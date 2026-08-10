@@ -70,6 +70,7 @@ std::condition_variable g_wake;
 std::string g_workdir = "/tmp/h3studio";
 std::string g_ffmpeg = "ffmpeg";
 std::string g_ui_dir;
+std::string g_models_dir;
 
 std::string Now() {
   static std::atomic<uint64_t> n{0};
@@ -215,6 +216,43 @@ bool SaveDataUrl(const std::string& url, const std::string& path, std::string* e
   return true;
 }
 
+// Checkpoints that are actually on disk. Asking a user to type an absolute path
+// into a browser is a bad interface AND an unnecessary one: the weights were
+// downloaded to a directory, so offer what is there.
+//
+// The partition is GUESSED from the filename because a community GGUF strips the
+// release metadata and the two partitions are byte-structurally identical -- so
+// there is nothing in the file to read. A wrong guess is not silently harmful:
+// the engine refuses a task its partition does not serve.
+std::string ScanModels() {
+  json out = json::array();
+  std::error_code ec;
+  if (g_models_dir.empty()) return out.dump();
+  for (const auto& e : std::filesystem::directory_iterator(g_models_dir, ec)) {
+    if (ec) break;
+    if (!e.is_regular_file()) continue;
+    const std::string path = e.path().string();
+    const std::string name = e.path().filename().string();
+    if (name.size() < 5 || name.substr(name.size() - 5) != ".gguf") continue;
+    std::string lower = name;
+    for (char& c : lower) c = static_cast<char>(std::tolower(c));
+    // The ENCODER is a gguf in the same directory and is not a DiT; naming it as
+    // one would offer a checkpoint that cannot render.
+    if (lower.find("qwen3vl") != std::string::npos || lower.find("enc") == 0) continue;
+    std::string part;
+    if (lower.find("ref2va") != std::string::npos) part = "ref2va";
+    else if (lower.find("fl2va") != std::string::npos) part = "fl2va";
+    std::error_code sec;
+    const auto sz = std::filesystem::file_size(e.path(), sec);
+    out.push_back({{"path", path},
+                   {"name", name},
+                   {"partition", part},
+                   {"pruned", lower.find("pruned") != std::string::npos},
+                   {"gib", sec ? 0.0 : static_cast<double>(sz) / (1024.0 * 1024.0 * 1024.0)}});
+  }
+  return out.dump();
+}
+
 std::string EngineStatus() {
   std::lock_guard<std::mutex> lk(g_engine.m);
   return json{{"loaded", g_engine.handle != nullptr},
@@ -279,6 +317,7 @@ int main(int argc, char** argv) {
     else if (a == "--workdir") g_workdir = Arg(argc, argv, i);
     else if (a == "--ffmpeg") g_ffmpeg = Arg(argc, argv, i);
     else if (a == "--ui") g_ui_dir = Arg(argc, argv, i);
+    else if (a == "--models-dir") g_models_dir = Arg(argc, argv, i);
     else if (a == "--host") host = Arg(argc, argv, i);
     else if (a == "--port") port = std::atoi(Arg(argc, argv, i));
     else if (a == "--help" || a == "-h") {
@@ -288,6 +327,7 @@ int main(int argc, char** argv) {
           "          [--audio-vae-config <j>] [--prompt-embeds <f>]\n"
           "          [--device cpu|cuda] [--keep-quant|--dequant-bf16]\n"
           "          [--workdir DIR] [--ffmpeg PATH] [--ui DIR]\n"
+          "          [--models-dir DIR]  offer every .gguf here in the picker\n"
           "          [--host H] [--port P]\n\n"
           "A browser console for MiniMax-H3 video generation: all three tasks,\n"
           "and the loaded checkpoint can be swapped without restarting.\n"
@@ -300,6 +340,8 @@ int main(int argc, char** argv) {
     }
   }
   if (g_engine.device.empty()) g_engine.device = "cuda";
+  if (g_models_dir.empty() && !g_engine.dit.empty())
+    g_models_dir = std::filesystem::path(g_engine.dit).parent_path().string();
 
   g_engine.base = vllm_video_model_params_default();
   g_engine.base.encoder_path = g_engine.encoder.empty() ? nullptr : g_engine.encoder.c_str();
@@ -338,6 +380,10 @@ int main(int argc, char** argv) {
       return;
     }
     res.set_content(body, "text/html; charset=utf-8");
+  });
+
+  srv.Get("/api/models", [](const httplib::Request&, httplib::Response& res) {
+    res.set_content(ScanModels(), "application/json");
   });
 
   srv.Get("/api/engine", [](const httplib::Request&, httplib::Response& res) {
