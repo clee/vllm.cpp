@@ -81,9 +81,9 @@ jobs:
         with:
           name: release-linux-x86_64-glibc-cpu-${{ github.sha }}
           path: |
-            build-release-cpu-x86/release/linux-x86_64-glibc-cpu.tar.gz
-            build-release-cpu-x86/release/linux-x86_64-glibc-cpu.tar.gz.sha256
-            build-release-cpu-x86/release/linux-x86_64-glibc-cpu.tar.gz.provenance.json
+            build-release-cpu-x86/release/vllm.cpp-${{ needs.plan.outputs.version }}-linux-x86_64-glibc-cpu.tar.gz
+            build-release-cpu-x86/release/vllm.cpp-${{ needs.plan.outputs.version }}-linux-x86_64-glibc-cpu.tar.gz.sha256
+            build-release-cpu-x86/release/vllm.cpp-${{ needs.plan.outputs.version }}-linux-x86_64-glibc-cpu.tar.gz.provenance.json
           if-no-files-found: error
           overwrite: false
           retention-days: 7
@@ -121,9 +121,9 @@ jobs:
         with:
           name: release-linux-aarch64-glibc-cpu-${{ github.sha }}
           path: |
-            build-release-cpu-arm64/release/linux-aarch64-glibc-cpu.tar.gz
-            build-release-cpu-arm64/release/linux-aarch64-glibc-cpu.tar.gz.sha256
-            build-release-cpu-arm64/release/linux-aarch64-glibc-cpu.tar.gz.provenance.json
+            build-release-cpu-arm64/release/vllm.cpp-${{ needs.plan.outputs.version }}-linux-aarch64-glibc-cpu.tar.gz
+            build-release-cpu-arm64/release/vllm.cpp-${{ needs.plan.outputs.version }}-linux-aarch64-glibc-cpu.tar.gz.sha256
+            build-release-cpu-arm64/release/vllm.cpp-${{ needs.plan.outputs.version }}-linux-aarch64-glibc-cpu.tar.gz.provenance.json
           if-no-files-found: error
           overwrite: false
           retention-days: 7
@@ -163,9 +163,9 @@ jobs:
         with:
           name: release-linux-x86_64-musl-cpu-static-${{ github.sha }}
           path: |
-            build-release-cpu-musl/release/linux-x86_64-musl-cpu-static.tar.gz
-            build-release-cpu-musl/release/linux-x86_64-musl-cpu-static.tar.gz.sha256
-            build-release-cpu-musl/release/linux-x86_64-musl-cpu-static.tar.gz.provenance.json
+            build-release-cpu-musl/release/vllm.cpp-${{ needs.plan.outputs.version }}-linux-x86_64-musl-cpu-static.tar.gz
+            build-release-cpu-musl/release/vllm.cpp-${{ needs.plan.outputs.version }}-linux-x86_64-musl-cpu-static.tar.gz.sha256
+            build-release-cpu-musl/release/vllm.cpp-${{ needs.plan.outputs.version }}-linux-x86_64-musl-cpu-static.tar.gz.provenance.json
           if-no-files-found: error
           overwrite: false
           retention-days: 7
@@ -196,16 +196,16 @@ jobs:
           SOURCE_DATE_EPOCH=$(git show -s --format=%ct HEAD)
           export SOURCE_DATE_EPOCH
           scripts/build-linux-accelerator-release.sh \
-            linux-x86_64-glibc-cuda-fat cuda build-release-cuda-x86
+            linux-x86_64-glibc-cuda cuda build-release-cuda-x86
       - name: Upload exact validated x86 CUDA asset triplet
         id: upload
         uses: actions/upload-artifact@v4
         with:
-          name: release-linux-x86_64-glibc-cuda-fat-${{ github.sha }}
+          name: release-linux-x86_64-glibc-cuda-${{ github.sha }}
           path: |
-            build-release-cuda-x86/release/linux-x86_64-glibc-cuda-fat.tar.gz
-            build-release-cuda-x86/release/linux-x86_64-glibc-cuda-fat.tar.gz.sha256
-            build-release-cuda-x86/release/linux-x86_64-glibc-cuda-fat.tar.gz.provenance.json
+            build-release-cuda-x86/release/vllm.cpp-${{ needs.plan.outputs.version }}-linux-x86_64-glibc-cuda.tar.gz
+            build-release-cuda-x86/release/vllm.cpp-${{ needs.plan.outputs.version }}-linux-x86_64-glibc-cuda.tar.gz.sha256
+            build-release-cuda-x86/release/vllm.cpp-${{ needs.plan.outputs.version }}-linux-x86_64-glibc-cuda.tar.gz.provenance.json
           if-no-files-found: error
           overwrite: false
           retention-days: 7
@@ -236,16 +236,16 @@ jobs:
           SOURCE_DATE_EPOCH=$(git show -s --format=%ct HEAD)
           export SOURCE_DATE_EPOCH
           scripts/build-linux-accelerator-release.sh \
-            linux-aarch64-glibc-cuda-fat cuda build-release-cuda-arm64
+            linux-aarch64-glibc-cuda cuda build-release-cuda-arm64
       - name: Upload exact validated Arm CUDA asset triplet
         id: upload
         uses: actions/upload-artifact@v4
         with:
-          name: release-linux-aarch64-glibc-cuda-fat-${{ github.sha }}
+          name: release-linux-aarch64-glibc-cuda-${{ github.sha }}
           path: |
-            build-release-cuda-arm64/release/linux-aarch64-glibc-cuda-fat.tar.gz
-            build-release-cuda-arm64/release/linux-aarch64-glibc-cuda-fat.tar.gz.sha256
-            build-release-cuda-arm64/release/linux-aarch64-glibc-cuda-fat.tar.gz.provenance.json
+            build-release-cuda-arm64/release/vllm.cpp-${{ needs.plan.outputs.version }}-linux-aarch64-glibc-cuda.tar.gz
+            build-release-cuda-arm64/release/vllm.cpp-${{ needs.plan.outputs.version }}-linux-aarch64-glibc-cuda.tar.gz.sha256
+            build-release-cuda-arm64/release/vllm.cpp-${{ needs.plan.outputs.version }}-linux-aarch64-glibc-cuda.tar.gz.provenance.json
           if-no-files-found: error
           overwrite: false
           retention-days: 7
@@ -278,9 +278,9 @@ jobs:
         with:
           name: release-linux-x86_64-glibc-vulkan-${{ github.sha }}
           path: |
-            build-release-vulkan-x86/release/linux-x86_64-glibc-vulkan.tar.gz
-            build-release-vulkan-x86/release/linux-x86_64-glibc-vulkan.tar.gz.sha256
-            build-release-vulkan-x86/release/linux-x86_64-glibc-vulkan.tar.gz.provenance.json
+            build-release-vulkan-x86/release/vllm.cpp-${{ needs.plan.outputs.version }}-linux-x86_64-glibc-vulkan.tar.gz
+            build-release-vulkan-x86/release/vllm.cpp-${{ needs.plan.outputs.version }}-linux-x86_64-glibc-vulkan.tar.gz.sha256
+            build-release-vulkan-x86/release/vllm.cpp-${{ needs.plan.outputs.version }}-linux-x86_64-glibc-vulkan.tar.gz.provenance.json
           if-no-files-found: error
           overwrite: false
           retention-days: 7
@@ -309,9 +309,9 @@ jobs:
         with:
           name: release-macos-arm64-metal-${{ github.sha }}
           path: |
-            build-release-metal-arm64/release/macos-arm64-metal.tar.gz
-            build-release-metal-arm64/release/macos-arm64-metal.tar.gz.sha256
-            build-release-metal-arm64/release/macos-arm64-metal.tar.gz.provenance.json
+            build-release-metal-arm64/release/vllm.cpp-${{ needs.plan.outputs.version }}-macos-arm64-metal.tar.gz
+            build-release-metal-arm64/release/vllm.cpp-${{ needs.plan.outputs.version }}-macos-arm64-metal.tar.gz.sha256
+            build-release-metal-arm64/release/vllm.cpp-${{ needs.plan.outputs.version }}-macos-arm64-metal.tar.gz.provenance.json
           if-no-files-found: error
           overwrite: false
           retention-days: 7
@@ -351,9 +351,9 @@ jobs:
         with:
           name: release-macos-arm64-metal-mlx-${{ github.sha }}
           path: |
-            build-release-mlx-arm64/release/macos-arm64-metal-mlx.tar.gz
-            build-release-mlx-arm64/release/macos-arm64-metal-mlx.tar.gz.sha256
-            build-release-mlx-arm64/release/macos-arm64-metal-mlx.tar.gz.provenance.json
+            build-release-mlx-arm64/release/vllm.cpp-${{ needs.plan.outputs.version }}-macos-arm64-metal-mlx.tar.gz
+            build-release-mlx-arm64/release/vllm.cpp-${{ needs.plan.outputs.version }}-macos-arm64-metal-mlx.tar.gz.sha256
+            build-release-mlx-arm64/release/vllm.cpp-${{ needs.plan.outputs.version }}-macos-arm64-metal-mlx.tar.gz.provenance.json
           if-no-files-found: error
           overwrite: false
           retention-days: 7
@@ -372,17 +372,18 @@ jobs:
         with:
           artifact-ids: ${{ needs.plan.outputs.artifact_id }}
           path: plan
+          merge-multiple: true
       - name: Download exact validated CPU artifacts by immutable IDs
         uses: actions/download-artifact@v4
         with:
           artifact-ids: ${{ needs.cpu_x86.outputs.artifact_id }},${{ needs.cpu_arm64.outputs.artifact_id }},${{ needs.cpu_musl.outputs.artifact_id }},${{ needs.cuda_x86.outputs.artifact_id }},${{ needs.cuda_arm64.outputs.artifact_id }},${{ needs.vulkan_x86.outputs.artifact_id }},${{ needs.metal_arm64.outputs.artifact_id }},${{ needs.mlx_arm64.outputs.artifact_id }}
-          path: assets
+          path: release-assets
           merge-multiple: true
       - name: Produce the byte-bound release handoff
         run: |
           python3 scripts/release_pipeline.py handoff \
             --plan plan/release-plan.json \
-            --assets-dir assets \
+            --assets-dir release-assets \
             --output release-handoff.json
       - name: Upload immutable unverified handoff
         id: upload
@@ -391,7 +392,7 @@ jobs:
           name: release-unverified-${{ github.sha }}
           path: |
             release-handoff.json
-            assets
+            release-assets
           if-no-files-found: error
           overwrite: false
           retention-days: 7
@@ -410,25 +411,27 @@ jobs:
         with:
           artifact-ids: ${{ needs.plan.outputs.artifact_id }}
           path: plan
+          merge-multiple: true
       - name: Download exact unverified handoff by ID
         uses: actions/download-artifact@v4
         with:
           artifact-ids: ${{ needs.build.outputs.artifact_id }}
           path: unverified
+          merge-multiple: true
       - name: Verify handoff against plan and workflow SHA
         run: |
           mkdir -p verified
-          cp -a unverified/assets verified/assets
+          cp -a unverified/release-assets verified/release-assets
           python3 scripts/release_pipeline.py verify \
             --plan plan/release-plan.json \
             --handoff unverified/release-handoff.json \
-            --assets-dir verified/assets \
+            --assets-dir verified/release-assets \
             --output verified/verified-handoff.json \
             --sha '${{ github.sha }}'
       - name: Generate byte-derived release indexes
         run: |
           python3 scripts/release_index.py \
-            --assets-dir verified/assets \
+            --assets-dir verified/release-assets \
             --handoff verified/verified-handoff.json \
             --json-output verified/release-index.json \
             --markdown-output verified/RELEASE_INDEX.md \
@@ -457,10 +460,11 @@ jobs:
         with:
           artifact-ids: ${{ needs.verify.outputs.artifact_id }}
           path: verified
+          merge-multiple: true
       - name: Attest verified bytes
         uses: actions/attest@v4
         with:
-          subject-path: verified/assets/**
+          subject-path: verified/release-assets/**
   publish:
     needs: [plan, verify, attest]
     if: needs.plan.outputs.publish == 'true' && startsWith(github.ref, 'refs/tags/v')
@@ -475,6 +479,7 @@ jobs:
         with:
           artifact-ids: ${{ needs.verify.outputs.artifact_id }}
           path: verified
+          merge-multiple: true
       - name: Publish the exact verified release assets
         env:
           GH_TOKEN: ${{ github.token }}
@@ -483,7 +488,7 @@ jobs:
           test "$tag" = "${GITHUB_REF#refs/tags/}"
           python3 scripts/release_pipeline.py publish \
             --handoff verified/verified-handoff.json \
-            --assets-dir verified/assets \
+            --assets-dir verified/release-assets \
             --index-json verified/release-index.json \
             --index-markdown verified/RELEASE_INDEX.md \
             --tag "$tag"

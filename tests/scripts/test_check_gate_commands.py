@@ -110,7 +110,7 @@ class ShippedRecordTests(unittest.TestCase):
     def test_the_audit_covers_every_gated_state(self):
         self.assertEqual(
             gates.GATED_STATES,
-            frozenset({"READY", "ACTIVE", "GATING", "DONE", "BLOCKED"}),
+            frozenset({"READY", "ACTIVE", "GATING", "BLOCKED"}),
         )
         # ...and audit() must actually FILTER on it. Asserting the constant's
         # literal value pins nothing about the denominator: deleting the state
@@ -235,6 +235,26 @@ def _bash_array(text: str, name: str) -> list[str]:
 
 
 class RatchetTests(unittest.TestCase):
+    def test_the_container_rows_credit_rests_on_scripts_that_exist(self):
+        """Why ENG-RELEASE-CONTAINERS is in the baseline, not merely that it is.
+
+        The row was credited on arrival because its spec binds the release chain
+        it inherits -- scripts that exist and genuinely fail on a broken staged
+        tree. Its OWN gates did not exist when it was pinned. If the credit ever
+        came to rest only on scripts the tree does not have, the pin would be a
+        certificate for nothing, and this is the case that catches that.
+        """
+        spec = ROOT / ".agents/specs/container-images.md"
+        self.assertTrue(spec.exists(), "the container spec is the source of the credit")
+        commands = gates.runnable_commands(spec.read_text(encoding="utf-8"))
+        existing = sorted({c for c in commands if (ROOT / c).exists()})
+        self.assertTrue(
+            existing,
+            "every command the container spec cites is absent from the tree; "
+            "the runnable credit rests on nothing",
+        )
+        self.assertIn("scripts/validate-release-archive.py", existing)
+
     def test_the_baseline_matches_the_shipped_record(self):
         # EXACT equality, in both directions, and that is the whole contract:
         # this is an exact pin, not a shrink-only floor. Lowering the baseline
@@ -243,6 +263,89 @@ class RatchetTests(unittest.TestCase):
         # stays 0 while this assertion, preflight and CI go red until the set
         # below is re-pinned. Growth is welcome; silent growth is not.
         runnable = {r["id"] for r in gates.audit() if r["verdict"] == "runnable"}
+        self.assertEqual(runnable, set(gates.RUNNABLE_BASELINE))
+
+    def test_now_derived_left_the_gated_population_cleanly(self):
+        # ENG-NOW-DERIVED (#374) shipped W1-W5 and reached DONE. Closure removes
+        # it from both sides of the exact pin; it is not assigned a weaker
+        # verdict and its implementation evidence remains in the record.
+        verdicts = {r["id"]: r["verdict"] for r in gates.audit()}
+        self.assertIsNone(verdicts.get("ENG-NOW-DERIVED"))
+        self.assertNotIn("ENG-NOW-DERIVED", gates.RUNNABLE_BASELINE)
+
+    def test_re_adding_done_to_the_gated_population_breaks_the_pin(self):
+        # MUTATION: restoring the departed lifecycle state must expose the four
+        # runnable DONE rows and disagree with the re-pinned baseline.
+        original = gates.GATED_STATES
+        gates.GATED_STATES = frozenset(original | {"DONE"})
+        try:
+            runnable = {
+                r["id"] for r in gates.audit() if r["verdict"] == "runnable"
+            }
+        finally:
+            gates.GATED_STATES = original
+        departed = {
+            "ENG-ASYNC-SCHED",
+            "SERVE-HTTP-TRANSPORT",
+            "ENG-NOW-DERIVED",
+            "ENG-TRAILER-MERGE-ARTIFACTS",
+        }
+        self.assertEqual(runnable - set(gates.RUNNABLE_BASELINE), departed)
+        self.assertNotEqual(runnable, set(gates.RUNNABLE_BASELINE))
+
+    def test_trailer_merge_artifacts_left_the_gated_population_cleanly(self):
+        # Credited runnable on arrival at ACTIVE, then gone the same day on
+        # reaching DONE (157080c8). Assert the departure on BOTH sides -- gone
+        # from the audit AND gone from the baseline -- because a row present in
+        # one and not the other is exactly what the exact pin exists to catch.
+        verdicts = {r["id"]: r["verdict"] for r in gates.audit()}
+        self.assertIsNone(verdicts.get("ENG-TRAILER-MERGE-ARTIFACTS"))
+        self.assertNotIn("ENG-TRAILER-MERGE-ARTIFACTS", gates.RUNNABLE_BASELINE)
+
+    def test_forge_coauthor_is_credited_for_real_commands(self):
+        # ENG-FORGE-COAUTHOR (#418) joins the runnable population on arrival, so
+        # it earns the credit the same way: its spec's Gates section must name
+        # commands that can actually fail, including the per-commit re-check of
+        # the real f64f2b71 the row exists to unblock.
+        verdicts = {r["id"]: r["verdict"] for r in gates.audit()}
+        self.assertEqual(verdicts.get("ENG-FORGE-COAUTHOR"), "runnable")
+        spec = (ROOT / ".agents/specs/forge-coauthor-attribution.md").read_text(
+            encoding="utf-8"
+        )
+        for command in ("scripts/agent-preflight.sh", "agent-integration.py"):
+            with self.subTest(command=command):
+                self.assertIn(command, spec)
+
+    def test_record_conflict_surfaces_is_credited_for_real_commands(self):
+        # ENG-RECORD-CONFLICT-SURFACES (#364) joined the runnable population on
+        # arrival, so the credit has to be earned the same way ENG-DOCS-SITE
+        # earns it: the spec's Gates section must name commands that can
+        # actually fail, not prose. This row's gate is the record gate -- no
+        # CUDA, GPU or SACRED gate is implicated because no product source is
+        # touched, and the spec says so rather than leaving the absence
+        # unexplained.
+        verdicts = {r["id"]: r["verdict"] for r in gates.audit()}
+        self.assertEqual(verdicts.get("ENG-RECORD-CONFLICT-SURFACES"), "runnable")
+        spec = (ROOT / ".agents/specs/retire-shared-record-surfaces.md").read_text(
+            encoding="utf-8"
+        )
+        for command in ("scripts/agent-preflight.sh", "agent-integration.py"):
+            with self.subTest(command=command):
+                self.assertIn(command, spec)
+
+    def test_the_baseline_re_pin_is_load_bearing(self):
+        # MUTATION: the re-pin that added this row must be what makes the audit
+        # agree with the baseline. Drop the entry and the exact-pin assertion
+        # above has to go red -- otherwise the baseline is decorative and a row
+        # could enter or leave the runnable population unnoticed, which is the
+        # failure the exact pin exists to catch.
+        reduced = set(gates.RUNNABLE_BASELINE) - {"ENG-RECORD-CONFLICT-SURFACES"}
+        runnable = {r["id"] for r in gates.audit() if r["verdict"] == "runnable"}
+        self.assertNotEqual(
+            runnable,
+            reduced,
+            "removing the row from the baseline must break the pin",
+        )
         self.assertEqual(runnable, set(gates.RUNNABLE_BASELINE))
 
     def test_eng_docs_site_is_credited_for_real_commands(self):
@@ -259,6 +362,64 @@ class RatchetTests(unittest.TestCase):
         body = spec.read_text(encoding="utf-8")
         self.assertIn("python3 scripts/check-site.py", body)
         self.assertIn("hugo --minify -s website", body)
+
+    def test_the_newly_pinned_row_carries_a_reproducible_invocation(self):
+        # The baseline is hand-edited and `audit()` is not, so the failure mode a
+        # re-pin invites is adding an id whose spec does not actually tell anyone
+        # how to run the gate. Set-equality above cannot catch that: both sides
+        # move together.
+        #
+        # It is worth being precise about what this does and does not prove. The
+        # obvious mutation -- strip the fenced block, expect the credit to vanish
+        # -- does NOT hold, and finding that out is the useful part: with both
+        # blocks removed the section still yields `ctest`, harvested from an
+        # inline code span in the surrounding prose. That is the weak-credit debt
+        # the checker's own header already admits to (see the RUNNABLE_BASELINE
+        # comment and gate-command-audit-2026-08-06.md risk 3), not something
+        # this row introduced, so it is recorded here rather than worked around.
+        #
+        # What is asserted instead is the thing a reader actually needs: the row
+        # is pinned, it audits runnable, and its Gates section carries a real
+        # fenced invocation naming the binaries the gate was run with.
+        row = "SAMPLE-PROMPT-LOGPROBS"
+        self.assertIn(row, gates.RUNNABLE_BASELINE)
+        record = next(r for r in gates.audit() if r["id"] == row)
+        self.assertEqual(record["verdict"], "runnable", record)
+
+        section = gates.gates_section(
+            (ROOT / ".agents/specs/prompt-logprobs.md").read_text(encoding="utf-8")
+        )
+        self.assertIsNotNone(section)
+        blocks = re.findall(r"```sh\n(.*?)```", section, flags=re.DOTALL)
+        self.assertTrue(blocks, "the Gates section carries no fenced invocation")
+        body = "\n".join(blocks)
+        for fragment in ("cmake -S . -B", "cmake --build", "test_llm_engine", "ctest"):
+            self.assertIn(fragment, body, fragment)
+
+    def test_lora_runtime_is_credited_for_its_own_invocation(self):
+        # LORA-RUNTIME re-entered the runnable population when the row went back
+        # to ACTIVE for W2 (#278), and the credit it arrived with was WEAK: the
+        # UPSTREAM path `tests/lora/test_qwen35_densemodel_lora.py`, named in
+        # the spec's prose as the eventual model gate, which nothing here runs.
+        # The pin was taken only alongside the row's real CPU invocation, so
+        # assert the real one is what the spec carries. Delete the ctest lines
+        # and this goes red, instead of the row quietly keeping a credit that
+        # rests on an upstream filename.
+        verdicts = {r["id"]: r["verdict"] for r in gates.audit()}
+        self.assertEqual(verdicts.get("LORA-RUNTIME"), "runnable")
+
+        spec = ROOT / ".agents" / "specs" / "lora-adapter.md"
+        section = gates.gates_section(spec.read_text(encoding="utf-8"))
+        self.assertIsNotNone(section)
+        commands = gates.runnable_commands(section)
+        self.assertIn(
+            "ctest --test-dir build-cpu -R test_lora_layers --output-on-failure",
+            commands,
+        )
+        self.assertIn(
+            "ctest --test-dir build-cpu -R test_punica_cpu --output-on-failure",
+            commands,
+        )
 
     def test_a_row_that_loses_its_command_is_refused(self):
         # Still present, still gated, no longer runnable -- a real regression.

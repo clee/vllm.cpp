@@ -238,6 +238,16 @@ struct Nvfp4Weight {
   // path. Uploaded once from the persistent `alpha` member; the diagnostic host
   // scalar path leaves this null.
   mutable std::shared_ptr<void> d_alpha;
+  // OPT-IN lifetime residency for the DEQUANTIZED bf16 [K=in, N=out] Matmul-B
+  // operand the backends with NO fp4 GEMM multiply against (CPU / Vulkan / Metal /
+  // HIP / Tenstorrent; CUDA never dequantizes). Default OFF, and it must stay a
+  // per-WEIGHT opt-in: the operand is a bf16 expansion of ~4x the packed bytes, so
+  // holding one per tower projection is the double-residency that OOM-reboots a
+  // Spark on Vulkan (#203). The dense loader opts in the OUTPUT HEAD alone — one
+  // weight, re-read whole every step (~2.54 GB a step rebuilt per call at the
+  // 27B's 248320x5120); everything else keeps a per-call copy.
+  bool keep_dequant_b = false;
+  mutable std::shared_ptr<void> d_dequant_b;
 
   // Resident Marlin constants (issue #237; see ResidentSlot). `resident_marlin`
   // is this weight's own repack; `resident_marlin_pair` is the fused gate+up
@@ -315,6 +325,20 @@ struct GdnLayerWeights {
   Fp8Weight in_proj_qkv_fp8;  // [N=conv_dim, K=H]
   Fp8Weight in_proj_z_fp8;    // [N=value_dim, K=H]
   Fp8Weight out_proj_fp8;     // [N=H, K=value_dim]
+
+  // PERF-27B-GDN-FP8-QKVZ: the FP8 analogue of `in_proj_qkvz`. vLLM runs ONE
+  // merged qkvz GEMM per GDN layer, so the two RAW fp8 shards above are
+  // N-concatenated ONCE into a single device operand — i8 [conv_dim+value_dim,
+  // H], qkv rows first — and the forward issues one fp8 GEMM instead of two.
+  // Built lazily-once (and eagerly, PRE-CAPTURE, by
+  // Qwen3_5DenseModel::PrepareGdnFp8Resident) exactly like Fp8Weight::d_packed;
+  // the shard-local `d_packed` residents are then never built, so the merged
+  // arm costs no duplicate device bytes. `d_qkvz_fp8_alpha` is the f32
+  // [conv_dim+value_dim] per-output-column folded alpha and stays NULL in the
+  // common case where both shards fold the SAME alpha (it is then folded into
+  // the GEMM scalar instead). Empty on every non-fp8 owner.
+  mutable std::shared_ptr<void> d_qkvz_fp8_packed;
+  mutable std::shared_ptr<void> d_qkvz_fp8_alpha;
 };
 
 // Full (dense causal) attention layer weights.

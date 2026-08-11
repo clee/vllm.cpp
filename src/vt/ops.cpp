@@ -1642,12 +1642,17 @@ void CheckGdnCommon(const Queue& q, const Tensor& out, const Tensor& q_in, const
   VT_CHECK(g.dtype == DType::kF32 && beta.dtype == DType::kF32,
            std::string(name) + ": g/beta must be f32 (upstream keeps them f32)");
   if (allow_compressed_state) {
+    // Asking the backend (Backend::SupportsCompressedGdnState) rather than
+    // naming a device — the same device-agnostic pattern CheckConvCommon
+    // already uses for the conv state. CUDA answers for its existing kernels;
+    // ROCm answers for the portable scan's f16/bf16 state arms.
+    const Backend* gdn_backend = TryGetBackend(q.device.type);
     VT_CHECK(state.dtype == DType::kF32 ||
-                 ((state.dtype == DType::kF16 ||
-                   state.dtype == DType::kBF16) &&
-                  q.device.type == DeviceType::kCUDA),
+                 ((state.dtype == DType::kF16 || state.dtype == DType::kBF16) &&
+                  gdn_backend != nullptr && gdn_backend->SupportsCompressedGdnState()),
              std::string(name) +
-                 ": state must be f32, or fp16/bf16 on CUDA (in/out, in place; "
+                 ": state must be f32, or fp16/bf16 on a backend whose GDN kernels "
+                 "support a compressed state in place (in/out, in place; "
                  "read/written in f32 registers)");
   } else {
     VT_CHECK(state.dtype == DType::kF32,
@@ -2289,8 +2294,12 @@ void MoeCombineGate(Queue& q, Tensor& out, const Tensor& expert_out, const Tenso
   VT_CHECK(IsFloat(expert_out.dtype) && IsOutFloat(out.dtype),
            "moe_combine_gate: float expert_out, f32/bf16 out");
   VT_CHECK(weights.dtype == DType::kF32, "moe_combine_gate: weights must be f32");
-  VT_CHECK(sd.dtype == DType::kF32 && sd.rank == 2 && sd.shape[0] == t && sd.shape[1] == h,
-           "moe_combine_gate: sd must be f32 [T,H]");
+  // sd may be bf16: the shared down-proj GEMM produces bf16 and the gate
+  // re-rounds through bf16 anyway, so reading it directly is bit-identical to
+  // casting to f32 first (VT_SHARED_DOWN_BF16).
+  VT_CHECK((sd.dtype == DType::kF32 || sd.dtype == DType::kBF16) && sd.rank == 2 &&
+               sd.shape[0] == t && sd.shape[1] == h,
+           "moe_combine_gate: sd must be f32/bf16 [T,H]");
   VT_CHECK(gl.dtype == DType::kF32 && gl.Numel() == t,
            "moe_combine_gate: gl must be f32 with T elements");
   VT_CHECK(expert_out.IsContiguous() && weights.IsContiguous() && out.IsContiguous() &&
@@ -3503,8 +3512,10 @@ void SharedExpertGate(Queue& q, Tensor& out, const Tensor& sd, const Tensor& gl)
   VT_CHECK(out.rank == 2, "shared_expert_gate: out rank-2 [T,H]");
   const int64_t t = out.shape[0], h = out.shape[1];
   VT_CHECK(out.dtype == DType::kBF16, "shared_expert_gate: out must be bf16");
-  VT_CHECK(sd.dtype == DType::kF32 && gl.dtype == DType::kF32,
-           "shared_expert_gate: sd/gl must be f32");
+  // sd may be bf16 (VT_SHARED_DOWN_BF16): widening in-kernel is exact and the
+  // store is bf16 either way, so both forms are bit-identical.
+  VT_CHECK((sd.dtype == DType::kF32 || sd.dtype == DType::kBF16) && gl.dtype == DType::kF32,
+           "shared_expert_gate: sd must be f32/bf16 and gl f32");
   VT_CHECK(sd.Numel() == t * h, "shared_expert_gate: sd must have T*H elements matching out");
   VT_CHECK(gl.Numel() == t, "shared_expert_gate: gl must have T elements (one gate per token)");
   VT_CHECK(out.IsContiguous() && sd.IsContiguous() && gl.IsContiguous(),

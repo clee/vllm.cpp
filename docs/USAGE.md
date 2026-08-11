@@ -24,6 +24,11 @@ directory (issue #85).
 
 ### One ROCm-specific behaviour
 
+ROCm builds register the full V1 sampler surface (temperature, top-k/top-p, min-p,
+penalties, allowed-token masks, logprobs, random sample) so EngineCore does not
+fatal with `no kernel for op` after prefill on AMD. Non-positive chat
+`max_tokens` is treated as unset on all backends (Hermes `max_tokens=-1`).
+
 Worth knowing before you read a hang as a bug in the tests: a build that sets no
 `CMAKE_BUILD_TYPE` floors **HIP device code** at `-O1` and prints a configure
 line saying so. At `-O0` the ROCm runtime starts a hostcall listener the kernels
@@ -31,6 +36,29 @@ never use, and its teardown can deadlock at process exit — every test passes,
 `Status: SUCCESS!` prints, and the process never returns
 ([#132](https://github.com/mudler/vllm.cpp/issues/132)). Setting a build type,
 or putting your own `-O` in `CMAKE_HIP_FLAGS`, overrides it.
+
+### ROCm op coverage is incremental (and throws are by design)
+
+The ROCm backend registers native ops family by family
+([#41](https://github.com/mudler/vllm.cpp/issues/41)); landed GDN slices so far:
+the indexed state I/O pair (`kGdnStateGather`/`kGdnStateScatter`), the causal
+conv1d pair (`kCausalConv1dFwd`/`kCausalConv1dUpdate`, incl. the exact-chunks
+descriptor form Qwen3.5 prefill passes), the fused post-conv glue
+(`kGdnPostConv`), the gated-delta recurrence (`kGdnPrefill`/`kGdnDecode`,
+portable scan), and the norm-gate/preamble ops (`kRmsNormGated`,
+`kSigmoidGateBf16`, `kAttnQkNormRopeGate`) — the full set Qwen3.5-class
+GDN-hybrid models call. Compressed conv/SSM state (bf16, the vLLM
+`mamba_cache_dtype` default) is advertised via the
+`SupportsCompressedConvState`/`SupportsCompressedGdnState` backend probes.
+MoE-path coverage is partial: `MoeRouterTopK` (f32/bf16 logits, ungrouped
+softmax, no bias) and `MoeSiluMul` are native; the remaining chain
+(`kSharedExpertGate`, `kMoeCombine`/`kMoeCombineGate`, and the grouped quant
+expert GEMM) is not registered yet, so MoE-bearing models still throw on
+those ops. On a
+discrete card there is no CPU fallback tier, so a model whose layers call an op
+that is not registered yet fails loudly with `vt: no kernel for op N on device
+type 5` — that is the memory-safety design working, not a crash. Run with
+`VT_OP_PROVIDER_STATS=1` to see which ops resolve native.
 
 ### CUTLASS is fetched as headers only
 
@@ -55,6 +83,13 @@ never used.
 ```sh
 grep '^CMAKE_CUDA_ARCHITECTURES' build-cuda/CMakeCache.txt
 ```
+
+Which fast paths a given architecture compiles is decided by the CUDA feature
+table, not by the arch string alone. `110` (Jetson Thor) builds the portable
+kernels plus the vendored Marlin NVFP4 W4A16 GEMM; the CUTLASS FP4/FP8 paths and
+`fp4-mma` stay off there because no kernel body exists for it. `cmake -P
+cmake/CudaArchFeaturesTest.cmake` prints the resolution for any target list
+without a GPU or a CUDA toolkit.
 
 It previously reported the toolkit's detected default (typically `75`) no matter
 what was requested, because the project set the variable without writing it back
@@ -86,6 +121,13 @@ welcome that the agent should relay. An explicit request can use
 claim action, rerun it after declaration, then run `scripts/agent-preflight.sh`.
 The entrypoint is non-interactive and does not mutate the checkout.
 
+The operator role is a coordinator, and **several may run at once**:
+`scripts/agent-role.py claim operator` records this worktree and is never
+refused, `scripts/agent-role.py show` lists the other live coordinators, and
+`scripts/agent-role.py release` removes only this worktree's record. What keeps
+concurrent coordinators safe is that `main` is never force-pushed, so a plain
+`git push` refuses any non-fast-forward.
+
 ## Running inference (CLI)
 
 `vllm-cli` runs a one-shot completion through the C ABI. Source:
@@ -110,6 +152,7 @@ build/examples/vllm-cli \
 | `--seed S` | (unset) | RNG seed (enables seeded sampling) |
 | `--stream` | off | Stream token deltas to stdout |
 | `--speculative-config '<json>'` | (unset) | Speculative decoding, same JSON as vLLM's flag. See [docs/SPECULATIVE-DECODING.md](SPECULATIVE-DECODING.md) |
+| `--max-num-seqs N` | engine default (32) | Max concurrent sequences. Under speculative decoding on a GDN model the recurrent state is `max-num-seqs x (k+1)` per slot, so this is the knob to lower when a run is refused for state budget |
 | `--repeat N` | `1` | Load once, then run N blocking completions. Use it to read a warm decode tok/s without paying model load each time. Not supported with `--stream`, which falls back to 1 |
 | `-h`, `--help` | | Print usage and exit |
 
@@ -118,9 +161,45 @@ Two more example binaries ship alongside it:
 - `vllm-bench` ([`examples/bench/main.cpp`](../examples/bench/main.cpp)), a
   throughput/latency harness taking `--model`, `--dataset-path`,
   `--num-prompts`, `--input-len`, `--output-len`, `--concurrency`,
-  `--max-num-batched-tokens`, and `--num-blocks`.
+  `--max-num-batched-tokens`, and `--num-blocks`. It pretokenizes before timing
+  and atomically publishes each concurrency wave. Set
+  `VT_BENCH_PRETOKENIZE=0` for the timed-string rollback; the report names the
+  resolved mode.
 - `tokenize` ([`examples/tokenize/main.cpp`](../examples/tokenize/main.cpp)), a
   tokenizer smoke tool taking `<tokenizer.json | model.gguf> <corpus.txt>`.
+  GGUF `tokenizer.ggml.pre` names accepted: `qwen35`, `qwen2`, `llama-bpe`,
+  `gpt-4o` / `llama4` / `kanana2` / `talkie` (the GPT-4o / o200k family),
+  `joyai-llm`, `deepseek-llm`, `deepseek-v3`, `laguna`. Any other name is
+  refused by name rather than aliased onto a near-miss regex.
+
+### Which HF tokenizers load
+
+A checkpoint's `tokenizer.json` is accepted when its `pre_tokenizer` is one this
+build recognises. Recognition is by exact regex or pipeline shape, not by model
+name, so a checkpoint from any vendor loads if it carries one of these:
+
+| family | shape | examples |
+|---|---|---|
+| Qwen3.6 | one `Split` regex, single-codepoint `\p{N}`, `\p{M}` folded into letter runs | Qwen3.6-27B |
+| Qwen2/Qwen3 classic | as above without `\p{M}` awareness | Qwen3-0.6B, Qwen3-Coder |
+| Llama-3 | `\p{N}{1,3}` digit groups, no `\p{M}` awareness | Llama-3 family |
+| Tekken (Mistral) | case-aware letter runs, single-codepoint `\p{N}`, `/` in the punct tail | Mistral-Nemo-Instruct-2407 |
+| GPT-4o / o200k | the same case-aware letter runs, plus o200k's contraction SUFFIX and `\p{N}{1,3}` | Muse Glimmer (pre `llama4`), GPT-4o |
+| GPT-2 byte-level | `ByteLevel(use_regex=true)` with no explicit `Split` | OPT, GPT-2 |
+| DeepSeek | a seven-stage `Sequence` pipeline, not one alternation | DeepSeek-V2/V3 |
+| SentencePiece | `Metaspace` + byte-fallback vocab | Mistral-7B-v0.3 |
+
+An unrecognised one fails loudly at load with `tokenizer: unrecognized
+pre-tokenizer split regex: <regex>`, rather than tokenizing incorrectly. If you
+hit that, the printed regex is what a new pattern would have to match.
+
+Note that Mistral ships **two** unrelated tokenizer families: Mistral-7B-v0.3 is
+SentencePiece, while Mistral-Nemo is Tekken, a byte-level BPE whose regex is
+tiktoken's `o200k_base` with the contraction group removed and `\p{N}{1,3}`
+reduced to `\p{N}`. Support for one says nothing about the other. Putting those
+two edits back gives the GPT-4o row above, so the two share one scanner's
+character classes but stay separate patterns: they disagree on `don't` and on
+every digit run longer than one.
 
 ### How much memory a Vulkan load needs
 
@@ -181,6 +260,10 @@ transposed (`lm_head`) or dequantized at load are not verbatim and still copy.
 `VT_LOAD_DIRECT_UPLOAD=0` turns the direct path off in the same binary; the
 loaded bytes, and therefore the tokens, are identical either way.
 
+Safetensors payloads are byte-addressed and do not promise natural scalar
+alignment. Borrowed BF16/F16/F32 inputs therefore use defined byte-copy loads;
+an odd payload offset neither forces a host copy nor changes the loaded bits.
+
 `device_upload` counts every single-source weight upload: the bf16/fp8 weights
 through `ResidentWeight` and the compressed-tensors NVFP4/MXFP4 `packed`/`scale`
 residents through `ResidentNvfp4`. It does NOT yet count the merged fp4 operands
@@ -208,6 +291,64 @@ forms in use, so pick a checkpoint by its quality, not by its head:
 
 The head is dequantized to BF16 at load, so all three cost the same memory once
 running. Any other dtype fails at load with a message naming what it saw.
+
+A `modelopt_mixed` checkpoint (`nvidia/Qwen3.6-27B-NVFP4`, and the 35B-A3B that
+shares the tower) keeps its `linear_attn` input projections in FP8 W8A8, and
+those two per-layer projections are packed into ONE merged `in_proj_qkvz` GEMM,
+mirroring vLLM's `MergedColumnParallelLinear`. The merge only fires when the two
+shards carry a bitwise-identical per-tensor `input_scale`, since one GEMM
+quantizes the activation once; a checkpoint whose scales differ keeps the two
+separate GEMMs automatically. `VT_GDN_MERGED_QKVZ_FP8=0` restores the two GEMMs
+in the same binary.
+
+### Architectures that resolve but refuse to run
+
+A few architectures are registered so their config and weight layout are
+accounted for, while their forward is deliberately not implemented. Pointing the
+CLI or server at one of these loads far enough to resolve the architecture and
+then fails with a message naming the missing piece, rather than emitting wrong
+tokens quietly.
+
+| Architecture | Why it refuses |
+|---|---|
+| `KimiK3ForConditionalGeneration` | Needs ~1.56 TB (MXFP4); no host here can run it |
+
+This is a deliberate state, not a bug: registering the architecture is what lets
+the config parse and weight-name mapping be tested before the forward exists.
+
+### Muse Glimmer: exactly what has been checked
+
+`MuseGlimmerForCausalLM` / `MuseGlimmerForConditionalGeneration` are not in that
+table: both towers forward and the perception encoder is wired, so an image or
+video prompt runs instead of refusing. What has been *measured* is much narrower
+than "it works", so it is worth stating precisely.
+
+- The text tower ran on real tensors from the released 30B checkpoint at
+  **reduced depth — 4 of its 52 layers.** Its **5 prefill argmax positions** are
+  identical to a standalone torch transcription of the upstream source and to
+  HF's own `muse_glimmer` implementation. The full-depth 52-layer arm of our
+  forward has **never run**.
+- Those are argmax positions from a single prefill, not generated tokens.
+  **Multi-step decode is untested**, and so is the sliding window across steps.
+- The perception encoder normalizes merged multimodal embeddings again as of
+  #405. Its config key is absent from the released checkpoint and defaults on,
+  which we had read as off — so image and video prompts before that fix skipped
+  a normalization step. Still no reference decode for the vision path either
+  way, so this corrects the code without changing what has been verified.
+- Even at reduced depth this is agreement with independent transcriptions of the
+  same upstream source, not agreement with the model's own runtime: the pinned
+  oracle cannot load `muse_glimmer` at all.
+- The perception encoder has **no reference check of any kind** — the wiring gate
+  proves the tower is reachable and that its output lands on the image/video
+  placeholder rows, not that an image produces the right tokens.
+- Nothing has run end to end through the server, and **no speed number exists for
+  this model on any axis**; there is no denominator to state one against.
+- The ATEM reasoning and tool parsers are ported and unit-gated, but at the
+  server's default `skip_special_tokens: true` the framing tokens they key on
+  (`<|start|>`, `<|message|>`, `<|eom|>`, `<|eot|>`) are stripped before the
+  parser sees the text. Channel scoping is therefore an **open gap at server
+  defaults** — see [FEATURES.md](FEATURES.md) and
+  [the spec](../.agents/specs/muse-glimmer.md) §6.7.
 
 ## OpenAI-compatible server
 
@@ -254,7 +395,7 @@ python3 scripts/check-cuda-fat-gencode.py \
 ```
 
 The release workflow applies this audit to independently linked x86_64 and
-arm64 host executables, packages each as a preview `cuda-fat` archive, and then
+arm64 host executables, packages each as a preview `cuda` archive, and then
 runs the extracted-archive validator. Each archive must contain all ten SM
 images and the six available exact-SM Triton AOT namespaces; the manifest keeps
 runtime evidence separate per SM. These build-only preview candidates are not
@@ -266,6 +407,12 @@ without publication. An exact version tag runs the same build, produces
 `release-index.json` and `RELEASE_INDEX.md` from the verified archive manifests,
 attests the archive bytes, and publishes every archive/checksum/provenance
 triplet through the protected release environment.
+
+Inside the workflow, generated archives live under `release-assets` (and then
+`unverified/release-assets` / `verified/release-assets`). This transient root is
+deliberately separate from the checkout's tracked `assets/` directory, so exact
+handoff validation sees only the planned archive/checksum/provenance triplets.
+The release filenames and published eight-tuple inventory are unchanged.
 
 ### Selecting an x86 CPU ISA tier
 
@@ -285,6 +432,52 @@ independently selectable with `VT_CPU_Q8_DOT`, `VT_CPU_QUANT_MMLA`, and
 while an unavailable forced tier fails closed. The exact accepted values are
 listed in [ENVIRONMENT.md](ENVIRONMENT.md).
 
+### NVFP4 dense sinks
+
+The `E=1` dense NVFP4 projections run on vLLM's own dense Marlin GEMM rather
+than the single-expert grouped-MoE route, which pays `moe_align` bookkeeping and
+row padding for a problem that has neither. `VT_MARLIN_DENSE` covers the single
+projections and `VT_MARLIN_DENSE_PAIR` the fused shared-expert gate_up sink;
+both default ON, opt out with `=0`. The pair sink was the last one still on the
+MoE route: enabling it measured **+1.31% at c8 and +1.38% at c4** on
+`nvidia/Qwen3.6-35B-A3B-NVFP4` with both SACRED gates unmoved. Only the
+throughput changes; the routed experts still use the grouped MoE kernel, which
+is where they belong.
+
+The shared expert's `down_proj` keeps its bf16 output rather than upcasting to
+f32 (`VT_SHARED_DOWN_BF16`, default ON, opt out with `=0`). Both consumers widen
+bf16 in-kernel — which is exact — and re-round through bf16 on store, so the
+f32 form was writing and re-reading a whole `[T,H]` buffer for a value it
+already had. The change is bit-identical and worth **+2.05% at c8**.
+
+### The NVFP4 output head
+
+On a Qwen3.6 dense checkpoint whose `lm_head` is stored NVFP4 (ModelOpt
+`weight`/`weight_scale`/`weight_scale_2`, or compressed-tensors
+`weight_packed`/`weight_global_scale`) the head is kept **packed** and the logits
+GEMM runs on it directly, as vLLM does. Nothing is dequantized at load, so the
+head costs `K*N/2 + K*N/16` bytes instead of `2*K*N`, about 0.715 GB instead of
+2.543 GB on `nvidia/Qwen3.6-27B-NVFP4` (measured peak host RSS 21.06 to 19.36
+GiB, a 1.70 GiB saving on CUDA; the figure is owed a re-measurement after
+`ENG-LOAD-DIRECT-UPLOAD` changed the RSS accounting).
+
+That accounting is CUDA's. A backend with no fp4 GEMM (CPU, Vulkan, Metal, HIP,
+Tenstorrent) has to multiply against a dequantized bf16 copy, so on those the
+head costs the packed bytes **plus** one `2*K*N` operand, built once when the
+model is prepared rather than per call — 0.666 + 2.368 = 3.034 GiB on the same
+checkpoint. The sign of the change therefore depends on the backend: on Vulkan,
+which used to stage a host bf16 head *and* a device copy of it, the head goes
+4.736 to 3.034 GiB, the same **-1.70 GiB**; on plain CPU it goes 2.368 to 3.034,
+a **+0.67 GiB** regression, paid once instead of rebuilding 2.368 GiB on every
+decode step as that backend did before. Only the head is kept that way; every
+other NVFP4 projection dequantizes per call, so a quantized tower is never
+expanded in memory. The head runs W4A16 under both namings: the on-disk
+activation divisor next to it (`input_scale`, or `input_global_scale` in the
+compressed-tensors spelling) is NOT consumed unless `VT_MODELOPT_W4A4=1`,
+matching vLLM, which deletes it on this path. Set `VT_LMHEAD_FP4=0` for a
+same-binary A/B that restores the old dequantize-at-load owner. BF16, FP8, GGUF
+and `tie_word_embeddings` heads are unaffected by either setting.
+
 ### Validating a staged release archive
 
 Release verification reads only a freshly extracted archive, never files from
@@ -293,9 +486,9 @@ provenance sidecars:
 
 ```sh
 python3 scripts/validate-release-archive.py \
-  --archive vllm.cpp-0.0.1-cpu-linux-x86_64.tar.gz \
-  --checksum vllm.cpp-0.0.1-cpu-linux-x86_64.tar.gz.sha256 \
-  --provenance vllm.cpp-0.0.1-cpu-linux-x86_64.tar.gz.provenance.json \
+  --archive vllm.cpp-0.0.2-linux-x86_64-glibc-cpu.tar.gz \
+  --checksum vllm.cpp-0.0.2-linux-x86_64-glibc-cpu.tar.gz.sha256 \
+  --provenance vllm.cpp-0.0.2-linux-x86_64-glibc-cpu.tar.gz.provenance.json \
   --forbid-path "$PWD/build"
 ```
 
@@ -315,7 +508,7 @@ model before metadata can be generated:
 
 ```sh
 SOURCE_SHA=$(git rev-parse HEAD) \
-VERSION=0.0.1 \
+VERSION=0.0.2 \
 SOURCE_DATE_EPOCH=$(git show -s --format=%ct HEAD) \
 EVIDENCE_URL=https://github.com/mudler/vllm.cpp/actions/runs/EXAMPLE \
 scripts/build-cpu-release.sh \
@@ -327,6 +520,73 @@ The corresponding arm64 tuple is `linux-aarch64-glibc-cpu`. The only literal
 static tuple is the CPU-only `linux-x86_64-musl-cpu-static` experiment; normal
 CPU and accelerator archives are static-core bundles with audited host runtime
 dependencies.
+
+## Container images
+
+Published to one GHCR package with the lane in the tag:
+`ghcr.io/mudler/vllm.cpp:<version>-cuda`, `-vulkan`, `-cpu`, plus the moving
+`:latest-<lane>`. The bare `:latest` is the **cpu** lane, so pulling it on a
+machine with no accelerator gets a working server rather than a library-load
+failure. Every lane is a `linux/amd64` + `linux/arm64` manifest.
+
+The entrypoint is `vllm-server`, so flags go straight after the image name and
+the server keeps its own default of `0.0.0.0:8000`:
+
+```sh
+docker run --rm -p 8000:8000 \
+  -v /path/to/models:/models:ro \
+  ghcr.io/mudler/vllm.cpp:latest \
+  --model /models/Qwen3.6-35B-A3B
+```
+
+For the CUDA lane, the GPU driver comes from the host through the container
+runtime; the image carries only the CUDA *runtime* libraries it links:
+
+```sh
+docker run --rm --gpus all -p 8000:8000 \
+  -v /path/to/models:/models:ro \
+  ghcr.io/mudler/vllm.cpp:latest-cuda \
+  --model /models/Qwen3.6-35B-A3B
+```
+
+`/models` is the weights mount and `/cache` is the tokenizer/HF cache; the
+container runs as uid 1000, so `/cache` must be writable by it if you bind-mount
+one. `ffmpeg` is installed in every lane, so `/v1/videos` works out of the box —
+a deliberate difference from the tarballs, which never vendor it because they
+are extracted onto a host that already has a `PATH`.
+
+macOS Metal and MLX have no image and never will: there is no macOS container
+runtime and no Metal passthrough. ROCm has no image until its backend compiles.
+
+### Building and validating an image locally
+
+One Dockerfile, one target per lane. The builder stage runs the same
+`scripts/build-*-release.sh` the release workflow runs, so there is no second
+build definition to drift:
+
+```sh
+docker build -f docker/Dockerfile --target cpu \
+  --build-arg VERSION=0.0.1 \
+  --build-arg SOURCE_SHA=$(git rev-parse HEAD) \
+  --build-arg JOBS=$(nproc) \
+  -t vllm-cpp:local-cpu .
+```
+
+Then gate it. Without `--model` the validator checks configuration and layout
+and says plainly that the image has no runtime evidence; with one it also boots
+the server, requires `/health` and `/version`, runs the image's own declared
+healthcheck, and requires a clean SIGTERM shutdown:
+
+```sh
+python3 scripts/validate-container-image.py \
+  --image vllm-cpp:local-cpu --lane cpu --version 0.0.1 \
+  --model /path/to/opt-125m
+```
+
+`scripts/check-container-matrix.py` keeps `release/container-matrix.json` and
+the Dockerfile agreeing about lanes, tags and digest-pinned bases;
+`scripts/check-container-workflow.py` holds the publish workflow to its
+least-privilege stages. Both run in preflight and CI.
 
 To exercise the release pipeline without publishing anything, trigger its
 manual entry point:
@@ -365,7 +625,7 @@ Registered in
 | GET | `/health` | Process liveness (200) |
 | GET, POST | `/ping` | Liveness probe (200, mirrors `/health`) |
 | GET | `/version` | Engine version |
-| GET | `/metrics` | Prometheus metrics (`vllm:*` names, text format 0.0.4) |
+| GET | `/metrics` | Prometheus metrics (`vllm:*` names, text format 0.0.4), recorded per engine step by the engine that serves your requests. Series and families keep stable addresses as new ones register (#330), so a long-lived scrape target does not read through a reallocated registry |
 | POST | `/tokenize` | Tokenize a `prompt` to token ids (optional `token_strs`) |
 | POST | `/detokenize` | Detokenize token ids back to text |
 | GET | `/server_info` | Server info (`vllm_config`, `vllm_env`, `system_env`) |
@@ -374,6 +634,25 @@ Registered in
 | POST | `/v1/videos/sync` | Same, but runs to completion before answering |
 | GET | `/v1/videos/{id}` | Job status |
 | GET | `/v1/videos/{id}/content` | The finished MP4 (`video/mp4`) |
+
+`prompt_logprobs` is accepted on `/v1/completions` and `/v1/chat/completions`
+and the engine computes it — every prompt position is scored against the token
+that followed it, accumulated across chunked prefill — but the **response body
+does not carry it yet**: emitting it needs the OpenAI `echo` wiring, which is
+not done. Until then it is reachable through the library
+(`RequestOutput.prompt_logprobs`), not over HTTP. `logprobs`/`top_logprobs` on
+GENERATED tokens are emitted normally.
+
+That computation is gated on the **CPU** backend only. A step that owes prompt
+logits takes the full-logits route, and on that route the sampler is handed a
+host-resident logits buffer carrying the accelerator's device label — sound on
+unified memory, and **not yet verified on CUDA at all, discrete or otherwise**.
+Treat `prompt_logprobs` on a GPU build as unverified until that gate runs; the
+mechanism and the exact owed invocation are in
+[`.agents/specs/prompt-logprobs.md`](../.agents/specs/prompt-logprobs.md)
+(risk 4 and the `PENDING` CUDA smoke gate). Requests that do NOT set it are
+unaffected on every backend — the route is only taken for a step where some
+request asked.
 
 The four `/v1/videos` routes are registered **only** when the server was started
 with `--video-dit`; without it they are absent (404) and the server is identical
@@ -428,15 +707,15 @@ a stop token early.
 | `--block-size N` | `32` | KV block size |
 | `--num-blocks N` | `256` | KV blocks |
 | `--max-model-len N` | `0` (config default) | Max sequence length |
-| `--max-num-seqs N` | `32` | Max concurrent sequences (also sizes the HTTP worker pool). Was `8`, which put a c8 client exactly on the batch ceiling; vLLM's own default is 1024, which we do not mirror because this also caps the padded decode-graph set |
+| `--max-num-seqs N` | `32` | Max concurrent sequences (also sizes the HTTP worker pool). Was `8`, which put a c8 client exactly on the batch ceiling; vLLM's own default is 1024, which we do not mirror because this also caps the padded decode-graph set. On a GDN/Mamba model under speculative decoding this also multiplies the recurrent state, which is sized `max-num-seqs x (k+1)`; an unservable budget is refused at load with the arithmetic |
 | `--max-num-batched-tokens N` | `0` (per-arch default) | Per-step token budget |
 | `--enable-prefix-caching` / `--no-enable-prefix-caching` | model default | Override automatic prefix caching |
 | `--scheduling-policy fcfs\|priority\|lpm` | `fcfs` | Scheduler policy (`lpm` is the SGLang cache-aware policy, see [docs/SGLANG-COMPAT.md](SGLANG-COMPAT.md)) |
 | `--enable-radix-attention` / `--disable-radix-attention` | model default | SGLang-named alias for the prefix-cache toggle |
 | `--enable-jump-forward` | off | Jump-forward decoding for structured output (token-unique subset) |
 | `--enable-force-include-usage` | off | Force the usage block in responses |
-| `--tool-call-parser <name>` | `hermes` | Tool-call dialect (40 names over 36 families). `auto` detects from the chat template, `none` disables |
-| `--reasoning-parser <name>` | `none` | Reasoning parser (`think_auto`, `deepseek_r1`, `deepseek_v3`, `holo2`, `mistral`, `minimax_m2`, `minimax_m2_append_think`, `step3`, `olmo3`). `auto` detects, `none` disables |
+| `--tool-call-parser <name>` | `hermes` | Tool-call dialect (41 names over 37 families). `auto` detects from the chat template, `none` disables. For `gemma4`, OpenAI chat uses the text-seam parser (wrapped `<\|tool_call>` **or** bare `call:NAME{ARGS}`) so free-form / detokenized tool bodies still become `tool_calls` |
+| `--reasoning-parser <name>` | `none` | Reasoning parser (`think_auto`, `deepseek_r1`, `deepseek_v3`, `holo2`, `mistral`, `minimax_m2`, `minimax_m2_append_think`, `step3`, `olmo3`, `muse_glimmer`). `auto` detects, `none` disables |
 | `--kv-transfer-config '<json>'` | (unset) | External KV connector, same JSON as vLLM's flag. See [docs/KV-OFFLOAD.md](KV-OFFLOAD.md) |
 | `--speculative-config '<json>'` | (unset) | Speculative decoding (`mtp`, `dflash`, `ngram`), same JSON as vLLM's flag. `dspark` speculates on the Qwen3.6 gate models (native + Speculators drafts), token-identically to speculative-off, but is not gated on speed (currently ~2% behind at c1). A GGUF target, or a target with no aux multi-tap, is refused by name (`SPEC-DSPARK`). See [docs/SPECULATIVE-DECODING.md](SPECULATIVE-DECODING.md) |
 | `--enable-log-requests` / `--disable-log-requests` | on | Log each incoming request. Mirrors vLLM's flag of the same name |
@@ -449,9 +728,70 @@ a stop token early.
 | `--cuda-profile-graph-batch N` | `16` when replays are armed | Batch size the profiler traces. Must not exceed `--max-num-seqs` |
 | `-h`, `--help` | | Print usage and exit |
 
+#### Context length vs the KV pool
+
+The KV pool holds `--num-blocks × --block-size` tokens — `256 × 32 = 8192` by
+default. A request longer than that can never be scheduled, so the engine
+refuses it early rather than leaving it in the waiting queue forever. Two checks
+do that, mirroring vLLM:
+
+- **At startup.** If `--max-model-len` is given and the pool cannot hold one
+  sequence that long, the server exits with the sizes and the flags that close
+  the gap (vLLM's `_check_enough_kv_cache_memory`). If it is **not** given, the
+  serving length is auto-fitted down to what the pool holds and logged
+  (vLLM's `_auto_fit_max_model_len`) — so raising `--num-blocks` is what buys a
+  longer context.
+- **At admission.** A prompt at or past the resolved `max_model_len` is
+  rejected with **HTTP 400** (`BadRequestError`) naming both lengths, exactly as
+  vLLM's `_validate_prompt_len` does. It is never a finish reason and never a
+  500.
+
+Set `VT_ENGINE_STEP_LOG=1` to print a per-step engine heartbeat if you need to
+confirm that a quiet engine is idle rather than stalled.
+
 For a production deployment, use [LocalAI](https://localai.io), which can embed
 engines like this behind a model gallery, multi-model serving, the full OpenAI
 API surface, auth, and metrics.
+
+## Muse Glimmer 30B from a GGUF k-quant
+
+The text tower loads from a `muse-glimmer`-architecture GGUF, so the 30B model
+runs from a ~17 GB k-quant instead of a ~60 GB bf16 checkpoint. Point `--model`
+straight at the file; the config comes from the GGUF's own metadata, so no
+`config.json` is needed:
+
+```sh
+./build/vllm-server --model /path/to/muse-glimmer-30B-kquant-17gb.gguf
+```
+
+Both published k-quants load (`muse-glimmer-30B-kquant-17gb.gguf` and the mixed
+per-tensor `muse-glimmer-30B-kquant-dynamic.gguf`). Standard GGUF residency
+knobs apply (`VT_GGUF_KEEP_QUANT`, `VT_GGUF_MMAP`, `VT_CPU_REF`); `o_proj`, the
+attention output gate, `down_proj` and the merged `gate_up` stay quantized, while
+the merged QKV, `lm_head` and the embedding table expand to bf16 because the
+shared forward consumes them in a form a block encoding cannot take.
+
+Three caveats:
+
+- **The k-quant generates coherent text, but is not token-exact against
+  llama.cpp.** Two defects had to be fixed to get there: the GGUF tokenizer gap
+  ([#347](https://github.com/mudler/vllm.cpp/issues/347), pre `llama4` = the
+  GPT-4o / o200k family) and the converter's Q/K RoPE row permutation
+  ([#359](https://github.com/mudler/vllm.cpp/issues/359), which produced
+  `" is is is ..."`). `"The capital of France is"` at `--temperature 0` now
+  continues `" Paris. The capital of France is Paris. ..."`. llama.cpp on the
+  same file agrees on the first token and then diverges; whether that residual is
+  quantization drift or a second defect is open.
+- **Image and video need the bf16 safetensors.** The released
+  `mmproj-kquant.gguf` ships its patch embedding without the `patch_temporal`
+  axis, so half the weight is not in the file; loading it is refused by name.
+- **No speed number exists for this model in any weight format.** The pinned
+  vLLM oracle cannot load `muse_glimmer` at all, so there is no denominator to
+  quote and none is claimed.
+
+Set `VLLM_MUSE_GGUF=<file>` (or `VLLM_MUSE_GGUF_LOAD=<file>` for the full
+materialization) to run `test_muse_glimmer_gguf` against a real checkpoint;
+without them the gate runs off committed header-only manifests.
 
 ## MiniMax-H3: video + audio generation
 
@@ -727,8 +1067,8 @@ that invokes `ffmpeg`, path configurable with `--video-ffmpeg`).
 ## Consuming it as a library (C ABI)
 
 Link `libvllm` (static or shared) and include [`include/vllm.h`](../include/vllm.h).
-It exposes a flat, exception-free, llama.cpp-style C ABI (`VLLM_ABI_VERSION 10`,
-19 exported symbols) suitable for `dlopen` / FFI / LocalAI integration.
+It exposes a flat, exception-free, llama.cpp-style C ABI (`VLLM_ABI_VERSION 17`,
+35 exported functions) suitable for `dlopen` / FFI / LocalAI integration.
 
 ```c
 #include "vllm.h"
@@ -767,6 +1107,13 @@ concurrent requests, memory helpers, and diagnostics. Later ABI versions add:
 | v8 | Custom logits processors |
 | v9 | Engine sizing: chunked-prefill token budget, scheduling policy, external KV connector / LMCache |
 | v10 | Jump-forward decoding (tri-state, default off) |
+| v11 | Audio transcription through `vllm_transcribe` |
+| v12 | Video and audio generation through `vllm_video_*` |
+| v13 | Pre-tokenized completion through `vllm_complete_tokens` |
+| v14 | Explicit device selection (`auto`, CPU, or CUDA) |
+| v15 | Embeddings through `vllm_embed` |
+| v16 | Absolute KV-cache memory sizing |
+| v17 | The OpenAI server as a thin ABI client through `vllm_server_main` |
 
 Chat templates render through the vendored google/minja engine, the same
 renderer llama.cpp ships.
@@ -791,9 +1138,52 @@ auto engine = vllm::entrypoints::LoadedEngine::FromModelDir(model_dir, ep);
 The underlying portable tensor runtime is `vt::` ([`include/vt/`](../include/vt/)),
 which carries no ggml or PyTorch dependency.
 
+`Sampler`'s `logprobs_mode` selects which tensor the returned logprobs are read
+from, and all four of vLLM's values now work: `raw_logprobs` (the default) and
+`raw_logits` are snapshotted before any logits processor runs, so they describe
+the MODEL's distribution; `processed_logprobs` and `processed_logits` are taken
+after temperature and top-k/top-p, so they describe the distribution actually
+SAMPLED from — a token top-k masked away reads `-inf` there and its true value
+under the raw pair. It is selectable by constructing a `Sampler` directly; there
+is no config, CLI or request field for it yet.
+
+The LoRA adapter headers ([`lora/lora_weights.h`](../include/vllm/lora/lora_weights.h),
+[`lora/punica.h`](../include/vllm/lora/punica.h),
+[`lora/layers.h`](../include/vllm/lora/layers.h)) are present but **not yet wired
+to any engine path**: they are the in-progress runtime (`LORA-RUNTIME`), not a
+supported way to serve an adapter. There is no CLI flag, server flag, config key
+or C-ABI field for LoRA, and adding one is a later work item — see
+[`.agents/specs/lora-adapter.md`](../.agents/specs/lora-adapter.md).
+
 `SamplingParams::logprobs` accepts `-1` for "every vocab entry", as vLLM's does;
 it returns the same gathered shape a finite count returns, one entry per vocab id
-per position. (Over HTTP the OpenAI `logprobs` field keeps its own 0..5 range.)
+per position.
+
+Over HTTP the same `-1` reaches the chat surface: `{"logprobs": true,
+"top_logprobs": -1}` is accepted, as in vLLM, and returns every vocab entry for
+each generated token. No numeric range is enforced on either surface — vLLM's
+`check_logprobs` request validation and its `max_logprobs` model cap are not
+ported yet. Two consequences: `{"logprobs": -1}` on the **completion** surface
+returns empty `top_logprobs` maps where vLLM answers `400`, and an out-of-range
+count is not rejected. Both are tracked by
+[issue #249](https://github.com/mudler/vllm.cpp/issues/249).
+
+`SamplingParams::logprob_token_ids` scores an EXPLICIT set of vocab ids instead —
+vLLM's generative-scoring path, and what to reach for when you only need a few
+labels compared, since it avoids the full-vocab sort `logprobs=-1` costs:
+
+```cpp
+vllm::SamplingParams sp;
+sp.max_tokens = 1;
+sp.logprob_token_ids = std::vector<int32_t>{yes_id, no_id};  // `logprobs` unset
+```
+
+Each returned position then carries exactly those ids plus the sampled token,
+whose `rank` is still its rank over the WHOLE vocabulary, so it stays comparable
+across requests. At most 128 ids (vLLM's `MAX_LOGPROB_TOKEN_IDS`); setting
+`logprobs` as well is allowed only when it equals the id count, and the explicit
+ids win. This is a library-API field today — the OpenAI request field is not
+wired yet.
 
 ## Multimodal input (image, video, audio to text)
 
@@ -905,3 +1295,11 @@ were removed when the example became a thin ABI client; see the header comment i
 Served over HTTP too: pass `--video-dit` (plus the VAEs and configs) to `examples/server` and
 `POST /v1/videos`, `POST /v1/videos/sync` and `GET /v1/videos/{id}` register. Without it the
 routes stay unregistered.
+
+## SSE keepalives on long prefill
+
+Async chat/completion streams may emit SSE **comment** frames (`:\n\n`) while
+waiting on the engine (long prefill / TTFT). Interval is `VT_SERVER_SSE_PING_S`
+(default 15s; `0` disables). Comment frames are not `data:` events and do not
+carry tokens. Token streaming still uses a timed wait on the request collector
+so deltas are not collapsed by a poll loop.

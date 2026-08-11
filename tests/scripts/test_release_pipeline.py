@@ -18,6 +18,11 @@ ROOT = Path(__file__).resolve().parents[2]
 PIPELINE = ROOT / "scripts/release_pipeline.py"
 CHECKER = ROOT / "scripts/check-release-workflow.py"
 WORKFLOW = ROOT / ".github/workflows/release.yml"
+BUILD_DRIVERS = (
+    ROOT / "scripts/build-cpu-release.sh",
+    ROOT / "scripts/build-linux-accelerator-release.sh",
+    ROOT / "scripts/build-macos-release.sh",
+)
 MATRIX = ROOT / "release/release-matrix.json"
 SHA = "0123456789abcdef0123456789abcdef01234567"
 
@@ -61,7 +66,7 @@ class ReleasePipelineContract(unittest.TestCase):
         ids = [item["id"] for item in plan["artifacts"]]
         self.assertEqual(len(ids), len(set(ids)))
         self.assertIn("linux-x86_64-glibc-cpu", ids)
-        self.assertIn("linux-aarch64-glibc-cuda-fat", ids)
+        self.assertIn("linux-aarch64-glibc-cuda", ids)
         self.assertNotIn("rocm", " ".join(ids))
         self.assertEqual(plan["retention"]["ci_artifacts_days"], 7)
 
@@ -81,8 +86,8 @@ class ReleasePipelineContract(unittest.TestCase):
                 "linux-x86_64-glibc-cpu": "stable",
                 "linux-aarch64-glibc-cpu": "stable",
                 "linux-x86_64-musl-cpu-static": "experimental-preview",
-                "linux-x86_64-glibc-cuda-fat": "preview",
-                "linux-aarch64-glibc-cuda-fat": "preview",
+                "linux-x86_64-glibc-cuda": "preview",
+                "linux-aarch64-glibc-cuda": "preview",
                 "linux-x86_64-glibc-vulkan": "preview",
                 "macos-arm64-metal": "stable",
                 "macos-arm64-metal-mlx": "preview",
@@ -98,7 +103,7 @@ class ReleasePipelineContract(unittest.TestCase):
             verified_path = root / "verified-handoff.json"
             assets = root / "assets"
             assets.mkdir()
-            archive = assets / "linux-x86_64-glibc-cpu.tar.gz"
+            archive = assets / "vllm.cpp-0.0.1-linux-x86_64-glibc-cpu.tar.gz"
             archive.write_bytes(b"release bytes")
             digest = self.pipeline.file_sha256(archive)
             (assets / f"{archive.name}.sha256").write_text(
@@ -135,12 +140,44 @@ class ReleasePipelineContract(unittest.TestCase):
             with self.assertRaises(ValueError):
                 self.pipeline.make_handoff(plan_path, assets, root / "handoff.json")
 
+    def test_handoff_accepts_only_versioned_matrix_asset_names(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            plan = self.plan("workflow_dispatch", "refs/heads/main")
+            plan_path = root / "plan.json"
+            self.pipeline.write_json(plan_path, plan)
+            assets = root / "assets"
+            assets.mkdir()
+            artifact_id = "linux-x86_64-glibc-cpu"
+            archive = assets / f"vllm.cpp-{plan['version']}-{artifact_id}.tar.gz"
+            archive.write_bytes(b"release bytes")
+            digest = self.pipeline.file_sha256(archive)
+            (assets / f"{archive.name}.sha256").write_text(
+                f"{digest}  {archive.name}\n", encoding="utf-8"
+            )
+            (assets / f"{archive.name}.provenance.json").write_text(
+                "{}\n", encoding="utf-8"
+            )
+            handoff_path = root / "handoff.json"
+            self.pipeline.make_handoff(plan_path, assets, handoff_path)
+            files = json.loads(handoff_path.read_text(encoding="utf-8"))["files"]
+            self.assertEqual({item["artifact_id"] for item in files}, {artifact_id})
+
+            # A checkout-owned file copied into the transient root is not a
+            # release asset and must remain a hard failure. The workflow fixes
+            # that collision by using a disjoint root, not by weakening this
+            # exact-inventory validator.
+            (assets / "favicon.png").write_bytes(b"checkout asset")
+            with self.assertRaises(ValueError):
+                self.pipeline.make_handoff(plan_path, assets, handoff_path)
+
     def test_publish_enumerates_only_verified_assets_without_shell_globs(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             assets = root / "assets"
             assets.mkdir()
-            archive = assets / "linux-x86_64-glibc-cpu.tar.gz"
+            artifact_id = "linux-x86_64-glibc-cpu"
+            archive = assets / f"vllm.cpp-0.0.1-{artifact_id}.tar.gz"
             archive.write_bytes(b"release bytes")
             digest = self.pipeline.file_sha256(archive)
             for suffix, content in (
@@ -157,6 +194,7 @@ class ReleasePipelineContract(unittest.TestCase):
                 "release_tag": "v0.0.1",
                 "source_sha": SHA,
                 "verified": True,
+                "version": "0.0.1",
             }
             handoff_path = root / "verified-handoff.json"
             index_json = root / "release-index.json"
@@ -165,7 +203,7 @@ class ReleasePipelineContract(unittest.TestCase):
             self.pipeline.write_json(index_json, {
                 "artifacts": [{
                     "archive": archive.name,
-                    "id": archive.name.removesuffix(".tar.gz"),
+                    "id": artifact_id,
                     "sha256": digest,
                 }],
                 "release_tag": "v0.0.1",
@@ -209,6 +247,7 @@ class ReleasePipelineContract(unittest.TestCase):
                 "publish": True,
                 "release_tag": "v0.0.1",
                 "verified": True,
+                "version": "0.0.1",
             }
             handoff_path = root / "verified-handoff.json"
             index_json = root / "release-index.json"
@@ -260,6 +299,286 @@ class ReleasePipelineContract(unittest.TestCase):
     def test_workflow_has_exact_least_privilege_stage_boundaries(self) -> None:
         errors = self.checker.validate(WORKFLOW.read_text(encoding="utf-8"))
         self.assertEqual(errors, [])
+
+    def test_all_archive_producers_use_the_canonical_versioned_name(self) -> None:
+        assignment = 'archive="$release_dir/vllm.cpp-$VERSION-$artifact_id.tar.gz"'
+        for driver in BUILD_DRIVERS:
+            with self.subTest(driver=driver.name):
+                self.assertIn(assignment, driver.read_text(encoding="utf-8"))
+
+        workflow = WORKFLOW.read_text(encoding="utf-8")
+        artifact_id = "linux-x86_64-glibc-cpu"
+        canonical = (
+            "build-release-cpu-x86/release/"
+            "vllm.cpp-${{ needs.plan.outputs.version }}-"
+            f"{artifact_id}.tar.gz"
+        )
+        self.assertIn(canonical, workflow)
+        mutant = workflow.replace(canonical, canonical.replace("vllm.cpp-${{ needs.plan.outputs.version }}-", ""), 1)
+        self.assertIn(
+            "every release upload path must use its canonical versioned archive name",
+            self.checker.validate(mutant),
+        )
+
+    def test_every_artifact_download_uses_flat_extraction(self) -> None:
+        original = WORKFLOW.read_text(encoding="utf-8")
+        self.assertIn("          merge-multiple: true", original)
+        mutant = original.replace(
+            "          merge-multiple: true",
+            "          merge-multiple: false",
+            1,
+        )
+        self.assertIn(
+            "every artifact download must flatten into its declared path",
+            self.checker.validate(mutant),
+        )
+
+    def test_every_release_stage_uses_a_checkout_disjoint_asset_root(self) -> None:
+        original = WORKFLOW.read_text(encoding="utf-8")
+        required = (
+            "          path: release-assets",
+            "            --assets-dir release-assets \\",
+            "            release-assets",
+            "          cp -a unverified/release-assets verified/release-assets",
+            "            --assets-dir verified/release-assets \\",
+            "          subject-path: verified/release-assets/**",
+        )
+        for fragment in required:
+            with self.subTest(fragment=fragment):
+                self.assertIn(fragment, original)
+                mutant = original.replace(fragment, fragment.replace("release-assets", "assets"), 1)
+                self.assertIn(
+                    "release workflow must bind each handoff stage to its declared root",
+                    self.checker.validate(mutant),
+                )
+
+    def test_asset_download_root_cannot_be_compensated_by_plan_download(self) -> None:
+        original = WORKFLOW.read_text(encoding="utf-8")
+        plan_download = """          artifact-ids: ${{ needs.plan.outputs.artifact_id }}
+          path: plan
+          merge-multiple: true"""
+        asset_download = """          artifact-ids: ${{ needs.cpu_x86.outputs.artifact_id }},${{ needs.cpu_arm64.outputs.artifact_id }},${{ needs.cpu_musl.outputs.artifact_id }},${{ needs.cuda_x86.outputs.artifact_id }},${{ needs.cuda_arm64.outputs.artifact_id }},${{ needs.vulkan_x86.outputs.artifact_id }},${{ needs.metal_arm64.outputs.artifact_id }},${{ needs.mlx_arm64.outputs.artifact_id }}
+          path: release-assets
+          merge-multiple: true"""
+        self.assertIn(plan_download, original)
+        self.assertIn(asset_download, original)
+
+        mutant = original.replace(
+            plan_download,
+            plan_download.replace("path: plan", "path: release-assets"),
+            1,
+        ).replace(
+            asset_download,
+            asset_download.replace("path: release-assets", "path: assets"),
+            1,
+        )
+        self.assertIn(
+            "release workflow must bind each handoff stage to its declared root",
+            self.checker.validate(mutant),
+        )
+
+    def test_publish_asset_root_cannot_be_compensated_by_an_inert_comment(self) -> None:
+        original = WORKFLOW.read_text(encoding="utf-8")
+        publish_command = (
+            "          python3 scripts/release_pipeline.py publish \\\n"
+            "            --handoff verified/verified-handoff.json \\\n"
+            "            --assets-dir verified/release-assets \\\n"
+            "            --index-json verified/release-index.json \\\n"
+            "            --index-markdown verified/RELEASE_INDEX.md \\\n"
+            '            --tag "$tag"'
+        )
+        self.assertIn(publish_command, original)
+        mutant = original.replace(
+            publish_command,
+            publish_command.replace(
+                "            --assets-dir verified/release-assets \\",
+                "            # Inert compensation: --assets-dir verified/release-assets\n"
+                "            --assets-dir verified/assets \\",
+            ),
+            1,
+        )
+        self.assertIn(
+            "release workflow must bind each handoff stage to its declared root",
+            self.checker.validate(mutant),
+        )
+
+    def test_publish_binding_ignores_inert_shell_text_and_duplicates(self) -> None:
+        original = WORKFLOW.read_text(encoding="utf-8")
+        publish_command = (
+            "          python3 scripts/release_pipeline.py publish \\\n"
+            "            --handoff verified/verified-handoff.json \\\n"
+            "            --assets-dir verified/release-assets \\\n"
+            "            --index-json verified/release-index.json \\\n"
+            "            --index-markdown verified/RELEASE_INDEX.md \\\n"
+            '            --tag "$tag"'
+        )
+        good_option = "            --assets-dir verified/release-assets \\"
+        bad_option = "            --assets-dir verified/assets \\"
+        wrong_publish = publish_command.replace(good_option, bad_option)
+        plan_command = "          python3 scripts/release_pipeline.py plan \\"
+        flat_publish = (
+            "python3 scripts/release_pipeline.py publish "
+            "--handoff verified/verified-handoff.json "
+            "--assets-dir verified/release-assets "
+            "--index-json verified/release-index.json "
+            "--index-markdown verified/RELEASE_INDEX.md --tag \"$tag\""
+        )
+        self.assertIn(publish_command, original)
+        self.assertIn(plan_command, original)
+
+        mutants = {
+            "inline comment": original.replace(
+                publish_command,
+                publish_command.replace(
+                    good_option,
+                    "            --assets-dir verified/assets"
+                    " # --assets-dir verified/release-assets",
+                ),
+                1,
+            ),
+            "echo": original.replace(
+                publish_command,
+                wrong_publish
+                + '\n          echo "--assets-dir verified/release-assets"',
+                1,
+            ),
+            "quoted assignment": original.replace(
+                publish_command,
+                wrong_publish
+                + "\n          note='--assets-dir verified/release-assets'",
+                1,
+            ),
+            "unrelated command": original.replace(
+                publish_command,
+                wrong_publish
+                + "\n          python3 scripts/other.py"
+                " --assets-dir verified/release-assets",
+                1,
+            ),
+            "duplicate option": original.replace(
+                publish_command,
+                publish_command.replace(
+                    good_option, good_option + "\n" + bad_option
+                ),
+                1,
+            ),
+            "duplicate publisher": original.replace(
+                publish_command, publish_command + "\n" + publish_command, 1
+            ),
+            "plan step": original.replace(
+                publish_command, wrong_publish, 1
+            ).replace(
+                plan_command, publish_command + "\n" + plan_command, 1
+            ),
+            "later control segment": original.replace(
+                publish_command,
+                wrong_publish + "\n          true && " + flat_publish,
+                1,
+            ),
+            "publisher followed by control": original.replace(
+                publish_command, publish_command + " && true", 1
+            ),
+        }
+        for attack, mutant in mutants.items():
+            with self.subTest(attack=attack):
+                self.assertIn(
+                    "release workflow must bind each handoff stage to its declared root",
+                    self.checker.validate(mutant),
+                )
+
+    def test_gh_release_bypass_check_only_matches_executable_commands(self) -> None:
+        original = WORKFLOW.read_text(encoding="utf-8")
+        anchor = '            --tag "$tag"'
+        self.assertIn(anchor, original)
+        for inert in (
+            "          # gh release create --notes harmless",
+            '          echo "gh release upload --clobber harmless"',
+            "          note='gh release create harmless'",
+            '          note="gh release upload harmless"',
+            "          note='$(gh release create harmless)'",
+            "          note='`gh release upload harmless`'",
+            '          note="\\$(gh release create harmless)"',
+        ):
+            with self.subTest(inert=inert):
+                mutant = original.replace(anchor, anchor + "\n" + inert, 1)
+                self.assertEqual(self.checker.validate(mutant), [])
+
+        for command in (
+            '          gh release create "$tag" verified/release-index.json',
+            '          gh release upload "$tag" verified/release-index.json',
+        ):
+            with self.subTest(command=command):
+                mutant = original.replace(anchor, anchor + "\n" + command, 1)
+                self.assertIn(
+                    "release workflow must not bypass the byte-bound publisher",
+                    self.checker.validate(mutant),
+                )
+
+    def test_gh_release_bypass_cannot_hide_in_shell_control_or_substitution(self) -> None:
+        original = WORKFLOW.read_text(encoding="utf-8")
+        anchor = '            --tag "$tag"'
+        self.assertIn(anchor, original)
+        for command in (
+            '          true && gh release create "$tag" verified/release-index.json',
+            '          true; gh release upload "$tag" verified/release-index.json',
+            '          note="$(gh release create "$tag")"',
+            '          false || gh release upload "$tag" verified/release-index.json',
+            '          printf x | gh release create "$tag" verified/release-index.json',
+            '          (gh release create "$tag" verified/release-index.json)',
+            '          { gh release upload "$tag" verified/release-index.json; }',
+            '          gh release create "$tag" verified/release-index.json && true',
+            '          true && gh release create "$tag" one; gh release upload "$tag" two',
+            '          note=`gh release upload "$tag" verified/release-index.json`',
+            '          cat <(gh release create "$tag" verified/release-index.json)',
+        ):
+            with self.subTest(command=command):
+                mutant = original.replace(anchor, anchor + "\n" + command, 1)
+                self.assertIn(
+                    "release workflow must not bypass the byte-bound publisher",
+                    self.checker.validate(mutant),
+                )
+
+    def test_flat_extraction_cannot_be_compensated_by_an_upload(self) -> None:
+        original = WORKFLOW.read_text(encoding="utf-8")
+        mutant = original.replace(
+            "          merge-multiple: true",
+            "          merge-multiple: false",
+            1,
+        ).replace(
+            "          overwrite: false",
+            "          merge-multiple: true\n          overwrite: false",
+            1,
+        )
+        self.assertIn(
+            "every artifact download must flatten into its declared path",
+            self.checker.validate(mutant),
+        )
+
+    def test_flat_extraction_cannot_be_spoofed_by_sibling_env(self) -> None:
+        original = WORKFLOW.read_text(encoding="utf-8")
+        download = (
+            "      - name: Download the exact immutable plan by ID\n"
+            "        uses: actions/download-artifact@v4\n"
+            "        with:\n"
+            "          artifact-ids: ${{ needs.plan.outputs.artifact_id }}\n"
+            "          path: plan\n"
+            "          merge-multiple: true"
+        )
+        spoofed = (
+            "      - name: Download the exact immutable plan by ID\n"
+            "        uses: actions/download-artifact@v4\n"
+            "        env:\n"
+            "          merge-multiple: true\n"
+            "        with:\n"
+            "          artifact-ids: ${{ needs.plan.outputs.artifact_id }}\n"
+            "          path: plan"
+        )
+        self.assertEqual(original.count(download), 1)
+        mutant = original.replace(download, spoofed, 1)
+        self.assertIn(
+            "every artifact download must flatten into its declared path",
+            self.checker.validate(mutant),
+        )
 
     def test_hosted_packagers_resolve_their_runtime_dependencies(self) -> None:
         workflow = WORKFLOW.read_text(encoding="utf-8")

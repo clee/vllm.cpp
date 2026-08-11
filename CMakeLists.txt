@@ -9,7 +9,7 @@ list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_LIST_DIR}/cmake")
 include(InSourceGuard)
 vllm_cpp_forbid_in_source_build("${CMAKE_SOURCE_DIR}" "${CMAKE_BINARY_DIR}")
 
-project(vllm_cpp VERSION 0.0.1 LANGUAGES CXX)
+project(vllm_cpp VERSION 0.0.2 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -638,17 +638,21 @@ if(VLLM_CPP_CUDA)
   # Marlin NVFP4 W4A16 grouped-MoE GEMM drop-in (the 35B expert kernel). Vendored
   # torch-free slice of vLLM's moe/marlin_moe_wna16 under src/vt/cuda/marlin/
   # (marlin-dropin-feasibility.md). NO external dependency — the kernel is
-  # standalone CUDA + inline PTX. Enabled on sm_12xa (compiles to native sm_121
-  # SASS). The two vendored TUs + the vt launcher are isolated with their own
-  # compile options (see below); gated by VT_MARLIN_NVFP4.
-  option(VLLM_CPP_MARLIN "Build the vendored Marlin NVFP4 W4A16 MoE GEMM (sm_12xa)" ON)
+  # standalone CUDA + inline PTX. Enabled on whichever architectures the
+  # `marlin-nvfp4` FEATURE-TABLE cell resolves to — sm_12xa (native sm_121 SASS)
+  # and, since the Thor bring-up, sm_110. The arch set is DATA, so these strings
+  # report the resolved cell instead of hardcoding one architecture; the previous
+  # "sm_12xa"-only wording went stale the moment the cell gained a second arch.
+  # The two vendored TUs + the vt launcher are isolated with their own compile
+  # options (see below); gated by VT_MARLIN_NVFP4.
+  option(VLLM_CPP_MARLIN "Build the vendored Marlin NVFP4 W4A16 MoE GEMM (marlin-nvfp4 archs)" ON)
   if(VLLM_CPP_MARLIN AND VT_MARLIN_NVFP4_ARCHS
      AND EXISTS "${CMAKE_SOURCE_DIR}/src/vt/cuda/marlin/core/scalar_type.hpp")
     set(VLLM_CPP_MARLIN ON)
-    message(STATUS "Marlin NVFP4 W4A16 MoE GEMM enabled (vendored, sm_12xa)")
+    message(STATUS "Marlin NVFP4 W4A16 MoE GEMM enabled (vendored) for [${VT_MARLIN_NVFP4_ARCHS}]")
   else()
     set(VLLM_CPP_MARLIN OFF)
-    message(STATUS "Marlin NVFP4 MoE GEMM disabled (needs sm_12xa + vendored slice)")
+    message(STATUS "Marlin NVFP4 MoE GEMM disabled (needs a marlin-nvfp4 arch + vendored slice)")
   endif()
 endif()
 
@@ -669,6 +673,7 @@ add_library(vllm STATIC
   src/vllm/version.cpp
   src/vllm/sampling_params.cpp
   src/vllm/lora/punica_cpu.cpp
+  src/vllm/lora/layers.cpp
   src/vllm/config/scheduler.cpp
   src/vllm/config/device.cpp
   src/vllm/config/kv_transfer.cpp
@@ -719,6 +724,12 @@ add_library(vllm STATIC
   src/vllm/model_executor/models/laguna_device.cpp
   src/vllm/model_executor/models/laguna_shared_fp4.cpp
   src/vllm/model_executor/models/laguna.cpp
+  src/vllm/model_executor/models/muse_glimmer_registry.cpp
+  src/vllm/model_executor/models/muse_glimmer_weights.cpp
+  src/vllm/model_executor/models/muse_glimmer_gguf_weights.cpp
+  src/vllm/model_executor/models/muse_glimmer.cpp
+  src/vllm/model_executor/models/muse_glimmer_vision.cpp
+  src/vllm/model_executor/models/muse_glimmer_mm.cpp
   src/vllm/model_executor/models/kimi_k3_registry.cpp
   src/vllm/model_executor/models/kimi_k3_weights.cpp
   src/vllm/model_executor/models/kimi_k3.cpp
@@ -1009,6 +1020,8 @@ add_library(vllm STATIC
   src/vllm/entrypoints/openai/tool_parsers/minimax_m2.cpp
   src/vllm/entrypoints/openai/tool_parsers/gemma4.cpp
   src/vllm/entrypoints/openai/tool_parsers/seed_oss.cpp
+  src/vllm/entrypoints/openai/tool_parsers/muse_glimmer.cpp
+  src/vllm/entrypoints/openai/reasoning_parsers/muse_glimmer.cpp
   src/vllm/parser/engine/incremental_lexer.cpp
   src/vllm/parser/engine/token_id_scanner.cpp
   src/vllm/parser/engine/streaming_parser_engine.cpp
@@ -1312,6 +1325,12 @@ if(VLLM_CPP_HIP)
     src/vt/rocm/rocm_gemma4_expert_geglu.hip
     src/vt/rocm/rocm_fp8_channel_gemv.hip
     src/vt/rocm/rocm_moe_router.hip
+    src/vt/rocm/rocm_sample.hip
+    src/vt/rocm/rocm_gdn_state.hip
+    src/vt/rocm/rocm_gdn_conv.hip
+    src/vt/rocm/rocm_gdn_postconv.hip
+    src/vt/rocm/rocm_gdn_scan.hip
+    src/vt/rocm/rocm_gdn_fused.hip
     src/vt/rocm/rocm_ops.hip)
   if(VLLM_CPP_HIP_ARCHITECTURES)
     set_source_files_properties(
@@ -1326,6 +1345,12 @@ if(VLLM_CPP_HIP)
       src/vt/rocm/rocm_gemma4_expert_geglu.hip
       src/vt/rocm/rocm_fp8_channel_gemv.hip
       src/vt/rocm/rocm_moe_router.hip
+      src/vt/rocm/rocm_sample.hip
+      src/vt/rocm/rocm_gdn_state.hip
+      src/vt/rocm/rocm_gdn_conv.hip
+      src/vt/rocm/rocm_gdn_postconv.hip
+      src/vt/rocm/rocm_gdn_scan.hip
+      src/vt/rocm/rocm_gdn_fused.hip
       src/vt/rocm/rocm_ops.hip
       PROPERTIES HIP_ARCHITECTURES "${VLLM_CPP_HIP_ARCHITECTURES}")
   endif()
