@@ -948,10 +948,10 @@ int VllmServerMain(int argc, char** argv) {
     // file keeps exactly what an example may own: flag plumbing, the job
     // directory, and the ONE process spawn (ffmpeg, ratified 2026-08-03 — the
     // library builds the argv and spawns nothing). ────────────────────────────
-    std::shared_ptr<vllm::multimodal::MiniMaxH3VideoEngine> video_engine;
+    std::shared_ptr<vllm::multimodal::VideoEngine> video_engine;
     if (!args.video_dit.empty()) {
-      std::cerr << "server: loading MiniMax-H3 video checkpoints...\n";
-      vllm::multimodal::MiniMaxH3VideoModelParams vmp;
+      std::cerr << "server: loading video checkpoints...\n";
+      vllm::multimodal::VideoModelParams vmp;
       vmp.dit_path = args.video_dit;
       vmp.encoder_path = args.video_encoder;
       vmp.tokenizer_path = args.video_tokenizer;
@@ -960,12 +960,16 @@ int VllmServerMain(int argc, char** argv) {
       vmp.audio_vae_path = args.audio_vae;
       vmp.audio_vae_config_path = args.audio_vae_config;
       vmp.prompt_embeds_path = args.video_prompt_embeds;
-      vmp.partition = args.video_partition;
+      // The H3-specific partition rides in the generic extras (LTX-2.5 L1).
+      if (!args.video_partition.empty()) vmp.extras["partition"] = args.video_partition;
       vmp.device = args.video_device == "cuda" ? 1 : 0;
       vmp.dequant_bf16 = args.video_dequant_bf16 ? 1 : 0;
       vmp.encoder_max_layers = args.video_encoder_max_layers;
-      video_engine = vllm::multimodal::MiniMaxH3VideoEngine::Load(vmp);
-      std::cerr << "server: /v1/videos on (device=" << args.video_device
+      // The family is DETECTED from the checkpoint; no --video-family flag is
+      // invented here until a second family exists to disambiguate.
+      video_engine = vllm::multimodal::LoadVideoEngine(vmp);
+      std::cerr << "server: /v1/videos on (family=" << video_engine->family()
+                << ", device=" << args.video_device
                 << (args.video_dequant_bf16 ? ", dequant-bf16" : ", keep-quant") << ")\n";
       // HONEST LIMIT, stated at startup rather than buried: turning a PROMPT
       // into conditioning needs the H3-Encoder; without one every request is
@@ -989,8 +993,8 @@ int VllmServerMain(int argc, char** argv) {
         const std::string dir = workdir + "/job" + std::to_string(id);
         // The library-owned request mapping + generation: conditioning, task
         // resolution, the #77 partition guard, reference encoding, artifacts.
-        const vllm::multimodal::MiniMaxH3VideoResult out = video_engine->Generate(
-            vllm::multimodal::MiniMaxH3VideoGenParamsFromRequest(req, dir));
+        const vllm::multimodal::VideoResult out =
+            video_engine->Generate(vllm::multimodal::VideoGenParamsFromRequest(req, dir));
         // The ONE process spawn: exec the argv the library composed.
         std::vector<std::string> argv_mux = out.mux_argv;
         if (!argv_mux.empty()) argv_mux[0] = ffmpeg;
