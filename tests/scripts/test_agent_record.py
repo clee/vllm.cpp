@@ -478,5 +478,44 @@ class PerClaimFileSource(unittest.TestCase):
             probe.unlink()
 
 
+class ForgeCoauthorRowIsCounted(unittest.TestCase):
+    """The ENGINE_ROWS bump for ENG-FORGE-COAUTHOR is backed by a real row (#418).
+
+    The pin is re-pinned by hand, so a bump with no row behind it looks exactly
+    like a bump for a new row. This ties this specific bump to this specific
+    row: the row must exist, and removing it must break the pin.
+    """
+
+    ROW = "ENG-FORGE-COAUTHOR"
+
+    def test_the_row_exists_in_the_engine_matrix(self) -> None:
+        text = (ROOT / ".agents/engine-matrix.md").read_text(encoding="utf-8")
+        matching = [
+            line for line in text.splitlines() if line.startswith(f"| `{self.ROW}` |")
+        ]
+        self.assertEqual(len(matching), 1, f"{self.ROW} must appear exactly once")
+
+    def test_removing_the_row_breaks_the_pin(self) -> None:
+        """MUTATION: the bump is load-bearing for THIS row, not decorative.
+
+        Dropping the row from the parsed matrix must make the count disagree
+        with ENGINE_ROWS, which is what stops the constant being raised to
+        silence an unrelated failure.
+        """
+        clean: list[str] = []
+        agent_record.check_matrices(clean)
+        self.assertEqual([e for e in clean if "engine rows" in e], [])
+
+        errors: list[str] = []
+        with mock.patch.object(
+            agent_record, "ENGINE_ROWS", agent_record.ENGINE_ROWS - 1
+        ):
+            agent_record.check_matrices(errors)
+        self.assertTrue(
+            any("engine rows" in e for e in errors),
+            "the pin must disagree when the count moves by one",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
