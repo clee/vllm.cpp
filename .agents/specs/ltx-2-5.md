@@ -127,6 +127,62 @@ cached and recomputed paths are **bit-identical**, so the cache cannot silently 
 | Video decode | ViT3D | Conv VAE **or** DiffVAE (neighborhood attn) |
 | Extras | — | latent spatial/temporal x2 upsamplers, duration head |
 
+### 1.4 Text conditioning is a MULTI-LAYER aggregate, not the last hidden state
+
+Recorded 2026-08-11 while briefing L3, from the real TE checkpoint
+(`vonkaiser` `gemma4-12b-with-proj-nvfp4-torchao.safetensors`, 1688 tensors) read against
+`text_encoders/gemma/feature_extractor.py`.
+
+`feature_extractor.py` takes hidden states shaped `[batch, seq_len, hidden_dim, num_layers]`,
+normalizes them, and concatenates **across the LAYER dimension** to
+`[batch, seq_len, hidden_dim * num_layers]`. The checkpoint confirms it: the two projections
+take **94080** input features, and 94080 = 1920 x 49 — the model's 1920-wide per-layer state
+across its 48 layers plus one.
+
+| Tensor | Shape |
+|---|---|
+| `text_embedding_projection.video_aggregate_embed.weight` / `.bias` | [4096, 94080] / [4096] |
+| `text_embedding_projection.audio_aggregate_embed.weight` / `.bias` | [2048, 94080] / [2048] |
+
+There are at least TWO normalization variants and the right one is selected from config, never
+guessed: `_norm_and_concat_padded_batch` (per-batch, per-layer masked mean and range, an `8 *`
+scale, `eps = 1e-6`) and `norm_and_concat_per_token_rms` (per-token RMS, "for V2 models"). Both
+are padding-side agnostic and ZERO padded positions.
+
+**Why this is a trap and not a detail:** getting the variant, the mask handling, the reduction
+axes or the layer order wrong yields conditioning that is finite, correctly shaped and WRONG.
+It renders a plausible video for the wrong prompt, which no shape or finiteness check catches.
+L3 gates the variant selection explicitly.
+
+Two further facts the loader must respect, both measured:
+
+- **The tokenizer is embedded AS A TENSOR** — `tokenizer_json` U8 [32,169,626] (~32 MB), plus
+  `hf_asset__{chat_template,generation_config,processor_config,tokenizer_config}`. A loader that
+  assumes a sibling `tokenizer.json` file fails on this checkpoint.
+- **The TE quantization is torchao NVFP4, NOT compressed-tensors.** `weight` U8 packed,
+  `weight_scale` F8_E4M3 grouped, `weight_scale_2` F32 scalar, plus a `torchao_nvfp4` U8 [240]
+  marker per quantized module. H3's NVFP4 arm is compressed-tensors, so the layouts must be
+  verified before any reuse rather than assumed equal (L6).
+
+The checkpoint also carries the FULL multimodal Gemma-4 (`vision_model.*`,
+`multi_modal_projector`, `audio_projector`); text-only conditioning is the scope, but the loader
+must not choke on their presence.
+
+### 1.5 The audio VAE is NOT end-to-end causal
+
+Recorded 2026-08-12 from L4, which measured it rather than assuming it: its first causality
+probes FAILED, and upstream agreed with the failure.
+
+`causality_axis` governs the audio decoder's **convolutions**, but its `AttnBlock`s attend over
+the whole (time, mel) map, so a last-frame perturbation reaches every output frame. The Conv
+video decoder is not end-to-end causal either, for a different reason: `res_x_y`'s shortcut norm
+is a one-group GroupNorm over (C,T,H,W) whose statistics span time.
+
+This matters because "causal" is exactly the kind of property a port assumes and never checks.
+Both are now gated in two parts: the shipped config asserts the GLOBAL reach, and a stripped
+config isolates the convolution-only reach, with upstream itself supplying the expected windows
+([5,8] audio, [3,4] video).
+
 ## 2. Scope
 
 **In:** the DiT forward (both streams, gated attention, AV cross-attention, split and
