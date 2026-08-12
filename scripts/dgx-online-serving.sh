@@ -553,18 +553,31 @@ run_startup_leg() {
   echo "startup ${model}/${engine}/r${repetition}: ${elapsed}s" >&2
 }
 
+# Stop the clock sampler and REQUIRE it to have written its record. A leg whose
+# clock was not captured is not a leg with an unknown clock -- it is a number
+# that cannot be attributed to a box state, and online_gate_summary.py voids it.
+stop_clock_sampler() {
+  local pid=$1
+  [[ -n ${pid} ]] || return 0
+  kill -TERM "${pid}" 2>/dev/null || true
+  wait "${pid}"
+}
+
 run_leg() {
   local engine=$1 repetition=$2
   local baseline final idle_ok=0
   local memory_dir="${evidence}/memory/${model}/${engine}"
   local thermal_dir="${evidence}/thermal/${model}/${engine}"
+  local clock_dir="${evidence}/clocks/${model}/${engine}"
   local return_dir="${evidence}/memory-return/${model}/${engine}"
   local cache_dir="${evidence}/cache-drop/${model}/${engine}"
   local preflight_dir="${evidence}/preflight/${model}/${engine}"
   local before_cache="${cache_dir}/r${repetition}-before.json"
   local after_cache="${cache_dir}/r${repetition}-after.json"
+  local clock_pid=""
   mkdir -p \
-    "${memory_dir}" "${thermal_dir}" "${return_dir}" "${cache_dir}" "${preflight_dir}"
+    "${memory_dir}" "${thermal_dir}" "${clock_dir}" "${return_dir}" "${cache_dir}" \
+    "${preflight_dir}"
 
   gpu_idle || { echo "GPU is not idle before ${model}/${engine}/r${repetition}" >&2; return 1; }
   drop_caches "${before_cache}"
@@ -584,10 +597,24 @@ run_leg() {
   # online_gate.points_for so the summary never flags a missing result group.
   local concurrency_points="1 2 4 8 16 32"
   [[ ${model} == q3mxfp4 ]] && concurrency_points="1 2 4 8"
+  # The SM clock the TIMED window actually ran at (#543). The clock differs
+  # between boots on this box without throttling, and a 12.79% delta repriced a
+  # byte-identical kernel by 9.65% -- larger than the deficits it was used to
+  # rank. Sampling starts after the preflight stream so the window is the timed
+  # grid's rather than the server's warm-up, and stops before the after-thermal
+  # snapshot. One probe per second, launched identically on both arms, so its
+  # cost cancels in the ratio exactly as the memory sampler's does.
+  python3 "${repo_root}/tools/bench/gpu_clock_state.py" sample \
+    --output "${clock_dir}/r${repetition}.samples.jsonl" \
+    --summary "${clock_dir}/r${repetition}.summary.json" \
+    --interval 1 &
+  clock_pid=$!
+
   local concurrency
   for concurrency in ${concurrency_points}; do
     kill -0 "${spid}" 2>/dev/null || {
       echo "server died before c${concurrency}" >&2
+      stop_clock_sampler "${clock_pid}" || true
       return 1
     }
     python3 "${repo_root}/tools/bench/online_gate.py" bench \
@@ -600,6 +627,11 @@ run_leg() {
       --concurrency "${concurrency}" \
       --repetition "${repetition}"
   done
+  stop_clock_sampler "${clock_pid}" || {
+    echo "SM-clock sampler failed for ${model}/${engine}/r${repetition}" >&2
+    cleanup_server
+    return 1
+  }
   nvidia-smi -q -d TEMPERATURE,POWER >"${thermal_dir}/r${repetition}-after.txt"
   cleanup_server
 
