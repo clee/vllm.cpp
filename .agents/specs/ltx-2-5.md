@@ -336,6 +336,51 @@ therefore N/A so far rather than satisfied, and saying so is the point.
 only. This spec inherits H3's open gap (model-matrix, H3 row: *"OPEN: there is no vllm-omni
 parity PIN"*) and records the vllm-omni SHA used for every golden inline with that golden.
 
+## 3.1 The two DiTs are NOT interchangeable quantizations of the same weights
+
+Recorded 2026-08-12, after the developer accepted the HF licence and the first-party weights
+downloaded. All six files verified: declared payload equals file size exactly, 23.01 GB total.
+
+The ungated `vonkaiser` **FP8** DiT and Lightricks' first-party **NVFP4** DiT are both
+"ltx-2.5-22b-distilled-transformer", and every phase before L6 gated against the FP8 copy
+alone. They agree on 4348 of 4349 non-scale tensor names — and disagree on one:
+
+| Family | FP8 | NVFP4 |
+|---|---|---|
+| `prompt_adaln_single` | 12 | 12 |
+| `audio_prompt_adaln_single` | 6 | 6 |
+| `video_embeddings_connector` | 129 | 129 |
+| `audio_embeddings_connector` | 129 | 129 |
+| **`keyframes_abs_pos_embedding`** | **1** | **0** |
+
+`model.py:216-219` builds it only when `use_keyframes_abs_pos_embedding` is set, and its
+comment reads: *"Marks tokens whose latent encodes a single standalone pixel frame.
+Zero-initialized, so a checkpoint that predates it behaves identically until the parameter is
+trained."*
+
+**It is trained in the FP8 checkpoint.** Read directly: `F8_E4M3 [1, 4096]`, byte values
+spread across `[24, 35, 39, 41, 42, 44, 45, 46, ...]`, with a real
+`keyframes_abs_pos_embedding_scale` of `7.68899917602539e-06`. Not zeros.
+
+So the upstream escape hatch — "behaves identically until trained" — **does not apply here**.
+The two files differ in a TRAINED parameter that marks single-standalone-frame latents. On any
+request that uses keyframe conditioning they are different models, not two precisions of one.
+
+Consequences, and none of them are optional:
+
+- **A parity number measured on one does not transfer to the other.** Everything gated so far
+  used the FP8 copy.
+- **L7 must state which DiT produced each artifact**, every time.
+- **L6's by-name refusal fires on FP8 and not on NVFP4**, because the family is simply absent
+  there. That is correct behaviour in both cases, but it means the two arms take different
+  paths, and a test that passes on one proves nothing about the other.
+- Quantization coverage differs too: FP8 carries 1775 `F8_E4M3` quantized tensors; NVFP4
+  carries 1176 `U8` + 1176 `F8_E4M3` group scales, so **fewer modules are quantized**.
+
+Checked because §1.2's retraction came from reading the shipped checkpoint and finding it
+contradicted the spec. The same question asked of the second checkpoint found a second
+difference. Ask it of every new artifact.
+
 ## 4. Checkpoint access and placement
 
 Verified against the HF API on 2026-08-11 with the session token:
