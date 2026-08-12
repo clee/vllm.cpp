@@ -6,7 +6,8 @@ Issues:
 [#499](https://github.com/mudler/vllm.cpp/issues/499) and
 [#500](https://github.com/mudler/vllm.cpp/issues/500), with post-merge follow-up
 [#512](https://github.com/mudler/vllm.cpp/issues/512) and
-[#514](https://github.com/mudler/vllm.cpp/issues/514)
+[#514](https://github.com/mudler/vllm.cpp/issues/514), and hosted-contract follow-up
+[#525](https://github.com/mudler/vllm.cpp/issues/525)
 
 Parent specifications:
 [release-binary-matrix.md](release-binary-matrix.md) and
@@ -380,3 +381,39 @@ compilation remain the required external Windows PR gates. The full unstaged
 repository preflight passed every gate except one transient tempfile failure in
 `test_check_release_binary_contract`; an immediate isolated retry of that exact
 suite passed all 30 tests.
+
+### Hosted contract follow-up: issue #525
+
+PR #524 candidate `a4d61bbddbc1a0aa744aea72c1cff3c4ed165a72`
+executed the new #512 contract on both hosted Windows lanes. CPU job
+`94242642198` and Vulkan job `94242642222` both accepted the explicit empty
+argument array, then failed at the exact non-empty record comparison with
+`nonempty arguments did not arrive unchanged`. Both stopped in
+`build-windows-release.ps1 -ContractTest` before configuration. The shared
+diagnostic isolates the failure to the contract harness's temporary `.cmd`
+argument recorder; it does not reopen the original empty-array binding defect
+or establish a product build failure.
+
+The #525 repair replaces only the batch recorder with a native PowerShell
+target whose parameter declaration accepts all remaining arguments and writes
+a structured exact record. The real `Invoke-Checked` function must still invoke
+that target for both the explicit empty array and the three literals `alpha`,
+`two words`, and `--flag=value`. The exit-23 target and rejection assertion
+remain live. Do not weaken an equality, normalize values, remove a behavior,
+or infer a hosted pass from structural Linux coverage.
+
+RED-first coverage must reject the current `.cmd` recorder and require the
+PowerShell recorder's remaining-arguments binding plus a structured exact
+empty/non-empty record. Mutations that remove the remaining-arguments binding,
+drop `two words`, bypass the real helper, or accept the nonzero child must make
+the focused contract red. Focused green remains Windows metadata, release
+pipeline, both direct Windows checkers, and full preflight. Hosted acceptance
+requires both native Windows PR jobs to execute the complete contract and
+continue into their MSVC build/runtime/archive gates.
+
+After #525 is integrated, current `origin/main` must be merged into the task
+branch before the operator gate and plain push so the PR-size checker receives
+an ancestor base. The HTTP 503 downloading glslang in job `94242642545` is an
+external retry condition, not authorization to change the freshness gate. No
+tag is authorized until PR #524 merges and a new exact-merged-SHA dry run has
+all ten tuples plus aggregate handoff and verify green.
