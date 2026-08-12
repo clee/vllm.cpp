@@ -1766,27 +1766,67 @@ TEST_CASE("capi v18: an EXPLICIT family selector loads, an unregistered one is r
 
   // An unregistered name is REFUSED naming what is registered — never treated
   // as a hint and never detected around.
+  //
+  // THE NAME MUST BE ONE THAT CANNOT BECOME REGISTERED. This case was written at
+  // L1 against "ltx-2.5" while H3 was the only family, and phase L7 registered
+  // exactly that name: the load then resolved to the LTX loader, which failed on
+  // an H3 fixture, so the unregistered-family branch under test was never taken
+  // at all. Note how it failed — the "ltx-2.5" assertion kept PASSING the whole
+  // time, matching the LTX loader's own failure text rather than a registry
+  // listing. A test whose premise can expire is a test that goes green for the
+  // wrong reason first and red second. Its C++-seam twin
+  // (test_video_engine.cpp, "an unknown family names what was asked and what
+  // exists") was repaired at L7; this C-ABI copy was missed because the phase
+  // baselines ran `test_capi -tc='capi v12*'` and never executed the v18 section.
   VideoFixtureParams unknown(ws.fixture);
-  unknown.mp.family = "ltx-2.5";
+  unknown.mp.family = "not-a-video-family";
   eng = reinterpret_cast<vllm_video_engine*>(0x1);
   CHECK(vllm_video_engine_load(&unknown.mp, &eng) == VLLM_ERR_MODEL_LOAD);
   CHECK(eng == nullptr);
-  CHECK(std::string(vllm_last_error()).find("ltx-2.5") != std::string::npos);
-  CHECK(std::string(vllm_last_error()).find("minimax-h3") != std::string::npos);
+  const std::string refusal = vllm_last_error();
+  INFO("refusal: ", refusal);
+  CHECK(refusal.find("not-a-video-family") != std::string::npos);
+  // Pin the BRANCH, not just the words in it. Without this the case cannot tell
+  // "the registry refused an unregistered name" from "a family loader was
+  // reached and threw", which is precisely the confusion that let the premise
+  // above rot undetected: a name that quietly becomes registered now fails here,
+  // naming the reason, instead of passing on a loader's error text.
+  CHECK(refusal.find("no family named") != std::string::npos);
+  // EVERY registered family is listed, not just the first. That is a stronger
+  // guarantee than this case could state at L1 with one family registered: a
+  // refusal is how a caller learns what it could have asked for instead, so one
+  // that named only some of the registry would send them away from a family that
+  // would have loaded their checkpoint.
+  CHECK(refusal.find("minimax-h3") != std::string::npos);
+  CHECK(refusal.find("ltx-2.5") != std::string::npos);
 }
 
-TEST_CASE("capi v18: an unrecognizable checkpoint is refused, not handed to the only family") {
+TEST_CASE("capi v18: an unrecognizable checkpoint is refused, and no family is guessed") {
   VideoFoldWorkspace ws;
-  // A real safetensors file that is a VAE, not a DiT. With one family
-  // registered, "there is only one, so it must be that one" would load it.
+  // A real safetensors file that is a VAE, not a DiT: readable, well-formed, and
+  // carrying no family's DiT signature, so ZERO detectors claim it.
+  //
+  // This case read "not handed to the ONLY family" at L1, when H3 was the sole
+  // registrant and the hazard was the "there is only one, so it must be that
+  // one" fallback. Phase L7 registered a second family, which makes that exact
+  // fallback unreachable in this binary — so the old title now overstates what
+  // the case can prove. What it still gates, and what it is renamed to state, is
+  // the zero-claimant refusal itself: nothing is loaded, and the message carries
+  // both halves a caller needs — the artifact that was inspected and the whole
+  // registry it failed to match.
   const std::string not_a_dit = ws.fixture + "/video_vae.safetensors";
   vllm_video_model_params mp = vllm_video_model_params_default();
   mp.dit_path = not_a_dit.c_str();
   vllm_video_engine* eng = reinterpret_cast<vllm_video_engine*>(0x1);
   CHECK(vllm_video_engine_load(&mp, &eng) == VLLM_ERR_MODEL_LOAD);
   CHECK(eng == nullptr);
-  CHECK(std::string(vllm_last_error()).find("video_vae.safetensors") != std::string::npos);
-  CHECK(std::string(vllm_last_error()).find("minimax-h3") != std::string::npos);
+  const std::string refusal = vllm_last_error();
+  INFO("refusal: ", refusal);
+  CHECK(refusal.find("video_vae.safetensors") != std::string::npos);
+  // Both registered families, for the same reason as the case above: the listing
+  // is the caller's only route out of the refusal.
+  CHECK(refusal.find("minimax-h3") != std::string::npos);
+  CHECK(refusal.find("ltx-2.5") != std::string::npos);
 }
 
 TEST_CASE("capi v18: the extras arrays carry the family knob, and disagreement is refused") {
