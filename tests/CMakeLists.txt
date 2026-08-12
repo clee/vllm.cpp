@@ -58,6 +58,14 @@ vllm_cpp_add_test(test_minimax_h3 vllm/models/test_minimax_h3.cpp)
 vllm_cpp_add_test(test_minimax_h3_video_fold vllm/models/test_minimax_h3_video_fold.cpp)
 target_compile_definitions(test_minimax_h3_video_fold PRIVATE
   MINIMAX_H3_VIDEO_FOLD_FIXTURE_DIR="${CMAKE_SOURCE_DIR}/tests/vllm/models/fixtures/minimax_h3_video_fold")
+# LTX-2.5 L1: the GENERALIZED VideoEngine seam + its family registry, held to
+# the SAME pre-fold goldens through the abstract path (and to the never-guess
+# refusals). Needs the fold fixture builder, which lives beside the H3 test.
+vllm_cpp_add_test(test_video_engine vllm/multimodal/test_video_engine.cpp)
+target_include_directories(test_video_engine PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
+target_compile_definitions(test_video_engine PRIVATE
+  MINIMAX_H3_VIDEO_FOLD_FIXTURE_DIR="${CMAKE_SOURCE_DIR}/tests/vllm/models/fixtures/minimax_h3_video_fold")
 vllm_cpp_add_test(test_video_api vllm/entrypoints/openai/test_video_api.cpp)
 target_include_directories(test_model_registry PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_platform vllm/platforms/test_platform.cpp)

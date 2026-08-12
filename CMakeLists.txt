@@ -852,6 +852,10 @@ add_library(vllm STATIC
   # server's private /v1/videos twin. Builds artifacts + the ffmpeg argv and
   # SPAWNS NOTHING (the ratified process boundary).
   src/vllm/multimodal/minimax_h3_video.cpp
+  # The GENERALIZED video seam (vllm::multimodal::VideoEngine) + its
+  # checkpoint-detected family registry — LTX-2.5 L1, .agents/specs/ltx-2-5.md
+  # §5. Knows about no family; each family self-registers from its own TU.
+  src/vllm/multimodal/video_engine.cpp
   src/vllm/v1/core/encoder_cache_manager.cpp
   src/vllm/tokenizer/unicode_data.cpp
   src/vllm/tokenizer/pretokenizer.cpp
