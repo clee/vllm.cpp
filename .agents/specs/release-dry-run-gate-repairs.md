@@ -6,8 +6,9 @@ Issues:
 [#499](https://github.com/mudler/vllm.cpp/issues/499) and
 [#500](https://github.com/mudler/vllm.cpp/issues/500), with post-merge follow-up
 [#512](https://github.com/mudler/vllm.cpp/issues/512) and
-[#514](https://github.com/mudler/vllm.cpp/issues/514), and hosted-contract follow-up
-[#525](https://github.com/mudler/vllm.cpp/issues/525)
+[#514](https://github.com/mudler/vllm.cpp/issues/514), hosted-contract follow-up
+[#525](https://github.com/mudler/vllm.cpp/issues/525), and native socket-runtime
+follow-up [#537](https://github.com/mudler/vllm.cpp/issues/537)
 
 Parent specifications:
 [release-binary-matrix.md](release-binary-matrix.md) and
@@ -16,10 +17,10 @@ Parent specifications:
 Related native compiler contract:
 [windows-msvc-strict-build.md](windows-msvc-strict-build.md)
 
-Status: `READY`. The developer approved this bounded design on 2026-08-12. It
+Status: `ACTIVE`. The developer approved this bounded design on 2026-08-12. It
 starts from exact main commit `e1087a8812c9b7d96fca5a813981f378fcace638`
-after PR #446 merged. Implementation, a fresh review, the operator gate, and a
-new non-publishing ten-tuple dry run remain required.
+after PR #446 merged. The #537 implementation, a fresh review, the operator
+gate, and a new non-publishing ten-tuple dry run remain required.
 
 ## Scope
 
@@ -434,3 +435,66 @@ The Windows metadata and release pipeline suites passed 50/50, followed by the
 direct Windows portability and release-binary checkers and the full unstaged
 repository preflight. The local host has no PowerShell runtime, so native
 execution remains a required hosted Windows gate.
+
+### Native socket-runtime follow-up: issue #537
+
+PR #524 candidate `d47d8408ab4dc2639e47ddfc7c7a997fa45d9981`
+executed the complete #525 PowerShell contract successfully on hosted Windows.
+CPU job
+[`94265239385`](https://github.com/mudler/vllm.cpp/actions/runs/31641616323/job/94265239385)
+then built `test_openai_api_server.exe` under unchanged `/W4 /WX`, served the
+final request in the first real-socket smoke test, and terminated with signed
+status `-1073740791` (`0xC0000409`) before doctest printed an assertion or
+summary.
+
+The failure has two independently grounded causes. First, vendored
+cpp-httplib v0.49.0 ends `process_and_close_socket` with an immediate
+shutdown/close. Upstream commit `8e702d3837b2164765ca1d98cb6d180ae4711e70`
+records that on Windows this can send an abortive RST when bytes are still in
+flight, making a fully written response appear to the client as a failed read.
+Its accepted repair half-closes the write side, drains at most 100 ms or 1 MiB,
+then performs final shutdown/close. Second, each local real-socket test owns a
+raw joinable `std::thread`, contains aborting `REQUIRE` assertions after that
+thread starts, and stops/joins only on the normal path. When a Windows client
+read is reset, doctest unwinds through the joinable thread and `std::terminate`
+turns the useful assertion into the observed process-wide fast-fail. Upstream
+commit `ae8356d86eabfd3ad4a969b55266fb3ecc2aa834` documents and repairs that exact
+test-lifetime pattern with scoped teardown.
+
+The #537 implementation is limited to both complete repairs. Backport the
+upstream accepted-socket drain helper and its single production call site with
+the upstream 100 ms and 1 MiB bounds unchanged. Add one test-local scoped
+server-thread owner and route every real-socket OpenAI test through it so
+server stop and thread join happen both normally and while an assertion
+unwinds. Preserve every existing request, status, body, concurrency, capacity,
+route-gating, and shutdown assertion. Do not skip the Windows runtime target,
+weaken `REQUIRE`, catch and discard a test failure, lengthen a timeout, detach a
+thread, change release topology, or vendor unrelated upstream cpp-httplib
+changes.
+
+RED-first evidence must demonstrate both defects against the pinned candidate.
+A focused behavioral test must make the accepted-socket peer leave unread
+request data and prove the old immediate close presents as a reset/failure on
+Windows while the bounded drain preserves the completed response. A separate
+test must intentionally fail after a server thread starts and prove scoped
+teardown lets doctest report the assertion instead of terminating the process.
+Structural coverage over the real vendored header and socket tests supplements,
+but does not replace, those native behaviors. Mutations that restore the old
+immediate accepted-socket close, remove either drain bound, or remove the scoped
+stop/join path must make the focused gates red, with the tree restored
+byte-for-byte afterwards.
+
+Focused green requires the OpenAI API server test, the cpp-httplib regression
+test, the Windows release metadata/pipeline contracts, both direct Windows
+checkers, and full unstaged/staged/post-commit preflight. Hosted acceptance
+requires both Windows CPU and Vulkan lanes to execute the full OpenAI API test,
+all other PR jobs to pass at one immutable head, and a fresh reviewer to mutate
+both guarantees. After merge, the exact merged SHA must pass all ten release
+tuples plus aggregate build and verify before `v0.0.3-pre.1` is tagged. The tag
+run must then pass all 15 required jobs and the authenticated audit over exactly
+32 assets.
+
+Stop with `NEEDS_DECISION` if the bounded upstream backport changes the public
+HTTP API, broadens beyond accepted-socket close, or requires any release-gate
+waiver. Stop with `NEEDS_CONTEXT` if Vulkan reports a different native failure;
+file and specify that defect separately rather than folding it into #537.
