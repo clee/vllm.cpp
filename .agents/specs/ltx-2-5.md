@@ -435,6 +435,57 @@ Owed: decide whether our fallbacks should follow `ltx_core`'s (a faithful port o
 reference) or LTX-2.5's declared values (what both references actually run). That is a product
 decision, not a porting one, and it wants its own row.
 
+## 4.1 The first-party NVFP4 DiT is SWIZZLED and HIGH-NIBBLE-FIRST
+
+Recorded 2026-08-13 by L9a, which was told the file was linear, measured instead of building,
+and returned `NEEDS_DECISION`. **The shape cannot discriminate here, and that is the trap.**
+
+For every quantized layer in that file `N % 128 == 0` and `(K/16) % 4 == 0`, so the linear
+shape `[N, K/16]` and the cuBLAS-padded swizzled shape
+`[round_up(N,128), round_up(K/16,4)]` are **the same numbers** — `[4096, 256]` for
+`attn1.to_q`. Our code knew only the OTHER 2-D framing of those same bytes, `to_blocked`'s
+`[32*ceil(N/128), 16*ceil(G/4)]` = `[1024, 1024]`. All three describe one set of 1,048,576
+swizzled bytes. A shape test alone can never separate them.
+
+**The discriminating measurement.** The `vonkaiser` FP8 DiT quantizes the SAME base weights, so
+it is an independent oracle. Dequantizing one module from both files, rows 0-127:
+
+| reading of the NVFP4 scale | rms | corr vs FP8 | rel rms err |
+|---|---|---|---|
+| LINEAR / lo-nibble-first (what the brief asked for) | 0.013564 | **0.000414** | 1.786 |
+| LINEAR / hi-nibble-first | 0.013564 | 0.257746 | 1.558 |
+| SWIZZLED / lo-nibble-first (our current dequant) | 0.009208 | 0.032296 | 1.394 |
+| **SWIZZLED / hi-nibble-first** | **0.009208** | **0.995560** | **0.0946** |
+
+FP8 oracle rms 0.009167; swizzled/hi-first matches to 0.4%, linear is 48% high. The 9.46%
+relative rms IS NVFP4 4-bit quantization error. Confirmed on 5 modules across 4 distinct
+shapes, corr 0.9952-0.9956. **Control**: the same NVFP4 read against OTHER modules' FP8 weights
+gives corr +0.021, +0.005, +0.002, +0.001 — so 0.9956 is signal, not method artifact.
+
+**Independently confirmed in the model author's own runtime**, which is what loads this
+checkpoint family: `ltx-core/quantization/nvfp4/linear.py:6-7` ("element 2j in the **high
+nibble**"; "E4M3 block scales … **cuBLAS 128x4 tiled layout**"), `ltx-kernels/csrc/nvfp4/
+quantize.cu:26-31` (`swizzled_offset`, `padded_cols == roundup(K/16,4)`),
+`ltx-kernels/docs/NVFP4.md:27-29` ("expected in the default (`hi_first=True`) order").
+
+**Two things this leaves.** `Ltx2UnswizzleNvfp4BlockScale` is already correct and framing-
+agnostic — only the shape assertion in `Ltx2DequantTorchaoNvfp4ToBf16` hard-codes the
+`to_blocked` framing. But `DequantNvfp4ToBf16` is low-nibble-first and this file is
+high-first: **a different byte ENCODING, not a different scale indexing**, in a header shared
+with the H3 and Laguna NVFP4 paths. That is why L9a stopped rather than reaching into it.
+
+### 4.2 An open question about work already shipped
+
+The torchao NVFP4 **text encoder** arm reads nibbles low-first, and its gate compares against
+goldens produced by **our own low-first helper** — the generator's header even notes its e2m1
+LUT is not torch-decoded. So the TE's nibble order has never been checked against an
+independent oracle. This is exactly the failure this project has recorded before: *a gate
+comparing two arms through the same helper proves consistency, not correctness.*
+
+The DiT result does not transfer — different producer (torchao vs Lightricks `nvfp4-prequant`)
+— and no second Gemma-4 checkpoint exists on the NAS to serve as an oracle. **torchao's own
+source is public and defines the packing**, and that is the cross-check owed.
+
 ## 4. Checkpoint access and placement
 
 Verified against the HF API on 2026-08-11 with the session token:
@@ -458,8 +509,15 @@ dgx.casa and the cluster nodes mount one copy rather than each pulling 30 GB.
 | Latent spatial upsampler x2, bf16 | `Lightricks/LTX-2.5` | 1.00 GB |
 | | | **~29 GB** |
 
-**CORRECTION, 2026-08-12 — the DiT in that table does NOT load.** L8 tried it and the loader
-refuses by name, before any forward:
+> **RETRACTION, 2026-08-13 — the diagnosis below is WRONG, and it was the operator's.** The
+> correction that follows said the first-party NVFP4 DiT stores `weight_scale` in the LINEAR
+> `[N, K/16]` layout. **It does not. It is SWIZZLED, and it additionally uses the OPPOSITE
+> NIBBLE ORDER from our dequant.** Phase L9a was dispatched to build a linear arm on that
+> premise, measured it first, and stopped without implementing — building it would have made
+> the file LOAD and render silently wrong output. See §4.1.
+
+**SUPERSEDED CORRECTION, 2026-08-12 — the DiT in that table does NOT load.** L8 tried it and
+the loader refuses by name, before any forward:
 
 > `'transformer_blocks.0.attn1.to_q.weight_scale' is [4096, 256] but a SWIZZLED torchao scale
 > for [4096, 4096] is stored as [1024, 1024]. The LINEAR shape [4096, 256] has the same element
