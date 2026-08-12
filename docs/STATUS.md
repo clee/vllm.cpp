@@ -635,6 +635,32 @@ oracle-blocked for a gate (see the capability table above).
 
 ### Frontier and hardware-blocked families
 
+**Qwen3.5 text-only arms (`Qwen3_5ForCausalLM`, `Qwen3_5MoeForCausalLM`) —
+REGISTERED 2026-08-12, RUN GATE OWED (#490).** An ahead-of-pin forward port of
+upstream PR vllm#50210 (`ad5d29db7`), which registers both arms against the same
+`qwen3_5` module our gated `ForConditionalGeneration` wrappers already use. Two
+additive `REGISTER_VLLM_MODEL` lines against the EXISTING dense and MoE
+factories: no forward, no KV-cache spec, no loader fork.
+
+The other half is ONE backbone weight-namespace decision per checkpoint:
+`model.` for a text-only arm, `model.language_model.` for the wrappers, and a
+MIXED index refused rather than half-bound. `Qwen/Qwen3.8-2.4T-A95B` declares
+`Qwen3_5MoeForCausalLM` / `qwen3_5_moe_text` and is the token-exact
+Qwen3.6-35B-A3B GDN-hybrid MoE backbone at larger scale, every knob
+config-driven, with weight names identical modulo that prefix.
+
+What is claimed is dispatch, flat-config resolution and namespace resolution,
+gated by `tests/vllm/models/test_qwen3_8_text_only.cpp` (5/5, 124 assertions)
+with 27B/35B/Coder inert and parity goldens md5-unchanged. **What is NOT claimed
+is a single generated token.** 2.4T bf16 is ~4.8 TB and the released FP8 variant
+~2.4 TB against 128 GB of unified memory, and no smaller Qwen3.8 sibling exists,
+so there is no token-exact oracle run and no speed number.
+
+Both rows therefore stay `PARTIAL`. The owed run gate closes only when a
+text-only `Qwen3_5[Moe]ForCausalLM` checkpoint that fits GB10 appears. MTP,
+quantized and GGUF arms for 3.8 are NOT implemented and are recorded as owed.
+This does not advance the parity pin.
+
 Larger DeepSeek / GLM / MiniMax / Gemma-4 variants are recorded as
 **hardware-blocked** (they do not fit 119 GiB of unified memory on this box) or
 **spiked-only**, per the [model matrix](../.agents/model-matrix.md).

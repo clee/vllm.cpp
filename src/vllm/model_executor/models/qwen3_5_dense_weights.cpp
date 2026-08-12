@@ -624,12 +624,12 @@ OwnedTensor MaterializeCtNvfp4Bf16Transposed(const TensorResolver& get,
   return o;
 }
 
-Qwen3_5DenseLayerWeights LoadQwen3_5DenseLayer(const TensorResolver& get,
-                                               const TensorExists& has,
-                                               const std::string& layer_type,
-                                               int64_t layer_idx) {
+Qwen3_5DenseLayerWeights LoadQwen3_5DenseLayer(
+    const TensorResolver& get, const TensorExists& has,
+    const std::string& layer_type, int64_t layer_idx,
+    const std::string& backbone_prefix) {
   const std::string base =
-      "model.language_model.layers." + std::to_string(layer_idx) + ".";
+      backbone_prefix + "layers." + std::to_string(layer_idx) + ".";
   Qwen3_5DenseLayerWeights layer;
   layer.input_layernorm =
       LoadModelBf16Direct(get, base + "input_layernorm.weight");
@@ -648,21 +648,31 @@ Qwen3_5DenseLayerWeights LoadQwen3_5DenseLayer(const TensorResolver& get,
   return layer;
 }
 
-Qwen3_5DenseLayerWeights LoadQwen3_5DenseLayer(const TensorResolver& get,
-                                               const std::string& layer_type,
-                                               int64_t layer_idx) {
+Qwen3_5DenseLayerWeights LoadQwen3_5DenseLayer(
+    const TensorResolver& get, const std::string& layer_type, int64_t layer_idx,
+    const std::string& backbone_prefix) {
   // The public resolver-only seam is used by the compressed-tensors parity
   // fixture, where every routed projection is NVFP4.
   const TensorExists has = [](const std::string&) { return true; };
-  return LoadQwen3_5DenseLayer(get, has, layer_type, layer_idx);
+  return LoadQwen3_5DenseLayer(get, has, layer_type, layer_idx,
+                               backbone_prefix);
 }
 
 Qwen3_5DenseWeights LoadQwen3_5Dense(const std::vector<SafetensorsFile>& shards,
                                      const HfConfig& config,
                                      vt::Queue* load_queue) {
   std::unordered_map<std::string, const SafetensorsFile*> where;
-  for (const SafetensorsFile& shard : shards)
-    for (const std::string& name : shard.Names()) where[name] = &shard;
+  std::vector<std::string> all_names;
+  for (const SafetensorsFile& shard : shards) {
+    for (const std::string& name : shard.Names()) {
+      where[name] = &shard;
+      all_names.push_back(name);
+    }
+  }
+  // ONE namespace decision for the whole checkpoint (qwen3_5_weights.h): the
+  // VL-nested spelling for the wrappers we gate, the flat `model.` spelling for
+  // a text-only arm, and a refusal for a mixed index.
+  const std::string backbone = ResolveQwen3_5BackbonePrefix(all_names);
   const TensorResolver get =
       [&where](const std::string& name) -> const StTensor& {
     auto it = where.find(name);
@@ -679,10 +689,8 @@ Qwen3_5DenseWeights LoadQwen3_5Dense(const std::vector<SafetensorsFile>& shards,
            "qwen3_5 dense: layer_types size must equal num_hidden_layers");
 
   Qwen3_5DenseWeights w;
-  w.embed_tokens =
-      LoadBf16Direct(get, "model.language_model.embed_tokens.weight");
-  w.final_norm =
-      LoadModelBf16Direct(get, "model.language_model.norm.weight");
+  w.embed_tokens = LoadBf16Direct(get, backbone + "embed_tokens.weight");
+  w.final_norm = LoadModelBf16Direct(get, backbone + "norm.weight");
   // The 27B owns an explicit head; smaller Qwen3.5 checkpoints tie logits to
   // the embedding table and omit lm_head.weight.
   if (DenseCheckpointHasLmHead(has, "lm_head")) {
@@ -695,7 +703,7 @@ Qwen3_5DenseWeights LoadQwen3_5Dense(const std::vector<SafetensorsFile>& shards,
   bool direct_device = DirectDeviceLoadEligible(load_queue);
   for (int64_t l = 0; l < config.num_hidden_layers; ++l) {
     w.layers.push_back(LoadQwen3_5DenseLayer(
-        get, has, config.layer_types[static_cast<size_t>(l)], l));
+        get, has, config.layer_types[static_cast<size_t>(l)], l, backbone));
     if (direct_device) {
       direct_device = IsPlainBf16Qwen3_5Dense(w);
       if (direct_device) StageAndReleaseLoadedDense(w, *load_queue);

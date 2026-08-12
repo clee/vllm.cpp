@@ -156,6 +156,16 @@ build/examples/vllm-cli \
 | `--repeat N` | `1` | Load once, then run N blocking completions. Use it to read a warm decode tok/s without paying model load each time. Not supported with `--stream`, which falls back to 1 |
 | `-h`, `--help` | | Print usage and exit |
 
+`--model` accepts a Qwen3.5-family checkpoint under EITHER weight namespace. The
+multimodal wrappers (`Qwen3_5ForConditionalGeneration`,
+`Qwen3_5MoeForConditionalGeneration`) publish the text backbone nested under
+`model.language_model.`; the text-only arms (`Qwen3_5ForCausalLM`,
+`Qwen3_5MoeForCausalLM`) publish it flat under `model.`. The loader decides which
+ONCE per checkpoint from the shard index, and REFUSES a checkpoint that carries
+backbone tensors under both rather than binding half the model from each. Nothing
+else about the invocation changes. Note that no text-only Qwen3.5 checkpoint has
+been RUN here — see [STATUS.md](STATUS.md) for the owed run gate.
+
 GGUF and safetensors mapped-payload paths, plus safetensors index paths, use the
 host's native filesystem encoding, including Unicode paths on Windows. Native
 Windows release artifacts are not published yet; they will remain unavailable

@@ -555,9 +555,10 @@ MoeBlockWeights LoadMoe(const TensorResolver& get, const std::string& base,
 Qwen3_5MoeLayerWeights LoadLayerImpl(const TensorResolver& get,
                                      const std::string& layer_type,
                                      int64_t layer_idx, int64_t num_experts,
-                                     bool with_experts) {
+                                     bool with_experts,
+                                     const std::string& backbone_prefix) {
   const std::string base =
-      "model.language_model.layers." + std::to_string(layer_idx) + ".";
+      backbone_prefix + "layers." + std::to_string(layer_idx) + ".";
   Qwen3_5MoeLayerWeights layer;
   layer.input_layernorm = LoadBf16Direct(get, base + "input_layernorm.weight");
   layer.post_attention_layernorm =
@@ -575,7 +576,43 @@ Qwen3_5MoeLayerWeights LoadLayerImpl(const TensorResolver& get,
   return layer;
 }
 
+// True iff any name in `names` is a backbone tensor under `prefix`. Only the
+// three structural backbone spellings vote (see qwen3_5_weights.h): the
+// vision tower (`model.visual.*`) and the top-level `lm_head.*` / `mtp.*` are
+// deliberately NOT backbone names, so they cannot decide the namespace.
+bool HasBackboneUnder(const std::vector<std::string>& names,
+                      std::string_view prefix) {
+  const std::string embed = std::string(prefix) + "embed_tokens.weight";
+  const std::string norm = std::string(prefix) + "norm.weight";
+  const std::string layers = std::string(prefix) + "layers.";
+  for (const std::string& name : names) {
+    if (name == embed || name == norm) return true;
+    if (name.compare(0, layers.size(), layers) == 0) return true;
+  }
+  return false;
+}
+
 }  // namespace
+
+std::string ResolveQwen3_5BackbonePrefix(
+    const std::vector<std::string>& tensor_names) {
+  // `model.language_model.` is tested FIRST because it is also a `model.`
+  // name: a plain "starts with model." test would match both spellings.
+  const bool vl = HasBackboneUnder(tensor_names, kQwen3_5VlBackbonePrefix);
+  // ...so the canonical probe must EXCLUDE the VL-prefixed names, which the
+  // backbone spellings above already do (`model.language_model.` is neither
+  // `model.embed_tokens.weight`, nor `model.norm.weight`, nor `model.layers.`).
+  const bool flat = HasBackboneUnder(tensor_names, kQwen3_5TextBackbonePrefix);
+  VT_CHECK(!(vl && flat),
+           "qwen3_5 weights: checkpoint carries backbone tensors under BOTH "
+           "\"model.language_model.\" and \"model.\"; refusing a mixed weight "
+           "namespace rather than binding half the model from each");
+  VT_CHECK(vl || flat,
+           "qwen3_5 weights: no Qwen3.5 backbone tensors found under either "
+           "\"model.language_model.\" or \"model.\"");
+  return std::string(vl ? kQwen3_5VlBackbonePrefix
+                        : kQwen3_5TextBackbonePrefix);
+}
 
 // External-linkage seam so the DENSE loader can keep an FP8 GDN tower native.
 Fp8Weight LoadFp8RawShared(const TensorResolver& get, const std::string& proj) {
@@ -585,9 +622,10 @@ Fp8Weight LoadFp8RawShared(const TensorResolver& get, const std::string& proj) {
 Qwen3_5MoeLayerWeights LoadQwen3_5MoeLayer(const TensorResolver& get,
                                            const std::string& layer_type,
                                            int64_t layer_idx,
-                                           int64_t num_experts) {
+                                           int64_t num_experts,
+                                           const std::string& backbone_prefix) {
   return LoadLayerImpl(get, layer_type, layer_idx, num_experts,
-                       /*with_experts=*/true);
+                       /*with_experts=*/true, backbone_prefix);
 }
 
 Qwen3_5MoeWeights LoadQwen3_5Moe(
@@ -601,9 +639,17 @@ Qwen3_5MoeWeights LoadQwen3_5Moe(
   // which `shards_owner` keeps mmap'd.
   auto where =
       std::make_shared<std::unordered_map<std::string, const SafetensorsFile*>>();
+  std::vector<std::string> all_names;
   for (const SafetensorsFile& shard : shards) {
-    for (const std::string& name : shard.Names()) (*where)[name] = &shard;
+    for (const std::string& name : shard.Names()) {
+      (*where)[name] = &shard;
+      all_names.push_back(name);
+    }
   }
+  // ONE namespace decision for the whole checkpoint (qwen3_5_weights.h): the
+  // VL-nested spelling for the wrappers we gate, the flat `model.` spelling for
+  // a text-only arm, and a refusal for a mixed index.
+  const std::string backbone = ResolveQwen3_5BackbonePrefix(all_names);
   const TensorResolver get =
       [where](const std::string& name) -> const StTensor& {
     auto it = where->find(name);
@@ -628,16 +674,16 @@ Qwen3_5MoeWeights LoadQwen3_5Moe(
   const bool defer_experts = shards_owner != nullptr;
 
   Qwen3_5MoeWeights w;
-  w.embed_tokens =
-      LoadBf16Direct(get, "model.language_model.embed_tokens.weight");
-  w.final_norm = LoadBf16Direct(get, "model.language_model.norm.weight");
+  w.embed_tokens = LoadBf16Direct(get, backbone + "embed_tokens.weight");
+  w.final_norm = LoadBf16Direct(get, backbone + "norm.weight");
   w.lm_head_fp4 = LoadNvfp4Raw(get, "lm_head");  // M2.2b fp4-resident
   w.layers.reserve(static_cast<size_t>(config.num_hidden_layers));
   for (int64_t l = 0; l < config.num_hidden_layers; ++l) {
     w.layers.push_back(LoadLayerImpl(get,
                                      config.layer_types[static_cast<size_t>(l)],
                                      l, config.num_experts,
-                                     /*with_experts=*/!defer_experts));
+                                     /*with_experts=*/!defer_experts,
+                                     backbone));
   }
 
   if (defer_experts) {
@@ -647,7 +693,9 @@ Qwen3_5MoeWeights LoadQwen3_5Moe(
     // last layer is built. Does NOT capture the (movable) Qwen3_5MoeWeights — the
     // target MoE block is passed in by reference, so the closure survives the
     // model's move into the LoadedModel.
-    w.load_layer_experts = [where, shards_owner, num_experts](
+    // `backbone` is captured BY VALUE: the closure outlives this frame, and it
+    // must keep using the ONE namespace resolved above rather than re-deciding.
+    w.load_layer_experts = [where, shards_owner, num_experts, backbone](
                                int64_t layer, MoeBlockWeights& moe) {
       const TensorResolver g =
           [where](const std::string& name) -> const StTensor& {
@@ -656,8 +704,8 @@ Qwen3_5MoeWeights LoadQwen3_5Moe(
                  "qwen3_5 weights: tensor not found: " + name);
         return it->second->Get(name);
       };
-      const std::string mlp = "model.language_model.layers." +
-                              std::to_string(layer) + ".mlp.";
+      const std::string mlp =
+          backbone + "layers." + std::to_string(layer) + ".mlp.";
       LoadMoeExpertsInto(g, mlp, num_experts, moe);
     };
   }

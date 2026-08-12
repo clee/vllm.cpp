@@ -164,4 +164,45 @@ run gate and closes this axis.
 
 ## Now
 
-Row is `READY`. Spec committed; implementation not started.
+Both rows are `PARTIAL` (2026-08-12). Registration, the once-per-checkpoint
+backbone-namespace resolution and the tests above are landed on
+`row/MODEL-QWEN38-TEXT-ONLY`; full CPU gate green (396/396, 1 skipped:
+`test_voxtral_e2e`, fixture absent) and `tests/parity/goldens` md5-unchanged.
+
+**Next step is the OWED run gate, and nothing else advances these rows.** It
+needs a text-only `Qwen3_5ForCausalLM` / `Qwen3_5MoeForCausalLM` checkpoint that
+fits GB10; none exists today. Until one does, the honest claim stays "the
+architecture is registered and the weight namespace resolves". Also owed, and
+deliberately NOT implemented on speculation: the MTP, quantized and GGUF arms for
+3.8.
+
+## Outcome
+
+**Measured.** Architecture dispatch for both strings, config resolution on the
+flat 3.8 shape (scale fields plus the family's 0.25 partial-rotary default with
+no `text_config`, `vision_config` or `mrope_section`), and weight-namespace
+resolution on a clean index, a VL-prefixed index, a vision-inclusive VL index, an
+index carrying `mtp.*`, a mixed index and an empty one. The strongest of these is
+not a name-mapping assertion: two synthetic one-layer checkpoints with
+byte-identical payloads and only the namespace differing load to byte-identical
+weights through the production `LoadQwen3_5Dense`.
+
+**Rejected.** A per-lookup namespace fallback — it would let a checkpoint bind
+half its tensors from each namespace and still appear to load, which is exactly
+the failure a name-mapping test cannot see. Also rejected: a blanket
+"starts with `model.`" probe, because `model.visual.*` on a vision-inclusive 27B
+checkpoint would have made it look like a flat text checkpoint and turned a
+checkpoint we gate today into a refusal. Only the three structural backbone
+spellings vote.
+
+**Why the defaults are what they are.** The per-layer public seams
+(`LoadQwen3_5MoeLayer`, `LoadQwen3_5DenseLayer`) default `backbone_prefix` to the
+VL spelling, so every 27B/35B/Coder caller is byte-identical by construction
+rather than by re-measurement. The text-only arms register with
+`kQwen3_5TextInfo` (hybrid YES, multimodal NO) because upstream's
+`Qwen3_5ForCausalLMBase` inherits `IsHybrid` but not `SupportsMultiModal`; the
+`ForConditionalGeneration` wrappers remain the multimodal registrations.
+
+**What was NOT established.** Any claim about generated tokens, memory or speed
+for `Qwen/Qwen3.8-2.4T-A95B`. That checkpoint cannot be executed on this
+hardware and was never run.

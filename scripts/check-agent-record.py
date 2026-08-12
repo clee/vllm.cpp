@@ -39,7 +39,16 @@ MATRICES = {
     # delegates it. Its only upstream implementation is the still-OPEN
     # vllm#51655; see porting-inventory.md §9 deviation 16. Bumped because a new
     # row EXISTS, never to make a transition pass.
-    "MODEL": (AGENTS / "model-matrix.md", 362),
+    # 364 since 2026-08-12: +`MODEL-TEXT-qwen3-5-qwen3-5-for-causal-lm` and
+    # +`MODEL-TEXT-qwen3-5-qwen3-5-moe-for-causal-lm` (issue #490), the TEXT-ONLY
+    # arms of the Qwen3.5 backbone. FOURTH and FIFTH beyond-pin rows: they are not
+    # among the 326 registry architectures at `555967922` because they landed
+    # upstream afterwards (PR vllm#50210 @ `ad5d29db7`), exactly like the Muse
+    # Glimmer row above. Their Upstream cells deliberately carry no pinned
+    # module/class target, so the pin-derived static invariants in
+    # check_model_invariants are UNCHANGED — this is the row-EXISTS count only,
+    # bumped because two new rows exist, never to make a transition pass.
+    "MODEL": (AGENTS / "model-matrix.md", 364),
     # 82 since 2026-07-21: +`QUANT-NVFP4-CT-W4A16` (compressed-tensors NVFP4A16 /
     # W4A16 — NVFP4 weights with BF16 activations, distinct from the existing
     # `QUANT-NVFP4-CT-W4A4` and `QUANT-NVFP4-MO-W4A16` rows in both scheme
