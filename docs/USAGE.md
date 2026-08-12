@@ -1501,7 +1501,7 @@ text encoder with its embedded tokenizer. There is still no render path, so
 these are library entry points and not a command.
 
 Two behaviours a caller has to know. `Ltx2LoadDitFromSafetensors` REFUSES the
-shipped DiT by default, because that file carries four module families phase L2
+shipped DiT by default, because that file carries five module families phase L2
 does not port (`prompt_adaln_single`, `audio_prompt_adaln_single`,
 `keyframes_abs_pos_embedding`, and the two `*_embeddings_connector` towers); pass
 `Ltx2DitLoadOptions::allow_unported_modules` to load the ported subset, which

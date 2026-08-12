@@ -1,6 +1,6 @@
 // LTX-2.5 phase L6 — the quantized loaders. See
 // include/vllm/model_executor/models/ltx2_loader.h for the port map, the one
-// delta, the dtype polarity and the four unported families.
+// delta, the dtype polarity and the five unported families.
 //
 // Ported from / grounded in:
 //   the swizzle inverted here      <- vllm/model_executor/layers/quantization/
@@ -103,6 +103,20 @@ std::string FamilyOf(const std::string& name) {
   return dot == std::string::npos ? name : name.substr(0, dot);
 }
 
+// `patchify_proj.weight` -> `patchify_proj`. The torchao helpers take the MODULE
+// and append `.weight` / `.weight_scale` / `.weight_scale_2` themselves, so
+// handing them a full tensor name yields `patchify_proj.weight.weight_scale_2`,
+// which a user grepping the checkpoint will never find. A rank-2 quantized DiT
+// tensor is always `<module>.weight` (ltx2.cpp PushLinear), but the fallback
+// keeps a future name from silently losing its last component.
+std::string ModulePrefixOfWeight(const std::string& tensor_name) {
+  static const std::string kSuffix = ".weight";
+  if (EndsWith(tensor_name, kSuffix)) {
+    return tensor_name.substr(0, tensor_name.size() - kSuffix.size());
+  }
+  return tensor_name;
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -191,11 +205,19 @@ void Ltx2DequantTorchaoNvfp4ToBf16(const std::string& module, const StTensor& pa
     Fail("'" + module + ".weight' must be U8 (two E2M1 values per byte), not " +
          packed.dtype);
   }
-  if (packed.shape.size() != 2 || packed.shape[0] != out_features ||
-      packed.shape[1] * 2 != in_features) {
-    Fail("'" + module + ".weight' is " + ShapeText(packed.shape) + " but the module is [" +
-         std::to_string(out_features) + ", " + std::to_string(in_features) +
-         "]. NVFP4 packs TWO values per byte along the last dimension, so the stored "
+  if (packed.shape.size() != 2) {
+    Fail("'" + module + ".weight' is rank " + std::to_string(packed.shape.size()) + " (" +
+         ShapeText(packed.shape) + "); an NVFP4-packed weight is rank 2.");
+  }
+  if (packed.shape[0] != out_features || packed.shape[1] * 2 != in_features) {
+    // Print the LOGICAL width the stored shape implies, never the stored one
+    // twice. NVFP4 packs two values per byte, so "is [128, 8] but the module is
+    // [128, 8]" — which is what naming the stored shape on both sides produced —
+    // reads as a contradiction and tells a reader nothing.
+    Fail("'" + module + ".weight' is stored " + ShapeText(packed.shape) +
+         ", i.e. a LOGICAL " + ShapeText({packed.shape[0], packed.shape[1] * 2}) +
+         ", but the module is " + ShapeText({out_features, in_features}) +
+         ". NVFP4 packs TWO values per byte along the last dimension, so the stored "
          "width must be exactly half the logical one.");
   }
   if (in_features % kNvfp4GroupSize != 0) {
@@ -361,7 +383,13 @@ vt::DType MaterializeDitTensor(const SafetensorsFile& file, const DitPlan& plan,
     const StTensor& scale = file.Get(fname + "_scale");
     const StTensor& global = file.Get(fname + "_scale_2");
     buffer.resize(static_cast<size_t>(numel) * sizeof(uint16_t));
-    Ltx2DequantTorchaoNvfp4ToBf16(spec.name, t, scale, global, spec.shape[0], spec.shape[1],
+    // Ltx2DequantTorchaoNvfp4ToBf16 takes a MODULE prefix and appends `.weight`,
+    // `.weight_scale` and `.weight_scale_2` itself. `spec.name` is already the
+    // full tensor name, so passing it produced 'patchify_proj.weight.weight' —
+    // a name that appears nowhere in the checkpoint, which defeats the whole
+    // point of refusing BY NAME. Strip the suffix the callee will re-add.
+    Ltx2DequantTorchaoNvfp4ToBf16(ModulePrefixOfWeight(spec.name), t, scale, global,
+                                  spec.shape[0], spec.shape[1],
                                   reinterpret_cast<uint16_t*>(buffer.data()));
     return vt::DType::kBF16;
   }
@@ -495,8 +523,9 @@ Ltx2DitCheckpoint Ltx2StreamDitToDevice(vt::Queue& queue, const SafetensorsFile&
     backend.Copy(queue, device, host.data(), host.size());
     backend.Synchronize(queue);  // `host` dies at the end of this iteration
     out.views[spec.name] = MakeView(device, dtype, queue.device, spec.shape);
-    // The device allocation's lifetime rides on the same storage vector the host
-    // load uses, so a staged checkpoint frees exactly like a host one.
+    // The device allocation's lifetime rides on `device_storage` — the host
+    // load's `storage` stays empty on this path — so a staged checkpoint frees
+    // exactly like a host one, by dropping the checkpoint.
     out.device_storage.emplace_back(device, [&backend](void* p) { backend.Free(p); });
     load_stats::AddDeviceUpload(host.size());
   }

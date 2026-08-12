@@ -2,7 +2,7 @@
 //
 // Tensor manifest of a REAL safetensors checkpoint (vonkaiser/LTX-2.5-FP8-NVFP4 text_encoders/gemma4-12b-with-proj-nvfp4-torchao.safetensors): 1688 tensors,
 // names/dtypes/shapes only — no weight bytes. Captured from the file's own header via
-// an HTTP range request. See .agents/specs/minimax-h3.md.
+// a local read of the file on the NAS. See .agents/specs/ltx-2-5.md.
 #pragma once
 
 #include <cstdint>

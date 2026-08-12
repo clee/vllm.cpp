@@ -1131,13 +1131,22 @@ Examples: `examples/cli` ✅ (C-API client), `examples/server` ✅ (OpenAI serve
       512-byte tile of the SHIPPED text encoder's own `weight_scale` with its values
       decoded by torch's fp8-e4m3; and the two REAL manifests
       (`ltx2_fp8_dit_manifest.inc`, 6124 tensors; `ltx2_nvfp4_te_manifest.inc`,
-      1688), captured from the files' own headers with no payload read.
-    * **OWED, and precisely:** the swizzle oracle is a PINNED TRANSCRIPTION of
-      `to_blocked`, not a running one — vLLM is not importable on the generating
-      host (`import vllm.*` dies in `vllm.distributed` on a missing `zmq`).
-      `scripts/gen-ltx2-quant-goldens.py` diffs its transcription against the
-      checkout's live text and refuses on drift, but EXECUTING `to_blocked` on a
-      host where vLLM imports is still owed. Also owed: Lightricks' first-party
+      1688), captured from the files' own headers with no payload read. The swizzle
+      oracle RUNS: `scripts/gen-ltx2-quant-goldens.py` loads vLLM's own `to_blocked`
+      out of the pinned checkout with `importlib.util.spec_from_file_location` and
+      calls `to_blocked(x, backend="torch")`. The earlier "not importable, so it
+      cannot be executed here" limit was WRONG — `import vllm.*` does die in
+      `vllm.distributed` on a missing `zmq`, but `qutlass_utils.py` needs only
+      torch, `vllm.triton_utils` and `vllm.utils.math_utils`, so loading the file
+      directly runs the real producer. Regenerating against it left every golden
+      byte IDENTICAL to the transcription's, and upstream's executing `to_blocked`
+      reproduces the shipped file's first 512 `weight_scale` bytes from the emitted
+      linear tile.
+    * **OWED, and precisely:** the `backend="triton"` arm of `to_blocked` and
+      `swizzle_blockscale` — vLLM's other two writings of the same permutation —
+      are pinned by source fragment only. Neither can execute on this host (no
+      active Triton driver; `swizzle_blockscale` calls `.cuda()` unconditionally),
+      so running them needs a GPU host. Also owed: Lightricks' first-party
       NVFP4 DiT (`ltx-2.5-22b-distilled-transformer-nvfp4.safetensors`, 18.72 GB)
       is behind an un-accepted HF gate (HTTP 403) and was NOT downloaded, so the
       NVFP4 **DiT** arm is gated on a synthetic file whose header mirrors the real

@@ -260,9 +260,10 @@ void Ltx2WidenDitToF32(Ltx2DitCheckpoint& checkpoint);
 
 // The GB10 arm: dequantize and upload tensor by tensor, freeing each host
 // buffer before the next, so peak residency is the device copy plus ONE tensor.
-// Returns the same struct with `views` pointing at DEVICE memory and `storage`
-// holding the device allocations; `widen_to_f32` is refused here because the
-// point of staging is not to move twice the bytes.
+// Returns the same struct with `views` pointing at DEVICE memory and
+// `device_storage` — NOT `storage`, which stays empty on this path — holding the
+// device allocations; `widen_to_f32` is refused here because the point of
+// staging is not to move twice the bytes.
 Ltx2DitCheckpoint Ltx2StreamDitToDevice(vt::Queue& queue, const SafetensorsFile& file,
                                          const Ltx2DitLoadOptions& options = {});
 

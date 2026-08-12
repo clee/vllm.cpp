@@ -6,8 +6,10 @@
 // vLLM revision (swizzle transcription pinned against it): 5559679229bc961848b121ccdeaa8fa5d79bec98
 // Both pinned vLLM sources are clean at that revision; the rest of that
 // checkout's worktree is NOT, so the anchor covers those two files only.
-// The swizzle oracle is a PINNED TRANSCRIPTION of vLLM's `to_blocked`, not a
-// running one: vLLM is not importable on the generating host. See the script.
+// The swizzle oracle RUNS: vLLM's own `to_blocked(x, backend="torch")` is
+// loaded out of the pinned checkout and called. Its `backend="triton"` arm and
+// `swizzle_blockscale` are not executed here (no driver / unconditional
+// .cuda()); both are pinned by source. See the script.
 //
 // Regenerate (one line; a trailing backslash in a // comment is a
 // -Werror=comment line continuation):

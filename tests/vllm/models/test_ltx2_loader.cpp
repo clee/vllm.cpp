@@ -23,6 +23,9 @@
 // NVFP4 DiT sits behind an un-accepted HF gate (HTTP 403) and was NOT
 // downloaded; that is recorded as owed in .agents/porting-inventory.md rather
 // than papered over with a fabricated manifest.
+#include <unistd.h>
+
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -32,6 +35,14 @@
 #include <vector>
 
 #include <doctest/doctest.h>
+
+// Issue #449: every max|diff| reduction here goes through the ONE hardened
+// helper, where a non-finite operand on either side is a FAILURE. The two
+// obvious spellings (`if (d > worst)` / `std::max`) are both NaN-BLIND, and this
+// suite had seven copies of the first: injecting all-NaN for exactly the
+// real-bytes probe geometry left `19 passed | 1664 passed | SUCCESS!`, byte for
+// byte, with the function under test returning nothing but NaN.
+#include "support/max_abs_diff.h"
 
 #include "ltx2_fp8_dit_manifest.inc"
 #include "ltx2_nvfp4_te_manifest.inc"
@@ -94,6 +105,15 @@ uint16_t F32ToBf16(float f) {
   std::memcpy(&bits, &f, sizeof(bits));
   const uint32_t rounded = bits + 0x7FFFU + ((bits >> 16) & 1U);
   return static_cast<uint16_t>(rounded >> 16);
+}
+
+// True when `v` survives a bf16 store UNCHANGED, i.e. its low 16 mantissa bits
+// are already zero. Used to state, as a gated fact rather than a comment, which
+// fixtures do and do not reach the bf16 rounding regime at all.
+bool IsBf16Exact(float v) {
+  uint32_t bits = 0;
+  std::memcpy(&bits, &v, sizeof(bits));
+  return (bits & 0xFFFFU) == 0U;
 }
 
 // ---------------------------------------------------------------------------
@@ -214,10 +234,30 @@ float TrueValue(const std::string& name, size_t i) {
   return static_cast<float>(static_cast<double>(u >> 11) * 0x1p-53 * 2.0 - 1.0) * 0.05F;
 }
 
+// The FP8 arm's per-tensor scale. It is deliberately NOT a power of two, and
+// that is the whole point: fp8-e4m3 carries 4 significant bits, so against a
+// power-of-two scale (this fixture used 2^-8) every product is EXACTLY
+// bf16-representable and the bf16 store never rounds. Under such a scale
+// replacing round-nearest-even with truncation in DequantFp8ToBf16 changes
+// nothing anywhere in this suite — measured, and it is why the real-bytes case
+// above cannot gate the rounding mode either. This value carries a full f32
+// significand, so 252 of the 256 fp8 encodings times it land off a bf16 grid
+// point and the rounding mode becomes load-bearing. The whole-model FP8 test
+// below counts how many elements actually reach that regime, so the guarantee
+// cannot quietly evaporate if this constant is ever changed again.
+constexpr float kSyntheticFp8Scale = 0.011234567F;
+
 struct SyntheticDit {
   std::vector<StEntry> entries;
   // name (contract, unprefixed) -> the exact bf16 the loader must produce.
   std::map<std::string, std::vector<uint16_t>> expected;
+  // How many FP8 elements the fixture holds, and how many of them need a real
+  // bf16 round. The second is what makes the RNE claim load-bearing.
+  int64_t fp8_elements = 0;
+  int64_t fp8_rounding_elements = 0;
+  // Must stay 0: a NaN weight is not something a real checkpoint stores, and it
+  // makes a gate compare nan against nan.
+  int64_t fp8_nonfinite_elements = 0;
 };
 
 SyntheticDit BuildSyntheticDit(const Ltx2DitParams& p, Ltx2DitQuant quant,
@@ -234,9 +274,7 @@ SyntheticDit BuildSyntheticDit(const Ltx2DitParams& p, Ltx2DitQuant quant,
       std::vector<float> v(static_cast<size_t>(numel));
       for (size_t i = 0; i < v.size(); ++i) v[i] = TrueValue(spec.name, i);
       out.entries.push_back({pre + spec.name, "F32", spec.shape, PackF32(v)});
-      std::vector<uint16_t> keep(v.size());
-      for (size_t i = 0; i < v.size(); ++i) std::memcpy(&keep[i], &v[i], 0);
-      continue;  // f32 tables are checked separately
+      continue;  // f32 tables are checked separately, against TrueValue directly
     }
     if (!quantized) {
       // Biases and q/k norms: BF16, stored as-is.
@@ -253,11 +291,25 @@ SyntheticDit BuildSyntheticDit(const Ltx2DitParams& p, Ltx2DitQuant quant,
 
     const int64_t rows = spec.shape[0], cols = spec.shape[1];
     if (quant == Ltx2DitQuant::kFp8) {
-      const std::vector<uint8_t> raw = RandBytes(spec.name, static_cast<size_t>(numel));
-      const float scale = 0.00390625F;  // exact power of two: no rounding of its own
+      std::vector<uint8_t> raw = RandBytes(spec.name, static_cast<size_t>(numel));
+      // Never emit the fp8-e4m3 NaN encodings, exactly as the NVFP4 arm below
+      // already does. A NaN WEIGHT is not something a real checkpoint stores,
+      // and it makes the gate compare nan against nan — which the old NaN-blind
+      // reductions read as agreement (issue #449). Found by hardening them.
+      for (uint8_t& b : raw) {
+        if (b == 0x7FU || b == 0xFFU) b = 0x38U;
+      }
+      const float scale = kSyntheticFp8Scale;
       std::vector<uint16_t> want(raw.size());
       for (size_t i = 0; i < raw.size(); ++i) {
-        want[i] = F32ToBf16(vllm::F8E4M3ToF32(raw[i]) * scale);
+        // `want` rounds with this file's OWN round-nearest-even, which is a copy
+        // of the rule and not a call into the code under test, so a rounding
+        // change in DequantFp8ToBf16 shows up as a bit mismatch.
+        const float product = vllm::F8E4M3ToF32(raw[i]) * scale;
+        want[i] = F32ToBf16(product);
+        ++out.fp8_elements;
+        if (!std::isfinite(product)) ++out.fp8_nonfinite_elements;
+        if (!IsBf16Exact(product)) ++out.fp8_rounding_elements;
       }
       out.entries.push_back({pre + spec.name, "F8_E4M3", spec.shape, PackBytes(raw)});
       out.entries.push_back({pre + spec.name + "_scale", "F32", {},
@@ -312,8 +364,14 @@ SyntheticDit BuildSyntheticDit(const Ltx2DitParams& p, Ltx2DitQuant quant,
   return out;
 }
 
+// A path no CONCURRENT run can collide on. This box carries ~150 worktrees, and
+// a fixed /tmp/ltx2_loader_fp8.safetensors means two suites running at once
+// write and unlink each other's file — a failure that reads as a loader bug.
 std::string TmpPath(const char* stem) {
-  return std::string("/tmp/ltx2_loader_") + stem + ".safetensors";
+  static const std::string unique = std::to_string(static_cast<long long>(::getpid())) + "_" +
+                                    std::to_string(static_cast<unsigned long long>(
+                                        std::chrono::steady_clock::now().time_since_epoch().count()));
+  return std::string("/tmp/ltx2_loader_") + stem + "_" + unique + ".safetensors";
 }
 
 // ---------------------------------------------------------------------------
@@ -341,6 +399,34 @@ const vllm_test::Ltx25Nvfp4TeTensor* FindTe(const std::string& name) {
 bool EndsWith(const std::string& s, const std::string& suffix) {
   return s.size() >= suffix.size() &&
          s.compare(s.size() - suffix.size(), suffix.size(), suffix) == 0;
+}
+
+// The RELATIVE companion to vllm_test::MaxAbsDiff, with the SAME polarity: a
+// non-finite operand on either side is a failure, never a zero. It does not
+// restate the finiteness rule — it asks MaxAbsDiffScan for the verdict — and it
+// accumulates with `!(rel <= worst)` so a NaN ratio cannot be dropped either.
+// Issue #449 is about `if (d > worst)`; the ratio form of the same loop is the
+// same blindness one division later.
+double MaxRelDiff(const std::vector<float>& got, const float* want, size_t count) {
+  REQUIRE(got.size() == count);
+  const vllm_test::MaxAbsDiffScanResult r = vllm_test::MaxAbsDiffScan(got.data(), want, count);
+  if (!r.ok()) {
+    FAIL_CHECK("max rel: NON-FINITE operand at index "
+               << r.bad_index << " (got = " << r.bad_got << ", want = " << r.bad_want
+               << "). A NaN here used to reduce to 0.0 and PASS — see issue #449.");
+    return std::numeric_limits<double>::infinity();
+  }
+  double worst = 0.0;
+  for (size_t i = 0; i < count; ++i) {
+    // A relative error is undefined where the reference is zero; the ABSOLUTE
+    // bound covers those elements.
+    if (want[i] == 0.0F) continue;
+    const double rel =
+        std::abs(static_cast<double>(got[i]) - static_cast<double>(want[i])) /
+        std::abs(static_cast<double>(want[i]));
+    if (!(rel <= worst)) worst = rel;
+  }
+  return worst;
 }
 
 }  // namespace
@@ -462,14 +548,20 @@ TEST_CASE("ltx2 loader: the shipped text encoder's swizzled scale tile unswizzle
   INFO("mismatches=" << mismatches);
   CHECK(mismatches == 0);
 
-  // And the bytes decode to the values TORCH read out of them.
-  double max_abs = 0.0;
+  // And the bytes decode to the values TORCH read out of them. F8E4M3ToF32
+  // returns NaN for the two NaN encodings (0x7F / 0xFF); the shipped tile
+  // carries neither, which the count below states rather than assumes, so the
+  // hardened reduction cannot be red for a legitimate reason here.
+  int64_t nan_encodings = 0;
+  std::vector<float> ours(512, 0.0F);
   for (int i = 0; i < 512; ++i) {
-    const float ours = vllm::F8E4M3ToF32(got[static_cast<size_t>(i)]);
-    const double d = std::abs(static_cast<double>(ours) -
-                              vllm_test::kLtx2RealTeScaleTileLinearF32[i]);
-    if (d > max_abs) max_abs = d;
+    const uint8_t b = got[static_cast<size_t>(i)];
+    if (b == 0x7FU || b == 0xFFU) ++nan_encodings;
+    ours[static_cast<size_t>(i)] = vllm::F8E4M3ToF32(b);
   }
+  CHECK(nan_encodings == 0);
+  const double max_abs =
+      vllm_test::MaxAbsDiff(ours, vllm_test::kLtx2RealTeScaleTileLinearF32, 512);
   INFO("max abs diff vs torch fp8-e4m3 = " << max_abs);
   CHECK(max_abs == 0.0);
 }
@@ -480,32 +572,57 @@ TEST_CASE("ltx2 loader: the shipped FP8 DiT's own bytes dequantize to torch's va
   std::vector<uint16_t> bf16(static_cast<size_t>(n), 0);
   vllm::DequantFp8ToBf16(vllm_test::kLtx2RealDitFp8Head, vllm_test::kLtx2RealDitFp8Scale, n,
                          bf16.data());
-  double max_abs = 0.0, max_rel = 0.0;
+  std::vector<float> got(static_cast<size_t>(n), 0.0F);
   for (int64_t i = 0; i < n; ++i) {
-    const double want = vllm_test::kLtx2RealDitFp8HeadF32[i];
-    const double got = Bf16ToF32(bf16[static_cast<size_t>(i)]);
-    const double d = std::abs(got - want);
-    if (d > max_abs) max_abs = d;
-    if (want != 0.0 && d / std::abs(want) > max_rel) max_rel = d / std::abs(want);
+    got[static_cast<size_t>(i)] = Bf16ToF32(bf16[static_cast<size_t>(i)]);
   }
+  const double max_abs =
+      vllm_test::MaxAbsDiff(got, vllm_test::kLtx2RealDitFp8HeadF32, static_cast<size_t>(n));
+  const double max_rel =
+      MaxRelDiff(got, vllm_test::kLtx2RealDitFp8HeadF32, static_cast<size_t>(n));
   INFO("max abs = " << max_abs << " max rel = " << max_rel);
   // bf16 carries 8 significand bits, so RNE's worst relative error is half an
   // ulp = 2^-8. (An earlier revision of this line wrote 2^-9 by counting the 7
   // EXPLICIT mantissa bits and forgetting the implicit one — a miscounted
   // constant, not a tolerance anyone widened to pass.)
   CHECK(max_rel <= 0.00390625);
-  // And tighter, because it can be: our path computes f32(byte) * scale and
-  // rounds, which is torch's association exactly, so the bf16 bits must match
-  // bit for bit. A rounding-mode or association change breaks this and not the
-  // bound above.
-  int64_t bit_mismatches = 0;
+  // And tighter, because it can be: our path computes f32(byte) * scale, which
+  // is torch's association exactly, so the bf16 bits must match bit for bit.
+  // That pins the SCALE and the ASSOCIATION.
+  //
+  // WHAT IT DOES NOT PIN, measured rather than assumed. An earlier revision of
+  // this comment claimed "a rounding-mode or association change breaks this",
+  // and the rounding half was false: replacing RNE with truncation in
+  // DequantFp8ToBf16 left the whole suite green. The reason is structural, not a
+  // property of which 32 bytes were sampled, so a different slice of this tensor
+  // would not help either: an fp8-e4m3 value carries at most 4 significant bits,
+  // this tensor's per-tensor scale (0x3A880000, mantissa 1.0001b) carries 4, and
+  // 4 x 4 lands inside bf16's 8, so the product is ALWAYS exactly representable
+  // and the bf16 store never rounds at all. The two counts below say so, so the
+  // claim cannot drift from the fixture. The rounding mode is gated where the
+  // regime is actually reachable: the synthetic FP8 arm below, whose scale is
+  // deliberately not a power of two.
+  int64_t bit_mismatches = 0, bf16_exact_goldens = 0;
   for (int64_t i = 0; i < n; ++i) {
     if (bf16[static_cast<size_t>(i)] != F32ToBf16(vllm_test::kLtx2RealDitFp8HeadF32[i])) {
       ++bit_mismatches;
     }
+    if (IsBf16Exact(vllm_test::kLtx2RealDitFp8HeadF32[i])) ++bf16_exact_goldens;
   }
   INFO("bf16 bit mismatches = " << bit_mismatches);
   CHECK(bit_mismatches == 0);
+  INFO("bf16-exact goldens = " << bf16_exact_goldens << " of " << n);
+  CHECK(bf16_exact_goldens == n);
+  // ... and the structural statement, over EVERY fp8 byte rather than the 32
+  // sampled: none of the 256 encodings times this scale needs a bf16 round.
+  int64_t rounding_bytes = 0;
+  for (int b = 0; b < 256; ++b) {
+    const float v = vllm::F8E4M3ToF32(static_cast<uint8_t>(b));
+    if (std::isnan(v)) continue;  // the two NaN encodings carry no value
+    if (!IsBf16Exact(v * vllm_test::kLtx2RealDitFp8Scale)) ++rounding_bytes;
+  }
+  INFO("fp8 encodings that would need a bf16 round at this scale = " << rounding_bytes);
+  CHECK(rounding_bytes == 0);
 }
 
 TEST_CASE("ltx2 loader: a torchao module built from the shipped bytes dequantizes") {
@@ -537,14 +654,12 @@ TEST_CASE("ltx2 loader: a torchao module built from the shipped bytes dequantize
   std::vector<uint16_t> bf16(static_cast<size_t>(out_features * in_features), 0);
   vllm::Ltx2DequantTorchaoNvfp4ToBf16("video_aggregate_embed", w, s, g, out_features,
                                       in_features, bf16.data());
-  double max_abs = 0.0, max_rel = 0.0;
-  for (int64_t i = 0; i < vllm_test::kLtx2RealTeWeightHeadF32Count; ++i) {
-    const double want = vllm_test::kLtx2RealTeWeightHeadF32[i];
-    const double got = Bf16ToF32(bf16[static_cast<size_t>(i)]);
-    const double d = std::abs(got - want);
-    if (d > max_abs) max_abs = d;
-    if (want != 0.0 && d / std::abs(want) > max_rel) max_rel = d / std::abs(want);
-  }
+  const size_t head = static_cast<size_t>(vllm_test::kLtx2RealTeWeightHeadF32Count);
+  std::vector<float> got(head, 0.0F);
+  for (size_t i = 0; i < head; ++i) got[i] = Bf16ToF32(bf16[i]);
+  const double max_abs =
+      vllm_test::MaxAbsDiff(got, vllm_test::kLtx2RealTeWeightHeadF32, head);
+  const double max_rel = MaxRelDiff(got, vllm_test::kLtx2RealTeWeightHeadF32, head);
   INFO("max abs = " << max_abs << " max rel = " << max_rel);
   // Half an ulp of bf16 (2^-8). Not bit-exact here, unlike the FP8 case: the
   // generator multiplies nibble * group_scale * global while
@@ -562,19 +677,19 @@ TEST_CASE("ltx2 loader: a torchao module built from the shipped bytes dequantize
   std::vector<uint16_t> probe(bf16.size(), 0);
   vllm::Ltx2DequantTorchaoNvfp4ToBf16("video_aggregate_embed", w1, s, g, out_features,
                                       in_features, probe.data());
-  double probe_max_rel = 0.0;
+  const size_t probe_n = static_cast<size_t>(out_features) * static_cast<size_t>(in_features);
+  std::vector<float> probe_got(probe_n, 0.0F);
+  std::vector<float> probe_want(probe_n, 0.0F);
   for (int64_t r = 0; r < out_features; ++r) {
     for (int64_t i = 0; i < in_features; ++i) {
-      const double want =
+      const size_t k = static_cast<size_t>(r * in_features + i);
+      probe_want[k] = static_cast<float>(
           static_cast<double>(vllm_test::kLtx2RealTeScaleTileLinearF32[r * 4 + i / 16]) *
-          static_cast<double>(scale2);
-      const double got = Bf16ToF32(probe[static_cast<size_t>(r * in_features + i)]);
-      if (want != 0.0) {
-        const double rel = std::abs(got - want) / std::abs(want);
-        if (rel > probe_max_rel) probe_max_rel = rel;
-      }
+          static_cast<double>(scale2));
+      probe_got[k] = Bf16ToF32(probe[k]);
     }
   }
+  const double probe_max_rel = MaxRelDiff(probe_got, probe_want.data(), probe_n);
   INFO("per-row group-scale probe max rel = " << probe_max_rel);
   CHECK(probe_max_rel <= 0.00390625);
 
@@ -584,6 +699,84 @@ TEST_CASE("ltx2 loader: a torchao module built from the shipped bytes dequantize
   bad.shape = {out_features, in_features / 16};
   CHECK_THROWS(vllm::Ltx2DequantTorchaoNvfp4ToBf16("video_aggregate_embed", w, bad, g,
                                                    out_features, in_features, bf16.data()));
+
+  // The PACKED-WIDTH refusal has to say something a reader can act on. Naming
+  // the stored shape on both sides of "is X but the module is X" is a
+  // contradiction, not a diagnosis, so the message states the LOGICAL width the
+  // stored shape implies.
+  std::string width_what;
+  try {
+    vllm::Ltx2DequantTorchaoNvfp4ToBf16("video_aggregate_embed", w, s, g, out_features,
+                                        in_features / 2, bf16.data());
+  } catch (const std::exception& e) {
+    width_what = e.what();
+  }
+  const std::string width_msg = "what: " + width_what;
+  INFO(width_msg);
+  // stored [128, 32] -> logical [128, 64], asked for [128, 32].
+  CHECK(width_what.find("stored [128, 32]") != std::string::npos);
+  CHECK(width_what.find("LOGICAL [128, 64]") != std::string::npos);
+  CHECK(width_what.find("the module is [128, 32]") != std::string::npos);
+}
+
+TEST_CASE("ltx2 loader: the NVFP4 refusal names a tensor the checkpoint ACTUALLY has") {
+  // "Refuse BY NAME" is this phase's headline promise, and a name that appears
+  // nowhere in the file does not keep it. Ltx2DequantTorchaoNvfp4ToBf16 takes a
+  // MODULE and appends `.weight` / `.weight_scale` / `.weight_scale_2`; the DiT
+  // call site used to hand it the full tensor name, so the refusal read
+  // 'patchify_proj.weight.weight_scale' and a user grepping the checkpoint for
+  // it found nothing.
+  const Ltx2DitParams p = TinyParams();
+  SyntheticDit syn = BuildSyntheticDit(p, Ltx2DitQuant::kNvfp4, {});
+  const std::string pre = vllm::kLtx2DitCheckpointPrefix;
+  const std::string scale_name = pre + "patchify_proj.weight_scale";
+
+  // Corrupt ONLY the stored SHAPE of one scale sidecar: the same 512 bytes
+  // declared as the PADDED-LINEAR [128, 4] rather than the swizzled [32, 16].
+  // Same element count, so the safetensors reader accepts it and the refusal
+  // fires inside the torchao helper, which is the call site under test.
+  std::set<std::string> present;
+  bool patched = false;
+  for (StEntry& e : syn.entries) {
+    present.insert(e.name);
+    if (e.name == scale_name) {
+      REQUIRE(e.shape == std::vector<int64_t>{32, 16});
+      e.shape = {128, 4};
+      patched = true;
+    }
+  }
+  REQUIRE(patched);
+  const std::string path = TmpPath("nvfp4_name");
+  WriteSafetensors(syn.entries, path);
+  const SafetensorsFile file = SafetensorsFile::Open(path);
+
+  std::string what;
+  try {
+    vllm::Ltx2LoadDitFromSafetensors(file);
+  } catch (const std::exception& e) {
+    what = e.what();
+  }
+  const std::string what_msg = "what: " + what;
+  INFO(what_msg);
+  CHECK_FALSE(what.empty());
+  // The doubled component, stated directly: it must not come back.
+  CHECK(what.find(".weight.weight") == std::string::npos);
+  // Every name the message quotes must be a tensor this checkpoint carries,
+  // which is the property "refuse by name" actually claims.
+  size_t open = what.find('\'');
+  int64_t quoted = 0;
+  while (open != std::string::npos) {
+    const size_t close = what.find('\'', open + 1);
+    if (close == std::string::npos) break;
+    const std::string quoted_name = what.substr(open + 1, close - open - 1);
+    ++quoted;
+    const std::string quoted_msg = "quoted name: " + quoted_name;
+    INFO(quoted_msg);
+    CHECK(present.count(pre + quoted_name) == 1);
+    open = what.find('\'', close + 1);
+  }
+  CHECK(quoted > 0);
+  std::remove(path.c_str());
 }
 
 // ===========================================================================
@@ -816,6 +1009,16 @@ TEST_CASE("ltx2 loader: the FP8 DiT materializes onto the L2 contract, exactly")
   WriteSafetensors(syn.entries, path);
   const SafetensorsFile file = SafetensorsFile::Open(path);
 
+  // The fixture must REACH the bf16 rounding regime, or the bit-exact comparison
+  // below silently stops gating the rounding mode — which is exactly what the
+  // old power-of-two scale did. Stated as a gate, not as a comment.
+  INFO("fp8 elements = " << syn.fp8_elements
+                         << " needing a bf16 round = " << syn.fp8_rounding_elements
+                         << " non-finite = " << syn.fp8_nonfinite_elements);
+  CHECK(syn.fp8_elements > 0);
+  CHECK(syn.fp8_rounding_elements * 2 > syn.fp8_elements);
+  CHECK(syn.fp8_nonfinite_elements == 0);
+
   const vllm::Ltx2DitCheckpoint ck = vllm::Ltx2LoadDitFromSafetensors(file);
   CHECK(ck.quant == Ltx2DitQuant::kFp8);
   CHECK(ck.unported.empty());
@@ -853,12 +1056,11 @@ TEST_CASE("ltx2 loader: the FP8 DiT materializes onto the L2 contract, exactly")
   auto tbl = ck.views.find("scale_shift_table");
   REQUIRE(tbl != ck.views.end());
   CHECK(tbl->second.dtype == vt::DType::kF32);
-  double table_max_abs = 0.0;
-  for (int64_t i = 0; i < 2 * p.inner_dim(); ++i) {
-    const double d = std::abs(static_cast<double>(tbl->second.Ptr<float>()[i]) -
-                              TrueValue("scale_shift_table", static_cast<size_t>(i)));
-    if (d > table_max_abs) table_max_abs = d;
-  }
+  const size_t table_n = static_cast<size_t>(2 * p.inner_dim());
+  std::vector<float> table_got(tbl->second.Ptr<float>(), tbl->second.Ptr<float>() + table_n);
+  std::vector<float> table_want(table_n, 0.0F);
+  for (size_t i = 0; i < table_n; ++i) table_want[i] = TrueValue("scale_shift_table", i);
+  const double table_max_abs = vllm_test::MaxAbsDiff(table_got, table_want);
   INFO("table max abs = " << table_max_abs);
   CHECK(table_max_abs == 0.0);
 
@@ -932,8 +1134,9 @@ TEST_CASE("ltx2 loader: the unported families are refused by name, not absorbed"
   const Ltx2DitParams p = TinyParams();
   const SyntheticDit syn = BuildSyntheticDit(
       p, Ltx2DitQuant::kFp8,
-      {"prompt_adaln_single.linear.weight", "keyframes_abs_pos_embedding",
-       "video_embeddings_connector.learnable_registers"});
+      {"prompt_adaln_single.linear.weight", "audio_prompt_adaln_single.linear.weight",
+       "keyframes_abs_pos_embedding", "video_embeddings_connector.learnable_registers",
+       "audio_embeddings_connector.learnable_registers"});
   const std::string path = TmpPath("unported");
   WriteSafetensors(syn.entries, path);
   const SafetensorsFile file = SafetensorsFile::Open(path);
@@ -946,15 +1149,21 @@ TEST_CASE("ltx2 loader: the unported families are refused by name, not absorbed"
   }
   const std::string what_msg = "what: " + what;
   INFO(what_msg);
+  // All FIVE families the shipped DiT manifest names, not the three that were
+  // convenient: `audio_prompt_adaln_single` and `audio_embeddings_connector` go
+  // through the identical generic FamilyOf path, and covering them literally is
+  // one line each.
   CHECK(what.find("prompt_adaln_single") != std::string::npos);
+  CHECK(what.find("audio_prompt_adaln_single") != std::string::npos);
   CHECK(what.find("keyframes_abs_pos_embedding") != std::string::npos);
   CHECK(what.find("video_embeddings_connector") != std::string::npos);
+  CHECK(what.find("audio_embeddings_connector") != std::string::npos);
 
   // The opt-in still REPORTS every one of them; it does not make them vanish.
   Ltx2DitLoadOptions options;
   options.allow_unported_modules = true;
   const vllm::Ltx2DitCheckpoint ck = vllm::Ltx2LoadDitFromSafetensors(file, options);
-  CHECK(ck.unported.size() == 3);
+  CHECK(ck.unported.size() == 5);
   CHECK(ck.checkpoint_params.use_prompt_adaln_single);
   CHECK_FALSE(ck.params.use_prompt_adaln_single);
   std::remove(path.c_str());
@@ -975,11 +1184,12 @@ TEST_CASE("ltx2 loader: the f32 widening is OPT-IN and bit-exact over bf16") {
     auto it = ck.views.find(kv.first);
     REQUIRE(it != ck.views.end());
     REQUIRE(it->second.dtype == vt::DType::kF32);
-    const float* got = it->second.Ptr<float>();
-    for (size_t i = 0; i < kv.second.size(); ++i) {
-      const double d = std::abs(static_cast<double>(got[i]) - Bf16ToF32(kv.second[i]));
-      if (d > max_abs) max_abs = d;
-    }
+    const std::vector<float> got(it->second.Ptr<float>(),
+                                 it->second.Ptr<float>() + kv.second.size());
+    std::vector<float> want(kv.second.size(), 0.0F);
+    for (size_t i = 0; i < kv.second.size(); ++i) want[i] = Bf16ToF32(kv.second[i]);
+    const double d = vllm_test::MaxAbsDiff(got, want);
+    if (!(d <= max_abs)) max_abs = d;
   }
   INFO("widen max abs = " << max_abs);
   CHECK(max_abs == 0.0);
@@ -1138,12 +1348,10 @@ TEST_CASE("ltx2 loader: the torchao text encoder materializes onto the L3 contra
   CHECK(w.video.out_features == video_out);
   CHECK(w.video.in_features == hidden * (layers + 1));
   CHECK(w.video.bias.size() == static_cast<size_t>(video_out));
-  double max_abs = 0.0;
-  for (size_t i = 0; i < w.video.weight.size(); ++i) {
-    const double d =
-        std::abs(static_cast<double>(w.video.weight[i]) - Bf16ToF32(ck.video.weight_bf16[i]));
-    if (d > max_abs) max_abs = d;
-  }
+  REQUIRE(w.video.weight.size() == ck.video.weight_bf16.size());
+  std::vector<float> te_want(w.video.weight.size(), 0.0F);
+  for (size_t i = 0; i < te_want.size(); ++i) te_want[i] = Bf16ToF32(ck.video.weight_bf16[i]);
+  const double max_abs = vllm_test::MaxAbsDiff(w.video.weight, te_want);
   INFO("te widen max abs = " << max_abs);
   CHECK(max_abs == 0.0);
   std::remove(path.c_str());

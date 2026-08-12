@@ -15,17 +15,23 @@ sections and their provenance is recorded separately.
    same permutation a second time as `swizzle_blockscale`
    (vllm/model_executor/layers/quantization/utils/nvfp4_utils.py:44-49).
 
-   `to_blocked_torch` below is that function's `backend="torch"` body,
-   TRANSCRIBED VERBATIM, and `--vllm` pins the source it was transcribed from:
-   the generator diffs its own transcription against the checkout's live text
-   and REFUSES on any drift, so the copy cannot silently rot.
+   This generator EXECUTES that function. `import vllm.*` dies in
+   `vllm.distributed` on a missing `zmq`, but qutlass_utils.py itself imports
+   only torch, `vllm.triton_utils` and `vllm.utils.math_utils`, all of which
+   load, so `importlib.util.spec_from_file_location` runs the pinned FILE
+   directly and `to_blocked(x, backend="torch")` is called for real. The goldens
+   below therefore come from the producer upstream itself calls, not from a copy
+   of it. `--vllm` pins the checkout, and `check_transcription` additionally
+   diffs the body the C++ INVERSE was written against, so a change to the
+   permutation is caught as a source change and not only as a golden diff.
 
-   HONEST LIMIT, recorded rather than papered over: vLLM is not IMPORTABLE on
-   this host (no installed package, `import vllm.*` dies in `vllm.distributed`
-   on a missing `zmq`), and `swizzle_blockscale` calls `.cuda()` unconditionally,
-   so neither producer can be EXECUTED here. This section is therefore gated
-   against a pinned transcription, not against a running oracle. Executing
-   `to_blocked` on a host where vLLM imports is OWED.
+   The `backend="triton"` arm is NOT exercised: it dispatches to a Triton kernel
+   and this host has no active driver. That arm is a separate implementation of
+   the same permutation upstream, and gating it needs a GPU host.
+
+   `swizzle_blockscale` — vLLM's SECOND writing of the same permutation — still
+   cannot be executed here, because it calls `.cuda()` unconditionally. It is
+   pinned by source fragment only, and that is stated where it is checked.
 
 2. THE REAL CHECKPOINT BYTES (`kLtx2Real*`). These come off the SHIPPED files on
    $CHECKPOINT_ROOT — a few hundred bytes read at their own offsets, never a
@@ -48,6 +54,7 @@ Needs torch + numpy (CPU only).
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import struct
 import subprocess
@@ -102,9 +109,13 @@ def pinned_revision(root: Path, label: str, paths: list[str]) -> tuple[str, bool
 # The transcription, and the pin that keeps it honest
 # ---------------------------------------------------------------------------
 
-# Transcribed VERBATIM from vllm/model_executor/layers/quantization/
-# qutlass_utils.py:174-180 (the `backend="torch"` body of `to_blocked`). The
-# `cdiv` calls are inlined as the assert below already forces exact multiples.
+# The `backend="torch"` body of `to_blocked`, verbatim from
+# vllm/model_executor/layers/quantization/qutlass_utils.py:167-180. Nothing here
+# is EXECUTED — the goldens come from calling the real function — so this is not
+# a second hand-typing that could drift from what runs. It is the text the C++
+# inverse in Ltx2UnswizzleNvfp4BlockScale was written against, pinned so that a
+# change to the permutation upstream is reported as a source change rather than
+# only as a silent golden diff on the next regeneration.
 _TO_BLOCKED_SOURCE_ANCHOR = """    rows, cols = input_matrix.shape
     n_row_blocks = cdiv(rows, 128)
     n_col_blocks = cdiv(cols, 4)
@@ -160,17 +171,32 @@ def check_transcription(vllm_root: Path) -> None:
             )
 
 
-def to_blocked_torch(input_matrix: torch.Tensor) -> torch.Tensor:
-    rows, cols = input_matrix.shape
-    n_row_blocks = (rows + 127) // 128
-    n_col_blocks = (cols + 3) // 4
-    padded_rows = n_row_blocks * 128
-    padded_cols = n_col_blocks * 4
-    padded = input_matrix
-    assert (rows, cols) == (padded_rows, padded_cols)
-    blocks = padded.view(n_row_blocks, 128, n_col_blocks, 4).permute(0, 2, 1, 3)
-    rearranged = blocks.reshape(-1, 4, 32, 4).transpose(1, 2).reshape(-1, 32, 16)
-    return rearranged.flatten()
+def load_upstream_to_blocked(vllm_root: Path):
+    """Return vLLM's OWN `to_blocked`, executed from the pinned checkout.
+
+    `import vllm.model_executor...` pulls in `vllm.distributed`, which dies on a
+    missing `zmq` on this host. qutlass_utils.py itself needs only torch,
+    `vllm.triton_utils` and `vllm.utils.math_utils`, so loading the FILE through
+    `spec_from_file_location` runs the real function without importing the
+    package graph around it. That is what makes this a RUNNING oracle rather
+    than a transcription of one.
+    """
+    path = vllm_root / "vllm/model_executor/layers/quantization/qutlass_utils.py"
+    if not path.is_file():
+        raise SystemExit(f"not a vLLM checkout: {path} is missing")
+    # `vllm.triton_utils` / `vllm.utils.math_utils` are imported by name from
+    # inside the file, so the checkout has to be importable as a package root.
+    if str(vllm_root) not in sys.path:
+        sys.path.insert(0, str(vllm_root))
+    spec = importlib.util.spec_from_file_location("vllm_qutlass_utils_oracle", path)
+    if spec is None or spec.loader is None:
+        raise SystemExit(f"cannot load {path} as a module")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    to_blocked = getattr(module, "to_blocked", None)
+    if to_blocked is None:
+        raise SystemExit(f"{path}: no `to_blocked` to execute; the producer has MOVED")
+    return to_blocked
 
 
 # ---------------------------------------------------------------------------
@@ -285,6 +311,7 @@ def main() -> int:
     args = parser.parse_args()
 
     check_transcription(args.vllm)
+    to_blocked = load_upstream_to_blocked(args.vllm)
     vllm_sha, vllm_clean = pinned_revision(args.vllm, "vllm", _PINNED_VLLM_PATHS)
 
     root = args.checkpoint_root / "ltx-2.5/vonkaiser-fp8-nvfp4"
@@ -310,8 +337,10 @@ def main() -> int:
             else "// That vLLM checkout was entirely clean at generation time.\n"
         )
         +
-        "// The swizzle oracle is a PINNED TRANSCRIPTION of vLLM's `to_blocked`, not a\n"
-        "// running one: vLLM is not importable on the generating host. See the script.\n"
+        "// The swizzle oracle RUNS: vLLM's own `to_blocked(x, backend=\"torch\")` is\n"
+        "// loaded out of the pinned checkout and called. Its `backend=\"triton\"` arm and\n"
+        "// `swizzle_blockscale` are not executed here (no driver / unconditional\n"
+        "// .cuda()); both are pinned by source. See the script.\n"
         "//\n"
         "// Regenerate (one line; a trailing backslash in a // comment is a\n"
         "// -Werror=comment line continuation):\n"
@@ -332,7 +361,7 @@ def main() -> int:
     for idx, (rows, cols) in enumerate(cases):
         src = rand_bytes(f"blocked.{rows}x{cols}", rows * cols)
         t = torch.from_numpy(src.reshape(rows, cols).copy())
-        blocked = to_blocked_torch(t).numpy()
+        blocked = to_blocked(t, backend="torch").numpy()
         assert blocked.size == rows * cols, (blocked.size, rows * cols)
         emit_bytes(out, f"kLtx2BlockedLinear{idx}", src)
         emit_bytes(out, f"kLtx2BlockedSwizzled{idx}", blocked)
@@ -353,12 +382,13 @@ def main() -> int:
         f"// Stored shape {scale_info['shape']} (= [out/4, (in/16)*4]).\n"
     )
     emit_bytes(out, "kLtx2RealTeScaleTileSwizzled", real_tile)
-    # Unswizzle by inverting the transcription: run the SAME permute chain over an
-    # index map (int32, because a 512-entry arange does not fit in uint8) to get
-    # linear->swizzled, then scatter through it.
+    # Unswizzle by inverting the oracle rather than by re-deriving it: push an
+    # index map (int32, because a 512-entry arange does not fit in uint8) through
+    # UPSTREAM's own `to_blocked` to get linear->swizzled, then scatter through
+    # it. Writing the permute chain out a second time here would be the same
+    # hand-typing the transcription used to be.
     idx = torch.arange(128 * 4, dtype=torch.int32).reshape(128, 4)
-    blocks = idx.view(1, 128, 1, 4).permute(0, 2, 1, 3)
-    fwd = blocks.reshape(-1, 4, 32, 4).transpose(1, 2).reshape(-1).numpy()
+    fwd = to_blocked(idx, backend="torch").numpy()
     linear_tile = np.empty(128 * 4, dtype=np.uint8)
     linear_tile[fwd] = np.frombuffer(real_tile, dtype=np.uint8)
     emit_bytes(out, "kLtx2RealTeScaleTileLinear", linear_tile)
