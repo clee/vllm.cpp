@@ -29,6 +29,7 @@
 
 #include "ltx2_goldens.inc"
 
+#include "support/max_abs_diff.h"
 #include "vt/backend.h"
 #include "vt/op_provider.h"
 #include "vt/ops.h"
@@ -181,15 +182,10 @@ std::string RefusalMessage(Fn run) {
   return std::string();
 }
 
-double MaxAbsDiff(const std::vector<float>& got, const float* want, size_t count) {
-  REQUIRE(got.size() == count);
-  double worst = 0.0;
-  for (size_t i = 0; i < count; ++i) {
-    const double d = std::fabs(static_cast<double>(got[i]) - static_cast<double>(want[i]));
-    if (d > worst) worst = d;
-  }
-  return worst;
-}
+// The shared, NaN-hardened reduction. The local copy this replaces used
+// `if (d > worst) worst = d;`, and NaN is never > anything, so an all-NaN result
+// against a correct golden reduced to 0.0 and passed every bound (issue #449).
+using vllm_test::MaxAbsDiff;
 
 // Round-off floor for this gate. The oracle runs torch float32 and the port runs
 // f32 GEMMs with f64 norm accumulation, so the two differ only in the last f32
