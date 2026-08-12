@@ -2381,7 +2381,7 @@ void MoeRouterTopK(Queue& q, Tensor& weights, Tensor& indices, const Tensor& log
 // materializing expert_out/shared in the activation dtype.
 //
 // `routed_scale` is upstream's `apply_routed_scale_to_output=True` arm
-// (layers/fused_moe/runner/moe_runner.py:389-406 `fused_output *=
+// (layers/fused_moe/runner/moe_runner.py:390-407, :402-406 `fused_output *=
 // routed_scaling_factor`, then :722-725 `result = shared_output + fused_output`).
 // It multiplies the ROUTED sum ONLY — the shared-expert term is added unscaled,
 // which is the whole point of the flag and the error a token gate catches late.

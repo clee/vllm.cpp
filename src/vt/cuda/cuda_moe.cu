@@ -471,10 +471,16 @@ void MoeRouterTopKKernelCuda(Queue& q, Tensor& weights, Tensor& indices, const T
 
 // `routed_scale` multiplies the ROUTED sum only, BEFORE the shared term is added
 // — upstream's apply_routed_scale_to_output arm (layers/fused_moe/runner/
-// moe_runner.py:389-406 scales `fused_output` and leaves `shared_output` alone,
+// moe_runner.py:390-407 (:402-406) scales `fused_output`, leaves `shared_output` alone,
 // then :722-725 adds them). Applied in the same f32 accumulator the CPU
 // reference (cpu_ops.cpp MoeCombineKernel) uses, in the same order, so CPU and
 // CUDA stay bit-for-bit equal. Default 1.0f == the landed fold-into-weights arm.
+// Like the CPU reference it scales the ASSEMBLED sum, not each router weight
+// (:404 `fused_output *= factor` is one multiply on the finished tensor); the
+// fold is equal in exact arithmetic and a different f32 value. Upstream's fp16
+// arm (:403-406, divide `shared_output` instead) is unreachable here — `out` is
+// gated to f32/bf16 by `IsOutFloat` (ops.cpp:22). See cpu_ops.cpp for the full
+// note.
 template <typename Teo, typename Tsh, typename Tout>
 __global__ void MoeCombineKernel(Tout* out, const Teo* expert_out, const float* weights,
                                  const Tsh* shared, int64_t t, int64_t h, int k,

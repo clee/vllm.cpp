@@ -2493,9 +2493,20 @@ void MoeRouterTopKKernel(Queue&, Tensor& weights, Tensor& indices, const Tensor&
 // §4/§6 weighted scatter-combine: out[t,:] = sum_j w[t,j]*expert_out[t,j,:]
 // (f32 accumulation) + shared[t,:] (optional). Stored at out's dtype.
 // `routed_scale` multiplies the ROUTED sum only, BEFORE the shared term is added
-// — upstream's apply_routed_scale_to_output arm (moe_runner.py:389-406 scales
+// — upstream's apply_routed_scale_to_output arm (moe_runner.py:390-407, :402-406 scales
 // `fused_output`, leaves `shared_output` alone, then :722-725 adds them). The
 // default 1.0f is the fold-into-router-weights polarity every landed caller uses.
+// It scales the ASSEMBLED sum, not each router weight: upstream's
+// `fused_output *= factor` (:404) is one multiply on the finished tensor, so the
+// scale rounds ONCE after the K-term reduction. Folding it into `weights[j]` is
+// equal in exact arithmetic and a different f32 value (it rounds K times inside
+// the sum); Laguna is entitled to that fold (`laguna_ops.h:48`, no `shared`),
+// this path is not. Pinned bitwise in test_ops_moe_nongated_relu2.cpp.
+// NOT MIRRORED, UNREACHABLE: upstream's fp16 arm (:403-406) instead divides
+// `shared_output` by the factor to dodge an fp16 overflow. That branch is keyed
+// on `fused_output.dtype == torch.float16`; the analogue here is `out`, whose
+// dtype `MoeCombine` gates through `IsOutFloat` (ops.cpp:22 — f32/bf16 only, no
+// kF16), so no caller can reach it. Pinned by the f16-out refusal test.
 void MoeCombineKernel(Queue&, Tensor& out, const Tensor& expert_out, const Tensor& weights,
                       const Tensor* shared, float routed_scale) {
   const int64_t t = out.shape[0], h = out.shape[1], k = weights.shape[1];
