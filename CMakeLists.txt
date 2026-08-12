@@ -777,6 +777,9 @@ add_library(vllm STATIC
   src/vllm/model_executor/models/ltx2_upsampler.cpp
   src/vllm/model_executor/models/ltx2_duration_head.cpp
   src/vllm/model_executor/models/ltx2_connector.cpp
+  # LTX-2.5 (ROW MODEL-DIFFUSION-LTX25, phase L11): the conditioning items that
+  # place the VAE ENCODERS' output into the denoise state.
+  src/vllm/model_executor/models/ltx2_conditioning.cpp
   # LTX-2.5 (ROW MODEL-DIFFUSION-LTX25, phase L6): the quantized loaders — the
   # FP8 and torchao-NVFP4 DiT arms, the torchao-NVFP4 text encoder, and the
   # load-time device staging GB10's ATS penalty makes the default.

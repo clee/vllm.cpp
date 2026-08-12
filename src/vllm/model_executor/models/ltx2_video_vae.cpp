@@ -44,6 +44,8 @@
 // number should be taken from it.
 #include "vllm/model_executor/models/ltx2_video_vae.h"
 
+#include "vllm/model_executor/models/ltx2_video_vae_encoder.h"
+
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
@@ -104,10 +106,18 @@ int64_t SpatialIndex(int64_t index, int64_t size, Ltx2PaddingMode mode, bool* ze
 //   * the non-causal branch replicates the FIRST and LAST frame `(k_t - 1) / 2`
 //     times each, so the output frame count is the same either way.
 // Spatial padding is `k // 2` on each side in `spatial_padding_mode`.
+//
+// THE STRIDE IS APPLIED AFTER THE PAD, AND THE PAD DOES NOT KNOW ABOUT IT.
+// `CausalConv3d.forward` concatenates `k_t - 1` copies of frame 0 and only then
+// calls the strided `nn.Conv3d` (convolution.py:305-312), so a stride-2 temporal
+// convolution still prepends TWO frames, not one. The video ENCODER is the only
+// caller that passes a stride; every decoder call site keeps the defaults.
 Volume CausalConv3d(const Volume& in, int64_t out_channels, int64_t kernel, bool causal,
                     Ltx2PaddingMode mode, const std::vector<float>& weight,
-                    const std::vector<float>* bias) {
+                    const std::vector<float>* bias, int64_t stride_t = 1, int64_t stride_h = 1,
+                    int64_t stride_w = 1) {
   const int64_t ci = in.channels;
+  VT_CHECK(stride_t >= 1 && stride_h >= 1 && stride_w >= 1, "ltx2 conv3d: stride must be positive");
   VT_CHECK(static_cast<int64_t>(in.data.size()) == ci * in.spatial(),
            "ltx2 conv3d: input size does not match [C, T, H, W]");
   VT_CHECK(static_cast<int64_t>(weight.size()) == out_channels * ci * kernel * kernel * kernel,
@@ -141,10 +151,11 @@ Volume CausalConv3d(const Volume& in, int64_t out_channels, int64_t kernel, bool
 
   Volume out;
   out.channels = out_channels;
-  out.t = pt - kernel + 1;
-  out.h = ph - kernel + 1;
-  out.w = pw - kernel + 1;
-  VT_CHECK(out.t > 0 && out.h > 0 && out.w > 0, "ltx2 conv3d: empty output");
+  out.t = (pt - kernel) / stride_t + 1;
+  out.h = (ph - kernel) / stride_h + 1;
+  out.w = (pw - kernel) / stride_w + 1;
+  VT_CHECK(pt >= kernel && ph >= kernel && pw >= kernel && out.t > 0 && out.h > 0 && out.w > 0,
+           "ltx2 conv3d: empty output");
   out.data.resize(static_cast<size_t>(out_channels * out.spatial()));
   for (int64_t oc = 0; oc < out_channels; ++oc) {
     for (int64_t ti = 0; ti < out.t; ++ti) {
@@ -156,8 +167,10 @@ Volume CausalConv3d(const Volume& in, int64_t out_channels, int64_t kernel, bool
               for (int64_t b = 0; b < kernel; ++b) {
                 for (int64_t d = 0; d < kernel; ++d) {
                   acc += static_cast<double>(
-                             padded[static_cast<size_t>(
-                                 ((ic * pt + ti + a) * ph + hi + b) * pw + wi + d)]) *
+                             padded[static_cast<size_t>(((ic * pt + ti * stride_t + a) * ph +
+                                                         hi * stride_h + b) *
+                                                            pw +
+                                                        wi * stride_w + d)]) *
                          static_cast<double>(weight[static_cast<size_t>(
                              (((oc * ci + ic) * kernel + a) * kernel + b) * kernel + d)]);
                 }
@@ -218,7 +231,35 @@ void PixelNorm(std::vector<float>& x, int64_t channels, int64_t spatial, double 
   }
 }
 
-void ApplyNorm(const Ltx2ConvVideoDecoderConfig& config, std::vector<float>& x, int64_t channels,
+// The fields the shared convolution/normalization primitives need, so ONE set of
+// them serves both the decoder and the encoder rather than each half growing its
+// own causal pad. Nothing here is a new degree of freedom: every member is read
+// straight off whichever config the caller holds.
+struct VideoConvSpec {
+  Ltx2NormLayer norm_layer = Ltx2NormLayer::kPixelNorm;
+  int64_t norm_num_groups = 32;
+  double norm_eps = 1e-6;
+  double pixel_norm_eps = 1e-8;
+  Ltx2PaddingMode spatial_padding_mode = Ltx2PaddingMode::kZeros;
+  // The per-CALL causal flag, i.e. what upstream passes as `causal=` rather than
+  // what it passes to a constructor. The decoder takes it from `self.causal`
+  // (conv_video_decoder.py:307); the encoder never passes it at all and so always
+  // gets the `causal: bool = True` DEFAULT (convolution.py:304).
+  bool causal = true;
+};
+
+VideoConvSpec SpecOf(const Ltx2ConvVideoDecoderConfig& config) {
+  VideoConvSpec spec;
+  spec.norm_layer = config.norm_layer;
+  spec.norm_num_groups = config.norm_num_groups;
+  spec.norm_eps = config.norm_eps;
+  spec.pixel_norm_eps = config.pixel_norm_eps;
+  spec.spatial_padding_mode = config.spatial_padding_mode;
+  spec.causal = config.causal;
+  return spec;
+}
+
+void ApplyNorm(const VideoConvSpec& config, std::vector<float>& x, int64_t channels,
                int64_t spatial, const Ltx2VaeWeights& weights, const std::string& prefix) {
   if (config.norm_layer == Ltx2NormLayer::kPixelNorm) {
     PixelNorm(x, channels, spatial, config.pixel_norm_eps);
@@ -323,7 +364,7 @@ void ApplyAdaLn(Volume& x, const std::vector<float>& table, const std::vector<fl
 }
 
 // ResnetBlock3D.forward (resnet.py:121-186).
-Volume ResnetBlock3d(const Ltx2ConvVideoDecoderConfig& config, const Ltx2VaeWeights& weights,
+Volume ResnetBlock3d(const VideoConvSpec& config, const Ltx2VaeWeights& weights,
                      const std::string& prefix, const Volume& input, int64_t out_channels,
                      bool inject_noise, bool timestep_conditioning,
                      const std::vector<float>* timestep_embed, Ltx2NoiseStream* noise) {
@@ -374,7 +415,7 @@ Volume ResnetBlock3d(const Ltx2ConvVideoDecoderConfig& config, const Ltx2VaeWeig
 // DepthToSpaceUpsample.forward (sampling.py:93-123). The channel unpack is
 // `(c p1 p2 p3)` with p1 temporal and p2/p3 spatial, and a temporal stride of 2
 // DROPS THE FIRST FRAME afterwards.
-Volume DepthToSpaceUpsample(const Ltx2ConvVideoDecoderConfig& config, const Ltx2VaeWeights& weights,
+Volume DepthToSpaceUpsample(const VideoConvSpec& config, const Ltx2VaeWeights& weights,
                             const std::string& prefix, const Volume& x, int64_t st, int64_t sh,
                             int64_t sw, int64_t reduction, bool residual) {
   const int64_t stride_product = st * sh * sw;
@@ -567,6 +608,7 @@ Ltx2VideoFrames Ltx2ConvVideoDecode(const Ltx2ConvVideoDecoderConfig& config,
   VT_CHECK(static_cast<int64_t>(latent.size()) == latent_channels * latent_t * latent_h * latent_w,
            "ltx2 video vae: latent size does not match [C, T, H, W]");
   const std::string p = config.prefix;
+  const VideoConvSpec spec = SpecOf(config);
 
   Volume x;
   x.channels = latent_channels;
@@ -648,14 +690,14 @@ Ltx2VideoFrames Ltx2ConvVideoDecode(const Ltx2ConvVideoDecoderConfig& config,
         embed_ptr = &embed;
       }
       for (int64_t i = 0; i < block.num_layers; ++i) {
-        x = ResnetBlock3d(config, weights, bp + ".res_blocks." + std::to_string(i), x, x.channels,
+        x = ResnetBlock3d(spec, weights, bp + ".res_blocks." + std::to_string(i), x, x.channels,
                           block.inject_noise, config.timestep_conditioning, embed_ptr, noise);
       }
     } else if (block.name == "res_x_y") {
       const int64_t out_channels = x.channels / (block.multiplier != 0 ? block.multiplier : 2);
       // _make_decoder_block forces timestep_conditioning=False for res_x_y
       // (conv_video_decoder.py:107).
-      x = ResnetBlock3d(config, weights, bp, x, out_channels, block.inject_noise,
+      x = ResnetBlock3d(spec, weights, bp, x, out_channels, block.inject_noise,
                         /*timestep_conditioning=*/false, nullptr, noise);
     } else if (block.name == "attn") {
       x = AttnBlock3d(weights, bp, x);
@@ -663,7 +705,7 @@ Ltx2VideoFrames Ltx2ConvVideoDecode(const Ltx2ConvVideoDecoderConfig& config,
                block.name == "compress_all") {
       const int64_t st = block.name == "compress_space" ? 1 : 2;
       const int64_t ss = block.name == "compress_time" ? 1 : 2;
-      x = DepthToSpaceUpsample(config, weights, bp, x, st, ss, ss,
+      x = DepthToSpaceUpsample(spec, weights, bp, x, st, ss, ss,
                                block.multiplier != 0 ? block.multiplier : 1,
                                block.name == "compress_all" && block.residual);
     } else if (block.name == "attn_res_x") {
@@ -741,6 +783,353 @@ Ltx2VideoFrames Ltx2VideoDecode(Ltx2VideoDecoderKind kind,
            "downgraded to the Conv video VAE, which would silently return a worse render");
   return Ltx2ConvVideoDecode(config, weights, latent, latent_channels, latent_t, latent_h, latent_w,
                              noise, timestep);
+}
+
+// ===========================================================================
+// THE ENCODER HALF (video_vae.py:39-336), which phase L4 recorded as owed.
+//
+// It lives in this translation unit deliberately, so that `CausalConv3d`,
+// `PixelNorm`, `ApplyNorm`, `ResnetBlock3d` and `AttnBlock3d` are the SAME
+// functions the decoder is gated on rather than a second copy of each. The one
+// primitive the decoder never needed is a STRIDE on the causal convolution, and
+// that was added to the shared function above rather than forked here.
+// ===========================================================================
+
+namespace {
+
+// patchify (ops.py:6-32), the 5-D arm with patch_size_t = 1:
+//   `b c (f p) (h q) (w r) -> b (c p r q) f h w`
+// r is the OUTER spatial factor and q the inner one, and h takes q while w takes
+// r. That is the exact inverse of the decoder's unpatchify above; swapping r and
+// q transposes every patch and still type-checks.
+Volume Patchify(const Volume& in, int64_t patch) {
+  if (patch == 1) return in;
+  VT_CHECK(in.h % patch == 0 && in.w % patch == 0,
+           "ltx2 video encoder: height and width must be whole multiples of patch_size");
+  Volume out;
+  out.channels = in.channels * patch * patch;
+  out.t = in.t;
+  out.h = in.h / patch;
+  out.w = in.w / patch;
+  out.data.resize(static_cast<size_t>(out.channels * out.spatial()));
+  for (int64_t c = 0; c < in.channels; ++c) {
+    for (int64_t ri = 0; ri < patch; ++ri) {
+      for (int64_t qi = 0; qi < patch; ++qi) {
+        const int64_t dst_c = (c * patch + ri) * patch + qi;
+        for (int64_t f = 0; f < out.t; ++f) {
+          for (int64_t hi = 0; hi < out.h; ++hi) {
+            for (int64_t wi = 0; wi < out.w; ++wi) {
+              out.data[out.At(dst_c, f, hi, wi)] =
+                  in.data[in.At(c, f, hi * patch + qi, wi * patch + ri)];
+            }
+          }
+        }
+      }
+    }
+  }
+  return out;
+}
+
+// The space-to-depth fold both branches of SpaceToDepthDownsample share:
+//   `b c (d p1) (h p2) (w p3) -> b (c p1 p2 p3) d h w`   (sampling.py:43-49, 55-61)
+Volume SpaceToDepthFold(const Volume& in, int64_t st, int64_t sh, int64_t sw) {
+  VT_CHECK(in.t % st == 0 && in.h % sh == 0 && in.w % sw == 0,
+           "ltx2 video encoder: space-to-depth needs each axis to be a whole multiple of its "
+           "stride");
+  Volume out;
+  out.channels = in.channels * st * sh * sw;
+  out.t = in.t / st;
+  out.h = in.h / sh;
+  out.w = in.w / sw;
+  out.data.resize(static_cast<size_t>(out.channels * out.spatial()));
+  for (int64_t c = 0; c < in.channels; ++c) {
+    for (int64_t p1 = 0; p1 < st; ++p1) {
+      for (int64_t p2 = 0; p2 < sh; ++p2) {
+        for (int64_t p3 = 0; p3 < sw; ++p3) {
+          const int64_t dst_c = ((c * st + p1) * sh + p2) * sw + p3;
+          for (int64_t ti = 0; ti < out.t; ++ti) {
+            for (int64_t hi = 0; hi < out.h; ++hi) {
+              for (int64_t wi = 0; wi < out.w; ++wi) {
+                out.data[out.At(dst_c, ti, hi, wi)] =
+                    in.data[in.At(c, ti * st + p1, hi * sh + p2, wi * sw + p3)];
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+  return out;
+}
+
+// SpaceToDepthDownsample.forward (sampling.py:34-65). Three things that fail
+// silently and are therefore spelled out:
+//  * a temporal stride of 2 DUPLICATES FRAME 0 first (sampling.py:39-40), and the
+//    duplication happens BEFORE both the skip fold and the convolution;
+//  * the skip is a GROUP MEAN over `group_size` contiguous folded channels
+//    (`b (c g) d h w -> b c g d h w` then `.mean(dim=2)`, sampling.py:50-51) —
+//    c is the OUTER factor, so group g is contiguous;
+//  * the convolution emits `out_channels / prod(stride)` channels and the fold
+//    multiplies them back up (sampling.py:27, 55-61).
+Volume SpaceToDepthDownsample(const VideoConvSpec& spec, const Ltx2VaeWeights& weights,
+                              const std::string& prefix, const Volume& x, int64_t st, int64_t sh,
+                              int64_t sw, int64_t out_channels) {
+  const int64_t stride_product = st * sh * sw;
+  VT_CHECK(out_channels % stride_product == 0,
+           "ltx2 video encoder: SpaceToDepthDownsample needs out_channels divisible by the stride "
+           "product (sampling.py:27)");
+  const int64_t conv_out_channels = out_channels / stride_product;
+  const int64_t folded = x.channels * stride_product;
+  VT_CHECK(folded % out_channels == 0,
+           "ltx2 video encoder: SpaceToDepthDownsample needs in_channels * prod(stride) divisible "
+           "by out_channels (sampling.py:23)");
+  const int64_t group_size = folded / out_channels;
+
+  Volume grown = x;
+  if (st == 2) {
+    grown.t = x.t + 1;
+    grown.data.resize(static_cast<size_t>(grown.channels * grown.spatial()));
+    for (int64_t c = 0; c < grown.channels; ++c) {
+      for (int64_t ti = 0; ti < grown.t; ++ti) {
+        const int64_t src_t = ti == 0 ? 0 : ti - 1;
+        for (int64_t hi = 0; hi < grown.h; ++hi) {
+          for (int64_t wi = 0; wi < grown.w; ++wi) {
+            grown.data[grown.At(c, ti, hi, wi)] = x.data[x.At(c, src_t, hi, wi)];
+          }
+        }
+      }
+    }
+  }
+
+  // --- the skip: fold, then average each contiguous group of `group_size` ---
+  const Volume folded_in = SpaceToDepthFold(grown, st, sh, sw);
+  Volume skip;
+  skip.channels = out_channels;
+  skip.t = folded_in.t;
+  skip.h = folded_in.h;
+  skip.w = folded_in.w;
+  skip.data.resize(static_cast<size_t>(skip.channels * skip.spatial()));
+  const int64_t n = skip.spatial();
+  for (int64_t c = 0; c < out_channels; ++c) {
+    for (int64_t i = 0; i < n; ++i) {
+      double acc = 0.0;
+      for (int64_t g = 0; g < group_size; ++g) {
+        acc += static_cast<double>(
+            folded_in.data[static_cast<size_t>((c * group_size + g) * n + i)]);
+      }
+      skip.data[static_cast<size_t>(c * n + i)] =
+          static_cast<float>(acc / static_cast<double>(group_size));
+    }
+  }
+
+  // --- the conv branch, at stride 1, on the SAME duplicated input ---
+  const Volume convolved =
+      CausalConv3d(grown, conv_out_channels, 3, spec.causal, spec.spatial_padding_mode,
+                   weights.Get(prefix + ".conv.conv.weight"),
+                   &weights.Get(prefix + ".conv.conv.bias"));
+  Volume out = SpaceToDepthFold(convolved, st, sh, sw);
+  VT_CHECK(out.data.size() == skip.data.size(),
+           "ltx2 video encoder: SpaceToDepthDownsample skip and conv shapes must match");
+  for (size_t i = 0; i < out.data.size(); ++i) out.data[i] += skip.data[i];
+  return out;
+}
+
+bool StartsWith(const std::string& value, const char* prefix) {
+  return value.rfind(prefix, 0) == 0;
+}
+
+VideoConvSpec SpecOf(const Ltx2ConvVideoEncoderConfig& config) {
+  VideoConvSpec spec;
+  spec.norm_layer = config.norm_layer;
+  spec.norm_num_groups = config.norm_num_groups;
+  spec.norm_eps = config.norm_eps;
+  spec.pixel_norm_eps = config.pixel_norm_eps;
+  spec.spatial_padding_mode = config.spatial_padding_mode;
+  // The ENCODER never passes `causal=` to anything it calls (video_vae.py:292-299),
+  // so every convolution takes the `causal: bool = True` DEFAULT. There is no
+  // knob, and inventing one would let a caller build a non-causal encoder upstream
+  // cannot produce.
+  spec.causal = true;
+  return spec;
+}
+
+// `_make_encoder_block`'s out_channels arithmetic (video_vae.py:39-145). The
+// plain strided convolutions keep `in_channels`; every `*_x_y` and `*_res` kind
+// multiplies by `block_config.get("multiplier", 2)`.
+int64_t EncoderBlockOutChannels(const Ltx2VideoEncoderBlock& block, int64_t in_channels) {
+  const int64_t multiplier = block.multiplier != 0 ? block.multiplier : 2;
+  if (block.name == "res_x_y" || block.name == "compress_all_x_y" ||
+      block.name == "compress_all_res" || block.name == "compress_space_res" ||
+      block.name == "compress_time_res") {
+    return in_channels * multiplier;
+  }
+  return in_channels;
+}
+
+}  // namespace
+
+int64_t Ltx2VideoTemporalScaleFactor(const std::vector<Ltx2VideoEncoderBlock>& blocks) {
+  int64_t steps = 0;
+  for (const Ltx2VideoEncoderBlock& block : blocks) {
+    if (StartsWith(block.name, "compress_time") || StartsWith(block.name, "compress_all")) ++steps;
+  }
+  return int64_t{1} << steps;
+}
+
+int64_t Ltx2VideoSpatialScaleFactor(const std::vector<Ltx2VideoEncoderBlock>& blocks,
+                                    int64_t patch_size) {
+  int64_t steps = 0;
+  for (const Ltx2VideoEncoderBlock& block : blocks) {
+    if (StartsWith(block.name, "compress_space") || StartsWith(block.name, "compress_all")) ++steps;
+  }
+  return patch_size * (int64_t{1} << steps);
+}
+
+Ltx2LatentVolume Ltx2ConvVideoEncode(const Ltx2ConvVideoEncoderConfig& config,
+                                     const Ltx2VaeWeights& weights,
+                                     const std::vector<float>& frames, int64_t channels,
+                                     int64_t frame_count, int64_t height, int64_t width,
+                                     int64_t* out_cropped_frames) {
+  VT_CHECK(channels == config.in_channels,
+           "ltx2 video encoder: input channel count does not match in_channels");
+  VT_CHECK(static_cast<int64_t>(frames.size()) == channels * frame_count * height * width,
+           "ltx2 video encoder: input size does not match [C, F, H, W]");
+  VT_CHECK(frame_count >= 1, "ltx2 video encoder: at least one frame is required");
+  // `latent_log_var="none"` is REFUSED rather than reproduced. Upstream skips the
+  // uniform/constant fix-ups and then still runs `torch.chunk(sample, 2, dim=1)`
+  // (video_vae.py:335), so the means carry HALF of `out_channels` while
+  // `per_channel_statistics` carries `out_channels` — the broadcast in
+  // `normalize` (ops.py:81-84) raises. Reproducing "whatever it does" would mean
+  // inventing semantics upstream does not have.
+  VT_CHECK(config.latent_log_var != Ltx2LogVarianceType::kNone,
+           "ltx2 video encoder: latent_log_var=`none` cannot produce a latent — upstream still "
+           "chunks the conv_out into two halves (video_vae.py:335), leaving out_channels/2 mean "
+           "channels against out_channels per-channel statistics, and PerChannelStatistics."
+           "normalize raises on the broadcast (video_vae/ops.py:81-84)");
+
+  const std::string p = config.prefix;
+  const VideoConvSpec spec = SpecOf(config);
+
+  // --- the frame-count crop (video_vae.py:276-286) ---
+  // Upstream WARNS and crops rather than failing, so a caller that quietly hands
+  // an invalid count gets a SHORTER clip, not an error. The count is reported.
+  const int64_t temporal_factor = Ltx2VideoTemporalScaleFactor(config.encoder_blocks);
+  const int64_t cropped = (frame_count - 1) % temporal_factor;
+  const int64_t kept = frame_count - cropped;
+  if (out_cropped_frames != nullptr) *out_cropped_frames = cropped;
+
+  Volume x;
+  x.channels = channels;
+  x.t = kept;
+  x.h = height;
+  x.w = width;
+  x.data.resize(static_cast<size_t>(x.channels * x.spatial()));
+  for (int64_t c = 0; c < channels; ++c) {
+    for (int64_t f = 0; f < kept; ++f) {
+      const size_t src = static_cast<size_t>((c * frame_count + f) * height * width);
+      std::copy(frames.begin() + static_cast<ptrdiff_t>(src),
+                frames.begin() + static_cast<ptrdiff_t>(src + static_cast<size_t>(height * width)),
+                x.data.begin() + static_cast<ptrdiff_t>(x.At(c, f, 0, 0)));
+    }
+  }
+
+  // --- patchify -> conv_in (video_vae.py:291-292) ---
+  x = Patchify(x, config.patch_size);
+  x = CausalConv3d(x, config.out_channels, 3, spec.causal, spec.spatial_padding_mode,
+                   weights.Get(p + "conv_in.conv.weight"), &weights.Get(p + "conv_in.conv.bias"));
+
+  // --- the FORWARD block walk (video_vae.py:221-236, 294-295) ---
+  int64_t index = 0;
+  for (const Ltx2VideoEncoderBlock& block : config.encoder_blocks) {
+    const std::string bp = p + "down_blocks." + std::to_string(index);
+    const int64_t out_channels = EncoderBlockOutChannels(block, x.channels);
+    if (block.name == "res_x") {
+      // UNetMidBlock3D, built with neither timestep conditioning nor noise
+      // injection: `_make_encoder_block` passes neither (video_vae.py:52-60), so
+      // both take their `False` defaults (resnet.py:219-220).
+      for (int64_t i = 0; i < block.num_layers; ++i) {
+        x = ResnetBlock3d(spec, weights, bp + ".res_blocks." + std::to_string(i), x, x.channels,
+                          /*inject_noise=*/false, /*timestep_conditioning=*/false, nullptr,
+                          nullptr);
+      }
+    } else if (block.name == "res_x_y") {
+      x = ResnetBlock3d(spec, weights, bp, x, out_channels, /*inject_noise=*/false,
+                        /*timestep_conditioning=*/false, nullptr, nullptr);
+    } else if (block.name == "attn") {
+      x = AttnBlock3d(weights, bp, x);
+    } else if (block.name == "compress_time" || block.name == "compress_space" ||
+               block.name == "compress_all" || block.name == "compress_all_x_y") {
+      // Plain strided CausalConv3d (video_vae.py:72-112). `compress_all_x_y` is
+      // the only one of the four that changes the channel count.
+      const int64_t st = block.name == "compress_space" ? 1 : 2;
+      const int64_t ss = block.name == "compress_time" ? 1 : 2;
+      x = CausalConv3d(x, out_channels, 3, spec.causal, spec.spatial_padding_mode,
+                       weights.Get(bp + ".conv.weight"), &weights.Get(bp + ".conv.bias"), st, ss,
+                       ss);
+    } else if (block.name == "compress_all_res" || block.name == "compress_space_res" ||
+               block.name == "compress_time_res") {
+      const int64_t st = block.name == "compress_space_res" ? 1 : 2;
+      const int64_t ss = block.name == "compress_time_res" ? 1 : 2;
+      x = SpaceToDepthDownsample(spec, weights, bp, x, st, ss, ss, out_channels);
+    } else {
+      VT_CHECK(false, "ltx2 video encoder: unknown encoder block `" + block.name + "`");
+    }
+    ++index;
+  }
+
+  // --- conv_norm_out -> SiLU -> conv_out (video_vae.py:239-262, 297-299) ---
+  if (config.norm_layer == Ltx2NormLayer::kPixelNorm) {
+    PixelNorm(x.data, x.channels, x.spatial(), config.pixel_norm_eps);
+  } else {
+    MiniMaxH3GroupNorm3d(x.data, x.channels, x.spatial(), config.norm_num_groups,
+                         weights.Get(p + "conv_norm_out.weight"),
+                         weights.Get(p + "conv_norm_out.bias"), config.norm_eps);
+  }
+  Silu(x.data);
+  int64_t conv_out_channels = config.out_channels;
+  if (config.latent_log_var == Ltx2LogVarianceType::kPerChannel) {
+    conv_out_channels *= 2;
+  } else if (config.latent_log_var == Ltx2LogVarianceType::kUniform ||
+             config.latent_log_var == Ltx2LogVarianceType::kConstant) {
+    conv_out_channels += 1;
+  }
+  x = CausalConv3d(x, conv_out_channels, 3, spec.causal, spec.spatial_padding_mode,
+                   weights.Get(p + "conv_out.conv.weight"), &weights.Get(p + "conv_out.conv.bias"));
+
+  // --- the log-variance fix-ups and the mean split (video_vae.py:301-336) ---
+  // Only the MEANS survive, so the fix-ups matter for exactly one reason: they
+  // decide WHICH channels the split calls means. kUniform must drop the single
+  // trailing logvar channel; kConstant must drop it too. Getting either wrong
+  // shifts the whole latent by one channel.
+  VT_CHECK(conv_out_channels >= 2,
+           "ltx2 video encoder: conv_out must emit at least 2 channels (video_vae.py:308-312)");
+  const int64_t latent_channels = config.out_channels;
+  VT_CHECK(x.channels >= latent_channels,
+           "ltx2 video encoder: conv_out emitted fewer channels than the latent width");
+
+  const std::vector<float>& std_of_means = weights.Get(p + "per_channel_statistics.std-of-means");
+  const std::vector<float>& mean_of_means = weights.Get(p + "per_channel_statistics.mean-of-means");
+  VT_CHECK(static_cast<int64_t>(std_of_means.size()) == latent_channels &&
+               static_cast<int64_t>(mean_of_means.size()) == latent_channels,
+           "ltx2 video encoder: per-channel statistics must have one value per latent channel");
+
+  Ltx2LatentVolume out;
+  out.batch = 1;
+  out.channels = latent_channels;
+  out.frames = x.t;
+  out.height = x.h;
+  out.width = x.w;
+  out.data.resize(static_cast<size_t>(out.elems()));
+  const int64_t elems = x.spatial();
+  for (int64_t c = 0; c < latent_channels; ++c) {
+    const double mean = mean_of_means[static_cast<size_t>(c)];
+    const double denom = std_of_means[static_cast<size_t>(c)];
+    for (int64_t i = 0; i < elems; ++i) {
+      out.data[static_cast<size_t>(c * elems + i)] = static_cast<float>(
+          (static_cast<double>(x.data[static_cast<size_t>(c * elems + i)]) - mean) / denom);
+    }
+  }
+  return out;
 }
 
 }  // namespace vllm

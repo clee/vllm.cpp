@@ -318,12 +318,26 @@ the config parse and weight-name mapping be tested before the forward exists.
 
 ### LTX-2.5 has no user-facing entrypoint yet
 
-LTX-2.5 is being ported in phases. Its two VAE decoders and its pipeline layer
-(the sigma schedule, the diffusion steps, guidance, the latent spatial x2
-upsampler, the duration head and the embeddings connector) are implemented and
-gated, but no CLI flag, server endpoint or C ABI call reaches them, so there is
-nothing to run here yet and no request shape to document. Do not infer from
-[FEATURES](FEATURES.md) that a render is available.
+LTX-2.5 is being ported in phases. Its two VAE decoders, its two VAE ENCODERS
+with the mel front-end, the conditioning items that place encoded latents into
+the token stream, and its pipeline layer (the sigma schedule, the diffusion
+steps, guidance, the latent spatial x2 upsampler, the duration head and the
+embeddings connector) are implemented and gated, but no CLI flag, server
+endpoint or C ABI call reaches them, so there is nothing to run here yet and no
+request shape to document. Do not infer from [FEATURES](FEATURES.md) that a
+render is available.
+
+In particular, the encoders being present does NOT mean image, keyframe,
+reference-video or reference-audio conditioning is usable: the video engine
+still refuses every one of those by name, because the request-side work between
+a file on disk and a tensor the encoder accepts — image decode, aspect-fill
+resize, and the H.264 CRF re-compression upstream performs before encoding — is
+not ported. Two encoder-level limits are worth stating in advance because they
+are refusals rather than approximations. A reference waveform whose sample rate
+differs from the audio VAE's is refused rather than resampled, since upstream
+uses a polyphase kaiser resampler this project does not carry. And a VAE
+configured with `latent_log_var: none` is refused, because upstream itself
+raises on it.
 
 One behaviour is worth stating in advance, because it decides what you get when
 the entrypoint does arrive. LTX-2.5 ships two video decoders behind one
