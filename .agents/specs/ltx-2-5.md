@@ -515,6 +515,46 @@ slaney/slaney normalisation, centered-reflect padding and `power=1.0` rest on `l
 alone. That is recorded at the code site. A single-source fact is weaker evidence than a
 cross-checked one and should be labelled as such rather than blend into the rest.
 
+## 3.4 The tower's oracle existed all along, and BOS is the second disagreement
+
+Recorded 2026-08-13 from L10.
+
+**L3's blocker was a `transformers` VERSION, not a property of the tower.** L3 recorded that
+the Gemma-4 tower could not be gated because `gemma4_unified` was absent from `CONFIG_MAPPING`.
+Established by execution, both directions: `/usr/bin/python3` at transformers **5.3.0** raises
+`KeyError 'gemma4_unified'` (reproducing the blocker exactly), while a venv at **5.12.1**
+builds and RUNS it. So the tower is now held to a running upstream instead of to invariants
+derived from its own output — `gemma4.h` had said "grounded + compiles" since it landed, and
+compiling is not running.
+
+**The tolerance is measured, not chosen.** The generator measures how far UPSTREAM'S OWN answer
+moves between f32 and bf16, per hidden state, and emits that as the bound. The worst state
+reaches 0.71x of its own floor and state 0 is bit-identical — i.e. we are closer to
+upstream-in-bf16 than upstream-in-bf16 is to upstream-in-f32, at every layer. It cannot be
+loosened to rescue a failure: loosening it means regenerating it, which means the oracle moved.
+That is the shape every tolerance on this campaign should have had.
+
+**The second real disagreement (§3.3 was the first): BOS.** diffusers relies on
+`add_special_tokens=True`, which on THIS tokenizer adds nothing — so following it would **drop
+token 0 of every prompt**. `ltx_core` does not. We follow `ltx_core`, and the measurement is
+recorded in the goldens header. Tokenization is token-exact against HuggingFace over the
+shipped 262144-entry vocab, four prompts x 1024 positions, first mismatching index -1 on all
+four.
+
+**The Gemma config came from an 84 KB range request.** The `vonkaiser` build has no
+`__metadata__` at all, so the config had to come out of band; L10 read it authoritatively from
+the OFFICIAL bf16 checkpoint's safetensors header without downloading the payload. It
+independently re-confirms §1.4's corrected 188160 width.
+
+**Why `has_encoder()` is still false, and this is the honest part.** Upstream routes each
+stream through an `Embeddings1DConnector` before cross-attention. Its math is ported
+(`Ltx2ConnectorForward`), but its WEIGHTS are not loaded: they ship inside the DiT file as
+`video_embeddings_connector.*` / `audio_embeddings_connector.*` (**372 tensors, measured**) and
+are still among the modules the loader refuses as unported. So conditioning has nowhere to go,
+and flipping the flag would promise a render that cannot complete. L10 MOVED the refusal rather
+than lifting it — `encoder_path` still refuses, but the message now names the connector weights
+instead of the tower, because the old message became false.
+
 ## 4. Checkpoint access and placement
 
 Verified against the HF API on 2026-08-11 with the session token:
@@ -610,6 +650,24 @@ All on `row/MODEL-DIFFUSION-LTX25`, one PR.
 | **L6** | NVFP4 DiT + NVFP4 TE arms; GB10 load-time residency | quantized vs bf16 wiring gate; residency per the ATS finding |
 | **L7** | e2e on dgx.casa under `flock`; `/v1/videos` route | valid MP4+WAV; speed axis recorded `PENDING` per §0 |
 | **L8** | Device-resident DiT forward on GB10; the CUDA `vt::AttentionCross` it needed | every dispatched op `vt-native` on a CUDA queue, ZERO reference-tier hits; device-vs-host at f32 round-off against the SAME upstream goldens |
+| **L9a** | NVFP4 DiT: swizzled + hi-nibble-first (§4.1) | loads AND correlates ~0.9956 against the FP8 file's dequant, not merely finite |
+| **L9b** | Real render on shipped weights; `--video-family`, `--video-extra` | frames + WAV + MP4 from the 21B FP8 DiT under its DECLARED config |
+| **L9c** | Connector wiring + the missing pool Drain | conditioning real, not synthetic; peak device usage measured per phase |
+| **L10** | The Gemma-4 tower, so a prompt works | gated against a RUNNING upstream, tolerance MEASURED from upstream's own f32-to-bf16 spread |
+| **L11** | VAE encoders + image/keyframe/reference conditioning | both encoders at f32 round-off; the conditioning items EXACT |
+
+### 8.0 Two phases landed WITHOUT a spec, and both are the operator's failure
+
+L8 and **L10** were dispatched and landed with no spec section, against AGENTS.md's
+"committed *before* implementation, never written up afterwards". In both cases a phase brief
+stood in for the spec. That is the operator's error twice over, recorded rather than backfilled
+as though the order had been kept. §8.1 sets out what L8's spec would have had to say; the
+phase table above now carries L9a-L11 so the remaining phases are at least declared.
+
+The cost is measurable and was predicted in §8.1: a written scope would plausibly have caught
+the ungated config adoption in L7, and — for L10 — would have forced the question "what is the
+oracle for the tower?" up front, which is exactly the question whose answer turned out to be
+*a newer transformers*.
 
 ### 8.1 L8 — written AFTER the fact, and that is a process failure
 
