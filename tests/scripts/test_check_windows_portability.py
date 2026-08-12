@@ -33,6 +33,41 @@ NOMINMAX_REAL_CLOSURE = (
 )
 
 
+_ORACLE_DECLARATION_TYPE = re.compile(
+    r"\b(?:vt::Backend|Queue|(?:const\s+)?Device|"
+    r"std::vector\s*<\s*(?:float|int64_t)\s*>)\s*(?:[&*]\s*)?"
+)
+
+
+def _oracle_declarator_names(source: str) -> set[str]:
+    """Return names declared with the unbound oracle's relevant types."""
+    names: set[str] = set()
+    for type_match in _ORACLE_DECLARATION_TYPE.finditer(source):
+        declarators = []
+        start = type_match.end()
+        depths = {"(": 0, "[": 0, "{": 0}
+        closing = {")": "(", "]": "[", "}": "{"}
+        cursor = start
+        for index in range(start, len(source)):
+            char = source[index]
+            if char in depths:
+                depths[char] += 1
+            elif char in closing:
+                opener = closing[char]
+                if depths[opener] > 0:
+                    depths[opener] -= 1
+            elif char in {",", ";"} and not any(depths.values()):
+                declarators.append(source[cursor:index])
+                cursor = index + 1
+                if char == ";":
+                    break
+        for declarator in declarators:
+            match = re.match(r"\s*(?:[&*]\s*)*([A-Za-z_]\w*)", declarator)
+            if match is not None:
+                names.add(match.group(1))
+    return names
+
+
 SAFE_FILES = {
     "CMakeLists.txt": """
         set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
@@ -639,17 +674,28 @@ class WindowsPortabilityCheckerTest(unittest.TestCase):
             with self.subTest(name=name):
                 self.assertEqual(len(re.findall(declaration, oracle)), 1)
 
-        old_declarations = (
-            r"vt::Backend\s*&\s*cpu\s*=",
-            r"\bQueue\s+cq\s*=",
-            r"\bDevice\s+cd\s*\{",
-            r"std::vector<float>\s+ck\s*=",
-            r"\bcv\s*=",
-            r"std::vector<int64_t>\s+cslots\s*=",
+        forbidden = {"cpu", "cq", "cd", "ck", "cv", "cslots"}
+        self.assertTrue(
+            forbidden.isdisjoint(_oracle_declarator_names(oracle)),
+            "unbound oracle redeclares an enclosing-oracle name",
         )
-        for declaration in old_declarations:
-            with self.subTest(old_declaration=declaration):
-                self.assertNotRegex(oracle, declaration)
+
+    def test_unbound_flash_oracle_declarator_scan_handles_initializer_forms(
+            self) -> None:
+        declarations = checker._cpp_structural_view("""
+            vt::Backend& unbound_cpu = backend, &cpu(get_backend());
+            Queue unbound_queue = make_queue(), cq{make_queue()};
+            const Device unbound_device{DeviceType::kCPU, 0},
+                         cd(DeviceType::kCPU, 0);
+            std::vector<float> unbound_k = input, ck{1.0f, 2.0f},
+                               unbound_v(input), cv = input;
+            std::vector<int64_t> unbound_slots = slots, cslots{0, 1};
+        """)
+        self.assertEqual(
+            {"cpu", "cq", "cd", "ck", "cv", "cslots"},
+            _oracle_declarator_names(declarations)
+            & {"cpu", "cq", "cd", "ck", "cv", "cslots"},
+        )
 
     def test_cross_device_fused_tier_environment_is_windows_portable(self) -> None:
         source = (REPO / "tests/vt/test_backend_cross_device.cpp").read_text(

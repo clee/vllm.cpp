@@ -577,3 +577,12 @@ recorded hashes afterwards. The 73-test Windows portability suite, direct
 Windows portability checker, and a clean CPU-only Release build and execution
 of `test_backend_cross_device` (19 cases, 6 assertions) passed. Native MSVC
 acceptance remains pending the hosted Windows CPU and Vulkan lanes.
+
+Fresh review found that the negative checks recognized only six exact
+declaration spellings. The equivalent comma declarator
+`const Device unbound_device{...}, cd(DeviceType::kCPU, 0);` therefore passed
+the old contract. The follow-up contract derives declarator names within the
+exact unbound oracle while respecting comma, brace, and parenthesis nesting.
+That bypass and independent mutations for all six forbidden names now fail;
+the restored tree passes all 74 Windows portability tests and the direct
+checker.
