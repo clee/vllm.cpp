@@ -319,3 +319,19 @@ make the focused contract red. Focused green is the complete
 `test_cpu_x86_llamacpp_floor.py` suite under current host contention. The fresh
 reviewer mutates both call sites, the operator runs the full preflight, and an
 unchanged exact SHA must pass that gate immediately before the plain push.
+
+The #530 implementation replaces the separate `stat_busy` and `stat_total`
+readers with one `stat_sample` reader. A single `awk` invocation derives the
+unchanged busy-field sum and total-field sum from the same aggregate `cpu` line,
+and both `busy_pct` and `run_leg` read paired before/after samples. No threshold,
+clamp, retry, discard rule, evidence format, or benchmark value changed.
+
+RED-first structural coverage rejected the split reader functions and call
+sites. The pre-edit full preflight also reproduced the operational failure:
+`test_a_contended_leg_is_discarded_and_never_summarised` observed impossible
+`busy=110%` with `BUSY_WINDOW=0` and returned 4 instead of its intended 2.
+After the repair, the complete focused suite passed 11/11 under the same host
+contention. Independently splitting the initial snapshot in `busy_pct` and in
+`run_leg` made the focused structural contract fail for the mutated consumer;
+the script was restored byte-for-byte after both mutations. The full unstaged
+repository preflight then passed, including the complete CPU floor suite.

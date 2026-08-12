@@ -118,6 +118,36 @@ class CpuX86FloorHarnessTests(unittest.TestCase):
             timeout=300,
         )
 
+    def test_proc_stat_samples_pair_busy_and_total_from_one_read(self) -> None:
+        script = SCRIPT.read_text()
+
+        def function(name: str) -> str:
+            match = re.search(rf"(?ms)^{re.escape(name)}\(\).*?^\}}$", script)
+            self.assertIsNotNone(match, f"{name} function is missing")
+            assert match is not None
+            return match.group(0)
+
+        self.assertNotRegex(script, r"(?m)^stat_(?:busy|total)\(\)")
+        sample = function("stat_sample")
+        self.assertEqual(sample.count("/proc/stat"), 1)
+        self.assertIn("busy=$2+$3+$4+$7+$8+$9", sample)
+        self.assertIn("for(i=2;i<=NF;i++) total+=$i", sample)
+        self.assertIn("print busy, total", sample)
+
+        for consumer in ("busy_pct", "run_leg"):
+            body = function(consumer)
+            with self.subTest(consumer=consumer):
+                self.assertEqual(
+                    len(
+                        re.findall(
+                            r"(?m)^\s*read -r b[01] t[01] < <\(stat_sample\)$",
+                            body,
+                        )
+                    ),
+                    2,
+                )
+                self.assertNotRegex(body, r"\bstat_(?:busy|total)\b")
+
     def test_runs_to_completion_and_creates_its_own_output_dir(self) -> None:
         out = self.tmp / "nested" / "evi"  # does not exist: the shipped bug
         got = self.run_harness(out)

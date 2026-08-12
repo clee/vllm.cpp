@@ -97,17 +97,18 @@ builders() {
 # "busy" and "total" jiffies across all cpus. iowait is NOT counted as busy: a
 # neighbour waiting on disk does not steal our cores. steal IS counted -- on a
 # KVM guest that is exactly the co-tenant this box keeps losing series to.
-stat_busy() { awk '/^cpu /{print $2+$3+$4+$7+$8+$9}' /proc/stat; }
-stat_total() { awk '/^cpu /{s=0; for(i=2;i<=NF;i++)s+=$i; print s}' /proc/stat; }
+stat_sample() {
+  awk '/^cpu /{busy=$2+$3+$4+$7+$8+$9; for(i=2;i<=NF;i++) total+=$i; print busy, total}' /proc/stat
+}
 
 # Percent of the whole machine busy over a fresh BUSY_WINDOW. Nothing here is
 # decayed and nothing here counts a process that has already exited, so the
 # harness cannot gate on its own previous leg.
 busy_pct() {
   local b0 t0 b1 t1 db dt
-  b0=$(stat_busy); t0=$(stat_total)
+  read -r b0 t0 < <(stat_sample)
   sleep "$BUSY_WINDOW"
-  b1=$(stat_busy); t1=$(stat_total)
+  read -r b1 t1 < <(stat_sample)
   db=$((b1 - b0)); dt=$((t1 - t0))
   if [ "$dt" -le 0 ]; then echo 100; return; fi
   echo $((100 * db / dt))
@@ -154,7 +155,7 @@ run_leg() {  # engine rep -> 0 accepted, 1 discard
     echo "before builders: $(builders)"
   } > "$stem.load"
   echo "$eng rep=$rep START load=$(loadall) builders=$(builders)"
-  b0=$(stat_busy); t0=$(stat_total)
+  read -r b0 t0 < <(stat_sample)
   if [ "$eng" = ours ]; then
     # shellcheck disable=SC2086
     $TIMEV $TASKSET env VLLM_CPP_CPU_THREADS=$T \
@@ -171,7 +172,7 @@ run_leg() {  # engine rep -> 0 accepted, 1 discard
     rc=$?
     own=$(own_cpu_jiffies "$OUT/llama-bench-$rep.time")
   fi
-  b1=$(stat_busy); t1=$(stat_total)
+  read -r b1 t1 < <(stat_sample)
   bafter=$(builders)
   # Everything the machine burned while our leg ran, minus what our leg burned,
   # as a share of the machine. This is the check the old post-leg test did not
