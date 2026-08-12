@@ -87,6 +87,11 @@ vllm_cpp_add_test(test_ltx2_video vllm/multimodal/test_ltx2_video.cpp)
 # LTX-2.5 DiT parity gate (row MODEL-DIFFUSION-LTX25, spec phase L2). The goldens
 # live next to the test source, like every other generated .inc.
 vllm_cpp_add_test(test_ltx2 vllm/models/test_ltx2.cpp)
+# LTX-2.5 L8: the DEVICE-RESIDENT forward, held to the SAME ltx2_goldens.inc the
+# L2 CPU gate above is held to. Its own target so test_ltx2's recorded 29/1615
+# baseline stays exactly where it is; it runs on the CPU backend everywhere and
+# adds the CUDA cases when a CUDA backend is registered.
+vllm_cpp_add_test(test_ltx2_device vllm/models/test_ltx2_device.cpp)
 # LTX-2.5 L4: the VAE bricks, gated against upstream ltx_core executed at reduced
 # dimensions. ltx2_vae_goldens.inc lives next to the test source.
 vllm_cpp_add_test(test_ltx2_vae vllm/models/test_ltx2_vae.cpp)

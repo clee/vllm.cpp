@@ -13,6 +13,7 @@
 #include <fstream>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <system_error>
@@ -22,6 +23,7 @@
 #include "vllm/model_executor/model_loader/safetensors_reader.h"
 #include "vllm/model_executor/models/ltx2.h"
 #include "vllm/model_executor/models/ltx2_audio_vae.h"
+#include "vllm/model_executor/models/ltx2_device.h"
 #include "vllm/model_executor/models/ltx2_loader.h"
 #include "vllm/model_executor/models/ltx2_pipeline.h"
 #include "vllm/model_executor/models/ltx2_upsampler.h"
@@ -307,7 +309,17 @@ bool DetectLtx2Video(const VideoModelParams& params) {
 
 struct Ltx2VideoEngine::Impl {
   VideoModelParams params;
-  vt::Device device;  // always CPU — see the `device = 1` refusal in the header
+  // CPU, or the CUDA device `params.device - 1` names. Phase L8 made the second
+  // real: the DiT is staged with `Ltx2StreamDitToDevice` and driven by
+  // `Ltx2DitForwardDevice`, so a CUDA handle now denotes a CUDA forward.
+  vt::Device device;
+  // The stream dtype the DiT was staged at, and the one the forward computes in.
+  // bf16 on an accelerator — upstream resolves ONE model dtype and every layer
+  // inherits it, and bf16 is what `Ltx2StreamDitToDevice` puts on the device.
+  // f32 on the CPU, which is the L2 parity forward's declared dtype.
+  vt::DType compute_dtype = vt::DType::kF32;
+  bool on_device = false;
+  std::optional<vt::Queue> queue;
 
   Ltx2DitCheckpoint dit;
   std::string model_version, pipeline_kind;
@@ -352,35 +364,56 @@ std::unique_ptr<Ltx2VideoEngine> Ltx2VideoEngine::Load(const VideoModelParams& p
   if (params.dit_path.empty()) Fail("dit_path is required");
   CheckKnownExtras(params.extras);
 
-  // REFUSAL 1 (header). The two halves of the device story do not meet yet:
-  // phase L2's forward is f32-only by declaration and phase L6's device staging
-  // is bf16 and refuses to widen. Running the CPU forward behind a CUDA-looking
-  // handle would make every later timing and every "it ran on the GPU" claim
-  // false, so the gap is named here instead.
-  if (params.device != 0) {
-    Fail(
-        "device " + std::to_string(params.device) +
-        " is refused. `Ltx2DitForward` accepts only vt::DType::kF32 (ltx2.h:33-39) and "
-        "`Ltx2StreamDitToDevice` stages bf16 and refuses `widen_to_f32` by design "
-        "(ltx2_loader.h:73-81), so no combination puts this forward on an accelerator "
-        "today. The bf16/quantized device forward is OWED and recorded as such; it is not "
-        "silently substituted by the CPU one.");
-  }
-
   auto engine = std::unique_ptr<Ltx2VideoEngine>(new Ltx2VideoEngine());
   engine->impl_ = std::make_unique<Impl>();
   Impl& im = *engine->impl_;
   im.params = params;
-  im.device = vt::Device{};
+
+  // ── where this engine runs (phase L8) ─────────────────────────────────────
+  //
+  // `device` is 0 for the CPU and 1 + <cuda index> for an accelerator, which is
+  // the mapping the seam already documents. Phase L7 REFUSED anything but 0,
+  // because the f32-only forward and the bf16-only staging did not meet; phase
+  // L8 is the forward that closes that, so the refusal is gone and the handle
+  // now means what it says.
+  //
+  // What is NOT gone is the refusal to fake it: if the CUDA backend is not
+  // registered in this build, the load is refused BY NAME rather than served the
+  // CPU forward behind a CUDA-looking handle. That substitution is exactly what
+  // would make every later timing and every "it ran on the GPU" claim false.
+  im.on_device = params.device != 0;
+  if (im.on_device) {
+    vt::Backend* backend = vt::TryGetBackend(vt::DeviceType::kCUDA);
+    if (backend == nullptr) {
+      Fail("device " + std::to_string(params.device) +
+           " asks for CUDA, but no CUDA backend is registered in this build. The LTX-2.5 "
+           "device-resident forward is present (Ltx2DitForwardDevice); what is missing is "
+           "the backend. Refusing rather than running the CPU forward behind a CUDA handle.");
+    }
+    im.queue = backend->CreateQueue();
+    im.queue->device.index = static_cast<int32_t>(params.device - 1);
+    im.device = im.queue->device;
+    // bf16: upstream resolves ONE model dtype and every layer inherits it, and it
+    // is what `Ltx2StreamDitToDevice` stages. f32 on an accelerator would move
+    // twice the bytes to reach a gate dtype, which is the polarity this project
+    // inverted deliberately.
+    im.compute_dtype = vt::DType::kBF16;
+  } else {
+    im.device = vt::Device{};
+    im.compute_dtype = vt::DType::kF32;
+  }
 
   // ── the DiT ───────────────────────────────────────────────────────────────
   const SafetensorsFile dit_file = SafetensorsFile::Open(params.dit_path);
   Ltx2DitLoadOptions dit_options;
   dit_options.allow_unported_modules = VideoExtra(params.extras, kLtx2AllowUnportedExtra) == "1";
-  // f32 is what the forward requires. It is the PARITY dtype, not a widening of
-  // a bf16 path — and it is why this engine is not a production runtime.
-  dit_options.widen_to_f32 = true;
-  im.dit = Ltx2LoadDitFromSafetensors(dit_file, dit_options);
+  // On the CPU, f32 is what `Ltx2DitForward` requires: it is the PARITY dtype,
+  // not a widening of a bf16 path. On an accelerator nothing is widened at all —
+  // `Ltx2StreamDitToDevice` dequantizes and uploads ONE TENSOR AT A TIME, so peak
+  // residency is the device copy plus one tensor rather than two whole models.
+  dit_options.widen_to_f32 = !im.on_device;
+  im.dit = im.on_device ? Ltx2StreamDitToDevice(*im.queue, dit_file, dit_options)
+                        : Ltx2LoadDitFromSafetensors(dit_file, dit_options);
 
   // ── the config the SHAPES cannot see ──────────────────────────────────────
   //
@@ -823,8 +856,15 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
       ain.positions = audio.positions.data();
       ain.context = im.audio_prompt_embeds.data();
 
+      // One graph, two residencies. On the CPU this is the L2 parity forward in
+      // its declared f32; on an accelerator it is the phase-L8 device-resident
+      // forward over the bf16 the DiT was STAGED at, and the two agree on
+      // everything but where the bytes live and how wide they are.
       const Ltx2DitOutputs velocity =
-          Ltx2DitForward(im.device, im.dit.params, im.dit.weights, &vin, &ain, vt::DType::kF32);
+          im.on_device ? Ltx2DitForwardDevice(*im.queue, im.dit.params, im.dit.weights, &vin,
+                                              &ain, im.compute_dtype)
+                       : Ltx2DitForward(im.device, im.dit.params, im.dit.weights, &vin, &ain,
+                                        im.compute_dtype);
 
       const std::vector<float> v_denoised = PostProcessLatent(
           ToDenoised(video.latent, velocity.video, v_timesteps, video.tokens, video.width), video);

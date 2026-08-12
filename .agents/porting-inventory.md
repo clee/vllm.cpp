@@ -1083,11 +1083,23 @@ Examples: `examples/cli` ✅ (C-API client), `examples/server` ✅ (OpenAI serve
       (`src/vllm/model_executor/models/ltx2.cpp`), which routes on `context ==
       nullptr` — the call's MEANING — so the op a call site dispatches never depends
       on the prompt length.
-    * **Backends:** CPU kernel only. `RegisterReferenceTier` installs it for a
-      UNIFIED-MEMORY accelerator, so GB10 is served; a DISCRETE device has no
-      provider and `GetOp` refuses naming the op (`vt::OpName`). The native CUDA
-      kernel is OWED alongside the LTX-2.5 device-resident forward (phase L6), which
-      is the first caller that would need it.
+    * **Backends:** CPU kernel, and — since phase L8 (2026-08-12) — a NATIVE CUDA
+      kernel, `src/vt/cuda/cuda_attention_cross.cu`. The CUDA one was owed to "the
+      LTX-2.5 device-resident forward, which is the first caller that would need
+      it", and that caller arrived. It had to arrive WITH it: before it the op had
+      a CPU kernel only, and on GB10 `Backend::UnifiedMemory()` is true, so
+      `RegisterReferenceTier` would have installed the CPU kernel for the CUDA
+      device and every cross-attention in the DiT — six per block — would have run
+      on the HOST while every gate stayed green and "it ran on the GPU" was false.
+      The CUDA kernel is a structural port of `AttentionDenseFlashKernel`
+      (`src/vt/cuda/cuda_ops.cu:3229-3318`, itself a 1:1 port of the vendored FA2
+      `compute_attn_1rowblock`), generalized on the three axes `AttentionCrossArgs`
+      exists for: the key extent is KEY's own `S`, there is no causal mode, and an
+      optional f32 additive bias joins the SCALED score before the max-subtraction.
+      It uses the online-softmax recurrence where the CPU kernel uses the explicit
+      three-pass, so the two agree to f32 summation-order slack and are NOT
+      bit-identical — the same relationship `AttentionDenseFast` already has with
+      `AttentionKernel`.
     * **Tests and evidence:** `tests/vllm/models/test_ltx2.cpp` — the validation
       refusals, the fully-masked-key softmax, the DENSE `[Tq, S]` per-query bias
       rows, the `Hq > Hkv` GQA broadcast, bit-for-bit agreement with `vt::Attention`
@@ -1095,7 +1107,7 @@ Examples: `examples/cli` ✅ (C-API client), `examples/server` ✅ (OpenAI serve
       forward goldens (`scripts/gen-ltx2-goldens.py`, upstream `fd4ded7f`) that run
       it inside the model.
     * **Spec:** [ltx-2.5 spec](specs/ltx-2-5.md) §1.2 and §7. Lifecycle: shipped
-      (CPU), CUDA arm OWED. Owner: the LTX-2.5 row.
+      (CPU + CUDA). Owner: the LTX-2.5 row.
 18. **LTX-2.5 pipeline recipes are sourced from the CROSS-CHECK, and three upstream
     guiders are refused (2026-08-12,
     `MODEL-DIFFUSION-ltx-2-5-ltx2-video-transformer-3d-model` phase L5, issue
@@ -1222,6 +1234,17 @@ Examples: `examples/cli` ✅ (C-API client), `examples/server` ✅ (OpenAI serve
       tower module without materializing it.
     * **Spec:** [ltx-2.5 spec](specs/ltx-2-5.md) §1.4 and §6 (L6). Lifecycle:
       shipped (host + load-time device staging). Owner: the LTX-2.5 row.
+    * **OWED, FOUND 2026-08-12 by the phase-L8 GB10 run (entry 20 below).** The
+      NVFP4 dequant here assumes torchao's SWIZZLED block scales, and the
+      FIRST-PARTY `ltx-2.5-22b-distilled-transformer-nvfp4.safetensors` is not
+      that: it carries **no `.torchao_nvfp4` marker at all** and stores
+      `weight_scale` as `[4096, 256]`, the LINEAR `[N, K/16]` layout, against the
+      SWIZZLED `[1024, 1024]` this path expects. The refusal is correct and fires
+      by name — the two shapes have the same element count, so reading one as the
+      other type-checks and permutes every scale within a 128x4 tile — but it
+      means the first-party NVFP4 DiT cannot be loaded at all today. The LINEAR
+      read is the missing piece. Phase L7's shipped-checkpoint test only parsed
+      the MANIFEST, so nothing had materialized a tensor from that file before.
 
 19. **LTX-2.5 phase L7 — the family behind `vllm::multimodal::VideoEngine`, and
     the driving loop.**
@@ -1261,9 +1284,8 @@ Examples: `examples/cli` ✅ (C-API client), `examples/server` ✅ (OpenAI serve
       shipped file format, the same generation driven through `include/vllm.h`
       alone, every refusal by name, and the shipped Lightricks checkpoints when
       `LTX2_CHECKPOINT_ROOT` is set.
-    * **OWED, and precisely:** (a) the forward on an accelerator — L2's forward
-      is f32-only and L6's staging is bf16, so `device = 1` is REFUSED by name
-      rather than served by the CPU path; (b) the Gemma-4 tower, so a PROMPT
+    * **OWED, and precisely:** (a) the forward on an accelerator — CLOSED by
+      phase L8, entry 20 below; (b) the Gemma-4 tower, so a PROMPT
       cannot be encoded and conditioning is prompt-embeds only; (c) image /
       keyframe / reference conditioning, which needs the video VAE's ENCODER;
       (d) the full-scale render, which at 21.00B needs ~76 GB of f32 weights and
@@ -1271,6 +1293,86 @@ Examples: `examples/cli` ✅ (C-API client), `examples/server` ✅ (OpenAI serve
       any speed number, both structurally pending per the spec's §0 and §3.
     * **Spec:** [ltx-2.5 spec](specs/ltx-2-5.md) §5 and §6 (L7). Lifecycle:
       shipped (CPU, structural e2e). Owner: the LTX-2.5 row.
+20. **LTX-2.5 phase L8 — the DEVICE-RESIDENT DiT forward, and the `vt::OpId::kLtx2`
+    glue table (2026-08-12,
+    `MODEL-DIFFUSION-ltx-2-5-ltx2-video-transformer-3d-model` phase L8, issue
+    [#435](https://github.com/mudler/vllm.cpp/issues/435)).** Phase L7 wired
+    LTX-2.5 through `vllm::multimodal::VideoEngine` and had to REFUSE `device = 1`,
+    because L2's forward was f32-only by declaration and L6's staging was bf16 and
+    refused to widen. This is the forward that makes the two meet: the same graph
+    with every activation in device memory and the stream in the checkpoint's own
+    dtype.
+    * **Upstream semantics mirrored:** unchanged from L2 — Lightricks/LTX-2 @
+      `fd4ded7f`, `packages/ltx-core/.../transformer/{model,transformer,attention,
+      adaln,rope,feed_forward}.py`. This entry adds no new upstream BEHAVIOR; it is
+      the same `LTXModel.forward` at a different residency, which is why it is
+      gated against the SAME frozen goldens rather than new ones.
+    * **Dtype polarity, which is the design decision:** the device stream is
+      **bf16**, because upstream resolves ONE model dtype and every layer inherits
+      it (`model.py` has no per-layer dtype at all) and bf16 is what
+      `Ltx2StreamDitToDevice` already puts on the device. `kF32` is accepted as a
+      GATE arm only — it is the L2 parity dtype, and it is what lets this forward
+      be compared against `ltx2_goldens.inc` at f32 round-off instead of at a bf16
+      band. Nothing widens a bf16 load to reach it. The `scale_shift_table` family
+      stays F32 on both arms because the CHECKPOINT stores it F32
+      (`ltx2_loader.h:64-66`); those are a few kilobytes against a 21 GB model.
+    * **Written from scratch** in the sense §9.1 means: seven small kernels the
+      shared `vt::` surface does not express — `ada_value`, `modulate`,
+      `add_gated`, `gate_heads`, `rope` (LTX's split and interleaved layouts),
+      `output_modulate`, and plain ungated `silu`. Each is a 1:1 transcription of a
+      named host helper in `ltx2_dit.cpp` / `ltx2.cpp`, in the same arithmetic
+      order. Everything else reuses tuned shared ops (`vt::MatmulBT`, `vt::Add`,
+      `vt::RmsNorm`, `vt::LayerNorm`, `vt::GeluTanh`, `vt::Attention`,
+      `vt::AttentionCross`); no new GEMM, norm or attention kernel was added.
+    * **Local anchor:** `include/vllm/model_executor/models/ltx2_device.h`,
+      `src/vllm/model_executor/models/ltx2_device.cpp`,
+      `src/vllm/model_executor/models/ltx2_device_resolve.cpp` (a separate TU so
+      the `vt::GetOp` cast links in CPU-only builds), `src/vt/cpu/cpu_ltx2.cpp`,
+      `src/vt/cuda/cuda_ltx2.cu`, and `vt::OpId::kLtx2` appended before `kCount`
+      (no id shift). Registered on BOTH `kCPU` and `kCUDA`, so the port's STRUCTURE
+      is covered by CPU CI and a GPU gates the KERNELS.
+    * **Tests and evidence:** `tests/vllm/models/test_ltx2_device.cpp`, its own
+      target so `test_ltx2`'s 29/1615 baseline does not move. It runs all six
+      upstream forward cases device-resident against the SAME `ltx2_goldens.inc`
+      the CPU arm meets, the bf16 stream against those goldens at a bf16 band PLUS
+      a check that it actually DIFFERS from f32 (a bf16 arm that matched f32 would
+      mean the dtype policy silently was not applied), a CUDA-vs-host comparison at
+      identical inputs, and every refusal by name.
+    * **FOUND BY THE bf16 ARM, which is why that arm exists.** The staging
+      predicate matched the `scale_shift_table` SUFFIX, which silently excluded
+      `scale_shift_table_a2v_ca_video` / `..._audio`; those were staged bf16 and
+      then read through `ada_value`'s `const float*` table parameter. The
+      audio<->video cross gate became 2.85e32 and the video stream 6.89e30 after
+      one block — while the f32 arm, where the mismatch cannot arise, stayed green
+      at 1e-7. The predicate is now a SUBSTRING match and every table read is
+      guarded by an explicit `CheckTableF32`, so a future miss is a named refusal
+      rather than a reinterpretation.
+    * **MEASURED ON GB10 (2026-08-12), and it is where the shipped model stands.**
+      A 21.00B DiT stages and runs device-resident: vonkaiser
+      `ltx-2.5-22b-distilled-fp8.safetensors` (21.0 GB, 6124 tensors) staged in
+      271.5 s and one bf16 forward at 48 layers / inner 4096 / head_dim 128
+      produced finite, non-degenerate output. The wall-clock is SIZING ONLY and is
+      not a speed result — spec §0, no production-configuration denominator exists.
+      The FIRST-PARTY `ltx-2.5-22b-distilled-transformer-nvfp4.safetensors`
+      (18.72 GB, 7876 tensors) does NOT stage, and the refusal is L6's and is
+      correct: the file carries **no `.torchao_nvfp4` marker at all**, and its
+      `weight_scale` is `[4096, 256]` — the LINEAR `[N, K/16]` layout — where
+      `Ltx2DequantTorchaoNvfp4ToBf16` expects the SWIZZLED `[1024, 1024]` form.
+      The two have the same element count, so reading one as the other
+      type-checks and permutes every scale within a 128x4 tile. The LINEAR-scale
+      read is owed against the **L6 loader** surface (entry 18 above), not this
+      one; the device forward never sees it. Phase L7's shipped-checkpoint test
+      only parsed the MANIFEST, which is why this surfaced now: nothing had
+      materialized a tensor from that file before.
+    * **OWED, and precisely:** (a) the prompt-K/V cache on the device path, which
+      is REFUSED by name rather than ignored; (b) an FP4-RESIDENT arm — the
+      `LinearDev` seam is one parameter away from the shared Marlin W4A16
+      dispatcher MiniMax-H3 routes through, but `Ltx2StreamDitToDevice` dequantizes
+      to bf16 at load, so keeping the packed weights resident is loader work this
+      phase did not do; (c) every speed number, structurally pending per the spec's
+      §0 — no production-configuration denominator exists.
+    * **Spec:** [ltx-2.5 spec](specs/ltx-2-5.md) §6 (L8). Lifecycle: shipped
+      (CPU + CUDA, bf16 and f32 streams). Owner: the LTX-2.5 row.
 
 ## 10. E2E test suites (T0 deliverable)
 

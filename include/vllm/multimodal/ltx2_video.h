@@ -29,14 +29,20 @@
 //                                         (modality_from_latent_state, timesteps_from_mask)
 //   post_process_latent               <-  utils/helpers.py:462-464
 //
-// ─── THE THREE THINGS THIS PHASE REFUSES, AND WHY EACH WOULD RENDER ──────────
+// ─── WHAT THIS ENGINE REFUSES, AND WHY EACH WOULD RENDER ────────────────────
 //
-// 1. `device = 1` (CUDA). Phase L2 declared the DiT forward f32-only and phase
-//    L6's `Ltx2StreamDitToDevice` stages bf16 and REFUSES to widen, so there is
-//    today no combination that puts this forward on a GPU: the two halves are
-//    each correct and they do not meet. The refusal names that gap rather than
-//    running the CPU forward under a CUDA-looking handle. It is recorded as owed
-//    in .agents/porting-inventory.md, not discovered later.
+// 1. `device = 1` (CUDA) WITHOUT A CUDA BACKEND. Phase L7 refused every non-zero
+//    device outright: L2's forward was f32-only by declaration and L6's
+//    `Ltx2StreamDitToDevice` stages bf16 and refuses to widen, so no combination
+//    put the DiT on a GPU. **Phase L8 closed that** — `Ltx2DitForwardDevice`
+//    (ltx2_device.h) is the same graph with every activation in device memory and
+//    the stream in the checkpoint's own bf16 — so a CUDA handle now denotes a
+//    CUDA forward and the load succeeds.
+//
+//    What is still refused is the SUBSTITUTION. If the CUDA backend is not
+//    registered in this build, the load is refused BY NAME rather than served the
+//    CPU forward behind a CUDA-looking handle, because that substitution is what
+//    would make every later timing and every "it ran on the GPU" claim false.
 //
 // 2. A PROMPT with no text tower. Phase L6 loads the caption projections and the
 //    embedded tokenizer, and records the Gemma-4 TOWER itself as owed
@@ -54,12 +60,13 @@
 //
 // ─── SCALE, STATED PLAINLY ───────────────────────────────────────────────────
 //
-// The f32 CPU forward is the parity forward, not a production one. At the
-// shipped 21.00B geometry a single denoise step over a 512x768x121 latent is
-// ~2.6e14 FLOPs and the f32 weights are ~76 GB, so this engine composes the real
-// pipeline at whatever geometry the CHECKPOINT declares and is exercised at
-// reduced dimensions. That is a statement about the forward's dtype, not about
-// the composition, and the composition is what this phase owes.
+// The f32 CPU forward is the parity forward, not a production one: at the shipped
+// 21.00B geometry its weights alone are ~76 GB. The bf16 DEVICE forward (L8) is
+// the production residency — ~42 GB staged tensor-by-tensor — and it is what
+// `device = 1` runs. Neither changes the other number this row owes: a single
+// denoise step over a 512x768x121 latent is ~2.6e14 FLOPs, and there is no
+// production-configuration oracle to divide by, so no speed figure is claimed
+// anywhere in this family (spec §0).
 #pragma once
 
 #include <memory>

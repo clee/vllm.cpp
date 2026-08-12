@@ -363,6 +363,18 @@ enum class OpId : uint8_t {
   kConv2d,
   kDepthwiseConv1d,
   kAttentionRelPos,
+  // LTX-2.5 DiT device-resident-forward glue table (phase L8). Only the seven
+  // small ops the shared vt:: surface does NOT already cover: the AdaLN table
+  // lookup, the AdaZero affine, the gated residual accumulate, the per-head
+  // attention gate, LTX's split/interleaved RoPE, the output head's
+  // table+embedded affine, and plain ungated SiLU. Everything else in the DiT
+  // forward reuses tuned shared ops (kMatmulBT, kRmsNorm, kLayerNorm, kGeluTanh,
+  // kAdd, kAttention, kAttentionCross), so this table stays deliberately small.
+  // Registered on BOTH kCPU and kCUDA (cpu_ltx2.cpp / cuda_ltx2.cu) so the
+  // device forward is exercised in CPU CI too; resolved via ltx2::Ltx2Device().
+  // Additive: only Ltx2DitForwardDevice dispatches it. Appended before kCount
+  // so no existing op's id shifts.
+  kLtx2,
   kCount
 };
 

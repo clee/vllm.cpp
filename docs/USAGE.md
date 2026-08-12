@@ -1258,11 +1258,13 @@ declares none), `allow_unported_modules`, `max_phase`, `upsampler_path` and
 `duration_head_path`. An extra a family does not define is refused, never
 ignored.
 
-The LTX-2.5 arm is CPU only today and says so: its DiT forward accepts f32 alone,
-the device staging path materializes bf16, so `device = 1` is refused by name
-rather than served by the CPU forward behind a CUDA handle. It also has no text
-tower yet, so `encoder_path` is refused and conditioning comes from the two
-prompt-embeds files, which must agree on their row count.
+The LTX-2.5 arm runs on the CPU in f32 and on CUDA in bf16. `device = 0` takes
+the f32 parity forward; `device = 1` stages the DiT to the GPU one tensor at a
+time and runs the device-resident forward, so a CUDA handle means a CUDA forward.
+On a build with no CUDA backend, `device = 1` is refused by name rather than
+served the CPU forward behind a CUDA handle. It has no text tower yet, so
+`encoder_path` is refused and conditioning comes from the two prompt-embeds
+files, which must agree on their row count.
 
 `Sampler`'s `logprobs_mode` selects which tensor the returned logprobs are read
 from, and all four of vLLM's values now work: `raw_logprobs` (the default) and

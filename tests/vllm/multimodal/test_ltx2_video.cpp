@@ -40,6 +40,8 @@
 #include "vllm/model_executor/models/ltx2_upsampler.h"
 #include "vllm/model_executor/models/ltx2_video_vae.h"
 #include "vllm.h"
+#include "vt/backend.h"
+#include "vt/device.h"
 #include "vllm/multimodal/video_engine.h"
 
 namespace {
@@ -332,19 +334,43 @@ TEST_CASE("ltx2 video: the second phase upsamples, and refuses when it cannot") 
 
 // ─── the refusals, each of which would otherwise RENDER ─────────────────────
 
-TEST_CASE("ltx2 video: device 1 is refused, naming the gap rather than substituting the CPU") {
+// PHASE L8 CHANGED WHAT THIS CASE ASSERTS, and the change is the phase.
+//
+// L7 had to refuse `device = 1` outright: the forward was f32-only by
+// declaration and the staging was bf16 and refused to widen, so no combination
+// put the DiT on an accelerator. L8 is the device-resident forward that closes
+// that (`Ltx2DitForwardDevice`), so a CUDA handle now denotes a CUDA forward and
+// the load must SUCCEED where a CUDA backend exists.
+//
+// What must never come back is the substitution: on a build with no CUDA backend
+// the load is still refused, and the refusal must name the missing BACKEND. If it
+// ever again names the f32/bf16 gap, the device forward has been un-wired; if it
+// silently succeeds with a CPU device, the engine is lying about where it ran.
+TEST_CASE("ltx2 video: device 1 runs on CUDA, and is refused by name without it") {
   Workspace ws;
   vllm::multimodal::VideoModelParams mp = FixtureParams(ws.paths);
   mp.device = 1;
-  try {
-    (void)vllm::multimodal::LoadVideoEngine(mp);
-    FAIL("a CUDA load must be refused while the forward is f32-only");
-  } catch (const std::exception& e) {
-    const std::string msg = e.what();
-    INFO(msg);
-    CHECK(msg.find("kF32") != std::string::npos);
-    CHECK(msg.find("Ltx2StreamDitToDevice") != std::string::npos);
+  vt::Backend* cuda = vt::TryGetBackend(vt::DeviceType::kCUDA);
+  if (cuda == nullptr) {
+    try {
+      (void)vllm::multimodal::LoadVideoEngine(mp);
+      FAIL("a CUDA load must be refused when no CUDA backend is registered");
+    } catch (const std::exception& e) {
+      const std::string msg = e.what();
+      INFO(msg);
+      CHECK(msg.find("no CUDA backend") != std::string::npos);
+      // The L7 gap must NOT be what is named any more; naming it would mean the
+      // device forward is no longer wired in.
+      CHECK(msg.find("kF32") == std::string::npos);
+    }
+    return;
   }
+  const std::unique_ptr<vllm::multimodal::VideoEngine> engine =
+      vllm::multimodal::LoadVideoEngine(mp);
+  REQUIRE(engine != nullptr);
+  // The handle means what it says: a CUDA device, not a CPU one behind it.
+  CHECK(engine->device().type == vt::DeviceType::kCUDA);
+  CHECK(engine->family() == std::string(vllm::multimodal::kLtx2VideoFamily));
 }
 
 TEST_CASE("ltx2 video: a prompt with no text tower is refused, never quietly ignored") {
