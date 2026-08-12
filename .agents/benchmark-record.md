@@ -20150,3 +20150,48 @@ Verdict: 0.975x code cell, 1.012x prose cell, NOT parity, residual real and
 unattributed.
 
 Evidence: `dgx:~/work/dspark-w6/ncu2.log`, cuobjdump on both binaries.
+
+## SPEC-DSPARK: final attribution -- 12.9% effective-bandwidth gap (2026-08-12)
+
+The Marlin MoE kernel is DRAM-bound (L2 hit 9.5%, SM throughput 10.6%), so its
+time IS its achieved bandwidth. 4-bit weights: gate_up K*2N/2 = 1.05 MB/expert,
+down N*K/2 = 0.52 MB (K=2048, N=512), average 0.79 MB per expert-block.
+
+| | us/launch | MB/launch | effective bandwidth |
+|---|---|---|---|
+| ours | 164.0 | 30.59 | 186.6 GB/s |
+| upstream | 151.6 | 31.93 | 210.7 GB/s |
+
+Upstream sustains 12.9% more effective bandwidth, which is the entire per-unit-
+work gap (12.8%).
+
+Residency is NOT the cause: the standing GB10 staging fix is already applied --
+ResidentWeight (dense_attn_block.h:190-196) and BuildMoeMarlinResident both
+allocate via d.b.Alloc -> cudaMalloc and upload once, so expert weights are true
+device memory, contiguous and 256-byte aligned like upstream's tensors.
+
+Identical machine code, identical launch parameters, identical layout and
+residency, LESS work on our side, 13% lower achieved bandwidth on the same bytes.
+The cause is memory-system behaviour for our allocation (page backing / TLB
+coverage of one ~512 MB slab spanning all 256 experts vs torch's segmented
+caching allocator), not anything the kernel or its inputs express.
+
+Next levers: (1) split the per-expert slab and re-measure; (2) cudaMemAdvise /
+preferred-location hints; (3) upstream ncu counters (blocked: EngineCore will not
+initialise under ncu replay).
+
+Verdict: 0.975x code, 1.012x prose, NOT parity, residual attributed to achieved
+memory bandwidth.
+
+## SPEC-DSPARK: the slab-size lever is REFUTED (2026-08-12)
+
+Proposed as the cheapest next lever, then checked before spending on it: our
+per-expert gate_up slot is 2*wg_i32 = 262144 int32 = exactly the 1.0 MB that a
+[K, 2N] 4-bit weight requires (K=2048, N=512), with no padding, and the full slab
+is 268 MB -- identical to upstream's [E, K, 2N] 4-bit tensor. There is no
+oversizing or stride inflation to remove, so splitting or re-packing the slab
+cannot recover the 12.9% bandwidth difference.
+
+That closes the last cheap lever. What remains needs upstream's ncu counters
+(blocked: its EngineCore will not initialise under ncu kernel replay) or
+cudaMemAdvise-style placement experiments whose premise is currently unverified.
