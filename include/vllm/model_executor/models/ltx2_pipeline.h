@@ -234,21 +234,29 @@ std::vector<float> Ltx2StgDelta(const float* cond, const float* perturbed, int64
 // NOT PORTED, refused by name: CFGStarRescalingGuider (guiders.py:30-52),
 // LtxAPGGuider (:77-125) and LegacyStatefulAPGGuider (:128-191).
 //
-// MEASURED, not assumed. All three multiply `projection_coef`'s rank-2 `(B, 1)`
-// result straight into the latent (`proj_coeff * cond`, :48, :118, :184). torch
-// right-aligns that against the latent's LAST TWO axes, so the expression
-// composes at rank 2, RAISES at every rectangular rank >= 3 — which is every real
-// `(B, C, F, H, W)` video latent — and on a coincidentally square shape silently
-// indexes an axis that is not the batch. LtxAPG's own
-// `norm(dim=[-1, -2, -3])` (:114) additionally requires rank >= 3, so no
-// rectangular shape satisfies both halves of the same function.
+// THE REASON IS REACHABILITY. Nothing in the LTX-2 tree constructs any of the
+// three: they appear only at their own `class` statements (:31, :78, :129), and
+// every pipeline builds MultiModalGuider from MultiModalGuiderParams
+// (utils/constants.py:49-68). Porting an arm upstream cannot reach would be
+// inventing behaviour, so `Ltx2Guidance` refuses them by name and they are
+// recorded as owed (.agents/porting-inventory.md 9.18(b)).
 //
-// No ltx-pipelines entry point constructs any of the three; the only guider any
-// of them builds is MultiModalGuiderParams (utils/constants.py:49-68). Shipping a
-// broadcast rule upstream cannot reach would be inventing behaviour, so
-// `Ltx2Guidance` refuses these three by name and they are recorded as owed. The
-// shape matrix that measurement produced is a golden
-// (kLtx2GuideProbeComposes), so upstream repairing the shapes fails this gate
+// IT IS *NOT* BECAUSE THE SHAPES CANNOT WORK — an earlier revision of this
+// comment said so and was wrong, and the correction is kept here because the
+// wrong version had been frozen as a golden (spec §7.0(b)). All three do
+// multiply `projection_coef`'s rank-2 `(B, 1)` result straight into the latent
+// (`proj_coeff * cond`, :48, :118, :184) and torch does right-align it onto the
+// LAST TWO axes, but the measured predicate is
+//
+//     raises  <=>  B > 1 and shape[-2] not in {1, B}
+//
+// so at B = 1 — the ordinary single-request video latent — it composes and is
+// numerically CORRECT, `(1, 1)` being a scalar. Where it composes with B > 1 it
+// is silently wrong, applying the per-batch coefficient along axis -2 rather
+// than the batch axis. LtxAPG's `norm(dim=[-1, -2, -3])` (:114) is a SEPARATE
+// constraint needing rank >= 3. The measured matrix is a golden
+// (kLtx2GuideProbeComposes), now including B = 1 and shape[-2] == B rows, so
+// upstream changing either the shapes or the reachability fails this gate
 // instead of going unnoticed.
 enum class Ltx2GuiderKind {
   kCfg,

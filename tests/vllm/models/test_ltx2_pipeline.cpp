@@ -229,7 +229,67 @@ TEST_CASE("ltx2 LTX2Scheduler reproduces upstream's sigma schedule") {
   LTX2_SCHED_ARM(ManyTokens);
   LTX2_SCHED_ARM(Terminal0);
   LTX2_SCHED_ARM(OneStep);
+  // The two arms that gate the linspace WALK rather than its algebra. Every step
+  // count above is one a naive `start + step * i` forward walk happens to get
+  // right, so all six stayed green against it; 41 and 47 are the first two counts
+  // where it misses exact 0 (see the generator's _SCHED_CASES note).
+  LTX2_SCHED_ARM(Steps41);
+  LTX2_SCHED_ARM(Steps47);
 #undef LTX2_SCHED_ARM
+}
+
+TEST_CASE("ltx2 the sigma schedule terminates at exactly 0 for every step count") {
+  // `Ltx2SigmaSchedule` early-outs on `sigma == 0.0f` (schedulers.py:42) and then
+  // takes the LAST NON-ZERO sigma as the stretch anchor (:52). A terminal residue
+  // of 5.96e-08 is not a rounding cosmetic: it passes the `!= 0` guard, goes
+  // through the shift transform, and displaces the anchor, which moves the WHOLE
+  // schedule and leaves the denoise loop never reaching zero noise.
+  //
+  // Swept rather than tabulated because which counts are affected is a property
+  // of f32 division, not of anything upstream declares: 24 of the first 198 miss
+  // it under a forward walk. A tabulated arm gates the counts someone thought of.
+  for (int64_t steps = 1; steps <= 200; ++steps) {
+    vllm::Ltx2SchedulerParams params;
+    const std::vector<float> sigmas = vllm::Ltx2SigmaSchedule(steps, 0, params);
+    INFO("steps = ", steps, " back = ", sigmas.back());
+    REQUIRE(sigmas.size() == static_cast<size_t>(steps + 1));
+    CHECK(sigmas.back() == 0.0f);
+    if (steps >= 2) {
+      // Every sigma is finite, so the terminal 0 is reached by the walk rather
+      // than produced by a degenerate stretch.
+      //
+      // steps == 1 IS EXCLUDED BECAUSE IT IS CURRENTLY BROKEN, not because the
+      // property does not apply. `Ltx2SigmaSchedule(1, ...)` returns
+      // {-nan, 0} where upstream returns {0.10000002, 0}. Root cause, measured:
+      // upstream's shift is a PYTHON SCALAR divided by a tensor
+      // (schedulers.py:43-45), and torch evaluates scalar/tensor as
+      // `scalar * reciprocal(tensor)`, so at sigma == 1 it yields 0.99999994 —
+      // one ulp below 1 — not 1.0. That residue is `one_minus_z[-1]` (:52), and
+      // at steps == 1 it is the ONLY non-zero sigma, so it alone sets
+      // scale_factor (6.62e-08). This port computes the same expression entirely
+      // in f32, gets exactly 1.0, and so divides 0/0.
+      //
+      // NOT repaired here: mirroring torch's scalar/tensor reciprocal-multiply
+      // changes every sigma on every arm, so it needs its own spec and a fresh
+      // review rather than a drive-by edit in a review-repair branch. The
+      // `OneStep` golden arm already carries upstream's correct 0.100000024 and
+      // did not catch this only because `MaxAbsDiff` drops NaN (`d > worst` is
+      // false for NaN) — that helper is deliberately left alone for the same
+      // reason: fixing it turns this suite red on the defect above.
+      size_t non_finite = 0;
+      for (float sigma : sigmas) {
+        if (!std::isfinite(sigma)) ++non_finite;
+      }
+      CHECK(non_finite == 0u);
+    }
+  }
+  // The same exactness for the other ported scheduler, whose terminal is a
+  // structural `1.0 - 1.0` (schedulers.py:87) rather than an accumulated walk.
+  for (int64_t steps = 1; steps <= 200; ++steps) {
+    const std::vector<float> sigmas = vllm::Ltx2LinearQuadraticSchedule(steps);
+    INFO("linear-quadratic steps = ", steps, " back = ", sigmas.back());
+    CHECK(sigmas.back() == 0.0f);
+  }
 }
 
 TEST_CASE("ltx2 LinearQuadraticScheduler reproduces upstream's schedule") {
@@ -571,34 +631,67 @@ TEST_CASE("ltx2 CFG and STG guidance deltas reproduce upstream") {
       vllm_test::kLtx2GuideStgScale0Golden);
 }
 
-TEST_CASE("ltx2 the three projection guiders are refused, with upstream's own shape matrix") {
-  // The refusal is a MEASUREMENT, not a preference: upstream's own
-  // `projection_coef(...) * cond` composes at rank 2 and raises at every
-  // rectangular rank >= 3, which is every real video latent. The matrix below
-  // comes from executing upstream, so it fails this gate if upstream ever repairs
-  // the shapes — at which point the refusal should be revisited rather than kept.
+TEST_CASE("ltx2 the three projection guiders are refused as UNREACHABLE, not as unshapeable") {
+  // WHAT THIS GATE IS FOR, since an earlier revision got it wrong. It used to
+  // assert that `projection_coef(...) * cond` "raises at every rectangular rank
+  // >= 3, i.e. at every real (B, C, F, H, W) video latent", and froze that as a
+  // golden. Executing upstream disproves it. The `(B, 1)` coefficient
+  // (guiders.py:363-369) is right-aligned onto the latent's last two axes, so the
+  // real predicate is
+  //
+  //     raises  <=>  B > 1 and shape[-2] not in {1, B}
+  //
+  // and at B = 1 — the ordinary single-request render — it composes AND is
+  // numerically correct, because `(1, 1)` is just a scalar. The old `square`
+  // abstraction was a mis-generalization of exactly these two axes and is gone.
+  //
+  // So the refusal does NOT rest on shapes. It rests on REACHABILITY: nothing in
+  // the LTX-2 tree constructs these three at all (they appear only at their own
+  // `class` statements, guiders.py:31, :78, :129; every pipeline builds
+  // MultiModalGuider from MultiModalGuiderParams, utils/constants.py:49-68). They
+  // are an unported arm, refused by name and recorded as owed per AGENTS.md.
+  // The matrix stays gated so that upstream changing either fact shows up here.
   const int64_t guiders = vllm_test::kLtx2GuideProbeGuiderCount;
   const int64_t shapes = vllm_test::kLtx2GuideProbeShapeCount;
   REQUIRE(std::size(vllm_test::kLtx2GuideProbeComposes) ==
           static_cast<size_t>(guiders * shapes));
+  REQUIRE(std::size(vllm_test::kLtx2GuideProbeBatch) == static_cast<size_t>(shapes));
+  REQUIRE(std::size(vllm_test::kLtx2GuideProbeSecondLast) == static_cast<size_t>(shapes));
 
+  bool saw_b1_composing = false;
+  bool saw_rank5_composing = false;
   for (int64_t g = 0; g < guiders; ++g) {
     const std::string name = vllm_test::kLtx2GuideProbeNames[g];
+    const bool elementwise = name == "CFGGuider" || name == "STGGuider";
+    // Only the two threshold arms carry `norm(dim=[-1,-2,-3])` (guiders.py:114,
+    // :205), which is a SEPARATE constraint needing rank >= 3.
+    const bool needs_rank3 = name == "LtxAPGGuiderThreshold" || name == "LegacyStatefulAPGGuider";
     for (int64_t s = 0; s < shapes; ++s) {
       const bool composes = vllm_test::kLtx2GuideProbeComposes[g * shapes + s] != 0;
       const int64_t rank = vllm_test::kLtx2GuideProbeRanks[s];
-      const bool square = vllm_test::kLtx2GuideProbeSquare[s] != 0;
-      INFO("guider = ", name, " rank = ", rank, " square = ", square,
+      const int64_t batch = vllm_test::kLtx2GuideProbeBatch[s];
+      const int64_t second_last = vllm_test::kLtx2GuideProbeSecondLast[s];
+      INFO("guider = ", name, " rank = ", rank, " B = ", batch, " shape[-2] = ", second_last,
            " composes = ", composes);
-      if (name == "CFGGuider" || name == "STGGuider") {
+      if (elementwise) {
         // The two ported ones are elementwise and survive every shape.
         CHECK(composes);
-      } else if (rank >= 3 && !square) {
-        // Every rectangular video latent. This is the finding.
-        CHECK_FALSE(composes);
+        continue;
       }
+      const bool broadcast_raises = batch > 1 && second_last != 1 && second_last != batch;
+      const bool expected_raise = broadcast_raises || (needs_rank3 && rank < 3);
+      // The predicate is asserted in BOTH directions, so a shape that upstream
+      // starts or stops accepting fails here either way.
+      CHECK(composes == !expected_raise);
+      if (composes && batch == 1) saw_b1_composing = true;
+      if (composes && rank == 5) saw_rank5_composing = true;
     }
   }
+  // The two rows the old matrix never probed, and which is why it drew the wrong
+  // conclusion: a B = 1 latent, and a rank-5 `(B, C, F, H, W)` video latent that
+  // composes anyway. Asserted so the matrix cannot silently shrink back.
+  CHECK(saw_b1_composing);
+  CHECK(saw_rank5_composing);
 
   vllm::Ltx2MultiModalGuiderParams params;
   const int64_t count = vllm_test::kLtx2GuideCount;
@@ -610,8 +703,13 @@ TEST_CASE("ltx2 the three projection guiders are refused, with upstream's own sh
                                count);
     });
     INFO("refusal = ", message);
-    CHECK(Mentions(message, "projection_coef"));
+    // The message must name the arm and say it is unported. It must NOT rest on
+    // the shape claim that measurement disproved.
     CHECK(Mentions(message, "not ported"));
+    CHECK(Mentions(message, "CFGStarRescalingGuider"));
+    CHECK(Mentions(message, "LtxAPGGuider"));
+    CHECK(Mentions(message, "LegacyStatefulAPGGuider"));
+    CHECK(Mentions(message, "constructs"));
   }
 }
 
@@ -1193,6 +1291,21 @@ vllm::Ltx2LatentVolume ReducedUpsamplerLatent() {
 }
 
 }  // namespace
+
+TEST_CASE("ltx2 the constants the headers call pinned are actually pinned") {
+  // Both headers said "pinned", and NEITHER constant had a single test reference,
+  // so either could be edited with every golden still green — exactly the
+  // invisible-constant class of spec §7.0(a), where the fixture never enters the
+  // regime the constant governs. The connector's rows are never near-zero, so its
+  // eps is inert in the value comparison; the blur width is only reachable through
+  // a default upstream never passes explicitly.
+  //
+  // Each expected value is READ OFF upstream's own signature by the generator
+  // (utils.py:7, blur_downsample.py:14), not retyped here, so upstream moving
+  // either one fails this gate instead of silently redefining the port.
+  CHECK(vllm::kLtx2ConnectorRmsNormEps == vllm_test::kLtx2ConnRmsNormEps);
+  CHECK(vllm::kLtx2BlurKernelSize == vllm_test::kLtx2UpsBlurKernelSize);
+}
 
 TEST_CASE("ltx2 the binomial anti-alias kernel is built, not loaded") {
   // blur_downsample.py:29-33. Computed at construction on both sides, like the

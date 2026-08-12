@@ -1516,6 +1516,14 @@ schedule or guidance scale renders a video instead of failing. The pairs that
 resolve are `one_stage` at 2, 2.3, 2.4 and 2.5, `distilled_two_stage` at 2 and
 2.5, and `dmd2` at 2 and 2.3.
 
+`Ltx2Guidance` serves `CFGGuider`, `STGGuider` and `MultiModalGuider`. It refuses
+`CFGStarRescalingGuider`, `LtxAPGGuider` and `LegacyStatefulAPGGuider` by name,
+because nothing upstream constructs them: all three appear in the Lightricks tree
+only at their own `class` statements. Two known gaps in the schedule are open:
+`Ltx2SigmaSchedule(1, ...)` returns a NaN first sigma where upstream returns
+0.10000002, and the suite's `MaxAbsDiff` drops NaN so a golden alone will not
+catch it.
+
 ## SSE keepalives on long prefill
 
 Async chat/completion streams may emit SSE **comment** frames (`:\n\n`) while

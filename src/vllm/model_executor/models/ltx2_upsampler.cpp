@@ -8,6 +8,26 @@
 // copies of frame 0 instead (convolution.py:306-307). Reusing that kernel here
 // would shift the whole clip while still producing a correctly shaped, finite,
 // plausible latent — so the two stay separate, deliberately.
+//
+// ARITHMETIC WIDTH, stated once and referenced per site below. Upstream is f32
+// everywhere in this file; every `double` here is an ESCAPE and each one is
+// annotated at its site. They come in two kinds and only the first is justified
+// by the suite's convention:
+//
+//   REDUCTIONS (conv accumulators, GroupNorm mean/var, the blur accumulator).
+//     Upstream reduces in f32 but in a blocked/vectorized order no straight loop
+//     reproduces, so accumulating exactly and rounding ONCE is the closest
+//     single-rounding approximation to any order. This is the same escape L3
+//     took and documented at ltx2_text_encoder.cpp:259-269.
+//
+//   POINTWISE (`Silu` here, `GeluTanh` in ltx2_duration_head.cpp). These are NOT
+//     reductions, so the convention above does not cover them: upstream rounds to
+//     f32 at each step of the expression and computing wider is numerically FINER
+//     than the mirror, not equal to it — the polarity AGENTS.md warns about, where
+//     a too-wide dtype still passes a value gate. Left as-is here rather than
+//     narrowed in a review-repair branch, because narrowing moves the upsampler
+//     and duration-head goldens and so owes its own red-first change. Recorded so
+//     it is visible debt rather than an unremarked default.
 #include "vllm/model_executor/models/ltx2_upsampler.h"
 
 #include <algorithm>
@@ -66,6 +86,7 @@ Volume Conv3dPad1(const Volume& in, int64_t out_channels, const std::vector<floa
     for (int64_t f = 0; f < out.frames; ++f) {
       for (int64_t y = 0; y < out.height; ++y) {
         for (int64_t x = 0; x < out.width; ++x) {
+          // f64 REDUCTION escape -- see the width note in the file header.
           double acc = static_cast<double>(bias[static_cast<size_t>(oc)]);
           for (int64_t ic = 0; ic < in.channels; ++ic) {
             for (int64_t kf = 0; kf < k; ++kf) {
@@ -113,6 +134,7 @@ Volume Conv2dPad1PerFrame(const Volume& in, int64_t out_channels,
     for (int64_t f = 0; f < out.frames; ++f) {
       for (int64_t y = 0; y < out.height; ++y) {
         for (int64_t x = 0; x < out.width; ++x) {
+          // f64 REDUCTION escape -- see the width note in the file header.
           double acc = static_cast<double>(bias[static_cast<size_t>(oc)]);
           for (int64_t ic = 0; ic < in.channels; ++ic) {
             for (int64_t ky = 0; ky < k; ++ky) {
@@ -148,6 +170,7 @@ void GroupNorm(Volume& x, const std::vector<float>& weight, const std::vector<fl
   const int64_t elems = per_group * spatial;
 
   for (int64_t g = 0; g < groups; ++g) {
+    // f64 REDUCTION escape (mean and var) -- see the width note in the header.
     double mean = 0.0;
     for (int64_t c = g * per_group; c < (g + 1) * per_group; ++c) {
       for (int64_t i = 0; i < spatial; ++i) {
@@ -178,6 +201,8 @@ void GroupNorm(Volume& x, const std::vector<float>& weight, const std::vector<fl
 
 void Silu(std::vector<float>& x) {
   for (float& value : x) {
+    // POINTWISE f64, WIDER than upstream's f32 -- see the width note in the
+    // file header. Not covered by the reduction convention.
     const double v = static_cast<double>(value);
     value = static_cast<float>(v / (1.0 + std::exp(-v)));
   }
@@ -244,6 +269,7 @@ Volume BlurDownsample(const Volume& in, int64_t stride, int64_t kernel_size) {
     for (int64_t f = 0; f < in.frames; ++f) {
       for (int64_t y = 0; y < out.height; ++y) {
         for (int64_t x = 0; x < out.width; ++x) {
+          // f64 REDUCTION escape -- see the width note in the file header.
           double acc = 0.0;
           for (int64_t ky = 0; ky < kernel_size; ++ky) {
             const int64_t sy = y * stride + ky - pad;

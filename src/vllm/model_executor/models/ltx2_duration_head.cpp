@@ -52,6 +52,15 @@ std::vector<float> Linear(vt::Queue& q, const float* in, int64_t rows, int64_t i
 
 // `torch.nn.functional.gelu(x, approximate="tanh")` — the same activation the
 // DiT's FeedForward uses (gelu_approx.py:4-10).
+//
+// POINTWISE f64, WIDER than upstream's f32, and NOT covered by the suite's
+// f64-reduction convention: this is not a reduction at all. Upstream rounds to
+// f32 at each step of the expression, so computing the whole thing in double and
+// rounding once is numerically FINER than the mirror rather than equal to it —
+// the too-wide polarity AGENTS.md warns about, which a value gate cannot catch.
+// Left as-is here rather than narrowed in a review-repair branch, because
+// narrowing moves the duration-head goldens and so owes its own red-first change.
+// Same class as `Silu` in ltx2_upsampler.cpp; see that file's header note.
 float GeluTanh(float x) {
   const double v = static_cast<double>(x);
   const double inner = 0.7978845608028654 * (v + 0.044715 * v * v * v);

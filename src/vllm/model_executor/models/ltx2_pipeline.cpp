@@ -15,6 +15,22 @@
 // The diffusion steps are float32 (each casts `.to(torch.float32)` on entry), and
 // their scalar coefficients are 0-dim float32 tensors, so `eta`, `s_noise` and
 // friends round to f32 at every binary op rather than staying double.
+//
+// ONE KNOWN EXCEPTION TO THE "EVERY" ABOVE, found 2026-08-12 and NOT yet
+// repaired. `Ltx2SigmaSchedule`'s shift (:105-109) is written as f32/f32, but
+// upstream's is a PYTHON SCALAR divided by a tensor (schedulers.py:43-45), and
+// torch evaluates scalar/tensor as `scalar * reciprocal(tensor)` — so at
+// sigma == 1 upstream yields 0.99999994, one ulp below 1, where this file yields
+// exactly 1.0. It is invisible for steps >= 2 (the stretch renormalizes it away,
+// within the 5e-06 gate), but at steps == 1 that residue is the ONLY non-zero
+// sigma and therefore the whole stretch anchor: upstream returns
+// {0.10000002, 0} and this returns {-nan, 0}. The `OneStep` golden already
+// carries upstream's correct value and did not catch it because the suite's
+// `MaxAbsDiff` drops NaN. Left unrepaired deliberately: mirroring torch's
+// reciprocal-multiply moves every sigma on every arm, so it owes its own
+// red-first change and a fresh review rather than a drive-by edit. Gated as far
+// as it can be without the fix by the "terminates at exactly 0" case in
+// tests/vllm/models/test_ltx2_pipeline.cpp, which sweeps steps 1..200.
 #include "vllm/model_executor/models/ltx2_pipeline.h"
 
 #include <algorithm>
@@ -524,17 +540,19 @@ std::vector<float> Ltx2Guidance(Ltx2GuiderKind kind, const Ltx2MultiModalGuiderP
     case Ltx2GuiderKind::kLegacyStatefulApg:
       break;
   }
-  // MEASURED, not assumed — see the header. All three multiply
-  // `projection_coef`'s rank-2 (B, 1) result straight into the latent, which
-  // torch right-aligns onto the latent's last two axes: it composes at rank 2 and
-  // RAISES at every rectangular rank >= 3, i.e. at every real video latent. No
-  // ltx-pipelines entry point constructs any of them.
+  // UNREACHABLE, not unshapeable — see the header. Nothing in the LTX-2 tree
+  // constructs these three; they appear only at their own `class` statements.
+  // (An earlier revision refused them on a shape argument instead. That premise
+  // was measured and is FALSE: at B = 1 the (B, 1) coefficient is a scalar and
+  // composes correctly on any rank. The real predicate is
+  // `B > 1 && shape[-2] not in {1, B}` and it is gated in the test, not here.)
   Refuse(
       "ltx2 guidance: CFGStarRescalingGuider / LtxAPGGuider / LegacyStatefulAPGGuider are not "
-      "ported. Upstream multiplies projection_coef's rank-2 (B, 1) result into the latent "
-      "(guiders.py:48, 118, 184), which torch broadcasts onto the latent's LAST TWO axes, so "
-      "the expression raises on every rectangular (B, C, F, H, W) latent; no ltx-pipelines "
-      "entry point constructs them. Owed and recorded in .agents/specs/ltx-2-5.md phase L5.");
+      "ported. Nothing upstream constructs them: all three appear in the LTX-2 tree only at "
+      "their own class statements (guiders.py:31, 78, 129), and every pipeline builds "
+      "MultiModalGuider from MultiModalGuiderParams (ltx-pipelines utils/constants.py:49-68). "
+      "This arm is owed and recorded in .agents/specs/ltx-2-5.md phase L5 and "
+      ".agents/porting-inventory.md 9.18(b).");
 }
 
 const Ltx2MultiModalGuiderParams& Ltx2GuiderParamsForSigma(

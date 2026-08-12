@@ -95,6 +95,11 @@ Ltx2RationalScale Ltx2RationalForScale(double scale);
 // independently — the same rule the audio VAE's kaiser-sinc windows follow.
 // Returns [kernel_size * kernel_size], row-major.
 std::vector<float> Ltx2BlurKernel(int64_t kernel_size);
+// `BlurDownsample.__init__`'s default (blur_downsample.py:14), which
+// `SpatialRationalResampler` never overrides (:38) — so this default IS the
+// shipped kernel width. Gated against upstream's own signature by
+// test_ltx2_pipeline.cpp, case "the constants the headers call pinned are
+// actually pinned".
 inline constexpr int64_t kLtx2BlurKernelSize = 5;
 
 // The parameter contract: every tensor `LatentUpsampler(config)` creates, in

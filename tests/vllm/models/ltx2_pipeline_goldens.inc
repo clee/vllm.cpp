@@ -98,6 +98,39 @@ inline constexpr float kLtx2SchedOneStepGolden[] = {
     0.100000024f, 0.0f,
 };
 
+inline constexpr int64_t kLtx2SchedSteps41Steps = 41;
+inline constexpr int64_t kLtx2SchedSteps41Tokens = 0;
+inline constexpr double kLtx2SchedSteps41MaxShift = 2.0499999999999998;
+inline constexpr double kLtx2SchedSteps41BaseShift = 0.94999999999999996;
+inline constexpr bool kLtx2SchedSteps41Stretch = true;
+inline constexpr double kLtx2SchedSteps41Terminal = 0.10000000000000001;
+inline constexpr float kLtx2SchedSteps41Golden[] = {
+    0.99999994f, 0.99655205f, 0.992951095f, 0.989186585f, 0.985247374f, 0.981120706f,
+    0.976793051f, 0.972249269f, 0.967472911f, 0.962445617f, 0.957146883f, 0.951554239f,
+    0.945642591f, 0.939383864f, 0.93274641f, 0.925694764f, 0.918189108f, 0.910184085f,
+    0.901628077f, 0.892462134f, 0.882618785f, 0.872019768f, 0.860574961f, 0.848178625f,
+    0.834707141f, 0.820014179f, 0.803925693f, 0.786233008f, 0.766683578f, 0.74496913f,
+    0.720708549f, 0.69342643f, 0.662520766f, 0.627218127f, 0.586508393f, 0.539046466f,
+    0.483000338f, 0.415809691f, 0.333783209f, 0.231397927f, 0.100000024f, 0.0f,
+};
+
+inline constexpr int64_t kLtx2SchedSteps47Steps = 47;
+inline constexpr int64_t kLtx2SchedSteps47Tokens = 0;
+inline constexpr double kLtx2SchedSteps47MaxShift = 2.0499999999999998;
+inline constexpr double kLtx2SchedSteps47BaseShift = 0.94999999999999996;
+inline constexpr bool kLtx2SchedSteps47Stretch = true;
+inline constexpr double kLtx2SchedSteps47Terminal = 0.10000000000000001;
+inline constexpr float kLtx2SchedSteps47Golden[] = {
+    0.99999994f, 0.997064114f, 0.994015217f, 0.990846694f, 0.987551272f, 0.984121084f,
+    0.980547965f, 0.976822495f, 0.972934902f, 0.968874335f, 0.964628875f, 0.960185766f,
+    0.955530822f, 0.950648487f, 0.945521593f, 0.940131545f, 0.934457302f, 0.928475857f,
+    0.922161698f, 0.915486157f, 0.908417165f, 0.900919199f, 0.892951727f, 0.884469271f,
+    0.875420272f, 0.865746081f, 0.855379403f, 0.844243348f, 0.832248807f, 0.819292486f,
+    0.805254042f, 0.789992034f, 0.773338795f, 0.755095482f, 0.735022783f, 0.71283102f,
+    0.688165784f, 0.660589278f, 0.629553795f, 0.594364882f, 0.554128766f, 0.507676244f,
+    0.453445554f, 0.389304936f, 0.312264502f, 0.217997849f, 0.100000024f, 0.0f,
+};
+
 inline constexpr int64_t kLtx2LinQuadDefaultSteps = 6;
 inline constexpr double kLtx2LinQuadDefaultThreshold = 0.025000000000000001;
 inline constexpr int64_t kLtx2LinQuadDefaultLinearSteps = -1;
@@ -501,18 +534,24 @@ inline constexpr const char* kLtx2GuideProbeNames[] = {
     "LegacyStatefulAPGGuider",
 };
 inline constexpr int64_t kLtx2GuideProbeGuiderCount = 6;
-inline constexpr int64_t kLtx2GuideProbeShapeCount = 4;
+inline constexpr int64_t kLtx2GuideProbeShapeCount = 7;
 inline constexpr int64_t kLtx2GuideProbeRanks[] = {
-    2, 3, 4, 4,
+    2, 3, 4, 4, 3, 5, 5,
 };
 
-inline constexpr int64_t kLtx2GuideProbeSquare[] = {
-    0, 0, 0, 1,
+inline constexpr int64_t kLtx2GuideProbeBatch[] = {
+    2, 2, 2, 4, 1, 1, 2,
+};
+
+inline constexpr int64_t kLtx2GuideProbeSecondLast[] = {
+    2, 3, 4, 4, 3, 16, 2,
 };
 
 inline constexpr int64_t kLtx2GuideProbeComposes[] = {
-    1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 1,
-    1, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1,
+    1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+    1, 1, 1, 0, 0, 1, 1, 1, 1, 1, 0, 0,
+    1, 1, 1, 1, 0, 0, 0, 1, 1, 1, 1, 0,
+    0, 0, 1, 1, 1, 1,
 };
 
 
@@ -1227,6 +1266,7 @@ inline constexpr int64_t kLtx2UpsFrames = 2;
 inline constexpr int64_t kLtx2UpsHeight = 4;
 inline constexpr int64_t kLtx2UpsWidth = 6;
 inline constexpr int64_t kLtx2UpsNormGroups = 32;
+inline constexpr int64_t kLtx2UpsBlurKernelSize = 5;
 inline constexpr float kLtx2UpsLatent[] = {
     -0.556119144f, 0.50332576f, 0.169520676f, 0.448386252f, -0.440451503f, 0.856429696f,
     -0.898950458f, 0.718741119f, 0.195268765f, -0.36020577f, 0.336151272f, -0.29771331f,
@@ -2053,6 +2093,7 @@ inline constexpr int64_t kLtx2ConnRegisters = 4;
 inline constexpr int64_t kLtx2ConnSeq = 8;
 inline constexpr int64_t kLtx2ConnBatch = 2;
 inline constexpr double kLtx2ConnTheta = 10000.0;
+inline constexpr double kLtx2ConnRmsNormEps = 9.9999999999999995e-07;
 inline constexpr float kLtx2ConnHidden[] = {
     0.584765196f, 0.982704222f, 0.302177519f, -0.019259993f, 0.151686698f, 0.159495667f,
     0.785913765f, -0.0731741115f, 0.0228380058f, 0.207212716f, -0.455723017f, 0.619888663f,

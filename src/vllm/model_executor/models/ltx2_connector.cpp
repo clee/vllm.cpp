@@ -48,6 +48,12 @@ float RoundToBf16(float value) {
 void RmsNormRows(std::vector<float>& x, int64_t rows, int64_t width) {
   for (int64_t r = 0; r < rows; ++r) {
     float* row = x.data() + r * width;
+    // f64 SUM ACCUMULATOR, the suite-wide reduction escape (L3 precedent,
+    // ltx2_text_encoder.cpp:259-269): upstream's `rms_norm` reduces in f32 but in
+    // a BLOCKED order no straight loop reproduces, so accumulating exactly and
+    // rounding once is the closest single-rounding approximation to any order.
+    // The reciprocal-sqrt below narrows back to f32 immediately, so nothing
+    // downstream of this row carries the wider value.
     double sum = 0.0;
     for (int64_t i = 0; i < width; ++i) sum += static_cast<double>(row[i]) * row[i];
     const float inv = static_cast<float>(

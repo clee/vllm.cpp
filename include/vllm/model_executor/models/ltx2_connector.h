@@ -63,7 +63,10 @@ namespace vllm {
 // utils.py:7-12 — `torch.nn.functional.rms_norm`'s eps as `rms_norm` passes it.
 // The connector uses the WEIGHTLESS form, so this is the only stabilizer in the
 // residual path. A member of the invisible-constant class (the fixture's rows are
-// never near-zero), pinned here rather than left to the value comparison.
+// never near-zero), so the value comparison does NOT gate it. What gates it is
+// test_ltx2_pipeline.cpp, case "the constants the headers call pinned are
+// actually pinned", which compares this against upstream's own `rms_norm`
+// signature default rather than a retyped literal.
 inline constexpr double kLtx2ConnectorRmsNormEps = 1e-6;
 
 // Embeddings1DConnector.__init__ defaults (:95-108), which are also both

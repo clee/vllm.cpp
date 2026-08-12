@@ -259,6 +259,16 @@ _SCHED_CASES = (
     ("ManyTokens", 6, 16384, 2.05, 0.95, True, 0.1),
     ("Terminal0", 5, 1024, 2.05, 0.95, True, 0.0),
     ("OneStep", 1, 4096, 2.05, 0.95, True, 0.1),
+    # STEP COUNTS WHERE A NAIVE FORWARD linspace WALK MISSES EXACT 0. torch walks
+    # the second half BACKWARDS from `end` (aten RangeFactories.cpp), which is the
+    # only reason the terminal sigma is exactly 0. `start + step * i` instead leaves
+    # 5.96e-08 there, which survives the `sigmas != 0` guard at schedulers.py:42,
+    # takes the shift transform, and then becomes `one_minus_z[-1]` in the stretch
+    # branch (:52) -- so the WHOLE schedule moves and the denoise loop never reaches
+    # zero noise. `--steps 41` is a plain user-reachable render, not a corner.
+    # 24 of the first 198 counts are affected; these are the first two above 1.
+    ("Steps41", 41, None, 2.05, 0.95, True, 0.1),
+    ("Steps47", 47, None, 2.05, 0.95, True, 0.1),
 )
 
 # (tag, steps, threshold_noise, linear_steps-or-None)
@@ -551,23 +561,37 @@ def section_guiders(out) -> None:
     out.write("\n")
 
     # --- The three PROJECTION guiders, and why the port refuses them ----------
-    # MEASURED, not assumed. `projection_coef` returns a rank-2 `(B, 1)` tensor
-    # (guiders.py:363-369), and CFGStarRescalingGuider / LtxAPGGuider /
-    # LegacyStatefulAPGGuider then multiply it straight into a latent
-    # (`proj_coeff * cond`, guiders.py:48, 118, 184). torch right-aligns, so that
-    # `(B, 1)` lands on the latent's LAST TWO axes: it composes at rank 2, raises
-    # at any rectangular rank >= 3 — including every real `(B, C, F, H, W)` video
-    # latent — and on a coincidentally SQUARE shape it silently indexes an axis
-    # that is not the batch. LtxAPG's own `norm(dim=[-1,-2,-3])` additionally
-    # needs rank >= 3, so no shape satisfies both arms except a square one.
+    # THE REFUSAL RESTS ON REACHABILITY, NOT ON SHAPES. An earlier revision of
+    # this file claimed the shape expression "raises at every rectangular rank
+    # >= 3, i.e. at every real (B, C, F, H, W) video latent". That premise is
+    # FALSE and the matrix below is what disproves it, so it is recorded here
+    # rather than quietly dropped (spec §7.0(b): a wrong finding frozen as a
+    # golden is worse than no golden).
     #
-    # No ltx-pipelines entry point constructs any of the three (grepped: only
-    # `MultiModalGuiderParams` appears, utils/constants.py:49-68). So this port
-    # REFUSES them by name and records them as owed, rather than shipping a
-    # broadcast rule nothing upstream can reach. The matrix below is the evidence
-    # for that decision, taken from upstream itself, so it becomes a golden that
-    # fails if upstream ever repairs the shapes.
-    probe_shapes = ((2, 6), (2, 3, 4), (2, 3, 4, 5), (4, 4, 4, 4))
+    # `projection_coef` returns a rank-2 `(B, 1)` tensor (guiders.py:363-369) and
+    # the three guiders multiply it straight into a latent (`proj_coeff * cond`,
+    # guiders.py:48, 118, 184). torch right-aligns, so `(B, 1)` lands on the
+    # latent's LAST TWO axes. The real predicate is therefore
+    #
+    #     raises  <=>  B > 1 and shape[-2] not in {1, B}
+    #
+    # which is NOT "every video latent": at B = 1 — the ordinary single-request
+    # render — `(1, 1)` broadcasts as a plain scalar and the result is also
+    # numerically CORRECT, and `(2, 128, 8, 2, 16)` composes as well because its
+    # `shape[-2]` happens to equal B. Where it composes with B > 1 it is silently
+    # WRONG, applying the per-batch coefficient along axis -2 instead of the batch
+    # axis. The `norm(dim=[-1,-2,-3])` in the two threshold arms is a SEPARATE
+    # constraint that additionally needs rank >= 3.
+    #
+    # What actually justifies the refusal is that NOTHING UPSTREAM CONSTRUCTS
+    # THEM. `CFGStarRescalingGuider`, `LtxAPGGuider` and `LegacyStatefulAPGGuider`
+    # appear in the whole LTX-2 tree only at their own `class` statements in
+    # guiders.py (:31, :78, :129); every pipeline builds `MultiModalGuider` from
+    # `MultiModalGuiderParams` (utils/constants.py:49-68). So the arm is UNPORTED
+    # and refused by name and recorded as owed, per AGENTS.md. The matrix stays a
+    # golden so that upstream wiring one of them up shows up as a golden change.
+    probe_shapes = ((2, 6), (2, 3, 4), (2, 3, 4, 5), (4, 4, 4, 4), (1, 3, 4),
+                    (1, 128, 8, 16, 16), (2, 128, 8, 2, 16))
     probe_guiders = (
         ("CFGGuider", lambda: CFGGuider(scale=3.0)),
         ("STGGuider", lambda: STGGuider(scale=1.0)),
@@ -594,8 +618,11 @@ def section_guiders(out) -> None:
     emit_scalar(out, "kLtx2GuideProbeGuiderCount", len(probe_guiders))
     emit_scalar(out, "kLtx2GuideProbeShapeCount", len(probe_shapes))
     emit_i64(out, "kLtx2GuideProbeRanks", [len(s) for s in probe_shapes])
-    emit_i64(out, "kLtx2GuideProbeSquare",
-             [1 if len(set(s)) == 1 else 0 for s in probe_shapes])
+    # The two axes the real predicate is written in: the batch, and the axis the
+    # `(B, 1)` coefficient actually lands on. `square` is deliberately NOT emitted
+    # any more — it was a mis-generalization of these two.
+    emit_i64(out, "kLtx2GuideProbeBatch", [s[0] for s in probe_shapes])
+    emit_i64(out, "kLtx2GuideProbeSecondLast", [s[-2] for s in probe_shapes])
     emit_i64(out, "kLtx2GuideProbeComposes", composes)
     out.write("\n")
 
@@ -1026,6 +1053,19 @@ def section_upsampler(out) -> None:
     # (res_block.py:24,26; model.py:50), so the group count is a pinned constant
     # and not a config key a checkpoint could move.
     emit_scalar(out, "kLtx2UpsNormGroups", 32)
+    # BlurDownsample's kernel_size default, READ OFF upstream's own signature
+    # (blur_downsample.py:14). `SpatialRationalResampler` never passes one
+    # (spatial_rational_resampler.py:38), so this default IS the shipped kernel
+    # width, and it silently changes the whole binomial kernel if it moves.
+    import inspect  # noqa: PLC0415
+
+    from ltx_core.model.upsampler.blur_downsample import BlurDownsample  # noqa: PLC0415
+
+    emit_scalar(
+        out,
+        "kLtx2UpsBlurKernelSize",
+        inspect.signature(BlurDownsample.__init__).parameters["kernel_size"].default,
+    )
 
     count = _UPS_IN * _UPS_F * _UPS_H * _UPS_W
     latent = torch.from_numpy(make("ltx2.ups.latent", count, 1.0)).reshape(
@@ -1205,6 +1245,19 @@ def section_connector(out) -> None:
     emit_scalar(out, "kLtx2ConnSeq", _CONN_SEQ)
     emit_scalar(out, "kLtx2ConnBatch", _CONN_BATCH)
     emit_double(out, "kLtx2ConnTheta", 10000.0)
+
+    # The rms_norm eps, READ OFF upstream's own signature (utils.py:7) rather than
+    # retyped. Spec §7.0(a): this is the invisible-constant class — the fixture's
+    # rows are never near-zero, so the value comparison alone accepts a 100x
+    # change. The C++ header says it is "pinned here"; this is what makes that
+    # true, and it moves if upstream moves.
+    import inspect  # noqa: PLC0415
+
+    from ltx_core.utils import rms_norm  # noqa: PLC0415
+
+    emit_double(
+        out, "kLtx2ConnRmsNormEps", inspect.signature(rms_norm).parameters["eps"].default
+    )
 
     count = _CONN_BATCH * _CONN_SEQ * inner
     hidden = torch.from_numpy(make("ltx2.conn.hidden", count, 1.0)).reshape(

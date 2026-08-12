@@ -1124,20 +1124,29 @@ Examples: `examples/cli` ✅ (C-API client), `examples/server` ✅ (OpenAI serve
       [vllm-omni#6066](https://github.com/vllm-project/vllm-omni/issues/6066)), at
       which point the rows re-anchor to it.
     * **(b) `CFGStarRescalingGuider`, `LtxAPGGuider` and `LegacyStatefulAPGGuider`
-      are REFUSED, not ported.** MEASURED against upstream rather than assumed: all
-      three multiply `projection_coef`'s rank-2 `(B, 1)` result straight into the
-      latent (`components/guiders.py:48, 118, 184`), and torch right-aligns that
-      onto the latent's LAST TWO axes — so the expression composes at rank 2,
-      RAISES at every rectangular rank >= 3 (i.e. at every real `(B, C, F, H, W)`
-      video latent), and on a coincidentally square shape silently indexes an axis
-      that is not the batch. `LtxAPGGuider`'s own `norm(dim=[-1,-2,-3])` (`:114`)
-      additionally needs rank >= 3, so no rectangular shape satisfies both halves
-      of the same function. No `ltx-pipelines` entry point constructs any of the
-      three; the only guider parameters any of them builds are
-      `MultiModalGuiderParams` (`utils/constants.py:49-68`). Shipping a broadcast
-      rule upstream cannot reach would be inventing behaviour, so `vllm::Ltx2Guidance`
-      refuses them by name. `CFGGuider`, `STGGuider`, `MultiModalGuider` and
+      are REFUSED, not ported — because NOTHING UPSTREAM CONSTRUCTS THEM.** All
+      three appear in the whole `LTX-2` tree only at their own `class` statements
+      (`components/guiders.py:31, 78, 129`); every pipeline builds
+      `MultiModalGuider` from `MultiModalGuiderParams`
+      (`utils/constants.py:49-68`). They are an unported arm, refused by name and
+      recorded as owed. `CFGGuider`, `STGGuider`, `MultiModalGuider` and
       `projection_coef` itself ARE ported.
+
+      **CORRECTION, 2026-08-12.** This entry previously justified the refusal on a
+      SHAPE claim — that `projection_coef`'s rank-2 `(B, 1)` result "RAISES at
+      every rectangular rank >= 3, i.e. at every real `(B, C, F, H, W)` video
+      latent". That premise is FALSE and was recorded as a golden, which is the
+      failure spec §7.0(b) exists to prevent. Re-measured against upstream: torch
+      right-aligns `(B, 1)` onto the last two axes, so the real predicate is
+      `B > 1 && shape[-2] not in {1, B}`. At **B = 1** — the ordinary
+      single-request video latent — it composes AND is numerically correct,
+      because `(1, 1)` is just a scalar; `(2, 128, 8, 2, 16)` composes too. Where
+      it composes with `B > 1` it is silently WRONG, applying the per-batch
+      coefficient along axis -2 rather than the batch axis. The
+      `norm(dim=[-1,-2,-3])` in the two threshold arms (`:114`, `:205`) is a
+      SEPARATE constraint needing rank >= 3. The measured matrix now carries
+      `B = 1` and `shape[-2] == B` rows and the `square` abstraction — a
+      mis-generalization of those two axes — is gone.
     * **Local anchor:** `include/vllm/model_executor/models/ltx2_pipeline.h`,
       `src/vllm/model_executor/models/ltx2_pipeline.cpp`
       (`ResolveLtx2PipelineRecipe`, `Ltx2Guidance`).
