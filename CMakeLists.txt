@@ -754,6 +754,9 @@ add_library(vllm STATIC
   src/vllm/model_executor/models/minimax_h3_encoder_sharded.cpp
   src/vllm/model_executor/models/minimax_h3_encoder_device.cpp
   src/vllm/model_executor/models/minimax_h3_vision_gguf.cpp
+  # LTX-2.5 (row MODEL-DIFFUSION-LTX25, .agents/specs/ltx-2-5.md phase L2).
+  src/vllm/model_executor/models/ltx2.cpp
+  src/vllm/model_executor/models/ltx2_dit.cpp
   src/vllm/entrypoints/openai/video_api.cpp
   src/vllm/model_executor/models/kimi_kda.cpp
   src/vllm/model_executor/models/kimi_linear_registry.cpp

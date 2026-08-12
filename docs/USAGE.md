@@ -1445,6 +1445,39 @@ Served over HTTP too: pass `--video-dit` (plus the VAEs and configs) to `example
 `POST /v1/videos`, `POST /v1/videos/sync` and `GET /v1/videos/{id}` register. Without it the
 routes stay unregistered.
 
+## LTX-2.5: reproducing the DiT parity gate
+
+**There is no LTX-2.5 render path yet.** What ships today is the DiT's layout and
+forward, and there is no text encoder, no VAE, no pipeline and no `/v1/videos`
+route for it — asking the video engine for LTX-2.5 will not work. The C++ surface
+is `include/vllm/model_executor/models/ltx2.h`, and it refuses by name every arm it
+does not carry (a non-f32 stream dtype, the 19B caption-projection checkpoint form,
+keyframe absolute-position embeddings, the video-only / audio-only model types).
+
+The prompt-K/V cache (`Ltx2PromptKvCache`) is reusable across the DENOISE STEPS of
+one prompt, and only those. It records a fingerprint of the prompt it was filled
+for, and a forward whose context tensors, context geometry or prompt masks differ
+from that prompt is refused by name rather than served K/V that would render the
+cached prompt. Call `Ltx2PromptKvCache::Reset()` to rebind the same allocation to
+a new request.
+
+The gate runs the UPSTREAM modules at reduced dimensions on CPU, so it needs a
+Lightricks LTX-2 checkout and the system `python3` with torch — **no checkpoint, no
+venv and no gated download**. Regenerate the goldens and run it:
+
+```sh
+git clone https://github.com/Lightricks/LTX-2 ~/_git/LTX-2
+python3 scripts/gen-ltx2-goldens.py \
+  --ltx2 ~/_git/LTX-2 \
+  --out tests/vllm/models/ltx2_goldens.inc
+cmake --build build --target test_ltx2 && ./build/tests/test_ltx2
+```
+
+The generator asserts the `ltx_core` it imported came from that checkout and not
+from anything installed in site-packages, and it writes the upstream revision it
+executed into the generated header. Neither side checks in a weight byte: both
+rebuild every tensor from one deterministic stream keyed by the parameter's name.
+
 ## SSE keepalives on long prefill
 
 Async chat/completion streams may emit SSE **comment** frames (`:\n\n`) while
