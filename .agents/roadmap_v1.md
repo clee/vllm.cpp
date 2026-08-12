@@ -83,6 +83,7 @@ issue is not yet placed. Keyed record: update in place, never append.
 | [#514](https://github.com/mudler/vllm.cpp/issues/514) | `ENG-RELEASE-WINDOWS` | Windows Vulkan release test uses POSIX environment APIs | bug |
 | [#525](https://github.com/mudler/vllm.cpp/issues/525) | `ENG-RELEASE-WINDOWS` | Windows release contract recorder misreports non-empty argv | bug |
 | [#537](https://github.com/mudler/vllm.cpp/issues/537) | `ENG-RELEASE-WINDOWS` | Windows OpenAI socket smoke fast-fails instead of reporting a reset response | bug |
+| [#540](https://github.com/mudler/vllm.cpp/issues/540) | `ENG-RELEASE-WINDOWS` | Windows Vulkan strict build rejects shadowed KV-cache test locals | bug |
 | [#170](https://github.com/mudler/vllm.cpp/issues/170) | `ENG-RELEASE-BINARIES` | Publish container images to GHCR (cuda, vulkan, cpu) | feature |
 | [#322](https://github.com/mudler/vllm.cpp/issues/322) | `ENG-RELEASE-BINARIES` | Release handoff collides with tracked checkout `assets` directory | bug |
 | [#406](https://github.com/mudler/vllm.cpp/issues/406) | `ENG-TRAILER-MERGE-ARTIFACTS` | The trailer gate fails on how commits LAND: GitHub's Co-authored-by displaces the trailer block | bug |

@@ -7,8 +7,9 @@ Issues:
 [#500](https://github.com/mudler/vllm.cpp/issues/500), with post-merge follow-up
 [#512](https://github.com/mudler/vllm.cpp/issues/512) and
 [#514](https://github.com/mudler/vllm.cpp/issues/514), hosted-contract follow-up
-[#525](https://github.com/mudler/vllm.cpp/issues/525), and native socket-runtime
-follow-up [#537](https://github.com/mudler/vllm.cpp/issues/537)
+[#525](https://github.com/mudler/vllm.cpp/issues/525), native socket-runtime
+follow-up [#537](https://github.com/mudler/vllm.cpp/issues/537), and strict
+Vulkan-test follow-up [#540](https://github.com/mudler/vllm.cpp/issues/540)
 
 Parent specifications:
 [release-binary-matrix.md](release-binary-matrix.md) and
@@ -498,3 +499,42 @@ Stop with `NEEDS_DECISION` if the bounded upstream backport changes the public
 HTTP API, broadens beyond accepted-socket close, or requires any release-gate
 waiver. Stop with `NEEDS_CONTEXT` if Vulkan reports a different native failure;
 file and specify that defect separately rather than folding it into #537.
+
+### Strict Vulkan-test follow-up: issue #540
+
+The same immutable PR #524 candidate reached a different boundary in hosted
+Windows Vulkan job
+[`94265239433`](https://github.com/mudler/vllm.cpp/actions/runs/31641616323/job/94265239433).
+The PowerShell contract and prior Windows portability fixes passed; MSVC then
+rejected `tests/vt/test_backend_cross_device.cpp:525-529` under unchanged
+`/W4 /WX`. The unbound-flash-layout CPU-oracle block redeclares `cpu`, `cq`,
+`cd`, `ck`, `cv`, and `cslots`, shadowing names at lines 462-466 in the
+enclosing `ReshapeAndCache` test. MSVC C4456 diagnoses all six. Git history
+grounds the collision: `2c86f79ec` added the enclosing oracle and `822b3a2e15`
+later added the nested oracle with the same short names.
+
+The #540 repair is test-only. Rename exactly those six inner declarations to
+role-specific unbound-layout names and update only their uses in that nested
+oracle. Preserve the data, types, tensor shapes and strides, CPU operation,
+device loop, memcmp assertions, `/W4 /WX`, build targets, release topology, and
+all production files. Do not suppress C4456, relax the warning gate, introduce
+a compiler conditional, remove the nested oracle, or conflate this diagnostic
+with #537.
+
+RED-first evidence is the hosted MSVC diagnostic above plus a focused local
+contract over the real `ReshapeAndCache` test that rejects each of the six
+shadowing inner declarations. Each independent mutation restoring one old name
+must fail the focused contract, and the source must be restored byte-for-byte.
+Focused green requires that contract, the direct Windows portability checker,
+a clean local CPU compile/execution of `test_backend_cross_device`, and full
+unstaged/staged/post-commit preflight. Hosted acceptance requires both native
+Windows lanes to compile their complete unchanged targets; Vulkan must continue
+through runtime, package, and archive validation.
+
+After both #537 and #540 pass fresh review and operator gates, PR #524 must be
+plain-pushed at one exact SHA and all required PR checks must pass. The merged
+SHA must then pass the complete ten-tuple non-publishing workflow before the
+prerelease tag. Tag-run publication and the authenticated exactly-32-asset
+audit remain mandatory. Stop with `NEEDS_DECISION` if a production edit or
+warning-policy change is required; otherwise this is a bounded test hygiene
+repair.
