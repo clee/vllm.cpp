@@ -5,7 +5,8 @@ Identity: `ENG-RELEASE-WINDOWS`
 Issues:
 [#499](https://github.com/mudler/vllm.cpp/issues/499) and
 [#500](https://github.com/mudler/vllm.cpp/issues/500), with post-merge follow-up
-[#512](https://github.com/mudler/vllm.cpp/issues/512)
+[#512](https://github.com/mudler/vllm.cpp/issues/512) and
+[#514](https://github.com/mudler/vllm.cpp/issues/514)
 
 Parent specifications:
 [release-binary-matrix.md](release-binary-matrix.md) and
@@ -294,6 +295,29 @@ dry run to execute, package, and validate their archives. All other required
 tuples, aggregate `build`, and `verify` must also pass on that same SHA before
 `v0.0.3-pre.1` is tagged. The tag run must then pass all 15 required jobs and
 the authenticated post-publication audit over exactly 32 assets.
+
+Issue #514 is a separate Windows Vulkan compile defect from the same dry run.
+Job `94211117906` compiled and linked `test_cpu_isa_x86`, then MSVC rejected
+`setenv` at `tests/vt/test_backend_cross_device.cpp:1004,1048` and `unsetenv`
+at line 1050 with C3861. Those POSIX-only calls set, then restore,
+`VT_FUSED_TIER` around the cross-device fused-chain test. Linux accepts them;
+MSVC exposes `_putenv_s` instead.
+
+The #514 repair is limited to a test-local cross-platform environment seam.
+On Windows it must use checked `_putenv_s`, with an empty value removing the
+variable. On POSIX it must preserve checked `setenv(..., 1)` and `unsetenv`.
+The fused-chain case must still execute tiers 0 and 1, assert the selected tier,
+and restore the caller's prior environment state. Do not disable the case,
+change fused-chain production behavior, add a global compatibility macro, or
+weaken `/W4` or any release gate.
+
+RED-first structural coverage must reject the three live unguarded POSIX calls
+and require both platform arms in the real translation unit. Mutation must
+remove or bypass the Windows arm and make the focused suite fail. Focused green
+is the relevant Windows portability suite and direct checker, a clean local
+CPU compile/execution of `test_backend_cross_device`, and the full preflight.
+Hosted acceptance remains the same exact-merged-SHA dry run: Windows Vulkan
+must compile, execute, package, and validate before any tag is authorized.
 
 Fresh review of immutable implementation `e0b17eb9` found that the compiled
 version test derived its default expectation from the same cache value under
