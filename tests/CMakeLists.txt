@@ -35,6 +35,12 @@ function(vllm_cpp_add_test name)
 endfunction()
 
 vllm_cpp_add_test(test_version vllm/test_version.cpp)
+set(_vllm_cpp_expected_build_version "${PROJECT_VERSION}")
+if(DEFINED VLLM_CPP_BUILD_VERSION)
+  set(_vllm_cpp_expected_build_version "${VLLM_CPP_BUILD_VERSION}")
+endif()
+target_compile_definitions(test_version PRIVATE
+  VLLM_CPP_EXPECTED_BUILD_VERSION="${_vllm_cpp_expected_build_version}")
 vllm_cpp_add_test(test_sampling_params vllm/test_sampling_params.cpp)
 vllm_cpp_add_test(test_punica_cpu vllm/lora/test_punica_cpu.cpp)
 vllm_cpp_add_test(test_lora_layers vllm/lora/test_lora_layers.cpp)
@@ -171,6 +177,14 @@ target_include_directories(test_deepseek_v2_forward PRIVATE ${CMAKE_SOURCE_DIR}/
 # named W3-W8 residuals (.agents/specs/deepseek-v4-flash.md).
 vllm_cpp_add_test(test_deepseek_v4_scaffold vllm/models/test_deepseek_v4_scaffold.cpp)
 target_include_directories(test_deepseek_v4_scaffold PRIVATE ${CMAKE_SOURCE_DIR}/src)
+
+# DeepSeek-V4-Pro shape-generality gate (#504): the Pro config descends through
+# the SAME ParseDeepseekV4Params with zero new keys, and compress_ratios alone
+# reproduces the compressor/indexer layer counts of BOTH real checkpoints
+# (Flash 41/21, Pro 61/30). No checkpoint / GPU — Pro's 805 GiB does not fit one
+# GB10, so a load gate is memory-infeasible (.agents/specs/deepseek-v4-pro.md).
+vllm_cpp_add_test(test_deepseek_v4_pro_variant vllm/models/test_deepseek_v4_pro_variant.cpp)
+target_include_directories(test_deepseek_v4_pro_variant PRIVATE ${CMAKE_SOURCE_DIR}/src)
 
 # Laguna-S-2.1 W1/W2 scaffolding gate: LagunaForCausalLM RESOLVES through the
 # registry + ParseLagunaParams descends the shipped config (nested dual-rope +
@@ -1115,6 +1129,16 @@ add_test(NAME test_ops_fp8_cutlass_plan_cache_on
     "--test-case=fp8 cuBLASLt cached-plan GEMM is BYTE-identical to the fresh-plan GEMM")
 set_tests_properties(test_ops_fp8_cutlass_plan_cache_on PROPERTIES
   ENVIRONMENT "VT_FP8_PLAN_CACHE=1")
+# Opt-in arm: PERF-FP8-ALPHA-FOLD's per-column alpha applied INSIDE the cuBLASLt
+# epilogue (VT_FP8_ALPHA_VEC_EPILOGUE=1) versus the shipped two-launch form. This
+# is the BINDING byte-exactness comparison. The plain test_ops_fp8_cutlass run has
+# the toggle unset, where both sides execute the same fallback code and the case
+# only proves that fallback is unchanged.
+add_test(NAME test_ops_fp8_alpha_vec_epilogue_on
+  COMMAND test_ops_fp8_cutlass
+    "--test-case=fp8 cuBLASLt per-column alpha is BYTE-identical to the two-launch form")
+set_tests_properties(test_ops_fp8_alpha_vec_epilogue_on PROPERTIES
+  ENVIRONMENT "VT_FP8_ALPHA_VEC_EPILOGUE=1")
 vllm_cpp_add_test(test_ops_moe_grouped vt/test_ops_moe_grouped.cpp)
 vllm_cpp_add_test(test_ops_moe_grouped_bf16 vt/test_ops_moe_grouped_bf16.cpp)
 vllm_cpp_add_test(test_ops_moe_grouped_bf16_gate_up_silu
@@ -1140,6 +1164,15 @@ vllm_cpp_add_test(test_ops_kda_recurrence vt/test_ops_kda_recurrence.cpp)
 target_include_directories(test_ops_kda_recurrence PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_ops_kda_chunk_prefill vt/test_ops_kda_chunk_prefill.cpp)
 target_include_directories(test_ops_kda_chunk_prefill PRIVATE ${CMAKE_SOURCE_DIR}/src)
+# Mamba2 / SSD host references (.agents/specs/mamba2-ssd.md W1, #496). Three
+# sibling ops of the GDN/KDA lane above, gated against a sequential
+# double-precision reference and across chunk sizes.
+vllm_cpp_add_test(test_ops_mamba2_ssd vt/test_ops_mamba2_ssd.cpp)
+target_include_directories(test_ops_mamba2_ssd PRIVATE ${CMAKE_SOURCE_DIR}/src)
+vllm_cpp_add_test(test_ops_mamba2_state_update vt/test_ops_mamba2_state_update.cpp)
+target_include_directories(test_ops_mamba2_state_update PRIVATE ${CMAKE_SOURCE_DIR}/src)
+vllm_cpp_add_test(test_ops_mamba2_gated_norm vt/test_ops_mamba2_gated_norm.cpp)
+target_include_directories(test_ops_mamba2_gated_norm PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_ops_moe vt/test_ops_moe.cpp)
 vllm_cpp_add_test(test_ops_glue vt/test_ops_glue.cpp)
 vllm_cpp_add_test(test_ops_attn_preamble vt/test_ops_attn_preamble.cpp)
