@@ -139,6 +139,47 @@ _TO_BLOCKED_SOURCE_ANCHOR = """    rows, cols = input_matrix.shape
 _PINNED_VLLM_PATHS = [
     "vllm/model_executor/layers/quantization/qutlass_utils.py",
     "vllm/model_executor/layers/quantization/utils/nvfp4_utils.py",
+    "vllm/model_executor/layers/quantization/utils/nvfp4_emulation_utils.py",
+]
+
+# ── THE NIBBLE ORDER, PINNED ON BOTH SIDES ──────────────────────────────────
+#
+# .agents/specs/nvfp4-nibble-order.md. E2M1 packs two values per byte and the two
+# producers we read DISAGREE about which logical element gets which nibble, so
+# both conventions are anchored against a pinned, clean checkout. A silent flip
+# on either side transposes every adjacent weight pair: finite, correctly shaped,
+# and wrong.
+
+# LOW-first, vLLM's reader — and therefore torchao's and ModelOpt's, which it
+# reads. Matches torchao's own producer, `pack_uint4`
+# (pytorch/ao torchao/prototype/mx_formats/kernels.py:160,
+#  `uint8_data[::2] | uint8_data[1::2] << 4`), which is NOT pinnable here: torchao
+# is not installed on this host and not vendored. vLLM's reader is the local
+# witness, and it is an independent implementation of the same convention.
+_VLLM_LOW_NIBBLE_ANCHORS = [
+    "high = (a_flat & 0xF0) >> 4  # Upper nibbles",
+    "low = a_flat & 0x0F  # Lower nibbles",
+    "combined = torch.stack((low, high), dim=1).flatten()",
+]
+
+# HIGH-first, Lightricks' own runtime, which is what wrote the first-party
+# LTX-2.5 NVFP4 DiT.
+_PINNED_LTX2_PATHS = [
+    "packages/ltx-kernels/docs/NVFP4.md",
+    "packages/ltx-kernels/csrc/nvfp4/quantize.cu",
+    "packages/ltx-core/src/ltx_core/quantization/nvfp4/linear.py",
+]
+_LTX2_HIGH_NIBBLE_ANCHORS = [
+    ("packages/ltx-kernels/docs/NVFP4.md",
+     "`hi_first=True` (default) puts element `2j` in the **high** nibble of byte `j`;"),
+    ("packages/ltx-core/src/ltx_core/quantization/nvfp4/linear.py",
+     "element ``2j`` in the high nibble)"),
+    ("packages/ltx-core/src/ltx_core/quantization/nvfp4/linear.py",
+     "``weight_scale`` — E4M3 block scales as ``uint8``, cuBLAS 128x4 tiled layout"),
+    # The permutation itself, which our Ltx2UnswizzleNvfp4BlockScale inverts, and
+    # the `padded_cols == roundup(K/16, 4)` framing that the DiT declares.
+    ("packages/ltx-kernels/csrc/nvfp4/quantize.cu",
+     "return static_cast<int64_t>(tile) * 512 + (r & 31) * 16 + (r >> 5) * 4 + (col & 3);"),
 ]
 
 
@@ -168,6 +209,33 @@ def check_transcription(vllm_root: Path) -> None:
             raise SystemExit(
                 f"{other}: `swizzle_blockscale` no longer contains {fragment!r}; "
                 "the two vLLM producers may have diverged. Re-read both."
+            )
+    # LOW-nibble-first, vLLM's own reader.
+    emu = vllm_root / "vllm/model_executor/layers/quantization/utils/nvfp4_emulation_utils.py"
+    if not emu.is_file():
+        raise SystemExit(f"not a vLLM checkout: {emu} is missing")
+    etext = emu.read_text(encoding="utf-8")
+    for fragment in _VLLM_LOW_NIBBLE_ANCHORS:
+        if fragment not in etext:
+            raise SystemExit(
+                f"{emu}: `break_fp4_bytes` no longer contains {fragment!r}.\n"
+                "  That is the LOW-nibble-first convention DequantNvfp4ToBf16 defaults "
+                "to. If it moved, re-read it; do not relax this check."
+            )
+
+
+def check_ltx2_nibble_order(ltx2_root: Path) -> None:
+    """Fail if Lightricks' HIGH-first convention is no longer stated where we read it."""
+    for rel, fragment in _LTX2_HIGH_NIBBLE_ANCHORS:
+        path = ltx2_root / rel
+        if not path.is_file():
+            raise SystemExit(f"not an LTX-2 checkout: {path} is missing")
+        if fragment not in path.read_text(encoding="utf-8"):
+            raise SystemExit(
+                f"{path}: no longer contains {fragment!r}.\n"
+                "  The first-party NVFP4 DiT is read HIGH-nibble-first on the strength of "
+                "that statement (.agents/specs/nvfp4-nibble-order.md section 1). Re-read "
+                "it; do not relax this check."
             )
 
 
@@ -306,18 +374,28 @@ def emit_f32(out, name: str, data) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--vllm", required=True, type=Path, help="the pinned vLLM checkout")
+    parser.add_argument("--ltx2", required=True, type=Path,
+                        help="the Lightricks LTX-2 checkout (the HIGH-nibble authority)")
     parser.add_argument("--checkpoint-root", required=True, type=Path)
     parser.add_argument("--out", required=True, type=Path)
     args = parser.parse_args()
 
     check_transcription(args.vllm)
+    check_ltx2_nibble_order(args.ltx2)
     to_blocked = load_upstream_to_blocked(args.vllm)
     vllm_sha, vllm_clean = pinned_revision(args.vllm, "vllm", _PINNED_VLLM_PATHS)
+
+    ltx2_sha, ltx2_clean = pinned_revision(args.ltx2, "ltx2", _PINNED_LTX2_PATHS)
 
     root = args.checkpoint_root / "ltx-2.5/vonkaiser-fp8-nvfp4"
     dit_path = root / "transformer/ltx-2.5-22b-distilled-fp8.safetensors"
     te_path = root / "text_encoders/gemma4-12b-with-proj-nvfp4-torchao.safetensors"
-    for p in (dit_path, te_path):
+    nvfp4_dit_path = (
+        args.checkpoint_root
+        / "ltx-2.5/lightricks-ltx-2.5/diffusion_models"
+        / "ltx-2.5-22b-distilled-transformer-nvfp4.safetensors"
+    )
+    for p in (dit_path, te_path, nvfp4_dit_path):
         if not p.is_file():
             raise SystemExit(f"missing shipped checkpoint: {p}")
 
@@ -326,9 +404,18 @@ def main() -> int:
     out.write(
         "// GENERATED by scripts/gen-ltx2-quant-goldens.py — DO NOT EDIT BY HAND.\n"
         "//\n"
-        "// LTX-2.5 phase L6 (.agents/specs/ltx-2-5.md, issue #435): the torchao-NVFP4\n"
-        "// scale swizzle and the two shipped checkpoints' own bytes.\n"
+        "// LTX-2.5 phases L6 + L9a (.agents/specs/ltx-2-5.md, issue #435): the\n"
+        "// torchao-NVFP4 scale swizzle, the NIBBLE ORDER\n"
+        "// (.agents/specs/nvfp4-nibble-order.md), and the three shipped checkpoints'\n"
+        "// own bytes.\n"
         "//\n"
+        f"// FP8 DiT     {dit_path}\n"
+        f"// NVFP4 TE    {te_path}\n"
+        f"// NVFP4 DiT   {nvfp4_dit_path} ({nvfp4_dit_path.stat().st_size} bytes)\n"
+        "//\n"
+        f"// LTX-2 revision (HIGH-nibble-first authority): {ltx2_sha}"
+        + ("" if ltx2_clean else "  [worktree not fully clean; the pinned files are]")
+        + "\n"
         f"// vLLM revision (swizzle transcription pinned against it): {vllm_sha}\n"
         + (
             "// Both pinned vLLM sources are clean at that revision; the rest of that\n"
@@ -344,7 +431,7 @@ def main() -> int:
         "//\n"
         "// Regenerate (one line; a trailing backslash in a // comment is a\n"
         "// -Werror=comment line continuation):\n"
-        "//   python3 scripts/gen-ltx2-quant-goldens.py --vllm <vllm>"
+        "//   python3 scripts/gen-ltx2-quant-goldens.py --vllm <vllm> --ltx2 <ltx2>"
         " --checkpoint-root <root> --out tests/vllm/models/ltx2_quant_goldens.inc\n"
         "#pragma once\n\n#include <cstdint>\n\nnamespace vllm_test {\n\n"
     )
@@ -440,6 +527,131 @@ def main() -> int:
     emit_bytes(out, "kLtx2RealDitFp8Head", w_raw)
     out.write(f"inline constexpr float kLtx2RealDitFp8Scale = {cxx_f32(dit_scale)};\n\n")
     emit_f32(out, "kLtx2RealDitFp8HeadF32", f8e4m3_to_f32(bytes(w_raw)) * dit_scale)
+
+    # --- section 4: the FIRST-PARTY NVFP4 DiT, against the FP8 file as ORACLE ---
+    #
+    # Phase L9a / .agents/specs/nvfp4-nibble-order.md section 5.2. The two shipped
+    # DiTs quantize the SAME base weights, so the FP8 file is an oracle that is not
+    # ours for the NVFP4 read. What is emitted here lets the C++ suite run the
+    # WHOLE pipeline -- unswizzle, then hi-nibble-first dequant -- on real bytes and
+    # correlate the result against real FP8 weights, with a CONTROL arm.
+    n4_fh, n4_hdr, n4_base = open_header(nvfp4_dit_path)
+    n4_module = "model.diffusion_model.transformer_blocks.0.attn1.to_q"
+    # The control: a DIFFERENT module, so the gate must prove it can tell the right
+    # answer from a wrong one rather than passing on any two finite arrays.
+    n4_control = "model.diffusion_model.transformer_blocks.0.attn1.to_k"
+
+    n4_w = n4_hdr[n4_module + ".weight"]
+    n4_out, n4_packed_in = n4_w["shape"]
+    n4_in = n4_packed_in * 2
+    n4_groups = n4_in // 16
+    if any(name.endswith(".torchao_nvfp4") for name in n4_hdr):
+        raise SystemExit(
+            f"{nvfp4_dit_path}: a torchao_nvfp4 marker appeared. Its ABSENCE is half of "
+            "how the loader discriminates the producer. Re-read the file."
+        )
+    # The cuBLAS-PADDED framing of the swizzled scale, which is what this file
+    # declares, and which for these dims is numerically identical to the LINEAR
+    # [N, K/16] shape -- the ambiguity spec section 4.1 records.
+    padded_framing = [((n4_out + 127) // 128) * 128, ((n4_groups + 3) // 4) * 4]
+    to_blocked_framing = [32 * ((n4_out + 127) // 128), 16 * ((n4_groups + 3) // 4)]
+    if list(n4_hdr[n4_module + ".weight_scale"]["shape"]) != padded_framing:
+        raise SystemExit(
+            f"{n4_module}.weight_scale is "
+            f"{n4_hdr[n4_module + '.weight_scale']['shape']}, not the cuBLAS-padded "
+            f"{padded_framing} this section was written for."
+        )
+
+    # THE SCALE TILE, and why exactly 2048 bytes is a self-contained problem.
+    # Swizzled offset is tile*512 + (r%32)*16 + ((r%128)//32)*4 + (c%4), with
+    # tile = (r//128)*n_col_blocks + c//4. For r < 128 the row-tile index is 0, so
+    # n_col_blocks drops out entirely and the first 2048 bytes of the REAL scale
+    # are, byte for byte, a VALID STANDALONE swizzled [128, 16] grid. The C++ test
+    # therefore runs the real unswizzle on real bytes without the 4096x256 buffer.
+    n4_scale_tile = read_slice(n4_fh, n4_hdr, n4_base, n4_module + ".weight_scale", 2048)
+    n4_scale2 = struct.unpack(
+        "<f", read_slice(n4_fh, n4_hdr, n4_base, n4_module + ".weight_scale_2", 4)
+    )[0]
+
+    # Rows spanning all four 32-row QUARTERS of the swizzle tile. Rows 0..15 alone
+    # would leave quarter=1,2,3 unexercised -- the section 7.0(c) trap, where the
+    # fixture never enters the regime that discriminates.
+    n4_rows = [1, 33, 65, 97, 2, 34, 66, 98]
+    n4_elems = 256  # logical elements per row => 128 packed bytes, 16 groups
+    out.write(
+        "// ---------------------------------------------------------------------\n"
+        "// Phase L9a: the FIRST-PARTY NVFP4 DiT vs the FP8 DiT as an ORACLE\n"
+        f"// {nvfp4_dit_path.name}\n"
+        f"// module  {n4_module}\n"
+        f"// control {n4_control}\n"
+        f"// logical [{n4_out}, {n4_in}]; weight_scale stored "
+        f"{n4_hdr[n4_module + '.weight_scale']['shape']} = the cuBLAS-PADDED framing\n"
+        f"// {padded_framing}. torchao's to_blocked framing would be "
+        f"{to_blocked_framing};\n"
+        "// both dress the SAME bytes. This file carries NO torchao_nvfp4 marker.\n"
+        "//\n"
+        "// The first 2048 scale bytes are a valid standalone SWIZZLED [128, 16] grid\n"
+        "// (the row-tile index is 0 below row 128, so n_col_blocks drops out).\n"
+        f"// Rows {n4_rows} span all four 32-row quarters of that tile.\n"
+    )
+    # The module's REAL geometry and the shape it REALLY declares, so the C++ gate
+    # can run the producer resolver on the artifact's own numbers rather than on a
+    # geometry invented in the test.
+    out.write(f"inline constexpr int64_t kLtx2RealDitNvfp4OutFeatures = {n4_out};\n")
+    out.write(f"inline constexpr int64_t kLtx2RealDitNvfp4InFeatures = {n4_in};\n")
+    out.write(
+        f"inline constexpr int64_t kLtx2RealDitNvfp4DeclaredScaleShape[] = "
+        f"{{{n4_hdr[n4_module + '.weight_scale']['shape'][0]}, "
+        f"{n4_hdr[n4_module + '.weight_scale']['shape'][1]}}};\n"
+    )
+    out.write(
+        f'inline constexpr const char* kLtx2RealDitNvfp4Module =\n    "{n4_module}";\n'
+    )
+    out.write(f"inline constexpr int64_t kLtx2RealDitNvfp4ScaleTileRows = 128;\n")
+    out.write(f"inline constexpr int64_t kLtx2RealDitNvfp4ScaleTileCols = 16;\n")
+    out.write(f"inline constexpr int64_t kLtx2RealDitNvfp4RowElems = {n4_elems};\n")
+    out.write(
+        f"inline constexpr int64_t kLtx2RealDitNvfp4Rows[] = "
+        f"{{{', '.join(str(r) for r in n4_rows)}}};\n"
+        f"inline constexpr int64_t kLtx2RealDitNvfp4RowCount = {len(n4_rows)};\n"
+    )
+    out.write(f"inline constexpr float kLtx2RealDitNvfp4Scale2 = {cxx_f32(n4_scale2)};\n\n")
+    emit_bytes(out, "kLtx2RealDitNvfp4ScaleTile", n4_scale_tile)
+
+    # The packed NVFP4 weight rows, and the FP8 oracle's same rows.
+    def packed_rows(fh, hdr, base, module, rows, nbytes, stride):
+        begin = hdr[module + ".weight"]["data_offsets"][0]
+        acc = bytearray()
+        for r in rows:
+            fh.seek(base + begin + r * stride)
+            chunk = fh.read(nbytes)
+            if len(chunk) != nbytes:
+                raise SystemExit(f"{module} row {r}: short read")
+            acc += chunk
+        return bytes(acc)
+
+    n4_packed = packed_rows(n4_fh, n4_hdr, n4_base, n4_module, n4_rows,
+                            n4_elems // 2, n4_packed_in)
+    emit_bytes(out, "kLtx2RealDitNvfp4Packed", n4_packed)
+    n4_fh.close()
+
+    # The ORACLE: the same rows of the same module out of the FP8 checkpoint,
+    # decoded by TORCH. Emitted as f32 VALUES, per section 7.0's "emit values".
+    dit_fh2, dit_hdr2, dit_base2 = open_header(dit_path)
+    for label, module in (("Oracle", n4_module), ("Control", n4_control)):
+        fw_shape = dit_hdr2[module + ".weight"]["shape"]
+        fw_scale = struct.unpack(
+            "<f", read_slice(dit_fh2, dit_hdr2, dit_base2, module + ".weight_scale", 4)
+        )[0]
+        raw = packed_rows(dit_fh2, dit_hdr2, dit_base2, module, n4_rows, n4_elems,
+                          fw_shape[1])
+        vals = f8e4m3_to_f32(raw) * fw_scale
+        out.write(
+            f"// FP8 `{module}` rows {n4_rows}, elements 0..{n4_elems - 1},\n"
+            f"// per-tensor scale {fw_scale!r}, decoded by torch.\n"
+        )
+        emit_f32(out, f"kLtx2RealDitFp8{label}F32", vals)
+    dit_fh2.close()
     dit_fh.close()
 
     out.write("}  // namespace vllm_test\n")

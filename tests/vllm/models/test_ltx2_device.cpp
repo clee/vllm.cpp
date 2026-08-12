@@ -715,14 +715,23 @@ TEST_CASE("ltx2 device: HOST weights on a device queue are REFUSED by name") {
 //     STAGES AND RUNS. F8_E4M3 plus an F32 scalar is the dequant path phase L6
 //     already implements.
 //   * The first-party `ltx-2.5-22b-distilled-transformer-nvfp4.safetensors`
-//     (18.72 GB, 7876 tensors) does NOT stage, and the refusal is L6's and is
-//     correct. That file carries NO `.torchao_nvfp4` marker at all, and its
-//     `weight_scale` is [4096, 256] — the LINEAR [N, K/16] layout — where
-//     `Ltx2DequantTorchaoNvfp4ToBf16` expects the SWIZZLED [1024, 1024] form.
-//     The two have the same element count, so reading one as the other
-//     type-checks and permutes every scale within a 128x4 tile; L6 refuses by
-//     name rather than doing that. The LINEAR-scale read is LOADER work, owed
-//     against the L6 surface and not this one — the forward never sees it.
+//     (18.72 GB, 7876 tensors) ALSO stages and runs, since phase L9a
+//     (.agents/specs/nvfp4-nibble-order.md).
+//
+//     It used to be refused, and the refusal carried a WRONG diagnosis worth
+//     recording: it said the file stored a LINEAR [N, K/16] group scale. It does
+//     not. The bytes were SWIZZLED all along, declared in the cuBLAS-padded
+//     framing [4096, 256] rather than the `to_blocked` [1024, 1024] the loader
+//     knew — and for every layer in that file the padded framing is NUMERICALLY
+//     IDENTICAL to the linear shape, which is exactly why a shape test could not
+//     tell them apart and why the wrong diagnosis looked right.
+//
+//     The file also packs element 2j in the HIGH nibble, where torchao, ModelOpt
+//     and our default put it in the LOW one. Nothing about the SHAPES could have
+//     revealed that: it was found by correlating the dequantized weights against
+//     the vonkaiser FP8 DiT of the same base weights (0.9956 correct vs 0.032
+//     wrong), which is now a committed gate in test_ltx2_loader rather than a
+//     one-off measurement.
 //
 // WHAT IT DOES AND DOES NOT CLAIM. There is no golden at this geometry and there
 // is no oracle: vLLM-Omni carries no native LTX-2.5 path, so nothing here is a

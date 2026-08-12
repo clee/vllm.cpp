@@ -38,6 +38,25 @@
 // the same permutation written twice — and hands the result to the UNCHANGED
 // `DequantNvfp4ToBf16`. Nothing else about the scheme differs.
 //
+// ─── AND A SECOND PRODUCER, WITH A SECOND DELTA ──────────────────────────────
+//
+// Recorded 2026-08-13 (phase L9a, .agents/specs/nvfp4-nibble-order.md). The above
+// describes the torchao-quantized TEXT ENCODER. Lightricks' first-party NVFP4
+// **DiT** was written by their own `nvfp4-prequant`, and it differs twice:
+//
+//   * the SAME swizzled bytes are declared in the cuBLAS-PADDED framing
+//     [round_up(N,128), round_up(G,4)] rather than torchao's `to_blocked`
+//     [32*ceil(N/128), 16*ceil(G/4)]. Same buffer, same permutation, different
+//     2-D dress — `Ltx2UnswizzleNvfp4BlockScale` reads both unchanged;
+//   * element 2j is in the HIGH nibble, not the low one.
+//
+// The second is a different byte ENCODING and is why `DequantNvfp4ToBf16` grew an
+// `Nvfp4NibbleOrder`. This file used to be REFUSED, with a message diagnosing its
+// scale as the LINEAR layout; that diagnosis was wrong — the bytes were swizzled
+// all along, and the linear shape is numerically identical to the padded framing
+// for every layer here, which is exactly why a shape test could not tell.
+// `Ltx2ResolveNvfp4Producer` below is what decides, and what refuses.
+//
 // ─── WHAT THE STORED SHAPES MEAN, AND THE TRAP IN THEM ───────────────────────
 //
 // NVFP4 packs TWO values per byte along the LAST dimension, so every U8 width
@@ -112,6 +131,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include "vllm/model_executor/model_loader/nvfp4_dequant.h"  // Nvfp4NibbleOrder
 #include "vllm/model_executor/models/ltx2.h"
 #include "vllm/model_executor/models/ltx2_audio_vae.h"
 #include "vllm/model_executor/models/ltx2_text_encoder.h"
@@ -148,6 +168,66 @@ struct Ltx2TorchaoNvfp4Marker {
 // The tensor name this port is keyed on.
 inline constexpr const char* kLtx2TorchaoNvfp4MarkerSuffix = ".torchao_nvfp4";
 
+// ---------------------------------------------------------------------------
+// WHICH PRODUCER WROTE THIS FILE — .agents/specs/nvfp4-nibble-order.md section 3.2
+// ---------------------------------------------------------------------------
+//
+// The two NVFP4 checkpoints this campaign loads were written by DIFFERENT
+// producers that disagree about BOTH the group scale's 2-D framing AND the nibble
+// order. Getting either wrong yields finite, correctly shaped, correctly scaled,
+// WRONG weights, so the choice is made from evidence and refused when the
+// evidence does not fit.
+//
+//   torchao          `<module>.torchao_nvfp4` marker present, scale stored in the
+//                    `to_blocked` framing [32*ceil(N/128), 16*ceil(G/4)],
+//                    LOW-nibble-first.  (the Gemma-4 text encoder)
+//   nvfp4-prequant   NO marker anywhere, scale stored in the cuBLAS-PADDED framing
+//                    [round_up(N,128), round_up(G,4)], HIGH-nibble-first.
+//                    (Lightricks' first-party LTX-2.5 DiT)
+//
+// THE MARKER IS THE DISCRIMINANT, AND ITS ABSENCE IS EVIDENCE, NOT A DEFAULT:
+// torchao always emits that sidecar, so a file without one was not written by
+// torchao. That is an inference from a producer's signature and it is stated here
+// rather than buried, because it is the one step in this path that is not read
+// directly off the file. What supports it, measured rather than argued: reading
+// the first-party DiT this way correlates 0.9956 (9.46% relative rms, which IS
+// NVFP4 quantization error) against the independent vonkaiser FP8 DiT of the same
+// base weights, where the alternative readings give 0.0004 to 0.26; and Lightricks'
+// own runtime documents exactly this layout and order
+// (ltx-kernels/docs/NVFP4.md:27-29, ltx-core/quantization/nvfp4/linear.py:6-7).
+//
+// THE SHAPE CANNOT DISCRIMINATE ALONE, which is why the marker leads. Every layer
+// of the first-party DiT has N % 128 == 0 and G % 4 == 0, so its cuBLAS-padded
+// shape is NUMERICALLY IDENTICAL to the linear [N, G] one. A shape test can never
+// separate those two. It is used only to CORROBORATE what the marker decided, and
+// any other combination is refused by name rather than resolved in either
+// direction.
+enum class Ltx2Nvfp4Producer {
+  kTorchao,        // marker present: to_blocked framing, low-nibble-first
+  kNvfp4Prequant,  // marker absent:  cuBLAS-padded framing, high-nibble-first
+};
+
+// The two 2-D framings of the SAME swizzled byte buffer. Equal element counts,
+// identical layout; `Ltx2UnswizzleNvfp4BlockScale` reads either because it keys
+// off the LOGICAL rows/cols and a byte count, not off the declared shape.
+std::vector<int64_t> Ltx2Nvfp4ToBlockedScaleShape(int64_t out_features,
+                                                  int64_t in_features);
+std::vector<int64_t> Ltx2Nvfp4PaddedScaleShape(int64_t out_features,
+                                               int64_t in_features);
+
+// Resolve the producer from the marker, corroborated by the stored scale shape.
+// `marker` is null when the file declares none for this module.
+//
+// Throws std::runtime_error naming `module` when the marker and the shape
+// disagree, or when the shape matches neither framing — never picking one.
+Ltx2Nvfp4Producer Ltx2ResolveNvfp4Producer(const std::string& module,
+                                           const Ltx2TorchaoNvfp4Marker* marker,
+                                           const std::vector<int64_t>& scale_shape,
+                                           int64_t out_features, int64_t in_features);
+
+// The nibble order each producer packs with.
+Nvfp4NibbleOrder Ltx2Nvfp4NibbleOrderFor(Ltx2Nvfp4Producer producer);
+
 // Parses the marker's JSON payload. Throws std::runtime_error naming `module`
 // on: a non-JSON payload, a `format` other than "torchao_nvfp4", a
 // `block_size` other than kNvfp4GroupSize (16), or `is_swizzled_scales` false —
@@ -174,20 +254,26 @@ Ltx2TorchaoNvfp4Marker ParseLtx2TorchaoNvfp4Marker(const std::string& module,
 void Ltx2UnswizzleNvfp4BlockScale(const uint8_t* swizzled, size_t swizzled_bytes,
                                   int64_t rows, int64_t cols, uint8_t* linear);
 
-// One torchao-NVFP4 quantized module, dequantized to bf16 through the UNCHANGED
-// modelopt path: unswizzle the group scale, then `DequantNvfp4ToBf16`.
+// One NVFP4 quantized module, dequantized to bf16 through the UNCHANGED modelopt
+// path: unswizzle the group scale, then `DequantNvfp4ToBf16`.
 //
-//   packed    U8       [out, in/2]        (in = stored cols * 2)
-//   scale     F8_E4M3  [out/4, (in/16)*4] the SWIZZLED layout
-//   scale_2   F32      scalar             MULTIPLIER
+//   packed    U8       [out, in/2]  (in = stored cols * 2), packed per `producer`
+//   scale     F8_E4M3  the SWIZZLED group scale, in `producer`'s framing
+//   scale_2   F32      scalar       MULTIPLIER
 //
-// Every one of those three shapes is asserted against `out`/`in` before a byte
-// is read, and a mismatch throws naming `module`. `out_bf16` receives out*in
-// bf16 bit patterns.
-void Ltx2DequantTorchaoNvfp4ToBf16(const std::string& module, const StTensor& packed,
-                                   const StTensor& scale, const StTensor& scale_2,
-                                   int64_t out_features, int64_t in_features,
-                                   uint16_t* out_bf16);
+// Both scale layouts are the same permutation over the same bytes; only the
+// declared 2-D shape and the nibble order differ, and `producer` names which.
+// Every one of those three shapes is asserted against `out`/`in` before a byte is
+// read, and a mismatch throws naming `module`. `out_bf16` receives out*in bf16 bit
+// patterns.
+//
+// `producer` is NOT defaulted. A default here would let a caller that never
+// thought about the question silently get the torchao reading for a
+// nvfp4-prequant file, which is precisely the failure this seam exists to refuse.
+void Ltx2DequantNvfp4ToBf16(const std::string& module, const StTensor& packed,
+                            const StTensor& scale, const StTensor& scale_2,
+                            int64_t out_features, int64_t in_features,
+                            Ltx2Nvfp4Producer producer, uint16_t* out_bf16);
 
 // ---------------------------------------------------------------------------
 // The DiT
