@@ -4,7 +4,8 @@ Identity: `ENG-RELEASE-WINDOWS`
 
 Issues:
 [#499](https://github.com/mudler/vllm.cpp/issues/499) and
-[#500](https://github.com/mudler/vllm.cpp/issues/500)
+[#500](https://github.com/mudler/vllm.cpp/issues/500), with post-merge follow-up
+[#512](https://github.com/mudler/vllm.cpp/issues/512)
 
 Parent specifications:
 [release-binary-matrix.md](release-binary-matrix.md) and
@@ -250,6 +251,49 @@ row's scope.
 Native Windows compilation, the complete ten-tuple non-publishing workflow,
 and the tag-run publication/audit remain post-merge acceptance gates. No tag or
 release is authorized by the local evidence alone.
+
+### Follow-up outcome and repair contract: issue #512
+
+PR #508 merged as `2bc4be070a3883f0f7115682469a289f42d86d1a`.
+Exact-SHA dry run
+[`31625581156`](https://github.com/mudler/vllm.cpp/actions/runs/31625581156)
+proved the prior fixes far enough for Windows CPU to compile
+`test_cpu_isa_x86.cpp` successfully. Job `94211117810` then failed before its
+first no-argument test executed:
+
+```text
+Cannot bind argument to parameter 'Arguments' because it is an empty array.
+```
+
+`scripts/build-windows-release.ps1:20-26` declares `Invoke-Checked` with a
+mandatory `string[] Arguments` parameter. The script deliberately passes
+`@()` when executing tests that take no arguments at lines 226-231 and 264-266.
+PowerShell parameter binding rejects that explicit empty collection before the
+helper invokes the executable. The build, strict MSVC warning gate, and
+`test_cpu_isa_x86` link all succeeded; this is not a recurrence of #500.
+
+The #512 repair is limited to making `Invoke-Checked` accept an explicitly empty
+argument array while preserving argument splatting and the non-zero exit-status
+failure contract. It must not remove `Invoke-Checked`, bypass any test, add a
+dummy argument, weaken the Windows release gate, change a release tuple, or
+publish a tag.
+
+RED-first evidence must execute the real PowerShell helper contract with both
+zero and nonzero argument counts. Before the fix, the zero-argument arm must
+fail with the observed parameter-binding error. After the fix, it must prove
+that the target runs exactly once with zero arguments, that nonempty arguments
+arrive unchanged, and that a nonzero child exit remains rejected. Mutating the
+helper back to a mandatory non-empty array must make the focused contract red.
+
+Focused acceptance is the PowerShell contract test plus
+`tests.scripts.test_release_windows_metadata`,
+`tests.scripts.test_release_pipeline`, the direct Windows portability and
+release-binary checkers, and the full repository preflight. Hosted acceptance
+requires both Windows CPU and Vulkan jobs in a new exact-merged-SHA ten-tuple
+dry run to execute, package, and validate their archives. All other required
+tuples, aggregate `build`, and `verify` must also pass on that same SHA before
+`v0.0.3-pre.1` is tagged. The tag run must then pass all 15 required jobs and
+the authenticated post-publication audit over exactly 32 assets.
 
 Fresh review of immutable implementation `e0b17eb9` found that the compiled
 version test derived its default expectation from the same cache value under
