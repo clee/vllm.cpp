@@ -34,9 +34,16 @@ registry-bound list in [FEATURES.md](FEATURES.md).
 ## vLLM, online serving
 
 The binding comparison. vLLM runs its **production graphed config**, never
-`--enforce-eager`, because the graphed config is the honest denominator.
+`--enforce-eager`. The oracle column is what RAN, which is **not the pin**
+`555967922`: the harness enforced `0.25.0` and *raised* on anything else until
+2026-08-12, so those rows could not have been measured otherwise
+([#520](https://github.com/mudler/vllm.cpp/issues/520)). Attributed, not
+withdrawn; the two tie where checked (27B c1, 0.9983, n=3). A grid at the pin is
+owed ([#522](https://github.com/mudler/vllm.cpp/issues/522)), and the absent
+`--language-model-only` flatters these ratios
+([#414](https://github.com/mudler/vllm.cpp/issues/414)).
 
-| Model | Quant | vLLM pin | Axes passing | Disposition |
+| Model | Quant | vLLM oracle | Axes passing | Disposition |
 |---|---|---|---:|---|
 | Qwen3.6-27B | NVFP4 (`unsloth` @`890bdef7`) | 0.25.0 | **115/124** | Effective parity-or-better, two-grid totality. Revision-PINNED (the gate no longer lets `readdir` choose): @`ccdaab7e` is the same repo name re-quantized to FP8 W8A8 throughout, not NVFP4 |
 | Qwen3.6-27B | NVFP4 (`nvidia` @`0893e160`, ModelOpt `modelopt_mixed`) | 0.25.0 | 0/6 | **BEHIND, uniformly 0.94x** on decode, flat c1-c32 (6-point, `gate_pass:false`); greedy continuation IDENTICAL to vLLM. Different model from the `unsloth` row (NVFP4 MLP + FP8 W8A8 tower) |
@@ -97,6 +104,7 @@ the same metric at higher concurrency (c8 p99 ITL 0.86x, but 1.055x at c16 and
 | Step attribution (nsys, node-level, both arms same tool) | ours 98.906 vs vLLM 81.577 ms/step, 99.2/99.3% GPU-busy; lm_head 8.6414 + fp8 tower 7.6068 + splitK 0.0532 + other 1.0279 = **17.3292 vs measured 17.3292** | | |
 | Lever 1, `lm_head` | ships U8/NVFP4 (0.666 GiB), we read 2.368 GiB BF16: **+1.702 GiB/step**, 11.183 ms. Marlin efficiency is EQUAL (207.9 vs 210.0 GiB/s), only bytes differ | | |
 | Lever 2, GDN fp8 in_proj | identical 6.7188 GiB/step both arms; ours 96 GEMMs at 165.9 GiB/s vs vLLM 48 merged qkvz at 204.3; `in_proj_qkv` at **129.3 vs 213.6 GiB/s** | | |
+| Lever 2b, packed GDN decode (#365) | separate c1 in16/out256 harness: 0.977x -> 0.984x, INDICATIVE not binding (arms not interleaved); see the record | | | | | |
 | OPEN: host-memory-state sensitivity | same binaries read c1 0.7604 pre-reboot vs 0.8289 post; vLLM barely moved. Protocols also differed, variables not separated | | |
 | Spread, ours / vLLM | 1.000 / 1.006 | 1.009 / 1.069 | 1.001 / 1.001 | 1.005 / 1.003 |
 | Method | medians of 3, warm servers, one `flock`, greedy, `ignore_eos` so both emit exactly 128 tokens, `--gpu-memory-utilization 0.55 --max-model-len 4096`, vLLM in its production graphed config | | | |
@@ -123,13 +131,14 @@ the same metric at higher concurrency (c8 p99 ITL 0.86x, but 1.055x at c16 and
 
 | Concurrency | 1 | 2 | 4 | 8 | 16 | 32 |
 |---|---:|---:|---:|---:|---:|---:|
-| **vllm.cpp** tok/s | 65.6 | 93.6 | 142.9 | 197.6 | 256.2 | 323.1 |
-| vLLM tok/s | 67.0 | 99.9 | 150.6 | 211.3 | 272.9 | 333.6 |
-| **Ratio** | **0.979x** | 0.937x | 0.949x | 0.935x | 0.939x | 0.969x |
-| Mean TPOT | 0.978x | 0.945x | 0.943x | 0.938x | 0.930x | 0.967x |
-| Mean TTFT | 0.972x | **0.872x** | 0.970x | 0.965x | 0.969x | 0.968x |
-| Our CoV | 0.39% | 0.26% | 0.59% | 0.60% | 0.37% | 0.41% |
-| vLLM CoV | 0.62% | 0.35% | 0.81% | 0.57% | 0.50% | 0.35% |
+| **Ratio, CANONICAL @`348c265d`** | **0.9708x** | 0.9293x | **0.9719x** | 0.9183x | 0.9264x | 0.9377x |
+| **vllm.cpp** tok/s @`348c265d` | 65.262 | 93.012 | 140.174 | 193.477 | 251.490 | 311.897 |
+| vLLM tok/s @`348c265d` | 67.223 | 100.088 | 144.226 | 210.679 | 271.479 | 332.606 |
+| Ratio, superseded @`a0fa12c7` | 0.979x | 0.937x | 0.949x | 0.935x | 0.939x | 0.969x |
+| Mean TPOT @`a0fa12c7` | 0.978x | 0.945x | 0.943x | 0.938x | 0.930x | 0.967x |
+| Mean TTFT @`a0fa12c7` | 0.972x | **0.872x** | 0.970x | 0.965x | 0.969x | 0.968x |
+| Our CoV @`a0fa12c7` | 0.39% | 0.26% | 0.59% | 0.60% | 0.37% | 0.41% |
+| vLLM CoV @`a0fa12c7` | 0.62% | 0.35% | 0.81% | 0.57% | 0.50% | 0.35% |
 
 **There is no isolated c2/c8 weakness.** Binding grid at `a0fa12c7`
 (2026-08-10), 3 reps, binding-eligible 12/12; the prior c2 0.87x / c8 0.92x
@@ -335,7 +344,7 @@ in the tree, default-OFF, for reproducibility; detail in the benchmark record.
 | MTP | Qwen3.6-27B NVFP4 | token-identical to vLLM MTP, **~4% faster at c1**; on-par at c2-c8 | `DONE` |
 | DFlash | Qwen3.6-27B NVFP4 | **2.9x over spec-off** (10.16 → 29.32 tok/s), at/above vLLM DFlash-on (**1.003x**, non-overlapping bands) | `DONE` |
 | n-gram | Qwen3.6-27B NVFP4 | draft-free (`SPEC-NGRAM`); 27B 5/5 STRICT our-ngram-ON == vLLM-ngram-ON, 180/180 drafts accepted (correctness only, no speed row yet) | `DONE` |
-| DSpark | 27B NVFP4 dense k=15; 35B-A3B MoE k=8 | vs the **pinned, graphed** oracle: MoE **0.975x** code / 1.012x prose under PINNED CLOCKS (non-overlapping). NOT parity; residual is the expert GEMM. W8 captures the T=1+k verify (#442): +12.2%/+3.5%, byte-identical | `ACTIVE` |
+| DSpark | 27B NVFP4 dense k=15; 35B-A3B MoE k=8 | MoE **0.975x** code / **1.012x** prose vs the pinned graphed oracle (PINNED CLOCKS, non-overlapping). NOT parity: identical code and slab, but **186.6 vs 210.7 GB/s** (derived; upstream ncu blocked) (#442) | `ACTIVE` |
 | Breadth (EAGLE1/3, suffix, ngram-gpu, dynamic-k, ...) | n/a | enumerated from vLLM source + `INVENTORIED` 2026-08-06 (`.agents/specs/spec-decode-inventory.md`), unmeasured | `INVENTORIED` |
 
 ## How we measure
