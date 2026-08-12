@@ -777,9 +777,13 @@ TEST_CASE("ltx2 device: a SHIPPED 21.00B DiT stages and runs on the GPU") {
   // artifact, every time. The two are not interchangeable quantizations of one
   // model — they differ in a TRAINED `keyframes_abs_pos_embedding` — so a report
   // that cannot say which one ran is not evidence about either.
+  // EVERY `const char*` streamed here is wrapped, not just the ternary. A bare
+  // `path_env` decays through the SAME overload and printed `(path 1)` on the
+  // first GB10 run of this fix -- the identical defect, reintroduced one token
+  // away from where it was being repaired.
   const std::string quant_name = quant == vllm::Ltx2DitQuant::kNvfp4 ? "NVFP4" : "FP8";
   MESSAGE("shipped DiT: " << file.Names().size() << " tensors, quant=" << quant_name
-                          << " (path " << path_env << ")");
+                          << " (path " << std::string(path_env) << ")");
 
   // Stage tensor-by-tensor. This is the production path: it dequantizes and
   // uploads ONE tensor at a time and frees each host buffer before the next, so
@@ -809,9 +813,14 @@ TEST_CASE("ltx2 device: a SHIPPED 21.00B DiT stages and runs on the GPU") {
   // calls, so the two cannot answer differently.
   const bool declares_config = file.Metadata().count("config") != 0;
   const char* config_env = std::getenv("LTX2_SHIPPED_DIT_CONFIG");
-  MESSAGE("config source: " << (declares_config ? "the checkpoint's own __metadata__"
-                                : config_env != nullptr ? "LTX2_SHIPPED_DIT_CONFIG"
-                                                        : "NONE (manifest shapes only)"));
+  // `std::string`, for the reason F8 records: a `const char*` ternary decays to
+  // `bool` through doctest's ostream and prints `1`, which is what this very line
+  // did on its first GB10 run.
+  const std::string config_source =
+      declares_config ? std::string("the checkpoint's own __metadata__[\"config\"]")
+      : config_env != nullptr ? std::string("LTX2_SHIPPED_DIT_CONFIG=") + config_env
+                              : std::string("NONE (manifest shapes only)");
+  MESSAGE("config source: " << config_source);
   if (declares_config || config_env != nullptr) {
     nlohmann::json config;
     std::string source;
@@ -822,7 +831,8 @@ TEST_CASE("ltx2 device: a SHIPPED 21.00B DiT stages and runs on the GPU") {
       source = "the DiT checkpoint's own __metadata__[\"config\"][\"transformer\"]";
     } else {
       std::ifstream in(config_env, std::ios::binary);
-      REQUIRE_MESSAGE(in.good(), "cannot open LTX2_SHIPPED_DIT_CONFIG ", config_env);
+      REQUIRE_MESSAGE(in.good(), "cannot open LTX2_SHIPPED_DIT_CONFIG ",
+                      std::string(config_env));
       config = nlohmann::json::parse(
           std::string((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>()));
       source = std::string("the LTX2_SHIPPED_DIT_CONFIG file '") + config_env + "'";
