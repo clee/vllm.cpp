@@ -623,10 +623,15 @@ void ExpectDeviceMatchesHost(const std::string& what, const std::vector<float>& 
       if (!std::isfinite(static_cast<double>(dev[i]))) break;
     }
   }
-  INFO(what << ": K=" << K << " rtol=" << rtol << " scale=" << scale << "; " << bit_differing
-            << " of " << dev.size() << " elements differ in any bit; worst element [" << worst_i
-            << "] dev=" << dev[worst_i] << " host=" << host[worst_i] << " |diff|=" << worst_diff
-            << " used " << (worst_ratio * 100.0) << "% of its derived budget");
+  // MESSAGE, not INFO: doctest prints an INFO context only when an assertion in
+  // its scope FAILS, so the used slack has to be logged unconditionally for the
+  // derived bar to be auditable on the green run that matters.
+  MESSAGE(what << ": K=" << K << " rtol=" << rtol << " scale=" << scale << "; "
+               << bit_differing << " of " << dev.size()
+               << " elements differ in any bit; worst element [" << worst_i
+               << "] dev=" << dev[worst_i] << " host=" << host[worst_i]
+               << " |diff|=" << worst_diff << " used " << (worst_ratio * 100.0)
+               << "% of its derived budget");
   CHECK(std::isfinite(static_cast<double>(dev[worst_i])));
   CHECK(worst_ratio <= 1.0);
 }
