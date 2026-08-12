@@ -3,6 +3,7 @@
 // (.agents/specs/qwen36-forward-notes.md §6).
 #include "vllm/model_executor/models/qwen3_5_weights.h"
 
+#include <cctype>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -10,6 +11,7 @@
 #include <optional>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #if defined(__unix__) || defined(__APPLE__)
@@ -592,6 +594,84 @@ bool HasBackboneUnder(const std::vector<std::string>& names,
   return false;
 }
 
+// --- Unimplemented MoE expert arms, REFUSED BY NAME (issue #490) -------------
+//
+// `LoadMoeExpertsInto` above reads exactly ONE routed-expert layout: per-expert
+// NVFP4 (`...mlp.experts.<e>.{gate,up,down}_proj` through `LoadNvfp4Raw`, which
+// hard-requires a `U8` `.weight`, an `F8_E4M3` `.weight_scale` and a
+// `.weight_scale_2`). There is no stacked branch and no bf16 branch — unlike
+// `gemma4_weights.cpp:326`, which dispatches between layouts.
+//
+// The PUBLISHED Qwen3.5-family MoE repos do not have that layout. Read off the
+// live safetensors indices 2026-08-12: `Qwen/Qwen3.8-2.4T-A95B` has 93x
+// `mlp.experts.gate_up_proj` + 93x `.down_proj` (3-D STACKED) and ZERO
+// `weight_scale` / `input_scale` tensors; `Qwen/Qwen3.6-35B-A3B` is the same
+// under the VL prefix. Our gated 35B row reads the REQUANTIZED
+// `nvidia/Qwen3.6-35B-A3B-NVFP4`, so this loader has never read a published
+// Qwen bf16 MoE checkpoint. Left alone, such a load dies at
+// `LoadNvfp4Raw(get, "lm_head")` with "expected U8 for lm_head.weight" — which
+// reads as a corrupt checkpoint, not as an unimplemented arm.
+//
+// AGENTS.md: an arm that is not implemented "is refused with a message naming
+// the missing piece ... never left to be discovered later", and the row's spec
+// (.agents/specs/qwen38-text-only.md) says the same in its stop conditions.
+// This is that refusal and ONLY that: the stacked/bf16 MoE expert arm is OWED,
+// and implementing it needs its own spec, RED-first test and NVFP4 inertness
+// proof. Inert on the supported layout — every name it inspects already has to
+// exist for the load to succeed at all.
+void CheckMoeExpertLayoutSupported(const std::vector<std::string>& names,
+                                   const std::string& backbone) {
+  static const std::string kRequired =
+      " This loader implements only the per-expert NVFP4 layout: "
+      "<layer>.mlp.experts.<e>.{gate,up,down}_proj.weight (U8 packed) + "
+      ".weight_scale (F8_E4M3) + .weight_scale_2, and lm_head the same way. The "
+      "published bf16 repos (Qwen/Qwen3.8-2.4T-A95B, Qwen/Qwen3.6-35B-A3B) ship "
+      "the 3-D stacked, unquantized layout; an NVFP4 requant (e.g. "
+      "nvidia/Qwen3.6-35B-A3B-NVFP4) ships the supported one. The stacked and "
+      "unquantized MoE expert arms are OWED, not silently unsupported: see "
+      ".agents/specs/qwen38-text-only.md.";
+  const std::string layers = backbone + "layers.";
+  const std::string experts = ".mlp.experts.";
+  const std::string weight = ".weight";
+  const std::unordered_set<std::string> present(names.begin(), names.end());
+  for (const std::string& name : names) {
+    if (name.compare(0, layers.size(), layers) != 0) continue;
+    const size_t at = name.find(experts);
+    if (at == std::string::npos) continue;
+    const size_t rest = at + experts.size();
+    if (rest >= name.size()) continue;
+    // `experts.<digit>` is the per-expert spelling; anything else — the
+    // published `experts.gate_up_proj` / `experts.down_proj` — is the stacked
+    // one, where a single 3-D tensor holds every expert.
+    if (std::isdigit(static_cast<unsigned char>(name[rest])) == 0) {
+      VT_CHECK(false,
+               "qwen3_5 weights: 3-D stacked routed experts are not implemented "
+               "for the safetensors MoE arm -- found \"" +
+                   name + "\"." + kRequired);
+    }
+    if (name.size() > weight.size() &&
+        name.compare(name.size() - weight.size(), weight.size(), weight) == 0 &&
+        present.count(name + "_scale") == 0) {
+      VT_CHECK(false,
+               "qwen3_5 weights: unquantized routed experts are not implemented "
+               "for the safetensors MoE arm -- \"" +
+                   name + "\" has no \"" + name + "_scale\" beside it." +
+                   kRequired);
+    }
+  }
+  // The MoE head is likewise NVFP4-only here, where the DENSE loader routes a
+  // head by dtype (`LoadDenseLmHead` / `LoadLmHeadAnyDtype`). A checkpoint with
+  // no `lm_head.weight` at all is the tied-head case and is not this refusal.
+  if (present.count("lm_head.weight") != 0 &&
+      present.count("lm_head.weight_scale") == 0) {
+    VT_CHECK(false,
+             "qwen3_5 weights: an unquantized lm_head is not implemented for "
+             "the safetensors MoE arm -- \"lm_head.weight\" has no "
+             "\"lm_head.weight_scale\" beside it." +
+                 kRequired);
+  }
+}
+
 }  // namespace
 
 std::string ResolveQwen3_5BackbonePrefix(
@@ -650,6 +730,10 @@ Qwen3_5MoeWeights LoadQwen3_5Moe(
   // VL-nested spelling for the wrappers we gate, the flat `model.` spelling for
   // a text-only arm, and a refusal for a mixed index.
   const std::string backbone = ResolveQwen3_5BackbonePrefix(all_names);
+  // ...and ONE decision about the routed-expert layout, before any tensor is
+  // touched, so an arm we do not implement is refused by name rather than
+  // discovered as a dtype complaint about `lm_head` (issue #490).
+  CheckMoeExpertLayoutSupported(all_names, backbone);
   const TensorResolver get =
       [where](const std::string& name) -> const StTensor& {
     auto it = where->find(name);

@@ -46,6 +46,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -104,9 +105,17 @@ class TempFile {
 // One tiny synthetic tensor description: name + shape + safetensors dtype
 // string, filled with a deterministic per-tensor pattern so a wrong binding
 // shows up in the VALUES, not only in a name. The dense arm is all-BF16 (the
-// default); the MoE arm needs the checkpoint's real per-class quantization —
-// per-tensor FP8 attention and NVFP4 experts/head — because the MoE loader
-// type-checks every one of them (qwen3_5_weights.cpp:385-463).
+// default); the MoE arm needs the ONE per-class quantization `LoadQwen3_5Moe`
+// can read — per-tensor FP8 attention and PER-EXPERT NVFP4 projections/head —
+// because that loader hard-requires each of those dtypes
+// (qwen3_5_weights.cpp:385-463) and carries no bf16 and no stacked branch.
+//
+// That is NOT what the published Qwen3.5-family MoE repos ship. Both
+// `Qwen/Qwen3.8-2.4T-A95B` and `Qwen/Qwen3.6-35B-A3B` publish 3D-STACKED,
+// UNQUANTIZED experts and zero `weight_scale` tensors; the layout below is what
+// an NVFP4 requant (e.g. `nvidia/Qwen3.6-35B-A3B-NVFP4`, which is what our gated
+// 35B row actually reads) ships. The published layout is a NOT-IMPLEMENTED arm
+// and is pinned as a REFUSAL further down, not as a load.
 struct Spec {
   std::string name;
   std::vector<int64_t> shape;
@@ -255,10 +264,16 @@ void CheckSameBytes(const vllm::OwnedTensor& a, const vllm::OwnedTensor& b,
 // per-layer routed-expert closure (:698-709), which captures the prefix BY
 // VALUE and runs long after the resolution frame is gone.
 //
-// The quantization per weight class is the real 35B/3.8 scheme
+// The quantization per weight class is the ONLY scheme `LoadQwen3_5Moe` reads
 // (qwen3_5_weights.h:1-13): bf16 embeds/norms/router/shared-gate, per-tensor
-// FP8 attention, NVFP4 routed experts + shared expert + lm_head. NVFP4 requires
-// K % 16 == 0, which is what fixes the toy hidden size at 16.
+// FP8 attention, PER-EXPERT NVFP4 routed experts + shared expert + lm_head.
+// NVFP4 requires K % 16 == 0, which is what fixes the toy hidden size at 16.
+//
+// This is the NVFP4-requant layout (`nvidia/Qwen3.6-35B-A3B-NVFP4` and the
+// like), NOT the layout of the published `Qwen/Qwen3.6-35B-A3B` or
+// `Qwen/Qwen3.8-2.4T-A95B` repos, which are stacked and unquantized. What
+// follows therefore proves the prefix is threaded correctly through the arm we
+// implement; the published arm is a refusal, pinned separately.
 // ---------------------------------------------------------------------------
 constexpr int64_t kMoeHidden = 16;
 constexpr int64_t kMoeInter = 16;
@@ -322,6 +337,144 @@ std::vector<Spec> MoeOneLayerSpecs(const std::string& p) {
   AppendNvfp4(s, "lm_head", kMoeVocab, kMoeHidden);
   return s;
 }
+
+// ---------------------------------------------------------------------------
+// The PUBLISHED Qwen3.5-family MoE layouts, which `LoadQwen3_5Moe` does NOT
+// implement. Read off the live safetensors indices on 2026-08-12:
+//
+//   Qwen/Qwen3.8-2.4T-A95B   1609 tensors, 92x `model.layers.N.mlp.experts
+//                            .gate_up_proj` + 92x `.down_proj` (3-D STACKED),
+//                            ZERO `weight_scale`, ZERO `input_scale`,
+//                            `lm_head.weight` alone.
+//   Qwen/Qwen3.6-35B-A3B     1045 tensors, same stacked spelling under the VL
+//                            prefix, ZERO `weight_scale`.
+//
+// `LoadMoeExpertsInto` (qwen3_5_weights.cpp:519-530) reads only per-expert
+// `experts.<e>.<proj>` through `LoadNvfp4Raw` (:433-462), which hard-requires
+// U8 `.weight` + F8_E4M3 `.weight_scale` + `.weight_scale_2`. There is no
+// stacked branch and no bf16 branch, unlike `gemma4_weights.cpp:326`, which
+// dispatches between layouts. Our gated 35B row reads the REQUANTIZED
+// `nvidia/Qwen3.6-35B-A3B-NVFP4`; this loader has never read a published Qwen
+// bf16 MoE repo. AGENTS.md requires an unimplemented arm be "refused with a
+// message naming the missing piece" — these fixtures are that gate.
+// ---------------------------------------------------------------------------
+
+// Everything a published Qwen3.5 MoE checkpoint carries EXCEPT the routed
+// experts: all bf16, no scale tensors anywhere, `lm_head.weight` top-level.
+std::vector<Spec> PublishedMoeCoreSpecs(const std::string& p) {
+  const std::string l = p + "layers.0.";
+  const std::string sa = l + "self_attn.";
+  const std::string mlp = l + "mlp.";
+  return {
+      {p + "embed_tokens.weight", {kMoeVocab, kMoeHidden}},
+      {p + "norm.weight", {kMoeHidden}},
+      {l + "input_layernorm.weight", {kMoeHidden}},
+      {l + "post_attention_layernorm.weight", {kMoeHidden}},
+      {sa + "q_proj.weight", {kMoeQ, kMoeHidden}},
+      {sa + "k_proj.weight", {kMoeKv, kMoeHidden}},
+      {sa + "v_proj.weight", {kMoeKv, kMoeHidden}},
+      {sa + "o_proj.weight", {kMoeHidden, kMoeQ}},
+      {sa + "q_norm.weight", {kMoeHeadDim}},
+      {sa + "k_norm.weight", {kMoeHeadDim}},
+      {mlp + "gate.weight", {kMoeExperts, kMoeHidden}},
+      {mlp + "shared_expert.gate_proj.weight", {kMoeInter, kMoeHidden}},
+      {mlp + "shared_expert.up_proj.weight", {kMoeInter, kMoeHidden}},
+      {mlp + "shared_expert.down_proj.weight", {kMoeHidden, kMoeInter}},
+      {mlp + "shared_expert_gate.weight", {1, kMoeHidden}},
+      {"lm_head.weight", {kMoeVocab, kMoeHidden}},
+  };
+}
+
+// The published shape: ONE 3-D tensor per layer holding ALL experts.
+std::vector<Spec> PublishedStackedMoeSpecs(const std::string& p) {
+  std::vector<Spec> s = PublishedMoeCoreSpecs(p);
+  const std::string mlp = p + "layers.0.mlp.";
+  s.push_back({mlp + "experts.gate_up_proj",
+               {kMoeExperts, 2 * kMoeInter, kMoeHidden}});
+  s.push_back({mlp + "experts.down_proj", {kMoeExperts, kMoeHidden, kMoeInter}});
+  return s;
+}
+
+// The per-expert spelling this loader DOES resolve, but unquantized: plain bf16
+// `<e>.<proj>.weight` with no `.weight_scale` beside it.
+std::vector<Spec> UnquantizedPerExpertMoeSpecs(const std::string& p) {
+  std::vector<Spec> s = PublishedMoeCoreSpecs(p);
+  const std::string mlp = p + "layers.0.mlp.";
+  for (int64_t e = 0; e < kMoeExperts; ++e) {
+    const std::string ex = mlp + "experts." + std::to_string(e) + ".";
+    s.push_back({ex + "gate_proj.weight", {kMoeInter, kMoeHidden}});
+    s.push_back({ex + "up_proj.weight", {kMoeInter, kMoeHidden}});
+    s.push_back({ex + "down_proj.weight", {kMoeHidden, kMoeInter}});
+  }
+  return s;
+}
+
+// Per-expert NVFP4 everywhere — the supported arm — but a plain bf16 head, the
+// spelling the DENSE loader accepts (`LoadLmHeadAnyDtype`) and the MoE loader
+// does not.
+std::vector<Spec> MoeSpecsWithBf16LmHead(const std::string& p) {
+  std::vector<Spec> s;
+  for (const Spec& x : MoeOneLayerSpecs(p)) {
+    if (x.name.rfind("lm_head.", 0) != 0) s.push_back(x);
+  }
+  s.push_back({"lm_head.weight", {kMoeVocab, kMoeHidden}});
+  return s;
+}
+
+// Runs `fn` and returns the `what()` of whatever it threw, or "" if it returned
+// normally. A refusal is only useful if it NAMES the missing piece, which
+// CHECK_THROWS_AS cannot see.
+std::string CaptureThrow(const std::function<void()>& fn) {
+  try {
+    fn();
+  } catch (const std::exception& e) {
+    return e.what();
+  }
+  return "";
+}
+
+bool Mentions(const std::string& haystack, const char* needle) {
+  return haystack.find(needle) != std::string::npos;
+}
+
+// A TensorResolver + presence probe over ONE synthetic safetensors file, so a
+// per-layer public seam can be driven exactly as the full loaders drive it —
+// with the backbone-prefix argument OMITTED, which is the only way its DEFAULT
+// is observable at all.
+class ShardBag {
+ public:
+  ShardBag(const std::vector<Spec>& specs, const char* tag)
+      : file_(BuildSafetensors(specs), tag),
+        shard_(vllm::SafetensorsFile::Open(file_.path())) {}
+  ShardBag(const ShardBag&) = delete;
+  ShardBag& operator=(const ShardBag&) = delete;
+
+  vllm::TensorResolver Resolver() const {
+    const vllm::SafetensorsFile* shard = &shard_;
+    return [shard](const std::string& name) -> const vllm::StTensor& {
+      // Same message shape `LoadQwen3_5Moe`'s own resolver produces, so a miss
+      // is reported by the NAME that was looked for.
+      for (const std::string& have : shard->Names()) {
+        if (have == name) return shard->Get(name);
+      }
+      throw std::runtime_error("qwen3_5 weights: tensor not found: " + name);
+    };
+  }
+
+  std::function<bool(const std::string&)> Has() const {
+    const vllm::SafetensorsFile* shard = &shard_;
+    return [shard](const std::string& name) {
+      for (const std::string& have : shard->Names()) {
+        if (have == name) return true;
+      }
+      return false;
+    };
+  }
+
+ private:
+  TempFile file_;
+  vllm::SafetensorsFile shard_;
+};
 
 HfConfig OneLayerMoeConfig() {
   HfConfig config;
@@ -750,17 +903,118 @@ TEST_CASE("qwen3_8: the MoE loader reads the SAME weights through either namespa
 }
 
 // ===========================================================================
+// 4c. THE PUBLISHED MoE EXPERT LAYOUT IS AN UNIMPLEMENTED ARM, AND IS REFUSED
+//     BY NAME. Registering the architecture and resolving the namespace does
+//     NOT make `Qwen/Qwen3.8-2.4T-A95B` loadable: its routed experts are 3-D
+//     STACKED and it carries no quantization scales at all, while
+//     `LoadQwen3_5Moe` reads only per-expert NVFP4. Before this gate the load
+//     died at `LoadNvfp4Raw(get, "lm_head")` with
+//
+//       qwen3_5 weights: expected U8 for lm_head.weight
+//
+//     which is indistinguishable from a corrupt or truncated checkpoint.
+//     AGENTS.md: an arm that is not implemented "is refused with a message
+//     naming the missing piece ... never left to be discovered later", and this
+//     row's spec §Stop conditions says the same. NOTE this adds a REFUSAL only:
+//     stacked/bf16 MoE expert loading is OWED and needs its own spec, RED-first
+//     test and NVFP4 inertness proof.
+// ===========================================================================
+TEST_CASE("qwen3_8: the published stacked/unquantized MoE arm is REFUSED, and the message names it") {
+  auto load = [](const std::vector<Spec>& specs, const char* tag) {
+    return CaptureThrow([&specs, tag] {
+      const TempFile file(BuildSafetensors(specs), tag);
+      std::vector<vllm::SafetensorsFile> shards;
+      shards.push_back(vllm::SafetensorsFile::Open(file.path()));
+      vllm::LoadQwen3_5Moe(shards, OneLayerMoeConfig());
+    });
+  };
+
+  // Every refusal must say WHAT is missing and WHAT would be required — a bare
+  // "unsupported" is the failure mode this case exists to prevent.
+  auto names_the_requirement = [](const std::string& message) {
+    CAPTURE(message);
+    CHECK(Mentions(message, "qwen3_5 weights"));
+    CHECK(Mentions(message, "not implemented"));
+    CHECK(Mentions(message, "per-expert NVFP4"));
+    CHECK(Mentions(message, "weight_scale"));
+    // The two failures it must NOT degrade into: a raw dtype complaint about a
+    // tensor the reader never reached, or a bare lookup miss.
+    CHECK_FALSE(Mentions(message, "expected U8 for lm_head.weight"));
+    CHECK_FALSE(Mentions(message, "tensor not found"));
+  };
+
+  SUBCASE("3-D stacked experts, flat namespace — the Qwen3.8-2.4T-A95B shape") {
+    const std::string message = load(PublishedStackedMoeSpecs("model."), "stacked_flat");
+    CAPTURE(message);
+    CHECK(Mentions(message, "model.layers.0.mlp.experts.gate_up_proj"));
+    CHECK(Mentions(message, "stacked"));
+    names_the_requirement(message);
+  }
+
+  SUBCASE("3-D stacked experts, VL namespace — the Qwen3.6-35B-A3B shape") {
+    // The published 35B repo is stacked too; only the NVFP4 REQUANT loads. So
+    // this refusal is not a text-only-arm quirk — the MoE loader has never read
+    // a published Qwen bf16 MoE checkpoint under EITHER spelling.
+    const std::string message =
+        load(PublishedStackedMoeSpecs("model.language_model."), "stacked_vl");
+    CAPTURE(message);
+    CHECK(Mentions(message,
+                   "model.language_model.layers.0.mlp.experts.gate_up_proj"));
+    CHECK(Mentions(message, "stacked"));
+    names_the_requirement(message);
+  }
+
+  SUBCASE("per-expert but UNQUANTIZED experts") {
+    const std::string message =
+        load(UnquantizedPerExpertMoeSpecs("model."), "unquant_experts");
+    CAPTURE(message);
+    CHECK(Mentions(message, "model.layers.0.mlp.experts.0.gate_proj.weight"));
+    CHECK(Mentions(message, "unquantized"));
+    names_the_requirement(message);
+  }
+
+  SUBCASE("NVFP4 experts but an UNQUANTIZED lm_head") {
+    // The dense arm accepts a bf16 head (`LoadLmHeadAnyDtype`,
+    // qwen3_5_dense_weights.cpp:215-233); the MoE arm hard-requires NVFP4.
+    const std::string message =
+        load(MoeSpecsWithBf16LmHead("model."), "bf16_lmhead");
+    CAPTURE(message);
+    CHECK(Mentions(message, "lm_head.weight_scale"));
+    CHECK(Mentions(message, "unquantized"));
+    names_the_requirement(message);
+  }
+
+  SUBCASE("the SUPPORTED per-expert NVFP4 layout is untouched by the check") {
+    // Inertness in the same case as the refusals, so the gate cannot be made
+    // green by refusing everything: the arm we DO implement still loads, under
+    // both namespaces.
+    CHECK(load(MoeOneLayerSpecs("model."), "inert_flat").empty());
+    CHECK(load(MoeOneLayerSpecs("model.language_model."), "inert_vl").empty());
+  }
+}
+
+// ===========================================================================
 // 5. INERTNESS of the gated rows. 27B / 35B / Coder are VL-prefixed
 //    checkpoints; the per-layer public seams keep the VL prefix as their
 //    DEFAULT, so every existing caller is unchanged by construction.
+//
+//    ASSERTING THE TWO CONSTANTS IS NOT THAT PROOF. Flipping both header
+//    defaults from `kQwen3_5VlBackbonePrefix` to `kQwen3_5TextBackbonePrefix`
+//    left this case entirely green (review finding F7), because the default
+//    ARGUMENT is a third fact neither constant pins. So the seams are driven
+//    below with the prefix argument OMITTED, exactly as every 27B/35B/Coder
+//    caller drives them.
 // ===========================================================================
 TEST_CASE("qwen3_8: the VL prefix stays the default for the gated 27B/35B checkpoints") {
   // The two spellings are named constants, not literals scattered per lookup.
   CHECK(std::string(vllm::kQwen3_5VlBackbonePrefix) == "model.language_model.");
   CHECK(std::string(vllm::kQwen3_5TextBackbonePrefix) == "model.");
 
-  // A 35B-shaped VL index (GDN + full-attn layers, 3D-stacked experts, shared
-  // expert gate, top-level head) still resolves to the VL namespace.
+  // A 35B-shaped VL index. `...mlp.experts.gate_up_proj` is the PUBLISHED
+  // stacked spelling, which the loader refuses (case 4c) — it appears here
+  // because the namespace probe must ignore it either way: only
+  // `<prefix>embed_tokens.weight`, `<prefix>norm.weight` and `<prefix>layers.`
+  // vote, so what the expert tensors are called cannot change the answer.
   std::vector<std::string> names{
       "model.language_model.embed_tokens.weight",
       "model.language_model.norm.weight",
@@ -772,4 +1026,39 @@ TEST_CASE("qwen3_8: the VL prefix stays the default for the gated 27B/35B checkp
       "lm_head.weight",
   };
   CHECK(vllm::ResolveQwen3_5BackbonePrefix(names) == "model.language_model.");
+
+  SUBCASE("LoadQwen3_5MoeLayer defaults to the VL spelling") {
+    const ShardBag vl(MoeOneLayerSpecs("model.language_model."), "seam_moe_vl");
+    const ShardBag flat(MoeOneLayerSpecs("model."), "seam_moe_flat");
+    // Prefix argument OMITTED on both calls. The VL layer must bind...
+    CHECK(CaptureThrow([&vl] {
+            (void)vllm::LoadQwen3_5MoeLayer(vl.Resolver(), "full_attention", 0,
+                                            kMoeExperts);
+          }).empty());
+    // ...and the flat one must fail looking for the VL name, which is what the
+    // default actually being the VL spelling MEANS.
+    const std::string message = CaptureThrow([&flat] {
+      (void)vllm::LoadQwen3_5MoeLayer(flat.Resolver(), "full_attention", 0,
+                                      kMoeExperts);
+    });
+    CAPTURE(message);
+    CHECK(Mentions(message,
+                   "model.language_model.layers.0.input_layernorm.weight"));
+  }
+
+  SUBCASE("LoadQwen3_5DenseLayer defaults to the VL spelling") {
+    const ShardBag vl(DenseOneLayerSpecs("model.language_model."), "seam_dn_vl");
+    const ShardBag flat(DenseOneLayerSpecs("model."), "seam_dn_flat");
+    CHECK(CaptureThrow([&vl] {
+            (void)vllm::LoadQwen3_5DenseLayer(vl.Resolver(), vl.Has(),
+                                              "full_attention", 0);
+          }).empty());
+    const std::string message = CaptureThrow([&flat] {
+      (void)vllm::LoadQwen3_5DenseLayer(flat.Resolver(), flat.Has(),
+                                        "full_attention", 0);
+    });
+    CAPTURE(message);
+    CHECK(Mentions(message,
+                   "model.language_model.layers.0.input_layernorm.weight"));
+  }
 }

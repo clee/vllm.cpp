@@ -25,8 +25,10 @@ In scope:
   existing path;
 - prove the 27B / 35B / Coder gates stay byte-identical.
 
-Out of scope: any speed claim, any GGUF/quantized arm for 3.8, the vision tower
+Out of scope: any speed claim, any GGUF arm for 3.8, the vision tower
 (a text-only checkpoint has none), MTP weights for 3.8, advancing the parity pin,
+the **bf16 / 3-D-stacked MoE routed-expert arm** (owed, and refused by name
+here — see [What this row does NOT make loadable](#what-this-row-does-not-make-loadable)),
 and **any support claim for the 2.4T checkpoint itself**, which this hardware
 cannot execute (see Gates).
 
@@ -68,17 +70,20 @@ debt argued here and in the commit, not a silent divergence.
 
 Weight-name evidence, read from the published indices of both checkpoints:
 
-| | Qwen3.6-35B-A3B | Qwen3.8-2.4T-A95B |
+| | Qwen3.6-35B-A3B (published) | Qwen3.8-2.4T-A95B (published) |
 |---|---|---|
 | embed | `model.language_model.embed_tokens.weight` | `model.embed_tokens.weight` |
 | layer | `model.language_model.layers.0.linear_attn.*` | `model.layers.0.linear_attn.*` |
-| experts | `...mlp.experts.gate_up_proj` (3D stacked) | `...mlp.experts.gate_up_proj` (3D stacked) |
+| experts | `...mlp.experts.gate_up_proj` + `.down_proj` (3D STACKED, 41x) | `...mlp.experts.gate_up_proj` + `.down_proj` (3D STACKED, 93x) |
 | shared | `...mlp.shared_expert_gate.weight` | `...mlp.shared_expert_gate.weight` |
 | head | `lm_head.weight` | `lm_head.weight` |
+| quant scales | **NONE** — 0 `weight_scale`, 0 `input_scale` | **NONE** — 0 `weight_scale`, 0 `input_scale` |
 
-The names are identical modulo the prefix — same 3D-stacked experts, same shared
-expert gate, same top-level `lm_head`. So the loader body is already correct and
-the only structural change is where it looks.
+The **backbone** names are identical modulo the prefix, so the namespace
+decision is the whole of what this row changes in the loader. **It is not the
+whole of what either checkpoint needs**, and an earlier revision of this spec —
+and of the two commits below it — wrongly said it was. See
+[What this row does NOT make loadable](#what-this-row-does-not-make-loadable).
 
 1. **One prefix decision, resolved once.** The Qwen3.5 loaders currently
    concatenate the literal `model.language_model.` in 4 places
@@ -100,6 +105,56 @@ the only structural change is where it looks.
    applies to a flat config. MRoPE is mm-path-only and every text caller passes
    `nullptr` (`qwen3_5.cpp:7540`), so a config without `mrope_section` is
    unaffected. Both facts get a test rather than an assumption.
+
+## What this row does NOT make loadable
+
+Corrected 2026-08-12 after an independent review returned FAIL on records
+honesty. The registration and the namespace resolution are sound; the claim
+built on top of them was not.
+
+**The MoE arm cannot read a published Qwen3.5-family MoE checkpoint, in either
+namespace.** `LoadQwen3_5Moe` routes every routed expert through
+`LoadMoeExpertsInto` (`qwen3_5_weights.cpp:519-530`) into `LoadNvfp4Raw`
+(`:433-462`), which hard-requires per-expert `experts.<e>.<proj>.weight` = `U8`,
+`.weight_scale` = `F8_E4M3` and `.weight_scale_2`. There is **no stacked branch
+and no bf16 branch** — unlike `gemma4_weights.cpp:326`, which dispatches between
+layouts. Against that, the published indices (read live 2026-08-12):
+
+- `Qwen/Qwen3.8-2.4T-A95B`: 1609 tensors, 93x `mlp.experts.gate_up_proj` +
+  93x `.down_proj` (3-D stacked, 92 backbone layers + 1 MTP), **zero** names
+  matching `weight_scale` or `input_scale`, `lm_head.weight` alone.
+- `Qwen/Qwen3.6-35B-A3B`: 1045 tensors, the same stacked spelling under
+  `model.language_model.`, **zero** `weight_scale`.
+
+So the 2.4T load would die at `w.lm_head_fp4 = LoadNvfp4Raw(get, "lm_head")`
+(`:679`) before the experts are even reached, and would die again at the FP8
+attention, the routed experts and the shared expert. Our gated 35B row reads the
+REQUANTIZED `nvidia/Qwen3.6-35B-A3B-NVFP4`; this loader **has never read a
+published Qwen bf16 MoE repo**.
+
+**The dense/MoE asymmetry is real and must not be flattened.**
+`LoadQwen3_5Dense` DOES route BF16 vs FP8 vs NVFP4 per projection by tensor
+presence (`qwen3_5_dense_weights.cpp:354-360,472-503`, and
+`LoadDenseLmHead`/`LoadLmHeadAnyDtype` at `:215-233,515-547`), so the DENSE
+text-only arm may genuinely load a flat bf16 checkpoint. Only the MoE arm
+cannot. Any statement about "the text-only arms" that does not make that
+distinction is wrong.
+
+**What is therefore OWED, named:** the **bf16 / 3-D-stacked MoE routed-expert
+arm** (plus the bf16 shared expert, the bf16 FP8-less attention tower, and the
+bf16 `lm_head`, all on the MoE path). That is a real port with its own spec,
+RED-first test and NVFP4 inertness proof — it is not this row. Until it exists,
+this row ships a **REFUSAL that names the missing piece**
+(`CheckMoeExpertLayoutSupported`, `qwen3_5_weights.cpp`), because AGENTS.md
+requires an unimplemented arm be refused by name rather than discovered later,
+and this spec's own stop conditions said the same.
+
+**Consequence for the run gate.** "It closes when a text-only
+`Qwen3_5[Moe]ForCausalLM` checkpoint that fits GB10 appears" is FALSE for the
+MoE arm: a fitting *published* (bf16/stacked) MoE checkpoint would still be
+refused at load. The MoE run gate needs a fitting checkpoint **whose routed
+experts are per-expert NVFP4**, or the owed stacked/bf16 arm implemented first.
+For the DENSE arm a fitting bf16 checkpoint is sufficient.
 
 ## Risks
 
@@ -138,7 +193,18 @@ the only structural change is where it looks.
    `load_layer_experts` actually driven — because the deferred closure captures
    the resolved prefix by value and executes after the resolving frame returns,
    which is a third prefix site the dense loader has no analogue of.
-5. Inertness: 27B/35B/Coder suites unchanged, golden md5 unchanged.
+4c. Refusal (added 2026-08-12): a synthetic checkpoint in the PUBLISHED shape —
+   3-D stacked `mlp.experts.gate_up_proj` / `.down_proj`, bf16, no scale tensors
+   — must be refused by `LoadQwen3_5Moe` with a message that NAMES the offending
+   tensor and the required per-expert NVFP4 layout, in both namespaces; likewise
+   a per-expert-but-unquantized index and an NVFP4 index with a bf16 `lm_head`.
+   The supported per-expert NVFP4 layout must still load unchanged, asserted in
+   the same case so the gate cannot be satisfied by refusing everything.
+5. Inertness: 27B/35B/Coder suites unchanged, golden md5 unchanged. The
+   per-layer seam DEFAULT is pinned by DRIVING `LoadQwen3_5MoeLayer` /
+   `LoadQwen3_5DenseLayer` with the prefix argument OMITTED — asserting the two
+   named constants does not pin it, and flipping both defaults VL->flat left the
+   original case green (review finding F7).
 
 ## Gates
 
@@ -152,9 +218,12 @@ the only structural change is where it looks.
   can honestly claim is that the architecture is registered and the weight
   namespace resolves — nothing about generated tokens.
 
-If a text-only checkpoint small enough to execute appears (any
-`Qwen3_5ForCausalLM` / `Qwen3_5MoeForCausalLM` that fits GB10), that becomes the
-run gate and closes this axis.
+If a `Qwen3_5ForCausalLM` checkpoint small enough to execute appears, that
+becomes the DENSE run gate and closes that axis. **It does not close the MoE
+axis**: a fitting *published* (bf16/stacked) MoE checkpoint would still be
+refused at load, so the MoE gate needs one whose routed experts are per-expert
+NVFP4, or the owed stacked/bf16 arm implemented first (see
+[What this row does NOT make loadable](#what-this-row-does-not-make-loadable)).
 
 ## Evidence required
 
@@ -162,6 +231,10 @@ run gate and closes this axis.
 - A mutation capture per prefix site — dense and MoE, including the deferred
   expert closure — showing the hardcoded VL literal makes the flat load throw.
 - Green focused + full gate after.
+- RED capture of the refusal case before `CheckMoeExpertLayoutSupported` exists
+  (the literal `qwen3_5 weights: expected U8 for lm_head.weight`), plus a
+  mutation per refusal branch and one that refuses unconditionally, which must
+  turn the SUPPORTED-layout assertions red.
 - Golden md5 before/after for 27B/35B/Coder showing no drift.
 - The owed run gate recorded explicitly in the row and in `docs/STATUS.md`.
 
@@ -172,9 +245,10 @@ run gate and closes this axis.
   scattering fallbacks through the loader.
 - If any 27B/35B/Coder golden md5 moves, stop — that is a regression on a gated
   row, and this row carries no evidence that could justify it.
-- Do not implement an MTP arm, a quantized arm, or a GGUF arm for 3.8 on
-  speculation; refuse them with a message naming the missing piece and record
-  them as owed.
+- Do not implement an MTP arm, a stacked/bf16 MoE expert arm, or a GGUF arm for
+  3.8 on speculation; refuse them with a message naming the missing piece and
+  record them as owed. (The QUANTIZED arm is the one that IS implemented — the
+  earlier wording here had this inverted.)
 
 ## Now
 
@@ -183,12 +257,18 @@ backbone-namespace resolution and the tests above are landed on
 `row/MODEL-QWEN38-TEXT-ONLY`; full CPU gate green (396/396, 1 skipped:
 `test_voxtral_e2e`, fixture absent) and `tests/parity/goldens` md5-unchanged.
 
-**Next step is the OWED run gate, and nothing else advances these rows.** It
-needs a text-only `Qwen3_5ForCausalLM` / `Qwen3_5MoeForCausalLM` checkpoint that
-fits GB10; none exists today. Until one does, the honest claim stays "the
-architecture is registered and the weight namespace resolves". Also owed, and
-deliberately NOT implemented on speculation: the MTP, quantized and GGUF arms for
-3.8.
+**Next step is the OWED run gate, and nothing else advances these rows.** The
+DENSE one needs a `Qwen3_5ForCausalLM` checkpoint that fits GB10; the MoE one
+needs a fitting checkpoint whose routed experts are PER-EXPERT NVFP4, because a
+published (stacked/bf16) MoE checkpoint is refused at load. Neither exists
+today. Until they do, the honest claim stays "the architecture is registered,
+the weight namespace resolves, and an unimplemented expert layout is refused by
+name".
+
+Also owed, and deliberately NOT implemented on speculation: the **bf16 /
+3-D-stacked MoE routed-expert arm** (this was recorded INVERTED as "the
+quantized arm is owed" until 2026-08-12 — the quantized arm is the only one
+implemented), and the MTP and GGUF arms for 3.8.
 
 ## Outcome
 
@@ -227,15 +307,25 @@ rather than by re-measurement. The text-only arms register with
 `Qwen3_5ForCausalLMBase` inherits `IsHybrid` but not `SupportsMultiModal`; the
 `ForConditionalGeneration` wrappers remain the multimodal registrations.
 
-**What was NOT established.** Any claim about generated tokens, memory or speed
-for `Qwen/Qwen3.8-2.4T-A95B`. That checkpoint cannot be executed on this
-hardware and was never run.
+**What was NOT established, and what an earlier revision wrongly claimed.** Any
+claim about generated tokens, memory or speed for `Qwen/Qwen3.8-2.4T-A95B` —
+that checkpoint cannot be executed on this hardware and was never run. And,
+corrected 2026-08-12 after a review FAIL, **any claim that hardware size is the
+only thing between this code and that checkpoint**: it is not, because the MoE
+loader reads only per-expert NVFP4 experts and both published Qwen MoE repos
+ship 3-D stacked, unquantized ones. That arm is OWED and is now refused by a
+message naming it (`CheckMoeExpertLayoutSupported`), with the fixture and the
+literal RED in `tests/vllm/models/test_qwen3_8_text_only.cpp`. The DENSE loader
+routes BF16/FP8/NVFP4 by tensor presence and is not subject to that gap — the
+asymmetry is deliberate record, not an oversight.
 
 **Recorded as tracked debt** in [porting-inventory](../porting-inventory.md) §9
 deviation 17, with the two arms carried on its §5 Qwen3.5 row and the owed run
 gate on [BENCHMARKS](../../docs/BENCHMARKS.md) §Open gaps: the ahead-of-pin
 anchor `ad5d29db7` (17a/b), the deliberate REFUSAL of a mixed namespace where
-upstream's `WeightsMapper` would normalize it (17c), and the published config's
+upstream's `WeightsMapper` would normalize it (17c), the published config's
 transformers-4.57.3 `dtype` key, which `hf_config.cpp:520-522` does not consume
 (17d — inert, no reader, and a fix would touch every model, so it is pinned by
-an assertion rather than smuggled in here).
+an assertion rather than smuggled in here), and the **unimplemented bf16 /
+3-D-stacked MoE routed-expert arm** (17e, added 2026-08-12 — it was previously
+recorded inverted, as the quantized arm being the owed one).

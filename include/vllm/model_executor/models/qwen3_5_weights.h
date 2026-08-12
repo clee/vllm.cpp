@@ -495,9 +495,20 @@ using TensorResolver = std::function<const StTensor&(const std::string&)>;
 // spellings. The multimodal wrappers we already gate (Qwen3.6-27B / 35B-A3B /
 // Coder) nest it under `model.language_model.`; the TEXT-ONLY arms
 // (`Qwen3_5ForCausalLM` / `Qwen3_5MoeForCausalLM`, e.g.
-// `Qwen/Qwen3.8-2.4T-A95B`) publish it flat under `model.`. Every other name is
-// identical — same 3D-stacked experts, same `mlp.shared_expert_gate.weight`,
-// same top-level `lm_head`.
+// `Qwen/Qwen3.8-2.4T-A95B`) publish it flat under `model.`. The BACKBONE names
+// are otherwise identical — same `mlp.shared_expert_gate.weight`, same
+// top-level `lm_head`.
+//
+// THE PREFIX IS NOT THE ONLY THING BETWEEN THIS LOADER AND A PUBLISHED
+// CHECKPOINT, and an earlier revision of this comment wrongly implied it was.
+// The published Qwen3.5-family MoE repos ship 3-D STACKED routed experts
+// (`...mlp.experts.gate_up_proj` / `.down_proj`) and carry no quantization
+// scales at all, while `LoadQwen3_5Moe` reads ONLY per-expert NVFP4. That arm
+// is OWED and is refused by name (`CheckMoeExpertLayoutSupported`,
+// `qwen3_5_weights.cpp`). The DENSE loader is different: it routes BF16 vs FP8
+// vs NVFP4 per projection by tensor presence, so it may genuinely read a flat
+// bf16 checkpoint. Resolving the namespace is what THIS seam does; it is not a
+// support claim for either published checkpoint.
 //
 // Upstream normalizes the two with ONE mapper —
 //   WeightsMapper(orig_to_new_prefix={"model.language_model.": "model."})

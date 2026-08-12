@@ -647,19 +647,39 @@ The other half is ONE backbone weight-namespace decision per checkpoint:
 MIXED index refused rather than half-bound. `Qwen/Qwen3.8-2.4T-A95B` declares
 `Qwen3_5MoeForCausalLM` / `qwen3_5_moe_text` and is the token-exact
 Qwen3.6-35B-A3B GDN-hybrid MoE backbone at larger scale, every knob
-config-driven, with weight names identical modulo that prefix.
+config-driven, with the BACKBONE weight names identical modulo that prefix.
 
-What is claimed is dispatch, flat-config resolution and namespace resolution,
-gated by `tests/vllm/models/test_qwen3_8_text_only.cpp` (5/5, 124 assertions)
-with 27B/35B/Coder inert and parity goldens md5-unchanged. **What is NOT claimed
-is a single generated token.** 2.4T bf16 is ~4.8 TB and the released FP8 variant
+**CORRECTED 2026-08-12: the prefix is NOT the only thing between this code and
+`Qwen/Qwen3.8-2.4T-A95B`, and the first two commits of this row said it was.**
+The MoE loader reads only PER-EXPERT NVFP4 routed experts (`LoadMoeExpertsInto`
+-> `LoadNvfp4Raw`: `U8` weight + `F8_E4M3` `.weight_scale` + `.weight_scale_2`),
+with no stacked and no bf16 branch. The published indices (read live 2026-08-12)
+have neither: `Qwen/Qwen3.8-2.4T-A95B` carries 93x `mlp.experts.gate_up_proj` +
+93x `.down_proj` (3-D STACKED) and **zero** `weight_scale` / `input_scale`
+tensors, and `Qwen/Qwen3.6-35B-A3B` is the same under the VL prefix — our gated
+35B row reads the REQUANTIZED `nvidia/Qwen3.6-35B-A3B-NVFP4`.
+
+So the **bf16 / 3-D-stacked MoE routed-expert arm is NOT implemented and is
+OWED**, and a published MoE checkpoint is now REFUSED by a message naming it
+rather than dying on `expected U8 for lm_head.weight`. The DENSE arm is not
+affected: `LoadQwen3_5Dense` routes BF16 vs FP8 vs NVFP4 per projection by
+tensor presence, so it may genuinely load a flat bf16 checkpoint. That asymmetry
+is the record.
+
+What is claimed is dispatch, flat-config resolution, namespace resolution and
+the refusal, gated by `tests/vllm/models/test_qwen3_8_text_only.cpp`, with
+27B/35B/Coder inert and parity goldens md5-unchanged. **What is NOT claimed is a
+single generated token.** 2.4T bf16 is ~4.8 TB and the released FP8 variant
 ~2.4 TB against 128 GB of unified memory, and no smaller Qwen3.8 sibling exists,
 so there is no token-exact oracle run and no speed number.
 
-Both rows therefore stay `PARTIAL`. The owed run gate closes only when a
-text-only `Qwen3_5[Moe]ForCausalLM` checkpoint that fits GB10 appears. MTP,
-quantized and GGUF arms for 3.8 are NOT implemented and are recorded as owed.
-This does not advance the parity pin.
+Both rows therefore stay `PARTIAL`. The owed **DENSE** run gate closes when a
+`Qwen3_5ForCausalLM` checkpoint that fits GB10 appears. The **MoE** run gate
+needs more: a fitting *published* (bf16/stacked) MoE checkpoint would still be
+refused at load, so it needs a fitting checkpoint whose routed experts are
+per-expert NVFP4, or the owed stacked/bf16 arm implemented first. Also NOT
+implemented and recorded as owed: that stacked/bf16 MoE expert arm, and the MTP
+and GGUF arms for 3.8. This does not advance the parity pin.
 
 Larger DeepSeek / GLM / MiniMax / Gemma-4 variants are recorded as
 **hardware-blocked** (they do not fit 119 GiB of unified memory on this box) or
