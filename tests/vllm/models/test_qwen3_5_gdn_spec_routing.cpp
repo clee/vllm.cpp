@@ -26,6 +26,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <string>
 #include <vector>
 
 #include "vllm/transformers_utils/hf_config.h"
@@ -83,6 +84,13 @@ struct GdnDims {
   int64_t hk, hv, dk, dv, kw;
   const char* name;
 };
+
+// Every case below runs at BOTH gate dims, so a failure log has to say which.
+// `CAPTURE(g.name)` does NOT: doctest 2.5.2 stringifies a `const char*` through
+// its generic path and prints `g.name := 1` (the pointer decayed to bool), so
+// the one thing the capture exists to disambiguate is exactly what is lost.
+// Wrap in std::string, which has a real stringifier. Applies to `INFO(... <<
+// ptr)` too — the `<<` form goes through the same DOCTEST_STRINGIFY.
 
 // Minimal dense (num_experts==0) GDN config at the real gate-checkpoint GDN dims.
 HfConfig MakeConfig(const GdnDims& g, int64_t H) {
@@ -212,7 +220,7 @@ void RunSpecRoutingCase(vt::DeviceType dev, const GdnDims& g, bool bit_exact) {
         if (bad == 0) first = i;
         ++bad;
       }
-    CAPTURE(g.name);
+    INFO("dims := ", std::string(g.name));
     CAPTURE(bad);
     CAPTURE(first);
     if (bad != 0) {
@@ -224,7 +232,7 @@ void RunSpecRoutingCase(vt::DeviceType dev, const GdnDims& g, bool bit_exact) {
     float maxabs = 0.0f;
     for (size_t i = 0; i < spec_out.size(); ++i)
       maxabs = std::max(maxabs, std::fabs(spec_out[i] - ref_out[i]));
-    CAPTURE(g.name);
+    INFO("dims := ", std::string(g.name));
     CAPTURE(maxabs);
     // Tight band: only the M=1-vs-M=T projection GEMM retile differs; the spec
     // conv/recurrence routing is exact. A broken split would blow past this.
@@ -351,7 +359,7 @@ void RunMixedRoutingCase(vt::DeviceType dev, const GdnDims& g, bool bit_exact) {
         if (bad == 0) first = i;
         ++bad;
       }
-    CAPTURE(g.name);
+    INFO("dims := ", std::string(g.name));
     CAPTURE(bad);
     CAPTURE(first);
     if (bad != 0) { CAPTURE(mixed_out[first]); CAPTURE(ref[first]); }
@@ -360,7 +368,7 @@ void RunMixedRoutingCase(vt::DeviceType dev, const GdnDims& g, bool bit_exact) {
     float maxabs = 0.0f;
     for (size_t i = 0; i < mixed_out.size(); ++i)
       maxabs = std::max(maxabs, std::fabs(mixed_out[i] - ref[i]));
-    CAPTURE(g.name);
+    INFO("dims := ", std::string(g.name));
     CAPTURE(maxabs);
     CHECK(maxabs < 0.05f);
   }
@@ -628,7 +636,7 @@ void RunGateActivationCase(const GdnDims& g, bool mixed) {
   for (size_t i = 0; i < silu_out.size(); ++i)
     maxd = std::max(maxd,
                     std::abs(static_cast<double>(silu_out[i]) - sigmoid_out[i]));
-  CAPTURE(g.name);
+  INFO("dims := ", std::string(g.name));
   CAPTURE(mixed);
   CAPTURE(maxd);
   CHECK(maxd > 0.0);
@@ -700,7 +708,7 @@ void RunGatePolarityCase(const GdnDims& g, bool mixed) {
   const std::vector<float> sigmoid_out = run(sigmoid);
   REQUIRE(static_cast<int64_t>(silu_out.size()) == T * H);
   REQUIRE(sigmoid_out.size() == silu_out.size());
-  CAPTURE(g.name);
+  INFO("dims := ", std::string(g.name));
   CAPTURE(mixed);
 
   // silu(0) == 0 annihilates the block output, exactly.

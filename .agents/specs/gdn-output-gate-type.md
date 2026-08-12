@@ -95,7 +95,11 @@ comparison.
 
 ## Gates
 
-- Focused: the two test targets above, plus the Qwen3.5 dense/MoE/MTP suites.
+- Focused: the two test targets above, plus the Qwen3.5 dense/MoE/MTP suites —
+  and, because `GlueFuseEnabled()` is a once-per-process static, the two GDN
+  polarity suites a SECOND time with the glue-fusion lever forced off, registered
+  as their own CTest entries so the unfused tail is gated rather than manually
+  spot-checked.
 - Full gate on the row before push.
 - **Byte-identical evidence:** the 27B/35B goldens' md5 must be unchanged. A
   passing token gate is necessary but not sufficient here — the whole defect
@@ -122,9 +126,16 @@ Row is `ACTIVE` on `row/MODEL-GDN-OUTPUT-GATE-TYPE`. Implemented at `5da2e364`,
 reviewed independently (design confirmed correct and complete: all 13 non-test
 gated-RMSNorm constructions enumerated, no tail unwired, the fp8 `FusedRecipe`
 value-copy proven unable to alias the constexpr original), then repaired for the
-three findings that review returned. Owed before `DONE`: the operator's own
-rerun of the row gate, the GPU arms this host cannot execute, and an `## Outcome`
-section.
+three findings that review returned. A second independent review returned
+**PASS** — no mutation exposed wrong behavior — with three residual coverage and
+record-accuracy findings, closed at `3bd684cd`'s successor: the unfused bf16 tail
+is now gated by two `VT_GLUE_FUSE=0` CTest entries, the non-string config arm has
+its own subcase, and the dim capture no longer prints `1`.
+
+Owed before `DONE`: the operator's own rerun of the row gate; the GPU arms this
+host cannot execute, **including the fp8 sigmoid polarity case that no backend
+has ever executed**; an issue tracking the promised widening of the refusal to a
+GDN-architecture check; and an `## Outcome` section.
 
 ### What landed
 
@@ -146,6 +157,22 @@ contradicting `docs/USAGE.md`, which already shipped the refusal contract.
 The refusal is unconditional rather than gated on a GDN architecture, where
 upstream's assert lives. No known checkpoint carries the key outside the GDN
 family; if one appears, widening is a scoped follow-up with its own test.
+**That follow-up has no issue.** It is a deliberate divergence from upstream, not
+an oversight, but the promise to widen currently lives only in this paragraph and
+in the comment at `hf_config.cpp:458-462` — nothing tracks it, and nothing will
+surface it when the first non-GDN checkpoint carrying the key appears. Filing it
+is owed before `DONE`, per "every change starts from an issue".
+
+Each of the three tails carries FOUR gate-carrying constructions, not one: the
+fp8 `FusedChain` recipe copy, the fp8 direct `RmsNormGatedQuantFp8`, the
+glue-FUSED `RmsNormGated`, and the UNFUSED `RmsNormGated`. `GlueFuseEnabled()`
+defaults ON and is read once per process into a function-local static, so a
+single run reaches at most one of the two bf16 arms. The row therefore registers
+`test_qwen27_dense_forward_glue_fuse_off` and
+`test_qwen3_5_gdn_spec_routing_glue_fuse_off` — the same binaries re-run with
+`VT_GLUE_FUSE=0`, mirroring the per-lever re-run
+`test_dense_gateup_fused_marlin_off_*` and the precedent the fusion row itself
+set (`.agents/parity-ledger.md:112`).
 
 ### Evidence
 
@@ -193,6 +220,59 @@ qwen36*/gdn* goldens: `886f4202f9e4fea2af611f1642f84a08`; individually
 `qwen36_gdn_layer_35b 1320c83388c6220426a660858d90322c`,
 `qwen3coder_greedy 444895f5dc423427510251b1dcdad13e`.
 
-**Not run here.** This host has no GPU: the CUDA/fp8 arms of all three tails,
-the `FusedChain` fp8 recipe copy on device, and every dgx gate are UNRUN and
-owed at the operator's rerun.
+**Non-string coverage.** The parse routes every non-string JSON type through
+`dump()`, and `null` was the only one exercised. Mutating that arm so a number or
+a bool takes the absent path instead
+(`: gate_it->is_null() ? gate_it->dump() : std::string("silu")` — surgical, so the
+`null` subcase stays green and only the new one can fire) goes RED in
+`test_hf_config`: `20 | 19 passed | 1 failed`,
+`assertions: 215 | 210 passed | 5 failed`, `Status: FAILURE!`, every failure of
+the form `CHECK_THROWS_WITH_AS( vllm::LoadHfConfig(num.path()),
+"output_gate_type", std::runtime_error ) did NOT throw at all!` in
+`a present non-string value is refused, naming what was found`. Restored:
+`215 | 215 passed`, `Status: SUCCESS!` (was `210 | 210` before the subcase).
+
+**Both bf16 tails gated, F1.** The unfused arm was live and correctly wired but
+UNGATED: inverting only `qwen3_5.cpp:3662` left the whole declared focused gate
+green. With the two `_glue_fuse_off` entries registered, that same mutation now
+fails the gate, and only through the new entry:
+
+- invert `:3662` alone (`GdnBlock`) — `ctest` `75% tests passed, 1 tests failed
+  out of 4`, `35 - test_qwen27_dense_forward_glue_fuse_off (Failed)`;
+  `test_qwen27_dense_forward` itself still **Passed**. The binary under
+  `VT_GLUE_FUSE=0` reads `9 | 8 passed | 1 failed`,
+  `assertions: 583 | 581 passed | 2 failed`, `Status: FAILURE!`,
+  `CHECK( silu_differs == 0 )` → `240 == 0` and `CHECK( sigmoid_gap > 0.0 )` →
+  `0 > 0`.
+- invert `:4132` + `:4560` alone (`GdnBlockPaged`, `GdnBlockPagedMixedSpec`) —
+  `36 - test_qwen3_5_gdn_spec_routing_glue_fuse_off (Failed)`, the default entry
+  still **Passed**; `6 | 4 passed | 2 failed`,
+  `assertions: 52 | 44 passed | 8 failed`, `Status: FAILURE!`,
+  `CHECK( silu_nonzero == 0 )` → `640 == 0` with `max_sigmoid == 0` at both gate
+  dims.
+
+`qwen3_5.cpp` was restored after each (`md5 ee95ae274364249eb26f9029f5301922`,
+empty `git diff` over `src/`); `src/` is untouched by this repair.
+
+**Failure logs name the dim, F3.** `CAPTURE(g.name)` printed `g.name := 1` —
+doctest 2.5.2 stringifies a `const char*` through its generic path and the
+pointer decays to bool, so the capture whose only purpose is telling 27B from 35B
+erased exactly that. All six uses in `test_qwen3_5_gdn_spec_routing.cpp` now go
+through `INFO("dims := ", std::string(g.name))`; the RED above is what proves it,
+logging `dims := 27B (Hv=48)` and `dims := 35B (Hv=32)`.
+
+**Not run here.** This host has no GPU, so every CUDA arm of all three tails is
+UNRUN and owed at the operator's rerun. Two of those are worth naming, because
+neither is merely "the CUDA copy of something already gated":
+
+- **No fp8 gated-RMSNorm site has ever run the sigmoid arm, on any backend.**
+  Six of the twelve gate-carrying constructions are fp8
+  (`qwen3_5.cpp:3641-3647`, `4111-4117`, `4539-4545` — the `FusedChain` recipe
+  copy and the direct `RmsNormGatedQuantFp8` in each tail). They need a populated
+  `out_proj_fp8` and a CUDA device, so no CPU gate can reach them and no gate in
+  this row did. Wired-but-never-executed is precisely the footing this row was
+  opened to close, so the operator's GPU rerun owes a 35B fp8 sigmoid-vs-silu
+  polarity case of the same shape as the bf16 one — discharged deliberately, not
+  discovered later.
+- The CPU `_glue_fuse_off` entries gate the UNFUSED bf16 tail on CPU only; the
+  CUDA gated-RMSNorm kernels (fused and unfused) remain UNRUN.

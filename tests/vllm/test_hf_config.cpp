@@ -940,6 +940,14 @@ const std::string kNull = R"(,
     "output_gate_type": null)";
 const std::string kEmpty = R"(,
     "output_gate_type": "")";
+// PRESENT and not a string at all. `getattr` returns whatever the attribute
+// holds regardless of type, so a number or a bool reaches upstream's assert the
+// same way None does. Locally these take the `dump()` arm of the parse, which
+// null alone was covering.
+const std::string kNumber = R"(,
+    "output_gate_type": 3)";
+const std::string kBool = R"(,
+    "output_gate_type": true)";
 
 }  // namespace
 
@@ -1012,6 +1020,31 @@ TEST_CASE("LoadHfConfig normalizes the GDN output_gate_type") {
                          doctest::Contains("sigmoid"), std::runtime_error);
 
     TempJson nested(NestedGdnJson(kEmpty));
+    CHECK_THROWS_AS(vllm::LoadHfConfig(nested.path()), std::runtime_error);
+  }
+
+  // `null` is only ONE of the non-string JSON types the parse routes through
+  // `dump()`, and it was the only one exercised. A number and a bool are just
+  // as reachable from a hand-edited or generator-written config, take the same
+  // arm, and must be refused with the offending value QUOTED into the message —
+  // the whole reason that arm dumps rather than substituting a default.
+  SUBCASE("a present non-string value is refused, naming what was found") {
+    TempJson num(FlatGdnJson(kNumber));
+    CHECK_THROWS_WITH_AS(vllm::LoadHfConfig(num.path()),
+                         doctest::Contains("output_gate_type"),
+                         std::runtime_error);
+    CHECK_THROWS_WITH_AS(vllm::LoadHfConfig(num.path()),
+                         doctest::Contains("\"3\""), std::runtime_error);
+
+    TempJson yes(FlatGdnJson(kBool));
+    CHECK_THROWS_WITH_AS(vllm::LoadHfConfig(yes.path()),
+                         doctest::Contains("output_gate_type"),
+                         std::runtime_error);
+    CHECK_THROWS_WITH_AS(vllm::LoadHfConfig(yes.path()),
+                         doctest::Contains("\"true\""), std::runtime_error);
+
+    // Same in a nested wrapper: the resolved text config is what decides.
+    TempJson nested(NestedGdnJson(kNumber));
     CHECK_THROWS_AS(vllm::LoadHfConfig(nested.path()), std::runtime_error);
   }
 

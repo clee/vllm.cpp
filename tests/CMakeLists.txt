@@ -86,6 +86,22 @@ vllm_cpp_add_test(test_qwen3_5_gguf_mtp vllm/models/test_qwen3_5_gguf_mtp.cpp)
 vllm_cpp_add_test(test_qwen3_dflash_gguf vllm/models/test_qwen3_dflash_gguf.cpp)
 target_include_directories(test_qwen3_5_gdn_spec_routing PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_qwen27_dense_forward vllm/models/test_qwen27_dense_forward.cpp)
+# MODEL-GDN-OUTPUT-GATE-TYPE (#489): `GlueFuseEnabled()` defaults ON and is read
+# ONCE per process into a function-local static, so one run of these two suites
+# can only ever execute the glue-FUSED gated-RMSNorm tail. The UNFUSED tail
+# carries its own `vt::RmsNormGatedArgs{eps, sigmoid_gate}` construction in each
+# of the three GDN blocks, and inverting only that construction left the entire
+# declared focused gate GREEN (test_hf_config 210|210, test_qwen27_dense_forward
+# 583|583, test_qwen3_5_gdn_spec_routing 52|52) — live code, but ungated.
+# Re-run the SAME binaries with the lever forced to 0 so the `VT_GLUE_FUSE=0`
+# fallback is gated too, mirroring the precedent the fusion row itself set
+# (parity-ledger.md:112 — "fused ON default AND `VT_GLUE_FUSE=0` fallback 16/16")
+# and the per-lever re-run below.
+foreach(_glue_fuse_test test_qwen27_dense_forward test_qwen3_5_gdn_spec_routing)
+  add_test(NAME ${_glue_fuse_test}_glue_fuse_off COMMAND ${_glue_fuse_test})
+  set_tests_properties(${_glue_fuse_test}_glue_fuse_off PROPERTIES
+    ENVIRONMENT "VT_GLUE_FUSE=0" SKIP_RETURN_CODE 77)
+endforeach()
 # PERF-27B-DENSE-MARLIN-GATEUP (#365): the pre-kernel DECISIONS that route the
 # 27B's dense W4A16 MLP through the fused Marlin gate_up pair. CPU-only by
 # construction — the fused GEMM itself is CUDA + VT_MARLIN_NVFP4.
