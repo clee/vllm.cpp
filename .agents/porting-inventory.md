@@ -1096,6 +1096,59 @@ Examples: `examples/cli` ✅ (C-API client), `examples/server` ✅ (OpenAI serve
       it inside the model.
     * **Spec:** [ltx-2.5 spec](specs/ltx-2-5.md) §1.2 and §7. Lifecycle: shipped
       (CPU), CUDA arm OWED. Owner: the LTX-2.5 row.
+18. **LTX-2.5 pipeline recipes are sourced from the CROSS-CHECK, and three upstream
+    guiders are refused (2026-08-12,
+    `MODEL-DIFFUSION-ltx-2-5-ltx2-video-transformer-3d-model` phase L5, issue
+    [#435](https://github.com/mudler/vllm.cpp/issues/435)).** Two deviations, both
+    forced, both recorded rather than discovered later.
+    * **(a) The 2.4 and 2.5 recipe rows have NO binding-oracle source.** vLLM-Omni
+      is this project's binding oracle for LTX (spec §3) and its recipe table stops
+      at 2.3: `_PIPELINE_RECIPES` keys on exactly `("one_stage","2")`,
+      `("one_stage","2.3")`, `("distilled_two_stage","2")`, `("dmd2","2")`,
+      `("dmd2","2.3")` (`vllm_omni/diffusion/models/ltx2/ltx2_recipes.py:161-166` @
+      `a4ea67a2`). The three rows this port adds — `("one_stage","2.4")`,
+      `("one_stage","2.5")`, `("distilled_two_stage","2.5")` — take their VALUES
+      from Lightricks `ltx-pipelines` @ `fd4ded7f`, which is the model author's own
+      runtime and the spec's designated cross-check: `utils/constants.py:17-23`
+      (the distilled sigmas), `:130-179` (`_PARAMS_SINCE_VERSION` /
+      `detect_params`, which is what makes (2,5) inherit `LTX_2_4_PARAMS`), and
+      `distilled.py:62-84, 170-185` (the ancestral stage-1 sampler, the single
+      thing generation 2.5 changes). The SHAPE of the recipe model stays
+      vLLM-Omni's. The refusal on an unknown pair is mirrored exactly and never
+      relaxed, because a plausible-but-wrong sigma schedule renders rather than
+      failing. **The two references disagree on the default negative prompt** —
+      Lightricks' carries five leading tags vLLM-Omni's lacks — so both strings are
+      kept, each row takes its own source's, and the disagreement is a gated value
+      (`kLtx2NegativePromptsAgree`) rather than a preference. Discharged when
+      vllm-omni lands native 2.5 (upstream
+      [vllm-omni#6066](https://github.com/vllm-project/vllm-omni/issues/6066)), at
+      which point the rows re-anchor to it.
+    * **(b) `CFGStarRescalingGuider`, `LtxAPGGuider` and `LegacyStatefulAPGGuider`
+      are REFUSED, not ported.** MEASURED against upstream rather than assumed: all
+      three multiply `projection_coef`'s rank-2 `(B, 1)` result straight into the
+      latent (`components/guiders.py:48, 118, 184`), and torch right-aligns that
+      onto the latent's LAST TWO axes — so the expression composes at rank 2,
+      RAISES at every rectangular rank >= 3 (i.e. at every real `(B, C, F, H, W)`
+      video latent), and on a coincidentally square shape silently indexes an axis
+      that is not the batch. `LtxAPGGuider`'s own `norm(dim=[-1,-2,-3])` (`:114`)
+      additionally needs rank >= 3, so no rectangular shape satisfies both halves
+      of the same function. No `ltx-pipelines` entry point constructs any of the
+      three; the only guider parameters any of them builds are
+      `MultiModalGuiderParams` (`utils/constants.py:49-68`). Shipping a broadcast
+      rule upstream cannot reach would be inventing behaviour, so `vllm::Ltx2Guidance`
+      refuses them by name. `CFGGuider`, `STGGuider`, `MultiModalGuider` and
+      `projection_coef` itself ARE ported.
+    * **Local anchor:** `include/vllm/model_executor/models/ltx2_pipeline.h`,
+      `src/vllm/model_executor/models/ltx2_pipeline.cpp`
+      (`ResolveLtx2PipelineRecipe`, `Ltx2Guidance`).
+    * **Tests and evidence:** `tests/vllm/models/test_ltx2_pipeline.cpp` — the
+      recipe table gated against vLLM-Omni's OWN key list (so a row appearing
+      upstream fails this gate instead of going unnoticed), the refusal on six
+      unknown pairs, the ancestral-sampler split between the 2.0 and 2.5 distilled
+      rows, and `kLtx2GuideProbeComposes`, the shape matrix taken from executing
+      upstream that is the evidence behind (b).
+    * **Spec:** [ltx-2.5 spec](specs/ltx-2-5.md) §3 and §6 (phase L5). Lifecycle:
+      shipped (CPU reference). Owner: the LTX-2.5 row.
 
 ## 10. E2E test suites (T0 deliverable)
 

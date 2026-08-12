@@ -318,7 +318,9 @@ the config parse and weight-name mapping be tested before the forward exists.
 
 ### LTX-2.5 has no user-facing entrypoint yet
 
-LTX-2.5 is being ported in phases. Its two VAE decoders are implemented and
+LTX-2.5 is being ported in phases. Its two VAE decoders and its pipeline layer
+(the sigma schedule, the diffusion steps, guidance, the latent spatial x2
+upsampler, the duration head and the embeddings connector) are implemented and
 gated, but no CLI flag, server endpoint or C ABI call reaches them, so there is
 nothing to run here yet and no request shape to document. Do not infer from
 [FEATURES](FEATURES.md) that a render is available.
@@ -1492,6 +1494,27 @@ The generator asserts the `ltx_core` it imported came from that checkout and not
 from anything installed in site-packages, and it writes the upstream revision it
 executed into the generated header. Neither side checks in a weight byte: both
 rebuild every tensor from one deterministic stream keyed by the parameter's name.
+
+The pipeline layer has its own gate, and it needs a second checkout: the recipe
+table is read from vLLM-Omni, which is the binding oracle for LTX even though it
+carries no 2.5 row of its own. Both checkouts must be CLEAN, because a revision
+anchor read from a tree with uncommitted edits stamps a SHA the goldens do not
+come from.
+
+```sh
+git clone https://github.com/vllm-project/vllm-omni ~/_git/vllm-omni
+python3 scripts/gen-ltx2-pipeline-goldens.py \
+  --ltx2 ~/_git/LTX-2 \
+  --vllm-omni ~/_git/vllm-omni \
+  --out tests/vllm/models/ltx2_pipeline_goldens.inc
+cmake --build build --target test_ltx2_pipeline && ./build/tests/test_ltx2_pipeline
+```
+
+Recipes resolve on an EXACT `(pipeline_kind, model_version)` pair and refuse
+anything else by name rather than defaulting, because a plausible but wrong sigma
+schedule or guidance scale renders a video instead of failing. The pairs that
+resolve are `one_stage` at 2, 2.3, 2.4 and 2.5, `distilled_two_stage` at 2 and
+2.5, and `dmd2` at 2 and 2.3.
 
 ## SSE keepalives on long prefill
 

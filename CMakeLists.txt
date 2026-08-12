@@ -761,6 +761,13 @@ add_library(vllm STATIC
   # VAE and its vocoder. Additive files mirroring ltx_core's own structure.
   src/vllm/model_executor/models/ltx2_audio_vae.cpp
   src/vllm/model_executor/models/ltx2_video_vae.cpp
+  # LTX-2.5 (ROW MODEL-DIFFUSION-LTX25, phase L5): the flow-matching pipeline,
+  # the latent spatial upsampler, the duration head and the embeddings
+  # connector. Additive files mirroring ltx_core's own structure.
+  src/vllm/model_executor/models/ltx2_pipeline.cpp
+  src/vllm/model_executor/models/ltx2_upsampler.cpp
+  src/vllm/model_executor/models/ltx2_duration_head.cpp
+  src/vllm/model_executor/models/ltx2_connector.cpp
   src/vllm/entrypoints/openai/video_api.cpp
   src/vllm/model_executor/models/kimi_kda.cpp
   src/vllm/model_executor/models/kimi_linear_registry.cpp

@@ -73,6 +73,12 @@ vllm_cpp_add_test(test_ltx2 vllm/models/test_ltx2.cpp)
 # dimensions. ltx2_vae_goldens.inc lives next to the test source.
 vllm_cpp_add_test(test_ltx2_vae vllm/models/test_ltx2_vae.cpp)
 target_include_directories(test_ltx2_vae PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
+# LTX-2.5 L5: the pipeline layer — sigma schedule, noiser, diffusion steps,
+# guidance, patchifiers, the recipe table, the latent spatial upsampler, the
+# duration head and the embeddings connector. ltx2_pipeline_goldens.inc lives
+# next to the test source.
+vllm_cpp_add_test(test_ltx2_pipeline vllm/models/test_ltx2_pipeline.cpp)
+target_include_directories(test_ltx2_pipeline PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
 vllm_cpp_add_test(test_video_api vllm/entrypoints/openai/test_video_api.cpp)
 target_include_directories(test_model_registry PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_platform vllm/platforms/test_platform.cpp)
