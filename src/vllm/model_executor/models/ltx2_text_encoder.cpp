@@ -249,26 +249,49 @@ std::vector<float> Ltx2NormAndConcatPaddedBatch(const float* stacked, const int3
     for (int64_t t = 0; t < T; ++t)
       if (mask[static_cast<size_t>(b * T + t)] != 0) ++seq_len;
     // :34 — denom = (sequence_lengths * d), i.e. the number of VALID (t, d) pairs.
-    const double denom = static_cast<double>(seq_len) * static_cast<double>(D);
+    // INT64, exactly as upstream: `attention_mask.sum(-1)` is an int64 tensor and
+    // `* d` keeps it there. The width it is added to `eps` in is decided at :35.
+    const int64_t denom = seq_len * D;
 
     for (int64_t l = 0; l < L; ++l) {
       // :33-38 — mean over the masked entries and min/max over them, both reduced
       // over BOTH the token and the hidden axis, per (batch, layer).
+      //
+      // f64 SUM ACCUMULATOR, and it is the deliberate escape rather than an
+      // oversight: upstream's `masked.sum` is a float32 reduction, but a BLOCKED
+      // one whose order no straight loop reproduces. Accumulating exactly and
+      // rounding once is the closest single-rounding approximation to any order.
+      // Measured against upstream on this fixture: f64 accumulate reads 2.38e-07
+      // (left) / 4.77e-07 (right), a naive f32 accumulate reads 4.77e-07 / 2.38e-07
+      // — it wins on one mask and loses on the other, which is noise, not a mirror.
+      // The min/max stay f32 because they ARE f32 values and `hi - lo` is then the
+      // same single rounding upstream's f32 subtraction does; taking the
+      // difference in f64 and rounding after would double-round.
       double sum = 0.0;
-      double lo = std::numeric_limits<double>::infinity();
-      double hi = -std::numeric_limits<double>::infinity();
+      float lo = std::numeric_limits<float>::infinity();
+      float hi = -std::numeric_limits<float>::infinity();
       for (int64_t t = 0; t < T; ++t) {
         if (mask[static_cast<size_t>(b * T + t)] == 0) continue;
         for (int64_t d = 0; d < D; ++d) {
-          const double v = static_cast<double>(
-              stacked[static_cast<size_t>((((b * T) + t) * D + d) * L + l)]);
-          sum += v;
+          const float v = stacked[static_cast<size_t>((((b * T) + t) * D + d) * L + l)];
+          sum += static_cast<double>(v);
           lo = std::min(lo, v);
           hi = std::max(hi, v);
         }
       }
-      const float mean = static_cast<float>(sum / (denom + kEps));
-      const float range = static_cast<float>(hi - lo);
+      // :35 — `denom + eps` where `denom` is an int64 TENSOR and `eps` a python
+      // float. Torch promotes int64-tensor + python-float to the DEFAULT dtype, so
+      // that add happens in FLOAT32, not float64: upstream's denominator for
+      // seq_len*D == 18 is 18.000001907348633, where an f64 add gives 18.000001.
+      // Adding in f64 is numerically finer and therefore WRONG here — it is a
+      // dtype that is too wide, which no token gate and no random-input golden can
+      // see. It costs one f32 ulp in `mean`, which `range_ + eps` below multiplies
+      // by 8/eps = 8e6 as `range_` collapses: on a constant slice it moves the
+      // output from 0.476837158 to 0.238418579. Gated on that input in
+      // tests/vllm/models/test_ltx2_text_encoder.cpp.
+      const float mean = static_cast<float>(sum) /
+                         (static_cast<float>(denom) + static_cast<float>(kEps));
+      const float range = hi - lo;
 
       // :41 — 8 * (x - mean) / (range + eps), applied to the UNMASKED tensor.
       for (int64_t t = 0; t < T; ++t) {

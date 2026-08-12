@@ -516,27 +516,39 @@ def emit_conditioning(out, v2) -> None:
 def emit_epsilons(out) -> None:
     """The two normalization EPSILONS, MEASURED out of upstream rather than restated.
 
-    Both constants are invisible to every golden above, and that is a property of
-    the algorithm, not of this fixture:
+    Both constants are invisible to the RANDOM goldens above, and that is a
+    property of the algorithm, not of this fixture:
 
       * `range_ + eps` (feature_extractor.py:41) only matters when a whole
         (batch, layer) slice is CONSTANT over its valid positions, so `range_`
         collapses to 0. Random inputs never do that.
-      * `denom + eps` (feature_extractor.py:34) only matters when
-        `sequence_lengths == 0`, and every position of such a batch row is a pad
-        that :45 zeroes, so the NaN it would prevent can never reach the output.
-        It is unobservable at the output FOR ANY INPUT, which is why it is pinned
-        as a CONSTANT here and not as behaviour.
+      * `denom + eps` (feature_extractor.py:34-35) only matters when
+        `sequence_lengths == 0` — but its DTYPE matters far more widely, and is
+        observable at the output. `sequence_lengths * d` is an int64 tensor, and
+        `int64 + python float` promotes to the DEFAULT dtype, so upstream adds
+        the epsilon in float32: `18 + 1e-6` is 18.000001907348633, not the
+        18.000001 a float64 add gives. That is one f32 ULP in `mean`, and the
+        RANGE epsilon amplifies it by 8/eps whenever `range_` collapses. On a
+        constant 0.5 stack under `mask_right` it moves row 0 from 0.476837158 to
+        0.238418579 — 23842x this suite's kTol. The claim this docstring used to
+        make, that the epsilon is "unobservable at the output for any input", was
+        false; it is unobservable only on an all-pad row.
       * `variance + 1e-6` (feature_extractor.py:61) only matters when a token's
         whole hidden slice is zero.
 
     So they are gated two ways. The VALUE is recovered from upstream numerically,
     by probes whose algebra inverts the epsilon exactly — no source parsing, no
     restating our own constant back to ourselves. And the degenerate inputs
-    themselves are run through upstream, so the C++ side's "still finite" property
-    assertions mirror a MEASURED upstream fact.
+    themselves are run through upstream and emitted as FULL OUTPUT TENSORS, so
+    the C++ side compares against upstream's measured VALUES.
 
-    Upstream has ONE `eps = 1e-6` (feature_extractor.py:28) used at BOTH :34 and
+    Emitting values rather than a property is the whole point of this section. An
+    earlier revision ran each degenerate input through upstream, had the output
+    tensor in hand, and reduced it to one `isfinite` boolean. Both a float32 and a
+    float64 mean denominator are finite, so that gate could not see the dtype
+    defect above, and it sat green under it.
+
+    Upstream has ONE `eps = 1e-6` (feature_extractor.py:28) used at BOTH :35 and
     :41; our port has one `kLtx2TextNormV1Eps` used at both. Measuring it through
     the range denominator therefore pins the same constant the mean denominator
     uses.
@@ -571,27 +583,57 @@ def emit_epsilons(out) -> None:
     emit_f64_scalar(out, "kLtxTeNormV1EpsUpstream", v1_eps)
     emit_f64_scalar(out, "kLtxTeNormV2EpsUpstream", v2_eps)
 
-    # The degenerate inputs, run through UPSTREAM, so the property the C++ suite
-    # asserts is upstream's own and not one we invented.
+    # The degenerate inputs, run through UPSTREAM and emitted as the FULL OUTPUT
+    # TENSOR. `_cxx_float` refuses a non-finite literal, so each array carries the
+    # old "still finite" property AND the values it used to discard; the finiteness
+    # scalars are kept so nothing that was asserted before stops being asserted.
     #
-    # A CONSTANT stack: every (batch, layer) slice has range_ == 0.
+    # 1. A CONSTANT stack: every (batch, layer) slice has range_ == 0, so `range_ +
+    #    eps` is the entire denominator and it multiplies the mean's rounding by
+    #    8/eps = 8e6. This is the input that falsifies a float64 mean denominator:
+    #    row 0 has 3 valid tokens (denom 18) and reads 0.476837158 upstream against
+    #    0.238418579 from a float64 add, while row 0 of the ONE-VALID-TOKEN case and
+    #    every position of row 1 (denom 24) agree either way. A gate needs all
+    #    three, because two of them cannot see the defect.
     const_stack = torch.full((BATCH, SEQ, GEMMA_HIDDEN, NUM_LAYERS), 0.5, dtype=torch.float32)
     const_out = _norm_and_concat_padded_batch(const_stack, mask_right())
     emit_scalar(out, "kLtxTeNormV1ConstantSliceFinite", int(bool(torch.isfinite(const_out).all())))
+    emit_f32(out, "kLtxTeNormV1ConstantSlice", tensor(const_out))
 
-    # A batch row with NO valid token at all: sequence_lengths == 0, so denom == 0
-    # and range_ == -inf. Upstream's output for that row is finite and ZERO,
-    # because :45 zeroes every position of it — with or without `denom + eps`.
+    # 2. The same constant stack with exactly ONE valid token in row 0, so
+    #    sequence_lengths == 1 and denom == d. Emitted with its mask so the two
+    #    sides cannot drift on which positions are valid.
+    one_token_mask = torch.tensor(
+        [[1] + [0] * (SEQ - 1), [1] * (SEQ - 1) + [0]], dtype=torch.int64
+    )
+    one_token_out = _norm_and_concat_padded_batch(const_stack, one_token_mask)
+    emit_i64(out, "kLtxTeNormV1OneValidTokenMask", one_token_mask)
+    emit_f32(out, "kLtxTeNormV1OneValidToken", tensor(one_token_out))
+
+    # 3. A range of exactly one f32 ULP. `nextafter(0.5)` in one position makes
+    #    range_ == 2**-24, which is the same order as eps itself, so the two
+    #    epsilons interact instead of one dominating.
+    near_stack = const_stack.clone()
+    near_stack[0, 0, 0, 0] = torch.nextafter(torch.tensor(0.5), torch.tensor(1.0))
+    near_out = _norm_and_concat_padded_batch(near_stack, mask_right())
+    emit_f32(out, "kLtxTeNormV1NearConstant", tensor(near_out))
+
+    # 4. A batch row with NO valid token at all: sequence_lengths == 0, so denom == 0
+    #    and range_ == -inf. This is the ONE case in which `denom + eps` really is
+    #    unobservable, because :44-45 zeroes every position of that row. The array
+    #    is what proves it, rather than the two booleans asserting it.
     zero_len_mask = torch.tensor([[0] * SEQ, [1] * SEQ], dtype=torch.int64)
     zero_len_out = _norm_and_concat_padded_batch(torch.stack(hidden_states(), dim=-1), zero_len_mask)
     emit_scalar(out, "kLtxTeNormV1ZeroLenFinite", int(bool(torch.isfinite(zero_len_out).all())))
     emit_scalar(out, "kLtxTeNormV1ZeroLenRowIsZero", int(bool((zero_len_out[0] == 0.0).all())))
+    emit_f32(out, "kLtxTeNormV1ZeroLen", tensor(zero_len_out))
 
-    # A token whose whole hidden slice is zero: variance == 0.
+    # 5. A token whose whole hidden slice is zero: variance == 0.
     zero_var = torch.stack(hidden_states(), dim=-1).clone()
     zero_var[0, 0, :, :] = 0.0
     zero_var_out = norm_and_concat_per_token_rms(zero_var, mask_right())
     emit_scalar(out, "kLtxTeNormV2ZeroVarianceFinite", int(bool(torch.isfinite(zero_var_out).all())))
+    emit_f32(out, "kLtxTeNormV2ZeroVariance", tensor(zero_var_out))
     out.write("\n")
 
 

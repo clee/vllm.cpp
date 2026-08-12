@@ -136,16 +136,31 @@ struct Ltx2TextHiddenStates {
 
 // feature_extractor.py:28 — ONE `eps = 1e-6` bound at the top of
 // `_norm_and_concat_padded_batch` and used TWICE: in the mean's denominator
-// (`denom + eps`, :34) and in the range's (`range_ + eps`, :41). Named here so
-// there is a single thing to pin, and pinned against the value MEASURED out of
-// upstream in tests/vllm/models/test_ltx2_text_encoder.cpp.
+// (`denom` is defined at :34, the `+ eps` is at :35) and in the range's
+// (`range_ + eps`, :41). Named here so there is a single thing to pin, and pinned
+// against the value MEASURED out of upstream in
+// tests/vllm/models/test_ltx2_text_encoder.cpp.
 //
-// Reachability, stated because it is what makes the pin necessary: `range_ + eps`
-// is reachable only when a whole (batch, layer) slice is CONSTANT over its valid
-// positions, and `denom + eps` is reachable only when a batch row has NO valid
-// token — and on that row every position is a pad that :44-45 zeroes, so the
-// second use is UNOBSERVABLE at the output for every possible input. It is
-// mirrored because upstream has it, and held by the constant, not by behaviour.
+// Reachability, stated because it is what makes the pin necessary, and stated
+// CORRECTLY because an earlier revision of this comment got it wrong in the
+// direction that makes a reader relax:
+//
+//   * `range_ + eps` (:41) is reachable only when a whole (batch, layer) slice is
+//     CONSTANT over its valid positions, so `range_` collapses to 0.
+//   * `denom + eps` (:35) is DIVISION-BY-ZERO-reachable only when a batch row has
+//     no valid token. But it is OUTPUT-OBSERVABLE far more widely, because its
+//     DTYPE is observable: `denom` is an int64 tensor and `eps` a python float, so
+//     upstream adds them in FLOAT32, and an f64 add differs by one f32 ulp in the
+//     mean. `range_ + eps` then amplifies that by 8/eps = 8e6 as `range_` -> 0. On
+//     a constant 0.5 stack under a 3-valid-token mask, upstream reads 0.476837158
+//     and an f64 denominator reads 0.238418579 — 23842x the suite's kTol.
+//
+// So this constant is UNOBSERVABLE at the output only on an all-pad row or an
+// all-zero mask, where :44-45 zeroes every position before anything escapes. On a
+// realistic Gemma workload `range_` is O(1), so the same one-ulp perturbation
+// lands around 2e-12 at the output — small, but not the "any input" the earlier
+// comment claimed. Both the value and the arithmetic width are gated on the
+// degenerate inputs, where they are visible.
 inline constexpr double kLtx2TextNormV1Eps = 1e-6;
 
 // feature_extractor.py:61 — `torch.rsqrt(variance + 1e-6)`. Reachable only when a

@@ -169,8 +169,10 @@ void CheckExactI(const std::vector<int32_t>& got, const int64_t* want, size_t co
 }
 
 // The tolerance every f32 brick is held to. The generator runs upstream in torch
-// float32 and we accumulate in float32, so anything above this is an algorithm
-// difference, not round-off.
+// float32 and every value we compare is an f32 store, so anything above this is an
+// algorithm difference, not round-off. (The reductions accumulate in f64 and round
+// once, which is stated and justified where they are written; the SCALARS are f32
+// because upstream's are.)
 constexpr double kTol = 1e-5;
 
 Ltx2TextFeatureConfig V2Config() {
@@ -902,9 +904,17 @@ TEST_CASE("ltx2 text: the normalization EPSILONS are PINNED and load-bearing") {
   // from 4.77e-07 to 5.24521e-06 and the gate still said SUCCESS, and
   // `denom + eps` -> `denom + 0.0` moved nothing at all.
   //
-  // So they are held two ways: the VALUE against upstream measured by probe, and
-  // the DEGENERATE INPUT that makes each one the only thing between the port and
-  // a division by zero.
+  // That second measurement is the reason the degenerate goldens below are ARRAYS
+  // rather than `isfinite` booleans. The generator was already running each of
+  // these inputs through upstream and already had the output tensor; reducing it
+  // to one boolean is what made `denom + 0.0` invisible, and a float64 mean
+  // denominator invisible with it. Re-measured against the arrays:
+  // `denom + eps` -> `denom + 0.0` now fails three of them, at 0.476837 (constant
+  // slice), 0.715256 (one valid token) and 0.476837 (near-constant).
+  //
+  // So they are held three ways: the VALUE against upstream measured by probe, the
+  // ARITHMETIC WIDTH the value is used at, and the DEGENERATE INPUT that makes
+  // each one the only thing between the port and a division by zero.
 
   // 1. The values. The generator recovers them from upstream numerically
   //    (gen-ltx2-text-goldens.py :: emit_epsilons) rather than restating ours.
@@ -923,22 +933,44 @@ TEST_CASE("ltx2 text: the normalization EPSILONS are PINNED and load-bearing") {
   const std::vector<int32_t> mask = MaskFrom(vllm_test::kLtxTeMaskRight);
 
   // 2. V1 `range_ + eps` (feature_extractor.py:41). A CONSTANT (batch, layer)
-  //    slice makes `range_` EXACTLY zero, which is the only input on which the
-  //    epsilon is reachable. Upstream stays finite here — measured, not assumed.
+  //    slice makes `range_` EXACTLY zero, which is the only input on which THAT
+  //    epsilon is reachable — and because it then divides the whole expression,
+  //    it also multiplies any error in `mean` by 8/eps = 8e6. So this input gates
+  //    both epsilons at once, against upstream's VALUES.
   REQUIRE(vllm_test::kLtxTeNormV1ConstantSliceFinite == 1);
   const std::vector<float> constant(count, 0.5f);
   const std::vector<float> const_out = vllm::Ltx2NormAndConcatPaddedBatch(
       constant.data(), mask.data(), kBatch, kSeq, kHidden, kLayers);
   REQUIRE(const_out.size() == count);
   for (float x : const_out) CHECK(std::isfinite(x));
+  {
+    const double worst = MaxAbsDiff(const_out, vllm_test::kLtxTeNormV1ConstantSlice, count);
+    MESSAGE("ltx2 text norm V1 constant slice max|diff| = " << worst);
+    CHECK(worst < kTol);
+  }
 
-  // 3. V1 `denom + eps` (feature_extractor.py:34). A batch row with NO valid
-  //    token makes `denom` zero. Reported honestly rather than over-claimed: this
-  //    epsilon is UNOBSERVABLE at the output for every possible input, because
-  //    every position of such a row is a pad that :44-45 zeroes, so the NaN it
-  //    prevents in the intermediate `mean` can never escape. Upstream behaves the
-  //    same way (kLtxTeNormV1ZeroLenRowIsZero). The constant assertion above is
-  //    what holds it; this is the behaviour that constant is consistent with.
+  // 3. V1 `denom + eps` (feature_extractor.py:34-35), the mean's denominator, and
+  //    the DTYPE it is added in. Upstream's `denom` is an int64 tensor and `eps` a
+  //    python float, so `denom + eps` promotes to the DEFAULT dtype and the add
+  //    happens in float32: 18 + 1e-6 is 18.000001907348633, where a float64 add
+  //    gives 18.000001. That is one f32 ULP in `mean`, and case 2 above amplifies
+  //    it by 8/eps.
+  //
+  //    Stated precisely, because the previous revision of this comment claimed the
+  //    opposite and was wrong: this epsilon IS observable at the output. On the
+  //    constant slice under `mask_right`, row 0 (3 valid tokens, denom 18) reads
+  //    0.476837158 upstream and 0.238418579 from a float64 denominator — 23842x
+  //    kTol. It is unobservable only on an all-pad row, checked immediately below,
+  //    where :44-45 zeroes every position before anything can escape. Two further
+  //    degenerate inputs are gated because neither of them can see the defect on
+  //    its own: ONE valid token in row 0 (denom 6) agrees to the bit either way,
+  //    and so does row 1 of the constant slice (denom 24). A gate built from only
+  //    those would be green on a defect worth 23842x its own tolerance.
+  //
+  //    On a realistic Gemma workload none of this is catastrophic: `range_` is
+  //    O(1) rather than 0, so the same one-ULP mean error lands around 2e-12 at
+  //    the output. It is gated here because the degenerate arm is where it is
+  //    visible, not because the degenerate arm is where it matters.
   REQUIRE(vllm_test::kLtxTeNormV1ZeroLenFinite == 1);
   REQUIRE(vllm_test::kLtxTeNormV1ZeroLenRowIsZero == 1);
   const std::vector<std::vector<float>> buffers = HiddenStateBuffers();
@@ -951,6 +983,35 @@ TEST_CASE("ltx2 text: the normalization EPSILONS are PINNED and load-bearing") {
   for (float x : zero_len_out) CHECK(std::isfinite(x));
   for (int64_t i = 0; i < kSeq * kHidden * kLayers; ++i)
     CHECK(zero_len_out[static_cast<size_t>(i)] == 0.0f);
+  {
+    const double worst = MaxAbsDiff(zero_len_out, vllm_test::kLtxTeNormV1ZeroLen, count);
+    MESSAGE("ltx2 text norm V1 zero-length row max|diff| = " << worst);
+    CHECK(worst < kTol);
+  }
+
+  // 3b. ONE valid token in row 0, so `sequence_lengths == 1` and denom == d. The
+  //     mask travels with the golden so the two sides cannot disagree about which
+  //     positions are valid.
+  {
+    const std::vector<int32_t> one_mask = MaskFrom(vllm_test::kLtxTeNormV1OneValidTokenMask);
+    const std::vector<float> one_out = vllm::Ltx2NormAndConcatPaddedBatch(
+        constant.data(), one_mask.data(), kBatch, kSeq, kHidden, kLayers);
+    const double worst = MaxAbsDiff(one_out, vllm_test::kLtxTeNormV1OneValidToken, count);
+    MESSAGE("ltx2 text norm V1 one-valid-token max|diff| = " << worst);
+    CHECK(worst < kTol);
+  }
+
+  // 3c. A range of exactly ONE f32 ULP, so `range_` (2^-24) and `eps` (1e-6) are
+  //     the same order and neither dominates the other.
+  {
+    std::vector<float> near = constant;
+    near[0] = std::nextafterf(0.5f, 1.0f);
+    const std::vector<float> near_out = vllm::Ltx2NormAndConcatPaddedBatch(
+        near.data(), mask.data(), kBatch, kSeq, kHidden, kLayers);
+    const double worst = MaxAbsDiff(near_out, vllm_test::kLtxTeNormV1NearConstant, count);
+    MESSAGE("ltx2 text norm V1 near-constant max|diff| = " << worst);
+    CHECK(worst < kTol);
+  }
 
   // 4. V2 `variance + 1e-6` (feature_extractor.py:61). A token whose whole hidden
   //    slice is zero has variance 0, so `rsqrt(0)` is the alternative.
@@ -963,6 +1024,11 @@ TEST_CASE("ltx2 text: the normalization EPSILONS are PINNED and load-bearing") {
       zero_var.data(), mask.data(), kBatch, kSeq, kHidden, kLayers);
   REQUIRE(zero_var_out.size() == count);
   for (float x : zero_var_out) CHECK(std::isfinite(x));
+  {
+    const double worst = MaxAbsDiff(zero_var_out, vllm_test::kLtxTeNormV2ZeroVariance, count);
+    MESSAGE("ltx2 text norm V2 zero-variance max|diff| = " << worst);
+    CHECK(worst < kTol);
+  }
 }
 
 TEST_CASE("ltx2 text: a non-f32 compute dtype is REFUSED, never silently widened") {

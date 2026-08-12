@@ -1482,7 +1482,13 @@ cmake --build build --target test_ltx2_text_encoder
 
 The generator imports the upstream modules by path and executes them at reduced
 dimensions; both sides rebuild every weight from one deterministic stream, so no
-weight byte is checked in.
+weight byte is checked in. It also runs four degenerate inputs through upstream
+and emits each one's full output tensor, not a "still finite" flag, because the
+normalization epsilons and the width they are added in are invisible to a random
+fixture. The mean's denominator is one of those: upstream adds it in float32
+(`sequence_lengths * d` is an int64 tensor and `eps` a python float, which
+promotes to the default dtype), so computing it in float64 is finer arithmetic
+and the wrong answer.
 
 A third thing to know if you are wiring a loader to it: the feature extractor
 refuses, by name, any disagreement between what the checkpoint config declares
