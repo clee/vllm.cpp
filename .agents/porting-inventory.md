@@ -1411,7 +1411,9 @@ Examples: `examples/cli` ✅ (C-API client), `examples/server` ✅ (OpenAI serve
          on both the declared and the supplied config.
       3. **`test_ltx2_device`'s recorded GB10 baseline was 12/547; it is 13/547.**
          The env-gated shipped-checkpoint case is still COUNTED when it skips.
-         Assertions were right.
+         Assertions were right. **After this row it is 13/552 on GB10** — the F9
+         cross-backend bf16 arm adds exactly five assertions, and the CPU-backend
+         arm stays at its own 13/498.
       4. **"bit-identical" overstated the bf16 evidence.** What was measured is
          that both arms print the same max|diff| against the goldens at six
          significant figures, which is consistent with bit-identity and does not
@@ -1426,6 +1428,29 @@ Examples: `examples/cli` ✅ (C-API client), `examples/server` ✅ (OpenAI serve
          `vt::CreateQueue(Device)` and refuses an index with no registered
          backend, by name. Unreachable on single-GPU GB10, which is why it had to
          be fixed before a second device exists.
+    * **RE-VERIFIED ON GB10 2026-08-12 (row `LTX25-L8-FIX`), one `flock` hold,
+      2305 s of waiting behind a foreign holder.** The shipped vonkaiser FP8 DiT
+      (6124 tensors) staged in 185.9 s and one bf16 forward at 48 layers / inner
+      4096 / head_dim 128 ran device-resident in 0.42 s (SIZING ONLY, not a speed
+      result — spec §0). Output finite and non-degenerate: absmax video 0.300781,
+      audio 2.14062. `VT_OP_PROVIDER_STATS=1` on that run: **8 distinct ops on
+      device=1, all `vt-native`, ZERO `vt-cpu-ref` and ZERO `<none>`** — so the
+      forward is device-native and the reference tier never served it.
+      `test_ltx2_device` 13/552 SUCCESS.
+      **The CUDA `AttentionCross` tiling is now MUTATION-PROVED**, four mutants
+      built unlocked and executed inside the hold. Three are INVISIBLE to every
+      LTX-2.5 gate and caught only by `test_ops_attention_cross`: the bias read by
+      within-tile column instead of absolute key (5 cases red / device gate
+      SUCCESS), the GQA kv-head `h/(hq/hk)` replaced by `h%hk` (1 case red /
+      device gate SUCCESS — identical whenever `Hq == Hkv`, which is every
+      LTX-2.5 geometry, so it is invisible there BY CONSTRUCTION), and the
+      shared-memory limit raised so `ChooseTileCols` never halves (device gate
+      SUCCESS; the direct gate's assertion count DROPS 63 -> 59 because the
+      `d=128` f32 case throws on the launch — which CONFIRMS the halving's own
+      comment that a fixed 64-column tile fails "on exactly the real geometry").
+      The fourth, removing the online-softmax rescale, is caught by BOTH gates and
+      is recorded as such: the rescale runs at every KEY, not only at tile
+      boundaries, so it is not evidence about tiling.
     * **FOUND WHILE GATING THE ABOVE, and it is NOT an LTX-2.5 defect: the shared
       `DevicePool` is DEVICE-BLIND.** `vllm::Pool()` (device_pool.h) is a
       process-wide singleton whose free list is
