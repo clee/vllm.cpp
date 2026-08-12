@@ -58,6 +58,9 @@ vllm_cpp_add_test(test_minimax_h3 vllm/models/test_minimax_h3.cpp)
 vllm_cpp_add_test(test_minimax_h3_video_fold vllm/models/test_minimax_h3_video_fold.cpp)
 target_compile_definitions(test_minimax_h3_video_fold PRIVATE
   MINIMAX_H3_VIDEO_FOLD_FIXTURE_DIR="${CMAKE_SOURCE_DIR}/tests/vllm/models/fixtures/minimax_h3_video_fold")
+# LTX-2.5 DiT parity gate (row MODEL-DIFFUSION-LTX25, spec phase L2). The goldens
+# live next to the test source, like every other generated .inc.
+vllm_cpp_add_test(test_ltx2 vllm/models/test_ltx2.cpp)
 vllm_cpp_add_test(test_video_api vllm/entrypoints/openai/test_video_api.cpp)
 target_include_directories(test_model_registry PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_platform vllm/platforms/test_platform.cpp)
