@@ -1426,6 +1426,25 @@ Examples: `examples/cli` ✅ (C-API client), `examples/server` ✅ (OpenAI serve
          `vt::CreateQueue(Device)` and refuses an index with no registered
          backend, by name. Unreachable on single-GPU GB10, which is why it had to
          be fixed before a second device exists.
+    * **FOUND WHILE GATING THE ABOVE, and it is NOT an LTX-2.5 defect: the shared
+      `DevicePool` is DEVICE-BLIND.** `vllm::Pool()` (device_pool.h) is a
+      process-wide singleton whose free list is
+      `unordered_map<size_class, vector<void*>>` — the DEVICE is not part of the
+      key. So a block `cudaMalloc`ed for a CUDA-queue forward is handed straight
+      back to a CPU-backend `DBuf` of the same size class, and the CPU backend's
+      `Copy` is a host `memcpy` on a device pointer. MEASURED on GB10 2026-08-12:
+      SIGSEGV in `__memcpy_sve <- UploadStream <- PrepareStreamDev`, with
+      compute-sanitizer reporting ZERO device errors because the fault is
+      host-side. It had never been reachable because no test had run a bf16
+      CPU-backend device forward AFTER a bf16 CUDA one; at f32 the two arms land
+      in different size classes and never trade blocks. The pool already carries
+      exactly this invariant for STREAMS — `AuxPool()` exists because "two streams
+      sharing one pool BREAKS" its reuse ordering — and the fix used here is that
+      same sanctioned seam: the CPU arm runs under an `ActivePoolScope` with its
+      own pool. **The DEVICE half of the invariant is still unstated at the pool
+      itself, and a size-keyed device-blind free list in a multi-device process is
+      a trap for the next caller. Repairing it is a shared-hot-path change and is
+      owed as its own row, not this one.**
     * **OWED, and precisely:** (a) the prompt-K/V cache on the device path, which
       is REFUSED by name rather than ignored; (b) an FP4-RESIDENT arm — the
       `LinearDev` seam is one parameter away from the shared Marlin W4A16

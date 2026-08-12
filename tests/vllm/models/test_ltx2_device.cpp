@@ -43,6 +43,9 @@
 
 #include "support/max_abs_diff.h"
 #include "vllm/model_executor/model_loader/safetensors_reader.h"
+// For the CPU-backend arm's own scratch pool; see the CUDA-vs-host case for why
+// sharing the process-wide `Pool()` across two DEVICES is what crashed.
+#include "vllm/model_executor/models/device_pool.h"
 #include "vllm/model_executor/models/ltx2.h"
 #include "vllm/model_executor/models/ltx2_loader.h"
 #include "vt/backend.h"
@@ -591,11 +594,42 @@ TEST_CASE("ltx2 device: CUDA tracks the HOST forward, not just the golden") {
       Ltx2StageDitWeightsToDevice(q, p, set.views, vt::DType::kBF16);
   const vllm::Ltx2DitOutputs cuda_bf16 =
       Ltx2DitForwardDevice(q, p, staged_bf16.weights, &m.video, &m.audio, vt::DType::kBF16);
+
+  // THE CPU-BACKEND ARM NEEDS ITS OWN SCRATCH POOL, and this is not a style
+  // preference. `vllm::Pool()` is a process-wide singleton whose free list is
+  // keyed by SIZE CLASS ONLY (device_pool.h) — the device is not part of the
+  // key. So a block `cudaMalloc`ed for the CUDA arm three lines up is handed
+  // straight back to a CPU-backend `DBuf` of the same size class, and the CPU
+  // backend's `Copy` is a host `memcpy` on what is a device pointer.
+  //
+  // MEASURED, not theorised: without this scope the case SIGSEGVs on GB10 in
+  // `__memcpy_sve <- UploadStream <- PrepareStreamDev`, and compute-sanitizer
+  // reports ZERO device errors because the fault is host-side. It had never been
+  // reachable before, because no test had run a bf16 CPU-backend device forward
+  // AFTER a bf16 CUDA one — at f32 the two arms land in different size classes
+  // and never trade blocks.
+  //
+  // The pool already carries exactly this invariant for STREAMS: `AuxPool()`
+  // exists because "two streams sharing one pool BREAKS" its reuse ordering, and
+  // the remedy there is the same as here — a distinct execution context gets a
+  // distinct pool, via the `ActivePoolScope` seam the pool provides for it. What
+  // is NOT stated at the pool is the DEVICE half of the same invariant, and a
+  // size-keyed, device-blind free list shared by a multi-device process is a trap
+  // for the next caller rather than a property of this test. Recorded as owed;
+  // it is a shared hot path and repairing it is its own row, not this one.
+  //
+  // `cpu_pool` is declared BEFORE the buffers that draw from it: a `DBuf` returns
+  // its block to the pool it was built from, so that pool has to outlive it.
+  vllm::DevicePool cpu_pool;
   vt::Queue cpuq{Cpu(), nullptr};
-  const Ltx2DitDeviceWeights host_bf16 =
-      Ltx2StageDitWeightsToDevice(cpuq, p, set.views, vt::DType::kBF16);
-  const vllm::Ltx2DitOutputs cpu_bf16 = Ltx2DitForwardDevice(
-      cpuq, p, host_bf16.weights, &m.video, &m.audio, vt::DType::kBF16);
+  vllm::Ltx2DitOutputs cpu_bf16;
+  {
+    vllm::ActivePoolScope cpu_scope(&cpu_pool);
+    const Ltx2DitDeviceWeights host_bf16 =
+        Ltx2StageDitWeightsToDevice(cpuq, p, set.views, vt::DType::kBF16);
+    cpu_bf16 = Ltx2DitForwardDevice(cpuq, p, host_bf16.weights, &m.video, &m.audio,
+                                    vt::DType::kBF16);
+  }
   REQUIRE(cuda_bf16.video.size() == cpu_bf16.video.size());
   const double bv = MaxAbsDiff(cuda_bf16.video, cpu_bf16.video.data(), cpu_bf16.video.size());
   const double ba = MaxAbsDiff(cuda_bf16.audio, cpu_bf16.audio.data(), cpu_bf16.audio.size());
