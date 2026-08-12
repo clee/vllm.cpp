@@ -46,6 +46,7 @@
 #include "support/max_abs_diff.h"
 
 #include "ltx2_fp8_dit_manifest.inc"
+#include "ltx2_nvfp4_dit_manifest.inc"
 #include "ltx2_nvfp4_te_manifest.inc"
 #include "ltx2_quant_goldens.inc"
 
@@ -1257,6 +1258,71 @@ TEST_CASE("ltx2 loader: the producer discriminator, every row of the table") {
       open = what.find('\'', close + 1);
     }
   }
+}
+
+TEST_CASE("ltx2 loader: EVERY quantized module of the shipped NVFP4 DiT resolves alike") {
+  // The correlation gate proves ONE module decodes correctly. This proves the
+  // producer resolves the SAME way for all 1176 of them, straight off the real
+  // header — because "I sampled a few and they agreed" is how the linear-layout
+  // diagnosis got written in the first place.
+  REQUIRE(vllm_test::kLtx25Nvfp4DitTensorCount == 7876);
+  const std::string pre = vllm::kLtx2DitCheckpointPrefix;
+
+  // A name -> shape index over the manifest, so the scale lookup is not O(n^2).
+  std::map<std::string, const vllm_test::Ltx25Nvfp4DitTensor*> by_name;
+  for (const auto& t : vllm_test::kLtx25Nvfp4DitTensors) by_name[t.name] = &t;
+
+  int64_t packed = 0, markers = 0, scale2 = 0, input_scale = 0, resolved_prequant = 0;
+  int64_t padded_framing = 0, would_be_blocked = 0, ambiguous_with_linear = 0;
+  for (const auto& t : vllm_test::kLtx25Nvfp4DitTensors) {
+    const std::string name = t.name;
+    if (EndsWith(name, ".torchao_nvfp4")) ++markers;
+    if (EndsWith(name, ".weight_scale_2")) ++scale2;
+    if (EndsWith(name, ".input_scale")) ++input_scale;
+    if (std::string(t.dtype) != "U8") continue;
+    ++packed;
+    REQUIRE(t.rank == 2);
+    const int64_t out_features = t.shape[0];
+    const int64_t in_features = t.shape[1] * 2;  // TWO values per byte
+
+    const auto it = by_name.find(name + "_scale");
+    REQUIRE(it != by_name.end());
+    const std::vector<int64_t> scale_shape = ShapeOf(it->second->shape, it->second->rank);
+
+    // No marker ANYWHERE in this file, so every module takes the marker-less arm.
+    const vllm::Ltx2Nvfp4Producer p = vllm::Ltx2ResolveNvfp4Producer(
+        name, nullptr, scale_shape, out_features, in_features);
+    if (p == vllm::Ltx2Nvfp4Producer::kNvfp4Prequant) ++resolved_prequant;
+    if (scale_shape == vllm::Ltx2Nvfp4PaddedScaleShape(out_features, in_features)) {
+      ++padded_framing;
+    }
+    if (scale_shape == vllm::Ltx2Nvfp4ToBlockedScaleShape(out_features, in_features)) {
+      ++would_be_blocked;
+    }
+    // THE AMBIGUITY, counted rather than asserted in prose: for these geometries
+    // the padded framing IS the linear [N, K/16] shape, so a shape test alone
+    // could not have told swizzled from linear for a single one of them.
+    if (scale_shape == std::vector<int64_t>{out_features, in_features / 16}) {
+      ++ambiguous_with_linear;
+    }
+  }
+  INFO("packed=" << packed << " markers=" << markers << " scale2=" << scale2
+                 << " input_scale=" << input_scale << " prequant=" << resolved_prequant
+                 << " padded=" << padded_framing << " blocked=" << would_be_blocked
+                 << " ambiguous_with_linear=" << ambiguous_with_linear);
+  CHECK(packed == 1176);
+  // torchao ALWAYS writes its marker. Zero of them is what excludes torchao, and
+  // it is the whole basis of the marker-less arm.
+  CHECK(markers == 0);
+  CHECK(scale2 == 1176);
+  // W4A4-shaped export: the activation scales are present and UNUSED on this
+  // weight-only path, exactly as vLLM's W4A16 method discards them
+  // (modelopt.py:1264-1268).
+  CHECK(input_scale == 1176);
+  CHECK(resolved_prequant == 1176);
+  CHECK(padded_framing == 1176);
+  CHECK(would_be_blocked == 0);
+  CHECK(ambiguous_with_linear == 1176);
 }
 
 TEST_CASE("ltx2 loader: the two scale framings are the same buffer, differently dressed") {
