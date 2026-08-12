@@ -499,8 +499,27 @@ So at every other noise scale the conditioning differs, and the difference is in
 shape, finiteness or dtype check — it is a correct-looking render of subtly wrong conditioning.
 Following diffusers here would have been a silent divergence at every noise scale except one.
 
+**The divergence is LIVE in this project, not hypothetical.** L11's reviewer executed both
+compositions on shared tensors and a shared noise draw:
+
+| `noise_scale` | max abs diff, `ltx_core` vs diffusers |
+|---|---|
+| 1.0 | 2.38e-07 (f32 round-off — they agree) |
+| **0.909375** | **1.16e-01** |
+| 0.5 | 6.38e-01 |
+| 0.0 | 1.28e+00 |
+
+`ltx2_pipeline.cpp:1083` sets `stage2.noise_scale = Stage2DistilledSigmas().front()` =
+**0.909375**. So the distilled two-stage recipe — the one this campaign actually runs — sits
+exactly at a 1.16e-01 divergence, five orders above any golden tolerance and invisible to every
+shape and finiteness check.
+
 **We follow `ltx_core`**, and the port asserts the noisy tensor is byte-identical, so the
-choice is pinned rather than incidental. The reasoning: `ltx_core` is the model author's own
+choice is pinned rather than incidental. The reviewer's decisive argument is internal
+consistency: L5 already landed `Ltx2GaussianNoise` as a direct port of `noisers.py:30-37`, so
+adopting the diffusers write WITHOUT also replacing the noiser would double-apply the clean
+tokens and be strictly wrong. The two halves must come from one reference, and one of them is
+already landed. The reasoning: `ltx_core` is the model author's own
 runtime and is what loads this checkpoint family, and §3 already names it the immediate
 cross-check while vLLM-Omni access stays pending. This is recorded as a CHOICE with a reason,
 not as an unnoticed coincidence.
