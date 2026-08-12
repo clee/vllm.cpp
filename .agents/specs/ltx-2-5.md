@@ -640,9 +640,21 @@ its `SKIPPED` early-return and the suite reports:
 **That is indistinguishable from the defect being fixed**, and it arrives precisely when
 someone is hoping to see green. A skip that reads as a pass is worse than a failure.
 
-The fix is general: **guard a fixture on its input being present, and refuse-by-name as
-ENVIRONMENTAL when it is not.** A case that silently degrades to a skip is not a gate; it is a
-gate-shaped hole that opens whenever the environment breaks.
+**The rule, in the diagnosing agent's own formulation:** *a fixture that opts in on an
+environment variable must assert the resource it names is USABLE, not merely that the variable
+is SET.* `LTX2_SHIPPED_DIT` gates the case on `getenv() != nullptr`, so every downstream claim
+rests on a path nothing ever checked. Nothing lies — each layer does exactly what it says — but
+the composition manufactures the shape of a repair out of a broken mount.
+
+**`SKIPPED` is only honest when the operator CHOSE not to supply the resource, never when they
+supplied one that is gone.** An opt-in fixture therefore owes a readability check on its input
+and a refusal by name when that fails.
+
+**How narrowly this was missed, because the margin is the point.** The measurement hold ran
+22:31:12-22:55:34; the box went down at 23:18. Twenty minutes slower in the lock queue and the
+relaunch would have run against a dead mount and reported a clean green suite — and the most
+likely reading of that is "the red went away after a reboot", which is the worst possible
+conclusion to draw about an allocator bug that returns **wrong answers silently**.
 
 This is (a)/(c)'s pattern from a new direction. There the INSTRUMENT could not see the defect;
 here the instrument is fine and the ENVIRONMENT manufactures the shape of success. Both produce
