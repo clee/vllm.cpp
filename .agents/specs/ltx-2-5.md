@@ -557,7 +557,7 @@ S at prompt length and Tq in the thousands, straight into the untested regime.
 
 ## 7. Tests
 
-### 7.0 Three findings about the METHOD itself, and how they compound
+### 7.0 Four findings about the METHOD itself, and how they compound
 
 Recorded 2026-08-12. These came out of the L2/L3/L4 review rounds and they change what the
 evidence is evidence *of*. They matter to every future brick, not just LTX-2.5.
@@ -623,6 +623,32 @@ Same failure, different axis. A golden proves only what its inputs can distingui
 every brick ask: *what input would tell a correct implementation from a plausible wrong one,
 and does the fixture contain it?* Sweeping a parameter (step counts, scales, batch sizes)
 costs almost nothing and is what turns a golden from a witness into a gate.
+
+**(d) A BROKEN ENVIRONMENT can impersonate a repair.** Recorded 2026-08-13, from the #516
+diagnosis, and it is the variant with the worst timing.
+
+`test_ltx2_device`'s shipped-DiT case reads its checkpoint from `LTX2_SHIPPED_DIT`. If that
+path is unreadable — which on this project means simply that dgx rebooted and
+`mnt-nas_share.mount` lost its boot race again, as it has every single time — the case takes
+its `SKIPPED` early-return and the suite reports:
+
+```
+[doctest] test cases: 13 | 13 passed | 0 failed
+[doctest] Status: SUCCESS!
+```
+
+**That is indistinguishable from the defect being fixed**, and it arrives precisely when
+someone is hoping to see green. A skip that reads as a pass is worse than a failure.
+
+The fix is general: **guard a fixture on its input being present, and refuse-by-name as
+ENVIRONMENTAL when it is not.** A case that silently degrades to a skip is not a gate; it is a
+gate-shaped hole that opens whenever the environment breaks.
+
+This is (a)/(c)'s pattern from a new direction. There the INSTRUMENT could not see the defect;
+here the instrument is fine and the ENVIRONMENT manufactures the shape of success. Both produce
+a green that means nothing, and neither is visible in the summary line — which is why
+`Status:` alone is not sufficient evidence either. Ask additionally: *did this run actually
+execute the thing it claims to gate?*
 
 ### 7.1 Method
 
