@@ -328,3 +328,18 @@ declaration. With the `9.9.9` mutation applied, that assertion failed exactly
 with `9.9.9 != ${PROJECT_VERSION}`; after restoration it and the complete
 42-test release pipeline suite passed. Production CMake and runtime code remain
 unchanged by this follow-up.
+
+Issue #512 implementation makes the existing mandatory `Arguments` parameter
+explicitly accept an empty collection; argument splatting and the checked
+nonzero exit path are unchanged. The Windows `-ContractTest` path now invokes a
+temporary recording target once with zero arguments, invokes it with three
+literal nonempty arguments and checks each value, and requires an exit-23 child
+to be rejected. Before the production edit, the new focused contract failed on
+the missing `AllowEmptyCollection` declaration; the hosted exact-SHA failure
+above is the matching real-PowerShell RED execution. The local host has no
+PowerShell runtime, so execution of the new live process contract remains a
+required native Windows PR gate rather than being inferred from local Python.
+After the fix, Windows metadata passed 8/8, release pipeline passed 42/42, and
+both direct Windows portability and release-binary checkers passed. Removing
+`AllowEmptyCollection` made the focused contract red again, and both changed
+files were restored to their exact pre-mutation SHA-256 values.

@@ -99,6 +99,29 @@ class WindowsMetadataContract(unittest.TestCase):
         self.assertLess(contract, contract_exit)
         self.assertLess(contract_exit, environment)
 
+    def test_invoke_checked_contract_covers_empty_exact_and_failing_arguments(self) -> None:
+        script = (ROOT / "scripts/build-windows-release.ps1").read_text(encoding="utf-8")
+        helper_start = script.index("function Invoke-Checked {")
+        helper_end = script.index("\n}\n", helper_start) + len("\n}\n")
+        helper = script[helper_start:helper_end]
+        self.assertIn("[AllowEmptyCollection()][string[]]$Arguments", helper)
+        self.assertIn("& $Program @Arguments", helper)
+        self.assertIn("if ($LASTEXITCODE -ne 0)", helper)
+
+        contract_start = script.index("function Invoke-CheckedContractTests {")
+        contract_end = script.index("\n}\n", contract_start) + len("\n}\n")
+        contract = script[contract_start:contract_end]
+        for behavior in (
+            "zero-argument target",
+            "nonempty arguments",
+            "nonzero child exit",
+        ):
+            with self.subTest(behavior=behavior):
+                self.assertIn(behavior, contract)
+
+        dispatch = script[script.index("if ($ContractTest)"):]
+        self.assertEqual(dispatch.count("Invoke-CheckedContractTests"), 1)
+
     def test_pe_report_rejects_msys_debug_crt_and_developer_paths(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             args = self.fixture(Path(temporary), "cpu")
