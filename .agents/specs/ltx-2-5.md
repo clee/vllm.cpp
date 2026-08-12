@@ -352,6 +352,46 @@ All on `row/MODEL-DIFFUSION-LTX25`, one PR.
 
 ## 7. Tests
 
+### 7.0 Two findings about the METHOD itself, and how they compound
+
+Recorded 2026-08-12. These came out of the L2/L3/L4 review rounds and they change what the
+evidence is evidence *of*. They matter to every future brick, not just LTX-2.5.
+
+**(a) There is a CLASS of constants a reduced-dimension golden cannot see.** Not one
+constant, a class. Confirmed independently on two phases. An epsilon, a clamp bound or a
+normalize floor only becomes load-bearing in a regime the synthetic fixture never enters, so
+it can be changed — sometimes by 100x — with every golden still green:
+
+| Constant | Mutation that stayed GREEN | Why the fixture cannot reach it |
+|---|---|---|
+| video VAE `pixel_norm_eps` | 1e-8 -> 1e-6 | activations are O(1); the epsilons differ by ~1e-7 relative |
+| video VAE `norm_eps` | 1e-6 -> **1e-4** | same |
+| BWE mel log clamp | 1e-5 -> 1e-8 | `mel_basis` is built non-negative and well-scaled, so nothing saturates. **Real silence DOES saturate it in production** |
+| Snake/SnakeBeta `eps`, `_RMSNorm2D` floor | -> 0.0 | never divides by a zero-norm row |
+| text `range_ + eps` | -> 0.0 | only matters when a whole (batch, layer) slice is constant |
+| text `denom + eps` | -> 0.0 | only matters when `sequence_lengths == 0` |
+
+The repair is not "tighten the tolerance" — the tolerance is fine. It is a **source-anchored
+constant assertion** pinning the value against the upstream line it came from, plus, where
+feasible, a golden arm whose input actually enters the regime (L4 built one that attenuates
+`mel_basis` so all 384 bins saturate, and it catches the mutation numerically).
+
+**(b) Byte-identical goldens are NOT evidence that the oracle was right.** L4's repair tested
+this instead of assuming it: with a decoy `ltx_core` differing from upstream by ONE drifted
+constant, and path precedence defeated, the generator imported the decoy, **exited 0, and
+emitted goldens whose md5 was identical to the real ones**.
+
+That is (a) and (b) compounding. A drifted constant from the invisible class produces
+identical goldens, so "the goldens reproduce byte-for-byte" cannot distinguish the right
+oracle from a wrong one. Reproducibility proves determinism; it does not prove provenance.
+
+**Therefore every generator on this campaign owes two things, and they are separate:**
+assert the resolved `ltx_core.__file__` lives under the `--ltx2` checkout (identity), and
+record the upstream revision SHA in the emitted goldens (provenance). AGENTS.md already
+required the revision anchor; the identity assertion is what makes the anchor mean anything.
+
+### 7.1 Method
+
 Mirroring H3's method, which is what made its bricks trustworthy: upstream's modules are
 pure Python, so they are **executed at reduced dimensions on CPU** as the oracle, with both
 sides rebuilding weights and inputs from an identical deterministic stream so **no weight
