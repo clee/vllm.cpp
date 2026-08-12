@@ -123,10 +123,11 @@ comparison.
 ## Now
 
 Row is `ACTIVE` on `row/MODEL-GDN-OUTPUT-GATE-TYPE`. Implemented at `5da2e364`,
-reviewed independently (design confirmed correct and complete: all 13 non-test
-gated-RMSNorm constructions enumerated, no tail unwired, the fp8 `FusedRecipe`
-value-copy proven unable to alias the constexpr original), then repaired for the
-three findings that review returned. A second independent review returned
+reviewed independently (design confirmed correct and complete: all 13 literal
+`vt::RmsNormGatedArgs` constructions in model code enumerated, no tail unwired,
+the fp8 `FusedRecipe` value-copy proven unable to alias the constexpr original),
+then repaired for the three findings that review returned. A second independent
+review returned
 **PASS** — no mutation exposed wrong behavior — with three residual coverage and
 record-accuracy findings, closed at `3bd684cd`'s successor: the unfused bf16 tail
 is now gated by two `VT_GLUE_FUSE=0` CTest entries, the non-string config arm has
@@ -134,8 +135,10 @@ its own subcase, and the dim capture no longer prints `1`.
 
 Owed before `DONE`: the operator's own rerun of the row gate; the GPU arms this
 host cannot execute, **including the fp8 sigmoid polarity case that no backend
-has ever executed**; an issue tracking the promised widening of the refusal to a
-GDN-architecture check; and an `## Outcome` section.
+has ever executed**; and an `## Outcome` section. The promised widening of the
+refusal to a GDN-architecture check is now tracked by
+[#533](https://github.com/mudler/vllm.cpp/issues/533) as a scoped follow-up with
+its own test, so it is no longer owed here.
 
 ### What landed
 
@@ -157,11 +160,12 @@ contradicting `docs/USAGE.md`, which already shipped the refusal contract.
 The refusal is unconditional rather than gated on a GDN architecture, where
 upstream's assert lives. No known checkpoint carries the key outside the GDN
 family; if one appears, widening is a scoped follow-up with its own test.
-**That follow-up has no issue.** It is a deliberate divergence from upstream, not
-an oversight, but the promise to widen currently lives only in this paragraph and
-in the comment at `hf_config.cpp:458-462` — nothing tracks it, and nothing will
-surface it when the first non-GDN checkpoint carrying the key appears. Filing it
-is owed before `DONE`, per "every change starts from an issue".
+It is a deliberate divergence from upstream, not an oversight, and it is now
+tracked by [#533](https://github.com/mudler/vllm.cpp/issues/533). Before that
+issue existed the promise lived only in this paragraph and in the comment at
+`hf_config.cpp:458-462`, so nothing would have surfaced it when the first
+non-GDN checkpoint carrying the key appeared — a promise discharged by another
+promise, which is what "every change starts from an issue" exists to prevent.
 
 Each of the three tails carries FOUR gate-carrying constructions, not one: the
 fp8 `FusedChain` recipe copy, the fp8 direct `RmsNormGatedQuantFp8`, the
@@ -173,6 +177,29 @@ single run reaches at most one of the two bf16 arms. The row therefore registers
 `VT_GLUE_FUSE=0`, mirroring the per-lever re-run
 `test_dense_gateup_fused_marlin_off_*` and the precedent the fusion row itself
 set (`.agents/parity-ledger.md:112`).
+
+**Thirteen and twelve count different populations**, and both are exact.
+*Thirteen* is the literal `vt::RmsNormGatedArgs{...}` constructions in model
+code: the 9 in `qwen3_5.cpp` (`:3647`, `:3657`, `:3662`, `:4117`, `:4127`,
+`:4132`, `:4545`, `:4555`, `:4560`) plus Kimi-Linear's 4
+(`kimi_linear_device.cpp:735`, `:1040`, `:1473`, `:1945`). *Twelve* is this
+row's surface — the config-driven gate-carrying sites in the three Qwen3.5
+tails, 3 tails x 4 each: those same 9 literal constructions plus the 3
+`FusedRecipe` step-flag copies at `qwen3_5.cpp:3642`, `:4112`, `:4540`, which
+carry the gate without constructing a `RmsNormGatedArgs`.
+
+The two populations differ by exactly the 4 Kimi-Linear sites, which hardcode
+`/*sigmoid_gate=*/true` and never consult `HfConfig::output_gate_type` — KDA's
+output norm is sigmoid-gated at the call site, and models outside the GDN family
+are out of this row's scope by its own `## Scope`. Whether Kimi-Linear should
+resolve its gate from config too is a question for that model's own row; nothing
+here was checked against its upstream, and nothing here changes it. Separately,
+`RmsNormGatedArgs` is constructed twice more outside model code, at
+`src/vt/ops.cpp:952` and
+`:1057` — the `FusedChain` dispatcher rebuilding the args from the recipe's own
+step flag, not a call site anything resolves a config into. That is why the
+enumeration is bounded to model code rather than to "non-test", which would
+count 15.
 
 ### Evidence
 
@@ -266,7 +293,8 @@ UNRUN and owed at the operator's rerun. Two of those are worth naming, because
 neither is merely "the CUDA copy of something already gated":
 
 - **No fp8 gated-RMSNorm site has ever run the sigmoid arm, on any backend.**
-  Six of the twelve gate-carrying constructions are fp8
+  Six of the twelve gate-carrying constructions in the three Qwen3.5 tails
+  (the population disambiguated above) are fp8
   (`qwen3_5.cpp:3641-3647`, `4111-4117`, `4539-4545` — the `FusedChain` recipe
   copy and the direct `RmsNormGatedQuantFp8` in each tail). They need a populated
   `out_proj_fp8` and a CUDA device, so no CPU gate can reach them and no gate in
