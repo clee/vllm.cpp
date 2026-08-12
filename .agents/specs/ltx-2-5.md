@@ -114,7 +114,25 @@ K/V for all 48 blocks is computed once per request and reused for every denoise 
 
 This is a property of the checkpoint, not an optimization we invent, so it ships as the
 default path (AGENTS.md: parity enablers ship as defaults). L2 gates it by asserting the
-cached and recomputed paths are **bit-identical**, so the cache cannot silently diverge.
+cached and recomputed paths are **bit-identical**.
+
+**Correction, 2026-08-12 — the earlier claim here was too strong.** This section previously
+said the bit-identity gate meant the cache "cannot silently diverge". L2's fresh review
+disproved that, and the distinction is the whole point of the feature:
+
+- Against a changed **timestep**, the cache cannot diverge. That is the property the
+  checkpoint gives us, and it is real.
+- Against a changed **prompt**, it silently could. The gate ran the forward twice with
+  IDENTICAL inputs, so it only ever proved "same in, same out"; the cache carried no prompt
+  identity and its only validity check was on SIZE. A probe that swapped in a different
+  prompt of equal token count found the cache did not notice.
+
+The failure that implies is not academic: a pipeline or server reusing one cache across two
+requests whose prompts differ but tokenize to the same length renders the **second request
+with the first request's prompt**, with no error, no shape mismatch and no finiteness
+failure. The repair carries a content fingerprint on the cache and refuses by name on
+mismatch. Recorded rather than quietly amended, because "we gate that" was written here
+before it was true.
 
 ### 1.3 How this differs from MiniMax-H3
 
@@ -221,6 +239,23 @@ from main.
   phase unblocked while `-Diffusers` access is pending.
 
 Both are recorded per brick. Where they disagree, the disagreement is the finding.
+
+**BINDING-ORACLE PARITY IS PENDING FOR EVERY BRICK LANDED SO FAR** (recorded 2026-08-12, from
+L2's review). L1–L5 gate against the CROSS-CHECK (`ltx_core` executed at reduced dimensions),
+not against the binding oracle, because `Lightricks/LTX-2.5-Diffusers` access is still
+awaiting manual approval. That is legitimate under §3 and §6 and it is what "immediate
+cross-check" is for — but it must be stated, not left implicit. Concretely:
+
+| Axis | State |
+|---|---|
+| DiT / VAE / text-encoder parity vs `ltx_core` (cross-check) | gated, per-brick max abs diff recorded |
+| DiT / VAE / text-encoder parity vs vLLM-Omni (BINDING oracle) | **PENDING** on `-Diffusers` access |
+| Throughput vs vLLM's production configuration | **PENDING**, structurally, per §0 |
+
+`docs/BENCHMARKS.md` records only the SPEED axis as pending, which understates it; the
+correctness axis against the binding oracle is pending too. Neither is a failure, and neither
+is a pass. §3's instruction to "record the vllm-omni SHA inline with every golden" is
+therefore N/A so far rather than satisfied, and saying so is the point.
 
 **There is still no vllm-omni parity PIN** — `.agents/upstream-sync.md` covers the vLLM repo
 only. This spec inherits H3's open gap (model-matrix, H3 row: *"OPEN: there is no vllm-omni
