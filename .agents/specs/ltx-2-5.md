@@ -352,7 +352,7 @@ All on `row/MODEL-DIFFUSION-LTX25`, one PR.
 
 ## 7. Tests
 
-### 7.0 Two findings about the METHOD itself, and how they compound
+### 7.0 Three findings about the METHOD itself, and how they compound
 
 Recorded 2026-08-12. These came out of the L2/L3/L4 review rounds and they change what the
 evidence is evidence *of*. They matter to every future brick, not just LTX-2.5.
@@ -389,6 +389,35 @@ oracle from a wrong one. Reproducibility proves determinism; it does not prove p
 assert the resolved `ltx_core.__file__` lives under the `--ltx2` checkout (identity), and
 record the upstream revision SHA in the emitted goldens (provenance). AGENTS.md already
 required the revision anchor; the identity assertion is what makes the anchor mean anything.
+
+**(c) A FIXTURE that cannot separate right from wrong is the same defect, wearing different
+clothes.** Recorded 2026-08-12 from L5's review, and it is the sharpest instance so far.
+
+L5's `linspace` mirror — the two-sided walk that makes the last sigma land on EXACTLY 0 —
+was declared load-bearing in a comment and was **not gated at all**. Replacing it with a
+naive forward walk left 33 cases and 1512 assertions green. It is not cosmetic: for **23 of
+the first 198 step counts** the naive walk misses exact zero, and at `steps=41` a 5.96e-08
+terminal survives the `sigma == 0` guard, takes the shift transform, and displaces
+`last_non_zero`, moving the WHOLE schedule by 0.1 so the denoise loop never reaches zero
+noise. A plain `--steps 41` renders confidently and wrongly.
+
+It hid because the fixture exercises `steps in {8,6,5,1,4,7}` — every one of which the broken
+walk happens to get right.
+
+Two other instances from the same phase, both caught before landing:
+
+- The duration head's three arms collapsed to within 2.98e-06 at the fixture's scale, **below
+  the round-off bound**, so an implementation ignoring one input stream would have passed.
+  Widening the scale to 0.35 separates them by 4.9e-02.
+- A guider-refusal probe matrix omitted the `B=1` row, so a claim false at batch 1 — the
+  ordinary single-request shape — was recorded as a golden.
+
+**The generalization.** (a) is about a constant the fixture never drives into its active
+regime; (c) is about an INPUT the fixture never drives into the regime that discriminates.
+Same failure, different axis. A golden proves only what its inputs can distinguish, so for
+every brick ask: *what input would tell a correct implementation from a plausible wrong one,
+and does the fixture contain it?* Sweeping a parameter (step counts, scales, batch sizes)
+costs almost nothing and is what turns a golden from a witness into a gate.
 
 ### 7.1 Method
 
