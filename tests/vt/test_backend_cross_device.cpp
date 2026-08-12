@@ -522,15 +522,18 @@ TEST_CASE("ReshapeAndCache scatters into the KV cache BIT-EXACTLY") {
       }
     std::vector<float> ref_comb = combined;
     {
-      vt::Backend& cpu = vt::GetBackend(DeviceType::kCPU);
-      Queue cq = cpu.CreateQueue();
-      const Device cd{DeviceType::kCPU, 0};
-      std::vector<float> ck = knew, cv = vnew, cslots_f;
-      std::vector<int64_t> cslots = slots;
-      Tensor tk = Tensor::Contiguous(ck.data(), DType::kF32, cd, {kTokens, kHk, kD});
-      Tensor tv = Tensor::Contiguous(cv.data(), DType::kF32, cd, {kTokens, kHk, kD});
+      vt::Backend& unbound_cpu = vt::GetBackend(DeviceType::kCPU);
+      Queue unbound_queue = unbound_cpu.CreateQueue();
+      const Device unbound_device{DeviceType::kCPU, 0};
+      std::vector<float> unbound_k = knew, unbound_v = vnew, cslots_f;
+      std::vector<int64_t> unbound_slots = slots;
+      Tensor tk = Tensor::Contiguous(unbound_k.data(), DType::kF32, unbound_device,
+                                     {kTokens, kHk, kD});
+      Tensor tv = Tensor::Contiguous(unbound_v.data(), DType::kF32, unbound_device,
+                                     {kTokens, kHk, kD});
       Tensor tcomb =
-          Tensor::Contiguous(ref_comb.data(), DType::kF32, cd, {kBlocks * 2 * within});
+          Tensor::Contiguous(ref_comb.data(), DType::kF32, unbound_device,
+                             {kBlocks * 2 * within});
       auto slice = [&](int which) {
         Tensor t = tcomb;
         t.data = static_cast<char*>(t.data) +
@@ -546,10 +549,11 @@ TEST_CASE("ReshapeAndCache scatters into the KV cache BIT-EXACTLY") {
         t.stride[3] = 1;
         return t;
       };
-      Tensor tsm = Tensor::Contiguous(cslots.data(), DType::kI64, cd, {kTokens});
+      Tensor tsm = Tensor::Contiguous(unbound_slots.data(), DType::kI64, unbound_device,
+                                      {kTokens});
       Tensor tkc = slice(0), tvc = slice(1);
-      vt::ReshapeAndCache(cq, tk, tv, tkc, tvc, tsm);
-      cpu.DestroyQueue(cq);
+      vt::ReshapeAndCache(unbound_queue, tk, tv, tkc, tvc, tsm);
+      unbound_cpu.DestroyQueue(unbound_queue);
     }
 
     for (DeviceType dt : RegisteredDevices()) {

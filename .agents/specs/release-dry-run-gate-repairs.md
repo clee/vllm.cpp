@@ -565,3 +565,15 @@ the last two respectively timed out and reproduced `SIGABRT`. The mutated files
 were restored byte-for-byte. Linux also passes the socket behavior, but the
 native reset RED and final acceptance remain correctly pending the hosted
 Windows CPU and Vulkan lanes; this local result is not substituted for them.
+
+#### #540 implementation outcome
+
+Implementation evidence: the focused contract was red with all six old
+declarations present (12 subtest failures), then green after the nested locals
+were renamed to `unbound_cpu`, `unbound_queue`, `unbound_device`, `unbound_k`,
+`unbound_v`, and `unbound_slots`. Restoring each old declaration independently
+made its named contract checks red, with both source files restored to their
+recorded hashes afterwards. The 73-test Windows portability suite, direct
+Windows portability checker, and a clean CPU-only Release build and execution
+of `test_backend_cross_device` (19 cases, 6 assertions) passed. Native MSVC
+acceptance remains pending the hosted Windows CPU and Vulkan lanes.

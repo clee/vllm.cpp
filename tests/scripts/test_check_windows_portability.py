@@ -619,6 +619,38 @@ class WindowsPortabilityCheckerTest(unittest.TestCase):
         )
         self.assertIn("std::string_view::npos", source)
 
+    def test_unbound_flash_oracle_names_do_not_shadow_enclosing_oracle(self) -> None:
+        source = (REPO / "tests/vt/test_backend_cross_device.cpp").read_text(
+            encoding="utf-8"
+        )
+        start = source.index("// --- Unbind flash layout:")
+        end = source.index("for (DeviceType dt : RegisteredDevices())", start)
+        oracle = checker._cpp_structural_view(source[start:end])
+
+        declarations = {
+            "unbound_cpu": r"vt::Backend\s*&\s*unbound_cpu\s*=",
+            "unbound_queue": r"\bQueue\s+unbound_queue\s*=",
+            "unbound_device": r"\bDevice\s+unbound_device\s*\{",
+            "unbound_k": r"std::vector<float>\s+unbound_k\s*=",
+            "unbound_v": r"\bunbound_v\s*=",
+            "unbound_slots": r"std::vector<int64_t>\s+unbound_slots\s*=",
+        }
+        for name, declaration in declarations.items():
+            with self.subTest(name=name):
+                self.assertEqual(len(re.findall(declaration, oracle)), 1)
+
+        old_declarations = (
+            r"vt::Backend\s*&\s*cpu\s*=",
+            r"\bQueue\s+cq\s*=",
+            r"\bDevice\s+cd\s*\{",
+            r"std::vector<float>\s+ck\s*=",
+            r"\bcv\s*=",
+            r"std::vector<int64_t>\s+cslots\s*=",
+        )
+        for declaration in old_declarations:
+            with self.subTest(old_declaration=declaration):
+                self.assertNotRegex(oracle, declaration)
+
     def test_cross_device_fused_tier_environment_is_windows_portable(self) -> None:
         source = (REPO / "tests/vt/test_backend_cross_device.cpp").read_text(
             encoding="utf-8"
