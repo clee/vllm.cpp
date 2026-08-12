@@ -73,6 +73,10 @@ vllm_cpp_add_test(test_ltx2 vllm/models/test_ltx2.cpp)
 # dimensions. ltx2_vae_goldens.inc lives next to the test source.
 vllm_cpp_add_test(test_ltx2_vae vllm/models/test_ltx2_vae.cpp)
 target_include_directories(test_ltx2_vae PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
+# LTX-2.5 L3: the text conditioning path, gated against upstream ltx_core executed
+# at reduced dimensions. ltx2_text_goldens.inc lives next to the test source.
+vllm_cpp_add_test(test_ltx2_text_encoder vllm/models/test_ltx2_text_encoder.cpp)
+target_include_directories(test_ltx2_text_encoder PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
 # LTX-2.5 L5: the pipeline layer — sigma schedule, noiser, diffusion steps,
 # guidance, patchifiers, the recipe table, the latent spatial upsampler, the
 # duration head and the embeddings connector. ltx2_pipeline_goldens.inc lives
