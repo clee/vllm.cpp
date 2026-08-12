@@ -566,3 +566,91 @@ TEST_CASE("GDN merged FP8 qkvz resident is built pre-capture, at prepare") {
   CHECK_FALSE(static_cast<bool>(weights.layers[0].gdn.d_qkvz_fp8_alpha));
 }
 #endif
+
+namespace {
+
+// The gate ACTIVATION must reach the PAGED GDN tails, not just the eager one.
+//
+// Upstream qwen_gdn_linear_attn.py:452-464 @555967922 resolves
+// `output_gate_type` once per layer and hands it to RMSNormGated as
+// `activation=`; vt::RmsNormGatedArgs::sigmoid_gate is the same switch. Our
+// paged forward has TWO independently wired gated-RMSNorm tails --
+// GdnBlockPaged's shared tail and GdnBlockPagedMixedSpec's own -- so each is
+// driven here. Every gate checkpoint we own resolves to silu, so a silu-only
+// corpus cannot see either wiring being absent: the proof has to be that the
+// sigmoid arm MOVES the output.
+//
+// `mixed=false` runs the pure-prefill batch (GdnBlockPaged's tail);
+// `mixed=true` runs the spec+prefill batch (GdnBlockPagedMixedSpec's tail).
+void RunGateActivationCase(const GdnDims& g, bool mixed) {
+  setenv("VT_GDN_INDEXED_STATE_IO", "1", 1);  // mixed needs widened indexed IO
+  const int64_t H = 128;
+  const int Ts = 2, Tp = 3;
+  const int64_t T = mixed ? Ts + Tp : Tp;
+  const HfConfig silu = MakeConfig(g, H);
+  // MakeConfig never sets the key: the struct default IS the upstream default.
+  REQUIRE(silu.output_gate_type == "silu");
+  HfConfig sigmoid = MakeConfig(g, H);
+  sigmoid.output_gate_type = "sigmoid";
+
+  const GdnLayerWeights w = MakeGdnWeights(silu);
+  const int64_t Hv = g.hv, Dv = g.dv, Dk = g.dk, Kw = g.kw;
+  const int64_t key_dim = g.hk * Dk, value_dim = Hv * Dv;
+  const int64_t conv_dim = 2 * key_dim + value_dim;
+  const int64_t ssm_row = Hv * Dv * Dk;
+  const int64_t conv_len = (Kw - 1) + 1;  // widened spec row (k = 1)
+  const int64_t slots = 3;
+
+  std::vector<float> h(static_cast<size_t>(T * H));
+  for (size_t i = 0; i < h.size(); ++i) h[i] = RandV(5000 + i, -1.0f, 1.0f);
+  std::vector<float> ssm0(static_cast<size_t>(slots * ssm_row));
+  for (size_t i = 0; i < ssm0.size(); ++i) ssm0[i] = RandV(6000 + i, -0.5f, 0.5f);
+  std::vector<float> conv0(static_cast<size_t>(slots * conv_dim * conv_len), 0.0f);
+  for (int64_t s = 0; s < slots; ++s)
+    for (int64_t ch = 0; ch < conv_dim; ++ch)
+      for (int64_t j = 0; j < Kw - 1; ++j)
+        conv0[static_cast<size_t>((s * conv_dim + ch) * conv_len + j)] =
+            RandV(7000 + (s * conv_dim + ch) * (Kw - 1) + j, -1.0f, 1.0f);
+
+  const auto run = [&](const HfConfig& c) {
+    std::vector<float> ssm = ssm0, conv = conv0;
+    const GDNAttentionMetadata meta = mixed ? MixedMeta(Tp) : PrefillMeta(Tp, 2);
+    return vllm::GdnBlockPagedForTest(Q(vt::DeviceType::kCPU), w, c, h, meta, ssm,
+                                      conv, slots, conv_len, T);
+  };
+
+  const std::vector<float> silu_out = run(silu);
+  const std::vector<float> sigmoid_out = run(sigmoid);
+  REQUIRE(static_cast<int64_t>(silu_out.size()) == T * H);
+  REQUIRE(sigmoid_out.size() == silu_out.size());
+
+  double maxd = 0.0;
+  for (size_t i = 0; i < silu_out.size(); ++i)
+    maxd = std::max(maxd,
+                    std::abs(static_cast<double>(silu_out[i]) - sigmoid_out[i]));
+  CAPTURE(g.name);
+  CAPTURE(mixed);
+  CAPTURE(maxd);
+  CHECK(maxd > 0.0);
+
+  // The same arm twice is BIT-identical, so the delta above is the gate and not
+  // run-to-run noise.
+  const std::vector<float> silu_again = run(silu);
+  size_t bad = 0;
+  for (size_t i = 0; i < silu_out.size(); ++i)
+    if (std::memcmp(&silu_out[i], &silu_again[i], sizeof(float)) != 0) ++bad;
+  CAPTURE(bad);
+  CHECK(bad == 0);
+}
+
+}  // namespace
+
+TEST_CASE("GDN output_gate_type=sigmoid reaches GdnBlockPaged's gate (CPU)") {
+  RunGateActivationCase(kGate27B, /*mixed=*/false);
+  RunGateActivationCase(kGate35B, /*mixed=*/false);
+}
+
+TEST_CASE("GDN output_gate_type=sigmoid reaches the MIXED spec batch gate (CPU)") {
+  RunGateActivationCase(kGate27B, /*mixed=*/true);
+  RunGateActivationCase(kGate35B, /*mixed=*/true);
+}

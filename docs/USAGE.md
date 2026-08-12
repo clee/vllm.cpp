@@ -330,6 +330,24 @@ tokens quietly.
 This is a deliberate state, not a bug: registering the architecture is what lets
 the config parse and weight-name mapping be tested before the forward exists.
 
+### GDN checkpoints: the `output_gate_type` key
+
+A Gated DeltaNet checkpoint (the Qwen3.5 / Qwen3-Next family) chooses its
+output-gate activation in `config.json`:
+
+| `output_gate_type` | Gate applied |
+|---|---|
+| absent | `silu` — the upstream default |
+| `"silu"` or `"swish"` | `silu` — `swish` is an alias, collapsed at load |
+| `"sigmoid"` | `sigmoid` |
+
+The key is read from the **resolved text config**, so a flat text-only
+`config.json` and a multimodal wrapper that nests the text model under
+`text_config` behave identically. Any other value is **refused at load** with a
+message naming the key and the accepted set — never silently defaulted, because
+the wrong gate is a numerics change that still emits plausible tokens
+([#489](https://github.com/mudler/vllm.cpp/issues/489)).
+
 ### Muse Glimmer: exactly what has been checked
 
 `MuseGlimmerForCausalLM` / `MuseGlimmerForConditionalGeneration` are not in that

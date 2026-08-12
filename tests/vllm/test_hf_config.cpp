@@ -876,3 +876,120 @@ TEST_CASE("LoadHfConfig reads sibling generation_config.json eos ids") {
     CHECK(cfg.generation_config_eos_ids.empty());
   }
 }
+
+namespace {
+
+// GDN gate-activation fixtures. The text-model body is shared so the flat and
+// nested arms differ ONLY in where the key lives -- the exact confusion the
+// nested arm exists to catch.
+std::string GdnTextFields(const std::string& gate_entry) {
+  return std::string(R"(
+    "hidden_size": 2048,
+    "num_hidden_layers": 4,
+    "vocab_size": 151936,
+    "num_attention_heads": 16,
+    "num_key_value_heads": 2,
+    "head_dim": 256,
+    "layer_types": ["linear_attention", "linear_attention", "linear_attention",
+                    "full_attention"],
+    "intermediate_size": 5120,
+    "linear_num_key_heads": 16,
+    "linear_num_value_heads": 32,
+    "linear_key_head_dim": 128,
+    "linear_value_head_dim": 128,
+    "linear_conv_kernel_dim": 4,
+    "rms_norm_eps": 1e-06,
+    "max_position_embeddings": 262144)") +
+         gate_entry;
+}
+
+// A flat text-only checkpoint (Qwen3-Next layout): the key sits at top level.
+std::string FlatGdnJson(const std::string& gate_entry) {
+  return std::string(R"({
+    "model_type": "qwen3_5",
+    "architectures": ["Qwen3_5ForCausalLM"],)") +
+         "\n" + GdnTextFields(gate_entry) + "\n}";
+}
+
+// A composite VL wrapper (Qwen3_5MoeForConditionalGeneration layout): the key
+// sits inside `text_config`, and the wrapper level carries a DIFFERENT
+// (deliberately unrecognized) value that must never be read.
+std::string NestedGdnJson(const std::string& gate_entry) {
+  return std::string(R"({
+  "model_type": "qwen3_5_moe",
+  "architectures": ["Qwen3_5MoeForConditionalGeneration"],
+  "output_gate_type": "not_a_gate",
+  "text_config": {
+    "model_type": "qwen3_5_moe_text",)") +
+         "\n" + GdnTextFields(gate_entry) + "\n  }\n}";
+}
+
+const std::string kSilu = R"(,
+    "output_gate_type": "silu")";
+const std::string kSwish = R"(,
+    "output_gate_type": "swish")";
+const std::string kSigmoid = R"(,
+    "output_gate_type": "sigmoid")";
+const std::string kBogus = R"(,
+    "output_gate_type": "gelu")";
+
+}  // namespace
+
+// Ports vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py:452-456
+// @555967922:
+//   output_gate_type = getattr(config, "output_gate_type", "silu")
+//   if output_gate_type == "swish": output_gate_type = "silu"
+//   assert output_gate_type in ["silu", "swish", "sigmoid"]
+// Canonicalized at PARSE time (spec gdn-output-gate-type.md "Design"), so
+// HfConfig only ever holds "silu" or "sigmoid" and no call site can
+// reintroduce the default by forgetting to normalize. Upstream asserts on an
+// unrecognized value; we refuse at load with a message naming the key and the
+// accepted set rather than silently defaulting.
+TEST_CASE("LoadHfConfig normalizes the GDN output_gate_type") {
+  SUBCASE("absent key resolves to silu") {
+    TempJson f(kHybridJson);  // carries no output_gate_type
+    CHECK(vllm::LoadHfConfig(f.path()).output_gate_type == "silu");
+  }
+
+  SUBCASE("explicit silu stays silu") {
+    TempJson f(FlatGdnJson(kSilu));
+    CHECK(vllm::LoadHfConfig(f.path()).output_gate_type == "silu");
+  }
+
+  SUBCASE("swish collapses to silu, exactly as upstream") {
+    TempJson f(FlatGdnJson(kSwish));
+    CHECK(vllm::LoadHfConfig(f.path()).output_gate_type == "silu");
+  }
+
+  SUBCASE("sigmoid is preserved") {
+    TempJson f(FlatGdnJson(kSigmoid));
+    CHECK(vllm::LoadHfConfig(f.path()).output_gate_type == "sigmoid");
+  }
+
+  SUBCASE("an unrecognized value is refused, never silently defaulted") {
+    TempJson f(FlatGdnJson(kBogus));
+    CHECK_THROWS_WITH_AS(vllm::LoadHfConfig(f.path()),
+                         doctest::Contains("output_gate_type"),
+                         std::runtime_error);
+    CHECK_THROWS_WITH_AS(vllm::LoadHfConfig(f.path()),
+                         doctest::Contains("sigmoid"), std::runtime_error);
+  }
+
+  SUBCASE("the key is read from the RESOLVED text config, not the wrapper") {
+    TempJson f(NestedGdnJson(kSigmoid));
+    CHECK(vllm::LoadHfConfig(f.path()).output_gate_type == "sigmoid");
+
+    TempJson swish(NestedGdnJson(kSwish));
+    CHECK(vllm::LoadHfConfig(swish.path()).output_gate_type == "silu");
+
+    // The nested fixtures put "not_a_gate" on the WRAPPER: reading the top-level
+    // doc instead of the resolved text config would throw here.
+    TempJson absent(NestedGdnJson(""));
+    CHECK(vllm::LoadHfConfig(absent.path()).output_gate_type == "silu");
+  }
+
+  SUBCASE("a nested unrecognized value is still refused") {
+    TempJson f(NestedGdnJson(kBogus));
+    CHECK_THROWS_AS(vllm::LoadHfConfig(f.path()), std::runtime_error);
+  }
+}

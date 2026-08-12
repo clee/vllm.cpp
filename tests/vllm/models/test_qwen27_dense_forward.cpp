@@ -528,3 +528,54 @@ TEST_CASE("qwen27 dense forward: merged qkvz owner equals split raw-NK fields") 
     maxd = std::max(maxd, std::abs(static_cast<double>(base[i]) - got[i]));
   CHECK(maxd == 0.0);
 }
+
+// The gate ACTIVATION must reach the kernel, not just the config struct.
+//
+// Upstream qwen_gdn_linear_attn.py:452-464 @555967922 resolves
+// `output_gate_type` and hands it to RMSNormGated as `activation=`; our
+// vt::RmsNormGatedArgs::sigmoid_gate is the same switch. Every gate checkpoint
+// we own today resolves to silu, so a silu-only corpus cannot see this wiring
+// being absent -- a config-field assertion would pass with the model layer
+// still hard-coding silu. This drives the sigmoid arm through the real dense
+// forward (GdnBlock -> vt::RmsNormGated) and requires the logits to MOVE.
+//
+// Sensitivity note: silu(z) = z*sigmoid(z) and sigmoid(z) differ for every
+// z != 1, and the synthetic z gate spans a non-degenerate range, so the two
+// arms cannot coincide by construction.
+TEST_CASE("qwen27 dense forward: output_gate_type=sigmoid reaches the GDN gate") {
+  const HfConfig silu = MakeConfig();
+  // The struct default is the upstream default; MakeConfig never sets it.
+  REQUIRE(silu.output_gate_type == "silu");
+  HfConfig sigmoid = MakeConfig();
+  sigmoid.output_gate_type = "sigmoid";
+
+  const Qwen3_5DenseWeights w = MakeWeights(silu);
+  vt::Queue q = Q();
+  const std::vector<int32_t> ids = {5, 9, 2, 31, 17, 3};
+  const std::vector<int32_t> pos = {0, 1, 2, 3, 4, 5};
+
+  const std::vector<float> silu_logits =
+      Qwen3_5DenseModel::ForwardDense(ids, pos, w, silu, q);
+  const std::vector<float> sigmoid_logits =
+      Qwen3_5DenseModel::ForwardDense(ids, pos, w, sigmoid, q);
+  REQUIRE(sigmoid_logits.size() == silu_logits.size());
+
+  double maxd = 0.0;
+  for (size_t i = 0; i < silu_logits.size(); ++i) {
+    CHECK(std::isfinite(sigmoid_logits[i]));
+    maxd = std::max(maxd,
+                    std::abs(static_cast<double>(silu_logits[i]) - sigmoid_logits[i]));
+  }
+  MESSAGE("silu vs sigmoid GDN gate moved logits by max|diff| = " << maxd);
+  CHECK(maxd > 0.0);
+
+  // Same config twice is deterministic: the difference above is the gate, not
+  // run-to-run noise.
+  const std::vector<float> silu_again =
+      Qwen3_5DenseModel::ForwardDense(ids, pos, w, silu, q);
+  double repeat = 0.0;
+  for (size_t i = 0; i < silu_logits.size(); ++i)
+    repeat = std::max(repeat,
+                      std::abs(static_cast<double>(silu_logits[i]) - silu_again[i]));
+  CHECK(repeat == 0.0);
+}
