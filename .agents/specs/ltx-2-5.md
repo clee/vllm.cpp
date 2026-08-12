@@ -205,8 +205,14 @@ plus two H3-specific fields (`partition` = fl2va/ref2va, and H3's 50-step defaul
 **L1 introduces `vllm::multimodal::VideoEngine`**, an abstract seam with a
 checkpoint-detected registry, and moves H3 behind it **unchanged**. Per AGENTS.md
 §"Shared seams", a capability not reachable through the shared surface is not done, and new
-models are additive files. ABI goes to **v13 by ADDING fields only** — v12 callers keep
+models are additive files. ABI goes to **v18 by ADDING fields only** — v12 video callers keep
 working byte-identically, which the existing `test_capi` v12 section already guards.
+
+**Correction, 2026-08-11.** Earlier revisions of this section said "v13". That was wrong: it
+read the VIDEO SLICE's own v12 label as if it were the ABI counter, when `VLLM_ABI_VERSION`
+was already **17** and v13 shipped long ago as `vllm_complete_tokens`. The additive
+requirement was always the real one and is unchanged; only the number moves, 17 -> 18. L1
+found this while implementing, which is the delegation loop working as intended.
 
 Reuse is the point. Already ours and shared, not re-implemented: the flow-matching denoise
 loop, AdaLN block plumbing, 3D RoPE construction, VAE CNN infrastructure
@@ -225,7 +231,7 @@ All on `row/MODEL-DIFFUSION-LTX25`, one PR.
 | Phase | Scope | Gate |
 |---|---|---|
 | **L0** | This spec; issue #435; checkpoint inventory; oracle stand-up | spec committed |
-| **L1** | `VideoEngine` interface + registry; H3 behind it unchanged; ABI v13 additive | H3 frames+WAV **byte-identical** to pre-refactor on the committed fold fixture; v12 `test_capi` green |
+| **L1** | `VideoEngine` interface + registry; H3 behind it unchanged; ABI v18 additive | H3 frames+WAV **byte-identical** to pre-refactor on the committed fold fixture; v12 `test_capi` green |
 | **L2** | DiT layout + forward: dual stream, gated attn, AV cross-attn, split/interleaved RoPE, prompt-KV cache | reduced-dim CPU parity vs upstream modules; cached vs recomputed prompt K/V **bit-identical** |
 | **L3** | Gemma-4 12B TE + caption projections (4096 video / 2048 audio) | parity vs upstream TE; reuses `gemma4.cpp` |
 | **L4** | Conv video VAE + audio VAE + vocoder | per-brick parity vs upstream decoders |
