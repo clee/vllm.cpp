@@ -1208,16 +1208,69 @@ Examples: `examples/cli` ✅ (C-API client), `examples/server` ✅ (OpenAI serve
       `swizzle_blockscale` — vLLM's other two writings of the same permutation —
       are pinned by source fragment only. Neither can execute on this host (no
       active Triton driver; `swizzle_blockscale` calls `.cuda()` unconditionally),
-      so running them needs a GPU host. Also owed: Lightricks' first-party
-      NVFP4 DiT (`ltx-2.5-22b-distilled-transformer-nvfp4.safetensors`, 18.72 GB)
-      is behind an un-accepted HF gate (HTTP 403) and was NOT downloaded, so the
-      NVFP4 **DiT** arm is gated on a synthetic file whose header mirrors the real
-      layout; and the torchao arm of the Gemma TOWER itself (`Gemma4Weights`) is not
+      so running them needs a GPU host. **CLOSED at L7 (2026-08-12):** Lightricks'
+      first-party NVFP4 DiT
+      (`ltx-2.5-22b-distilled-transformer-nvfp4.safetensors`, 18.72 GB) was behind
+      an un-accepted HF gate when this was written and is now on the NAS; the
+      SHIPPED file's own header is read by
+      `tests/vllm/multimodal/test_ltx2_video.cpp` (`LTX2_CHECKPOINT_ROOT`), which
+      resolves it onto the L2 contract and checks its declared config against the
+      shape-derived one. Still owed: the torchao arm of the Gemma TOWER itself
+      (`Gemma4Weights`) is not
       wired — `ltx2_text_encoder.h` declares no tower contract, so L6 loads the two
       caption projections, the asset pack and the geometry, and VALIDATES every
       tower module without materializing it.
     * **Spec:** [ltx-2.5 spec](specs/ltx-2-5.md) §1.4 and §6 (L6). Lifecycle:
       shipped (host + load-time device staging). Owner: the LTX-2.5 row.
+
+19. **LTX-2.5 phase L7 — the family behind `vllm::multimodal::VideoEngine`, and
+    the driving loop.**
+    * **Upstream source:** Lightricks/LTX-2 @ `fd4ded7`,
+      `packages/ltx-pipelines/src/ltx_pipelines/` — `distilled.py:186-300`
+      (`DistilledPipeline.__call__`), `utils/blocks.py:500-582`
+      (`DiffusionStage.__call__`) and `:212-235` (`_build_state`),
+      `utils/samplers.py:39-79` (`euler_denoising_loop`) and `:488-558` (the
+      ancestral driver), `utils/helpers.py:428-447` (`create_noised_state`),
+      `:462-464` (`post_process_latent`), `:466-503`
+      (`modality_from_latent_state`, `timesteps_from_mask`),
+      `utils/denoisers.py:214-252` (`SimpleDenoiser`); plus `packages/ltx-core`
+      `model/transformer/model.py:590-604` (`X0Model.forward`), `utils.py:38-50`
+      (`to_denoised`), `types.py:70,108-123,164-200` (the scale factors and both
+      latent-shape derivations), `tools.py:139-184` / `:246-280` (the two
+      `LatentTools`), and the four configurators
+      (`video_vae/model_configurator.py:21-24,81-94,255-265`,
+      `audio_vae/model_configurator.py:13-39,49-88,108-141,184-190`,
+      `upsampler/model_configurator.py:12-30`).
+    * **Written from scratch**, and recorded as such: the noise STREAM. Upstream
+      draws from a seeded `torch.Generator`; reproducing torch's stream
+      bit-exactly decides WHICH sample comes out, not whether the pipeline is
+      right, so `SplitMixGaussian` is a documented splitmix64 + Box-Muller source
+      drawn in upstream's own ORDER (video before audio, one draw per state per
+      step) and is NOT torch's. Same call MiniMax-H3 made
+      (`minimax_h3.h:1895-1897`). The cost is stated where it is taken: a clip
+      rendered here is a different sample from the same distribution, so it is
+      not comparable to an upstream render frame by frame, and sample-level
+      comparison needs the noise supplied from outside.
+    * **Local anchor:** `include/vllm/multimodal/ltx2_video.h`,
+      `src/vllm/multimodal/ltx2_video.cpp`; the loaders it needed are
+      `Ltx2LoadVaeWeights`, the three `SDOps` key-rule sets and the four config
+      parsers in `ltx2_loader.{h,cpp}`.
+    * **Tests and evidence:** `tests/vllm/multimodal/test_ltx2_video.cpp` —
+      registration, detection by tensor name (prefixed and de-prefixed), a
+      STRUCTURAL e2e over a reduced-dimension checkpoint set written in the
+      shipped file format, the same generation driven through `include/vllm.h`
+      alone, every refusal by name, and the shipped Lightricks checkpoints when
+      `LTX2_CHECKPOINT_ROOT` is set.
+    * **OWED, and precisely:** (a) the forward on an accelerator — L2's forward
+      is f32-only and L6's staging is bf16, so `device = 1` is REFUSED by name
+      rather than served by the CPU path; (b) the Gemma-4 tower, so a PROMPT
+      cannot be encoded and conditioning is prompt-embeds only; (c) image /
+      keyframe / reference conditioning, which needs the video VAE's ENCODER;
+      (d) the full-scale render, which at 21.00B needs ~76 GB of f32 weights and
+      ~2.6e14 FLOPs per denoise step; (e) parity against the BINDING oracle and
+      any speed number, both structurally pending per the spec's §0 and §3.
+    * **Spec:** [ltx-2.5 spec](specs/ltx-2-5.md) §5 and §6 (L7). Lifecycle:
+      shipped (CPU, structural e2e). Owner: the LTX-2.5 row.
 
 ## 10. E2E test suites (T0 deliverable)
 

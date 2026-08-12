@@ -703,4 +703,375 @@ Ltx2TextEncoderWeights Ltx2WidenTextProjectionsToF32(
   return out;
 }
 
+// ---------------------------------------------------------------------------
+// The VAEs, the upsampler and the duration head (phase L7)
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// `config.get(key, fallback)`, refusing a present-but-wrong-typed value rather
+// than falling back to the default. A checkpoint that says
+// `"patch_size": "4"` means something; treating it as absent silently builds a
+// decoder for a different latent grid.
+template <typename T>
+T ConfigGet(const nlohmann::json& config, const std::string& key, T fallback,
+            const std::string& where) {
+  const auto it = config.find(key);
+  if (it == config.end() || it->is_null()) return fallback;
+  try {
+    return it->get<T>();
+  } catch (const std::exception&) {
+    Fail("'" + where + "." + key + "' is present but not the expected type (" + it->dump() + ")");
+  }
+}
+
+// `check_config_value` (ltx_core/utils.py:15-18): the exact assertion upstream
+// makes, with the same expectation, so a checkpoint upstream would refuse is
+// refused here too instead of being built into a plausible wrong model.
+void CheckConfigValue(const nlohmann::json& config, const std::string& key,
+                      const nlohmann::json& expected, const std::string& where) {
+  const auto it = config.find(key);
+  const nlohmann::json actual = it == config.end() ? nlohmann::json() : *it;
+  if (actual != expected) {
+    Fail("config value " + where + "." + key + " is " + actual.dump() + ", expected " +
+         expected.dump() + " (check_config_value, audio_vae/model_configurator.py:61-66)");
+  }
+}
+
+const nlohmann::json& ConfigObject(const nlohmann::json& parent, const std::string& key,
+                                   const std::string& where) {
+  static const nlohmann::json kEmpty = nlohmann::json::object();
+  const auto it = parent.find(key);
+  if (it == parent.end() || it->is_null()) return kEmpty;
+  if (!it->is_object()) Fail("'" + where + "." + key + "' is not a JSON object");
+  return *it;
+}
+
+Ltx2NormLayer ParseNormLayer(const std::string& name) {
+  // NormLayerType (video_vae/enums.py). `group_norm` and `pixel_norm` are the
+  // two the ConvVideoDecoder builds; anything else is a checkpoint this port has
+  // never seen, and mapping it onto the nearest one would normalize with the
+  // wrong statistics everywhere.
+  if (name == "pixel_norm") return Ltx2NormLayer::kPixelNorm;
+  if (name == "group_norm") return Ltx2NormLayer::kGroupNorm;
+  Fail("vae.norm_layer is '" + name + "'; only 'pixel_norm' and 'group_norm' are ported");
+}
+
+Ltx2PaddingMode ParsePaddingMode(const std::string& name) {
+  if (name == "zeros") return Ltx2PaddingMode::kZeros;
+  if (name == "reflect") return Ltx2PaddingMode::kReflect;
+  if (name == "replicate") return Ltx2PaddingMode::kReplicate;
+  Fail("vae.spatial_padding_mode is '" + name +
+       "'; only 'zeros', 'reflect' and 'replicate' are ported");
+}
+
+Ltx2NormType ParseAudioNormType(const std::string& name) {
+  if (name == "pixel") return Ltx2NormType::kPixel;
+  if (name == "group") return Ltx2NormType::kGroup;
+  Fail("audio_vae ddconfig.norm_type is '" + name + "'; only 'pixel' and 'group' are ported");
+}
+
+Ltx2CausalityAxis ParseCausalityAxis(const std::string& name) {
+  // causality_axis.py:4-10.
+  if (name == "none") return Ltx2CausalityAxis::kNone;
+  if (name == "width") return Ltx2CausalityAxis::kWidth;
+  if (name == "height") return Ltx2CausalityAxis::kHeight;
+  if (name == "width_compatibility") return Ltx2CausalityAxis::kWidthCompatibility;
+  Fail("audio_vae ddconfig.causality_axis is '" + name + "'; it is not one of the four");
+}
+
+// `[["res_x", {"num_layers": 4}], ["compress_space", {"multiplier": 2}], ...]`
+// — the pair form every shipped LTX-2 VAE config uses
+// (video_vae/video_vae.py `_make_decoder_block` reads exactly these keys).
+std::vector<Ltx2VideoDecoderBlock> ParseDecoderBlocks(const nlohmann::json& blocks) {
+  if (!blocks.is_array()) Fail("vae.decoder_blocks is not an array");
+  std::vector<Ltx2VideoDecoderBlock> out;
+  for (const nlohmann::json& entry : blocks) {
+    if (!entry.is_array() || entry.size() != 2 || !entry[0].is_string() || !entry[1].is_object()) {
+      Fail("a vae.decoder_blocks entry is not a [name, {params}] pair: " + entry.dump());
+    }
+    Ltx2VideoDecoderBlock block;
+    block.name = entry[0].get<std::string>();
+    const nlohmann::json& params = entry[1];
+    block.num_layers = ConfigGet<int64_t>(params, "num_layers", 1, "decoder_block");
+    // 0 is the sentinel `Ltx2VideoDecoderBlock` documents for "the upstream
+    // default for this block kind", so an ABSENT multiplier must stay 0 rather
+    // than becoming 1 and quietly halving res_x_y's width.
+    block.multiplier = ConfigGet<int64_t>(params, "multiplier", 0, "decoder_block");
+    block.inject_noise = ConfigGet<bool>(params, "inject_noise", false, "decoder_block");
+    block.residual = ConfigGet<bool>(params, "residual", false, "decoder_block");
+    out.push_back(std::move(block));
+  }
+  if (out.empty()) Fail("vae.decoder_blocks is empty; there is no decoder to build");
+  return out;
+}
+
+Ltx2VocoderConfig ParseVocoderArm(const nlohmann::json& cfg, const std::string& where,
+                                  int64_t output_sampling_rate, bool apply_final_activation,
+                                  const std::string& prefix) {
+  // `_vocoder_from_config` (audio_vae/model_configurator.py:13-39).
+  Ltx2VocoderConfig out;
+  out.resblock_kernel_sizes =
+      ConfigGet<std::vector<int64_t>>(cfg, "resblock_kernel_sizes", {3, 7, 11}, where);
+  out.upsample_rates = ConfigGet<std::vector<int64_t>>(cfg, "upsample_rates", {6, 5, 2, 2, 2}, where);
+  out.upsample_kernel_sizes =
+      ConfigGet<std::vector<int64_t>>(cfg, "upsample_kernel_sizes", {16, 15, 8, 4, 4}, where);
+  out.resblock_dilation_sizes = ConfigGet<std::vector<std::vector<int64_t>>>(
+      cfg, "resblock_dilation_sizes", {{1, 3, 5}, {1, 3, 5}, {1, 3, 5}}, where);
+  out.upsample_initial_channel =
+      ConfigGet<int64_t>(cfg, "upsample_initial_channel", 1024, where);
+  // The two ARM selectors. The BWE branch has already asserted both are
+  // "AMP1"/"snakebeta" through check_config_value, so these reads cannot
+  // disagree with that assertion — they are here so the config, not a default,
+  // is what sets them.
+  out.amp = ConfigGet<std::string>(cfg, "resblock", "1", where) == "AMP1";
+  out.snakebeta = ConfigGet<std::string>(cfg, "activation", "snake", where) == "snakebeta";
+  out.use_tanh_at_final = ConfigGet<bool>(cfg, "use_tanh_at_final", true, where);
+  out.apply_final_activation = apply_final_activation;
+  out.use_bias_at_final = ConfigGet<bool>(cfg, "use_bias_at_final", true, where);
+  out.output_sampling_rate = output_sampling_rate;
+  out.prefix = prefix;
+  return out;
+}
+
+}  // namespace
+
+nlohmann::json Ltx2ReadCheckpointConfig(const SafetensorsFile& file) {
+  const std::map<std::string, std::string>& meta = file.Metadata();
+  const auto it = meta.find("config");
+  if (it == meta.end()) {
+    Fail(
+        "the checkpoint carries no __metadata__[\"config\"]. Every shipped LTX-2.5 VAE, "
+        "upsampler and duration head embeds its own config there, and upstream reads it "
+        "from the same place (video_vae/model_configurator.py:21-24). Refusing rather than "
+        "assuming a geometry: a VAE built to the wrong config decodes a finite, "
+        "correctly shaped, WRONG picture.");
+  }
+  nlohmann::json parsed;
+  try {
+    parsed = nlohmann::json::parse(it->second);
+  } catch (const std::exception& e) {
+    Fail(std::string("__metadata__[\"config\"] is not readable JSON: ") + e.what());
+  }
+  if (!parsed.is_object()) Fail("__metadata__[\"config\"] is not a JSON object");
+  return parsed;
+}
+
+std::string Ltx2ReadCheckpointModelVersion(const SafetensorsFile& file) {
+  const std::map<std::string, std::string>& meta = file.Metadata();
+  const auto it = meta.find("model_version");
+  return it == meta.end() ? std::string() : it->second;
+}
+
+std::vector<Ltx2VaeKeyRule> Ltx2VideoVaeDecoderKeyRules() {
+  return {
+      {"vae.decoder.", ""},
+      {"vae.per_channel_statistics.", "per_channel_statistics."},
+      {"decoder.", ""},
+      {"per_channel_statistics.", "per_channel_statistics."},
+  };
+}
+
+std::vector<Ltx2VaeKeyRule> Ltx2AudioVaeDecoderKeyRules() {
+  return {
+      {"audio_vae.decoder.", ""},
+      {"audio_vae.per_channel_statistics.", "per_channel_statistics."},
+  };
+}
+
+std::vector<Ltx2VaeKeyRule> Ltx2VocoderKeyRules() { return {{"vocoder.", ""}}; }
+
+Ltx2VaeWeights Ltx2LoadVaeWeights(const SafetensorsFile& file,
+                                  const std::vector<Ltx2VaeKeyRule>& rules) {
+  Ltx2VaeWeights out;
+  for (const std::string& name : file.Names()) {
+    std::string key = name;
+    if (!rules.empty()) {
+      const Ltx2VaeKeyRule* matched = nullptr;
+      for (const Ltx2VaeKeyRule& rule : rules) {
+        if (StartsWith(name, rule.match_prefix)) {
+          matched = &rule;
+          break;
+        }
+      }
+      if (matched == nullptr) continue;  // upstream's filters drop it too
+      key = matched->replacement + name.substr(matched->match_prefix.size());
+    }
+    // A COLLISION IS NOT A LAST-WRITE-WINS. Two file names rewriting onto one
+    // module name means the rule set is wrong for this checkpoint, and taking
+    // either tensor binds half a model to the other half's weights.
+    if (out.tensors.count(key) != 0) {
+      Fail("'" + name + "' rewrites onto '" + key +
+           "', which another tensor already claimed; the key rules do not fit this checkpoint");
+    }
+    const StTensor& t = file.Get(name);
+    int64_t numel = 1;
+    for (const int64_t d : t.shape) numel *= d;
+    std::vector<float> values(static_cast<size_t>(numel));
+    if (t.dtype == "BF16") {
+      if (t.nbytes != static_cast<size_t>(numel) * sizeof(uint16_t)) {
+        Fail("'" + name + "' declares " + std::to_string(t.nbytes) +
+             " BF16 bytes but its shape needs " +
+             std::to_string(static_cast<size_t>(numel) * sizeof(uint16_t)));
+      }
+      const uint16_t* src = reinterpret_cast<const uint16_t*>(t.data);
+      for (int64_t i = 0; i < numel; ++i) values[static_cast<size_t>(i)] = Bf16ToF32(src[i]);
+    } else if (t.dtype == "F32") {
+      if (t.nbytes != static_cast<size_t>(numel) * sizeof(float)) {
+        Fail("'" + name + "' declares " + std::to_string(t.nbytes) +
+             " F32 bytes but its shape needs " +
+             std::to_string(static_cast<size_t>(numel) * sizeof(float)));
+      }
+      std::memcpy(values.data(), t.data, t.nbytes);
+    } else {
+      Fail("'" + name + "' is " + t.dtype +
+           "; the shipped VAE, upsampler and duration-head checkpoints are BF16/F32 and a "
+           "quantized one would need its scale sidecars read, not its bytes reinterpreted");
+    }
+    out.tensors.emplace(std::move(key), std::move(values));
+  }
+  if (out.tensors.empty()) Fail("no tensor in the checkpoint matched the key rules");
+  return out;
+}
+
+Ltx2ConvVideoDecoderConfig Ltx2ParseConvVideoDecoderConfig(const nlohmann::json& config,
+                                                            Ltx2VideoDecoderKind* out_kind) {
+  const nlohmann::json& vae = ConfigObject(config, "vae", "config");
+  if (vae.empty()) Fail("the video VAE config carries no 'vae' object");
+  // `_vae_class_name_from_metadata` (video_vae/model_configurator.py:21-24): the
+  // DEFAULT is the conv class, so a file that omits the key reads as conv —
+  // upstream's own rule, kept rather than tightened.
+  const std::string class_name =
+      ConfigGet<std::string>(vae, "_class_name", "CausalVideoAutoencoder", "vae");
+  if (out_kind != nullptr) *out_kind = Ltx2ParseVideoDecoderKind(class_name);
+
+  Ltx2ConvVideoDecoderConfig out;
+  // `_build_conv_video_decoder` (video_vae/model_configurator.py:81-94), key for
+  // key. `dims` is asserted rather than stored: this port is 3-D only, and a 2-D
+  // checkpoint would need a different convolution everywhere.
+  const int64_t dims = ConfigGet<int64_t>(vae, "dims", 3, "vae");
+  if (dims != 3) Fail("vae.dims is " + std::to_string(dims) + "; only the 3-D decoder is ported");
+  out.in_channels = ConfigGet<int64_t>(vae, "latent_channels", 128, "vae");
+  out.out_channels = ConfigGet<int64_t>(vae, "out_channels", 3, "vae");
+  out.decoder_blocks = ParseDecoderBlocks(vae.contains("decoder_blocks")
+                                              ? vae.at("decoder_blocks")
+                                              : nlohmann::json::array());
+  out.patch_size = ConfigGet<int64_t>(vae, "patch_size", 4, "vae");
+  out.norm_layer = ParseNormLayer(ConfigGet<std::string>(vae, "norm_layer", "pixel_norm", "vae"));
+  out.causal = ConfigGet<bool>(vae, "causal_decoder", false, "vae");
+  out.timestep_conditioning = ConfigGet<bool>(vae, "timestep_conditioning", true, "vae");
+  out.spatial_padding_mode =
+      ParsePaddingMode(ConfigGet<std::string>(vae, "spatial_padding_mode", "reflect", "vae"));
+  out.base_channels = ConfigGet<int64_t>(vae, "decoder_base_channels", 128, "vae");
+  // norm_num_groups, norm_eps, pixel_norm_eps and the two decode-noise knobs are
+  // NOT config keys upstream — they are constructor defaults on ResnetBlock3D /
+  // PixelNorm — so they keep the values ltx2_video_vae.h pins to their upstream
+  // lines. Reading them from config would let a file move a constant no golden
+  // can see (ltx2_video_vae.h:102-122).
+  return out;
+}
+
+Ltx2AudioDecoderConfig Ltx2ParseAudioDecoderConfig(const nlohmann::json& config) {
+  // `AudioDecoderConfigurator.from_metadata` (audio_vae/model_configurator.py:108-141).
+  const nlohmann::json& audio_vae = ConfigObject(config, "audio_vae", "config");
+  if (audio_vae.empty()) Fail("the audio VAE config carries no 'audio_vae' object");
+  const nlohmann::json& model = ConfigObject(audio_vae, "model", "audio_vae");
+  const nlohmann::json& params = ConfigObject(model, "params", "audio_vae.model");
+  const nlohmann::json& dd = ConfigObject(params, "ddconfig", "audio_vae.model.params");
+  const nlohmann::json& pre = ConfigObject(audio_vae, "preprocessing", "audio_vae");
+  const nlohmann::json& mel = ConfigObject(pre, "mel", "audio_vae.preprocessing");
+  const nlohmann::json& variables = ConfigObject(audio_vae, "variables", "audio_vae");
+
+  Ltx2AudioDecoderConfig out;
+  out.ch = ConfigGet<int64_t>(dd, "ch", 128, "ddconfig");
+  out.out_ch = ConfigGet<int64_t>(dd, "out_ch", 2, "ddconfig");
+  out.ch_mult = ConfigGet<std::vector<int64_t>>(dd, "ch_mult", {1, 2, 4}, "ddconfig");
+  out.num_res_blocks = ConfigGet<int64_t>(dd, "num_res_blocks", 2, "ddconfig");
+  out.attn_resolutions =
+      ConfigGet<std::vector<int64_t>>(dd, "attn_resolutions", {8, 16, 32}, "ddconfig");
+  out.resolution = ConfigGet<int64_t>(dd, "resolution", 256, "ddconfig");
+  out.z_channels = ConfigGet<int64_t>(dd, "z_channels", 8, "ddconfig");
+  out.norm_type = ParseAudioNormType(ConfigGet<std::string>(dd, "norm_type", "pixel", "ddconfig"));
+  out.causality_axis =
+      ParseCausalityAxis(ConfigGet<std::string>(dd, "causality_axis", "height", "ddconfig"));
+  out.mid_block_add_attention =
+      ConfigGet<bool>(dd, "mid_block_add_attention", true, "ddconfig");
+  // `ddconfig.mel_bins or mel.n_mel_channels or variables.mel_bins` (:120) —
+  // a PYTHON `or` chain, so a 0 falls through exactly as an absent key does.
+  int64_t mel_bins = ConfigGet<int64_t>(dd, "mel_bins", 0, "ddconfig");
+  if (mel_bins == 0) mel_bins = ConfigGet<int64_t>(mel, "n_mel_channels", 0, "mel");
+  if (mel_bins == 0) mel_bins = ConfigGet<int64_t>(variables, "mel_bins", 0, "variables");
+  out.mel_bins = mel_bins;
+  return out;
+}
+
+Ltx2UpsamplerConfig Ltx2ParseUpsamplerConfig(const nlohmann::json& config) {
+  // `LatentUpsamplerConfigurator.from_metadata` (upsampler/model_configurator.py:12-30),
+  // key for key, off the FLAT config object.
+  Ltx2UpsamplerConfig out;
+  out.in_channels = ConfigGet<int64_t>(config, "in_channels", 128, "config");
+  out.mid_channels = ConfigGet<int64_t>(config, "mid_channels", 512, "config");
+  out.num_blocks_per_stage = ConfigGet<int64_t>(config, "num_blocks_per_stage", 4, "config");
+  out.dims = ConfigGet<int64_t>(config, "dims", 3, "config");
+  out.spatial_upsample = ConfigGet<bool>(config, "spatial_upsample", true, "config");
+  out.temporal_upsample = ConfigGet<bool>(config, "temporal_upsample", false, "config");
+  out.spatial_scale = ConfigGet<double>(config, "spatial_scale", 2.0, "config");
+  out.rational_resampler = ConfigGet<bool>(config, "rational_resampler", false, "config");
+  return out;
+}
+
+Ltx2VocoderBweConfig Ltx2ParseVocoderBweConfig(const nlohmann::json& config) {
+  // `VocoderConfigurator.from_metadata` (audio_vae/model_configurator.py:49-88).
+  const nlohmann::json& cfg = ConfigObject(config, "vocoder", "config");
+  if (cfg.empty()) Fail("the audio VAE config carries no 'vocoder' object");
+  if (!cfg.contains("bwe")) {
+    Fail(
+        "the vocoder config has no 'bwe' block, so it is the PRE-2.3 flat vocoder "
+        "(audio_vae/model_configurator.py:53-56). That arm is not ported: LTX-2.5 ships the "
+        "BWE chain, and building the legacy generator instead would emit audio from the "
+        "wrong model rather than failing.");
+  }
+  const nlohmann::json& vocoder_cfg = ConfigObject(cfg, "vocoder", "vocoder");
+  const nlohmann::json& bwe_cfg = ConfigObject(cfg, "bwe", "vocoder");
+
+  CheckConfigValue(vocoder_cfg, "resblock", "AMP1", "vocoder.vocoder");
+  CheckConfigValue(vocoder_cfg, "stereo", true, "vocoder.vocoder");
+  CheckConfigValue(vocoder_cfg, "activation", "snakebeta", "vocoder.vocoder");
+  CheckConfigValue(bwe_cfg, "resblock", "AMP1", "vocoder.bwe");
+  CheckConfigValue(bwe_cfg, "stereo", true, "vocoder.bwe");
+  CheckConfigValue(bwe_cfg, "activation", "snakebeta", "vocoder.bwe");
+
+  const auto input_rate = bwe_cfg.find("input_sampling_rate");
+  const auto output_rate = bwe_cfg.find("output_sampling_rate");
+  const auto hop = bwe_cfg.find("hop_length");
+  const auto n_fft = bwe_cfg.find("n_fft");
+  const auto num_mels = bwe_cfg.find("num_mels");
+  if (input_rate == bwe_cfg.end() || output_rate == bwe_cfg.end() || hop == bwe_cfg.end() ||
+      n_fft == bwe_cfg.end() || num_mels == bwe_cfg.end()) {
+    // Upstream subscripts these five (`bwe_cfg["input_sampling_rate"]`, :69-82)
+    // rather than `.get`-ing them, so a missing one is a KeyError there and is a
+    // refusal here. They set the resample ratio and the mel analysis; a default
+    // for any of them retunes the whole BWE stage.
+    Fail(
+        "the vocoder 'bwe' block is missing one of input_sampling_rate / output_sampling_rate "
+        "/ hop_length / n_fft / num_mels, which upstream subscripts directly "
+        "(audio_vae/model_configurator.py:69-82)");
+  }
+  Ltx2VocoderBweConfig out;
+  out.input_sampling_rate = input_rate->get<int64_t>();
+  out.output_sampling_rate = output_rate->get<int64_t>();
+  out.hop_length = hop->get<int64_t>();
+  out.filter_length = n_fft->get<int64_t>();
+  out.win_length = out.filter_length;  // MelSTFT(win_length=n_fft), :77-82
+  out.n_mel_channels = num_mels->get<int64_t>();
+  out.prefix = std::string();
+  // The inner vocoder's output rate is the BWE's INPUT rate (:69-71), and the
+  // BWE generator runs with `apply_final_activation=False` (:72-76).
+  out.vocoder = ParseVocoderArm(vocoder_cfg, "vocoder.vocoder", out.input_sampling_rate, true,
+                                out.prefix + "vocoder.");
+  out.bwe_generator = ParseVocoderArm(bwe_cfg, "vocoder.bwe", out.output_sampling_rate, false,
+                                      out.prefix + "bwe_generator.");
+  return out;
+}
+
 }  // namespace vllm

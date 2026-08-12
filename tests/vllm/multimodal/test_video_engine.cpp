@@ -206,14 +206,18 @@ TEST_CASE("video engine seam: an EXPLICITLY declared family renders the same byt
 TEST_CASE("video engine registry: an unknown family names what was asked and what exists") {
   SeamWorkspace ws;
   vllm::multimodal::VideoModelParams mp = FixtureParams(ws.fixture);
-  mp.family = "ltx-2.5";  // not registered until the LTX phases land
+  // A name that is not, and is not planned to be, a family. This read "ltx-2.5"
+  // until phase L7 registered it; the case is about an UNREGISTERED name, so it
+  // has to name one that stays unregistered rather than one whose refusal was
+  // always going to expire.
+  mp.family = "not-a-video-family";
   try {
     (void)vllm::multimodal::LoadVideoEngine(mp);
     FAIL("an unregistered family must be refused, not detected around");
   } catch (const std::exception& e) {
     const std::string msg = e.what();
     INFO(msg);
-    CHECK(msg.find("ltx-2.5") != std::string::npos);
+    CHECK(msg.find("not-a-video-family") != std::string::npos);
     CHECK(msg.find("minimax-h3") != std::string::npos);
   }
 }

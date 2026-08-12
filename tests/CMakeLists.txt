@@ -81,6 +81,9 @@ target_include_directories(test_video_engine PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
 target_compile_definitions(test_video_engine PRIVATE
   MINIMAX_H3_VIDEO_FOLD_FIXTURE_DIR="${CMAKE_SOURCE_DIR}/tests/vllm/models/fixtures/minimax_h3_video_fold")
+# LTX-2.5 L7: the family behind the VideoEngine seam and the driving loop, run
+# over a reduced-dimension checkpoint set written in the SHIPPED file format.
+vllm_cpp_add_test(test_ltx2_video vllm/multimodal/test_ltx2_video.cpp)
 # LTX-2.5 DiT parity gate (row MODEL-DIFFUSION-LTX25, spec phase L2). The goldens
 # live next to the test source, like every other generated .inc.
 vllm_cpp_add_test(test_ltx2 vllm/models/test_ltx2.cpp)

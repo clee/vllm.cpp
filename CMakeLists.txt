@@ -878,6 +878,11 @@ add_library(vllm STATIC
   # checkpoint-detected family registry — LTX-2.5 L1, .agents/specs/ltx-2-5.md
   # §5. Knows about no family; each family self-registers from its own TU.
   src/vllm/multimodal/video_engine.cpp
+  # LTX-2.5 behind that seam — the SECOND family, and the driving loop that
+  # composes the L2-L6 bricks into frames + a waveform (phase L7). Additive:
+  # one file plus one REGISTER_VLLM_VIDEO_FAMILY line, which is the property
+  # the seam exists to have.
+  src/vllm/multimodal/ltx2_video.cpp
   src/vllm/v1/core/encoder_cache_manager.cpp
   src/vllm/tokenizer/unicode_data.cpp
   src/vllm/tokenizer/pretokenizer.cpp

@@ -1247,6 +1247,23 @@ help. A family adds itself with `RegisterVideoFamily`, which refuses a name that
 is already registered, because two families under one name would collapse into a
 single claimant and leave the choice of loader to link order.
 
+Two families are registered. `minimax-h3` is detected by `video_patch_proj` plus
+`audio_patch_proj`; `ltx-2.5` by `patchify_proj` plus `audio_patchify_proj`, with
+or without the ComfyUI `model.diffusion_model.` prefix. Each family reads its own
+knobs from `extras`. H3 takes `partition`. LTX-2.5 takes
+`audio_prompt_embeds_path` (the audio stream's conditioning, the twin of the
+seam's `prompt_embeds_path`, which carries the video stream), `pipeline_kind`
+(default `distilled_two_stage`), `model_version` (only for a checkpoint that
+declares none), `allow_unported_modules`, `max_phase`, `upsampler_path` and
+`duration_head_path`. An extra a family does not define is refused, never
+ignored.
+
+The LTX-2.5 arm is CPU only today and says so: its DiT forward accepts f32 alone,
+the device staging path materializes bf16, so `device = 1` is refused by name
+rather than served by the CPU forward behind a CUDA handle. It also has no text
+tower yet, so `encoder_path` is refused and conditioning comes from the two
+prompt-embeds files, which must agree on their row count.
+
 `Sampler`'s `logprobs_mode` selects which tensor the returned logprobs are read
 from, and all four of vLLM's values now work: `raw_logprobs` (the default) and
 `raw_logits` are snapshotted before any logits processor runs, so they describe

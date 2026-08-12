@@ -1,0 +1,946 @@
+// LTX-2.5 behind the generalized video seam — implementation. See
+// include/vllm/multimodal/ltx2_video.h for the port map and the three refusals.
+//
+// Row: MODEL-DIFFUSION-LTX25, .agents/specs/ltx-2-5.md phase L7. Issue #435.
+#include "vllm/multimodal/ltx2_video.h"
+
+#include <algorithm>
+#include <cmath>
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <memory>
+#include <mutex>
+#include <stdexcept>
+#include <string>
+#include <system_error>
+#include <utility>
+#include <vector>
+
+#include "vllm/model_executor/model_loader/safetensors_reader.h"
+#include "vllm/model_executor/models/ltx2.h"
+#include "vllm/model_executor/models/ltx2_audio_vae.h"
+#include "vllm/model_executor/models/ltx2_loader.h"
+#include "vllm/model_executor/models/ltx2_pipeline.h"
+#include "vllm/model_executor/models/ltx2_upsampler.h"
+#include "vllm/model_executor/models/ltx2_video_vae.h"
+#include "vllm/model_executor/models/minimax_h3.h"
+
+namespace vllm::multimodal {
+namespace {
+
+[[noreturn]] void Fail(const std::string& message) {
+  throw std::runtime_error("ltx-2.5 video: " + message);
+}
+
+std::string ReadFileBytes(const std::string& field, const std::string& path) {
+  std::ifstream in(path, std::ios::binary);
+  if (!in) Fail(field + ": cannot open " + path);
+  return std::string((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+}
+
+void WriteFileBytes(const std::string& path, const std::string& bytes) {
+  std::ofstream out(path, std::ios::binary);
+  if (!out) Fail("cannot write " + path);
+  out.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+  if (!out) Fail("short write " + path);
+}
+
+std::vector<float> ReadF32File(const std::string& field, const std::string& path) {
+  const std::string bytes = ReadFileBytes(field, path);
+  if (bytes.size() % sizeof(float) != 0) {
+    Fail(field + ": '" + path + "' is " + std::to_string(bytes.size()) +
+         " bytes, not a whole number of little-endian f32 values");
+  }
+  std::vector<float> out(bytes.size() / sizeof(float));
+  std::memcpy(out.data(), bytes.data(), bytes.size());
+  return out;
+}
+
+// ── the noise stream ────────────────────────────────────────────────────────
+//
+// Upstream draws every tensor from ONE seeded `torch.Generator`
+// (distilled.py:214-215) and the ancestral loop draws from a second one offset
+// by `ANCESTRAL_NOISE_SEED_OFFSET` (:70-73, :177-183). Reproducing torch's
+// Mersenne/Philox stream bit-exactly would decide WHICH sample comes out, not
+// whether the pipeline is right — the same call MiniMax-H3 made and recorded
+// (minimax_h3.h:1895-1897). So this is a documented splitmix64 + Box-Muller
+// stream: deterministic, seedable, drawn in the SAME ORDER upstream draws
+// (video before audio, one draw per state per step), and NOT torch's.
+//
+// What that costs is stated rather than hidden: a clip rendered here is a
+// different sample from the same distribution as upstream's, so it is not
+// comparable to an upstream render frame by frame. Sample-level comparison
+// against the binding oracle needs the noise supplied from outside, which is
+// exactly why every brick below L7 takes its noise as an argument.
+class SplitMixGaussian {
+ public:
+  explicit SplitMixGaussian(uint64_t seed) : state_(seed) {}
+
+  void Fill(float* out, int64_t count) {
+    for (int64_t i = 0; i < count; ++i) out[i] = Next();
+  }
+  std::vector<float> Draw(int64_t count) {
+    std::vector<float> out(static_cast<size_t>(count));
+    Fill(out.data(), count);
+    return out;
+  }
+
+ private:
+  uint64_t NextBits() {
+    state_ += 0x9E3779B97F4A7C15ULL;
+    uint64_t z = state_;
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
+    return z ^ (z >> 31);
+  }
+  double Uniform() {
+    // (0, 1): Box-Muller takes a log of the first draw, so 0 must be excluded.
+    return (static_cast<double>(NextBits() >> 11) + 0.5) * (1.0 / 9007199254740992.0);
+  }
+  float Next() {
+    if (have_spare_) {
+      have_spare_ = false;
+      return spare_;
+    }
+    const double u1 = Uniform();
+    const double u2 = Uniform();
+    const double r = std::sqrt(-2.0 * std::log(u1));
+    const double theta = 6.283185307179586476925286766559 * u2;
+    spare_ = static_cast<float>(r * std::sin(theta));
+    have_spare_ = true;
+    return static_cast<float>(r * std::cos(theta));
+  }
+
+  uint64_t state_ = 0;
+  bool have_spare_ = false;
+  float spare_ = 0.0F;
+};
+
+// The VAE decoder's `torch.randn` source (ltx2_video_vae.h:152-161), consumed in
+// CALL ORDER — which is what makes the decode reproducible on both sides.
+class EngineNoiseStream : public Ltx2NoiseStream {
+ public:
+  explicit EngineNoiseStream(uint64_t seed) : gen_(seed) {}
+  std::vector<float> Draw(int64_t count) override { return gen_.Draw(count); }
+
+ private:
+  SplitMixGaussian gen_;
+};
+
+// ── one modality's state through the loop (ltx-core types.py LatentState) ───
+// Every buffer is PATCHIFIED: [tokens, width]. `mask` and `clean` are what
+// `post_process_latent` (utils/helpers.py:462-464) blends between.
+struct StreamState {
+  int64_t tokens = 0;
+  int64_t width = 0;                 // channels per token
+  std::vector<float> latent, clean;  // [tokens, width]
+  std::vector<float> mask;           // [tokens], patchified denoise mask
+  std::vector<double> positions;     // [n_pos_dims, tokens, 2]
+};
+
+// `post_process_latent` (utils/helpers.py:462-464):
+//   denoised * mask + clean * (1 - mask)
+// The mask is PER TOKEN and the latent is per token x channel, so the mask
+// broadcasts along the channel axis exactly as torch's trailing-axis rule does.
+std::vector<float> PostProcessLatent(const std::vector<float>& denoised, const StreamState& state) {
+  std::vector<float> out(denoised.size());
+  for (int64_t t = 0; t < state.tokens; ++t) {
+    const float m = state.mask[static_cast<size_t>(t)];
+    for (int64_t c = 0; c < state.width; ++c) {
+      const size_t i = static_cast<size_t>(t * state.width + c);
+      out[i] = denoised[i] * m + state.clean[i] * (1.0F - m);
+    }
+  }
+  return out;
+}
+
+// `GaussianNoiser.__call__` (components/noisers.py:30-37), on the PATCHIFIED
+// state. The second lerp is the one a port gets backwards; `Ltx2GaussianNoise`
+// already implements both and is gated, so this only broadcasts the per-token
+// mask onto the per-token x channel latent before calling it.
+void ApplyGaussianNoise(StreamState& state, const std::vector<float>& noise, float noise_scale) {
+  std::vector<float> broadcast_mask(state.latent.size());
+  for (int64_t t = 0; t < state.tokens; ++t) {
+    for (int64_t c = 0; c < state.width; ++c) {
+      broadcast_mask[static_cast<size_t>(t * state.width + c)] = state.mask[static_cast<size_t>(t)];
+    }
+  }
+  state.latent = Ltx2GaussianNoise(state.latent.data(), state.clean.data(), broadcast_mask.data(),
+                                   noise.data(), static_cast<int64_t>(state.latent.size()),
+                                   noise_scale);
+}
+
+// `timesteps_from_mask` (utils/helpers.py:494-503): the per-token timestep is
+// `denoise_mask * sigma`, so a conditioned token is at timestep 0 while an
+// unconditioned one is at the schedule's sigma.
+std::vector<float> TimestepsFromMask(const StreamState& state, float sigma) {
+  std::vector<float> out(static_cast<size_t>(state.tokens));
+  for (int64_t t = 0; t < state.tokens; ++t) out[static_cast<size_t>(t)] = state.mask[static_cast<size_t>(t)] * sigma;
+  return out;
+}
+
+// `X0Model.forward` (model/transformer/model.py:601-604) composed with
+// `to_denoised` (utils.py:38-50): the DiT emits a VELOCITY and the loop consumes
+// a denoised prediction, `x - sigma * v`, with the PER-TOKEN sigma. Getting the
+// per-token part wrong (using the scalar schedule sigma for every token) is
+// invisible until a request carries conditioned tokens, and then it re-noises
+// them.
+std::vector<float> ToDenoised(const std::vector<float>& sample, const std::vector<float>& velocity,
+                              const std::vector<float>& timesteps, int64_t tokens, int64_t width) {
+  std::vector<float> out(sample.size());
+  for (int64_t t = 0; t < tokens; ++t) {
+    const double sigma = timesteps[static_cast<size_t>(t)];
+    for (int64_t c = 0; c < width; ++c) {
+      const size_t i = static_cast<size_t>(t * width + c);
+      out[i] = static_cast<float>(static_cast<double>(sample[i]) -
+                                  sigma * static_cast<double>(velocity[i]));
+    }
+  }
+  return out;
+}
+
+std::string JoinPath(const std::string& dir, const std::string& leaf) {
+  if (dir.empty()) return leaf;
+  return dir.back() == '/' ? dir + leaf : dir + "/" + leaf;
+}
+
+int64_t ExtraInt(const std::map<std::string, std::string>& extras, const std::string& key,
+                 int64_t fallback) {
+  const std::string raw = VideoExtra(extras, key);
+  if (raw.empty()) return fallback;
+  try {
+    size_t consumed = 0;
+    const long long value = std::stoll(raw, &consumed);
+    if (consumed != raw.size()) throw std::invalid_argument("trailing");
+    return static_cast<int64_t>(value);
+  } catch (const std::exception&) {
+    Fail("the load extra '" + key + "' is '" + raw + "', which is not an integer");
+  }
+}
+
+// Every extra key this family DEFINES. An extra outside this set is refused
+// rather than ignored, for the same reason H3 refuses one
+// (minimax_h3_video.cpp): a mistyped knob that is silently dropped renders the
+// DEFAULT and looks like the feature not working.
+const char* const kKnownLoadExtras[] = {
+    kLtx2AudioPromptEmbedsExtra, kLtx2PipelineKindExtra, kLtx2ModelVersionExtra,
+    kLtx2AllowUnportedExtra,     kLtx2MaxPhaseExtra,     "upsampler_path",
+    "duration_head_path",
+};
+
+void CheckKnownExtras(const std::map<std::string, std::string>& extras) {
+  for (const auto& kv : extras) {
+    bool known = false;
+    for (const char* name : kKnownLoadExtras) {
+      if (kv.first == name) known = true;
+    }
+    if (!known) {
+      std::string listing;
+      for (const char* name : kKnownLoadExtras) listing += std::string(listing.empty() ? "" : ", ") + name;
+      Fail("unknown load extra '" + kv.first + "'. This family defines: " + listing);
+    }
+  }
+}
+
+// `detect_model_version` normalizes the separator before parsing
+// (utils/constants.py:161), and the recipe table is keyed on the two-component
+// spelling ("2.5"), not on the checkpoint's three-component "2.5.0". Reduce it
+// with the SAME parser the table's own callers use, so "2.5.0", "2.5" and
+// "2.5-rc1" all resolve to one row instead of two of them missing it.
+std::string RecipeVersionKey(const std::string& declared) {
+  const std::vector<int64_t> parsed = Ltx2ParseModelVersion(declared);
+  if (parsed.empty()) {
+    Fail("the DiT checkpoint declares model_version '" + declared +
+         "', whose numeric prefix is empty (loader/helpers.py:62-81). A recipe is resolved "
+         "from an EXACT (kind, version) pair and never defaulted.");
+  }
+  std::string key = std::to_string(parsed[0]);
+  if (parsed.size() > 1) key += "." + std::to_string(parsed[1]);
+  return key;
+}
+
+}  // namespace
+
+// ---------------------------------------------------------------------------
+// Detection
+// ---------------------------------------------------------------------------
+
+// Does this checkpoint set hold an LTX-2.5 DiT? The discriminator is the DUAL
+// PATCHIFY PROJECTION, `patchify_proj.weight` + `audio_patchify_proj.weight` —
+// the two names phase L2's contract binds first (`EnumerateLtx2DitTensors`) and
+// the two every shipped arm carries, ComfyUI prefix or not.
+//
+// It CANNOT collide with MiniMax-H3's, which keys on `video_patch_proj.weight` +
+// `audio_patch_proj.weight` (minimax_h3_video.cpp:820-831). The names are
+// different words, not a prefix of one another, so neither detector can see the
+// other's checkpoint however either file was repackaged.
+//
+// Deliberately NOT keyed on the file extension, on the directory layout, or on
+// the presence of a `model.diffusion_model.` prefix: which container a checkpoint
+// was repackaged into, and whether the repackager kept ComfyUI's prefix, say
+// nothing about which model it holds. Both shipped LTX-2.5 DiTs carry the
+// prefix; a de-prefixed re-export must still be found.
+bool DetectLtx2Video(const VideoModelParams& params) {
+  std::vector<std::string> names;
+  std::string why;
+  if (!ReadVideoCheckpointTensorNames(params.dit_path, &names, &why)) return false;
+  const std::string prefix = kLtx2DitCheckpointPrefix;
+  bool video_patchify = false, audio_patchify = false;
+  for (const std::string& n : names) {
+    std::string bare = n;
+    if (bare.size() > prefix.size() && bare.compare(0, prefix.size(), prefix) == 0) {
+      bare = bare.substr(prefix.size());
+    }
+    if (bare == "patchify_proj.weight") video_patchify = true;
+    if (bare == "audio_patchify_proj.weight") audio_patchify = true;
+    if (video_patchify && audio_patchify) return true;
+  }
+  return false;
+}
+
+// ---------------------------------------------------------------------------
+// The engine
+// ---------------------------------------------------------------------------
+
+struct Ltx2VideoEngine::Impl {
+  VideoModelParams params;
+  vt::Device device;  // always CPU — see the `device = 1` refusal in the header
+
+  Ltx2DitCheckpoint dit;
+  std::string model_version, pipeline_kind;
+  Ltx2PipelineRecipe recipe;
+  int64_t max_phase = -1;  // -1 => every phase
+
+  Ltx2VideoDecoderKind video_kind = Ltx2VideoDecoderKind::kConv;
+  Ltx2ConvVideoDecoderConfig video_cfg;
+  Ltx2VaeWeights video_weights;
+
+  Ltx2AudioDecoderConfig audio_cfg;
+  Ltx2VaeWeights audio_weights;
+  Ltx2VocoderBweConfig vocoder_cfg;
+  Ltx2VaeWeights vocoder_weights;
+
+  bool has_upsampler = false;
+  Ltx2UpsamplerConfig upsampler_cfg;
+  Ltx2VaeWeights upsampler_weights;
+
+  // Conditioning. `has_encoder` is false for every checkpoint today; see the
+  // header's refusal 2.
+  bool has_encoder = false;
+  std::vector<float> video_prompt_embeds, audio_prompt_embeds;
+  int64_t prompt_tokens = 0;
+
+  std::mutex mutex;
+};
+
+Ltx2VideoEngine::Ltx2VideoEngine() = default;
+Ltx2VideoEngine::Ltx2VideoEngine(Ltx2VideoEngine&&) noexcept = default;
+Ltx2VideoEngine& Ltx2VideoEngine::operator=(Ltx2VideoEngine&&) noexcept = default;
+Ltx2VideoEngine::~Ltx2VideoEngine() = default;
+
+std::string Ltx2VideoEngine::family() const { return kLtx2VideoFamily; }
+vt::Device Ltx2VideoEngine::device() const { return impl_->device; }
+bool Ltx2VideoEngine::has_encoder() const { return impl_->has_encoder; }
+bool Ltx2VideoEngine::has_prompt_embeds() const { return !impl_->video_prompt_embeds.empty(); }
+const std::string& Ltx2VideoEngine::model_version() const { return impl_->model_version; }
+const std::string& Ltx2VideoEngine::pipeline_kind() const { return impl_->pipeline_kind; }
+
+std::unique_ptr<Ltx2VideoEngine> Ltx2VideoEngine::Load(const VideoModelParams& params) {
+  if (params.dit_path.empty()) Fail("dit_path is required");
+  CheckKnownExtras(params.extras);
+
+  // REFUSAL 1 (header). The two halves of the device story do not meet yet:
+  // phase L2's forward is f32-only by declaration and phase L6's device staging
+  // is bf16 and refuses to widen. Running the CPU forward behind a CUDA-looking
+  // handle would make every later timing and every "it ran on the GPU" claim
+  // false, so the gap is named here instead.
+  if (params.device != 0) {
+    Fail(
+        "device " + std::to_string(params.device) +
+        " is refused. `Ltx2DitForward` accepts only vt::DType::kF32 (ltx2.h:33-39) and "
+        "`Ltx2StreamDitToDevice` stages bf16 and refuses `widen_to_f32` by design "
+        "(ltx2_loader.h:73-81), so no combination puts this forward on an accelerator "
+        "today. The bf16/quantized device forward is OWED and recorded as such; it is not "
+        "silently substituted by the CPU one.");
+  }
+
+  auto engine = std::unique_ptr<Ltx2VideoEngine>(new Ltx2VideoEngine());
+  engine->impl_ = std::make_unique<Impl>();
+  Impl& im = *engine->impl_;
+  im.params = params;
+  im.device = vt::Device{};
+
+  // ── the DiT ───────────────────────────────────────────────────────────────
+  const SafetensorsFile dit_file = SafetensorsFile::Open(params.dit_path);
+  Ltx2DitLoadOptions dit_options;
+  dit_options.allow_unported_modules = VideoExtra(params.extras, kLtx2AllowUnportedExtra) == "1";
+  // f32 is what the forward requires. It is the PARITY dtype, not a widening of
+  // a bf16 path — and it is why this engine is not a production runtime.
+  dit_options.widen_to_f32 = true;
+  im.dit = Ltx2LoadDitFromSafetensors(dit_file, dit_options);
+
+  // ── the config the SHAPES cannot see ──────────────────────────────────────
+  //
+  // FOUND AT L7 AND REPAIRED HERE. `Ltx2LoadDitFromSafetensors` derives its
+  // geometry with `ParseLtx2DitParamsFromManifest`, which reads SHAPES — the way
+  // a ComfyUI checkpoint carrying no config has to be read. But both shipped
+  // LTX-2.5 DiTs DO carry one, in `__metadata__["config"]["transformer"]`, and it
+  // states things no shape encodes:
+  //
+  //     "frequencies_precision": "float64"          -> double_precision_rope
+  //     "av_ca_timestep_scale_multiplier": 1000.0   -> default is 1
+  //     "positional_embedding_max_pos": [20,2048,2048], "..._theta": 10000.0
+  //     "norm_eps", "timestep_scale_multiplier", "use_middle_indices_grid"
+  //
+  // Each moves every RoPE angle or every modulation while leaving the tensor
+  // set byte-identical, so the manifest path resolves a DIFFERENT MODEL from the
+  // same file and nothing downstream can tell. `ParseLtx2DitParams` already
+  // mirrors `LTXModelConfigurator.from_metadata` (model_configurator.py:19-83)
+  // for exactly this; it was simply never reached.
+  //
+  // The declared config is adopted only when it produces the IDENTICAL weight
+  // contract — which is what proves it describes THIS file rather than another
+  // checkpoint's config pasted into it. A disagreement is refused by name.
+  if (dit_file.Metadata().count("config") != 0) {
+    nlohmann::json config = Ltx2ReadCheckpointConfig(dit_file);
+    // THE UNPORTED FLAGS ARE CLEARED IN THE COPY, NOT ARGUED WITH.
+    // `ParseLtx2DitParams` refuses `use_keyframes_abs_pos_embedding` by name
+    // (ltx2.cpp:191-196), and both shipped LTX-2.5 DiTs declare it — so reading
+    // the declared config would refuse every real checkpoint, including the ones
+    // `Ltx2LoadDitFromSafetensors` has just loaded under
+    // `allow_unported_modules`. Clearing it here is the SAME move the loader
+    // makes for `use_prompt_adaln_single`: the flag is cleared for the CONTRACT,
+    // the module stays unported, and the DiT checkpoint's `unported` list still
+    // names it. Without the opt-in the parse throws, which is the refusal.
+    if (dit_options.allow_unported_modules && config.contains("transformer") &&
+        config["transformer"].is_object()) {
+      config["transformer"]["use_keyframes_abs_pos_embedding"] = false;
+    }
+    nlohmann::json wrapper;
+    wrapper["config"] = config;
+    Ltx2DitParams declared = ParseLtx2DitParams(wrapper);
+    // The one flag the L2 contract clears, mirroring the loader
+    // (ltx2_loader.cpp: "cleared for the CONTRACT only").
+    declared.use_prompt_adaln_single = false;
+    const std::vector<Ltx2TensorSpec> from_shapes = EnumerateLtx2DitTensors(im.dit.params);
+    const std::vector<Ltx2TensorSpec> from_config = EnumerateLtx2DitTensors(declared);
+    bool same = from_shapes.size() == from_config.size();
+    for (size_t i = 0; same && i < from_shapes.size(); ++i) {
+      same = from_shapes[i].name == from_config[i].name &&
+             from_shapes[i].shape == from_config[i].shape;
+    }
+    if (!same) {
+      Fail(
+          "the DiT checkpoint's own __metadata__[\"config\"][\"transformer\"] describes a "
+          "DIFFERENT weight contract from the one its tensor shapes describe. Refusing "
+          "rather than preferring either: the config decides values no shape can see "
+          "(frequencies_precision, av_ca_timestep_scale_multiplier, the positional-embedding "
+          "bounds), so taking the shapes would render with the wrong RoPE and taking the "
+          "config would bind the wrong tensors.");
+    }
+    im.dit.params = declared;
+  }
+
+  // ── the recipe ────────────────────────────────────────────────────────────
+  const std::string declared_version = Ltx2ReadCheckpointModelVersion(dit_file);
+  const std::string override_version = VideoExtra(params.extras, kLtx2ModelVersionExtra);
+  if (!declared_version.empty() && !override_version.empty() &&
+      RecipeVersionKey(declared_version) != RecipeVersionKey(override_version)) {
+    Fail("the DiT checkpoint declares model_version '" + declared_version + "' but the '" +
+         kLtx2ModelVersionExtra + "' extra says '" + override_version +
+         "'. Refusing rather than preferring one: they resolve DIFFERENT sigma schedules, "
+         "and the wrong one renders a video instead of failing.");
+  }
+  const std::string version = !declared_version.empty() ? declared_version : override_version;
+  if (version.empty()) {
+    Fail("the DiT checkpoint declares no __metadata__[\"model_version\"] and no '" +
+         std::string(kLtx2ModelVersionExtra) +
+         "' extra was supplied, so no recipe can be resolved. A recipe is never defaulted "
+         "(ltx2_recipes.py:170-175).");
+  }
+  im.model_version = RecipeVersionKey(version);
+  im.pipeline_kind = VideoExtra(params.extras, kLtx2PipelineKindExtra, "distilled_two_stage");
+  im.recipe = ResolveLtx2PipelineRecipe(im.pipeline_kind, im.model_version);
+  im.max_phase = ExtraInt(params.extras, kLtx2MaxPhaseExtra, -1);
+  if (im.max_phase >= static_cast<int64_t>(im.recipe.phases.size())) {
+    Fail("the '" + std::string(kLtx2MaxPhaseExtra) + "' extra is " +
+         std::to_string(im.max_phase) + " but the '" + im.pipeline_kind + "'/'" +
+         im.model_version + "' recipe has " + std::to_string(im.recipe.phases.size()) +
+         " phases");
+  }
+
+  // ── the video VAE ─────────────────────────────────────────────────────────
+  if (params.video_vae_path.empty()) Fail("video_vae_path is required");
+  {
+    const SafetensorsFile f = SafetensorsFile::Open(params.video_vae_path);
+    im.video_cfg = Ltx2ParseConvVideoDecoderConfig(Ltx2ReadCheckpointConfig(f), &im.video_kind);
+    im.video_weights = Ltx2LoadVaeWeights(f, Ltx2VideoVaeDecoderKeyRules());
+  }
+  if (im.video_cfg.in_channels != im.dit.params.out_channels) {
+    Fail("the video VAE takes " + std::to_string(im.video_cfg.in_channels) +
+         " latent channels but the DiT emits " + std::to_string(im.dit.params.out_channels));
+  }
+
+  // ── the audio VAE + its vocoder ───────────────────────────────────────────
+  if (params.audio_vae_path.empty()) Fail("audio_vae_path is required");
+  {
+    const SafetensorsFile f = SafetensorsFile::Open(params.audio_vae_path);
+    const nlohmann::json config = Ltx2ReadCheckpointConfig(f);
+    im.audio_cfg = Ltx2ParseAudioDecoderConfig(config);
+    im.audio_weights = Ltx2LoadVaeWeights(f, Ltx2AudioVaeDecoderKeyRules());
+    im.vocoder_cfg = Ltx2ParseVocoderBweConfig(config);
+    im.vocoder_weights = Ltx2LoadVaeWeights(f, Ltx2VocoderKeyRules());
+  }
+
+  // ── the optional latent spatial upsampler (the two-stage recipe's phase 2) ─
+  const std::string upsampler_path = VideoExtra(params.extras, "upsampler_path");
+  if (!upsampler_path.empty()) {
+    const SafetensorsFile f = SafetensorsFile::Open(upsampler_path);
+    const nlohmann::json config = Ltx2ReadCheckpointConfig(f);
+    im.upsampler_cfg = Ltx2ParseUpsamplerConfig(config);
+    im.upsampler_weights = Ltx2LoadVaeWeights(f);
+    im.has_upsampler = true;
+  }
+
+  // ── conditioning ──────────────────────────────────────────────────────────
+  // REFUSAL 2 (header): the Gemma-4 TOWER is owed, so `encoder_path` cannot be
+  // turned into hidden states here. Saying so at LOAD, when the caller supplied
+  // one, is better than accepting the path and refusing every request later.
+  if (!params.encoder_path.empty()) {
+    Fail(
+        "encoder_path was supplied, but this family cannot encode a prompt yet: phase L6 "
+        "loads the caption projections and the embedded tokenizer and records the Gemma-4 "
+        "TOWER itself as owed (ltx2_loader.h:318-324), so there is nothing to produce the "
+        "49 hidden states `Ltx2TextFeatureExtractorForward` consumes. Condition through "
+        "prompt_embeds_path + the '" +
+        std::string(kLtx2AudioPromptEmbedsExtra) +
+        "' extra meanwhile; that is the seam's own documented fallback.");
+  }
+  const std::string audio_embeds_path = VideoExtra(params.extras, kLtx2AudioPromptEmbedsExtra);
+  if (params.prompt_embeds_path.empty() != audio_embeds_path.empty()) {
+    Fail(
+        "LTX-2.5 conditions TWO streams at two widths, so prompt_embeds_path (the video "
+        "stream, " +
+        std::to_string(im.dit.params.cross_attention_dim) + " wide) and the '" +
+        std::string(kLtx2AudioPromptEmbedsExtra) + "' extra (the audio stream, " +
+        std::to_string(im.dit.params.audio_cross_attention_dim) +
+        " wide) are supplied together or not at all. One of them alone would leave a stream "
+        "unconditioned, which renders.");
+  }
+  if (!params.prompt_embeds_path.empty()) {
+    im.video_prompt_embeds = ReadF32File("prompt_embeds_path", params.prompt_embeds_path);
+    im.audio_prompt_embeds = ReadF32File(kLtx2AudioPromptEmbedsExtra, audio_embeds_path);
+    const int64_t vw = im.dit.params.cross_attention_dim;
+    const int64_t aw = im.dit.params.audio_cross_attention_dim;
+    if (im.video_prompt_embeds.size() % static_cast<size_t>(vw) != 0) {
+      Fail("prompt_embeds_path holds " + std::to_string(im.video_prompt_embeds.size()) +
+           " floats, which is not a whole number of " + std::to_string(vw) + "-wide rows");
+    }
+    if (im.audio_prompt_embeds.size() % static_cast<size_t>(aw) != 0) {
+      Fail(std::string(kLtx2AudioPromptEmbedsExtra) + " holds " +
+           std::to_string(im.audio_prompt_embeds.size()) +
+           " floats, which is not a whole number of " + std::to_string(aw) + "-wide rows");
+    }
+    const int64_t v_rows = static_cast<int64_t>(im.video_prompt_embeds.size()) / vw;
+    const int64_t a_rows = static_cast<int64_t>(im.audio_prompt_embeds.size()) / aw;
+    if (v_rows != a_rows) {
+      // Upstream's two encodings come from ONE tokenization
+      // (feature_extractor.py:114-129 projects the SAME hidden states twice), so
+      // differing row counts mean two different prompts, and the render would be
+      // a picture of one with a soundtrack of the other.
+      Fail("prompt_embeds_path has " + std::to_string(v_rows) + " rows but " +
+           std::string(kLtx2AudioPromptEmbedsExtra) + " has " + std::to_string(a_rows) +
+           "; both projections are built from ONE tokenization and must agree");
+    }
+    if (v_rows == 0) Fail("the prompt embeds are empty");
+    im.prompt_tokens = v_rows;
+  }
+  return engine;
+}
+
+VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
+  Impl& im = *impl_;
+  std::lock_guard<std::mutex> guard(im.mutex);
+
+  if (gen.output_dir.empty()) Fail("output_dir is required");
+  if (!gen.extras.empty()) {
+    Fail("unknown per-generation extra '" + gen.extras.begin()->first +
+         "' (this family defines none)");
+  }
+  if (!gen.prompt.empty()) {
+    Fail(
+        "a prompt was supplied but no text tower is loaded, so it cannot condition this "
+        "render. Rendering the prompt-embeds conditioning INSTEAD would silently ignore the "
+        "request's own prompt. See the encoder_path refusal at load.");
+  }
+  if (im.video_prompt_embeds.empty()) {
+    Fail("no conditioning is loaded; supply prompt_embeds_path and the '" +
+         std::string(kLtx2AudioPromptEmbedsExtra) + "' extra");
+  }
+  // Image / reference conditioning is `ImageConditioner` upstream
+  // (distilled.py:245-258) and needs the video VAE's ENCODER, which phase L4
+  // ported the DECODER of. Refused by name rather than dropped: a keyframe that
+  // is silently ignored renders an unconditioned clip that looks like the
+  // feature not working.
+  if (!gen.first_frame_path.empty() || !gen.first_frame_ppm.empty() ||
+      !gen.last_frame_path.empty() || !gen.ref_image_paths.empty() ||
+      !gen.ref_video_dir.empty() || !gen.ref_audio_path.empty() || !gen.ref_audio_wav.empty()) {
+    Fail(
+        "keyframe / reference conditioning is not ported for this family: it runs through "
+        "upstream's ImageConditioner (distilled.py:245-258), which encodes the images with "
+        "the video VAE's ENCODER, and phase L4 ported the DECODER only. Recorded as owed.");
+  }
+
+  // ── geometry ──────────────────────────────────────────────────────────────
+  const Ltx2PipelineRecipe& recipe = im.recipe;
+  const double fps = recipe.frame_rate;
+  const int64_t height = gen.height > 0 ? gen.height : recipe.height;
+  const int64_t width = gen.width > 0 ? gen.width : recipe.width;
+  int64_t frames = gen.num_frames > 1 ? gen.num_frames : recipe.num_frames;
+  if (gen.duration_seconds > 0.0) {
+    // `resolve_num_frames` (utils/blocks.py) turns an AUTO duration into frames
+    // through the DURATION HEAD, which needs the encoded prompt this engine
+    // cannot produce. An explicit duration is exact arithmetic, so it is served;
+    // the AUTO path is what is missing, and `num_frames` is how to avoid it.
+    frames = static_cast<int64_t>(std::llround(gen.duration_seconds * fps));
+  }
+  if (frames < 1) Fail("num_frames resolved to " + std::to_string(frames));
+
+  const Ltx2ScaleFactors factors;  // VIDEO_SCALE_FACTORS (types.py:70) — the conv
+                                   // arm's fixed (8, 32, 32), not derived
+                                   // (utils/helpers.py:66-72)
+  // `AudioLatentShape.from_video_pixel_shape` (types.py:184-200) and
+  // `VideoLatentShape.from_pixel_shape` (:108-123) defaults. Asserted against the
+  // DiT rather than assumed: the audio latent's channels x mel_bins IS the audio
+  // stream's input width, and a mismatch would reinterpret the spectrogram.
+  constexpr int64_t kAudioLatentChannels = 8;
+  constexpr int64_t kAudioLatentMelBins = 16;
+  if (kAudioLatentChannels * kAudioLatentMelBins != im.dit.params.audio_in_channels) {
+    Fail("the audio latent is " + std::to_string(kAudioLatentChannels) + " x " +
+         std::to_string(kAudioLatentMelBins) + " = " +
+         std::to_string(kAudioLatentChannels * kAudioLatentMelBins) +
+         " wide (types.py:184-200) but the DiT's audio stream takes " +
+         std::to_string(im.dit.params.audio_in_channels));
+  }
+
+  const int64_t last_phase =
+      im.max_phase >= 0 ? im.max_phase : static_cast<int64_t>(recipe.phases.size()) - 1;
+
+  // One generator for the state noise (distilled.py:214-215) — see
+  // SplitMixGaussian for what this is and is not.
+  const uint64_t seed = gen.has_seed ? gen.seed : static_cast<uint64_t>(recipe.num_frames);
+  SplitMixGaussian state_noise(seed);
+
+  std::vector<float> video_latent_volume;  // [C, F, H, W], unpatchified
+  int64_t video_lc = 0, video_lf = 0, video_lh = 0, video_lw = 0;
+  std::vector<float> audio_latent_volume;  // [C, F, M], unpatchified
+  int64_t audio_lc = 0, audio_lf = 0, audio_lm = 0;
+
+  for (int64_t phase_index = 0; phase_index <= last_phase; ++phase_index) {
+    const Ltx2PhaseRecipe& phase = recipe.phases[static_cast<size_t>(phase_index)];
+    const int64_t phase_h = height / phase.spatial_downscale;
+    const int64_t phase_w = width / phase.spatial_downscale;
+
+    Ltx2VideoLatentShape vshape;
+    vshape.channels = im.dit.params.in_channels;
+    vshape.frames = (frames - 1) / factors.time + 1;
+    vshape.height = phase_h / factors.height;
+    vshape.width = phase_w / factors.width;
+    if (vshape.frames < 1 || vshape.height < 1 || vshape.width < 1) {
+      Fail("phase '" + phase.name + "' resolves a latent of " + std::to_string(vshape.frames) +
+           "x" + std::to_string(vshape.height) + "x" + std::to_string(vshape.width) +
+           " from " + std::to_string(frames) + " frames at " + std::to_string(phase_w) + "x" +
+           std::to_string(phase_h) + "; the VAE downscales by " +
+           std::to_string(factors.time) + "x" + std::to_string(factors.height) + "x" +
+           std::to_string(factors.width) + " so the request is below one latent cell");
+    }
+
+    Ltx2AudioLatentShape ashape;
+    ashape.channels = kAudioLatentChannels;
+    ashape.mel_bins = kAudioLatentMelBins;
+    {
+      // `AudioLatentShape.from_duration` (types.py:164-181).
+      const Ltx2AudioPatchifierParams ap;
+      const double latents_per_second = static_cast<double>(ap.sample_rate) /
+                                        static_cast<double>(ap.hop_length) /
+                                        static_cast<double>(ap.audio_latent_downsample_factor);
+      ashape.frames = static_cast<int64_t>(
+          std::llround(static_cast<double>(frames) / fps * latents_per_second));
+    }
+    if (ashape.frames < 1) Fail("the audio latent resolved to zero frames");
+
+    // ── the input transform (ltx2_recipes.py:38) ────────────────────────────
+    std::vector<float> video_initial;
+    if (phase.input_transform == Ltx2PhaseInputTransform::kSpatialUpsample) {
+      if (video_latent_volume.empty()) {
+        Fail("phase '" + phase.name +
+             "' asks for the spatial-upsample input transform but no earlier phase produced a "
+             "latent");
+      }
+      if (!im.has_upsampler) {
+        Fail("phase '" + phase.name +
+             "' needs the latent spatial x2 upsampler, and no 'upsampler_path' load extra was "
+             "supplied. Refusing rather than skipping the phase: its 3-step refinement is what "
+             "makes the upscaled latent valid, and running the decode on the half-resolution "
+             "latent instead would return a smaller clip that looks like a completed request. "
+             "Supply 'upsampler_path', or stop before this phase with '" +
+             std::string(kLtx2MaxPhaseExtra) + "'.");
+      }
+      Ltx2LatentVolume in;
+      in.batch = 1;
+      in.channels = video_lc;
+      in.frames = video_lf;
+      in.height = video_lh;
+      in.width = video_lw;
+      in.data = video_latent_volume;
+      // `upsample_video` (upsampler/model.py:129-143): un-normalize by the video
+      // ENCODER's per-channel statistics, upsample, re-normalize. Those live in
+      // the VAE checkpoint, not in the upsampler's.
+      const Ltx2LatentVolume up = Ltx2UpsampleVideoLatent(
+          im.upsampler_cfg, im.upsampler_weights, in,
+          im.video_weights.Get("per_channel_statistics.std-of-means"),
+          im.video_weights.Get("per_channel_statistics.mean-of-means"));
+      if (up.channels != vshape.channels || up.frames != vshape.frames ||
+          up.height != vshape.height || up.width != vshape.width) {
+        Fail("the upsampled latent is " + std::to_string(up.channels) + "x" +
+             std::to_string(up.frames) + "x" + std::to_string(up.height) + "x" +
+             std::to_string(up.width) + " but phase '" + phase.name + "' needs " +
+             std::to_string(vshape.channels) + "x" + std::to_string(vshape.frames) + "x" +
+             std::to_string(vshape.height) + "x" + std::to_string(vshape.width));
+      }
+      video_initial = up.data;
+    }
+
+    // ── build the two states (create_noised_state, helpers.py:428-447) ───────
+    StreamState video;
+    video.width = vshape.channels;  // patch_size 1 (VideoLatentPatchifier(1))
+    video.tokens = Ltx2VideoTokenCount(vshape, 1);
+    {
+      std::vector<float> volume(static_cast<size_t>(vshape.channels) *
+                                static_cast<size_t>(vshape.frames) *
+                                static_cast<size_t>(vshape.height) *
+                                static_cast<size_t>(vshape.width));
+      if (!video_initial.empty()) {
+        if (video_initial.size() != volume.size()) Fail("the initial video latent is the wrong size");
+        volume = video_initial;
+      }
+      video.latent = Ltx2VideoPatchify(volume.data(), vshape, 1);
+      video.clean = video.latent;
+      video.mask.assign(static_cast<size_t>(video.tokens), 1.0F);
+      const std::vector<int64_t> bounds = Ltx2VideoPatchBounds(vshape, 1);
+      const std::vector<int64_t> pixels = Ltx2PixelCoords(bounds, 1, video.tokens, factors, true);
+      // `positions = get_pixel_coords(...).float()` then
+      // `positions[:, 0, ...] /= fps` (tools.py:169-174). The division is f32
+      // upstream, so it is done in float here and only then widened to the
+      // double the DiT's `positions` field takes.
+      video.positions.resize(pixels.size());
+      for (size_t i = 0; i < pixels.size(); ++i) {
+        const float value = static_cast<float>(pixels[i]);
+        const bool temporal = i < static_cast<size_t>(video.tokens) * 2;
+        video.positions[i] = temporal ? static_cast<double>(value / static_cast<float>(fps))
+                                      : static_cast<double>(value);
+      }
+    }
+
+    StreamState audio;
+    audio.width = ashape.channels * ashape.mel_bins;
+    audio.tokens = ashape.frames;
+    {
+      std::vector<float> volume(static_cast<size_t>(ashape.channels) *
+                                static_cast<size_t>(ashape.frames) *
+                                static_cast<size_t>(ashape.mel_bins));
+      if (phase_index > 0) {
+        // Stage 2 re-noises stage 1's AUDIO latent rather than starting from
+        // zeros (distilled.py:307-311). Dropping that carry-over regenerates the
+        // soundtrack from scratch with a 3-step schedule, which produces audio.
+        if (audio_latent_volume.size() != volume.size()) {
+          Fail("the audio latent changed size between phases");
+        }
+        volume = audio_latent_volume;
+      }
+      audio.latent = Ltx2AudioPatchify(volume.data(), ashape);
+      audio.clean = audio.latent;
+      audio.mask.assign(static_cast<size_t>(audio.tokens), 1.0F);
+      const std::vector<float> timings = Ltx2AudioPatchTimings(ashape, Ltx2AudioPatchifierParams{});
+      audio.positions.assign(timings.begin(), timings.end());
+    }
+
+    // The noiser draws VIDEO first, AUDIO second, from one generator
+    // (blocks.py:576-580 builds the video state before the audio one).
+    const float noise_scale = static_cast<float>(phase.noise_scale);
+    ApplyGaussianNoise(video, state_noise.Draw(static_cast<int64_t>(video.latent.size())),
+                       noise_scale);
+    ApplyGaussianNoise(audio, state_noise.Draw(static_cast<int64_t>(audio.latent.size())),
+                       noise_scale);
+
+    // ── the schedule ────────────────────────────────────────────────────────
+    std::vector<float> sigmas = phase.sigmas;
+    if (sigmas.empty()) {
+      int64_t steps = gen.steps > 0 ? gen.steps : recipe.num_inference_steps;
+      if (steps < 1) Fail("num_inference_steps resolved to " + std::to_string(steps));
+      sigmas = Ltx2SigmaSchedule(steps, video.tokens);
+    } else if (gen.steps > 0 && !recipe.allow_request_sigmas) {
+      // `fixed_num_inference_steps` (ltx2_recipes.py:53-87): a distilled recipe's
+      // schedule is trained INTO the model, so honouring a step override would
+      // sample a trajectory the weights were never distilled for.
+      Fail("this recipe fixes its own distilled schedule (" +
+           std::to_string(static_cast<int64_t>(phase.sigmas.size()) - 1) + " steps for phase '" +
+           phase.name + "'), so a `steps` override is refused rather than applied");
+    }
+
+    // ── the denoise loop (samplers.py:39-79 / :488-558) ─────────────────────
+    // The ancestral arm's loop generator is seeded from the pipeline seed plus
+    // the recipe's own offset (distilled.py:69-73, :177-183) — a separate stream
+    // from the state noise, so its first draw is not the initial latent's.
+    SplitMixGaussian loop_noise(seed + static_cast<uint64_t>(phase.noise_seed_offset));
+    const int64_t sigma_count = static_cast<int64_t>(sigmas.size());
+    for (int64_t step = 0; step + 1 < sigma_count; ++step) {
+      const float sigma = sigmas[static_cast<size_t>(step)];
+      const std::vector<float> v_timesteps = TimestepsFromMask(video, sigma);
+      const std::vector<float> a_timesteps = TimestepsFromMask(audio, sigma);
+      const float sigma_row = sigma;
+
+      Ltx2ModalityInput vin;
+      vin.batch = 1;
+      vin.tokens = video.tokens;
+      vin.context_tokens = im.prompt_tokens;
+      vin.latent = video.latent.data();
+      vin.timesteps = v_timesteps.data();
+      vin.sigma = &sigma_row;
+      vin.positions = video.positions.data();
+      vin.context = im.video_prompt_embeds.data();
+
+      Ltx2ModalityInput ain;
+      ain.batch = 1;
+      ain.tokens = audio.tokens;
+      ain.context_tokens = im.prompt_tokens;
+      ain.latent = audio.latent.data();
+      ain.timesteps = a_timesteps.data();
+      ain.sigma = &sigma_row;
+      ain.positions = audio.positions.data();
+      ain.context = im.audio_prompt_embeds.data();
+
+      const Ltx2DitOutputs velocity =
+          Ltx2DitForward(im.device, im.dit.params, im.dit.weights, &vin, &ain, vt::DType::kF32);
+
+      const std::vector<float> v_denoised = PostProcessLatent(
+          ToDenoised(video.latent, velocity.video, v_timesteps, video.tokens, video.width), video);
+      const std::vector<float> a_denoised = PostProcessLatent(
+          ToDenoised(audio.latent, velocity.audio, a_timesteps, audio.tokens, audio.width), audio);
+
+      const bool terminal = sigmas[static_cast<size_t>(step + 1)] == 0.0F;
+      if (phase.stepper == Ltx2StepperKind::kEulerAncestral) {
+        if (terminal) {
+          // samplers.py:545-547 — the terminal step IS the denoised prediction;
+          // taking an ancestral step there would re-noise the finished latent.
+          video.latent = v_denoised;
+          audio.latent = a_denoised;
+          continue;
+        }
+        const std::vector<float> v_noise =
+            loop_noise.Draw(static_cast<int64_t>(video.latent.size()));
+        const std::vector<float> a_noise =
+            loop_noise.Draw(static_cast<int64_t>(audio.latent.size()));
+        video.latent = PostProcessLatent(
+            Ltx2EulerAncestralStep(video.latent.data(), v_denoised.data(), sigmas.data(),
+                                   sigma_count, step, static_cast<int64_t>(video.latent.size()),
+                                   phase.stepper_eta, phase.stepper_s_noise, v_noise.data()),
+            video);
+        audio.latent = PostProcessLatent(
+            Ltx2EulerAncestralStep(audio.latent.data(), a_denoised.data(), sigmas.data(),
+                                   sigma_count, step, static_cast<int64_t>(audio.latent.size()),
+                                   phase.stepper_eta, phase.stepper_s_noise, a_noise.data()),
+            audio);
+      } else {
+        video.latent = Ltx2EulerStep(video.latent.data(), v_denoised.data(), sigmas.data(),
+                                     sigma_count, step,
+                                     static_cast<int64_t>(video.latent.size()));
+        audio.latent = Ltx2EulerStep(audio.latent.data(), a_denoised.data(), sigmas.data(),
+                                     sigma_count, step,
+                                     static_cast<int64_t>(audio.latent.size()));
+      }
+    }
+
+    // `clear_conditioning` + `unpatchify` (blocks.py:575-580). There are no
+    // conditioning tokens on this path, so the clear is the identity; the
+    // unpatchify is not.
+    video_latent_volume = Ltx2VideoUnpatchify(video.latent.data(), vshape, 1);
+    video_lc = vshape.channels;
+    video_lf = vshape.frames;
+    video_lh = vshape.height;
+    video_lw = vshape.width;
+    audio_latent_volume = Ltx2AudioUnpatchify(audio.latent.data(), ashape);
+    audio_lc = ashape.channels;
+    audio_lf = ashape.frames;
+    audio_lm = ashape.mel_bins;
+  }
+
+  // ── decode (distilled.py:314-315) ─────────────────────────────────────────
+  EngineNoiseStream decode_noise(seed ^ 0x1D7Cull);
+  const Ltx2VideoFrames rendered =
+      Ltx2VideoDecode(im.video_kind, im.video_cfg, im.video_weights, video_latent_volume, video_lc,
+                      video_lf, video_lh, video_lw, &decode_noise);
+
+  const Ltx2AudioSpectrogram mel = Ltx2AudioDecoderForward(
+      im.audio_cfg, im.audio_weights, audio_latent_volume, audio_lc, audio_lf, audio_lm);
+  int64_t audio_samples = 0;
+  const std::vector<float> waveform =
+      Ltx2VocoderWithBweForward(im.vocoder_cfg, im.vocoder_weights, mel.data, mel.channels,
+                                mel.frames, mel.mel_bins, &audio_samples);
+
+  // ── artifacts (the library WRITES these, spawns nothing) ──────────────────
+  std::error_code ec;
+  std::filesystem::create_directories(gen.output_dir, ec);
+  if (ec) Fail("cannot create " + gen.output_dir + ": " + ec.message());
+
+  VideoResult result;
+  result.frame_dir = gen.output_dir;
+  MiniMaxH3VideoFrameShape shape;
+  shape.channels = rendered.channels;
+  shape.t = rendered.frames;
+  shape.h = rendered.height;
+  shape.w = rendered.width;
+  for (int64_t f = 0; f < rendered.frames; ++f) {
+    char name[64];
+    std::snprintf(name, sizeof(name), "frame_%06lld.ppm", static_cast<long long>(f));
+    // The PPM/WAV/mux writers are the SHARED serialization the spec's §5 reuse
+    // list names, not H3 behaviour: they take a buffer and a shape and contain
+    // no model. Reimplementing them here would be the parallel path §"Shared
+    // seams" forbids.
+    WriteFileBytes(JoinPath(gen.output_dir, name),
+                   MiniMaxH3WritePpmFrame(rendered.data, shape, f));
+  }
+  result.audio_path = JoinPath(gen.output_dir, "audio.wav");
+  WriteFileBytes(result.audio_path,
+                 MiniMaxH3WriteWav(waveform, mel.channels, audio_samples,
+                                   im.vocoder_cfg.output_sampling_rate));
+  result.frame_count = rendered.frames;
+  result.width = rendered.width;
+  result.height = rendered.height;
+  result.fps = static_cast<int64_t>(std::llround(fps));
+  result.sample_rate = im.vocoder_cfg.output_sampling_rate;
+
+  MiniMaxH3MuxRequest mux;
+  mux.frame_pattern = JoinPath(gen.output_dir, "frame_%06d.ppm");
+  mux.audio_path = result.audio_path;
+  mux.output_path = JoinPath(gen.output_dir, "video.mp4");
+  mux.fps = result.fps;
+  result.mux_argv = MiniMaxH3BuildMp4MuxArgs(mux);
+  result.mux_output_path = mux.output_path;
+  return result;
+}
+
+namespace {
+
+std::unique_ptr<VideoEngine> LoadLtx2VideoFamily(const VideoModelParams& params) {
+  return Ltx2VideoEngine::Load(params);
+}
+
+}  // namespace
+
+REGISTER_VLLM_VIDEO_FAMILY(ltx2, kLtx2VideoFamily, DetectLtx2Video, LoadLtx2VideoFamily)
+
+}  // namespace vllm::multimodal
