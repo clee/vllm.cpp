@@ -1158,6 +1158,66 @@ Examples: `examples/cli` ✅ (C-API client), `examples/server` ✅ (OpenAI serve
       upstream that is the evidence behind (b).
     * **Spec:** [ltx-2.5 spec](specs/ltx-2-5.md) §3 and §6 (phase L5). Lifecycle:
       shipped (CPU reference). Owner: the LTX-2.5 row.
+19. **torchao NVFP4 group-scale UNSWIZZLE (`Ltx2UnswizzleNvfp4BlockScale`,
+    2026-08-12, `MODEL-DIFFUSION-ltx-2-5-ltx2-video-transformer-3d-model` phase L6,
+    issue [#435](https://github.com/mudler/vllm.cpp/issues/435)).** LTX-2.5's
+    shipped Gemma-4 text encoder is quantized by **torchao**, not
+    compressed-tensors and not modelopt. Measured from the file's own
+    `<module>.torchao_nvfp4` U8[240] marker rather than assumed: `{"format":
+    "torchao_nvfp4", "block_size": 16, "is_swizzled_scales": true, ...}`. The
+    ENCODING is identical to the modelopt W4A16 path we already have — E2M1 nibble
+    pairs, one fp8-e4m3 scale per 16 inputs, one F32 `weight_scale_2` used as a
+    MULTIPLIER. The single delta is that the group-scale tensor is stored in the
+    cuBLAS block-scaling-factors layout, so it needs inverting before the existing
+    dequant can read it. **No new quant scheme was added.**
+    * **Upstream semantics mirrored:** the permutation vLLM's own producers apply —
+      `swizzle_blockscale`, `vllm/model_executor/layers/quantization/utils/
+      nvfp4_utils.py:44-49`, and `to_blocked`,
+      `vllm/model_executor/layers/quantization/qutlass_utils.py:165-180`, at the
+      parity pin `555967922`. The two are the same permutation written twice;
+      `qutlass_utils.py`'s own header records it as a copy of
+      `torchao/prototype/mx_formats`, i.e. of the module that quantized this
+      checkpoint. NVIDIA's layout reference:
+      <https://docs.nvidia.com/cuda/cublas/index.html#d-block-scaling-factors-layout>.
+    * **Written from scratch** in the sense §9.1 means: only the INVERSE, as an
+      explicit index formula. Both upstream writings are forward-only, and
+      `swizzle_blockscale` calls `.cuda()` unconditionally, so there is nothing to
+      port verbatim. The decode itself is `DequantNvfp4ToBf16`
+      (`include/vllm/model_executor/model_loader/nvfp4_dequant.h:59`), UNCHANGED.
+    * **Local anchor:** `include/vllm/model_executor/models/ltx2_loader.h`,
+      `src/vllm/model_executor/models/ltx2_loader.cpp`
+      (`Ltx2UnswizzleNvfp4BlockScale`, `ParseLtx2TorchaoNvfp4Marker`,
+      `Ltx2DequantTorchaoNvfp4ToBf16`).
+    * **Tests and evidence:** `tests/vllm/models/test_ltx2_loader.cpp`, three ways —
+      the five swizzle cases in `tests/vllm/models/ltx2_quant_goldens.inc`; a
+      512-byte tile of the SHIPPED text encoder's own `weight_scale` with its values
+      decoded by torch's fp8-e4m3; and the two REAL manifests
+      (`ltx2_fp8_dit_manifest.inc`, 6124 tensors; `ltx2_nvfp4_te_manifest.inc`,
+      1688), captured from the files' own headers with no payload read. The swizzle
+      oracle RUNS: `scripts/gen-ltx2-quant-goldens.py` loads vLLM's own `to_blocked`
+      out of the pinned checkout with `importlib.util.spec_from_file_location` and
+      calls `to_blocked(x, backend="torch")`. The earlier "not importable, so it
+      cannot be executed here" limit was WRONG — `import vllm.*` does die in
+      `vllm.distributed` on a missing `zmq`, but `qutlass_utils.py` needs only
+      torch, `vllm.triton_utils` and `vllm.utils.math_utils`, so loading the file
+      directly runs the real producer. Regenerating against it left every golden
+      byte IDENTICAL to the transcription's, and upstream's executing `to_blocked`
+      reproduces the shipped file's first 512 `weight_scale` bytes from the emitted
+      linear tile.
+    * **OWED, and precisely:** the `backend="triton"` arm of `to_blocked` and
+      `swizzle_blockscale` — vLLM's other two writings of the same permutation —
+      are pinned by source fragment only. Neither can execute on this host (no
+      active Triton driver; `swizzle_blockscale` calls `.cuda()` unconditionally),
+      so running them needs a GPU host. Also owed: Lightricks' first-party
+      NVFP4 DiT (`ltx-2.5-22b-distilled-transformer-nvfp4.safetensors`, 18.72 GB)
+      is behind an un-accepted HF gate (HTTP 403) and was NOT downloaded, so the
+      NVFP4 **DiT** arm is gated on a synthetic file whose header mirrors the real
+      layout; and the torchao arm of the Gemma TOWER itself (`Gemma4Weights`) is not
+      wired — `ltx2_text_encoder.h` declares no tower contract, so L6 loads the two
+      caption projections, the asset pack and the geometry, and VALIDATES every
+      tower module without materializing it.
+    * **Spec:** [ltx-2.5 spec](specs/ltx-2-5.md) §1.4 and §6 (L6). Lifecycle:
+      shipped (host + load-time device staging). Owner: the LTX-2.5 row.
 
 ## 10. E2E test suites (T0 deliverable)
 

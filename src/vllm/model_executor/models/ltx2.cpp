@@ -336,8 +336,12 @@ const std::vector<int64_t>* FindShape(const std::vector<Ltx2TensorSpec>& manifes
 std::vector<int64_t> RequireShape(const std::vector<Ltx2TensorSpec>& manifest,
                                   const std::string& name, int64_t rank) {
   const std::vector<int64_t>* shape = FindShape(manifest, name);
-  VT_CHECK(shape != nullptr, "ltx2 manifest: a tensor the geometry is derived from is missing");
-  VT_CHECK(static_cast<int64_t>(shape->size()) == rank, "ltx2 manifest: unexpected tensor rank");
+  VT_CHECK(shape != nullptr,
+           "ltx2 manifest: the tensor '" + name + "', which the geometry is derived from, "
+           "is missing");
+  VT_CHECK(static_cast<int64_t>(shape->size()) == rank,
+           "ltx2 manifest: '" + name + "' has rank " + std::to_string(shape->size()) +
+               ", expected " + std::to_string(rank));
   return *shape;
 }
 
@@ -422,7 +426,12 @@ namespace {
 
 Tensor Lookup(const std::map<std::string, Tensor>& tensors, const std::string& name) {
   auto it = tensors.find(name);
-  VT_CHECK(it != tensors.end(), "ltx2: a required tensor is missing from the weight map");
+  // BY NAME, which is what ltx2.h:228-232 promises. The name is the whole point:
+  // a caller assembling its own map has no other way to tell WHICH of 4078
+  // parameters it forgot, and the alternative to a named refusal is a
+  // zero-filled tensor that renders a plausible wrong video.
+  VT_CHECK(it != tensors.end(),
+           "ltx2: the weight map is missing the required tensor '" + name + "'");
   return it->second;
 }
 

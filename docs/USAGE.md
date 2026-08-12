@@ -1524,6 +1524,34 @@ only at their own `class` statements. Two known gaps in the schedule are open:
 0.10000002, and the suite's `MaxAbsDiff` drops NaN so a golden alone will not
 catch it.
 
+## LTX-2.5 quantized loaders (no render path yet)
+
+`include/vllm/model_executor/models/ltx2_loader.h` materializes the shipped
+LTX-2.5 checkpoints: the FP8 DiT, an NVFP4 DiT, and the torchao-NVFP4 Gemma-4
+text encoder with its embedded tokenizer. There is still no render path, so
+these are library entry points and not a command.
+
+Two behaviours a caller has to know. `Ltx2LoadDitFromSafetensors` REFUSES the
+shipped DiT by default, because that file carries five module families phase L2
+does not port (`prompt_adaln_single`, `audio_prompt_adaln_single`,
+`keyframes_abs_pos_embedding`, and the two `*_embeddings_connector` towers); pass
+`Ltx2DitLoadOptions::allow_unported_modules` to load the ported subset, which
+still reports every one of them in `Ltx2DitCheckpoint::unported`. And loading is
+**bf16** by default, the checkpoint's own model dtype; `widen_to_f32` is opt-in
+and exists only for the f32 parity forward.
+
+`Ltx2StreamDitToDevice` is the GB10 arm. It dequantizes and uploads one tensor at
+a time so peak residency is the device copy plus one tensor, and it stages at
+load because host-resident weights measure 20 to 30 percent slower there.
+
+The gate needs the two checkpoint headers and a vLLM checkout; it reads a few
+hundred bytes at their own offsets and never a payload:
+
+```sh
+python3 scripts/gen-ltx2-quant-goldens.py --vllm ~/_git/vllm --checkpoint-root /mnt/nas_share/checkpoints --out tests/vllm/models/ltx2_quant_goldens.inc
+cmake --build build --target test_ltx2_loader && ./build/tests/test_ltx2_loader
+```
+
 ## SSE keepalives on long prefill
 
 Async chat/completion streams may emit SSE **comment** frames (`:\n\n`) while

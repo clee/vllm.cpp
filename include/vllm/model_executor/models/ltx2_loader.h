@@ -1,0 +1,334 @@
+// LTX-2.5 QUANTIZED LOADERS — the FP8 DiT, the torchao-NVFP4 DiT and the
+// torchao-NVFP4 Gemma-4 text encoder, materialized from their SHIPPED
+// checkpoints onto the contracts phases L2 and L3 already committed.
+//
+// Row: MODEL-DIFFUSION-LTX25, .agents/specs/ltx-2-5.md phase L6. Issue #435.
+//
+// ─── NO NEW QUANT SCHEME. ONE DELTA, AND IT IS A SCALE LAYOUT ────────────────
+//
+// The DiT's FP8 arm is per-tensor E4M3 with an F32 `weight_scale` MULTIPLIER —
+// byte for byte what `DequantFp8ToBf16` (nvfp4_dequant.h:76) already consumes.
+//
+// The text encoder is torchao NVFP4, NOT compressed-tensors. Measured against
+// the shipped file rather than assumed: every quantized module carries a
+// `torchao_nvfp4` U8[240] marker whose JSON reads
+//
+//   {"format": "torchao_nvfp4", "block_size": 16, "scope": "full",
+//    "config": "NVFP4DynamicActivationNVFP4WeightConfig",
+//    "is_swizzled_scales": true, "use_triton_kernel": true,
+//    "use_dynamic_activation": true, "use_dynamic_per_tensor_scale": true}
+//
+// so the encoding is the SAME E2M1 nibble pair + fp8-e4m3 group scale +
+// per-tensor f32 global as the modelopt W4A16 path `DequantNvfp4ToBf16`
+// (nvfp4_dequant.h:59) implements, with `weight_scale_2` used as a MULTIPLIER
+// and not reciprocated — confirmed numerically on the real file, not inferred:
+// `model.layers.0.self_attn.q_proj` has weight_scale_2 = 1.3515e-4 and a group
+// scale whose maximum is exactly 448.0, so 6 * 448 * 1.3515e-4 = 0.3633 is a
+// plausible weight amax. Under the compressed-tensors DIVISOR convention
+// (nvfp4_emulation.h:18-23) the same number would imply an amax of 2688/1.35e-4
+// = 1.99e7, which no trained weight has. The convention is therefore modelopt's.
+//
+// The ONE delta is `is_swizzled_scales`: the group-scale tensor is stored in
+// the cuBLAS "block scaling factors layout" rather than the linear
+// [out, in/16] the two existing paths expect. `Ltx2UnswizzleNvfp4BlockScale`
+// inverts exactly the permutation vLLM's own producers apply —
+// `swizzle_blockscale` (vllm/model_executor/layers/quantization/utils/
+// nvfp4_utils.py:44-49) and `to_blocked`
+// (vllm/model_executor/layers/quantization/qutlass_utils.py:165-180), which are
+// the same permutation written twice — and hands the result to the UNCHANGED
+// `DequantNvfp4ToBf16`. Nothing else about the scheme differs.
+//
+// ─── WHAT THE STORED SHAPES MEAN, AND THE TRAP IN THEM ───────────────────────
+//
+// NVFP4 packs TWO values per byte along the LAST dimension, so every U8 width
+// in the text encoder's header is HALF the logical one. This campaign already
+// shipped that mistake once into a spec (§1.4). The loader therefore NEVER
+// reads a packed width as logical: `in_features = stored_cols * 2`, always, and
+// the result is cross-checked against the unpacked `model.norm.weight` [3840],
+// which is BF16 and so authoritative.
+//
+// The SWIZZLED scale is the second half of the same trap. Its stored shape is
+// [out/4, (in/16)*4] — the same element count as the linear [out, in/16], in a
+// different 2-D dress. Reading it as linear type-checks, produces finite
+// weights, and permutes every group scale within a 128x64 tile. The loader
+// asserts the swizzled shape explicitly and refuses anything else BY NAME.
+//
+// ─── DTYPE ───────────────────────────────────────────────────────────────────
+//
+// The default materialization is **bf16**, which is the checkpoint's own model
+// dtype: `DequantFp8ToBf16` / `DequantNvfp4ToBf16` land there natively, the
+// biases and norms are stored BF16, and upstream resolves ONE model dtype that
+// every layer inherits. A gate cannot catch a dtype that is too WIDE, so f32 is
+// never the default here.
+//
+// The tables (`scale_shift_table` and friends) are the annotated exception:
+// they are stored F32 IN THE CHECKPOINT and are kept F32, because narrowing a
+// tensor the file itself widened would be this rule applied backwards.
+//
+// `Ltx2WidenDitToF32` exists for one caller only — `Ltx2DitForward`, which
+// phase L2 declared f32-only because f32 is its PARITY dtype against upstream
+// run in torch float32 (ltx2.h:33-39). It is opt-in, it is named for what it
+// does, and it is not what a production load does.
+//
+// ─── GB10 RESIDENCY ──────────────────────────────────────────────────────────
+//
+// `Ltx2StreamDitToDevice` dequantizes and uploads ONE TENSOR AT A TIME, freeing
+// each host buffer before the next. Two measured findings force this and it is
+// not an option: host/ATS-retagged decode weights run 20-30% slower on GB10, so
+// weights are staged at LOAD; and a load-to-host-then-stage of a 21 GB DiT
+// holds both copies at once, which is what wedged the box during MiniMax-H3's
+// port (minimax_h3.h:1598-1606). Same shape, same reason.
+//
+// ─── WHAT THE SHIPPED DiT CARRIES THAT PHASE L2 DOES NOT PORT ────────────────
+//
+// MEASURED 2026-08-12 from the FP8 checkpoint's own header, and reported rather
+// than absorbed. The file carries four families outside the L2 contract:
+//
+//   prompt_adaln_single.*, audio_prompt_adaln_single.*
+//       Upstream builds these only when `cross_attention_adaln AND
+//       use_prompt_adaln_single` (model.py:222-226, :253-257). Their presence
+//       means the shipped LTX-2.5 sets `use_prompt_adaln_single = TRUE`, which
+//       contradicts .agents/specs/ltx-2-5.md §1.2 and ltx2.h:115-117 — and with
+//       it the prompt-K/V "free win", whose whole premise is that the prompt
+//       modulation carries no timestep term.
+//   keyframes_abs_pos_embedding  [1, 4096]
+//       So `use_keyframes_abs_pos_embedding = TRUE`, contradicting ltx2.h:47-49.
+//   video_embeddings_connector.*, audio_embeddings_connector.*
+//       8 `transformer_1d_blocks` and a `learnable_registers` [128, dim] each —
+//       the `Embeddings1DConnector` ltx2_text_encoder.h:319-324 already records
+//       as owed.
+//
+// None of these is silently dropped. `Ltx2LoadDitFromSafetensors` REFUSES the
+// load by naming them, and only an explicit `allow_unported_modules` — which
+// exists so the ported subset stays gateable — proceeds, still reporting every
+// one of them in `unported`.
+#pragma once
+
+#include <cstdint>
+#include <map>
+#include <memory>
+#include <string>
+#include <vector>
+
+#include "vllm/model_executor/models/ltx2.h"
+#include "vllm/model_executor/models/ltx2_text_encoder.h"
+#include "vt/backend.h"
+#include "vt/dtype.h"
+#include "vt/tensor.h"
+
+namespace vllm {
+
+class SafetensorsFile;
+struct StTensor;
+
+// ---------------------------------------------------------------------------
+// torchao NVFP4: the marker, and the one delta
+// ---------------------------------------------------------------------------
+
+// The `<module>.torchao_nvfp4` U8 sidecar, parsed. Every field is read rather
+// than assumed, and `ParseLtx2TorchaoNvfp4Marker` REFUSES a combination this
+// port does not implement — which is what makes "verify the layout before
+// reusing anything" a gate and not a comment.
+struct Ltx2TorchaoNvfp4Marker {
+  std::string format;
+  int64_t block_size = 0;
+  std::string scope;
+  std::string config;
+  bool is_swizzled_scales = false;
+  bool use_triton_kernel = false;
+  bool use_dynamic_activation = false;
+  bool use_dynamic_per_tensor_scale = false;
+};
+
+// The tensor name this port is keyed on.
+inline constexpr const char* kLtx2TorchaoNvfp4MarkerSuffix = ".torchao_nvfp4";
+
+// Parses the marker's JSON payload. Throws std::runtime_error naming `module`
+// on: a non-JSON payload, a `format` other than "torchao_nvfp4", a
+// `block_size` other than kNvfp4GroupSize (16), or `is_swizzled_scales` false —
+// the last because an UNSWIZZLED torchao checkpoint would need the linear read,
+// and silently applying the unswizzle to it permutes every scale.
+Ltx2TorchaoNvfp4Marker ParseLtx2TorchaoNvfp4Marker(const std::string& module,
+                                                   const StTensor& marker);
+
+// Invert the cuBLAS block-scaling-factors permutation.
+//
+// Source (vLLM `swizzle_blockscale`, nvfp4_utils.py:44-49): the [rows, cols]
+// scale is padded to [round_up(rows,128), round_up(cols,4)], viewed as
+// [rows/128, 4, 32, cols/4, 4] and permuted to (0, 3, 2, 1, 4). vLLM's
+// `to_blocked` (qutlass_utils.py:165-180) writes the identical permutation a
+// second way and is what torchao's own producer matches.
+//
+// So the element at logical (r, c), with r = 128*rt + 32*a + s and
+// c = 4*ct + q, lives at flat offset
+//
+//   ((((rt * (cols_padded/4)) + ct) * 32 + s) * 4 + a) * 4 + q
+//
+// `swizzled_bytes` must be exactly round_up(rows,128) * round_up(cols,4);
+// `linear` receives rows*cols bytes. Padding rows/cols are never read.
+void Ltx2UnswizzleNvfp4BlockScale(const uint8_t* swizzled, size_t swizzled_bytes,
+                                  int64_t rows, int64_t cols, uint8_t* linear);
+
+// One torchao-NVFP4 quantized module, dequantized to bf16 through the UNCHANGED
+// modelopt path: unswizzle the group scale, then `DequantNvfp4ToBf16`.
+//
+//   packed    U8       [out, in/2]        (in = stored cols * 2)
+//   scale     F8_E4M3  [out/4, (in/16)*4] the SWIZZLED layout
+//   scale_2   F32      scalar             MULTIPLIER
+//
+// Every one of those three shapes is asserted against `out`/`in` before a byte
+// is read, and a mismatch throws naming `module`. `out_bf16` receives out*in
+// bf16 bit patterns.
+void Ltx2DequantTorchaoNvfp4ToBf16(const std::string& module, const StTensor& packed,
+                                   const StTensor& scale, const StTensor& scale_2,
+                                   int64_t out_features, int64_t in_features,
+                                   uint16_t* out_bf16);
+
+// ---------------------------------------------------------------------------
+// The DiT
+// ---------------------------------------------------------------------------
+
+// ComfyUI-format checkpoints — which is what both shipped LTX-2.5 DiTs are —
+// prefix every parameter. Stripped before the name meets the L2 contract.
+inline constexpr const char* kLtx2DitCheckpointPrefix = "model.diffusion_model.";
+
+// Which quantization the DiT file actually uses, DETECTED from the tensors
+// rather than from a filename.
+enum class Ltx2DitQuant {
+  kFp8,    // F8_E4M3 weight + F32 scalar `<name>_scale`   (vonkaiser 22b-distilled-fp8)
+  kNvfp4,  // U8 packed + F8_E4M3 `<name>_scale` + F32 `<name>_scale_2`
+};
+
+struct Ltx2DitLoadOptions {
+  // Proceed past the unported families named at the top of this header,
+  // reporting them in `Ltx2DitCheckpoint::unported` instead of throwing. The
+  // ported subset is still bound exactly; nothing is approximated.
+  bool allow_unported_modules = false;
+  // Widen the bf16 materialization to f32 for `Ltx2DitForward`, whose gate is
+  // f32 by declaration. Doubles the footprint; see the DTYPE note above.
+  bool widen_to_f32 = false;
+};
+
+// A host buffer owned by a loaded checkpoint. Pointer-stable: the views index
+// into `bytes`, and the shared_ptr keeps that allocation alive independently of
+// how the owning vector grows.
+struct Ltx2HostBuffer {
+  std::vector<uint8_t> bytes;
+  vt::DType dtype = vt::DType::kF32;
+};
+
+struct Ltx2DitCheckpoint {
+  Ltx2DitQuant quant = Ltx2DitQuant::kFp8;
+  // The geometry the FILE describes, including the flags whose modules this
+  // port does not carry.
+  Ltx2DitParams checkpoint_params;
+  // The geometry actually BOUND — `checkpoint_params` with every unported flag
+  // cleared. The two differing is exactly what `unported` enumerates.
+  Ltx2DitParams params;
+  // Module prefixes present in the file and outside the L2 contract, in header
+  // order, deduplicated. Empty means the file and the contract agree.
+  std::vector<std::string> unported;
+  Ltx2DitWeights weights;
+  std::map<std::string, vt::Tensor> views;
+  // Host-resident buffers (`Ltx2LoadDitFromSafetensors`). Pointer-stable.
+  std::vector<std::shared_ptr<Ltx2HostBuffer>> storage;
+  // Device allocations (`Ltx2StreamDitToDevice`), each with its backend's Free
+  // as the deleter so a staged checkpoint releases exactly like a host one.
+  std::vector<std::shared_ptr<void>> device_storage;
+};
+
+// Recover `Ltx2DitParams` from a checkpoint header alone, prefix stripped and
+// packed widths doubled. Pure manifest work: no payload is touched.
+Ltx2DitParams Ltx2ParseDitParamsFromCheckpoint(const SafetensorsFile& file,
+                                                Ltx2DitQuant* out_quant = nullptr);
+
+// Materialize the whole DiT onto the L2 contract, HOST-resident.
+//
+// Every name the contract requires and the file lacks throws BY NAME, so a
+// missing tensor can never read as zeros. `EnumerateLtx2DitTensors` supplies
+// the required set and its shapes; both are checked before anything is bound.
+//
+// This is the REFERENCE loader and it materializes the whole model at once
+// (~21 GB bf16 for the shipped FP8 DiT). A real GB10 run uses
+// `Ltx2StreamDitToDevice`.
+Ltx2DitCheckpoint Ltx2LoadDitFromSafetensors(const SafetensorsFile& file,
+                                              const Ltx2DitLoadOptions& options = {});
+
+// Widen a bf16 checkpoint in place to f32, rebinding every view. Only for
+// `Ltx2DitForward`; see the DTYPE note.
+void Ltx2WidenDitToF32(Ltx2DitCheckpoint& checkpoint);
+
+// The GB10 arm: dequantize and upload tensor by tensor, freeing each host
+// buffer before the next, so peak residency is the device copy plus ONE tensor.
+// Returns the same struct with `views` pointing at DEVICE memory and
+// `device_storage` — NOT `storage`, which stays empty on this path — holding the
+// device allocations; `widen_to_f32` is refused here because the point of
+// staging is not to move twice the bytes.
+Ltx2DitCheckpoint Ltx2StreamDitToDevice(vt::Queue& queue, const SafetensorsFile& file,
+                                         const Ltx2DitLoadOptions& options = {});
+
+// ---------------------------------------------------------------------------
+// The text encoder
+// ---------------------------------------------------------------------------
+
+// One caption projection as it comes off the checkpoint: bf16 weight, bf16
+// bias. `Ltx2TextFeatureExtractorForward` refuses a config/weights disagreement
+// (ltx2_text_encoder.h:260-269), and the bias is loaded here precisely because
+// the case it names — reading the U8 weight and missing the BF16 bias — is what
+// a two-dtype module invites.
+struct Ltx2TextProjection {
+  std::vector<uint16_t> weight_bf16;  // [out_features, in_features]
+  std::vector<uint16_t> bias_bf16;    // [out_features], empty when bias=False
+  int64_t out_features = 0;
+  int64_t in_features = 0;
+};
+
+struct Ltx2TextEncoderLoadOptions {
+  // Mirror upstream's `GemmaAssets.from_single_file` refusal of a file with no
+  // `__metadata__`. The shipped checkpoint HAS none, so a caller holding the
+  // Gemma config out of band passes false — see ltx2_text_encoder.h:366-373.
+  bool require_config = false;
+  // Skip the two ~1.5 GB / ~0.8 GB projections and load only the geometry, the
+  // assets and the quantized-module inventory. What a manifest gate wants.
+  bool skip_projections = false;
+};
+
+struct Ltx2TextEncoderCheckpoint {
+  // Established from the UNPACKED `model.norm.weight` (BF16, so authoritative),
+  // never from a packed U8 width. Cross-checked against both projections.
+  int64_t gemma_hidden_size = 0;
+  int64_t gemma_num_hidden_layers = 0;
+  Ltx2TextProjection video, audio;
+  Ltx2GemmaAssets assets;
+  // Every module carrying a `torchao_nvfp4` marker, in header order. Includes
+  // the full multimodal tower (`vision_model.*`, `multi_modal_projector`,
+  // `audio_projector`) the file also ships: text conditioning is the scope, but
+  // a loader that CHOKES on their presence cannot read this checkpoint.
+  std::vector<std::string> quantized_modules;
+};
+
+// Materialize the LTX-specific half of the text encoder — the two caption
+// projections, the embedded tokenizer/asset pack and the Gemma geometry — from
+// the shipped torchao-NVFP4 file.
+//
+// Also VALIDATES every quantized module in the file, the Gemma tower included:
+// each must carry weight / weight_scale / weight_scale_2 / torchao_nvfp4 with
+// shapes consistent under the packed-width and swizzled-scale rules. A module
+// that does not throws BY NAME, so an unreadable tower is a load-time refusal
+// and not a phase-L7 surprise.
+//
+// The Gemma TOWER ITSELF is not materialized here: `ltx2_text_encoder.h`
+// declares no tower contract (it consumes hidden states through
+// `Ltx2TextHiddenStates`, which `Gemma4Model::ForwardHiddenStates` produces).
+// Wiring the tower's torchao arm onto `Gemma4Weights` is owed and named as such
+// rather than half-done.
+Ltx2TextEncoderCheckpoint Ltx2LoadTextEncoderFromSafetensors(
+    const SafetensorsFile& file, const Ltx2TextEncoderLoadOptions& options = {});
+
+// Widen the bf16 projections into `Ltx2TextEncoderWeights`, whose f32 is phase
+// L3's declared PARITY dtype (ltx2_text_encoder.h:73-83). Opt-in, and ~4.6 GB
+// at the shipped widths — which is exactly why it is not what loading does.
+Ltx2TextEncoderWeights Ltx2WidenTextProjectionsToF32(
+    const Ltx2TextEncoderCheckpoint& checkpoint);
+
+}  // namespace vllm
