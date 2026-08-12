@@ -58,6 +58,7 @@ are our reading of their documented behavior, not measurements.
 | KV events (block create / evict publish) | ◐ no transport | ✅ | ☐ | ☐ |
 | Prefix-cache matching unit | ◐ resolver only | ✅ | ☐ | ☐ |
 | Compute directly on quantized blocks | ✅ | ☐ | ☐ | ✅ |
+| Scratch allocator keyed by device (two backends, one process) | ✅ since [#516](https://github.com/mudler/vllm.cpp/issues/516); a pool is bound to one backend and refuses any other | ✅ device is field 0 of the allocation handle | ✅ | ✅ |
 | Automatic memory sizing (no hand-tuned budget) | ☐ hand-typed block count | ☐ percent, hand-tuned | ☐ | ◐ |
 | Memory cap with a pre-flight error instead of an OOM | ☐ | ◐ KV pool only | ◐ | ☐ |
 

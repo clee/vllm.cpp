@@ -32,6 +32,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <stdexcept>
 #include <vector>
 
 #include "vllm/model_executor/models/dense_device_glue.h"
@@ -234,4 +235,126 @@ TEST_CASE("device pool: size-class rounding still lets nearby sizes share a bloc
   }
   CHECK(second == first);
   CHECK(a.allocs() == allocs_after_first);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// The three properties that follow from "a pool is bound to one device", each
+// of which was silently wrong before and none of which the DBuf cases above
+// would catch on their own.
+// ═══════════════════════════════════════════════════════════════════════════
+
+TEST_CASE("device pool: Drain frees ONE device's blocks, through ITS OWN backend") {
+  // Before the device entered the key there was one free list, so the MiniMax-H3
+  // phase-change drain (minimax_h3_pipeline.cpp) handed every retained block to
+  // whichever backend it was called with — including another device's blocks, to
+  // an allocator that never made them.
+  TagBackend& a = NewBackend();
+  TagBackend& b = NewBackend();
+  Queue qa = QueueOn(0);
+  Queue qb = QueueOn(1);
+  const std::vector<int64_t> shape{16384};  // 65,536 bytes @ f32
+
+  void* held_by_b = nullptr;
+  {
+    DBuf x(Dev{a, qa}, DType::kF32, shape);
+  }
+  {
+    DBuf y(Dev{b, qb}, DType::kF32, shape);
+    held_by_b = y.ptr();
+  }
+  REQUIRE(a.frees() == 0);
+  REQUIRE(b.frees() == 0);
+
+  const size_t drained = vllm::Pool(a).Drain(a);
+  CHECK(drained > 0);
+  CHECK(a.frees() == 1);
+  CHECK(b.frees() == 0);  // device 1's retained block was NOT freed by device 0
+
+  // ...and device 1's free list is intact: its next request of that class is
+  // still the same block, i.e. the drain did not quietly empty it.
+  {
+    DBuf y(Dev{b, qb}, DType::kF32, shape);
+    CHECK(y.ptr() == held_by_b);
+  }
+}
+
+TEST_CASE("device pool: a pool bound to another device is REFUSED, not served") {
+  // `ActivePoolScope` is the one remaining way to hand a DBuf a pool that is not
+  // its device's. It is a legitimate seam — the aux CUDA stream uses it — so it
+  // stays, and the pool checks the backend instead. A hard throw, not an
+  // `assert`: the gate builds are Release/NDEBUG, where an assert is compiled
+  // out and the silent cross-device hand-off would come straight back.
+  TagBackend& a = NewBackend();
+  TagBackend& b = NewBackend();
+  Queue qa = QueueOn(0);
+  vllm::DevicePool bs_pool(b);  // a pool that belongs to device 1
+
+  const vllm::ActivePoolScope wrong(&bs_pool);
+  CHECK_THROWS_AS(DBuf(Dev{a, qa}, DType::kF32, {64}), std::logic_error);
+}
+
+TEST_CASE("device pool: ReleaseShared returns the block to the pool it CAME FROM") {
+  // The cross-step carrier (device logits, MTP hidden states, MoE scratch) used
+  // to be built by hand at ~28 sites, from a deleter that closed over the byte
+  // count ALONE and called `Pool().Put(alloc, q)`. So it returned the block to
+  // the one global pool whatever device it came from — and, separately, whatever
+  // POOL it came from, which silently drained the aux-stream pool into the main
+  // one. `ReleaseShared()` captures both.
+  TagBackend& a = NewBackend();
+  Queue qa = QueueOn(0);
+  const std::vector<int64_t> shape{12288};  // 49,152 bytes @ f32
+
+  void* raw = nullptr;
+  {
+    std::shared_ptr<void> carrier;
+    {
+      DBuf x(Dev{a, qa}, DType::kF32, shape);
+      raw = x.ptr();
+      carrier = x.ReleaseShared();
+    }
+    // The DBuf is gone but the carrier holds the block: this device's free list
+    // must NOT have it yet, so a same-class request allocates afresh.
+    DBuf other(Dev{a, qa}, DType::kF32, shape);
+    CHECK(other.ptr() != raw);
+  }
+  // Carrier dropped -> the block is back in THIS device's pool.
+  {
+    DBuf again(Dev{a, qa}, DType::kF32, shape);
+    CHECK(again.ptr() == raw);
+  }
+}
+
+TEST_CASE("device pool: a scoped pool's block returns to the SCOPED pool, not the device's") {
+  // The aux-stream shape, which the hand-written deleters got wrong on every
+  // path that used them: a block drawn under an ActivePoolScope and handed to a
+  // shared_ptr must come back to the SCOPED pool. Returning it to the device's
+  // main pool is how a second stream's block ends up in the first stream's free
+  // list — the race AuxPool() exists to prevent.
+  TagBackend& a = NewBackend();
+  Queue qa = QueueOn(0);
+  vllm::DevicePool scoped(a);  // same DEVICE, different pool
+  const std::vector<int64_t> shape{24576};  // 98,304 bytes @ f32
+
+  void* raw = nullptr;
+  {
+    std::shared_ptr<void> carrier;
+    {
+      const vllm::ActivePoolScope scope(&scoped);
+      DBuf x(Dev{a, qa}, DType::kF32, shape);
+      raw = x.ptr();
+      carrier = x.ReleaseShared();
+    }  // scope ends BEFORE the carrier is dropped, deliberately
+  }
+
+  // The device's main pool must not have acquired it...
+  {
+    DBuf from_main(Dev{a, qa}, DType::kF32, shape);
+    CHECK(from_main.ptr() != raw);
+  }
+  // ...the scoped pool must have.
+  {
+    const vllm::ActivePoolScope scope(&scoped);
+    DBuf from_scoped(Dev{a, qa}, DType::kF32, shape);
+    CHECK(from_scoped.ptr() == raw);
+  }
 }
