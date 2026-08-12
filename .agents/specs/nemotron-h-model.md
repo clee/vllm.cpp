@@ -189,6 +189,78 @@ RAM on GB10 and has OOM-rebooted the box.
   non-attention layers and may not move tokens on short prompts. Gate with a
   long-prompt arm, not only a 6-token one.
 
+## 6a. W2 note — the non-gated `relu²` expert, as built
+
+**Seam verdict: the non-gated expert is NOT a merged pair, and does not get a
+`MergedGemmGroup` descriptor.** `MergedGemmGroup` describes N GEMMs *sharing
+operand A* collapsed into one launch (`merged_gemm.h:1-22`). NemotronH's expert
+has exactly one projection — `ckpt_names=("up_proj", "down_proj", "")`
+(`nemotron_h.py:220`, the empty third entry being the absent gate) — so with
+N == 1 there is nothing to merge and no launch to save; an arity-1 descriptor
+would name a fusion that does not exist. `MlpGateUpMethodBase`
+(`linear.h:82-86`) is likewise a *merged `[2I,H]` gate_up* seam and has no pair
+to hold either.
+
+The arm is therefore the **existing** grouped projection plus the activation we
+did not have — exactly the shape the gated bf16 archs had before their pair was
+folded (`kMoeGroupedGemmBf16` + `kMoeSiluMul`):
+
+```
+up   : kMoeGroupedGemmBf16   (bf16)  |  kMoeGroupedGemmNvfp4Marlin (W4A16 g16)
+act  : kMoeRelu2                          <- NEW, the only new kernel
+down : kMoeGroupedGemmBf16   (bf16)  |  kMoeGroupedGemmNvfp4Marlin (W4A16 g16)
+comb : kMoeCombine(..., routed_scale)     <- routed scale on the OUTPUT
+```
+
+No parallel MoE path was added. The reasoning is recorded next to the seam it
+excludes (`merged_gemm.h`, the note after the bf16-sibling block).
+
+**`vt::MoeRelu2` (`OpId::kMoeRelu2`, CPU + CUDA).** Mirrors
+`ReLUSquaredActivation` (`layers/activation.py:609-628`) as the fused-MoE path
+reaches it: `activation_without_mul("relu2")` → `MoEActivation.RELU2_NO_MUL`
+(`layers/fused_moe/activation.py:33,98`) → `apply_moe_activation`'s
+`F.relu(input, inplace=True); torch.square(input, out=output)`. The **dtype
+order is the mirrored part**: upstream's kernel
+(`csrc/libtorch_stable/activation_kernels.cu:673-678`) widens to f32, clamps at
+zero in f32, squares in f32 and rounds ONCE on the store. No new f32 buffer is
+introduced — the op reads and writes the caller's dtype and only its arithmetic
+is f32, which is what `LoadF32`/`StoreF32` already are elsewhere in `vt`.
+
+**`routed_scaling_factor` is applied to the OUTPUT**
+(`apply_routed_scale_to_output=True`, `nemotron_h.py:234`). `vt::MoeCombine`
+gained a trailing `routed_scale` (default `1.0f`, so every landed caller is
+byte-identical) which multiplies the routed sum *before* the shared term is
+added — literally `moe_runner.py:389-406` (`fused_output *= routed_scaling_factor`,
+`shared_output` untouched) followed by `:722-725` (`shared_output + fused_output`).
+Upstream forces the ROUTER's factor to `1.0` in exactly this case
+(`layer.py:291-300`), so `MoeRouterTopKArgs::routed_scaling_factor` stays 1.0 on
+this path. Note this is the *opposite* polarity from Laguna, which folds the same
+factor into the router weights by linearity (`laguna_ops.h:48`); NemotronH takes
+the literal upstream form.
+
+**`group_size=16` NVFP4 — SUPPORTED, risk closed by source.** `MoeMarlinArgs`
+already defaults to `group_size = 16` with `mxfp4 = false` (`ops.h`), and
+`cuda_moe_marlin.cu:7,115-129` documents and consumes exactly that
+(`group_blocks=1`, `s_type = kFE4M3fn`, `num_groups = size_k / group_size`); 32
+is reachable only via the MXFP4 branch. It is the configuration the landed
+NVFP4 MoE archs (Laguna, Qwen3.5) already run. A unit test pins the default so a
+later widening cannot silently re-point these experts. **Not run here**: this
+worktree has no GPU (`nvcc` absent), so the CUDA arms — `kMoeRelu2` on kCUDA,
+`kMoeGroupedGemmNvfp4Marlin` on the real g16 tensors — are compiled-and-reviewed
+only and remain owed to a GB10 run (W6, or an earlier GPU-host spot check).
+
+**Evidence.** `tests/vt/test_ops_moe_nongated_relu2.cpp` (10 cases): the
+activation against hand-computed exact values, the `relu`/`silu` mis-ports, a
+bf16-in/f32-out arm that catches narrowing the square, a bf16-out raw-bit arm,
+the routed scale on the routed sum only, the 1.0 default being byte-identical to
+the landed call, and the whole expert `up → relu² → down → scaled combine` against
+an independently-written scalar reference. Mutations executed and caught:
+`relu` (5 cases red), `silu` (5 red), square narrowed through bf16 (2 red),
+routed scale dropped (2 red), routed scale applied to the combined output
+including the shared term (2 red), routed scale folded into the router logits
+(3 cases / 498 assertions red in `test_ops_moe_router_grouped`), NVFP4
+`group_size` default changed to 32 (1 red).
+
 ## 7. Now
 
 **State at this commit:** spec committed, implementation **not started**. The
