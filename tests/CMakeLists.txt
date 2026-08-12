@@ -165,6 +165,13 @@ foreach(_gateup_lever VT_DENSE_MARLIN_GATEUP VT_NVFP4_MARLIN VT_MOE_FUSED_W13)
     PROPERTIES ENVIRONMENT "${_gateup_lever}=0")
 endforeach()
 vllm_cpp_add_test(test_qwen35_plain_weights vllm/models/test_qwen35_plain_weights.cpp)
+# POOL-DEVICE-KEY (#516, .agents/specs/pool-device-key.md): the shared scratch
+# pool's free list must be keyed by DEVICE as well as size class, or a block
+# allocated through one backend is handed to a DBuf running on another —
+# host-side SIGSEGV in one direction, silent all-NaN output in the other.
+# Hardware-free: two fake backends stand in for two devices, so this runs
+# everywhere and in ~milliseconds rather than only where a GPU is present.
+vllm_cpp_add_test(test_device_pool vllm/models/test_device_pool.cpp)
 vllm_cpp_add_test(test_moe_resident_lifetime vllm/models/test_moe_resident_lifetime.cpp)
 vllm_cpp_add_test(test_qwen3_load vllm/models/test_qwen3_load.cpp)
 vllm_cpp_add_test(test_qwen3_forward vllm/models/test_qwen3_forward.cpp)
