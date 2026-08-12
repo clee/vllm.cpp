@@ -9,7 +9,9 @@
 **Upstream (serving oracle):** vLLM-Omni `vllm_omni/diffusion/` — see §3, it does NOT yet
 carry 2.5.
 **Checkpoints:** `Lightricks/LTX-2.5` (gated: auto), `vonkaiser/LTX-2.5-FP8-NVFP4` (ungated).
-**Status:** L0 — spec committed. Implementation phases L1–L7 below.
+**Status:** phases L1–L8. **L8's spec was written AFTER its implementation** (§8.1), which
+violates the spec-before-code rule; the operator's error, recorded rather than backfilled
+silently.
 
 ---
 
@@ -404,6 +406,25 @@ dgx.casa and the cluster nodes mount one copy rather than each pulling 30 GB.
 | Latent spatial upsampler x2, bf16 | `Lightricks/LTX-2.5` | 1.00 GB |
 | | | **~29 GB** |
 
+**CORRECTION, 2026-08-12 — the DiT in that table does NOT load.** L8 tried it and the loader
+refuses by name, before any forward:
+
+> `'transformer_blocks.0.attn1.to_q.weight_scale' is [4096, 256] but a SWIZZLED torchao scale
+> for [4096, 4096] is stored as [1024, 1024]. The LINEAR shape [4096, 256] has the same element
+> count, so reading one as the other type-checks and permutes every scale within a 128x4 tile.`
+
+The first-party NVFP4 file carries **no `.torchao_nvfp4` marker at all** and stores
+`weight_scale` in the LINEAR `[N, K/16]` layout, where L6's dequant expects the swizzled one.
+Same element count, so the mistake type-checks — which is exactly why the refusal exists.
+
+This is **L6 loader debt, not a forward defect**: it throws from `Ltx2StreamDitToDevice`. But it
+means the arm this table calls "best" is the one that cannot load, and nothing had materialized
+a tensor from that file before L8 — L7's shipped-checkpoint test only parsed the manifest.
+
+**What actually ran on the GB10 is the `vonkaiser` FP8 DiT** (21.0 GB, 6124 tensors), and §3.1
+records that the two are not interchangeable. Until the loader learns the linear layout, the
+NVFP4 arm is aspirational and the FP8 arm is the real one.
+
 Comfortably inside the pool, and materially smaller than H3's ~41 GB GGUF arm.
 
 ## 5. Design — the generalized seam
@@ -449,6 +470,38 @@ All on `row/MODEL-DIFFUSION-LTX25`, one PR.
 | **L5** | Pipeline: sigma schedule, distilled two-stage, latent spatial x2 upsampler, duration head | recipe values EXACT vs upstream |
 | **L6** | NVFP4 DiT + NVFP4 TE arms; GB10 load-time residency | quantized vs bf16 wiring gate; residency per the ATS finding |
 | **L7** | e2e on dgx.casa under `flock`; `/v1/videos` route | valid MP4+WAV; speed axis recorded `PENDING` per §0 |
+| **L8** | Device-resident DiT forward on GB10; the CUDA `vt::AttentionCross` it needed | every dispatched op `vt-native` on a CUDA queue, ZERO reference-tier hits; device-vs-host at f32 round-off against the SAME upstream goldens |
+
+### 8.1 L8 — written AFTER the fact, and that is a process failure
+
+**AGENTS.md is unambiguous: the spec "is committed *before* implementation, never written up
+afterwards."** L8 was dispatched and landed with no spec. That is the operator's error, not the
+implementer's, and it is recorded here rather than backfilled as though the order had been kept.
+
+What the spec would have had to say, had it been written first:
+
+**Scope.** A device-resident LTX-2.5 DiT forward whose activations live in device memory, and
+the CUDA `vt::AttentionCross` kernel it requires. Everything else routes through existing shared
+seams (`vt::MatmulBT`, `Add`, `RmsNorm`, `LayerNorm`, `GeluTanh`, `Attention`, `AttentionCross`).
+
+**The risk that justified the phase, and that a spec would have named first.** GB10 reports
+`UnifiedMemory`, so `RegisterReferenceTier` will serve a CPU kernel to a CUDA queue. With
+`vt::AttentionCross` CPU-only, all six cross-attentions per block would have executed on the
+host with every gate green and "it ran on the GPU" false. The gate therefore cannot be
+"the tests pass" — it has to be *provider identity per op*, which is what
+`VT_OP_PROVIDER_STATS=1` reports and what the review used.
+
+**Dtype.** bf16 is the production stream; `kF32` exists only as a gate arm, so the device
+forward can be held to `ltx2_goldens.inc` at f32 round-off. Nothing widens a bf16 load.
+
+**Stop condition that should have been written down.** "No 'it ran on the GPU' unless every
+dispatched op did, proven by provider identity rather than by a passing suite."
+
+**What the missing spec cost.** Two of the review's five MEDIUM findings are gate defects a
+written scope would plausibly have caught up front: the L7 config adoption landed entirely
+ungated (§7.0(c) again), and the new CUDA cross-attention's tiling machinery is never reached
+by any fixture — every gate geometry is `tiles=1 npl=1 nblk=1 hq==hk`, while a real render puts
+S at prompt length and Tq in the thousands, straight into the untested regime.
 
 ## 7. Tests
 
@@ -563,6 +616,18 @@ rather than an error:
 
 ## Now
 
-L0 committed. Next: L1 — introduce `vllm::multimodal::VideoEngine` and move MiniMax-H3
-behind it unchanged, gated on frames+WAV being byte-identical to the pre-refactor fold
-fixture.
+L1-L6 merged and operator-gated on `row/MODEL-DIFFUSION-LTX25`. L7 (VideoEngine wiring +
+dgx e2e) and L8 (device-resident forward) are implemented and reviewed FAIL on five MEDIUM
+findings; the repair is in flight.
+
+**The DiT forward runs on the GB10 GPU.** Independently verified by the runtime provider
+announcer, not by reading: all eight dispatched ops resolve `vt-native` on device 1 with
+`registered=1`, and ZERO reference-tier hits across eleven logs. The shipped 21.00B FP8 DiT
+(6124 tensors) staged and produced one finite forward, reproduced by the reviewer to the
+digit (absmax video 0.300781 / audio 2.14062).
+
+**Two things that claim qualifies.** The FP8 DiT carries NO `__metadata__`, so it ran under
+DEFAULTS (`av_ca_timestep_scale_multiplier = 1`, `double_precision_rope = false`) against
+LTX-2.5's declared 1000 / float64 — the shipped weights on the right device in the wrong
+configuration. And the first-party NVFP4 DiT, which §4 names as the best GB10 arm, does NOT
+load (§4 correction). Next: the L7/L8 repair, then the squash landing.
