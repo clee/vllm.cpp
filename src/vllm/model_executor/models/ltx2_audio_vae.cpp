@@ -186,176 +186,15 @@ void ApplyNorm(const Ltx2AudioDecoderConfig& config, std::vector<float>& x, int6
 
 // ---------------------------------------------------------------------------
 // 1-D primitives. Signals are [C, T].
+//
+// These are NOT reimplemented here. LTX-2.5's vocoder and MiniMax-H3's are the
+// same BigVGAN lineage, so Conv1d, ConvTranspose1d, the replicate/zero pad, the
+// Snake(Beta) nonlinearity and the alias-free `Activation1d` are ONE
+// implementation, published from minimax_h3.h and gated by BOTH suites. See that
+// header: a second copy of the alias-free trim geometry is the duplicate that
+// goes wrong quietly, because each copy keeps its own green gate while the two
+// audio VAEs drift apart.
 // ---------------------------------------------------------------------------
-
-std::vector<float> Conv1d(const std::vector<float>& in, int64_t in_channels, int64_t in_len,
-                          const std::vector<float>& weight, const std::vector<float>* bias,
-                          int64_t out_channels, int64_t kernel, int64_t stride, int64_t dilation,
-                          int64_t groups, int64_t* out_len) {
-  const int64_t effective = dilation * (kernel - 1) + 1;
-  const int64_t length = (in_len - effective) / stride + 1;
-  VT_CHECK(length > 0, "ltx2 conv1d: output length is empty");
-  const int64_t in_per_group = in_channels / groups;
-  const int64_t out_per_group = out_channels / groups;
-  std::vector<float> out(static_cast<size_t>(out_channels * length));
-  for (int64_t oc = 0; oc < out_channels; ++oc) {
-    const int64_t g = oc / out_per_group;
-    for (int64_t t = 0; t < length; ++t) {
-      double acc = bias != nullptr ? (*bias)[static_cast<size_t>(oc)] : 0.0;
-      for (int64_t ic = 0; ic < in_per_group; ++ic) {
-        const int64_t src_c = g * in_per_group + ic;
-        for (int64_t k = 0; k < kernel; ++k) {
-          acc += static_cast<double>(
-                     in[static_cast<size_t>(src_c * in_len + t * stride + k * dilation)]) *
-                 static_cast<double>(
-                     weight[static_cast<size_t>((oc * in_per_group + ic) * kernel + k)]);
-        }
-      }
-      out[static_cast<size_t>(oc * length + t)] = static_cast<float>(acc);
-    }
-  }
-  *out_len = length;
-  return out;
-}
-
-// torch.nn.functional.conv_transpose1d. Weight is [C_in, C_out/groups, K].
-std::vector<float> ConvTranspose1d(const std::vector<float>& in, int64_t in_channels,
-                                   int64_t in_len, const std::vector<float>& weight,
-                                   const std::vector<float>* bias, int64_t out_channels,
-                                   int64_t kernel, int64_t stride, int64_t padding, int64_t groups,
-                                   int64_t* out_len) {
-  const int64_t full = (in_len - 1) * stride + kernel;
-  const int64_t length = full - 2 * padding;
-  VT_CHECK(length > 0, "ltx2 conv_transpose1d: output length is empty");
-  const int64_t in_per_group = in_channels / groups;
-  const int64_t out_per_group = out_channels / groups;
-  std::vector<double> acc(static_cast<size_t>(out_channels * full), 0.0);
-  for (int64_t ic = 0; ic < in_channels; ++ic) {
-    const int64_t g = ic / in_per_group;
-    for (int64_t t = 0; t < in_len; ++t) {
-      const double value = in[static_cast<size_t>(ic * in_len + t)];
-      if (value == 0.0) continue;
-      for (int64_t oc = 0; oc < out_per_group; ++oc) {
-        const int64_t dst_c = g * out_per_group + oc;
-        for (int64_t k = 0; k < kernel; ++k) {
-          acc[static_cast<size_t>(dst_c * full + t * stride + k)] +=
-              value * static_cast<double>(
-                          weight[static_cast<size_t>((ic * out_per_group + oc) * kernel + k)]);
-        }
-      }
-    }
-  }
-  std::vector<float> out(static_cast<size_t>(out_channels * length));
-  for (int64_t c = 0; c < out_channels; ++c) {
-    for (int64_t t = 0; t < length; ++t) {
-      double value = acc[static_cast<size_t>(c * full + t + padding)];
-      if (bias != nullptr) value += (*bias)[static_cast<size_t>(c)];
-      out[static_cast<size_t>(c * length + t)] = static_cast<float>(value);
-    }
-  }
-  *out_len = length;
-  return out;
-}
-
-std::vector<float> Pad1d(const std::vector<float>& in, int64_t channels, int64_t in_len,
-                         int64_t left, int64_t right, bool replicate, int64_t* out_len) {
-  const int64_t length = in_len + left + right;
-  std::vector<float> out(static_cast<size_t>(channels * length), 0.0f);
-  for (int64_t c = 0; c < channels; ++c) {
-    for (int64_t t = 0; t < length; ++t) {
-      int64_t src = t - left;
-      if (src < 0 || src >= in_len) {
-        if (!replicate) continue;  // zero pad
-        src = std::max<int64_t>(0, std::min<int64_t>(in_len - 1, src));
-      }
-      out[static_cast<size_t>(c * length + t)] = in[static_cast<size_t>(c * in_len + src)];
-    }
-  }
-  *out_len = length;
-  return out;
-}
-
-// Snake / SnakeBeta (vocoder.py:187-230). Snake reuses ALPHA as the reciprocal
-// scale; SnakeBeta uses a separate BETA. Both exponentiate when logscale.
-void SnakeActivation(std::vector<float>& x, int64_t channels, int64_t length,
-                     const std::vector<float>& alpha, const std::vector<float>* beta,
-                     bool logscale) {
-  for (int64_t c = 0; c < channels; ++c) {
-    double a = alpha[static_cast<size_t>(c)];
-    double b = beta != nullptr ? (*beta)[static_cast<size_t>(c)] : a;
-    if (logscale) {
-      a = std::exp(a);
-      b = std::exp(b);
-    }
-    const double inv = 1.0 / (b + 1e-9);
-    for (int64_t t = 0; t < length; ++t) {
-      const double v = x[static_cast<size_t>(c * length + t)];
-      const double s = std::sin(a * v);
-      x[static_cast<size_t>(c * length + t)] = static_cast<float>(v + inv * s * s);
-    }
-  }
-}
-
-// Activation1d (vocoder.py:167-184): upsample 2x -> Snake(Beta) -> downsample 2x,
-// both through the kaiser-sinc window with REPLICATE padding. Structurally the
-// same activation MiniMax-H3's BigVGAN port carries, but H3's copy is private to
-// its translation unit, so this is a second implementation of the same upstream
-// lineage rather than a call into it; the shared piece that IS reachable — the
-// kaiser window itself — is reused through Ltx2KaiserSincFilter1d.
-struct AliasFreeActivation {
-  int64_t ratio = 2;
-  int64_t kernel_size = 12;
-  std::vector<float> filter;
-
-  void Build() {
-    filter = Ltx2KaiserSincFilter1d(0.5 / static_cast<double>(ratio),
-                                    0.6 / static_cast<double>(ratio), kernel_size);
-  }
-
-  std::vector<float> Apply(const std::vector<float>& in, int64_t channels, int64_t in_len,
-                           const std::vector<float>& alpha, const std::vector<float>* beta,
-                           bool logscale, int64_t* out_len) const {
-    // --- UpSample1d (vocoder.py:143-148) ---
-    const int64_t pad = kernel_size / ratio - 1;
-    const int64_t pad_left = pad * ratio + (kernel_size - ratio) / 2;
-    const int64_t pad_right = pad * ratio + (kernel_size - ratio + 1) / 2;
-    int64_t padded_len = 0;
-    const std::vector<float> padded =
-        Pad1d(in, channels, in_len, pad, pad, /*replicate=*/true, &padded_len);
-    std::vector<float> depthwise(static_cast<size_t>(channels * kernel_size));
-    for (int64_t c = 0; c < channels; ++c) {
-      for (int64_t k = 0; k < kernel_size; ++k) {
-        depthwise[static_cast<size_t>(c * kernel_size + k)] = filter[static_cast<size_t>(k)];
-      }
-    }
-    int64_t up_len = 0;
-    std::vector<float> up = ConvTranspose1d(padded, channels, padded_len, depthwise, nullptr,
-                                            channels, kernel_size, ratio, /*padding=*/0,
-                                            /*groups=*/channels, &up_len);
-    for (float& value : up) value *= static_cast<float>(ratio);
-    const int64_t trimmed_len = up_len - pad_left - pad_right;
-    VT_CHECK(trimmed_len > 0, "ltx2 activation1d: upsample trim emptied the signal");
-    std::vector<float> trimmed(static_cast<size_t>(channels * trimmed_len));
-    for (int64_t c = 0; c < channels; ++c) {
-      for (int64_t t = 0; t < trimmed_len; ++t) {
-        trimmed[static_cast<size_t>(c * trimmed_len + t)] =
-            up[static_cast<size_t>(c * up_len + pad_left + t)];
-      }
-    }
-
-    SnakeActivation(trimmed, channels, trimmed_len, alpha, beta, logscale);
-
-    // --- DownSample1d / LowPassFilter1d (vocoder.py:73-164) ---
-    const bool even = (kernel_size % 2) == 0;
-    const int64_t lp_left = kernel_size / 2 - (even ? 1 : 0);
-    const int64_t lp_right = kernel_size / 2;
-    int64_t lp_len = 0;
-    const std::vector<float> lp_padded =
-        Pad1d(trimmed, channels, trimmed_len, lp_left, lp_right, /*replicate=*/true, &lp_len);
-    return Conv1d(lp_padded, channels, lp_len, depthwise, nullptr, channels, kernel_size,
-                  /*stride=*/ratio, /*dilation=*/1, /*groups=*/channels, out_len);
-  }
-};
 
 // get_padding (vocoder.py:15-16) and torch's `padding="same"` split, which the
 // legacy ResBlock1 arm uses (resnet.py:22). Both are symmetric for odd kernels.
@@ -671,7 +510,7 @@ namespace {
 // AMPBlock1 (vocoder.py:283-290) and ResBlock1 (resnet.py:73-80): the two residual
 // stacks a Vocoder can carry.
 std::vector<float> VocoderResBlock(const Ltx2VocoderConfig& config, const Ltx2VaeWeights& weights,
-                                   const std::string& prefix, const AliasFreeActivation& act,
+                                   const std::string& prefix, const MiniMaxH3AliasFreeActivation1d& act,
                                    const std::vector<float>& x, int64_t channels, int64_t length,
                                    int64_t kernel, const std::vector<int64_t>& dilations) {
   std::vector<float> current = x;
@@ -699,10 +538,10 @@ std::vector<float> VocoderResBlock(const Ltx2VocoderConfig& config, const Ltx2Va
       }
       int64_t padded_len = 0;
       const std::vector<float> padded =
-          Pad1d(input, channels, in_len, left, right, /*replicate=*/false, &padded_len);
+          MiniMaxH3Pad1d(input, channels, in_len, left, right, /*replicate=*/false, &padded_len);
       int64_t produced = 0;
       std::vector<float> result =
-          Conv1d(padded, channels, padded_len, weights.Get(name + ".weight"),
+          MiniMaxH3Conv1d(padded, channels, padded_len, weights.Get(name + ".weight"),
                  &weights.Get(name + ".bias"), channels, kernel, 1, dil, 1, &produced);
       VT_CHECK(produced == in_len, "ltx2 vocoder: resblock conv changed the length");
       return result;
@@ -752,18 +591,18 @@ std::vector<float> VocoderForwardFromRows(const Ltx2VocoderConfig& config,
            "ltx2 vocoder: input size does not match [rows, frames]");
 
   const std::string p = config.prefix;
-  AliasFreeActivation act;
+  MiniMaxH3AliasFreeActivation1d act;
   if (config.amp) act.Build();
 
-  // conv_pre: Conv1d(128 -> upsample_initial_channel, k=7, padding=3).
+  // conv_pre: MiniMaxH3Conv1d(128 -> upsample_initial_channel, k=7, padding=3).
   int64_t channels = config.upsample_initial_channel;
   int64_t length = 0;
   std::vector<float> x;
   {
     int64_t padded_len = 0;
     const std::vector<float> padded =
-        Pad1d(rows, row_count, frames, 3, 3, /*replicate=*/false, &padded_len);
-    x = Conv1d(padded, row_count, padded_len, weights.Get(p + "conv_pre.weight"),
+        MiniMaxH3Pad1d(rows, row_count, frames, 3, 3, /*replicate=*/false, &padded_len);
+    x = MiniMaxH3Conv1d(padded, row_count, padded_len, weights.Get(p + "conv_pre.weight"),
                &weights.Get(p + "conv_pre.bias"), channels, 7, 1, 1, 1, &length);
   }
 
@@ -774,7 +613,7 @@ std::vector<float> VocoderForwardFromRows(const Ltx2VocoderConfig& config,
     const int64_t out_channels = config.upsample_initial_channel / (int64_t{1} << (i + 1));
     const std::string up = p + "ups." + std::to_string(i);
     int64_t up_len = 0;
-    x = ConvTranspose1d(x, channels, length, weights.Get(up + ".weight"),
+    x = MiniMaxH3ConvTranspose1d(x, channels, length, weights.Get(up + ".weight"),
                         &weights.Get(up + ".bias"), out_channels, kernel, stride,
                         /*padding=*/(kernel - stride) / 2, /*groups=*/1, &up_len);
     channels = out_channels;
@@ -798,7 +637,14 @@ std::vector<float> VocoderForwardFromRows(const Ltx2VocoderConfig& config,
 
   if (config.amp) {
     const std::string a = p + "act_post.act";
-    const std::vector<float>* beta = config.snakebeta ? &weights.Get(a + ".beta") : nullptr;
+    // act_post is UNCONDITIONALLY SnakeBeta, independently of `activation`:
+    // `self.act_post = Activation1d(SnakeBeta(final_channels))` (vocoder.py:388),
+    // inside `if self.is_amp` and taking no `activation=` argument — unlike the
+    // resblocks, which do (vocoder.py:376). So the beta tensor is read here
+    // whenever `amp` is set, even on the `activation="snake"` arm where every
+    // resblock uses plain Snake. Gating it on `config.snakebeta` instead made this
+    // one activation silently reuse ALPHA as its reciprocal scale.
+    const std::vector<float>* beta = &weights.Get(a + ".beta");
     int64_t produced = 0;
     x = act.Apply(x, channels, length, weights.Get(a + ".alpha"), beta, config.snake_logscale,
                   &produced);
@@ -811,11 +657,11 @@ std::vector<float> VocoderForwardFromRows(const Ltx2VocoderConfig& config,
 
   int64_t padded_len = 0;
   const std::vector<float> padded =
-      Pad1d(x, channels, length, 3, 3, /*replicate=*/false, &padded_len);
+      MiniMaxH3Pad1d(x, channels, length, 3, 3, /*replicate=*/false, &padded_len);
   const std::vector<float>* post_bias =
       config.use_bias_at_final ? &weights.Get(p + "conv_post.bias") : nullptr;
   int64_t final_len = 0;
-  std::vector<float> out = Conv1d(padded, channels, padded_len, weights.Get(p + "conv_post.weight"),
+  std::vector<float> out = MiniMaxH3Conv1d(padded, channels, padded_len, weights.Get(p + "conv_post.weight"),
                                   post_bias, 2, 7, 1, 1, 1, &final_len);
 
   if (config.apply_final_activation) {
@@ -879,7 +725,7 @@ std::vector<float> Ltx2VocoderWithBweForward(const Ltx2VocoderBweConfig& config,
   const int64_t remainder = low_len % config.hop_length;
   if (remainder != 0) {
     std::vector<float> grown;
-    grown = Pad1d(x, out_channels, low_len, 0, config.hop_length - remainder, /*replicate=*/false,
+    grown = MiniMaxH3Pad1d(x, out_channels, low_len, 0, config.hop_length - remainder, /*replicate=*/false,
                   &padded_len);
     x.swap(grown);
   }
@@ -905,9 +751,9 @@ std::vector<float> Ltx2VocoderWithBweForward(const Ltx2VocoderBweConfig& config,
     // CAUSAL: left-only padding, so a frame never depends on future samples
     // (vocoder.py:469-470).
     const std::vector<float> padded =
-        Pad1d(channel, 1, padded_len, left_pad, 0, /*replicate=*/false, &padded_wave);
+        MiniMaxH3Pad1d(channel, 1, padded_len, left_pad, 0, /*replicate=*/false, &padded_wave);
     const std::vector<float> spec =
-        Conv1d(padded, 1, padded_wave, forward_basis, nullptr, n_freqs * 2, config.filter_length,
+        MiniMaxH3Conv1d(padded, 1, padded_wave, forward_basis, nullptr, n_freqs * 2, config.filter_length,
                config.hop_length, 1, 1, &stft_len);
     if (c == 0) {
       mel_frames = stft_len;
@@ -926,7 +772,7 @@ std::vector<float> Ltx2VocoderWithBweForward(const Ltx2VocoderBweConfig& config,
         // The bwe generator consumes (channel, frame, mel) — the same layout
         // Ltx2VocoderForward takes (vocoder.py:625).
         bwe_mel[static_cast<size_t>((c * mel_frames + t) * config.n_mel_channels + m)] =
-            static_cast<float>(std::log(std::max(acc, 1e-5)));
+            static_cast<float>(std::log(std::max(acc, kLtx2BweMelLogClamp)));
       }
     }
   }
@@ -948,10 +794,10 @@ std::vector<float> Ltx2VocoderWithBweForward(const Ltx2VocoderBweConfig& config,
   }
   int64_t skip_padded = 0;
   const std::vector<float> skip_in =
-      Pad1d(x, out_channels, padded_len, pad, pad, /*replicate=*/true, &skip_padded);
+      MiniMaxH3Pad1d(x, out_channels, padded_len, pad, pad, /*replicate=*/true, &skip_padded);
   int64_t skip_full = 0;
   std::vector<float> skip =
-      ConvTranspose1d(skip_in, out_channels, skip_padded, depthwise, nullptr, out_channels,
+      MiniMaxH3ConvTranspose1d(skip_in, out_channels, skip_padded, depthwise, nullptr, out_channels,
                       kernel_size, ratio, /*padding=*/0, /*groups=*/out_channels, &skip_full);
   for (float& value : skip) value *= static_cast<float>(ratio);
   const int64_t skip_len = skip_full - pad_left - pad_right;

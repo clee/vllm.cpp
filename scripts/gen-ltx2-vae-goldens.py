@@ -24,6 +24,31 @@ Usage:
 Needs torch + numpy + einops (CPU only). `ltx_core` is imported with a single
 sys.path insert; no checkpoint, venv, or gated download is involved.
 
+UPSTREAM REVISION ANCHOR. The goldens are only interpretable against the exact
+upstream tree that produced them: if Lightricks changes `video_vae/resnet.py` and
+someone regenerates, the numbers move, and without a SHA nobody can tell whether
+the PORT drifted or UPSTREAM did, nor bisect from anywhere. So this generator
+resolves `git -C <--ltx2> rev-parse HEAD` at generation time and emits it into the
+`.inc` twice: once as a header comment for a human, and once as
+`kLtx2VaeUpstreamRevision`, which the C++ suite asserts against the SHA PINNED in
+the test. That makes the anchor load-bearing rather than decorative — a
+regeneration against a different checkout fails the gate instead of silently
+replacing the oracle.
+
+  Pinned revision: fd4ded7f2d88d3da713abcdd4ad41ecc4a9314ca
+
+Advancing the pin is a deliberate, reviewable edit in BOTH places (here and
+`kLtx2VaeUpstreamRevisionPin` in tests/vllm/models/test_ltx2_vae.cpp), never a
+side effect of regenerating.
+
+ORACLE IDENTITY, asserted rather than assumed. `sys.path.insert(0, ...)` normally
+wins, but path precedence is not a guarantee this script should be staking the
+oracle on: a `.pth` file, an editable install, a namespace-package layout or a
+later refactor to `sys.path.append` all make a pip-installed `ltx_core` resolve
+instead, and it would import silently and gate against the wrong source. So the
+resolved `ltx_core.__file__` is checked to live under `--ltx2` before anything
+runs. This mirrors scripts/gen-ltx2-goldens.py (phase L2).
+
 Two harness adaptations, both recorded because they change nothing about the math:
 
   * `ConvVideoDecoder` injects Gaussian noise through `torch.randn` (decoder
@@ -42,6 +67,7 @@ from __future__ import annotations
 
 import argparse
 import math
+import subprocess
 import sys
 from pathlib import Path
 
@@ -101,7 +127,20 @@ def param_values(name: str, shape) -> np.ndarray:
     if name.endswith("mel_basis"):
         # A mel filterbank is NON-NEGATIVE. Signed values would push most bins
         # under log's 1e-5 clamp, and a saturated golden hides errors.
-        return np.abs(ltx_rand(name, count)) * 0.2 + 0.05
+        basis = np.abs(ltx_rand(name, count)) * 0.2 + 0.05
+        # ...EXCEPT for the one arm that exists precisely to saturate it. The
+        # clamp `torch.clamp(mel, min=1e-5)` (vocoder.py:515) sets the floor of the
+        # log-mel the bwe_generator consumes, and it is the member of the
+        # invisible-constant class that BINDS IN PRODUCTION, because real silence
+        # reaches it. The well-scaled basis above never can — measured: the raw
+        # mel minimum is ~4.4e-3, and it stays there even for a zero input,
+        # because the vocoder's conv biases keep the waveform off silence. Scaling
+        # the basis by 1e-4 puts EVERY bin under the clamp, so on this arm the
+        # constant alone decides the generator's input and a mutation of it moves
+        # the golden.
+        if ".bwequiet." in name:
+            basis *= 1e-4
+        return basis
     if name.endswith(".gamma"):
         return ltx_rand(name, count) * 0.1 + 1.0
     if name.endswith(".alpha") or name.endswith(".beta"):
@@ -375,6 +414,35 @@ def section_audio_decoder(out) -> None:
     out.write("\n")
     emit_manifest(out, "kLtx2AudioDecCausalParam", causal_manifest)
 
+    # --- section 1c: the OTHER THREE causality axes ---
+    # Everything above runs `causality_axis=height`, the shipped default. The
+    # remaining three arms of `CausalConv2d`'s padding switch (causal_conv_2d.py,
+    # via causality_axis.py:4-10) were never executed, so the port's pad split for
+    # them was an untested claim. They are cheap to gate and one of them is subtle:
+    # WIDTH_COMPATIBILITY pads the width one-sidedly like WIDTH, but the
+    # UPSAMPLER treats it differently (upsample.py:44-48 does NOT drop the first
+    # element for that axis, while WIDTH and HEIGHT do), so the two axes are not
+    # interchangeable however similar their convolution padding looks.
+    for label, axis in (
+        ("None", CausalityAxis.NONE),
+        ("Width", CausalityAxis.WIDTH),
+        ("WidthCompat", CausalityAxis.WIDTH_COMPATIBILITY),
+    ):
+        arm = AudioDecoder(
+            norm_type=NormType.PIXEL,
+            causality_axis=axis,
+            mel_bins=mel_bins,
+            **AUDIO_DEC,
+        ).eval()
+        arm_manifest = fill_from_stream(arm, prefix="ltx2.audiodec.")
+        y_axis = arm(latent)
+        out.write(f"// --- section 1c: causality_axis = {axis.name} ---\n")
+        emit_scalar(out, f"kLtx2AudioDec{label}OutFrames", y_axis.shape[2])
+        emit_scalar(out, f"kLtx2AudioDec{label}OutMelBins", y_axis.shape[3])
+        out.write("\n")
+        emit_manifest(out, f"kLtx2AudioDec{label}Param", arm_manifest)
+        emit_f32(out, f"kLtx2AudioDec{label}Golden", y_axis.numpy())
+
 
 def _vocoder(cfg):
     from ltx_core.model.audio_vae.vocoder import Vocoder
@@ -402,6 +470,25 @@ def section_vocoder(out) -> None:
              kaiser_sinc_filter1d(cutoff=0.5 / 2, half_width=0.6 / 2, kernel_size=12).reshape(-1))
     emit_manifest(out, "kLtx2VocParam", manifest)
     emit_f32(out, "kLtx2VocGolden", y.numpy())
+
+    # --- section 2b: resblock "AMP1" with activation "snake" ---
+    # The arm that proves act_post is NOT governed by `activation`. Upstream builds
+    # `self.act_post = Activation1d(SnakeBeta(final_channels))` (vocoder.py:388)
+    # inside `if self.is_amp` and passes it no `activation=` argument, unlike the
+    # resblocks one line earlier (vocoder.py:376). So on THIS arm every resblock
+    # activation is plain Snake — which reuses ALPHA as its reciprocal scale
+    # (vocoder.py:198) — while act_post still reads `.beta`. A port that keys
+    # act_post off `activation` produces a plausible waveform from the wrong
+    # scale, and no other arm can tell, because on the shipped snakebeta arm the
+    # two agree.
+    voc_snake = _vocoder({**VOC, "activation": "snake"})
+    snake_manifest = fill_from_stream(voc_snake, prefix="ltx2.vocsnake.")
+    y_snake = voc_snake(mel)
+    out.write('// --- section 2b: AMP1 with activation "snake" (act_post stays SnakeBeta) ---\n')
+    emit_scalar(out, "kLtx2VocSnakeOutSamples", y_snake.shape[2])
+    out.write("\n")
+    emit_manifest(out, "kLtx2VocSnakeParam", snake_manifest)
+    emit_f32(out, "kLtx2VocSnakeGolden", y_snake.numpy())
 
 
 def section_vocoder_legacy(out) -> None:
@@ -451,6 +538,54 @@ def section_bwe(out) -> None:
     emit_f32(out, "kLtx2BweResamplerFilterGolden", resampler.filter.reshape(-1).numpy())
     emit_manifest(out, "kLtx2BweParam", manifest)
     emit_f32(out, "kLtx2BweGolden", y.numpy())
+
+    # --- section 4b: the arm where the mel log CLAMP actually binds ---
+    # Everything above leaves `torch.clamp(mel, min=1e-5)` (vocoder.py:515) inert:
+    # the raw mel minimum is ~4.4e-3. So the clamp is an INVISIBLE CONSTANT there,
+    # and mutation confirms 1e-5 -> 1e-8 changes nothing. This arm attenuates
+    # mel_basis by 1e-4 (see param_values) so every bin lands under the clamp and
+    # the constant alone decides what the bwe_generator sees — which is what real
+    # silence does in production. The saturation COUNT is emitted too, so the C++
+    # side asserts the probe is actually saturated rather than trusting it.
+    quiet_voc = _vocoder(VOC)
+    quiet_gen = _vocoder(BWE_GEN)
+    quiet_stft = MelSTFT(
+        filter_length=BWE["filter_length"],
+        hop_length=BWE["hop_length"],
+        win_length=BWE["win_length"],
+        n_mel_channels=BWE["n_mel_channels"],
+    )
+    quiet = VocoderWithBWE(
+        vocoder=quiet_voc,
+        bwe_generator=quiet_gen,
+        mel_stft=quiet_stft,
+        input_sampling_rate=BWE["input_sampling_rate"],
+        output_sampling_rate=BWE["output_sampling_rate"],
+        hop_length=BWE["hop_length"],
+    ).eval()
+    quiet_manifest = fill_from_stream(quiet, prefix="ltx2.bwequiet.")
+    y_quiet = quiet(mel)
+
+    # Recompute the RAW (pre-clamp) mel exactly as VocoderWithBWE.forward does, to
+    # count how many values the clamp is holding up.
+    import torch
+
+    low = quiet_voc(mel)
+    pad = (-low.shape[-1]) % BWE["hop_length"]
+    padded = torch.nn.functional.pad(low, (0, pad))
+    magnitude, _ = quiet_stft.stft_fn(padded.reshape(-1, padded.shape[-1]))
+    raw_mel = torch.matmul(quiet_stft.mel_basis.to(magnitude.dtype), magnitude)
+    saturated = int((raw_mel < 1e-5).sum())
+    assert saturated == raw_mel.numel(), (
+        f"the saturating probe must saturate EVERY bin or it gates nothing: "
+        f"{saturated}/{raw_mel.numel()}, min={float(raw_mel.min()):g}"
+    )
+    out.write("// --- section 4b: the BWE mel log clamp, SATURATED (vocoder.py:515) ---\n")
+    emit_scalar(out, "kLtx2BweQuietSaturatedBins", saturated)
+    emit_scalar(out, "kLtx2BweQuietOutSamples", y_quiet.shape[2])
+    out.write("\n")
+    emit_manifest(out, "kLtx2BweQuietParam", quiet_manifest)
+    emit_f32(out, "kLtx2BweQuietGolden", y_quiet.numpy())
 
 
 def section_conv_video_decoder(out) -> None:
@@ -537,6 +672,87 @@ def section_conv_video_decoder(out) -> None:
     out.write("\n")
     emit_manifest(out, "kLtx2VideoDecCausalParam", causal_manifest)
 
+    # --- section 5c: causal=False, which is UPSTREAM'S OWN DEFAULT ---
+    # `ConvVideoDecoder.__init__` declares `causal: bool = False`
+    # (conv_video_decoder.py:184) and its docstring calls that the standard
+    # decoder, yet every arm above runs causal=True. The non-causal branch is a
+    # DIFFERENT padding rule, not a disabled one: CausalConv3d replicates the
+    # first AND last frame (kernel-1)//2 times each instead of putting kernel-1
+    # copies of frame 0 on the left (convolution.py:266-317), which is why the
+    # frame count comes out the same either way and why getting it wrong shifts
+    # the whole clip without changing a single shape.
+    # It shares the causal arm's WEIGHTS, INPUT and NOISE stream deliberately, so
+    # the only difference between the two goldens is the padding rule — which lets
+    # the C++ side assert the two arms actually diverge.
+    noncausal_draws: list[int] = []
+
+    def noncausal_randn(*args, **kwargs):
+        shape = tuple(args[0]) if len(args) == 1 and not isinstance(args[0], int) else tuple(args)
+        count = int(np.prod(shape)) if shape else 1
+        values = ltx_rand(f"ltx2.videodec.noise.{len(noncausal_draws)}", count)
+        noncausal_draws.append(count)
+        return torch.from_numpy(values.astype(np.float32)).reshape(shape)
+
+    noncausal = ConvVideoDecoder(
+        decoder_blocks=VIDEO_BLOCKS,
+        norm_layer=NormLayerType.PIXEL_NORM,
+        decoder_spatial_padding_mode=PaddingModeType.REFLECT,
+        **{**VIDEO_DEC, "causal": False},
+    ).eval()
+    noncausal_manifest = fill_from_stream(noncausal, prefix="ltx2.videodec.")
+    torch.randn = noncausal_randn
+    try:
+        y_nc = noncausal(latent)
+    finally:
+        torch.randn = real_randn
+    assert not torch.equal(y, y_nc), (
+        "causal and non-causal must DIFFER on identical weights, or the arm gates nothing"
+    )
+
+    out.write("// --- section 5c: causal=False, upstream's default arm ---\n")
+    emit_scalar(out, "kLtx2VideoDecNcOutT", y_nc.shape[2])
+    emit_scalar(out, "kLtx2VideoDecNcOutH", y_nc.shape[3])
+    emit_scalar(out, "kLtx2VideoDecNcOutW", y_nc.shape[4])
+    emit_scalar(out, "kLtx2VideoDecNcNoiseDraws", len(noncausal_draws))
+    out.write("inline constexpr int64_t kLtx2VideoDecNcNoiseCounts[] = {\n    "
+              + ", ".join(str(c) for c in noncausal_draws) + ",\n};\n\n")
+    emit_manifest(out, "kLtx2VideoDecNcParam", noncausal_manifest)
+    emit_f32(out, "kLtx2VideoDecNcGolden", y_nc.numpy())
+
+
+def load_upstream(root: Path) -> Path:
+    """Import `ltx_core` BY PATH from `root`, and prove that is what resolved."""
+    src = root / "packages" / "ltx-core" / "src"
+    if not (src / "ltx_core" / "model" / "audio_vae" / "audio_vae.py").is_file():
+        raise SystemExit(f"no ltx_core under {src}; point --ltx2 at a Lightricks/LTX-2 checkout")
+    sys.path.insert(0, str(src))
+    import ltx_core  # noqa: PLC0415
+
+    # ORACLE IDENTITY, asserted rather than assumed: a pip-installed or editable
+    # `ltx_core` that wins path resolution would import silently and gate every
+    # golden below against the wrong source. See the module docstring.
+    resolved = Path(ltx_core.__file__).resolve()
+    if not resolved.is_relative_to(src.resolve()):
+        raise SystemExit(
+            f"ltx_core resolved to {resolved}, which is NOT under the checkout at {src}. "
+            "Refusing to generate goldens from an oracle this script did not choose."
+        )
+    return src
+
+
+def upstream_revision(root: Path) -> str:
+    """The exact upstream tree these goldens were produced from."""
+    try:
+        done = subprocess.run(
+            ["git", "-C", str(root), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except Exception:  # noqa: BLE001 - a tarball checkout carries no git metadata
+        return "unknown"
+    return done.stdout.strip()
+
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -545,10 +761,9 @@ def main() -> int:
     parser.add_argument("--out", required=True, type=Path)
     args = parser.parse_args()
 
-    src = (args.ltx2.expanduser().resolve() / "packages" / "ltx-core" / "src")
-    if not (src / "ltx_core" / "model" / "audio_vae" / "audio_vae.py").is_file():
-        raise SystemExit(f"no ltx_core under {src}; point --ltx2 at a Lightricks/LTX-2 checkout")
-    sys.path.insert(0, str(src))
+    root = args.ltx2.expanduser().resolve()
+    load_upstream(root)
+    revision = upstream_revision(root)
 
     import torch
 
@@ -566,8 +781,14 @@ def main() -> int:
             "//   python3 scripts/gen-ltx2-vae-goldens.py --ltx2 <LTX-2 checkout>\n"
             "//       --out tests/vllm/models/ltx2_vae_goldens.inc\n"
             "//\n"
+            f"// Upstream revision: {revision}\n"
+            "//\n"
             "// See .agents/specs/ltx-2-5.md section 7 for why this is the gate.\n"
             "#pragma once\n\n#include <cstdint>\n\nnamespace vllm_test {\n\n"
+            "// The upstream tree these numbers came from. The suite asserts this equals\n"
+            "// the SHA it pins, so regenerating against a DIFFERENT checkout fails the\n"
+            "// gate instead of silently replacing the oracle.\n"
+            f'inline constexpr const char* kLtx2VaeUpstreamRevision = "{revision}";\n\n'
         )
         section_audio_decoder(out)
         section_vocoder(out)

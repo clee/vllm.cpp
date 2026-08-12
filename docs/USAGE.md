@@ -316,6 +316,21 @@ tokens quietly.
 This is a deliberate state, not a bug: registering the architecture is what lets
 the config parse and weight-name mapping be tested before the forward exists.
 
+### LTX-2.5 has no user-facing entrypoint yet
+
+LTX-2.5 is being ported in phases. Its two VAE decoders are implemented and
+gated, but no CLI flag, server endpoint or C ABI call reaches them, so there is
+nothing to run here yet and no request shape to document. Do not infer from
+[FEATURES](FEATURES.md) that a render is available.
+
+One behaviour is worth stating in advance, because it decides what you get when
+the entrypoint does arrive. LTX-2.5 ships two video decoders behind one
+checkpoint field. The convolutional one is implemented; the higher quality
+diffusion one (`NADiffusionDecoder`) is not, and asking for it fails with a
+message naming the missing neighborhood-attention kernel. It never falls back to
+the convolutional decoder, because that would hand back a lower quality render as
+if it were the one you asked for.
+
 ### Muse Glimmer: exactly what has been checked
 
 `MuseGlimmerForCausalLM` / `MuseGlimmerForConditionalGeneration` are not in that

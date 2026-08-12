@@ -43,6 +43,15 @@
 //    pixels inside every 2x2 block; keeping the first frame shifts the whole clip.
 //  * `unpatchify` DECOMPOSES CHANNELS AS `(c p r q)` WITH `h` TAKING q AND `w`
 //    TAKING r (ops.py:50-58) — r and q are NOT interchangeable.
+//
+// ─── DTYPE ───────────────────────────────────────────────────────────────────
+// Every buffer this header names is f32, because this is the CPU REFERENCE arm.
+// Upstream runs the decoder in the CHECKPOINT's dtype instead
+// (`sample.to(weights_dtype)` in, `sample.to(output_dtype)` out —
+// conv_video_decoder.py:283-286, 355-356), and it has none of the float32 pin the
+// audio tower carries. The bf16/NVFP4 arm that inherits the checkpoint dtype is
+// owed by phase L6; see ltx2_video_vae.cpp for why no gate here can catch a dtype
+// that is merely too WIDE.
 #pragma once
 
 #include <cstdint>
@@ -63,6 +72,15 @@ enum class Ltx2PaddingMode { kZeros, kReflect, kReplicate };
 // Which decoder a checkpoint asks for.
 enum class Ltx2VideoDecoderKind { kConv, kDiffusion };
 
+// `_RMSNorm2D` is `F.normalize(x, dim=1) * (sqrt(C) * gamma)` (attention.py:11-30),
+// so the denominator floor is torch's `F.normalize` DEFAULT eps of 1e-12 — an L2
+// normalize, not a mean-square RMS, and not this project's usual rms_norm epsilon.
+// Named so it can be pinned: mutation proves 1e-12 -> 0.0 leaves every golden
+// green, because the reduced-dimension activations are O(1) and the floor never
+// binds. It still decides whether an all-zero channel vector divides or produces
+// NaN.
+inline constexpr double kLtx2RmsNorm2dEps = 1e-12;
+
 // `config.vae._class_name` -> the decoder kind, mirroring
 // `_vae_class_name_from_metadata` + `VideoDecoderConfigurator.from_metadata`
 // (video_vae/model_configurator.py:18-34, 242-250): the conv decoder is selected
@@ -81,6 +99,27 @@ struct Ltx2VideoDecoderBlock {
   bool residual = false;
 };
 
+// ─── THE INVISIBLE-CONSTANT CLASS ────────────────────────────────────────────
+// An HONEST LIMIT of these goldens, and it is a CLASS, not one instance. Any
+// epsilon or floor that exists to stabilize a division is, by construction,
+// invisible to a reduced-dimension parity gate: the deterministic stream produces
+// O(1) activations, the term it guards never binds, and the tensor comparison
+// therefore accepts any value at all — including 0.0, and including one 100x off.
+// MEASURED, by mutating each in turn with EVERY golden staying green:
+//
+//   Ltx2ConvVideoDecoderConfig::norm_eps   1e-6 -> 1e-4   green
+//   Ltx2ConvVideoDecoderConfig::pixel_norm_eps 1e-8 -> 1e-6 green
+//   kLtx2BweMelLogClamp                    1e-5 -> 1e-8   green
+//   kMiniMaxH3SnakeEps                     1e-9 -> 0.0    green
+//   kLtx2RmsNorm2dEps                      1e-12 -> 0.0   green
+//
+// So every member of the class is held by a SOURCE-ANCHORED CONSTANT ASSERTION in
+// tests/vllm/models/test_ltx2_vae.cpp, cited to the upstream line that sets it,
+// rather than by the tensor comparison — and a constant that is added later and
+// left unpinned is a new hole, not a covered one. The BWE clamp additionally gets
+// a golden whose input SATURATES it, because that is the one the reduced-dimension
+// stream can be pushed into reaching and the one real silence reaches in
+// production.
 struct Ltx2ConvVideoDecoderConfig {
   // Defaults mirror `_build_conv_video_decoder`
   // (video_vae/model_configurator.py:81-94).
@@ -98,16 +137,14 @@ struct Ltx2ConvVideoDecoderConfig {
   int64_t norm_num_groups = 32;
   double decode_noise_scale = 0.025;
   double decode_timestep = 0.05;
-  double norm_eps = 1e-6;  // GroupNorm arm, and the norm3 LayerNorm-equivalent
+  // The GroupNorm arm's eps, and the one `res_x_y`'s shortcut norm3 uses.
+  // `ResnetBlock3D.__init__` declares `eps: float = 1e-6` (video_vae/resnet.py:31)
+  // and hands it to every nn.GroupNorm it builds (resnet.py:44, 65, 94);
+  // `UNetMidBlock3D` carries the same value as `resnet_eps` (resnet.py:216).
+  double norm_eps = 1e-6;
   // `PixelNorm()`'s DEFAULT (normalization.py:22), reached bare from
   // video_vae/resnet.py:46 and conv_video_decoder.py:243 — NOT the 1e-6 the audio
   // VAE gets through build_normalization_layer.
-  //
-  // HONEST LIMIT, measured by mutation: the reduced-dimension golden CANNOT tell
-  // 1e-8 from 1e-6 here. The normalized activations are O(1), so the two epsilons
-  // differ by ~1e-7 relative — below the f32 round-off the gate already carries.
-  // This field is therefore pinned by a source-anchored constant assertion in the
-  // test, not by the tensor comparison, and that is exactly what it is worth.
   double pixel_norm_eps = 1e-8;
   std::string prefix;
 };

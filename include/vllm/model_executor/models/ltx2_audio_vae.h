@@ -138,7 +138,20 @@ Ltx2AudioSpectrogram Ltx2AudioDecoderForward(const Ltx2AudioDecoderConfig& confi
 // ---------------------------------------------------------------------------
 
 struct Ltx2VocoderConfig {
-  // Defaults mirror Vocoder.__init__ (vocoder.py:317-341).
+  // Shapes mirror Vocoder.__init__ (vocoder.py:317-341), but the two ARM
+  // selectors deliberately do NOT: `Vocoder.__init__` defaults to `resblock="1"`
+  // and `activation="snake"`, i.e. the pre-2.3 legacy arm, while `amp` and
+  // `snakebeta` below default to the AMP1/snakebeta arm.
+  //
+  // That is not a mismatch, it is the LTX-2.5 contract. A 2.5 checkpoint reaches
+  // the vocoder through VocoderConfigurator.from_metadata, whose BWE branch
+  // REQUIRES both — `check_config_value(vocoder_cfg, "resblock", "AMP1")` and
+  // `check_config_value(vocoder_cfg, "activation", "snakebeta")`, and the same
+  // pair again for the BWE generator (audio_vae/model_configurator.py:59-64).
+  // A default that mirrored `Vocoder.__init__` would therefore be a default no
+  // shipping checkpoint can use. The legacy arm stays reachable by setting
+  // `amp = false`, which is what the `resblock == "1"` branch selects
+  // (model_configurator.py:53), and it is gated on its own.
   std::vector<int64_t> resblock_kernel_sizes = {3, 7, 11};
   std::vector<int64_t> upsample_rates = {6, 5, 2, 2, 2};
   std::vector<int64_t> upsample_kernel_sizes = {16, 15, 8, 4, 4};
@@ -173,6 +186,15 @@ std::vector<float> Ltx2VocoderForward(const Ltx2VocoderConfig& config,
 // ---------------------------------------------------------------------------
 // VocoderWithBWE (vocoder.py:519-630) — the ltx-2.3+ arm the 2.5 checkpoint uses.
 // ---------------------------------------------------------------------------
+
+// The floor under the BWE mel BEFORE its log: `torch.clamp(mel, min=1e-5)`
+// (vocoder.py:516). Named so it can be pinned, because it is the member of the
+// invisible-constant class that actually bites in production: it sets the floor of
+// the log-mel fed to the bwe_generator, and REAL SILENCE reaches it. A
+// reduced-dimension golden built from the deterministic stream cannot, because
+// that stream's mel_basis is non-negative and well-scaled and nothing saturates —
+// mutation proves 1e-5 -> 1e-8 leaves every tensor golden green.
+inline constexpr double kLtx2BweMelLogClamp = 1e-5;
 
 struct Ltx2VocoderBweConfig {
   Ltx2VocoderConfig vocoder;        // prefix defaults to `<prefix>vocoder.`

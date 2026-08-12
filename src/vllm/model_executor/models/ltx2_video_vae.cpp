@@ -16,6 +16,32 @@
 //    are not ported: the decoder is built with `convolution_dimensions=3`.
 //  * The ENCODER half and the TILED decode path (`tiled_decode`,
 //    conv_video_decoder.py:383-484) are out of this phase and owed.
+//
+// ─── DTYPE: THIS IS THE CPU REFERENCE ARM, AND f32 IS NOT WHAT SHIPS ─────────
+// Every buffer below is f32, and unlike the audio VAE next door that is NOT an
+// upstream-grounded choice — it is the choice a reference arm makes, and it is
+// annotated here because AGENTS.md requires an f32 on a model path to carry a
+// reason, and because a too-WIDE dtype is the one defect a correctness gate
+// structurally cannot report: it stays numerically right, the goldens stay green,
+// and the only symptom is twice the bytes moved.
+//
+// Upstream does the OPPOSITE of what the audio VAE does. `ConvVideoDecoder.forward`
+// runs in the CHECKPOINT's dtype: it casts in with `sample.to(weights_dtype)` on
+// entry and back with `sample.to(output_dtype)` on exit
+// (conv_video_decoder.py:283-286, 355-356). There is no autocast, no float32
+// pin, and no spectral-metric argument of the kind that justifies the audio
+// tower's f32 (ltx2_audio_vae.cpp:7-12 -> vocoder.py:585-595). So f32 here is
+// the reference arm's convention and nothing more.
+//
+// The golden CANNOT catch this either, and that is worth stating plainly rather
+// than leaving for someone to discover: the generator's `fill_from_stream` casts
+// every upstream parameter to f32, so the oracle itself runs f32 and a dtype
+// comparison against it is vacuous by construction.
+//
+// PHASE L6 OWES THE PRODUCTION ARM — the bf16/NVFP4 decode that inherits the
+// checkpoint dtype the way upstream does. Until it lands, this file is a
+// correctness reference, not the shipping path, and no memory or throughput
+// number should be taken from it.
 #include "vllm/model_executor/models/ltx2_video_vae.h"
 
 #include <algorithm>
@@ -462,7 +488,7 @@ Volume AttnBlock3d(const Ltx2VaeWeights& weights, const std::string& prefix, con
         const double value = x.data[x.At(ch, frame, i / x.w, i % x.w)];
         sum_sq += value * value;
       }
-      const double inv = 1.0 / std::max(std::sqrt(sum_sq), 1e-12);
+      const double inv = 1.0 / std::max(std::sqrt(sum_sq), kLtx2RmsNorm2dEps);
       for (int64_t ch = 0; ch < c; ++ch) {
         normed[static_cast<size_t>(ch * n + i)] =
             x.data[x.At(ch, frame, i / x.w, i % x.w)] * inv * norm_scale *
@@ -597,8 +623,14 @@ Ltx2VideoFrames Ltx2ConvVideoDecode(const Ltx2ConvVideoDecoderConfig& config,
       multiplier *= block.multiplier != 0 ? block.multiplier : 2;
     }
   }
-  // conv_in is ALWAYS causal upstream (conv_video_decoder.py:216), independently
-  // of `config.causal`, which only reaches the per-call `causal=` argument.
+  // TWO DIFFERENT `causal` FLAGS, and passing `config.causal` here is correct.
+  // Upstream builds conv_in with `causal=True` (conv_video_decoder.py:216), but
+  // that constructor argument only selects the MODULE — it is what makes conv_in a
+  // CausalConv3d at all. The one-sidedness of any given call comes from the
+  // separate per-call argument, `self.conv_in(sample, causal=self.causal)`
+  // (conv_video_decoder.py:307), and that is `self.causal`, i.e. this config's
+  // field. So `config.causal` is the value that belongs here; hardcoding `true`
+  // would silently make a non-causal decoder pad one-sidedly.
   x = CausalConv3d(x, config.base_channels * multiplier, 3, config.causal,
                    config.spatial_padding_mode, weights.Get(p + "conv_in.conv.weight"),
                    &weights.Get(p + "conv_in.conv.bias"));
