@@ -35,6 +35,7 @@
 #include <vector>
 
 #include "doctest/doctest.h"
+#include "support/max_abs_diff.h"
 #include "vllm/model_executor/model_loader/safetensors_reader.h"
 #include "vllm/model_executor/models/gemma4.h"
 #include "vllm/model_executor/models/ltx2_text_encoder.h"
@@ -145,15 +146,10 @@ std::vector<int32_t> MaskFrom(const int64_t* golden) {
   return mask;
 }
 
-double MaxAbsDiff(const std::vector<float>& got, const float* want, size_t count) {
-  REQUIRE(got.size() == count);
-  double worst = 0.0;
-  for (size_t i = 0; i < count; ++i) {
-    worst = std::max(worst,
-                     std::abs(static_cast<double>(got[i]) - static_cast<double>(want[i])));
-  }
-  return worst;
-}
+// The shared, NaN-hardened reduction. The local copy this replaces used
+// `std::max(worst, ...)`, which is `a < b ? b : a`; `a < NaN` is false, so an
+// all-NaN result against a correct golden reduced to 0.0 (issue #449).
+using vllm_test::MaxAbsDiff;
 
 // `additive_mask` holds -FLT_MAX, whose absolute difference saturates any bound;
 // compare it EXACTLY instead, which is also what upstream produces (one multiply
