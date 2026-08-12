@@ -798,6 +798,16 @@ target_compile_definitions(test_chat_template PRIVATE
   VLLM_TEST_FIXTURES_DIR="${CMAKE_SOURCE_DIR}/tests/fixtures")
 # The HTTP api_server smoke test needs the vendored cpp-httplib (gated).
 if(VLLM_CPP_SERVER)
+  add_executable(test_httplib_accepted_socket_close
+    vllm/entrypoints/openai/test_httplib_accepted_socket_close.cpp)
+  target_link_libraries(test_httplib_accepted_socket_close PRIVATE
+    vllm_test_main Threads::Threads)
+  if(WIN32)
+    target_link_libraries(test_httplib_accepted_socket_close PRIVATE ws2_32)
+  endif()
+  vllm_cpp_set_warnings(test_httplib_accepted_socket_close)
+  add_test(NAME test_httplib_accepted_socket_close
+    COMMAND test_httplib_accepted_socket_close)
   vllm_cpp_add_test(test_openai_api_server vllm/entrypoints/openai/test_api_server.cpp)
   # /v1/audio/transcriptions dispatch + socket smoke run against the REAL
   # library transcription seam on the committed parakeet_e2e fixture
@@ -809,6 +819,18 @@ if(VLLM_CPP_SERVER)
     # (ARCH-ONE-SURFACE ROW 6).
     LLAMA_EMBED_FIXTURE_DIR="${CMAKE_SOURCE_DIR}/tests/vllm/models/fixtures/llama_embed_e2e")
   target_include_directories(test_openai_api_server PRIVATE ${CMAKE_SOURCE_DIR}/src)
+  add_executable(test_openai_server_thread_failure_fixture
+    vllm/entrypoints/openai/test_server_thread_failure_fixture.cpp)
+  target_link_libraries(test_openai_server_thread_failure_fixture PRIVATE
+    vllm_test_main Threads::Threads)
+  vllm_cpp_set_warnings(test_openai_server_thread_failure_fixture)
+  add_test(NAME test_openai_server_thread_failure_fixture
+    COMMAND ${Python3_EXECUTABLE}
+      "${CMAKE_SOURCE_DIR}/tests/scripts/run_expected_doctest_failure.py"
+      $<TARGET_FILE:test_openai_server_thread_failure_fixture>
+      "scoped teardown fixture assertion")
+  set_tests_properties(test_openai_server_thread_failure_fixture PROPERTIES
+    TIMEOUT 10)
   # M3.6: the OpenAI server CONFORMANCE suite — the full API contract exercised
   # end to end over the REAL cpp-httplib server on an ephemeral port.
   vllm_cpp_add_test(test_openai_conformance vllm/entrypoints/openai/test_conformance.cpp)

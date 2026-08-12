@@ -13,6 +13,7 @@
 #include "vllm/entrypoints/openai/api_server.h"
 #include "vllm/entrypoints/openai/video_api.h"
 #include "vllm/multimodal/parakeet_transcription.h"
+#include "scoped_server_thread.h"
 
 #include <doctest/doctest.h>
 
@@ -110,6 +111,7 @@ using vllm::v1::OutputProcessor;
 using vllm::v1::Scheduler;
 using vllm::v1::sha256_cbor;
 using vt::DType;
+using vllm::test::ScopedServerThread;
 
 namespace {
 
@@ -1238,7 +1240,8 @@ TEST_CASE("api_server: socket smoke — real HTTP requests over an ephemeral por
 
   const int port = h.server.bind_to_any_port("127.0.0.1");
   REQUIRE(port > 0);
-  std::thread server_thread([&h]() { h.server.serve(); });
+  ScopedServerThread server_thread([&h]() { h.server.serve(); },
+                                   [&h]() { h.server.stop(); });
   // Wait until the accept loop is up.
   for (int i = 0; i < 500 && !h.server.is_running(); ++i)
     std::this_thread::sleep_for(std::chrono::milliseconds(2));
@@ -1297,8 +1300,6 @@ TEST_CASE("api_server: socket smoke — real HTTP requests over an ephemeral por
     CHECK(j.at("choices").at(0).at("message").at("role") == "assistant");
   }
 
-  h.server.stop();
-  server_thread.join();
 }
 
 // Route-registration gate over a real socket: /tokenizer_info is ABSENT (404)
@@ -1317,7 +1318,8 @@ TEST_CASE("api_server: /tokenizer_info + /abort_requests are opt-in routes") {
     h.server.set_tokenizer(&Fixture(), kMaxModelLen);
     const int port = h.server.bind_to_any_port("127.0.0.1");
     REQUIRE(port > 0);
-    std::thread server_thread([&h]() { h.server.serve(); });
+    ScopedServerThread server_thread([&h]() { h.server.serve(); },
+                                     [&h]() { h.server.stop(); });
     for (int i = 0; i < 500 && !h.server.is_running(); ++i)
       std::this_thread::sleep_for(std::chrono::milliseconds(2));
     REQUIRE(h.server.is_running());
@@ -1332,8 +1334,6 @@ TEST_CASE("api_server: /tokenizer_info + /abort_requests are opt-in routes") {
     REQUIRE(abort);
     CHECK(abort->status == 404);  // no callback → route not registered
 
-    h.server.stop();
-    server_thread.join();
   }
 
   SUBCASE("backings attached → routes serve (200)") {
@@ -1348,7 +1348,8 @@ TEST_CASE("api_server: /tokenizer_info + /abort_requests are opt-in routes") {
         });
     const int port = h.server.bind_to_any_port("127.0.0.1");
     REQUIRE(port > 0);
-    std::thread server_thread([&h]() { h.server.serve(); });
+    ScopedServerThread server_thread([&h]() { h.server.serve(); },
+                                     [&h]() { h.server.stop(); });
     for (int i = 0; i < 500 && !h.server.is_running(); ++i)
       std::this_thread::sleep_for(std::chrono::milliseconds(2));
     REQUIRE(h.server.is_running());
@@ -1367,8 +1368,6 @@ TEST_CASE("api_server: /tokenizer_info + /abort_requests are opt-in routes") {
     CHECK(json::parse(abort->body).at("aborted") == 2);
     CHECK(aborted_calls == 1);
 
-    h.server.stop();
-    server_thread.join();
   }
 }
 
@@ -1387,15 +1386,14 @@ TEST_CASE("api_server: ConfigureUtilityEndpoints wires the production C8 surface
   auto with_server = [](ServerHarness& h, auto&& body) {
     const int port = h.server.bind_to_any_port("127.0.0.1");
     REQUIRE(port > 0);
-    std::thread server_thread([&h]() { h.server.serve(); });
+    ScopedServerThread server_thread([&h]() { h.server.serve(); },
+                                     [&h]() { h.server.stop(); });
     for (int i = 0; i < 500 && !h.server.is_running(); ++i)
       std::this_thread::sleep_for(std::chrono::milliseconds(2));
     REQUIRE(h.server.is_running());
     httplib::Client client("127.0.0.1", port);
     client.set_read_timeout(5, 0);
     body(client);
-    h.server.stop();
-    server_thread.join();
   };
 
   // RED: a default production server WITHOUT the wiring seam 404s every C8 route,
@@ -1529,7 +1527,8 @@ TEST_CASE("api_server: concurrent requests share AsyncLLM without state races") 
 
   const int port = h.server.bind_to_any_port("127.0.0.1");
   REQUIRE(port > 0);
-  std::thread server_thread([&h]() { h.server.serve(); });
+  ScopedServerThread server_thread([&h]() { h.server.serve(); },
+                                   [&h]() { h.server.stop(); });
   for (int i = 0; i < 500 && !h.server.is_running(); ++i)
     std::this_thread::sleep_for(std::chrono::milliseconds(2));
   REQUIRE(h.server.is_running());
@@ -1569,8 +1568,6 @@ TEST_CASE("api_server: concurrent requests share AsyncLLM without state races") 
   for (int i = 1; i < kClients; ++i)
     CHECK(texts[static_cast<size_t>(i)] == texts[0]);
 
-  h.server.stop();
-  server_thread.join();
 }
 
 TEST_CASE("api_server: configured persistent-stream capacity remains readable") {
@@ -1584,7 +1581,8 @@ TEST_CASE("api_server: configured persistent-stream capacity remains readable") 
         kStreamCapacity + ApiServer::kControlWorkerHeadroom);
   const int port = h.server.bind_to_any_port("127.0.0.1");
   REQUIRE(port > 0);
-  std::thread server_thread([&h]() { h.server.serve(); });
+  ScopedServerThread server_thread([&h]() { h.server.serve(); },
+                                   [&h]() { h.server.stop(); });
   for (int i = 0; i < 500 && !h.server.is_running(); ++i)
     std::this_thread::sleep_for(std::chrono::milliseconds(2));
   REQUIRE(h.server.is_running());
@@ -1616,8 +1614,6 @@ TEST_CASE("api_server: configured persistent-stream capacity remains readable") 
   CHECK(response->status == 200);
 
   parked.clear();
-  h.server.stop();
-  server_thread.join();
 }
 
 TEST_CASE("api_server: stream capacity must be positive") {
@@ -1657,7 +1653,8 @@ TEST_CASE(
 
   const int port = h.server.bind_to_any_port("127.0.0.1");
   REQUIRE(port > 0);
-  std::thread server_thread([&h]() { h.server.serve(); });
+  ScopedServerThread server_thread([&h]() { h.server.serve(); },
+                                   [&h]() { h.server.stop(); });
   for (int i = 0; i < 500 && !h.server.is_running(); ++i)
     std::this_thread::sleep_for(std::chrono::milliseconds(2));
   REQUIRE(h.server.is_running());
@@ -1695,8 +1692,6 @@ TEST_CASE(
   CHECK(nodelay == 1);    // RED until ApiServer calls set_tcp_nodelay(true)
 
   ::close(client_fd);
-  h.server.stop();
-  server_thread.join();
 #endif  // defined(__linux__)
 }
 
@@ -2096,15 +2091,14 @@ TEST_CASE("api_server: the /v1/videos routes do not exist without a runner") {
   auto with_server = [](ServerHarness& h, auto&& body) {
     const int port = h.server.bind_to_any_port("127.0.0.1");
     REQUIRE(port > 0);
-    std::thread server_thread([&h]() { h.server.serve(); });
+    ScopedServerThread server_thread([&h]() { h.server.serve(); },
+                                     [&h]() { h.server.stop(); });
     for (int i = 0; i < 500 && !h.server.is_running(); ++i)
       std::this_thread::sleep_for(std::chrono::milliseconds(2));
     REQUIRE(h.server.is_running());
     httplib::Client client("127.0.0.1", port);
     client.set_read_timeout(5, 0);
     body(client);
-    h.server.stop();
-    server_thread.join();
   };
 
   SUBCASE("no runner: every video route 404s, and the core routes are unaffected") {
@@ -2262,7 +2256,8 @@ TEST_CASE("api_server: transcriptions socket smoke (multipart), generate routes 
   AsrHarness h;
   const int port = h.server.bind_to_any_port("127.0.0.1");
   REQUIRE(port > 0);
-  std::thread server_thread([&h]() { h.server.serve(); });
+  ScopedServerThread server_thread([&h]() { h.server.serve(); },
+                                   [&h]() { h.server.stop(); });
   for (int i = 0; i < 500 && !h.server.is_running(); ++i)
     std::this_thread::sleep_for(std::chrono::milliseconds(2));
   REQUIRE(h.server.is_running());
@@ -2309,8 +2304,6 @@ TEST_CASE("api_server: transcriptions socket smoke (multipart), generate routes 
           "parakeet-fixture");
   }
 
-  h.server.stop();
-  server_thread.join();
 }
 
 TEST_CASE("api_server: the audio routes do not exist on a TEXT server") {
@@ -2328,7 +2321,8 @@ TEST_CASE("api_server: the audio routes do not exist on a TEXT server") {
 
   const int port = h.server.bind_to_any_port("127.0.0.1");
   REQUIRE(port > 0);
-  std::thread server_thread([&h]() { h.server.serve(); });
+  ScopedServerThread server_thread([&h]() { h.server.serve(); },
+                                   [&h]() { h.server.stop(); });
   for (int i = 0; i < 500 && !h.server.is_running(); ++i)
     std::this_thread::sleep_for(std::chrono::milliseconds(2));
   REQUIRE(h.server.is_running());
@@ -2361,8 +2355,6 @@ TEST_CASE("api_server: the audio routes do not exist on a TEXT server") {
     CHECK(health->status == 200);
   }
 
-  h.server.stop();
-  server_thread.join();
 }
 
 // ─── ARCH-ONE-SURFACE ROW 8: the server's --device seam ──────────────────────
@@ -2516,7 +2508,8 @@ TEST_CASE("api_server: embeddings socket smoke; generate routes 404 on the "
   EmbedHarness h;
   const int port = h.server.bind_to_any_port("127.0.0.1");
   REQUIRE(port > 0);
-  std::thread server_thread([&h]() { h.server.serve(); });
+  ScopedServerThread server_thread([&h]() { h.server.serve(); },
+                                   [&h]() { h.server.stop(); });
   for (int i = 0; i < 500 && !h.server.is_running(); ++i)
     std::this_thread::sleep_for(std::chrono::milliseconds(2));
   REQUIRE(h.server.is_running());
@@ -2552,8 +2545,6 @@ TEST_CASE("api_server: embeddings socket smoke; generate routes 404 on the "
           "llama-embed-fixture");
   }
 
-  h.server.stop();
-  server_thread.join();
 }
 
 TEST_CASE("api_server: /v1/embeddings does not exist on a TEXT server") {
@@ -2569,7 +2560,8 @@ TEST_CASE("api_server: /v1/embeddings does not exist on a TEXT server") {
 
   const int port = h.server.bind_to_any_port("127.0.0.1");
   REQUIRE(port > 0);
-  std::thread server_thread([&h]() { h.server.serve(); });
+  ScopedServerThread server_thread([&h]() { h.server.serve(); },
+                                   [&h]() { h.server.stop(); });
   for (int i = 0; i < 500 && !h.server.is_running(); ++i)
     std::this_thread::sleep_for(std::chrono::milliseconds(2));
   REQUIRE(h.server.is_running());
@@ -2584,8 +2576,6 @@ TEST_CASE("api_server: /v1/embeddings does not exist on a TEXT server") {
     CHECK(res->status == 404);
   }
 
-  h.server.stop();
-  server_thread.join();
 }
 
 TEST_CASE("platform process: Windows command line preserves every argv byte") {

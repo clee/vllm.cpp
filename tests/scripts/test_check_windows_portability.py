@@ -547,6 +547,63 @@ class WindowsPortabilityCheckerTest(unittest.TestCase):
             r"\(\s*argv\s*\)\s*==\s*expected\s*\)\s*;",
         )
 
+    def test_accepted_server_socket_close_is_bounded_and_drained(self) -> None:
+        source = (REPO / "third_party/httplib/httplib.h").read_text(
+            encoding="utf-8"
+        )
+        helper = re.search(
+            r"inline\s+void\s+drain_and_close_socket\s*\(.*?\n\}",
+            source,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(helper, "accepted-socket drain helper")
+        assert helper is not None
+        body = helper.group(0)
+        self.assertIn("shutdown(sock, SD_SEND)", body)
+        self.assertIn("shutdown(sock, SHUT_WR)", body)
+        self.assertRegex(body, r"milliseconds\s*\(\s*100\s*\)")
+        self.assertRegex(body, r"1024u\s*\*\s*1024u")
+        self.assertLess(body.index("shutdown_socket(sock)"),
+                        body.index("close_socket(sock)"))
+
+        process_close = re.search(
+            r"inline\s+bool\s+Server::process_and_close_socket\s*\(.*?\n\}",
+            source,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(process_close)
+        assert process_close is not None
+        self.assertEqual(
+            process_close.group(0).count(
+                "detail::drain_and_close_socket(sock);"
+            ),
+            1,
+        )
+        self.assertEqual(
+            source.count("detail::drain_and_close_socket(sock);"), 1
+        )
+
+    def test_real_socket_tests_use_scoped_server_threads(self) -> None:
+        source = (
+            REPO / "tests/vllm/entrypoints/openai/test_api_server.cpp"
+        ).read_text(encoding="utf-8")
+        owner = (
+            REPO
+            / "tests/vllm/entrypoints/openai/scoped_server_thread.h"
+        ).read_text(encoding="utf-8")
+
+        bound_servers = len(
+            re.findall(r"\.server\.bind_to_any_port\s*\(", source)
+        )
+        scoped_threads = len(
+            re.findall(r"ScopedServerThread\s+server_thread\s*\(", source)
+        )
+        self.assertGreater(bound_servers, 0)
+        self.assertEqual(scoped_threads, bound_servers)
+        self.assertNotRegex(source, r"std::thread\s+server_thread\b")
+        self.assertIn("stop_();", owner)
+        self.assertIn("if (thread_.joinable()) thread_.join();", owner)
+
     def test_cpu_isa_test_owns_ostream_for_string_view_diagnostics(self) -> None:
         source = (REPO / "tests/vt/test_cpu_isa_x86.cpp").read_text(
             encoding="utf-8"

@@ -538,3 +538,30 @@ prerelease tag. Tag-run publication and the authenticated exactly-32-asset
 audit remain mandatory. Stop with `NEEDS_DECISION` if a production edit or
 warning-policy change is required; otherwise this is a bounded test hygiene
 repair.
+
+#### #537 implementation outcome
+
+The implementation backports only cpp-httplib
+`8e702d3837b2164765ca1d98cb6d180ae4711e70`: accepted plain HTTP sockets now
+half-close writes, drain for at most 100 ms or 1 MiB, and then perform the
+existing final shutdown and close. The helper remains internal to the vendored
+header and has exactly one production call site. No public HTTP API, TLS close
+path, timeout, or release topology changed.
+
+All 12 real-socket cases in `test_openai_api_server.cpp` now use one test-local
+scoped owner that stops the server and joins its thread on normal return and
+assertion unwind. A deliberately failing doctest fixture must exit with
+doctest's normal status 1, print the named assertion, and emit its failure
+summary; a subprocess harness rejects termination or any other exit status.
+The accepted-socket regression leaves 64 KiB of unread request data after a
+complete close-delimited request and requires the complete response followed by
+an orderly EOF.
+
+The focused transport tests, the full OpenAI API server test, Windows release
+metadata, both direct Windows checkers, and the 74-test portability suite pass
+locally. Mutations restoring immediate close, changing either drain bound,
+removing scoped stop, and removing scoped join each made the focused gates red;
+the last two respectively timed out and reproduced `SIGABRT`. The mutated files
+were restored byte-for-byte. Linux also passes the socket behavior, but the
+native reset RED and final acceptance remain correctly pending the hosted
+Windows CPU and Vulkan lanes; this local result is not substituted for them.
