@@ -96,25 +96,80 @@ Attentions per block: `attn1` (video self), `attn2` (video↔text, cross_dim 409
 output as `out = self.gated_attention_function(x, out, self)` (`attention.py:577`). H3 has
 no analogue; getting this wrong yields a plausible-but-wrong render rather than an error.
 
-### 1.2 The free win — prompt K/V is timestep-independent
+### 1.2 The prompt K/V cache — RETRACTED as a win for the shipped checkpoint
 
-`get_ada_values` modulates from `scale_shift_table` **using `timestep`**
-(`transformer.py:192-197`). The prompt path does not: at `transformer.py:441`,
+> **RETRACTION, 2026-08-12.** This section previously called a timestep-independent prompt
+> K/V "the free win" and made it the headline of this spec, of issue #435 and of the PR.
+> **It does not apply to the checkpoint this campaign actually runs.** The mechanism is real
+> and correctly implemented; the claim that 2.5 enables it was wrong, and it was wrong
+> because the spec author read `transformer.py:441` and stopped two lines early.
+
+**What upstream actually does.** `apply_cross_attention_adaln` (`transformer.py:420-447`):
 
 ```python
-kv_modulation = prompt_scale_shift_table[None, None].to(device=..., dtype=...)
+kv_modulation = prompt_scale_shift_table[None, None].to(...)      # :441
+if prompt_timestep is not None:                                   # :442
+    kv_modulation = kv_modulation + prompt_timestep.reshape(...)  # :443
 ```
 
-— no timestep term at all. `model_configurator.py:74-76` states the consequence directly:
-*"KV-cacheable checkpoints set `use_prompt_adaln_single=false`, dropping the
-timestep-dependence of the cross-attention K/V so they can be computed once per prompt and
-reused across steps."* The 2.5 checkpoint carries only the static
-`prompt_scale_shift_table [2, dim]` and no prompt-side timestep MLP, so **the cross-attention
-K/V for all 48 blocks is computed once per request and reused for every denoise step.**
+Line 441 alone was quoted as proof of "no timestep term at all". Lines 442-443 add one
+whenever `prompt_timestep` is not None, and the comment immediately above them says so
+outright: *"With the prompt-side AdaLN MLP disabled (use_prompt_adaln_single=False),
+prompt_timestep is None and only the static per-block table applies, so K/V are
+timestep-independent and cacheable across denoising/AR steps. Otherwise the
+timestep-conditioned MLP output is added on top."*
 
-This is a property of the checkpoint, not an optimization we invent, so it ships as the
-default path (AGENTS.md: parity enablers ship as defaults). L2 gates it by asserting the
-cached and recomputed paths are **bit-identical**.
+`model.py:223-227` builds the MLP conditionally:
+
+```python
+self.prompt_adaln_single = (
+    AdaLayerNormSingle(self.inner_dim, embedding_coefficient=2)
+    if self.cross_attention_adaln and self.use_prompt_adaln_single else None)
+```
+
+**What the shipped checkpoint carries.** Read from
+`ltx-2.5-22b-distilled-transformer-fp8.safetensors`, 12 tensors that only exist when the MLP
+is built:
+
+| Tensor | Shape |
+|---|---|
+| `prompt_adaln_single.emb.timestep_embedder.linear_1.weight` | [4096, **256**] |
+| `prompt_adaln_single.emb.timestep_embedder.linear_2.weight` | [4096, 4096] |
+| `prompt_adaln_single.linear.weight` | [8192, 4096] (= 2 x 4096) |
+| `audio_prompt_adaln_single.*` | the audio twin |
+
+The **256** is the sinusoidal timestep input width. There is a prompt-side timestep MLP.
+Therefore `use_prompt_adaln_single` is TRUE for this checkpoint, `prompt_timestep` is not
+None, the cross-attention K/V **do** carry a timestep term, and caching them across denoise
+steps would be **wrong**.
+
+**Why the earlier reasoning looked sound and was not.** Three pieces of evidence were
+consistent with the wrong conclusion: `model_configurator.py:74-76` genuinely documents
+KV-cacheable checkpoints as setting the flag false; the checkpoint genuinely carries the
+static `prompt_scale_shift_table [2, dim]` (96 of them); and line 441 genuinely has no
+timestep. All three are true. None of them says the flag is false HERE — and the tensor that
+settles it was never looked for. The header dump that would have shown it was filtered with
+`'adaln_single' not in k`.
+
+**What this costs, and what saves it.** No shipped defect: L2's implementer read upstream's
+conditional correctly even though the brief handed it the wrong conclusion, and wrote
+
+```cpp
+VT_CHECK(!params.use_prompt_adaln_single,
+         "ltx2: the prompt K/V cache is only valid when use_prompt_adaln_single is false "
+         "(transformer.py:441-443); with the prompt AdaLN MLP enabled the K/V carry a "
+         "timestep term and caching them would be wrong");
+```
+
+at `ltx2_dit.cpp:672`, refusing by name before any block runs. So the cache is
+correct-and-inapplicable rather than silently wrong. It remains implemented, gated
+bit-identical, and prompt-bound (§below) for any checkpoint that does set the flag false.
+
+**The lesson, which is the same one §7.0 keeps teaching.** A claim assembled from three true
+facts is not thereby true. The decisive test was one `grep` for `prompt_adaln_single` against
+the checkpoint, and it was never run because the conclusion already looked supported.
+
+L2 gates the cache by asserting the cached and recomputed paths are **bit-identical**.
 
 **Correction, 2026-08-12 — the earlier claim here was too strong.** This section previously
 said the bit-identity gate meant the cache "cannot silently diverge". L2's fresh review
