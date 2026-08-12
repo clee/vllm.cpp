@@ -371,13 +371,14 @@ expert, §6a) was reviewed PASS at `e2d68404` and this branch is the repair pass
 for that review's six findings.
 
 The row stays `INVENTORIED`; this commit changes no lifecycle state, so it owes
-no `STATUS`/`BENCHMARKS` write. The checkpoint is staged on the NAS and the
-oracle smoke run is still queued behind the GPU lock.
+no `STATUS`/`BENCHMARKS` write. **Oracle gateability is CLOSED** — §5a records
+the pinned oracle loading and running the checkpoint on GB10 with three greedy
+goldens committed, so W6 has a denominator whenever it is reached.
 
 **Next action:** land W2 after a fresh scoped re-review, then dispatch **W3**.
-Carry forward the two OWED GPU items named in §6a
-(`kMoeGroupedGemmNvfp4Marlin` on the real g16 tensors, and the end-to-end
-NemotronH MoE block on GB10).
+Three things are carried forward, not resolved here: the two OWED GPU items in
+§6a (`kMoeGroupedGemmNvfp4Marlin` on the real g16 tensors, and the end-to-end
+NemotronH MoE block on GB10), and the OWED GGUF k-quant arm tracked as W7 (§5b).
 
 ## 8. Stop conditions
 
