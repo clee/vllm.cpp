@@ -162,6 +162,20 @@ Gemma4Weights LoadGemma4ForConditionalGenerationWeightsOwned(
 // which is why this order is stated here and gated in
 // tests/vllm/models/test_ltx2_text_encoder.cpp rather than left to the reader.
 struct Gemma4HiddenStatesResult {
+  // HOST f32, and that is a WIDENING of upstream's dtype — recorded here rather
+  // than left as bare fact, per AGENTS.md's dtype-polarity rule. Upstream runs the
+  // whole text tower in ONE resolved dtype, bf16 by default
+  // (`LTXGemmaTextEncoder.__init__`, base_encoder.py:41
+  // `dtype: torch.dtype = torch.bfloat16`), and the `hidden_states` tuple it
+  // passes to the feature extractor is bf16. These states are downloaded from BF16
+  // device buffers (gemma4.cpp:571-578) and widened on the way out because this is
+  // the CPU REFERENCE ARM: it is what the LTX-2.5 parity gate compares against
+  // upstream executed in torch float32, and every LTX entry point REFUSES a
+  // non-f32 compute dtype by name rather than widening silently
+  // (ltx2_text_encoder.h, the DTYPE note). Cost of the widening, stated so it is
+  // not discovered later: at the shipped 49 x 1024 x 3840 x 4B this holds ~771 MB
+  // host where upstream holds ~385 MB. The bf16 / FP8 / NVFP4 arms are phase L6 of
+  // .agents/specs/ltx-2-5.md and are OWED, not shipped.
   std::vector<std::vector<float>> hidden_states;
   std::vector<float> logits;  // [n_out, vocab], as Forward() returns
 };

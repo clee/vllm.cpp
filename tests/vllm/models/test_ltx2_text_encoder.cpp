@@ -789,6 +789,182 @@ TEST_CASE("ltx2 text: the encoder -> conditioning hand-off") {
   }
 }
 
+TEST_CASE("ltx2 text: the DECLARED weight contract is checked against the WEIGHTS") {
+  // `aggregate_bias` and `*_out_features` are what the SELECTOR read out of the
+  // checkpoint config (ltx2_text_encoder.cpp:130, :166). `w.bias.empty()`,
+  // `w.out_features` and `w.in_features` are what the LOADER actually supplied.
+  // Nothing compared the two, so both of the following ran silently:
+  //
+  //   * bias-less weights under aggregate_bias=true — the loader reads
+  //     `video_aggregate_embed.weight` (U8/NVFP4) and misses `.bias` (BF16, a
+  //     DIFFERENT dtype on a different unpack path). Every conditioning row is
+  //     then shifted by the missing bias and every padded row projects to 0
+  //     instead of to the bias: finite, correctly shaped, WRONG PROMPT. Measured
+  //     drift on this fixture before the refusal existed: 0.0194063.
+  //   * an out_features mismatch — the config claimed 40 while the video tensor
+  //     came out 80 wide, because the width that runs comes from `w.out_features`
+  //     and the config's copy is only used for `_rescale_norm`.
+  //
+  // This is the header's fourth "fails silently" entry (ltx2_text_encoder.h:57-60)
+  // enforced rather than merely named, and it is phase L6's most likely mistake.
+  const std::vector<std::vector<float>> buffers = HiddenStateBuffers();
+  const Ltx2TextHiddenStates states = MakeStates(buffers);
+  const std::vector<int32_t> mask = MaskFrom(vllm_test::kLtxTeMaskLeft);
+
+  SUBCASE("the CORRECT weights still go through the same door") {
+    CHECK_NOTHROW(vllm::Ltx2TextFeatureExtractorForward(states, mask.data(), V2Weights(),
+                                                        V2Config()));
+    CHECK_NOTHROW(vllm::Ltx2TextFeatureExtractorForward(states, mask.data(), V1Weights(),
+                                                        V1Config()));
+    CHECK_NOTHROW(vllm::Ltx2TextEncoderConditioning(states, mask.data(), V2Weights(),
+                                                    V2Config()));
+    CHECK_NOTHROW(vllm::Ltx2TextEncoderConditioning(states, mask.data(), V1Weights(),
+                                                    V1Config()));
+  }
+
+  SUBCASE("aggregate_bias=true with a bias-less projection is REFUSED") {
+    vllm::Ltx2TextEncoderWeights video_dropped = V2Weights();
+    video_dropped.video.bias.clear();
+    CHECK_THROWS_AS(vllm::Ltx2TextFeatureExtractorForward(states, mask.data(),
+                                                          video_dropped, V2Config()),
+                    std::runtime_error);
+    CHECK_THROWS_AS(vllm::Ltx2TextEncoderConditioning(states, mask.data(), video_dropped,
+                                                      V2Config()),
+                    std::runtime_error);
+
+    vllm::Ltx2TextEncoderWeights audio_dropped = V2Weights();
+    audio_dropped.audio.bias.clear();
+    CHECK_THROWS_AS(vllm::Ltx2TextFeatureExtractorForward(states, mask.data(),
+                                                          audio_dropped, V2Config()),
+                    std::runtime_error);
+    CHECK_THROWS_AS(vllm::Ltx2TextEncoderConditioning(states, mask.data(), audio_dropped,
+                                                      V2Config()),
+                    std::runtime_error);
+  }
+
+  SUBCASE("aggregate_bias=false with a bias that appeared anyway is REFUSED") {
+    // encoder_configurator.py:187 builds V1's Linear with bias=False, so a bias
+    // here means the loader bound a tensor upstream does not have.
+    vllm::Ltx2TextEncoderWeights invented = V1Weights();
+    invented.video.bias.assign(static_cast<size_t>(kHidden), 0.5f);
+    CHECK_THROWS_AS(vllm::Ltx2TextFeatureExtractorForward(states, mask.data(), invented,
+                                                          V1Config()),
+                    std::runtime_error);
+    CHECK_THROWS_AS(vllm::Ltx2TextEncoderConditioning(states, mask.data(), invented,
+                                                      V1Config()),
+                    std::runtime_error);
+  }
+
+  SUBCASE("an out_features that disagrees with the config is REFUSED") {
+    Ltx2TextFeatureConfig narrowed = V2Config();
+    narrowed.video_out_features = vllm_test::kLtxTeVideoInner / 2;
+    CHECK_THROWS_AS(vllm::Ltx2TextFeatureExtractorForward(states, mask.data(), V2Weights(),
+                                                          narrowed),
+                    std::runtime_error);
+    CHECK_THROWS_AS(vllm::Ltx2TextEncoderConditioning(states, mask.data(), V2Weights(),
+                                                      narrowed),
+                    std::runtime_error);
+
+    Ltx2TextFeatureConfig audio_narrowed = V2Config();
+    audio_narrowed.audio_out_features = vllm_test::kLtxTeAudioInner / 2;
+    CHECK_THROWS_AS(vllm::Ltx2TextFeatureExtractorForward(states, mask.data(), V2Weights(),
+                                                          audio_narrowed),
+                    std::runtime_error);
+
+    Ltx2TextFeatureConfig v1_narrowed = V1Config();
+    v1_narrowed.video_out_features = kHidden - 1;
+    CHECK_THROWS_AS(vllm::Ltx2TextFeatureExtractorForward(states, mask.data(), V1Weights(),
+                                                          v1_narrowed),
+                    std::runtime_error);
+  }
+
+  SUBCASE("an in_features that is not the FLAT width is REFUSED") {
+    // The "+1 is the embedding layer" trap from the other side: a projection
+    // built for 48 layers instead of 49 is exactly `flat - embedding_dim` wide.
+    vllm::Ltx2TextEncoderWeights short_flat = V2Weights();
+    short_flat.video.in_features = vllm_test::kLtxTeFlatDim - kHidden;
+    short_flat.video.weight.resize(
+        static_cast<size_t>(short_flat.video.out_features * short_flat.video.in_features));
+    CHECK_THROWS_AS(vllm::Ltx2TextFeatureExtractorForward(states, mask.data(), short_flat,
+                                                          V2Config()),
+                    std::runtime_error);
+    CHECK_THROWS_AS(vllm::Ltx2TextEncoderConditioning(states, mask.data(), short_flat,
+                                                      V2Config()),
+                    std::runtime_error);
+  }
+}
+
+TEST_CASE("ltx2 text: the normalization EPSILONS are PINNED and load-bearing") {
+  // The epsilon limit is a CLASS, not one instance: a constant that only matters
+  // on a degenerate input is invisible to any golden built from random values,
+  // and this fixture's values are random. Measured on THIS suite before the pins
+  // below existed: `range_ + eps` -> `range_ + 0.0f` moved norm V1's max|diff|
+  // from 4.77e-07 to 5.24521e-06 and the gate still said SUCCESS, and
+  // `denom + eps` -> `denom + 0.0` moved nothing at all.
+  //
+  // So they are held two ways: the VALUE against upstream measured by probe, and
+  // the DEGENERATE INPUT that makes each one the only thing between the port and
+  // a division by zero.
+
+  // 1. The values. The generator recovers them from upstream numerically
+  //    (gen-ltx2-text-goldens.py :: emit_epsilons) rather than restating ours.
+  MESSAGE("ltx2 text eps V1 upstream = " << vllm_test::kLtxTeNormV1EpsUpstream
+                                         << " ours = " << vllm::kLtx2TextNormV1Eps);
+  MESSAGE("ltx2 text eps V2 upstream = " << vllm_test::kLtxTeNormV2EpsUpstream
+                                         << " ours = " << vllm::kLtx2TextNormV2Eps);
+  CHECK(std::abs(vllm::kLtx2TextNormV1Eps - vllm_test::kLtxTeNormV1EpsUpstream) < 1e-8);
+  CHECK(std::abs(static_cast<double>(vllm::kLtx2TextNormV2Eps) -
+                 vllm_test::kLtxTeNormV2EpsUpstream) < 1e-8);
+  // Both probes must land ON 1e-6, not merely near each other.
+  CHECK(vllm_test::kLtxTeNormV1EpsUpstream > 0.0);
+  CHECK(vllm_test::kLtxTeNormV2EpsUpstream > 0.0);
+
+  const size_t count = static_cast<size_t>(kBatch * kSeq * kHidden * kLayers);
+  const std::vector<int32_t> mask = MaskFrom(vllm_test::kLtxTeMaskRight);
+
+  // 2. V1 `range_ + eps` (feature_extractor.py:41). A CONSTANT (batch, layer)
+  //    slice makes `range_` EXACTLY zero, which is the only input on which the
+  //    epsilon is reachable. Upstream stays finite here — measured, not assumed.
+  REQUIRE(vllm_test::kLtxTeNormV1ConstantSliceFinite == 1);
+  const std::vector<float> constant(count, 0.5f);
+  const std::vector<float> const_out = vllm::Ltx2NormAndConcatPaddedBatch(
+      constant.data(), mask.data(), kBatch, kSeq, kHidden, kLayers);
+  REQUIRE(const_out.size() == count);
+  for (float x : const_out) CHECK(std::isfinite(x));
+
+  // 3. V1 `denom + eps` (feature_extractor.py:34). A batch row with NO valid
+  //    token makes `denom` zero. Reported honestly rather than over-claimed: this
+  //    epsilon is UNOBSERVABLE at the output for every possible input, because
+  //    every position of such a row is a pad that :44-45 zeroes, so the NaN it
+  //    prevents in the intermediate `mean` can never escape. Upstream behaves the
+  //    same way (kLtxTeNormV1ZeroLenRowIsZero). The constant assertion above is
+  //    what holds it; this is the behaviour that constant is consistent with.
+  REQUIRE(vllm_test::kLtxTeNormV1ZeroLenFinite == 1);
+  REQUIRE(vllm_test::kLtxTeNormV1ZeroLenRowIsZero == 1);
+  const std::vector<std::vector<float>> buffers = HiddenStateBuffers();
+  const std::vector<float> stacked = Ltx2StackHiddenStates(MakeStates(buffers));
+  std::vector<int32_t> zero_len(static_cast<size_t>(kBatch * kSeq), 1);
+  for (int64_t t = 0; t < kSeq; ++t) zero_len[static_cast<size_t>(t)] = 0;
+  const std::vector<float> zero_len_out = vllm::Ltx2NormAndConcatPaddedBatch(
+      stacked.data(), zero_len.data(), kBatch, kSeq, kHidden, kLayers);
+  REQUIRE(zero_len_out.size() == count);
+  for (float x : zero_len_out) CHECK(std::isfinite(x));
+  for (int64_t i = 0; i < kSeq * kHidden * kLayers; ++i)
+    CHECK(zero_len_out[static_cast<size_t>(i)] == 0.0f);
+
+  // 4. V2 `variance + 1e-6` (feature_extractor.py:61). A token whose whole hidden
+  //    slice is zero has variance 0, so `rsqrt(0)` is the alternative.
+  REQUIRE(vllm_test::kLtxTeNormV2ZeroVarianceFinite == 1);
+  std::vector<float> zero_var = stacked;
+  for (int64_t d = 0; d < kHidden; ++d)
+    for (int64_t l = 0; l < kLayers; ++l)
+      zero_var[static_cast<size_t>(d * kLayers + l)] = 0.0f;
+  const std::vector<float> zero_var_out = vllm::Ltx2NormAndConcatPerTokenRms(
+      zero_var.data(), mask.data(), kBatch, kSeq, kHidden, kLayers);
+  REQUIRE(zero_var_out.size() == count);
+  for (float x : zero_var_out) CHECK(std::isfinite(x));
+}
+
 TEST_CASE("ltx2 text: a non-f32 compute dtype is REFUSED, never silently widened") {
   const std::vector<std::vector<float>> buffers = HiddenStateBuffers();
   const Ltx2TextHiddenStates states = MakeStates(buffers);

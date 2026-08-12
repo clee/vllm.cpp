@@ -565,4 +565,12 @@ inline constexpr int64_t kLtxTeBinaryMaskFromRegistersRight[] = {
     1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
 };
 
+// --- section 6: the epsilons, MEASURED from upstream by probe ---
+inline constexpr double kLtxTeNormV1EpsUpstream = 9.9998279390984754e-07;
+inline constexpr double kLtxTeNormV2EpsUpstream = 9.9999993911447867e-07;
+inline constexpr int64_t kLtxTeNormV1ConstantSliceFinite = 1;
+inline constexpr int64_t kLtxTeNormV1ZeroLenFinite = 1;
+inline constexpr int64_t kLtxTeNormV1ZeroLenRowIsZero = 1;
+inline constexpr int64_t kLtxTeNormV2ZeroVarianceFinite = 1;
+
 }  // namespace vllm_test

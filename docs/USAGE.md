@@ -1483,3 +1483,14 @@ cmake --build build --target test_ltx2_text_encoder
 The generator imports the upstream modules by path and executes them at reduced
 dimensions; both sides rebuild every weight from one deterministic stream, so no
 weight byte is checked in.
+
+A third thing to know if you are wiring a loader to it: the feature extractor
+refuses, by name, any disagreement between what the checkpoint config declares
+and what the weights actually carry. That covers the declared bias against
+`bias.empty()`, the declared `out_features` against the weight's own width, and
+`embedding_dim x (num_hidden_layers + 1)` against the weight's `in_features`. The
+case worth naming is a loader that binds `video_aggregate_embed.weight` (U8,
+NVFP4) and misses `.bias` (BF16, so a different unpack path) while the config
+still says the projection is biased. Without the refusal that renders a plausible
+video for the wrong prompt: every conditioning row is shifted by the missing bias
+and every padded row projects to 0 instead of to the bias.

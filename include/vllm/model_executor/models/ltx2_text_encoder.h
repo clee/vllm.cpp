@@ -57,7 +57,18 @@
 //  * V1'S PROJECTION HAS NO BIAS AND V2'S HAVE ONE (encoder_configurator.py:187,
 //    206-208). Because the norm zeroes padded positions, a padded position's
 //    PROJECTED value is exactly the bias — not zero. A port that force-zeroes the
-//    projected pads silently diverges from upstream on every padded row.
+//    projected pads silently diverges from upstream on every padded row. The
+//    DECLARED contract below (`aggregate_bias`, `*_out_features`) is therefore
+//    checked against the weights the loader actually supplied — see
+//    `Ltx2TextFeatureExtractorForward`.
+//
+// ─── AND THE EPSILONS, WHICH ARE A CLASS AND NOT ONE INSTANCE ────────────────
+// A constant that only changes the answer on a DEGENERATE input is invisible to
+// any golden built from random values. Both normalizations have one, they are
+// named below, and each is held two ways: its VALUE against upstream measured by
+// probe, and the degenerate input on which it is the only thing between the port
+// and a division by zero. When a fourth epsilon arrives, it owes the same pair —
+// not a comment saying it matches upstream.
 //
 // ─── DTYPE ───────────────────────────────────────────────────────────────────
 // Everything here is f32, exactly as phase L2 (ltx2.h) records for the DiT: that
@@ -122,6 +133,24 @@ struct Ltx2TextHiddenStates {
 };
 
 // ───────────────────────────── feature aggregation ───────────────────────────
+
+// feature_extractor.py:28 — ONE `eps = 1e-6` bound at the top of
+// `_norm_and_concat_padded_batch` and used TWICE: in the mean's denominator
+// (`denom + eps`, :34) and in the range's (`range_ + eps`, :41). Named here so
+// there is a single thing to pin, and pinned against the value MEASURED out of
+// upstream in tests/vllm/models/test_ltx2_text_encoder.cpp.
+//
+// Reachability, stated because it is what makes the pin necessary: `range_ + eps`
+// is reachable only when a whole (batch, layer) slice is CONSTANT over its valid
+// positions, and `denom + eps` is reachable only when a batch row has NO valid
+// token — and on that row every position is a pad that :44-45 zeroes, so the
+// second use is UNOBSERVABLE at the output for every possible input. It is
+// mirrored because upstream has it, and held by the constant, not by behaviour.
+inline constexpr double kLtx2TextNormV1Eps = 1e-6;
+
+// feature_extractor.py:61 — `torch.rsqrt(variance + 1e-6)`. Reachable only when a
+// token's whole hidden slice is zero.
+inline constexpr float kLtx2TextNormV2Eps = 1e-6f;
 
 // feature_extractor.py:12-64. Which of the two normalizations runs.
 enum class Ltx2TextNormVariant {
@@ -212,6 +241,17 @@ struct Ltx2TextFeatures {
 // feature_extractor.py:85-129 — the whole extractor: stack, normalize by the
 // selected variant, (V2) rescale per projection, project. `compute_dtype` must be
 // vt::DType::kF32 — see the DTYPE note at the top of this header.
+//
+// REFUSES, by name, any disagreement between what `config` DECLARES and what
+// `weights` actually carries: `aggregate_bias` vs `w.bias.empty()`,
+// `*_out_features` vs `w.out_features`, and `FlatDim()` vs `w.in_features`.
+// Upstream builds both Linears from the one config object
+// (encoder_configurator.py:187, 206-208) and so cannot disagree with itself; a
+// port that loads the config and the tensors separately can. The concrete case is
+// a loader that reads `video_aggregate_embed.weight` (U8/NVFP4) and misses
+// `.bias` (BF16, a different unpack path) while the config still says bias=True:
+// every conditioning row is then shifted by the missing bias and every padded row
+// projects to 0 rather than to the bias — finite, correctly shaped, wrong prompt.
 Ltx2TextFeatures Ltx2TextFeatureExtractorForward(
     const Ltx2TextHiddenStates& states, const int32_t* mask,
     const Ltx2TextEncoderWeights& weights, const Ltx2TextFeatureConfig& config,

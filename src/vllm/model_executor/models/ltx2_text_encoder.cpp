@@ -78,6 +78,49 @@ constexpr V2Marker kV2Markers[] = {
     {"caption_projection_second_linear", false},
 };
 
+// The DECLARED contract, checked against the SUPPLIED weights.
+//
+// `config.aggregate_bias` and `config.*_out_features` are what the SELECTOR read
+// out of the checkpoint's config (Ltx2SelectTextFeatureVariant, :130 and :166).
+// `w.bias.empty()`, `w.out_features` and `w.in_features` are what the LOADER
+// actually bound. Upstream builds both `nn.Linear`s from the one config object
+// (encoder_configurator.py:187, 206-208) and therefore cannot disagree with
+// itself; a port that resolves the config and the tensors on separate paths can,
+// and nothing compared them.
+//
+// The concrete failure this refuses, which is the LTX-2.5 loader's most likely
+// mistake: `video_aggregate_embed.weight` is U8/NVFP4 and `.bias` is BF16 — a
+// different dtype on a different unpack path — so a loader can bind the weight
+// and miss the bias while the config still says bias=True. Every conditioning row
+// is then shifted by the missing bias, and every padded row projects to 0 instead
+// of to the bias (feature_extractor.py:44-45 zeroes the NORM, not the
+// projection). Finite, correctly shaped, wrong prompt.
+void RequireDeclaredProjection(const char* which, const Ltx2TextAggregateEmbed& w,
+                               int64_t declared_out, bool declared_bias, int64_t flat) {
+  const bool has_bias = !w.bias.empty();
+  if (has_bias != declared_bias)
+    Fail(std::string(which) + " projection: the config declares aggregate_bias=" +
+         (declared_bias ? "true" : "false") + " but the supplied weights carry " +
+         (has_bias ? "a bias" : "NO bias") +
+         ". A missing bias shifts every conditioning row and projects every PADDED "
+         "row to 0 instead of to the bias — finite, correctly shaped, wrong prompt. "
+         "The .weight is U8/NVFP4 and the .bias is BF16, so a loader can bind one "
+         "and miss the other (encoder_configurator.py:187, 206-208).");
+  if (w.out_features != declared_out)
+    Fail(std::string(which) + " projection: the config declares out_features=" +
+         std::to_string(declared_out) + " but the supplied weights are " +
+         std::to_string(w.out_features) +
+         " wide. The width that RUNS comes from the weights; the config's copy only "
+         "feeds _rescale_norm (feature_extractor.py:121-129), so a mismatch rescales "
+         "by one width and emits another.");
+  if (w.in_features != flat)
+    Fail(std::string(which) + " projection: the config declares in_features=" +
+         std::to_string(flat) + " = embedding_dim x (num_hidden_layers + 1) but the "
+         "supplied weights take " + std::to_string(w.in_features) +
+         ". LTX conditions on EVERY Gemma hidden state plus the embedding output "
+         "(encoder_configurator.py:182).");
+}
+
 int64_t RequireInt(const nlohmann::json& config, const char* key) {
   if (!config.contains(key) || !config.at(key).is_number_integer())
     Fail(std::string("transformer config is missing integer key '") + key + "'");
@@ -193,7 +236,10 @@ std::vector<float> Ltx2NormAndConcatPaddedBatch(const float* stacked, const int3
                                                 int64_t hidden, int64_t layers) {
   if (stacked == nullptr || mask == nullptr) Fail("null input to the V1 normalization");
   const int64_t B = batch, T = seq, D = hidden, L = layers;
-  constexpr double kEps = 1e-6;  // feature_extractor.py:28
+  // feature_extractor.py:28 — the ONE `eps`, named in the header and pinned there
+  // against the value measured out of upstream, because neither of its two uses is
+  // reachable from a random fixture.
+  constexpr double kEps = kLtx2TextNormV1Eps;
   const size_t count = static_cast<size_t>(B * T * D * L);
   std::vector<float> out(count);
 
@@ -247,7 +293,7 @@ std::vector<float> Ltx2NormAndConcatPerTokenRms(const float* stacked, const int3
                                                 int64_t hidden, int64_t layers) {
   if (stacked == nullptr || mask == nullptr) Fail("null input to the V2 normalization");
   const int64_t B = batch, T = seq, D = hidden, L = layers;
-  constexpr float kEps = 1e-6f;  // feature_extractor.py:61
+  constexpr float kEps = kLtx2TextNormV2Eps;  // feature_extractor.py:61
   std::vector<float> out(static_cast<size_t>(B * T * D * L));
 
   for (int64_t bt = 0; bt < B * T; ++bt) {
@@ -303,6 +349,18 @@ Ltx2TextFeatures Ltx2TextFeatureExtractorForward(const Ltx2TextHiddenStates& sta
 
   const int64_t B = states.batch, T = states.seq;
   const int64_t flat = config.FlatDim();
+
+  // The declared contract, checked BEFORE any work — see RequireDeclaredProjection.
+  // Only the projections that actually run are checked: V1 uses `video` alone and
+  // returns it twice under `is_av` (feature_extractor.py:95-96), and V2's audio arm
+  // exists only when the config gave it a width.
+  RequireDeclaredProjection("video", weights.video, config.video_out_features,
+                            config.aggregate_bias, flat);
+  if (config.variant != Ltx2TextNormVariant::kPaddedBatchV1 &&
+      config.audio_out_features > 0)
+    RequireDeclaredProjection("audio", weights.audio, config.audio_out_features,
+                              config.aggregate_bias, flat);
+
   const std::vector<float> stacked = Ltx2StackHiddenStates(states);
 
   std::vector<float> normed =
@@ -330,7 +388,6 @@ Ltx2TextFeatures Ltx2TextFeatureExtractorForward(const Ltx2TextHiddenStates& sta
     for (size_t i = 0; i < normed.size(); ++i) scaled[i] = normed[i] * scale;
     return Linear(scaled, B * T, w);
   };
-  (void)flat;
   features.video = project(weights.video, config.video_out_features);
   if (config.audio_out_features > 0)
     features.audio = project(weights.audio, config.audio_out_features);

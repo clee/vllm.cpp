@@ -28,6 +28,7 @@ Upstream sources (Lightricks/LTX-2, packages/ltx-core/src/ltx_core/):
   text_encoders/gemma/embeddings_processor.py:16-95 -> additive mask + right-pad ordering
   text_encoders/gemma/encoders/base_encoder.py:49-71 -> which hidden states, and their order
   text_encoders/gemma/gemma_assets.py:104-142       -> the EMBEDDED tokenizer/sidecar tensors
+  text_encoders/gemma/feature_extractor.py:28,41,61 -> the EPSILONS, measured by probe
 
 Usage:
     python3 scripts/gen-ltx2-text-goldens.py \
@@ -512,6 +513,88 @@ def emit_conditioning(out, v2) -> None:
         emit_i64(out, f"kLtxTeBinaryMaskFromRegisters{tag}", binary_zeros.reshape(BATCH, SEQ))
 
 
+def emit_epsilons(out) -> None:
+    """The two normalization EPSILONS, MEASURED out of upstream rather than restated.
+
+    Both constants are invisible to every golden above, and that is a property of
+    the algorithm, not of this fixture:
+
+      * `range_ + eps` (feature_extractor.py:41) only matters when a whole
+        (batch, layer) slice is CONSTANT over its valid positions, so `range_`
+        collapses to 0. Random inputs never do that.
+      * `denom + eps` (feature_extractor.py:34) only matters when
+        `sequence_lengths == 0`, and every position of such a batch row is a pad
+        that :45 zeroes, so the NaN it would prevent can never reach the output.
+        It is unobservable at the output FOR ANY INPUT, which is why it is pinned
+        as a CONSTANT here and not as behaviour.
+      * `variance + 1e-6` (feature_extractor.py:61) only matters when a token's
+        whole hidden slice is zero.
+
+    So they are gated two ways. The VALUE is recovered from upstream numerically,
+    by probes whose algebra inverts the epsilon exactly — no source parsing, no
+    restating our own constant back to ourselves. And the degenerate inputs
+    themselves are run through upstream, so the C++ side's "still finite" property
+    assertions mirror a MEASURED upstream fact.
+
+    Upstream has ONE `eps = 1e-6` (feature_extractor.py:28) used at BOTH :34 and
+    :41; our port has one `kLtx2TextNormV1Eps` used at both. Measuring it through
+    the range denominator therefore pins the same constant the mean denominator
+    uses.
+    """
+    from ltx_core.text_encoders.gemma.feature_extractor import (  # noqa: PLC0415
+        _norm_and_concat_padded_batch,
+        norm_and_concat_per_token_rms,
+    )
+
+    out.write("// --- section 6: the epsilons, MEASURED from upstream by probe ---\n")
+
+    # V1 range epsilon. [b=1, t=2, d=1, l=1] with two valid tokens whose values
+    # differ by exactly r, so range_ == r. The two outputs are
+    #   y_i = 8 * (x_i - mean) / (r + eps)
+    # and their DIFFERENCE cancels `mean` exactly:
+    #   y_0 - y_1 = 8 * r / (r + eps)   =>   eps = 8 * r / (y_0 - y_1) - r.
+    # r is a power of two so it is exact in f32, and the difference removes the
+    # mean, which is the only place the OTHER use of eps enters.
+    r = 2.0**-10
+    probe = torch.tensor([[[[r]], [[0.0]]]], dtype=torch.float32)
+    ones = torch.ones(1, 2, dtype=torch.int64)
+    y = _norm_and_concat_padded_batch(probe, ones).reshape(-1).tolist()
+    v1_eps = 8.0 * r / (float(y[0]) - float(y[1])) - r
+
+    # V2 epsilon. [1, 1, 1, 1] with value v: variance == v**2 and the output is
+    #   y = v * rsqrt(v**2 + eps)   =>   eps = (v / y)**2 - v**2.
+    v = 2.0**-10
+    probe2 = torch.tensor([[[[v]]]], dtype=torch.float32)
+    y2 = float(norm_and_concat_per_token_rms(probe2, torch.ones(1, 1, dtype=torch.int64))[0, 0, 0])
+    v2_eps = (v / y2) ** 2 - v**2
+
+    emit_f64_scalar(out, "kLtxTeNormV1EpsUpstream", v1_eps)
+    emit_f64_scalar(out, "kLtxTeNormV2EpsUpstream", v2_eps)
+
+    # The degenerate inputs, run through UPSTREAM, so the property the C++ suite
+    # asserts is upstream's own and not one we invented.
+    #
+    # A CONSTANT stack: every (batch, layer) slice has range_ == 0.
+    const_stack = torch.full((BATCH, SEQ, GEMMA_HIDDEN, NUM_LAYERS), 0.5, dtype=torch.float32)
+    const_out = _norm_and_concat_padded_batch(const_stack, mask_right())
+    emit_scalar(out, "kLtxTeNormV1ConstantSliceFinite", int(bool(torch.isfinite(const_out).all())))
+
+    # A batch row with NO valid token at all: sequence_lengths == 0, so denom == 0
+    # and range_ == -inf. Upstream's output for that row is finite and ZERO,
+    # because :45 zeroes every position of it — with or without `denom + eps`.
+    zero_len_mask = torch.tensor([[0] * SEQ, [1] * SEQ], dtype=torch.int64)
+    zero_len_out = _norm_and_concat_padded_batch(torch.stack(hidden_states(), dim=-1), zero_len_mask)
+    emit_scalar(out, "kLtxTeNormV1ZeroLenFinite", int(bool(torch.isfinite(zero_len_out).all())))
+    emit_scalar(out, "kLtxTeNormV1ZeroLenRowIsZero", int(bool((zero_len_out[0] == 0.0).all())))
+
+    # A token whose whole hidden slice is zero: variance == 0.
+    zero_var = torch.stack(hidden_states(), dim=-1).clone()
+    zero_var[0, 0, :, :] = 0.0
+    zero_var_out = norm_and_concat_per_token_rms(zero_var, mask_right())
+    emit_scalar(out, "kLtxTeNormV2ZeroVarianceFinite", int(bool(torch.isfinite(zero_var_out).all())))
+    out.write("\n")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -541,6 +624,7 @@ def main() -> int:
         emit_selection(out, v1, v2)
         emit_extractors(out, v1, v2)
         emit_conditioning(out, v2)
+        emit_epsilons(out)
         out.write("}  // namespace vllm_test\n")
     print(f"wrote {args.out}", file=sys.stderr)
     return 0
