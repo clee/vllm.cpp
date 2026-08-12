@@ -112,11 +112,30 @@ class WindowsMetadataContract(unittest.TestCase):
         contract_start = script.index("function Invoke-CheckedContractTests {")
         contract_end = script.index("\n}\n", contract_start) + len("\n}\n")
         contract = script[contract_start:contract_end]
+        self.assertNotIn("record-arguments.cmd", contract)
+        self.assertEqual(contract.count('"record-arguments.ps1"'), 1)
+        for recorder_statement in (
+            "[Parameter(ValueFromRemainingArguments = $true)]",
+            "[string[]]$RemainingArguments = @()",
+            "Count = @($RemainingArguments).Count",
+            "Arguments = @($RemainingArguments)",
+            "ConvertTo-Json -Compress",
+        ):
+            with self.subTest(recorder_statement=recorder_statement):
+                self.assertEqual(contract.count(recorder_statement), 1)
+
         required_statements = (
             "Invoke-Checked $recordingTarget @()",
-            '"CALL`nARG1=[]`nARG2=[]`nARG3=[]`nARG4=[]"',
+            "$zeroArgumentRecord = Get-Content -LiteralPath $callLog -Raw | ConvertFrom-Json",
+            "[int]$zeroArgumentRecord.Count -ne 0",
+            "@($zeroArgumentRecord.Arguments).Count -ne 0",
             'Invoke-Checked $recordingTarget @("alpha", "two words", "--flag=value")',
-            '"CALL`nARG1=[alpha]`nARG2=[two words]`nARG3=[--flag=value]`nARG4=[]"',
+            "$nonemptyArgumentRecord = Get-Content -LiteralPath $callLog -Raw | ConvertFrom-Json",
+            "[int]$nonemptyArgumentRecord.Count -ne 3",
+            "@($nonemptyArgumentRecord.Arguments).Count -ne 3",
+            '$nonemptyArgumentRecord.Arguments[0] -cne "alpha"',
+            '$nonemptyArgumentRecord.Arguments[1] -cne "two words"',
+            '$nonemptyArgumentRecord.Arguments[2] -cne "--flag=value"',
             "Invoke-Checked $failingTarget @()",
             "if (-not $rejected)",
         )

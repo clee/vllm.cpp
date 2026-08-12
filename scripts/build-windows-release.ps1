@@ -29,21 +29,24 @@ function Invoke-Checked {
 function Invoke-CheckedContractTests {
     $temporaryDir = Join-Path ([System.IO.Path]::GetTempPath()) `
         "vllm-invoke-checked-$([guid]::NewGuid().ToString('N'))"
-    $recordingTarget = Join-Path $temporaryDir "record-arguments.cmd"
+    $recordingTarget = Join-Path $temporaryDir "record-arguments.ps1"
     $failingTarget = Join-Path $temporaryDir "fail.cmd"
     $callLog = Join-Path $temporaryDir "calls.txt"
     $savedCallLog = $env:VLLM_INVOKE_CHECKED_LOG
     try {
         New-Item -ItemType Directory -Path $temporaryDir | Out-Null
         @'
-@echo off
->>"%VLLM_INVOKE_CHECKED_LOG%" echo CALL
->>"%VLLM_INVOKE_CHECKED_LOG%" echo ARG1=[%~1]
->>"%VLLM_INVOKE_CHECKED_LOG%" echo ARG2=[%~2]
->>"%VLLM_INVOKE_CHECKED_LOG%" echo ARG3=[%~3]
->>"%VLLM_INVOKE_CHECKED_LOG%" echo ARG4=[%~4]
-exit /b 0
-'@ | Set-Content -LiteralPath $recordingTarget -Encoding ascii
+param(
+    [Parameter(ValueFromRemainingArguments = $true)]
+    [string[]]$RemainingArguments = @()
+)
+[pscustomobject]@{
+    Count = @($RemainingArguments).Count
+    Arguments = @($RemainingArguments)
+} | ConvertTo-Json -Compress | Set-Content `
+    -LiteralPath $env:VLLM_INVOKE_CHECKED_LOG -Encoding utf8
+exit 0
+'@ | Set-Content -LiteralPath $recordingTarget -Encoding utf8
         @'
 @echo off
 exit /b 23
@@ -51,17 +54,20 @@ exit /b 23
         $env:VLLM_INVOKE_CHECKED_LOG = $callLog
 
         Invoke-Checked $recordingTarget @()
-        $zeroArgumentCalls = @(Get-Content -LiteralPath $callLog)
-        if (($zeroArgumentCalls -join "`n") -ne
-            "CALL`nARG1=[]`nARG2=[]`nARG3=[]`nARG4=[]") {
+        $zeroArgumentRecord = Get-Content -LiteralPath $callLog -Raw | ConvertFrom-Json
+        if ([int]$zeroArgumentRecord.Count -ne 0 -or
+            @($zeroArgumentRecord.Arguments).Count -ne 0) {
             throw "zero-argument target was not invoked exactly once without arguments"
         }
 
         Remove-Item -LiteralPath $callLog
         Invoke-Checked $recordingTarget @("alpha", "two words", "--flag=value")
-        $nonemptyCalls = @(Get-Content -LiteralPath $callLog)
-        if (($nonemptyCalls -join "`n") -ne
-            "CALL`nARG1=[alpha]`nARG2=[two words]`nARG3=[--flag=value]`nARG4=[]") {
+        $nonemptyArgumentRecord = Get-Content -LiteralPath $callLog -Raw | ConvertFrom-Json
+        if ([int]$nonemptyArgumentRecord.Count -ne 3 -or
+            @($nonemptyArgumentRecord.Arguments).Count -ne 3 -or
+            $nonemptyArgumentRecord.Arguments[0] -cne "alpha" -or
+            $nonemptyArgumentRecord.Arguments[1] -cne "two words" -or
+            $nonemptyArgumentRecord.Arguments[2] -cne "--flag=value") {
             throw "nonempty arguments did not arrive unchanged"
         }
 

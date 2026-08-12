@@ -417,3 +417,20 @@ an ancestor base. The HTTP 503 downloading glslang in job `94242642545` is an
 external retry condition, not authorization to change the freshness gate. No
 tag is authorized until PR #524 merges and a new exact-merged-SHA dry run has
 all ten tuples plus aggregate handoff and verify green.
+
+The #525 implementation replaces the batch argument recorder with a temporary
+PowerShell script. Its `ValueFromRemainingArguments` string-array parameter
+defaults to an empty array, and it serializes the exact count and argument array
+as compact JSON. The unchanged real `Invoke-Checked` helper executes that script
+once with `@()` and once with `alpha`, `two words`, and `--flag=value`; the
+contract parses each record and compares its exact count and values. The
+separate exit-23 batch target and rejection assertion remain unchanged.
+
+RED-first coverage rejected the prior `record-arguments.cmd` implementation.
+After the repair, mutations removing the remaining-arguments binding, dropping
+`two words`, bypassing `Invoke-Checked`, or disabling the nonzero rejection each
+failed the focused metadata contract, and the script was restored byte-for-byte.
+The Windows metadata and release pipeline suites passed 50/50, followed by the
+direct Windows portability and release-binary checkers and the full unstaged
+repository preflight. The local host has no PowerShell runtime, so native
+execution remains a required hosted Windows gate.
