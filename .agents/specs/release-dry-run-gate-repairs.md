@@ -357,3 +357,26 @@ After the fix, Windows metadata passed 8/8, release pipeline passed 42/42, and
 both direct Windows portability and release-binary checkers passed. Removing
 `AllowEmptyCollection` made the focused contract red again, and both changed
 files were restored to their exact pre-mutation SHA-256 values.
+
+Fresh review of combined candidate `0a70da1d` found two test-strength gaps.
+Adding an unconditional `return` as the first statement of
+`Invoke-CheckedContractTests` left all eight Windows metadata tests green even
+though the hosted `-ContractTest` path would silently skip its runtime proofs.
+Changing both fused-tier restoration calls to target
+`VT_FUSED_TIER_WRONG` likewise left the focused portability test and direct
+checker green. The test-only repair now binds the three exact `Invoke-Checked`
+calls and their ordered literal outcomes, rejects an executable early control
+exit in the contract-test function, and pins both restoration branches to the
+exact `VT_FUSED_TIER` key with `saved.c_str()` or `nullptr` respectively.
+
+After the repair, the early-return mutation and separate wrong-key mutations
+in the prior-present and prior-absent restoration branches each failed their
+focused test. The existing `AllowEmptyCollection`-removal and `_putenv_s`-
+removal mutations also remained red. Production files were restored to their
+pre-mutation SHA-256 values. The combined Windows metadata, release pipeline,
+and Windows portability suites passed 122/122, followed by both direct Windows
+portability and release-binary checkers. Native PowerShell execution and MSVC
+compilation remain the required external Windows PR gates. The full unstaged
+repository preflight passed every gate except one transient tempfile failure in
+`test_check_release_binary_contract`; an immediate isolated retry of that exact
+suite passed all 30 tests.

@@ -608,11 +608,19 @@ class WindowsPortabilityCheckerTest(unittest.TestCase):
             '(both tiers)")'
         )
         case_end = source.index("\nTEST_CASE(", case_start + 1)
-        case = checker._cpp_structural_view(source[case_start:case_end])
+        case_source = checker.without_cpp_comments(source[case_start:case_end])
+        case = checker._cpp_structural_view(case_source)
         self.assertEqual(len(re.findall(r"\bSetTestEnvironment\s*\(", case)), 3)
         self.assertRegex(case, r"REQUIRE\s*\(\s*vt::FusedTier\s*\(\s*\)\s*==\s*tier")
-        self.assertIn("had_prev", case)
-        self.assertIn("saved", case)
+        self.assertRegex(
+            case_source,
+            r'if\s*\(\s*had_prev\s*\)\s*\{\s*'
+            r'SetTestEnvironment\s*\(\s*"VT_FUSED_TIER"\s*,\s*'
+            r'saved\.c_str\s*\(\s*\)\s*\)\s*;\s*'
+            r'\}\s*else\s*\{\s*'
+            r'SetTestEnvironment\s*\(\s*"VT_FUSED_TIER"\s*,\s*'
+            r'nullptr\s*\)\s*;\s*\}',
+        )
 
     def test_posix_cache_source_requires_exact_not_win32_cmake_guard(self) -> None:
         source = "src/vt/cuda/nvfp4_persistent_cache.cpp"

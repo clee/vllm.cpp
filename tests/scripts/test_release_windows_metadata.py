@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import json
+import re
 import tempfile
 import unittest
 from pathlib import Path
@@ -111,13 +112,38 @@ class WindowsMetadataContract(unittest.TestCase):
         contract_start = script.index("function Invoke-CheckedContractTests {")
         contract_end = script.index("\n}\n", contract_start) + len("\n}\n")
         contract = script[contract_start:contract_end]
+        required_statements = (
+            "Invoke-Checked $recordingTarget @()",
+            '"CALL`nARG1=[]`nARG2=[]`nARG3=[]`nARG4=[]"',
+            'Invoke-Checked $recordingTarget @("alpha", "two words", "--flag=value")',
+            '"CALL`nARG1=[alpha]`nARG2=[two words]`nARG3=[--flag=value]`nARG4=[]"',
+            "Invoke-Checked $failingTarget @()",
+            "if (-not $rejected)",
+        )
+        cursor = 0
+        for statement in required_statements:
+            with self.subTest(statement=statement):
+                self.assertEqual(contract.count(statement), 1)
+                offset = contract.index(statement)
+                self.assertGreaterEqual(offset, cursor)
+                cursor = offset + len(statement)
+        executable_contract = re.sub(
+            r"(?ms)^[ \t]*@'\s*$.*?^[ \t]*'@[^\n]*$",
+            "",
+            contract,
+        )
+        self.assertNotRegex(
+            executable_contract,
+            r"(?m)^\s*(?:return|exit|break|continue)(?:\s|$)",
+            "Invoke-Checked contract proofs must not be bypassable",
+        )
         for behavior in (
-            "zero-argument target",
-            "nonempty arguments",
-            "nonzero child exit",
+            "zero-argument target was not invoked exactly once without arguments",
+            "nonempty arguments did not arrive unchanged",
+            "nonzero child exit was accepted",
         ):
             with self.subTest(behavior=behavior):
-                self.assertIn(behavior, contract)
+                self.assertEqual(contract.count(behavior), 1)
 
         dispatch = script[script.index("if ($ContractTest)"):]
         self.assertEqual(dispatch.count("Invoke-CheckedContractTests"), 1)
