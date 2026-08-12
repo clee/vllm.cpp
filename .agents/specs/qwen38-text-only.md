@@ -108,13 +108,17 @@ the only structural change is where it looks.
   not by a green suite.
 - **Half-resolved namespace.** Probing per lookup instead of once could load a
   mixture. Mitigated by design point 1 and a test with a deliberately mixed
-  index, which must be refused.
+  index, which must be refused. Refusing where upstream's `WeightsMapper`
+  NORMALIZES is a deliberate divergence in the strict direction and is recorded
+  as such in [porting-inventory](../porting-inventory.md) §9 deviation 17(c).
 - **Untestable scale.** 92 layers / 512 experts is far past anything we can
   instantiate. Mitigated by testing config resolution and name mapping directly,
   and by *not* claiming the checkpoint runs.
 - **Ahead-of-pin drift.** The forward-ported arm could diverge if upstream
-  changes it before our next sync. Recorded in the porting inventory as
-  ahead-of-pin so the next sync cycle reconciles it deliberately.
+  changes it before our next sync. Recorded in
+  [porting-inventory](../porting-inventory.md) §9 deviation 17 as ahead-of-pin,
+  with the two arms added to its §5 Qwen3.5 row, so the next sync cycle
+  reconciles it deliberately.
 
 ## Tests
 
@@ -126,7 +130,15 @@ the only structural change is where it looks.
 3. Weight-name mapping: a clean (`model.`) index and a VL-prefixed
    (`model.language_model.`) index both resolve every expected backbone tensor
    name; a mixed index is refused.
-4. Inertness: 27B/35B/Coder suites unchanged, golden md5 unchanged.
+4. Loader byte-equality, DENSE and MoE. Two synthetic one-layer checkpoints
+   with byte-identical payloads and only the namespace differing must load to
+   byte-identical weights through the production `LoadQwen3_5Dense` and
+   `LoadQwen3_5Moe`. The MoE case runs on BOTH expert-residency paths —
+   `shards_owner == nullptr` (eager) and non-null (deferred), with
+   `load_layer_experts` actually driven — because the deferred closure captures
+   the resolved prefix by value and executes after the resolving frame returns,
+   which is a third prefix site the dense loader has no analogue of.
+5. Inertness: 27B/35B/Coder suites unchanged, golden md5 unchanged.
 
 ## Gates
 
@@ -147,6 +159,8 @@ run gate and closes this axis.
 ## Evidence required
 
 - RED capture of the dispatch test before registration.
+- A mutation capture per prefix site — dense and MoE, including the deferred
+  expert closure — showing the hardcoded VL literal makes the flat load throw.
 - Green focused + full gate after.
 - Golden md5 before/after for 27B/35B/Coder showing no drift.
 - The owed run gate recorded explicitly in the row and in `docs/STATUS.md`.
@@ -179,13 +193,23 @@ deliberately NOT implemented on speculation: the MTP, quantized and GGUF arms fo
 ## Outcome
 
 **Measured.** Architecture dispatch for both strings, config resolution on the
-flat 3.8 shape (scale fields plus the family's 0.25 partial-rotary default with
-no `text_config`, `vision_config` or `mrope_section`), and weight-namespace
+PUBLISHED `Qwen/Qwen3.8-2.4T-A95B` `config.json` (committed verbatim as
+`tests/vllm/models/fixtures/qwen3_8_2_4t_a95b/config.json`, md5
+`303dc59227f1d03afc941646e8df3132`) — the scale fields, the 92-entry
+`layer_types` list and its `[linear,linear,linear,full] x 23` pattern, the NESTED
+`rope_parameters` block both loaders' rope actually reads, and the absence of
+`text_config` / `vision_config` / `mrope_section` — and weight-namespace
 resolution on a clean index, a VL-prefixed index, a vision-inclusive VL index, an
 index carrying `mtp.*`, a mixed index and an empty one. The strongest of these is
 not a name-mapping assertion: two synthetic one-layer checkpoints with
 byte-identical payloads and only the namespace differing load to byte-identical
-weights through the production `LoadQwen3_5Dense`.
+weights through the production `LoadQwen3_5Dense` — and, on the MoE arm this row
+exists for, through the production `LoadQwen3_5Moe` on BOTH expert-residency
+paths, the deferred `load_layer_experts` closure included. Each of the three MoE
+prefix sites was reverted to the hardcoded VL literal in turn and each RED is the
+flat checkpoint failing to bind: `layers.0.input_layernorm.weight` (per-layer
+base), `embed_tokens.weight` (top level) and `layers.0.mlp.experts.0.gate_proj
+.weight` (the deferred closure).
 
 **Rejected.** A per-lookup namespace fallback — it would let a checkpoint bind
 half its tensors from each namespace and still appear to load, which is exactly
@@ -206,3 +230,12 @@ rather than by re-measurement. The text-only arms register with
 **What was NOT established.** Any claim about generated tokens, memory or speed
 for `Qwen/Qwen3.8-2.4T-A95B`. That checkpoint cannot be executed on this
 hardware and was never run.
+
+**Recorded as tracked debt** in [porting-inventory](../porting-inventory.md) §9
+deviation 17, with the two arms carried on its §5 Qwen3.5 row and the owed run
+gate on [BENCHMARKS](../../docs/BENCHMARKS.md) §Open gaps: the ahead-of-pin
+anchor `ad5d29db7` (17a/b), the deliberate REFUSAL of a mixed namespace where
+upstream's `WeightsMapper` would normalize it (17c), and the published config's
+transformers-4.57.3 `dtype` key, which `hf_config.cpp:520-522` does not consume
+(17d — inert, no reader, and a fix would touch every model, so it is pinned by
+an assertion rather than smuggled in here).

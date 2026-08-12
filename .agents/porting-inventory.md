@@ -142,7 +142,10 @@ implementation targets, 261 modules) plus a dynamic Transformers-compatible
 path. The generic ordered architecture-to-type-erased-
 factory contract is now implemented for the two architectures whose text paths
 exist locally: `Qwen3_5ForConditionalGeneration` and
-`Qwen3_5MoeForConditionalGeneration`. Live loading consumes the full
+`Qwen3_5MoeForConditionalGeneration` — plus, since 2026-08-12, their TEXT-ONLY
+arms `Qwen3_5ForCausalLM` / `Qwen3_5MoeForCausalLM`, which are two further
+registrations over those SAME two factories rather than new implementations (§9
+deviation 17: ahead-of-pin, run gate OWED). Live loading consumes the full
 `config.architectures` list in order and mirrors pinned unknown,
 previously-supported, and out-of-tree rejection; unimplemented IDs remain
 unsupported rather than being misclassified by `num_experts`. The execution row
@@ -153,7 +156,7 @@ Python lazy-import/subprocess caching remain explicitly deferred.
 
 | Family | Marquee members | Needs | Tier |
 |---|---|---|---|
-| **Qwen3.5/3.6 hybrid (incl. MoE)** | `Qwen3_5ForConditionalGeneration` (27B dense-hybrid, **VL multimodal** wrapper — vision_config present), `Qwen3_5MoeForConditionalGeneration` / `qwen35moe` (35B-A3B) | GDN layers ×3 : 1 gated full-attn (qk-norm, partial RoPE 64d, output gate), MoE 256e top-8 + shared expert (35B) / **dense SwiGLU MLP** (27B), GemmaRMSNorm-style `(1+w)` — ✅ `25326fc` (35B forward correctness-grade, **safetensors**; 16/16 greedy on GB10 = M0 exit; GGUF k-quant load M0.10). **27B (co-equal gate):** CPU-first scaffolding started — arch/quant surveyed (`.agents/specs/qwen27b-w4a4-notes.md`: dense hybrid, W4A4, **and a VL wrapper — text path first, ViT deferred**), CPU W4A4 emulation reference + skipping greedy-parity gate landed; dense loader + single-seq `ForwardDense` + batched PAGED `Qwen3_5DenseModel::Forward` (paged==dense CPU-anchored) + `GPUModelRunner` dense route all landed CPU-green; W4A4 GPU GEMM + oracle golden pending (GPU-gated). **Ordinary plain-BF16 leaf (`LOAD-SAFETENSORS-DIRECT-DENSE`):** raw-NK stacked/tied 4B loading plus layer-bounded discrete-CUDA staging is implemented; real-weight CPU load passes 1656/1656 and local AOT-CUDA retained-host/direct-device tokens match at 1664/1664. The corrected AOT series completes 18/18 legs: ON/OFF/vLLM total **6155.10/6064.06/6730.46 tok/s**, ON=OFF 128/128, peak PSS **2.405/8.571/7.569 GiB**; current ON is 0.9316x the previous AOT result. Current-v0.25 oracle/sanitizer, strict VRAM and external 27B/35B regressions remain open, so this is not a support claim. serving M1–M3 | **T0 (the gate)** |
+| **Qwen3.5/3.6 hybrid (incl. MoE)** | `Qwen3_5ForConditionalGeneration` (27B dense-hybrid, **VL multimodal** wrapper — vision_config present), `Qwen3_5MoeForConditionalGeneration` / `qwen35moe` (35B-A3B), plus the TEXT-ONLY arms `Qwen3_5ForCausalLM` and `Qwen3_5MoeForCausalLM` (`qwen3_5_text` / `qwen3_5_moe_text`; motivating checkpoint `Qwen/Qwen3.8-2.4T-A95B`) | GDN layers ×3 : 1 gated full-attn (qk-norm, partial RoPE 64d, output gate), MoE 256e top-8 + shared expert (35B) / **dense SwiGLU MLP** (27B), GemmaRMSNorm-style `(1+w)` — ✅ `25326fc` (35B forward correctness-grade, **safetensors**; 16/16 greedy on GB10 = M0 exit; GGUF k-quant load M0.10). **27B (co-equal gate):** CPU-first scaffolding started — arch/quant surveyed (`.agents/specs/qwen27b-w4a4-notes.md`: dense hybrid, W4A4, **and a VL wrapper — text path first, ViT deferred**), CPU W4A4 emulation reference + skipping greedy-parity gate landed; dense loader + single-seq `ForwardDense` + batched PAGED `Qwen3_5DenseModel::Forward` (paged==dense CPU-anchored) + `GPUModelRunner` dense route all landed CPU-green; W4A4 GPU GEMM + oracle golden pending (GPU-gated). **Ordinary plain-BF16 leaf (`LOAD-SAFETENSORS-DIRECT-DENSE`):** raw-NK stacked/tied 4B loading plus layer-bounded discrete-CUDA staging is implemented; real-weight CPU load passes 1656/1656 and local AOT-CUDA retained-host/direct-device tokens match at 1664/1664. The corrected AOT series completes 18/18 legs: ON/OFF/vLLM total **6155.10/6064.06/6730.46 tok/s**, ON=OFF 128/128, peak PSS **2.405/8.571/7.569 GiB**; current ON is 0.9316x the previous AOT result. Current-v0.25 oracle/sanitizer, strict VRAM and external 27B/35B regressions remain open, so this is not a support claim. **TEXT-ONLY arms (`MODEL-TEXT-qwen3-5-qwen3-5-for-causal-lm`, `MODEL-TEXT-qwen3-5-qwen3-5-moe-for-causal-lm`, issue #490, both `PARTIAL`):** additive registration against the existing dense/MoE factories plus a once-per-checkpoint backbone-namespace resolution (`model.language_model.` or flat `model.`, mixed REFUSED); AHEAD OF THE PIN at `ad5d29db7` / vllm#50210 and the **run gate is OWED** — no Qwen3.8 checkpoint fits GB10, so nothing about generated tokens, memory or speed is claimed (§9 deviation 17; [spec](specs/qwen38-text-only.md)). serving M1–M3 | **T0 (the gate)** |
 | Dense decoders | Llama 3.x, Qwen2/3, Mistral, Gemma 2/3, Phi | GQA + RoPE + SwiGLU + RMSNorm (subset of T0 layer set) | T1 |
 | MoE decoders | Mixtral, Qwen3-MoE (30B-A3B), GLM-4-MoE, OLMoE | FusedMoE 🚧 `65788b3` (correctness-grade eager; grouped-GEMM perf M2.2) | T1 |
 | Qwen3-Next | `Qwen3NextForCausalLM` | same stack, interleaved-GQA weight layout | T1 |
@@ -1055,6 +1058,58 @@ Examples: `examples/cli` ✅ (C-API client), `examples/server` ✅ (OpenAI serve
     #51655 merging plus a pin advance that includes it; until then the row
     carries this deviation. Scope and gates: [muse-glimmer
     spec](specs/muse-glimmer.md) §0.
+
+17. **Ahead-of-pin forward port: the Qwen3.5 TEXT-ONLY arms are anchored on a
+    POST-PIN upstream commit (2026-08-12,
+    `MODEL-TEXT-qwen3-5-qwen3-5-for-causal-lm` +
+    `MODEL-TEXT-qwen3-5-qwen3-5-moe-for-causal-lm`, issue
+    [#490](https://github.com/mudler/vllm.cpp/issues/490)).** Our parity pin is
+    `555967922` (2026-07-26), whose `vllm/model_executor/models/registry.py`
+    carries only `Qwen3_5ForConditionalGeneration` and
+    `Qwen3_5MoeForConditionalGeneration`. The text-only arms
+    `Qwen3_5ForCausalLM` / `Qwen3_5MoeForCausalLM` arrived upstream AFTERWARDS,
+    in [vllm#50210](https://github.com/vllm-project/vllm/pull/50210) at
+    `ad5d29db7` (a descendant of the pin). Every `file:line` this row cites —
+    `registry.py:202-203`, `qwen3_5.py:296-300`, `qwen3_5.py:439-449` — therefore
+    points at a **post-pin head, not at the pin**, which is a deliberate
+    exception to "port from the pinned oracle". Same shape as deviation 16 above
+    and taken for the same reason: at the pin the feature does not exist at all,
+    so there is nothing there to mirror. It is recorded here, and argued for in
+    the commit that introduced it, because no checker enforces the anchor rule.
+    Consequences, all binding while this stands:
+    (a) this row does **not** advance the pin and reconciles nothing else in the
+    `555967922..ad5d29db7` range — the next [upstream-sync](upstream-sync.md)
+    cycle reconciles it deliberately, and until then a Qwen3.5 change must check
+    both anchors; (b) **no token or speed axis is claimable for
+    `Qwen/Qwen3.8-2.4T-A95B`** — 2.4T bf16 is ~4.8 TB and the released FP8
+    variant ~2.4 TB against GB10's 128 GB unified, with no smaller Qwen3.8
+    sibling, so the run gate is OWED (both rows are `PARTIAL`, never `DONE`, and
+    the gap is recorded in [BENCHMARKS](../docs/BENCHMARKS.md) §Open gaps); it
+    closes only when a text-only `Qwen3_5[Moe]ForCausalLM` checkpoint that fits
+    GB10 appears; (c) **one behavior deliberately diverges from upstream, in the
+    strict direction.** Upstream normalizes the two weight namespaces with
+    `WeightsMapper(orig_to_new_prefix={"model.language_model.": "model."})`, so a
+    checkpoint carrying backbone tensors under BOTH spellings LOADS upstream, its
+    names silently rewritten; `ResolveQwen3_5BackbonePrefix`
+    (`src/vllm/model_executor/models/qwen3_5_weights.cpp:597-615`) REFUSES it.
+    The reason is that our loaders resolve the namespace ONCE and a mixed index
+    is the one input where a per-lookup mapper binds half a model from each
+    namespace and still appears to succeed — a wrong model that loads, which no
+    name-mapping test can see. A refusal is strictly safer than upstream's
+    rewrite and cannot make a checkpoint upstream rejects load here, so it is
+    tracked rather than reconciled; it is revisited if upstream ever publishes a
+    genuinely mixed index; (d) **the published config's dtype key is NOT
+    consumed, tree-wide.** `Qwen/Qwen3.8-2.4T-A95B` is transformers 4.57.3 and
+    spells the model dtype `dtype`; `hf_config.cpp:520-522` reads only the legacy
+    `torch_dtype`, so `HfConfig::torch_dtype` is EMPTY on this document. Inert
+    today — nothing in the tree reads that field — and deliberately NOT fixed on
+    this row, because consuming `dtype` is a behavior change on every model and
+    owes its own row, RED-first test and inertness proof. Pinned by an assertion
+    in `tests/vllm/models/test_qwen3_8_text_only.cpp` so it cannot drift
+    silently. The whole deviation is discharged by a pin advance that includes
+    `ad5d29db7`, at which point (a) and the anchors become ordinary mirrored
+    behavior and only (c) and (d) survive as tracked items. Scope and gates:
+    [qwen3.8 text-only spec](specs/qwen38-text-only.md).
 
 ## 10. E2E test suites (T0 deliverable)
 

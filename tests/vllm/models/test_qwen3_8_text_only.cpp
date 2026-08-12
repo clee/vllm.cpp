@@ -21,15 +21,35 @@
 // that checkpoint and none is implied here. These cases pin architecture
 // dispatch, flat-config resolution and weight-namespace resolution — nothing
 // about generated tokens. See .agents/specs/qwen38-text-only.md §Gates.
+//
+// WHAT IT DOES PIN, and why each shape was chosen:
+//   1. dispatch          — both architecture strings resolve to the EXISTING
+//                          dense/MoE factories with the text `_ModelInfo`.
+//   2. config            — the PUBLISHED config.json, committed verbatim as
+//                          fixtures/qwen3_8_2_4t_a95b/config.json.
+//   3. namespace probe   — clean / VL / vision-inclusive / mtp / mixed / empty.
+//   4. dense LOADER      — two synthetic checkpoints, byte-identical payloads,
+//                          only the namespace differing, loaded through the
+//                          production `LoadQwen3_5Dense`.
+//   4b. MoE LOADER       — the same proof through `LoadQwen3_5Moe`, on BOTH
+//                          expert-residency paths (eager, and the DEFERRED
+//                          `load_layer_experts` closure actually driven). The
+//                          MoE arm is the one this row exists for and it
+//                          threads the prefix through three sites the dense
+//                          loader has no analogue of.
+//   5. inertness         — the VL spelling stays the per-layer seam DEFAULT.
 #include <doctest/doctest.h>
 
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <memory>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "vllm/model_executor/model_loader/safetensors_reader.h"
@@ -81,37 +101,31 @@ class TempFile {
   std::string path_;
 };
 
-class TempJsonDir {
- public:
-  explicit TempJsonDir(const std::string& config_body) {
-    static int counter = 0;
-    dir_ = (std::filesystem::temp_directory_path() /
-            ("vllm_qwen3_8_cfg_" + std::to_string(counter++)))
-               .string();
-    std::filesystem::create_directories(dir_);
-    std::ofstream(dir_ + "/config.json", std::ios::binary) << config_body;
-  }
-  ~TempJsonDir() { std::filesystem::remove_all(dir_); }
-  TempJsonDir(const TempJsonDir&) = delete;
-  TempJsonDir& operator=(const TempJsonDir&) = delete;
-  std::string config_path() const { return dir_ + "/config.json"; }
-
- private:
-  std::string dir_;
-};
-
-// One tiny synthetic tensor description: name + shape, BF16, filled with a
-// deterministic per-tensor pattern so a wrong binding shows up in the VALUES,
-// not only in a name.
+// One tiny synthetic tensor description: name + shape + safetensors dtype
+// string, filled with a deterministic per-tensor pattern so a wrong binding
+// shows up in the VALUES, not only in a name. The dense arm is all-BF16 (the
+// default); the MoE arm needs the checkpoint's real per-class quantization —
+// per-tensor FP8 attention and NVFP4 experts/head — because the MoE loader
+// type-checks every one of them (qwen3_5_weights.cpp:385-463).
 struct Spec {
   std::string name;
   std::vector<int64_t> shape;
+  std::string dtype = "BF16";
 };
 
 int64_t Numel(const std::vector<int64_t>& shape) {
   int64_t n = 1;
   for (const int64_t d : shape) n *= d;
   return n;
+}
+
+// Byte width of the safetensors dtypes this file emits. Must agree with the
+// reader's own table (safetensors_reader.cpp:41-48), which REJECTS a header
+// whose shape times dtype width does not equal its data_offsets span.
+size_t ElemSize(const std::string& dtype) {
+  if (dtype == "BF16") return 2;
+  if (dtype == "F32") return 4;
+  return 1;  // U8 (packed fp4 codes) / F8_E4M3
 }
 
 // Builds a whole safetensors file from `specs`. The bytes of a tensor depend
@@ -124,9 +138,11 @@ std::string BuildSafetensors(const std::vector<Spec>& specs) {
   uint64_t offset = 0;
   for (size_t i = 0; i < specs.size(); ++i) {
     const int64_t n = Numel(specs[i].shape);
-    const auto nbytes = static_cast<uint64_t>(n) * 2;
+    const std::string& dtype = specs[i].dtype;
+    const size_t elem = ElemSize(dtype);
+    const auto nbytes = static_cast<uint64_t>(n) * elem;
     if (i != 0) header += ",";
-    header += "\"" + specs[i].name + "\":{\"dtype\":\"BF16\",\"shape\":[";
+    header += "\"" + specs[i].name + "\":{\"dtype\":\"" + dtype + "\",\"shape\":[";
     for (size_t d = 0; d < specs[i].shape.size(); ++d) {
       if (d != 0) header += ",";
       header += std::to_string(specs[i].shape[d]);
@@ -135,14 +151,29 @@ std::string BuildSafetensors(const std::vector<Spec>& specs) {
               std::to_string(offset + nbytes) + "]}";
     offset += nbytes;
 
-    std::vector<uint16_t> values(static_cast<size_t>(n));
-    for (size_t e = 0; e < values.size(); ++e) {
-      // A finite, distinct bf16 per (tensor index, element index).
-      values[e] = static_cast<uint16_t>(0x3d00 + ((i * 37 + e * 7) & 0x1ff));
-    }
     const size_t at = body.size();
     body.resize(at + static_cast<size_t>(nbytes));
-    std::memcpy(body.data() + at, values.data(), static_cast<size_t>(nbytes));
+    char* dst = body.data() + at;
+    if (dtype == "BF16") {
+      for (size_t e = 0; e < static_cast<size_t>(n); ++e) {
+        // A finite, distinct bf16 per (tensor index, element index).
+        const auto v = static_cast<uint16_t>(0x3d00 + ((i * 37 + e * 7) & 0x1ff));
+        std::memcpy(dst + e * 2, &v, 2);
+      }
+    } else if (dtype == "F32") {
+      for (size_t e = 0; e < static_cast<size_t>(n); ++e) {
+        // A finite, POSITIVE, distinct f32 — these are the per-tensor
+        // weight_scale / input_scale / weight_scale_2 scalars, and the loader
+        // multiplies them into `alpha`, so a NaN would make an equality
+        // assertion on the derived scalar meaningless.
+        const float v = 0.125F * static_cast<float>((i * 5 + e * 3) % 7 + 1);
+        std::memcpy(dst + e * 4, &v, 4);
+      }
+    } else {
+      for (size_t e = 0; e < static_cast<size_t>(n); ++e) {
+        dst[e] = static_cast<char>((i * 37 + e * 7) & 0xff);
+      }
+    }
   }
   header += "}";
   return U64Le(header.size()) + header + body;
@@ -215,6 +246,182 @@ void CheckSameBytes(const vllm::OwnedTensor& a, const vllm::OwnedTensor& b,
   CHECK(std::memcmp(a.bytes.data(), b.bytes.data(), a.bytes.size()) == 0);
 }
 
+// ---------------------------------------------------------------------------
+// MoE arm. `Qwen3_5MoeForCausalLM` is the architecture this row exists for, and
+// the MoE loader threads the resolved prefix through THREE further sites the
+// dense loader has no analogue of: the per-layer base (LoadLayerImpl,
+// qwen3_5_weights.cpp:560-561), the top-level embed/norm pair
+// (LoadQwen3_5Moe:677-678), and — only on the shards-owner path — the DEFERRED
+// per-layer routed-expert closure (:698-709), which captures the prefix BY
+// VALUE and runs long after the resolution frame is gone.
+//
+// The quantization per weight class is the real 35B/3.8 scheme
+// (qwen3_5_weights.h:1-13): bf16 embeds/norms/router/shared-gate, per-tensor
+// FP8 attention, NVFP4 routed experts + shared expert + lm_head. NVFP4 requires
+// K % 16 == 0, which is what fixes the toy hidden size at 16.
+// ---------------------------------------------------------------------------
+constexpr int64_t kMoeHidden = 16;
+constexpr int64_t kMoeInter = 16;
+constexpr int64_t kMoeVocab = 6;
+constexpr int64_t kMoeExperts = 2;
+constexpr int64_t kMoeHeadDim = 4;
+constexpr int64_t kMoeQ = 8;   // 2 heads x 4
+constexpr int64_t kMoeKv = 4;  // 1 head  x 4
+
+// Per-tensor FP8 (W8A8) projection: weight + weight_scale + input_scale. Both
+// scalars are emitted so the fixture loads on EITHER arm of DenseNativeEnabled()
+// (fp8-resident on a CUDA+cutlass build, dequant-to-bf16 otherwise).
+void AppendFp8(std::vector<Spec>& out, const std::string& proj, int64_t out_dim,
+               int64_t in_dim) {
+  out.push_back({proj + ".weight", {out_dim, in_dim}, "F8_E4M3"});
+  out.push_back({proj + ".weight_scale", {1}, "F32"});
+  out.push_back({proj + ".input_scale", {1}, "F32"});
+}
+
+// NVFP4 W4A16 projection: packed [N, K/2] U8 codes + [N, K/16] fp8-e4m3 group
+// scales + the f32 per-tensor global.
+void AppendNvfp4(std::vector<Spec>& out, const std::string& proj,
+                 int64_t out_dim, int64_t in_dim) {
+  out.push_back({proj + ".weight", {out_dim, in_dim / 2}, "U8"});
+  out.push_back({proj + ".weight_scale", {out_dim, in_dim / 16}, "F8_E4M3"});
+  out.push_back({proj + ".weight_scale_2", {1}, "F32"});
+}
+
+// The full tensor list of a ONE-layer, full-attention, two-expert Qwen3.5 MoE
+// checkpoint under backbone prefix `p`. `lm_head` is deliberately TOP-LEVEL
+// (unprefixed) in both spellings, exactly as both published indices have it.
+std::vector<Spec> MoeOneLayerSpecs(const std::string& p) {
+  const std::string l = p + "layers.0.";
+  const std::string sa = l + "self_attn.";
+  const std::string mlp = l + "mlp.";
+  std::vector<Spec> s{
+      {p + "embed_tokens.weight", {kMoeVocab, kMoeHidden}},
+      {p + "norm.weight", {kMoeHidden}},
+      {l + "input_layernorm.weight", {kMoeHidden}},
+      {l + "post_attention_layernorm.weight", {kMoeHidden}},
+  };
+  AppendFp8(s, sa + "q_proj", kMoeQ, kMoeHidden);
+  AppendFp8(s, sa + "k_proj", kMoeKv, kMoeHidden);
+  AppendFp8(s, sa + "v_proj", kMoeKv, kMoeHidden);
+  AppendFp8(s, sa + "o_proj", kMoeHidden, kMoeQ);
+  s.push_back({sa + "q_norm.weight", {kMoeHeadDim}});
+  s.push_back({sa + "k_norm.weight", {kMoeHeadDim}});
+  // Router + shared-expert gate (bf16, transposed at load).
+  s.push_back({mlp + "gate.weight", {kMoeExperts, kMoeHidden}});
+  s.push_back({mlp + "shared_expert_gate.weight", {1, kMoeHidden}});
+  for (int64_t e = 0; e < kMoeExperts; ++e) {
+    const std::string ex = mlp + "experts." + std::to_string(e) + ".";
+    AppendNvfp4(s, ex + "gate_proj", kMoeInter, kMoeHidden);
+    AppendNvfp4(s, ex + "up_proj", kMoeInter, kMoeHidden);
+    AppendNvfp4(s, ex + "down_proj", kMoeHidden, kMoeInter);
+  }
+  const std::string se = mlp + "shared_expert.";
+  AppendNvfp4(s, se + "gate_proj", kMoeInter, kMoeHidden);
+  AppendNvfp4(s, se + "up_proj", kMoeInter, kMoeHidden);
+  AppendNvfp4(s, se + "down_proj", kMoeHidden, kMoeInter);
+  AppendNvfp4(s, "lm_head", kMoeVocab, kMoeHidden);
+  return s;
+}
+
+HfConfig OneLayerMoeConfig() {
+  HfConfig config;
+  config.model_type = "qwen3_5_moe_text";
+  config.hidden_size = kMoeHidden;
+  config.num_hidden_layers = 1;
+  config.layer_types = {"full_attention"};
+  config.num_experts = kMoeExperts;
+  return config;
+}
+
+void CheckSameNvfp4(const vllm::Nvfp4Weight& a, const vllm::Nvfp4Weight& b,
+                    const char* what) {
+  CAPTURE(what);
+  CHECK(a.n == b.n);
+  CHECK(a.k == b.k);
+  CHECK(a.scale2 == b.scale2);
+  CheckSameBytes(a.packed, b.packed, what);
+  CheckSameBytes(a.scale, b.scale, what);
+}
+
+void CheckSameFp8(const vllm::Fp8Weight& a, const vllm::Fp8Weight& b,
+                  const char* what) {
+  CAPTURE(what);
+  CHECK(a.n == b.n);
+  CHECK(a.k == b.k);
+  CHECK(a.weight_scale == b.weight_scale);
+  CHECK(a.input_scale == b.input_scale);
+  CHECK(a.alpha == b.alpha);
+  CheckSameBytes(a.packed, b.packed, what);
+}
+
+// Which arm of the attention projections the loader fills depends on the BUILD,
+// not on this test: DenseNativeEnabled() keeps them fp8-resident on a
+// CUDA+cutlass build and dequants them to bf16 otherwise. Assert on whichever
+// this build populated, and REQUIRE that exactly one of the two is populated.
+void CheckSameAttn(const vllm::FullAttnLayerWeights& a,
+                   const vllm::FullAttnLayerWeights& b) {
+  const bool fp8 = !a.q_proj_fp8.Empty();
+  REQUIRE(fp8 == !b.q_proj_fp8.Empty());
+  REQUIRE(fp8 == a.q_proj.Empty());
+  REQUIRE(fp8 == b.q_proj.Empty());
+  if (fp8) {
+    CheckSameFp8(a.q_proj_fp8, b.q_proj_fp8, "q_proj fp8");
+    CheckSameFp8(a.k_proj_fp8, b.k_proj_fp8, "k_proj fp8");
+    CheckSameFp8(a.v_proj_fp8, b.v_proj_fp8, "v_proj fp8");
+    CheckSameFp8(a.o_proj_fp8, b.o_proj_fp8, "o_proj fp8");
+  } else {
+    CheckSameBytes(a.q_proj, b.q_proj, "q_proj");
+    CheckSameBytes(a.k_proj, b.k_proj, "k_proj");
+    CheckSameBytes(a.v_proj, b.v_proj, "v_proj");
+    CheckSameBytes(a.o_proj, b.o_proj, "o_proj");
+  }
+  CheckSameBytes(a.q_norm, b.q_norm, "q_norm");
+  CheckSameBytes(a.k_norm, b.k_norm, "k_norm");
+}
+
+void CheckSameMoeBlock(const vllm::MoeBlockWeights& a,
+                       const vllm::MoeBlockWeights& b) {
+  CheckSameBytes(a.router_gate, b.router_gate, "mlp.gate");
+  CheckSameBytes(a.shared_gate, b.shared_gate, "mlp.shared_expert_gate");
+  CheckSameNvfp4(a.shared_gate_proj_fp4, b.shared_gate_proj_fp4,
+                 "shared_expert.gate_proj");
+  CheckSameNvfp4(a.shared_up_proj_fp4, b.shared_up_proj_fp4,
+                 "shared_expert.up_proj");
+  CheckSameNvfp4(a.shared_down_proj_fp4, b.shared_down_proj_fp4,
+                 "shared_expert.down_proj");
+  REQUIRE(a.expert_gate_fp4.size() == static_cast<size_t>(kMoeExperts));
+  REQUIRE(b.expert_gate_fp4.size() == a.expert_gate_fp4.size());
+  REQUIRE(a.expert_up_fp4.size() == a.expert_gate_fp4.size());
+  REQUIRE(a.expert_down_fp4.size() == a.expert_gate_fp4.size());
+  for (size_t e = 0; e < a.expert_gate_fp4.size(); ++e) {
+    CAPTURE(e);
+    CheckSameNvfp4(a.expert_gate_fp4[e], b.expert_gate_fp4[e], "expert gate");
+    CheckSameNvfp4(a.expert_up_fp4[e], b.expert_up_fp4[e], "expert up");
+    CheckSameNvfp4(a.expert_down_fp4[e], b.expert_down_fp4[e], "expert down");
+  }
+}
+
+void CheckSameMoeModel(const vllm::Qwen3_5MoeWeights& a,
+                       const vllm::Qwen3_5MoeWeights& b) {
+  REQUIRE(a.layers.size() == b.layers.size());
+  REQUIRE(a.layers.size() == 1u);
+  CheckSameBytes(a.embed_tokens, b.embed_tokens, "embed_tokens");
+  CheckSameBytes(a.final_norm, b.final_norm, "final_norm");
+  CheckSameNvfp4(a.lm_head_fp4, b.lm_head_fp4, "lm_head");
+  for (size_t l = 0; l < a.layers.size(); ++l) {
+    CAPTURE(l);
+    const vllm::Qwen3_5MoeLayerWeights& x = a.layers[l];
+    const vllm::Qwen3_5MoeLayerWeights& y = b.layers[l];
+    CHECK_FALSE(x.is_linear_attention);
+    CHECK_FALSE(y.is_linear_attention);
+    CheckSameBytes(x.input_layernorm, y.input_layernorm, "input_layernorm");
+    CheckSameBytes(x.post_attention_layernorm, y.post_attention_layernorm,
+                   "post_attention_layernorm");
+    CheckSameAttn(x.attn, y.attn);
+    CheckSameMoeBlock(x.moe, y.moe);
+  }
+}
+
 }  // namespace
 
 // ===========================================================================
@@ -252,38 +459,26 @@ TEST_CASE("qwen3_8: both text-only architecture strings resolve to the Qwen3.5 f
 }
 
 // ===========================================================================
-// 2. Config resolution on the REAL flat 3.8 shape. `Qwen/Qwen3.8-2.4T-A95B`
-//    declares `model_type: qwen3_5_moe_text` at the TOP level with no
-//    `text_config` wrapper, no `vision_config` and no `mrope_section` — the
-//    composite-wrapper path our 27B/35B checkpoints take does not apply.
-//    Values from .agents/specs/qwen38-text-only.md §"Why this is not a new port".
+// 2. Config resolution on the REAL flat 3.8 config — the PUBLISHED DOCUMENT,
+//    not a hand-written approximation of it.
+//
+//    `tests/vllm/models/fixtures/qwen3_8_2_4t_a95b/config.json` is
+//    https://huggingface.co/Qwen/Qwen3.8-2.4T-A95B/raw/main/config.json,
+//    committed VERBATIM (md5 303dc59227f1d03afc941646e8df3132, fetched
+//    2026-08-12). It declares `model_type: qwen3_5_moe_text` at the TOP level
+//    with no `text_config` wrapper, no `vision_config` and no `mrope_section`,
+//    so the composite-wrapper path our 27B/35B checkpoints take does not apply.
+//
+//    Three things a paraphrase got wrong and this document does not: the rope
+//    knobs live in a NESTED `rope_parameters` block (so the parse actually
+//    reaches hf_config.cpp's rope_parameters branch, LooksLikeNestedRopeParameters
+//    included, rather than the no-block early return); `layer_types` is present
+//    and 92 entries long, which BOTH loaders hard-require to equal
+//    num_hidden_layers; and the dtype key is transformers 4.57.3's `dtype`, not
+//    the legacy `torch_dtype`.
 // ===========================================================================
-TEST_CASE("qwen3_8: the flat 2.4T text config resolves through the shared Qwen3.5 path") {
-  const TempJsonDir dir(R"({
-    "architectures": ["Qwen3_5MoeForCausalLM"],
-    "model_type": "qwen3_5_moe_text",
-    "hidden_size": 8192,
-    "num_hidden_layers": 92,
-    "vocab_size": 248320,
-    "num_attention_heads": 64,
-    "num_key_value_heads": 4,
-    "head_dim": 256,
-    "intermediate_size": 2048,
-    "num_experts": 512,
-    "num_experts_per_tok": 10,
-    "moe_intermediate_size": 2048,
-    "shared_expert_intermediate_size": 2048,
-    "linear_num_key_heads": 16,
-    "linear_num_value_heads": 128,
-    "linear_key_head_dim": 128,
-    "linear_value_head_dim": 128,
-    "linear_conv_kernel_dim": 4,
-    "rope_theta": 10000000.0,
-    "rms_norm_eps": 1e-06,
-    "max_position_embeddings": 262144,
-    "torch_dtype": "bfloat16"
-  })");
-  const HfConfig config = vllm::LoadHfConfig(dir.config_path());
+TEST_CASE("qwen3_8: the PUBLISHED 2.4T text config resolves through the shared Qwen3.5 path") {
+  const HfConfig config = vllm::LoadHfConfig(QWEN3_8_CONFIG_FIXTURE);
 
   // The architecture the registry will be asked for, straight off a flat doc.
   REQUIRE(config.architectures.size() == 1);
@@ -309,9 +504,29 @@ TEST_CASE("qwen3_8: the flat 2.4T text config resolves through the shared Qwen3.
   CHECK(config.linear_conv_kernel_dim == 4);
   CHECK(config.rope_theta == doctest::Approx(1e7).scale(0.0));
 
-  // `qwen3_5_moe_text` is already in IsQwen35Family, so a config with NO
-  // rope_parameters block still gets the family's 0.25 partial-rotary default
-  // (qwen3_next.py:240 / qwen3_5_moe.py:92) => rotary_dim = 0.25 * 256.
+  // `layer_types` is a HARD requirement of both Qwen3.5 loaders
+  // (qwen3_5_weights.cpp:660-663, qwen3_5_dense_weights.cpp) — they refuse a
+  // checkpoint whose list does not equal num_hidden_layers. The published
+  // pattern is [linear, linear, linear, full] x 23, i.e.
+  // full_attention_interval 4, the same interleave as the 35B.
+  REQUIRE(static_cast<int64_t>(config.layer_types.size()) ==
+          config.num_hidden_layers);
+  REQUIRE(config.layer_types.size() == 92u);
+  for (size_t i = 0; i < config.layer_types.size(); ++i) {
+    CAPTURE(i);
+    CHECK(config.layer_types[i] ==
+          ((i % 4 == 3) ? "full_attention" : "linear_attention"));
+  }
+
+  // The rope block is NESTED and flat-valued, so ParseRopeParameters takes the
+  // rope_parameters branch, LooksLikeNestedRopeParameters is false (its values
+  // are scalars, not per-layer-type objects), and the block's own
+  // partial_rotary_factor/rope_theta win. The 0.25 also appears at top level,
+  // and IsQwen35Family would default it to 0.25 in any case — all three agree,
+  // which is why rotary_dim is 0.25 * 256.
+  CHECK(config.has_rope_parameters);
+  CHECK(config.rope_parameters.rope_type == "default");
+  CHECK(config.rope_parameters.rope_theta == doctest::Approx(1e7).scale(0.0));
   CHECK(config.rope_parameters.partial_rotary_factor ==
         doctest::Approx(0.25).scale(0.0));
   CHECK(config.rotary_dim == 64);
@@ -321,6 +536,23 @@ TEST_CASE("qwen3_8: the flat 2.4T text config resolves through the shared Qwen3.
   CHECK(config.raw.find("vision_config") == config.raw.end());
   CHECK(config.raw.find("text_config") == config.raw.end());
   CHECK(config.rope_parameters.mrope_section.empty());
+
+  // DELIBERATELY UNCONSUMED, PINNED SO IT CANNOT DRIFT SILENTLY. transformers
+  // 4.57.3 writes the model dtype as `dtype`; hf_config.cpp:520-522 reads only
+  // the legacy `torch_dtype`, so `cfg.torch_dtype` is EMPTY on this document.
+  // That is inert today — nothing in the tree reads `HfConfig::torch_dtype` —
+  // and consuming `dtype` is a behavior change on EVERY model, so it is
+  // recorded as a tracked deviation (porting-inventory.md §9 deviation 17)
+  // rather than smuggled in on this row. This assertion is the tripwire: it
+  // fails the day someone teaches hf_config the new spelling, forcing the
+  // deviation to be discharged rather than forgotten.
+  CHECK(config.raw.at("dtype") == "bfloat16");
+  CHECK(config.raw.find("torch_dtype") == config.raw.end());
+  CHECK(config.torch_dtype.empty());
+
+  // The published document has no top-level `intermediate_size` — the MoE
+  // widths are `moe_intermediate_size` / `shared_expert_intermediate_size`.
+  CHECK(config.raw.find("intermediate_size") == config.raw.end());
 }
 
 // ===========================================================================
@@ -430,6 +662,91 @@ TEST_CASE("qwen3_8: the dense loader reads the SAME weights through either names
   CheckSameBytes(a.attn.k_norm, b.attn.k_norm, "k_norm");
   CheckSameBytes(a.mlp.gate_up_proj, b.mlp.gate_up_proj, "gate_up_proj");
   CheckSameBytes(a.mlp.down_proj, b.mlp.down_proj, "down_proj");
+}
+
+// ===========================================================================
+// 4b. THE SAME PROOF FOR THE MoE ARM — the architecture this row exists for.
+//     `LoadQwen3_5Moe` threads the resolved prefix through three sites the
+//     dense loader has no analogue of, and the third of them lives in a
+//     closure that runs AFTER the resolving frame has returned. Two synthetic
+//     one-layer MoE checkpoints with byte-identical payloads and only the
+//     namespace differing must load to byte-identical weights on BOTH expert
+//     residency paths:
+//       * shards_owner == nullptr  -> routed experts loaded EAGERLY at load;
+//       * shards_owner != nullptr  -> routed experts DEFERRED behind
+//         `load_layer_experts`, which is then driven explicitly so the closure
+//         body actually executes (an installed-but-never-called closure pins
+//         nothing).
+//     Reverting any of the three sites to the hardcoded `model.language_model.`
+//     literal makes the flat load throw `tensor not found`.
+// ===========================================================================
+TEST_CASE("qwen3_8: the MoE loader reads the SAME weights through either namespace") {
+  const std::vector<Spec> vl = MoeOneLayerSpecs("model.language_model.");
+  const std::vector<Spec> flat = MoeOneLayerSpecs("model.");
+  REQUIRE(vl.size() == flat.size());
+
+  const std::string vl_bytes = BuildSafetensors(vl);
+  const std::string flat_bytes = BuildSafetensors(flat);
+  // Same specs in the same order => IDENTICAL payloads, only the names differ,
+  // so a later byte-equality of the two loads cannot be satisfied by two
+  // identically-WRONG reads of two different payloads.
+  REQUIRE(Payload(vl_bytes) == Payload(flat_bytes));
+  REQUIRE(vl_bytes != flat_bytes);
+  const TempFile vl_file(vl_bytes, "moe_vl");
+  const TempFile flat_file(flat_bytes, "moe_flat");
+  const HfConfig config = OneLayerMoeConfig();
+
+  SUBCASE("EAGER experts (no shards owner)") {
+    std::vector<vllm::SafetensorsFile> vl_shards;
+    vl_shards.push_back(vllm::SafetensorsFile::Open(vl_file.path()));
+    std::vector<vllm::SafetensorsFile> flat_shards;
+    flat_shards.push_back(vllm::SafetensorsFile::Open(flat_file.path()));
+
+    const vllm::Qwen3_5MoeWeights from_vl =
+        vllm::LoadQwen3_5Moe(vl_shards, config);
+    const vllm::Qwen3_5MoeWeights from_flat =
+        vllm::LoadQwen3_5Moe(flat_shards, config);
+
+    // No owner => no streaming closure, and the routed experts are already here.
+    CHECK_FALSE(static_cast<bool>(from_vl.load_layer_experts));
+    CHECK_FALSE(static_cast<bool>(from_flat.load_layer_experts));
+    REQUIRE(from_flat.layers.size() == 1u);
+    REQUIRE(from_flat.layers[0].moe.expert_gate_fp4.size() ==
+            static_cast<size_t>(kMoeExperts));
+    CheckSameMoeModel(from_vl, from_flat);
+  }
+
+  SUBCASE("DEFERRED experts (shards owner) — the closure runs") {
+    auto vl_owner = std::make_shared<std::vector<vllm::SafetensorsFile>>();
+    vl_owner->push_back(vllm::SafetensorsFile::Open(vl_file.path()));
+    auto flat_owner = std::make_shared<std::vector<vllm::SafetensorsFile>>();
+    flat_owner->push_back(vllm::SafetensorsFile::Open(flat_file.path()));
+
+    vllm::Qwen3_5MoeWeights from_vl =
+        vllm::LoadQwen3_5Moe(*vl_owner, config, vl_owner);
+    vllm::Qwen3_5MoeWeights from_flat =
+        vllm::LoadQwen3_5Moe(*flat_owner, config, flat_owner);
+
+    // Deferred precondition: the closure is installed and NOTHING routed is
+    // resident yet, so what the next four lines compare is what it produced.
+    REQUIRE(static_cast<bool>(from_vl.load_layer_experts));
+    REQUIRE(static_cast<bool>(from_flat.load_layer_experts));
+    REQUIRE(from_vl.layers.size() == 1u);
+    REQUIRE(from_flat.layers.size() == 1u);
+    CHECK(from_vl.layers[0].moe.expert_gate_fp4.empty());
+    CHECK(from_flat.layers[0].moe.expert_gate_fp4.empty());
+
+    // Move first, exactly as the real load moves the weights into the
+    // LoadedModel before PrepareMarlinResident drives the closure.
+    vllm::Qwen3_5MoeWeights vl_moved = std::move(from_vl);
+    vllm::Qwen3_5MoeWeights flat_moved = std::move(from_flat);
+    vl_moved.load_layer_experts(0, vl_moved.layers[0].moe);
+    flat_moved.load_layer_experts(0, flat_moved.layers[0].moe);
+
+    REQUIRE(flat_moved.layers[0].moe.expert_gate_fp4.size() ==
+            static_cast<size_t>(kMoeExperts));
+    CheckSameMoeModel(vl_moved, flat_moved);
+  }
 }
 
 // ===========================================================================
