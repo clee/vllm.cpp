@@ -42,7 +42,7 @@ The binding comparison. vLLM runs its **production graphed config**, never
 | Qwen3.6-27B | NVFP4 (`nvidia` @`0893e160`, ModelOpt `modelopt_mixed`) | 0.25.0 | 0/6 | **BEHIND, uniformly 0.94x** on decode, flat c1-c32 (6-point, `gate_pass:false`); greedy continuation IDENTICAL to vLLM. Different model from the `unsloth` row (NVFP4 MLP + FP8 W8A8 tower) |
 | Qwen3.6-35B-A3B | NVFP4 `modelopt_mixed` | 0.25.0 | 2/18 | 3-rep grid 2026-08-05 @`1ea26427`: 0.93-1.03x (c4 wins), c16 0.93x. Both c16 levers A/B'd NEG: drain event -1.9%, mirror 0.999x. ★ probe found a prod async batch-1 greedy DEGENERATION bug the mirror fixes |
 | DeepSeek-V2-Lite | bf16 MLA | 0.25.0 | 4/25 | Attributed miss, row stays `ACTIVE` |
-| Qwen3.5-4B | bf16 direct-load | 0.26.0.dev0 | **1.0283x tput, `PENDING`** | OPEN: TTFT/TPOT/E2E 1.085/1.017/1.029x, VRAM +118.7 MiB ([data](bench-evidence/qwen35-4b-sm120-main-20260807.md)) |
+| Qwen3.5-4B | bf16 direct-load | 0.26.0.dev0 | **1.0283x tput, `PENDING`** | OPEN: TTFT/TPOT/E2E 1.085/1.017/1.029x, VRAM +118.7 MiB ([data](bench-evidence/qwen35-4b-sm120-main-20260807.md)). Next: both-engine TTFT intake/prefill split ([#527](https://github.com/mudler/vllm.cpp/issues/527)) |
 
 ### GDN prefill kernels by GPU
 
