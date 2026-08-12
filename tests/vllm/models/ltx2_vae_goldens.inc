@@ -3791,4 +3791,845 @@ inline constexpr float kLtx2VideoDecNcGolden[] = {
     -0.284617603f, -0.397902191f, -0.13071467f, -0.841662765f, 0.062342234f, 0.121501237f,
 };
 
+// --- section 6a: VideoEncoder, the *_res family (video_vae.py:148-336) ---
+inline constexpr int64_t kLtx2VideoEncInC = 3;
+inline constexpr int64_t kLtx2VideoEncInT = 5;
+inline constexpr int64_t kLtx2VideoEncInH = 8;
+inline constexpr int64_t kLtx2VideoEncInW = 8;
+inline constexpr int64_t kLtx2VideoEncOutC = 4;
+inline constexpr int64_t kLtx2VideoEncOutT = 3;
+inline constexpr int64_t kLtx2VideoEncOutH = 2;
+inline constexpr int64_t kLtx2VideoEncOutW = 2;
+inline constexpr int64_t kLtx2VideoEncTemporalFactor = 2;
+inline constexpr int64_t kLtx2VideoEncSpatialFactor = 4;
+
+inline constexpr const char* kLtx2VideoEncParamNames[] = {
+    "ltx2.videoenc.per_channel_statistics.std-of-means",
+    "ltx2.videoenc.per_channel_statistics.mean-of-means",
+    "ltx2.videoenc.conv_in.conv.weight",
+    "ltx2.videoenc.conv_in.conv.bias",
+    "ltx2.videoenc.down_blocks.0.res_blocks.0.conv1.conv.weight",
+    "ltx2.videoenc.down_blocks.0.res_blocks.0.conv1.conv.bias",
+    "ltx2.videoenc.down_blocks.0.res_blocks.0.conv2.conv.weight",
+    "ltx2.videoenc.down_blocks.0.res_blocks.0.conv2.conv.bias",
+    "ltx2.videoenc.down_blocks.1.conv.conv.weight",
+    "ltx2.videoenc.down_blocks.1.conv.conv.bias",
+    "ltx2.videoenc.down_blocks.2.conv1.conv.weight",
+    "ltx2.videoenc.down_blocks.2.conv1.conv.bias",
+    "ltx2.videoenc.down_blocks.2.conv2.conv.weight",
+    "ltx2.videoenc.down_blocks.2.conv2.conv.bias",
+    "ltx2.videoenc.down_blocks.2.conv_shortcut.weight",
+    "ltx2.videoenc.down_blocks.2.conv_shortcut.bias",
+    "ltx2.videoenc.down_blocks.2.norm3.weight",
+    "ltx2.videoenc.down_blocks.2.norm3.bias",
+    "ltx2.videoenc.down_blocks.3.norm.gamma",
+    "ltx2.videoenc.down_blocks.3.to_qkv.weight",
+    "ltx2.videoenc.down_blocks.3.to_qkv.bias",
+    "ltx2.videoenc.down_blocks.3.proj.weight",
+    "ltx2.videoenc.down_blocks.3.proj.bias",
+    "ltx2.videoenc.down_blocks.4.conv.conv.weight",
+    "ltx2.videoenc.down_blocks.4.conv.conv.bias",
+    "ltx2.videoenc.conv_out.conv.weight",
+    "ltx2.videoenc.conv_out.conv.bias",
+};
+inline constexpr int64_t kLtx2VideoEncParamCounts[] = {
+    4, 4, 1296, 4, 432, 4, 432, 4, 216, 2,
+    3456, 16, 6912, 16, 128, 16, 8, 8, 16, 768,
+    48, 256, 16, 3456, 8, 2160, 5,
+};
+
+inline constexpr float kLtx2VideoEncGolden[] = {
+    0.105971001f, -0.700810492f, 0.398659229f, 0.200228721f, 0.0540282726f, -0.515504777f,
+    0.343788236f, 0.0766926482f, -0.0605714135f, -0.241365179f, 0.11828395f, 0.42367959f,
+    0.317803919f, -0.473070711f, -0.485584319f, -0.360296696f, 0.279691517f, -0.483887911f,
+    -0.435320079f, -0.327897519f, 0.484271467f, -0.381646693f, -0.631743193f, -0.235939562f,
+    0.47586602f, 0.104150631f, 0.638799489f, -0.225516915f, 0.585891366f, 0.0630168989f,
+    0.48395592f, -0.258150041f, 0.779793262f, 0.35244453f, 0.718912661f, -0.261953801f,
+    -0.136490017f, -0.0636894479f, 0.0922358334f, -0.0444480591f, -0.0809553489f, -0.0305593126f,
+    0.0111112557f, -0.185704693f, 0.036068134f, -0.47769174f, 0.0674109012f, 0.411738217f,
+};
+
+// --- section 6a-none: latent_log_var=`none` raises upstream ---
+inline constexpr const char* kLtx2VideoEncNoneRaises = "RuntimeError";
+
+// --- section 6b: VideoEncoder, strided convs + per_channel + reflect ---
+inline constexpr int64_t kLtx2VideoEncBInC = 3;
+inline constexpr int64_t kLtx2VideoEncBInT = 9;
+inline constexpr int64_t kLtx2VideoEncBInH = 16;
+inline constexpr int64_t kLtx2VideoEncBInW = 16;
+inline constexpr int64_t kLtx2VideoEncBOutC = 4;
+inline constexpr int64_t kLtx2VideoEncBOutT = 2;
+inline constexpr int64_t kLtx2VideoEncBOutH = 2;
+inline constexpr int64_t kLtx2VideoEncBOutW = 2;
+inline constexpr int64_t kLtx2VideoEncBTemporalFactor = 8;
+inline constexpr int64_t kLtx2VideoEncBSpatialFactor = 8;
+
+inline constexpr const char* kLtx2VideoEncBParamNames[] = {
+    "ltx2.videoencb.per_channel_statistics.std-of-means",
+    "ltx2.videoencb.per_channel_statistics.mean-of-means",
+    "ltx2.videoencb.conv_in.conv.weight",
+    "ltx2.videoencb.conv_in.conv.bias",
+    "ltx2.videoencb.down_blocks.0.conv.weight",
+    "ltx2.videoencb.down_blocks.0.conv.bias",
+    "ltx2.videoencb.down_blocks.1.conv.weight",
+    "ltx2.videoencb.down_blocks.1.conv.bias",
+    "ltx2.videoencb.down_blocks.2.conv.weight",
+    "ltx2.videoencb.down_blocks.2.conv.bias",
+    "ltx2.videoencb.down_blocks.3.conv.weight",
+    "ltx2.videoencb.down_blocks.3.conv.bias",
+    "ltx2.videoencb.conv_out.conv.weight",
+    "ltx2.videoencb.conv_out.conv.bias",
+};
+inline constexpr int64_t kLtx2VideoEncBParamCounts[] = {
+    4, 4, 324, 4, 432, 4, 432, 4, 432, 4,
+    864, 8, 1728, 8,
+};
+
+inline constexpr float kLtx2VideoEncBGolden[] = {
+    -0.0388578773f, 0.205233708f, 0.399401635f, 0.294156522f, 0.0185675006f, 0.316804916f,
+    0.37762323f, 0.391095251f, 0.36520341f, 0.075237304f, -0.21595262f, -0.153452128f,
+    0.259288728f, -0.0267137364f, -0.237237379f, -0.284870535f, 0.499453843f, 0.586642325f,
+    1.14933825f, 0.555839241f, 0.668445826f, 0.666742623f, 1.26402438f, 0.73645705f,
+    0.326640069f, 0.743207097f, -0.330169022f, 0.455331683f, 0.184415609f, 0.875364065f,
+    -0.308851629f, 0.4899275f,
+};
+
+// --- section 6c: the frame-count crop ---
+inline constexpr int64_t kLtx2VideoEncCropInT = 6;
+inline constexpr int64_t kLtx2VideoEncCropDropped = 1;
+
+// --- section 6d: convolution-only causal reach ---
+inline constexpr int64_t kLtx2VideoEncCausalOutT = 3;
+inline constexpr int64_t kLtx2VideoEncCausalFirstMoved = 2;
+inline constexpr int64_t kLtx2VideoEncCausalLastMoved = 2;
+
+inline constexpr const char* kLtx2VideoEncCausalParamNames[] = {
+    "ltx2.videoenccausal.per_channel_statistics.std-of-means",
+    "ltx2.videoenccausal.per_channel_statistics.mean-of-means",
+    "ltx2.videoenccausal.conv_in.conv.weight",
+    "ltx2.videoenccausal.conv_in.conv.bias",
+    "ltx2.videoenccausal.down_blocks.0.res_blocks.0.conv1.conv.weight",
+    "ltx2.videoenccausal.down_blocks.0.res_blocks.0.conv1.conv.bias",
+    "ltx2.videoenccausal.down_blocks.0.res_blocks.0.conv2.conv.weight",
+    "ltx2.videoenccausal.down_blocks.0.res_blocks.0.conv2.conv.bias",
+    "ltx2.videoenccausal.down_blocks.1.conv.conv.weight",
+    "ltx2.videoenccausal.down_blocks.1.conv.conv.bias",
+    "ltx2.videoenccausal.conv_out.conv.weight",
+    "ltx2.videoenccausal.conv_out.conv.bias",
+};
+inline constexpr int64_t kLtx2VideoEncCausalParamCounts[] = {
+    4, 4, 1296, 4, 432, 4, 432, 4, 216, 2,
+    540, 5,
+};
+
+inline constexpr float kLtx2VideoEncCausalGolden[] = {
+    0.388585865f, 0.412475765f, -0.410767019f, 0.119437166f, 0.243495986f, -0.0674157143f,
+    0.634991348f, 0.0744367242f, 0.81338352f, -0.616049349f, -0.08583498f, -0.00761500187f,
+    0.344359666f, 0.182607532f, -0.365490854f, -0.209434256f, 0.359659851f, 0.386875838f,
+    -0.268847525f, 0.0113966754f, 0.349139035f, -0.18845363f, 0.73814857f, 0.186186627f,
+    0.637698591f, -0.235718578f, -0.122905888f, -0.0286924932f, 0.345776796f, 0.33680281f,
+    -0.324784726f, -0.147931501f, 0.110579774f, 0.26382035f, -0.184239551f, 0.00245962082f,
+    0.281337351f, -0.493095696f, 0.494089216f, -0.0654679015f, 0.155299217f, 0.181592256f,
+    -0.364810824f, 0.0974672064f, -0.132918552f, 0.335532635f, -0.0329911932f, -0.445451915f,
+    0.0377714634f, 0.149615929f, -0.0130539685f, 0.167344227f, -0.0139074121f, -0.375788927f,
+    -0.213169888f, -0.379772156f, 0.537082613f, 0.366054416f, 0.815363467f, 0.347173989f,
+    0.118494563f, -0.274914861f, -0.141476661f, -0.153783828f, -0.189920992f, 0.066306144f,
+    0.236640483f, 0.215138063f, -0.0614042468f, -0.799161375f, -0.244378835f, -0.382329315f,
+    0.59409374f, 0.16831404f, 0.682499766f, 0.298386753f, 0.0116465902f, -0.47730872f,
+    -0.283743888f, -0.0994414985f, 0.163255855f, 0.346899271f, 0.0187051706f, 0.230782807f,
+    0.229406565f, -0.857979774f, -0.141673371f, -0.18015787f, 0.942494512f, 0.676118374f,
+    0.965322375f, 0.595418632f, 0.0947985277f, -0.227328628f, -0.490106106f, -0.171066731f,
+    0.480273783f, 0.102388427f, 0.31676048f, -0.324242622f, -0.303161472f, -0.0154122692f,
+    0.0335840061f, -0.0244060941f, -0.177747265f, 0.0775080398f, -0.459396929f, 0.097922273f,
+    -0.00159269769f, 0.251228988f, 0.103479996f, -0.335489839f, 0.357684433f, 0.068110764f,
+    0.13505733f, -0.303357124f, -0.141957983f, -0.000556529849f, 0.115697019f, 0.0679490641f,
+    -0.183365107f, -0.169840798f, -0.574528754f, 0.053143803f, -0.139811575f, 0.274487168f,
+    0.017468283f, -0.341473252f, 0.374214947f, 0.0772039592f, -0.0518022701f, -0.172725648f,
+    0.00534226187f, 0.115055531f, 0.220665097f, 0.0755976662f, 0.156082064f, -0.0024032658f,
+    -0.197618112f, 0.0633909553f, 0.143182382f, 0.299633414f, 0.017280871f, -0.122067712f,
+    -0.26028344f, 0.348852456f, 0.40907371f, -0.0189061984f, 0.299972326f, 0.818447292f,
+    0.285517037f, 0.2297104f, -0.00494842092f, 0.526073992f, -0.104721576f, -0.41078794f,
+    0.0772248134f, 0.419353127f, 0.073468633f, 0.0592884086f, -0.0470100008f, 0.58925122f,
+    0.396583289f, 0.0667504445f, 0.241813213f, 0.838992774f, 0.384794533f, 0.0666357577f,
+    0.00377432955f, 0.51582557f, -0.105046242f, -0.306907713f, 0.184191808f, 0.430418611f,
+    0.152246013f, 0.0464528315f, 0.0841644704f, 0.0878413394f, 0.202692285f, -0.0686218962f,
+    0.19329837f, 0.85626781f, 0.136077195f, -0.00423162291f, -0.389855295f, -0.0550363325f,
+    -0.220072761f, -0.209537283f, 0.112118676f, 0.710037708f, -0.134408429f, -0.276275754f,
+};
+
+// --- section 7a: AudioEncoder with attention (audio_vae.py:60-246) ---
+inline constexpr int64_t kLtx2AudioEncInC = 2;
+inline constexpr int64_t kLtx2AudioEncInT = 8;
+inline constexpr int64_t kLtx2AudioEncInF = 8;
+inline constexpr int64_t kLtx2AudioEncOutC = 4;
+inline constexpr int64_t kLtx2AudioEncOutT = 2;
+inline constexpr int64_t kLtx2AudioEncOutF = 2;
+
+inline constexpr const char* kLtx2AudioEncParamNames[] = {
+    "ltx2.audioenc.per_channel_statistics.std-of-means",
+    "ltx2.audioenc.per_channel_statistics.mean-of-means",
+    "ltx2.audioenc.conv_in.conv.weight",
+    "ltx2.audioenc.conv_in.conv.bias",
+    "ltx2.audioenc.down.0.block.0.conv1.conv.weight",
+    "ltx2.audioenc.down.0.block.0.conv1.conv.bias",
+    "ltx2.audioenc.down.0.block.0.conv2.conv.weight",
+    "ltx2.audioenc.down.0.block.0.conv2.conv.bias",
+    "ltx2.audioenc.down.0.downsample.conv.weight",
+    "ltx2.audioenc.down.0.downsample.conv.bias",
+    "ltx2.audioenc.down.1.block.0.conv1.conv.weight",
+    "ltx2.audioenc.down.1.block.0.conv1.conv.bias",
+    "ltx2.audioenc.down.1.block.0.conv2.conv.weight",
+    "ltx2.audioenc.down.1.block.0.conv2.conv.bias",
+    "ltx2.audioenc.down.1.block.0.nin_shortcut.conv.weight",
+    "ltx2.audioenc.down.1.block.0.nin_shortcut.conv.bias",
+    "ltx2.audioenc.down.1.downsample.conv.weight",
+    "ltx2.audioenc.down.1.downsample.conv.bias",
+    "ltx2.audioenc.down.2.block.0.conv1.conv.weight",
+    "ltx2.audioenc.down.2.block.0.conv1.conv.bias",
+    "ltx2.audioenc.down.2.block.0.conv2.conv.weight",
+    "ltx2.audioenc.down.2.block.0.conv2.conv.bias",
+    "ltx2.audioenc.down.2.block.0.nin_shortcut.conv.weight",
+    "ltx2.audioenc.down.2.block.0.nin_shortcut.conv.bias",
+    "ltx2.audioenc.down.2.attn.0.q.weight",
+    "ltx2.audioenc.down.2.attn.0.q.bias",
+    "ltx2.audioenc.down.2.attn.0.k.weight",
+    "ltx2.audioenc.down.2.attn.0.k.bias",
+    "ltx2.audioenc.down.2.attn.0.v.weight",
+    "ltx2.audioenc.down.2.attn.0.v.bias",
+    "ltx2.audioenc.down.2.attn.0.proj_out.weight",
+    "ltx2.audioenc.down.2.attn.0.proj_out.bias",
+    "ltx2.audioenc.mid.block_1.conv1.conv.weight",
+    "ltx2.audioenc.mid.block_1.conv1.conv.bias",
+    "ltx2.audioenc.mid.block_1.conv2.conv.weight",
+    "ltx2.audioenc.mid.block_1.conv2.conv.bias",
+    "ltx2.audioenc.mid.attn_1.q.weight",
+    "ltx2.audioenc.mid.attn_1.q.bias",
+    "ltx2.audioenc.mid.attn_1.k.weight",
+    "ltx2.audioenc.mid.attn_1.k.bias",
+    "ltx2.audioenc.mid.attn_1.v.weight",
+    "ltx2.audioenc.mid.attn_1.v.bias",
+    "ltx2.audioenc.mid.attn_1.proj_out.weight",
+    "ltx2.audioenc.mid.attn_1.proj_out.bias",
+    "ltx2.audioenc.mid.block_2.conv1.conv.weight",
+    "ltx2.audioenc.mid.block_2.conv1.conv.bias",
+    "ltx2.audioenc.mid.block_2.conv2.conv.weight",
+    "ltx2.audioenc.mid.block_2.conv2.conv.bias",
+    "ltx2.audioenc.conv_out.conv.weight",
+    "ltx2.audioenc.conv_out.conv.bias",
+};
+inline constexpr int64_t kLtx2AudioEncParamCounts[] = {
+    8, 8, 144, 8, 576, 8, 576, 8, 576, 8,
+    1152, 16, 2304, 16, 128, 16, 2304, 16, 4608, 32,
+    9216, 32, 512, 32, 1024, 32, 1024, 32, 1024, 32,
+    1024, 32, 9216, 32, 9216, 32, 1024, 32, 1024, 32,
+    1024, 32, 1024, 32, 9216, 32, 9216, 32, 2304, 8,
+};
+
+inline constexpr float kLtx2AudioEncGolden[] = {
+    -0.106687427f, 0.281030357f, -0.359464735f, 0.145433813f, -0.166735068f, 0.168153554f,
+    -0.442537487f, -0.00601064786f, 0.120763905f, -0.184674814f, 0.291086674f, -0.745148182f,
+    -0.0353460535f, 0.398609519f, -0.455394745f, 0.515475512f,
+};
+
+// --- section 7b: AudioEncoder, the SHIPPED no-attention config ---
+inline constexpr int64_t kLtx2AudioEncPlainOutC = 4;
+inline constexpr int64_t kLtx2AudioEncPlainOutT = 2;
+inline constexpr int64_t kLtx2AudioEncPlainOutF = 2;
+
+inline constexpr const char* kLtx2AudioEncPlainParamNames[] = {
+    "ltx2.audioencplain.per_channel_statistics.std-of-means",
+    "ltx2.audioencplain.per_channel_statistics.mean-of-means",
+    "ltx2.audioencplain.conv_in.conv.weight",
+    "ltx2.audioencplain.conv_in.conv.bias",
+    "ltx2.audioencplain.down.0.block.0.conv1.conv.weight",
+    "ltx2.audioencplain.down.0.block.0.conv1.conv.bias",
+    "ltx2.audioencplain.down.0.block.0.conv2.conv.weight",
+    "ltx2.audioencplain.down.0.block.0.conv2.conv.bias",
+    "ltx2.audioencplain.down.0.downsample.conv.weight",
+    "ltx2.audioencplain.down.0.downsample.conv.bias",
+    "ltx2.audioencplain.down.1.block.0.conv1.conv.weight",
+    "ltx2.audioencplain.down.1.block.0.conv1.conv.bias",
+    "ltx2.audioencplain.down.1.block.0.conv2.conv.weight",
+    "ltx2.audioencplain.down.1.block.0.conv2.conv.bias",
+    "ltx2.audioencplain.down.1.block.0.nin_shortcut.conv.weight",
+    "ltx2.audioencplain.down.1.block.0.nin_shortcut.conv.bias",
+    "ltx2.audioencplain.down.1.downsample.conv.weight",
+    "ltx2.audioencplain.down.1.downsample.conv.bias",
+    "ltx2.audioencplain.down.2.block.0.conv1.conv.weight",
+    "ltx2.audioencplain.down.2.block.0.conv1.conv.bias",
+    "ltx2.audioencplain.down.2.block.0.conv2.conv.weight",
+    "ltx2.audioencplain.down.2.block.0.conv2.conv.bias",
+    "ltx2.audioencplain.down.2.block.0.nin_shortcut.conv.weight",
+    "ltx2.audioencplain.down.2.block.0.nin_shortcut.conv.bias",
+    "ltx2.audioencplain.mid.block_1.conv1.conv.weight",
+    "ltx2.audioencplain.mid.block_1.conv1.conv.bias",
+    "ltx2.audioencplain.mid.block_1.conv2.conv.weight",
+    "ltx2.audioencplain.mid.block_1.conv2.conv.bias",
+    "ltx2.audioencplain.mid.block_2.conv1.conv.weight",
+    "ltx2.audioencplain.mid.block_2.conv1.conv.bias",
+    "ltx2.audioencplain.mid.block_2.conv2.conv.weight",
+    "ltx2.audioencplain.mid.block_2.conv2.conv.bias",
+    "ltx2.audioencplain.conv_out.conv.weight",
+    "ltx2.audioencplain.conv_out.conv.bias",
+};
+inline constexpr int64_t kLtx2AudioEncPlainParamCounts[] = {
+    8, 8, 144, 8, 576, 8, 576, 8, 576, 8,
+    1152, 16, 2304, 16, 128, 16, 2304, 16, 4608, 32,
+    9216, 32, 512, 32, 9216, 32, 9216, 32, 9216, 32,
+    9216, 32, 2304, 8,
+};
+
+inline constexpr float kLtx2AudioEncPlainGolden[] = {
+    -0.253115714f, 0.505523562f, 0.00469430629f, 0.272326261f, -0.275289774f, -0.104336835f,
+    0.248687536f, 0.311929673f, -0.703851461f, -0.4485071f, -0.788222432f, 0.536556542f,
+    0.249711186f, 0.107625484f, 0.990849614f, 0.142197087f,
+};
+
+// --- section 7c: AudioEncoder, avg-pool downsample, causality NONE ---
+inline constexpr int64_t kLtx2AudioEncPoolOutC = 4;
+inline constexpr int64_t kLtx2AudioEncPoolOutT = 2;
+inline constexpr int64_t kLtx2AudioEncPoolOutF = 2;
+
+inline constexpr const char* kLtx2AudioEncPoolParamNames[] = {
+    "ltx2.audioencpool.per_channel_statistics.std-of-means",
+    "ltx2.audioencpool.per_channel_statistics.mean-of-means",
+    "ltx2.audioencpool.conv_in.conv.weight",
+    "ltx2.audioencpool.conv_in.conv.bias",
+    "ltx2.audioencpool.down.0.block.0.conv1.conv.weight",
+    "ltx2.audioencpool.down.0.block.0.conv1.conv.bias",
+    "ltx2.audioencpool.down.0.block.0.conv2.conv.weight",
+    "ltx2.audioencpool.down.0.block.0.conv2.conv.bias",
+    "ltx2.audioencpool.down.1.block.0.conv1.conv.weight",
+    "ltx2.audioencpool.down.1.block.0.conv1.conv.bias",
+    "ltx2.audioencpool.down.1.block.0.conv2.conv.weight",
+    "ltx2.audioencpool.down.1.block.0.conv2.conv.bias",
+    "ltx2.audioencpool.down.1.block.0.nin_shortcut.conv.weight",
+    "ltx2.audioencpool.down.1.block.0.nin_shortcut.conv.bias",
+    "ltx2.audioencpool.down.2.block.0.conv1.conv.weight",
+    "ltx2.audioencpool.down.2.block.0.conv1.conv.bias",
+    "ltx2.audioencpool.down.2.block.0.conv2.conv.weight",
+    "ltx2.audioencpool.down.2.block.0.conv2.conv.bias",
+    "ltx2.audioencpool.down.2.block.0.nin_shortcut.conv.weight",
+    "ltx2.audioencpool.down.2.block.0.nin_shortcut.conv.bias",
+    "ltx2.audioencpool.down.2.attn.0.q.weight",
+    "ltx2.audioencpool.down.2.attn.0.q.bias",
+    "ltx2.audioencpool.down.2.attn.0.k.weight",
+    "ltx2.audioencpool.down.2.attn.0.k.bias",
+    "ltx2.audioencpool.down.2.attn.0.v.weight",
+    "ltx2.audioencpool.down.2.attn.0.v.bias",
+    "ltx2.audioencpool.down.2.attn.0.proj_out.weight",
+    "ltx2.audioencpool.down.2.attn.0.proj_out.bias",
+    "ltx2.audioencpool.mid.block_1.conv1.conv.weight",
+    "ltx2.audioencpool.mid.block_1.conv1.conv.bias",
+    "ltx2.audioencpool.mid.block_1.conv2.conv.weight",
+    "ltx2.audioencpool.mid.block_1.conv2.conv.bias",
+    "ltx2.audioencpool.mid.attn_1.q.weight",
+    "ltx2.audioencpool.mid.attn_1.q.bias",
+    "ltx2.audioencpool.mid.attn_1.k.weight",
+    "ltx2.audioencpool.mid.attn_1.k.bias",
+    "ltx2.audioencpool.mid.attn_1.v.weight",
+    "ltx2.audioencpool.mid.attn_1.v.bias",
+    "ltx2.audioencpool.mid.attn_1.proj_out.weight",
+    "ltx2.audioencpool.mid.attn_1.proj_out.bias",
+    "ltx2.audioencpool.mid.block_2.conv1.conv.weight",
+    "ltx2.audioencpool.mid.block_2.conv1.conv.bias",
+    "ltx2.audioencpool.mid.block_2.conv2.conv.weight",
+    "ltx2.audioencpool.mid.block_2.conv2.conv.bias",
+    "ltx2.audioencpool.conv_out.conv.weight",
+    "ltx2.audioencpool.conv_out.conv.bias",
+};
+inline constexpr int64_t kLtx2AudioEncPoolParamCounts[] = {
+    8, 8, 144, 8, 576, 8, 576, 8, 1152, 16,
+    2304, 16, 128, 16, 4608, 32, 9216, 32, 512, 32,
+    1024, 32, 1024, 32, 1024, 32, 1024, 32, 9216, 32,
+    9216, 32, 1024, 32, 1024, 32, 1024, 32, 1024, 32,
+    9216, 32, 9216, 32, 2304, 8,
+};
+
+inline constexpr float kLtx2AudioEncPoolGolden[] = {
+    -0.0632195547f, -0.137398124f, -0.583196342f, 0.105248861f, 0.0674940646f, 0.528878272f,
+    0.290589631f, -0.122368082f, -0.129604712f, 0.305493325f, 0.110726915f, 0.484557778f,
+    0.408448756f, 1.19915688f, 0.244993225f, 0.149357542f,
+};
+
+// --- section 8a: the slaney mel filterbank (torchaudio melscale_fbanks) ---
+inline constexpr int64_t kLtx2MelRate = 16000;
+inline constexpr int64_t kLtx2MelFreqs = 33;
+inline constexpr int64_t kLtx2MelBins = 8;
+inline constexpr float kLtx2MelBasisGolden[] = {
+    -0.0f, 0.00222563604f, 0.00151615415f, 0.0f, 0.0f, 0.0f,
+    0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+    0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+    0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+    0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+    0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.00146715029f,
+    0.00227399287f, 5.0215247e-05f, 0.0f, 0.0f, 0.0f, 0.0f,
+    0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+    0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+    0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+    0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+    0.0f, 0.0f, 0.0f, 0.000633269083f, 0.0026198267f, 0.00109652535f,
+    0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+    0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+    0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+    0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+    0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+    0.0f, 0.0f, 0.00117479218f, 0.00172697392f, 0.00087628141f, 2.55888972e-05f,
+    0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+    0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+    0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+    0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+    0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+    0.000190590974f, 0.000792685896f, 0.00139478082f, 0.000999565353f, 0.00057342049f, 0.000147275525f,
+    0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+    0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+    0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+    0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+    0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+    0.000292540382f, 0.000594153302f, 0.000895766192f, 0.000860306784f, 0.000646833912f, 0.000433361012f,
+    0.000219888127f, 6.41523548e-06f, 0.0f, 0.0f, 0.0f, 0.0f,
+    0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+    0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+    0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+    0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+    9.88732936e-05f, 0.000249963166f, 0.000401053054f, 0.00055214297f, 0.000703232887f, 0.000604050001f,
+    0.000497112982f, 0.000390175963f, 0.000283238973f, 0.000176301954f, 6.93649417e-05f, 0.0f,
+    0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+    0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+    0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+    0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+    0.0f, 0.0f, 7.34123387e-05f, 0.0001490992f, 0.000224786068f, 0.000300472922f,
+    0.00037615982f, 0.000451846659f, 0.000482119824f, 0.000428550877f, 0.000374981988f, 0.00032141307f,
+    0.000267844152f, 0.000214275235f, 0.000160706317f, 0.000107137406f, 5.35684958e-05f, 0.0f,
+};
+
+inline constexpr int64_t kLtx2MelOddRate = 8001;
+inline constexpr int64_t kLtx2MelOddFreqs = 17;
+inline constexpr int64_t kLtx2MelOddBins = 6;
+inline constexpr float kLtx2MelOddBasisGolden[] = {
+    -0.0f, 0.00222886191f, 0.00151402561f, 0.0f, 0.0f, 0.0f,
+    0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+    0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+    0.0f, 0.00147149758f, 0.00227083731f, 4.35714355e-05f, 0.0f, 0.0f,
+    0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+    0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+    0.0f, 0.000638433325f, 0.00262907078f, 0.00109051273f, 0.0f, 0.0f,
+    0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+    0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+    0.0f, 0.0f, 0.00118238723f, 0.00172464969f, 0.00087087939f, 1.71091706e-05f,
+    0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+    0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+    0.0f, 0.0f, 0.000194764973f, 0.000799189729f, 0.00140361453f, 0.000996400602f,
+    0.000568499148f, 0.000140597782f, 0.0f, 0.0f, 0.0f, 0.0f,
+    0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+    0.0f, 0.0f, 0.0f, 0.0f, 0.000296861108f, 0.000599792809f,
+    0.000902724511f, 0.000858266838f, 0.000643807231f, 0.000429347565f, 0.000214887928f, 4.28290974e-07f,
+};
+
+// --- section 8b: AudioProcessor.waveform_to_mel (ops.py:44-55) ---
+inline constexpr int64_t kLtx2MelWaveChannels = 2;
+inline constexpr int64_t kLtx2MelWaveSamples = 200;
+inline constexpr int64_t kLtx2MelHop = 16;
+inline constexpr int64_t kLtx2MelNFft = 64;
+inline constexpr int64_t kLtx2MelOutFrames = 13;
+inline constexpr int64_t kLtx2MelOutBins = 8;
+
+inline constexpr float kLtx2MelGolden[] = {
+    -5.7380805f, -4.52926159f, -4.62833452f, -5.03318787f, -5.31457424f, -4.91543579f,
+    -5.35437822f, -5.54438639f, -5.21748638f, -4.56098795f, -5.36539888f, -5.2037611f,
+    -5.195117f, -5.03299475f, -5.72774124f, -5.48484755f, -4.87721634f, -4.82320547f,
+    -5.76288652f, -5.64119005f, -5.44773293f, -5.29594707f, -5.58988667f, -5.61207199f,
+    -5.31075335f, -5.77972412f, -6.04858303f, -6.11076069f, -5.22815323f, -5.35906267f,
+    -5.58971977f, -5.23083019f, -5.77725267f, -6.36613321f, -5.92594004f, -5.53588247f,
+    -5.09507608f, -4.97658062f, -5.02690744f, -5.20704365f, -5.34727812f, -5.63119602f,
+    -5.55041313f, -5.15874481f, -5.15593147f, -5.06128883f, -4.95796537f, -5.40851879f,
+    -5.43191433f, -5.6757369f, -6.04383516f, -5.35738993f, -4.78693151f, -5.00363064f,
+    -5.39214468f, -5.65474081f, -5.36183643f, -5.01627827f, -5.12967443f, -5.51700497f,
+    -5.30291224f, -4.97506905f, -5.38409853f, -5.56516647f, -4.90143061f, -5.15264034f,
+    -4.98715782f, -5.70936489f, -5.37132215f, -4.74343157f, -5.62887144f, -5.50232267f,
+    -5.21058416f, -4.81116819f, -4.62828112f, -5.28502846f, -4.98368645f, -5.07308626f,
+    -5.215662f, -5.54698038f, -5.68805456f, -5.27246666f, -4.44579411f, -4.989748f,
+    -5.30091572f, -5.8096137f, -5.39010525f, -5.57366228f, -5.52282476f, -5.29005146f,
+    -4.57230473f, -5.17770624f, -5.06462955f, -5.71698618f, -5.23407125f, -5.46132088f,
+    -5.11064148f, -4.94577074f, -5.22903347f, -5.27090168f, -5.0099659f, -5.73138189f,
+    -5.43620062f, -5.52422047f, -5.81036568f, -5.50501251f, -5.13619041f, -5.62565088f,
+    -5.09157467f, -5.6744113f, -5.08144379f, -5.59426737f, -4.91010141f, -5.04321671f,
+    -5.72232199f, -5.67005396f, -5.37894583f, -5.32801819f, -5.11195993f, -5.58225536f,
+    -5.2892971f, -4.99231291f, -5.45073557f, -5.3080864f, -5.30910015f, -5.20221758f,
+    -5.22488689f, -5.29467678f, -5.3044281f, -5.22858953f, -5.05017328f, -5.25846767f,
+    -5.06435013f, -5.85884428f, -5.18013334f, -5.27582502f, -5.21089697f, -5.30022001f,
+    -5.17723656f, -5.84374237f, -5.23161221f, -5.82169867f, -5.19455242f, -5.34573078f,
+    -5.85503435f, -5.54043627f, -5.21470594f, -5.8631711f, -4.94018841f, -5.3500638f,
+    -5.3406229f, -5.66642475f, -5.22050619f, -5.31860828f, -5.29191828f, -5.20989656f,
+    -5.45686483f, -5.53626013f, -5.27692556f, -5.26270294f, -5.01956797f, -5.24597073f,
+    -5.57272911f, -5.47861481f, -5.58870554f, -5.08819962f, -5.23200893f, -5.26943254f,
+    -5.51262617f, -5.28721476f, -4.96062708f, -5.59634304f, -5.37225676f, -5.21091509f,
+    -5.05701876f, -5.22913122f, -4.83422709f, -4.68939924f, -5.08459091f, -5.60706615f,
+    -5.0759244f, -5.45930052f, -5.18181515f, -5.10271168f, -4.86976719f, -5.05948973f,
+    -5.77884865f, -5.39808035f, -5.143116f, -5.28565359f, -5.66441107f, -5.04439783f,
+    -5.64928961f, -5.35596037f, -5.39128923f, -5.25846195f, -5.0412612f, -5.23938227f,
+    -5.44201565f, -5.32879686f, -5.13055515f, -5.88467455f, -5.79571772f, -6.30031538f,
+    -5.48332548f, -5.42740488f, -4.93420219f, -5.37582016f,
+};
+
+// --- section 8c: silence, which SATURATES the 1e-5 log clamp ---
+inline constexpr int64_t kLtx2MelQuietFrames = 13;
+
+inline constexpr float kLtx2MelQuietGolden[] = {
+    -11.5129251f, -11.5129251f, -11.5129251f, -11.5129251f, -11.5129251f, -11.5129251f,
+    -11.5129251f, -11.5129251f, -11.5129251f, -11.5129251f, -11.5129251f, -11.5129251f,
+    -11.5129251f, -11.5129251f, -11.5129251f, -11.5129251f, -11.5129251f, -11.5129251f,
+    -11.5129251f, -11.5129251f, -11.5129251f, -11.5129251f, -11.5129251f, -11.5129251f,
+    -11.5129251f, -11.5129251f, -11.5129251f, -11.5129251f, -11.5129251f, -11.5129251f,
+    -11.5129251f, -11.5129251f, -11.5129251f, -11.5129251f, -11.5129251f, -11.5129251f,
+    -11.5129251f, -11.5129251f, -11.5129251f, -11.5129251f, -11.5129251f, -11.5129251f,
+    -11.5129251f, -11.5129251f, -11.5129251f, -11.5129251f, -11.5129251f, -11.5129251f,
+    -11.5129251f, -11.5129251f, -11.5129251f, -11.5129251f, -11.5129251f, -11.5129251f,
+    -11.5129251f, -11.5129251f, -11.5129251f, -11.5129251f, -11.5129251f, -11.5129251f,
+    -11.5129251f, -11.5129251f, -11.5129251f, -11.5129251f, -11.5129251f, -11.5129251f,
+    -11.5129251f, -11.5129251f, -11.5129251f, -11.5129251f, -11.5129251f, -11.5129251f,
+    -11.5129251f, -11.5129251f, -11.5129251f, -11.5129251f, -11.5129251f, -11.5129251f,
+    -11.5129251f, -11.5129251f, -11.5129251f, -11.5129251f, -11.5129251f, -11.5129251f,
+    -11.5129251f, -11.5129251f, -11.5129251f, -11.5129251f, -11.5129251f, -11.5129251f,
+    -11.5129251f, -11.5129251f, -11.5129251f, -11.5129251f, -11.5129251f, -11.5129251f,
+    -11.5129251f, -11.5129251f, -11.5129251f, -11.5129251f, -11.5129251f, -11.5129251f,
+    -11.5129251f, -11.5129251f, -11.5129251f, -11.5129251f, -11.5129251f, -11.5129251f,
+    -11.5129251f, -11.5129251f, -11.5129251f, -11.5129251f, -11.5129251f, -11.5129251f,
+    -11.5129251f, -11.5129251f, -11.5129251f, -11.5129251f, -11.5129251f, -11.5129251f,
+    -11.5129251f, -11.5129251f, -11.5129251f, -11.5129251f, -11.5129251f, -11.5129251f,
+    -11.5129251f, -11.5129251f, -11.5129251f, -11.5129251f, -11.5129251f, -11.5129251f,
+    -11.5129251f, -11.5129251f, -11.5129251f, -11.5129251f, -11.5129251f, -11.5129251f,
+    -11.5129251f, -11.5129251f, -11.5129251f, -11.5129251f, -11.5129251f, -11.5129251f,
+    -11.5129251f, -11.5129251f, -11.5129251f, -11.5129251f, -11.5129251f, -11.5129251f,
+    -11.5129251f, -11.5129251f, -11.5129251f, -11.5129251f, -11.5129251f, -11.5129251f,
+    -11.5129251f, -11.5129251f, -11.5129251f, -11.5129251f, -11.5129251f, -11.5129251f,
+    -11.5129251f, -11.5129251f, -11.5129251f, -11.5129251f, -11.5129251f, -11.5129251f,
+    -11.5129251f, -11.5129251f, -11.5129251f, -11.5129251f, -11.5129251f, -11.5129251f,
+    -11.5129251f, -11.5129251f, -11.5129251f, -11.5129251f, -11.5129251f, -11.5129251f,
+    -11.5129251f, -11.5129251f, -11.5129251f, -11.5129251f, -11.5129251f, -11.5129251f,
+    -11.5129251f, -11.5129251f, -11.5129251f, -11.5129251f, -11.5129251f, -11.5129251f,
+    -11.5129251f, -11.5129251f, -11.5129251f, -11.5129251f, -11.5129251f, -11.5129251f,
+    -11.5129251f, -11.5129251f, -11.5129251f, -11.5129251f, -11.5129251f, -11.5129251f,
+    -11.5129251f, -11.5129251f, -11.5129251f, -11.5129251f,
+};
+
+// --- section 9a: the INITIAL video state (tools.py:139-186) ---
+inline constexpr int64_t kLtx2CondVideoBaseTokens = 12;
+inline constexpr int64_t kLtx2CondVideoBaseWidth = 4;
+inline constexpr int64_t kLtx2CondVideoBasePosDims = 3;
+inline constexpr int64_t kLtx2CondVideoBaseTokensBefore = 12;
+
+inline constexpr float kLtx2CondVideoBaseClean[] = {
+    0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+    0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+    0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+    0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+    0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+    0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+    0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+    0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+};
+
+inline constexpr float kLtx2CondVideoBaseLatent[] = {
+    0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+    0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+    0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+    0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+    0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+    0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+    0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+    0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+};
+
+inline constexpr float kLtx2CondVideoBaseMask[] = {
+    1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f,
+    1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f,
+};
+
+inline constexpr float kLtx2CondVideoBasePositions[] = {
+    0.0f, 0.125f, 0.0f, 0.125f, 0.0f, 0.125f,
+    0.0f, 0.125f, 0.125f, 1.125f, 0.125f, 1.125f,
+    0.125f, 1.125f, 0.125f, 1.125f, 1.125f, 2.125f,
+    1.125f, 2.125f, 1.125f, 2.125f, 1.125f, 2.125f,
+    0.0f, 32.0f, 0.0f, 32.0f, 32.0f, 64.0f,
+    32.0f, 64.0f, 0.0f, 32.0f, 0.0f, 32.0f,
+    32.0f, 64.0f, 32.0f, 64.0f, 0.0f, 32.0f,
+    0.0f, 32.0f, 32.0f, 64.0f, 32.0f, 64.0f,
+    0.0f, 32.0f, 32.0f, 64.0f, 0.0f, 32.0f,
+    32.0f, 64.0f, 0.0f, 32.0f, 32.0f, 64.0f,
+    0.0f, 32.0f, 32.0f, 64.0f, 0.0f, 32.0f,
+    32.0f, 64.0f, 0.0f, 32.0f, 32.0f, 64.0f,
+};
+
+inline constexpr float kLtx2CondVideoBaseKeyframesMask[] = {
+    1.0f, 1.0f, 1.0f, 1.0f, 0.0f, 0.0f,
+    0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+};
+
+// --- section 9b: VideoConditionByLatentIndex (latent_cond.py:9-43) ---
+inline constexpr int64_t kLtx2CondIndexLatentIdx = 1;
+inline constexpr int64_t kLtx2CondIndexTokens = 12;
+inline constexpr int64_t kLtx2CondIndexWidth = 4;
+inline constexpr int64_t kLtx2CondIndexPosDims = 3;
+inline constexpr int64_t kLtx2CondIndexTokensBefore = 12;
+
+inline constexpr float kLtx2CondIndexClean[] = {
+    0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+    0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+    0.0f, 0.0f, 0.0f, 0.0f, -0.59777981f, 0.274754137f,
+    -0.888238668f, 0.0687821954f, 0.625318587f, -0.853003263f, 0.485605836f, -0.622332215f,
+    0.418527573f, -0.206398517f, 0.532972634f, -0.014356087f, 0.61927551f, 0.329649627f,
+    0.136871114f, -0.156331152f, 0.0f, 0.0f, 0.0f, 0.0f,
+    0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+    0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+};
+
+inline constexpr float kLtx2CondIndexLatent[] = {
+    0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+    0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+    0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+    0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+    0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+    0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+    0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+    0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+};
+
+inline constexpr float kLtx2CondIndexMask[] = {
+    1.0f, 1.0f, 1.0f, 1.0f, 0.300000012f, 0.300000012f,
+    0.300000012f, 0.300000012f, 1.0f, 1.0f, 1.0f, 1.0f,
+};
+
+inline constexpr float kLtx2CondIndexPositions[] = {
+    0.0f, 0.125f, 0.0f, 0.125f, 0.0f, 0.125f,
+    0.0f, 0.125f, 0.125f, 1.125f, 0.125f, 1.125f,
+    0.125f, 1.125f, 0.125f, 1.125f, 1.125f, 2.125f,
+    1.125f, 2.125f, 1.125f, 2.125f, 1.125f, 2.125f,
+    0.0f, 32.0f, 0.0f, 32.0f, 32.0f, 64.0f,
+    32.0f, 64.0f, 0.0f, 32.0f, 0.0f, 32.0f,
+    32.0f, 64.0f, 32.0f, 64.0f, 0.0f, 32.0f,
+    0.0f, 32.0f, 32.0f, 64.0f, 32.0f, 64.0f,
+    0.0f, 32.0f, 32.0f, 64.0f, 0.0f, 32.0f,
+    32.0f, 64.0f, 0.0f, 32.0f, 32.0f, 64.0f,
+    0.0f, 32.0f, 32.0f, 64.0f, 0.0f, 32.0f,
+    32.0f, 64.0f, 0.0f, 32.0f, 32.0f, 64.0f,
+};
+
+// --- section 9c: VideoConditionByKeyframeIndex (keyframe_cond.py:36-90) ---
+inline constexpr int64_t kLtx2CondKeyframeFrameIdx = 5;
+inline constexpr int64_t kLtx2CondKeyframeTokens = 16;
+inline constexpr int64_t kLtx2CondKeyframeWidth = 4;
+inline constexpr int64_t kLtx2CondKeyframePosDims = 3;
+inline constexpr int64_t kLtx2CondKeyframeTokensBefore = 12;
+
+inline constexpr float kLtx2CondKeyframeClean[] = {
+    0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+    0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+    0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+    0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+    0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+    0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+    0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+    0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+    0.587871909f, -0.621193826f, 0.851575077f, -0.365423083f, -0.699276865f, -0.241857901f,
+    -0.0551209301f, -0.220622644f, -0.785050929f, -0.474982381f, -0.936228514f, 0.951274931f,
+    -0.0518908687f, -0.770928562f, 0.72826314f, 0.248028144f,
+};
+
+inline constexpr float kLtx2CondKeyframeLatent[] = {
+    0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+    0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+    0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+    0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+    0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+    0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+    0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+    0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+    0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+    0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+    0.0f, 0.0f, 0.0f, 0.0f,
+};
+
+inline constexpr float kLtx2CondKeyframeMask[] = {
+    1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f,
+    1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f,
+    0.400000006f, 0.400000006f, 0.400000006f, 0.400000006f,
+};
+
+inline constexpr float kLtx2CondKeyframePositions[] = {
+    0.0f, 0.125f, 0.0f, 0.125f, 0.0f, 0.125f,
+    0.0f, 0.125f, 0.125f, 1.125f, 0.125f, 1.125f,
+    0.125f, 1.125f, 0.125f, 1.125f, 1.125f, 2.125f,
+    1.125f, 2.125f, 1.125f, 2.125f, 1.125f, 2.125f,
+    0.625f, 0.75f, 0.625f, 0.75f, 0.625f, 0.75f,
+    0.625f, 0.75f, 0.0f, 32.0f, 0.0f, 32.0f,
+    32.0f, 64.0f, 32.0f, 64.0f, 0.0f, 32.0f,
+    0.0f, 32.0f, 32.0f, 64.0f, 32.0f, 64.0f,
+    0.0f, 32.0f, 0.0f, 32.0f, 32.0f, 64.0f,
+    32.0f, 64.0f, 0.0f, 32.0f, 0.0f, 32.0f,
+    32.0f, 64.0f, 32.0f, 64.0f, 0.0f, 32.0f,
+    32.0f, 64.0f, 0.0f, 32.0f, 32.0f, 64.0f,
+    0.0f, 32.0f, 32.0f, 64.0f, 0.0f, 32.0f,
+    32.0f, 64.0f, 0.0f, 32.0f, 32.0f, 64.0f,
+    0.0f, 32.0f, 32.0f, 64.0f, 0.0f, 32.0f,
+    32.0f, 64.0f, 0.0f, 32.0f, 32.0f, 64.0f,
+};
+
+// --- section 9d: VideoConditionByReferenceLatent (reference_video_cond.py) ---
+inline constexpr int64_t kLtx2CondRefDownscale = 2;
+inline constexpr int64_t kLtx2CondRefTemporalScale = 2;
+inline constexpr int64_t kLtx2CondRefTokens = 20;
+inline constexpr int64_t kLtx2CondRefWidth = 4;
+inline constexpr int64_t kLtx2CondRefPosDims = 3;
+inline constexpr int64_t kLtx2CondRefTokensBefore = 12;
+
+inline constexpr float kLtx2CondRefClean[] = {
+    0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+    0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+    0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+    0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+    0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+    0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+    0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+    0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+    0.878708184f, -0.287134022f, -0.245662272f, -0.0702121779f, -0.170051619f, 0.00297549367f,
+    -0.594314098f, -0.697941959f, 0.119104765f, -0.874067068f, 0.531385481f, -0.603763223f,
+    -0.844884694f, 0.648026824f, 0.134054303f, -0.335918188f, -0.897487104f, 0.668988645f,
+    0.203272745f, -0.327772021f, -0.360841602f, -0.25403592f, -0.241726562f, 0.240199f,
+    0.347349137f, -0.632631779f, 0.260963321f, -0.829037428f, 0.62900722f, -0.0269816294f,
+    -0.15226683f, 0.121326715f,
+};
+
+inline constexpr float kLtx2CondRefLatent[] = {
+    0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+    0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+    0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+    0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+    0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+    0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+    0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+    0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+    0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+    0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+    0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+    0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+    0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+    0.0f, 0.0f,
+};
+
+inline constexpr float kLtx2CondRefMask[] = {
+    1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f,
+    1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f,
+    0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+    0.0f, 0.0f,
+};
+
+inline constexpr float kLtx2CondRefPositions[] = {
+    0.0f, 0.125f, 0.0f, 0.125f, 0.0f, 0.125f,
+    0.0f, 0.125f, 0.125f, 1.125f, 0.125f, 1.125f,
+    0.125f, 1.125f, 0.125f, 1.125f, 1.125f, 2.125f,
+    1.125f, 2.125f, 1.125f, 2.125f, 1.125f, 2.125f,
+    0.0f, 0.125f, 0.0f, 0.125f, 0.0f, 0.125f,
+    0.0f, 0.125f, 0.125f, 2.125f, 0.125f, 2.125f,
+    0.125f, 2.125f, 0.125f, 2.125f, 0.0f, 32.0f,
+    0.0f, 32.0f, 32.0f, 64.0f, 32.0f, 64.0f,
+    0.0f, 32.0f, 0.0f, 32.0f, 32.0f, 64.0f,
+    32.0f, 64.0f, 0.0f, 32.0f, 0.0f, 32.0f,
+    32.0f, 64.0f, 32.0f, 64.0f, 0.0f, 64.0f,
+    0.0f, 64.0f, 64.0f, 128.0f, 64.0f, 128.0f,
+    0.0f, 64.0f, 0.0f, 64.0f, 64.0f, 128.0f,
+    64.0f, 128.0f, 0.0f, 32.0f, 32.0f, 64.0f,
+    0.0f, 32.0f, 32.0f, 64.0f, 0.0f, 32.0f,
+    32.0f, 64.0f, 0.0f, 32.0f, 32.0f, 64.0f,
+    0.0f, 32.0f, 32.0f, 64.0f, 0.0f, 32.0f,
+    32.0f, 64.0f, 0.0f, 64.0f, 64.0f, 128.0f,
+    0.0f, 64.0f, 64.0f, 128.0f, 0.0f, 64.0f,
+    64.0f, 128.0f, 0.0f, 64.0f, 64.0f, 128.0f,
+};
+
+// --- section 9d': the unscaled reference branch ---
+inline constexpr float kLtx2CondRefPlainPositions[] = {
+    0.0f, 0.125f, 0.0f, 0.125f, 0.0f, 0.125f,
+    0.0f, 0.125f, 0.125f, 1.125f, 0.125f, 1.125f,
+    0.125f, 1.125f, 0.125f, 1.125f, 1.125f, 2.125f,
+    1.125f, 2.125f, 1.125f, 2.125f, 1.125f, 2.125f,
+    0.0f, 0.125f, 0.0f, 0.125f, 0.0f, 0.125f,
+    0.0f, 0.125f, 0.125f, 1.125f, 0.125f, 1.125f,
+    0.125f, 1.125f, 0.125f, 1.125f, 0.0f, 32.0f,
+    0.0f, 32.0f, 32.0f, 64.0f, 32.0f, 64.0f,
+    0.0f, 32.0f, 0.0f, 32.0f, 32.0f, 64.0f,
+    32.0f, 64.0f, 0.0f, 32.0f, 0.0f, 32.0f,
+    32.0f, 64.0f, 32.0f, 64.0f, 0.0f, 32.0f,
+    0.0f, 32.0f, 32.0f, 64.0f, 32.0f, 64.0f,
+    0.0f, 32.0f, 0.0f, 32.0f, 32.0f, 64.0f,
+    32.0f, 64.0f, 0.0f, 32.0f, 32.0f, 64.0f,
+    0.0f, 32.0f, 32.0f, 64.0f, 0.0f, 32.0f,
+    32.0f, 64.0f, 0.0f, 32.0f, 32.0f, 64.0f,
+    0.0f, 32.0f, 32.0f, 64.0f, 0.0f, 32.0f,
+    32.0f, 64.0f, 0.0f, 32.0f, 32.0f, 64.0f,
+    0.0f, 32.0f, 32.0f, 64.0f, 0.0f, 32.0f,
+    32.0f, 64.0f, 0.0f, 32.0f, 32.0f, 64.0f,
+};
+
+// --- section 9e: the INITIAL audio state (tools.py:246-279) ---
+inline constexpr int64_t kLtx2CondAudioBaseTokens = 4;
+inline constexpr int64_t kLtx2CondAudioBaseWidth = 4;
+inline constexpr int64_t kLtx2CondAudioBasePosDims = 1;
+inline constexpr int64_t kLtx2CondAudioBaseTokensBefore = 4;
+
+inline constexpr float kLtx2CondAudioBaseClean[] = {
+    0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+    0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+    0.0f, 0.0f, 0.0f, 0.0f,
+};
+
+inline constexpr float kLtx2CondAudioBaseLatent[] = {
+    0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+    0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+    0.0f, 0.0f, 0.0f, 0.0f,
+};
+
+inline constexpr float kLtx2CondAudioBaseMask[] = {
+    1.0f, 1.0f, 1.0f, 1.0f,
+};
+
+inline constexpr float kLtx2CondAudioBasePositions[] = {
+    0.0f, 0.00999999978f, 0.00999999978f, 0.0500000007f, 0.0500000007f, 0.0900000036f,
+    0.0900000036f, 0.129999995f,
+};
+
+// --- section 9f: AudioConditionByReferenceLatent (reference_audio_cond.py) ---
+inline constexpr int64_t kLtx2CondRefAudioFrames = 3;
+inline constexpr int64_t kLtx2CondRefAudioTokens = 7;
+inline constexpr int64_t kLtx2CondRefAudioWidth = 4;
+inline constexpr int64_t kLtx2CondRefAudioPosDims = 1;
+inline constexpr int64_t kLtx2CondRefAudioTokensBefore = 4;
+
+inline constexpr float kLtx2CondRefAudioClean[] = {
+    0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+    0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+    0.0f, 0.0f, 0.0f, 0.0f, 0.297785044f, 0.843928993f,
+    0.944527209f, -0.0926633701f, -0.798593998f, 0.643038213f, 0.87078172f, -0.652220488f,
+    -0.70609206f, -0.670318902f, -0.487703741f, 0.353271097f,
+};
+
+inline constexpr float kLtx2CondRefAudioLatent[] = {
+    0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+    0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+    0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+    0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+    0.0f, 0.0f, 0.0f, 0.0f,
+};
+
+inline constexpr float kLtx2CondRefAudioMask[] = {
+    1.0f, 1.0f, 1.0f, 1.0f, 0.0f, 0.0f,
+    0.0f,
+};
+
+inline constexpr float kLtx2CondRefAudioPositions[] = {
+    0.0f, 0.00999999978f, 0.00999999978f, 0.0500000007f, 0.0500000007f, 0.0900000036f,
+    0.0900000036f, 0.129999995f, 0.0f, 0.00999999978f, 0.00999999978f, 0.0500000007f,
+    0.0500000007f, 0.0900000036f,
+};
+
 }  // namespace vllm_test

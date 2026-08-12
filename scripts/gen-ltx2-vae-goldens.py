@@ -15,6 +15,10 @@ Upstream sources (Lightricks/LTX-2, packages/ltx-core/src/ltx_core/):
   model/audio_vae/audio_vae.py          -> section 1 (audio decoder)
   model/audio_vae/vocoder.py            -> sections 2-4 (vocoder, legacy arm, BWE)
   model/video_vae/conv_video_decoder.py -> section 5 (Conv video decoder)
+  model/video_vae/video_vae.py          -> section 6 (VideoEncoder)
+  model/audio_vae/audio_vae.py          -> section 7 (AudioEncoder)
+  model/audio_vae/ops.py                -> section 8 (AudioProcessor mel front-end)
+  conditioning/types/*.py               -> section 9 (the conditioning items)
 
 Usage:
     python3 scripts/gen-ltx2-vae-goldens.py \\
@@ -720,6 +724,511 @@ def section_conv_video_decoder(out) -> None:
     emit_f32(out, "kLtx2VideoDecNcGolden", y_nc.numpy())
 
 
+# ---------------------------------------------------------------------------
+# Sections 6-8 — the ENCODER halves (phase L11), which L4 recorded as owed.
+# ---------------------------------------------------------------------------
+
+# Section 6a — VideoEncoder, the `*_res` family. Covers SpaceToDepthDownsample on
+# BOTH a spatial-only and a temporal stride, `res_x` (UNetMidBlock3D),
+# `res_x_y` (channel growth, so norm3 + conv_shortcut are live) and `attn`.
+# patch_size=2 keeps the patchify channel order load-bearing.
+VIDEO_ENC_A_BLOCKS = [
+    ("res_x", {"num_layers": 1}),
+    ("compress_space_res", {"multiplier": 2}),
+    ("res_x_y", {"num_layers": 1, "multiplier": 2}),
+    ("attn", {"num_layers": 1}),
+    ("compress_time_res", {"multiplier": 1}),
+]
+VIDEO_ENC_A = dict(
+    convolution_dimensions=3,
+    in_channels=3,
+    out_channels=4,
+    patch_size=2,
+)
+# 5 frames satisfies 1 + 2k for this block list's single temporal step.
+VIDEO_ENC_A_INPUT = (1, 3, 5, 8, 8)
+
+# Section 6b — VideoEncoder, the PLAIN STRIDED CONVOLUTIONS (`compress_all`,
+# `compress_space`, `compress_time`, `compress_all_x_y`), the `per_channel`
+# log-variance mode, and `reflect` spatial padding — which is NOT the encoder's
+# default and is what a flat LTX-2 checkpoint's `spatial_padding_mode` key
+# actually selects for both halves.
+VIDEO_ENC_B_BLOCKS = [
+    ("compress_all", {}),
+    ("compress_space", {}),
+    ("compress_time", {}),
+    ("compress_all_x_y", {"multiplier": 2}),
+]
+VIDEO_ENC_B = dict(
+    convolution_dimensions=3,
+    in_channels=3,
+    out_channels=4,
+    patch_size=1,
+)
+# 3 temporal steps -> 1 + 8k.
+VIDEO_ENC_B_INPUT = (1, 3, 9, 16, 16)
+
+# Section 6d — the convolution-only causality probe. No `res_x_y`, so no
+# GroupNorm-with-one-group whose statistics span time, and no `attn`; PixelNorm is
+# per-location. What is left is decided by the causal padding alone.
+VIDEO_ENC_CAUSAL_BLOCKS = [
+    ("res_x", {"num_layers": 1}),
+    ("compress_time_res", {"multiplier": 1}),
+]
+
+# Section 7 — AudioEncoder. attn_resolutions={8} puts attention on the DEEPEST
+# level (curr_res = 32 -> 16 -> 8), so both the per-level list and the mid block
+# are exercised. z_channels * (mel_bins // 4) must equal `ch`, because the
+# patchifier flattens (c, f) into the axis the per-channel statistics index.
+AUDIO_ENC = dict(
+    ch=8,
+    ch_mult=(1, 2, 4),
+    num_res_blocks=1,
+    attn_resolutions={8},
+    resolution=32,
+    z_channels=4,
+    double_z=True,
+    in_channels=2,
+    dropout=0.0,
+    resamp_with_conv=True,
+    mid_block_add_attention=True,
+    sample_rate=16000,
+    mel_hop_length=160,
+    n_fft=1024,
+    is_causal=True,
+    mel_bins=8,
+)
+AUDIO_ENC_FRAMES = 8
+AUDIO_ENC_MEL = 8
+
+# Section 8 — the mel front-end. n_fft is small so the direct DFT the C++ side
+# uses stays cheap, but every parameter that decides a value is preserved.
+MEL = dict(target_sample_rate=16000, mel_bins=8, mel_hop_length=16, n_fft=64)
+MEL_SAMPLES = 200
+
+
+def section_video_encoder(out) -> None:
+    import torch
+
+    from ltx_core.model.video_vae.enums import LogVarianceType, NormLayerType, PaddingModeType
+    from ltx_core.model.video_vae.video_vae import VideoEncoder
+
+    # --- 6a: the *_res family, `uniform` log variance, `zeros` padding ---
+    enc = VideoEncoder(
+        encoder_blocks=VIDEO_ENC_A_BLOCKS,
+        norm_layer=NormLayerType.PIXEL_NORM,
+        latent_log_var=LogVarianceType.UNIFORM,
+        encoder_spatial_padding_mode=PaddingModeType.ZEROS,
+        **VIDEO_ENC_A,
+    ).eval()
+    manifest = fill_from_stream(enc, prefix="ltx2.videoenc.")
+    frames = make_input("ltx2.videoenc.input", VIDEO_ENC_A_INPUT, 1.0)
+    y = enc(frames)
+
+    out.write("// --- section 6a: VideoEncoder, the *_res family (video_vae.py:148-336) ---\n")
+    emit_scalar(out, "kLtx2VideoEncInC", VIDEO_ENC_A_INPUT[1])
+    emit_scalar(out, "kLtx2VideoEncInT", VIDEO_ENC_A_INPUT[2])
+    emit_scalar(out, "kLtx2VideoEncInH", VIDEO_ENC_A_INPUT[3])
+    emit_scalar(out, "kLtx2VideoEncInW", VIDEO_ENC_A_INPUT[4])
+    emit_scalar(out, "kLtx2VideoEncOutC", y.shape[1])
+    emit_scalar(out, "kLtx2VideoEncOutT", y.shape[2])
+    emit_scalar(out, "kLtx2VideoEncOutH", y.shape[3])
+    emit_scalar(out, "kLtx2VideoEncOutW", y.shape[4])
+    emit_scalar(out, "kLtx2VideoEncTemporalFactor", enc.video_scale_factors.time)
+    emit_scalar(out, "kLtx2VideoEncSpatialFactor", enc.video_scale_factors.height)
+    out.write("\n")
+    emit_manifest(out, "kLtx2VideoEncParam", manifest)
+    emit_f32(out, "kLtx2VideoEncGolden", y.numpy())
+
+    # --- 6a-constant: `constant` produces the IDENTICAL means, and that is a
+    # FINDING, not an omission. Both modes size conv_out at out_channels + 1 and
+    # both keep `sample[:, :-1]` as the means (video_vae.py:315 vs :327), so with
+    # the same deterministic weights the returned latent is bit-identical. A
+    # separate golden would therefore gate nothing; the EQUALITY is what carries
+    # information, so it is asserted here and re-asserted in C++.
+    enc_const = VideoEncoder(
+        encoder_blocks=VIDEO_ENC_A_BLOCKS,
+        norm_layer=NormLayerType.PIXEL_NORM,
+        latent_log_var=LogVarianceType.CONSTANT,
+        encoder_spatial_padding_mode=PaddingModeType.ZEROS,
+        **VIDEO_ENC_A,
+    ).eval()
+    const_manifest = fill_from_stream(enc_const, prefix="ltx2.videoenc.")
+    assert const_manifest == manifest, (
+        "the `constant` arm must build the SAME parameter set as `uniform`, or the equality "
+        "below compares two different models"
+    )
+    y_const = enc_const(frames)
+    assert torch.equal(y, y_const), (
+        "uniform and constant must produce identical MEANS; if upstream ever changes that, this "
+        "assertion is the thing that notices"
+    )
+
+    # --- 6a-none: upstream RAISES, and the port refuses by name instead of
+    # inventing semantics. Measured rather than assumed.
+    raised = ""
+    try:
+        VideoEncoder(
+            encoder_blocks=VIDEO_ENC_A_BLOCKS,
+            norm_layer=NormLayerType.PIXEL_NORM,
+            latent_log_var=LogVarianceType.NONE,
+            encoder_spatial_padding_mode=PaddingModeType.ZEROS,
+            **VIDEO_ENC_A,
+        ).eval()(frames)
+    except Exception as exc:  # noqa: BLE001 - the exception IS the observation
+        raised = type(exc).__name__
+    assert raised, (
+        "latent_log_var=none must FAIL upstream; if it started working, the C++ refusal is now "
+        "wrong and this assertion is what says so"
+    )
+    out.write("// --- section 6a-none: latent_log_var=`none` raises upstream ---\n")
+    out.write(f'inline constexpr const char* kLtx2VideoEncNoneRaises = "{raised}";\n\n')
+
+    # --- 6b: the plain strided convolutions, `per_channel`, `reflect` padding ---
+    enc_b = VideoEncoder(
+        encoder_blocks=VIDEO_ENC_B_BLOCKS,
+        norm_layer=NormLayerType.PIXEL_NORM,
+        latent_log_var=LogVarianceType.PER_CHANNEL,
+        encoder_spatial_padding_mode=PaddingModeType.REFLECT,
+        **VIDEO_ENC_B,
+    ).eval()
+    manifest_b = fill_from_stream(enc_b, prefix="ltx2.videoencb.")
+    frames_b = make_input("ltx2.videoencb.input", VIDEO_ENC_B_INPUT, 1.0)
+    y_b = enc_b(frames_b)
+
+    out.write("// --- section 6b: VideoEncoder, strided convs + per_channel + reflect ---\n")
+    emit_scalar(out, "kLtx2VideoEncBInC", VIDEO_ENC_B_INPUT[1])
+    emit_scalar(out, "kLtx2VideoEncBInT", VIDEO_ENC_B_INPUT[2])
+    emit_scalar(out, "kLtx2VideoEncBInH", VIDEO_ENC_B_INPUT[3])
+    emit_scalar(out, "kLtx2VideoEncBInW", VIDEO_ENC_B_INPUT[4])
+    emit_scalar(out, "kLtx2VideoEncBOutC", y_b.shape[1])
+    emit_scalar(out, "kLtx2VideoEncBOutT", y_b.shape[2])
+    emit_scalar(out, "kLtx2VideoEncBOutH", y_b.shape[3])
+    emit_scalar(out, "kLtx2VideoEncBOutW", y_b.shape[4])
+    emit_scalar(out, "kLtx2VideoEncBTemporalFactor", enc_b.video_scale_factors.time)
+    emit_scalar(out, "kLtx2VideoEncBSpatialFactor", enc_b.video_scale_factors.height)
+    out.write("\n")
+    emit_manifest(out, "kLtx2VideoEncBParam", manifest_b)
+    emit_f32(out, "kLtx2VideoEncBGolden", y_b.numpy())
+
+    # --- 6c: the FRAME-COUNT CROP (video_vae.py:276-286). One extra frame, whose
+    # first VIDEO_ENC_A_INPUT[2] frames are the 6a input, must give the 6a answer.
+    # An implementation that skips the crop cannot even run: the temporal fold
+    # needs an even frame count after the first-frame duplication.
+    crop_input = torch.cat([frames, make_input("ltx2.videoenc.tail", (1, 3, 1, 8, 8), 1.0)], dim=2)
+    enc_crop = VideoEncoder(
+        encoder_blocks=VIDEO_ENC_A_BLOCKS,
+        norm_layer=NormLayerType.PIXEL_NORM,
+        latent_log_var=LogVarianceType.UNIFORM,
+        encoder_spatial_padding_mode=PaddingModeType.ZEROS,
+        **VIDEO_ENC_A,
+    ).eval()
+    fill_from_stream(enc_crop, prefix="ltx2.videoenc.")
+    y_crop = enc_crop(crop_input)
+    assert torch.equal(y, y_crop), "the crop arm must reproduce the 6a golden exactly"
+    out.write("// --- section 6c: the frame-count crop ---\n")
+    emit_scalar(out, "kLtx2VideoEncCropInT", crop_input.shape[2])
+    emit_scalar(out, "kLtx2VideoEncCropDropped", crop_input.shape[2] - VIDEO_ENC_A_INPUT[2])
+    out.write("\n")
+
+    # --- 6d: what the encoder's causality actually reaches, MEASURED ---
+    enc_causal = VideoEncoder(
+        encoder_blocks=VIDEO_ENC_CAUSAL_BLOCKS,
+        norm_layer=NormLayerType.PIXEL_NORM,
+        latent_log_var=LogVarianceType.UNIFORM,
+        encoder_spatial_padding_mode=PaddingModeType.ZEROS,
+        **VIDEO_ENC_A,
+    ).eval()
+    causal_manifest = fill_from_stream(enc_causal, prefix="ltx2.videoenccausal.")
+    base = enc_causal(frames)
+    bumped_in = frames.clone()
+    bumped_in[:, :, -1] += 5.0
+    bumped = enc_causal(bumped_in)
+    moved = [t for t in range(base.shape[2]) if not torch.equal(base[:, :, t], bumped[:, :, t])]
+    assert moved, "the causality probe must move SOMETHING or it gates nothing"
+    assert len(moved) < base.shape[2], (
+        "the causality probe must leave at least one EARLY latent frame untouched, or it is not "
+        "testing causality at all"
+    )
+    out.write("// --- section 6d: convolution-only causal reach ---\n")
+    emit_scalar(out, "kLtx2VideoEncCausalOutT", base.shape[2])
+    emit_scalar(out, "kLtx2VideoEncCausalFirstMoved", moved[0])
+    emit_scalar(out, "kLtx2VideoEncCausalLastMoved", moved[-1])
+    out.write("\n")
+    emit_manifest(out, "kLtx2VideoEncCausalParam", causal_manifest)
+    emit_f32(out, "kLtx2VideoEncCausalGolden", base.numpy())
+
+
+def section_audio_encoder(out) -> None:
+    from ltx_core.model.audio_vae.attention import AttentionType
+    from ltx_core.model.audio_vae.audio_vae import AudioEncoder
+    from ltx_core.model.audio_vae.causality_axis import CausalityAxis
+    from ltx_core.model.common.normalization import NormType
+
+    def build(prefix, **overrides):
+        cfg = dict(AUDIO_ENC)
+        cfg.update(overrides)
+        enc = AudioEncoder(
+            norm_type=NormType.PIXEL,
+            causality_axis=CausalityAxis.HEIGHT,
+            attn_type=AttentionType.VANILLA,
+            **cfg,
+        ).eval()
+        return enc, fill_from_stream(enc, prefix=prefix)
+
+    spectrogram = make_input(
+        "ltx2.audioenc.input", (1, AUDIO_ENC["in_channels"], AUDIO_ENC_FRAMES, AUDIO_ENC_MEL), 1.0
+    )
+
+    enc, manifest = build("ltx2.audioenc.")
+    y = enc(spectrogram)
+    out.write("// --- section 7a: AudioEncoder with attention (audio_vae.py:60-246) ---\n")
+    emit_scalar(out, "kLtx2AudioEncInC", AUDIO_ENC["in_channels"])
+    emit_scalar(out, "kLtx2AudioEncInT", AUDIO_ENC_FRAMES)
+    emit_scalar(out, "kLtx2AudioEncInF", AUDIO_ENC_MEL)
+    emit_scalar(out, "kLtx2AudioEncOutC", y.shape[1])
+    emit_scalar(out, "kLtx2AudioEncOutT", y.shape[2])
+    emit_scalar(out, "kLtx2AudioEncOutF", y.shape[3])
+    out.write("\n")
+    emit_manifest(out, "kLtx2AudioEncParam", manifest)
+    emit_f32(out, "kLtx2AudioEncGolden", y.numpy())
+
+    # --- 7b: the SHIPPED configuration, which carries NO attention at all
+    # (`attn_resolutions: []`, `mid_block_add_attention: false` in the 2.x audio
+    # VAE metadata). Gating only the attention arm would gate a model nobody runs.
+    enc_plain, manifest_plain = build(
+        "ltx2.audioencplain.", attn_resolutions=set(), mid_block_add_attention=False
+    )
+    y_plain = enc_plain(spectrogram)
+    out.write("// --- section 7b: AudioEncoder, the SHIPPED no-attention config ---\n")
+    emit_scalar(out, "kLtx2AudioEncPlainOutC", y_plain.shape[1])
+    emit_scalar(out, "kLtx2AudioEncPlainOutT", y_plain.shape[2])
+    emit_scalar(out, "kLtx2AudioEncPlainOutF", y_plain.shape[3])
+    out.write("\n")
+    emit_manifest(out, "kLtx2AudioEncPlainParam", manifest_plain)
+    emit_f32(out, "kLtx2AudioEncPlainGolden", y_plain.numpy())
+
+    # --- 7c: the AVERAGE-POOL downsample arm (`resamp_with_conv=False`), which
+    # upstream only allows with causality NONE (downsample.py:28-29). It is a
+    # different sampling lattice, not a cheaper one.
+    enc_pool = AudioEncoder(
+        norm_type=NormType.PIXEL,
+        causality_axis=CausalityAxis.NONE,
+        attn_type=AttentionType.VANILLA,
+        **{**AUDIO_ENC, "resamp_with_conv": False},
+    ).eval()
+    manifest_pool = fill_from_stream(enc_pool, prefix="ltx2.audioencpool.")
+    y_pool = enc_pool(spectrogram)
+    out.write("// --- section 7c: AudioEncoder, avg-pool downsample, causality NONE ---\n")
+    emit_scalar(out, "kLtx2AudioEncPoolOutC", y_pool.shape[1])
+    emit_scalar(out, "kLtx2AudioEncPoolOutT", y_pool.shape[2])
+    emit_scalar(out, "kLtx2AudioEncPoolOutF", y_pool.shape[3])
+    out.write("\n")
+    emit_manifest(out, "kLtx2AudioEncPoolParam", manifest_pool)
+    emit_f32(out, "kLtx2AudioEncPoolGolden", y_pool.numpy())
+
+
+def section_audio_mel(out) -> None:
+    import torch
+    import torchaudio
+
+    from ltx_core.model.audio_vae.ops import AudioProcessor
+    from ltx_core.types import Audio
+
+    # --- 8a: the slaney filterbank on its own, at TWO sample rates. The second is
+    # ODD, which is the only way to see `torch.linspace(0, sample_rate // 2, ...)`
+    # halving with INTEGER division while `f_max` stays `sample_rate / 2.0`.
+    banks = []
+    for tag, sr, n_fft, n_mels in (("", 16000, 64, 8), ("Odd", 8001, 32, 6)):
+        n_freqs = n_fft // 2 + 1
+        fb = torchaudio.functional.melscale_fbanks(
+            n_freqs=n_freqs,
+            f_min=0.0,
+            f_max=sr / 2.0,
+            n_mels=n_mels,
+            sample_rate=sr,
+            norm="slaney",
+            mel_scale="slaney",
+        )
+        assert float(fb.abs().max()) > 0.0, "an all-zero filterbank gates nothing"
+        banks.append((tag, sr, n_freqs, n_mels, fb))
+
+    out.write("// --- section 8a: the slaney mel filterbank (torchaudio melscale_fbanks) ---\n")
+    for tag, sr, n_freqs, n_mels, fb in banks:
+        emit_scalar(out, f"kLtx2Mel{tag}Rate", sr)
+        emit_scalar(out, f"kLtx2Mel{tag}Freqs", n_freqs)
+        emit_scalar(out, f"kLtx2Mel{tag}Bins", n_mels)
+        # TRANSPOSED to [n_mels, n_freqs], the layout every consumer contracts in.
+        emit_f32(out, f"kLtx2Mel{tag}BasisGolden", fb.transpose(0, 1).contiguous().numpy())
+
+    # --- 8b: waveform_to_mel end to end ---
+    processor = AudioProcessor(
+        target_sample_rate=MEL["target_sample_rate"],
+        mel_bins=MEL["mel_bins"],
+        mel_hop_length=MEL["mel_hop_length"],
+        n_fft=MEL["n_fft"],
+    )
+    wave = make_input("ltx2.mel.input", (1, 2, MEL_SAMPLES), 0.5)
+    mel = processor.waveform_to_mel(Audio(waveform=wave, sampling_rate=MEL["target_sample_rate"]))
+    out.write("// --- section 8b: AudioProcessor.waveform_to_mel (ops.py:44-55) ---\n")
+    emit_scalar(out, "kLtx2MelWaveChannels", wave.shape[1])
+    emit_scalar(out, "kLtx2MelWaveSamples", MEL_SAMPLES)
+    emit_scalar(out, "kLtx2MelHop", MEL["mel_hop_length"])
+    emit_scalar(out, "kLtx2MelNFft", MEL["n_fft"])
+    emit_scalar(out, "kLtx2MelOutFrames", mel.shape[2])
+    emit_scalar(out, "kLtx2MelOutBins", mel.shape[3])
+    out.write("\n")
+    emit_f32(out, "kLtx2MelGolden", mel.numpy())
+
+    # --- 8c: SILENCE, the arm that actually enters the clamp's regime. The
+    # `torch.clamp(mel, min=1e-5)` at ops.py:52 is invisible to 8b — a well-scaled
+    # waveform never gets near it — but real silence saturates EVERY bin, and then
+    # the constant alone decides the encoder's input. Asserted, not hoped for.
+    silence = torch.zeros_like(wave)
+    raw = processor.mel_transform(silence)
+    assert float(raw.max()) < 1e-5, (
+        "the silence probe must drive EVERY mel bin under the clamp or it gates nothing; "
+        f"max was {float(raw.max())}"
+    )
+    quiet = processor.waveform_to_mel(
+        Audio(waveform=silence, sampling_rate=MEL["target_sample_rate"])
+    )
+    out.write("// --- section 8c: silence, which SATURATES the 1e-5 log clamp ---\n")
+    emit_scalar(out, "kLtx2MelQuietFrames", quiet.shape[2])
+    out.write("\n")
+    emit_f32(out, "kLtx2MelQuietGolden", quiet.numpy())
+
+
+# ---------------------------------------------------------------------------
+# Section 9 — the CONDITIONING ITEMS (phase L11). What the encoders' output is
+# FOR: placing an encoded image / keyframe / reference video / reference audio
+# into the token stream the DiT already accepts.
+# ---------------------------------------------------------------------------
+
+COND_VIDEO_SHAPE = dict(batch=1, channels=4, frames=3, height=2, width=2)
+COND_VIDEO_PATCH = 1
+COND_VIDEO_FPS = 8.0
+COND_AUDIO_SHAPE = dict(batch=1, channels=2, frames=4, mel_bins=2)
+
+
+def section_conditioning(out) -> None:
+    import torch
+
+    from ltx_core.components.patchifiers import AudioPatchifier, VideoLatentPatchifier
+    from ltx_core.conditioning.types.keyframe_cond import VideoConditionByKeyframeIndex
+    from ltx_core.conditioning.types.latent_cond import VideoConditionByLatentIndex
+    from ltx_core.conditioning.types.reference_audio_cond import AudioConditionByReferenceLatent
+    from ltx_core.conditioning.types.reference_video_cond import VideoConditionByReferenceLatent
+    from ltx_core.tools import AudioLatentTools, VideoLatentTools
+    from ltx_core.types import AudioLatentShape, SpatioTemporalScaleFactors, VideoLatentShape
+
+    factors = SpatioTemporalScaleFactors.default()
+    target = VideoLatentShape(**COND_VIDEO_SHAPE)
+    tools = VideoLatentTools(
+        patchifier=VideoLatentPatchifier(patch_size=COND_VIDEO_PATCH),
+        target_shape=target,
+        fps=COND_VIDEO_FPS,
+        scale_factors=factors,
+        causal_fix=True,
+    )
+    base = tools.create_initial_state(device="cpu", dtype=torch.float32)
+
+    def emit_state(out, prefix, state, tokens_before):
+        emit_scalar(out, prefix + "Tokens", state.latent.shape[1])
+        emit_scalar(out, prefix + "Width", state.latent.shape[2])
+        emit_scalar(out, prefix + "PosDims", state.positions.shape[1])
+        emit_scalar(out, prefix + "TokensBefore", tokens_before)
+        out.write("\n")
+        emit_f32(out, prefix + "Clean", state.clean_latent.numpy())
+        emit_f32(out, prefix + "Latent", state.latent.numpy())
+        emit_f32(out, prefix + "Mask", state.denoise_mask.numpy())
+        emit_f32(out, prefix + "Positions", state.positions.numpy())
+
+    out.write("// --- section 9a: the INITIAL video state (tools.py:139-186) ---\n")
+    emit_state(out, "kLtx2CondVideoBase", base, base.latent.shape[1])
+    emit_f32(out, "kLtx2CondVideoBaseKeyframesMask", base.keyframes_mask.numpy())
+
+    # --- 9b: VideoConditionByLatentIndex — an image REPLACING one latent frame.
+    cond_latent = make_input("ltx2.cond.image", (1, 4, 1, 2, 2), 1.0)
+    by_index = VideoConditionByLatentIndex(latent=cond_latent, strength=0.7, latent_idx=1)
+    state_index = by_index.apply_to(base, tools)
+    assert not torch.equal(state_index.clean_latent, base.clean_latent), (
+        "the latent-index item must CHANGE the clean latent or it gates nothing"
+    )
+    assert not torch.equal(state_index.denoise_mask, base.denoise_mask), (
+        "the latent-index item must CHANGE the denoise mask or it gates nothing"
+    )
+    assert torch.equal(state_index.latent, base.latent), (
+        "upstream leaves the NOISY tensor untouched here (latent_cond.py:38-39); if that ever "
+        "changes, the port's noising composition changes with it"
+    )
+    out.write("// --- section 9b: VideoConditionByLatentIndex (latent_cond.py:9-43) ---\n")
+    emit_scalar(out, "kLtx2CondIndexLatentIdx", 1)
+    emit_state(out, "kLtx2CondIndex", state_index, base.latent.shape[1])
+
+    # --- 9c: VideoConditionByKeyframeIndex — an image APPENDED at a pixel frame.
+    keyframe = make_input("ltx2.cond.keyframe", (1, 4, 1, 2, 2), 1.0)
+    by_keyframe = VideoConditionByKeyframeIndex(
+        keyframes=keyframe, frame_idx=5, strength=0.6, num_pixel_frames=1
+    )
+    state_kf = by_keyframe.apply_to(base, tools)
+    assert state_kf.latent.shape[1] > base.latent.shape[1], "the keyframe item must APPEND tokens"
+    assert state_kf.attention_mask is None, (
+        "with attention_mask=None and no existing mask, update_attention_mask returns None "
+        "(mask_utils.py:110-140); the port relies on that"
+    )
+    out.write("// --- section 9c: VideoConditionByKeyframeIndex (keyframe_cond.py:36-90) ---\n")
+    emit_scalar(out, "kLtx2CondKeyframeFrameIdx", 5)
+    emit_state(out, "kLtx2CondKeyframe", state_kf, base.latent.shape[1])
+
+    # --- 9d: VideoConditionByReferenceLatent — a reference video, IC-LoRA style.
+    reference = make_input("ltx2.cond.reference", (1, 4, 2, 2, 2), 1.0)
+    by_reference = VideoConditionByReferenceLatent(
+        latent=reference, downscale_factor=2, temporal_scale_factor=2, strength=1.0
+    )
+    state_ref = by_reference.apply_to(base, tools)
+    assert state_ref.latent.shape[1] > base.latent.shape[1], "the reference item must APPEND tokens"
+    out.write("// --- section 9d: VideoConditionByReferenceLatent (reference_video_cond.py) ---\n")
+    emit_scalar(out, "kLtx2CondRefDownscale", 2)
+    emit_scalar(out, "kLtx2CondRefTemporalScale", 2)
+    emit_state(out, "kLtx2CondRef", state_ref, base.latent.shape[1])
+
+    # A downscale/temporal factor of 1 must take the OTHER branch — both guards
+    # are `if factor != 1`, so an implementation that always applied them would
+    # pass 9d and fail here.
+    plain_ref = VideoConditionByReferenceLatent(
+        latent=reference, downscale_factor=1, temporal_scale_factor=1, strength=1.0
+    ).apply_to(base, tools)
+    assert not torch.equal(plain_ref.positions, state_ref.positions), (
+        "the scaled and unscaled reference positions must DIFFER, or 9d gates neither factor"
+    )
+    out.write("// --- section 9d': the unscaled reference branch ---\n")
+    emit_f32(out, "kLtx2CondRefPlainPositions", plain_ref.positions.numpy())
+
+    # --- 9e: AudioConditionByReferenceLatent ---
+    audio_target = AudioLatentShape(**COND_AUDIO_SHAPE)
+    audio_patchifier = AudioPatchifier(patch_size=1)
+    audio_tools = AudioLatentTools(patchifier=audio_patchifier, target_shape=audio_target)
+    audio_base = audio_tools.create_initial_state(device="cpu", dtype=torch.float32)
+    out.write("// --- section 9e: the INITIAL audio state (tools.py:246-279) ---\n")
+    emit_state(out, "kLtx2CondAudioBase", audio_base, audio_base.latent.shape[1])
+
+    ref_audio_latent = make_input("ltx2.cond.refaudio", (1, 2, 3, 2), 1.0)
+    ref_tokens = audio_patchifier.patchify(ref_audio_latent)
+    ref_positions = audio_patchifier.get_patch_grid_bounds(
+        output_shape=AudioLatentShape(batch=1, channels=2, frames=3, mel_bins=2)
+    )
+    audio_ref = AudioConditionByReferenceLatent(
+        patchified=ref_tokens, positions=ref_positions, strength=1.0
+    ).apply_to(audio_base, audio_tools)
+    assert audio_ref.latent.shape[1] > audio_base.latent.shape[1], (
+        "the audio reference item must APPEND tokens"
+    )
+    out.write("// --- section 9f: AudioConditionByReferenceLatent (reference_audio_cond.py) ---\n")
+    emit_scalar(out, "kLtx2CondRefAudioFrames", 3)
+    emit_state(out, "kLtx2CondRefAudio", audio_ref, audio_base.latent.shape[1])
+
+
 def load_upstream(root: Path) -> Path:
     """Import `ltx_core` BY PATH from `root`, and prove that is what resolved."""
     src = root / "packages" / "ltx-core" / "src"
@@ -741,7 +1250,18 @@ def load_upstream(root: Path) -> Path:
 
 
 def upstream_revision(root: Path) -> str:
-    """The exact upstream tree these goldens were produced from."""
+    """The exact upstream tree these goldens were produced from.
+
+    AND REFUSE A DIRTY ONE. `git rev-parse HEAD` reports the COMMITTED sha
+    whatever the working tree looks like, so a checkout with one edited line
+    stamps a clean anchor onto goldens the pinned commit cannot reproduce — the
+    anchor then actively misleads, which is worse than having none. `git status
+    --porcelain` is empty exactly when the tree matches the commit, so it is the
+    check that makes the recorded sha mean what it says.
+
+    A checkout with no git metadata at all still returns "unknown", which the
+    suite rejects on its own; only a REAL repository is held to cleanliness.
+    """
     try:
         done = subprocess.run(
             ["git", "-C", str(root), "rev-parse", "HEAD"],
@@ -751,6 +1271,18 @@ def upstream_revision(root: Path) -> str:
         )
     except Exception:  # noqa: BLE001 - a tarball checkout carries no git metadata
         return "unknown"
+    dirty = subprocess.run(
+        ["git", "-C", str(root), "status", "--porcelain"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    if dirty:
+        raise SystemExit(
+            f"the LTX-2 checkout at {root} is DIRTY:\n{dirty}\n"
+            "Refusing to generate: `git rev-parse HEAD` would stamp a CLEAN revision anchor onto "
+            "goldens produced by a tree that commit cannot reproduce. Commit or stash first."
+        )
     return done.stdout.strip()
 
 
@@ -795,6 +1327,10 @@ def main() -> int:
         section_vocoder_legacy(out)
         section_bwe(out)
         section_conv_video_decoder(out)
+        section_video_encoder(out)
+        section_audio_encoder(out)
+        section_audio_mel(out)
+        section_conditioning(out)
         out.write("}  // namespace vllm_test\n")
     print(f"wrote {args.out}", file=sys.stderr)
     return 0
