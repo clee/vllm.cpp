@@ -1166,6 +1166,13 @@ vllm_cpp_add_test(test_ops_moe vt/test_ops_moe.cpp)
 vllm_cpp_add_test(test_ops_glue vt/test_ops_glue.cpp)
 vllm_cpp_add_test(test_ops_attn_preamble vt/test_ops_attn_preamble.cpp)
 vllm_cpp_add_test(test_ops_attention vt/test_ops_attention.cpp)
+# vt::AttentionCross, DIRECTLY, on every backend that registers it. Its own
+# target rather than more cases in test_ops_attention or test_ltx2_device, both
+# of which carry recorded baselines. It exists because the CUDA kernel's whole
+# flash-tiling machinery (cross-tile rescale, multi-block launch, npl>1 head
+# split, GQA broadcast, ChooseTileCols' halving) is unreachable from every
+# LTX-2.5 call geometry, which is tiles=1/npl=1/nblk=1/Hq==Hkv throughout.
+vllm_cpp_add_test(test_ops_attention_cross vt/test_ops_attention_cross.cpp)
 vllm_cpp_add_test(test_ops_dflash_block_attn vt/test_ops_dflash_block_attn.cpp)
 vllm_cpp_add_test(test_ops_dflash_paged_block_attn vt/test_ops_dflash_paged_block_attn.cpp)
 vllm_cpp_add_test(test_ops_reshape_cache vt/test_ops_reshape_cache.cpp)

@@ -353,6 +353,41 @@ Ltx2TextEncoderWeights Ltx2WidenTextProjectionsToF32(
 // decodes to a plausible, finite, wrong picture.
 nlohmann::json Ltx2ReadCheckpointConfig(const SafetensorsFile& file);
 
+// Adopt a `{"transformer": {...}}` DiT configuration onto the params the SHAPES
+// resolved, or refuse by name.
+//
+// WHAT THIS DECIDES, and why it is not cosmetic. `Ltx2ParseDitParamsFromManifest`
+// reads shapes, which is the only thing a ComfyUI-flavoured checkpoint offers. A
+// config states what no shape encodes — `frequencies_precision`,
+// `av_ca_timestep_scale_multiplier`, the positional-embedding bounds and theta,
+// `norm_eps`, `use_middle_indices_grid`. Each moves every RoPE angle or every
+// modulation while leaving the tensor set byte-identical, so the manifest path
+// resolves a DIFFERENT MODEL from the same file and nothing downstream can tell.
+//
+// A config is believed only when `EnumerateLtx2DitTensors` over it reproduces the
+// IDENTICAL weight contract `from_shapes` produces. That is what proves it
+// describes THIS file rather than another checkpoint's config pasted beside it;
+// a disagreement is refused rather than resolved in either direction, because
+// taking the shapes renders with the wrong RoPE and taking the config binds the
+// wrong tensors.
+//
+// ONE FUNCTION, because two callers must not answer this differently: the video
+// engine (`Ltx2VideoEngine::Load`) and the device gate, which drives
+// `Ltx2StreamDitToDevice` directly and therefore owes the same adoption.
+//
+// `allow_unported_modules` clears `use_keyframes_abs_pos_embedding` IN A COPY of
+// the config before parsing, mirroring what the loader does for
+// `use_prompt_adaln_single`: the flag is cleared for the CONTRACT, the module
+// stays unported, and the checkpoint's `unported` list still names it. Without
+// the opt-in `ParseLtx2DitParams` throws, which is the refusal.
+//
+// `source` names the config in every refusal, so a reader knows whether the
+// checkpoint declared it or a caller supplied it.
+Ltx2DitParams Ltx2AdoptDeclaredDitParams(const nlohmann::json& config,
+                                         const Ltx2DitParams& from_shapes,
+                                         bool allow_unported_modules,
+                                         const std::string& source);
+
 // `__metadata__["model_version"]` ("2.5.0"), which is what
 // `detect_model_version` reads to pick a recipe (ltx-pipelines
 // utils/constants.py:161) and what `should_use_ancestral_sampler` keys on

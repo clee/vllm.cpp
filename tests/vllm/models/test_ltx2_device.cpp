@@ -30,6 +30,8 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
+#include <fstream>
+#include <iterator>
 #include <map>
 #include <memory>
 #include <string>
@@ -570,6 +572,37 @@ TEST_CASE("ltx2 device: CUDA tracks the HOST forward, not just the golden") {
   // would be orders of magnitude larger.
   CHECK(dv < kDeviceRoundOff);
   CHECK(da < kDeviceRoundOff);
+
+  // ── the bf16 arm, BACKEND AGAINST BACKEND ─────────────────────────────────
+  //
+  // WHY THIS IS HERE. The landing commit said the bf16 CUDA numbers were
+  // "bit-identical to the CPU backend's". What was actually measured was that the
+  // two arms print the SAME max|diff| against the goldens at six significant
+  // figures, and equal printed maxima are consistent with bit-identity without
+  // establishing it: nothing compared the two backends' OUTPUTS to each other at
+  // bf16 at all. This is that comparison, and it is stated as what it measures.
+  //
+  // It is deliberately not asserted as equality. The two arms run different
+  // softmax algorithms (online recurrence on CUDA, explicit three-pass on the
+  // CPU) and different reduction orders, so a bf16 band is the honest bound; the
+  // MEASURED value is printed so the claim can be made from a number rather than
+  // from an adjective.
+  const Ltx2DitDeviceWeights staged_bf16 =
+      Ltx2StageDitWeightsToDevice(q, p, set.views, vt::DType::kBF16);
+  const vllm::Ltx2DitOutputs cuda_bf16 =
+      Ltx2DitForwardDevice(q, p, staged_bf16.weights, &m.video, &m.audio, vt::DType::kBF16);
+  vt::Queue cpuq{Cpu(), nullptr};
+  const Ltx2DitDeviceWeights host_bf16 =
+      Ltx2StageDitWeightsToDevice(cpuq, p, set.views, vt::DType::kBF16);
+  const vllm::Ltx2DitOutputs cpu_bf16 = Ltx2DitForwardDevice(
+      cpuq, p, host_bf16.weights, &m.video, &m.audio, vt::DType::kBF16);
+  REQUIRE(cuda_bf16.video.size() == cpu_bf16.video.size());
+  const double bv = MaxAbsDiff(cuda_bf16.video, cpu_bf16.video.data(), cpu_bf16.video.size());
+  const double ba = MaxAbsDiff(cuda_bf16.audio, cpu_bf16.audio.data(), cpu_bf16.audio.size());
+  MESSAGE("bf16 CUDA-vs-CPU-BACKEND max|diff|: video=" << bv << " audio=" << ba
+          << " (a BOUND, not a bit-identity claim -- nothing here measures bit-identity)");
+  CHECK(bv < kBf16RoundOff);
+  CHECK(ba < kBf16RoundOff);
 }
 
 // ---------------------------------------------------------------------------
@@ -664,6 +697,26 @@ TEST_CASE("ltx2 device: HOST weights on a device queue are REFUSED by name") {
 // ways a 21B forward fails silently. Any wall-clock printed is for sizing only
 // and is NOT a speed result; the spec's §0 says why no denominator exists.
 //
+// AND UNDER WHICH CONFIGURATION, which this case used to leave unstated. That is
+// not a footnote here: `Ltx2StreamDitToDevice` resolves geometry from SHAPES, and
+// shapes cannot see `frequencies_precision` or
+// `av_ca_timestep_scale_multiplier`. Only ONE of the two shipped DiTs declares
+// them — read from the NAS 2026-08-12:
+//
+//   first-party NVFP4  __metadata__ = ['config','gemma_source_checkpoint',
+//                                      'license','model_version']
+//   vonkaiser FP8      has __metadata__ key: FALSE
+//
+// So the FP8 arm — the one this case actually runs — took the parser defaults
+// `double_precision_rope = false` and `av_ca_timestep_scale_multiplier = 1`,
+// against LTX-2.5's declared float64 and 1000, and nothing said so. The engine
+// now REFUSES that (ltx2_video.cpp, the `dit_config_path` extra); this case sits
+// BELOW the engine, so it resolves the configuration the same way through
+// `Ltx2AdoptDeclaredDitParams` and ASSERTS what it ended up with either way.
+// Set LTX2_SHIPPED_DIT_CONFIG to a `{"transformer": {...}}` JSON file to supply
+// one for a checkpoint that declares none; without it the case still runs, and
+// says in its own assertions that it is NOT running LTX-2.5's declared config.
+//
 // Off by default: it needs the checkpoint AND ~42 GB of device memory, and GB10's
 // memory is unified, so an unattended run of this alongside anything else is how
 // the box gets rebooted. Set LTX2_SHIPPED_DIT to the .safetensors path.
@@ -683,8 +736,16 @@ TEST_CASE("ltx2 device: a SHIPPED 21.00B DiT stages and runs on the GPU") {
   const vllm::SafetensorsFile file = vllm::SafetensorsFile::Open(path_env);
   vllm::Ltx2DitQuant quant = vllm::Ltx2DitQuant::kFp8;
   (void)vllm::Ltx2ParseDitParamsFromCheckpoint(file, &quant);
-  MESSAGE("shipped DiT: " << file.Names().size() << " tensors, quant="
-                          << (quant == vllm::Ltx2DitQuant::kNvfp4 ? "NVFP4" : "FP8"));
+  // `std::string`, NOT a bare `const char*` ternary. doctest's MESSAGE streams
+  // through an ostream whose overload set makes `cond ? "NVFP4" : "FP8"` decay to
+  // `bool` and print `1`, so this line reported `quant=1` for BOTH shipped files
+  // and could not do the one job spec §3.1 gives it: NAME which DiT produced each
+  // artifact, every time. The two are not interchangeable quantizations of one
+  // model — they differ in a TRAINED `keyframes_abs_pos_embedding` — so a report
+  // that cannot say which one ran is not evidence about either.
+  const std::string quant_name = quant == vllm::Ltx2DitQuant::kNvfp4 ? "NVFP4" : "FP8";
+  MESSAGE("shipped DiT: " << file.Names().size() << " tensors, quant=" << quant_name
+                          << " (path " << path_env << ")");
 
   // Stage tensor-by-tensor. This is the production path: it dequantizes and
   // uploads ONE tensor at a time and frees each host buffer before the next, so
@@ -698,7 +759,7 @@ TEST_CASE("ltx2 device: a SHIPPED 21.00B DiT stages and runs on the GPU") {
   const double stage_s = std::chrono::duration<double>(t1 - t0).count();
 
   // The geometry the FILE describes, at full scale.
-  const vllm::Ltx2DitParams& p = ck.params;
+  vllm::Ltx2DitParams p = ck.params;
   MESSAGE("staged in " << stage_s << " s (NOT a speed result): layers=" << p.num_layers
                        << " inner=" << p.inner_dim() << " audio_inner=" << p.audio_inner_dim()
                        << " head_dim=" << p.attention_head_dim
@@ -706,6 +767,61 @@ TEST_CASE("ltx2 device: a SHIPPED 21.00B DiT stages and runs on the GPU") {
   CHECK(p.num_layers == 48);
   CHECK(p.inner_dim() == 4096);
   CHECK(p.attention_head_dim == 128);
+
+  // ── WHICH CONFIGURATION THIS FORWARD RUNS UNDER, resolved and then ASSERTED ──
+  //
+  // Three cases, and each one ends in an assertion rather than a hope. The
+  // adoption rule is `Ltx2AdoptDeclaredDitParams`, the SAME function the engine
+  // calls, so the two cannot answer differently.
+  const bool declares_config = file.Metadata().count("config") != 0;
+  const char* config_env = std::getenv("LTX2_SHIPPED_DIT_CONFIG");
+  MESSAGE("config source: " << (declares_config ? "the checkpoint's own __metadata__"
+                                : config_env != nullptr ? "LTX2_SHIPPED_DIT_CONFIG"
+                                                        : "NONE (manifest shapes only)"));
+  if (declares_config || config_env != nullptr) {
+    nlohmann::json config;
+    std::string source;
+    if (declares_config) {
+      // Both present is the same ambiguity the engine refuses; here it is simply
+      // not exercised, and the checkpoint's own config wins by being named.
+      config = vllm::Ltx2ReadCheckpointConfig(file);
+      source = "the DiT checkpoint's own __metadata__[\"config\"][\"transformer\"]";
+    } else {
+      std::ifstream in(config_env, std::ios::binary);
+      REQUIRE_MESSAGE(in.good(), "cannot open LTX2_SHIPPED_DIT_CONFIG ", config_env);
+      config = nlohmann::json::parse(
+          std::string((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>()));
+      source = std::string("the LTX2_SHIPPED_DIT_CONFIG file '") + config_env + "'";
+    }
+    // Refuses by name if it describes a different weight contract, so a config
+    // from the OTHER shipped DiT cannot be bound to these tensors unnoticed.
+    p = vllm::Ltx2AdoptDeclaredDitParams(config, ck.params, opt.allow_unported_modules, source);
+    MESSAGE("adopted config: double_precision_rope=" << p.double_precision_rope
+            << " av_ca_timestep_scale_multiplier=" << p.av_ca_timestep_scale_multiplier
+            << " timestep_scale_multiplier=" << p.timestep_scale_multiplier);
+    // LTX-2.5's declared values. A config that reached here and did NOT carry
+    // them is not an LTX-2.5 config, and saying so is the point of asserting.
+    CHECK(p.double_precision_rope);
+    CHECK(p.av_ca_timestep_scale_multiplier == 1000);
+    // The geometry must survive adoption, or the config was bound to the wrong
+    // checkpoint and the contract check did not do its job.
+    CHECK(p.num_layers == ck.params.num_layers);
+    CHECK(p.inner_dim() == ck.params.inner_dim());
+  } else {
+    // THE HONEST BRANCH, and it is the one the shipped vonkaiser FP8 DiT takes.
+    // The forward below runs under the MANIFEST DEFAULTS. That is a different
+    // configuration from LTX-2.5's declared one, and the assertions state exactly
+    // which, so no later reader can take this run for an LTX-2.5-configured
+    // render. It does not invalidate what this case claims — the weights stage,
+    // the forward executes on the device, the output is finite and
+    // non-degenerate — because none of those depends on the RoPE precision.
+    MESSAGE("NO CONFIG DECLARED OR SUPPLIED. This forward runs under the MANIFEST "
+            "defaults: double_precision_rope=false, av_ca_timestep_scale_multiplier=1. "
+            "LTX-2.5 declares float64 and 1000, so this is NOT LTX-2.5's declared "
+            "configuration. Set LTX2_SHIPPED_DIT_CONFIG to run under one.");
+    CHECK_FALSE(p.double_precision_rope);
+    CHECK(p.av_ca_timestep_scale_multiplier == 1);
+  }
   // Every weight must be device-resident, or the forward would run at host
   // bandwidth on unified memory with nothing complaining.
   REQUIRE(!ck.views.empty());

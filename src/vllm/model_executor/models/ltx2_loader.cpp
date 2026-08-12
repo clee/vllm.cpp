@@ -232,12 +232,27 @@ void Ltx2DequantTorchaoNvfp4ToBf16(const std::string& module, const StTensor& pa
   const int64_t padded_cols = RoundUp(groups, 4);
   const std::vector<int64_t> want_shape = {padded_rows / 4, padded_cols * 4};
   if (scale.shape != want_shape) {
-    Fail("'" + module + ".weight_scale' is " + ShapeText(scale.shape) +
-         " but a SWIZZLED torchao scale for [" + std::to_string(out_features) + ", " +
-         std::to_string(in_features) + "] is stored as " + ShapeText(want_shape) +
-         ". The LINEAR shape " + ShapeText({out_features, groups}) +
-         " has the same element count, so reading one as the other type-checks and "
-         "permutes every scale within a 128x4 tile.");
+    // NAME WHAT WAS SEEN, and attribute "torchao" to what this port READS rather
+    // than to the file. The first-party `Lightricks/LTX-2.5` NVFP4 DiT lands
+    // here, and it carries no `.torchao_nvfp4` marker at all — so a message
+    // saying its scale is not "a SWIZZLED torchao scale" described the file as a
+    // broken torchao checkpoint when it is simply a different, valid layout this
+    // port does not read yet. That sends a reader looking for corruption instead
+    // of for the missing loader arm.
+    const std::vector<int64_t> linear_shape = {out_features, groups};
+    const bool is_linear = scale.shape == linear_shape;
+    Fail("'" + module + ".weight_scale' is " + scale.dtype + " " + ShapeText(scale.shape) +
+         (is_linear ? ", which is exactly the LINEAR [N, K/16] group-scale layout" : "") +
+         ". This port reads the SWIZZLED torchao layout, which for [" +
+         std::to_string(out_features) + ", " + std::to_string(in_features) + "] is stored as " +
+         ShapeText(want_shape) + ". " +
+         (is_linear ? std::string("The two have the same element count, so reading this one as "
+                                  "swizzled type-checks and permutes every scale within a "
+                                  "128x4 tile. Reading the LINEAR layout is owed loader work; "
+                                  "refusing rather than silently permuting.")
+                    : "The LINEAR shape " + ShapeText(linear_shape) +
+                          " has the same element count, so reading one as the other "
+                          "type-checks and permutes every scale within a 128x4 tile."));
   }
   const float global = ReadScalarF32(module + ".weight_scale_2", scale_2);
 
@@ -835,6 +850,44 @@ Ltx2VocoderConfig ParseVocoderArm(const nlohmann::json& cfg, const std::string& 
 }
 
 }  // namespace
+
+Ltx2DitParams Ltx2AdoptDeclaredDitParams(const nlohmann::json& config,
+                                         const Ltx2DitParams& from_shapes,
+                                         bool allow_unported_modules,
+                                         const std::string& source) {
+  nlohmann::json copy = config;
+  // THE UNPORTED FLAG IS CLEARED IN THE COPY, NOT ARGUED WITH. `ParseLtx2DitParams`
+  // refuses `use_keyframes_abs_pos_embedding` by name (ltx2.cpp:191-196) and the
+  // first-party LTX-2.5 DiT declares it, so reading the declared config verbatim
+  // would refuse a real checkpoint the loader has just accepted under
+  // `allow_unported_modules`.
+  if (allow_unported_modules && copy.contains("transformer") &&
+      copy["transformer"].is_object()) {
+    copy["transformer"]["use_keyframes_abs_pos_embedding"] = false;
+  }
+  nlohmann::json wrapper;
+  wrapper["config"] = copy;
+  Ltx2DitParams declared = ParseLtx2DitParams(wrapper);
+  // The one flag the L2 contract clears, mirroring the manifest path above
+  // ("cleared for the CONTRACT only").
+  declared.use_prompt_adaln_single = false;
+
+  const std::vector<Ltx2TensorSpec> a = EnumerateLtx2DitTensors(from_shapes);
+  const std::vector<Ltx2TensorSpec> b = EnumerateLtx2DitTensors(declared);
+  bool same = a.size() == b.size();
+  for (size_t i = 0; same && i < a.size(); ++i) {
+    same = a[i].name == b[i].name && a[i].shape == b[i].shape;
+  }
+  if (!same) {
+    Fail(source +
+         " describes a DIFFERENT weight contract from the one its tensor shapes describe. "
+         "Refusing rather than preferring either: the config decides values no shape can see "
+         "(frequencies_precision, av_ca_timestep_scale_multiplier, the positional-embedding "
+         "bounds), so taking the shapes would render with the wrong RoPE and taking the "
+         "config would bind the wrong tensors.");
+  }
+  return declared;
+}
 
 nlohmann::json Ltx2ReadCheckpointConfig(const SafetensorsFile& file) {
   const std::map<std::string, std::string>& meta = file.Metadata();

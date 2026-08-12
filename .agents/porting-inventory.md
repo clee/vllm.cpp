@@ -1105,7 +1105,26 @@ Examples: `examples/cli` ✅ (C-API client), `examples/server` ✅ (OpenAI serve
       rows, the `Hq > Hkv` GQA broadcast, bit-for-bit agreement with `vt::Attention`
       on a square unbiased call, the no-provider refusal, and the six full-DiT
       forward goldens (`scripts/gen-ltx2-goldens.py`, upstream `fd4ded7f`) that run
-      it inside the model.
+      it inside the model. Those are all CPU-only.
+      **`tests/vt/test_ops_attention_cross.cpp` is the DIRECT gate on both
+      backends (2026-08-12).** It exists because of a finding recorded here so it
+      cannot recur: when the CUDA kernel landed, every test that reached it went
+      through the LTX-2.5 DiT, and all six distinct call geometries that model
+      produces are `tiles=1 npl=1 nblk=1 Hq==Hkv` — so the kernel's whole
+      flash-tiling machinery was DEAD CODE in every gate, including the
+      `ChooseTileCols` halving whose own comment says it prevents a launch failure
+      "on exactly the real geometry". A render puts `S` at prompt length and `Tq`
+      in the thousands, straight into that regime. The new suite drives
+      `tiles>1`, `nblk>1` with a RAGGED last block, `npl>1`, the `Hq>Hkv` GQA
+      broadcast, the `head_dim = 128` f32 case where the tile MUST halve
+      (`2*64*128*4` = 64 KiB against a 48 KiB launch limit), a bf16 stream at that
+      head_dim, a dense `[Tq, S]` bias carried across a tile boundary, and a fully
+      masked key placed in a LATER tile. Each case asserts the tile/block/lane
+      counts it reaches before asserting the numbers, and the oracle is an
+      INDEPENDENT f64 host reference in the test file — not the CPU kernel — so
+      the CUDA arm is not gated against a helper that could be wrong in the same
+      direction; the CPU-vs-CUDA comparison is kept as a separate, tighter
+      statement.
     * **Spec:** [ltx-2.5 spec](specs/ltx-2-5.md) §1.2 and §7. Lifecycle: shipped
       (CPU + CUDA). Owner: the LTX-2.5 row.
 18. **LTX-2.5 pipeline recipes are sourced from the CROSS-CHECK, and three upstream
@@ -1364,6 +1383,49 @@ Examples: `examples/cli` ✅ (C-API client), `examples/server` ✅ (OpenAI serve
       one; the device forward never sees it. Phase L7's shipped-checkpoint test
       only parsed the MANIFEST, which is why this surfaced now: nothing had
       materialized a tensor from that file before.
+    * **CORRECTED 2026-08-12 by an adversarial review of L7+L8 (row
+      `LTX25-L8-FIX`). The headline held; five records did not.**
+      1. **The FP8 DiT this row RAN carries no `__metadata__` at all.** The engine
+         comment claimed "both shipped LTX-2.5 DiTs DO carry one". Read from the
+         NAS: the first-party NVFP4 file declares
+         `['config','gemma_source_checkpoint','license','model_version']`; the
+         vonkaiser FP8 file declares NO `__metadata__` key. So for the copy L1-L6
+         gated against and L8 ran on the GPU, the config-adoption branch never
+         executed and the DiT silently took `double_precision_rope = false` and
+         `av_ca_timestep_scale_multiplier = 1` against LTX-2.5's declared
+         `float64` and `1000`. Both move every RoPE angle and every audio<->video
+         modulation. The run's own claims survive it — the weights stage, the
+         forward executes device-resident, the output is finite and
+         non-degenerate, none of which depends on the RoPE precision — but the
+         CONFIGURATION was unstated, which is what made it a defect. A DiT that
+         declares no config is now REFUSED by the engine unless the caller names
+         one through the `dit_config_path` extra, mirroring how `model_version`
+         was already handled; the device gate resolves it through the same
+         `Ltx2AdoptDeclaredDitParams` and ASSERTS which configuration it ended up
+         running under, in both branches.
+      2. **The L7 in-flow repair was ungated.** Deleting `im.dit.params =
+         declared;` left the whole suite green. `Ltx2VideoEngine::dit_params()`
+         now exposes what the ENGINE loaded and `test_ltx2_video.cpp` asserts on
+         it against a manifest control; the same deletion now fails 2 cases / 4
+         assertions. The disagreement-refusal branch, also unexercised, is gated
+         on both the declared and the supplied config.
+      3. **`test_ltx2_device`'s recorded GB10 baseline was 12/547; it is 13/547.**
+         The env-gated shipped-checkpoint case is still COUNTED when it skips.
+         Assertions were right.
+      4. **"bit-identical" overstated the bf16 evidence.** What was measured is
+         that both arms print the same max|diff| against the goldens at six
+         significant figures, which is consistent with bit-identity and does not
+         establish it; nothing compared the two backends' outputs to each other at
+         bf16. That comparison now exists inside the CUDA-vs-host case, and is
+         asserted as a bf16 BOUND with the measured value printed.
+      5. **`device = N` relabelled a queue instead of selecting one.** The load
+         called `Backend::CreateQueue()` — which `backend.h:212-217` records as a
+         temporary index-0 shim — and then overwrote `queue->device.index`, so on
+         a multi-GPU host `device = 2` would have run on GPU 0 while every
+         residency check agreed it was index 1. It now uses the free function
+         `vt::CreateQueue(Device)` and refuses an index with no registered
+         backend, by name. Unreachable on single-GPU GB10, which is why it had to
+         be fixed before a second device exists.
     * **OWED, and precisely:** (a) the prompt-K/V cache on the device path, which
       is REFUSED by name rather than ignored; (b) an FP4-RESIDENT arm — the
       `LinearDev` seam is one parameter away from the shared Marlin W4A16

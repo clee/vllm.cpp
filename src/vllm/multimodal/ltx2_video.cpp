@@ -50,6 +50,23 @@ void WriteFileBytes(const std::string& path, const std::string& bytes) {
   if (!out) Fail("short write " + path);
 }
 
+// A JSON object read from a FILE, for the one configuration a checkpoint may not
+// carry itself (`dit_config_path`). Both failure modes are refusals by name: a
+// path that will not open, and bytes that are not a JSON object. Returning an
+// empty object on either would be indistinguishable from an empty config, which
+// is exactly the silent default this extra exists to remove.
+nlohmann::json ReadJsonFile(const std::string& field, const std::string& path) {
+  const std::string bytes = ReadFileBytes(field, path);
+  nlohmann::json parsed;
+  try {
+    parsed = nlohmann::json::parse(bytes);
+  } catch (const std::exception& e) {
+    Fail(field + ": '" + path + "' is not JSON (" + e.what() + ")");
+  }
+  if (!parsed.is_object()) Fail(field + ": '" + path + "' is not a JSON object");
+  return parsed;
+}
+
 std::vector<float> ReadF32File(const std::string& field, const std::string& path) {
   const std::string bytes = ReadFileBytes(field, path);
   if (bytes.size() % sizeof(float) != 0) {
@@ -229,8 +246,8 @@ int64_t ExtraInt(const std::map<std::string, std::string>& extras, const std::st
 // DEFAULT and looks like the feature not working.
 const char* const kKnownLoadExtras[] = {
     kLtx2AudioPromptEmbedsExtra, kLtx2PipelineKindExtra, kLtx2ModelVersionExtra,
-    kLtx2AllowUnportedExtra,     kLtx2MaxPhaseExtra,     "upsampler_path",
-    "duration_head_path",
+    kLtx2AllowUnportedExtra,     kLtx2MaxPhaseExtra,     kLtx2DitConfigPathExtra,
+    "upsampler_path",            "duration_head_path",
 };
 
 void CheckKnownExtras(const std::map<std::string, std::string>& extras) {
@@ -359,6 +376,7 @@ bool Ltx2VideoEngine::has_encoder() const { return impl_->has_encoder; }
 bool Ltx2VideoEngine::has_prompt_embeds() const { return !impl_->video_prompt_embeds.empty(); }
 const std::string& Ltx2VideoEngine::model_version() const { return impl_->model_version; }
 const std::string& Ltx2VideoEngine::pipeline_kind() const { return impl_->pipeline_kind; }
+const Ltx2DitParams& Ltx2VideoEngine::dit_params() const { return impl_->dit.params; }
 
 std::unique_ptr<Ltx2VideoEngine> Ltx2VideoEngine::Load(const VideoModelParams& params) {
   if (params.dit_path.empty()) Fail("dit_path is required");
@@ -390,9 +408,24 @@ std::unique_ptr<Ltx2VideoEngine> Ltx2VideoEngine::Load(const VideoModelParams& p
            "device-resident forward is present (Ltx2DitForwardDevice); what is missing is "
            "the backend. Refusing rather than running the CPU forward behind a CUDA handle.");
     }
-    im.queue = backend->CreateQueue();
-    im.queue->device.index = static_cast<int32_t>(params.device - 1);
-    im.device = im.queue->device;
+    // `vt::CreateQueue(Device)`, NOT `Backend::CreateQueue()`. backend.h:212-217
+    // records the method as a "temporary index-0 migration shim" and says new
+    // adapter code must use the free function, and the difference is not
+    // cosmetic: the shim creates the queue on device 0 and relabelling its
+    // `device.index` afterwards MOVES THE LABEL, not the stream. On a multi-GPU
+    // host `device = 2` would then run every kernel on GPU 0 while every
+    // residency check in this file reported index 1 and agreed with itself. GB10
+    // has one GPU so it cannot be reached there, which is exactly why it has to
+    // be right before a second device exists.
+    const int32_t index = static_cast<int32_t>(params.device - 1);
+    im.device = vt::Device{vt::DeviceType::kCUDA, index};
+    if (vt::TryGetBackend(im.device) == nullptr) {
+      Fail("device " + std::to_string(params.device) + " names CUDA device index " +
+           std::to_string(index) +
+           ", and no backend is registered for it. Refusing rather than creating a queue "
+           "on device 0 and labelling it with an index nothing runs on.");
+    }
+    im.queue = vt::CreateQueue(im.device);
     // bf16: upstream resolves ONE model dtype and every layer inherits it, and it
     // is what `Ltx2StreamDitToDevice` stages. f32 on an accelerator would move
     // twice the bytes to reach a gate dtype, which is the polarity this project
@@ -419,9 +452,8 @@ std::unique_ptr<Ltx2VideoEngine> Ltx2VideoEngine::Load(const VideoModelParams& p
   //
   // FOUND AT L7 AND REPAIRED HERE. `Ltx2LoadDitFromSafetensors` derives its
   // geometry with `ParseLtx2DitParamsFromManifest`, which reads SHAPES — the way
-  // a ComfyUI checkpoint carrying no config has to be read. But both shipped
-  // LTX-2.5 DiTs DO carry one, in `__metadata__["config"]["transformer"]`, and it
-  // states things no shape encodes:
+  // a ComfyUI checkpoint carrying no config has to be read. A config states
+  // things no shape encodes:
   //
   //     "frequencies_precision": "float64"          -> double_precision_rope
   //     "av_ca_timestep_scale_multiplier": 1000.0   -> default is 1
@@ -434,46 +466,68 @@ std::unique_ptr<Ltx2VideoEngine> Ltx2VideoEngine::Load(const VideoModelParams& p
   // mirrors `LTXModelConfigurator.from_metadata` (model_configurator.py:19-83)
   // for exactly this; it was simply never reached.
   //
-  // The declared config is adopted only when it produces the IDENTICAL weight
-  // contract — which is what proves it describes THIS file rather than another
-  // checkpoint's config pasted into it. A disagreement is refused by name.
-  if (dit_file.Metadata().count("config") != 0) {
-    nlohmann::json config = Ltx2ReadCheckpointConfig(dit_file);
-    // THE UNPORTED FLAGS ARE CLEARED IN THE COPY, NOT ARGUED WITH.
-    // `ParseLtx2DitParams` refuses `use_keyframes_abs_pos_embedding` by name
-    // (ltx2.cpp:191-196), and both shipped LTX-2.5 DiTs declare it — so reading
-    // the declared config would refuse every real checkpoint, including the ones
-    // `Ltx2LoadDitFromSafetensors` has just loaded under
-    // `allow_unported_modules`. Clearing it here is the SAME move the loader
-    // makes for `use_prompt_adaln_single`: the flag is cleared for the CONTRACT,
-    // the module stays unported, and the DiT checkpoint's `unported` list still
-    // names it. Without the opt-in the parse throws, which is the refusal.
-    if (dit_options.allow_unported_modules && config.contains("transformer") &&
-        config["transformer"].is_object()) {
-      config["transformer"]["use_keyframes_abs_pos_embedding"] = false;
-    }
-    nlohmann::json wrapper;
-    wrapper["config"] = config;
-    Ltx2DitParams declared = ParseLtx2DitParams(wrapper);
-    // The one flag the L2 contract clears, mirroring the loader
-    // (ltx2_loader.cpp: "cleared for the CONTRACT only").
-    declared.use_prompt_adaln_single = false;
-    const std::vector<Ltx2TensorSpec> from_shapes = EnumerateLtx2DitTensors(im.dit.params);
-    const std::vector<Ltx2TensorSpec> from_config = EnumerateLtx2DitTensors(declared);
-    bool same = from_shapes.size() == from_config.size();
-    for (size_t i = 0; same && i < from_shapes.size(); ++i) {
-      same = from_shapes[i].name == from_config[i].name &&
-             from_shapes[i].shape == from_config[i].shape;
-    }
-    if (!same) {
-      Fail(
-          "the DiT checkpoint's own __metadata__[\"config\"][\"transformer\"] describes a "
-          "DIFFERENT weight contract from the one its tensor shapes describe. Refusing "
-          "rather than preferring either: the config decides values no shape can see "
-          "(frequencies_precision, av_ca_timestep_scale_multiplier, the positional-embedding "
-          "bounds), so taking the shapes would render with the wrong RoPE and taking the "
-          "config would bind the wrong tensors.");
-    }
+  // AND ONLY ONE OF THE TWO SHIPPED LTX-2.5 DiTs CARRIES ONE. An earlier revision
+  // of this comment said "both shipped LTX-2.5 DiTs DO carry one". That was FALSE
+  // and it mattered, because the copy it was false about is the one phases L1-L6
+  // gated against and the one L8 ran on the GPU. Read from the files on the NAS,
+  // 2026-08-12:
+  //
+  //   Lightricks/LTX-2.5 ...-transformer-nvfp4.safetensors
+  //       __metadata__ = ['config','gemma_source_checkpoint','license',
+  //                       'model_version']                       -> declares one
+  //   vonkaiser/LTX-2.5-FP8-NVFP4 ltx-2.5-22b-distilled-fp8.safetensors
+  //       has __metadata__ key: FALSE                            -> declares NONE
+  //
+  // So the adoption below never executed for the FP8 arm, and its DiT silently
+  // took `av_ca_timestep_scale_multiplier = 1` (ltx2.h:106) and
+  // `double_precision_rope = false` (ltx2.h:112) against LTX-2.5's declared 1000
+  // and float64. That is a different model, not a different precision, and
+  // nothing said so.
+  //
+  // THE REPAIR IS THAT A DiT WITHOUT A CONFIG IS REFUSED, not defaulted. The
+  // caller supplies one through `dit_config_path` and it is adopted through the
+  // IDENTICAL weight-contract check the declared path uses. `model_version` was
+  // already treated this way one block down — never defaulted, supplied by an
+  // extra when the file carries none — and this is the same rule applied to the
+  // configuration that decides the arithmetic rather than the schedule.
+  //
+  // A config is adopted only when it produces the IDENTICAL weight contract —
+  // which is what proves it describes THIS file rather than another checkpoint's
+  // config pasted into it. A disagreement is refused by name.
+  const std::string config_path = VideoExtra(params.extras, kLtx2DitConfigPathExtra);
+  const bool declares_config = dit_file.Metadata().count("config") != 0;
+  if (declares_config && !config_path.empty()) {
+    Fail("the DiT checkpoint declares its own __metadata__[\"config\"] and the '" +
+         std::string(kLtx2DitConfigPathExtra) + "' extra names '" + config_path +
+         "'. Refusing rather than preferring one: they decide values no shape can see "
+         "(frequencies_precision, av_ca_timestep_scale_multiplier, the "
+         "positional-embedding bounds), so the wrong choice renders with the wrong RoPE "
+         "instead of failing. Drop the extra to use the checkpoint's own config.");
+  }
+  if (!declares_config && config_path.empty()) {
+    Fail("the DiT checkpoint declares no __metadata__[\"config\"][\"transformer\"], and no '" +
+         std::string(kLtx2DitConfigPathExtra) +
+         "' extra was supplied. The tensor SHAPES resolve the geometry but not the values "
+         "no shape encodes: double_precision_rope would default to false and "
+         "av_ca_timestep_scale_multiplier to 1, where LTX-2.5 declares float64 and 1000. "
+         "Both move every RoPE angle and every audio<->video modulation, so defaulting them "
+         "renders a DIFFERENT MODEL confidently. This is the shape the shipped vonkaiser FP8 "
+         "DiT is in: it carries no __metadata__ at all. Supply the config rather than "
+         "inheriting a default that contradicts the model family.");
+  }
+  {
+    const nlohmann::json config =
+        declares_config ? Ltx2ReadCheckpointConfig(dit_file)
+                        : ReadJsonFile(kLtx2DitConfigPathExtra, config_path);
+    const std::string source =
+        declares_config
+            ? std::string("the DiT checkpoint's own __metadata__[\"config\"][\"transformer\"]")
+            : "the '" + std::string(kLtx2DitConfigPathExtra) + "' file '" + config_path + "'";
+    // `Ltx2AdoptDeclaredDitParams` (ltx2_loader.h) is the ONE place the adoption
+    // rule lives, because the device gate drives `Ltx2StreamDitToDevice` without
+    // this engine and owes the same check; two copies would be two rules.
+    const Ltx2DitParams declared = Ltx2AdoptDeclaredDitParams(
+        config, im.dit.params, dit_options.allow_unported_modules, source);
     im.dit.params = declared;
   }
 

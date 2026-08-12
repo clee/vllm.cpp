@@ -74,6 +74,10 @@
 
 #include "vllm/multimodal/video_engine.h"
 
+namespace vllm {
+struct Ltx2DitParams;
+}  // namespace vllm
+
 namespace vllm::multimodal {
 
 // The stable registry name this family is reached under
@@ -103,6 +107,26 @@ inline constexpr char kLtx2PipelineKindExtra[] = "pipeline_kind";
 // `__metadata__`. Present for a checkpoint that carries none; it never silently
 // replaces one that does, and a mismatch between the two is reported.
 inline constexpr char kLtx2ModelVersionExtra[] = "model_version";
+
+// The DiT's `{"transformer": {...}}` configuration, as a JSON FILE, for a
+// checkpoint whose `__metadata__` carries none.
+//
+// MEASURED 2026-08-12, and it is why this extra exists: of the two shipped
+// LTX-2.5 DiTs only the first-party NVFP4 one carries `__metadata__` at all.
+// `vonkaiser/LTX-2.5-FP8-NVFP4`'s FP8 DiT — the copy every phase before L6 gated
+// against and the one L8 ran on the GPU — has NO `__metadata__` key whatsoever.
+// Without a config the geometry still resolves from SHAPES, but the values no
+// shape encodes fall back to the parser's defaults: `double_precision_rope =
+// false` and `av_ca_timestep_scale_multiplier = 1`, against LTX-2.5's declared
+// `float64` and `1000`. Both move every RoPE angle and every audio<->video
+// modulation, so a silent default is a DIFFERENT MODEL rendering confidently.
+//
+// So a DiT that declares no config is REFUSED unless this extra names one. The
+// file holds the same object the shipped checkpoints put in
+// `__metadata__["config"]` — `{"transformer": {...}}` — and it is adopted through
+// the IDENTICAL weight-contract check the declared path uses, so a config
+// belonging to another checkpoint is refused rather than bound.
+inline constexpr char kLtx2DitConfigPathExtra[] = "dit_config_path";
 
 // Proceed past the module families the L2 contract does not carry
 // (`prompt_adaln_single`, `keyframes_abs_pos_embedding`, the two embeddings
@@ -139,6 +163,18 @@ class Ltx2VideoEngine : public VideoEngine {
   // one thing a rendered clip cannot be inspected for.
   const std::string& model_version() const;
   const std::string& pipeline_kind() const;
+
+  // The DiT parameters THIS ENGINE LOADED — the ones its forward actually runs
+  // under, after the checkpoint's own declared config has been adopted.
+  //
+  // Exposed because the values that config decides are exactly the ones a
+  // rendered clip cannot be inspected for and a SHAPE cannot see:
+  // `double_precision_rope` and `av_ca_timestep_scale_multiplier` move every
+  // RoPE angle and every audio<->video modulation while leaving the tensor set
+  // byte-identical. A test that re-derives them from the file and asserts on its
+  // own local copy proves nothing about what the engine bound; this accessor is
+  // what lets it assert on the engine.
+  const Ltx2DitParams& dit_params() const;
 
  private:
   Ltx2VideoEngine();

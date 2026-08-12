@@ -447,6 +447,162 @@ TEST_CASE("ltx2 video: an unknown extra is refused, not ignored") {
   }
 }
 
+// ─── the config the SHAPES cannot see ───────────────────────────────────────
+//
+// WHY THESE ASSERT ON THE ENGINE AND NOT ON A LOCAL. The L7 repair is one line in
+// `Ltx2VideoEngine::Load` — `im.dit.params = declared;` — and before this case
+// existed, DELETING it left the whole suite green: 13 cases / 142 assertions
+// SUCCESS with the engine silently back to `double_precision_rope = false` and
+// `av_ca_timestep_scale_multiplier = 1`. The only case that touched those values
+// re-derived them from the file into its own local `declared` and asserted on
+// THAT, which is a statement about `ParseLtx2DitParams`, not about what the
+// engine bound. Spec §7.0(c) exactly: a fixture that cannot separate right from
+// wrong. `Ltx2VideoEngine::dit_params()` exists so this can assert on the loaded
+// engine, and the manifest control below is what makes the assertion non-vacuous.
+TEST_CASE("ltx2 video: the engine ADOPTS the checkpoint's declared config") {
+  Workspace ws;
+  const std::unique_ptr<vllm::multimodal::VideoEngine> seam =
+      vllm::multimodal::LoadVideoEngine(FixtureParams(ws.paths));
+  const auto* engine = dynamic_cast<const vllm::multimodal::Ltx2VideoEngine*>(seam.get());
+  REQUIRE(engine != nullptr);
+
+  // THE CONTROL, first: what the SHAPES alone resolve from the very same file.
+  // Without this the assertions below could be satisfied by the defaults, and
+  // the case would gate nothing.
+  const vllm::SafetensorsFile file = vllm::SafetensorsFile::Open(ws.paths.dit);
+  vllm::Ltx2DitQuant quant = vllm::Ltx2DitQuant::kNvfp4;
+  const vllm::Ltx2DitParams from_shapes =
+      vllm::Ltx2ParseDitParamsFromCheckpoint(file, &quant);
+  REQUIRE_FALSE(from_shapes.double_precision_rope);
+  REQUIRE(from_shapes.av_ca_timestep_scale_multiplier == 1);
+
+  // ... and what the ENGINE actually loaded, which is the whole point.
+  const vllm::Ltx2DitParams& got = engine->dit_params();
+  CHECK(got.double_precision_rope);                     // "frequencies_precision": "float64"
+  CHECK(got.av_ca_timestep_scale_multiplier == 1000);   // declared 1000.0, default 1
+  CHECK(got.timestep_scale_multiplier == 1000);
+  CHECK(got.positional_embedding_theta == doctest::Approx(10000.0).scale(0.0));
+  CHECK(got.positional_embedding_max_pos == std::vector<int64_t>{20, 2048, 2048});
+  CHECK(got.audio_positional_embedding_max_pos == std::vector<int64_t>{20});
+  CHECK(got.norm_eps == doctest::Approx(1e-6).scale(0.0));
+  // The geometry must still be the file's, or the config was bound to the wrong
+  // checkpoint and the contract check below did not do its job.
+  CHECK(got.num_layers == from_shapes.num_layers);
+  CHECK(got.inner_dim() == from_shapes.inner_dim());
+  CHECK(got.audio_inner_dim() == from_shapes.audio_inner_dim());
+}
+
+TEST_CASE("ltx2 video: a declared config that disagrees with the SHAPES is refused") {
+  // The other half of the L7 repair, and it was unexercised: adoption is allowed
+  // only when the config reproduces the IDENTICAL weight contract, because a
+  // config pasted in from another checkpoint would otherwise bind the wrong
+  // tensors while looking like a more precise answer.
+  Workspace ws;
+  const std::string mismatched = ws.root + "/config_disagrees.safetensors";
+  ltx2_fixture::ReducedDitOptions options;
+  // The TENSORS are written from `ReducedDitParams()`; the CONFIG claims one
+  // more layer. Nothing about the file's bytes changes.
+  options.transformer_overrides["num_layers"] = ltx2_fixture::ReducedDitParams().num_layers + 1;
+  ltx2_fixture::WriteReducedDit(ltx2_fixture::ReducedDitParams(), mismatched, options);
+  vllm::multimodal::VideoModelParams mp = FixtureParams(ws.paths);
+  mp.dit_path = mismatched;
+  try {
+    (void)vllm::multimodal::LoadVideoEngine(mp);
+    FAIL("a config describing a different weight contract must be refused");
+  } catch (const std::exception& e) {
+    const std::string msg = e.what();
+    INFO(msg);
+    CHECK(msg.find("DIFFERENT weight contract") != std::string::npos);
+  }
+}
+
+// The FP8 arm. MEASURED from the NAS 2026-08-12: `vonkaiser/LTX-2.5-FP8-NVFP4`'s
+// `ltx-2.5-22b-distilled-fp8.safetensors` has NO `__metadata__` key at all, while
+// the first-party NVFP4 DiT carries `['config','gemma_source_checkpoint',
+// 'license','model_version']`. So for the copy L1-L6 gated against and L8 ran on
+// the GPU, the adoption branch never executed and the DiT took the shape defaults
+// — `double_precision_rope = false`, `av_ca_timestep_scale_multiplier = 1` —
+// against LTX-2.5's declared float64 and 1000.
+TEST_CASE("ltx2 video: a DiT that declares NO config is refused, never defaulted") {
+  Workspace ws;
+  const vllm::Ltx2DitParams params = ltx2_fixture::ReducedDitParams();
+  const std::string bare = ws.root + "/no_metadata.safetensors";
+  ltx2_fixture::ReducedDitOptions options;
+  options.declare_config = false;
+  options.declare_model_version = false;  // the shipped FP8 file carries neither
+  ltx2_fixture::WriteReducedDit(params, bare, options);
+  // The file really is in that shape, or this case proves nothing.
+  const vllm::SafetensorsFile file = vllm::SafetensorsFile::Open(bare);
+  REQUIRE(file.Metadata().count("config") == 0);
+  REQUIRE(file.Metadata().count("model_version") == 0);
+
+  vllm::multimodal::VideoModelParams mp = FixtureParams(ws.paths);
+  mp.dit_path = bare;
+
+  SUBCASE("with nothing supplied, the load refuses BY NAME") {
+    try {
+      (void)vllm::multimodal::LoadVideoEngine(mp);
+      FAIL("a DiT with no declared config must be refused, not given the defaults");
+    } catch (const std::exception& e) {
+      const std::string msg = e.what();
+      INFO(msg);
+      CHECK(msg.find(vllm::multimodal::kLtx2DitConfigPathExtra) != std::string::npos);
+      CHECK(msg.find("double_precision_rope") != std::string::npos);
+      CHECK(msg.find("av_ca_timestep_scale_multiplier") != std::string::npos);
+    }
+  }
+
+  SUBCASE("supplied explicitly, it loads and the ENGINE runs under it") {
+    const std::string cfg = ws.root + "/dit_config.json";
+    ltx2_fixture::WriteDitConfigJson(params, cfg);
+    mp.extras[vllm::multimodal::kLtx2DitConfigPathExtra] = cfg;
+    mp.extras[vllm::multimodal::kLtx2ModelVersionExtra] = "2.5";
+    const std::unique_ptr<vllm::multimodal::VideoEngine> seam =
+        vllm::multimodal::LoadVideoEngine(mp);
+    const auto* engine = dynamic_cast<const vllm::multimodal::Ltx2VideoEngine*>(seam.get());
+    REQUIRE(engine != nullptr);
+    CHECK(engine->dit_params().double_precision_rope);
+    CHECK(engine->dit_params().av_ca_timestep_scale_multiplier == 1000);
+  }
+
+  SUBCASE("a supplied config that disagrees with the SHAPES is refused too") {
+    const std::string cfg = ws.root + "/dit_config_wrong.json";
+    nlohmann::json overrides;
+    overrides["num_layers"] = params.num_layers + 1;
+    ltx2_fixture::WriteDitConfigJson(params, cfg, overrides);
+    mp.extras[vllm::multimodal::kLtx2DitConfigPathExtra] = cfg;
+    mp.extras[vllm::multimodal::kLtx2ModelVersionExtra] = "2.5";
+    try {
+      (void)vllm::multimodal::LoadVideoEngine(mp);
+      FAIL("a supplied config binding a different contract must be refused");
+    } catch (const std::exception& e) {
+      const std::string msg = e.what();
+      INFO(msg);
+      CHECK(msg.find("DIFFERENT weight contract") != std::string::npos);
+      CHECK(msg.find(vllm::multimodal::kLtx2DitConfigPathExtra) != std::string::npos);
+    }
+  }
+}
+
+TEST_CASE("ltx2 video: a checkpoint config AND a supplied one are refused, not ordered") {
+  // Both present is a genuine ambiguity between two answers to a question no
+  // shape can settle, so it is refused for the same reason two disagreeing
+  // `model_version`s are.
+  Workspace ws;
+  const std::string cfg = ws.root + "/dit_config_dup.json";
+  ltx2_fixture::WriteDitConfigJson(ltx2_fixture::ReducedDitParams(), cfg);
+  vllm::multimodal::VideoModelParams mp = FixtureParams(ws.paths);
+  mp.extras[vllm::multimodal::kLtx2DitConfigPathExtra] = cfg;
+  try {
+    (void)vllm::multimodal::LoadVideoEngine(mp);
+    FAIL("two configs must be refused rather than silently ordered");
+  } catch (const std::exception& e) {
+    const std::string msg = e.what();
+    INFO(msg);
+    CHECK(msg.find("Refusing rather than preferring one") != std::string::npos);
+  }
+}
+
 TEST_CASE("ltx2 video: the recipe comes from the CHECKPOINT's own model_version") {
   Workspace ws;
   const std::unique_ptr<vllm::multimodal::VideoEngine> seam =

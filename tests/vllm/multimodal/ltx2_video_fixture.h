@@ -234,36 +234,12 @@ inline vllm::Ltx2DitParams ReducedDitParams() {
   return p;
 }
 
-// Write the DiT in the shipped ComfyUI + FP8 shape: every rank-2 `*.weight`
-// becomes F8_E4M3 with an F32 `<name>_scale` sidecar, the scale-shift tables stay
-// F32 (the shipped file stores them F32), and everything else is BF16 — which is
-// exactly the dtype split `vonkaiser/LTX-2.5-FP8-NVFP4` carries.
-inline void WriteReducedDit(const vllm::Ltx2DitParams& params, const std::string& path,
-                            const std::string& model_version = "2.5.0") {
-  std::vector<Entry> entries;
-  const std::string prefix = vllm::kLtx2DitCheckpointPrefix;
-  for (const vllm::Ltx2TensorSpec& spec : vllm::EnumerateLtx2DitTensors(params)) {
-    int64_t numel = 1;
-    for (const int64_t d : spec.shape) numel *= d;
-    const std::string full = prefix + spec.name;
-    const bool table = spec.name.find("scale_shift_table") != std::string::npos;
-    const bool quantizable = spec.shape.size() == 2 && !table &&
-                             spec.name.size() > 7 &&
-                             spec.name.compare(spec.name.size() - 7, 7, ".weight") == 0;
-    std::vector<float> values = Param("ltx2.dit." + spec.name, numel, 0.08);
-    if (table) {
-      entries.push_back({full, "F32", spec.shape, std::move(values)});
-    } else if (quantizable) {
-      // The FP8 arm's own convention: bytes carry the SHAPE of the weight and the
-      // per-tensor F32 scale carries its magnitude.
-      constexpr float kScale = 0.5F;
-      for (float& v : values) v /= kScale;
-      entries.push_back({full, "F8_E4M3", spec.shape, std::move(values)});
-      entries.push_back({full + "_scale", "F32", {}, {kScale}});
-    } else {
-      entries.push_back({full, "BF16", spec.shape, std::move(values)});
-    }
-  }
+// The DiT's `{"transformer": {...}}` object, exactly as the first-party
+// `Lightricks/LTX-2.5` DiT carries it in `__metadata__["config"]`. Built
+// separately from the file writer because two callers need it: the writer, and a
+// test that has to hand the SAME config to the engine through the
+// `dit_config_path` extra for a checkpoint that declares none.
+inline nlohmann::json ReducedDitTransformerConfig(const vllm::Ltx2DitParams& params) {
   nlohmann::json transformer;
   transformer["_class_name"] = "AVTransformer3DModel";
   // Every key `LTXModelConfigurator.from_metadata` runs `check_config_value` on
@@ -314,12 +290,90 @@ inline void WriteReducedDit(const vllm::Ltx2DitParams& params, const std::string
   transformer["ff_bias"] = params.ff_bias;
   transformer["rope_type"] = "split";
   transformer["use_middle_indices_grid"] = params.use_middle_indices_grid;
+  return transformer;
+}
+
+// How a fixture DiT declares itself. Every field mirrors a shape a SHIPPED file
+// is actually in, measured 2026-08-12 — none of them is a hypothetical:
+//
+//   declare_config = true  + declare_model_version = true
+//       the first-party `Lightricks/LTX-2.5` NVFP4 DiT
+//       (`__metadata__` = config, gemma_source_checkpoint, license, model_version)
+//   declare_config = false + declare_model_version = false
+//       the `vonkaiser/LTX-2.5-FP8-NVFP4` FP8 DiT, which carries NO
+//       `__metadata__` key at all
+//
+// `transformer_overrides` is merged into the config AFTER it is built and AFTER
+// the tensors have been written from `params`, which is how a test makes a
+// declared config DISAGREE with the shapes beside it.
+struct ReducedDitOptions {
+  std::string model_version = "2.5.0";
+  bool declare_config = true;
+  bool declare_model_version = true;
+  nlohmann::json transformer_overrides = nlohmann::json::object();
+};
+
+// Write the DiT in the shipped ComfyUI + FP8 shape: every rank-2 `*.weight`
+// becomes F8_E4M3 with an F32 `<name>_scale` sidecar, the scale-shift tables stay
+// F32 (the shipped file stores them F32), and everything else is BF16 — which is
+// exactly the dtype split `vonkaiser/LTX-2.5-FP8-NVFP4` carries.
+inline void WriteReducedDit(const vllm::Ltx2DitParams& params, const std::string& path,
+                            const ReducedDitOptions& options) {
+  std::vector<Entry> entries;
+  const std::string prefix = vllm::kLtx2DitCheckpointPrefix;
+  for (const vllm::Ltx2TensorSpec& spec : vllm::EnumerateLtx2DitTensors(params)) {
+    int64_t numel = 1;
+    for (const int64_t d : spec.shape) numel *= d;
+    const std::string full = prefix + spec.name;
+    const bool table = spec.name.find("scale_shift_table") != std::string::npos;
+    const bool quantizable = spec.shape.size() == 2 && !table &&
+                             spec.name.size() > 7 &&
+                             spec.name.compare(spec.name.size() - 7, 7, ".weight") == 0;
+    std::vector<float> values = Param("ltx2.dit." + spec.name, numel, 0.08);
+    if (table) {
+      entries.push_back({full, "F32", spec.shape, std::move(values)});
+    } else if (quantizable) {
+      // The FP8 arm's own convention: bytes carry the SHAPE of the weight and the
+      // per-tensor F32 scale carries its magnitude.
+      constexpr float kScale = 0.5F;
+      for (float& v : values) v /= kScale;
+      entries.push_back({full, "F8_E4M3", spec.shape, std::move(values)});
+      entries.push_back({full + "_scale", "F32", {}, {kScale}});
+    } else {
+      entries.push_back({full, "BF16", spec.shape, std::move(values)});
+    }
+  }
+  nlohmann::json metadata = nlohmann::json::object();
+  if (options.declare_config) {
+    nlohmann::json transformer = ReducedDitTransformerConfig(params);
+    transformer.update(options.transformer_overrides);
+    nlohmann::json config;
+    config["transformer"] = transformer;
+    metadata["config"] = config.dump();
+  }
+  if (options.declare_model_version) metadata["model_version"] = options.model_version;
+  // An EMPTY object writes no `__metadata__` key at all, which is the shape the
+  // shipped vonkaiser FP8 DiT is in — not an empty one.
+  WriteSafetensors(entries, metadata.empty() ? std::string() : metadata.dump(), path);
+}
+
+inline void WriteReducedDit(const vllm::Ltx2DitParams& params, const std::string& path,
+                            const std::string& model_version = "2.5.0") {
+  ReducedDitOptions options;
+  options.model_version = model_version;
+  WriteReducedDit(params, path, options);
+}
+
+// The same `{"transformer": {...}}` object as a standalone JSON FILE, which is
+// what the engine's `dit_config_path` extra reads.
+inline void WriteDitConfigJson(const vllm::Ltx2DitParams& params, const std::string& path,
+                               const nlohmann::json& transformer_overrides =
+                                   nlohmann::json::object()) {
+  nlohmann::json transformer = ReducedDitTransformerConfig(params);
+  transformer.update(transformer_overrides);
   nlohmann::json config;
   config["transformer"] = transformer;
-  nlohmann::json metadata;
-  metadata["config"] = config.dump();
-  metadata["model_version"] = model_version;
-  WriteSafetensors(entries, metadata.dump(), path);
+  WriteFileBytes(path, config.dump());
 }
 
 // ── the Conv video VAE ─────────────────────────────────────────────────────

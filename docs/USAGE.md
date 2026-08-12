@@ -1254,9 +1254,23 @@ knobs from `extras`. H3 takes `partition`. LTX-2.5 takes
 `audio_prompt_embeds_path` (the audio stream's conditioning, the twin of the
 seam's `prompt_embeds_path`, which carries the video stream), `pipeline_kind`
 (default `distilled_two_stage`), `model_version` (only for a checkpoint that
-declares none), `allow_unported_modules`, `max_phase`, `upsampler_path` and
-`duration_head_path`. An extra a family does not define is refused, never
-ignored.
+declares none), `dit_config_path`, `allow_unported_modules`, `max_phase`,
+`upsampler_path` and `duration_head_path`. An extra a family does not define is
+refused, never ignored.
+
+`dit_config_path` names a JSON file holding the DiT's `{"transformer": {...}}`
+configuration, and it exists because only one of the two shipped LTX-2.5 DiTs
+carries one. The first-party NVFP4 file embeds it in `__metadata__["config"]`;
+the ungated `vonkaiser/LTX-2.5-FP8-NVFP4` FP8 DiT has no `__metadata__` at all.
+Tensor shapes resolve the geometry but not the values no shape encodes, so
+without a config `double_precision_rope` would default to false and
+`av_ca_timestep_scale_multiplier` to 1, where LTX-2.5 declares `float64` and
+`1000`. Both move every RoPE angle and every audio-to-video modulation, so a DiT
+that declares no config is refused until one is supplied rather than rendered
+under defaults that contradict the model family. A supplied config is adopted
+only when it reproduces the identical weight contract the shapes describe, and
+supplying one for a checkpoint that already declares its own is refused rather
+than ordered.
 
 The LTX-2.5 arm runs on the CPU in f32 and on CUDA in bf16. `device = 0` takes
 the f32 parity forward; `device = 1` stages the DiT to the GPU one tensor at a
