@@ -44,12 +44,27 @@
 //    CPU forward behind a CUDA-looking handle, because that substitution is what
 //    would make every later timing and every "it ran on the GPU" claim false.
 //
-// 2. A PROMPT with no text tower. Phase L6 loads the caption projections and the
-//    embedded tokenizer, and records the Gemma-4 TOWER itself as owed
-//    (ltx2_loader.h:318-324) — so this engine cannot turn a prompt string into
-//    hidden states. `has_encoder()` is therefore false and a prompt-carrying
-//    request is refused BY NAME. Conditioning comes from prompt-embeds, which is
-//    the seam's own documented fallback (video_engine.h:55-57).
+// 2. A PROMPT, whose refusal has MOVED and is stated where it now lives.
+//    Phase L10 built the text tower: the embedded tokenizer reaches a prompt
+//    string, the torchao-NVFP4 Gemma-4 tower is materialized onto Gemma4Weights,
+//    it runs, all 49 hidden states come out within the oracle's own bf16 noise
+//    floor, and the aggregation and both caption projections turn them into the
+//    4096-wide video and 2048-wide audio conditioning streams
+//    (`Ltx2EncodePromptToConditioning`).
+//
+//    What is missing is the last hop. Upstream does not hand the projections to
+//    cross-attention: each stream goes through an `Embeddings1DConnector` first
+//    (embeddings_processor.py:70-117). Its math IS ported
+//    (`Ltx2ConnectorForward`); its WEIGHTS are not loaded — they ship inside the
+//    DiT file as `video_embeddings_connector.*` / `audio_embeddings_connector.*`
+//    and remain among the modules `Ltx2LoadDitFromSafetensors` refuses
+//    (ltx2_loader.h:96-99).
+//
+//    So `has_encoder()` is STILL false, and deliberately: the tower runs, but its
+//    output cannot reach the DiT, and a `true` here would promise a render that
+//    conditioning cannot complete. Flipping it is one change away — bind those
+//    tensors — and that change owns the flag. Conditioning meanwhile comes from
+//    prompt-embeds, the seam's own documented fallback (video_engine.h:55-57).
 //
 // 3. Any pipeline kind / model version the recipe table does not carry.
 //    `ResolveLtx2PipelineRecipe` already throws rather than defaulting

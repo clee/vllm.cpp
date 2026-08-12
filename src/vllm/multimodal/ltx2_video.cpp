@@ -597,12 +597,42 @@ std::unique_ptr<Ltx2VideoEngine> Ltx2VideoEngine::Load(const VideoModelParams& p
   // turned into hidden states here. Saying so at LOAD, when the caller supplied
   // one, is better than accepting the path and refusing every request later.
   if (!params.encoder_path.empty()) {
+    // The refusal STANDS, and its REASON has moved. Saying so precisely matters
+    // more than the refusal itself: the previous message named the Gemma-4 tower
+    // as the missing piece, and that is no longer true.
+    //
+    // What phase L10 built: the embedded tokenizer reaches a prompt string
+    // (Ltx2TokenizeGemmaPrompt, token-exact against HuggingFace on the shipped
+    // 262144-entry vocab), the torchao-NVFP4 tower is materialized onto
+    // Gemma4Weights (Ltx2LoadGemmaTowerFromSafetensors), it runs and produces all
+    // 49 hidden states within the oracle's own bf16 noise floor, and the existing
+    // aggregation and both caption projections turn those into the two
+    // conditioning streams (Ltx2EncodePromptToConditioning), at 4096 and 2048 —
+    // which are exactly `attn2.to_k.weight [4096, 4096]` and the audio arm's
+    // 2048 in the shipped DiT.
+    //
+    // What is STILL missing is the last hop between them. Upstream does not feed
+    // the projections to cross-attention directly: it passes each stream through
+    // an `Embeddings1DConnector` first (embeddings_processor.py:70-117). The MATH
+    // of that connector is ported — `Ltx2ConnectorForward` — but its WEIGHTS are
+    // not loaded: they ship inside the DiT file as
+    // `video_embeddings_connector.*` / `audio_embeddings_connector.*`, and
+    // `Ltx2LoadDitFromSafetensors` still lists them among the modules it REFUSES
+    // (ltx2_loader.h:96-99). So the conditioning this engine could now compute
+    // has nowhere to go.
+    //
+    // Refusing here rather than at request time is unchanged: a caller who
+    // supplied an encoder_path finds out while they can still choose.
     Fail(
-        "encoder_path was supplied, but this family cannot encode a prompt yet: phase L6 "
-        "loads the caption projections and the embedded tokenizer and records the Gemma-4 "
-        "TOWER itself as owed (ltx2_loader.h:318-324), so there is nothing to produce the "
-        "49 hidden states `Ltx2TextFeatureExtractorForward` consumes. Condition through "
-        "prompt_embeds_path + the '" +
+        "encoder_path was supplied, and the text tower it names can now be RUN — phase L10 "
+        "tokenizes a prompt with the embedded tokenizer, materializes the torchao-NVFP4 "
+        "Gemma-4 tower, produces all 49 hidden states and projects them to the 4096-wide "
+        "video and 2048-wide audio streams. What is missing is the hop from there to "
+        "cross-attention: upstream routes both streams through an Embeddings1DConnector "
+        "first, whose math is ported (Ltx2ConnectorForward) but whose WEIGHTS live in the "
+        "DiT file as video_embeddings_connector.* / audio_embeddings_connector.* and are "
+        "still among the modules Ltx2LoadDitFromSafetensors refuses (ltx2_loader.h:96-99). "
+        "Condition through prompt_embeds_path + the '" +
         std::string(kLtx2AudioPromptEmbedsExtra) +
         "' extra meanwhile; that is the seam's own documented fallback.");
   }

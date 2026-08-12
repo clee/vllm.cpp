@@ -1250,7 +1250,24 @@ Examples: `examples/cli` ✅ (C-API client), `examples/server` ✅ (OpenAI serve
       (`Gemma4Weights`) is not
       wired — `ltx2_text_encoder.h` declares no tower contract, so L6 loads the two
       caption projections, the asset pack and the geometry, and VALIDATES every
-      tower module without materializing it.
+      tower module without materializing it. **CLOSED at L10 (2026-08-12):**
+      `Ltx2LoadGemmaTowerFromSafetensors` (ltx2_text_encoder.h/.cpp) materializes
+      the tower onto `Gemma4Weights`, reusing L6's
+      `Ltx2DequantTorchaoNvfp4ToBf16` unchanged. It reads the FLAT
+      `model.layers.{i}.*` names the LTX file ships — not the
+      `model.language_model.layers.{i}.*` form `gemma4_weights.cpp` reads, which
+      is why the tower could not simply go through that loader — and resolves
+      each layer's geometry from `layer_types`, `global_head_dim` and
+      `num_global_key_value_heads` rather than from the stored tensor widths,
+      which are HALF the logical ones under NVFP4. It REFUSES by name: a PLE
+      config against a checkpoint with no PLE tensors, `num_kv_shared_layers`
+      != 0, a `v_proj` present or absent against what `attention_k_eq_v`
+      declares, and a module in neither the BF16 nor the torchao-NVFP4 form.
+      The Gemma config is an INPUT and is never inferred: the shipped
+      `vonkaiser` build has NO `__metadata__` at all, and `layer_types`,
+      `global_head_dim`, `num_global_key_value_heads`, `attention_k_eq_v` and
+      both `rope_parameters` entries each move every hidden state while leaving
+      the tensor set byte-identical.
     * **Spec:** [ltx-2.5 spec](specs/ltx-2-5.md) §1.4 and §6 (L6). Lifecycle:
       shipped (host + load-time device staging). Owner: the LTX-2.5 row.
     * **OWED, FOUND 2026-08-12 by the phase-L8 GB10 run (entry 20 below).** The

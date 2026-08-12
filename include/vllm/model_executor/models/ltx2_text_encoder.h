@@ -90,11 +90,15 @@
 
 #include <nlohmann/json.hpp>
 
+#include "vllm/model_executor/models/gemma4.h"
 #include "vt/dtype.h"
 
 namespace vllm {
 
 class SafetensorsFile;
+namespace tok {
+class Tokenizer;
+}  // namespace tok
 
 // ─────────────────────────── the hidden-state contract ───────────────────────
 
@@ -371,5 +375,190 @@ inline constexpr const char* kLtx2GemmaAssetPrefix = "hf_asset__";
 // gets the tensors, with `has_config` reporting which happened.
 Ltx2GemmaAssets Ltx2LoadGemmaAssets(const SafetensorsFile& file,
                                     bool require_config = true);
+
+// ─────────────────────── the prompt -> tokens hand-off ───────────────────────
+//
+// `LTXGemmaTokenizer.tokenize_with_weights` (tokenizer.py:31-59), which is the
+// ONLY tokenization on the conditioning path. Both references agree that no chat
+// template is applied here — the template belongs to the separate prompt
+// ENHANCEMENT path (base_encoder.py:100, diffusers pipeline_ltx2.py:624), which
+// produces a plain string that then comes back through this function.
+
+// gemma_assets.py:162 — `TOKENIZER_MAX_LENGTH = 1024`, bound at
+// base_encoder.py:231-236. Confirmed independently by diffusers, whose
+// `_get_gemma_prompt_embeds` defaults `max_sequence_length: int = 1024`
+// (pipeline_ltx2.py:304).
+inline constexpr int64_t kLtx2GemmaTokenizerMaxLength = 1024;
+
+// base_encoder.py:235 — `PaddingSide.LEFT`. diffusers sets the same thing
+// explicitly with the comment "Gemma expects left padding for chat-style
+// prompts" (pipeline_ltx2.py:328-329).
+//
+// This is why `Ltx2GemmaPromptTokens` reports `first_valid` rather than assuming
+// position 0: the valid tokens are the TAIL, and their absolute positions start
+// at the pad count, not at zero.
+enum class Ltx2GemmaPaddingSide { kLeft, kRight };
+
+// One tokenized prompt, in upstream's `[max_length]` shape.
+struct Ltx2GemmaPromptTokens {
+  // [max_length]. Pad positions carry `pad_id`.
+  std::vector<int32_t> input_ids;
+  // [max_length] in {0, 1} — the second element of upstream's (token, weight)
+  // pairs (tokenizer.py:57-59), used as the attention mask at
+  // base_encoder.py:65-67.
+  std::vector<int32_t> attention_mask;
+  // Index of the first valid token, and how many there are. On the LEFT-padded
+  // default `first_valid` is the pad count and the valid run is the tail.
+  int64_t first_valid = 0;
+  int64_t num_valid = 0;
+  // True when the prompt was longer than `max_length` and lost tokens.
+  bool truncated = false;
+};
+
+// tokenizer.py:31-59, mirrored including the parts that look like details:
+//
+//   * `text.strip()` first (:33). diffusers strips too (pipeline_ltx2.py:333).
+//   * encode with NO special tokens added by the post_processor. The shipped
+//     tokenizer's `post_processor` is a TemplateProcessing whose `special_tokens`
+//     map is EMPTY, so it would add nothing anyway — measured on the shipped
+//     file, not assumed.
+//   * then PREPEND BOS unconditionally if it is not already first (:44-46).
+//     THIS IS WHERE THE TWO REFERENCES DISAGREE and upstream is followed:
+//     `ltx_core` prepends explicitly and says why — "Gemma 3 already emits it
+//     via post_processor; Gemma 4 does not, so we prepend" (tokenizer.py:12-15)
+//     — while diffusers passes `add_special_tokens=True` and relies on the
+//     post_processor (pipeline_ltx2.py:339), which for THIS tokenizer.json adds
+//     nothing. Following diffusers would drop token 0 of every prompt. Recorded
+//     rather than silently resolved: `ltx_core` is the model author's own
+//     runtime and is explicit about the case.
+//   * EOS is never appended (:14).
+//   * truncation happens BEFORE the BOS prepend and again after (:41, :46), so a
+//     maximal prompt loses its LAST token to make room for BOS rather than
+//     losing the BOS.
+//   * pad to exactly `max_length` on `padding_side` (:48-54).
+//
+// Throws std::runtime_error when `bos_id` is negative — upstream raises for the
+// same reason at tokenizer.py:34-36, because a conditioning path with no BOS is
+// a different prompt, not a degraded one.
+Ltx2GemmaPromptTokens Ltx2TokenizeGemmaPrompt(
+    const tok::Tokenizer& tokenizer, const std::string& prompt, int32_t bos_id,
+    int32_t pad_id, int64_t max_length = kLtx2GemmaTokenizerMaxLength,
+    Ltx2GemmaPaddingSide padding_side = Ltx2GemmaPaddingSide::kLeft);
+
+// The two ids upstream reads off the tokenizer/config rather than hardcoding.
+// MEASURED on the shipped checkpoint's own `hf_asset__generation_config.json`:
+// `bos_token_id` 2, `pad_token_id` 0 — and its `tokenizer_json` added_tokens
+// agree (`<pad>` 0, `<eos>` 1, `<bos>` 2).
+struct Ltx2GemmaSpecialIds {
+  int32_t bos_id = -1;
+  int32_t pad_id = -1;
+};
+
+// Resolve the two ids from the asset pack, or throw naming which one is missing.
+// Reads `hf_asset__generation_config.json` first (that is where the checkpoint
+// states them) and falls back to the tokenizer's own added-token table, which is
+// what `LTXGemmaTokenizer` does through `tokenizer.bos_token_id`
+// (tokenizer.py:35) and `tokenizer.pad_token` (:26-27).
+Ltx2GemmaSpecialIds Ltx2ResolveGemmaSpecialIds(const Ltx2GemmaAssets& assets,
+                                               const tok::Tokenizer& tokenizer);
+
+// ───────────────────────────── the Gemma-4 TOWER ─────────────────────────────
+//
+// Phase L6 loaded the two caption projections and the asset pack and recorded
+// "wiring the tower's torchao arm onto `Gemma4Weights` is owed and named as such
+// rather than half-done" (ltx2_loader.h:325-329). This is that wiring.
+//
+// WHERE THE CONFIG COMES FROM, because this checkpoint cannot answer it.
+// The shipped `vonkaiser` NVFP4 build carries NO `__metadata__` block at all, so
+// upstream's own `GemmaAssets.from_single_file` raises on it before reading a
+// tensor (gemma_assets.py:110-114) and there is nothing in the file to read a
+// Gemma config out of. The config is therefore an INPUT, and a caller that has
+// none gets a refusal naming the missing piece rather than a plausible default.
+//
+// The fields that no shape encodes, and that a default would get wrong:
+//
+//   layer_types                  which layers are full vs sliding. The shipped
+//                                tower is (sliding x 5, full) x 8, and the two
+//                                have DIFFERENT geometry.
+//   global_head_dim              512 on the full layers against head_dim 256.
+//   num_global_key_value_heads   ONE, against 8 on the sliding layers.
+//   attention_k_eq_v             true — the full layers ship no `v_proj` at all.
+//   rope_parameters              two rope types at two thetas, partial rotary
+//                                0.25 on the full arm only.
+//   rms_norm_eps, sliding_window, final_logit_softcapping
+//
+// Each moves every hidden state while leaving the tensor set byte-identical, so
+// a wrong config resolves a DIFFERENT MODEL out of the same file and nothing
+// downstream can tell. That is why this takes the config rather than inferring
+// it: shapes can confirm a config, and cannot supply one.
+
+// The tower, materialized. `weights` is bf16 throughout — the NVFP4 modules are
+// dequantized on the way in, which is what `Gemma4Model::ForwardHiddenStates`
+// consumes and what upstream's own resolved model dtype is
+// (base_encoder.py:41). At the shipped 12B that is ~24 GB of host memory, and
+// the caller is told so here rather than discovering it.
+struct Ltx2GemmaTower {
+  HfConfig config;
+  Gemma4Weights weights;
+  // Every module that arrived NVFP4-packed and was dequantized, in header order.
+  // A tower whose modules are all bf16 already leaves this empty.
+  std::vector<std::string> dequantized_modules;
+};
+
+// Materialize the Gemma-4 tower from an LTX text-encoder safetensors file.
+//
+// Reads `model.embed_tokens.*`, `model.norm.weight` and `model.layers.{i}.*` and
+// IGNORES everything else the file carries — `vision_model.*`,
+// `multi_modal_projector`, `audio_projector` and the two caption projections are
+// all present in the shipped checkpoint and none of them is on the text path.
+// Ignoring is deliberate and not laziness: choking on their presence would make
+// the only shipped checkpoint unreadable.
+//
+// Each module is taken bf16 when it is stored bf16 and dequantized through
+// `Ltx2DequantTorchaoNvfp4ToBf16` when it carries a `torchao_nvfp4` marker.
+// A module in neither form throws BY NAME.
+//
+// REFUSES, by name, rather than loading something shaped like a tower:
+//   * a `v_proj` present on a layer the config says is `attention_k_eq_v`, or
+//     absent on one it does not — the two cases are 16 kv heads apart;
+//   * any per-layer tensor whose width disagrees with the geometry the config
+//     resolves for THAT layer;
+//   * `hidden_size_per_layer_input` > 0, i.e. a PLE tower, since this checkpoint
+//     family ships no `embed_tokens_per_layer` and a silently-absent PLE is a
+//     different model.
+Ltx2GemmaTower Ltx2LoadGemmaTowerFromSafetensors(const SafetensorsFile& file,
+                                                 const nlohmann::json& gemma_config);
+
+// ─────────────────────── prompt -> conditioning, end to end ──────────────────
+//
+// `LTXGemmaTextEncoder.encode` (base_encoder.py:49-71) followed by
+// `EmbeddingsProcessor.process_hidden_states` (embeddings_processor.py:70-117).
+//
+// WHAT THIS DOES NOT DO, and why it is not a shortcut. Upstream pads every
+// prompt to 1024 and runs all 1024 rows through the tower. This runs only the
+// VALID tokens, at their ORIGINAL absolute positions, and treats the pad rows as
+// zero. That is equivalent, not approximate: pads are masked out of attention
+// and sit causally before every valid token, and the feature extractor zeroes
+// their rows anyway (feature_extractor.py:63-64). Both halves of that are
+// MEASURED rather than argued — upstream's own padded-vs-short f32 spread is
+// f32 round-off, and our short run reproduces the padded run's valid rows, both
+// gated in tests/vllm/models/test_ltx2_text_encoder.cpp. At the shipped 1024 it
+// is the difference between a 12B forward over 1024 rows and over the prompt's
+// own length.
+struct Ltx2PromptConditioning {
+  Ltx2TextConditioning conditioning;
+  Ltx2GemmaPromptTokens tokens;
+  // [max_length], the binary mask the extractor consumed — 1 on a valid token.
+  std::vector<int32_t> mask;
+  int64_t seq = 0;  // == max_length; the DiT sees the full padded width
+};
+
+// `queue` runs the tower. `weights`/`config` are the caption projections and the
+// resolved V1/V2 shape, exactly as `Ltx2TextFeatureExtractorForward` takes them.
+Ltx2PromptConditioning Ltx2EncodePromptToConditioning(
+    const Ltx2GemmaTower& tower, const tok::Tokenizer& tokenizer,
+    const Ltx2GemmaSpecialIds& ids, const Ltx2TextEncoderWeights& weights,
+    const Ltx2TextFeatureConfig& feature_config, const std::string& prompt,
+    vt::Queue& queue, int64_t max_length = kLtx2GemmaTokenizerMaxLength);
 
 }  // namespace vllm

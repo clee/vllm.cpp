@@ -333,6 +333,19 @@ message naming the missing neighborhood-attention kernel. It never falls back to
 the convolutional decoder, because that would hand back a lower quality render as
 if it were the one you asked for.
 
+A second behaviour changed and is worth stating precisely, because the reason a
+prompt is refused has moved. The Gemma-4 text tower now RUNS: a prompt string
+tokenizes with the tokenizer the checkpoint ships as a tensor, the torchao-NVFP4
+tower is materialized and forwarded, all 49 hidden states feed the multi-layer
+aggregation, and both caption projections produce the 4096-wide video and
+2048-wide audio conditioning streams. What is still missing is the hop from there
+into cross-attention: upstream routes each stream through an
+`Embeddings1DConnector` first, and while that connector's math is ported, its
+weights ship inside the DiT file and are still among the modules the DiT loader
+refuses. So `encoder_path` is still refused — with a message that now names the
+connector weights rather than the tower — and `has_encoder()` is still false.
+Conditioning meanwhile comes from `prompt_embeds_path`.
+
 ### Muse Glimmer: exactly what has been checked
 
 `MuseGlimmerForCausalLM` / `MuseGlimmerForConditionalGeneration` are not in that
@@ -1542,6 +1555,50 @@ python3 scripts/gen-ltx2-pipeline-goldens.py \
   --out tests/vllm/models/ltx2_pipeline_goldens.inc
 cmake --build build --target test_ltx2_pipeline && ./build/tests/test_ltx2_pipeline
 ```
+
+### The Gemma-4 text tower gate, and the interpreter it needs
+
+The text tower is gated against the UPSTREAM HuggingFace implementation built and
+run at reduced dimensions. It needs a `transformers` that registers
+`gemma4_unified` in `CONFIG_MAPPING` — **5.8 or newer; 5.3.0 does not have it and
+fails in a way that reads exactly like "Gemma-4 is unsupported"**. The generator
+refuses such an interpreter by name rather than emitting goldens from a tower it
+could not build.
+
+```sh
+/path/to/venv/bin/python scripts/gen-ltx2-gemma-tower-goldens.py \
+  --out tests/vllm/models/ltx2_gemma_tower_goldens.inc
+cmake --build build --target test_ltx2_text_encoder && ./build/tests/test_ltx2_text_encoder
+```
+
+No checkpoint and no download: the reduced config comes from
+`tests/vllm/models/ltx2_gemma4_text_config.json`, which is the
+`__metadata__["gemma_config"]` of the official bf16 text encoder, and every weight
+is rebuilt on both sides from the deterministic stream. The tolerance is not a
+constant — the generator MEASURES how far upstream's own answer moves between f32
+and bf16 and emits that per state as the bound.
+
+Two more gates want the real checkpoint. The prompt-token goldens are regenerated
+from the tokenizer the text encoder ships **as a tensor**, and the end-to-end case
+dequantizes the 12B tower to roughly 24 GB of host bf16, so it is opt-in rather
+than checkpoint-presence gated:
+
+```sh
+TE=$CHECKPOINT_ROOT/ltx-2.5/vonkaiser-fp8-nvfp4/text_encoders/gemma4-12b-with-proj-nvfp4-torchao.safetensors
+/path/to/venv/bin/python scripts/gen-ltx2-prompt-tokens-goldens.py \
+  --text-encoder "$TE" \
+  --out tests/vllm/models/ltx2_prompt_tokens_goldens.inc
+
+# real vocab, token-exact vs HuggingFace
+CHECKPOINT_ROOT=... ./build/tests/test_ltx2_text_encoder --test-case="ltx2 prompt: REAL*"
+
+# the full 12B vertical: ~33 GB host, minutes of CPU
+CHECKPOINT_ROOT=... VLLM_CPP_LTX2_TOWER_E2E=1 \
+  ./build/tests/test_ltx2_text_encoder --test-case="ltx2 e2e*"
+```
+
+`VLLM_CPP_LTX2_TEXT_ENCODER` names the file directly when it does not sit under
+`CHECKPOINT_ROOT` at the path above.
 
 Recipes resolve on an EXACT `(pipeline_kind, model_version)` pair and refuse
 anything else by name rather than defaulting, because a plausible but wrong sigma
