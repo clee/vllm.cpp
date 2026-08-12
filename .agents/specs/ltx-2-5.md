@@ -154,13 +154,33 @@ Recorded 2026-08-11 while briefing L3, from the real TE checkpoint
 `feature_extractor.py` takes hidden states shaped `[batch, seq_len, hidden_dim, num_layers]`,
 normalizes them, and concatenates **across the LAYER dimension** to
 `[batch, seq_len, hidden_dim * num_layers]`. The checkpoint confirms it: the two projections
-take **94080** input features, and 94080 = 1920 x 49 — the model's 1920-wide per-layer state
-across its 48 layers plus one.
+take **188160** input features, and 188160 = **3840** x 49 — the model's 3840-wide per-layer
+state across its 48 layers plus one.
 
-| Tensor | Shape |
-|---|---|
-| `text_embedding_projection.video_aggregate_embed.weight` / `.bias` | [4096, 94080] / [4096] |
-| `text_embedding_projection.audio_aggregate_embed.weight` / `.bias` | [2048, 94080] / [2048] |
+| Tensor | Stored shape | LOGICAL shape |
+|---|---|---|
+| `text_embedding_projection.video_aggregate_embed.weight` | U8 [4096, 94080] | **[4096, 188160]** |
+| `text_embedding_projection.audio_aggregate_embed.weight` | U8 [2048, 94080] | **[2048, 188160]** |
+| `.bias` (both) | BF16 [4096] / [2048] | unchanged, BF16 is unpacked |
+
+**Correction, 2026-08-12 — NVFP4 STORED widths are HALF the logical ones.** This section first
+recorded 94080 = 1920 x 49, reading the U8 shapes as logical. L3 caught it. NVFP4 packs **two
+values per byte along the last dimension**, so every U8 width in this file is half the real
+one. The tell was in the same header all along: `model.norm.weight` is **BF16 [3840]**, and
+BF16 is unpacked, so 3840 is authoritative. Three independent confirmations agree:
+`model.embed_tokens.weight` U8 [262144, 1920] -> [262144, **3840**];
+`model.layers.0.self_attn.o_proj.weight` U8 [3840, 2048] -> [3840, **4096**] (= 16 heads x 256);
+and the projections' BF16 biases, [4096] and [2048], match the DiT's two stream widths exactly.
+
+The layer count (48 + 1) was right; only the width moved. **Read a quantized checkpoint's
+unpacked tensors to establish the width, never its packed ones** — that is the general lesson,
+and it applies again at L6.
+
+L3 also settled the variant question by execution: 2.5 uses **`FeatureExtractorV2`** (per-token
+RMS), selected by four `_V2_EXPECTED_CONFIG` marker keys, with `_rescale_norm` applied
+SEPARATELY per projection using that projection's own `out_features` over the Gemma hidden
+size. `create_caption_projection` is not on this path — 2.5's projections are the two
+`aggregate_embed` Linears inside the encoder, as §1.4 assumed.
 
 There are at least TWO normalization variants and the right one is selected from config, never
 guessed: `_norm_and_concat_padded_batch` (per-batch, per-layer masked mean and range, an `8 *`
