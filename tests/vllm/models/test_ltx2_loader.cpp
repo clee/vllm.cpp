@@ -25,6 +25,7 @@
 // than papered over with a fabricated manifest.
 #include <unistd.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -1217,7 +1218,14 @@ TEST_CASE("ltx2 loader: the producer discriminator, every row of the table") {
   CHECK_THROWS(
       vllm::Ltx2ResolveNvfp4Producer("m", nullptr, nonsense, out_features, in_features));
 
-  // Both refusals must NAME the module, which is what "refuse by name" claims.
+  // Both refusals must NAME the module, which is what "refuse by name" claims —
+  // and every SINGLE-QUOTED span in them must be a tensor name, because that is
+  // the convention the whole loader refuses in and the convention a user greps
+  // the checkpoint with. An apostrophe in ordinary prose silently breaks it: it
+  // opens a quote that closes on the next one, so the message starts "naming" a
+  // fragment of its own explanation. This suite already asserts that for the
+  // whole-file refusal path; asserting it HERE too is what stopped a stray
+  // "the other's assumption" from shipping in the marker-present branch.
   for (bool with_marker : {true, false}) {
     std::string what;
     try {
@@ -1231,6 +1239,23 @@ TEST_CASE("ltx2 loader: the producer discriminator, every row of the table") {
     const std::string msg = "what: " + what;
     INFO(msg);
     CHECK(what.find("transformer_blocks.0.attn1.to_q") != std::string::npos);
+    // An even count means every quote pairs; an odd one means prose ate a
+    // delimiter.
+    const int64_t quotes = std::count(what.begin(), what.end(), '\'');
+    INFO("single-quote count = " << quotes);
+    CHECK(quotes % 2 == 0);
+    CHECK(quotes >= 2);
+    // ...and each pair really is the tensor this refusal is about.
+    size_t open = what.find('\'');
+    while (open != std::string::npos) {
+      const size_t close = what.find('\'', open + 1);
+      if (close == std::string::npos) break;
+      const std::string quoted = what.substr(open + 1, close - open - 1);
+      const std::string qmsg = "quoted span: " + quoted;
+      INFO(qmsg);
+      CHECK(quoted == "transformer_blocks.0.attn1.to_q.weight_scale");
+      open = what.find('\'', close + 1);
+    }
   }
 }
 

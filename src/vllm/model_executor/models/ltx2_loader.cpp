@@ -241,7 +241,7 @@ Ltx2Nvfp4Producer Ltx2ResolveNvfp4Producer(const std::string& module,
                           "producer also packs the OPPOSITE nibble order. The marker says "
                           "torchao and the shape says nvfp4-prequant; refusing rather "
                           "than picking one, because each reading is finite and wrong "
-                          "under the other's assumption."
+                          "under the assumption of the other."
                     : ". The declaration and the stored shape disagree.") +
          " See .agents/specs/nvfp4-nibble-order.md section 3.2.");
   }
