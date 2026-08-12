@@ -754,6 +754,10 @@ add_library(vllm STATIC
   src/vllm/model_executor/models/minimax_h3_encoder_sharded.cpp
   src/vllm/model_executor/models/minimax_h3_encoder_device.cpp
   src/vllm/model_executor/models/minimax_h3_vision_gguf.cpp
+  # LTX-2.5 (ROW MODEL-DIFFUSION-LTX25, phase L3): the Gemma-4 multi-layer feature
+  # aggregation, the two caption projections and the embedded asset pack. An
+  # additive file mirroring ltx_core's own structure.
+  src/vllm/model_executor/models/ltx2_text_encoder.cpp
   src/vllm/entrypoints/openai/video_api.cpp
   src/vllm/model_executor/models/kimi_kda.cpp
   src/vllm/model_executor/models/kimi_linear_registry.cpp

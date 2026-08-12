@@ -1447,3 +1447,39 @@ Dual-GPU resident FP8 MoE and SharedK-WMMA prefill are controlled via
 ENVIRONMENT.md (`VT_GEMMA4_RESIDENT_*`, `VT_ATTN_*`). Defaults stay safe off RDNA4.
 This PR does **not** restructure the Gemma-4 layer loop or enable decode hipGraph
 (those stay lab-only until a CUDA token-exact gate can land them).
+
+## LTX-2.5 text conditioning (no render path yet)
+
+There is **no LTX-2.5 render path**. This section documents one brick, the text
+conditioning the DiT consumes, and how to reproduce its gate.
+
+LTX-2.5 does not condition on a text encoder's last hidden state. It takes every
+Gemma-4 hidden state (the embedding output plus all 48 decoder outputs, 49 in
+total), normalizes them, concatenates across the layer axis, and projects the
+result twice: a 4096-wide video caption projection and a 2048-wide audio one.
+That is why the shipped projections take 3840 x 49 = 188160 inputs.
+
+Two things about the shipped checkpoint are easy to trip over:
+
+* the tokenizer is stored **as a tensor**, `tokenizer_json`, alongside
+  `hf_asset__*` sidecars, so a loader that expects a sibling `tokenizer.json`
+  file cannot read it;
+* `vonkaiser/LTX-2.5-FP8-NVFP4`'s text encoder carries **no** safetensors
+  `__metadata__` block, so the Gemma config has to be supplied out of band.
+  `Ltx2LoadGemmaAssets(file, /*require_config=*/false)` is the opt-out; the
+  default refuses, exactly as upstream does.
+
+Reproduce the parity gate (CPU only, no checkpoint and no gated download; needs
+torch, numpy and einops plus a Lightricks LTX-2 checkout):
+
+```sh
+python3 scripts/gen-ltx2-text-goldens.py \
+    --ltx2 ~/_git/LTX-2 \
+    --out tests/vllm/models/ltx2_text_goldens.inc
+cmake --build build --target test_ltx2_text_encoder
+./build/tests/test_ltx2_text_encoder
+```
+
+The generator imports the upstream modules by path and executes them at reduced
+dimensions; both sides rebuild every weight from one deterministic stream, so no
+weight byte is checked in.

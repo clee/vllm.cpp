@@ -147,9 +147,38 @@ Gemma4Weights LoadGemma4ForConditionalGenerationWeightsOwned(
 // end-to-end gate is BLOCKED on the runner allocating one uniform KV head_dim
 // (runner.cpp:600-646) — Gemma-4's per-layer 256/512 heads are not representable
 // without a shared-path change to attn_kv_ construction. See gemma4-multimodal.md.
+// MODEL-DIFFUSION-LTX25 L3. What `output_hidden_states=True` returns, for the
+// consumers that condition on the WHOLE stack rather than on the logits — LTX-2.5's
+// text encoder is one (base_encoder.py:68-71: it runs the inner model, takes
+// `outputs.hidden_states`, and never touches lm_head).
+//
+// `hidden_states` has `num_hidden_layers + 1` entries, each [T, H] host f32, in
+// transformers' own append order:
+//   [0]   the input embeddings, already sqrt(hidden)-scaled
+//   [i]   the output of decoder layer i-1, for i in 1..num_hidden_layers-1
+//   [L]   model.norm(output of the LAST decoder layer)
+// The RAW output of the last decoder layer is NOT in the tuple. A consumer that
+// assumes it is gets 49 finite tensors of the right shape and the wrong content,
+// which is why this order is stated here and gated in
+// tests/vllm/models/test_ltx2_text_encoder.cpp rather than left to the reader.
+struct Gemma4HiddenStatesResult {
+  std::vector<std::vector<float>> hidden_states;
+  std::vector<float> logits;  // [n_out, vocab], as Forward() returns
+};
+
 class Gemma4Model {
  public:
   static std::vector<float> Forward(
+      const std::vector<int32_t>& token_ids, const std::vector<int32_t>& positions,
+      const v1::CommonAttentionMetadata& attn_meta,
+      const std::vector<PagedKvCache>& attn_kv, const Gemma4Weights& weights,
+      const HfConfig& config, vt::Queue& queue,
+      const std::vector<int32_t>& logits_indices = {});
+
+  // The same forward as Forward(), additionally returning every hidden state in
+  // transformers' order (see Gemma4HiddenStatesResult). Capture is OFF on every
+  // other entry point, so no shipped path changes shape or cost.
+  static Gemma4HiddenStatesResult ForwardHiddenStates(
       const std::vector<int32_t>& token_ids, const std::vector<int32_t>& positions,
       const v1::CommonAttentionMetadata& attn_meta,
       const std::vector<PagedKvCache>& attn_kv, const Gemma4Weights& weights,
