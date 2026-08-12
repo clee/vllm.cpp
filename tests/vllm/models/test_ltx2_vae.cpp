@@ -22,6 +22,7 @@
 #include <vector>
 
 #include "doctest/doctest.h"
+#include "support/max_abs_diff.h"
 #include "vllm/model_executor/models/ltx2_audio_vae.h"
 #include "vllm/model_executor/models/ltx2_video_vae.h"
 // kMiniMaxH3SnakeEps: the Snake/SnakeBeta stabilizer is SHARED with MiniMax-H3's
@@ -176,14 +177,10 @@ void CheckManifest(const ParamBag& bag, const char* const* want_names, const int
 constexpr double kLtx2GoldenTol = 5e-6;
 constexpr double kLtx2FilterTol = 1e-7;
 
-double MaxAbsDiff(const std::vector<float>& got, const float* want, size_t count) {
-  REQUIRE(got.size() == count);
-  double worst = 0.0;
-  for (size_t i = 0; i < count; ++i) {
-    worst = std::max(worst, std::abs(static_cast<double>(got[i]) - static_cast<double>(want[i])));
-  }
-  return worst;
-}
+// The shared, NaN-hardened reduction. The local copy this replaces used
+// `std::max(worst, ...)`, which is `a < b ? b : a`; `a < NaN` is false, so an
+// all-NaN result against a correct golden reduced to 0.0 (issue #449).
+using vllm_test::MaxAbsDiff;
 
 // The reduced audio decoder the generator built (AUDIO_DEC).
 vllm::Ltx2AudioDecoderConfig ReducedAudioDecoderConfig(int64_t mel_bins) {

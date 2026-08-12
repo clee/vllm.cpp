@@ -17,6 +17,10 @@ set_tests_properties(test_serve_low_tools PROPERTIES
 
 function(vllm_cpp_add_test name)
   add_executable(${name} ${ARGN})
+  # tests/ on the include path so every suite can reach the shared test helpers
+  # under tests/support/ as "support/<name>.h". No header name under tests/
+  # collides with one under include/ or src/, so nothing else resolves here.
+  target_include_directories(${name} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
   if(TARGET vllm::sanitize_test_shared)
     target_link_libraries(${name} PRIVATE vllm::sanitize_test_shared vllm_test_main)
   else()
@@ -25,6 +29,17 @@ function(vllm_cpp_add_test name)
   vllm_cpp_set_warnings(${name})
   add_test(NAME ${name} COMMAND ${name})
 endfunction()
+
+# The gate on the golden-comparison helper itself (issue #449): a NaN operand
+# must be a FAILURE, never the 0.0 that both historical spellings returned.
+vllm_cpp_add_test(test_max_abs_diff support/test_max_abs_diff.cpp)
+# ...and the wrapper must RAISE, not merely return +infinity, so the
+# "these must differ" callers cannot read a NaN as a difference. That case is
+# skipped in the normal run because a raised failure would count as one; here it
+# is forced on and REQUIRED to exit non-zero. Without the guard this entry fails.
+add_test(NAME test_max_abs_diff_nan_raises
+  COMMAND test_max_abs_diff --no-skip --test-case=*RAISES*)
+set_tests_properties(test_max_abs_diff_nan_raises PROPERTIES WILL_FAIL TRUE)
 
 vllm_cpp_add_test(test_version vllm/test_version.cpp)
 vllm_cpp_add_test(test_sampling_params vllm/test_sampling_params.cpp)
