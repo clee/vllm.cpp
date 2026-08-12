@@ -932,6 +932,14 @@ const std::string kSigmoid = R"(,
     "output_gate_type": "sigmoid")";
 const std::string kBogus = R"(,
     "output_gate_type": "gelu")";
+// PRESENT but unusable. Upstream's `getattr(config, "output_gate_type",
+// "silu")` only substitutes the default when the attribute is ABSENT: a
+// present None or "" is returned as-is and then fails
+// `assert output_gate_type in ["silu", "swish", "sigmoid"]`.
+const std::string kNull = R"(,
+    "output_gate_type": null)";
+const std::string kEmpty = R"(,
+    "output_gate_type": "")";
 
 }  // namespace
 
@@ -973,6 +981,38 @@ TEST_CASE("LoadHfConfig normalizes the GDN output_gate_type") {
                          std::runtime_error);
     CHECK_THROWS_WITH_AS(vllm::LoadHfConfig(f.path()),
                          doctest::Contains("sigmoid"), std::runtime_error);
+  }
+
+  // ABSENT and PRESENT-BUT-NULL are different states, and only the first one
+  // takes upstream's `getattr` default. A `"output_gate_type": null` reaches
+  // upstream as None, fails the assert, and errors — so it must be refused
+  // here rather than collapsing into silu, which is what docs/USAGE.md already
+  // tells a user this loader does.
+  SUBCASE("a present null is refused, never treated as absent") {
+    TempJson f(FlatGdnJson(kNull));
+    CHECK_THROWS_WITH_AS(vllm::LoadHfConfig(f.path()),
+                         doctest::Contains("output_gate_type"),
+                         std::runtime_error);
+    CHECK_THROWS_WITH_AS(vllm::LoadHfConfig(f.path()),
+                         doctest::Contains("sigmoid"), std::runtime_error);
+
+    // Same in a nested wrapper: the resolved text config is what decides.
+    TempJson nested(NestedGdnJson(kNull));
+    CHECK_THROWS_AS(vllm::LoadHfConfig(nested.path()), std::runtime_error);
+  }
+
+  // An empty string is a value, not an absence: upstream returns "" from
+  // getattr and the assert rejects it.
+  SUBCASE("a present empty string is refused, never treated as absent") {
+    TempJson f(FlatGdnJson(kEmpty));
+    CHECK_THROWS_WITH_AS(vllm::LoadHfConfig(f.path()),
+                         doctest::Contains("output_gate_type"),
+                         std::runtime_error);
+    CHECK_THROWS_WITH_AS(vllm::LoadHfConfig(f.path()),
+                         doctest::Contains("sigmoid"), std::runtime_error);
+
+    TempJson nested(NestedGdnJson(kEmpty));
+    CHECK_THROWS_AS(vllm::LoadHfConfig(nested.path()), std::runtime_error);
   }
 
   SUBCASE("the key is read from the RESOLVED text config, not the wrapper") {

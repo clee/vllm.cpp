@@ -340,6 +340,7 @@ output-gate activation in `config.json`:
 | absent | `silu` — the upstream default |
 | `"silu"` or `"swish"` | `silu` — `swish` is an alias, collapsed at load |
 | `"sigmoid"` | `sigmoid` |
+| present but `null`, `""`, or not a string | refused |
 
 The key is read from the **resolved text config**, so a flat text-only
 `config.json` and a multimodal wrapper that nests the text model under
@@ -347,6 +348,11 @@ The key is read from the **resolved text config**, so a flat text-only
 message naming the key and the accepted set — never silently defaulted, because
 the wrong gate is a numerics change that still emits plausible tokens
 ([#489](https://github.com/mudler/vllm.cpp/issues/489)).
+
+Only an **absent** key takes the default. A key that is present but `null` or
+empty is a value, not an absence: upstream hands it straight to its
+`assert output_gate_type in ["silu", "swish", "sigmoid"]` and errors, so this
+loader refuses it as well rather than quietly reading it as `silu`.
 
 ### Muse Glimmer: exactly what has been checked
 

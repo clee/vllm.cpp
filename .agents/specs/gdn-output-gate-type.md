@@ -3,7 +3,7 @@
 **Rows:** `MODEL-MM-qwen3-5-qwen3-5-for-conditional-generation`,
 `MODEL-MM-qwen3-5-qwen3-5-moe-for-conditional-generation`
 **Issue:** [#489](https://github.com/mudler/vllm.cpp/issues/489)
-**Lifecycle:** `READY`
+**Lifecycle:** `ACTIVE`
 **Owner:** unassigned
 
 ## Scope
@@ -118,4 +118,81 @@ comparison.
 
 ## Now
 
-Row is `READY`. Spec committed; implementation not started.
+Row is `ACTIVE` on `row/MODEL-GDN-OUTPUT-GATE-TYPE`. Implemented at `5da2e364`,
+reviewed independently (design confirmed correct and complete: all 13 non-test
+gated-RMSNorm constructions enumerated, no tail unwired, the fp8 `FusedRecipe`
+value-copy proven unable to alias the constexpr original), then repaired for the
+three findings that review returned. Owed before `DONE`: the operator's own
+rerun of the row gate, the GPU arms this host cannot execute, and an `## Outcome`
+section.
+
+### What landed
+
+`LoadHfConfig` resolves `output_gate_type` from the **resolved text config** and
+canonicalizes it there — absent -> `silu`, `"swish"` -> `silu`, `"sigmoid"`
+preserved, anything else refused naming the key and the accepted set. The three
+Qwen3.5 GDN tails (`GdnBlock`, `GdnBlockPaged`, `GdnBlockPagedMixedSpec`)
+consume the resolved boolean through `vt::RmsNormGatedArgs::sigmoid_gate`; the
+fp8 glue-fused arm binds a value copy of `kRmsNormGatedQuantFp8` because
+`sigmoid_gate` is a structural recipe flag.
+
+Absent and present-but-unusable are **different states**. `getattr` substitutes
+its default only for a missing attribute, so `"output_gate_type": null`, `""`,
+and a non-string value reach upstream's assert and error; the loader probes for
+the key rather than routing through `GetString`, which flattens absence and null
+to the same empty string. The first implementation collapsed both into `silu`,
+contradicting `docs/USAGE.md`, which already shipped the refusal contract.
+
+The refusal is unconditional rather than gated on a GDN architecture, where
+upstream's assert lives. No known checkpoint carries the key outside the GDN
+family; if one appears, widening is a scoped follow-up with its own test.
+
+### Evidence
+
+**RED first, F1** (`test_hf_config`, before the probe replaced `GetString`) —
+`1 failed | 19 skipped`, `assertions: 16 | 10 passed | 6 failed`,
+`Status: FAILURE!`; every failure of the form
+`CHECK_THROWS_WITH_AS( vllm::LoadHfConfig(f.path()), "output_gate_type",
+std::runtime_error ) did NOT throw at all!` in the two new subcases (present
+`null`, present `""`, flat and nested). Green after: `210 | 210 passed`.
+
+**Polarity, the F2 repair.** The original numerics tests asserted only that the
+two arms DIFFER. Review inverted the resolution
+(`return cfg.output_gate_type != "sigmoid";` — a silu checkpoint driving the
+sigmoid kernel, this row's own bug class reversed) and both focused suites
+stayed GREEN. The repair adds a reference that never consults our gate:
+silu(0) = 0·sigmoid(0) = 0 exactly while sigmoid(0) = 0.5, and the gate input is
+`z = h @ in_proj_z` with no bias, so zeroing that projection makes a silu tail
+annihilate the whole GDN block output while a sigmoid tail does not. The paged
+cases assert the silu arm is exactly zero and the sigmoid arm is not; the dense
+case asserts the silu arm is BIT-identical to an independently constructed model
+whose GDN `out_proj` is zeroed, and that the sigmoid arm is not.
+
+Re-running review's inversion now goes RED in both focused suites, both halves
+flipping together:
+
+- `test_qwen27_dense_forward` — `9 | 8 passed | 1 failed`,
+  `assertions: 583 | 581 passed | 2 failed`, `Status: FAILURE!`;
+  `CHECK( silu_differs == 0 )` reads `240 == 0`, `CHECK( sigmoid_gap > 0.0 )`
+  reads `0 > 0`. The pre-existing "arms differ" case still passes with
+  `max|diff| = 0.12374` — which is exactly why it could not see this.
+- `test_qwen3_5_gdn_spec_routing` — `6 | 4 passed | 2 failed`,
+  `assertions: 52 | 44 passed | 8 failed`, `Status: FAILURE!`;
+  `CHECK( silu_nonzero == 0 )` reads `384 == 0` (`mixed=false`) and `640 == 0`
+  (`mixed=true`) at both 27B and 35B GDN dims, with `max_sigmoid == 0`.
+
+The mutated file was restored byte-for-byte (`md5 ee95ae2743...`, empty
+`git diff`) and both suites returned to `583 | 583 passed` and `52 | 52 passed`.
+
+**Inertness.** `tests/parity/goldens` is untouched — `git diff` against the
+spec commit `3b99c1db` over that tree is empty. Rollup md5 over the qwen3*/
+qwen36*/gdn* goldens: `886f4202f9e4fea2af611f1642f84a08`; individually
+`qwen36_logits_27b f6b07d2df97f0ea6938202414e00a011`,
+`qwen36_logits_35b 3a4d27ce010310c5cdb3435f59aebcad`,
+`qwen36_gdn_layer_27b a86b3dbd8086f3684bb9bc04d51cdd32`,
+`qwen36_gdn_layer_35b 1320c83388c6220426a660858d90322c`,
+`qwen3coder_greedy 444895f5dc423427510251b1dcdad13e`.
+
+**Not run here.** This host has no GPU: the CUDA/fp8 arms of all three tails,
+the `FusedChain` fp8 recipe copy on device, and every dgx gate are UNRUN and
+owed at the operator's rerun.

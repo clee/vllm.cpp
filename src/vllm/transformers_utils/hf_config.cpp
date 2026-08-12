@@ -448,13 +448,33 @@ HfConfig LoadHfConfig(const std::string& path) {
     // an unrecognized value; we refuse at load naming the key and the accepted
     // set, because a silent fallback to silu is a numerics change no token gate
     // over today's (all-silu) checkpoints could ever see.
-    cfg.output_gate_type = GetString(text, "output_gate_type");
-    if (cfg.output_gate_type.empty()) cfg.output_gate_type = "silu";
-    if (cfg.output_gate_type == "swish") cfg.output_gate_type = "silu";
-    if (cfg.output_gate_type != "silu" && cfg.output_gate_type != "sigmoid") {
-      throw std::runtime_error(
-          "hf_config: unsupported output_gate_type \"" + cfg.output_gate_type +
-          "\" (expected one of: silu, swish, sigmoid) in " + path);
+    //
+    // ABSENT and PRESENT-BUT-UNUSABLE are different states, so this cannot go
+    // through GetString(), which flattens both to "": `getattr` substitutes the
+    // default ONLY when the attribute is missing, and a present None / "" /
+    // non-string is handed straight to the assert and errors. Probing for the
+    // key keeps null and "" on the refusal path.
+    //
+    // The refusal is unconditional rather than gated on the architecture being
+    // GDN, where upstream's assert lives. No checkpoint we know of carries the
+    // key outside the GDN family, and refusing a value nothing can honor is the
+    // safer direction; if one ever appears, that is a scoped follow-up with its
+    // own test, not a silent widening here.
+    const auto gate_it = text.find("output_gate_type");
+    if (gate_it == text.end()) {
+      cfg.output_gate_type = "silu";  // upstream's getattr default
+    } else {
+      // A non-string value is dumped verbatim (`null`, `3`) so the refusal
+      // names what was actually found; it can never match silu/sigmoid.
+      cfg.output_gate_type =
+          gate_it->is_string() ? gate_it->get<std::string>() : gate_it->dump();
+      if (cfg.output_gate_type == "swish") cfg.output_gate_type = "silu";
+      if (cfg.output_gate_type != "silu" && cfg.output_gate_type != "sigmoid") {
+        throw std::runtime_error(
+            "hf_config: unsupported output_gate_type \"" +
+            cfg.output_gate_type +
+            "\" (expected one of: silu, swish, sigmoid) in " + path);
+      }
     }
     cfg.mamba_ssm_dtype = GetString(text, "mamba_ssm_dtype");
 

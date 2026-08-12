@@ -643,6 +643,82 @@ void RunGateActivationCase(const GdnDims& g, bool mixed) {
   CHECK(bad == 0);
 }
 
+// WHICH activation each paged tail applies, not merely that the arms differ.
+//
+// RunGateActivationCase proves the outputs MOVE; it would pass unchanged with
+// the boolean INVERTED, i.e. a silu checkpoint driving the sigmoid kernel --
+// this row's bug class turned inside out. The polarity therefore needs a
+// reference that never consults our gate.
+//
+// Arithmetic supplies one: silu(0) = 0 * sigmoid(0) = 0 EXACTLY, while
+// sigmoid(0) = 0.5. The gate input is z = h @ in_proj_z, a plain GEMM with no
+// bias (qwen3_5.cpp ProjectGdnQkvz), so a zeroed in_proj_z makes z identically
+// zero. A SILU tail then computes norm(core) * 0 = 0 and the block returns
+// 0 @ out_proj = ZERO, whatever the recurrence produced; a SIGMOID tail
+// computes 0.5 * norm(core) and returns something non-zero. Inverting the
+// resolution flips both assertions at once.
+void RunGatePolarityCase(const GdnDims& g, bool mixed) {
+  setenv("VT_GDN_INDEXED_STATE_IO", "1", 1);  // mixed needs widened indexed IO
+  const int64_t H = 128;
+  const int Ts = 2, Tp = 3;
+  const int64_t T = mixed ? Ts + Tp : Tp;
+  const HfConfig silu = MakeConfig(g, H);
+  REQUIRE(silu.output_gate_type == "silu");
+  HfConfig sigmoid = MakeConfig(g, H);
+  sigmoid.output_gate_type = "sigmoid";
+
+  const int64_t Hv = g.hv, Dv = g.dv, Dk = g.dk, Kw = g.kw;
+  const int64_t key_dim = g.hk * Dk, value_dim = Hv * Dv;
+  const int64_t conv_dim = 2 * key_dim + value_dim;
+  const int64_t ssm_row = Hv * Dv * Dk;
+  const int64_t conv_len = (Kw - 1) + 1;
+  const int64_t slots = 3;
+
+  GdnLayerWeights w = MakeGdnWeights(silu);
+  // z ≡ 0. lo == hi == 0 makes every element exactly +0.0f.
+  w.in_proj_z = MakeOwned(DType::kBF16, {H, value_dim}, 20, 0.0f, 0.0f);
+
+  std::vector<float> h(static_cast<size_t>(T * H));
+  for (size_t i = 0; i < h.size(); ++i) h[i] = RandV(5000 + i, -1.0f, 1.0f);
+  std::vector<float> ssm0(static_cast<size_t>(slots * ssm_row));
+  for (size_t i = 0; i < ssm0.size(); ++i) ssm0[i] = RandV(6000 + i, -0.5f, 0.5f);
+  std::vector<float> conv0(static_cast<size_t>(slots * conv_dim * conv_len), 0.0f);
+  for (int64_t s = 0; s < slots; ++s)
+    for (int64_t ch = 0; ch < conv_dim; ++ch)
+      for (int64_t j = 0; j < Kw - 1; ++j)
+        conv0[static_cast<size_t>((s * conv_dim + ch) * conv_len + j)] =
+            RandV(7000 + (s * conv_dim + ch) * (Kw - 1) + j, -1.0f, 1.0f);
+
+  const auto run = [&](const HfConfig& c) {
+    std::vector<float> ssm = ssm0, conv = conv0;
+    const GDNAttentionMetadata meta = mixed ? MixedMeta(Tp) : PrefillMeta(Tp, 2);
+    return vllm::GdnBlockPagedForTest(Q(vt::DeviceType::kCPU), w, c, h, meta, ssm,
+                                      conv, slots, conv_len, T);
+  };
+
+  const std::vector<float> silu_out = run(silu);
+  const std::vector<float> sigmoid_out = run(sigmoid);
+  REQUIRE(static_cast<int64_t>(silu_out.size()) == T * H);
+  REQUIRE(sigmoid_out.size() == silu_out.size());
+  CAPTURE(g.name);
+  CAPTURE(mixed);
+
+  // silu(0) == 0 annihilates the block output, exactly.
+  size_t silu_nonzero = 0;
+  for (size_t i = 0; i < silu_out.size(); ++i)
+    if (silu_out[i] != 0.0f) ++silu_nonzero;
+  CAPTURE(silu_nonzero);
+  CHECK(silu_nonzero == 0);
+
+  // sigmoid(0) == 0.5 does not. Without this the check above would also pass on
+  // a fixture whose core happened to be zero, which would prove nothing.
+  double max_sigmoid = 0.0;
+  for (size_t i = 0; i < sigmoid_out.size(); ++i)
+    max_sigmoid = std::max(max_sigmoid, std::abs(static_cast<double>(sigmoid_out[i])));
+  CAPTURE(max_sigmoid);
+  CHECK(max_sigmoid > 0.0);
+}
+
 }  // namespace
 
 TEST_CASE("GDN output_gate_type=sigmoid reaches GdnBlockPaged's gate (CPU)") {
@@ -653,4 +729,14 @@ TEST_CASE("GDN output_gate_type=sigmoid reaches GdnBlockPaged's gate (CPU)") {
 TEST_CASE("GDN output_gate_type=sigmoid reaches the MIXED spec batch gate (CPU)") {
   RunGateActivationCase(kGate27B, /*mixed=*/true);
   RunGateActivationCase(kGate35B, /*mixed=*/true);
+}
+
+TEST_CASE("GDN gate POLARITY: GdnBlockPaged's silu arm is silu (CPU)") {
+  RunGatePolarityCase(kGate27B, /*mixed=*/false);
+  RunGatePolarityCase(kGate35B, /*mixed=*/false);
+}
+
+TEST_CASE("GDN gate POLARITY: the MIXED spec batch's silu arm is silu (CPU)") {
+  RunGatePolarityCase(kGate27B, /*mixed=*/true);
+  RunGatePolarityCase(kGate35B, /*mixed=*/true);
 }
