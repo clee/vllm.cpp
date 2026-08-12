@@ -368,6 +368,20 @@ So the upstream escape hatch — "behaves identically until trained" — **does 
 The two files differ in a TRAINED parameter that marks single-standalone-frame latents. On any
 request that uses keyframe conditioning they are different models, not two precisions of one.
 
+**CORRECTION, 2026-08-13 — the practical reach was OVERSTATED.** A third implementation
+settles it. `huggingface/diffusers` main documents `keyframes_abs_pos_embedding` as
+*"Zero-initialized in the reference; **unused by the regular distilled forward** until a
+dedicated keyframes pipeline applies it after `proj_in`"*
+(`src/diffusers/models/transformers/transformer_ltx2.py:1116-1119, 1199-1200`), and defaults
+`use_keyframes_abs_pos_embedding` to `False`.
+
+So for the DISTILLED forward this campaign actually runs, that tensor is **not consumed at
+all**. The difference between the two files is real and the FP8 copy's parameter is genuinely
+trained, but the claim below that they are "different models" on any keyframe request
+overstates what it means for our path: no forward we run reads it. What remains true is the
+narrow statement — the files differ, and a keyframes pipeline (which we do not have) would
+distinguish them.
+
 Consequences, and none of them are optional:
 
 - **A parity number measured on one does not transfer to the other.** Everything gated so far
@@ -382,6 +396,44 @@ Consequences, and none of them are optional:
 Checked because §1.2's retraction came from reading the shipped checkpoint and finding it
 contradicted the spec. The same question asked of the second checkpoint found a second
 difference. Ask it of every new artifact.
+
+## 3.2 The THIRD implementation, and the default it disagrees with
+
+Recorded 2026-08-13, after the developer asked whether the diffusers implementation had been
+checked. **It had not been**, and that was a gap: §3 named vLLM-Omni's diffusers adapter as the
+binding oracle ROUTE and recorded it PENDING on the gated `LTX-2.5-Diffusers` **weights** repo,
+after which nobody read the diffusers **source** — which is public on GitHub and needed no gate
+at all. AGENTS.md asks for verification against the running oracle *and* its source; this
+campaign checked one implementation's source twice instead of two implementations once.
+
+`huggingface/diffusers` main carries `LTX2VideoTransformer3DModel`
+(`src/diffusers/models/transformers/transformer_ltx2.py`, 1683 lines) plus the `ltx2` pipelines.
+Three results from reading it:
+
+**(a) It confirms §1.2's retraction independently.** `use_prompt_adaln_single` defaults to
+**`True`** (`:1185`), and `:677` documents `temb_prompt` as `None` only when it is `False`
+("KV-cacheable"). The cacheable case is the exception, exactly as the retraction states.
+
+**(b) It corrects §3.1's reach** — see the correction there. The keyframes parameter is unused
+by the regular distilled forward.
+
+**(c) It DISAGREES with our fallback defaults**, and that is the finding worth acting on:
+
+| | ours (`ltx2.h:106,112`) | `ltx_core` (`model_configurator.py:66,68`) | **diffusers** (`:1176,1179`) |
+|---|---|---|---|
+| `av_ca_timestep_scale_multiplier` | `1` | `1` | **`1000`** |
+| rope double precision | `false` | `false` | **`True`** |
+
+We mirrored Lightricks' fallbacks faithfully, so ours are not wrong *as a port of ltx_core*.
+But diffusers defaults both to what LTX-2.5 DECLARES. So a checkpoint carrying no metadata —
+which is exactly the shipped `vonkaiser` FP8 DiT (§1.2, F2) — resolves under our defaults to a
+configuration **neither upstream would produce**. That is weaker than the "differently
+configured, not materially wrong" reading recorded at F2, and it is why L7's repair refusing a
+config-less DiT unless one is named is the right shape rather than a nicety.
+
+Owed: decide whether our fallbacks should follow `ltx_core`'s (a faithful port of one
+reference) or LTX-2.5's declared values (what both references actually run). That is a product
+decision, not a porting one, and it wants its own row.
 
 ## 4. Checkpoint access and placement
 
