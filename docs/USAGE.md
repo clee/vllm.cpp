@@ -316,22 +316,82 @@ tokens quietly.
 This is a deliberate state, not a bug: registering the architecture is what lets
 the config parse and weight-name mapping be tested before the forward exists.
 
-### LTX-2.5 has no user-facing entrypoint yet
+### LTX-2.5: what runs, and what it cannot do
 
-LTX-2.5 is being ported in phases. Its two VAE decoders and its pipeline layer
-(the sigma schedule, the diffusion steps, guidance, the latent spatial x2
-upsampler, the duration head and the embeddings connector) are implemented and
-gated, but no CLI flag, server endpoint or C ABI call reaches them, so there is
-nothing to run here yet and no request shape to document. Do not infer from
-[FEATURES](FEATURES.md) that a render is available.
+LTX-2.5 is reachable as video family `ltx-2.5`, through the same
+`vllm_video_engine_load` / `vllm_video_generate` C ABI that serves MiniMax-H3,
+and through the `ltx2-gen` example that drives it. Two limits decide what you can
+actually ask for, and both refuse by name rather than rendering something else.
 
-One behaviour is worth stating in advance, because it decides what you get when
-the entrypoint does arrive. LTX-2.5 ships two video decoders behind one
-checkpoint field. The convolutional one is implemented; the higher quality
-diffusion one (`NADiffusionDecoder`) is not, and asking for it fails with a
-message naming the missing neighborhood-attention kernel. It never falls back to
-the convolutional decoder, because that would hand back a lower quality render as
-if it were the one you asked for.
+**There is no prompt.** The Gemma-4 12B text tower is not ported, so nothing can
+turn words into the conditioning the caption projections consume. Conditioning
+comes from `--prompt-embeds` plus `--audio-prompt-embeds`: rows of
+little-endian f32, 4096 wide for the video stream and 2048 for the audio stream,
+with the same row count in both. Supplying a `--prompt` is refused, and supplying
+only one of the two files is refused, because a stream left unconditioned renders
+instead of failing.
+
+**The DiT config is required when the checkpoint does not carry one.** The
+shipped `vonkaiser` FP8 transformer has no `__metadata__` at all, and the values
+a config decides are ones no tensor shape encodes: `frequencies_precision` and
+`av_ca_timestep_scale_multiplier` move every RoPE angle and every audio/video
+modulation. Defaulting them resolves a different model from the same file, so
+the loader refuses and `--dit-config` supplies LTX-2.5's declared values.
+
+```sh
+ltx2-gen --dit  ltx-2.5-22b-distilled-fp8.safetensors \
+         --dit-config ltx-2.5-transformer-config.json \
+         --model-version 2.5 --allow-unported \
+         --video-vae ltx-2.5-video-vae-conv-bf16.safetensors \
+         --audio-vae ltx-2.5-audio-vae-bf16.safetensors \
+         --upsampler ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors \
+         --prompt-embeds video_prompt_embeds.f32 \
+         --audio-prompt-embeds audio_prompt_embeds.f32 \
+         --frames 25 --width 320 --height 192 --seed 20260812 \
+         --device cuda --workdir /tmp/ltx25 --out /tmp/ltx25/video.mp4
+```
+
+`--frames` must satisfy `(frames - 1) % 8 == 0` and width/height must divide by
+64 (32 for the VAE, twice that because the distilled recipe's first phase runs at
+half resolution). Omitting all three renders the recipe default, which is
+1024x1536 at 121 frames and is a much larger request than it looks.
+
+`--upsampler` is what the distilled recipe's second phase needs. Without it that
+phase refuses rather than skipping: its three-step refinement is what makes the
+upscaled latent valid, and decoding the half-resolution latent instead would hand
+back a smaller clip that looks like a completed request. `--max-phase 0` stops
+after the first phase deliberately.
+
+On the server, `--video-family ltx-2.5` pins the family instead of detecting it,
+and `--video-extra KEY=VALUE` (repeatable) carries the same family-specific load
+knobs the flags above map onto. Both are described under
+[the server's video flags](#video-family-and-family-specific-load-knobs).
+
+**Two things about that command are worth knowing before you run it.**
+
+*It is bounded by memory well below the recipe's own defaults.* Staging the
+21.00B FP8 transformer costs about 44 GB on a 119 GB GB10, and the render then
+runs a forward per denoise step on top of that. A 128x128 clip at 9 frames
+completes comfortably through both distilled phases; a 320x192 clip at 25 frames
+consumed a further 58 GB and had to be stopped. Unified memory makes those host
+bytes, and this class of box reboots rather than OOM-killing, so start small and
+grow. The recipe default (1024x1536 at 121 frames) is far beyond what one GB10
+holds today.
+
+*It cannot yet render a scene, and that is conditioning, not the model.* The
+text tower is not ported and neither is the embeddings connector that sits
+between it and the DiT's cross-attention, so whatever you supply as prompt
+embeds reaches the transformer unprocessed. A completed render at the sizes
+above is a structurally valid MP4 of smooth colour fields, not a depiction of
+anything. Treat it as an end-to-end plumbing check.
+
+LTX-2.5 ships two video decoders behind one checkpoint field. The convolutional
+one is implemented; the higher quality diffusion one (`NADiffusionDecoder`) is
+not, and asking for it fails with a message naming the missing
+neighborhood-attention kernel. It never falls back to the convolutional decoder,
+because that would hand back a lower quality render as if it were the one you
+asked for. Keyframe and reference conditioning is refused for the same reason: it
+runs through the video VAE's encoder, and only the decoder is ported.
 
 ### Muse Glimmer: exactly what has been checked
 
@@ -1160,6 +1220,40 @@ rather than a 200 with zero bytes.
 The library never spawns a process, so generation and muxing enter through a
 caller-supplied `VideoRunner` callback (`examples/server/main.cpp` supplies one
 that invokes `ffmpeg`, path configurable with `--video-ffmpeg`).
+
+### Video family, and family-specific load knobs
+
+`/v1/videos` serves whichever video family the `--video-dit` checkpoint belongs
+to. By default the family is **detected** from what the checkpoint holds, and
+that is unchanged.
+
+`--video-family NAME` pins it instead. Two registered families exist,
+`minimax-h3` and `ltx-2.5`, and a name outside that set is refused at argument
+parsing, before the text model loads, with the registered names printed. It is
+never a hint: a declared family that cannot load the checkpoint fails loudly
+rather than falling back to detection, because a checkpoint handed to the wrong
+family does not fail, it renders noise.
+
+`--video-extra KEY=VALUE`, repeatable, carries a family's own load knobs. LTX-2.5
+cannot load without `dit_config_path` and `audio_prompt_embeds_path`; MiniMax-H3
+defines `partition`, for which `--video-partition` remains the documented alias.
+A bare `KEY` with no `=` is refused rather than read as an empty value, and a
+`--video-extra partition=X` contradicting `--video-partition Y` is refused rather
+than resolved by whichever assignment ran last. A family refuses any key it does
+not define, so a mistyped knob is an error instead of a silently defaulted
+render.
+
+```sh
+vllm-server --model /path/to/text-model \
+  --video-family ltx-2.5 \
+  --video-dit ltx-2.5-22b-distilled-fp8.safetensors \
+  --video-vae ltx-2.5-video-vae-conv-bf16.safetensors \
+  --audio-vae ltx-2.5-audio-vae-bf16.safetensors \
+  --video-prompt-embeds video_prompt_embeds.f32 \
+  --video-extra dit_config_path=ltx-2.5-transformer-config.json \
+  --video-extra audio_prompt_embeds_path=audio_prompt_embeds.f32 \
+  --video-extra model_version=2.5 --video-extra allow_unported_modules=1
+```
 
 ## Consuming it as a library (C ABI)
 
