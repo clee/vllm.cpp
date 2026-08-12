@@ -319,6 +319,20 @@ CPU compile/execution of `test_backend_cross_device`, and the full preflight.
 Hosted acceptance remains the same exact-merged-SHA dry run: Windows Vulkan
 must compile, execute, package, and validate before any tag is authorized.
 
+The #514 implementation keeps the environment change local to the cross-device
+test. A single `SetTestEnvironment` helper uses checked `_putenv_s` on Windows,
+passing an empty value for removal, and retains checked `setenv(..., 1)` and
+`unsetenv` on POSIX. The fused-chain case still selects tiers 0 and 1, asserts
+the active tier, and restores either the saved value or the prior absence.
+
+RED-first structural coverage failed on the pinned candidate because the helper
+and Windows arm were absent. After the repair, the 72-case Windows portability
+suite and direct checker passed. A scratch mutation deleting the `_putenv_s`
+call failed the focused contract, and the candidate files were restored
+byte-for-byte. A clean Release CPU configuration compiled and executed
+`test_backend_cross_device`: 19 cases and 6 assertions passed. Native MSVC and
+the exact-merged-SHA ten-tuple dry run remain hosted acceptance gates.
+
 Fresh review of immutable implementation `e0b17eb9` found that the compiled
 version test derived its default expectation from the same cache value under
 test. Mutating the cache default from `${PROJECT_VERSION}` to `9.9.9` therefore

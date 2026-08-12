@@ -96,6 +96,18 @@ std::vector<DeviceType> RegisteredDevices() {
 
 bool OpAvailable(vt::OpId op, DeviceType t) { return vt::OpRegistered(op, t); }
 
+void SetTestEnvironment(const char* name, const char* value) {
+#ifdef _WIN32
+  REQUIRE(::_putenv_s(name, value != nullptr ? value : "") == 0);
+#else
+  if (value != nullptr) {
+    REQUIRE(setenv(name, value, 1) == 0);
+  } else {
+    REQUIRE(unsetenv(name) == 0);
+  }
+#endif
+}
+
 // A device-resident f32 buffer with host staging, so one body serves a unified
 // backend (Metal, GB10) and a discrete one identically: every transfer goes
 // through Backend::Copy rather than assuming the host can dereference the
@@ -1001,7 +1013,7 @@ TEST_CASE("FusedChain matches the CPU oracle within NMSE <= 5e-4 (both tiers)") 
 
   for (int tier : {0, 1}) {
     CAPTURE(tier);
-    setenv("VT_FUSED_TIER", tier == 0 ? "0" : "1", 1);
+    SetTestEnvironment("VT_FUSED_TIER", tier == 0 ? "0" : "1");
     // ASSERT the tier actually took effect rather than trusting the log: doctest
     // CAPTURE is lazily stringified, so a mis-set environment would silently
     // run the same path twice and still look like two-tier coverage.
@@ -1045,9 +1057,9 @@ TEST_CASE("FusedChain matches the CPU oracle within NMSE <= 5e-4 (both tiers)") 
   }
 
   if (had_prev) {
-    setenv("VT_FUSED_TIER", saved.c_str(), 1);
+    SetTestEnvironment("VT_FUSED_TIER", saved.c_str());
   } else {
-    unsetenv("VT_FUSED_TIER");
+    SetTestEnvironment("VT_FUSED_TIER", nullptr);
   }
 }
 

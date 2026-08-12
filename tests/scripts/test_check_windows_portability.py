@@ -562,6 +562,58 @@ class WindowsPortabilityCheckerTest(unittest.TestCase):
         )
         self.assertIn("std::string_view::npos", source)
 
+    def test_cross_device_fused_tier_environment_is_windows_portable(self) -> None:
+        source = (REPO / "tests/vt/test_backend_cross_device.cpp").read_text(
+            encoding="utf-8"
+        )
+        helper_span = checker._cpp_function_body_span(
+            source, r"\bSetTestEnvironment\s*\("
+        )
+        self.assertIsNotNone(helper_span, "SetTestEnvironment helper")
+        assert helper_span is not None
+        helper = source[helper_span[1]:helper_span[2]]
+
+        directives = checker._cpp_directive_view(helper)
+        self.assertRegex(directives, r"(?m)^\s*#\s*ifdef\s+_WIN32\s*$")
+        self.assertRegex(directives, r"(?m)^\s*#\s*else\s*$")
+        self.assertRegex(directives, r"(?m)^\s*#\s*endif\s*$")
+
+        active = checker._cpp_structural_view(helper)
+        self.assertRegex(
+            directives,
+            r"REQUIRE\s*\(\s*::_putenv_s\s*\(\s*name\s*,\s*"
+            r'value\s*!=\s*nullptr\s*\?\s*value\s*:\s*""\s*\)\s*'
+            r"==\s*0\s*\)",
+        )
+        self.assertRegex(
+            active,
+            r"REQUIRE\s*\(\s*setenv\s*\(\s*name\s*,\s*value\s*,\s*1\s*\)\s*"
+            r"==\s*0\s*\)",
+        )
+        self.assertRegex(
+            active,
+            r"REQUIRE\s*\(\s*unsetenv\s*\(\s*name\s*\)\s*==\s*0\s*\)",
+        )
+
+        windows_lines = "\n".join(
+            line for _, line in checker.windows_possible_lines(
+                checker.without_cpp_comments(source)
+            )
+        )
+        self.assertIn("::_putenv_s", windows_lines)
+        self.assertNotRegex(windows_lines, r"(?<!_)\b(?:setenv|unsetenv)\s*\(")
+
+        case_start = source.index(
+            'TEST_CASE("FusedChain matches the CPU oracle within NMSE <= 5e-4 '
+            '(both tiers)")'
+        )
+        case_end = source.index("\nTEST_CASE(", case_start + 1)
+        case = checker._cpp_structural_view(source[case_start:case_end])
+        self.assertEqual(len(re.findall(r"\bSetTestEnvironment\s*\(", case)), 3)
+        self.assertRegex(case, r"REQUIRE\s*\(\s*vt::FusedTier\s*\(\s*\)\s*==\s*tier")
+        self.assertIn("had_prev", case)
+        self.assertIn("saved", case)
+
     def test_posix_cache_source_requires_exact_not_win32_cmake_guard(self) -> None:
         source = "src/vt/cuda/nvfp4_persistent_cache.cpp"
         for condition, expected in (("NOT WIN32", {source}), ("WIN32", set()), ("NOT APPLE", set())):
