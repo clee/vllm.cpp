@@ -5,7 +5,8 @@ matrix](../backend-matrix.md)) · `QUANT-GGUF-COMPUTE`
 ([quantization matrix](../quantization-matrix.md)) ·
 `ROAD-V1-D1` punch-list item 13, CPU half
 ([roadmap-v1-completion](roadmap-v1-completion.md)) ·
-**issue:** [#433](https://github.com/mudler/vllm.cpp/issues/433) ·
+**issues:** [#433](https://github.com/mudler/vllm.cpp/issues/433),
+[#530](https://github.com/mudler/vllm.cpp/issues/530) ·
 **claim:** `CLAIM-CPU-X86-FLOOR-1` · **base:** `31a2b493`.
 
 ## Scope
@@ -289,3 +290,32 @@ presented G4's 3.38x/8.20x/2.29x as the live position. Both now point at
 **Out of scope and stated as such.** The Metal/MLX half of `ROAD-V1-D1`
 punch-list item 13 needs an Apple M4, which this host is not, and was not
 touched.
+
+### Follow-up repair contract: issue #530
+
+The exact release-repair candidate
+`6f5b98afd4019d6dca492e8ee1edc135163b9d5e` passed the full operator gate,
+then exposed a nondeterministic defect while the required handoff gate was
+being chained to its push. The smoke harness sets `BUSY_WINDOW=0` and
+`QUIET_BUSY=100`; `busy_pct` separately opens `/proc/stat` for `stat_busy` and
+`stat_total` at each side of that zero-length interval. On a contended host the
+counter boundaries disagree, producing impossible readings including 110%.
+`test_a_contended_leg_is_discarded_and_never_summarised` then exits 4 for no
+quiet window instead of reaching its intended foreign-work discard and exit 2.
+The same immutable tree passed when scheduling happened not to expose the split
+snapshot, and failed twice when chained to the push.
+
+Repair each sample, not the threshold. One read of the aggregate `cpu` line
+must derive both busy and total counters, and both `busy_pct` and `run_leg` must
+consume paired samples. Preserve which fields count as busy, the fresh-window
+policy, builder detection, `QUIET_BUSY`, `FOREIGN_MAX`, discard semantics,
+evidence format, and every accepted benchmark value. Do not clamp the result,
+raise a ceiling, add a retry to the unit test, or make contention disappear.
+
+RED-first coverage must reject the current split `stat_busy`/`stat_total`
+reads and require both call sites to use one paired snapshot. Mutation must
+restore a split sample independently in `busy_pct` and `run_leg`; each must
+make the focused contract red. Focused green is the complete
+`test_cpu_x86_llamacpp_floor.py` suite under current host contention. The fresh
+reviewer mutates both call sites, the operator runs the full preflight, and an
+unchanged exact SHA must pass that gate immediately before the plain push.
