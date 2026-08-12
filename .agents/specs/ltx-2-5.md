@@ -486,6 +486,35 @@ The DiT result does not transfer — different producer (torchao vs Lightricks `
 — and no second Gemma-4 checkpoint exists on the NAS to serve as an oracle. **torchao's own
 source is public and defines the packing**, and that is the cross-check owed.
 
+## 3.3 Where the two references DISAGREE, and which one we follow
+
+Recorded 2026-08-13 from L11. §3 says: *"Where they disagree, the disagreement is the
+finding."* This is the first place they actually do, and it is not a cosmetic difference.
+
+**The noised-state composition.** `ltx_core`'s `latent_cond.py:38-39` leaves the NOISY tensor
+untouched and lets the noiser compose it. diffusers writes clean tokens INTO the noisy tensor
+(`pipeline_ltx2_condition.py:1002`). **The two agree only at `noise_scale == 1`.**
+
+So at every other noise scale the conditioning differs, and the difference is invisible to any
+shape, finiteness or dtype check — it is a correct-looking render of subtly wrong conditioning.
+Following diffusers here would have been a silent divergence at every noise scale except one.
+
+**We follow `ltx_core`**, and the port asserts the noisy tensor is byte-identical, so the
+choice is pinned rather than incidental. The reasoning: `ltx_core` is the model author's own
+runtime and is what loads this checkpoint family, and §3 already names it the immediate
+cross-check while vLLM-Omni access stays pending. This is recorded as a CHOICE with a reason,
+not as an unnoticed coincidence.
+
+**Four further divergences**, all following `ltx_core`: diffusers has no frame-count crop (it
+dies in `unflatten`); `latent_log_var` is hardcoded to `uniform`; `norm3` is `GroupNorm(1)`
+where ours is `LayerNorm(C)` (shape-compatible, statistically different — the kind that passes
+every structural check); and diffusers has **no reference-audio conditioning at all**.
+
+**One thing only ONE reference attests.** diffusers has **no mel front-end whatsoever**, so
+slaney/slaney normalisation, centered-reflect padding and `power=1.0` rest on `ltx_core`
+alone. That is recorded at the code site. A single-source fact is weaker evidence than a
+cross-checked one and should be labelled as such rather than blend into the rest.
+
 ## 4. Checkpoint access and placement
 
 Verified against the HF API on 2026-08-11 with the session token:
