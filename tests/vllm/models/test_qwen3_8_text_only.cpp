@@ -335,6 +335,30 @@ std::vector<Spec> MoeOneLayerSpecs(const std::string& p) {
   AppendNvfp4(s, se + "up_proj", kMoeInter, kMoeHidden);
   AppendNvfp4(s, se + "down_proj", kMoeHidden, kMoeInter);
   AppendNvfp4(s, "lm_head", kMoeVocab, kMoeHidden);
+  // THE MTP DRAFT HEAD, AND WHY IT IS IN THE *SUPPORTED* FIXTURE. Read off the
+  // REAL gated index `nvidia/Qwen3.6-35B-A3B-NVFP4/model.safetensors.index.json`
+  // (124,468 tensors, fetched 2026-08-12): the checkpoint this loader is built
+  // for DOES carry the 3-D STACKED expert spelling — but only under the
+  // top-level `mtp.` prefix, as exactly these two names. Its 92 backbone layers
+  // are per-expert NVFP4 throughout (zero stacked names under
+  // `model.language_model.layers.`, zero expert `.weight` without a `_scale`
+  // sibling), and `lm_head.weight_scale` / `lm_head.weight_scale_2` are both
+  // present, so the checkpoint loads.
+  //
+  // It loads ONLY because `CheckMoeExpertLayoutSupported` scans names under
+  // `<backbone>layers.` (qwen3_5_weights.cpp:633,638) and `mtp.` is neither
+  // `model.layers.` nor `model.language_model.layers.`. That exclusion is
+  // LOAD-BEARING, not incidental: broadening the scan to every `.mlp.experts.`
+  // name would refuse the one checkpoint we gate today, on a CUDA-only load
+  // path, with the whole CPU suite still green. These two entries put the real
+  // index's shape into the fixture so that regression is CPU-visible — see the
+  // dedicated subcase in case 4c. `LoadQwen3_5Moe` never requests `mtp.*`
+  // (LoadQwen3_5MTP loads the draft head separately, only under speculative
+  // decoding), so they are inert to every other assertion here.
+  const std::string mtp = "mtp.layers.0.mlp.";
+  s.push_back({mtp + "experts.gate_up_proj",
+               {kMoeExperts, 2 * kMoeInter, kMoeHidden}});
+  s.push_back({mtp + "experts.down_proj", {kMoeExperts, kMoeHidden, kMoeInter}});
   return s;
 }
 
@@ -990,6 +1014,41 @@ TEST_CASE("qwen3_8: the published stacked/unquantized MoE arm is REFUSED, and th
     // both namespaces.
     CHECK(load(MoeOneLayerSpecs("model."), "inert_flat").empty());
     CHECK(load(MoeOneLayerSpecs("model.language_model."), "inert_vl").empty());
+  }
+
+  SUBCASE("the gated checkpoint's `mtp.` STACKED experts do not trip it either") {
+    // The one checkpoint this arm is actually gated on —
+    // `nvidia/Qwen3.6-35B-A3B-NVFP4`, 124,468 tensors in its published
+    // safetensors index — DOES contain the exact stacked spelling the first
+    // refusal rejects, as `mtp.layers.0.mlp.experts.{gate_up_proj,down_proj}`.
+    // It loads only because the scan is anchored at `<backbone>layers.`
+    // (qwen3_5_weights.cpp:633,638) and `mtp.` is under neither backbone
+    // spelling. Nothing else in this suite pins that, so a later edit
+    // broadening the scan to every `.mlp.experts.` name would refuse the
+    // checkpoint we gate — on a CUDA-only load path, with the whole CPU suite
+    // green. This subcase is that CPU-visible pin.
+    auto carries = [](const std::vector<Spec>& specs, const std::string& name) {
+      int hits = 0;
+      for (const Spec& x : specs) {
+        if (x.name == name) ++hits;
+      }
+      return hits;
+    };
+    // The fixture must still BE the real index's shape; a fixture that quietly
+    // lost these names would leave the two loads below proving nothing.
+    for (const char* p : {"model.", "model.language_model."}) {
+      CAPTURE(p);
+      const std::vector<Spec> specs = MoeOneLayerSpecs(p);
+      REQUIRE(carries(specs, "mtp.layers.0.mlp.experts.gate_up_proj") == 1);
+      REQUIRE(carries(specs, "mtp.layers.0.mlp.experts.down_proj") == 1);
+      // ...and they must be OUTSIDE the scanned namespace, which is the whole
+      // reason the refusal stays silent on them.
+      REQUIRE(carries(specs, std::string(p) +
+                                 "layers.0.mlp.experts.gate_up_proj") == 0);
+    }
+    CHECK(load(MoeOneLayerSpecs("model."), "mtp_stacked_flat").empty());
+    CHECK(load(MoeOneLayerSpecs("model.language_model."), "mtp_stacked_vl")
+              .empty());
   }
 }
 

@@ -319,6 +319,43 @@ literal RED in `tests/vllm/models/test_qwen3_8_text_only.cpp`. The DENSE loader
 routes BF16/FP8/NVFP4 by tensor presence and is not subject to that gap — the
 asymmetry is deliberate record, not an oversight.
 
+**The refusal was verified against the REAL gated checkpoint, and its `mtp.`
+exclusion is LOAD-BEARING.** Added 2026-08-12 after an independent review. The
+published `nvidia/Qwen3.6-35B-A3B-NVFP4` safetensors index was fetched and read
+directly (`model.safetensors.index.json`, **124,468 tensors**): it **does**
+contain the exact 3-D stacked spelling `CheckMoeExpertLayoutSupported` refuses,
+as `mtp.layers.0.mlp.experts.gate_up_proj` and `mtp.layers.0.mlp.experts
+.down_proj` — and only there. Under the resolved backbone
+(`model.language_model.`) there are **zero** stacked expert names, **zero**
+expert `.weight` without a `_scale` sibling, and both `lm_head.weight_scale` and
+`lm_head.weight_scale_2` are present. So the checkpoint we gate today is **not**
+refused — but only because the scan is anchored at `<backbone>layers.`
+(`qwen3_5_weights.cpp:633,638`) and `mtp.` is under neither backbone spelling.
+
+That exclusion was pinned by nothing in-tree. Broadening the scan to every
+`.mlp.experts.` name would refuse the one checkpoint this arm is gated on, on a
+**CUDA-only load path**, with the entire CPU suite still green. The supported
+fixture (`MoeOneLayerSpecs`) therefore now carries those two `mtp.` names, so
+the shape of the real index is what the inertness assertions run against, and
+case 4c gains a subcase that both re-asserts the fixture still carries them
+(count `== 1`, and zero under either backbone prefix) and that the load stays
+clean. RED-first: with the `<backbone>layers.` filter dropped, the new subcase
+fails with `3-D stacked routed experts are not implemented ... found
+"mtp.layers.0.mlp.experts.gate_up_proj"` (2 cases failed, `Status: FAILURE!`,
+assertion count 747 → 277 as the thrown cases abort); `src/` restored
+byte-for-byte afterwards and back to 7/7, 747/747.
+
+**What the "refused by name" guarantee does and does not cover.** It covers the
+routed experts and `lm_head` only: the stacked spelling, a per-expert `.weight`
+with no `.weight_scale` beside it, and an unquantized `lm_head` that is present
+(a checkpoint with no `lm_head.weight` at all is the tied-head case and is
+deliberately not this refusal). Everything else on the MoE path still surfaces
+its raw loader error — a bf16 **shared** expert, a bf16 (FP8-less) attention
+tower, the compressed-tensors `weight_packed` spelling, and a tied-head MoE
+checkpoint. No surface claims otherwise, so this is a clarification of scope
+rather than a gap; widening the refusal belongs with the owed stacked/bf16 arm,
+which has to read those layouts anyway.
+
 **Recorded as tracked debt** in [porting-inventory](../porting-inventory.md) §9
 deviation 17, with the two arms carried on its §5 Qwen3.5 row and the owed run
 gate on [BENCHMARKS](../../docs/BENCHMARKS.md) §Open gaps: the ahead-of-pin
