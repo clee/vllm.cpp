@@ -69,6 +69,10 @@ target_compile_definitions(test_video_engine PRIVATE
 # LTX-2.5 DiT parity gate (row MODEL-DIFFUSION-LTX25, spec phase L2). The goldens
 # live next to the test source, like every other generated .inc.
 vllm_cpp_add_test(test_ltx2 vllm/models/test_ltx2.cpp)
+# LTX-2.5 L4: the VAE bricks, gated against upstream ltx_core executed at reduced
+# dimensions. ltx2_vae_goldens.inc lives next to the test source.
+vllm_cpp_add_test(test_ltx2_vae vllm/models/test_ltx2_vae.cpp)
+target_include_directories(test_ltx2_vae PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
 vllm_cpp_add_test(test_video_api vllm/entrypoints/openai/test_video_api.cpp)
 target_include_directories(test_model_registry PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_platform vllm/platforms/test_platform.cpp)
