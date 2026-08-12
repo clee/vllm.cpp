@@ -253,7 +253,24 @@ def audio_self_mask() -> torch.Tensor:
     return make_param("input.audio.attention_mask", (BATCH, 1, AUDIO_TOKENS), 0.5, 0.5)
 
 
-def build_modalities(masked: bool, audio_enabled: bool = True):
+# The DENSE `(B, T, T)` self-attention mask — the form transformer_args.py:212-215
+# documents as *the* dense one, where every QUERY carries its own row of key
+# strengths. The key-only `(B, 1, T)` broadcast above cannot distinguish a kernel
+# that reads each query's own bias row from one that reads row 0 for every query,
+# because there is only one row; this shape is what separates them.
+def video_self_mask_dense() -> torch.Tensor:
+    return make_param(
+        "input.video.attention_mask_dense", (BATCH, VIDEO_TOKENS, VIDEO_TOKENS), 0.5, 0.5
+    )
+
+
+def audio_self_mask_dense() -> torch.Tensor:
+    return make_param(
+        "input.audio.attention_mask_dense", (BATCH, AUDIO_TOKENS, AUDIO_TOKENS), 0.5, 0.5
+    )
+
+
+def build_modalities(masked: bool, audio_enabled: bool = True, dense_self_mask: bool = False):
     from ltx_core.model.transformer.modality import Modality  # noqa: PLC0415
 
     video_ctx_mask = None
@@ -263,8 +280,12 @@ def build_modalities(masked: bool, audio_enabled: bool = True):
     if masked:
         video_ctx_mask = video_context_mask()
         audio_ctx_mask = audio_context_mask()
-        video_attn_mask = video_self_mask()
-        audio_attn_mask = audio_self_mask()
+        if dense_self_mask:
+            video_attn_mask = video_self_mask_dense()
+            audio_attn_mask = audio_self_mask_dense()
+        else:
+            video_attn_mask = video_self_mask()
+            audio_attn_mask = audio_self_mask()
 
     video = Modality(
         latent=rand_input("input.video.latent", (BATCH, VIDEO_TOKENS, ARCH["in_channels"]), 0.5),
@@ -595,14 +616,14 @@ def emit_bricks(out, model) -> None:
 
 def emit_forward(
     out, tag: str, rope_type_name: str, double_rope: bool, masked: bool,
-    audio_enabled: bool = True,
+    audio_enabled: bool = True, dense_self_mask: bool = False,
 ) -> None:
     out.write(
         f"// --- forward case {tag}: rope={rope_type_name} float64_freqs={double_rope} "
-        f"masked={masked} audio_enabled={audio_enabled} ---\n"
+        f"masked={masked} audio_enabled={audio_enabled} dense_self_mask={dense_self_mask} ---\n"
     )
     model = build_model(rope_type_name, double_rope)
-    video, audio = build_modalities(masked, audio_enabled)
+    video, audio = build_modalities(masked, audio_enabled, dense_self_mask)
     with torch.no_grad():
         vx, ax = model(video=video, audio=audio, perturbations=None)
     emit_f32(out, f"kLtx2Forward{tag}Video", tensor(vx))
@@ -616,6 +637,8 @@ def emit_masks(out) -> None:
     emit_i64(out, "kLtx2AudioContextMask", audio_context_mask())
     emit_f32(out, "kLtx2VideoSelfMask", tensor(video_self_mask()))
     emit_f32(out, "kLtx2AudioSelfMask", tensor(audio_self_mask()))
+    emit_f32(out, "kLtx2VideoSelfMaskDense", tensor(video_self_mask_dense()))
+    emit_f32(out, "kLtx2AudioSelfMaskDense", tensor(audio_self_mask_dense()))
 
 
 def main() -> int:
@@ -652,6 +675,11 @@ def main() -> int:
         # reads the audio state (:268), and the audio output head still runs over the
         # untouched patchified latent (model.py:527-536).
         emit_forward(out, "AudioOff", "split", False, False, audio_enabled=False)
+        # The DENSE (B, T, T) self-attention mask (transformer_args.py:212-215).
+        # Every query carries its OWN row of key strengths, so this case — and
+        # only this case — separates a kernel that indexes the bias by query from
+        # one that reads bias row 0 for every query.
+        emit_forward(out, "DenseMask", "split", False, True, dense_self_mask=True)
         out.write("}  // namespace vllm_test\n")
     print(f"wrote {args.out}", file=sys.stderr)
     return 0

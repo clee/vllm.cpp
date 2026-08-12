@@ -30,6 +30,7 @@
 #include "ltx2_goldens.inc"
 
 #include "vt/backend.h"
+#include "vt/op_provider.h"
 #include "vt/ops.h"
 #include "vt/tensor.h"
 
@@ -167,6 +168,19 @@ std::vector<float> Input(const std::string& name, int64_t count, double scale, d
   return MakeParam(name, count, scale, offset);
 }
 
+// The text of the refusal `run` throws, or "" when it does not throw at all. A
+// refusal is only useful if it NAMES what went wrong, so the message is part of
+// the contract and is asserted, not just the fact that something was thrown.
+template <typename Fn>
+std::string RefusalMessage(Fn run) {
+  try {
+    run();
+  } catch (const std::exception& e) {
+    return std::string(e.what());
+  }
+  return std::string();
+}
+
 double MaxAbsDiff(const std::vector<float>& got, const float* want, size_t count) {
   REQUIRE(got.size() == count);
   double worst = 0.0;
@@ -193,7 +207,7 @@ struct Modalities {
   Ltx2ModalityInput video, audio;
 };
 
-void BuildModalities(Modalities* m, bool masked) {
+void BuildModalities(Modalities* m, bool masked, bool dense_self_mask = false) {
   const int64_t b = vllm_test::kLtx2Batch;
   const int64_t tv = vllm_test::kLtx2VideoTokens;
   const int64_t ta = vllm_test::kLtx2AudioTokens;
@@ -241,16 +255,26 @@ void BuildModalities(Modalities* m, bool masked) {
                                vllm_test::kLtx2VideoContextMask + b * sv);
   m->audio_context_mask.assign(vllm_test::kLtx2AudioContextMask,
                                vllm_test::kLtx2AudioContextMask + b * sa);
-  m->video_self_mask.assign(vllm_test::kLtx2VideoSelfMask,
-                            vllm_test::kLtx2VideoSelfMask + b * tv);
-  m->audio_self_mask.assign(vllm_test::kLtx2AudioSelfMask,
-                            vllm_test::kLtx2AudioSelfMask + b * ta);
+  // The DENSE (B, T, T) form (transformer_args.py:212-215) gives every QUERY its
+  // own row of key strengths; the key-only (B, 1, T) broadcast has a single row
+  // and so cannot tell a per-query bias index from a constant row-0 read.
+  if (dense_self_mask) {
+    m->video_self_mask.assign(vllm_test::kLtx2VideoSelfMaskDense,
+                              vllm_test::kLtx2VideoSelfMaskDense + b * tv * tv);
+    m->audio_self_mask.assign(vllm_test::kLtx2AudioSelfMaskDense,
+                              vllm_test::kLtx2AudioSelfMaskDense + b * ta * ta);
+  } else {
+    m->video_self_mask.assign(vllm_test::kLtx2VideoSelfMask,
+                              vllm_test::kLtx2VideoSelfMask + b * tv);
+    m->audio_self_mask.assign(vllm_test::kLtx2AudioSelfMask,
+                              vllm_test::kLtx2AudioSelfMask + b * ta);
+  }
   m->video.context_mask = m->video_context_mask.data();
   m->audio.context_mask = m->audio_context_mask.data();
   m->video.attention_mask = m->video_self_mask.data();
-  m->video.attention_mask_rows = 1;
+  m->video.attention_mask_rows = dense_self_mask ? tv : 1;
   m->audio.attention_mask = m->audio_self_mask.data();
-  m->audio.attention_mask_rows = 1;
+  m->audio.attention_mask_rows = dense_self_mask ? ta : 1;
 }
 
 nlohmann::json ReducedConfig() {
@@ -543,6 +567,91 @@ TEST_CASE("ltx2 brick: per-head gated attention") {
         kRoundOff);
 }
 
+// Which shared op a call site dispatches must follow from what the call MEANS,
+// not from a coincidence in its numbers. A cross-attention whose prompt happens
+// to carry exactly `tokens` keys is still a cross-attention; routing it to
+// vt::Attention made the op — and therefore, on a device that has kAttention but
+// no kAttentionCross, the SUCCESS OR FAILURE of the call — depend on the prompt
+// length, so the same code path would serve one request and throw on the next.
+TEST_CASE("ltx2 attention: a CROSS call routes to vt::AttentionCross at ANY prompt length") {
+  const Ltx2DitParams p = ReducedParams(Ltx2RopeType::kSplit, false);
+  WeightSet set = BuildWeights(p);
+  const int64_t b = vllm_test::kLtx2Batch;
+  const int64_t tv = vllm_test::kLtx2VideoTokens;
+  const int64_t dim = p.inner_dim();
+  std::vector<float> x(vllm_test::kLtx2AttnGatedInput,
+                       vllm_test::kLtx2AttnGatedInput + b * tv * dim);
+  // The degenerate length: a prompt with EXACTLY as many keys as there are
+  // queries. `attn2` is the text cross-attention, so context_dim == query_dim.
+  std::vector<float> context(vllm_test::kLtx2A2vQuery, vllm_test::kLtx2A2vQuery + b * tv * dim);
+
+  vllm::Ltx2AttentionArgs a;
+  a.batch = b;
+  a.tokens = tv;
+  a.context_tokens = tv;  // S == Tq, and no mask: numerically square
+  a.query_dim = dim;
+  a.context_dim = dim;
+  a.heads = p.num_attention_heads;
+  a.dim_head = p.attention_head_dim;
+  a.norm_eps = p.norm_eps;
+
+  vt::EnableOpProviderCallStats(true);
+  const unsigned long long cross_before =
+      vt::GetOpProviderStats(vt::OpId::kAttentionCross, vt::DeviceType::kCPU).selections;
+  const unsigned long long self_before =
+      vt::GetOpProviderStats(vt::OpId::kAttention, vt::DeviceType::kCPU).selections;
+  const std::vector<float> cross_out =
+      vllm::Ltx2Attention(Cpu(), set.weights.blocks[0].attn2, x.data(), context.data(), a);
+  const unsigned long long cross_after =
+      vt::GetOpProviderStats(vt::OpId::kAttentionCross, vt::DeviceType::kCPU).selections;
+  const unsigned long long self_after =
+      vt::GetOpProviderStats(vt::OpId::kAttention, vt::DeviceType::kCPU).selections;
+  CHECK(cross_after == cross_before + static_cast<unsigned long long>(b));
+  CHECK(self_after == self_before);
+
+  // SELF-attention with no bias keeps its shared seam: vt::Attention, as the
+  // header says. The routing key is `context == nullptr`, not `S == Tq`.
+  const unsigned long long self_mid = self_after;
+  const std::vector<float> self_out =
+      vllm::Ltx2Attention(Cpu(), set.weights.blocks[0].attn1, x.data(), nullptr, a);
+  CHECK(vt::GetOpProviderStats(vt::OpId::kAttention, vt::DeviceType::kCPU).selections ==
+        self_mid + static_cast<unsigned long long>(b));
+  vt::EnableOpProviderCallStats(false);
+
+  REQUIRE(cross_out.size() == static_cast<size_t>(b * tv * dim));
+  REQUIRE(self_out.size() == cross_out.size());
+}
+
+// Routing is a DISPATCH choice and never an arithmetic one — which is what makes
+// it safe to route on the call's meaning instead of on its numbers. On the
+// unbiased square problem the two ops both accept, they must agree BIT-FOR-BIT.
+TEST_CASE("vt::Attention and vt::AttentionCross agree BIT-for-BIT on a square unbiased call") {
+  vt::Queue q{Cpu(), nullptr};
+  const int64_t t = 6, h = 2, d = 4;
+  std::vector<float> qb = Input("route.q", t * h * d, 0.5, 0.0);
+  std::vector<float> kb = Input("route.k", t * h * d, 0.5, 0.0);
+  std::vector<float> vb = Input("route.v", t * h * d, 0.5, 0.0);
+  std::vector<float> dense_out(static_cast<size_t>(t * h * d), 0.0f);
+  std::vector<float> cross_out(static_cast<size_t>(t * h * d), 0.0f);
+  vt::Tensor tq = vt::Tensor::Contiguous(qb.data(), vt::DType::kF32, Cpu(), {t, h, d});
+  vt::Tensor tk = vt::Tensor::Contiguous(kb.data(), vt::DType::kF32, Cpu(), {t, h, d});
+  vt::Tensor tv = vt::Tensor::Contiguous(vb.data(), vt::DType::kF32, Cpu(), {t, h, d});
+  vt::Tensor td = vt::Tensor::Contiguous(dense_out.data(), vt::DType::kF32, Cpu(), {t, h, d});
+  vt::Tensor tc = vt::Tensor::Contiguous(cross_out.data(), vt::DType::kF32, Cpu(), {t, h, d});
+  const float scale = static_cast<float>(1.0 / std::sqrt(static_cast<double>(d)));
+  vt::AttentionArgs dense;
+  dense.scale = scale;
+  dense.causal = false;
+  vt::Attention(q, td, tq, tk, tv, dense);
+  vt::AttentionCrossArgs cross;
+  cross.scale = scale;
+  vt::AttentionCross(q, tc, tq, tk, tv, nullptr, cross);
+  for (size_t i = 0; i < dense_out.size(); ++i) {
+    CAPTURE(i);
+    CHECK(cross_out[i] == dense_out[i]);
+  }
+}
+
 TEST_CASE("ltx2 brick: the asymmetric audio->video cross attention") {
   const Ltx2DitParams p = ReducedParams(Ltx2RopeType::kSplit, false);
   WeightSet set = BuildWeights(p);
@@ -617,12 +726,12 @@ namespace {
 
 void CheckForward(Ltx2RopeType rope_type, bool double_precision, bool masked,
                   const float* want_video, const float* want_audio, const char* label,
-                  bool audio_enabled = true) {
+                  bool audio_enabled = true, bool dense_self_mask = false) {
   INFO("forward case: " << std::string(label));
   const Ltx2DitParams p = ReducedParams(rope_type, double_precision);
   WeightSet set = BuildWeights(p);
   Modalities m;
-  BuildModalities(&m, masked);
+  BuildModalities(&m, masked, dense_self_mask);
   m.audio.enabled = audio_enabled;
   const vllm::Ltx2DitOutputs out =
       Ltx2DitForward(Cpu(), p, set.weights, &m.video, &m.audio, vt::DType::kF32);
@@ -658,6 +767,18 @@ TEST_CASE("ltx2 forward: the float64 frequency ladder") {
 TEST_CASE("ltx2 forward: prompt mask + self-attention strength mask") {
   CheckForward(Ltx2RopeType::kSplit, false, true, vllm_test::kLtx2ForwardMaskedVideo,
                vllm_test::kLtx2ForwardMaskedAudio, "masked");
+}
+
+// The DENSE `(B, T, T)` self-attention mask — upstream's documented dense form
+// (transformer_args.py:212-215), which the port accepts (`attention_mask_rows ==
+// tokens`) and `vt::AttentionCross` validates as a `[Tq, S]` bias. Every query
+// reads its OWN bias row here, so this case is what makes the per-query row
+// index observable: with a key-only mask there is exactly one row, and a kernel
+// that read row 0 for every query would be indistinguishable.
+TEST_CASE("ltx2 forward: a DENSE (B, T, T) self-attention mask, per-query rows") {
+  CheckForward(Ltx2RopeType::kSplit, false, true, vllm_test::kLtx2ForwardDenseMaskVideo,
+               vllm_test::kLtx2ForwardDenseMaskAudio, "dense self-attention mask",
+               /*audio_enabled=*/true, /*dense_self_mask=*/true);
 }
 
 TEST_CASE("ltx2 forward: a disabled audio stream still feeds audio->video") {
@@ -731,6 +852,105 @@ TEST_CASE("ltx2 prompt K/V: cached and recomputed are BIT-IDENTICAL") {
   CHECK(moved);
 }
 
+// The failure a SIZE check cannot see. Two requests whose prompts differ but
+// whose token counts agree — the ordinary case for a server that reuses one
+// cache — would otherwise render request 1's prompt for request 2, silently: no
+// shape mismatch, no non-finite value, no error. The cache carries a prompt
+// FINGERPRINT and refuses by name instead.
+TEST_CASE("ltx2 prompt K/V: a CHANGED prompt of the SAME length is REFUSED, not served") {
+  const Ltx2DitParams p = ReducedParams(Ltx2RopeType::kSplit, false);
+  WeightSet set = BuildWeights(p);
+  Modalities m;
+  BuildModalities(&m, false);
+
+  const vllm::Ltx2DitOutputs first_prompt =
+      Ltx2DitForward(Cpu(), p, set.weights, &m.video, &m.audio, vt::DType::kF32);
+  Ltx2PromptKvCache cache;
+  Ltx2DitForward(Cpu(), p, set.weights, &m.video, &m.audio, vt::DType::kF32, &cache);
+  REQUIRE(cache.valid);
+
+  // A DIFFERENT prompt with the IDENTICAL geometry: negate every context value.
+  for (float& value : m.video_context) value = -value;
+  for (float& value : m.audio_context) value = -value;
+
+  // GROUND TRUTH: the new prompt really does move the output, so a reuse that
+  // reproduces the old numbers is a stale render and not a coincidence.
+  const vllm::Ltx2DitOutputs second_prompt =
+      Ltx2DitForward(Cpu(), p, set.weights, &m.video, &m.audio, vt::DType::kF32);
+  bool ground_truth_moved = false;
+  for (size_t i = 0; i < first_prompt.video.size(); ++i) {
+    if (second_prompt.video[i] != first_prompt.video[i]) ground_truth_moved = true;
+  }
+  REQUIRE(ground_truth_moved);
+
+  CHECK_THROWS(
+      Ltx2DitForward(Cpu(), p, set.weights, &m.video, &m.audio, vt::DType::kF32, &cache));
+  // Refusing is half of it; the refusal has to say WHAT changed and what to do.
+  CHECK(RefusalMessage([&] {
+          Ltx2DitForward(Cpu(), p, set.weights, &m.video, &m.audio, vt::DType::kF32, &cache);
+        }).find("video prompt's CONTENTS") != std::string::npos);
+  CHECK(RefusalMessage([&] {
+          Ltx2DitForward(Cpu(), p, set.weights, &m.video, &m.audio, vt::DType::kF32, &cache);
+        }).find("Reset()") != std::string::npos);
+
+  // Reset() is the documented repair: it rebinds the cache to the NEW prompt and
+  // the result is bit-identical to a cache-free forward on that prompt.
+  cache.Reset();
+  const vllm::Ltx2DitOutputs rebound =
+      Ltx2DitForward(Cpu(), p, set.weights, &m.video, &m.audio, vt::DType::kF32, &cache);
+  REQUIRE(rebound.video.size() == second_prompt.video.size());
+  for (size_t i = 0; i < second_prompt.video.size(); ++i) {
+    CAPTURE(i);
+    CHECK(rebound.video[i] == second_prompt.video[i]);
+  }
+  for (size_t i = 0; i < second_prompt.audio.size(); ++i) {
+    CAPTURE(i);
+    CHECK(rebound.audio[i] == second_prompt.audio[i]);
+  }
+
+  // The audio prompt alone is enough, and the prompt MASK counts as part of the
+  // prompt: neither stream can hide behind the other.
+  Modalities audio_only;
+  BuildModalities(&audio_only, false);
+  Ltx2PromptKvCache audio_cache;
+  Ltx2DitForward(Cpu(), p, set.weights, &audio_only.video, &audio_only.audio, vt::DType::kF32,
+                 &audio_cache);
+  for (float& value : audio_only.audio_context) value = -value;
+  CHECK_THROWS(Ltx2DitForward(Cpu(), p, set.weights, &audio_only.video, &audio_only.audio,
+                              vt::DType::kF32, &audio_cache));
+  CHECK(RefusalMessage([&] {
+          Ltx2DitForward(Cpu(), p, set.weights, &audio_only.video, &audio_only.audio,
+                         vt::DType::kF32, &audio_cache);
+        }).find("audio prompt's CONTENTS") != std::string::npos);
+
+  // A shorter prompt is caught too — by NAME, not by the size check inside the
+  // attention, which reports geometry rather than identity.
+  Modalities shorter;
+  BuildModalities(&shorter, false);
+  Ltx2PromptKvCache shorter_cache;
+  Ltx2DitForward(Cpu(), p, set.weights, &shorter.video, &shorter.audio, vt::DType::kF32,
+                 &shorter_cache);
+  shorter.video.context_tokens -= 1;
+  CHECK(RefusalMessage([&] {
+          Ltx2DitForward(Cpu(), p, set.weights, &shorter.video, &shorter.audio, vt::DType::kF32,
+                         &shorter_cache);
+        }).find("video prompt's token count") != std::string::npos);
+}
+
+TEST_CASE("ltx2 prompt K/V: the prompt MASK is part of the prompt identity") {
+  const Ltx2DitParams p = ReducedParams(Ltx2RopeType::kSplit, false);
+  WeightSet set = BuildWeights(p);
+  Modalities m;
+  BuildModalities(&m, true);
+  Ltx2PromptKvCache cache;
+  Ltx2DitForward(Cpu(), p, set.weights, &m.video, &m.audio, vt::DType::kF32, &cache);
+  // Same context bytes, same lengths, one key unmasked: a different prompt.
+  m.video_context_mask[0] = m.video_context_mask[0] != 0 ? 0 : 1;
+  CHECK(RefusalMessage([&] {
+          Ltx2DitForward(Cpu(), p, set.weights, &m.video, &m.audio, vt::DType::kF32, &cache);
+        }).find("video prompt mask") != std::string::npos);
+}
+
 TEST_CASE("ltx2 prompt K/V: caching is REFUSED when the prompt AdaLN MLP is on") {
   Ltx2DitParams p = ReducedParams(Ltx2RopeType::kSplit, false);
   WeightSet set = BuildWeights(p);
@@ -773,6 +993,72 @@ TEST_CASE("vt::AttentionCross refuses what it cannot serve") {
   // An unset scale is refused rather than silently defaulting.
   vt::AttentionCrossArgs unscaled;
   CHECK_THROWS(vt::AttentionCross(q, to, tq, tk, tv, nullptr, unscaled));
+}
+
+// include/vt/ops.h documents that a device with no `kAttentionCross` provider
+// REFUSES BY NAME rather than falling back to a host kernel over device memory.
+// This is that claim, gated: a device type nothing registers this op on (and
+// which `ReferenceTierEligible` rejects, since no backend in this build claims
+// it) must throw, and the throw must name the op.
+TEST_CASE("vt::AttentionCross: a device with no provider refuses BY NAME") {
+  CHECK_FALSE(vt::OpRegistered(vt::OpId::kAttentionCross, vt::DeviceType::kXPU));
+  const std::string msg = RefusalMessage(
+      [] { (void)vt::GetOp(vt::OpId::kAttentionCross, vt::DeviceType::kXPU); });
+  CHECK(msg.find("AttentionCross") != std::string::npos);
+  CHECK(msg.find("xpu") != std::string::npos);
+}
+
+TEST_CASE("vt::AttentionCross: a DENSE [Tq, S] bias gives every query its OWN row") {
+  vt::Queue q{Cpu(), nullptr};
+  // Two IDENTICAL queries over two identical keys: the only thing that can make
+  // their outputs differ is the bias row each one reads. A kernel that read row 0
+  // for every query would return value row 0 twice.
+  std::vector<float> qb = {1.0f, 1.0f};
+  std::vector<float> kb = {1.0f, 1.0f};
+  std::vector<float> vb = {10.0f, 20.0f};
+  std::vector<float> ob(2, 0.0f);
+  vt::Tensor tq = vt::Tensor::Contiguous(qb.data(), vt::DType::kF32, Cpu(), {2, 1, 1});
+  vt::Tensor tk = vt::Tensor::Contiguous(kb.data(), vt::DType::kF32, Cpu(), {2, 1, 1});
+  vt::Tensor tv = vt::Tensor::Contiguous(vb.data(), vt::DType::kF32, Cpu(), {2, 1, 1});
+  vt::Tensor to = vt::Tensor::Contiguous(ob.data(), vt::DType::kF32, Cpu(), {2, 1, 1});
+  // Row 0 keeps key 0 and drops key 1; row 1 does the opposite.
+  std::vector<float> bias = {0.0f, -3.4028235e38f, -3.4028235e38f, 0.0f};
+  vt::Tensor tb = vt::Tensor::Contiguous(bias.data(), vt::DType::kF32, Cpu(), {2, 2});
+  vt::AttentionCrossArgs args;
+  args.scale = 1.0f;
+  vt::AttentionCross(q, to, tq, tk, tv, &tb, args);
+  CHECK(std::fabs(ob[0] - 10.0f) < 1e-6f);
+  CHECK(std::fabs(ob[1] - 20.0f) < 1e-6f);
+}
+
+// GQA broadcast (`g = h / (Hq / Hkv)`): a declared capability of this op that
+// every LTX attention happens not to exercise, because Hq == Hkv everywhere in
+// the model. Gate it here rather than ship it unreached.
+TEST_CASE("vt::AttentionCross: Hq > Hkv broadcasts each kv-head to its query group") {
+  vt::Queue q{Cpu(), nullptr};
+  // Tq=1, Hq=4, Hkv=2, D=1, S=1. Query heads 0,1 must read kv-head 0 and query
+  // heads 2,3 must read kv-head 1, so the output names its own group.
+  std::vector<float> qb = {1.0f, 1.0f, 1.0f, 1.0f};
+  std::vector<float> kb = {1.0f, 1.0f};
+  std::vector<float> vb = {7.0f, -3.0f};
+  std::vector<float> ob(4, 0.0f);
+  vt::Tensor tq = vt::Tensor::Contiguous(qb.data(), vt::DType::kF32, Cpu(), {1, 4, 1});
+  vt::Tensor tk = vt::Tensor::Contiguous(kb.data(), vt::DType::kF32, Cpu(), {1, 2, 1});
+  vt::Tensor tv = vt::Tensor::Contiguous(vb.data(), vt::DType::kF32, Cpu(), {1, 2, 1});
+  vt::Tensor to = vt::Tensor::Contiguous(ob.data(), vt::DType::kF32, Cpu(), {1, 4, 1});
+  vt::AttentionCrossArgs args;
+  args.scale = 1.0f;
+  vt::AttentionCross(q, to, tq, tk, tv, nullptr, args);
+  // A single key means the softmax is 1.0, so each output IS its kv-head's value.
+  CHECK(std::fabs(ob[0] - 7.0f) < 1e-6f);
+  CHECK(std::fabs(ob[1] - 7.0f) < 1e-6f);
+  CHECK(std::fabs(ob[2] + 3.0f) < 1e-6f);
+  CHECK(std::fabs(ob[3] + 3.0f) < 1e-6f);
+  // Hq that is not a multiple of Hkv has no defined grouping and is refused.
+  std::vector<float> q3(3, 1.0f), o3(3, 0.0f);
+  vt::Tensor tq3 = vt::Tensor::Contiguous(q3.data(), vt::DType::kF32, Cpu(), {1, 3, 1});
+  vt::Tensor to3 = vt::Tensor::Contiguous(o3.data(), vt::DType::kF32, Cpu(), {1, 3, 1});
+  CHECK_THROWS(vt::AttentionCross(q, to3, tq3, tk, tv, nullptr, args));
 }
 
 TEST_CASE("vt::AttentionCross: a fully masked key drops out of the softmax") {

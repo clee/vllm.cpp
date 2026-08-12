@@ -2174,9 +2174,12 @@ void Attention(Queue& q, Tensor& out, const Tensor& query, const Tensor& key,
 // BACKENDS, recorded so it cannot be discovered later: this op ships with a CPU
 // kernel only. On unified memory `RegisterReferenceTier` installs that kernel for
 // the accelerator, so a GB10-class device is served; a DISCRETE CUDA device has
-// no provider and `GetOp` refuses by name rather than falling back. The native
-// CUDA kernel is owed alongside the LTX-2.5 device-resident forward, which is the
-// first caller that would need it.
+// no provider and `GetOp` refuses, naming this op through `vt::OpName` rather
+// than falling back. The native CUDA kernel is owed alongside the LTX-2.5
+// device-resident forward, which is the first caller that would need it. Callers
+// route on what a call MEANS, not on whether its numbers happen to be square, so
+// that refusal is deterministic per call site instead of per prompt length —
+// see Ltx2Attention (src/vllm/model_executor/models/ltx2.cpp).
 void AttentionCross(Queue& q, Tensor& out, const Tensor& query, const Tensor& key,
                     const Tensor& value, const Tensor* bias, const AttentionCrossArgs& args);
 

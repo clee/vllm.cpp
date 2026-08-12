@@ -306,14 +306,47 @@ struct Ltx2CrossKv {
   std::vector<float> k, v;
 };
 
+// The identity of the PROMPT a cache was filled for.
+//
+// The cached K/V are timestep-independent, so reusing them across DENOISE STEPS
+// is exact. They are NOT prompt-independent, and a geometry check cannot tell
+// two different prompts of equal token count apart — which is precisely the case
+// a pipeline hits when one cache outlives one request. Serving request 1's K/V
+// to request 2 renders request 1's prompt with no shape mismatch, no non-finite
+// value and no error, so the cache carries a CONTENT fingerprint over both
+// streams' context tensors, their geometry, and their prompt masks, and a
+// mismatch is refused by name.
+//
+// The digests are FNV-1a over the raw bytes: an exact-identity test, never an
+// approximate one. Two prompts that differ in one f32 ulp are two prompts.
+struct Ltx2PromptIdentity {
+  int64_t batch = 0;
+  int64_t video_context_tokens = 0, audio_context_tokens = 0;
+  int64_t video_context_dim = 0, audio_context_dim = 0;
+  uint64_t video_context_digest = 0, audio_context_digest = 0;
+  uint64_t video_mask_digest = 0, audio_mask_digest = 0;
+};
+
 // Per-request cache of every block's text-cross-attention K/V, both streams.
-// `valid` is set by the first forward that fills it; later forwards reuse it.
-// Gated BIT-IDENTICAL against recomputation — a cache that silently diverges is
-// exactly the failure this is here to make impossible.
+// `valid` is set by the first forward that fills it; later forwards reuse it —
+// but ONLY for the prompt `prompt` records. Gated BIT-IDENTICAL against
+// recomputation, and gated to REFUSE a changed prompt: a cache that silently
+// diverges is exactly the failure this is here to make impossible.
 struct Ltx2PromptKvCache {
   bool valid = false;
+  Ltx2PromptIdentity prompt;
   std::vector<Ltx2CrossKv> video;  // one per block
   std::vector<Ltx2CrossKv> audio;  // one per block
+
+  // Unbind the cache from its prompt so the next forward re-fills it for a new
+  // one. This is how a pipeline REUSES the allocation across requests; anything
+  // else is refused rather than served stale.
+  void Reset() {
+    valid = false;
+    prompt = Ltx2PromptIdentity{};
+    video.clear();
+    audio.clear();
+  }
 };
 
 // Attention.forward (attention.py:520-579). `context` is nullptr for
@@ -374,6 +407,14 @@ struct Ltx2ModalityInput {
   bool enabled = true;              // Modality.enabled -> TransformerArgs.enabled
 };
 
+// The prompt identity a `Ltx2PromptKvCache` is bound to, over the two streams'
+// context tensors, their geometry and their prompt masks — every input the
+// cached K/V are a function of. Exposed so a caller can key its own per-request
+// cache the same way rather than re-deriving the rule.
+Ltx2PromptIdentity Ltx2PromptIdentityOf(const Ltx2DitParams& params,
+                                        const Ltx2ModalityInput& video,
+                                        const Ltx2ModalityInput& audio);
+
 struct Ltx2DitOutputs {
   std::vector<float> video;  // [batch, video tokens, out_channels]
   std::vector<float> audio;  // [batch, audio tokens, audio_out_channels]
@@ -395,6 +436,10 @@ struct Ltx2DitOutputs {
 // reused afterwards. It is only legal when `use_prompt_adaln_single` is false —
 // with the prompt AdaLN MLP enabled the K/V carry a timestep term and caching
 // them would be wrong, so that combination is refused rather than approximated.
+// A filled cache is bound to the PROMPT it was filled for: a call whose context
+// tensors, context geometry or prompt masks differ from that prompt is REFUSED
+// by name (call `Ltx2PromptKvCache::Reset()` to rebind it to a new request)
+// rather than served K/V that would render the previous prompt.
 Ltx2DitOutputs Ltx2DitForward(vt::Device device, const Ltx2DitParams& params,
                               const Ltx2DitWeights& weights, const Ltx2ModalityInput* video,
                               const Ltx2ModalityInput* audio, vt::DType compute_dtype,

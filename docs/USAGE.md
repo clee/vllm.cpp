@@ -1442,6 +1442,13 @@ is `include/vllm/model_executor/models/ltx2.h`, and it refuses by name every arm
 does not carry (a non-f32 stream dtype, the 19B caption-projection checkpoint form,
 keyframe absolute-position embeddings, the video-only / audio-only model types).
 
+The prompt-K/V cache (`Ltx2PromptKvCache`) is reusable across the DENOISE STEPS of
+one prompt, and only those. It records a fingerprint of the prompt it was filled
+for, and a forward whose context tensors, context geometry or prompt masks differ
+from that prompt is refused by name rather than served K/V that would render the
+cached prompt. Call `Ltx2PromptKvCache::Reset()` to rebind the same allocation to
+a new request.
+
 The gate runs the UPSTREAM modules at reduced dimensions on CPU, so it needs a
 Lightricks LTX-2 checkout and the system `python3` with torch — **no checkpoint, no
 venv and no gated download**. Regenerate the goldens and run it:

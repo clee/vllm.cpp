@@ -843,8 +843,16 @@ std::vector<float> Ltx2Attention(vt::Device device, const Ltx2AttentionWeights& 
                                      {s, heads, dim_head});
     Tensor to_t = Tensor::Contiguous(attn.data() + b * tq * inner, DType::kF32, device,
                                      {tq, heads, dim_head});
-    if (s == tq && args.bias == nullptr) {
-      // The self-attention shape the shared dense op already expresses.
+    // Route on what the call MEANS, never on what its numbers happen to be.
+    // `context == nullptr` is upstream's own self-attention marker
+    // (attention.py:556), and an unbiased self-attention is exactly what the
+    // shared dense op expresses. Keying this on `s == tq` instead made the
+    // DISPATCHED OP depend on the prompt length — and on a device that carries a
+    // kAttention kernel but no kAttentionCross one, that is the difference
+    // between a call that runs and a call that refuses, from one request to the
+    // next. The two ops agree bit-for-bit on the square unbiased problem, so this
+    // is a dispatch decision and not an arithmetic one.
+    if (context == nullptr && args.bias == nullptr) {
       vt::AttentionArgs a;
       a.scale = scale;
       a.causal = false;

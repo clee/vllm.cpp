@@ -1055,6 +1055,47 @@ Examples: `examples/cli` ✅ (C-API client), `examples/server` ✅ (OpenAI serve
     #51655 merging plus a pin advance that includes it; until then the row
     carries this deviation. Scope and gates: [muse-glimmer
     spec](specs/muse-glimmer.md) §0.
+17. **From-necessity dense non-causal CROSS attention (`vt::OpId::kAttentionCross`,
+    2026-08-11, `MODEL-DIFFUSION-ltx-2-5-ltx2-video-transformer-3d-model` phase L2,
+    issue [#435](https://github.com/mudler/vllm.cpp/issues/435)).** The pinned vLLM
+    (`555967922`, 0.26) has no dense non-causal attention op whose QUERY and KEY
+    token counts may differ: every attention entry point it exposes is a paged or
+    causal decode/prefill path, and `vt::Attention` inherited that assumption and
+    REJECTS `Tq != S` — which no cross-attention can satisfy. LTX-2.5's DiT is
+    four cross-attentions per block (text→video, text→audio, audio→video,
+    video→audio), so the op is a precondition for the model, not a convenience.
+    * **Upstream semantics mirrored:** torch
+      `scaled_dot_product_attention(q, k, v, attn_mask=..., is_causal=False)` as
+      LTX's `PytorchAttention` calls it — Lightricks/LTX-2 @ `fd4ded7f`,
+      `packages/ltx-core/src/ltx_core/model/transformer/attention.py:97-102`. The
+      additive-bias contract (both the `(mask - 1) * finfo.max` prompt form and the
+      log-space self-attention STRENGTH form, dense `[Tq, S]` and key-only `[1, S]`)
+      mirrors `transformer_args.py:199-237`.
+    * **Written from scratch** in the sense §9.1 means: the three-pass
+      max-subtract / exp / weighted-sum STRUCTURE is this tree's own
+      `AttentionKernel` (`src/vt/cpu/cpu_ops.cpp`) with the key extent taken from
+      the KEY's token count and the optional bias added before the max, so the two
+      agree bit-for-bit on a square unbiased call. No vLLM kernel was ported.
+    * **Local anchor:** `include/vt/ops.h` (`OpId::kAttentionCross` appended before
+      `kCount` — no id shift — plus `AttentionCrossArgs` and the declaration),
+      `src/vt/ops.cpp` (`vt::AttentionCross` validation), `src/vt/cpu/cpu_ops.cpp`
+      (`AttentionCrossKernel`, the CPU reference). Sole caller: `vllm::Ltx2Attention`
+      (`src/vllm/model_executor/models/ltx2.cpp`), which routes on `context ==
+      nullptr` — the call's MEANING — so the op a call site dispatches never depends
+      on the prompt length.
+    * **Backends:** CPU kernel only. `RegisterReferenceTier` installs it for a
+      UNIFIED-MEMORY accelerator, so GB10 is served; a DISCRETE device has no
+      provider and `GetOp` refuses naming the op (`vt::OpName`). The native CUDA
+      kernel is OWED alongside the LTX-2.5 device-resident forward (phase L6), which
+      is the first caller that would need it.
+    * **Tests and evidence:** `tests/vllm/models/test_ltx2.cpp` — the validation
+      refusals, the fully-masked-key softmax, the DENSE `[Tq, S]` per-query bias
+      rows, the `Hq > Hkv` GQA broadcast, bit-for-bit agreement with `vt::Attention`
+      on a square unbiased call, the no-provider refusal, and the six full-DiT
+      forward goldens (`scripts/gen-ltx2-goldens.py`, upstream `fd4ded7f`) that run
+      it inside the model.
+    * **Spec:** [ltx-2.5 spec](specs/ltx-2-5.md) §1.2 and §7. Lifecycle: shipped
+      (CPU), CUDA arm OWED. Owner: the LTX-2.5 row.
 
 ## 10. E2E test suites (T0 deliverable)
 

@@ -559,7 +559,91 @@ std::vector<float> ProcessOutput(vt::Device device, const vt::Tensor& table,
   return out;
 }
 
+// FNV-1a over raw bytes — the same 64-bit constants the golden generator's
+// parameter stream uses (scripts/gen-ltx2-goldens.py :: fnv1a64), so there is one
+// hash in this port and not two. This is an IDENTITY digest, never a similarity
+// one: it hashes the bytes, so -0.0f and 0.0f are different prompts and so are
+// two values one f32 ulp apart. That polarity is deliberate — a false refusal
+// costs one recompute, a false ACCEPT renders the wrong prompt.
+uint64_t Fnv1a64Bytes(const void* data, size_t bytes, uint64_t seed) {
+  const unsigned char* p = static_cast<const unsigned char*>(data);
+  uint64_t h = seed;
+  for (size_t i = 0; i < bytes; ++i) {
+    h ^= static_cast<uint64_t>(p[i]);
+    h *= 0x100000001B3ULL;
+  }
+  return h;
+}
+
+constexpr uint64_t kFnvOffsetBasis = 0xCBF29CE484222325ULL;
+
+// The digest of one stream's prompt: its context tensor, then its prompt mask.
+// The COUNT is folded in first so a shorter buffer can never hash to the same
+// value as a longer one that starts with the same bytes.
+uint64_t PromptDigest(const float* context, int64_t count) {
+  uint64_t h = Fnv1a64Bytes(&count, sizeof(count), kFnvOffsetBasis);
+  if (context == nullptr || count <= 0) return h;
+  return Fnv1a64Bytes(context, static_cast<size_t>(count) * sizeof(float), h);
+}
+
+uint64_t MaskDigest(const int32_t* mask, int64_t count) {
+  uint64_t h = Fnv1a64Bytes(&count, sizeof(count), kFnvOffsetBasis);
+  if (mask == nullptr || count <= 0) return h;
+  return Fnv1a64Bytes(mask, static_cast<size_t>(count) * sizeof(int32_t), h);
+}
+
+// Refuse by NAME: say which of the prompt's parts moved, and say what to do
+// about it. A pipeline that hits this is reusing one cache across two requests,
+// and the actionable repair is `Reset()` (or a per-request cache), never a
+// silent recompute that would hide the reuse bug.
+void CheckPromptIdentity(const Ltx2PromptIdentity& cached, const Ltx2PromptIdentity& call) {
+  const char* changed = nullptr;
+  if (cached.batch != call.batch) {
+    changed = "the batch size";
+  } else if (cached.video_context_tokens != call.video_context_tokens) {
+    changed = "the video prompt's token count";
+  } else if (cached.video_context_dim != call.video_context_dim) {
+    changed = "the video prompt's context width";
+  } else if (cached.audio_context_tokens != call.audio_context_tokens) {
+    changed = "the audio prompt's token count";
+  } else if (cached.audio_context_dim != call.audio_context_dim) {
+    changed = "the audio prompt's context width";
+  } else if (cached.video_context_digest != call.video_context_digest) {
+    changed = "the video prompt's CONTENTS (same length, different prompt)";
+  } else if (cached.audio_context_digest != call.audio_context_digest) {
+    changed = "the audio prompt's CONTENTS (same length, different prompt)";
+  } else if (cached.video_mask_digest != call.video_mask_digest) {
+    changed = "the video prompt mask";
+  } else if (cached.audio_mask_digest != call.audio_mask_digest) {
+    changed = "the audio prompt mask";
+  }
+  VT_CHECK(changed == nullptr,
+           std::string("ltx2: this prompt K/V cache was filled for a DIFFERENT prompt — ") +
+               (changed != nullptr ? changed : "") +
+               " changed. Reusing it would render the CACHED prompt for this request. Call "
+               "Ltx2PromptKvCache::Reset() (or use one cache per request) when the prompt "
+               "changes; the cache is only reusable across DENOISE STEPS of one prompt.");
+}
+
 }  // namespace
+
+Ltx2PromptIdentity Ltx2PromptIdentityOf(const Ltx2DitParams& params,
+                                        const Ltx2ModalityInput& video,
+                                        const Ltx2ModalityInput& audio) {
+  Ltx2PromptIdentity id;
+  id.batch = video.batch;
+  id.video_context_tokens = video.context_tokens;
+  id.audio_context_tokens = audio.context_tokens;
+  id.video_context_dim = params.cross_attention_dim;
+  id.audio_context_dim = params.audio_cross_attention_dim;
+  id.video_context_digest =
+      PromptDigest(video.context, video.batch * video.context_tokens * id.video_context_dim);
+  id.audio_context_digest =
+      PromptDigest(audio.context, audio.batch * audio.context_tokens * id.audio_context_dim);
+  id.video_mask_digest = MaskDigest(video.context_mask, video.batch * video.context_tokens);
+  id.audio_mask_digest = MaskDigest(audio.context_mask, audio.batch * audio.context_tokens);
+  return id;
+}
 
 Ltx2DitOutputs Ltx2DitForward(vt::Device device, const Ltx2DitParams& params,
                               const Ltx2DitWeights& weights, const Ltx2ModalityInput* video,
@@ -609,9 +693,19 @@ Ltx2DitOutputs Ltx2DitForward(vt::Device device, const Ltx2DitParams& params,
   }
 
   const bool use_cache = cache != nullptr;
-  if (use_cache && !cache->valid) {
-    cache->video.assign(static_cast<size_t>(params.num_layers), Ltx2CrossKv{});
-    cache->audio.assign(static_cast<size_t>(params.num_layers), Ltx2CrossKv{});
+  if (use_cache) {
+    // The cached K/V are a function of the PROMPT (and of nothing else on this
+    // path — that is what use_prompt_adaln_single=false buys). A filled cache is
+    // therefore bound to one prompt, and a call carrying another one is refused
+    // by name here, BEFORE any block reads a stale byte.
+    const Ltx2PromptIdentity id = Ltx2PromptIdentityOf(params, *video, *audio);
+    if (cache->valid) {
+      CheckPromptIdentity(cache->prompt, id);
+    } else {
+      cache->prompt = id;
+      cache->video.assign(static_cast<size_t>(params.num_layers), Ltx2CrossKv{});
+      cache->audio.assign(static_cast<size_t>(params.num_layers), Ltx2CrossKv{});
+    }
   }
 
   for (int64_t i = 0; i < params.num_layers; ++i) {
