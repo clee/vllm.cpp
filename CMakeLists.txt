@@ -765,6 +765,10 @@ add_library(vllm STATIC
   # aggregation, the two caption projections and the embedded asset pack. An
   # additive file mirroring ltx_core's own structure.
   src/vllm/model_executor/models/ltx2_text_encoder.cpp
+  # LTX-2.5 (ROW MODEL-DIFFUSION-LTX25, phase L6): the quantized loaders — the
+  # FP8 and torchao-NVFP4 DiT arms, the torchao-NVFP4 text encoder, and the
+  # load-time device staging GB10's ATS penalty makes the default.
+  src/vllm/model_executor/models/ltx2_loader.cpp
   src/vllm/entrypoints/openai/video_api.cpp
   src/vllm/model_executor/models/kimi_kda.cpp
   src/vllm/model_executor/models/kimi_linear_registry.cpp

@@ -77,6 +77,12 @@ target_include_directories(test_ltx2_vae PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vll
 # at reduced dimensions. ltx2_text_goldens.inc lives next to the test source.
 vllm_cpp_add_test(test_ltx2_text_encoder vllm/models/test_ltx2_text_encoder.cpp)
 target_include_directories(test_ltx2_text_encoder PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
+# LTX-2.5 L6: the quantized loaders, gated three ways — the SHIPPED checkpoints'
+# own manifests, a few hundred of their own bytes against torch, and synthetic
+# files for whole-model materialization. All three .inc files live beside the
+# test source.
+vllm_cpp_add_test(test_ltx2_loader vllm/models/test_ltx2_loader.cpp)
+target_include_directories(test_ltx2_loader PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
 vllm_cpp_add_test(test_video_api vllm/entrypoints/openai/test_video_api.cpp)
 target_include_directories(test_model_registry PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_platform vllm/platforms/test_platform.cpp)
