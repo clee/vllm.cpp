@@ -757,6 +757,11 @@ add_library(vllm STATIC
   # LTX-2.5 (row MODEL-DIFFUSION-LTX25, .agents/specs/ltx-2-5.md phase L2).
   src/vllm/model_executor/models/ltx2.cpp
   src/vllm/model_executor/models/ltx2_dit.cpp
+  # LTX-2.5 (row MODEL-DIFFUSION-LTX25, phase L8): the DEVICE-RESIDENT forward and
+  # the (kLtx2, device) resolver. The resolver is its own TU so the vt::GetOp cast
+  # links in CPU-only builds, exactly as minimax_h3_device_resolve.cpp is.
+  src/vllm/model_executor/models/ltx2_device_resolve.cpp
+  src/vllm/model_executor/models/ltx2_device.cpp
   # LTX-2.5 (ROW MODEL-DIFFUSION-LTX25, phase L4): the Conv video VAE, the audio
   # VAE and its vocoder. Additive files mirroring ltx_core's own structure.
   src/vllm/model_executor/models/ltx2_audio_vae.cpp
@@ -878,6 +883,11 @@ add_library(vllm STATIC
   # checkpoint-detected family registry — LTX-2.5 L1, .agents/specs/ltx-2-5.md
   # §5. Knows about no family; each family self-registers from its own TU.
   src/vllm/multimodal/video_engine.cpp
+  # LTX-2.5 behind that seam — the SECOND family, and the driving loop that
+  # composes the L2-L6 bricks into frames + a waveform (phase L7). Additive:
+  # one file plus one REGISTER_VLLM_VIDEO_FAMILY line, which is the property
+  # the seam exists to have.
+  src/vllm/multimodal/ltx2_video.cpp
   src/vllm/v1/core/encoder_cache_manager.cpp
   src/vllm/tokenizer/unicode_data.cpp
   src/vllm/tokenizer/pretokenizer.cpp
@@ -1073,6 +1083,7 @@ add_library(vllm STATIC
   src/vt/cpu/cpu_threadpool.cpp
   src/vt/cpu/cpu_ops.cpp
   src/vt/cpu/cpu_minimax_h3.cpp
+  src/vt/cpu/cpu_ltx2.cpp
   src/vt/cpu/cpu_isa_arm.cpp
   src/vt/cpu/cpu_isa_x86.cpp
   src/vt/cpu/cpu_matmul_elem.cpp
@@ -1462,7 +1473,9 @@ if(VLLM_CPP_CUDA)
     src/vt/cuda/cuda_sample.cu
     src/vt/cuda/cuda_deepseek_v4.cu
     src/vt/cuda/cuda_laguna.cu
-    src/vt/cuda/cuda_minimax_h3.cu)
+    src/vt/cuda/cuda_minimax_h3.cu
+    src/vt/cuda/cuda_ltx2.cu
+    src/vt/cuda/cuda_attention_cross.cu)
   find_package(CUDAToolkit REQUIRED)
   # cublasLt is linked now so the Task 4 matmul lands without a build change.
   target_link_libraries(vllm PUBLIC CUDA::cudart CUDA::cublasLt)

@@ -149,7 +149,7 @@ they sit outside the gated list above.
 | Voxtral audio (`VoxtralForConditionalGeneration`) | Voxtral-Mini-3B-2507 | near-tie-robust 16/16 vs vLLM 0.25.0 | decode 0.97x (beats vLLM); encoder TTFT ~17x, pending |
 | Whisper audio encoder | openai/whisper-small; whisper-large-v3 (Voxtral cfg) | encoder tower 77/77; large-v3 tower 203/203 | pending |
 | MiniMax-H3 DiT (`MiniMaxH3DiTModel`, vllm-omni lane) | MiniMax-H3 (33.1B video+audio) | portable 79/79; all three modalities COHERENT on Q4_K_M (§8.20); PRUNED ckpts run, Q8_0 seam 0.9941 (§8.21); ref2va grid was NVFP4 quant error, §8.9 REFUTED; GGUF/NVFP4/bf16 shards stream | FP4/Marlin landed; speed pending; no bf16 render yet. Render from the Q4_K_M GGUF, not the NVFP4 arm. Krea 2 text-to-image (roadmap C11) is scoped to reuse these DiT seams |
-| LTX-2.5 DiT (`LTX2VideoTransformer3DModel`, Lightricks lane) | LTX-2.5 (21.00B video+audio) | `SPIKE`, no e2e. DiT, BOTH VAE decoders, the PIPELINE layer and the QUANTIZED LOADERS gated vs upstream at reduced dims plus the shipped checkpoints' own bytes: max\|diff\| 1.2e-07 DiT, 1.8e-06 VAE, 2.8e-06 pipeline | Fits ONE GB10 at ~29 GB NVFP4. FP8 + torchao-NVFP4 arms load; DiT refuses 5 unported families by name. Prompt-K/V cache does NOT apply to the shipped checkpoint. DiffVAE, LoRA, multishot, guiders refused. Speed PENDING |
+| LTX-2.5 DiT (`LTX2VideoTransformer3DModel`, Lightricks lane) | LTX-2.5 (21.00B video+audio) | `SPIKE`. DiT, both VAE decoders, the pipeline layer and the quantized loaders gated vs upstream at reduced dims: max\|diff\| 1.2e-07 DiT, 1.8e-06 VAE, 2.8e-06 pipeline. Reachable as VideoEngine family `ltx-2.5`; STRUCTURAL e2e only, no render-quality claim | Fits ONE GB10 at ~29 GB NVFP4. FP8 + torchao-NVFP4 arms load. CPU (f32) and CUDA (`device=1`, bf16 device-resident). Text tower, DiffVAE, LoRA, image conditioning refused. FP4-resident arm OWED. Speed PENDING |
 | MTP speculator | Qwen3.6-27B, Qwen3.6-35B-A3B | token-identical to vLLM `mtp` at c1 | ~4% faster c1; +16% output tput (MoE) |
 | DFlash block-diffusion | Qwen3 (DFlash draft) | near-tie e2e 27/27 vs vLLM | 2.9x over spec-off, 1.003x vs vLLM DFlash-on |
 | DeepSeek-V4 MTP | DeepSeek-V4-Flash (nextn head) | lossless 5/5; real-model weight-blocked | pending |
@@ -280,7 +280,7 @@ Build with `-DVLLM_CPP_VULKAN=ON`; off by default.
 | Custom logits processor | `vllm_logits_processor` | reachable |
 | Embeddings / pooling (task=embed) | `vllm_embed`, `vllm_embedding_result_free` (ABI v15; pooling checkpoints load via `vllm_engine_load`) | reachable |
 | Audio transcription (Parakeet ASR) | `vllm_transcribe`, `vllm_transcription_params_default`, `vllm_transcription_free` | reachable |
-| Video+audio generation (MiniMax-H3) | `vllm_video_engine_load`, `vllm_video_generate`, `vllm_video_result_free`, `vllm_video_mux_argv` | reachable |
+| Video+audio generation (MiniMax-H3, LTX-2.5) | `vllm_video_engine_load`, `vllm_video_generate`, `vllm_video_result_free`, `vllm_video_mux_argv`, `vllm_video_engine_family` (ABI v18 family registry) | reachable |
 | Explicit device selection (auto/cpu/cuda) | `device` field on `vllm_model_params` (ABI v14; 0=auto keeps the probe, explicit absent device fails loud) | reachable |
 | Run the OpenAI server (server as a thin ABI client) | `vllm_server_main` (ABI v17) | reachable |
 | Multimodal input (image/audio/video) | none | embedder-unreachable | <!-- abi-capability-table:end -->

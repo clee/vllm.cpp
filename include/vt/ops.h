@@ -363,6 +363,18 @@ enum class OpId : uint8_t {
   kConv2d,
   kDepthwiseConv1d,
   kAttentionRelPos,
+  // LTX-2.5 DiT device-resident-forward glue table (phase L8). Only the seven
+  // small ops the shared vt:: surface does NOT already cover: the AdaLN table
+  // lookup, the AdaZero affine, the gated residual accumulate, the per-head
+  // attention gate, LTX's split/interleaved RoPE, the output head's
+  // table+embedded affine, and plain ungated SiLU. Everything else in the DiT
+  // forward reuses tuned shared ops (kMatmulBT, kRmsNorm, kLayerNorm, kGeluTanh,
+  // kAdd, kAttention, kAttentionCross), so this table stays deliberately small.
+  // Registered on BOTH kCPU and kCUDA (cpu_ltx2.cpp / cuda_ltx2.cu) so the
+  // device forward is exercised in CPU CI too; resolved via ltx2::Ltx2Device().
+  // Additive: only Ltx2DitForwardDevice dispatches it. Appended before kCount
+  // so no existing op's id shifts.
+  kLtx2,
   kCount
 };
 
@@ -2172,14 +2184,26 @@ void Attention(Queue& q, Tensor& out, const Tensor& query, const Tensor& key,
 // does. All softmax/accumulation math is f32.
 //
 // BACKENDS, recorded so it cannot be discovered later: this op ships with a CPU
-// kernel only. On unified memory `RegisterReferenceTier` installs that kernel for
-// the accelerator, so a GB10-class device is served; a DISCRETE CUDA device has
-// no provider and `GetOp` refuses, naming this op through `vt::OpName` rather
-// than falling back. The native CUDA kernel is owed alongside the LTX-2.5
-// device-resident forward, which is the first caller that would need it. Callers
-// route on what a call MEANS, not on whether its numbers happen to be square, so
-// that refusal is deterministic per call site instead of per prompt length —
-// see Ltx2Attention (src/vllm/model_executor/models/ltx2.cpp).
+// kernel (`AttentionCrossKernel`, src/vt/cpu/cpu_ops.cpp) AND — since phase L8,
+// 2026-08-12 — a NATIVE CUDA kernel (src/vt/cuda/cuda_attention_cross.cu). An
+// earlier revision of this paragraph recorded the CUDA one as OWED "alongside the
+// LTX-2.5 device-resident forward, which is the first caller that would need it";
+// that caller arrived and so did the kernel, in the same change, and a CUDA
+// device now has a real provider rather than a refusal or a unified-memory
+// fallback to the host.
+//
+// The CUDA kernel is a structural port of `AttentionDenseFlashKernel`
+// (src/vt/cuda/cuda_ops.cu), generalized on the three axes AttentionCrossArgs
+// exists for. It uses the online-softmax recurrence where the CPU kernel uses the
+// explicit three-pass max/exp/normalize, so the two agree to f32 summation-order
+// slack and are NOT bit-identical — the same relationship `AttentionDenseFast`
+// already has with `AttentionKernel`.
+//
+// A device with NO provider — kXPU, say — still refuses through `GetOp`, naming
+// this op via `vt::OpName` rather than falling back. Callers route on what a call
+// MEANS, not on whether its numbers happen to be square, so that refusal is
+// deterministic per call site instead of per prompt length — see Ltx2Attention
+// (src/vllm/model_executor/models/ltx2.cpp).
 void AttentionCross(Queue& q, Tensor& out, const Tensor& query, const Tensor& key,
                     const Tensor& value, const Tensor* bias, const AttentionCrossArgs& args);
 

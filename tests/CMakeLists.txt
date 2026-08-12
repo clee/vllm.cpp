@@ -81,9 +81,17 @@ target_include_directories(test_video_engine PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
 target_compile_definitions(test_video_engine PRIVATE
   MINIMAX_H3_VIDEO_FOLD_FIXTURE_DIR="${CMAKE_SOURCE_DIR}/tests/vllm/models/fixtures/minimax_h3_video_fold")
+# LTX-2.5 L7: the family behind the VideoEngine seam and the driving loop, run
+# over a reduced-dimension checkpoint set written in the SHIPPED file format.
+vllm_cpp_add_test(test_ltx2_video vllm/multimodal/test_ltx2_video.cpp)
 # LTX-2.5 DiT parity gate (row MODEL-DIFFUSION-LTX25, spec phase L2). The goldens
 # live next to the test source, like every other generated .inc.
 vllm_cpp_add_test(test_ltx2 vllm/models/test_ltx2.cpp)
+# LTX-2.5 L8: the DEVICE-RESIDENT forward, held to the SAME ltx2_goldens.inc the
+# L2 CPU gate above is held to. Its own target so test_ltx2's recorded 29/1615
+# baseline stays exactly where it is; it runs on the CPU backend everywhere and
+# adds the CUDA cases when a CUDA backend is registered.
+vllm_cpp_add_test(test_ltx2_device vllm/models/test_ltx2_device.cpp)
 # LTX-2.5 L4: the VAE bricks, gated against upstream ltx_core executed at reduced
 # dimensions. ltx2_vae_goldens.inc lives next to the test source.
 vllm_cpp_add_test(test_ltx2_vae vllm/models/test_ltx2_vae.cpp)
@@ -1158,6 +1166,13 @@ vllm_cpp_add_test(test_ops_moe vt/test_ops_moe.cpp)
 vllm_cpp_add_test(test_ops_glue vt/test_ops_glue.cpp)
 vllm_cpp_add_test(test_ops_attn_preamble vt/test_ops_attn_preamble.cpp)
 vllm_cpp_add_test(test_ops_attention vt/test_ops_attention.cpp)
+# vt::AttentionCross, DIRECTLY, on every backend that registers it. Its own
+# target rather than more cases in test_ops_attention or test_ltx2_device, both
+# of which carry recorded baselines. It exists because the CUDA kernel's whole
+# flash-tiling machinery (cross-tile rescale, multi-block launch, npl>1 head
+# split, GQA broadcast, ChooseTileCols' halving) is unreachable from every
+# LTX-2.5 call geometry, which is tiles=1/npl=1/nblk=1/Hq==Hkv throughout.
+vllm_cpp_add_test(test_ops_attention_cross vt/test_ops_attention_cross.cpp)
 vllm_cpp_add_test(test_ops_dflash_block_attn vt/test_ops_dflash_block_attn.cpp)
 vllm_cpp_add_test(test_ops_dflash_paged_block_attn vt/test_ops_dflash_paged_block_attn.cpp)
 vllm_cpp_add_test(test_ops_reshape_cache vt/test_ops_reshape_cache.cpp)

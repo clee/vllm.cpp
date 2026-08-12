@@ -110,8 +110,13 @@
 #include <string>
 #include <vector>
 
+#include <nlohmann/json.hpp>
+
 #include "vllm/model_executor/models/ltx2.h"
+#include "vllm/model_executor/models/ltx2_audio_vae.h"
 #include "vllm/model_executor/models/ltx2_text_encoder.h"
+#include "vllm/model_executor/models/ltx2_upsampler.h"
+#include "vllm/model_executor/models/ltx2_video_vae.h"
 #include "vt/backend.h"
 #include "vt/dtype.h"
 #include "vt/tensor.h"
@@ -330,5 +335,129 @@ Ltx2TextEncoderCheckpoint Ltx2LoadTextEncoderFromSafetensors(
 // at the shipped widths — which is exactly why it is not what loading does.
 Ltx2TextEncoderWeights Ltx2WidenTextProjectionsToF32(
     const Ltx2TextEncoderCheckpoint& checkpoint);
+
+// ---------------------------------------------------------------------------
+// The VAEs, the upsampler and the duration head (phase L7)
+// ---------------------------------------------------------------------------
+//
+// Every one of these ships as a plain bf16 safetensors file whose CONFIG rides
+// in the file's own `__metadata__["config"]`, exactly as upstream's
+// `SafetensorsModelStateDictLoader().metadata(path)` reads it
+// (video_vae/model_configurator.py:21-24, audio_vae/model_configurator.py:50,
+// :109). So a sibling JSON is not merely unnecessary here — reading one would
+// let a caller pair a config with weights it does not describe, which is the
+// mis-load this whole seam exists to refuse.
+
+// The parsed `__metadata__["config"]` object. Throws BY NAME when the key is
+// absent or is not a JSON object: a VAE whose geometry has to be GUESSED
+// decodes to a plausible, finite, wrong picture.
+nlohmann::json Ltx2ReadCheckpointConfig(const SafetensorsFile& file);
+
+// Adopt a `{"transformer": {...}}` DiT configuration onto the params the SHAPES
+// resolved, or refuse by name.
+//
+// WHAT THIS DECIDES, and why it is not cosmetic. `Ltx2ParseDitParamsFromManifest`
+// reads shapes, which is the only thing a ComfyUI-flavoured checkpoint offers. A
+// config states what no shape encodes — `frequencies_precision`,
+// `av_ca_timestep_scale_multiplier`, the positional-embedding bounds and theta,
+// `norm_eps`, `use_middle_indices_grid`. Each moves every RoPE angle or every
+// modulation while leaving the tensor set byte-identical, so the manifest path
+// resolves a DIFFERENT MODEL from the same file and nothing downstream can tell.
+//
+// A config is believed only when `EnumerateLtx2DitTensors` over it reproduces the
+// IDENTICAL weight contract `from_shapes` produces. That is what proves it
+// describes THIS file rather than another checkpoint's config pasted beside it;
+// a disagreement is refused rather than resolved in either direction, because
+// taking the shapes renders with the wrong RoPE and taking the config binds the
+// wrong tensors.
+//
+// ONE FUNCTION, because two callers must not answer this differently: the video
+// engine (`Ltx2VideoEngine::Load`) and the device gate, which drives
+// `Ltx2StreamDitToDevice` directly and therefore owes the same adoption.
+//
+// `allow_unported_modules` clears `use_keyframes_abs_pos_embedding` IN A COPY of
+// the config before parsing, mirroring what the loader does for
+// `use_prompt_adaln_single`: the flag is cleared for the CONTRACT, the module
+// stays unported, and the checkpoint's `unported` list still names it. Without
+// the opt-in `ParseLtx2DitParams` throws, which is the refusal.
+//
+// `source` names the config in every refusal, so a reader knows whether the
+// checkpoint declared it or a caller supplied it.
+Ltx2DitParams Ltx2AdoptDeclaredDitParams(const nlohmann::json& config,
+                                         const Ltx2DitParams& from_shapes,
+                                         bool allow_unported_modules,
+                                         const std::string& source);
+
+// `__metadata__["model_version"]` ("2.5.0"), which is what
+// `detect_model_version` reads to pick a recipe (ltx-pipelines
+// utils/constants.py:161) and what `should_use_ancestral_sampler` keys on
+// (distilled.py:84). Empty when the file declares none — never defaulted to a
+// generation, because defaulting one picks a sigma schedule that renders.
+std::string Ltx2ReadCheckpointModelVersion(const SafetensorsFile& file);
+
+// One `SDOps` key rule: a name is KEPT when it starts with `match_prefix`, and
+// that prefix is then rewritten to `replacement`. Mirrors
+// `SDOps.with_matching(prefix=...)` + `.with_replacement(from, to)`
+// (loader/sd_ops.py), which is how every shipped VAE file's ComfyUI-flavoured
+// names are turned into the module's own `state_dict` names. A rule set is
+// applied IN ORDER and the first matching rule wins, so the longer prefixes come
+// first exactly as upstream's chained filters list them.
+//
+// A name matched by NO rule is dropped, which is upstream's behaviour and is
+// what lets one file hold the encoder, the decoder and the vocoder at once.
+struct Ltx2VaeKeyRule {
+  std::string match_prefix;
+  std::string replacement;
+};
+
+// The three shipped filters, verbatim:
+//   VAE_DECODER_COMFY_KEYS_FILTER        video_vae/model_configurator.py:255-265
+//   AUDIO_VAE_DECODER_COMFY_KEYS_FILTER  audio_vae/model_configurator.py:184-190
+//   VOCODER_COMFY_KEYS_FILTER            audio_vae/model_configurator.py:91-103
+// The vocoder's rule strips `vocoder.` EXACTLY ONCE (`removeprefix`, :91-97), so
+// `vocoder.vocoder.conv_pre` becomes `vocoder.conv_pre` and NOT `conv_pre` —
+// which is the difference between the BWE chain finding its two generators and
+// binding both of them to one name.
+std::vector<Ltx2VaeKeyRule> Ltx2VideoVaeDecoderKeyRules();
+std::vector<Ltx2VaeKeyRule> Ltx2AudioVaeDecoderKeyRules();
+std::vector<Ltx2VaeKeyRule> Ltx2VocoderKeyRules();
+
+// Every tensor a rule set keeps, widened to f32 and keyed by the REWRITTEN name,
+// which is `Ltx2VaeWeights`' whole contract (ltx2_audio_vae.h:60-70). BF16 and
+// F32 are the only dtypes these files carry; anything else throws by name rather
+// than being reinterpreted. An empty rule set keeps every name unchanged.
+//
+// f32 here is NOT a widening of a production path: `Ltx2VaeWeights` is declared
+// f32 by phases L4/L5 because f32 is their parity dtype, and this materializes
+// onto that declared contract. The VAEs together are ~1.8 GB bf16, so the
+// widened copy is ~3.7 GB — small next to the DiT, and the reason the DiT does
+// NOT take this path.
+Ltx2VaeWeights Ltx2LoadVaeWeights(const SafetensorsFile& file,
+                                  const std::vector<Ltx2VaeKeyRule>& rules = {});
+
+// `_build_conv_video_decoder` (video_vae/model_configurator.py:81-94) applied to
+// `config["vae"]`, plus `_vae_class_name_from_metadata` (:21-24) recovered into
+// `*out_kind` so a `CausalDiffusionVAE` checkpoint is REFUSED by
+// `Ltx2VideoDecode` rather than decoded by the conv arm.
+Ltx2ConvVideoDecoderConfig Ltx2ParseConvVideoDecoderConfig(const nlohmann::json& config,
+                                                            Ltx2VideoDecoderKind* out_kind);
+
+// `AudioDecoderConfigurator.from_metadata` (audio_vae/model_configurator.py:108-141).
+Ltx2AudioDecoderConfig Ltx2ParseAudioDecoderConfig(const nlohmann::json& config);
+
+// `LatentUpsamplerConfigurator.from_metadata` (upsampler/model_configurator.py:14-21).
+// Unlike the two VAEs this config is FLAT — the shipped
+// `ltx-2.5-latent-spatial-upscaler-x2` writes its keys at the top level of
+// `__metadata__["config"]`, with no `vae` wrapper — so it is read from the
+// object itself. `temporal_upsample` is left as the file states it and refused
+// downstream by `Ltx2LatentUpsample`, which is where the missing arm lives.
+Ltx2UpsamplerConfig Ltx2ParseUpsamplerConfig(const nlohmann::json& config);
+
+// `VocoderConfigurator.from_metadata`, the BWE branch
+// (audio_vae/model_configurator.py:49-88). The legacy flat branch (:53-56) is
+// REFUSED by name: it is the pre-2.3 `resblock == "1"` vocoder, no LTX-2.5
+// checkpoint carries it, and silently building it would emit audio from the
+// wrong generator. Every `check_config_value` upstream asserts is asserted here.
+Ltx2VocoderBweConfig Ltx2ParseVocoderBweConfig(const nlohmann::json& config);
 
 }  // namespace vllm

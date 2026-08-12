@@ -462,6 +462,8 @@ const char* OpNameImpl(OpId op) {
       return "MarlinDenseGemm";
     case OpId::kMiniMaxH3:
       return "MiniMaxH3";
+    case OpId::kLtx2:
+      return "Ltx2";
     case OpId::kConv2d:
       return "Conv2d";
     case OpId::kDepthwiseConv1d:
