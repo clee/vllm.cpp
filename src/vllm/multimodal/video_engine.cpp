@@ -8,6 +8,7 @@
 #include "vllm/multimodal/video_engine.h"
 
 #include <algorithm>
+#include <cassert>
 #include <cstdio>
 #include <exception>
 #include <fstream>
@@ -32,27 +33,26 @@ namespace {
 // REGISTER_VLLM_VIDEO_FAMILY registrar. Meyers singleton: the vector is
 // constructed on the first RegisterVideoFamily call, safely before any
 // registrar body runs.
+//
+// TWO INVARIANTS, both established by RegisterVideoFamily and therefore true
+// after EVERY registration rather than after the first query: the table is
+// sorted by name, and no name appears twice. "After every registration" is the
+// load-bearing half. `RegisterVideoFamily` is a public header function, so a
+// caller may register long after main started — canonicalizing once, on first
+// query, would silently append everything that arrived afterwards in whatever
+// order it arrived, and any adjacency-based reasoning downstream would then be
+// reasoning about a list that is no longer sorted.
 std::vector<VideoFamilyRegistration>& RegistryStorage() {
   static std::vector<VideoFamilyRegistration> storage;
   return storage;
 }
 
-// C++ does not order static init across TUs, so arrival order is unspecified.
-// Sort by family name once, on first query (after all static init), so the
-// listing a refusal prints is deterministic. Resolution itself is
-// order-independent — exactly one detector may claim a checkpoint — so this
-// sort can never change WHICH family loads, only how the list reads.
-const std::vector<VideoFamilyRegistration>& OrderedRegistry() {
-  [[maybe_unused]] static const bool sorted = [] {
-    std::vector<VideoFamilyRegistration>& storage = RegistryStorage();
-    std::stable_sort(storage.begin(), storage.end(),
-                     [](const VideoFamilyRegistration& a, const VideoFamilyRegistration& b) {
-                       return a.name < b.name;
-                     });
-    return true;
-  }();
-  return RegistryStorage();
-}
+// The registry as every reader sees it. C++ does not order static init across
+// TUs, but arrival order is invisible here because the table is kept sorted at
+// insertion. Ordering can only change how a refusal READS, never which family
+// loads: resolution is order-independent by construction, since exactly one
+// detector may claim a checkpoint and exactly one entry may carry a name.
+const std::vector<VideoFamilyRegistration>& OrderedRegistry() { return RegistryStorage(); }
 
 bool IsDir(const std::string& path) {
   struct stat st {};
@@ -172,13 +172,43 @@ void RegisterVideoFamily(VideoFamilyRegistration registration) {
     throw std::runtime_error("video engine: family '" + registration.name +
                              "' must register both a detector and a loader");
   }
-  RegistryStorage().push_back(std::move(registration));
+  std::vector<VideoFamilyRegistration>& storage = RegistryStorage();
+  const auto at = std::lower_bound(
+      storage.begin(), storage.end(), registration.name,
+      [](const VideoFamilyRegistration& r, const std::string& name) { return r.name < name; });
+  // A DUPLICATE NAME IS NOT A LISTING BLEMISH, IT IS A SILENT MIS-LOAD. Two
+  // registrations under one name defeat every guard downstream at once: the
+  // listing a refusal prints shows one family, DetectVideoFamilies returns the
+  // same name twice so the SEVERAL-claimants refusal never fires, and
+  // LoadVideoEngine takes the FIRST matching entry — which makes the choice of
+  // loader a function of static-init and link order. Refuse here, at the one
+  // point where the collision is still nameable.
+  //
+  // Registrars run at static init, so this throw terminates the process rather
+  // than unwinding into anything that could handle it. That is the intended
+  // outcome and the same one the empty-name and missing-callback refusals above
+  // already produce: two families claiming one name is a BUILD defect, and a
+  // process that dies naming it is strictly better than one that renders noise.
+  if (at != storage.end() && at->name == registration.name) {
+    throw std::runtime_error(
+        "video engine: family '" + registration.name +
+        "' is already registered — two families cannot share one name, because resolution would "
+        "then pick between them by link order and a checkpoint handed to the wrong family does "
+        "not fail, it renders noise");
+  }
+  storage.insert(at, std::move(registration));
 }
 
 std::vector<std::string> RegisteredVideoFamilies() {
   std::vector<std::string> names;
   for (const VideoFamilyRegistration& r : OrderedRegistry()) names.push_back(r.name);
-  names.erase(std::unique(names.begin(), names.end()), names.end());
+  // NOT de-duplicated. RegisterVideoFamily refuses a name already present, so a
+  // duplicate cannot reach the table; the std::unique this replaces was not
+  // protecting the listing but HIDING that violation — it collapsed the printed
+  // names while leaving two entries in the registry for resolution to pick
+  // between. The assertion states the invariant instead of papering over it.
+  assert(std::is_sorted(names.begin(), names.end()));
+  assert(std::adjacent_find(names.begin(), names.end()) == names.end());
   return names;
 }
 
@@ -230,7 +260,11 @@ std::vector<std::string> DetectVideoFamilies(const VideoModelParams& params) {
     }
     if (claimed) claimants.push_back(r.name);
   }
-  claimants.erase(std::unique(claimants.begin(), claimants.end()), claimants.end());
+  // NOT de-duplicated, for the same reason: registry names are unique, so two
+  // claimants ARE two families and the caller must see both. A std::unique here
+  // would merge a duplicate-name pair back into a single claimant and let the
+  // SEVERAL refusal fall through into a load.
+  assert(std::adjacent_find(claimants.begin(), claimants.end()) == claimants.end());
   return claimants;
 }
 
@@ -250,6 +284,19 @@ std::unique_ptr<VideoEngine> LoadVideoEngine(const VideoModelParams& params) {
     }
   }
   if (claimants.empty()) {
+    // "Declare the family explicitly" is the right advice for a checkpoint no
+    // detector claimed. It is a DEAD END for a caller who supplied no
+    // checkpoint at all: the declared loader would still have nothing to open,
+    // so following it produces a second, more confusing refusal. Name the
+    // missing input instead, and say what would satisfy it.
+    if (params.dit_path.empty()) {
+      throw std::runtime_error(
+          "video engine: no dit_path was supplied, so there is no checkpoint to determine a "
+          "model family from. Supply dit_path — the denoiser artifact: a GGUF file, a "
+          "safetensors file, or a multi-shard directory holding its index. Registered "
+          "families: " +
+          FamilyList());
+    }
     throw std::runtime_error(
         "video engine: cannot determine the model family of dit_path '" + params.dit_path + "' — " +
         DescribeCheckpoint(params.dit_path) + ". Registered families: " + FamilyList() +

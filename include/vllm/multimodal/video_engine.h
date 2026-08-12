@@ -184,11 +184,20 @@ struct VideoFamilyRegistration {
   VideoFamilyLoader load;
 };
 
+// Add a family to the process-global registry. Throws std::runtime_error on an
+// empty name, a missing detector or loader, or A NAME ALREADY REGISTERED — the
+// last because two families sharing one name is the never-guess guarantee
+// defeated from the inside: the listing shows one family, two claimants collapse
+// into one name so the SEVERAL-claimants refusal cannot fire, and which loader
+// runs falls to link order. Registrars run at static init, so a refusal there
+// ends the process; that is intended, since a name collision is a build defect
+// and a checkpoint handed to the wrong family renders noise rather than failing.
 void RegisterVideoFamily(VideoFamilyRegistration registration);
 
-// Every registered family name, sorted and duplicate-free (static-init order
-// across TUs is unspecified, so the listing is canonicalized on first query —
-// the model registry's precedent). This listing is what refusals print.
+// Every registered family name, sorted and duplicate-free — invariants of the
+// registry itself (RegisterVideoFamily inserts in order and refuses a
+// collision), so they hold however static init ordered the TUs and however late
+// a caller registers. This listing is what refusals print.
 std::vector<std::string> RegisteredVideoFamilies();
 
 // Every registered family that CLAIMS this checkpoint set, sorted. Empty means

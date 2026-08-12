@@ -1219,6 +1219,17 @@ auto engine = vllm::entrypoints::LoadedEngine::FromModelDir(model_dir, ep);
 The underlying portable tensor runtime is `vt::` ([`include/vt/`](../include/vt/)),
 which carries no ggml or PyTorch dependency.
 
+Video and audio generation is reached through `vllm::multimodal::VideoEngine`
+([`multimodal/video_engine.h`](../include/vllm/multimodal/video_engine.h)).
+`LoadVideoEngine` resolves the model family from what the checkpoint HOLDS, never
+from a filename, and refuses rather than guessing: zero claimants, several
+claimants, and an unregistered declared `family` are all errors that name what was
+seen and what is registered. A caller who supplies no `dit_path` is told which
+artifact is missing rather than being advised to declare a family, which would not
+help. A family adds itself with `RegisterVideoFamily`, which refuses a name that
+is already registered, because two families under one name would collapse into a
+single claimant and leave the choice of loader to link order.
+
 `Sampler`'s `logprobs_mode` selects which tensor the returned logprobs are read
 from, and all four of vLLM's values now work: `raw_logprobs` (the default) and
 `raw_logits` are snapshotted before any logits processor runs, so they describe

@@ -27,6 +27,7 @@
 #include <cstdio>
 #include <fstream>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -92,7 +93,13 @@ vllm::multimodal::VideoGenParams FixtureGen(const std::string& out_dir) {
   return gen;
 }
 
-void CheckAgainstGoldens(const std::string& out_dir) {
+// `reported_audio_path` is what the RESULT says it wrote, not what the caller
+// assumes: reading `out_dir + "/audio.wav"` off disk would leave the WAV half of
+// the byte-identity claim resting on a filename convention, so a result that
+// reports a path it never wrote (or writes a path it never reports) would still
+// read as byte-identical. The frames are already pinned this way through
+// `result.frame_dir`; the audio path is the other half of the same contract.
+void CheckAgainstGoldens(const std::string& out_dir, const std::string& reported_audio_path) {
   for (int f = 0; f < kGoldenFrames; ++f) {
     char name[64];
     std::snprintf(name, sizeof(name), "/frame_%06d.ppm", f);
@@ -102,7 +109,8 @@ void CheckAgainstGoldens(const std::string& out_dir) {
     REQUIRE(got.size() == want.size());
     CHECK_MESSAGE(got == want, "frame ", f, " diverged from the pre-fold golden");
   }
-  const std::string got_wav = ReadAll(out_dir + "/audio.wav");
+  REQUIRE(reported_audio_path == out_dir + "/audio.wav");
+  const std::string got_wav = ReadAll(reported_audio_path);
   const std::string want_wav = ReadAll(GoldenDir() + "/audio.wav");
   REQUIRE(got_wav.size() == want_wav.size());
   CHECK_MESSAGE(got_wav == want_wav, "audio.wav diverged from the pre-fold golden");
@@ -163,7 +171,7 @@ TEST_CASE("video engine seam: an auto-detected H3 render reproduces the pre-fold
   CHECK(result.fps == 24);
   CHECK(result.sample_rate == 32000);
   CHECK(result.mux_output_path == out_dir + "/video.mp4");
-  CheckAgainstGoldens(out_dir);
+  CheckAgainstGoldens(out_dir, result.audio_path);
 
   // The mux argv the generic seam hands back is the H3 seam's, unchanged.
   std::string joined;
@@ -190,8 +198,8 @@ TEST_CASE("video engine seam: an EXPLICITLY declared family renders the same byt
       vllm::multimodal::LoadVideoEngine(mp);
   CHECK(engine->family() == "minimax-h3");
   const std::string out_dir = ws.root + "/declared_out";
-  (void)engine->Generate(FixtureGen(out_dir));
-  CheckAgainstGoldens(out_dir);
+  const vllm::multimodal::VideoResult declared = engine->Generate(FixtureGen(out_dir));
+  CheckAgainstGoldens(out_dir, declared.audio_path);
 }
 
 // ─── the refusals: never guess a family ─────────────────────────────────────
@@ -224,10 +232,24 @@ TEST_CASE("video engine registry: an unrecognizable checkpoint refuses instead o
     CHECK(msg.find("minimax-h3") != std::string::npos);
   }
 
-  // An empty dit_path is refused with the same never-guess rule.
+  // An empty dit_path is refused with the same never-guess rule — but with
+  // ADVICE THE CALLER CAN ACT ON. "Declare the family explicitly" is the right
+  // answer for a checkpoint nobody claimed; it is a dead end for a caller who
+  // supplied no checkpoint at all, because declaring a family still leaves the
+  // loader with nothing to open. The refusal must name the missing input.
   vllm::multimodal::VideoModelParams empty = FixtureParams(ws.fixture);
   empty.dit_path.clear();
-  CHECK_THROWS(vllm::multimodal::LoadVideoEngine(empty));
+  try {
+    (void)vllm::multimodal::LoadVideoEngine(empty);
+    FAIL("an empty dit_path must be refused, not detected around");
+  } catch (const std::exception& e) {
+    const std::string msg = e.what();
+    INFO(msg);
+    CHECK(msg.find("dit_path") != std::string::npos);
+    CHECK(msg.find("minimax-h3") != std::string::npos);
+    CHECK_MESSAGE(msg.find("Declare the family explicitly") == std::string::npos,
+                  "declaring a family cannot help a caller who supplied no dit_path");
+  }
 }
 
 // ─── extras carry the family-specific knob, in BOTH directions ──────────────
@@ -395,10 +417,143 @@ TEST_CASE("video engine seam: the concrete H3 handle IS a VideoEngine") {
   h3_gen.width = 32;
   h3_gen.steps = 3;
   h3_gen.output_dir = a;
-  (void)concrete->Generate(h3_gen);
-  CheckAgainstGoldens(a);
+  const vllm::multimodal::MiniMaxH3VideoResult h3_result = concrete->Generate(h3_gen);
+  CheckAgainstGoldens(a, h3_result.audio_path);
 
   const std::string b = ws.root + "/seam_out";
-  (void)seam->Generate(FixtureGen(b));
-  CheckAgainstGoldens(b);
+  const vllm::multimodal::VideoResult seam_result = seam->Generate(FixtureGen(b));
+  CheckAgainstGoldens(b, seam_result.audio_path);
+}
+
+// ─── the never-guess refusals that need a SECOND family to be reachable ──────
+//
+// LoadVideoEngine's SEVERAL-claimants branch and RegisterVideoFamily's
+// duplicate-name refusal are both unreachable while exactly one family is
+// registered, so nothing gated them and they could rot before LTX-2.5 arrives.
+// A registry test does not have to wait for a real second family: it can
+// register a throwaway one of its own. That is also the only way to exercise
+// what happens to the listing when a family registers AFTER the first query,
+// which no REGISTER_VLLM_VIDEO_FAMILY registrar can do (registrars all run
+// before main) but which the PUBLIC RegisterVideoFamily plainly allows.
+//
+// This test case is deliberately LAST in the file: the registry is process-
+// global and has no unregister, so the double it adds outlives it.
+namespace {
+
+// Sorts BEFORE "minimax-h3", so a listing that appends late registrations
+// instead of ordering them is visibly out of order.
+constexpr char kTestDoubleFamily[] = "aa-video-test-double";
+// The double claims only when the caller sets this extra, so its presence in
+// the process registry cannot change what any other test detects.
+constexpr char kTestDoubleExtra[] = "video-test-double";
+
+int g_impostor_loads = 0;
+
+bool DetectTestDouble(const vllm::multimodal::VideoModelParams& params) {
+  return vllm::multimodal::VideoExtra(params.extras, kTestDoubleExtra) == "claim";
+}
+
+// An IMPOSTOR loader: a checkpoint handed to it would render noise, which is
+// the whole hazard this seam exists to prevent. It records the call so a test
+// can prove a refusal happened INSTEAD of a load rather than after one.
+std::unique_ptr<vllm::multimodal::VideoEngine> LoadImpostor(
+    const vllm::multimodal::VideoModelParams&) {
+  ++g_impostor_loads;
+  throw std::runtime_error("the video test double must never be loaded");
+}
+
+// The registry has no unregister and doctest re-enters a test body once per
+// subcase, so the double registers exactly once per process.
+void RegisterTestDoubleOnce() {
+  static const bool once = [] {
+    vllm::multimodal::RegisterVideoFamily(vllm::multimodal::VideoFamilyRegistration{
+        kTestDoubleFamily, DetectTestDouble, LoadImpostor});
+    return true;
+  }();
+  (void)once;
+}
+
+size_t CountRegistered(const std::string& family) {
+  const std::vector<std::string> all = vllm::multimodal::RegisteredVideoFamilies();
+  return static_cast<size_t>(std::count(all.begin(), all.end(), family));
+}
+
+}  // namespace
+
+TEST_CASE("video engine registry: a second family is ordered, refused twice, and never guessed") {
+  SeamWorkspace ws;
+
+  // Query FIRST, so the double provably registers after the listing has already
+  // been asked for once. A listing canonicalized only on first query would
+  // append everything that arrives afterwards, unordered.
+  REQUIRE(Registered("minimax-h3"));
+  RegisterTestDoubleOnce();
+
+  const std::vector<std::string> all = vllm::multimodal::RegisteredVideoFamilies();
+  INFO("registered: ", all.size());
+  CHECK(Registered(kTestDoubleFamily));
+  CHECK(Registered("minimax-h3"));
+  CHECK_MESSAGE(std::is_sorted(all.begin(), all.end()),
+                "a family registered after the first query must still list in order");
+  CHECK(std::adjacent_find(all.begin(), all.end()) == all.end());
+
+  // The double is scoped: without its extra, nothing about H3 detection moved.
+  const std::vector<std::string> plain =
+      vllm::multimodal::DetectVideoFamilies(FixtureParams(ws.fixture));
+  REQUIRE(plain.size() == 1);
+  CHECK(plain[0] == "minimax-h3");
+
+  // ── SEVERAL claimants: refuse, naming both, and load NEITHER. ──
+  vllm::multimodal::VideoModelParams contested = FixtureParams(ws.fixture);
+  contested.extras[kTestDoubleExtra] = "claim";
+  const std::vector<std::string> claimants = vllm::multimodal::DetectVideoFamilies(contested);
+  CHECK(claimants.size() == 2);
+  const int loads_before = g_impostor_loads;
+  try {
+    (void)vllm::multimodal::LoadVideoEngine(contested);
+    FAIL("two claimants must be refused, not resolved by registration order");
+  } catch (const std::exception& e) {
+    const std::string msg = e.what();
+    INFO(msg);
+    CHECK(msg.find("SEVERAL") != std::string::npos);
+    CHECK(msg.find("minimax-h3") != std::string::npos);
+    CHECK(msg.find(kTestDoubleFamily) != std::string::npos);
+  }
+  CHECK_MESSAGE(g_impostor_loads == loads_before,
+                "the refusal must happen instead of a load, not after one");
+
+  // ── A DUPLICATE NAME is the same hazard wearing a disguise. ──
+  // Two registrations under one name make the SEVERAL check above unreachable
+  // (both claimants carry the same name, so the listing collapses to one) and
+  // hand the choice of loader to static-init and link order. Registering an
+  // impostor as "minimax-h3" must be refused AT THE REGISTRATION, naming the
+  // collision — that is the last point at which the ambiguity is still
+  // nameable.
+  REQUIRE(CountRegistered("minimax-h3") == 1);
+  try {
+    vllm::multimodal::RegisterVideoFamily(vllm::multimodal::VideoFamilyRegistration{
+        "minimax-h3",
+        [](const vllm::multimodal::VideoModelParams&) { return true; },  // claims everything
+        LoadImpostor});
+    FAIL("a family name that is already registered must be refused");
+  } catch (const std::exception& e) {
+    const std::string msg = e.what();
+    INFO(msg);
+    CHECK(msg.find("minimax-h3") != std::string::npos);
+    CHECK(msg.find("already registered") != std::string::npos);
+  }
+  CHECK_MESSAGE(CountRegistered("minimax-h3") == 1,
+                "a refused registration must leave the registry untouched");
+
+  // And the real family still resolves — the impostor is not in the table, so
+  // which loader runs cannot depend on which TU linked first.
+  const std::vector<std::string> after =
+      vllm::multimodal::DetectVideoFamilies(FixtureParams(ws.fixture));
+  REQUIRE(after.size() == 1);
+  CHECK(after[0] == "minimax-h3");
+  const std::unique_ptr<vllm::multimodal::VideoEngine> engine =
+      vllm::multimodal::LoadVideoEngine(FixtureParams(ws.fixture));
+  REQUIRE(engine != nullptr);
+  CHECK(engine->family() == "minimax-h3");
+  CHECK(g_impostor_loads == 0);
 }
