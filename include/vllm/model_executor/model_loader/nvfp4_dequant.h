@@ -42,9 +42,22 @@ inline constexpr float kE2M1Lut[8] = {0.0F, 0.5F, 1.0F, 1.5F,
 //
 // Read the wrong way round, every adjacent fp4 pair is transposed. The result is
 // finite, correctly shaped and correctly scaled, so nothing downstream notices:
-// a decoder emits fluent tokens, a DiT renders a plausible-but-wrong frame. It is
-// therefore never inferred and never defaulted per call site — the loader that
-// knows the producer passes it.
+// a decoder emits fluent tokens, a DiT renders a plausible-but-wrong frame.
+//
+// This parameter IS defaulted, to kLowFirst, and that is the deliberate design:
+// every caller predating .agents/specs/nvfp4-nibble-order.md consumes a ModelOpt
+// or compressed-tensors checkpoint, which is low-first, so the default makes
+// "this change moved nothing else" true BY CONSTRUCTION rather than by
+// inspection. Four callers rely on it today — minimax_h3_nvfp4.cpp:112,
+// minimax_h3_device.cpp:1311, qwen3_5.cpp:1298 and
+// dense_nvfp4_gemm.h DequantNvfp4ToBLayout — and H3 reaches low-first by
+// normalizing its bytes at load (MiniMaxH3Nvfp4SwapNibbles) rather than by
+// passing an order.
+//
+// The seam where the order is NEVER defaulted is `Ltx2DequantNvfp4ToBf16`
+// (ltx2_loader.h), which takes a resolved `Ltx2Nvfp4Producer` with no default,
+// because that is the path where the two conventions actually meet and a default
+// would let a caller that never thought about it get the silent wrong answer.
 enum class Nvfp4NibbleOrder {
   // Element 2j in the LOW nibble, 2j+1 in the HIGH. torchao's `pack_uint4`
   // (torchao/prototype/mx_formats/kernels.py:160,

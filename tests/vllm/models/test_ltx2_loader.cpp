@@ -1146,9 +1146,66 @@ TEST_CASE("ltx2 loader: the first-party NVFP4 DiT agrees with the FP8 DiT") {
   // VALUES, not booleans (spec section 7.0).
   INFO("corr(oracle) = " << corr << "  rel_rms = " << rel << "  corr(control) = " << ctrl);
   CHECK(corr >= 0.99);
-  CHECK(rel <= 0.15);
+  // ── rel_rms IS A BAND, NOT A CEILING ───────────────────────────────────────
+  //
+  // rel_rms here is not an error budget to stay under; it is a PREDICTED
+  // QUANTITY — the disagreement two different quantizations of the same base
+  // weights must show. Measured 0.100672 (spec section 7), which is NVFP4's own
+  // group-scaled E2M1 error combined with the oracle's fp8-e4m3 error.
+  //
+  // A one-sided `<= 0.15` was wrong in both directions, and both were measured
+  // on these bytes rather than argued:
+  //
+  //   TOO LOOSE ABOVE. A uniform group-scale error of x1.10 lands at rel 0.1489
+  //   and PASSED. Pearson correlation cannot help: it is scale-INVARIANT, so a
+  //   systematic scale defect leaves corr at 0.994968 to every printed digit.
+  //   rel is the ONLY statistic in this gate that can see it, which is exactly
+  //   why it may not be spent as slack. Both facts are asserted below.
+  //
+  //   UNBOUNDED BELOW. rel had no floor at all, so an arm that reproduced the
+  //   FP8 oracle EXACTLY — the shape a fixture takes when the "independent"
+  //   oracle has quietly become the thing under test, this project's 7.0(c)
+  //   failure — scored rel 0.0, corr 1.0 and passed with room to spare.
+  //
+  // The band is the measured value +/- about 15%. The width is for compiler and
+  // libm drift, NOT for run-to-run noise: every input here is a committed byte
+  // array and the reduction is a plain sequential double loop, so the value is
+  // deterministic. It admits at worst a ~4% uniform scale error, against the
+  // ~10% the ceiling alone admitted.
+  CHECK(rel >= 0.085);
+  CHECK(rel <= 0.115);
+  // ...and the same ceiling on the correlation, for the same reason: an oracle
+  // that agrees TOO well is not a better result, it is a broken oracle.
+  CHECK(corr <= 0.998);
   // The control MUST collapse, or this fixture cannot separate right from wrong.
   CHECK(ctrl < 0.2);
+
+  // ── THE TWO MUTATIONS THE BAND EXISTS FOR, RUN HERE ─────────────────────────
+  //
+  // Same discipline as the wrong-nibble arm below: the defect is executed by the
+  // gate rather than described in a comment a future reader has to re-derive.
+
+  // (1) A uniform +10% group-scale error. Invisible to corr BY CONSTRUCTION;
+  //     caught only by the band's upper edge.
+  std::vector<float> overscaled(got);
+  for (float& v : overscaled) v = static_cast<float>(static_cast<double>(v) * 1.10);
+  const double over_corr = Correlation(overscaled, vllm_test::kLtx2RealDitFp8OracleF32, n);
+  const double over_rel = RelRms(overscaled, vllm_test::kLtx2RealDitFp8OracleF32, n);
+  INFO("x1.10 group scale: corr = " << over_corr << "  rel_rms = " << over_rel);
+  // Pearson is scale-invariant: the defect moves corr by less than a printed digit.
+  CHECK(std::fabs(over_corr - corr) < 1e-6);
+  // The old `rel <= 0.15` admitted this. The band does not.
+  CHECK(over_rel > 0.115);
+
+  // (2) The too-good arm: hand the gate the oracle itself. Rejected by the rel
+  //     FLOOR and by the corr ceiling, neither of which existed before.
+  const std::vector<float> perfect(vllm_test::kLtx2RealDitFp8OracleF32,
+                                   vllm_test::kLtx2RealDitFp8OracleF32 + n);
+  const double perfect_corr = Correlation(perfect, vllm_test::kLtx2RealDitFp8OracleF32, n);
+  const double perfect_rel = RelRms(perfect, vllm_test::kLtx2RealDitFp8OracleF32, n);
+  INFO("oracle vs itself: corr = " << perfect_corr << "  rel_rms = " << perfect_rel);
+  CHECK(perfect_rel < 0.085);
+  CHECK(perfect_corr > 0.998);
 
   // ── AND THE WRONG ORDER MUST FAIL, MEASURED RATHER THAN ASSUMED ─────────────
   //

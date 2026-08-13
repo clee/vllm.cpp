@@ -199,9 +199,44 @@ inline constexpr const char* kLtx2TorchaoNvfp4MarkerSuffix = ".torchao_nvfp4";
 // THE SHAPE CANNOT DISCRIMINATE ALONE, which is why the marker leads. Every layer
 // of the first-party DiT has N % 128 == 0 and G % 4 == 0, so its cuBLAS-padded
 // shape is NUMERICALLY IDENTICAL to the linear [N, G] one. A shape test can never
-// separate those two. It is used only to CORROBORATE what the marker decided, and
-// any other combination is refused by name rather than resolved in either
-// direction.
+// separate those two. It is used only to CORROBORATE what the marker decided.
+//
+// WHAT THE REFUSAL DOES AND DOES NOT COVER — state it exactly, because the
+// tempting sentence ("any other combination is refused by name") is FALSE and
+// would be read as a safety guarantee.
+//
+// A combination the shape can SEPARATE is refused by name: a marker with the
+// to_blocked shape resolves, a marker with any other shape refuses, no marker
+// with the to_blocked shape refuses, and no marker with a shape that is neither
+// framing refuses. What CANNOT be refused is the case the shape cannot see. A
+// marker-less NVFP4 checkpoint whose `weight_scale` is stored LINEAR [N, K/16]
+// — never swizzled — presents, for every geometry with N % 128 == 0 and
+// G % 4 == 0, a shape numerically identical to the cuBLAS-padded one. It
+// therefore resolves kNvfp4Prequant, gets the 128x4 unswizzle applied to scales
+// that were never swizzled, and is read high-first. Finite, correctly shaped,
+// correctly scaled, WRONG.
+//
+// That is not an exotic file. LINEAR [N, K/16] is precisely what NVIDIA ModelOpt,
+// llm-compressor and compressed-tensors write, and it is what vLLM's own readers
+// expect on disk (modelopt.py:1335-1345 and
+// compressed_tensors/schemes/compressed_tensors_w4a4_nvfp4.py:73-76 both allocate
+// `weight_scale` as [out, in // 16]); none of the three emits a `.torchao_nvfp4`
+// sidecar. So the marker's absence excludes torchao and NOTHING ELSE.
+//
+// It is resolved this way anyway, deliberately, because there is no better
+// evidence in the file: the shipped DiT's `__metadata__` carries exactly
+// `config`, `gemma_source_checkpoint`, `model_version` and `license` — no
+// `quantization_config`, no producer key, and no tensor name mentioning the
+// quantizer. Unlike MiniMax-H3, whose community checkpoint DID name its
+// converter, there is nothing here to key on. The correlation gate is what
+// converts that inference into a measurement, and it is why the gate is the
+// result rather than "the forward ran".
+//
+// The consequence is a tracked condition, recorded in
+// .agents/specs/nvfp4-nibble-order.md section 3.1 alongside the H3 one: THIS
+// LOADER MUST NOT BE POINTED AT A SECOND MARKER-LESS NVFP4 PRODUCER without
+// first re-running the correlation gate against an independent oracle for that
+// artifact. It resolves such a file rather than refusing it.
 enum class Ltx2Nvfp4Producer {
   kTorchao,        // marker present: to_blocked framing, low-nibble-first
   kNvfp4Prequant,  // marker absent:  cuBLAS-padded framing, high-nibble-first

@@ -1680,9 +1680,21 @@ The two NVFP4 checkpoints were written by different producers that disagree abou
 both the group-scale framing and which nibble holds which weight, so the loader
 resolves the producer from the `torchao_nvfp4` marker: present means torchao
 (`to_blocked` framing, low-nibble-first), absent means the Lightricks
-`nvfp4-prequant` tool (cuBLAS-padded framing, high-nibble-first). Any other
-combination is refused by name rather than guessed, because both readings
-type-check and produce finite, correctly scaled, wrong weights. See
+`nvfp4-prequant` tool (cuBLAS-padded framing, high-nibble-first). A marker whose
+stored scale shape contradicts it, and a marker-less file whose shape is the
+`to_blocked` framing or neither framing, are refused by name rather than guessed,
+because both readings type-check and produce finite, correctly scaled, wrong
+weights.
+
+The refusal cannot cover everything, and the limit is worth knowing before you
+point this loader at a checkpoint it was not built for. A marker-less NVFP4 file
+whose `weight_scale` is stored **linear** `[N, K/16]` — what ModelOpt,
+llm-compressor and compressed-tensors write, none of which emit a
+`torchao_nvfp4` sidecar — has, whenever `N % 128 == 0` and `K/16 % 4 == 0`, a
+shape indistinguishable from the cuBLAS-padded one. Such a file is resolved as
+`nvfp4-prequant` and read swizzled and high-first: it loads, and it is wrong.
+Only the LTX-2.5 DiT is gated against an independent oracle here, so treat any
+other marker-less NVFP4 checkpoint as unsupported until it is. See
 `.agents/specs/nvfp4-nibble-order.md`.
 
 Two behaviours a caller has to know. `Ltx2LoadDitFromSafetensors` REFUSES the
