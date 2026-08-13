@@ -119,16 +119,36 @@ class WindowsMetadataContract(unittest.TestCase):
             'foreach ($test in @(\n'
             '    "test_openai_api_server.exe",'
         )
+        full_suite_invoke = (
+            'Invoke-Checked (Join-Path $BuildDir '
+            '"tests/Release/$test") @()'
+        )
         self.assertEqual(script.count(test_path), 1)
         self.assertEqual(script.count(probe), 1)
         self.assertEqual(script.count(full_suite), 1)
         self.assertLess(script.index(test_path), script.index(probe))
         self.assertLess(script.index(probe), script.index(full_suite))
 
+        suite_start = script.index(full_suite)
+        suite_end = script.index("\n}\n", suite_start) + 2
+        suite = script[suite_start:suite_end]
+        body_start = suite.index(")) {") + len(")) {")
+        invoke_start = suite.index(full_suite_invoke, body_start)
+        self.assertEqual(suite.count(full_suite_invoke), 1)
+        self.assertEqual(
+            suite[body_start:invoke_start].strip(),
+            "",
+            "the unchanged full suite must run before any loop-body control flow",
+        )
+
     def test_socket_teardown_probe_marks_each_owner_and_terminate_reason(self) -> None:
         main = (ROOT / "tests/doctest_main.cpp").read_text(encoding="utf-8")
+        handler_start = main.index(
+            "[[noreturn]] void DiagnosticTerminate() noexcept {"
+        )
+        handler_end = main.index("\n}\n\n}  // namespace", handler_start) + 2
+        handler = main[handler_start:handler_end]
         for diagnostic in (
-            "std::set_terminate",
             "std::current_exception()",
             "std::rethrow_exception",
             "catch (const std::exception& error)",
@@ -136,11 +156,37 @@ class WindowsMetadataContract(unittest.TestCase):
             "std::abort()",
         ):
             with self.subTest(diagnostic=diagnostic):
-                self.assertEqual(main.count(diagnostic), 1)
+                self.assertEqual(handler.count(diagnostic), 1)
+        self.assertLess(
+            handler.index("std::fflush(stderr)"), handler.index("std::abort()")
+        )
+
+        entry_start = main.index("int main(int argc, char** argv) {")
+        entry_end = main.index("\n}", entry_start) + 2
+        entry = main[entry_start:entry_end]
+        terminate_install = "std::set_terminate(DiagnosticTerminate);"
+        self.assertEqual(entry.count("std::set_terminate("), 1)
+        self.assertEqual(entry.count(terminate_install), 1)
+        self.assertLess(
+            entry.index(terminate_install),
+            entry.index("doctest::Context(argc, argv).run()"),
+        )
 
         source = (
             ROOT / "tests/vllm/entrypoints/openai/test_api_server.cpp"
         ).read_text(encoding="utf-8")
+        marker_start = source.index("class TeardownProbeMarker {")
+        marker_end = source.index("\n};", marker_start) + 3
+        marker = source[marker_start:marker_end]
+        destructor_start = marker.index("~TeardownProbeMarker() {")
+        destructor_end = marker.index("\n  }", destructor_start) + 4
+        destructor = marker[destructor_start:destructor_end]
+        emit = "std::fputs(message_, stderr);"
+        flush = "std::fflush(stderr);"
+        self.assertEqual(destructor.count(emit), 1)
+        self.assertEqual(destructor.count(flush), 1)
+        self.assertLess(destructor.index(emit), destructor.index(flush))
+
         start = source.index(
             'TEST_CASE("api_server: socket smoke — real HTTP requests over an ephemeral port")'
         )
