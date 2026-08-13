@@ -473,8 +473,14 @@ void MoeRouterTopKKernelCuda(Queue& q, Tensor& weights, Tensor& indices, const T
 // — upstream's apply_routed_scale_to_output arm (layers/fused_moe/runner/
 // moe_runner.py:390-407 (:402-406) scales `fused_output`, leaves `shared_output` alone,
 // then :722-725 adds them). Applied in the same f32 accumulator the CPU
-// reference (cpu_ops.cpp MoeCombineKernel) uses, in the same order, so CPU and
-// CUDA stay bit-for-bit equal. Default 1.0f == the landed fold-into-weights arm.
+// reference (cpu_ops.cpp MoeCombineKernel) uses, in the same order. The scale
+// itself is ONE standalone f32 multiply on the finished accumulator, with
+// nothing adjacent to contract into, so THIS step is bit-identical to the CPU
+// reference. That does not extend to the `acc += w * Load(...)` reduction above
+// it: only CXX/HIP/OBJCXX carry -ffp-contract=off (CMakeLists.txt:55, :393,
+// :467) and nothing passes nvcc --fmad=false, so device code may contract that
+// multiply-add into an FMA where the host may not. See #591, which tracks that
+// repo-wide flag gap. Default 1.0f == the landed fold-into-weights arm.
 // Like the CPU reference it scales the ASSEMBLED sum, not each router weight
 // (:404 `fused_output *= factor` is one multiply on the finished tensor); the
 // fold is equal in exact arithmetic and a different f32 value. Upstream's fp16
@@ -697,7 +703,10 @@ void MoeSiluMulKernelCuda(Queue& q, Tensor& out, const Tensor& gate, const Tenso
 // (csrc/libtorch_stable/activation_kernels.cu:673-678) verbatim: widen to f32,
 // clamp at zero in f32, square in f32, ONE round on the store — so a bf16 input
 // with an f32 output keeps the full f32 square. Byte-identical to the CPU
-// reference (cpu_ops.cpp MoeRelu2Kernel): both are exact f32 ops, no expf.
+// reference (cpu_ops.cpp MoeRelu2Kernel): both are exact f32 ops, no expf —
+// and unlike the combine reduction above there is no multiply-add here for
+// nvcc to contract into an FMA (a compare-select and ONE multiply), so this
+// one holds without --fmad=false. See #591 for the flag gap itself.
 template <typename Tx, typename Tout>
 __global__ void MoeRelu2Kernel(Tout* out, const Tx* x, int64_t n) {
   const int64_t step = static_cast<int64_t>(gridDim.x) * blockDim.x;

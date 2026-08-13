@@ -1666,7 +1666,9 @@ void MoeSiluMul(Queue& q, Tensor& out, const Tensor& gate, const Tensor& up);
 // reached through the fused-MoE path: `activation_without_mul("relu2")` ->
 // `MoEActivation.RELU2_NO_MUL` -> `apply_moe_activation`'s
 // `F.relu(input, inplace=True); torch.square(input, out=output)`
-// (layers/fused_moe/activation.py:33,98 and its RELU2_NO_MUL branch).
+// (layers/fused_moe/activation.py:34 `RELU2_NO_MUL`, :98
+// `activation_without_mul`, and the :184 RELU2_NO_MUL branch; `:33` is
+// GELU_TANH_NO_MUL, the neighbouring enumerator).
 //
 // Why this is NOT a MergedGemmGroup epilogue: a NON-gated expert has no gate
 // half to merge with (nemotron_h.py:220 `ckpt_names=("up_proj","down_proj","")`
