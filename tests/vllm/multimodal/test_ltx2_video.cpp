@@ -1430,6 +1430,13 @@ Rendered RenderPrompt(const vllm::multimodal::VideoModelParams& mp, const std::s
   const auto* ltx = dynamic_cast<const vllm::multimodal::Ltx2VideoEngine*>(engine.get());
   REQUIRE(ltx != nullptr);
   out.trace = ltx->last_conditioning();
+  // `completed` separates "this conditioning produced that clip" from "this
+  // conditioning was built for a render that then threw". The trace is filled
+  // BEFORE the denoise loop — the only point at which the buffers
+  // cross-attention reads still exist as such — so everything from there to the
+  // muxer can fail with the trace already populated. `Generate` returned here,
+  // so it must be true; the refusal cases below cover the other polarity.
+  CHECK(out.trace.completed);
   for (int64_t f = 0; f < result.frame_count; ++f) {
     char name[64];
     std::snprintf(name, sizeof(name), "/frame_%06lld.ppm", static_cast<long long>(f));
@@ -1621,4 +1628,51 @@ TEST_CASE("ltx2 video: a tower with no prompt and no embeds is refused") {
     INFO(msg);
     CHECK(msg.find("no prompt") != std::string::npos);
   }
+}
+
+TEST_CASE("ltx2 video: a trace for a render that never completed says so") {
+  // THE DEFECT. `Ltx2ConditioningTrace` is filled immediately after the
+  // connector and BEFORE the denoise loop, because that is the only point at
+  // which the exact f32 buffers cross-attention will read still exist as such.
+  // Everything after it — denoise, both VAE decodes, the WAV, the muxer — can
+  // throw with the trace already fully populated. A reader that then asked
+  // "which conditioning produced this clip" would be answered for a clip that
+  // was never produced, and every field would look entirely healthy: real
+  // prompt, non-zero absmax, plausible digests.
+  //
+  // THE PROBE IS A REAL REFUSAL, not an injected one. Keyframe / reference
+  // conditioning is refused by name (ltx2_video.cpp, the `ImageConditioner`
+  // note) and that refusal sits AFTER the trace is written, so a prompted
+  // request carrying a reference image walks the whole encode path, fills the
+  // trace, and then fails — exactly the shape this flag exists to report.
+  Workspace ws;
+  const vllm::multimodal::VideoModelParams mp = EncoderParams(ws.paths);
+  const std::unique_ptr<vllm::multimodal::VideoEngine> engine =
+      vllm::multimodal::LoadVideoEngine(mp);
+  REQUIRE(engine != nullptr);
+  const auto* ltx = dynamic_cast<const vllm::multimodal::Ltx2VideoEngine*>(engine.get());
+  REQUIRE(ltx != nullptr);
+
+  vllm::multimodal::VideoGenParams gen = PromptedGen(ws.root + "/thrown", "a b c");
+  gen.ref_image_paths.push_back(ws.root + "/nonexistent-reference.png");
+  try {
+    (void)engine->Generate(gen);
+    FAIL("keyframe / reference conditioning must be refused");
+  } catch (const std::exception& e) {
+    const std::string msg = e.what();
+    INFO(msg);
+    CHECK(msg.find("reference conditioning") != std::string::npos);
+  }
+
+  const vllm::multimodal::Ltx2ConditioningTrace trace = ltx->last_conditioning();
+  // THE CONTROL, and the reason this case is not vacuous. The encode really did
+  // run to completion before the refusal: the prompt was tokenized, the tower
+  // and both projections ran, the connector ran, and the trace holds the result.
+  // Without these three the case would also pass on an engine that threw BEFORE
+  // ever writing a trace, which is a different bug with the same symptom.
+  CHECK(trace.from_prompt);
+  CHECK(trace.prompt == "a b c");
+  CHECK(trace.video_absmax > 0.0);
+  // ...and yet no render came out of it. This is the whole assertion.
+  CHECK_FALSE(trace.completed);
 }

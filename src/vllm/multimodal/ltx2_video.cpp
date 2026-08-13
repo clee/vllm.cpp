@@ -501,7 +501,8 @@ bool Ltx2VideoEngine::has_prompt_embeds() const { return !impl_->video_prompt_em
 const std::string& Ltx2VideoEngine::model_version() const { return impl_->model_version; }
 const std::string& Ltx2VideoEngine::pipeline_kind() const { return impl_->pipeline_kind; }
 const Ltx2DitParams& Ltx2VideoEngine::dit_params() const { return impl_->dit.params; }
-const Ltx2ConditioningTrace& Ltx2VideoEngine::last_conditioning() const {
+Ltx2ConditioningTrace Ltx2VideoEngine::last_conditioning() const {
+  std::lock_guard<std::mutex> guard(impl_->mutex);
   return impl_->trace;
 }
 
@@ -1027,6 +1028,17 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
   //     holding the composition is refused rather than quietly re-ordering the
   //     caption against the mask.
   //
+  //     THAT ASSERTION IS ITSELF UNGATED, and it is named here rather than left
+  //     to read as a positive. No test reaches it: every mask that arrives comes
+  //     from `Ltx2ComputeRightPadOrder`, which produces a non-increasing mask by
+  //     construction, so the only way to fire it through the public API is a
+  //     defect INSIDE that function. Deleting the loop moves no test. That is
+  //     NOT a claim that it is unreachable — no probe was built that fails to
+  //     reach it, and this campaign's own rule is that a mutation which moves
+  //     nothing is not evidence of unreachability. It is a guard on an internal
+  //     invariant, carried because the invariant is what makes the double sort
+  //     an identity, and recorded as ungated.
+  //
   // (2) THE TOWER RUNS ON A CPU QUEUE EVEN ON THE DEVICE ARM, and that is a
   //     stated limit, not an oversight. Everything in `ltx2_text_encoder.h` is
   //     f32 by declaration — `Ltx2TextFeatureExtractorForward` REFUSES any other
@@ -1489,6 +1501,12 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
   mux.fps = result.fps;
   result.mux_argv = MiniMaxH3BuildMp4MuxArgs(mux);
   result.mux_output_path = mux.output_path;
+  // The trace was filled before the denoise loop, which is the only place the
+  // buffers cross-attention reads still exist as such. Everything between there
+  // and here can throw, so `completed` is set HERE and nowhere else: it is what
+  // separates "this conditioning produced that clip" from "this conditioning was
+  // built for a render that then failed".
+  im.trace.completed = true;
   return result;
 }
 

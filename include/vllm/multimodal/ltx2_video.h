@@ -246,6 +246,42 @@ inline constexpr char kLtx2EncoderConfigPathExtra[] = "encoder_config_path";
 // depend on this prompt, through these weights" and nothing else. A server also
 // has a use for it: "which conditioning produced this clip" is otherwise
 // unanswerable after the fact.
+//
+// IT IS A WITNESS, NOT A GATE — and the difference is MEASURED, not argued. A
+// digest detects CHANGE; it does not pin VALUES, so nothing at this level says
+// the values are the ones upstream would produce. A reviewer proved it on this
+// exact head with two mutations applied to the composition below:
+//
+//   * video conditioning scaled by 1.5 AFTER the connector, and
+//   * the conditioning rows REVERSED, putting every caption row on the wrong
+//     token,
+//
+// and BOTH passed all 485 assertions of `test_ltx2_video` with exit 0. The
+// digest moved, as it must — but no assertion says WHICH value it should have
+// moved to.
+//
+// THE VALUE ORACLE THE COMPOSITION IS OWED. The per-brick oracles are real and
+// strong: the Gemma-4 tower against a running `transformers` at a measured bf16
+// floor, `Ltx2ConnectorForward` on five arms against executed upstream, and the
+// feature extractor and both caption projections against executed upstream. The
+// two JOINS between them have none: `Ltx2ConnectorCreateEmbeddings`
+// (ltx2_connector.h) and the `Generate` composition that chains it onto
+// `Ltx2TextEncoderConditioning`. Both mutations above live in exactly that gap.
+//
+// The closure is specified rather than left as a wish, because the path is
+// already built. `scripts/gen-ltx2-pipeline-goldens.py` imports and EXECUTES
+// upstream `text_encoders/gemma/embeddings_connector.py` under a pinned SHA
+// (section 10), and the composition's upstream counterpart is one function in
+// the same package: `EmbeddingsProcessor.process_hidden_states`
+// (embeddings_processor.py:97-117), which is feature extractor -> additive mask
+// -> `create_embeddings` -> the two connectors — precisely this chain. A section
+// that executes it end-to-end at the reduced dims the script already uses would
+// give both joins a real numeric oracle, WITHOUT the "gate through our own
+// helper" trap that makes a max|diff| of 0 prove only that two arms agree. The
+// script reproduces its current output byte-for-byte (md5 53e2a6ab…9eb4,
+// verified 2026-08-13), so the section can be added without disturbing anything
+// already gated. Until that lands, this trace is a change detector and the
+// composition's VALUES rest on the per-brick oracles either side of it.
 struct Ltx2ConditioningTrace {
   // True when the text tower encoded the request's own prompt; false when the
   // conditioning came from `prompt_embeds_path`.
@@ -259,6 +295,15 @@ struct Ltx2ConditioningTrace {
   // two prompts the SAME digest and RED any dependence check, but it would do so
   // for the wrong reason; this says which happened.
   double video_absmax = 0.0, audio_absmax = 0.0;
+  // True only once the `Generate` that produced this conditioning RETURNED. The
+  // trace is filled immediately after the connector and BEFORE the denoise loop,
+  // because that is the only point at which the exact buffers cross-attention
+  // will read still exist as such. So a `Generate` that throws in denoise, in a
+  // VAE decode or in the muxer leaves a fully populated trace behind for a render
+  // that produced no frames. Without this flag the next reader cannot tell that
+  // from a completed render, and "which conditioning produced this clip" would
+  // answer for a clip that does not exist.
+  bool completed = false;
 };
 
 // A loaded LTX-2.5 checkpoint set. Construct through
@@ -298,7 +343,16 @@ class Ltx2VideoEngine : public VideoEngine {
 
   // The conditioning the LAST `Generate()` fed cross-attention. `tokens == 0`
   // before the first generation. See `Ltx2ConditioningTrace`.
-  const Ltx2ConditioningTrace& last_conditioning() const;
+  //
+  // BY VALUE, under the same mutex `Generate` holds. Returning a reference was a
+  // data race on the exact use this accessor is FOR: the header offers it to a
+  // server ("which conditioning produced this clip"), and a server calls it from
+  // a thread that is not the one inside `Generate`. A reference hands the caller
+  // a `std::string` and two digests that a concurrent `Generate` is rewriting,
+  // and the lock cannot help because it is released before the caller reads. A
+  // copy taken while the writer is excluded is the only form that is safe to
+  // hand out. Costs one short string copy per call, on a path that renders video.
+  Ltx2ConditioningTrace last_conditioning() const;
 
  private:
   Ltx2VideoEngine();

@@ -392,6 +392,20 @@ stream and 2048 for the audio stream, with the same row count in both. A
 `--prompt` with no tower is refused, and supplying only one of the two files is
 refused, because a stream left unconditioned renders instead of failing.
 
+**Asking what a clip was conditioned on.** `Ltx2VideoEngine::last_conditioning()`
+returns the trace of the last `Generate()` — whether the conditioning came from a
+prompt or from embeds, the prompt string, the row count and both stream widths, an
+FNV-1a digest over the exact f32 buffers cross-attention read, and each stream's
+absmax. It is returned **by value, under the engine's own lock**, so it is safe to
+call from a server thread while another thread renders. `completed` is true only
+if that `Generate()` returned: the trace is filled before the denoise loop, so a
+render that throws later leaves a populated trace behind, and this flag is what
+separates the two.
+
+It is a **change detector, not a quality measure**. It answers "did this render
+depend on this prompt, through these weights" and nothing else — it does not say
+the conditioning values are the ones upstream would produce.
+
 The text path runs on the CPU even when `--device cuda` puts the DiT on the GPU:
 everything in the text encoder is f32 by declaration and its device arm is owed.
 That is one host-side 12B forward over the prompt's own tokens per request,

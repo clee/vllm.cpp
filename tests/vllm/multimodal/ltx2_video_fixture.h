@@ -335,11 +335,41 @@ inline nlohmann::json ReducedDitTransformerConfig(
   // Upstream selects V1 vs V2 from the presence AND the exact values of the set
   // (encoder_configurator.py:163-209), and a PARTIAL set is refused as config
   // drift rather than resolved either way. An earlier revision of this fixture
-  // carried only `caption_proj_before_connector`, which is the partial case: it
-  // gated no variant selection at all and would have refused the moment the
-  // engine asked for one. The three values below are READ from the first-party
-  // `Lightricks/LTX-2.5` NVFP4 DiT's own `__metadata__["config"]["transformer"]`
-  // (2026-08-13), not assumed from the class defaults.
+  // carried only `caption_proj_before_connector`, which is the partial case —
+  // `Ltx2SelectTextFeatureVariant` REFUSES it (ltx2_text_encoder.cpp:184-192).
+  // The reason that refusal never fired is NOT that the partial set gated
+  // nothing: it is that no production path CALLED the selector before L13. The
+  // four marker keys and the engine's first call to the selector landed in the
+  // same commit, so there was no earlier run for the partial set to refuse.
+  //
+  // THE OBSERVED HEADER, recorded so the next reader does not need the 18.72 GB
+  // checkpoint mounted to check these four values. Read 2026-08-13 from the
+  // safetensors `__metadata__` of the first-party NVFP4 DiT — header JSON only,
+  // no tensor data:
+  //
+  //   /mnt/nas_share/checkpoints/ltx-2.5/lightricks-ltx-2.5/diffusion_models/
+  //       ltx-2.5-22b-distilled-transformer-nvfp4.safetensors
+  //   18,721,432,024 bytes; `Lightricks/LTX-2.5` revision
+  //   8a4ff96f581e72bedc1b44367581c49d544a05f1 (HF download record; the LFS oid
+  //   is the upstream sha256 and was NOT re-verified locally).
+  //
+  //   __metadata__["config"]["transformer"]:
+  //       caption_proj_before_connector     true
+  //       caption_projection_first_linear   false
+  //       caption_proj_input_norm           false
+  //       caption_projection_second_linear  false
+  //       num_attention_heads 32, attention_head_dim 128        -> video 4096
+  //       audio_num_attention_heads 32, audio_attention_head_dim 64 -> audio 2048
+  //       text_encoder_norm_type "PER_TOKEN_RMS", model_version "2.5.0"
+  //
+  // So this checkpoint resolves to V2 with no key missing and no value drifted.
+  // `text_encoder_norm_type` independently corroborates that, and the selector
+  // deliberately does NOT read it — it mirrors upstream's four-marker test.
+  //
+  // The vonkaiser FP8 DiT that the render arms actually load carries NO
+  // `__metadata__` block at all, so this first-party file is the only on-disk
+  // source for these four values. The four below are READ from it, not assumed
+  // from the class defaults.
   transformer["caption_proj_before_connector"] = true;
   transformer["caption_projection_first_linear"] = false;
   transformer["caption_proj_input_norm"] = false;
