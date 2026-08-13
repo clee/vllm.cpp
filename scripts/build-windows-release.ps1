@@ -30,7 +30,7 @@ function Invoke-CheckedContractTests {
     $temporaryDir = Join-Path ([System.IO.Path]::GetTempPath()) `
         "vllm-invoke-checked-$([guid]::NewGuid().ToString('N'))"
     $recordingTarget = Join-Path $temporaryDir "record-arguments.ps1"
-    $failingTarget = Join-Path $temporaryDir "fail.cmd"
+    $failingTarget = Join-Path $temporaryDir "fail.ps1"
     $callLog = Join-Path $temporaryDir "calls.txt"
     $savedCallLog = $env:VLLM_INVOKE_CHECKED_LOG
     try {
@@ -48,9 +48,8 @@ param(
 exit 0
 '@ | Set-Content -LiteralPath $recordingTarget -Encoding utf8
         @'
-@echo off
-exit /b 23
-'@ | Set-Content -LiteralPath $failingTarget -Encoding ascii
+exit 23
+'@ | Set-Content -LiteralPath $failingTarget -Encoding utf8
         $env:VLLM_INVOKE_CHECKED_LOG = $callLog
 
         Invoke-Checked $recordingTarget @()

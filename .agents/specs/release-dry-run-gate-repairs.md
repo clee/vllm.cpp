@@ -627,6 +627,27 @@ PowerShell Core does not prove Windows process semantics.
 Stop with `NEEDS_DECISION` if the repair would change production invocation or
 the native release gate rather than only its contract fixture.
 
+#### #599 implementation outcome
+
+The failure was confined to the contract fixture: PowerShell Core 7.6.4 on
+Linux dispatched the temporary `fail.cmd` through `gio`, whose success status
+made the real `Invoke-Checked` helper accept the supposed failure child. The
+fixture is now a temporary PowerShell script containing only `exit 23`; both
+Windows PowerShell and cross-platform PowerShell execute that script directly.
+Production `Invoke-Checked`, its argument splatting, the release gate, and the
+workflow topology are unchanged.
+
+Before the repair, the focused metadata contract failed on `fail.cmd` and the
+live `-ContractTest` failed with `nonzero child exit was accepted`. After the
+repair, the live PowerShell contract, all nine Windows metadata tests, all 42
+release-pipeline tests, all 76 Windows-portability tests, and both direct
+Windows checkers passed. Independently restoring the batch fixture, changing
+the child to exit 24, and bypassing the real child invocation each made both
+the focused structural and live-process tests fail; restoration returned the
+script and test to SHA-256 values `bc98e85ec59b076e04c490b23d00c41b9a8fe57277d2ba051f4fc0d3f65c569e`
+and `cb81cc1b9914306081b0861929e907cf6d50310b8a6dde7f4d27aeae40700df8`.
+Native Windows CPU and Vulkan acceptance remains pending the hosted PR jobs.
+
 #### #540 implementation outcome
 
 Implementation evidence: the focused contract was red with all six old

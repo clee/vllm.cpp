@@ -7,6 +7,8 @@ import argparse
 import importlib.util
 import json
 import re
+import shutil
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -225,6 +227,9 @@ class WindowsMetadataContract(unittest.TestCase):
         contract = script[contract_start:contract_end]
         self.assertNotIn("record-arguments.cmd", contract)
         self.assertEqual(contract.count('"record-arguments.ps1"'), 1)
+        self.assertNotIn('"fail.cmd"', contract)
+        self.assertEqual(contract.count('"fail.ps1"'), 1)
+        self.assertEqual(contract.count("exit 23"), 1)
         for recorder_statement in (
             "[Parameter(ValueFromRemainingArguments = $true)]",
             "[string[]]$RemainingArguments = @()",
@@ -277,6 +282,34 @@ class WindowsMetadataContract(unittest.TestCase):
 
         dispatch = script[script.index("if ($ContractTest)"):]
         self.assertEqual(dispatch.count("Invoke-CheckedContractTests"), 1)
+
+    def test_contract_test_executes_real_children_under_powershell_core(self) -> None:
+        pwsh = shutil.which("pwsh")
+        if pwsh is None:
+            snap_pwsh = Path("/snap/bin/pwsh")
+            if snap_pwsh.is_file():
+                pwsh = str(snap_pwsh)
+        if pwsh is None:
+            self.skipTest("PowerShell Core is not installed")
+
+        result = subprocess.run(
+            [
+                pwsh,
+                "-NoProfile",
+                "-NonInteractive",
+                "-File",
+                str(ROOT / "scripts/build-windows-release.ps1"),
+                "-SourceDir",
+                str(ROOT),
+                "-ContractTest",
+            ],
+            cwd=ROOT,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("Windows PowerShell/CRT contract tests OK", result.stdout)
 
     def test_pe_report_rejects_msys_debug_crt_and_developer_paths(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
