@@ -595,6 +595,28 @@ for that exact lifetime defect before implementing a repair. If the isolated
 case passes but the full process fails, bisect test-case prefixes in fresh
 processes to prove the cross-test state dependency rather than guessing.
 
+Candidate `f06c77fe4af502a9934e525112008e1a02bdc1ff` executed that probe in
+[run `31688115193`](https://github.com/mudler/vllm.cpp/actions/runs/31688115193).
+CPU job `94408881944` and Vulkan job `94408881974` produced the same boundary:
+the isolated socket case passed with all six destruction markers, while the
+full 54-case process produced those same six markers and then fast-failed with
+exact signed status `-1073740791` (`0xC0000409`) before the doctest summary.
+Neither job emitted the diagnostic `std::terminate` marker. This rules out the
+three instrumented owners as the final failing boundary and establishes a
+source-order cross-test dependency as the next hypothesis.
+
+The developer approved one diagnostic-only adaptive prefix bisect. It lists the
+54 doctest cases in file order, executes every probed `--first=1 --last=N`
+prefix in a fresh process, requires the full prefix to reproduce only the exact
+native fast-fail, and requires the first case as a known-good short prefix. It
+then binary-searches the smallest failing `N`, confirms `N-1` succeeds and `N`
+fast-fails in new processes, and runs only case `N` with matching first/last
+bounds to distinguish an isolated defect from cumulative contamination. The
+probe emits one stable diagnostic containing `N`, the listed test name, all
+three confirmation statuses, and the dependency classification. The existing
+unfiltered full-suite invocation remains unchanged and still runs afterwards.
+Any other probe status stops the release job rather than being classified.
+
 ### Cross-platform PowerShell contract follow-up: issue #599
 
 Fresh review of diagnostic candidate `5a845c28a7a9afe5addf94771e59a71cecd31e81`
