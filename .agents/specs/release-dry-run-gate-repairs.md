@@ -595,6 +595,38 @@ for that exact lifetime defect before implementing a repair. If the isolated
 case passes but the full process fails, bisect test-case prefixes in fresh
 processes to prove the cross-test state dependency rather than guessing.
 
+### Cross-platform PowerShell contract follow-up: issue #599
+
+Fresh review of diagnostic candidate `5a845c28a7a9afe5addf94771e59a71cecd31e81`
+ran the required direct Windows portability checker on a Linux host with
+PowerShell Core installed. `Invoke-CheckedContractTests` created `fail.cmd` and
+invoked that path directly. Non-Windows PowerShell handed the batch file to
+`gio` instead of a Windows command interpreter; `gio` reported the unusable
+path but returned success, so the contract failed at its own guard with
+`nonzero child exit was accepted`. The repository preflight did not substitute
+for this direct checker and its green result is not evidence for this boundary.
+
+The #599 repair is contract-test only. Replace the platform-specific failing
+child fixture with a script directly executable by both Windows PowerShell and
+PowerShell Core on non-Windows hosts. Preserve the real-process invocation,
+exact exit status 23, zero- and non-empty-argument forwarding proofs, production
+`Invoke-Checked` behavior, native release gate, and release topology. Do not
+mock this boundary, special-case the checker host, skip the nonzero child, or
+accept a desktop-opener status.
+
+RED-first evidence is the direct checker failure above. Focused coverage must
+pin the portable fixture and its exact exit 23, then run the actual
+`-ContractTest` path under installed PowerShell Core. Mutating the fixture back
+to `.cmd`, changing its exit status, or bypassing the real child invocation must
+make the focused gate red. Focused green requires Windows release metadata and
+pipeline tests, the complete Windows portability unit suite, the direct Windows
+portability and release-binary checkers, and full unstaged/staged/post-commit
+preflight. Hosted CPU and Vulkan execution remains required because local
+PowerShell Core does not prove Windows process semantics.
+
+Stop with `NEEDS_DECISION` if the repair would change production invocation or
+the native release gate rather than only its contract fixture.
+
 #### #540 implementation outcome
 
 Implementation evidence: the focused contract was red with all six old
