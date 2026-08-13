@@ -33,6 +33,7 @@ function Invoke-CheckedContractTests {
     $failingTarget = Join-Path $temporaryDir "fail.ps1"
     $callLog = Join-Path $temporaryDir "calls.txt"
     $savedCallLog = $env:VLLM_INVOKE_CHECKED_LOG
+    $powerShellExecutable = [System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
     try {
         New-Item -ItemType Directory -Path $temporaryDir | Out-Null
         @'
@@ -48,11 +49,15 @@ param(
 exit 0
 '@ | Set-Content -LiteralPath $recordingTarget -Encoding utf8
         @'
+[string]$PID | Set-Content `
+    -LiteralPath $env:VLLM_INVOKE_CHECKED_LOG -Encoding ascii
 exit 23
 '@ | Set-Content -LiteralPath $failingTarget -Encoding utf8
         $env:VLLM_INVOKE_CHECKED_LOG = $callLog
+        $parentProcessId = $PID
 
-        Invoke-Checked $recordingTarget @()
+        Invoke-Checked $powerShellExecutable @(
+            "-NoProfile", "-NonInteractive", "-File", $recordingTarget)
         $zeroArgumentRecord = Get-Content -LiteralPath $callLog -Raw | ConvertFrom-Json
         if ([int]$zeroArgumentRecord.Count -ne 0 -or
             @($zeroArgumentRecord.Arguments).Count -ne 0) {
@@ -60,7 +65,9 @@ exit 23
         }
 
         Remove-Item -LiteralPath $callLog
-        Invoke-Checked $recordingTarget @("alpha", "two words", "--flag=value")
+        Invoke-Checked $powerShellExecutable @(
+            "-NoProfile", "-NonInteractive", "-File", $recordingTarget,
+            "alpha", "two words", "--flag=value")
         $nonemptyArgumentRecord = Get-Content -LiteralPath $callLog -Raw | ConvertFrom-Json
         if ([int]$nonemptyArgumentRecord.Count -ne 3 -or
             @($nonemptyArgumentRecord.Arguments).Count -ne 3 -or
@@ -72,7 +79,8 @@ exit 23
 
         $rejected = $false
         try {
-            Invoke-Checked $failingTarget @()
+            Invoke-Checked $powerShellExecutable @(
+                "-NoProfile", "-NonInteractive", "-File", $failingTarget)
         } catch {
             if ($_.Exception.Message -notmatch 'exited with status 23') {
                 throw
@@ -81,6 +89,10 @@ exit 23
         }
         if (-not $rejected) {
             throw "nonzero child exit was accepted"
+        }
+        $failingChildProcessId = [int](Get-Content -LiteralPath $callLog -Raw)
+        if ($failingChildProcessId -eq $parentProcessId) {
+            throw "failure target did not execute in a child process"
         }
     } finally {
         if ($null -eq $savedCallLog) {

@@ -648,6 +648,26 @@ script and test to SHA-256 values `bc98e85ec59b076e04c490b23d00c41b9a8fe57277d2b
 and `cb81cc1b9914306081b0861929e907cf6d50310b8a6dde7f4d27aeae40700df8`.
 Native Windows CPU and Vulkan acceptance remains pending the hosted PR jobs.
 
+Fresh review of `bb3a4ef409d372b7f22698b8b530b4cb7f953cb9` disproved the
+outcome's claim that direct invocation of the portable `.ps1` fixture preserved
+a real-process boundary: the parent and invoked fixture both recorded PID
+`3526837`. Direct `.ps1` invocation creates another PowerShell scope in the
+same host process, so the earlier process-boundary claim is rejected.
+
+The follow-up resolves the running host through
+`[System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName`, which
+is available to Windows PowerShell 5.1 as well as PowerShell Core, and passes
+that executable plus `-NoProfile -NonInteractive -File` through the unchanged
+`Invoke-Checked` helper for every fixture. The failing fixture records its PID
+before exact exit 23, and the live contract rejects equality with the parent
+PID. Before the repair that assertion failed with `failure target did not
+execute in a child process`; after it, the live contract, all 9 Windows metadata
+tests, all 42 release-pipeline tests, all 76 Windows-portability tests, and the
+four direct Windows release checkers pass. Mutating the failure launch back to
+direct `.ps1`, changing exit 23 to exit 24, or bypassing `Invoke-Checked` makes
+both structural and live-process coverage red. Native hosted Windows remains
+the final authority for Windows process semantics.
+
 #### #540 implementation outcome
 
 Implementation evidence: the focused contract was red with all six old

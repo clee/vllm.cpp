@@ -240,20 +240,34 @@ class WindowsMetadataContract(unittest.TestCase):
             with self.subTest(recorder_statement=recorder_statement):
                 self.assertEqual(contract.count(recorder_statement), 1)
 
+        self.assertEqual(
+            contract.count(
+                "$powerShellExecutable = "
+                "[System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName"
+            ),
+            1,
+        )
+        self.assertEqual(contract.count("Invoke-Checked $powerShellExecutable @("), 3)
+        self.assertNotIn("Invoke-Checked $recordingTarget", contract)
+        self.assertNotIn("Invoke-Checked $failingTarget", contract)
+
         required_statements = (
-            "Invoke-Checked $recordingTarget @()",
+            '"-NoProfile", "-NonInteractive", "-File", $recordingTarget)',
             "$zeroArgumentRecord = Get-Content -LiteralPath $callLog -Raw | ConvertFrom-Json",
             "[int]$zeroArgumentRecord.Count -ne 0",
             "@($zeroArgumentRecord.Arguments).Count -ne 0",
-            'Invoke-Checked $recordingTarget @("alpha", "two words", "--flag=value")',
+            '"-NoProfile", "-NonInteractive", "-File", $recordingTarget,',
+            '"alpha", "two words", "--flag=value")',
             "$nonemptyArgumentRecord = Get-Content -LiteralPath $callLog -Raw | ConvertFrom-Json",
             "[int]$nonemptyArgumentRecord.Count -ne 3",
             "@($nonemptyArgumentRecord.Arguments).Count -ne 3",
             '$nonemptyArgumentRecord.Arguments[0] -cne "alpha"',
             '$nonemptyArgumentRecord.Arguments[1] -cne "two words"',
             '$nonemptyArgumentRecord.Arguments[2] -cne "--flag=value"',
-            "Invoke-Checked $failingTarget @()",
+            '"-NoProfile", "-NonInteractive", "-File", $failingTarget)',
             "if (-not $rejected)",
+            "$failingChildProcessId = [int](Get-Content -LiteralPath $callLog -Raw)",
+            "if ($failingChildProcessId -eq $parentProcessId)",
         )
         cursor = 0
         for statement in required_statements:
@@ -276,6 +290,7 @@ class WindowsMetadataContract(unittest.TestCase):
             "zero-argument target was not invoked exactly once without arguments",
             "nonempty arguments did not arrive unchanged",
             "nonzero child exit was accepted",
+            "failure target did not execute in a child process",
         ):
             with self.subTest(behavior=behavior):
                 self.assertEqual(contract.count(behavior), 1)
