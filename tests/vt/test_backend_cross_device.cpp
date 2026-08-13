@@ -34,6 +34,12 @@
 #include <string>
 #include <vector>
 
+#if defined(_WIN32)
+// _putenv_s lives in <stdlib.h>. <cstdlib> is only REQUIRED to declare the
+// std:: names, so do not rely on it dragging the MSVC-specific one in (#514).
+#include <stdlib.h>
+#endif
+
 #include "vt/backend.h"
 #include "vt/op_provider.h"
 #include "vt/ops.h"
@@ -150,6 +156,32 @@ Tensor TI32(void* p, Device d, int64_t n) {
 }
 Tensor TI64(void* p, Device d, int64_t n) {
   return Tensor::Contiguous(p, DType::kI64, d, {n});
+}
+
+// Environment seam (#514). MSVC has NEITHER setenv NOR unsetenv, so the bare
+// POSIX calls this file used broke the native Windows build with C3861 before
+// any gate ran. Same file-local shape as tests/vllm/test_gguf.cpp:83-92, but
+// SET and UNSET stay SEPARATE entry points on purpose: the tier restore below
+// needs "make VT_FUSED_TIER absent again", and folding that into
+// SetEnv(name, "") would silently turn absent into empty. On MSVC, passing an
+// empty value to _putenv_s is the documented REMOVAL form -- getenv then
+// returns nullptr, which is the semantic ::unsetenv gives us on POSIX. Return
+// values are ignored to match the pre-existing call sites exactly; adding a
+// REQUIRE here would change this file's assertion count.
+void SetEnv(const char* name, const char* value) {
+#if defined(_WIN32)
+  ::_putenv_s(name, value);
+#else
+  ::setenv(name, value, /*overwrite=*/1);
+#endif
+}
+
+void UnsetEnv(const char* name) {
+#if defined(_WIN32)
+  ::_putenv_s(name, "");
+#else
+  ::unsetenv(name);
+#endif
 }
 
 }  // namespace
@@ -510,15 +542,20 @@ TEST_CASE("ReshapeAndCache scatters into the KV cache BIT-EXACTLY") {
       }
     std::vector<float> ref_comb = combined;
     {
-      vt::Backend& cpu = vt::GetBackend(DeviceType::kCPU);
-      Queue cq = cpu.CreateQueue();
-      const Device cd{DeviceType::kCPU, 0};
-      std::vector<float> ck = knew, cv = vnew, cslots_f;
-      std::vector<int64_t> cslots = slots;
-      Tensor tk = Tensor::Contiguous(ck.data(), DType::kF32, cd, {kTokens, kHk, kD});
-      Tensor tv = Tensor::Contiguous(cv.data(), DType::kF32, cd, {kTokens, kHk, kD});
-      Tensor tcomb =
-          Tensor::Contiguous(ref_comb.data(), DType::kF32, cd, {kBlocks * 2 * within});
+      // Names are prefixed `unbind_` so they do not SHADOW the enclosing test's
+      // bound-layout oracle locals of the same role (#540): MSVC /W4 /WX turns
+      // C4456 into an error, and the shadow was genuinely confusing to read.
+      vt::Backend& unbind_cpu = vt::GetBackend(DeviceType::kCPU);
+      Queue unbind_cq = unbind_cpu.CreateQueue();
+      const Device unbind_cd{DeviceType::kCPU, 0};
+      std::vector<float> unbind_ck = knew, unbind_cv = vnew, cslots_f;
+      std::vector<int64_t> unbind_cslots = slots;
+      Tensor tk =
+          Tensor::Contiguous(unbind_ck.data(), DType::kF32, unbind_cd, {kTokens, kHk, kD});
+      Tensor tv =
+          Tensor::Contiguous(unbind_cv.data(), DType::kF32, unbind_cd, {kTokens, kHk, kD});
+      Tensor tcomb = Tensor::Contiguous(ref_comb.data(), DType::kF32, unbind_cd,
+                                        {kBlocks * 2 * within});
       auto slice = [&](int which) {
         Tensor t = tcomb;
         t.data = static_cast<char*>(t.data) +
@@ -534,10 +571,11 @@ TEST_CASE("ReshapeAndCache scatters into the KV cache BIT-EXACTLY") {
         t.stride[3] = 1;
         return t;
       };
-      Tensor tsm = Tensor::Contiguous(cslots.data(), DType::kI64, cd, {kTokens});
+      Tensor tsm =
+          Tensor::Contiguous(unbind_cslots.data(), DType::kI64, unbind_cd, {kTokens});
       Tensor tkc = slice(0), tvc = slice(1);
-      vt::ReshapeAndCache(cq, tk, tv, tkc, tvc, tsm);
-      cpu.DestroyQueue(cq);
+      vt::ReshapeAndCache(unbind_cq, tk, tv, tkc, tvc, tsm);
+      unbind_cpu.DestroyQueue(unbind_cq);
     }
 
     for (DeviceType dt : RegisteredDevices()) {
@@ -1001,7 +1039,7 @@ TEST_CASE("FusedChain matches the CPU oracle within NMSE <= 5e-4 (both tiers)") 
 
   for (int tier : {0, 1}) {
     CAPTURE(tier);
-    setenv("VT_FUSED_TIER", tier == 0 ? "0" : "1", 1);
+    SetEnv("VT_FUSED_TIER", tier == 0 ? "0" : "1");
     // ASSERT the tier actually took effect rather than trusting the log: doctest
     // CAPTURE is lazily stringified, so a mis-set environment would silently
     // run the same path twice and still look like two-tier coverage.
@@ -1045,9 +1083,9 @@ TEST_CASE("FusedChain matches the CPU oracle within NMSE <= 5e-4 (both tiers)") 
   }
 
   if (had_prev) {
-    setenv("VT_FUSED_TIER", saved.c_str(), 1);
+    SetEnv("VT_FUSED_TIER", saved.c_str());
   } else {
-    unsetenv("VT_FUSED_TIER");
+    UnsetEnv("VT_FUSED_TIER");
   }
 }
 
