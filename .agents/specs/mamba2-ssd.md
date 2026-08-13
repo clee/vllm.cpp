@@ -829,9 +829,41 @@ is the CPU-only lane, so it is a much smaller and much faster gate than §8.4's
 failures is reachable here. `scripts/agent-preflight.sh --staged` returned
 `RC=0`.
 
-**The CUDA arm could not be built or run — `omitted_gates`.** `dgx.casa` has been
-unreachable since 06:50 CEST (§8.4) and this box has no `nvcc` and no GPU. Two
-substitutes were run instead, and neither is offered as the device gate:
+**The CUDA arm was COMPILED by the operator on `dgx.casa`; it was not RUN.**
+`dgx.casa` returned at **06:57 UTC** (it had rebooted; uptime was 0), which
+supersedes §8.4's `REMOTE_UNVERIFIED` note on the host being away. The
+implementer's box has no `nvcc` and no GPU, so the compile was **operator-run,
+not implementer-run**, and is recorded as the operator's result rather than
+folded into the implementer's evidence. The branch was transferred by
+`git archive` — never `rsync`, which has previously overwritten goldens into
+false passes — and built with real nvcc:
+
+```
+NVCC: cuda_13.0.r13.0
+CUTLASS found at ~/cutlass-4.5.0; enabling sm120a NVFP4 cutlass GEMM
+Marlin NVFP4 W4A16 MoE GEMM enabled (vendored) for [121a]
+FlashAttention-2 prefill/decode: ENABLED for arch(es) [121a]
+CONFIGURE_EXIT=0   BUILD_EXIT=0   WARNINGS=0   ENOSPC=0
+```
+
+Zero nvcc errors and **zero warnings under the project's `-Werror` flags**, disk
+unchanged at 64G either side (so not the stale-binary false-green shape), and
+the three fast-path features read **out of the configure log** rather than
+assumed — an absent CUTLASS also exits 0, so "the build succeeded" alone would
+have proved nothing ([[dgx-build-fast-path-verification]]). This closes the axis
+the shim check below could only approximate: `cuda_mamba2_ssd.cuh` now compiles
+through `cuda_gdn.cu` with real nvcc at the arch it ships on, which is what
+actually retires the risk that the new `S` kernel parameter or the `M2Scratch`
+guard broke the device build.
+
+**Attribute it to the operator, not to CI.** `cuda-fat-build` has still never
+completed on this branch (see the cancellation note below), so no CI job has
+compiled this code.
+
+The two substitutes below were run BEFORE that compile existed. They are kept
+because they are what the implementer could establish unaided, and because the
+second one is not superseded by any compile — but neither is offered as the
+device gate:
 
 1. **`.cuh` compile + arity check.** The header was compiled by the host compiler
    at `-std=c++20 -Wall -Wextra -Werror` against minimal CUDA shims, with each
@@ -853,16 +885,59 @@ substitutes were run instead, and neither is offered as the device gate:
    `seq_idx` violations read no previous state at all — which is what the new
    device case compares against an in-contract zero-init run.
 
-**Owed on the device, all `omitted_gates` until `dgx.casa` returns:** the three
-suites' CUDA arms (Release and Debug); `compute-sanitizer memcheck` on the new
-"clamps out-of-contract metadata in registers" case, which is what actually
-proves memory safety — a green run without it is necessary and not sufficient,
-because an out-of-bounds write into a `cudaMallocAsync` pool commonly does not
-fault; a re-run of the 9-mutation sweep against the moved bound; and §8.4's
-still-pending `~/w2ssd/refail.log` attribution, which remains `REMOTE_UNVERIFIED`.
+**Still `omitted_gates` — and the blocker is now the GPU LOCK, not the host.**
+`dgx.casa` is back, so these are no longer waiting on a machine; they are
+waiting on `$HOME/gpu.lock`, currently held by other coordinators' jobs with
+8-hour timeouts. A host being reachable is not the same as the GPU being
+available, and running any of these against a contended GPU would reproduce
+exactly the undetected-contention defect §8.4 already records. Owed:
 
-The Windows CI reds remain the `main` baseline described in §8.4 (#512 now fixed
-by #583, #514, #584); they are subtracted, not inherited.
+1. the three suites' CUDA arms (Release and Debug) — **execution**, which the
+   operator's compile does not supply;
+2. `compute-sanitizer memcheck` on the new "clamps out-of-contract metadata in
+   registers" case. This is the one that actually proves the F2 clamps: a green
+   run without it is necessary and not sufficient, because an out-of-bounds
+   write into a `cudaMallocAsync` pool commonly does not fault;
+3. a re-run of the 9-mutation sweep against the moved bound `5·(K+2)·u` — the
+   §8.4 sweep was scored against `4·(K+2)·u`, and a widened bound is precisely
+   the change that could stop a mutation reddening;
+4. §8.4's `~/w2ssd/refail.log` attribution, still `REMOTE_UNVERIFIED`.
+
+Item 3 is the one a reader is most likely to assume is safe. It is not assumed
+here: the re-scaled margins in §8.3 point 6 make it very likely to hold, and
+"very likely" is not a gate result.
+
+**CI on this branch is `REMOTE_UNVERIFIED`, and the distinction matters.** Every
+GitHub Actions run for PR #592 -- all four SHAs, both the `ci` and `containers`
+workflows -- ended `conclusion: cancelled`, never `failure` and never `success`.
+`gh pr checks` renders a cancelled job as `fail`, so the PR reads as 16 reds
+that are not reds; the run-level conclusion is what settles it. Three of the
+four were cancelled by my own subsequent pushes, which is ordinary. The fourth
+was not: run `31676434945` on the head SHA `f5c589f5e` sat queued from 07:06:49,
+started at ~07:42, and was cancelled at **07:44:45-07:44:55** together with
+**every other run in the repository** -- 20 of 20 across 7 branches, including
+`row/LTX25-L9C-REGISTER-GATE`, `row/GATE-GPU-LOCK-WRAPPER` and
+`row/FIX-HF-SNAPSHOT-ORDER-551`. `windows-msvc-cpu` had already passed two steps
+when it was killed mid-build. A simultaneous repo-wide cancellation is an
+Actions-side event, not a verdict on any diff, and it is recorded as unknown
+rather than as either absence or success. A re-run was triggered at 07:47 and
+was still `queued` at 07:50 when this was written; **whatever it reports, not
+this paragraph, is the CI result.**
+
+**The rendering trap is worth carrying beyond this row, because two people hit
+it independently from opposite ends.** `gh pr checks` prints a CANCELLED job as
+`fail`. The implementer's watcher reported 16 failures on #592 and the
+operator's reported 20, and the true count of failures in both was **zero**. A
+per-check listing therefore cannot distinguish "this branch is red" from "the
+whole runner pool was killed"; only the RUN-level `conclusion` field can
+(`gh run view <id> --json status,conclusion` → `cancelled`). Anyone subtracting
+a CI baseline on this repo should read run conclusions, not check rows, or they
+will attribute an infrastructure event to a diff.
+
+**No CI claim is made or repaired here.** In particular the two Windows jobs
+remain the `main` baseline described in §8.4 (#512 now fixed by #583, #514,
+#584) -- subtracted, not inherited -- and nothing above should be read as
+evidence that this branch's CI passed.
 
 ## 9. Stop conditions
 
