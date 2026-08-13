@@ -129,4 +129,57 @@ Ltx2ConnectorOutput Ltx2ConnectorForward(const Ltx2ConnectorConfig& config,
                                          const float* additive_attention_mask, int64_t batch,
                                          int64_t seq);
 
+// ─── THE PROCESSOR AROUND THE TWO CONNECTORS ─────────────────────────────────
+//
+// Upstream: `EmbeddingsProcessor.create_embeddings`
+// (text_encoders/gemma/embeddings_processor.py:70-95). It is a SEPARATE module
+// from the connector and it does three things the connector does not, each of
+// which changes the conditioning silently when it is skipped:
+//
+//   * IT RIGHT-PAD-SORTS THE FEATURES FIRST (:82-84, `_compute_right_pad_order` /
+//     `_apply_right_pad_order`). Upstream's own comment is "Connectors expect
+//     right-padded input ([valid, pad])", because the register table is indexed
+//     by ABSOLUTE position (`s % num_registers`) rather than by which positions
+//     were padded. A LEFT-padded batch handed straight to the connector puts
+//     real tokens where registers belong and registers where tokens belong, and
+//     the result is finite, correctly shaped and conditioned on nothing.
+//   * IT MULTIPLIES THE VIDEO ENCODING BY A BINARY MASK (:86-87) and does NOT do
+//     the same to the audio one (:91-93) — an asymmetry that reads like an
+//     oversight, is upstream's behaviour, and is mirrored rather than tidied.
+//   * IT RETURNS THE BINARY MASK THE DiT CONSUMES (:89), which is the connector's
+//     OUTPUT mask, not the caller's input one. That mask is derived with
+//     `encoded_mask < 0.000001` (:46-48), and BOTH values an additive mask can
+//     hold — 0.0 and -finfo(f32).max — satisfy it, so it is all ones for every
+//     input either reference can produce. See the implementation: the direction
+//     is surprising, `diffusers` writes the identical comparison, and the
+//     multiply is consequently an identity on every reachable path.
+//
+// THE TWO REFERENCES DISAGREE ABOUT WHERE THE SORT LIVES, and the disagreement is
+// recorded rather than resolved by preference. `diffusers`'
+// `LTX2ConnectorTransformer1d.forward` folds the sort INTO the connector
+// (`src/diffusers/pipelines/ltx2/connectors.py`, the `torch.argsort(1 -
+// binary_attn_mask, stable=True)` branch) and its comment claims that matches
+// "the original LTX implementation" — which is true only because `ltx_core`
+// sorts one level up, in the processor. The two compose to the same function;
+// they differ in which module owns it. This port follows `ltx_core`, so
+// `Ltx2ConnectorForward` stays a faithful port of `Embeddings1DConnector` and
+// the sort lands here, at the processor.
+struct Ltx2ConnectorEmbeddings {
+  std::vector<float> video;  // [batch, seq, video inner_dim]
+  std::vector<float> audio;  // [batch, seq, audio inner_dim]
+  // `binary_mask.squeeze(-1)` (:89): [batch, seq], 1.0 for a position the DiT's
+  // cross-attention may attend to and 0.0 for one it may not. With registers
+  // enabled every position is attendable, which is the whole point of them.
+  std::vector<float> mask;
+};
+
+// `additive_attention_mask` is [batch, seq] with 0 for a kept token and
+// -finfo(f32).max for a padded one, and it is required: it is what decides which
+// positions become registers.
+Ltx2ConnectorEmbeddings Ltx2ConnectorCreateEmbeddings(
+    const Ltx2ConnectorConfig& video_config, const Ltx2VaeWeights& video_weights,
+    const float* video_features, const Ltx2ConnectorConfig& audio_config,
+    const Ltx2VaeWeights& audio_weights, const float* audio_features,
+    const float* additive_attention_mask, int64_t batch, int64_t seq);
+
 }  // namespace vllm

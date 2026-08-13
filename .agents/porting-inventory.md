@@ -1480,6 +1480,91 @@ Examples: `examples/cli` ✅ (C-API client), `examples/server` ✅ (OpenAI serve
     * **Spec:** [ltx-2.5 spec](specs/ltx-2-5.md) §6 (L8). Lifecycle: shipped
       (CPU + CUDA, bf16 and f32 streams). Owner: the LTX-2.5 row.
 
+21. **LTX-2.5 phase L9c — the EMBEDDINGS CONNECTOR reaches the render path, and the
+    two references disagree about which module owns the sort.**
+    2026-08-13, `MODEL-DIFFUSION-ltx-2-5-ltx2-video-transformer-3d-model` phase L9c,
+    issue [#435](https://github.com/mudler/vllm.cpp/issues/435).
+    * **Upstream source:** Lightricks/LTX-2 @ `fd4ded7f`,
+      `packages/ltx-core/src/ltx_core/text_encoders/gemma/embeddings_processor.py:70-95`
+      (`EmbeddingsProcessor.create_embeddings`) and `:23-48` (its three helpers), plus
+      `embeddings_connector.py:194-256` (the two configurators) and
+      `encoders/encoder_configurator.py:331-346` (`EMBEDDINGS_PROCESSOR_KEY_OPS`,
+      which is what says these weights belong to the TEXT ENCODER even though they
+      ship inside the DiT file).
+    * **Local anchor:** `Ltx2ConnectorCreateEmbeddings`
+      (`src/vllm/model_executor/models/ltx2_connector.cpp`), `Ltx2ParseConnectorConfig`
+      and `Ltx2LoadConnectorWeights` (`ltx2_loader.cpp`), and the call in
+      `Ltx2VideoEngine::Load` (`src/vllm/multimodal/ltx2_video.cpp`).
+    * **What was actually wrong before it.** `Ltx2ConnectorForward` landed at L5 and
+      was gated against upstream on five arms — and its ONLY caller was its own test.
+      The render handed the prompt-embeds file straight to cross-attention, and the
+      two `*_embeddings_connector` families (129 tensors each, present in both shipped
+      DiTs) were reported as unported and stepped over. A brick with a golden and no
+      caller is indistinguishable, from the outside, from a brick that is wired.
+    * **THE TWO REFERENCES DISAGREE, and it is recorded rather than resolved by
+      preference.** `ltx_core` right-pad-sorts the features in the PROCESSOR before
+      calling the connector ("Connectors expect right-padded input",
+      `embeddings_processor.py:80-84`); `diffusers` folds that sort INTO the connector
+      (`src/diffusers/pipelines/ltx2/connectors.py`, the
+      `torch.argsort(1 - binary_attn_mask, stable=True)` branch) and its comment
+      claims that matches "the original LTX implementation" — true only because
+      `ltx_core` does it one level up. They compose to the same function and differ in
+      which module owns it. This port follows `ltx_core`, so `Ltx2ConnectorForward`
+      stays a faithful port of `Embeddings1DConnector`.
+    * **WHERE THEY AGREE AND IT LOOKS LIKE A BUG.** `_to_binary_mask` is
+      `encoded_mask < 0.000001` (`embeddings_processor.py:46-48`). An additive mask
+      holds `0.0` for KEPT and `-finfo(f32).max` for PADDED, and BOTH satisfy it — so
+      the mask handed to the DiT is one at every position, and the video-only multiply
+      that follows is an identity on every reachable path. `diffusers` writes the
+      identical `(video_attn_mask < 1e-6)` and the identical multiply. Checked on both
+      BEFORE mirroring it, because the reading a port arrives at by reasoning about
+      intent (`>= 0`) is the opposite at padded positions. Gated as the surprising
+      behaviour, so "fixing" it REDs: `test_ltx2_pipeline`, case "ltx2 the processor's
+      binary mask mirrors a comparison that looks backwards".
+    * **THE REGISTER BOUNDARY IS NOW NUMERICALLY REACHABLE (2026-08-13, review
+      finding F1 on the L9c PR).** `prompt_embeds_valid_rows` is the single knob
+      deciding which positions become the connector's TRAINED registers, and the
+      only case covering it asserted that valid=4 renders differently from valid=2.
+      Every monotone corruption of that boundary keeps that true, so a fresh
+      reviewer's `prompt_valid_rows + 1` left the suite fully green — one padded row
+      conditioned on caller junk instead of a register: finite, correctly shaped,
+      plausible, wrong. Closed by asserting WHICH positions are registers, from both
+      sides: perturbing rows `[valid, N)` must move NOTHING (they are substituted at
+      `embeddings_connector.py:148-150`) and perturbing row `valid - 1` must move
+      something. `test_ltx2_video`, case "the register boundary sits EXACTLY at the
+      valid-row count"; RED under `+ 1`, `- 1`, `0` and `v_rows`.
+    * **A CONFIG VALUE THAT IS NOT NEAR ITS DEFAULT.** LTX-2.5 declares
+      `connector_positional_embedding_max_pos = [4096]` where `Embeddings1DConnector`'s
+      class default is `[1]`, and `get_fractional_positions` DIVIDES the token index by
+      it (`rope.py:132-141`). No shape can see the difference; the default is every
+      RoPE angle wrong. `positional_embedding_theta` is deliberately NOT read from the
+      DiT config even though one is declared, because neither configurator passes it —
+      reading it would be a re-invention rather than a port.
+    * **ONE KEY WHERE THIS PARSE DIVERGES RATHER THAN MIRRORS (2026-08-13, review
+      finding F3).** `Ltx2ParseConnectorConfig` reads
+      `connector_num_learnable_registers`, which NEITHER configurator does
+      (`embeddings_connector.py:194-219` and `:222-256` both leave it at the class
+      default of 128), so "mirrors both configurators key for key" is not literally
+      true of this one key. The divergence is kept — a checkpoint declaring something
+      else must not be silently run at 128 — and is now ENFORCED rather than asserted:
+      `test_ltx2_video`, case "a connector config that disagrees with the FILE is
+      refused", subcase "a register count the file's TABLE does not carry is refused",
+      which REDs when the read is made inert.
+    * **The record changed, not just the code.** The two connector families are no
+      longer reported as unported: this port reads them, so naming them would say
+      something untrue about the tree and would demand `allow_unported_modules` from a
+      caller whose checkpoint is read completely. Asserted as an ABSENCE in
+      `test_ltx2_loader`, case "ltx2 loader: the unported families are refused by name,
+      not absorbed" (`CHECK(conn_ck.unported.empty())`), so restoring the old behaviour
+      REDs.
+    * **OWED, and precisely:** the Gemma-4 TOWER, so what ENTERS the connector is still
+      whatever the caller put in the prompt-embeds file — the link below the tower is
+      real, the tower is not. `prompt_embeds_valid_rows` exists because a file carries
+      no tokenizer mask and the connector REPLACES padding with learned registers.
+    * **Spec:** [ltx-2.5 spec](specs/ltx-2-5.md) §6. Lifecycle: shipped (CPU host
+      module; f32, an annotated escape — it runs once per load and its output is
+      narrowed to the stream dtype on upload). Owner: the LTX-2.5 row.
+
 ## 10. E2E test suites (T0 deliverable)
 
 1. **Op parity**: golden dumps from upstream vLLM (Python, test-time only) →

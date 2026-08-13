@@ -20353,3 +20353,173 @@ per stream), NOT as a perf fix; C_tmp size is ELIMINATED as an explanation of th
 Method: third time drift has fooled a before/after here. Pairing caught the
 first, pinned clocks the second, and only an in-process toggle catches this one.
 Future perf claims on this row need the toggle, not two runs.
+## LTX-2.5 L9c — the per-phase pool drain is worth 0.11 GiB, and L9B's 58 GB runaway does not reproduce (2026-08-13, `row/LTX25-L9C-CONNECTOR-DRAIN`, issue [#435](https://github.com/mudler/vllm.cpp/issues/435))
+
+**No speed number is claimed and none is implied.** LTX-2.5's speed axis is
+structurally `PENDING` (spec [ltx-2-5.md](specs/ltx-2-5.md) §0): vLLM-Omni has no
+native 2.5 and its diffusers adapter is a black box, so no production-configuration
+denominator exists. Every wall clock below is SIZING — how long a render takes on
+this box — and is not comparable to anything.
+
+### What was measured, and on what
+
+dgx.casa (GB10, sm_121a, 119 GiB unified), one `flock $HOME/gpu.lock` hold,
+`local-ai-worker` down at both ends of every arm. Build: Release, CUDA `121a`,
+`VLLM_CPP_CUTLASS_DIR=$HOME/cutlass-4.5.0`, `VLLM_CPP_TRITON=ON`, configure log
+verified to print `CUTLASS found ... sm120a NVFP4 cutlass GEMM`,
+`FlashAttention-2 prefill/decode: ENABLED for arch(es) [121a]` and
+`Triton AOT: ... sm_121a`.
+
+Artifacts, named per spec §3.1 because a render is only a statement about the
+files that produced it:
+
+| | |
+|---|---|
+| DiT | `vonkaiser/LTX-2.5-FP8-NVFP4` `ltx-2.5-22b-distilled-fp8.safetensors` (21.00B, FP8, 6124 tensors) |
+| Video VAE | `Lightricks/LTX-2.5` `ltx-2.5-video-vae-conv-bf16.safetensors` (Conv arm) |
+| Audio VAE | `Lightricks/LTX-2.5` `ltx-2.5-audio-vae-bf16.safetensors` + its BWE vocoder |
+| Upsampler | `ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors` |
+| Config | LTX-2.5's **DECLARED** config, `sha256 30d08fad…4b21` — `frequencies_precision=float64`, `av_ca_timestep_scale_multiplier=1000`, `connector_positional_embedding_max_pos=[4096]`. NOT the manifest defaults |
+| Conditioning | 128 rows, `--prompt-valid-rows 24`, `sha256 c7dff715…11e8` / `b7ff5ff3…ef0f`. **Synthetic** N(0, 0.2): the Gemma-4 tower is not ported |
+
+### The drain A/B — same binary, `VLLM_LTX2_POOL_DRAIN`, 320x192 / 25 frames
+
+| arm | drain | wall (sizing only) | user CPU | peak host RSS | lowest MemAvailable | result |
+|---|---|---|---|---|---|---|
+| E0 | OFF | 23:39.30 | 1265.63 s | 32.84 GB | **68.23 GiB** | 25 frames, h264 320x192 + AAC |
+| E1 | ON | 23:40.13 | 1265.82 s | 32.84 GB | **68.14 GiB** | 25 frames, h264 320x192 + AAC |
+
+0.8 s of wall and 0.09 GiB of floor separate them, and the floor moves the WRONG
+way, so both are noise. The drain's own report says why:
+
+| geometry | after `generate_lowres` | after `refine` |
+|---|---|---|
+| 128x128 / 9f | 0.01 GiB | 0.02 GiB |
+| 320x192 / 25f | 0.03 GiB | 0.08 GiB |
+
+**The retained scratch at an LTX phase boundary is 0.11 GiB, not 58 GB.** The
+drain is correct, costs one free per retained block, and matches what MiniMax-H3
+does at the same boundary — and it is NOT what makes a bigger render possible.
+
+**And it is numerically INERT, proven rather than argued.** `diff -r -q` over the
+two arms' output directories returns 0: all 25 frames, the WAV and the MP4 are
+BYTE-IDENTICAL between drain-off and drain-on (rolled-up md5 `2eba29bf…e656` on
+both sides). Draining a free list cannot change arithmetic, and this is what
+saying so looks like when it is measured instead of asserted.
+
+### The ladder, and where L9B's ~58 GB actually lives
+
+| rung | geometry | denoise | outcome |
+|---|---|---|---|
+| D0 | 128x128 / 9f | drains 0.01 + 0.02 GiB | **completes**, 9 frames, 6:31 |
+| E0/E1 | 320x192 / 25f | drains 0.03 + 0.08 GiB | **completes**, 25 frames, 23:39, floor 68.2 GiB |
+| F1 | 448x256 / 25f | drains 0.04 + 0.14 GiB | **STOPPED by the watchdog**, 0 frames |
+
+**The highest rung that completes is 320x192 / 25 frames.** That is a measurement,
+not a ceiling — see the next hypothesis below.
+
+F1 is where L9B's number turns up, and it is not where L9B put it. Both denoise
+phases finished and drained normally, and MemAvailable was flat at **75.2 GiB**
+through all of it. Then, AFTER the last drain:
+
+```
+03:47:11 avail_kB=73014000 rss_kB=4972520
+03:47:21 avail_kB=57800944 rss_kB=4972520
+03:47:31 avail_kB=27711644 rss_kB=4899272
+03:47:35 WATCHDOG_KILL avail_kB=13774472 floor=18000000
+```
+
+**~59 GB in 24 seconds with the process's own RSS flat at 4.9 GB.** That is L9B's
+~58 GB and L9B's "host RSS flat", reproduced exactly — on the DECODE side of the
+denoise-to-decode boundary, not inside the denoise loop L9B attributed it to. No
+drain can shrink it: the drain runs before it, and what it returns is 0.14 GiB.
+
+At 320x192/25f the same code path completes with the drain OFF and MemAvailable
+flat, so L9B's own arm — which was 320x192 at `--max-phase 0`, a SMALLER decode
+than E0's — remains unreproduced at its own geometry. Both statements are true
+and they are about different rungs.
+
+**Two obvious attributions are each contradicted by a measurement, so neither is
+claimed.** `Ltx2ConvVideoDecode` is pure host C++ — no `vt::` op, no queue, no
+device pointer anywhere in `ltx2_video_vae.cpp` — and GPU utilization is **0%**
+throughout, so it is not a device pool. But `ps -o rss=` reports 4.9 GB across all
+twelve samples of the decline, so it is not a plain resident host allocation
+either. **Next traceable step: instrument `Ltx2ConvVideoDecode`'s own allocations
+directly.** It is ONE function; inferring its footprint from a system-wide counter
+is what produced L9B's mis-attribution and would produce another.
+
+### The instrument, stated because it is weaker than it looks
+
+`nvidia-smi --query-gpu=memory.used` returns **`[N/A]`** on GB10. There is no
+per-process device-memory reading on this box, so "device usage" is only
+observable as unified-memory pressure — `MemAvailable` — which moves for anything
+on the machine. That is what L9B had too, and it is why L9B's attribution of a
+MemAvailable fall to the denoise loop could not have been checked at the time.
+
+### What bounds the ladder is the DECODE, in both of its costs
+
+At 320x192/25f the process ran at **0% GPU utilization and ~110% CPU** for most of
+the 23:39, and at 448x256/25f it is the decode that takes the box to the floor. So
+the decode is the wall twice over — it is the time and it is the memory —
+and `Ltx2VideoDecode` is a HOST path: it takes `std::vector<float>` and the host
+VAE weights, and `ltx2_video_vae.cpp` contains no `vt::` op at all. MiniMax-H3 has
+the device analogue (`MiniMaxH3VideoVaeDecodeTemporalDevice`,
+minimax_h3_pipeline.cpp) — and, just as relevantly, H3's decode is CHUNKED in time
+and TILED in space by default, so it never materializes the whole canvas at once.
+LTX-2.5's does neither.
+
+**No ceiling is declared.** The next traceable steps, in order: measure
+`Ltx2ConvVideoDecode`'s own allocation footprint; then temporal chunking + spatial
+tiling, which is what H3 already needed at a real canvas; then the device decode.
+
+### The frames ARE a scene
+
+Measured with L9B's OWN analyzer, unchanged, so the numbers are comparable:
+frame-to-frame mean |diff| 0.500-1.465 (avg 0.980, so not a still); neighbour
+|dx| / whole-image sd **0.093** where white noise gives ~1.13; 8-px block-mean
+aligned/offset ratio 1.012 and 32-px 1.193, so not H3's patch grid.
+
+**Those statistics are almost identical to L9B's, and L9B's frames were not a
+scene while these are.** The 25 frames are a temporally coherent photorealistic
+clip: one subject, consistent identity and background, frame-to-frame motion. The
+statistics could not separate "smooth colour field" from "photograph", and only
+looking did. That is a finding about the INSTRUMENT and it belongs beside the
+result.
+
+It is not a depiction of a prompt. With `--prompt-valid-rows 24`, 104 of the 128
+conditioning rows are the connector's own trained `learnable_registers` — which is
+exactly what upstream substitutes at padded positions — and the other 24 are
+synthetic noise. So what conditions the render is the checkpoint's own learned
+default, reached through the real connector, and not anything a caller asked for.
+
+**The audio is NOT claimed to be anything.** 1.0100 s, 48 kHz stereo, ch0/ch1 rms
+26.82/26.83, peak 217/218, zero-fraction 0.024 — so it is not silence, and it is
+FAINTER than L9B's at the same settings (rms 131.28/127.30). Whether it is
+speech-shaped, or matches the mouth movements in the frames, is not something
+these numbers answer and is not asserted. Owed: a spectral check against the
+video, which is the audio half of the question the frames just answered.
+
+### Owed, and why — two arms the lock never came free for
+
+Two bounded waits on `$HOME/gpu.lock`, `flock -w 2700` each, both timed out
+(`HOLD2_WRAPPER_DONE rc=1` at 04:36 and 05:22). The box was saturated with other
+coordinators' `ctest` work for the whole 90 minutes. Waiting is normal and
+stealing is not, so these are reported OWED rather than run:
+
+1. **The L9B repro arm** (`dgx:~/work/ltx25-l9c/dgx_repro_l9b.sh`, shipped and
+   syntax-checked on the box): L9B's own binary with L9B's own arguments at
+   320x192/25f `--max-phase 0`, which is the one arm that separates "L9B measured
+   the environment" from "L9B's geometry behaves differently from ours". It cannot
+   run on the L9c binary, which refuses 32 conditioning rows.
+2. **`test_minimax_h3` and `test_capi` through ctest** (`dgx_baselines2.sh`, also
+   shipped). The first baseline pass ran the BINARIES directly and both reported a
+   summary followed by a SIGSEGV — `test_capi` `4 cases | 51 skipped` against a
+   brief baseline of 55, `test_minimax_h3` `38 | 41 skipped` against 79. A summary
+   printed before a crash counts the unreached cases as "skipped", which is the
+   third instance this campaign has recorded of a run reading as a pass. **These
+   two are UNRESOLVED, not green**, and the instrument that would resolve them is
+   ctest plus the full output, not a grep of a bare binary.
+
+Evidence: `dgx:~/work/ltx25-l9c/{hold.log,hold2.log,hold2b.log,baselines.log,render-*.log,mem-*.log}`,
+renders under `dgx:~/work/ltx25-l9c/render/`, contact sheets under
+`dgx:~/work/ltx25-l9c/contact/`.

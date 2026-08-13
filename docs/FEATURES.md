@@ -153,7 +153,7 @@ they sit outside the gated list above.
 | Voxtral audio (`VoxtralForConditionalGeneration`) | Voxtral-Mini-3B-2507 | near-tie-robust 16/16 vs vLLM 0.25.0 | decode 0.97x (beats vLLM); encoder FORWARD 15.90x of vLLM's whole TTFT (pin 46.02 ms), or 2.89x with opt-in `VT_WHISPER_ENC_FA2=1` (costs 3 near-tie divergences vs 0). Not a TTFT ratio. Pending |
 | Whisper audio encoder | openai/whisper-small; whisper-large-v3 (Voxtral cfg) | encoder tower 77/77; large-v3 tower 203/203 | pending |
 | MiniMax-H3 DiT (`MiniMaxH3DiTModel`, vllm-omni lane) | MiniMax-H3 (33.1B video+audio) | portable 79/79; all three modalities COHERENT on Q4_K_M (§8.20); PRUNED ckpts run, Q8_0 seam 0.9941 (§8.21); ref2va grid was NVFP4 quant error, §8.9 REFUTED; GGUF/NVFP4/bf16 shards stream | FP4/Marlin landed; speed pending; no bf16 render yet. Render from the Q4_K_M GGUF, not the NVFP4 arm. Krea 2 text-to-image (roadmap C11) is scoped to reuse these DiT seams |
-| LTX-2.5 DiT (`LTX2VideoTransformer3DModel`, Lightricks lane) | LTX-2.5 (21.00B video+audio) | `SPIKE`. DiT, both VAE decoders, both VAE ENCODERS + mel front-end, the conditioning items, the pipeline and the quantized loaders gated vs upstream at reduced dims: max\|diff\| 1.2e-07 DiT, 1.8e-06 VAE decode, 6.0e-07 VAE encode, 2.8e-06 pipeline. STRUCTURAL e2e only | Fits ONE GB10 at ~29 GB NVFP4. FP8 + torchao-NVFP4 arms load. CPU f32, CUDA bf16 device-resident. Text tower, DiffVAE, LoRA, image conditioning all still refused AT THE ENGINE. FP4-resident arm OWED. Speed PENDING |
+| LTX-2.5 DiT (`LTX2VideoTransformer3DModel`, Lightricks lane) | LTX-2.5 (21.00B video+audio) | `SPIKE`. DiT, both VAE decoders and ENCODERS, conditioning items, pipeline and quantized loaders gated vs upstream at reduced dims. With the connector wired, renders e2e at 320x192/25f: a coherent scene, valid MP4+WAV | Family `ltx-2.5` via `ltx2-gen`. ~29 GB NVFP4/GB10, FP8 ~44 GB. FP8 and torchao-NVFP4 load, first-party NVFP4 does not. Text tower, DiffVAE, LoRA, image conditioning refused AT THE ENGINE. Speed PENDING |
 | MTP speculator | Qwen3.6-27B, Qwen3.6-35B-A3B | token-identical to vLLM `mtp` at c1 | ~4% faster c1; +16% output tput (MoE) |
 | DFlash block-diffusion | Qwen3 (DFlash draft) | near-tie e2e 27/27 vs vLLM | 2.9x over spec-off, 1.003x vs vLLM DFlash-on |
 | DeepSeek-V4 MTP | DeepSeek-V4-Flash (nextn head) | lossless 5/5; real-model weight-blocked | pending |
@@ -267,7 +267,7 @@ Build with `-DVLLM_CPP_VULKAN=ON`; off by default.
 | Multiple engines in one process (build, destroy, rebuild) | ✅ resident device state is owned by the weights, so a new engine never inherits a freed one's pointers | ✅ | ✅ | ✅ |
 | LoRA adapters | ☐ CPU brick only | ✅ | ✅ | ✅ |
 | Embedding / pooling endpoints | ◐ `/v1/embeddings` live (task=embed; score/rerank/classify pending) | ✅ | ✅ | ✅ |
-| OpenAI video generation `/v1/videos` (Sora shape) | ✅ `model`/`size`/`seconds` aliases + `GET /{id}/content`; `input_reference` and the `metadata` video/audio references condition the render | ◐ (vllm-omni, its own request shape) | ☐ | ☐ |
+| OpenAI video generation `/v1/videos` (Sora shape) | ✅ `model`/`size`/`seconds` aliases + `GET /{id}/content`; `input_reference` and `metadata` references condition the render; `--video-family` pins the family (default DETECT), `--video-extra K=V` carries family knobs | ◐ (vllm-omni, its own request shape) | ☐ | ☐ |
 | Flat C ABI for embedding in other languages | ✅ versioned | ☐ | ☐ | ✅ |
 
 #### C-ABI capability coverage <!-- abi-capability-table:begin -->

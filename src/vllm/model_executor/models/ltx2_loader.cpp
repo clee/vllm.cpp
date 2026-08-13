@@ -411,7 +411,22 @@ vt::DType MaterializeDitTensor(const SafetensorsFile& file, const DitPlan& plan,
   Fail("'" + spec.name + "' has dtype " + t.dtype + ", which this loader does not read");
 }
 
-// The families the file carries and the L2 contract does not.
+// The families the file carries and NOTHING IN THIS PORT reads.
+//
+// The two `*_embeddings_connector` families are outside the DiT contract and are
+// NOT unported: phase L9c materializes them through `Ltx2LoadConnectorWeights`
+// and the video engine runs them, which is where upstream puts them too — its
+// key ops rewrite `model.diffusion_model.video_embeddings_connector.` into the
+// TEXT ENCODER's `EmbeddingsProcessor` (encoder_configurator.py:331-346). Naming
+// them here would make the refusal say something untrue about the tree, and
+// would demand `allow_unported_modules` from a caller whose checkpoint this port
+// reads completely. Their contract is checked where it can be: against a parsed
+// connector configuration, in `Ltx2LoadConnectorWeights`, which refuses a
+// missing tensor, a wrong shape, and a leftover tensor by name.
+bool LoadedElsewhere(const std::string& family) {
+  return family == "video_embeddings_connector" || family == "audio_embeddings_connector";
+}
+
 std::vector<std::string> UnportedFamilies(const DitPlan& plan,
                                           const std::vector<Ltx2TensorSpec>& contract) {
   std::set<std::string> known;
@@ -421,6 +436,7 @@ std::vector<std::string> UnportedFamilies(const DitPlan& plan,
   for (const Ltx2TensorSpec& spec : plan.manifest) {
     if (known.count(spec.name) != 0) continue;
     const std::string family = FamilyOf(spec.name);
+    if (LoadedElsewhere(family)) continue;
     if (seen.insert(family).second) families.push_back(family);
   }
   return families;
@@ -441,9 +457,10 @@ std::vector<Ltx2TensorSpec> ContractOf(const Ltx2DitParams& params) {
       ". They are not dropped silently: prompt_adaln_single / "
       "audio_prompt_adaln_single mean use_prompt_adaln_single is TRUE, which "
       "contradicts .agents/specs/ltx-2-5.md section 1.2 and voids the prompt-K/V "
-      "cache's premise; keyframes_abs_pos_embedding contradicts ltx2.h:47-49; the "
-      "two *_embeddings_connector families are the Embeddings1DConnector "
-      "ltx2_text_encoder.h:319-324 already records as owed. Pass "
+      "cache's premise; keyframes_abs_pos_embedding contradicts ltx2.h:47-49. The "
+      "two *_embeddings_connector families are NOT in this list and never will be "
+      "— they are outside the DiT contract by design and are loaded by "
+      "Ltx2LoadConnectorWeights, which is what the video engine calls. Pass "
       "Ltx2DitLoadOptions::allow_unported_modules to load the ported SUBSET, which "
       "still reports every one of them.");
 }
@@ -908,6 +925,208 @@ nlohmann::json Ltx2ReadCheckpointConfig(const SafetensorsFile& file) {
   }
   if (!parsed.is_object()) Fail("__metadata__[\"config\"] is not a JSON object");
   return parsed;
+}
+
+// ---------------------------------------------------------------------------
+// The embeddings connector (phase L9c) — see ltx2_loader.h for why it loads here
+// ---------------------------------------------------------------------------
+
+const char* Ltx2ConnectorCheckpointPrefix(Ltx2ConnectorStream stream) {
+  return stream == Ltx2ConnectorStream::kVideo ? "video_embeddings_connector."
+                                               : "audio_embeddings_connector.";
+}
+
+bool Ltx2CheckpointHasConnector(const SafetensorsFile& file, Ltx2ConnectorStream stream) {
+  const std::string bare =
+      std::string(Ltx2ConnectorCheckpointPrefix(stream)) + "learnable_registers";
+  const std::string prefixed = std::string(kLtx2DitCheckpointPrefix) + bare;
+  for (const std::string& n : file.Names()) {
+    if (n == bare || n == prefixed) return true;
+  }
+  return false;
+}
+
+namespace {
+
+// `transformer_config.get(key, fallback)` for the four scalar shapes the two
+// connector configurators read. Kept local because a config value that is
+// present but of the WRONG JSON type must refuse rather than fall back — a
+// silent fallback is exactly how a declared 8-layer connector becomes a 2-layer
+// one.
+int64_t ConnectorInt(const nlohmann::json& t, const std::string& key, int64_t fallback) {
+  const auto it = t.find(key);
+  if (it == t.end() || it->is_null()) return fallback;
+  if (!it->is_number_integer() && !it->is_number_unsigned()) {
+    Fail("the connector config key '" + key + "' is " + it->dump() + ", not an integer");
+  }
+  return it->get<int64_t>();
+}
+
+bool ConnectorBool(const nlohmann::json& t, const std::string& key, bool fallback) {
+  const auto it = t.find(key);
+  if (it == t.end() || it->is_null()) return fallback;
+  if (!it->is_boolean()) {
+    Fail("the connector config key '" + key + "' is " + it->dump() + ", not a boolean");
+  }
+  return it->get<bool>();
+}
+
+}  // namespace
+
+Ltx2ConnectorConfig Ltx2ParseConnectorConfig(const nlohmann::json& config,
+                                             Ltx2ConnectorStream stream) {
+  const auto tit = config.find("transformer");
+  if (tit == config.end() || !tit->is_object()) {
+    Fail("the connector configuration needs a `{\"transformer\": {...}}` object; the two "
+         "configurators read the DiT's own transformer config "
+         "(embeddings_connector.py:196, :227)");
+  }
+  const nlohmann::json& t = *tit;
+
+  Ltx2ConnectorConfig out;
+  out.prefix = Ltx2ConnectorCheckpointPrefix(stream);
+
+  // :198, :226 — `LTXRopeType(transformer_config.get("rope_type", "split"))`.
+  const auto rope = t.find("rope_type");
+  std::string rope_type = "split";
+  if (rope != t.end() && !rope->is_null()) {
+    if (!rope->is_string()) Fail("the connector config key 'rope_type' is not a string");
+    rope_type = rope->get<std::string>();
+  }
+  if (rope_type == "split") {
+    out.rope_type = Ltx2RopeType::kSplit;
+  } else if (rope_type == "interleaved") {
+    out.rope_type = Ltx2RopeType::kInterleaved;
+  } else {
+    Fail("the connector config declares rope_type '" + rope_type +
+         "', which is neither 'split' nor 'interleaved' (rope.py:11-13)");
+  }
+
+  // :199, :228 — `transformer_config.get("frequencies_precision", False) == "float64"`.
+  // Absent or false means SINGLE precision, so a non-string value is not an
+  // error upstream; it simply is not "float64".
+  const auto freq = t.find("frequencies_precision");
+  out.double_precision_rope =
+      freq != t.end() && freq->is_string() && freq->get<std::string>() == "float64";
+
+  // :200, :229 — `connector_positional_embedding_max_pos`, default [1]. The one
+  // value the shipped config moves off its default, and it scales every position.
+  const auto max_pos = t.find("connector_positional_embedding_max_pos");
+  if (max_pos == t.end() || max_pos->is_null()) {
+    out.positional_embedding_max_pos = {1};
+  } else {
+    if (!max_pos->is_array()) {
+      Fail("the connector config key 'connector_positional_embedding_max_pos' is " +
+           max_pos->dump() + ", not an array");
+    }
+    out.positional_embedding_max_pos.clear();
+    for (const nlohmann::json& e : *max_pos) {
+      if (!e.is_number()) {
+        Fail("'connector_positional_embedding_max_pos' holds a non-numeric entry " + e.dump());
+      }
+      out.positional_embedding_max_pos.push_back(e.get<int64_t>());
+    }
+    if (out.positional_embedding_max_pos.size() != 1) {
+      // `get_fractional_positions` asserts the grid's position-dimension count
+      // equals `len(max_pos)` (rope.py:130-134), and the connector's grid is 1-D.
+      Fail("'connector_positional_embedding_max_pos' has " +
+           std::to_string(out.positional_embedding_max_pos.size()) +
+           " entries; the connector's position grid is 1-D (embeddings_connector.py:172-174) "
+           "so exactly one is required");
+    }
+  }
+
+  // :203-206 for video; :232-241 for audio, which falls back to the VIDEO keys
+  // "for backwards compatibility" rather than to the class defaults.
+  if (stream == Ltx2ConnectorStream::kVideo) {
+    out.num_attention_heads = ConnectorInt(t, "connector_num_attention_heads", 30);
+    out.attention_head_dim = ConnectorInt(t, "connector_attention_head_dim", 128);
+    out.num_layers = ConnectorInt(t, "connector_num_layers", 2);
+  } else {
+    out.num_attention_heads = ConnectorInt(
+        t, "audio_connector_num_attention_heads", ConnectorInt(t, "connector_num_attention_heads", 30));
+    out.attention_head_dim = ConnectorInt(
+        t, "audio_connector_attention_head_dim", ConnectorInt(t, "connector_attention_head_dim", 128));
+    out.num_layers =
+        ConnectorInt(t, "audio_connector_num_layers", ConnectorInt(t, "connector_num_layers", 2));
+  }
+  // :212-213, :253-254 — BOTH configurators read the VIDEO spellings of these two.
+  out.apply_gated_attention = ConnectorBool(t, "connector_apply_gated_attention", false);
+  out.ff_bias = ConnectorBool(t, "connector_ff_bias", true);
+
+  // NOT read by either configurator: `Embeddings1DConnector`'s own default of 128
+  // is what upstream always runs (:102, :131). The shipped config declares
+  // `connector_num_learnable_registers` and declares 128, so the two agree; it is
+  // read here so a checkpoint that declares something else is not silently run at
+  // 128, and `Ltx2LoadConnectorWeights` checks it against the stored table.
+  out.num_learnable_registers = ConnectorInt(t, "connector_num_learnable_registers", 128);
+
+  if (out.num_attention_heads < 1 || out.attention_head_dim < 1 || out.num_layers < 1) {
+    Fail("the connector config resolves " + std::to_string(out.num_layers) + " layers of " +
+         std::to_string(out.num_attention_heads) + " x " +
+         std::to_string(out.attention_head_dim) + " heads, which is not a module");
+  }
+  return out;
+}
+
+Ltx2VaeWeights Ltx2LoadConnectorWeights(const SafetensorsFile& file,
+                                        const Ltx2ConnectorConfig& config) {
+  const DitPlan plan = PlanDit(file);
+  const std::vector<Ltx2ConnectorTensorSpec> specs = EnumerateLtx2ConnectorTensors(config);
+
+  Ltx2VaeWeights out;
+  for (const Ltx2ConnectorTensorSpec& spec : specs) {
+    const auto shape_it = plan.logical.find(spec.name);
+    if (shape_it == plan.logical.end()) {
+      Fail("the checkpoint is missing '" + spec.name + "' " + ShapeText(spec.shape) +
+           ", which the connector configuration resolved from " +
+           std::to_string(config.num_layers) + " layers of " +
+           std::to_string(config.num_attention_heads) + " x " +
+           std::to_string(config.attention_head_dim) +
+           " heads. The config and the file describe different modules; refusing rather "
+           "than binding the subset that happens to be present.");
+    }
+    if (shape_it->second != spec.shape) {
+      Fail("'" + spec.name + "' is " + ShapeText(shape_it->second) +
+           " in the checkpoint but the connector configuration needs " + ShapeText(spec.shape));
+    }
+    std::vector<uint8_t> bytes;
+    const vt::DType dtype = MaterializeDitTensor(file, plan, {spec.name, spec.shape}, bytes);
+    int64_t numel = 1;
+    for (const int64_t d : spec.shape) numel *= d;
+    std::vector<float> widened(static_cast<size_t>(numel));
+    if (dtype == vt::DType::kBF16) {
+      const auto* src = reinterpret_cast<const uint16_t*>(bytes.data());
+      for (int64_t i = 0; i < numel; ++i) widened[static_cast<size_t>(i)] = Bf16ToF32(src[static_cast<size_t>(i)]);
+    } else if (dtype == vt::DType::kF32) {
+      std::memcpy(widened.data(), bytes.data(), static_cast<size_t>(numel) * sizeof(float));
+    } else {
+      Fail("'" + spec.name + "' materialized as a dtype the connector bag cannot hold");
+    }
+    out.tensors[spec.name] = std::move(widened);
+  }
+
+  // The other half of the contract check: a tensor of this family that the
+  // configuration did NOT enumerate. Without it a config declaring FEWER layers
+  // than the file carries binds a valid prefix and runs — the exact shape of the
+  // defect the shape check above cannot see.
+  int64_t extra = 0;
+  std::string first_extra;
+  for (const auto& kv : plan.logical) {
+    if (!StartsWith(kv.first, config.prefix)) continue;
+    if (out.tensors.count(kv.first) != 0) continue;
+    if (extra == 0) first_extra = kv.first;
+    ++extra;
+  }
+  if (extra != 0) {
+    Fail("the checkpoint carries " + std::to_string(extra) + " '" + config.prefix +
+         "' tensors the connector configuration does not name (first: '" + first_extra +
+         "'). The configuration resolved " + std::to_string(config.num_layers) +
+         " layers, gated_attention=" + (config.apply_gated_attention ? "true" : "false") +
+         ", ff_bias=" + (config.ff_bias ? "true" : "false") +
+         ". Refusing rather than binding the prefix that matches and leaving the rest.");
+  }
+  return out;
 }
 
 std::string Ltx2ReadCheckpointModelVersion(const SafetensorsFile& file) {
