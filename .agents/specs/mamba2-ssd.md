@@ -773,6 +773,12 @@ comparisons in a green run, the worst one used **7.66%** of `rtol(K) =
 the bound is neither tuned down to the observed error nor wide enough to hide a
 defect.
 
+These percentages are **against the bound as it stood at this run**,
+`4·(K+2)·2⁻²⁴`. §8.5 corrects the derivation and the bound is now
+`5·(K+2)·2⁻²⁴`, against which the same measurements read 6.13%, 0.26%/0.14% and
+769738%. The numbers above are left as captured rather than restated, because
+they are what the run produced; §8.3 point 6 carries the conversion.
+
 ### 8.5 W2 tightening pass (fresh review of PR #566 returned PASS + 5 findings)
 
 `row/KERNEL-SSM-MAMBA-SSD-W2-FIX`, branched from `1e819144e` with `origin/main`
