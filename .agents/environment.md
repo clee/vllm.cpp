@@ -133,11 +133,37 @@ environment:
   - **GPU mutex:** every CUDA test/model/serve/benchmark/profile holds the
     `${GPU_LOCK}` file mutex for the whole job or multi-arm series WHEN other
     agents may run GPU work concurrently (sole owner verified idle via
-    `nvidia-smi` may skip). Mechanism: run GPU work as
-    `flock ${GPU_LOCK} -c '<command>'`, or take the lock once around an entire
-    benchmark series so arms are never interleaved; waiting on the lock is
+    `nvidia-smi` may skip). **`scripts/gpu-lock.sh` is the ONE sanctioned way
+    to take it** — a raw `flock` is how #587 happened. Run GPU work as
+    `scripts/gpu-lock.sh -- <command>`, or wrap an entire benchmark series in
+    one invocation so arms are never interleaved; waiting on the lock is
     normal, stealing it is not. Compilation, source inspection and file
     transfer do not need the lock. Never kill an unowned PID.
+  - **The canonical lock file is `$HOME/gpu.lock`** (`${GPU_LOCK}` overrides
+    it, and the wrapper stamps whichever it resolved). Never invent a second
+    spelling: until 2026-08-13 one job on this box took `/tmp/gpu.lock` while
+    everything else took `$HOME/gpu.lock`, so two jobs ran concurrently while
+    each believed it owned the GPU, and `fuser $HOME/gpu.lock` showed an empty
+    waiter list throughout (#587). On unified memory that is an OOM-reboot
+    mechanism, and it voids any contention-sensitive number silently.
+    `scripts/gpu-lock.sh` **refuses** (exit 78) rather than proceeding without
+    the lock, times out with its own status (exit 75) rather than waiting
+    forever on a dead holder, propagates the wrapped command's exit code
+    unchanged — `137` still means SIGKILL, not "your code failed" — and stamps
+    the resolved lock path, the wait, `df -h /` and load average, and that exit
+    code **first**, so contention is at worst detectable afterwards. Do not
+    double-wrap by hand: a nested invocation on the same resolved path passes
+    through instead of deadlocking, and that is the only nesting that is safe.
+    Guarantees pinned by `tests/scripts/test_gpu_lock.py`.
+  - **A third spelling is still open (2026-08-13 sweep).** `/tmp/gpu`, with no
+    extension, is taken as `exec 9>/tmp/gpu` by `scripts/dgx-online-serving.sh`
+    and `scripts/dgx-gdn-packed-component.sh`, named by `scripts/opt-dgx-gate.sh`
+    and `scripts/dgx-sglang-low-concurrency.sh`, and recorded as this box's
+    `${GPU_LOCK}` in `coordination.md`. Until those are repointed at
+    `scripts/gpu-lock.sh`, a run under the wrapper does **not** exclude an
+    online-serving or gdn-packed-component run — #587 with different filenames.
+    Do not read a clean `fuser $HOME/gpu.lock` as an idle box; check
+    `nvidia-smi` and `fuser /tmp/gpu` too.
   - Disk cleanup 2026-07-10 reclaimed ~368 GB from unrelated cached model sets,
     April-era autoresearch logits/F16-GGUF cache artifacts, the vLLM compile
     cache and stale rebuildable CUDA build trees. Active latency/PR workspaces,

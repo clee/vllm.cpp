@@ -22,6 +22,31 @@ One GPU job at a time. Take the box lock before any measurement, stop competing
 services, and never run two large models at once — unified-memory boxes reboot
 rather than swap.
 
+**Take it with `scripts/gpu-lock.sh`, not a raw `flock`.** It is the one
+sanctioned way to take the GPU, and the reason is #587: the discipline said
+`$HOME/gpu.lock`, one job on `dgx` took `/tmp/gpu.lock`, and two jobs holding
+different files ran concurrently while each believed it owned the box. Nothing
+in the record said so afterwards. A wrapped leg looks like
+
+```sh
+scripts/gpu-lock.sh --label 'ours-c1' --record evidence/lock.txt -- ./bench ...
+```
+
+and it refuses loudly (exit 78) rather than proceeding without the lock, expires
+its bounded wait with its own status (exit 75) rather than sitting behind a dead
+holder, and passes the wrapped command's exit code through unchanged. Its stamp
+carries the **resolved** lock path it actually took, the wait, `df -h /` and
+load average, and the exit code first — disk and load say the box was unhealthy,
+the exit code says which thing killed the run, and `137` (someone else's
+`pkill`) is not a result about your code at all.
+
+The stamp does not prevent contention; it prevents contention being undetectable
+afterwards. A same-binary A/B on this box survived #587 only because its
+conclusion rested on `diff -r -q` over two output directories — byte-identity is
+contention-immune — while the wall times printed beside it were not. Had the
+conclusion rested on the times, #587 would have voided it silently. Quote the
+lock stamp beside any number that a second job could have moved.
+
 Calibrate the noise band from repeated identical legs *before* interpreting a
 delta. Discard cold legs for a named cause, never because they are
 inconvenient. Use paired, order-alternated A/B legs and a majority rule; a
