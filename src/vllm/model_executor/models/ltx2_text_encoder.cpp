@@ -686,12 +686,20 @@ Ltx2GemmaPromptTokens Ltx2TokenizeGemmaPrompt(const tok::Tokenizer& tokenizer,
           ? std::string()
           : prompt.substr(begin, prompt.find_last_not_of(kSpace) - begin + 1);
 
-  // NOT EncodeWithSpecialTokens. The shipped tokenizer's post_processor is a
-  // TemplateProcessing with an EMPTY `special_tokens` map, so it adds nothing and
-  // the two are identical HERE — but upstream calls the plain encode and then
-  // prepends BOS itself, and mirroring which call is made keeps that true if a
-  // future checkpoint ships a post_processor that does add something. Doing both
-  // would double the BOS.
+  // NOT EncodeWithSpecialTokens — and that is a KNOWN DIVERGENCE, not a mirror.
+  // Upstream calls `self.tokenizer(text, ...)` (tokenizer.py:37-43) — `__call__`
+  // with its default `add_special_tokens=True` — so upstream DOES run the
+  // post_processor, and plain `Encode` does not. The two are identical HERE only
+  // because the shipped tokenizer's post_processor is a TemplateProcessing whose
+  // `special_tokens` map is EMPTY, so it has nothing to add: MEASURED on the
+  // shipped file, not assumed. If a future checkpoint ships a post_processor that
+  // DOES add something, upstream would emit it and we would not — so this is the
+  // line to change, not a property to rely on.
+  //
+  // The one thing that would NOT go wrong is a doubled BOS: the guard below
+  // (`ids.front() != bos_id`) is upstream's own guard at :45, so a post_processor
+  // that emitted a leading BOS would be absorbed by either call. The exposure is
+  // a post_processor that adds anything ELSE. Full note at the declaration.
   std::vector<int32_t> ids = tokenizer.Encode(stripped);
 
   Ltx2GemmaPromptTokens out;

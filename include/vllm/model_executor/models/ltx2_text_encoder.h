@@ -418,8 +418,9 @@ struct Ltx2GemmaPromptTokens {
 // tokenizer.py:31-59, mirrored including the parts that look like details:
 //
 //   * `text.strip()` first (:33). diffusers strips too (pipeline_ltx2.py:333).
-//   * encode, then PREPEND BOS unconditionally if it is not already first
-//     (:44-46).
+//   * encode, then PREPEND BOS if it is not already first — CONDITIONAL, on
+//     upstream's own `if not input_ids or input_ids[0] != bos_id` guard
+//     (:44-46). A port that prepends unconditionally doubles the BOS.
 //
 //     Two things about that, and the first one is a KNOWN DIVERGENCE rather than
 //     a mirrored default. Upstream calls `self.tokenizer(text, ...)` — `__call__`

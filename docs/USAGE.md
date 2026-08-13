@@ -374,7 +374,14 @@ kaiser resampler this project does not carry. And a VAE configured with
 the checkpoint ships as a tensor, the tower is materialized and forwarded, and
 both caption projections emit their conditioning streams — all of it gated in CI
 against a running upstream tower rather than against invariants derived from its
-own output. What still blocks a prompt is the hop from there into
+own output. One tokenization detail is a KNOWN DIVERGENCE rather than a mirror,
+and it is checkpoint-conditional: upstream tokenizes through the HuggingFace
+`__call__` with its default `add_special_tokens=True`, so it runs the tokenizer's
+post_processor, while this port calls the plain encode and prepends BOS by hand.
+On the shipped checkpoint the two are identical — its post_processor declares an
+EMPTY special-token map, measured on the shipped file rather than assumed — so
+nothing is lost today. A checkpoint whose post_processor DID add tokens would
+tokenize differently here. What still blocks a prompt is the hop from there into
 cross-attention, which "A second behaviour changed" below states precisely.
 Conditioning therefore still
 comes from `--prompt-embeds` plus `--audio-prompt-embeds`: rows of

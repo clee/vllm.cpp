@@ -629,6 +629,13 @@ const float* TowerGoldenPaddedBf16(int64_t state) {
 // byte for byte, which is a real gate on the parts that have no shape to check
 // them: the q|k|v concat ORDER, the `k_eq_v` aliasing of V onto K on the full
 // layers, and the per-layer 8-vs-16 head_dim / 2-vs-1 kv-head split.
+//
+// SCOPE, because "the concat order is gated" is broader than what this reaches.
+// The only concat under this case is the LTX tower loader's own `TowerConcat`
+// (ltx2_text_encoder.cpp:943-945). `gemma4_weights.cpp` assembles its qkv through
+// a SEPARATE implementation (gemma4_weights.cpp:281-295) that nothing in this
+// suite loads — MEASURED: mutating it leaves every case in this file green. That
+// path owes its own gate; this one does not stand in for it.
 std::vector<PackTensor> TowerPackTensors(const vllm::HfConfig& c) {
   const int64_t H = c.hidden_size, I = c.intermediate_size, V = c.vocab_size;
   const int64_t Hq = vllm_test::kLtxTowerNumHeads;
@@ -1950,6 +1957,13 @@ TEST_CASE("gemma4 tower: partial_rotary_factor, on the ROPE TABLE the states can
   // the oracle's own `Gemma4UnifiedTextRotaryEmbedding` routed through
   // `_compute_proportional_rope_parameters` — the code that actually decides the
   // zero padding (modeling_rope_utils.py:187-245).
+  //
+  // SCOPE, so the instrument is not read as covering more than it does: this is
+  // the FULL-ATTENTION table only (`kLtxTowerGlobalHeadDim`, the `proportional`
+  // arm at theta 1e6 — the one `partial_rotary_factor` applies to). The SLIDING
+  // layers' `default` rope at theta 1e4 has NO equivalent f32 instrument; it is
+  // reached only through the hidden states, where the same bf16 noise-floor
+  // argument above works against resolving a config-carried angle defect.
   const vllm::HfConfig cfg = TowerConfig();
   const int64_t Dh = vllm_test::kLtxTowerGlobalHeadDim;
   const int64_t P = vllm_test::kLtxTowerRopePositions;
@@ -2243,7 +2257,19 @@ TEST_CASE("ltx2 prompt -> conditioning: the VALUES, against the left-padded orac
   CHECK(audio_bf16 <= audio_floor);
   CHECK(audio_f32 <= 2.0 * audio_floor);
 
-  // The reorder and the mask are position-free, so they are held EXACTLY.
+  // The reorder and the mask, compared EXACTLY — but read what that does and does
+  // NOT prove, because the label oversells it. `out.conditioning` and `want_f32`
+  // reach `sort_index` / `additive_mask` through the SAME
+  // `Ltx2ComputeRightPadOrder`, over the SAME `out.mask`, so a defect INSIDE that
+  // function cancels and these assertions cannot fire. MEASURED: replacing its
+  // stable partition with the identity permutation leaves this case entirely
+  // green. What they DO establish is that the end-to-end path hands the mask
+  // through unaltered — `out.mask` itself is held to the golden above — so the
+  // conditioning is ordered consistently with the tokens this case just checked.
+  // The ORDERING ITSELF is gated by the two cases that red on that same mutation,
+  // both against committed upstream goldens rather than against a second call of
+  // the code under test: "ltx2 text: additive mask, right-pad ordering and the
+  // binary mask" and "ltx2 text: the encoder -> conditioning hand-off".
   REQUIRE(out.conditioning.sort_index.size() == want_f32.sort_index.size());
   for (size_t i = 0; i < want_f32.sort_index.size(); ++i)
     CHECK(out.conditioning.sort_index[i] == want_f32.sort_index[i]);
