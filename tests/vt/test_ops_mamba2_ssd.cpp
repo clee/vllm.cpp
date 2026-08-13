@@ -1024,18 +1024,28 @@ TEST_CASE("mamba2 chunk scan refuses the arms it does not implement") {
 //   `initial_states`, a missing `D` skip — is an O(1) error and fails here,
 //   against a reference the kernel was not written from.
 //
-//   G2 (DEVICE vs HOST, DERIVED). A BYTE COMPARE IS NOT REACHABLE, and the reason
-//   is exactly one thing: the two arms call different libms. CUDA's `expf` is
-//   documented to <= 2 ulp and glibc's to <= 0.5, and they disagree in the last
-//   ulp on some inputs, so `exp`/`log1p` alone put the two arms off each other by
-//   ulps that the recurrence then amplifies. Everything else is held IDENTICAL by
-//   construction: the device kernels accumulate every output element in ONE
-//   thread, over the same index range in the same direction as the host arm, so
-//   summation order is not a second source. `DerivedRtol` below propagates that
-//   one source, and only that. Nothing in it was tuned, and the slack actually
-//   USED is reported on every comparison — if it ever approached the bar, the bar
-//   would have stopped being a statement about libm and the finding would be a
-//   NEEDS_DECISION, not a wider tolerance.
+//   G2 (DEVICE vs HOST, DERIVED). A BYTE COMPARE IS NOT REACHABLE, for TWO
+//   named reasons and no others:
+//
+//     (a) LIBM. The two arms call different ones. CUDA's `expf` is documented to
+//         <= 2 ulp and glibc's to <= 0.5, and they disagree in the last ulp on
+//         some inputs, so `exp`/`log1p` alone put the two arms off each other by
+//         ulps that the recurrence then amplifies.
+//     (b) FMA CONTRACTION. Host C++ is pinned `-ffp-contract=off`
+//         (CMakeLists.txt:41-56), so `a*b + c` keeps two roundings; nothing
+//         passes `--fmad=false` to nvcc, so the device arm compiles at the
+//         DEFAULT `--fmad=true` and every `acc += a*b` is a single-rounding
+//         `fma` whose host twin is not. `-fmad=false` was weighed and rejected
+//         at src/vt/cuda/cuda_mamba2_ssd.cuh — it is a per-TU flag on a header
+//         included by a hot GDN TU — so the bound carries the term.
+//
+//   Summation ORDER is not a third source: the device kernels accumulate every
+//   output element in ONE thread, over the same index range in the same
+//   direction as the host arm. `DerivedRtol` below propagates (a) and (b), and
+//   only those. Nothing in it was tuned, and the slack actually USED is reported
+//   on every comparison — if it ever approached the bar, the bar would have
+//   stopped being a statement about libm and contraction and the finding would
+//   be a NEEDS_DECISION, not a wider tolerance.
 // ═════════════════════════════════════════════════════════════════════════════
 #ifdef VLLM_CPP_CUDA
 
@@ -1080,16 +1090,36 @@ void RequireNativeCudaProvider(vt::OpId op, const std::string& what) {
 // f32 unit roundoff, and the bound the two arms are held to.
 //
 // A value that has run through a product of at most K decay factors and a
-// length-K f32 summation carries, between the two arms:
-//   * <= 2.5 ulp of libm disagreement PER FACTOR — CUDA's `expf` is documented
-//     to <= 2 ulp and glibc's to <= 0.5 — so <= 2.5*K*u on the product, and
-//   * the standard (K-1)*u forward error of the summation itself,
-// i.e. <= 3.5*K*u. `4*(K + 2)*u` is that, rounded up to integers. K is the
-// case's own recurrence length; nothing here is fitted, and the slack actually
-// USED is reported on every comparison so a bar that had stopped doing work
-// would be visible rather than silently absorbing a defect.
+// length-K f32 sum of products carries, between the two arms, THREE terms:
+//
+//   libm         <= 2.5 ulp PER FACTOR — CUDA `expf` <= 2 ulp, glibc <= 0.5 —
+//                through a product of at most K, i.e. <= 2.5*K*u;
+//   summation    the standard (K-1)*u forward error of a length-K f32 sum,
+//                which is what AMPLIFIES the libm difference in the inputs;
+//   contraction  the device arm's `acc += a*b` is ONE nvcc-`fmad` rounding and
+//                the host arm's is TWO (`-ffp-contract=off`, CMakeLists.txt:55),
+//                so the host carries K product roundings the device does not:
+//                <= K*u. See the FMA-contraction note in
+//                src/vt/cuda/cuda_mamba2_ssd.cuh for why the flag is not simply
+//                turned off instead.
+//
+// Total <= 2.5*K*u + (K-1)*u + K*u = 4.5*K*u - u. `5*(K + 2)*u` is that,
+// rounded up to integers, and it covers the model for every K >= 0 because
+// 5K + 10 >= 4.5K - 1 reduces to 0.5K + 11 >= 0.
+//
+// THE OLD `4*(K + 2)*u` DID NOT. It omitted the contraction term, and
+// 4.5K - 1 <= 4K + 8 holds only for K <= 18 — while the driver-shapes case runs
+// at K = T = 200. The constant moved because the DERIVATION gained a term the
+// build actually emits, not because a run needed slack: at 4*(K+2) the worst of
+// the 55 audited comparisons used 7.66% of budget, so at 5*(K+2) it uses 6.13%,
+// and mutant M3's 962173% becomes 769738% — still caught by four orders of
+// magnitude (§8.4).
+//
+// K is the case's own recurrence length; nothing here is fitted, and the slack
+// actually USED is reported on every comparison so a bar that had stopped doing
+// work would be visible rather than silently absorbing a defect.
 constexpr double kUnitRoundoff = 5.9604644775390625e-08;  // 2^-24
-double DerivedRtol(int64_t K) { return 4.0 * static_cast<double>(K + 2) * kUnitRoundoff; }
+double DerivedRtol(int64_t K) { return 5.0 * static_cast<double>(K + 2) * kUnitRoundoff; }
 
 // atol is `rtol * max|host|` rather than 0: a bound proportional to |want| alone
 // is vacuous for an element that is near zero through cancellation of O(max)
@@ -1170,16 +1200,25 @@ class DBuf {
 };
 
 // The CUDA twin of RunChunkScan, argument for argument.
+//
+// `lci_override` / `sidx_override` replace the metadata `ComputeVarlenChunkMetadata`
+// derived, and exist for ONE caller: the clamp case below, which must reach the
+// device kernels with metadata the host arm refuses. Every other caller passes
+// nullptr and gets the derived metadata unchanged.
 RunOut RunChunkScanCuda(Backend& gpu, const Inputs& in, int64_t T, int64_t H, int64_t P,
                         int64_t G, int64_t N, const std::vector<int32_t>& cu_seqlens,
                         const std::vector<float>* D, const std::vector<float>* z,
                         const std::vector<float>* dt_bias,
-                        const std::vector<float>* initial_states, const RunCfg& cfg) {
+                        const std::vector<float>* initial_states, const RunCfg& cfg,
+                        const std::vector<int32_t>* lci_override = nullptr,
+                        const std::vector<int32_t>* sidx_override = nullptr) {
   Queue q = gpu.CreateQueue();
   const Device dev{DeviceType::kCUDA, 0};
   const int64_t S = static_cast<int64_t>(cu_seqlens.size()) - 1;
   ChunkMeta meta = ComputeVarlenChunkMetadata(cu_seqlens, cfg.chunk_size);
   const int64_t nchunks = static_cast<int64_t>(meta.seq_idx.size());
+  if (lci_override != nullptr) meta.last_chunk_indices = *lci_override;
+  if (sidx_override != nullptr) meta.seq_idx = *sidx_override;
 
   const std::vector<uint8_t> xb = Pack(in.x, cfg.act_dtype);
   const std::vector<uint8_t> dtb = Pack(in.dt, cfg.act_dtype);
@@ -1573,6 +1612,133 @@ TEST_CASE("mamba2 chunk scan CUDA arm covers the optional arms and the dtype kno
           std::max(max_out_diff, std::abs(static_cast<double>(dev.y[i]) - f32dev.y[i]));
     INFO("device max|out(bf16 state) - out(f32 state)| = " << max_out_diff);
     CHECK(max_out_diff > 1e-6);
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// OUT-OF-CONTRACT METADATA, DEVICE ONLY.
+//
+// The shared validator checks metadata SHAPE / DTYPE / DEVICE only
+// (`CheckI32Meta`, ops.cpp); every VALUE check lives in the HOST kernel, which
+// reads the tensors (cpu_ops.cpp). The device arm therefore runs with NONE of
+// them, and two of the dropped ones are memory-UNSAFE rather than merely wrong:
+// `last_chunk_indices[b] >= nchunks` makes the `passed` store run past its
+// `cudaMallocAsync` allocation, and a `seq_idx[c]` outside `[0,S)` reads
+// `initial_states` out of bounds (with `seq_idx[0] < 0` additionally indexing
+// `passed` at chunk -1). Both are clamped in registers at their use sites
+// (src/vt/cuda/cuda_mamba2_ssd.cuh); this case PINS the resulting behaviour so
+// it is a test, not a sentence in a header.
+//
+// THIS CASE HAS NO HOST TWIN, deliberately: the host kernel REFUSES both inputs,
+// which is exactly why the device arm needed the clamp. Each clamp is pinned
+// against an IN-CONTRACT reference run whose result the clamp is defined to
+// reproduce, so the assertions are EXACT — a tolerance here would be wide enough
+// to hide the defect it is meant to catch.
+//
+// What this case does NOT establish is memory safety itself. An out-of-bounds
+// write into a `cudaMallocAsync` pool very often does not fault, so a green run
+// is necessary and not sufficient; `compute-sanitizer memcheck` on this case is
+// what proves it, and is recorded as owed in §8.4.
+TEST_CASE("mamba2 chunk scan CUDA arm clamps out-of-contract metadata in registers") {
+  Backend* gpu = MaybeCuda();
+  if (gpu == nullptr) {
+    MESSAGE("SKIP: no CUDA backend registered (CPU-only build/box)");
+    return;
+  }
+  // Four one-chunk sequences, so `nchunks == S == 4` and every chunk opens a new
+  // sequence. That makes the in-contract `seq_idx` {0,1,2,3} and the in-contract
+  // `last_chunk_indices` {0,1,2,3}.
+  const int64_t H = 4, P = 8, G = 2, N = 16, chunk = 16;
+  const std::vector<int32_t> cu{0, 16, 32, 48, 64};
+  const int64_t T = cu.back(), S = static_cast<int64_t>(cu.size()) - 1;
+  const Inputs in = GenerateInputs(T, H, P, G, N, 0xC1A47u);
+  const ChunkMeta meta = ComputeVarlenChunkMetadata(cu, chunk);
+  const int64_t nchunks = static_cast<int64_t>(meta.seq_idx.size());
+  REQUIRE(nchunks == S);
+  // A braced init-list cannot appear inside a doctest macro — the preprocessor
+  // splits it on the commas — so the expectation is named first.
+  const std::vector<int32_t> in_contract{0, 1, 2, 3};
+  REQUIRE(meta.last_chunk_indices == in_contract);
+  REQUIRE(meta.seq_idx == in_contract);
+
+  std::mt19937 rng(0xB0B0u);
+  std::normal_distribution<float> nd(0.0f, 0.5f);
+  std::vector<float> init(static_cast<size_t>(S * H * P * N));
+  for (auto& v : init) v = nd(rng);
+
+  RunCfg cfg;
+  cfg.chunk_size = chunk;
+
+  auto max_abs_diff = [](const std::vector<float>& a, const std::vector<float>& b) {
+    REQUIRE(a.size() == b.size());
+    double worst = 0.0;
+    for (size_t i = 0; i < a.size(); ++i)
+      worst = std::max(worst, std::abs(static_cast<double>(a[i]) - static_cast<double>(b[i])));
+    return worst;
+  };
+  auto count_differing = [](const std::vector<float>& a, const std::vector<float>& b) {
+    REQUIRE(a.size() == b.size());
+    size_t n = 0;
+    for (size_t i = 0; i < a.size(); ++i)
+      if (a[i] != b[i]) ++n;
+    return n;
+  };
+
+  SUBCASE("last_chunk_indices past the end stops the chunk loop at nchunks") {
+    // In contract, the last sequence's `lci` is `nchunks - 1`. The clamp is
+    // defined to make anything >= nchunks behave as nchunks - 1, so these two
+    // runs must agree BIT FOR BIT — in `final_states` as much as in `y`, since
+    // the clamp is inside the state-passing kernel that produces both.
+    const RunOut ref =
+        RunChunkScanCuda(*gpu, in, T, H, P, G, N, cu, nullptr, nullptr, nullptr, &init, cfg);
+    RequireNativeCudaProvider(vt::OpId::kMamba2ChunkScan, "lci clamp reference");
+    for (int32_t past : {static_cast<int32_t>(nchunks), static_cast<int32_t>(nchunks + 41)}) {
+      std::vector<int32_t> lci = meta.last_chunk_indices;
+      lci.back() = past;
+      const RunOut got = RunChunkScanCuda(*gpu, in, T, H, P, G, N, cu, nullptr, nullptr, nullptr,
+                                          &init, cfg, &lci, nullptr);
+      INFO("last_chunk_indices.back() = " << past << " (nchunks = " << nchunks << ")");
+      CHECK(count_differing(got.y, ref.y) == 0);
+      CHECK(count_differing(got.final_states, ref.final_states) == 0);
+    }
+  }
+
+  SUBCASE("a seq_idx outside [0,S) opens the chunk with a ZERO previous state") {
+    // The reference is an IN-CONTRACT run with NO initial states: `seq_idx`
+    // {0,1,2,3} makes every chunk open a new sequence, and with `initial_states
+    // == nullptr` every one of them therefore opens from zero. That is exactly
+    // what the clamp is defined to do for an out-of-range index, so `y` must
+    // match bit for bit. `final_states` is NOT compared: the state-passing
+    // kernel reads `initial_states` by `b`, not by `seq_idx`, so it legitimately
+    // differs between a run that was given initial states and one that was not.
+    const RunOut zero_ref =
+        RunChunkScanCuda(*gpu, in, T, H, P, G, N, cu, nullptr, nullptr, nullptr, nullptr, cfg);
+    RequireNativeCudaProvider(vt::OpId::kMamba2ChunkScan, "seq_idx clamp reference");
+    // ... and the pin is not vacuous: with the SAME metadata in contract, the
+    // initial states genuinely move `y`, so "matches the zero-init run" is a
+    // real statement rather than two identical computations
+    // ([[gate-comparing-shared-helper-proves-consistency-not-correctness]]).
+    const RunOut init_ref =
+        RunChunkScanCuda(*gpu, in, T, H, P, G, N, cu, nullptr, nullptr, nullptr, &init, cfg);
+    INFO("max|y(initial_states) - y(none)| = " << max_abs_diff(init_ref.y, zero_ref.y));
+    REQUIRE(max_abs_diff(init_ref.y, zero_ref.y) > 1e-6);
+
+    // Over the top: every index >= S, which unclamped indexes `initial_states`
+    // out of bounds. Under the bottom: every index negative, which unclamped
+    // ALSO makes `si == si_prev` at c == 0 and indexes `passed` at chunk -1.
+    const std::vector<std::vector<int32_t>> bad{
+        {static_cast<int32_t>(S), static_cast<int32_t>(S + 1), static_cast<int32_t>(S + 2),
+         static_cast<int32_t>(S + 900)},
+        {-1, -1, -1, -1},
+    };
+    for (const std::vector<int32_t>& sidx : bad) {
+      REQUIRE(static_cast<int64_t>(sidx.size()) == nchunks);
+      const RunOut got = RunChunkScanCuda(*gpu, in, T, H, P, G, N, cu, nullptr, nullptr, nullptr,
+                                          &init, cfg, nullptr, &sidx);
+      INFO("seq_idx = {" << sidx[0] << ", " << sidx[1] << ", " << sidx[2] << ", " << sidx[3]
+                         << "}, S = " << S);
+      CHECK(count_differing(got.y, zero_ref.y) == 0);
+    }
   }
 }
 

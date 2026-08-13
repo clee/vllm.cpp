@@ -733,8 +733,9 @@ TEST_CASE("mamba2 state update refuses the arms it does not implement") {
 // section of tests/vt/test_ops_mamba2_ssd.cpp and in
 // src/vt/cuda/cuda_mamba2_ssd.cuh: f32 accumulation throughout, no tile
 // downcasts, identical memory format, and the same per-element accumulation
-// order — leaving the libm difference as the only admitted source of divergence,
-// which `DerivedRtol` bounds without a tuned number.
+// order — leaving TWO admitted sources of divergence, the libm difference and
+// nvcc's default `--fmad=true` contraction of `y += sn * cv`, both of which
+// `DerivedRtol` bounds without a tuned number.
 //
 // The decode step's evidence is mostly EXACT rather than approximate, and
 // deliberately so: which cache slot was written, which was left alone, and what a
@@ -775,12 +776,14 @@ void RequireNativeCudaProvider(vt::OpId op, const std::string& what) {
   CHECK(std::string(st.last_selected) != std::string(vt::kReferenceProviderName));
 }
 
-// `4*(K + 2)*u` — the bound derived at the head of the CUDA section of
+// `5*(K + 2)*u` — the bound derived at the head of the CUDA section of
 // tests/vt/test_ops_mamba2_ssd.cpp: 2.5 ulp of glibc-vs-CUDA libm disagreement
 // per decay factor through a product of at most K, plus the standard (K-1)*u
-// forward error of a length-K f32 summation.
+// forward error of a length-K f32 summation, plus K*u for the K product
+// roundings the host arm's `-ffp-contract=off` keeps and the device arm's
+// nvcc-`fmad` `fma` does not (`y += sn * cv`, cuda_mamba2_ssd.cuh).
 constexpr double kUnitRoundoff = 5.9604644775390625e-08;  // 2^-24
-double DerivedRtol(int64_t K) { return 4.0 * static_cast<double>(K + 2) * kUnitRoundoff; }
+double DerivedRtol(int64_t K) { return 5.0 * static_cast<double>(K + 2) * kUnitRoundoff; }
 
 void ExpectDeviceMatchesHost(const std::string& what, const std::vector<float>& dev,
                              const std::vector<float>& host, int64_t K) {

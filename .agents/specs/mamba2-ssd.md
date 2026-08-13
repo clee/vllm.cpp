@@ -437,9 +437,16 @@ reported `1: worst element ...` instead of naming the tensor. The labels are
 Named residuals unchanged from §2: the CUDA arm (W2), `n_groups` TP sharding,
 spec-decode temporal state, ReplaySSM and Mamba v1. One more, from the port
 itself: the Triton dots downcast their tile inputs (`ssd_chunk_state.py:283-285`,
-`ssd_chunk_scan.py:266-269`) where this host reference stays f32, so W2's
-device-vs-host comparison is a tolerance comparison at the activation dtype, not
-a byte compare.
+`ssd_chunk_scan.py:266-269`) where this host reference stays f32.
+
+**Corrected by §8.3, which supersedes this paragraph.** As originally written it
+predicted that W2 would mirror those downcasts, and therefore that W2's
+device-vs-host comparison would be "a tolerance comparison at the activation
+dtype, not a byte compare". W2 did NOT mirror them — §8.3 point 1 records the
+decision and why — so **both arms stay f32** and the dtype is not the reason a
+byte compare is out of reach. The reasons are **libm and FMA contraction**
+(§8.3 points 4 and 4b). Only the conclusion survived; its stated cause did not,
+and two different causes for one fact in one spec is the drift this note closes.
 
 ### 8.3 W2 — the declared equivalence contract for the CUDA arm
 
@@ -477,17 +484,46 @@ feeding an MMA.
 **3. Accumulation ORDER is part of the port.** Except in the gated norm's group
 reduction — which is a block reduction, and says so at the kernel — every
 accumulation runs in ONE thread, over the SAME index range in the SAME direction
-as the host reference. That is deliberate: it leaves the elementary functions as
-the *only* admitted source of divergence, so the derived bound has exactly one
-term to account for.
+as the host reference. That is deliberate: order is the *amplifying* source, and
+pinning it holds the derived bound to the two terms named in points 4 and 4b.
 
 **4. A byte compare against the host arm is NOT reachable, and the downcasts are
 not why.** The two arms call different libms — CUDA `expf` is documented at
 ≤ 2 ulp, glibc's at ≤ 0.5 — and the gated norm additionally reorders one
-non-negative reduction. Everything else is identical by construction. §9's third
-stop condition ("the device arm cannot reach the host reference byte-for-byte")
-is therefore resolved as **not reachable for a named, non-defect reason**, and
-the gap is kept open in the form below rather than closed by widening anything.
+non-negative reduction. §9's third stop condition ("the device arm cannot reach
+the host reference byte-for-byte") is therefore resolved as **not reachable for
+a named, non-defect reason**, and the gap is kept open in the form below rather
+than closed by widening anything.
+
+**4b. The second reason is FMA CONTRACTION, and the original derivation omitted
+it.** Corrected here after a fresh review of PR #566 (finding F1, MEDIUM);
+points 3 and 4 as first written claimed the elementary functions were the *only*
+admitted source, and that was false as written. Host C++ is pinned
+`-ffp-contract=off` (`CMakeLists.txt:41-56`) precisely so `a*b + c` keeps two
+roundings. **Nothing passes `--fmad=false` to nvcc** — `grep -rn fmad
+CMakeLists.txt cmake/` returns nothing — so `cuda_mamba2_ssd.cuh` compiles at
+nvcc's **default `--fmad=true`**, and every `acc += a*b` in it is a
+single-rounding `fma` whose host twin is not. This project has *measured* that
+exact idiom: `.agents/benchmark-record.md:532` records a pre-rounded `v²`
+differing by ≤ 1 ulp from the nvcc-`fmad` form and flipping a near-tie at token
+108. `CMakeLists.txt:41-56` carves CUDA out of the contraction policy on the
+grounds that "GPU parity tests compare GPU-vs-GPU"; **G2 is precisely the case
+that carve-out does not cover**.
+
+Nothing was hidden empirically — the worst audited comparison used 7.66% of the
+bound and the driver shapes 0.32% / 0.18% — so this is a **derivation-accuracy**
+defect, not a numerical failure. It is repaired by carrying the term, not by
+turning the flag off:
+
+- **`-fmad=false` on the TU: REJECTED.** nvcc takes the flag per *translation
+  unit*. `cuda_mamba2_ssd.cuh` is a **header**, included by `cuda_gdn.cu:48`, so
+  the only ways to apply it are (a) de-contract every GDN kernel in that TU — a
+  measured hot decode path ([[gdn-packed-bridge-closes-31pct-decode-gap]]) — or
+  (b) split a new `src/vt/` TU, which the *Placement* deviation below already
+  records as blocked on #515. Slowing a shipped kernel to make a bound's prose
+  true is the wrong trade.
+- **Carrying the term: TAKEN.** The bound moves from `4·(K+2)·u` to
+  `5·(K+2)·u`; the arithmetic is in point 6.
 
 **5. The primary gate is therefore NOT device-vs-host.** It is the device output
 against the **same double-precision sequential reference** the host arm is held
@@ -498,11 +534,29 @@ cleanly: device-only means a device defect; both means the cited upstream
 threshold does not cover this shape, which is a `NEEDS_DECISION`, not a wider
 tolerance.
 
-**6. The derived device-vs-host bar is `rtol(K) = 4·(K+2)·2⁻²⁴`**
-(`ExpectDeviceMatchesHost` / `DerivedRtol`, `tests/vt/test_ops_mamba2_ssd.cpp`),
-from 2.5 ulp of libm disagreement per decay factor through a product of at most
-`K`, plus `(K-1)·u` of summation error. **No number was tuned and no tolerance
-was widened**; `K` is the sequence length the comparison actually ran at.
+**6. The derived device-vs-host bar is `rtol(K) = 5·(K+2)·2⁻²⁴`**
+(`ExpectDeviceMatchesHost` / `DerivedRtol`, in all three suites). Three terms,
+one per admitted source:
+
+| term | bound | source |
+|---|---|---|
+| libm | `2.5·K·u` | ≤ 2.5 ulp per decay factor (CUDA `expf` ≤ 2, glibc ≤ 0.5) through a product of at most `K` |
+| summation | `(K-1)·u` | the standard forward error of a length-`K` f32 sum, which is what *amplifies* the libm difference |
+| contraction | `K·u` | the `K` product roundings the host keeps under `-ffp-contract=off` and the device's `fma` does not (point 4b) |
+
+Total `≤ 2.5·K·u + (K-1)·u + K·u = 4.5·K·u − u`, and `5·(K+2)·u` covers it
+for every `K ≥ 0` because `5K + 10 ≥ 4.5K − 1` reduces to `0.5K + 11 ≥ 0`.
+
+**The previous `4·(K+2)·u` did not, and that is why the constant moved.**
+`4.5K − 1 ≤ 4K + 8` reduces to `K ≤ 18`, so the old bound was provable only up
+to `K = 18` — while the driver-shapes case runs at `K = T = 200`
+(`test_ops_mamba2_ssd.cpp`, §1.4 shapes). The constant changed because the
+**derivation gained a term the build actually emits**, not because a run needed
+slack: re-scaling §8.4's audit by `4/5`, the worst of the 55 comparisons goes
+from 7.66% to **6.13%** of budget, the driver shapes from 0.32%/0.18% to
+**0.26%/0.14%**, and mutant M3 from 962173% to **769738%** — still caught by
+four orders of magnitude. **No number is tuned**; `K` is the sequence length the
+comparison actually ran at.
 Because a bar nobody audits is a false claim, every comparison logs the
 **fraction of the budget actually used** through `MESSAGE` — not `INFO`, because
 doctest prints `INFO` only on failure, so an `INFO` would have been invisible on
@@ -516,14 +570,54 @@ the green run that the claim rests on.
   which `check-doc-checkpoint` classifies `user_usage` + `landing_page`, so any
   new `src/vt/` file owes a `docs/USAGE.md` update that a kernel exposing no
   command, config key or C-ABI entry point has nothing true to write (#515).
-- **The device arm does not re-check `A < 0` or `state_indices` distinctness.**
-  Both operands are on-device; re-reading them costs a D2H plus a stream
-  synchronise per call — the same host tax the GDN prefill path was rebuilt to
-  remove — and makes the op uncapturable in a CUDA graph. This mirrors the policy
-  `cuda_gdn.cu:8-13` already states for exactly this case. The kernels stay
-  **memory safe** under a violation: an out-of-range `state_indices` slot writes
-  nothing at all rather than out of bounds. **Owed, not implemented here:** route
-  both through the deferred device error ring at `cuda_ops.cu:790-940`.
+- **The device arm re-checks NONE of the host arm's metadata VALUE checks.**
+  Corrected here after the fresh review of PR #566 (finding F2, MEDIUM), which
+  established both that the list was longer than "`A < 0` and `state_indices`
+  distinctness" and that the memory-safety claim attached to it was broader than
+  the kernels guarantee.
+
+  The **shared** validator (`Mamba2ChunkScan` / `Mamba2StateUpdate`,
+  `src/vt/ops.cpp`) checks metadata **shape, dtype and device only**
+  (`CheckI32Meta`, `ops.cpp:1717-1723`). Every **value** check lives in the host
+  kernel, where the data is host-readable (`cpu_ops.cpp:1622-1648`). The device
+  arm therefore does not check, in full:
+
+  1. `A < 0` (`CheckMamba2ANegative`) — value-only
+  2. `state_indices` distinctness (§8.2 F8) — value-only
+  3. the `cu_chunk_seqlens` tiling of `[0,T)` — **memory-unsafe**
+  4. per-chunk `0 < len ≤ chunk_size` — **memory-unsafe**
+  5. `seq_idx[c] ∈ [0,S)` — **memory-unsafe**, now CLAMPED
+  6. `0 ≤ last_chunk_indices[b] < nchunks` (§8.2 **F7**) — **memory-unsafe**, now CLAMPED
+
+  The reason for dropping them is unchanged and still holds for the *reads*:
+  the operands are on-device, so re-reading them costs a D2H plus a stream
+  synchronise per call — the host tax the GDN prefill path was rebuilt to remove
+  — and makes the op uncapturable in a CUDA graph, mirroring the policy
+  `cuda_gdn.cu:8-13` states for exactly this case.
+
+  **But that reason does not reach 5 and 6, and the review was right that the
+  file was internally inconsistent.** Both values are already **in device
+  registers** at their use sites, and the decode kernel has always clamped its
+  `state_indices` slot for free on exactly that basis. Unclamped, `lci[b] ≥
+  nchunks` makes the `passed` store an out-of-bounds **write** past the
+  `cudaMallocAsync` allocation, and a `seq_idx[c] ∉ [0,S)` an out-of-bounds
+  **read** of `initial_states` (with `seq_idx[0] < 0` additionally indexing
+  `passed` at chunk −1). Both are now **clamped in registers**, which is free,
+  matches the decode kernel, and matters because W4 is about to become the first
+  caller of these ops. The clamps do **not** restore the checks: out-of-contract
+  metadata still yields a **wrong answer**, now with a defined shape ("the chunk
+  loop stops at `nchunks`", "that chunk opens with a zero previous state"). They
+  bound only *where* it is read from. Pinned by a device-only case
+  (`test_ops_mamba2_ssd.cpp`, "clamps out-of-contract metadata in registers")
+  against in-contract reference runs, so the assertions are exact.
+
+  **3 and 4 are NOT clamped and the arm is NOT memory-safe under them** — a
+  garbage `ccs` yields a `start`/`len` that index `x`/`B`/`C`/`z`/`out` out of
+  bounds in every stage, and bounding that needs `T` at each use site plus a
+  clamp inside the inner loops, which is not free. That is stated as unsafe
+  rather than folded into a blanket "memory safe" claim. **Owed, not implemented
+  here:** route 1–4 through the deferred device error ring at
+  `cuda_ops.cu:790-940`.
 
 **Not fixed here, filed as #547.** The W2 RED run SIGSEGV'd on all three
 binaries. GB10 reports `Backend::UnifiedMemory() == true`, so
@@ -584,7 +678,7 @@ catch. Sources restored byte-for-byte after each, md5 re-asserted
 | M4 | drop the `D` skip connection | 570 `SUCCESS!` | `FAILURE!` |
 | M5 | ignore `state_indices` (slot = row) | 1318 `SUCCESS!` | `FAILURE!` |
 | M6 | treat the NULL row as slot 0 | 1318 `SUCCESS!` | `FAILURE!` |
-| M7 | whole-row variance instead of per-group | 9 `SUCCESS!` | `FAILURE!` |
+| M7 | `n_groups = 1` in the kernel, launcher grid unchanged (see below) | 9 `SUCCESS!` | `FAILURE!` |
 | M8 | sigmoid instead of silu | 9 `SUCCESS!` | `FAILURE!` |
 | M9 | drop `CheckMamba2ANegative` on decode (§8.2) | 11 `SUCCESS!` | `FAILURE!` |
 
@@ -598,6 +692,18 @@ mutation and must not be scored as one. Both were rewritten to drop exactly the
 same term while leaving every variable read — M1 multiplies the inter-chunk
 product by `0.0f`, M7 passes `1, group_size * args.n_groups` (which *is*
 `hidden`) — and both then failed as intended.
+
+**M7's label is narrower than "whole-row variance", and the fresh review of
+#566 was right to say so (finding F3, LOW).** The reformulated M7 forces
+`n_groups = 1` in the *kernel* while the launcher's `nblocks = rows *
+args.n_groups` is left alone, so blocks `blk ≥ rows` compute `r = blk / 1 ≥ rows`
+and read and write past the tensor. The device mutant is therefore
+**memory-unsafe**, and fails partly for that rather than purely on the
+whole-row-variance arithmetic. The guarantee IS pinned — the reviewer ran a
+clean CPU twin of the same mutation, with no grid mismatch, and it reds on the
+intended assertion — so only the label was wrong, and it is corrected in the
+table above. A device mutant that is also memory-unsafe is a weaker instrument
+than one that is not, and is recorded as such rather than re-scored.
 
 **Full `ctest` on the gate host**, all 392 test targets built (777 ninja edges,
 0 warnings), `ctest -j 1` — serial is required, not cautious: GB10 memory is
@@ -666,6 +772,82 @@ comparisons in a green run, the worst one used **7.66%** of `rtol(K) =
 `MESSAGE` line under mutant M3 reads `used 962173% of its derived budget`. So
 the bound is neither tuned down to the observed error nor wide enough to hide a
 defect.
+
+### 8.5 W2 tightening pass (fresh review of PR #566 returned PASS + 5 findings)
+
+`row/KERNEL-SSM-MAMBA-SSD-W2-FIX`, branched from `1e819144e` with `origin/main`
+merged. The review's **verdict was PASS**; it verified the equivalence contract's
+central MMA reasoning, reconstructed the reformulated mutations on CPU twins,
+and confirmed the grep, the recovered-byte md5s and the CI baseline subtraction.
+None of that was re-done. What changed:
+
+- **F1 (MEDIUM, derivation accuracy)** — repaired by carrying the FMA-contraction
+  term, not by disabling contraction. `-fmad=false` was rejected on the grounds
+  in §8.3 point 4b: it is a per-TU flag on a header included by `cuda_gdn.cu`, so
+  it would de-contract a measured hot decode path. `DerivedRtol` is
+  `5·(K+2)·2⁻²⁴` in all three suites; §8.3 point 6 carries the arithmetic and the
+  re-scaled audit.
+- **F2 (MEDIUM, over-broad memory-safety claim)** — repaired by taking BOTH
+  halves the finding offered: the two free register-local clamps AND the narrowed
+  claim. The header and §8.3's second deviation now enumerate all six dropped
+  value checks, mark which are memory-unsafe, and state plainly that the
+  `cu_chunk_seqlens` tiling and length checks are **NOT** clamped and **NOT**
+  safe. `M2ChunkScanKernel` gained an `S` parameter for the `seq_idx` clamp.
+- **F3, F4 (LOW, record accuracy)** — M7's label corrected in §8.4 with the grid
+  mismatch stated; §8.2's superseded downcast-tolerance sentence reconciled
+  against §8.3.
+- **F5 (LOW)** — taken. The five per-call `cudaMallocAsync` scratch buffers are
+  held by an `M2Scratch` scope guard, so a throw on the Nth no longer leaks the
+  N-1 before it. `Release()` also frees all five before reporting, where the
+  open-coded sequence it replaces leaked the remainder on a mid-sequence failure.
+
+**Evidence, CPU box `promaxgb10` worktree host, `df -h /` = 85% used (67G free)
+before and after every result below.**
+
+| suite | test cases | assertions | status |
+|---|---|---|---|
+| `test_ops_mamba2_ssd` | 8 / 8 passed | 1175 / 1175 | `SUCCESS!` |
+| `test_ops_mamba2_state_update` | 6 / 6 passed | 2469 / 2469 | `SUCCESS!` |
+| `test_ops_mamba2_gated_norm` | 9 / 9 passed | 2107 / 2107 | `SUCCESS!` |
+
+Identical to the pre-change CPU counts, as expected: every code change is inside
+`#ifdef VLLM_CPP_CUDA` or in the `.cuh`. `Status:` was read, not `assertions:`
+alone ([[doctest-assertions-line-hides-thrown-cases]]).
+
+**The CUDA arm could not be built or run — `omitted_gates`.** `dgx.casa` has been
+unreachable since 06:50 CEST (§8.4) and this box has no `nvcc` and no GPU. Two
+substitutes were run instead, and neither is offered as the device gate:
+
+1. **`.cuh` compile + arity check.** The header was compiled by the host compiler
+   at `-std=c++20 -Wall -Wextra -Werror` against minimal CUDA shims, with each
+   `Kernel<<<cfg>>>(args)` rewritten to `M2Sink(cfg), Kernel(args)` — which drops
+   the launch configuration while PRESERVING the argument-count and
+   argument-type check on all 7 launches. `EXIT 0`. Proved ARMED rather than
+   vacuous by deleting the `S` argument the F2 clamp added to the chunk-scan
+   launch on a scratch copy: `too few arguments to function M2ChunkScanKernel`,
+   exit 1. This checks C++, not PTX or device semantics.
+2. **F2 clamp CPU twin.** The two index computations were transcribed and walked
+   over the device case's own shape (`S=H=nchunks=4`, `row=128`, `passed`
+   allocation 2048 elements), clamped and unclamped. Unclamped and out of
+   contract, every claimed hole reproduced: `lci[3] = nchunks` forms index
+   **2432** (an out-of-bounds WRITE), `lci[1] = -9` forms **−4096**,
+   `seq_idx >= S` reaches **463232** into a 2048-element `initial_states`, and
+   `seq_idx = {-1,…}` forms **−512** into `passed` — the `c == 0`,
+   `si == si_prev` hole. Clamped, all of them land in `[0, 1920] ⊂ [0, 2048)`,
+   the `lci` clamp reproduces the in-contract index range exactly, and both
+   `seq_idx` violations read no previous state at all — which is what the new
+   device case compares against an in-contract zero-init run.
+
+**Owed on the device, all `omitted_gates` until `dgx.casa` returns:** the three
+suites' CUDA arms (Release and Debug); `compute-sanitizer memcheck` on the new
+"clamps out-of-contract metadata in registers" case, which is what actually
+proves memory safety — a green run without it is necessary and not sufficient,
+because an out-of-bounds write into a `cudaMallocAsync` pool commonly does not
+fault; a re-run of the 9-mutation sweep against the moved bound; and §8.4's
+still-pending `~/w2ssd/refail.log` attribution, which remains `REMOTE_UNVERIFIED`.
+
+The Windows CI reds remain the `main` baseline described in §8.4 (#512 now fixed
+by #583, #514, #584); they are subtracted, not inherited.
 
 ## 9. Stop conditions
 

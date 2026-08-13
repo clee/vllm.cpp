@@ -37,32 +37,86 @@
 // differs in the direction Triton itself takes wherever it is not feeding an MMA.
 //
 // The consequence for the gate is stated in the test files: the two arms are NOT
-// bit-identical, because they call different libms (`expf`/`log1pf`), and the
-// gated norm additionally reorders one non-negative reduction. Both effects carry
-// a DERIVED forward-error bound; neither is a tuned number. See
+// bit-identical. TWO effects are admitted, both structural and both carrying a
+// DERIVED forward-error bound; neither is a tuned number. See
 // tests/vt/test_ops_mamba2_ssd.cpp `DerivedRtol`.
+//
+// ─── ADMITTED SOURCE 1: THE ELEMENTARY FUNCTIONS ─────────────────────────────
+// The two arms call different libms (`expf`/`log1pf`) — CUDA's `expf` is
+// documented to <= 2 ulp and glibc's to <= 0.5.
+//
+// ─── ADMITTED SOURCE 2: FMA CONTRACTION ──────────────────────────────────────
+// Host C++ is pinned `-ffp-contract=off` (CMakeLists.txt:41-56) precisely so
+// `a*b + c` keeps two roundings. NOTHING passes `--fmad=false` to nvcc, so this
+// header compiles at nvcc's DEFAULT `--fmad=true` and every `acc += a*b` below
+// (:290, :335, :364, :434, :442, :501, and the gated norm's `part += v*v` at
+// :554) is a SINGLE-rounding `fma` whose host twin is not. That is measured, not
+// theoretical: .agents/benchmark-record.md:532 records a pre-rounded `v²`
+// differing by <= 1 ulp from this exact nvcc-`fmad` idiom and flipping a
+// near-tie. CMakeLists.txt:41-56 carves CUDA out of the contraction policy on
+// the grounds that "GPU parity tests compare GPU-vs-GPU"; the device-vs-host
+// comparison is exactly the case that carve-out does not cover, so the bound
+// carries the term instead of the build removing it.
+//
+// `-fmad=false` was REJECTED, not overlooked. nvcc takes it per TRANSLATION
+// UNIT and this is a header, included by cuda_gdn.cu:48 — so applying it means
+// either de-contracting every GDN kernel in that TU (a measured hot decode
+// path) or splitting a new `src/vt/` TU, which §8.3 already records as blocked
+// on #515. Slowing an unrelated shipped kernel to make a bound's prose true is
+// the wrong trade; widening the bound by the term the build actually emits is
+// the right one. `DerivedRtol` is `5·(K+2)·u`, not `4·(K+2)·u`, and §8.3 shows
+// the arithmetic.
 //
 // ─── ACCUMULATION ORDER IS PART OF THE PORT ──────────────────────────────────
 // Except in the gated norm's group reduction (which is a block reduction, and
 // says so), every accumulation below runs in ONE thread, over the SAME index
-// range in the SAME direction as the host reference. That is deliberate: it
-// leaves the elementary functions as the ONLY admitted source of divergence, so
-// the derived bound has exactly one term to account for.
+// range in the SAME direction as the host reference. That is deliberate — order
+// is the AMPLIFYING source and pinning it keeps the bound to the two terms
+// above. It does not, on its own, make the libm the only one.
 //
 // ─── WHAT THIS ARM DOES NOT CHECK (named residual, §8.3) ─────────────────────
-// The host arm validates two data-dependent preconditions by READING THE TENSORS:
-// `A < 0` (`CheckMamba2ANegative`, cpu_ops.cpp) and the distinctness of
-// `state_indices`. Both operands live on the DEVICE here, so re-checking them
-// would cost a D2H copy plus a stream synchronise on every call — the same host
-// tax the GDN prefill path was rebuilt to remove (`GdnArgs::query_start_loc_host`,
-// include/vt/ops.h), and it would make the op uncapturable in a CUDA graph. This
-// arm therefore mirrors the policy cuda_gdn.cu already states for exactly this
-// case ("here bad metadata is unchecked -- correctness-grade; the M0.9 builder
-// owns metadata integrity", cuda_gdn.cu:8-13). The device kernels remain MEMORY
-// SAFE under a violation: an out-of-range `state_indices` slot writes nothing at
-// all rather than out of bounds. Closing the gap needs the deferred device error
-// ring cuda_ops.cu:790-940 already implements for embedding, and is recorded as
-// owed rather than silently dropped.
+// The SHARED validator checks metadata SHAPE, DTYPE and DEVICE only
+// (`CheckI32Meta`, ops.cpp:1717-1723). Every VALUE check lives in the host
+// kernel, which reads the tensors (cpu_ops.cpp:1622-1648): `A < 0`
+// (`CheckMamba2ANegative`), `state_indices` distinctness, the `cu_chunk_seqlens`
+// tiling, per-chunk length bounds, `seq_idx[c] ∈ [0,S)`, and both halves of
+// `0 <= last_chunk_indices[b] < nchunks`. This arm re-checks NONE of them: the
+// operands live on the DEVICE, so reading them costs a D2H copy plus a stream
+// synchronise per call — the same host tax the GDN prefill path was rebuilt to
+// remove (`GdnArgs::query_start_loc_host`, include/vt/ops.h) — and it would make
+// the op uncapturable in a CUDA graph. This mirrors the policy cuda_gdn.cu
+// already states for exactly this case ("here bad metadata is unchecked --
+// correctness-grade; the M0.9 builder owns metadata integrity",
+// cuda_gdn.cu:8-13). Closing the gap needs the deferred device error ring
+// cuda_ops.cu:790-940 already implements for embedding, and is owed.
+//
+// MEMORY SAFETY IS A NARROWER CLAIM AND IS MADE SEPARATELY, because dropping a
+// check whose consequence is a WRONG NUMBER is correctness-grade while dropping
+// one whose consequence is an out-of-bounds ACCESS is not:
+//
+//   CLAMPED, therefore memory-safe under a violation —
+//     * `last_chunk_indices[b] >= nchunks` would make M2Store(passed, ...) at
+//       :336 write PAST the cudaMallocAsync allocation; `lci[b-1] < -1` would
+//       make `states[...]` at :335 read before it. Clamped at :319-331.
+//     * `seq_idx[c] ∉ [0,S)` would read `initial_states` out of bounds at :435,
+//       and a `seq_idx[0] < 0` would additionally make `si == si_prev` at c == 0
+//       and index `passed` at chunk -1. Clamped at :404-419.
+//     * an out-of-range `state_indices` slot writes nothing at all. Clamped at
+//       :486, as it always has been.
+//   The clamps are the reason the D2H argument above does not apply to these:
+//   the values are ALREADY IN REGISTERS at their use sites, so bounding them
+//   costs nothing and needs no host round trip. They do NOT restore the checks —
+//   out-of-contract metadata still produces a WRONG ANSWER, now with a defined
+//   shape. They bound only WHERE it is read from. Both are pinned by device-only
+//   cases in tests/vt/test_ops_mamba2_ssd.cpp rather than asserted here.
+//
+//   NOT CLAMPED, therefore NOT memory-safe under a violation —
+//     * the `cu_chunk_seqlens` tiling and per-chunk length checks. `start` and
+//       `len` derived from a garbage `ccs` index x/B/C/z/out out of bounds in
+//       every stage. Bounding these needs T at each use site and a clamp in the
+//       inner loops, which is not free; it is owed with the error ring above.
+//   VALUE-ONLY, in-bounds wrong number —
+//     * `A < 0` and `state_indices` distinctness.
 #ifndef VT_CUDA_MAMBA2_SSD_CUH_
 #define VT_CUDA_MAMBA2_SSD_CUH_
 
@@ -89,6 +143,49 @@ void M2Check(cudaError_t err, const char* what) {
 }
 
 cudaStream_t M2Stream(const Queue& q) { return static_cast<cudaStream_t>(q.handle); }
+
+// Scope guard for the prefill path's per-call scratch. `M2Check` throws, so a
+// failure on the Nth `cudaMallocAsync` would otherwise leak the N-1 before it.
+// The happy path calls `Release()`, which frees on the stream and CHECKS each
+// free exactly as the open-coded sequence it replaces did; the destructor is the
+// unwinding path only, and cannot throw.
+class M2Scratch {
+ public:
+  explicit M2Scratch(cudaStream_t s) : s_(s) {}
+  M2Scratch(const M2Scratch&) = delete;
+  M2Scratch& operator=(const M2Scratch&) = delete;
+  ~M2Scratch() {
+    for (int i = 0; i < n_; ++i) static_cast<void>(cudaFreeAsync(p_[i], s_));
+  }
+  void* Alloc(size_t bytes, const char* what) {
+    // Refuse rather than overrun if a sixth buffer is ever added: a silent
+    // overflow here would be the exact defect class the guard exists to remove.
+    if (n_ >= kMax) throw std::runtime_error("vt cuda mamba2: scratch slots exhausted");
+    void* p = nullptr;
+    M2Check(cudaMallocAsync(&p, bytes, s_), what);
+    p_[n_++] = p;
+    return p;
+  }
+  void Release() {
+    const int n = n_;
+    n_ = 0;
+    // Free ALL of them before reporting, so a mid-sequence failure does not
+    // leak the remainder the way the open-coded `M2Check(cudaFreeAsync(...))`
+    // sequence this replaces did; then throw on the first error seen.
+    cudaError_t first = cudaSuccess;
+    for (int i = 0; i < n; ++i) {
+      const cudaError_t e = cudaFreeAsync(p_[i], s_);
+      if (first == cudaSuccess) first = e;
+    }
+    M2Check(first, "scratch free");
+  }
+
+ private:
+  static constexpr int kMax = 5;
+  cudaStream_t s_;
+  void* p_[kMax] = {};
+  int n_ = 0;
+};
 
 // Grid for a grid-stride loop over `n` items at kM2Block threads, capped so a
 // launch stays reasonable on any element count.
@@ -222,8 +319,19 @@ __global__ void M2StatePassKernel(void* passed, DType sdt, void* final_states, c
     const int64_t i = idx % row;
     const int64_t h = (idx / row) % H;
     const int64_t b = idx / (row * H);
-    const int64_t chunk_end = lci[b] + 1;
-    const int64_t chunk_start = b > 0 ? lci[b - 1] + 1 : 0;
+    // REGISTER-LOCAL MEMORY-SAFETY CLAMP (see the header's "what this arm does
+    // not check"). The host arm value-checks `0 <= last_chunk_indices[b] <
+    // nchunks` (cpu_ops.cpp); this arm cannot. Unclamped, `lci[b] >= nchunks`
+    // makes the `M2Store(passed, ...)` below write PAST the cudaMallocAsync
+    // allocation, and `lci[b-1] < -1` makes `states[...]` read before it. Both
+    // bounds are already in registers, so the D2H argument for dropping the
+    // check does not reach them and this costs nothing. It does NOT restore the
+    // check: out-of-contract metadata still yields a wrong number, now with a
+    // DEFINED shape — the chunk loop stops at nchunks and starts at 0.
+    int64_t chunk_end = lci[b] + 1;
+    int64_t chunk_start = b > 0 ? lci[b - 1] + 1 : 0;
+    if (chunk_end > nchunks) chunk_end = nchunks;
+    if (chunk_start < 0) chunk_start = 0;
     float s = init != nullptr ? M2Load(init, initdt, (b * H + h) * row + i) : 0.0f;
     for (int64_t c = chunk_start; c < chunk_end; ++c) {
       const float decay = expf(dac[(h * nchunks + c) * cs + cs - 1]);
@@ -279,8 +387,8 @@ __global__ void M2ChunkScanKernel(void* out, DType odt, const void* x, DType xdt
                                   const void* passed, DType sdt, const void* init, DType initdt,
                                   const float* D, bool d_has_hdim, const void* z, DType zdt,
                                   const int32_t* ccs, const int32_t* sidx, int64_t nchunks,
-                                  int64_t H, int64_t P, int64_t G, int64_t N, int64_t cs,
-                                  int64_t hpg) {
+                                  int64_t H, int64_t P, int64_t G, int64_t N, int64_t S,
+                                  int64_t cs, int64_t hpg) {
   const int64_t total = nchunks * H * cs * P;
   for (int64_t idx = blockIdx.x * blockDim.x + threadIdx.x; idx < total;
        idx += static_cast<int64_t>(gridDim.x) * blockDim.x) {
@@ -296,11 +404,22 @@ __global__ void M2ChunkScanKernel(void* out, DType odt, const void* x, DType xdt
 
     const int32_t si = sidx[c];
     const int32_t si_prev = c >= 1 ? sidx[c - 1] : -1;
+    // REGISTER-LOCAL MEMORY-SAFETY CLAMP, as in M2StatePassKernel above. The
+    // host arm value-checks `seq_idx[c] in [0,S)` (cpu_ops.cpp); unclamped, an
+    // out-of-range `si` reads `initial_states` out of bounds at `prevbase`, and
+    // a `sidx[0] < 0` makes `si == si_prev` at c == 0 and indexes `passed` at
+    // chunk -1. In-contract `si` is ALWAYS in range, so every in-contract path
+    // below is bit-identical to the unclamped form; out of contract the answer
+    // is still wrong, now with the defined shape "this chunk opens with a zero
+    // previous state".
+    const bool si_ok = si >= 0 && static_cast<int64_t>(si) < S;
     bool prev_zero = false;
     const void* prevp = passed;
     DType prevdt = sdt;
     int64_t prevbase = ((c - 1) * H + h) * row;
-    if (si != si_prev) {
+    if (!si_ok) {
+      prev_zero = true;
+    } else if (si != si_prev) {
       if (init != nullptr) {
         prevp = init;
         prevdt = initdt;
@@ -487,16 +606,15 @@ void Mamba2ChunkScanKernelCuda(Queue& q, Tensor& out, Tensor& final_states, cons
   const size_t n_states = static_cast<size_t>(nchunks * H * P * N);
   const size_t n_cb = static_cast<size_t>(nchunks * G * cs * cs);
   const size_t state_elem = sdt == DType::kF32 ? 4u : 2u;
-  float* dtv = nullptr;
-  float* dac = nullptr;
-  float* states = nullptr;
-  float* cb = nullptr;
-  void* passed = nullptr;
-  M2Check(cudaMallocAsync(&dtv, n_cumsum * sizeof(float), s), "dtv alloc");
-  M2Check(cudaMallocAsync(&dac, n_cumsum * sizeof(float), s), "dac alloc");
-  M2Check(cudaMallocAsync(&states, n_states * sizeof(float), s), "states alloc");
-  M2Check(cudaMallocAsync(&cb, n_cb * sizeof(float), s), "cb alloc");
-  M2Check(cudaMallocAsync(&passed, n_states * state_elem, s), "passed alloc");
+  // `M2Check` THROWS, so the five allocations below are held by a scope guard:
+  // without it a failure on the 3rd leaks the 1st and 2nd. The guard is released
+  // once the explicit frees at the end of the happy path have run.
+  M2Scratch scratch(s);
+  float* dtv = static_cast<float*>(scratch.Alloc(n_cumsum * sizeof(float), "dtv alloc"));
+  float* dac = static_cast<float*>(scratch.Alloc(n_cumsum * sizeof(float), "dac alloc"));
+  float* states = static_cast<float*>(scratch.Alloc(n_states * sizeof(float), "states alloc"));
+  float* cb = static_cast<float*>(scratch.Alloc(n_cb * sizeof(float), "cb alloc"));
+  void* passed = scratch.Alloc(n_states * state_elem, "passed alloc");
   // cudaMallocAsync hands back DIRTY pool memory. Every element of dtv/dac/states
   // is written before it is read; `cb` and `passed` are written only where they
   // are read (the causal triangle, and the chunks of a scheduled sequence), so
@@ -520,14 +638,10 @@ void Mamba2ChunkScanKernelCuda(Queue& q, Tensor& out, Tensor& final_states, cons
       initial_states != nullptr ? initial_states->data : nullptr,
       initial_states != nullptr ? initial_states->dtype : DType::kF32, Dp, d_has_hdim,
       z != nullptr ? z->data : nullptr, z != nullptr ? z->dtype : DType::kF32, ccs, sidx,
-      nchunks, H, P, G, N, cs, hpg);
+      nchunks, H, P, G, N, S, cs, hpg);
 
   const cudaError_t launched = cudaGetLastError();
-  M2Check(cudaFreeAsync(dtv, s), "dtv free");
-  M2Check(cudaFreeAsync(dac, s), "dac free");
-  M2Check(cudaFreeAsync(states, s), "states free");
-  M2Check(cudaFreeAsync(cb, s), "cb free");
-  M2Check(cudaFreeAsync(passed, s), "passed free");
+  scratch.Release();  // frees all five on the stream, reporting the first error
   M2Check(launched, "mamba2_chunk_scan launch");
 }
 
