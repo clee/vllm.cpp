@@ -181,6 +181,18 @@ struct Ltx2ConnectorEmbeddings {
 // `additive_attention_mask` is [batch, seq] with 0 for a kept token and
 // -finfo(f32).max for a padded one, and it is required: it is what decides which
 // positions become registers.
+//
+// NO NUMERIC ORACLE, and that is owed rather than overlooked. `Ltx2ConnectorForward`
+// — the connector this wraps — is gated on five arms against EXECUTED upstream
+// (`gen-ltx2-pipeline-goldens.py` section 10). This wrapper is not. Its own tests
+// are PROPERTY tests: padding-side agnosticism compares two of OUR OWN calls, so
+// a defect present in both arms cancels, and the binary-mask case pins a polarity
+// rather than a value. A reviewer's mutations at the layer above — video scaled
+// x1.5, conditioning rows reversed — passed every assertion in the suite.
+// Upstream's counterpart is `EmbeddingsProcessor.create_embeddings`
+// (embeddings_processor.py:70-95), reachable from the same generator that already
+// executes the connector; see the closure note on `Ltx2ConditioningTrace`
+// (multimodal/ltx2_video.h).
 Ltx2ConnectorEmbeddings Ltx2ConnectorCreateEmbeddings(
     const Ltx2ConnectorConfig& video_config, const Ltx2VaeWeights& video_weights,
     const float* video_features, const Ltx2ConnectorConfig& audio_config,

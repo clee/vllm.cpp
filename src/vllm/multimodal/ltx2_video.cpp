@@ -30,9 +30,11 @@
 #include "vllm/model_executor/models/ltx2_device.h"
 #include "vllm/model_executor/models/ltx2_loader.h"
 #include "vllm/model_executor/models/ltx2_pipeline.h"
+#include "vllm/model_executor/models/ltx2_text_encoder.h"
 #include "vllm/model_executor/models/ltx2_upsampler.h"
 #include "vllm/model_executor/models/ltx2_video_vae.h"
 #include "vllm/model_executor/models/minimax_h3.h"
+#include "vllm/tokenizer/tokenizer.h"
 
 namespace vllm::multimodal {
 namespace {
@@ -251,8 +253,31 @@ int64_t ExtraInt(const std::map<std::string, std::string>& extras, const std::st
 const char* const kKnownLoadExtras[] = {
     kLtx2AudioPromptEmbedsExtra, kLtx2PipelineKindExtra,   kLtx2ModelVersionExtra,
     kLtx2AllowUnportedExtra,     kLtx2MaxPhaseExtra,       kLtx2DitConfigPathExtra,
-    kLtx2PromptValidRowsExtra,   "upsampler_path",         "duration_head_path",
+    kLtx2PromptValidRowsExtra,   kLtx2EncoderConfigPathExtra,
+    "upsampler_path",            "duration_head_path",
 };
+
+// FNV-1a over the raw bytes of a float buffer — the `Ltx2ConditioningTrace`
+// digest. It is deliberately a function of the BYTES rather than of a reduction
+// like a sum or a mean: a sum cannot see a permutation and a mean cannot see two
+// compensating changes, and the question this instrument answers is exactly
+// "are these the same numbers in the same places".
+uint64_t DigestF32(const std::vector<float>& values) {
+  uint64_t h = 1469598103934665603ULL;
+  const auto* bytes = reinterpret_cast<const unsigned char*>(values.data());
+  const size_t n = values.size() * sizeof(float);
+  for (size_t i = 0; i < n; ++i) {
+    h ^= bytes[i];
+    h *= 1099511628211ULL;
+  }
+  return h;
+}
+
+double AbsMax(const std::vector<float>& values) {
+  double m = 0.0;
+  for (const float v : values) m = std::max(m, std::abs(static_cast<double>(v)));
+  return m;
+}
 
 void CheckKnownExtras(const std::map<std::string, std::string>& extras) {
   for (const auto& kv : extras) {
@@ -283,6 +308,69 @@ std::string RecipeVersionKey(const std::string& declared) {
   std::string key = std::to_string(parsed[0]);
   if (parsed.size() > 1) key += "." + std::to_string(parsed[1]);
   return key;
+}
+
+// `EmbeddingsProcessor`'s two connector calls plus its output-mask contract —
+// ONE statement of it, because two callers now reach it and they must not answer
+// "what does the connector do here" differently: the LOAD-time prompt-embeds
+// path, and the PER-REQUEST path that phase L13 added on top of the text tower.
+// Before L13 there was one caller and the logic sat inline; a second copy is
+// exactly the shape this project has recorded as producing two rules.
+//
+// THE WEIGHTS LIVE AND DIE INSIDE THIS CALL, and that is the whole reason it
+// takes a `SafetensorsFile` rather than materialized weights. 129 tensors per
+// stream is ~1.61G video + ~0.40G audio parameters at the shipped widths —
+// about 8 GB of f32 together — and holding them for an engine's lifetime on a
+// 119 GB unified-memory box that reboots rather than OOM-killing is 8 GB spent
+// on a module that runs once per request over 1024 rows. A diffusion request is
+// minutes; re-reading the DiT file is not the cost that matters here.
+//
+// THE f32 IS AN ANNOTATED ESCAPE, not an inherited default. Upstream runs this
+// module at the model dtype, so f32 here is WIDER — the polarity AGENTS.md says
+// a value gate cannot catch. It is taken because `Ltx2ConnectorForward` is L5's
+// declared PARITY dtype and this is the arm its goldens cover, and its output is
+// narrowed to the stream dtype on the first upload like every other activation.
+Ltx2ConnectorEmbeddings RunConnector(const SafetensorsFile& dit_file,
+                                     const Ltx2ConnectorConfig& video_cfg,
+                                     const Ltx2ConnectorConfig& audio_cfg,
+                                     const std::vector<float>& video_in,
+                                     const std::vector<float>& audio_in,
+                                     const std::vector<float>& additive, int64_t rows) {
+  const Ltx2VaeWeights video_weights = Ltx2LoadConnectorWeights(dit_file, video_cfg);
+  const Ltx2VaeWeights audio_weights = Ltx2LoadConnectorWeights(dit_file, audio_cfg);
+  Ltx2ConnectorEmbeddings encoded = Ltx2ConnectorCreateEmbeddings(
+      video_cfg, video_weights, video_in.data(), audio_cfg, audio_weights, audio_in.data(),
+      additive.data(), /*batch=*/1, rows);
+  // The processor returns the mask the DiT's cross-attention is supposed to
+  // honour (embeddings_processor.py:89). `Ltx2ModalityInput` carries no context
+  // mask, so a mask with a masked position would be silently dropped — the DiT
+  // would attend over register-free padding as if it were caption.
+  //
+  // THIS LOOP IS UNREACHABLE ON EVERY INPUT EITHER REFERENCE PRODUCES, and
+  // saying which case reaches it is how the claim stays checkable. It is NOT the
+  // `num_learnable_registers = 0` case, which an earlier version of this comment
+  // named and which cannot get here: with registers disabled
+  // `Ltx2ConnectorForward` passes the caller's ADDITIVE mask straight through,
+  // and `_to_binary_mask`'s `encoded_mask < 0.000001`
+  // (embeddings_processor.py:46-48) is satisfied by BOTH values an additive mask
+  // holds — 0.0 and -finfo(f32).max — so the binary mask is one everywhere there
+  // too. With registers enabled :152 returns `torch.zeros_like(mask)` and the
+  // answer is one everywhere for the same reason. What would reach it is a
+  // connector whose output mask carries a value at or above +1e-6, which no path
+  // in `ltx_core` or `diffusers` emits today. It is kept as a guard on that
+  // future, refused by name rather than ignored, and it is deliberately not
+  // gated: a test would have to fabricate a mask neither reference can produce.
+  for (const float m : encoded.mask) {
+    if (m == 1.0f) continue;
+    Fail(
+        "the embeddings connector returned a cross-attention mask with masked "
+        "positions, and `Ltx2ModalityInput` carries no context mask to pass it through. "
+        "No path in either reference emits such a mask — `_to_binary_mask` is one "
+        "everywhere for both values an additive mask holds — so this is a connector "
+        "whose output mask this port does not model. Refusing rather than dropping "
+        "the mask, which would condition the DiT on unmasked padding.");
+  }
+  return encoded;
 }
 
 }  // namespace
@@ -360,8 +448,8 @@ struct Ltx2VideoEngine::Impl {
   Ltx2UpsamplerConfig upsampler_cfg;
   Ltx2VaeWeights upsampler_weights;
 
-  // Conditioning. `has_encoder` is false for every checkpoint today; see the
-  // header's refusal 2.
+  // Conditioning. `has_encoder` is true exactly when `encoder_path` named a
+  // Gemma-4 text tower and it materialized; see the header's item 2.
   bool has_encoder = false;
   // What the DiT's cross-attention consumes. When the checkpoint carries the
   // embeddings connector these are the CONNECTOR's output; without one they are
@@ -378,6 +466,26 @@ struct Ltx2VideoEngine::Impl {
   Ltx2ConnectorConfig video_connector_cfg, audio_connector_cfg;
   int64_t prompt_valid_rows = 0;
 
+  // ── the text tower (phase L13) ────────────────────────────────────────────
+  //
+  // RESIDENT, unlike the connector weights, and the asymmetry is deliberate.
+  // A prompt arrives PER REQUEST, so the tower has to survive the load: at the
+  // shipped 12B that is ~24 GB of host bf16 and the header says so. The
+  // connector is ~8 GB of f32 and is re-read from the DiT file inside one scope
+  // per request instead, so the steady state is the tower alone. Both numbers
+  // matter on a 119 GB unified-memory box that reboots rather than OOM-killing.
+  //
+  // `Ltx2GemmaTower` and `tok::Tokenizer` are held by value / by pointer rather
+  // than rebuilt: rebuilding the tower per request would dequantize 337 NVFP4
+  // modules on every generation.
+  std::unique_ptr<Ltx2GemmaTower> tower;
+  std::unique_ptr<tok::Tokenizer> tokenizer;
+  Ltx2GemmaSpecialIds gemma_ids;
+  Ltx2TextEncoderWeights caption_projections;
+  Ltx2TextFeatureConfig feature_cfg;
+
+  Ltx2ConditioningTrace trace;
+
   std::mutex mutex;
 };
 
@@ -393,6 +501,10 @@ bool Ltx2VideoEngine::has_prompt_embeds() const { return !impl_->video_prompt_em
 const std::string& Ltx2VideoEngine::model_version() const { return impl_->model_version; }
 const std::string& Ltx2VideoEngine::pipeline_kind() const { return impl_->pipeline_kind; }
 const Ltx2DitParams& Ltx2VideoEngine::dit_params() const { return impl_->dit.params; }
+Ltx2ConditioningTrace Ltx2VideoEngine::last_conditioning() const {
+  std::lock_guard<std::mutex> guard(impl_->mutex);
+  return impl_->trace;
+}
 
 std::unique_ptr<Ltx2VideoEngine> Ltx2VideoEngine::Load(const VideoModelParams& params) {
   if (params.dit_path.empty()) Fail("dit_path is required");
@@ -665,20 +777,127 @@ std::unique_ptr<Ltx2VideoEngine> Ltx2VideoEngine::Load(const VideoModelParams& p
     im.has_upsampler = true;
   }
 
-  // ── conditioning ──────────────────────────────────────────────────────────
-  // REFUSAL 2 (header): the Gemma-4 TOWER is owed, so `encoder_path` cannot be
-  // turned into hidden states here. Saying so at LOAD, when the caller supplied
-  // one, is better than accepting the path and refusing every request later.
-  if (!params.encoder_path.empty()) {
-    Fail(
-        "encoder_path was supplied, but this family cannot encode a prompt yet: phase L6 "
-        "loads the caption projections and the embedded tokenizer and records the Gemma-4 "
-        "TOWER itself as owed (ltx2_loader.h:318-324), so there is nothing to produce the "
-        "49 hidden states `Ltx2TextFeatureExtractorForward` consumes. Condition through "
-        "prompt_embeds_path + the '" +
-        std::string(kLtx2AudioPromptEmbedsExtra) +
-        "' extra meanwhile; that is the seam's own documented fallback.");
+  // ── the text tower (phase L13) ────────────────────────────────────────────
+  //
+  // THIS IS THE LAST HOP, and the reason it could be taken here is worth stating
+  // once at the code rather than only in the spec: L10 built prompt -> tokens ->
+  // tower -> the two caption projections, L9c put the `Embeddings1DConnector` on
+  // the render path with the checkpoint's own weights, and neither branch could
+  // see the other. L10's refusal said the connector weights were still refused
+  // by `Ltx2LoadDitFromSafetensors`; `ltx2_loader.cpp:417` now records in terms
+  // that they are NOT unported and are materialized by `Ltx2LoadConnectorWeights`.
+  // So the chain closes, and what is left is composition.
+  //
+  // The order is fixed by data, not taste: the FEATURE VARIANT is resolved from
+  // the DiT's transformer config (`Ltx2SelectTextFeatureVariant`,
+  // encoder_configurator.py:163-209), so this must run after `dit_config` and
+  // after the params adoption that fixes the two stream widths.
+  const std::string encoder_config_path =
+      VideoExtra(params.extras, kLtx2EncoderConfigPathExtra);
+  if (params.encoder_path.empty() && !encoder_config_path.empty()) {
+    Fail("the '" + std::string(kLtx2EncoderConfigPathExtra) +
+         "' extra names '" + encoder_config_path +
+         "' but no encoder_path was supplied, so there is no tower for it to "
+         "configure. Refusing rather than ignoring it: an extra that is silently "
+         "dropped looks exactly like the feature not working.");
   }
+  if (!params.encoder_path.empty()) {
+    const SafetensorsFile encoder_file = SafetensorsFile::Open(params.encoder_path);
+
+    // 1. THE ASSET PACK. `require_config=false` unconditionally, because the
+    //    decision about WHERE the Gemma config comes from is made below with
+    //    both candidates in hand; letting the reader throw first would report
+    //    "this checkpoint has no metadata" for a caller who supplied the config.
+    const Ltx2GemmaAssets assets = Ltx2LoadGemmaAssets(encoder_file, /*require_config=*/false);
+    if (assets.has_config && !encoder_config_path.empty()) {
+      Fail("the text encoder declares its own __metadata__[\"gemma_config\"] and the '" +
+           std::string(kLtx2EncoderConfigPathExtra) + "' extra names '" +
+           encoder_config_path +
+           "'. Refusing rather than preferring one: layer_types, global_head_dim, "
+           "num_global_key_value_heads and attention_k_eq_v each resolve a DIFFERENT "
+           "model out of a byte-identical tensor set, so the wrong choice conditions "
+           "on a plausible wrong prompt instead of failing. Drop the extra to use the "
+           "checkpoint's own config.");
+    }
+    if (!assets.has_config && encoder_config_path.empty()) {
+      Fail("the text encoder '" + params.encoder_path +
+           "' declares no __metadata__[\"gemma_config\"], and no '" +
+           std::string(kLtx2EncoderConfigPathExtra) +
+           "' extra was supplied. The tensor SHAPES cannot supply one: which layers are "
+           "full vs sliding (layer_types) decides their head_dim and kv head count, and "
+           "attention_k_eq_v decides whether a missing v_proj is an architecture or a "
+           "damaged file. This is the shape the shipped vonkaiser text encoder is in — it "
+           "carries no __metadata__ at all, which is why upstream's own "
+           "GemmaAssets.from_single_file raises on it (gemma_assets.py:110-114). Supply "
+           "the config rather than inheriting a default that resolves a different tower.");
+    }
+    const nlohmann::json gemma_config =
+        assets.has_config ? assets.config
+                          : ReadJsonFile(kLtx2EncoderConfigPathExtra, encoder_config_path);
+
+    // 2. THE TOKENIZER, out of the `tokenizer_json` TENSOR — a loader assuming a
+    //    sibling tokenizer.json fails on every shipped build of this family.
+    im.tokenizer = std::make_unique<tok::Tokenizer>(tok::Tokenizer::FromHfJsonBytes(
+        std::string_view(reinterpret_cast<const char*>(assets.tokenizer_json.data()),
+                         assets.tokenizer_json.size()),
+        params.encoder_path + "::tokenizer_json"));
+    im.gemma_ids = Ltx2ResolveGemmaSpecialIds(assets, *im.tokenizer);
+
+    // 3. THE TOWER. ~24 GB of host bf16 at the shipped 12B; see the Impl note.
+    im.tower = std::make_unique<Ltx2GemmaTower>(
+        Ltx2LoadGemmaTowerFromSafetensors(encoder_file, gemma_config));
+
+    // 4. THE TWO CAPTION PROJECTIONS, and the V1/V2 shape they belong to.
+    const Ltx2TextEncoderCheckpoint te = Ltx2LoadTextEncoderFromSafetensors(encoder_file);
+    im.feature_cfg = Ltx2SelectTextFeatureVariant(
+        dit_config.contains("transformer") ? dit_config.at("transformer") : dit_config,
+        te.gemma_hidden_size, te.gemma_num_hidden_layers);
+    im.caption_projections = Ltx2WidenTextProjectionsToF32(te);
+
+    // 5. THE TWO WIDTHS MUST BE THE DiT's. `Ltx2SelectTextFeatureVariant` reads
+    //    them from the SAME transformer config the DiT's cross-attention
+    //    dimensions come from, so a disagreement here means the config and the
+    //    encoder file describe different models — checked rather than assumed,
+    //    because the failure downstream would be a wrong-shaped GEMM inside the
+    //    DiT rather than a load refusal.
+    if (im.feature_cfg.video_out_features != im.dit.params.cross_attention_dim) {
+      Fail("the video caption projection emits " +
+           std::to_string(im.feature_cfg.video_out_features) +
+           " features but the DiT's cross-attention takes " +
+           std::to_string(im.dit.params.cross_attention_dim));
+    }
+    if (im.feature_cfg.audio_out_features != im.dit.params.audio_cross_attention_dim) {
+      Fail("the audio caption projection emits " +
+           std::to_string(im.feature_cfg.audio_out_features) +
+           " features but the DiT's audio cross-attention takes " +
+           std::to_string(im.dit.params.audio_cross_attention_dim) +
+           ". LTX-2.5 conditions TWO streams and a V1 config emits only one "
+           "(encoder_configurator.py:185-188), so an audio width of 0 here means the "
+           "checkpoint's config resolved the pre-2.5 single-projection form.");
+    }
+
+    // 6. THE REGISTER TILING, at the width the TOKENIZER will produce. Upstream
+    //    asserts the same thing (embeddings_connector.py:144) because the
+    //    register table is TILED across the sequence rather than indexed by
+    //    which positions were padded. Checked at LOAD rather than on the first
+    //    request: it depends on nothing a request supplies.
+    if (im.has_connector) {
+      const int64_t registers = im.video_connector_cfg.num_learnable_registers;
+      if (registers > 0 && kLtx2GemmaTokenizerMaxLength % registers != 0) {
+        Fail("the tokenizer pads every prompt to " +
+             std::to_string(kLtx2GemmaTokenizerMaxLength) +
+             " rows (gemma_assets.py:162), which is not a multiple of the connector's " +
+             std::to_string(registers) + " learnable registers");
+      }
+    }
+    im.has_encoder = true;
+  }
+
+  // ── conditioning from a FILE (the seam's documented fallback) ─────────────
+  //
+  // Still served, and still the only conditioning when no tower is loaded. With
+  // a tower it becomes the fallback for a request that carries no prompt, which
+  // is why the two are not mutually exclusive.
   const std::string audio_embeds_path = VideoExtra(params.extras, kLtx2AudioPromptEmbedsExtra);
   if (params.prompt_embeds_path.empty() != audio_embeds_path.empty()) {
     Fail(
@@ -744,58 +963,11 @@ std::unique_ptr<Ltx2VideoEngine> Ltx2VideoEngine::Load(const VideoModelParams& p
       for (int64_t s = im.prompt_valid_rows; s < v_rows; ++s) {
         additive[static_cast<size_t>(s)] = -std::numeric_limits<float>::max();
       }
-      // The weights live and die inside this scope. See the Impl comment: 129
-      // tensors per stream is ~8 GB of f32 at the shipped widths, and holding
-      // them for the engine's lifetime would spend that on a module that runs
-      // exactly once. The DiT file is still open if a per-request conditioning
-      // path ever needs to re-read them.
-      //
-      // THE f32 IS AN ANNOTATED ESCAPE, not an inherited default. Upstream runs
-      // this module at the model dtype, so f32 here is WIDER — the polarity
-      // AGENTS.md says a value gate cannot catch. It is taken because
-      // `Ltx2ConnectorForward` is L5's declared PARITY dtype and this is the
-      // arm its goldens cover, and it costs nothing on the production path: the
-      // connector runs ONCE per load over 128 rows, and its output is narrowed
-      // to the stream dtype on the first upload like every other activation.
-      // What it does cost is the transient above, which is why it is scoped.
-      const Ltx2VaeWeights video_connector =
-          Ltx2LoadConnectorWeights(dit_file, im.video_connector_cfg);
-      const Ltx2VaeWeights audio_connector =
-          Ltx2LoadConnectorWeights(dit_file, im.audio_connector_cfg);
-      const Ltx2ConnectorEmbeddings encoded = Ltx2ConnectorCreateEmbeddings(
-          im.video_connector_cfg, video_connector, im.video_prompt_embeds.data(),
-          im.audio_connector_cfg, audio_connector, im.audio_prompt_embeds.data(),
-          additive.data(), /*batch=*/1, v_rows);
-      // The processor returns the mask the DiT's cross-attention is supposed to
-      // honour (embeddings_processor.py:89). `Ltx2ModalityInput` carries no
-      // context mask, so a mask with a masked position would be silently dropped
-      // — the DiT would attend over register-free padding as if it were caption.
-      //
-      // THIS LOOP IS UNREACHABLE ON EVERY INPUT EITHER REFERENCE PRODUCES, and
-      // saying which case reaches it is how the claim stays checkable. It is NOT
-      // the `num_learnable_registers = 0` case, which an earlier version of this
-      // comment named and which cannot get here: with registers disabled
-      // `Ltx2ConnectorForward` passes the caller's ADDITIVE mask straight
-      // through, and `_to_binary_mask`'s `encoded_mask < 0.000001`
-      // (embeddings_processor.py:46-48) is satisfied by BOTH values an additive
-      // mask holds — 0.0 and -finfo(f32).max — so the binary mask is one
-      // everywhere there too. With registers enabled :152 returns
-      // `torch.zeros_like(mask)` and the answer is one everywhere for the same
-      // reason. What would reach it is a connector whose output mask carries a
-      // value at or above +1e-6, which no path in `ltx_core` or `diffusers`
-      // emits today. It is kept as a guard on that future, refused by name
-      // rather than ignored, and it is deliberately not gated: a test would have
-      // to fabricate a mask neither reference can produce.
-      for (const float m : encoded.mask) {
-        if (m == 1.0f) continue;
-        Fail(
-            "the embeddings connector returned a cross-attention mask with masked "
-            "positions, and `Ltx2ModalityInput` carries no context mask to pass it through. "
-            "No path in either reference emits such a mask — `_to_binary_mask` is one "
-            "everywhere for both values an additive mask holds — so this is a connector "
-            "whose output mask this port does not model. Refusing rather than dropping "
-            "the mask, which would condition the DiT on unmasked padding.");
-      }
+      // ONE statement of the connector call and its mask contract, shared with
+      // the per-request prompt path (`RunConnector`).
+      const Ltx2ConnectorEmbeddings encoded =
+          RunConnector(dit_file, im.video_connector_cfg, im.audio_connector_cfg,
+                       im.video_prompt_embeds, im.audio_prompt_embeds, additive, v_rows);
       im.video_prompt_embeds = encoded.video;
       im.audio_prompt_embeds = encoded.audio;
     }
@@ -812,15 +984,131 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
     Fail("unknown per-generation extra '" + gen.extras.begin()->first +
          "' (this family defines none)");
   }
-  if (!gen.prompt.empty()) {
+  if (!gen.prompt.empty() && !im.has_encoder) {
     Fail(
         "a prompt was supplied but no text tower is loaded, so it cannot condition this "
         "render. Rendering the prompt-embeds conditioning INSTEAD would silently ignore the "
-        "request's own prompt. See the encoder_path refusal at load.");
+        "request's own prompt. Load with encoder_path to condition on the prompt.");
   }
-  if (im.video_prompt_embeds.empty()) {
+  if (gen.prompt.empty() && im.video_prompt_embeds.empty()) {
+    if (im.has_encoder) {
+      Fail(
+          "this request carries no prompt, and no prompt-embeds conditioning was loaded "
+          "either. A text tower IS loaded, so supply the prompt: rendering unconditioned "
+          "would return a clip that looks like the tower not working.");
+    }
     Fail("no conditioning is loaded; supply prompt_embeds_path and the '" +
          std::string(kLtx2AudioPromptEmbedsExtra) + "' extra");
+  }
+
+  // ── conditioning (phase L13) ──────────────────────────────────────────────
+  //
+  // THE PROMPT PATH, END TO END, and every step is a brick that already has a
+  // golden — this composes them and adds no numerics:
+  //
+  //   prompt -> `Ltx2EncodePromptToConditioning`   (L10: tokenize on the embedded
+  //             tokenizer, run the tower, aggregate all 49 hidden states, project
+  //             them twice, right-pad-order the result)
+  //          -> `RunConnector`                     (L9c: the checkpoint's OWN
+  //             `*_embeddings_connector` weights, under its own `connector_*`
+  //             configuration)
+  //          -> `Ltx2ModalityInput::context`
+  //
+  // TWO THINGS A READER SHOULD BE ABLE TO CHECK RATHER THAN TAKE ON TRUST.
+  //
+  // (1) THE RIGHT-PAD SORT IS APPLIED TWICE AND THE SECOND IS THE IDENTITY.
+  //     `Ltx2TextEncoderConditioning` and `Ltx2ConnectorCreateEmbeddings` are two
+  //     ports of overlapping halves of `embeddings_processor.py:70-117`, and both
+  //     carry the sort. Composing them therefore sorts an already-sorted stream.
+  //     That is correct — a stable descending argsort of a 0/1 key is idempotent,
+  //     which the first port's own header states — but "correct because it is
+  //     idempotent" is a claim, so the loop below ASSERTS the precondition that
+  //     makes it one: the additive mask leaving the encoder is non-increasing,
+  //     i.e. every kept position precedes every padded one. If that ever stops
+  //     holding the composition is refused rather than quietly re-ordering the
+  //     caption against the mask.
+  //
+  //     THAT ASSERTION IS ITSELF UNGATED, and it is named here rather than left
+  //     to read as a positive. No test reaches it: every mask that arrives comes
+  //     from `Ltx2ComputeRightPadOrder`, which produces a non-increasing mask by
+  //     construction, so the only way to fire it through the public API is a
+  //     defect INSIDE that function. Deleting the loop moves no test. That is
+  //     NOT a claim that it is unreachable — no probe was built that fails to
+  //     reach it, and this campaign's own rule is that a mutation which moves
+  //     nothing is not evidence of unreachability. It is a guard on an internal
+  //     invariant, carried because the invariant is what makes the double sort
+  //     an identity, and recorded as ungated.
+  //
+  // (2) THE TOWER RUNS ON A CPU QUEUE EVEN ON THE DEVICE ARM, and that is a
+  //     stated limit, not an oversight. Everything in `ltx2_text_encoder.h` is
+  //     f32 by declaration — `Ltx2TextFeatureExtractorForward` REFUSES any other
+  //     compute dtype by name — so the text path has no device arm to run on.
+  //     The DiT still runs where `device` says. What this costs is a host-side
+  //     12B forward over the prompt's own valid tokens once per request, against
+  //     a denoise loop of many 21B forwards; it is recorded as owed rather than
+  //     hidden, and it is the reason `im.queue` is not passed here.
+  std::vector<float> prompt_video, prompt_audio;
+  const float* video_context = im.video_prompt_embeds.data();
+  const float* audio_context = im.audio_prompt_embeds.data();
+  int64_t context_tokens = im.prompt_tokens;
+  im.trace = Ltx2ConditioningTrace{};
+
+  if (!gen.prompt.empty()) {
+    vt::Queue text_queue{vt::Device{vt::DeviceType::kCPU, 0}, nullptr};
+    const Ltx2PromptConditioning encoded = Ltx2EncodePromptToConditioning(
+        *im.tower, *im.tokenizer, im.gemma_ids, im.caption_projections, im.feature_cfg,
+        gen.prompt, text_queue);
+    prompt_video = encoded.conditioning.video;
+    prompt_audio = encoded.conditioning.audio;
+    context_tokens = encoded.seq;
+
+    if (im.has_connector) {
+      const std::vector<float>& mask = encoded.conditioning.additive_mask;
+      if (static_cast<int64_t>(mask.size()) != context_tokens) {
+        Fail("the text encoder returned a " + std::to_string(mask.size()) +
+             "-entry additive mask for " + std::to_string(context_tokens) + " rows");
+      }
+      for (size_t s = 1; s < mask.size(); ++s) {
+        if (mask[s] <= mask[s - 1]) continue;
+        Fail(
+            "the text encoder's additive mask is not right-padded at row " +
+            std::to_string(s) +
+            ", so the connector's own right-pad sort would REORDER it rather than "
+            "leave it alone. The two ports of embeddings_processor.py:23-43 compose "
+            "only because a stable argsort of a 0/1 key is idempotent, and that holds "
+            "only on an already right-padded input. Refusing rather than sorting a "
+            "caption stream against a mask it no longer matches.");
+      }
+      const Ltx2ConnectorEmbeddings through = RunConnector(
+          SafetensorsFile::Open(im.params.dit_path), im.video_connector_cfg,
+          im.audio_connector_cfg, prompt_video, prompt_audio, mask, context_tokens);
+      prompt_video = through.video;
+      prompt_audio = through.audio;
+    }
+    video_context = prompt_video.data();
+    audio_context = prompt_audio.data();
+    im.trace.from_prompt = true;
+    im.trace.prompt = gen.prompt;
+  }
+
+  {
+    const int64_t vw = im.dit.params.cross_attention_dim;
+    const int64_t aw = im.dit.params.audio_cross_attention_dim;
+    const std::vector<float>& v = im.trace.from_prompt ? prompt_video : im.video_prompt_embeds;
+    const std::vector<float>& a = im.trace.from_prompt ? prompt_audio : im.audio_prompt_embeds;
+    if (static_cast<int64_t>(v.size()) != context_tokens * vw ||
+        static_cast<int64_t>(a.size()) != context_tokens * aw) {
+      Fail("the conditioning is " + std::to_string(v.size()) + " / " +
+           std::to_string(a.size()) + " floats for " + std::to_string(context_tokens) +
+           " rows at widths " + std::to_string(vw) + " / " + std::to_string(aw));
+    }
+    im.trace.tokens = context_tokens;
+    im.trace.video_width = vw;
+    im.trace.audio_width = aw;
+    im.trace.video_digest = DigestF32(v);
+    im.trace.audio_digest = DigestF32(a);
+    im.trace.video_absmax = AbsMax(v);
+    im.trace.audio_absmax = AbsMax(a);
   }
   // Image / reference conditioning is `ImageConditioner` upstream
   // (ltx-pipelines/utils/blocks.py:936-993, called at distilled.py:212). The
@@ -853,8 +1141,16 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
   int64_t frames = gen.num_frames > 1 ? gen.num_frames : recipe.num_frames;
   if (gen.duration_seconds > 0.0) {
     // `resolve_num_frames` (utils/blocks.py) turns an AUTO duration into frames
-    // through the DURATION HEAD, which needs the encoded prompt this engine
-    // cannot produce. An explicit duration is exact arithmetic, so it is served;
+    // through the DURATION HEAD. THE REASON THIS IS UNSERVED MOVED IN L13 and the
+    // old one is recorded so a reader can re-check it: it used to be "the head
+    // needs an encoded prompt this engine cannot produce", and since `has_encoder`
+    // above the engine produces exactly that. What is missing now is the head
+    // itself — `ltx2_duration_head.h` is ported and gated as a brick, but nothing
+    // here constructs one, and `duration_head_path` is accepted in
+    // `kKnownLoadExtras` while NO code reads it (grep: it appears at that one
+    // site). So the extra is inert rather than wired, and that is recorded as owed
+    // rather than left to be discovered by someone who supplies it and gets the
+    // recipe default. An explicit duration is exact arithmetic, so it is served;
     // the AUTO path is what is missing, and `num_frames` is how to avoid it.
     frames = static_cast<int64_t>(std::llround(gen.duration_seconds * fps));
   }
@@ -1057,22 +1353,22 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
       Ltx2ModalityInput vin;
       vin.batch = 1;
       vin.tokens = video.tokens;
-      vin.context_tokens = im.prompt_tokens;
+      vin.context_tokens = context_tokens;
       vin.latent = video.latent.data();
       vin.timesteps = v_timesteps.data();
       vin.sigma = &sigma_row;
       vin.positions = video.positions.data();
-      vin.context = im.video_prompt_embeds.data();
+      vin.context = video_context;
 
       Ltx2ModalityInput ain;
       ain.batch = 1;
       ain.tokens = audio.tokens;
-      ain.context_tokens = im.prompt_tokens;
+      ain.context_tokens = context_tokens;
       ain.latent = audio.latent.data();
       ain.timesteps = a_timesteps.data();
       ain.sigma = &sigma_row;
       ain.positions = audio.positions.data();
-      ain.context = im.audio_prompt_embeds.data();
+      ain.context = audio_context;
 
       // One graph, two residencies. On the CPU this is the L2 parity forward in
       // its declared f32; on an accelerator it is the phase-L8 device-resident
@@ -1228,6 +1524,12 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
   mux.fps = result.fps;
   result.mux_argv = MiniMaxH3BuildMp4MuxArgs(mux);
   result.mux_output_path = mux.output_path;
+  // The trace was filled before the denoise loop, which is the only place the
+  // buffers cross-attention reads still exist as such. Everything between there
+  // and here can throw, so `completed` is set HERE and nowhere else: it is what
+  // separates "this conditioning produced that clip" from "this conditioning was
+  // built for a render that then failed".
+  im.trace.completed = true;
   return result;
 }
 

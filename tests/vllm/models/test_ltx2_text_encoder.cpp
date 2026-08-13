@@ -38,12 +38,16 @@
 #include "support/max_abs_diff.h"
 #include "vllm/model_executor/model_loader/safetensors_reader.h"
 #include "vllm/model_executor/models/gemma4.h"
+#include "vllm/model_executor/models/ltx2_loader.h"
 #include "vllm/model_executor/models/ltx2_text_encoder.h"
+#include "vllm/tokenizer/tokenizer.h"
 #include "vllm/transformers_utils/hf_config.h"
 #include "vt/backend.h"
 #include "vt/dtype.h"
 
 #include "ltx2_text_goldens.inc"
+#include "ltx2_gemma_tower_goldens.inc"
+#include "ltx2_prompt_tokens_goldens.inc"
 
 namespace fs = std::filesystem;
 
@@ -367,6 +371,212 @@ vllm::Gemma4Weights TinyGemma4Weights(const vllm::HfConfig& c) {
     w.layers.push_back(std::move(lw));
   }
   return w;
+}
+
+// ---------------------------------------------------------------------------
+// The Gemma-4 TOWER fixture — the mirror of
+// scripts/gen-ltx2-gemma-tower-goldens.py.
+//
+// Every tensor is rebuilt from the deterministic stream keyed by the same
+// HuggingFace parameter NAME the oracle filled, so this side and the oracle
+// cannot drift by reordering, and a port that reads the wrong tensor name reads
+// different numbers rather than the same numbers in the wrong slot.
+// ---------------------------------------------------------------------------
+
+std::string TowerParam(int64_t layer, const char* suffix) {
+  return "language_model.layers." + std::to_string(layer) + "." + suffix;
+}
+
+// The generator's `gemma_param_spec`, verbatim. The OFFSETS are the load-bearing
+// part: Gemma-4's RMSNorm multiplies by `weight` directly rather than by
+// `1 + weight` (modeling_gemma4_unified.py:181-185) and initializes it to ones,
+// and `layer_scalar` is a buffer initialized to ones and applied as
+// `hidden_states *= layer_scalar` (:501, :535). Centring either on 0 would make a
+// port that ignores it pass.
+std::vector<float> TowerRand(const std::string& name, int64_t count) {
+  double scale = 0.05;
+  double offset = 0.0;
+  if (EndsWith(name, "layer_scalar") || EndsWith(name, "_layernorm.weight") ||
+      EndsWith(name, "norm.weight")) {
+    scale = 0.1;
+    offset = 1.0;
+  } else if (EndsWith(name, ".bias")) {
+    scale = 0.02;
+  }
+  return Ltx2Make(name, count, scale, offset);
+}
+
+vllm::OwnedTensor TowerTensor(const std::string& name,
+                              const std::vector<int64_t>& shape, bool nk) {
+  int64_t numel = 1;
+  for (int64_t d : shape) numel *= d;
+  const std::vector<float> values = TowerRand(name, numel);
+  vllm::OwnedTensor o;
+  o.dtype = vt::DType::kBF16;
+  o.nk = nk;
+  o.rank = static_cast<int>(shape.size());
+  for (int i = 0; i < o.rank; ++i) o.shape[i] = shape[static_cast<size_t>(i)];
+  o.bytes.resize(static_cast<size_t>(numel) * sizeof(uint16_t));
+  auto* p = reinterpret_cast<uint16_t*>(o.bytes.data());
+  for (int64_t i = 0; i < numel; ++i)
+    p[i] = vt::F32ToBF16(values[static_cast<size_t>(i)]);
+  return o;
+}
+
+// Concatenate several named [rows_i, H] tensors into one raw-NK block, which is
+// how `Gemma4Weights` carries q/k/v and gate/up (gemma4_weights.cpp:290-296).
+vllm::OwnedTensor TowerConcatNk(
+    const std::vector<std::pair<std::string, int64_t>>& parts, int64_t H) {
+  int64_t rows = 0;
+  for (const auto& part : parts) rows += part.second;
+  vllm::OwnedTensor o;
+  o.dtype = vt::DType::kBF16;
+  o.nk = true;
+  o.rank = 2;
+  o.shape[0] = rows;
+  o.shape[1] = H;
+  o.bytes.resize(static_cast<size_t>(rows * H) * sizeof(uint16_t));
+  auto* p = reinterpret_cast<uint16_t*>(o.bytes.data());
+  int64_t at = 0;
+  for (const auto& part : parts) {
+    const std::vector<float> values = TowerRand(part.first, part.second * H);
+    for (int64_t i = 0; i < part.second * H; ++i)
+      p[at + i] = vt::F32ToBF16(values[static_cast<size_t>(i)]);
+    at += part.second * H;
+  }
+  return o;
+}
+
+vllm::HfConfig TowerConfig() {
+  // PARSED from the very JSON the oracle was configured with, rather than
+  // reconstructed field by field. `attention_k_eq_v`, `final_logit_softcapping`,
+  // both `rope_parameters` entries and `rms_norm_eps` all reach the forward
+  // through `cfg.raw`, and a hand-built config would silently disagree with the
+  // run that produced the goldens about any field nobody remembered.
+  return vllm::ParseHfConfig(nlohmann::json::parse(vllm_test::kLtxTowerTextConfigJson),
+                             "ltx2_gemma_tower_goldens.inc");
+}
+
+vllm::Gemma4Weights TowerWeights(const vllm::HfConfig& c) {
+  const int64_t H = c.hidden_size;
+  const int64_t I = c.intermediate_size, V = c.vocab_size;
+  const int64_t Hq = vllm_test::kLtxTowerNumHeads;
+  vllm::Gemma4Weights w;
+  w.tie_word_embeddings = true;
+  w.embed_tokens = TowerTensor("language_model.embed_tokens.weight", {V, H}, false);
+  w.final_norm = TowerTensor("language_model.norm.weight", {H}, false);
+  for (int64_t l = 0; l < c.num_hidden_layers; ++l) {
+    const bool full = vllm_test::kLtxTowerLayerIsFull[static_cast<size_t>(l)] != 0;
+    // The two geometries the shipped tower actually mixes.
+    const int64_t Dh = full ? vllm_test::kLtxTowerGlobalHeadDim
+                            : vllm_test::kLtxTowerHeadDim;
+    const int64_t Hkv = full ? vllm_test::kLtxTowerNumGlobalKvHeads
+                             : vllm_test::kLtxTowerNumKvHeads;
+    vllm::Gemma4LayerWeights lw;
+    lw.is_full_attention = full;
+    lw.is_kv_shared = false;
+    lw.kv_target_layer = -1;
+    lw.head_dim = Dh;
+    lw.num_kv_heads = Hkv;
+    // `attention_k_eq_v` is true and the FULL layers are where it bites: they
+    // ship no `v_proj` at all, so V aliases K. Duplicating the K rows is exactly
+    // what gemma4_weights.cpp:289-292 does for that case.
+    lw.k_eq_v = full;
+    const std::string q = TowerParam(l, "self_attn.q_proj.weight");
+    const std::string k = TowerParam(l, "self_attn.k_proj.weight");
+    const std::string v = TowerParam(l, "self_attn.v_proj.weight");
+    lw.attn.qkv_proj =
+        full ? TowerConcatNk({{q, Hq * Dh}, {k, Hkv * Dh}, {k, Hkv * Dh}}, H)
+             : TowerConcatNk({{q, Hq * Dh}, {k, Hkv * Dh}, {v, Hkv * Dh}}, H);
+    lw.attn.o_proj =
+        TowerTensor(TowerParam(l, "self_attn.o_proj.weight"), {H, Hq * Dh}, true);
+    lw.attn.q_norm = TowerTensor(TowerParam(l, "self_attn.q_norm.weight"), {Dh}, false);
+    lw.attn.k_norm = TowerTensor(TowerParam(l, "self_attn.k_norm.weight"), {Dh}, false);
+    lw.mlp.gate_up_proj = TowerConcatNk({{TowerParam(l, "mlp.gate_proj.weight"), I},
+                                         {TowerParam(l, "mlp.up_proj.weight"), I}},
+                                        H);
+    lw.mlp.down_proj = TowerTensor(TowerParam(l, "mlp.down_proj.weight"), {H, I}, true);
+    lw.input_layernorm =
+        TowerTensor(TowerParam(l, "input_layernorm.weight"), {H}, false);
+    lw.post_attention_layernorm =
+        TowerTensor(TowerParam(l, "post_attention_layernorm.weight"), {H}, false);
+    lw.pre_feedforward_layernorm =
+        TowerTensor(TowerParam(l, "pre_feedforward_layernorm.weight"), {H}, false);
+    lw.post_feedforward_layernorm =
+        TowerTensor(TowerParam(l, "post_feedforward_layernorm.weight"), {H}, false);
+    lw.layer_scalar = TowerTensor(TowerParam(l, "layer_scalar"), {1}, false);
+    w.layers.push_back(std::move(lw));
+  }
+  return w;
+}
+
+// A KV pool whose layers do NOT share one geometry. The shipped tower's sliding
+// layers are 8 kv heads x 256 and its full layers 1 x 512, and the runner's
+// single-uniform-head_dim allocation (gemma4.h, G1 HONEST STATUS) is exactly
+// what cannot express that — so the LTX text path builds its own, and so does
+// this gate.
+struct TowerCachePool {
+  std::vector<std::vector<float>> buf;
+  std::vector<vllm::PagedKvCache> attn_kv;
+  TowerCachePool(const vllm::HfConfig& c, int64_t num_blocks, int64_t block_size) {
+    buf.reserve(static_cast<size_t>(c.num_hidden_layers));
+    for (int64_t l = 0; l < c.num_hidden_layers; ++l) {
+      const bool full = vllm_test::kLtxTowerLayerIsFull[static_cast<size_t>(l)] != 0;
+      const int64_t Dh = full ? vllm_test::kLtxTowerGlobalHeadDim
+                              : vllm_test::kLtxTowerHeadDim;
+      const int64_t Hkv = full ? vllm_test::kLtxTowerNumGlobalKvHeads
+                               : vllm_test::kLtxTowerNumKvHeads;
+      buf.emplace_back(
+          static_cast<size_t>(num_blocks * 2 * block_size * Hkv * Dh), 0.0f);
+      vllm::PagedKvCache kv;
+      kv.data = buf.back().data();
+      kv.dtype = vt::DType::kF32;
+      kv.num_blocks = num_blocks;
+      kv.block_size = block_size;
+      kv.num_kv_heads = Hkv;
+      kv.head_size = Dh;
+      attn_kv.push_back(kv);
+    }
+  }
+};
+
+const float* TowerGoldenF32(int64_t state) {
+  static const float* const kStates[] = {
+      vllm_test::kLtxTowerStateF32_0,  vllm_test::kLtxTowerStateF32_1,
+      vllm_test::kLtxTowerStateF32_2,  vllm_test::kLtxTowerStateF32_3,
+      vllm_test::kLtxTowerStateF32_4,  vllm_test::kLtxTowerStateF32_5,
+      vllm_test::kLtxTowerStateF32_6,  vllm_test::kLtxTowerStateF32_7,
+      vllm_test::kLtxTowerStateF32_8,  vllm_test::kLtxTowerStateF32_9,
+      vllm_test::kLtxTowerStateF32_10, vllm_test::kLtxTowerStateF32_11,
+      vllm_test::kLtxTowerStateF32_12,
+  };
+  return kStates[static_cast<size_t>(state)];
+}
+
+const float* TowerGoldenBf16(int64_t state) {
+  static const float* const kStates[] = {
+      vllm_test::kLtxTowerStateBf16_0,  vllm_test::kLtxTowerStateBf16_1,
+      vllm_test::kLtxTowerStateBf16_2,  vllm_test::kLtxTowerStateBf16_3,
+      vllm_test::kLtxTowerStateBf16_4,  vllm_test::kLtxTowerStateBf16_5,
+      vllm_test::kLtxTowerStateBf16_6,  vllm_test::kLtxTowerStateBf16_7,
+      vllm_test::kLtxTowerStateBf16_8,  vllm_test::kLtxTowerStateBf16_9,
+      vllm_test::kLtxTowerStateBf16_10, vllm_test::kLtxTowerStateBf16_11,
+      vllm_test::kLtxTowerStateBf16_12,
+  };
+  return kStates[static_cast<size_t>(state)];
+}
+
+const float* TowerGoldenPadded(int64_t state) {
+  static const float* const kStates[] = {
+      vllm_test::kLtxTowerPaddedStateF32_0,  vllm_test::kLtxTowerPaddedStateF32_1,
+      vllm_test::kLtxTowerPaddedStateF32_2,  vllm_test::kLtxTowerPaddedStateF32_3,
+      vllm_test::kLtxTowerPaddedStateF32_4,  vllm_test::kLtxTowerPaddedStateF32_5,
+      vllm_test::kLtxTowerPaddedStateF32_6,  vllm_test::kLtxTowerPaddedStateF32_7,
+      vllm_test::kLtxTowerPaddedStateF32_8,  vllm_test::kLtxTowerPaddedStateF32_9,
+      vllm_test::kLtxTowerPaddedStateF32_10, vllm_test::kLtxTowerPaddedStateF32_11,
+      vllm_test::kLtxTowerPaddedStateF32_12,
+  };
+  return kStates[static_cast<size_t>(state)];
 }
 
 struct Gemma4CachePool {
@@ -1258,4 +1468,631 @@ TEST_CASE("gemma4 -> ltx2: the captured stack feeds the conditioning path") {
   CHECK_THROWS_AS(
       vllm::Ltx2TextEncoderConditioning(short_stack, mask.data(), w, fcfg),
       std::runtime_error);
+}
+
+// ─────────── the TOWER, against the oracle phase L3 could not run ────────────
+//
+// L3 recorded that this comparison was impossible: the `transformers` on the box
+// had no `gemma4_unified` in CONFIG_MAPPING, so the tower could not be built at
+// reduced dims and there was nothing to compare against. It is possible now, and
+// these cases are the first time `Gemma4Model::ForwardHiddenStates` is held to a
+// RUNNING upstream rather than to invariants derived from its own output.
+//
+// The fixture keeps every geometry the shipped 12B mixes — a (sliding x 5, full)
+// pattern twice over, two head widths, 2 kv heads against 1, `attention_k_eq_v`
+// on the full layers only, two rope types at two thetas — because a fixture with
+// one uniform layer type cannot separate a port that handles both from one that
+// handles the first and applies it twice.
+
+TEST_CASE("gemma4 tower: the config the oracle ran PARSES into HfConfig") {
+  const vllm::HfConfig c = TowerConfig();
+  CHECK(c.hidden_size == vllm_test::kLtxTowerHidden);
+  CHECK(c.num_hidden_layers == vllm_test::kLtxTowerNumLayers);
+  CHECK(c.head_dim == vllm_test::kLtxTowerHeadDim);
+  CHECK(c.num_attention_heads == vllm_test::kLtxTowerNumHeads);
+  CHECK(c.num_key_value_heads == vllm_test::kLtxTowerNumKvHeads);
+  CHECK(c.intermediate_size == vllm_test::kLtxTowerIntermediate);
+  CHECK(c.vocab_size == vllm_test::kLtxTowerVocab);
+  REQUIRE(c.sliding_window.has_value());
+  CHECK(*c.sliding_window == vllm_test::kLtxTowerSlidingWindow);
+
+  // The fields that reach the forward through `raw` and that NO shape encodes.
+  // Each one moves every hidden state while leaving every tensor byte identical,
+  // which is why they are read from the config rather than defaulted.
+  CHECK(c.raw["global_head_dim"] == vllm_test::kLtxTowerGlobalHeadDim);
+  CHECK(c.raw["num_global_key_value_heads"] == vllm_test::kLtxTowerNumGlobalKvHeads);
+  CHECK(c.raw["attention_k_eq_v"] == true);
+  CHECK(c.raw["num_kv_shared_layers"] == 0);
+  CHECK(c.raw["hidden_size_per_layer_input"] == 0);  // no PLE on this tower
+  CHECK(c.raw["tie_word_embeddings"] == true);
+  CHECK(c.raw["enable_moe_block"] == false);
+
+  // `layer_types` is what decides which of the two geometries each layer gets,
+  // and it must agree with the pattern the goldens were produced under.
+  REQUIRE(static_cast<int64_t>(c.layer_types.size()) == vllm_test::kLtxTowerNumLayers);
+  int64_t full_count = 0;
+  for (int64_t l = 0; l < vllm_test::kLtxTowerNumLayers; ++l) {
+    const bool want_full = vllm_test::kLtxTowerLayerIsFull[static_cast<size_t>(l)] != 0;
+    CHECK((c.layer_types[static_cast<size_t>(l)] == "full_attention") == want_full);
+    if (want_full) ++full_count;
+  }
+  // Both kinds are present, so neither branch can be dead in this fixture.
+  CHECK(full_count == 2);
+  CHECK(full_count < vllm_test::kLtxTowerNumLayers);
+
+  // The nested per-layer-type rope: two thetas, and partial rotary on the full
+  // arm only (the shipped config's `rope_parameters`, carried over unreduced).
+  const nlohmann::json& rope = c.raw["rope_parameters"];
+  CHECK(rope["full_attention"]["rope_type"] == "proportional");
+  CHECK(rope["full_attention"]["rope_theta"] == 1000000.0);
+  CHECK(rope["full_attention"]["partial_rotary_factor"] == 0.25);
+  CHECK(rope["sliding_attention"]["rope_type"] == "default");
+  CHECK(rope["sliding_attention"]["rope_theta"] == 10000.0);
+}
+
+TEST_CASE("gemma4 tower: EVERY hidden state matches the RUNNING upstream tower") {
+  const vllm::HfConfig cfg = TowerConfig();
+  const vllm::Gemma4Weights weights = TowerWeights(cfg);
+  const int64_t T = vllm_test::kLtxTowerSeq;
+  const int64_t H = vllm_test::kLtxTowerHidden;
+  const int64_t S = vllm_test::kLtxTowerNumStates;
+
+  std::vector<int32_t> tokens(static_cast<size_t>(T));
+  std::vector<int32_t> positions(static_cast<size_t>(T));
+  for (int64_t t = 0; t < T; ++t) {
+    tokens[static_cast<size_t>(t)] = vllm_test::kLtxTowerTokens[static_cast<size_t>(t)];
+    positions[static_cast<size_t>(t)] = static_cast<int32_t>(t);
+  }
+
+  TowerCachePool pool(cfg, /*num_blocks=*/4, /*block_size=*/8);
+  const vllm::v1::CommonAttentionMetadata meta = PrefillMeta(T, 8);
+  vt::Queue q = Qcpu();
+  const vllm::Gemma4HiddenStatesResult got = vllm::Gemma4Model::ForwardHiddenStates(
+      tokens, positions, meta, pool.attn_kv, weights, cfg, q);
+
+  REQUIRE(static_cast<int64_t>(got.hidden_states.size()) == S);
+
+  // THE TOLERANCE IS A MEASUREMENT, NOT A NUMBER SOMEBODY PICKED.
+  //
+  // Our stream carries bf16 and widens only on the way out (gemma4.h,
+  // Gemma4HiddenStatesResult); bf16 is also upstream's own resolved model dtype
+  // (base_encoder.py:41). So the dtype-MATCHED arm is bf16-vs-bf16, and the
+  // question "is a difference a defect?" has a measurable answer: how much does
+  // UPSTREAM's own answer move when the same upstream code runs at bf16 instead
+  // of f32? That is `kLtxTowerDtypeNoise`, emitted by the generator from the two
+  // oracle runs, and it is the smallest difference this comparison can resolve.
+  //
+  // A port inside it is indistinguishable from upstream at upstream's arithmetic
+  // width. A port outside it has something bf16 rounding does not explain. And
+  // the bound cannot be loosened to rescue a failure, because loosening it means
+  // regenerating it, which means the oracle moved.
+  //
+  // The f32 arm is gated too, at the triangle-inequality bound (our distance to
+  // the bf16 oracle plus the bf16 oracle's distance to the f32 one, so 2x the
+  // floor). A bf16 store is exactly what absorbs a reduction-order defect, so the
+  // wider arm is the one that would show one moving; reporting it without gating
+  // it would be the "report-only is not a result" failure.
+  double worst_bf16_ratio = 0.0;
+  double worst_f32_ratio = 0.0;
+  for (int64_t s = 0; s < S; ++s) {
+    REQUIRE(static_cast<int64_t>(got.hidden_states[static_cast<size_t>(s)].size()) ==
+            T * H);
+    const double d_bf16 = MaxAbsDiff(got.hidden_states[static_cast<size_t>(s)],
+                                     TowerGoldenBf16(s), static_cast<size_t>(T * H));
+    const double d_f32 = MaxAbsDiff(got.hidden_states[static_cast<size_t>(s)],
+                                    TowerGoldenF32(s), static_cast<size_t>(T * H));
+    const double floor =
+        static_cast<double>(vllm_test::kLtxTowerDtypeNoise[static_cast<size_t>(s)]);
+    const double state_scale =
+        static_cast<double>(vllm_test::kLtxTowerStateScale[static_cast<size_t>(s)]);
+    REQUIRE(floor > 0.0);
+    MESSAGE("gemma4 tower state "
+            << static_cast<int>(s) << ": max|diff| vs bf16 oracle = " << d_bf16
+            << " (" << (d_bf16 / floor) << "x the oracle's own f32-vs-bf16 floor "
+            << floor << "), vs f32 oracle = " << d_f32 << ", over max|value| = "
+            << state_scale);
+    CHECK(d_bf16 <= floor);
+    CHECK(d_f32 <= 2.0 * floor);
+    worst_bf16_ratio = std::max(worst_bf16_ratio, d_bf16 / floor);
+    worst_f32_ratio = std::max(worst_f32_ratio, d_f32 / (2.0 * floor));
+  }
+  MESSAGE("gemma4 tower: WORST over all "
+          << static_cast<int>(S) << " states — bf16 arm reached "
+          << worst_bf16_ratio << "x its floor, f32 arm " << worst_f32_ratio
+          << "x its floor (1.0 = at the bound)");
+
+  // The states are not all the same buffer pushed S times — the check every
+  // other assertion here would still pass under.
+  for (int64_t s = 0; s + 1 < S; ++s) {
+    double gap = 0.0;
+    for (size_t i = 0; i < got.hidden_states[static_cast<size_t>(s)].size(); ++i)
+      gap = std::max(gap,
+                     std::abs(static_cast<double>(
+                                  got.hidden_states[static_cast<size_t>(s)][i]) -
+                              static_cast<double>(
+                                  got.hidden_states[static_cast<size_t>(s + 1)][i])));
+    CHECK(gap > 0.0);
+  }
+}
+
+TEST_CASE("gemma4 tower: LEFT PADDING is equivalent to running the valid tokens") {
+  // What this buys, stated because it is the difference between a prompt costing
+  // 1024 tower rows and costing its own length. Upstream pads EVERY prompt to
+  // 1024 (gemma_assets.py:162, base_encoder.py:231-236) and runs all 1024 rows
+  // through a 12B tower. Pads are masked out of attention and sit causally
+  // BEFORE every valid token, so a valid row cannot depend on one; the feature
+  // extractor then zeroes the pad rows anyway (feature_extractor.py:63-64).
+  //
+  // That is an argument, and an argument is not a measurement. Here the oracle
+  // runs the FULL left-padded sequence and our short run's rows are held to its
+  // VALID rows. If the equivalence is ever false — a mask that leaks, a position
+  // that is derived from the mask rather than from the cache position, a sliding
+  // window that counts pads — this is what says so.
+  const vllm::HfConfig cfg = TowerConfig();
+  const vllm::Gemma4Weights weights = TowerWeights(cfg);
+  const int64_t T = vllm_test::kLtxTowerSeq;
+  const int64_t H = vllm_test::kLtxTowerHidden;
+  const int64_t S = vllm_test::kLtxTowerNumStates;
+  const int64_t P = vllm_test::kLtxTowerNumPad;
+  const int64_t PT = vllm_test::kLtxTowerPaddedSeq;
+
+  // The pads are real pad ids in a real left-padded batch, so the fixture is the
+  // layout the tokenizer produces rather than a convenient one.
+  REQUIRE(P > 0);
+  REQUIRE(P + T == PT);
+  for (int64_t i = 0; i < P; ++i) {
+    CHECK(vllm_test::kLtxTowerPaddedTokens[static_cast<size_t>(i)] ==
+          vllm_test::kLtxTowerPadId);
+    CHECK(vllm_test::kLtxTowerPaddedMask[static_cast<size_t>(i)] == 0);
+  }
+
+  // Positions are the ORIGINAL absolute ones — P..P+T-1, not 0..T-1. That is
+  // what transformers does: with no explicit position_ids it uses the cache
+  // position, which counts pad rows (modeling_gemma4_unified.py, the
+  // `cache_position` default), so a port that renumbers from zero after dropping
+  // the pads rotates every query by the wrong angle.
+  std::vector<int32_t> tokens(static_cast<size_t>(T));
+  std::vector<int32_t> positions(static_cast<size_t>(T));
+  for (int64_t t = 0; t < T; ++t) {
+    tokens[static_cast<size_t>(t)] =
+        vllm_test::kLtxTowerPaddedTokens[static_cast<size_t>(P + t)];
+    positions[static_cast<size_t>(t)] = static_cast<int32_t>(P + t);
+  }
+
+  // Only the T VALID tokens are given to the tower, and their KV occupies slots
+  // 0..T-1. The pads get no cache entry at all, which is the point: a run that
+  // declared seq_len = P + T while writing only T keys would have attention read
+  // P slots of zeroes and call them keys — the same wrong answer as attending to
+  // the pads, arrived at by a different route. Measured, when this gate was
+  // first written that way: max|diff| 17.97 against a max|value| of 14.35.
+  TowerCachePool pool(cfg, /*num_blocks=*/4, /*block_size=*/8);
+  const vllm::v1::CommonAttentionMetadata meta = PrefillMeta(T, 8);
+
+  vt::Queue q = Qcpu();
+  const vllm::Gemma4HiddenStatesResult got = vllm::Gemma4Model::ForwardHiddenStates(
+      tokens, positions, meta, pool.attn_kv, weights, cfg, q);
+  REQUIRE(static_cast<int64_t>(got.hidden_states.size()) == S);
+
+  // CLAIM 1, and it is UPSTREAM'S, not ours: dropping the pads is free. The
+  // generator measured it inside the oracle in f32 — the same valid tokens told
+  // their absolute positions, run with and without the pads — so this number
+  // carries no dtype noise at all. Asserting it here keeps the claim from
+  // quietly becoming untrue if the oracle ever moves.
+  double worst_oracle = 0.0;
+  double scale = 0.0;
+  for (int64_t s = 0; s < S; ++s) {
+    worst_oracle = std::max(
+        worst_oracle,
+        static_cast<double>(vllm_test::kLtxTowerPadEquivalence[static_cast<size_t>(s)]));
+    scale = std::max(scale,
+                     static_cast<double>(
+                         vllm_test::kLtxTowerStateScale[static_cast<size_t>(s)]));
+  }
+  MESSAGE("gemma4 tower: UPSTREAM's own padded-vs-short f32 spread = "
+          << worst_oracle << " over max|value| = " << scale << " ("
+          << (worst_oracle / scale) << " relative)");
+  // f32 round-off on values of this magnitude, and nothing more.
+  CHECK(worst_oracle < 1e-5 * scale);
+
+  // CLAIM 2, and this one IS ours: our short run reproduces the padded run's
+  // valid rows. Held to twice the dtype floor, because our stream is bf16 and
+  // the padded golden is f32 — the same triangle bound the parity case uses.
+  double worst = 0.0;
+  double worst_ratio = 0.0;
+  for (int64_t s = 0; s < S; ++s) {
+    const std::vector<float>& mine = got.hidden_states[static_cast<size_t>(s)];
+    REQUIRE(static_cast<int64_t>(mine.size()) == T * H);
+    const float* want = TowerGoldenPadded(s);
+    double d = 0.0;
+    for (int64_t t = 0; t < T; ++t)
+      for (int64_t h = 0; h < H; ++h) {
+        const double w = static_cast<double>(want[static_cast<size_t>((P + t) * H + h)]);
+        const double m = static_cast<double>(mine[static_cast<size_t>(t * H + h)]);
+        d = std::max(d, std::abs(m - w));
+      }
+    const double floor =
+        static_cast<double>(vllm_test::kLtxTowerDtypeNoise[static_cast<size_t>(s)]);
+    REQUIRE(floor > 0.0);
+    CHECK(d <= 2.0 * floor);
+    worst = std::max(worst, d);
+    worst_ratio = std::max(worst_ratio, d / (2.0 * floor));
+  }
+  MESSAGE("gemma4 tower left-pad equivalence: OUR max|diff| over the VALID rows of all "
+          << static_cast<int>(S) << " states = " << worst << ", worst state reached "
+          << worst_ratio << "x its bound");
+}
+
+// ──────────────────── a real prompt becomes real tokens ──────────────────────
+
+namespace {
+
+// The env-gated path to the shipped text encoder. The tokenizer it carries is a
+// 32 MB TENSOR, so this cannot be a committed fixture; the GOLDENS are committed
+// and the asset is opt-in.
+std::string Ltx2TextEncoderPathOrEmpty() {
+  const char* explicit_path = std::getenv("VLLM_CPP_LTX2_TEXT_ENCODER");
+  if (explicit_path != nullptr && *explicit_path != '\0') return explicit_path;
+  const char* root = std::getenv("CHECKPOINT_ROOT");
+  if (root == nullptr || *root == '\0') return {};
+  const fs::path p = fs::path(root) / "ltx-2.5" / "vonkaiser-fp8-nvfp4" /
+                     "text_encoders" / "gemma4-12b-with-proj-nvfp4-torchao.safetensors";
+  std::error_code ec;
+  return fs::exists(p, ec) ? p.string() : std::string();
+}
+
+const int32_t* PromptIds(int64_t i) {
+  static const int32_t* const kIds[] = {
+      vllm_test::kLtxPromptIds_0, vllm_test::kLtxPromptIds_1,
+      vllm_test::kLtxPromptIds_2, vllm_test::kLtxPromptIds_3};
+  return kIds[static_cast<size_t>(i)];
+}
+
+const int32_t* PromptMask(int64_t i) {
+  static const int32_t* const kMask[] = {
+      vllm_test::kLtxPromptMask_0, vllm_test::kLtxPromptMask_1,
+      vllm_test::kLtxPromptMask_2, vllm_test::kLtxPromptMask_3};
+  return kMask[static_cast<size_t>(i)];
+}
+
+}  // namespace
+
+TEST_CASE("ltx2 prompt: the tokenizer WRAPPER, on a fixture that needs no asset") {
+  // A tiny SentencePiece-flavoured tokenizer.json in the shipped tokenizer's own
+  // form — `Replace(" " -> U+2581)` normalizer plus `Split(" ",
+  // MergedWithPrevious)` pre-tokenizer — so the wrapper's behaviour is gated in
+  // CI without the 32 MB tensor. What is checked here is the WRAPPER
+  // (tokenizer.py:31-59); the real vocab is the next case.
+  const std::string tokenizer_json = R"JSON({
+    "version": "1.0",
+    "added_tokens": [
+      {"id": 0, "content": "<pad>", "special": true},
+      {"id": 1, "content": "<eos>", "special": true},
+      {"id": 2, "content": "<bos>", "special": true}
+    ],
+    "normalizer": {"type": "Replace", "pattern": {"String": " "}, "content": "▁"},
+    "pre_tokenizer": {"type": "Split", "pattern": {"String": " "},
+                      "behavior": "MergedWithPrevious", "invert": false},
+    "post_processor": {"type": "TemplateProcessing",
+                       "single": [{"Sequence": {"id": "A", "type_id": 0}}],
+                       "special_tokens": {}},
+    "decoder": {"type": "Sequence", "decoders": [
+      {"type": "Replace", "pattern": {"String": "▁"}, "content": " "},
+      {"type": "ByteFallback"}, {"type": "Fuse"}]},
+    "model": {"type": "BPE", "byte_fallback": true,
+              "vocab": {"<pad>": 0, "<eos>": 1, "<bos>": 2,
+                        "▁a": 3, "▁b": 4, "▁c": 5,
+                        "a": 6, "b": 7, "c": 8, "▁": 9,
+                        "▁ab": 10, "ab": 11},
+              "merges": ["▁ a", "▁ b", "▁ c", "a b", "▁a b"]}
+  })JSON";
+
+  const vllm::tok::Tokenizer tok =
+      vllm::tok::Tokenizer::FromHfJsonBytes(tokenizer_json, "<inline fixture>");
+  const int32_t kBos = 2, kPad = 0;
+  const int64_t kMax = 8;
+
+  SUBCASE("the BOS is PREPENDED and the padding is on the LEFT") {
+    const vllm::Ltx2GemmaPromptTokens t =
+        vllm::Ltx2TokenizeGemmaPrompt(tok, "a b c", kBos, kPad, kMax);
+    REQUIRE(static_cast<int64_t>(t.input_ids.size()) == kMax);
+    REQUIRE(static_cast<int64_t>(t.attention_mask.size()) == kMax);
+    // LEFT padding (base_encoder.py:235): the valid run is the TAIL, and its
+    // first index is the pad count — which is why the caller cannot assume the
+    // prompt starts at position 0.
+    CHECK(t.first_valid == kMax - t.num_valid);
+    CHECK(t.num_valid > 1);
+    CHECK(t.input_ids[static_cast<size_t>(t.first_valid)] == kBos);
+    CHECK_FALSE(t.truncated);
+    for (int64_t i = 0; i < kMax; ++i) {
+      const bool valid = i >= t.first_valid;
+      CHECK(t.attention_mask[static_cast<size_t>(i)] == (valid ? 1 : 0));
+      if (!valid) CHECK(t.input_ids[static_cast<size_t>(i)] == kPad);
+    }
+  }
+
+  SUBCASE("the prompt is STRIPPED before tokenizing") {
+    // tokenizer.py:33, and diffusers strips too (pipeline_ltx2.py:333). Without
+    // it the leading run becomes real metaspace tokens and the prompt differs.
+    const vllm::Ltx2GemmaPromptTokens bare =
+        vllm::Ltx2TokenizeGemmaPrompt(tok, "a b", kBos, kPad, kMax);
+    const vllm::Ltx2GemmaPromptTokens padded =
+        vllm::Ltx2TokenizeGemmaPrompt(tok, "  \n a b \t ", kBos, kPad, kMax);
+    CHECK(bare.num_valid == padded.num_valid);
+    CHECK(bare.input_ids == padded.input_ids);
+    CHECK(bare.attention_mask == padded.attention_mask);
+  }
+
+  SUBCASE("an EMPTY prompt still carries a BOS, and exactly one token") {
+    const vllm::Ltx2GemmaPromptTokens t =
+        vllm::Ltx2TokenizeGemmaPrompt(tok, "   ", kBos, kPad, kMax);
+    CHECK(t.num_valid == 1);
+    CHECK(t.input_ids[static_cast<size_t>(kMax - 1)] == kBos);
+    CHECK(t.attention_mask[static_cast<size_t>(kMax - 1)] == 1);
+  }
+
+  SUBCASE("a BOS already present is NOT doubled") {
+    // Upstream's guard is `if not input_ids or input_ids[0] != bos_id`
+    // (tokenizer.py:44), i.e. conditional. A port that prepends unconditionally
+    // produces two BOS and drops the prompt's last token to fit.
+    const vllm::Ltx2GemmaPromptTokens t =
+        vllm::Ltx2TokenizeGemmaPrompt(tok, "<bos> a b", kBos, kPad, kMax);
+    REQUIRE(t.num_valid >= 2);
+    CHECK(t.input_ids[static_cast<size_t>(t.first_valid)] == kBos);
+    CHECK(t.input_ids[static_cast<size_t>(t.first_valid + 1)] != kBos);
+  }
+
+  SUBCASE("truncation costs the LAST token, never the BOS") {
+    // tokenizer.py:39-46 truncates, prepends, then re-slices, so the BOS wins.
+    const int64_t tiny = 3;
+    const vllm::Ltx2GemmaPromptTokens t =
+        vllm::Ltx2TokenizeGemmaPrompt(tok, "a b c a b c a b c", kBos, kPad, tiny);
+    REQUIRE(static_cast<int64_t>(t.input_ids.size()) == tiny);
+    CHECK(t.num_valid == tiny);
+    CHECK(t.first_valid == 0);
+    CHECK(t.input_ids[0] == kBos);
+    CHECK(t.truncated);
+    for (int64_t i = 0; i < tiny; ++i)
+      CHECK(t.attention_mask[static_cast<size_t>(i)] == 1);
+  }
+
+  SUBCASE("RIGHT padding puts the valid run at the FRONT") {
+    const vllm::Ltx2GemmaPromptTokens t = vllm::Ltx2TokenizeGemmaPrompt(
+        tok, "a b", kBos, kPad, kMax, vllm::Ltx2GemmaPaddingSide::kRight);
+    CHECK(t.first_valid == 0);
+    CHECK(t.input_ids[0] == kBos);
+    CHECK(t.attention_mask[static_cast<size_t>(kMax - 1)] == 0);
+  }
+
+  SUBCASE("a missing BOS id is REFUSED, not defaulted") {
+    CHECK_THROWS_AS(vllm::Ltx2TokenizeGemmaPrompt(tok, "a b", -1, kPad, kMax),
+                    std::runtime_error);
+  }
+}
+
+TEST_CASE("ltx2 prompt: REAL prompts through the SHIPPED 262144-entry vocab") {
+  const std::string path = Ltx2TextEncoderPathOrEmpty();
+  if (path.empty()) {
+    MESSAGE(
+        "SKIPPED: set CHECKPOINT_ROOT (or VLLM_CPP_LTX2_TEXT_ENCODER) to gate the "
+        "real vocab. The tokenizer ships as a 32 MB TENSOR inside the checkpoint, "
+        "so it cannot be a committed fixture; the goldens beside this test are.");
+    return;
+  }
+
+  const vllm::SafetensorsFile file = vllm::SafetensorsFile::Open(path);
+  // require_config=false: the shipped vonkaiser build has NO __metadata__ at all,
+  // which is exactly the case ltx2_text_encoder.h:366-373 records.
+  const vllm::Ltx2GemmaAssets assets = vllm::Ltx2LoadGemmaAssets(file, false);
+  CHECK_FALSE(assets.has_config);
+  REQUIRE(!assets.tokenizer_json.empty());
+
+  const vllm::tok::Tokenizer tok = vllm::tok::Tokenizer::FromHfJsonBytes(
+      std::string_view(reinterpret_cast<const char*>(assets.tokenizer_json.data()),
+                       assets.tokenizer_json.size()),
+      path + "::tokenizer_json");
+
+  // The ids come from the checkpoint's own generation_config, not from a
+  // hardcoded pair, and they must be the ones the goldens were built with.
+  const vllm::Ltx2GemmaSpecialIds ids = vllm::Ltx2ResolveGemmaSpecialIds(assets, tok);
+  CHECK(ids.bos_id == vllm_test::kLtxPromptBosId);
+  CHECK(ids.pad_id == vllm_test::kLtxPromptPadId);
+
+  for (int64_t p = 0; p < vllm_test::kLtxPromptCount; ++p) {
+    const vllm::Ltx2GemmaPromptTokens t = vllm::Ltx2TokenizeGemmaPrompt(
+        tok, vllm_test::kLtxPromptText[p], ids.bos_id, ids.pad_id,
+        vllm_test::kLtxPromptMaxLength);
+    REQUIRE(static_cast<int64_t>(t.input_ids.size()) ==
+            vllm_test::kLtxPromptMaxLength);
+    const int64_t want_valid = vllm_test::kLtxPromptValidCount[static_cast<size_t>(p)];
+    // The count first, because a count mismatch makes every id comparison
+    // meaningless and its message is the readable one.
+    CHECK(t.num_valid == want_valid);
+    int64_t first_bad = -1;
+    for (int64_t i = 0; i < vllm_test::kLtxPromptMaxLength && first_bad < 0; ++i) {
+      if (t.input_ids[static_cast<size_t>(i)] !=
+              PromptIds(p)[static_cast<size_t>(i)] ||
+          t.attention_mask[static_cast<size_t>(i)] !=
+              PromptMask(p)[static_cast<size_t>(i)])
+        first_bad = i;
+    }
+    MESSAGE("ltx2 prompt " << static_cast<int>(p) << " ("
+                           << static_cast<int>(want_valid)
+                           << " valid tokens): first mismatching index = "
+                           << static_cast<int>(first_bad) << " (-1 = EXACT)");
+    // Token ids are EXACT or they are wrong; there is no tolerance here.
+    CHECK(first_bad == -1);
+  }
+}
+
+// ────────────── a real prompt, the real 12B tower, real conditioning ─────────
+//
+// The whole point of phase L10, and the one case that cannot be run from a
+// fixture: 7.4 GB of NVFP4 off the NAS, dequantized to ~24 GB of bf16, a real
+// English sentence tokenized with the embedded 262144-entry vocab, 49 hidden
+// states, both caption projections, and conditioning the DiT's two streams
+// accept. Env-gated on the checkpoint and on an explicit opt-in, because it
+// wants ~33 GB of host memory and minutes of CPU — a gate nobody can run by
+// accident is worse than useless, and one that runs by accident in CI is worse
+// still.
+
+TEST_CASE("ltx2 e2e: a PROMPT drives the real Gemma-4 12B tower to conditioning") {
+  const std::string path = Ltx2TextEncoderPathOrEmpty();
+  if (path.empty() || std::getenv("VLLM_CPP_LTX2_TOWER_E2E") == nullptr) {
+    MESSAGE(
+        "SKIPPED: needs CHECKPOINT_ROOT (or VLLM_CPP_LTX2_TEXT_ENCODER) AND "
+        "VLLM_CPP_LTX2_TOWER_E2E=1. It dequantizes a 12B NVFP4 tower to ~24 GB of "
+        "host bf16 and runs it, so it is opt-in rather than checkpoint-presence "
+        "gated.");
+    return;
+  }
+
+  const vllm::SafetensorsFile file = vllm::SafetensorsFile::Open(path);
+
+  // 1. THE ASSETS. `require_config=false` because the shipped vonkaiser build
+  //    has no `__metadata__` at all — upstream's own `from_single_file` raises
+  //    here (gemma_assets.py:110-114), which is precisely why the Gemma config
+  //    has to be supplied out of band.
+  const vllm::Ltx2GemmaAssets assets = vllm::Ltx2LoadGemmaAssets(file, false);
+  CHECK_FALSE(assets.has_config);
+
+  const vllm::tok::Tokenizer tokenizer = vllm::tok::Tokenizer::FromHfJsonBytes(
+      std::string_view(reinterpret_cast<const char*>(assets.tokenizer_json.data()),
+                       assets.tokenizer_json.size()),
+      path + "::tokenizer_json");
+  const vllm::Ltx2GemmaSpecialIds ids =
+      vllm::Ltx2ResolveGemmaSpecialIds(assets, tokenizer);
+
+  // 2. THE CONFIG, out of band and committed with its provenance: it is the
+  //    `__metadata__["gemma_config"]` of the OFFICIAL bf16 text encoder.
+  const fs::path config_path =
+      fs::path(__FILE__).parent_path() / "ltx2_gemma4_text_config.json";
+  std::ifstream cfg_in(config_path);
+  REQUIRE(cfg_in.good());
+  const nlohmann::json gemma_config = nlohmann::json::parse(cfg_in);
+  CHECK(gemma_config["gemma_version"] == "gemma4-12b-ltx-v1");
+
+  // 3. THE TOWER. This is the ~24 GB step.
+  const vllm::Ltx2GemmaTower tower =
+      vllm::Ltx2LoadGemmaTowerFromSafetensors(file, gemma_config);
+  CHECK(tower.config.hidden_size == 3840);
+  CHECK(tower.config.num_hidden_layers == 48);
+  CHECK(tower.config.vocab_size == 262144);
+  CHECK(static_cast<int64_t>(tower.weights.layers.size()) == 48);
+  // Every one of the 337 quantized modules on the text path arrived NVFP4 and
+  // was dequantized — a tower that silently found bf16 tensors instead would be
+  // a different checkpoint.
+  MESSAGE("ltx2 e2e: dequantized " << tower.dequantized_modules.size()
+                                   << " torchao-NVFP4 modules");
+  CHECK(tower.dequantized_modules.size() > 300);
+
+  // The mixed geometry, READ BACK off what was actually built rather than off
+  // the config that asked for it.
+  int64_t full_layers = 0;
+  for (const vllm::Gemma4LayerWeights& lw : tower.weights.layers) {
+    if (lw.is_full_attention) {
+      ++full_layers;
+      CHECK(lw.head_dim == 512);
+      CHECK(lw.num_kv_heads == 1);
+      CHECK(lw.k_eq_v);  // no v_proj: V aliases K
+      CHECK(lw.attn.qkv_proj.shape[0] == 16 * 512 + 2 * 1 * 512);
+    } else {
+      CHECK(lw.head_dim == 256);
+      CHECK(lw.num_kv_heads == 8);
+      CHECK_FALSE(lw.k_eq_v);
+      CHECK(lw.attn.qkv_proj.shape[0] == 16 * 256 + 2 * 8 * 256);
+    }
+    CHECK(lw.attn.qkv_proj.shape[1] == 3840);
+    CHECK(lw.mlp.gate_up_proj.shape[0] == 2 * 15360);
+  }
+  CHECK(full_layers == 8);
+
+  // 4. THE CAPTION PROJECTIONS and the V1/V2 selection.
+  const vllm::Ltx2TextEncoderCheckpoint te =
+      vllm::Ltx2LoadTextEncoderFromSafetensors(file);
+  CHECK(te.gemma_hidden_size == 3840);
+  CHECK(te.gemma_num_hidden_layers == 48);
+  CHECK(te.video.out_features == 4096);
+  CHECK(te.audio.out_features == 2048);
+  // 188160 = 3840 x 49 — the width §1.4 had to correct once, confirmed here off
+  // the file rather than off the spec.
+  CHECK(te.video.in_features == 3840 * 49);
+  CHECK(te.audio.in_features == 3840 * 49);
+
+  vllm::Ltx2TextFeatureConfig fcfg;
+  fcfg.variant = vllm::Ltx2TextNormVariant::kPerTokenRmsV2;
+  fcfg.embedding_dim = te.gemma_hidden_size;
+  fcfg.num_layers = te.gemma_num_hidden_layers + 1;
+  fcfg.video_out_features = te.video.out_features;
+  fcfg.audio_out_features = te.audio.out_features;
+  fcfg.aggregate_bias = true;  // V2: both Linears carry one (encoder_configurator.py:206-208)
+  const vllm::Ltx2TextEncoderWeights proj = vllm::Ltx2WidenTextProjectionsToF32(te);
+  REQUIRE(!proj.video.bias.empty());
+  REQUIRE(!proj.audio.bias.empty());
+
+  // 5. THE PROMPT.
+  const std::string prompt = "a red fox running through deep snow at sunrise";
+  vt::Queue q = Qcpu();
+  const vllm::Ltx2PromptConditioning out = vllm::Ltx2EncodePromptToConditioning(
+      tower, tokenizer, ids, proj, fcfg, prompt, q);
+
+  // The tokens: the same 10 the HF oracle produced for this exact prompt.
+  CHECK(out.tokens.num_valid == vllm_test::kLtxPromptValidCount[0]);
+  CHECK(out.seq == vllm_test::kLtxPromptMaxLength);
+  for (int64_t i = 0; i < out.seq; ++i)
+    CHECK(out.tokens.input_ids[static_cast<size_t>(i)] ==
+          vllm_test::kLtxPromptIds_0[static_cast<size_t>(i)]);
+
+  // The conditioning: two streams at the two widths the DiT cross-attends over.
+  REQUIRE(out.conditioning.video.size() ==
+          static_cast<size_t>(out.seq * fcfg.video_out_features));
+  REQUIRE(out.conditioning.audio.size() ==
+          static_cast<size_t>(out.seq * fcfg.audio_out_features));
+  REQUIRE(out.conditioning.additive_mask.size() == static_cast<size_t>(out.seq));
+  REQUIRE(out.conditioning.sort_index.size() == static_cast<size_t>(out.seq));
+
+  double vmax = 0.0, amax = 0.0, vsum = 0.0;
+  for (float x : out.conditioning.video) {
+    REQUIRE(std::isfinite(x));
+    vmax = std::max(vmax, std::abs(static_cast<double>(x)));
+    vsum += std::abs(static_cast<double>(x));
+  }
+  for (float x : out.conditioning.audio) {
+    REQUIRE(std::isfinite(x));
+    amax = std::max(amax, std::abs(static_cast<double>(x)));
+  }
+  MESSAGE("ltx2 e2e: prompt \"" << prompt << "\" -> " << out.tokens.num_valid
+                                << " tokens -> video ["
+                                << out.seq << ", " << fcfg.video_out_features
+                                << "] max|v| = " << vmax << " mean|v| = "
+                                << (vsum / static_cast<double>(out.conditioning.video.size()))
+                                << ", audio [" << out.seq << ", "
+                                << fcfg.audio_out_features << "] max|v| = " << amax);
+  // VALUES, not just isfinite: a conditioning tensor that reduced to zeros would
+  // satisfy every shape and finiteness check above and render an unconditioned
+  // clip. §7.0(3) — a golden reduced to `isfinite` once hid a 23842x error.
+  CHECK(vmax > 1e-3);
+  CHECK(amax > 1e-3);
+
+  // The RIGHT-PAD REORDER put the valid tokens at the FRONT. Upstream's
+  // connector assumes right-padded input (embeddings_processor.py:82-92) while
+  // the tokenizer LEFT-pads, so this reordering is load-bearing: without it every
+  // valid token would sit behind 1014 pad rows.
+  for (int64_t i = 0; i < out.tokens.num_valid; ++i)
+    CHECK(out.conditioning.sort_index[static_cast<size_t>(i)] ==
+          static_cast<int32_t>(out.tokens.first_valid + i));
+
+  // A DIFFERENT prompt must produce DIFFERENT conditioning. Without this the
+  // whole case would pass for a tower that ignored its input entirely — which is
+  // exactly the failure "the model advertises text-to-video and we cannot type
+  // text" would become if it were fixed carelessly.
+  const vllm::Ltx2PromptConditioning other = vllm::Ltx2EncodePromptToConditioning(
+      tower, tokenizer, ids, proj, fcfg, "a blue whale diving under thick pack ice",
+      q, vllm_test::kLtxPromptMaxLength);
+  REQUIRE(other.conditioning.video.size() == out.conditioning.video.size());
+  double gap = 0.0;
+  for (size_t i = 0; i < out.conditioning.video.size(); ++i)
+    gap = std::max(gap, std::abs(static_cast<double>(out.conditioning.video[i]) -
+                                 static_cast<double>(other.conditioning.video[i])));
+  MESSAGE("ltx2 e2e: two different prompts differ by max|diff| = " << gap);
+  CHECK(gap > 1e-3);
 }

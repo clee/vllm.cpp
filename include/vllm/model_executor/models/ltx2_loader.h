@@ -101,7 +101,14 @@
 // ─── WHAT THE SHIPPED DiT CARRIES THAT PHASE L2 DOES NOT PORT ────────────────
 //
 // MEASURED 2026-08-12 from the FP8 checkpoint's own header, and reported rather
-// than absorbed. The file carries four families outside the L2 contract:
+// than absorbed. The file carries four families outside the L2 contract, and
+// they fall into TWO groups that this comment used to conflate — corrected
+// 2026-08-13, because the conflation is what made a downstream refusal state
+// something untrue about the tree for a whole phase.
+//
+// UNPORTED. `Ltx2LoadDitFromSafetensors` REFUSES the load by naming these, and
+// only an explicit `allow_unported_modules` — which exists so the ported subset
+// stays gateable — proceeds, still reporting every one of them in `unported`:
 //
 //   prompt_adaln_single.*, audio_prompt_adaln_single.*
 //       Upstream builds these only when `cross_attention_adaln AND
@@ -112,15 +119,25 @@
 //       modulation carries no timestep term.
 //   keyframes_abs_pos_embedding  [1, 4096]
 //       So `use_keyframes_abs_pos_embedding = TRUE`, contradicting ltx2.h:47-49.
-//   video_embeddings_connector.*, audio_embeddings_connector.*
-//       8 `transformer_1d_blocks` and a `learnable_registers` [128, dim] each —
-//       the `Embeddings1DConnector` ltx2_text_encoder.h:319-324 already records
-//       as owed.
 //
-// None of these is silently dropped. `Ltx2LoadDitFromSafetensors` REFUSES the
-// load by naming them, and only an explicit `allow_unported_modules` — which
-// exists so the ported subset stays gateable — proceeds, still reporting every
-// one of them in `unported`.
+// LOADED ELSEWHERE — NOT UNPORTED, and never named in that refusal:
+//
+//   video_embeddings_connector.*, audio_embeddings_connector.*
+//       8 `transformer_1d_blocks` and a `learnable_registers` [128, dim] each.
+//       They sit OUTSIDE the DiT contract by design, because upstream loads them
+//       into the TEXT ENCODER's `EmbeddingsProcessor` through
+//       `EMBEDDINGS_PROCESSOR_KEY_OPS` (encoder_configurator.py:331-346), and
+//       phase L9c materializes them here through `Ltx2LoadConnectorWeights`,
+//       which the video engine calls on the render path. `LoadedElsewhere`
+//       (ltx2_loader.cpp:417-428) is the code that says so.
+//
+// This paragraph previously listed the connector families among the refused
+// ones, citing `ltx2_text_encoder.h`'s "records as owed" note, and phase L10's
+// `encoder_path` refusal cited THIS comment as its evidence that the last hop
+// could not be taken. By then it was false on both counts: the weights load, and
+// the hop is taken (phase L13). Recorded rather than quietly edited, because a
+// refusal whose REASON goes stale is the recurring defect of this campaign and
+// this is the third instance.
 #pragma once
 
 #include <cstdint>

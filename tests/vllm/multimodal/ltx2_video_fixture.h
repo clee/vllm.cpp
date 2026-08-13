@@ -146,12 +146,24 @@ inline uint8_t F32ToE4M3(float v) {
                               static_cast<uint8_t>(frac));
 }
 
-// ── a safetensors writer that can emit three dtypes ────────────────────────
+// ── a safetensors writer that can emit four dtypes ─────────────────────────
+//
+// "U8" is the ONE that does not go through `values`: it writes `raw` verbatim.
+// The text encoder needs it for three things a float stream cannot express —
+// NVFP4-packed projection weights (two 4-bit values per byte), the
+// `torchao_nvfp4` marker's JSON payload, and the embedded tokenizer/asset pack,
+// which the shipped file stores AS TENSORS (ltx2_text_encoder.h:336-346).
 struct Entry {
   std::string name;
-  std::string dtype;  // "F32" | "BF16" | "F8_E4M3"
+  std::string dtype;  // "F32" | "BF16" | "F8_E4M3" | "U8"
   std::vector<int64_t> shape;
   std::vector<float> values;
+  // "U8" only. A default member initializer rather than a bare declaration
+  // because every existing brace-initializer in this file supplies four fields,
+  // and `-Wmissing-field-initializers` is an ERROR here: an NSDMI is what makes
+  // the field genuinely optional instead of demanding a `{}` at 30 call sites
+  // that have nothing to do with the text encoder.
+  std::string raw = {};
 };
 
 inline void WriteFileBytes(const std::string& path, const std::string& bytes) {
@@ -173,7 +185,15 @@ inline void WriteSafetensors(const std::vector<Entry>& entries, const std::strin
   std::string payload;
   for (const Entry& e : entries) {
     size_t bytes = 0;
-    if (e.dtype == "F32") {
+    // `raw` is "these bytes are already encoded", and it wins over `values` for
+    // ANY dtype rather than only for U8. The text encoder needs exactly that for
+    // its `weight_scale`: the tensor is F8_E4M3, but its bytes are a SWIZZLED
+    // permutation of E4M3 codes, so they cannot be produced by encoding a float
+    // stream element-wise the way every other F8_E4M3 entry here is.
+    if (!e.raw.empty()) {
+      bytes = e.raw.size();
+      payload += e.raw;
+    } else if (e.dtype == "F32") {
       bytes = e.values.size() * sizeof(float);
       const size_t at = payload.size();
       payload.resize(at + bytes);
@@ -310,7 +330,50 @@ inline nlohmann::json ReducedDitTransformerConfig(
   transformer["av_cross_ada_norm"] = true;
   // The 22B form: the caption projections live in the TEXT ENCODER, not in the
   // DiT (model_configurator.py:199-219). LTX-2.5 is that form.
+  //
+  // ALL FOUR of `Ltx2SelectTextFeatureVariant`'s markers, not just the first.
+  // Upstream selects V1 vs V2 from the presence AND the exact values of the set
+  // (encoder_configurator.py:163-209), and a PARTIAL set is refused as config
+  // drift rather than resolved either way. An earlier revision of this fixture
+  // carried only `caption_proj_before_connector`, which is the partial case —
+  // `Ltx2SelectTextFeatureVariant` REFUSES it (ltx2_text_encoder.cpp:184-192).
+  // The reason that refusal never fired is NOT that the partial set gated
+  // nothing: it is that no production path CALLED the selector before L13. The
+  // four marker keys and the engine's first call to the selector landed in the
+  // same commit, so there was no earlier run for the partial set to refuse.
+  //
+  // THE OBSERVED HEADER, recorded so the next reader does not need the 18.72 GB
+  // checkpoint mounted to check these four values. Read 2026-08-13 from the
+  // safetensors `__metadata__` of the first-party NVFP4 DiT — header JSON only,
+  // no tensor data:
+  //
+  //   /mnt/nas_share/checkpoints/ltx-2.5/lightricks-ltx-2.5/diffusion_models/
+  //       ltx-2.5-22b-distilled-transformer-nvfp4.safetensors
+  //   18,721,432,024 bytes; `Lightricks/LTX-2.5` revision
+  //   8a4ff96f581e72bedc1b44367581c49d544a05f1 (HF download record; the LFS oid
+  //   is the upstream sha256 and was NOT re-verified locally).
+  //
+  //   __metadata__["config"]["transformer"]:
+  //       caption_proj_before_connector     true
+  //       caption_projection_first_linear   false
+  //       caption_proj_input_norm           false
+  //       caption_projection_second_linear  false
+  //       num_attention_heads 32, attention_head_dim 128        -> video 4096
+  //       audio_num_attention_heads 32, audio_attention_head_dim 64 -> audio 2048
+  //       text_encoder_norm_type "PER_TOKEN_RMS", model_version "2.5.0"
+  //
+  // So this checkpoint resolves to V2 with no key missing and no value drifted.
+  // `text_encoder_norm_type` independently corroborates that, and the selector
+  // deliberately does NOT read it — it mirrors upstream's four-marker test.
+  //
+  // The vonkaiser FP8 DiT that the render arms actually load carries NO
+  // `__metadata__` block at all, so this first-party file is the only on-disk
+  // source for these four values. The four below are READ from it, not assumed
+  // from the class defaults.
   transformer["caption_proj_before_connector"] = true;
+  transformer["caption_projection_first_linear"] = false;
+  transformer["caption_proj_input_norm"] = false;
+  transformer["caption_projection_second_linear"] = false;
   // The values the SHAPES cannot see, which is why the engine reads this config
   // at all — they are the shipped ones.
   transformer["norm_eps"] = 1e-6;
@@ -853,6 +916,312 @@ inline void WriteReducedUpsampler(const vllm::Ltx2UpsamplerConfig& cfg, const st
   WriteSafetensors(entries, metadata.dump(), path);
 }
 
+// ── the Gemma-4 TEXT ENCODER (phase L13) ───────────────────────────────────
+//
+// The shipped `vonkaiser/LTX-2.5-FP8-NVFP4` text encoder is ONE safetensors file
+// carrying four separable things, and this writes all four in their shipped
+// forms because the engine reads all four:
+//
+//   1. the Gemma-4 tower  `model.embed_tokens`, `model.norm`, `model.layers.{i}.*`
+//   2. the two caption projections `text_embedding_projection.*_aggregate_embed`
+//   3. the embedded tokenizer/asset pack, stored AS TENSORS
+//   4. NO `__metadata__` at all — which is why the Gemma config is an INPUT
+//
+// TWO dtype rules, both measured from the shipped file rather than chosen:
+//
+//   * the TOWER may be BF16 (`Ltx2LoadGemmaTowerFromSafetensors` takes either
+//     form), so the fixture writes it BF16 — the NVFP4 tower arm is gated
+//     against the SHIPPED checkpoint in tests/vllm/models/test_ltx2_text_encoder.cpp
+//     and duplicating it here would gate the same dequant twice.
+//   * the PROJECTIONS have no BF16 form at all: `LoadProjection`
+//     (ltx2_loader.cpp:583-623) requires `weight_scale` + `weight_scale_2` and
+//     goes through `Ltx2DequantTorchaoNvfp4ToBf16` unconditionally. So they are
+//     written torchao-NVFP4, swizzled, with a marker — anything else does not
+//     load, and a fixture that dodged that would gate a file shape no shipped
+//     checkpoint is in.
+
+// e2m1 -> the byte pairs `DequantNvfp4ToBf16` reads. Deterministic per NAME, in
+// the same shape every fixture in this tree uses.
+inline std::string Nvfp4PackedBytes(const std::string& name, size_t count) {
+  uint64_t state = Fnv1a(name);
+  std::string out;
+  out.reserve(count);
+  for (size_t i = 0; i < count; ++i) {
+    state += 0x9E3779B97F4A7C15ULL;
+    uint64_t z = state;
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
+    z ^= z >> 31;
+    // Every one of the 256 byte values is a pair of VALID e2m1 codes — the
+    // format has no NaN and no infinity — so unlike the E4M3 scale below this
+    // needs no exclusion.
+    out.push_back(static_cast<char>(static_cast<uint8_t>(z & 0xFFU)));
+  }
+  return out;
+}
+
+// The E4M3 group scales, LINEAR [rows, groups], before the swizzle. Confined to
+// 0x30..0x3F, i.e. [0.5, 1.875): E4M3's only NaNs are 0x7F/0xFF, and a scale of
+// 448 against an e2m1 6.0 would put the fixture's weights four orders above the
+// DiT's — finite, and nothing like a checkpoint.
+inline std::vector<uint8_t> Nvfp4LinearScale(const std::string& name, size_t count) {
+  uint64_t state = Fnv1a(name);
+  std::vector<uint8_t> out(count);
+  for (size_t i = 0; i < count; ++i) {
+    state += 0x9E3779B97F4A7C15ULL;
+    uint64_t z = state;
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
+    z ^= z >> 31;
+    out[i] = static_cast<uint8_t>(0x30U | static_cast<uint8_t>(z & 0x0FU));
+  }
+  return out;
+}
+
+// The FORWARD cuBLAS block-scale swizzle, PADDED — the inverse of
+// `Ltx2UnswizzleNvfp4BlockScale` (ltx2_loader.h:160-176), transcribed from the
+// same source it cites (vLLM `qutlass_utils.py:177-179`).
+//
+// The padding is the part that is NOT optional here and IS optional in
+// tests/vllm/models/test_ltx2_loader.cpp's copy, which `REQUIRE`s rows % 128 == 0.
+// A reduced fixture's projection is 16 and 8 rows wide, so it never satisfies
+// that; the loader nonetheless demands the buffer be exactly
+// round_up(rows,128) * round_up(cols,4) bytes, and the pad rows are never read.
+inline std::string SwizzleBlockScalePadded(const std::vector<uint8_t>& linear, int64_t rows,
+                                           int64_t cols) {
+  const int64_t rows_padded = ((rows + 127) / 128) * 128;
+  const int64_t cols_padded = ((cols + 3) / 4) * 4;
+  const int64_t ctiles = cols_padded / 4;
+  std::string out(static_cast<size_t>(rows_padded * cols_padded), '\0');
+  for (int64_t r = 0; r < rows; ++r) {
+    for (int64_t c = 0; c < cols; ++c) {
+      const int64_t rt = r / 128, rem = r % 128, a = rem / 32, s = rem % 32;
+      const int64_t ct = c / 4, q = c % 4;
+      out[static_cast<size_t>(((((rt * ctiles) + ct) * 32 + s) * 4 + a) * 4 + q)] =
+          static_cast<char>(linear[static_cast<size_t>(r * cols + c)]);
+    }
+  }
+  return out;
+}
+
+// The `__metadata__`-less shipped encoder's geometry, reduced. `heads`/`head_dim`
+// and their `global_*` twins are separate on purpose: the shipped tower's full
+// layers are 512-wide with ONE kv head against the sliding layers' 256 and 8, and
+// a fixture with one uniform geometry would never bind that split.
+struct ReducedTextEncoderOptions {
+  int64_t hidden = 64;
+  int64_t layers = 3;
+  int64_t heads = 4;
+  int64_t head_dim = 16;         // the SLIDING layers
+  int64_t kv_heads = 2;          // the SLIDING layers
+  int64_t global_head_dim = 32;  // the FULL layers
+  int64_t global_kv_heads = 1;   // the FULL layers
+  int64_t intermediate = 128;
+  int64_t vocab = 16;  // >= every id ReducedTokenizerJson can emit
+  // Seeds the tower's own parameter stream. A second value writes a DIFFERENT
+  // tower into an otherwise identically shaped file, which is how a test proves
+  // the render actually READS these weights.
+  std::string tag = "a";
+  // The shipped `vonkaiser` build carries NO `__metadata__`, so this defaults
+  // false and the Gemma config has to come through the engine's own extra —
+  // exactly the shape the real checkpoint puts a caller in.
+  bool declare_gemma_config = false;
+};
+
+// The Gemma-4 config, in the OFFICIAL bf16 encoder's `__metadata__["gemma_config"]`
+// shape (tests/vllm/models/ltx2_gemma4_text_config.json), reduced. `layer_types`
+// carries one `full_attention` so the mixed geometry above is actually bound.
+inline nlohmann::json ReducedGemmaConfig(const ReducedTextEncoderOptions& o) {
+  nlohmann::json text;
+  text["model_type"] = "gemma4_unified_text";
+  text["hidden_size"] = o.hidden;
+  text["num_hidden_layers"] = o.layers;
+  text["num_attention_heads"] = o.heads;
+  text["num_key_value_heads"] = o.kv_heads;
+  text["head_dim"] = o.head_dim;
+  text["global_head_dim"] = o.global_head_dim;
+  text["num_global_key_value_heads"] = o.global_kv_heads;
+  text["intermediate_size"] = o.intermediate;
+  text["vocab_size"] = o.vocab;
+  text["rms_norm_eps"] = 1e-6;
+  text["sliding_window"] = 8;
+  text["hidden_size_per_layer_input"] = 0;
+  text["num_kv_shared_layers"] = 0;
+  // The shipped tower's full layers alias V onto K and ship no `v_proj`
+  // (ltx2_text_encoder.h:485-486). Declared here AND expressed in the tensor set
+  // below, because the loader cross-checks the two against each other.
+  text["attention_k_eq_v"] = true;
+  text["tie_word_embeddings"] = true;
+  std::vector<std::string> types;
+  for (int64_t l = 0; l < o.layers; ++l) {
+    types.push_back(l + 1 == o.layers ? "full_attention" : "sliding_attention");
+  }
+  text["layer_types"] = types;
+  nlohmann::json rope;
+  rope["sliding_attention"] = {{"rope_type", "default"}, {"rope_theta", 10000.0}};
+  rope["full_attention"] = {
+      {"rope_type", "default"}, {"rope_theta", 1000000.0}, {"partial_rotary_factor", 0.25}};
+  text["rope_parameters"] = rope;
+
+  nlohmann::json doc;
+  doc["model_type"] = "gemma4_unified";
+  doc["architectures"] = std::vector<std::string>{"Gemma4UnifiedForConditionalGeneration"};
+  doc["gemma_version"] = "gemma4-ltx-fixture";
+  doc["tie_word_embeddings"] = true;
+  doc["text_config"] = text;
+  return doc;
+}
+
+// A tiny SentencePiece-flavoured `tokenizer.json` in the SHIPPED tokenizer's own
+// form — `Replace(" " -> U+2581)` normalizer, `Split(" ", MergedWithPrevious)`
+// pre-tokenizer, an EMPTY `post_processor.special_tokens` map (measured on the
+// shipped file: it adds nothing, which is why `ltx_core` prepends BOS itself).
+// Written independently of the one in test_ltx2_text_encoder.cpp rather than
+// shared: it is the INPUT to a different gate, and this file's header records
+// why two independent statements beat one helper called twice.
+inline std::string ReducedTokenizerJson() {
+  return R"JSON({
+    "version": "1.0",
+    "added_tokens": [
+      {"id": 0, "content": "<pad>", "special": true},
+      {"id": 1, "content": "<eos>", "special": true},
+      {"id": 2, "content": "<bos>", "special": true}
+    ],
+    "normalizer": {"type": "Replace", "pattern": {"String": " "}, "content": "▁"},
+    "pre_tokenizer": {"type": "Split", "pattern": {"String": " "},
+                      "behavior": "MergedWithPrevious", "invert": false},
+    "post_processor": {"type": "TemplateProcessing",
+                       "single": [{"Sequence": {"id": "A", "type_id": 0}}],
+                       "special_tokens": {}},
+    "decoder": {"type": "Sequence", "decoders": [
+      {"type": "Replace", "pattern": {"String": "▁"}, "content": " "},
+      {"type": "ByteFallback"}, {"type": "Fuse"}]},
+    "model": {"type": "BPE", "byte_fallback": true,
+              "vocab": {"<pad>": 0, "<eos>": 1, "<bos>": 2,
+                        "▁a": 3, "▁b": 4, "▁c": 5,
+                        "a": 6, "b": 7, "c": 8, "▁": 9,
+                        "▁ab": 10, "ab": 11},
+              "merges": ["▁ a", "▁ b", "▁ c", "a b", "▁a b"]}
+  })JSON";
+}
+
+// The reduced text encoder. `dit` supplies the two projection WIDTHS, because
+// `Ltx2SelectTextFeatureVariant` resolves them from the DiT's own
+// `num_attention_heads * attention_head_dim` (encoder_configurator.py:203-209) —
+// so a fixture that picked its own would write a file the engine then refuses.
+inline void WriteReducedTextEncoder(const vllm::Ltx2DitParams& dit, const std::string& path,
+                                    const ReducedTextEncoderOptions& o =
+                                        ReducedTextEncoderOptions{}) {
+  std::vector<Entry> entries;
+  const std::string seed = "ltx2.te." + o.tag + ".";
+  auto bf16 = [&](const std::string& name, const std::vector<int64_t>& shape, double scale,
+                  double offset = 0.0) {
+    int64_t numel = 1;
+    for (const int64_t d : shape) numel *= d;
+    entries.push_back({name, "BF16", shape, Param(seed + name, numel, scale, offset), {}});
+  };
+
+  // 1. THE TOWER, bf16.
+  bf16("model.embed_tokens.weight", {o.vocab, o.hidden}, 0.1);
+  bf16("model.norm.weight", {o.hidden}, 0.1, 1.0);
+  for (int64_t l = 0; l < o.layers; ++l) {
+    const std::string b = "model.layers." + std::to_string(l) + ".";
+    const bool full = l + 1 == o.layers;
+    const int64_t dh = full ? o.global_head_dim : o.head_dim;
+    const int64_t kv = full ? o.global_kv_heads : o.kv_heads;
+    bf16(b + "self_attn.q_proj.weight", {o.heads * dh, o.hidden}, 0.1);
+    bf16(b + "self_attn.k_proj.weight", {kv * dh, o.hidden}, 0.1);
+    // The FULL layer ships NO `v_proj` — that is what `attention_k_eq_v` MEANS,
+    // and the loader refuses an absent one that the config does not declare.
+    if (!full) bf16(b + "self_attn.v_proj.weight", {kv * dh, o.hidden}, 0.1);
+    bf16(b + "self_attn.o_proj.weight", {o.hidden, o.heads * dh}, 0.1);
+    bf16(b + "self_attn.q_norm.weight", {dh}, 0.1, 1.0);
+    bf16(b + "self_attn.k_norm.weight", {dh}, 0.1, 1.0);
+    bf16(b + "mlp.gate_proj.weight", {o.intermediate, o.hidden}, 0.1);
+    bf16(b + "mlp.up_proj.weight", {o.intermediate, o.hidden}, 0.1);
+    bf16(b + "mlp.down_proj.weight", {o.hidden, o.intermediate}, 0.1);
+    bf16(b + "input_layernorm.weight", {o.hidden}, 0.1, 1.0);
+    bf16(b + "post_attention_layernorm.weight", {o.hidden}, 0.1, 1.0);
+    bf16(b + "pre_feedforward_layernorm.weight", {o.hidden}, 0.1, 1.0);
+    bf16(b + "post_feedforward_layernorm.weight", {o.hidden}, 0.1, 1.0);
+    bf16(b + "layer_scalar", {1}, 0.1, 1.0);
+  }
+
+  // 2. THE TWO CAPTION PROJECTIONS, torchao-NVFP4, at the DiT's own widths.
+  const int64_t in_features = o.hidden * (o.layers + 1);
+  const int64_t groups = in_features / 16;
+  const char* marker =
+      R"({"format": "torchao_nvfp4", "block_size": 16, "scope": "full", )"
+      R"("config": "NVFP4DynamicActivationNVFP4WeightConfig", "is_swizzled_scales": true, )"
+      R"("use_triton_kernel": true, "use_dynamic_activation": true, )"
+      R"("use_dynamic_per_tensor_scale": true})";
+  struct Projection {
+    const char* module;
+    int64_t out;
+  };
+  const Projection projections[] = {
+      {"text_embedding_projection.video_aggregate_embed", dit.cross_attention_dim},
+      {"text_embedding_projection.audio_aggregate_embed", dit.audio_cross_attention_dim},
+  };
+  for (const Projection& p : projections) {
+    const std::string m = p.module;
+    entries.push_back({m + ".weight",
+                       "U8",
+                       {p.out, in_features / 2},
+                       {},
+                       Nvfp4PackedBytes(seed + m + ".w",
+                                        static_cast<size_t>(p.out * in_features / 2))});
+    entries.push_back(
+        {m + ".weight_scale",
+         "F8_E4M3",
+         {((p.out + 127) / 128) * 128 / 4, ((groups + 3) / 4) * 4 * 4},
+         {},
+         SwizzleBlockScalePadded(
+             Nvfp4LinearScale(seed + m + ".s", static_cast<size_t>(p.out * groups)), p.out,
+             groups)});
+    const float scale_2 = 0.0078125F;  // 2^-7 — see Nvfp4LinearScale on magnitude
+    entries.push_back({m + ".weight_scale_2", "F32", {}, {scale_2}, {}});
+    entries.push_back({m + ".torchao_nvfp4",
+                       "U8",
+                       {static_cast<int64_t>(std::strlen(marker))},
+                       {},
+                       std::string(marker)});
+    // V2 declares `aggregate_bias = true`, and the bias is BF16 on its own
+    // unpack path — the exact split `RequireDeclaredProjection` refuses a loader
+    // for getting half right.
+    bf16(m + ".bias", {p.out}, 0.05);
+  }
+
+  // 3. THE ASSET PACK, stored as tensors. `tokenizer_config.json` and
+  //    `processor_config.json` are REQUIRED (gemma_assets.py:38-41);
+  //    `generation_config.json` is not, and is what states the two ids.
+  auto raw = [&](const std::string& name, const std::string& bytes) {
+    entries.push_back(
+        {name, "U8", {static_cast<int64_t>(bytes.size())}, {}, bytes});
+  };
+  raw("tokenizer_json", ReducedTokenizerJson());
+  raw("hf_asset__tokenizer_config.json", R"({"tokenizer_class":"PreTrainedTokenizerFast"})");
+  raw("hf_asset__processor_config.json", R"({"processor_class":"Gemma4Processor"})");
+  raw("hf_asset__generation_config.json", R"({"bos_token_id":2,"pad_token_id":0})");
+
+  // 4. `__metadata__`, or the shipped file's LACK of one.
+  std::string metadata;
+  if (o.declare_gemma_config) {
+    nlohmann::json md;
+    md["gemma_config"] = ReducedGemmaConfig(o).dump();
+    metadata = md.dump();
+  }
+  WriteSafetensors(entries, metadata, path);
+}
+
+// The Gemma config as a standalone JSON FILE, which is what the engine's
+// `encoder_config_path` extra reads for a checkpoint that declares none.
+inline void WriteGemmaConfigJson(const std::string& path,
+                                 const ReducedTextEncoderOptions& o =
+                                     ReducedTextEncoderOptions{}) {
+  WriteFileBytes(path, ReducedGemmaConfig(o).dump());
+}
+
 // ── prompt embeds ──────────────────────────────────────────────────────────
 inline void WritePromptEmbeds(const std::string& path, const std::string& tag, int64_t rows,
                               int64_t width) {
@@ -864,6 +1233,10 @@ inline void WritePromptEmbeds(const std::string& path, const std::string& tag, i
 // The whole set, as an engine would be pointed at it.
 struct Paths {
   std::string dit, video_vae, audio_vae, upsampler, video_embeds, audio_embeds;
+  // Phase L13: the text tower, and the Gemma config the shipped encoder does not
+  // carry. Written by every fixture; POINTING the engine at them is opt-in,
+  // because a load that materializes a tower is not what most cases here gate.
+  std::string encoder, encoder_config;
 };
 
 // `prompt_tokens` defaults to 4, not 3: the connector's register table is TILED
@@ -881,6 +1254,10 @@ inline Paths WriteFixture(const std::string& dir, int64_t prompt_tokens = 4) {
   p.upsampler = dir + "/upsampler.safetensors";
   p.video_embeds = dir + "/video_prompt_embeds.f32";
   p.audio_embeds = dir + "/audio_prompt_embeds.f32";
+  p.encoder = dir + "/text_encoder.safetensors";
+  p.encoder_config = dir + "/gemma_config.json";
+  WriteReducedTextEncoder(dit, p.encoder);
+  WriteGemmaConfigJson(p.encoder_config);
   WriteReducedDit(dit, p.dit);
   WriteReducedVideoVae(ReducedVideoDecoderConfig(dit.in_channels), p.video_vae);
   WriteReducedAudioVae(ReducedAudioDecoderConfig(), ReducedVocoderBweConfig(), p.audio_vae);

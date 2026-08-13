@@ -21,7 +21,12 @@
 #include <string>
 #include <vector>
 
+#include <cstring>
+
 #include "vllm/model_executor/model_loader/safetensors_reader.h"
+#include "vllm/model_executor/models/ltx2_loader.h"
+#include "vllm/tokenizer/tokenizer.h"
+#include "vllm/transformers_utils/hf_config.h"
 
 namespace vllm {
 namespace {
@@ -596,6 +601,499 @@ Ltx2GemmaAssets Ltx2LoadGemmaAssets(const SafetensorsFile& file, bool require_co
          " (embed as " + prefix + "<name>, or as metadata for small JSON)");
 
   return assets;
+}
+
+// ─────────────────────── the prompt -> tokens hand-off ───────────────────────
+
+Ltx2GemmaSpecialIds Ltx2ResolveGemmaSpecialIds(const Ltx2GemmaAssets& assets,
+                                               const tok::Tokenizer& tokenizer) {
+  Ltx2GemmaSpecialIds ids;
+
+  // The checkpoint STATES both, and that is the first place to look: the
+  // tokenizer's own added-token table lists `<bos>` and `<pad>` by content, but
+  // reading them by content would make this port depend on two strings rather
+  // than on the ids the model was trained with.
+  const auto gen = assets.sidecars.find("generation_config.json");
+  if (gen != assets.sidecars.end()) {
+    nlohmann::json doc;
+    try {
+      doc = nlohmann::json::parse(std::string(gen->second.begin(), gen->second.end()));
+    } catch (const nlohmann::json::exception&) {
+      doc = nlohmann::json::object();
+    }
+    if (doc.is_object()) {
+      const auto bos = doc.find("bos_token_id");
+      if (bos != doc.end() && bos->is_number_integer())
+        ids.bos_id = bos->get<int32_t>();
+      const auto pad = doc.find("pad_token_id");
+      if (pad != doc.end() && pad->is_number_integer())
+        ids.pad_id = pad->get<int32_t>();
+    }
+  }
+
+  // Fall back to the tokenizer, which is what upstream reads
+  // (tokenizer.py:35 `tokenizer.bos_token_id`, :26-27 the pad_token default).
+  if (ids.bos_id < 0) ids.bos_id = tokenizer.BosId();
+  if (ids.bos_id < 0) {
+    for (const tok::SpecialToken& t : tokenizer.AddedTokens())
+      if (t.text == "<bos>") ids.bos_id = t.id;
+  }
+  if (ids.pad_id < 0) {
+    for (const tok::SpecialToken& t : tokenizer.AddedTokens())
+      if (t.text == "<pad>") ids.pad_id = t.id;
+  }
+  // tokenizer.py:26-27 — when there is no pad token, the EOS one is used.
+  if (ids.pad_id < 0) ids.pad_id = tokenizer.EosId();
+
+  if (ids.bos_id < 0) {
+    Fail(
+        "the text encoder's asset pack declares no bos_token_id, and its tokenizer "
+        "carries no <bos> added token. Upstream raises here too "
+        "(tokenizer.py:34-36): every LTX conditioning prompt is tokenized with a "
+        "LEADING BOS, so a prompt without one is a DIFFERENT prompt rather than a "
+        "slightly degraded one.");
+  }
+  if (ids.pad_id < 0) {
+    Fail(
+        "the text encoder's asset pack declares no pad_token_id and its tokenizer "
+        "has neither a <pad> added token nor an eos to fall back on "
+        "(tokenizer.py:26-27), so the prompt cannot be padded to the "
+        "fixed-width batch the tower is run on.");
+  }
+  return ids;
+}
+
+Ltx2GemmaPromptTokens Ltx2TokenizeGemmaPrompt(const tok::Tokenizer& tokenizer,
+                                              const std::string& prompt,
+                                              int32_t bos_id, int32_t pad_id,
+                                              int64_t max_length,
+                                              Ltx2GemmaPaddingSide padding_side) {
+  if (bos_id < 0) {
+    Fail(
+        "Ltx2TokenizeGemmaPrompt requires a bos_token_id: upstream refuses the same "
+        "way (tokenizer.py:34-36) because the conditioning path always tokenizes "
+        "with a leading BOS.");
+  }
+  if (max_length <= 0) Fail("max_length must be positive");
+
+  // tokenizer.py:33 — `text.strip()`. Python's bare `str.strip()` removes
+  // whitespace from BOTH ends; mirrored on the ASCII whitespace set, which is
+  // what a prompt's leading/trailing run is in practice.
+  const char* kSpace = " \t\n\r\f\v";
+  const size_t begin = prompt.find_first_not_of(kSpace);
+  const std::string stripped =
+      begin == std::string::npos
+          ? std::string()
+          : prompt.substr(begin, prompt.find_last_not_of(kSpace) - begin + 1);
+
+  // NOT EncodeWithSpecialTokens. The shipped tokenizer's post_processor is a
+  // TemplateProcessing with an EMPTY `special_tokens` map, so it adds nothing and
+  // the two are identical HERE — but upstream calls the plain encode and then
+  // prepends BOS itself, and mirroring which call is made keeps that true if a
+  // future checkpoint ships a post_processor that does add something. Doing both
+  // would double the BOS.
+  std::vector<int32_t> ids = tokenizer.Encode(stripped);
+
+  Ltx2GemmaPromptTokens out;
+  // tokenizer.py:39-42 — truncate to max_length FIRST.
+  out.truncated = static_cast<int64_t>(ids.size()) > max_length;
+  if (out.truncated) ids.resize(static_cast<size_t>(max_length));
+
+  // tokenizer.py:44-46 — then prepend BOS if it is not already leading, and
+  // re-truncate. A maximal prompt therefore loses its LAST token, not its BOS.
+  if (ids.empty() || ids.front() != bos_id) {
+    ids.insert(ids.begin(), bos_id);
+    if (static_cast<int64_t>(ids.size()) > max_length) {
+      ids.resize(static_cast<size_t>(max_length));
+      out.truncated = true;
+    }
+  }
+
+  out.num_valid = static_cast<int64_t>(ids.size());
+  const int64_t pad = max_length - out.num_valid;
+  out.input_ids.assign(static_cast<size_t>(max_length), pad_id);
+  out.attention_mask.assign(static_cast<size_t>(max_length), 0);
+  // tokenizer.py:48-54 — pad to exactly max_length on the configured side.
+  out.first_valid = padding_side == Ltx2GemmaPaddingSide::kLeft ? pad : 0;
+  for (int64_t i = 0; i < out.num_valid; ++i) {
+    out.input_ids[static_cast<size_t>(out.first_valid + i)] =
+        ids[static_cast<size_t>(i)];
+    out.attention_mask[static_cast<size_t>(out.first_valid + i)] = 1;
+  }
+  return out;
+}
+
+// ───────────────────────────── the Gemma-4 TOWER ─────────────────────────────
+
+namespace {
+
+// Every name this loader reads lives under `model.`. The shipped checkpoint is
+// FLAT (`model.layers.0.self_attn.q_proj.weight`), not the multimodal-wrapper
+// form gemma4_weights.cpp reads (`model.language_model.layers.0....`), which is
+// why the tower cannot simply go through that loader.
+constexpr const char* kTowerPrefix = "model.";
+
+bool TowerHas(const SafetensorsFile& file, const std::string& name) {
+  try {
+    file.Get(name);
+    return true;
+  } catch (const std::runtime_error&) {
+    return false;
+  }
+}
+
+int64_t TowerRawInt(const nlohmann::json& doc, const char* key, int64_t fallback) {
+  const auto it = doc.find(key);
+  if (it == doc.end() || it->is_null() || !it->is_number_integer()) return fallback;
+  return it->get<int64_t>();
+}
+
+// One module -> bf16, whichever form it arrived in.
+//
+// `out`/`in` are the LOGICAL widths the config resolves, and they are passed in
+// rather than read off the tensor precisely because an NVFP4 tensor's stored
+// width is HALF its logical one. A loader that trusted the stored shape would
+// build a tower of exactly half the right width, whose every matmul still has
+// conforming dimensions among themselves.
+OwnedTensor TowerModule(const SafetensorsFile& file, const std::string& module,
+                        int64_t out_features, int64_t in_features, bool nk,
+                        std::vector<std::string>* dequantized) {
+  const std::string weight = module + ".weight";
+  const StTensor& w = file.Get(weight);
+
+  OwnedTensor t;
+  t.dtype = vt::DType::kBF16;
+  t.nk = nk;
+  t.rank = 2;
+  t.shape[0] = out_features;
+  t.shape[1] = in_features;
+
+  if (w.dtype == "BF16") {
+    if (w.shape.size() != 2 || w.shape[0] != out_features || w.shape[1] != in_features) {
+      Fail("tower module '" + module + "' is BF16 " + std::to_string(w.shape.size()) +
+           "-D but the config resolves [" + std::to_string(out_features) + ", " +
+           std::to_string(in_features) + "] for this layer");
+    }
+    t.bytes.resize(w.nbytes);
+    std::memcpy(t.bytes.data(), w.data, w.nbytes);
+    return t;
+  }
+
+  const std::string marker = module + std::string(kLtx2TorchaoNvfp4MarkerSuffix);
+  if (w.dtype != "U8" || !TowerHas(file, marker)) {
+    Fail("tower module '" + module + "' is stored as " + w.dtype +
+         " with no '" + marker +
+         "' sidecar, so it is neither the BF16 form nor the torchao-NVFP4 form "
+         "this loader understands. Refusing rather than reading its bytes as "
+         "whichever of the two happens to parse.");
+  }
+  // Parsed, not assumed: the marker is what says block_size 16 and swizzled
+  // scales, and it REFUSES a combination the dequant would silently mis-read.
+  ParseLtx2TorchaoNvfp4Marker(module, file.Get(marker));
+
+  t.bytes.resize(static_cast<size_t>(out_features) * static_cast<size_t>(in_features) *
+                 sizeof(uint16_t));
+  Ltx2DequantTorchaoNvfp4ToBf16(module, w, file.Get(module + ".weight_scale"),
+                                file.Get(module + ".weight_scale_2"), out_features,
+                                in_features, reinterpret_cast<uint16_t*>(t.bytes.data()));
+  if (dequantized != nullptr) dequantized->push_back(module);
+  return t;
+}
+
+// A plain bf16 vector weight (a norm, or `layer_scalar`). Never quantized in any
+// shipped build, so a non-BF16 one is a checkpoint this loader has not seen.
+OwnedTensor TowerVector(const SafetensorsFile& file, const std::string& name,
+                        int64_t n) {
+  const StTensor& w = file.Get(name);
+  if (w.dtype != "BF16")
+    Fail("tower tensor '" + name + "' is " + w.dtype + ", expected BF16");
+  int64_t numel = 1;
+  for (int64_t d : w.shape) numel *= d;
+  if (numel != n)
+    Fail("tower tensor '" + name + "' has " + std::to_string(numel) +
+         " elements, expected " + std::to_string(n));
+  OwnedTensor t;
+  t.dtype = vt::DType::kBF16;
+  t.rank = 1;
+  t.shape[0] = n;
+  t.bytes.resize(w.nbytes);
+  std::memcpy(t.bytes.data(), w.data, w.nbytes);
+  return t;
+}
+
+// Concatenate already-materialized bf16 [rows_i, in] blocks into one raw-NK
+// tensor, which is the layout `Gemma4Weights` carries q/k/v and gate/up in
+// (gemma4_weights.cpp:290-296).
+OwnedTensor TowerConcat(std::vector<const OwnedTensor*> parts, int64_t in_features) {
+  int64_t rows = 0;
+  for (const OwnedTensor* p : parts) rows += p->shape[0];
+  OwnedTensor t;
+  t.dtype = vt::DType::kBF16;
+  t.nk = true;
+  t.rank = 2;
+  t.shape[0] = rows;
+  t.shape[1] = in_features;
+  t.bytes.resize(static_cast<size_t>(rows) * static_cast<size_t>(in_features) *
+                 sizeof(uint16_t));
+  size_t at = 0;
+  for (const OwnedTensor* p : parts) {
+    std::memcpy(t.bytes.data() + at, p->bytes.data(), p->bytes.size());
+    at += p->bytes.size();
+  }
+  return t;
+}
+
+}  // namespace
+
+Ltx2GemmaTower Ltx2LoadGemmaTowerFromSafetensors(const SafetensorsFile& file,
+                                                 const nlohmann::json& gemma_config) {
+  Ltx2GemmaTower tower;
+  tower.config = ParseHfConfig(gemma_config, "ltx2 gemma tower config");
+  const HfConfig& c = tower.config;
+
+  const nlohmann::json& text = c.raw.contains("text_config") && c.raw["text_config"].is_object()
+                                   ? c.raw["text_config"]
+                                   : c.raw;
+
+  const int64_t H = c.hidden_size;
+  const int64_t L = c.num_hidden_layers;
+  const int64_t V = c.vocab_size;
+  const int64_t I = c.intermediate_size;
+  const int64_t Hq = c.num_attention_heads;
+  const int64_t Dh_slide = c.head_dim;
+  const int64_t Dh_full = TowerRawInt(text, "global_head_dim", Dh_slide);
+  const int64_t Hkv_slide = c.num_key_value_heads;
+  const int64_t Hkv_full = TowerRawInt(text, "num_global_key_value_heads", Hkv_slide);
+  const int64_t ple = TowerRawInt(text, "hidden_size_per_layer_input", 0);
+  const int64_t shared = TowerRawInt(text, "num_kv_shared_layers", 0);
+
+  if (H <= 0 || L <= 0 || V <= 0 || I <= 0 || Hq <= 0)
+    Fail("the gemma config resolves a degenerate tower geometry");
+  if (ple > 0) {
+    Fail(
+        "the gemma config declares hidden_size_per_layer_input=" + std::to_string(ple) +
+        ", i.e. a Per-Layer-Embeddings tower, but this checkpoint family ships no "
+        "`model.embed_tokens_per_layer` and no `per_layer_model_projection`. A PLE "
+        "tower whose PLE tensors are silently absent is a DIFFERENT model that "
+        "still produces 49 finite hidden states.");
+  }
+  if (shared != 0) {
+    Fail("the gemma config declares num_kv_shared_layers=" + std::to_string(shared) +
+         "; the LTX text tower ships none and YOCO KV-sharing is not wired on this "
+         "path. Refusing rather than reading a target layer's cache that was never "
+         "written.");
+  }
+  if (static_cast<int64_t>(c.layer_types.size()) != L) {
+    Fail("the gemma config declares " + std::to_string(c.layer_types.size()) +
+         " layer_types for " + std::to_string(L) +
+         " layers. Which layers are full-attention decides their head_dim (" +
+         std::to_string(Dh_full) + " vs " + std::to_string(Dh_slide) +
+         ") and their kv head count, so it cannot be defaulted.");
+  }
+
+  const std::string prefix = kTowerPrefix;
+  tower.weights.tie_word_embeddings = true;
+  tower.weights.embed_tokens =
+      TowerModule(file, prefix + "embed_tokens", V, H, /*nk=*/false,
+                  &tower.dequantized_modules);
+  tower.weights.final_norm = TowerVector(file, prefix + "norm.weight", H);
+
+  const bool k_eq_v_declared = text.contains("attention_k_eq_v") &&
+                               text["attention_k_eq_v"].is_boolean() &&
+                               text["attention_k_eq_v"].get<bool>();
+
+  tower.weights.layers.reserve(static_cast<size_t>(L));
+  for (int64_t l = 0; l < L; ++l) {
+    const std::string base = prefix + "layers." + std::to_string(l) + ".";
+    const std::string sa = base + "self_attn.";
+    const std::string mlp = base + "mlp.";
+    const bool full = c.layer_types[static_cast<size_t>(l)] == "full_attention";
+    const int64_t Dh = full ? Dh_full : Dh_slide;
+    const int64_t Hkv = full ? Hkv_full : Hkv_slide;
+
+    Gemma4LayerWeights w;
+    w.is_full_attention = full;
+    w.is_kv_shared = false;
+    w.kv_target_layer = -1;
+    w.head_dim = Dh;
+    w.num_kv_heads = Hkv;
+
+    // `attention_k_eq_v` is a config-level flag but a PER-LAYER fact: the shipped
+    // tower's full layers carry no `v_proj` and its sliding layers do. Resolving
+    // it from tensor PRESENCE is what gemma4_weights.cpp:275 does; cross-checking
+    // it against the declaration is what stops a checkpoint that dropped a
+    // `v_proj` by accident from loading as a deliberately K-aliased layer, which
+    // is a 16-kv-head difference that every shape check still passes.
+    const bool has_v = TowerHas(file, sa + "v_proj.weight");
+    w.k_eq_v = !has_v;
+    if (!has_v && !k_eq_v_declared) {
+      Fail("layer " + std::to_string(l) + " has no `" + sa +
+           "v_proj.weight`, but the config does not declare attention_k_eq_v. "
+           "Aliasing V onto K is a deliberate architecture, not a repair for a "
+           "missing tensor.");
+    }
+
+    const OwnedTensor q = TowerModule(file, sa + "q_proj", Hq * Dh, H, true,
+                                      &tower.dequantized_modules);
+    const OwnedTensor k = TowerModule(file, sa + "k_proj", Hkv * Dh, H, true,
+                                      &tower.dequantized_modules);
+    if (has_v) {
+      const OwnedTensor v = TowerModule(file, sa + "v_proj", Hkv * Dh, H, true,
+                                        &tower.dequantized_modules);
+      w.attn.qkv_proj = TowerConcat({&q, &k, &v}, H);
+    } else {
+      w.attn.qkv_proj = TowerConcat({&q, &k, &k}, H);
+    }
+    w.attn.o_proj = TowerModule(file, sa + "o_proj", H, Hq * Dh, true,
+                                &tower.dequantized_modules);
+    w.attn.q_norm = TowerVector(file, sa + "q_norm.weight", Dh);
+    w.attn.k_norm = TowerVector(file, sa + "k_norm.weight", Dh);
+
+    const OwnedTensor gate =
+        TowerModule(file, mlp + "gate_proj", I, H, true, &tower.dequantized_modules);
+    const OwnedTensor up =
+        TowerModule(file, mlp + "up_proj", I, H, true, &tower.dequantized_modules);
+    w.mlp.gate_up_proj = TowerConcat({&gate, &up}, H);
+    w.mlp.down_proj =
+        TowerModule(file, mlp + "down_proj", H, I, true, &tower.dequantized_modules);
+
+    w.input_layernorm = TowerVector(file, base + "input_layernorm.weight", H);
+    w.post_attention_layernorm =
+        TowerVector(file, base + "post_attention_layernorm.weight", H);
+    w.pre_feedforward_layernorm =
+        TowerVector(file, base + "pre_feedforward_layernorm.weight", H);
+    w.post_feedforward_layernorm =
+        TowerVector(file, base + "post_feedforward_layernorm.weight", H);
+    // Optional: a tower without it is upstream's `torch.ones(1)` default
+    // (modeling_gemma4_unified.py:501), which is the identity.
+    if (TowerHas(file, base + "layer_scalar"))
+      w.layer_scalar = TowerVector(file, base + "layer_scalar", 1);
+
+    tower.weights.layers.push_back(std::move(w));
+  }
+  return tower;
+}
+
+// ─────────────────────── prompt -> conditioning, end to end ──────────────────
+
+Ltx2PromptConditioning Ltx2EncodePromptToConditioning(
+    const Ltx2GemmaTower& tower, const tok::Tokenizer& tokenizer,
+    const Ltx2GemmaSpecialIds& ids, const Ltx2TextEncoderWeights& weights,
+    const Ltx2TextFeatureConfig& feature_config, const std::string& prompt,
+    vt::Queue& queue, int64_t max_length) {
+  const HfConfig& c = tower.config;
+  const int64_t H = c.hidden_size;
+  const int64_t L = c.num_hidden_layers;
+
+  if (feature_config.embedding_dim != H) {
+    Fail("the caption projections were resolved for a " +
+         std::to_string(feature_config.embedding_dim) +
+         "-wide Gemma hidden state but the tower is " + std::to_string(H) + " wide");
+  }
+  if (feature_config.num_layers != Ltx2GemmaHiddenStateContract::Count(L)) {
+    Fail("the caption projections expect " + std::to_string(feature_config.num_layers) +
+         " hidden states but the tower has " + std::to_string(L) +
+         " layers, i.e. " + std::to_string(Ltx2GemmaHiddenStateContract::Count(L)) +
+         " states (encoder_configurator.py:182)");
+  }
+
+  Ltx2PromptConditioning out;
+  out.tokens = Ltx2TokenizeGemmaPrompt(tokenizer, prompt, ids.bos_id, ids.pad_id,
+                                       max_length);
+  out.seq = max_length;
+  out.mask = out.tokens.attention_mask;
+
+  const int64_t T = out.tokens.num_valid;
+  // Upstream always has at least the BOS, so this cannot be zero; asserted
+  // because a zero-token forward would produce empty states that every later
+  // shape check would then compare against zero-length goldens.
+  if (T <= 0) Fail("the tokenizer produced no valid tokens");
+
+  std::vector<int32_t> token_ids(static_cast<size_t>(T));
+  std::vector<int32_t> positions(static_cast<size_t>(T));
+  for (int64_t i = 0; i < T; ++i) {
+    token_ids[static_cast<size_t>(i)] =
+        out.tokens.input_ids[static_cast<size_t>(out.tokens.first_valid + i)];
+    // The ORIGINAL absolute position, not a renumbering from zero: transformers
+    // derives positions from the cache position, which counts the pad rows, so a
+    // left-padded prompt's first real token sits at `first_valid`.
+    positions[static_cast<size_t>(i)] =
+        static_cast<int32_t>(out.tokens.first_valid + i);
+  }
+
+  // A KV pool sized PER LAYER. The sliding and full layers do not share a
+  // geometry, and the runner's single-uniform-head_dim allocation cannot express
+  // that (gemma4.h, G1 HONEST STATUS) — so this path builds its own rather than
+  // routing through a seam that would have to lie about one of the two.
+  const int64_t block = 16;
+  const int64_t blocks = (T + block - 1) / block;
+  std::vector<std::vector<float>> kv_storage;
+  std::vector<PagedKvCache> attn_kv;
+  kv_storage.reserve(static_cast<size_t>(L));
+  for (int64_t l = 0; l < L; ++l) {
+    const Gemma4LayerWeights& lw = tower.weights.layers[static_cast<size_t>(l)];
+    kv_storage.emplace_back(
+        static_cast<size_t>(blocks * 2 * block * lw.num_kv_heads * lw.head_dim), 0.0f);
+    PagedKvCache kv;
+    kv.data = kv_storage.back().data();
+    kv.dtype = vt::DType::kF32;
+    kv.num_blocks = blocks;
+    kv.block_size = block;
+    kv.num_kv_heads = lw.num_kv_heads;
+    kv.head_size = lw.head_dim;
+    attn_kv.push_back(kv);
+  }
+
+  v1::CommonAttentionMetadata meta;
+  meta.num_reqs = 1;
+  meta.num_actual_tokens = static_cast<int>(T);
+  meta.query_start_loc = {0, static_cast<int32_t>(T)};
+  meta.query_start_loc_cpu = meta.query_start_loc;
+  meta.seq_lens = {static_cast<int32_t>(T)};
+  meta.seq_lens_cpu = meta.seq_lens;
+  meta.max_query_len = static_cast<int>(T);
+  meta.max_seq_len = static_cast<int>(T);
+  meta.block_table_num_cols = static_cast<int>(blocks);
+  meta.block_table_tensor.resize(static_cast<size_t>(blocks));
+  for (int64_t b = 0; b < blocks; ++b)
+    meta.block_table_tensor[static_cast<size_t>(b)] = static_cast<int32_t>(b);
+  meta.slot_mapping.resize(static_cast<size_t>(T));
+  for (int64_t i = 0; i < T; ++i)
+    meta.slot_mapping[static_cast<size_t>(i)] = static_cast<int32_t>(i);
+  meta.causal = true;
+
+  const Gemma4HiddenStatesResult run = Gemma4Model::ForwardHiddenStates(
+      token_ids, positions, meta, attn_kv, tower.weights, c, queue);
+  if (static_cast<int64_t>(run.hidden_states.size()) != feature_config.num_layers) {
+    Fail("the tower returned " + std::to_string(run.hidden_states.size()) +
+         " hidden states, expected " + std::to_string(feature_config.num_layers));
+  }
+
+  // Scatter the valid rows back into the full padded width and leave the pad rows
+  // ZERO. Their VALUE is irrelevant — the extractor zeroes every masked position
+  // before the projection (feature_extractor.py:63-64) — but the DiT is fed the
+  // full 1024-wide conditioning, so the rows have to exist.
+  std::vector<std::vector<float>> padded(static_cast<size_t>(feature_config.num_layers));
+  std::vector<const float*> layer_ptrs;
+  layer_ptrs.reserve(static_cast<size_t>(feature_config.num_layers));
+  for (int64_t s = 0; s < feature_config.num_layers; ++s) {
+    std::vector<float>& dst = padded[static_cast<size_t>(s)];
+    dst.assign(static_cast<size_t>(out.seq * H), 0.0f);
+    const std::vector<float>& src = run.hidden_states[static_cast<size_t>(s)];
+    std::memcpy(dst.data() + static_cast<size_t>(out.tokens.first_valid * H),
+                src.data(), src.size() * sizeof(float));
+    layer_ptrs.push_back(dst.data());
+  }
+
+  Ltx2TextHiddenStates states;
+  states.layers = std::move(layer_ptrs);
+  states.batch = 1;
+  states.seq = out.seq;
+  states.hidden = H;
+
+  out.conditioning =
+      Ltx2TextEncoderConditioning(states, out.mask.data(), weights, feature_config);
+  return out;
 }
 
 }  // namespace vllm

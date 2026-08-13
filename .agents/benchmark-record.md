@@ -20555,3 +20555,116 @@ freed box: **`test_capi` 55/55 cases / 505 assertions and `test_minimax_h3`
 references `ltx2` while this work touches only `ltx2_*`. The earlier reading was
 an INFRASTRUCTURE artifact of a 100%-full disk, not a regression, and the public
 status surface should not have gone on implying otherwise.
+
+## LTX-2.5 L13 — the 320x192/25f render was REGISTER-conditioned, not prompted, and the composition's value oracle is owed (2026-08-13, `row/LTX25-L13-PROMPT-HOP`, issue [#435](https://github.com/mudler/vllm.cpp/issues/435))
+
+**No speed number is claimed and none is implied.** LTX-2.5's speed axis stays
+structurally `PENDING` (spec [ltx-2-5.md](specs/ltx-2-5.md) §0).
+
+### The public-doc claim that was withdrawn
+
+`docs/FEATURES.md` briefly read *"e2e at 320x192/25f from a TYPED PROMPT via
+Gemma-4: coherent scene, valid MP4+WAV"*. **No recorded run supports that
+sentence**, and it is withdrawn rather than softened.
+
+| what the sentence asserted | what was actually measured |
+|---|---|
+| a render from a TYPED PROMPT | L9c's 320x192/25f arm ran with `--prompt-valid-rows 24` and **synthetic** N(0, 0.2) conditioning; the Gemma-4 tower was not on that path at all |
+| a "coherent scene" produced BY that prompt | the record for that same arm states it plainly: *"It is not a depiction of a prompt"* — 104 of 128 rows are the connector's own trained `learnable_registers` and the other 24 are noise, so what conditioned the render is **the checkpoint's own learned default** |
+| Gemma-4 in the loop | L10's real-checkpoint run produced **conditioning only** (`video [1024, 4096]`, max\|v\| 34.07) and **no frames** |
+| an e2e gate behind it | L13's own gate is **fixture-only, CPU Release**; the PR body itself claims no real-checkpoint prompted render |
+
+Both halves of the claim — "typed prompt" and "coherent scene" — were attached
+to a run that did not happen, by re-attributing L9B/L9c's measurement
+(this record, the L9c section above) to a capability that landed three hops
+later. The public cells now read *"Typed prompt -> Gemma-4 -> cross-attn,
+FIXTURE-gated. The 320x192/25f scene was register-conditioned; a prompted render
+is OWED"*.
+
+**OWED, and not attempted here:** a real-checkpoint prompted render. The
+arithmetic is why it was not run rather than run badly. L9c's 320x192/25f arm
+bottomed out at **68.2 GiB MemAvailable** on a 119 GiB unified-memory box that
+**reboots rather than OOM-kills**, and the text tower is a further **~24 GB of
+host bf16** at the shipped 12B (`ltx2_video.cpp:846`) on top of the FP8 DiT. At the time of writing dgx.casa's `$HOME/gpu.lock`
+was held by another session's `ctest` and its root filesystem was at **99%
+(62 GiB free)**, against a ~21 GiB build tree plus render artifacts. Attempting
+it would have risked the box for other live agents to produce one number. The
+honest statement is the one now in the docs.
+
+### The composition has no value oracle — measured, not suspected
+
+`Ltx2VideoEngine::last_conditioning()` is a **witness, not a gate**. A reviewer
+proved it on this head with two mutations of the `Generate` composition
+(`ltx2_video.cpp`), each applied alone:
+
+| mutation | result |
+|---|---|
+| video conditioning scaled **x1.5** after the connector | **485/485 assertions, exit 0** |
+| conditioning rows **REVERSED** — every caption row on the wrong token | **485/485 assertions, exit 0** |
+
+A digest detects CHANGE; it does not pin VALUES. The digest moved under both,
+and no assertion says which value it should have moved to.
+
+**Where the gap is, precisely.** The per-brick oracles are real: the Gemma-4
+tower vs a running `transformers` at a measured bf16 floor, `Ltx2ConnectorForward`
+on five arms vs executed upstream, and the feature extractor and both caption
+projections vs executed upstream. The two **joins** have none —
+`Ltx2ConnectorCreateEmbeddings` and the `Generate` composition that chains it
+onto `Ltx2TextEncoderConditioning`. Both mutations live in exactly that gap.
+`Ltx2ConnectorCreateEmbeddings`'s own tests are PROPERTY tests: the
+padding-side-agnosticism case compares two of OUR OWN calls, so a defect in both
+arms cancels — the "gate through a shared helper proves consistency, not
+correctness" pattern this project has already been burned by.
+
+**The closure, specified because the path is already built.**
+`scripts/gen-ltx2-pipeline-goldens.py` already imports and EXECUTES upstream
+`text_encoders/gemma/embeddings_connector.py` under a pinned SHA (section 10),
+and the composition's upstream counterpart is one function in the same package:
+`EmbeddingsProcessor.process_hidden_states` (`embeddings_processor.py:97-117`) —
+feature extractor, additive mask, `create_embeddings`, both connectors, i.e.
+this exact chain. A section executing it end-to-end at the reduced dims the
+script already uses gives both joins a numeric oracle against executed upstream
+rather than against our own helper.
+
+**Verified as a prerequisite, so the next implementer does not have to:** the
+generator reproduces its committed output **byte-for-byte** on the pinned
+upstream — `md5 53e2a6aba8885d7d58302ad0b7b09eb4` for both the regenerated file
+and `tests/vllm/models/ltx2_pipeline_goldens.inc`, with `LTX-2` and `vllm-omni`
+both clean at `fd4ded7f2d88d3da713abcdd4ad41ecc4a9314ca` /
+`a4ea67a21b20054dacc6e83952f9bd407e8ee4e7`, the SHA the C++ suite pins. So a new
+section can be added without disturbing anything already gated.
+
+### The V2 marker header, recorded so it can be checked without the checkpoint
+
+The four `Ltx2SelectTextFeatureVariant` markers in
+`tests/vllm/multimodal/ltx2_video_fixture.h` are correct, but nothing in the
+repo recorded the header they came from. Read 2026-08-13 from the safetensors
+`__metadata__` (header JSON only, no tensor data) of
+`/mnt/nas_share/checkpoints/ltx-2.5/lightricks-ltx-2.5/diffusion_models/ltx-2.5-22b-distilled-transformer-nvfp4.safetensors`
+(18,721,432,024 bytes; `Lightricks/LTX-2.5` revision
+`8a4ff96f581e72bedc1b44367581c49d544a05f1` per the HF download record — the LFS
+oid is the upstream sha256 and was NOT re-verified locally):
+
+| key | observed |
+|---|---|
+| `caption_proj_before_connector` | `true` |
+| `caption_projection_first_linear` | `false` |
+| `caption_proj_input_norm` | `false` |
+| `caption_projection_second_linear` | `false` |
+| `num_attention_heads` / `attention_head_dim` | 32 / 128 -> video 4096 |
+| `audio_num_attention_heads` / `audio_attention_head_dim` | 32 / 64 -> audio 2048 |
+| `text_encoder_norm_type`, `model_version` | `PER_TOKEN_RMS`, `2.5.0` |
+
+All four present, none drifted, so this checkpoint resolves to V2.
+`text_encoder_norm_type` corroborates it independently, and the selector
+deliberately does not read that key — it mirrors upstream's four-marker test.
+The vonkaiser FP8 DiT the render arms actually load carries **no `__metadata__`
+block at all**, so this first-party file is the only on-disk source for the four
+values.
+
+**A cause corrected in the same pass.** The fixture comment said an earlier
+partial marker set *"gated no variant selection at all"*. That is not why the
+refusal never fired: `Ltx2SelectTextFeatureVariant` **does** refuse a partial set
+(`ltx2_text_encoder.cpp:184-192`). It never fired because **no production path
+called the selector before L13** — the marker keys and the engine's first call to
+it landed in the same commit, so there was no earlier run for it to refuse.
