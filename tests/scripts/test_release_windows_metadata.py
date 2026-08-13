@@ -224,7 +224,17 @@ class WindowsMetadataContract(unittest.TestCase):
         source = (
             ROOT / "tests/vllm/entrypoints/openai/test_api_server.cpp"
         ).read_text(encoding="utf-8")
+        case_start = source.index(
+            'TEST_CASE("api_server: an explicit-cpu device-selected engine serves '
+            '/v1/completions") {'
+        )
+        case_end = source.index("\n}\n", case_start) + len("\n}\n")
+        explicit_cpu_case = source[case_start:case_end]
         for phase in (
+            "before-make-weights",
+            "after-make-weights",
+            "before-build-fixture",
+            "after-build-fixture",
             "before-loaded-engine",
             "after-loaded-engine",
             "before-serving-stack",
@@ -240,6 +250,28 @@ class WindowsMetadataContract(unittest.TestCase):
                 self.assertEqual(
                     source.count(f'OpenAiExplicitCpuPhaseWitness("{phase}")'), 1
                 )
+        ordered_construction = (
+            'OpenAiExplicitCpuPhaseWitness("before-make-weights")',
+            "Qwen3_5MoeWeights weights = MakeWeights(c)",
+            'OpenAiExplicitCpuPhaseWitness("after-make-weights")',
+            'OpenAiExplicitCpuPhaseWitness("before-build-fixture")',
+            "Tokenizer tokenizer = BuildFixture()",
+            'OpenAiExplicitCpuPhaseWitness("after-build-fixture")',
+            'OpenAiExplicitCpuPhaseWitness("before-loaded-engine")',
+            "std::move(weights)",
+            "std::move(tokenizer)",
+            'OpenAiExplicitCpuPhaseWitness("after-loaded-engine")',
+        )
+        positions = []
+        for statement in ordered_construction:
+            with self.subTest(statement=statement):
+                self.assertEqual(explicit_cpu_case.count(statement), 1)
+                positions.append(explicit_cpu_case.index(statement))
+        self.assertEqual(positions, sorted(positions))
+        self.assertNotIn(
+            "LoadedEngine loaded(c, MakeWeights(c), BuildFixture(), params)",
+            explicit_cpu_case,
+        )
         witness_start = source.index(
             "void OpenAiExplicitCpuPhaseWitness(const char* phase) noexcept {"
         )

@@ -2407,10 +2407,16 @@ TEST_CASE("api_server: an explicit-cpu device-selected engine serves /v1/complet
   // The server's own parse of `--device cpu` (an unknown name throws there at
   // startup; pinned in test_loaded_engine_dense.cpp).
   params.device = vllm::DeviceFromString("cpu");
+  OpenAiExplicitCpuPhaseWitness("before-make-weights");
+  Qwen3_5MoeWeights weights = MakeWeights(c);
+  OpenAiExplicitCpuPhaseWitness("after-make-weights");
+  OpenAiExplicitCpuPhaseWitness("before-build-fixture");
+  Tokenizer tokenizer = BuildFixture();
+  OpenAiExplicitCpuPhaseWitness("after-build-fixture");
   OpenAiExplicitCpuPhaseWitness("before-loaded-engine");
   {
-    vllm::entrypoints::LoadedEngine loaded(c, MakeWeights(c), BuildFixture(),
-                                           params);
+    vllm::entrypoints::LoadedEngine loaded(
+        c, std::move(weights), std::move(tokenizer), params);
     OpenAiExplicitCpuPhaseWitness("after-loaded-engine");
     // The observable seam: the runner of the explicitly-cpu engine is on the
     // CPU device (on a CUDA build this is the force-CPU pin; auto would select
