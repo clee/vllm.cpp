@@ -617,6 +617,23 @@ three confirmation statuses, and the dependency classification. The existing
 unfiltered full-suite invocation remains unchanged and still runs afterwards.
 Any other probe status stops the release job rather than being classified.
 
+Hosted run `31728014706` resolved that boundary to source-order case 47/54,
+`api_server: an explicit-cpu device-selected engine serves /v1/completions`.
+Both its prefix and its isolated invocation terminate with the exact native
+fast-fail status, while the confirmed predecessor succeeds. The defect is
+therefore isolated to that test or the production path it exercises, not a
+cross-test lifetime dependency.
+
+The next diagnostic is limited to that isolated process. Preserve and print
+its already-captured output, and add flushed phase witnesses around construction
+of `LoadedEngine`, construction of the async serving stack, completion dispatch,
+response validation, and scope teardown. Do not change timing, add sleeps,
+weaken assertions, or accept this instrumentation as the repair. The hosted
+Windows CPU/Vulkan result must identify the last completed phase. Then remove
+the diagnostic and add the smallest RED regression for the actual owner before
+changing production code. If the phase evidence does not distinguish an owner,
+stop and extend the spec rather than guessing.
+
 ### Current-main portability regression: issue #645
 
 Current `main` at `cefacd2d00cb9b4776331cd213116773cd97f811` added LTX2
