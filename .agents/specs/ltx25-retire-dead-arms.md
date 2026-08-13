@@ -353,7 +353,16 @@ is a different row. Refusing is the cheap correct answer until then.
 
 - `.agents/specs/ltx-2-5.md` — operator-owned. This row does not edit it. Its §2
   "Out" list still names `multishot`; correcting that is the operator's edit, and
-  this spec is the record it would cite.
+  this spec is the record it would cite. Filed as
+  [#692](https://github.com/mudler/vllm.cpp/issues/692) by the review repair so
+  `main` stops carrying the claim unowned.
+- Making the reachable/marker split gate REACHABILITY rather than message text.
+  The ledger test asserts what each message says; nothing asserts that a marker
+  still has no product call site, so giving `kLoraFusion` one would leave the test
+  green while the shipped refusal told a caller it is not requestable immediately
+  after they requested it. Filed as
+  [#691](https://github.com/mudler/vllm.cpp/issues/691), with the extras inventory
+  gate named as the anti-tautological shape to copy.
 - Constructing a duration head, and the AUTO-duration path. Stays owed (#611
   remains open after this row, retitled by the fix rather than closed by it —
   see §7).
