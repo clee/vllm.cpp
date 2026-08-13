@@ -283,12 +283,23 @@ FAIL, round 2 PASS). `KERNEL-SSM-MAMBA` stays `INVENTORIED`: this is a host
 reference, not generic Mamba support, and no lifecycle state moved, so it owes
 no `STATUS.md` / `BENCHMARKS.md` projection. No performance claim is made.
 
-**Owed before the row can move:** W2 (the CUDA arm, byte-compared to these host
-references, `compute-sanitizer` clean on dgx), W3 (the `MambaSpec` producer for
-Mamba2 shapes), and the one missing decode refusal `SUBCASE` recorded in §8.2.
+**W2 (2026-08-13):** the CUDA arm for all three ops is implemented and gated —
+see §8.3 for the equivalence contract it was written against, which supersedes
+§6's "byte-compared to W1" exit criterion with a named reason (the two arms call
+different libms, so a byte compare is not reachable; the primary gate is the
+device output against the same double-precision reference at the same
+upstream-ported tolerances). The §8.2 decode `SUBCASE` is CLOSED and re-proved.
+`KERNEL-SSM-MAMBA` still stays `INVENTORIED`: this lands `src/`, `include/`,
+`tests/` and this spec only, no lifecycle state moved, and no performance claim
+is made.
 
-**Next action:** dispatch a fresh implementer for W2 (CUDA), and fold the §8.2
-`SUBCASE` into that task since it touches the same suites.
+**Owed before the row can move:** W3 (the `MambaSpec` producer for Mamba2
+shapes), a fresh scoped review of W2, and the two residuals named in §8.3 —
+routing the device-side `A < 0` and `state_indices` precondition checks through
+the deferred error ring, and #547 (`ReferenceTierEligible` gating on
+`UnifiedMemory()` where it needs `DeviceMemoryIsHostAddressable()`).
+
+**Next action:** dispatch a fresh scoped review of W2, then W3.
 
 ### 8.1 W1 progress (host references landed, awaiting a fresh scoped review)
 
