@@ -196,6 +196,8 @@ def _clock_comparison(
             "estimated_effect_pct": None,
             "median_offset_pct": None,
             "ours_boot_id": None if ours is None else ours.get("boot_id"),
+            "ours_busy_samples": None,
+            "ours_idle_samples_excluded": None,
             "ours_median_sm_mhz": None,
             "ours_spread_pct": None,
             "reasons": [
@@ -205,6 +207,8 @@ def _clock_comparison(
             ],
             "same_boot": False,
             "vllm_boot_id": None if floor is None else floor.get("boot_id"),
+            "vllm_busy_samples": None,
+            "vllm_idle_samples_excluded": None,
             "vllm_median_sm_mhz": None,
             "vllm_spread_pct": None,
         }
@@ -1144,6 +1148,11 @@ def _report(runs: Mapping[str, Any], ratios: Mapping[str, Any]) -> str:
     lines.append("")
     # The clock sits NEXT TO the verdict, not in an appendix: a ratio quoted
     # without the clock it was measured at is what #543 retracted.
+
+    def _sample_count(block: Mapping[str, Any], key: str) -> str:
+        value = block.get(key)
+        return "?" if value is None else str(value)
+
     for model, clock in sorted(ratios.get("clocks", {}).items()):
         ours = clock.get("ours_median_sm_mhz")
         floor = clock.get("vllm_median_sm_mhz")
@@ -1157,6 +1166,18 @@ def _report(runs: Mapping[str, Any], ratios: Mapping[str, Any]) -> str:
                 f"({offset:+.2f}%, estimated {effect:+.2f}% of kernel time); "
                 f"boot {'SAME' if clock['same_boot'] else 'DIFFERS'}"
                 + (" (OVERRIDDEN)" if clock.get("cross_boot_override") else "")
+            )
+            # How much of the window each arm was observed over. A +0.00% offset
+            # taken over one busy sample in three hundred is the cleanest line
+            # this report can print and the emptiest; the counts are what tell
+            # the two apart, so they are printed beside the offset, not filed in
+            # `r<N>.summary.json` where nothing reads them.
+            lines.append(
+                "  - observed: ours "
+                f"{_sample_count(clock, 'ours_busy_samples')} busy / "
+                f"{_sample_count(clock, 'ours_idle_samples_excluded')} idle, vLLM "
+                f"{_sample_count(clock, 'vllm_busy_samples')} busy / "
+                f"{_sample_count(clock, 'vllm_idle_samples_excluded')} idle"
             )
         for reason in clock.get("reasons", []):
             lines.append(f"  - {reason}")

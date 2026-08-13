@@ -40,7 +40,11 @@ is pending and blocked on [#522](https://github.com/mudler/vllm.cpp/issues/522).
 byte-identical `marlin::Marlin` by +9.65%, larger than either deficit that
 comparison ranked. The harness now records the clock window, `clocks.max.sm`,
 the applications clock, the active throttle reasons, persistence mode and the
-**boot id** per leg, refuses a cross-boot pair, and voids an over-spread run
+**boot id** per leg, refuses a cross-boot pair, and voids a run whose window was
+over-spread or barely observed — a single busy sample scores a perfect 0.00%
+spread, so the retained sample count and the busy fraction are floored and
+printed. The cross-boot override waives the boot id and nothing else: the GPU,
+driver and clock ceilings are compared across the arms either way
 ([spec](../.agents/specs/bench-assert-clock-state.md)). Every speed figure
 recorded before this date predates the assertion: not withdrawn, not restated,
 but carrying no clock attribution. The first attributable grid is pending on the

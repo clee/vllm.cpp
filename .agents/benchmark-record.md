@@ -20399,14 +20399,27 @@ statistics and counted, never silently dropped. `online_gate_summary.py` folds
 an arm's three legs, refuses a cross-boot pair, voids a run whose within-window
 spread exceeds **5%** or whose arms' medians differ by more than **1%**, and
 attaches the clock block to every ratio so the clock can be sized against the
-effect without leaving the row. `--allow-cross-boot` waives identity, never
-state, and stamps a recorded caveat.
+effect without leaving the row. `--allow-cross-boot` stamps a recorded caveat and
+waives **`boot_id` and nothing else** — the GPU, driver, `clocks.max.sm`,
+applications clock and persistence mode are compared across the arms
+unconditionally, because same-boot equality was the only thing standing in for
+"same machine" and the override removes it.
 
-Both thresholds are arguments from the table above and are derived in
-`.agents/specs/bench-assert-clock-state.md`. The transfer used to report an
-estimated effect — **0.754** points of kernel time per point of clock — is
-`n = 1`, is reported and never gated on, and is owed a second pair once #545
-allows one.
+A window must also have been **observed**: at least **30 retained busy samples**
+and a **majority** of the window busy. Without those floors the incentive is
+inverted — `spread_pct` over `n == 1` is definitionally **0.00%**, the best score
+the gate can award, so six legs each holding one busy sample and 300 idle scored
+a clean pass at `+0.00%`. Both counts are now carried in the ratio's clock block
+and printed beside the offset.
+
+All four thresholds are arguments from the table above and from the grid
+definition, derived in `.agents/specs/bench-assert-clock-state.md`. The **5%**
+spread ceiling is deliberately *not* held to the forward criterion the **1%**
+offset was chosen by; the spec says why and states the residual. The transfer
+used to report an estimated effect — **0.7548** points of kernel time per point
+of clock — is `n = 1`, is reported and never gated on, and is owed a second pair
+once #545 allows one; the offset threshold no longer rests on it, holding
+instead at the transfer's physical ceiling of 1.0.
 
 ### Live state at the time of writing
 

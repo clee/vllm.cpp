@@ -81,7 +81,7 @@ STATIC_FIELDS: tuple[str, ...] = (
     "persistence_mode",
 )
 
-# --- Thresholds. Both are arguments from the data above, not preferences. -----
+# --- Thresholds. All four are arguments from the data above, not preferences. -
 #
 # Within-run spread, 5.0%. The admissible band is bounded on both sides: it must
 # ACCEPT the only clean window we have, (2489-2398)/2470 = 3.68%, because a
@@ -90,18 +90,74 @@ STATIC_FIELDS: tuple[str, ...] = (
 # is ~26% however it is normalized. 5.0 clears the clean observation by ~1.3
 # points so a marginally noisier but healthy window is not spuriously voided,
 # and sits roughly five times below the failure it exists to catch.
+#
+# It is deliberately NOT held to the forward criterion the offset below is held
+# to. 5.0 x the transfer is 3.77%, above the 2.97% smallest deficit ranked, so a
+# leg sitting AT the spread ceiling can carry an artifact larger than that
+# deficit. The two rules defend different things and the difference is the
+# reason. The offset bounds a SYSTEMATIC difference between the arms -- one arm
+# ran at one clock and the other at another, and the whole of it transfers into
+# the ratio -- so it must sit under the smallest effect anyone ranks. Spread
+# bounds DISPERSION inside one arm's window, which does not transfer that way:
+# both arms sweep the same six concurrency points on the same box, so most of
+# the dispersion is common, and what survives into the ratio is the difference
+# of two medians, which MAX_CROSS_ARM_OFFSET_PCT already bounds at 1.0%. The
+# spread rule's job is to detect that a window was not ONE state at all (the 26%
+# within-boot disagreement), not to bound a transferable bias. Tightening it to
+# satisfy the forward criterion would mean <=3.93%, which sits 0.25 points above
+# our only clean capture and would void it on any noisier-but-healthy day -- the
+# exact failure the both-sides bound was chosen to avoid. The residual is stated
+# rather than hidden: passing spread establishes that each arm was one state, it
+# does NOT by itself establish a sub-4% deficit. The offset rule is what
+# qualifies the ratio.
 MAX_WITHIN_RUN_SPREAD_PCT = 5.0
 #
-# Cross-arm median offset, 1.0%. At the measured transfer below a 1.0% offset
-# estimates to ~0.75% of kernel time, comfortably under the 2.97% smallest
-# deficit this harness has been used to rank -- so a pair inside the threshold
-# cannot have had its ranking inverted by clocks.
+# Cross-arm median offset, 1.0%. For any kernel whose time scales with clock the
+# transfer is bounded above by 1.0 -- a 12.79% clock deficit can cost at most
+# 12.79% of time -- so a 1.0% offset implies AT MOST a 1.0% effect on physics,
+# with no appeal to any measurement. That is already under the 2.97% smallest
+# deficit this harness has been used to rank, so a pair inside the threshold
+# cannot have had its ranking inverted by clocks. The measured 0.7548 below is
+# consistent with that ceiling and sits under it exactly as a partly
+# memory-bound kernel should, which is corroboration, not the argument.
 MAX_CROSS_ARM_OFFSET_PCT = 1.0
+#
+# Retained busy samples per window, 30. `spread_pct` over n == 1 is definitionally
+# 0.00% -- the BEST score the gate can award -- so without a floor the window the
+# sampler barely observed outscores the one it actually watched. Bounded on both
+# sides like the spread rule. It must ACCEPT the real windows: the only two
+# #543 captured are n=61 and n=50, and 30 sits 40% below the smaller. It must
+# REJECT the degenerate window, and 30 is 30x above n == 1. And it reads
+# straight off the sampler and the grid rather than off what happens to pass: at
+# the driver's `--interval 1` a busy sample is a second of OBSERVED BUSY GPU,
+# while the smallest configured leg (online_gate.POINTS_BY_MODEL's four-point
+# set: 6+6+12+24 prompts at 128 output tokens = 1920 sequential decode steps)
+# would have to average under ~16 ms/step INCLUDING its 48 prefills of 1024
+# tokens to finish in 30 busy seconds. #543's own table for this box is 82-88
+# ms/step. A leg below this floor is not a fast leg; it is an unobserved one.
+MIN_BUSY_SAMPLES = 30
+#
+# Busy fraction of the window, 0.5. The count floor alone does not catch
+# dilution: 30 busy among 3000 idle still clears it, and the reported spread
+# still describes 1% of the window. The sampler covers the BENCH LOOP only -- it
+# starts after the preflight stream and stops before the after-thermal snapshot
+# -- so the non-busy time inside it is the client startup between six
+# `online_gate.py bench` invocations, not model load, not cache drops, not
+# server start, while the GPU serves 336 requests of 1024-in/128-out across the
+# span. Requiring the MAJORITY of the window to be busy is the weakest form of
+# the claim the record makes, namely that it describes the measured work. It is
+# also the field that betrays a sampler which outlived its leg: an orphan accrues
+# idle samples without bound and nothing else in the record notices.
+MIN_BUSY_FRACTION = 0.5
 #
 # Percentage points of kernel time per percentage point of clock, from the one
 # cross-boot pair we have: +9.65% marlin over a 12.79% clock offset. The
-# step-level transfer was lower (0.565); the larger is used. THIS IS n = 1. It
-# is used only to REPORT an estimated effect and is never a gate term.
+# step-level transfer was lower (0.565); the larger is used. THIS IS n = 1. It is
+# not a gate TERM -- no gate expression evaluates it, which the mutation set
+# proves -- but it was a gate PREMISE, because MAX_CROSS_ARM_OFFSET_PCT was
+# chosen by multiplying through it. The physics bound above retires it from that
+# role: the threshold now holds at the transfer's theoretical ceiling of 1.0, so
+# the coefficient only ever REPORTS an estimated effect.
 CLOCK_TIME_TRANSFER = (49.6544 / 45.2845 - 1.0) / (2470.0 / 2190.0 - 1.0)
 
 # GpuIdle | ApplicationsClocksSetting | DisplayClockSetting. These say something
@@ -400,6 +456,11 @@ def validate_clock_record(record: Mapping[str, Any], *, label: str) -> None:
             )
     if not isinstance(summary["n"], int) or isinstance(summary["n"], bool) or summary["n"] < 1:
         raise HarnessError(f"{label} clock record sm_clock_mhz.n must be a positive count")
+    idle = record["idle_samples_excluded"]
+    if not isinstance(idle, int) or isinstance(idle, bool) or idle < 0:
+        raise HarnessError(
+            f"{label} clock record idle_samples_excluded must be a non-negative count"
+        )
     if float(summary["min"]) > float(summary["max"]):
         raise HarnessError(f"{label} clock record sm_clock_mhz min exceeds max")
     reasons = record["throttle_reasons_active"]
@@ -434,6 +495,27 @@ def clock_reasons(record: Mapping[str, Any], *, label: str) -> list[str]:
     except HarnessError as error:
         return [f"clock: {error}"]
     reasons: list[str] = []
+    # The coverage floors come FIRST because they qualify everything below them:
+    # a spread computed over one retained sample is 0.00% and says nothing, and
+    # a median computed over 1% of the window describes 1% of the window.
+    busy = int(record["sm_clock_mhz"]["n"])
+    idle = int(record["idle_samples_excluded"])
+    if busy < MIN_BUSY_SAMPLES:
+        reasons.append(
+            f"clock: {label} retained only {busy} busy SM-clock sample(s) over the "
+            f"measured window, below the {MIN_BUSY_SAMPLES} floor; a window this "
+            "short cannot establish a spread (over n == 1 the spread is "
+            "definitionally 0.00%, the best score the gate awards)"
+        )
+    observed = busy + idle
+    busy_fraction = busy / observed if observed else 0.0
+    if busy_fraction < MIN_BUSY_FRACTION:
+        reasons.append(
+            f"clock: {label} was idle for {idle} of {observed} SM-clock samples "
+            f"({busy_fraction * 100.0:.2f}% busy, below the "
+            f"{MIN_BUSY_FRACTION * 100.0:.0f}% floor); the retained window does not "
+            "describe the measured work"
+        )
     spread = float(record["sm_clock_mhz"]["spread_pct"])
     if spread > MAX_WITHIN_RUN_SPREAD_PCT + _THRESHOLD_EPSILON:
         reasons.append(
@@ -469,16 +551,37 @@ def compare_clock_records(
     medians, both spreads, the signed offset, and the estimated share of the
     ratio the clock alone explains.
 
-    `allow_cross_boot` waives IDENTITY, never STATE. It exists because #545
-    makes same-boot capture of a four-leg chain unreliable and a gate nobody can
-    satisfy is a gate everybody routes around; it converts the refusal into a
-    recorded caveat, and the spread and offset rules still apply.
+    `allow_cross_boot` waives ONE FIELD, `boot_id`, and nothing else. It exists
+    because #545 makes same-boot capture of a four-leg chain unreliable and a
+    gate nobody can satisfy is a gate everybody routes around; it converts that
+    one refusal into a recorded caveat, and every other rule still applies.
+
+    Because #545 makes the override the NORMAL path, the hardware the two arms
+    ran on is asserted here explicitly rather than left to same-boot equality as
+    an implicit proxy. Without that, waiving the boot silently waived "same
+    machine" too: a GB10 at 3003 MHz max against an H100 at 1980 compared clean,
+    with a caveat that said only "different boots".
     """
 
     reasons = [
         *clock_reasons(ours, label=ours_label),
         *clock_reasons(theirs, label=theirs_label),
     ]
+    # STATIC_FIELDS is enforced within a window (`build_clock_record`) and
+    # between one arm's legs (`merge_clock_records`); this is the third edge, and
+    # the only one the override can reach. It is UNCONDITIONAL: two arms that
+    # disagree on the GPU, the driver, the maximum SM clock, the applications
+    # clock, or persistence mode are not two arms of one comparison, and no
+    # override makes them so.
+    for field in STATIC_FIELDS:
+        ours_value = ours.get(field)
+        theirs_value = theirs.get(field)
+        if ours_value != theirs_value:
+            reasons.append(
+                f"clock: {ours_label} and {theirs_label} report a different {field} "
+                f"({ours_value!r} vs {theirs_value!r}); these are not two arms of "
+                "one comparison"
+            )
     caveats: list[str] = []
     ours_boot = str(ours.get("boot_id", ""))
     theirs_boot = str(theirs.get("boot_id", ""))
@@ -520,11 +623,18 @@ def compare_clock_records(
         ),
         "median_offset_pct": offset_pct,
         f"{ours_label}_boot_id": ours_boot,
+        # How much of the window each side actually observed. Without these two
+        # pairs a reader cannot tell a window the sampler watched from one it
+        # barely touched, and the latter scores a perfect 0.00% spread.
+        f"{ours_label}_busy_samples": _busy_or_none(ours),
+        f"{ours_label}_idle_samples_excluded": _idle_or_none(ours),
         f"{ours_label}_median_sm_mhz": ours_median,
         f"{ours_label}_spread_pct": _spread_or_none(ours),
         "reasons": reasons,
         "same_boot": same_boot,
         f"{theirs_label}_boot_id": theirs_boot,
+        f"{theirs_label}_busy_samples": _busy_or_none(theirs),
+        f"{theirs_label}_idle_samples_excluded": _idle_or_none(theirs),
         f"{theirs_label}_median_sm_mhz": theirs_median,
         f"{theirs_label}_spread_pct": _spread_or_none(theirs),
     }
@@ -547,6 +657,23 @@ def _median_or_none(record: Mapping[str, Any]) -> float | None:
 
 def _spread_or_none(record: Mapping[str, Any]) -> float | None:
     return _summary_field(record, "spread_pct")
+
+
+def _busy_or_none(record: Mapping[str, Any]) -> int | None:
+    summary = record.get("sm_clock_mhz")
+    if not isinstance(summary, Mapping):
+        return None
+    value = summary.get("n")
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value
+
+
+def _idle_or_none(record: Mapping[str, Any]) -> int | None:
+    value = record.get("idle_samples_excluded")
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value
 
 
 # --------------------------------------------------------------------------

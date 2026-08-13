@@ -52,6 +52,8 @@ gdn_packed_mode=""
 # the old 360 x 5 s timeout, preserved exactly.
 ready_poll_interval=0.2
 ready_timeout_seconds=1800
+# Hard ceiling on the SM-clock sampler's own lifetime (#543). See run_leg.
+clock_sampler_max_seconds=7200
 
 while (($#)); do
   case "$1" in
@@ -345,11 +347,32 @@ profile_control_flag=$([[ ${mode} == trace-only ]] && echo on || echo off)
 
 spid=""
 mpid=""
+# GLOBAL, exactly like mpid, because the EXIT trap has to be able to reap it. As
+# a `local` in run_leg it was invisible to cleanup_server, so any failure inside
+# the bench loop -- and `set -e` makes a failing `online_gate.py bench` exactly
+# that -- left the sampler polling nvidia-smi once a second forever on a box
+# another session may be measuring on.
+clock_pid=""
 startup_launch_epoch=""
 startup_ready_epoch=""
 profiled_pid=""
 profiled_pgid=""
+# Stop the clock sampler and REQUIRE it to have written its record. A leg whose
+# clock was not captured is not a leg with an unknown clock -- it is a number
+# that cannot be attributed to a box state, and online_gate_summary.py voids it.
+# Reads and clears the GLOBAL clock_pid so that calling it twice -- once on the
+# normal path, once from the EXIT trap -- is a no-op the second time.
+stop_clock_sampler() {
+  local pid=${clock_pid}
+  clock_pid=""
+  [[ -n ${pid} ]] || return 0
+  kill -TERM "${pid}" 2>/dev/null || true
+  wait "${pid}"
+}
 cleanup_server() {
+  # Before the server, because the sampler's window ends with the leg and an
+  # orphan here outlives the whole script.
+  stop_clock_sampler || true
   if [[ -n ${profiled_pid} ]] && kill -0 "${profiled_pid}" 2>/dev/null; then
     if [[ -n ${profiled_pgid} && ${profiled_pgid} == "${profiled_pid}" ]]; then
       kill -TERM -- "-${profiled_pgid}" 2>/dev/null || true
@@ -553,16 +576,6 @@ run_startup_leg() {
   echo "startup ${model}/${engine}/r${repetition}: ${elapsed}s" >&2
 }
 
-# Stop the clock sampler and REQUIRE it to have written its record. A leg whose
-# clock was not captured is not a leg with an unknown clock -- it is a number
-# that cannot be attributed to a box state, and online_gate_summary.py voids it.
-stop_clock_sampler() {
-  local pid=$1
-  [[ -n ${pid} ]] || return 0
-  kill -TERM "${pid}" 2>/dev/null || true
-  wait "${pid}"
-}
-
 run_leg() {
   local engine=$1 repetition=$2
   local baseline final idle_ok=0
@@ -574,7 +587,6 @@ run_leg() {
   local preflight_dir="${evidence}/preflight/${model}/${engine}"
   local before_cache="${cache_dir}/r${repetition}-before.json"
   local after_cache="${cache_dir}/r${repetition}-after.json"
-  local clock_pid=""
   mkdir -p \
     "${memory_dir}" "${thermal_dir}" "${clock_dir}" "${return_dir}" "${cache_dir}" \
     "${preflight_dir}"
@@ -604,17 +616,26 @@ run_leg() {
   # grid's rather than the server's warm-up, and stops before the after-thermal
   # snapshot. One probe per second, launched identically on both arms, so its
   # cost cancels in the ratio exactly as the memory sampler's does.
+  #
+  # --max-duration is the sampler's OWN stop condition, carried over from the
+  # memory sampler's --pid: that one dies with the process it watches, and this
+  # one must likewise not depend on a signal an aborting caller may never send.
+  # The ceiling is a safety net, not a budget -- it sits above the driver's own
+  # readiness budget (ready_timeout_seconds, 1800 s) by 4x, so it cannot truncate
+  # a leg the rest of the driver would still consider live, while an orphan dies
+  # instead of polling nvidia-smi once a second forever on a SHARED box.
   python3 "${repo_root}/tools/bench/gpu_clock_state.py" sample \
     --output "${clock_dir}/r${repetition}.samples.jsonl" \
     --summary "${clock_dir}/r${repetition}.summary.json" \
-    --interval 1 &
+    --interval 1 \
+    --max-duration "${clock_sampler_max_seconds}" &
   clock_pid=$!
 
   local concurrency
   for concurrency in ${concurrency_points}; do
     kill -0 "${spid}" 2>/dev/null || {
       echo "server died before c${concurrency}" >&2
-      stop_clock_sampler "${clock_pid}" || true
+      stop_clock_sampler || true
       return 1
     }
     python3 "${repo_root}/tools/bench/online_gate.py" bench \
@@ -627,7 +648,7 @@ run_leg() {
       --concurrency "${concurrency}" \
       --repetition "${repetition}"
   done
-  stop_clock_sampler "${clock_pid}" || {
+  stop_clock_sampler || {
     echo "SM-clock sampler failed for ${model}/${engine}/r${repetition}" >&2
     cleanup_server
     return 1
