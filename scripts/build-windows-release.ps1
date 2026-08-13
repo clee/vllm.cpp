@@ -91,6 +91,7 @@ exit 23
             throw "nonzero child exit was accepted"
         }
         $failingChildProcessId = [int](Get-Content -LiteralPath $callLog -Raw)
+        Write-Host "Invoke-Checked PID contract: parent=$parentProcessId failure_child=$failingChildProcessId"
         if ($failingChildProcessId -eq $parentProcessId) {
             throw "failure target did not execute in a child process"
         }

@@ -668,6 +668,26 @@ direct `.ps1`, changing exit 23 to exit 24, or bypassing `Invoke-Checked` makes
 both structural and live-process coverage red. Native hosted Windows remains
 the final authority for Windows process semantics.
 
+Fresh review of `8dfddfed2b27f6830768acbe32803c1bb7399459` found that the
+external live Python test still trusted the contract's in-script PID guard.
+Deleting that guard left the live method green, so the claimed child-process
+evidence was not independently checked outside the script. The strengthened
+contract emits one stable diagnostic containing only the parent and failing
+child integer PIDs. The live Python method parses both values, requires each to
+be positive, and independently rejects equality; it also pins the exact runtime
+equality guard so removing either layer is red.
+
+Before the test change, deleting the runtime guard reproduced the false green.
+The strengthened test was then RED because the diagnostic did not yet exist.
+After adding the diagnostic only to `Invoke-CheckedContractTests`, the direct
+PowerShell contract and live Python method pass with distinct PIDs. Removing
+the runtime guard, launching the failing `.ps1` directly, changing exit 23 to
+exit 24, and bypassing `Invoke-Checked` each made the focused live method red;
+each mutation was restored before the next. All 9 Windows metadata tests, all
+42 release-pipeline tests, all 76 Windows-portability tests, and the four direct
+Windows release checkers pass. Production `Invoke-Checked`, the release gate,
+and release topology remain unchanged; native hosted Windows is still binding.
+
 #### #540 implementation outcome
 
 Implementation evidence: the focused contract was red with all six old

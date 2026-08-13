@@ -299,6 +299,16 @@ class WindowsMetadataContract(unittest.TestCase):
         self.assertEqual(dispatch.count("Invoke-CheckedContractTests"), 1)
 
     def test_contract_test_executes_real_children_under_powershell_core(self) -> None:
+        script = (ROOT / "scripts/build-windows-release.ps1").read_text(
+            encoding="utf-8"
+        )
+        runtime_pid_guard = (
+            "        if ($failingChildProcessId -eq $parentProcessId) {\n"
+            '            throw "failure target did not execute in a child process"\n'
+            "        }\n"
+        )
+        self.assertEqual(script.count(runtime_pid_guard), 1)
+
         pwsh = shutil.which("pwsh")
         if pwsh is None:
             snap_pwsh = Path("/snap/bin/pwsh")
@@ -325,6 +335,18 @@ class WindowsMetadataContract(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("Windows PowerShell/CRT contract tests OK", result.stdout)
+        pid_diagnostic = re.search(
+            r"(?m)^Invoke-Checked PID contract: parent=(?P<parent>[0-9]+) "
+            r"failure_child=(?P<child>[0-9]+)\r?$",
+            result.stdout,
+        )
+        if pid_diagnostic is None:
+            self.fail(f"missing Invoke-Checked PID diagnostic:\n{result.stdout}")
+        parent_process_id = int(pid_diagnostic.group("parent"))
+        failure_child_process_id = int(pid_diagnostic.group("child"))
+        self.assertGreater(parent_process_id, 0)
+        self.assertGreater(failure_child_process_id, 0)
+        self.assertNotEqual(parent_process_id, failure_child_process_id)
 
     def test_pe_report_rejects_msys_debug_crt_and_developer_paths(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
