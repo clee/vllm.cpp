@@ -414,6 +414,31 @@ TEST_CASE("ltx2 config: ParseLtx2DitParams mirrors LTXModelConfigurator") {
   }
 }
 
+TEST_CASE("ltx2 dit: Ltx2AttentionArgs::norm_eps is a LATENT default, so it is pinned") {
+  // The sixth instance the constant sweep turned up, and the most inert of them.
+  // `Ltx2AttentionArgs::norm_eps` is the eps of the q/k RMSNorm — upstream's
+  // `Attention.__init__` declares `norm_eps: float = 1e-6` (attention.py:485) and
+  // hands it to both `torch.nn.RMSNorm`s (attention.py:505-506) — but EVERY
+  // construction of the struct assigns it before use: ltx2_dit.cpp:188, :244,
+  // :280, :338, :366 from `Ltx2DitParams::norm_eps`, ltx2_connector.cpp:253 from
+  // `kLtx2ConnectorRmsNormEps`, and each of this suite's own arms from its
+  // ReducedParams.
+  //
+  // Measured, not assumed: mutating this default 1e-6 -> 1.0, a 10^6 change,
+  // leaves every suite green. That is not the invisible-epsilon story the other
+  // five tell — those are read and merely never bind. This one is never READ, so
+  // no fixture, however scaled, can reach it. It is a latent trap: the value a
+  // future call site inherits on the day someone adds one and forgets the
+  // assignment, at which point 1.0 would be silently applied inside an RMSNorm.
+  // A pin is the only instrument that can hold it, and this records that limit
+  // rather than dressing it up as coverage.
+  CHECK(vllm::Ltx2AttentionArgs{}.norm_eps == doctest::Approx(1e-6).epsilon(1e-12).scale(0.0));
+  // ...and it must agree with the DiT parameter that every real call site feeds
+  // it from, so the two cannot drift apart unnoticed.
+  CHECK(vllm::Ltx2AttentionArgs{}.norm_eps ==
+        doctest::Approx(vllm::Ltx2DitParams{}.norm_eps).epsilon(1e-12).scale(0.0));
+}
+
 TEST_CASE("ltx2 layout: the shapes recover the geometry") {
   const Ltx2DitParams p = ReducedParams(Ltx2RopeType::kSplit, false);
   const Ltx2DitParams derived = ParseLtx2DitParamsFromManifest(EnumerateLtx2DitTensors(p));

@@ -204,9 +204,10 @@ vllm::Ltx2AudioDecoderConfig ReducedAudioDecoderConfig(int64_t mel_bins) {
 }
 
 // The reduced GROUP-NORM audio decoder the generator built (AUDIO_GROUP_DEC).
-// `ch` is 32 because `build_normalization_layer` hardcodes `num_groups=32`
-// (normalization.py:56) and torch's GroupNorm refuses a channel count 32 does not
-// divide; `z_channels` is 16 because `PerChannelStatistics` indexes the
+// `ch` is 32 because `build_normalization_layer` forwards its own `num_groups`
+// keyword, whose default is 32 and which no audio_vae call site passes
+// (normalization.py:44, 56), and torch's GroupNorm refuses a channel count 32
+// does not divide; `z_channels` is 16 because `PerChannelStatistics` indexes the
 // patchified `(c, f)` axis, so z_channels x latent mel bins must equal `ch`.
 vllm::Ltx2AudioDecoderConfig ReducedAudioDecoderGroupConfig() {
   vllm::Ltx2AudioDecoderConfig cfg = ReducedAudioDecoderConfig(
@@ -453,12 +454,16 @@ TEST_CASE("ltx2 vae: the GROUP-NORM audio decoder matches upstream ltx_core") {
   // the GroupNorm branch and `norm_eps` is not merely inert but never READ:
   // mutating it 1e-6 -> 1e-4, a 100x change, left all 33 cases green.
   //
-  // `norm_type = group` is not hypothetical. It is the DEFAULT of
-  // `AudioDecoder.__init__` (audio_vae.py:295) and the other half of
-  // `build_normalization_layer` (normalization.py:56-57); a checkpoint declaring
-  // it is legal wherever `causality_axis` is `none`, which is exactly what
-  // `ResnetBlock.__init__` permits (resnet.py:130-131). Without this arm such a
-  // checkpoint would run a 100x-wrong stabilizer and still produce a spectrogram.
+  // `norm_type = group` is not hypothetical, and it is not free either.
+  // `AudioDecoder.__init__` declares `norm_type = GROUP` (audio_vae.py:294) and
+  // on the next line `causality_axis = WIDTH` (audio_vae.py:295) — a pair
+  // `ResnetBlock` REFUSES, with `ValueError: Causal ResnetBlock with GroupNorm is
+  // not supported` (resnet.py:130-131), so constructing the upstream decoder on
+  // pure defaults raises rather than group-normalizing. What is legal, and what
+  // this arm runs, is a checkpoint that declares `causality_axis: none` alongside
+  // it — the other half of `build_normalization_layer` (normalization.py:56-57).
+  // Without this arm such a checkpoint would run a 100x-wrong stabilizer and
+  // still produce a spectrogram.
   const vllm::Ltx2AudioDecoderConfig cfg = ReducedAudioDecoderGroupConfig();
   ParamBag bag = BuildAudioDecoderParams(cfg);
   CheckManifest(bag, vllm_test::kLtx2AudioDecGroupParamNames,
@@ -1053,6 +1058,81 @@ TEST_CASE("ltx2 vae: the NON-causal Conv video decoder matches upstream ltx_core
   CHECK(causal_frames.data != frames.data);
 }
 
+TEST_CASE("ltx2 vae: the video decoder's norm_eps is gated where it BINDS") {
+  // THE ARM THAT MAKES `Ltx2ConvVideoDecoderConfig::norm_eps` NUMERICALLY
+  // REACHABLE, and the correction of a record that said it was not.
+  //
+  // The earlier claim — that this constant is invisible because upstream discards
+  // it on the PixelNorm arm — is FALSE. `ResnetBlock3D.__init__` builds
+  // `norm3 = nn.GroupNorm(num_groups=1, num_channels=in_channels, eps=eps)`
+  // whenever `in_channels != out_channels` (resnet.py:93-97), REGARDLESS of
+  // `norm_layer`, and `forward` applies it to the residual (resnet.py:178). Every
+  // `res_x_y` block therefore reads it, and the shipped section-5 arm above has
+  // one, at `up_blocks.4.norm3`.
+  //
+  // What was true is a statement about the FIXTURE, not the constant. norm3
+  // divides by `sqrt(var + eps)` over all of (C, T, H, W); five blocks deep that
+  // variance is ~0.2, so on section 5's golden 1e-6 -> 1e-4 moves 1.8e-6 — under
+  // the 5e-6 band — while 1e-6 -> 1.0 moves 1.6e-2. A 100x error passed because
+  // the denominator was large, which is an accident of scale and not a property
+  // worth recording as coverage.
+  //
+  // So this arm removes the accident. ONE `res_x_y` block puts norm3 directly
+  // behind conv_in, and a latent at a tenth of the usual scale leaves it a
+  // variance of ~5e-3 to compete with. `kLtx2VideoDecEpsZeroMove` is what the
+  // ORACLE measured for the mutation the other arms are blindest to — removing
+  // the epsilon entirely, which moves section 5's golden by 5.4e-7, a tenth of
+  // the band — so the sensitivity is gated here rather than narrated.
+  REQUIRE(vllm_test::kLtx2VideoDecEpsZeroMove > 10.0 * kLtx2GoldenTol);
+
+  vllm::Ltx2ConvVideoDecoderConfig cfg;
+  cfg.in_channels = 6;
+  cfg.out_channels = 3;
+  cfg.patch_size = 2;
+  cfg.norm_layer = vllm::Ltx2NormLayer::kPixelNorm;
+  cfg.causal = true;
+  cfg.timestep_conditioning = false;
+  cfg.spatial_padding_mode = vllm::Ltx2PaddingMode::kReflect;
+  cfg.base_channels = 8;
+  cfg.prefix = "ltx2.videodeceps.";
+  cfg.decoder_blocks = {{"res_x_y", 1, 2, false, false}};
+  // The constant under test is the FIELD DEFAULT, never an override — an arm that
+  // set it explicitly would gate the plumbing and not the value.
+  CHECK(cfg.norm_eps == doctest::Approx(1e-6).epsilon(1e-12).scale(0.0));
+
+  ParamBag bag = BuildVideoDecoderParams(cfg);
+  CheckManifest(bag, vllm_test::kLtx2VideoDecEpsParamNames,
+                vllm_test::kLtx2VideoDecEpsParamCounts,
+                std::size(vllm_test::kLtx2VideoDecEpsParamNames));
+  // norm3 exists only because the block changes channel count; without these two
+  // parameters the manifest would match a decoder that never reads the epsilon.
+  CHECK(bag.weights.Has("ltx2.videodeceps.up_blocks.0.norm3.weight"));
+  CHECK(bag.weights.Has("ltx2.videodeceps.up_blocks.0.norm3.bias"));
+
+  const int64_t lc = vllm_test::kLtx2VideoDecEpsLatentC;
+  const int64_t lt = vllm_test::kLtx2VideoDecEpsLatentT;
+  const int64_t lh = vllm_test::kLtx2VideoDecEpsLatentH;
+  const int64_t lw = vllm_test::kLtx2VideoDecEpsLatentW;
+  const std::vector<float> latent = Ltx2Input("ltx2.videodeceps.input", lc * lt * lh * lw,
+                                              vllm_test::kLtx2VideoDecEpsLatentScale);
+
+  GoldenNoise noise("ltx2.videodeceps.");
+  const vllm::Ltx2VideoFrames frames =
+      vllm::Ltx2ConvVideoDecode(cfg, bag.weights, latent, lc, lt, lh, lw, &noise);
+  CHECK(frames.channels == vllm_test::kLtx2VideoDecEpsOutC);
+  CHECK(frames.frames == vllm_test::kLtx2VideoDecEpsOutT);
+  CHECK(frames.height == vllm_test::kLtx2VideoDecEpsOutH);
+  CHECK(frames.width == vllm_test::kLtx2VideoDecEpsOutW);
+  // Neither timestep conditioning nor an inject_noise block, so upstream calls
+  // torch.randn zero times and this port must draw nothing either.
+  CHECK(noise.counts().empty());
+
+  const double err = MaxAbsDiff(frames.data, vllm_test::kLtx2VideoDecEpsGolden,
+                                std::size(vllm_test::kLtx2VideoDecEpsGolden));
+  INFO("norm_eps-binding video decoder max|diff| = " << err);
+  CHECK(err <= kLtx2GoldenTol);
+}
+
 TEST_CASE("ltx2 vae: video temporal causality is one-sided, proven by perturbation") {
   // The trap this catches: putting temporal padding on BOTH sides of a causal
   // Conv3d — or zero-padding it the way MiniMax-H3's Conv3d does instead of
@@ -1166,7 +1246,17 @@ TEST_CASE("ltx2 vae: every stabilizing epsilon is pinned to its upstream line") 
   // ResnetBlock3D's `eps: float = 1e-6` (video_vae/resnet.py:31), handed to every
   // nn.GroupNorm it builds (resnet.py:44, 65, 94) and carried by UNetMidBlock3D as
   // `resnet_eps` (resnet.py:216). This is the norm `res_x_y`'s shortcut uses.
-  // Mutation: 1e-6 -> 1e-4, a 100x change, left every golden green.
+  //
+  // CORRECTED. This one is NOT a member of the invisible class, and the record
+  // that put it here said so for a reason that does not hold: `norm3` is built at
+  // resnet.py:93-97 whenever `in_channels != out_channels`, REGARDLESS of
+  // `norm_layer`, and applied at resnet.py:178 — so a PixelNorm decoder reads it
+  // too, at every `res_x_y`. The 1e-6 -> 1e-4 mutation stayed green because
+  // section 5's norm3 sits five blocks deep behind a variance of ~0.2, not
+  // because nothing read the value. "ltx2 vae: the video decoder's norm_eps is
+  // gated where it BINDS" is the arm that removes that accident of scale; the pin
+  // stays because it still catches the edit a golden cannot, a regeneration that
+  // moves the constant and the goldens together.
   CHECK(vllm::Ltx2ConvVideoDecoderConfig{}.norm_eps ==
         doctest::Approx(1e-6).epsilon(1e-12).scale(0.0));
 

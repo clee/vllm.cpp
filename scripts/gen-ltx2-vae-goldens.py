@@ -268,19 +268,27 @@ AUDIO_DEC_LATENT_F = 2  # z_channels * mel_bins(latent) must equal `ch` (patchif
 # every arm above takes the PIXEL one, which is parameter-free and reads
 # `pixel_norm_eps`. On those arms `norm_eps` is not merely inert, it is never
 # LOADED: nothing in the audio VAE ever touches the GroupNorm branch, so mutating
-# the constant 100x moved no golden at all. `norm_type=group` is legal upstream
-# (it is the DEFAULT of both `AudioEncoder.__init__` and `AudioDecoder.__init__`)
-# and `ResnetBlock.__init__` permits it at `causality_axis=NONE`
-# (audio_vae/resnet.py:130-131), which is the configuration gated here.
+# the constant 100x moved no golden at all.
+#
+# `norm_type=group` is legal upstream, but NOT on defaults alone: both
+# `AudioEncoder.__init__` and `AudioDecoder.__init__` declare `norm_type = GROUP`
+# (audio_vae.py:82, :294) and, on the very next line, `causality_axis = WIDTH`
+# (audio_vae.py:83, :295) — a pair `ResnetBlock` refuses with
+# `ValueError: Causal ResnetBlock with GroupNorm is not supported`
+# (audio_vae/resnet.py:130-131). Constructing either class on pure defaults raises,
+# verified by construction against the pinned tree. What a checkpoint may legally
+# declare, and what these arms gate, is GROUP alongside `causality_axis=NONE`.
 #
 # TWO REDUCED DIMENSIONS MOVE, and both are forced, not chosen:
-#  * `ch` becomes 32 because `build_normalization_layer` HARDCODES `num_groups=32`
-#    and no audio_vae call site overrides it, so `torch.nn.GroupNorm` refuses any
-#    channel count that 32 does not divide. Every level is then 32/64/128.
+#  * `ch` becomes 32 because `build_normalization_layer` forwards its own
+#    `num_groups` keyword, whose default is 32 (normalization.py:44, 56), and no
+#    audio_vae call site passes one — so `torch.nn.GroupNorm` refuses any channel
+#    count that 32 does not divide. Every level is then 32/64/128.
 #  * `z_channels` becomes 16 because `PerChannelStatistics(latent_channels=ch)`
 #    indexes the patchified `(c, f)` axis, so `z_channels * mel_bins(latent)` has
 #    to equal the new `ch` (audio_vae.py:118, 318).
-# Nothing else changes, so a diff against the pixel arms is exactly the norm.
+# No other DIMENSION changes; the rest of the diff against the pixel arms is the
+# norm type and the causality axis it forces, which is what the arms are for.
 AUDIO_GROUP_DEC = {**AUDIO_DEC, "ch": 32, "z_channels": 16}
 AUDIO_GROUP_DEC_LATENT_T = 3
 AUDIO_GROUP_DEC_LATENT_F = 2
@@ -365,6 +373,44 @@ VIDEO_DEC = dict(
     base_channels=8,
 )
 VIDEO_LATENT = (1, 6, 3, 2, 2)
+
+# Section 5d — the arm on which `norm_eps` is a FIRST-ORDER term.
+#
+# `norm_eps` is NOT unreachable on the video decoder, and the earlier record that
+# called it "invisible" was wrong about the reason. `ResnetBlock3D.__init__`
+# builds `norm3 = nn.GroupNorm(num_groups=1, num_channels=in_channels, eps=eps)`
+# whenever `in_channels != out_channels` (resnet.py:93-97) — REGARDLESS of
+# `norm_layer` — and `forward` applies it to the residual (resnet.py:178). So
+# every `res_x_y` block reads the constant even on the PIXEL_NORM arms, and
+# section 5 above has one.
+#
+# What was actually true is a sensitivity statement about the FIXTURE, not a
+# reachability statement about the constant. norm3 divides by
+# `sqrt(var + eps)` over ALL of (C, T, H, W), and on section 5's arm that
+# variance is ~0.2 at a norm3 that sits five blocks deep, so 1e-6 -> 1e-4 moves
+# the golden 1.8e-6 — under the 5e-6 band — while 1e-6 -> 1.0 moves it 1.6e-2.
+# The band accepted a 100x error only because the denominator was large.
+#
+# This arm removes that accident instead of recording it. ONE `res_x_y` block, so
+# norm3 sits directly behind conv_in, and a latent at a tenth of the usual scale,
+# so the variance it competes with is ~5e-3 rather than ~0.2. Every mutation of
+# the constant then moves the golden by 1e-5 or more, INCLUDING eps -> 0, which
+# no other arm in this file can see. Nothing else about the arm is unusual: the
+# weights come from the same stream, the padding mode and causality match section
+# 5, and `timestep_conditioning` is off only because the epsilon is what is under
+# test and the noise stream is not.
+VIDEO_EPS_BLOCKS = [("res_x_y", {"num_layers": 1, "multiplier": 2})]
+VIDEO_EPS_DEC = dict(
+    convolution_dimensions=3,
+    in_channels=6,
+    out_channels=3,
+    patch_size=2,
+    causal=True,
+    timestep_conditioning=False,
+    base_channels=8,
+)
+VIDEO_EPS_LATENT = (1, 6, 3, 2, 2)
+VIDEO_EPS_LATENT_SCALE = 0.1
 
 
 def section_audio_decoder(out) -> None:
@@ -778,6 +824,62 @@ def section_conv_video_decoder(out) -> None:
     emit_manifest(out, "kLtx2VideoDecNcParam", noncausal_manifest)
     emit_f32(out, "kLtx2VideoDecNcGolden", y_nc.numpy())
 
+    # --- section 5d: the arm where `norm_eps` actually BINDS ---
+    # See VIDEO_EPS_BLOCKS for why this arm exists. No torch.randn patch: with
+    # `timestep_conditioning=False` and no `inject_noise` block, the decoder draws
+    # nothing, which the C++ side asserts by requiring an EMPTY draw list.
+    eps_dec = ConvVideoDecoder(
+        decoder_blocks=VIDEO_EPS_BLOCKS,
+        norm_layer=NormLayerType.PIXEL_NORM,
+        decoder_spatial_padding_mode=PaddingModeType.REFLECT,
+        **VIDEO_EPS_DEC,
+    ).eval()
+    eps_manifest = fill_from_stream(eps_dec, prefix="ltx2.videodeceps.")
+    eps_latent = make_input("ltx2.videodeceps.input", VIDEO_EPS_LATENT, VIDEO_EPS_LATENT_SCALE)
+
+    norm3 = [m for m in eps_dec.modules() if isinstance(m, torch.nn.GroupNorm)]
+    assert len(norm3) == 1, (
+        f"the eps arm must have EXACTLY ONE nn.GroupNorm (norm3), found {len(norm3)}"
+    )
+    assert norm3[0].eps == 1e-6, "norm3 must carry the constant this arm gates"
+    y_eps = eps_dec(eps_latent)
+
+    # PROVEN SENSITIVE, not assumed — the same discipline section 5b applies to its
+    # causality probe and section 4b to the mel clamp. eps -> 0 is the mutation the
+    # OTHER arms are blindest to (section 5's golden moves 5.4e-7 under it, a tenth
+    # of the band), so it is the one this arm has to catch.
+    norm3[0].eps = 0.0
+    try:
+        y_zero = eps_dec(eps_latent)
+    finally:
+        norm3[0].eps = 1e-6
+    zero_move = float((y_eps - y_zero).abs().max())
+    assert zero_move > 10 * 5e-6, (
+        f"the eps arm must move well past the 5e-6 band when the constant is "
+        f"removed, moved only {zero_move:g}"
+    )
+    print(f"[eps arm] norm3 in {tuple(y_eps.shape)}; eps 1e-6 -> 0 moves {zero_move:g}",
+          file=sys.stderr)
+
+    out.write("// --- section 5d: the arm on which `norm_eps` BINDS (resnet.py:93-97) ---\n")
+    emit_scalar(out, "kLtx2VideoDecEpsLatentC", VIDEO_EPS_LATENT[1])
+    emit_scalar(out, "kLtx2VideoDecEpsLatentT", VIDEO_EPS_LATENT[2])
+    emit_scalar(out, "kLtx2VideoDecEpsLatentH", VIDEO_EPS_LATENT[3])
+    emit_scalar(out, "kLtx2VideoDecEpsLatentW", VIDEO_EPS_LATENT[4])
+    out.write("inline constexpr double kLtx2VideoDecEpsLatentScale = "
+              + _cxx_float(VIDEO_EPS_LATENT_SCALE, 17) + ";\n")
+    emit_scalar(out, "kLtx2VideoDecEpsOutC", y_eps.shape[1])
+    emit_scalar(out, "kLtx2VideoDecEpsOutT", y_eps.shape[2])
+    emit_scalar(out, "kLtx2VideoDecEpsOutH", y_eps.shape[3])
+    emit_scalar(out, "kLtx2VideoDecEpsOutW", y_eps.shape[4])
+    # How far the golden travels when the constant is REMOVED, measured on the
+    # oracle. The C++ arm requires it to clear the band by a wide margin, so the
+    # sensitivity this arm exists for is gated rather than narrated.
+    out.write("inline constexpr double kLtx2VideoDecEpsZeroMove = "
+              + _cxx_float(zero_move, 9) + ";\n\n")
+    emit_manifest(out, "kLtx2VideoDecEpsParam", eps_manifest)
+    emit_f32(out, "kLtx2VideoDecEpsGolden", y_eps.numpy())
+
 
 # ---------------------------------------------------------------------------
 # Sections 6-8 — the ENCODER halves (phase L11), which L4 recorded as owed.
@@ -856,8 +958,9 @@ AUDIO_ENC = dict(
 AUDIO_ENC_FRAMES = 8
 AUDIO_ENC_MEL = 8
 # Section 7d — the encoder's GROUP-NORM arm. Same two forced dimension changes as
-# AUDIO_GROUP_DEC, for the same two reasons: `num_groups=32` is hardcoded in
-# `build_normalization_layer`, and `z_channels * mel_bins(latent)` must equal `ch`
+# AUDIO_GROUP_DEC, for the same two reasons: `build_normalization_layer`'s own
+# `num_groups` default is 32 and nothing overrides it (normalization.py:44, 56),
+# and `z_channels * mel_bins(latent)` must equal `ch`
 # because `PerChannelStatistics` indexes the patchified `(c, f)` axis. The encoder
 # reaches its deepest level at 8 -> 4 -> 2 mel bins, so 16 * 2 = 32.
 AUDIO_GROUP_ENC = {**AUDIO_ENC, "ch": 32, "z_channels": 16}

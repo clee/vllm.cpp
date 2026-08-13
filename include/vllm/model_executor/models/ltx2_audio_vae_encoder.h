@@ -90,14 +90,22 @@ struct Ltx2AudioEncoderConfig {
   bool mid_block_add_attention = true;
   Ltx2NormType norm_type = Ltx2NormType::kPixel;
   Ltx2CausalityAxis causality_axis = Ltx2CausalityAxis::kHeight;
-  // Only read on the GroupNorm arm; PixelNorm is parameter-free. Both are
-  // HARDCODED upstream — `build_normalization_layer` builds
-  // `torch.nn.GroupNorm(num_groups=32, ..., eps=1e-6)` (normalization.py:56) and
-  // nothing in audio_vae overrides either — so they are fields only so the gate
-  // can pin them. `norm_type = kGroup` is `AudioEncoder.__init__`'s own DEFAULT
-  // (audio_vae.py:81) and legal at `causality_axis = kNone` (resnet.py:130-131);
-  // it is gated numerically by the group-norm golden in test_ltx2_vae.cpp, which
-  // is what stopped this eps from being a constant no arm ever read.
+  // Only read on the GroupNorm arm; PixelNorm is parameter-free. Neither is
+  // reachable from a checkpoint: `build_normalization_layer` passes `eps=1e-6` as
+  // a LITERAL and forwards its own `num_groups` keyword, whose default is 32
+  // (normalization.py:44, 56), and no audio_vae call site passes `num_groups` at
+  // all — so they are fields only so the gate can pin them.
+  //
+  // `norm_type = kGroup` is `AudioEncoder.__init__`'s declared default
+  // (audio_vae.py:82), but it is NOT what pure defaults give you: the paired
+  // default is `causality_axis = WIDTH` (audio_vae.py:83), and `ResnetBlock`
+  // refuses GroupNorm on any causal axis with
+  // `ValueError: Causal ResnetBlock with GroupNorm is not supported`
+  // (resnet.py:130-131) — verified by construction against the pinned upstream.
+  // So a group-norm checkpoint is one that declares `causality_axis: none`
+  // alongside it, which is legal and is what the group-norm golden in
+  // test_ltx2_vae.cpp runs. That arm is what stopped this eps from being a
+  // constant no arm ever read.
   int64_t num_groups = 32;
   double norm_eps = 1e-6;
   // Reached through `build_normalization_layer`, which passes eps=1e-6

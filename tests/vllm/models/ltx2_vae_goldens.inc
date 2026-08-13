@@ -3959,6 +3959,66 @@ inline constexpr float kLtx2VideoDecNcGolden[] = {
     -0.284617603f, -0.397902191f, -0.13071467f, -0.841662765f, 0.062342234f, 0.121501237f,
 };
 
+// --- section 5d: the arm on which `norm_eps` BINDS (resnet.py:93-97) ---
+inline constexpr int64_t kLtx2VideoDecEpsLatentC = 6;
+inline constexpr int64_t kLtx2VideoDecEpsLatentT = 3;
+inline constexpr int64_t kLtx2VideoDecEpsLatentH = 2;
+inline constexpr int64_t kLtx2VideoDecEpsLatentW = 2;
+inline constexpr double kLtx2VideoDecEpsLatentScale = 0.10000000000000001;
+inline constexpr int64_t kLtx2VideoDecEpsOutC = 3;
+inline constexpr int64_t kLtx2VideoDecEpsOutT = 3;
+inline constexpr int64_t kLtx2VideoDecEpsOutH = 4;
+inline constexpr int64_t kLtx2VideoDecEpsOutW = 4;
+inline constexpr double kLtx2VideoDecEpsZeroMove = 0.00010240078;
+
+inline constexpr const char* kLtx2VideoDecEpsParamNames[] = {
+    "ltx2.videodeceps.per_channel_statistics.std-of-means",
+    "ltx2.videodeceps.per_channel_statistics.mean-of-means",
+    "ltx2.videodeceps.conv_in.conv.weight",
+    "ltx2.videodeceps.conv_in.conv.bias",
+    "ltx2.videodeceps.up_blocks.0.conv1.conv.weight",
+    "ltx2.videodeceps.up_blocks.0.conv1.conv.bias",
+    "ltx2.videodeceps.up_blocks.0.conv2.conv.weight",
+    "ltx2.videodeceps.up_blocks.0.conv2.conv.bias",
+    "ltx2.videodeceps.up_blocks.0.conv_shortcut.weight",
+    "ltx2.videodeceps.up_blocks.0.conv_shortcut.bias",
+    "ltx2.videodeceps.up_blocks.0.norm3.weight",
+    "ltx2.videodeceps.up_blocks.0.norm3.bias",
+    "ltx2.videodeceps.conv_out.conv.weight",
+    "ltx2.videodeceps.conv_out.conv.bias",
+};
+inline constexpr int64_t kLtx2VideoDecEpsParamCounts[] = {
+    6, 6, 2592, 16, 3456, 8, 1728, 8, 128, 8,
+    16, 16, 2592, 12,
+};
+
+inline constexpr float kLtx2VideoDecEpsGolden[] = {
+    -0.090099901f, -0.190385759f, 0.380734861f, 0.718365669f, -0.31643483f, 0.147556275f,
+    -0.0505845137f, -0.789054036f, -0.11956919f, -0.145736665f, 0.434144616f, 0.35374558f,
+    -0.499161243f, 0.0523100793f, -0.120252334f, -0.878462672f, -0.16313675f, -0.163570255f,
+    0.486694992f, 0.785750449f, -0.228940845f, 0.12952736f, -0.112032175f, -0.843012929f,
+    -0.0985285193f, -0.171556711f, 0.395003319f, 0.435430497f, -0.60490793f, 0.00392973423f,
+    -0.0427067131f, -0.878887415f, -0.256884098f, -0.198793769f, 0.632248998f, 0.69324261f,
+    -0.274890065f, 0.390317559f, -0.294240803f, -0.995928526f, -0.190123811f, -0.107693791f,
+    0.427072853f, 0.395498425f, -0.587177634f, 0.138619155f, 0.0856989399f, -1.01287937f,
+    -0.397891402f, 0.402391732f, 0.0976787806f, -0.943622291f, -0.0623765476f, 0.504308522f,
+    -0.515643835f, -0.530895472f, -0.83202219f, 0.712152362f, 0.155863255f, -0.767041802f,
+    -0.400780559f, 0.23786135f, -0.750451028f, -0.787663937f, -0.299554139f, 0.338808537f,
+    0.133289099f, -0.993130922f, -0.0635531694f, 0.565576851f, -0.559501112f, -0.437328607f,
+    -0.915952027f, 0.752729118f, 0.0779756084f, -0.813403726f, -0.445726335f, 0.196311533f,
+    -0.612994373f, -0.705531895f, -0.54736352f, 0.387349099f, 0.215518951f, -0.881484926f,
+    -0.0314500444f, 0.279632688f, -0.549191356f, -0.49227643f, -0.832705796f, 0.583334982f,
+    0.124879047f, -0.890190005f, -0.261227369f, 0.205473766f, -0.546670079f, -0.696205318f,
+    -0.362264246f, 0.0967199802f, 0.162463546f, -0.0424314439f, 0.541362107f, -0.0823153034f,
+    -0.102280006f, 0.618953407f, -0.492172986f, -0.107823014f, 0.0281953812f, -0.214136556f,
+    -0.184159517f, -0.305839151f, -0.408877313f, 0.31305331f, -0.431710958f, 0.127348065f,
+    0.219748765f, -0.125161737f, 0.573620319f, -0.0725017786f, -0.167064339f, 0.606333792f,
+    -0.431218207f, -0.0944405794f, 0.0440774485f, -0.306593657f, -0.0629140884f, -0.260454893f,
+    -0.473808587f, 0.28820464f, -0.319598079f, 0.0228947997f, 0.0474464335f, -0.0519712567f,
+    0.500710905f, -0.0979719311f, -0.372783929f, 0.51922673f, -0.388694286f, 0.330318749f,
+    0.0460506156f, -0.246671095f, -0.131759092f, -0.448623538f, -0.278485179f, 0.350407869f,
+};
+
 // --- section 6a: VideoEncoder, the *_res family (video_vae.py:148-336) ---
 inline constexpr int64_t kLtx2VideoEncInC = 3;
 inline constexpr int64_t kLtx2VideoEncInT = 5;

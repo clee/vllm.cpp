@@ -683,10 +683,11 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
         "from here: this engine materializes the DECODER key filter only, so no "
         "VAE_ENCODER_COMFY_KEYS_FILTER / VideoEncoderConfigurator path "
         "(video_vae/model_configurator.py:72, 267) puts encoder weights in memory, and "
-        "upstream re-compresses every image conditioning at the checkpoint's "
-        "default_image_crf before encoding it (ImageConditioner.resolve_crf, "
-        "ltx-pipelines/utils/blocks.py:977), which is an H.264 round trip this build does "
-        "not do. Recorded as owed.");
+        "upstream resolves each image conditioning's CRF against the checkpoint's "
+        "default_image_crf when the caller left it unset (ImageConditioner.resolve_crf, "
+        "ltx-pipelines/utils/blocks.py:977-983) and then re-compresses through an H.264 "
+        "round trip unless that CRF is 0 (media_io/decode.py:413-435, from "
+        "load_image_and_preprocess :75), which this build does not do. Recorded as owed.");
   }
 
   // ── geometry ──────────────────────────────────────────────────────────────
