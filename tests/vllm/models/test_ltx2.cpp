@@ -362,6 +362,26 @@ TEST_CASE("ltx2 config: ParseLtx2DitParams mirrors LTXModelConfigurator") {
   CHECK(parsed.rope_type == Ltx2RopeType::kSplit);
   CHECK_FALSE(parsed.double_precision_rope);
 
+  // THE INVISIBLE-CONSTANT CLASS, in the DiT. `norm_eps` feeds the q/k RMSNorm
+  // (attention.py:505-506) and every AdaLN, but every arm in this suite passes it
+  // EXPLICITLY through ReducedParams, so nothing here reads the FIELD DEFAULT and
+  // a 100x mutation of it left all six LTX suites green. The default is not dead
+  // code: `ReducedConfig()` carries no `norm_eps` key, which is the shape of a
+  // checkpoint that omits it, and upstream's own fallback is
+  // `config.get("norm_eps", 1e-06)` (transformer/model_configurator.py:54, 124,
+  // 181). So the parse below is exactly the path the default binds on, and this
+  // pins it there rather than in a list far from its use.
+  CHECK(parsed.norm_eps == doctest::Approx(1e-6).epsilon(1e-12).scale(0.0));
+  {
+    // Not a SUBCASE deliberately: doctest re-enters the whole case body once per
+    // subcase, so adding one here would multiply every assertion above it and
+    // move this suite's recorded count for a reason unrelated to coverage.
+    nlohmann::json explicit_eps = ReducedConfig();
+    explicit_eps["config"]["transformer"]["norm_eps"] = 1e-5;
+    CHECK(ParseLtx2DitParams(explicit_eps).norm_eps ==
+          doctest::Approx(1e-5).epsilon(1e-12).scale(0.0));
+  }
+
   SUBCASE("frequencies_precision selects the float64 ladder") {
     nlohmann::json cfg = ReducedConfig();
     cfg["config"]["transformer"]["frequencies_precision"] = "float64";

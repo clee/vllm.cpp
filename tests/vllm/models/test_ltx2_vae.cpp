@@ -1294,6 +1294,17 @@ TEST_CASE("ltx2 vae: the two PixelNorm epsilons stay different") {
         doctest::Approx(1e-8).epsilon(1e-12).scale(0.0));
   CHECK(vllm::Ltx2AudioDecoderConfig{}.pixel_norm_eps !=
         vllm::Ltx2ConvVideoDecoderConfig{}.pixel_norm_eps);
+
+  // The two ENCODER halves phase L11 added carry the SAME split for the SAME
+  // reason, and this case only ever held the decoder pair. Both encoder epsilons
+  // are reachable by their own goldens, unlike the decoder pair, so this is not
+  // closing a silent hole — it is keeping the case's claim ("the two PixelNorm
+  // epsilons stay different") true of every config that has the field, rather
+  // than of the two it happened to be written for.
+  CHECK(vllm::Ltx2AudioEncoderConfig{}.pixel_norm_eps ==
+        doctest::Approx(1e-6).epsilon(1e-12).scale(0.0));
+  CHECK(vllm::Ltx2AudioEncoderConfig{}.pixel_norm_eps !=
+        vllm::Ltx2ConvVideoEncoderConfig{}.pixel_norm_eps);
 }
 
 TEST_CASE("ltx2 vae: the diffusion video decoder is refused by name, never downgraded") {
