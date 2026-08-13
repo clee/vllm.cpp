@@ -27,6 +27,8 @@
 #include "vllm/model_executor/models/qwen3_5_weights.h"   // OwnedTensor
 #include "vllm/platforms/interface.h"
 #include "vt/backend.h"
+#include "vt/device.h"  // kNumDeviceTypes
+#include "vt/dtype.h"   // VT_CHECK
 #include "vt/ops.h"
 
 namespace vllm {
@@ -73,6 +75,12 @@ inline Tensor Reshape(const Tensor& src, const std::vector<int64_t>& shape) {
 // layer down, and a mixed-backend process would have run a CUDA DBuf under the
 // CPU platform's policy. DBuf is a per-op hot path, so the virtual dispatch is
 // still paid at most once per device type.
+//
+// A backend whose platform was never REGISTERED now throws out of
+// `platforms::GetPlatform` instead of inheriting whichever device asked first.
+// That is the point: a residency cap read off another platform is a wrong
+// number wearing a default's clothes. Gated by
+// tests/vllm/models/test_device_pool.cpp.
 struct DevicePoolPolicy {
   size_t cap_bytes = 0;  // residency_policy().device_pool_cap_bytes (0 == uncapped)
 };
@@ -81,7 +89,12 @@ inline DevicePoolPolicy ResolveDevicePoolPolicy(const Dev& d) {
   // (every platform today) still caches. Racing threads resolve the same device
   // type to the same value, so the benign double-resolve needs no lock.
   static std::array<std::atomic<size_t>, vt::kNumDeviceTypes> cached{};
+  // Same bound, same place, as platforms::Index() (src/vllm/platforms/
+  // platform.cpp) applies to this identical value before indexing ITS registry.
+  // An out-of-range DeviceType is only reachable by a cast, and the two lookups
+  // must not disagree about whether that is a throw or a stray write.
   const size_t idx = static_cast<size_t>(d.q.device.type);
+  VT_CHECK(idx < vt::kNumDeviceTypes, "invalid device type");
   const size_t seen = cached[idx].load(std::memory_order_relaxed);
   if (seen != 0) return DevicePoolPolicy{seen - 1};
   const auto rp = vllm::platforms::GetPlatform(d.q.device.type).residency_policy();
@@ -162,8 +175,13 @@ class DBuf {
   // It replaces ~28 copies of a hand-written deleter that closed over the byte
   // count ALONE and called `Pool().Put(alloc, q)`. That idiom named neither the
   // device nor the pool, so it returned every such block to the one global pool
-  // — a block from another device (#516), and a block drawn from the aux-stream
-  // pool, both landing in the main device's free list.
+  // — a block from another device (#516), which was LIVE, and a block drawn
+  // from the aux-stream pool, which was not: none of the nine `Release()` sites
+  // sat inside or under any of the four `ActivePoolScope` regions, so the old
+  // deleter and the buffer's own `pool_` always agreed in practice. It was a
+  // hazard one new call site away from being real, and it is gone either way,
+  // because the carrier now captures the pool it came from rather than
+  // re-deriving it.
   std::shared_ptr<void> ReleaseShared() {
     DevicePool* const pool = pool_;
     Backend* const b = b_;

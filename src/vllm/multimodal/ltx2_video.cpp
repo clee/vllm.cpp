@@ -23,7 +23,7 @@
 #include <vector>
 
 #include "vllm/model_executor/model_loader/safetensors_reader.h"
-#include "vllm/model_executor/models/device_pool.h"  // ActivePool()/DevicePool::Drain
+#include "vllm/model_executor/models/device_pool.h"  // ActivePool(b)/DevicePool::Drain
 #include "vllm/model_executor/models/ltx2.h"
 #include "vllm/model_executor/models/ltx2_audio_vae.h"
 #include "vllm/model_executor/models/ltx2_connector.h"
@@ -1160,7 +1160,13 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
       const char* off = std::getenv("VLLM_LTX2_POOL_DRAIN");
       if (off == nullptr || off[0] != '0') {
         vt::Backend& backend = vt::GetBackend(im.device.type);
-        const size_t drained = ActivePool()->Drain(backend);
+        // `ActivePool(backend)`, not the device-less `ActivePool()` this line was
+        // written against (#516): "the pool" without a device is what handed one
+        // device's block to another, and draining it through `backend` was the
+        // same assumption twice — resolve a pool with no device, then free its
+        // blocks through an allocator that may not have made them. There is no
+        // device-less spelling any more, and `Drain` refuses a foreign backend.
+        const size_t drained = ActivePool(backend).Drain(backend);
         if (std::getenv("VT_POOL_STATS") != nullptr) {
           std::fprintf(stderr, "[ltx2] phase '%s' drained %.2f GiB of denoise scratch\n",
                        phase.name.c_str(),

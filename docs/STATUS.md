@@ -1414,6 +1414,17 @@ platform missing from `CurrentPlatform()`'s hardcoded walk registers and answers
 correctly but is NEVER selected, with no compiler diagnostic. `test_platform`
 now gates that every `DeviceType` is in the walk and CPU is last.
 
+**The device-scratch pool is now ONE POOL PER DEVICE (`POOL-DEVICE-KEY`, #516).**
+It was a process-wide free list keyed by byte size class with no device in the
+key, so in a mixed-backend process a block allocated through one backend was
+handed to the next caller of that class on another: a `cudaMalloc` block reaching
+a CPU forward SIGSEGVs host-side with `compute-sanitizer` clean, and a host block
+reaching a CUDA forward returned a uniform `0x7fff0000` quiet NaN. A pool is now
+bound to a backend, `Pool(b)` is the only spelling, every operation refuses a
+foreign backend, and the two per-caller workarounds are deleted. `test_device_pool`
+gates it without a GPU; `VT_POOL_BYPASS`/`VT_POOL_EXACT` keep their meanings and
+the suite is green under both.
+
 **CUDA architectures.** The runtime-gated production arch is GB10 `sm_121a`
 (every gate model, every benchmark). A build-supported cross-family fan-out
 (`sm_80/86/87/89`, `sm_90a`, `sm_100a/103a`, `sm_110`) compiles single-arch,

@@ -1,9 +1,32 @@
 # `POOL-DEVICE-KEY` — put the DEVICE in the `vllm::Pool()` free-list key
 
 **Issue:** [#516](https://github.com/mudler/vllm.cpp/issues/516) (open).
-**Row:** `POOL-DEVICE-KEY`. **Base:** `row/MODEL-DIFFUSION-LTX25` @ `aac24761`.
+**Row:** `POOL-DEVICE-KEY`. **Base:** `row/MODEL-DIFFUSION-LTX25`, REBASED onto
+`2d437d5a9` (which contains `origin/main`) from the stale `aac24761`.
 **Owning file:** this spec. **Status at write time:** spec committed before any
 implementation, per AGENTS.md "Spec before code".
+
+## Now
+
+`DONE` on `row/POOL-DEVICE-KEY`, landing THROUGH the campaign branch
+`row/MODEL-DIFFUSION-LTX25` rather than onto `main` directly. That is a
+sequencing fact, not a preference: `tests/vllm/models/test_ltx2_device.cpp` does
+not exist on `main` at all, and it is the ONLY test that exposes the silent-NaN
+direction, so removing its per-caller workaround — which §4 D6 requires, because
+a list of remembered callers is what this fault was — needs LTX-2.5 to land
+first.
+
+Records this row owns: this spec, the `#516` line in the issue table of
+[`../roadmap_v1.md`](../roadmap_v1.md), the `POOL-DEVICE-KEY` paragraph under
+"Backend detail" in [`docs/STATUS.md`](../../docs/STATUS.md), and the
+`porting-inventory.md` §L8 note, which said the shared `DevicePool` "is
+DEVICE-BLIND … repairing it is owed as its own row" and would have contradicted
+the tree the moment this merged. `docs/BENCHMARKS.md` is deliberately NOT
+written: this row claims no measurement on any speed, latency or memory axis
+(§6), and a row with nothing to record there records nothing there.
+
+Open, and named rather than closed by assertion: eight of the nine dgx `ctest`
+failures in §10 stay UNATTRIBUTED pending the BEFORE/AFTER pair described there.
 
 ## 1. Scope
 
@@ -148,8 +171,15 @@ not a device one.
 today is literally `alloc_bytes()`, then `Release()`, then a `std::shared_ptr`
 whose deleter closes over the byte count alone and calls `Pool().Put(alloc, q)`.
 That idiom names neither the device nor the pool, so
-it also silently returns AUX-pool blocks to the MAIN pool — a second, live bug
-in the same three lines. `ReleaseShared()` captures the buffer's OWN pool and
+it would also return AUX-pool blocks to the MAIN pool — a second bug in the same
+three lines, but a LATENT one: enumerated at the base commit, none of the nine
+`Release()` sites (`gemma4_moe.cpp:1197,1541`, `qwen3_5.cpp:6324,6520,6820,
+7100,7134,8034,8065`) is inside or transitively under any of the four
+`ActivePoolScope` regions (`laguna.cpp:2574`, `qwen3_5.cpp:5468,8644,8964`),
+which are leaf-ward of all of them, so the old deleter and the DBuf's own
+`pool_` agreed on every path that actually ran. The one place it WAS live at
+base is `test_deepseek_v2_forward`'s own workaround, which this change deletes.
+`ReleaseShared()` captures the buffer's OWN pool and
 backend, so both are right by construction, and the backend-less
 `Put(size_t, void*)` overload is removed with its last caller. Uncapped
 retention is preserved for these cross-step buffers via a new
@@ -177,8 +207,13 @@ Not chosen, and why:
 
 **T1 (RED-first, the row's own gate) — `tests/vllm/models/test_device_pool.cpp`,
 new target `test_device_pool`.** Hardware-free: two distinguishable fake
-`vt::Backend`s on the otherwise-unused `kXPU` slots, the technique
-`test_backend_multidevice` / `test_reference_tier` already use. Cases:
+`vt::Backend`s, the technique `test_backend_multidevice` /
+`test_reference_tier` already use, on `Device{kCPU,0}` and `Device{kCPU,1}` —
+two INDICES of one registered type, not two types. `kXPU` was the first idea
+and is wrong for the pool cases: it has no registered platform, so
+`ResolveDevicePoolPolicy` throws before the pool is ever reached and every case
+would measure the platform registry instead. `kXPU` earns exactly one case, the
+one that is ABOUT that throw (T1.7). Cases:
 
 1. **The defect.** Allocate on A, free, then allocate the same size class on B.
    The block B receives MUST NOT be the block A freed, and must come from B's
@@ -194,6 +229,20 @@ new target `test_device_pool`.** Hardware-free: two distinguishable fake
    rather than served.
 6. **`ReleaseShared()` returns the block to its own pool and backend**, and an
    AUX-scoped buffer returns to the AUX pool, not the main one.
+7. **A backend whose PLATFORM is unregistered is refused.** D5's per-device-type
+   memoization calls `platforms::GetPlatform` once per device TYPE instead of
+   once per process, so an unregistered type now throws where it used to inherit
+   the first device's cap. That is the correct answer and it is a NEW failure
+   mode, so it gets a case rather than a comment.
+
+**The two debug lanes stay GREEN.** §10 hands `VT_POOL_BYPASS=1` to the next
+reader as the cheap discriminator, so this suite must not red under it. Cases
+2, 4, 6 and the AUX half of 6 state the ACTIVE lane's behavior (a pooled hit by
+default, a fresh driver block under bypass); case 3 states sharing by default
+and SEPARATION under `VT_POOL_EXACT`, which is the assertion its second clause
+above always promised and never had. Both vars are read once into a
+function-local static in `DevicePool`, so a process is in one lane for its whole
+life and no case can toggle them.
 
 **T2 (end-to-end corroboration) — `test_ltx2_device --order-by=rand
 --rand-seed=7`.** No checkpoint, no NAS, ~2 s. RED before the fix (exit 139,
@@ -277,8 +326,10 @@ at both ends; `git log --oneline` and the final SHA.
 
 ## 10. Outcome
 
-Landed. Spec `17532ea0b` (this file, committed before any implementation), RED
-test `f4be8a4e2`, fix `1a2eb35ec`.
+Spec `17532ea0b` (this file, committed before any implementation), RED test
+`f4be8a4e2`, fix `1a2eb35ec` — the four original commits, later REBASED onto
+`row/MODEL-DIFFUSION-LTX25` @ `2d437d5a9` (see §11), so those SHAs name the
+history rather than the branch.
 
 **Environment.** dgx.casa, GB10 sm_121a, CUDA 13.0.88, configured with all three
 MANDATORY confirmations printed: `CUTLASS found at ~/cutlass-4.5.0; enabling

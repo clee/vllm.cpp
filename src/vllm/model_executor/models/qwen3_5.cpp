@@ -616,7 +616,9 @@ Tensor Reshape(const Tensor& src, const std::vector<int64_t>& shape) {
 // afterward. It used to be ONE function-local static, which cached whichever
 // device asked first and applied that cap to every later one — the same
 // ambient-device assumption #516 fixed one layer down (dense_device_glue.h
-// carries the identical repair).
+// carries the identical repair). A backend whose platform was never REGISTERED
+// therefore throws out of GetPlatform rather than inheriting the first device's
+// cap — a cap read off another platform is a wrong number, not a default.
 struct DevicePoolPolicy {
   size_t cap_bytes = 0;  // residency_policy().device_pool_cap_bytes (0 == uncapped)
 };
@@ -624,7 +626,10 @@ DevicePoolPolicy ResolveDevicePoolPolicy(const Dev& d) {
   // cap+1, so 0 means "not resolved yet" and a genuine cap of 0 (every platform
   // today) still caches. Racing threads resolve the same type to the same value.
   static std::array<std::atomic<size_t>, vt::kNumDeviceTypes> cached{};
+  // Same bound platforms::Index() applies to this identical value before
+  // indexing ITS registry (src/vllm/platforms/platform.cpp).
   const size_t idx = static_cast<size_t>(d.q.device.type);
+  VT_CHECK(idx < vt::kNumDeviceTypes, "invalid device type");
   const size_t seen = cached[idx].load(std::memory_order_relaxed);
   if (seen != 0) return DevicePoolPolicy{seen - 1};
   const auto rp = vllm::platforms::GetPlatform(d.q.device.type).residency_policy();

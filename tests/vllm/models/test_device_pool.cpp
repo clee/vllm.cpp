@@ -27,6 +27,19 @@
 // stack or heap address is ever reused — the pool is keyed on the backend's
 // identity, and an address reused by a later case would make one case's pool
 // answer another case's question.
+//
+// THE TWO DEBUG LANES ARE GREEN HERE, ON PURPOSE. `VT_POOL_BYPASS=1` removes the
+// free list and `VT_POOL_EXACT=1` removes size-class rounding; the spec's own
+// §10 hands `VT_POOL_BYPASS=1` to whoever picks up the unattributed dgx failures
+// as "the cheap discriminator that needs no second build". A suite that reds
+// under the very lane it tells you to use is a suite that costs its next reader
+// an hour deciding whether the red is theirs. So: a case whose subject is REUSE
+// states what the ACTIVE lane does — a pooled hit by default, a fresh driver
+// block under bypass — and the case whose subject is the SIZE CLASS states
+// sharing by default and SEPARATION under `VT_POOL_EXACT` (spec §5 T1.3's
+// second clause, which had no assertion until now). Both env vars are read ONCE
+// into a function-local static inside `DevicePool`, so a process is in exactly
+// one lane for its whole life and no case can toggle them.
 #include <doctest/doctest.h>
 
 #include <cstdlib>
@@ -36,6 +49,7 @@
 #include <vector>
 
 #include "vllm/model_executor/models/dense_device_glue.h"
+#include "vllm/platforms/interface.h"
 #include "vt/backend.h"
 #include "vt/device.h"
 
@@ -113,6 +127,18 @@ Queue QueueOn(int32_t index) {
   q.device = Device{DeviceType::kCPU, index};
   q.handle = nullptr;
   return q;
+}
+
+// The two debug lanes, spelled EXACTLY as `DevicePool::Bypass()` and
+// `DevicePool::ClassOf()` spell them ("=1", first character only), so this file
+// cannot disagree with the header about which lane a process is in.
+bool PoolBypass() {
+  const char* e = std::getenv("VT_POOL_BYPASS");
+  return e != nullptr && e[0] == '1';
+}
+bool PoolExact() {
+  const char* e = std::getenv("VT_POOL_EXACT");
+  return e != nullptr && e[0] == '1';
 }
 
 }  // namespace
@@ -208,8 +234,19 @@ TEST_CASE("device pool: reuse on ONE device still returns the identical block") 
     DBuf y(Dev{a, qa}, DType::kF32, shape);
     second = y.ptr();
   }
-  CHECK(second == first);                   // a pool HIT...
-  CHECK(a.allocs() == allocs_after_first);  // ...proven by the allocator counter
+  if (PoolBypass()) {
+    // The bypass lane HAS no free list — every Get is an exact-size driver
+    // Alloc and every Put a real Free, which is the whole reason it exists (it
+    // restores the allocation boundaries compute-sanitizer needs). Reuse is
+    // therefore the wrong expectation here, not a regression, and asserting the
+    // lane's own behavior is what keeps the lane usable as a discriminator.
+    CHECK(second != first);
+    CHECK(a.allocs() == allocs_after_first + 1);
+    CHECK(a.WasFreed(first));
+  } else {
+    CHECK(second == first);                   // a pool HIT...
+    CHECK(a.allocs() == allocs_after_first);  // ...proven by the allocator counter
+  }
 }
 
 TEST_CASE("device pool: size-class rounding still lets nearby sizes share a block") {
@@ -233,8 +270,26 @@ TEST_CASE("device pool: size-class rounding still lets nearby sizes share a bloc
     DBuf y(Dev{a, qa}, DType::kF32, {8192});  // 32,768 bytes, same class
     second = y.ptr();
   }
-  CHECK(second == first);
-  CHECK(a.allocs() == allocs_after_first);
+  const size_t lo_class = vllm::DevicePool::SizeClassForTest(32400);
+  const size_t hi_class = vllm::DevicePool::SizeClassForTest(32768);
+  if (PoolBypass()) {
+    CHECK(second != first);  // no free list at all, so nothing to share
+  } else if (PoolExact()) {
+    // Spec §5 T1.3's second clause, "`VT_POOL_EXACT` still separates them",
+    // which had no assertion anywhere until this one. Exact keying is the A/B
+    // arm that MEASURED the rounding innocent (still red), so it has to keep
+    // being a real second behavior and not merely a variable nobody reads.
+    CHECK(lo_class == 32400);
+    CHECK(hi_class == 32768);
+    CHECK(lo_class != hi_class);
+    CHECK(second != first);
+    CHECK(a.allocs() == allocs_after_first + 1);
+  } else {
+    CHECK(lo_class == hi_class);  // ...one class...
+    CHECK(lo_class == 32768);     // ...and it is the larger of the two
+    CHECK(second == first);
+    CHECK(a.allocs() == allocs_after_first);
+  }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -261,6 +316,17 @@ TEST_CASE("device pool: Drain frees ONE device's blocks, through ITS OWN backend
   {
     DBuf y(Dev{b, qb}, DType::kF32, shape);
     held_by_b = y.ptr();
+  }
+  if (PoolBypass()) {
+    // Bypass frees straight through, so both destructors already returned their
+    // block to their OWN backend and there is nothing retained to drain. That is
+    // the same device-scoped property this case is about, enforced by the
+    // absence of a free list rather than by the key — worth stating, because it
+    // is the arm the spec sends a reader to when a drain is under suspicion.
+    CHECK(a.frees() == 1);
+    CHECK(b.frees() == 1);
+    CHECK(vllm::Pool(a).Drain(a) == 0);
+    return;
   }
   REQUIRE(a.frees() == 0);
   REQUIRE(b.frees() == 0);
@@ -317,6 +383,13 @@ TEST_CASE("device pool: ReleaseShared returns the block to the pool it CAME FROM
     DBuf other(Dev{a, qa}, DType::kF32, shape);
     CHECK(other.ptr() != raw);
   }
+  if (PoolBypass()) {
+    // No free list, so the block does not come back. What the lane still proves
+    // — and it is the half that matters — is that the carrier's deleter ran
+    // against the buffer's OWN backend rather than an ambient one.
+    CHECK(a.WasFreed(raw));
+    return;
+  }
   // Carrier dropped -> the block is back in THIS device's pool.
   {
     DBuf again(Dev{a, qa}, DType::kF32, shape);
@@ -346,6 +419,12 @@ TEST_CASE("device pool: a scoped pool's block returns to the SCOPED pool, not th
     }  // scope ends BEFORE the carrier is dropped, deliberately
   }
 
+  if (PoolBypass()) {
+    // Neither pool retains anything under bypass; the deleter freed the block
+    // to the backend it was allocated from, which is all this lane can show.
+    CHECK(a.WasFreed(raw));
+    return;
+  }
   // The device's main pool must not have acquired it...
   {
     DBuf from_main(Dev{a, qa}, DType::kF32, shape);
@@ -357,4 +436,27 @@ TEST_CASE("device pool: a scoped pool's block returns to the SCOPED pool, not th
     DBuf from_scoped(Dev{a, qa}, DType::kF32, shape);
     CHECK(from_scoped.ptr() == raw);
   }
+}
+
+TEST_CASE("device pool: a backend whose PLATFORM is unregistered is REFUSED, not defaulted") {
+  // The residency policy is memoized PER DEVICE TYPE now (spec §4 D5), where it
+  // used to be one function-local static for the process. That closed the
+  // ambient-device hole one layer above the pool, and it opened a new failure
+  // mode with it: `platforms::GetPlatform` VT_CHECK-throws for an unregistered
+  // type, so a DBuf on such a backend now throws where it previously inherited
+  // whichever device happened to resolve FIRST. That is the correct answer — a
+  // `device_pool_cap_bytes` read off another platform is a wrong number, not a
+  // default — but a new throw with no test is a new throw nobody has run.
+  //
+  // kXPU is the type with no `RegisterPlatform` call anywhere in the tree (grep
+  // src/vllm/platforms/*.cpp: cpu, cuda, rocm, vulkan, metal, tenstorrent). The
+  // REQUIRE_FALSE states that as the precondition it is, so the day an XPU
+  // platform lands this case goes RED and asks to be re-pointed rather than
+  // quietly asserting nothing.
+  REQUIRE_FALSE(vllm::platforms::HasPlatform(DeviceType::kXPU));
+  TagBackend& a = NewBackend();
+  Queue q;
+  q.device = Device{DeviceType::kXPU, 0};
+  q.handle = nullptr;
+  CHECK_THROWS_AS(DBuf(Dev{a, q}, DType::kF32, {64}), std::runtime_error);
 }

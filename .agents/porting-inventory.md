@@ -1482,12 +1482,17 @@ Examples: `examples/cli` ✅ (C-API client), `examples/server` ✅ (OpenAI serve
       CPU-backend device forward AFTER a bf16 CUDA one; at f32 the two arms land
       in different size classes and never trade blocks. The pool already carries
       exactly this invariant for STREAMS — `AuxPool()` exists because "two streams
-      sharing one pool BREAKS" its reuse ordering — and the fix used here is that
-      same sanctioned seam: the CPU arm runs under an `ActivePoolScope` with its
-      own pool. **The DEVICE half of the invariant is still unstated at the pool
-      itself, and a size-keyed device-blind free list in a multi-device process is
-      a trap for the next caller. Repairing it is a shared-hot-path change and is
-      owed as its own row, not this one.**
+      sharing one pool BREAKS" its reuse ordering — and the first fix used that
+      same sanctioned seam: the CPU arm ran under an `ActivePoolScope` with its
+      own pool. **That workaround is GONE, and so is the fault it worked around.**
+      `POOL-DEVICE-KEY` ([#516](https://github.com/mudler/vllm.cpp/issues/516),
+      [`specs/pool-device-key.md`](specs/pool-device-key.md)) states the DEVICE
+      half at the pool itself: a `DevicePool` is bound to one backend, `Pool(b)`
+      is the only spelling and there is no device-less one, every operation
+      throws on a foreign backend, and the per-caller scope in
+      `test_ltx2_device.cpp` was DELETED in the same change — because a list of
+      remembered callers is what this fault was, and leaving one behind would
+      have disarmed the only test that exposes the silent-NaN direction.
     * **OWED, and precisely:** (a) the prompt-K/V cache on the device path, which
       is REFUSED by name rather than ignored; (b) an FP4-RESIDENT arm — the
       `LinearDev` seam is one parameter away from the shared Marlin W4A16

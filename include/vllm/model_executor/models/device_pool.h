@@ -121,9 +121,15 @@ class DevicePool {
   // This used to take no backend at all, which is how ~28 copy-pasted
   // `shared_ptr` deleters came to name neither the device nor the pool: they
   // closed over a byte count and called `Pool().Put(alloc, q)`, so a block from
-  // ANY device (and from the aux-stream pool) was returned to the one global
-  // pool. `DBuf::ReleaseShared()` is now the only way to build that carrier and
-  // it captures the buffer's own pool and backend (#516).
+  // ANY device was returned to the one global pool. The aux-stream half of that
+  // was LATENT rather than live: the deleter would have returned an AuxPool
+  // block to the main pool, but no `Release()` site sat under an
+  // `ActivePoolScope` — the four scope regions are leaf-ward of all nine of
+  // them — so the wrong-pool return was reachable only by adding a site, which
+  // is precisely the mistake that then costs a debugging campaign.
+  // `DBuf::ReleaseShared()` is now the only way to build that carrier and it
+  // captures the buffer's own pool and backend, so neither half can come back
+  // (#516).
   void Put(vt::Backend& b, size_t bytes, void* p) {
     RequireOwnDevice(b, "Put");
     // Bypass: free for real so a later use-after-free traps.

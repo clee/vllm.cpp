@@ -141,9 +141,18 @@ is uniformly NaN rather than wrong. Neither can happen now — a scratch pool is
 bound to one backend and refuses any other with a `std::logic_error` naming both
 — and no user-facing flag or env var selects the behaviour: it is unconditional.
 
+One consequence is worth knowing before you add a backend. The scratch pool's
+residency cap now comes from *that device's* platform rather than from whichever
+device resolved first, so constructing a buffer on a backend whose platform was
+never registered raises instead of silently inheriting another platform's cap. A
+cap read off the wrong platform is a wrong number, not a default, and every
+backend the tree ships registers one.
+
 `VT_POOL_BYPASS=1` and `VT_POOL_EXACT=1` keep exactly the meanings
 [ENVIRONMENT.md](ENVIRONMENT.md) records for them. They are debugging lanes, not
-timing configurations.
+timing configurations, and the pool's own test suite is green under both, so
+either one stays usable as a discriminator when something else is under
+suspicion.
 
 ## Starting an agent-assisted contribution
 
