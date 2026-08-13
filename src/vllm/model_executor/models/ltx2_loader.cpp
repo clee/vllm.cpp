@@ -541,8 +541,11 @@ std::vector<Ltx2TensorSpec> ContractOf(const Ltx2DitParams& params) {
   }
   Fail(
       "the checkpoint carries modules this port does NOT carry: " + list +
-      ". They are not dropped silently: keyframes_abs_pos_embedding means "
-      "use_keyframes_abs_pos_embedding is TRUE, and nothing here applies it. "
+      ". They are not dropped silently. This refusal is keyed on the TENSORS the "
+      "file carries, NOT on a declared flag, and that is deliberate: the FP8 DiT "
+      "carries a trained keyframes_abs_pos_embedding while declaring no "
+      "__metadata__ at all, so a flag-keyed refusal would read a DEFAULT rather "
+      "than the file and would silently discard it (see ltx2.h). "
       "prompt_adaln_single / audio_prompt_adaln_single are NO LONGER in this list "
       "— they were ported by row LTX25-PROMPT-ADALN "
       "(.agents/specs/ltx25-prompt-adaln.md, issue #644) and are now part of the "

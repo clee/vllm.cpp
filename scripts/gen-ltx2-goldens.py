@@ -752,15 +752,30 @@ def measure_prompt_adaln_magnitude() -> str:
         f"max|table| = {static_max:.6g}  ({term_max / static_max * 100:.1f}%)"
     )
     lines.append(
-        "// The two output rows are bounded by this generator's SYNTHETIC weight scale"
+        "// ALL FOUR ROWS ARE GATE-FLOOR NUMBERS FROM SYNTHETIC WEIGHTS. The table and"
     )
     lines.append(
-        "// (0.05, param_spec above) and by a 2-block stack; they are the FLOOR the gate"
+        "// the prompt-AdaLN MLP are BOTH drawn at param_spec's scale=0.05 above, so every"
     )
     lines.append(
-        "// needs, not a claim about the trained checkpoint. The K/V row is where the"
+        "// ratio here is a property of THIS FIXTURE and moves with that scale; the output"
     )
-    lines.append("// term actually enters and is the number that answers 'does this matter'.")
+    lines.append(
+        "// rows are bounded by it AND by a 2-block stack. They are reported because a"
+    )
+    lines.append(
+        "// mutation has to be shown to move something -- NOT as a claim about the trained"
+    )
+    lines.append(
+        "// checkpoint. On the SHIPPED DiT the term DOMINATES the table it is added to:"
+    )
+    lines.append(
+        "// rms|term|/rms|table| = 1347% video, 1583% audio, measured through upstream's"
+    )
+    lines.append(
+        "// own AdaLayerNormSingle on the real weights. See"
+    )
+    lines.append("// .agents/specs/ltx25-prompt-adaln.md section Outcome.")
     text = "\n".join(lines)
     print("prompt-AdaLN magnitude:\n" + text, file=sys.stderr)
     return text
@@ -818,7 +833,7 @@ def main() -> int:
         # Upstream's DEFAULT arm, and the one the shipped checkpoint runs.
         emit_prompt_adaln(out)
         out.write(
-            "// --- the MEASURED magnitude of the prompt-AdaLN term ---\n"
+            "// --- the prompt-AdaLN term's magnitude ON THIS SYNTHETIC FIXTURE ---\n"
             "// Same shared weights, same inputs, flag ON vs OFF:\n"
             + measure_prompt_adaln_magnitude()
             + "\n"

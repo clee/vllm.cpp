@@ -193,7 +193,9 @@ Ltx2DitParams ParseLtx2DitParams(const nlohmann::json& metadata) {
                !cfg.at("use_keyframes_abs_pos_embedding").is_boolean() ||
                !cfg.at("use_keyframes_abs_pos_embedding").get<bool>(),
            "ltx2: use_keyframes_abs_pos_embedding is not ported (transformer_args.py:23-43); "
-           "the LTX-2.5 checkpoint does not carry keyframes_abs_pos_embedding");
+           "upstream applies it on every prepare whose keyframes_mask is set, which "
+           "tools.py:186-196 populates unconditionally, so this is refused rather than "
+           "ignored (see ltx2.h for what each shipped DiT actually declares and carries)");
 
   VT_CHECK(p.num_attention_heads > 0 && p.attention_head_dim > 0 &&
                p.audio_num_attention_heads > 0 && p.audio_attention_head_dim > 0 &&

@@ -112,7 +112,11 @@
 // stays gateable — proceeds, still reporting every one of them in `unported`:
 //
 //   keyframes_abs_pos_embedding  [1, 4096]
-//       So `use_keyframes_abs_pos_embedding = TRUE`, contradicting ltx2.h:47-49.
+//       Present in the FP8 DiT and ABSENT from the NVFP4 one, whose config
+//       nonetheless DECLARES the flag `true` — so tensors and flag do not imply
+//       each other in either direction, and the refusal is keyed on the tensors.
+//       Corrected 2026-08-13 (#644); the measured behaviour of BOTH files, and
+//       why the keying stays on tensors, is in ltx2.h.
 //       This is now the ONLY flag `Ltx2AdoptDeclaredDitParams` clears in its
 //       config copy, and it must stay that way: a flag cleared there is invisible
 //       to the contract-equality check, so clearing a PORTED one silently drops

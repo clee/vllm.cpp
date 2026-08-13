@@ -228,10 +228,18 @@ byte cost.
 
 ## 6. Measured magnitude
 
-Recorded in §Outcome: the relative change in the modulated prompt context and in
-the DiT's outputs, flag ON vs OFF, at the reduced dimensions. This is the answer
-to "does this matter"; a number below round-off would mean the term is inert and
-the whole row is decoration.
+Recorded in §Outcome, on two fixtures that answer two different questions.
+
+The reduced-dimension generator gives the relative change in the modulated prompt
+context and in the DiT's outputs, flag ON vs OFF. That is a GATE FLOOR: a number
+below round-off would mean the term is inert and the mutation in §5.3 could not
+bite. It is **not** the answer to "does this matter", because both the static
+table and the prompt-AdaLN MLP are drawn from the same synthetic init scale, so
+every ratio it produces is a property of the fixture.
+
+"Does this matter" is answered on the SHIPPED checkpoint's own weights, run
+through upstream's `AdaLayerNormSingle`. That measurement is required before the
+row's Outcome may state a magnitude.
 
 ## 7. Risks
 
@@ -256,7 +264,7 @@ the whole row is decoration.
 
 ## Outcome
 
-### What was measured
+### What was measured — (a) the gate floor, on SYNTHETIC weights
 
 The generator emits these into `tests/vllm/models/ltx2_goldens.inc` and prints
 them on stderr, from the SAME shared weight stream on both arms (keyed by
@@ -265,21 +273,71 @@ term and nothing else):
 
 | Quantity | Flag ON vs OFF |
 |---|---|
-| **timestep term vs the static table it is added to** | `max\|term\|` 0.0252 vs `max\|table\|` 0.0487 — **51.7%** |
-| **block-0 modulated prompt K/V** | `max\|on-off\|` 0.0310 — **5.82%** of `max\|off\|` |
+| timestep term vs the static table it is added to | `max\|term\|` 0.0252 vs `max\|table\|` 0.0487 — 51.7% |
+| block-0 modulated prompt K/V | `max\|on-off\|` 0.0310 — 5.82% of `max\|off\|` |
 | DiT video output (2 blocks) | 1.4567e-4 — 0.04% of `max\|off\|`, **73x** the gate's 2e-6 floor |
 | DiT audio output (2 blocks) | 7.367e-5 — 0.03%, **37x** the floor |
 
-**The answer to "does this matter" is the first two rows.** Roughly half the
-magnitude of the prompt K/V modulation is the timestep-conditioned term, and
-including it moves the modulated prompt context by ~6%. Every render before this
-row discarded that.
+**ALL FOUR ROWS ARE GATE-FLOOR NUMBERS, AND NONE OF THEM ANSWERS "DOES THIS
+MATTER".** Corrected 2026-08-13 (issue #644) — this section originally billed the
+first two as the answer and disclaimed only the last two as synthetic-bounded.
+They have identical provenance: `prompt_scale_shift_table` and every
+prompt-AdaLN MLP parameter are drawn from the same `param_spec` rule at
+`scale=0.05` (`scripts/gen-ltx2-goldens.py:100-106`), so the ratio between them
+is a property of the FIXTURE, not of the conditioning. Vary only the MLP init and
+it moves with it: 0.005 → 4.1% / 0.49%, 0.05 (committed) → 51.7% / 5.82%,
+0.2 → 1450% / 142%. What these rows are FOR is the mutation below: 73x and 37x
+above round-off is what makes a zeroed term detectable.
 
-The two output rows are the GATE's floor, not a claim about the trained
-checkpoint: they are bounded by the generator's synthetic weight scale (0.05) and
-by a 2-block stack rather than 48. They are reported because a mutation must be
-shown to move something, and 73x/37x above round-off is what makes the mutation
-below meaningful.
+### What was measured — (b) the SHIPPED checkpoint, which is the answer
+
+Measured 2026-08-13 by loading the real tensors into upstream's own
+`AdaLayerNormSingle(inner_dim, embedding_coefficient=2)` (`adaln.py:19-45`, built
+by `model.py:223-227` / `:253-257`) and evaluating it on `sigma *
+timestep_scale_multiplier` — the file's own config gives 1000 — exactly as
+`transformer_args.py:274-278` and `:177` do, then comparing against all 48
+`prompt_scale_shift_table` / `audio_prompt_scale_shift_table` tensors it is
+summed with at `transformer.py:441-443`.
+
+- File: `/mnt/nas_share/checkpoints/ltx-2.5/lightricks-ltx-2.5/diffusion_models/ltx-2.5-22b-distilled-transformer-nvfp4.safetensors`
+  (7876 tensors, 1,179,408-byte header; the prompt-AdaLN tensors are BF16 there,
+  so they are read directly with no dequantisation step of ours in the path).
+- Upstream: `ltx_core` at `fd4ded7f`, imported BY PATH from
+  `/home/mudler/_git/LTX-2` with `ltx_core.__file__` asserted under that checkout.
+- Sigmas: a uniform grid over the whole range, `linspace(0, 1, 101)`, and
+  separately the sampler the file's own scheduler config names —
+  `LinearQuadraticScheduler().execute(8)` (`components/schedulers.py:60-88`).
+
+| | video (dim 4096) | audio (dim 2048) |
+|---|---|---|
+| `rms\|table\|`, 48 blocks | 0.017553 | 0.021925 |
+| `rms\|term\|`, uniform σ | 0.236446 | 0.347171 |
+| **term/table, RMS** | **1347%** | **1583%** |
+| `max\|term\|` / `max\|table\|` | **7119%** | **2817%** |
+| term/table RMS, LinearQuadratic 8-step | 1275% | 1492% |
+
+Split by row, on the uniform grid: shift 605% (video) / 461% (audio), scale 1732%
+/ 2044%. The scale row is where it concentrates, which is the row that multiplies.
+
+**On the shipped model the timestep term DOMINATES the static table; the table is
+the perturbation.** What the pre-row renders applied was
+`context * (1 + ~0.018 rms) + ~0.018` where upstream applies
+`context * (1 + ~0.32 rms) + ~0.10`. Stated as the quantity actually consumed at
+`transformer.py:446`, for a context of unit rms: the modulated context has rms
+1.0035 static-only against 1.0915 upstream (video, **+8.8%**) and 1.0033 against
+1.3170 (audio, **+31.3%**).
+
+**The synthetic fixture UNDERSTATES the real defect by two orders of magnitude.**
+Comparing like with like — the fixture's 51.7% is a `max\|term\|` / `max\|table\|`
+ratio, and that same ratio on the shipped weights is 7119% (video) and 2817%
+(audio): **138x and 54x** larger. Recorded because the original Outcome quoted
+"roughly half the magnitude" from the fixture as if it described the checkpoint.
+
+Reproduce with `scripts/measure-ltx2-prompt-adaln.py --ltx2 <LTX-2 checkout>
+--checkpoint <the file above>`, committed by this repair so the number is
+re-runnable rather than transcribed. It asserts `ltx_core.__file__` under the
+named checkout before it reads anything, and nothing of ours is in its numeric
+path — the only vllm.cpp input is which tensors to read.
 
 ### The mutations
 
@@ -316,7 +374,16 @@ re-checking its md5 (`03324d42…`, identical before and after):
 | `test_ltx2` | 30 cases / 1627 assertions | 35 / 2435 | +5 cases, +808 assertions |
 | `test_ltx2_loader` | 24 / 4817 | 26 / 4826 | +2 cases, +9 (new cases minus the assertions the retired unported-family claims took with them) |
 | `test_ltx2_device` | 13 / 498 | 15 / 523 | +2 cases, +25 assertions |
-| `test_ltx2_video` | 30 / 502 | 30 / 502 | unchanged — the fixture now carries the module, and no assertion counted it |
+| `test_ltx2_video` | 30 / 502 | 30 / 502 | unchanged — see below; 502 is the SKIPPED default |
+
+**What `30 / 502` does and does not say (corrected 2026-08-13).** The
+shipped-checkpoint case is env-gated: with `LTX2_CHECKPOINT_ROOT` unset it prints
+`SKIPPED` and returns at `test_ltx2_video.cpp:917-921`, so `30 / 502` means the
+whole real-header case DID NOT RUN — not "it ran and no assertion counted the
+module". With the variable pointing at the Lightricks tree the same binary
+measures **30 cases / 8734 assertions**, both before and after this repair
+(re-measured on this branch, exit 0 in both configurations). Any future quote of
+this suite's count owes the configuration alongside it.
 
 The `test_ltx2_video` fixture had to move: it declared a config that omits
 `use_prompt_adaln_single` (mirroring the shipped NVFP4 DiT) while its SHAPES said
@@ -355,6 +422,90 @@ the opt-in for it. What changed is that it can no longer switch a ported feature
 off: the loader asserts the flag against the file instead of clearing it, and
 `Ltx2AdoptDeclaredDitParams` clears exactly one flag, for a module nothing
 applies.
+
+### The keyframes claim next door, corrected 2026-08-13
+
+`ltx2.h` carried, in the same paragraph this row rewrote, *"LTX-2.5's checkpoint
+does not carry the parameter"* about `keyframes_abs_pos_embedding`. It is FALSE —
+the same class of claim as the `use_prompt_adaln_single=false` assertion this row
+exists to remove — and the tree already contradicted it twice
+(`.agents/model-matrix.md`, `tests/vllm/multimodal/test_ltx2_video.cpp:913-914`).
+Read straight off both files' headers, and run through upstream's own loader and
+configurator:
+
+| | FP8 (`vonkaiser`) | NVFP4 (first-party) |
+|---|---|---|
+| carries `keyframes_abs_pos_embedding` | YES — `F8_E4M3 [1, 4096]` + F32 scale | NO |
+| declares the flag in `__metadata__` | **no `__metadata__` AT ALL** | `true` |
+| `LTXModelConfigurator.from_metadata` | **RAISES** `KeyError: 'caption_channels'` | builds it, `[1, 4096]` |
+
+So the two files each contradict one half of the retired claim, and neither
+supports it. Two corrections to the reasoning that came with the finding, both
+measured rather than read:
+
+- The FP8 file does not "resolve the flag `False` at `model_configurator.py:82`".
+  Upstream never reaches line 82 on it: `_build_caption_projections` indexes
+  `caption_channels` on the empty config first and raises. That file ships no
+  config, so what its flag resolves to is decided entirely out of band — and the
+  tensor it carries is trained (`.agents/specs/ltx-2-5.md` §3.1 reads its bytes).
+- On the NVFP4 file the flag IS on and the module IS built, but the tensor is
+  absent, so it keeps `torch.zeros(1, inner_dim)` (`model.py:217-219`) through
+  `load_state_dict(..., strict=False)`
+  (`loader/single_gpu_model_builder.py:98`) — a genuine no-op there.
+
+It is also not a keyframe-only feature: `transformer_args.py:269` applies it on
+every `prepare` whose `keyframes_mask` is set, and `tools.py:186-196` sets that
+mask unconditionally on the target's first latent frame. (Diffusers' own pipeline
+does not consume it — `.agents/specs/ltx-2-5.md` §3.1 records that — but `ltx_core`
+is what this campaign ports, and `ltx_core` does.)
+
+**The refusal keying does NOT change, and that is the decision, not an omission.**
+`ltx2_loader.cpp`'s `RefuseUnported` fires on the TENSORS the file carries. Keying
+it on the resolved flag instead would, on the FP8 DiT, read a DEFAULT rather than
+the file — because that file declares nothing — and would therefore load it
+silently while discarding a trained `[1, 4096]` parameter. Tensor presence is the
+only signal that file actually carries, and refusing loudly with an opt-in is
+strictly safer than resolving quietly. No behaviour changed, so no new gate is
+owed; the refusal MESSAGE changed, because it asserted the implication that is
+false in both directions.
+
+### The claims repair's own gate (2026-08-13)
+
+Nothing executable changed except three refusal MESSAGES, so the numbers are
+expected to be identical and the point is that they are:
+
+- `BUILD_EXIT=0`; build logs grepped for `No space left|BFD assertion` — 0 hits;
+  `df -h /` 92% used, 37G free at the end.
+- `ctest -N` = **423**. Full `ctest -j8` = 422/423 with `test_serve_low_tools`
+  starved under `-j` (a known parallel flake); serially **1/1 PASS, exit 0**.
+  2 skipped (`test_modelopt_mixed_precision_checkpoint`, `test_voxtral_e2e`) as
+  on the baseline.
+- Suite counts, unchanged from the row above: `test_ltx2` 35/2435,
+  `test_ltx2_loader` 26/4826, `test_ltx2_device` 15/523, `test_ltx2_video`
+  30/502 skipped-default and **30/8734** with `LTX2_CHECKPOINT_ROOT` set. Exit 0
+  on all five runs.
+- `tests/vllm/models/ltx2_goldens.inc` REGENERATED from
+  `scripts/gen-ltx2-goldens.py` against `ltx_core` `fd4ded7f`: every golden VALUE
+  byte-identical, the diff is the comment block alone. That re-proves provenance
+  as well as the wording.
+
+An earlier full run was voided rather than reported: another session's
+disk-pressure cleanup deleted `build/` while ctest was at 421/423, and the last
+two tests recorded `Not Run — Failed to change working directory`. A run whose
+tree vanished under it is not a result; it was rebuilt and re-run from scratch.
+
+### Two divergences from upstream, recorded rather than fixed
+
+- **We are stricter than upstream about a config that disagrees with its file.**
+  Upstream loads with `load_state_dict(..., strict=False)`
+  (`loader/single_gpu_model_builder.py:98`), so a config declaring
+  `use_prompt_adaln_single=false` over a file that carries the module would build
+  no module, drop 18 tensors on the floor and run flag-OFF without a word. §3.2's
+  equality check refuses that. Ours is better; it is still a DIVERGENCE, not a
+  mirror, and it is named here so it is not later mistaken for ported behaviour.
+- **We refuse `keyframes_abs_pos_embedding` by tensor presence** where upstream
+  would take an out-of-band config's word for it (above). Same shape of
+  divergence, same reason it stands.
 
 ## Now
 

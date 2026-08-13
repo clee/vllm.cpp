@@ -913,6 +913,11 @@ TEST_CASE("ltx2 video: an ABI client loads, detects and generates through vllm.h
 // It is NOT interchangeable with the `vonkaiser` FP8 copy — they differ in a
 // TRAINED `keyframes_abs_pos_embedding` (spec section 3.1) — so the file this
 // case reads is named here and in every report of its result.
+// WHEN QUOTING THIS SUITE'S ASSERTION COUNT, QUOTE THE CONFIGURATION WITH IT.
+// This case skips by default, and it is most of the suite: unset, the binary
+// measures 30 cases / 502 assertions; with LTX2_CHECKPOINT_ROOT set it measures
+// 30 / 8734. An "unchanged 30 / 502" across a change therefore says the real
+// headers were never read, not that they were read and nothing counted them.
 TEST_CASE("ltx2 video: the SHIPPED Lightricks checkpoints parse and load") {
   const char* root_env = std::getenv("LTX2_CHECKPOINT_ROOT");
   if (root_env == nullptr) {

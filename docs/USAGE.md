@@ -2072,12 +2072,19 @@ Only the LTX-2.5 DiT is gated against an independent oracle here, so treat any
 other marker-less NVFP4 checkpoint as unsupported until it is. See
 `.agents/specs/nvfp4-nibble-order.md`.
 
-Two behaviours a caller has to know. `Ltx2LoadDitFromSafetensors` REFUSES the
-shipped DiT by default, because that file carries **one** module family this port
-does not carry (`keyframes_abs_pos_embedding`); pass
-`Ltx2DitLoadOptions::allow_unported_modules`
+Two behaviours a caller has to know. `Ltx2LoadDitFromSafetensors` REFUSES a
+shipped DiT by default over **one** module family this port does not carry,
+`keyframes_abs_pos_embedding`; pass `Ltx2DitLoadOptions::allow_unported_modules`
 to load the ported subset, which still reports every one of them in
-`Ltx2DitCheckpoint::unported`. `prompt_adaln_single` and
+`Ltx2DitCheckpoint::unported`. Both shipped DiTs need the opt-in, for DIFFERENT
+reasons, and the distinction matters if you are reading the refusal text
+(corrected 2026-08-13): the **FP8** file CARRIES the tensor
+(`F8_E4M3 [1, 4096]`) and declares no `__metadata__` at all, so the refusal is on
+its TENSORS; the first-party **NVFP4** file does NOT carry the tensor but its
+config DECLARES `use_keyframes_abs_pos_embedding: true`, so it is refused by the
+FLAG, in `ParseLtx2DitParams`, and `allow_unported_modules` clears that flag in a
+config copy. Neither file supports the retired claim that "LTX-2.5's checkpoint
+does not carry the parameter". `prompt_adaln_single` and
 `audio_prompt_adaln_single` were on that list until 2026-08-13 and are now
 PORTED, so a checkpoint carrying them needs no opt-in on their account, and the
 opt-in no longer disables them. The two `*_embeddings_connector` towers are

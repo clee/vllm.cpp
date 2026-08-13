@@ -44,9 +44,30 @@
 //     attention.py:545-552 `perturbation_mask`). L2 runs the no-perturbation
 //     configuration, whose masks are all-ones and whose flags are all false —
 //     upstream's own `perturbations=None` path (model.py:509-511).
-//   - `use_keyframes_abs_pos_embedding` (transformer_args.py:23-43). LTX-2.5's
-//     checkpoint does not carry the parameter; the enumeration refuses a config
-//     that asks for it.
+//   - `use_keyframes_abs_pos_embedding` (transformer_args.py:23-43). The
+//     enumeration refuses a config that asks for it.
+//
+//     CORRECTED 2026-08-13 (issue #644). This line read "LTX-2.5's checkpoint
+//     does not carry the parameter", which is FALSE, and it is the same class of
+//     claim the prompt-AdaLN repair below exists to remove. The two shipped DiTs
+//     disagree with each other and each contradicts one half of it, read straight
+//     off their safetensors headers:
+//       * FP8 (`vonkaiser`, ltx-2.5-22b-distilled-fp8): CARRIES
+//         `keyframes_abs_pos_embedding` `F8_E4M3 [1, 4096]` plus its F32 scale,
+//         and declares NO `__metadata__` at all — so it ships no config, and
+//         upstream's own `LTXModelConfigurator.from_metadata` cannot configure it
+//         (run 2026-08-13: `KeyError: 'caption_channels'`, raised by
+//         `_build_caption_projections` on the empty dict, BEFORE the flag at
+//         model_configurator.py:82 is ever read). What that file's flag resolves
+//         to therefore depends on a config it does not ship.
+//       * NVFP4 (first-party Lightricks): DECLARES the flag `true` and does NOT
+//         carry the tensor, so upstream's parameter stays its
+//         `torch.zeros(1, inner_dim)` initialiser (model.py:217-219) and
+//         `load_state_dict(..., strict=False)`
+//         (loader/single_gpu_model_builder.py:98) leaves it zero — a no-op.
+//     It is also NOT a keyframe-only feature: `transformer_args.py:269` applies it
+//     on EVERY prepare whenever `keyframes_mask` is non-None, and `tools.py:186-196`
+//     marks the target's first latent frame unconditionally.
 //   - The caption projections (text_projection.py:31-38). LTX-2.5 is a 22B-form
 //     checkpoint: `caption_proj_before_connector=true` puts them in the TEXT
 //     ENCODER, so the DiT has none (model_configurator.py:199-219). They are
