@@ -640,6 +640,23 @@ must perturb the replacement constant enough to prove an LTX2 numerical test
 detects it. Stop with `NEEDS_DECISION` if preserving the current value requires
 an algorithmic or tolerance change rather than a constant substitution.
 
+#### #645 implementation outcome
+
+The regression was the non-standard macro itself: `ltx2.cpp` consumed `M_PI`,
+while both VAE files carried fallback definitions even though the video VAE did
+not consume the macro. The C++20 production expressions now use
+`std::numbers::pi_v<double>`, which preserves the previous double type and
+rounded value, and the unused video fallback is gone. No algorithm or tolerance
+changed.
+
+Before the repair, the real-tree portability regression failed with exactly the
+three specified files. Afterwards that regression and all 76 Windows
+portability tests pass; the combined Windows metadata, release-pipeline, and
+portability suite passes 130 tests. A CPU Release build compiled all three
+affected translation units and linked `test_ltx2` and `test_ltx2_vae`; their
+upstream-golden numerical gates pass 30/30 cases with 1627 assertions and 36/36
+cases with 3039 assertions, respectively.
+
 Fresh mutation review of the adaptive probe found three false-green contract
 gaps: the listing fixture did not distinguish file order from name order, the
 unexpected-status branches at an intermediate midpoint and isolated probe were
