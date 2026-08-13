@@ -941,6 +941,64 @@ Item 3 is the one a reader is most likely to assume is safe. It is not assumed
 here: the re-scaled margins in §8.3 point 6 make it very likely to hold, and
 "very likely" is not a gate result.
 
+### 8.6 All four discharged, operator-run on the gate host (2026-08-13)
+
+Items 1, 2 and 3 are CLOSED by measurement, not by argument. Item 4 is closed by
+attribution.
+
+**Items 1 + 2 — the CUDA arms and `compute-sanitizer`.** One lock acquisition,
+`LOCK_ACQUIRED_UTC=2026-08-13T08:07:31Z`, `BUILD_EXIT=0`, `ENOSPC=0`:
+
+| arm | result |
+|---|---|
+| `test_ops_mamba2_ssd` | 12 cases / **2095** assertions, `SUCCESS!`, exit 0 |
+| `test_ops_mamba2_state_update` | 10 / **5965**, `SUCCESS!`, exit 0 |
+| `test_ops_mamba2_gated_norm` | 12 / **3723**, `SUCCESS!`, exit 0 |
+| `memcheck` (ssd, state_update) | `ERROR SUMMARY: 0 errors`, exit 0 both |
+
+The assertion counts are quoted because a suite that skipped every CUDA case
+would also exit 0; a non-zero count is what distinguishes "the device arms ran"
+from "the binary started".
+
+**Item 3 — the re-sweep against the MOVED bound.** `BOUND=5*(K+2)*u`,
+`LOCK_ACQUIRED_UTC=2026-08-13T21:06:55Z`. Controls first, at the same counts as
+the arms above (2095 / 5965 / 3723, all `SUCCESS!`), so an empty run is
+excluded. **9 of 9 CAUGHT:**
+
+| | guarantee | evidence |
+|---|---|---|
+| M1 | inter-chunk state term | ssd 74 failed, state_update 2 |
+| M2 | `initial_states` seeding | ssd 16 failed |
+| M3 | decay reads the LAST tap | ssd 69, state_update 2 |
+| M4 | `D` skip term | ssd 6, state_update 1 |
+| M5 | `state_indices` honoured | state_update 4 |
+| M6 | NULL row skipped | state_update **exit 134** (SIGABRT) |
+| M7 | PER-GROUP variance | gated_norm 11 |
+| M8 | silu gate, not sigmoid | ssd 2, state_update 7, gated_norm 17 |
+| M9 | `eps` INSIDE the sqrt | gated_norm 1 |
+
+Every mutant was built in a phase that takes **no** lock, stashed, and run under
+one acquisition; the source was restored and md5-verified after each
+(`FINAL_MD5` matched `PRISTINE_MD5`). Every form keeps every variable read,
+because a mutation that fails to compile under `-Werror=all-warnings` is not a
+caught mutation — it is a suite that never ran.
+
+**M6 is the one worth reading.** It aborts, printing
+`assertions: 2577 | 2577 passed | 0 failed` — a **clean** assertions line on a
+FAILING run. It is caught only because the harness reads the **exit code**. This
+is the repo's recurring trap in its sharpest form, and it is why item 3 could
+not have been discharged by inspecting summaries.
+
+**Item 4 — `test_minimax_h3` ATTRIBUTED, not waived.** Reproduced standalone on
+an idle box under the lock: `TEST_EXIT=139`, `ENOSPC=0`. It is **#486**, root
+cause **#516** (`vllm::Pool()`'s free list keyed by size class with no device in
+the key), signature-for-signature — `38 | 36 passed | 2 failed | 41 skipped`,
+42724 assertions, `cudaFree: invalid argument` then SIGSEGV. The independent
+baseline that PASSED was `row/pool-device-key`, **the branch that fixes #516** —
+so the baseline carried a fix, this branch does not carry a defect. The
+GPU-contention hypothesis §8.4 recorded as "plausible, not proven" is
+**REFUTED**, not quietly retained.
+
 **CI on this branch is `REMOTE_UNVERIFIED`, and the distinction matters.** Every
 GitHub Actions run for PR #592 -- all four SHAs, both the `ci` and `containers`
 workflows -- ended `conclusion: cancelled`, never `failure` and never `success`.
