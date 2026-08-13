@@ -450,19 +450,29 @@ struct Ltx2GemmaPromptTokens {
 // tokenizer.py:31-59, mirrored including the parts that look like details:
 //
 //   * `text.strip()` first (:33). diffusers strips too (pipeline_ltx2.py:333).
-//   * encode with NO special tokens added by the post_processor. The shipped
-//     tokenizer's `post_processor` is a TemplateProcessing whose `special_tokens`
-//     map is EMPTY, so it would add nothing anyway — measured on the shipped
-//     file, not assumed.
-//   * then PREPEND BOS unconditionally if it is not already first (:44-46).
-//     THIS IS WHERE THE TWO REFERENCES DISAGREE and upstream is followed:
-//     `ltx_core` prepends explicitly and says why — "Gemma 3 already emits it
-//     via post_processor; Gemma 4 does not, so we prepend" (tokenizer.py:12-15)
-//     — while diffusers passes `add_special_tokens=True` and relies on the
-//     post_processor (pipeline_ltx2.py:339), which for THIS tokenizer.json adds
-//     nothing. Following diffusers would drop token 0 of every prompt. Recorded
-//     rather than silently resolved: `ltx_core` is the model author's own
-//     runtime and is explicit about the case.
+//   * encode, then PREPEND BOS if it is not already first — CONDITIONAL, on
+//     upstream's own `if not input_ids or input_ids[0] != bos_id` guard
+//     (:44-46). A port that prepends unconditionally doubles the BOS.
+//
+//     Two things about that, and the first one is a KNOWN DIVERGENCE rather than
+//     a mirrored default. Upstream calls `self.tokenizer(text, ...)` — `__call__`
+//     with its default `add_special_tokens=True` (tokenizer.py:37-43) — so
+//     upstream DOES run the post_processor and we call plain `Encode`, which
+//     does not. On THIS checkpoint the two are identical, because the shipped
+//     `post_processor` is a TemplateProcessing whose `special_tokens` map is
+//     EMPTY and whose template is the bare sequence, so it has nothing to add:
+//     measured on the shipped file, not assumed. If a future checkpoint ships a
+//     post_processor that DOES add something, upstream would emit it and we
+//     would not — so this is the line to change, not a property to rely on.
+//
+//     What the two references actually disagree about is narrower than "one
+//     runs the post-processor": both let it run. `ltx_core` ALSO prepends BOS
+//     explicitly and says why — "Gemma 3 already emits it via post_processor;
+//     Gemma 4 does not, so we prepend" (tokenizer.py:12-15) — while diffusers
+//     relies on the post_processor alone (pipeline_ltx2.py:339), which for this
+//     tokenizer.json adds nothing, so following diffusers would drop token 0 of
+//     every prompt. `ltx_core` is the model author's own runtime and is explicit
+//     about the case, so it is the one followed.
 //   * EOS is never appended (:14).
 //   * truncation happens BEFORE the BOS prepend and again after (:41, :46), so a
 //     maximal prompt loses its LAST token to make room for BOS rather than

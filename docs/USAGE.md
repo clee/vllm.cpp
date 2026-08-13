@@ -408,6 +408,15 @@ them to 4096 and 2048, and passes both streams through the embeddings connector
 before cross-attention. The tower is ~24 GB of host bf16 and stays resident,
 because a prompt arrives per request.
 
+One tokenization detail is a KNOWN DIVERGENCE rather than a mirror, and it is
+checkpoint-conditional: upstream tokenizes through the HuggingFace `__call__`
+with its default `add_special_tokens=True`, so it runs the tokenizer's
+post_processor, while this port calls the plain encode and prepends BOS by hand.
+On the shipped checkpoint the two are identical — its post_processor declares an
+EMPTY special-token map, measured on the shipped file rather than assumed — so
+nothing is lost today. A checkpoint whose post_processor DID add tokens would
+tokenize differently here.
+
 `--encoder-config` supplies the Gemma config, and it is required for the only
 shipped encoder: `vonkaiser`'s
 `gemma4-12b-with-proj-nvfp4-torchao.safetensors` carries no `__metadata__` at

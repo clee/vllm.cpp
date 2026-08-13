@@ -251,6 +251,30 @@ std::vector<int32_t> Gemma4GenerateGreedyViaRegistry(
     vt::Queue& queue, int max_new_tokens,
     std::vector<float>* out_margins = nullptr);
 
+// The FULL-attention layers' "proportional" rope cos|sin table, on host in f32 —
+// the exact values the forward builds (BuildProportionalRopeCache rounds them to
+// bf16 to match the q/k it rotates; nothing else differs). Returns
+// [max_pos + 1, head_dim]: the first head_dim/2 columns are cos and the second
+// half sin, over the head_dim/2 DISTINCT angle pairs, mirroring upstream's
+// `emb = cat((freqs, freqs))` with each angle stored once
+// (`Gemma4UnifiedTextRotaryEmbedding.forward`, modeling_gemma4_unified.py:259-275
+// — the `cat` itself is :271; the inv_freq it consumes comes from
+// modeling_rope_utils.py:187-254).
+//
+// This is a GATE SURFACE, and it exists because of a measurement rather than a
+// preference. `partial_rotary_factor` decides how many angle pairs are rotated
+// and how many are zero-padded to identity, and it is the one field on this path
+// that the tower's hidden states cannot resolve: on the reduced LTX tower
+// fixture, forcing it from the config's 0.25 to 1.0 displaces the worst hidden
+// state by 1.09e-01 against that state's measured bf16 noise floor of 9.99e-02
+// — a ratio of 1.09, inside the tolerance the states are gated at — and a LARGER
+// fixture makes it worse, not better (0.65 at head_dim 16/32, seq 32), because
+// bf16 accumulation noise grows at least as fast as the rope contribution. So
+// the states are the wrong instrument and this table is the right one: f32, no
+// accumulation, compared element-wise against the oracle's own rotary embedding.
+std::vector<float> Gemma4ProportionalRopeCosSin(const HfConfig& config,
+                                                int64_t head_dim, int64_t max_pos);
+
 // Wrap already-loaded Gemma-4 weights in the registered LoadedModel so a caller
 // that owns the weights (the mm e2e gate) can drive ModelRegistry::Forward without
 // re-reading the checkpoint. `Make` OWNS the moved weights; `Borrow` does NOT own

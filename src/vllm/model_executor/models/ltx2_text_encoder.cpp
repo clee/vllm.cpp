@@ -686,12 +686,20 @@ Ltx2GemmaPromptTokens Ltx2TokenizeGemmaPrompt(const tok::Tokenizer& tokenizer,
           ? std::string()
           : prompt.substr(begin, prompt.find_last_not_of(kSpace) - begin + 1);
 
-  // NOT EncodeWithSpecialTokens. The shipped tokenizer's post_processor is a
-  // TemplateProcessing with an EMPTY `special_tokens` map, so it adds nothing and
-  // the two are identical HERE — but upstream calls the plain encode and then
-  // prepends BOS itself, and mirroring which call is made keeps that true if a
-  // future checkpoint ships a post_processor that does add something. Doing both
-  // would double the BOS.
+  // NOT EncodeWithSpecialTokens — and that is a KNOWN DIVERGENCE, not a mirror.
+  // Upstream calls `self.tokenizer(text, ...)` (tokenizer.py:37-43) — `__call__`
+  // with its default `add_special_tokens=True` — so upstream DOES run the
+  // post_processor, and plain `Encode` does not. The two are identical HERE only
+  // because the shipped tokenizer's post_processor is a TemplateProcessing whose
+  // `special_tokens` map is EMPTY, so it has nothing to add: MEASURED on the
+  // shipped file, not assumed. If a future checkpoint ships a post_processor that
+  // DOES add something, upstream would emit it and we would not — so this is the
+  // line to change, not a property to rely on.
+  //
+  // The one thing that would NOT go wrong is a doubled BOS: the guard below
+  // (`ids.front() != bos_id`) is upstream's own guard at :45, so a post_processor
+  // that emitted a leading BOS would be absorbed by either call. The exposure is
+  // a post_processor that adds anything ELSE. Full note at the declaration.
   std::vector<int32_t> ids = tokenizer.Encode(stripped);
 
   Ltx2GemmaPromptTokens out;
@@ -1020,7 +1028,18 @@ Ltx2PromptConditioning Ltx2EncodePromptToConditioning(
         out.tokens.input_ids[static_cast<size_t>(out.tokens.first_valid + i)];
     // The ORIGINAL absolute position, not a renumbering from zero: transformers
     // derives positions from the cache position, which counts the pad rows, so a
-    // left-padded prompt's first real token sits at `first_valid`.
+    // left-padded prompt's first real token sits at `first_valid`. This mirrors
+    // upstream because upstream does it, and for no stronger reason than that —
+    // MEASURED against the running oracle rather than argued: rotary position
+    // embedding is RELATIVE and the pads are masked out of attention, so shifting
+    // every position by the same amount is a no-op. Upstream's own f32 answers
+    // for positions 12..19 and 0..7 on the same 8 tokens differ by 5.11e-05 on
+    // values of magnitude 14.35, i.e. 3.6e-06 relative — f32 round-off and
+    // nothing else. At bf16 they differ by 1.09, but that is the rounding of
+    // different absolute angles and is 0.65-1.70x the per-state dtype floor, so
+    // no tolerance separates the two cleanly either. Renumbering here would
+    // therefore NOT rotate a query by the wrong angle; it would simply stop
+    // matching what transformers passes. Keep it matching.
     positions[static_cast<size_t>(i)] =
         static_cast<int32_t>(out.tokens.first_valid + i);
   }
@@ -1029,18 +1048,32 @@ Ltx2PromptConditioning Ltx2EncodePromptToConditioning(
   // geometry, and the runner's single-uniform-head_dim allocation cannot express
   // that (gemma4.h, G1 HONEST STATUS) — so this path builds its own rather than
   // routing through a seam that would have to lie about one of the two.
+  //
+  // BF16, which is upstream's ONE resolved model dtype for this tower
+  // (base_encoder.py:41 `dtype: torch.dtype = torch.bfloat16`) and the dtype the
+  // attention itself runs in (gemma4.cpp, `adt = DType::kBF16`). This was f32
+  // until the L10 review: nothing was wrong with the numbers — an f32 KV cache
+  // is strictly WIDER, so every token gate and every golden still passed — it
+  // simply held twice the bytes and made `Gemma4AttnBlock` allocate two extra
+  // per-layer cast buffers and run a CastF32 on every K and V it wrote
+  // (gemma4.cpp:306-315, the `kv.dtype != adt` arm — the two DBufs at :307-308
+  // and the CastF32 pair at :313-314). That is exactly the defect class
+  // AGENTS.md names: a token gate cannot see a dtype that is too wide.
+  // At the shipped 48 layers x 1024 positions this is ~2x on a cache that peaks
+  // near 200 MB for one prompt.
   const int64_t block = 16;
   const int64_t blocks = (T + block - 1) / block;
-  std::vector<std::vector<float>> kv_storage;
+  std::vector<std::vector<uint16_t>> kv_storage;
   std::vector<PagedKvCache> attn_kv;
   kv_storage.reserve(static_cast<size_t>(L));
   for (int64_t l = 0; l < L; ++l) {
     const Gemma4LayerWeights& lw = tower.weights.layers[static_cast<size_t>(l)];
     kv_storage.emplace_back(
-        static_cast<size_t>(blocks * 2 * block * lw.num_kv_heads * lw.head_dim), 0.0f);
+        static_cast<size_t>(blocks * 2 * block * lw.num_kv_heads * lw.head_dim),
+        static_cast<uint16_t>(0));
     PagedKvCache kv;
     kv.data = kv_storage.back().data();
-    kv.dtype = vt::DType::kF32;
+    kv.dtype = vt::DType::kBF16;
     kv.num_blocks = blocks;
     kv.block_size = block;
     kv.num_kv_heads = lw.num_kv_heads;

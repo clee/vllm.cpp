@@ -147,7 +147,13 @@ speed-pending, which [BENCHMARKS.md](BENCHMARKS.md) tracks.
 ### Standalone and non-registered lanes
 
 These run through dedicated forwards, not the `REGISTER_VLLM_MODEL` registry, so
-they sit outside the gated list above.
+they sit outside the gated list above. One caveat the LTX-2.5 row is too narrow
+to carry: its text tower's prompt tokenization mirrors upstream only while the
+checkpoint's tokenizer `post_processor` adds nothing. The shipped one is MEASURED
+empty, so this port's plain encode plus an explicit BOS prepend matches
+upstream's `add_special_tokens=True` today; a checkpoint with a non-empty
+`post_processor` would tokenize differently here, and `Ltx2TokenizeGemmaPrompt`
+in `ltx2_text_encoder.cpp` is the call that would have to change.
 
 | Lane | Tested checkpoint(s) | Correctness gate | Speed vs reference |
 |---|---|---|---|

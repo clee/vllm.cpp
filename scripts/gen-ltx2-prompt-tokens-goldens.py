@@ -83,7 +83,13 @@ def tokenize_with_weights(tok, text: str, bos_id: int, pad_id: int):
     only thing borrowed is the algorithm, and every step cites its line.
     """
     text = text.strip()                                       # :33
-    ids = list(tok.encode(text, add_special_tokens=False).ids)  # :38-43
+    # :37-43 is `self.tokenizer(text, ...)` — `__call__` with its DEFAULT
+    # `add_special_tokens=True`, so upstream runs the post_processor. This passes
+    # False deliberately, to transcribe what the C++ `Encode` does; the two agree
+    # only because the measured post_processor here has an EMPTY `special_tokens`
+    # map (asserted into the emitted header below). On a checkpoint where it added
+    # something, THIS line and the C++ call would both have to change.
+    ids = list(tok.encode(text, add_special_tokens=False).ids)  # :37-43
     if len(ids) > MAX_LENGTH:                                 # truncation=True
         ids = ids[:MAX_LENGTH]
     if not ids or ids[0] != bos_id:                           # :44-46
