@@ -205,6 +205,13 @@ For the DENSE arm a fitting bf16 checkpoint is sufficient.
    `LoadQwen3_5DenseLayer` with the prefix argument OMITTED — asserting the two
    named constants does not pin it, and flipping both defaults VL->flat left the
    original case green (review finding F7).
+6. Record count (added 2026-08-13): the `MODEL` ratchet bump 362 -> 364 in
+   `scripts/check-agent-record.py` is tied to the two rows behind it —
+   `MODEL-TEXT-qwen3-5-qwen3-5-for-causal-lm` and
+   `MODEL-TEXT-qwen3-5-qwen3-5-moe-for-causal-lm` each appear exactly once in
+   `.agents/model-matrix.md`, and the pin equals the MODEL rows that file
+   carries. The existing ratchet test moves the pin by one, which holds for ANY
+   pin value and so cannot say whether THIS value is right; these do.
 
 ## Gates
 
@@ -237,6 +244,12 @@ NVFP4, or the owed stacked/bf16 arm implemented first (see
   turn the SUPPORTED-layout assertions red.
 - Golden md5 before/after for 27B/35B/Coder showing no drift.
 - The owed run gate recorded explicitly in the row and in `docs/STATUS.md`.
+- Executable mutation evidence for the checker change, in
+  `tests/scripts/test_agent_record.py`, which is what `scripts/check-pr-size.py`
+  runs BASE-checker-against-HEAD-tree: the literal RED
+  `AssertionError: 364 != 362 : the MODEL pin must equal the MODEL rows
+  model-matrix.md carries` with the pin at its BASE value, a second RED from
+  deleting one of the two new matrix rows, and green after both restorations.
 
 ## Stop conditions
 
