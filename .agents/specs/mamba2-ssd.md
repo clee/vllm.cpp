@@ -639,6 +639,27 @@ attribution, and it is owed before the fresh review closes. **`~/w2ssd` on the
 gate host is deliberately left in place for it** (`rm -rf ~/w2ssd` once
 `refail.log` is read).
 
+**Update, 06:50 CEST: `dgx.casa` went unreachable** (`No route to host`, ping
+100% loss) while that re-run was still queued, so its state is
+**`REMOTE_UNVERIFIED`** — unknown is neither absence nor success. The box has
+OOM-rebooted before under exactly the unified-memory pressure described above,
+which is suggestive and is *not* offered as proof of anything. Whoever picks
+this up: `~/w2ssd/refail.log` either completed or did not, and re-running
+`~/w2ssd/w2refail.sh` is cheap. Every result recorded above this line was
+captured and read BEFORE the box went away.
+
+**CI: the two Windows jobs are the `main` BASELINE, not this branch.**
+`windows-msvc-cpu` and `windows-msvc-vulkan` fail on PR #566, and the baseline
+was subtracted rather than assumed: **#580** (`row/ENG-ISSUE-TABLE-INTAKE`, a
+records-only change) fails both at 22m15s / 22m6s, and **#576** — already
+*merged* to `main` — failed both at 22m6s / 21m33s. Two fixes are in flight for
+exactly these: **#583** "Invoke-Checked rejected the empty argument list every
+no-arg test uses" (#512), which is the failing step here — *Build and execute
+the native Windows CPU focused gate* — and **#578** "the Windows arm cannot
+compile `test_backend_cross_device`" (#514, #540). This branch's diff since the
+merge is one markdown file and cannot reach an MSVC build; no Windows-arm claim
+is made or repaired here.
+
 **The derived bar is audited, not asserted.** Across the 55 device-vs-host
 comparisons in a green run, the worst one used **7.66%** of `rtol(K) =
 4·(K+2)·2⁻²⁴`; the driver shapes used 0.32% and 0.18%. For contrast the same
