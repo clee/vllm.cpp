@@ -418,11 +418,14 @@ taken on report, as mutation **M9** of the W2 sweep: deleting
 call site is unique, the other two hits of that symbol being its definition at
 `:1582` and the chunk-scan call at `:1633` — takes
 `test_ops_mamba2_state_update -tc=mamba2 state update refuses the arms it does
-not implement` from `Status: SUCCESS!` to `Status: FAILURE!`. The pristine
-binary was run under the identical filter first, so the filter is proved to
-select a non-zero assertion count; the source was restored byte-for-byte and its
-md5 re-asserted. The verbatim control and mutant output is in the W2 commit
-message.
+not implement` from `1 passed | 0 failed`, `assertions: 11 | 11 passed`,
+`Status: SUCCESS!` to `0 passed | 1 failed`, `assertions: 11 | 8 passed |
+3 failed`, `Status: FAILURE!` — the three reds being `CHECK(threw)`,
+`CHECK(msg.find("A_log") != npos)` and `CHECK_THROWS(...) did NOT throw at all`
+at `:672`, `:673`, `:680`. The pristine binary was run under the identical
+filter FIRST, so the filter is proved to select a non-zero assertion count
+rather than nothing; `cpu_ops.cpp` was restored byte-for-byte and its md5
+re-asserted at `9ed9eb980c239eca37ec7d92bfe0e766`.
 
 One repo-wide test trap found while capturing the RED output, and worth carrying
 to any doctest suite: **doctest 2.5.2 `INFO` prints a `const char*` VARIABLE as
@@ -532,6 +535,76 @@ on GB10. `op_provider.cpp:515-526` gates on `UnifiedMemory()` where it needs
 backends, so it takes its own row. Every CUDA case here calls
 `RequireNativeCudaProvider`, so a device arm can never be gated by running the
 host arm twice.
+
+### 8.4 W2 evidence (gate host `promaxgb10-4ad8`, GB10 / sm_121a, 2026-08-13)
+
+Build recipe, both arms: `cmake -G Ninja -DVLLM_CPP_CUDA=ON
+-DVLLM_CPP_CUDA_ARCHITECTURES=121a -DVLLM_CPP_CUTLASS_DIR=$HOME/cutlass-4.5.0
+-DVLLM_CPP_TRITON=ON -DVLLM_CPP_BUILD_TESTS=ON`. The configure log was READ, not
+assumed: `cutlass-nvfp4: ENABLED`, `cutlass-fp8: ENABLED`, `marlin-nvfp4:
+ENABLED`, `fa2: ENABLED for [121a]`, `CUTLASS found at ~/cutlass-4.5.0` — an
+absent CUTLASS silently falls back and the arm would not be the shipped one.
+**0 warnings** in both build logs.
+
+**Release, after the `origin/main` re-merge** — identical to the pre-merge
+counts, so the merge moved nothing:
+
+| suite | test cases | assertions | status |
+|---|---|---|---|
+| `test_ops_mamba2_ssd` | 11 / 11 passed | 2069 / 2069 | `SUCCESS!` |
+| `test_ops_mamba2_state_update` | 10 / 10 passed | 5965 / 5965 | `SUCCESS!` |
+| `test_ops_mamba2_gated_norm` | 12 / 12 passed | 3723 / 3723 | `SUCCESS!` |
+
+**Debug arm** (`CMAKE_BUILD_TYPE=Debug`, so `NDEBUG` is OFF and every `assert`
+in the tree is live; CXX `-g -O0`, CUDA `-g` and deliberately *not* `-G`, which
+would disable device optimisation and change what was measured): the same
+`11 / 2069`, `10 / 5965`, `12 / 3723`, all `SUCCESS!`, exit 0. This arm exists
+because the gate build is `-O3 -DNDEBUG`, where an assert-abort defect stays
+latent behind a green Release run.
+
+**`compute-sanitizer`, 8 runs, all `ERROR SUMMARY: 0 errors` / `EXIT=0`:**
+`memcheck` on the ssd optional-arms + dtype-knobs case, on the continuous-batch
+`initial_states` subcase, and on both decode suites' `*CUDA arm*` cases;
+`initcheck` on three; `synccheck` on the gated norm, which is the one kernel
+with a block reduction and `__syncthreads`.
+
+**Mutation sweep — 9 of 9 CAUGHT.** Each mutation patches one source file, is
+rebuilt, and is run under a doctest `-tc` filter; the **pristine** binary is run
+under the *identical* filter first, because a filter that selects no test case
+makes doctest print `SUCCESS!` and an unverified filter would score a false
+catch. Sources restored byte-for-byte after each, md5 re-asserted
+(`cuda_mamba2_ssd.cuh` `cbb1f928f4b421bdea2e24476012eed2`, `cpu_ops.cpp`
+`9ed9eb980c239eca37ec7d92bfe0e766`).
+
+| # | mutation | control assertions | mutant |
+|---|---|---|---|
+| M1 | drop the inter-chunk state term | 27 `SUCCESS!` | `FAILURE!` |
+| M2 | ignore `initial_states` in state passing | 297 `SUCCESS!` | `FAILURE!` |
+| M3 | read `states[c]` for `states[c-1]` | 297 `SUCCESS!` | `FAILURE!` |
+| M4 | drop the `D` skip connection | 570 `SUCCESS!` | `FAILURE!` |
+| M5 | ignore `state_indices` (slot = row) | 1318 `SUCCESS!` | `FAILURE!` |
+| M6 | treat the NULL row as slot 0 | 1318 `SUCCESS!` | `FAILURE!` |
+| M7 | whole-row variance instead of per-group | 9 `SUCCESS!` | `FAILURE!` |
+| M8 | sigmoid instead of silu | 9 `SUCCESS!` | `FAILURE!` |
+| M9 | drop `CheckMamba2ANegative` on decode (§8.2) | 11 `SUCCESS!` | `FAILURE!` |
+
+**Two mutations had to be REFORMULATED, and that is worth carrying.** The
+obvious form of M1 (`if (!prev_zero)` → `if (false)`) and of M7 (passing
+`1, hidden` for `n_groups, group_size`) do not COMPILE: the CUDA arm is built
+`-Werror=all-warnings`, and nvcc raises `#550-D "prev_zero was set but never
+used"` and `#177-D "group_size was declared but never referenced"` once the
+mutation dead-codes the read. A mutation that will not build is not a caught
+mutation and must not be scored as one. Both were rewritten to drop exactly the
+same term while leaving every variable read — M1 multiplies the inter-chunk
+product by `0.0f`, M7 passes `1, group_size * args.n_groups` (which *is*
+`hidden`) — and both then failed as intended.
+
+**The derived bar is audited, not asserted.** Across the 55 device-vs-host
+comparisons in a green run, the worst one used **7.66%** of `rtol(K) =
+4·(K+2)·2⁻²⁴`; the driver shapes used 0.32% and 0.18%. For contrast the same
+`MESSAGE` line under mutant M3 reads `used 962173% of its derived budget`. So
+the bound is neither tuned down to the observed error nor wide enough to hide a
+defect.
 
 ## 9. Stop conditions
 
