@@ -784,9 +784,22 @@ wears when nobody probes it.**
   move by 1.64e-2 and 2.04e-2 against a 5e-6 band. Its ENCODER twin at the SAME 100x moves
   4.39e-5 and goes red — so the decoder's silence was an accident of fixture scale, not a
   property of upstream.
-- `kLtx2RmsNorm2dEps` is a `clamp_min` FLOOR in `F.normalize`, not a discarded value. It binds
-  only on a ~zero channel vector, which no arm constructs — and the project's own BWE-quiet arm
-  is precedent that such a probe IS constructible.
+- `kLtx2RmsNorm2dEps` is a `clamp_min` FLOOR in `F.normalize`, not a discarded value. It IS read
+  — setting it to `1.0` reds two encoder arms at 5.26e-4, so the path demonstrably executes —
+  but the floor itself binds only on an exactly-zero channel vector.
+
+  **SECOND CORRECTION, 2026-08-13.** This entry originally went on to claim the project's own
+  BWE-quiet arm is precedent that such a probe IS constructible. A later reviewer disproved
+  that, and the distinction is one I should have drawn myself: in the BWE case **silence is a
+  legitimate INPUT**, so the probe is just a fixture. Here the floor binds on a **mid-network
+  activation vector**, and no legitimate input zeroes one downstream of a biased convolution.
+  The precedent does not transfer. So this constant is read-but-never-binding, and a pin really
+  is the only honest instrument for it.
+
+  Worth stating plainly: in correcting the sweep for calling a live constant unreachable, I
+  overcorrected and called an unreachable one constructible. Both errors are the same failure —
+  asserting a reachability verdict without the probe that settles it — and mine had the
+  additional defect of citing a precedent I had not checked applied.
 - Only `kLtx2EncoderApproxLnZero` is genuinely unreachable: `video_vae.py:325-334` concatenates
   the block and `torch.chunk(...)[0]` discards it. Mutating -30 to -1 leaves the suite green
   because upstream never reads it either.
