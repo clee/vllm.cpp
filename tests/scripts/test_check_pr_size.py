@@ -354,6 +354,41 @@ class BudgetEnforcement(unittest.TestCase):
             any("mutation evidence" in e for e in checker.change_errors([lone_checker]))
         )
 
+    def test_every_secondary_oracle_file_classifies(self) -> None:
+        """One file per oracle must classify (GATE-PR-SIZE-BINARY follow-on, #668).
+
+        RED before the fix on EVERY tracked file under .agents/oracles/: the
+        secondary-oracle registry landed with no pattern in the checker, so a
+        required check refused any PR that recorded a pin -- which is the one
+        thing the registry exists to make cheap. Asserted on the whole tracked
+        set rather than a sample, so a ninth oracle added without a class is
+        caught here and not in someone's PR.
+        """
+        tracked = subprocess.run(
+            ["git", "ls-files", ".agents/oracles/"],
+            capture_output=True, text=True, check=True, cwd=checker.ROOT,
+        ).stdout.split()
+        self.assertTrue(tracked, "expected tracked .agents/oracles/ files")
+        for path in tracked:
+            with self.subTest(path=path):
+                self.assertEqual(checker.classify_path(path), "procedure")
+
+    def test_oracles_is_a_pattern_not_a_blanket_directory_exemption(self) -> None:
+        """The class is earned by shape, not by living under .agents/oracles/.
+
+        AGENTS.md forbids hiding mutable files behind a blanket directory
+        exemption, so a non-.md file or a nested path there must still fail
+        closed rather than inherit `procedure`.
+        """
+        for path in (
+            ".agents/oracles/pin.txt",
+            ".agents/oracles/vllm.json",
+            ".agents/oracles/nested/dir.md",
+        ):
+            with self.subTest(path=path):
+                with self.assertRaises(ValueError):
+                    checker.classify_path(path)
+
     def test_a_classified_binary_is_accepted(self) -> None:
         """A binary at a classified path is not an error (GATE-PR-SIZE-BINARY, #615).
 

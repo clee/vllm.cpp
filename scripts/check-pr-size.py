@@ -174,6 +174,12 @@ COMPLETED = re.compile(r"\.agents/completed/[A-Za-z0-9_.-]+\.md\Z")
 # this. A claim in its own file has one writer and cannot collide. Classified
 # with the other per-row records it now resembles.
 CLAIM = re.compile(r"\.agents/claims/[A-Za-z0-9_.-]+\.md\Z")
+# One file per secondary oracle (AGENTS.md, "When vLLM has no implementation").
+# Same shape and therefore the same class as SPEC and CLAIM: a per-key record
+# globbed for reading, deliberately NOT a shared table every change must write.
+# Absent until #668 -- the registry landed with no pattern here, so every one of
+# its files was unclassified and a required check refused any PR touching a pin.
+ORACLE = re.compile(r"\.agents/oracles/[A-Za-z0-9_.-]+\.md\Z")
 # Retired state evidence, moved wholesale under completed/ when history became
 # git. It is archived evidence, classified like every other completed record.
 COMPLETED_STATE_EVENT = re.compile(
@@ -368,6 +374,7 @@ def classify_path(path: str) -> str:
         path in PROCEDURE_FILES
         or SPEC.fullmatch(path)
         or CLAIM.fullmatch(path)
+        or ORACLE.fullmatch(path)
         or COMPLETED.fullmatch(path)
         or COMPLETED_STATE_EVENT.fullmatch(path)
     ):
