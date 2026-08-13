@@ -654,6 +654,17 @@ So **all ten ctest failures are pre-existing and tracked** (#486 / #516 for
 pre-existing ctest failures", and the same-name baseline for the rest). None is
 attributable to W2. The standalone log is `~/w2ssd/refail.log`.
 
+**All ten reproduce STANDALONE** on the idle box, one `ctest -R` per binary under
+the lock — `CTEST_EXIT=8` for every one of `test_minimax_h3`, `test_ops_gdn`,
+`test_capi`, `test_serve_low_tools`, `test_linear_method`,
+`test_glm4_moe_lite_paged_engine`, `test_qwen3_apc_e2e`,
+`test_minicpm3_paged_engine`, `test_internlm2_paged_engine`,
+`test_llama_paged_engine`, `W2_REFAIL_DONE`. That matters in both directions: it
+rules out "the 431-test run starved them", so none of the ten is a contention
+flake to be waved through, and it confirms they are deterministic reds that
+exist independently of this branch — which is what makes the same-name baseline
+comparison sound rather than a coincidence of two noisy runs.
+
 **A live protocol defect found while doing this, and fixed.** The re-run had
 been relaunched (not by this session) as
 `flock -w 3600 $HOME/gpu.lock ./w2refail.sh` — an OUTER `flock` wrapping a
