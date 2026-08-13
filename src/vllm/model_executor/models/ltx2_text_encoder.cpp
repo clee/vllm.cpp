@@ -793,9 +793,13 @@ OwnedTensor TowerModule(const SafetensorsFile& file, const std::string& module,
 
   t.bytes.resize(static_cast<size_t>(out_features) * static_cast<size_t>(in_features) *
                  sizeof(uint16_t));
-  Ltx2DequantTorchaoNvfp4ToBf16(module, w, file.Get(module + ".weight_scale"),
-                                file.Get(module + ".weight_scale_2"), out_features,
-                                in_features, reinterpret_cast<uint16_t*>(t.bytes.data()));
+  // The producer is NOT inferred here: `ParseLtx2TorchaoNvfp4Marker` above has
+  // already REFUSED anything whose marker does not say torchao, so by the time
+  // we reach this line the low-nibble-first reading is established rather than
+  // assumed. That is why the seam takes no default (ltx2_loader.h:323-325).
+  Ltx2DequantNvfp4ToBf16(module, w, file.Get(module + ".weight_scale"),
+                         file.Get(module + ".weight_scale_2"), out_features, in_features,
+                         Ltx2Nvfp4Producer::kTorchao, reinterpret_cast<uint16_t*>(t.bytes.data()));
   if (dequantized != nullptr) dequantized->push_back(module);
   return t;
 }
