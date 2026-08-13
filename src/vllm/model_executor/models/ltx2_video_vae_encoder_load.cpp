@@ -110,6 +110,21 @@ std::vector<Ltx2VideoEncoderBlock> ParseEncoderBlocks(const nlohmann::json& bloc
     Ltx2VideoEncoderBlock block;
     block.name = entry[0].get<std::string>();
     const nlohmann::json& params = entry[1];
+    // `num_layers` is REQUIRED, and required by exactly one block kind. Upstream
+    // SUBSCRIPTS it — `num_layers=block_config["num_layers"]` (video_vae.py:55) —
+    // which raises `KeyError` when it is absent, and no other branch of
+    // `_make_encoder_block` reads it at all (:61-145). This defaulted to 1, so a
+    // `res_x` config upstream refuses outright built a silent one-layer
+    // `UNetMidBlock3D` here — the same class of wrong-shape-without-a-word defect
+    // that `multiplier`'s sentinel two lines below exists to prevent, resolved the
+    // opposite way. Made consistent 2026-08-13 (review of #657, row LTX25-IMAGE-COND).
+    if (block.name == "res_x" && !params.contains("num_layers")) {
+      Fail("a '" + where + ".encoder_blocks' res_x entry carries no 'num_layers': " +
+           entry.dump() +
+           ". Upstream subscripts it (video_vae.py:55) and raises KeyError, so a checkpoint "
+           "without it is one upstream cannot load either; the layer count is not derivable "
+           "from anything else in the config");
+    }
     block.num_layers = ConfigGet<int64_t>(params, "num_layers", 1, "encoder_block");
     // 0 is the sentinel `Ltx2VideoEncoderBlock` documents for "the upstream
     // default for this block kind" (2 for every `*_x_y` / `*_res`). An ABSENT
@@ -125,11 +140,30 @@ std::vector<Ltx2VideoEncoderBlock> ParseEncoderBlocks(const nlohmann::json& bloc
 }  // namespace
 
 std::vector<Ltx2VaeKeyRule> Ltx2VideoVaeEncoderKeyRules() {
-  // model_configurator.py:267-276, rule for rule. ORDER MATTERS in this port's
-  // first-match-wins loop the way it does in upstream's replacement chain: the
-  // `vae.`-prefixed spellings must be tried before their bare twins, or
-  // `vae.encoder.conv_in...` would fall through to no rule at all (it does not
-  // start with `encoder.`) and be dropped.
+  // `VAE_ENCODER_COMFY_KEYS_FILTER` (model_configurator.py:267-276), TRANSLATED
+  // into this port's rule shape — not copied rule for rule, and the difference is
+  // worth stating rather than glossing.
+  //
+  // Upstream's `SDOps` is two passes (loader/sd_ops.py:101-122): an `any()` over
+  // its four `with_matching` PREFIXES decides whether the key is admitted at all,
+  // and then every `with_replacement` is applied in order as a chained SUBSTRING
+  // replace. Upstream declares four matchings and only three replacements,
+  // because the bare `per_channel_statistics.` form needs admitting but not
+  // rewriting.
+  //
+  // This port has ONE pass: a first-match-wins prefix loop where the matched
+  // rule's replacement is substituted (`Ltx2LoadVaeTensors`). So the fourth rule
+  // below is an IDENTITY — it exists to carry upstream's fourth matching, since a
+  // key admitted by no rule here is dropped. ORDER MATTERS for the same reason
+  // upstream lists its `vae.`-prefixed spellings first: `vae.encoder.conv_in...`
+  // does not start with `encoder.`, so a bare-first ordering would drop it.
+  //
+  // The two shapes agree on every key any shipped checkpoint carries: all four
+  // upstream matchings are prefixes, no admitted key contains a second
+  // replacement's substring after the first has fired, and no replacement is a
+  // substring of another's output. They would diverge on a key needing TWO
+  // rewrites in one pass, which no LTX-2 VAE file produces — behaviourally
+  // equivalent, therefore, not verbatim.
   return {
       {"vae.encoder.", ""},
       {"vae.per_channel_statistics.", "per_channel_statistics."},

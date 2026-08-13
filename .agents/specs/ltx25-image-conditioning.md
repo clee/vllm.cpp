@@ -70,7 +70,7 @@ codec.
 |---|---|---|
 | encoder key filter | `ltx-core/.../video_vae/model_configurator.py:267-276` (`VAE_ENCODER_COMFY_KEYS_FILTER`) | `Ltx2VideoVaeEncoderKeyRules` |
 | encoder config | `model_configurator.py:37-69` (`_prepare_video_encoder_kwargs`) + `:72-78` (`VideoEncoderConfigurator`) | `Ltx2ParseConvVideoEncoderConfig` |
-| encoder lifecycle | `ltx-pipelines/.../utils/blocks.py:936-993` (`ImageConditioner`) | engine load path, `ltx2_video.cpp` |
+| encoder lifecycle | `ltx-pipelines/.../utils/blocks.py:936-991` (`ImageConditioner`; build `:985-986`, build-and-free `:988-991`) | engine load path, `ltx2_video.cpp` |
 | CRF resolution | `blocks.py:966-983` + `constants.py:36-37, 124, 130-133` | `Ltx2ResolveDefaultImageCrf` |
 | CRF round trip | `decode.py:413-435`, `encode_single_frame:386-400` | **REFUSED BY NAME** (§3.4) |
 | image decode | `decode.py:139-170` (`decode_image`: EXIF rotate, ICC→sRGB, uint8 RGB) | `Ltx2DecodePpmRgb` (PPM only, §3.2) |
@@ -86,8 +86,14 @@ codec.
 ### 3.1 The encoder load path
 
 `Ltx2VideoVaeEncoderKeyRules()` mirrors `VAE_ENCODER_COMFY_KEYS_FILTER`
-(`model_configurator.py:267-276`) in the same first-match-wins prefix form the
-already-gated `Ltx2VideoVaeDecoderKeyRules()` uses:
+(`model_configurator.py:267-276`) in the first-match-wins prefix form the
+already-gated `Ltx2VideoVaeDecoderKeyRules()` uses. It is a TRANSLATION, not a
+rule-for-rule copy: upstream's `SDOps` (`loader/sd_ops.py:101-122`) admits a key
+by `any()` over four matchings and then chains three substring replacements,
+while this port matches and replaces in one pass — so the fourth rule below is an
+identity that exists to carry upstream's fourth matching. Equivalent on every key
+a shipped checkpoint carries; see the comment on the function for exactly when
+they would part.
 
 ```
 {"vae.encoder.",                ""}
@@ -180,7 +186,10 @@ to the diffusers form.
 
 Placement in `Generate`: the conditioning is applied to the video `StreamState`
 AFTER `clean` is seeded from the patchified initial volume and BEFORE
-`ApplyGaussianNoise` — which is `blocks.py:576-580` / `helpers.py:428-447` order.
+`ApplyGaussianNoise` — which is `create_noised_state` order (`helpers.py:428-445`:
+initial state, then the conditioning items, then the noiser). NOT `blocks.py:576-580`,
+which this spec cited until the review of #657: those lines are the TEARDOWN
+(`clear_conditioning` + `unpatchify`) and say nothing about conditioning order.
 It is applied on EVERY phase, because every phase rebuilds its state from the
 recipe and a conditioning dropped on phase 2 would be re-noised away.
 
@@ -203,10 +212,31 @@ whose stated reason went stale; each message below names the exact symbol or
 2. **No encoder in the checkpoint.** Names `Ltx2VideoVaeEncoderKeyRules` and says
    the file carried no `encoder.*` / `vae.encoder.*` tensors.
 3. **Keyframes** (`last_frame_path`, or an image at a non-zero frame index).
-   `Ltx2ConditionVideoByKeyframe` EXISTS and is gated; what is missing is that
-   the DiT's `keyframes_abs_pos_embedding` module is unported and is refused by
-   `ParseLtx2DitParams`, so the appended keyframe tokens would carry no
-   positional embedding.
+   `Ltx2ConditionVideoByKeyframe` EXISTS and is gated; what is missing is the
+   TOKEN-APPEND machinery. `VideoConditionByKeyframeIndex.apply_to`
+   (`keyframe_cond.py:36-90`) appends tokens — concatenating onto `latent`,
+   `denoise_mask`, `positions` and `clean_latent` (`:79-82`), giving them their
+   own coordinates offset to `frame_idx` (`:46-59`) and rebuilding the attention
+   mask via `update_attention_mask` (`:68-76`) — and `clear_conditioning`
+   (`ltx_core/tools.py:88-105`) trims them back before unpatchify. `Ltx2LatentState`
+   carries no attention mask, and the engine's phase loop is fixed at the target
+   grid's token count from one `Ltx2VideoTokenCount` through the sigma schedule,
+   the `Ltx2ModalityInput` and `Ltx2VideoUnpatchify`. The first-frame arm needs
+   none of it because `VideoConditionByLatentIndex` REPLACES existing tokens.
+
+   **This spec and the shipped message previously named
+   `keyframes_abs_pos_embedding` as the blocker. That was FALSE at pin
+   `fd4ded7f`, and a test had been written to assert it by name.** A supplied
+   keyframe is appended with `marked=False` (`keyframe_cond.py:84-86`), and its
+   sole consumer adds `mask * embedding` with `mask = keyframes_mask > 0`
+   (`model/transformer/transformer_args.py:42-43`, called once at `:269`), so the
+   embedding contributes nothing to those tokens and porting it would not serve
+   this arm. The tokens that DO reach it are the target's own first latent frame,
+   marked unconditionally by `_first_frame_keyframes_mask`
+   (`ltx_core/tools.py:184-196`) — the frame the SERVED first-frame arm writes
+   into. That is a real gap on the served arm and is tracked as
+   [#658](https://github.com/mudler/vllm.cpp/issues/658); it is not what blocks a
+   last-frame keyframe.
 4. **Reference video / reference image / reference audio.**
    `Ltx2ConditionVideoByReference` and `Ltx2ConditionAudioByReference` also
    EXIST; what is missing is that both need the IC-LoRA's `downscale_factor` /
@@ -222,7 +252,13 @@ whose stated reason went stale; each message below names the exact symbol or
   and still produces a latent.
 * **The encoder's `zeros` vs the decoder's `reflect` padding default.** Same
   checkpoint key, different defaults, and they only diverge when the key is
-  absent.
+  absent (`model_configurator.py:63-68` vs `:92`).
+* **Defaulting a `res_x` block's `num_layers`.** Upstream subscripts
+  `block_config["num_layers"]` (`video_vae.py:55`) and raises `KeyError`; no
+  other block kind reads the field. `ParseEncoderBlocks` defaulted it to 1, which
+  builds a one-layer `UNetMidBlock3D` out of a config upstream refuses. Made
+  strict in the review of #657, matching how `multiplier`'s sentinel two lines
+  below already treats an absent value.
 * **Normalizing before resizing.** Same answer to ~1e-7 — and §8.1 records the
   outcome: NO golden here sees it either, because the two orders are
   algebraically equal. Mirrored because it is upstream's, and written down
@@ -381,12 +417,20 @@ only because of that change.
 * **`image_crf` has no default that renders.** Absent resolves 18 and refuses.
   A default of 0 would silently condition every request out of distribution.
 * **The encoder stays RESIDENT**, where `ImageConditioner` builds and frees it
-  per call (`blocks.py:988-993`). A conditioning image arrives per request and
+  per call (built at `blocks.py:985-986`, built-and-freed around `fn` at
+  `:988-991`). A conditioning image arrives per request and
   the encoder is small next to the DiT; the divergence is lifecycle only.
 * **The conditioning is applied PER PHASE**, because the two-stage recipe renders
   its stages at different resolutions and upstream passes each stage's own
   height/width. One encode would either be re-noised away or placed at the wrong
-  scale.
+  scale. **This reason was gated by nothing until the review of #657.** MEASURED:
+  changing the guard to `wants_image && phase_index == 0` left `test_ltx2_video`
+  at 32 cases / 550 assertions / exit 0, because `image_tokens` and `image_digest`
+  are overwritten each phase and the suite only asked `image_tokens > 0`. The
+  trace now pins the LAST phase's per-latent-frame token count (4 in the fixture,
+  1 at phase 0) and contrasts it with a `max_phase = 0` engine over the same
+  request, which REDs that mutant at `1 == 4`. It matters because hoisting the
+  per-phase decode+encode out of the loop is the obvious optimization.
 
 ## 9. Now
 

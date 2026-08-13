@@ -687,7 +687,9 @@ std::string ConditioningPpm(int height, int width, unsigned seed) {
 // BOTH phases, which for image conditioning is not a detail: the two-stage
 // recipe renders its stages at DIFFERENT resolutions, so the image is decoded,
 // resized and encoded once per phase against that phase's own height and width
-// (ltx-pipelines/utils/helpers.py:274-275). A `max_phase = 0` fixture would
+// (ltx-pipelines/utils/helpers.py:274-275 are the parameters; distilled.py:251,
+// :255-256 and :285-286 are where the two stages pass different values). A
+// `max_phase = 0` fixture would
 // leave the second encode — and the whole reason the conditioning lives inside
 // the phase loop — untested.
 vllm::multimodal::VideoModelParams ConditioningParams(const ltx2_fixture::Paths& paths) {
@@ -724,18 +726,36 @@ TEST_CASE("ltx2 video: keyframe and reference conditioning is refused BY WHAT IS
     }
   };
 
-  SUBCASE("a LAST-frame keyframe names the unported DiT module") {
+  SUBCASE("a LAST-frame keyframe names the TOKEN-APPEND machinery, not the embedding") {
     const std::string msg = refusal("a last-frame keyframe",
                                     [](vllm::multimodal::VideoGenParams& g, const Workspace& w) {
                                       g.last_frame_path = w.paths.video_embeds;
                                     });
     INFO(msg);
-    // The encoder is NOT what is missing any more, and the message must not say
-    // it is. What IS missing is the positional-embedding module the appended
-    // keyframe tokens would be read through.
-    CHECK(msg.find("keyframes_abs_pos_embedding") != std::string::npos);
+    // THIS ASSERTION USED TO PIN A FALSE REASON. It required the message to
+    // blame `keyframes_abs_pos_embedding`, and at pin `fd4ded7f` that is not
+    // what blocks a supplied keyframe: `apply_to` appends it with
+    // `marked=False` (keyframe_cond.py:84-86) and the sole consumer adds
+    // `mask * embedding` (transformer_args.py:42-43, called at :269), so the
+    // embedding contributes exactly nothing to those tokens. Porting it would
+    // not serve this arm. The gate enforced the wrong thing, which is worse
+    // than not gating the message at all.
+    //
+    // What actually blocks it is the append: extended `positions`,
+    // `update_attention_mask`, extended `clean_latent` / `denoise_mask`, and
+    // `clear_conditioning` trimming back — none of which this engine's
+    // fixed-length phase loop can express.
+    CHECK(msg.find("update_attention_mask") != std::string::npos);
+    CHECK(msg.find("clear_conditioning") != std::string::npos);
     CHECK(msg.find("keyframe_cond.py") != std::string::npos);
     CHECK(msg.find("VAE_ENCODER_COMFY_KEYS_FILTER") == std::string::npos);
+    // The refuted reason may still be NAMED — it is worth telling a reader that
+    // it was ruled out — but never as the thing that is missing, and only next
+    // to the issue that tracks where the embedding really does bite (#658).
+    if (msg.find("keyframes_abs_pos_embedding") != std::string::npos) {
+      CHECK(msg.find("NOT* THE REASON") != std::string::npos);
+      CHECK(msg.find("#658") != std::string::npos);
+    }
   }
   SUBCASE("a reference video names the IC-LoRA metadata this project does not read") {
     const std::string msg = refusal("a reference video",
@@ -817,7 +837,21 @@ TEST_CASE("ltx2 video: an image at crf 0 conditions the render, and the ENCODER 
   CHECK(trace.completed);
   CHECK(trace.image_crf == 0);
   CHECK(trace.image_strength == 1.0);  // noise_aug defaults to 1.0 => the frame is PINNED
-  CHECK(trace.image_tokens > 0);
+  // WHICH PHASE this describes is the claim, and `image_tokens > 0` did not make
+  // it. MEASURED: changing the guard to `wants_image && phase_index == 0` — the
+  // shape of an obvious refactor that hoists the per-phase decode+encode out of
+  // the loop — left this whole binary at 32 cases / 550 assertions / exit 0
+  // while `refine`, the phase whose latent is actually rendered, ran with the
+  // pinned frame re-noised away. The design's own reason for living inside the
+  // loop (spec section 8.5) was gated by nothing.
+  //
+  // So the count is pinned to the LAST phase's per-latent-frame token count.
+  // This fixture's two-stage recipe runs `generate_lowres` at
+  // `spatial_downscale = 2` and `refine` at 1, so the latent grid doubles in
+  // each spatial dimension and the placed count is 1 then 4 — a per-phase value,
+  // which is exactly why `image_tokens == 4` falsifies a stage-1-only build.
+  constexpr int64_t kRefineImageTokens = 4;
+  CHECK(trace.image_tokens == kRefineImageTokens);
   CHECK(trace.image_digest != 0);
   // A conditioning that collapsed to zeros would give every image the same
   // digest and still satisfy every check below it, so the magnitude is asked for
@@ -825,6 +859,35 @@ TEST_CASE("ltx2 video: an image at crf 0 conditions the render, and the ENCODER 
   CHECK(trace.image_absmax > 0.0);
   // The render still produced its artifacts; conditioning is not a bypass.
   CHECK(result.frame_count == 9);
+
+  SUBCASE("the trace describes the LAST phase, and stage 1 is a different count") {
+    // The other half of the same claim, and the half a literal cannot make: the
+    // number above is not a constant of the fixture, it TRACKS the phase that
+    // ran last. Same request, capped at phase 0, must report stage 1's smaller
+    // count — and the ratio is checked between two MEASURED values rather than
+    // between two compile-time constants, which would assert nothing.
+    // `max_phase` is a LOAD-time extra, not a per-generation one, so the cap
+    // needs its own engine over the same fixture.
+    vllm::multimodal::VideoModelParams capped = ConditioningParams(ws.paths);
+    capped.extras[vllm::multimodal::kLtx2MaxPhaseExtra] = "0";
+    const std::unique_ptr<vllm::multimodal::VideoEngine> stage1_engine =
+        vllm::multimodal::LoadVideoEngine(capped);
+    auto* stage1_ltx2 =
+        dynamic_cast<vllm::multimodal::Ltx2VideoEngine*>(stage1_engine.get());
+    REQUIRE(stage1_ltx2 != nullptr);
+    vllm::multimodal::VideoGenParams lowres = FixtureGen(ws.root + "/img_stage1");
+    lowres.first_frame_ppm = ConditioningPpm(20, 28, 1);
+    lowres.extras[vllm::multimodal::kLtx2ImageCrfExtra] = "0";
+    (void)stage1_engine->Generate(lowres);
+    const vllm::multimodal::Ltx2ConditioningTrace stage1 = stage1_ltx2->last_conditioning();
+    CHECK(stage1.image_tokens == 1);
+    CHECK(trace.image_tokens == 4 * stage1.image_tokens);
+    // And it is a DIFFERENT encode, not the same one carried forward: the image
+    // is resized and encoded against each phase's own height and width
+    // (ltx-pipelines/utils/helpers.py:274-275, per-stage h/w at
+    // distilled.py:251, 255-256, 285-286).
+    CHECK(stage1.image_digest != trace.image_digest);
+  }
 
   SUBCASE("a DIFFERENT image is a different conditioning") {
     vllm::multimodal::VideoGenParams other = FixtureGen(ws.root + "/img2");

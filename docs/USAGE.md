@@ -404,15 +404,25 @@ it is stated rather than applied silently.
 
 Keyframe, reference-image, reference-video and reference-audio conditioning are
 still refused, each naming a different missing piece: a last-frame keyframe needs
-the DiT's unported `keyframes_abs_pos_embedding`; the reference arms need the
-IC-LoRA's scale factors, which live in LoRA metadata this project does not read;
-reference audio additionally needs the AUDIO VAE's encoder key filter, which is
-not built. Two encoder-level limits are worth
+the token-APPEND machinery — a keyframe is appended to the sequence with its own
+positions and a rebuilt attention mask, then trimmed back off, and this engine's
+phase loop is fixed at the target grid's token count — while the served
+first-frame arm only REPLACES tokens that already exist; the reference arms need
+the IC-LoRA's scale factors, which live in LoRA metadata this project does not
+read; reference audio additionally needs the AUDIO VAE's encoder key filter,
+which is not built. (Until 2026-08-13 this said a last-frame keyframe needs the
+DiT's unported `keyframes_abs_pos_embedding`. That was wrong: a supplied keyframe
+is appended unmarked, so the embedding never applies to it. Where the embedding
+does bite is the FIRST latent frame of every render, which is a separate gap,
+tracked as issue #658.) Three encoder-level limits are worth
 stating in advance because they are refusals rather than approximations. A
 reference waveform whose sample rate differs from the audio VAE's is refused
 rather than resampled, since upstream uses a polyphase kaiser resampler this
-project does not carry. And a VAE configured with `latent_log_var: none` is
-refused, because upstream itself raises on it.
+project does not carry. A VAE configured with `latent_log_var: none` is
+refused, because upstream itself raises on it. And a video-VAE `res_x` encoder
+block that declares no `num_layers` is refused rather than defaulted, because
+upstream subscripts that key and raises `KeyError` on it; no other encoder block
+kind reads it.
 
 **A typed prompt works.** `--encoder` names the Gemma-4 12B text tower and
 `--prompt` carries the words. The tower tokenizes them with its OWN embedded
