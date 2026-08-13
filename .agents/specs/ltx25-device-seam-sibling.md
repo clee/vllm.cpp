@@ -1,0 +1,198 @@
+# The diffusion lane's device seam — the sibling that never adopted it, and the gate that cannot see it
+
+Row: `LTX25-DEVICE-SEAM-SIBLING`
+Issues: [#659](https://github.com/mudler/vllm.cpp/issues/659), [#660](https://github.com/mudler/vllm.cpp/issues/660)
+Campaign: [#644](https://github.com/mudler/vllm.cpp/issues/644)
+Base: `11cc1d5896b480a1b652db9249319242053aca93`
+
+Both defects were found by a **peer session's reviewer** while reviewing the
+main-red repair for landing, not by this campaign. They are recorded here
+because they are in this lane and this campaign owns them.
+
+## 0. What is wrong today
+
+`11cc1d589` routed LTX-2.5's device question through the platform seam. It fixed
+the lane it was aimed at and left two things standing.
+
+**(a) #659 — the seam was adopted, its companion guard was not.**
+`src/vllm/multimodal/ltx2_video.cpp:549-562` now asks two questions:
+
+```cpp
+const vt::DeviceType accelerator = vllm::platforms::CurrentPlatform().device_type();
+if (accelerator == vt::DeviceType::kCPU ||
+    vt::TryGetBackend(accelerator) == nullptr) { Fail(...); }
+```
+
+That is "is there an accelerator, and is a backend registered for it". The
+precedent it cites, `SelectQueueForModel`, asks a third question —
+`src/vllm/entrypoints/model_loader.cpp:97`:
+
+```cpp
+(architecture.empty() || plat.supports_model_architecture(architecture))
+```
+
+`supports_model_architecture` exists precisely so a **partial** backend can
+decline by name. Two platforms override it and both declare a short list:
+`src/vllm/platforms/metal.cpp:70` and `src/vllm/platforms/tenstorrent.cpp:52`.
+On such a build a `device = 1` LTX-2.5 load **was refused by name** and is now
+accepted, so the failure moves from a refusal that says which piece is missing
+into a kernel bind that says nothing. CUDA is unaffected, which is exactly why
+this is invisible on the box that runs the gates.
+
+The refusal that *is* there argues, correctly, that serving the CPU forward
+behind an accelerator handle "would make every later timing and every 'it ran on
+the GPU' claim false". A partial backend that binds and dies has the same
+property one level down: it is a device claim the build cannot honour.
+
+**(b) #660 — the gate that certified (a) is a token grep, and the sibling lane
+spells its way past it.** `scripts/check-device-leakage.py:78` is
+
+```python
+RE_KCUDA = re.compile(r"\bkCUDA\b")
+```
+
+`src/vllm/multimodal/minimax_h3_video.cpp:221-226` never writes that token:
+
+```cpp
+vt::DeviceType MiniMaxH3VideoDeviceType(int32_t device) {
+  if (device != 0 && device != 1) { throw ...; }
+  return static_cast<vt::DeviceType>(device);
+}
+```
+
+It hardcodes the ABI's `0/1` into the enum by integer cast and scores **zero**
+in the `kcuda` bucket. The same defect, in the sibling diffusion lane, under a
+different spelling.
+
+**The sharpest form of it:** `tests/vllm/models/test_minimax_h3_video_fold.cpp:162`
+asserts `MiniMaxH3VideoDeviceType(1) == vt::DeviceType::kCUDA`. The *test* spells
+the token honestly and is counted; the *source* launders it and is not. The gate
+therefore reads the confession and misses the act.
+
+This is the shape the project already has a name for — an instrument that cannot
+report its own blind spot returns a pass. "`kcuda` 2 → 0" is a true statement
+about the token and a weaker statement about the property than it appears to be.
+
+## 1. Scope
+
+**In.**
+
+1. `minimax_h3_video.cpp` resolves its device through the platform seam rather
+   than by integer cast, mirroring what `ltx2_video.cpp` now does. The public
+   `MiniMaxH3VideoDeviceType(int32_t)` contract in
+   `include/vllm/multimodal/minimax_h3_video.h:63` is preserved — `0` is CPU,
+   anything else is refused or resolved, never cast.
+2. `ltx2_video.cpp` asks `supports_model_architecture` alongside the two
+   questions it already asks, and refuses **by name**, naming the platform and
+   the architecture, when a registered backend declines the model.
+3. `check-device-leakage.py` gains a bucket that sees an integer cast to
+   `vt::DeviceType`. The bucket must be **derived from the property**, not from
+   the one spelling we happen to have found — see §3.
+
+**Out.**
+
+- Any change to what CUDA does. This row must be a no-op on a CUDA build, and
+  the gate for that is the existing suite passing unchanged on this box.
+- Widening or rewriting `device-leakage-baseline.json` beyond the new bucket's
+  own entries. **The baseline is a ratchet**: a peer measured that
+  `--write-baseline` refuses to raise it (`REFUSING to write a HIGHER baseline
+  (32 → 35)`) but that **hand-editing the JSON to a higher number makes the
+  checker PASS**. So the only real defence is that the diff is visible and
+  reviewed. Any baseline line this row touches is called out in the PR body,
+  with its reason, and the reviewer checks the file by md5 against the base for
+  every key this row does not claim.
+- The H3 video engine's model behaviour. This is a device-resolution change.
+
+## 2. Upstream anchors
+
+There is no upstream for this: vLLM has no LTX-2.5 or MiniMax-H3 video engine,
+and the device seam is ours. The mirror source is therefore **our own
+`SelectQueueForModel`** (`src/vllm/entrypoints/model_loader.cpp:59-104`), which
+is the shape every other model path already uses, and
+`include/vllm/platforms/interface.h:263`, which defines the capability question.
+Mirroring an internal seam is what "route it through the shared surface" means;
+a second, parallel device resolution in the diffusion lane is exactly the
+hand-rolled path AGENTS.md forbids.
+
+## 3. Design
+
+**The capability question, at the same site as the existing two.** One added
+clause, one refusal message that names the platform, the architecture and the
+fact that the backend declined — not a shape error. It must be possible to read
+the refusal and know that the build is partial rather than broken.
+
+**The sibling's resolution.** `static_cast<vt::DeviceType>(device)` is replaced
+by an explicit mapping: `0` → `kCPU`, non-zero → the platform's
+`device_type()`, refused when that is `kCPU` or its backend is absent or it
+declines the architecture. That makes the two diffusion lanes answer the device
+question the same way, which is the point of the seam.
+
+**The gate's new bucket is the hard part, and it is where this row can go
+wrong.** A bucket that greps `static_cast<vt::DeviceType>` closes the one site
+we found and nothing else — the same defect as the token grep, one spelling
+later. The bucket is defined by the property: *an integer literal or integer
+variable becoming a `vt::DeviceType` without passing through the platform
+seam*. Whatever the implementation, the acceptance test is adversarial and
+stated up front:
+
+> The bucket must go RED for **at least three spellings** of the same defect
+> that are not the one already in the tree — e.g. a C-style cast, a
+> `vt::DeviceType(x)` functional cast, and an assignment through an
+> intermediate `int`. If it only catches the one we knew about, it is a
+> regression test wearing a gate's clothes, and the row says so rather than
+> claiming coverage.
+
+If the property cannot be expressed at the granularity a text checker allows,
+that is a finding to record, not to paper over: the row then states the residual
+blind spot in the checker's own message, because **a checker's message is the
+authority on what it enforces**.
+
+## 4. Tests
+
+RED-first for each of the three.
+
+1. A build with a platform that declines the architecture must refuse the LTX-2.5
+   `device = 1` load **by name**. The existing test fixture pattern for a
+   partial backend is `metal.cpp` / `tenstorrent.cpp`; if neither is
+   constructible in the CPU test build, the test injects a stub platform rather
+   than skipping — a skipped test here is the whole finding.
+2. `MiniMaxH3VideoDeviceType` keeps its contract: `0` → `kCPU`, `-1` and `2`
+   throw (`test_minimax_h3_video_fold.cpp:161-164` already assert this and must
+   stay green **unchanged**), and `1` resolves through the seam rather than by
+   cast. The new assertion is that on a CPU-only build `1` is **refused**, which
+   the cast could never do.
+3. The checker's three-spelling adversarial test above, each spelling asserted
+   RED individually, not as a batch.
+
+**Mutations that must be run and recorded:** revert each of the three changes
+independently and confirm the corresponding test goes RED; and confirm the
+existing suite is byte-identical in count on CUDA-absent builds, since a changed
+count is RED even when it reads green.
+
+## 5. Risks
+
+- **The capability guard could refuse a load that works today.** `metal.cpp` and
+  `tenstorrent.cpp` are the only overriders, so the blast radius is those two
+  builds — but if either currently *runs* a diffusion model despite a short
+  list, this row breaks it. Check before assuming; if it does run, the finding
+  is in the list, not in the guard.
+- **The new bucket could red other lanes.** An integer-to-`DeviceType` cast
+  elsewhere in the tree is either the same defect (fix it or record it) or a
+  legitimate deserialization boundary (which needs a stated, per-entry reason,
+  never a blanket directory exemption).
+- **Baseline churn.** See §1 Out.
+
+## 6. Stop conditions
+
+- If the capability guard turns out to refuse a currently-working configuration,
+  stop and return `NEEDS_DECISION` rather than either shipping the refusal or
+  dropping the guard.
+- If the new bucket cannot reach three independent spellings, stop and report
+  the residual blind spot; do not ship a one-spelling bucket described as
+  coverage.
+- `dgx.casa` is not required for any of this. Nothing here is a GPU measurement.
+
+## Now
+
+`READY`. Spec committed ahead of implementation; a fresh implementer works from
+this file, and a fresh reviewer — not the implementer — reviews the head.
