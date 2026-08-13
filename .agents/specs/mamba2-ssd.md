@@ -399,8 +399,19 @@ half of F4. Dropping `CheckMamba2ANegative` at `cpu_ops.cpp:1877` leaves
 chunk-scan twin at `:1633` reds. The guard itself is present, correct and
 reachable (a direct probe refuses `A` = `+1.0`, `0.0`, `-0.0` naming `A_log`,
 and accepts `-1e-30` and `-9.8e-45`), so this is a missing mutation-proof, not
-a defect — **owed:** an "A must be negative" `SUBCASE` on the state-update
-refusal case mirroring `tests/vt/test_ops_mamba2_ssd.cpp:900`.
+a defect — ~~**owed:** an "A must be negative" `SUBCASE` on the state-update
+refusal case mirroring `tests/vt/test_ops_mamba2_ssd.cpp:900`.~~ **CLOSED in W2**
+(`tests/vt/test_ops_mamba2_state_update.cpp:658`). Re-proved here rather than
+taken on report, as mutation **M9** of the W2 sweep: deleting
+`CheckMamba2ANegative(A, "mamba2_state_update");` at `cpu_ops.cpp:1877` — the
+call site is unique, the other two hits of that symbol being its definition at
+`:1582` and the chunk-scan call at `:1633` — takes
+`test_ops_mamba2_state_update -tc=mamba2 state update refuses the arms it does
+not implement` from `Status: SUCCESS!` to `Status: FAILURE!`. The pristine
+binary was run under the identical filter first, so the filter is proved to
+select a non-zero assertion count; the source was restored byte-for-byte and its
+md5 re-asserted. The verbatim control and mutant output is in the W2 commit
+message.
 
 One repo-wide test trap found while capturing the RED output, and worth carrying
 to any doctest suite: **doctest 2.5.2 `INFO` prints a `const char*` VARIABLE as
@@ -415,6 +426,101 @@ itself: the Triton dots downcast their tile inputs (`ssd_chunk_state.py:283-285`
 `ssd_chunk_scan.py:266-269`) where this host reference stays f32, so W2's
 device-vs-host comparison is a tolerance comparison at the activation dtype, not
 a byte compare.
+
+### 8.3 W2 — the declared equivalence contract for the CUDA arm
+
+This section is the spec copy of the contract the W2 implementer decided
+**before** writing the kernel and recorded in `src/vt/cuda/cuda_mamba2_ssd.cuh`
+and in all three test headers. Its original copy was a staged blob lost with the
+worktree; it is re-authored here from the recovery commit `fcdb7d824`, unchanged.
+It is a contract, not a tolerance budget: nothing in it was renegotiated to make
+a run pass.
+
+**1. f32 accumulation throughout; the upstream tile downcasts are deliberately
+NOT mirrored.** Upstream downcasts its tiles before `tl.dot` — `b.to(x_ptr.
+dtype.element_ty)` at `ssd_chunk_state.py:283-285`, `cb.to(...)` and
+`prev_states.to(C_ptr.dtype.element_ty)` at `ssd_chunk_scan.py:266-269` and
+`:359-363`. Those casts are the **input-precision requirement of `tl.dot`**, i.e.
+of a tensor-core MMA, not a statement of the algorithm: every one of those tiles
+is loaded with an explicit `.to(tl.float32)` and computed in f32 right up to the
+instant it is fed to the MMA. These are scalar-FMA kernels with no MMA, so
+mirroring the downcast would copy a constraint we do not have, and would be lossy
+for nothing.
+
+**2. This is not the "too wide" deviation §7 warns about, and the distinction is
+checkable.** A token gate cannot catch a dtype that is too wide
+([[token-gates-cannot-see-dequant-fallbacks]]), so the claim is made about the
+**memory format**, which is byte-for-byte the host arm's: every load and store
+goes through the operand's own declared dtype (`M2Load` / `M2Store`); `states`
+and `CB` are f32 because upstream pins them there (`states_in_fp32=True`,
+`ssd_combined.py:100-102`; `output_dtype=torch.float32`, `:124`); and the
+inter-chunk `passed` buffer is allocated at **`state_dtype`**, *not* at the host
+reference's f32 working width, which §8.2 F9 explicitly flagged as a width W2
+must not inherit. No extra byte moves. Only the register precision of one product
+differs, and it differs in the direction Triton itself takes wherever it is not
+feeding an MMA.
+
+**3. Accumulation ORDER is part of the port.** Except in the gated norm's group
+reduction — which is a block reduction, and says so at the kernel — every
+accumulation runs in ONE thread, over the SAME index range in the SAME direction
+as the host reference. That is deliberate: it leaves the elementary functions as
+the *only* admitted source of divergence, so the derived bound has exactly one
+term to account for.
+
+**4. A byte compare against the host arm is NOT reachable, and the downcasts are
+not why.** The two arms call different libms — CUDA `expf` is documented at
+≤ 2 ulp, glibc's at ≤ 0.5 — and the gated norm additionally reorders one
+non-negative reduction. Everything else is identical by construction. §9's third
+stop condition ("the device arm cannot reach the host reference byte-for-byte")
+is therefore resolved as **not reachable for a named, non-defect reason**, and
+the gap is kept open in the form below rather than closed by widening anything.
+
+**5. The primary gate is therefore NOT device-vs-host.** It is the device output
+against the **same double-precision sequential reference** the host arm is held
+to, at the **same upstream-ported tolerances**, on the **same inputs** — e.g. atol
+8e-3 / rtol 5e-3 from `test_mamba_ssm_ssd.py:210-213` on the driver shapes. Both
+arms are asserted against it in the same test case, so a failure separates
+cleanly: device-only means a device defect; both means the cited upstream
+threshold does not cover this shape, which is a `NEEDS_DECISION`, not a wider
+tolerance.
+
+**6. The derived device-vs-host bar is `rtol(K) = 4·(K+2)·2⁻²⁴`**
+(`ExpectDeviceMatchesHost` / `DerivedRtol`, `tests/vt/test_ops_mamba2_ssd.cpp`),
+from 2.5 ulp of libm disagreement per decay factor through a product of at most
+`K`, plus `(K-1)·u` of summation error. **No number was tuned and no tolerance
+was widened**; `K` is the sequence length the comparison actually ran at.
+Because a bar nobody audits is a false claim, every comparison logs the
+**fraction of the budget actually used** through `MESSAGE` — not `INFO`, because
+doctest prints `INFO` only on failure, so an `INFO` would have been invisible on
+the green run that the claim rests on.
+
+**Two deviations recorded with the arm, carried forward deliberately:**
+
+- **Placement.** The kernels live in `src/vt/cuda/cuda_mamba2_ssd.cuh`, included
+  by `cuda_gdn.cu`, not in a new `.cu`. Same reason as W1's `cpu_ops.cpp`
+  placement (§8.1): a new library TU must be listed in the root `CMakeLists.txt`,
+  which `check-doc-checkpoint` classifies `user_usage` + `landing_page`, so any
+  new `src/vt/` file owes a `docs/USAGE.md` update that a kernel exposing no
+  command, config key or C-ABI entry point has nothing true to write (#515).
+- **The device arm does not re-check `A < 0` or `state_indices` distinctness.**
+  Both operands are on-device; re-reading them costs a D2H plus a stream
+  synchronise per call — the same host tax the GDN prefill path was rebuilt to
+  remove — and makes the op uncapturable in a CUDA graph. This mirrors the policy
+  `cuda_gdn.cu:8-13` already states for exactly this case. The kernels stay
+  **memory safe** under a violation: an out-of-range `state_indices` slot writes
+  nothing at all rather than out of bounds. **Owed, not implemented here:** route
+  both through the deferred device error ring at `cuda_ops.cu:790-940`.
+
+**Not fixed here, filed as #547.** The W2 RED run SIGSEGV'd on all three
+binaries. GB10 reports `Backend::UnifiedMemory() == true`, so
+`ReferenceTierEligible(kCUDA)` is true and, with no native kernel registered,
+`GetOp` installs the CPU host kernel as a `vt-cpu-ref` provider over `cudaMalloc`
+pointers — which `include/vt/backend.h` already says are not host-dereferenceable
+on GB10. `op_provider.cpp:515-526` gates on `UnifiedMemory()` where it needs
+`DeviceMemoryIsHostAddressable()`. That is shared-seam semantics across three
+backends, so it takes its own row. Every CUDA case here calls
+`RequireNativeCudaProvider`, so a device arm can never be gated by running the
+host arm twice.
 
 ## 9. Stop conditions
 
