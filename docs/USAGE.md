@@ -556,6 +556,26 @@ because that would hand back a lower quality render as if it were the one you
 asked for. Keyframe and reference conditioning is refused for the same reason: it
 runs through the video VAE's encoder, and only the decoder is ported.
 
+**The convolutional decode is TILED and STREAMED, on upstream's own defaults, and
+there is no knob.** The layout is the one `ltx_pipelines` builds for a Conv VAE
+when you pass `AUTO_TILING`: a 768 px tile with a 64 px overlap on the long side,
+aspect coupled to the short one, and 80 frame temporal chunks overlapping by 24.
+Each temporal chunk is written to its PPM files and dropped, so the full pixel
+volume never exists at once. Two consequences worth knowing before you read a
+memory number:
+
+- **Below a 768 px long side and 81 frames the layout does not tile at all.** A
+  single tile comes out, and that path reproduces the untiled decode bit for bit
+  (`test_ltx2_tiling`'s one tile control, on both causality settings). So
+  448x256/25f renders byte identically to how it rendered before tiling existed,
+  and its memory is unchanged. Tiling starts doing something at 896x512, and
+  temporal chunking at 121 frames.
+- **A tiled render is not the same image as an untiled one**, and that is
+  upstream's behaviour, not a defect here. Each tile decodes a crop of the latent,
+  the decoder's receptive field is wider than the 64 px overlap, and the seam is
+  blended rather than eliminated. Do not compare a 1920x1088 render against a
+  hypothetical untiled one and read the difference as an error.
+
 **The refusal that used to stand here is gone, and what replaced it is an owed
 ORACLE rather than an owed feature.** Through L10 this page said a prompt was
 refused because the `Embeddings1DConnector` weights, which ship inside the DiT

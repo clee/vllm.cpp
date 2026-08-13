@@ -25,7 +25,7 @@ here before any implementation, because acting on an unverified premise is the f
 mode this campaign has been punished for repeatedly:
 
 **(a) Upstream's own default tiling is a NO-OP at 448x256/25f.** Executed, not read:
-`_scratch/probe_tiling.py` runs `TileSizeConfig.from_long_side(long_side=768/64,
+`scripts/probe_ltx2_tiling_layout.py` runs `TileSizeConfig.from_long_side(long_side=768/64,
 frames=80/24)` — the exact auto layout `ltx_pipelines/utils/helpers.py:62-63,80-88`
 builds for a Conv VAE — through `TileSizeConfig.to_splitters` (`tiling.py:797-834`) and
 `ConvVideoDecoder._prepare_tiles` (`conv_video_decoder.py:359-381`) at the pinned SHA:
@@ -180,32 +180,71 @@ pinned upstream exactly as the existing `gen-ltx2-*-goldens.py` scripts do, asse
    tensor, and the callback is invoked once per temporal group with the frame counts
    `group_tiles_by_temporal_slice` predicts.
 
-### 4.1 The equivalence bound
+### 4.1 The equivalence bound — MEASURED, and it does not exist
 
-Tiled and untiled decode are **not** bit-identical, and a round number would be a
-fabricated bound. The difference is exactly: each output sample is `sum_i m_i * y_i`
-where `sum_i m_i == 1` and every `y_i` comes from a decode of a *different* latent crop.
-Inside a tile's interior the crop's receptive field is complete and `y_i` is the untiled
-value up to f32 accumulation order; near a tile edge it is not, and the ramp is what
-attenuates it. So the bound is derived, per fixture, from a measured decomposition:
+This section originally planned to derive a bound on `max|tiled - untiled|`. That was
+written before the sweep. **The sweep refutes it**, and the correction is recorded here
+rather than quietly replaced.
 
-* run untiled, run tiled, record `max|diff|`;
-* re-run tiled with every mask forced to a one-hot (no blending, hard cut at the tile
-  centre) and record `max|diff|` again — the *seam* magnitude;
-* the accepted band is set from the blended number with the same headroom the existing
-  VAE goldens use, and the test asserts the hard-cut number is **larger by at least an
-  order of magnitude**, so the band cannot be satisfied by a broken blend.
+`scripts/probe_ltx2_tiled_vs_untiled.py` and `scripts/probe_ltx2_tiled_vs_untiled_shipped_ladder.py` run upstream's own
+`ConvVideoDecoder` at reduced dimensions across tile sizes, latent extents, both
+causality polarities, and both with and without a `res_x_y` block:
 
-The measured numbers and the resulting band go in `## Outcome`, not here.
+| arm | latent | tile (f/ovl, s/ovl) | chunks | max&#124;tiled − untiled&#124; | ÷ output range |
+|---|---|---|---|---|---|
+| causal | 5,4,4 | **no split** | 1 | **0** | **0** |
+| causal | 5,4,4 | 12/4, 16/8 | 2 | 1.54113 | 1.16 |
+| causal | 9,12,12 | 16/4, 24/8 | 3 | 1.72940 | 0.98 |
+| causal | 9,12,12 | 24/8, 48/16 | 2 | 1.41765 | 0.80 |
+| non-causal | 9,12,12 | 24/8, 48/16 | 2 | 1.18317 | 0.68 |
+
+The gap is the size of the signal and does **not** converge as the tile grows, on either
+polarity, with or without the global `res_x_y` norm. The reason is structural: the
+decoder's receptive field measured in LATENT units is wider than the overlap the layout
+uses — the shipped AUTO layout blends a 768 px tile with a **64 px** overlap on a 32x
+grid, which is TWO latent cells. Upstream accepts that seam and blends it. There is no
+bound to state and inventing one would be fabricating a gate.
+
+So the gate set is:
+
+* **A.** our tiled output == **upstream's tiled** output, to the same `5e-6` band every
+  other LTX-2.5 golden uses. This is the correctness gate.
+* **B.** our untiled output == upstream's untiled output, same band — otherwise A proves
+  nothing about the tiling.
+* **B'. The ONE-TILE CONTROL, whose bound is ZERO and is measured.** A tiling config
+  whose splits all short-circuit produces one tile, and `tiled_decode` then reproduces
+  `forward` bit for bit: upstream's own value is exactly `0` on every arm swept, emitted
+  as a golden rather than assumed, and the port is held to `== 0.0`. This is the property
+  that makes routing the pipeline through the streaming entry point safe at every size
+  where the AUTO layout does not tile — which today is every resolution this project has
+  run.
+* **C.** the tiled-vs-untiled gap is **upstream's own number**, held to the golden band,
+  so a port that blends differently moves A and C together.
+
+The blend mutation is what proves A and C bind; its numbers are in `## Outcome`.
 
 ## 5. The memory attribution — measured
 
-Recorded in `## Outcome` after the run. The measurement is `_scratch/decode_mem_probe`,
-which loads the real shipped conv VAE (`ltx-2.5-video-vae-conv-bf16.safetensors`, 1.45 GB
-bf16) through `Ltx2LoadVaeWeights` + `Ltx2ParseConvVideoDecoderConfig` and calls
-`Ltx2ConvVideoDecode` at the exact 448x256/25f latent, while a 50 ms sampler thread reads
-`/proc/self/status` `VmRSS`/`VmHWM` and `/proc/meminfo` `MemAvailable`. It touches no
-product code, so it cannot perturb what it measures.
+`scripts/probe_ltx2_decode_memory.cpp` loads the real shipped conv VAE
+(`ltx-2.5-video-vae-conv-bf16.safetensors`, 1.45 GB bf16) through `Ltx2LoadVaeWeights` +
+`Ltx2ParseConvVideoDecoderConfig` and calls `Ltx2ConvVideoDecode` at the exact
+448x256/25f latent. It measures two different things on purpose:
+
+* a 50 ms sampler thread reading `/proc/self/status` `VmRSS`/`VmHWM` and `/proc/meminfo`
+  `MemAvailable` — the SYSTEM pressure, which is what the failing report sampled;
+* a replacement of the global `operator new`/`delete` in the final link, so every
+  `std::vector` inside `libvllm.a` routes through an exact live/peak byte counter — the
+  DECODER's own allocations, which RSS overstates because glibc retains freed arenas.
+
+It touches no product code, so it cannot perturb what it measures.
+
+**Validation of the analytic model first**, because the full-size run takes ~30 CPU
+minutes: at a 64x64/9f latent the model predicts the largest single allocation is the
+`CausalConv3d` pad buffer of the last `res_x` block, `128 x 11 x 18 x 18` f32 =
+**1.74 MiB**. Measured: `HEAP largest single alloc = 1.74 MiB`, `HEAP peak live =
+5.13 MiB`, decode-attributed RSS 6.13 MiB. The model is exact, so its 448x256/25f
+prediction (peak on the order of 350 MB, largest single allocation 99.3 MiB) is
+trustworthy — and the full-size run confirms it in `## Outcome`.
 
 ## 6. Gates
 
@@ -228,9 +267,109 @@ product code, so it cannot perturb what it measures.
 
 ## Now
 
-`ACTIVE`.
+`DONE` — the mechanism is ported, gated against executed upstream, and routed through the
+pipeline. Two axes stay open and are named in `## Outcome`: the 60 GiB is **not**
+attributed (it is not in the decode), and the reference decoder's ~30 CPU-minute
+448x256/25f decode is a separate, newly measured problem.
 
 ## Outcome
 
-To be filled on completion: the measured memory attribution, the derived equivalence
-bound, the mutation RED/GREEN, and the largest resolution that completes.
+### What was measured, and what it refutes
+
+**1. Upstream's own AUTO tiling is a NO-OP at 448x256/25f.** Executed at the pin, emitted
+as a golden (`kLtx2AutoCases`) and asserted in `test_ltx2_tiling`:
+
+| request | latent (T,H,W) | resolved cfg | t/h/w intervals | chunks |
+|---|---|---|---|---|
+| 128x128/9f | 2,4,4 | h 768/64, w 768/64, f 80/24 | 1 / 1 / 1 | 1 |
+| 320x192/25f | 4,6,10 | h 448/64, w 768/64, f 80/24 | 1 / 1 / 1 | 1 |
+| **448x256/25f** | **4,8,14** | h 448/64, w 768/64, f 80/24 | **1 / 1 / 1** | **1** |
+| 896x512/25f | 4,16,28 | h 448/64, w 768/64, f 80/24 | 1 / 2 / 2 | 1 |
+| 1280x704/121f | 16,22,40 | h 416/64, w 768/64, f 80/24 | 2 / 2 / 2 | 3 |
+| 1920x1088/241f | 31,34,60 | h 448/64, w 768/64, f 80/24 | 4 / 3 / 3 | 5 |
+
+Tiling first binds at **896x512** spatially and **121 frames** temporally. The
+dispatching premise — "we call the untiled path where upstream tiles" — is false at the
+size that failed.
+
+**2. The decode's own memory is 170x too small to be the 60 GiB.** Real shipped conv VAE,
+real 448x256/25f latent decoded to completion (`[3, 25, 256, 448]`), exact `operator new`
+accounting plus RSS sampling:
+
+| | 64x64/9f (model validation) | **448x256/25f** |
+|---|---|---|
+| largest single allocation | 1.74 MiB (predicted 1.74) | **99.20 MiB** (predicted 99.3) |
+| heap peak live, exact | 5.13 MiB | **361.72 MiB** |
+| decode-attributed RSS | 6.13 MiB | **362.23 MiB** |
+| process `VmHWM` | 2339 MiB | 2695 MiB (weights alone are 2335) |
+| decode wall | 25.27 s | 2681.02 s |
+
+The analytic ladder model predicted the largest allocation to three significant figures at
+both scales, so the attribution is not an artefact of one run. **`361.72 MiB` against a
+reported `60 GiB` is a factor of 170.** Flat process RSS at 4.9 GB while `MemAvailable`
+fell 60 GiB is itself self-consistent with the decode NOT being the consumer: whatever
+took that memory was not this process's anonymous heap.
+
+**The 60 GiB is NOT attributed by this row and the axis stays open.** The next traceable
+hypotheses, in order: which PID the RSS sampler actually read and at what interval; any
+other process on that box during the window; and — if it was the same process — a CUDA or
+`mmap` allocation, neither of which lands in `VmRSS` the way a `std::vector` does. None of
+that is recoverable from the report as written, and this row will not guess at it.
+
+*(The probe's own `MemAvailable` delta of 11.1 GiB is NOT the decode: a full 405-target
+build and a 416-test `ctest -j 6` ran on the same box during the window. That is exactly
+the confound the exact heap counter exists to remove, and it is why `361.72 MiB` is the
+number quoted and `11.1 GiB` is not.)*
+
+**3. A NEW problem, found while measuring.** `Ltx2ConvVideoDecode` at 448x256/25f took
+**2681 s — 44.7 minutes** of single-threaded double-precision convolution, about 3.5 TMAC
+at the 1.9 GMAC/s the 64x64/9f run measured. The reference decoder is not a shipping
+decode path and phase L6 already owes the production-dtype arm; this quantifies how far
+away it is. It is a separate row, not this one — but it also means the reported "24
+seconds" of memory fall cannot have been a completed decode.
+
+**4. Tiled decode is NOT an approximation of untiled decode** — §4.1, swept. The
+one-tile control IS exact, on both causality arms, ours and upstream's: `max|diff| == 0`.
+
+### The gate
+
+Build: `BUILD_EXIT=0` clean, `No space left`/`BFD assertion` count 0, `df -h /` 91%.
+`ctest -N` denominator **416**.
+
+Focused, with COUNTS (a changed count is RED even when green):
+
+| suite | cases | assertions |
+|---|---|---|
+| `test_ltx2_tiling` (new) | 9 / 9 | 830 / 830 |
+| `test_ltx2_vae` | 36 / 36 | 3039 / 3039 |
+| `test_ltx2_video` | 30 / 30 | 502 / 502 |
+
+### The blend mutation — RED, then restored
+
+`Ltx2TrapezoidalMask1d`'s linear ramp replaced by a hard cut at the ramp midpoint, in a
+scratch copy of `ltx2_tiling.cpp`:
+
+* **RED**: 9 cases -> 3 passed / **6 failed**; 830 assertions -> **39 failed**. The case
+  and assertion COUNTS were unchanged, which is the point — only the verdicts moved.
+* the tiled output moved from `<= 5e-6` to **max|diff| vs upstream = 1.11411** (causal)
+  and **1.16359** (non-causal): five orders of magnitude past the band, and ~half the
+  output's own range.
+* complementarity also broke, and the mapper masks with it — the mutation is caught in
+  four independent places, not one.
+* restored and verified byte-for-byte: `md5 e734ee2e3503e10ea111305a33574293` before and
+  after, `git diff` empty, rebuild GREEN 9/9, 830/830.
+
+### What is owed
+
+* **The 60 GiB attribution.** Open, with the next hypothesis named above.
+* **The reference decoder's throughput.** Newly quantified (item 3); belongs with phase
+  L6's production-dtype arm.
+* **`memory_efficient_decode.py:1-43`** (workspace buffers, in-place chunked Conv3d,
+  free-before-conv). Deliberately not ported: it is a second, independent rewrite of
+  `CausalConv3d`, and the measurement says peak decode memory is ~362 MiB, so it is not
+  the binding lever here.
+* **One fixture header for the LTX-2.5 deterministic stream.** `test_ltx2_tiling.cpp`
+  duplicates ~120 lines of `test_ltx2_vae.cpp`'s PRNG and param-role helpers rather than
+  hoisting them, because two other rows are editing that file concurrently and a
+  relocation is the one merge shape this protocol has been bitten by. Owed once those
+  land.
