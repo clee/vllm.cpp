@@ -4,6 +4,7 @@
 // e24d1b24) as exercised by examples/server/main.cpp and the test harness.
 #include "vllm/entrypoints/model_loader.h"
 #include "vllm/model_executor/models/qwen3_dflash_gguf.h"
+#include "vllm/diagnostics/constructor_witness.h"
 
 #include <algorithm>
 #include <chrono>
@@ -43,6 +44,8 @@
 namespace vllm::entrypoints {
 
 namespace fs = std::filesystem;
+using diagnostics::ConstructorWitnessCall;
+using diagnostics::ConstructorWitnessPhase;
 
 // `architecture` is the model's registered architecture string. It is what lets
 // a PARTIAL backend decline a model whose kernels it has not registered, instead
@@ -948,7 +951,11 @@ int LoadedEngine::ResolveMaxModelLen(const EngineParams& params,
 LoadedEngine::LoadedEngine(HfConfig config, Qwen3_5MoeWeights weights,
                            tok::Tokenizer tokenizer, const EngineParams& params)
     : LoadedEngine(std::move(config),
-                   MakeQwen3_5MoeLoadedModel(std::move(weights)),
+                   ConstructorWitnessCall(
+                       "LoadedEngine", "MakeQwen3_5MoeLoadedModel",
+                       [&weights]() {
+                         return MakeQwen3_5MoeLoadedModel(std::move(weights));
+                       }),
                    std::move(tokenizer), params) {}
 
 LoadedEngine::LoadedEngine(HfConfig config, Qwen3_5DenseWeights weights,
@@ -963,59 +970,82 @@ LoadedEngine::LoadedEngine(HfConfig config,
                            const EngineParams& params,
                            vt::Queue* preselected_queue,
                            std::unique_ptr<DflashDraft> dflash_draft)
-    : hash_ready_(EnsureNoneHash()),
-      config_(std::move(config)),
+    : hash_ready_((ConstructorWitnessPhase{"LoadedEngine", "hash_ready_"},
+                   EnsureNoneHash())),
+      config_((ConstructorWitnessPhase{"LoadedEngine", "config_"},
+               std::move(config))),
       // SPEC-MTP I5d: finalize the speculative config against the checkpoint
       // (n_predict + resolved k). nullopt on the production default path.
-      resolved_spec_config_(ResolveSpecConfig(params, config_)),
+      resolved_spec_config_((ConstructorWitnessPhase{
+                                 "LoadedEngine", "resolved_spec_config_"},
+                             ResolveSpecConfig(params, config_))),
       // SPEC-DFLASH D5: the separately-loaded DFlash draft (null for mtp/non-spec).
-      dflash_draft_(std::move(dflash_draft)),
-      model_(std::move(model)),
-      tokenizer_(std::move(tokenizer)),
+      dflash_draft_((ConstructorWitnessPhase{"LoadedEngine", "dflash_draft_"},
+                     std::move(dflash_draft))),
+      model_((ConstructorWitnessPhase{"LoadedEngine", "model_"},
+              std::move(model))),
+      kv_connector_((ConstructorWitnessPhase{"LoadedEngine", "kv_connector_"},
+                     nullptr)),
+      tokenizer_((ConstructorWitnessPhase{"LoadedEngine", "tokenizer_"},
+                  std::move(tokenizer))),
       // ROAD-V1-MEM M1: resolve the block count from the sizing knobs
       // (num_blocks override > kv_cache_memory_bytes > util fallback) against the
       // model's own per-block byte geometry. FIRST, because max_model_len_ is
       // resolved against this pool.
-      kv_cfg_(MakeKVCacheResolved(
-          *model_, config_, params.block_size > 0 ? params.block_size : 32,
-          params, resolved_spec_config_)),
+      kv_cfg_((ConstructorWitnessPhase{"LoadedEngine", "kv_cfg_"},
+               MakeKVCacheResolved(
+                   *model_, config_,
+                   params.block_size > 0 ? params.block_size : 32, params,
+                   resolved_spec_config_))),
       // The serving length, checked (pinned) or auto-fitted (unpinned) against
       // kv_cfg_. See ResolveMaxModelLen.
-      max_model_len_(ResolveMaxModelLen(
-          params, config_, kv_cfg_,
-          params.block_size > 0 ? params.block_size : 32)),
-      max_num_batched_tokens_(ResolveMaxNumBatchedTokens(
-          params, max_model_len_, ModelRegistry::IsDenseModel(*model_))),
-      prefix_caching_enabled_(ResolveEnablePrefixCaching(
-          params, model_->registration().info)),
+      max_model_len_((ConstructorWitnessPhase{"LoadedEngine", "max_model_len_"},
+                      ResolveMaxModelLen(
+                          params, config_, kv_cfg_,
+                          params.block_size > 0 ? params.block_size : 32))),
+      max_num_batched_tokens_((ConstructorWitnessPhase{
+                                   "LoadedEngine", "max_num_batched_tokens_"},
+                               ResolveMaxNumBatchedTokens(
+                                   params, max_model_len_,
+                                   ModelRegistry::IsDenseModel(*model_)))),
+      prefix_caching_enabled_((ConstructorWitnessPhase{
+                                   "LoadedEngine", "prefix_caching_enabled_"},
+                               ResolveEnablePrefixCaching(
+                                   params, model_->registration().info))),
       // ENG-SGLANG-BEHAVIOR-FLAG SW3: resolve jump-forward once (config field +
       // VT_ENABLE_JUMP_FORWARD env override). Default nullopt+no-env => false =>
       // the byte-identical decode path (jump-forward is inert until enabled).
-      jump_forward_enabled_(
-          vllm::v1::JumpForwardEnabled(params.enable_jump_forward)),
+      jump_forward_enabled_((ConstructorWitnessPhase{
+                                 "LoadedEngine", "jump_forward_enabled_"},
+                             vllm::v1::JumpForwardEnabled(
+                                 params.enable_jump_forward))),
       // runner_ FIRST (W3): the async-scheduling flip reads
       // runner_.runner_supports_async(). SPEC-MTP I5d: when speculation is on,
       // pass the resolved config + the MTP draft (built from the retained mtp.*
       // weights, sharing the target embed/lm_head). The draft KV `fa_draft` group
       // is allocated by the runner from kv_cfg_ (empty vector here), so the loop
       // reaches it via runner-owned storage. nullopt/null on the default path.
-      runner_(config_, *model_, kv_cfg_,
-              preselected_queue != nullptr
-                  ? *preselected_queue
-                  : SelectQueueForModel(model_->registration().architecture,
-                                        params.device),
-              /*max_num_reqs=*/params.max_num_seqs > 0 ? params.max_num_seqs : 8,
-              max_model_len_,
-              /*max_num_batched_tokens=*/max_num_batched_tokens_,
-              resolved_spec_config_,
-              // Only the MTP method builds an in-target MTP draft; DFlash (D5)
-              // loads a SEPARATE draft, wired via set_dflash_draft in the body.
-              resolved_spec_config_.has_value() &&
-                      resolved_spec_config_->method == "mtp" &&
-                      model_->supports_mtp_draft()
-                  ? model_->BuildMtpDraft(config_)
-                  : nullptr,
-              /*draft_kv=*/{}),
+      runner_((ConstructorWitnessPhase{"LoadedEngine", "runner_"},
+               vllm::v1::GPUModelRunner(
+                   config_, *model_, kv_cfg_,
+                   preselected_queue != nullptr
+                       ? *preselected_queue
+                       : SelectQueueForModel(
+                             model_->registration().architecture, params.device),
+                   /*max_num_reqs=*/params.max_num_seqs > 0
+                       ? params.max_num_seqs
+                       : 8,
+                   max_model_len_,
+                   /*max_num_batched_tokens=*/max_num_batched_tokens_,
+                   resolved_spec_config_,
+                   // Only the MTP method builds an in-target MTP draft; DFlash
+                   // (D5) loads a SEPARATE draft, wired in the body.
+                   resolved_spec_config_.has_value() &&
+                           resolved_spec_config_->method == "mtp" &&
+                           model_->supports_mtp_draft()
+                       ? model_->BuildMtpDraft(config_)
+                       : nullptr,
+                   /*draft_kv=*/{}))),
       // Resolve the enable-flip from the now-constructed runner + VT_ASYNC_SCHED,
       // then size the batch-queue depth (2 under async scheduling → depth-2
       // step_with_batch_queue; 1 otherwise). Since the 2026-07-17 flip the default
@@ -1025,55 +1055,84 @@ LoadedEngine::LoadedEngine(HfConfig config,
       // post_step path, which is the SYNCHRONOUS scheduler's contract; the
       // async-scheduling draft-in-output variant is deferred (spec §2.5), so a
       // configured speculator forces sync scheduling here.
-      async_scheduling_enabled_(!resolved_spec_config_.has_value() &&
-          ResolveAsyncEnabled(
-          MakeSchedulerConfig(
-              max_model_len_,
-              params.max_num_seqs > 0 ? params.max_num_seqs : 8,
-              max_num_batched_tokens_, params.policy),
-          runner_.runner_supports_async(),
-          model_->registration().info.is_pooling_model)),
-      max_concurrent_batches_(MakeSchedulerConfig(
-                                  max_model_len_,
-                                  params.max_num_seqs > 0 ? params.max_num_seqs
-                                                          : 8,
-                                  max_num_batched_tokens_, params.policy)
-                                  .MaxConcurrentBatches(async_scheduling_enabled_)),
+      async_scheduling_enabled_((ConstructorWitnessPhase{
+                                     "LoadedEngine",
+                                     "async_scheduling_enabled_"},
+                                 !resolved_spec_config_.has_value() &&
+                                     ResolveAsyncEnabled(
+                                         MakeSchedulerConfig(
+                                             max_model_len_,
+                                             params.max_num_seqs > 0
+                                                 ? params.max_num_seqs
+                                                 : 8,
+                                             max_num_batched_tokens_,
+                                             params.policy),
+                                         runner_.runner_supports_async(),
+                                         model_->registration()
+                                             .info.is_pooling_model))),
+      max_concurrent_batches_((ConstructorWitnessPhase{
+                                   "LoadedEngine", "max_concurrent_batches_"},
+                               MakeSchedulerConfig(
+                                   max_model_len_,
+                                   params.max_num_seqs > 0 ? params.max_num_seqs
+                                                           : 8,
+                                   max_num_batched_tokens_, params.policy)
+                                   .MaxConcurrentBatches(
+                                       async_scheduling_enabled_))),
       // The engine-wide structured-output manager, native backend over the
       // tokenizer (upstream EngineCore constructs one unconditionally,
       // core.py:134). Wired into the scheduler + engine cores below so
       // response_format / C-ABI structured constraints gate decoding.
-      structured_output_manager_(
-          params.max_num_seqs > 0 ? params.max_num_seqs : 8,
-          vllm::v1::MakeNativeBackendFactory(
-              tokenizer_, static_cast<int>(config_.vocab_size))),
+      structured_output_manager_((ConstructorWitnessPhase{
+                                      "LoadedEngine",
+                                      "structured_output_manager_"},
+                                  vllm::v1::StructuredOutputManager(
+                                      params.max_num_seqs > 0
+                                          ? params.max_num_seqs
+                                          : 8,
+                                      vllm::v1::MakeNativeBackendFactory(
+                                          tokenizer_, static_cast<int>(
+                                                          config_.vocab_size))))),
       // AsyncScheduler when the flip resolved ON, else the synchronous Scheduler.
-      scheduler_(MakeScheduler(
-          async_scheduling_enabled_,
-          MakeSchedulerConfig(
-              max_model_len_, params.max_num_seqs > 0 ? params.max_num_seqs : 8,
-              max_num_batched_tokens_, params.policy),
-          kv_cfg_, params.block_size > 0 ? params.block_size : 32,
-          /*enable_caching=*/prefix_caching_enabled_,
-          &structured_output_manager_, resolved_spec_config_)),
-      executor_(runner_),
+      scheduler_((ConstructorWitnessPhase{"LoadedEngine", "scheduler_"},
+                  MakeScheduler(
+                      async_scheduling_enabled_,
+                      MakeSchedulerConfig(
+                          max_model_len_,
+                          params.max_num_seqs > 0 ? params.max_num_seqs : 8,
+                          max_num_batched_tokens_, params.policy),
+                      kv_cfg_, params.block_size > 0 ? params.block_size : 32,
+                      /*enable_caching=*/prefix_caching_enabled_,
+                      &structured_output_manager_, resolved_spec_config_))),
+      executor_((ConstructorWitnessPhase{"LoadedEngine", "executor_"},
+                 vllm::v1::Executor(runner_))),
       // SPEC-MTP I5d: with a speculator configured, EngineCore pulls the runner's
       // out-of-band drafts each step (take_draft_token_ids -> update_draft_token_ids)
       // so the next verify step schedules them. Default false (no-op post_step).
-      engine_core_(*scheduler_, executor_, &structured_output_manager_,
-                   /*check_for_draft_tokens=*/resolved_spec_config_.has_value()),
+      engine_core_((ConstructorWitnessPhase{"LoadedEngine", "engine_core_"},
+                    vllm::v1::EngineCore(
+                        *scheduler_, executor_, &structured_output_manager_,
+                        /*check_for_draft_tokens=*/
+                            resolved_spec_config_.has_value()))),
       // The admission-time prompt-length check validates against the RESOLVED
       // serving length, which is what upstream's model_config.max_model_len is
       // (input_processor.py:399-401). Passing config_ alone would check against
       // the raw checkpoint context and let through prompts the pool cannot hold.
-      input_processor_(tokenizer_, config_, max_model_len_),
-      output_processor_(&tokenizer_),
-      block_hasher_(prefix_caching_enabled_
-                        ? vllm::v1::get_request_block_hasher(
-                              params.block_size > 0 ? params.block_size : 32,
-                              vllm::v1::sha256_cbor)
-                        : nullptr),
-      engine_(input_processor_, engine_core_, output_processor_, block_hasher_) {
+      input_processor_((ConstructorWitnessPhase{"LoadedEngine", "input_processor_"},
+                        vllm::v1::InputProcessor(tokenizer_, config_,
+                                                 max_model_len_))),
+      output_processor_((ConstructorWitnessPhase{
+                             "LoadedEngine", "output_processor_"},
+                         vllm::v1::OutputProcessor(&tokenizer_))),
+      block_hasher_((ConstructorWitnessPhase{"LoadedEngine", "block_hasher_"},
+                     prefix_caching_enabled_
+                         ? vllm::v1::get_request_block_hasher(
+                               params.block_size > 0 ? params.block_size : 32,
+                               vllm::v1::sha256_cbor)
+                         : nullptr)),
+      engine_((ConstructorWitnessPhase{"LoadedEngine", "engine_"},
+               vllm::v1::LLMEngine(input_processor_, engine_core_,
+                                    output_processor_, block_hasher_))) {
   (void)hash_ready_;
   // issue #371: REFUSE an unservable recurrent-state budget instead of
   // allocating it. Speculation widens the Mamba/GDN state to k+1 snapshot slots

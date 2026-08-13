@@ -694,6 +694,12 @@ imports before running the staged executable's `--help`, forced-tier, or HTTP
 shutdown smokes. The Win32 console-control regression uses bounded waits so a
 teardown failure reports an error instead of hanging the gate.
 
+While issue #537 is being attributed, the Windows release helper also runs an
+internal constructor witness only in the fresh-process isolated OpenAI case
+found by its prefix probe. The helper restores the process environment before
+continuing; the ordinary prefix probes, complete OpenAI suite, staged server,
+and production invocations do not enable or inherit that diagnostic.
+
 The CUDA graph-replay profiler and its FIFO diagnostic controls remain
 POSIX-only and are not exposed by native Windows server builds. Native Windows
 process launch, environment updates, process IDs, and console shutdown stay on

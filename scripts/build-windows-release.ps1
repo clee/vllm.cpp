@@ -340,8 +340,16 @@ function Invoke-OpenAiPrefixBisect {
     if ($badPrefixResult.ExitCode -ne $expectedFastFailStatus) {
         throw "OpenAI confirmed bad prefix exited with status $($badPrefixResult.ExitCode) instead of $expectedFastFailStatus"
     }
-    $isolatedResult = Invoke-OpenAiPrefixRange -Program $TestProgram `
-        -First $firstBad -Last $firstBad -Runner $Runner
+    $diagnosticEnvironmentName = "VLLM_WINDOWS_CTOR_DIAGNOSTIC"
+    $priorDiagnosticEnvironment = [Environment]::GetEnvironmentVariable(
+        $diagnosticEnvironmentName, "Process")
+    try {
+        [Environment]::SetEnvironmentVariable($diagnosticEnvironmentName, "1", "Process")
+        $isolatedResult = Invoke-OpenAiPrefixRange -Program $TestProgram `
+            -First $firstBad -Last $firstBad -Runner $Runner
+    } finally {
+        [Environment]::SetEnvironmentVariable($diagnosticEnvironmentName, $priorDiagnosticEnvironment, "Process")
+    }
     Write-Host "OpenAI isolated output: begin case=$firstBad"
     foreach ($isolatedOutputLine in @($isolatedResult.Output)) {
         Write-Host ([string]$isolatedOutputLine)
@@ -397,6 +405,8 @@ function Invoke-OpenAiPrefixBisectContractTests {
         $calls.Add([pscustomobject]@{
             Program = $Program
             Arguments = @($Arguments)
+            DiagnosticEnvironment = [Environment]::GetEnvironmentVariable(
+                "VLLM_WINDOWS_CTOR_DIAGNOSTIC", "Process")
         }) | Out-Null
         if ($Arguments -contains "--list-test-cases") {
             $orderArguments = @($Arguments | Where-Object { $_ -like "--order-by=*" })
@@ -431,10 +441,41 @@ function Invoke-OpenAiPrefixBisectContractTests {
         return [pscustomobject]@{ ExitCode = $exitCode; Output = @($output) }
     }.GetNewClosure()
 
-    $captured = @(& {
-        Invoke-OpenAiPrefixBisect -TestProgram "fake-openai-test.exe" `
-            -Runner $runner
-    } 6>&1)
+    $contractDiagnosticEnvironment = [Environment]::GetEnvironmentVariable(
+        "VLLM_WINDOWS_CTOR_DIAGNOSTIC", "Process")
+    try {
+        [Environment]::SetEnvironmentVariable(
+            "VLLM_WINDOWS_CTOR_DIAGNOSTIC", "fixture-prior", "Process")
+        $captured = @(& {
+            Invoke-OpenAiPrefixBisect -TestProgram "fake-openai-test.exe" `
+                -Runner $runner
+        } 6>&1)
+        if ([Environment]::GetEnvironmentVariable(
+                "VLLM_WINDOWS_CTOR_DIAGNOSTIC", "Process") -cne
+            "fixture-prior") {
+            throw "OpenAI constructor diagnostic environment was not restored"
+        }
+    } finally {
+        [Environment]::SetEnvironmentVariable(
+            "VLLM_WINDOWS_CTOR_DIAGNOSTIC", $contractDiagnosticEnvironment,
+            "Process")
+    }
+    Write-Host "OpenAI constructor diagnostic restoration contract OK"
+    $diagnosticCalls = @($calls | Where-Object {
+        $_.DiagnosticEnvironment -ceq "1"
+    })
+    if ($diagnosticCalls.Count -ne 1 -or
+        $diagnosticCalls[0].Arguments -notcontains "--first=27" -or
+        $diagnosticCalls[0].Arguments -notcontains "--last=27") {
+        throw "OpenAI constructor diagnostic was not limited to the isolated case"
+    }
+    $ordinaryDiagnosticCalls = @($calls | Where-Object {
+        $_.DiagnosticEnvironment -ne "1"
+    })
+    if ($ordinaryDiagnosticCalls.Count -ne ($calls.Count - 1)) {
+        throw "OpenAI constructor diagnostic leaked into an ordinary probe"
+    }
+    Write-Host "OpenAI constructor diagnostic activation contract OK"
     $results = @($captured | Where-Object {
         $null -ne $_.PSObject.Properties["FirstBad"]
     })

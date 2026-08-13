@@ -12,6 +12,7 @@
 // (tiny hybrid-MoE Qwen3.6 + the BPE fixture, vocab ids 0..21).
 #include "vllm/entrypoints/openai/api_server.h"
 #include "vllm/entrypoints/openai/video_api.h"
+#include "vllm/diagnostics/constructor_witness.h"
 #include "vllm/multimodal/parakeet_transcription.h"
 #include "scoped_server_thread.h"
 
@@ -34,6 +35,11 @@
 #if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#endif
+
+#if defined(_MSC_VER)
+#include <crtdbg.h>
+#include <stdlib.h>
 #endif
 
 #include <httplib/httplib.h>
@@ -114,6 +120,74 @@ using vt::DType;
 using vllm::test::ScopedServerThread;
 
 namespace {
+
+#if defined(_MSC_VER)
+_invalid_parameter_handler prior_invalid_parameter_handler = nullptr;
+_purecall_handler prior_purecall_handler = nullptr;
+
+[[noreturn]] void WindowsCrtInvalidParameterWitness(
+    const wchar_t* expression, const wchar_t* function, const wchar_t* file,
+    unsigned int line, uintptr_t reserved) {
+  std::fprintf(stderr,
+               "WINDOWS_CRT_INVALID_PARAMETER: expression=%ls function=%ls "
+               "file=%ls line=%u\n",
+               expression != nullptr ? expression : L"(null)",
+               function != nullptr ? function : L"(null)",
+               file != nullptr ? file : L"(null)", line);
+  std::fflush(stderr);
+  if (prior_invalid_parameter_handler != nullptr) {
+    prior_invalid_parameter_handler(expression, function, file, line, reserved);
+  }
+  _invoke_watson(expression, function, file, line, reserved);
+}
+
+[[noreturn]] void WindowsCrtPurecallWitness() {
+  std::fputs("WINDOWS_CRT_PURECALL\n", stderr);
+  std::fflush(stderr);
+  if (prior_purecall_handler != nullptr) {
+    prior_purecall_handler();
+  }
+  _invoke_watson(L"pure virtual function call", L"_purecall", L"(runtime)",
+                 0, 0);
+}
+#endif
+
+class ScopedWindowsCrtConstructorWitness final {
+ public:
+  ScopedWindowsCrtConstructorWitness() noexcept {
+#if defined(_MSC_VER)
+    if (!vllm::diagnostics::ConstructorWitnessEnabled()) return;
+    prior_invalid_parameter_handler_ =
+        _set_invalid_parameter_handler(WindowsCrtInvalidParameterWitness);
+    prior_invalid_parameter_handler = prior_invalid_parameter_handler_;
+    prior_purecall_handler_ = _set_purecall_handler(WindowsCrtPurecallWitness);
+    prior_purecall_handler = prior_purecall_handler_;
+    installed_ = true;
+#endif
+  }
+
+  ScopedWindowsCrtConstructorWitness(
+      const ScopedWindowsCrtConstructorWitness&) = delete;
+  ScopedWindowsCrtConstructorWitness& operator=(
+      const ScopedWindowsCrtConstructorWitness&) = delete;
+
+  ~ScopedWindowsCrtConstructorWitness() noexcept {
+#if defined(_MSC_VER)
+    if (!installed_) return;
+    _set_purecall_handler(prior_purecall_handler_);
+    _set_invalid_parameter_handler(prior_invalid_parameter_handler_);
+    prior_purecall_handler = nullptr;
+    prior_invalid_parameter_handler = nullptr;
+#endif
+  }
+
+ private:
+#if defined(_MSC_VER)
+  _invalid_parameter_handler prior_invalid_parameter_handler_ = nullptr;
+  _purecall_handler prior_purecall_handler_ = nullptr;
+  bool installed_ = false;
+#endif
+};
 
 void OpenAiExplicitCpuPhaseWitness(const char* phase) noexcept {
   std::fprintf(stderr, "OPENAI_EXPLICIT_CPU_PHASE: %s\n", phase);
@@ -2398,6 +2472,7 @@ TEST_CASE("api_server: the audio routes do not exist on a TEXT server") {
 // accelerator; explicit cuda never falls back) is test_loaded_engine_dense.cpp;
 // the C-ABI plumb is test_capi.cpp.
 TEST_CASE("api_server: an explicit-cpu device-selected engine serves /v1/completions") {
+  ScopedWindowsCrtConstructorWitness crt_witness;
   const HfConfig c = MakeConfig();
   vllm::entrypoints::EngineParams params;
   params.block_size = kBlockSize;

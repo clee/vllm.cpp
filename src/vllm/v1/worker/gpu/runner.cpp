@@ -5,6 +5,7 @@
 // See include/vllm/v1/worker/gpu/runner.h for scope, the V1-algorithm / MRV2-
 // contract composition, the four-way ordering contract, and the deferred paths.
 #include "vllm/v1/worker/gpu/runner.h"
+#include "vllm/diagnostics/constructor_witness.h"
 
 #include <algorithm>
 #include <chrono>
@@ -39,6 +40,10 @@
 #endif
 
 namespace vllm::v1 {
+
+using diagnostics::ConstructorWitnessAfter;
+using diagnostics::ConstructorWitnessBefore;
+using diagnostics::ConstructorWitnessPhase;
 
 // Logits-gather A/B toggle (perf). Default ON: the forward gathers the
 // per-request last-token hidden rows BEFORE lm_head (prefill/mixed), so lm_head
@@ -317,18 +322,29 @@ GPUModelRunner::GPUModelRunner(
     std::optional<vllm::SpeculativeConfig> spec_config,
     std::unique_ptr<vllm::Qwen3_5MTPModel> draft_model,
     std::vector<PagedKvCache> draft_kv)
-    : config_(config),
-      model_(&model),
-      spec_config_(std::move(spec_config)),
-      draft_model_(std::move(draft_model)),
-      draft_attn_kv_(std::move(draft_kv)),
-      queue_(queue),
-      input_batch_(max_num_reqs, max_model_len, max_num_batched_tokens,
-                   static_cast<int>(config.vocab_size),
-                   group_block_sizes(kv_cache_config),
-                   group_block_sizes(kv_cache_config)) {
+    : config_((ConstructorWitnessPhase{"GPUModelRunner", "config_"}, config)),
+      owned_model_((ConstructorWitnessPhase{"GPUModelRunner", "owned_model_"},
+                    nullptr)),
+      model_((ConstructorWitnessPhase{"GPUModelRunner", "model_"}, &model)),
+      spec_config_((ConstructorWitnessPhase{"GPUModelRunner", "spec_config_"},
+                    std::move(spec_config))),
+      draft_model_((ConstructorWitnessPhase{"GPUModelRunner", "draft_model_"},
+                    std::move(draft_model))),
+      draft_attn_kv_((ConstructorWitnessPhase{"GPUModelRunner", "draft_attn_kv_"},
+                      std::move(draft_kv))),
+      queue_((ConstructorWitnessPhase{"GPUModelRunner", "queue_"}, queue)),
+      input_batch_((ConstructorWitnessPhase{"GPUModelRunner", "input_batch_"},
+                    InputBatch(max_num_reqs, max_model_len,
+                               max_num_batched_tokens,
+                               static_cast<int>(config.vocab_size),
+                               group_block_sizes(kv_cache_config),
+                               group_block_sizes(kv_cache_config)))) {
+  ConstructorWitnessBefore("GPUModelRunner", "assign-max-num-reqs");
   max_num_reqs_ = max_num_reqs;
+  ConstructorWitnessAfter("GPUModelRunner", "assign-max-num-reqs");
+  ConstructorWitnessBefore("GPUModelRunner", "assign-max-num-batched-tokens");
   max_num_batched_tokens_ = max_num_batched_tokens;
+  ConstructorWitnessAfter("GPUModelRunner", "assign-max-num-batched-tokens");
   // SPEC-MTP I5e: the async input-combine splices the device-resident
   // last_sampled token over each decode row's input id with
   // num_new_sampled_tokens==1; it is NOT spec-aware and would overwrite the
@@ -337,17 +353,25 @@ GPUModelRunner::GPUModelRunner(
   // spliced into token_ids_cpu by update_req_spec_token_ids + prepare_inputs,
   // so force the sync host input path here. Byte-identical for non-spec
   // (spec_config_ is nullopt there, so this is AsyncRunnerEnvDefault()).
+  ConstructorWitnessBefore("GPUModelRunner", "resolve-async-input-combine");
   async_input_combine_ = AsyncRunnerEnvDefault() && !spec_config_.has_value() &&
                          QueueSupportsAsyncInputCombine(queue_);
+  ConstructorWitnessAfter("GPUModelRunner", "resolve-async-input-combine");
   // ARCH-ONE-SURFACE ROW 6 (mirror gpu/model_runner.py:368-369): a POOLING
   // model's runner pools instead of sampling — build the PoolingRunner over
   // the model-owned Pooler. Null for every text arch (byte-identical).
+  ConstructorWitnessBefore("GPUModelRunner", "pooling-model-branch");
   if (model_->registration().info.is_pooling_model &&
       model_->pooler() != nullptr) {
     pooling_runner_ = std::make_unique<vllm::PoolingRunner>(*model_->pooler());
   }
+  ConstructorWitnessAfter("GPUModelRunner", "pooling-model-branch");
+  ConstructorWitnessBefore("GPUModelRunner", "initialize-kv-cache");
   initialize_kv_cache(kv_cache_config);
+  ConstructorWitnessAfter("GPUModelRunner", "initialize-kv-cache");
+  ConstructorWitnessBefore("GPUModelRunner", "model-registry-prepare");
   ModelRegistry::Prepare(*model_, config_, queue_);
+  ConstructorWitnessAfter("GPUModelRunner", "model-registry-prepare");
 }
 
 GPUModelRunner::GPUModelRunner(
@@ -437,6 +461,8 @@ GPUModelRunner::CacheBuffer::~CacheBuffer() {
 }
 
 void GPUModelRunner::initialize_kv_cache(const KVCacheConfig& kv_cache_config) {
+  ConstructorWitnessBefore("GPUModelRunner::initialize_kv_cache",
+                           "scalar-state-slot-setup");
   num_blocks_ = kv_cache_config.num_blocks;
   // GDN mamba-state slots = max concurrent sequences (one recurrent state per
   // sequence), decoupled from the attention num_blocks. Guard against a 0 (e.g.
@@ -457,6 +483,8 @@ void GPUModelRunner::initialize_kv_cache(const KVCacheConfig& kv_cache_config) {
   // spec_cols; without speculation spec_cols==1 and this is the pre-spec pool.
   for (int64_t b = base_slots - 1; b >= 0; --b)
     gdn_free_slots_.push_back(static_cast<int32_t>(b * spec_cols));
+  ConstructorWitnessAfter("GPUModelRunner::initialize_kv_cache",
+                          "scalar-state-slot-setup");
 
   // Resolve the full-attn + GDN(mamba) KV group ids (T0 gate models: exactly one
   // of each). The block-table group order == kv_cache_groups order.
@@ -472,6 +500,8 @@ void GPUModelRunner::initialize_kv_cache(const KVCacheConfig& kv_cache_config) {
   // byte-identical to the old behavior — the first and only group is chosen.
   for (int g = 0; g < static_cast<int>(kv_cache_config.kv_cache_groups.size());
        ++g) {
+    ConstructorWitnessBefore("GPUModelRunner::initialize_kv_cache",
+                             "kv-group-scan", g);
     const auto& group = kv_cache_config.kv_cache_groups[static_cast<size_t>(g)];
     const KVCacheSpecKind kind = group.kv_cache_spec->kind();
     // MLA campaign W7: an `MLAAttentionSpec` group IS the model's attention
@@ -489,6 +519,8 @@ void GPUModelRunner::initialize_kv_cache(const KVCacheConfig& kv_cache_config) {
     } else if (kind == KVCacheSpecKind::kMamba) {
       gdn_group_id_ = g;
     }
+    ConstructorWitnessAfter("GPUModelRunner::initialize_kv_cache",
+                            "kv-group-scan", g);
   }
 
   // Allocate one PagedKvCache per full-attn layer and one GdnStateCache per GDN
@@ -508,6 +540,8 @@ void GPUModelRunner::initialize_kv_cache(const KVCacheConfig& kv_cache_config) {
 
   const MambaSpec* mamba_spec = nullptr;
   if (gdn_group_id_ >= 0) {
+    ConstructorWitnessBefore("GPUModelRunner::initialize_kv_cache",
+                             "mamba-validation", gdn_group_id_);
     mamba_spec = dynamic_cast<const MambaSpec*>(
         kv_cache_config.kv_cache_groups[static_cast<size_t>(gdn_group_id_)]
             .kv_cache_spec.get());
@@ -534,6 +568,8 @@ void GPUModelRunner::initialize_kv_cache(const KVCacheConfig& kv_cache_config) {
     VT_CHECK(supported_state_dtype(gdn_conv_cache_dtype_) &&
                  supported_state_dtype(gdn_ssm_cache_dtype_),
              "runner: Qwen3.5 MambaSpec state dtypes must be floating");
+    ConstructorWitnessAfter("GPUModelRunner::initialize_kv_cache",
+                            "mamba-validation", gdn_group_id_);
   }
 
   // SPEC-DRIVEN attention-cache sizing and layout (MLA campaign W1).
@@ -564,6 +600,9 @@ void GPUModelRunner::initialize_kv_cache(const KVCacheConfig& kv_cache_config) {
   int64_t fa_page_bytes = 0;
   vt::DType kv_dtype = ResolveKvCacheDType();
   if (full_attn_group_id_ >= 0) {
+    ConstructorWitnessBefore("GPUModelRunner::initialize_kv_cache",
+                             "full-attention-geometry",
+                             full_attn_group_id_);
     const KVCacheSpec* fa_spec =
         kv_cache_config.kv_cache_groups[static_cast<size_t>(full_attn_group_id_)]
             .kv_cache_spec.get();
@@ -600,12 +639,17 @@ void GPUModelRunner::initialize_kv_cache(const KVCacheConfig& kv_cache_config) {
                    static_cast<long long>(fa_page_bytes),
                    static_cast<long long>(num_blocks_));
     }
+    ConstructorWitnessAfter("GPUModelRunner::initialize_kv_cache",
+                            "full-attention-geometry",
+                            full_attn_group_id_);
   }
   // Recorded for the gates: the exact per-block byte cost the allocator used,
   // sourced from the spec. `fa_page_size_bytes() > 0` is the runtime proof that
   // the spec-driven path RAN (a compiled-but-unexercised path leaves it 0).
   fa_page_size_bytes_ = fa_page_bytes;
 
+  ConstructorWitnessBefore("GPUModelRunner::initialize_kv_cache",
+                           "residency-buffer-setup");
   const vt::Device dev = queue_.device;
   const char* device_cache_env = std::getenv("VT_DEVICE_KV_CACHE");
   // W0b-1 / work row M3a: this read `is_cuda()`, which is the SAME defect the
@@ -656,6 +700,8 @@ void GPUModelRunner::initialize_kv_cache(const KVCacheConfig& kv_cache_config) {
     vt::DType dtype;
   };
   std::vector<FaDims> fa_dims;
+  ConstructorWitnessAfter("GPUModelRunner::initialize_kv_cache",
+                          "residency-buffer-setup");
   for (int64_t l = 0; l < config_.num_hidden_layers; ++l) {
     const bool is_gdn =
         has_mamba_group && !config_.layer_types.empty() &&
@@ -669,14 +715,22 @@ void GPUModelRunner::initialize_kv_cache(const KVCacheConfig& kv_cache_config) {
       const size_t conv_es = vt::SizeOf(gdn_conv_cache_dtype_);
       const int64_t conv_row_elems = conv_dim * conv_state_len;
       const int64_t ssm_row_elems = Hv * Dv * Dk;
+      ConstructorWitnessBefore("GPUModelRunner::initialize_kv_cache",
+                               "gdn-ssm-allocation", l);
       ssm_buf_.push_back(std::make_unique<CacheBuffer>(
           dev, queue_,
           static_cast<size_t>(gdn_state_slots_ * ssm_row_elems) * ssm_es,
           kv_cache_backend_resident_));
+      ConstructorWitnessAfter("GPUModelRunner::initialize_kv_cache",
+                              "gdn-ssm-allocation", l);
+      ConstructorWitnessBefore("GPUModelRunner::initialize_kv_cache",
+                               "gdn-conv-allocation", l);
       conv_buf_.push_back(std::make_unique<CacheBuffer>(
           dev, queue_,
           static_cast<size_t>(gdn_state_slots_ * conv_row_elems) * conv_es,
           kv_cache_backend_resident_));
+      ConstructorWitnessAfter("GPUModelRunner::initialize_kv_cache",
+                              "gdn-conv-allocation", l);
     } else {
       // Bytes come from the SPEC, not from HF-config arithmetic: exactly
       // `num_blocks * spec->page_size_bytes()`, mirroring upstream's
@@ -713,11 +767,15 @@ void GPUModelRunner::initialize_kv_cache(const KVCacheConfig& kv_cache_config) {
         VT_CHECK(l_page > 0,
                  "runner: per-layer attention spec reported a non-positive page");
       }
+      ConstructorWitnessBefore("GPUModelRunner::initialize_kv_cache",
+                               "full-attention-allocation", l);
       full_attn_buf_.push_back(std::make_unique<CacheBuffer>(
           dev, queue_,
           static_cast<size_t>(num_blocks_) * static_cast<size_t>(l_page),
           kv_cache_backend_resident_));
       fa_dims.push_back(FaDims{l_Hkv, l_Dh, l_dtype});
+      ConstructorWitnessAfter("GPUModelRunner::initialize_kv_cache",
+                              "full-attention-allocation", l);
     }
   }
 
@@ -727,6 +785,9 @@ void GPUModelRunner::initialize_kv_cache(const KVCacheConfig& kv_cache_config) {
            "runner: per-layer KV view geometry out of sync with buffers");
   attn_kv_.clear();
   for (size_t i = 0; i < full_attn_buf_.size(); ++i) {
+    ConstructorWitnessBefore("GPUModelRunner::initialize_kv_cache",
+                             "full-attention-view",
+                             static_cast<long long>(i));
     PagedKvCache kv;
     kv.data = full_attn_buf_[i]->data();
     kv.dtype = fa_dims[i].dtype;
@@ -735,6 +796,9 @@ void GPUModelRunner::initialize_kv_cache(const KVCacheConfig& kv_cache_config) {
     kv.num_kv_heads = fa_dims[i].num_kv_heads;
     kv.head_size = fa_dims[i].head_size;
     attn_kv_.push_back(kv);
+    ConstructorWitnessAfter("GPUModelRunner::initialize_kv_cache",
+                            "full-attention-view",
+                            static_cast<long long>(i));
   }
 
   // SPEC-MTP I5d: allocate the MTP draft's own paged KV layer (the `fa_draft`
@@ -753,6 +817,8 @@ void GPUModelRunner::initialize_kv_cache(const KVCacheConfig& kv_cache_config) {
       if (group.kv_cache_spec->kind() != KVCacheSpecKind::kFullAttention) {
         continue;  // the GDN group and any non-attn group are not the draft.
       }
+      ConstructorWitnessBefore("GPUModelRunner::initialize_kv_cache",
+                               "draft-attention-storage", g);
       draft_attn_buf_.push_back(std::make_unique<CacheBuffer>(
           dev, queue_,
           static_cast<size_t>(num_blocks_) * static_cast<size_t>(fa_page_bytes),
@@ -765,12 +831,16 @@ void GPUModelRunner::initialize_kv_cache(const KVCacheConfig& kv_cache_config) {
       dkv.num_kv_heads = Hkv;
       dkv.head_size = Dh;
       draft_attn_kv_.push_back(dkv);
+      ConstructorWitnessAfter("GPUModelRunner::initialize_kv_cache",
+                              "draft-attention-storage", g);
       break;  // exactly one fa_draft group at k=1.
     }
   }
 
   gdn_state_.clear();
   for (size_t g = 0; g < ssm_buf_.size(); ++g) {
+    ConstructorWitnessBefore("GPUModelRunner::initialize_kv_cache",
+                             "gdn-state-view", static_cast<long long>(g));
     GdnStateCache gs;
     gs.ssm_state = vt::Tensor::Contiguous(ssm_buf_[g]->data(),
                                           gdn_ssm_cache_dtype_,
@@ -781,6 +851,8 @@ void GPUModelRunner::initialize_kv_cache(const KVCacheConfig& kv_cache_config) {
                                            {gdn_state_slots_, conv_dim,
                                             conv_state_len});
     gdn_state_.push_back(gs);
+    ConstructorWitnessAfter("GPUModelRunner::initialize_kv_cache",
+                            "gdn-state-view", static_cast<long long>(g));
   }
 }
 

@@ -293,6 +293,171 @@ class WindowsMetadataContract(unittest.TestCase):
             with self.subTest(forwarded_line=forwarded_line):
                 self.assertIn(forwarded_line, contract)
 
+    def test_openai_constructor_diagnostic_is_isolated_ordered_and_nonrecovering(self) -> None:
+        script = (ROOT / "scripts/build-windows-release.ps1").read_text(
+            encoding="utf-8"
+        )
+        helper_start = script.find("function Invoke-OpenAiPrefixBisect {")
+        self.assertNotEqual(helper_start, -1, "adaptive prefix bisect is missing")
+        helper_end = script.index("\n}\n", helper_start) + len("\n}\n")
+        helper = script[helper_start:helper_end]
+        env_name = "VLLM_WINDOWS_CTOR_DIAGNOSTIC"
+        for statement in (
+            f'$diagnosticEnvironmentName = "{env_name}"',
+            "$priorDiagnosticEnvironment = [Environment]::GetEnvironmentVariable(",
+            '[Environment]::SetEnvironmentVariable($diagnosticEnvironmentName, "1", "Process")',
+            "try {",
+            "finally {",
+            "[Environment]::SetEnvironmentVariable($diagnosticEnvironmentName, $priorDiagnosticEnvironment, \"Process\")",
+        ):
+            with self.subTest(statement=statement):
+                self.assertEqual(helper.count(statement), 1)
+        isolated = helper.index("$isolatedResult = Invoke-OpenAiPrefixRange")
+        enable = helper.index(
+            '[Environment]::SetEnvironmentVariable($diagnosticEnvironmentName, "1", "Process")'
+        )
+        restore = helper.index(
+            '[Environment]::SetEnvironmentVariable($diagnosticEnvironmentName, $priorDiagnosticEnvironment, "Process")'
+        )
+        self.assertLess(enable, isolated)
+        self.assertLess(isolated, restore)
+
+        contract_start = script.index(
+            "function Invoke-OpenAiPrefixBisectContractTests {"
+        )
+        contract_end = script.index("\n}\n", contract_start) + len("\n}\n")
+        contract = script[contract_start:contract_end]
+        for guarantee in (
+            "DiagnosticEnvironment = [Environment]::GetEnvironmentVariable(",
+            'DiagnosticEnvironment -ceq "1"',
+            'DiagnosticEnvironment -ne "1"',
+            'Write-Host "OpenAI constructor diagnostic activation contract OK"',
+            'Write-Host "OpenAI constructor diagnostic restoration contract OK"',
+        ):
+            with self.subTest(guarantee=guarantee):
+                self.assertIn(guarantee, contract)
+
+        diagnostic = (
+            ROOT / "src/vllm/diagnostics/constructor_witness.h"
+        ).read_text(encoding="utf-8")
+        for guarantee in (
+            f'constexpr const char* kConstructorWitnessEnvironment = "{env_name}"',
+            '"VLLM_CTOR_DIAGNOSTIC: function=%s stage=%s phase=%s\\n"',
+            '"VLLM_CTOR_DIAGNOSTIC: function=%s stage=%s phase=%s index=%lld\\n"',
+            "std::fflush(stderr)",
+            "std::uncaught_exceptions() == uncaught_exceptions_",
+        ):
+            with self.subTest(guarantee=guarantee):
+                self.assertIn(guarantee, diagnostic)
+
+        loader = (ROOT / "src/vllm/entrypoints/model_loader.cpp").read_text(
+            encoding="utf-8"
+        )
+        constructor_start = loader.index(
+            "LoadedEngine::LoadedEngine(HfConfig config,\n"
+            "                           std::unique_ptr<LoadedModel> model,"
+        )
+        constructor_end = loader.index("\n}\n", constructor_start) + len("\n}\n")
+        constructor = loader[constructor_start:constructor_end]
+        compact_constructor = re.sub(r"\s+", "", constructor)
+        loaded_stages = (
+            "hash_ready_", "config_", "resolved_spec_config_", "dflash_draft_",
+            "model_", "kv_connector_", "tokenizer_", "kv_cfg_", "max_model_len_",
+            "max_num_batched_tokens_", "prefix_caching_enabled_",
+            "jump_forward_enabled_", "runner_", "async_scheduling_enabled_",
+            "max_concurrent_batches_", "structured_output_manager_", "scheduler_",
+            "executor_", "engine_core_", "input_processor_", "output_processor_",
+            "block_hasher_", "engine_",
+        )
+        positions = []
+        for stage in loaded_stages:
+            marker = f'ConstructorWitnessPhase{{"LoadedEngine","{stage}"}}'
+            with self.subTest(loaded_engine_stage=stage):
+                self.assertEqual(compact_constructor.count(marker), 1)
+                positions.append(compact_constructor.index(marker))
+        self.assertEqual(positions, sorted(positions))
+        self.assertIn(
+            'ConstructorWitnessCall("LoadedEngine","MakeQwen3_5MoeLoadedModel"',
+            re.sub(r"\s+", "", loader),
+        )
+
+        runner = (ROOT / "src/vllm/v1/worker/gpu/runner.cpp").read_text(
+            encoding="utf-8"
+        )
+        runner_start = runner.index(
+            "GPUModelRunner::GPUModelRunner(\n    const HfConfig& config, LoadedModel& model,"
+        )
+        runner_end = runner.index("\n}\n", runner_start) + len("\n}\n")
+        runner_constructor = runner[runner_start:runner_end]
+        compact_runner_constructor = re.sub(r"\s+", "", runner_constructor)
+        runner_stages = (
+            "config_", "owned_model_", "model_", "spec_config_", "draft_model_",
+            "draft_attn_kv_", "queue_", "input_batch_",
+        )
+        runner_positions = []
+        for stage in runner_stages:
+            marker = f'ConstructorWitnessPhase{{"GPUModelRunner","{stage}"}}'
+            with self.subTest(runner_stage=stage):
+                self.assertEqual(compact_runner_constructor.count(marker), 1)
+                runner_positions.append(compact_runner_constructor.index(marker))
+        self.assertEqual(runner_positions, sorted(runner_positions))
+        for body_stage in (
+            "assign-max-num-reqs", "assign-max-num-batched-tokens",
+            "resolve-async-input-combine", "pooling-model-branch",
+            "initialize-kv-cache", "model-registry-prepare",
+        ):
+            with self.subTest(runner_body_stage=body_stage):
+                self.assertEqual(
+                    runner_constructor.count(
+                        f'ConstructorWitnessBefore("GPUModelRunner", "{body_stage}")'
+                    ),
+                    1,
+                )
+                self.assertEqual(
+                    runner_constructor.count(
+                        f'ConstructorWitnessAfter("GPUModelRunner", "{body_stage}")'
+                    ),
+                    1,
+                )
+
+        init_start = runner.index(
+            "void GPUModelRunner::initialize_kv_cache(const KVCacheConfig& kv_cache_config) {"
+        )
+        init_end = runner.index("\n}\n", init_start) + len("\n}\n")
+        initialize = runner[init_start:init_end]
+        compact_initialize = re.sub(r"\s+", "", initialize)
+        for stage in (
+            "scalar-state-slot-setup", "kv-group-scan", "mamba-validation",
+            "full-attention-geometry", "residency-buffer-setup",
+            "gdn-ssm-allocation", "gdn-conv-allocation",
+            "full-attention-allocation", "full-attention-view",
+            "draft-attention-storage", "gdn-state-view",
+        ):
+            with self.subTest(kv_stage=stage):
+                self.assertIn(
+                    f'"GPUModelRunner::initialize_kv_cache","{stage}"',
+                    compact_initialize,
+                )
+
+        api_test = (
+            ROOT / "tests/vllm/entrypoints/openai/test_api_server.cpp"
+        ).read_text(encoding="utf-8")
+        for guarantee in (
+            "_set_invalid_parameter_handler",
+            "_set_purecall_handler",
+            "_invoke_watson",
+            "WINDOWS_CRT_INVALID_PARAMETER:",
+            "WINDOWS_CRT_PURECALL",
+            "prior_invalid_parameter_handler_",
+            "prior_purecall_handler_",
+        ):
+            with self.subTest(crt_guarantee=guarantee):
+                self.assertIn(guarantee, api_test)
+        self.assertLess(
+            api_test.index("WINDOWS_CRT_INVALID_PARAMETER:"),
+            api_test.index("_invoke_watson"),
+        )
+
     def test_socket_teardown_probe_marks_each_owner_and_terminate_reason(self) -> None:
         main = (ROOT / "tests/doctest_main.cpp").read_text(encoding="utf-8")
         handler_start = main.index(
