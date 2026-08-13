@@ -100,6 +100,71 @@ class WindowsMetadataContract(unittest.TestCase):
         self.assertLess(contract, contract_exit)
         self.assertLess(contract_exit, environment)
 
+    def test_openai_socket_teardown_probe_precedes_unchanged_full_suite(self) -> None:
+        script = (ROOT / "scripts/build-windows-release.ps1").read_text(
+            encoding="utf-8"
+        )
+        test_path = (
+            '$openaiApiServerTest = Join-Path $BuildDir '
+            '"tests/Release/test_openai_api_server.exe"'
+        )
+        probe = (
+            "Invoke-Checked $openaiApiServerTest @(\n"
+            '    "--test-case=api_server: socket smoke *real HTTP requests over an ephemeral port",\n'
+            '    "--success=true",\n'
+            '    "--duration=true"\n'
+            ")"
+        )
+        full_suite = (
+            'foreach ($test in @(\n'
+            '    "test_openai_api_server.exe",'
+        )
+        self.assertEqual(script.count(test_path), 1)
+        self.assertEqual(script.count(probe), 1)
+        self.assertEqual(script.count(full_suite), 1)
+        self.assertLess(script.index(test_path), script.index(probe))
+        self.assertLess(script.index(probe), script.index(full_suite))
+
+    def test_socket_teardown_probe_marks_each_owner_and_terminate_reason(self) -> None:
+        main = (ROOT / "tests/doctest_main.cpp").read_text(encoding="utf-8")
+        for diagnostic in (
+            "std::set_terminate",
+            "std::current_exception()",
+            "std::rethrow_exception",
+            "catch (const std::exception& error)",
+            "error.what()",
+            "std::abort()",
+        ):
+            with self.subTest(diagnostic=diagnostic):
+                self.assertEqual(main.count(diagnostic), 1)
+
+        source = (
+            ROOT / "tests/vllm/entrypoints/openai/test_api_server.cpp"
+        ).read_text(encoding="utf-8")
+        start = source.index(
+            'TEST_CASE("api_server: socket smoke — real HTTP requests over an ephemeral port")'
+        )
+        end = source.index(
+            "// Route-registration gate over a real socket", start
+        )
+        socket_smoke = source[start:end]
+        owners = (
+            ("ServerHarness", "h"),
+            ("ScopedServerThread", "server_thread"),
+            ("httplib::Client", "client"),
+        )
+        for owner, variable in owners:
+            with self.subTest(owner=owner):
+                completed = f'"[vllm-test-probe] {owner} destruction complete\\n"'
+                started = f'"[vllm-test-probe] {owner} destruction start\\n"'
+                owner_declaration = f"{owner} {variable}"
+                self.assertEqual(socket_smoke.count(completed), 1)
+                self.assertEqual(socket_smoke.count(started), 1)
+                self.assertLess(socket_smoke.index(completed),
+                                socket_smoke.index(owner_declaration))
+                self.assertLess(socket_smoke.index(owner_declaration),
+                                socket_smoke.index(started))
+
     def test_invoke_checked_contract_covers_empty_exact_and_failing_arguments(self) -> None:
         script = (ROOT / "scripts/build-windows-release.ps1").read_text(encoding="utf-8")
         helper_start = script.index("function Invoke-Checked {")

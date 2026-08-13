@@ -285,6 +285,13 @@ if ($Backend -eq "vulkan") {
 }
 Invoke-Checked cmake (@("--build", $BuildDir, "--config", "Release", "--target") + $targets)
 
+$openaiApiServerTest = Join-Path $BuildDir "tests/Release/test_openai_api_server.exe"
+Invoke-Checked $openaiApiServerTest @(
+    "--test-case=api_server: socket smoke *real HTTP requests over an ephemeral port",
+    "--success=true",
+    "--duration=true"
+)
+
 foreach ($test in @(
     "test_openai_api_server.exe",
     "test_lmcache_client.exe",

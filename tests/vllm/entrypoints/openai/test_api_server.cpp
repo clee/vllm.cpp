@@ -115,6 +115,21 @@ using vllm::test::ScopedServerThread;
 
 namespace {
 
+class TeardownProbeMarker {
+ public:
+  explicit TeardownProbeMarker(const char* message) : message_(message) {}
+  ~TeardownProbeMarker() {
+    std::fputs(message_, stderr);
+    std::fflush(stderr);
+  }
+
+  TeardownProbeMarker(const TeardownProbeMarker&) = delete;
+  TeardownProbeMarker& operator=(const TeardownProbeMarker&) = delete;
+
+ private:
+  const char* message_;
+};
+
 // ─── Synthetic weights (mirrors test_serving.cpp) ────────────────────────────
 uint64_t Mix(uint64_t x) {
   x += 0x9E3779B97F4A7C15ULL;
@@ -1236,18 +1251,30 @@ TEST_CASE("api_server: /abort_requests aborts an in-flight engine request") {
 TEST_CASE("api_server: socket smoke — real HTTP requests over an ephemeral port") {
   const HfConfig c = MakeConfig();
   const Qwen3_5MoeWeights w = MakeWeights(c);
+  [[maybe_unused]] TeardownProbeMarker harness_destroyed(
+      "[vllm-test-probe] ServerHarness destruction complete\n");
   ServerHarness h(c, w, Fixture());
+  [[maybe_unused]] TeardownProbeMarker harness_destroying(
+      "[vllm-test-probe] ServerHarness destruction start\n");
 
   const int port = h.server.bind_to_any_port("127.0.0.1");
   REQUIRE(port > 0);
+  [[maybe_unused]] TeardownProbeMarker server_thread_destroyed(
+      "[vllm-test-probe] ScopedServerThread destruction complete\n");
   ScopedServerThread server_thread([&h]() { h.server.serve(); },
                                    [&h]() { h.server.stop(); });
+  [[maybe_unused]] TeardownProbeMarker server_thread_destroying(
+      "[vllm-test-probe] ScopedServerThread destruction start\n");
   // Wait until the accept loop is up.
   for (int i = 0; i < 500 && !h.server.is_running(); ++i)
     std::this_thread::sleep_for(std::chrono::milliseconds(2));
   REQUIRE(h.server.is_running());
 
+  [[maybe_unused]] TeardownProbeMarker client_destroyed(
+      "[vllm-test-probe] httplib::Client destruction complete\n");
   httplib::Client client("127.0.0.1", port);
+  [[maybe_unused]] TeardownProbeMarker client_destroying(
+      "[vllm-test-probe] httplib::Client destruction start\n");
   client.set_connection_timeout(5, 0);
   client.set_read_timeout(15, 0);
 
