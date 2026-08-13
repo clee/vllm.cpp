@@ -12,11 +12,19 @@
 // ─── WHY A CALLBACK AND NOT A RETURNED VOLUME ────────────────────────────────
 // Upstream's `tiled_decode` is a GENERATOR: it buffers ONE temporal group, blends
 // the overlap with the previous chunk, `yield`s the non-overlapping part and DROPS
-// it (conv_video_decoder.py:466-476). Peak memory is about two temporal chunks and
-// never the whole video, and the consumer streams chunks straight into the muxer
+// it (conv_video_decoder.py:466-476). Peak memory is about two temporal chunks,
+// and the consumer streams chunks straight into the muxer
 // (ti2vid_two_stages.py:369-376). Returning an `Ltx2VideoFrames` here would
 // materialize exactly the tensor the generator exists to avoid, so the C++
 // spelling is a sink that is called once per chunk and whose return releases it.
+//
+// "TWO CHUNKS, NEVER THE WHOLE VIDEO" IS A CLAIM ABOUT THE TILED CASE ONLY. At
+// one tile and one temporal group — every size below 896x512 / 81 frames, which
+// is every size this project has rendered — the single chunk IS the whole pixel
+// volume, the decoded tile is a second copy of it, and the `Concat`/emit path can
+// hold a third. 34.4 MiB at 448x256/25f, so the magnitude is immaterial and it is
+// no worse than the untiled path it replaced; but a row about memory does not get
+// to state the tiled-case bound as if it were unconditional.
 //
 // ─── THE OVERLAP BOOKKEEPING, WHICH IS THE PART THAT LOOKS WRONG AND IS NOT ──
 // Every tile is accumulated into its group's buffer ALREADY MULTIPLIED by its
@@ -166,6 +174,29 @@ void Ltx2ConvVideoDecodeTiled(const Ltx2ConvVideoDecoderConfig& config,
   VT_CHECK(static_cast<int64_t>(latent.size()) == latent_channels * latent_t * latent_h * latent_w,
            "ltx2 tiled decode: latent size does not match [C, T, H, W]");
   VT_CHECK(static_cast<bool>(emit), "ltx2 tiled decode: a chunk sink is required");
+  // An UNTILED FRAMES AXIS IS REFUSED BY NAME, because upstream cannot run it.
+  //
+  // `tile_size = 0` is legal to `DimensionSizeConfig` (tiling.py:619-645) and
+  // `create_tiles` maps the axis through `DEFAULT_MAPPING_OPERATION`
+  // (tiling.py:126-132), which returns `slice(0, None)`. `tiled_decode` then
+  // computes `curr_temporal_slice.stop - curr_temporal_slice.start`
+  // (conv_video_decoder.py:424) and raises `TypeError: unsupported operand
+  // type(s) for -: 'NoneType' and 'int'`. Measured at the pinned SHA over all
+  // eight (frames, height, width) x (tiled, untiled) combinations: every arm
+  // with frames untiled raises, every arm with frames tiled runs and reproduces
+  // `forward` exactly. The gate for both halves is
+  // `kLtx2TileDec*UpstreamUntiledFramesRaises` /
+  // `kLtx2TileDec*UpstreamUntiledSpatialVsUntiled`.
+  //
+  // Inventing a concrete stop here would be a behaviour upstream never produces,
+  // on a public signature, with no oracle — so it refuses instead. The SPATIAL
+  // axes are untiled-legal and are gated end to end.
+  VT_CHECK(tiling.frames.IsTiled(),
+           "ltx2 tiled decode: the frames axis must be tiled (tile_size > 0); upstream's "
+           "tiled_decode cannot run an untiled temporal axis, because "
+           "DEFAULT_MAPPING_OPERATION hands it slice(0, None) and conv_video_decoder.py:424 "
+           "subtracts its None stop. Pass a frames tile_size larger than the clip to get one "
+           "temporal chunk.");
 
   const Ltx2ScaleFactors factors =
       Ltx2VideoScaleFactorsFromBlocks(config.decoder_blocks, config.patch_size);

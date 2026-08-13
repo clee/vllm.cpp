@@ -36,6 +36,9 @@ builds for a Conv VAE — through `TileSizeConfig.to_splitters` (`tiling.py:797-
 | 320x192/25f | 4, 6, 10 | h 448/64, w 768/64, f 80/24 | **1** | **1** |
 | **448x256/25f** | **4, 8, 14** | h 448/64, w 768/64, f 80/24 | **1** | **1** |
 | 896x512/25f | 4, 16, 28 | h 448/64, w 768/64, f 80/24 | 4 | 1 |
+| 768x768/73f | 10, 24, 24 | h 768/64, w 768/64, f 80/24 | **1** | **1** |
+| **768x768/81f** | **11, 24, 24** | h 768/64, w 768/64, f 80/24 | **2** | **2** |
+| 1024x576/97f | 13, 18, 32 | h 448/64, w 768/64, f 80/24 | 8 | 2 |
 | 1280x704/121f | 16, 22, 40 | h 416/64, w 768/64, f 80/24 | 8 | 2 |
 | 1920x1088/241f | 31, 34, 60 | h 448/64, w 768/64, f 80/24 | 36 | 4 |
 
@@ -46,10 +49,42 @@ temporal tile. So upstream, on its own defaults, calls `self.forward` **once on 
 volume** at this size — exactly what `ltx2_video.cpp:1477-1479` does. Running tiled
 decode there would allocate one extra full-size pixel buffer and decode identically.
 
-The temporal axis does not start chunking until **121 frames**; the spatial axes do not
+The temporal axis does not start chunking until **81 frames**; the spatial axes do not
 start tiling until the long side exceeds 768 px (or the short side exceeds its
 aspect-coupled tile). "The win at our resolution is TEMPORAL chunking" is therefore not
 true at 25 frames.
+
+> **Corrected 2026-08-13 (review of PR #656).** This paragraph, §2 and §"What this row
+> therefore does" all said **121 frames**, and 121 is wrong. `latent_t = (frames - 1) / 8
+> + 1`, and `split_temporal_causal` short-circuits only while `latent_t <= 10`
+> (`tiling.py:239-240`), so the split first happens at `latent_t = 11`, i.e. **81 frames**.
+> Executed at the pinned SHA over `range(1, 137, 8)` on the 1024x576 AUTO layout, the
+> interval count goes 1 -> 2 exactly at 81. The row's own golden already said so —
+> `kLtx2AutoCases` carries `768x768/81f -> t_intervals = 2, chunks = 2` — and
+> `docs/FEATURES.md` said 81; only the prose was wrong.
+>
+> **Root cause, recorded because it is the reusable part.**
+> `scripts/probe_ltx2_tiling_layout.py` swept 9, 25, 25, 25, **121**, 241. It never
+> sampled a frame count between 25 and 121, so it stepped straight over its own binding
+> point and the number it happened to land on was written down as the threshold. The
+> sweep now walks the temporal axis in single latent-frame steps across the boundary and
+> asserts where the transition is, so skipping it again is not possible.
+>
+> **What the correction costs, stated plainly.** 81..120 frames is the tiled regime, and
+> `docs/USAGE.md` records the LTX-2.5 recipe default as **1024x1536 at 121 frames** — an
+> ordinary request is inside it. Proven on the shipped checkpoint at the AUTO layout,
+> 64x64/81f (the same AUTO layout the golden's 768x768/81f row resolves, at a size a
+> full-precision reference decode can finish), latent 11,2,2 -> 2 tiles / 2 groups:
+>
+> ```
+> [equiv] tiles=2 groups=2 -> untiled [3,81,64,64]  streamed [3,81,64,64] chunks=2
+> [equiv] max|diff| = 0.71614238619804382   non-bit-identical floats = 985849 / 995328
+> ```
+>
+> 99.05% of the pixels move, by up to 0.716 on a signal of scale ~1. That is upstream's
+> behaviour and not a defect, but the ONE-TILE CONTROL's safety argument — "routing
+> through the streaming entry point is safe at every size the AUTO layout does not tile" —
+> **covers below 81 frames and does not cover 81..120**.
 
 **(b) The decoder's own buffers at that shape are ~2 orders of magnitude too small.**
 The shipped ladder is read from the checkpoint's own `__metadata__["config"]`
@@ -89,7 +124,7 @@ buffers, that is the finding**, and §5 says where it actually is.
 
 The structural port is still correct and still owed — `ltx2_video_vae.cpp:17-18` records
 `tiled_decode` as out of phase L4 and owed, and the sizes where it *does* bind
-(896x512 and up, 121 frames and up) are inside this project's v1 scope. So this row
+(896x512 and up, 81 frames and up) are inside this project's v1 scope. So this row
 ports the mechanism, and states honestly which size it is a no-op at.
 
 What changes:
@@ -268,9 +303,11 @@ trustworthy — and the full-size run confirms it in `## Outcome`.
 ## Now
 
 `DONE` — the mechanism is ported, gated against executed upstream, and routed through the
-pipeline. Two axes stay open and are named in `## Outcome`: the 60 GiB is **not**
-attributed (it is not in the decode), and the reference decoder's ~30 CPU-minute
-448x256/25f decode is a separate, newly measured problem.
+pipeline. The FAIL review of PR #656 is answered in `## Outcome`; both blocking findings
+are closed with reproduced RED/GREEN evidence. Three axes stay open and are named there:
+the 60 GiB is **not** attributed (it is not in the decode), the reference decoder's
+~30 CPU-minute 448x256/25f decode is a separate newly measured problem, and a tiled
+decode over a NOISE-DRAWING config has no gate.
 
 ## Outcome
 
@@ -287,10 +324,13 @@ as a golden (`kLtx2AutoCases`) and asserted in `test_ltx2_tiling`:
 | 896x512/25f | 4,16,28 | h 448/64, w 768/64, f 80/24 | 1 / 2 / 2 | 1 |
 | 1280x704/121f | 16,22,40 | h 416/64, w 768/64, f 80/24 | 2 / 2 / 2 | 3 |
 | 1920x1088/241f | 31,34,60 | h 448/64, w 768/64, f 80/24 | 4 / 3 / 3 | 5 |
+| **768x768/81f** | **11,24,24** | h 768/64, w 768/64, f 80/24 | **2 / 1 / 1** | **2** |
+| 1024x576/97f | 13,18,32 | h 448/64, w 768/64, f 80/24 | 2 / 2 / 2 | 2 |
 
-Tiling first binds at **896x512** spatially and **121 frames** temporally. The
-dispatching premise — "we call the untiled path where upstream tiles" — is false at the
-size that failed.
+Tiling first binds at **896x512** spatially and **81 frames** temporally — see the
+correction box in §0, which records why the prose here said 121 and the golden said 81.
+The dispatching premise — "we call the untiled path where upstream tiles" — is false at
+the size that failed.
 
 **2. The decode's own memory is 170x too small to be the 60 GiB.** Real shipped conv VAE,
 real 448x256/25f latent decoded to completion (`[3, 25, 256, 448]`), exact `operator new`
@@ -333,16 +373,66 @@ one-tile control IS exact, on both causality arms, ours and upstream's: `max|dif
 
 ### The gate
 
-Build: `BUILD_EXIT=0` clean, `No space left`/`BFD assertion` count 0, `df -h /` 91%.
-`ctest -N` denominator **416**.
+**The `ctest -N` denominator is 424, not the 416 first recorded.** 416 was the ninja edge
+count of `ninja test_ltx2_tiling test_ltx2_vae test_ltx2_video`, whose last line is
+`[416/416] Linking CXX executable tests/test_ltx2_video` — a build number read as a test
+number, so "full ctest 416/416" described a run that never happened at that denominator.
+The configure line that produces 424, recorded because a denominator without one is not
+reproducible:
+
+```sh
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+ctest --test-dir build -N | tail -1     # Total Tests: 424
+```
+
+Build: clean `rm -rf build` + reconfigure + `cmake --build build -j 4`, `BUILD_EXIT`
+captured separately from the run, log grepped for `No space left` / `BFD assertion`
+(count 0), `df -h /` recorded at 93% before and 89% after.
 
 Focused, with COUNTS (a changed count is RED even when green):
 
 | suite | cases | assertions |
 |---|---|---|
-| `test_ltx2_tiling` (new) | 9 / 9 | 830 / 830 |
+| `test_ltx2_tiling` | 10 / 10 | 907 / 907 |
 | `test_ltx2_vae` | 36 / 36 | 3039 / 3039 |
-| `test_ltx2_video` | 30 / 30 | 502 / 502 |
+| `test_ltx2_video` | 31 / 31 | 673 / 673 |
+| `test_ltx2_pipeline` | 37 / 37 | 2382 / 2382 |
+
+Full: `ctest --test-dir build --output-on-failure` -> **424/424 tests passed, 0 failed**,
+`CTEST_EXIT=0`, 222.72 s, 424 lines of `N/424 Test` in the log — the run's own
+denominator asserted against the `ctest -N` above. Two tests report `Skipped` by
+their own guards (`test_modelopt_mixed_precision_checkpoint`, `test_voxtral_e2e`).
+
+One re-run was needed and is recorded rather than hidden: an earlier pass aborted at
+96/424 with `test_muse_glimmer_text` throwing
+`safetensors: empty file in /tmp/muse_glimmer_text_0.safetensors`. That fixture path is a
+FIXED name in shared `/tmp`, and six agents were compiling on the box at 98% disk; run
+serially the suite is 24/24, 528/528, SUCCESS. Not charged to this diff, which touches
+no muse_glimmer path — but the fixed `/tmp` name is real shared-state flakiness and is
+worth its own issue.
+
+### The untiled-mapper mutation — RED, then restored (F2)
+
+`map_t` and `map_s`'s `{1.0f}` broadcast masks set to `{0.0f}` in
+`src/vllm/model_executor/models/ltx2_tiling.cpp`, which multiplies the whole decoded
+volume by zero — a black clip.
+
+* **BEFORE this change** (reviewed head): `test_ltx2_tiling` 9 cases / 9 passed,
+  830 assertions / 830 passed, `Status: SUCCESS!`, exit 0; `test_ltx2_video` 30/30,
+  502/502, SUCCESS. The finding reproduces exactly.
+* **AFTER**: 10 cases -> **7 passed / 3 failed**, 907 assertions -> **5 failed**, exit 1.
+  Three of the failures are the section-3b mask assertion, once per axis; the fourth is
+  `untiled-spatial control max|diff| vs untiled = 2.31736` against upstream's 0.
+* restored with `git checkout`, `git diff` empty, rebuilt: 10/10, 907/907, SUCCESS.
+
+### The render mutations — RED, then restored (F6, F7)
+
+* `chunk.first_frame + f` -> `f` (per-chunk frame numbering) in `ltx2_video.cpp`:
+  the new multi-chunk case goes 171 assertions -> **35 failed**, exit 1 — the second
+  chunk overwrites the first and the clip's tail is missing.
+* the stale-frame cleanup loop disabled: same case -> **72 failed**, exit 1, on
+  `!stale.good()` for every frame a shorter re-render left behind.
+* both restored; `test_ltx2_video` 31/31, 673/673, SUCCESS.
 
 ### The blend mutation — RED, then restored
 
@@ -359,8 +449,98 @@ scratch copy of `ltx2_tiling.cpp`:
 * restored and verified byte-for-byte: `md5 e734ee2e3503e10ea111305a33574293` before and
   after, `git diff` empty, rebuild GREEN 9/9, 830/830.
 
+### The review of PR #656 — FAIL, and what closed each finding
+
+The reviewer confirmed all three refutations independently, regenerated the tiling
+goldens byte-for-byte, reproduced the memory probe at three scales and verified
+`Ltx2VideoDecodeStreaming` bit-identical to the untiled path on the real checkpoint.
+None of that is re-litigated. Two blocking findings and six minor ones were raised.
+
+**F1 (blocking) — the temporal binding point is 81 frames, not 121.** Corrected at all
+five sites (`ltx2_tiling.h`, `ltx2_video.cpp`, `docs/USAGE.md`, and §0/§1/§2 here);
+`docs/FEATURES.md` and the golden already said 81. Root cause recorded in the §0
+correction box: `scripts/probe_ltx2_tiling_layout.py` swept 9, 25, 25, 25, 121, 241 and
+never sampled between 25 and 121, so it stepped over its own binding point. The probe now
+WALKS the temporal axis one latent frame at a time and **asserts** the transition is at
+81, so skipping it again fails instead of publishing a number. The 81..120 window is
+stated as a user-visible consequence rather than implied, because
+`docs/USAGE.md` records the recipe default as 1024x1536 at 121 frames.
+
+Reproduced on the shipped conv VAE by `scripts/probe_ltx2_tiled_equivalence.cpp`
+(new, committed with its compile line):
+
+```
+[equiv] 64x64, latent 11,2,2  AUTO h=768/64 w=768/64 f=80/24
+[equiv] tiles=2 groups=2  ->  untiled [3,81,64,64]  streamed [3,81,64,64] chunks=2
+[equiv] max|diff| = 0.71614238619804382   non-bit-identical floats = 985849 / 995328
+[equiv] untiled |out|max = 0.75126725435256958
+```
+
+99.05% of pixels move, by up to 95% of the output's own range. Upstream's behaviour,
+mirrored — but the one-tile control's safety argument covers **below 81 frames only**.
+
+**F2 (blocking) — the `!IsTiled()` mapper branches were shipped and ungated.**
+Reproduced first: with `map_t`/`map_s`'s `{1.0f}` broadcast masks mutated to `{0.0f}` —
+which multiplies the entire decoded volume by zero, i.e. renders a black clip —
+`test_ltx2_tiling` reported 9/9 cases, 830/830 assertions, SUCCESS and `test_ltx2_video`
+30/30, 502/502, SUCCESS.
+
+Measured rather than assumed: swept over all eight (frames, height, width) x
+(tiled, untiled) combinations against upstream at the pinned SHA,
+
+| frames | spatial | upstream `tiled_decode` |
+|---|---|---|
+| tiled | any combination | runs; `max|diff|` vs `forward` == **0.0** |
+| UNTILED | every combination | **TypeError** at `conv_video_decoder.py:424` |
+
+because `DEFAULT_MAPPING_OPERATION` hands it `slice(0, None)` and :424 subtracts that
+`None` stop. So the two halves are not symmetric and are closed differently:
+
+* the SPATIAL half is gated end to end — new `UNTILED_SPATIAL` arm in the generator
+  (`kLtx2TileDec*UpstreamUntiledSpatialVsUntiled` / `*UntiledSpatialChunkCount`) and a
+  `(B'')` control in `RunDecodeArm` on both causality arms;
+* the TEMPORAL half is **refused by name** in `Ltx2ConvVideoDecodeTiled`, mirroring
+  upstream's own failure rather than inventing a concrete stop upstream never computes.
+  The golden `kLtx2TileDec*UpstreamUntiledFramesRaises` records that upstream raises, so
+  the refusal is mirrored and not local policy;
+* the mapper output itself is pinned by new goldens section 3b
+  (`kLtx2UntiledMap*`, upstream's `create_tiles` executed on an all-untiled config).
+
+The same black-out mutation now goes **RED**: 10 cases -> 7 passed / **3 failed**,
+907 assertions -> **5 failed**, `untiled-spatial control max|diff| vs untiled = 2.31736`
+against upstream's 0. Restored byte-for-byte (`git diff` empty) and re-verified GREEN.
+
+**F3 — the recorded `ctest -N` did not reproduce.** It does not: 416 was the ninja edge
+count from `ninja test_ltx2_tiling test_ltx2_vae test_ltx2_video`, whose last line is
+`[416/416] Linking CXX executable tests/test_ltx2_video`. The real denominator is in
+"The gate" below, with the configure line that produced it.
+
+**F4** `ltx2_video_vae.cpp:17-18` no longer records tiled decode as owed; the encoder
+half still is. **F5** the shared `Ltx2NoiseStream*` across tiles is documented at
+`Ltx2ConvVideoDecodeTiled` and recorded under "What is owed" — it mirrors upstream
+(`self.forward` per tile with one generator) and is inert on the shipped checkpoint.
+**F6** a multi-chunk render case now drives `chunk.first_frame + f` through the PPM
+writer at 81 frames. **F7** a previous render's frame tail is deleted before a new render
+writes. **F8** the "never materialized" claim is bounded to the tiled case at both
+anchors. **F9** the compile line for both probes is recorded in their headers.
+**F10** the fixture's `res_x_y` block is disclosed in the test header.
+
 ### What is owed
 
+* **A gate over a NOISE-DRAWING tiled decode.** `Ltx2ConvVideoDecodeTiled` calls
+  `Ltx2ConvVideoDecode` once per tile with the SAME `Ltx2NoiseStream*`, exactly as
+  upstream calls `self.forward` per tile with one generator — so on a checkpoint with
+  `timestep_conditioning = true` (`ltx2_video_vae.h:175` defaults it true) or a block with
+  `inject_noise` (`:100`), the draw count and order differ between the tiled and untiled
+  paths. That is upstream's behaviour, mirrored, not a local divergence; it is inert on
+  the shipped `ltx-2.5-video-vae-conv` checkpoint (`timestep_conditioning: false`, no
+  `inject_noise` block), and the golden fixtures disable it for exactly that reason. What
+  is missing is a gate over a config that DOES draw.
+* **A multi-chunk render at a SHIPPED resolution.** The new `test_ltx2_video` case chunks
+  at 81 frames on the reduced fixture, which is the right shape but not the right size.
+  On the real checkpoint even the 64x64/81f equivalence probe above took over ten minutes
+  of single-threaded f32 reference decode, so a gated multi-chunk render at a shipped
+  resolution belongs with phase L6's production-dtype arm, not here.
 * **The 60 GiB attribution.** Open, with the next hypothesis named above.
 * **The reference decoder's throughput.** Newly quantified (item 3); belongs with phase
   L6's production-dtype arm.

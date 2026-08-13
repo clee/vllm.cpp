@@ -50,7 +50,26 @@
 // `split_by_size` returns ONE interval when `dim <= size` (tiling.py:199-200).
 // Executed at the pinned SHA, the first size that tiles at all is 896x512 (4
 // spatial tiles, still ONE temporal group) and the first that CHUNKS temporally
-// is 121 frames. At 448x256/25f the latent is 8x14 against a 14x24 grid tile and
+// is **81 frames** — 81, because `latent_t = (frames - 1) / 8 + 1` reaches 11
+// there and `split_temporal_causal` short-circuits only while `latent_t <= 10`
+// (tiling.py:239-240). NOT 121, which this line used to say four lines under the
+// paragraph above already saying 81: 121 is merely the first frame count the
+// original probe sweep sampled above 25. The row's own golden `kLtx2AutoCases`
+// carries `768x768/81f -> t_intervals = 2, chunks = 2`, and the sweep now walks
+// the axis one latent frame at a time and asserts where the transition is.
+//
+// THE CONSEQUENCE IS USER-VISIBLE, so it is stated and not implied: 81..120
+// frames IS the tiled regime. `docs/USAGE.md` records the LTX-2.5 recipe default
+// as 1024x1536 at 121 frames, so an ordinary request lands inside it, and a
+// tiled render is not the same image as an untiled one (upstream's behaviour,
+// not a defect — see the equivalence note in tests/vllm/models/test_ltx2_tiling.cpp).
+// Measured on the shipped checkpoint at 64x64/81f by
+// scripts/probe_ltx2_tiled_equivalence.cpp: 2 chunks, max|diff| 0.716 against an
+// output whose own |max| is 0.751, with 985849 of 995328 channel values not
+// bit-identical. The ONE-TILE CONTROL therefore makes routing safe below 81
+// frames and NOT within 81..120.
+//
+// At 448x256/25f the latent is 8x14 against a 14x24 grid tile and
 // 4 frames against a 10-latent-frame temporal tile, so upstream calls `forward`
 // once on the whole volume there — see .agents/specs/ltx25-tiled-decode.md §0.
 //
@@ -231,8 +250,35 @@ using Ltx2VideoChunkSink = std::function<void(const Ltx2VideoChunk&)>;
 // `ConvVideoDecoder.tiled_decode` (conv_video_decoder.py:383-484) together with
 // `_accumulate_temporal_group_into_buffer` (:508-557).
 //
-// The full pixel volume is NEVER materialized: at most two temporal chunk buffers
-// are live at once, which is the whole point of the generator upstream.
+// MEMORY, stated precisely rather than as a slogan. At more than one tile the
+// full pixel volume is never materialized: at most two temporal chunk buffers are
+// live at once, which is the whole point of the generator upstream. At exactly
+// ONE tile and ONE group — every size below 896x512 / 81 frames — the chunk
+// buffer IS the full volume, the decoded tile is another copy of it, and the
+// callback's consumer may hold a third. That is not a regression (the untiled
+// path allocates the volume too) and at 448x256/25f it is 34.4 MiB, but "never
+// materialized" is false there and this row is about memory, so it says so.
+//
+// THE NOISE STREAM IS SHARED ACROSS TILES, AND ITS DRAW COUNT IS OWED. This calls
+// `Ltx2ConvVideoDecode` once per tile with the SAME `Ltx2NoiseStream*`, exactly as
+// upstream calls `self.forward` per tile (conv_video_decoder.py:529) with the same
+// generator. So on a checkpoint with `timestep_conditioning = true`
+// (ltx2_video_vae.h:175 defaults it true) or a block with `inject_noise` (:100),
+// the tiled and untiled paths draw a DIFFERENT number of tensors in a different
+// order — upstream's behaviour, mirrored, not a local divergence. It is inert on
+// the shipped `ltx-2.5-video-vae-conv` checkpoint, whose config sets
+// `timestep_conditioning: false` with no `inject_noise` block, and the golden
+// fixtures disable it for the same reason (see the generator's docstring). What is
+// OWED is a gate over a noise-drawing config; recorded in
+// .agents/specs/ltx25-tiled-decode.md's "What is owed", not left to be found.
+//
+// REFUSES an UNTILED FRAMES AXIS (`tiling.frames.tile_size == 0`) by name.
+// `create_tiles` accepts it and maps the axis through `DEFAULT_MAPPING_OPERATION`
+// (tiling.py:126-132), but upstream's `tiled_decode` then subtracts the `None`
+// stop of `slice(0, None)` (conv_video_decoder.py:424) and raises TypeError —
+// measured over all eight (frames, height, width) x (tiled, untiled) combinations
+// at the pin. Pass a frames tile_size larger than the clip for one chunk. The
+// SPATIAL axes are untiled-legal and gated end to end.
 void Ltx2ConvVideoDecodeTiled(const Ltx2ConvVideoDecoderConfig& config,
                               const Ltx2VaeWeights& weights, const std::vector<float>& latent,
                               int64_t latent_channels, int64_t latent_t, int64_t latent_h,

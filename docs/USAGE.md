@@ -569,12 +569,19 @@ memory number:
   (`test_ltx2_tiling`'s one tile control, on both causality settings). So
   448x256/25f renders byte identically to how it rendered before tiling existed,
   and its memory is unchanged. Tiling starts doing something at 896x512, and
-  temporal chunking at 121 frames.
+  temporal chunking at 81 frames.
 - **A tiled render is not the same image as an untiled one**, and that is
   upstream's behaviour, not a defect here. Each tile decodes a crop of the latent,
   the decoder's receptive field is wider than the 64 px overlap, and the seam is
   blended rather than eliminated. Do not compare a 1920x1088 render against a
   hypothetical untiled one and read the difference as an error.
+- **81 to 120 frames is already the tiled regime, and the recipe default is
+  inside it.** The default request is 1024x1536 at 121 frames. At 81 frames the
+  latent is 11 frames deep against a 10 frame temporal tile, so it splits into two
+  chunks. Measured on the shipped conv VAE at 64x64 / 81 frames: max abs diff
+  0.716 against the untiled decode, on an output whose own max is 0.751, with
+  985849 of 995328 channel values not bit identical. If you need the pre tiling
+  render back, ask for 73 frames or fewer.
 
 **The refusal that used to stand here is gone, and what replaced it is an owed
 ORACLE rather than an owed feature.** Through L10 this page said a prompt was

@@ -5,6 +5,7 @@
 #include "vllm/multimodal/ltx2_video.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -1488,13 +1489,33 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
   // temporal tile, so exactly one tile and one chunk come out — and the ONE-TILE
   // CONTROL in tests/vllm/models/test_ltx2_tiling.cpp proves that path reproduces
   // the untiled decode BIT FOR BIT (max|diff| == 0, on both causality arms, and
-  // upstream's own value for the same control is 0 too). Tiling first does
-  // anything at 896x512 spatially and at 121 frames temporally.
+  // upstream's own value for the same control is 0 too).
   //
-  // What it buys: the full pixel volume is never materialized. Each temporal chunk
-  // is written to disk and dropped, so the peak is about two chunks rather than
-  // [3, F, H, W] — which is what makes the long clips upstream's 80/24 layout
-  // exists for reachable at all.
+  // TILING FIRST DOES ANYTHING AT 896x512 SPATIALLY AND AT **81 FRAMES**
+  // TEMPORALLY — 81, not 121. `latent_t = (frames - 1) / 8 + 1` is 11 at 81
+  // frames and `split_temporal_causal` short-circuits only while `latent_t <= 10`
+  // (tiling.py:239-240). The row's own golden `kLtx2AutoCases` has said so since
+  // it was generated (`768x768/81f -> t_intervals = 2`); the prose here said 121
+  // because the probe sweep that produced it stepped 25 -> 121 and never sampled
+  // the binding point.
+  //
+  // SO THE "CHANGES NOTHING" ABOVE IS BOUNDED BY 81 FRAMES, AND A DEFAULT REQUEST
+  // IS NOT INSIDE THAT BOUND. `docs/USAGE.md` records the recipe default as
+  // 1024x1536 at 121 frames. Between 81 and 120 frames the render is tiled and is
+  // NOT the render this path produced before tiling existed — measured on the
+  // SHIPPED conv VAE at the AUTO layout, 64x64 / 81 frames, latent 11,2,2, by
+  // scripts/probe_ltx2_tiled_equivalence.cpp: 2 tiles, 2 chunks, max|diff| 0.716
+  // against the untiled decode on an output whose own |max| is 0.751, with 985849
+  // of 995328 floats not bit-identical. That is upstream's own behaviour (a
+  // receptive field wider than the overlap, blended at the seam) and not a defect
+  // here — but it is a different image, and the one-tile control does not cover it.
+  //
+  // What it buys, ABOVE ONE CHUNK: the full pixel volume is never materialized.
+  // Each temporal chunk is written to disk and dropped, so the peak is about two
+  // chunks rather than [3, F, H, W] — which is what makes the long clips
+  // upstream's 80/24 layout exists for reachable at all. At exactly one chunk the
+  // chunk IS the volume and nothing is saved; that is the regime below 81 frames,
+  // and it is no worse than the buffered path it replaced.
   EngineNoiseStream decode_noise(seed ^ 0x1D7Cull);
   const Ltx2ScaleFactors video_factors =
       Ltx2VideoScaleFactorsFromBlocks(im.video_cfg.decoder_blocks, im.video_cfg.patch_size);
@@ -1507,6 +1528,45 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
   std::error_code ec;
   std::filesystem::create_directories(gen.output_dir, ec);
   if (ec) Fail("cannot create " + gen.output_dir + ": " + ec.message());
+
+  // A PREVIOUS RENDER'S TAIL IS DELETED BEFORE THIS ONE STARTS, and it has to be.
+  //
+  // The muxer is handed `frame_%06d.ppm` with no frame count (see `mux.frame_pattern`
+  // below), so it takes whatever consecutive files it finds. A 121-frame render
+  // followed by a 25-frame render into the same directory would leave
+  // frame_000025..frame_000120 on disk and mux a clip that runs 96 frames past its
+  // own end — silently, and looking like the longer render succeeded. Streaming
+  // widened this: a chunk that throws now also leaves a partial render behind,
+  // where the old buffered path wrote nothing until the whole decode had finished.
+  //
+  // Scoped deliberately: only `frame_<digits>.ppm`, only in the directory this
+  // render is about to write, and nothing else in it is touched. Collected first
+  // and removed after, because unlinking the entry the iterator is standing on is
+  // not something the directory iterator promises to survive.
+  {
+    std::vector<std::filesystem::path> stale;
+    for (const std::filesystem::directory_entry& entry :
+         std::filesystem::directory_iterator(gen.output_dir, ec)) {
+      if (ec) break;
+      if (!entry.is_regular_file()) continue;
+      const std::string name = entry.path().filename().string();
+      // "frame_" + at least one digit + ".ppm" is 11 characters.
+      if (name.size() < 11) continue;
+      if (name.rfind("frame_", 0) != 0) continue;
+      if (name.compare(name.size() - 4, 4, ".ppm") != 0) continue;
+      bool all_digits = true;
+      for (size_t i = 6; i + 4 < name.size(); ++i) {
+        if (std::isdigit(static_cast<unsigned char>(name[i])) == 0) all_digits = false;
+      }
+      if (!all_digits) continue;
+      stale.push_back(entry.path());
+    }
+    for (const std::filesystem::path& p : stale) {
+      std::error_code rm;
+      std::filesystem::remove(p, rm);
+    }
+    ec.clear();
+  }
 
   int64_t rendered_frames = 0;
   int64_t rendered_channels = 0;

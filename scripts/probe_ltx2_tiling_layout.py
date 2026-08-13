@@ -58,6 +58,13 @@ for (W, H, F) in [
     (320, 192, 25),
     (448, 256, 25),
     (896, 512, 25),
+    # The temporal binding point and the two frame counts around it. The first
+    # version of this sweep went 25 -> 121 and skipped 81 entirely, which is how
+    # "temporal chunking starts at 121 frames" got written down; see the temporal
+    # walk below, which is the part that makes skipping it impossible.
+    (768, 768, 73),
+    (768, 768, 81),
+    (1024, 576, 97),
     (1280, 704, 121),
     (1920, 1088, 241),
 ]:
@@ -83,3 +90,52 @@ for (W, H, F) in [
         f"chunkbuf={peak / 2**20:.1f} MiB "
         f"fullpix={3 * full.frames * full.height * full.width * 4 / 2**20:.1f} MiB"
     )
+
+
+# ---------------------------------------------------------------------------
+# THE TEMPORAL BINDING POINT, walked rather than sampled.
+#
+# The resolution sweep above cannot establish a threshold: it visits a handful of
+# frame counts, and whichever of them happens to be the first that tiles reads as
+# the answer. Its first version went 9, 25, 25, 25, 121, 241 and so recorded
+# "temporal chunking starts at 121 frames" — the smallest number it sampled above
+# 25. The real answer is 81, and the row's own goldens had it all along.
+#
+# So this walks the axis one latent frame at a time across the boundary and
+# ASSERTS both where the transition is and that it saw both sides of it. A sweep
+# that steps over its own binding point now fails instead of publishing a number.
+# ---------------------------------------------------------------------------
+
+WALK_W, WALK_H = 1024, 576
+walk_cfg = TileSizeConfig.from_long_side(
+    long_side=LONG, height=WALK_H, width=WALK_W, scale_factors=SF, frames=FR
+)
+t_split, _h_split, _w_split = walk_cfg.to_splitters(SF)
+
+print()
+print(f"temporal walk @ {WALK_W}x{WALK_H}, one latent frame per step:")
+first_tiled = None
+saw_untiled = False
+for F in range(1, 137, 8):  # (frames - 1) % 8 == 0 — exactly one latent frame per step
+    lat_t = (F - 1) // SF.time + 1
+    n = len(t_split(lat_t).intervals)
+    if n == 1:
+        saw_untiled = True
+    elif first_tiled is None:
+        first_tiled = F
+    mark = "   <<< FIRST FRAME COUNT THAT SPLITS" if F == first_tiled else ""
+    print(
+        f"  frames={F:4d} latent_t={lat_t:3d} t_intervals={n} "
+        f"chunks={walk_cfg.video_chunks_number(F)}{mark}"
+    )
+
+assert saw_untiled, "the walk never saw an untiled frame count; it cannot locate a boundary"
+assert first_tiled is not None, (
+    "the walk never saw a tiled frame count; extend the range before trusting a threshold"
+)
+assert first_tiled == 81, (
+    f"the temporal axis first splits at {first_tiled} frames, not 81 — reconcile "
+    "ltx2_tiling.h, ltx2_video.cpp, docs/USAGE.md, docs/FEATURES.md and "
+    ".agents/specs/ltx25-tiled-decode.md before publishing a new number"
+)
+print(f"  -> the temporal axis first splits at {first_tiled} frames (latent_t 11 > 10)")

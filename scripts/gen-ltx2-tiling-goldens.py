@@ -148,6 +148,60 @@ def _control_config():
     )
 
 
+# THE UNTILED-AXIS CONTROL, which is a DIFFERENT arm from the one above and was
+# ungated until it was asked for by name.
+#
+# `tile_size = 0` means "this axis is not tiled" (tiling.py:619-645), and it is a
+# legal, documented value that `DimensionSizeConfig.__post_init__` blesses. It is
+# NOT the same thing as `tile_size = 10_000`: a huge tile still declares the axis
+# tiled, so `_prepare_tiles` installs the REAL mapper and the split merely
+# short-circuits. A zero tile size installs `DEFAULT_MAPPING_OPERATION`
+# (tiling.py:126-132) instead, which returns `slice(0, None)` and a length-1
+# broadcast mask from `untiled_mask_1d` (tiling.py:121-123) — a completely
+# separate code path that the 10_000 control never touches.
+#
+# Nothing in the shipped pipeline reaches it (`Ltx2AutoTileSizeConfig` always
+# declares all three axes tiled), but it is on the public signature of
+# `Ltx2ConvVideoDecodeTiled`, so it ships. A defect there multiplies the whole
+# decoded volume by the mask — i.e. renders a black clip — and no assertion in
+# this suite could see it until this arm existed.
+#
+# ─── AND THE TWO AXES ARE NOT SYMMETRIC, WHICH IS THE MEASURED PART ──────────
+# Swept over all eight (frames, height, width) x (tiled, untiled) combinations on
+# this fixture at the pinned SHA:
+#
+#   frames tiled,   any spatial combination  -> runs, max|diff| vs forward == 0.0
+#   frames UNTILED, every spatial combination -> TypeError
+#
+# because `tiled_decode` computes `curr_temporal_slice.stop - .start`
+# (conv_video_decoder.py:424) and `DEFAULT_MAPPING_OPERATION` hands it
+# `slice(0, None)`, whose `.stop` is None. So an untiled FRAMES axis is legal to
+# `create_tiles` and unusable in `tiled_decode` — upstream raises, and this port
+# refuses with the reason named rather than inventing a concrete stop upstream
+# never computes. The spatial half is gated end to end below.
+UNTILED_SPATIAL = (0, 0)
+
+
+def _untiled_spatial_config():
+    """Frames still tiled (so `tiled_decode` runs), height and width NOT tiled."""
+    from ltx_core.tiling import DimensionSizeConfig, TileSizeConfig
+
+    zero = DimensionSizeConfig(tile_size=UNTILED_SPATIAL[0], overlap=UNTILED_SPATIAL[1])
+    return TileSizeConfig(
+        frames=DimensionSizeConfig(tile_size=CONTROL_FRAMES[0], overlap=CONTROL_FRAMES[1]),
+        height=zero,
+        width=zero,
+    )
+
+
+def _untiled_axes_config():
+    """All three axes untiled — legal to `create_tiles`, fatal to `tiled_decode`."""
+    from ltx_core.tiling import DimensionSizeConfig, TileSizeConfig
+
+    zero = DimensionSizeConfig(tile_size=UNTILED_SPATIAL[0], overlap=UNTILED_SPATIAL[1])
+    return TileSizeConfig(frames=zero, height=zero, width=zero)
+
+
 # ---------------------------------------------------------------------------
 # Emit helpers on top of the imported ones.
 # ---------------------------------------------------------------------------
@@ -325,6 +379,44 @@ def section_auto_layout(out) -> None:
     out.write("\n")
 
 
+def section_untiled_mapping(out) -> None:
+    """Section 3b — `DEFAULT_MAPPING_OPERATION` (tiling.py:126-132), executed.
+
+    The AUTO layout never produces it, so it is emitted from an explicitly
+    untiled config rather than from a resolution. `slice(0, None)` has no
+    integer stop upstream; -1 is emitted for it and the C++ side asserts its own
+    concrete stop equals the full axis extent, which is what `None` means.
+    """
+    tiles = _prepare_tiles(TILING_LATENT, _untiled_axes_config())
+
+    starts, stops, mask_lens, mask_values = [], [], [], []
+    for axis in (2, 3, 4):  # frames, height, width — batch/channel are never split
+        out_slice = tiles[0].out_coords[axis]
+        mask = tiles[0].masks_1d[axis]
+        starts.append(0 if out_slice.start is None else int(out_slice.start))
+        stops.append(-1 if out_slice.stop is None else int(out_slice.stop))
+        mask_lens.append(int(mask.numel()))
+        mask_values.append(float(mask.reshape(-1)[0]))
+
+    out.write(
+        "// --- section 3b: the UNTILED-AXIS mapping arm — `DEFAULT_MAPPING_OPERATION`\n"
+        "// (tiling.py:126-132) with `untiled_mask_1d` (tiling.py:121-123). Reached by\n"
+        "// `tile_size = 0`, which is legal (tiling.py:619-645) and is a DIFFERENT path\n"
+        "// from a huge tile size: that one still installs the real mapper. Order is\n"
+        "// {frames, height, width}; a stop of -1 is upstream's `slice(0, None)`. ---\n"
+    )
+    G.emit_scalar(out, "kLtx2UntiledMapTileCount", len(tiles))
+    emit_i64_array(out, "kLtx2UntiledMapStart", starts)
+    emit_i64_array(out, "kLtx2UntiledMapStop", stops)
+    emit_i64_array(out, "kLtx2UntiledMapMaskLen", mask_lens)
+    # `repr`, not `%g`: `f"{1.0:.9g}"` is "1", and "1f" is not a C++ float literal.
+    out.write(
+        "inline constexpr float kLtx2UntiledMapMaskValue[] = {"
+        + ", ".join(f"{float(v)!r}f" for v in mask_values)
+        + "};\n\n"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Section 4 — the axis mappers (video_vae.py:549-555, 586-592)
 # ---------------------------------------------------------------------------
@@ -473,6 +565,17 @@ def _decode_arm(out, out_prefix: str, causal: bool, name_prefix: str) -> None:
         tiled = torch.cat(chunks, dim=2)
         control_chunks = list(decoder.tiled_decode(latent, _control_config()))
         control = torch.cat(control_chunks, dim=2)
+        untiled_spatial_chunks = list(decoder.tiled_decode(latent, _untiled_spatial_config()))
+        untiled_spatial = torch.cat(untiled_spatial_chunks, dim=2)
+    # And the arm upstream CANNOT run, recorded as the exception type it raises
+    # rather than as prose. `emit_scalar` of the boolean is what the C++ refusal
+    # test asserts its own refusal against.
+    try:
+        with torch.no_grad():
+            list(decoder.tiled_decode(latent, _untiled_axes_config()))
+        untiled_frames_raises = 0
+    except TypeError:
+        untiled_frames_raises = 1
 
     tiles = _prepare_tiles(TILING_LATENT, _tiling_config())
     groups = group_tiles_by_temporal_slice(tiles)
@@ -511,8 +614,19 @@ def _decode_arm(out, out_prefix: str, causal: bool, name_prefix: str) -> None:
     control_gap = float(np.max(np.abs(untiled.numpy() - control.numpy())))
     G.emit_scalar(out, out_prefix + "ControlChunkCount", len(control_chunks))
     out.write(
-        f"inline constexpr double {out_prefix}UpstreamControlVsUntiled = {control_gap:.9g};\n\n"
+        f"inline constexpr double {out_prefix}UpstreamControlVsUntiled = {control_gap:.9g};\n"
     )
+    # THE UNTILED-SPATIAL CONTROL. Same bound, different code path: `tile_size = 0`
+    # routes height and width through `DEFAULT_MAPPING_OPERATION` and its length-1
+    # broadcast mask, which the 10_000 control above never touches.
+    untiled_spatial_gap = float(np.max(np.abs(untiled.numpy() - untiled_spatial.numpy())))
+    G.emit_scalar(out, out_prefix + "UntiledSpatialChunkCount", len(untiled_spatial_chunks))
+    out.write(
+        f"inline constexpr double {out_prefix}UpstreamUntiledSpatialVsUntiled = "
+        f"{untiled_spatial_gap:.9g};\n"
+    )
+    G.emit_scalar(out, out_prefix + "UpstreamUntiledFramesRaises", untiled_frames_raises)
+    out.write("\n")
 
 
 def section_decode(out) -> None:
@@ -571,6 +685,7 @@ def main() -> int:
         out.write("\n")
         section_splits(out)
         section_auto_layout(out)
+        section_untiled_mapping(out)
         section_mappers(out)
         out.write("\n")
         section_complementary(out)

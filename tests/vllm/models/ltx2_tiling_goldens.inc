@@ -134,6 +134,23 @@ inline constexpr int64_t kLtx2AutoCases[] = {
     768, 64, 80, 24, 2, 2, 2, 2,
 };
 
+// --- section 3b: the UNTILED-AXIS mapping arm — `DEFAULT_MAPPING_OPERATION`
+// (tiling.py:126-132) with `untiled_mask_1d` (tiling.py:121-123). Reached by
+// `tile_size = 0`, which is legal (tiling.py:619-645) and is a DIFFERENT path
+// from a huge tile size: that one still installs the real mapper. Order is
+// {frames, height, width}; a stop of -1 is upstream's `slice(0, None)`. ---
+inline constexpr int64_t kLtx2UntiledMapTileCount = 1;
+inline constexpr int64_t kLtx2UntiledMapStart[] = {
+    0, 0, 0,
+};
+inline constexpr int64_t kLtx2UntiledMapStop[] = {
+    -1, -1, -1,
+};
+inline constexpr int64_t kLtx2UntiledMapMaskLen[] = {
+    1, 1, 1,
+};
+inline constexpr float kLtx2UntiledMapMaskValue[] = {1.0f, 1.0f, 1.0f};
+
 // --- section 4: the axis mappers (video_vae.py:549-555, 586-592) ---
 inline constexpr int64_t kLtx2MapCaseCount = 8;
 inline constexpr int64_t kLtx2MapCaseParams[] = {
@@ -17866,6 +17883,9 @@ inline constexpr double kLtx2TileDecCausalUpstreamTiledVsUntiled = 2.13274002;
 inline constexpr double kLtx2TileDecCausalOutputSpan = 2.31735897;
 inline constexpr int64_t kLtx2TileDecCausalControlChunkCount = 1;
 inline constexpr double kLtx2TileDecCausalUpstreamControlVsUntiled = 0;
+inline constexpr int64_t kLtx2TileDecCausalUntiledSpatialChunkCount = 1;
+inline constexpr double kLtx2TileDecCausalUpstreamUntiledSpatialVsUntiled = 0;
+inline constexpr int64_t kLtx2TileDecCausalUpstreamUntiledFramesRaises = 1;
 
 // --- section 7: the same, NON-CAUSAL — the polarity the shipped
 // ltx-2.5-video-vae-conv checkpoint actually sets (`causal_decoder: false`),
@@ -35340,5 +35360,8 @@ inline constexpr double kLtx2TileDecNonCausalUpstreamTiledVsUntiled = 2.07932711
 inline constexpr double kLtx2TileDecNonCausalOutputSpan = 2.14835119;
 inline constexpr int64_t kLtx2TileDecNonCausalControlChunkCount = 1;
 inline constexpr double kLtx2TileDecNonCausalUpstreamControlVsUntiled = 0;
+inline constexpr int64_t kLtx2TileDecNonCausalUntiledSpatialChunkCount = 1;
+inline constexpr double kLtx2TileDecNonCausalUpstreamUntiledSpatialVsUntiled = 0;
+inline constexpr int64_t kLtx2TileDecNonCausalUpstreamUntiledFramesRaises = 1;
 
 }  // namespace vllm_test

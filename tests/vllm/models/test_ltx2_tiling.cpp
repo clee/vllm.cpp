@@ -25,10 +25,34 @@
 //      golden rather than assumed. This is the property that makes routing the
 //      pipeline through the streaming entry point safe at every size where the
 //      AUTO layout does not tile, which today is every resolution this project
-//      has run (see the 448x256/25f row of the AUTO sweep below).
+//      has run (see the 448x256/25f row of the AUTO sweep below). It is a bound,
+//      not a blanket: the AUTO layout DOES tile at 896x512 and DOES chunk at
+//      **81 frames**, so 81..120 frames — which contains the recipe default's
+//      121 — is outside it, and a render there is a different image. Measured on
+//      the shipped checkpoint in .agents/specs/ltx25-tiled-decode.md §0.
+//   B'. The UNTILED-AXIS control is exact too, through the OTHER mapper branch
+//      (`tile_size == 0` -> `DEFAULT_MAPPING_OPERATION`). Without it, zeroing the
+//      broadcast mask renders a black clip and this whole suite stays green.
 //   C. The tiled-vs-untiled gap is UPSTREAM's own number, held to the golden band.
 //      A port that blends differently — a hard cut instead of a ramp, say — moves
 //      A and C together, which is the mutation recorded in the spec.
+//
+// ─── WHAT THE FIXTURE IS NOT: IT CARRIES A `res_x_y`, THE SHIPPED LADDER DOES NOT
+// `TilingFixtureConfig` below builds res_x / compress_all / **res_x_y** /
+// compress_space / compress_time / res_x. `res_x_y` builds
+// `norm3 = nn.GroupNorm(num_groups=1, ...)` (resnet.py:91-97) — a GLOBAL reduction
+// over all of (C, T, H, W) — and the shipped `ltx-2.5-video-vae-conv` ladder has
+// none (its blocks are res_x and compress_* only; see §0 of the row's spec, read
+// from the checkpoint's own `__metadata__["config"]`).
+//
+// That matters for exactly one claim and no other: a decoder containing a global
+// norm cannot have a local tiled approximation, so it INFLATES the tiled-vs-untiled
+// gap (C) relative to the shipped ladder. It does not weaken A or B — our output
+// is compared against upstream running the SAME fixture, and the one-tile and
+// untiled-axis controls are exact on both. The res_x_y-free ladder is swept by
+// scripts/probe_ltx2_tiled_vs_untiled_shipped_ladder.py and reaches the same
+// conclusion, which is why the gap is reported as upstream's own number rather
+// than bounded.
 //
 // Tolerances use `.scale(0.0)` nowhere because no doctest::Approx appears here;
 // every comparison is an explicit max|diff| against a named band.
@@ -215,6 +239,34 @@ vllm::Ltx2TileSizeConfig ControlTiling() {
   cfg.frames = vllm::Ltx2DimensionSizeConfig{10000, 0};
   cfg.height = vllm::Ltx2DimensionSizeConfig{10000, 0};
   cfg.width = vllm::Ltx2DimensionSizeConfig{10000, 0};
+  return cfg;
+}
+
+// The generator's UNTILED_SPATIAL arm, and it is NOT the control above.
+//
+// `tile_size == 0` declares the axis UNTILED, so `Ltx2CreateTiles` replaces the
+// real mapper with the broadcast one (`DEFAULT_MAPPING_OPERATION`,
+// tiling.py:126-132). `tile_size == 10000` still declares the axis TILED and the
+// split merely short-circuits, so the real mapper runs. Those are two different
+// branches of `Ltx2CreateTiles`, and until this config existed nothing in the
+// suite entered the untiled one — a mask of {0.0f} there multiplies the whole
+// decoded volume by zero, i.e. renders a BLACK CLIP, and every assertion in this
+// file still passed.
+vllm::Ltx2TileSizeConfig UntiledSpatialTiling() {
+  vllm::Ltx2TileSizeConfig cfg;
+  cfg.frames = vllm::Ltx2DimensionSizeConfig{10000, 0};
+  cfg.height = vllm::Ltx2DimensionSizeConfig{0, 0};
+  cfg.width = vllm::Ltx2DimensionSizeConfig{0, 0};
+  return cfg;
+}
+
+// All three axes untiled: legal to `create_tiles`, and FATAL to upstream's
+// `tiled_decode`. See the refusal case below.
+vllm::Ltx2TileSizeConfig UntiledAxesTiling() {
+  vllm::Ltx2TileSizeConfig cfg;
+  cfg.frames = vllm::Ltx2DimensionSizeConfig{0, 0};
+  cfg.height = vllm::Ltx2DimensionSizeConfig{0, 0};
+  cfg.width = vllm::Ltx2DimensionSizeConfig{0, 0};
   return cfg;
 }
 
@@ -457,6 +509,69 @@ TEST_CASE("ltx2 tiling: the CONV AUTO layout matches upstream, and is a NO-OP be
   // construction, and so would one that never sees the 448x256 row.
   CHECK(saw_untiled_448);
   CHECK(saw_tiled_somewhere);
+
+  // AND THE AUTO LAYOUT NEVER DECLARES AN AXIS UNTILED, which is why the
+  // untiled-mapper branch below needs a case of its own rather than a resolution.
+  for (int64_t c = 0; c < vllm_test::kLtx2AutoCaseCount; ++c) {
+    const int64_t* row = vllm_test::kLtx2AutoCases + c * vllm_test::kLtx2AutoCaseStride;
+    const vllm::Ltx2TileSizeConfig cfg = vllm::Ltx2AutoTileSizeConfig(row[1], row[0], factors);
+    CHECK(cfg.frames.IsTiled());
+    CHECK(cfg.height.IsTiled());
+    CHECK(cfg.width.IsTiled());
+  }
+}
+
+TEST_CASE("ltx2 tiling: an UNTILED axis maps through the broadcast mask, not the ramp") {
+  // Section 3b of the goldens: upstream's `DEFAULT_MAPPING_OPERATION`
+  // (tiling.py:126-132), executed on an all-untiled `TileSizeConfig`. Its
+  // out-slice is `slice(0, None)` and its mask is `untiled_mask_1d()` — length-1
+  // ones that BROADCAST (tiling.py:121-123).
+  //
+  // This is the arm the shipped `Ltx2AutoTileSizeConfig` never reaches and that
+  // `ControlTiling` (10000/0) does not reach either, because a huge tile still
+  // declares the axis tiled. A `{0.0f}` mask here is a black clip.
+  const vllm::Ltx2ConvVideoDecoderConfig cfg =
+      TilingFixtureConfig(/*causal=*/false, "ltx2.tiledec.noncausal.");
+  const vllm::Ltx2ScaleFactors factors =
+      vllm::Ltx2VideoScaleFactorsFromBlocks(cfg.decoder_blocks, cfg.patch_size);
+
+  const std::vector<vllm::Ltx2Tile> tiles =
+      vllm::Ltx2CreateTiles(kLatentT, kLatentH, kLatentW, UntiledAxesTiling(), factors);
+  REQUIRE(static_cast<int64_t>(tiles.size()) == vllm_test::kLtx2UntiledMapTileCount);
+
+  // Upstream's `None` stop has no integer to compare against; -1 is emitted for
+  // it and the concrete stop this port computes must be the FULL axis extent,
+  // which is what `slice(0, None)` means for a tensor of that shape.
+  const int64_t full[3] = {(kLatentT - 1) * factors.time + 1, kLatentH * factors.height,
+                           kLatentW * factors.width};
+  const vllm::Ltx2AxisMapping* axes[3] = {&tiles[0].out_t, &tiles[0].out_h, &tiles[0].out_w};
+  const char* names[3] = {"frames", "height", "width"};
+  for (int a = 0; a < 3; ++a) {
+    INFO("untiled axis " << names[a]);
+    CHECK(axes[a]->start == vllm_test::kLtx2UntiledMapStart[a]);
+    REQUIRE(vllm_test::kLtx2UntiledMapStop[a] == -1);
+    CHECK(axes[a]->stop == full[a]);
+    CHECK(static_cast<int64_t>(axes[a]->mask.size()) == vllm_test::kLtx2UntiledMapMaskLen[a]);
+    REQUIRE(!axes[a]->mask.empty());
+    CHECK(axes[a]->mask[0] == vllm_test::kLtx2UntiledMapMaskValue[a]);
+  }
+
+  // Guard the guard: the golden must be the BROADCAST value, not zero, or the
+  // three assertions above would accept the black-clip mutation they exist to
+  // catch by simply moving with it.
+  for (int a = 0; a < 3; ++a) {
+    CHECK(vllm_test::kLtx2UntiledMapMaskLen[a] == 1);
+    CHECK(vllm_test::kLtx2UntiledMapMaskValue[a] == 1.0f);
+  }
+
+  // And it is a DIFFERENT branch from the 10000/0 control: that one declares the
+  // axis tiled, so the real mapper runs and the mask is a full-length ramp.
+  const std::vector<vllm::Ltx2Tile> control =
+      vllm::Ltx2CreateTiles(kLatentT, kLatentH, kLatentW, ControlTiling(), factors);
+  REQUIRE(control.size() == 1u);
+  CHECK(control[0].out_h.mask.size() > 1u);
+  CHECK(control[0].out_w.mask.size() > 1u);
+  CHECK(control[0].out_t.mask.size() > 1u);
 }
 
 TEST_CASE("ltx2 tiling: the temporal and spatial axis mappers are NOT interchangeable") {
@@ -566,7 +681,8 @@ void RunDecodeArm(bool causal, const std::string& prefix, const char* const* par
                   int64_t complementary, const int64_t* chunk_frames, int64_t chunk_count,
                   const float* untiled_golden, size_t untiled_size, const float* tiled_golden,
                   size_t tiled_size, double upstream_gap, double upstream_control_gap,
-                  int64_t control_chunk_count) {
+                  int64_t control_chunk_count, double upstream_untiled_spatial_gap,
+                  int64_t untiled_spatial_chunk_count, int64_t upstream_untiled_frames_raises) {
   const vllm::Ltx2ConvVideoDecoderConfig cfg = TilingFixtureConfig(causal, prefix);
   ParamBag bag = BuildFixtureParams(cfg);
   CheckManifest(bag, param_names, param_counts, param_size);
@@ -654,6 +770,45 @@ void RunDecodeArm(bool causal, const std::string& prefix, const char* const* par
       MaxAbsDiff(control_frames.data, untiled.data.data(), untiled.data.size());
   INFO("one-tile control max|diff| vs untiled = " << control_gap);
   CHECK(control_gap == 0.0);
+
+  // (B'') THE UNTILED-SPATIAL CONTROL — the same bound through the OTHER branch.
+  //
+  // Height and width declared untiled (`tile_size == 0`) send `Ltx2CreateTiles`
+  // through the broadcast mapper instead of `Ltx2MapSpatialSlice`. Upstream runs
+  // this config and reproduces `forward` exactly; a `{0.0f}` broadcast mask would
+  // render the entire clip black and, before this arm existed, would still have
+  // left every case in this file green.
+  CHECK(upstream_untiled_spatial_gap == 0.0);
+  Collected untiled_spatial;
+  vllm::Ltx2ConvVideoDecodeTiled(
+      cfg, bag.weights, latent, cfg.in_channels, kLatentT, kLatentH, kLatentW, &noise,
+      UntiledSpatialTiling(),
+      [&](const vllm::Ltx2VideoChunk& c) { untiled_spatial.chunks.push_back(c); });
+  CHECK(static_cast<int64_t>(untiled_spatial.chunks.size()) == untiled_spatial_chunk_count);
+  const vllm::Ltx2VideoFrames untiled_spatial_frames = untiled_spatial.Concat();
+  REQUIRE(untiled_spatial_frames.data.size() == untiled.data.size());
+  const double untiled_spatial_gap =
+      MaxAbsDiff(untiled_spatial_frames.data, untiled.data.data(), untiled.data.size());
+  INFO("untiled-spatial control max|diff| vs untiled = " << untiled_spatial_gap);
+  CHECK(untiled_spatial_gap == upstream_untiled_spatial_gap);
+  // The config really did take the broadcast branch, or the assertion above is
+  // just the one-tile control wearing a different name.
+  const std::vector<vllm::Ltx2Tile> untiled_spatial_tiles =
+      vllm::Ltx2CreateTiles(kLatentT, kLatentH, kLatentW, UntiledSpatialTiling(), factors);
+  REQUIRE(untiled_spatial_tiles.size() == 1u);
+  CHECK(untiled_spatial_tiles[0].out_h.mask.size() == 1u);
+  CHECK(untiled_spatial_tiles[0].out_w.mask.size() == 1u);
+
+  // ...and the FRAMES axis is refused, because upstream's own `tiled_decode`
+  // cannot run it: `DEFAULT_MAPPING_OPERATION` hands it `slice(0, None)` and
+  // conv_video_decoder.py:424 subtracts that `None`. The golden records that
+  // upstream raises, so this is a mirrored refusal and not a local policy.
+  CHECK(upstream_untiled_frames_raises == 1);
+  int64_t refused_emitted = 0;
+  CHECK_THROWS(vllm::Ltx2ConvVideoDecodeTiled(
+      cfg, bag.weights, latent, cfg.in_channels, kLatentT, kLatentH, kLatentW, &noise,
+      UntiledAxesTiling(), [&](const vllm::Ltx2VideoChunk&) { ++refused_emitted; }));
+  CHECK(refused_emitted == 0);
 }
 
 }  // namespace
@@ -671,7 +826,10 @@ TEST_CASE("ltx2 tiled decode matches upstream ltx_core — CAUSAL") {
       vllm_test::kLtx2TileDecCausalTiled, std::size(vllm_test::kLtx2TileDecCausalTiled),
       vllm_test::kLtx2TileDecCausalUpstreamTiledVsUntiled,
       vllm_test::kLtx2TileDecCausalUpstreamControlVsUntiled,
-      vllm_test::kLtx2TileDecCausalControlChunkCount);
+      vllm_test::kLtx2TileDecCausalControlChunkCount,
+      vllm_test::kLtx2TileDecCausalUpstreamUntiledSpatialVsUntiled,
+      vllm_test::kLtx2TileDecCausalUntiledSpatialChunkCount,
+      vllm_test::kLtx2TileDecCausalUpstreamUntiledFramesRaises);
 }
 
 TEST_CASE("ltx2 tiled decode matches upstream ltx_core — NON-CAUSAL, the shipped polarity") {
@@ -690,7 +848,10 @@ TEST_CASE("ltx2 tiled decode matches upstream ltx_core — NON-CAUSAL, the shipp
       vllm_test::kLtx2TileDecNonCausalTiled, std::size(vllm_test::kLtx2TileDecNonCausalTiled),
       vllm_test::kLtx2TileDecNonCausalUpstreamTiledVsUntiled,
       vllm_test::kLtx2TileDecNonCausalUpstreamControlVsUntiled,
-      vllm_test::kLtx2TileDecNonCausalControlChunkCount);
+      vllm_test::kLtx2TileDecNonCausalControlChunkCount,
+      vllm_test::kLtx2TileDecNonCausalUpstreamUntiledSpatialVsUntiled,
+      vllm_test::kLtx2TileDecNonCausalUntiledSpatialChunkCount,
+      vllm_test::kLtx2TileDecNonCausalUpstreamUntiledFramesRaises);
 }
 
 TEST_CASE("ltx2 tiled decode: the diffusion decoder is REFUSED, never downgraded") {

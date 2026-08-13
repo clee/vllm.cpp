@@ -4,6 +4,22 @@
 // 448x256/25f latent, while a sampler thread reads /proc/self/status VmRSS/VmHWM
 // and /proc/meminfo MemAvailable every 50 ms. Touches NO product code, so it
 // cannot perturb what it measures.
+//
+// ─── BUILD AND RUN (there is no CMake target; this is the recorded recipe) ───
+// It is deliberately NOT a CMake target: the global `operator new` replacement
+// below would be linked into anything sharing the target's objects, and adding it
+// to the default build would charge every configure for a probe. So the recipe is
+// written down instead of implied — a reviewer cannot re-run a probe whose compile
+// line was never recorded, which is exactly the finding this comment closes.
+//
+//   cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+//   ninja -C build vllm
+//   g++ -O2 -std=c++20 -Iinclude -Ithird_party \
+//       scripts/probe_ltx2_decode_memory.cpp build/libvllm.a -o /tmp/ltx2_mem -pthread
+//   /tmp/ltx2_mem <vae.safetensors> <lat_t> <lat_h> <lat_w>
+//
+// e.g. 448x256/25f on the shipped conv VAE is `... 4 8 14`. The sibling
+// scripts/probe_ltx2_tiled_equivalence.cpp builds with the identical line.
 #include <malloc.h>
 
 #include <atomic>
