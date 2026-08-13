@@ -1,8 +1,10 @@
 # `POOL-DEVICE-KEY` — put the DEVICE in the `vllm::Pool()` free-list key
 
 **Issue:** [#516](https://github.com/mudler/vllm.cpp/issues/516) (open).
-**Row:** `POOL-DEVICE-KEY`. **Base:** `row/MODEL-DIFFUSION-LTX25`, REBASED onto
-`2d437d5a9` (which contains `origin/main`) from the stale `aac24761`.
+**Row:** `POOL-DEVICE-KEY`. **Base:** `row/MODEL-DIFFUSION-LTX25` @ `310fa1688`,
+REBASED there from the stale `aac24761`, which was not an ancestor of
+`origin/main` (§11 F1). The dgx pair in §11 was measured one campaign move
+earlier, at `aa6aa0ecd`; §11 says why that is still the right pair.
 **Owning file:** this spec. **Status at write time:** spec committed before any
 implementation, per AGENTS.md "Spec before code".
 
@@ -25,8 +27,16 @@ the tree the moment this merged. `docs/BENCHMARKS.md` is deliberately NOT
 written: this row claims no measurement on any speed, latency or memory axis
 (§6), and a row with nothing to record there records nothing there.
 
-Open, and named rather than closed by assertion: eight of the nine dgx `ctest`
-failures in §10 stay UNATTRIBUTED pending the BEFORE/AFTER pair described there.
+§10's nine UNATTRIBUTED dgx failures are no longer open against this row: the
+BEFORE/AFTER pair in §11 reproduces all nine on the base WITHOUT this change, so
+they are measured pre-existing and belong to whoever owns those suites. The one
+test that moves is `test_minimax_h3`, SEGFAULT → Passed, which is
+[#486](https://github.com/mudler/vllm.cpp/issues/486).
+
+Still not established, and not claimed: why a host `aligned_alloc` block yields
+a uniform quiet NaN on GB10 rather than running correct-but-slow through ATS
+(§7). `MoeAuxStreamFor`'s index-only aux-stream key is a recorded latent trap of
+the same family, deliberately not widened into here.
 
 ## 1. Scope
 
@@ -473,8 +483,222 @@ a latent trap of this same family rather than a live defect, and widening this
 diff to it was not worth the review surface. Recorded here so the next reader
 finds it.
 
-**Owed, and outside this row's granted scope** (this spec was the only record
-surface granted): the `#516` line in the issue table of `.agents/roadmap_v1.md`,
-and the `porting-inventory.md` §L8 note at line 1455 which still reads "the
-shared `DevicePool` is DEVICE-BLIND … repairing it is owed as its own row" and
-should now point at this spec.
+**Owed at the time of §10, and PAID in §11:** the `#516` line in the issue table
+of `.agents/roadmap_v1.md`, and the `porting-inventory.md` §L8 note which read
+"the shared `DevicePool` is DEVICE-BLIND … repairing it is owed as its own row".
+
+## 11. Review round: the landing state, and the dgx pair §10 could not get
+
+A fresh review PASSED the fix and FAILED the landing state. Six findings; all
+six closed. The endorsed code — the device key, `ReleaseShared`, both workaround
+removals, `test_device_pool` — is unchanged in behaviour.
+
+### F1 — the base was stale, and its resolution would have reverted main
+
+The row was based on `aac24761`, which is **not an ancestor of `origin/main`**,
+and `git merge-tree origin/main 7336def93` CONFLICTED in `device_pool.h`. Main
+had changed that same file in `49539559d` / `8fa2ecdbb` (Windows contracts,
+[#117](https://github.com/mudler/vllm.cpp/issues/117)) three ways the reviewed
+header lacked: `__builtin_clzll` → `std::bit_width`, an `std::overflow_error`
+guard in `ClassOf`, and `static size_t SizeClassForTest(size_t)`. Taking the
+row's side of that hunk — the heavily rewritten side, which is what a resolver
+reaches for — would have silently reverted the portability fix and the overflow
+guard, and `tests/vt/test_cpu_isa_x86.cpp` calls `SizeClassForTest` **nine**
+times including `CHECK_THROWS_AS(…, std::overflow_error)`, so the tree would not
+have compiled.
+
+Rebased onto `row/MODEL-DIFFUSION-LTX25`, which contains `origin/main`, and
+`device_pool.h` resolved BY HAND: all three of main's changes
+sit **on top of** the device-keyed rewrite. `git diff <reviewed head>..HEAD --
+device_pool.h` is exactly three code hunks (the two includes, `SizeClassForTest`,
+and the `ClassOf` body) plus the F4 comment. `test_cpu_isa_x86` is **6 cases /
+8242 assertions / SUCCESS**.
+
+**Every number in §10 was measured on a tree missing main's last 201 commits and
+none of it is carried forward.** The re-run caught drift §10 could not have seen:
+`test_ltx2_vae` is **36 cases / 3039 assertions**, not the 16/1816 §6 records,
+and `test_ltx2_loader` is **24 / 4817**, not 20/2363. Those are campaign-branch
+commits (`6c9374ebc`, the VAE encoders, and the L9A NVFP4 loader work); this row
+touches neither file. §6's baseline list is therefore stale by construction on a
+moving campaign branch — what this row can honestly assert is that it moves
+nothing, which the full 415/415 below and the dgx pair above both say.
+
+The rebase also caught a **new instance of this row's own defect**, added to the
+campaign branch after the row was written: `ltx2_video.cpp:1154` called
+`ActivePool()->Drain(backend)` — "the pool" resolved with no device, then drained
+through a backend that may not have allocated its blocks. It is now
+`ActivePool(backend).Drain(backend)`, and the old form is no longer spellable.
+That is the argument for D1 restated by events: the removal of the no-argument
+accessor is the fix; the free-list key alone would not have caught this.
+
+### F3 — the dgx BEFORE/AFTER pair, which §10 reported as not run
+
+Both arms on dgx.casa (GB10 sm_121a, CUDA 13.0.88), same session, back to back,
+`ctest -j 1`, CLEAN builds (`rm -rf build`) from the SAME base, all three
+MANDATORY confirmations printed for each (`CUTLASS found at ~/cutlass-4.5.0`,
+`FlashAttention-2 … ENABLED for arch(es) [121a]`, six `MANIFEST hashes OK`
+vendored Triton trees). `BUILD_EXIT=0` and zero `No space left`/`BFD assertion`
+in both build logs and both ctest logs.
+
+| | BEFORE (`aa6aa0ecd`, no fix) | AFTER (this branch) |
+|---|---|---|
+| build | `BUILD_EXIT=0`, 34 GB tree | `BUILD_EXIT=0`, 34 GB tree |
+| lock | acquired 08:26:13Z, released 09:22:00Z | waited 13m45s, acquired 09:40:20Z, released 10:34:02Z |
+| disk at start / end | 62 GB free (99%) / 62 GB | 96 GB free (98%) / 60 GB |
+| result | **10 failed of 449** | **9 failed of 450** |
+
+**The denominators differ by one because this row ADDS a test.** 449 → 450 is
+`test_device_pool` existing in the AFTER arm and not in the BEFORE one; it is not
+drift, and comparing 10-of-449 against 9-of-450 without that reads one test off.
+The like-for-like statement is on the 449 tests both arms share: **10 failures
+before, 9 after, and the one that leaves is `test_minimax_h3`.**
+
+| test | BEFORE | AFTER |
+|---|---|---|
+| `test_minimax_h3` | **`***Exception: SegFault` 11.73 s** (`ctest-before.log:51`) | **Passed 19.06 s** |
+| `test_device_pool` | (does not exist) | **Passed 0.25 s** (new test #50) |
+
+Every other failure is the same set in both arms, and **every one of them is
+already tracked by an existing issue** — checked, not assumed:
+
+| test | both arms | tracked by |
+|---|---|---|
+| `test_serve_low_tools` | Failed | [#233](https://github.com/mudler/vllm.cpp/issues/233) |
+| `test_linear_method` | Failed | [#233](https://github.com/mudler/vllm.cpp/issues/233) (`VT_MARLIN_DENSE` defaults ON, so `fused_gate_up` never increments) |
+| `test_glm4_moe_lite_paged_engine` | Failed | [#233](https://github.com/mudler/vllm.cpp/issues/233) (SACRED gate, token divergence) |
+| `test_capi` | **SEGFAULT** | [#248](https://github.com/mudler/vllm.cpp/issues/248) |
+| `test_ops_gdn` | Failed | [#305](https://github.com/mudler/vllm.cpp/issues/305), probably — see below |
+| `test_qwen3_apc_e2e` | Failed | [#248](https://github.com/mudler/vllm.cpp/issues/248) |
+| `test_minicpm3_paged_engine` | Failed | [#248](https://github.com/mudler/vllm.cpp/issues/248) |
+| `test_internlm2_paged_engine` | Failed | [#614](https://github.com/mudler/vllm.cpp/issues/614), filed by this row |
+| `test_llama_paged_engine` | Failed | [#248](https://github.com/mudler/vllm.cpp/issues/248) |
+
+**So all nine of §10's UNATTRIBUTED failures are now MEASURED pre-existing rather
+than argued.** Nothing in this diff moves any of them, the row does not claim to
+fix them, and they are named rather than adopted. This supersedes §10's "eight
+remain open" as a statement about this row.
+
+**`test_capi` is NOT the timing flake §10 called it, and that correction
+matters.** §10's flake evidence — `--repeat until-fail:8` passing 8/8 with wall
+times spanning 0.78 s to 339.88 s — was gathered on the **CPU host**, where the
+test fails without crashing. On dgx it **SEGFAULTs**, in **both** arms, in
+**1.95 s** (BEFORE) and **1.97 s** (AFTER), under `ctest -j 1`. A sub-2-second
+segfault is not a three-orders-of-magnitude timing spread, and #248 says so
+directly: "`test_capi` is not the documented flake … this run was `ctest -j 1`,
+so that explanation is unavailable and the SIGSEGV needs a real diagnosis." It is
+pre-existing here either way, but it goes back to #248 as a crash, not into a
+flake story it does not fit. Whether the two arms' crashes are the SAME crash is
+**not established**: neither `LastTest.log` survives (both 34 GB build trees were
+deleted to keep a 98%-full box under control) and these runs were plain
+`ctest -j 1` without `--output-on-failure`, so the only recorded evidence is the
+signal, the test index and the duration.
+
+**`test_internlm2_paged_engine` had no issue at all**, so this row filed
+[#614](https://github.com/mudler/vllm.cpp/issues/614) rather than folding it
+into a neighbour's: #248 lists four
+paged-engine-family failures and this is not among them, and a search over open
+and closed issues returns nothing. `test_ops_gdn` is attributed to #305 only
+tentatively — #305 is a `conv_state` cross-block race and §10 recorded this
+failure as `:728 CHECK( bad == 0 )` → `2609 == 0`, a numeric check that may or
+may not be that race — so it is recorded as probable, not confirmed.
+
+It also **re-confirms #486 in both directions on one box**: SEGFAULT with the
+pool device-blind, Passed with it device-keyed, same binary recipe, same lock,
+14 minutes apart. §10 asserted this from two separate sessions; it is now one
+paired measurement.
+
+The build trees were deleted after each arm (the box was at 98–99% throughout).
+
+**The pair was measured at base `aa6aa0ecd`; the branch is now rebased onto
+`310fa1688`, fifteen commits later.** Chasing a moving campaign branch with a
+five-hour paired CUDA gate does not terminate, so the honest thing is to name the
+base the pair was taken at and say what would invalidate it. What the pair
+measures is THIS ROW'S delta against a common base, and the fifteen intervening
+commits are LTX-2.5 loader/VAE/NVFP4 work plus their goldens and specs: none
+touches `device_pool.h`, `dense_device_glue.h`, the `DBuf` deleters, or any pool
+accessor, and a tree-wide sweep for a device-less `Pool()` / `AuxPool()` /
+`ActivePool()` spelling comes back empty on the new base. The CPU gate below WAS
+re-run in full on `310fa1688`. A campaign commit that touched the pool would
+invalidate the pair and is the one thing to re-check before merging.
+
+### F4 — a genuine hazard, but LATENT, and the assertions said "live"
+
+`device_pool.h`, `dense_device_glue.h` and §4 D4 claimed the old deleter idiom
+also returned AUX-pool blocks to the MAIN pool as a *live* second bug. Enumerated
+at the base: none of the nine `Release()` sites (`gemma4_moe.cpp:1197,1541`,
+`qwen3_5.cpp:6324,6520,6820,7100,7134,8034,8065`) is inside or transitively under
+any of the four `ActivePoolScope` regions (`laguna.cpp:2574`,
+`qwen3_5.cpp:5468,8644,8964`), which are leaf-ward of all of them. All three now
+say "would have" / latent. `ReleaseShared` is unchanged: a hazard one call site
+away from real is worth removing structurally, and `ltx2_video.cpp` above is that
+call site arriving.
+
+### F5 — the suite reds under the lane §10 recommends
+
+`VT_POOL_EXACT=1` was 7/8 and `VT_POOL_BYPASS=1` was 3/8 at the reviewed head,
+and §10 hands `VT_POOL_BYPASS=1` to the next reader as "the cheap discriminator
+that needs no second build". A suite that reds under the lane it recommends
+costs that reader an hour deciding whose red it is. Every affected case now
+states the ACTIVE lane's behaviour, and the size-class case states SEPARATION
+under `VT_POOL_EXACT` — §5 T1.3's second clause, promised since the spec was
+written and asserted nowhere. All three lanes are green:
+
+| lane | result |
+|---|---|
+| default | 9 cases / 30 assertions / SUCCESS (also `--order-by=rand` seeds 1 and 7) |
+| `VT_POOL_BYPASS=1` | 9 / 24 / SUCCESS |
+| `VT_POOL_EXACT=1` | 9 / 31 / SUCCESS |
+
+### F6 — a new throw with no test, and one un-bounded index
+
+D5's per-device-type memoization turned `platforms::GetPlatform` into a
+per-type call, so a backend whose platform was never registered now throws where
+it used to inherit the first device's cap. That is correct — a cap read off
+another platform is a wrong number, not a default — and it had no test. T1.7
+covers it on `kXPU`, the one `DeviceType` with no `RegisterPlatform` call in the
+tree, with a `REQUIRE_FALSE(HasPlatform(kXPU))` precondition so the case goes RED
+and asks to be re-pointed if an XPU platform ever lands. The
+`cached[static_cast<size_t>(type)]` index gains the same `VT_CHECK` bound
+`platforms::Index()` (`platform.cpp:40-44`) applies to that identical value, in
+both mirrored copies.
+
+### Mutation evidence for the NEW assertions
+
+Product mutated in place, focused suite rebuilt and run, tree restored
+byte-for-byte (md5 verified) after each:
+
+| mutation | result |
+|---|---|
+| `ResolveDevicePoolPolicy` returns cap 0 for an unregistered platform | 8 passed / **1 failed** — T1.7 only, `CHECK_THROWS_AS … did NOT throw at all!` |
+| `ClassOf` ignores `VT_POOL_EXACT` | under `VT_POOL_EXACT=1`: 8 passed / **1 failed**, 4 assertions — the size-class case only |
+| `Bypass()` forced `false` | under `VT_POOL_BYPASS=1`: 4 passed / **5 failed** |
+
+### Local gate, on the RESOLVED tree
+
+CPU host, at base `310fa1688`, CLEAN rebuild (`rm -rf build` — `device_pool.h`
+is a header and an incremental build masks `-Werror`): `CONFIGURE_EXIT=0`,
+`BUILD_EXIT=0`, **zero** `warning`, **zero** `No space left`/`BFD assertion`,
+`ctest -N` **415**, full `ctest` **415/415 passed, exit 0** (one skip,
+`test_voxtral_e2e`, checkpoint-gated). `test_cpu_isa_x86` — the suite F1's
+resolution had to keep compiling — **6 / 8242 / SUCCESS**. `test_ltx2_device`
+13/498 SUCCESS at default, `--order-by=name` and `--rand-seed=7`.
+`test_deepseek_v2_forward` 11/1052. `test_minimax_h3` 79/57395. `test_capi`
+55/505.
+
+`scripts/agent-preflight.sh` reports `doc-checkpoint range` FAIL on **three
+commits, none of them this row's** — `b0aa475a3`, `d67f8125e` and `aa6aa0ecd`,
+all pre-existing on the campaign branch and reproduced exactly by
+`check-doc-checkpoint.py --base origin/main --head origin/row/MODEL-DIFFUSION-LTX25`.
+Over this row's own range (`row/MODEL-DIFFUSION-LTX25..HEAD`) the same checker is
+OK. `test_cpu_x86_llamacpp_floor` failed once at local load average 28 and is
+10/10 OK standalone; it is a contention-sensitive harness test this diff does not
+reach.
+
+### What is still not established
+
+Why a host `aligned_alloc` block yields a uniform quiet NaN on GB10 rather than
+running correct-but-slow through ATS (§7, unchanged — the fix makes the ordering
+unreachable, so the question is academic for this row and is not claimed to be
+answered). `MoeAuxStreamFor`'s `d.q.device.index`-only key stays a recorded
+latent trap of the same family, not fixed here. The nine dgx failures above
+belong to other rows and are named, not adopted.
