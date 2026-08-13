@@ -1312,8 +1312,10 @@ TEST_CASE("ltx2 the constants the headers call pinned are actually pinned") {
   //     the argument does not make the default unreachable — the default IS the
   //     shipped width, which ltx2_upsampler.h has said all along. Only the
   //     Rational1p5 arm reaches it, because `BlurDownsample` runs on the
-  //     rational `den` (ltx2_upsampler.cpp:439) and 1.5 -> {3, 2} is the one
-  //     supported scale of the three with den != 1.
+  //     rational `den` (ltx2_upsampler.cpp:439) and 1.5 -> {3, 2} is the only
+  //     one of the THREE ARMS with den != 1. (0.75 -> {3, 4} would reach it too
+  //     and no arm covers it, so this is arm coverage, not a property of the
+  //     supported-scale map.)
   //
   // So the reason to keep this case is the narrower, real one: a golden
   // regenerated from a moved constant moves with it, and these two lines are the
