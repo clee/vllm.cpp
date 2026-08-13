@@ -699,9 +699,10 @@ internal constructor witness only in the fresh-process isolated OpenAI case
 found by its prefix probe. The helper restores the process environment before
 continuing; the ordinary prefix probes, complete OpenAI suite, staged server,
 and production invocations do not enable or inherit that diagnostic. Its
-ordered markers cover the model factory, engine and runner member construction,
-and indexed KV-cache allocation; Windows invalid-parameter and purecall faults
-flush their own marker and terminate through the CRT fallback.
+ordered markers cover guaranteed-elided model-factory construction, engine and
+runner member construction, and indexed KV-cache allocation; Windows
+invalid-parameter and purecall faults flush their own marker and terminate
+through the CRT fallback.
 
 The CUDA graph-replay profiler and its FIFO diagnostic controls remain
 POSIX-only and are not exposed by native Windows server builds. Native Windows
