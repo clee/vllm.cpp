@@ -952,8 +952,11 @@ TEST_CASE("ltx2 forward: the prompt-side AdaLN arm, with both masks") {
 // their output would reproduce the flag-OFF numbers exactly and pass nothing here.
 //
 // WHAT THIS FIXTURE'S NUMBERS ARE, AND ARE NOT. The generator's stderr and the
-// comment at the end of ltx2_goldens.inc report the term at 51.7% of the static
-// per-block table, the block-0 prompt K/V moving 5.82%, and the DiT output moving
+// comment at the end of ltx2_goldens.inc report the VIDEO stream's term at 51.7%
+// of its static per-block table — that ratio is emitted for the video stream ONLY,
+// and the audio stream's own value on the same fixture is 40.6%, so the 51.7% is
+// not a denominator for anything audio — the block-0 prompt K/V moving 5.82%, and
+// the DiT output moving
 // 1.46e-4 (73x kRoundOff). ALL FOUR are GATE-FLOOR numbers from SYNTHETIC weights,
 // not a claim about the trained checkpoint: the table and the prompt-AdaLN MLP are
 // both drawn at `param_spec`'s scale=0.05 (gen-ltx2-goldens.py:100-106), so every

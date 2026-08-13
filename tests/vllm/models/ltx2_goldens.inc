@@ -3231,8 +3231,8 @@ inline constexpr float kLtx2ForwardPromptAdalnMaskedAudio[] = {
 // Same shared weights, same inputs, flag ON vs OFF:
 //   DiT video output: max|on-off| = 0.000145674  (0.04% of max|off|)
 //   DiT audio output: max|on-off| = 7.36713e-05  (0.03% of max|off|)
-//   block 0 modulated prompt K/V: max|on-off| = 0.0309528  (5.82% of max|off|)
-//   timestep term vs static table: max|term| = 0.0252012 vs max|table| = 0.0487142  (51.7%)
+//   block 0 modulated prompt K/V (VIDEO stream): max|on-off| = 0.0309528  (5.82% of max|off|)
+//   timestep term vs static table (VIDEO stream): max|term| = 0.0252012 vs max|table| = 0.0487142  (51.7%)
 // ALL FOUR ROWS ARE GATE-FLOOR NUMBERS FROM SYNTHETIC WEIGHTS. The table and
 // the prompt-AdaLN MLP are BOTH drawn at param_spec's scale=0.05 above, so every
 // ratio here is a property of THIS FIXTURE and moves with that scale; the output

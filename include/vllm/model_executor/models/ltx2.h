@@ -60,11 +60,41 @@
 //         `_build_caption_projections` on the empty dict, BEFORE the flag at
 //         model_configurator.py:82 is ever read). What that file's flag resolves
 //         to therefore depends on a config it does not ship.
-//       * NVFP4 (first-party Lightricks): DECLARES the flag `true` and does NOT
-//         carry the tensor, so upstream's parameter stays its
-//         `torch.zeros(1, inner_dim)` initialiser (model.py:217-219) and
-//         `load_state_dict(..., strict=False)`
-//         (loader/single_gpu_model_builder.py:98) leaves it zero — a no-op.
+//       * NVFP4 (first-party Lightricks): DECLARES the flag `true` (at
+//         `config.transformer`, not at the top level) and does NOT carry the
+//         tensor — 0 of its 7876 entries match `keyframes_abs_pos`.
+//
+//         CORRECTED AGAIN 2026-08-13, same issue. This bullet said the parameter
+//         "stays its `torch.zeros(1, inner_dim)` initialiser (model.py:217-219)"
+//         and that `load_state_dict(..., strict=False)`
+//         (loader/single_gpu_model_builder.py:98) "leaves it zero — a no-op".
+//         IT IS NOT A NO-OP. That quote dropped the `assign=True` that is ON THE
+//         SAME LINE, and upstream builds on the META DEVICE — helpers.py:84-95,
+//         `create_meta_model`, `with torch.device("meta"):
+//         configurator.from_metadata(...)` at :90-91. A key absent from the state
+//         dict is never materialised at all. What this path leaves is an
+//         UNMATERIALISED META PARAMETER, not a silent zero.
+//         RUN 2026-08-13 through upstream's own `create_meta_model` on this
+//         file's real `__metadata__`: `[1, 4096]` f32 `device=meta`; after
+//         `load_state_dict(sd, strict=False, assign=True)` still `is_meta=True`,
+//         present in `missing_keys`, and reading it raises `RuntimeError:
+//         Tensor.item() cannot be called on meta tensors`.
+//         Upstream states this itself and then never asks:
+//         `supports_keyframes_abs_pos_embedding` (model.py:166-173) returns FALSE
+//         for "a model whose config set the flag but whose checkpoint carried no
+//         weight for it (the parameter would still be on `meta`)" (:170), and
+//         `enable_keyframes_abs_pos_embedding` (model.py:175-200) exists because
+//         such a parameter "would fail at the first forward" (:182). BOTH ARE
+//         DEFINED AND NEVER CALLED — one `grep -rn` hit each across the whole
+//         Lightricks/LTX-2 checkout at fd4ded7f, the definition itself.
+//         Polarity is not what fails: `apply_keyframes_absolute_embedding` is
+//         `hidden_states + mask * embedding` (transformer_args.py:23-43, the sum
+//         at :43), so REAL zeros would be inert. The claim fails on `meta`, not
+//         on additivity.
+//         This STRENGTHENS the refusals below rather than changing them: this
+//         file is refused by FLAG in `ParseLtx2DitParams` (ltx2.cpp:192-198) and
+//         the FP8 file by TENSOR PRESENCE, and upstream's own guard would report
+//         a model loaded this way as not supporting the feature at all.
 //     It is also NOT a keyframe-only feature: `transformer_args.py:269` applies it
 //     on EVERY prepare whenever `keyframes_mask` is non-None, and `tools.py:186-196`
 //     marks the target's first latent frame unconditionally.

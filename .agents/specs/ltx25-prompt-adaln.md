@@ -273,8 +273,8 @@ term and nothing else):
 
 | Quantity | Flag ON vs OFF |
 |---|---|
-| timestep term vs the static table it is added to | `max\|term\|` 0.0252 vs `max\|table\|` 0.0487 — 51.7% |
-| block-0 modulated prompt K/V | `max\|on-off\|` 0.0310 — 5.82% of `max\|off\|` |
+| timestep term vs the static table it is added to (**VIDEO stream**) | `max\|term\|` 0.0252 vs `max\|table\|` 0.0487 — 51.7% |
+| block-0 modulated prompt K/V (**VIDEO stream**) | `max\|on-off\|` 0.0310 — 5.82% of `max\|off\|` |
 | DiT video output (2 blocks) | 1.4567e-4 — 0.04% of `max\|off\|`, **73x** the gate's 2e-6 floor |
 | DiT audio output (2 blocks) | 7.367e-5 — 0.03%, **37x** the floor |
 
@@ -328,10 +328,53 @@ the perturbation.** What the pre-row renders applied was
 1.3170 (audio, **+31.3%**).
 
 **The synthetic fixture UNDERSTATES the real defect by two orders of magnitude.**
-Comparing like with like — the fixture's 51.7% is a `max\|term\|` / `max\|table\|`
-ratio, and that same ratio on the shipped weights is 7119% (video) and 2817%
-(audio): **138x and 54x** larger. Recorded because the original Outcome quoted
-"roughly half the magnitude" from the fixture as if it described the checkpoint.
+Comparing like with like — the fixture ratio is `max\|term\|` / `max\|table\|`,
+and so is the shipped-weights ratio — **per stream, each against its own fixture
+denominator**:
+
+| | fixture `max\|term\|`/`max\|table\|` | shipped | understatement |
+|---|---|---|---|
+| video (`prompt_adaln_single` vs `prompt_scale_shift_table`) | 51.7% | 7119% | **138x** |
+| audio (`audio_prompt_adaln_single` vs `audio_prompt_scale_shift_table`) | 40.6% | 2817% | **69x** |
+
+**CORRECTED 2026-08-13 (issue #644): this read "138x and 54x", which is not a
+per-stream pair.** The generator emits exactly ONE fixture ratio and it is the
+VIDEO stream's (`gen-ltx2-goldens.py`, `measure_prompt_adaln_magnitude`), so 54x
+divided the shipped AUDIO number by the VIDEO denominator. It is literally true
+about the single published figure and it errs CONSERVATIVE — the real audio
+understatement is larger. The audio stream's own fixture ratio, recomputed with
+the identical statistic on the identical fixture (the generator is imported, so
+the weight stream is bit-identical), is **40.6%** — `max|term|` 0.0201763 vs
+`max|table|` 0.0496868 — giving **2817 / 40.6 = 69x**. The video row is
+unchanged and was always like-for-like: `max|term|` 0.0252012 vs `max|table|`
+0.0487142 = 51.7327%, and 7119 / 51.73 = 137.6.
+
+Reproduce the audio denominator by importing the generator and asking it the same
+question the video row is built from (`measure_prompt_adaln_magnitude`), so no
+weight is re-drawn:
+
+```python
+gen.load_upstream(LTX2); torch.set_grad_enabled(False)
+on = gen.build_model("split", False, prompt_adaln=True)
+video, audio = gen.build_modalities(False)
+scale = float(gen.ARCH["timestep_scale_multiplier"])
+amod, _ = on.audio_prompt_adaln_single((audio.sigma * scale).flatten(), hidden_dtype=torch.float32)
+amod.abs().max() / on.transformer_blocks[0].audio_prompt_scale_shift_table.abs().max()
+```
+
+**Fixed at the source, not only in prose.** The generator emitted both video-only
+rows unlabelled, which is how a video denominator came to be applied to an audio
+numerator; `gen-ltx2-goldens.py` now names the stream on both, and
+`ltx2_goldens.inc` was REGENERATED against `ltx_core` `fd4ded7f` to carry them.
+The regeneration diff is those two comment lines and nothing else — every golden
+VALUE byte-identical, and the `Regenerate with:` header unchanged because the
+committed command was re-run verbatim, so this re-proves provenance as well as
+the labels. `test_ltx2.cpp` says the same. No fifth golden was added: the audio
+figure is a denominator for this record, not a gate floor, so "ALL FOUR ROWS"
+still holds.
+
+Recorded because the original Outcome quoted "roughly half the magnitude" from
+the fixture as if it described the checkpoint.
 
 Reproduce with `scripts/measure-ltx2-prompt-adaln.py --ltx2 <LTX-2 checkout>
 --checkpoint <the file above>`, committed by this repair so the number is
@@ -384,6 +427,19 @@ module". With the variable pointing at the Lightricks tree the same binary
 measures **30 cases / 8734 assertions**, both before and after this repair
 (re-measured on this branch, exit 0 in both configurations). Any future quote of
 this suite's count owes the configuration alongside it.
+
+**And CI never sets it — [#673](https://github.com/mudler/vllm.cpp/issues/673),
+filed 2026-08-13 as visible debt rather than repaired here.** `grep -rn
+CHECKPOINT_ROOT .github/` exits 1 with zero hits while the same pattern matches in
+`tests/` and `.agents/` (positive control run in the same command, so this is not
+an assertion from a failed grep). CI therefore executes **502 of 8734 assertions —
+5.7%** of this suite, at an unchanged case count of 30, and
+`scripts/measure-ltx2-prompt-adaln.py` — which produces every shipped-weights
+number in this Outcome — is a manual tool no gate invokes (`grep -rn
+measure-ltx2-prompt-adaln` hits only its own usage string and this file). So this
+row's checkpoint-derived evidence is **manual and host-local**: reproducible only
+on a box carrying the 18.72 GB NVFP4 DiT and the 23 GB FP8 DiT under
+`$CHECKPOINT_ROOT`. Wiring checkpoints into CI is explicitly NOT in this row.
 
 The `test_ltx2_video` fixture had to move: it declared a config that omits
 `use_prompt_adaln_single` (mirroring the shipped NVFP4 DiT) while its SHAPES said
@@ -449,9 +505,54 @@ measured rather than read:
   config, so what its flag resolves to is decided entirely out of band — and the
   tensor it carries is trained (`.agents/specs/ltx-2-5.md` §3.1 reads its bytes).
 - On the NVFP4 file the flag IS on and the module IS built, but the tensor is
-  absent, so it keeps `torch.zeros(1, inner_dim)` (`model.py:217-219`) through
-  `load_state_dict(..., strict=False)`
-  (`loader/single_gpu_model_builder.py:98`) — a genuine no-op there.
+  absent — 0 of its 7876 entries match `keyframes_abs_pos`.
+
+  **CORRECTED AGAIN 2026-08-13, same issue.** This bullet said the parameter
+  "keeps `torch.zeros(1, inner_dim)` (`model.py:217-219`) through
+  `load_state_dict(..., strict=False)` (`loader/single_gpu_model_builder.py:98`)
+  — a genuine no-op there". **It is not a no-op.** The claim quoted that line
+  while dropping the `assign=True` that is ON THE SAME LINE, and upstream builds
+  on the **meta device** — `loader/helpers.py:84-95`, `create_meta_model`:
+  `with torch.device("meta"): configurator.from_metadata(...)` at `:90-91`. A key
+  absent from the state dict is therefore never materialised at all; it is not a
+  zero, it is an **unmaterialised meta parameter**.
+
+  Run 2026-08-13 through upstream's own `create_meta_model` on this file's real
+  `__metadata__` (read with upstream's own `read_model_metadata` /
+  `SafetensorsModelStateDictLoader`, which JSON-decodes each value —
+  `sft_loader.py:58-74`; the flag lives at `config.transformer`, not at the top
+  level):
+
+  ```text
+  config.transformer['use_keyframes_abs_pos_embedding'] = True
+  keyframes_abs_pos_embedding: shape=(1, 4096) dtype=torch.float32 device=meta is_meta=True
+  supports_keyframes_abs_pos_embedding (BEFORE load) : False
+  after load_state_dict(sd, strict=False, assign=True):
+    neighbour patchify_proj.weight : device=cpu is_meta=False   <- materialised
+    keyframes_abs_pos_embedding    : device=meta is_meta=True
+    in missing_keys                : True
+    reading the value RAISES       : RuntimeError: Tensor.item() cannot be called on meta tensors
+  supports_keyframes_abs_pos_embedding (AFTER load)  : False
+  ```
+
+  **Upstream says exactly this itself**, and then never asks.
+  `supports_keyframes_abs_pos_embedding` (`model.py:166-173`) returns `False` for
+  "a model whose config set the flag but whose checkpoint carried no weight for it
+  (the parameter would still be on `meta`)", and
+  `enable_keyframes_abs_pos_embedding` (`model.py:175-200`) exists because such a
+  parameter "would fail at the first forward". **Both are defined and never
+  called** — one `grep -rn` hit each across the whole `Lightricks/LTX-2` checkout
+  at `fd4ded7f`, the definition itself, re-confirmed here rather than transcribed.
+
+  Polarity is not what fails. `apply_keyframes_absolute_embedding` is
+  `hidden_states + mask * embedding` (`transformer_args.py:23-43`, the sum at
+  `:43`), so **real** zeros would be inert — the mechanism claim fails on `meta`,
+  not on additivity.
+
+  This **strengthens** the row's conclusion and changes nothing downstream: the
+  refusal stays keyed on tensor presence for the FP8 file, and the NVFP4 file is
+  refused by flag in `ParseLtx2DitParams` (`ltx2.cpp:192-198`) — where upstream,
+  had it loaded, would carry a parameter its own guard reports as unsupported.
 
 It is also not a keyframe-only feature: `transformer_args.py:269` applies it on
 every `prepare` whose `keyframes_mask` is set, and `tools.py:186-196` sets that
@@ -497,8 +598,10 @@ tree vanished under it is not a result; it was rebuilt and re-run from scratch.
 ### Two divergences from upstream, recorded rather than fixed
 
 - **We are stricter than upstream about a config that disagrees with its file.**
-  Upstream loads with `load_state_dict(..., strict=False)`
-  (`loader/single_gpu_model_builder.py:98`), so a config declaring
+  Upstream loads with `load_state_dict(..., strict=False, assign=True)`
+  (`loader/single_gpu_model_builder.py:98` — quoted in full, because dropping the
+  `assign=True` is exactly what made the keyframes claim above wrong), so a config
+  declaring
   `use_prompt_adaln_single=false` over a file that carries the module would build
   no module, drop 18 tensors on the floor and run flag-OFF without a word. §3.2's
   equality check refuses that. Ours is better; it is still a DIVERGENCE, not a

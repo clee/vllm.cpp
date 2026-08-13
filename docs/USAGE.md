@@ -2084,7 +2084,24 @@ its TENSORS; the first-party **NVFP4** file does NOT carry the tensor but its
 config DECLARES `use_keyframes_abs_pos_embedding: true`, so it is refused by the
 FLAG, in `ParseLtx2DitParams`, and `allow_unported_modules` clears that flag in a
 config copy. Neither file supports the retired claim that "LTX-2.5's checkpoint
-does not carry the parameter". `prompt_adaln_single` and
+does not carry the parameter".
+
+**What the opt-in costs you on the NVFP4 file: nothing upstream has either.**
+Corrected 2026-08-13 — an earlier note said upstream keeps a zero-initialised
+parameter there, "a no-op". It does not. Upstream builds on the **meta device**
+(`create_meta_model`, `loader/helpers.py:90-91`) and loads with
+`load_state_dict(..., strict=False, assign=True)`
+(`loader/single_gpu_model_builder.py:98`), so a tensor the file does not carry is
+never materialised: the parameter stays on `meta`, lands in `missing_keys`, and
+reading it raises `RuntimeError: Tensor.item() cannot be called on meta tensors`.
+Upstream's own `supports_keyframes_abs_pos_embedding` (`model.py:166-173`) reports
+such a model as NOT supporting the feature — and nothing in the LTX-2 checkout
+ever calls that guard, or the `enable_…` repair next to it. So passing
+`allow_unported_modules` on the NVFP4 DiT does not drop a capability upstream
+would have given you; it declines a marker upstream cannot use on that file
+either. On the **FP8** file the opt-in does drop something real — a trained
+`[1, 4096]` tensor — which is why the refusal there is keyed on tensor presence
+and is worth taking seriously. `prompt_adaln_single` and
 `audio_prompt_adaln_single` were on that list until 2026-08-13 and are now
 PORTED, so a checkpoint carrying them needs no opt-in on their account, and the
 opt-in no longer disables them. The two `*_embeddings_connector` towers are
