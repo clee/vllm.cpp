@@ -77,8 +77,10 @@ enum class Ltx2VideoDecoderKind { kConv, kDiffusion };
 // normalize, not a mean-square RMS, and not this project's usual rms_norm epsilon.
 // Named so it can be pinned: mutation proves 1e-12 -> 0.0 leaves every golden
 // green, because the reduced-dimension activations are O(1) and the floor never
-// binds. It still decides whether an all-zero channel vector divides or produces
-// NaN.
+// binds at that magnitude. It is still READ on every element, so the goldens are
+// not blind to it in the other direction — 1e-12 -> 1.0 reds two encoder goldens
+// at 0.000525832. And it decides whether an all-zero channel vector divides or
+// produces NaN.
 inline constexpr double kLtx2RmsNorm2dEps = 1e-12;
 
 // `config.vae._class_name` -> the decoder kind, mirroring
@@ -102,13 +104,23 @@ struct Ltx2VideoDecoderBlock {
 // ─── THE INVISIBLE-CONSTANT CLASS ────────────────────────────────────────────
 // An HONEST LIMIT of these goldens, and it is a CLASS, not one instance. Any
 // epsilon or floor that exists to stabilize a division is, by construction,
-// invisible to a reduced-dimension parity gate: the deterministic stream produces
-// O(1) activations, the term it guards never binds, and the tensor comparison
-// therefore accepts any value at all — including 0.0, and including one 100x off.
-// MEASURED, by mutating each in turn; these two left EVERY golden green:
+// hard for a reduced-dimension parity gate to reach DOWNWARD: the deterministic
+// stream produces O(1) activations, so shrinking the term it guards changes
+// nothing the tensor comparison can see. That is the honest form of the claim.
+// "Accepts any value at all" is what this paragraph used to say, and it is FALSE
+// even of its own members — the epsilon is still READ on every element, so a
+// large enough value moves the output. Only a probe that FAILS TO REACH proves
+// unreachable; a mutation that happens not to move anything proves nothing, and
+// the direction and MAGNITUDE of the mutation are therefore part of the verdict.
+// MEASURED, by mutating each in turn, with the bound each number actually holds:
 //
-//   kMiniMaxH3SnakeEps                     1e-9 -> 0.0    green
-//   kLtx2RmsNorm2dEps                      1e-12 -> 0.0   green
+//   kMiniMaxH3SnakeEps      1e-9  -> 0.0   green
+//   kLtx2RmsNorm2dEps       1e-12 -> 0.0   green ...but NOT green upward:
+//     escalating it to 1.0 REDS "the video ENCODER (*_res family)" and "the video
+//     encoder CROPS a frame count that is not 1 + k*factor", both at 0.000525832
+//     against the 5e-6 band. It never BINDS at the shipped value, and it is read
+//     regardless — the two are different statements and only the first is true
+//     of this constant.
 //
 // `kLtx2BweMelLogClamp` was listed with them and NO LONGER belongs — the third
 // entry to leave this list for the same reason, which is why the verdict is now

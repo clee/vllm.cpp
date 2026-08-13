@@ -1401,10 +1401,24 @@ TEST_CASE("ltx2 vae: the BWE mel log clamp is gated where it actually binds") {
 }
 
 TEST_CASE("ltx2 vae: the two PixelNorm epsilons stay different") {
-  // This is a SOURCE-ANCHORED CONSTANT guard, not a numerical gate, and it exists
-  // because mutation proved the numerical gate cannot do the job: flipping the
-  // video decoder's eps from 1e-8 to 1e-6 leaves every golden green, since the
-  // normalized activations are O(1) and the difference is ~1e-7 relative.
+  // This is a SOURCE-ANCHORED CONSTANT guard, and it is NOT the only thing holding
+  // either epsilon: both are also reached numerically, MEASURED on this tree by
+  // mutating the field defaults every arm runs.
+  //
+  //   Ltx2ConvVideoDecoderConfig::pixel_norm_eps  1e-8 -> 1e-6 (100x)
+  //     REDS "ltx2 vae: the video decoder's norm_eps is gated where it BINDS"
+  //     at max|diff| = 0.000169305 against the 5e-6 band.
+  //   Ltx2AudioDecoderConfig::pixel_norm_eps      1e-6 -> 1e-4 (100x)
+  //     REDS 5 goldens across three arms — "the audio decoder matches upstream
+  //     ltx_core" (0.0120053), "the other three causality axes" (0.00461239,
+  //     0.00302449, 0.00245912) and "pads the frequency axis" (0.0120053).
+  //
+  // An earlier revision of this comment said the video half "leaves every golden
+  // green". That was true when it was written and false when the low-scale
+  // norm_eps arm landed: at a tenth of the usual latent scale this epsilon is a
+  // first-order term too, which ltx2_video_vae.h already records. The pin stays
+  // for the reason a pin always earns — a regeneration that moves the constant
+  // and the goldens together, which no value comparison can see.
   //
   // The values are not interchangeable upstream. The audio VAE reaches PixelNorm
   // through build_normalization_layer, which passes eps=1e-6
@@ -1419,11 +1433,11 @@ TEST_CASE("ltx2 vae: the two PixelNorm epsilons stay different") {
         vllm::Ltx2ConvVideoDecoderConfig{}.pixel_norm_eps);
 
   // The two ENCODER halves phase L11 added carry the SAME split for the SAME
-  // reason, and this case only ever held the decoder pair. Both encoder epsilons
-  // are reachable by their own goldens, unlike the decoder pair, so this is not
-  // closing a silent hole — it is keeping the case's claim ("the two PixelNorm
-  // epsilons stay different") true of every config that has the field, rather
-  // than of the two it happened to be written for.
+  // reason, and this case only ever held the decoder pair. All FOUR are reachable
+  // by their own goldens — the encoder pair per d45bcb5fb, the decoder pair per
+  // the numbers above — so this is not closing a silent hole. It keeps the case's
+  // claim ("the two PixelNorm epsilons stay different") true of every config that
+  // has the field, rather than of the two it happened to be written for.
   CHECK(vllm::Ltx2AudioEncoderConfig{}.pixel_norm_eps ==
         doctest::Approx(1e-6).epsilon(1e-12).scale(0.0));
   CHECK(vllm::Ltx2AudioEncoderConfig{}.pixel_norm_eps !=

@@ -62,11 +62,16 @@ namespace vllm {
 
 // utils.py:7-12 — `torch.nn.functional.rms_norm`'s eps as `rms_norm` passes it.
 // The connector uses the WEIGHTLESS form, so this is the only stabilizer in the
-// residual path. A member of the invisible-constant class (the fixture's rows are
-// never near-zero), so the value comparison does NOT gate it. What gates it is
-// test_ltx2_pipeline.cpp, case "the constants the headers call pinned are
-// actually pinned", which compares this against upstream's own `rms_norm`
-// signature default rather than a retyped literal.
+// residual path. NOT a member of the invisible-constant class, however near-zero
+// the fixture's rows are: `rms_norm` adds the epsilon to the MEAN SQUARE, not to
+// a row minimum, so it perturbs every row it normalizes. At the class's own 100x
+// bar (1e-6 -> 1e-4) it REDS 5 of the arms in "ltx2 the Embeddings1DConnector
+// reproduces upstream on every arm" — Split 0.0558581, Interleaved 0.104284,
+// Float64 0.140343, NoRegisters 0.000542641, GatedNoBias 0.0892045.
+// It is pinned as well as gated, in test_ltx2_pipeline.cpp, case "the constants
+// the headers call pinned are actually pinned", which compares this against
+// upstream's own `rms_norm` signature default rather than a retyped literal —
+// the one check a regenerated golden cannot satisfy by moving with it.
 inline constexpr double kLtx2ConnectorRmsNormEps = 1e-6;
 
 // Embeddings1DConnector.__init__ defaults (:95-108), which are also both

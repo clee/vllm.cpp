@@ -1561,6 +1561,17 @@ python3 scripts/gen-ltx2-pipeline-goldens.py \
 cmake --build build --target test_ltx2_pipeline && ./build/tests/test_ltx2_pipeline
 ```
 
+If you regenerate that `.inc` against a moved upstream, expect the goldens to
+carry the change rather than only the pin cases. The pipeline goldens reach the
+GroupNorm eps and group count in the latent upsampler, the connector's
+`rms_norm` eps, the `BlurDownsample` width (on the 1.5 arm only, since the blur
+runs on the rational denominator) and the Res2s `sigma_up` clamp — that last one
+on the eta = 1 arm, where the clamp binds on every step. A regeneration that
+moves one of those constants alone reds a value comparison; one that moves the
+constant AND the tensors together passes it, and is caught only by the cases that
+compare each constant against upstream's own signature. Both layers are there
+deliberately, and neither is redundant.
+
 Recipes resolve on an EXACT `(pipeline_kind, model_version)` pair and refuse
 anything else by name rather than defaulting, because a plausible but wrong sigma
 schedule or guidance scale renders a video instead of failing. The pairs that

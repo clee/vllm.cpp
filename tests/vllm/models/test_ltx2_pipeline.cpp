@@ -473,10 +473,14 @@ TEST_CASE("ltx2 Res2s diffusion step reproduces upstream") {
   LTX2_RES2S_ARM(Eta1);
 #undef LTX2_RES2S_ARM
 
-  // The sigma_up clamp (diffusion_steps.py:138). A member of the
-  // invisible-constant class: on any well-formed schedule eta <= 1 keeps sigma_up
-  // at or below sigma_next, so the clamp never binds and no value comparison can
-  // see it. Pinned against the upstream literal instead.
+  // The sigma_up clamp (diffusion_steps.py:138), and NOT a member of the
+  // invisible-constant class. The old reasoning here — "eta <= 1 keeps sigma_up at
+  // or below sigma_next, so the clamp never binds" — reads its own inequality
+  // wrongly: <= includes ==, and the Eta1 arm run five lines up sits exactly on
+  // that boundary, where `min` takes `sigma_next * 0.9999` on every step. A 1%
+  // move (0.9999 -> 0.99) REDS Eta1 index 0 at max|diff| = 0.086 and index 1 at
+  // 0.130563; EtaHalf and the terminal index stay green. Pinned against the
+  // upstream literal AS WELL, since a regenerated golden moves with the constant.
   CHECK(vllm::kLtx2Res2sSigmaUpClamp == 0.9999);
   // ...and the clamp is proved to be a clamp, on an input that DOES exceed it.
   const vllm::Ltx2SdeCoeff clamped = vllm::Ltx2Res2sSdeCoeff(0.5, 2.0);
@@ -1293,12 +1297,27 @@ vllm::Ltx2LatentVolume ReducedUpsamplerLatent() {
 }  // namespace
 
 TEST_CASE("ltx2 the constants the headers call pinned are actually pinned") {
-  // Both headers said "pinned", and NEITHER constant had a single test reference,
-  // so either could be edited with every golden still green — exactly the
-  // invisible-constant class of spec §7.0(a), where the fixture never enters the
-  // regime the constant governs. The connector's rows are never near-zero, so its
-  // eps is inert in the value comparison; the blur width is only reachable through
-  // a default upstream never passes explicitly.
+  // Both headers said "pinned" and NEITHER constant had a test reference, so this
+  // case exists because an unreferenced constant can be edited without the suite
+  // naming it. What it does NOT do is make either one invisible to the goldens:
+  // that was inferred rather than measured, and both are in fact reached.
+  //
+  //   kLtx2ConnectorRmsNormEps 1e-6 -> 1e-4 (100x) REDS 5 arms of "ltx2 the
+  //     Embeddings1DConnector reproduces upstream on every arm" — Split
+  //     0.0558581, Interleaved 0.104284, Float64 0.140343, NoRegisters
+  //     0.000542641, GatedNoBias 0.0892045. `rms_norm` adds the epsilon to the
+  //     MEAN SQUARE, so "the rows are never near-zero" was never the question.
+  //   kLtx2BlurKernelSize 5 -> 3 REDS "ltx2 the latent spatial upsampler
+  //     reproduces upstream", arm Rational1p5, at 0.689782. Upstream not passing
+  //     the argument does not make the default unreachable — the default IS the
+  //     shipped width, which ltx2_upsampler.h has said all along. Only the
+  //     Rational1p5 arm reaches it, because `BlurDownsample` runs on the
+  //     rational `den` (ltx2_upsampler.cpp:439) and 1.5 -> {3, 2} is the one
+  //     supported scale of the three with den != 1.
+  //
+  // So the reason to keep this case is the narrower, real one: a golden
+  // regenerated from a moved constant moves with it, and these two lines are the
+  // only comparison against upstream's own signature.
   //
   // Each expected value is READ OFF upstream's own signature by the generator
   // (utils.py:7, blur_downsample.py:14), not retyped here, so upstream moving
@@ -1375,8 +1394,17 @@ TEST_CASE("ltx2 the latent spatial upsampler reproduces upstream") {
 
   // GroupNorm's group count is a LITERAL upstream (res_block.py:24,26; model.py:50),
   // not a config key a checkpoint could move, and its eps is torch's default
-  // because no site passes one. Both are members of the invisible-constant class
-  // at this fixture's scale, so both are pinned rather than left to the tensors.
+  // because no site passes one. NEITHER is a member of the invisible-constant
+  // class: the three arms above reach both, MEASURED on this tree.
+  //
+  //   kLtx2UpsamplerNormEps    1e-5 -> 1e-3 (100x)  REDS PixelShuffle 0.0289409,
+  //                            Rational2 0.0347079, Rational1p5 0.0649014
+  //   kLtx2UpsamplerNormGroups 32   -> 16           REDS PixelShuffle 0.63738,
+  //                            Rational2 0.633718, Rational1p5 0.874346
+  //
+  // Both stay pinned anyway, for the one thing the tensors cannot do: a
+  // regeneration that moves the constant and the goldens together still passes
+  // the value comparison, and only these two lines compare against upstream.
   CHECK(vllm::kLtx2UpsamplerNormGroups == vllm_test::kLtx2UpsNormGroups);
   CHECK(vllm::kLtx2UpsamplerNormEps == 1e-5);
 }

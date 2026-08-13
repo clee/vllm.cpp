@@ -63,11 +63,20 @@
 //    `Ltx2TextFeatureExtractorForward`.
 //
 // ─── AND THE EPSILONS, WHICH ARE A CLASS AND NOT ONE INSTANCE ────────────────
-// A constant that only changes the answer on a DEGENERATE input is invisible to
-// any golden built from random values. Both normalizations have one, they are
-// named below, and each is held two ways: its VALUE against upstream measured by
-// probe, and the degenerate input on which it is the only thing between the port
-// and a division by zero. When a fourth epsilon arrives, it owes the same pair —
+// A constant that only changes the answer on a DEGENERATE input is invisible to a
+// golden built from random values — but NEITHER of the two below is that
+// constant, and the detailed note at kLtx2TextNormV1Eps already says why for the
+// V1 half. Both are additive terms on an O(1) denominator against a 1e-5 band, so
+// at the 100x bar they move ORDINARY random-value goldens: V1 1e-6 -> 1e-4 REDS
+// "`_norm_and_concat_padded_batch`, both padding sides" at 0.000524044 and
+// "FeatureExtractorV1" at 7.53999e-05 / 6.61612e-05; V2 1e-6 -> 1e-4 REDS
+// "`norm_and_concat_per_token_rms`, both padding sides" at 0.00232971 and
+// carries into "FeatureExtractorV2" and the hand-off at 0.000344872 /
+// 0.000259042 / 0.00039053. They are held two ways all the same: their VALUE
+// against upstream measured by probe, and the degenerate input on which each is
+// the only thing between the port and a division by zero — that input is what
+// makes a division-by-zero visible, not what makes the constant visible at all.
+// When a fourth epsilon arrives, it owes the same pair —
 // not a comment saying it matches upstream.
 //
 // ─── DTYPE ───────────────────────────────────────────────────────────────────
@@ -161,10 +170,23 @@ struct Ltx2TextHiddenStates {
 // lands around 2e-12 at the output — small, but not the "any input" the earlier
 // comment claimed. Both the value and the arithmetic width are gated on the
 // degenerate inputs, where they are visible.
+//
+// That is the ONE-ULP dtype perturbation. A VALUE move of the size the pin
+// exists to catch is far louder and needs no degenerate input at all: 1e-6 ->
+// 1e-4 REDS "`_norm_and_concat_padded_batch`, both padding sides" at 0.000524044
+// and "FeatureExtractorV1" at 7.53999e-05 / 6.61612e-05, on the ordinary
+// random-value goldens.
 inline constexpr double kLtx2TextNormV1Eps = 1e-6;
 
-// feature_extractor.py:61 — `torch.rsqrt(variance + 1e-6)`. Reachable only when a
-// token's whole hidden slice is zero.
+// feature_extractor.py:61 — `torch.rsqrt(variance + 1e-6)`. DIVISION-BY-ZERO-
+// reachable only when a token's whole hidden slice is zero, which is the narrow
+// claim the earlier "reachable only when" was making and the wrong one to state
+// alone: the epsilon is added to an O(1) variance, so it is OUTPUT-observable on
+// ordinary random values too. 1e-6 -> 1e-4 REDS
+// "`norm_and_concat_per_token_rms`, both padding sides" at 0.00232971, and the
+// perturbation carries through the projections into "FeatureExtractorV2" and
+// "the encoder -> conditioning hand-off" at 0.000344872 / 0.000259042 /
+// 0.00039053 against the suite's 1e-5 kTol. Same shape as the V1 half above.
 inline constexpr float kLtx2TextNormV2Eps = 1e-6f;
 
 // feature_extractor.py:12-64. Which of the two normalizations runs.
