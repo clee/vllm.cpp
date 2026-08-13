@@ -33,6 +33,7 @@
 
 #include "vllm/model_executor/model_loader/nvfp4_dequant.h"
 #include "vllm/model_executor/model_loader/safetensors_reader.h"
+#include "vt/unaligned.h"  // LoadUnaligned — safetensors payloads are byte-offset (#627)
 
 namespace vllm {
 namespace {
@@ -1321,8 +1322,19 @@ Ltx2VaeWeights Ltx2LoadVaeWeights(const SafetensorsFile& file,
              " BF16 bytes but its shape needs " +
              std::to_string(static_cast<size_t>(numel) * sizeof(uint16_t)));
       }
-      const uint16_t* src = reinterpret_cast<const uint16_t*>(t.data);
-      for (int64_t i = 0; i < numel; ++i) values[static_cast<size_t>(i)] = Bf16ToF32(src[i]);
+      // `t.data` points INTO the mapped safetensors payload, whose tensor offsets
+      // are byte offsets fixed by the sizes of everything before them — so a BF16
+      // tensor that follows an odd-length one starts on an odd byte and forming a
+      // `const uint16_t*` to it is undefined, whatever x86 tolerates. This is
+      // #627's defect class verbatim, and `vt::LoadUnaligned` is the seam that
+      // already answers it (15 casts in 9 loaders were migrated to it); this
+      // loader landed without adopting it. At -O2 the memcpy folds to the same
+      // `movzwl` load, so nothing is paid for it.
+      const auto* src = static_cast<const uint8_t*>(t.data);
+      for (int64_t i = 0; i < numel; ++i) {
+        values[static_cast<size_t>(i)] = Bf16ToF32(
+            vt::LoadUnaligned<uint16_t>(src + static_cast<size_t>(i) * sizeof(uint16_t)));
+      }
     } else if (t.dtype == "F32") {
       if (t.nbytes != static_cast<size_t>(numel) * sizeof(float)) {
         Fail("'" + name + "' declares " + std::to_string(t.nbytes) +
