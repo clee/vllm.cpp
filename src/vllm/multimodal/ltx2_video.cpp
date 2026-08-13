@@ -527,12 +527,17 @@ std::unique_ptr<Ltx2VideoEngine> Ltx2VideoEngine::Load(const VideoModelParams& p
   //
   // WHICH accelerator is the PLATFORM's question, not this model file's. This
   // asked `TryGetBackend(kCUDA)` — the same defect work row M3a repaired in
-  // `SelectQueueForModel` (model_loader.cpp:75-104), where a hardcoded
+  // `SelectQueueForModel` (src/vllm/entrypoints/model_loader.cpp:75-104 — the
+  // full path matters, there is also a src/vllm/model_executor/model_loader/
+  // DIRECTORY and the bare file name sends a reader there), where a hardcoded
   // `GetBackend(kCUDA)` was the one line standing between a complete non-NVIDIA
   // backend and running a model. `CurrentPlatform()` walks the probe order
-  // {kCUDA, kROCM, kXPU, kVULKAN, kMETAL, kTENSTORRENT, kCPU} and returns the
-  // first whose backend actually found a device (platforms/platform.cpp:91-99),
-  // so on a CUDA box this resolves EXACTLY the device the hardcoded lookup did.
+  // {kCUDA, kROCM, kXPU, kVULKAN, kMETAL, kTENSTORRENT, kCPU}
+  // (src/vllm/platforms/platform.cpp:62-64) and returns the first one REGISTERED
+  // (:91-98) — and a platform registers only where its own probe found a device,
+  // e.g. src/vllm/platforms/cuda.cpp:136-138 returns early on a box with the CUDA
+  // toolkit and no usable GPU — so on a CUDA box this resolves EXACTLY the device
+  // the hardcoded lookup did.
   // Nothing below this line names a device either: `Ltx2StreamDitToDevice` and
   // `Ltx2DitForwardDevice` drive `vt::Queue` and the op table, so a backend that
   // registers those ops reaches this forward with no edit here.
