@@ -369,6 +369,23 @@ class WindowsMetadataContract(unittest.TestCase):
             "executor_", "engine_core_", "input_processor_", "output_processor_",
             "block_hasher_", "engine_",
         )
+        loader_header = (
+            ROOT / "include/vllm/entrypoints/model_loader.h"
+        ).read_text(encoding="utf-8")
+        loader_members = loader_header[
+            loader_header.index("  bool hash_ready_;"):
+            loader_header.index("  vllm::v1::LLMEngine engine_;")
+            + len("  vllm::v1::LLMEngine engine_;")
+        ]
+        declared_loaded_stages = tuple(
+            re.findall(
+                r"^\s*(?!//)(?:const\s+)?(?:[\w:]+(?:<[^;\n]+>)?)"
+                r"[\s*&]+([A-Za-z]\w*_)\s*(?:=[^;]*)?;\s*(?://.*)?$",
+                loader_members,
+                re.MULTILINE,
+            )
+        )
+        self.assertEqual(loaded_stages, declared_loaded_stages)
         positions = []
         for stage in loaded_stages:
             marker = f'ConstructorWitnessPhase{{"LoadedEngine","{stage}"}}'
@@ -376,9 +393,15 @@ class WindowsMetadataContract(unittest.TestCase):
                 self.assertEqual(compact_constructor.count(marker), 1)
                 positions.append(compact_constructor.index(marker))
         self.assertEqual(positions, sorted(positions))
+        model_factory = (
+            ROOT / "src/vllm/model_executor/models/qwen3_5_moe.cpp"
+        ).read_text(encoding="utf-8")
+        compact_model_factory = re.sub(r"\s+", "", model_factory)
+        self.assertNotIn("ConstructorWitnessCall", diagnostic + loader)
         self.assertIn(
-            'ConstructorWitnessCall("LoadedEngine","MakeQwen3_5MoeLoadedModel"',
-            re.sub(r"\s+", "", loader),
+            'return(ConstructorWitnessPhase{"LoadedEngine",'
+            '"MakeQwen3_5MoeLoadedModel"},std::make_unique<',
+            compact_model_factory,
         )
 
         runner = (ROOT / "src/vllm/v1/worker/gpu/runner.cpp").read_text(
@@ -394,6 +417,23 @@ class WindowsMetadataContract(unittest.TestCase):
             "config_", "owned_model_", "model_", "spec_config_", "draft_model_",
             "draft_attn_kv_", "queue_", "input_batch_",
         )
+        runner_header = (
+            ROOT / "include/vllm/v1/worker/gpu/runner.h"
+        ).read_text(encoding="utf-8")
+        runner_members = runner_header[
+            runner_header.index("  const HfConfig& config_;"):
+            runner_header.index("  InputBatch input_batch_;")
+            + len("  InputBatch input_batch_;")
+        ]
+        declared_runner_stages = tuple(
+            re.findall(
+                r"^\s*(?!//)(?:const\s+)?(?:[\w:]+(?:<[^;\n]+>)?)"
+                r"[\s*&]+([A-Za-z]\w*_)\s*(?:=[^;]*)?;\s*(?://.*)?$",
+                runner_members,
+                re.MULTILINE,
+            )
+        )
+        self.assertEqual(runner_stages, declared_runner_stages)
         runner_positions = []
         for stage in runner_stages:
             marker = f'ConstructorWitnessPhase{{"GPUModelRunner","{stage}"}}'
@@ -426,37 +466,68 @@ class WindowsMetadataContract(unittest.TestCase):
         init_end = runner.index("\n}\n", init_start) + len("\n}\n")
         initialize = runner[init_start:init_end]
         compact_initialize = re.sub(r"\s+", "", initialize)
-        for stage in (
-            "scalar-state-slot-setup", "kv-group-scan", "mamba-validation",
-            "full-attention-geometry", "residency-buffer-setup",
-            "gdn-ssm-allocation", "gdn-conv-allocation",
-            "full-attention-allocation", "full-attention-view",
-            "draft-attention-storage", "gdn-state-view",
-        ):
-            with self.subTest(kv_stage=stage):
-                self.assertIn(
-                    f'"GPUModelRunner::initialize_kv_cache","{stage}"',
-                    compact_initialize,
+        kv_stages = {
+            "scalar-state-slot-setup": None,
+            "kv-group-scan": "g",
+            "mamba-validation": "gdn_group_id_",
+            "full-attention-geometry": "full_attn_group_id_",
+            "residency-buffer-setup": None,
+            "gdn-ssm-allocation": "l",
+            "gdn-conv-allocation": "l",
+            "full-attention-allocation": "l",
+            "full-attention-view": "static_cast<longlong>(i)",
+            "draft-attention-storage": "g",
+            "gdn-state-view": "static_cast<longlong>(g)",
+        }
+        for stage, index in kv_stages.items():
+            suffix = "" if index is None else f",{index}"
+            for phase in ("Before", "After"):
+                marker = (
+                    f'ConstructorWitness{phase}('
+                    f'"GPUModelRunner::initialize_kv_cache","{stage}"'
+                    f'{suffix});'
                 )
+                with self.subTest(kv_stage=stage, phase=phase):
+                    self.assertEqual(compact_initialize.count(marker), 1)
 
         api_test = (
             ROOT / "tests/vllm/entrypoints/openai/test_api_server.cpp"
         ).read_text(encoding="utf-8")
-        for guarantee in (
-            "_set_invalid_parameter_handler",
-            "_set_purecall_handler",
-            "_invoke_watson",
-            "WINDOWS_CRT_INVALID_PARAMETER:",
-            "WINDOWS_CRT_PURECALL",
-            "prior_invalid_parameter_handler_",
-            "prior_purecall_handler_",
-        ):
-            with self.subTest(crt_guarantee=guarantee):
-                self.assertIn(guarantee, api_test)
-        self.assertLess(
-            api_test.index("WINDOWS_CRT_INVALID_PARAMETER:"),
-            api_test.index("_invoke_watson"),
+        invalid_start = api_test.index(
+            "[[noreturn]] void WindowsCrtInvalidParameterWitness("
         )
+        pure_start = api_test.index(
+            "[[noreturn]] void WindowsCrtPurecallWitness() {"
+        )
+        invalid_handler = api_test[invalid_start:pure_start]
+        pure_end = api_test.index("\n}\n#endif", pure_start) + len("\n}\n")
+        pure_handler = api_test[pure_start:pure_end]
+        handler_contracts = (
+            (
+                "invalid-parameter",
+                invalid_handler,
+                "[[noreturn]] void WindowsCrtInvalidParameterWitness(",
+                "WINDOWS_CRT_INVALID_PARAMETER:",
+                "prior_invalid_parameter_handler(expression, function, file, line, reserved);",
+            ),
+            (
+                "purecall",
+                pure_handler,
+                "[[noreturn]] void WindowsCrtPurecallWitness() {",
+                "WINDOWS_CRT_PURECALL",
+                "prior_purecall_handler();",
+            ),
+        )
+        for name, body, signature, diagnostic_line, prior_call in handler_contracts:
+            with self.subTest(crt_handler=name):
+                self.assertTrue(body.startswith(signature))
+                self.assertEqual(body.count(diagnostic_line), 1)
+                self.assertEqual(body.count("std::fflush(stderr)"), 1)
+                self.assertEqual(body.count(prior_call), 1)
+                self.assertEqual(body.count("_invoke_watson("), 1)
+                self.assertLess(body.index(diagnostic_line), body.index("std::fflush(stderr)"))
+                self.assertLess(body.index("std::fflush(stderr)"), body.index(prior_call))
+                self.assertLess(body.index(prior_call), body.index("_invoke_watson("))
 
     def test_socket_teardown_probe_marks_each_owner_and_terminate_reason(self) -> None:
         main = (ROOT / "tests/doctest_main.cpp").read_text(encoding="utf-8")

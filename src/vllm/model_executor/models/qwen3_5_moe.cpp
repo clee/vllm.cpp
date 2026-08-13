@@ -23,6 +23,7 @@
 #include "vllm/model_executor/models/qwen3_5_mtp.h"  // SPEC-MTP I5d-pre draft
 #include "vllm/model_executor/models/qwen3_5_weights.h"
 #include "vllm/platforms/interface.h"  // GetPlatform(device.type) memory-model seam
+#include "vllm/diagnostics/constructor_witness.h"
 
 namespace vllm {
 namespace {
@@ -200,9 +201,12 @@ const ModelFactory kQwen3_5MoeFactory{
 
 std::unique_ptr<LoadedModel> MakeQwen3_5MoeLoadedModel(
     Qwen3_5MoeWeights weights) {
-  return std::make_unique<Qwen3_5MoeLoadedModel>(
-      RegistrationFor("Qwen3_5MoeForConditionalGeneration"),
-      std::move(weights));
+  using diagnostics::ConstructorWitnessPhase;
+  return (ConstructorWitnessPhase{"LoadedEngine",
+                                  "MakeQwen3_5MoeLoadedModel"},
+          std::make_unique<Qwen3_5MoeLoadedModel>(
+              RegistrationFor("Qwen3_5MoeForConditionalGeneration"),
+              std::move(weights)));
 }
 
 std::unique_ptr<LoadedModel> BorrowQwen3_5MoeLoadedModel(

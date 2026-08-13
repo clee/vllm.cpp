@@ -44,7 +44,6 @@
 namespace vllm::entrypoints {
 
 namespace fs = std::filesystem;
-using diagnostics::ConstructorWitnessCall;
 using diagnostics::ConstructorWitnessPhase;
 
 // `architecture` is the model's registered architecture string. It is what lets
@@ -951,11 +950,7 @@ int LoadedEngine::ResolveMaxModelLen(const EngineParams& params,
 LoadedEngine::LoadedEngine(HfConfig config, Qwen3_5MoeWeights weights,
                            tok::Tokenizer tokenizer, const EngineParams& params)
     : LoadedEngine(std::move(config),
-                   ConstructorWitnessCall(
-                       "LoadedEngine", "MakeQwen3_5MoeLoadedModel",
-                       [&weights]() {
-                         return MakeQwen3_5MoeLoadedModel(std::move(weights));
-                       }),
+                   MakeQwen3_5MoeLoadedModel(std::move(weights)),
                    std::move(tokenizer), params) {}
 
 LoadedEngine::LoadedEngine(HfConfig config, Qwen3_5DenseWeights weights,

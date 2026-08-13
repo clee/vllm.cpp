@@ -4,9 +4,6 @@
 #include <cstdio>
 #include <cstdlib>
 #include <exception>
-#include <functional>
-#include <type_traits>
-#include <utility>
 
 namespace vllm::diagnostics {
 
@@ -73,16 +70,6 @@ class ConstructorWitnessPhase {
   bool enabled_;
   int uncaught_exceptions_;
 };
-
-template <typename Function>
-auto ConstructorWitnessCall(const char* function, const char* stage,
-                            Function&& call)
-    -> std::invoke_result_t<Function> {
-  ConstructorWitnessBefore(function, stage);
-  auto result = std::invoke(std::forward<Function>(call));
-  ConstructorWitnessAfter(function, stage);
-  return result;
-}
 
 }  // namespace vllm::diagnostics
 

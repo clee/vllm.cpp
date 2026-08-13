@@ -27,7 +27,7 @@ are our reading of their documented behavior, not measurements.
 | Correctness gate | token-exact vs vLLM | reference | own | own |
 | Architectures | 38 registered, 27 gated | 130+ | 100+ | 100+ |
 | Downloadable server binaries | ✅ v0.0.2: eight indexed archives with checksums, provenance, manifests, and SBOMs. Windows ZIP downloads do not exist; native CPU/Vulkan lanes await hosted runtime, dry-run, prerelease, and authenticated audit gates | ✅ wheels/containers | ✅ wheels/containers | ✅ host-specific binaries |
-| Native Windows builds | ◐ CPU/Vulkan: `/MT /W4 /WX`, central `NOMINMAX`, UTF-8, aligned allocation, runtime ISA dispatch; LTX2 uses C++20 math constants, not `M_PI`. Local DeepSeek float probe green; hosted compile/runtime/release pending | ✅ | ✅ | ✅ |
+| Native Windows builds | ◐ CPU/Vulkan: `/MT /W4 /WX`, `NOMINMAX`, UTF-8, aligned allocation, runtime ISA dispatch. Issue #537 has an isolated constructor/KV/CRT witness. Local float probe green; hosted compile/runtime/release pending | ✅ | ✅ | ✅ |
 
 ## Serving and scheduling
 
