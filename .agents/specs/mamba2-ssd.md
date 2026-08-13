@@ -620,11 +620,24 @@ model or layer code calls these ops at all** — `grep` for `vt::Mamba2ChunkScan
 `include/vt/ops.h` declarations and the three unit tests, nothing else — so the
 H3 path cannot reach a kernel this brick added, and the only W2 delta it can see
 is three extra registrations in the op table. What is NOT yet established is the
-positive cause. A standalone serial re-run of all ten under the lock is queued
-and is **PENDING on a named external resource**: `$HOME/gpu.lock` has been held
-for ~2 h by an unrelated benchmark series with three jobs ahead of it. That
-re-run, not this paragraph, is what settles the attribution, and it is owed
-before the fresh review closes.
+positive cause.
+
+One contention fact IS established, and it invalidates the "idle box" premise
+this run was read under: an unrelated job (`~/work/marlin442`, files touched
+03:14 → 04:20, spanning the whole 03:51-04:44 ctest window) serialises on
+**`/tmp/gpu.lock`, not `$HOME/gpu.lock`** — a different file, so the shared
+mutex did not exclude it and it was on the GPU while this suite ran.
+`test_minimax_h3` loads a ~41 GB model on a box whose memory is UNIFIED, which
+is precisely the documented OOM failure mode. That is a plausible cause, not a
+proven one, and it is recorded as the former.
+
+A standalone serial re-run of all ten is queued and writes
+`~/w2ssd/refail.log`; it is **PENDING on a named external resource** —
+`$HOME/gpu.lock` has been held ~2.3 h by an unrelated benchmark series with
+three jobs ahead of it. That re-run, not this paragraph, settles the
+attribution, and it is owed before the fresh review closes. **`~/w2ssd` on the
+gate host is deliberately left in place for it** (`rm -rf ~/w2ssd` once
+`refail.log` is read).
 
 **The derived bar is audited, not asserted.** Across the 55 device-vs-host
 comparisons in a green run, the worst one used **7.66%** of `rtol(K) =
