@@ -19406,6 +19406,953 @@ streams are byte-identical, so upstream's DSpark is lossless on that lane.
 Evidence: `dgx:~/work/dspark-w6/pinned_{35b,27b}_{on,off}.json`, `xengine.log`,
 `xengine_ours.log`, `xengine_pinned.log`.
 
+## Moved out of `docs/BENCHMARKS.md` 2026-08-11 to pay for the x86_64 CPU row (#433)
+
+Moved BYTE-FOR-BYTE, links and provenance intact, because
+`docs/BENCHMARKS.md` is a projection surface that had reached its hard
+45,000-character cap. Nothing is deleted. The remaining headroom is
+deliberately NOT quoted here: `scripts/check-public-doc-tables.py` measures it,
+in characters, and is the only authority on it — a number that moves on every
+edit of one file does not belong inside another. (The first version of this
+note said "241 characters"; the commit said 64 and the PR body said 80. The
+checker counts characters and 80 was the right answer at that SHA, which is the
+whole argument for not writing it down here.)
+
+The row was already marked SUPERSEDED in place by the BINDING row directly
+above it in the 35B concurrency table. It is quoted inside a fenced block so
+its bytes survive verbatim.
+
+A second candidate, the RPi5 `Assembly vs compiler SDOT` row, was NOT moved and
+stays in `docs/BENCHMARKS.md`: it carries a relative link that resolves from
+`docs/` and dangles from here, and rewriting the path would break the
+byte-for-byte guarantee this section exists to provide. The x86_64 row that
+this move pays for was shortened instead. That is not a quirk of one row — it
+is the general blocker on compacting this surface at all, filed with its
+mechanism and a reproduction as
+[#460](https://github.com/mudler/vllm.cpp/issues/460): `check_links` in
+`scripts/check-agent-record.py` matches links inside fenced code blocks and
+resolves them from the archive's own directory, so no row carrying a
+`docs/`-relative link can be archived verbatim.
+
+From the Qwen3.6-35B-A3B concurrency table:
+
+```text
+| Ratio 2026-08-10, same SHA (SUPERSEDED) | 0.8384x | 0.9637x | 0.9545x | 0.9670x | not run | not run |
+```
+
+**MULTIMODAL SPEED - AUDIO ENCODER TTFT: FA-2 TENSOR CORES for the hd-64 non-causal encoder
+attention - 5.50x encoder forward / 115.8x kernel, LANDS OPT-IN because it costs precision
+(2026-08-12, `CLAIM-MM-SPEED-AUDIO-ENC-FA2`, [spec](specs/multimodal-speed.md) S17, issue #432).**
+`benchmark_binding=false` (single-seq test driver; vLLM graphed is the honest denominator).
+Base `origin/main` `dc7a1392`, branch `row/MM-SPEED-ENC-FA2`. dgx GB10 sm_121a
+`~/work/mmenc-fa2/build-cuda`, `-DVLLM_CPP_CUDA_ARCHITECTURES=121a
+-DVLLM_CPP_CUTLASS_DIR=$HOME/cutlass-4.5.0 -DVLLM_CPP_TRITON=ON`; all three mandatory banners
+CONFIRMED at configure ("CUTLASS found ... sm120a NVFP4 cutlass GEMM", "FlashAttention-2
+prefill/decode: ENABLED for arch(es) [121a]", "Triton AOT ... MANIFEST hashes OK" sm_121a),
+`-Werror` **0 warn**. `local-ai-worker` STOPPED. ALL GPU under `flock $HOME/gpu.lock`;
+**CONTENTION: the box was NOT idle** - three other agents' jobs held or queued on the lock
+during the session, so each arm-group ran inside ONE lock window and could not interleave.
+Cold rep0 dropped. Implements the S14.5/S15.5 residual lever #1 (the one all three prior
+sections ranked first and deferred as LARGE).
+
+**KERNEL:** new `vt::AttentionDenseFa2` (`OpId::kAttentionDenseFa2`) routes a dense,
+non-paged, single-request, non-causal hd-64 bf16 attention to the VENDORED FlashAttention-2
+forward - the kernel vLLM itself dispatches here (`whisper.py` WhisperEncoderAttention:255 ->
+forward:298-317 -> `flash_attn_varlen_func`, causal=False). Three pieces: an upstream-form
+`flash_fwd_hdim64_bf16_sm80.cu` instantiating `run_mha_fwd_hdim64` (head_dim 64 AND the plain
+batch `run_mha_fwd_` entry are both firsts in this tree - every prior caller is paged, hence
+split-KV); `LaunchDenseFA2Bf16` filling `Flash_fwd_params` for b=1 with a null `cu_seqlens_q`
+(which is what selects the batch geometry in `BlockInfo`); and the additive op, whose fast
+path is narrow (bf16 + hd 64 + non-causal + MHA + FA-2 compiled + `VT_FA2_DENSE`) and which
+otherwise falls through to `AttentionDenseFlash`, so it is total. `kAttention` /
+`kAttentionDenseFast` / `kAttentionDenseFlash` untouched => Qwen vision tower, Gemma-4 vision
+and all text paths byte-identical BY CONSTRUCTION.
+
+**SAME-BINARY A/B** (throwaway `VT_ENC_REPS` `steady_clock` around the encoder forward, NOT
+committed; 6 reps/arm, rep0 dropped; one lock window):
+
+The right-hand columns are **our ENCODER FORWARD against vLLM's whole TTFT**, and they are
+NOT TTFT ratios (review finding F3, 2026-08-12): the numerator is
+`WhisperAudioEncoderForward` alone, while our projector, merge and prefill are unmeasured.
+
+| Arm | encoder forward (reps 1-5) | vs shipped default | enc fwd vs PIN TTFT 46.02 ms | (vs 0.25.0 42.8 ms) |
+|---|---|---|---|---|
+| warp `AttentionDenseFast` (S13) | 844.8 ms (843.6-847.6) | 0.87x | 18.36x | ~19.7x |
+| flash-tiled `AttentionDenseFlash` (S14/S15, **ships**) | **731.7 ms** (731.5-738.8) | 1.00x | **15.90x** | ~17.1x |
+| FA-2 `AttentionDenseFa2` (`VT_WHISPER_ENC_FA2=1`, opt-in) | **133.0 ms** (131.6-137.9) | **5.50x faster** | **2.89x** | ~3.11x |
+
+**DENOMINATOR RE-MEASURED AGAINST THE PIN (2026-08-12).** The original entry carried
+0.25.0's 42.8 ms forward and listed the fresh capture as owed. The review took it: the
+pinned oracle `555967922` ran the identical clip in its production/graphed configuration,
+6 reps rep0 dropped, **TTFT median 46.02 ms (45.60-46.41)** - disjoint bands from 42.8 ms,
+the pin 7.5% SLOWER. The published ratios were therefore CONSERVATIVE. Assert the oracle BY
+COMMIT: the venv's `0.23.1rc1.dev1511+g555967922` string is a setuptools_scm
+nearest-ancestor-tag artefact, and HEAD is `5559679229bc`. `soundfile==0.14.0` had to be
+installed into `~/venvs/vllm-oracle-next` before the pin could tokenize Voxtral at all -
+that package is what makes the pin gateable for this vehicle (recorded against #375).
+
+Bands non-overlapping by a wide margin. **Proof-of-run** (nsys `cuda_gpu_kern_sum
+--cuda-graph-trace=node`, SAME tool + workload both arms): flash-tiled =
+`AttentionDenseFlashKernel<bf16,bf16>` 32 inst @ 19,278 us = 616.9 ms (24.0% of all GPU);
+FA-2 = `flash_fwd_kernel<Flash_fwd_kernel_traits<64,128,128,4,...>>` **32 inst @ 166.5 us =
+5.33 ms (0.3%)** with **ZERO** `AttentionDenseFlashKernel` - **115.8x on the kernel**, 32
+instances = 32 encoder layers exactly. (The 1410-instance `flash_fwd_splitkv_kernel` in both
+arms is the untouched S12 text decode.)
+
+**CORRECTNESS - why this is OPT-IN and not the default.** `test_voxtral_e2e` FA-2 arm
+**14/16 FAIL**: strict_prefix 12/48 (bar >= 18), determinism anchor repro 13/48 (bar 48);
+token md5 `d6d6ae1b...` vs `89923566...` shared IDENTICALLY by the naive/warp/flash-tiled
+arms. Goldens md5 UNCHANGED (`voxtral_golden.json 8ab87b7e...`, `voxtral_neartie.json
+937b9ad3...`, before == after) - nothing regenerated to make anything pass. ORACLE
+teacher-force of the FA-2 sequence against the fixture's OWN capture stack
+(`~/venvs/vllm-oracle-v0.25.0-stage`, asserted live: vLLM **0.25.0**, torch 2.11.0+cu130,
+transformers 5.13.1, mistral_common **1.11.5**, flashinfer 0.6.13):
+**divergent 3, worst gap 0.1250 nats @ pos 12, over-band 0, RESULT PASS** - inside the
+ratified 0.5-nat band, BUT the shipping scalar kernel has **0 divergent at gap 0.0** (every
+token is vLLM's own argmax). That is a precision step DOWN, not a tie flip, and it is the
+difference from S12 (whose adopted FA-2 decode kept divergent=0 while getting faster).
+**MECHANISM - HYPOTHESIS, and the leading candidate is REFUTED (corrected 2026-08-12).**
+This entry originally asserted a root cause as fact: FA-2 converting the softmax
+probabilities from its f32 accumulator to bf16 before the PV MMA
+(`flash_attn/src/flash_fwd_kernel.h:347` `convert_type<Element>(acc_s)`) where our scalar
+kernel keeps `p` in f32. **Mutation M4 refutes it** - rounding `p` to bf16 and back inside
+the SHIPPING scalar kernel (`const float p = expf(s - m_new)`), clean rebuild, default arm
+re-run, returned token md5 `89923566...` **UNCHANGED**. That conversion cannot move one
+token on this clip, so it cannot account for three. Five differences remain candidates and
+only one is a precision loss: (i) QK^T reassociated by `mma.sync`; (ii) `exp2f` on a
+log2-scaled score (`softmax.h:86,118`) vs our `expf`; (iii) the online-max rescale also in
+`exp2f` (`softmax.h:157`); (iv) bf16 P - REFUTED; (v) PV reassociated. None is isolated.
+Also deleted as unmeasured and now refuted: "the scalar kernel's higher-precision softmax
+happened to compensate". Measured against the pin, `encoder_out` rel-L2 vs vLLM is 8.685%
+(default) / 9.053% (FA-2) and `audio_embeds` 10.933% / 11.164% - the swap perturbs 0.37
+points of a divergence that is ~96% conv/LayerNorm/GEMM (`audio-track.md:279` already
+records 8.7%). There is no meaningful compensation.
+**DISPOSITION: default unchanged (byte-exact flash-tiled, gate 16/16);
+FA-2 opt-in behind `VT_WHISPER_ENC_FA2=1`; ADOPTION IS A DEVELOPER DECISION** - it would buy
+the encoder forward going from 15.90x to 2.89x of vLLM's TTFT, the last mm axis below
+floor, at the cost of 0 -> 3 near-tie divergences. **NOT a ceiling, RE-RANKED after M4:**
+(1) attention is no longer the encoder bottleneck (5.33 ms of 133 ms), so the S15.1-deferred
+DEVICE im2col kernel for the cross-channel Whisper conv is the top lever; (2) measure our
+ACTUAL audio TTFT - projector + merge + prefill are missing from every ratio here; (3)
+isolate WHICH of the five differences flips the tokens, one M4-style single-difference
+mutation at a time; (4) keep the tensor cores AND the precision via an FA-3-style two-stage
+rescale / f32-correction-term split - DEMOTED from #1, because M4 refuted the
+single-conversion premise it rested on. (The carried-forward-denominator item is CLOSED: the
+pin was measured, see above.) **Repro:** `git archive` the branch to
+`dgx.casa:~/work/mmenc-fa2`, configure with the three flags above, `cmake --build build-cuda
+--target test_voxtral_e2e`, then `STF=~/.cache/huggingface/hub/models--mistralai--Voxtral-Mini-3B-2507/snapshots/*/consolidated.safetensors;
+flock $HOME/gpu.lock env VLLM_VOXTRAL_SAFETENSORS=$STF VT_WHISPER_ENC_FA2=1 nsys profile
+--cuda-graph-trace=node -t cuda -o /tmp/f ./build-cuda/tests/test_voxtral_e2e; nsys stats
+--report cuda_gpu_kern_sum /tmp/f.nsys-rep | grep flash_fwd_kernel`. NOTE: without
+`VLLM_VOXTRAL_SAFETENSORS` the test SKIPPED and still exited 0 - a silent false pass, now
+FIXED (issue #463): it exits 77 and CTest reports Skipped. NOTE 2:
+the oracle needs BOTH `ninja` AND `CC` on PATH in a non-login shell (Triton JIT dies
+"Failed to find C compiler"), which is likely what environment.md records as "v0.25.0-stage
+crashes in EngineCore init". No mm row advances to DONE.
+## SPEC-DSPARK W7: device sequential Markov sampling (#436), 2026-08-12
+
+Same binary, only `VT_DSPARK_DEVICE_SAMPLE` differing, one flock, warm repeats,
+cold run discarded, `VT_SPEC_TRACE=1` for the phase split.
+
+| arm | sample ms | warm tok/s | text |
+|---|---|---|---|
+| 27B dense k=15, host loop | 10.44 | 17.31 | - |
+| 27B dense k=15, device | 9.24 | 17.42 | byte-IDENTICAL to host |
+| 35B A3B k=8, host loop | 0.59 | 71.06 | - |
+| 35B A3B k=8, device | 0.50 | 73.3 | byte-IDENTICAL to host |
+
+Byte-identical output on both lanes is the bar: this is a pure cost move, so a
+changed token would void it regardless of the speed delta.
+
+The residual sampling cost is a BANDWIDTH bound, not overhead. `markov_w2` is
+`[draft_vocab, markov_rank]` bf16 and the per-step bias GEMV re-reads all of it:
+27B 15 x 127 MB = 1.9 GB per draft step, 9.3 ms at ~205 GB/s against 9.24 ms
+measured; 35B 8 x 16 MB = 131 MB, 0.6 ms against 0.50 ms measured. Two lanes 13x
+apart in vocab both landing on the bound is not a coincidence. Upstream runs the
+same k sequential GEMVs, so this is not a gap against it, and graph capture
+cannot remove weight traffic.
+
+Unit gate 10 cases / 89 assertions, RED-first proven by MUTATION: dropping
+`first_sample_offset` from the base-row index fails 1 assertion, dropping the
+Markov bias from the sum fails 11 across 2 cases, tree restored byte-for-byte
+after each. Green on the local CPU build and the dgx CUDA build
+(`-DVLLM_CPP_CUTLASS_DIR=$HOME/cutlass-4.5.0`).
+
+Evidence: `dgx:~/work/dspark-w6/w7_ab.log`, `w7/*.txt`.
+
+## SPEC-DSPARK paired parity re-measure with W7 (2026-08-12)
+
+Both engines on an idle box after a reboot, pinned graphed oracle
+(`g555967922`), same target+draft+k, `max_num_seqs=2`, greedy, matched token
+counts, cold run discarded, ours 6 reps (median of the 5 warm).
+
+| 35B cell | ours | pinned graphed vLLM | ratio |
+|---|---|---|---|
+| "capital", 128 tok both | 75.82 | 77.28 | 0.981x |
+| "fibonacci", 89 tok both | 135.39 | 155.60 | 0.870x |
+
+Our fibonacci reps are 134.81 / 135.41 / 135.24 / 135.39 / 135.40, a 0.4%
+spread, so 0.870x is a reading and not noise. The capital cell spreads ~8%, so
+0.981x is the looser of the two.
+
+SPEED PARITY IS NOT MET. W7 removed host-side sampling waste but sampling is
+0.5 ms of this lane's step, so the e2e effect sits inside the capital cell's own
+noise band. The earlier 79.19 tok/s reading was PRE-REBOOT machine state and is
+not a W7 win; on the idle box both engines moved and the oracle moved more.
+Same-session pairing is what makes these rows quotable.
+
+The deficit is largest in the HIGH-ACCEPTANCE regime (0.870x, verify running
+every step) and smallest in the low-acceptance one (0.981x), which points at the
+T=1+k verify forward: both model families gate their decode CUDA graph on
+`input.pure_decode`, so our speculative verify falls off the captured graph and
+runs eager while upstream captures the uniform 1+k shape. Next lever.
+
+Evidence: `dgx:~/work/dspark-w6/parity35b.log`, `pinned_35b_on.json`.
+
+## SPEC-DSPARK W8: the T=1+k verify is CAPTURED (#442), 2026-08-12
+
+Paired against the pinned graphed oracle (`g555967922`) in ONE lock session,
+matched token counts, ours = median of 3 warm reps, cold run discarded.
+
+| 35B cell | before W8 | with capture | pinned vLLM | ratio |
+|---|---|---|---|---|
+| "capital", 128 tok both | 72.23 | 78.37 | 78.76 | 0.995x (was 0.981x) |
+| "fibonacci", 89 tok both | 134.55 | 140.82 | 142.88 | 0.986x (was 0.870x) |
+
+Same-binary A/B (`VT_SPEC_DECODE_GRAPH=0` is the eager verify): +8.5% on the
+capital cell, +4.7% on fibonacci, text byte-identical on both lanes.
+
+NOT >= 1.0x. The residual is ~1.4% against reps that spread 0.3%, so it is a real
+gap, not noise, and the row does not claim parity.
+
+Correctness: the four e2e spec-decode suites pass with capture ON and OFF with
+identical assertion counts (qwen27_spec 9, qwen27_dflash 27, qwen36_spec 9,
+qwen27_concurrent 5); default ON re-verified with the env unset.
+
+The mechanism, mirrored from vLLM: upstream's uniform-decode test is that all
+requests share a query_len, not that it is 1 (cudagraph_utils.py:95-105), and its
+captured decode length is `1 + num_speculative_tokens`
+(cudagraph_dispatcher.py:37), so upstream graphs the verify by construction. Ours
+gated on `num_actual_tokens == num_reqs` and ran it eager EVERY step.
+
+Three defects found on the way, each measured rather than reasoned: the aux
+multi-tap forward returned BEFORE the decode-graph gate (so no predicate could
+reach it); a captured replay re-read the PREVIOUS step's `num_accepted`, giving
+incoherent tokens AND 5x SLOWER (26 vs 136 tok/s) because zero acceptance
+multiplies the step count; and the staging path sized PER-REQUEST arrays by the
+TOKEN count, which is correct only when they are equal. Upstream keys graphs on
+BatchDescriptor(num_tokens, num_reqs, uniform) precisely because speculation
+makes them differ.
+
+Evidence: `dgx:~/work/dspark-w6/parity_w8.log`, `w8b.log`, `gates.log`,
+`final.log`, `pinned_35b_on.json`.
+
+## Moved out of `docs/BENCHMARKS.md` 2026-08-12 to pay for the Voxtral encoder FA-2 row (#432)
+
+Moved BYTE-FOR-BYTE, provenance intact, because `docs/BENCHMARKS.md` is a
+projection surface at its hard 45,000-character cap and landing #439 needed
+the room. Nothing is deleted. The remaining headroom is deliberately NOT
+quoted here: `scripts/check-public-doc-tables.py` measures it and is the only
+authority on it.
+
+This row was DEMONSTRABLY SUPERSEDED in place, which is why it was the one
+chosen. It asserted that c16 and c32 were `NOT MEASURED` and that both
+canonical attempts were void; six lines above it in the same section, the
+canonical 2026-08-11 six-point grid at `348c265d` reports c16 69.040 vs
+73.114 = 0.9443x and c32 84.064 vs 89.706 = 0.9371x, and labels itself the
+"first c16/c32". The scoreboard was contradicting itself; archiving the stale
+row resolves the contradiction rather than merely making room.
+
+It carries NO links of any kind, so it is archivable under the #460
+constraint: a row with a `docs/`-relative link cannot be moved here without
+dangling, because `check_links` resolves links from the archive's own
+directory and does not strip fenced spans. Quoted inside a fenced block so
+its bytes survive verbatim.
+
+From the Qwen3.6-27B NVFP4 by-concurrency section:
+
+```text
+| c16, c32 | NOT MEASURED. Both canonical attempts void: denominator contended mid-timing once, host OOM-reboot once | | |
+```
+
+## SPEC-DSPARK: INTERLEAVED cross-engine medians, and why single-shot was wrong (2026-08-12)
+
+Supersedes the 0.986x/0.995x figures recorded earlier the same day, which used
+ONE oracle load per cell.
+
+The pinned oracle's own per-prompt result moves up to 27% between same-config
+sessions on this box: "capital" 78.76 -> 98.01, "fibonacci" 142.88 -> 152.45.
+Our reps hold 0.3% across the same span, so the variance is the reference, not
+us. Part of it was self-inflicted: one run put the oracle FIRST to dodge a GB10
+reboot during its load, handing it a freshly booted idle box. The same
+comparison then reads 0.995x/0.986x one way and 0.833x/0.925x the other.
+
+INTERLEAVED (O,U,O,U,O,U in one flock, medians of per-rep medians):
+
+| cell | ours (per-rep medians) | oracle (per rep) | ratio |
+|---|---|---|---|
+| "capital", 128 tok | 75.3, 81.4, 78.2 | 81.5, 85.1, 97.8 | 0.919x |
+| "fibonacci", 89 tok | 141.4, 141.4, 141.4 | 143.2, 149.4, 142.1 | 0.987x |
+
+NOT parity: the MoE lane is 0.919x-0.987x.
+
+What is unaffected, because both arms run adjacent under identical conditions
+with the capture as the only difference:
+
+| cell | capture OFF | capture ON | delta |
+|---|---|---|---|
+| "capital" | 72.7 | 81.6 | +12.2% |
+| "fibonacci" | 136.2 | 141.0 | +3.5% |
+
+Plus the sync-free Markov chain (draft-ordered markov_w1 built at load, so the
+argmax feeds the next step's embedding on device and the chain needs ONE readback
+instead of k): the four e2e spec-decode suites pass with capture ON and OFF, 8/8
+runs green.
+
+Rule for this row: no cross-engine ratio without interleaved repetitions and
+medians. A single oracle load is worth nothing where the reference swings 27%,
+and the sign of the error depends on which engine got the first slot.
+
+Evidence: `dgx:~/work/dspark-w6/interleaved.log`, `oracle_rep{1,2,3}.json`,
+`parity_final.log`, `gates.log`.
+
+## SPEC-DSPARK: 5-rep interleaved, and why the ratio must be DISTRIBUTIONAL (2026-08-12)
+
+| cell | ours (median, range) | oracle (median, range) | ratio |
+|---|---|---|---|
+| "capital", 128 tok | 78.04 [76.0-79.3] | 77.16 [74.6-96.5] | 1.012x |
+| "fibonacci", 89 tok | 141.83 [138.9-142.4] | 149.03 [142.1-151.6] | 0.952x |
+
+The 3-rep run gave 0.919x / 0.987x for the same two cells. Both are "correct"
+and neither is stable, because the REFERENCE is not:
+
+| oracle rep | fib tok/s | capital tok/s | drafts | acceptance |
+|---|---|---|---|---|
+| 1 | 149.03 | 77.16 | 127 | 21.2% |
+| 2 | 151.61 | 74.60 | 117 | 24.0% |
+| 3 | 142.08 | 76.84 | 124 | 22.6% |
+| 4 | 151.13 | 78.50 | 127 | 21.2% |
+| 5 | 142.31 | 96.48 | 104 | 29.6% |
+
+Upstream's speculative decode is NOT run-to-run deterministic: identical prompts,
+greedy sampling and output lengths (89 / 128 tokens every rep), yet draft count
+104-127 and acceptance 21.2-29.6%. Fewer draft steps is fewer forwards, which is
+the 96.48 outlier and the 142-vs-151 bimodality. Ours is deterministic (identical
+tokens, identical step count), hence our 76-79 and 139-142 ranges.
+
+Distributional reading: on "capital" ours (78.04) is ABOVE the oracle's median
+and above 3 of its 5 draws; on "fibonacci" ours (141.83) sits just BELOW its
+floor (142.08), 0.998x of the worst draw and 0.952x of the median.
+
+Verdict: approximate parity, cell-dependent, NOT a clean >= 1.0x on both cells.
+Per-step the engines are aligned (ours 30.4 ms/step vs ~30.1 on "capital", 34.7
+vs ~34.5 on "fibonacci"), with the draft graph capturing, the verify captured and
+the Markov sample at its bandwidth bound, so there is no structural gap left --
+the residual lives inside the reference's own spread.
+
+Evidence: `dgx:~/work/dspark-w6/interleaved5.log`, `oracle5_rep{1..5}.json`,
+`diag.log`.
+
+## SPEC-DSPARK: the fibonacci gap was the REFERENCE's draw, not a deficit (2026-08-12)
+
+Isolating that prompt on the oracle (only prompt, warm-up on the same prompt, so
+the cumulative spec_decode counters are attributable):
+
+| run | tok/s | drafts | accepted | rate | tokens/step |
+|---|---|---|---|---|---|
+| 0 | 142.01 | 18 | 70 | 48.6% | 4.94 |
+| 1 | 142.66 | 18 | 70 | 48.6% | 4.94 |
+| 2 | 142.37 | 18 | 70 | 48.6% | 4.94 |
+| 3 | 151.18 | 17 | 71 | 52.2% | 5.24 |
+
+The 151 draw is ONE extra accepted token (71 vs 70), removing a whole draft step
+(17 instead of 18). It occurred in 1 run of 4 and is not faster per step; it did
+less work. Our acceptance equals upstream's MODAL value exactly: 48.6%, 4.94
+tokens/step, 18 steps.
+
+On matched work: ours 141.83 vs upstream 142.01-142.66 = 0.996x-0.999x. Against
+its 5-rep median (149.03, inflated by two lucky draws) the same data reads
+0.952x, which is why that figure is withdrawn.
+
+MoE lane on matched work: "capital" 1.012x, "fibonacci" 0.996x-0.999x. That is
+parity within the measurement's resolution, NOT a demonstrated >= 1.0x on both
+cells, and the row records it as such.
+
+Method note: a bimodal reference must be compared modally or per-work, never by
+its mean. Three earlier ratios for this row (0.986x single-shot, 0.919x/0.987x at
+3 reps, 0.952x at 5 reps) were all measuring the reference's draw distribution
+rather than either engine.
+
+Evidence: `dgx:~/work/dspark-w6/fibacc.log`, `fibacc.json`, `diag.log`.
+
+## SPEC-DSPARK: stop condition -- the residual is below measurement resolution (2026-08-12)
+
+| quantity | value |
+|---|---|
+| ours, 5 reps ("fibonacci") | min 138.90, median 141.80, max 142.40 |
+| oracle, modal draws (18 steps / 70 accepted) | min 142.01, median 142.37, max 142.66 |
+| distributions | OVERLAP (our max 142.40 > their min 142.01) |
+| median ratio | 0.9960x |
+| best-vs-best | 0.9982x |
+| our run-to-run spread | 2.47% |
+| their modal spread | 0.46% |
+
+The 0.4% median difference is six times smaller than our own spread and the
+distributions overlap, so the ordering is not established either way.
+
+No identified lever can close it: the largest remaining one is dropping the
+block-logits round trip (1.15 MB down + up), whose sync must happen regardless,
+so it is worth ~0.03 ms of a 34.7 ms step = 0.09%. The draft graph captures, the
+verify captures, the Markov sample is at its bandwidth bound, and per-step the
+engines match (30.4 vs ~30.1 ms; 34.7 vs ~34.5).
+
+Verdict: parity within the measurement's resolution. "capital" 1.012x,
+"fibonacci" 0.996x with overlapping distributions, acceptance identical at 48.6%
+/ 4.94 tokens per step. A strict >= 1.0x claim now needs a lower-noise harness
+(pinned clocks, many reps, and a reference whose acceptance does not vary), not
+more engineering.
+
+## SPEC-DSPARK: LOW-NOISE harness -- the gap is REAL at 0.975x (2026-08-12)
+
+Supersedes the same day's 0.996x "within resolution" reading, which was measured
+at free boost clocks and was too generous.
+
+Harness: GPU clocks PINNED at 1800 MHz for the whole run, 16 reps per arm with
+the cold run dropped, our arm run TWICE bracketing the oracle so drift is
+detectable, and the oracle's non-modal draws excluded by their own draft counts.
+
+| arm | n | median | range | spread |
+|---|---|---|---|---|
+| ours, BEFORE | 15 | 135.98 | 135.3-136.2 | 0.66% |
+| ours, AFTER | 15 | 135.86 | 128.8-136.0 | 5.30% |
+| drift before -> after | | -0.088% | | |
+| oracle, MODAL (18 steps) | 12 | 139.36 | 137.8-139.7 | 1.33% |
+| oracle, non-modal (17 steps) | 3 | 147.7-148.2 | | excluded |
+
+Distributions do NOT overlap (our max 136.2 < their min 137.8). Ratio 0.9751x by
+median, 0.9750x best-vs-best. Drift is negligible.
+
+At free boost clocks the same two engines read 141.8 vs 142.4 (0.996x); pinning
+the clock moved ours to 135.9 and theirs to 139.4. Both slowed, OURS MORE, which
+means our step carries more SM-clock-sensitive work per token. That points at the
+MoE expert activation at T=9 that this row measured at ~1.7x GPU per token and
+never closed -- the verify is ~30 ms of a ~34.7 ms step and both engines graph
+it, so the residual is inside the expert path, not launch overhead.
+
+Verdict: NOT parity on this cell. 0.975x, real and reproducible.
+
+Method lesson (the inverse of the bimodal-reference one): a difference that hides
+inside noise is not thereby absent. "Below resolution" describes the harness, not
+the engines.
+
+Evidence: `dgx:~/work/dspark-w6/lownoise.log`, `fibacc.json`.
+
+## SPEC-DSPARK: the 2.5% is in the MoE expert GEMM, and the repack is LOAD-TIME (2026-08-12)
+
+nsys on our verify at T=9 (35B, k=8), --cuda-graph-trace=node, two token lengths.
+
+NOT the gap: `TransposeToInt32Kernel` (16.9%), `gptq_marlin_repack_kernel`
+(15.8%) and `ProcessScalesKernel` (7.7%) total 40.4% of the 96-token run, but
+report the SAME 20561 instances and the same totals in the 32-token run
+(183.5/170.4/83.9 ms vs 183.0/170.2/83.5). Identical counts across run lengths
+means LOAD-TIME: ~437 ms once at startup, nothing per token. Reading the
+96-token percentages alone would have sent someone optimising a one-time cost.
+
+The per-token cost is the expert GEMM: `marlin_moe_wna16::Marlin` 560 -> 1520
+instances (32 -> 96 tokens) = ~15/token, (249.2 - 90.9) ms / 64 tok = 2.47
+ms/token, which at 135.9 tok/s (7.36 ms/token) is ~34% of wall. Compute-bound,
+matching the clock sensitivity that exposed the 0.975x gap.
+
+Closing 2.5% end-to-end needs ~7% off that kernel.
+
+REQUIRED before acting: profile the oracle's expert path and pair by call count.
+A prior campaign on this repo found Marlin at 55.5% of our step and called it the
+gap; upstream's profile then showed 57.2% of ITS step, so it was never the gap. A
+share measures where OUR time goes, not where upstream's advantage is.
+
+Evidence: `dgx:~/work/dspark-w6/prof.log`, `prof/ours_{32,96}.nsys-rep`.
+
+## SPEC-DSPARK: paired profile -- 8.2% inside the SAME Marlin MoE kernel (2026-08-12)
+
+Upstream profiled via its own torch profiler (nsys breaks its EngineCore), warm
+generate only, 96 tokens, same model + draft + k as ours.
+
+| | kernel | instances | GPU time |
+|---|---|---|---|
+| ours | marlin_moe_wna16::Marlin | 1520 | 249.22 ms |
+| upstream | marlin_moe_wna16::Marlin | 1520 | 230.39 ms |
+
+Same kernel, same template arguments, same 1520 launches, ours 8.2% slower.
+Shares agree too: excluding our load-time repack (437 ms) it is 38.8% of our
+decode-relevant GPU time vs their 36.9%.
+
+The arithmetic closes: 34% of wall x 8.2% = 2.8% end-to-end against the 2.5%
+measured under pinned clocks. The whole residual is this kernel.
+
+Note for method: the SHARES are near-equal (38.8 vs 36.9), so share reasoning
+would have concluded "not the gap" -- the same mistake a previous campaign made
+with Marlin at 55.5% vs 57.2%. Only ABSOLUTE time at matched call count exposes
+it: identical work, 18.8 ms more of it.
+
+Ruled out by the same pairing: different algorithm, different kernel family,
+launch overhead, acceptance, the repack (load-time), the sampler (bandwidth
+bound) and graph capture (both capture).
+
+Next step is narrow: compare LAUNCH parameters (Marlin selects thread_k/thread_n
+per shape), the grouped-GEMM problem layout at T=9, and the repacked
+scales/zero-point layout. Recovering 8.2% there is worth the full 2.5%.
+
+Evidence: `dgx:~/work/dspark-w6/oracle_prof.log`, `oracle_kernels.json`,
+`prof/ours_{32,96}.nsys-rep`.
+
+## SPEC-DSPARK: narrowing the 8.2% inside the Marlin MoE kernel (2026-08-12)
+
+Instrumentation cross-check (ours nsys, upstream torch profiler):
+
+| | ours | upstream | delta |
+|---|---|---|---|
+| Marlin MoE | 249.2 ms | 230.4 ms | +8.2% |
+| everything else | 392.8 ms | 393.6 ms | -0.2% |
+| total decode GPU | 642.0 ms | 624.0 ms | +2.9% |
+
+All other GPU work matches to 0.2%, so the tools are not the explanation, and the
+total tracks the pinned-clock wall gap (2.5%).
+
+Eliminated by source reading: kernel selection (full template arguments identical
+on both sides), the block_size_m >= 16 clamp for 1-byte inputs (same instantiation
+proves it does not bite here), grid selection (determine_exec_config is
+byte-identical to the pinned csrc copy, 69 lines, and both callers take the auto
+path), and ignore_invalid_experts (only matters with an expert_map).
+
+Remaining: what the kernel READS. Our load path runs TransposeToInt32Kernel and
+ProcessScalesKernel that upstream does not, adapting a different source layout, so
+the stride/padding/alignment of the final B and scales tensors is unverified; and
+weight RESIDENCY is unestablished on this path, against a standing GB10 finding
+that host/ATS-retagged weights are materially slower per GEMM.
+
+Next step is measurement, not a rewrite: dump B/scales strides and pointer
+residency for one expert on both sides and compare. The kernel itself is vendored
+from vLLM and identical where it chooses what to run.
+
+## SPEC-DSPARK: the kernel inputs MATCH -- the 8.2% may be routing (2026-08-12)
+
+Direct comparison of what each engine hands the Marlin MoE kernel:
+
+| property | ours | upstream |
+|---|---|---|
+| w13 scales per expert | 2*(K/16)*N = 131072 B | [256,128,1024] fp8 = 131072 B |
+| w2 scales per expert | (N/16)*K = 65536 B | [256,32,2048] fp8 = 65536 B |
+| pointer alignment | pool over cudaMalloc | ptr%16 == 0, ptr%256 == 0 |
+| residency | cudaMalloc (device) | torch CUDA tensor (device) |
+
+Identical kernel, instantiation, grid rule, launch count, scale layout, alignment
+and residency. "Our kernel is slower" is no longer the simplest explanation.
+
+Likelier: we are not doing the same WORK. The kernel loops
+div_ceil(num_tokens_past_padded, moe_block_size) blocks per launch, and that
+depends on how many DISTINCT experts the batch touches (E=256, top_k=8, M=9 ->
+up to 72 pairs, each padded). The launch COUNT is fixed by layers x steps (1520
+both sides) but the blocks per launch are not. Our token stream is not upstream's
+-- the 35B "fibonacci" outputs diverge at char 55 (`return (` vs `return(`), the
+ratified near-tie regime -- so the two engines can execute different amounts of
+expert work for the same prompt.
+
+If so, the 8.2% is not an implementation gap and cannot be optimised away.
+
+Deciding experiment, required BEFORE any kernel work: instrument
+num_tokens_past_padded (or per-call block count) on both sides for the same
+prompt and compare totals. Equal totals => our kernel is genuinely slower.
+Different totals => the gap is routing and the kernel comparison was never
+like-for-like.
+
+## SPEC-DSPARK: routing REFUTED -- our Marlin MoE is 12.8% slower per unit of work (2026-08-12)
+
+Measured on both sides (VT_MOE_PAD_STATS=1 ours; moe_align_block_size wrapped
+upstream), same prompt, same k:
+
+| | avg padded tokens / call | avg blocks / call | block size |
+|---|---|---|---|
+| ours | 311.2 | 38.9 | 8 |
+| upstream | 324.8 | 40.6 | 8 |
+
+Upstream loops 4.4% MORE blocks per launch and is still 8.2% faster, so the
+divergent-routing explanation is dead. Normalising by the work performed makes
+our deficit larger:
+
+| | time | launches | blocks/launch | per block |
+|---|---|---|---|---|
+| ours | 249.2 ms | 1520 | 38.9 | 4.21 us |
+| upstream | 230.4 ms | 1520 | 40.6 | 3.73 us |
+
+~12.8% slower per unit of work. Both choose block_size 8, independently
+confirming that upstream's >= 16 clamp does not bite on this shape.
+
+Every input-side explanation is now eliminated: same kernel, same instantiation,
+same grid rule, same scale layout, same alignment, same residency, and more work
+on their side. What remains is how the kernel executes given identical inputs
+(occupancy / shared-memory budget / max_shared_mem passed to the launcher).
+
+Two diagnostic traps, both hit here: our probe read a device value inside the
+verify, which W8 now CAPTURES ("cudaStreamSynchronize: operation not permitted
+when stream is capturing"), and upstream's wrapper sat inside a torch.compile
+region and broke compilation. Both counts are capture- and compile-independent,
+so they run with VT_SPEC_DECODE_GRAPH=0 and enforce_eager respectively. A work
+COUNT may be taken under different execution modes; a TIME may not.
+
+Evidence: `dgx:~/work/dspark-w6/padcmp.log`, `oracle_pad.json`.
+## PERF-GDN-PACKED-BRIDGE: packed GDN decode reaches the fp8 tower — 0.977x -> 0.984x, INDICATIVE (2026-08-12, #365)
+
+Qwen3.6-27B NVFP4 `nvidia`@`0893e160` (ModelOpt `modelopt_mixed`), GB10 `sm_121a`,
+`RelWithDebInfo` + `TRITON=ON` + `CUTLASS` + arch `121a`. **Everything below is c1
+at `input_len=16`, out 256.** That is a DECODE-weighted harness and it is not the
+1024-in/128-out canonical grid six lines up in `docs/BENCHMARKS.md`; the two are
+not comparable and neither supersedes the other.
+
+**SELECTION — PROVEN.** Read from `test_qwen27n_fp8_tower_paged_engine`, the only
+harness that loads this checkpoint AND steps eagerly (CUDA-graph replay performs
+no host dispatch, so the counters read 0 in a graphed run whatever was selected):
+default `packed_launches`/`triton_launches` = 0/0; with
+`VT_GDN_PACKED_DECODE_FP8_TOWER=1 VT_GDN_FP8_IN_BF16=1` = **48/48**, the vendored
+FLA cubin on every GDN layer. Corroborated by the arm exactly as it landed on
+main — contract `packed_launches == 0` — passing without the lever and FAILING
+with it (`231 assertions | 1 failed`, exit 1).
+
+**e2e vs the PIN — 0.977x -> 0.984x, INDICATIVE, NOT BINDING.** Median TPOT, 3
+requests/leg: pin 81.39 ms, ours OFF 83.33, ours ON 82.72. Two methodology gaps,
+both recorded because the ratio is quotable and someone will quote it:
+
+1. **The arms ran under different background conditions.** The oracle driver
+   (`bridge-oracle.sh:51`) stops `local-ai-worker` before its legs; the script
+   that produced ALL SIX of our legs and BOTH nsys traces (`bridge-measure.sh`)
+   does not. Numerator and denominator therefore did not share a machine state.
+2. **The arms were not interleaved.** Ours ran 16:52-17:04 and the pin 17:14-17:18
+   under SEPARATE lock acquisitions. `oracle.log` pin-leg 3 reports Mean 83.57 /
+   P99 87.88 against an 81.39 median — a real interference event inside the pin
+   legs, not a tail artefact.
+
+Both defects push the same way: they inflate the pin's time, so the true ratio is
+**no better than** quoted and the number is conservative. It is still a
+single-shot cross-engine comparison and an interleaved re-run is OWED before it
+becomes binding.
+
+**Per-kernel A/B — quote the STRUCTURAL terms only.** nsys `-t cuda
+--cuda-graph-trace=node`, `cuda_gpu_kern_sum`, 63 decode steps, one run per arm:
+
+| term | delta ms/step | survives the control drift? |
+|---|---:|---|
+| `GdnDecodeFusedKernel` -> FLA `fused_recurrent_gated_delta_rule_packed_decode_kernel` | **-0.400** | YES — kernel identity CHANGES |
+| `GdnPostConvFastKernel` absorbed (3024 decode calls gone) | **-0.131** | YES — the kernel DISAPPEARS |
+| bf16 cascade (`CastBf16` 4096->1024, conv/`MulColVecF32` f32->bf16, `gemvx`) | -0.078 | NO — within drift |
+| merged fp8 qkvz GEMM `nvjet…qqsss` -> `…qqtst` (D f32->bf16) | +0.095 | NO — within drift |
+
+The control is `marlin::Marlin`: 8,128 instances in BOTH traces, touched by
+nothing in this row, and it moves **+0.58% = +0.262 ms/step** between them. That
+is half the size of the -0.5137 "net attributable" the row's own commit body
+quotes to four figures, so **-0.5137 must not be quoted**. Only the two
+structural terms — a kernel that changes identity and a kernel that disappears —
+are larger than the drift. The +-0.09 terms are inside it and are candidates, not
+findings. The e2e -0.61 ms/step is a separate instrument agreeing on direction.
+
+**Open gap: ~4.6% against vLLM's own launch of the SAME cubin.** Ours runs the
+FLA packed decode at **20.09 us/call**; the profile this row was scoped from
+records vLLM at **19.21 us/call** on the identical kernel — ~0.042 ms/step. Same
+binary artefact on both sides, so this is launch/argument-side, not a ceiling.
+Not re-measured here.
+
+**Also unmeasured, and named so nobody quotes them as measured:** any concurrency
+above c1; any input length above 16 — which matters because the
+`VT_GDN_FP8_IN_BF16` half of the composition earns **+0.017 ms/step (slightly
+NEGATIVE) in decode** and its actual justification is a 122.99 ms/req PREFILL
+pass at T~4096 that this harness never exercises; and the `qqsss`->`qqtst`
+reselection at large M.
+
+**Tokens.** `test_qwen27n_fp8_tower_paged_engine` 236 assertions SUCCESS, 16/16
+token-exact OFF and ON; SACRED `test_qwen27_paged_engine` (`unsloth@890bdef7`)
+235 assertions SUCCESS, 16/16 OFF and ON, confirming the lever is inert on a BF16
+tower. That gate admits a **x1.10** fp8 scale perturbation while the change it is
+asked to bound is bf16 rounding of the `in_proj` D at ~2^-9 ~ **0.2%**, so it is
+~50x coarser than the perturbation and establishes NO GROSS DEFECT, not
+numerical equivalence. No test anywhere compares `vt::GdnPackedDecode` against
+`vt::GdnDecode`; the only op-level bound is packed-vs-CPU-reference at 2% rtol
+(`tests/vt/test_ops_gdn.cpp`), i.e. a ~4% mutual bound. That comparison is OWED.
+
+Both toggles stay DEFAULT OFF; nothing here argues a flip.
+
+## SPEC-DSPARK: source-level explanations EXHAUSTED for the Marlin residual (2026-08-12)
+
+Complete elimination list for the 12.8%/unit-work gap, so it is not redone:
+
+| checked | verdict |
+|---|---|
+| kernel source | dispatcher VERBATIM vs upstream csrc; our only deltas are includes + a default-OFF E=1 clamp that cannot fire for MoE |
+| template instantiation | identical (<...128, 1, 8, 4, true, 4, 1, false>), same a/b/c/s scalar types |
+| determine_exec_config | byte-identical (69 lines); both callers take the auto path |
+| moe_block_size | 8 on both (measured); upstream's >= 16 clamp does not fire |
+| max_shared_mem | same query + same /blocks_per_sm - 1024 adjustment |
+| use_atomic_add / use_fp32_reduce / is_k_full | false / true / true on both |
+| scale bytes per expert | 131072 and 65536 on both |
+| alignment / residency | 256-byte aligned, cudaMalloc device memory on both |
+| work per launch | ours 38.9 blocks vs upstream 40.6 -- upstream does MORE |
+| CUDA toolkit | 13.0 both (ours V13.0.88; torch 2.13.0+cu130) |
+| arch / flags | 121a, -O3 -DNDEBUG; sm_121 kernels in both traces |
+
+Identical code, parameters, toolchain and arch, with LESS work on our side, still
+4.21 us/block vs 3.73.
+
+Next step is ncu, not source reading:
+  sudo ncu --set full --kernel-name-base mangled --kernel-name regex:marlin_moe_wna16 \
+           --launch-count 20 <cmd>
+on both engines, comparing sm__throughput, achieved_occupancy,
+launch__registers_per_thread and the top stall reason. Equal occupancy with
+different memory throughput => data placement; different occupancy => register
+pressure, i.e. a codegen difference between two builds of the same source.
+
+## SPEC-DSPARK: the compiled kernels are EQUIVALENT -- residual is runtime (2026-08-12)
+
+ncu on our side (10 launches, steady state): 94 registers/thread, 24.0% warps
+active, 10.6% SM throughput, L1 hit 0.7%, L2 hit 9.5% -- latency-bound, as
+expected for a W4A16 grouped GEMM at M=9.
+
+Static comparison of the SAME instantiation, ours from our build object and
+upstream from the shipped _moe_C_stable_libtorch.abi3.so:
+
+| | registers | SASS instructions |
+|---|---|---|
+| ours (sm_121a) | 94 | 3664 |
+| upstream (sm_120) | 94 | 3664 |
+
+Equivalent machine code. Upstream ships NO sm_121 cubin
+(sm_80/87/89/90/90a/100/110/120), so on GB10 it runs family-compatible sm_120
+while we compile sm_121a, and both compile to the same instruction count and
+register pressure.
+
+Every code-level explanation is therefore eliminated, including the machine code:
+source, instantiation, grid, block size, shared memory, reduction flags, scale
+layout, alignment, residency, toolkit, arch, registers and SASS length all match,
+and upstream does MORE work per launch (40.6 vs 38.9 blocks). Ours still takes
+4.21 us/block vs 3.73.
+
+The residual is RUNTIME, not code: how each allocator places expert weights and
+activations, hence L2/DRAM locality across 256 experts. Our L2 hit rate is 9.5%,
+so this kernel is dominated by memory placement, and the two engines allocate
+differently (DevicePool slabs vs torch caching allocator) despite both being
+cudaMalloc-backed, contiguous and 256-byte aligned.
+
+NOT worth doing: editing the kernel, its launch config, layout or build flags --
+all proven identical.
+
+Blocked: upstream's ncu counters for the same kernel. vLLM's EngineCore fails to
+initialise under ncu kernel replay, so the occupancy / L2 / DRAM comparison
+cannot be completed the same way. Options: --replay-mode application, a
+standalone harness calling the op directly, or accepting the 2.5% as unattributed.
+
+Verdict: 0.975x code cell, 1.012x prose cell, NOT parity, residual real and
+unattributed.
+
+Evidence: `dgx:~/work/dspark-w6/ncu2.log`, cuobjdump on both binaries.
+
+## SPEC-DSPARK: final attribution -- 12.9% effective-bandwidth gap (2026-08-12)
+
+The Marlin MoE kernel is DRAM-bound (L2 hit 9.5%, SM throughput 10.6%), so its
+time IS its achieved bandwidth. 4-bit weights: gate_up K*2N/2 = 1.05 MB/expert,
+down N*K/2 = 0.52 MB (K=2048, N=512), average 0.79 MB per expert-block.
+
+| | us/launch | MB/launch | effective bandwidth |
+|---|---|---|---|
+| ours | 164.0 | 30.59 | 186.6 GB/s |
+| upstream | 151.6 | 31.93 | 210.7 GB/s |
+
+Upstream sustains 12.9% more effective bandwidth, which is the entire per-unit-
+work gap (12.8%).
+
+Residency is NOT the cause: the standing GB10 staging fix is already applied --
+ResidentWeight (dense_attn_block.h:190-196) and BuildMoeMarlinResident both
+allocate via d.b.Alloc -> cudaMalloc and upload once, so expert weights are true
+device memory, contiguous and 256-byte aligned like upstream's tensors.
+
+Identical machine code, identical launch parameters, identical layout and
+residency, LESS work on our side, 13% lower achieved bandwidth on the same bytes.
+The cause is memory-system behaviour for our allocation (page backing / TLB
+coverage of one ~512 MB slab spanning all 256 experts vs torch's segmented
+caching allocator), not anything the kernel or its inputs express.
+
+Next levers: (1) split the per-expert slab and re-measure; (2) cudaMemAdvise /
+preferred-location hints; (3) upstream ncu counters (blocked: EngineCore will not
+initialise under ncu replay).
+
+Verdict: 0.975x code, 1.012x prose, NOT parity, residual attributed to achieved
+memory bandwidth.
+
+## SPEC-DSPARK: the slab-size lever is REFUTED (2026-08-12)
+
+Proposed as the cheapest next lever, then checked before spending on it: our
+per-expert gate_up slot is 2*wg_i32 = 262144 int32 = exactly the 1.0 MB that a
+[K, 2N] 4-bit weight requires (K=2048, N=512), with no padding, and the full slab
+is 268 MB -- identical to upstream's [E, K, 2N] 4-bit tensor. There is no
+oversizing or stride inflation to remove, so splitting or re-packing the slab
+cannot recover the 12.9% bandwidth difference.
+
+That closes the last cheap lever. What remains needs upstream's ncu counters
+(blocked: its EngineCore will not initialise under ncu kernel replay) or
+cudaMemAdvise-style placement experiments whose premise is currently unverified.
+
+## SPEC-DSPARK: upstream ncu is blocked in BOTH replay modes (2026-08-12)
+
+Recorded earlier as "blocked under kernel replay" with `--replay-mode
+application` listed as an option. Tried it: identical failure ("Engine core
+initialization failed"), so vLLM's EngineCore will not initialise under ncu on
+this stack in either mode -- the profiler's presence alone breaks init, not the
+kernel serialisation.
+
+Consequence: upstream's DRAM efficiency (210.7 GB/s) remains DERIVED from
+time x bytes rather than directly counted, and its L2 hit rate / occupancy cannot
+be compared against our measured 9.5% / 24.0%. The only remaining route is a
+standalone harness calling moe_wna16_marlin_gemm outside the engine.
+## ORACLE PROVENANCE: every online-serving ratio on this project ran against the 0.25.0 ROLLBACK, because the harness ENFORCED it (2026-08-12, `row/BENCH-ORACLE-PIN-RECONCILE`, #520, no GPU work)
+
+This entry adds no measurement. It records **which oracle the existing ones
+used**, which was not knowable from the numbers themselves, and it is filed here
+rather than in `docs/BENCHMARKS.md` because it re-labels many rows at once.
+
+### The mechanism, which is stronger than #375
+
+`.agents/upstream-sync.md:7-9` advanced the parity pin to `555967922` on
+2026-07-26. `tools/bench/online_gate.py:53-54` still read
+`VLLM_ORACLE_VERSION = "0.25.0"` / `FLASHINFER_VERSION = "0.6.13"`, and
+`serve_low_common.py:28` still read `VLLM_COMMIT = 702f4814…`, enforced by a
+`raise` at `online_gate.py:3509-3533`.
+
+So this is not the #375 story of an operator resolving a stale symlink. **The
+gate refused the pin.** For 17 days no run through the canonical harness could
+have named a compliant denominator, however careful the operator was. AGENTS.md
+calls this a record disagreeing with the tree; it is reconciled in this row.
+
+Confirmed live the same day: `~/venvs/vllm-oracle -> vllm-oracle-v0.25.0-stage`,
+and `scripts/dgx-online-serving.sh:35` resolves exactly that path, so the
+canonical driver took the rollback by construction.
+
+### Measured identity of both venvs (dgx, read-only ssh, 2026-08-12)
+
+| | `vllm-oracle-v0.25.0-stage` (what ran) | `vllm-oracle-next` (**the PIN**) |
+|---|---|---|
+| `vllm.__version__` | `0.25.0` | `0.23.1rc1.dev1511+g555967922` |
+| distribution metadata | `0.25.0` | `0.23.1rc1.dev1511+g555967922.precompiled` |
+| `flashinfer.__version__` | `0.6.13` | `0.6.15.post1` |
+| torch / transformers | 2.11.0 / 5.13.1 | 2.13.0 / 5.14.1 |
+| pandas | 2.2.3 | **MISSING** (#522) |
+| install shape | site-packages | **editable** → `~/work/vllm-src-5559679` @`5559679229bc9618` |
+
+**Two traps worth more than the table.** (1) The pin is an *editable* install, so
+`<venv>/lib/python3.12/site-packages/vllm` DOES NOT EXIST; a `grep -r` under that
+path returns nothing and reads exactly like "the feature is absent from the pin".
+(2) The pin's runtime string is `0.23.1rc1.dev1511+g555967922`, **not** the
+`0.26.0.dev0` the pin record's prose names, and its metadata carries a
+`.precompiled` suffix the runtime string lacks — so the old
+`metadata == runtime == CONST` check was unsatisfiable at the pin for ANY value.
+
+### What is now labelled, and what is NOT thereby wrong
+
+Every `0.25.0` row in the `docs/BENCHMARKS.md` online-serving table, the 27B
+canonical six-point grid (`0.9371x-0.9561x`), and the 35B canonical grid
+(`0.918x-0.972x`) name the ROLLBACK. #417 measured the rollback and the rebuilt
+pin **equivalent in speed** on the 27B at c1 (rollback/pin 0.9983 mean, 0.9996
+median, OVERLAPPING, n=3), so this is a **provenance defect, not a numbers
+defect** — the figures are not withdrawn, they are attributed. A binding grid
+against the pin is owed and is blocked by #522.
+
+The 35B grid measured 2026-08-12 (reported `0.9840` / `0.9817` at c1 falling to
+`0.9309` at c4) was **run through this same harness and therefore against the
+rollback**. It is not otherwise recorded in this tree, and its evidence artifacts
+are not committed, so it is named here for provenance only and is not quotable
+until recorded with them.
+
+**The figure `0.9781` does not exist in this repository.** Grepped across
+`docs/` and `.agents/`: zero hits. The nearest real values are the
+2026-08-10 `a0fa12c7` grid's c1 output-throughput ratio `0.979` and c1 mean TPOT
+`0.978` (this file, §"35B c2/c8 weak cells REFUTED"), which the 2026-08-11
+canonical grid at `348c265d` supersedes with c1 `0.9708`. Anyone carrying
+`0.9781` forward is carrying a number no artifact produced.
+
+### `docs/BENCHMARKS.md` disagreed with itself about the 35B, and now does not
+
+Its scoreboard row named the CANONICAL 2026-08-11 grid (`0.918x-0.972x`,
+`348c265d`) while its own by-concurrency table below still printed the SUPERSEDED
+2026-08-10 `a0fa12c7` grid (`0.935x-0.979x`) with no SHA on the rows. Both grids
+are real and both are binding-harness runs at different code SHAs; the page
+simply did not say which was which. Reconciled by labelling each row with its
+grid, keeping the `a0fa12c7` TPOT/TTFT/CoV detail that #414 and #417 both cite
+rather than evicting it.
+
+### `--language-model-only` EXISTS at the pin — the "it does not" report is REFUTED
+
+A live claim held that the flag is absent from the pinned vLLM (`grep -r
+language_model_only` empty, absent from `vllm serve --help`), which would have
+meant every 27B run quoting "oracle GRAPHED + `--language-model-only`" used
+something other than the pin. **Both premises were artifacts of how they were
+checked, and the flag is present and accepted on BOTH venvs:**
+
+| check | pin (`vllm-oracle-next`) | rollback (`v0.25.0-stage`) |
+|---|---|---|
+| `engine/arg_utils.py` registration | `:1276` | `:1241` |
+| `vllm serve --help=all` occurrences | **1** | **1** |
+| `vllm serve --help=language-model-only` | resolves, with help text | resolves, with help text |
+| config consumer | `config/multimodal.py:326` | `:325` |
+
+The grep was empty because the pin is an editable install (no `site-packages/vllm`
+to grep). The flag is missing from `vllm serve --help` because that output is a
+**summary**; it ends with "For full list: `vllm serve --help=all`". A null grep
+proved the path wrong, not the feature absent.
+
+**So no ratio needs re-labelling on account of the flag's existence.** The
+separate and still-live defect is #414: the canonical driver
+(`scripts/dgx-online-serving.sh:460-478`) never PASSES it, so the oracle runs the
+unfused QK-norm+RoPE+gate path while our arm runs the fused one. Note also that
+`tools/bench/run_serve_low.py:549`, the repo's only other mention, sits inside
+`build_dry_run_manifest` with `<VLLM_ORACLE>` / `<MODEL_SNAPSHOT>` placeholders —
+it is a RECORDED RECIPE, not executed argv, so nothing in the tree verifies that
+a serve-low server was actually launched with the flag it documents.
+
+### The repair, and why it is not just three new constants
+
+`.agents/upstream-sync.md` gains a machine-readable `parity-pin` block carrying
+the four exact strings a runtime check can compare; `tools/bench/` reads it
+instead of duplicating it. The assertion is **strengthened, not relaxed**: the
+resolved commit is now asserted via the `+g<sha>` segment of `vllm.__version__`,
+which is the only term that separates the pin from the rollback — the rollback
+runs, is deterministic, and reports a perfectly clean `0.25.0`. `PANDAS_VERSION`
+is deliberately left failing closed at the pin (#522) rather than papered over.
+18 new tests in `tests/tools/test_oracle_pin.py`; `tests/tools` 208 → 226, green.
+
+## SPEC-DSPARK: C_tmp cap is performance-NEUTRAL; a +2.9% claim was drift (2026-08-12)
+
+Real divergence found: upstream caps the split-K reduce buffer at
+min(size_n * sorted_len, sms*4*moe_block_size*max_thread_n) (ops.cu:709-713); we
+allocated only the upper bound -- 15.3 MB vs 3.15 MB (gate_up) and 30.5 MB vs
+3.15 MB (down).
+
+First measurement suggested +2.91% (135.98 -> 139.93, pinned-clock harness).
+WRONG. Same binary, same session, interleaved capped/uncapped/capped behind
+VT_MARLIN_CTMP_UNCAPPED:
+
+| arm | median |
+|---|---|
+| capped (fix) | 137.36 |
+| uncapped | 137.32 |
+| gain | +0.03% |
+
+The same run shows the trap: first arm 119.74 (min 108.3), third arm 137.63 --
++14.9% drift INSIDE one session. GB10 cannot lock memory clocks (only SM), so a
+DRAM-bound kernel's absolute throughput wanders and cross-run before/after
+attributes that wander to whatever changed.
+
+Conclusions: the cap lands as memory hygiene (mirrors upstream, returns 12-27 MB
+per stream), NOT as a perf fix; C_tmp size is ELIMINATED as an explanation of the
+12.9% bandwidth gap; the standing within-session ratios are 0.9757 and 0.9646
+(~0.965-0.976) and the fix moved neither.
+
+Method: third time drift has fooled a before/after here. Pairing caught the
+first, pinned clocks the second, and only an in-process toggle catches this one.
+Future perf claims on this row need the toggle, not two runs.
 ## LTX-2.5 L9c — the per-phase pool drain is worth 0.11 GiB, and L9B's 58 GB runaway does not reproduce (2026-08-13, `row/LTX25-L9C-CONNECTOR-DRAIN`, issue [#435](https://github.com/mudler/vllm.cpp/issues/435))
 
 **No speed number is claimed and none is implied.** LTX-2.5's speed axis is

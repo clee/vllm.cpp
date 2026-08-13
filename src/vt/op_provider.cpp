@@ -462,6 +462,19 @@ const char* OpNameImpl(OpId op) {
       return "MarlinDenseGemm";
     case OpId::kMiniMaxH3:
       return "MiniMaxH3";
+    // Absorbed from origin/main, named in enum order. This exhaustive switch IS
+    // the drift guard (0541cbeaa), and it carries no `default`, so merging main
+    // is precisely when it is supposed to fire.
+    case OpId::kAttentionDenseFa2:
+      return "AttentionDenseFa2";
+    case OpId::kMatmulFp8CublasLtAlphaVec:
+      return "MatmulFp8CublasLtAlphaVec";
+    case OpId::kMamba2ChunkScan:
+      return "Mamba2ChunkScan";
+    case OpId::kMamba2StateUpdate:
+      return "Mamba2StateUpdate";
+    case OpId::kRmsNormGatedGroup:
+      return "RmsNormGatedGroup";
     case OpId::kLtx2:
       return "Ltx2";
     case OpId::kConv2d:
