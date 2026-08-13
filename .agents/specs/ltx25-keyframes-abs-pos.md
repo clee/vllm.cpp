@@ -61,9 +61,12 @@ is small and it is unconditional, which is exactly why its absence is easy to
 miss and expensive to leave.
 
 **Do not port `enable_keyframes_abs_pos_embedding` / `supports_…`
-(`model.py:167-193`).** Both are **defined and never called** anywhere in the
-checkout — one grep hit each, the definition. Re-verify that before relying on
-it; do not take it from this spec.
+(`model.py:166-173` and `:175-200`).** Both are **defined and never called**
+anywhere in the checkout — one grep hit each, the definition, re-confirmed with a
+positive control in the same command. Re-verify before relying on it; do not take
+it from this spec. But **read `supports_…`**: §2 shows it returns `False` on the
+NVFP4 arm both before and after the load, which is what settles that arm's
+behaviour even though nothing calls it.
 
 ## 2. Why this is not "just a zero"
 
@@ -82,18 +85,52 @@ The polarity does mean a *genuine* zero would be inert, since the term is
 **added**, not multiplied. That is why the FP8 case is the one that changes
 output.
 
-**Two reviewers disagree about the NVFP4 arm, and the implementer must settle
-it by execution, not by reading.** One reports the parameter is *zero-initialized*
-(`model.py:200`) and therefore "an exact no-op there". The other **ran** it and
-got a **meta** tensor: construction happens under `with torch.device("meta")`,
-so the `torch.zeros(1, inner_dim)` in `model.py:217-219` is itself a meta
-tensor, `assign=True` never materialises the missing key, and reading the value
-raises `RuntimeError: Tensor.item() cannot be called on meta tensors`. Both
+**SETTLED BY EXECUTION on 2026-08-13, and the answer decides the NVFP4 arm.**
+Two reviewers had disagreed — one read the parameter as *zero-initialized*
+(`model.py:200`) and therefore "an exact no-op there"; the other **ran** it. Both
 readings are consistent with the source; only one is consistent with what runs.
-**Reproduce it yourself and record the transcript.** The answer decides §6:
-a materialised zero means the NVFP4 arm can simply no-op, while a meta parameter
-means upstream would never reach the add at all, and mirroring a no-op there
-would be inventing behaviour rather than porting it.
+An implementer then executed upstream's own `create_meta_model`
+(`loader/helpers.py:84-95`) against the real NVFP4 `__metadata__`, read through
+upstream's own `read_model_metadata` / `SafetensorsModelStateDictLoader`
+(`sft_loader.py:58-74`):
+
+```
+keys matching 'keyframes_abs_pos' in the file : []   (0 of 7876 entries)
+config.transformer['use_keyframes_abs_pos_embedding'] = True
+keyframes_abs_pos_embedding: shape=(1, 4096) f32 device=meta is_meta=True
+supports_keyframes_abs_pos_embedding (BEFORE load) : False
+after load_state_dict(sd, strict=False, assign=True):
+  neighbour patchify_proj.weight : device=cpu is_meta=False   <- materialised
+  keyframes_abs_pos_embedding    : device=meta is_meta=True
+  in missing_keys                : True
+  reading the value RAISES : RuntimeError: Tensor.item() cannot be called on meta tensors
+supports_keyframes_abs_pos_embedding (AFTER load)  : False
+```
+
+The materialised **neighbour** is what makes this mean something: the loader did
+run and did populate the model; only the absent key stayed on `meta`.
+
+**Therefore, on the first-party NVFP4 DiT, upstream never reaches the add at
+all** — `supports_keyframes_abs_pos_embedding` is False before *and* after the
+load. So the correct mirror on that arm is **to load and apply nothing**, which
+is neither a refusal nor an invented zero. Refusing it, as `ltx2.cpp:192` does
+today, is stricter than upstream; synthesising a zero and adding it would be
+inventing behaviour that upstream's own guard exists to prevent.
+
+Two consequences for this row. **The NVFP4 arm's refusal is retired outright**,
+not replaced by a no-op path with a fabricated tensor. And a render taken today
+on the NVFP4 DiT with `allow_unported_modules` is, **for this module only**,
+upstream-equivalent — the flag is declared, the tensor is absent, and upstream
+would apply nothing either. That is a narrow claim about one module and must not
+be restated as "the render is upstream-equivalent".
+
+**The flag is not where you would look for it.** A raw read of `__metadata__`
+returns `None`; it lives at `config.transformer`, which is why upstream's
+JSON-decoding reader is needed to see it at all.
+
+**Re-derive these anchors at HEAD before relying on them.** The guards are
+`model.py:166-173` and `:175-200`, with the quoted phrases at `:170` and `:182`
+— corrected from an earlier brief that said `167-182` / `175-193`.
 
 **What is not in dispute, because it was measured on the bytes:** the vonkaiser
 FP8 copy is **trained** — `F8_E4M3 [1,4096]`, **4096 of 4096 bytes non-zero**,
@@ -169,11 +206,12 @@ finding about the gate, not a pass).
   must be **regenerated from the generator against the pin**, with the
   regeneration itself proved reproducible, and the diff explained per value
   rather than accepted wholesale.
-- The NVFP4 DiT declares the flag and carries no tensor. After this row it must
-  still be handled deliberately: mirror upstream, where the parameter would be
-  unmaterialised, and decide — with the anchor — whether that is a refusal or a
-  zero. Do not let it become an accidental zero because the code happens to
-  allocate one.
+- **The FP8 arm is the only one whose output changes.** The NVFP4 arm is settled
+  in §2 by execution: upstream never reaches the add there, so this row **retires
+  that refusal and applies nothing**. The risk to guard is the tempting
+  middle option — allocating a zero tensor because the code path wants one, and
+  adding it. That is not a mirror; upstream's own `supports_…` guard exists
+  precisely to stop a model reaching the add without a trained parameter.
 
 ## 7. Stop conditions
 
