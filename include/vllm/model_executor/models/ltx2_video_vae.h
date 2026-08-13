@@ -105,11 +105,23 @@ struct Ltx2VideoDecoderBlock {
 // invisible to a reduced-dimension parity gate: the deterministic stream produces
 // O(1) activations, the term it guards never binds, and the tensor comparison
 // therefore accepts any value at all — including 0.0, and including one 100x off.
-// MEASURED, by mutating each in turn; these three left EVERY golden green:
+// MEASURED, by mutating each in turn; these two left EVERY golden green:
 //
-//   kLtx2BweMelLogClamp                    1e-5 -> 1e-8   green
 //   kMiniMaxH3SnakeEps                     1e-9 -> 0.0    green
 //   kLtx2RmsNorm2dEps                      1e-12 -> 0.0   green
+//
+// `kLtx2BweMelLogClamp` was listed with them and NO LONGER belongs — the third
+// entry to leave this list for the same reason, which is why the verdict is now
+// stated per-entry with the number that proves it. The arm that made it
+// reachable, "ltx2 vae: the BWE mel log clamp is gated where it actually binds",
+// landed with the pin itself; the line calling it invisible was written in the
+// same change and was false the moment it shipped. 1e-5 -> 1e-8 REDS that arm at
+// max|diff| = 0.144965 against the 5e-6 band (36 cases: 34 passed, 2 failed —
+// the golden, and the constant assertion below it). What made it look invisible
+// was the SCALE of the ordinary arm, not the constant's nature: that arm's raw
+// mel minimum is ~4.4e-3 and never approaches the floor, so the reachable arm
+// attenuates mel_basis by 1e-4 until every bin lands under it — and asserts the
+// saturated-bin count rather than assuming it.
 //
 // `Ltx2ConvVideoDecoderConfig::pixel_norm_eps` was listed with them and NO LONGER
 // belongs. The arm added to make `norm_eps` reachable — "ltx2 vae: the video
@@ -133,10 +145,10 @@ struct Ltx2VideoDecoderBlock {
 // So every member of the class is held by a SOURCE-ANCHORED CONSTANT ASSERTION in
 // tests/vllm/models/test_ltx2_vae.cpp, cited to the upstream line that sets it,
 // rather than by the tensor comparison — and a constant that is added later and
-// left unpinned is a new hole, not a covered one. The BWE clamp additionally gets
-// a golden whose input SATURATES it, because that is the one the reduced-dimension
-// stream can be pushed into reaching and the one real silence reaches in
-// production.
+// left unpinned is a new hole, not a covered one. The three names above that LEFT
+// the class keep their assertions as well: their goldens now move under a
+// mutation, but a golden still cannot catch a regeneration that shifts the
+// constant and the expected tensors together, and only the pin can.
 struct Ltx2ConvVideoDecoderConfig {
   // Defaults mirror `_build_conv_video_decoder`
   // (video_vae/model_configurator.py:81-94).

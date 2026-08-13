@@ -665,7 +665,8 @@ TEST_CASE("ltx2 video: keyframe and reference conditioning is refused by name") 
     CHECK(msg.find("default_image_crf") != std::string::npos);
     // And the QUALIFIER on that re-compression, which the two substrings above do
     // not reach: `preprocess` returns the image UNTOUCHED at `crf == 0`
-    // (media_io/decode.py:413-435, the early return at :427), so "re-compresses
+    // (media_io/decode.py:413-435, the `if crf == 0:` early return at :425-426 —
+    // NOT the one at :427-428, which is the degenerate-size guard), so "re-compresses
     // before encoding" is only true of a nonzero resolved CRF. Naming the round
     // trip without naming its exception overstates what is unported and sends the
     // next reader to build an H.264 path for a case that needs none — the same

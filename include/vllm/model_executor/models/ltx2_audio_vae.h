@@ -203,12 +203,18 @@ std::vector<float> Ltx2VocoderForward(const Ltx2VocoderConfig& config,
 // ---------------------------------------------------------------------------
 
 // The floor under the BWE mel BEFORE its log: `torch.clamp(mel, min=1e-5)`
-// (vocoder.py:516). Named so it can be pinned, because it is the member of the
-// invisible-constant class that actually bites in production: it sets the floor of
-// the log-mel fed to the bwe_generator, and REAL SILENCE reaches it. A
-// reduced-dimension golden built from the deterministic stream cannot, because
-// that stream's mel_basis is non-negative and well-scaled and nothing saturates —
-// mutation proves 1e-5 -> 1e-8 leaves every tensor golden green.
+// (vocoder.py:515). Named so it can be pinned, because it sets the floor of the
+// log-mel fed to the bwe_generator and REAL SILENCE reaches it in production.
+//
+// It is NOT a member of the invisible-constant class described in
+// ltx2_video_vae.h, and the line here that said it was is corrected rather than
+// carried: the ORDINARY BWE arm's mel_basis is non-negative and well-scaled and
+// its raw minimum is ~4.4e-3, so that arm alone cannot move under a mutation.
+// "ltx2 vae: the BWE mel log clamp is gated where it actually binds" attenuates
+// mel_basis until every bin saturates the floor, and against it 1e-5 -> 1e-8 REDS
+// at max|diff| = 0.144965 versus the 5e-6 band. The pin below stays anyway, for
+// what no golden can see: a regeneration that moves the constant and the expected
+// tensors together.
 inline constexpr double kLtx2BweMelLogClamp = 1e-5;
 
 struct Ltx2VocoderBweConfig {
