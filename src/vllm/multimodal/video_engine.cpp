@@ -11,14 +11,14 @@
 #include <cassert>
 #include <cstdio>
 #include <exception>
+#include <filesystem>
 #include <fstream>
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <system_error>
 #include <utility>
 #include <vector>
-
-#include <sys/stat.h>
 
 #include <nlohmann/json.hpp>
 
@@ -54,14 +54,35 @@ std::vector<VideoFamilyRegistration>& RegistryStorage() {
 // detector may claim a checkpoint and exactly one entry may carry a name.
 const std::vector<VideoFamilyRegistration>& OrderedRegistry() { return RegistryStorage(); }
 
+// `<filesystem>`, not `<sys/stat.h>`: this TU is reachable from the shipped
+// server, and `sys/stat.h` is not a Windows header, so the POSIX spelling broke
+// the native build outright (#646). The sibling families already read the
+// filesystem this way (ltx2_video.cpp, minimax_h3_video.cpp,
+// parakeet_transcription.cpp, entrypoints/model_loader.cpp), so this is the
+// convention rather than a new one.
+//
+// TWO SEMANTICS ARE LOAD-BEARING and both are preserved deliberately.
+//
+// FOLLOWING SYMLINKS. `::stat` resolved a symlink before testing its mode, and
+// `exists`/`is_directory` are specified on `status()` — which also follows —
+// rather than `symlink_status()`. A checkpoint directory reached through a
+// symlink is the ordinary case here (a `snapshots/<sha>` HF layout, a NAS
+// mount), so the symlink-following half is not incidental.
+//
+// NOT THROWING. The `error_code` overloads are required. The throwing overloads
+// raise `filesystem_error` for any error OTHER than a plain not-found — an
+// unreadable parent directory being the everyday one — and the only caller,
+// ReadVideoCheckpointTensorNames, is a `bool` + `*why` refusal path whose
+// contract is to REPORT that it cannot read the checkpoint, not to unwind
+// through the C ABI. `::stat` returned a code and never threw; so must these.
 bool IsDir(const std::string& path) {
-  struct stat st {};
-  return ::stat(path.c_str(), &st) == 0 && S_ISDIR(st.st_mode);
+  std::error_code ec;
+  return std::filesystem::is_directory(std::filesystem::path(path), ec);
 }
 
 bool Exists(const std::string& path) {
-  struct stat st {};
-  return ::stat(path.c_str(), &st) == 0;
+  std::error_code ec;
+  return std::filesystem::exists(std::filesystem::path(path), ec);
 }
 
 std::string StripTrailingSlash(const std::string& dir) {

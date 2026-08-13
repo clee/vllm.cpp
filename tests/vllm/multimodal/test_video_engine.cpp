@@ -25,10 +25,12 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <filesystem>
 #include <fstream>
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <system_error>
 #include <vector>
 
 #include <sys/stat.h>
@@ -253,6 +255,117 @@ TEST_CASE("video engine registry: an unrecognizable checkpoint refuses instead o
     CHECK(msg.find("minimax-h3") != std::string::npos);
     CHECK_MESSAGE(msg.find("Declare the family explicitly") == std::string::npos,
                   "declaring a family cannot help a caller who supplied no dit_path");
+  }
+}
+
+// ─── the checkpoint-path probes: dir / file / absent, and NEVER a throw ─────
+// ReadVideoCheckpointTensorNames splits three ways on what a path IS before it
+// opens anything — absent, a shard DIRECTORY, or a single-file checkpoint — and
+// the split is what every family detector inherits. Nothing gated those three
+// answers directly; the fold gates above only ever hand it a real file, so the
+// directory and absent arms were reachable only through a render's refusal text.
+//
+// They are gated here because the probes moved off `::stat` and onto
+// `std::filesystem` for the native Windows build (#646), and two properties of
+// `::stat` had to survive that move: it FOLLOWS symlinks before testing the
+// mode, and it RETURNS A CODE rather than throwing. The `std::filesystem`
+// overloads that take no `error_code` throw `filesystem_error` on any error
+// other than a plain not-found, so "reports absent" silently becoming "unwinds
+// through the C ABI" is the exact regression this case exists to catch.
+TEST_CASE("video engine: the checkpoint path probe answers dir/file/absent and never throws") {
+  SeamWorkspace ws;
+  std::vector<std::string> names;
+  std::string why;
+
+  SUBCASE("a DIRECTORY is read as a shard set, not opened as a single file") {
+    names.assign(1, "a stale name the reader must clear");
+    const bool ok = vllm::multimodal::ReadVideoCheckpointTensorNames(ws.fixture, &names, &why);
+    INFO(why);
+    CHECK_FALSE(ok);
+    // The fold fixture is a directory holding no shard index, so the refusal is
+    // the DIRECTORY one. That it is not the "reads as neither GGUF nor
+    // safetensors" text a file arm produces IS the is-a-directory answer.
+    CHECK(why.find("index.json") != std::string::npos);
+    CHECK(names.empty());
+  }
+
+  SUBCASE("a REGULAR FILE is not a directory and is enumerated as a checkpoint") {
+    const bool ok =
+        vllm::multimodal::ReadVideoCheckpointTensorNames(ws.fixture + "/dit.gguf", &names, &why);
+    INFO(why);
+    CHECK(ok);
+    CHECK_FALSE(names.empty());
+  }
+
+  SUBCASE("a SYMLINK to a directory is followed, exactly as ::stat followed it") {
+    const std::string link = ws.root + "/linked_fixture";
+    std::error_code ec;
+    std::filesystem::create_directory_symlink(ws.fixture, link, ec);
+    if (ec) {
+      // A host that will not create a directory symlink (Windows without the
+      // symlink privilege). Say the arm was unobservable rather than let a
+      // vacuous pass read as evidence that the link was followed.
+      WARN_MESSAGE(false, "directory symlinks unavailable here: ", ec.message());
+    } else {
+      const bool ok = vllm::multimodal::ReadVideoCheckpointTensorNames(link, &names, &why);
+      INFO(why);
+      CHECK_FALSE(ok);
+      // Followed => the DIRECTORY refusal. A probe that stopped at the link
+      // itself would call it a regular file and try to read its magic.
+      CHECK(why.find("index.json") != std::string::npos);
+    }
+  }
+
+  SUBCASE("a MISSING path reports absent, and does not throw") {
+    bool threw = false;
+    bool ok = true;
+    try {
+      ok = vllm::multimodal::ReadVideoCheckpointTensorNames(ws.root + "/no_such_checkpoint", &names,
+                                                            &why);
+    } catch (const std::exception& e) {
+      threw = true;
+      why = e.what();
+    }
+    INFO(why);
+    CHECK_FALSE(threw);
+    CHECK_FALSE(ok);
+    CHECK(why == "no such file or directory");
+  }
+
+  SUBCASE("a path under an UNREADABLE parent reports absent, and does not throw") {
+    // The one shape that separates the error_code overloads from the throwing
+    // ones: a not-found is not an error to std::filesystem, but EACCES from the
+    // parent is, and the throwing overload raises on it while ::stat returned
+    // -1 and this seam answered `false`. Running as root defeats the mode bits,
+    // which weakens the case to the missing-path one above rather than breaking
+    // it.
+    const std::string locked = ws.root + "/locked";
+    std::error_code ec;
+    std::filesystem::create_directory(locked, ec);
+    REQUIRE_FALSE(ec);
+    std::filesystem::permissions(locked, std::filesystem::perms::none,
+                                 std::filesystem::perm_options::replace, ec);
+    const bool mode_applied = !ec;
+
+    bool threw = false;
+    bool ok = true;
+    try {
+      ok = vllm::multimodal::ReadVideoCheckpointTensorNames(locked + "/dit.gguf", &names, &why);
+    } catch (const std::exception& e) {
+      threw = true;
+      why = e.what();
+    }
+
+    // Restored before any assertion can abandon the subcase: the workspace's
+    // destructor has to be able to delete this directory.
+    std::error_code restore_ec;
+    std::filesystem::permissions(locked, std::filesystem::perms::owner_all,
+                                 std::filesystem::perm_options::replace, restore_ec);
+
+    INFO(why);
+    CHECK(mode_applied);
+    CHECK_FALSE(threw);
+    CHECK_FALSE(ok);
   }
 }
 
