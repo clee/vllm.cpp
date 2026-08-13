@@ -115,6 +115,11 @@ using vllm::test::ScopedServerThread;
 
 namespace {
 
+void OpenAiExplicitCpuPhaseWitness(const char* phase) noexcept {
+  std::fprintf(stderr, "OPENAI_EXPLICIT_CPU_PHASE: %s\n", phase);
+  std::fflush(stderr);
+}
+
 class TeardownProbeMarker {
  public:
   explicit TeardownProbeMarker(const char* message) : message_(message) {}
@@ -2402,28 +2407,42 @@ TEST_CASE("api_server: an explicit-cpu device-selected engine serves /v1/complet
   // The server's own parse of `--device cpu` (an unknown name throws there at
   // startup; pinned in test_loaded_engine_dense.cpp).
   params.device = vllm::DeviceFromString("cpu");
-  vllm::entrypoints::LoadedEngine loaded(c, MakeWeights(c), BuildFixture(),
-                                         params);
-  // The observable seam: the runner of the explicitly-cpu engine is on the CPU
-  // device (on a CUDA build this is the force-CPU pin; auto would select CUDA).
-  CHECK(loaded.runner().device().type == vt::DeviceType::kCPU);
+  OpenAiExplicitCpuPhaseWitness("before-loaded-engine");
+  {
+    vllm::entrypoints::LoadedEngine loaded(c, MakeWeights(c), BuildFixture(),
+                                           params);
+    OpenAiExplicitCpuPhaseWitness("after-loaded-engine");
+    // The observable seam: the runner of the explicitly-cpu engine is on the
+    // CPU device (on a CUDA build this is the force-CPU pin; auto would select
+    // CUDA).
+    CHECK(loaded.runner().device().type == vt::DeviceType::kCPU);
 
-  OpenAIServingModels models("test-model");
-  OpenAIServingCompletion completion(loaded.async_engine(), "test-model",
-                                     /*enable_force_include_usage=*/false);
-  OpenAIServingChat chat(loaded.async_engine(), "test-model", InVocabChatPrompt,
-                         "hermes", /*reasoning_parser_name=*/std::string(),
-                         /*enable_force_include_usage=*/false);
-  ApiServer server(completion, chat, models, "9.9.9");
+    OpenAiExplicitCpuPhaseWitness("before-serving-stack");
+    OpenAIServingModels models("test-model");
+    OpenAIServingCompletion completion(loaded.async_engine(), "test-model",
+                                       /*enable_force_include_usage=*/false);
+    OpenAIServingChat chat(
+        loaded.async_engine(), "test-model", InVocabChatPrompt, "hermes",
+        /*reasoning_parser_name=*/std::string(),
+        /*enable_force_include_usage=*/false);
+    ApiServer server(completion, chat, models, "9.9.9");
+    OpenAiExplicitCpuPhaseWitness("after-serving-stack");
 
-  const std::string body =
-      R"({"model":"test-model","prompt":"hello","max_tokens":5,"temperature":0.0})";
-  ApiServer::DispatchResult r = server.handle_completions(body);
-  CHECK(r.status == 200);
-  json j = json::parse(r.body);
-  CHECK(j.at("object") == "text_completion");
-  CHECK(j.at("choices").at(0).at("finish_reason") == "length");
-  CHECK(j.at("usage").at("completion_tokens") == 5);
+    const std::string body =
+        R"({"model":"test-model","prompt":"hello","max_tokens":5,"temperature":0.0})";
+    OpenAiExplicitCpuPhaseWitness("before-completion-dispatch");
+    ApiServer::DispatchResult r = server.handle_completions(body);
+    OpenAiExplicitCpuPhaseWitness("after-completion-dispatch");
+    OpenAiExplicitCpuPhaseWitness("before-response-validation");
+    CHECK(r.status == 200);
+    json j = json::parse(r.body);
+    CHECK(j.at("object") == "text_completion");
+    CHECK(j.at("choices").at(0).at("finish_reason") == "length");
+    CHECK(j.at("usage").at("completion_tokens") == 5);
+    OpenAiExplicitCpuPhaseWitness("after-response-validation");
+    OpenAiExplicitCpuPhaseWitness("before-scope-teardown");
+  }
+  OpenAiExplicitCpuPhaseWitness("after-scope-teardown");
 }
 
 // ─── /v1/embeddings (ARCH-ONE-SURFACE ROW 6) ─────────────────────────────────

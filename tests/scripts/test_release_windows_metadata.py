@@ -204,6 +204,63 @@ class WindowsMetadataContract(unittest.TestCase):
             with self.subTest(guarantee=guarantee):
                 self.assertIn(guarantee, contract)
 
+    def test_openai_isolated_probe_forwards_stable_phase_witness_output(self) -> None:
+        script = (ROOT / "scripts/build-windows-release.ps1").read_text(
+            encoding="utf-8"
+        )
+        helper_start = script.find("function Invoke-OpenAiPrefixBisect {")
+        self.assertNotEqual(helper_start, -1, "adaptive prefix bisect is missing")
+        helper_end = script.index("\n}\n", helper_start) + len("\n}\n")
+        helper = script[helper_start:helper_end]
+        for statement in (
+            'Write-Host "OpenAI isolated output: begin case=$firstBad"',
+            "foreach ($isolatedOutputLine in @($isolatedResult.Output))",
+            "Write-Host ([string]$isolatedOutputLine)",
+            'Write-Host "OpenAI isolated output: end case=$firstBad"',
+        ):
+            with self.subTest(statement=statement):
+                self.assertEqual(helper.count(statement), 1)
+
+        source = (
+            ROOT / "tests/vllm/entrypoints/openai/test_api_server.cpp"
+        ).read_text(encoding="utf-8")
+        for phase in (
+            "before-loaded-engine",
+            "after-loaded-engine",
+            "before-serving-stack",
+            "after-serving-stack",
+            "before-completion-dispatch",
+            "after-completion-dispatch",
+            "before-response-validation",
+            "after-response-validation",
+            "before-scope-teardown",
+            "after-scope-teardown",
+        ):
+            with self.subTest(phase=phase):
+                self.assertEqual(
+                    source.count(f'OpenAiExplicitCpuPhaseWitness("{phase}")'), 1
+                )
+        witness_start = source.index(
+            "void OpenAiExplicitCpuPhaseWitness(const char* phase) noexcept {"
+        )
+        witness_end = source.index("\n}", witness_start)
+        witness = source[witness_start:witness_end]
+        self.assertEqual(witness.count('"OPENAI_EXPLICIT_CPU_PHASE: %s\\n"'), 1)
+        self.assertEqual(witness.count("std::fflush(stderr)"), 1)
+        contract_start = script.index(
+            "function Invoke-OpenAiPrefixBisectContractTests {"
+        )
+        contract_end = script.index("\n}\n", contract_start) + len("\n}\n")
+        contract = script[contract_start:contract_end]
+        for forwarded_line in (
+            "OpenAI isolated output: begin case=27",
+            "OPENAI_EXPLICIT_CPU_PHASE: fixture-isolated",
+            "OpenAI isolated output: end case=27",
+            "OpenAI prefix bisect isolated output forwarding contract OK",
+        ):
+            with self.subTest(forwarded_line=forwarded_line):
+                self.assertIn(forwarded_line, contract)
+
     def test_socket_teardown_probe_marks_each_owner_and_terminate_reason(self) -> None:
         main = (ROOT / "tests/doctest_main.cpp").read_text(encoding="utf-8")
         handler_start = main.index(
@@ -401,6 +458,7 @@ class WindowsMetadataContract(unittest.TestCase):
             "OpenAI prefix bisect unexpected midpoint status contract OK",
             "OpenAI prefix bisect unexpected isolated status contract OK",
             "OpenAI prefix bisect diagnostic schema contract OK",
+            "OpenAI prefix bisect isolated output forwarding contract OK",
         ):
             with self.subTest(proof=proof):
                 self.assertIn(proof, result.stdout)

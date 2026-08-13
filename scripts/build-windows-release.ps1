@@ -342,6 +342,11 @@ function Invoke-OpenAiPrefixBisect {
     }
     $isolatedResult = Invoke-OpenAiPrefixRange -Program $TestProgram `
         -First $firstBad -Last $firstBad -Runner $Runner
+    Write-Host "OpenAI isolated output: begin case=$firstBad"
+    foreach ($isolatedOutputLine in @($isolatedResult.Output)) {
+        Write-Host ([string]$isolatedOutputLine)
+    }
+    Write-Host "OpenAI isolated output: end case=$firstBad"
     if ($isolatedResult.ExitCode -eq 0) {
         $dependency = "cumulative"
     } elseif ($isolatedResult.ExitCode -eq $expectedFastFailStatus) {
@@ -418,7 +423,12 @@ function Invoke-OpenAiPrefixBisectContractTests {
         } else {
             0
         }
-        return [pscustomobject]@{ ExitCode = $exitCode; Output = @() }
+        $output = if ($first -eq $firstBad -and $last -eq $firstBad) {
+            @("OPENAI_EXPLICIT_CPU_PHASE: fixture-isolated")
+        } else {
+            @()
+        }
+        return [pscustomobject]@{ ExitCode = $exitCode; Output = @($output) }
     }.GetNewClosure()
 
     $captured = @(& {
@@ -475,6 +485,17 @@ function Invoke-OpenAiPrefixBisectContractTests {
             throw "OpenAI prefix bisect omitted confirmation $($bounds -join '..')"
         }
     }
+    $forwardedOutput = @(
+        "OpenAI isolated output: begin case=27",
+        "OPENAI_EXPLICIT_CPU_PHASE: fixture-isolated",
+        "OpenAI isolated output: end case=27"
+    )
+    foreach ($line in $forwardedOutput) {
+        if (@($captured | Where-Object { [string]$_ -ceq $line }).Count -ne 1) {
+            throw "OpenAI prefix bisect did not forward isolated output exactly once: $line"
+        }
+    }
+    Write-Host "OpenAI prefix bisect isolated output forwarding contract OK"
 
     $midpointInjected = $false
     $unexpectedMidpointRunner = {
