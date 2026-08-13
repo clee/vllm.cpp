@@ -617,6 +617,20 @@ three confirmation statuses, and the dependency classification. The existing
 unfiltered full-suite invocation remains unchanged and still runs afterwards.
 Any other probe status stops the release job rather than being classified.
 
+Fresh mutation review of the adaptive probe found three false-green contract
+gaps: the listing fixture did not distinguish file order from name order, the
+unexpected-status branches at an intermediate midpoint and isolated probe were
+not executed, and the emitted diagnostic field names were not pinned. The
+repaired live PowerShell contract uses a deliberately name-order-inverted
+source-order listing, injects status 7 independently at the midpoint and
+isolated boundaries and requires both invocations to throw, and captures the
+real host output for an exact diagnostic-schema comparison. Mutating the
+listing call to name order, accepting either unexpected status, or renaming
+`predecessor_status` now makes the contract red. The restored candidate passes
+the 12-test Windows metadata suite, the combined 130-test metadata/pipeline/
+portability suite, the live PowerShell contract, and all four direct Windows
+release checkers.
+
 ### Cross-platform PowerShell contract follow-up: issue #599
 
 Fresh review of diagnostic candidate `5a845c28a7a9afe5addf94771e59a71cecd31e81`

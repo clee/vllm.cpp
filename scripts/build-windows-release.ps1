@@ -363,6 +363,29 @@ function Invoke-OpenAiPrefixBisect {
 function Invoke-OpenAiPrefixBisectContractTests {
     $firstBad = 27
     $testCount = 54
+    $caseNames = @(
+        foreach ($index in 1..$testCount) {
+            if ($index -eq $firstBad) {
+                "aaa source case $index"
+            } elseif ($index -eq 1) {
+                "zzz source case $index"
+            } else {
+                "source case $index"
+            }
+        }
+    )
+    if (@($caseNames | Sort-Object)[0] -ceq $caseNames[0]) {
+        throw "OpenAI prefix bisect fixture does not distinguish file order from name order"
+    }
+    $listing = [System.Collections.Generic.List[string]]::new()
+    $listing.Add("[doctest] listing all test case names") | Out-Null
+    $listing.Add("===============================================================================") | Out-Null
+    foreach ($caseName in $caseNames) {
+        $listing.Add($caseName) | Out-Null
+    }
+    $listing.Add("===============================================================================") | Out-Null
+    $listing.Add("[doctest] unskipped test cases passing the current filters: $testCount") | Out-Null
+
     $calls = [System.Collections.Generic.List[object]]::new()
     $runner = {
         param([string]$Program, [string[]]$Arguments)
@@ -371,14 +394,14 @@ function Invoke-OpenAiPrefixBisectContractTests {
             Arguments = @($Arguments)
         }) | Out-Null
         if ($Arguments -contains "--list-test-cases") {
-            $listing = [System.Collections.Generic.List[string]]::new()
-            $listing.Add("[doctest] listing all test case names") | Out-Null
-            $listing.Add("===============================================================================") | Out-Null
-            foreach ($index in 1..$testCount) {
-                $listing.Add("case $index") | Out-Null
+            $orderArguments = @($Arguments | Where-Object { $_ -like "--order-by=*" })
+            if ($orderArguments.Count -ne 1 -or
+                $orderArguments[0] -cne "--order-by=file") {
+                return [pscustomobject]@{
+                    ExitCode = 7
+                    Output = @($caseNames | Sort-Object)
+                }
             }
-            $listing.Add("===============================================================================") | Out-Null
-            $listing.Add("[doctest] unskipped test cases passing the current filters: $testCount") | Out-Null
             return [pscustomobject]@{ ExitCode = 0; Output = @($listing) }
         }
 
@@ -398,11 +421,20 @@ function Invoke-OpenAiPrefixBisectContractTests {
         return [pscustomobject]@{ ExitCode = $exitCode; Output = @() }
     }.GetNewClosure()
 
-    $result = Invoke-OpenAiPrefixBisect -TestProgram "fake-openai-test.exe" `
-        -Runner $runner
+    $captured = @(& {
+        Invoke-OpenAiPrefixBisect -TestProgram "fake-openai-test.exe" `
+            -Runner $runner
+    } 6>&1)
+    $results = @($captured | Where-Object {
+        $null -ne $_.PSObject.Properties["FirstBad"]
+    })
+    if ($results.Count -ne 1) {
+        throw "OpenAI prefix bisect did not return exactly one result"
+    }
+    $result = $results[0]
     if ($result.FirstBad -ne $firstBad -or
         $result.TestCount -ne $testCount -or
-        $result.TestName -cne "case 27" -or
+        $result.TestName -cne "aaa source case 27" -or
         $result.Dependency -cne "cumulative") {
         throw "OpenAI prefix bisect returned the wrong boundary"
     }
@@ -412,6 +444,14 @@ function Invoke-OpenAiPrefixBisectContractTests {
     if ($listCalls.Count -ne 1) {
         throw "OpenAI prefix bisect did not list tests exactly once"
     }
+    if ($listCalls[0].Arguments.Count -ne 4 -or
+        $listCalls[0].Arguments[0] -cne "--list-test-cases" -or
+        $listCalls[0].Arguments[1] -cne "--order-by=file" -or
+        $listCalls[0].Arguments[2] -cne "--no-version=true" -or
+        $listCalls[0].Arguments[3] -cne "--no-colors=true") {
+        throw "OpenAI prefix bisect listing did not request exact file order"
+    }
+    Write-Host "OpenAI prefix bisect listing order contract OK"
     foreach ($call in @($calls | Where-Object {
         $_.Arguments -notcontains "--list-test-cases"
     })) {
@@ -435,6 +475,74 @@ function Invoke-OpenAiPrefixBisectContractTests {
             throw "OpenAI prefix bisect omitted confirmation $($bounds -join '..')"
         }
     }
+
+    $midpointInjected = $false
+    $unexpectedMidpointRunner = {
+        param([string]$Program, [string[]]$Arguments)
+        if ($Arguments -notcontains "--list-test-cases") {
+            $firstArgument = @($Arguments | Where-Object { $_ -like "--first=*" })
+            $lastArgument = @($Arguments | Where-Object { $_ -like "--last=*" })
+            if ($firstArgument.Count -eq 1 -and $lastArgument.Count -eq 1 -and
+                $firstArgument[0] -ceq "--first=1" -and
+                $lastArgument[0] -ceq "--last=27" -and
+                -not $midpointInjected) {
+                $midpointInjected = $true
+                return [pscustomobject]@{ ExitCode = 7; Output = @("injected midpoint failure") }
+            }
+        }
+        return & $runner $Program $Arguments
+    }.GetNewClosure()
+    $midpointRejected = $false
+    try {
+        Invoke-OpenAiPrefixBisect -TestProgram "fake-openai-test.exe" `
+            -Runner $unexpectedMidpointRunner | Out-Null
+    } catch {
+        if ($_.Exception.Message -cne
+            "OpenAI prefix 1..27 exited with unexpected status 7") {
+            throw
+        }
+        $midpointRejected = $true
+    }
+    if (-not $midpointRejected) {
+        throw "OpenAI prefix bisect accepted an unexpected midpoint status"
+    }
+    Write-Host "OpenAI prefix bisect unexpected midpoint status contract OK"
+
+    $unexpectedIsolatedRunner = {
+        param([string]$Program, [string[]]$Arguments)
+        if ($Arguments -notcontains "--list-test-cases" -and
+            $Arguments -contains "--first=27" -and
+            $Arguments -contains "--last=27") {
+            return [pscustomobject]@{ ExitCode = 7; Output = @("injected isolated failure") }
+        }
+        return & $runner $Program $Arguments
+    }.GetNewClosure()
+    $isolatedRejected = $false
+    try {
+        Invoke-OpenAiPrefixBisect -TestProgram "fake-openai-test.exe" `
+            -Runner $unexpectedIsolatedRunner | Out-Null
+    } catch {
+        if ($_.Exception.Message -cne
+            "OpenAI isolated case 27 exited with unexpected status 7") {
+            throw
+        }
+        $isolatedRejected = $true
+    }
+    if (-not $isolatedRejected) {
+        throw "OpenAI prefix bisect accepted an unexpected isolated status"
+    }
+    Write-Host "OpenAI prefix bisect unexpected isolated status contract OK"
+
+    $expectedDiagnostic = 'OpenAI prefix bisect: first_bad=27/54 test="aaa source case 27" predecessor_status=0 prefix_status=-1073740791 isolated_status=0 dependency=cumulative'
+    $diagnostics = @($captured | Where-Object {
+        ([string]$_).StartsWith("OpenAI prefix bisect: first_bad=")
+    })
+    if ($diagnostics.Count -ne 1 -or
+        [string]$diagnostics[0] -cne $expectedDiagnostic) {
+        throw "OpenAI prefix bisect emitted an unstable diagnostic schema"
+    }
+    Write-Host "OpenAI prefix bisect diagnostic schema contract OK"
+    Write-Host $expectedDiagnostic
     Write-Host "OpenAI prefix bisect contract OK"
 }
 

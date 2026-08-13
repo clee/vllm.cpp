@@ -396,8 +396,16 @@ class WindowsMetadataContract(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("Windows PowerShell/CRT contract tests OK", result.stdout)
+        for proof in (
+            "OpenAI prefix bisect listing order contract OK",
+            "OpenAI prefix bisect unexpected midpoint status contract OK",
+            "OpenAI prefix bisect unexpected isolated status contract OK",
+            "OpenAI prefix bisect diagnostic schema contract OK",
+        ):
+            with self.subTest(proof=proof):
+                self.assertIn(proof, result.stdout)
         self.assertIn(
-            'OpenAI prefix bisect: first_bad=27/54 test="case 27" '
+            'OpenAI prefix bisect: first_bad=27/54 test="aaa source case 27" '
             'predecessor_status=0 prefix_status=-1073740791 isolated_status=0 '
             'dependency=cumulative',
             result.stdout,
