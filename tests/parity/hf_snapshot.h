@@ -65,7 +65,7 @@ inline std::string HfSnapshot(const char* repo_dir, const char* revision,
   return snap.string();
 }
 
-// The Nemotron-3.5-Lightning gate model (#517). Unlike the Qwen pins below,
+// The Nemotron-3.5-Lightning gate model (#517). Unlike the Qwen pins above,
 // this one is NOT in the HF cache: it is staged on the NAS as a `local_dir`
 // snapshot at `$CHECKPOINT_ROOT/nemotron-3.5-lightning-30b-nvfp4`, so there is
 // no `models--org--name/snapshots/<rev>` layout to resolve. The env override is
