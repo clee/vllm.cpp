@@ -814,6 +814,15 @@ Identical to the pre-change CPU counts, as expected: every code change is inside
 `#ifdef VLLM_CPP_CUDA` or in the `.cuh`. `Status:` was read, not `assertions:`
 alone ([[doctest-assertions-line-hides-thrown-cases]]).
 
+Clean Release rebuild of every target — **817 / 817 ninja edges, 0 warnings, 0
+errors** at `-Wall -Wextra -Werror`, exit 0 — then **full `ctest -j 4`:
+`100% tests passed, 0 tests failed out of 403`**, `CTEST_EXIT=0`, 22.35 s,
+2 skipped (`test_modelopt_mixed_precision_checkpoint`, `test_voxtral_e2e`). This
+is the CPU-only lane, so it is a much smaller and much faster gate than §8.4's
+431-test GPU-host run and is **not** a substitute for it; none of §8.4's ten
+failures is reachable here. `scripts/agent-preflight.sh --staged` returned
+`RC=0`.
+
 **The CUDA arm could not be built or run — `omitted_gates`.** `dgx.casa` has been
 unreachable since 06:50 CEST (§8.4) and this box has no `nvcc` and no GPU. Two
 substitutes were run instead, and neither is offered as the device gate:
