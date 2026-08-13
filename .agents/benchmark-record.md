@@ -19552,6 +19552,27 @@ speech-shaped, or matches the mouth movements in the frames, is not something
 these numbers answer and is not asserted. Owed: a spectral check against the
 video, which is the audio half of the question the frames just answered.
 
-Evidence: `dgx:~/work/ltx25-l9c/{hold.log,baselines.log,render-*.log,mem-*.log}`,
+### Owed, and why — two arms the lock never came free for
+
+Two bounded waits on `$HOME/gpu.lock`, `flock -w 2700` each, both timed out
+(`HOLD2_WRAPPER_DONE rc=1` at 04:36 and 05:22). The box was saturated with other
+coordinators' `ctest` work for the whole 90 minutes. Waiting is normal and
+stealing is not, so these are reported OWED rather than run:
+
+1. **The L9B repro arm** (`dgx:~/work/ltx25-l9c/dgx_repro_l9b.sh`, shipped and
+   syntax-checked on the box): L9B's own binary with L9B's own arguments at
+   320x192/25f `--max-phase 0`, which is the one arm that separates "L9B measured
+   the environment" from "L9B's geometry behaves differently from ours". It cannot
+   run on the L9c binary, which refuses 32 conditioning rows.
+2. **`test_minimax_h3` and `test_capi` through ctest** (`dgx_baselines2.sh`, also
+   shipped). The first baseline pass ran the BINARIES directly and both reported a
+   summary followed by a SIGSEGV — `test_capi` `4 cases | 51 skipped` against a
+   brief baseline of 55, `test_minimax_h3` `38 | 41 skipped` against 79. A summary
+   printed before a crash counts the unreached cases as "skipped", which is the
+   third instance this campaign has recorded of a run reading as a pass. **These
+   two are UNRESOLVED, not green**, and the instrument that would resolve them is
+   ctest plus the full output, not a grep of a bare binary.
+
+Evidence: `dgx:~/work/ltx25-l9c/{hold.log,hold2.log,hold2b.log,baselines.log,render-*.log,mem-*.log}`,
 renders under `dgx:~/work/ltx25-l9c/render/`, contact sheets under
 `dgx:~/work/ltx25-l9c/contact/`.
