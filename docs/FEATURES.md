@@ -287,7 +287,7 @@ Build with `-DVLLM_CPP_VULKAN=ON`; off by default.
 | Audio transcription (Parakeet ASR) | `vllm_transcribe`, `vllm_transcription_params_default`, `vllm_transcription_free` | reachable |
 | Video+audio generation (MiniMax-H3, LTX-2.5) | `vllm_video_engine_load`, `vllm_video_generate`, `vllm_video_result_free`, `vllm_video_mux_argv`, `vllm_video_engine_family` (ABI v18 family registry) | reachable |
 | Explicit device selection (auto/cpu/cuda) | `device` field on `vllm_model_params` (ABI v14; 0=auto keeps the probe, explicit absent device fails loud) | reachable |
-| Run the OpenAI server (server as a thin ABI client) | `vllm_server_main` (ABI v17) | reachable |
+| Run the OpenAI server (server as a thin ABI client) | `vllm_server_main` (ABI v18) | reachable |
 | Multimodal input (image/audio/video) | none | embedder-unreachable | <!-- abi-capability-table:end -->
 
 ## Parallelism and scale-out

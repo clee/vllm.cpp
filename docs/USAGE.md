@@ -1389,8 +1389,8 @@ vllm-server --model /path/to/text-model \
 ## Consuming it as a library (C ABI)
 
 Link `libvllm` (static or shared) and include [`include/vllm.h`](../include/vllm.h).
-It exposes a flat, exception-free, llama.cpp-style C ABI (`VLLM_ABI_VERSION 17`,
-35 exported functions) suitable for `dlopen` / FFI / LocalAI integration.
+It exposes a flat, exception-free, llama.cpp-style C ABI (`VLLM_ABI_VERSION 18`,
+36 exported functions) suitable for `dlopen` / FFI / LocalAI integration.
 
 ```c
 #include "vllm.h"
