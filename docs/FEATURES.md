@@ -80,7 +80,7 @@ are our reading of their documented behavior, not measurements.
 | Merged fp8 projection folds per-column alpha in the GEMM epilogue | ◐ `VT_FP8_ALPHA_VEC_EPILOGUE`, CUDA only, default off, ungated; refuses split-K under a bf16-D equivalence claim (`claims_splitk1_premise`, default off) | n/a | n/a | n/a |
 | `vt::MulColVecF32` carries a bf16 store width | ✅ f32 arm byte-identical; bf16 arm rounds once; CPU + CUDA | n/a | ☐ | ☐ |
 | bf16 / fp16 | ✅ | ✅ | ✅ | ✅ |
-| Safetensors direct load, no conversion | ✅ | ✅ | ✅ | ☐ |
+| Safetensors direct load, no conversion | ✅ a payload offset carries no alignment guarantee, so reads of the mapping go byte-wise ([#674](https://github.com/mudler/vllm.cpp/issues/674) VAE loader; [#627](https://github.com/mudler/vllm.cpp/issues/627) the rest) | ✅ | ✅ | ☐ |
 | Weights uploaded straight from the file mapping (no host copy first) | ◐ verbatim tensors only (37.8% of 27B BF16); arbitrary-offset reads are defined, including Laguna graph staging. Merged/transposed and merged FP4 weights still copy | ✅ | ✅ | ✅ mmap |
 
 ## Model coverage
