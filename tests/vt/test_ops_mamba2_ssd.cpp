@@ -1621,13 +1621,16 @@ TEST_CASE("mamba2 chunk scan CUDA arm covers the optional arms and the dtype kno
 // The shared validator checks metadata SHAPE / DTYPE / DEVICE only
 // (`CheckI32Meta`, ops.cpp); every VALUE check lives in the HOST kernel, which
 // reads the tensors (cpu_ops.cpp). The device arm therefore runs with NONE of
-// them, and two of the dropped ones are memory-UNSAFE rather than merely wrong:
-// `last_chunk_indices[b] >= nchunks` makes the `passed` store run past its
-// `cudaMallocAsync` allocation, and a `seq_idx[c]` outside `[0,S)` reads
-// `initial_states` out of bounds (with `seq_idx[0] < 0` additionally indexing
-// `passed` at chunk -1). Both are clamped in registers at their use sites
-// (src/vt/cuda/cuda_mamba2_ssd.cuh); this case PINS the resulting behaviour so
-// it is a test, not a sentence in a header.
+// them. src/vt/cuda/cuda_mamba2_ssd.cuh enumerates all six and says which are
+// memory-unsafe; this case covers the TWO that are both memory-unsafe and
+// bounded by a register-local clamp:
+//   * `last_chunk_indices[b] >= nchunks` makes the `passed` store run past its
+//     `cudaMallocAsync` allocation, and
+//   * a `seq_idx[c]` outside `[0,S)` reads `initial_states` out of bounds, with
+//     `seq_idx[0] < 0` additionally indexing `passed` at chunk -1.
+// It PINS the clamped behaviour so it is a test, not a sentence in a header.
+// The `cu_chunk_seqlens` checks are NOT clamped and are NOT covered here; the
+// header states that as an open memory-safety gap rather than hiding it.
 //
 // THIS CASE HAS NO HOST TWIN, deliberately: the host kernel REFUSES both inputs,
 // which is exactly why the device arm needed the clamp. Each clamp is pinned
@@ -1638,7 +1641,7 @@ TEST_CASE("mamba2 chunk scan CUDA arm covers the optional arms and the dtype kno
 // What this case does NOT establish is memory safety itself. An out-of-bounds
 // write into a `cudaMallocAsync` pool very often does not fault, so a green run
 // is necessary and not sufficient; `compute-sanitizer memcheck` on this case is
-// what proves it, and is recorded as owed in §8.4.
+// what proves it, and is recorded as owed in mamba2-ssd.md §8.5.
 TEST_CASE("mamba2 chunk scan CUDA arm clamps out-of-contract metadata in registers") {
   Backend* gpu = MaybeCuda();
   if (gpu == nullptr) {
