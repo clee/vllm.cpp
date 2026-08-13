@@ -223,8 +223,10 @@ whose stated reason went stale; each message below names the exact symbol or
 * **The encoder's `zeros` vs the decoder's `reflect` padding default.** Same
   checkpoint key, different defaults, and they only diverge when the key is
   absent.
-* **Normalizing before resizing.** Same answer to ~1e-7, so every finiteness and
-  shape check passes; only a value golden sees it.
+* **Normalizing before resizing.** Same answer to ~1e-7 — and §8.1 records the
+  outcome: NO golden here sees it either, because the two orders are
+  algebraically equal. Mirrored because it is upstream's, and written down
+  rather than assumed to be covered.
 * **Applying the conditioning after the noiser.** Produces a pinned first frame
   that is pinned to the NOISED latent. Shapes, masks and finiteness all pass.
 * **Inverting the mask (`strength` instead of `1 - strength`).** Renders an
@@ -240,8 +242,9 @@ upstream under the pinned SHA and emits
 `tests/vllm/multimodal/ltx2_image_cond_goldens.inc`. Sections:
 
 1. `resize_and_center_crop` alone, over shapes covering upscale, downscale,
-   wider-than-target and taller-than-target, including one where `ceil` changes
-   the answer.
+   wider-than-target and taller-than-target, including one where `ceil`
+   disagrees with both `round` and `floor` (§8.1 corrects what that case
+   actually demonstrates).
 2. `load_image_and_preprocess`'s full chain at `crf = 0` (resize then normalize).
 3. `VideoEncoder(image)` at reduced dims over deterministic weights.
 4. `VideoConditionByLatentIndex.apply_to` over that encoded latent — `clean` and
@@ -289,6 +292,103 @@ request identical.
 * If executed upstream disagrees with a ported stage by more than
   `kLtx2GoldenTol`, the port is wrong; do not widen the band.
 
-## 8. Now
+## 8. Outcome — what was measured, and what was refuted
 
-`ACTIVE` — spec committed before implementation.
+Recorded here rather than in the code, because none of it is derivable from the
+tree. All measurements: CPU Release, gcc, `-ffp-contract=off` (the tree's own
+flag), `build-lic`, this box, at the head this spec landed on.
+
+### 8.1 Three claims in §3 and §5 were WRONG, and are corrected here
+
+* **The `ceil` reason.** §3.2 repeated upstream's own comment — that `ceil`
+  guards against `src * scale` landing just above an integer and producing a
+  negative crop offset. Swept every source/target pair in `3..40 -> {16, 24}`:
+  **no pair does that** in IEEE double. The `ceil` is still load-bearing, for
+  the ordinary reason that it disagrees with `round` and `floor` at a
+  non-integer scale (case 1, `32 * 16/24 = 21.333` → 22 rows and a 3-row crop,
+  against 21 and a 2-row crop), and the generator asserts THAT rather than the
+  claim upstream makes.
+* **A golden can see the resize/normalize ORDER.** It cannot, and the reason is
+  structural: resize is a convex combination and normalize is affine, so the two
+  orders are equal in exact arithmetic and their f32 gap is pure rounding —
+  **1.94e-07 measured**, below the golden band and below this port's own distance
+  from torch. It cannot be amplified by choosing a different image. The order is
+  mirrored because it is upstream's; that is now written down in three places
+  rather than assumed to be covered, and `kLtx2ImgPreOrderGap` asserts the gap
+  stays below the band so a future change that makes it gateable is visible.
+* **The port can match torch's bilinear bit for bit.** It cannot, portably. The
+  index map and the lambdas were probed with basis images and match EXACTLY
+  (`0.61111104`, `0.35185182`, `0.09259248` … reproduced to the bit). The
+  residual is in the ACCUMULATION and appears on an output element whose width
+  weights are `(1, 0)` — a pure two-term `a*h0 + c*h1` — which rules out
+  dimension order. Plain-f32, f64-accumulate and premultiplied-weight orderings
+  all land 1 ulp away on the same elements: FMA contraction inside torch's
+  kernel, which this tree compiles with `-ffp-contract=off` and so cannot
+  reproduce. Hence `kLtx2ImgPixelTol`.
+
+### 8.2 The bands, derived rather than picked
+
+Measured by setting both to `1e-12` and reading the reported `worst`:
+
+| section | space | worst | band |
+|---|---|---|---|
+| 1 resize | 0..255 | `6.10352e-05` (identity case: 0) | `kLtx2ImgPixelTol = 2e-4` |
+| 2 preprocess | [-1, 1] | `4.76837e-07` | `kLtx2ImgGoldenTol = 2e-6` |
+| 3 encoded latent | latent | `2.68221e-07` | same |
+| 4 conditioned clean | latent | `2.68221e-07` | same |
+| 5 noised latent | latent | `1.78814e-07` | same |
+
+### 8.3 Mutation evidence — RED, with counts
+
+Each applied to the tree, rebuilt, run, and restored byte-for-byte (md5 checked).
+Green baseline: `test_ltx2_image_cond` **15 cases / 198 assertions**,
+`test_ltx2_video` **32 cases / 550 assertions**, both exit 0.
+
+| mutation | file | result |
+|---|---|---|
+| `ceil` → `llround` in the resize | `ltx2_image_preprocess.cpp` | image_cond 14/15, 197/198, exit 1 |
+| encoder key rules → the DECODER's | `ltx2_video_vae_encoder_load.cpp` | image_cond 14/15, 195/198; video 31/32 (THREW, assertions 517 — the COUNT itself moved) |
+| mask `1 - strength` → `strength` | `ltx2_conditioning.cpp` | image_cond 13/15, 193/198, exit 1 |
+| latent width from `vae.out_channels` | `ltx2_video_vae_encoder_load.cpp` | image_cond 14/15, 192/198; video 9/32, 36/53 |
+| CRF refusal removed | `ltx2_image_preprocess.cpp` | image_cond 14/15, 193/198; video 31/32 |
+| encode the image, never PLACE it | `ltx2_video.cpp` | video 31/32, 548/550, exit 1 |
+
+### 8.4 A mutation that SURVIVED, and what that says
+
+`video.latent = state.clean` inserted after the placement left `test_ltx2_video`
+fully green (32/32, 550/550). Two findings, and the first is not a gap:
+
+1. **Phase 0 runs at `noise_scale = 1.0`** (`ltx2_pipeline.cpp:1068`), where
+   `lerp(latent, noise, 1)` discards `latent` entirely — so on that phase the
+   mutation is genuinely inert. AGENTS.md's rule applies: a mutation that moves
+   nothing is not evidence of unreachability. It IS live on phase 1
+   (`noise_scale = 0.909375`).
+2. **`test_ltx2_video` gates no VALUE of the composed latent.** It gates that the
+   conditioning is placed, that it depends on the image, and that it depends on
+   the ENCODER'S OWN WEIGHTS — not the arithmetic. That arithmetic is gated
+   against executed upstream in `test_ltx2_image_cond`, over the identical
+   functions. This is recorded as a named residual rather than closed with an
+   unanchored digest, which would detect change without pinning anything.
+
+That mutation is also what caused `Ltx2ConditioningTrace::image_digest` to be
+taken over the TOKENS AS WRITTEN rather than over the encoder's output: the
+first version digested `encoded.data`, which stays healthy for a build that
+encodes an image and never places it. The "never place it" mutation above is RED
+only because of that change.
+
+### 8.5 Why the defaults are what they are
+
+* **`image_crf` has no default that renders.** Absent resolves 18 and refuses.
+  A default of 0 would silently condition every request out of distribution.
+* **The encoder stays RESIDENT**, where `ImageConditioner` builds and frees it
+  per call (`blocks.py:988-993`). A conditioning image arrives per request and
+  the encoder is small next to the DiT; the divergence is lifecycle only.
+* **The conditioning is applied PER PHASE**, because the two-stage recipe renders
+  its stages at different resolutions and upstream passes each stage's own
+  height/width. One encode would either be re-noised away or placed at the wrong
+  scale.
+
+## 9. Now
+
+`ACTIVE` — spec committed before implementation; implementation landed with the
+outcome above.
