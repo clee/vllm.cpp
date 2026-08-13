@@ -186,6 +186,7 @@ issue is not yet placed. Keyed record: update in place, never append.
 | [#651](https://github.com/mudler/vllm.cpp/issues/651) | — | `test_agent_record`'s MODEL-ratchet docstring is two contradictory paragraphs spliced together, and the surviving half records a pin transition that never happened | bug |
 | [#652](https://github.com/mudler/vllm.cpp/issues/652) | — | `model-matrix.md` prose counters drifted: LTX-2.5 reached the rows and the CI-enforced rollup but none of the five sentences that count them | bug |
 | [#608](https://github.com/mudler/vllm.cpp/issues/608) | `TOOLS-PARSER-BREADTH` | Six `--tool-call-parser` names missing (`openai`, `inkling`, `minimax_m3`, `nemotron_json`, `kimi_k3`, `ling3`), closing the last 8 of 90 official-recipe uses; four are portable at the pin, two are post-pin | feature |
+| [#647](https://github.com/mudler/vllm.cpp/issues/647) | — | Oracle policy had no fallback and no pin concept: five upstreams beyond vLLM are already compared against (vLLM-Omni, SGLang, llama.cpp, `transformers`, tt-forge) with their pins scattered across individual specs or absent entirely. AGENTS.md now admits a named secondary oracle where vLLM implements nothing, `.agents/oracles/<id>.md` pins each one file-per-oracle, and `check-oracle-pins.py` enforces both directions. The gateability debts for `sglang`, `diffusers` and `tt-forge` stay open on this issue | feature |
 
 ## Top-level portfolio
 
