@@ -632,10 +632,11 @@ const float* TowerGoldenPaddedBf16(int64_t state) {
 //
 // SCOPE, because "the concat order is gated" is broader than what this reaches.
 // The only concat under this case is the LTX tower loader's own `TowerConcat`
-// (ltx2_text_encoder.cpp:943-945). `gemma4_weights.cpp` assembles its qkv through
-// a SEPARATE implementation (gemma4_weights.cpp:281-295) that nothing in this
-// suite loads — MEASURED: mutating it leaves every case in this file green. That
-// path owes its own gate; this one does not stand in for it.
+// (ltx2_text_encoder.cpp:951-953, both qkv arms; the helper is at :835).
+// `gemma4_weights.cpp` assembles its qkv through a SEPARATE implementation
+// (gemma4_weights.cpp:281-295) that nothing in this suite loads — MEASURED:
+// mutating it leaves every case in this file green. That path owes its own
+// gate; this one does not stand in for it.
 std::vector<PackTensor> TowerPackTensors(const vllm::HfConfig& c) {
   const int64_t H = c.hidden_size, I = c.intermediate_size, V = c.vocab_size;
   const int64_t Hq = vllm_test::kLtxTowerNumHeads;
@@ -1956,7 +1957,7 @@ TEST_CASE("gemma4 tower: partial_rotary_factor, on the ROPE TABLE the states can
   // So the instrument is the TABLE, in f32, with no accumulation in it, against
   // the oracle's own `Gemma4UnifiedTextRotaryEmbedding` routed through
   // `_compute_proportional_rope_parameters` — the code that actually decides the
-  // zero padding (modeling_rope_utils.py:187-245).
+  // zero padding (modeling_rope_utils.py:187-254; the `torch.zeros` pad is :246).
   //
   // SCOPE, so the instrument is not read as covering more than it does: this is
   // the FULL-ATTENTION table only (`kLtxTowerGlobalHeadDim`, the `proportional`
@@ -1989,7 +1990,7 @@ TEST_CASE("gemma4 tower: partial_rotary_factor, on the ROPE TABLE the states can
 
   // The STRUCTURE, exactly, because it is the thing the factor controls and an
   // exact check cannot be absorbed by any noise argument. `rope_angles` is
-  // upstream's `int(partial * head_dim // 2)` (modeling_rope_utils.py:233).
+  // upstream's `int(partial * head_dim // 2)` (modeling_rope_utils.py:234).
   const int64_t rotated = static_cast<int64_t>(0.25 * static_cast<double>(Dh)) / 2;
   REQUIRE(rotated == 2);
   REQUIRE(rotated < pairs);

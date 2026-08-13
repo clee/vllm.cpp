@@ -151,8 +151,8 @@ to carry: its text tower's prompt tokenization mirrors upstream only while the
 checkpoint's tokenizer `post_processor` adds nothing. The shipped one is MEASURED
 empty, so this port's plain encode plus an explicit BOS prepend matches
 upstream's `add_special_tokens=True` today; a checkpoint with a non-empty
-`post_processor` would tokenize differently here, and `ltx2_text_encoder.cpp`
-names the line that would have to change.
+`post_processor` would tokenize differently here, and `Ltx2TokenizeGemmaPrompt`
+in `ltx2_text_encoder.cpp` is the call that would have to change.
 
 | Lane | Tested checkpoint(s) | Correctness gate | Speed vs reference |
 |---|---|---|---|

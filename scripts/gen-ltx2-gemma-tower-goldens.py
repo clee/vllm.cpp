@@ -375,8 +375,9 @@ def rope_cos_sin(config, layer_type: str, head_dim: int, positions) -> np.ndarra
 
     Built by the real `Gemma4UnifiedTextRotaryEmbedding`, which is what routes
     `rope_type: "proportional"` to `_compute_proportional_rope_parameters`
-    (modeling_gemma4_unified.py:214-218, modeling_rope_utils.py:187-245) and so
-    is the only thing that decides how many angle pairs are zero-padded.
+    (modeling_gemma4_unified.py:206-218 -- the ROPE_INIT_FUNCTIONS lookup at :207
+    and the call at :218; modeling_rope_utils.py:187-254) and so is the only
+    thing that decides how many angle pairs are zero-padded.
 
     Returns [len(positions), head_dim]: the first head_dim/2 columns are cos
     over the distinct angle pairs and the second half is sin, which is the

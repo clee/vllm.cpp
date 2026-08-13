@@ -257,7 +257,9 @@ std::vector<int32_t> Gemma4GenerateGreedyViaRegistry(
 // [max_pos + 1, head_dim]: the first head_dim/2 columns are cos and the second
 // half sin, over the head_dim/2 DISTINCT angle pairs, mirroring upstream's
 // `emb = cat((freqs, freqs))` with each angle stored once
-// (modeling_gemma4_unified.py:257-274, modeling_rope_utils.py:187-245).
+// (`Gemma4UnifiedTextRotaryEmbedding.forward`, modeling_gemma4_unified.py:259-275
+// — the `cat` itself is :271; the inv_freq it consumes comes from
+// modeling_rope_utils.py:187-254).
 //
 // This is a GATE SURFACE, and it exists because of a measurement rather than a
 // preference. `partial_rotary_factor` decides how many angle pairs are rotated

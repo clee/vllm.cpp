@@ -1052,8 +1052,9 @@ Ltx2PromptConditioning Ltx2EncodePromptToConditioning(
   // is strictly WIDER, so every token gate and every golden still passed — it
   // simply held twice the bytes and made `Gemma4AttnBlock` allocate two extra
   // per-layer cast buffers and run a CastF32 on every K and V it wrote
-  // (gemma4.cpp:300-312, the `kv.dtype != adt` arm). That is exactly the defect
-  // class AGENTS.md names: a token gate cannot see a dtype that is too wide.
+  // (gemma4.cpp:306-315, the `kv.dtype != adt` arm — the two DBufs at :307-308
+  // and the CastF32 pair at :313-314). That is exactly the defect class
+  // AGENTS.md names: a token gate cannot see a dtype that is too wide.
   // At the shipped 48 layers x 1024 positions this is ~2x on a cache that peaks
   // near 200 MB for one prompt.
   const int64_t block = 16;

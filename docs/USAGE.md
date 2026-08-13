@@ -1755,9 +1755,12 @@ routes stay unregistered.
 
 ## LTX-2.5: reproducing the DiT parity gate
 
-**There is no LTX-2.5 render path yet.** What ships today is the DiT's layout and
-forward, and there is no text encoder, no VAE, no pipeline and no `/v1/videos`
-route for it — asking the video engine for LTX-2.5 will not work. The C++ surface
+**This section is the DiT layer's own parity gate, not the render path.** It used
+to open by saying there was no render path, no text encoder, no VAE, no pipeline
+and no `/v1/videos` route for LTX-2.5; every one of those has since landed, and
+what the video engine can actually be asked for is under "LTX-2.5: what runs, and
+what it cannot do" above. What follows reproduces the DiT layer's gate from
+source. The C++ surface
 is `include/vllm/model_executor/models/ltx2.h`, and it refuses by name every arm it
 does not carry (a non-f32 stream dtype, the 19B caption-projection checkpoint form,
 keyframe absolute-position embeddings, the video-only / audio-only model types).
