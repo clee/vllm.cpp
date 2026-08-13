@@ -22,6 +22,7 @@
 #include "vllm/model_executor/model_loader/nvfp4_dequant.h"
 #include "vt/backend.h"
 #include "vt/dtype.h"
+#include "vt/unaligned.h"
 
 namespace vllm {
 
@@ -290,12 +291,20 @@ float ReadF32Scalar(const StTensor& t) {
 }
 
 // src bf16 [rows, cols] -> dst bf16 [cols, rows].
-void TransposeBf16(const uint16_t* src, int64_t rows, int64_t cols,
-                   uint16_t* dst) {
+//
+// `src` is `const void*`, not `const uint16_t*`, because the caller below hands
+// it a pointer INTO the mmap'd safetensors payload. A tensor's offset there is
+// the running byte total of everything ahead of it, so a bf16 tensor that
+// follows an odd-length one starts on an odd byte and the typed pointer is
+// undefined to form or load through (issue #627). `vt::LoadUnaligned` is the
+// project's seam for that — the same one `ReadF32Scalar` above open-codes with
+// memcpy and `dense_loaders::TransposeBf16` already uses for this exact loop.
+void TransposeBf16(const void* src, int64_t rows, int64_t cols, uint16_t* dst) {
+  const auto* bytes = static_cast<const uint8_t*>(src);
   for (int64_t r = 0; r < rows; ++r) {
-    const uint16_t* src_row = src + r * cols;
+    const uint8_t* src_row = bytes + r * cols * 2;
     for (int64_t c = 0; c < cols; ++c) {
-      dst[c * rows + r] = src_row[c];
+      dst[c * rows + r] = vt::LoadUnaligned<uint16_t>(src_row + c * 2);
     }
   }
 }
@@ -331,7 +340,7 @@ OwnedTensor LoadBf16Transposed(const TensorResolver& get,
   const int64_t out_dim = t.shape[0];
   const int64_t in_dim = t.shape[1];
   OwnedTensor o = MakeOwned(vt::DType::kBF16, {in_dim, out_dim});
-  TransposeBf16(reinterpret_cast<const uint16_t*>(t.data), out_dim, in_dim,
+  TransposeBf16(t.data, out_dim, in_dim,
                 reinterpret_cast<uint16_t*>(o.bytes.data()));
   MaybeReleaseSourcePages(t.data, t.nbytes);
   return o;
@@ -345,9 +354,12 @@ OwnedTensor LoadBf16ToF32(const TensorResolver& get, const std::string& name) {
            "qwen3_5 weights: expected 1-D tensor for " + name);
   const int64_t n = t.shape[0];
   OwnedTensor o = MakeOwned(vt::DType::kF32, {n});
-  const auto* src = reinterpret_cast<const uint16_t*>(t.data);
+  // Unaligned: `t.data` is an arbitrary byte offset into the mmap (#627).
+  const uint8_t* src = t.data;
   auto* dst = reinterpret_cast<float*>(o.bytes.data());
-  for (int64_t i = 0; i < n; ++i) dst[i] = vt::BF16ToF32(src[i]);
+  for (int64_t i = 0; i < n; ++i) {
+    dst[i] = vt::BF16ToF32(vt::LoadUnaligned<uint16_t>(src + i * 2));
+  }
   MaybeReleaseSourcePages(t.data, t.nbytes);
   return o;
 }

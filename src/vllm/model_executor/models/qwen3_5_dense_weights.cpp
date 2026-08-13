@@ -18,6 +18,7 @@
 #include "vllm/platforms/interface.h"
 #include "vt/backend.h"
 #include "vt/dtype.h"
+#include "vt/unaligned.h"
 
 namespace vllm {
 
@@ -114,8 +115,10 @@ OwnedTensor LoadToF32(const TensorResolver& get, const std::string& name) {
              "qwen3_5 dense: byte-size mismatch for " + name);
     std::memcpy(dst, t.data, t.nbytes);
   } else {
-    const auto* src = reinterpret_cast<const uint16_t*>(t.data);
-    for (int64_t i = 0; i < n; ++i) dst[i] = vt::BF16ToF32(src[i]);
+    // Unaligned: `t.data` is an arbitrary byte offset into the mmap (#627).
+    for (int64_t i = 0; i < n; ++i) {
+      dst[i] = vt::BF16ToF32(vt::LoadUnaligned<uint16_t>(t.data + i * 2));
+    }
   }
   MaybeReleaseSourcePages(t.data, t.nbytes);
   return o;

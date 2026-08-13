@@ -5,6 +5,9 @@
 adds them to [`model-matrix.md`](../model-matrix.md) with the inventory counts
 bumped, mirroring the `MuseGlimmer`/`KimiK3` beyond-pin precedent)
 **Issue:** [#490](https://github.com/mudler/vllm.cpp/issues/490)
+**Also closes:** [#627](https://github.com/mudler/vllm.cpp/issues/627) — the
+pre-existing misaligned-load UB this row's new test was the first gate to reach
+(see `## Outcome` → "The safetensors alignment class").
 **Lifecycle:** `READY`
 **Owner:** unassigned
 
@@ -379,3 +382,55 @@ transformers-4.57.3 `dtype` key, which `hf_config.cpp:520-522` does not consume
 an assertion rather than smuggled in here), and the **unimplemented bf16 /
 3-D-stacked MoE routed-expert arm** (17e, added 2026-08-12 — it was previously
 recorded inverted, as the quantized arm being the owed one).
+
+**The safetensors alignment class** ([#627](https://github.com/mudler/vllm.cpp/issues/627),
+fixed 2026-08-13). This row's `test_qwen3_8_text_only` was the first gate ever to
+run a safetensors weight loader under UBSan, and it went RED on
+`qwen3_5_weights.cpp:298` — `load of misaligned address ... for type
+'const uint16_t', which requires 2 byte alignment`. **The defect is pre-existing
+(`8ee2c0766`), not this row's**; what this row supplied is the first synthetic
+checkpoint whose tensor offsets are not all even, which is a legitimate shape a
+real file can have because a safetensors offset is just the running byte total of
+everything ahead of it.
+
+The observed site was one instance of a class. A sweep of every
+`reinterpret_cast<T*>(<sttensor>.data)` in `src/vllm/model_executor/models/`
+found **fifteen** across nine `*_weights.cpp` loaders, including two with
+stricter-than-2-byte requirements: `olmo2_weights.cpp` forms a `const float*`
+(4-byte) and `qwen3_dspark_weights.cpp` a `const int64_t*` (8-byte). All fifteen
+now go through `vt::LoadUnaligned` — the seam `ea4deb203` introduced and that
+`dense_loaders::TransposeBf16` and `minimax_h3_vae_loader.cpp:87` already used;
+the local `qwen3_5_weights.cpp` copy of `TransposeBf16` had simply never been
+migrated to it. Two sites could not take a byte pointer and were handled in kind:
+`internlm2_weights.cpp` only ever bulk-`memcpy`s from its source, so it keeps a
+`const uint8_t*` and scales its offsets, and `gemma4_weights.cpp` feeds a typed
+scale pointer to `DequantFp8ChannelToBf16` (whose header is outside this row's
+authority), so it copies the N-element scale row into an aligned buffer first.
+
+**Inertness is proven three ways, not asserted.** (1) `vt::LoadUnaligned<T>` is
+`memcpy`, which is bit-identical to `*(const T*)p` on every input the old code
+was *allowed* to read — a scratch harness ran the original and rewritten form of
+all six loops over one payload at an aligned base and got byte-identical output,
+then reproduced those same bytes from the rewritten form at misaligned bases 1
+through 8. (2) `tests/parity/goldens` is untouched and every golden-comparing
+suite passes. (3) Full CPU gate 404/404 (2 skipped: `test_voxtral_e2e` and
+`test_modelopt_mixed_precision_checkpoint`, fixtures absent) and — the gate that
+was red — full ASan+UBSan 404/404, `test_qwen3_8_text_only` back to 7/7 and
+747/747 with zero runtime errors.
+
+**No load-time regression, checked rather than assumed.** `TransposeBf16` is a
+hot load-time loop and a naive per-element `memcpy` is exactly the kind of change
+that can turn one load into a call. It does not here: at `-O2` the old and new
+inner loops are instruction-for-instruction identical — the same six
+instructions, the same `movzx REG, WORD PTR [rax]`, no call emitted. The whole
+delta is five prologue instructions (one callee-saved push/pop pair and two
+address setups), paid once per call, not per element.
+
+**Still owed, and deliberately not touched here** because they fall outside this
+row's authority (`*_weights.cpp`): the same cast survives at
+`voxtral.cpp:51,347`, `qwen3_vl.cpp:78` and `qwen3_5_mtp.cpp:71`. The first three
+are genuine misaligned *loads* of the same severity as the one UBSan caught; the
+`qwen3_5_mtp.cpp` one only forms the pointer and then `memcpy`s through it, so it
+is UB but will not fire the `alignment` check. None is reached by any suite that
+runs under sanitizers today, which is precisely why they need a follow-up rather
+than a grep.
