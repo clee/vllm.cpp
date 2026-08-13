@@ -599,6 +599,33 @@ same term while leaving every variable read — M1 multiplies the inter-chunk
 product by `0.0f`, M7 passes `1, group_size * args.n_groups` (which *is*
 `hidden`) — and both then failed as intended.
 
+**Full `ctest` on the gate host**, all 392 test targets built (777 ninja edges,
+0 warnings), `ctest -j 1` — serial is required, not cautious: GB10 memory is
+UNIFIED, so a parallel CUDA suite reserves HOST RAM and has OOM-rebooted this
+box, and several suites starve under `-j` and red spuriously. Result:
+**`98% tests passed, 10 tests failed out of 431`**, `CTEST_EXIT=8`, 53 min.
+
+None of the three mamba2 suites is among the failures. Nine of the ten match, by
+name, an **independent same-box baseline** — another agent's full `ctest` on
+`row/pool-device-key` finishing 80 minutes earlier, `98% tests passed, 9 tests
+failed out of 437`: `test_serve_low_tools`, `test_linear_method`,
+`test_glm4_moe_lite_paged_engine`, `test_capi` (SEGFAULT), `test_ops_gdn`,
+`test_qwen3_apc_e2e`, `test_minicpm3_paged_engine`, `test_internlm2_paged_engine`,
+`test_llama_paged_engine`. Two branches, two builds, the same nine.
+
+The tenth, **`test_minimax_h3` (SEGFAULT at 11.81 s)**, passed on that baseline
+and is the one difference, so it is NOT dismissed. What is established: **no
+model or layer code calls these ops at all** — `grep` for `vt::Mamba2ChunkScan`,
+`vt::Mamba2StateUpdate` and `vt::RmsNormGatedGroup` outside `src/vt/` returns
+`include/vt/ops.h` declarations and the three unit tests, nothing else — so the
+H3 path cannot reach a kernel this brick added, and the only W2 delta it can see
+is three extra registrations in the op table. What is NOT yet established is the
+positive cause. A standalone serial re-run of all ten under the lock is queued
+and is **PENDING on a named external resource**: `$HOME/gpu.lock` has been held
+for ~2 h by an unrelated benchmark series with three jobs ahead of it. That
+re-run, not this paragraph, is what settles the attribution, and it is owed
+before the fresh review closes.
+
 **The derived bar is audited, not asserted.** Across the 55 device-vs-host
 comparisons in a green run, the worst one used **7.66%** of `rtol(K) =
 4·(K+2)·2⁻²⁴`; the driver shapes used 0.32% and 0.18%. For contrast the same
