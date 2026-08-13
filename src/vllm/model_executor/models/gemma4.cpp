@@ -157,8 +157,8 @@ Gemma4Layout MakeLayout(const HfConfig& cfg) {
 // identity; angle denominator is Dh (not rotary_dim). Layout matches
 // RopeCosSinCache: cos_sin[t, i]=cos, cos_sin[t, Dh/2 + i]=sin, over Dh pairs...
 // stored as [P, Dh] with first Dh/2 = cos, second Dh/2 = sin. Double angle -> f32.
-DBuf BuildProportionalRopeCache(Dev d, const Gemma4Layout& g, int64_t Dh,
-                                int64_t max_pos) {
+std::vector<float> ProportionalRopeCosSinHost(const Gemma4Layout& g, int64_t Dh,
+                                              int64_t max_pos) {
   const int64_t pairs = Dh / 2;
   const int64_t rope_angles =
       static_cast<int64_t>(g.rope_partial_full * static_cast<double>(Dh)) / 2;
@@ -169,21 +169,27 @@ DBuf BuildProportionalRopeCache(Dev d, const Gemma4Layout& g, int64_t Dh,
     inv_freq[static_cast<size_t>(j)] = 1.0 / std::pow(base, exponent);
   }
   const int64_t P = max_pos + 1;
-  std::vector<uint16_t> host(static_cast<size_t>(P) * static_cast<size_t>(Dh));
-  // NOTE: cache dtype bf16 to match the bf16 q/k it rotates (RopeFromCache wants
-  // q/k/cache same dtype). vLLM keeps f32 cos/sin — a named bf16-rounding nuance.
+  std::vector<float> host(static_cast<size_t>(P) * static_cast<size_t>(Dh), 0.0f);
   for (int64_t t = 0; t < P; ++t) {
     for (int64_t i = 0; i < pairs; ++i) {
       const double angle = static_cast<double>(t) * inv_freq[static_cast<size_t>(i)];
-      const float c = static_cast<float>(std::cos(angle));
-      const float s = static_cast<float>(std::sin(angle));
       host[static_cast<size_t>(t) * static_cast<size_t>(Dh) + static_cast<size_t>(i)] =
-          vt::F32ToBF16(c);
+          static_cast<float>(std::cos(angle));
       host[static_cast<size_t>(t) * static_cast<size_t>(Dh) +
-           static_cast<size_t>(pairs + i)] = vt::F32ToBF16(s);
+           static_cast<size_t>(pairs + i)] = static_cast<float>(std::sin(angle));
     }
   }
-  DBuf cache(d, DType::kBF16, {P, Dh}, host.data());
+  return host;
+}
+
+DBuf BuildProportionalRopeCache(Dev d, const Gemma4Layout& g, int64_t Dh,
+                                int64_t max_pos) {
+  const std::vector<float> f32 = ProportionalRopeCosSinHost(g, Dh, max_pos);
+  // NOTE: cache dtype bf16 to match the bf16 q/k it rotates (RopeFromCache wants
+  // q/k/cache same dtype). vLLM keeps f32 cos/sin — a named bf16-rounding nuance.
+  std::vector<uint16_t> host(f32.size());
+  for (size_t i = 0; i < f32.size(); ++i) host[i] = vt::F32ToBF16(f32[i]);
+  DBuf cache(d, DType::kBF16, {max_pos + 1, Dh}, host.data());
   return cache;
 }
 
@@ -802,6 +808,14 @@ std::vector<float> Gemma4Model::ForwardMm(
   std::vector<float> logits(static_cast<size_t>(n_out) * config.vocab_size);
   dlogits.Download(d, logits.data());
   return logits;
+}
+
+std::vector<float> Gemma4ProportionalRopeCosSin(const HfConfig& config, int64_t head_dim,
+                                                int64_t max_pos) {
+  VT_CHECK(head_dim > 0 && head_dim % 2 == 0 && max_pos >= 0,
+           "gemma4: proportional rope table wants an even positive head_dim and a "
+           "non-negative max_pos");
+  return ProportionalRopeCosSinHost(MakeLayout(config), head_dim, max_pos);
 }
 
 }  // namespace vllm

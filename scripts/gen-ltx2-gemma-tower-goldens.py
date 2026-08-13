@@ -35,17 +35,28 @@ What it gates, and why each piece is here rather than assumed:
     12B tower. Our port runs only the VALID tokens at their ORIGINAL absolute
     positions. That is equivalent -- pads are masked out of attention and are
     causally before every valid token, and the feature extractor zeroes their
-    rows anyway -- but "is equivalent" is a claim, so section 3 emits the full
+    rows anyway -- but "is equivalent" is a claim, so section 4 emits the full
     left-padded oracle run and the C++ suite holds the short run's valid rows
     to the padded run's valid rows. If the equivalence is ever false, that gate
     is what says so, and a 100x cost claim stops resting on an argument.
 
   * ONE arithmetic width per state, both ways round. Section 2 is the oracle in
-    float32 and section 4 the SAME oracle in bfloat16. Our forward carries the
-    stream in bf16 and widens only on the way out (gemma4.h,
-    Gemma4HiddenStatesResult), so bf16 is the dtype-MATCHED arm and f32 is the
-    arm that would catch a reduction-order defect a bf16 store absorbs. Gating
-    only one of them has burned this project before.
+    float32 and section 3 the SAME oracle in bfloat16; sections 4 and 4b are
+    that pair again for the left-padded run. Our forward carries the stream in
+    bf16 and widens only on the way out (gemma4.h, Gemma4HiddenStatesResult),
+    so bf16 is the dtype-MATCHED arm and f32 is the arm that would catch a
+    reduction-order defect a bf16 store absorbs. Gating only one of them has
+    burned this project before.
+
+    Every leg runs on a DEEP COPY of the module. `nn.Module.to(dtype)` converts
+    in place and bf16 rounding is destructive, so before that fix the two
+    "float32" legs after the bf16 one were executing over bf16-ROUNDED weights
+    -- MEASURED at up to 3.90e-02 per state, of the same order as the noise
+    floor the tolerance itself is derived from.
+
+  * The ROPE TABLES, in f32 (section 6), because `partial_rotary_factor` is not
+    resolvable from the hidden states at any fixture size this generator can
+    build. Section 6's note carries the measurement that establishes it.
 
 Both sides rebuild every weight from one deterministic FNV-1a + splitmix64
 stream keyed by the parameter's own HuggingFace NAME, exactly as
@@ -84,6 +95,7 @@ checkpoint, no download, no network.
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import os
 import subprocess
@@ -317,7 +329,20 @@ def build_tower(real_config: dict):
 
 
 def run_tower(inner, ids, mask, dtype, positions=None):
-    m = inner.to(dtype).eval()
+    """One oracle leg, on a DEEP COPY of the module.
+
+    `nn.Module.to(dtype)` converts parameters and buffers IN PLACE, so the
+    obvious `inner.to(dtype)` / `inner.to(torch.float32)` round trip does not
+    restore anything: bf16 rounding is destructive, and every leg after the
+    first bf16 one would run over bf16-ROUNDED weights while calling itself
+    float32. MEASURED on this fixture before the fix: re-running the identical
+    f32 call after the bf16 leg moved a state by up to 3.90e-02, which is
+    ~40x the f32 legs' own round-off and of the same order as the bf16 noise
+    floor the gate is calibrated on. Sections 4 and 5 were silently
+    order-dependent because of it. Copying is cheap here -- the reduced tower
+    is a few hundred KB -- and it makes every leg independent of leg order.
+    """
+    m = copy.deepcopy(inner).to(dtype).eval()
     kwargs = {}
     if positions is not None:
         # The absolute positions the tokens occupy in the padded batch. Left
@@ -332,9 +357,44 @@ def run_tower(inner, ids, mask, dtype, positions=None):
             output_hidden_states=True,
             **kwargs,
         )
-    states = [h[0].to(torch.float32).contiguous().numpy() for h in out.hidden_states]
-    inner.to(torch.float32)
-    return states
+    return [h[0].to(torch.float32).contiguous().numpy() for h in out.hidden_states]
+
+
+def rope_cos_sin(config, layer_type: str, head_dim: int, positions) -> np.ndarray:
+    """The oracle's OWN cos|sin table for one layer type, in float32.
+
+    Why this is emitted at all: `partial_rotary_factor` is NOT resolvable from
+    the hidden states. MEASURED on this fixture, the whole difference between
+    the config's 0.25 and a port that ignored it and rotated fully is 1.09e-01
+    at the worst state against a bf16 noise floor of 9.99e-02 -- a ratio of
+    1.09, i.e. inside the tolerance the same states are gated at. Enlarging the
+    fixture does not rescue it: at (head_dim 16/32, seq 32) the ratio FALLS to
+    0.65, because bf16 accumulation noise grows at least as fast as the rope
+    contribution does. So the end-to-end states are the wrong instrument, and
+    the right one is the table itself, in f32, with no accumulation in it.
+
+    Built by the real `Gemma4UnifiedTextRotaryEmbedding`, which is what routes
+    `rope_type: "proportional"` to `_compute_proportional_rope_parameters`
+    (modeling_gemma4_unified.py:214-218, modeling_rope_utils.py:187-245) and so
+    is the only thing that decides how many angle pairs are zero-padded.
+
+    Returns [len(positions), head_dim]: the first head_dim/2 columns are cos
+    over the distinct angle pairs and the second half is sin, which is the
+    layout `BuildProportionalRopeCache` writes.
+    """
+    from transformers.models.gemma4_unified.modeling_gemma4_unified import (  # noqa: PLC0415
+        Gemma4UnifiedTextRotaryEmbedding,
+    )
+
+    rope = Gemma4UnifiedTextRotaryEmbedding(config)
+    pos = torch.tensor([list(positions)], dtype=torch.long)
+    x = torch.zeros(1, len(positions), head_dim, dtype=torch.float32)
+    cos, sin = rope(x, pos, layer_type=layer_type)
+    pairs = head_dim // 2
+    # Upstream duplicates each angle (`emb = cat((freqs, freqs))`) so cos/sin are
+    # head_dim wide over head_dim/2 DISTINCT angles; take one copy of each.
+    table = torch.cat((cos[0, :, :pairs], sin[0, :, :pairs]), dim=-1)
+    return table.to(torch.float32).contiguous().numpy()
 
 
 # ---------------------------------------------------------------------------
@@ -408,6 +468,11 @@ def main() -> int:
     plain_f32 = run_tower(inner, TOKENS, [1] * SEQ, torch.float32)
     plain_bf16 = run_tower(inner, TOKENS, [1] * SEQ, torch.bfloat16)
     padded_f32 = run_tower(inner, padded_ids, padded_mask, torch.float32)
+    # The padded run at the SHIPPED dtype too. Without it the left-padded rows
+    # have no dtype-matched oracle, and anything gated against them -- the
+    # prompt-to-conditioning path, which is left-padded by construction -- has
+    # no measured floor to be held to, only a borrowed one.
+    padded_bf16 = run_tower(inner, padded_ids, padded_mask, torch.bfloat16)
     # The equivalence claim, isolated INSIDE the oracle and in f32 so no dtype
     # noise is mixed into it: the same valid tokens, told their absolute
     # positions, run WITHOUT the pads. If upstream's own two answers agree, the
@@ -523,18 +588,59 @@ def main() -> int:
             "// [state][padded_seq * hidden]. Rows 0..kLtxTowerNumPad-1 are pad rows and\n"
             "// their contents are upstream's garbage-but-masked values; the gate reads\n"
             "// only the VALID tail and holds section 2 to it.\n"
+            "// Every leg runs on a DEEP COPY of the module, so this one is not\n"
+            "// downstream of the bf16 leg's rounding and the sections are independent\n"
+            "// of the order they are produced in.\n"
         )
         for i, s in enumerate(padded_f32):
             emit_f32(out, f"kLtxTowerPaddedStateF32_{i}", s)
 
         out.write(
+            "// --- section 4b: the LEFT-PADDED run, BFLOAT16 (the SHIPPED dtype) ---\n"
+            "// The dtype-MATCHED arm for anything gated on the left-padded rows, and\n"
+            "// with section 4 it is also the padded run's own measured noise floor.\n"
+        )
+        for i, s in enumerate(padded_bf16):
+            emit_f32(out, f"kLtxTowerPaddedStateBf16_{i}", s)
+
+        out.write(
             "// --- section 5: the equivalence, measured INSIDE the oracle ---\n"
             "// Per state, max|short-run-at-absolute-positions - padded-run's valid rows|,\n"
-            "// both f32, so this number carries NO dtype noise. It is upstream's own\n"
-            "// answer to 'is dropping the pads free?'. Our port inherits it; the C++\n"
-            "// gate checks the two claims separately so a failure says which one broke.\n"
+            "// both f32 and both on independently deep-copied modules, so this number\n"
+            "// carries NO dtype noise. It is upstream's own answer to 'is dropping the\n"
+            "// pads free?'. Our port inherits it; the C++ gate checks the two claims\n"
+            "// separately so a failure says which one broke.\n"
         )
         emit_f32(out, "kLtxTowerPadEquivalence", equivalence)
+
+        # SECTION 6 -- the rope table, because the hidden states cannot see it.
+        #
+        # `partial_rotary_factor` decides how many of the full-attention layers'
+        # angle pairs are rotated and how many are zero-padded to identity. It is
+        # config-carried, shape-invisible, and -- MEASURED, not assumed -- also
+        # invisible in the gated hidden states: setting it to 1.0 displaces the
+        # worst state by 1.09e-01 against a bf16 floor of 9.99e-02 (ratio 1.09),
+        # and a larger fixture makes that WORSE, not better (0.65 at head_dim
+        # 16/32, seq 32), because bf16 accumulation noise grows at least as fast.
+        # A gate whose tolerance is bf16 noise cannot resolve it, so the table
+        # itself is emitted and compared in f32.
+        full_head_dim = GLOBAL_HEAD_DIM
+        rope_positions = list(range(PADDED_SEQ))
+        rope_full = rope_cos_sin(config.text_config, "full_attention",
+                                 full_head_dim, rope_positions)
+        out.write(
+            "// --- section 6: the ORACLE's FULL-attention rope cos|sin table, f32 ---\n"
+            "// [position][global_head_dim]: first half cos, second half sin, over the\n"
+            "// global_head_dim/2 DISTINCT angle pairs (upstream stores each twice).\n"
+            "// `rope_type: proportional` at theta 1e6 and partial_rotary_factor 0.25,\n"
+            "// so the trailing pairs are cos=1, sin=0. Emitted because the partial\n"
+            "// factor is NOT resolvable from the hidden states -- see the note above --\n"
+            "// and because a table that silently rotated every pair would still produce\n"
+            "// 13 finite, plausibly-scaled states.\n"
+        )
+        emit_scalar(out, "kLtxTowerRopePositions", len(rope_positions))
+        out.write("\n")
+        emit_f32(out, "kLtxTowerRopeFullCosSin", rope_full)
 
         out.write("}  // namespace vllm_test\n")
 

@@ -1016,7 +1016,18 @@ Ltx2PromptConditioning Ltx2EncodePromptToConditioning(
         out.tokens.input_ids[static_cast<size_t>(out.tokens.first_valid + i)];
     // The ORIGINAL absolute position, not a renumbering from zero: transformers
     // derives positions from the cache position, which counts the pad rows, so a
-    // left-padded prompt's first real token sits at `first_valid`.
+    // left-padded prompt's first real token sits at `first_valid`. This mirrors
+    // upstream because upstream does it, and for no stronger reason than that —
+    // MEASURED against the running oracle rather than argued: rotary position
+    // embedding is RELATIVE and the pads are masked out of attention, so shifting
+    // every position by the same amount is a no-op. Upstream's own f32 answers
+    // for positions 12..19 and 0..7 on the same 8 tokens differ by 5.11e-05 on
+    // values of magnitude 14.35, i.e. 3.6e-06 relative — f32 round-off and
+    // nothing else. At bf16 they differ by 1.09, but that is the rounding of
+    // different absolute angles and is 0.65-1.70x the per-state dtype floor, so
+    // no tolerance separates the two cleanly either. Renumbering here would
+    // therefore NOT rotate a query by the wrong angle; it would simply stop
+    // matching what transformers passes. Keep it matching.
     positions[static_cast<size_t>(i)] =
         static_cast<int32_t>(out.tokens.first_valid + i);
   }
@@ -1025,18 +1036,31 @@ Ltx2PromptConditioning Ltx2EncodePromptToConditioning(
   // geometry, and the runner's single-uniform-head_dim allocation cannot express
   // that (gemma4.h, G1 HONEST STATUS) — so this path builds its own rather than
   // routing through a seam that would have to lie about one of the two.
+  //
+  // BF16, which is upstream's ONE resolved model dtype for this tower
+  // (base_encoder.py:41 `dtype: torch.dtype = torch.bfloat16`) and the dtype the
+  // attention itself runs in (gemma4.cpp, `adt = DType::kBF16`). This was f32
+  // until the L10 review: nothing was wrong with the numbers — an f32 KV cache
+  // is strictly WIDER, so every token gate and every golden still passed — it
+  // simply held twice the bytes and made `Gemma4AttnBlock` allocate two extra
+  // per-layer cast buffers and run a CastF32 on every K and V it wrote
+  // (gemma4.cpp:300-312, the `kv.dtype != adt` arm). That is exactly the defect
+  // class AGENTS.md names: a token gate cannot see a dtype that is too wide.
+  // At the shipped 48 layers x 1024 positions this is ~2x on a cache that peaks
+  // near 200 MB for one prompt.
   const int64_t block = 16;
   const int64_t blocks = (T + block - 1) / block;
-  std::vector<std::vector<float>> kv_storage;
+  std::vector<std::vector<uint16_t>> kv_storage;
   std::vector<PagedKvCache> attn_kv;
   kv_storage.reserve(static_cast<size_t>(L));
   for (int64_t l = 0; l < L; ++l) {
     const Gemma4LayerWeights& lw = tower.weights.layers[static_cast<size_t>(l)];
     kv_storage.emplace_back(
-        static_cast<size_t>(blocks * 2 * block * lw.num_kv_heads * lw.head_dim), 0.0f);
+        static_cast<size_t>(blocks * 2 * block * lw.num_kv_heads * lw.head_dim),
+        static_cast<uint16_t>(0));
     PagedKvCache kv;
     kv.data = kv_storage.back().data();
-    kv.dtype = vt::DType::kF32;
+    kv.dtype = vt::DType::kBF16;
     kv.num_blocks = blocks;
     kv.block_size = block;
     kv.num_kv_heads = lw.num_kv_heads;

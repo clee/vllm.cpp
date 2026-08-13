@@ -369,8 +369,14 @@ the audio VAE's is refused rather than resampled, since upstream uses a polyphas
 kaiser resampler this project does not carry. And a VAE configured with
 `latent_log_var: none` is refused, because upstream itself raises on it.
 
-**There is no prompt.** The Gemma-4 12B text tower is not ported, so nothing can
-turn words into the conditioning the caption projections consume. Conditioning
+**There is no prompt**, and this page said the wrong reason for it. The Gemma-4
+12B text tower IS ported and RUNS: a prompt string tokenizes with the tokenizer
+the checkpoint ships as a tensor, the tower is materialized and forwarded, and
+both caption projections emit their conditioning streams — all of it gated in CI
+against a running upstream tower rather than against invariants derived from its
+own output. What still blocks a prompt is the hop from there into
+cross-attention, which "A second behaviour changed" below states precisely.
+Conditioning therefore still
 comes from `--prompt-embeds` plus `--audio-prompt-embeds`: rows of
 little-endian f32, 4096 wide for the video stream and 2048 for the audio stream,
 with the same row count in both. Supplying a `--prompt` is refused, and supplying
