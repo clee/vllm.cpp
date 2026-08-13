@@ -249,16 +249,23 @@ inline constexpr char kLtx2EncoderConfigPathExtra[] = "encoder_config_path";
 //
 // IT IS A WITNESS, NOT A GATE — and the difference is MEASURED, not argued. A
 // digest detects CHANGE; it does not pin VALUES, so nothing at this level says
-// the values are the ones upstream would produce. A reviewer proved it on this
-// exact head with two mutations applied to the composition below:
+// the values are the ones upstream would produce. Two mutations applied to the
+// composition below, each alone:
 //
 //   * video conditioning scaled by 1.5 AFTER the connector, and
 //   * the conditioning rows REVERSED, putting every caption row on the wrong
 //     token,
 //
-// and BOTH passed all 485 assertions of `test_ltx2_video` with exit 0. The
-// digest moved, as it must — but no assertion says WHICH value it should have
-// moved to.
+// and BOTH passed `test_ltx2_video` at 30 cases / 499 assertions with exit 0.
+// The digest moved, as it must — but no assertion says WHICH value it should
+// have moved to.
+//
+// THAT COUNT IS THIS HEAD'S, and the distinction is the point of writing it
+// down. A reviewer first measured the pair at `43aa58377`, where the suite stood
+// at 485 assertions; the numbers were carried forward unchanged while the suite
+// grew, so the comment named a count no run of it could produce. Re-run here
+// (CPU Release, mutant recompiled and relinked each leg, tree restored
+// byte-for-byte and re-verified green between legs): 499/499, exit 0, both.
 //
 // THE VALUE ORACLE THE COMPOSITION IS OWED. The per-brick oracles are real and
 // strong: the Gemma-4 tower against a running `transformers` at a measured bf16

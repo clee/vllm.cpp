@@ -1132,8 +1132,16 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
   int64_t frames = gen.num_frames > 1 ? gen.num_frames : recipe.num_frames;
   if (gen.duration_seconds > 0.0) {
     // `resolve_num_frames` (utils/blocks.py) turns an AUTO duration into frames
-    // through the DURATION HEAD, which needs the encoded prompt this engine
-    // cannot produce. An explicit duration is exact arithmetic, so it is served;
+    // through the DURATION HEAD. THE REASON THIS IS UNSERVED MOVED IN L13 and the
+    // old one is recorded so a reader can re-check it: it used to be "the head
+    // needs an encoded prompt this engine cannot produce", and since `has_encoder`
+    // above the engine produces exactly that. What is missing now is the head
+    // itself — `ltx2_duration_head.h` is ported and gated as a brick, but nothing
+    // here constructs one, and `duration_head_path` is accepted in
+    // `kKnownLoadExtras` while NO code reads it (grep: it appears at that one
+    // site). So the extra is inert rather than wired, and that is recorded as owed
+    // rather than left to be discovered by someone who supplies it and gets the
+    // recipe default. An explicit duration is exact arithmetic, so it is served;
     // the AUTO path is what is missing, and `num_frames` is how to avoid it.
     frames = static_cast<int64_t>(std::llround(gen.duration_seconds * fps));
   }

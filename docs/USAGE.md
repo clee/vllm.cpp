@@ -397,8 +397,10 @@ returns the trace of the last `Generate()` — whether the conditioning came fro
 prompt or from embeds, the prompt string, the row count and both stream widths, an
 FNV-1a digest over the exact f32 buffers cross-attention read, and each stream's
 absmax. It is returned **by value, under the engine's own lock**, so it is safe to
-call from a server thread while another thread renders. `completed` is true only
-if that `Generate()` returned: the trace is filled before the denoise loop, so a
+call from a server thread while another thread renders — but `Generate` holds that
+same lock for the WHOLE render, so such a call blocks for minutes rather than
+returning a stale answer immediately. `completed` is true only if that
+`Generate()` returned: the trace is filled before the denoise loop, so a
 render that throws later leaves a populated trace behind, and this flag is what
 separates the two.
 
@@ -464,12 +466,15 @@ and `--video-extra KEY=VALUE` (repeatable) carries the same family-specific load
 knobs the flags above map onto. Both are described under
 [the server's video flags](#video-family-and-family-specific-load-knobs).
 
-**Two things about that command are worth knowing before you run it.**
+**Three things about that command are worth knowing before you run it.**
 
 *It is bounded by the VIDEO DECODE, well below the recipe's own defaults.*
-Staging the 21.00B FP8 transformer costs about 44 GB on a 119 GB GB10. **320x192
-at 25 frames completes** through both distilled phases; 448x256 at 25 frames
-finishes its denoise and then loses about 59 GB in 24 seconds inside the decode
+Staging the 21.00B FP8 transformer costs about 44 GB on a 119 GB GB10, and
+`--encoder` adds the text tower on top of that — roughly 24 GB of host bf16 that
+stays resident, because a prompt arrives per request. Every memory figure here
+was measured WITHOUT the tower, on the prompt-embeds path, so budget for both.
+**320x192 at 25 frames completes** through both distilled phases; 448x256 at 25
+frames finishes its denoise and then loses about 59 GB in 24 seconds inside the decode
 and has to be stopped. The denoise itself is flat at either size. Unified memory
 makes those host bytes and this class of box reboots rather than OOM-killing, so
 start small and grow, and put a memory watchdog in front of anything larger. The
@@ -477,16 +482,30 @@ recipe default (1024x1536 at 121 frames) is far beyond what one GB10 holds today
 Expect minutes, not seconds: most of a 320x192/25f render is spent single-threaded
 in the host VAE decode at 0% GPU.
 
-*It renders a scene, and it does not render YOUR scene.* With the connector on
-the path the shipped 21.00B FP8 transformer produces a temporally coherent
-photorealistic clip at 320x192 / 25 frames: consistent subject, consistent
-background, frame-to-frame motion. Before the connector was wired the same
-weights at the same settings produced smooth colour fields. What conditions it,
-though, is mostly the connector's own trained `learnable_registers` table, which
-is what upstream substitutes at PADDED positions — so the render is the model's
-own default, not a depiction of anything you asked for. The Gemma-4 text tower is
-still not ported, so the rows you supply as prompt embeds are not an encoded
-prompt. Ask for a subject and you will not get it.
+*The render behind those numbers was NOT prompted, and it renders a scene without
+rendering YOUR scene.* It was the EMBEDS path — `--prompt-embeds` with
+`--prompt-valid-rows 24`, over synthetic N(0, 0.2) rows, with no text tower on the
+path at all. With the connector wired the shipped 21.00B FP8 transformer produced
+a temporally coherent photorealistic clip at 320x192 / 25 frames: consistent
+subject, consistent background, frame-to-frame motion, where before the connector
+the same weights at the same settings produced smooth colour fields. But 104 of
+its 128 connector rows were the connector's own trained `learnable_registers`
+table, which is what upstream substitutes at PADDED positions, and the other 24
+were noise. So what conditioned that clip is the checkpoint's own learned default,
+not a depiction of anything anyone asked for — and on the embeds path it could not
+be otherwise, because rows read from a file are whatever you put in them rather
+than an encoded caption. Ask a `--prompt-embeds` run for a subject and you will
+not get it.
+
+*Nobody has yet run the command above end to end, and this page claims nothing
+about what it renders.* The typed-prompt path is gated all the way through —
+tokenizer, Gemma-4 tower, connector, cross-attention — but the gate is a
+REDUCED-DIMENSION synthetic encoder under CPU Release, with no real checkpoint
+anywhere in it. A real-checkpoint prompted render is OWED. Until it runs, neither
+claim is available: not that `--prompt "a red fox…"` puts a fox on the screen, and
+not that it fails to. `last_conditioning()` answers a narrower question — that the
+render depended on your prompt, through these weights — which is not the same
+question as whether the frames depict it.
 
 LTX-2.5 ships two video decoders behind one checkpoint field. The convolutional
 one is implemented; the higher quality diffusion one (`NADiffusionDecoder`) is
@@ -496,18 +515,21 @@ because that would hand back a lower quality render as if it were the one you
 asked for. Keyframe and reference conditioning is refused for the same reason: it
 runs through the video VAE's encoder, and only the decoder is ported.
 
-A second behaviour changed and is worth stating precisely, because the reason a
-prompt is refused has moved. The Gemma-4 text tower now RUNS: a prompt string
-tokenizes with the tokenizer the checkpoint ships as a tensor, the torchao-NVFP4
-tower is materialized and forwarded, all 49 hidden states feed the multi-layer
-aggregation, and both caption projections produce the 4096-wide video and
-2048-wide audio conditioning streams. What is still missing is the hop from there
-into cross-attention: upstream routes each stream through an
-`Embeddings1DConnector` first, and while that connector's math is ported, its
-weights ship inside the DiT file and are still among the modules the DiT loader
-refuses. So `encoder_path` is still refused — with a message that now names the
-connector weights rather than the tower — and `has_encoder()` is still false.
-Conditioning meanwhile comes from `prompt_embeds_path`.
+**The refusal that used to stand here is gone, and what replaced it is an owed
+ORACLE rather than an owed feature.** Through L10 this page said a prompt was
+refused because the `Embeddings1DConnector` weights, which ship inside the DiT
+file, were among the modules the DiT loader would not load. They are loaded
+(`ltx2_loader.cpp:416-427` carries them as their own contract, outside the DiT's),
+so `encoder_path` is accepted, `has_encoder()` is true, and a prompt no longer
+needs a matching pair of embeds files. The gap that remains is a numeric one: the
+tower, the connector's forward and both caption projections each have an oracle
+against executed upstream, and the two JOINS between them —
+`create_embeddings`, and the render composition that chains it onto the tower's
+output — have none. Upstream's `EmbeddingsProcessor.process_hidden_states` is
+that whole chain in one function and is the oracle this owes; until it is
+executed, the composition's VALUES rest on the per-brick oracles either side of
+it. That is also why `last_conditioning()` is described above as a change
+detector and not as a check on the conditioning.
 
 ### Muse Glimmer: exactly what has been checked
 
@@ -1531,7 +1553,12 @@ seam's `prompt_embeds_path`, which carries the video stream), `pipeline_kind`
 (default `distilled_two_stage`), `model_version` (only for a checkpoint that
 declares none), `dit_config_path`, `allow_unported_modules`, `max_phase`,
 `prompt_embeds_valid_rows`, `upsampler_path` and `duration_head_path`. An extra a
-family does not define is refused, never ignored.
+family does not define is refused, never ignored. One caveat inside that set:
+`duration_head_path` is accepted but INERT — the duration head is ported and gated
+as a brick, nothing in the video engine constructs one, and no code reads that
+key, so supplying it neither loads a head nor enables an AUTO duration. Give
+`num_frames` (or `duration`, which is exact arithmetic against the recipe's frame
+rate) instead.
 
 `prompt_embeds_valid_rows` is how many of the supplied conditioning rows are real
 tokens; absent, every row is. It matters because the embeddings connector
