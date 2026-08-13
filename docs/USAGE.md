@@ -1813,12 +1813,26 @@ routes stay unregistered.
 
 ## LTX-2.5: reproducing the DiT parity gate
 
-**There is no LTX-2.5 render path yet.** What ships today is the DiT's layout and
-forward, and there is no text encoder, no VAE, no pipeline and no `/v1/videos`
-route for it — asking the video engine for LTX-2.5 will not work. The C++ surface
-is `include/vllm/model_executor/models/ltx2.h`, and it refuses by name every arm it
-does not carry (a non-f32 stream dtype, the 19B caption-projection checkpoint form,
-keyframe absolute-position embeddings, the video-only / audio-only model types).
+**This section is the DiT's own parity gate, not the way to run LTX-2.5.** The
+render path ships and is documented above under
+[LTX-2.5: what runs, and what it cannot do](#ltx-25-what-runs-and-what-it-cannot-do):
+`ltx-2.5` is one of the two registered video families
+(`REGISTER_VLLM_VIDEO_FAMILY` at `src/vllm/multimodal/ltx2_video.cpp:1529`), the
+Gemma-4 text tower loads from `--encoder` and sets `has_encoder`
+(`ltx2_video.cpp:893`), both VAEs and the pipeline layer are implemented
+(`ltx2_video_vae.cpp`, `ltx2_audio_vae.cpp`, `ltx2_pipeline.cpp`), and the
+`/v1/videos` routes register for whatever family `--video-dit` resolves —
+`server_main.cpp` calls the family-agnostic `LoadVideoEngine` and then prints the
+resolved family. What follows here is how to regenerate the DiT's goldens. The
+C++ surface is `include/vllm/model_executor/models/ltx2.h`, and it refuses by
+name every arm it does not carry (a non-f32 stream dtype, the 19B
+caption-projection checkpoint form, keyframe absolute-position embeddings, the
+video-only / audio-only model types).
+
+Provenance, so this can be re-checked rather than trusted: the paragraph above
+replaces one that arrived at `3d89f6fc4` — the first LTX commit, where it was
+true — and was never revisited as L3 through L13 built each of the six pieces it
+denied.
 
 The prompt-K/V cache (`Ltx2PromptKvCache`) is reusable across the DENOISE STEPS of
 one prompt, and only those. It records a fingerprint of the prompt it was filled
@@ -1917,19 +1931,32 @@ only at their own `class` statements. Two known gaps in the schedule are open:
 0.10000002, and the suite's `MaxAbsDiff` drops NaN so a golden alone will not
 catch it.
 
-## LTX-2.5 quantized loaders (no render path yet)
+## LTX-2.5 quantized loaders
 
 `include/vllm/model_executor/models/ltx2_loader.h` materializes the shipped
 LTX-2.5 checkpoints: the FP8 DiT, an NVFP4 DiT, and the torchao-NVFP4 Gemma-4
-text encoder with its embedded tokenizer. There is still no render path, so
-these are library entry points and not a command.
+text encoder with its embedded tokenizer. These are the entry points the render
+path itself drives: `--dit` (`--video-dit` on the server) reaches
+`Ltx2StreamDitToDevice` / `Ltx2LoadDitFromSafetensors` at
+`ltx2_video.cpp:576-577`, and `--encoder` (`--video-encoder`) reaches
+`Ltx2LoadTextEncoderFromSafetensors` at `ltx2_video.cpp:851`. This section
+documents them at the library level, where the gate below runs.
 
 Two behaviours a caller has to know. `Ltx2LoadDitFromSafetensors` REFUSES the
-shipped DiT by default, because that file carries five module families phase L2
-does not port (`prompt_adaln_single`, `audio_prompt_adaln_single`,
-`keyframes_abs_pos_embedding`, and the two `*_embeddings_connector` towers); pass
-`Ltx2DitLoadOptions::allow_unported_modules` to load the ported subset, which
-still reports every one of them in `Ltx2DitCheckpoint::unported`. And loading is
+shipped DiT by default, because that file carries **three** module families phase
+L2 does not port (`prompt_adaln_single`, `audio_prompt_adaln_single` and
+`keyframes_abs_pos_embedding`); pass `Ltx2DitLoadOptions::allow_unported_modules`
+to load the ported subset, which still reports every one of them in
+`Ltx2DitCheckpoint::unported`. The two `*_embeddings_connector` towers are
+**not** among them and never will be:
+`UnportedFamilies` filters them out at `ltx2_loader.cpp:439` (`LoadedElsewhere`),
+`RefuseUnported`'s own message says so in capitals at `ltx2_loader.cpp:461-464`,
+and `Ltx2LoadConnectorWeights` loads them under their own contract — which is
+what the video engine calls, so a checkpoint this port reads completely is never
+made to ask for `allow_unported_modules` on their account. (The "five" this
+paragraph used to say arrived at `5966ffef3` and was true until `e48c86253`
+added `LoadedElsewhere` — the same claim the "what runs" section above already
+retired, which survived here because it was never swept for.) And loading is
 **bf16** by default, the checkpoint's own model dtype; `widen_to_f32` is opt-in
 and exists only for the f32 parity forward.
 
@@ -1960,10 +1987,13 @@ ENVIRONMENT.md (`VT_GEMMA4_RESIDENT_*`, `VT_ATTN_*`). Defaults stay safe off RDN
 This PR does **not** restructure the Gemma-4 layer loop or enable decode hipGraph
 (those stay lab-only until a CUDA token-exact gate can land them).
 
-## LTX-2.5 text conditioning (no render path yet)
+## LTX-2.5 text conditioning
 
-There is **no LTX-2.5 render path**. This section documents one brick, the text
-conditioning the DiT consumes, and how to reproduce its gate.
+This documents **one brick of the shipped render path** — the text conditioning
+the DiT consumes — and how to reproduce its gate. The render itself is above
+under [LTX-2.5: what runs, and what it cannot do](#ltx-25-what-runs-and-what-it-cannot-do);
+`--encoder` is what puts this brick on that path, and `has_encoder` is set at
+`ltx2_video.cpp:893` once the tower loads.
 
 LTX-2.5 does not condition on a text encoder's last hidden state. It takes every
 Gemma-4 hidden state (the embedding output plus all 48 decoder outputs, 49 in
