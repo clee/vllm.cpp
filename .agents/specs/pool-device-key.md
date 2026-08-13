@@ -274,3 +274,156 @@ device suite with no per-case scoping; the enumerated mixed-backend binaries and
 the full suite before/after; the #486 result either way; every baseline as a
 `Status:` line and case count; the exact `flock` lines, the wait, and `docker ps`
 at both ends; `git log --oneline` and the final SHA.
+
+## 10. Outcome
+
+Landed. Spec `17532ea0b` (this file, committed before any implementation), RED
+test `f4be8a4e2`, fix `1a2eb35ec`.
+
+**Environment.** dgx.casa, GB10 sm_121a, CUDA 13.0.88, configured with all three
+MANDATORY confirmations printed: `CUTLASS found at ~/cutlass-4.5.0; enabling
+sm120a NVFP4 cutlass GEMM`, `FlashAttention-2 prefill/decode: ENABLED for
+arch(es) [121a]`, `Triton AOT: vendored tree …/sm_121a matches triton_kernels/
+(MANIFEST hashes OK)`. Both arms are CLEAN builds (`rm -rf build`), RED
+1508/1508 exit 0 and GREEN 1508/1508 exit 0; the CPU host likewise clean,
+1219/1219 exit 0, zero warnings under `-Werror`. `local-ai-worker` was stopped
+before any GPU work and left DOWN. `mnt-nas_share.mount` had lost its boot race
+after a reboot and was restarted with `sudo -n systemctl restart`; the shipped
+DiT was then proven READABLE (21,025,119,068 bytes, first 16 bytes dumped)
+before the opt-in case was allowed to run.
+
+**RED, at `f4be8a4e2`.** Both directions, on the same binary:
+
+| run | result |
+|---|---|
+| `test_device_pool` (CPU host) | 4 cases / 2 passed / 2 failed · 15 assertions / 5 failed · FAILURE · exit 1 |
+| `test_ltx2_device --order-by=rand --rand-seed=7` | **exit 139**, `:533 FATAL ERROR: test case CRASHED: SIGSEGV` · 4 cases / 3 passed / 1 failed / 9 skipped · **44 assertions / 0 failed** |
+| `--rand-seed=1` | exit 139, SIGSEGV at `:518` · 7 / 6 / 1 / 6 · 481 assertions / 0 failed |
+| `--order-by=name` | exit 139, SIGSEGV at `:452` · 7 / 6 / 1 / 6 · 455 assertions / 0 failed |
+| default order, `LTX2_SHIPPED_DIT` set (21B FP8) | **exit 1**, `:925 FATAL ERROR: REQUIRE( std::isfinite(v) )` · 13 / 12 / 1 · 4639 assertions / 1 failed — the SILENT direction |
+| default order, fixture UNSET | SUCCESS 13/552 — the skip that impersonates a repair (§7.0(d)) |
+| `test_minimax_h3` | exit 139, SIGSEGV at `:3974` · 38 / 36 / 2 / 41 · 42,724 assertions |
+| `test_minimax_h3` + `VT_POOL_BYPASS=1` | SUCCESS 79 / 79 · 451,993 assertions · exit 0 |
+
+**GREEN, at `1a2eb35ec`** (`b4618b8c7` before an amend that added the
+doc-gate argument to the message; the tree is identical), with NO per-case pool scoping anywhere (both
+workarounds deleted):
+
+| run | result |
+|---|---|
+| `test_device_pool` | 8 / 8 · 26 assertions · SUCCESS (also under `--order-by=rand` seeds 1 and 7) |
+| `test_ltx2_device` seed 7 / seed 1 / by-name / default | 13 / 13 · 552 assertions · SUCCESS · exit 0, all four |
+| `test_ltx2_device` + shipped 21B DiT, default AND seed 7 | **13 / 13 · 6176 assertions · SUCCESS · exit 0** |
+| `test_minimax_h3` (pool ON) | **79 / 79 · 451,993 assertions · SUCCESS · exit 0** |
+| `test_deepseek_v2_forward` | 11 / 11 · 1558 assertions · SUCCESS |
+
+**#486 is this bug.** Asked as a question, not assumed: at the RED commit
+`test_minimax_h3` SIGSEGVs with the pool on and is 79/79 with `VT_POOL_BYPASS=1`
+— the bypass lane changes nothing but the free list. At the fixed commit it is
+79/79 with the pool ON. The hypothesis is confirmed by measurement in both
+directions.
+
+**ENOSPC re-verification.** The local box hit 100% disk during this session
+(operator note). Every build log here was grepped for `No space left` — zero hits
+in the local RED build, the local clean AFTER build, the dgx RED build, the dgx
+GREEN build and the dgx AFTER `ctest` — and the local gates were then re-run
+CHAINED to their build in one command, with `ninja` reporting "no work to do"
+first, so no result here comes from a stale binary left behind by a died build.
+
+**Baselines, CPU host, full `ctest`: 402/402 passed, exit 0.** Every named
+baseline byte-for-byte where it was: `test_ltx2` 29/1615 · `test_ltx2_vae`
+16/1816 · `test_ltx2_text_encoder` 17/3350 · `test_ltx2_pipeline` 35/2358 ·
+`test_ltx2_loader` 20/2363 · `test_ltx2_video` 17/170 ·
+`test_ops_attention_cross` 9/32 · `test_minimax_h3` 79/57395 ·
+`test_minimax_h3_video_fold` 6/137 · `test_video_engine` 11/254 · `test_capi`
+55/505.
+
+**Full CUDA `ctest -j 1` on dgx, AFTER: 98% passed, 9 failed out of 437.** The
+nine, with their exact signatures:
+
+| test | signature |
+|---|---|
+| `test_serve_low_tools` | the Python bench-tooling suite (no C++, no GPU) |
+| `test_linear_method` | `:246 CHECK( after == before + 1 )` → `0 == 1` — the `fused_gate_up` counter did not move, i.e. the fused Marlin gate-up path FELL BACK; its numeric arm passed at `bitexact=12288/12288 max_abs=0`, which is exactly what a fallback to the split path looks like |
+| `test_ops_gdn` | `:728 CHECK( bad == 0 )` → `2609 == 0`, a GDN kernel numeric check |
+| `test_capi` | **SEGFAULT** at `:482` "capi: custom logits processor forces the generated token (ABI v8)" — 4 cases / 3 passed / 1 failed / 51 skipped, 47 assertions / 0 failed |
+| `test_glm4_moe_lite_paged_engine`, `test_qwen3_apc_e2e`, `test_minicpm3_paged_engine`, `test_internlm2_paged_engine`, `test_llama_paged_engine` | checkpoint-gated paged-engine suites |
+
+**These nine are UNATTRIBUTED, and that is stated rather than glossed.** The dgx
+full-suite BEFORE arm was NOT run: the box was at 99–100% disk with a single 31 GB
+build tree, so the RED and GREEN trees could not coexist, and the GPU lock was
+shared with three other agents (one bounded `flock -w 2700` wait expired without
+acquiring). Without that arm, "pre-existing" would be an inference, and this row
+does not report inferences as measurements.
+
+What IS measured and bears on them: the same binaries are GREEN on the CPU host
+in a 402/402 full run — including `test_capi` at its recorded 55/505 and
+`test_linear_method` — and every pool-adjacent gate on dgx is green
+(`test_ltx2_device` 13/13·6176 in four orderings, `test_minimax_h3` 79/79,
+`test_deepseek_v2_forward` 11/11, `test_device_pool` 8/8). None of the nine
+signatures is a cross-device scratch symptom: two are a dispatch counter and a
+kernel numeric check that this diff does not reach, five are checkpoint-gated,
+one is Python.
+
+**`test_capi` IS A TIMING FLAKE, and that one is measured, not inferred.** It
+reproduced on the CPU host, where this row's change is CPU-only and every pool
+gate is green: a first full `ctest -j 1` had it at its recorded 55/505 SUCCESS,
+a second full run on the SAME binary (ninja: "no work to do") failed it, and
+standalone it is **55/55 · 505 assertions · SUCCESS**, then `--repeat
+until-fail:8` passed **8 of 8** with per-run wall times of 0.78, 1.02, 1.65,
+2.00, 4.21, 12.56, 228.94 and 339.88 s. A test whose duration spans three orders
+of magnitude on a contended box is timing-sensitive, which is what
+`.agents/environment.md` already records for `test_capi`. Non-deterministic on a
+host where the pool change cannot produce it ⇒ not this row's.
+
+**The exact next step, for whoever picks up the remaining eight.** Re-run them
+standalone on this GREEN tree and again on a pre-fix tree; the cheap
+discriminator that needs no second build is `VT_POOL_BYPASS=1`, which removes the
+free list entirely — a failure that survives bypass cannot be a pooling failure.
+The rerun script is `~/work/pool-device-key/dgx_rerun.sh`; it was written and
+shipped but never ran, because two consecutive bounded `flock -w 2700` waits
+expired without acquiring the shared GPU lock (three other agents were rendering
+on it). Reported and stopped, per the lock protocol, rather than camping.
+
+**Blast radius, MEASURED not guessed.** `VT_POOL_STATS=1` makes every pool print
+one line naming its backend at exit, so the full suite counts pools per binary
+rather than grepping for device names. On the CPU host **42 of 402 test binaries
+instantiate a `DevicePool` at all**, and exactly one — `test_device_pool` itself,
+with its 11 fakes — instantiates more than one, which is the expected answer for
+a host with a single backend. The grep-level upper bound is 51 test sources that
+name both `kCUDA` and `kCPU`.
+
+**What was rejected.** A composite `(Backend*, class)` key inside one pool: it
+needs a `void*`→`Backend*` side map to serve the backend-less `Put`, i.e. a
+second hash operation on the hottest allocation path, to keep an overload that
+should not exist. A `virtual Device device() const` on `vt::Backend`: reaches
+every backend implementation for information the caller already holds, and was
+an explicit stop condition. Per-caller `ActivePoolScope`: a list of remembered
+places, which is what the current red already disproved.
+
+**Why the defaults are what they are.** The device check is a runtime `throw`
+rather than an `assert` because the gate builds are Release/NDEBUG, where an
+assert compiles out and hands back exactly the pre-fix behaviour. The pool
+lookup is a thread-local last-(backend,pool) memo rather than a hash because a
+`DBuf` resolves its pool on every construction and the pool exists to avoid a
+synchronizing `cudaMalloc`. Size-class rounding is untouched: `VT_POOL_EXACT=1`
+was measured still red, so it was never the fault.
+
+**Not established, and left open.** Why a host `aligned_alloc` block yields a
+uniform quiet NaN on GB10 rather than running correct-but-slow through ATS. The
+fix makes the ordering unreachable, so the question is now academic for this row,
+but it is not answered and is not claimed to be.
+
+**Related, NOT fixed here.** `MoeAuxStreamFor` (`qwen3_5.cpp`) caches its aux
+stream on `d.q.device.index` alone, so a CPU device 0 and a CUDA device 0 collide
+in the key. It is unreachable today because the only call site is gated on
+`Backend::SupportsAuxStream()`, which no host backend answers true to — so it is
+a latent trap of this same family rather than a live defect, and widening this
+diff to it was not worth the review surface. Recorded here so the next reader
+finds it.
+
+**Owed, and outside this row's granted scope** (this spec was the only record
+surface granted): the `#516` line in the issue table of `.agents/roadmap_v1.md`,
+and the `porting-inventory.md` §L8 note at line 1455 which still reads "the
+shared `DevicePool` is DEVICE-BLIND … repairing it is owed as its own row" and
+should now point at this spec.
