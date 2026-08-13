@@ -133,9 +133,21 @@ record-accuracy findings, closed at `3bd684cd`'s successor: the unfused bf16 tai
 is now gated by two `VT_GLUE_FUSE=0` CTest entries, the non-string config arm has
 its own subcase, and the dim capture no longer prints `1`.
 
-Owed before `DONE`: the operator's own rerun of the row gate; the GPU arms this
-host cannot execute, **including the fp8 sigmoid polarity case that no backend
-has ever executed**; and an `## Outcome` section. The promised widening of the
+The fp8 sigmoid polarity case, which no backend had ever executed, **has now
+been executed** — on the dgx (GB10, sm_121a) at `b9d172f6`. Its numbers, its
+negative mutation, and the argument for why they transfer to this head without a
+re-run are under **The fp8 GPU arm** below. A third independent review of that
+head returned **PASS** with four record-and-coverage findings, closed here: the
+fp8 GPU evidence was recorded nowhere in the tree (F1, records below); the
+`_fused_chain_off` entry's marginal purpose is argued rather than demonstrated
+(F2, recorded as owed below — deliberately not attempted without a GPU);
+`RunGatePolarityFp8Case` hard-FAILED instead of skipping where fp8 is
+unsupported (F3, a code change); and the CPU `_fused_chain_off` entry is vacuous
+(F4, recorded below).
+
+Owed before `DONE`: the operator's own rerun of the row gate; the remaining GPU
+arms this host cannot execute, itemized under **Owed at the next GPU run**
+below; and an `## Outcome` section. The promised widening of the
 refusal to a GDN-architecture check is now tracked by
 [#533](https://github.com/mudler/vllm.cpp/issues/533) as a scoped follow-up with
 its own test, so it is no longer owed here.
@@ -288,19 +300,107 @@ erased exactly that. All six uses in `test_qwen3_5_gdn_spec_routing.cpp` now go
 through `INFO("dims := ", std::string(g.name))`; the RED above is what proves it,
 logging `dims := 27B (Hv=48)` and `dims := 35B (Hv=32)`.
 
-**Not run here.** This host has no GPU, so every CUDA arm of all three tails is
-UNRUN and owed at the operator's rerun. Two of those are worth naming, because
-neither is merely "the CUDA copy of something already gated":
+**The fp8 GPU arm — RUN, at `b9d172f6`.** Six of the twelve gate-carrying
+constructions in the three Qwen3.5 tails (the population disambiguated above) are
+fp8 — `qwen3_5.cpp:3641-3647`, `4111-4117`, `4539-4545`, the `FusedChain` recipe
+copy and the direct `RmsNormGatedQuantFp8` in each tail. They need a populated
+`out_proj_fp8` and `Platform::supports_fp8()`, so no CPU gate could reach them
+and, until `b9d172f6`, none ever had on any backend. That is no longer true. The
+`test_qwen3_5_gdn_spec_routing` fp8 polarity cases were executed on the dgx
+(GB10, `sm_121a`), on a CUDA build configured with
+`-DVLLM_CPP_CUDA_ARCHITECTURES=121a` and the CUTLASS nvfp4/fp8 and FA2 arms all
+ENABLED — verified in the configure log, because an absent CUTLASS falls back to
+the slow WMMA path silently.
 
-- **No fp8 gated-RMSNorm site has ever run the sigmoid arm, on any backend.**
-  Six of the twelve gate-carrying constructions in the three Qwen3.5 tails
-  (the population disambiguated above) are fp8
-  (`qwen3_5.cpp:3641-3647`, `4111-4117`, `4539-4545` — the `FusedChain` recipe
-  copy and the direct `RmsNormGatedQuantFp8` in each tail). They need a populated
-  `out_proj_fp8` and a CUDA device, so no CPU gate can reach them and no gate in
-  this row did. Wired-but-never-executed is precisely the footing this row was
-  opened to close, so the operator's GPU rerun owes a 35B fp8 sigmoid-vs-silu
-  polarity case of the same shape as the bf16 one — discharged deliberately, not
-  discovered later.
-- The CPU `_glue_fuse_off` entries gate the UNFUSED bf16 tail on CPU only; the
-  CUDA gated-RMSNorm kernels (fused and unfused) remain UNRUN.
+- **fp8 polarity case:** `test cases: 2 | 2 passed | 0 failed | 10 skipped`,
+  `assertions: 28 | 28 passed | 0 failed`, `Status: SUCCESS!`.
+  `CHECK(silu_nonzero == 0)` reads `0 == 0`; `CHECK(max_sigmoid > 0.0)` reads
+  **`36.75 > 0`** at `dims := 35B (Hv=32)`, `mixed := true`. The silu tail
+  annihilates the block output *exactly* through the fp8 store and the fp8
+  `out_proj` GEMM; the sigmoid tail does not.
+- **SACRED gates at the same head, real runs with zero skips:**
+  `test_qwen36_paged_engine` 315/315, `test_qwen27_paged_engine` 235/235,
+  `test_qwen27n_fp8_tower_paged_engine` 236/236, `test_qwen3coder_paged_engine`
+  138/138, each `Status: SUCCESS!`; goldens byte-identical across all 805 files.
+- **Negative mutation, confined to the six fp8 sites only** —
+  `gated_fp8.steps[0].sigmoid_gate` x3 and the direct `RmsNormGatedQuantFp8` args
+  x3, every anchor asserted UNIQUE (count 3/3, per the standing
+  assert-uniqueness-not-existence trap). The fp8 cases go
+  `2 | 0 passed | 2 failed`, `assertions: 28 | 24 passed | 4 failed`,
+  `Status: FAILURE!`, `max_sigmoid` reading `0 > 0` at both 27B and 35B dims and
+  both `mixed` values. The CPU bf16 polarity cases stayed `2 | 2 passed`,
+  `20 | 20 passed`, `Status: SUCCESS!` — the mutation did not leak out of the fp8
+  tail, which is what makes the RED attributable to those six sites rather than
+  to the gate wiring at large. Restoration was verified byte-for-byte only AFTER
+  forcing a relink: the `cp -p` restore preserved mtime, ninja found nothing to
+  do, and the STALE MUTATED BINARY re-ran and reported the mutated result.
+
+**Why that transfers to this head by construction, not by re-run.** This is an
+argument from the tree; nothing re-ran on a GPU to produce it and nothing here
+should be read as a run. `b9d172f6` is an ancestor of the row head. Between them
+sit only `7572b0f4` (an `origin/main` fast-forward) and the merge commit itself,
+and neither touched a line the fp8 arm executes: `git diff b9d172f6..HEAD` is
+EMPTY over `src/vllm/model_executor/models/qwen3_5.cpp`, `src/vt/ops.cpp`,
+`include/vt/ops.h`, `src/vllm/transformers_utils/hf_config.cpp`,
+`src/vllm/platforms/`, and over
+`tests/vllm/models/test_qwen3_5_gdn_spec_routing.cpp` itself. What `src/` did
+gain is Nemotron-H files, a DeepSeek-V4 DSA kernel fix and a MoE-Marlin `C_tmp`
+cap — none of them on the GDN gated-RMSNorm path. `tests/CMakeLists.txt` gained
+47 lines, none of them touching the `_glue_fuse_off` or `_fused_chain_off`
+entries, which already existed at `b9d172f6`.
+
+**Owed at the next GPU run.**
+
+1. **The SPLIT per-site fp8 mutation.** `test_qwen3_5_gdn_spec_routing_fused_chain_off`
+   exists to gate the DIRECT `vt::RmsNormGatedQuantFp8` hand-call, which the
+   default entry — running at the `VT_FUSED_CHAIN_ADOPT` default — cannot reach.
+   The mutation recorded above inverted BOTH fp8 kinds at once, and the default
+   entry alone would have caught that, so the new entry's marginal coverage is
+   **argued, not demonstrated**. This row set the correct standard itself for
+   `_glue_fuse_off`: invert ONE site alone, and show that only that entry fails
+   while the default still Passes. The fp8 half owes the same shape — invert only
+   the 3 direct `RmsNormGatedQuantFp8` sites and show the default entry
+   **Passed** and `_fused_chain_off` **Failed**, then the converse for the 3
+   recipe-copy sites. Until that runs, `_fused_chain_off` is a registered entry
+   whose marginal coverage is unproven.
+2. **The CUDA bf16 gated-RMSNorm kernels**, fused and unfused, remain UNRUN. The
+   CPU `_glue_fuse_off` entries gate the UNFUSED bf16 tail on CPU only.
+
+**A green CPU `_fused_chain_off` is NOT coverage.** On a CPU build that entry is
+fully vacuous: the fp8 cases are `#ifdef VLLM_CPP_CUDA`-compiled out entirely, and
+both `FusedChainAdoptEnabled()` call sites sit in CUDA-only or
+`supports_fp8()`-guarded branches, so `VT_FUSED_CHAIN_ADOPT=0` changes nothing the
+binary executes. It re-runs the identical 52 assertions and reports Passed.
+`tests/CMakeLists.txt:143` already says "CUDA-only in effect"; this is the
+consequence of that, written down so a green CPU entry is not mistaken for the
+coverage it was registered to provide. Read it as coverage ONLY on a CUDA host
+where `supports_fp8()` is true.
+
+**fp8 ABSENT is now a skip, not a failure.** `RunGatePolarityFp8Case` opened with
+`REQUIRE(GetPlatform(kCUDA).supports_fp8())`. `supports_fp8()` is
+`has_device_capability(8, 9)` (`src/vllm/platforms/cuda.cpp:39`), so any CUDA
+build run on a pre-sm_89 device turned this whole suite RED over a capability the
+board never claimed — including the Jetson AGX Orin `sm_87` board, a recorded
+runtime-gate host (`.agents/benchmark-record.md:2402-2426`). The repo's rule for
+an absent precondition is a graceful skip (`tests/CMakeLists.txt:26-33`; the
+try/catch at `tests/vt/test_ops_fp8_cutlass.cpp:33-39`), so the `REQUIRE` is now a
+`MESSAGE` naming the missing capability followed by `return`.
+
+The guard cannot swallow a real defect: it returns BEFORE any of the case's own
+CHECKs and ONLY on the missing capability, so where fp8 IS supported the case is
+unchanged. That was proven on this GPU-less host rather than asserted — the guard
+and the two CHECKs were compiled VERBATIM into a scratch doctest binary twice,
+with `supports_fp8()` and the two arms' outputs faked:
+
+- capability ABSENT — the SKIP message prints, `assertions: 0 | 0 passed |
+  0 failed`, `Status: SUCCESS!`, exit 0;
+- capability PRESENT with the wiring broken to the readings the six-site mutation
+  actually produced on the dgx (silu arm non-zero, `max_sigmoid == 0`) —
+  `CHECK( silu_nonzero == 0 )` reads `2 == 0`, `CHECK( max_sigmoid > 0.0 )` reads
+  `0 > 0`, `assertions: 2 | 0 passed | 2 failed`, `Status: FAILURE!`, exit 1.
+
+That is a structural proof of the guard's control flow, not a run of the GDN fp8
+path. The cost it buys is real and is the F4 trap again: a run on a pre-sm_89
+board reports Passed with the fp8 cases contributing ZERO assertions. Read the
+assertion COUNT, never the `Status:` line alone, to tell a run that exercised the
+fp8 tail from one that skipped it.

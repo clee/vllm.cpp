@@ -779,7 +779,14 @@ namespace {
 // about which gated-RMSNorm ran. What pins it is the mutation: hardwiring
 // `sigmoid_gate` to `false` at the SIX fp8 constructions ONLY — leaving the six
 // bf16 ones untouched — must turn this case RED while every CPU polarity case
-// above stays GREEN. That is recorded with the row's GPU evidence.
+// above stays GREEN. That mutation WAS run, on the dgx at b9d172f6, and is
+// recorded in `.agents/specs/gdn-output-gate-type.md`. It inverted both fp8
+// KINDS at once, so it does not yet demonstrate what the
+// `_fused_chain_off` CTest entry adds over the default entry — the default
+// entry alone would have caught it. The SPLIT mutation that would demonstrate
+// it (the 3 direct `RmsNormGatedQuantFp8` sites alone, then the 3 recipe-copy
+// sites alone, each showing exactly one of the two entries fail) is recorded in
+// that spec as OWED at the next GPU run. It has not been performed.
 vllm::Fp8Weight MakeFp8OutProj(int64_t n, int64_t k, uint64_t seed) {
   vllm::Fp8Weight f;
   f.n = n;
@@ -806,7 +813,30 @@ vllm::Fp8Weight MakeFp8OutProj(int64_t n, int64_t k, uint64_t seed) {
 void RunGatePolarityFp8Case(const GdnDims& g, bool mixed) {
   setenv("VT_GDN_INDEXED_STATE_IO", "1", 1);  // mixed needs widened indexed IO
   vt::GetBackend(vt::DeviceType::kCUDA);      // skip cleanly if no device
-  REQUIRE(vllm::platforms::GetPlatform(vt::DeviceType::kCUDA).supports_fp8());
+
+  // An ABSENT precondition is a SKIP, never a failure — tests/CMakeLists.txt:26-33
+  // ("A test whose preconditions are absent exits 77") and the try/catch at
+  // tests/vt/test_ops_fp8_cutlass.cpp:33-39. `supports_fp8()` is
+  // `has_device_capability(8, 9)` (src/vllm/platforms/cuda.cpp:39), so a CUDA
+  // build running on a pre-sm_89 board has NO fp8 gated-RMSNorm tail to reach:
+  // the branch under test is unreachable, not broken. The Jetson AGX Orin
+  // (sm_87) is a recorded runtime-gate host (.agents/benchmark-record.md:2402-2426),
+  // and a `REQUIRE` here turned this whole suite RED on it for a capability the
+  // board never claimed.
+  //
+  // The skip cannot swallow a real defect: it returns BEFORE any of this case's
+  // CHECKs and ONLY on the missing capability. Where fp8 IS supported the guard
+  // is not taken and every assertion below runs unchanged, so broken gate wiring
+  // still fails loudly. The cost is that a skipped run reports Passed with the
+  // fp8 cases contributing zero assertions — read the assertion COUNT, not the
+  // status, to tell a run that exercised the fp8 tail from one that did not.
+  if (!vllm::platforms::GetPlatform(vt::DeviceType::kCUDA).supports_fp8()) {
+    MESSAGE(
+        "SKIP: this device does not support fp8 (Platform::supports_fp8() == "
+        "has_device_capability(8, 9) is false) — the GDN fp8 gated-RMSNorm tail "
+        "is unreachable here, so the fp8 gate-polarity case did NOT run");
+    return;
+  }
 
   const int64_t H = 128;
   const int Ts = 2, Tp = 3;
