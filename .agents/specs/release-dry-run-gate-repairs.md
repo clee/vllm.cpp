@@ -655,6 +655,75 @@ fast-fails, stop and spec constructor-internal attribution rather than guessing;
 otherwise remove every prefix/phase diagnostic and write the smallest RED
 regression for the failing factory before repairing it.
 
+Hosted run
+[`31737430012`](https://github.com/mudler/vllm.cpp/actions/runs/31737430012)
+reached that stop condition. CPU job
+[`94572345175`](https://github.com/mudler/vllm.cpp/actions/runs/31737430012/job/94572345175)
+and Vulkan job
+[`94572345101`](https://github.com/mudler/vllm.cpp/actions/runs/31737430012/job/94572345101)
+agree in both the isolated probe and the unchanged full-suite invocation: each
+printed `before-make-weights`, `after-make-weights`, `before-build-fixture`,
+`after-build-fixture`, and `before-loaded-engine`, then fast-failed with signed
+status `-1073740791` (`0xC0000409`) without printing `after-loaded-engine`.
+Synthetic weight construction and tokenizer-fixture construction are therefore
+excluded. The failure is inside `LoadedEngine` construction, before its first
+constructor-body log, on both explicit CPU and Vulkan release builds.
+
+The next increment is diagnostic-only constructor-internal attribution. Enable
+it explicitly only for the fresh-process isolated case-47 invocation; the
+ordinary full-suite command and every production invocation remain unmodified
+and do not enable the witnesses. Emit and flush a stable before/after phase for
+the delegating `MakeQwen3_5MoeLoadedModel` call, then for every private
+`LoadedEngine` initialization stage in declaration order through `engine_`:
+`hash_ready_`, `config_`, `resolved_spec_config_`, `dflash_draft_`, `model_`,
+the default `kv_connector_`, `tokenizer_`, `kv_cfg_`, `max_model_len_`,
+`max_num_batched_tokens_`, `prefix_caching_enabled_`,
+`jump_forward_enabled_`, `runner_`, `async_scheduling_enabled_`,
+`max_concurrent_batches_`, `structured_output_manager_`, `scheduler_`,
+`executor_`, `engine_core_`, `input_processor_`, `output_processor_`,
+`block_hasher_`, and `engine_`. The contract must pin this sequence to the real
+member-declaration order and require exactly one matching before/after pair for
+every completed stage. Instrumentation must preserve every initializer value,
+move, evaluation dependency, and construction order; it may not introduce a
+replacement constructor path.
+
+Make the same isolated diagnostic dense below `runner_` so a failure there is
+attributed in this hosted run rather than another coarse loop. Bracket the
+`GPUModelRunner` member-initializer boundary through `input_batch_`, then its
+constructor-body assignments, `async_input_combine_` resolution, pooling-model
+branch, `initialize_kv_cache`, and `ModelRegistry::Prepare`. Inside
+`initialize_kv_cache`, bracket the scalar/state-slot setup, KV-group scan,
+Mamba shape/dtype validation, full-attention spec geometry, residency/buffer
+setup, and each layer-indexed allocation family separately: GDN SSM storage,
+GDN convolution storage, and full-attention storage. Also bracket creation of
+the full-attention views, optional draft-attention storage, and GDN state views,
+so success of an allocation cannot be confused with failure while viewing it.
+Each nested marker names its function, stage, and layer or group index where
+applicable. The first before marker lacking its matching after marker must
+identify one exact initializer, function, or allocation/view family.
+
+These witnesses are temporary evidence, not a repair. They may not add an
+assertion, sleep, timeout, catch, parameter change, device substitution, or
+production semantic change. Because `0xC0000409` is an MSVC fail-fast and the
+earlier `std::terminate` marker did not fire, the isolated Windows process must
+also install a flushed `_set_invalid_parameter_handler` witness that reports
+the CRT expression, function, file, and line. Install a similarly flushed
+`_set_purecall_handler` witness when the existing MSVC runtime exposes it
+without a new dependency. These Windows-only handlers are diagnostic: they may
+observe but must not suppress or recover from the original failure, and a
+surviving process restores the prior handlers before exit. If neither the
+first incomplete phase nor a CRT witness names one owner, collect a native
+Windows crash dump and symbolized stack from the same isolated workload instead
+of inferring one. Before any actual repair, remove all adaptive-prefix, phase,
+and CRT diagnostics, write the smallest automated regression that is RED for
+the attributed defect, and observe that RED against the unfixed code. Only then
+may a fresh implementation repair the root cause.
+
+The device-leakage failure reported beside these jobs is independent. Issue
+[#553](https://github.com/mudler/vllm.cpp/issues/553) fixes it on current `main`
+at `11cc1d5896b480a1b652db9249319242053aca93`; this campaign absorbs that change
+when it merges current `main`. This #537 diagnostic must not edit that scope.
+
 ### Current-main portability regression: issue #645
 
 Current `main` at `cefacd2d00cb9b4776331cd213116773cd97f811` added LTX2
