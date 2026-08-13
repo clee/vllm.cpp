@@ -767,8 +767,39 @@ the interesting one:
 | verdict | count | meaning |
 |---|---|---|
 | pinned AND numerically reachable | 12 | a mutation moves a golden; the gate genuinely bites |
-| **INVISIBLE — no arm read it at all** | **5** | a 100x change left every suite green |
-| pinned, correctly unreachable | 3 | upstream discards the value, so a pin is the only honest treatment |
+| **INVISIBLE — no arm read it at all** | **5+1** | a 100x change left every suite green |
+| pinned, genuinely unreachable | **1** | upstream discards the value, so a pin is the only honest treatment |
+| **MISLABELLED as unreachable** | **2** | live numeric path; the mutation was merely below fixture sensitivity |
+
+**CORRECTION, 2026-08-13.** The row above originally read "3 pinned, correctly unreachable",
+taken from the sweep's own table and propagated into this spec by the operator without
+independent check. Its review disproved two of the three, and the failure mode is the one this
+whole section exists to name: **"upstream discards it" is exactly the label a fixture gap
+wears when nobody probes it.**
+
+- `Ltx2ConvVideoDecoderConfig::norm_eps` is NOT discarded. `video_vae/resnet.py:93-97` builds
+  `norm3 = nn.GroupNorm(num_groups=1, ..., eps=eps)` **regardless of `norm_layer`** whenever
+  `in_channels != out_channels`. A `VT_CHECK` probe at our `norm3` call site fired on FIVE
+  goldens. The 100x mutation was simply below that fixture's sensitivity; at 1.0 the goldens
+  move by 1.64e-2 and 2.04e-2 against a 5e-6 band. Its ENCODER twin at the SAME 100x moves
+  4.39e-5 and goes red — so the decoder's silence was an accident of fixture scale, not a
+  property of upstream.
+- `kLtx2RmsNorm2dEps` is a `clamp_min` FLOOR in `F.normalize`, not a discarded value. It binds
+  only on a ~zero channel vector, which no arm constructs — and the project's own BWE-quiet arm
+  is precedent that such a probe IS constructible.
+- Only `kLtx2EncoderApproxLnZero` is genuinely unreachable: `video_vae.py:325-334` concatenates
+  the block and `torch.chunk(...)[0]` discards it. Mutating -30 to -1 leaves the suite green
+  because upstream never reads it either.
+
+**And the sweep missed a sixth invisible constant**, `Ltx2AttentionArgs::norm_eps`
+(`ltx2.h:365`) — same shape as the DiT case, all ten call sites assign it explicitly, so a
+10^6 mutation leaves every suite green. A latent trap rather than live code today, but the
+"class swept" claim was incomplete by one.
+
+**The lesson is sharper than the fix.** A change written to close this class mislabelled a live
+constant as unreachable, and the operator copied the label into the spec without probing it.
+Recording a hole is not removing it: the only evidence that a constant is unreachable is a
+probe that FAILS to reach it, not a mutation that happens not to move anything.
 
 The fifth instance is the one worth remembering: **`Ltx2DitParams::norm_eps`**. Every test
 passes that value explicitly through `ReducedParams`, so nothing ever read the FIELD DEFAULT —
