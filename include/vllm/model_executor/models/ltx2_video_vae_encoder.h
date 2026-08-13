@@ -122,6 +122,27 @@ struct Ltx2ConvVideoEncoderConfig {
   // `eps=1e-6` literally (video_vae.py:56, 66) and `conv_norm_out` takes
   // `eps=1e-6` (video_vae.py:240). It is a field here only so the gate can pin
   // it; there is no checkpoint key that moves it.
+  //
+  // And norm3 is the reason it is LIVE on a PixelNorm checkpoint here too, for
+  // the identical reason it is on the decoder's `norm_eps`: `ResnetBlock3D`
+  // builds `norm3 = nn.GroupNorm(num_groups=1, ..., eps=eps)` whenever
+  // `in_channels != out_channels` (resnet.py:93-97) and applies it to the
+  // residual (resnet.py:178), and `norm_layer` does not gate that. So every
+  // `res_x_y` encoder block reads this value even though `conv_norm_out` and
+  // `ApplyNorm` take their PixelNorm branches.
+  //
+  // Both halves route through ONE line in the port — ltx2_video_vae.cpp:1051,1056
+  // reach :405, the same line the decoder reaches from :693,700 — but a SHARED
+  // LINE IS NOT AN ARGUMENT FOR LIVENESS, and this file previously offered it as
+  // one. :405 sits behind the `input.channels != out_channels` guard at :400, so
+  // even entering ResnetBlock3d is not reaching it — `res_x` passes `x.channels`
+  // as `out_channels` at :1051 and the guard is false. Encoder arm B does not
+  // reach it at all: all four blocks it holds are plain strided CausalConv3d
+  // (:1060-1068), so it never enters ResnetBlock3d and stays green under every
+  // mutation of this value. Liveness is per-arm and MEASURED — the field default
+  // 1e-6 -> 1e-4 reds two encoder goldens at max|diff| = 4.38839e-05 — which makes
+  // the numerical coverage real but PARTIAL, and is why the pin still carries the
+  // arms the goldens do not.
   double norm_eps = 1e-6;
   // `PixelNorm()`'s bare DEFAULT (normalization.py:22), same as the decoder's.
   double pixel_norm_eps = 1e-8;

@@ -77,8 +77,10 @@ enum class Ltx2VideoDecoderKind { kConv, kDiffusion };
 // normalize, not a mean-square RMS, and not this project's usual rms_norm epsilon.
 // Named so it can be pinned: mutation proves 1e-12 -> 0.0 leaves every golden
 // green, because the reduced-dimension activations are O(1) and the floor never
-// binds. It still decides whether an all-zero channel vector divides or produces
-// NaN.
+// binds at that magnitude. It is still READ on every element, so the goldens are
+// not blind to it in the other direction — 1e-12 -> 1.0 reds two encoder goldens
+// at 0.000525832. And it decides whether an all-zero channel vector divides or
+// produces NaN.
 inline constexpr double kLtx2RmsNorm2dEps = 1e-12;
 
 // `config.vae._class_name` -> the decoder kind, mirroring
@@ -102,24 +104,63 @@ struct Ltx2VideoDecoderBlock {
 // ─── THE INVISIBLE-CONSTANT CLASS ────────────────────────────────────────────
 // An HONEST LIMIT of these goldens, and it is a CLASS, not one instance. Any
 // epsilon or floor that exists to stabilize a division is, by construction,
-// invisible to a reduced-dimension parity gate: the deterministic stream produces
-// O(1) activations, the term it guards never binds, and the tensor comparison
-// therefore accepts any value at all — including 0.0, and including one 100x off.
-// MEASURED, by mutating each in turn with EVERY golden staying green:
+// hard for a reduced-dimension parity gate to reach DOWNWARD: the deterministic
+// stream produces O(1) activations, so shrinking the term it guards changes
+// nothing the tensor comparison can see. That is the honest form of the claim.
+// "Accepts any value at all" is what this paragraph used to say, and it is FALSE
+// even of its own members — the epsilon is still READ on every element, so a
+// large enough value moves the output. Only a probe that FAILS TO REACH proves
+// unreachable; a mutation that happens not to move anything proves nothing, and
+// the direction and MAGNITUDE of the mutation are therefore part of the verdict.
+// MEASURED, by mutating each in turn, with the bound each number actually holds:
 //
-//   Ltx2ConvVideoDecoderConfig::norm_eps   1e-6 -> 1e-4   green
-//   Ltx2ConvVideoDecoderConfig::pixel_norm_eps 1e-8 -> 1e-6 green
-//   kLtx2BweMelLogClamp                    1e-5 -> 1e-8   green
-//   kMiniMaxH3SnakeEps                     1e-9 -> 0.0    green
-//   kLtx2RmsNorm2dEps                      1e-12 -> 0.0   green
+//   kMiniMaxH3SnakeEps      1e-9  -> 0.0   green
+//   kLtx2RmsNorm2dEps       1e-12 -> 0.0   green ...but NOT green upward:
+//     escalating it to 1.0 REDS "the video ENCODER (*_res family)" and "the video
+//     encoder CROPS a frame count that is not 1 + k*factor", both at 0.000525832
+//     against the 5e-6 band. It never BINDS at the shipped value, and it is read
+//     regardless — the two are different statements and only the first is true
+//     of this constant.
+//
+// `kLtx2BweMelLogClamp` was listed with them and NO LONGER belongs — the third
+// entry to leave this list for the same reason, which is why the verdict is now
+// stated per-entry with the number that proves it. The arm that made it
+// reachable, "ltx2 vae: the BWE mel log clamp is gated where it actually binds",
+// landed with the pin itself; the line calling it invisible was written in the
+// same change and was false the moment it shipped. 1e-5 -> 1e-8 REDS that arm at
+// max|diff| = 0.144965 against the 5e-6 band (36 cases: 34 passed, 2 failed —
+// the golden, and the constant assertion below it). What made it look invisible
+// was the SCALE of the ordinary arm, not the constant's nature: that arm's raw
+// mel minimum is ~4.4e-3 and never approaches the floor, so the reachable arm
+// attenuates mel_basis by 1e-4 until every bin lands under it — and asserts the
+// saturated-bin count rather than assuming it.
+//
+// `Ltx2ConvVideoDecoderConfig::pixel_norm_eps` was listed with them and NO LONGER
+// belongs. The arm added to make `norm_eps` reachable — "ltx2 vae: the video
+// decoder's norm_eps is gated where it BINDS" — runs its latent at a tenth of the
+// usual scale, and that makes this epsilon a first-order term too: 1e-8 -> 1e-6
+// now REDS that arm at max|diff| = 1.69305e-04 against the 5e-6 band. The fixture
+// built to close one hole closed its neighbour with it, and the line claiming
+// otherwise survived the change that falsified it. It stays pinned, in "ltx2 vae:
+// the two PixelNorm epsilons stay different", for the reason a pin always earns:
+// a regeneration that moves the constant and the goldens together.
+//
+// `Ltx2ConvVideoDecoderConfig::norm_eps` was listed here and DOES NOT BELONG. It
+// is read on every arm that has a `res_x_y` block, PixelNorm included, because
+// `norm3` is a GroupNorm built whenever `in_channels != out_channels`
+// (resnet.py:93-97) and applied at resnet.py:178. Its 1e-6 -> 1e-4 mutation
+// stayed green only because the norm3 in the shipped fixture divides by a
+// variance of ~0.2 five blocks deep; at 1e-6 -> 1.0 the same golden moves 1.6e-2.
+// That is a sensitivity property of one fixture, not invisibility, and it is now
+// gated numerically by a fixture where the epsilon is a first-order term.
 //
 // So every member of the class is held by a SOURCE-ANCHORED CONSTANT ASSERTION in
 // tests/vllm/models/test_ltx2_vae.cpp, cited to the upstream line that sets it,
 // rather than by the tensor comparison — and a constant that is added later and
-// left unpinned is a new hole, not a covered one. The BWE clamp additionally gets
-// a golden whose input SATURATES it, because that is the one the reduced-dimension
-// stream can be pushed into reaching and the one real silence reaches in
-// production.
+// left unpinned is a new hole, not a covered one. The three names above that LEFT
+// the class keep their assertions as well: their goldens now move under a
+// mutation, but a golden still cannot catch a regeneration that shifts the
+// constant and the expected tensors together, and only the pin can.
 struct Ltx2ConvVideoDecoderConfig {
   // Defaults mirror `_build_conv_video_decoder`
   // (video_vae/model_configurator.py:81-94).
@@ -141,6 +182,14 @@ struct Ltx2ConvVideoDecoderConfig {
   // `ResnetBlock3D.__init__` declares `eps: float = 1e-6` (video_vae/resnet.py:31)
   // and hands it to every nn.GroupNorm it builds (resnet.py:44, 65, 94);
   // `UNetMidBlock3D` carries the same value as `resnet_eps` (resnet.py:216).
+  //
+  // norm3 is the reason this is LIVE on a PixelNorm checkpoint too: it is built
+  // whenever `in_channels != out_channels` (resnet.py:93-97) and applied to the
+  // residual at resnet.py:178, and `norm_layer` does not gate it. Neither does a
+  // checkpoint key — `_make_decoder_block` passes `eps=1e-6` / `resnet_eps=1e-6`
+  // literally (conv_video_decoder.py:78, 103), so this field exists to be pinned
+  // to that literal, and is gated numerically by the norm_eps arm in
+  // tests/vllm/models/test_ltx2_vae.cpp.
   double norm_eps = 1e-6;
   // `PixelNorm()`'s DEFAULT (normalization.py:22), reached bare from
   // video_vae/resnet.py:46 and conv_video_decoder.py:243 — NOT the 1e-6 the audio

@@ -59,10 +59,14 @@ namespace vllm {
 // literal on all three sites.
 inline constexpr int64_t kLtx2UpsamplerNormGroups = 32;
 // torch's `nn.GroupNorm` default `eps` (it is not passed at any of the three
-// construction sites). A member of the invisible-constant class: the reduced
-// fixture's variances are O(1), so a mutation of it leaves every golden green,
-// and it is therefore pinned here against the upstream default rather than by the
-// value comparison.
+// construction sites). NOT a member of the invisible-constant class. It was
+// recorded as one on a mutation that happened not to move anything, and a
+// mutation that moves nothing proves nothing; at the class's OWN 100x bar
+// (1e-5 -> 1e-3) it REDS all three arms of
+// "ltx2 the latent spatial upsampler reproduces upstream" —
+// PixelShuffle 0.0289409, Rational2 0.0347079, Rational1p5 0.0649014. The pin
+// below still earns its place, because a golden regenerated with a moved eps
+// moves with it and only the pin compares against torch's own default.
 inline constexpr double kLtx2UpsamplerNormEps = 1e-5;
 
 // LatentUpsampler.__init__ defaults (model.py:25-35), which are also
@@ -99,7 +103,10 @@ std::vector<float> Ltx2BlurKernel(int64_t kernel_size);
 // `SpatialRationalResampler` never overrides (:38) — so this default IS the
 // shipped kernel width. Gated against upstream's own signature by
 // test_ltx2_pipeline.cpp, case "the constants the headers call pinned are
-// actually pinned".
+// actually pinned", and reached NUMERICALLY as well: 5 -> 3 REDS the Rational1p5
+// arm of "ltx2 the latent spatial upsampler reproduces upstream" at 0.689782.
+// Only that arm, because the blur runs on the rational `den` and 1.5 -> {3, 2} is
+// the one scale the suite covers with den != 1.
 inline constexpr int64_t kLtx2BlurKernelSize = 5;
 
 // The parameter contract: every tensor `LatentUpsampler(config)` creates, in

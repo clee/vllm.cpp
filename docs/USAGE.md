@@ -358,16 +358,21 @@ the embeddings connector) are implemented and gated. Several limits decide what
 you can actually ask for, and each refuses by name rather than rendering
 something else.
 
-The encoders being present does NOT mean image, keyframe, reference-video or
-reference-audio conditioning is usable: the video engine still refuses every one
-of those by name, because the request-side work between a file on disk and a
-tensor the encoder accepts — image decode, aspect-fill resize, and the H.264 CRF
-re-compression upstream performs before encoding — is not ported. Two
-encoder-level limits are worth stating in advance because they are refusals
-rather than approximations. A reference waveform whose sample rate differs from
-the audio VAE's is refused rather than resampled, since upstream uses a polyphase
-kaiser resampler this project does not carry. And a VAE configured with
-`latent_log_var: none` is refused, because upstream itself raises on it.
+In particular, the encoders being present does NOT mean image, keyframe,
+reference-video or reference-audio conditioning is usable: the video engine
+still refuses every one of those by name, because the request-side work between
+a file on disk and a tensor the encoder accepts — image decode, aspect-fill
+resize, and the H.264 CRF re-compression upstream performs before encoding
+whenever the resolved CRF is not `0` and the image is at least 2 pixels on its
+shorter side — is not ported. The engine also holds no
+encoder to call: it materializes the VAE DECODER key filters only, so no
+encoder weights are ever in memory, and the refusal names that rather than
+claiming the encoder itself is missing. Two encoder-level limits are worth
+stating in advance because they are refusals rather than approximations. A
+reference waveform whose sample rate differs from the audio VAE's is refused
+rather than resampled, since upstream uses a polyphase kaiser resampler this
+project does not carry. And a VAE configured with `latent_log_var: none` is
+refused, because upstream itself raises on it.
 
 **There is no prompt.** The Gemma-4 12B text tower is not ported, so nothing can
 turn words into the conditioning the caption projections consume. Conditioning
@@ -1774,6 +1779,17 @@ python3 scripts/gen-ltx2-pipeline-goldens.py \
   --out tests/vllm/models/ltx2_pipeline_goldens.inc
 cmake --build build --target test_ltx2_pipeline && ./build/tests/test_ltx2_pipeline
 ```
+
+If you regenerate that `.inc` against a moved upstream, expect the goldens to
+carry the change rather than only the pin cases. The pipeline goldens reach the
+GroupNorm eps and group count in the latent upsampler, the connector's
+`rms_norm` eps, the `BlurDownsample` width (on the 1.5 arm only, since the blur
+runs on the rational denominator) and the Res2s `sigma_up` clamp — that last one
+on the eta = 1 arm, where the clamp binds on every step. A regeneration that
+moves one of those constants alone reds a value comparison; one that moves the
+constant AND the tensors together passes it, and is caught only by the cases that
+compare each constant against upstream's own signature. Both layers are there
+deliberately, and neither is redundant.
 
 Recipes resolve on an EXACT `(pipeline_kind, model_version)` pair and refuse
 anything else by name rather than defaulting, because a plausible but wrong sigma

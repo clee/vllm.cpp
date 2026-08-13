@@ -362,6 +362,14 @@ struct Ltx2AttentionArgs {
   int64_t context_dim = 0;
   int64_t heads = 0;
   int64_t dim_head = 0;
+  // The q/k RMSNorm eps: `Attention.__init__`'s `norm_eps: float = 1e-6`
+  // (attention.py:485), handed to both RMSNorms (attention.py:505-506).
+  //
+  // This DEFAULT is read by nothing today — every construction of this struct
+  // assigns it — and a 10^6 mutation of it leaves every suite green. It is a
+  // latent trap rather than live code, so the only instrument that can hold it is
+  // the pin in tests/vllm/models/test_ltx2.cpp. Keep it equal to
+  // `Ltx2DitParams::norm_eps`, which is where every real call site sources it.
   double norm_eps = 1e-6;
   Ltx2RopeType rope_type = Ltx2RopeType::kSplit;
   const Ltx2FreqsCis* pe = nullptr;

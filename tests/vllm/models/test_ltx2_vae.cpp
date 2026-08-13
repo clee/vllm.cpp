@@ -203,23 +203,53 @@ vllm::Ltx2AudioDecoderConfig ReducedAudioDecoderConfig(int64_t mel_bins) {
   return cfg;
 }
 
+// The reduced GROUP-NORM audio decoder the generator built (AUDIO_GROUP_DEC).
+// `ch` is 32 because `build_normalization_layer` forwards its own `num_groups`
+// keyword, whose default is 32 and which no audio_vae call site passes
+// (normalization.py:44, 56), and torch's GroupNorm refuses a channel count 32
+// does not divide; `z_channels` is 16 because `PerChannelStatistics` indexes the
+// patchified `(c, f)` axis, so z_channels x latent mel bins must equal `ch`.
+vllm::Ltx2AudioDecoderConfig ReducedAudioDecoderGroupConfig() {
+  vllm::Ltx2AudioDecoderConfig cfg = ReducedAudioDecoderConfig(
+      vllm_test::kLtx2AudioDecGroupOutMelBins);
+  cfg.ch = 32;
+  cfg.z_channels = vllm_test::kLtx2AudioDecGroupLatentC;
+  cfg.norm_type = vllm::Ltx2NormType::kGroup;
+  // ResnetBlock REFUSES GroupNorm on any causal axis (resnet.py:130-131), so this
+  // is the only causality a group-norm checkpoint can legally declare.
+  cfg.causality_axis = vllm::Ltx2CausalityAxis::kNone;
+  cfg.prefix = "ltx2.audiodecgroup.";
+  return cfg;
+}
+
 // Build the audio decoder's parameters in upstream state_dict ORDER:
 // per_channel_statistics, conv_in, mid, up (block / attn / upsample per level),
-// conv_out. PixelNorm carries no parameters, which is why no norm tensor appears.
+// norm_out, conv_out. PixelNorm carries no parameters, which is why no norm
+// tensor appears on the pixel arms; GroupNorm is affine, so on `kGroup` every
+// `norm1` / `norm2` / `attn.norm` / `norm_out` contributes a weight and a bias
+// AHEAD of the convolution it precedes (resnet.py:136-146, attention.py:25-29).
 ParamBag BuildAudioDecoderParams(const vllm::Ltx2AudioDecoderConfig& cfg) {
   ParamBag bag;
   const std::string p = cfg.prefix;
   const int64_t levels = static_cast<int64_t>(cfg.ch_mult.size());
   const int64_t base = cfg.ch * cfg.ch_mult[static_cast<size_t>(levels - 1)];
+  const bool group = cfg.norm_type == vllm::Ltx2NormType::kGroup;
 
   bag.Put(p + "per_channel_statistics.std-of-means", {cfg.ch});
   bag.Put(p + "per_channel_statistics.mean-of-means", {cfg.ch});
   bag.Put(p + "conv_in.conv.weight", {base, cfg.z_channels, 3, 3});
   bag.Put(p + "conv_in.conv.bias", {base});
 
+  auto put_norm = [&](const std::string& prefix, int64_t channels) {
+    if (!group) return;
+    bag.Put(prefix + ".weight", {channels});
+    bag.Put(prefix + ".bias", {channels});
+  };
   auto put_resnet = [&](const std::string& prefix, int64_t in_ch, int64_t out_ch) {
+    put_norm(prefix + ".norm1", in_ch);
     bag.Put(prefix + ".conv1.conv.weight", {out_ch, in_ch, 3, 3});
     bag.Put(prefix + ".conv1.conv.bias", {out_ch});
+    put_norm(prefix + ".norm2", out_ch);
     bag.Put(prefix + ".conv2.conv.weight", {out_ch, out_ch, 3, 3});
     bag.Put(prefix + ".conv2.conv.bias", {out_ch});
     if (in_ch != out_ch) {
@@ -228,6 +258,7 @@ ParamBag BuildAudioDecoderParams(const vllm::Ltx2AudioDecoderConfig& cfg) {
     }
   };
   auto put_attn = [&](const std::string& prefix, int64_t channels) {
+    put_norm(prefix + ".norm", channels);
     for (const char* leaf : {"q", "k", "v", "proj_out"}) {
       bag.Put(prefix + "." + leaf + ".weight", {channels, channels, 1, 1});
       bag.Put(prefix + "." + leaf + ".bias", {channels});
@@ -280,6 +311,7 @@ ParamBag BuildAudioDecoderParams(const vllm::Ltx2AudioDecoderConfig& cfg) {
     }
   }
 
+  put_norm(p + "norm_out", block_in);
   bag.Put(p + "conv_out.conv.weight", {cfg.out_ch, block_in, 3, 3});
   bag.Put(p + "conv_out.conv.bias", {cfg.out_ch});
   return bag;
@@ -414,6 +446,61 @@ TEST_CASE("ltx2 vae: the audio decoder matches upstream ltx_core") {
     INFO("output frame " << t << " under global attention");
     CHECK(moved);
   }
+}
+
+TEST_CASE("ltx2 vae: the GROUP-NORM audio decoder matches upstream ltx_core") {
+  // THE ARM THAT MAKES `Ltx2AudioDecoderConfig::norm_eps` REACHABLE. Every other
+  // audio arm in this file runs `norm_type = kPixel`, so `ApplyNorm` never enters
+  // the GroupNorm branch and `norm_eps` is not merely inert but never READ:
+  // mutating it 1e-6 -> 1e-4, a 100x change, left all 33 cases green.
+  //
+  // `norm_type = group` is not hypothetical, and it is not free either.
+  // `AudioDecoder.__init__` declares `norm_type = GROUP` (audio_vae.py:294) and
+  // on the next line `causality_axis = WIDTH` (audio_vae.py:295) — a pair
+  // `ResnetBlock` REFUSES, with `ValueError: Causal ResnetBlock with GroupNorm is
+  // not supported` (resnet.py:130-131), so constructing the upstream decoder on
+  // pure defaults raises rather than group-normalizing. What is legal, and what
+  // this arm runs, is a checkpoint that declares `causality_axis: none` alongside
+  // it — the other half of `build_normalization_layer` (normalization.py:56-57).
+  // Without this arm such a checkpoint would run a 100x-wrong stabilizer and
+  // still produce a spectrogram.
+  const vllm::Ltx2AudioDecoderConfig cfg = ReducedAudioDecoderGroupConfig();
+  ParamBag bag = BuildAudioDecoderParams(cfg);
+  CheckManifest(bag, vllm_test::kLtx2AudioDecGroupParamNames,
+                vllm_test::kLtx2AudioDecGroupParamCounts,
+                std::size(vllm_test::kLtx2AudioDecGroupParamNames));
+
+  const int64_t c = vllm_test::kLtx2AudioDecGroupLatentC;
+  const int64_t t = vllm_test::kLtx2AudioDecGroupLatentT;
+  const int64_t f = vllm_test::kLtx2AudioDecGroupLatentF;
+  const std::vector<float> latent = Ltx2Input("ltx2.audiodecgroup.input", c * t * f, 1.0);
+
+  const vllm::Ltx2AudioSpectrogram mel =
+      vllm::Ltx2AudioDecoderForward(cfg, bag.weights, latent, c, t, f);
+  CHECK(mel.channels == cfg.out_ch);
+  CHECK(mel.frames == vllm_test::kLtx2AudioDecGroupOutFrames);
+  CHECK(mel.mel_bins == vllm_test::kLtx2AudioDecGroupOutMelBins);
+
+  const double err = MaxAbsDiff(mel.data, vllm_test::kLtx2AudioDecGroupGolden,
+                                std::size(vllm_test::kLtx2AudioDecGroupGolden));
+  INFO("group-norm audio decoder max|diff| = " << err);
+  CHECK(err <= kLtx2GoldenTol);
+
+  // The combination upstream REFUSES must be refused here too, not silently
+  // group-normalized on a causal axis.
+  vllm::Ltx2AudioDecoderConfig bad = cfg;
+  bad.causality_axis = vllm::Ltx2CausalityAxis::kHeight;
+  bool threw = false;
+  std::string message;
+  try {
+    vllm::Ltx2AudioDecoderForward(bad, bag.weights, latent, c, t, f);
+  } catch (const std::exception& error) {
+    threw = true;
+    message = error.what();
+  }
+  REQUIRE(threw);
+  INFO("refusal message: " << message);
+  CHECK(message.find("GroupNorm") != std::string::npos);
 }
 
 TEST_CASE("ltx2 vae: the audio decoder's CONVOLUTIONS are one-sided in time") {
@@ -971,6 +1058,81 @@ TEST_CASE("ltx2 vae: the NON-causal Conv video decoder matches upstream ltx_core
   CHECK(causal_frames.data != frames.data);
 }
 
+TEST_CASE("ltx2 vae: the video decoder's norm_eps is gated where it BINDS") {
+  // THE ARM THAT MAKES `Ltx2ConvVideoDecoderConfig::norm_eps` NUMERICALLY
+  // REACHABLE, and the correction of a record that said it was not.
+  //
+  // The earlier claim — that this constant is invisible because upstream discards
+  // it on the PixelNorm arm — is FALSE. `ResnetBlock3D.__init__` builds
+  // `norm3 = nn.GroupNorm(num_groups=1, num_channels=in_channels, eps=eps)`
+  // whenever `in_channels != out_channels` (resnet.py:93-97), REGARDLESS of
+  // `norm_layer`, and `forward` applies it to the residual (resnet.py:178). Every
+  // `res_x_y` block therefore reads it, and the shipped section-5 arm above has
+  // one, at `up_blocks.4.norm3`.
+  //
+  // What was true is a statement about the FIXTURE, not the constant. norm3
+  // divides by `sqrt(var + eps)` over all of (C, T, H, W); five blocks deep that
+  // variance is ~0.2, so on section 5's golden 1e-6 -> 1e-4 moves 1.8e-6 — under
+  // the 5e-6 band — while 1e-6 -> 1.0 moves 1.6e-2. A 100x error passed because
+  // the denominator was large, which is an accident of scale and not a property
+  // worth recording as coverage.
+  //
+  // So this arm removes the accident. ONE `res_x_y` block puts norm3 directly
+  // behind conv_in, and a latent at a tenth of the usual scale leaves it a
+  // variance of ~5e-3 to compete with. `kLtx2VideoDecEpsZeroMove` is what the
+  // ORACLE measured for the mutation the other arms are blindest to — removing
+  // the epsilon entirely, which moves section 5's golden by 5.4e-7, a tenth of
+  // the band — so the sensitivity is gated here rather than narrated.
+  REQUIRE(vllm_test::kLtx2VideoDecEpsZeroMove > 10.0 * kLtx2GoldenTol);
+
+  vllm::Ltx2ConvVideoDecoderConfig cfg;
+  cfg.in_channels = 6;
+  cfg.out_channels = 3;
+  cfg.patch_size = 2;
+  cfg.norm_layer = vllm::Ltx2NormLayer::kPixelNorm;
+  cfg.causal = true;
+  cfg.timestep_conditioning = false;
+  cfg.spatial_padding_mode = vllm::Ltx2PaddingMode::kReflect;
+  cfg.base_channels = 8;
+  cfg.prefix = "ltx2.videodeceps.";
+  cfg.decoder_blocks = {{"res_x_y", 1, 2, false, false}};
+  // The constant under test is the FIELD DEFAULT, never an override — an arm that
+  // set it explicitly would gate the plumbing and not the value.
+  CHECK(cfg.norm_eps == doctest::Approx(1e-6).epsilon(1e-12).scale(0.0));
+
+  ParamBag bag = BuildVideoDecoderParams(cfg);
+  CheckManifest(bag, vllm_test::kLtx2VideoDecEpsParamNames,
+                vllm_test::kLtx2VideoDecEpsParamCounts,
+                std::size(vllm_test::kLtx2VideoDecEpsParamNames));
+  // norm3 exists only because the block changes channel count; without these two
+  // parameters the manifest would match a decoder that never reads the epsilon.
+  CHECK(bag.weights.Has("ltx2.videodeceps.up_blocks.0.norm3.weight"));
+  CHECK(bag.weights.Has("ltx2.videodeceps.up_blocks.0.norm3.bias"));
+
+  const int64_t lc = vllm_test::kLtx2VideoDecEpsLatentC;
+  const int64_t lt = vllm_test::kLtx2VideoDecEpsLatentT;
+  const int64_t lh = vllm_test::kLtx2VideoDecEpsLatentH;
+  const int64_t lw = vllm_test::kLtx2VideoDecEpsLatentW;
+  const std::vector<float> latent = Ltx2Input("ltx2.videodeceps.input", lc * lt * lh * lw,
+                                              vllm_test::kLtx2VideoDecEpsLatentScale);
+
+  GoldenNoise noise("ltx2.videodeceps.");
+  const vllm::Ltx2VideoFrames frames =
+      vllm::Ltx2ConvVideoDecode(cfg, bag.weights, latent, lc, lt, lh, lw, &noise);
+  CHECK(frames.channels == vllm_test::kLtx2VideoDecEpsOutC);
+  CHECK(frames.frames == vllm_test::kLtx2VideoDecEpsOutT);
+  CHECK(frames.height == vllm_test::kLtx2VideoDecEpsOutH);
+  CHECK(frames.width == vllm_test::kLtx2VideoDecEpsOutW);
+  // Neither timestep conditioning nor an inject_noise block, so upstream calls
+  // torch.randn zero times and this port must draw nothing either.
+  CHECK(noise.counts().empty());
+
+  const double err = MaxAbsDiff(frames.data, vllm_test::kLtx2VideoDecEpsGolden,
+                                std::size(vllm_test::kLtx2VideoDecEpsGolden));
+  INFO("norm_eps-binding video decoder max|diff| = " << err);
+  CHECK(err <= kLtx2GoldenTol);
+}
+
 TEST_CASE("ltx2 vae: video temporal causality is one-sided, proven by perturbation") {
   // The trap this catches: putting temporal padding on BOTH sides of a causal
   // Conv3d — or zero-padding it the way MiniMax-H3's Conv3d does instead of
@@ -1073,18 +1235,39 @@ TEST_CASE("ltx2 vae: the goldens carry the upstream revision they came from") {
 }
 
 TEST_CASE("ltx2 vae: every stabilizing epsilon is pinned to its upstream line") {
-  // THE INVISIBLE-CONSTANT CLASS. An epsilon that exists to stabilize a division
-  // is by construction invisible to a reduced-dimension parity gate: the
-  // deterministic stream produces O(1) activations, the guarded term never binds,
-  // and the tensor comparison accepts ANY value — including 0.0 and including one
-  // 100x off. Each of these was mutated with every golden staying green, so each
-  // is held HERE, cited to the upstream line that sets it. Adding a new constant
-  // without adding it to this list reopens the hole.
+  // THE INVISIBLE-CONSTANT CLASS, and the PIN LIST that holds it. An epsilon that
+  // exists to stabilize a division CAN be invisible to a reduced-dimension parity
+  // gate: the deterministic stream produces O(1) activations, the guarded term
+  // never binds, and the tensor comparison accepts ANY value — including 0.0 and
+  // including one 100x off.
+  //
+  // Membership is a MEASURED, PER-ENTRY property, and it is NOT a property of
+  // this list. Some entries below were mutated with every golden staying green.
+  // Others are gated numerically by an arm that reaches them, and are pinned
+  // anyway, because a pin catches the edit a golden cannot: a regeneration that
+  // moves the constant and the goldens TOGETHER. Each entry says which it is, and
+  // says it because the mutation was RUN, on this tree, with the numbers recorded
+  // beside it.
+  //
+  // Adding a new constant without adding it here reopens the hole. Recording one
+  // as invisible without mutating it reopens a worse one — this case has now
+  // carried a wrong reachability verdict twice, which is the whole reason the
+  // claim is per-entry and quantified rather than a sentence at the top.
 
   // ResnetBlock3D's `eps: float = 1e-6` (video_vae/resnet.py:31), handed to every
   // nn.GroupNorm it builds (resnet.py:44, 65, 94) and carried by UNetMidBlock3D as
   // `resnet_eps` (resnet.py:216). This is the norm `res_x_y`'s shortcut uses.
-  // Mutation: 1e-6 -> 1e-4, a 100x change, left every golden green.
+  //
+  // CORRECTED. This one is NOT a member of the invisible class, and the record
+  // that put it here said so for a reason that does not hold: `norm3` is built at
+  // resnet.py:93-97 whenever `in_channels != out_channels`, REGARDLESS of
+  // `norm_layer`, and applied at resnet.py:178 — so a PixelNorm decoder reads it
+  // too, at every `res_x_y`. The 1e-6 -> 1e-4 mutation stayed green because
+  // section 5's norm3 sits five blocks deep behind a variance of ~0.2, not
+  // because nothing read the value. "ltx2 vae: the video decoder's norm_eps is
+  // gated where it BINDS" is the arm that removes that accident of scale; the pin
+  // stays because it still catches the edit a golden cannot, a regeneration that
+  // moves the constant and the goldens together.
   CHECK(vllm::Ltx2ConvVideoDecoderConfig{}.norm_eps ==
         doctest::Approx(1e-6).epsilon(1e-12).scale(0.0));
 
@@ -1107,6 +1290,58 @@ TEST_CASE("ltx2 vae: every stabilizing epsilon is pinned to its upstream line") 
   // left every golden green; it decides whether an all-zero channel vector
   // divides or produces NaN.
   CHECK(vllm::kLtx2RmsNorm2dEps == doctest::Approx(1e-12).epsilon(1e-12).scale(0.0));
+
+  // The AUDIO VAE's GroupNorm eps, on BOTH halves. `build_normalization_layer`
+  // passes `eps=1e-6` literally to `torch.nn.GroupNorm` (normalization.py:56),
+  // the same line that gives PixelNorm its 1e-6 — so the two fields agree here
+  // and, unlike the video VAE's pair below, are NOT deliberately different.
+  //
+  // These two were the fourth recurrence of this class, and worse than inert:
+  // every audio arm ran `norm_type = kPixel`, so the GroupNorm branch was never
+  // entered and the constant was never READ. 1e-6 -> 1e-4 on both left all 33
+  // cases green. They are now reachable — the two group-norm arms above execute
+  // the branch numerically — and pinned here as well, because a pin catches the
+  // edit a golden cannot: replacing 1e-6 with the video VAE's 1e-8 while
+  // regenerating would move the goldens and the arms would follow it.
+  CHECK(vllm::Ltx2AudioDecoderConfig{}.norm_eps ==
+        doctest::Approx(1e-6).epsilon(1e-12).scale(0.0));
+  CHECK(vllm::Ltx2AudioEncoderConfig{}.norm_eps ==
+        doctest::Approx(1e-6).epsilon(1e-12).scale(0.0));
+
+  // The VIDEO VAE's GroupNorm eps on the ENCODER half, which phase L11 added and
+  // this list did not grow to match. `_make_encoder_block` passes `resnet_eps=1e-6`
+  // / `eps=1e-6` literally (video_vae.py:56, 66) and `conv_norm_out` takes
+  // `eps=1e-6` (video_vae.py:240); there is no checkpoint key that moves it.
+  //
+  // NOT INVISIBLE — this entry arrived carrying the same wrong verdict the decoder
+  // entry above did, for the same reason, and is corrected the same way. Encoder
+  // arm A has a `res_x_y` block, so ResnetBlock3d builds norm3 (resnet.py:93-97,
+  // applied at :178) exactly as the decoder does, and our port reads it at ONE
+  // line for both halves: ltx2_video_vae.cpp:1051,1056 reach :405, which the
+  // decoder reaches from :693,700. Measured on this tree: the field default
+  // 1e-6 -> 1e-4 REDS two goldens at max|diff| = 4.38839e-05 against the 5e-6
+  // band — "the video ENCODER (*_res family)" and "the video encoder CROPS a
+  // frame count that is not 1 + k*factor". Forcing :405 to 1.0 reds those same
+  // two at 0.150858, which is what IDENTIFIES norm3 as the reader: `norm_layer`
+  // is kPixelNorm on both encoder arms, so neither ApplyNorm nor conv_norm_out
+  // (ltx2_video_vae.cpp:1081-1087) ever enters a GroupNorm branch. Arm B holds no
+  // `res_x_y` and therefore no norm3, and stays green throughout — the coverage
+  // is real but PARTIAL, which is exactly what the pin is still for.
+  CHECK(vllm::Ltx2ConvVideoEncoderConfig{}.norm_eps ==
+        doctest::Approx(1e-6).epsilon(1e-12).scale(0.0));
+
+  // And its PixelNorm eps, which is the video VAE's bare `PixelNorm()` DEFAULT of
+  // 1e-8 (normalization.py:22) — NOT the audio VAE's 1e-6. The decoder-side pair
+  // has its own case below; the encoder was missing from both.
+  //
+  // Also NOT INVISIBLE, and the more clearly so: PixelNorm IS the encoder's norm
+  // on every arm, so this epsilon is a first-order term the whole way down rather
+  // than a guard that never binds. Measured: 1e-8 -> 1e-6 REDS four encoder
+  // goldens — 1.02744e-05 on the `*_res` family and on the frame-count crop,
+  // 8.10623e-06 on encoder temporal causality, and 0.000175595 on "the video
+  // ENCODER (strided convs, per_channel, reflect)".
+  CHECK(vllm::Ltx2ConvVideoEncoderConfig{}.pixel_norm_eps ==
+        doctest::Approx(1e-8).epsilon(1e-12).scale(0.0));
 }
 
 TEST_CASE("ltx2 vae: the BWE mel log clamp is gated where it actually binds") {
@@ -1166,10 +1401,24 @@ TEST_CASE("ltx2 vae: the BWE mel log clamp is gated where it actually binds") {
 }
 
 TEST_CASE("ltx2 vae: the two PixelNorm epsilons stay different") {
-  // This is a SOURCE-ANCHORED CONSTANT guard, not a numerical gate, and it exists
-  // because mutation proved the numerical gate cannot do the job: flipping the
-  // video decoder's eps from 1e-8 to 1e-6 leaves every golden green, since the
-  // normalized activations are O(1) and the difference is ~1e-7 relative.
+  // This is a SOURCE-ANCHORED CONSTANT guard, and it is NOT the only thing holding
+  // either epsilon: both are also reached numerically, MEASURED on this tree by
+  // mutating the field defaults every arm runs.
+  //
+  //   Ltx2ConvVideoDecoderConfig::pixel_norm_eps  1e-8 -> 1e-6 (100x)
+  //     REDS "ltx2 vae: the video decoder's norm_eps is gated where it BINDS"
+  //     at max|diff| = 0.000169305 against the 5e-6 band.
+  //   Ltx2AudioDecoderConfig::pixel_norm_eps      1e-6 -> 1e-4 (100x)
+  //     REDS 5 goldens across three arms — "the audio decoder matches upstream
+  //     ltx_core" (0.0120053), "the other three causality axes" (0.00461239,
+  //     0.00302449, 0.00245912) and "pads the frequency axis" (0.0120053).
+  //
+  // An earlier revision of this comment said the video half "leaves every golden
+  // green". That was true when it was written and false when the low-scale
+  // norm_eps arm landed: at a tenth of the usual latent scale this epsilon is a
+  // first-order term too, which ltx2_video_vae.h already records. The pin stays
+  // for the reason a pin always earns — a regeneration that moves the constant
+  // and the goldens together, which no value comparison can see.
   //
   // The values are not interchangeable upstream. The audio VAE reaches PixelNorm
   // through build_normalization_layer, which passes eps=1e-6
@@ -1182,6 +1431,17 @@ TEST_CASE("ltx2 vae: the two PixelNorm epsilons stay different") {
         doctest::Approx(1e-8).epsilon(1e-12).scale(0.0));
   CHECK(vllm::Ltx2AudioDecoderConfig{}.pixel_norm_eps !=
         vllm::Ltx2ConvVideoDecoderConfig{}.pixel_norm_eps);
+
+  // The two ENCODER halves phase L11 added carry the SAME split for the SAME
+  // reason, and this case only ever held the decoder pair. All FOUR are reachable
+  // by their own goldens — the encoder pair per d45bcb5fb, the decoder pair per
+  // the numbers above — so this is not closing a silent hole. It keeps the case's
+  // claim ("the two PixelNorm epsilons stay different") true of every config that
+  // has the field, rather than of the two it happened to be written for.
+  CHECK(vllm::Ltx2AudioEncoderConfig{}.pixel_norm_eps ==
+        doctest::Approx(1e-6).epsilon(1e-12).scale(0.0));
+  CHECK(vllm::Ltx2AudioEncoderConfig{}.pixel_norm_eps !=
+        vllm::Ltx2ConvVideoEncoderConfig{}.pixel_norm_eps);
 }
 
 TEST_CASE("ltx2 vae: the diffusion video decoder is refused by name, never downgraded") {
@@ -1369,6 +1629,18 @@ vllm::Ltx2AudioEncoderConfig ReducedAudioEncoderConfig() {
   return cfg;
 }
 
+// The reduced GROUP-NORM audio encoder the generator built (AUDIO_GROUP_ENC).
+// Same two forced dimensions as the decoder's group arm, for the same reasons.
+vllm::Ltx2AudioEncoderConfig ReducedAudioEncoderGroupConfig() {
+  vllm::Ltx2AudioEncoderConfig cfg = ReducedAudioEncoderConfig();
+  cfg.ch = 32;
+  cfg.z_channels = vllm_test::kLtx2AudioEncGroupOutC;
+  cfg.norm_type = vllm::Ltx2NormType::kGroup;
+  cfg.causality_axis = vllm::Ltx2CausalityAxis::kNone;
+  cfg.prefix = "ltx2.audioencgroup.";
+  return cfg;
+}
+
 // Build the AudioEncoder's parameters in upstream state_dict ORDER
 // (audio_vae.py:118-188): per_channel_statistics, conv_in, then per level the
 // `block` ModuleList, then that level's `attn` ModuleList, then `downsample`;
@@ -1377,15 +1649,25 @@ ParamBag BuildAudioEncoderParams(const vllm::Ltx2AudioEncoderConfig& cfg) {
   ParamBag bag;
   const std::string p = cfg.prefix;
   const int64_t levels = cfg.num_resolutions();
+  const bool group = cfg.norm_type == vllm::Ltx2NormType::kGroup;
 
   bag.Put(p + "per_channel_statistics.std-of-means", {cfg.ch});
   bag.Put(p + "per_channel_statistics.mean-of-means", {cfg.ch});
   bag.Put(p + "conv_in.conv.weight", {cfg.ch, cfg.in_channels, 3, 3});
   bag.Put(p + "conv_in.conv.bias", {cfg.ch});
 
+  // GroupNorm is affine and PixelNorm is parameter-free, so the `kGroup` arm
+  // carries a weight/bias pair AHEAD of each convolution the norm precedes.
+  auto put_norm = [&](const std::string& prefix, int64_t channels) {
+    if (!group) return;
+    bag.Put(prefix + ".weight", {channels});
+    bag.Put(prefix + ".bias", {channels});
+  };
   auto put_resnet = [&](const std::string& prefix, int64_t in_ch, int64_t out_ch) {
+    put_norm(prefix + ".norm1", in_ch);
     bag.Put(prefix + ".conv1.conv.weight", {out_ch, in_ch, 3, 3});
     bag.Put(prefix + ".conv1.conv.bias", {out_ch});
+    put_norm(prefix + ".norm2", out_ch);
     bag.Put(prefix + ".conv2.conv.weight", {out_ch, out_ch, 3, 3});
     bag.Put(prefix + ".conv2.conv.bias", {out_ch});
     if (in_ch != out_ch) {
@@ -1394,6 +1676,7 @@ ParamBag BuildAudioEncoderParams(const vllm::Ltx2AudioEncoderConfig& cfg) {
     }
   };
   auto put_attn = [&](const std::string& prefix, int64_t channels) {
+    put_norm(prefix + ".norm", channels);
     for (const char* leaf : {"q", "k", "v", "proj_out"}) {
       bag.Put(prefix + "." + leaf + ".weight", {channels, channels, 1, 1});
       bag.Put(prefix + "." + leaf + ".bias", {channels});
@@ -1433,6 +1716,7 @@ ParamBag BuildAudioEncoderParams(const vllm::Ltx2AudioEncoderConfig& cfg) {
   if (cfg.mid_block_add_attention) put_attn(p + "mid.attn_1", block_in);
   put_resnet(p + "mid.block_2", block_in, block_in);
 
+  put_norm(p + "norm_out", block_in);
   const int64_t conv_out_channels = cfg.double_z ? 2 * cfg.z_channels : cfg.z_channels;
   bag.Put(p + "conv_out.conv.weight", {conv_out_channels, block_in, 3, 3});
   bag.Put(p + "conv_out.conv.bias", {conv_out_channels});
@@ -1762,6 +2046,50 @@ TEST_CASE("ltx2 vae: the AUDIO encoder's average-pool downsample arm") {
   REQUIRE(threw);
   INFO("refusal message: " << message);
   CHECK(message.find("with_conv") != std::string::npos);
+}
+
+TEST_CASE("ltx2 vae: the GROUP-NORM audio encoder matches upstream ltx_core") {
+  // The encoder half of the same hole: `Ltx2AudioEncoderConfig::norm_eps` was
+  // added by phase L11 and, like the decoder's, could not be read by any arm,
+  // because 7a/7b/7c all run `norm_type = kPixel`. Mutating it 1e-6 -> 1e-4 left
+  // all 33 cases green. This arm executes the GroupNorm branch of
+  // `build_normalization_layer` (normalization.py:56-57) at the only causality
+  // `ResnetBlock` permits it on (resnet.py:130-131).
+  const vllm::Ltx2AudioEncoderConfig cfg = ReducedAudioEncoderGroupConfig();
+  ParamBag bag = BuildAudioEncoderParams(cfg);
+  CheckManifest(bag, vllm_test::kLtx2AudioEncGroupParamNames,
+                vllm_test::kLtx2AudioEncGroupParamCounts,
+                std::size(vllm_test::kLtx2AudioEncGroupParamNames));
+
+  const int64_t c = vllm_test::kLtx2AudioEncInC;
+  const int64_t t = vllm_test::kLtx2AudioEncInT;
+  const int64_t f = vllm_test::kLtx2AudioEncInF;
+  const std::vector<float> spec = Ltx2Input("ltx2.audioenc.input", c * t * f, 1.0);
+
+  const vllm::Ltx2AudioSpectrogram latent =
+      vllm::Ltx2AudioEncoderForward(cfg, bag.weights, spec, c, t, f);
+  CHECK(latent.channels == vllm_test::kLtx2AudioEncGroupOutC);
+  CHECK(latent.frames == vllm_test::kLtx2AudioEncGroupOutT);
+  CHECK(latent.mel_bins == vllm_test::kLtx2AudioEncGroupOutF);
+
+  const double err = MaxAbsDiff(latent.data, vllm_test::kLtx2AudioEncGroupGolden,
+                                std::size(vllm_test::kLtx2AudioEncGroupGolden));
+  INFO("group-norm audio encoder max|diff| = " << err);
+  CHECK(err <= kLtx2GoldenTol);
+
+  vllm::Ltx2AudioEncoderConfig bad = cfg;
+  bad.causality_axis = vllm::Ltx2CausalityAxis::kHeight;
+  bool threw = false;
+  std::string message;
+  try {
+    vllm::Ltx2AudioEncoderForward(bad, bag.weights, spec, c, t, f);
+  } catch (const std::exception& error) {
+    threw = true;
+    message = error.what();
+  }
+  REQUIRE(threw);
+  INFO("refusal message: " << message);
+  CHECK(message.find("GroupNorm") != std::string::npos);
 }
 
 TEST_CASE("ltx2 vae: the slaney mel filterbank matches torchaudio") {

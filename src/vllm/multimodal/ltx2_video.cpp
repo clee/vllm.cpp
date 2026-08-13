@@ -823,17 +823,26 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
          std::string(kLtx2AudioPromptEmbedsExtra) + "' extra");
   }
   // Image / reference conditioning is `ImageConditioner` upstream
-  // (distilled.py:245-258) and needs the video VAE's ENCODER, which phase L4
-  // ported the DECODER of. Refused by name rather than dropped: a keyframe that
-  // is silently ignored renders an unconditioned clip that looks like the
+  // (ltx-pipelines/utils/blocks.py:936-993, called at distilled.py:212). The
+  // ENCODER it needs is no longer what is missing — phase L11 ported it as
+  // `Ltx2ConvVideoEncode` — so the refusal names what actually is: this engine
+  // holds no encoder to call. Refused by name rather than dropped: a keyframe
+  // that is silently ignored renders an unconditioned clip that looks like the
   // feature not working.
   if (!gen.first_frame_path.empty() || !gen.first_frame_ppm.empty() ||
       !gen.last_frame_path.empty() || !gen.ref_image_paths.empty() ||
       !gen.ref_video_dir.empty() || !gen.ref_audio_path.empty() || !gen.ref_audio_wav.empty()) {
     Fail(
-        "keyframe / reference conditioning is not ported for this family: it runs through "
-        "upstream's ImageConditioner (distilled.py:245-258), which encodes the images with "
-        "the video VAE's ENCODER, and phase L4 ported the DECODER only. Recorded as owed.");
+        "keyframe / reference conditioning is not ported for this family. The video VAE "
+        "ENCODER itself landed in phase L11 (Ltx2ConvVideoEncode), but nothing can reach it "
+        "from here: this engine materializes the DECODER key filter only, so no "
+        "VAE_ENCODER_COMFY_KEYS_FILTER / VideoEncoderConfigurator path "
+        "(video_vae/model_configurator.py:72, 267) puts encoder weights in memory, and "
+        "upstream resolves each image conditioning's CRF against the checkpoint's "
+        "default_image_crf when the caller left it unset (ImageConditioner.resolve_crf, "
+        "ltx-pipelines/utils/blocks.py:977-983) and then re-compresses through an H.264 "
+        "round trip unless that CRF is 0 (media_io/decode.py:413-435, from "
+        "load_image_and_preprocess :75), which this build does not do. Recorded as owed.");
   }
 
   // ── geometry ──────────────────────────────────────────────────────────────

@@ -668,11 +668,29 @@ TEST_CASE("ltx2 video: keyframe and reference conditioning is refused by name") 
   gen.first_frame_path = ws.paths.video_embeds;  // any path: the refusal precedes the read
   try {
     (void)engine->Generate(gen);
-    FAIL("keyframe conditioning must be refused while the VAE encoder is unported");
+    FAIL("keyframe conditioning must be refused while no encoder is reachable from here");
   } catch (const std::exception& e) {
     const std::string msg = e.what();
     INFO(msg);
     CHECK(msg.find("ImageConditioner") != std::string::npos);
+    // A refusal whose stated REASON has gone stale is worse than a vague one: it
+    // sends the next reader to build something that already exists. Phase L11
+    // ported the video VAE encoder, so the message may no longer claim the
+    // encoder is missing, and these two assertions hold it to the pieces that
+    // actually are — the loader path that would put encoder weights in memory,
+    // and the CRF re-compression upstream applies before encoding.
+    CHECK(msg.find("VAE_ENCODER_COMFY_KEYS_FILTER") != std::string::npos);
+    CHECK(msg.find("default_image_crf") != std::string::npos);
+    // And the QUALIFIER on that re-compression, which the two substrings above do
+    // not reach: `preprocess` returns the image UNTOUCHED at `crf == 0`
+    // (media_io/decode.py:413-435, the `if crf == 0:` early return at :425-426 —
+    // NOT the one at :427-428, which is the degenerate-size guard), so "re-compresses
+    // before encoding" is only true of a nonzero resolved CRF. Naming the round
+    // trip without naming its exception overstates what is unported and sends the
+    // next reader to build an H.264 path for a case that needs none — the same
+    // failure mode as a stale reason, one step subtler. Gated here so deleting the
+    // qualifier goes RED rather than quietly restoring the overstatement.
+    CHECK(msg.find("unless that CRF is 0") != std::string::npos);
   }
 }
 

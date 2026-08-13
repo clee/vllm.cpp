@@ -362,6 +362,26 @@ TEST_CASE("ltx2 config: ParseLtx2DitParams mirrors LTXModelConfigurator") {
   CHECK(parsed.rope_type == Ltx2RopeType::kSplit);
   CHECK_FALSE(parsed.double_precision_rope);
 
+  // THE INVISIBLE-CONSTANT CLASS, in the DiT. `norm_eps` feeds the q/k RMSNorm
+  // (attention.py:505-506) and every AdaLN, but every arm in this suite passes it
+  // EXPLICITLY through ReducedParams, so nothing here reads the FIELD DEFAULT and
+  // a 100x mutation of it left all six LTX suites green. The default is not dead
+  // code: `ReducedConfig()` carries no `norm_eps` key, which is the shape of a
+  // checkpoint that omits it, and upstream's own fallback is
+  // `config.get("norm_eps", 1e-06)` (transformer/model_configurator.py:54, 124,
+  // 181). So the parse below is exactly the path the default binds on, and this
+  // pins it there rather than in a list far from its use.
+  CHECK(parsed.norm_eps == doctest::Approx(1e-6).epsilon(1e-12).scale(0.0));
+  {
+    // Not a SUBCASE deliberately: doctest re-enters the whole case body once per
+    // subcase, so adding one here would multiply every assertion above it and
+    // move this suite's recorded count for a reason unrelated to coverage.
+    nlohmann::json explicit_eps = ReducedConfig();
+    explicit_eps["config"]["transformer"]["norm_eps"] = 1e-5;
+    CHECK(ParseLtx2DitParams(explicit_eps).norm_eps ==
+          doctest::Approx(1e-5).epsilon(1e-12).scale(0.0));
+  }
+
   SUBCASE("frequencies_precision selects the float64 ladder") {
     nlohmann::json cfg = ReducedConfig();
     cfg["config"]["transformer"]["frequencies_precision"] = "float64";
@@ -392,6 +412,31 @@ TEST_CASE("ltx2 config: ParseLtx2DitParams mirrors LTXModelConfigurator") {
     cfg["config"]["transformer"]["use_keyframes_abs_pos_embedding"] = true;
     CHECK_THROWS(ParseLtx2DitParams(cfg));
   }
+}
+
+TEST_CASE("ltx2 dit: Ltx2AttentionArgs::norm_eps is a LATENT default, so it is pinned") {
+  // The sixth instance the constant sweep turned up, and the most inert of them.
+  // `Ltx2AttentionArgs::norm_eps` is the eps of the q/k RMSNorm — upstream's
+  // `Attention.__init__` declares `norm_eps: float = 1e-6` (attention.py:485) and
+  // hands it to both `torch.nn.RMSNorm`s (attention.py:505-506) — but EVERY
+  // construction of the struct assigns it before use: ltx2_dit.cpp:188, :244,
+  // :280, :338, :366 from `Ltx2DitParams::norm_eps`, ltx2_connector.cpp:253 from
+  // `kLtx2ConnectorRmsNormEps`, and each of this suite's own arms from its
+  // ReducedParams.
+  //
+  // Measured, not assumed: mutating this default 1e-6 -> 1.0, a 10^6 change,
+  // leaves every suite green. That is not the invisible-epsilon story the other
+  // five tell — those are read and merely never bind. This one is never READ, so
+  // no fixture, however scaled, can reach it. It is a latent trap: the value a
+  // future call site inherits on the day someone adds one and forgets the
+  // assignment, at which point 1.0 would be silently applied inside an RMSNorm.
+  // A pin is the only instrument that can hold it, and this records that limit
+  // rather than dressing it up as coverage.
+  CHECK(vllm::Ltx2AttentionArgs{}.norm_eps == doctest::Approx(1e-6).epsilon(1e-12).scale(0.0));
+  // ...and it must agree with the DiT parameter that every real call site feeds
+  // it from, so the two cannot drift apart unnoticed.
+  CHECK(vllm::Ltx2AttentionArgs{}.norm_eps ==
+        doctest::Approx(vllm::Ltx2DitParams{}.norm_eps).epsilon(1e-12).scale(0.0));
 }
 
 TEST_CASE("ltx2 layout: the shapes recover the geometry") {

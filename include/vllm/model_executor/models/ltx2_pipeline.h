@@ -171,10 +171,19 @@ struct Ltx2SdeCoeff {
   double sigma_up = 0.0;
 };
 
-// diffusion_steps.py:138. The fallback that keeps `sqrt(sigma_next^2 - sigma_up^2)`
-// off zero. Pinned because it never binds on a well-formed schedule (eta <= 1
-// keeps sigma_up <= sigma_next), so no value comparison can see it — a member of
-// the invisible-constant class the spec's section 7.0(a) names.
+// diffusion_steps.py:138. What keeps `sqrt(sigma_next^2 - sigma_up^2)` off zero,
+// and it BINDS on the ordinary eta = 1 schedule rather than only on a malformed
+// one. `step` forms `sigma_up = sigma_next * eta`, so eta <= 1 gives
+// sigma_up <= sigma_next — but <= includes ==, and at equality `min` takes
+// `sigma_next * 0.9999`, which is the whole point: without it the residual is
+// exactly 0 and `sigma_down` collapses. The earlier note reasoned from the
+// inequality and skipped its boundary, calling the constant invisible; it is not.
+// A 1% move (0.9999 -> 0.99) REDS the Eta1 arm the suite already runs, at
+// max|diff| = 0.086 (index 0) and 0.130563 (index 1), because the residual scales
+// as sqrt(1 - clamp^2) and that is 10x larger at 0.99. The EtaHalf arm stays green
+// (0.5 * sigma_next is below the clamp) and Eta1 index 2 stays green
+// (sigma_next == 0 returns the denoised prediction unchanged, :181-182). Pinned
+// as well, because a regenerated golden would move with the constant.
 inline constexpr double kLtx2Res2sSigmaUpClamp = 0.9999;
 
 Ltx2SdeCoeff Ltx2Res2sSdeCoeff(double sigma_next, double sigma_up);

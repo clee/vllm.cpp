@@ -97,7 +97,22 @@ struct Ltx2AudioDecoderConfig {
   // The decoder's TARGET mel-bin count. 0 keeps whatever the latent carried,
   // mirroring `mel_bins=None` (audio_vae.py:422).
   int64_t mel_bins = 0;
-  // Only read on the GroupNorm arm; PixelNorm has no parameters at all.
+  // Only read on the GroupNorm arm; PixelNorm has no parameters at all. Neither
+  // is reachable from a checkpoint: `build_normalization_layer` passes `eps=1e-6`
+  // as a LITERAL and forwards its own `num_groups` keyword, whose default is 32
+  // (normalization.py:44, 56), and no audio_vae call site passes `num_groups`.
+  // They are fields here so the gate can pin them.
+  //
+  // `norm_type = kGroup` is not a dead arm, but it is not what pure defaults give
+  // you either. `AudioDecoder.__init__` declares `norm_type = GROUP`
+  // (audio_vae.py:294) and, on the very next line, `causality_axis = WIDTH`
+  // (audio_vae.py:295) — and `ResnetBlock` refuses that combination with
+  // `ValueError: Causal ResnetBlock with GroupNorm is not supported`
+  // (resnet.py:130-131), verified by construction against the pinned upstream. A
+  // group-norm checkpoint is therefore one that declares `causality_axis: none`
+  // alongside it, which is legal and is what the group-norm golden in
+  // test_ltx2_vae.cpp runs. Before that arm existed this eps was never READ on
+  // any path, and a 100x change moved nothing.
   int64_t num_groups = 32;
   double norm_eps = 1e-6;
   // The audio VAE reaches PixelNorm through `build_normalization_layer`, which
@@ -188,12 +203,18 @@ std::vector<float> Ltx2VocoderForward(const Ltx2VocoderConfig& config,
 // ---------------------------------------------------------------------------
 
 // The floor under the BWE mel BEFORE its log: `torch.clamp(mel, min=1e-5)`
-// (vocoder.py:516). Named so it can be pinned, because it is the member of the
-// invisible-constant class that actually bites in production: it sets the floor of
-// the log-mel fed to the bwe_generator, and REAL SILENCE reaches it. A
-// reduced-dimension golden built from the deterministic stream cannot, because
-// that stream's mel_basis is non-negative and well-scaled and nothing saturates —
-// mutation proves 1e-5 -> 1e-8 leaves every tensor golden green.
+// (vocoder.py:515). Named so it can be pinned, because it sets the floor of the
+// log-mel fed to the bwe_generator and REAL SILENCE reaches it in production.
+//
+// It is NOT a member of the invisible-constant class described in
+// ltx2_video_vae.h, and the line here that said it was is corrected rather than
+// carried: the ORDINARY BWE arm's mel_basis is non-negative and well-scaled and
+// its raw minimum is ~4.4e-3, so that arm alone cannot move under a mutation.
+// "ltx2 vae: the BWE mel log clamp is gated where it actually binds" attenuates
+// mel_basis until every bin saturates the floor, and against it 1e-5 -> 1e-8 REDS
+// at max|diff| = 0.144965 versus the 5e-6 band. The pin below stays anyway, for
+// what no golden can see: a regeneration that moves the constant and the expected
+// tensors together.
 inline constexpr double kLtx2BweMelLogClamp = 1e-5;
 
 struct Ltx2VocoderBweConfig {
