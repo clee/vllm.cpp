@@ -770,17 +770,31 @@ std::unique_ptr<Ltx2VideoEngine> Ltx2VideoEngine::Load(const VideoModelParams& p
       // honour (embeddings_processor.py:89). `Ltx2ModalityInput` carries no
       // context mask, so a mask with a masked position would be silently dropped
       // — the DiT would attend over register-free padding as if it were caption.
-      // With registers enabled every position is attendable and the mask is all
-      // ones, which is the case the shipped checkpoint is in; anything else is
-      // refused by name rather than ignored.
+      //
+      // THIS LOOP IS UNREACHABLE ON EVERY INPUT EITHER REFERENCE PRODUCES, and
+      // saying which case reaches it is how the claim stays checkable. It is NOT
+      // the `num_learnable_registers = 0` case, which an earlier version of this
+      // comment named and which cannot get here: with registers disabled
+      // `Ltx2ConnectorForward` passes the caller's ADDITIVE mask straight
+      // through, and `_to_binary_mask`'s `encoded_mask < 0.000001`
+      // (embeddings_processor.py:46-48) is satisfied by BOTH values an additive
+      // mask holds — 0.0 and -finfo(f32).max — so the binary mask is one
+      // everywhere there too. With registers enabled :152 returns
+      // `torch.zeros_like(mask)` and the answer is one everywhere for the same
+      // reason. What would reach it is a connector whose output mask carries a
+      // value at or above +1e-6, which no path in `ltx_core` or `diffusers`
+      // emits today. It is kept as a guard on that future, refused by name
+      // rather than ignored, and it is deliberately not gated: a test would have
+      // to fabricate a mask neither reference can produce.
       for (const float m : encoded.mask) {
         if (m == 1.0f) continue;
         Fail(
             "the embeddings connector returned a cross-attention mask with masked "
             "positions, and `Ltx2ModalityInput` carries no context mask to pass it through. "
-            "That happens when the connector runs with num_learnable_registers = 0, where "
-            "padding stays padding instead of becoming a register. Refusing rather than "
-            "dropping the mask, which would condition the DiT on unmasked padding.");
+            "No path in either reference emits such a mask — `_to_binary_mask` is one "
+            "everywhere for both values an additive mask holds — so this is a connector "
+            "whose output mask this port does not model. Refusing rather than dropping "
+            "the mask, which would condition the DiT on unmasked padding.");
       }
       im.video_prompt_embeds = encoded.video;
       im.audio_prompt_embeds = encoded.audio;

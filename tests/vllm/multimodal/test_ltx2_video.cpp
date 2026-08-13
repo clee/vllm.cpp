@@ -100,6 +100,24 @@ std::string ReadAll(const std::string& path) {
   return std::string((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
 }
 
+// A prompt-embeds file as floats, and back. The register cases need to change
+// ONE row of a supplied stream and leave every other byte alone, which the
+// fixture's seeded writer cannot express.
+std::vector<float> ReadFloats(const std::string& path) {
+  const std::string bytes = ReadAll(path);
+  REQUIRE(bytes.size() % sizeof(float) == 0);
+  std::vector<float> out(bytes.size() / sizeof(float));
+  std::memcpy(out.data(), bytes.data(), bytes.size());
+  return out;
+}
+
+void WriteFloats(const std::string& path, const std::vector<float>& values) {
+  std::ofstream out(path, std::ios::binary);
+  REQUIRE_MESSAGE(out.good(), "cannot write ", path);
+  out.write(reinterpret_cast<const char*>(values.data()),
+            static_cast<std::streamsize>(values.size() * sizeof(float)));
+}
+
 bool Registered(const std::string& family) {
   const std::vector<std::string> all = vllm::multimodal::RegisteredVideoFamilies();
   return std::find(all.begin(), all.end(), family) != all.end();
@@ -841,6 +859,20 @@ TEST_CASE("ltx2 video: an ABI client loads, detects and generates through vllm.h
 // otherwise rather than silently passing: a gate that quietly does nothing when
 // its input is absent is how "we tested the real checkpoint" becomes untrue.
 //
+// HOW FAR THAT ANNOUNCEMENT CARRIES, stated so nobody over-reads it. The
+// `MESSAGE` below is printed by the doctest binary's own run, so `test_ltx2_video`
+// executed directly says SKIPPED on its own output. `ctest` captures a passing
+// test's output and prints only the pass line, so under `ctest` this case is
+// indistinguishable from one that ran. Read "the shipped checkpoints were read"
+// off the binary's output or off an explicitly set env, never off a green ctest
+// row.
+//
+// The env is deliberately NOT the tree-wide `CHECKPOINT_ROOT`. That one "declares
+// an INTENT, not a behaviour" and nothing in the tree reads it (`.env.example`),
+// while this needs a path to one specific publisher tree whose internal layout
+// (`diffusion_models/…`) the case walks. Pointing it at the shared root would
+// make this its first reader and change what that variable means.
+//
 // It deliberately stops short of the DiT FORWARD. At the shipped 21.00B geometry
 // the f32 parity forward needs ~76 GB of weights and ~2.6e14 FLOPs per step, and
 // the device path cannot feed it (see the `device = 1` refusal). What is checked
@@ -1131,6 +1163,28 @@ TEST_CASE("ltx2 video: a connector config that disagrees with the FILE is refuse
     CHECK(msg.find("transformer_1d_blocks.2") != std::string::npos);
   }
 
+  SUBCASE("a register count the file's TABLE does not carry is refused") {
+    // `connector_num_learnable_registers` is the ONE key `Ltx2ParseConnectorConfig`
+    // reads that NEITHER upstream configurator does: `Embeddings1DConnectorConfigurator`
+    // (embeddings_connector.py:194-219) and its audio sibling (:222-256) both leave
+    // it at the class default of 128, so "mirrors both configurators key for key" is
+    // not literally true of this one key and the divergence is deliberate — a
+    // checkpoint declaring something else must not be silently run at 128.
+    //
+    // A read that nothing can falsify is a claim, not a gate, and this is what
+    // falsifies it: the fixture's stored table stays `[2, dim]` while the config
+    // declares 4, and `Ltx2LoadConnectorWeights`' shape check is what has to fire.
+    ltx2_fixture::ReducedDitOptions relabelled;
+    relabelled.transformer_overrides["connector_num_learnable_registers"] = 4;
+    const std::string path = ws.root + "/dit_conn_registers.safetensors";
+    ltx2_fixture::WriteReducedDit(dit, path, relabelled);
+    vllm::multimodal::VideoModelParams mp = FixtureParams(ws.paths);
+    mp.dit_path = path;
+    const std::string msg = RefusalOf(mp);
+    INFO(msg);
+    CHECK(msg.find("learnable_registers") != std::string::npos);
+  }
+
   SUBCASE("gating the config declares but the file does not carry is refused") {
     ltx2_fixture::ReducedDitOptions ungated;
     ungated.connector.gated = false;  // writes NO to_gate_logits tensors...
@@ -1195,5 +1249,98 @@ TEST_CASE("ltx2 video: the valid-row count decides which positions are registers
     const std::string msg = RefusalOf(over);
     INFO(msg);
     CHECK(msg.find(vllm::multimodal::kLtx2PromptValidRowsExtra) != std::string::npos);
+  }
+}
+
+TEST_CASE("ltx2 video: the register boundary sits EXACTLY at the valid-row count") {
+  // WHY THE CASE ABOVE IS NOT ENOUGH, and this one exists. It asserts only that
+  // a render at valid=4 differs from one at valid=2. ANY monotone corruption of
+  // the boundary keeps that true — `prompt_valid_rows + 1` still renders
+  // differently from valid=2 — so the whole family passes it. The defect it
+  // cannot see is ONE padded row conditioned on caller junk instead of the
+  // connector's TRAINED register: finite, correctly shaped, plausible, wrong.
+  //
+  // WHAT MAKES THE BOUNDARY NUMERICALLY REACHABLE is the substitution itself.
+  // `binary_mask = additive_attention_mask[:, 0, 0, :] >= 0` then
+  // `binary_mask * hidden_states + (1 - binary_mask) * registers`
+  // (embeddings_connector.py:148-150) REPLACES a masked position's features
+  // outright, so what the caller supplied there cannot reach the render at all.
+  // Positions therefore separate by whether perturbing them moves a byte:
+  //
+  //   rows [valid, N) are REGISTERS -> perturbing them must change NOTHING
+  //   rows [0, valid)  are CAPTION  -> perturbing the last one must change something
+  //
+  // Together those pin the boundary from both sides, which is what "which
+  // positions are registers" means when the conditioning itself is not
+  // observable from outside the engine. `+ 1` breaks the first (row `valid`
+  // keeps caller junk); `- 1` breaks the second (row `valid - 1` becomes a
+  // register and its content stops mattering). The reviewer's mutation was the
+  // former and the suite stayed fully green.
+  //
+  // THE POLARITY AND THE CONTIGUITY ARE BOTH UPSTREAM'S.
+  // `_prepare_attention_mask` builds `(attention_mask - 1) * finfo.max`
+  // (transformer_args.py:203-206), so 0.0 is kept and -finfo.max is padded; and
+  // `_compute_right_pad_order`'s stable descending argsort
+  // (embeddings_processor.py:33-38) makes the padded set the CONTIGUOUS SUFFIX
+  // `[valid, N)` that `prompt_embeds_valid_rows` names. Neither the mask
+  // comparison nor the returned mask can carry this: with registers on, :152
+  // returns `torch.zeros_like(mask)` and `_to_binary_mask`'s `< 0.000001`
+  // (:46-48) is satisfied by BOTH values an additive mask holds, so the mask the
+  // DiT receives is all ones either way. The substitution is the only carrier.
+  Workspace ws;
+  const vllm::Ltx2DitParams dit = ltx2_fixture::ReducedDitParams();
+  const int64_t width = dit.cross_attention_dim;
+  const int64_t rows = 4;   // `ltx2_fixture::WriteFixture`'s `prompt_tokens`
+  const int64_t valid = 2;  // two caption rows, two padded ones
+
+  const std::vector<float> base = ReadFloats(ws.paths.video_embeds);
+  REQUIRE(base.size() == static_cast<size_t>(rows * width));
+
+  // A perturbation big enough that no 8-bit frame byte can absorb it, and
+  // column-varying so it cannot turn one row into a copy of another.
+  auto perturb_rows = [&](const std::string& name, int64_t first, int64_t last) {
+    std::vector<float> values = base;
+    for (int64_t r = first; r < last; ++r) {
+      for (int64_t c = 0; c < width; ++c) {
+        values[static_cast<size_t>(r * width + c)] += 3.0f + 0.25f * static_cast<float>(c);
+      }
+    }
+    const std::string path = ws.root + "/" + name + ".f32";
+    WriteFloats(path, values);
+    return path;
+  };
+
+  vllm::multimodal::VideoModelParams half = FixtureParams(ws.paths);
+  half.extras[vllm::multimodal::kLtx2PromptValidRowsExtra] = std::to_string(valid);
+  const std::string reference = RenderBytes(half, ws.root + "/reg_ref");
+  // Without this an `==` below could pass on two empty reads rather than on two
+  // renders.
+  REQUIRE(reference.size() > 1000);
+  // ...and the same request twice is byte-identical, which is what makes the
+  // equality an assertion about the registers rather than about noise.
+  REQUIRE(RenderBytes(half, ws.root + "/reg_ref2") == reference);
+
+  SUBCASE("every row at or past the count is a register, so its content is inert") {
+    vllm::multimodal::VideoModelParams padded = half;
+    padded.prompt_embeds_path = perturb_rows("perturbed_padding", valid, rows);
+    // REDs at `prompt_valid_rows + 1`: row `valid` would keep the caller's junk
+    // instead of becoming the trained register.
+    CHECK(RenderBytes(padded, ws.root + "/reg_padded") == reference);
+  }
+
+  SUBCASE("the row just BEFORE the count is caption, so its content is not") {
+    vllm::multimodal::VideoModelParams caption = half;
+    caption.prompt_embeds_path = perturb_rows("perturbed_last_caption", valid - 1, valid);
+    // REDs at `prompt_valid_rows - 1`: row `valid - 1` would be replaced by a
+    // register and the perturbation would stop reaching the DiT.
+    CHECK(RenderBytes(caption, ws.root + "/reg_caption") != reference);
+  }
+
+  SUBCASE("the FIRST row is caption too, so the boundary is not the whole prompt") {
+    // Guards the degenerate reading where nothing is caption: a mask of all
+    // -finfo.max renders the register table and only the register table.
+    vllm::multimodal::VideoModelParams first = half;
+    first.prompt_embeds_path = perturb_rows("perturbed_first", 0, 1);
+    CHECK(RenderBytes(first, ws.root + "/reg_first") != reference);
   }
 }

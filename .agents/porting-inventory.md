@@ -1519,7 +1519,20 @@ Examples: `examples/cli` ✅ (C-API client), `examples/server` ✅ (OpenAI serve
       identical `(video_attn_mask < 1e-6)` and the identical multiply. Checked on both
       BEFORE mirroring it, because the reading a port arrives at by reasoning about
       intent (`>= 0`) is the opposite at padded positions. Gated as the surprising
-      behaviour, so "fixing" it REDs (`test_ltx2_pipeline`, mutation M3).
+      behaviour, so "fixing" it REDs: `test_ltx2_pipeline`, case "ltx2 the processor's
+      binary mask mirrors a comparison that looks backwards".
+    * **THE REGISTER BOUNDARY IS NOW NUMERICALLY REACHABLE (2026-08-13, review
+      finding F1 on the L9c PR).** `prompt_embeds_valid_rows` is the single knob
+      deciding which positions become the connector's TRAINED registers, and the
+      only case covering it asserted that valid=4 renders differently from valid=2.
+      Every monotone corruption of that boundary keeps that true, so a fresh
+      reviewer's `prompt_valid_rows + 1` left the suite fully green — one padded row
+      conditioned on caller junk instead of a register: finite, correctly shaped,
+      plausible, wrong. Closed by asserting WHICH positions are registers, from both
+      sides: perturbing rows `[valid, N)` must move NOTHING (they are substituted at
+      `embeddings_connector.py:148-150`) and perturbing row `valid - 1` must move
+      something. `test_ltx2_video`, case "the register boundary sits EXACTLY at the
+      valid-row count"; RED under `+ 1`, `- 1`, `0` and `v_rows`.
     * **A CONFIG VALUE THAT IS NOT NEAR ITS DEFAULT.** LTX-2.5 declares
       `connector_positional_embedding_max_pos = [4096]` where `Embeddings1DConnector`'s
       class default is `[1]`, and `get_fractional_positions` DIVIDES the token index by
@@ -1527,11 +1540,23 @@ Examples: `examples/cli` ✅ (C-API client), `examples/server` ✅ (OpenAI serve
       RoPE angle wrong. `positional_embedding_theta` is deliberately NOT read from the
       DiT config even though one is declared, because neither configurator passes it —
       reading it would be a re-invention rather than a port.
+    * **ONE KEY WHERE THIS PARSE DIVERGES RATHER THAN MIRRORS (2026-08-13, review
+      finding F3).** `Ltx2ParseConnectorConfig` reads
+      `connector_num_learnable_registers`, which NEITHER configurator does
+      (`embeddings_connector.py:194-219` and `:222-256` both leave it at the class
+      default of 128), so "mirrors both configurators key for key" is not literally
+      true of this one key. The divergence is kept — a checkpoint declaring something
+      else must not be silently run at 128 — and is now ENFORCED rather than asserted:
+      `test_ltx2_video`, case "a connector config that disagrees with the FILE is
+      refused", subcase "a register count the file's TABLE does not carry is refused",
+      which REDs when the read is made inert.
     * **The record changed, not just the code.** The two connector families are no
       longer reported as unported: this port reads them, so naming them would say
       something untrue about the tree and would demand `allow_unported_modules` from a
       caller whose checkpoint is read completely. Asserted as an ABSENCE in
-      `test_ltx2_loader`, so restoring the old behaviour REDs (mutation M4).
+      `test_ltx2_loader`, case "ltx2 loader: the unported families are refused by name,
+      not absorbed" (`CHECK(conn_ck.unported.empty())`), so restoring the old behaviour
+      REDs.
     * **OWED, and precisely:** the Gemma-4 TOWER, so what ENTERS the connector is still
       whatever the caller put in the prompt-embeds file — the link below the tower is
       real, the tower is not. `prompt_embeds_valid_rows` exists because a file carries
