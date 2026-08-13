@@ -252,4 +252,108 @@ Nothing in `docs/` may say more than that.
 
 ## 8. Outcome
 
-*(filled at DONE)*
+**Ported and gated. Not reachable from any shipped pipeline.** §7's sentence
+stands unchanged after implementation — nothing measured here moved it.
+
+### 8.1 What was built
+
+`PixelShuffle1d` and `DropFirstFrame` in
+`src/vllm/model_executor/models/ltx2_upsampler.cpp`, one branch in
+`Ltx2LatentUpsample`, one branch in `EnumerateLtx2UpsamplerTensors`, and the
+`kTemporalUpsampler` → `kSpatiotemporalUpsampler` retarget from §4. The loader
+needed no change, as §3 predicted: `Ltx2ParseUpsamplerConfig` already read
+`temporal_upsample`, and the engine test in 8.4 proves it end to end on a real
+safetensors file.
+
+### 8.2 The band, derived from measurement
+
+All four arms measured on the same tree by temporarily bounding at `0.0`,
+restoring immediately (test file md5 back to `214418c4b2c124eb37c64d3ce96ea3de`,
+binary md5 back to the GREEN one):
+
+| arm | `max|diff|` vs executed upstream |
+|---|---|
+| PixelShuffle (spatial x2) | 1.19209e-06 |
+| Rational2 | 1.13249e-06 |
+| Rational1p5 | 9.68575e-07 |
+| **Temporal x2** | **2.38419e-06** |
+
+The suite's existing `kRoundOff = 5e-6` holds without widening: the new arm is
+2.0x the largest shipped arm and 0.48x the bound. It was **not** chosen to fit —
+the three shipped arms were re-measured next to it precisely so the new number
+could be read against a scale that predates this row. The bound is a MAX over
+every element, never a fraction of them.
+
+Two extra frames of accumulated convolution is the whole difference in scale:
+the temporal arm's post-upsample res-blocks and `final_conv` run over `2F - 1 = 5`
+frames where the spatial arms run over `F = 2`.
+
+### 8.3 Mutations — every one RED, restored, GREEN
+
+Run against `tests/vllm/models/test_ltx2_pipeline.cpp` (38 cases / 2443
+assertions when green, `RUN_EXIT=0`). Each mutation was applied to the source,
+`touch`ed, rebuilt with `BUILD_EXIT=0` and a CHANGED binary md5, run, then
+restored to source md5 `32729b8895561d885f4bea9d4c02b0dd` and rebuilt back to
+binary md5 `b662957cd1ce693727725cbce74649ae`.
+
+| # | Mutation | Result |
+|---|---|---|
+| M1 | `PixelShuffle1d` source channel `c*up_f + j` → `j*out.channels + c` | RED, `max|diff| = 2.97727` vs bound `5e-06`; 37 passed / 1 failed, `RUN_EXIT=1` |
+| M2 | first frame kept instead of dropped | RED on SHAPE first (`6 == 5`, twice) then `REQUIRE(864 == 720)`; 3 failed, `RUN_EXIT=1` |
+| M3 | temporal `upsampler.0.weight` enumerated at the spatial arm's Conv2d rank | RED in the manifest (`18432 == 55296`) and the case then threw `conv3d weight has the wrong element count`; `RUN_EXIT=1` |
+
+None stayed green, so no escalation was needed.
+
+### 8.4 The regression this row would otherwise have shipped, and its gate
+
+Retargeting the refusal made the *engine* worse before it made it better. A
+temporal checkpoint handed to `--upsampler` shares the class name and the
+`upsampler.0.*` tensor names with the spatial one, so after this row it LOADS
+and RUNS, and the `kSpatialUpsample` phase then failed with a bare shape
+mismatch instead of the named refusal it used to give.
+
+`src/vllm/multimodal/ltx2_video.cpp` therefore gains a guard that names the swap,
+and `tests/vllm/multimodal/test_ltx2_video.cpp` gains a subcase that writes a
+`temporal_upsample: true` fixture checkpoint and asserts the message names it
+AND does **not** contain the shape complaint. Removing the guard (`if (...)` →
+`if (false)`) REDs it with the real prior message:
+
+```
+ltx-2.5 video: the upsampled latent is 4x3x1x1 but phase 'refine' needs 4x2x2x2
+```
+
+That RED is also the row's only end-to-end evidence, and it is worth more than
+the guard: `4x3x1x1` is the temporal arm's output, from a real safetensors file,
+through `Ltx2ParseUpsamplerConfig` and `Ltx2LoadVaeWeights`, at `2F - 1 = 3`
+frames and unchanged `1x1` spatial. The loader path is not assumed.
+
+### 8.5 The checkpoint
+
+`/mnt/nas_share/checkpoints/ltx-2.5/lightricks-ltx-2.5/latent_upscale_models/`
+contains `ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors` and nothing
+else. The temporal one is **absent**, so `test_ltx2_video.cpp`'s
+checkpoint-gated "loads and configures" subcase covers the spatial arm only and
+this row adds no real-weight arm to it. Nothing here claims one.
+
+### 8.6 Counts, against the denominator
+
+| Suite | before (origin/main) | after |
+|---|---|---|
+| `test_ltx2_pipeline` | 37 cases / 2382 assertions | 38 / 2443 |
+| `test_ltx2_video` | 30 cases / 502 assertions | 30 / 505 |
+
+Both `RUN_EXIT=0`. Full gate: `ctest -N` = **423**, `ctest -j 4` = 423/423
+passed, `CTEST_EXIT=0`, with `test_modelopt_mixed_precision_checkpoint` and
+`test_voxtral_e2e` skipped by their own guards. At `-j 8` the run reported
+`test_engine_core_proc` failed; it passes on its own and is the recorded
+parallel-starvation flake, which is why the accepted run is the `-j 4` one.
+
+### 8.7 What was NOT done, and why
+
+- **No DFR pipeline.** Out of scope by §2 and the reason §7 says what it says.
+- **No bf16 arm.** This file is the CPU f32 reference arm; the bf16 arm is owed
+  by phase L6 for the whole upsampler, spatial included, and this row does not
+  change that debt either way.
+- **The spatial+temporal arm stays refused.** It is a different operator, and
+  implementing it because it is adjacent would have shipped an ungated third
+  branch.
