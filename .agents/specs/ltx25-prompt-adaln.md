@@ -254,6 +254,108 @@ the whole row is decoration.
   done. Escalate the mutation's magnitude before concluding anything about
   reachability (issue #604).
 
+## Outcome
+
+### What was measured
+
+The generator emits these into `tests/vllm/models/ltx2_goldens.inc` and prints
+them on stderr, from the SAME shared weight stream on both arms (keyed by
+parameter name, so every common weight is bit-identical and the difference is the
+term and nothing else):
+
+| Quantity | Flag ON vs OFF |
+|---|---|
+| **timestep term vs the static table it is added to** | `max\|term\|` 0.0252 vs `max\|table\|` 0.0487 — **51.7%** |
+| **block-0 modulated prompt K/V** | `max\|on-off\|` 0.0310 — **5.82%** of `max\|off\|` |
+| DiT video output (2 blocks) | 1.4567e-4 — 0.04% of `max\|off\|`, **73x** the gate's 2e-6 floor |
+| DiT audio output (2 blocks) | 7.367e-5 — 0.03%, **37x** the floor |
+
+**The answer to "does this matter" is the first two rows.** Roughly half the
+magnitude of the prompt K/V modulation is the timestep-conditioned term, and
+including it moves the modulated prompt context by ~6%. Every render before this
+row discarded that.
+
+The two output rows are the GATE's floor, not a claim about the trained
+checkpoint: they are bounded by the generator's synthetic weight scale (0.05) and
+by a 2-block stack rather than 48. They are reported because a mutation must be
+shown to move something, and 73x/37x above round-off is what makes the mutation
+below meaningful.
+
+### The mutations
+
+All five run on the committed head, restored byte-for-byte afterwards (source
+md5s re-checked). Exit status is the authority; assertion COUNTS are recorded
+because doctest's summary and the exit code disagree in both directions.
+
+| # | Mutation | Result |
+|---|---|---|
+| M1 | host `ModulateContext` ignores `prompt_mod` | RED — 3/35 cases, 6/2435 assertions, exit 1 |
+| M2 | device `TextCrossAttentionDev` takes the static-only branch always | RED — 1/15 cases, 6/523 assertions, exit 1 |
+| M3 | re-add `use_prompt_adaln_single = false` before the loader guard | RED — the guard throws by name; assertion count DROPS 4826 → 4815, exit 1 |
+| M4 | prompt AdaLN driven by `m.timesteps` instead of `m.sigma` | RED — 2/35 cases, 4/2435 assertions, exit 1 |
+| M5 | shift and scale rows swapped within the `[2, width]` row | RED — 2/35 cases, 4/2435 assertions, exit 1 |
+
+M3 is the one that cannot be reached by any INPUT, and that is stated rather than
+papered over: `ParseLtx2DitParamsFromManifest` derives the flag from the same
+manifest the guard reads, so they agree by construction unless an assignment
+intervenes — which is exactly the edit the guard exists to catch. The
+input-driven half of the same rule lives in `Ltx2AdoptDeclaredDitParams`, where a
+config that disagrees with the shapes now produces two different contracts and is
+refused; that one is gated by a test with real inputs in both directions.
+
+### The gate
+
+`BUILD_EXIT=0` on every build; build logs grepped for `No space left|BFD assertion`
+(0 hits) and `df -h /` logged (88% used, 52G free at the end). Case AND assertion
+counts against the `cefacd2d0` baseline, measured by reverting the working tree to
+HEAD, rebuilding the four targets and running them, then re-applying the diff and
+re-checking its md5 (`03324d42…`, identical before and after):
+
+| Suite | HEAD `cefacd2d0` | this row | delta |
+|---|---|---|---|
+| `test_ltx2` | 30 cases / 1627 assertions | 35 / 2435 | +5 cases, +808 assertions |
+| `test_ltx2_loader` | 24 / 4817 | 26 / 4826 | +2 cases, +9 (new cases minus the assertions the retired unported-family claims took with them) |
+| `test_ltx2_device` | 13 / 498 | 15 / 523 | +2 cases, +25 assertions |
+| `test_ltx2_video` | 30 / 502 | 30 / 502 | unchanged — the fixture now carries the module, and no assertion counted it |
+
+The `test_ltx2_video` fixture had to move: it declared a config that omits
+`use_prompt_adaln_single` (mirroring the shipped NVFP4 DiT) while its SHAPES said
+false, so the config/shape equality check refused it — correctly. It now carries
+the module, which is the shipped shape and puts the whole video engine on the new
+path.
+
+### What was rejected
+
+- **Widening `modulate`'s kernel contract** with a `rows_per_src_row` divisor, to
+  express "one row per batch element broadcast over that element's tokens" in one
+  launch. Rejected: it changes a kernel's semantics for a dimension that is 1 or 2
+  in every shipped call, and would owe its own red-before evidence. The device
+  path loops over batch and offsets the pointers instead.
+- **Narrowing the static prompt table to the stream dtype** on the flag-ON path,
+  which is literally what upstream's `.to(dtype=x_normed.dtype)` does. Rejected as
+  out of scope: the existing static-only path deliberately keeps the table at F32
+  (`ltx2_device.cpp`, "a narrowed table would be the dtype rule applied
+  backwards"), and changing that polarity is a separate decision. The flag-ON path
+  routes the sum through `ada_value`, which stores at the stream dtype — the same
+  rounding every other table+modulation sum in that file already has.
+
+### Why the defaults are what they are
+
+`Ltx2DitParams::use_prompt_adaln_single` keeps its `true` default, which is now
+honoured rather than overwritten. It matches `model.py:77`,
+`model_configurator.py:76`/`:138` and diffusers `transformer_ltx2.py:1185`, and
+it matches both shipped DiTs: the FP8 file carries no config at all (so the
+default decides), and the NVFP4 file's config OMITS the key — verified by reading
+both headers off the NAS. So neither shipped checkpoint is refused by the new
+config/shape equality check.
+
+`allow_unported_modules` keeps existing, because
+`keyframes_abs_pos_embedding` is genuinely unported and a real render still needs
+the opt-in for it. What changed is that it can no longer switch a ported feature
+off: the loader asserts the flag against the file instead of clearing it, and
+`Ltx2AdoptDeclaredDitParams` clears exactly one flag, for a module nothing
+applies.
+
 ## Now
 
-`ACTIVE` — implementation on `row/LTX25-PROMPT-ADALN`.
+`DONE` — landed on `row/LTX25-PROMPT-ADALN`.
