@@ -34,6 +34,7 @@
 #include <string>
 #include <vector>
 
+#include "support/test_env.h"  // SetEnv/UnsetEnv — MSVC has no setenv (#603)
 #include "vt/backend.h"
 #include "vt/op_provider.h"
 #include "vt/ops.h"
@@ -95,18 +96,6 @@ std::vector<DeviceType> RegisteredDevices() {
 }
 
 bool OpAvailable(vt::OpId op, DeviceType t) { return vt::OpRegistered(op, t); }
-
-void SetTestEnvironment(const char* name, const char* value) {
-#ifdef _WIN32
-  REQUIRE(::_putenv_s(name, value != nullptr ? value : "") == 0);
-#else
-  if (value != nullptr) {
-    REQUIRE(setenv(name, value, 1) == 0);
-  } else {
-    REQUIRE(unsetenv(name) == 0);
-  }
-#endif
-}
 
 // A device-resident f32 buffer with host staging, so one body serves a unified
 // backend (Metal, GB10) and a discrete one identically: every transfer goes
@@ -549,8 +538,8 @@ TEST_CASE("ReshapeAndCache scatters into the KV cache BIT-EXACTLY") {
         t.stride[3] = 1;
         return t;
       };
-      Tensor tsm = Tensor::Contiguous(unbound_slots.data(), DType::kI64, unbound_device,
-                                      {kTokens});
+      Tensor tsm = Tensor::Contiguous(unbound_slots.data(), DType::kI64,
+                                      unbound_device, {kTokens});
       Tensor tkc = slice(0), tvc = slice(1);
       vt::ReshapeAndCache(unbound_queue, tk, tv, tkc, tvc, tsm);
       unbound_cpu.DestroyQueue(unbound_queue);
@@ -1017,7 +1006,7 @@ TEST_CASE("FusedChain matches the CPU oracle within NMSE <= 5e-4 (both tiers)") 
 
   for (int tier : {0, 1}) {
     CAPTURE(tier);
-    SetTestEnvironment("VT_FUSED_TIER", tier == 0 ? "0" : "1");
+    vllm_test::SetEnv("VT_FUSED_TIER", tier == 0 ? "0" : "1");
     // ASSERT the tier actually took effect rather than trusting the log: doctest
     // CAPTURE is lazily stringified, so a mis-set environment would silently
     // run the same path twice and still look like two-tier coverage.
@@ -1061,9 +1050,9 @@ TEST_CASE("FusedChain matches the CPU oracle within NMSE <= 5e-4 (both tiers)") 
   }
 
   if (had_prev) {
-    SetTestEnvironment("VT_FUSED_TIER", saved.c_str());
+    vllm_test::SetEnv("VT_FUSED_TIER", saved);
   } else {
-    SetTestEnvironment("VT_FUSED_TIER", nullptr);
+    vllm_test::UnsetEnv("VT_FUSED_TIER");
   }
 }
 
