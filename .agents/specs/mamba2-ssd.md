@@ -614,39 +614,62 @@ failed out of 437`: `test_serve_low_tools`, `test_linear_method`,
 `test_llama_paged_engine`. Two branches, two builds, the same nine.
 
 The tenth, **`test_minimax_h3` (SEGFAULT at 11.81 s)**, passed on that baseline
-and is the one difference, so it is NOT dismissed. What is established: **no
-model or layer code calls these ops at all** — `grep` for `vt::Mamba2ChunkScan`,
-`vt::Mamba2StateUpdate` and `vt::RmsNormGatedGroup` outside `src/vt/` returns
-`include/vt/ops.h` declarations and the three unit tests, nothing else — so the
-H3 path cannot reach a kernel this brick added, and the only W2 delta it can see
-is three extra registrations in the op table. What is NOT yet established is the
-positive cause.
+and was the one difference, so it was NOT dismissed. It is now **fully
+attributed, and it is not this brick**.
 
-One contention fact IS established, and it invalidates the "idle box" premise
-this run was read under: an unrelated job (`~/work/marlin442`, files touched
-03:14 → 04:20, spanning the whole 03:51-04:44 ctest window) serialises on
-**`/tmp/gpu.lock`, not `$HOME/gpu.lock`** — a different file, so the shared
-mutex did not exclude it and it was on the GPU while this suite ran.
-`test_minimax_h3` loads a ~41 GB model on a box whose memory is UNIFIED, which
-is precisely the documented OOM failure mode. That is a plausible cause, not a
-proven one, and it is recorded as the former.
+It was RE-RUN STANDALONE, serially, under the lock, on a box that had just
+rebooted and was idle (`up 5 min`, load 0.12, no CUDA process resident) — so the
+contention hypothesis this section previously recorded as "plausible, not
+proven" is **REFUTED**: it reproduces with nobody else on the GPU. It is instead
+**#486**, already filed and open: *"test_minimax_h3 is RED on dgx (GB10):
+cudaFree invalid argument + SIGSEGV when two CUDA cases run in one process"*.
+The standalone re-run reproduces that issue's recorded signature exactly, number
+for number:
 
-A standalone serial re-run of all ten is queued and writes
-`~/w2ssd/refail.log`; it is **PENDING on a named external resource** —
-`$HOME/gpu.lock` has been held ~2.3 h by an unrelated benchmark series with
-three jobs ahead of it. That re-run, not this paragraph, settles the
-attribution, and it is owed before the fresh review closes. **`~/w2ssd` on the
-gate host is deliberately left in place for it** (`rm -rf ~/w2ssd` once
-`refail.log` is read).
+- `minimax_h3: the WHOLE t2va path composes end to end` throws
+  `vt cuda: cudaFree: invalid argument` (`test_minimax_h3.cpp:3537`);
+- `minimax_h3: an NVFP4 checkpoint loads into a runnable DiT` then SIGSEGVs
+  (`:3977`);
+- `test cases: 38 | 36 passed | 2 failed | 41 skipped`, `assertions: 42724 |
+  42724 passed | 0 failed` — the identical counts #486 records.
 
-**Update, 06:50 CEST: `dgx.casa` went unreachable** (`No route to host`, ping
-100% loss) while that re-run was still queued, so its state is
-**`REMOTE_UNVERIFIED`** — unknown is neither absence nor success. The box has
-OOM-rebooted before under exactly the unified-memory pressure described above,
-which is suggestive and is *not* offered as proof of anything. Whoever picks
-this up: `~/w2ssd/refail.log` either completed or did not, and re-running
-`~/w2ssd/w2refail.sh` is cheap. Every result recorded above this line was
-captured and read BEFORE the box went away.
+#486 further records that each case passes ALONE and only crashes when the two
+run in one process, i.e. cross-test CUDA state, and that an A/B in another
+agent's tree already proved it was not THEIR change either. Its root cause is
+tracked as **#516** — *"vllm::Pool() free list is keyed by size class with no
+DEVICE in the key: a cudaMalloc'd block can be handed to a CPU DBuf"* — which is
+exactly what `row/pool-device-key` is repairing, and therefore exactly why the
+baseline branch passed a test that main-based branches fail. The difference was
+the baseline carrying a FIX, not this branch carrying a defect.
+
+Two independent lines already pointed the same way and are kept because they
+remain true: **no model or layer code calls these ops at all** — `grep` for
+`vt::Mamba2ChunkScan`, `vt::Mamba2StateUpdate` and `vt::RmsNormGatedGroup`
+outside `src/vt/` returns `include/vt/ops.h` declarations and the three unit
+tests, nothing else — so the H3 path cannot reach a kernel this brick added; and
+the only W2 delta it could see is three extra registrations in the op table.
+
+So **all ten ctest failures are pre-existing and tracked** (#486 / #516 for
+`test_minimax_h3`, #233 for `test_glm4_moe_lite_paged_engine` "plus 4 more
+pre-existing ctest failures", and the same-name baseline for the rest). None is
+attributable to W2. The standalone log is `~/w2ssd/refail.log`.
+
+**A live protocol defect found while doing this, and fixed.** The re-run had
+been relaunched (not by this session) as
+`flock -w 3600 $HOME/gpu.lock ./w2refail.sh` — an OUTER `flock` wrapping a
+script that takes the SAME lock itself on its own fd. `flock` locks an open file
+DESCRIPTION, so the inner acquisition blocks against the outer one held by its
+own parent: a self-deadlock that **held the shared GPU mutex while making no
+progress**, with three other agents' jobs queued behind it. Killed the stack, the
+lock passed straight to a waiter, and the re-run was relaunched with its own
+single acquisition. Anything wrapping a script that already locks must not lock
+again.
+
+**The gate host rebooted TWICE during this window** (08:57 and ~09:30 CEST,
+`up 14 min` then `up 5 min`), which is the documented GB10 unified-memory
+OOM-reboot under multi-agent load, and it killed two queued attempts before the
+third landed. Recorded because it is the environment every measurement on this
+box is taken in, not as an excuse for any result above.
 
 **CI: the two Windows jobs are the `main` BASELINE, not this branch.**
 `windows-msvc-cpu` and `windows-msvc-vulkan` fail on PR #566, and the baseline
