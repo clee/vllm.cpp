@@ -1,4 +1,4 @@
-# Features
+# Features <!-- ENG-RELEASE-WINDOWS: state=ACTIVE publication=pending artifact=unpublished -->
 
 What vllm.cpp supports, next to the engines it is measured against. This page is
 a **keyed table**: one row per feature, kept current. It is not a changelog.
@@ -26,7 +26,8 @@ are our reading of their documented behavior, not measurements.
 | Weight formats | Safetensors + GGUF | Safetensors | Safetensors | GGUF |
 | Correctness gate | token-exact vs vLLM | reference | own | own |
 | Architectures | 37 registered, 27 gated | 130+ | 100+ | 100+ |
-| Downloadable server binaries | ✅ v0.0.2 publishes eight indexed CPU/CUDA/Vulkan/Metal/MLX archives with checksums, provenance records, manifests, and SBOMs | ✅ wheels/containers | ✅ wheels/containers | ✅ host-specific binaries |
+| Downloadable server binaries | ✅ v0.0.2: eight indexed archives with checksums, provenance, manifests, and SBOMs. Windows ZIP downloads do not exist; native CPU/Vulkan lanes await hosted runtime, dry-run, prerelease, and authenticated audit gates | ✅ wheels/containers | ✅ wheels/containers | ✅ host-specific binaries |
+| Native Windows builds | ◐ CPU/Vulkan: `/MT /W4 /WX`, central `NOMINMAX`, UTF-8, aligned allocation, runtime ISA dispatch. Local closure includes the float-domain DeepSeek probe; hosted compile/runtime/release pending | ✅ | ✅ | ✅ |
 
 ## Serving and scheduling
 
@@ -69,11 +70,14 @@ are our reading of their documented behavior, not measurements.
 | Dense W4A16 MLP runs ONE merged `gate_up` Marlin GEMM (vLLM's `MergedColumnParallelLinear` topology) | ✅ `VT_DENSE_MARLIN_GATEUP`, **default ON** (opt out `=0`): the A/B measured +2.12% c1 / +1.70% c8 on the 27B, arms separated, tokens identical (#365). Replaces the split pair's 193 Marlin calls/step vs the oracle's 129 | ✅ | ☐ | ☐ |
 | NVFP4 shared-expert `down_proj` kept bf16 (no f32 round-trip) | ✅ `VT_SHARED_DOWN_BF16` default-ON; bit-identical (both consumers widen bf16 in-kernel and re-round on store), SACRED 315/315 + 235/235 on BOTH arms with unchanged assertion counts; +2.05% c8 / +0.79% c4 on 35B-A3B | ☐ | ☐ | ☐ |
 | NVFP4 `lm_head` kept packed (no dequant at load) | ✅ `VT_LMHEAD_FP4` default-ON, #213; CUDA-gated on `nvidia`@`0893e160` (continuations byte-identical packed vs dequant, 235/235; RSS -1.70 GiB on CUDA, owed a re-measure; a no-fp4-GEMM backend keeps one bf16 operand too) | ✅ | ☐ | ☐ |
-| GGUF k-quants and i-quants | ✅ (CPU grouped keep-quant MoE took a bf16-activation regression in `b4f5610a`; found by bisect and fixed 2026-08-06) | ☐ | ☐ | ✅ |
+| GGUF k-quants and i-quants | ✅ (CPU grouped keep-quant MoE bf16 regression in `b4f5610a` fixed 2026-08-06). **CPU quant compute is ISA-tiered:** Arm has i8mm + repack; x86_64 portable-only, MEASURED open on every axis (CIQ `G5`, #433) | ☐ | ☐ | ✅ |
 | AWQ | ◐ CPU dequant | ✅ | ✅ | ☐ |
 | GPTQ | ◐ CPU dequant | ✅ | ✅ | ☐ |
 | MXFP4 compressed-tensors | ◐ W4A16 Marlin, mem 2.63x less. gate_up FUSION + decode-graph default-ON; #44 3/3, 32B 6/6. **`VT_MARLIN_DENSE` DEFAULT-ON** (`KERNEL-MARLIN-DENSE-EXEC`): dense marlin 48-CTA, byte-faithful, beats MoE (c8 0.969) | ✅ | ✅ | ☐ |
 | fp8 weights | ✅ | ✅ | ✅ | ☐ |
+| fp8-tower GDN `in_proj` emits bf16, unlocking packed GDN decode | ◐ `VT_GDN_FP8_IN_BF16` + `VT_GDN_PACKED_DECODE_FP8_TOWER` (inert alone), both default **OFF**, ungated (#339) ([spec](../.agents/specs/perf-fp8-alpha-fold.md)) | ✅ bf16 `out_dtype` | ☐ | ☐ |
+| Merged fp8 projection folds per-column alpha in the GEMM epilogue | ◐ `VT_FP8_ALPHA_VEC_EPILOGUE`, CUDA only, default off, ungated; refuses split-K under a bf16-D equivalence claim (`claims_splitk1_premise`, default off) | n/a | n/a | n/a |
+| `vt::MulColVecF32` carries a bf16 store width | ✅ f32 arm byte-identical; bf16 arm rounds once; CPU + CUDA | n/a | ☐ | ☐ |
 | bf16 / fp16 | ✅ | ✅ | ✅ | ✅ |
 | Safetensors direct load, no conversion | ✅ | ✅ | ✅ | ☐ |
 | Weights uploaded straight from the file mapping (no host copy first) | ◐ verbatim tensors only (37.8% of 27B BF16); arbitrary-offset reads are defined, including Laguna graph staging. Merged/transposed and merged FP4 weights still copy | ✅ | ✅ | ✅ mmap |
@@ -146,7 +150,7 @@ they sit outside the gated list above.
 
 | Lane | Tested checkpoint(s) | Correctness gate | Speed vs reference |
 |---|---|---|---|
-| Voxtral audio (`VoxtralForConditionalGeneration`) | Voxtral-Mini-3B-2507 | near-tie-robust 16/16 vs vLLM 0.25.0 | decode 0.97x (beats vLLM); encoder TTFT ~17x, pending |
+| Voxtral audio (`VoxtralForConditionalGeneration`) | Voxtral-Mini-3B-2507 | near-tie-robust 16/16 vs vLLM 0.25.0 | decode 0.97x (beats vLLM); encoder FORWARD 15.90x of vLLM's whole TTFT (pin 46.02 ms), or 2.89x with opt-in `VT_WHISPER_ENC_FA2=1` (costs 3 near-tie divergences vs 0). Not a TTFT ratio. Pending |
 | Whisper audio encoder | openai/whisper-small; whisper-large-v3 (Voxtral cfg) | encoder tower 77/77; large-v3 tower 203/203 | pending |
 | MiniMax-H3 DiT (`MiniMaxH3DiTModel`, vllm-omni lane) | MiniMax-H3 (33.1B video+audio) | portable 79/79; all three modalities COHERENT on Q4_K_M (§8.20); PRUNED ckpts run, Q8_0 seam 0.9941 (§8.21); ref2va grid was NVFP4 quant error, §8.9 REFUTED; GGUF/NVFP4/bf16 shards stream | FP4/Marlin landed; speed pending; no bf16 render yet. Render from the Q4_K_M GGUF, not the NVFP4 arm. Krea 2 text-to-image (roadmap C11) is scoped to reuse these DiT seams |
 | LTX-2.5 DiT (`LTX2VideoTransformer3DModel`, Lightricks lane) | LTX-2.5 (21.00B video+audio) | `SPIKE`. DiT, both VAE decoders, both VAE ENCODERS + mel front-end, the conditioning items, the pipeline and the quantized loaders gated vs upstream at reduced dims: max\|diff\| 1.2e-07 DiT, 1.8e-06 VAE decode, 6.0e-07 VAE encode, 2.8e-06 pipeline. STRUCTURAL e2e only | Fits ONE GB10 at ~29 GB NVFP4. FP8 + torchao-NVFP4 arms load. CPU f32, CUDA bf16 device-resident. Text tower, DiffVAE, LoRA, image conditioning all still refused AT THE ENGINE. FP4-resident arm OWED. Speed PENDING |
@@ -163,6 +167,7 @@ Enumerated in `.agents/model-matrix.md`, not registered, no runnable GB10 gate:
 | `DeepseekV3ForCausalLM`, `DeepseekV32ForCausalLM` | DeepSeek-V3 / V3.2 | 671B, ~642 GiB fp8 vs 119 GiB unified; V3.2 also DSA-indexer dep-blocked |
 | `GlmMoeDsaForCausalLM` | GLM-5 (DSA) | ~1404 GiB bf16; dep-blocked (GLM-5.x is DeepSeek-V3.2 verbatim) |
 | `MiniMaxM2ForCausalLM` | MiniMax-M2 | ~230B, ~428 GiB bf16, ~4x over the unified pool |
+| `NemotronHForCausalLM` | Nemotron-H / Nemotron-3.5-Lightning-30B-A3B | capability-blocked, not HW-blocked (20.1 GiB fits the pool): Mamba2 SSD unported ([#496](https://github.com/mudler/vllm.cpp/issues/496)), MoE and loader owed; spec [#517](https://github.com/mudler/vllm.cpp/issues/517) |
 
 27 of the 31 registered text-generation architectures carry a passing
 correctness gate today; the rest are honestly marked scaffold or blocked above.
@@ -200,7 +205,7 @@ HTTP are not started.
 | EAGLE / EAGLE3 | ☐ | ✅ | ✅ |
 | DFlash block diffusion | ✅ 2.9x over spec-off, at/above vLLM DFlash-on | ✅ | ☐ |
 | n-gram / prompt lookup | ✅ 27B 5/5 strict vs vLLM | ✅ | ✅ |
-| DSpark (semi-autoregressive block drafter) | ◐ **works on the 35B gate model** ([spec](../.agents/specs/dspark-spec-decode.md)): spec-on output token-identical to spec-off, 48/48, reproducible; speed ~2% behind spec-off, so no speed claim | ✅ | ◐ |
+| DSpark (semi-autoregressive block drafter) | ◐ **both gate models** ([spec](../.agents/specs/dspark-spec-decode.md)): token-identical to spec-off; the T=1+k verify is CAPTURED. MoE **0.975x-1.012x** of the pinned oracle; residual is the Marlin MoE kernel | ✅ | ◐ |
 | Other methods (ngram-gpu, suffix, custom-class, dynamic-k, mlp-speculator) | ☐ inventoried | ✅ | ◐ |
 
 ## Structured output and tool calling
@@ -225,7 +230,7 @@ HTTP are not started.
 | CPU (x86, Arm i8mm; A76 assembly correct/default, llama speed gate open) | ✅ | ◐ | ☐ | ✅ |
 | Metal (Apple Silicon) | ✅ | ☐ | ☐ | ✅ |
 | Vulkan | ◐ | ☐ | ☐ | ✅ |
-| ROCm | W0-W1 verified on 5 gfx archs; classic-dense AND GDN-hybrid e2e run all-native (strict CPU parity not met: near-tie regime, #269; GDN divergence characterization open) | Backend + platform + #140 ops + full GDN op set; ctest-green gfx1151/1103/1100/1201/1200 ([#41](https://github.com/mudler/vllm.cpp/issues/41)). APU UnifiedMemory fix verified. [ROCM.md](ROCM.md) | ✅ | ✅ |
+| ROCm | W0 verified on 5 gfx archs; dense and GDN models run all-native. Strict CPU parity is open in the measured near-tie regime (#269) | 44 registered ops including full GDN; ctest-green gfx1151/1103/1100/1201/1200 ([#41](https://github.com/mudler/vllm.cpp/issues/41)). APU managed allocation is unverified. [ROCM.md](ROCM.md) | ✅ | ✅ |
 | XPU / TPU | ☐ | ✅ | ◐ | ☐ |
 | Tenstorrent Blackhole | ◐ `ACTIVE`, OPT-125m STRICT 6/6 e2e; Qwen3-0.6B gate wired with device goldens. Full 16x16 rerun and residual-RMS numerics at the rows≥32 device boundary both owed ([spec](../.agents/specs/tenstorrent-backend.md)) | ✅ | ☐ | ☐ |
 
@@ -313,7 +318,7 @@ CPU elementwise GEMM (f32/f16/bf16) runs AVX2 and AVX-512 tiers on x86 where the
 | LoRA end to end | CPU brick landed | Unwired standalone; not usable through the server |
 | Multimodal over HTTP | Image request path wired; forward + codec pending | `ROAD-V1-MM` W1-W3 landed (`server_main.cpp:826`). Open: no mm-forward consuming `Request.mm_features`; no image codec vendored (raw RGB only); video/audio/multi-image not started |
 | Reranking / classify models | Engine side only | Embeddings are LIVE (`LlamaModel`, `vllm_embed`, `/v1/embeddings`); the classify/score heads are landed ops with no registered arch |
-| ROCm | W0-W1 community-verified on 5 gfx archs; classic-dense e2e runs all-native (near-tie regime, #269); GDN-hybrid blocked on remaining GDN kernels | Backend + platform + #140 ops + GDN state/conv/postconv/recurrence, ctest-green gfx1151/1103/1100/1201/1200 ([#41](https://github.com/mudler/vllm.cpp/issues/41)). APU UnifiedMemory fix verified. [ROCM.md](ROCM.md) |
+| ROCm | W0 community-verified on 5 gfx archs; classic-dense and GDN-hybrid e2e run all-native; correctness gaps remain | 44 registered ops including the GDN state/conv/postconv/recurrence set; APU managed-allocation branch remains unverified. [ROCM.md](ROCM.md) |
 | XPU, TPU | Not started | CUDA, CPU, Metal and Vulkan are the built backends |
 | Custom logits processors on CUDA | Open, not root-caused | Segfaults in a CUDA build, 232/232 green on CPU |
 | Memory budgeting (`ROAD-V1-MEM`, #83) | M1+M2 landed (absolute bytes) | `--kv-cache-memory` sizes the KV pool from an absolute byte budget (ABI v16, group-aware divisor); `--num-blocks` overrides; `--gpu-memory-utilization` needs the M3 profile run (dgx-gated). See `specs/kv-sizing.md` |

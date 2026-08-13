@@ -1119,7 +1119,11 @@ std::optional<ModelRunnerOutput> GPUModelRunner::execute_model(
 
   // Flattened dense-order forward inputs (positions int64 -> int32 for RoPE).
   const std::vector<int32_t>& token_ids = step.input_token_ids;
-  std::vector<int32_t> positions(step.positions.begin(), step.positions.end());
+  std::vector<int32_t> positions;
+  positions.reserve(step.positions.size());
+  for (const int64_t position : step.positions) {
+    positions.push_back(static_cast<int32_t>(position));
+  }
 
   // THE FORWARD (Task 3, over the persistent KV caches). Returns f32 logits
   // (lm_head already applied): [num_reqs, vocab] when the gather-before-lm_head
@@ -1178,6 +1182,11 @@ std::optional<ModelRunnerOutput> GPUModelRunner::execute_model(
       .num_reqs = num_reqs,
       .gdn_state_slots = gdn_state_slots_,
       .pure_decode = pure_decode,
+      // SPEC-DSPARK W8 (#442): the decode-graph gate mirrors vLLM's UNIFORM
+      // decode predicate, whose captured length is 1 + num_speculative_tokens
+      // (cudagraph_dispatcher.py:37). 0 when speculation is off, which makes
+      // the predicate reduce to today's pure-decode shape.
+      .num_speculative_tokens = num_spec(),
       .gather_logits = gather,
       // SPEC-MTP I5d: capture the target's post-final-norm [T,H] hidden for the
       // MTP drafter. Non-null only when a speculator is configured — the Qwen3.5
