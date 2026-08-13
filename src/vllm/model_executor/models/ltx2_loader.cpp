@@ -197,10 +197,76 @@ void Ltx2UnswizzleNvfp4BlockScale(const uint8_t* swizzled, size_t swizzled_bytes
   }
 }
 
-void Ltx2DequantTorchaoNvfp4ToBf16(const std::string& module, const StTensor& packed,
-                                   const StTensor& scale, const StTensor& scale_2,
-                                   int64_t out_features, int64_t in_features,
-                                   uint16_t* out_bf16) {
+std::vector<int64_t> Ltx2Nvfp4ToBlockedScaleShape(int64_t out_features,
+                                                  int64_t in_features) {
+  const int64_t groups = in_features / kNvfp4GroupSize;
+  return {RoundUp(out_features, 128) / 4, RoundUp(groups, 4) * 4};
+}
+
+std::vector<int64_t> Ltx2Nvfp4PaddedScaleShape(int64_t out_features,
+                                               int64_t in_features) {
+  const int64_t groups = in_features / kNvfp4GroupSize;
+  return {RoundUp(out_features, 128), RoundUp(groups, 4)};
+}
+
+Nvfp4NibbleOrder Ltx2Nvfp4NibbleOrderFor(Ltx2Nvfp4Producer producer) {
+  return producer == Ltx2Nvfp4Producer::kTorchao ? Nvfp4NibbleOrder::kLowFirst
+                                                 : Nvfp4NibbleOrder::kHighFirst;
+}
+
+Ltx2Nvfp4Producer Ltx2ResolveNvfp4Producer(const std::string& module,
+                                           const Ltx2TorchaoNvfp4Marker* marker,
+                                           const std::vector<int64_t>& scale_shape,
+                                           int64_t out_features, int64_t in_features) {
+  if (in_features % kNvfp4GroupSize != 0) {
+    Fail("'" + module + "': in_features " + std::to_string(in_features) +
+         " is not a multiple of the group size " + std::to_string(kNvfp4GroupSize));
+  }
+  const std::vector<int64_t> blocked = Ltx2Nvfp4ToBlockedScaleShape(out_features, in_features);
+  const std::vector<int64_t> padded = Ltx2Nvfp4PaddedScaleShape(out_features, in_features);
+  const bool is_blocked = scale_shape == blocked;
+  const bool is_padded = scale_shape == padded;
+
+  // The MARKER decides; the shape only corroborates. A disagreement is refused
+  // rather than resolved in either direction, because both readings type-check
+  // and one of them permutes every scale in a 128x4 tile.
+  if (marker != nullptr) {
+    if (is_blocked) return Ltx2Nvfp4Producer::kTorchao;
+    Fail("'" + module + ".weight_scale' is " + ShapeText(scale_shape) +
+         " but the module carries a torchao_nvfp4 marker, and a torchao swizzled scale "
+         "for [" + std::to_string(out_features) + ", " + std::to_string(in_features) +
+         "] is stored " + ShapeText(blocked) +
+         (is_padded ? ". It is instead the cuBLAS-PADDED framing " + ShapeText(padded) +
+                          ", which is what the Lightricks nvfp4-prequant tool writes -- and that "
+                          "producer also packs the OPPOSITE nibble order. The marker says "
+                          "torchao and the shape says nvfp4-prequant; refusing rather "
+                          "than picking one, because each reading is finite and wrong "
+                          "under the assumption of the other."
+                    : ". The declaration and the stored shape disagree.") +
+         " See .agents/specs/nvfp4-nibble-order.md section 3.2.");
+  }
+
+  // No marker anywhere for this module. torchao ALWAYS writes one, so its absence
+  // excludes torchao — the inference ltx2_loader.h records, with its evidence.
+  if (is_padded) return Ltx2Nvfp4Producer::kNvfp4Prequant;
+  Fail("'" + module + ".weight_scale' is " + ShapeText(scale_shape) +
+       " and the module carries NO torchao_nvfp4 marker. Without a marker this port "
+       "reads the Lightricks nvfp4-prequant layout, whose swizzled scale for [" +
+       std::to_string(out_features) + ", " + std::to_string(in_features) +
+       "] is stored " + ShapeText(padded) +
+       (is_blocked ? " -- but this is the torchao to_blocked framing " + ShapeText(blocked) +
+                         ", and a torchao file without its marker is a combination this "
+                         "port does not recognise. The two producers pack DIFFERENT "
+                         "nibble orders, so guessing picks a byte encoding as well as a "
+                         "layout."
+                   : ", which this is not.") +
+       " Refusing by name. See .agents/specs/nvfp4-nibble-order.md section 3.2.");
+}
+
+void Ltx2DequantNvfp4ToBf16(const std::string& module, const StTensor& packed,
+                            const StTensor& scale, const StTensor& scale_2,
+                            int64_t out_features, int64_t in_features,
+                            Ltx2Nvfp4Producer producer, uint16_t* out_bf16) {
   if (packed.dtype != "U8") {
     Fail("'" + module + ".weight' must be U8 (two E2M1 values per byte), not " +
          packed.dtype);
@@ -228,41 +294,44 @@ void Ltx2DequantTorchaoNvfp4ToBf16(const std::string& module, const StTensor& pa
     Fail("'" + module + ".weight_scale' must be F8_E4M3, not " + scale.dtype);
   }
   const int64_t groups = in_features / kNvfp4GroupSize;
-  const int64_t padded_rows = RoundUp(out_features, 128);
-  const int64_t padded_cols = RoundUp(groups, 4);
-  const std::vector<int64_t> want_shape = {padded_rows / 4, padded_cols * 4};
+  // The shape the RESOLVED producer stores. Both framings dress the same buffer,
+  // so this asserts the caller's resolution against the file rather than
+  // re-deciding it: a caller that resolved torchao and hands a padded-framing
+  // scale is refused here even though the bytes would unswizzle identically,
+  // because it would then decode them with the wrong NIBBLE ORDER.
+  const std::vector<int64_t> want_shape =
+      producer == Ltx2Nvfp4Producer::kTorchao
+          ? Ltx2Nvfp4ToBlockedScaleShape(out_features, in_features)
+          : Ltx2Nvfp4PaddedScaleShape(out_features, in_features);
   if (scale.shape != want_shape) {
-    // NAME WHAT WAS SEEN, and attribute "torchao" to what this port READS rather
-    // than to the file. The first-party `Lightricks/LTX-2.5` NVFP4 DiT lands
-    // here, and it carries no `.torchao_nvfp4` marker at all — so a message
-    // saying its scale is not "a SWIZZLED torchao scale" described the file as a
-    // broken torchao checkpoint when it is simply a different, valid layout this
-    // port does not read yet. That sends a reader looking for corruption instead
-    // of for the missing loader arm.
-    const std::vector<int64_t> linear_shape = {out_features, groups};
-    const bool is_linear = scale.shape == linear_shape;
+    const std::vector<int64_t> other =
+        producer == Ltx2Nvfp4Producer::kTorchao
+            ? Ltx2Nvfp4PaddedScaleShape(out_features, in_features)
+            : Ltx2Nvfp4ToBlockedScaleShape(out_features, in_features);
     Fail("'" + module + ".weight_scale' is " + scale.dtype + " " + ShapeText(scale.shape) +
-         (is_linear ? ", which is exactly the LINEAR [N, K/16] group-scale layout" : "") +
-         ". This port reads the SWIZZLED torchao layout, which for [" +
-         std::to_string(out_features) + ", " + std::to_string(in_features) + "] is stored as " +
-         ShapeText(want_shape) + ". " +
-         (is_linear ? std::string("The two have the same element count, so reading this one as "
-                                  "swizzled type-checks and permutes every scale within a "
-                                  "128x4 tile. Reading the LINEAR layout is owed loader work; "
-                                  "refusing rather than silently permuting.")
-                    : "The LINEAR shape " + ShapeText(linear_shape) +
-                          " has the same element count, so reading one as the other "
-                          "type-checks and permutes every scale within a 128x4 tile."));
+         ", but this module resolved to the " +
+         (producer == Ltx2Nvfp4Producer::kTorchao ? "torchao" : "nvfp4-prequant") +
+         " producer, whose swizzled group scale for [" + std::to_string(out_features) +
+         ", " + std::to_string(in_features) + "] is stored " + ShapeText(want_shape) +
+         ". The other producer framing would be " + ShapeText(other) +
+         "; both have the same element count, so reading one as the other type-checks "
+         "and — because the two producers also pack OPPOSITE nibble orders — decodes "
+         "every weight pair transposed. See .agents/specs/nvfp4-nibble-order.md.");
   }
   const float global = ReadScalarF32(module + ".weight_scale_2", scale_2);
 
+  // ONE permutation, both framings. `Ltx2UnswizzleNvfp4BlockScale` keys off the
+  // LOGICAL rows/cols and the byte count, which are identical either way, so
+  // nothing about the swizzle inverse is producer-specific.
   std::vector<uint8_t> linear(static_cast<size_t>(out_features) *
                               static_cast<size_t>(groups));
   Ltx2UnswizzleNvfp4BlockScale(static_cast<const uint8_t*>(scale.data), scale.nbytes,
                                out_features, groups, linear.data());
-  // From here the path is the EXISTING modelopt one, byte for byte.
+  // From here the path is the EXISTING modelopt one, byte for byte, except for the
+  // producer's nibble order.
   DequantNvfp4ToBf16(static_cast<const uint8_t*>(packed.data), linear.data(), global,
-                     out_features, in_features, out_bf16);
+                     out_features, in_features, out_bf16,
+                     Ltx2Nvfp4NibbleOrderFor(producer));
 }
 
 // ---------------------------------------------------------------------------
@@ -281,6 +350,10 @@ struct DitPlan {
   std::map<std::string, std::vector<int64_t>> logical;
   std::vector<Ltx2TensorSpec> manifest;
   std::vector<std::string> unported;  // module families, header order, deduped
+  // module (bare) -> the `<module>.torchao_nvfp4` FILE name, for every module that
+  // declares one. Absent from this map means the file carries NO marker for that
+  // module, which is what `Ltx2ResolveNvfp4Producer` reads as "not torchao".
+  std::map<std::string, std::string> marker_name;
 };
 
 bool IsScaleSidecar(const std::string& bare) {
@@ -308,8 +381,12 @@ DitPlan PlanDit(const SafetensorsFile& file) {
   plan.prefix = prefixed != 0 ? prefix : std::string();
 
   bool saw_u8 = false, saw_f8 = false;
+  const std::string marker_suffix = kLtx2TorchaoNvfp4MarkerSuffix;
   for (const std::string& n : names) {
     const std::string bare = n.substr(plan.prefix.size());
+    if (EndsWith(bare, marker_suffix)) {
+      plan.marker_name[bare.substr(0, bare.size() - marker_suffix.size())] = n;
+    }
     if (IsScaleSidecar(bare)) continue;
     const StTensor& t = file.Get(n);
     std::vector<int64_t> shape = t.shape;
@@ -398,14 +475,24 @@ vt::DType MaterializeDitTensor(const SafetensorsFile& file, const DitPlan& plan,
     const StTensor& scale = file.Get(fname + "_scale");
     const StTensor& global = file.Get(fname + "_scale_2");
     buffer.resize(static_cast<size_t>(numel) * sizeof(uint16_t));
-    // Ltx2DequantTorchaoNvfp4ToBf16 takes a MODULE prefix and appends `.weight`,
+    // Ltx2DequantNvfp4ToBf16 takes a MODULE prefix and appends `.weight`,
     // `.weight_scale` and `.weight_scale_2` itself. `spec.name` is already the
     // full tensor name, so passing it produced 'patchify_proj.weight.weight' —
     // a name that appears nowhere in the checkpoint, which defeats the whole
     // point of refusing BY NAME. Strip the suffix the callee will re-add.
-    Ltx2DequantTorchaoNvfp4ToBf16(ModulePrefixOfWeight(spec.name), t, scale, global,
-                                  spec.shape[0], spec.shape[1],
-                                  reinterpret_cast<uint16_t*>(buffer.data()));
+    const std::string module = ModulePrefixOfWeight(spec.name);
+    // Which producer wrote this file decides BOTH the scale framing and the nibble
+    // order, and it is resolved from the marker the file does or does not carry.
+    const auto marker_it = plan.marker_name.find(module);
+    Ltx2TorchaoNvfp4Marker marker;
+    const bool has_marker = marker_it != plan.marker_name.end();
+    if (has_marker) {
+      marker = ParseLtx2TorchaoNvfp4Marker(module, file.Get(marker_it->second));
+    }
+    const Ltx2Nvfp4Producer producer = Ltx2ResolveNvfp4Producer(
+        module, has_marker ? &marker : nullptr, scale.shape, spec.shape[0], spec.shape[1]);
+    Ltx2DequantNvfp4ToBf16(module, t, scale, global, spec.shape[0], spec.shape[1],
+                           producer, reinterpret_cast<uint16_t*>(buffer.data()));
     return vt::DType::kBF16;
   }
   Fail("'" + spec.name + "' has dtype " + t.dtype + ", which this loader does not read");
@@ -602,10 +689,19 @@ Ltx2TextProjection LoadProjection(const SafetensorsFile& file, const std::string
   const StTensor* g = Find(file, module + ".weight_scale_2");
   if (s == nullptr) Fail("the text encoder is missing '" + module + ".weight_scale'");
   if (g == nullptr) Fail("the text encoder is missing '" + module + ".weight_scale_2'");
+  // Resolved, not assumed — even though this file is torchao and its marker is
+  // present. Hard-coding kTorchao here would make the projections the one NVFP4
+  // path in the loader that cannot notice a producer change.
+  const StTensor* m = Find(file, module + kLtx2TorchaoNvfp4MarkerSuffix);
+  Ltx2TorchaoNvfp4Marker marker;
+  if (m != nullptr) marker = ParseLtx2TorchaoNvfp4Marker(module, *m);
+  const Ltx2Nvfp4Producer producer = Ltx2ResolveNvfp4Producer(
+      module, m != nullptr ? &marker : nullptr, s->shape, proj.out_features,
+      proj.in_features);
   proj.weight_bf16.resize(static_cast<size_t>(proj.out_features) *
                           static_cast<size_t>(proj.in_features));
-  Ltx2DequantTorchaoNvfp4ToBf16(module, *w, *s, *g, proj.out_features, proj.in_features,
-                                proj.weight_bf16.data());
+  Ltx2DequantNvfp4ToBf16(module, *w, *s, *g, proj.out_features, proj.in_features,
+                         producer, proj.weight_bf16.data());
 
   const StTensor* b = Find(file, module + ".bias");
   if (b != nullptr) {
@@ -664,7 +760,7 @@ Ltx2TextEncoderCheckpoint Ltx2LoadTextEncoderFromSafetensors(
     if (!EndsWith(name, marker_suffix)) continue;
     const std::string module = name.substr(0, name.size() - marker_suffix.size());
     out.quantized_modules.push_back(module);
-    ParseLtx2TorchaoNvfp4Marker(module, file.Get(name));
+    const Ltx2TorchaoNvfp4Marker parsed = ParseLtx2TorchaoNvfp4Marker(module, file.Get(name));
 
     const StTensor* w = Find(file, module + ".weight");
     const StTensor* s = Find(file, module + ".weight_scale");
@@ -688,13 +784,15 @@ Ltx2TextEncoderCheckpoint Ltx2LoadTextEncoderFromSafetensors(
       Fail("'" + module + "' unpacks to in_features " + std::to_string(in_features) +
            ", not a multiple of " + std::to_string(kNvfp4GroupSize));
     }
-    const std::vector<int64_t> want = {RoundUp(out_features, 128) / 4,
-                                       RoundUp(in_features / kNvfp4GroupSize, 4) * 4};
-    if (s->dtype != "F8_E4M3" || s->shape != want) {
-      Fail("'" + module + ".weight_scale' is " + s->dtype + " " + ShapeText(s->shape) +
-           " but a swizzled torchao scale for [" + std::to_string(out_features) + ", " +
-           std::to_string(in_features) + "] is F8_E4M3 " + ShapeText(want));
+    if (s->dtype != "F8_E4M3") {
+      Fail("'" + module + ".weight_scale' is " + s->dtype +
+           ", and an NVFP4 group scale is F8_E4M3");
     }
+    // Every module in this loop carries a marker (the loop is keyed on them), so
+    // this validates the torchao framing — through the SAME resolver the
+    // materializing paths use, so a validation pass cannot accept a shape the
+    // load would then refuse.
+    (void)Ltx2ResolveNvfp4Producer(module, &parsed, s->shape, out_features, in_features);
     if (g->dtype != "F32") {
       Fail("'" + module + ".weight_scale_2' must be F32, not " + g->dtype);
     }

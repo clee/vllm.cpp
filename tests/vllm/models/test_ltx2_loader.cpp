@@ -25,6 +25,7 @@
 // than papered over with a fabricated manifest.
 #include <unistd.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -45,6 +46,7 @@
 #include "support/max_abs_diff.h"
 
 #include "ltx2_fp8_dit_manifest.inc"
+#include "ltx2_nvfp4_dit_manifest.inc"
 #include "ltx2_nvfp4_te_manifest.inc"
 #include "ltx2_quant_goldens.inc"
 
@@ -345,12 +347,19 @@ SyntheticDit BuildSyntheticDit(const Ltx2DitParams& p, Ltx2DitQuant quant,
               lin[static_cast<size_t>(r * pcols + g)];
         }
       }
+      // The synthetic NVFP4 DiT mirrors the SHIPPED one, which is Lightricks'
+      // nvfp4-prequant: no torchao marker, the cuBLAS-PADDED scale framing, and
+      // HIGH-nibble-first packing. It used to declare the to_blocked framing with
+      // no marker — a combination NEITHER producer emits, which the discriminator
+      // now refuses by name. That refusal is correct and this fixture was the
+      // thing that was wrong: a synthetic file has to be a file some real producer
+      // could have written, or it gates a shape nothing ships.
       std::vector<uint16_t> want(static_cast<size_t>(rows * cols));
       vllm::DequantNvfp4ToBf16(packed.data(), lin_live.data(), scale2, rows, cols,
-                               want.data());
+                               want.data(), vllm::Nvfp4NibbleOrder::kHighFirst);
       out.entries.push_back({pre + spec.name, "U8", {rows, cols / 2}, PackBytes(packed)});
-      out.entries.push_back({pre + spec.name + "_scale", "F8_E4M3",
-                             {prows / 4, pcols * 4}, PackBytes(sw)});
+      out.entries.push_back({pre + spec.name + "_scale", "F8_E4M3", {prows, pcols},
+                             PackBytes(sw)});
       out.entries.push_back({pre + spec.name + "_scale_2", "F32", {},
                              std::string(reinterpret_cast<const char*>(&scale2), 4)});
       out.expected[spec.name] = want;
@@ -652,8 +661,8 @@ TEST_CASE("ltx2 loader: a torchao module built from the shipped bytes dequantize
   g.nbytes = sizeof(float);
 
   std::vector<uint16_t> bf16(static_cast<size_t>(out_features * in_features), 0);
-  vllm::Ltx2DequantTorchaoNvfp4ToBf16("video_aggregate_embed", w, s, g, out_features,
-                                      in_features, bf16.data());
+  vllm::Ltx2DequantNvfp4ToBf16("video_aggregate_embed", w, s, g, out_features, in_features,
+                              vllm::Ltx2Nvfp4Producer::kTorchao, bf16.data());
   const size_t head = static_cast<size_t>(vllm_test::kLtx2RealTeWeightHeadF32Count);
   std::vector<float> got(head, 0.0F);
   for (size_t i = 0; i < head; ++i) got[i] = Bf16ToF32(bf16[i]);
@@ -675,8 +684,8 @@ TEST_CASE("ltx2 loader: a torchao module built from the shipped bytes dequantize
   vllm::StTensor w1 = w;
   w1.data = ones.data();
   std::vector<uint16_t> probe(bf16.size(), 0);
-  vllm::Ltx2DequantTorchaoNvfp4ToBf16("video_aggregate_embed", w1, s, g, out_features,
-                                      in_features, probe.data());
+  vllm::Ltx2DequantNvfp4ToBf16("video_aggregate_embed", w1, s, g, out_features, in_features,
+                              vllm::Ltx2Nvfp4Producer::kTorchao, probe.data());
   const size_t probe_n = static_cast<size_t>(out_features) * static_cast<size_t>(in_features);
   std::vector<float> probe_got(probe_n, 0.0F);
   std::vector<float> probe_want(probe_n, 0.0F);
@@ -697,8 +706,9 @@ TEST_CASE("ltx2 loader: a torchao module built from the shipped bytes dequantize
   // [out, in/16] type-checks on element count. It must not be accepted.
   vllm::StTensor bad = s;
   bad.shape = {out_features, in_features / 16};
-  CHECK_THROWS(vllm::Ltx2DequantTorchaoNvfp4ToBf16("video_aggregate_embed", w, bad, g,
-                                                   out_features, in_features, bf16.data()));
+  CHECK_THROWS(vllm::Ltx2DequantNvfp4ToBf16("video_aggregate_embed", w, bad, g, out_features,
+                                            in_features, vllm::Ltx2Nvfp4Producer::kTorchao,
+                                            bf16.data()));
 
   // The PACKED-WIDTH refusal has to say something a reader can act on. Naming
   // the stored shape on both sides of "is X but the module is X" is a
@@ -706,8 +716,9 @@ TEST_CASE("ltx2 loader: a torchao module built from the shipped bytes dequantize
   // stored shape implies.
   std::string width_what;
   try {
-    vllm::Ltx2DequantTorchaoNvfp4ToBf16("video_aggregate_embed", w, s, g, out_features,
-                                        in_features / 2, bf16.data());
+    vllm::Ltx2DequantNvfp4ToBf16("video_aggregate_embed", w, s, g, out_features,
+                                  in_features / 2, vllm::Ltx2Nvfp4Producer::kTorchao,
+                                  bf16.data());
   } catch (const std::exception& e) {
     width_what = e.what();
   }
@@ -732,16 +743,20 @@ TEST_CASE("ltx2 loader: the NVFP4 refusal names a tensor the checkpoint ACTUALLY
   const std::string scale_name = pre + "patchify_proj.weight_scale";
 
   // Corrupt ONLY the stored SHAPE of one scale sidecar: the same 512 bytes
-  // declared as the PADDED-LINEAR [128, 4] rather than the swizzled [32, 16].
-  // Same element count, so the safetensors reader accepts it and the refusal
-  // fires inside the torchao helper, which is the call site under test.
+  // declared in the torchao `to_blocked` framing [32, 16] rather than the
+  // cuBLAS-padded [128, 4] this (marker-less) file actually uses. Same element
+  // count, so the safetensors reader accepts it and the refusal fires in the
+  // producer resolver, which is the call site under test. It is also a REAL
+  // disagreement rather than a nonsense shape: [32, 16] is exactly what a torchao
+  // file of this geometry would store, so nothing but the missing marker says it
+  // is wrong.
   std::set<std::string> present;
   bool patched = false;
   for (StEntry& e : syn.entries) {
     present.insert(e.name);
     if (e.name == scale_name) {
-      REQUIRE(e.shape == std::vector<int64_t>{32, 16});
-      e.shape = {128, 4};
+      REQUIRE(e.shape == std::vector<int64_t>{128, 4});
+      e.shape = {32, 16};
       patched = true;
     }
   }
@@ -995,6 +1010,399 @@ TEST_CASE("ltx2 loader: the shipped torchao text encoder's widths are the LOGICA
     const std::string asset_msg = std::string("asset ") + asset;
     INFO(asset_msg);
     CHECK(FindTe(asset) != nullptr);
+  }
+}
+
+// ===========================================================================
+// 5b. The FIRST-PARTY NVFP4 DiT, held against the FP8 DiT as an ORACLE
+//
+// .agents/specs/nvfp4-nibble-order.md section 5.2. The two shipped DiTs quantize
+// the SAME base weights, so the FP8 file is an independent oracle for the NVFP4
+// read — which matters because NOTHING else here can tell a correct dequant from
+// a plausible wrong one. A wrong nibble order or a wrong scale indexing produces
+// finite, correctly shaped, correctly scaled garbage.
+//
+// The CONTROL arm is what makes this a gate rather than a witness: the same NVFP4
+// read is also correlated against a DIFFERENT module's FP8 weights, and that must
+// COLLAPSE. Without it, a fixture that passes on any two finite arrays would look
+// exactly like a fixture that works (spec ltx-2-5.md section 7.0(c)).
+// ===========================================================================
+
+namespace {
+
+// Pearson correlation. Non-finite on either side is a FAILURE, never a 0 — the
+// same polarity issue #449 hardened MaxAbsDiff for.
+double Correlation(const std::vector<float>& a, const float* b, size_t n) {
+  REQUIRE(a.size() == n);
+  REQUIRE(n > 1);
+  const vllm_test::MaxAbsDiffScanResult scan = vllm_test::MaxAbsDiffScan(a.data(), b, n);
+  if (!scan.ok()) {
+    FAIL_CHECK("correlation: NON-FINITE operand at index "
+               << scan.bad_index << " (got = " << scan.bad_got
+               << ", want = " << scan.bad_want << ")");
+    return std::numeric_limits<double>::quiet_NaN();
+  }
+  double ma = 0.0, mb = 0.0;
+  for (size_t i = 0; i < n; ++i) {
+    ma += static_cast<double>(a[i]);
+    mb += static_cast<double>(b[i]);
+  }
+  ma /= static_cast<double>(n);
+  mb /= static_cast<double>(n);
+  double num = 0.0, da = 0.0, db = 0.0;
+  for (size_t i = 0; i < n; ++i) {
+    const double x = static_cast<double>(a[i]) - ma;
+    const double y = static_cast<double>(b[i]) - mb;
+    num += x * y;
+    da += x * x;
+    db += y * y;
+  }
+  REQUIRE(da > 0.0);
+  REQUIRE(db > 0.0);
+  return num / std::sqrt(da * db);
+}
+
+double RelRms(const std::vector<float>& a, const float* b, size_t n) {
+  double num = 0.0, den = 0.0;
+  for (size_t i = 0; i < n; ++i) {
+    const double d = static_cast<double>(a[i]) - static_cast<double>(b[i]);
+    num += d * d;
+    den += static_cast<double>(b[i]) * static_cast<double>(b[i]);
+  }
+  REQUIRE(den > 0.0);
+  return std::sqrt(num / den);
+}
+
+// Unswizzle the real [128, 16] scale tile and decode the committed real rows.
+// `order` is the thing under test: both arms are exercised by the gate below, so
+// the "wrong" one is not hypothetical.
+std::vector<float> DequantRealNvfp4RowsWith(vllm::Nvfp4NibbleOrder order) {
+  const int64_t rows = vllm_test::kLtx2RealDitNvfp4ScaleTileRows;
+  const int64_t cols = vllm_test::kLtx2RealDitNvfp4ScaleTileCols;
+  const int64_t elems = vllm_test::kLtx2RealDitNvfp4RowElems;
+  const int64_t nrows = vllm_test::kLtx2RealDitNvfp4RowCount;
+  REQUIRE(vllm_test::kLtx2RealDitNvfp4ScaleTileCount == rows * cols);
+  REQUIRE(vllm_test::kLtx2RealDitNvfp4PackedCount == nrows * elems / 2);
+  REQUIRE(cols == elems / 16);
+
+  // The REAL unswizzle, on the REAL bytes.
+  std::vector<uint8_t> linear(static_cast<size_t>(rows * cols), 0);
+  vllm::Ltx2UnswizzleNvfp4BlockScale(vllm_test::kLtx2RealDitNvfp4ScaleTile,
+                                     static_cast<size_t>(rows * cols), rows, cols,
+                                     linear.data());
+
+  std::vector<float> got;
+  got.reserve(static_cast<size_t>(nrows * elems));
+  for (int64_t i = 0; i < nrows; ++i) {
+    const int64_t row = vllm_test::kLtx2RealDitNvfp4Rows[i];
+    std::vector<uint16_t> bf16(static_cast<size_t>(elems), 0);
+    vllm::DequantNvfp4ToBf16(
+        vllm_test::kLtx2RealDitNvfp4Packed + static_cast<size_t>(i * elems / 2),
+        linear.data() + static_cast<size_t>(row * cols),
+        vllm_test::kLtx2RealDitNvfp4Scale2, 1, elems, bf16.data(), order);
+    for (int64_t j = 0; j < elems; ++j) {
+      got.push_back(Bf16ToF32(bf16[static_cast<size_t>(j)]));
+    }
+  }
+  return got;
+}
+
+// RESOLVE the producer from the artifact's own marker state and declared shape,
+// then decode with the order that producer implies.
+//
+// The resolver is INSIDE this helper deliberately. If it ever returned kTorchao
+// for this file the nibble order would flip, the correlation would collapse, and
+// the gate below would fail — which is what ties "the discriminator is right" to
+// "the numbers are right" instead of testing them as two unrelated facts.
+std::vector<float> DequantRealNvfp4Rows() {
+  const std::vector<int64_t> declared(
+      vllm_test::kLtx2RealDitNvfp4DeclaredScaleShape,
+      vllm_test::kLtx2RealDitNvfp4DeclaredScaleShape + 2);
+  // The real file carries NO marker for this module — that absence IS the
+  // evidence, so it is passed as one.
+  const vllm::Ltx2Nvfp4Producer producer = vllm::Ltx2ResolveNvfp4Producer(
+      vllm_test::kLtx2RealDitNvfp4Module, nullptr, declared,
+      vllm_test::kLtx2RealDitNvfp4OutFeatures, vllm_test::kLtx2RealDitNvfp4InFeatures);
+  CHECK(producer == vllm::Ltx2Nvfp4Producer::kNvfp4Prequant);
+  const vllm::Nvfp4NibbleOrder order = vllm::Ltx2Nvfp4NibbleOrderFor(producer);
+  CHECK(order == vllm::Nvfp4NibbleOrder::kHighFirst);
+  return DequantRealNvfp4RowsWith(order);
+}
+
+}  // namespace
+
+TEST_CASE("ltx2 loader: the first-party NVFP4 DiT agrees with the FP8 DiT") {
+  const size_t n = static_cast<size_t>(vllm_test::kLtx2RealDitNvfp4RowCount *
+                                       vllm_test::kLtx2RealDitNvfp4RowElems);
+  REQUIRE(vllm_test::kLtx2RealDitFp8OracleF32Count == static_cast<int64_t>(n));
+  REQUIRE(vllm_test::kLtx2RealDitFp8ControlF32Count == static_cast<int64_t>(n));
+
+  const std::vector<float> got = DequantRealNvfp4Rows();
+
+  const double corr = Correlation(got, vllm_test::kLtx2RealDitFp8OracleF32, n);
+  const double rel = RelRms(got, vllm_test::kLtx2RealDitFp8OracleF32, n);
+  const double ctrl = Correlation(got, vllm_test::kLtx2RealDitFp8ControlF32, n);
+
+  // VALUES, not booleans (spec section 7.0).
+  INFO("corr(oracle) = " << corr << "  rel_rms = " << rel << "  corr(control) = " << ctrl);
+  CHECK(corr >= 0.99);
+  // ── rel_rms IS A BAND, NOT A CEILING ───────────────────────────────────────
+  //
+  // rel_rms here is not an error budget to stay under; it is a PREDICTED
+  // QUANTITY — the disagreement two different quantizations of the same base
+  // weights must show. Measured 0.100672 (spec section 7), which is NVFP4's own
+  // group-scaled E2M1 error combined with the oracle's fp8-e4m3 error.
+  //
+  // A one-sided `<= 0.15` was wrong in both directions, and both were measured
+  // on these bytes rather than argued:
+  //
+  //   TOO LOOSE ABOVE. A uniform group-scale error of x1.10 lands at rel 0.1489
+  //   and PASSED. Pearson correlation cannot help: it is scale-INVARIANT, so a
+  //   systematic scale defect leaves corr at 0.994968 to every printed digit.
+  //   rel is the ONLY statistic in this gate that can see it, which is exactly
+  //   why it may not be spent as slack. Both facts are asserted below.
+  //
+  //   UNBOUNDED BELOW. rel had no floor at all, so an arm that reproduced the
+  //   FP8 oracle EXACTLY — the shape a fixture takes when the "independent"
+  //   oracle has quietly become the thing under test, this project's 7.0(c)
+  //   failure — scored rel 0.0, corr 1.0 and passed with room to spare.
+  //
+  // The band is the measured value +/- about 15%. The width is for compiler and
+  // libm drift, NOT for run-to-run noise: every input here is a committed byte
+  // array and the reduction is a plain sequential double loop, so the value is
+  // deterministic. It admits at worst a ~4% uniform scale error, against the
+  // ~10% the ceiling alone admitted.
+  CHECK(rel >= 0.085);
+  CHECK(rel <= 0.115);
+  // ...and the same ceiling on the correlation, for the same reason: an oracle
+  // that agrees TOO well is not a better result, it is a broken oracle.
+  CHECK(corr <= 0.998);
+  // The control MUST collapse, or this fixture cannot separate right from wrong.
+  CHECK(ctrl < 0.2);
+
+  // ── THE TWO MUTATIONS THE BAND EXISTS FOR, RUN HERE ─────────────────────────
+  //
+  // Same discipline as the wrong-nibble arm below: the defect is executed by the
+  // gate rather than described in a comment a future reader has to re-derive.
+
+  // (1) A uniform +10% group-scale error. Invisible to corr BY CONSTRUCTION;
+  //     caught only by the band's upper edge.
+  std::vector<float> overscaled(got);
+  for (float& v : overscaled) v = static_cast<float>(static_cast<double>(v) * 1.10);
+  const double over_corr = Correlation(overscaled, vllm_test::kLtx2RealDitFp8OracleF32, n);
+  const double over_rel = RelRms(overscaled, vllm_test::kLtx2RealDitFp8OracleF32, n);
+  INFO("x1.10 group scale: corr = " << over_corr << "  rel_rms = " << over_rel);
+  // Pearson is scale-invariant: the defect moves corr by less than a printed digit.
+  CHECK(std::fabs(over_corr - corr) < 1e-6);
+  // The old `rel <= 0.15` admitted this. The band does not.
+  CHECK(over_rel > 0.115);
+
+  // (2) The too-good arm: hand the gate the oracle itself. Rejected by the rel
+  //     FLOOR and by the corr ceiling, neither of which existed before.
+  const std::vector<float> perfect(vllm_test::kLtx2RealDitFp8OracleF32,
+                                   vllm_test::kLtx2RealDitFp8OracleF32 + n);
+  const double perfect_corr = Correlation(perfect, vllm_test::kLtx2RealDitFp8OracleF32, n);
+  const double perfect_rel = RelRms(perfect, vllm_test::kLtx2RealDitFp8OracleF32, n);
+  INFO("oracle vs itself: corr = " << perfect_corr << "  rel_rms = " << perfect_rel);
+  CHECK(perfect_rel < 0.085);
+  CHECK(perfect_corr > 0.998);
+
+  // ── AND THE WRONG ORDER MUST FAIL, MEASURED RATHER THAN ASSUMED ─────────────
+  //
+  // A gate that only ever runs the right answer proves the right answer is
+  // self-consistent. Running the SAME bytes low-first is the defect this whole
+  // change exists to prevent, so its collapse is asserted here — the mutation
+  // built into the gate rather than left for a reviewer to perform.
+  const std::vector<float> wrong =
+      DequantRealNvfp4RowsWith(vllm::Nvfp4NibbleOrder::kLowFirst);
+  const double wrong_corr = Correlation(wrong, vllm_test::kLtx2RealDitFp8OracleF32, n);
+  const double wrong_rel = RelRms(wrong, vllm_test::kLtx2RealDitFp8OracleF32, n);
+  INFO("low-first (WRONG for this file): corr = " << wrong_corr
+                                                  << "  rel_rms = " << wrong_rel);
+  CHECK(wrong_corr < 0.2);
+  CHECK(wrong_rel > 0.5);
+  // Both readings decode the same MULTISET per group, so absmax cannot separate
+  // them. Stated as a gated fact: it is why "the output looked reasonable" is not
+  // evidence here, and why the correlation is what this gate reduces to.
+  double got_absmax = 0.0, wrong_absmax = 0.0;
+  for (size_t i = 0; i < n; ++i) {
+    got_absmax = std::max(got_absmax, std::fabs(static_cast<double>(got[i])));
+    wrong_absmax = std::max(wrong_absmax, std::fabs(static_cast<double>(wrong[i])));
+  }
+  INFO("absmax right = " << got_absmax << " wrong = " << wrong_absmax);
+  CHECK(got_absmax == wrong_absmax);
+}
+
+TEST_CASE("ltx2 loader: the producer discriminator, every row of the table") {
+  // .agents/specs/nvfp4-nibble-order.md section 3.2. The marker decides, the shape
+  // corroborates, and every other combination REFUSES.
+  const int64_t out_features = 4096, in_features = 4096;
+  const std::vector<int64_t> blocked =
+      vllm::Ltx2Nvfp4ToBlockedScaleShape(out_features, in_features);
+  const std::vector<int64_t> padded =
+      vllm::Ltx2Nvfp4PaddedScaleShape(out_features, in_features);
+  CHECK(blocked == std::vector<int64_t>{1024, 1024});
+  CHECK(padded == std::vector<int64_t>{4096, 256});
+
+  vllm::Ltx2TorchaoNvfp4Marker marker;
+  marker.format = "torchao_nvfp4";
+  marker.block_size = 16;
+  marker.is_swizzled_scales = true;
+
+  // Marker present + to_blocked framing -> torchao, LOW-first.
+  const vllm::Ltx2Nvfp4Producer torchao = vllm::Ltx2ResolveNvfp4Producer(
+      "m", &marker, blocked, out_features, in_features);
+  CHECK(torchao == vllm::Ltx2Nvfp4Producer::kTorchao);
+  CHECK(vllm::Ltx2Nvfp4NibbleOrderFor(torchao) == vllm::Nvfp4NibbleOrder::kLowFirst);
+
+  // Marker absent + cuBLAS-padded framing -> nvfp4-prequant, HIGH-first.
+  const vllm::Ltx2Nvfp4Producer prequant =
+      vllm::Ltx2ResolveNvfp4Producer("m", nullptr, padded, out_features, in_features);
+  CHECK(prequant == vllm::Ltx2Nvfp4Producer::kNvfp4Prequant);
+  CHECK(vllm::Ltx2Nvfp4NibbleOrderFor(prequant) == vllm::Nvfp4NibbleOrder::kHighFirst);
+
+  // THE TWO DISAGREEMENTS. Each is a shape that is perfectly valid for the OTHER
+  // producer, so neither is malformed — which is exactly why picking one would be
+  // silent and wrong.
+  CHECK_THROWS(
+      vllm::Ltx2ResolveNvfp4Producer("m", &marker, padded, out_features, in_features));
+  CHECK_THROWS(
+      vllm::Ltx2ResolveNvfp4Producer("m", nullptr, blocked, out_features, in_features));
+
+  // A shape that is neither framing, with and without a marker.
+  const std::vector<int64_t> nonsense = {512, 2048};
+  CHECK_THROWS(
+      vllm::Ltx2ResolveNvfp4Producer("m", &marker, nonsense, out_features, in_features));
+  CHECK_THROWS(
+      vllm::Ltx2ResolveNvfp4Producer("m", nullptr, nonsense, out_features, in_features));
+
+  // Both refusals must NAME the module, which is what "refuse by name" claims —
+  // and every SINGLE-QUOTED span in them must be a tensor name, because that is
+  // the convention the whole loader refuses in and the convention a user greps
+  // the checkpoint with. An apostrophe in ordinary prose silently breaks it: it
+  // opens a quote that closes on the next one, so the message starts "naming" a
+  // fragment of its own explanation. This suite already asserts that for the
+  // whole-file refusal path; asserting it HERE too is what stopped a stray
+  // "the other's assumption" from shipping in the marker-present branch.
+  for (bool with_marker : {true, false}) {
+    std::string what;
+    try {
+      vllm::Ltx2ResolveNvfp4Producer("transformer_blocks.0.attn1.to_q",
+                                     with_marker ? &marker : nullptr,
+                                     with_marker ? padded : blocked, out_features,
+                                     in_features);
+    } catch (const std::exception& e) {
+      what = e.what();
+    }
+    const std::string msg = "what: " + what;
+    INFO(msg);
+    CHECK(what.find("transformer_blocks.0.attn1.to_q") != std::string::npos);
+    // An even count means every quote pairs; an odd one means prose ate a
+    // delimiter.
+    const int64_t quotes = std::count(what.begin(), what.end(), '\'');
+    INFO("single-quote count = " << quotes);
+    CHECK(quotes % 2 == 0);
+    CHECK(quotes >= 2);
+    // ...and each pair really is the tensor this refusal is about.
+    size_t open = what.find('\'');
+    while (open != std::string::npos) {
+      const size_t close = what.find('\'', open + 1);
+      if (close == std::string::npos) break;
+      const std::string quoted = what.substr(open + 1, close - open - 1);
+      const std::string qmsg = "quoted span: " + quoted;
+      INFO(qmsg);
+      CHECK(quoted == "transformer_blocks.0.attn1.to_q.weight_scale");
+      open = what.find('\'', close + 1);
+    }
+  }
+}
+
+TEST_CASE("ltx2 loader: EVERY quantized module of the shipped NVFP4 DiT resolves alike") {
+  // The correlation gate proves ONE module decodes correctly. This proves the
+  // producer resolves the SAME way for all 1176 of them, straight off the real
+  // header — because "I sampled a few and they agreed" is how the linear-layout
+  // diagnosis got written in the first place.
+  REQUIRE(vllm_test::kLtx25Nvfp4DitTensorCount == 7876);
+  const std::string pre = vllm::kLtx2DitCheckpointPrefix;
+
+  // A name -> shape index over the manifest, so the scale lookup is not O(n^2).
+  std::map<std::string, const vllm_test::Ltx25Nvfp4DitTensor*> by_name;
+  for (const auto& t : vllm_test::kLtx25Nvfp4DitTensors) by_name[t.name] = &t;
+
+  int64_t packed = 0, markers = 0, scale2 = 0, input_scale = 0, resolved_prequant = 0;
+  int64_t padded_framing = 0, would_be_blocked = 0, ambiguous_with_linear = 0;
+  for (const auto& t : vllm_test::kLtx25Nvfp4DitTensors) {
+    const std::string name = t.name;
+    if (EndsWith(name, ".torchao_nvfp4")) ++markers;
+    if (EndsWith(name, ".weight_scale_2")) ++scale2;
+    if (EndsWith(name, ".input_scale")) ++input_scale;
+    if (std::string(t.dtype) != "U8") continue;
+    ++packed;
+    REQUIRE(t.rank == 2);
+    const int64_t out_features = t.shape[0];
+    const int64_t in_features = t.shape[1] * 2;  // TWO values per byte
+
+    const auto it = by_name.find(name + "_scale");
+    REQUIRE(it != by_name.end());
+    const std::vector<int64_t> scale_shape = ShapeOf(it->second->shape, it->second->rank);
+
+    // No marker ANYWHERE in this file, so every module takes the marker-less arm.
+    const vllm::Ltx2Nvfp4Producer p = vllm::Ltx2ResolveNvfp4Producer(
+        name, nullptr, scale_shape, out_features, in_features);
+    if (p == vllm::Ltx2Nvfp4Producer::kNvfp4Prequant) ++resolved_prequant;
+    if (scale_shape == vllm::Ltx2Nvfp4PaddedScaleShape(out_features, in_features)) {
+      ++padded_framing;
+    }
+    if (scale_shape == vllm::Ltx2Nvfp4ToBlockedScaleShape(out_features, in_features)) {
+      ++would_be_blocked;
+    }
+    // THE AMBIGUITY, counted rather than asserted in prose: for these geometries
+    // the padded framing IS the linear [N, K/16] shape, so a shape test alone
+    // could not have told swizzled from linear for a single one of them.
+    if (scale_shape == std::vector<int64_t>{out_features, in_features / 16}) {
+      ++ambiguous_with_linear;
+    }
+  }
+  INFO("packed=" << packed << " markers=" << markers << " scale2=" << scale2
+                 << " input_scale=" << input_scale << " prequant=" << resolved_prequant
+                 << " padded=" << padded_framing << " blocked=" << would_be_blocked
+                 << " ambiguous_with_linear=" << ambiguous_with_linear);
+  CHECK(packed == 1176);
+  // torchao ALWAYS writes its marker. Zero of them is what excludes torchao, and
+  // it is the whole basis of the marker-less arm.
+  CHECK(markers == 0);
+  CHECK(scale2 == 1176);
+  // W4A4-shaped export: the activation scales are present and UNUSED on this
+  // weight-only path, exactly as vLLM's W4A16 method discards them
+  // (modelopt.py:1264-1268).
+  CHECK(input_scale == 1176);
+  CHECK(resolved_prequant == 1176);
+  CHECK(padded_framing == 1176);
+  CHECK(would_be_blocked == 0);
+  CHECK(ambiguous_with_linear == 1176);
+}
+
+TEST_CASE("ltx2 loader: the two scale framings are the same buffer, differently dressed") {
+  // Why the shape cannot discriminate alone, as a gated fact rather than a claim
+  // in a comment: for every geometry the shipped DiT uses, the cuBLAS-padded
+  // framing has the SAME element count as the to_blocked one AND is numerically
+  // identical to the LINEAR [N, K/16] shape.
+  struct Geom { int64_t out, in; };
+  const Geom geoms[] = {{4096, 4096}, {2048, 2048}, {16384, 4096}, {4096, 16384},
+                        {8192, 2048}, {2048, 4096}, {4096, 256}};
+  for (const Geom& g : geoms) {
+    const std::vector<int64_t> blocked = vllm::Ltx2Nvfp4ToBlockedScaleShape(g.out, g.in);
+    const std::vector<int64_t> padded = vllm::Ltx2Nvfp4PaddedScaleShape(g.out, g.in);
+    const std::string msg = "geom [" + std::to_string(g.out) + ", " + std::to_string(g.in) + "]";
+    INFO(msg);
+    CHECK(blocked[0] * blocked[1] == padded[0] * padded[1]);
+    // The trap: padded == linear [N, K/16] exactly, because N % 128 == 0 and
+    // (K/16) % 4 == 0 for all of these.
+    CHECK(padded == std::vector<int64_t>{g.out, g.in / 16});
+    // ...and the two FRAMINGS are never equal to each other, so a marker-bearing
+    // file can always be told from a marker-less one by shape once the marker has
+    // already narrowed it.
+    CHECK(blocked != padded);
   }
 }
 

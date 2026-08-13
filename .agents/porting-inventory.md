@@ -1253,17 +1253,35 @@ Examples: `examples/cli` ✅ (C-API client), `examples/server` ✅ (OpenAI serve
       tower module without materializing it.
     * **Spec:** [ltx-2.5 spec](specs/ltx-2-5.md) §1.4 and §6 (L6). Lifecycle:
       shipped (host + load-time device staging). Owner: the LTX-2.5 row.
-    * **OWED, FOUND 2026-08-12 by the phase-L8 GB10 run (entry 20 below).** The
-      NVFP4 dequant here assumes torchao's SWIZZLED block scales, and the
-      FIRST-PARTY `ltx-2.5-22b-distilled-transformer-nvfp4.safetensors` is not
-      that: it carries **no `.torchao_nvfp4` marker at all** and stores
-      `weight_scale` as `[4096, 256]`, the LINEAR `[N, K/16]` layout, against the
-      SWIZZLED `[1024, 1024]` this path expects. The refusal is correct and fires
-      by name — the two shapes have the same element count, so reading one as the
-      other type-checks and permutes every scale within a 128x4 tile — but it
-      means the first-party NVFP4 DiT cannot be loaded at all today. The LINEAR
-      read is the missing piece. Phase L7's shipped-checkpoint test only parsed
-      the MANIFEST, so nothing had materialized a tensor from that file before.
+    * **CLOSED 2026-08-13 by phase L9a — and the diagnosis it closes was WRONG.**
+      This entry previously recorded that the FIRST-PARTY
+      `ltx-2.5-22b-distilled-transformer-nvfp4.safetensors` stores `weight_scale`
+      in the LINEAR `[N, K/16]` layout, and that a linear read was the missing
+      piece. **It does not, and it was not.** The bytes are SWIZZLED — the same
+      permutation this entry already inverts — merely declared in the
+      cuBLAS-padded framing `[round_up(N,128), round_up(G,4)]` = `[4096, 256]`
+      instead of torchao's `to_blocked` `[32*ceil(N/128), 16*ceil(G/4)]` =
+      `[1024, 1024]`. For every layer in that file `N % 128 == 0` and
+      `G % 4 == 0`, so the padded framing is NUMERICALLY IDENTICAL to the linear
+      shape; that coincidence is what made the wrong diagnosis look right, and it
+      is why no shape test could have settled it.
+
+      The file additionally packs element `2j` in the HIGH nibble, which no shape
+      encodes at all. Both facts were established by correlating the dequantized
+      weights against the `vonkaiser` FP8 DiT of the same base weights (0.9956
+      with 9.46% relative rms, against 0.0004-0.26 for every other reading), and
+      independently confirmed in Lightricks' own runtime
+      (`ltx-kernels/docs/NVFP4.md:27-29`, `csrc/nvfp4/quantize.cu:26-31`,
+      `ltx-core/quantization/nvfp4/linear.py:6-7`).
+    * **Resolution.** `Ltx2ResolveNvfp4Producer` discriminates on the
+      `torchao_nvfp4` marker (torchao always writes one, so its absence excludes
+      torchao), corroborates with the framing, and REFUSES by name on any other
+      combination. `Ltx2UnswizzleNvfp4BlockScale` was already framing-agnostic and
+      is UNCHANGED. The nibble order became an `Nvfp4NibbleOrder` parameter on
+      `DequantNvfp4ToBf16`, defaulting to low-first so every pre-existing caller
+      is untouched by construction — see
+      [nvfp4-nibble-order spec](specs/nvfp4-nibble-order.md), which also records
+      why H3's nibble-swap-at-load was NOT reused and when it must be.
 
 19. **LTX-2.5 phase L7 — the family behind `vllm::multimodal::VideoEngine`, and
     the driving loop.**
@@ -1373,16 +1391,16 @@ Examples: `examples/cli` ✅ (C-API client), `examples/server` ✅ (OpenAI serve
       produced finite, non-degenerate output. The wall-clock is SIZING ONLY and is
       not a speed result — spec §0, no production-configuration denominator exists.
       The FIRST-PARTY `ltx-2.5-22b-distilled-transformer-nvfp4.safetensors`
-      (18.72 GB, 7876 tensors) does NOT stage, and the refusal is L6's and is
-      correct: the file carries **no `.torchao_nvfp4` marker at all**, and its
-      `weight_scale` is `[4096, 256]` — the LINEAR `[N, K/16]` layout — where
-      `Ltx2DequantTorchaoNvfp4ToBf16` expects the SWIZZLED `[1024, 1024]` form.
-      The two have the same element count, so reading one as the other
-      type-checks and permutes every scale within a 128x4 tile. The LINEAR-scale
-      read is owed against the **L6 loader** surface (entry 18 above), not this
-      one; the device forward never sees it. Phase L7's shipped-checkpoint test
-      only parsed the MANIFEST, which is why this surfaced now: nothing had
-      materialized a tensor from that file before.
+      (18.72 GB, 7876 tensors) did NOT stage at that time. **The reason recorded
+      here was WRONG and is superseded by entry 18 above (phase L9a,
+      2026-08-13):** the file does not store a LINEAR `[N, K/16]` scale. Its bytes
+      are SWIZZLED, declared in the cuBLAS-padded framing — which for these
+      geometries is numerically identical to the linear shape, which is precisely
+      why the wrong reading looked confirmed — and it packs the OPPOSITE nibble
+      order. The refusal was correct; its diagnosis was not. Loading it needed a
+      producer discriminator and a nibble-order arm, not a linear read. Phase L7's
+      shipped-checkpoint test only parsed the MANIFEST, which is why this surfaced
+      as late as it did: nothing had materialized a tensor from that file before.
     * **CORRECTED 2026-08-12 by an adversarial review of L7+L8 (row
       `LTX25-L8-FIX`). The headline held; five records did not.**
       1. **The FP8 DiT this row RAN carries no `__metadata__` at all.** The engine
