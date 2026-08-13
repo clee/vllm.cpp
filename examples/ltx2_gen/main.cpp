@@ -85,6 +85,7 @@ const char* Need(int argc, char** argv, int i, const char* flag) {
       "                [--model-version 2.5] [--pipeline-kind distilled_two_stage]\n"
       "                [--upsampler <latent-spatial-x2.safetensors>]  phase 2 needs it\n"
       "                [--max-phase N] [--allow-unported]\n"
+      "                [--prompt-valid-rows N]   how many embed rows are real tokens\n"
       "                [--frames N] [--width N] [--height N] [--seed N]\n"
       "                [--device cpu|cuda]\n\n"
       "Renders LTX-2.5 (family \"ltx-2.5\") through vllm_video_engine_load +\n"
@@ -92,7 +93,14 @@ const char* Need(int argc, char** argv, int i, const char* flag) {
       "little-endian f32, the video one 4096 wide and the audio one 2048, with the\n"
       "SAME row count. There is no --prompt: the Gemma-4 text tower is not ported and\n"
       "the engine refuses a prompt rather than silently rendering these embeddings\n"
-      "as if they were it.\n");
+      "as if they were it.\n\n"
+      "Those rows are the EMBEDDINGS CONNECTOR's input, not the DiT's: when the\n"
+      "checkpoint carries the two *_embeddings_connector families (both shipped\n"
+      "LTX-2.5 DiTs do) they run through it first, with the checkpoint's own\n"
+      "weights. The row count must then be a multiple of the connector's learnable\n"
+      "register count (128 on the shipped files), and --prompt-valid-rows says how\n"
+      "many of them are real: the rest are padding, and padding is REPLACED by the\n"
+      "learnable register table rather than ignored.\n");
   std::exit(code);
 }
 
@@ -135,6 +143,8 @@ int main(int argc, char** argv) {
     else if (f == "--duration-head")
       SetExtra("duration_head_path", Need(argc, argv, ++i, f.c_str()));
     else if (f == "--max-phase") SetExtra("max_phase", Need(argc, argv, ++i, f.c_str()));
+    else if (f == "--prompt-valid-rows")
+      SetExtra("prompt_embeds_valid_rows", Need(argc, argv, ++i, f.c_str()));
     else if (f == "--allow-unported") SetExtra("allow_unported_modules", "1");
     else if (f == "--device") device = Need(argc, argv, ++i, "--device");
     else if (f == "--frames") vp.num_frames = std::atoi(Need(argc, argv, ++i, "--frames"));

@@ -1008,3 +1008,192 @@ TEST_CASE("ltx2 video: the SHIPPED Lightricks checkpoints parse and load") {
     MESSAGE("shipped upsampler: " << weights.tensors.size() << " tensors");
   }
 }
+
+// ─── the embeddings connector (phase L9c) ───────────────────────────────────
+//
+// WHAT THESE ARE FOR. Until L9c the conditioning this engine handed the DiT was
+// the prompt-embeds file VERBATIM: `Ltx2ConnectorForward` had landed at L5, had
+// been gated against upstream on five arms, and was called by NOTHING but its
+// own test, while the 129-tensor `*_embeddings_connector` family the shipped DiT
+// carries was refused as unported and stepped over. Every case below fails on
+// the pre-L9c engine, and the first two fail for the reason that matters:
+// deleting the connector call leaves the render byte-identical to a render with
+// DIFFERENT connector weights, because nothing read them.
+
+namespace {
+
+// Every frame byte of a render, so two renders can be compared as a whole rather
+// than through a statistic that might not move.
+//
+// Phase 0 only, for the same reason the first render case gives: the recipe's
+// second phase needs the latent spatial upsampler and running without one is a
+// REFUSAL. Phase 0 already carries the conditioning through cross-attention in
+// every one of its blocks, which is what these cases are about.
+std::string RenderBytes(vllm::multimodal::VideoModelParams mp, const std::string& out_dir) {
+  mp.extras[vllm::multimodal::kLtx2MaxPhaseExtra] = "0";
+  const std::unique_ptr<vllm::multimodal::VideoEngine> engine =
+      vllm::multimodal::LoadVideoEngine(mp);
+  const vllm::multimodal::VideoResult result = engine->Generate(FixtureGen(out_dir));
+  std::string all;
+  for (int64_t f = 0; f < result.frame_count; ++f) {
+    char name[64];
+    std::snprintf(name, sizeof(name), "/frame_%06lld.ppm", static_cast<long long>(f));
+    all += ReadAll(out_dir + name);
+  }
+  all += ReadAll(result.audio_path);
+  return all;
+}
+
+std::string RefusalOf(const vllm::multimodal::VideoModelParams& mp) {
+  try {
+    (void)vllm::multimodal::LoadVideoEngine(mp);
+  } catch (const std::exception& e) {
+    return e.what();
+  }
+  return std::string();
+}
+
+}  // namespace
+
+TEST_CASE("ltx2 video: the render READS the checkpoint's connector weights") {
+  Workspace ws;
+  const vllm::Ltx2DitParams dit = ltx2_fixture::ReducedDitParams();
+
+  // A second DiT, byte-identical except that its connector's parameter stream is
+  // seeded differently. Same shapes, same config, same DiT weights.
+  ltx2_fixture::ReducedDitOptions other;
+  other.connector.tag = "b";
+  const std::string other_dit = ws.root + "/dit_connector_b.safetensors";
+  ltx2_fixture::WriteReducedDit(dit, other_dit, other);
+
+  vllm::multimodal::VideoModelParams a = FixtureParams(ws.paths);
+  vllm::multimodal::VideoModelParams b = a;
+  b.dit_path = other_dit;
+
+  const std::string frames_a = RenderBytes(a, ws.root + "/conn_a");
+  const std::string frames_b = RenderBytes(b, ws.root + "/conn_b");
+  CHECK(frames_a.size() == frames_b.size());
+  // BEFORE L9c these are EQUAL: the connector weights were loaded by nobody, so
+  // the only thing that differed between the two files was never read.
+  CHECK(frames_a != frames_b);
+
+  // ...and the same render twice is byte-identical, which is what makes the
+  // inequality above a statement about the connector rather than about noise.
+  CHECK(RenderBytes(a, ws.root + "/conn_a2") == frames_a);
+}
+
+TEST_CASE("ltx2 video: the connector's positional bound comes from the CONFIG") {
+  // `connector_positional_embedding_max_pos` divides every token index
+  // (rope.py:132-141). LTX-2.5 declares [4096]; the class default is [1], which
+  // is 4096x. Nothing in a SHAPE can see the difference, so a config that is
+  // parsed but not USED renders confidently at the wrong RoPE — the invisible
+  // constant class spec section 7.0(a) names.
+  Workspace ws;
+  const vllm::Ltx2DitParams dit = ltx2_fixture::ReducedDitParams();
+  ltx2_fixture::ReducedDitOptions defaulted;
+  defaulted.transformer_overrides["connector_positional_embedding_max_pos"] =
+      std::vector<int64_t>{1};
+  const std::string other_dit = ws.root + "/dit_maxpos_1.safetensors";
+  ltx2_fixture::WriteReducedDit(dit, other_dit, defaulted);
+
+  vllm::multimodal::VideoModelParams a = FixtureParams(ws.paths);
+  vllm::multimodal::VideoModelParams b = a;
+  b.dit_path = other_dit;
+  CHECK(RenderBytes(a, ws.root + "/maxpos_4096") != RenderBytes(b, ws.root + "/maxpos_1"));
+}
+
+TEST_CASE("ltx2 video: a connector config that disagrees with the FILE is refused") {
+  Workspace ws;
+  const vllm::Ltx2DitParams dit = ltx2_fixture::ReducedDitParams();
+
+  SUBCASE("fewer layers than the file carries binds a PREFIX, so it is refused") {
+    ltx2_fixture::ReducedDitOptions shrunk;
+    shrunk.transformer_overrides["connector_num_layers"] = 1;
+    const std::string path = ws.root + "/dit_conn_1layer.safetensors";
+    ltx2_fixture::WriteReducedDit(dit, path, shrunk);
+    vllm::multimodal::VideoModelParams mp = FixtureParams(ws.paths);
+    mp.dit_path = path;
+    const std::string msg = RefusalOf(mp);
+    INFO(msg);
+    CHECK(msg.find("embeddings_connector") != std::string::npos);
+    CHECK(msg.find("does not name") != std::string::npos);
+  }
+
+  SUBCASE("more layers than the file carries names the MISSING tensor") {
+    ltx2_fixture::ReducedDitOptions grown;
+    grown.transformer_overrides["connector_num_layers"] = 3;
+    const std::string path = ws.root + "/dit_conn_3layer.safetensors";
+    ltx2_fixture::WriteReducedDit(dit, path, grown);
+    vllm::multimodal::VideoModelParams mp = FixtureParams(ws.paths);
+    mp.dit_path = path;
+    const std::string msg = RefusalOf(mp);
+    INFO(msg);
+    CHECK(msg.find("transformer_1d_blocks.2") != std::string::npos);
+  }
+
+  SUBCASE("gating the config declares but the file does not carry is refused") {
+    ltx2_fixture::ReducedDitOptions ungated;
+    ungated.connector.gated = false;  // writes NO to_gate_logits tensors...
+    ungated.transformer_overrides["connector_apply_gated_attention"] = true;  // ...but claims them
+    const std::string path = ws.root + "/dit_conn_gate.safetensors";
+    ltx2_fixture::WriteReducedDit(dit, path, ungated);
+    vllm::multimodal::VideoModelParams mp = FixtureParams(ws.paths);
+    mp.dit_path = path;
+    const std::string msg = RefusalOf(mp);
+    INFO(msg);
+    CHECK(msg.find("to_gate_logits") != std::string::npos);
+  }
+}
+
+TEST_CASE("ltx2 video: half a connector conditions two modalities differently") {
+  Workspace ws;
+  ltx2_fixture::ReducedDitOptions video_only;
+  video_only.connector.audio = false;
+  const std::string path = ws.root + "/dit_video_connector_only.safetensors";
+  ltx2_fixture::WriteReducedDit(ltx2_fixture::ReducedDitParams(), path, video_only);
+  vllm::multimodal::VideoModelParams mp = FixtureParams(ws.paths);
+  mp.dit_path = path;
+  const std::string msg = RefusalOf(mp);
+  INFO(msg);
+  CHECK(msg.find("embeddings connector") != std::string::npos);
+  CHECK(msg.find("audio") != std::string::npos);
+}
+
+TEST_CASE("ltx2 video: prompt rows the register table cannot tile are refused") {
+  // `seq_len % num_learnable_registers == 0` is upstream's own assert
+  // (embeddings_connector.py:144), because the table is TILED across the
+  // sequence rather than indexed by which positions were padded.
+  Workspace ws;
+  const std::string odd = ws.root + "/three_rows.f32";
+  const vllm::Ltx2DitParams dit = ltx2_fixture::ReducedDitParams();
+  ltx2_fixture::WritePromptEmbeds(odd, "ltx2.embeds.video.odd", 3, dit.cross_attention_dim);
+  const std::string odd_audio = ws.root + "/three_rows_audio.f32";
+  ltx2_fixture::WritePromptEmbeds(odd_audio, "ltx2.embeds.audio.odd", 3,
+                                  dit.audio_cross_attention_dim);
+  vllm::multimodal::VideoModelParams mp = FixtureParams(ws.paths);
+  mp.prompt_embeds_path = odd;
+  mp.extras[vllm::multimodal::kLtx2AudioPromptEmbedsExtra] = odd_audio;
+  const std::string msg = RefusalOf(mp);
+  INFO(msg);
+  CHECK(msg.find("learnable registers") != std::string::npos);
+}
+
+TEST_CASE("ltx2 video: the valid-row count decides which positions are registers") {
+  // With no text tower there is no tokenizer mask, so `prompt_embeds_valid_rows`
+  // is what says which supplied rows are caption and which are padding — and
+  // padding is not inert here, it is REPLACED by the learnable register table.
+  // A render that ignored the extra would be identical whatever it said.
+  Workspace ws;
+  vllm::multimodal::VideoModelParams all_valid = FixtureParams(ws.paths);
+  vllm::multimodal::VideoModelParams half = all_valid;
+  half.extras[vllm::multimodal::kLtx2PromptValidRowsExtra] = "2";
+  CHECK(RenderBytes(all_valid, ws.root + "/rows_4") != RenderBytes(half, ws.root + "/rows_2"));
+
+  SUBCASE("a count past the end of the file is refused") {
+    vllm::multimodal::VideoModelParams over = all_valid;
+    over.extras[vllm::multimodal::kLtx2PromptValidRowsExtra] = "99";
+    const std::string msg = RefusalOf(over);
+    INFO(msg);
+    CHECK(msg.find(vllm::multimodal::kLtx2PromptValidRowsExtra) != std::string::npos);
+  }
+}

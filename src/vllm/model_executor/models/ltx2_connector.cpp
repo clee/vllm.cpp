@@ -282,4 +282,105 @@ Ltx2ConnectorOutput Ltx2ConnectorForward(const Ltx2ConnectorConfig& config,
   return state;
 }
 
+Ltx2ConnectorEmbeddings Ltx2ConnectorCreateEmbeddings(
+    const Ltx2ConnectorConfig& video_config, const Ltx2VaeWeights& video_weights,
+    const float* video_features, const Ltx2ConnectorConfig& audio_config,
+    const Ltx2VaeWeights& audio_weights, const float* audio_features,
+    const float* additive_attention_mask, int64_t batch, int64_t seq) {
+  Require(video_features != nullptr && audio_features != nullptr,
+          "ltx2 connector: both modality feature streams are required "
+          "(embeddings_processor.py:76-79 refuses one without the other)");
+  Require(additive_attention_mask != nullptr,
+          "ltx2 connector: the processor requires the additive attention mask; it is what "
+          "decides which positions become learnable registers "
+          "(embeddings_processor.py:82)");
+  const int64_t vdim = video_config.inner_dim();
+  const int64_t adim = audio_config.inner_dim();
+
+  // `_compute_right_pad_order` (:23-38): a STABLE descending argsort of the
+  // binary mask, so valid tokens move to the front keeping their relative order
+  // and padded ones follow. Written as a stable partition because that is what a
+  // stable argsort of a 0/1 key IS, and it needs no comparator.
+  std::vector<int64_t> order(static_cast<size_t>(batch * seq));
+  std::vector<float> reordered_mask(static_cast<size_t>(batch * seq));
+  for (int64_t b = 0; b < batch; ++b) {
+    int64_t write = 0;
+    for (int64_t s = 0; s < seq; ++s) {
+      if (additive_attention_mask[b * seq + s] >= 0.0f) order[static_cast<size_t>(b * seq + write++)] = s;
+    }
+    const int64_t valid = write;
+    for (int64_t s = 0; s < seq; ++s) {
+      if (additive_attention_mask[b * seq + s] < 0.0f) order[static_cast<size_t>(b * seq + write++)] = s;
+    }
+    // `new_additive = (new_binary - 1) * finfo.max` (:37): 0 for the valid
+    // prefix, -finfo.max for the padded tail.
+    for (int64_t s = 0; s < seq; ++s) {
+      reordered_mask[static_cast<size_t>(b * seq + s)] =
+          s < valid ? 0.0f : -std::numeric_limits<float>::max();
+    }
+  }
+
+  // `_apply_right_pad_order` (:41-43): gather the feature rows into that order.
+  auto gather = [&](const float* src, int64_t width) {
+    std::vector<float> out(static_cast<size_t>(batch * seq * width));
+    for (int64_t b = 0; b < batch; ++b) {
+      for (int64_t s = 0; s < seq; ++s) {
+        const int64_t from = order[static_cast<size_t>(b * seq + s)];
+        std::memcpy(out.data() + static_cast<size_t>((b * seq + s) * width),
+                    src + static_cast<size_t>((b * seq + from) * width),
+                    static_cast<size_t>(width) * sizeof(float));
+      }
+    }
+    return out;
+  };
+  const std::vector<float> video_sorted = gather(video_features, vdim);
+  const std::vector<float> audio_sorted = gather(audio_features, adim);
+
+  const Ltx2ConnectorOutput video_out = Ltx2ConnectorForward(
+      video_config, video_weights, video_sorted.data(), reordered_mask.data(), batch, seq);
+  const Ltx2ConnectorOutput audio_out = Ltx2ConnectorForward(
+      audio_config, audio_weights, audio_sorted.data(), reordered_mask.data(), batch, seq);
+
+  Ltx2ConnectorEmbeddings out;
+  out.mask.resize(static_cast<size_t>(batch * seq));
+  // `_to_binary_mask` (:46-48): `encoded_mask < 0.000001`.
+  //
+  // THE COMPARISON DIRECTION IS SURPRISING AND IT IS MIRRORED EXACTLY. An
+  // additive mask holds 0.0 for a kept position and -finfo(f32).max for a padded
+  // one, and BOTH are `< 0.000001` — so this returns 1 at every position, for
+  // every mask upstream can produce. The reading a port would arrive at by
+  // reasoning about intent (`>= 0`, "keep the unmasked ones") is the OPPOSITE at
+  // padded positions, and it is not what either reference does.
+  //
+  // Checked against both, because a line this surprising is exactly where one
+  // implementation being wrong would show: `diffusers`
+  // `LTX2TextConnectors.forward` writes `(video_attn_mask < 1e-6).to(int64)` and
+  // then the same video-only multiply. They agree, down to the constant.
+  //
+  // The consequence is that the multiply below is a NO-OP for every mask value
+  // that can reach it, and the mask this returns is all ones. That is not a
+  // reason to drop either: with registers enabled the connector zeroes the mask
+  // itself, so the shipped configuration reaches this line with all-zeros and
+  // the identity is CORRECT rather than incidental — and removing upstream's
+  // line would silently change a future connector whose output mask is not one
+  // of those two values.
+  for (int64_t i = 0; i < batch * seq; ++i) {
+    out.mask[static_cast<size_t>(i)] = video_out.mask[static_cast<size_t>(i)] < 0.000001f ? 1.0f : 0.0f;
+  }
+  // :86-87 — the VIDEO encoding is multiplied by that binary mask. The AUDIO
+  // encoding is not (:91-93). Mirrored, not tidied.
+  out.video = video_out.hidden_states;
+  for (int64_t b = 0; b < batch; ++b) {
+    for (int64_t s = 0; s < seq; ++s) {
+      const float m = out.mask[static_cast<size_t>(b * seq + s)];
+      if (m != 0.0f) continue;
+      for (int64_t i = 0; i < vdim; ++i) {
+        out.video[static_cast<size_t>((b * seq + s) * vdim + i)] = 0.0f;
+      }
+    }
+  }
+  out.audio = audio_out.hidden_states;
+  return out;
+}
+
 }  // namespace vllm

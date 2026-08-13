@@ -114,6 +114,7 @@
 
 #include "vllm/model_executor/models/ltx2.h"
 #include "vllm/model_executor/models/ltx2_audio_vae.h"
+#include "vllm/model_executor/models/ltx2_connector.h"
 #include "vllm/model_executor/models/ltx2_text_encoder.h"
 #include "vllm/model_executor/models/ltx2_upsampler.h"
 #include "vllm/model_executor/models/ltx2_video_vae.h"
@@ -387,6 +388,69 @@ Ltx2DitParams Ltx2AdoptDeclaredDitParams(const nlohmann::json& config,
                                          const Ltx2DitParams& from_shapes,
                                          bool allow_unported_modules,
                                          const std::string& source);
+
+// ---------------------------------------------------------------------------
+// The embeddings connector (phase L9c)
+// ---------------------------------------------------------------------------
+//
+// The two `*_embeddings_connector` families live in the DiT FILE but not in the
+// DiT's own weight contract: upstream loads them into the TEXT ENCODER's
+// `EmbeddingsProcessor`, through `EMBEDDINGS_PROCESSOR_KEY_OPS`, which rewrites
+// `model.diffusion_model.video_embeddings_connector.` to `video_connector.`
+// (text_encoders/gemma/encoders/encoder_configurator.py:331-346). They are
+// therefore loaded HERE, beside the DiT and not inside it, and they stay outside
+// `EnumerateLtx2DitTensors`.
+
+enum class Ltx2ConnectorStream { kVideo, kAudio };
+
+// The tensor-name prefix each stream's family carries in the checkpoint, WITHOUT
+// the ComfyUI `model.diffusion_model.` prefix (`PlanDit` strips that).
+const char* Ltx2ConnectorCheckpointPrefix(Ltx2ConnectorStream stream);
+
+// Does this DiT file carry a connector at all? Keyed on `learnable_registers`,
+// the one tensor the family always has and the only one that is not per-block.
+bool Ltx2CheckpointHasConnector(const SafetensorsFile& file, Ltx2ConnectorStream stream);
+
+// `Embeddings1DConnectorConfigurator.from_metadata` and its audio twin
+// (embeddings_connector.py:194-256) applied to a `{"transformer": {...}}` object.
+//
+// FOUR VALUES NO SHAPE ENCODES, and one of them is not close to its default:
+// LTX-2.5 declares `connector_positional_embedding_max_pos = [4096]` where the
+// class default is `[1]`. `get_fractional_positions` divides the token index by
+// it (rope.py:132-141), so the default turns every position into a fractional
+// position 4096x too large and every RoPE angle with it. The others are
+// `rope_type`, `frequencies_precision` (-> double-precision frequencies) and
+// `connector_apply_gated_attention`.
+//
+// `positional_embedding_theta` is deliberately NOT read from the config even
+// though the DiT declares one: neither configurator passes it, so upstream's
+// connector always runs at the class default of 10000.0. Reading the DiT's key
+// would be a re-invention, not a port — and the shipped file declares 10000.0
+// anyway, so the two agree and only the RULE differs.
+Ltx2ConnectorConfig Ltx2ParseConnectorConfig(const nlohmann::json& config,
+                                             Ltx2ConnectorStream stream);
+
+// Materialize one connector family out of the DiT checkpoint, widened to f32 —
+// which is `Ltx2ConnectorForward`'s declared parity dtype.
+//
+// IT IS NOT CHEAP AND THE CALLER MUST TREAT IT AS EXPENSIVE. 129 tensors is 8
+// blocks of four dim x dim projections plus a 4x-wide feed-forward, so at the
+// shipped widths the video family is ~1.61G parameters and the audio family
+// ~0.40G: **about 8 GB of f32 together**. That is small against the DiT's 21 GB
+// on disk and 44 GB staged, and it is NOT small on a 119 GB unified-memory box
+// that reboots rather than OOM-killing. The video engine therefore loads these,
+// runs the connector once, and drops them inside one scope — the conditioning is
+// resolved at load time, so the weights never outlive their single use.
+//
+// It is also the CONTRACT CHECK on the config. `Ltx2ParseConnectorConfig` reads
+// values that mostly cannot be seen in a shape — but `connector_num_layers`,
+// `connector_apply_gated_attention`, `connector_ff_bias` and the head geometry
+// all CAN, so every enumerated tensor must exist at its enumerated shape AND no
+// tensor of the family may be left over. A config that says 2 layers against a
+// file carrying 8 is refused by name here rather than binding the first two and
+// rendering.
+Ltx2VaeWeights Ltx2LoadConnectorWeights(const SafetensorsFile& file,
+                                        const Ltx2ConnectorConfig& config);
 
 // `__metadata__["model_version"]` ("2.5.0"), which is what
 // `detect_model_version` reads to pick a recipe (ltx-pipelines

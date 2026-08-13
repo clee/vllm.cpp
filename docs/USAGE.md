@@ -331,6 +331,17 @@ with the same row count in both. Supplying a `--prompt` is refused, and supplyin
 only one of the two files is refused, because a stream left unconditioned renders
 instead of failing.
 
+**Those rows go through the embeddings connector.** Both shipped LTX-2.5 DiTs
+carry two `*_embeddings_connector` families, 129 tensors each, and they are the
+8-layer 1-D transformer upstream runs between the caption projections and the
+DiT's cross-attention. The render applies it with the checkpoint's own weights,
+under the checkpoint's own `connector_*` configuration. Two consequences for the
+command line: the row count must be a multiple of the connector's learnable
+register count (128 on the shipped files), and `--prompt-valid-rows N` says how
+many of those rows are real tokens. The rest are padding, and padding is not
+inert here: the connector REPLACES it with its learnable register table, so a
+run that leaves the default renders as if every supplied row were caption.
+
 **The DiT config is required when the checkpoint does not carry one.** The
 shipped `vonkaiser` FP8 transformer has no `__metadata__` at all, and the values
 a config decides are ones no tensor shape encodes: `frequencies_precision` and
@@ -369,21 +380,27 @@ knobs the flags above map onto. Both are described under
 
 **Two things about that command are worth knowing before you run it.**
 
-*It is bounded by memory well below the recipe's own defaults.* Staging the
-21.00B FP8 transformer costs about 44 GB on a 119 GB GB10, and the render then
-runs a forward per denoise step on top of that. A 128x128 clip at 9 frames
-completes comfortably through both distilled phases; a 320x192 clip at 25 frames
-consumed a further 58 GB and had to be stopped. Unified memory makes those host
-bytes, and this class of box reboots rather than OOM-killing, so start small and
-grow. The recipe default (1024x1536 at 121 frames) is far beyond what one GB10
-holds today.
+*It is bounded by the VIDEO DECODE, well below the recipe's own defaults.*
+Staging the 21.00B FP8 transformer costs about 44 GB on a 119 GB GB10. **320x192
+at 25 frames completes** through both distilled phases; 448x256 at 25 frames
+finishes its denoise and then loses about 59 GB in 24 seconds inside the decode
+and has to be stopped. The denoise itself is flat at either size. Unified memory
+makes those host bytes and this class of box reboots rather than OOM-killing, so
+start small and grow, and put a memory watchdog in front of anything larger. The
+recipe default (1024x1536 at 121 frames) is far beyond what one GB10 holds today.
+Expect minutes, not seconds: most of a 320x192/25f render is spent single-threaded
+in the host VAE decode at 0% GPU.
 
-*It cannot yet render a scene, and that is conditioning, not the model.* The
-text tower is not ported and neither is the embeddings connector that sits
-between it and the DiT's cross-attention, so whatever you supply as prompt
-embeds reaches the transformer unprocessed. A completed render at the sizes
-above is a structurally valid MP4 of smooth colour fields, not a depiction of
-anything. Treat it as an end-to-end plumbing check.
+*It renders a scene, and it does not render YOUR scene.* With the connector on
+the path the shipped 21.00B FP8 transformer produces a temporally coherent
+photorealistic clip at 320x192 / 25 frames: consistent subject, consistent
+background, frame-to-frame motion. Before the connector was wired the same
+weights at the same settings produced smooth colour fields. What conditions it,
+though, is mostly the connector's own trained `learnable_registers` table, which
+is what upstream substitutes at PADDED positions — so the render is the model's
+own default, not a depiction of anything you asked for. The Gemma-4 text tower is
+still not ported, so the rows you supply as prompt embeds are not an encoded
+prompt. Ask for a subject and you will not get it.
 
 LTX-2.5 ships two video decoders behind one checkpoint field. The convolutional
 one is implemented; the higher quality diffusion one (`NADiffusionDecoder`) is
@@ -1349,8 +1366,15 @@ knobs from `extras`. H3 takes `partition`. LTX-2.5 takes
 seam's `prompt_embeds_path`, which carries the video stream), `pipeline_kind`
 (default `distilled_two_stage`), `model_version` (only for a checkpoint that
 declares none), `dit_config_path`, `allow_unported_modules`, `max_phase`,
-`upsampler_path` and `duration_head_path`. An extra a family does not define is
-refused, never ignored.
+`prompt_embeds_valid_rows`, `upsampler_path` and `duration_head_path`. An extra a
+family does not define is refused, never ignored.
+
+`prompt_embeds_valid_rows` is how many of the supplied conditioning rows are real
+tokens; absent, every row is. It matters because the embeddings connector
+substitutes its learnable register table at PADDED positions, so padding decides
+which of the connector's inputs are learned constants rather than caption
+features. Upstream always knows this because its tokenizer produced the mask;
+this seam reads conditioning from a file, which carries none.
 
 `dit_config_path` names a JSON file holding the DiT's `{"transformer": {...}}`
 configuration, and it exists because only one of the two shipped LTX-2.5 DiTs

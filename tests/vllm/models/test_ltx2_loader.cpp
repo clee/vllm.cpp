@@ -1149,24 +1149,51 @@ TEST_CASE("ltx2 loader: the unported families are refused by name, not absorbed"
   }
   const std::string what_msg = "what: " + what;
   INFO(what_msg);
-  // All FIVE families the shipped DiT manifest names, not the three that were
-  // convenient: `audio_prompt_adaln_single` and `audio_embeddings_connector` go
-  // through the identical generic FamilyOf path, and covering them literally is
-  // one line each.
+  // THREE families now, not five. `audio_prompt_adaln_single` is here because it
+  // goes through the identical generic FamilyOf path as its video twin and
+  // covering it literally is one line.
   CHECK(what.find("prompt_adaln_single") != std::string::npos);
   CHECK(what.find("audio_prompt_adaln_single") != std::string::npos);
   CHECK(what.find("keyframes_abs_pos_embedding") != std::string::npos);
-  CHECK(what.find("video_embeddings_connector") != std::string::npos);
-  CHECK(what.find("audio_embeddings_connector") != std::string::npos);
 
-  // The opt-in still REPORTS every one of them; it does not make them vanish.
+  // THE TWO CONNECTOR FAMILIES ARE NOT UNPORTED AS OF PHASE L9c. They are
+  // outside the DiT's contract by design — upstream loads them into the text
+  // encoder's EmbeddingsProcessor (encoder_configurator.py:331-346) and so does
+  // this port, through `Ltx2LoadConnectorWeights`, which the video engine calls.
+  // Listing them here would say something untrue about the tree AND would demand
+  // `allow_unported_modules` from a caller whose checkpoint this port reads
+  // completely. Asserted as an ABSENCE, so restoring the old behaviour REDs.
+  CHECK(what.find("video_embeddings_connector") == std::string::npos);
+  CHECK(what.find("audio_embeddings_connector") == std::string::npos);
+
+  // The opt-in still REPORTS every one of the three; it does not make them vanish.
   Ltx2DitLoadOptions options;
   options.allow_unported_modules = true;
   const vllm::Ltx2DitCheckpoint ck = vllm::Ltx2LoadDitFromSafetensors(file, options);
-  CHECK(ck.unported.size() == 5);
+  CHECK(ck.unported.size() == 3);
+  for (const std::string& family : ck.unported) {
+    CHECK(family != "video_embeddings_connector");
+    CHECK(family != "audio_embeddings_connector");
+  }
   CHECK(ck.checkpoint_params.use_prompt_adaln_single);
   CHECK_FALSE(ck.params.use_prompt_adaln_single);
   std::remove(path.c_str());
+
+  // AND THE CONNECTOR-ONLY CHECKPOINT LOADS WITH NO OPT-IN AT ALL, which is the
+  // half of the change a message assertion cannot see: a file whose only
+  // out-of-contract modules are the two connectors is now fully read by this
+  // port, so requiring the flag would be requiring an admission of a gap that
+  // has been closed.
+  const SyntheticDit conn_only = BuildSyntheticDit(
+      p, Ltx2DitQuant::kFp8,
+      {"video_embeddings_connector.learnable_registers",
+       "audio_embeddings_connector.learnable_registers"});
+  const std::string conn_path = TmpPath("connector_only");
+  WriteSafetensors(conn_only.entries, conn_path);
+  const SafetensorsFile conn_file = SafetensorsFile::Open(conn_path);
+  const vllm::Ltx2DitCheckpoint conn_ck = vllm::Ltx2LoadDitFromSafetensors(conn_file);
+  CHECK(conn_ck.unported.empty());
+  std::remove(conn_path.c_str());
 }
 
 TEST_CASE("ltx2 loader: the f32 widening is OPT-IN and bit-exact over bf16") {
