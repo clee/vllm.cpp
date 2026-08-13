@@ -108,6 +108,18 @@ foreach(_glue_fuse_test test_qwen27_dense_forward test_qwen3_5_gdn_spec_routing)
   set_tests_properties(${_glue_fuse_test}_glue_fuse_off PROPERTIES
     ENVIRONMENT "VT_GLUE_FUSE=0" SKIP_RETURN_CODE 77)
 endforeach()
+# MODEL-GDN-OUTPUT-GATE-TYPE (#489), the FP8 half. Each GDN tail carries TWO fp8
+# gate-carrying constructions: the `vt::kRmsNormGatedQuantFp8` FusedRecipe copy
+# (taken at the `VT_FUSED_CHAIN_ADOPT` default) and the direct
+# `vt::RmsNormGatedQuantFp8` hand-call (taken only at =0). `FusedChainAdoptEnabled()`
+# is another read-once static, so a single run reaches exactly one of the two and
+# the other is live-but-ungated — the same defect the `_glue_fuse_off` entries
+# above were added for. Re-run the SAME binary with the lever forced to 0.
+# CUDA-only in effect: the fp8 tail needs `Platform::supports_fp8()`.
+add_test(NAME test_qwen3_5_gdn_spec_routing_fused_chain_off
+  COMMAND test_qwen3_5_gdn_spec_routing)
+set_tests_properties(test_qwen3_5_gdn_spec_routing_fused_chain_off PROPERTIES
+  ENVIRONMENT "VT_FUSED_CHAIN_ADOPT=0" SKIP_RETURN_CODE 77)
 # PERF-27B-DENSE-MARLIN-GATEUP (#365): the pre-kernel DECISIONS that route the
 # 27B's dense W4A16 MLP through the fused Marlin gate_up pair. CPU-only by
 # construction — the fused GEMM itself is CUDA + VT_MARLIN_NVFP4.
