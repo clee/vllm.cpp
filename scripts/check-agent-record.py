@@ -39,16 +39,47 @@ MATRICES = {
     # delegates it. Its only upstream implementation is the still-OPEN
     # vllm#51655; see porting-inventory.md §9 deviation 16. Bumped because a new
     # row EXISTS, never to make a transition pass.
-    # 364 since 2026-08-12: +`MODEL-TEXT-qwen3-5-qwen3-5-for-causal-lm` and
+    # 369 since 2026-08-13: +7 rows for the architectures behind official
+    # `vllm-project/recipes` models that had no row at all (#609, #610). One is
+    # pin-lag — `BailingMoeV3ForCausalLM` is registered on vLLM `main` and
+    # absent only at `555967922`. Six are out-of-repo: `MossTTSDelayModel`,
+    # `MossTTSRealtime`, `Qwen3TTSForConditionalGeneration` and
+    # `HiggsMultimodalQwen3ForConditionalGeneration` are registered by
+    # `vllm-project/vllm-omni`, and `VoxtralRealtimeForConditionalGeneration`
+    # and `BailingMMNativeForConditionalGeneration` are target-pending — their
+    # exact `config.json` architecture strings are registered in neither core
+    # vLLM `main` nor `vllm-omni`, so the rows record what was searched instead
+    # of an invented anchor. SEVEN, not eight: the audit's eighth architecture
+    # `Qwen3_5MoeForCausalLM` is rowed by #490 / PR #601, which registers it
+    # rather than only inventorying it. Two branches ADDING the same keyed row
+    # merge without a conflict and define it twice, so the row is left to its
+    # owner. None of the seven touches the at-the-pin model inventory below
+    # (324/373/356/310/261 is unchanged), because like the MuseGlimmer, KimiK3
+    # and MiniMaxH3DiT rows they carry no pinned-registry target. Bumped
+    # because seven new rows EXIST, never to make a transition pass.
+    # 363 since 2026-08-11: +`MODEL-DIFFUSION-ltx-2-5-ltx2-video-transformer-3d-model`
+    # (Lightricks LTX-2.5, 21.00B joint video+audio DiT, released 2026-08). A FOURTH
+    # beyond-pin row, and like Muse Glimmer it is absent from `555967922` because it
+    # did not exist yet. Unlike the others it is also out-of-repo: the architecture
+    # reference is Lightricks' own `LTX-2` (`ltx-core`), and vLLM-Omni's `ltx2` module
+    # stops at 2.3 (`ltx2_recipes.py:162-166`), with 2.5 still OPEN upstream at
+    # vllm-omni#6066. Same lane as the MiniMax-H3 diffusion row. Bumped because a new
+    # row EXISTS, never to make a transition pass.
+    # 372 since 2026-08-13: +`MODEL-TEXT-qwen3-5-qwen3-5-for-causal-lm` and
     # +`MODEL-TEXT-qwen3-5-qwen3-5-moe-for-causal-lm` (issue #490), the TEXT-ONLY
-    # arms of the Qwen3.5 backbone. FOURTH and FIFTH beyond-pin rows: they are not
-    # among the 326 registry architectures at `555967922` because they landed
-    # upstream afterwards (PR vllm#50210 @ `ad5d29db7`), exactly like the Muse
-    # Glimmer row above. Their Upstream cells deliberately carry no pinned
-    # module/class target, so the pin-derived static invariants in
-    # check_model_invariants are UNCHANGED — this is the row-EXISTS count only,
-    # bumped because two new rows exist, never to make a transition pass.
-    "MODEL": (AGENTS / "model-matrix.md", 364),
+    # arms of the Qwen3.5 backbone — the eighth architecture the #609/#610 audit
+    # found and deliberately left to its owner, plus its dense sibling. Both are
+    # beyond-pin: they are not among the 326 registry architectures at
+    # `555967922` because they landed upstream afterwards (PR vllm#50210 @
+    # `ad5d29db7`), exactly like the Muse Glimmer row above. Their Upstream cells
+    # deliberately carry no pinned module/class target, so the pin-derived static
+    # invariants in check_model_invariants are UNCHANGED (324/373/356/310/261) —
+    # this is the row-EXISTS count only, bumped because two new rows exist, never
+    # to make a transition pass. Written 370 -> 372 rather than the 362 -> 364
+    # this row was authored against: the #609/#610 backfill and the LTX-2.5 row
+    # landed while it was in review, and a justification framed against a number
+    # this file no longer carries would be false about the file it sits in.
+    "MODEL": (AGENTS / "model-matrix.md", 372),
     # 82 since 2026-07-21: +`QUANT-NVFP4-CT-W4A16` (compressed-tensors NVFP4A16 /
     # W4A16 — NVFP4 weights with BF16 activations, distinct from the existing
     # `QUANT-NVFP4-CT-W4A4` and `QUANT-NVFP4-MO-W4A16` rows in both scheme
@@ -381,8 +412,20 @@ ENGINE_PREFIXES = (
 # while its committed specification awaits implementation and hosted evidence.
 # No build, artifact, runtime evidence, workflow, or publication is claimed by
 # this row-count bump.
+# 153 since 2026-08-13: +`SERVE-RECIPE-ARGS` (accepted-and-inert serve arguments).
+# `vllm-serve` aborts on any unrecognized flag, so `--enable-auto-tool-choice`
+# (89 of 157 official vLLM recipes) and `--trust-remote-code` (82 of 157) stop the
+# server before model load even though neither means anything to this engine —
+# including for models we ship token-exact and gated. Found by the 2026-08-13
+# recipe-surface sweep, issue #606. The row was `SPIKE` when this bump was first
+# written against the spec-only commit; it lands `ACTIVE`, because the squash that
+# carries this line also carries the seam (`kAcceptedInertArgs` in
+# `server_main.cpp`), its test (`test_serve_recipe_args.cpp`) and the
+# `docs/USAGE.md` entry. Stated as of THIS tree rather than as of the spec commit:
+# `main` is squash-only, so a justification framed at an intermediate commit would
+# ship as a comment that is false about the file it sits in.
 # Bumped for a real new row, never to make a failing state transition pass.
-ENGINE_ROWS = 152
+ENGINE_ROWS = 153
 
 ENGINE_SUMMARY_SECTIONS = (
     ("Engine and scheduling", "Engine core and scheduling"),

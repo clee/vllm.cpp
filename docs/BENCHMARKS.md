@@ -363,9 +363,9 @@ traceable. The
 review protocol behind these numbers is guarded the same way: the reviewer and
 implementer sub-agent prompts are tracked artifacts checked by
 `check-protocol-consistency` (orchestration harness step 5/5), and
-`check-gate-commands` pins the 25 record rows that name a gate command able to
+`check-gate-commands` pins the record rows that name a gate command able to
 FAIL. That pin is exact, not shrink-only: gaining a gate command reddens it too,
-so the set is never re-pinned silently in either direction. Since 2026-08-07,
+so the set is never re-pinned silently in either direction (#621). Since 2026-08-07,
 a PR verified green merges in that same session (disposition rule).
 
 **Hardware.** NVIDIA GB10 / DGX Spark (sm_121a) for CUDA, `dgx.casa` aarch64 for
@@ -422,6 +422,7 @@ built on it rather than keeping the flattering one.
 | Clock-controlled pin grid (#520, #414, #543) | **First defensible series LANDED** at 1024/128, n=3, interleaved, one boot, flat 2184 MHz. Only c1, c4 and a partial c16 exist | c2, c8 and c32 at the pin under clock control, so the sweep is a sweep |
 | 35B low-batch MoE decode | CLOSED at low batch (c1 0.975x, c4 wins); c16 0.93x. `VT_ASYNC_DEVICE_MIRROR` **default ON for correctness**. `VT_ASYNC_EXECUTOR` Option A (H2D out of capture) A/B'd speed-NEUTRAL | c16 lever is prefill glue (task #61), not the decode drain. `test_qwen36_async_serving` GREEN |
 | CPU keep-quant MoE decode | **No number owed**: correctness-only P0. The grouped keep-quant GEMM read activations as f32 whatever their dtype, so CPU MoE decode emitted token-0 garbage from `b4f5610a` (2026-07-31) | Speed unmeasured and unclaimed; `test_ops_quant_dot` GREEN (150224 assertions) |
+| Accepted-and-inert serve args (`SERVE-RECIPE-ARGS`, #606) | **No number owed**: argument parsing only, so nothing to time and no oracle leg. Correctness gate 4 cases / 58 asserts GREEN, RED-first, mutation-proven | None. A speed axis would be fabricated; closes on review plus the operator gate rerun |
 | DeepSeek-V2-Lite MLA | Attributed miss, `ACTIVE` | Throughput at every concurrency |
 | Qwen3.5 text-only arms (#490) | **No number; gates OWED**, both `PARTIAL` | No fitting ckpt: no denominator; MoE needs NVFP4 experts: published REFUSED (§9 17e) |
 | Qwen3.5 upstream throughput levers (roadmap C10) | NOT MEASURED. vLLM's 2026-08-06 25K tok/s/GPU is a GB200/NVLink72 disaggregated cluster result, not comparable to one GB10, and is NOT adopted as our bar | Advance the parity pin past `555967922` so the referenced PRs exist, re-capture goldens at zero drift, then port the GDN prefill kernel |
@@ -435,6 +436,7 @@ built on it rather than keeping the flattering one.
 | Kimi-Linear-48B-A3B (KDA+MLA+MoE) | **RUNNER FOLD LANDS (ROW 7, §21, #122): engine==CLI 128/128 byte-identical; vs golden 122/128 (near-tie profile); FA2 MLA default-ON; SACRED green.** Server 19.0 tok/s wall; CLI 18.93 reproduced | vLLM ~21 (#111 floor; in-session re-measure ABORTED by GB10 reboot at util 0.82, §21): **~0.90×**, >= vLLM NOT met; residual = KDA host islands + grouped MoE + decode graph |
 | vLLM 0.26 re-benchmark | Pending | Re-run the binding grids on the advanced pin |
 | MiniMax-H3 FP4 speed (W-FP4a) | **Measured GB10 (`row/H3-FP4-GPU-E2E`).** Marlin W4A16 byte-exact vs bf16; fp4 a memory win, 0.8x bf16/forward. Real-ckpt fp4-resident e2e RUNS (mp4/wav) | fp4 speed CLOSED. bf16-vs-quant A/B: ENCODER half MEASURED (§8.15), DiT half NOT (no bf16 render exists). Detail: benchmark-record + spec §8 |
+| LTX-2.5 axes | Speed `PENDING` (vllm-omni#6066 has no native 2.5), binding oracle too. **SIZE: 320x192/25f completes on GB10, 448x256 does not**; that render was REGISTER-conditioned, not prompted | Wall is the HOST VAE decode, not the pool: drain returns 0.11 GiB, byte-inert. 2 baselines UNRESOLVED (lock). A real-checkpoint PROMPTED render is OWED |
 | MiniMax-H3 render coherence (`row/H3-RENDER-CLOSE` #77) | **CLOSED: a COHERENT scene on GB10.** #70/#74 white was wrong-PARTITION usage (t2va on the ref2va ckpt); t2va on the FL2VA GGUF renders a prompt-matched orange cat (adj-cos 0.95 vs 0.06, no patch-grid) | Verified first: t2va inputs byte-exact vs upstream; CUDA device==host at seq 1920. Follow-up `H3-TASK-PARTITION-GUARD`: the task/partition mismatch now RAISES 1:1 with `_resolve_task` (spec §8.6-8.7) |
 | MiniMax-H3 image conditioning (`row/H3-CONDITIONED-E2E`, `row/H3-VISION-SCATTER`, `row/H3-REF2VA-ASSEMBLY`) | **fl2va COHERENT; ref2va assembly bug FIXED+gated.** vision→cond scatter gated; ref2va block-dim double-division fixed + RED-first gated (128 vs 512) + a permanent ref2va DiT-forward rung (§8.10) | grid RE-ATTRIBUTED: with the fix ref2va grids in fp4 AND bf16, and t2va with no refs on the ref2va NVFP4 also grids while FL2VA-GGUF renders, so it is the **NVFP4 checkpoint/loader**, NOT assembly/fp4 (§8.10) |
 | MiniMax-H3 Thor render speed (sm_110, no FA2) | **34.6 s/step** at 864x480/124f/50 steps on Q4_K_M, **16.6x** off 574.5 (render ~28 min, was ~8 h). Landed: warp-per-query, chunked warp reduce-scatter (1.76x), bf16 `mma.sync` (9.82x) | Shared-memory K/V tiling (23% SLOWER) and register Q-blocking (-0.8%) both measured and REVERTED: memory traffic is not the bound (one head's K+V is 3.9 MB against 32 MB of L2) |
