@@ -1,4 +1,4 @@
-# Benchmarks
+# Benchmarks <!-- ENG-RELEASE-WINDOWS: state=ACTIVE publication=pending artifact=unpublished -->
 
 ## At a glance: W5/W6 green; validated release artifacts pending
 
@@ -6,8 +6,7 @@
 |---|---|---|---|
 | **Weight load (`ENG-LOAD-DIRECT-UPLOAD`, #150)** | Qwen3.6-27B bf16 (50.098 GiB), GB10 Vulkan, same binary both arms, interleaved under one GPU lock | **Load phase 1.54x warm** (19.27 -> 12.48 s), **1.61x cold** (52.62 -> 32.75 s); bytes moved **100.196 -> 81.260 GiB**. Every ON leg beat every OFF leg | byte-identical; 6/6 token-exact |
 | **Structured state record (active)** | v1 scalar + relational + Git-history contracts | No benchmark. At `776c56f1`: 157 imports = 3,231,342 exact bytes; append preserved all 156 wrappers/rows. 95 tests: validator/core 44 (checker 20 + core 24), NOW 18, migration 22, cutover 11. New raw-row mutation guard. | n/a |
-| **Binary release matrix (ACTIVE; required W1-W11/W13 implemented in #196)** | Eight primary CPU/CUDA/Vulkan/Metal/MLX host tuples | Adaptive x86 tiers, Vulkan 35/35 + cross-device 11/11, and metadata/mutation gates green. **PENDING:** hosted full matrix, matching hardware, tagged publish | n/a |
-| **Binary release delivery topology** | #196: read-only build/verify, OIDC attest, protected publish; generated indexes and explicit handoff-authenticated assets | Fixes the zero-binary release path by attaching all eight archive/checksum/provenance triplets plus indexes. Hosted proof pending; W12 diagnostics optional | n/a |
+| **Binary release (ACTIVE; Windows pre-alpha pending)** | v0.0.2 shipped eight primary archive/checksum/provenance triplets + two indexes (26 assets) from source SHA `7020de93652ca920424a10ac5255b34810dd2f24`, run `31466516224` | Windows W14-W16 implemented. **PENDING:** native hosted gates, merged-SHA ten-tuple dry run, matching-hardware evidence, v0.0.3-pre.1 publication, 32-asset audit | W12 optional/non-primary |
 | **Container images (ACTIVE; arm64 cuda verified on GB10 + Orin 2026-08-11)** | `ENG-RELEASE-CONTAINERS` ([spec](../.agents/specs/container-images.md)) | cpu amd64 783 MB; cuda arm64 **1.71 GB**. GB10 `sm_121a`: `/health`+`/version`+SIGTERM on `--gpus all`. Orin `sm_87` (Tegra): Qwen3-0.6B **generates**, GPU **GR3D 95-97%** | n/a |
 | **Developer/row protocol** | Contribution entry point; `ENG-NOW-DERIVED` #374 @`dbd0d51c` | Entry-point gates retained. #374 W1-W5 DONE; benchmark/runtime/parity `VOID`; row specs now carry `## Now` | n/a |
 | **LoRA runtime W2** (`LORA-RUNTIME`, #278) | **No number owed:** correctness-only; a grid PENDS the W7 model gate |
@@ -35,9 +34,16 @@ registry-bound list in [FEATURES.md](FEATURES.md).
 ## vLLM, online serving
 
 The binding comparison. vLLM runs its **production graphed config**, never
-`--enforce-eager`, because the graphed config is the honest denominator.
+`--enforce-eager`. The oracle column is what RAN, which is **not the pin**
+`555967922`: the harness enforced `0.25.0` and *raised* on anything else until
+2026-08-12, so those rows could not have been measured otherwise
+([#520](https://github.com/mudler/vllm.cpp/issues/520)). Attributed, not
+withdrawn; the two tie where checked (27B c1, 0.9983, n=3). A grid at the pin is
+owed ([#522](https://github.com/mudler/vllm.cpp/issues/522)), and the absent
+`--language-model-only` flatters these ratios
+([#414](https://github.com/mudler/vllm.cpp/issues/414)).
 
-| Model | Quant | vLLM pin | Axes passing | Disposition |
+| Model | Quant | vLLM oracle | Axes passing | Disposition |
 |---|---|---|---:|---|
 | Qwen3.6-27B | NVFP4 (`unsloth` @`890bdef7`) | 0.25.0 | **115/124** | Effective parity-or-better, two-grid totality. Revision-PINNED (the gate no longer lets `readdir` choose): @`ccdaab7e` is the same repo name re-quantized to FP8 W8A8 throughout, not NVFP4 |
 | Qwen3.6-27B | NVFP4 (`nvidia` @`0893e160`, ModelOpt `modelopt_mixed`) | 0.25.0 | 0/6 | **BEHIND, uniformly 0.94x** on decode, flat c1-c32 (6-point, `gate_pass:false`); greedy continuation IDENTICAL to vLLM. Different model from the `unsloth` row (NVFP4 MLP + FP8 W8A8 tower) |
@@ -88,18 +94,17 @@ the same metric at higher concurrency (c8 p99 ITL 0.86x, but 1.055x at c16 and
 | **vllm.cpp** tok/s (canonical 2026-08-11) | 10.756 | 19.232 | 32.365 | 50.520 | 69.040 | 84.064 |
 | vLLM 0.25.0 tok/s (canonical 2026-08-11) | 11.250 | 20.153 | 34.281 | 53.666 | 73.114 | 89.706 |
 | **Ratio BINDING (main @`348c265d`, n=3 both arms)** | **0.9561x** | **0.9543x** | **0.9441x** | **0.9414x** | **0.9443x** | **0.9371x** |
-| Ratio 2026-08-10, same SHA (SUPERSEDED) | 0.8384x | 0.9637x | 0.9545x | 0.9670x | not run | not run |
 | Driver verdict | `{"gate_pass": false}`; first six-point grid here. Levers `lm_head`+qkvz ACTIVE by kernel signature | | | | | |
 | OPEN, and what it retracts | vLLM reproduces to 1.0%, OURS moved +14.8% at c1; lottery REFUTED (6 loads, 1.0046x); build diff leads. "c1 did not move" withdrawn: c1 was noise-dominated ([#349](https://github.com/mudler/vllm.cpp/issues/349)) | | | | | |
 
 | Noise band, measured BEFORE any delta | ±0.03% c1 back-to-back; 0.29-1.85% leg-to-leg with reload, drifting down on BOTH arms so it cancels in the ratio | | |
-| c16, c32 | NOT MEASURED. Both canonical attempts void: denominator contended mid-timing once, host OOM-reboot once | | |
 | Startup, cold to `/health` | 33.38 s vs vLLM 182.41 s = **5.46x faster** | | |
 | Peak host RSS | 21.10 vs 13.09 GiB = **1.612x, BELOW FLOOR, open gap** | | |
 | Peak GPU memory | PENDING: `nvidia-smi` returns N/A on this unified-memory part | | |
 | Step attribution (nsys, node-level, both arms same tool) | ours 98.906 vs vLLM 81.577 ms/step, 99.2/99.3% GPU-busy; lm_head 8.6414 + fp8 tower 7.6068 + splitK 0.0532 + other 1.0279 = **17.3292 vs measured 17.3292** | | |
 | Lever 1, `lm_head` | ships U8/NVFP4 (0.666 GiB), we read 2.368 GiB BF16: **+1.702 GiB/step**, 11.183 ms. Marlin efficiency is EQUAL (207.9 vs 210.0 GiB/s), only bytes differ | | |
 | Lever 2, GDN fp8 in_proj | identical 6.7188 GiB/step both arms; ours 96 GEMMs at 165.9 GiB/s vs vLLM 48 merged qkvz at 204.3; `in_proj_qkv` at **129.3 vs 213.6 GiB/s** | | |
+| Lever 2b, packed GDN decode (#365) | separate c1 in16/out256 harness: 0.977x -> 0.984x, INDICATIVE not binding (arms not interleaved); see the record | | | | | |
 | OPEN: host-memory-state sensitivity | same binaries read c1 0.7604 pre-reboot vs 0.8289 post; vLLM barely moved. Protocols also differed, variables not separated | | |
 | Spread, ours / vLLM | 1.000 / 1.006 | 1.009 / 1.069 | 1.001 / 1.001 | 1.005 / 1.003 |
 | Method | medians of 3, warm servers, one `flock`, greedy, `ignore_eos` so both emit exactly 128 tokens, `--gpu-memory-utilization 0.55 --max-model-len 4096`, vLLM in its production graphed config | | | |
@@ -126,13 +131,14 @@ the same metric at higher concurrency (c8 p99 ITL 0.86x, but 1.055x at c16 and
 
 | Concurrency | 1 | 2 | 4 | 8 | 16 | 32 |
 |---|---:|---:|---:|---:|---:|---:|
-| **vllm.cpp** tok/s | 65.6 | 93.6 | 142.9 | 197.6 | 256.2 | 323.1 |
-| vLLM tok/s | 67.0 | 99.9 | 150.6 | 211.3 | 272.9 | 333.6 |
-| **Ratio** | **0.979x** | 0.937x | 0.949x | 0.935x | 0.939x | 0.969x |
-| Mean TPOT | 0.978x | 0.945x | 0.943x | 0.938x | 0.930x | 0.967x |
-| Mean TTFT | 0.972x | **0.872x** | 0.970x | 0.965x | 0.969x | 0.968x |
-| Our CoV | 0.39% | 0.26% | 0.59% | 0.60% | 0.37% | 0.41% |
-| vLLM CoV | 0.62% | 0.35% | 0.81% | 0.57% | 0.50% | 0.35% |
+| **Ratio, CANONICAL @`348c265d`** | **0.9708x** | 0.9293x | **0.9719x** | 0.9183x | 0.9264x | 0.9377x |
+| **vllm.cpp** tok/s @`348c265d` | 65.262 | 93.012 | 140.174 | 193.477 | 251.490 | 311.897 |
+| vLLM tok/s @`348c265d` | 67.223 | 100.088 | 144.226 | 210.679 | 271.479 | 332.606 |
+| Ratio, superseded @`a0fa12c7` | 0.979x | 0.937x | 0.949x | 0.935x | 0.939x | 0.969x |
+| Mean TPOT @`a0fa12c7` | 0.978x | 0.945x | 0.943x | 0.938x | 0.930x | 0.967x |
+| Mean TTFT @`a0fa12c7` | 0.972x | **0.872x** | 0.970x | 0.965x | 0.969x | 0.968x |
+| Our CoV @`a0fa12c7` | 0.39% | 0.26% | 0.59% | 0.60% | 0.37% | 0.41% |
+| vLLM CoV @`a0fa12c7` | 0.62% | 0.35% | 0.81% | 0.57% | 0.50% | 0.35% |
 
 **There is no isolated c2/c8 weakness.** Binding grid at `a0fa12c7`
 (2026-08-10), 3 reps, binding-eligible 12/12; the prior c2 0.87x / c8 0.92x
@@ -263,6 +269,8 @@ it goes our way. Output tokens are **byte-identical** to llama.cpp's greedy
 decode and to our own CPU reference path. Single-stream only: we have not
 measured concurrent serving against llama.cpp's server.
 
+**x86_64 arm, first measured 2026-08-11 (#433).** Both arms above are AArch64 and their levers are Arm-only. Peak RSS **1.0022x, a hairline OPEN GAP**; prefill/decode/E2E **`PENDING` a quiet host**; CIQ `G5` open ([evidence](bench-evidence/cpu-x86-llamacpp-20260811.md)).
+
 ## MLX-LM, Apple M4
 
 Qwen3-0.6B, warm, batch 1, 6 interleaved runs.
@@ -336,7 +344,7 @@ in the tree, default-OFF, for reproducibility; detail in the benchmark record.
 | MTP | Qwen3.6-27B NVFP4 | token-identical to vLLM MTP, **~4% faster at c1**; on-par at c2-c8 | `DONE` |
 | DFlash | Qwen3.6-27B NVFP4 | **2.9x over spec-off** (10.16 → 29.32 tok/s), at/above vLLM DFlash-on (**1.003x**, non-overlapping bands) | `DONE` |
 | n-gram | Qwen3.6-27B NVFP4 | draft-free (`SPEC-NGRAM`); 27B 5/5 STRICT our-ngram-ON == vLLM-ngram-ON, 180/180 drafts accepted (correctness only, no speed row yet) | `DONE` |
-| DSpark | 27B NVFP4 dense k=15; 35B-A3B MoE k=8 | vs the **pinned, graphed** oracle: MoE **0.92-0.98x**, acceptance matches upstream (20.8% vs 20.4%); dense **0.35-0.94x**, upstream accepting **49.3%** to our 12.2% (issue #430) | `ACTIVE` |
+| DSpark | 27B NVFP4 dense k=15; 35B-A3B MoE k=8 | MoE **0.975x** code / **1.012x** prose vs the pinned graphed oracle (PINNED CLOCKS, non-overlapping). NOT parity: **0.965x-0.976x** within-session; C_tmp cap landed but is perf-NEUTRAL (+0.03%) (#442) | `ACTIVE` |
 | Breadth (EAGLE1/3, suffix, ngram-gpu, dynamic-k, ...) | n/a | enumerated from vLLM source + `INVENTORIED` 2026-08-06 (`.agents/specs/spec-decode-inventory.md`), unmeasured | `INVENTORIED` |
 
 ## How we measure
@@ -409,12 +417,13 @@ built on it rather than keeping the flattering one.
 | DeepSeek-V4-Flash vs vLLM | Infeasible on one Spark | 2x GB10 with TP2 over the NCCL seam |
 | Tensor parallelism (task #287 spike, 2026-08-08) | **No number owed** (`benchmark_binding=false`): records-only scope at pin `555967922` ([spec](../.agents/specs/tensor-parallelism-spike.md)). TP-W1 landed (group table, 6/6); TP-W2..W7 gate on token-exactness, not speed | Perf gate is TP-W6: at or above vLLM TP=2 on every axis, same 2-GPU box (PENDING-HW) |
 | Multimodal image, audio, video | Correctness gated, speed unmeasured | Per-modality speed grids |
+| Voxtral enc attn (`VT_WHISPER_ENC_FA2`, #432) | FA-2 hd-64: 731.7 -> 133.0 ms (5.50x); enc fwd (not TTFT) vs pin TTFT 46.02: 15.90x -> 2.89x | **OPT-IN**: 3 near-tie diverg (band PASS) vs 0. Dev call |
 | `/v1/videos` OpenAI + ONE-SURFACE ROW 2 | **No number owed:** ABI-v12 device selection is backend-dispatch plumbing; generation math and speed paths are unchanged | DSR 34→32; baseline/allowlist unchanged; 25/25 checker mutations; CPU fold 6/137, including one-queue/device-provenance mutations |
 | Qwen3-dense decode CUDA-graph | Token-exact pass, ~4.3% e2e directional | Steady-state per-step tok/s |
 | Kimi-Linear-48B-A3B (KDA+MLA+MoE) | **RUNNER FOLD LANDS (ROW 7, §21, #122): engine==CLI 128/128 byte-identical; vs golden 122/128 (near-tie profile); FA2 MLA default-ON; SACRED green.** Server 19.0 tok/s wall; CLI 18.93 reproduced | vLLM ~21 (#111 floor; in-session re-measure ABORTED by GB10 reboot at util 0.82, §21): **~0.90×**, >= vLLM NOT met; residual = KDA host islands + grouped MoE + decode graph |
 | vLLM 0.26 re-benchmark | Pending | Re-run the binding grids on the advanced pin |
 | MiniMax-H3 FP4 speed (W-FP4a) | **Measured GB10 (`row/H3-FP4-GPU-E2E`).** Marlin W4A16 byte-exact vs bf16; fp4 a memory win, 0.8x bf16/forward. Real-ckpt fp4-resident e2e RUNS (mp4/wav) | fp4 speed CLOSED. bf16-vs-quant A/B: ENCODER half MEASURED (§8.15), DiT half NOT (no bf16 render exists). Detail: benchmark-record + spec §8 |
-| LTX-2.5 axes | BOTH `PENDING`. Speed: no native vLLM-Omni 2.5 (vllm-omni#6066), its diffusers adapter is a black box, so no production denominator. Correctness vs that BINDING oracle also pending | Bricks gate vs the ltx-core cross-check; max abs diff in the spec |
+| LTX-2.5 axes | Speed `PENDING` (vllm-omni#6066 has no native 2.5), binding oracle too. **SIZE: 320x192/25f completes on GB10, 448x256 does not** | Wall is the HOST VAE decode, not the pool: drain returns 0.11 GiB, byte-inert. 2 baselines UNRESOLVED (lock) |
 | MiniMax-H3 render coherence (`row/H3-RENDER-CLOSE` #77) | **CLOSED: a COHERENT scene on GB10.** #70/#74 white was wrong-PARTITION usage (t2va on the ref2va ckpt); t2va on the FL2VA GGUF renders a prompt-matched orange cat (adj-cos 0.95 vs 0.06, no patch-grid) | Verified first: t2va inputs byte-exact vs upstream; CUDA device==host at seq 1920. Follow-up `H3-TASK-PARTITION-GUARD`: the task/partition mismatch now RAISES 1:1 with `_resolve_task` (spec §8.6-8.7) |
 | MiniMax-H3 image conditioning (`row/H3-CONDITIONED-E2E`, `row/H3-VISION-SCATTER`, `row/H3-REF2VA-ASSEMBLY`) | **fl2va COHERENT; ref2va assembly bug FIXED+gated.** vision→cond scatter gated; ref2va block-dim double-division fixed + RED-first gated (128 vs 512) + a permanent ref2va DiT-forward rung (§8.10) | grid RE-ATTRIBUTED: with the fix ref2va grids in fp4 AND bf16, and t2va with no refs on the ref2va NVFP4 also grids while FL2VA-GGUF renders, so it is the **NVFP4 checkpoint/loader**, NOT assembly/fp4 (§8.10) |
 | MiniMax-H3 Thor render speed (sm_110, no FA2) | **34.6 s/step** at 864x480/124f/50 steps on Q4_K_M, **16.6x** off 574.5 (render ~28 min, was ~8 h). Landed: warp-per-query, chunked warp reduce-scatter (1.76x), bf16 `mma.sync` (9.82x) | Shared-memory K/V tiling (23% SLOWER) and register Q-blocking (-0.8%) both measured and REVERTED: memory traffic is not the bound (one head's K+V is 3.9 MB against 32 MB of L2) |
@@ -428,7 +437,7 @@ built on it rather than keeping the flattering one.
 | Startup latency (cold to first `/health`) | **36.51 s vs vLLM 0.25.0's 221.51 s = 6.07x** (medians of 3, 27B-NVFP4, GB10). PROVISIONAL: 3 of 6 legs contended, repeat killed by a host reboot. [Detail](../.agents/benchmark-record.md) | Uncontended 3-rep re-run on a quiet box |
 | Speculation depth (`ROAD-V1-D3-SPEC-K`, #81) | **Never measured, MTP is k=1** (our port covers vLLM's k=1 branch only), so no acceptance-vs-depth curve exists | k=2..4 three-way greedy gate, then the c1/c>1 A/B + the per-workload (prose vs code) acceptance-vs-depth curve any dynamic or adaptive depth policy needs |
 | Vulkan vs llama.cpp Vulkan (`BENCH-VK-LLAMA`) | 25 NATIVE (+8 GDN). **27B prefill 21.5x**; decode **4.36 vs 4.35, MET** (7 clean legs). Smart barriers skip 19.8%/tok, GPU -1.09 ms; e2e 8/12, unresolved. OFF. [source](../benchmarks/demo/vulkan_27b_llamacpp.json) | `VK-C` coopmat A/B on Thor (`VT_VULKAN_COOPMAT=0` A/Bs it): **11.1x-32.9x** vs our UNTILED scalar kernel, not vs a competent GEMM. `VK-E`: llama.cpp `-DGGML_VULKAN=ON` at `237ad9b96` on dgx, same GGUF, three columns |
-| ROCm (`BACKEND-GATE-ROCM-VLLM` / `-SGLANG`) | **NOT APPLICABLE: no number measured, claimed or owed.** W0 ctest-green on 4 gfx archs (#41); gfx1201 hipBLAS + Gemma-4 MoE (#140, contributor) ran M0/M1 on 2× R9700, our side CPU-link-verified only. No AMD HW here | The approach-(b) fix (PENDING community) unblocks the first APU model run (M2); the gate becomes a same-box vLLM-ROCm oracle once a model runs ([#41](https://github.com/mudler/vllm.cpp/issues/41)); floor: vLLM |
+| ROCm (`BACKEND-GATE-ROCM-VLLM` / `-SGLANG`) | **PENDING: no binding throughput number.** Runtime-green on 5 gfx archs. Gemma-3 is 48/48 exact vs two vLLM-ROCm oracles; Qwen3.5-0.8B correctness remains open | Same model, quantization, request shape and cache policy vs pinned vLLM-ROCm on one idle AMD host. Add equivalent SGLang; close correctness first ([#41](https://github.com/mudler/vllm.cpp/issues/41)) |
 | Tenstorrent Blackhole (`BACKEND-TENSTORRENT`) | **NOT APPLICABLE (speed).** Correctness: OPT-125m STRICT 6/6 e2e on real hardware. Qwen3-0.6B has a device-specific golden and short 4-token warm smoke (~0.28 tok/s), not a completed speed run | Full 16x16 Qwen3 gate, then device-resident tensors + `ttnn::sdpa_decode` before any performance comparison. [Spec](../.agents/specs/tenstorrent-backend.md) |
 | Prompt logprobs (`SAMPLE-PROMPT-LOGPROBS`, #223) | **NO number measured, claimed or owed.** Correctness-only, CPU. Upstream ships this path explicitly unoptimized (`gpu_model_runner.py:5622-5623`); a step where no request asks is unchanged | Floor if one is ever wanted: vLLM's own `prompt_logprobs=k`, same model and prompt |
 | `logprobs_mode` (`SAMPLE-LOGPROB-TOKEN-IDS`, #238) | **NO number measured, claimed or owed.** Correctness-only, CPU. One [n, vocab] device->host copy per step when a processed mode is engaged, nothing when not | Nothing to close: observation modes, not a path vLLM optimizes either |

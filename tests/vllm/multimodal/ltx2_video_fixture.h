@@ -234,12 +234,57 @@ inline vllm::Ltx2DitParams ReducedDitParams() {
   return p;
 }
 
+// ── the embeddings connector ───────────────────────────────────────────────
+//
+// The two `*_embeddings_connector` families the shipped DiTs carry (129 tensors
+// each) and that phase L9c wires into the render path. Reduced in every axis the
+// shipped one is reduced in, and NOT reduced in the one that decides the
+// substitution: `num_learnable_registers` tiles across the sequence, so the
+// prompt row count must be a multiple of it.
+struct ReducedConnectorOptions {
+  bool present = true;
+  int64_t num_layers = 2;
+  int64_t num_learnable_registers = 2;
+  bool gated = true;
+  bool ff_bias = true;
+  // Seeds the connector's own parameter stream. A second value writes a DIFFERENT
+  // connector into an otherwise byte-identical checkpoint, which is how a test
+  // proves the render actually READS these weights.
+  std::string tag = "a";
+  // Write the audio family too. `false` is the half-a-connector checkpoint the
+  // engine refuses.
+  bool audio = true;
+};
+
+// The connector configuration the fixture's own tensors are written from, so the
+// config the engine parses and the shapes it finds can never disagree by
+// accident — only when a test makes them.
+inline vllm::Ltx2ConnectorConfig ReducedConnectorConfig(const vllm::Ltx2DitParams& params,
+                                                        const ReducedConnectorOptions& options,
+                                                        vllm::Ltx2ConnectorStream stream) {
+  vllm::Ltx2ConnectorConfig c;
+  c.prefix = vllm::Ltx2ConnectorCheckpointPrefix(stream);
+  const bool video = stream == vllm::Ltx2ConnectorStream::kVideo;
+  c.num_attention_heads = video ? params.num_attention_heads : params.audio_num_attention_heads;
+  c.attention_head_dim = video ? params.attention_head_dim : params.audio_attention_head_dim;
+  c.num_layers = options.num_layers;
+  c.num_learnable_registers = options.num_learnable_registers;
+  c.apply_gated_attention = options.gated;
+  c.ff_bias = options.ff_bias;
+  c.rope_type = vllm::Ltx2RopeType::kSplit;
+  c.double_precision_rope = true;  // the shipped config's frequencies_precision
+  c.positional_embedding_max_pos = {4096};
+  return c;
+}
+
 // The DiT's `{"transformer": {...}}` object, exactly as the first-party
 // `Lightricks/LTX-2.5` DiT carries it in `__metadata__["config"]`. Built
 // separately from the file writer because two callers need it: the writer, and a
 // test that has to hand the SAME config to the engine through the
 // `dit_config_path` extra for a checkpoint that declares none.
-inline nlohmann::json ReducedDitTransformerConfig(const vllm::Ltx2DitParams& params) {
+inline nlohmann::json ReducedDitTransformerConfig(
+    const vllm::Ltx2DitParams& params,
+    const ReducedConnectorOptions& connector = ReducedConnectorOptions{}) {
   nlohmann::json transformer;
   transformer["_class_name"] = "AVTransformer3DModel";
   // Every key `LTXModelConfigurator.from_metadata` runs `check_config_value` on
@@ -290,6 +335,19 @@ inline nlohmann::json ReducedDitTransformerConfig(const vllm::Ltx2DitParams& par
   transformer["ff_bias"] = params.ff_bias;
   transformer["rope_type"] = "split";
   transformer["use_middle_indices_grid"] = params.use_middle_indices_grid;
+  // The `connector_*` keys the two Embeddings1DConnector configurators read
+  // (embeddings_connector.py:194-256). `connector_positional_embedding_max_pos`
+  // is the one the shipped config moves OFF its class default of [1], and it
+  // divides every token index, so it is written at the shipped [4096].
+  transformer["connector_num_attention_heads"] = params.num_attention_heads;
+  transformer["connector_attention_head_dim"] = params.attention_head_dim;
+  transformer["audio_connector_num_attention_heads"] = params.audio_num_attention_heads;
+  transformer["audio_connector_attention_head_dim"] = params.audio_attention_head_dim;
+  transformer["connector_num_layers"] = connector.num_layers;
+  transformer["connector_num_learnable_registers"] = connector.num_learnable_registers;
+  transformer["connector_apply_gated_attention"] = connector.gated;
+  transformer["connector_ff_bias"] = connector.ff_bias;
+  transformer["connector_positional_embedding_max_pos"] = std::vector<int64_t>{4096};
   return transformer;
 }
 
@@ -311,6 +369,7 @@ struct ReducedDitOptions {
   bool declare_config = true;
   bool declare_model_version = true;
   nlohmann::json transformer_overrides = nlohmann::json::object();
+  ReducedConnectorOptions connector;
 };
 
 // Write the DiT in the shipped ComfyUI + FP8 shape: every rank-2 `*.weight`
@@ -343,9 +402,42 @@ inline void WriteReducedDit(const vllm::Ltx2DitParams& params, const std::string
       entries.push_back({full, "BF16", spec.shape, std::move(values)});
     }
   }
+  // The connector families, written in the SAME FP8/BF16 split. They sit beside
+  // the DiT contract, not inside it — upstream loads them into the text
+  // encoder's EmbeddingsProcessor (encoder_configurator.py:331-346) — which is
+  // why they are enumerated from their own contract rather than the DiT's.
+  if (options.connector.present) {
+    std::vector<vllm::Ltx2ConnectorStream> streams = {vllm::Ltx2ConnectorStream::kVideo};
+    if (options.connector.audio) streams.push_back(vllm::Ltx2ConnectorStream::kAudio);
+    for (const vllm::Ltx2ConnectorStream stream : streams) {
+      const vllm::Ltx2ConnectorConfig c =
+          ReducedConnectorConfig(params, options.connector, stream);
+      for (const vllm::Ltx2ConnectorTensorSpec& spec : vllm::EnumerateLtx2ConnectorTensors(c)) {
+        int64_t numel = 1;
+        for (const int64_t d : spec.shape) numel *= d;
+        const std::string full = prefix + spec.name;
+        std::vector<float> values =
+            Param("ltx2.conn." + options.connector.tag + "." + spec.name, numel, 0.08);
+        // MEASURED from the shipped `vonkaiser` FP8 DiT header: every rank-2
+        // tensor of this family is F8_E4M3 with an F32 sidecar, `learnable_registers`
+        // INCLUDED (`...learnable_registers` + `...learnable_registers_scale`).
+        // That is not the DiT's rule — there the scale-shift tables stay F32 —
+        // so it is stated from the file rather than inherited.
+        const bool quantizable = spec.shape.size() == 2;
+        if (quantizable) {
+          constexpr float kScale = 0.5F;
+          for (float& v : values) v /= kScale;
+          entries.push_back({full, "F8_E4M3", spec.shape, std::move(values)});
+          entries.push_back({full + "_scale", "F32", {}, {kScale}});
+        } else {
+          entries.push_back({full, "BF16", spec.shape, std::move(values)});
+        }
+      }
+    }
+  }
   nlohmann::json metadata = nlohmann::json::object();
   if (options.declare_config) {
-    nlohmann::json transformer = ReducedDitTransformerConfig(params);
+    nlohmann::json transformer = ReducedDitTransformerConfig(params, options.connector);
     transformer.update(options.transformer_overrides);
     nlohmann::json config;
     config["transformer"] = transformer;
@@ -368,8 +460,10 @@ inline void WriteReducedDit(const vllm::Ltx2DitParams& params, const std::string
 // what the engine's `dit_config_path` extra reads.
 inline void WriteDitConfigJson(const vllm::Ltx2DitParams& params, const std::string& path,
                                const nlohmann::json& transformer_overrides =
-                                   nlohmann::json::object()) {
-  nlohmann::json transformer = ReducedDitTransformerConfig(params);
+                                   nlohmann::json::object(),
+                               const ReducedConnectorOptions& connector =
+                                   ReducedConnectorOptions{}) {
+  nlohmann::json transformer = ReducedDitTransformerConfig(params, connector);
   transformer.update(transformer_overrides);
   nlohmann::json config;
   config["transformer"] = transformer;
@@ -772,7 +866,12 @@ struct Paths {
   std::string dit, video_vae, audio_vae, upsampler, video_embeds, audio_embeds;
 };
 
-inline Paths WriteFixture(const std::string& dir, int64_t prompt_tokens = 3) {
+// `prompt_tokens` defaults to 4, not 3: the connector's register table is TILED
+// across the sequence (embeddings_connector.py:144), so the row count must be a
+// multiple of `ReducedConnectorOptions::num_learnable_registers` (2), and 4 makes
+// the tiling repeat twice rather than once — a single repeat cannot separate a
+// tiled table from an indexed one.
+inline Paths WriteFixture(const std::string& dir, int64_t prompt_tokens = 4) {
   ::mkdir(dir.c_str(), 0755);
   const vllm::Ltx2DitParams dit = ReducedDitParams();
   Paths p;

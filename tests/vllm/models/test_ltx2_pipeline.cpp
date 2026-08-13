@@ -1727,3 +1727,193 @@ TEST_CASE("ltx2 the connector's learnable registers are stored BFLOAT16, and rou
   INFO("refusal = ", message);
   CHECK(Mentions(message, "learnable_registers"));
 }
+
+// ===========================================================================
+// Section 10a — the PROCESSOR around the two connectors (phase L9c)
+// ===========================================================================
+//
+// `EmbeddingsProcessor.create_embeddings` (embeddings_processor.py:70-95) is a
+// separate module from the connector, and the two things it does that the
+// connector does not are both invisible to a value golden of the connector
+// itself. They are gated here by their upstream-stated PROPERTIES rather than by
+// a new golden, because a golden generated through the same helper the port uses
+// proves the two agree and not that either is right — this project has recorded
+// that failure once already.
+
+namespace {
+
+// Two independently seeded bags at the two stream widths the shipped checkpoint
+// uses, so the video and audio connectors cannot accidentally be the same module.
+vllm::Ltx2ConnectorConfig ProcessorConfig(const std::string& prefix, int64_t heads,
+                                          int64_t head_dim, int64_t registers) {
+  vllm::Ltx2ConnectorConfig config;
+  config.attention_head_dim = head_dim;
+  config.num_attention_heads = heads;
+  config.num_layers = vllm_test::kLtx2ConnLayers;
+  config.positional_embedding_theta = vllm_test::kLtx2ConnTheta;
+  config.positional_embedding_max_pos = {4096};  // the shipped connector bound
+  config.num_learnable_registers = registers;
+  config.rope_type = vllm::Ltx2RopeType::kSplit;
+  config.double_precision_rope = true;
+  config.apply_gated_attention = true;
+  config.ff_bias = true;
+  config.prefix = prefix;
+  return config;
+}
+
+ParamBag ProcessorBag(const vllm::Ltx2ConnectorConfig& config) {
+  ParamBag bag;
+  for (const vllm::Ltx2ConnectorTensorSpec& spec : vllm::EnumerateLtx2ConnectorTensors(config)) {
+    bag.Put(spec.name, spec.shape);
+  }
+  return bag;
+}
+
+}  // namespace
+
+TEST_CASE("ltx2 the processor is PADDING-SIDE AGNOSTIC, which is what the sort is for") {
+  // "Connectors expect right-padded input ([valid, pad]). Normalize layout here
+  // so the upstream tokenizer can keep using either side without coupling to the
+  // connector." — embeddings_processor.py:80-82.
+  //
+  // THE DEFECT THIS CATCHES. The register table is indexed by ABSOLUTE position
+  // (`s % num_registers`), not by which positions were padded, so a LEFT-padded
+  // batch handed straight to the connector puts registers where caption tokens
+  // belong. The result is finite, correctly shaped, and conditioned on the wrong
+  // thing — which no shape or finiteness check can see. Skipping the sort makes
+  // these two renders DIFFER; upstream's own contract is that they are the same.
+  const int64_t batch = 1, seq = 4, valid = 2;
+  const vllm::Ltx2ConnectorConfig vcfg = ProcessorConfig("ltx2.proc.v.", 3, 8, 2);
+  const vllm::Ltx2ConnectorConfig acfg = ProcessorConfig("ltx2.proc.a.", 2, 4, 2);
+  const ParamBag vbag = ProcessorBag(vcfg);
+  const ParamBag abag = ProcessorBag(acfg);
+  const int64_t vdim = vcfg.inner_dim(), adim = acfg.inner_dim();
+
+  const std::vector<float> real_v = Make("ltx2.proc.real.v", valid * vdim, 1.0);
+  const std::vector<float> real_a = Make("ltx2.proc.real.a", valid * adim, 1.0);
+  const std::vector<float> junk_v = Make("ltx2.proc.junk.v", (seq - valid) * vdim, 1.0);
+  const std::vector<float> junk_a = Make("ltx2.proc.junk.a", (seq - valid) * adim, 1.0);
+
+  auto build = [&](bool pad_left, const std::vector<float>& real, const std::vector<float>& junk,
+                   int64_t width) {
+    std::vector<float> out;
+    if (pad_left) {
+      out.insert(out.end(), junk.begin(), junk.end());
+      out.insert(out.end(), real.begin(), real.end());
+    } else {
+      out.insert(out.end(), real.begin(), real.end());
+      out.insert(out.end(), junk.begin(), junk.end());
+    }
+    (void)width;
+    return out;
+  };
+  auto mask_of = [&](bool pad_left) {
+    std::vector<float> m(static_cast<size_t>(seq), 0.0f);
+    for (int64_t s = 0; s < seq - valid; ++s) {
+      m[static_cast<size_t>(pad_left ? s : valid + s)] = -std::numeric_limits<float>::max();
+    }
+    return m;
+  };
+
+  const std::vector<float> right_v = build(false, real_v, junk_v, vdim);
+  const std::vector<float> right_a = build(false, real_a, junk_a, adim);
+  const std::vector<float> left_v = build(true, real_v, junk_v, vdim);
+  const std::vector<float> left_a = build(true, real_a, junk_a, adim);
+  const std::vector<float> right_mask = mask_of(false);
+  const std::vector<float> left_mask = mask_of(true);
+
+  const vllm::Ltx2ConnectorEmbeddings from_right = vllm::Ltx2ConnectorCreateEmbeddings(
+      vcfg, vbag.weights, right_v.data(), acfg, abag.weights, right_a.data(), right_mask.data(),
+      batch, seq);
+  const vllm::Ltx2ConnectorEmbeddings from_left = vllm::Ltx2ConnectorCreateEmbeddings(
+      vcfg, vbag.weights, left_v.data(), acfg, abag.weights, left_a.data(), left_mask.data(),
+      batch, seq);
+
+  const double video_worst =
+      MaxAbsDiff(from_left.video, from_right.video.data(), from_right.video.size());
+  const double audio_worst =
+      MaxAbsDiff(from_left.audio, from_right.audio.data(), from_right.audio.size());
+  INFO("padding-side agnostic: video max|diff| = ", video_worst, " audio max|diff| = ",
+       audio_worst);
+  CHECK(video_worst <= kExactRoundOff);
+  CHECK(audio_worst <= kExactRoundOff);
+
+  // THE CONTROL. The two inputs really are different buffers, so the equality
+  // above is the sort working and not two identical arrays compared to
+  // themselves. Without this the case passes on a port that ignores its input.
+  CHECK(left_v != right_v);
+  CHECK(left_a != right_a);
+  // ...and with registers on, every position is attendable (:152).
+  for (const float m : from_right.mask) CHECK(m == 1.0f);
+}
+
+TEST_CASE("ltx2 the processor's binary mask mirrors a comparison that looks backwards") {
+  // `_to_binary_mask` is `encoded_mask < 0.000001` (embeddings_processor.py:46-48).
+  // An additive mask holds 0.0 for KEPT and -finfo(f32).max for PADDED, and BOTH
+  // are `< 0.000001` — so the mask this produces is ONE EVERYWHERE, at every
+  // position, for every input either reference can produce, and the video-only
+  // multiply that follows it is an identity.
+  //
+  // THIS CASE EXISTS BECAUSE THE INTENT-READING IS THE OPPOSITE. A port that
+  // reasoned "keep the unmasked ones" would write `>= 0`, get 0 at padded
+  // positions, zero the video encoding there, and hand the DiT a mask that
+  // masks. It would look more correct and it would not be a port. Written as a
+  // gate on the SURPRISING behaviour so that "fixing" it REDs.
+  //
+  // Confirmed on BOTH references before being pinned, because a line this odd is
+  // where one implementation being wrong would show: `diffusers`
+  // `LTX2TextConnectors.forward` writes `(video_attn_mask < 1e-6).to(torch.int64)`
+  // and the same video-only multiply. They agree, down to the constant.
+  //
+  // Registers are DISABLED here so the connector passes the caller's mask through
+  // instead of zeroing it — that is the only configuration in which the two
+  // readings differ at all.
+  const int64_t batch = 1, seq = 4, valid = 2;
+  const vllm::Ltx2ConnectorConfig vcfg = ProcessorConfig("ltx2.proc.nv.", 3, 8, 0);
+  const vllm::Ltx2ConnectorConfig acfg = ProcessorConfig("ltx2.proc.na.", 2, 4, 0);
+  const ParamBag vbag = ProcessorBag(vcfg);
+  const ParamBag abag = ProcessorBag(acfg);
+  const int64_t vdim = vcfg.inner_dim(), adim = acfg.inner_dim();
+
+  const std::vector<float> hidden_v = Make("ltx2.proc.nv.hidden", batch * seq * vdim, 1.0);
+  const std::vector<float> hidden_a = Make("ltx2.proc.na.hidden", batch * seq * adim, 1.0);
+  std::vector<float> mask(static_cast<size_t>(seq), 0.0f);
+  for (int64_t s = valid; s < seq; ++s) mask[static_cast<size_t>(s)] = -std::numeric_limits<float>::max();
+
+  const vllm::Ltx2ConnectorEmbeddings got = vllm::Ltx2ConnectorCreateEmbeddings(
+      vcfg, vbag.weights, hidden_v.data(), acfg, abag.weights, hidden_a.data(), mask.data(),
+      batch, seq);
+
+  for (int64_t s = 0; s < seq; ++s) {
+    const bool kept = s < valid;
+    double video_abs = 0.0, audio_abs = 0.0;
+    for (int64_t i = 0; i < vdim; ++i) {
+      video_abs += std::fabs(static_cast<double>(got.video[static_cast<size_t>(s * vdim + i)]));
+    }
+    for (int64_t i = 0; i < adim; ++i) {
+      audio_abs += std::fabs(static_cast<double>(got.audio[static_cast<size_t>(s * adim + i)]));
+    }
+    INFO("position ", s, " kept = ", kept, " |video| = ", video_abs, " |audio| = ", audio_abs);
+    // ONE at EVERY position, padded ones included. The `>= 0` reading gives 0.0
+    // here for s >= valid, which is what this pins.
+    CHECK(got.mask[static_cast<size_t>(s)] == 1.0f);
+    // ...so nothing is zeroed, in either modality. Under the `>= 0` reading the
+    // video row would be exactly 0 at the padded positions.
+    CHECK(video_abs > 0.0);
+    CHECK(audio_abs > 0.0);
+  }
+
+  // THE CONTROL. The connector really did see a mask with padded positions in
+  // it: with registers disabled the padded rows are NOT substituted, so they
+  // still derive from the caller's own features. Without this the case would
+  // pass on a processor that dropped the mask argument entirely.
+  const int64_t pad = seq - valid;
+  std::vector<float> unpadded_mask(static_cast<size_t>(seq), 0.0f);
+  const vllm::Ltx2ConnectorEmbeddings all_valid = vllm::Ltx2ConnectorCreateEmbeddings(
+      vcfg, vbag.weights, hidden_v.data(), acfg, abag.weights, hidden_a.data(),
+      unpadded_mask.data(), batch, seq);
+  const double masked_vs_unmasked =
+      MaxAbsDiff(all_valid.video, got.video.data(), got.video.size());
+  INFO("padded rows = ", pad, " max|diff| vs an all-valid mask = ", masked_vs_unmasked);
+  CHECK(masked_vs_unmasked > 0.0);
+}

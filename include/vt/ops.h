@@ -4,6 +4,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <optional>
 #include <type_traits>
 
@@ -109,6 +110,7 @@ enum class OpId : uint8_t {
   kAttentionCross,
   kAttentionDenseFast,
   kAttentionDenseFlash,
+  kAttentionDenseFa2,
   kDFlashBlockAttention,
   kDFlashPagedBlockAttention,
   kReshapeAndCache,
@@ -363,6 +365,26 @@ enum class OpId : uint8_t {
   kConv2d,
   kDepthwiseConv1d,
   kAttentionRelPos,
+  // PERF-FP8-ALPHA-FOLD (.agents/specs/perf-fp8-alpha-fold.md, #402 §3 "Lever
+  // B"): the vector-alpha form of kMatmulFp8CublasLt — a per-output-column f32
+  // alpha applied INSIDE the cuBLASLt epilogue instead of by a second
+  // full-tensor pass. A distinct id, not a parameter of the existing op,
+  // because the pointer mode lives on the matmul DESCRIPTOR and therefore
+  // participates in plan/algo selection. Appended before kCount so no existing
+  // op's id shifts.
+  kMatmulFp8CublasLtAlphaVec,
+  // --- Mamba2 / SSD selective-scan core (.agents/specs/mamba2-ssd.md W1,
+  // #496). The three numerical objects the GDN arm of KERNEL-SSM-MAMBA never
+  // built. SSD is NOT the gated delta rule: there is no `(I - beta*k*k^T)`
+  // removal term, the decay is a diagonal `exp(A*dt)` driven by `A_log`/`dt`,
+  // and `B`/`C` are shared across `n_groups` head groups. See
+  // vt::Mamba2ChunkScan / vt::Mamba2StateUpdate / vt::RmsNormGatedGroup below
+  // for the exact contracts and their upstream anchors. Additive: nothing
+  // outside the Mamba2 path dispatches them. Appended before kCount so no
+  // existing op's id shifts.
+  kMamba2ChunkScan,
+  kMamba2StateUpdate,
+  kRmsNormGatedGroup,
   // LTX-2.5 DiT device-resident-forward glue table (phase L8). Only the seven
   // small ops the shared vt:: surface does NOT already cover: the AdaLN table
   // lookup, the AdaZero affine, the gated residual accumulate, the per-head
@@ -481,6 +503,41 @@ struct RmsNormGatedArgs {
   // output_gate_type (gdn-semantics.md §5). norm_before_gate=True and
   // group_size=None (the only configuration Qwen GDN uses) are baked in.
   bool sigmoid_gate = false;
+};
+
+// Silu-gated GROUP RMS norm args (Mixer2RMSNormGated, mamba_mixer2.py:69-149).
+// SIBLING of RmsNormGatedArgs, not a mode of it: the GDN/KDA gated norm reduces
+// over the WHOLE row with an optional sigmoid gate, this one always uses SILU and
+// reduces over `group_size = hidden / n_groups` slices (:136-141).
+struct RmsNormGatedGroupArgs {
+  float eps = 1e-6f;  // Mixer2RMSNormGated default (mamba_mixer2.py:76)
+  // full_n_groups. group_size = hidden / n_groups must divide the last dim
+  // (mamba_mixer2.py:80). n_groups == 1 degenerates to a whole-row RMS norm,
+  // which is exactly upstream's `self.n_groups == 1` branch (:120-131).
+  int64_t n_groups = 1;
+  // W1 lands tp_world_size == 1 only. Any other value is REFUSED with a message
+  // naming `extra_groups_for_head_shards` (mamba_utils.py:187) rather than
+  // silently computing a wrong split (mamba2-ssd.md §7).
+  int64_t tp_world_size = 1;
+};
+
+// Mamba2 SSD args, shared by the chunked prefill scan and the decode state
+// update (ssd_combined.py:27-235, mamba_ssm.py:497+).
+struct Mamba2Args {
+  // Physical chunk length. MUST be an integer power of two — upstream asserts it
+  // (`is_int_pow_2`, ssd_combined.py:48). Ignored by Mamba2StateUpdate.
+  int64_t chunk_size = 0;
+  // Whether dt goes through softplus before the decay (`dt_softplus`). Upstream
+  // guards it as `dt <= 20 ? softplus(dt) : dt` (ssd_chunk_state.py:94,
+  // mamba_kernels.hpp:177). mamba_mixer2.py:1097 passes True.
+  bool dt_softplus = false;
+  // dt_limit, applied AFTER softplus (`tl.clamp(dt, dt_min, dt_max)`,
+  // ssd_chunk_state.py:96). Upstream default is (0.0, +inf).
+  // Ignored by Mamba2StateUpdate: selective_state_update has no dt_limit.
+  float dt_min = 0.0f;
+  float dt_max = std::numeric_limits<float>::infinity();
+  // W1 lands tp_world_size == 1 only; see RmsNormGatedGroupArgs::tp_world_size.
+  int64_t tp_world_size = 1;
 };
 
 struct GdnArgs {
@@ -803,8 +860,13 @@ using MatmulNvfp4CutlassFn =
              const Tensor*, float);
 using MatmulFp8CutlassFn =
     void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, float);
+// The trailing bool is `claims_splitk1_premise` — see MatmulFp8CublasLt below.
 using MatmulFp8CublasLtFn =
-    void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, float);
+    void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, float, bool);
+// Same operands as MatmulFp8CublasLtFn, but the trailing scalar alpha becomes a
+// device f32 [N] vector — one folded alpha per OUTPUT COLUMN.
+using MatmulFp8CublasLtAlphaVecFn =
+    void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, const Tensor& /*alpha_vec*/, bool);
 using QuantFp8StaticFn = void (*)(Queue&, Tensor&, const Tensor&, float);
 using RmsNormQuantFp8Fn = void (*)(Queue&, Tensor& /*out_fp8*/, Tensor* /*out_bf16*/,
                                    const Tensor& /*x*/, const Tensor& /*weight*/,
@@ -969,6 +1031,31 @@ using KdaGatedDeltaRuleFn = void (*)(Queue&, Tensor&, const Tensor&, const Tenso
 using KdaChunkPrefillFn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, const Tensor&,
                                    const Tensor&, const Tensor&, const Tensor&, const Tensor&,
                                    Tensor&, const Tensor&, const GdnArgs&);
+// Mamba2 SSD varlen chunked prefill scan (vt::Mamba2ChunkScan). NOT a shape of
+// GdnPrefillFn: the SSD recurrence has no delta-removal term and carries the
+// per-chunk decay/state-passing metadata upstream builds in mamba2_attn.py.
+using Mamba2ChunkScanFn = void (*)(Queue&, Tensor& /*out*/, Tensor& /*final_states*/,
+                                   const Tensor& /*x*/, const Tensor& /*dt*/,
+                                   const Tensor& /*A*/, const Tensor& /*B*/,
+                                   const Tensor& /*C*/, const Tensor* /*D*/,
+                                   const Tensor* /*z*/, const Tensor* /*dt_bias*/,
+                                   const Tensor* /*initial_states*/,
+                                   const Tensor& /*cu_seqlens*/,
+                                   const Tensor& /*cu_chunk_seqlens*/,
+                                   const Tensor& /*last_chunk_indices*/,
+                                   const Tensor& /*seq_idx*/, const Mamba2Args&);
+// Mamba2 single-token selective state update (vt::Mamba2StateUpdate).
+using Mamba2StateUpdateFn = void (*)(Queue&, Tensor& /*out*/, Tensor& /*state*/,
+                                     const Tensor& /*x*/, const Tensor& /*dt*/,
+                                     const Tensor& /*A*/, const Tensor& /*B*/,
+                                     const Tensor& /*C*/, const Tensor* /*D*/,
+                                     const Tensor* /*z*/, const Tensor* /*dt_bias*/,
+                                     const Tensor* /*state_indices*/, const Mamba2Args&);
+// Silu-gated group RMS norm (vt::RmsNormGatedGroup). `weight` is nullable:
+// upstream skips the parameter entirely when use_rms_norm is False.
+using RmsNormGatedGroupFn = void (*)(Queue&, Tensor& /*out*/, const Tensor& /*x*/,
+                                     const Tensor& /*gate*/, const Tensor* /*weight*/,
+                                     const RmsNormGatedGroupArgs&);
 using GdnStateGatherFn =
     void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, const Tensor*);
 using GdnStateScatterFn =
@@ -1428,8 +1515,57 @@ void MatmulFp8Cutlass(Queue& q, Tensor& out, const Tensor& a_fp8, const Tensor& 
 // (cublasLt writes the requested output type directly). K,N multiples of 16.
 // CUDA-only. Falls back to the cutlass fp8 GEMM if cublasLt has no fp8 heuristic
 // for a given shape (keeps the correctness gate robust on odd M).
+//
+// `claims_splitk1_premise` (default FALSE) is how a caller opts INTO a stricter
+// contract than the op otherwise offers. Pass it only when this GEMM's bf16 `out`
+// is asserted to be byte-equivalent to the SAME GEMM's f32 `out` — a pure
+// store-width narrowing over one ordered f32 reduction. That claim requires the
+// selected cuBLASLt plan to run at splitK=1 (a split-K sums per-split partials
+// in an order the f32 arm never used, and f32 addition is not associative), so
+// the implementation verifies it and REFUSES otherwise.
+//
+// It is FALSE by default because that claim is unusual. An ordinary bf16 `out`
+// — what every `o_proj` / `out_proj` fp8 projection asks for, on a default-ON
+// path — is just an output dtype: split-K is correct for it, it is compared
+// against nothing, and it is never checked. Do not set this flag merely because
+// `out` is bf16; set it when you are asserting equivalence with an f32 arm.
 void MatmulFp8CublasLt(Queue& q, Tensor& out, const Tensor& a_fp8, const Tensor& b_fp8,
-                       float alpha);
+                       float alpha, bool claims_splitk1_premise = false);
+
+// MatmulFp8CublasLtAlphaVec — the SAME fp8 GEMM with a per-output-COLUMN alpha:
+//   out[m,n] = alpha_vec[n] * (A_fp8[M,K] @ B_fp8[N,K]^T)[m,n]
+// `alpha_vec` is f32 [N], contiguous, on the queue device; `out` is f32 OR bf16
+// [M,N]. This is the form an N-CONCATENATED operand needs when its shards carry
+// different folded alphas (input_scale * that shard's weight_scale), which no
+// single host scalar can express. Mirrors the tensor-alpha overload the NVFP4
+// CUTLASS path already took (.agents/specs/nvfp4-device-alpha.md).
+//
+// The op is TOTAL: when VT_FP8_ALPHA_VEC_EPILOGUE=1 AND the heuristic returns an
+// algo whose CUBLASLT_ALGO_CAP_POINTER_MODE_MASK advertises
+// ALPHA_DEVICE_VECTOR_BETA_ZERO, the alpha is applied in the cuBLASLt epilogue
+// (one launch). Otherwise it runs the GEMM at alpha=1 and applies the vector
+// with vt::MulColVecF32 — the two-launch form this seam shipped with, byte for
+// byte. Callers therefore never branch on the toggle or the driver's capability;
+// they express the per-column alpha ONCE, here. CUDA-only.
+//
+// A bf16 `out` (PERF-FP8-ALPHA-FOLD / #417) is what vLLM emits for this
+// projection (ModelOptFp8LinearMethod's out_dtype is the model dtype,
+// modelopt.py:458 @ the pin). It halves the bytes the column pass moves — the
+// dominant cost, since that pass is a full read-modify-write measured at 77% of
+// the device's peak bandwidth. It is NOT value-neutral: the GEMM's f32
+// accumulator is rounded to bf16 before the alpha multiply instead of after it,
+// so callers opt in rather than defaulting to it.
+//
+// A bf16 `out` always takes the TWO-LAUNCH arm regardless of the toggle. At bf16
+// the epilogue would round once where the fallback rounds twice, so admitting it
+// would make VT_FP8_ALPHA_VEC_EPILOGUE change VALUES rather than just speed; the
+// toggle is kept a pure performance A/B at every dtype.
+//
+// `claims_splitk1_premise` carries exactly the meaning it has on
+// MatmulFp8CublasLt above, and reaches the same check: a bf16 `out` always takes
+// the two-launch arm, whose GEMM IS MatmulFp8CublasLt.
+void MatmulFp8CublasLtAlphaVec(Queue& q, Tensor& out, const Tensor& a_fp8, const Tensor& b_fp8,
+                               const Tensor& alpha_vec, bool claims_splitk1_premise = false);
 
 // --- Fused MoE grouped NVFP4 GEMM (M2.4). One kernel launch computes the expert
 // projection for ALL (token, activated-expert) pairs at once, instead of the
@@ -1981,6 +2117,112 @@ void KdaChunkPrefill(Queue& q, Tensor& out, const Tensor& q_in, const Tensor& k,
                      const Tensor& a_log, const Tensor& dt_bias, Tensor& state,
                      const Tensor& query_start_loc, const GdnArgs& args);
 
+// ─── Mamba2 / SSD (.agents/specs/mamba2-ssd.md, issue #496) ──────────────────
+//
+// SSD IS NOT THE GATED DELTA RULE. GdnPrefill/KdaGatedDeltaRule above carry a
+// delta REMOVAL term `(I - beta*k*k^T)` and a decay that is a per-head (GDN) or
+// per-K-channel (KDA) scalar. Mamba2's SSD is a diagonally-decayed gated linear
+// recurrence with NO removal term, whose decay `exp(A[h]*dt[t,h])` is driven by
+// `A_log`/`dt`, with a `D` skip and `B`/`C` SHARED across `n_groups` head groups
+// (head h reads group `h / (nheads/ngroups)`). These are sibling ops, never a
+// parameterisation of the GDN kernels (mamba2-ssd.md §0, §7).
+
+// MAMBA2 CHUNKED SSD PREFILL — the varlen entry
+// `mamba_chunk_scan_combined_varlen` (ssd_combined.py:157-235) over the 5-stage
+// pipeline `_mamba_chunk_scan_combined_fwd` (:27-156), in upstream order:
+//   1. `_chunk_cumsum_fwd`  (ssd_chunk_state.py:300-346) — dt bias/softplus/clamp
+//      then per-chunk `dA_cumsum[h,c,i] = sum_{j<=i} dt[h,c,j]*A[h]`. Positions
+//      past a partial chunk's length hold dt = 0, so `dA_cumsum[h,c,cs-1]` is the
+//      chunk's TOTAL decay whatever its length (:96-110).
+//   2. `_chunk_state_fwd`   (ssd_chunk_state.py:349-407) — the chunk-local state
+//      `sum_i x*B * exp(min(dA_last - dA_i, 0)) * dt`, accumulated in f32
+//      (`states_in_fp32=True`, ssd_combined.py:100-102).
+//   3. `_state_passing_fwd` (ssd_state_passing.py:99-146) — the inter-chunk
+//      recurrence `S_c = exp(dA_last[c]) * S_{c-1} + states[c]`, run per SEQUENCE
+//      over the chunk range `last_chunk_indices` derives, seeded from
+//      `initial_states`. Note out[c] is the state AFTER chunk c (:90-97).
+//   4. `_bmm_chunk_fwd`     (ssd_bmm.py:148-209) — `CB[c,g,i,j] = C_i . B_j`,
+//      accumulated and RETURNED in f32 regardless of activation dtype
+//      (`output_dtype=torch.float32`, ssd_combined.py:124).
+//   5. `_chunk_scan_fwd`    (ssd_chunk_scan.py:216-525) — per token i of chunk c:
+//        out = exp(dA_i) * (C_i . S_{c-1})                       // inter-chunk
+//            + sum_{j<=i} CB[i,j] * exp(min(dA_i - dA_j,0)) * dt_j * x_j // intra
+//            + D * x_i                                           // skip
+//        and `out *= z*sigmoid(z)` when z is given. `S_{c-1}` is
+//        `initial_states[seq_idx[c]]` when `seq_idx[c] != seq_idx[c-1]` and
+//        initial states were supplied, ZEROS when they were not (:236-250,
+//        :271-289) — that is what makes a sequence boundary inside a physical
+//        chunk correct.
+//
+// Shapes (varlen, implicit batch 1 — ssd_combined.py:158-215):
+//   x            [T,H,P] float          dt      [T,H] float
+//   A            [H] f32 (negative)     B,C     [T,G,N] float, H % G == 0
+//   D            optional [H] or [H,P] f32       z  optional [T,H,P] float
+//   dt_bias      optional [H] f32
+//   initial_states optional [S,H,P,N] f32/bf16 (:79, :194)
+//   cu_seqlens   [S+1] i32              seq_idx [nchunks] i32 — PER CHUNK, not
+//                                       per token (:60-61, :189)
+//   cu_chunk_seqlens [nchunks+1] i32    last_chunk_indices [S] i32
+//   out          [T,H,P] f32/bf16 (pre-allocated, written in place)
+//   final_states [S,H,P,N] f32/bf16 — `varlen_states`, the state after each
+//                sequence's LAST chunk (:154). Its dtype is the SEPARATE
+//                `state_dtype` knob (:46,119,176), NOT the activation dtype.
+// `args.chunk_size` must be a power of two (:48). All arithmetic is f32; the
+// device tile-precision downcasts inside the Triton dots are a W2 concern.
+void Mamba2ChunkScan(Queue& q, Tensor& out, Tensor& final_states, const Tensor& x,
+                     const Tensor& dt, const Tensor& A, const Tensor& B, const Tensor& C,
+                     const Tensor* D, const Tensor* z, const Tensor* dt_bias,
+                     const Tensor* initial_states, const Tensor& cu_seqlens,
+                     const Tensor& cu_chunk_seqlens, const Tensor& last_chunk_indices,
+                     const Tensor& seq_idx, const Mamba2Args& args);
+
+// MAMBA2 SINGLE-TOKEN SELECTIVE STATE UPDATE — the decode path,
+// `selective_state_update` (mamba_ssm.py:497+) as mamba_mixer2.py:1087 calls it.
+// Per row b and head h (group g = h / (H/G)), with dt SCALAR PER HEAD — the
+// `tie_hdim` shape Mamba2 always uses, and the only one upstream's own CPU
+// kernel implements (csrc/cpu/mamba_kernels.hpp:104-250, and the
+// `current_platform.is_cpu()` skips in tests/kernels/mamba/test_mamba_ssm.py):
+//   dt = softplus(dt[b,h] + dt_bias[h])            // guarded dt<=20, :177
+//   s  = s * exp(A[h]*dt) + B[b,g,:] * x[b,h,p] * dt
+//   out[b,h,p] = sum_n s[n]*C[b,g,n] + D[h]*x[b,h,p]   (then *= silu(z))
+//
+//   state   [S,H,P,N] f32/bf16 — the FULL cache when state_indices is given
+//           (mamba2_state_dtype's ssm_dtype is its own knob, mamba_utils.py:73-81),
+//           else compact [Nb,H,P,N] with row b == b. Updated IN PLACE.
+//   x [Nb,H,P] float, dt [Nb,H] float, A [H] f32, B/C [Nb,G,N] float,
+//   D optional [H] f32, z optional [Nb,H,P] float, dt_bias optional [H] f32,
+//   out [Nb,H,P] f32/bf16.
+//   state_indices optional [Nb] i32 (upstream `state_batch_indices`). LOCAL ABI:
+//           index < 0 is the NULL row — its cache slot is left untouched and its
+//           output row is zeroed, exactly as GdnDecode/CausalConv1dSpecUpdate
+//           already model it (ops.h GdnDecode, cpu_ops.cpp GdnDecodeKernel).
+//           Upstream's sentinel is `NULL_BLOCK_ID = 0`
+//           (v1/attention/backends/utils.py:46) and it leaves the padded output
+//           rows UNDEFINED (`continue`, mamba_kernels.hpp:147); the caller maps
+//           its padding onto the local negative sentinel, and zeroing is strictly
+//           more defined than what upstream promises.
+void Mamba2StateUpdate(Queue& q, Tensor& out, Tensor& state, const Tensor& x,
+                       const Tensor& dt, const Tensor& A, const Tensor& B, const Tensor& C,
+                       const Tensor* D, const Tensor* z, const Tensor* dt_bias,
+                       const Tensor* state_indices, const Mamba2Args& args);
+
+// SILU-GATED GROUP RMS NORM — `Mixer2RMSNormGated.forward_native`
+// (mamba_mixer2.py:100-149). A SIBLING of RmsNormGated, not a mode of it: that
+// one is the GDN/KDA gate (sigmoid or silu) over the WHOLE row; this one always
+// SILU-gates and reduces the variance over `group_size = hidden / n_groups`
+// slices. Both the activation and the reduction extent differ (mamba2-ssd.md §0).
+//   v      = x * silu(f32(gate))                                     (:114)
+//   out    = weight * dtype(x)( v * rsqrt(mean(v^2 over its group) + eps) )
+//            (:136-141 grouped, :127-131 the n_groups == 1 whole-row branch,
+//             :149 the `self.weight * x.to(input_dtype)` cast point)
+// x/gate/out are rank 2 [rows,Hd] or rank 3 [T,H,D]; the LAST dim is the hidden
+// dim and every leading dim is a row (`*prefix_dims, hidden_dim`, :136).
+// `weight` is [Hd] float, or NULLPTR for `use_rms_norm=False`, where upstream
+// registers no parameter at all and returns just the gated value (:94-96,
+// :115-116). args.n_groups must divide the last dim.
+void RmsNormGatedGroup(Queue& q, Tensor& out, const Tensor& x, const Tensor& gate,
+                       const Tensor* weight, const RmsNormGatedGroupArgs& args);
+
 // Single-token gated-delta-rule step, one token per sequence
 // (gdn-semantics.md §7 decode path). Same math as GdnPrefill with T == B and
 // state[B,Hv,Dv,Dk] row b for token b. q_in/k must be l2-normalized by the
@@ -2328,6 +2570,23 @@ void AttentionDenseFast(Queue& q, Tensor& out, const Tensor& query, const Tensor
 // so kAttention / kAttentionDenseFast stay untouched.
 void AttentionDenseFlash(Queue& q, Tensor& out, const Tensor& query, const Tensor& key,
                          const Tensor& value, const AttentionArgs& args);
+
+// Same contract as AttentionDenseFlash, but the CUDA impl runs the VENDORED
+// FlashAttention-2 forward (src/vt/cuda/flash_attn/) on its tensor cores instead of a
+// scalar per-warp recurrence — the kernel vLLM itself dispatches for dense non-causal
+// encoder self-attention (vllm/model_executor/models/whisper.py
+// WhisperEncoderAttention:255 -> forward:298-317 -> flash_attn_varlen_func).
+//
+// NOT bit-identical to AttentionDenseFast/Flash: `mma.sync` reassociates the QK^T and
+// PV reductions, so results differ within the bf16 envelope and adoption is gated on
+// the token-exact / ratified near-tie gate, never assumed. The FA-2 fast path applies
+// only to bf16, head_dim 64, non-causal, MHA (h_k == h) on CUDA with the vendored
+// kernels compiled; every other shape falls back to kAttentionDenseFlash, which is why
+// this op is safe to call generically. On CPU it dispatches to the SAME kernel as
+// Attention. Separate op so kAttention / kAttentionDenseFast / kAttentionDenseFlash
+// stay untouched.
+void AttentionDenseFa2(Queue& q, Tensor& out, const Tensor& query, const Tensor& key,
+                       const Tensor& value, const AttentionArgs& args);
 
 // DFlash in-block attention (SPEC-DFLASH D2, DF-DRAFT-MODEL) — the project's FIRST
 // non-causal / bidirectional attention primitive. See DFlashBlockAttentionArgs for
@@ -2835,9 +3094,9 @@ void CastBf16(Queue& q, Tensor& out, const Tensor& in);
 // value the bf16 output rounds to (mirror of the cutlass f32-output scratch cast).
 void CastF32(Queue& q, Tensor& out, const Tensor& in);
 
-// In-place per-output-column scale: x[m,n] *= col[n], with x an F32 [M,N]
-// (row-major, inner-contiguous rows; row stride may be padded) and col an F32
-// [N] contiguous broadcast vector. The load-time-free realization of a merged
+// In-place per-output-column scale: x[m,n] *= col[n], with x an F32 or BF16
+// [M,N] (row-major, inner-contiguous rows; row stride may be padded) and col an
+// F32 [N] contiguous broadcast vector. The load-time-free realization of a merged
 // per-tensor-fp8 projection's per-shard dequant: one fp8 GEMM over the
 // N-concatenated weight is run with alpha=1 (raw f32 accumulation), then this
 // applies each output column's folded scalar (= input_scale * that shard's
@@ -2845,6 +3104,14 @@ void CastF32(Queue& q, Tensor& out, const Tensor& in);
 // GEMM's accumulation matches (the alpha multiply is the same IEEE f32 op cuBLASLt
 // would fold). CPU + CUDA. (Mirrors the fp4 merge's per-column block-scale
 // concatenation, qwen3_5.cpp ResidentNvfp4Qkv.)
+//
+// The MULTIPLY is f32 on both x dtypes, and `col` is always f32 — x's dtype is
+// the STORE width only. A bf16 x (PERF-FP8-ALPHA-FOLD / #417) halves the bytes
+// this read-modify-write moves, which is its whole cost: it is bandwidth-bound,
+// measured at 209.5 GB/s = 77% of the GB10's peak over the merged FP8 GDN
+// in_proj output. It also rounds the product, so the byte-identity above holds
+// only for the f32 arm; a bf16 x is the vLLM-faithful width (its fp8 linear
+// emits the model dtype) but is a real value change and is opt-in at the caller.
 void MulColVecF32(Queue& q, Tensor& x, const Tensor& col);
 
 // Splits the fused q/gate attention projection into its two halves. qgate is

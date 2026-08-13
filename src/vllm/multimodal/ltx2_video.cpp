@@ -8,9 +8,11 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -21,8 +23,10 @@
 #include <vector>
 
 #include "vllm/model_executor/model_loader/safetensors_reader.h"
+#include "vllm/model_executor/models/device_pool.h"  // ActivePool()/DevicePool::Drain
 #include "vllm/model_executor/models/ltx2.h"
 #include "vllm/model_executor/models/ltx2_audio_vae.h"
+#include "vllm/model_executor/models/ltx2_connector.h"
 #include "vllm/model_executor/models/ltx2_device.h"
 #include "vllm/model_executor/models/ltx2_loader.h"
 #include "vllm/model_executor/models/ltx2_pipeline.h"
@@ -245,9 +249,9 @@ int64_t ExtraInt(const std::map<std::string, std::string>& extras, const std::st
 // (minimax_h3_video.cpp): a mistyped knob that is silently dropped renders the
 // DEFAULT and looks like the feature not working.
 const char* const kKnownLoadExtras[] = {
-    kLtx2AudioPromptEmbedsExtra, kLtx2PipelineKindExtra, kLtx2ModelVersionExtra,
-    kLtx2AllowUnportedExtra,     kLtx2MaxPhaseExtra,     kLtx2DitConfigPathExtra,
-    "upsampler_path",            "duration_head_path",
+    kLtx2AudioPromptEmbedsExtra, kLtx2PipelineKindExtra,   kLtx2ModelVersionExtra,
+    kLtx2AllowUnportedExtra,     kLtx2MaxPhaseExtra,       kLtx2DitConfigPathExtra,
+    kLtx2PromptValidRowsExtra,   "upsampler_path",         "duration_head_path",
 };
 
 void CheckKnownExtras(const std::map<std::string, std::string>& extras) {
@@ -359,8 +363,20 @@ struct Ltx2VideoEngine::Impl {
   // Conditioning. `has_encoder` is false for every checkpoint today; see the
   // header's refusal 2.
   bool has_encoder = false;
+  // What the DiT's cross-attention consumes. When the checkpoint carries the
+  // embeddings connector these are the CONNECTOR's output; without one they are
+  // the supplied prompt embeds verbatim, which is what every render before L9c
+  // did on every checkpoint.
   std::vector<float> video_prompt_embeds, audio_prompt_embeds;
   int64_t prompt_tokens = 0;
+
+  // The connector's CONFIGURATION is kept; its WEIGHTS are not. They are ~8 GB
+  // of f32 at the shipped widths (ltx2_loader.h), the conditioning they process
+  // is resolved once at load, and this box reboots rather than OOM-killing — so
+  // they are loaded, used and dropped inside one scope below.
+  bool has_connector = false;
+  Ltx2ConnectorConfig video_connector_cfg, audio_connector_cfg;
+  int64_t prompt_valid_rows = 0;
 
   std::mutex mutex;
 };
@@ -515,10 +531,14 @@ std::unique_ptr<Ltx2VideoEngine> Ltx2VideoEngine::Load(const VideoModelParams& p
          "DiT is in: it carries no __metadata__ at all. Supply the config rather than "
          "inheriting a default that contradicts the model family.");
   }
+  // Hoisted out of the block it used to live in because the EMBEDDINGS CONNECTOR
+  // is configured from the SAME object: its geometry, its RoPE bounds and its
+  // gating are `connector_*` keys of the DiT's transformer config, and reading
+  // them from a second source would let the two disagree.
+  const nlohmann::json dit_config =
+      declares_config ? Ltx2ReadCheckpointConfig(dit_file)
+                      : ReadJsonFile(kLtx2DitConfigPathExtra, config_path);
   {
-    const nlohmann::json config =
-        declares_config ? Ltx2ReadCheckpointConfig(dit_file)
-                        : ReadJsonFile(kLtx2DitConfigPathExtra, config_path);
     const std::string source =
         declares_config
             ? std::string("the DiT checkpoint's own __metadata__[\"config\"][\"transformer\"]")
@@ -527,8 +547,61 @@ std::unique_ptr<Ltx2VideoEngine> Ltx2VideoEngine::Load(const VideoModelParams& p
     // rule lives, because the device gate drives `Ltx2StreamDitToDevice` without
     // this engine and owes the same check; two copies would be two rules.
     const Ltx2DitParams declared = Ltx2AdoptDeclaredDitParams(
-        config, im.dit.params, dit_options.allow_unported_modules, source);
+        dit_config, im.dit.params, dit_options.allow_unported_modules, source);
     im.dit.params = declared;
+  }
+
+  // ── the embeddings connector (phase L9c) ──────────────────────────────────
+  //
+  // WHAT THIS CLOSES. Until L9c the conditioning this engine handed the DiT's
+  // cross-attention was the prompt-embeds file VERBATIM. Upstream never does
+  // that: `EmbeddingsProcessor` runs an 8-layer 1-D transformer over the caption
+  // projections before the DiT sees them (embeddings_processor.py:70-95), and
+  // that module SHIPS IN THE DiT FILE — 129 tensors per stream, which this
+  // loader used to refuse as "unported" and then step over. The bricks existed
+  // (`Ltx2ConnectorForward`, landed at L5, gated against upstream on five arms);
+  // nothing called them outside a test. This is the call.
+  //
+  // PRESENCE DECIDES, not a config flag. The connector is applied exactly when
+  // the checkpoint carries it, which is the same rule `DetectLtx2Video` uses on
+  // the DiT itself: which modules a file HOLDS is a fact, and a flag saying
+  // otherwise would be a second, disagreeable authority. A checkpoint carrying
+  // one stream's connector and not the other is refused, because rendering the
+  // video stream through eight transformer layers and the audio stream through
+  // none conditions the two halves of one clip on two different things.
+  const bool has_video_connector =
+      Ltx2CheckpointHasConnector(dit_file, Ltx2ConnectorStream::kVideo);
+  const bool has_audio_connector =
+      Ltx2CheckpointHasConnector(dit_file, Ltx2ConnectorStream::kAudio);
+  if (has_video_connector != has_audio_connector) {
+    Fail(std::string("the DiT checkpoint carries the ") +
+         (has_video_connector ? "video" : "audio") +
+         " embeddings connector but not the other stream's. Both conditioning paths run "
+         "through one `EmbeddingsProcessor` upstream (embeddings_processor.py:60-68 refuses "
+         "an audio connector without audio features and vice versa), so half a connector "
+         "would condition one modality on eight transformer layers and the other on none.");
+  }
+  im.has_connector = has_video_connector;
+  if (im.has_connector) {
+    im.video_connector_cfg = Ltx2ParseConnectorConfig(dit_config, Ltx2ConnectorStream::kVideo);
+    im.audio_connector_cfg = Ltx2ParseConnectorConfig(dit_config, Ltx2ConnectorStream::kAudio);
+    // The connector is dimension-PRESERVING: it consumes the caption projection's
+    // output and hands the DiT's cross-attention the same width. Asserted rather
+    // than assumed — a connector whose inner_dim disagrees with the stream it
+    // feeds would still forward, and the mismatch would surface as a wrong-shaped
+    // GEMM deep inside the DiT rather than as a load refusal.
+    if (im.video_connector_cfg.inner_dim() != im.dit.params.cross_attention_dim) {
+      Fail("the video embeddings connector is " +
+           std::to_string(im.video_connector_cfg.inner_dim()) +
+           " wide but the DiT's cross-attention takes " +
+           std::to_string(im.dit.params.cross_attention_dim));
+    }
+    if (im.audio_connector_cfg.inner_dim() != im.dit.params.audio_cross_attention_dim) {
+      Fail("the audio embeddings connector is " +
+           std::to_string(im.audio_connector_cfg.inner_dim()) +
+           " wide but the DiT's audio cross-attention takes " +
+           std::to_string(im.dit.params.audio_cross_attention_dim));
+    }
   }
 
   // ── the recipe ────────────────────────────────────────────────────────────
@@ -674,6 +747,88 @@ std::unique_ptr<Ltx2VideoEngine> Ltx2VideoEngine::Load(const VideoModelParams& p
     }
     if (v_rows == 0) Fail("the prompt embeds are empty");
     im.prompt_tokens = v_rows;
+
+    // How much of the supplied conditioning is REAL. Everything by default; the
+    // extra is what a caller with a tokenizer's mask supplies.
+    im.prompt_valid_rows = ExtraInt(params.extras, kLtx2PromptValidRowsExtra, v_rows);
+    if (im.prompt_valid_rows < 0 || im.prompt_valid_rows > v_rows) {
+      Fail("the '" + std::string(kLtx2PromptValidRowsExtra) + "' extra is " +
+           std::to_string(im.prompt_valid_rows) + " but the prompt embeds hold " +
+           std::to_string(v_rows) + " rows");
+    }
+    if (im.has_connector) {
+      const int64_t registers = im.video_connector_cfg.num_learnable_registers;
+      if (registers > 0 && v_rows % registers != 0) {
+        // Upstream asserts this (embeddings_connector.py:144) because the
+        // register table is TILED across the sequence rather than indexed by
+        // which positions were padded.
+        Fail("the prompt embeds hold " + std::to_string(v_rows) +
+             " rows, which is not a multiple of the connector's " +
+             std::to_string(registers) +
+             " learnable registers. The register table is tiled across the sequence "
+             "(embeddings_connector.py:144), so upstream asserts the same thing.");
+      }
+      // The additive mask `_prepare_attention_mask` would produce: 0.0 for a real
+      // token, -finfo(f32).max for padding.
+      std::vector<float> additive(static_cast<size_t>(v_rows), 0.0f);
+      for (int64_t s = im.prompt_valid_rows; s < v_rows; ++s) {
+        additive[static_cast<size_t>(s)] = -std::numeric_limits<float>::max();
+      }
+      // The weights live and die inside this scope. See the Impl comment: 129
+      // tensors per stream is ~8 GB of f32 at the shipped widths, and holding
+      // them for the engine's lifetime would spend that on a module that runs
+      // exactly once. The DiT file is still open if a per-request conditioning
+      // path ever needs to re-read them.
+      //
+      // THE f32 IS AN ANNOTATED ESCAPE, not an inherited default. Upstream runs
+      // this module at the model dtype, so f32 here is WIDER — the polarity
+      // AGENTS.md says a value gate cannot catch. It is taken because
+      // `Ltx2ConnectorForward` is L5's declared PARITY dtype and this is the
+      // arm its goldens cover, and it costs nothing on the production path: the
+      // connector runs ONCE per load over 128 rows, and its output is narrowed
+      // to the stream dtype on the first upload like every other activation.
+      // What it does cost is the transient above, which is why it is scoped.
+      const Ltx2VaeWeights video_connector =
+          Ltx2LoadConnectorWeights(dit_file, im.video_connector_cfg);
+      const Ltx2VaeWeights audio_connector =
+          Ltx2LoadConnectorWeights(dit_file, im.audio_connector_cfg);
+      const Ltx2ConnectorEmbeddings encoded = Ltx2ConnectorCreateEmbeddings(
+          im.video_connector_cfg, video_connector, im.video_prompt_embeds.data(),
+          im.audio_connector_cfg, audio_connector, im.audio_prompt_embeds.data(),
+          additive.data(), /*batch=*/1, v_rows);
+      // The processor returns the mask the DiT's cross-attention is supposed to
+      // honour (embeddings_processor.py:89). `Ltx2ModalityInput` carries no
+      // context mask, so a mask with a masked position would be silently dropped
+      // — the DiT would attend over register-free padding as if it were caption.
+      //
+      // THIS LOOP IS UNREACHABLE ON EVERY INPUT EITHER REFERENCE PRODUCES, and
+      // saying which case reaches it is how the claim stays checkable. It is NOT
+      // the `num_learnable_registers = 0` case, which an earlier version of this
+      // comment named and which cannot get here: with registers disabled
+      // `Ltx2ConnectorForward` passes the caller's ADDITIVE mask straight
+      // through, and `_to_binary_mask`'s `encoded_mask < 0.000001`
+      // (embeddings_processor.py:46-48) is satisfied by BOTH values an additive
+      // mask holds — 0.0 and -finfo(f32).max — so the binary mask is one
+      // everywhere there too. With registers enabled :152 returns
+      // `torch.zeros_like(mask)` and the answer is one everywhere for the same
+      // reason. What would reach it is a connector whose output mask carries a
+      // value at or above +1e-6, which no path in `ltx_core` or `diffusers`
+      // emits today. It is kept as a guard on that future, refused by name
+      // rather than ignored, and it is deliberately not gated: a test would have
+      // to fabricate a mask neither reference can produce.
+      for (const float m : encoded.mask) {
+        if (m == 1.0f) continue;
+        Fail(
+            "the embeddings connector returned a cross-attention mask with masked "
+            "positions, and `Ltx2ModalityInput` carries no context mask to pass it through. "
+            "No path in either reference emits such a mask — `_to_binary_mask` is one "
+            "everywhere for both values an additive mask holds — so this is a connector "
+            "whose output mask this port does not model. Refusing rather than dropping "
+            "the mask, which would condition the DiT on unmasked padding.");
+      }
+      im.video_prompt_embeds = encoded.video;
+      im.audio_prompt_embeds = encoded.audio;
+    }
   }
   return engine;
 }
@@ -1000,6 +1155,40 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
     audio_lc = ashape.channels;
     audio_lf = ashape.frames;
     audio_lm = ashape.mel_bins;
+
+    // PHASE CHANGE. The denoise loop just left the shared scratch pool holding
+    // every activation size class this phase touched, and on an UNCAPPED pool
+    // (`device_pool_cap_bytes == 0`, which is GB10 and Thor today) those blocks
+    // are never returned to the driver. What comes next allocates DIFFERENT
+    // classes — the next phase runs at twice the resolution, and after the last
+    // phase the VAE decode runs on the host — so none of them can be reused and
+    // all of them are headroom the next stage does not get.
+    //
+    // On GB10 that headroom is HOST memory: the unified pool is one ~119 GiB
+    // arena, and this class of box REBOOTS rather than OOM-killing when the
+    // driver runs out (`NVRM ... Out of memory [NV_ERR_NO_MEMORY]`), which it did
+    // twice during phase L9b's 320x192/25-frame attempt. MiniMax-H3 drains at
+    // exactly this boundary and for exactly this reason
+    // (minimax_h3_pipeline.cpp:546-563); the LTX path drained nowhere.
+    //
+    // Draining costs one free per retained block, once per phase.
+    if (im.on_device) {
+      // A MEASUREMENT LANE, in the same shape `VT_POOL_BYPASS` and
+      // `VT_POOL_EXACT` already take (device_pool.h): it exists so the A/B that
+      // establishes what the drain is worth runs on ONE binary, which is what
+      // AGENTS.md asks of a measurement. It is never a configuration — the drain
+      // is on by default and there is no supported reason to turn it off.
+      const char* off = std::getenv("VLLM_LTX2_POOL_DRAIN");
+      if (off == nullptr || off[0] != '0') {
+        vt::Backend& backend = vt::GetBackend(im.device.type);
+        const size_t drained = ActivePool()->Drain(backend);
+        if (std::getenv("VT_POOL_STATS") != nullptr) {
+          std::fprintf(stderr, "[ltx2] phase '%s' drained %.2f GiB of denoise scratch\n",
+                       phase.name.c_str(),
+                       static_cast<double>(drained) / (1024.0 * 1024.0 * 1024.0));
+        }
+      }
+    }
   }
 
   // ── decode (distilled.py:314-315) ─────────────────────────────────────────

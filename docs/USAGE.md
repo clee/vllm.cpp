@@ -22,6 +22,22 @@ example targets are named after the directories they are built from, so an
 in-source build makes the linker write each executable over its own source
 directory (issue #85).
 
+### Setting the compiled build identity
+
+`vllm-server --version` reports the CMake project version by default. Release
+packaging passes the complete release identity, including any prerelease
+component, with `-DVLLM_CPP_BUILD_VERSION=<version>`:
+
+```sh
+cmake -S . -B build -DVLLM_CPP_BUILD_VERSION=0.0.3-pre.1
+```
+
+The value must not be empty. CUDA builds append their existing `+cuda`
+qualifier to this identity. This option controls only the compiled binary
+identity; release archives must still use the repository release workflow so
+their manifest, `VERSION` record, archive name, and executable are validated as
+one version.
+
 ### One ROCm-specific behaviour
 
 ROCm builds register the full V1 sampler surface (temperature, top-k/top-p, min-p,
@@ -156,6 +172,11 @@ build/examples/vllm-cli \
 | `--repeat N` | `1` | Load once, then run N blocking completions. Use it to read a warm decode tok/s without paying model load each time. Not supported with `--stream`, which falls back to 1 |
 | `-h`, `--help` | | Print usage and exit |
 
+GGUF and safetensors mapped-payload paths, plus safetensors index paths, use the
+host's native filesystem encoding, including Unicode paths on Windows. Native
+Windows release artifacts are not published yet; they will remain unavailable
+until the `v0.0.3-pre.1` prerelease build and publication gates succeed.
+
 Two more example binaries ship alongside it:
 
 - `vllm-bench` ([`examples/bench/main.cpp`](../examples/bench/main.cpp)), a
@@ -234,6 +255,15 @@ a silent fallback cannot post a plausible number:
   and reports GB/s against that roof. Set `VT_VULKAN_DISPATCH_STATS=1` so it
   reports GPU-timestamp time rather than wall clock; see
   [ENVIRONMENT.md](ENVIRONMENT.md) for what each knob does and what it measured.
+
+  Audio note: the Voxtral/Whisper encoder attention has an opt-in FlashAttention-2
+  tensor-core path, `VT_WHISPER_ENC_FA2=1`, which makes the encoder forward 5.50x
+  faster — from 15.90x down to 2.89x vLLM's whole time-to-first-token. Those are
+  encoder-forward-versus-TTFT ratios, not TTFT ratios: our projector, merge and
+  prefill are not yet measured. It is off by default because it differs numerically
+  from the shipping kernel and shifts three tokens within the ratified near-tie band
+  on the gate clip, so turn it on only where encoder latency matters more than exact
+  reproduction of the default output.
 
 ### Quantized checkpoints: which weight forms load
 ### How long a load takes, and how to see where it goes
@@ -316,22 +346,115 @@ tokens quietly.
 This is a deliberate state, not a bug: registering the architecture is what lets
 the config parse and weight-name mapping be tested before the forward exists.
 
-### LTX-2.5 has no user-facing entrypoint yet
+### LTX-2.5: what runs, and what it cannot do
 
-LTX-2.5 is being ported in phases. Its two VAE decoders and its pipeline layer
-(the sigma schedule, the diffusion steps, guidance, the latent spatial x2
-upsampler, the duration head and the embeddings connector) are implemented and
-gated, but no CLI flag, server endpoint or C ABI call reaches them, so there is
-nothing to run here yet and no request shape to document. Do not infer from
-[FEATURES](FEATURES.md) that a render is available.
+LTX-2.5 is reachable as video family `ltx-2.5`, through the same
+`vllm_video_engine_load` / `vllm_video_generate` C ABI that serves MiniMax-H3,
+and through the `ltx2-gen` example that drives it. Its two VAE decoders, its two
+VAE ENCODERS with the mel front-end, the conditioning items that place encoded
+latents into the token stream, and its pipeline layer (the sigma schedule, the
+diffusion steps, guidance, the latent spatial x2 upsampler, the duration head and
+the embeddings connector) are implemented and gated. Several limits decide what
+you can actually ask for, and each refuses by name rather than rendering
+something else.
 
-One behaviour is worth stating in advance, because it decides what you get when
-the entrypoint does arrive. LTX-2.5 ships two video decoders behind one
-checkpoint field. The convolutional one is implemented; the higher quality
-diffusion one (`NADiffusionDecoder`) is not, and asking for it fails with a
-message naming the missing neighborhood-attention kernel. It never falls back to
-the convolutional decoder, because that would hand back a lower quality render as
-if it were the one you asked for.
+The encoders being present does NOT mean image, keyframe, reference-video or
+reference-audio conditioning is usable: the video engine still refuses every one
+of those by name, because the request-side work between a file on disk and a
+tensor the encoder accepts — image decode, aspect-fill resize, and the H.264 CRF
+re-compression upstream performs before encoding — is not ported. Two
+encoder-level limits are worth stating in advance because they are refusals
+rather than approximations. A reference waveform whose sample rate differs from
+the audio VAE's is refused rather than resampled, since upstream uses a polyphase
+kaiser resampler this project does not carry. And a VAE configured with
+`latent_log_var: none` is refused, because upstream itself raises on it.
+
+**There is no prompt.** The Gemma-4 12B text tower is not ported, so nothing can
+turn words into the conditioning the caption projections consume. Conditioning
+comes from `--prompt-embeds` plus `--audio-prompt-embeds`: rows of
+little-endian f32, 4096 wide for the video stream and 2048 for the audio stream,
+with the same row count in both. Supplying a `--prompt` is refused, and supplying
+only one of the two files is refused, because a stream left unconditioned renders
+instead of failing.
+
+**Those rows go through the embeddings connector.** Both shipped LTX-2.5 DiTs
+carry two `*_embeddings_connector` families, 129 tensors each, and they are the
+8-layer 1-D transformer upstream runs between the caption projections and the
+DiT's cross-attention. The render applies it with the checkpoint's own weights,
+under the checkpoint's own `connector_*` configuration. Two consequences for the
+command line: the row count must be a multiple of the connector's learnable
+register count (128 on the shipped files), and `--prompt-valid-rows N` says how
+many of those rows are real tokens. The rest are padding, and padding is not
+inert here: the connector REPLACES it with its learnable register table, so a
+run that leaves the default renders as if every supplied row were caption.
+
+**The DiT config is required when the checkpoint does not carry one.** The
+shipped `vonkaiser` FP8 transformer has no `__metadata__` at all, and the values
+a config decides are ones no tensor shape encodes: `frequencies_precision` and
+`av_ca_timestep_scale_multiplier` move every RoPE angle and every audio/video
+modulation. Defaulting them resolves a different model from the same file, so
+the loader refuses and `--dit-config` supplies LTX-2.5's declared values.
+
+```sh
+ltx2-gen --dit  ltx-2.5-22b-distilled-fp8.safetensors \
+         --dit-config ltx-2.5-transformer-config.json \
+         --model-version 2.5 --allow-unported \
+         --video-vae ltx-2.5-video-vae-conv-bf16.safetensors \
+         --audio-vae ltx-2.5-audio-vae-bf16.safetensors \
+         --upsampler ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors \
+         --prompt-embeds video_prompt_embeds.f32 \
+         --audio-prompt-embeds audio_prompt_embeds.f32 \
+         --frames 25 --width 320 --height 192 --seed 20260812 \
+         --device cuda --workdir /tmp/ltx25 --out /tmp/ltx25/video.mp4
+```
+
+`--frames` must satisfy `(frames - 1) % 8 == 0` and width/height must divide by
+64 (32 for the VAE, twice that because the distilled recipe's first phase runs at
+half resolution). Omitting all three renders the recipe default, which is
+1024x1536 at 121 frames and is a much larger request than it looks.
+
+`--upsampler` is what the distilled recipe's second phase needs. Without it that
+phase refuses rather than skipping: its three-step refinement is what makes the
+upscaled latent valid, and decoding the half-resolution latent instead would hand
+back a smaller clip that looks like a completed request. `--max-phase 0` stops
+after the first phase deliberately.
+
+On the server, `--video-family ltx-2.5` pins the family instead of detecting it,
+and `--video-extra KEY=VALUE` (repeatable) carries the same family-specific load
+knobs the flags above map onto. Both are described under
+[the server's video flags](#video-family-and-family-specific-load-knobs).
+
+**Two things about that command are worth knowing before you run it.**
+
+*It is bounded by the VIDEO DECODE, well below the recipe's own defaults.*
+Staging the 21.00B FP8 transformer costs about 44 GB on a 119 GB GB10. **320x192
+at 25 frames completes** through both distilled phases; 448x256 at 25 frames
+finishes its denoise and then loses about 59 GB in 24 seconds inside the decode
+and has to be stopped. The denoise itself is flat at either size. Unified memory
+makes those host bytes and this class of box reboots rather than OOM-killing, so
+start small and grow, and put a memory watchdog in front of anything larger. The
+recipe default (1024x1536 at 121 frames) is far beyond what one GB10 holds today.
+Expect minutes, not seconds: most of a 320x192/25f render is spent single-threaded
+in the host VAE decode at 0% GPU.
+
+*It renders a scene, and it does not render YOUR scene.* With the connector on
+the path the shipped 21.00B FP8 transformer produces a temporally coherent
+photorealistic clip at 320x192 / 25 frames: consistent subject, consistent
+background, frame-to-frame motion. Before the connector was wired the same
+weights at the same settings produced smooth colour fields. What conditions it,
+though, is mostly the connector's own trained `learnable_registers` table, which
+is what upstream substitutes at PADDED positions — so the render is the model's
+own default, not a depiction of anything you asked for. The Gemma-4 text tower is
+still not ported, so the rows you supply as prompt embeds are not an encoded
+prompt. Ask for a subject and you will not get it.
+
+LTX-2.5 ships two video decoders behind one checkpoint field. The convolutional
+one is implemented; the higher quality diffusion one (`NADiffusionDecoder`) is
+not, and asking for it fails with a message naming the missing
+neighborhood-attention kernel. It never falls back to the convolutional decoder,
+because that would hand back a lower quality render as if it were the one you
+asked for. Keyframe and reference conditioning is refused for the same reason: it
+runs through the video VAE's encoder, and only the decoder is ported.
 
 A second behaviour changed and is worth stating precisely, because the reason a
 prompt is refused has moved. The Gemma-4 text tower now RUNS: a prompt string
@@ -406,6 +529,65 @@ cmake --build build --target vllm-server-stage
 cmake --build build --target vllm-server-archive
 build/release/stage/bin/vllm-server --help
 ```
+
+At the current numeric project version, `vllm-server-archive` emits exactly one
+deterministic developer tarball named
+`build/release/vllm.cpp-0.0.3-<configured-artifact-id>.tar.gz`. The target
+selects `tar.gz` explicitly; it does not infer the format from the filename.
+This is separate from the release workflow, whose `0.0.3-pre.1` asset names and
+per-tuple formats come from the release matrix, including `.zip` for Windows.
+
+On native Windows, run the release-bundle gate from a Visual Studio 2022 x64
+developer PowerShell. It builds with MSVC/UCRT `/MT` and `/W4 /WX`, installs
+`bin/vllm-server.exe`, runs the focused Win32 tests, exercises the portable and
+AVX2 tiers, verifies an unsupported forced tier is refused, and smokes
+`--help`, `/health`, `/version`, and a clean CTRL_BREAK shutdown:
+
+The MSVC build defines `NOMINMAX` and the portable ISO CRT contract centrally,
+and compiles C++ sources as UTF-8. Do not add those definitions per target or
+disable `/WX`; both CPU and Vulkan release configurations share this contract.
+
+```powershell
+$env:SOURCE_SHA = git rev-parse HEAD
+$env:VERSION = "0.0.3-pre.1"
+$env:SOURCE_DATE_EPOCH = git show -s --format=%ct HEAD
+$env:EVIDENCE_URL = "https://github.com/mudler/vllm.cpp/actions/runs/EXAMPLE"
+pwsh -File scripts/build-windows-release.ps1 -Backend cpu
+pwsh -File scripts/build-windows-release.ps1 -Backend vulkan `
+  -BuildDir build-release-windows-vulkan `
+  -StageDir build-release-windows-vulkan/stage
+```
+
+The adaptive binary keeps its F16C translation unit at `/arch:AVX`; AVX2 and
+AVX-512 remain separate runtime-selected translation units. The gate derives
+the complete server source set from CMake's generated codemodel, recursively
+checks its project-local header closure, and refuses required runtime sources
+that are not reachable from the shipped target. After installation it audits
+project COFF directives for static `LIBCMT` and rejects dynamic/debug CRT
+imports before running the staged executable's `--help`, forced-tier, or HTTP
+shutdown smokes. The Win32 console-control regression uses bounded waits so a
+teardown failure reports an error instead of hanging the gate.
+
+The CUDA graph-replay profiler and its FIFO diagnostic controls remain
+POSIX-only and are not exposed by native Windows server builds. Native Windows
+process launch, environment updates, process IDs, and console shutdown stay on
+the direct CRT/Win32 adapters; they do not require a POSIX compatibility layer
+or a command shell.
+
+Each invocation emits a deterministic `.zip` plus its exact `.sha256` and
+`.provenance.json` sidecars. ZIP members are sorted, use the
+`SOURCE_DATE_EPOCH` timestamp, and reject traversal, drive-qualified paths,
+backslashes, symlinks, and reparse points. The PE audit requires AMD64, `/MT`,
+system DLL imports, and no build/debug/MSYS paths. The Vulkan archive bundles no
+loader, ICD, or driver: `vulkan-1.dll` and a working host Vulkan stack remain
+external, and runtime evidence stays absent unless the extracted server is
+actually probed against a real ICD.
+
+The default smoke model is the committed tiny embedding fixture; pass
+`-SmokeModel C:\path\to\model` to use another complete model directory. This
+command produces a staged developer tree only. The Windows CPU and Vulkan ZIP
+downloads do not exist until the `v0.0.3-pre.1` prerelease workflow and
+post-publication audit succeed. <!-- ENG-RELEASE-WINDOWS: state=ACTIVE publication=pending artifact=unpublished -->
 
 The basic CMake archive under `build/release/` includes the version, configured
 backend, OS, and host architecture in its name. It is a developer package. The
@@ -546,6 +728,7 @@ provenance sidecars:
 ```sh
 python3 scripts/validate-release-archive.py \
   --archive vllm.cpp-0.0.2-linux-x86_64-glibc-cpu.tar.gz \
+  --archive-format tar.gz \
   --checksum vllm.cpp-0.0.2-linux-x86_64-glibc-cpu.tar.gz.sha256 \
   --provenance vllm.cpp-0.0.2-linux-x86_64-glibc-cpu.tar.gz.provenance.json \
   --forbid-path "$PWD/build"
@@ -690,12 +873,15 @@ manual entry point:
 gh workflow run release.yml --ref main
 ```
 
-Manual runs are always dry runs. Publication additionally requires an exact
-`v<project-version>` tag, a release matrix whose required lanes are all marked
+Manual runs are always dry runs. Publication additionally requires the exact
+tag declared in `release/release-version.json` (currently
+`v0.0.3-pre.1`), a release matrix whose required lanes are all marked
 ready, successful verification and attestation jobs, and approval of the
 protected `release` environment. Build and verification jobs have read-only
 repository permissions; only attestation receives OIDC authority, and only the
-final protected job receives `contents: write`.
+final protected job receives `contents: write`. The current declaration is a
+prerelease; the publisher must pass GitHub's prerelease flag and a manual dry
+run cannot publish.
 
 Any OpenAI client works by pointing its `base_url` at it:
 
@@ -814,7 +1000,7 @@ a stop token early.
 | `--tool-call-parser <name>` | `hermes` | Tool-call dialect (41 names over 37 families). `auto` detects from the chat template, `none` disables. For `gemma4`, OpenAI chat uses the text-seam parser (wrapped `<\|tool_call>` **or** bare `call:NAME{ARGS}`) so free-form / detokenized tool bodies still become `tool_calls` |
 | `--reasoning-parser <name>` | `none` | Reasoning parser (`think_auto`, `deepseek_r1`, `deepseek_v3`, `holo2`, `mistral`, `minimax_m2`, `minimax_m2_append_think`, `step3`, `olmo3`, `muse_glimmer`). `auto` detects, `none` disables |
 | `--kv-transfer-config '<json>'` | (unset) | External KV connector, same JSON as vLLM's flag. See [docs/KV-OFFLOAD.md](KV-OFFLOAD.md) |
-| `--speculative-config '<json>'` | (unset) | Speculative decoding (`mtp`, `dflash`, `ngram`), same JSON as vLLM's flag. `dspark` speculates on the Qwen3.6 gate models (native + Speculators drafts), token-identically to speculative-off, but is not gated on speed (currently ~2% behind at c1). A GGUF target, or a target with no aux multi-tap, is refused by name (`SPEC-DSPARK`). See [docs/SPECULATIVE-DECODING.md](SPECULATIVE-DECODING.md) |
+| `--speculative-config '<json>'` | (unset) | Speculative decoding (`mtp`, `dflash`, `ngram`), same JSON as vLLM's flag. `dspark` speculates on the Qwen3.6 gate models (native + Speculators drafts), token-identically to speculative-off, but is not gated on speed (currently ~2% behind at c1). A GGUF target, or a target with no aux multi-tap, is refused by name (`SPEC-DSPARK`). Its sequential Markov sampling runs on device by default; `VT_DSPARK_DEVICE_SAMPLE=0` restores the host loop (token-identical, cost only). The speculative verify runs from a captured CUDA graph, worth +12.2%/+3.5% on the 35B cells; `VT_SPEC_DECODE_GRAPH=0` restores the eager verify (also token-identical). See [docs/SPECULATIVE-DECODING.md](SPECULATIVE-DECODING.md) |
 | `--enable-log-requests` / `--disable-log-requests` | on | Log each incoming request. Mirrors vLLM's flag of the same name |
 | `--enable-log-outputs` | off | Also log the generated output, not just the request |
 | `--max-log-len N` | `256` | Truncate logged prompts and outputs to N characters |
@@ -1174,6 +1360,40 @@ The library never spawns a process, so generation and muxing enter through a
 caller-supplied `VideoRunner` callback (`examples/server/main.cpp` supplies one
 that invokes `ffmpeg`, path configurable with `--video-ffmpeg`).
 
+### Video family, and family-specific load knobs
+
+`/v1/videos` serves whichever video family the `--video-dit` checkpoint belongs
+to. By default the family is **detected** from what the checkpoint holds, and
+that is unchanged.
+
+`--video-family NAME` pins it instead. Two registered families exist,
+`minimax-h3` and `ltx-2.5`, and a name outside that set is refused at argument
+parsing, before the text model loads, with the registered names printed. It is
+never a hint: a declared family that cannot load the checkpoint fails loudly
+rather than falling back to detection, because a checkpoint handed to the wrong
+family does not fail, it renders noise.
+
+`--video-extra KEY=VALUE`, repeatable, carries a family's own load knobs. LTX-2.5
+cannot load without `dit_config_path` and `audio_prompt_embeds_path`; MiniMax-H3
+defines `partition`, for which `--video-partition` remains the documented alias.
+A bare `KEY` with no `=` is refused rather than read as an empty value, and a
+`--video-extra partition=X` contradicting `--video-partition Y` is refused rather
+than resolved by whichever assignment ran last. A family refuses any key it does
+not define, so a mistyped knob is an error instead of a silently defaulted
+render.
+
+```sh
+vllm-server --model /path/to/text-model \
+  --video-family ltx-2.5 \
+  --video-dit ltx-2.5-22b-distilled-fp8.safetensors \
+  --video-vae ltx-2.5-video-vae-conv-bf16.safetensors \
+  --audio-vae ltx-2.5-audio-vae-bf16.safetensors \
+  --video-prompt-embeds video_prompt_embeds.f32 \
+  --video-extra dit_config_path=ltx-2.5-transformer-config.json \
+  --video-extra audio_prompt_embeds_path=audio_prompt_embeds.f32 \
+  --video-extra model_version=2.5 --video-extra allow_unported_modules=1
+```
+
 ## Consuming it as a library (C ABI)
 
 Link `libvllm` (static or shared) and include [`include/vllm.h`](../include/vllm.h).
@@ -1268,8 +1488,15 @@ knobs from `extras`. H3 takes `partition`. LTX-2.5 takes
 seam's `prompt_embeds_path`, which carries the video stream), `pipeline_kind`
 (default `distilled_two_stage`), `model_version` (only for a checkpoint that
 declares none), `dit_config_path`, `allow_unported_modules`, `max_phase`,
-`upsampler_path` and `duration_head_path`. An extra a family does not define is
-refused, never ignored.
+`prompt_embeds_valid_rows`, `upsampler_path` and `duration_head_path`. An extra a
+family does not define is refused, never ignored.
+
+`prompt_embeds_valid_rows` is how many of the supplied conditioning rows are real
+tokens; absent, every row is. It matters because the embeddings connector
+substitutes its learnable register table at PADDED positions, so padding decides
+which of the connector's inputs are learned constants rather than caption
+features. Upstream always knows this because its tokenizer produced the mask;
+this seam reads conditioning from a file, which carries none.
 
 `dit_config_path` names a JSON file holding the DiT's `{"transformer": {...}}`
 configuration, and it exists because only one of the two shipped LTX-2.5 DiTs
@@ -1301,6 +1528,11 @@ after temperature and top-k/top-p, so they describe the distribution actually
 SAMPLED from — a token top-k masked away reads `-inf` there and its true value
 under the raw pair. It is selectable by constructing a `Sampler` directly; there
 is no config, CLI or request field for it yet.
+
+`LogprobsTensors::slice_request(req_idx, request_num_positions)` cuts that
+batch-wide payload by rows. The second argument is the requested row count;
+each row keeps the source tensor's independent `num_tokens_per_position`
+width.
 
 The LoRA adapter headers ([`lora/lora_weights.h`](../include/vllm/lora/lora_weights.h),
 [`lora/punica.h`](../include/vllm/lora/punica.h),

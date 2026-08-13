@@ -66,6 +66,15 @@
 //    tensors — and that change owns the flag. Conditioning meanwhile comes from
 //    prompt-embeds, the seam's own documented fallback (video_engine.h:55-57).
 //
+//    WHAT PHASE L9c CHANGED, AND WHAT IT DID NOT. The link BELOW the tower is now
+//    real: when the checkpoint carries the two `*_embeddings_connector` families
+//    — both shipped LTX-2.5 DiTs do, 129 tensors each — the supplied prompt
+//    embeds are run through the connector before the DiT sees them, with those
+//    weights, under the checkpoint's own `connector_*` configuration. Before
+//    L9c they went to cross-attention verbatim and the connector was reachable
+//    only from a test. The TOWER is still owed, so what enters the connector is
+//    still whatever the caller put in the file rather than an encoded prompt.
+//
 // 3. Any pipeline kind / model version the recipe table does not carry.
 //    `ResolveLtx2PipelineRecipe` already throws rather than defaulting
 //    (ltx2_pipeline.h:543-562); this engine passes the checkpoint's OWN
@@ -155,6 +164,20 @@ inline constexpr char kLtx2AllowUnportedExtra[] = "allow_unported_modules";
 // second phase needs the latent spatial upsampler, and a run without one must
 // say so rather than skipping the phase silently.
 inline constexpr char kLtx2MaxPhaseExtra[] = "max_phase";
+
+// How many of the supplied prompt-embeds rows are REAL tokens; the rest are
+// padding. Absent means every row is real.
+//
+// WHY A SEAM WITH NO TOKENIZER NEEDS THIS. The embeddings connector substitutes
+// its `learnable_registers` table at PADDED positions
+// (embeddings_connector.py:139-152), so the padding is not inert — it is what
+// decides which of the connector's inputs are learned constants rather than
+// caption features. Upstream always knows this, because the tokenizer produced
+// the mask. This seam takes prompt embeds from a FILE, which carries no mask, so
+// without this extra the padded tail would be conditioned on as if it were text
+// and every register would go unused. Recorded as a knob rather than assumed,
+// and it is the field the Gemma-4 tower will supply when it lands.
+inline constexpr char kLtx2PromptValidRowsExtra[] = "prompt_embeds_valid_rows";
 
 // A loaded LTX-2.5 checkpoint set. Construct through
 // `vllm::multimodal::LoadVideoEngine` (detection) or by declaring

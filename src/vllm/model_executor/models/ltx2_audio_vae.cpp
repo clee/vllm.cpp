@@ -19,6 +19,8 @@
 // (see ltx2_video_vae.cpp).
 #include "vllm/model_executor/models/ltx2_audio_vae.h"
 
+#include "vllm/model_executor/models/ltx2_audio_vae_encoder.h"
+
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
@@ -174,7 +176,39 @@ void PixelNorm(std::vector<float>& x, int64_t channels, int64_t spatial, double 
 // The audio VAE's normalization switch (normalization.py:43-59). The GroupNorm arm
 // reuses the shared 3-D-shaped implementation: its statistics span the group's
 // channels and every non-channel element, which is exactly torch's rule at any rank.
-void ApplyNorm(const Ltx2AudioDecoderConfig& config, std::vector<float>& x, int64_t channels,
+// The fields the shared 2-D primitives need, so ONE set of them serves both the
+// decoder and the encoder rather than each half growing its own causal pad.
+// Nothing here is a new degree of freedom: every member is read straight off
+// whichever config the caller holds.
+struct AudioConvSpec {
+  Ltx2NormType norm_type = Ltx2NormType::kPixel;
+  Ltx2CausalityAxis causality_axis = Ltx2CausalityAxis::kHeight;
+  int64_t num_groups = 32;
+  double norm_eps = 1e-6;
+  double pixel_norm_eps = 1e-6;
+};
+
+AudioConvSpec SpecOf(const Ltx2AudioDecoderConfig& config) {
+  AudioConvSpec spec;
+  spec.norm_type = config.norm_type;
+  spec.causality_axis = config.causality_axis;
+  spec.num_groups = config.num_groups;
+  spec.norm_eps = config.norm_eps;
+  spec.pixel_norm_eps = config.pixel_norm_eps;
+  return spec;
+}
+
+AudioConvSpec SpecOf(const Ltx2AudioEncoderConfig& config) {
+  AudioConvSpec spec;
+  spec.norm_type = config.norm_type;
+  spec.causality_axis = config.causality_axis;
+  spec.num_groups = config.num_groups;
+  spec.norm_eps = config.norm_eps;
+  spec.pixel_norm_eps = config.pixel_norm_eps;
+  return spec;
+}
+
+void ApplyNorm(const AudioConvSpec& config, std::vector<float>& x, int64_t channels,
                int64_t spatial, const Ltx2VaeWeights& weights, const std::string& prefix) {
   if (config.norm_type == Ltx2NormType::kPixel) {
     PixelNorm(x, channels, spatial, config.pixel_norm_eps);
@@ -211,7 +245,7 @@ struct AudioMap {
   int64_t channels = 0, h = 0, w = 0;
 };
 
-AudioMap CausalConv(const AudioMap& in, const Ltx2AudioDecoderConfig& config, int64_t out_channels,
+AudioMap CausalConv(const AudioMap& in, const AudioConvSpec& config, int64_t out_channels,
                     int64_t kernel, const Ltx2VaeWeights& weights, const std::string& prefix) {
   Conv2dSpec spec;
   spec.in_channels = in.channels;
@@ -229,7 +263,7 @@ AudioMap CausalConv(const AudioMap& in, const Ltx2AudioDecoderConfig& config, in
 
 // ResnetBlock (resnet.py:155-176) with temb always None: the decoder builds it
 // with temb_channels=0, so no temb_proj exists at all.
-AudioMap ResnetBlock(const AudioMap& x, const Ltx2AudioDecoderConfig& config, int64_t out_channels,
+AudioMap ResnetBlock(const AudioMap& x, const AudioConvSpec& config, int64_t out_channels,
                      const Ltx2VaeWeights& weights, const std::string& prefix) {
   VT_CHECK(config.causality_axis == Ltx2CausalityAxis::kNone ||
                config.norm_type != Ltx2NormType::kGroup,
@@ -258,7 +292,7 @@ AudioMap ResnetBlock(const AudioMap& x, const Ltx2AudioDecoderConfig& config, in
 
 // AttnBlock (attention.py:31-55): full self-attention over every (time, mel)
 // location. It is NOT causal — upstream applies it to the whole map.
-AudioMap AttnBlock(const AudioMap& x, const Ltx2AudioDecoderConfig& config,
+AudioMap AttnBlock(const AudioMap& x, const AudioConvSpec& config,
                    const Ltx2VaeWeights& weights, const std::string& prefix) {
   const int64_t c = x.channels;
   const int64_t n = x.h * x.w;
@@ -327,7 +361,7 @@ AudioMap AttnBlock(const AudioMap& x, const Ltx2AudioDecoderConfig& config,
 // Upsample (upsample.py:25-55): nearest 2x on BOTH axes, a causal conv, then DROP
 // THE FIRST element on the causal axis — the head, not the tail, because only the
 // first two interpolated elements depend on a single input element.
-AudioMap Upsample(const AudioMap& x, const Ltx2AudioDecoderConfig& config,
+AudioMap Upsample(const AudioMap& x, const AudioConvSpec& config,
                   const Ltx2VaeWeights& weights, const std::string& prefix) {
   AudioMap up;
   up.channels = x.channels;
@@ -456,12 +490,13 @@ Ltx2AudioSpectrogram Ltx2AudioDecoderForward(const Ltx2AudioDecoderConfig& confi
 
   // --- conv_in -> mid -> up path -> norm/SiLU/conv_out ---
   const std::string p = config.prefix;
+  const AudioConvSpec spec = SpecOf(config);
   const int64_t base = config.ch * config.ch_mult[static_cast<size_t>(levels - 1)];
-  h = CausalConv(h, config, base, 3, weights, p + "conv_in");
+  h = CausalConv(h, spec, base, 3, weights, p + "conv_in");
 
-  h = ResnetBlock(h, config, base, weights, p + "mid.block_1");
-  if (config.mid_block_add_attention) h = AttnBlock(h, config, weights, p + "mid.attn_1");
-  h = ResnetBlock(h, config, base, weights, p + "mid.block_2");
+  h = ResnetBlock(h, spec, base, weights, p + "mid.block_1");
+  if (config.mid_block_add_attention) h = AttnBlock(h, spec, weights, p + "mid.attn_1");
+  h = ResnetBlock(h, spec, base, weights, p + "mid.block_2");
 
   int64_t curr_res = config.resolution / (int64_t{1} << (levels - 1));
   for (int64_t level = levels - 1; level >= 0; --level) {
@@ -470,18 +505,18 @@ Ltx2AudioSpectrogram Ltx2AudioDecoderForward(const Ltx2AudioDecoderConfig& confi
     const bool has_attn = std::find(config.attn_resolutions.begin(), config.attn_resolutions.end(),
                                     curr_res) != config.attn_resolutions.end();
     for (int64_t i = 0; i < config.num_res_blocks + 1; ++i) {
-      h = ResnetBlock(h, config, block_out, weights, sp + ".block." + std::to_string(i));
-      if (has_attn) h = AttnBlock(h, config, weights, sp + ".attn." + std::to_string(i));
+      h = ResnetBlock(h, spec, block_out, weights, sp + ".block." + std::to_string(i));
+      if (has_attn) h = AttnBlock(h, spec, weights, sp + ".attn." + std::to_string(i));
     }
     if (level != 0) {
-      h = Upsample(h, config, weights, sp + ".upsample");
+      h = Upsample(h, spec, weights, sp + ".upsample");
       curr_res *= 2;
     }
   }
 
-  ApplyNorm(config, h.data, h.channels, h.h * h.w, weights, p + "norm_out");
+  ApplyNorm(spec, h.data, h.channels, h.h * h.w, weights, p + "norm_out");
   Silu(h.data);
-  h = CausalConv(h, config, config.out_ch, 3, weights, p + "conv_out");
+  h = CausalConv(h, spec, config.out_ch, 3, weights, p + "conv_out");
   // give_pre_end and tanh_out are both hardcoded False upstream (audio_vae.py:338-339).
 
   // --- _adjust_output_shape (audio_vae.py:427-472): crop, then zero-pad on the
@@ -815,6 +850,347 @@ std::vector<float> Ltx2VocoderWithBweForward(const Ltx2VocoderBweConfig& config,
     }
   }
   if (out_samples != nullptr) *out_samples = output_length;
+  return out;
+}
+
+// ===========================================================================
+// THE ENCODER HALF (audio_vae.py:60-246) and its mel front-end (ops.py:8-55),
+// which phase L4 recorded as owed.
+//
+// It lives in this translation unit deliberately, so that `Conv2d`,
+// `ApplyCausalPadding`, `PixelNorm`, `ApplyNorm`, `ResnetBlock` and `AttnBlock`
+// are the SAME functions the decoder is gated on rather than a second copy of
+// each. `Downsample` is the only genuinely new module, because the decoder has
+// no strided convolution.
+// ===========================================================================
+
+namespace {
+
+// Downsample (downsample.py:11-57). NOT a CausalConv2d: a bare
+// `nn.Conv2d(k=3, stride=2, padding=0)` preceded by an explicit, ASYMMETRIC
+// `F.pad` whose tuple depends on the causality axis. The pad is in F.pad order,
+// `(left, right, top, bottom)` — left/right on the MEL axis, top/bottom on TIME.
+AudioMap Downsample(const AudioMap& x, const AudioConvSpec& spec, bool with_conv,
+                    const Ltx2VaeWeights& weights, const std::string& prefix) {
+  VT_CHECK(spec.causality_axis == Ltx2CausalityAxis::kNone || with_conv,
+           "ltx2 audio encoder: causality is only supported when `with_conv=True` "
+           "(downsample.py:28-29)");
+  if (!with_conv) {
+    // avg_pool2d(kernel_size=2, stride=2) (downsample.py:55).
+    AudioMap out;
+    out.channels = x.channels;
+    out.h = x.h / 2;
+    out.w = x.w / 2;
+    out.data.resize(static_cast<size_t>(out.channels * out.h * out.w));
+    for (int64_t c = 0; c < out.channels; ++c) {
+      for (int64_t y = 0; y < out.h; ++y) {
+        for (int64_t z = 0; z < out.w; ++z) {
+          double acc = 0.0;
+          for (int64_t a = 0; a < 2; ++a) {
+            for (int64_t b = 0; b < 2; ++b) {
+              acc += static_cast<double>(
+                  x.data[static_cast<size_t>((c * x.h + y * 2 + a) * x.w + z * 2 + b)]);
+            }
+          }
+          out.data[static_cast<size_t>((c * out.h + y) * out.w + z)] =
+              static_cast<float>(acc / 4.0);
+        }
+      }
+    }
+    return out;
+  }
+
+  Conv2dSpec conv;
+  conv.in_channels = x.channels;
+  conv.out_channels = x.channels;
+  conv.h = x.h;
+  conv.w = x.w;
+  conv.kh = conv.kw = 3;
+  conv.stride_h = conv.stride_w = 2;
+  switch (spec.causality_axis) {
+    case Ltx2CausalityAxis::kNone:  // (0, 1, 0, 1)
+      conv.pad_left = 0;
+      conv.pad_right = 1;
+      conv.pad_top = 0;
+      conv.pad_bottom = 1;
+      break;
+    case Ltx2CausalityAxis::kWidth:  // (2, 0, 0, 1)
+      conv.pad_left = 2;
+      conv.pad_right = 0;
+      conv.pad_top = 0;
+      conv.pad_bottom = 1;
+      break;
+    case Ltx2CausalityAxis::kHeight:  // (0, 1, 2, 0) — the SHIPPED axis.
+      conv.pad_left = 0;
+      conv.pad_right = 1;
+      conv.pad_top = 2;
+      conv.pad_bottom = 0;
+      break;
+    case Ltx2CausalityAxis::kWidthCompatibility:  // (1, 0, 0, 1)
+      conv.pad_left = 1;
+      conv.pad_right = 0;
+      conv.pad_top = 0;
+      conv.pad_bottom = 1;
+      break;
+  }
+  AudioMap out;
+  out.channels = x.channels;
+  out.data = Conv2d(x.data, conv, weights.Get(prefix + ".conv.weight"),
+                    &weights.Get(prefix + ".conv.bias"), &out.h, &out.w);
+  return out;
+}
+
+// _hz_to_mel / _mel_to_hz with `mel_scale="slaney"`, i.e. torchaudio's port of
+// the Auditory Toolbox scale. The three constants below are the whole
+// definition, and every one of them is a member of the invisible-constant class:
+// a reduced-dimension golden compares filterbanks, so it DOES see them — which is
+// exactly why the filterbank is gated on its own rather than only through the
+// spectrogram it multiplies.
+constexpr double kSlaneyFSp = 200.0 / 3.0;      // linear step below 1 kHz
+constexpr double kSlaneyMinLogHz = 1000.0;      // where the scale turns logarithmic
+constexpr double kSlaneyLogStep = 0.06875177742094912;  // log(6.4) / 27.0
+
+double HzToMelSlaney(double hz) {
+  constexpr double kMinLogMel = kSlaneyMinLogHz / kSlaneyFSp;
+  if (hz < kSlaneyMinLogHz) return hz / kSlaneyFSp;
+  return kMinLogMel + std::log(hz / kSlaneyMinLogHz) / kSlaneyLogStep;
+}
+
+double MelToHzSlaney(double mel) {
+  constexpr double kMinLogMel = kSlaneyMinLogHz / kSlaneyFSp;
+  if (mel < kMinLogMel) return kSlaneyFSp * mel;
+  return kSlaneyMinLogHz * std::exp(kSlaneyLogStep * (mel - kMinLogMel));
+}
+
+}  // namespace
+
+std::vector<float> Ltx2SlaneyMelFilterbank(int64_t n_freqs, double f_min, double f_max,
+                                           int64_t n_mels, int64_t sample_rate) {
+  VT_CHECK(n_freqs > 1 && n_mels > 0, "ltx2 mel: n_freqs and n_mels must be positive");
+  VT_CHECK(f_max > f_min, "ltx2 mel: f_max must exceed f_min");
+  // `torch.linspace(0, sample_rate // 2, n_freqs)` — INTEGER halving, which is
+  // what makes an odd sample rate land a hair below Nyquist.
+  const double nyquist = static_cast<double>(sample_rate / 2);
+  std::vector<double> all_freqs(static_cast<size_t>(n_freqs));
+  for (int64_t i = 0; i < n_freqs; ++i) {
+    all_freqs[static_cast<size_t>(i)] =
+        nyquist * static_cast<double>(i) / static_cast<double>(n_freqs - 1);
+  }
+
+  const double m_min = HzToMelSlaney(f_min);
+  const double m_max = HzToMelSlaney(f_max);
+  std::vector<double> f_pts(static_cast<size_t>(n_mels + 2));
+  for (int64_t i = 0; i < n_mels + 2; ++i) {
+    const double mel = m_min + (m_max - m_min) * static_cast<double>(i) /
+                                   static_cast<double>(n_mels + 1);
+    f_pts[static_cast<size_t>(i)] = MelToHzSlaney(mel);
+  }
+
+  // _create_triangular_filterbank, then the `slaney` area normalization
+  // `2 / (f_pts[i + 2] - f_pts[i])`.
+  std::vector<float> fb(static_cast<size_t>(n_mels * n_freqs));
+  for (int64_t m = 0; m < n_mels; ++m) {
+    const double lower = f_pts[static_cast<size_t>(m)];
+    const double center = f_pts[static_cast<size_t>(m + 1)];
+    const double upper = f_pts[static_cast<size_t>(m + 2)];
+    const double enorm = 2.0 / (upper - lower);
+    for (int64_t f = 0; f < n_freqs; ++f) {
+      const double freq = all_freqs[static_cast<size_t>(f)];
+      // torchaudio names these `down_slopes` / `up_slopes`, and the names are the
+      // opposite way round from what they compute: `down_slopes` is
+      // `-(f_pts[m] - freq) / (f_pts[m+1] - f_pts[m])`, i.e. the RISING edge, and
+      // `up_slopes` is `(f_pts[m+2] - freq) / (f_pts[m+2] - f_pts[m+1])`, the
+      // FALLING one. Writing the triangle "the obvious way" from the names gives
+      // a filterbank that is mostly zero — measured max|diff| 2.62e-03 against
+      // torchaudio, small enough to look like a tolerance problem rather than a
+      // structural one.
+      const double rising = (freq - lower) / (center - lower);
+      const double falling = (upper - freq) / (upper - center);
+      const double value = std::max(0.0, std::min(rising, falling));
+      fb[static_cast<size_t>(m * n_freqs + f)] = static_cast<float>(value * enorm);
+    }
+  }
+  return fb;
+}
+
+std::vector<float> Ltx2WaveformToLogMel(const Ltx2AudioProcessorConfig& config,
+                                        const std::vector<float>& waveform, int64_t channels,
+                                        int64_t samples, int64_t sampling_rate,
+                                        int64_t* out_frames) {
+  VT_CHECK(static_cast<int64_t>(waveform.size()) == channels * samples,
+           "ltx2 mel: waveform size does not match [channels, samples]");
+  VT_CHECK(sampling_rate == config.target_sample_rate,
+           "ltx2 mel: the waveform is at " + std::to_string(sampling_rate) + " Hz but the audio "
+           "VAE wants " + std::to_string(config.target_sample_rate) +
+           " Hz. Upstream resamples with torchaudio.functional.resample (audio_vae/ops.py:36-42), "
+           "a polyphase kaiser resampler for an arbitrary rational ratio, which is NOT ported — "
+           "this project carries only the integer-ratio hann-sinc variant the BWE stage needs. "
+           "Refused rather than reinterpreted: treating the samples as if they were already at "
+           "the target rate conditions on audio that is pitched and time-scaled wrong");
+  const int64_t n_fft = config.n_fft;
+  const int64_t hop = config.mel_hop_length;
+  VT_CHECK(n_fft > 0 && hop > 0, "ltx2 mel: n_fft and hop_length must be positive");
+  const int64_t n_freqs = n_fft / 2 + 1;
+  const int64_t pad = n_fft / 2;
+  VT_CHECK(samples > pad,
+           "ltx2 mel: `center=True` reflect-pads by n_fft/2, so the waveform must be longer than "
+           "that (torch.stft's own constraint)");
+
+  // torch.hann_window(win_length) is PERIODIC by default: 0.5 - 0.5*cos(2*pi*n/N),
+  // n in [0, N). The symmetric variant differs in the last sample and quietly
+  // changes every frame.
+  std::vector<double> window(static_cast<size_t>(n_fft));
+  for (int64_t i = 0; i < n_fft; ++i) {
+    window[static_cast<size_t>(i)] =
+        0.5 - 0.5 * std::cos(2.0 * M_PI * static_cast<double>(i) / static_cast<double>(n_fft));
+  }
+
+  // `center=True, pad_mode="reflect"`: pad n_fft/2 on BOTH sides, so frame 0 is
+  // centered on sample 0 and the frame count is 1 + samples / hop.
+  const int64_t padded = samples + 2 * pad;
+  const int64_t frames = 1 + (padded - n_fft) / hop;
+  if (out_frames != nullptr) *out_frames = frames;
+
+  const std::vector<float> basis = Ltx2SlaneyMelFilterbank(
+      n_freqs, 0.0, static_cast<double>(config.target_sample_rate) / 2.0, config.mel_bins,
+      config.target_sample_rate);
+
+  std::vector<float> out(
+      static_cast<size_t>(channels * frames * config.mel_bins));
+  std::vector<double> magnitude(static_cast<size_t>(n_freqs));
+  std::vector<double> frame(static_cast<size_t>(n_fft));
+  for (int64_t c = 0; c < channels; ++c) {
+    for (int64_t t = 0; t < frames; ++t) {
+      const int64_t start = t * hop;
+      for (int64_t i = 0; i < n_fft; ++i) {
+        // Reflect WITHOUT repeating the edge sample, torch's rule.
+        int64_t index = start + i - pad;
+        while (index < 0 || index >= samples) {
+          if (index < 0) index = -index;
+          if (index >= samples) index = 2 * (samples - 1) - index;
+        }
+        frame[static_cast<size_t>(i)] =
+            static_cast<double>(waveform[static_cast<size_t>(c * samples + index)]) *
+            window[static_cast<size_t>(i)];
+      }
+      // A direct DFT rather than an FFT: this is the CPU reference arm and the
+      // cost is O(n_fft * n_freqs) per frame, which is irrelevant next to the
+      // encoder it feeds. Accumulated in double so the magnitude matches torch's
+      // FFT to f32 round-off.
+      for (int64_t f = 0; f < n_freqs; ++f) {
+        double real = 0.0;
+        double imag = 0.0;
+        const double omega = -2.0 * M_PI * static_cast<double>(f) / static_cast<double>(n_fft);
+        for (int64_t i = 0; i < n_fft; ++i) {
+          const double angle = omega * static_cast<double>(i);
+          real += frame[static_cast<size_t>(i)] * std::cos(angle);
+          imag += frame[static_cast<size_t>(i)] * std::sin(angle);
+        }
+        // `power=1.0` is the MAGNITUDE, not the power spectrum. Squaring it
+        // instead still produces a spectrogram-shaped tensor.
+        magnitude[static_cast<size_t>(f)] = std::sqrt(real * real + imag * imag);
+      }
+      for (int64_t m = 0; m < config.mel_bins; ++m) {
+        double acc = 0.0;
+        for (int64_t f = 0; f < n_freqs; ++f) {
+          acc += static_cast<double>(basis[static_cast<size_t>(m * n_freqs + f)]) *
+                 magnitude[static_cast<size_t>(f)];
+        }
+        // The final `permute(0, 1, 3, 2)` (ops.py:55) is folded into this write:
+        // the result is [channels, TIME, mel], not [channels, mel, TIME].
+        out[static_cast<size_t>((c * frames + t) * config.mel_bins + m)] =
+            static_cast<float>(std::log(std::max(acc, kLtx2AudioMelLogClamp)));
+      }
+    }
+  }
+  return out;
+}
+
+Ltx2AudioSpectrogram Ltx2AudioEncoderForward(const Ltx2AudioEncoderConfig& config,
+                                             const Ltx2VaeWeights& weights,
+                                             const std::vector<float>& spectrogram,
+                                             int64_t channels, int64_t frames, int64_t mel_bins) {
+  const int64_t levels = config.num_resolutions();
+  VT_CHECK(levels > 0, "ltx2 audio encoder: ch_mult must not be empty");
+  VT_CHECK(channels == config.in_channels,
+           "ltx2 audio encoder: spectrogram channel count does not match in_channels");
+  VT_CHECK(static_cast<int64_t>(spectrogram.size()) == channels * frames * mel_bins,
+           "ltx2 audio encoder: spectrogram size does not match [C, T, F]");
+
+  const std::string p = config.prefix;
+  const AudioConvSpec spec = SpecOf(config);
+
+  AudioMap h;
+  h.channels = channels;
+  h.h = frames;
+  h.w = mel_bins;
+  h.data = spectrogram;
+
+  h = CausalConv(h, spec, config.ch, 3, weights, p + "conv_in");
+
+  // --- build_downsampling_path (downsample.py:60-110) + _run_downsampling_path
+  // (audio_vae.py:205-216). `in_ch_mult = (1, *ch_mult)` is what makes level i
+  // read `ch * ch_mult[i-1]`; `curr_res` is halved only after the level's blocks.
+  int64_t curr_res = config.resolution;
+  for (int64_t level = 0; level < levels; ++level) {
+    const std::string sp = p + "down." + std::to_string(level);
+    const int64_t block_out = config.ch * config.ch_mult[static_cast<size_t>(level)];
+    const bool has_attn = std::find(config.attn_resolutions.begin(), config.attn_resolutions.end(),
+                                    curr_res) != config.attn_resolutions.end();
+    for (int64_t i = 0; i < config.num_res_blocks; ++i) {
+      h = ResnetBlock(h, spec, block_out, weights, sp + ".block." + std::to_string(i));
+      if (has_attn) h = AttnBlock(h, spec, weights, sp + ".attn." + std::to_string(i));
+    }
+    if (level != levels - 1) {
+      h = Downsample(h, spec, config.resamp_with_conv, weights, sp + ".downsample");
+      curr_res /= 2;
+    }
+  }
+
+  // --- build_mid_block / run_mid_block (audio_vae.py:22-57) ---
+  const int64_t block_in = config.ch * config.ch_mult[static_cast<size_t>(levels - 1)];
+  VT_CHECK(h.channels == block_in,
+           "ltx2 audio encoder: the downsampling path did not reach ch * ch_mult[-1]");
+  h = ResnetBlock(h, spec, block_in, weights, p + "mid.block_1");
+  if (config.mid_block_add_attention) h = AttnBlock(h, spec, weights, p + "mid.attn_1");
+  h = ResnetBlock(h, spec, block_in, weights, p + "mid.block_2");
+
+  // --- _finalize_output (audio_vae.py:218-221) ---
+  ApplyNorm(spec, h.data, h.channels, h.h * h.w, weights, p + "norm_out");
+  Silu(h.data);
+  const int64_t conv_out_channels = config.double_z ? 2 * config.z_channels : config.z_channels;
+  h = CausalConv(h, spec, conv_out_channels, 3, weights, p + "conv_out");
+
+  // --- _normalize_latents (audio_vae.py:223-246) ---
+  // `torch.chunk(x, 2, dim=1)[0]` takes CEIL(C / 2) channels, then the patchifier
+  // flattens `b c t f -> b t (c f)`, so the statistics are indexed by
+  // `c * mel_bins + f`. Indexing them by `c` alone is the mistake that survives
+  // every shape check.
+  const int64_t mean_channels = (h.channels + 1) / 2;
+  Ltx2AudioSpectrogram out;
+  out.channels = mean_channels;
+  out.frames = h.h;
+  out.mel_bins = h.w;
+  out.data.resize(static_cast<size_t>(out.channels * out.frames * out.mel_bins));
+
+  const int64_t patched_width = mean_channels * out.mel_bins;
+  const std::vector<float>& std_of_means = weights.Get(p + "per_channel_statistics.std-of-means");
+  const std::vector<float>& mean_of_means = weights.Get(p + "per_channel_statistics.mean-of-means");
+  VT_CHECK(static_cast<int64_t>(std_of_means.size()) == patched_width &&
+               static_cast<int64_t>(mean_of_means.size()) == patched_width,
+           "ltx2 audio encoder: per-channel statistics must span latent channels x mel bins");
+
+  for (int64_t c = 0; c < mean_channels; ++c) {
+    for (int64_t t = 0; t < out.frames; ++t) {
+      for (int64_t f = 0; f < out.mel_bins; ++f) {
+        const size_t i = static_cast<size_t>((c * out.frames + t) * out.mel_bins + f);
+        const size_t k = static_cast<size_t>(c * out.mel_bins + f);
+        out.data[i] = static_cast<float>(
+            (static_cast<double>(h.data[i]) - static_cast<double>(mean_of_means[k])) /
+            static_cast<double>(std_of_means[k]));
+      }
+    }
+  }
   return out;
 }
 

@@ -28,6 +28,7 @@
 // this binary is only built + smoke-tested against a synthetic engine (see
 // tests/vllm/entrypoints/openai/test_api_server.cpp). The wiring below is the
 // same either way.
+#include <algorithm>
 #include <cmath>
 #include <cstdlib>
 #include <exception>
@@ -45,13 +46,13 @@
 #include <vector>
 #include <atomic>
 #include <cerrno>
-#include <csignal>
 #include <functional>
 #include <thread>
-#include <sys/wait.h>
-#include <unistd.h>
+#if defined(_WIN32)
+#include <process.h>
+#endif
 // DSR-ALLOW(ARCH-ONE-SURFACE): VT_BENCH_PROFILE_CONTROL is a build-option guard for the CUDA-graph-replay profiler, not a device fork; #189 moved it here verbatim from examples/server/main.cpp, which the DSR scanner never covered.
-#ifdef VT_BENCH_PROFILE_CONTROL
+#if defined(VT_BENCH_PROFILE_CONTROL) && !defined(_WIN32)
 #include <cerrno>
 #include <chrono>
 #include <fcntl.h>
@@ -78,10 +79,13 @@
 #include "vllm/entrypoints/openai/tool_parsers/detect.h"
 #include "vllm/model_executor/model_loader/safetensors_reader.h"
 #include "vllm/model_executor/models/qwen3_5_weights.h"
+#include "vllm/platform/console_shutdown.h"
+#include "vllm/platform/process.h"
 #include "vllm/transformers_utils/hf_config.h"
 #include "vllm/model_executor/models/model_registry.h"
 #include "vllm/multimodal/minimax_h3_video.h"
 #include "vllm/multimodal/parakeet_transcription.h"
+#include "vllm/multimodal/video_engine.h"
 #include "vllm/tokenizer/tokenizer.h"
 #include "vllm/version.h"
 #include "vllm/v1/core/kv_cache_utils.h"
@@ -96,7 +100,7 @@
 #include "vllm/v1/worker/gpu/runner.h"
 #include "vt/backend.h"
 // DSR-ALLOW(ARCH-ONE-SURFACE): VT_BENCH_PROFILE_CONTROL is a build-option guard for the CUDA-graph-replay profiler, not a device fork; #189 moved it here verbatim from examples/server/main.cpp, which the DSR scanner never covered.
-#ifdef VT_BENCH_PROFILE_CONTROL
+#if defined(VT_BENCH_PROFILE_CONTROL) && !defined(_WIN32)
 #include "vt/cuda/cuda_profiler_control.h"
 #endif
 #include "vt/dtype.h"
@@ -108,30 +112,53 @@ namespace fs = std::filesystem;
 using vllm::HfConfig;
 using vllm::Qwen3_5MoeWeights;
 
+fs::path NativeUtf8Path(const std::string& value) {
+#if defined(_WIN32)
+  const std::u8string utf8(
+      reinterpret_cast<const char8_t*>(value.data()), value.size());
+  return fs::path(utf8);
+#else
+  return fs::path(value);
+#endif
+}
+
+std::string PathUtf8(const fs::path& path) {
+#if defined(_WIN32)
+  const std::u8string utf8 = path.u8string();
+  return std::string(reinterpret_cast<const char*>(utf8.data()), utf8.size());
+#else
+  return path.string();
+#endif
+}
+
+void SetEnvironment(const char* name, const char* value) {
+#if defined(_WIN32)
+  if (_putenv_s(name, value) != 0) {
+    throw std::runtime_error(std::string("could not set environment variable ") +
+                             name);
+  }
+#else
+  if (setenv(name, value, /*overwrite=*/1) != 0) {
+    throw std::runtime_error(std::string("could not set environment variable ") +
+                             name);
+  }
+#endif
+}
+
+// DSR-ALLOW(ENG-RELEASE-WINDOWS): the profiler process-ID adapter is POSIX-only; #117 keeps native Windows on its CRT process boundary, not a device-dispatch fork.
+#if defined(VT_BENCH_PROFILE_CONTROL) && !defined(_WIN32)
+uint64_t CurrentProcessId() {
+  return static_cast<uint64_t>(::getpid());
+}
+#endif
+
 // Run an argv to completion and return its exit status — the ONE process
 // spawn in the MiniMax-H3 path, and it lives HERE, in examples/, by the
 // developer-ratified 2026-08-03 decision: the library (the
 // MiniMaxH3VideoEngine seam behind /v1/videos) writes the artifacts and
 // BUILDS this argv, and spawns nothing.
 int RunFfmpegArgv(const std::vector<std::string>& args) {
-  std::vector<char*> c_args;
-  c_args.reserve(args.size() + 1);
-  for (const std::string& arg : args) {
-    c_args.push_back(const_cast<char*>(arg.c_str()));
-  }
-  c_args.push_back(nullptr);
-  const pid_t pid = fork();
-  if (pid < 0) throw std::runtime_error("fork failed");
-  if (pid == 0) {
-    execvp(c_args[0], c_args.data());
-    _exit(127);  // exec failed; never run the parent's atexit handlers
-  }
-  int status = 0;
-  if (waitpid(pid, &status, 0) < 0) throw std::runtime_error("waitpid failed");
-  if (WIFSIGNALED(status)) {
-    throw std::runtime_error("ffmpeg died on signal " + std::to_string(WTERMSIG(status)));
-  }
-  return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+  return vllm::platform::RunProcessArgv(args);
 }
 
 struct Args {
@@ -169,6 +196,18 @@ struct Args {
   int video_encoder_max_layers = 50;
   std::string video_ffmpeg = "ffmpeg", video_device = "cuda";
   std::string video_partition;  // served partition (fl2va|ref2va); see the #77 guard
+  // The video model FAMILY to load. EMPTY keeps detection, which is the default
+  // and what every pre-L9B invocation gets. See the --video-family block below
+  // for why it now exists.
+  std::string video_family;
+  // FAMILY-SPECIFIC load knobs, `--video-extra KEY=VALUE`, repeatable. Pinning a
+  // family is useless if that family's required load knobs are unreachable:
+  // LTX-2.5 cannot load without `dit_config_path` (the shipped FP8 DiT carries
+  // no __metadata__) and `audio_prompt_embeds_path` (its audio stream conditions
+  // at a second width), and neither has — or should have — a dedicated flag on a
+  // family-generic server. `--video-partition` remains the documented alias for
+  // the H3 key "partition".
+  std::vector<std::pair<std::string, std::string>> video_extras;
   // Keep-quant is the library seam's DEFAULT arm; --video-dequant-bf16 selects
   // the bf16 dequant/stream arm (the throughput trade the gen example ships).
   // --video-keep-quant is still accepted (it names the default).
@@ -337,6 +376,20 @@ Args ParseArgs(int argc, char** argv) {
       a.video_device = NextArg(argc, argv, i, argv[0]);
     } else if (flag == "--video-partition") {
       a.video_partition = NextArg(argc, argv, i, argv[0]);
+    } else if (flag == "--video-family") {
+      a.video_family = NextArg(argc, argv, i, argv[0]);
+    } else if (flag == "--video-extra") {
+      const std::string kv = NextArg(argc, argv, i, argv[0]);
+      const std::string::size_type eq = kv.find('=');
+      // A bare KEY is refused rather than read as KEY="": an extra whose value
+      // silently became empty is how a mistyped knob renders the default and
+      // looks like the feature not working, which is the same failure the
+      // families' own unknown-extra refusals exist to stop.
+      if (eq == std::string::npos || eq == 0) {
+        std::cerr << "server: --video-extra takes KEY=VALUE, got '" << kv << "'\n";
+        Usage(argv[0], 2);
+      }
+      a.video_extras.emplace_back(kv.substr(0, eq), kv.substr(eq + 1));
     } else if (flag == "--video-keep-quant") {
       // the seam's default arm; accepted for pre-fold CLI compatibility
       a.video_dequant_bf16 = false;
@@ -444,6 +497,24 @@ Args ParseArgs(int argc, char** argv) {
     std::cerr << "server: --cuda-profile-graph-batch exceeds --max-num-seqs\n";
     Usage(argv[0], 2);
   }
+  // The declared video family, checked HERE for the same reason the parser
+  // dialects below are: `LoadVideoEngine` would refuse an unregistered name
+  // anyway, but only after the TEXT model has loaded, so a typo would cost a
+  // multi-GB load instead of a second. The REGISTRY is the authority — never a
+  // literal list here — so a family added in its own file is accepted with no
+  // edit to this one, which is the whole point of the registration seam.
+  if (!a.video_family.empty()) {
+    const std::vector<std::string> registered =
+        vllm::multimodal::RegisteredVideoFamilies();
+    if (std::find(registered.begin(), registered.end(), a.video_family) ==
+        registered.end()) {
+      std::cerr << "server: --video-family '" << a.video_family
+                << "' is not a registered video family. Registered families:";
+      for (const std::string& name : registered) std::cerr << " " << name;
+      std::cerr << "\n";
+      Usage(argv[0], 2);
+    }
+  }
   // Validate a NAMED parser dialect here, before the (multi-GB) model load, so a
   // typo costs a second rather than a full load. "auto" cannot be checked yet —
   // it resolves against the chat template — but detection only ever returns
@@ -459,84 +530,6 @@ Args ParseArgs(int argc, char** argv) {
 }
 
 
-// Clean shutdown on SIGTERM/SIGINT -- issue #312.
-//
-// Without this the server ignores SIGTERM outright when it is PID 1, because
-// the kernel does not apply default signal dispositions to PID 1. Every
-// `docker stop`, Kubernetes rolling update and `compose down` therefore waited
-// out its grace period and then SIGKILLed, dropping in-flight requests.
-//
-// The handler itself only write()s one byte to a self-pipe, which IS
-// async-signal-safe; a watcher thread does the actual stop(). That is the same
-// shape the VT_BENCH_PROFILE_CONTROL FIFO shutdown already uses, so both paths
-// converge on one stop().
-class SignalShutdown {
- public:
-  explicit SignalShutdown(std::function<void()> stop) : stop_(std::move(stop)) {
-    if (pipe(pipe_fds_) != 0) {
-      std::cerr << "server: could not install signal handlers (pipe failed); "
-                   "shutdown will not be graceful\n";
-      return;
-    }
-    write_fd.store(pipe_fds_[1], std::memory_order_release);
-    armed_ = Install(SIGTERM) && Install(SIGINT);
-    if (!armed_) return;
-    watcher_ = std::thread([this]() {
-      char byte = 0;
-      while (true) {
-        const ssize_t bytes = read(pipe_fds_[0], &byte, 1);
-        if (bytes == 1) {
-          if (byte == kCancel) return;
-          std::cerr << "server: shutting down on signal "
-                    << static_cast<int>(byte) << "\n";
-          stop_();
-          return;
-        }
-        if (bytes < 0 && errno == EINTR) continue;
-        return;
-      }
-    });
-  }
-
-  ~SignalShutdown() {
-    if (armed_) {
-      std::signal(SIGTERM, SIG_DFL);
-      std::signal(SIGINT, SIG_DFL);
-      const char cancel = kCancel;
-      const ssize_t ignored = write(pipe_fds_[1], &cancel, 1);
-      (void)ignored;
-    }
-    if (watcher_.joinable()) watcher_.join();
-    for (int fd : pipe_fds_) {
-      if (fd >= 0) close(fd);
-    }
-    write_fd.store(-1, std::memory_order_release);
-  }
-
-  SignalShutdown(const SignalShutdown&) = delete;
-  SignalShutdown& operator=(const SignalShutdown&) = delete;
-
-  static inline std::atomic<int> write_fd{-1};
-
- private:
-  static constexpr char kCancel = 0;
-
-  static void Handle(int signum) {
-    const int fd = write_fd.load(std::memory_order_acquire);
-    if (fd < 0) return;
-    const char byte = static_cast<char>(signum);
-    const ssize_t ignored = write(fd, &byte, 1);
-    (void)ignored;
-  }
-
-  static bool Install(int signum) { return std::signal(signum, Handle) != SIG_ERR; }
-
-  std::function<void()> stop_;
-  std::thread watcher_;
-  int pipe_fds_[2] = {-1, -1};
-  bool armed_ = false;
-};
-
 }  // namespace
 
 namespace vllm {
@@ -547,7 +540,7 @@ int VllmServerMain(int argc, char** argv) {
   try {
     const Args args = ParseArgs(argc, argv);
     if (args.verbose) {
-      setenv("VT_SERVER_VERBOSE", "1", /*overwrite=*/1);
+      SetEnvironment("VT_SERVER_VERBOSE", "1");
       std::cerr << "server: verbose stage logging enabled (debug_stages)\n";
     }
     {
@@ -567,17 +560,17 @@ int VllmServerMain(int argc, char** argv) {
                 << "\n";
     }
 
-    const fs::path dir(args.model_dir);
-    const std::string config_path = (dir / "config.json").string();
-    const std::string tokenizer_path = (dir / "tokenizer.json").string();
+    const fs::path dir = NativeUtf8Path(args.model_dir);
+    const std::string config_path = PathUtf8(dir / "config.json");
+    const std::string tokenizer_path = PathUtf8(dir / "tokenizer.json");
     const std::string tokenizer_config_path =
         args.tokenizer_config.empty()
-            ? (dir / "tokenizer_config.json").string()
+            ? PathUtf8(dir / "tokenizer_config.json")
             : args.tokenizer_config;
     const std::string served_model_name =
         args.served_model_name.empty()
-            ? (dir.has_filename() ? dir.filename().string()
-                                  : dir.parent_path().filename().string())
+            ? PathUtf8(dir.has_filename() ? dir.filename()
+                                          : dir.parent_path().filename())
             : args.served_model_name;
 
     // ── TASK DISPATCH (ARCH-ONE-SURFACE ROW 1): a model dir whose
@@ -665,7 +658,8 @@ int VllmServerMain(int argc, char** argv) {
             });
         std::cerr << "server: listening on http://" << args.host << ":"
                   << args.port << "\n";
-        SignalShutdown shutdown_on_signal([&]() { embed_server.stop(); });
+        vllm::platform::ConsoleShutdown shutdown_on_signal(
+            [&]() { embed_server.stop(); });
         if (!embed_server.listen(args.host, args.port)) {
           std::cerr << "server: failed to bind " << args.host << ":"
                     << args.port << "\n";
@@ -689,7 +683,8 @@ int VllmServerMain(int argc, char** argv) {
             });
         std::cerr << "server: listening on http://" << args.host << ":"
                   << args.port << "\n";
-        SignalShutdown shutdown_on_signal([&]() { asr_server.stop(); });
+        vllm::platform::ConsoleShutdown shutdown_on_signal(
+            [&]() { asr_server.stop(); });
         if (!asr_server.listen(args.host, args.port)) {
           std::cerr << "server: failed to bind " << args.host << ":"
                     << args.port << "\n";
@@ -787,11 +782,11 @@ int VllmServerMain(int argc, char** argv) {
 
     if (args.cuda_profile_graph_replays > 0) {
 // DSR-ALLOW(ARCH-ONE-SURFACE): VT_BENCH_PROFILE_CONTROL is a build-option guard for the CUDA-graph-replay profiler, not a device fork; #189 moved it here verbatim from examples/server/main.cpp, which the DSR scanner never covered.
-#ifdef VT_BENCH_PROFILE_CONTROL
+#if defined(VT_BENCH_PROFILE_CONTROL) && !defined(_WIN32)
       vt::cuda::ConfigureCudaGraphReplayProfiler(
           static_cast<uint32_t>(args.cuda_profile_graph_replays),
           static_cast<uint32_t>(args.cuda_profile_graph_batch));
-      std::cerr << "[VT_CUDA_PROFILE] ready pid=" << getpid()
+      std::cerr << "[VT_CUDA_PROFILE] ready pid=" << CurrentProcessId()
                 << " signal=SIGUSR2 target_replays="
                 << args.cuda_profile_graph_replays << "\n";
 #else
@@ -878,8 +873,8 @@ int VllmServerMain(int argc, char** argv) {
     // model runner has no mm-forward path yet. Kept alive for the server loop.
     std::unique_ptr<vllm::multimodal::Qwen3VLImageProcessor> mm_image_proc;
     const std::string preprocessor_config_path =
-        (dir / "preprocessor_config.json").string();
-    if (fs::exists(preprocessor_config_path)) {
+        PathUtf8(dir / "preprocessor_config.json");
+    if (fs::exists(NativeUtf8Path(preprocessor_config_path))) {
       try {
         vllm::multimodal::Qwen3VLProcessorConfig pcfg =
             vllm::multimodal::LoadQwen3VLProcessorConfig(
@@ -962,12 +957,37 @@ int VllmServerMain(int argc, char** argv) {
       vmp.prompt_embeds_path = args.video_prompt_embeds;
       // The H3-specific partition rides in the generic extras (LTX-2.5 L1).
       if (!args.video_partition.empty()) vmp.extras["partition"] = args.video_partition;
+      // ...and every other family-specific knob rides there too, from
+      // --video-extra KEY=VALUE. Applied AFTER the partition alias so the two
+      // spellings of one key cannot disagree silently: a --video-extra
+      // partition=X that contradicts --video-partition Y is refused by name
+      // rather than resolved by whichever assignment ran last.
+      for (const auto& kv : args.video_extras) {
+        const auto existing = vmp.extras.find(kv.first);
+        if (existing != vmp.extras.end() && existing->second != kv.second) {
+          throw std::runtime_error("server: --video-extra " + kv.first + "=" + kv.second +
+                                   " contradicts the value already supplied for '" + kv.first +
+                                   "' ('" + existing->second +
+                                   "'). Refusing rather than preferring one.");
+        }
+        vmp.extras[kv.first] = kv.second;
+      }
       vmp.device = args.video_device == "cuda" ? 1 : 0;
       vmp.dequant_bf16 = args.video_dequant_bf16 ? 1 : 0;
       vmp.encoder_max_layers = args.video_encoder_max_layers;
-      // The family is DETECTED from the checkpoint; no --video-family flag is
-      // invented here until a second family exists to disambiguate.
+      // --video-family PINS the family; empty keeps detection, which is what
+      // every invocation before this flag existed got and still gets. The flag
+      // exists now because a SECOND family is registered (LTX-2.5), and the two
+      // shipped LTX DiTs are separate files whose comparison is only a statement
+      // about the files if the family is declared rather than inferred. It is
+      // never a hint: an unregistered name was already refused at ParseArgs, and
+      // a declared family that cannot load the checkpoint fails loudly instead
+      // of falling back to detection.
+      vmp.family = args.video_family;
       video_engine = vllm::multimodal::LoadVideoEngine(vmp);
+      std::cerr << "server: video family "
+                << (args.video_family.empty() ? "DETECTED" : "DECLARED (--video-family)")
+                << "\n";
       std::cerr << "server: /v1/videos on (family=" << video_engine->family()
                 << ", device=" << args.video_device
                 << (args.video_dequant_bf16 ? ", dequant-bf16" : ", keep-quant") << ")\n";
@@ -1044,7 +1064,7 @@ int VllmServerMain(int argc, char** argv) {
     std::cerr << ")\n";
 
 // DSR-ALLOW(ARCH-ONE-SURFACE): VT_BENCH_PROFILE_CONTROL is a build-option guard for the CUDA-graph-replay profiler, not a device fork; #189 moved it here verbatim from examples/server/main.cpp, which the DSR scanner never covered.
-#ifdef VT_BENCH_PROFILE_CONTROL
+#if defined(VT_BENCH_PROFILE_CONTROL) && !defined(_WIN32)
     std::atomic<bool> benchmark_shutdown_waiter_ready{false};
     std::atomic<bool> benchmark_shutdown_received{false};
     std::atomic<bool> benchmark_shutdown_failed{false};
@@ -1073,7 +1093,7 @@ int VllmServerMain(int argc, char** argv) {
           return;
         }
         benchmark_shutdown_waiter_ready.store(true, std::memory_order_release);
-        std::cerr << "[VT_BENCH_SHUTDOWN] ready pid=" << getpid()
+        std::cerr << "[VT_BENCH_SHUTDOWN] ready pid=" << CurrentProcessId()
                   << " control=fifo\n";
         while (!benchmark_shutdown_cancelled.load(std::memory_order_acquire)) {
           char command = '\0';
@@ -1124,11 +1144,12 @@ int VllmServerMain(int argc, char** argv) {
     }
 #endif
 
-    SignalShutdown shutdown_on_signal([&]() { server.stop(); });
+    vllm::platform::ConsoleShutdown shutdown_on_signal(
+        [&]() { server.stop(); });
     const bool listen_ok = server.listen(args.host, args.port);
 
 // DSR-ALLOW(ARCH-ONE-SURFACE): VT_BENCH_PROFILE_CONTROL is a build-option guard for the CUDA-graph-replay profiler, not a device fork; #189 moved it here verbatim from examples/server/main.cpp, which the DSR scanner never covered.
-#ifdef VT_BENCH_PROFILE_CONTROL
+#if defined(VT_BENCH_PROFILE_CONTROL) && !defined(_WIN32)
     if (benchmark_shutdown_thread.joinable()) {
       benchmark_shutdown_cancelled.store(true, std::memory_order_release);
       benchmark_shutdown_thread.join();
