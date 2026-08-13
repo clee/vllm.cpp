@@ -106,6 +106,7 @@ issue is not yet placed. Keyed record: update in place, never append.
 | [#537](https://github.com/mudler/vllm.cpp/issues/537) | `ENG-RELEASE-WINDOWS` | Windows OpenAI socket smoke fast-fails instead of reporting a reset response | bug |
 | [#540](https://github.com/mudler/vllm.cpp/issues/540) | `ENG-RELEASE-WINDOWS` | Windows Vulkan strict build rejects shadowed KV-cache test locals | bug |
 | [#599](https://github.com/mudler/vllm.cpp/issues/599) | `ENG-RELEASE-WINDOWS` | Windows release contract failure fixture is not portable under PowerShell on Linux | bug |
+| [#645](https://github.com/mudler/vllm.cpp/issues/645) | `ENG-RELEASE-WINDOWS` | LTX2 sources reintroduce non-portable `M_PI` and break the Windows release gate | bug |
 | [#515](https://github.com/mudler/vllm.cpp/issues/515) | `ENG-RECORD-CONFLICT-SURFACES` | check-doc-checkpoint treats every root `CMakeLists.txt` edit as a usage change, so adding a source file demands a `docs/USAGE.md` edit with nothing true to say | bug |
 | [#547](https://github.com/mudler/vllm.cpp/issues/547) | — | GB10 reports `UnifiedMemory()` true, so `ReferenceTierEligible(kCUDA)` runs the CPU host kernel over `cudaMalloc` pointers; it needs `DeviceMemoryIsHostAddressable()` | bug |
 | [#569](https://github.com/mudler/vllm.cpp/issues/569) | `MODEL-TEXT-nemotron-h-nemotron-hfor-causal-lm` | The Nemotron revision pin was existence-only: a substituted checkpoint still resolved, and W6's token gate cannot see that | bug |

@@ -617,6 +617,29 @@ three confirmation statuses, and the dependency classification. The existing
 unfiltered full-suite invocation remains unchanged and still runs afterwards.
 Any other probe status stops the release job rather than being classified.
 
+### Current-main portability regression: issue #645
+
+Current `main` at `cefacd2d00cb9b4776331cd213116773cd97f811` added LTX2
+sources containing the non-standard `M_PI` macro. The existing real-tree
+Windows portability regression is RED and names exactly these three files:
+
+- `src/vllm/model_executor/models/ltx2.cpp`
+- `src/vllm/model_executor/models/ltx2_video_vae.cpp`
+- `src/vllm/model_executor/models/ltx2_audio_vae.cpp`
+
+The repair is limited to replacing those uses with a standard C++ constant
+whose type and value preserve the current expressions. Do not define feature
+macros, add a checker exemption, weaken the real-tree scan, or alter LTX2
+algorithms. The existing failing real-tree test is the RED regression; focused
+green requires that test, the complete Windows portability suite, the combined
+release script suite, and a clean CPU build covering the affected translation
+units. Hosted MSVC CPU and Vulkan builds remain binding.
+
+Fresh review must mutate at least one repaired expression back to `M_PI` and
+must perturb the replacement constant enough to prove an LTX2 numerical test
+detects it. Stop with `NEEDS_DECISION` if preserving the current value requires
+an algorithmic or tolerance change rather than a constant substitution.
+
 Fresh mutation review of the adaptive probe found three false-green contract
 gaps: the listing fixture did not distinguish file order from name order, the
 unexpected-status branches at an intermediate midpoint and isolated probe were
