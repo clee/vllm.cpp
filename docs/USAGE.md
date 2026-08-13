@@ -1650,14 +1650,16 @@ knobs from `extras`. H3 takes `partition`. LTX-2.5 takes
 `audio_prompt_embeds_path` (the audio stream's conditioning, the twin of the
 seam's `prompt_embeds_path`, which carries the video stream), `pipeline_kind`
 (default `distilled_two_stage`), `model_version` (only for a checkpoint that
-declares none), `dit_config_path`, `allow_unported_modules`, `max_phase`,
-`prompt_embeds_valid_rows`, `upsampler_path` and `duration_head_path`. An extra a
-family does not define is refused, never ignored. One caveat inside that set:
-`duration_head_path` is accepted but INERT — the duration head is ported and gated
-as a brick, nothing in the video engine constructs one, and no code reads that
-key, so supplying it neither loads a head nor enables an AUTO duration. Give
+declares none), `dit_config_path`, `encoder_config_path`,
+`allow_unported_modules`, `max_phase`, `prompt_embeds_valid_rows`,
+`upsampler_path` and `duration_head_path`. An extra a family does not define is
+refused, never ignored. One caveat inside that set: `duration_head_path` is
+defined but UNSERVED — the duration head is ported and gated as a brick, and
+nothing in the video engine constructs one — so supplying it is **refused by
+name** at load rather than accepted. It used to be accepted and read by nothing,
+which silently substituted the recipe default for the file you named. Give
 `num_frames` (or `duration`, which is exact arithmetic against the recipe's frame
-rate) instead.
+rate) instead. Every other key in that list reaches a reader.
 
 `prompt_embeds_valid_rows` is how many of the supplied conditioning rows are real
 tokens; absent, every row is. It matters because the embeddings connector

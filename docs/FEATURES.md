@@ -324,6 +324,8 @@ CPU elementwise GEMM (f32/f16/bf16) runs AVX2 and AVX-512 tiers on x86 where the
 |---|---|---|
 | Kimi-Linear-48B-A3B (KDA + NoPE-MLA + MoE hybrid) | **Runner fold LANDS (ROW 7 §21, #122): the ENGINE/SERVER surface serves Kimi at the 122/128 golden profile (engine==CLI 128/128); STRICT stays closed (intrinsic p7 near-tie)** | server 19.0 tok/s wall / CLI 18.9 vs vLLM ~21 (~0.90×), speed residual named (§21) |
 | Muse Glimmer 30B (Meta) | Text gated at **reduced depth 4/52** only; vision wired but never reference-checked | [spec](../.agents/specs/muse-glimmer.md) / [#268](https://github.com/mudler/vllm.cpp/issues/268). Full depth, multi-step decode, image/video, server path and parser scoping open. vLLM speed OPEN GAP; llama.cpp bar #333 |
+| LTX-2.5 AUTO duration (the duration head) | Brick ported, never constructed | `duration_head_path` is REFUSED by name rather than accepted-and-ignored ([#611](https://github.com/mudler/vllm.cpp/issues/611)); supplying a head cannot load one. Give `num_frames` or `duration` |
+| LTX-2.5 out-of-scope arms | Declared, not requestable | Temporal x2 upsampler, `BetaScheduler`, LoRA fusion, `int8-convrot` (ComfyUI-only), single-node multi-GPU. `multishot` was RETIRED: no such entry point exists in either reference |
 | Multi-GPU execution | Hardware-blocked | TP proven equal to tp=1 on CPU; no 2-GPU box to run it |
 | LoRA end to end | CPU brick landed | Unwired standalone; not usable through the server |
 | Multimodal over HTTP | Image request path wired; forward + codec pending | `ROAD-V1-MM` W1-W3 landed (`server_main.cpp:826`). Open: no mm-forward consuming `Request.mm_features`; no image codec vendored (raw RGB only); video/audio/multi-image not started |

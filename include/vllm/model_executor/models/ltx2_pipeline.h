@@ -571,20 +571,56 @@ Ltx2PipelineRecipe ResolveLtx2PipelineRecipe(const std::string& pipeline_kind,
                                              const std::string& model_version);
 
 // ---------------------------------------------------------------------------
-// Out of scope for L5, refused by name (spec section 2, "Out")
+// Out of scope, refused by name (spec section 2 "Out"; the 2026-08-13 grounding
+// pass is .agents/specs/ltx25-retire-dead-arms.md, row LTX25-RETIRE-DEAD-ARMS)
 // ---------------------------------------------------------------------------
 
 // Each of these renders something plausible if it is silently downgraded, which
 // is why none of them falls back. `Ltx2RefuseUnportedPipelineFeature` throws with
-// a message naming the missing piece and the phase or row that owes it.
+// a message naming the missing piece and the row that owes it.
+//
+// TWO KINDS live here, and conflating them overstated what this port refuses:
+//
+//   REACHABLE REFUSAL — a product path constructs the condition and throws, so a
+//   caller CAN trip it. `kTemporalUpsampler` (ltx2_upsampler.cpp:395) and
+//   `kBetaScheduler` (ltx2_pipeline.cpp:199) are the two.
+//
+//   DECLARED-OUT-OF-SCOPE MARKER — no request field, load extra or CLI flag asks
+//   for it, so nothing outside the ledger test reaches it. It is a record of what
+//   upstream HAS and this port does NOT, which is worth keeping; calling it a
+//   refusal is what was wrong. `kLoraFusion`, `kInt8ConvRot` and
+//   `kMultiGpuParallelism` are markers, and their messages say so.
+//
+// TWO ENUMERATORS WERE RETIRED on 2026-08-13, recorded here because the
+// retirement IS the record — a reader who finds them in git history needs to know
+// they did not simply move:
+//
+//   `kMultishot` — FABRICATED. It refused "multishot generation" and cited
+//   "ltx-pipelines multishot entry points". No such entry point, symbol or string
+//   exists in Lightricks/LTX-2 @ fd4ded7f or huggingface/diffusers @ 3a2f35d4.
+//   Searched as a SUBJECT rather than by our own phrasing: upstream's only sense
+//   of "shot" is ONE camera take (duration_head.py:1,5 "predicts shot duration";
+//   README.md:136 "a cinematographer describing a shot list"), and the only
+//   `scene` hit is PySceneDetect in the TRAINER. A defect in our record is not a
+//   gap in our port, so there was nothing to owe.
+//
+//   `kVideoEngineWiring` — LANDED. It said the end-to-end composition through
+//   `vllm::multimodal::VideoEngine` "is phase L7, not L5"; L7 shipped in
+//   `cefacd2d0`. A refusal whose subject shipped is a false statement.
 enum class Ltx2UnportedPipelineFeature {
-  kTemporalUpsampler,   // model/upsampler with temporal_upsample=True
-  kLoraFusion,          // loader/LoraPathStrengthAndSDOps
-  kMultishot,           // ltx-pipelines multishot entry points
-  kInt8ConvRot,         // ComfyUI-only quantization
-  kCfgParallelism,      // ltx-pipelines/multigpu
-  kVideoEngineWiring,   // end-to-end through vllm::multimodal::VideoEngine (L7)
-  kBetaScheduler,       // components/schedulers.py:91-120
+  // Reachable refusals.
+  kTemporalUpsampler,  // model/upsampler with temporal_upsample=True
+  kBetaScheduler,      // components/schedulers.py:91-120
+  // Declared-out-of-scope markers.
+  kLoraFusion,           // ltx-core loader/primitives.py:160 (LoraPathStrengthAndSDOps),
+                         //   fused by loader/fuse_loras.py
+  kInt8ConvRot,          // ComfyUI-ecosystem quantization, and NOT an LTX-2 arm: the four
+                         //   kinds upstream defines are fp8-cast / fp8-scaled-mm /
+                         //   nvfp4-cast / nvfp4-prequant (quantization_factory.py:23-27),
+                         //   int8 appears only in the TRAINER, and convrot nowhere at all
+  kMultiGpuParallelism,  // ltx-pipelines/multigpu — sequence-parallel, tiled data
+                         //   parallel and distributed VAE decode. NOT CFG batching:
+                         //   zero `cfg` hits in either multigpu tree
 };
 [[noreturn]] void Ltx2RefuseUnportedPipelineFeature(Ltx2UnportedPipelineFeature feature);
 

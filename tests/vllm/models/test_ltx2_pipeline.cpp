@@ -1231,25 +1231,56 @@ TEST_CASE("ltx2 the two references disagree on the default negative prompt, and 
 // Out-of-scope refusals
 // ===========================================================================
 
-TEST_CASE("ltx2 every L5 out-of-scope feature is refused BY NAME") {
-  // Spec section 2 "Out", plus the L7 boundary. A silent downgrade of any of
-  // these produces a video, which is exactly why none of them may fall back.
-  const std::vector<std::pair<vllm::Ltx2UnportedPipelineFeature, std::string>> owed = {
+// THE LIST SHRANK FROM SEVEN TO FIVE on 2026-08-13, and the shrink is the point.
+// Two enumerators were retired by row LTX25-RETIRE-DEAD-ARMS (#644):
+// `kMultishot`, which refused a feature that exists in NEITHER reference, and
+// `kVideoEngineWiring`, whose subject shipped in `cefacd2d0`. See
+// .agents/specs/ltx25-retire-dead-arms.md §1.1 and §1.5. A CHANGED CASE COUNT
+// here is that retirement, not a lost assertion.
+TEST_CASE("ltx2 every out-of-scope feature is refused BY NAME") {
+  // Spec section 2 "Out". A silent downgrade of any of these produces a video,
+  // which is exactly why none of them may fall back.
+  //
+  // REACHABLE REFUSALS: a product path constructs the condition, so a caller can
+  // trip these. The call sites are `ltx2_upsampler.cpp:395` and
+  // `ltx2_pipeline.cpp:199`.
+  const std::vector<std::pair<vllm::Ltx2UnportedPipelineFeature, std::string>> reachable = {
       {vllm::Ltx2UnportedPipelineFeature::kTemporalUpsampler, "temporal"},
-      {vllm::Ltx2UnportedPipelineFeature::kLoraFusion, "LoRA"},
-      {vllm::Ltx2UnportedPipelineFeature::kMultishot, "multishot"},
-      {vllm::Ltx2UnportedPipelineFeature::kInt8ConvRot, "int8-convrot"},
-      {vllm::Ltx2UnportedPipelineFeature::kCfgParallelism, "parallelism"},
-      {vllm::Ltx2UnportedPipelineFeature::kVideoEngineWiring, "VideoEngine"},
       {vllm::Ltx2UnportedPipelineFeature::kBetaScheduler, "BetaScheduler"},
   };
-  for (const auto& item : owed) {
+  // DECLARED-OUT-OF-SCOPE MARKERS: nothing a caller can send reaches these, so
+  // the message must not claim otherwise. Recording them as refusals overstated
+  // what this port has, which is the defect this row closes.
+  const std::vector<std::pair<vllm::Ltx2UnportedPipelineFeature, std::string>> markers = {
+      {vllm::Ltx2UnportedPipelineFeature::kLoraFusion, "LoRA"},
+      {vllm::Ltx2UnportedPipelineFeature::kInt8ConvRot, "int8-convrot"},
+      {vllm::Ltx2UnportedPipelineFeature::kMultiGpuParallelism, "multi-GPU"},
+  };
+
+  std::vector<std::pair<vllm::Ltx2UnportedPipelineFeature, std::string>> all = reachable;
+  all.insert(all.end(), markers.begin(), markers.end());
+  for (const auto& item : all) {
     const std::string message =
         RefusalMessage([&] { vllm::Ltx2RefuseUnportedPipelineFeature(item.first); });
     INFO("feature = ", item.second, " refusal = ", message);
     CHECK(Mentions(message, item.second));
     // Naming WHERE the work is owed is what keeps it from being rediscovered.
     CHECK(Mentions(message, "ltx-2-5.md"));
+    // The RETIRED arm must not come back: a refusal that cites a feature neither
+    // reference has sends the next reader looking upstream for it.
+    CHECK_FALSE(Mentions(message, "multishot"));
+  }
+  for (const auto& item : reachable) {
+    const std::string message =
+        RefusalMessage([&] { vllm::Ltx2RefuseUnportedPipelineFeature(item.first); });
+    INFO("reachable = ", item.second, " refusal = ", message);
+    CHECK_FALSE(Mentions(message, "DECLARED, NOT REQUESTABLE"));
+  }
+  for (const auto& item : markers) {
+    const std::string message =
+        RefusalMessage([&] { vllm::Ltx2RefuseUnportedPipelineFeature(item.first); });
+    INFO("marker = ", item.second, " refusal = ", message);
+    CHECK(Mentions(message, "DECLARED, NOT REQUESTABLE"));
   }
 }
 

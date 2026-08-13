@@ -476,6 +476,111 @@ TEST_CASE("ltx2 video: an unknown extra is refused, not ignored") {
   }
 }
 
+// A key this family DEFINES but does not serve is the worse half of the same
+// defect, and the one an "unknown extra" check cannot see. `duration_head_path`
+// was in `kKnownLoadExtras` and read by NOTHING (#611): supplying a duration head
+// loaded no head, opened no file, and handed back the recipe default with no
+// diagnostic. AGENTS.md requires an unimplemented arm to be refused with a
+// message naming the missing piece, so it is refused rather than accepted.
+//
+// Dropping the key from `kKnownLoadExtras` instead would produce "unknown load
+// extra", which is a DIFFERENT and wrong claim — the family defines the key and
+// understands what it means; what is missing is the head. Hence the assertion on
+// the missing piece and the alternative, not only on the key.
+TEST_CASE("ltx2 video: duration_head_path is REFUSED by name, not silently ignored") {
+  Workspace ws;
+  vllm::multimodal::VideoModelParams mp = FixtureParams(ws.paths);
+  // Any path at all: the point is that NOTHING opens it. Naming a file that does
+  // exist keeps a not-found error from standing in for the refusal.
+  mp.extras["duration_head_path"] = ws.paths.dit;
+  try {
+    (void)vllm::multimodal::LoadVideoEngine(mp);
+    FAIL("duration_head_path is served by no code; accepting it substitutes the recipe default");
+  } catch (const std::exception& e) {
+    const std::string msg = e.what();
+    INFO(msg);
+    CHECK(msg.find("duration_head_path") != std::string::npos);
+    // The MISSING PIECE, which is what separates this from "unknown key".
+    CHECK(msg.find("duration head") != std::string::npos);
+    // And what to use instead, so the refusal is actionable.
+    CHECK(msg.find("num_frames") != std::string::npos);
+    // Not the unknown-key message: that one would say the family does not define
+    // it, and this family does.
+    CHECK(msg.find("unknown load extra") == std::string::npos);
+  }
+}
+
+// The INVENTORY, so the defect above cannot come back as a different key. Every
+// extra this family accepts is either read by something or refused by name; a
+// tenth decorative key fails this case rather than waiting to be discovered by
+// the caller who supplies it.
+//
+// The audit behind it is in .agents/specs/ltx25-retire-dead-arms.md §2.1: nine of
+// the ten keys have a reader (`ltx2_video.cpp:570,625,721,737,739,771,796,901,942`),
+// and `duration_head_path` was the only one with none.
+TEST_CASE("ltx2 video: every accepted load extra is READ by something") {
+  Workspace ws;
+  // The keys with a reader.
+  const std::vector<std::string> served = {
+      vllm::multimodal::kLtx2AudioPromptEmbedsExtra, vllm::multimodal::kLtx2PipelineKindExtra,
+      vllm::multimodal::kLtx2ModelVersionExtra,      vllm::multimodal::kLtx2AllowUnportedExtra,
+      vllm::multimodal::kLtx2MaxPhaseExtra,          vllm::multimodal::kLtx2DitConfigPathExtra,
+      vllm::multimodal::kLtx2PromptValidRowsExtra,   vllm::multimodal::kLtx2EncoderConfigPathExtra,
+      "upsampler_path",
+  };
+  // The keys the family defines and does NOT serve. Growing this list is a
+  // deliberate act; growing it silently is the defect #611 records.
+  const std::vector<std::string> refused = {"duration_head_path"};
+
+  // THE HANDLE ON THE REAL ARRAY. The unknown-extra refusal builds its listing
+  // from `kKnownLoadExtras` itself, so parsing that listing gates the ACTUAL
+  // accepted set rather than a copy of it maintained here. Without this the two
+  // vectors above would be true by construction and would gate nothing.
+  std::string listing;
+  {
+    vllm::multimodal::VideoModelParams mp = FixtureParams(ws.paths);
+    mp.extras["definitely_not_a_key"] = "1";
+    try {
+      (void)vllm::multimodal::LoadVideoEngine(mp);
+      FAIL("an unknown extra must be refused");
+    } catch (const std::exception& e) {
+      const std::string msg = e.what();
+      const size_t at = msg.find("This family defines: ");
+      REQUIRE(at != std::string::npos);
+      listing = msg.substr(at + std::string("This family defines: ").size());
+    }
+  }
+  INFO("listing = " << listing);
+  // Every name this row inventoried is still accepted...
+  for (const std::string& key : served) CHECK(listing.find(key) != std::string::npos);
+  for (const std::string& key : refused) CHECK(listing.find(key) != std::string::npos);
+  // ...and there is no ELEVENTH name that this inventory has never seen. The
+  // separator is ", ", so the count is one more than the separators.
+  size_t names = 1;
+  for (size_t at = listing.find(", "); at != std::string::npos; at = listing.find(", ", at + 2)) {
+    ++names;
+  }
+  CHECK_MESSAGE(names == served.size() + refused.size(),
+                "kKnownLoadExtras grew; add the key to `served` (with its reader) or to "
+                "`refused` (with a by-name refusal), per .agents/specs/ltx25-retire-dead-arms.md");
+
+  // And the unserved half is refused rather than accepted.
+  for (const std::string& key : refused) {
+    vllm::multimodal::VideoModelParams mp = FixtureParams(ws.paths);
+    mp.extras[key] = ws.paths.dit;
+    INFO("key = " << key);
+    try {
+      (void)vllm::multimodal::LoadVideoEngine(mp);
+      FAIL("an accepted-but-unread extra must be refused by name");
+    } catch (const std::exception& e) {
+      const std::string msg = e.what();
+      INFO(msg);
+      CHECK(msg.find(key) != std::string::npos);
+      CHECK(msg.find("unknown load extra") == std::string::npos);
+    }
+  }
+}
+
 // ─── the config the SHAPES cannot see ───────────────────────────────────────
 //
 // WHY THESE ASSERT ON THE ENGINE AND NOT ON A LOCAL. The L7 repair is one line in
