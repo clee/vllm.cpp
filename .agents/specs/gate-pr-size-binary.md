@@ -10,9 +10,14 @@
 One behavioural change to `scripts/check-pr-size.py`: remove the error raised
 for a changed path that git reports as binary.
 
-**In scope.** The `change.lines is None` branch in `change_errors`, the header
-sentence that advertises it, the `SITE_ASSET` comment that contradicts it, and
-the two cases in `tests/scripts/test_check_pr_size.py` that pin it.
+**In scope.** The `change.lines is None` branch in `change_errors`, the two
+places in that file that advertise it, the two cases in
+`tests/scripts/test_check_pr_size.py` that pin it, and the three descriptions of
+the guard that live outside it: the `pr-size` job comment in
+`.github/workflows/ci.yml` and the font rationale in `website/README.md`.
+
+The `SITE_ASSET` comment is deliberately **not** edited: it never described the
+guard, and it reads correctly once the guard is gone.
 
 **Out of scope.** Explicit path classification, the checker-evidence contract,
 the role checks, and the retired line budget. None of them changes. This is not
@@ -71,7 +76,8 @@ paths by *where they live*, which is the derived-at-read-time shape.
 
 | Risk | Assessment |
 |---|---|
-| A large unreviewed binary lands in a product path | The classifier still refuses any path without a class, and `product` requires arriving on a PR. A binary in a classified location was always intended to be legal — see the `SITE_ASSET` comment. |
+| **The retirement is wider than the problem it solves** | Accepted, and the operator should merge knowing it. Goldens live under `tests/`, so they classify as `product` — permitting them necessarily permits binaries across `src/`, `scripts/`, `tools/` and `benchmarks/`, and the same delete admits them to `procedure`, `project_record`, `ci` and `vendored_dependency` too. Measured before/after, not inferred: an opaque blob at `src/vllm/blob.dat`, and binary bytes replacing `.agents/workflow.md` or `ci.yml`, were refused at BASE and pass at HEAD. What still refuses them: `.gitignore` eats the realistic accidental blob, every change arrives on a PR, and a binary in a diff is maximally visible to a reviewer. Judged an acceptable trade because the guard could not tell a golden from a rootkit, so keeping it meant blocking correctness evidence — which a correctness-first project should not do. |
+| A narrower fix was available | True, and it is the honest limit of this change. A derived regex class for `tests/parity/goldens/…` would be the same derived-at-read-time shape this spec praises in `SITE_ASSET`, and would not admit binaries to `src/`. It was not taken because it leaves the `asset` and `website/static/` cases still refused and would need a second class the next time a lane needs a binary — but it is a real alternative, and §3's earlier appeal to the `SITE_ASSET` comment over-generalized: that comment speaks for `website/static/` only, not for every class. |
 | This reads as weakening a gate to go green | It is a deliberate retirement, argued in the commit message per the no-waiver-registry rule, not a repair of a red run. No PR of mine is unblocked by it; the beneficiaries are #431 and future golden work. |
 | Goldens become unreviewable in practice | Unchanged by this edit — they are unreviewable as text either way. Golden provenance is enforced by the parity gates and the oracle-identity requirements, which is where it belongs. |
 | The retirement is silently reversed later | The RED-first test in §5 asserts the new behaviour directly, so a reintroduction turns it red. |
@@ -88,9 +94,12 @@ RED-first, in `tests/scripts/test_check_pr_size.py`:
    path still errors, and the error names classification, not binaryness. This
    is the guard rail that keeps the retirement scoped. Green both before and
    after (the classifier raises first), so it is a regression pin, not evidence.
-3. Rewrite `test_retiring_the_budget_did_not_retire_the_other_contracts` so its
-   binary clause asserts the *classified* binary passes while the *unclassified*
-   one fails, keeping the other two contracts pinned exactly as they are.
+3. `test_retiring_the_budget_did_not_retire_the_other_contracts` **drops its
+   binary clause entirely**, because cases 1 and 2 now carry that coverage
+   directly and duplicating it inside a multi-contract test would hide which
+   contract failed. Its classification and checker-evidence clauses are
+   untouched and still bite. (Drafted as "rewrite the clause"; deleting it was
+   the better shape once 1 and 2 existed, and this line records what shipped.)
 4. Delete `test_binary_changes_fail_closed_instead_of_becoming_free`, which
    states the retired rule and cannot survive it.
 
@@ -135,14 +144,29 @@ enforces on `governance_checker` paths:
 `check-pr-size.py --base 7572b0f4e --head <head>` → `OK`, exit 0.
 `check-commit-trailers.py` → `OK: commit trailer contract`, exit 0.
 
-**Stop condition §8 checked, not assumed.** The full `tests/scripts/` suite is
-byte-identical before and after: `8 failed, 20 passed, 2 skipped` on the
-modified worktree *and* on unmodified `main` `7572b0f4e`, across
-`test_gen_vulkan_spirv`, `test_mlx_system_headers` and `test_now_render`. All
-pre-existing; this change adds no failure. `test_cpu_kernel_bench.py` fails
-collection on unmodified main too (it wants a built benchmark binary).
-`test_cpu_x86_llamacpp_floor` and `test_now_render` are order-dependent under a
-loaded parallel run and pass in isolation on both trees.
+**Stop condition §8 checked, not assumed.** `python3 -m pytest tests/scripts/
+--ignore=tests/scripts/test_cpu_kernel_bench.py`, run sequentially on both
+trees:
+
+| tree | result |
+|---|---|
+| HEAD | `9 failed, 1276 passed, 3 skipped, 1510 subtests` |
+| BASE `7572b0f4e` | `9 failed, 1275 passed, 3 skipped, 1506 subtests` |
+
+The **failure sets are identical** — the same six `test_gen_vulkan_spirv` shader
+subfailures, the same `test_check_windows_portability` subfailure, and the same
+`test_mlx_system_headers` and `test_now_render` failures. All pre-existing; this
+change adds no failure. The `+1 passed / +4 subtests` delta is exactly this
+change: one test deleted, two added, four new subtests.
+
+`test_cpu_kernel_bench.py` fails collection on unmodified main too (it wants a
+built benchmark binary). `test_cpu_x86_llamacpp_floor` is order-dependent under
+a loaded parallel run and passes sequentially on both trees.
+
+An earlier draft of this section recorded `8 failed, 20 passed, 2 skipped` for
+this check. That was a **three-file subset** mislabelled as the whole suite; no
+stated command produced it. The substantive claim it was offered for — identical
+failure sets before and after — is unchanged and is what the table above shows.
 
 ## 8. Stop conditions
 
