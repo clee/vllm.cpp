@@ -1160,14 +1160,27 @@ void Ltx2RefuseUnportedPipelineFeature(Ltx2UnportedPipelineFeature feature) {
              "fused by loader/fuse_loras.py) is out of scope." +
              marker + owed);
     case Ltx2UnportedPipelineFeature::kInt8ConvRot:
-      // VERIFIED ABSENT so nobody re-audits it: LTX-2 @ fd4ded7f defines exactly four
-      // inference quantization kinds and none is int8, `convrot` is 0 hits, and every
-      // upstream `int8` is either the TRAINER's bitsandbytes / quanto path or a uint8
-      // buffer. This is a ComfyUI-ecosystem format, deliberately not ported.
+      // VERIFIED UNREACHABLE so nobody re-audits it, and stated as UNREACHABLE rather
+      // than ABSENT because absent is what the first version of this message claimed
+      // and it was false. At LTX-2 @ fd4ded7f: `convrot` / `conv_rot` / `quarot` /
+      // `spinquant` really are 0 hits, and the four inference quantization kinds are
+      // exhaustive (quantization_factory.py:23-26, `assert_never` at :50). But int8
+      // is NOT trainer-only. `ltx-kernels` — an inference package — carries a per-row
+      // int8 quantize kernel with fp32 scales (blockwise/triton_ops.py:25-50, out
+      // dtype `torch.int8` at :43), aliased `rowwise_int_quantize_triton` at :436.
+      // That alias is its ONLY reference: blockwise/functional.py:12-18 re-exports
+      // five names and not this one, so nothing constructs it. The package is a fork
+      // of Lightricks' int8 kernel library retargeted to fp8/fp6/nvfp4 — its custom-op
+      // namespace is still literally `q8_kernels_ops` (functional.py:25) — and the
+      // int8 half is what was left behind. Nothing wired reaches int8, which is why
+      // the disposition is unchanged; only the sentence was wrong.
       Refuse("ltx2: the int8-convrot quantization is out of scope. It is a ComfyUI-ecosystem "
-             "format, not an LTX-2 arm: upstream's own kinds are fp8-cast, fp8-scaled-mm, "
-             "nvfp4-cast and nvfp4-prequant (ltx-pipelines/utils/quantization_factory.py:"
-             "23-27), and int8 appears upstream only in the trainer." +
+             "format, not an LTX-2 arm: upstream's own inference kinds are fp8-cast, "
+             "fp8-scaled-mm, nvfp4-cast and nvfp4-prequant (ltx-pipelines/utils/"
+             "quantization_factory.py:23-26), and int8 is UNREACHABLE upstream — trainer-only "
+             "for anything wired (ltx-trainer gemma_8bit.py:33-36, quantization.py:11-15), plus "
+             "one DEAD per-row int8 quantize kernel in the ltx-kernels inference package "
+             "(blockwise/triton_ops.py:35,43, reached only by its own alias at :436)." +
              marker + owed);
     case Ltx2UnportedPipelineFeature::kMultiGpuParallelism:
       // The old spelling was `kCfgParallelism`, which named something upstream does

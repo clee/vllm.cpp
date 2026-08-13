@@ -1661,6 +1661,16 @@ which silently substituted the recipe default for the file you named. Give
 `num_frames` (or `duration`, which is exact arithmetic against the recipe's frame
 rate) instead. Every other key in that list reaches a reader.
 
+Two LTX-2.5 arms are refused where a render would otherwise silently downgrade:
+the temporal x2 latent upsampler and `BetaScheduler`. Both are reachable — a
+render asking for either gets a refusal naming the missing piece. Three more are
+recorded as out of scope but are **not requestable**, so no flag or extra can
+reach them: LoRA fusion, `int8-convrot`, and single-node multi-GPU. Their messages
+say `DECLARED, NOT REQUESTABLE` so the two kinds are not confused. `int8-convrot`
+in particular is a ComfyUI-ecosystem format: upstream LTX-2's own inference
+quantization kinds are `fp8-cast`, `fp8-scaled-mm`, `nvfp4-cast` and
+`nvfp4-prequant`, and nothing wired upstream reaches int8 at all.
+
 `prompt_embeds_valid_rows` is how many of the supplied conditioning rows are real
 tokens; absent, every row is. It matters because the embeddings connector
 substitutes its learnable register table at PADDED positions, so padding decides

@@ -30,8 +30,10 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <fstream>
 #include <iterator>
 #include <limits>
+#include <sstream>
 #include <string>
 #include <utility>
 #include <vector>
@@ -1282,6 +1284,83 @@ TEST_CASE("ltx2 every out-of-scope feature is refused BY NAME") {
     INFO("marker = ", item.second, " refusal = ", message);
     CHECK(Mentions(message, "DECLARED, NOT REQUESTABLE"));
   }
+
+  // THE ABSENCE THIS MESSAGE STATES IS ITSELF EVIDENCE, so it is gated. The first
+  // version of this marker ended "int8 appears upstream only in the trainer" — a
+  // false-absence claim of exactly the kind row LTX25-RETIRE-DEAD-ARMS exists to
+  // retire (#604), shipped inside a user-visible refusal. LTX-2 @ fd4ded7f carries
+  // a per-row int8 quantize kernel with fp32 scales in `ltx-kernels`, which is an
+  // INFERENCE package, not the trainer: `blockwise/triton_ops.py:35,43`, aliased
+  // `rowwise_int_quantize_triton` at `:436`. It is dead — that alias is its only
+  // reference and `blockwise/functional.py:12-18` does not re-export it — so the
+  // disposition is unchanged and only the sentence was wrong. See
+  // .agents/specs/ltx25-retire-dead-arms.md §1.2.
+  {
+    const std::string message = RefusalMessage([] {
+      vllm::Ltx2RefuseUnportedPipelineFeature(vllm::Ltx2UnportedPipelineFeature::kInt8ConvRot);
+    });
+    INFO("int8 marker = ", message);
+    CHECK_FALSE(Mentions(message, "only in the trainer"));
+    // The true statement names where the one inference-side int8 lives, so a
+    // reader who greps upstream and finds it is not left thinking we missed it.
+    CHECK(Mentions(message, "ltx-kernels"));
+  }
+}
+
+// THE PUBLIC SURFACE MUST NOT RE-MERGE WHAT THE LEDGER SPLIT. `docs/FEATURES.md`
+// is where the reachable/marker distinction reaches a user, and it carried ONE
+// "Declared, not requestable" row listing all five arms — including the two a
+// caller CAN trip. That is the same conflation the ledger above stopped making,
+// reintroduced one surface out. Gated here rather than left to review because a
+// doc row and an enum drift silently.
+//
+// Deliberately narrow: it asserts only that no row calling something
+// unrequestable names a REACHABLE arm. It does not police the wording of the doc.
+TEST_CASE("ltx2 docs/FEATURES.md never calls a REACHABLE refusal unrequestable") {
+  std::ifstream in(VLLM_CPP_FEATURES_DOC_PATH);
+  REQUIRE_MESSAGE(in.good(), "cannot open " << VLLM_CPP_FEATURES_DOC_PATH);
+  std::stringstream buf;
+  buf << in.rdbuf();
+  const std::string doc = buf.str();
+  REQUIRE(doc.size() > 1000);
+
+  // The two arms with a product call site: `ltx2_upsampler.cpp` constructs the
+  // temporal-upsampler condition and `ltx2_pipeline.cpp` the BetaScheduler one.
+  // Named by the words the doc uses for them, since that is what a reader sees.
+  const std::vector<std::string> reachable_words = {"upsampler", "BetaScheduler"};
+
+  size_t rows_examined = 0;
+  size_t line_no = 0;
+  size_t at = 0;
+  while (at <= doc.size()) {
+    const size_t end = doc.find('\n', at);
+    const std::string line = doc.substr(at, end == std::string::npos ? std::string::npos : end - at);
+    ++line_no;
+    // A table row that makes the not-requestable claim, in either casing the doc
+    // uses for it.
+    const bool is_row = !line.empty() && line[0] == '|';
+    const bool claims_unrequestable =
+        line.find("not requestable") != std::string::npos ||
+        line.find("NOT REQUESTABLE") != std::string::npos;
+    if (is_row && claims_unrequestable && line.find("LTX-2.5") != std::string::npos) {
+      ++rows_examined;
+      for (const std::string& word : reachable_words) {
+        INFO("FEATURES.md:" << line_no << " = " << line);
+        CHECK_MESSAGE(line.find(word) == std::string::npos,
+                      "a row claiming 'not requestable' names the REACHABLE arm '"
+                          << word
+                          << "'; split the reachable refusals out, per "
+                             ".agents/specs/ltx25-retire-dead-arms.md §1.6");
+      }
+    }
+    if (end == std::string::npos) break;
+    at = end + 1;
+  }
+  // ANTI-VACUOUS. Without this the case passes when the row is renamed away and
+  // proves nothing — the failure mode this whole row is about.
+  CHECK_MESSAGE(rows_examined == 1,
+                "expected exactly ONE LTX-2.5 'not requestable' row in docs/FEATURES.md, found "
+                    << rows_examined);
 }
 
 // ===========================================================================

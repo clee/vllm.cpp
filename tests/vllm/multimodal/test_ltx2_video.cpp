@@ -25,8 +25,10 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <cctype>
 #include <fstream>
 #include <memory>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -528,8 +530,10 @@ TEST_CASE("ltx2 video: duration_head_path is REFUSED by name, not silently ignor
 // the caller who supplies it.
 //
 // The audit behind it is in .agents/specs/ltx25-retire-dead-arms.md §2.1: nine of
-// the ten keys have a reader (`ltx2_video.cpp:570,625,721,737,739,771,796,901,942`),
-// and `duration_head_path` was the only one with none.
+// the ten keys have a reader and `duration_head_path` was the only one with none.
+// The reader LINES are deliberately not repeated here — they moved twice while
+// this row was in review. They live in one place, the READER ANCHORS comment in
+// `ltx2_video.cpp`, and the case below derives them and holds that comment to it.
 TEST_CASE("ltx2 video: every accepted load extra is READ by something") {
   Workspace ws;
   // The keys with a reader.
@@ -591,6 +595,159 @@ TEST_CASE("ltx2 video: every accepted load extra is READ by something") {
       CHECK(msg.find("unknown load extra") == std::string::npos);
     }
   }
+}
+
+// THE ANCHORS FOR THAT INVENTORY, DERIVED RATHER THAN TRUSTED.
+//
+// The case above proves each key is accepted or refused; it cannot prove WHERE a
+// key is read, and "nine of ten reach a reader at these lines" is the claim this
+// row rests on. That claim shipped wrong: the recorded anchors were nine lines
+// that named no reader at all, in the very file they were recorded in. Then, in
+// review, a merge of `origin/main` moved all nine again. A `file:line` written by
+// hand is stale by the next commit, so this derives them from the source and
+// holds the recorded list to what it finds. When it fails it prints the answer.
+//
+// It does NOT assert absolute line numbers of its own — nothing here to rot. The
+// only obligation it creates is on whoever moves a reader: update the one comment
+// block in the same file they are already editing.
+namespace {
+
+std::string ReadSourceFile(const char* path) {
+  std::ifstream in(path);
+  REQUIRE_MESSAGE(in.good(), "cannot open " << path);
+  std::stringstream buf;
+  buf << in.rdbuf();
+  return buf.str();
+}
+
+std::vector<std::string> SplitLines(const std::string& text) {
+  std::vector<std::string> lines;
+  size_t at = 0;
+  while (at <= text.size()) {
+    const size_t end = text.find('\n', at);
+    lines.push_back(text.substr(at, end == std::string::npos ? std::string::npos : end - at));
+    if (end == std::string::npos) break;
+    at = end + 1;
+  }
+  return lines;
+}
+
+// 1-based index of the ONLY line containing `needle`, or 0. Uniqueness is the
+// point: an anchor that matches twice anchors nothing, and existence alone is
+// what let the stale numbers survive.
+size_t UniqueLineWith(const std::vector<std::string>& lines, const std::string& needle) {
+  size_t found = 0;
+  size_t count = 0;
+  for (size_t i = 0; i < lines.size(); ++i) {
+    if (lines[i].find(needle) != std::string::npos) {
+      ++count;
+      found = i + 1;
+    }
+  }
+  return count == 1 ? found : 0;
+}
+
+std::string JoinNumbers(const std::vector<size_t>& v) {
+  std::string s;
+  for (size_t n : v) s += (s.empty() ? "" : " ") + std::to_string(n);
+  return s;
+}
+
+}  // namespace
+
+TEST_CASE("ltx2 video: the recorded reader anchors are the ones in the source") {
+  const std::string source = ReadSourceFile(LTX2_VIDEO_SOURCE_PATH);
+  const std::vector<std::string> lines = SplitLines(source);
+  REQUIRE(lines.size() > 500);
+
+  // Everything is measured relative to the accepted-keys array, so a stray
+  // mention in the file header cannot be mistaken for a reader.
+  const size_t array_line = UniqueLineWith(lines, "const char* const kKnownLoadExtras[] = {");
+  REQUIRE_MESSAGE(array_line != 0, "kKnownLoadExtras[] declaration is not unique in the source");
+  size_t array_end = 0;
+  for (size_t i = array_line; i < lines.size(); ++i) {
+    if (lines[i] == "};") {
+      array_end = i + 1;
+      break;
+    }
+  }
+  REQUIRE(array_end > array_line);
+
+  // The nine SERVED keys, by the token each is spelled with in the source. Order
+  // is irrelevant — the comparison is on the sorted set — so this list is not a
+  // second place the anchors live.
+  const std::vector<std::string> served_tokens = {
+      "kLtx2AudioPromptEmbedsExtra", "kLtx2PipelineKindExtra",  "kLtx2ModelVersionExtra",
+      "kLtx2AllowUnportedExtra",     "kLtx2MaxPhaseExtra",      "kLtx2DitConfigPathExtra",
+      "kLtx2PromptValidRowsExtra",   "kLtx2EncoderConfigPathExtra", "\"upsampler_path\"",
+  };
+  std::vector<size_t> derived;
+  for (const std::string& token : served_tokens) {
+    size_t first = 0;
+    for (size_t i = array_end; i < lines.size(); ++i) {
+      if (lines[i].find(token) != std::string::npos) {
+        first = i + 1;
+        break;
+      }
+    }
+    INFO("token = " << token);
+    CHECK_MESSAGE(first != 0, "no reader found after kKnownLoadExtras for " << token);
+    if (first != 0) derived.push_back(first);
+  }
+  REQUIRE(derived.size() == served_tokens.size());
+  std::sort(derived.begin(), derived.end());
+
+  // The RECORDED list, parsed out of the one comment line that carries it.
+  const size_t marker = UniqueLineWith(lines, "READER ANCHORS (derived and gated by");
+  REQUIRE_MESSAGE(marker != 0,
+                  "the READER ANCHORS comment marker is missing or not unique in the source");
+  const std::string recorded_line = lines[marker];  // the line AFTER the marker (1-based)
+  std::vector<size_t> recorded;
+  for (size_t i = 0; i < recorded_line.size();) {
+    if (std::isdigit(static_cast<unsigned char>(recorded_line[i]))) {
+      size_t j = i;
+      while (j < recorded_line.size() && std::isdigit(static_cast<unsigned char>(recorded_line[j]))) {
+        ++j;
+      }
+      recorded.push_back(static_cast<size_t>(std::stoul(recorded_line.substr(i, j - i))));
+      i = j;
+    } else {
+      ++i;
+    }
+  }
+  std::sort(recorded.begin(), recorded.end());
+  CHECK_MESSAGE(recorded == derived, "the reader anchors recorded in ltx2_video.cpp are STALE. "
+                                     "Recorded: ["
+                                         << JoinNumbers(recorded) << "]. Actual: ["
+                                         << JoinNumbers(derived)
+                                         << "]. Paste the actual list into the READER ANCHORS "
+                                            "comment; the spec's §2.1 table is dated and stays.");
+
+  // And the UNSERVED key is touched only by the refusal, never by a reader. This
+  // is the half a "has a reader" sweep cannot express.
+  const size_t refuse_line = UniqueLineWith(lines, "void CheckUnservedExtras(");
+  REQUIRE(refuse_line != 0);
+  size_t refuse_end = 0;
+  for (size_t i = refuse_line; i < lines.size(); ++i) {
+    if (lines[i] == "}") {
+      refuse_end = i + 1;
+      break;
+    }
+  }
+  REQUIRE(refuse_end > refuse_line);
+  size_t duration_hits = 0;
+  for (size_t i = array_end; i < lines.size(); ++i) {
+    if (lines[i].find("kLtx2DurationHeadPathExtra") == std::string::npos) continue;
+    ++duration_hits;
+    const size_t at = i + 1;
+    const bool inside_refusal = (at >= refuse_line) && (at <= refuse_end);
+    CHECK_MESSAGE(inside_refusal,
+                  "ltx2_video.cpp:" << at
+                                    << " touches the duration-head extra OUTSIDE "
+                                       "CheckUnservedExtras; if it now has a real reader, move "
+                                       "it to the served list and drop the refusal (#611)");
+  }
+  CHECK(duration_hits > 0);
 }
 
 // ─── the config the SHAPES cannot see ───────────────────────────────────────

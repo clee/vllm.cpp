@@ -127,6 +127,13 @@ target_compile_definitions(test_video_engine PRIVATE
 # LTX-2.5 L7: the family behind the VideoEngine seam and the driving loop, run
 # over a reduced-dimension checkpoint set written in the SHIPPED file format.
 vllm_cpp_add_test(test_ltx2_video vllm/multimodal/test_ltx2_video.cpp)
+# The reader-anchor claim this suite gates is a claim ABOUT a source file, so it
+# reads that file. Recorded `file:line` anchors go stale within the same PR here
+# (a merge of origin/main moved all nine of these by 25 lines mid-review), which
+# is why the anchors are derived from the source and compared with the recorded
+# ones rather than trusted.
+target_compile_definitions(test_ltx2_video PRIVATE
+  LTX2_VIDEO_SOURCE_PATH="${CMAKE_SOURCE_DIR}/src/vllm/multimodal/ltx2_video.cpp")
 # LTX-2.5 DiT parity gate (row MODEL-DIFFUSION-LTX25, spec phase L2). The goldens
 # live next to the test source, like every other generated .inc.
 vllm_cpp_add_test(test_ltx2 vllm/models/test_ltx2.cpp)
@@ -149,6 +156,12 @@ target_include_directories(test_ltx2_text_encoder PRIVATE ${CMAKE_CURRENT_SOURCE
 # next to the test source.
 vllm_cpp_add_test(test_ltx2_pipeline vllm/models/test_ltx2_pipeline.cpp)
 target_include_directories(test_ltx2_pipeline PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
+# The out-of-scope ledger separates a REACHABLE refusal from a declared marker, and
+# docs/FEATURES.md is where that distinction reaches a user. It had re-merged the two
+# into one "Declared, not requestable" row, so the public surface contradicted the
+# ledger it projects; the case below reads the doc and holds it to the split.
+target_compile_definitions(test_ltx2_pipeline PRIVATE
+  VLLM_CPP_FEATURES_DOC_PATH="${CMAKE_SOURCE_DIR}/docs/FEATURES.md")
 # LTX-2.5 L6: the quantized loaders, gated three ways — the SHIPPED checkpoints'
 # own manifests, a few hundred of their own bytes against torch, and synthetic
 # files for whole-model materialization. All three .inc files live beside the

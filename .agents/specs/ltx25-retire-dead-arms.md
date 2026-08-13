@@ -105,28 +105,72 @@ class QuantizationKind(str, Enum):
     NVFP4_PREQUANT = "nvfp4-prequant"
 ```
 
-No int8 arm, and no rotation of any kind: `convrot` / `conv_rot` / `hadamard` /
-`quarot` / `spinquant` are 0 hits across the repository. `rotation` hits only EXIF
-image orientation (`media_io/decode.py:32`) and the VAE's per-slab spatial
-rotation (`video_vae/transformer/det_attn_rope.py:61`) — neither a quantization
-transform.
+No int8 arm. `convrot` / `conv_rot` / `quarot` / `spinquant` are 0 hits across the
+repository, re-run at these pins.
 
-`int8` upstream is **training-only**, in two places, and neither is an inference
-weight format:
+**Correction, 2026-08-13 (review finding F2).** An earlier revision of this
+section put `hadamard` in that 0-hit list and concluded "no rotation of any kind".
+That was itself the #604 pattern this row exists to close — an absence asserted
+from a grep of our own vocabulary — and it is false. LTX-2 vendors Tri Dao's
+fast-Hadamard-transform family in `ltx-kernels`
+(`csrc/ops/include/fast_hadamard_transform.h`, `_common.h`, `_special.h`), and it
+is explicitly **quantization-coupled**: `DequantHadamardParamsBase:54`,
+`QuantHadamardParamsBase:71`, and `QuantMax<int8_t> = 127.0`
+(`fast_hadamard_transform_common.h:14`). A fast Hadamard transform *is* the "rot"
+of rotation-based quantization, so the word we should have searched for was there
+all along.
+
+What the conclusion rests on instead, re-derived here:
+
+- **Nothing calls it.** `hadamard_mult_thread` / `hadamard_mult_warp` are defined
+  at `fast_hadamard_transform_common.h:102,123` and `_special.h:12,31,58,93` and
+  invoked at **no site in `csrc/`**. The `fast_hadamard_transform_cuda`
+  instantiations are commented out (`rms_norm_rope_cuda.cu:225-228`), and
+  `DequantHadamardParamsBase` / `QuantHadamardParamsBase` / `QuantMax<int8_t>` are
+  declared and referenced nowhere.
+- **The live kernel that carries the Hadamard NAME does not rotate.** The only
+  params struct in use is `NormRopeHadamardParamsBase`
+  (`rms_norm_rope.cpp:12,19,95-98`, `rms_norm_rope_cuda.cu:188`), and
+  `norm_rope_cvt_kernel` (`rms_norm_rope_cuda.cu:51-170`) is RMS-norm → RoPE →
+  store, with no Hadamard step. The name is vestigial, inherited from the fork's
+  ancestry.
+- **And where it is instantiated it is fp8 or bf16, never int8**:
+  `<at::BFloat16, at::Float8_e4m3fn>` and `<at::BFloat16, at::BFloat16>`
+  (`rms_norm_rope_cuda.cu:219-223`), matching `rms_norm_split_rope_cuda.cu:196,200`.
+
+Corrected statement, same conclusion: **upstream vendors a
+quantization-coupled Hadamard family, wires none of it, and never exposes a
+rotation as a `QuantizationKind`.** So `int8-convrot` is still unreachable
+upstream — but by dead code, not by absence.
+
+`int8` upstream is **unreachable, not absent**. Everything *wired* is trainer-only:
 
 - `ltx-trainer/src/ltx_trainer/gemma_8bit.py:33-36` — bitsandbytes `LLM.int8()`
   for the Gemma backbone during LoRA training.
 - `ltx-trainer/src/ltx_trainer/quantization.py:11-15` — optimum-quanto precisions
   (`int8-quanto`, `int4-quanto`, …) for the trainer.
 
+**But one int8 kernel lives in an INFERENCE package** (review finding F1, and the
+same false-absence pattern shipped inside the user-visible refusal message):
+`ltx-kernels/src/ltx_kernels/blockwise/triton_ops.py` defines `_kernel` at
+`:25-37` and `run_quantize_kernel` at `:40-50` — a per-row int8 quantize with fp32
+scales, output dtype `torch.int8` at `:43`, not a `uint8` buffer — aliased
+`rowwise_int_quantize_triton` at `:436`. It is **dead**: that alias is its only
+reference anywhere in the repository, and `blockwise/functional.py:12-18`
+re-exports five other names and not this one. Context for why it is there at all:
+the package is a fork of Lightricks' int8 kernel library retargeted to
+fp8/fp6/nvfp4, and its custom-op namespace is still literally `q8_kernels_ops`
+(`functional.py:25`).
+
 Every other `int8` match in the repository is `uint8`: pixel buffers, packed NVFP4
 nibbles, block-streaming staging.
 
-**Disposition: KEEP, re-anchored.** The refusal message is honest — it is a
-ComfyUI-ecosystem quantization, not an LTX-2 arm — but the enum comment did not
-say it had been checked. It now records the absence at these pins so nobody
-re-audits it. Its *kind* changes: it is a declared-out-of-scope marker, not a
-reachable refusal.
+**Disposition: KEEP, re-anchored.** Unchanged by the two corrections above —
+nothing wired upstream reaches int8, and no rotation is exposed as a quantization
+kind. What changes is the sentence: the refusal now says int8 is UNREACHABLE
+(trainer-only for anything wired, plus one dead kernel in `ltx-kernels`) instead
+of claiming it appears "only in the trainer". Its *kind* also changes: it is a
+declared-out-of-scope marker, not a reachable refusal.
 
 ### 1.3 CFG parallelism — the name describes something upstream does not do
 
@@ -158,6 +202,14 @@ documented as "**single transformer call, no guidance**"
 (`utils/denoisers.py:25-26`), "only runs the conditioned pass and returns cond
 unchanged". A `cfg_scale` of 1.0 is one pass, so there is no second pass to place
 on a second GPU.
+
+Stronger still, and true even for the recipes that *do* guide: upstream's guided
+path is not distributed either. `utils/denoisers.py:7-8` records that
+`GuidedDenoiser` and `FactoryGuidedDenoiser` share `_guided_denoise`, "which
+batches all guidance passes into a single transformer call". So upstream's CFG is
+a batch dimension, never a second device — which is why no amount of `multigpu`
+code was ever going to be CFG parallelism, and why the old enumerator name could
+not have been right for any recipe.
 
 **Disposition: RENAME + re-anchor.** `kCfgParallelism` → `kMultiGpuParallelism`,
 anchored to the three real forms, with the reason it is out of scope stated as
@@ -213,24 +265,36 @@ is calling it a refusal. The header and the messages now distinguish:
 ### 2.1 The full `kKnownLoadExtras` audit
 
 Every key the family accepts, and whether any code reads it. Reader anchors are in
-`src/vllm/multimodal/ltx2_video.cpp` unless noted.
+`src/vllm/multimodal/ltx2_video.cpp` unless noted, **as of `3c6706cd0`** — this
+table is a dated record, not a live one; see the note below it.
 
 | Key | Constant | Reader | Status |
 |---|---|---|---|
-| `audio_prompt_embeds_path` | `kLtx2AudioPromptEmbedsExtra` | `:901`, `:914` | READ |
-| `pipeline_kind` | `kLtx2PipelineKindExtra` | `:737` | READ |
-| `model_version` | `kLtx2ModelVersionExtra` | `:721` | READ |
-| `allow_unported_modules` | `kLtx2AllowUnportedExtra` | `:570` | READ |
-| `max_phase` | `kLtx2MaxPhaseExtra` | `:739` | READ |
-| `dit_config_path` | `kLtx2DitConfigPathExtra` | `:625` | READ |
-| `prompt_embeds_valid_rows` | `kLtx2PromptValidRowsExtra` | `:942` | READ |
-| `encoder_config_path` | `kLtx2EncoderConfigPathExtra` | `:796` | READ |
-| `upsampler_path` | (literal) | `:771` | READ |
-| `duration_head_path` | (literal) | **none** | **ACCEPTED AND IGNORED** |
+| `audio_prompt_embeds_path` | `kLtx2AudioPromptEmbedsExtra` | `:969`, `:982` | READ |
+| `pipeline_kind` | `kLtx2PipelineKindExtra` | `:805` | READ |
+| `model_version` | `kLtx2ModelVersionExtra` | `:789` | READ |
+| `allow_unported_modules` | `kLtx2AllowUnportedExtra` | `:638` | READ |
+| `max_phase` | `kLtx2MaxPhaseExtra` | `:807` | READ |
+| `dit_config_path` | `kLtx2DitConfigPathExtra` | `:693` | READ |
+| `prompt_embeds_valid_rows` | `kLtx2PromptValidRowsExtra` | `:1010` | READ |
+| `encoder_config_path` | `kLtx2EncoderConfigPathExtra` | `:864` | READ |
+| `upsampler_path` | (literal) | `:839` | READ |
+| `duration_head_path` | `kLtx2DurationHeadPathExtra` | **none** | **was ACCEPTED AND IGNORED; now refused by name** |
 
 Nine of ten are wired. `duration_head_path` is the only defect, so the sweep this
 row owes is complete and closes the "the sweep that found this one did not cover
 them all" clause of #611.
+
+**These numbers rotted twice inside this one PR (review finding F3).** The first
+set shipped off by 37 lines and named nine lines that read nothing — cited, worst
+of all, *in the file they were wrong about*. Correcting them, a merge of
+`origin/main` moved the real ones by another 25. A hand-written `file:line` is
+stale by the next commit, so the anchors are no longer maintained by hand: the
+`READER ANCHORS` comment in `ltx2_video.cpp` carries the one live copy, and
+`test_ltx2_video`'s "the recorded reader anchors are the ones in the source" case
+derives them from the source on every run and fails with the replacement list
+printed. The table above stays because a spec is a dated record and the SHA is
+named; the code comment is the live one.
 
 One documentation gap found by the same sweep and fixed here:
 `docs/USAGE.md:1650-1654` lists the LTX-2.5 extras and omits `encoder_config_path`
@@ -279,6 +343,11 @@ is a different row. Refusing is the cheap correct answer until then.
    the header comment, in the messages, and in the test.
 5. Refuse `duration_head_path` by name (#611).
 6. `docs/USAGE.md`: the extras paragraph, corrected on both counts.
+7. Added by the review repair: correct the int8 sentence in the shipped refusal
+   (§1.2), correct this spec's own false `hadamard` absence (§1.2), derive the
+   reader anchors instead of writing them by hand (§2.1), and split the
+   `docs/FEATURES.md` row so the public surface stops calling the two REACHABLE
+   arms unrequestable (§1.6). No disposition changes.
 
 **Out.**
 
@@ -308,11 +377,32 @@ test's own assertions.
    either round-trips through a reader or is refused by name. Implemented as the
    two known-inert keys being refused and the rest being accepted, so adding a
    tenth decorative key fails.
-3. **`ltx2 every L5 out-of-scope feature is refused BY NAME`** (existing, updated).
+3. **`ltx2 every out-of-scope feature is refused BY NAME`** (existing, updated).
    The list drops from 7 to 5 entries — a CHANGED COUNT, reported as such — and
    splits into `reachable` and `markers`, with the marker messages required to say
    they are not requestable. Adds a guard that no refusal message mentions
    `multishot` again.
+
+Three more added by the review repair, each RED before its fix:
+
+4. **The int8 marker's own evidence** (an addition to case 3). The message shipped
+   the sentence "int8 appears upstream only in the trainer", which §1.2 shows is
+   false. The case now requires the message NOT to contain it and to name
+   `ltx-kernels`. **RED before**: both assertions failed against the shipped text.
+5. **`ltx2 video: the recorded reader anchors are the ones in the source`** (new,
+   `tests/vllm/multimodal/test_ltx2_video.cpp`). Derives each served key's reader
+   line from `ltx2_video.cpp` itself and compares it with the `READER ANCHORS`
+   comment, and separately requires every `kLtx2DurationHeadPathExtra` reference
+   after the array to sit inside `CheckUnservedExtras`. It hard-codes no line
+   number of its own, so it cannot go stale; the obligation it creates falls on
+   whoever moves a reader, in the file they are already editing. **RED before**:
+   `Recorded: []. Actual: [638 693 789 805 807 839 864 969 1010]`.
+6. **`ltx2 docs/FEATURES.md never calls a REACHABLE refusal unrequestable`** (new,
+   `tests/vllm/models/test_ltx2_pipeline.cpp`). The public surface had re-merged
+   the reachable/marker split into one "Declared, not requestable" row naming the
+   temporal upsampler and `BetaScheduler`. Anti-vacuous: it also requires exactly
+   one such LTX-2.5 row to exist, so renaming the row away fails it. **RED
+   before**: both reachable arms found on `FEATURES.md:328`.
 
 ## 5. Risks
 
@@ -338,9 +428,12 @@ none was taken from the prior grounding pass.** Results:
 
 - `multishot`: **fabricated, confirmed.** 0 hits for the term in either reference;
   the only upstream sense of "shot" is one camera take (§1.1). Retired.
-- `int8-convrot`: **absent upstream, confirmed.** Four inference quantization kinds
-  exist and none is int8; int8 is training-only (§1.2). Kept, re-anchored, so the
-  absence does not have to be re-audited.
+- `int8-convrot`: **unreachable upstream, and the first wording of that was wrong.**
+  Four inference quantization kinds exist and none is int8, and no rotation is
+  exposed as one — but int8 is not trainer-only (a dead per-row int8 kernel lives
+  in the `ltx-kernels` inference package) and `hadamard` is not 0 hits (a whole
+  quantization-coupled Hadamard family is vendored, and wired to nothing). Both
+  corrections are in §1.2; neither moves the disposition. Kept, re-anchored.
 - CFG parallelism: **the name was wrong, the exclusion is right.** 0 `cfg` hits in
   either multi-GPU tree; upstream's own README calls MGPU a latency tool; the
   distilled recipe runs `SimpleDenoiser` with no guidance at all, so there is no
@@ -355,6 +448,17 @@ none was taken from the prior grounding pass.** Results:
 What this row deliberately did **not** do: construct a duration head. #611 stays
 open for that, with its user-visible half — silent substitution of the recipe
 default — closed.
+
+**The review's own finding, recorded because it is the point of the row.** Six
+findings came back and every one was evidence accuracy, not logic: a false absence
+inside the shipped refusal (§1.2), a false absence in this spec's §1.2 — the one
+search term that mattered — nine stale reader anchors cited in the file they were
+wrong about (§2.1), and a public-doc row that re-merged the split the ledger had
+just made. A row whose subject is #604 committed three instances of #604. That is
+not irony to note and move past; it is why the anchors are now derived rather than
+written, why the int8 absence is stated as UNREACHABLE with its dead kernel named,
+and why the `hadamard` search this spec got wrong is spelled out in full rather
+than quietly corrected.
 
 ## Now
 

@@ -615,9 +615,11 @@ enum class Ltx2UnportedPipelineFeature {
   kLoraFusion,           // ltx-core loader/primitives.py:160 (LoraPathStrengthAndSDOps),
                          //   fused by loader/fuse_loras.py
   kInt8ConvRot,          // ComfyUI-ecosystem quantization, and NOT an LTX-2 arm: the four
-                         //   kinds upstream defines are fp8-cast / fp8-scaled-mm /
-                         //   nvfp4-cast / nvfp4-prequant (quantization_factory.py:23-27),
-                         //   int8 appears only in the TRAINER, and convrot nowhere at all
+                         //   inference kinds upstream defines are fp8-cast / fp8-scaled-mm /
+                         //   nvfp4-cast / nvfp4-prequant (quantization_factory.py:23-26).
+                         //   `convrot` is nowhere at all; int8 is UNREACHABLE rather than
+                         //   absent — trainer-only for anything wired, plus one DEAD kernel
+                         //   in ltx-kernels (triton_ops.py:35,43). §1.2 of the row spec
   kMultiGpuParallelism,  // ltx-pipelines/multigpu — sequence-parallel, tiled data
                          //   parallel and distributed VAE decode. NOT CFG batching:
                          //   zero `cfg` hits in either multigpu tree

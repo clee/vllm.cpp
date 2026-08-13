@@ -258,14 +258,20 @@ constexpr char kLtx2DurationHeadPathExtra[] = "duration_head_path";
 // DEFAULT and looks like the feature not working.
 //
 // DEFINED IS NOT THE SAME AS SERVED, and conflating the two was #611: nine of
-// these ten reach a reader (`:570`, `:625`, `:721`, `:737`, `:739`, `:771`,
-// `:796`, `:901`, `:942`), and `duration_head_path` reached none, so supplying a
+// these ten reach a reader, and `duration_head_path` reached none, so supplying a
 // duration head substituted the recipe default in silence — the failure mode this
 // very list exists to prevent, one level in. It stays in the list because the
 // family DOES define the key and DOES know what it means; `CheckUnservedExtras`
 // refuses it by name instead, which is a different and truer message than
 // "unknown load extra". The full audit is in
 // .agents/specs/ltx25-retire-dead-arms.md §2.1.
+//
+// The first hand-written set of these anchors named nine lines that were readers
+// of NOTHING, in this very file, and a later merge moved the real ones again. So
+// they are no longer trusted: the list below is derived from this file on every
+// run and compared, and the failure prints the replacement to paste in.
+// READER ANCHORS (derived and gated by test_ltx2_video):
+// 638 693 789 805 807 839 864 969 1010
 const char* const kKnownLoadExtras[] = {
     kLtx2AudioPromptEmbedsExtra, kLtx2PipelineKindExtra,   kLtx2ModelVersionExtra,
     kLtx2AllowUnportedExtra,     kLtx2MaxPhaseExtra,       kLtx2DitConfigPathExtra,
