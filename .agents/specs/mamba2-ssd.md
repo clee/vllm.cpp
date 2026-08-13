@@ -652,7 +652,7 @@ the only W2 delta it could see is three extra registrations in the op table.
 So **all ten ctest failures are pre-existing and tracked** (#486 / #516 for
 `test_minimax_h3`, #233 for `test_glm4_moe_lite_paged_engine` "plus 4 more
 pre-existing ctest failures", and the same-name baseline for the rest). None is
-attributable to W2. The standalone log is `~/w2ssd/refail.log`.
+attributable to W2. The standalone log is `~/w2ssd-evidence/refail.log`.
 
 **All ten reproduce STANDALONE** on the idle box, one `ctest -R` per binary under
 the lock — `CTEST_EXIT=8` for every one of `test_minimax_h3`, `test_ops_gdn`,
