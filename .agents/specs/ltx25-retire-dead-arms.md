@@ -68,6 +68,16 @@ The five `shot` files, with what the word means in each:
 Upstream's "shot" is a single continuous take. There is no multi-shot generation
 mode, and nothing that composes several takes into one output.
 
+diffusers says the same thing in its own vocabulary, which is the stronger check
+because the word is far more common there: every `shot` in
+`src/diffusers/pipelines/ltx2/` is a **camera shot type** in the prompt-enhancement
+guidance — `utils.py:217`, "Shot type (exactly one: extreme wide shot / wide shot
+/ medium shot / medium close-up / close-up / extreme close-up)" — or the duration
+head's own docstring, `duration_head.py:83`, "Predicts the natural duration of the
+**shot** implied by a caption". Its sixteen `ltx2/` modules are
+`pipeline_ltx2`, `_condition`, `_diffusion_decode`, `_hdr_lora`, `_ic_lora`,
+`_image2video`, `_latent_upsample`, plus the components. None is multi-shot.
+
 `ltx-pipelines`' actual entry points, from `docs/pipelines.md` ("Full reference
 for all 11 pipelines") and the module list:
 `ti2vid_one_stage`, `ti2vid_two_stages`, `ti2vid_two_stages_hq`,
