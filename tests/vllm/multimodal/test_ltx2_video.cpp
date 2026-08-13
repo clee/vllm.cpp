@@ -663,6 +663,15 @@ TEST_CASE("ltx2 video: keyframe and reference conditioning is refused by name") 
     // and the CRF re-compression upstream applies before encoding.
     CHECK(msg.find("VAE_ENCODER_COMFY_KEYS_FILTER") != std::string::npos);
     CHECK(msg.find("default_image_crf") != std::string::npos);
+    // And the QUALIFIER on that re-compression, which the two substrings above do
+    // not reach: `preprocess` returns the image UNTOUCHED at `crf == 0`
+    // (media_io/decode.py:413-435, the early return at :427), so "re-compresses
+    // before encoding" is only true of a nonzero resolved CRF. Naming the round
+    // trip without naming its exception overstates what is unported and sends the
+    // next reader to build an H.264 path for a case that needs none — the same
+    // failure mode as a stale reason, one step subtler. Gated here so deleting the
+    // qualifier goes RED rather than quietly restoring the overstatement.
+    CHECK(msg.find("unless that CRF is 0") != std::string::npos);
   }
 }
 

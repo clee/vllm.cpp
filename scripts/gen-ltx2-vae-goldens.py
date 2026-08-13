@@ -71,6 +71,7 @@ from __future__ import annotations
 
 import argparse
 import math
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -78,6 +79,42 @@ from pathlib import Path
 import numpy as np
 
 _MASK64 = (1 << 64) - 1
+
+
+# ---------------------------------------------------------------------------
+# THE GOLDEN BAND, READ from the C++ suite rather than repeated here.
+# `kLtx2GoldenTol` (tests/vllm/models/test_ltx2_vae.cpp) is the ONE authority on
+# what "green" means for these goldens, and section 5d asserts against it before
+# emitting — an arm that exists to make a constant reachable is worthless if it
+# does not clear the band the C++ side actually applies. A literal `5e-6` here
+# would be a second definition of one number in a second language, and the two
+# would drift the moment either moved: a widened C++ band would leave this
+# generator certifying arms against a band nobody uses, and a tightened one would
+# let it emit arms the suite already rejects.
+#
+# So the value is PARSED from that file, and a parse that does not find EXACTLY
+# ONE definition is fatal. An anchor that silently stops matching is how a gate
+# goes quiet, which is the failure this whole section of the suite exists to
+# prevent.
+# ---------------------------------------------------------------------------
+
+_GOLDEN_TOL_SOURCE = (
+    Path(__file__).resolve().parents[1] / "tests" / "vllm" / "models" / "test_ltx2_vae.cpp"
+)
+
+
+def _read_golden_tol() -> float:
+    text = _GOLDEN_TOL_SOURCE.read_text(encoding="utf-8")
+    hits = re.findall(r"^constexpr double kLtx2GoldenTol = ([0-9eE.+-]+);", text, re.M)
+    assert len(hits) == 1, (
+        f"expected EXACTLY ONE `constexpr double kLtx2GoldenTol = ...;` in "
+        f"{_GOLDEN_TOL_SOURCE}, found {len(hits)} — the generator cannot assert "
+        f"against a band it cannot resolve"
+    )
+    return float(hits[0])
+
+
+GOLDEN_TOL = _read_golden_tol()
 
 
 # ---------------------------------------------------------------------------
@@ -854,9 +891,9 @@ def section_conv_video_decoder(out) -> None:
     finally:
         norm3[0].eps = 1e-6
     zero_move = float((y_eps - y_zero).abs().max())
-    assert zero_move > 10 * 5e-6, (
-        f"the eps arm must move well past the 5e-6 band when the constant is "
-        f"removed, moved only {zero_move:g}"
+    assert zero_move > 10 * GOLDEN_TOL, (
+        f"the eps arm must move well past the {GOLDEN_TOL:g} band when the "
+        f"constant is removed, moved only {zero_move:g}"
     )
     print(f"[eps arm] norm3 in {tuple(y_eps.shape)}; eps 1e-6 -> 0 moves {zero_move:g}",
           file=sys.stderr)

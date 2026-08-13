@@ -1235,13 +1235,24 @@ TEST_CASE("ltx2 vae: the goldens carry the upstream revision they came from") {
 }
 
 TEST_CASE("ltx2 vae: every stabilizing epsilon is pinned to its upstream line") {
-  // THE INVISIBLE-CONSTANT CLASS. An epsilon that exists to stabilize a division
-  // is by construction invisible to a reduced-dimension parity gate: the
-  // deterministic stream produces O(1) activations, the guarded term never binds,
-  // and the tensor comparison accepts ANY value — including 0.0 and including one
-  // 100x off. Each of these was mutated with every golden staying green, so each
-  // is held HERE, cited to the upstream line that sets it. Adding a new constant
-  // without adding it to this list reopens the hole.
+  // THE INVISIBLE-CONSTANT CLASS, and the PIN LIST that holds it. An epsilon that
+  // exists to stabilize a division CAN be invisible to a reduced-dimension parity
+  // gate: the deterministic stream produces O(1) activations, the guarded term
+  // never binds, and the tensor comparison accepts ANY value — including 0.0 and
+  // including one 100x off.
+  //
+  // Membership is a MEASURED, PER-ENTRY property, and it is NOT a property of
+  // this list. Some entries below were mutated with every golden staying green.
+  // Others are gated numerically by an arm that reaches them, and are pinned
+  // anyway, because a pin catches the edit a golden cannot: a regeneration that
+  // moves the constant and the goldens TOGETHER. Each entry says which it is, and
+  // says it because the mutation was RUN, on this tree, with the numbers recorded
+  // beside it.
+  //
+  // Adding a new constant without adding it here reopens the hole. Recording one
+  // as invisible without mutating it reopens a worse one — this case has now
+  // carried a wrong reachability verdict twice, which is the whole reason the
+  // claim is per-entry and quantified rather than a sentence at the top.
 
   // ResnetBlock3D's `eps: float = 1e-6` (video_vae/resnet.py:31), handed to every
   // nn.GroupNorm it builds (resnet.py:44, 65, 94) and carried by UNetMidBlock3D as
@@ -1301,12 +1312,34 @@ TEST_CASE("ltx2 vae: every stabilizing epsilon is pinned to its upstream line") 
   // this list did not grow to match. `_make_encoder_block` passes `resnet_eps=1e-6`
   // / `eps=1e-6` literally (video_vae.py:56, 66) and `conv_norm_out` takes
   // `eps=1e-6` (video_vae.py:240); there is no checkpoint key that moves it.
+  //
+  // NOT INVISIBLE — this entry arrived carrying the same wrong verdict the decoder
+  // entry above did, for the same reason, and is corrected the same way. Encoder
+  // arm A has a `res_x_y` block, so ResnetBlock3d builds norm3 (resnet.py:93-97,
+  // applied at :178) exactly as the decoder does, and our port reads it at ONE
+  // line for both halves: ltx2_video_vae.cpp:1051,1056 reach :405, which the
+  // decoder reaches from :693,700. Measured on this tree: the field default
+  // 1e-6 -> 1e-4 REDS two goldens at max|diff| = 4.38839e-05 against the 5e-6
+  // band — "the video ENCODER (*_res family)" and "the video encoder CROPS a
+  // frame count that is not 1 + k*factor". Forcing :405 to 1.0 reds those same
+  // two at 0.150858, which is what IDENTIFIES norm3 as the reader: `norm_layer`
+  // is kPixelNorm on both encoder arms, so neither ApplyNorm nor conv_norm_out
+  // (ltx2_video_vae.cpp:1081-1087) ever enters a GroupNorm branch. Arm B holds no
+  // `res_x_y` and therefore no norm3, and stays green throughout — the coverage
+  // is real but PARTIAL, which is exactly what the pin is still for.
   CHECK(vllm::Ltx2ConvVideoEncoderConfig{}.norm_eps ==
         doctest::Approx(1e-6).epsilon(1e-12).scale(0.0));
 
   // And its PixelNorm eps, which is the video VAE's bare `PixelNorm()` DEFAULT of
   // 1e-8 (normalization.py:22) — NOT the audio VAE's 1e-6. The decoder-side pair
   // has its own case below; the encoder was missing from both.
+  //
+  // Also NOT INVISIBLE, and the more clearly so: PixelNorm IS the encoder's norm
+  // on every arm, so this epsilon is a first-order term the whole way down rather
+  // than a guard that never binds. Measured: 1e-8 -> 1e-6 REDS four encoder
+  // goldens — 1.02744e-05 on the `*_res` family and on the frame-count crop,
+  // 8.10623e-06 on encoder temporal causality, and 0.000175595 on "the video
+  // ENCODER (strided convs, per_channel, reflect)".
   CHECK(vllm::Ltx2ConvVideoEncoderConfig{}.pixel_norm_eps ==
         doctest::Approx(1e-8).epsilon(1e-12).scale(0.0));
 }

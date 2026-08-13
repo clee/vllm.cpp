@@ -105,12 +105,21 @@ struct Ltx2VideoDecoderBlock {
 // invisible to a reduced-dimension parity gate: the deterministic stream produces
 // O(1) activations, the term it guards never binds, and the tensor comparison
 // therefore accepts any value at all — including 0.0, and including one 100x off.
-// MEASURED, by mutating each in turn with EVERY golden staying green:
+// MEASURED, by mutating each in turn; these three left EVERY golden green:
 //
-//   Ltx2ConvVideoDecoderConfig::pixel_norm_eps 1e-8 -> 1e-6 green
 //   kLtx2BweMelLogClamp                    1e-5 -> 1e-8   green
 //   kMiniMaxH3SnakeEps                     1e-9 -> 0.0    green
 //   kLtx2RmsNorm2dEps                      1e-12 -> 0.0   green
+//
+// `Ltx2ConvVideoDecoderConfig::pixel_norm_eps` was listed with them and NO LONGER
+// belongs. The arm added to make `norm_eps` reachable — "ltx2 vae: the video
+// decoder's norm_eps is gated where it BINDS" — runs its latent at a tenth of the
+// usual scale, and that makes this epsilon a first-order term too: 1e-8 -> 1e-6
+// now REDS that arm at max|diff| = 1.69305e-04 against the 5e-6 band. The fixture
+// built to close one hole closed its neighbour with it, and the line claiming
+// otherwise survived the change that falsified it. It stays pinned, in "ltx2 vae:
+// the two PixelNorm epsilons stay different", for the reason a pin always earns:
+// a regeneration that moves the constant and the goldens together.
 //
 // `Ltx2ConvVideoDecoderConfig::norm_eps` was listed here and DOES NOT BELONG. It
 // is read on every arm that has a `res_x_y` block, PixelNorm included, because

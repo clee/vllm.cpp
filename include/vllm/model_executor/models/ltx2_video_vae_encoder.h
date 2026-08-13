@@ -122,6 +122,18 @@ struct Ltx2ConvVideoEncoderConfig {
   // `eps=1e-6` literally (video_vae.py:56, 66) and `conv_norm_out` takes
   // `eps=1e-6` (video_vae.py:240). It is a field here only so the gate can pin
   // it; there is no checkpoint key that moves it.
+  //
+  // And norm3 is the reason it is LIVE on a PixelNorm checkpoint here too, for
+  // the identical reason it is on the decoder's `norm_eps`: `ResnetBlock3D`
+  // builds `norm3 = nn.GroupNorm(num_groups=1, ..., eps=eps)` whenever
+  // `in_channels != out_channels` (resnet.py:93-97) and applies it to the
+  // residual (resnet.py:178), and `norm_layer` does not gate that. So every
+  // `res_x_y` encoder block reads this value even though `conv_norm_out` and
+  // `ApplyNorm` take their PixelNorm branches. It is ONE line in the port for
+  // both halves — ltx2_video_vae.cpp:1051,1056 reach :405, the same line the
+  // decoder reaches from :693,700 — so it cannot be live for one and dead for
+  // the other, and it is gated numerically by the encoder goldens rather than
+  // held by the pin alone.
   double norm_eps = 1e-6;
   // `PixelNorm()`'s bare DEFAULT (normalization.py:22), same as the decoder's.
   double pixel_norm_eps = 1e-8;
