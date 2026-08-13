@@ -1578,6 +1578,92 @@ allocator), not in anything the kernel or its inputs express.
 residual is now measured, localised to one kernel, quantified per unit of work,
 and attributed to achieved memory bandwidth rather than left as "unexplained".
 
+## 6ab. THE C_tmp CAP IS REAL BUT PERFORMANCE-NEUTRAL, and my +2.9% was DRIFT (2026-08-12)
+
+Found a genuine divergence: upstream caps the split-K reduce buffer at
+`min(size_n * sorted_len, sms * 4 * moe_block_size * max_thread_n)`
+(ops.cu:709-713) and we allocated only the upper bound, so ours was **15.3 MB vs
+3.15 MB** (gate_up, 4.9x) and **30.5 MB vs 3.15 MB** (down, 9.7x).
+
+Hypothesised that the oversized buffer turned a cache-resident reduce working set
+into DRAM traffic, which would have explained the 12.9% bandwidth deficit. A
+first measurement seemed to confirm it: 135.98 -> 139.93 median under the pinned
+clock harness, **+2.91%**.
+
+**That was drift, not the fix.** Measuring it properly -- SAME binary, SAME
+session, interleaved capped/uncapped/capped behind `VT_MARLIN_CTMP_UNCAPPED`:
+
+| arm | median |
+|---|---|
+| capped (fix) | 137.36 |
+| uncapped (pre-fix) | 137.32 |
+| **gain** | **+0.03%** |
+
+Nothing. And the same run shows why the earlier number lied: the first arm
+measured 119.74 (min 108.3) and the third 137.63 -- a **+14.9% drift inside one
+session**. GB10 cannot lock MEMORY clocks
+("Setting locked Memory clocks is not supported"), only SM clocks, so a
+DRAM-bound kernel's absolute throughput wanders and any before/after taken across
+runs attributes that wander to whatever changed in between.
+
+**Conclusions:**
+
+1. The cap is still correct and lands -- it mirrors upstream and returns 12-27 MB
+   per stream -- but it is a MEMORY-HYGIENE change, not a performance one, and
+   must not be recorded as the latter.
+2. The C_tmp size is ELIMINATED as an explanation for the 12.9% bandwidth gap.
+   The kernel only touches the region it indexes, so the oversize never became
+   traffic; my bandwidth reasoning had the mechanism wrong.
+3. **The within-session ratio is what stands**: 0.9757 (pre-fix session) and
+   0.9646 (post-fix session), i.e. ~0.965-0.976. The fix moved neither.
+
+**Method note, the third time drift has fooled a before/after in this row.** The
+first two were caught by pairing and by pinning clocks. This one needed an
+in-process A/B switch, because on a machine whose memory clock cannot be pinned,
+even a pinned-clock before/after across two runs is not a controlled experiment.
+Any future perf claim on this row needs the toggle, not two runs.
+
+## 6ac. STORAGE RULED OUT, and the ratio is stable at ~0.966 (2026-08-12)
+
+Developer question: could the weights being on NAS, or not fully resident in
+device memory, be distorting these measurements?
+
+**Tested, and no.**
+
+| check | result |
+|---|---|
+| weight location | local NVMe (`/dev/nvme0n1p2`, ext4) -- **no NAS mount exists on this box** |
+| total disk read for a run | 22.06 GB, i.e. ONE full model read at load |
+| process RSS during decode | 4.8 GB -- the weights are NOT held in host RSS; they are uploaded and the mapping released |
+| decode stability | 8 warm reps at 146.0 / 147.6 / 147.2 / 146.9 / 147.2 / 147.3 / 147.4 -- **0.5% spread** |
+
+If weights were still file-backed, decode would fault pages from NVMe and the
+per-rep numbers would be erratic; a 0.5% spread says they are resident and decode
+touches no storage. Worth keeping in mind that on GB10 the failure mode would be
+severe if it ever regressed -- host pages reach the GPU through ATS, which this
+repo measured at a 20-30% per-GEMM penalty.
+
+**Operational finding worth acting on separately:** that NVMe is **98% full**
+(3.4T of 3.6T, 76 GB free). This repo has already lost a gate run to ENOSPC
+producing a green-looking report over work that never executed.
+
+**And the ratio is now measured three times, each WITHIN one session:**
+
+| session | ours | oracle (modal) | ratio |
+|---|---|---|---|
+| pinned clocks, pre-C_tmp | 135.98 | 139.36 | 0.9757 |
+| pinned clocks, post-C_tmp | 139.20 | 144.32 | 0.9646 |
+| free clocks, ours->oracle->ours | 140.98 | 147.32 | **0.9569** |
+
+**~0.966 +/- 0.01, consistently below 1.0.** The absolute numbers move a lot
+between sessions (135.98 to 142.09 for the same binary) because GB10's memory
+clock cannot be pinned, which is exactly why only the within-session ratio is
+quotable -- and all three agree.
+
+Also visible in the last run: the oracle's draws are bimodal at ~147.3 and
+~155.6, the same one-extra-accepted-token effect as §6q, which is why its MODAL
+draws are the honest denominator.
+
 ## 7. Evidence, authority, stop conditions
 
 - Evidence root: `dgx:~/work/vllm.cpp-dspark-<slice>/`, one `flock`, named tmux.
