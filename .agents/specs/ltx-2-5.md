@@ -759,6 +759,28 @@ assert the resolved `ltx_core.__file__` lives under the `--ltx2` checkout (ident
 record the upstream revision SHA in the emitted goldens (provenance). AGENTS.md already
 required the revision anchor; the identity assertion is what makes the anchor mean anything.
 
+**(a-bis) The class was swept, and it had FIVE members, not one.** Recorded 2026-08-13
+(issue #560). After the fourth recurrence, every stabilizing constant in the LTX-2.5 files was
+enumerated and mutated ALONE — 20 constants. Three categories emerged, and the middle one is
+the interesting one:
+
+| verdict | count | meaning |
+|---|---|---|
+| pinned AND numerically reachable | 12 | a mutation moves a golden; the gate genuinely bites |
+| **INVISIBLE — no arm read it at all** | **5** | a 100x change left every suite green |
+| pinned, correctly unreachable | 3 | upstream discards the value, so a pin is the only honest treatment |
+
+The fifth instance is the one worth remembering: **`Ltx2DitParams::norm_eps`**. Every test
+passes that value explicitly through `ReducedParams`, so nothing ever read the FIELD DEFAULT —
+which is live code, because `ParseLtx2DitParams` falls back to it exactly as upstream's
+`config.get("norm_eps", 1e-06)` does. A constant can be invisible not because the fixture
+avoids its regime, but because the fixture never lets the default apply.
+
+The repair that matters is not the pin. For the two audio-VAE `norm_eps` holes the fix was a
+new gate arm at `norm_type = kGroup` / `causality_axis = kNone`, which makes the constant
+**numerically** reachable: the same 100x mutation now moves the goldens by 1.13e-3 and 5.18e-3
+against a 5e-6 band. A source-anchored `CHECK` is the floor; a reachable arm is the gate.
+
 **(c) A FIXTURE that cannot separate right from wrong is the same defect, wearing different
 clothes.** Recorded 2026-08-12 from L5's review, and it is the sharpest instance so far.
 

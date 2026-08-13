@@ -81,6 +81,7 @@ issue is not yet placed. Keyed record: update in place, never append.
 | [#338](https://github.com/mudler/vllm.cpp/issues/338) | `ROAD-V1-C1` | MiniCPM/MiniCPM3 hard-code SiLU: upstream `MiniCPMMLP` (`minicpm.py:219-226`) selects `FatreluAndMul` on `hidden_act == "fatrelu"` and raises otherwise; our `parse_config` never reads `hidden_act` | bug |
 | [#241](https://github.com/mudler/vllm.cpp/issues/241) | `ROAD-V1-H3` | MiniMax-H3: support the PRUNED (AdaLN timestep-curve) checkpoint variants | feature |
 | [#435](https://github.com/mudler/vllm.cpp/issues/435) | `ROAD-V1-LTX25` | LTX-2.5: port the 21B joint video+audio DiT and generalize the video seam | feature |
+| [#560](https://github.com/mudler/vllm.cpp/issues/560) | `ROAD-V1-LTX25` | Stabilizing constants unreachable by any gate: FIVE instances found by sweep, incl. the DiT's own `norm_eps` field default | bug |
 | [#238](https://github.com/mudler/vllm.cpp/issues/238) | `SAMPLE-LOGPROB-TOKEN-IDS` | `logprobs_mode`: three of four modes are runtime-refused stubs | bug |
 | [#264](https://github.com/mudler/vllm.cpp/issues/264) | `SAMPLE-LOGPROB-TOKEN-IDS` | `logprob_token_ids`: generative scoring over an explicit token set is unported | feature |
 | [#365](https://github.com/mudler/vllm.cpp/issues/365) | `PERF-27B-DENSE-MARLIN-GATEUP` | 27B gap decomposed vs vLLM's own decode profile; dense W4A16 MLP bypassed the fused gate_up seam (spec `specs/perf-27b-dense-marlin-gateup.md`) | bug |
