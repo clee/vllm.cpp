@@ -332,7 +332,10 @@ reference-video or reference-audio conditioning is usable: the video engine
 still refuses every one of those by name, because the request-side work between
 a file on disk and a tensor the encoder accepts — image decode, aspect-fill
 resize, and the H.264 CRF re-compression upstream performs before encoding — is
-not ported. Two encoder-level limits are worth stating in advance because they
+not ported. The engine also holds no encoder to call: it materializes the VAE
+DECODER key filters only, so no encoder weights are ever in memory, and the
+refusal names that rather than claiming the encoder itself is missing. Two
+encoder-level limits are worth stating in advance because they
 are refusals rather than approximations. A reference waveform whose sample rate
 differs from the audio VAE's is refused rather than resampled, since upstream
 uses a polyphase kaiser resampler this project does not carry. And a VAE

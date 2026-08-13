@@ -97,7 +97,17 @@ struct Ltx2AudioDecoderConfig {
   // The decoder's TARGET mel-bin count. 0 keeps whatever the latent carried,
   // mirroring `mel_bins=None` (audio_vae.py:422).
   int64_t mel_bins = 0;
-  // Only read on the GroupNorm arm; PixelNorm has no parameters at all.
+  // Only read on the GroupNorm arm; PixelNorm has no parameters at all. Both are
+  // HARDCODED upstream: `build_normalization_layer` builds
+  // `torch.nn.GroupNorm(num_groups=32, ..., eps=1e-6)` (normalization.py:56) and
+  // no audio_vae call site overrides either, so there is no checkpoint key that
+  // moves them. They are fields here so the gate can pin them.
+  //
+  // `norm_type = kGroup` is not a dead arm — it is `AudioDecoder.__init__`'s own
+  // DEFAULT (audio_vae.py:295), legal wherever `causality_axis` is `kNone`
+  // (resnet.py:130-131), and gated numerically by the group-norm golden in
+  // test_ltx2_vae.cpp. Before that arm existed this eps was never READ on any
+  // path, and a 100x change moved nothing.
   int64_t num_groups = 32;
   double norm_eps = 1e-6;
   // The audio VAE reaches PixelNorm through `build_normalization_layer`, which

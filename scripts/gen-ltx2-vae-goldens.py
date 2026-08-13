@@ -262,6 +262,33 @@ AUDIO_DEC = dict(
 AUDIO_DEC_LATENT_T = 3
 AUDIO_DEC_LATENT_F = 2  # z_channels * mel_bins(latent) must equal `ch` (patchified width)
 
+# Sections 1d / 7d — the GROUP-NORM arms, which exist so `norm_eps` is REACHABLE.
+#
+# `build_normalization_layer` has two branches (common/normalization.py:56-59) and
+# every arm above takes the PIXEL one, which is parameter-free and reads
+# `pixel_norm_eps`. On those arms `norm_eps` is not merely inert, it is never
+# LOADED: nothing in the audio VAE ever touches the GroupNorm branch, so mutating
+# the constant 100x moved no golden at all. `norm_type=group` is legal upstream
+# (it is the DEFAULT of both `AudioEncoder.__init__` and `AudioDecoder.__init__`)
+# and `ResnetBlock.__init__` permits it at `causality_axis=NONE`
+# (audio_vae/resnet.py:130-131), which is the configuration gated here.
+#
+# TWO REDUCED DIMENSIONS MOVE, and both are forced, not chosen:
+#  * `ch` becomes 32 because `build_normalization_layer` HARDCODES `num_groups=32`
+#    and no audio_vae call site overrides it, so `torch.nn.GroupNorm` refuses any
+#    channel count that 32 does not divide. Every level is then 32/64/128.
+#  * `z_channels` becomes 16 because `PerChannelStatistics(latent_channels=ch)`
+#    indexes the patchified `(c, f)` axis, so `z_channels * mel_bins(latent)` has
+#    to equal the new `ch` (audio_vae.py:118, 318).
+# Nothing else changes, so a diff against the pixel arms is exactly the norm.
+AUDIO_GROUP_DEC = {**AUDIO_DEC, "ch": 32, "z_channels": 16}
+AUDIO_GROUP_DEC_LATENT_T = 3
+AUDIO_GROUP_DEC_LATENT_F = 2
+# The mel-bin count the network itself produces (latent F doubled once per level
+# transition), so `_adjust_output_shape` neither crops nor pads and the golden is
+# the decoder's own output.
+AUDIO_GROUP_DEC_MEL_BINS = 8
+
 # Section 2 — BigVGAN v2 vocoder (resblock "AMP1", snakebeta). conv_pre's input is
 # hardcoded to 128 upstream (2 stereo channels x 64 mel bins), so the reduced arm
 # keeps 64 mel bins and shrinks everything else.
@@ -446,6 +473,34 @@ def section_audio_decoder(out) -> None:
         out.write("\n")
         emit_manifest(out, f"kLtx2AudioDec{label}Param", arm_manifest)
         emit_f32(out, f"kLtx2AudioDec{label}Golden", y_axis.numpy())
+
+    # --- section 1d: norm_type = GROUP, the arm that READS `norm_eps` ---
+    # See AUDIO_GROUP_DEC for why this arm exists and why its two dimensions move.
+    # GroupNorm is the only consumer of `norm_eps` in the audio VAE, and it also
+    # makes `num_groups` load-bearing: the norms carry `weight`/`bias` here, which
+    # PixelNorm does not, so the parameter manifest differs too.
+    group = AudioDecoder(
+        norm_type=NormType.GROUP,
+        causality_axis=CausalityAxis.NONE,
+        mel_bins=AUDIO_GROUP_DEC_MEL_BINS,
+        **AUDIO_GROUP_DEC,
+    ).eval()
+    group_manifest = fill_from_stream(group, prefix="ltx2.audiodecgroup.")
+    group_latent = make_input(
+        "ltx2.audiodecgroup.input",
+        (1, AUDIO_GROUP_DEC["z_channels"], AUDIO_GROUP_DEC_LATENT_T, AUDIO_GROUP_DEC_LATENT_F),
+        1.0,
+    )
+    y_group = group(group_latent)
+    out.write("// --- section 1d: norm_type = GROUP (normalization.py:56-57) ---\n")
+    emit_scalar(out, "kLtx2AudioDecGroupLatentC", AUDIO_GROUP_DEC["z_channels"])
+    emit_scalar(out, "kLtx2AudioDecGroupLatentT", AUDIO_GROUP_DEC_LATENT_T)
+    emit_scalar(out, "kLtx2AudioDecGroupLatentF", AUDIO_GROUP_DEC_LATENT_F)
+    emit_scalar(out, "kLtx2AudioDecGroupOutFrames", y_group.shape[2])
+    emit_scalar(out, "kLtx2AudioDecGroupOutMelBins", y_group.shape[3])
+    out.write("\n")
+    emit_manifest(out, "kLtx2AudioDecGroupParam", group_manifest)
+    emit_f32(out, "kLtx2AudioDecGroupGolden", y_group.numpy())
 
 
 def _vocoder(cfg):
@@ -800,6 +855,12 @@ AUDIO_ENC = dict(
 )
 AUDIO_ENC_FRAMES = 8
 AUDIO_ENC_MEL = 8
+# Section 7d — the encoder's GROUP-NORM arm. Same two forced dimension changes as
+# AUDIO_GROUP_DEC, for the same two reasons: `num_groups=32` is hardcoded in
+# `build_normalization_layer`, and `z_channels * mel_bins(latent)` must equal `ch`
+# because `PerChannelStatistics` indexes the patchified `(c, f)` axis. The encoder
+# reaches its deepest level at 8 -> 4 -> 2 mel bins, so 16 * 2 = 32.
+AUDIO_GROUP_ENC = {**AUDIO_ENC, "ch": 32, "z_channels": 16}
 
 # Section 8 — the mel front-end. n_fft is small so the direct DFT the C++ side
 # uses stays cheap, but every parameter that decides a value is preserved.
@@ -1026,6 +1087,26 @@ def section_audio_encoder(out) -> None:
     out.write("\n")
     emit_manifest(out, "kLtx2AudioEncPoolParam", manifest_pool)
     emit_f32(out, "kLtx2AudioEncPoolGolden", y_pool.numpy())
+
+    # --- 7d: norm_type = GROUP, the arm that READS `norm_eps` on the encoder half.
+    # See AUDIO_GROUP_ENC. `ResnetBlock` only permits GroupNorm at causality NONE
+    # (resnet.py:130-131), which is a configuration a checkpoint may legally
+    # declare and which the pixel arms above leave entirely unexecuted.
+    enc_group = AudioEncoder(
+        norm_type=NormType.GROUP,
+        causality_axis=CausalityAxis.NONE,
+        attn_type=AttentionType.VANILLA,
+        **AUDIO_GROUP_ENC,
+    ).eval()
+    manifest_group = fill_from_stream(enc_group, prefix="ltx2.audioencgroup.")
+    y_group = enc_group(spectrogram)
+    out.write("// --- section 7d: AudioEncoder, norm_type = GROUP, causality NONE ---\n")
+    emit_scalar(out, "kLtx2AudioEncGroupOutC", y_group.shape[1])
+    emit_scalar(out, "kLtx2AudioEncGroupOutT", y_group.shape[2])
+    emit_scalar(out, "kLtx2AudioEncGroupOutF", y_group.shape[3])
+    out.write("\n")
+    emit_manifest(out, "kLtx2AudioEncGroupParam", manifest_group)
+    emit_f32(out, "kLtx2AudioEncGroupGolden", y_group.numpy())
 
 
 def section_audio_mel(out) -> None:

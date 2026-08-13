@@ -90,7 +90,14 @@ struct Ltx2AudioEncoderConfig {
   bool mid_block_add_attention = true;
   Ltx2NormType norm_type = Ltx2NormType::kPixel;
   Ltx2CausalityAxis causality_axis = Ltx2CausalityAxis::kHeight;
-  // Only read on the GroupNorm arm; PixelNorm is parameter-free.
+  // Only read on the GroupNorm arm; PixelNorm is parameter-free. Both are
+  // HARDCODED upstream — `build_normalization_layer` builds
+  // `torch.nn.GroupNorm(num_groups=32, ..., eps=1e-6)` (normalization.py:56) and
+  // nothing in audio_vae overrides either — so they are fields only so the gate
+  // can pin them. `norm_type = kGroup` is `AudioEncoder.__init__`'s own DEFAULT
+  // (audio_vae.py:81) and legal at `causality_axis = kNone` (resnet.py:130-131);
+  // it is gated numerically by the group-norm golden in test_ltx2_vae.cpp, which
+  // is what stopped this eps from being a constant no arm ever read.
   int64_t num_groups = 32;
   double norm_eps = 1e-6;
   // Reached through `build_normalization_layer`, which passes eps=1e-6

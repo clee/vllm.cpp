@@ -650,11 +650,19 @@ TEST_CASE("ltx2 video: keyframe and reference conditioning is refused by name") 
   gen.first_frame_path = ws.paths.video_embeds;  // any path: the refusal precedes the read
   try {
     (void)engine->Generate(gen);
-    FAIL("keyframe conditioning must be refused while the VAE encoder is unported");
+    FAIL("keyframe conditioning must be refused while no encoder is reachable from here");
   } catch (const std::exception& e) {
     const std::string msg = e.what();
     INFO(msg);
     CHECK(msg.find("ImageConditioner") != std::string::npos);
+    // A refusal whose stated REASON has gone stale is worse than a vague one: it
+    // sends the next reader to build something that already exists. Phase L11
+    // ported the video VAE encoder, so the message may no longer claim the
+    // encoder is missing, and these two assertions hold it to the pieces that
+    // actually are — the loader path that would put encoder weights in memory,
+    // and the CRF re-compression upstream applies before encoding.
+    CHECK(msg.find("VAE_ENCODER_COMFY_KEYS_FILTER") != std::string::npos);
+    CHECK(msg.find("default_image_crf") != std::string::npos);
   }
 }
 
