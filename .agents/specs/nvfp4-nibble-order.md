@@ -205,5 +205,71 @@ with finite non-degenerate output.
 
 ## 7. Outcome
 
-To be written when this lands: what was measured, what was rejected, and why the default is
-low-first.
+**What was measured.** The first-party NVFP4 DiT is SWIZZLED and HIGH-nibble-first, and both
+halves were established against an oracle that is not ours — the `vonkaiser` FP8 DiT of the
+same base weights. Re-derived after a full-disk incident on the build host and identical to
+every digit:
+
+| reading | rms | corr vs FP8 | rel rms |
+|---|---|---|---|
+| LINEAR / low-first (what the original brief asked for) | 0.013564 | 0.000414 | 1.786 |
+| LINEAR / high-first | 0.013564 | 0.257746 | 1.558 |
+| SWIZZLED / low-first (the shipped dequant) | 0.009208 | 0.032296 | 1.394 |
+| **SWIZZLED / high-first** | **0.009208** | **0.995560** | **0.0946** |
+
+The committed gate re-measures this from real bytes at 0.994968 corr / 0.100672 rel rms, with
+the control at 0.00362 and the deliberately-wrong nibble order at 0.00514.
+
+**What was rejected.**
+
+1. *A linear-layout arm.* The premise was wrong; building it would have made the file load and
+   render silently wrong. L9a stopped and returned `NEEDS_DECISION` instead.
+2. *Discriminating by SHAPE.* Gated as impossible for this artifact: all 1176 quantized modules
+   have a cuBLAS-padded scale shape numerically identical to the linear one
+   (`ambiguous_with_linear == 1176`). The marker leads; the shape only corroborates.
+3. *H3's nibble-swap-at-load.* Correct for H3, which also feeds a Marlin fp4-resident path, and
+   wasteful here: LTX-2.5 dequantizes to bf16, so a swap would rewrite 9.4 GB of packed weights
+   to feed a consumer that could read them in place. §3.1 records the condition that reverses
+   this decision.
+4. *"The forward ran and the output was finite."* The gate asserts absmax is IDENTICAL under
+   both nibble orders, so every magnitude summary is blind to the defect by construction. Only
+   the correlation separates them.
+
+**Why the default is low-first.** It is what torchao's `pack_uint4` writes
+(`kernels.py:160`), what torchao's own unpacker reads (`:137-139`), and what vLLM's two
+independent readers assume (`nvfp4_emulation_utils.py:321-324` and `:101-108`). Every caller
+predating this change consumes a ModelOpt or torchao checkpoint, so a defaulted parameter makes
+"nothing else moves" true by construction — and the ten-gate sweep confirmed it, eight of them
+byte-identical.
+
+**§4.2 closed, no defect.** torchao is low-first on three independent witnesses, so the shipped
+text-encoder arm was already correct. Its gate is now anchored to those sources rather than
+comparing our helper to itself.
+
+**Gates.** Ten NVFP4 gates plus nine LTX/video gates green; the only counts that moved are the
+two suites this change adds cases to (`test_nvfp4_dequant` 4/47 -> 5/69, `test_ltx2_loader`
+20/2363 -> 24/4793). Three mutations were run and all three turned the suite red: forcing
+low-first (3 cases), resolving a marker-less padded file as torchao (3 cases), and reinstating
+an apostrophe in a refusal (1 case). Tree restored byte-for-byte after each.
+
+**On the GPU (dgx.casa, GB10, one `flock -w 2700 $HOME/gpu.lock` hold 02:31:03 to 02:37:15).**
+Both arms stage device-resident and forward, `Status: SUCCESS!`:
+
+| arm | file | assertions | output absmax |
+|---|---|---|---|
+| NVFP4 | `ltx-2.5-22b-distilled-transformer-nvfp4.safetensors` (18,721,432,024 B, 7876 tensors) | 5626 | video 0.275391 / audio 1.02344 |
+| FP8 | `ltx-2.5-22b-distilled-fp8.safetensors` (6124 tensors) | 5624 | video 0.300781 / audio 2.14062 |
+
+The FP8 figures reproduce the previously recorded GB10 run to the digit, which is what makes
+the NVFP4 figures next to them trustworthy rather than merely new. The two arms differ because
+they are different quantizations AND different configurations: the NVFP4 file declares a config
+(`double_precision_rope`, `av_ca_timestep_scale_multiplier = 1000`, both asserted after
+adoption), while the FP8 file declares none and runs under manifest defaults.
+
+**Not obtained.** The device case's MESSAGE text (printed tensor count, staging seconds, config
+source) was cut by a `tail` in the harness on the first run, and a second run to capture it
+timed out on the GPU lock after 45 minutes (`FLOCK_EXIT=1`) against a saturated box. The
+underlying facts are asserted rather than printed — the geometry CHECKs are among the 5626 that
+passed — and 7876 tensors / 48 blocks / video 4096 / audio 2048 / 21.004B parameters are gated
+from the committed manifest. Cosmetic, and not worth further contended GPU time while another
+row is rendering.
