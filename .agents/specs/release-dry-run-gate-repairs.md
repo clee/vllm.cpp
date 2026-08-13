@@ -566,6 +566,35 @@ were restored byte-for-byte. Linux also passes the socket behavior, but the
 native reset RED and final acceptance remain correctly pending the hosted
 Windows CPU and Vulkan lanes; this local result is not substituted for them.
 
+#### #537 hosted falsification and next diagnostic
+
+Hosted CPU job
+[`94287249909`](https://github.com/mudler/vllm.cpp/actions/runs/31648432555/job/94287249909)
+and Vulkan job
+[`94287249981`](https://github.com/mudler/vllm.cpp/actions/runs/31648432555/job/94287249981)
+executed candidate `f52b547d44439e7cfb005f5697142b755ff65586` with both
+repairs above and still terminated with `0xC0000409`. The log and doctest's
+source-order execution place the failure in teardown of
+`api_server: socket smoke — real HTTP requests over an ephemeral port`: its
+final chat response completes, but doctest never prints that test's duration or
+summary. Therefore the accepted-socket reset plus unscoped server thread was a
+real defect, but it was not the complete root cause of this native fast-fail.
+That earlier causal claim is rejected; its implementation remains required by
+its focused regressions.
+
+The next hosted probe must preserve the full unchanged test and release gate,
+add phase evidence around destruction of the `httplib::Client`, scoped server
+thread, and `ServerHarness`, and install a diagnostic `std::terminate` marker in
+the test process. It must run the isolated socket-smoke case first with doctest
+success/duration output and then retain the normal full-suite invocation if the
+probe survives. The probe may only add diagnostics; it must not skip an
+assertion, detach a thread, catch a failure, alter production lifetime, or be
+accepted as the fix. Use the first missing teardown marker plus the terminate
+marker to identify one owner, then remove the probe and write a RED regression
+for that exact lifetime defect before implementing a repair. If the isolated
+case passes but the full process fails, bisect test-case prefixes in fresh
+processes to prove the cross-test state dependency rather than guessing.
+
 #### #540 implementation outcome
 
 Implementation evidence: the focused contract was red with all six old
