@@ -683,6 +683,26 @@ is red and mutate directory classification to an existence-only query to prove
 behavior coverage rejects a regular file. Stop with `NEEDS_DECISION` if the
 portable implementation changes an observable resolution result or error.
 
+#### #648 implementation outcome
+
+The regression came from the generalized VideoEngine seam using POSIX `stat`
+for two private classification helpers even though C++20 filesystem support is
+already part of the project baseline. The direct portability checker failed at
+the unconditional `<sys/stat.h>` include and both `::stat` calls before the
+repair. `IsDir` now uses the non-throwing `std::filesystem::is_directory`
+overload and `Exists` uses the corresponding `exists` overload; both inspect an
+`std::error_code`, so missing and uninspectable paths still return false rather
+than throwing.
+
+The focused public-surface case distinguishes a directory without a shard
+index, a regular non-checkpoint file, and a missing path through
+`ReadVideoCheckpointTensorNames`. This pins the existing three refusal reasons
+and makes an existence-only directory predicate misclassify the regular file.
+After the repair the direct checker passed, the VideoEngine target built and
+its 12 cases / 260 assertions passed, and the combined Windows metadata,
+release-pipeline, and portability suite passed all 130 tests. No family
+resolution rule or public error changed.
+
 Fresh mutation review of the adaptive probe found three false-green contract
 gaps: the listing fixture did not distinguish file order from name order, the
 unexpected-status branches at an intermediate midpoint and isolated probe were

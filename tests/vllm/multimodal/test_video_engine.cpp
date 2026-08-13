@@ -152,6 +152,25 @@ TEST_CASE("video engine registry: detection resolves the H3 checkpoint by what i
   CHECK(vllm::multimodal::DetectVideoFamilies(not_a_dit).empty());
 }
 
+TEST_CASE("video checkpoint reader: directory, regular file, and missing path stay distinct") {
+  SeamWorkspace ws;
+  std::vector<std::string> names;
+  std::string why;
+
+  CHECK_FALSE(vllm::multimodal::ReadVideoCheckpointTensorNames(ws.fixture, &names, &why));
+  CHECK(why.find("directory holds neither") != std::string::npos);
+
+  why.clear();
+  CHECK_FALSE(vllm::multimodal::ReadVideoCheckpointTensorNames(
+      ws.fixture + "/video_vae_config.json", &names, &why));
+  CHECK(why.find("neither GGUF nor safetensors") != std::string::npos);
+
+  why.clear();
+  CHECK_FALSE(vllm::multimodal::ReadVideoCheckpointTensorNames(
+      ws.root + "/missing-checkpoint", &names, &why));
+  CHECK(why == "no such file or directory");
+}
+
 // ─── the byte-identity gate: the ABSTRACT seam lands on the pre-fold bytes ───
 TEST_CASE("video engine seam: an auto-detected H3 render reproduces the pre-fold goldens") {
   SeamWorkspace ws;

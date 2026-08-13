@@ -11,14 +11,14 @@
 #include <cassert>
 #include <cstdio>
 #include <exception>
+#include <filesystem>
 #include <fstream>
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <system_error>
 #include <utility>
 #include <vector>
-
-#include <sys/stat.h>
 
 #include <nlohmann/json.hpp>
 
@@ -55,13 +55,13 @@ std::vector<VideoFamilyRegistration>& RegistryStorage() {
 const std::vector<VideoFamilyRegistration>& OrderedRegistry() { return RegistryStorage(); }
 
 bool IsDir(const std::string& path) {
-  struct stat st {};
-  return ::stat(path.c_str(), &st) == 0 && S_ISDIR(st.st_mode);
+  std::error_code ec;
+  return std::filesystem::is_directory(path, ec) && !ec;
 }
 
 bool Exists(const std::string& path) {
-  struct stat st {};
-  return ::stat(path.c_str(), &st) == 0;
+  std::error_code ec;
+  return std::filesystem::exists(path, ec) && !ec;
 }
 
 std::string StripTrailingSlash(const std::string& dir) {
