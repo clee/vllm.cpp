@@ -25,9 +25,10 @@ enum class DeviceType : uint8_t {
   // uses "Blackwell" (sm_120/121, GB10) pervasively, and kBLACKHOLE next to
   // those would be a near-miss for both humans and grep.
   // (.agents/specs/tenstorrent-backend.md, BACKEND-TENSTORRENT)
-  kTENSTORRENT = 6
+  kTENSTORRENT = 6,
+  kSYCL = 7
 };
-constexpr size_t kNumDeviceTypes = 7;
+constexpr size_t kNumDeviceTypes = 8;
 
 // The canonical lowercase spelling of a device, for user-facing messages (and
 // the docs that quote them). Lives here, beside the enum, rather than in the
@@ -54,6 +55,8 @@ constexpr const char* DeviceTypeName(DeviceType device) {
       return "rocm";
     case DeviceType::kTENSTORRENT:
       return "tenstorrent";
+    case DeviceType::kSYCL:
+      return "sycl";
   }
   return "unknown";
 }
