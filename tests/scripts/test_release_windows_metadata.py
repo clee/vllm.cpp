@@ -102,7 +102,7 @@ class WindowsMetadataContract(unittest.TestCase):
         self.assertLess(contract, contract_exit)
         self.assertLess(contract_exit, environment)
 
-    def test_openai_socket_teardown_probe_precedes_unchanged_full_suite(self) -> None:
+    def test_openai_socket_probe_and_prefix_bisect_precede_unchanged_full_suite(self) -> None:
         script = (ROOT / "scripts/build-windows-release.ps1").read_text(
             encoding="utf-8"
         )
@@ -117,6 +117,7 @@ class WindowsMetadataContract(unittest.TestCase):
             '    "--duration=true"\n'
             ")"
         )
+        bisect = "Invoke-OpenAiPrefixBisect -TestProgram $openaiApiServerTest"
         full_suite = (
             'foreach ($test in @(\n'
             '    "test_openai_api_server.exe",'
@@ -127,21 +128,81 @@ class WindowsMetadataContract(unittest.TestCase):
         )
         self.assertEqual(script.count(test_path), 1)
         self.assertEqual(script.count(probe), 1)
+        self.assertEqual(script.count(bisect), 1)
         self.assertEqual(script.count(full_suite), 1)
         self.assertLess(script.index(test_path), script.index(probe))
-        self.assertLess(script.index(probe), script.index(full_suite))
+        self.assertLess(script.index(probe), script.index(bisect))
+        self.assertLess(script.index(bisect), script.index(full_suite))
 
         suite_start = script.index(full_suite)
         suite_end = script.index("\n}\n", suite_start) + 2
         suite = script[suite_start:suite_end]
         body_start = suite.index(")) {") + len(")) {")
-        invoke_start = suite.index(full_suite_invoke, body_start)
         self.assertEqual(suite.count(full_suite_invoke), 1)
+        invoke_start = suite.index(full_suite_invoke, body_start)
         self.assertEqual(
             suite[body_start:invoke_start].strip(),
             "",
             "the unchanged full suite must run before any loop-body control flow",
         )
+
+    def test_openai_prefix_bisect_pins_adaptive_exact_status_contract(self) -> None:
+        script = (ROOT / "scripts/build-windows-release.ps1").read_text(
+            encoding="utf-8"
+        )
+        range_start = script.find("function Invoke-OpenAiPrefixRange {")
+        self.assertNotEqual(range_start, -1, "fresh-process prefix range is missing")
+        range_end = script.index("\n}\n", range_start) + len("\n}\n")
+        range_helper = script[range_start:range_end]
+        for argument in (
+            '"--order-by=file"',
+            '"--first=$First"',
+            '"--last=$Last"',
+        ):
+            with self.subTest(argument=argument):
+                self.assertEqual(range_helper.count(argument), 1)
+        self.assertEqual(range_helper.count("Invoke-OpenAiProbeProcess"), 1)
+
+        helper_start = script.find("function Invoke-OpenAiPrefixBisect {")
+        self.assertNotEqual(helper_start, -1, "adaptive prefix bisect is missing")
+        helper_end = script.index("\n}\n", helper_start) + len("\n}\n")
+        helper = script[helper_start:helper_end]
+        for statement in (
+            "$expectedFastFailStatus = -1073740791",
+            '"--list-test-cases"',
+            "$fullPrefixResult.ExitCode -ne $expectedFastFailStatus",
+            "$shortPrefixResult.ExitCode -ne 0",
+            "$prefixResult.ExitCode -eq 0",
+            "$prefixResult.ExitCode -eq $expectedFastFailStatus",
+            "$predecessorResult.ExitCode -ne 0",
+            "$badPrefixResult.ExitCode -ne $expectedFastFailStatus",
+            "$isolatedResult.ExitCode -eq 0",
+            "$isolatedResult.ExitCode -eq $expectedFastFailStatus",
+            'dependency=$dependency',
+        ):
+            with self.subTest(statement=statement):
+                self.assertIn(statement, helper)
+        self.assertEqual(helper.count("Invoke-OpenAiPrefixRange"), 6)
+        self.assertIn("while ($high - $low -gt 1)", helper)
+        self.assertIn("[math]::Floor(($low + $high) / 2)", helper)
+
+        contract_start = script.find(
+            "function Invoke-OpenAiPrefixBisectContractTests {"
+        )
+        self.assertNotEqual(contract_start, -1, "prefix bisect contract is missing")
+        contract_end = script.index("\n}\n", contract_start) + len("\n}\n")
+        contract = script[contract_start:contract_end]
+        for guarantee in (
+            "$firstBad = 27",
+            "$testCount = 54",
+            '"--first=1"',
+            '"--last=26"',
+            '"--last=27"',
+            '"--first=27"',
+            '"OpenAI prefix bisect contract OK"',
+        ):
+            with self.subTest(guarantee=guarantee):
+                self.assertIn(guarantee, contract)
 
     def test_socket_teardown_probe_marks_each_owner_and_terminate_reason(self) -> None:
         main = (ROOT / "tests/doctest_main.cpp").read_text(encoding="utf-8")
@@ -335,6 +396,13 @@ class WindowsMetadataContract(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("Windows PowerShell/CRT contract tests OK", result.stdout)
+        self.assertIn(
+            'OpenAI prefix bisect: first_bad=27/54 test="case 27" '
+            'predecessor_status=0 prefix_status=-1073740791 isolated_status=0 '
+            'dependency=cumulative',
+            result.stdout,
+        )
+        self.assertIn("OpenAI prefix bisect contract OK", result.stdout)
         pid_diagnostic = re.search(
             r"(?m)^Invoke-Checked PID contract: parent=(?P<parent>[0-9]+) "
             r"failure_child=(?P<child>[0-9]+)\r?$",
