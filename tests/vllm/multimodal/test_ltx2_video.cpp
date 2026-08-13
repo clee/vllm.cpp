@@ -37,6 +37,7 @@
 #include "ltx2_video_fixture.h"
 #include "vllm/model_executor/model_loader/safetensors_reader.h"
 #include "vllm/model_executor/models/ltx2_loader.h"
+#include "vllm/model_executor/models/ltx2_text_encoder.h"
 #include "vllm/model_executor/models/ltx2_upsampler.h"
 #include "vllm/model_executor/models/ltx2_video_vae.h"
 #include "vllm.h"
@@ -406,17 +407,27 @@ TEST_CASE("ltx2 video: a prompt with no text tower is refused, never quietly ign
     CHECK(msg.find("text tower") != std::string::npos);
   }
 
-  // And supplying an encoder_path is refused at LOAD, where the caller can still
-  // act on it, rather than at every request.
+  // The engine loaded above has NO encoder, so `has_encoder()` says so and the
+  // refusal above is the whole behaviour. Phase L13 lifted the LOAD-time refusal
+  // of `encoder_path` itself — see "a typed PROMPT conditions the render" below.
+  CHECK_FALSE(engine->has_encoder());
+
+  // What is NOT lifted: an `encoder_path` that does not name a text encoder is
+  // still refused at LOAD, where the caller can still act on it, rather than at
+  // every request. The video VAE is a real safetensors file with none of the
+  // encoder's tensors in it.
   vllm::multimodal::VideoModelParams mp = FixtureParams(ws.paths);
-  mp.encoder_path = ws.paths.video_vae;  // any path: the refusal is unconditional
+  mp.encoder_path = ws.paths.video_vae;
+  mp.extras[vllm::multimodal::kLtx2EncoderConfigPathExtra] = ws.paths.encoder_config;
   try {
     (void)vllm::multimodal::LoadVideoEngine(mp);
-    FAIL("encoder_path must be refused while the Gemma-4 tower is owed");
+    FAIL("an encoder_path that is not a text encoder must be refused");
   } catch (const std::exception& e) {
     const std::string msg = e.what();
     INFO(msg);
-    CHECK(msg.find("Gemma-4") != std::string::npos);
+    // `Ltx2LoadGemmaAssets` keys the pack on `tokenizer_json`, which is the
+    // first thing a non-encoder file cannot produce.
+    CHECK(msg.find("tokenizer") != std::string::npos);
   }
 }
 
@@ -1342,5 +1353,272 @@ TEST_CASE("ltx2 video: the register boundary sits EXACTLY at the valid-row count
     vllm::multimodal::VideoModelParams first = half;
     first.prompt_embeds_path = perturb_rows("perturbed_first", 0, 1);
     CHECK(RenderBytes(first, ws.root + "/reg_first") != reference);
+  }
+}
+
+// ─── the prompt hop (phase L13) ─────────────────────────────────────────────
+//
+// WHAT THESE GATE, AND WHY THE INSTRUMENT IS WHAT IT IS.
+//
+// The claim is narrow and it is the whole point of the phase: a TYPED PROMPT
+// conditions the render. That is a DEPENDENCE claim — did these bytes come from
+// that string, through those weights — and not a quality claim, which nothing
+// here could support and nothing here asserts.
+//
+// The instrument is `Ltx2VideoEngine::last_conditioning()`: an FNV-1a digest and
+// an absmax over the exact f32 buffers `Ltx2ModalityInput::context` pointed at,
+// taken after the connector and immediately before the denoise loop. It is
+// chosen over a frame statistic deliberately, and the campaign already paid for
+// the lesson: L9c's reviewer found that a scene and a colour field were
+// INDISTINGUISHABLE to the existing frame analyzer (neighbour |dx|/sd 0.093 vs
+// 0.033, block-mean ratios nearly identical) and needed contact sheets to be
+// told apart. A digest cannot have that blind spot, because it is a function of
+// the bytes themselves rather than a summary of them: any change to any element
+// changes it, and no plausible-looking wrong tensor can satisfy it by accident.
+//
+// The absmax is the companion the digest needs. Two prompts whose conditioning
+// both collapsed to zeros would have EQUAL digests and RED the dependence check
+// — but for the wrong reason, and `video_absmax > 0` is what separates "the
+// tower ran" from "the tower returned nothing".
+//
+// The frame-byte comparison is then the second half: the digest says the
+// conditioning depends on the prompt, and the frames say the conditioning
+// reaches the render.
+
+namespace {
+
+// The fixture pointed at its own text tower. `max_phase = 0` for the same reason
+// `RenderBytes` gives: phase 1 needs the latent upsampler and running without one
+// is a refusal, while phase 0 already carries the conditioning through
+// cross-attention in every block.
+vllm::multimodal::VideoModelParams EncoderParams(const ltx2_fixture::Paths& paths) {
+  vllm::multimodal::VideoModelParams mp;
+  mp.dit_path = paths.dit;
+  mp.video_vae_path = paths.video_vae;
+  mp.audio_vae_path = paths.audio_vae;
+  mp.encoder_path = paths.encoder;
+  mp.extras[vllm::multimodal::kLtx2EncoderConfigPathExtra] = paths.encoder_config;
+  mp.extras[vllm::multimodal::kLtx2MaxPhaseExtra] = "0";
+  mp.device = 0;
+  return mp;
+}
+
+vllm::multimodal::VideoGenParams PromptedGen(const std::string& out_dir,
+                                             const std::string& prompt) {
+  vllm::multimodal::VideoGenParams gen = FixtureGen(out_dir);
+  gen.prompt = prompt;
+  return gen;
+}
+
+// One prompted render, returning both halves of the evidence: what the DiT was
+// conditioned on, and what came out.
+struct Rendered {
+  vllm::multimodal::Ltx2ConditioningTrace trace;
+  std::string bytes;
+};
+
+Rendered RenderPrompt(const vllm::multimodal::VideoModelParams& mp, const std::string& out_dir,
+                      const std::string& prompt) {
+  const std::unique_ptr<vllm::multimodal::VideoEngine> engine =
+      vllm::multimodal::LoadVideoEngine(mp);
+  REQUIRE(engine != nullptr);
+  const vllm::multimodal::VideoResult result = engine->Generate(PromptedGen(out_dir, prompt));
+  Rendered out;
+  // The trace is read off the ENGINE, not re-derived: a test that recomputed the
+  // conditioning from the same inputs would prove its own arithmetic and say
+  // nothing about what the engine bound.
+  const auto* ltx = dynamic_cast<const vllm::multimodal::Ltx2VideoEngine*>(engine.get());
+  REQUIRE(ltx != nullptr);
+  out.trace = ltx->last_conditioning();
+  for (int64_t f = 0; f < result.frame_count; ++f) {
+    char name[64];
+    std::snprintf(name, sizeof(name), "/frame_%06lld.ppm", static_cast<long long>(f));
+    out.bytes += ReadAll(out_dir + name);
+  }
+  out.bytes += ReadAll(result.audio_path);
+  return out;
+}
+
+}  // namespace
+
+TEST_CASE("ltx2 video: a typed PROMPT conditions the render") {
+  Workspace ws;
+  const vllm::multimodal::VideoModelParams mp = EncoderParams(ws.paths);
+  const vllm::Ltx2DitParams dit = ltx2_fixture::ReducedDitParams();
+
+  {
+    const std::unique_ptr<vllm::multimodal::VideoEngine> engine =
+        vllm::multimodal::LoadVideoEngine(mp);
+    REQUIRE(engine != nullptr);
+    // The seam's own flag. Before L13 this was false BY DECLARATION even though
+    // the tower ran, because its output could not reach the DiT.
+    CHECK(engine->has_encoder());
+    // ...and no prompt-embeds file was supplied, so the conditioning below
+    // cannot be coming from one.
+    CHECK_FALSE(engine->has_prompt_embeds());
+  }
+
+  const Rendered fox = RenderPrompt(mp, ws.root + "/p_fox", "a b c");
+  const Rendered whale = RenderPrompt(mp, ws.root + "/p_whale", "c a b a");
+
+  // 1. THE TOWER RAN, on the request's own string.
+  CHECK(fox.trace.from_prompt);
+  CHECK(fox.trace.prompt == "a b c");
+  // 2. THE GEOMETRY IS UPSTREAM'S. Every prompt is padded to
+  //    TOKENIZER_MAX_LENGTH (gemma_assets.py:162) and the DiT cross-attends over
+  //    the full padded width, at the two stream widths its config declares.
+  CHECK(fox.trace.tokens == vllm::kLtx2GemmaTokenizerMaxLength);
+  CHECK(fox.trace.video_width == dit.cross_attention_dim);
+  CHECK(fox.trace.audio_width == dit.audio_cross_attention_dim);
+  // 3. IT IS NOT ZEROS. Without this the dependence check below would pass for a
+  //    tower that returned nothing at all.
+  CHECK(fox.trace.video_absmax > 1e-6);
+  CHECK(fox.trace.audio_absmax > 1e-6);
+
+  // 4. THE CONDITIONING DEPENDS ON THE PROMPT — both streams, because LTX-2.5
+  //    conditions two and one of them silently constant is a soundtrack that
+  //    ignores the caption.
+  CHECK(whale.trace.tokens == fox.trace.tokens);
+  CHECK(whale.trace.video_digest != fox.trace.video_digest);
+  CHECK(whale.trace.audio_digest != fox.trace.audio_digest);
+
+  // 5. AND IT REACHES THE RENDER. The digests could differ while the frames did
+  //    not, if the conditioning were computed and then dropped — which is
+  //    precisely the shape of every bug this campaign has hit on this path.
+  CHECK(fox.bytes.size() == whale.bytes.size());
+  CHECK(fox.bytes != whale.bytes);
+
+  // 6. AND IT IS DETERMINISTIC, which is what makes 4 and 5 statements about the
+  //    prompt rather than about noise.
+  const Rendered again = RenderPrompt(mp, ws.root + "/p_fox2", "a b c");
+  CHECK(again.trace.video_digest == fox.trace.video_digest);
+  CHECK(again.trace.audio_digest == fox.trace.audio_digest);
+  CHECK(again.bytes == fox.bytes);
+}
+
+TEST_CASE("ltx2 video: the prompt's conditioning goes through the CONNECTOR") {
+  // The prompt path is a DIFFERENT caller of `RunConnector` from the
+  // prompt-embeds path, so "the connector is wired" proved for one proves
+  // nothing about the other. A second DiT, byte-identical except that its
+  // connector's parameter stream is seeded differently, is what separates
+  // "the projections went straight to cross-attention" from "they went through
+  // the checkpoint's own Embeddings1DConnector".
+  Workspace ws;
+  const vllm::Ltx2DitParams dit = ltx2_fixture::ReducedDitParams();
+  ltx2_fixture::ReducedDitOptions other;
+  other.connector.tag = "b";
+  const std::string other_dit = ws.root + "/dit_connector_b.safetensors";
+  ltx2_fixture::WriteReducedDit(dit, other_dit, other);
+
+  const vllm::multimodal::VideoModelParams a = EncoderParams(ws.paths);
+  vllm::multimodal::VideoModelParams b = a;
+  b.dit_path = other_dit;
+
+  const Rendered ra = RenderPrompt(a, ws.root + "/pc_a", "a b c");
+  const Rendered rb = RenderPrompt(b, ws.root + "/pc_b", "a b c");
+  // Same prompt, same tower, same DiT weights — only the connector differs. If
+  // the prompt path skipped the connector these would be EQUAL.
+  CHECK(ra.trace.video_digest != rb.trace.video_digest);
+  CHECK(ra.trace.audio_digest != rb.trace.audio_digest);
+  CHECK(ra.bytes != rb.bytes);
+}
+
+TEST_CASE("ltx2 video: the prompt's conditioning READS the text TOWER's weights") {
+  // The twin of the case above, one level up: a second text encoder whose tower
+  // and projections come from a different parameter stream, at identical shapes
+  // and with an identical tokenizer. A conditioning that ignored the tower —
+  // returning, say, the projection of a constant — would be equal here.
+  Workspace ws;
+  const vllm::Ltx2DitParams dit = ltx2_fixture::ReducedDitParams();
+  ltx2_fixture::ReducedTextEncoderOptions other;
+  other.tag = "b";
+  const std::string other_encoder = ws.root + "/text_encoder_b.safetensors";
+  ltx2_fixture::WriteReducedTextEncoder(dit, other_encoder, other);
+
+  const vllm::multimodal::VideoModelParams a = EncoderParams(ws.paths);
+  vllm::multimodal::VideoModelParams b = a;
+  b.encoder_path = other_encoder;
+
+  const Rendered ra = RenderPrompt(a, ws.root + "/pt_a", "a b c");
+  const Rendered rb = RenderPrompt(b, ws.root + "/pt_b", "a b c");
+  CHECK(ra.trace.tokens == rb.trace.tokens);
+  CHECK(ra.trace.video_digest != rb.trace.video_digest);
+  CHECK(ra.trace.audio_digest != rb.trace.audio_digest);
+  CHECK(ra.bytes != rb.bytes);
+}
+
+TEST_CASE("ltx2 video: the Gemma config is never defaulted") {
+  Workspace ws;
+
+  SUBCASE("an encoder that declares none, with no extra, is refused BY NAME") {
+    vllm::multimodal::VideoModelParams mp = EncoderParams(ws.paths);
+    mp.extras.erase(vllm::multimodal::kLtx2EncoderConfigPathExtra);
+    const std::string msg = RefusalOf(mp);
+    INFO(msg);
+    REQUIRE(!msg.empty());
+    // MEASURED WHILE MUTATING THIS CASE, and worth stating because it is the
+    // failure mode this whole campaign keeps hitting: an earlier version of this
+    // SUBCASE asserted only that the message named `encoder_config_path`, and
+    // deleting the refusal left it GREEN — the load still failed, but with
+    // "encoder_config_path: cannot open " from a fallthrough that tried to read
+    // the empty path. A refusal that fires for the wrong reason is exactly what
+    // this phase exists to stop shipping, and an assertion that cannot tell the
+    // two apart is not a gate. So the two clauses below are the DISCRIMINATING
+    // ones: the fallthrough message contains neither.
+    CHECK(msg.find("declares no") != std::string::npos);
+    CHECK(msg.find("layer_types") != std::string::npos);
+  }
+
+  SUBCASE("an encoder that DOES declare one, plus the extra, is refused too") {
+    // Never resolved in either direction — the two could describe different
+    // towers and there is no way to tell which the tensors belong to.
+    ltx2_fixture::ReducedTextEncoderOptions declaring;
+    declaring.declare_gemma_config = true;
+    const std::string path = ws.root + "/text_encoder_declaring.safetensors";
+    ltx2_fixture::WriteReducedTextEncoder(ltx2_fixture::ReducedDitParams(), path, declaring);
+    vllm::multimodal::VideoModelParams mp = EncoderParams(ws.paths);
+    mp.encoder_path = path;
+    const std::string msg = RefusalOf(mp);
+    INFO(msg);
+    REQUIRE(!msg.empty());
+    CHECK(msg.find("gemma_config") != std::string::npos);
+  }
+
+  SUBCASE("an encoder that declares one needs no extra") {
+    ltx2_fixture::ReducedTextEncoderOptions declaring;
+    declaring.declare_gemma_config = true;
+    const std::string path = ws.root + "/text_encoder_declaring2.safetensors";
+    ltx2_fixture::WriteReducedTextEncoder(ltx2_fixture::ReducedDitParams(), path, declaring);
+    vllm::multimodal::VideoModelParams mp = EncoderParams(ws.paths);
+    mp.encoder_path = path;
+    mp.extras.erase(vllm::multimodal::kLtx2EncoderConfigPathExtra);
+    CHECK(RefusalOf(mp).empty());
+  }
+
+  SUBCASE("the extra with no encoder_path at all is refused, not ignored") {
+    vllm::multimodal::VideoModelParams mp = FixtureParams(ws.paths);
+    mp.extras[vllm::multimodal::kLtx2EncoderConfigPathExtra] = ws.paths.encoder_config;
+    const std::string msg = RefusalOf(mp);
+    INFO(msg);
+    REQUIRE(!msg.empty());
+    CHECK(msg.find("no encoder_path") != std::string::npos);
+  }
+}
+
+TEST_CASE("ltx2 video: a tower with no prompt and no embeds is refused") {
+  // The seam admits both conditioning sources, so a request that supplies
+  // NEITHER must say so rather than render an unconditioned clip — which is
+  // exactly what "the tower is not working" looks like from the outside.
+  Workspace ws;
+  const std::unique_ptr<vllm::multimodal::VideoEngine> engine =
+      vllm::multimodal::LoadVideoEngine(EncoderParams(ws.paths));
+  REQUIRE(engine != nullptr);
+  try {
+    (void)engine->Generate(FixtureGen(ws.root + "/no_prompt"));
+    FAIL("a request with no prompt and no embeds must be refused");
+  } catch (const std::exception& e) {
+    const std::string msg = e.what();
+    INFO(msg);
+    CHECK(msg.find("no prompt") != std::string::npos);
   }
 }

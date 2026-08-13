@@ -320,12 +320,22 @@ struct Ltx2TextConditioning {
 
 // embeddings_processor.py:70-117, minus the two connector calls.
 //
-// OWED, and recorded here rather than discovered later: `Embeddings1DConnector`
-// (embeddings_connector.py:74-191) is NOT ported. It is built out of the DiT's
-// own `Attention`, `FeedForward` and RoPE (embeddings_connector.py:4-11), which
-// phase L2 owns, so it belongs to the change that can link against them. Until
-// then this function stops at the connector's INPUT contract, which is what it
-// gates.
+// WHERE THE CONNECTOR IS, corrected 2026-08-13. This note used to say
+// `Embeddings1DConnector` (embeddings_connector.py:74-191) was NOT ported and
+// that this function therefore stopped at its INPUT contract. Phase L5 ported it
+// (`Ltx2ConnectorForward`, ltx2_connector.h), phase L9c put it on the render
+// path with the checkpoint's own weights, and phase L13 runs this function's
+// output through it per request. The stopping point is unchanged — this is still
+// the processor MINUS the connector calls — but "the connector does not exist"
+// was true only until L5, and a stale owed-note is how a later refusal came to
+// cite a missing piece that had landed.
+//
+// ONE OVERLAP A CALLER MUST KNOW ABOUT. `Ltx2ConnectorCreateEmbeddings` is the
+// OTHER port of embeddings_processor.py:23-43 and carries the right-pad sort
+// too, so feeding this function's output into it sorts an already-sorted stream.
+// That composes to the identity — a stable descending argsort of a 0/1 key is
+// idempotent — and `Ltx2VideoEngine::Generate` asserts the precondition rather
+// than assuming it.
 Ltx2TextConditioning Ltx2TextEncoderConditioning(
     const Ltx2TextHiddenStates& states, const int32_t* mask,
     const Ltx2TextEncoderWeights& weights, const Ltx2TextFeatureConfig& config,

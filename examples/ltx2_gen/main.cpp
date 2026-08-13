@@ -18,13 +18,23 @@
 // noise stream, no schedule, no dtype choice — because all of that is the
 // library's and a second copy here would be a parallel path.
 //
-// CONDITIONING IS PROMPT-EMBEDS ONLY, and that is a stated limitation rather
-// than a design: the Gemma-4 12B text tower is owed (spec .agents/specs/ltx-2-5.md
-// §1.4), so `--prompt` does not exist here. The engine refuses a prompt by name
-// rather than rendering the supplied embeddings as though they were it. Both
-// streams are conditioned or neither: LTX-2.5 cross-attends at TWO widths
-// (4096 video, 2048 audio) and one of them alone leaves a stream unconditioned,
-// which renders instead of failing.
+// CONDITIONING HAS TWO SOURCES, and as of phase L13 the first of them is a
+// typed prompt. `--encoder` names the Gemma-4 12B text tower and `--prompt`
+// carries the words; the tower tokenizes them with its OWN embedded tokenizer,
+// runs, projects all 49 hidden states to the two stream widths and hands the
+// result to the embeddings connector and then to cross-attention. Before L13
+// the tower had no route to the DiT and `--prompt` did not exist here at all.
+//
+// `--prompt-embeds` + `--audio-prompt-embeds` remain, and remain the only
+// conditioning without a tower. Both streams are conditioned or neither:
+// LTX-2.5 cross-attends at TWO widths (4096 video, 2048 audio) and one of them
+// alone leaves a stream unconditioned, which renders instead of failing.
+//
+// `--encoder-config` is not optional paperwork. The only shipped LTX-2.5 text
+// encoder carries no `__metadata__` at all, so its Gemma config cannot come out
+// of the file; the engine refuses rather than defaulting one, because
+// `layer_types`, `global_head_dim` and `attention_k_eq_v` resolve a DIFFERENT
+// tower out of a byte-identical tensor set.
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -78,8 +88,11 @@ const char* Need(int argc, char** argv, int i, const char* flag) {
   std::fprintf(
       stderr,
       "usage: ltx2-gen --dit <transformer.safetensors> --video-vae <f> --audio-vae <f>\n"
-      "                --prompt-embeds <video.f32.bin> --audio-prompt-embeds <audio.f32.bin>\n"
+      "                (--encoder <gemma4-te.safetensors> --prompt \"...\"\n"
+      "                 | --prompt-embeds <video.f32.bin> --audio-prompt-embeds <audio.f32.bin>)\n"
       "                --workdir DIR [--out <out.mp4>] [--ffmpeg PATH]\n"
+      "                [--encoder-config <gemma_config.json>]     REQUIRED when the text\n"
+      "                                                           encoder carries no metadata\n"
       "                [--dit-config <transformer-config.json>]   REQUIRED when the DiT\n"
       "                                                           carries no __metadata__\n"
       "                [--model-version 2.5] [--pipeline-kind distilled_two_stage]\n"
@@ -89,11 +102,19 @@ const char* Need(int argc, char** argv, int i, const char* flag) {
       "                [--frames N] [--width N] [--height N] [--seed N]\n"
       "                [--device cpu|cuda]\n\n"
       "Renders LTX-2.5 (family \"ltx-2.5\") through vllm_video_engine_load +\n"
-      "vllm_video_generate. Conditioning is PROMPT-EMBEDS: both files are rows of\n"
+      "vllm_video_generate.\n\n"
+      "CONDITIONING, two ways. With --encoder the Gemma-4 12B text tower is loaded and\n"
+      "--prompt is tokenized by the tower's OWN embedded tokenizer, run, projected to\n"
+      "the two stream widths and passed through the embeddings connector. The tower is\n"
+      "~24 GB of host bf16 and stays resident, because a prompt arrives per request.\n"
+      "--encoder-config supplies the Gemma config when the encoder declares none, which\n"
+      "the only shipped one does not; without either the load is refused rather than\n"
+      "defaulted, since the config decides which layers are full-attention and a wrong\n"
+      "one resolves a different tower from the same tensors.\n\n"
+      "Without --encoder, conditioning is PROMPT-EMBEDS: both files are rows of\n"
       "little-endian f32, the video one 4096 wide and the audio one 2048, with the\n"
-      "SAME row count. There is no --prompt: the Gemma-4 text tower is not ported and\n"
-      "the engine refuses a prompt rather than silently rendering these embeddings\n"
-      "as if they were it.\n\n"
+      "SAME row count. Passing --prompt without --encoder is refused rather than\n"
+      "silently rendering those embeddings as if they were it.\n\n"
       "Those rows are the EMBEDDINGS CONNECTOR's input, not the DiT's: when the\n"
       "checkpoint carries the two *_embeddings_connector families (both shipped\n"
       "LTX-2.5 DiTs do) they run through it first, with the checkpoint's own\n"
@@ -110,6 +131,9 @@ int main(int argc, char** argv) {
   vllm_video_model_params mp = vllm_video_model_params_default();
   vllm_video_params vp = vllm_video_params_default();
   std::string workdir = "/tmp/ltx2_gen", out_path, ffmpeg = "ffmpeg", device = "cuda";
+  // BORROWED by `vllm_video_generate`, like the extras below, so it is owned
+  // here and pointed at only after parsing.
+  std::string prompt;
 
   // The extras are BORROWED by the load call, so the strings must outlive it.
   // Kept as two parallel vectors of owned strings plus the char* views the ABI
@@ -133,6 +157,10 @@ int main(int argc, char** argv) {
     else if (f == "--video-vae-config") mp.video_vae_config_path = Need(argc, argv, ++i, f.c_str());
     else if (f == "--audio-vae") mp.audio_vae_path = Need(argc, argv, ++i, "--audio-vae");
     else if (f == "--audio-vae-config") mp.audio_vae_config_path = Need(argc, argv, ++i, f.c_str());
+    else if (f == "--encoder") mp.encoder_path = Need(argc, argv, ++i, "--encoder");
+    else if (f == "--encoder-config")
+      SetExtra("encoder_config_path", Need(argc, argv, ++i, f.c_str()));
+    else if (f == "--prompt") prompt = Need(argc, argv, ++i, "--prompt");
     else if (f == "--prompt-embeds") mp.prompt_embeds_path = Need(argc, argv, ++i, f.c_str());
     else if (f == "--audio-prompt-embeds")
       SetExtra("audio_prompt_embeds_path", Need(argc, argv, ++i, f.c_str()));
@@ -174,6 +202,7 @@ int main(int argc, char** argv) {
   // about the two files rather than about what a detector happened to claim.
   mp.family = "ltx-2.5";
   vp.output_dir = workdir.c_str();
+  if (!prompt.empty()) vp.prompt = prompt.c_str();
 
   std::vector<const char*> keys, values;
   keys.reserve(extra_keys.size());

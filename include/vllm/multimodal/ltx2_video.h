@@ -31,6 +31,11 @@
 //
 // ─── WHAT THIS ENGINE REFUSES, AND WHY EACH WOULD RENDER ────────────────────
 //
+// Two of the three below are refusals that STAND. Item 2 is a refusal that was
+// LIFTED, and it is kept in this list rather than deleted because the interesting
+// thing about it is its history: it is the one whose stated reason went stale
+// twice, which is this campaign's recurring defect and worth leaving legible.
+//
 // 1. `device = 1` (CUDA) WITHOUT A CUDA BACKEND. Phase L7 refused every non-zero
 //    device outright: L2's forward was f32-only by declaration and L6's
 //    `Ltx2StreamDitToDevice` stages bf16 and refuses to widen, so no combination
@@ -44,36 +49,49 @@
 //    CPU forward behind a CUDA-looking handle, because that substitution is what
 //    would make every later timing and every "it ran on the GPU" claim false.
 //
-// 2. A PROMPT, whose refusal has MOVED and is stated where it now lives.
-//    Phase L10 built the text tower: the embedded tokenizer reaches a prompt
-//    string, the torchao-NVFP4 Gemma-4 tower is materialized onto Gemma4Weights,
-//    it runs, all 49 hidden states come out within the oracle's own bf16 noise
-//    floor, and the aggregation and both caption projections turn them into the
-//    4096-wide video and 2048-wide audio conditioning streams
-//    (`Ltx2EncodePromptToConditioning`).
+// 2. A PROMPT — NO LONGER REFUSED. Phase L13 closed the last hop, and what
+//    follows is the record of what each phase actually contributed, because
+//    this refusal went stale TWICE before it went away and a reader deserves to
+//    be able to re-check the reason rather than trust it.
 //
-//    What is missing is the last hop. Upstream does not hand the projections to
-//    cross-attention: each stream goes through an `Embeddings1DConnector` first
-//    (embeddings_processor.py:70-117). Its math IS ported
-//    (`Ltx2ConnectorForward`); its WEIGHTS are not loaded — they ship inside the
-//    DiT file as `video_embeddings_connector.*` / `audio_embeddings_connector.*`
-//    and remain among the modules `Ltx2LoadDitFromSafetensors` refuses
-//    (ltx2_loader.h:96-99).
+//    L10 made the tower RUN: the embedded tokenizer reaches a prompt string
+//    (`Ltx2TokenizeGemmaPrompt`, token-exact against HuggingFace on the shipped
+//    262144-entry vocab), the torchao-NVFP4 Gemma-4 tower materializes onto
+//    `Gemma4Weights` (`Ltx2LoadGemmaTowerFromSafetensors`), it produces all 49
+//    hidden states within the oracle's own bf16 noise floor, and the aggregation
+//    and both caption projections turn those into the 4096-wide video and
+//    2048-wide audio conditioning streams (`Ltx2EncodePromptToConditioning`).
 //
-//    So `has_encoder()` is STILL false, and deliberately: the tower runs, but its
-//    output cannot reach the DiT, and a `true` here would promise a render that
-//    conditioning cannot complete. Flipping it is one change away — bind those
-//    tensors — and that change owns the flag. Conditioning meanwhile comes from
-//    prompt-embeds, the seam's own documented fallback (video_engine.h:55-57).
+//    L9c put the `Embeddings1DConnector` on the render path with the
+//    checkpoint's OWN weights (`Ltx2LoadConnectorWeights`), which is where
+//    upstream puts it too: `EmbeddingsProcessor` runs an 8-layer 1-D transformer
+//    over the caption projections before the DiT sees them
+//    (embeddings_processor.py:70-117), and that module ships INSIDE THE DiT FILE
+//    as `video_embeddings_connector.*` / `audio_embeddings_connector.*`.
 //
-//    WHAT PHASE L9c CHANGED, AND WHAT IT DID NOT. The link BELOW the tower is now
-//    real: when the checkpoint carries the two `*_embeddings_connector` families
-//    — both shipped LTX-2.5 DiTs do, 129 tensors each — the supplied prompt
-//    embeds are run through the connector before the DiT sees them, with those
-//    weights, under the checkpoint's own `connector_*` configuration. Before
-//    L9c they went to cross-attention verbatim and the connector was reachable
-//    only from a test. The TOWER is still owed, so what enters the connector is
-//    still whatever the caller put in the file rather than an encoded prompt.
+//    The two landed on separate branches and could not see each other. L10's
+//    refusal said the connector's weights were "still among the modules
+//    `Ltx2LoadDitFromSafetensors` refuses", and by the time the branches met
+//    that was FALSE — `ltx2_loader.cpp:417` already recorded them as loaded
+//    elsewhere. So `has_encoder()` is now TRUE when `encoder_path` is supplied,
+//    and a request's own `prompt` is tokenized, encoded, projected, run through
+//    the connector and handed to cross-attention, per request.
+//
+//    WHAT THIS COSTS, stated rather than discovered: the tower is ~24 GB of host
+//    bf16 at the shipped 12B and it stays RESIDENT, because a prompt arrives per
+//    request. The connector weights do NOT stay resident — see the Impl comment
+//    in the .cpp; they are ~8 GB of f32 and are re-read from the still-present
+//    DiT file inside one scope per request, which keeps the steady state at the
+//    tower rather than at tower + connector.
+//
+//    WHAT IS STILL OWED, and it is a real gap rather than a formality: the
+//    shipped `vonkaiser` text encoder carries NO `__metadata__` at all, so the
+//    Gemma config is an INPUT. It comes from the checkpoint's own
+//    `__metadata__["gemma_config"]` when there is one and from the
+//    `encoder_config_path` extra when there is not, and an encoder with neither
+//    is REFUSED rather than given a default — the same polarity `dit_config_path`
+//    already has, and for the same reason: a wrong Gemma config resolves a
+//    DIFFERENT MODEL out of a byte-identical tensor set.
 //
 // 3. Any pipeline kind / model version the recipe table does not carry.
 //    `ResolveLtx2PipelineRecipe` already throws rather than defaulting
@@ -152,11 +170,17 @@ inline constexpr char kLtx2ModelVersionExtra[] = "model_version";
 // belonging to another checkpoint is refused rather than bound.
 inline constexpr char kLtx2DitConfigPathExtra[] = "dit_config_path";
 
-// Proceed past the module families the L2 contract does not carry
-// (`prompt_adaln_single`, `keyframes_abs_pos_embedding`, the two embeddings
-// connectors — ltx2_loader.h:82-104). "1" opts in; anything else leaves the
-// loader's refusal in place. The shipped DiTs all carry at least one of them, so
-// this is the flag that says "gate the ported subset knowingly".
+// Proceed past the module families the L2 contract does not carry —
+// `prompt_adaln_single` / `audio_prompt_adaln_single` and
+// `keyframes_abs_pos_embedding` (ltx2_loader.h). "1" opts in; anything else
+// leaves the loader's refusal in place. The shipped DiTs all carry at least one
+// of them, so this is the flag that says "gate the ported subset knowingly".
+//
+// The two `*_embeddings_connector` families are NOT in that set and this extra
+// has nothing to do with them: they are outside the DiT contract by design and
+// are materialized by `Ltx2LoadConnectorWeights`. An earlier revision of this
+// comment listed them here, which is the same stale claim `ltx2_loader.h`
+// carried and phase L10's refusal was built on.
 inline constexpr char kLtx2AllowUnportedExtra[] = "allow_unported_modules";
 
 // Run only the phases up to and including this index of the resolved recipe
@@ -178,6 +202,64 @@ inline constexpr char kLtx2MaxPhaseExtra[] = "max_phase";
 // and every register would go unused. Recorded as a knob rather than assumed,
 // and it is the field the Gemma-4 tower will supply when it lands.
 inline constexpr char kLtx2PromptValidRowsExtra[] = "prompt_embeds_valid_rows";
+
+// The Gemma-4 config for the tower `encoder_path` names, as a JSON FILE.
+//
+// MEASURED, and it is why this extra exists rather than being a convenience:
+// the only shipped LTX-2.5 text encoder, `vonkaiser`'s
+// `gemma4-12b-with-proj-nvfp4-torchao.safetensors`, has NO `__metadata__` block,
+// so upstream's own `GemmaAssets.from_single_file` raises on it before reading a
+// tensor (gemma_assets.py:110-114). The official bf16 encoder DOES carry one,
+// under `__metadata__["gemma_config"]`, and that is preferred when present.
+//
+// What a default would get wrong is not a detail. `layer_types` decides which
+// layers are full vs sliding and the two have DIFFERENT geometry;
+// `global_head_dim` is 512 against `head_dim` 256; `num_global_key_value_heads`
+// is ONE against 8; `attention_k_eq_v` is true, so the full layers ship no
+// `v_proj` at all. Each of those moves every hidden state while leaving the
+// tensor set byte-identical — a wrong config resolves a DIFFERENT MODEL out of
+// the same file and nothing downstream can tell. So an encoder with neither
+// source is refused, exactly as `dit_config_path`'s case is.
+//
+// Supplying BOTH a declaring checkpoint and this extra is refused rather than
+// resolved in either direction, for the same reason.
+inline constexpr char kLtx2EncoderConfigPathExtra[] = "encoder_config_path";
+
+// WHAT THE LAST `Generate()` ACTUALLY HANDED THE DiT's CROSS-ATTENTION.
+//
+// Every field is read off the exact f32 buffers `Ltx2ModalityInput::context`
+// pointed at, after the connector and immediately before the denoise loop — not
+// re-derived from the inputs that produced them.
+//
+// WHY THIS EXISTS AS A SURFACE. Conditioning is the one thing about a render
+// that the render cannot be inspected for. This project has already been burned
+// on that exact point twice: L9c's reviewer found that the difference between a
+// scene and a colour field was INVISIBLE to the frame analyzer (neighbour
+// |dx|/sd 0.093 vs 0.033, block-mean ratios nearly identical) and took contact
+// sheets to tell apart; and the campaign's standing lesson is that a golden
+// reduced to `isfinite` once hid a 23842x error. A digest over the bytes that
+// were actually fed is an instrument that cannot have that blind spot: it is a
+// function OF those bytes, so any change to any element changes it, and it
+// cannot be satisfied by a plausible-looking wrong tensor.
+//
+// It is not a quality claim and cannot become one. It answers "did this render
+// depend on this prompt, through these weights" and nothing else. A server also
+// has a use for it: "which conditioning produced this clip" is otherwise
+// unanswerable after the fact.
+struct Ltx2ConditioningTrace {
+  // True when the text tower encoded the request's own prompt; false when the
+  // conditioning came from `prompt_embeds_path`.
+  bool from_prompt = false;
+  std::string prompt;  // the exact string that was tokenized ("" for embeds)
+  int64_t tokens = 0;  // context rows the DiT cross-attends over
+  int64_t video_width = 0, audio_width = 0;
+  // FNV-1a over the raw little-endian f32 bytes of each stream.
+  uint64_t video_digest = 0, audio_digest = 0;
+  // max|x| per stream. A conditioning tensor that collapsed to zeros would give
+  // two prompts the SAME digest and RED any dependence check, but it would do so
+  // for the wrong reason; this says which happened.
+  double video_absmax = 0.0, audio_absmax = 0.0;
+};
 
 // A loaded LTX-2.5 checkpoint set. Construct through
 // `vllm::multimodal::LoadVideoEngine` (detection) or by declaring
@@ -213,6 +295,10 @@ class Ltx2VideoEngine : public VideoEngine {
   // own local copy proves nothing about what the engine bound; this accessor is
   // what lets it assert on the engine.
   const Ltx2DitParams& dit_params() const;
+
+  // The conditioning the LAST `Generate()` fed cross-attention. `tokens == 0`
+  // before the first generation. See `Ltx2ConditioningTrace`.
+  const Ltx2ConditioningTrace& last_conditioning() const;
 
  private:
   Ltx2VideoEngine();

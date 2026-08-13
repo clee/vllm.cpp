@@ -369,15 +369,35 @@ the audio VAE's is refused rather than resampled, since upstream uses a polyphas
 kaiser resampler this project does not carry. And a VAE configured with
 `latent_log_var: none` is refused, because upstream itself raises on it.
 
-**There is no prompt.** The Gemma-4 12B text tower is not ported, so nothing can
-turn words into the conditioning the caption projections consume. Conditioning
-comes from `--prompt-embeds` plus `--audio-prompt-embeds`: rows of
-little-endian f32, 4096 wide for the video stream and 2048 for the audio stream,
-with the same row count in both. Supplying a `--prompt` is refused, and supplying
-only one of the two files is refused, because a stream left unconditioned renders
-instead of failing.
+**A typed prompt works.** `--encoder` names the Gemma-4 12B text tower and
+`--prompt` carries the words. The tower tokenizes them with its OWN embedded
+tokenizer — the shipped encoder stores `tokenizer.json` as a TENSOR, so there is
+no sibling file to point at — runs, aggregates all 49 hidden states, projects
+them to 4096 and 2048, and passes both streams through the embeddings connector
+before cross-attention. The tower is ~24 GB of host bf16 and stays resident,
+because a prompt arrives per request.
 
-**Those rows go through the embeddings connector.** Both shipped LTX-2.5 DiTs
+`--encoder-config` supplies the Gemma config, and it is required for the only
+shipped encoder: `vonkaiser`'s
+`gemma4-12b-with-proj-nvfp4-torchao.safetensors` carries no `__metadata__` at
+all. An encoder that declares one (the official bf16 build does, under
+`__metadata__["gemma_config"]`) needs no flag, and supplying both is refused
+rather than resolved — `layer_types`, `global_head_dim`,
+`num_global_key_value_heads` and `attention_k_eq_v` each resolve a different
+tower out of a byte-identical tensor set.
+
+Without `--encoder`, conditioning comes from `--prompt-embeds` plus
+`--audio-prompt-embeds`: rows of little-endian f32, 4096 wide for the video
+stream and 2048 for the audio stream, with the same row count in both. A
+`--prompt` with no tower is refused, and supplying only one of the two files is
+refused, because a stream left unconditioned renders instead of failing.
+
+The text path runs on the CPU even when `--device cuda` puts the DiT on the GPU:
+everything in the text encoder is f32 by declaration and its device arm is owed.
+That is one host-side 12B forward over the prompt's own tokens per request,
+against a denoise loop of many 21B forwards.
+
+**Either source goes through the embeddings connector.** Both shipped LTX-2.5 DiTs
 carry two `*_embeddings_connector` families, 129 tensors each, and they are the
 8-layer 1-D transformer upstream runs between the caption projections and the
 DiT's cross-attention. The render applies it with the checkpoint's own weights,
@@ -387,6 +407,8 @@ register count (128 on the shipped files), and `--prompt-valid-rows N` says how
 many of those rows are real tokens. The rest are padding, and padding is not
 inert here: the connector REPLACES it with its learnable register table, so a
 run that leaves the default renders as if every supplied row were caption.
+`--prompt-valid-rows` applies to the embeds path only — with `--encoder` the
+tokenizer supplies the mask, which is what that flag exists to stand in for.
 
 **The DiT config is required when the checkpoint does not carry one.** The
 shipped `vonkaiser` FP8 transformer has no `__metadata__` at all, and the values
@@ -402,11 +424,15 @@ ltx2-gen --dit  ltx-2.5-22b-distilled-fp8.safetensors \
          --video-vae ltx-2.5-video-vae-conv-bf16.safetensors \
          --audio-vae ltx-2.5-audio-vae-bf16.safetensors \
          --upsampler ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors \
-         --prompt-embeds video_prompt_embeds.f32 \
-         --audio-prompt-embeds audio_prompt_embeds.f32 \
+         --encoder gemma4-12b-with-proj-nvfp4-torchao.safetensors \
+         --encoder-config ltx-2.5-gemma4-text-config.json \
+         --prompt "a red fox running through deep snow at sunrise" \
          --frames 25 --width 320 --height 192 --seed 20260812 \
          --device cuda --workdir /tmp/ltx25 --out /tmp/ltx25/video.mp4
 ```
+
+Swap the two `--encoder*` flags and `--prompt` for `--prompt-embeds` +
+`--audio-prompt-embeds` to condition from files instead.
 
 `--frames` must satisfy `(frames - 1) % 8 == 0` and width/height must divide by
 64 (32 for the VAE, twice that because the distilled recipe's first phase runs at
@@ -1374,7 +1400,9 @@ rather than falling back to detection, because a checkpoint handed to the wrong
 family does not fail, it renders noise.
 
 `--video-extra KEY=VALUE`, repeatable, carries a family's own load knobs. LTX-2.5
-cannot load without `dit_config_path` and `audio_prompt_embeds_path`; MiniMax-H3
+cannot load without `dit_config_path`, and it needs `encoder_config_path` beside
+`--video-encoder` when the text encoder declares no `gemma_config` (the shipped
+one does not); MiniMax-H3
 defines `partition`, for which `--video-partition` remains the documented alias.
 A bare `KEY` with no `=` is refused rather than read as an empty value, and a
 `--video-extra partition=X` contradicting `--video-partition Y` is refused rather
@@ -1388,9 +1416,9 @@ vllm-server --model /path/to/text-model \
   --video-dit ltx-2.5-22b-distilled-fp8.safetensors \
   --video-vae ltx-2.5-video-vae-conv-bf16.safetensors \
   --audio-vae ltx-2.5-audio-vae-bf16.safetensors \
-  --video-prompt-embeds video_prompt_embeds.f32 \
+  --video-encoder gemma4-12b-with-proj-nvfp4-torchao.safetensors \
+  --video-extra encoder_config_path=ltx-2.5-gemma4-text-config.json \
   --video-extra dit_config_path=ltx-2.5-transformer-config.json \
-  --video-extra audio_prompt_embeds_path=audio_prompt_embeds.f32 \
   --video-extra model_version=2.5 --video-extra allow_unported_modules=1
 ```
 
@@ -1516,9 +1544,11 @@ The LTX-2.5 arm runs on the CPU in f32 and on CUDA in bf16. `device = 0` takes
 the f32 parity forward; `device = 1` stages the DiT to the GPU one tensor at a
 time and runs the device-resident forward, so a CUDA handle means a CUDA forward.
 On a build with no CUDA backend, `device = 1` is refused by name rather than
-served the CPU forward behind a CUDA handle. It has no text tower yet, so
-`encoder_path` is refused and conditioning comes from the two prompt-embeds
-files, which must agree on their row count.
+served the CPU forward behind a CUDA handle. `encoder_path` loads the Gemma-4
+text tower, and the request's own `prompt` then conditions the render; the tower
+itself runs on the CPU in f32 whichever device the DiT is on. Without one,
+conditioning comes from the two prompt-embeds files, which must agree on their
+row count.
 
 `Sampler`'s `logprobs_mode` selects which tensor the returned logprobs are read
 from, and all four of vLLM's values now work: `raw_logprobs` (the default) and
