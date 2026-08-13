@@ -634,6 +634,27 @@ the diagnostic and add the smallest RED regression for the actual owner before
 changing production code. If the phase evidence does not distinguish an owner,
 stop and extend the spec rather than guessing.
 
+Hosted CPU run `31732971268` printed only
+`OPENAI_EXPLICIT_CPU_PHASE: before-loaded-engine` in both the isolated probe and
+the unchanged full-suite invocation, then terminated with `0xC0000409`. It did
+not print `after-loaded-engine`. This excludes the async serving stack,
+completion dispatch, response validation, and teardown, but it does not yet
+distinguish the three expressions in the construction statement: synthetic
+weight creation, tokenizer-fixture creation, and the `LoadedEngine` constructor
+itself. C++ does not impose a useful ordering between those argument
+evaluations, so their absence cannot identify which one terminated.
+
+The final diagnostic split keeps the same test and values but materializes the
+synthetic weights and tokenizer into named locals, with flushed witnesses before
+and after each factory and before and after `LoadedEngine` construction. It
+must move those locals into the constructor so ownership matches the original
+by-value call. No production source, timing, assertion, environment, or engine
+parameter may change. Hosted CPU and Vulkan must agree on the last completed
+factory/construction phase. If both factories complete and construction still
+fast-fails, stop and spec constructor-internal attribution rather than guessing;
+otherwise remove every prefix/phase diagnostic and write the smallest RED
+regression for the failing factory before repairing it.
+
 ### Current-main portability regression: issue #645
 
 Current `main` at `cefacd2d00cb9b4776331cd213116773cd97f811` added LTX2
