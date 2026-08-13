@@ -76,6 +76,49 @@ bool detail::ShouldUsePackedGdnDecode(
          e.num_actual_tokens == e.num_decode_tokens;
 }
 
+// PERF-27B-GDN-PACKED-REACHABLE (#365). Mirrors ProjectGdnQkvz's branch order:
+// the merged BF16 owner wins, then the native-FP8 owner, then the split BF16
+// owner. Order matters — a checkpoint that carries both owners projects through
+// the BF16 one, so predicting the FP8 dtype there would be wrong.
+vt::DType detail::GdnProjectedMixedQkvDType(const GdnMixedQkvDTypeInputs& in) {
+  if (in.has_bf16_qkvz_owner) return in.in_dtype;
+  // PERF-GDN-PACKED-BRIDGE (#365): only the MERGED fp8 arm can carry the
+  // narrowed epilogue dtype; the split arm hardcodes F32 (ProjectGdnQkvz).
+  if (in.has_fp8_qkv_owner)
+    return in.fp8_merged_arm ? in.fp8_out_dtype : vt::DType::kF32;
+  return in.in_dtype;
+}
+
+// PERF-GDN-PACKED-BRIDGE (#365). PERF-FP8-ALPHA-FOLD's three terms, verbatim,
+// in the ONE place both the producer and the predictor read. See the header for
+// why each term is required; the short version is that the toggle is the opt-in,
+// `indt` keeps VT_GDN_IN_BF16's rollback honest on this arm too, and `outdt`
+// confines the narrowing to the dense 27B.
+vt::DType detail::GdnFp8MergedMixedQkvDType(bool fp8_in_bf16_enabled,
+                                           vt::DType in_dtype,
+                                           vt::DType out_dtype) {
+  return (fp8_in_bf16_enabled && in_dtype == vt::DType::kBF16 &&
+          out_dtype == vt::DType::kBF16)
+             ? vt::DType::kBF16
+             : vt::DType::kF32;
+}
+
+// The dtype rule vt::GdnPackedDecode actually imposes (ops.cpp gdn_packed_decode
+// dtype checks), plus the model leg's BF16 pin. No term keys on weight storage.
+bool detail::GdnPackedDecodeDTypesCompatible(const GdnPackedDecodeDTypes& d) {
+  // Uniformity over the four activation tensors, pinned to BF16.
+  if (d.mixed_qkv != vt::DType::kBF16) return false;
+  if (d.ba_out != d.mixed_qkv || d.core_out != d.mixed_qkv) return false;
+  // The recurrent state is independent: any of the dtypes the caches can hold.
+  return d.ssm_state == vt::DType::kF32 || d.ssm_state == vt::DType::kF16 ||
+         d.ssm_state == vt::DType::kBF16;
+}
+
+// Default OFF: ON only for a '1'-leading value (vt::cuda::GdnPackedRegTileFlagIsOn).
+bool detail::PackedGdnDecodeFp8TowerFlagIsOn(const char* env_value) {
+  return env_value != nullptr && env_value[0] == '1';
+}
+
 bool detail::ShouldUseMergedGdnQkvz(const GdnMergedQkvzEligibility& e) {
   return e.runtime_enabled && e.cuda && e.has_packed_qkvz && e.uniform_dtype;
 }
@@ -424,6 +467,31 @@ void detail::ValidateGdnDecodeGraphState(
     const std::vector<GdnStateCache>& state_caches, int64_t real_batch) {
   VT_CHECK(real_batch > 0,
            "qwen3_5 decode graph: real batch must be positive");
+  // SPEC-DSPARK W8 (#442): a UNIFORM SPEC batch is capturable too. vLLM's
+  // captured decode length is `1 + num_speculative_tokens`
+  // (cudagraph_dispatcher.py:37), so its T=1+k verify is graphed by construction
+  // while ours was refused right here. The assertion is RE-EXPRESSED for that
+  // shape, never dropped: a spec batch is still required to be EXACT and pure
+  // (no prefill mixed in), with every token a spec token.
+  const bool spec_batch = metadata.num_spec_decodes > 0;
+  if (spec_batch) {
+    VT_CHECK(metadata.num_prefills == 0 && metadata.num_prefill_tokens == 0 &&
+                 metadata.num_decodes == 0 && metadata.num_decode_tokens == 0 &&
+                 metadata.num_spec_decode_tokens == real_batch &&
+                 metadata.num_actual_tokens == real_batch,
+             "qwen3_5 decode graph: a spec batch must be an exact PURE spec "
+             "decode (every token a spec token, no prefill)");
+    // Uniformity is what makes the shape a graph key: every request contributes
+    // the same 1+k query span, so real_batch == num_spec_decodes * (1+k).
+    VT_CHECK(metadata.num_spec_decodes > 0 &&
+                 real_batch % metadata.num_spec_decodes == 0,
+             "qwen3_5 decode graph: spec batch must be uniform across requests");
+    VT_CHECK(metadata.spec_state_indices_tensor.has_value(),
+             "qwen3_5 decode graph: missing GDN spec state indices");
+    VT_CHECK(!state_caches.empty(),
+             "qwen3_5 decode graph: missing GDN state caches");
+    return;
+  }
   VT_CHECK(metadata.num_prefills == 0 && metadata.num_prefill_tokens == 0 &&
                metadata.num_spec_decodes == 0 &&
                metadata.num_spec_decode_tokens == 0 &&
@@ -1553,11 +1621,19 @@ DBuf MergedFp8QkvD(Dev d, const Tensor& x, const Tensor* h_fp8,
     vt::QuantFp8Static(d.q, a_fp8_owner->t(), x, w.q_proj_fp8.input_scale);
     a_fp8_p = &a_fp8_owner->t();
   }
-  if (DenseCublasLtFp8Enabled())
-    vt::MatmulFp8CublasLt(d.q, out.t(), *a_fp8_p, qkv.packed, one);
-  else
+  // PERF-FP8-ALPHA-FOLD: same seam as the GDN qkvz merge above — the per-column
+  // alpha is expressed once and applied in the cuBLASLt epilogue when the arm is
+  // enabled and supported, else by the unchanged two-launch form. This site is
+  // default OFF (MergedFp8QkvEnabled), so nothing here moves a gate today; it is
+  // routed anyway so the seam has ONE per-column-alpha path rather than two, and
+  // so enabling the merge later cannot re-add 16 full-tensor passes per step
+  // (#402 §3 "D", which is sequenced after this row for exactly that reason).
+  if (DenseCublasLtFp8Enabled()) {
+    vt::MatmulFp8CublasLtAlphaVec(d.q, out.t(), *a_fp8_p, qkv.packed, qkv.alpha_vec);
+  } else {
     vt::MatmulFp8Cutlass(d.q, out.t(), *a_fp8_p, qkv.packed, one);
-  vt::MulColVecF32(d.q, out.t(), qkv.alpha_vec);
+    vt::MulColVecF32(d.q, out.t(), qkv.alpha_vec);
+  }
   return out;
 }
 
@@ -3048,9 +3124,10 @@ DType GdnActDType() {
 // activation buffers (mixed write+conv read, conv write+post-conv read) that
 // stayed f32 while the chunk trio was already bf16 (GdnActDType). The
 // l2norm/softplus math is f32-accumulated regardless (Load() upcasts); g/beta,
-// ssm_state, and the a/b GEMMs stay f32 (FLA's split). 27B-only by construction:
-// gated on the bf16-weight in_proj branch (the 27B's in_proj_qkv is a plain bf16
-// weight); the 35B's fp8-cutlass in_proj branch keeps its f32 output untouched.
+// ssm_state, and the a/b GEMMs stay f32 (FLA's split). Gated on the bf16-weight
+// in_proj branch (the 27B's in_proj_qkv is a plain bf16 weight); the fp8 in_proj
+// branch reaches it only under GdnFp8InBf16Enabled() below (#417), which is
+// default OFF, so an fp8 tower keeps its f32 output unless opted in.
 // MEASURED (27B, GB10, same-binary A/B): conv kernel -31.5%, post-conv -17.6%
 // (chunk trio FLAT — already bf16); e2e +0.68% (conc16, non-overlapping) / +0.83%
 // (conc32), TTFT -1.5%; token-exact (27B greedy paged-engine + 35B 16/16). The
@@ -3062,6 +3139,52 @@ DType GdnInDType() {
     return e == nullptr || e[0] != '0';
   }();
   return bf16 ? DType::kBF16 : DType::kF32;
+}
+
+// PERF-FP8-ALPHA-FOLD / issue #417 — make GdnInDType() REACHABLE on an fp8-tower
+// checkpoint (VT_GDN_FP8_IN_BF16, DEFAULT OFF).
+//
+// VT_GDN_IN_BF16 above is default ON with recorded conv -31.5% / post-conv
+// -17.6%, but it cannot fire on the ModelOpt FP8 GDN tower (the `nvidia` 27B is
+// `modelopt_mixed`, and the 35B shares the tower) because the merged fp8 in_proj
+// leaf hardcoded DType::kF32 for its output. `convdt = mixed.dtype` then carries
+// that f32 into the conv weight choice, the conv in/out buffer and the post-conv
+// read — the two largest GDN activation buffers, at 2x the bytes vLLM moves.
+//
+// That f32 is also what makes the per-column alpha pass cost what it does. The
+// merged [qkv;z] operand's shards carry DIFFERENT folded alphas on this
+// checkpoint (ResidentFp8Qkvz's `folded` is FALSE), so the alpha is applied by
+// vt::MulColVecF32 in a second full-tensor read-modify-write: MEASURED 122.99
+// ms/request over 48 calls at T=4096 prefill = 43.6% of the whole 27B prefill
+// deficit, at 209.5 GB/s = 77% of the GB10's 273.1 GB/s peak. It is
+// bandwidth-saturated, so its cost IS its width and a bf16 buffer halves it
+// (~61 ms/req, ~21.8% of the gap). All THREE cuBLASLt routes to ELIMINATING that
+// pass are measured unavailable on this hardware
+// (.agents/specs/perf-fp8-alpha-fold.md §Outcome); halving it depends on no
+// vendor capability whatsoever.
+//
+// vLLM emits BF16 here: ModelOptFp8LinearMethod applies with
+// out_dtype = torch.get_default_dtype() (vllm/model_executor/layers/quantization/
+// modelopt.py:458 @ the pin), and qwen_gdn_linear_attn.py:1285-1295 runs the
+// causal conv on that bf16 tensor. So this narrows TOWARD the oracle; our f32 is
+// the deviation, and it is the "too WIDE" kind a token-exactness gate cannot see
+// (.agents/porting.md, "Mirror the memory format, not just the math").
+//
+// It is NOT free, and that is why it is opt-in. Narrowing the GEMM's D rounds the
+// f32 accumulator to bf16 BEFORE the alpha multiply instead of after it, so
+// tokens CAN move. Both SACRED engine gates decide it, at their exact case AND
+// assertion counts; a lost token is NEEDS_DECISION, never a re-cut golden.
+//
+// f32-ONLY consumers are untouched: conv_state, g/beta, a_log/dt_bias, ssm_state
+// and the a/b GEMMs (FLA's split, ops.cpp gdn_g_beta). Only the STORE dtype
+// changes anywhere on this path — every kernel reads through Load(), which
+// upcasts to f32 before any arithmetic.
+bool GdnFp8InBf16Enabled() {
+  static const bool on = [] {
+    const char* e = std::getenv("VT_GDN_FP8_IN_BF16");
+    return e != nullptr && e[0] == '1';
+  }();
+  return on;
 }
 
 // GDN recurrence-OUTPUT + z-gate in bf16 (27B default ON; 35B keeps its former
@@ -3154,6 +3277,27 @@ bool PackedGdnDecodeRuntimeEnabled() {
     return e == nullptr || e[0] != '0';
   }();
   return enabled;
+}
+
+// PERF-27B-GDN-PACKED-REACHABLE (#365), DEFAULT OFF. Process-cached like every
+// sibling GDN toggle: a process is one arm, never a per-request mixture.
+bool PackedGdnDecodeFp8TowerEnabled() {
+  static const bool enabled = detail::PackedGdnDecodeFp8TowerFlagIsOn(
+      std::getenv("VT_GDN_PACKED_DECODE_FP8_TOWER"));
+  return enabled;
+}
+
+// PERF-27B-GDN-PACKED-REACHABLE (#365) — the SINGLE source for the dtype the
+// native-FP8 GDN input projection writes for `mixed_qkv`. `ProjectGdnQkvz` reads
+// it instead of hardcoding a literal, and the packed-decode eligibility reads it
+// to predict `mixed.dtype` before the projection has run, so the two cannot
+// drift. Today the fp8 cutlass epilogue always emits F32 (the merged arm's
+// `MergedFp8QkvzD` allocates F32 as well, VT_CHECKed at its call site). Making
+// it BF16 is PERF-27B-BF16-FP8-OUT / #339 (VT_BF16_GEMM_OUT_FP8); when that
+// lands, THIS function is the one line the two rows compose through, and the
+// packed path becomes eligible on the fp8 27B with no further change here.
+DType GdnFp8MergedInProjDType(DType indt, DType outdt) {
+  return detail::GdnFp8MergedMixedQkvDType(GdnFp8InBf16Enabled(), indt, outdt);
 }
 
 DBuf MatmulBTRawD(Dev d, const Tensor& x, const Tensor& weight,
@@ -3320,20 +3464,35 @@ Fp8QkvzDev ResidentFp8Qkvz(Dev d, const GdnLayerWeights& w) {
   return out;
 }
 
-// ONE fp8 GEMM over the N-concatenated [qkv;z] operand -> f32 [M, conv_dim +
+// ONE fp8 GEMM over the N-concatenated [qkv;z] operand -> `want` [M, conv_dim +
 // value_dim]. `h_fp8` is the shared pre-quantized activation (quantize-once)
 // when supplied, else the activation is quantized here with the shared
 // input_scale — the SAME activation bytes both split GEMMs would have read,
-// which is why one shared input_scale is a hard precondition. Output is f32 so
-// each column's alpha is applied by the same IEEE f32 multiply the folded-alpha
-// GEMM would apply, keeping the merged result identical to the concatenation of
-// the two split f32 GEMM outputs.
+// which is why one shared input_scale is a hard precondition.
+//
+// `want` is f32 (the shipped default) or bf16. At f32 each column's alpha is
+// applied by the same IEEE f32 multiply the folded-alpha GEMM would apply, so
+// the merged result is identical to the concatenation of the two split f32 GEMM
+// outputs — the #213 equivalence this leaf shipped with, unchanged.
+//
+// PERF-FP8-ALPHA-FOLD / #417: `want == kBF16` narrows the GEMM's D, which is the
+// ONLY remaining lever on the unfolded arm's per-column alpha pass — that pass is
+// a bandwidth-saturated full read-modify-write, so halving its width halves its
+// cost, and all three cuBLASLt routes to removing it outright are measured
+// unavailable on this hardware. It applies to BOTH arms uniformly and needs no
+// `folded` condition, because vt::MulColVecF32 now carries a bf16 store arm; the
+// alpha is still the same f32 multiply against the same f32 resident vector.
+// It is NOT byte-preserving — the accumulator is rounded to bf16 before the alpha
+// rather than after — so it is reached only through GdnFp8InBf16Enabled(), which
+// is DEFAULT OFF. Callers must read the returned buffer's dtype, never assume f32.
 DBuf MergedFp8QkvzD(Dev d, const Tensor& x, const Tensor* h_fp8,
-                    const GdnLayerWeights& w) {
+                    const GdnLayerWeights& w, DType want = DType::kF32) {
+  VT_CHECK(want == DType::kF32 || want == DType::kBF16,
+           "qwen3_5 merged FP8 GDN qkvz: output dtype must be f32 or bf16");
   Fp8QkvzDev qkvz = ResidentFp8Qkvz(d, w);
   const int64_t M = h_fp8 != nullptr ? h_fp8->shape[0] : x.shape[0];
   const int64_t total_n = qkvz.packed.shape[0];
-  DBuf out(d, DType::kF32, {M, total_n});
+  DBuf out(d, want, {M, total_n});
   const Tensor* a_fp8_p = h_fp8;
   std::optional<DBuf> a_fp8_owner;
   if (a_fp8_p == nullptr) {
@@ -3342,11 +3501,43 @@ DBuf MergedFp8QkvzD(Dev d, const Tensor& x, const Tensor* h_fp8,
     vt::QuantFp8Static(d.q, a_fp8_owner->t(), x, w.in_proj_qkv_fp8.input_scale);
     a_fp8_p = &a_fp8_owner->t();
   }
-  if (DenseCublasLtFp8Enabled())
-    vt::MatmulFp8CublasLt(d.q, out.t(), *a_fp8_p, qkvz.packed, qkvz.alpha);
-  else
+  // THIS is the call site that claims the splitK=1 premise, and the only one in
+  // the tree (#339, review finding F-A). `want == kBF16` here is reachable ONLY
+  // through GdnFp8InBf16Enabled() — the leaf above resolves `fp8_indt` to bf16
+  // under that toggle and nothing else — and that lever's whole argument is that
+  // its bf16 D is the f32 D narrowed at the STORE, nothing more. A split-K plan
+  // would silently make it a reduction-order change instead, which a bf16 store
+  // is very good at hiding from a token gate, so the op verifies it and refuses.
+  //
+  // The f32 arm passes false: it is the baseline the claim is made AGAINST, so
+  // it claims nothing. Neither does any other bf16-D fp8 GEMM in this file —
+  // o_proj_fp8 / out_proj_fp8 go through MatmulFp8Cutlass{,PreQuant}D at
+  // DType::kBF16 on a DEFAULT-ON path and simply want a bf16 output; split-K is
+  // correct for them and they are never checked.
+  const bool claims_splitk1 = want == DType::kBF16;
+  if (qkvz.folded) {
+    // One shared alpha: already a single GEMM scalar, nothing to apply after.
+    if (DenseCublasLtFp8Enabled())
+      vt::MatmulFp8CublasLt(d.q, out.t(), *a_fp8_p, qkvz.packed, qkvz.alpha, claims_splitk1);
+    else
+      vt::MatmulFp8Cutlass(d.q, out.t(), *a_fp8_p, qkvz.packed, qkvz.alpha);
+  } else if (DenseCublasLtFp8Enabled()) {
+    // PERF-FP8-ALPHA-FOLD: express the per-column alpha ONCE, at the seam. The
+    // op applies it in the cuBLASLt epilogue when VT_FP8_ALPHA_VEC_EPILOGUE=1
+    // and the selected algo supports the pointer mode, and otherwise runs the
+    // GEMM at alpha=1 plus vt::MulColVecF32 — byte for byte what this line pair
+    // did before. The model no longer owns that choice.
+    vt::MatmulFp8CublasLtAlphaVec(d.q, out.t(), *a_fp8_p, qkvz.packed, qkvz.alpha_vec,
+                                  claims_splitk1);
+  } else {
+    // CUTLASS arm (VT_DENSE_CUBLASLT_FP8=0): no epilogue alpha vector, so the
+    // two-launch form stays here verbatim. Both launches follow `out`'s dtype,
+    // so this arm narrows with `want` exactly as the cuBLASLt one does — and bf16
+    // is CUTLASS's NATIVE fp8 epilogue, so it also drops the bf16 scratch and the
+    // CastBf16ToF32 pass an f32 `out` costs here.
     vt::MatmulFp8Cutlass(d.q, out.t(), *a_fp8_p, qkvz.packed, qkvz.alpha);
-  if (!qkvz.folded) vt::MulColVecF32(d.q, out.t(), qkvz.alpha_vec);
+    vt::MulColVecF32(d.q, out.t(), qkvz.alpha_vec);
+  }
   return out;
 }
 
@@ -3414,31 +3605,72 @@ GdnQkvzOutput ProjectGdnQkvz(Dev d, const GdnLayerWeights& w, const Tensor& h,
     out.z = out.z_owner->t();
     return out;
   }
+  // PERF-FP8-ALPHA-FOLD / #417 — the output dtype of the merged fp8 in_proj leaf.
+  // vLLM's ModelOpt fp8 linear emits the model dtype (bf16); ours hardcoded f32,
+  // which is both what made GdnInDType() unreachable on an fp8 tower AND what
+  // makes the unfolded arm's per-column alpha pass cost twice what it needs to
+  // (see GdnFp8InBf16Enabled). All THREE conditions are required:
+  //   1. the opt-in toggle (default OFF; no measurement exists yet, and this
+  //      narrowing is not value-neutral),
+  //   2. indt == BF16, i.e. VT_GDN_IN_BF16 is on (its default) — this IS the
+  //      lever being unblocked, so honouring its rollback is mandatory,
+  //   3. outdt == BF16. This is what confines the change to the 27B: the 35B is
+  //      MoE, so GdnOutDType(dense_model=false) is f32 by default and this stays
+  //      inert there. It also keeps the whole chain dtype-uniform, which the
+  //      downstream contracts need — vt::RmsNormGatedQuantFp8 requires
+  //      gate.dtype == x.dtype (ops.cpp), and `z` below is exactly that gate.
+  // PERF-GDN-PACKED-BRIDGE (#365): PERF-FP8-ALPHA-FOLD's three-term decision,
+  // moved into the shared `GdnFp8MergedInProjDType` so the PRODUCER (this line,
+  // which reaches MergedFp8QkvzD and allocates the buffer) and the PREDICTOR
+  // (the packed-decode eligibility, which must answer BEFORE this runs because
+  // the decision feeds ProjectGdnBA) are literally the same call and cannot
+  // drift. The terms themselves are unchanged.
+  const DType fp8_indt = GdnFp8MergedInProjDType(indt, outdt);
   // PERF-27B-GDN-FP8-QKVZ — the native-FP8 owner's merged arm. ONE fp8 GEMM
   // over the N-concatenated [qkv;z] operand replaces the two below; `mixed_qkv`
   // and `z` become last-dim views of its output, exactly as in the BF16 leaf.
-  // The merged output is f32 — the dtype the split `mixed_qkv` GEMM already
-  // emits — so `mixed_qkv` is byte-identical. `z`'s split GEMM emits `outdt`;
-  // when that is not f32 the f32 view is cast, which rounds the SAME f32 product
-  // the split GEMM's epilogue would have rounded. Nothing about the split
-  // arithmetic changes, so this leaf is a pure launch/shape change.
+  // At the f32 default the merged output is f32 — the dtype the split
+  // `mixed_qkv` GEMM already emits — so `mixed_qkv` is byte-identical. `z`'s
+  // split GEMM emits `outdt`; when that is not f32 the f32 view is cast, which
+  // rounds the SAME f32 product the split GEMM's epilogue would have rounded.
+  // Nothing about the split arithmetic changes, so this leaf is a pure
+  // launch/shape change.
   if (!w.in_proj_qkv_fp8.Empty() &&
       detail::ShouldUseMergedGdnFp8Qkvz(
           GdnMergedFp8QkvzEligibilityFor(d, w, conv_dim, value_dim))) {
     if (g_gdn_fp8_inproj_debug_enabled.load(std::memory_order_acquire))
       g_gdn_fp8_inproj_merged.fetch_add(1, std::memory_order_relaxed);
-    out.packed_owner.emplace(MergedFp8QkvzD(d, h, h_fp8, w));
+    out.packed_owner.emplace(MergedFp8QkvzD(d, h, h_fp8, w, fp8_indt));
     Tensor packed = out.packed_owner->t();
+    // PERF-GDN-PACKED-BRIDGE (#365) -- the replacement anti-drift guard.
+    // The deleted one read `GdnFp8MixedQkvDType() == DType::kF32`: a property of
+    // the PREDICTOR against a literal, which cannot observe the producer and so
+    // passed unchanged once the merged arm began emitting bf16. This asserts the
+    // invariant that actually matters -- the dtype the eligibility PREDICTED
+    // equals the dtype this GEMM ALLOCATED -- read off the allocated buffer, so
+    // it fails whichever side moves.
+    VT_CHECK(packed.dtype == detail::GdnProjectedMixedQkvDType(
+                                 detail::GdnMixedQkvDTypeInputs{
+                                     !w.in_proj_qkvz.Empty(),
+                                     !w.in_proj_qkv_fp8.Empty(),
+                                     /*fp8_merged_arm=*/true, indt, fp8_indt}),
+             "qwen3_5 merged FP8 GDN qkvz: the allocated mixed_qkv dtype and the "
+             "packed-decode prediction disagree (GdnProjectedMixedQkvDType)");
     out.mixed = packed.Slice(1, 0, conv_dim);
-    Tensor z_f32 = packed.Slice(1, conv_dim, conv_dim + value_dim);
-    if (outdt == DType::kF32) {
-      out.z = z_f32;
+    Tensor z_raw = packed.Slice(1, conv_dim, conv_dim + value_dim);
+    // When the merged GEMM already emitted the z gate's dtype, the CastBf16 pass
+    // disappears with it (#417): the strided view IS the bf16 gate, and the
+    // gated-RMSNorm consumes a padded-row gate view natively (GdnGateView3, the
+    // z_strided path the f32 arm and the BF16-weight leaf already take). The
+    // f32-buffer arm below is the pre-existing behavior, unchanged.
+    if (z_raw.dtype == outdt) {
+      out.z = z_raw;
     } else {
-      VT_CHECK(outdt == DType::kBF16,
+      VT_CHECK(outdt == DType::kBF16 && z_raw.dtype == DType::kF32,
                "qwen3_5 merged FP8 GDN qkvz: unsupported z output dtype");
       out.z_owner.emplace(d, DType::kBF16,
                           std::vector<int64_t>{packed.shape[0], value_dim});
-      vt::CastBf16(d.q, out.z_owner->t(), z_f32);
+      vt::CastBf16(d.q, out.z_owner->t(), z_raw);
       out.z = out.z_owner->t();
     }
     return out;
@@ -3446,11 +3678,28 @@ GdnQkvzOutput ProjectGdnQkvz(Dev d, const GdnLayerWeights& w, const Tensor& h,
   if (!w.in_proj_qkv_fp8.Empty() &&
       g_gdn_fp8_inproj_debug_enabled.load(std::memory_order_acquire))
     g_gdn_fp8_inproj_split.fetch_add(2, std::memory_order_relaxed);
+  // PERF-GDN-PACKED-BRIDGE (#365): the SPLIT fp8 arm stays F32. VT_GDN_FP8_IN_BF16
+  // narrows the MERGED arm only (PERF-FP8-ALPHA-FOLD `fp8_indt`), so this literal
+  // is correct rather than a drift risk -- and the eligibility predicts exactly
+  // this, via GdnMixedQkvDTypeInputs::fp8_merged_arm == false. The guard below
+  // asserts the two agree, so if either side ever moves the build fails loudly.
+  const DType fp8_mixed_dt = DType::kF32;
+  // Same invariant on the other arm, and in the direction that matters here: a
+  // predictor that ever claimed BF16 for a split-arm layer would hand
+  // vt::GdnPackedDecode an f32 mixed_qkv against bf16 a/b/out and make it throw.
+  if (!w.in_proj_qkv_fp8.Empty())
+    VT_CHECK(fp8_mixed_dt == detail::GdnProjectedMixedQkvDType(
+                                 detail::GdnMixedQkvDTypeInputs{
+                                     !w.in_proj_qkvz.Empty(), true,
+                                     /*fp8_merged_arm=*/false, indt,
+                                     GdnFp8MergedInProjDType(indt, outdt)}),
+             "qwen3_5 split FP8 GDN qkv: the allocated mixed_qkv dtype and the "
+             "packed-decode prediction disagree (GdnProjectedMixedQkvDType)");
   out.mixed_owner.emplace(
       !w.in_proj_qkv_fp8.Empty()
           ? (h_fp8 ? MatmulFp8CutlassPreQuantD(d, *h_fp8, w.in_proj_qkv_fp8,
-                                               DType::kF32)
-                   : MatmulFp8CutlassD(d, h, w.in_proj_qkv_fp8, DType::kF32))
+                                               fp8_mixed_dt)
+                   : MatmulFp8CutlassD(d, h, w.in_proj_qkv_fp8, fp8_mixed_dt))
       : indt == DType::kBF16 ? MatmulBf16D(d, h, w.in_proj_qkv)
                              : MatmulF32D(d, h, w.in_proj_qkv));
   out.z_owner.emplace(
@@ -3502,8 +3751,9 @@ DBuf GdnBlock(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
   // cutlass fp8 (35B) when populated, else bf16 (default / GGUF). qkv/z read
   // the shared pre-quantized fp8 activation (h_fp8, quantize-once) when
   // supplied; a/b stay bf16 GEMMs on h (so h_fp8's producer also emits bf16 h
-  // for them). mixed_qkv: bf16 output under VT_GDN_IN_BF16 (27B bf16-weight
-  // branch); the fp8-cutlass branch (35B) keeps f32. See GdnInDType().
+  // for them). mixed_qkv: bf16 output under VT_GDN_IN_BF16 (bf16-weight branch),
+  // and on the merged fp8 branch too under VT_GDN_FP8_IN_BF16 (default OFF, see
+  // GdnFp8InBf16Enabled). See GdnInDType().
   const DType indt = GdnInDType();
   const DType outdt = GdnOutDType(cfg.num_experts == 0);
   GdnQkvzOutput qkvz =
@@ -4124,6 +4374,24 @@ DBuf GdnBlockPaged(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
 
   const DType indt = GdnInDType();
   const DType outdt = GdnOutDType(cfg.num_experts == 0);
+  // PERF-27B-GDN-PACKED-REACHABLE (#365). `dtype_compatible` is decided by the
+  // ACTIVATION dtypes vt::GdnPackedDecode requires, not by how the GDN weights
+  // are stored. `mixed_qkv` has to be PREDICTED because this decision runs
+  // before ProjectGdnQkvz (it feeds ProjectGdnBA's output dtype below).
+  const bool gdn_fp8_tower =
+      !w.in_proj_qkv_fp8.Empty() || !w.in_proj_z_fp8.Empty();
+  // PERF-GDN-PACKED-BRIDGE (#365): the arm term is the SAME predicate over the
+  // SAME inputs that ProjectGdnQkvz uses to choose the merged fp8 leaf, so the
+  // prediction cannot select a different arm than the projection does.
+  const bool gdn_fp8_merged_arm =
+      !w.in_proj_qkv_fp8.Empty() &&
+      detail::ShouldUseMergedGdnFp8Qkvz(
+          GdnMergedFp8QkvzEligibilityFor(d, w, conv_dim, value_dim));
+  const DType mixed_dt = detail::GdnProjectedMixedQkvDType(
+      detail::GdnMixedQkvDTypeInputs{!w.in_proj_qkvz.Empty(),
+                                     !w.in_proj_qkv_fp8.Empty(),
+                                     gdn_fp8_merged_arm, indt,
+                                     GdnFp8MergedInProjDType(indt, outdt)});
   const bool packed_decode = detail::ShouldUsePackedGdnDecode(
       detail::GdnPackedDecodeEligibility{
           PackedGdnDecodeRuntimeEnabled(),
@@ -4131,16 +4399,15 @@ DBuf GdnBlockPaged(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
           cfg.num_experts == 0,
           !w.in_proj_ba.Empty(),
           MergedGdnBaEnabled(d),
-          indt == DType::kBF16 && outdt == DType::kBF16 &&
-              MergedGdnBaOutputDType(true) == DType::kBF16 &&
-              // An FP8 GDN tower feeds fp8 projections that vt::GdnPackedDecode
-              // rejects ("mixed_qkv/a/b/out must share FP16/BF16/F32 dtype").
-              // The unpacked decode -- what the 35B fp8 path already runs --
-              // handles them, so an fp8 tower is NOT packed-decode eligible.
-              w.in_proj_qkv_fp8.Empty() && w.in_proj_z_fp8.Empty() &&
-              (state.ssm_state.dtype == DType::kF32 ||
-               state.ssm_state.dtype == DType::kF16 ||
-               state.ssm_state.dtype == DType::kBF16),
+          detail::GdnPackedDecodeDTypesCompatible(
+              detail::GdnPackedDecodeDTypes{mixed_dt,
+                                            MergedGdnBaOutputDType(true), outdt,
+                                            state.ssm_state.dtype}) &&
+              // VT_GDN_PACKED_DECODE_FP8_TOWER, DEFAULT OFF: the same-binary
+              // rollback of the relaxation. OFF reproduces the legacy blanket
+              // exclusion of an fp8 GDN tower exactly; ON lets the dtype rule
+              // above decide alone. Never deselects a non-fp8 checkpoint.
+              (!gdn_fp8_tower || PackedGdnDecodeFp8TowerEnabled()),
           sdi.has_gdn_idx,
           np,
           np_tok,
@@ -4169,9 +4436,10 @@ DBuf GdnBlockPaged(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
   // cutlass fp8 (35B) when populated, else bf16 (default / GGUF). qkv/z read
   // the shared pre-quantized fp8 activation (h_fp8, quantize-once) when
   // supplied; a/b stay bf16 GEMMs on h (so h_fp8's producer also emits bf16 h
-  // for them). mixed_qkv: bf16 output under VT_GDN_IN_BF16 (27B bf16-weight
-  // branch, halves the conv-input traffic); the fp8-cutlass branch (35B) keeps
-  // f32 (GdnInDType()). The z gate follows the recurrence-output dtype
+  // for them). mixed_qkv: bf16 output under VT_GDN_IN_BF16 (bf16-weight branch,
+  // halves the conv-input traffic); the merged fp8 branch reaches the same bf16
+  // output under VT_GDN_FP8_IN_BF16 (default OFF, GdnFp8InBf16Enabled) and keeps
+  // f32 otherwise. The z gate follows the recurrence-output dtype
   // (VT_GDN_OUT_BF16): the gated-RMSNorm requires gate.dtype == core.dtype.
   GdnQkvzOutput qkvz =
       ProjectGdnQkvz(d, w, h, conv_dim, value_dim, indt, outdt, h_fp8);
@@ -5493,6 +5761,36 @@ DBuf MoeBlockFusedMarlinCuda(Dev d, const MoeBlockWeights& w, const HfConfig& cf
       static_cast<int>(top_k), static_cast<int>(E), block,
       static_cast<int32_t*>(sorted_ids.t().data), static_cast<int32_t*>(expert_ids.t().data),
       static_cast<int32_t*>(num_pad.t().data));
+
+  // SPEC-DSPARK #442 diagnostic (VT_MOE_PAD_STATS=1, DEFAULT OFF, adds a D2H
+  // sync so it must never be on for a timing run). The Marlin MoE kernel loops
+  // div_ceil(num_tokens_past_padded, block) blocks PER LAUNCH, so two engines can
+  // launch it the same number of times and still do different amounts of work if
+  // their tokens route to different numbers of experts. Ours and upstream's token
+  // streams DIVERGE by a near-tie, so this is what decides whether the measured
+  // 8.2% kernel gap is an implementation defect or just a different token path.
+  static const bool pad_stats = [] {
+    const char* v = std::getenv("VT_MOE_PAD_STATS");
+    return v != nullptr && v[0] == '1';
+  }();
+  if (pad_stats) {
+    int32_t npad = 0;
+    d.b.Copy(d.q, &npad, num_pad.t().data, sizeof(int32_t));
+    d.b.Synchronize(d.q);
+    static int64_t calls = 0, sum_pad = 0, sum_blocks = 0;
+    ++calls;
+    sum_pad += npad;
+    sum_blocks += (npad + block - 1) / block;
+    if (calls % 500 == 0)
+      std::fprintf(stderr,
+                   "[MOE-PAD] calls=%lld padded_tokens_total=%lld blocks_total=%lld "
+                   "avg_pad=%.1f avg_blocks=%.1f (block=%d T=%d topk=%d E=%d)\n",
+                   static_cast<long long>(calls), static_cast<long long>(sum_pad),
+                   static_cast<long long>(sum_blocks),
+                   static_cast<double>(sum_pad) / calls,
+                   static_cast<double>(sum_blocks) / calls, block, static_cast<int>(T),
+                   static_cast<int>(top_k), static_cast<int>(E));
+  }
 
   Tensor wd = MakeTensor(mr.w_down, DType::kI32, d.q.device, {E, I / 16, H * 2});
   Tensor sd = MakeTensor(mr.s_down, DType::kI8, d.q.device, {E, I / 16, H});
@@ -8283,7 +8581,7 @@ struct PinnedStepInputs {
   int32_t* qsl = nullptr;
   int32_t* gdn_state_idx = nullptr;
   int32_t* token_ids = nullptr;
-  int64_t S = 0, cols = 0, idx = 0;
+  int64_t S = 0, R = 0, cols = 0, idx = 0;  // S = tokens, R = requests
   bool has_idx = false;
   bool ready = false;
 
@@ -8302,14 +8600,21 @@ struct PinnedStepInputs {
     seq_lens = nullptr; qsl = nullptr; gdn_state_idx = nullptr; token_ids = nullptr;
     b = nullptr; ready = false;
   }
-  void Alloc(Backend& bk, int64_t S_, int64_t cols_, int64_t idx_, bool has_idx_) {
+  // SPEC-DSPARK W8 (#442): `S` is TOKENS and `R` is REQUESTS. They are equal for
+  // pure decode, which is why one count sufficed until a speculative verify
+  // arrived with S = R * (1+k). Sizing the per-request arrays by S overran both
+  // the host block table and the device buffer (`cudaMemcpyAsync: invalid
+  // argument`). Upstream keeps both for the same reason: its graph key is
+  // BatchDescriptor(num_tokens, num_reqs, uniform).
+  void Alloc(Backend& bk, int64_t S_, int64_t R_, int64_t cols_, int64_t idx_,
+             bool has_idx_) {
     Free();
-    b = &bk; S = S_; cols = cols_; idx = idx_; has_idx = has_idx_;
+    b = &bk; S = S_; R = R_ > 0 ? R_ : S_; cols = cols_; idx = idx_; has_idx = has_idx_;
     positions = static_cast<int32_t*>(bk.AllocPinned(sizeof(int32_t) * S));
     slot_mapping = static_cast<int64_t*>(bk.AllocPinned(sizeof(int64_t) * S));
-    block_table = static_cast<int32_t*>(bk.AllocPinned(sizeof(int32_t) * S * cols));
-    seq_lens = static_cast<int32_t*>(bk.AllocPinned(sizeof(int32_t) * S));
-    qsl = static_cast<int32_t*>(bk.AllocPinned(sizeof(int32_t) * (S + 1)));
+    block_table = static_cast<int32_t*>(bk.AllocPinned(sizeof(int32_t) * R * cols));
+    seq_lens = static_cast<int32_t*>(bk.AllocPinned(sizeof(int32_t) * R));
+    qsl = static_cast<int32_t*>(bk.AllocPinned(sizeof(int32_t) * (R + 1)));
     token_ids = static_cast<int32_t*>(bk.AllocPinned(sizeof(int32_t) * S));
     if (has_idx) gdn_state_idx =
         static_cast<int32_t*>(bk.AllocPinned(sizeof(int32_t) * idx));
@@ -8337,17 +8642,64 @@ static DevicePool& PersistentDecodeInputPool() {
 // The caller records the input-staged event immediately after, so the next same-slot
 // Refresh waits only this tiny copy, not the GPU tail. Templated because the two
 // decode-graph drivers nest their own SizeSlot with identical field names.
+// SPEC-DSPARK W8 (#442): refill the PERSISTENT spec device tensors in place from
+// this slot's host metadata, OUTSIDE the captured region.
+//
+// This is the piece whose absence made the first spec capture produce garbage:
+// StageStepInputs refills only the pure-decode fields, so a replay re-read the
+// PREVIOUS step's `num_accepted` -- the very value GdnSpecDecode uses to select
+// each request's initial state (column num_accepted-1) and the conv window
+// advance. Stale there means the recurrence rolls back to the wrong state, which
+// measured as incoherent tokens AND 5x slower (26 vs 136 tok/s), because zero
+// acceptance multiplies the step count.
+//
+// Copies are issued on the main queue before the replay, so the graph reads the
+// addresses it was captured with, holding this step's values.
+template <class Slot>
+static void StageSpecStepInputs(Dev d, Slot& s) {
+  if (s.dev == nullptr) return;
+  StepDevInputs& dev = *s.dev;
+  if (!dev.has_gdn_spec) return;
+  const v1::GDNAttentionMetadata& gm = s.gdn_meta;
+  const auto cp32 = [&](DBuf& dst, const std::optional<std::vector<int32_t>>& src) {
+    if (src.has_value() && !src->empty())
+      d.b.Copy(d.q, dst.ptr(), src->data(), sizeof(int32_t) * src->size());
+  };
+  cp32(dev.gdn_spec_state_idx, gm.spec_state_indices_tensor);
+  cp32(dev.gdn_spec_qsl, gm.spec_query_start_loc);
+  cp32(dev.gdn_num_accepted, gm.num_accepted_tokens);
+  cp32(dev.gdn_spec_token_indx, gm.spec_token_indx);
+  cp32(dev.gdn_non_spec_token_indx, gm.non_spec_token_indx);
+  if (gm.spec_sequence_masks.has_value() && !gm.spec_sequence_masks->empty())
+    d.b.Copy(d.q, dev.gdn_spec_seq_masks.ptr(), gm.spec_sequence_masks->data(),
+             gm.spec_sequence_masks->size());
+  // conv state slot == column 0 of each request's spec_state_indices row
+  // (BuildStepDevInputs derives it the same way).
+  if (gm.spec_state_indices_tensor.has_value() && gm.spec_state_indices_num_cols > 0) {
+    const int64_t ns = gm.num_spec_decodes;
+    const int64_t nc = gm.spec_state_indices_num_cols;
+    const std::vector<int32_t>& ssi = *gm.spec_state_indices_tensor;
+    if (ns > 0 && static_cast<int64_t>(ssi.size()) >= ns * nc) {
+      std::vector<int32_t> col0(static_cast<size_t>(ns));
+      for (int64_t i = 0; i < ns; ++i)
+        col0[static_cast<size_t>(i)] = ssi[static_cast<size_t>(i * nc)];
+      d.b.Copy(d.q, dev.gdn_spec_conv_state_idx.ptr(), col0.data(),
+               sizeof(int32_t) * static_cast<size_t>(ns));
+    }
+  }
+}
+
 template <class Slot>
 static void StageStepInputs(Dev d, Slot& s) {
   PinnedStepInputs& pin = s.pin;
   StepDevInputs& dev = *s.dev;
-  const int64_t S = pin.S, cols = pin.cols;
+  const int64_t S = pin.S, R = pin.R, cols = pin.cols;  // tokens, requests
   std::memcpy(pin.positions, s.positions.data(), sizeof(int32_t) * S);
   std::memcpy(pin.slot_mapping, s.attn_meta.slot_mapping.data(), sizeof(int64_t) * S);
   std::memcpy(pin.block_table, s.attn_meta.block_table_tensor.data(),
-              sizeof(int32_t) * S * cols);
-  std::memcpy(pin.seq_lens, s.attn_meta.seq_lens.data(), sizeof(int32_t) * S);
-  std::memcpy(pin.qsl, s.attn_meta.query_start_loc.data(), sizeof(int32_t) * (S + 1));
+              sizeof(int32_t) * R * cols);
+  std::memcpy(pin.seq_lens, s.attn_meta.seq_lens.data(), sizeof(int32_t) * R);
+  std::memcpy(pin.qsl, s.attn_meta.query_start_loc.data(), sizeof(int32_t) * (R + 1));
   std::memcpy(pin.token_ids, s.token_ids.data(), sizeof(int32_t) * S);
   if (pin.has_idx && dev.has_gdn_idx &&
       s.gdn_meta.non_spec_state_indices_tensor.has_value())
@@ -8356,9 +8708,9 @@ static void StageStepInputs(Dev d, Slot& s) {
                 sizeof(int32_t) * pin.idx);
   d.b.Copy(d.q, dev.positions.ptr(), pin.positions, sizeof(int32_t) * S);
   d.b.Copy(d.q, dev.slot_mapping.ptr(), pin.slot_mapping, sizeof(int64_t) * S);
-  d.b.Copy(d.q, dev.block_table.ptr(), pin.block_table, sizeof(int32_t) * S * cols);
-  d.b.Copy(d.q, dev.seq_lens.ptr(), pin.seq_lens, sizeof(int32_t) * S);
-  d.b.Copy(d.q, dev.query_start_loc.ptr(), pin.qsl, sizeof(int32_t) * (S + 1));
+  d.b.Copy(d.q, dev.block_table.ptr(), pin.block_table, sizeof(int32_t) * R * cols);
+  d.b.Copy(d.q, dev.seq_lens.ptr(), pin.seq_lens, sizeof(int32_t) * R);
+  d.b.Copy(d.q, dev.query_start_loc.ptr(), pin.qsl, sizeof(int32_t) * (R + 1));
   if (pin.has_idx && dev.has_gdn_idx)
     d.b.Copy(d.q, dev.gdn_state_idx.ptr(), pin.gdn_state_idx,
              sizeof(int32_t) * pin.idx);
@@ -8416,6 +8768,14 @@ struct Qwen3_5DecodeGraph::Impl {
     v1::GDNAttentionMetadata gdn_meta;
     std::unique_ptr<DBuf> hidden;     // [S,H] bf16 persistent embed target
     std::unique_ptr<DBuf> logits;     // [S,vocab] f32 held graph output
+    // SPEC-DSPARK W8 (#442): the DFlash/DSpark verify must ALSO emit the
+    // [S, H*taps] aux hidden capture the drafter conditions on. That is exactly
+    // why the verify never reached this graph: ForwardDeviceMultiTap returns
+    // BEFORE the decode-graph gate. Held PERSISTENTLY per slot (like `logits`) so
+    // the captured region writes a fixed address across replays -- the eager path
+    // allocates a fresh buffer per call, which a captured graph cannot do.
+    std::unique_ptr<DBuf> aux;        // [S, H*taps] bf16, null when no aux tap
+    int64_t aux_taps = 0;             // tap count this buffer + graph were built for
     void* graph = nullptr;            // instantiated cudaGraphExec (opaque)
     int fa_cols = -1;                 // captured block-table column count
     bool captured = false;
@@ -8520,7 +8880,7 @@ ForwardLogits Qwen3_5DecodeGraph::Step(
     const v1::CommonAttentionMetadata& attn_meta,
     const v1::GDNAttentionMetadata& gdn_meta,
     const std::vector<PagedKvCache>& attn_kv,
-    const std::vector<GdnStateCache>& gdn_state) {
+    const std::vector<GdnStateCache>& gdn_state, Qwen3_5AuxTaps* aux_out) {
   CheckPagedForward(token_ids, positions, attn_meta, gdn_meta, attn_kv,
                     gdn_state, impl_->weights, impl_->config);
   const int64_t B = static_cast<int64_t>(token_ids.size());
@@ -8536,10 +8896,27 @@ ForwardLogits Qwen3_5DecodeGraph::Step(
   // first B rows are the real requests; the padded rows follow). Stream ordering
   // guarantees the sampler's later reads see the replay's writes; the next
   // same-size replay overwrites the buffer, so in-place sampler mutation is safe.
-  const int64_t S = PadToCaptureSize(B, impl_->max_num_reqs);
+  // SPEC-DSPARK W8 (#442): a uniform SPEC batch carries B = num_reqs * (1+k)
+  // tokens, which exceeds max_num_reqs and would make PadToCaptureSize return -1
+  // (eager). Capture its EXACT shape instead of padding: upstream pads only in
+  // whole multiples of the uniform query length (cudagraph_dispatcher.py:145
+  // asserts `num_tokens_padded % uniform_decode_query_len == 0`), and taking the
+  // exact shape trivially satisfies that while keeping the padded-row inertness
+  // question out of the spec path. The shape count stays bounded by max_num_seqs
+  // because num_reqs is.
+  const bool spec_step = gdn_meta.num_spec_decodes > 0;
+  const int64_t S = spec_step ? B : PadToCaptureSize(B, impl_->max_num_reqs);
   if (!impl_->enabled || S < 0 ||
       !detail::CanUseGdnDecodeGraphSize(
           B, S, IndexedGdnStateIoEnabled(impl_->queue.device))) {
+    if (aux_out != nullptr && !aux_out->layer_ids.empty()) {
+      // The graph cannot serve this batch (disabled / unsupported size), so fall
+      // back to the EAGER multi-tap forward, which fills aux_out itself. Without
+      // this the drafter sees no taps at all.
+      return Qwen3_5Model::ForwardDeviceMultiTap(
+          token_ids, positions, attn_meta, gdn_meta, attn_kv, gdn_state,
+          impl_->weights, impl_->config, impl_->queue, aux_out, {});
+    }
     DBuf lg = ForwardBody(d, token_ids, positions, attn_meta, gdn_meta, attn_kv,
                           gdn_state, impl_->weights, impl_->config);
     // ForwardBody returns [B,vocab] (owned pool block; hand ownership out).
@@ -8552,7 +8929,10 @@ ForwardLogits Qwen3_5DecodeGraph::Step(
   // previous replay before Refresh touches its persistent host inputs (hazard-C).
   // OFF: always slot[0], no wait — byte-identical to the single-slot driver.
   Impl::SlotRing& ring = impl_->slots[S];
-  const bool dbuf = impl_->dbuf;
+  // SPEC-DSPARK W8 (#442): a captured SPEC graph must read PERSISTENT step
+  // inputs. The per-call StepDevInputs is a pool block freed when the call
+  // returns, so a graph captured against it replays over recycled memory.
+  const bool dbuf = impl_->dbuf || spec_step;
   Impl::SizeSlot& s = ring.slot[dbuf ? ring.next : 0];
   if (dbuf) {
     ring.next ^= 1;
@@ -8571,12 +8951,61 @@ ForwardLogits Qwen3_5DecodeGraph::Step(
       s.reuse_event = b.CreateEvent(/*blocking=*/true);
     b.RecordEvent(s.reuse_event, impl_->queue);
   };
+
+  // SPEC-DSPARK W8 (#442): size this slot's PERSISTENT aux buffer and invalidate a
+  // graph captured for a different tap count. Only the EXACT-shape case (S == B,
+  // which is what a spec batch takes) is served: the aux contract is [T, H*taps]
+  // and padded rows would change T.
+  const int64_t aux_taps =
+      aux_out != nullptr ? static_cast<int64_t>(aux_out->layer_ids.size()) : 0;
+  if (s.aux_taps != aux_taps) {
+    if (s.graph != nullptr) {
+      b.DestroyGraph(s.graph);
+      s.graph = nullptr;
+    }
+    s.captured = false;
+    s.warm = false;
+    s.aux.reset();
+    s.aux_taps = aux_taps;
+  }
+  if (aux_taps > 0 && (s.aux == nullptr || s.aux->t().shape[0] != S)) {
+    s.aux = std::make_unique<DBuf>(d, DType::kBF16,
+                                   std::vector<int64_t>{S, H * aux_taps});
+  }
+  Tensor aux_view{};
+  const std::vector<int32_t>* aux_ids_arg = nullptr;
+  const Tensor* aux_out_arg = nullptr;
+  if (aux_taps > 0) {
+    ValidateAuxTapLayerIds(aux_out->layer_ids, impl_->config.num_hidden_layers);
+    aux_view = s.aux->t();
+    aux_ids_arg = &aux_out->layer_ids;
+    aux_out_arg = &aux_view;
+  }
+  // The captured region writes into the slot's buffer, so the drafter reads a
+  // NON-owning view valid until this slot's next replay -- the same lifetime the
+  // returned logits already carry.
+  const auto publish_aux = [&] {
+    if (aux_taps > 0) {
+      aux_out->storage.reset();
+      aux_out->tensor = s.aux->t();
+    }
+  };
   const int cols = attn_meta.block_table_num_cols;
   std::vector<int32_t> ptok, ppos;
   v1::CommonAttentionMetadata pam;
   v1::GDNAttentionMetadata pgm;
-  BuildPaddedDecode(S, token_ids, positions, attn_meta, gdn_meta, ptok, ppos,
-                    pam, pgm);
+  if (spec_step) {
+    // S == B for a spec batch, so there is nothing to pad, and BuildPaddedDecode
+    // would REWRITE the metadata as pure non-spec decode (num_decodes = S,
+    // spec fields dropped). Carry the real metadata through untouched.
+    ptok = token_ids;
+    ppos = positions;
+    pam = attn_meta;
+    pgm = gdn_meta;
+  } else {
+    BuildPaddedDecode(S, token_ids, positions, attn_meta, gdn_meta, ptok, ppos,
+                      pam, pgm);
+  }
 
   // A block-table column-count change reallocates the persistent block_table (the
   // staged/baked H2D dest shape moves) → invalidate this slot's graph and persistent
@@ -8600,12 +9029,14 @@ ForwardLogits Qwen3_5DecodeGraph::Step(
     EmbedInto(d, *s.hidden, s.token_ids, impl_->weights, impl_->config);
     if (dbuf) {
       StageStepInputs(d, s);
+      StageSpecStepInputs(d, s);
       record_staged();
       MaybePoisonStagedInputs(impl_->poison, s);
     }
     b.ReplayGraph(impl_->queue, s.graph);
     ++s.replays;
     ++impl_->replays;
+    publish_aux();
     return ViewDeviceLogits(s.logits->ptr(), d.q.device, B, vocab);
   }
 
@@ -8652,14 +9083,33 @@ ForwardLogits Qwen3_5DecodeGraph::Step(
           has_idx ? static_cast<int64_t>(
                         s.gdn_meta.non_spec_state_indices_tensor->size())
                   : 0;
-      s.pin.Alloc(b, S, cols, idx, has_idx);
+      s.pin.Alloc(b, S, s.attn_meta.num_reqs, cols, idx, has_idx);
     }
     EmbedInto(d, *s.hidden, s.token_ids, impl_->weights, impl_->config);
     b.BeginCapture(impl_->queue);
-    DBuf lg = ForwardLayers(d, s.hidden->t(), s.positions, s.attn_meta,
-                            s.gdn_meta, attn_kv, gdn_state, impl_->weights,
-                            impl_->config, {}, nullptr, nullptr, nullptr,
-                            dbuf ? s.dev.get() : nullptr);
+    // A THROW OUT OF A CAPTURE REGION MUST STILL END THE CAPTURE (#339, review
+    // finding F-B). Capture mode is cudaStreamCaptureModeThreadLocal
+    // (cuda_backend.cu), so if an exception skipped EndCaptureGraph the stream
+    // would stay in capture mode FOREVER and every later CUDA call on it would
+    // fail — a failure mode that looks nothing like its cause, arrives long
+    // after it, and cannot be repaired by the first catch (the engine thread in
+    // v1/engine/core_client.cpp, which only marks the engine dead). Any refusal
+    // raised inside ForwardLayers reaches here: the fp8 splitK premise check is
+    // one such, and it is not the only thing under here that can throw. Drain,
+    // then rethrow the ORIGINAL error — mirrors qwen3_dflash.cpp's capture guard.
+    DBuf lg = [&] {
+      try {
+        return ForwardLayers(d, s.hidden->t(), s.positions, s.attn_meta,
+                             s.gdn_meta, attn_kv, gdn_state, impl_->weights,
+                             impl_->config, {}, nullptr, aux_ids_arg, aux_out_arg,
+                             dbuf ? s.dev.get() : nullptr);
+      } catch (...) {
+        void* g = nullptr;
+        try { g = b.EndCaptureGraph(impl_->queue); } catch (...) {}  // unstick the stream
+        if (g != nullptr) b.DestroyGraph(g);
+        throw;
+      }
+    }();
     s.graph = b.EndCaptureGraph(impl_->queue);
     s.logits = std::make_unique<DBuf>(std::move(lg));
     s.captured = true;
@@ -8668,6 +9118,7 @@ ForwardLogits Qwen3_5DecodeGraph::Step(
     record_staged();
     s.replays = 1;
     ++impl_->replays;
+    publish_aux();
     return ViewDeviceLogits(s.logits->ptr(), d.q.device, B, vocab);
   }
 
@@ -8678,9 +9129,11 @@ ForwardLogits Qwen3_5DecodeGraph::Step(
   s.hidden = std::make_unique<DBuf>(d, DType::kBF16, std::vector<int64_t>{S, H});
   EmbedInto(d, *s.hidden, s.token_ids, impl_->weights, impl_->config);
   DBuf lg = ForwardLayers(d, s.hidden->t(), s.positions, s.attn_meta, s.gdn_meta,
-                          attn_kv, gdn_state, impl_->weights, impl_->config);
+                          attn_kv, gdn_state, impl_->weights, impl_->config, {},
+                          nullptr, aux_ids_arg, aux_out_arg);
   s.warm = true;
   s.captured = false;
+  publish_aux();
   record_staged();
   // lg is [S,vocab]; hand ownership out but expose only the first B (real) rows.
   ForwardLogits fl = WrapDeviceLogits(d, std::move(lg), vocab);
@@ -8737,6 +9190,14 @@ struct Qwen3_5DenseDecodeGraph::Impl {
     v1::GDNAttentionMetadata gdn_meta;
     std::unique_ptr<DBuf> hidden;     // [S,H] bf16 persistent embed target
     std::unique_ptr<DBuf> logits;     // [S,vocab] f32 held graph output
+    // SPEC-DSPARK W8 (#442): the DFlash/DSpark verify must ALSO emit the
+    // [S, H*taps] aux hidden capture the drafter conditions on. That is exactly
+    // why the verify never reached this graph: ForwardDeviceMultiTap returns
+    // BEFORE the decode-graph gate. Held PERSISTENTLY per slot (like `logits`) so
+    // the captured region writes a fixed address across replays -- the eager path
+    // allocates a fresh buffer per call, which a captured graph cannot do.
+    std::unique_ptr<DBuf> aux;        // [S, H*taps] bf16, null when no aux tap
+    int64_t aux_taps = 0;             // tap count this buffer + graph were built for
     void* graph = nullptr;            // instantiated cudaGraphExec (opaque)
     int fa_cols = -1;                 // captured block-table column count
     bool captured = false;
@@ -8842,7 +9303,7 @@ ForwardLogits Qwen3_5DenseDecodeGraph::Step(
     const v1::CommonAttentionMetadata& attn_meta,
     const v1::GDNAttentionMetadata& gdn_meta,
     const std::vector<PagedKvCache>& attn_kv,
-    const std::vector<GdnStateCache>& gdn_state) {
+    const std::vector<GdnStateCache>& gdn_state, Qwen3_5AuxTaps* aux_out) {
   CheckDensePagedForward(token_ids, positions, attn_meta, gdn_meta, attn_kv,
                          gdn_state, impl_->weights, impl_->config);
   const int64_t B = static_cast<int64_t>(token_ids.size());
@@ -8856,10 +9317,27 @@ ForwardLogits Qwen3_5DenseDecodeGraph::Step(
   // paths return a NON-owning view over the slot's persistent [S,vocab] logits
   // (first B rows are the real requests). Stream ordering guarantees the sampler
   // sees the replay's writes; the next same-size replay overwrites the buffer.
-  const int64_t S = PadToCaptureSize(B, impl_->max_num_reqs);
+  // SPEC-DSPARK W8 (#442): a uniform SPEC batch carries B = num_reqs * (1+k)
+  // tokens, which exceeds max_num_reqs and would make PadToCaptureSize return -1
+  // (eager). Capture its EXACT shape instead of padding: upstream pads only in
+  // whole multiples of the uniform query length (cudagraph_dispatcher.py:145
+  // asserts `num_tokens_padded % uniform_decode_query_len == 0`), and taking the
+  // exact shape trivially satisfies that while keeping the padded-row inertness
+  // question out of the spec path. The shape count stays bounded by max_num_seqs
+  // because num_reqs is.
+  const bool spec_step = gdn_meta.num_spec_decodes > 0;
+  const int64_t S = spec_step ? B : PadToCaptureSize(B, impl_->max_num_reqs);
   if (!impl_->enabled || S < 0 ||
       !detail::CanUseGdnDecodeGraphSize(
           B, S, IndexedGdnStateIoEnabled(impl_->queue.device))) {
+    if (aux_out != nullptr && !aux_out->layer_ids.empty()) {
+      // The graph cannot serve this batch (disabled / unsupported size), so fall
+      // back to the EAGER multi-tap forward, which fills aux_out itself. Without
+      // this the drafter sees no taps at all.
+      return Qwen3_5DenseModel::ForwardDeviceMultiTap(
+          token_ids, positions, attn_meta, gdn_meta, attn_kv, gdn_state,
+          impl_->weights, impl_->config, impl_->queue, aux_out, {});
+    }
     DBuf lg = DenseForwardBody(d, token_ids, positions, attn_meta, gdn_meta, attn_kv,
                                gdn_state, impl_->weights, impl_->config, {});
     return WrapDeviceLogits(d, std::move(lg), vocab);
@@ -8871,7 +9349,10 @@ ForwardLogits Qwen3_5DenseDecodeGraph::Step(
   // previous replay before Refresh touches its persistent host inputs (hazard-C).
   // OFF: always slot[0], no wait — byte-identical to the single-slot driver.
   Impl::SlotRing& ring = impl_->slots[S];
-  const bool dbuf = impl_->dbuf;
+  // SPEC-DSPARK W8 (#442): a captured SPEC graph must read PERSISTENT step
+  // inputs. The per-call StepDevInputs is a pool block freed when the call
+  // returns, so a graph captured against it replays over recycled memory.
+  const bool dbuf = impl_->dbuf || spec_step;
   Impl::SizeSlot& s = ring.slot[dbuf ? ring.next : 0];
   if (dbuf) {
     ring.next ^= 1;
@@ -8889,12 +9370,61 @@ ForwardLogits Qwen3_5DenseDecodeGraph::Step(
       s.reuse_event = b.CreateEvent(/*blocking=*/true);
     b.RecordEvent(s.reuse_event, impl_->queue);
   };
+
+  // SPEC-DSPARK W8 (#442): size this slot's PERSISTENT aux buffer and invalidate a
+  // graph captured for a different tap count. Only the EXACT-shape case (S == B,
+  // which is what a spec batch takes) is served: the aux contract is [T, H*taps]
+  // and padded rows would change T.
+  const int64_t aux_taps =
+      aux_out != nullptr ? static_cast<int64_t>(aux_out->layer_ids.size()) : 0;
+  if (s.aux_taps != aux_taps) {
+    if (s.graph != nullptr) {
+      b.DestroyGraph(s.graph);
+      s.graph = nullptr;
+    }
+    s.captured = false;
+    s.warm = false;
+    s.aux.reset();
+    s.aux_taps = aux_taps;
+  }
+  if (aux_taps > 0 && (s.aux == nullptr || s.aux->t().shape[0] != S)) {
+    s.aux = std::make_unique<DBuf>(d, DType::kBF16,
+                                   std::vector<int64_t>{S, H * aux_taps});
+  }
+  Tensor aux_view{};
+  const std::vector<int32_t>* aux_ids_arg = nullptr;
+  const Tensor* aux_out_arg = nullptr;
+  if (aux_taps > 0) {
+    ValidateAuxTapLayerIds(aux_out->layer_ids, impl_->config.num_hidden_layers);
+    aux_view = s.aux->t();
+    aux_ids_arg = &aux_out->layer_ids;
+    aux_out_arg = &aux_view;
+  }
+  // The captured region writes into the slot's buffer, so the drafter reads a
+  // NON-owning view valid until this slot's next replay -- the same lifetime the
+  // returned logits already carry.
+  const auto publish_aux = [&] {
+    if (aux_taps > 0) {
+      aux_out->storage.reset();
+      aux_out->tensor = s.aux->t();
+    }
+  };
   const int cols = attn_meta.block_table_num_cols;
   std::vector<int32_t> ptok, ppos;
   v1::CommonAttentionMetadata pam;
   v1::GDNAttentionMetadata pgm;
-  BuildPaddedDecode(S, token_ids, positions, attn_meta, gdn_meta, ptok, ppos,
-                    pam, pgm);
+  if (spec_step) {
+    // S == B for a spec batch, so there is nothing to pad, and BuildPaddedDecode
+    // would REWRITE the metadata as pure non-spec decode (num_decodes = S,
+    // spec fields dropped). Carry the real metadata through untouched.
+    ptok = token_ids;
+    ppos = positions;
+    pam = attn_meta;
+    pgm = gdn_meta;
+  } else {
+    BuildPaddedDecode(S, token_ids, positions, attn_meta, gdn_meta, ptok, ppos,
+                      pam, pgm);
+  }
 
   // A block-table column-count change reallocates the persistent block_table (the
   // staged/baked H2D dest shape moves) → invalidate this slot's graph + device inputs.
@@ -8917,6 +9447,7 @@ ForwardLogits Qwen3_5DenseDecodeGraph::Step(
     DenseEmbedInto(d, *s.hidden, s.token_ids, impl_->weights, impl_->config);
     if (dbuf) {
       StageStepInputs(d, s);
+      StageSpecStepInputs(d, s);
       record_staged();
       MaybePoisonStagedInputs(impl_->poison, s);
     }
@@ -8928,6 +9459,7 @@ ForwardLogits Qwen3_5DenseDecodeGraph::Step(
     b.ReplayGraph(impl_->queue, s.graph);
     ++s.replays;
     ++impl_->replays;
+    publish_aux();
     return ViewDeviceLogits(s.logits->ptr(), d.q.device, B, vocab);
   }
 
@@ -8972,14 +9504,28 @@ ForwardLogits Qwen3_5DenseDecodeGraph::Step(
           has_idx ? static_cast<int64_t>(
                         s.gdn_meta.non_spec_state_indices_tensor->size())
                   : 0;
-      s.pin.Alloc(b, S, cols, idx, has_idx);
+      s.pin.Alloc(b, S, s.attn_meta.num_reqs, cols, idx, has_idx);
     }
     DenseEmbedInto(d, *s.hidden, s.token_ids, impl_->weights, impl_->config);
     b.BeginCapture(impl_->queue);
-    DBuf lg = DenseForwardLayers(d, s.hidden->t(), s.positions, s.attn_meta,
-                                 s.gdn_meta, attn_kv, gdn_state, impl_->weights,
-                                 impl_->config, {}, nullptr, nullptr, nullptr,
-                                 nullptr, dbuf ? s.dev.get() : nullptr);
+    // Drain the capture if the forward throws — see the 35B driver above for why
+    // a skipped EndCaptureGraph poisons the stream permanently (#339, F-B). This
+    // is the 27B DENSE driver, and it is the one that matters most here: the
+    // bf16-D fp8 lever this row guards (VT_GDN_FP8_IN_BF16) is confined to the
+    // 27B by construction, since the 35B is MoE and its GdnOutDType is f32.
+    DBuf lg = [&] {
+      try {
+        return DenseForwardLayers(d, s.hidden->t(), s.positions, s.attn_meta,
+                                  s.gdn_meta, attn_kv, gdn_state, impl_->weights,
+                                  impl_->config, {}, nullptr, nullptr, aux_ids_arg,
+                                  aux_out_arg, dbuf ? s.dev.get() : nullptr);
+      } catch (...) {
+        void* g = nullptr;
+        try { g = b.EndCaptureGraph(impl_->queue); } catch (...) {}  // unstick the stream
+        if (g != nullptr) b.DestroyGraph(g);
+        throw;
+      }
+    }();
     s.graph = b.EndCaptureGraph(impl_->queue);
     s.logits = std::make_unique<DBuf>(std::move(lg));
     s.captured = true;
@@ -8992,6 +9538,7 @@ ForwardLogits Qwen3_5DenseDecodeGraph::Step(
     record_staged();
     s.replays = 1;
     ++impl_->replays;
+    publish_aux();
     return ViewDeviceLogits(s.logits->ptr(), d.q.device, B, vocab);
   }
 
@@ -9003,9 +9550,11 @@ ForwardLogits Qwen3_5DenseDecodeGraph::Step(
   DenseEmbedInto(d, *s.hidden, s.token_ids, impl_->weights, impl_->config);
   DBuf lg = DenseForwardLayers(d, s.hidden->t(), s.positions, s.attn_meta,
                                s.gdn_meta, attn_kv, gdn_state, impl_->weights,
-                               impl_->config);
+                               impl_->config, {}, nullptr, nullptr, aux_ids_arg,
+                               aux_out_arg);
   s.warm = true;
   s.captured = false;
+  publish_aux();
   record_staged();
   // lg is [S,vocab]; hand ownership out but expose only the first B (real) rows.
   ForwardLogits fl = WrapDeviceLogits(d, std::move(lg), vocab);

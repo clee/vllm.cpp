@@ -28,6 +28,14 @@ function(vllm_cpp_add_test name)
   endif()
   vllm_cpp_set_warnings(${name})
   add_test(NAME ${name} COMMAND ${name})
+  # A gate that cannot run must not report success. doctest exits 0 after a
+  # TEST_CASE returns early, printing "assertions: 0 | 0 passed | 0 failed" and
+  # "Status: SUCCESS!" — indistinguishable, in a log or a `&&` chain, from a gate
+  # that loaded a model and matched an oracle (issue #463; multimodal-speed.md
+  # §17.7 hit exactly this). A test whose preconditions are absent exits 77
+  # instead and CTest reports it **Skipped**. Inert for any test that never
+  # returns 77, which today is all but test_voxtral_e2e.
+  set_tests_properties(${name} PROPERTIES SKIP_RETURN_CODE 77)
 endfunction()
 
 # The gate on the golden-comparison helper itself (issue #449): a NaN operand
@@ -42,6 +50,12 @@ add_test(NAME test_max_abs_diff_nan_raises
 set_tests_properties(test_max_abs_diff_nan_raises PROPERTIES WILL_FAIL TRUE)
 
 vllm_cpp_add_test(test_version vllm/test_version.cpp)
+set(_vllm_cpp_expected_build_version "${PROJECT_VERSION}")
+if(DEFINED VLLM_CPP_BUILD_VERSION)
+  set(_vllm_cpp_expected_build_version "${VLLM_CPP_BUILD_VERSION}")
+endif()
+target_compile_definitions(test_version PRIVATE
+  VLLM_CPP_EXPECTED_BUILD_VERSION="${_vllm_cpp_expected_build_version}")
 vllm_cpp_add_test(test_sampling_params vllm/test_sampling_params.cpp)
 vllm_cpp_add_test(test_punica_cpu vllm/lora/test_punica_cpu.cpp)
 vllm_cpp_add_test(test_lora_layers vllm/lora/test_lora_layers.cpp)
@@ -62,6 +76,10 @@ vllm_cpp_add_test(test_gguf_nvfp4 vllm/test_gguf_nvfp4.cpp)
 target_include_directories(test_gguf_nvfp4 PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/vllm)
 vllm_cpp_add_test(test_qwen36_weights vllm/test_qwen36_weights.cpp)
+# GATE-PIN-UNPINNED-SNAPSHOTS (#471): resolves the 35B checkpoint through the
+# pinned parity::HfSnapshot, so it needs tests/parity on the include path.
+target_include_directories(test_qwen36_weights PRIVATE
+  ${CMAKE_SOURCE_DIR}/tests/parity)
 vllm_cpp_add_test(test_gguf_qwen36_loader vllm/test_gguf_qwen36_loader.cpp)
 vllm_cpp_add_test(test_gguf_keep_quant vllm/test_gguf_keep_quant.cpp)
 vllm_cpp_add_test(test_model_loader_gguf vllm/test_model_loader_gguf.cpp)
@@ -163,6 +181,8 @@ target_include_directories(test_qwen3_dspark_config PRIVATE ${CMAKE_SOURCE_DIR}/
 vllm_cpp_add_test(test_qwen3_dspark_weights vllm/models/test_qwen3_dspark_weights.cpp)
 target_include_directories(test_qwen3_dspark_weights PRIVATE ${CMAKE_SOURCE_DIR}/src)
 # SPEC-DSPARK W4: sequential Markov sampling + the anchor block layout.
+vllm_cpp_add_test(test_cudagraph_dispatch vllm/v1/worker/gpu/test_cudagraph_dispatch.cpp)
+target_include_directories(test_cudagraph_dispatch PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_dspark_sample vllm/v1/spec_decode/test_dspark_sample.cpp)
 target_include_directories(test_dspark_sample PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_llama_forward vllm/models/test_llama_forward.cpp)
@@ -204,6 +224,15 @@ target_include_directories(test_deepseek_v2_forward PRIVATE ${CMAKE_SOURCE_DIR}/
 # ParseDeepseekV4Params. No checkpoint / GPU — the forward + strict gate are
 # named W3-W8 residuals (.agents/specs/deepseek-v4-flash.md).
 vllm_cpp_add_test(test_deepseek_v4_scaffold vllm/models/test_deepseek_v4_scaffold.cpp)
+target_include_directories(test_deepseek_v4_scaffold PRIVATE ${CMAKE_SOURCE_DIR}/src)
+
+# DeepSeek-V4-Pro shape-generality gate (#504): the Pro config descends through
+# the SAME ParseDeepseekV4Params with zero new keys, and compress_ratios alone
+# reproduces the compressor/indexer layer counts of BOTH real checkpoints
+# (Flash 41/21, Pro 61/30). No checkpoint / GPU — Pro's 805 GiB does not fit one
+# GB10, so a load gate is memory-infeasible (.agents/specs/deepseek-v4-pro.md).
+vllm_cpp_add_test(test_deepseek_v4_pro_variant vllm/models/test_deepseek_v4_pro_variant.cpp)
+target_include_directories(test_deepseek_v4_pro_variant PRIVATE ${CMAKE_SOURCE_DIR}/src)
 
 # Laguna-S-2.1 W1/W2 scaffolding gate: LagunaForCausalLM RESOLVES through the
 # registry + ParseLagunaParams descends the shipped config (nested dual-rope +
@@ -833,6 +862,7 @@ if(VLLM_CPP_SERVER)
     # (LoadedEngine -> PoolingRunner) on the committed llama_embed_e2e fixture
     # (ARCH-ONE-SURFACE ROW 6).
     LLAMA_EMBED_FIXTURE_DIR="${CMAKE_SOURCE_DIR}/tests/vllm/models/fixtures/llama_embed_e2e")
+  target_include_directories(test_openai_api_server PRIVATE ${CMAKE_SOURCE_DIR}/src)
   # M3.6: the OpenAI server CONFORMANCE suite — the full API contract exercised
   # end to end over the REAL cpp-httplib server on an ephemeral port.
   vllm_cpp_add_test(test_openai_conformance vllm/entrypoints/openai/test_conformance.cpp)
@@ -904,6 +934,14 @@ target_include_directories(test_dropin_abi PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_cuda_ops vt/test_cuda_ops.cpp)
 vllm_cpp_add_test(test_dtype vt/test_dtype.cpp)
 vllm_cpp_add_test(test_backend vt/test_backend.cpp)
+add_executable(test_vulkan_loader
+  vt/test_vulkan_loader.cpp
+  ${CMAKE_SOURCE_DIR}/src/vt/vulkan/vulkan_loader.cpp)
+target_include_directories(test_vulkan_loader PRIVATE
+  ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(test_vulkan_loader PRIVATE vllm_test_main ${CMAKE_DL_LIBS})
+vllm_cpp_set_warnings(test_vulkan_loader)
+add_test(NAME test_vulkan_loader COMMAND test_vulkan_loader)
 # CPU-vs-device op-equality harness (BACKEND-METAL-MLX W0). Unconditional: it
 # discovers which non-CPU backends this build registered and compares only those,
 # so it is meaningful on a CUDA box, on the Metal M4, and inert (CPU-only bit-
@@ -1100,10 +1138,12 @@ target_include_directories(test_cpu_threadpool PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_ops_nvfp4_matmul vt/test_ops_nvfp4_matmul.cpp)
 vllm_cpp_add_test(test_ops_nvfp4_fp4 vt/test_ops_nvfp4_fp4.cpp)
 target_include_directories(test_ops_nvfp4_fp4 PRIVATE ${CMAKE_SOURCE_DIR}/src)
-vllm_cpp_add_test(test_nvfp4_persistent_cache vt/test_nvfp4_persistent_cache.cpp)
-target_include_directories(test_nvfp4_persistent_cache PRIVATE ${CMAKE_SOURCE_DIR}/src)
-target_compile_definitions(test_nvfp4_persistent_cache PRIVATE
-  TEST_FIXTURES_DIR="${CMAKE_SOURCE_DIR}/tests/fixtures")
+if(NOT WIN32)
+  vllm_cpp_add_test(test_nvfp4_persistent_cache vt/test_nvfp4_persistent_cache.cpp)
+  target_include_directories(test_nvfp4_persistent_cache PRIVATE ${CMAKE_SOURCE_DIR}/src)
+  target_compile_definitions(test_nvfp4_persistent_cache PRIVATE
+    TEST_FIXTURES_DIR="${CMAKE_SOURCE_DIR}/tests/fixtures")
+endif()
 if(VLLM_CPP_CUTLASS)
   foreach(_NVFP4_TACTIC RANGE 0 31)
     add_test(NAME test_ops_nvfp4_fp4_tactic_${_NVFP4_TACTIC}
@@ -1137,6 +1177,16 @@ add_test(NAME test_ops_fp8_cutlass_plan_cache_on
     "--test-case=fp8 cuBLASLt cached-plan GEMM is BYTE-identical to the fresh-plan GEMM")
 set_tests_properties(test_ops_fp8_cutlass_plan_cache_on PROPERTIES
   ENVIRONMENT "VT_FP8_PLAN_CACHE=1")
+# Opt-in arm: PERF-FP8-ALPHA-FOLD's per-column alpha applied INSIDE the cuBLASLt
+# epilogue (VT_FP8_ALPHA_VEC_EPILOGUE=1) versus the shipped two-launch form. This
+# is the BINDING byte-exactness comparison. The plain test_ops_fp8_cutlass run has
+# the toggle unset, where both sides execute the same fallback code and the case
+# only proves that fallback is unchanged.
+add_test(NAME test_ops_fp8_alpha_vec_epilogue_on
+  COMMAND test_ops_fp8_cutlass
+    "--test-case=fp8 cuBLASLt per-column alpha is BYTE-identical to the two-launch form")
+set_tests_properties(test_ops_fp8_alpha_vec_epilogue_on PROPERTIES
+  ENVIRONMENT "VT_FP8_ALPHA_VEC_EPILOGUE=1")
 vllm_cpp_add_test(test_ops_moe_grouped vt/test_ops_moe_grouped.cpp)
 vllm_cpp_add_test(test_ops_moe_grouped_bf16 vt/test_ops_moe_grouped_bf16.cpp)
 vllm_cpp_add_test(test_ops_moe_grouped_bf16_gate_up_silu
@@ -1162,10 +1212,23 @@ vllm_cpp_add_test(test_ops_kda_recurrence vt/test_ops_kda_recurrence.cpp)
 target_include_directories(test_ops_kda_recurrence PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_ops_kda_chunk_prefill vt/test_ops_kda_chunk_prefill.cpp)
 target_include_directories(test_ops_kda_chunk_prefill PRIVATE ${CMAKE_SOURCE_DIR}/src)
+# Mamba2 / SSD host references (.agents/specs/mamba2-ssd.md W1, #496). Three
+# sibling ops of the GDN/KDA lane above, gated against a sequential
+# double-precision reference and across chunk sizes.
+vllm_cpp_add_test(test_ops_mamba2_ssd vt/test_ops_mamba2_ssd.cpp)
+target_include_directories(test_ops_mamba2_ssd PRIVATE ${CMAKE_SOURCE_DIR}/src)
+vllm_cpp_add_test(test_ops_mamba2_state_update vt/test_ops_mamba2_state_update.cpp)
+target_include_directories(test_ops_mamba2_state_update PRIVATE ${CMAKE_SOURCE_DIR}/src)
+vllm_cpp_add_test(test_ops_mamba2_gated_norm vt/test_ops_mamba2_gated_norm.cpp)
+target_include_directories(test_ops_mamba2_gated_norm PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_ops_moe vt/test_ops_moe.cpp)
 vllm_cpp_add_test(test_ops_glue vt/test_ops_glue.cpp)
 vllm_cpp_add_test(test_ops_attn_preamble vt/test_ops_attn_preamble.cpp)
 vllm_cpp_add_test(test_ops_attention vt/test_ops_attention.cpp)
+# vt::AttentionDenseFa2 (multimodal-speed §17, #432): fast-path agreement with the
+# byte-exact scalar kernel, full-key-range coverage, fall-through totality, and the
+# VT_FA2_DENSE A/B knob. CUDA-only content; skips cleanly on a CPU box.
+vllm_cpp_add_test(test_ops_attention_dense_fa2 vt/test_ops_attention_dense_fa2.cpp)
 # vt::AttentionCross, DIRECTLY, on every backend that registers it. Its own
 # target rather than more cases in test_ops_attention or test_ltx2_device, both
 # of which carry recorded baselines. It exists because the CUDA kernel's whole
@@ -1428,6 +1491,21 @@ target_compile_definitions(test_qwen27_paged_engine PRIVATE
 target_include_directories(test_qwen27_paged_engine PRIVATE
   ${CMAKE_SOURCE_DIR}/tests/parity ${CMAKE_SOURCE_DIR}/src)
 
+# `GATE-27B-FP8-TOWER-GOLDEN` (issue #466): the SECOND dense 27B arm, pinned to
+# nvidia/Qwen3.6-27B-NVFP4@0893e160 (`modelopt_mixed` — W4A16 NVFP4 MLP + FP8
+# W8A8 tower + NVFP4 head). The gate above pins unsloth@890bdef7, whose GDN
+# input projections are BF16, so every fp8 branch is dead code there and that
+# gate can never fail for an fp8 defect. This arm asserts the fp8 GDN
+# input-projection dispatch contract UNCONDITIONALLY — a zero count is a
+# failure, not a skipped block. Checkpoint-gated, dgx-only; on CPU/CI it refuses
+# loudly instead of reporting a vacuous pass.
+vllm_cpp_add_test(test_qwen27n_fp8_tower_paged_engine
+  parity/test_qwen27n_fp8_tower_paged_engine.cpp)
+target_compile_definitions(test_qwen27n_fp8_tower_paged_engine PRIVATE
+  PARITY_GOLDENS_DIR="${CMAKE_SOURCE_DIR}/tests/parity/goldens")
+target_include_directories(test_qwen27n_fp8_tower_paged_engine PRIVATE
+  ${CMAKE_SOURCE_DIR}/tests/parity ${CMAKE_SOURCE_DIR}/src)
+
 # `PERF-27B-LMHEAD-FP4` (issue #213): the ModelOpt NVFP4 lm_head stays PACKED.
 # Synthetic (no checkpoint, no GPU) BECAUSE test_qwen27_paged_engine runs the
 # unsloth @890bdef7 snapshot, whose head is BF16 — that gate cannot see this path.
@@ -1481,6 +1559,14 @@ target_compile_definitions(test_qwen36_spec_decode PRIVATE
   PARITY_GOLDENS_DIR="${CMAKE_SOURCE_DIR}/tests/parity/goldens")
 target_include_directories(test_qwen36_spec_decode PRIVATE
   ${CMAKE_SOURCE_DIR}/tests/parity ${CMAKE_SOURCE_DIR}/src)
+
+# GATE-PIN-UNPINNED-SNAPSHOTS (#471). The resolver gate: CPU-only, needs no
+# checkpoint, synthesises its own two-revision cache. It is the direct proof that
+# a pinned accessor selects rather than substitutes, and unlike every gate it
+# protects, it runs everywhere.
+vllm_cpp_add_test(test_hf_snapshot_pinning parity/test_hf_snapshot_pinning.cpp)
+target_include_directories(test_hf_snapshot_pinning PRIVATE
+  ${CMAKE_SOURCE_DIR}/tests/parity)
 
 # SPEC-NGRAM (ROAD-V1-D3) — the 27B draft-free ngram e2e gate: our ngram-ON ==
 # the committed vLLM-ngram-ON golden (STRICT, exactness-preserving greedy) +

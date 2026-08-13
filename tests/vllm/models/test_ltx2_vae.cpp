@@ -24,7 +24,10 @@
 #include "doctest/doctest.h"
 #include "support/max_abs_diff.h"
 #include "vllm/model_executor/models/ltx2_audio_vae.h"
+#include "vllm/model_executor/models/ltx2_audio_vae_encoder.h"
+#include "vllm/model_executor/models/ltx2_conditioning.h"
 #include "vllm/model_executor/models/ltx2_video_vae.h"
+#include "vllm/model_executor/models/ltx2_video_vae_encoder.h"
 // kMiniMaxH3SnakeEps: the Snake/SnakeBeta stabilizer is SHARED with MiniMax-H3's
 // BigVGAN, so the constant this suite pins lives in that header.
 #include "vllm/model_executor/models/minimax_h3.h"
@@ -1216,4 +1219,956 @@ TEST_CASE("ltx2 vae: the diffusion video decoder is refused by name, never downg
   CHECK(message.find("neighborhood") != std::string::npos);
   // And nothing may have been decoded on the way to the refusal.
   CHECK(noise.counts().empty());
+}
+
+// ===========================================================================
+// PHASE L11 — the ENCODER halves, gated against the same upstream `ltx_core`
+// executed at reduced dimensions by scripts/gen-ltx2-vae-goldens.py sections
+// 6-8.
+// ===========================================================================
+
+namespace {
+
+// The reduced VideoEncoder arm A the generator built (VIDEO_ENC_A_BLOCKS).
+vllm::Ltx2ConvVideoEncoderConfig ReducedVideoEncoderConfigA() {
+  vllm::Ltx2ConvVideoEncoderConfig cfg;
+  cfg.in_channels = 3;
+  cfg.out_channels = 4;
+  cfg.patch_size = 2;
+  cfg.norm_layer = vllm::Ltx2NormLayer::kPixelNorm;
+  cfg.latent_log_var = vllm::Ltx2LogVarianceType::kUniform;
+  cfg.spatial_padding_mode = vllm::Ltx2PaddingMode::kZeros;
+  cfg.encoder_blocks = {
+      {"res_x", 1, 0},
+      {"compress_space_res", 1, 2},
+      {"res_x_y", 1, 2},
+      {"attn", 1, 0},
+      {"compress_time_res", 1, 1},
+  };
+  cfg.prefix = "ltx2.videoenc.";
+  return cfg;
+}
+
+// The reduced VideoEncoder arm B (VIDEO_ENC_B_BLOCKS) — the plain strided
+// convolutions, `per_channel` log variance, and REFLECT spatial padding.
+vllm::Ltx2ConvVideoEncoderConfig ReducedVideoEncoderConfigB() {
+  vllm::Ltx2ConvVideoEncoderConfig cfg;
+  cfg.in_channels = 3;
+  cfg.out_channels = 4;
+  cfg.patch_size = 1;
+  cfg.norm_layer = vllm::Ltx2NormLayer::kPixelNorm;
+  cfg.latent_log_var = vllm::Ltx2LogVarianceType::kPerChannel;
+  cfg.spatial_padding_mode = vllm::Ltx2PaddingMode::kReflect;
+  cfg.encoder_blocks = {
+      {"compress_all", 1, 0},
+      {"compress_space", 1, 0},
+      {"compress_time", 1, 0},
+      {"compress_all_x_y", 1, 2},
+  };
+  cfg.prefix = "ltx2.videoencb.";
+  return cfg;
+}
+
+// Build the VideoEncoder's parameters in upstream state_dict ORDER
+// (video_vae.py:194-262): per_channel_statistics, conv_in, the FORWARD block
+// walk, conv_norm_out (GroupNorm arm only), conv_out. PixelNorm carries no
+// parameters, which is why no norm tensor appears on the pixel arm.
+ParamBag BuildVideoEncoderParams(const vllm::Ltx2ConvVideoEncoderConfig& cfg) {
+  ParamBag bag;
+  const std::string p = cfg.prefix;
+  bag.Put(p + "per_channel_statistics.std-of-means", {cfg.out_channels});
+  bag.Put(p + "per_channel_statistics.mean-of-means", {cfg.out_channels});
+  const int64_t patched_in = cfg.in_channels * cfg.patch_size * cfg.patch_size;
+  bag.Put(p + "conv_in.conv.weight", {cfg.out_channels, patched_in, 3, 3, 3});
+  bag.Put(p + "conv_in.conv.bias", {cfg.out_channels});
+
+  auto put_resnet = [&](const std::string& prefix, int64_t in_ch, int64_t out_ch) {
+    bag.Put(prefix + ".conv1.conv.weight", {out_ch, in_ch, 3, 3, 3});
+    bag.Put(prefix + ".conv1.conv.bias", {out_ch});
+    bag.Put(prefix + ".conv2.conv.weight", {out_ch, out_ch, 3, 3, 3});
+    bag.Put(prefix + ".conv2.conv.bias", {out_ch});
+    if (in_ch != out_ch) {
+      // make_linear_nd -> a 1x1x1 Conv3d, and norm3 -> GroupNorm(1) over the
+      // INPUT channels (resnet.py:85-97). Both exist only when the widths differ.
+      bag.Put(prefix + ".conv_shortcut.weight", {out_ch, in_ch, 1, 1, 1});
+      bag.Put(prefix + ".conv_shortcut.bias", {out_ch});
+      bag.Put(prefix + ".norm3.weight", {in_ch});
+      bag.Put(prefix + ".norm3.bias", {in_ch});
+    }
+  };
+
+  int64_t feature = cfg.out_channels;
+  for (size_t i = 0; i < cfg.encoder_blocks.size(); ++i) {
+    const vllm::Ltx2VideoEncoderBlock& block = cfg.encoder_blocks[i];
+    const std::string bp = p + "down_blocks." + std::to_string(i);
+    const int64_t multiplier = block.multiplier != 0 ? block.multiplier : 2;
+    if (block.name == "res_x") {
+      for (int64_t j = 0; j < block.num_layers; ++j) {
+        put_resnet(bp + ".res_blocks." + std::to_string(j), feature, feature);
+      }
+    } else if (block.name == "res_x_y") {
+      put_resnet(bp, feature, feature * multiplier);
+      feature *= multiplier;
+    } else if (block.name == "attn") {
+      bag.Put(bp + ".norm.gamma", {feature});
+      bag.Put(bp + ".to_qkv.weight", {3 * feature, feature, 1, 1});
+      bag.Put(bp + ".to_qkv.bias", {3 * feature});
+      bag.Put(bp + ".proj.weight", {feature, feature, 1, 1});
+      bag.Put(bp + ".proj.bias", {feature});
+    } else if (block.name == "compress_time" || block.name == "compress_space" ||
+               block.name == "compress_all" || block.name == "compress_all_x_y") {
+      const int64_t out = block.name == "compress_all_x_y" ? feature * multiplier : feature;
+      bag.Put(bp + ".conv.weight", {out, feature, 3, 3, 3});
+      bag.Put(bp + ".conv.bias", {out});
+      feature = out;
+    } else {
+      // The *_res family: SpaceToDepthDownsample's conv emits
+      // out_channels / prod(stride), which the fold multiplies back up.
+      const int64_t st = block.name == "compress_space_res" ? 1 : 2;
+      const int64_t ss = block.name == "compress_time_res" ? 1 : 2;
+      const int64_t out = feature * multiplier;
+      const int64_t conv_out = out / (st * ss * ss);
+      bag.Put(bp + ".conv.conv.weight", {conv_out, feature, 3, 3, 3});
+      bag.Put(bp + ".conv.conv.bias", {conv_out});
+      feature = out;
+    }
+  }
+
+  if (cfg.norm_layer == vllm::Ltx2NormLayer::kGroupNorm) {
+    bag.Put(p + "conv_norm_out.weight", {feature});
+    bag.Put(p + "conv_norm_out.bias", {feature});
+  }
+  int64_t conv_out_channels = cfg.out_channels;
+  if (cfg.latent_log_var == vllm::Ltx2LogVarianceType::kPerChannel) {
+    conv_out_channels *= 2;
+  } else if (cfg.latent_log_var == vllm::Ltx2LogVarianceType::kUniform ||
+             cfg.latent_log_var == vllm::Ltx2LogVarianceType::kConstant) {
+    conv_out_channels += 1;
+  }
+  bag.Put(p + "conv_out.conv.weight", {conv_out_channels, feature, 3, 3, 3});
+  bag.Put(p + "conv_out.conv.bias", {conv_out_channels});
+  return bag;
+}
+
+// The reduced AudioEncoder the generator built (AUDIO_ENC).
+vllm::Ltx2AudioEncoderConfig ReducedAudioEncoderConfig() {
+  vllm::Ltx2AudioEncoderConfig cfg;
+  cfg.ch = 8;
+  cfg.in_channels = 2;
+  cfg.ch_mult = {1, 2, 4};
+  cfg.num_res_blocks = 1;
+  cfg.attn_resolutions = {8};
+  cfg.resolution = 32;
+  cfg.z_channels = 4;
+  cfg.double_z = true;
+  cfg.resamp_with_conv = true;
+  cfg.mid_block_add_attention = true;
+  cfg.norm_type = vllm::Ltx2NormType::kPixel;
+  cfg.causality_axis = vllm::Ltx2CausalityAxis::kHeight;
+  cfg.prefix = "ltx2.audioenc.";
+  return cfg;
+}
+
+// Build the AudioEncoder's parameters in upstream state_dict ORDER
+// (audio_vae.py:118-188): per_channel_statistics, conv_in, then per level the
+// `block` ModuleList, then that level's `attn` ModuleList, then `downsample`;
+// then mid, then conv_out.
+ParamBag BuildAudioEncoderParams(const vllm::Ltx2AudioEncoderConfig& cfg) {
+  ParamBag bag;
+  const std::string p = cfg.prefix;
+  const int64_t levels = cfg.num_resolutions();
+
+  bag.Put(p + "per_channel_statistics.std-of-means", {cfg.ch});
+  bag.Put(p + "per_channel_statistics.mean-of-means", {cfg.ch});
+  bag.Put(p + "conv_in.conv.weight", {cfg.ch, cfg.in_channels, 3, 3});
+  bag.Put(p + "conv_in.conv.bias", {cfg.ch});
+
+  auto put_resnet = [&](const std::string& prefix, int64_t in_ch, int64_t out_ch) {
+    bag.Put(prefix + ".conv1.conv.weight", {out_ch, in_ch, 3, 3});
+    bag.Put(prefix + ".conv1.conv.bias", {out_ch});
+    bag.Put(prefix + ".conv2.conv.weight", {out_ch, out_ch, 3, 3});
+    bag.Put(prefix + ".conv2.conv.bias", {out_ch});
+    if (in_ch != out_ch) {
+      bag.Put(prefix + ".nin_shortcut.conv.weight", {out_ch, in_ch, 1, 1});
+      bag.Put(prefix + ".nin_shortcut.conv.bias", {out_ch});
+    }
+  };
+  auto put_attn = [&](const std::string& prefix, int64_t channels) {
+    for (const char* leaf : {"q", "k", "v", "proj_out"}) {
+      bag.Put(prefix + "." + leaf + ".weight", {channels, channels, 1, 1});
+      bag.Put(prefix + "." + leaf + ".bias", {channels});
+    }
+  };
+
+  // `in_ch_mult = (1, *ch_mult)` (downsample.py:78-85): level i READS
+  // ch * ch_mult[i-1] and WRITES ch * ch_mult[i].
+  int64_t curr_res = cfg.resolution;
+  int64_t block_in = cfg.ch;
+  for (int64_t level = 0; level < levels; ++level) {
+    const std::string sp = p + "down." + std::to_string(level);
+    const int64_t block_out = cfg.ch * cfg.ch_mult[static_cast<size_t>(level)];
+    const bool has_attn = std::find(cfg.attn_resolutions.begin(), cfg.attn_resolutions.end(),
+                                    curr_res) != cfg.attn_resolutions.end();
+    for (int64_t i = 0; i < cfg.num_res_blocks; ++i) {
+      put_resnet(sp + ".block." + std::to_string(i), block_in, block_out);
+      block_in = block_out;
+    }
+    if (has_attn) {
+      for (int64_t i = 0; i < cfg.num_res_blocks; ++i) {
+        put_attn(sp + ".attn." + std::to_string(i), block_out);
+      }
+    }
+    if (level != levels - 1) {
+      if (cfg.resamp_with_conv) {
+        // Downsample's conv is a BARE nn.Conv2d, so its key is `.downsample.conv`
+        // and NOT the `.conv.conv` a CausalConv2d produces.
+        bag.Put(sp + ".downsample.conv.weight", {block_in, block_in, 3, 3});
+        bag.Put(sp + ".downsample.conv.bias", {block_in});
+      }
+      curr_res /= 2;
+    }
+  }
+
+  put_resnet(p + "mid.block_1", block_in, block_in);
+  if (cfg.mid_block_add_attention) put_attn(p + "mid.attn_1", block_in);
+  put_resnet(p + "mid.block_2", block_in, block_in);
+
+  const int64_t conv_out_channels = cfg.double_z ? 2 * cfg.z_channels : cfg.z_channels;
+  bag.Put(p + "conv_out.conv.weight", {conv_out_channels, block_in, 3, 3});
+  bag.Put(p + "conv_out.conv.bias", {conv_out_channels});
+  return bag;
+}
+
+}  // namespace
+
+TEST_CASE("ltx2 vae: the video ENCODER (*_res family) matches upstream ltx_core") {
+  const vllm::Ltx2ConvVideoEncoderConfig cfg = ReducedVideoEncoderConfigA();
+  ParamBag bag = BuildVideoEncoderParams(cfg);
+  CheckManifest(bag, vllm_test::kLtx2VideoEncParamNames, vllm_test::kLtx2VideoEncParamCounts,
+                std::size(vllm_test::kLtx2VideoEncParamNames));
+
+  // The scale factors are derived from the block list, not hardcoded, and they
+  // are what decides the frame-count crop below.
+  CHECK(vllm::Ltx2VideoTemporalScaleFactor(cfg.encoder_blocks) ==
+        vllm_test::kLtx2VideoEncTemporalFactor);
+  CHECK(vllm::Ltx2VideoSpatialScaleFactor(cfg.encoder_blocks, cfg.patch_size) ==
+        vllm_test::kLtx2VideoEncSpatialFactor);
+
+  const int64_t c = vllm_test::kLtx2VideoEncInC;
+  const int64_t t = vllm_test::kLtx2VideoEncInT;
+  const int64_t h = vllm_test::kLtx2VideoEncInH;
+  const int64_t w = vllm_test::kLtx2VideoEncInW;
+  const std::vector<float> frames = Ltx2Input("ltx2.videoenc.input", c * t * h * w, 1.0);
+
+  int64_t cropped = -1;
+  const vllm::Ltx2LatentVolume latent =
+      vllm::Ltx2ConvVideoEncode(cfg, bag.weights, frames, c, t, h, w, &cropped);
+  CHECK(cropped == 0);
+  CHECK(latent.batch == 1);
+  CHECK(latent.channels == vllm_test::kLtx2VideoEncOutC);
+  CHECK(latent.frames == vllm_test::kLtx2VideoEncOutT);
+  CHECK(latent.height == vllm_test::kLtx2VideoEncOutH);
+  CHECK(latent.width == vllm_test::kLtx2VideoEncOutW);
+
+  const double err = MaxAbsDiff(latent.data, vllm_test::kLtx2VideoEncGolden,
+                                std::size(vllm_test::kLtx2VideoEncGolden));
+  INFO("video encoder (*_res) max|diff| = " << err);
+  CHECK(err <= kLtx2GoldenTol);
+
+  // `constant` keeps `sample[:, :-1]` as the means exactly as `uniform` does
+  // (video_vae.py:315 vs :327), so with the same weights the two are IDENTICAL.
+  // The generator asserts this against upstream; asserting it here too is what
+  // makes the C++ arm's shared code path a claim rather than an assumption.
+  vllm::Ltx2ConvVideoEncoderConfig const_cfg = cfg;
+  const_cfg.latent_log_var = vllm::Ltx2LogVarianceType::kConstant;
+  const vllm::Ltx2LatentVolume const_latent =
+      vllm::Ltx2ConvVideoEncode(const_cfg, bag.weights, frames, c, t, h, w, nullptr);
+  CHECK(const_latent.data == latent.data);
+}
+
+TEST_CASE("ltx2 vae: the video ENCODER (strided convs, per_channel, reflect) matches upstream") {
+  // A DIFFERENT block vocabulary, a DIFFERENT log-variance mode and a DIFFERENT
+  // spatial padding mode from arm A. The padding matters on its own: the encoder
+  // DEFAULTS to `zeros` while the decoder defaults to `reflect`
+  // (model_configurator.py:63-67 vs :90), so an implementation that copied the
+  // decoder's default would pass arm A only by luck of the border.
+  const vllm::Ltx2ConvVideoEncoderConfig cfg = ReducedVideoEncoderConfigB();
+  ParamBag bag = BuildVideoEncoderParams(cfg);
+  CheckManifest(bag, vllm_test::kLtx2VideoEncBParamNames, vllm_test::kLtx2VideoEncBParamCounts,
+                std::size(vllm_test::kLtx2VideoEncBParamNames));
+
+  CHECK(vllm::Ltx2VideoTemporalScaleFactor(cfg.encoder_blocks) ==
+        vllm_test::kLtx2VideoEncBTemporalFactor);
+  CHECK(vllm::Ltx2VideoSpatialScaleFactor(cfg.encoder_blocks, cfg.patch_size) ==
+        vllm_test::kLtx2VideoEncBSpatialFactor);
+
+  const int64_t c = vllm_test::kLtx2VideoEncBInC;
+  const int64_t t = vllm_test::kLtx2VideoEncBInT;
+  const int64_t h = vllm_test::kLtx2VideoEncBInH;
+  const int64_t w = vllm_test::kLtx2VideoEncBInW;
+  const std::vector<float> frames = Ltx2Input("ltx2.videoencb.input", c * t * h * w, 1.0);
+
+  const vllm::Ltx2LatentVolume latent =
+      vllm::Ltx2ConvVideoEncode(cfg, bag.weights, frames, c, t, h, w, nullptr);
+  CHECK(latent.channels == vllm_test::kLtx2VideoEncBOutC);
+  CHECK(latent.frames == vllm_test::kLtx2VideoEncBOutT);
+  CHECK(latent.height == vllm_test::kLtx2VideoEncBOutH);
+  CHECK(latent.width == vllm_test::kLtx2VideoEncBOutW);
+
+  const double err = MaxAbsDiff(latent.data, vllm_test::kLtx2VideoEncBGolden,
+                                std::size(vllm_test::kLtx2VideoEncBGolden));
+  INFO("video encoder (strided convs) max|diff| = " << err);
+  CHECK(err <= kLtx2GoldenTol);
+
+  // The padding mode is load-bearing, so prove the two modes DIFFER on identical
+  // weights and input. Without this the arm would gate the block vocabulary only.
+  vllm::Ltx2ConvVideoEncoderConfig zeros_cfg = cfg;
+  zeros_cfg.spatial_padding_mode = vllm::Ltx2PaddingMode::kZeros;
+  const vllm::Ltx2LatentVolume zeros_latent =
+      vllm::Ltx2ConvVideoEncode(zeros_cfg, bag.weights, frames, c, t, h, w, nullptr);
+  REQUIRE(zeros_latent.data.size() == latent.data.size());
+  CHECK(zeros_latent.data != latent.data);
+}
+
+TEST_CASE("ltx2 vae: the video encoder CROPS a frame count that is not 1 + k*factor") {
+  // Upstream WARNS and crops rather than failing (video_vae.py:276-286), so a
+  // caller that hands 6 frames to an 8-frame-factor encoder gets a shorter clip
+  // and no error. The crop must therefore be reproduced exactly, and the count
+  // reported so the caller can surface it.
+  const vllm::Ltx2ConvVideoEncoderConfig cfg = ReducedVideoEncoderConfigA();
+  ParamBag bag = BuildVideoEncoderParams(cfg);
+
+  const int64_t c = vllm_test::kLtx2VideoEncInC;
+  const int64_t kept = vllm_test::kLtx2VideoEncInT;
+  const int64_t t = vllm_test::kLtx2VideoEncCropInT;
+  const int64_t h = vllm_test::kLtx2VideoEncInH;
+  const int64_t w = vllm_test::kLtx2VideoEncInW;
+  REQUIRE(t == kept + vllm_test::kLtx2VideoEncCropDropped);
+
+  // The generator built the 6-frame input by CONCATENATING one extra frame onto
+  // arm A's 5-frame input, so the same concatenation here must reproduce arm A's
+  // golden exactly once the tail is cropped.
+  const std::vector<float> head = Ltx2Input("ltx2.videoenc.input", c * kept * h * w, 1.0);
+  const std::vector<float> tail = Ltx2Input("ltx2.videoenc.tail", c * 1 * h * w, 1.0);
+  std::vector<float> frames(static_cast<size_t>(c * t * h * w));
+  for (int64_t ch = 0; ch < c; ++ch) {
+    const size_t plane = static_cast<size_t>(h * w);
+    std::copy(head.begin() + static_cast<ptrdiff_t>(ch * kept * h * w),
+              head.begin() + static_cast<ptrdiff_t>((ch + 1) * kept * h * w),
+              frames.begin() + static_cast<ptrdiff_t>(ch * t * h * w));
+    std::copy(tail.begin() + static_cast<ptrdiff_t>(static_cast<size_t>(ch) * plane),
+              tail.begin() + static_cast<ptrdiff_t>(static_cast<size_t>(ch + 1) * plane),
+              frames.begin() + static_cast<ptrdiff_t>(ch * t * h * w + kept * h * w));
+  }
+
+  int64_t cropped = -1;
+  const vllm::Ltx2LatentVolume latent =
+      vllm::Ltx2ConvVideoEncode(cfg, bag.weights, frames, c, t, h, w, &cropped);
+  CHECK(cropped == vllm_test::kLtx2VideoEncCropDropped);
+  CHECK(latent.frames == vllm_test::kLtx2VideoEncOutT);
+
+  const double err = MaxAbsDiff(latent.data, vllm_test::kLtx2VideoEncGolden,
+                                std::size(vllm_test::kLtx2VideoEncGolden));
+  INFO("cropped video encoder max|diff| = " << err);
+  CHECK(err <= kLtx2GoldenTol);
+}
+
+TEST_CASE("ltx2 vae: video ENCODER temporal causality is one-sided, proven by perturbation") {
+  // MEASURED, not assumed. The block list deliberately excludes `res_x_y` (whose
+  // shortcut norm3 is a one-group GroupNorm whose statistics span TIME) and `attn`,
+  // so what is left is decided by the causal padding alone. Upstream itself
+  // supplies the expected window, and the generator asserts the probe both moves
+  // something AND leaves an early frame untouched — a probe that moved everything
+  // would be indistinguishable from a non-causal encoder.
+  vllm::Ltx2ConvVideoEncoderConfig cfg = ReducedVideoEncoderConfigA();
+  cfg.encoder_blocks = {{"res_x", 1, 0}, {"compress_time_res", 1, 1}};
+  cfg.prefix = "ltx2.videoenccausal.";
+  ParamBag bag = BuildVideoEncoderParams(cfg);
+  CheckManifest(bag, vllm_test::kLtx2VideoEncCausalParamNames,
+                vllm_test::kLtx2VideoEncCausalParamCounts,
+                std::size(vllm_test::kLtx2VideoEncCausalParamNames));
+
+  const int64_t c = vllm_test::kLtx2VideoEncInC;
+  const int64_t t = vllm_test::kLtx2VideoEncInT;
+  const int64_t h = vllm_test::kLtx2VideoEncInH;
+  const int64_t w = vllm_test::kLtx2VideoEncInW;
+  const std::vector<float> frames = Ltx2Input("ltx2.videoenc.input", c * t * h * w, 1.0);
+
+  const vllm::Ltx2LatentVolume base =
+      vllm::Ltx2ConvVideoEncode(cfg, bag.weights, frames, c, t, h, w, nullptr);
+  CHECK(base.frames == vllm_test::kLtx2VideoEncCausalOutT);
+  const double err = MaxAbsDiff(base.data, vllm_test::kLtx2VideoEncCausalGolden,
+                                std::size(vllm_test::kLtx2VideoEncCausalGolden));
+  INFO("causal-arm video encoder max|diff| = " << err);
+  CHECK(err <= kLtx2GoldenTol);
+
+  // Perturb the LAST pixel frame and see which LATENT frames move.
+  std::vector<float> bumped = frames;
+  for (int64_t ch = 0; ch < c; ++ch) {
+    for (int64_t i = 0; i < h * w; ++i) {
+      bumped[static_cast<size_t>((ch * t + (t - 1)) * h * w + i)] += 5.0f;
+    }
+  }
+  const vllm::Ltx2LatentVolume moved_out =
+      vllm::Ltx2ConvVideoEncode(cfg, bag.weights, bumped, c, t, h, w, nullptr);
+  REQUIRE(moved_out.frames == base.frames);
+
+  int64_t first_moved = -1;
+  int64_t last_moved = -1;
+  const int64_t plane = base.height * base.width;
+  for (int64_t f = 0; f < base.frames; ++f) {
+    bool differs = false;
+    for (int64_t ch = 0; ch < base.channels && !differs; ++ch) {
+      for (int64_t i = 0; i < plane; ++i) {
+        const size_t index = static_cast<size_t>((ch * base.frames + f) * plane + i);
+        if (base.data[index] != moved_out.data[index]) {
+          differs = true;
+          break;
+        }
+      }
+    }
+    if (differs) {
+      if (first_moved < 0) first_moved = f;
+      last_moved = f;
+    }
+  }
+  INFO("moved latent frames: [" << first_moved << ", " << last_moved << "]");
+  CHECK(first_moved == vllm_test::kLtx2VideoEncCausalFirstMoved);
+  CHECK(last_moved == vllm_test::kLtx2VideoEncCausalLastMoved);
+  // The claim only means something if EARLIER frames genuinely did not move.
+  CHECK(first_moved > 0);
+}
+
+TEST_CASE("ltx2 vae: latent_log_var=`none` is refused by name, never approximated") {
+  // Upstream RAISES here — the generator executes it and records the exception
+  // type — because `none` sizes conv_out at out_channels and then still chunks in
+  // two (video_vae.py:335), leaving half as many mean channels as the per-channel
+  // statistics carry. Inventing a semantics for it would be a silent divergence.
+  CHECK(std::string(vllm_test::kLtx2VideoEncNoneRaises) == "RuntimeError");
+
+  vllm::Ltx2ConvVideoEncoderConfig cfg = ReducedVideoEncoderConfigA();
+  cfg.latent_log_var = vllm::Ltx2LogVarianceType::kNone;
+  ParamBag bag = BuildVideoEncoderParams(cfg);
+  const int64_t c = vllm_test::kLtx2VideoEncInC;
+  const int64_t t = vllm_test::kLtx2VideoEncInT;
+  const int64_t h = vllm_test::kLtx2VideoEncInH;
+  const int64_t w = vllm_test::kLtx2VideoEncInW;
+  const std::vector<float> frames = Ltx2Input("ltx2.videoenc.input", c * t * h * w, 1.0);
+
+  bool threw = false;
+  std::string message;
+  try {
+    vllm::Ltx2ConvVideoEncode(cfg, bag.weights, frames, c, t, h, w, nullptr);
+  } catch (const std::exception& error) {
+    threw = true;
+    message = error.what();
+  }
+  REQUIRE(threw);
+  INFO("refusal message: " << message);
+  CHECK(message.find("latent_log_var") != std::string::npos);
+  CHECK(message.find("video_vae.py:335") != std::string::npos);
+}
+
+TEST_CASE("ltx2 vae: the AUDIO encoder matches upstream ltx_core") {
+  const vllm::Ltx2AudioEncoderConfig cfg = ReducedAudioEncoderConfig();
+  ParamBag bag = BuildAudioEncoderParams(cfg);
+  CheckManifest(bag, vllm_test::kLtx2AudioEncParamNames, vllm_test::kLtx2AudioEncParamCounts,
+                std::size(vllm_test::kLtx2AudioEncParamNames));
+
+  const int64_t c = vllm_test::kLtx2AudioEncInC;
+  const int64_t t = vllm_test::kLtx2AudioEncInT;
+  const int64_t f = vllm_test::kLtx2AudioEncInF;
+  const std::vector<float> spec = Ltx2Input("ltx2.audioenc.input", c * t * f, 1.0);
+
+  const vllm::Ltx2AudioSpectrogram latent =
+      vllm::Ltx2AudioEncoderForward(cfg, bag.weights, spec, c, t, f);
+  CHECK(latent.channels == vllm_test::kLtx2AudioEncOutC);
+  CHECK(latent.frames == vllm_test::kLtx2AudioEncOutT);
+  CHECK(latent.mel_bins == vllm_test::kLtx2AudioEncOutF);
+
+  const double err = MaxAbsDiff(latent.data, vllm_test::kLtx2AudioEncGolden,
+                                std::size(vllm_test::kLtx2AudioEncGolden));
+  INFO("audio encoder max|diff| = " << err);
+  CHECK(err <= kLtx2GoldenTol);
+}
+
+TEST_CASE("ltx2 vae: the AUDIO encoder in the SHIPPED no-attention configuration") {
+  // The 2.x audio VAE metadata carries `attn_resolutions: []` and
+  // `mid_block_add_attention: false`, so the attention arm above is NOT the model
+  // anybody runs. Gating only that arm would gate a configuration this project
+  // never loads.
+  vllm::Ltx2AudioEncoderConfig cfg = ReducedAudioEncoderConfig();
+  cfg.attn_resolutions.clear();
+  cfg.mid_block_add_attention = false;
+  cfg.prefix = "ltx2.audioencplain.";
+  ParamBag bag = BuildAudioEncoderParams(cfg);
+  CheckManifest(bag, vllm_test::kLtx2AudioEncPlainParamNames,
+                vllm_test::kLtx2AudioEncPlainParamCounts,
+                std::size(vllm_test::kLtx2AudioEncPlainParamNames));
+
+  const int64_t c = vllm_test::kLtx2AudioEncInC;
+  const int64_t t = vllm_test::kLtx2AudioEncInT;
+  const int64_t f = vllm_test::kLtx2AudioEncInF;
+  const std::vector<float> spec = Ltx2Input("ltx2.audioenc.input", c * t * f, 1.0);
+
+  const vllm::Ltx2AudioSpectrogram latent =
+      vllm::Ltx2AudioEncoderForward(cfg, bag.weights, spec, c, t, f);
+  CHECK(latent.channels == vllm_test::kLtx2AudioEncPlainOutC);
+  CHECK(latent.frames == vllm_test::kLtx2AudioEncPlainOutT);
+  CHECK(latent.mel_bins == vllm_test::kLtx2AudioEncPlainOutF);
+
+  const double err = MaxAbsDiff(latent.data, vllm_test::kLtx2AudioEncPlainGolden,
+                                std::size(vllm_test::kLtx2AudioEncPlainGolden));
+  INFO("audio encoder (shipped, no attention) max|diff| = " << err);
+  CHECK(err <= kLtx2GoldenTol);
+}
+
+TEST_CASE("ltx2 vae: the AUDIO encoder's average-pool downsample arm") {
+  // `resamp_with_conv=False` replaces the strided convolution with avg_pool2d, and
+  // upstream only permits it with causality NONE (downsample.py:28-29). It is a
+  // different sampling lattice, so it gets its own golden AND its own refusal.
+  vllm::Ltx2AudioEncoderConfig cfg = ReducedAudioEncoderConfig();
+  cfg.resamp_with_conv = false;
+  cfg.causality_axis = vllm::Ltx2CausalityAxis::kNone;
+  cfg.prefix = "ltx2.audioencpool.";
+  ParamBag bag = BuildAudioEncoderParams(cfg);
+  CheckManifest(bag, vllm_test::kLtx2AudioEncPoolParamNames,
+                vllm_test::kLtx2AudioEncPoolParamCounts,
+                std::size(vllm_test::kLtx2AudioEncPoolParamNames));
+
+  const int64_t c = vllm_test::kLtx2AudioEncInC;
+  const int64_t t = vllm_test::kLtx2AudioEncInT;
+  const int64_t f = vllm_test::kLtx2AudioEncInF;
+  const std::vector<float> spec = Ltx2Input("ltx2.audioenc.input", c * t * f, 1.0);
+
+  const vllm::Ltx2AudioSpectrogram latent =
+      vllm::Ltx2AudioEncoderForward(cfg, bag.weights, spec, c, t, f);
+  const double err = MaxAbsDiff(latent.data, vllm_test::kLtx2AudioEncPoolGolden,
+                                std::size(vllm_test::kLtx2AudioEncPoolGolden));
+  INFO("audio encoder (avg-pool) max|diff| = " << err);
+  CHECK(err <= kLtx2GoldenTol);
+
+  // The combination upstream forbids must be refused, not silently pooled.
+  vllm::Ltx2AudioEncoderConfig bad = cfg;
+  bad.causality_axis = vllm::Ltx2CausalityAxis::kHeight;
+  bool threw = false;
+  std::string message;
+  try {
+    vllm::Ltx2AudioEncoderForward(bad, bag.weights, spec, c, t, f);
+  } catch (const std::exception& error) {
+    threw = true;
+    message = error.what();
+  }
+  REQUIRE(threw);
+  INFO("refusal message: " << message);
+  CHECK(message.find("with_conv") != std::string::npos);
+}
+
+TEST_CASE("ltx2 vae: the slaney mel filterbank matches torchaudio") {
+  // The filterbank is gated on its own because a wrong one makes every mel bin
+  // wrong at once, and the resulting mismatch is impossible to localize from the
+  // spectrogram alone. It is also where the slaney constants (200/3, 1000 Hz,
+  // log(6.4)/27) become load-bearing: unlike an epsilon, they move THIS golden.
+  {
+    const int64_t n_freqs = vllm_test::kLtx2MelFreqs;
+    const int64_t n_mels = vllm_test::kLtx2MelBins;
+    const int64_t rate = vllm_test::kLtx2MelRate;
+    const std::vector<float> fb = vllm::Ltx2SlaneyMelFilterbank(
+        n_freqs, 0.0, static_cast<double>(rate) / 2.0, n_mels, rate);
+    REQUIRE(static_cast<int64_t>(fb.size()) ==
+            static_cast<int64_t>(std::size(vllm_test::kLtx2MelBasisGolden)));
+    const double err =
+        MaxAbsDiff(fb, vllm_test::kLtx2MelBasisGolden, std::size(vllm_test::kLtx2MelBasisGolden));
+    INFO("mel filterbank max|diff| = " << err);
+    CHECK(err <= kLtx2FilterTol);
+  }
+  {
+    // An ODD sample rate is the only arm that can see torchaudio's
+    // `torch.linspace(0, sample_rate // 2, n_freqs)` halving with INTEGER
+    // division while `f_max` stays `sample_rate / 2.0`. With an even rate the two
+    // coincide and the distinction is invisible.
+    const int64_t n_freqs = vllm_test::kLtx2MelOddFreqs;
+    const int64_t n_mels = vllm_test::kLtx2MelOddBins;
+    const int64_t rate = vllm_test::kLtx2MelOddRate;
+    CHECK(rate % 2 == 1);
+    const std::vector<float> fb = vllm::Ltx2SlaneyMelFilterbank(
+        n_freqs, 0.0, static_cast<double>(rate) / 2.0, n_mels, rate);
+    REQUIRE(static_cast<int64_t>(fb.size()) ==
+            static_cast<int64_t>(std::size(vllm_test::kLtx2MelOddBasisGolden)));
+    const double err = MaxAbsDiff(fb, vllm_test::kLtx2MelOddBasisGolden,
+                                  std::size(vllm_test::kLtx2MelOddBasisGolden));
+    INFO("odd-rate mel filterbank max|diff| = " << err);
+    CHECK(err <= kLtx2FilterTol);
+  }
+}
+
+TEST_CASE("ltx2 vae: waveform_to_mel matches upstream AudioProcessor") {
+  vllm::Ltx2AudioProcessorConfig cfg;
+  cfg.target_sample_rate = vllm_test::kLtx2MelRate;
+  cfg.mel_bins = vllm_test::kLtx2MelOutBins;
+  cfg.mel_hop_length = vllm_test::kLtx2MelHop;
+  cfg.n_fft = vllm_test::kLtx2MelNFft;
+
+  const int64_t channels = vllm_test::kLtx2MelWaveChannels;
+  const int64_t samples = vllm_test::kLtx2MelWaveSamples;
+  const std::vector<float> wave = Ltx2Input("ltx2.mel.input", channels * samples, 0.5);
+
+  int64_t frames = 0;
+  const std::vector<float> mel =
+      vllm::Ltx2WaveformToLogMel(cfg, wave, channels, samples, cfg.target_sample_rate, &frames);
+  CHECK(frames == vllm_test::kLtx2MelOutFrames);
+  REQUIRE(static_cast<int64_t>(mel.size()) ==
+          static_cast<int64_t>(std::size(vllm_test::kLtx2MelGolden)));
+  const double err = MaxAbsDiff(mel, vllm_test::kLtx2MelGolden, std::size(vllm_test::kLtx2MelGolden));
+  INFO("waveform_to_mel max|diff| = " << err);
+  CHECK(err <= kLtx2GoldenTol);
+
+  // A rate that does not match is REFUSED, because upstream would RESAMPLE and
+  // this project does not carry that resampler. Treating the samples as if they
+  // were already at the target rate conditions on audio that is pitched wrong.
+  bool threw = false;
+  std::string message;
+  try {
+    vllm::Ltx2WaveformToLogMel(cfg, wave, channels, samples, 44100, nullptr);
+  } catch (const std::exception& error) {
+    threw = true;
+    message = error.what();
+  }
+  REQUIRE(threw);
+  INFO("refusal message: " << message);
+  CHECK(message.find("resample") != std::string::npos);
+  CHECK(message.find("44100") != std::string::npos);
+}
+
+TEST_CASE("ltx2 vae: SILENCE saturates the mel log clamp, and the clamp is pinned") {
+  // The invisible-constant class, with the one arm that ESCAPES it. A well-scaled
+  // waveform never reaches `torch.clamp(mel, min=1e-5)` (audio_vae/ops.py:52), so
+  // the arm above cannot see the constant at all — but real silence saturates
+  // every bin, and then the constant ALONE decides what the encoder is handed.
+  // The generator asserts upstream's raw mel maximum is genuinely below the clamp.
+  CHECK(vllm::kLtx2AudioMelLogClamp == doctest::Approx(1e-5).epsilon(1e-12).scale(0.0));
+  // And the video encoder's constant log-variance, which no MEANS-only golden can
+  // ever reach (video_vae.py:328).
+  CHECK(vllm::kLtx2EncoderApproxLnZero == doctest::Approx(-30.0).epsilon(1e-12).scale(0.0));
+
+  vllm::Ltx2AudioProcessorConfig cfg;
+  cfg.target_sample_rate = vllm_test::kLtx2MelRate;
+  cfg.mel_bins = vllm_test::kLtx2MelOutBins;
+  cfg.mel_hop_length = vllm_test::kLtx2MelHop;
+  cfg.n_fft = vllm_test::kLtx2MelNFft;
+
+  const int64_t channels = vllm_test::kLtx2MelWaveChannels;
+  const int64_t samples = vllm_test::kLtx2MelWaveSamples;
+  const std::vector<float> silence(static_cast<size_t>(channels * samples), 0.0f);
+
+  int64_t frames = 0;
+  const std::vector<float> mel =
+      vllm::Ltx2WaveformToLogMel(cfg, silence, channels, samples, cfg.target_sample_rate, &frames);
+  CHECK(frames == vllm_test::kLtx2MelQuietFrames);
+  const double err =
+      MaxAbsDiff(mel, vllm_test::kLtx2MelQuietGolden, std::size(vllm_test::kLtx2MelQuietGolden));
+  INFO("silence mel max|diff| = " << err);
+  CHECK(err <= kLtx2GoldenTol);
+
+  // Every value must BE the clamp's logarithm — that is what makes this arm a
+  // gate on the constant rather than on the spectrogram.
+  for (float value : mel) {
+    CHECK(static_cast<double>(value) ==
+          doctest::Approx(std::log(vllm::kLtx2AudioMelLogClamp)).epsilon(1e-6).scale(0.0));
+  }
+}
+
+// ===========================================================================
+// PHASE L11 — the CONDITIONING ITEMS: what the encoders' output is FOR.
+// Gated against the upstream `ConditioningItem` classes executed through the
+// real `VideoLatentTools` / `AudioLatentTools` (generator section 9).
+// ===========================================================================
+
+namespace {
+
+vllm::Ltx2VideoLatentShape CondVideoTarget() {
+  vllm::Ltx2VideoLatentShape shape;
+  shape.batch = 1;
+  shape.channels = 4;
+  shape.frames = 3;
+  shape.height = 2;
+  shape.width = 2;
+  return shape;
+}
+
+constexpr int64_t kCondPatch = 1;
+constexpr double kCondFps = 8.0;
+
+vllm::Ltx2AudioLatentShape CondAudioTarget() {
+  vllm::Ltx2AudioLatentShape shape;
+  shape.batch = 1;
+  shape.channels = 2;
+  shape.frames = 4;
+  shape.mel_bins = 2;
+  return shape;
+}
+
+vllm::Ltx2LatentVolume CondVolume(const std::string& name, int64_t channels, int64_t frames,
+                                  int64_t height, int64_t width) {
+  vllm::Ltx2LatentVolume volume;
+  volume.batch = 1;
+  volume.channels = channels;
+  volume.frames = frames;
+  volume.height = height;
+  volume.width = width;
+  volume.data = Ltx2Input(name, channels * frames * height * width, 1.0);
+  return volume;
+}
+
+// Every conditioning arm checks the SAME four fields, and the noisy tensor is
+// checked too — leaving it out is exactly how the diffusers-style "write the
+// clean tokens into the noisy tensor as well" divergence would slip through.
+void CheckState(const vllm::Ltx2LatentState& state, int64_t want_tokens, int64_t want_width,
+                int64_t want_pos_dims, const float* clean, size_t clean_size, const float* latent,
+                size_t latent_size, const float* mask, size_t mask_size, const float* positions,
+                size_t positions_size, const char* label) {
+  CHECK(state.tokens == want_tokens);
+  CHECK(state.width == want_width);
+  CHECK(state.pos_dims == want_pos_dims);
+  REQUIRE(state.clean.size() == clean_size);
+  REQUIRE(state.latent.size() == latent_size);
+  REQUIRE(state.mask.size() == mask_size);
+  REQUIRE(state.positions.size() == positions_size);
+  const double clean_err = MaxAbsDiff(state.clean, clean, clean_size);
+  const double latent_err = MaxAbsDiff(state.latent, latent, latent_size);
+  const double mask_err = MaxAbsDiff(state.mask, mask, mask_size);
+  const double pos_err = MaxAbsDiff(state.positions, positions, positions_size);
+  INFO(label << " clean=" << clean_err << " latent=" << latent_err << " mask=" << mask_err
+             << " positions=" << pos_err);
+  CHECK(clean_err <= kLtx2GoldenTol);
+  CHECK(latent_err <= kLtx2GoldenTol);
+  CHECK(mask_err <= kLtx2GoldenTol);
+  CHECK(pos_err <= kLtx2GoldenTol);
+}
+
+}  // namespace
+
+TEST_CASE("ltx2 conditioning: the initial video latent state matches upstream VideoLatentTools") {
+  std::vector<float> keyframes_mask;
+  const vllm::Ltx2ScaleFactors factors;
+  const vllm::Ltx2LatentState state = vllm::Ltx2CreateVideoLatentState(
+      CondVideoTarget(), kCondPatch, factors, kCondFps, /*causal_fix=*/true,
+      /*initial_latent=*/nullptr, &keyframes_mask);
+
+  CheckState(state, vllm_test::kLtx2CondVideoBaseTokens, vllm_test::kLtx2CondVideoBaseWidth,
+             vllm_test::kLtx2CondVideoBasePosDims, vllm_test::kLtx2CondVideoBaseClean,
+             std::size(vllm_test::kLtx2CondVideoBaseClean), vllm_test::kLtx2CondVideoBaseLatent,
+             std::size(vllm_test::kLtx2CondVideoBaseLatent), vllm_test::kLtx2CondVideoBaseMask,
+             std::size(vllm_test::kLtx2CondVideoBaseMask), vllm_test::kLtx2CondVideoBasePositions,
+             std::size(vllm_test::kLtx2CondVideoBasePositions), "video base state");
+
+  // _first_frame_keyframes_mask marks the target's FIRST latent frame
+  // unconditionally, because the causal encoder makes it span one pixel frame.
+  const double err = MaxAbsDiff(keyframes_mask, vllm_test::kLtx2CondVideoBaseKeyframesMask,
+                                std::size(vllm_test::kLtx2CondVideoBaseKeyframesMask));
+  INFO("keyframes mask max|diff| = " << err);
+  CHECK(err <= kLtx2GoldenTol);
+}
+
+TEST_CASE("ltx2 conditioning: an image REPLACES one latent frame, and leaves the noise alone") {
+  const vllm::Ltx2VideoLatentShape target = CondVideoTarget();
+  const vllm::Ltx2ScaleFactors factors;
+  vllm::Ltx2LatentState state =
+      vllm::Ltx2CreateVideoLatentState(target, kCondPatch, factors, kCondFps, true);
+  const std::vector<float> before_latent = state.latent;
+
+  const vllm::Ltx2LatentVolume image = CondVolume("ltx2.cond.image", 4, 1, 2, 2);
+  vllm::Ltx2ConditionVideoByLatentIndex(&state, target, kCondPatch, image, /*strength=*/0.7,
+                                        vllm_test::kLtx2CondIndexLatentIdx);
+
+  CheckState(state, vllm_test::kLtx2CondIndexTokens, vllm_test::kLtx2CondIndexWidth,
+             vllm_test::kLtx2CondIndexPosDims, vllm_test::kLtx2CondIndexClean,
+             std::size(vllm_test::kLtx2CondIndexClean), vllm_test::kLtx2CondIndexLatent,
+             std::size(vllm_test::kLtx2CondIndexLatent), vllm_test::kLtx2CondIndexMask,
+             std::size(vllm_test::kLtx2CondIndexMask), vllm_test::kLtx2CondIndexPositions,
+             std::size(vllm_test::kLtx2CondIndexPositions), "video by latent index");
+
+  // The NOISY tensor is untouched (latent_cond.py:38-39). diffusers writes the
+  // clean tokens into it as well and only agrees at noise_scale == 1
+  // (pipeline_ltx2_condition.py:1002 vs :1229-1232); copying that here would be a
+  // silent divergence at every other noise scale, which no shape can catch.
+  CHECK(state.latent == before_latent);
+  // The token count does NOT grow — this item replaces, it does not append.
+  CHECK(state.tokens == vllm_test::kLtx2CondVideoBaseTokens);
+
+  // A conditioning whose spatial shape does not match the target is REFUSED, as
+  // upstream's ConditioningError is.
+  const vllm::Ltx2LatentVolume wrong = CondVolume("ltx2.cond.wrong", 4, 1, 4, 2);
+  bool threw = false;
+  std::string message;
+  try {
+    vllm::Ltx2ConditionVideoByLatentIndex(&state, target, kCondPatch, wrong, 0.7, 0);
+  } catch (const std::exception& error) {
+    threw = true;
+    message = error.what();
+  }
+  REQUIRE(threw);
+  INFO("refusal message: " << message);
+  CHECK(message.find("same spatial shape") != std::string::npos);
+}
+
+TEST_CASE("ltx2 conditioning: a KEYFRAME appends tokens at its own pixel frame") {
+  const vllm::Ltx2VideoLatentShape target = CondVideoTarget();
+  const vllm::Ltx2ScaleFactors factors;
+  vllm::Ltx2LatentState state =
+      vllm::Ltx2CreateVideoLatentState(target, kCondPatch, factors, kCondFps, true);
+
+  const vllm::Ltx2LatentVolume keyframe = CondVolume("ltx2.cond.keyframe", 4, 1, 2, 2);
+  vllm::Ltx2ConditionVideoByKeyframe(&state, keyframe, kCondPatch, factors, kCondFps,
+                                     vllm_test::kLtx2CondKeyframeFrameIdx, /*strength=*/0.6,
+                                     /*num_pixel_frames=*/1, /*causal_fix=*/true);
+
+  CHECK(state.tokens > vllm_test::kLtx2CondKeyframeTokensBefore);
+  CheckState(state, vllm_test::kLtx2CondKeyframeTokens, vllm_test::kLtx2CondKeyframeWidth,
+             vllm_test::kLtx2CondKeyframePosDims, vllm_test::kLtx2CondKeyframeClean,
+             std::size(vllm_test::kLtx2CondKeyframeClean), vllm_test::kLtx2CondKeyframeLatent,
+             std::size(vllm_test::kLtx2CondKeyframeLatent), vllm_test::kLtx2CondKeyframeMask,
+             std::size(vllm_test::kLtx2CondKeyframeMask), vllm_test::kLtx2CondKeyframePositions,
+             std::size(vllm_test::kLtx2CondKeyframePositions), "video by keyframe");
+
+  // The causal fix is DISABLED for a keyframe that is not at pixel frame 0
+  // (keyframe_cond.py:45-50), so passing it must change NOTHING at frame_idx 5.
+  // Without this the flag could be wired backwards and every golden would agree.
+  vllm::Ltx2LatentState no_fix =
+      vllm::Ltx2CreateVideoLatentState(target, kCondPatch, factors, kCondFps, true);
+  vllm::Ltx2ConditionVideoByKeyframe(&no_fix, keyframe, kCondPatch, factors, kCondFps,
+                                     vllm_test::kLtx2CondKeyframeFrameIdx, 0.6, 1,
+                                     /*causal_fix=*/false);
+  CHECK(no_fix.positions == state.positions);
+}
+
+TEST_CASE("ltx2 conditioning: a REFERENCE VIDEO is translated into the target's frame") {
+  const vllm::Ltx2VideoLatentShape target = CondVideoTarget();
+  const vllm::Ltx2ScaleFactors factors;
+  vllm::Ltx2LatentState state =
+      vllm::Ltx2CreateVideoLatentState(target, kCondPatch, factors, kCondFps, true);
+
+  const vllm::Ltx2LatentVolume reference = CondVolume("ltx2.cond.reference", 4, 2, 2, 2);
+  vllm::Ltx2ConditionVideoByReference(&state, reference, kCondPatch, factors, kCondFps,
+                                      vllm_test::kLtx2CondRefDownscale,
+                                      vllm_test::kLtx2CondRefTemporalScale, /*strength=*/1.0,
+                                      /*causal_fix=*/true);
+
+  CheckState(state, vllm_test::kLtx2CondRefTokens, vllm_test::kLtx2CondRefWidth,
+             vllm_test::kLtx2CondRefPosDims, vllm_test::kLtx2CondRefClean,
+             std::size(vllm_test::kLtx2CondRefClean), vllm_test::kLtx2CondRefLatent,
+             std::size(vllm_test::kLtx2CondRefLatent), vllm_test::kLtx2CondRefMask,
+             std::size(vllm_test::kLtx2CondRefMask), vllm_test::kLtx2CondRefPositions,
+             std::size(vllm_test::kLtx2CondRefPositions), "video by reference");
+
+  // Both scale factors guard on `!= 1` (reference_video_cond.py:74, 80), so the
+  // unscaled branch is a DIFFERENT computation, not the same one times one. An
+  // implementation that always took the scaled path would pass the arm above and
+  // fail here.
+  vllm::Ltx2LatentState plain =
+      vllm::Ltx2CreateVideoLatentState(target, kCondPatch, factors, kCondFps, true);
+  vllm::Ltx2ConditionVideoByReference(&plain, reference, kCondPatch, factors, kCondFps,
+                                      /*downscale_factor=*/1, /*temporal_scale_factor=*/1, 1.0,
+                                      true);
+  const double err = MaxAbsDiff(plain.positions, vllm_test::kLtx2CondRefPlainPositions,
+                                std::size(vllm_test::kLtx2CondRefPlainPositions));
+  INFO("unscaled reference positions max|diff| = " << err);
+  CHECK(err <= kLtx2GoldenTol);
+  CHECK(plain.positions != state.positions);
+}
+
+TEST_CASE("ltx2 conditioning: the audio state and its REFERENCE AUDIO append") {
+  const vllm::Ltx2AudioLatentShape target = CondAudioTarget();
+  const vllm::Ltx2AudioPatchifierParams params;
+  vllm::Ltx2LatentState state = vllm::Ltx2CreateAudioLatentState(target, params);
+
+  CheckState(state, vllm_test::kLtx2CondAudioBaseTokens, vllm_test::kLtx2CondAudioBaseWidth,
+             vllm_test::kLtx2CondAudioBasePosDims, vllm_test::kLtx2CondAudioBaseClean,
+             std::size(vllm_test::kLtx2CondAudioBaseClean), vllm_test::kLtx2CondAudioBaseLatent,
+             std::size(vllm_test::kLtx2CondAudioBaseLatent), vllm_test::kLtx2CondAudioBaseMask,
+             std::size(vllm_test::kLtx2CondAudioBaseMask), vllm_test::kLtx2CondAudioBasePositions,
+             std::size(vllm_test::kLtx2CondAudioBasePositions), "audio base state");
+
+  // The reference is patchified through the SAME gated patchifier the pipeline
+  // uses, so this arm also proves the encoder's [C, T, F] output is the layout
+  // `Ltx2AudioPatchify` expects.
+  vllm::Ltx2AudioLatentShape ref_shape = target;
+  ref_shape.frames = vllm_test::kLtx2CondRefAudioFrames;
+  const std::vector<float> ref_latent = Ltx2Input(
+      "ltx2.cond.refaudio", ref_shape.channels * ref_shape.frames * ref_shape.mel_bins, 1.0);
+  const std::vector<float> ref_tokens = vllm::Ltx2AudioPatchify(ref_latent.data(), ref_shape);
+  const std::vector<float> ref_positions = vllm::Ltx2AudioPatchTimings(ref_shape, params);
+
+  vllm::Ltx2ConditionAudioByReference(&state, ref_tokens, ref_shape.frames,
+                                      ref_shape.channels * ref_shape.mel_bins, ref_positions,
+                                      /*strength=*/1.0);
+
+  CheckState(state, vllm_test::kLtx2CondRefAudioTokens, vllm_test::kLtx2CondRefAudioWidth,
+             vllm_test::kLtx2CondRefAudioPosDims, vllm_test::kLtx2CondRefAudioClean,
+             std::size(vllm_test::kLtx2CondRefAudioClean), vllm_test::kLtx2CondRefAudioLatent,
+             std::size(vllm_test::kLtx2CondRefAudioLatent), vllm_test::kLtx2CondRefAudioMask,
+             std::size(vllm_test::kLtx2CondRefAudioMask), vllm_test::kLtx2CondRefAudioPositions,
+             std::size(vllm_test::kLtx2CondRefAudioPositions), "audio by reference");
+}
+
+TEST_CASE("ltx2 conditioning: an ENCODED image reaches the pipeline's token stream end to end") {
+  // The point of phase L11, asserted as one chain rather than as parts: pixels ->
+  // `Ltx2ConvVideoEncode` -> `Ltx2ConditionVideoByLatentIndex` -> the token state
+  // the denoise loop already consumes. Nothing here re-derives a shape by hand.
+  const vllm::Ltx2ConvVideoEncoderConfig enc = ReducedVideoEncoderConfigA();
+  ParamBag bag = BuildVideoEncoderParams(enc);
+  const int64_t c = vllm_test::kLtx2VideoEncInC;
+  const int64_t t = vllm_test::kLtx2VideoEncInT;
+  const int64_t h = vllm_test::kLtx2VideoEncInH;
+  const int64_t w = vllm_test::kLtx2VideoEncInW;
+  const std::vector<float> pixels = Ltx2Input("ltx2.videoenc.input", c * t * h * w, 1.0);
+
+  const vllm::Ltx2LatentVolume encoded =
+      vllm::Ltx2ConvVideoEncode(enc, bag.weights, pixels, c, t, h, w, nullptr);
+
+  // A single ENCODED image is one latent frame wide; take the encoder's first.
+  vllm::Ltx2LatentVolume first_frame;
+  first_frame.batch = 1;
+  first_frame.channels = encoded.channels;
+  first_frame.frames = 1;
+  first_frame.height = encoded.height;
+  first_frame.width = encoded.width;
+  const int64_t plane = encoded.height * encoded.width;
+  first_frame.data.resize(static_cast<size_t>(encoded.channels * plane));
+  for (int64_t ch = 0; ch < encoded.channels; ++ch) {
+    for (int64_t i = 0; i < plane; ++i) {
+      first_frame.data[static_cast<size_t>(ch * plane + i)] =
+          encoded.data[static_cast<size_t>((ch * encoded.frames) * plane + i)];
+    }
+  }
+
+  vllm::Ltx2VideoLatentShape target;
+  target.batch = 1;
+  target.channels = encoded.channels;
+  target.frames = encoded.frames;
+  target.height = encoded.height;
+  target.width = encoded.width;
+
+  const vllm::Ltx2ScaleFactors factors;
+  vllm::Ltx2LatentState state =
+      vllm::Ltx2CreateVideoLatentState(target, /*patch_size=*/1, factors, kCondFps, true);
+  const std::vector<float> before = state.clean;
+  vllm::Ltx2ConditionVideoByLatentIndex(&state, target, /*patch_size=*/1, first_frame,
+                                        /*strength=*/1.0, /*latent_idx=*/0);
+
+  // Strength 1 means the first latent frame's tokens are FULLY conditioned: mask
+  // 0 there, still 1 everywhere else.
+  const int64_t per_frame = state.tokens / target.frames;
+  for (int64_t i = 0; i < state.tokens; ++i) {
+    CHECK(state.mask[static_cast<size_t>(i)] == (i < per_frame ? 0.0f : 1.0f));
+  }
+  CHECK(state.clean != before);
+  // And the conditioned tokens ARE the encoder's own first latent frame,
+  // channel-for-channel, which is the join this phase exists to make.
+  for (int64_t token = 0; token < per_frame; ++token) {
+    for (int64_t ch = 0; ch < target.channels; ++ch) {
+      CHECK(state.clean[static_cast<size_t>(token * state.width + ch)] ==
+            first_frame.data[static_cast<size_t>(ch * plane + token)]);
+    }
+  }
 }

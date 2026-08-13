@@ -486,6 +486,94 @@ The DiT result does not transfer — different producer (torchao vs Lightricks `
 — and no second Gemma-4 checkpoint exists on the NAS to serve as an oracle. **torchao's own
 source is public and defines the packing**, and that is the cross-check owed.
 
+## 3.3 Where the two references DISAGREE, and which one we follow
+
+Recorded 2026-08-13 from L11. §3 says: *"Where they disagree, the disagreement is the
+finding."* This is the first place they actually do, and it is not a cosmetic difference.
+
+**The noised-state composition.** `ltx_core`'s `latent_cond.py:38-39` leaves the NOISY tensor
+untouched and lets the noiser compose it. diffusers writes clean tokens INTO the noisy tensor
+(`pipeline_ltx2_condition.py:1002`). **The two agree only at `noise_scale == 1`.**
+
+So at every other noise scale the conditioning differs, and the difference is invisible to any
+shape, finiteness or dtype check — it is a correct-looking render of subtly wrong conditioning.
+Following diffusers here would have been a silent divergence at every noise scale except one.
+
+**The divergence is LIVE in this project, not hypothetical.** L11's reviewer executed both
+compositions on shared tensors and a shared noise draw:
+
+| `noise_scale` | max abs diff, `ltx_core` vs diffusers |
+|---|---|
+| 1.0 | 2.38e-07 (f32 round-off — they agree) |
+| **0.909375** | **1.16e-01** |
+| 0.5 | 6.38e-01 |
+| 0.0 | 1.28e+00 |
+
+`ltx2_pipeline.cpp:1083` sets `stage2.noise_scale = Stage2DistilledSigmas().front()` =
+**0.909375**. So the distilled two-stage recipe — the one this campaign actually runs — sits
+exactly at a 1.16e-01 divergence, five orders above any golden tolerance and invisible to every
+shape and finiteness check.
+
+**We follow `ltx_core`**, and the port asserts the noisy tensor is byte-identical, so the
+choice is pinned rather than incidental. The reviewer's decisive argument is internal
+consistency: L5 already landed `Ltx2GaussianNoise` as a direct port of `noisers.py:30-37`, so
+adopting the diffusers write WITHOUT also replacing the noiser would double-apply the clean
+tokens and be strictly wrong. The two halves must come from one reference, and one of them is
+already landed. The reasoning: `ltx_core` is the model author's own
+runtime and is what loads this checkpoint family, and §3 already names it the immediate
+cross-check while vLLM-Omni access stays pending. This is recorded as a CHOICE with a reason,
+not as an unnoticed coincidence.
+
+**Four further divergences**, all following `ltx_core`: diffusers has no frame-count crop (it
+dies in `unflatten`); `latent_log_var` is hardcoded to `uniform`; `norm3` is `GroupNorm(1)`
+where ours is `LayerNorm(C)` (shape-compatible, statistically different — the kind that passes
+every structural check); and diffusers has **no reference-audio conditioning at all**.
+
+**One thing only ONE reference attests.** diffusers has **no mel front-end whatsoever**, so
+slaney/slaney normalisation, centered-reflect padding and `power=1.0` rest on `ltx_core`
+alone. That is recorded at the code site. A single-source fact is weaker evidence than a
+cross-checked one and should be labelled as such rather than blend into the rest.
+
+## 3.4 The tower's oracle existed all along, and BOS is the second disagreement
+
+Recorded 2026-08-13 from L10.
+
+**L3's blocker was a `transformers` VERSION, not a property of the tower.** L3 recorded that
+the Gemma-4 tower could not be gated because `gemma4_unified` was absent from `CONFIG_MAPPING`.
+Established by execution, both directions: `/usr/bin/python3` at transformers **5.3.0** raises
+`KeyError 'gemma4_unified'` (reproducing the blocker exactly), while a venv at **5.12.1**
+builds and RUNS it. So the tower is now held to a running upstream instead of to invariants
+derived from its own output — `gemma4.h` had said "grounded + compiles" since it landed, and
+compiling is not running.
+
+**The tolerance is measured, not chosen.** The generator measures how far UPSTREAM'S OWN answer
+moves between f32 and bf16, per hidden state, and emits that as the bound. The worst state
+reaches 0.71x of its own floor and state 0 is bit-identical — i.e. we are closer to
+upstream-in-bf16 than upstream-in-bf16 is to upstream-in-f32, at every layer. It cannot be
+loosened to rescue a failure: loosening it means regenerating it, which means the oracle moved.
+That is the shape every tolerance on this campaign should have had.
+
+**The second real disagreement (§3.3 was the first): BOS.** diffusers relies on
+`add_special_tokens=True`, which on THIS tokenizer adds nothing — so following it would **drop
+token 0 of every prompt**. `ltx_core` does not. We follow `ltx_core`, and the measurement is
+recorded in the goldens header. Tokenization is token-exact against HuggingFace over the
+shipped 262144-entry vocab, four prompts x 1024 positions, first mismatching index -1 on all
+four.
+
+**The Gemma config came from an 84 KB range request.** The `vonkaiser` build has no
+`__metadata__` at all, so the config had to come out of band; L10 read it authoritatively from
+the OFFICIAL bf16 checkpoint's safetensors header without downloading the payload. It
+independently re-confirms §1.4's corrected 188160 width.
+
+**Why `has_encoder()` is still false, and this is the honest part.** Upstream routes each
+stream through an `Embeddings1DConnector` before cross-attention. Its math is ported
+(`Ltx2ConnectorForward`), but its WEIGHTS are not loaded: they ship inside the DiT file as
+`video_embeddings_connector.*` / `audio_embeddings_connector.*` (**372 tensors, measured**) and
+are still among the modules the loader refuses as unported. So conditioning has nowhere to go,
+and flipping the flag would promise a render that cannot complete. L10 MOVED the refusal rather
+than lifting it — `encoder_path` still refuses, but the message now names the connector weights
+instead of the tower, because the old message became false.
+
 ## 4. Checkpoint access and placement
 
 Verified against the HF API on 2026-08-11 with the session token:
@@ -581,6 +669,24 @@ All on `row/MODEL-DIFFUSION-LTX25`, one PR.
 | **L6** | NVFP4 DiT + NVFP4 TE arms; GB10 load-time residency | quantized vs bf16 wiring gate; residency per the ATS finding |
 | **L7** | e2e on dgx.casa under `flock`; `/v1/videos` route | valid MP4+WAV; speed axis recorded `PENDING` per §0 |
 | **L8** | Device-resident DiT forward on GB10; the CUDA `vt::AttentionCross` it needed | every dispatched op `vt-native` on a CUDA queue, ZERO reference-tier hits; device-vs-host at f32 round-off against the SAME upstream goldens |
+| **L9a** | NVFP4 DiT: swizzled + hi-nibble-first (§4.1) | loads AND correlates ~0.9956 against the FP8 file's dequant, not merely finite |
+| **L9b** | Real render on shipped weights; `--video-family`, `--video-extra` | frames + WAV + MP4 from the 21B FP8 DiT under its DECLARED config |
+| **L9c** | Connector wiring + the missing pool Drain | conditioning real, not synthetic; peak device usage measured per phase |
+| **L10** | The Gemma-4 tower, so a prompt works | gated against a RUNNING upstream, tolerance MEASURED from upstream's own f32-to-bf16 spread |
+| **L11** | VAE encoders + image/keyframe/reference conditioning | both encoders at f32 round-off; the conditioning items EXACT |
+
+### 8.0 Two phases landed WITHOUT a spec, and both are the operator's failure
+
+L8 and **L10** were dispatched and landed with no spec section, against AGENTS.md's
+"committed *before* implementation, never written up afterwards". In both cases a phase brief
+stood in for the spec. That is the operator's error twice over, recorded rather than backfilled
+as though the order had been kept. §8.1 sets out what L8's spec would have had to say; the
+phase table above now carries L9a-L11 so the remaining phases are at least declared.
+
+The cost is measurable and was predicted in §8.1: a written scope would plausibly have caught
+the ungated config adoption in L7, and — for L10 — would have forced the question "what is the
+oracle for the tower?" up front, which is exactly the question whose answer turned out to be
+*a newer transformers*.
 
 ### 8.1 L8 — written AFTER the fact, and that is a process failure
 
@@ -652,6 +758,59 @@ oracle from a wrong one. Reproducibility proves determinism; it does not prove p
 assert the resolved `ltx_core.__file__` lives under the `--ltx2` checkout (identity), and
 record the upstream revision SHA in the emitted goldens (provenance). AGENTS.md already
 required the revision anchor; the identity assertion is what makes the anchor mean anything.
+
+**(a-bis) The class was swept, and it had FIVE members, not one.** Recorded 2026-08-13
+(issue #560). After the fourth recurrence, every stabilizing constant in the LTX-2.5 files was
+enumerated and mutated ALONE — 20 constants. Three categories emerged, and the middle one is
+the interesting one:
+
+| verdict | count | meaning |
+|---|---|---|
+| pinned AND numerically reachable | 12 | a mutation moves a golden; the gate genuinely bites |
+| **INVISIBLE — no arm read it at all** | **5+1** | a 100x change left every suite green |
+| pinned, genuinely unreachable | **1** | upstream discards the value, so a pin is the only honest treatment |
+| **MISLABELLED as unreachable** | **2** | live numeric path; the mutation was merely below fixture sensitivity |
+
+**CORRECTION, 2026-08-13.** The row above originally read "3 pinned, correctly unreachable",
+taken from the sweep's own table and propagated into this spec by the operator without
+independent check. Its review disproved two of the three, and the failure mode is the one this
+whole section exists to name: **"upstream discards it" is exactly the label a fixture gap
+wears when nobody probes it.**
+
+- `Ltx2ConvVideoDecoderConfig::norm_eps` is NOT discarded. `video_vae/resnet.py:93-97` builds
+  `norm3 = nn.GroupNorm(num_groups=1, ..., eps=eps)` **regardless of `norm_layer`** whenever
+  `in_channels != out_channels`. A `VT_CHECK` probe at our `norm3` call site fired on FIVE
+  goldens. The 100x mutation was simply below that fixture's sensitivity; at 1.0 the goldens
+  move by 1.64e-2 and 2.04e-2 against a 5e-6 band. Its ENCODER twin at the SAME 100x moves
+  4.39e-5 and goes red — so the decoder's silence was an accident of fixture scale, not a
+  property of upstream.
+- `kLtx2RmsNorm2dEps` is a `clamp_min` FLOOR in `F.normalize`, not a discarded value. It binds
+  only on a ~zero channel vector, which no arm constructs — and the project's own BWE-quiet arm
+  is precedent that such a probe IS constructible.
+- Only `kLtx2EncoderApproxLnZero` is genuinely unreachable: `video_vae.py:325-334` concatenates
+  the block and `torch.chunk(...)[0]` discards it. Mutating -30 to -1 leaves the suite green
+  because upstream never reads it either.
+
+**And the sweep missed a sixth invisible constant**, `Ltx2AttentionArgs::norm_eps`
+(`ltx2.h:365`) — same shape as the DiT case, all ten call sites assign it explicitly, so a
+10^6 mutation leaves every suite green. A latent trap rather than live code today, but the
+"class swept" claim was incomplete by one.
+
+**The lesson is sharper than the fix.** A change written to close this class mislabelled a live
+constant as unreachable, and the operator copied the label into the spec without probing it.
+Recording a hole is not removing it: the only evidence that a constant is unreachable is a
+probe that FAILS to reach it, not a mutation that happens not to move anything.
+
+The fifth instance is the one worth remembering: **`Ltx2DitParams::norm_eps`**. Every test
+passes that value explicitly through `ReducedParams`, so nothing ever read the FIELD DEFAULT —
+which is live code, because `ParseLtx2DitParams` falls back to it exactly as upstream's
+`config.get("norm_eps", 1e-06)` does. A constant can be invisible not because the fixture
+avoids its regime, but because the fixture never lets the default apply.
+
+The repair that matters is not the pin. For the two audio-VAE `norm_eps` holes the fix was a
+new gate arm at `norm_type = kGroup` / `causality_axis = kNone`, which makes the constant
+**numerically** reachable: the same 100x mutation now moves the goldens by 1.13e-3 and 5.18e-3
+against a 5e-6 band. A source-anchored `CHECK` is the floor; a reachable arm is the gate.
 
 **(c) A FIXTURE that cannot separate right from wrong is the same defect, wearing different
 clothes.** Recorded 2026-08-12 from L5's review, and it is the sharpest instance so far.
