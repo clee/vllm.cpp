@@ -657,6 +657,32 @@ affected translation units and linked `test_ltx2` and `test_ltx2_vae`; their
 upstream-golden numerical gates pass 30/30 cases with 1627 assertions and 36/36
 cases with 3039 assertions, respectively.
 
+### Current-main VideoEngine portability regression: issue #648
+
+The configured direct Windows checker on current `main` reports three sites in
+`src/vllm/multimodal/video_engine.cpp`: the unconditional `<sys/stat.h>` include
+and the `::stat` calls in `IsDir` and `Exists`. These landed with the generalized
+video seam at `cefacd2d00cb9b4776331cd213116773cd97f811` and cannot reach the
+native MSVC release build.
+
+Replace that POSIX dependency with C++20 `std::filesystem` queries using the
+non-throwing `std::error_code` overloads. `IsDir` remains true only for a
+directory; `Exists` remains true for any existing filesystem entry; missing or
+uninspectable paths remain false. Do not add a Windows-only branch, guard the
+POSIX include, exempt the file from the checker, or change family resolution.
+
+RED evidence is the configured direct checker naming all three sites. Focused
+behavior must cover an existing directory, a regular file, and a missing path
+through the public VideoEngine resolution surface; add only the smallest test
+needed if existing coverage cannot prove each classification. Green requires
+the direct checker, the complete portability and combined release suites, a
+clean build of the affected translation unit, and the VideoEngine tests.
+
+Fresh review must restore the POSIX implementation to prove the direct checker
+is red and mutate directory classification to an existence-only query to prove
+behavior coverage rejects a regular file. Stop with `NEEDS_DECISION` if the
+portable implementation changes an observable resolution result or error.
+
 Fresh mutation review of the adaptive probe found three false-green contract
 gaps: the listing fixture did not distinguish file order from name order, the
 unexpected-status branches at an intermediate midpoint and isolated probe were
