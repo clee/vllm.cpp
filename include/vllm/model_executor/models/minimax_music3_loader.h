@@ -25,24 +25,61 @@
 // artifact it is and which one this port wants, or the next person re-derives
 // it. `MiniMaxMusic3ResolveCheckpoint` is where that happens.
 //
-// ─── THE DTYPE POLICY IS UPSTREAM'S, AND IT IS ENFORCED ─────────────────────
+// ─── ON-DISK DTYPE AND RUNTIME DTYPE ARE DIFFERENT THINGS HERE ──────────────
 //
-// Spec section 2.1. `convert_minimax_music3_to_diffusers.py:267` defaults
-// `--dtype float32`; `:208-211` puts the transformer, the condition encoder and
-// the vocoder at that dtype, and `:214` forces the RVQ depth decoder to bf16
-// regardless. SGLang-Omni's README says both its placements "run the acoustic
-// stage in FP32". The measured headers agree exactly.
+// WHAT THE FILES STORE, measured from the headers and not in dispute:
+// `transformer`, `condition_encoder` and `vocoder` are F32,
+// `rvq_depth_decoder` and `language_model` are BF16. That is what
+// `convert_minimax_music3_to_diffusers.py` writes — `:267` defaults
+// `--dtype float32`, `:208-211` applies it to three components, `:214` forces
+// the depth decoder to bf16 — and `EnumerateMiniMaxMusic3*Tensors` states it
+// per component so `MiniMaxMusic3AccountTensors` can refuse a file that
+// disagrees. Those dtypes are FACTS ABOUT THE FILES and they stay.
 //
-// So F32 on the DiT, the condition encoder and the vocoder is upstream's
-// RESOLVED choice and not the too-wide accident AGENTS.md warns about — the
-// oracle is fp32 too, so a token gate being blind to width does not matter here
-// because there is no width difference to be blind to. Every F32 expectation
-// this file states carries that reason at its declaration site.
+// WHAT WILL ACTUALLY RUN IS NOT THAT SET, and this correction is the reason
+// this section was rewritten. The spec's section 2.1 read the converter's
+// output as upstream's resolved RUNTIME policy. Running the oracle refuted it:
+// the on-disk set is NOT RUNNABLE through upstream's own pipeline.
 //
-// The enumeration therefore carries a dtype PER COMPONENT and
-// `MiniMaxMusic3AccountTensors` refuses a mismatch by name. A future narrowing
-// to bf16 is a measured change with its own evidence; it can never arrive by a
-// loader quietly accepting whichever dtype the file happened to carry.
+// Upstream casts in exactly two places and nowhere else:
+//
+//   denoise.py:83    the condition encoder's OUTPUT -> transformer.dtype
+//   decoders.py:84   the latents                    -> vocoder.dtype
+//
+// Nothing casts on the way IN. `denoise.py:82` hands
+// `block_state.frame_hiddens[...].to(device)` to the condition encoder with a
+// device move and no dtype move, so the encoder and the depth decoder consume
+// the LANGUAGE MODEL's hidden states at the language model's dtype. Load the
+// on-disk set and `condition_embedder_minimax_music3.py:64` raises
+//
+//   RuntimeError: Input type (c10::BFloat16) and bias type (float)
+//                 should be the same
+//
+// because `self.proj` is an fp32 `nn.Conv1d` being fed bf16. The two lines
+// above it are the tell: `:61` and `:63` cast `layer_weight_logits` and
+// `layer_scale` with `.to(hidden_states.dtype)`, so the learned MIX follows the
+// hidden states — but `proj` is a MODULE and is never cast, so it cannot.
+//
+// THE INVARIANT THAT ACTUALLY HOLDS, and what this loader enforces:
+//
+//   dtype(language_model) == dtype(rvq_depth_decoder) == dtype(condition_encoder)
+//
+// The gated configuration is `kBf16ArFp32Acoustic`: the AR half (language
+// model, depth decoder, condition encoder) in bf16 and the acoustic half
+// (transformer, vocoder) in fp32. That is also the converter's default for the
+// DiT and the vocoder, and what SGLang-Omni states it runs.
+//
+// `kAsStored` is kept SELECTABLE rather than deleted, so the failure stays
+// reproducible against the oracle's own `--dtype-policy on-disk`. It is
+// reported as not-runnable rather than quietly repaired.
+//
+// So the fp32 on the acoustic half still needs no apology under AGENTS.md's
+// too-wide rule — the oracle runs fp32 there too. What is NOT true, and what
+// this file previously said, is that the whole on-disk set is the runtime
+// policy. `MiniMaxMusic3CheckRuntimeDtypes` refuses a violating configuration
+// BY NAME, naming all three AR components and their dtypes, because a refusal
+// that says which three disagree is worth more than the torch type error
+// upstream gives from inside a forward pass.
 //
 // ─── WEIGHT NORM IS FOLDED AT LOAD, NOT REPRODUCED ──────────────────────────
 //
@@ -273,6 +310,51 @@ struct MiniMaxMusic3Config {
 // with no error, which is exactly what .agents/porting-a-model.md section 1
 // forbids.
 MiniMaxMusic3Config MiniMaxMusic3LoadConfig(const MiniMaxMusic3Paths& paths);
+
+// ---------------------------------------------------------------------------
+// RUNTIME dtype — what each component will RUN in, not what its file stores
+// ---------------------------------------------------------------------------
+
+// The five weight-bearing components, in AR-then-acoustic order, so a refusal
+// can name them in the order the pipeline uses them.
+struct MiniMaxMusic3RuntimeDtypes {
+  // The AR half. These three MUST agree: upstream never casts between them
+  // (denoise.py:82 moves device only), so a disagreement is a torch type error
+  // from inside `condition_embedder_minimax_music3.py:64`.
+  std::string language_model;
+  std::string rvq_depth_decoder;
+  std::string condition_encoder;
+  // The acoustic half. Each is reached through an explicit cast, so each may
+  // differ from the AR half and from the other freely.
+  std::string transformer;  // denoise.py:83 casts the condition into it
+  std::string vocoder;      // decoders.py:84 casts the latents into it
+};
+
+enum class MiniMaxMusic3DtypePolicy {
+  // GATED. AR half bf16, acoustic half fp32. The converter's default for the
+  // DiT and the vocoder, and what SGLang-Omni states it runs.
+  kBf16ArFp32Acoustic,
+  // The dtypes the FILES carry. NOT RUNNABLE — kept selectable so the failure
+  // stays reproducible against the oracle's `--dtype-policy on-disk`, never as
+  // a default and never silently repaired.
+  kAsStored,
+};
+
+MiniMaxMusic3RuntimeDtypes MiniMaxMusic3ResolveRuntimeDtypes(MiniMaxMusic3DtypePolicy policy);
+
+// True when the three AR components agree, i.e. when the configuration can run
+// at all. Never throws, so a caller can ask before committing to a load.
+bool MiniMaxMusic3RuntimeDtypesAreRunnable(const MiniMaxMusic3RuntimeDtypes& dtypes);
+
+// Enforce the invariant, or THROW naming all three AR components with their
+// dtypes and the upstream line that would otherwise fail. Refusing here rather
+// than at the first Conv1d is the whole point: upstream's message names a bias
+// dtype, not which component disagreed with which.
+void MiniMaxMusic3CheckRuntimeDtypes(const MiniMaxMusic3RuntimeDtypes& dtypes);
+
+// The dtype each component's FILE stores. A fact about the artifact, and
+// deliberately NOT a runtime policy — see the header note.
+MiniMaxMusic3RuntimeDtypes MiniMaxMusic3OnDiskDtypes();
 
 // ---------------------------------------------------------------------------
 // What each component OWES, derived from its config

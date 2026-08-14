@@ -878,3 +878,104 @@ TEST_CASE("music3 real checkpoint: resolve, parse and account every component") 
   CHECK(total == vllm_test::kMusic3ManifestTensorCount);
   MESSAGE("real-checkpoint tensors accounted: " << total);
 }
+
+// ===========================================================================
+// 8. RUNTIME dtype — the oracle refuted spec section 2.1, and this pins it
+// ===========================================================================
+//
+// The spec read the converter's OUTPUT dtypes as upstream's resolved RUNTIME
+// policy. Running the oracle refuted that: the on-disk set is not runnable,
+// because upstream casts only on the way OUT of the condition encoder
+// (denoise.py:83) and into the vocoder (decoders.py:84), never on the way IN.
+// `denoise.py:82` moves device only, so the AR half all runs at the language
+// model's dtype or it raises from `condition_embedder_minimax_music3.py:64`.
+
+TEST_CASE("music3 runtime dtype: the AR half must agree, and a violation is refused BY NAME") {
+  vllm::MiniMaxMusic3RuntimeDtypes dtypes =
+      vllm::MiniMaxMusic3ResolveRuntimeDtypes(vllm::MiniMaxMusic3DtypePolicy::kBf16ArFp32Acoustic);
+  // The gated configuration: AR half bf16, acoustic half fp32.
+  CHECK(dtypes.language_model == "BF16");
+  CHECK(dtypes.rvq_depth_decoder == "BF16");
+  CHECK(dtypes.condition_encoder == "BF16");
+  CHECK(dtypes.transformer == "F32");
+  CHECK(dtypes.vocoder == "F32");
+  CHECK(vllm::MiniMaxMusic3RuntimeDtypesAreRunnable(dtypes));
+  CHECK_NOTHROW(vllm::MiniMaxMusic3CheckRuntimeDtypes(dtypes));
+
+  // Every single-component deviation in the AR half is refused, and the
+  // refusal NAMES all three so a reader knows which disagreed with which.
+  int64_t refused = 0;
+  const char* ar_names[] = {"language_model", "rvq_depth_decoder", "condition_encoder"};
+  for (int index = 0; index < 3; ++index) {
+    CAPTURE(ar_names[index]);
+    vllm::MiniMaxMusic3RuntimeDtypes broken = dtypes;
+    (index == 0 ? broken.language_model
+                : index == 1 ? broken.rvq_depth_decoder
+                             : broken.condition_encoder) = "F32";
+    CHECK(!vllm::MiniMaxMusic3RuntimeDtypesAreRunnable(broken));
+    bool named_all_three = false;
+    try {
+      vllm::MiniMaxMusic3CheckRuntimeDtypes(broken);
+    } catch (const std::runtime_error& error) {
+      const std::string message = error.what();
+      named_all_three = message.find("language_model") != std::string::npos &&
+                        message.find("rvq_depth_decoder") != std::string::npos &&
+                        message.find("condition_encoder") != std::string::npos &&
+                        message.find("BF16") != std::string::npos &&
+                        message.find("F32") != std::string::npos;
+      if (index == 0) MESSAGE("refusal: " << message);
+    }
+    CHECK(named_all_three);
+    ++refused;
+  }
+  CHECK(refused == 3);
+  MESSAGE("AR-half deviations refused by name: " << refused);
+
+  // The ACOUSTIC half may differ from the AR half and from each other freely:
+  // both are reached through an explicit cast, so neither is constrained.
+  int64_t allowed = 0;
+  for (const char* dtype : {"F32", "BF16"}) {
+    vllm::MiniMaxMusic3RuntimeDtypes varied = dtypes;
+    varied.transformer = dtype;
+    CHECK_NOTHROW(vllm::MiniMaxMusic3CheckRuntimeDtypes(varied));
+    ++allowed;
+    varied = dtypes;
+    varied.vocoder = dtype;
+    CHECK_NOTHROW(vllm::MiniMaxMusic3CheckRuntimeDtypes(varied));
+    ++allowed;
+  }
+  CHECK(allowed == 4);
+  MESSAGE("acoustic-half variations accepted (each is reached through a cast): " << allowed);
+}
+
+TEST_CASE("music3 runtime dtype: the ON-DISK set is reported as NOT RUNNABLE") {
+  // This is the correction itself, pinned. The dtypes the files carry are a
+  // fact about the artifact; presenting them as a runnable configuration is
+  // what the oracle refuted, so `kAsStored` must NOT be runnable.
+  const vllm::MiniMaxMusic3RuntimeDtypes stored =
+      vllm::MiniMaxMusic3ResolveRuntimeDtypes(vllm::MiniMaxMusic3DtypePolicy::kAsStored);
+  CHECK(stored.language_model == "BF16");
+  CHECK(stored.rvq_depth_decoder == "BF16");
+  CHECK(stored.condition_encoder == "F32");  // the one that breaks it
+  CHECK(stored.transformer == "F32");
+  CHECK(stored.vocoder == "F32");
+
+  CHECK(!vllm::MiniMaxMusic3RuntimeDtypesAreRunnable(stored));
+  CHECK_THROWS_AS(vllm::MiniMaxMusic3CheckRuntimeDtypes(stored), std::runtime_error);
+
+  // And it agrees with what the manifest actually measured, so the "not
+  // runnable" claim is about THIS checkpoint and not about a made-up set.
+  CHECK(vllm::MiniMaxMusic3OnDiskDtypes().condition_encoder == stored.condition_encoder);
+  std::map<std::string, std::set<std::string>> measured;
+  for (const vllm_test::Music3ManifestTensor& t : vllm_test::kMusic3Manifest) {
+    measured[t.component].insert(t.dtype);
+  }
+  const vllm::MiniMaxMusic3RuntimeDtypes on_disk = vllm::MiniMaxMusic3OnDiskDtypes();
+  CHECK(measured["language_model"] == std::set<std::string>{on_disk.language_model});
+  CHECK(measured["rvq_depth_decoder"] == std::set<std::string>{on_disk.rvq_depth_decoder});
+  CHECK(measured["condition_encoder"] == std::set<std::string>{on_disk.condition_encoder});
+  CHECK(measured["transformer"] == std::set<std::string>{on_disk.transformer});
+  CHECK(measured["vocoder"] == std::set<std::string>{on_disk.vocoder});
+  MESSAGE("on-disk dtypes cross-checked against the manifest for "
+          << measured.size() << " components; the set is NOT runnable");
+}

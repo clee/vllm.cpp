@@ -26,15 +26,23 @@ namespace {
 
 namespace fs = std::filesystem;
 
-// The safetensors header spelling of each component's dtype, fixed by spec
-// section 2.1 and by convert_minimax_music3_to_diffusers.py:208-211 (the
-// `--dtype` default of float32, :267) and :214 (bf16, forced).
+// The safetensors header spelling of each component's ON-DISK dtype, as
+// convert_minimax_music3_to_diffusers.py writes it (`--dtype float32` default
+// at :267, applied at :208-211; bf16 forced on the depth decoder at :214) and
+// as the headers measure.
 //
-// F32 HERE IS NOT A TOO-WIDE ACCIDENT. AGENTS.md requires a one-line reason
-// beside any f32 on a model path: this is upstream's RESOLVED model dtype for
-// the acoustic stack, the oracle runs the same fp32, and SGLang-Omni's README
-// says both its placements "run the acoustic stage in FP32". Narrowing is a
-// measured change with its own evidence, never a loader's initiative.
+// THIS IS WHAT THE FILES STORE, NOT WHAT WILL RUN. The two differ here and the
+// distinction is load-bearing -- see the header's dtype section. The on-disk
+// set is not a runnable configuration: running the oracle showed the condition
+// encoder must match the LANGUAGE MODEL's dtype, because upstream never casts
+// on the way in (denoise.py:82 moves device only) and
+// condition_embedder_minimax_music3.py:64 then feeds bf16 hidden states to an
+// fp32 Conv1d. `MiniMaxMusic3ResolveRuntimeDtypes` owns the runtime answer.
+//
+// F32 on the ACOUSTIC half still needs no apology under AGENTS.md's too-wide
+// rule: the oracle runs fp32 there too (the converter's default, and what
+// SGLang-Omni states it runs). Narrowing that is a measured change with its own
+// evidence, never a loader's initiative.
 constexpr const char* kF32 = "F32";
 constexpr const char* kBf16 = "BF16";
 
@@ -257,6 +265,69 @@ int64_t MiniMaxMusic3Tensor::numel() const {
   int64_t total = 1;
   for (int64_t dim : shape) total *= dim;
   return total;
+}
+
+// ---------------------------------------------------------------------------
+// RUNTIME dtype
+// ---------------------------------------------------------------------------
+
+MiniMaxMusic3RuntimeDtypes MiniMaxMusic3OnDiskDtypes() {
+  // Measured from the shipped headers; pinned in tests by
+  // minimax_music3_manifest.inc, which the gate cross-checks against this.
+  MiniMaxMusic3RuntimeDtypes out;
+  out.language_model = kBf16;
+  out.rvq_depth_decoder = kBf16;
+  out.condition_encoder = kF32;
+  out.transformer = kF32;
+  out.vocoder = kF32;
+  return out;
+}
+
+MiniMaxMusic3RuntimeDtypes MiniMaxMusic3ResolveRuntimeDtypes(MiniMaxMusic3DtypePolicy policy) {
+  if (policy == MiniMaxMusic3DtypePolicy::kAsStored) {
+    // Deliberately returned UNREPAIRED. It is not runnable, and the point of
+    // keeping it is that the failure stays reproducible against the oracle's
+    // own `--dtype-policy on-disk`; silently promoting the condition encoder
+    // to bf16 here would hide exactly the finding this arm exists to preserve.
+    return MiniMaxMusic3OnDiskDtypes();
+  }
+  // kBf16ArFp32Acoustic: the gated configuration. The AR half runs at the
+  // language model's dtype because nothing casts between its stages; the
+  // acoustic half is fp32, which is the converter's default for the DiT and the
+  // vocoder and what SGLang-Omni states it runs.
+  MiniMaxMusic3RuntimeDtypes out;
+  out.language_model = kBf16;
+  out.rvq_depth_decoder = kBf16;
+  out.condition_encoder = kBf16;
+  out.transformer = kF32;
+  out.vocoder = kF32;
+  return out;
+}
+
+bool MiniMaxMusic3RuntimeDtypesAreRunnable(const MiniMaxMusic3RuntimeDtypes& dtypes) {
+  return dtypes.language_model == dtypes.rvq_depth_decoder &&
+         dtypes.language_model == dtypes.condition_encoder;
+}
+
+void MiniMaxMusic3CheckRuntimeDtypes(const MiniMaxMusic3RuntimeDtypes& dtypes) {
+  if (MiniMaxMusic3RuntimeDtypesAreRunnable(dtypes)) return;
+  // Name all three and their dtypes. Upstream's own failure names a BIAS dtype
+  // from inside a Conv1d and never says which component disagreed with which,
+  // which is the whole reason this refusal exists here instead.
+  throw std::runtime_error(
+      std::string("minimax_music3: this dtype configuration cannot run. The autoregressive half "
+                  "must share ONE dtype -- language_model=") +
+      dtypes.language_model + ", rvq_depth_decoder=" + dtypes.rvq_depth_decoder +
+      ", condition_encoder=" + dtypes.condition_encoder +
+      " -- because upstream casts only on the way OUT of the condition encoder "
+      "(denoise.py:83) and into the vocoder (decoders.py:84), never on the way in: "
+      "denoise.py:82 hands the language model's hidden states over with a device move and no "
+      "dtype move. A mismatch therefore fails inside "
+      "condition_embedder_minimax_music3.py:64 as \"Input type (c10::BFloat16) and bias type "
+      "(float) should be the same\". The gated configuration is bf16 AR half with an fp32 "
+      "acoustic half (MiniMaxMusic3DtypePolicy::kBf16ArFp32Acoustic). NOTE: the checkpoint's "
+      "ON-DISK dtypes are NOT this set and are not runnable as stored -- "
+      "MiniMaxMusic3DtypePolicy::kAsStored reproduces that failure on purpose.");
 }
 
 // ---------------------------------------------------------------------------

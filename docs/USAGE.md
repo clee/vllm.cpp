@@ -2230,12 +2230,26 @@ silently mis-loaded.
 
 Two things the loader enforces that a correctness gate later could not catch:
 
-**The fp32/bf16 split is upstream's, and it is checked per component.** The
-transformer, condition encoder and vocoder are F32 and the RVQ depth decoder is
-BF16 — the conversion script's `--dtype float32` default applied to three
-components and `torch.bfloat16` forced on the fourth. A dtype that is too *wide*
-is numerically correct, so no token or golden gate can see it; a component whose
-tensors arrive in the other dtype is therefore refused here, at load.
+**On-disk dtype and runtime dtype are different things, and the loader keeps
+them apart.** The files store F32 for the transformer, condition encoder and
+vocoder and BF16 for the RVQ depth decoder and language model, and
+`MiniMaxMusic3AccountTensors` refuses a file that disagrees. That set is *not* a
+runnable configuration. Upstream casts in exactly two places, `denoise.py:83`
+(condition encoder output into the transformer) and `decoders.py:84` (latents
+into the vocoder), and never on the way in: `denoise.py:82` hands the language
+model's hidden states to the condition encoder with a device move and no dtype
+move. So the autoregressive half must share one dtype, and loading the on-disk
+set raises `Input type (c10::BFloat16) and bias type (float) should be the same`
+from `condition_embedder_minimax_music3.py:64`.
+
+`MiniMaxMusic3ResolveRuntimeDtypes` answers the runtime question.
+`kBf16ArFp32Acoustic` is the gated configuration: language model, depth decoder
+and condition encoder in bf16, transformer and vocoder in fp32.
+`MiniMaxMusic3CheckRuntimeDtypes` refuses a violation by name, listing all three
+autoregressive components with their dtypes, because upstream's own error names
+a bias dtype and never says which component disagreed with which.
+`kAsStored` is kept selectable so that failure stays reproducible; it is
+reported as not runnable rather than quietly repaired.
 
 **The vocoder's weight norm is folded at load.** Its 30 weight-normed
 convolutions ship as torch's legacy `weight_g`/`weight_v` pairs;
