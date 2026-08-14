@@ -143,8 +143,16 @@ NemotronHParams TinyParams() {
   p.num_nextn_predict_layers = 0;
 
   p.num_attention_heads = 4;
-  p.num_key_value_heads = 2;  // GQA 2:1, as the real 32/2 is
-  p.head_dim = 6;
+  p.num_key_value_heads = 2;  // GQA 2:1 (the real ratio is 32/2)
+  // head_dim is INDEPENDENT of hidden_size in this architecture — the real
+  // checkpoint is 32*128 = 4096 against hidden_size 2688 — and it is 16 here
+  // rather than 6 for a measured reason. At head_dim 6 the qk dot runs over six
+  // terms, the scores land in a band the softmax barely resolves, and the block's
+  // output moved by only 2e-4 when a full NeoX RoPE was applied to q and k —
+  // BELOW the tolerance this file's own attention-equality check uses. That is a
+  // gate that cannot see the defect it claims to gate. 16 also gives the rotation
+  // 8 frequency pairs instead of 3, which is the shape the real 128 has.
+  p.head_dim = 16;
   p.rope_theta = 10000.0;      // present in config.json and INERT here
   p.partial_rotary_factor = 1.0;  // ditto
   p.attention_bias = false;
@@ -393,17 +401,47 @@ struct AttnRefWeights {
   std::vector<float> q, k, v, o;
 };
 
+// NeoX partial RoPE in double, applied in place to `v [T, heads, D]`. Written
+// here rather than called from `vt::RopeNeox` on purpose: this is a REFERENCE
+// for the mis-port, and a reference that shares an implementation with the tree
+// proves consistency, not correctness.
+void RefApplyRopeNeox(std::vector<double>& v, int64_t T, int64_t heads, int64_t D,
+                      int64_t rot, double base) {
+  const int64_t half = rot / 2;
+  for (int64_t t = 0; t < T; ++t) {
+    for (int64_t h = 0; h < heads; ++h) {
+      double* row = &v[static_cast<size_t>((t * heads + h) * D)];
+      for (int64_t i = 0; i < half; ++i) {
+        const double inv =
+            std::pow(base, -2.0 * static_cast<double>(i) / static_cast<double>(rot));
+        const double ang = static_cast<double>(t) * inv;
+        const double c = std::cos(ang), s = std::sin(ang);
+        const double x1 = row[i], x2 = row[i + half];
+        row[i] = x1 * c - x2 * s;
+        row[i + half] = x2 * c + x1 * s;
+      }
+    }
+  }
+}
+
 // nemotron_h.py:473-486 — causal GQA SDPA, scale head_dim**-0.5, and NO
-// POSITIONAL EMBEDDING of any kind.
+// POSITIONAL EMBEDDING of any kind. `rope` is the MIS-PORT arm: it applies the
+// rotation the config's inert `rope_theta`/`partial_rotary_factor` would drive.
 std::vector<double> RefAttention(const AttnRefWeights& w, const NemotronHParams& p,
-                                 const std::vector<float>& hidden, int64_t T) {
+                                 const std::vector<float>& hidden, int64_t T,
+                                 bool rope = false) {
   const int64_t H = p.hidden_size;
   const int64_t Hq = p.num_attention_heads;
   const int64_t Hkv = p.num_key_value_heads;
   const int64_t D = p.head_dim;
-  const std::vector<double> q = RefLinear(hidden, w.q, T, H, Hq * D);
-  const std::vector<double> k = RefLinear(hidden, w.k, T, H, Hkv * D);
+  std::vector<double> q = RefLinear(hidden, w.q, T, H, Hq * D);
+  std::vector<double> k = RefLinear(hidden, w.k, T, H, Hkv * D);
   const std::vector<double> v = RefLinear(hidden, w.v, T, H, Hkv * D);
+  if (rope) {
+    const int64_t rot = static_cast<int64_t>(static_cast<double>(D) * p.partial_rotary_factor);
+    RefApplyRopeNeox(q, T, Hq, D, rot, p.rope_theta);
+    RefApplyRopeNeox(k, T, Hkv, D, rot, p.rope_theta);
+  }
   const double scale = 1.0 / std::sqrt(static_cast<double>(D));
   const int64_t rep = Hq / Hkv;
 
@@ -456,7 +494,7 @@ struct MoeRefWeights {
 std::vector<double> RefMoe(const MoeRefWeights& w, const NemotronHParams& p,
                            const std::vector<float>& hidden, int64_t T,
                            bool fold_scale_into_weights = false,
-                           bool scale_logits = false) {
+                           bool scale_logits = false, bool scale_shared_too = false) {
   const int64_t H = p.hidden_size;
   const int64_t E = p.n_routed_experts;
   const int64_t Kk = p.num_experts_per_tok;
@@ -550,7 +588,10 @@ std::vector<double> RefMoe(const MoeRefWeights& w, const NemotronHParams& p,
           acc += h[static_cast<size_t>(i)] *
                  static_cast<double>(w.shared_down[static_cast<size_t>(d * Is + i)]);
         }
-        out[static_cast<size_t>(t * H + d)] += acc;
+        // The MIS-PORT arm (spec §6a M5): scaling the ASSEMBLED (routed+shared)
+        // sum instead of the routed sum alone.
+        out[static_cast<size_t>(t * H + d)] +=
+            scale_shared_too ? acc * p.routed_scaling_factor : acc;
       }
     }
   }
@@ -603,8 +644,15 @@ NemotronHMambaWeights PackMamba(const MambaRefWeights& r, const NemotronHParams&
 AttnRefWeights BuildAttnRef(const NemotronHParams& p, int64_t salt, DType dt) {
   AttnRefWeights r;
   const int64_t qd = p.q_proj_out_features(), kd = p.kv_proj_out_features();
-  r.q = RoundTo(SynthVec(static_cast<size_t>(qd * p.hidden_size), salt + 1, 0.2f), dt);
-  r.k = RoundTo(SynthVec(static_cast<size_t>(kd * p.hidden_size), salt + 2, 0.2f), dt);
+  // q/k are deliberately LARGER than v/o. MEASURED: at amplitude 0.2 the qk
+  // scores land in a ~0.15 band, the softmax is all but uniform, and the block's
+  // output is the mean of v whatever q and k are — so an attention-side defect
+  // (a wrong scale, a wrong GQA mapping, a spurious RoPE) moved the answer by
+  // only ~1e-5 and no honest tolerance could see it. That is the same "the gate
+  // could not distinguish the thing it claims to gate" shape the no-RoPE case
+  // below exists to falsify, so the fixture is the fix.
+  r.q = RoundTo(SynthVec(static_cast<size_t>(qd * p.hidden_size), salt + 1, 0.9f), dt);
+  r.k = RoundTo(SynthVec(static_cast<size_t>(kd * p.hidden_size), salt + 2, 0.9f), dt);
   r.v = RoundTo(SynthVec(static_cast<size_t>(kd * p.hidden_size), salt + 3, 0.2f), dt);
   r.o = RoundTo(SynthVec(static_cast<size_t>(p.hidden_size * qd), salt + 4, 0.2f), dt);
   return r;
@@ -869,7 +917,15 @@ TEST_CASE("NemotronH mamba2 state: the SSM dtype is independent, and it is CARRI
     for (int64_t i = T1 * p.hidden_size; i < T * p.hidden_size; ++i) {
       tail.push_back(whole[static_cast<size_t>(i)]);
     }
-    CHECK(AnyDiffers(y2, tail, 2e-4, 2e-4));
+    // EXACT inequality, not a tolerance. The two runs differ in ONE thing — the
+    // dtype the recurrent state is stored at between the legs — and everything
+    // downstream of it is deterministic, so the correct question is "did any bit
+    // move", not "did it move by more than X". A tolerance here would be a
+    // count-based bound on a quantity nothing bounds: measured, the bf16 state's
+    // effect on this f32-activation leg is ~1e-5 absolute, which sits UNDER the
+    // 2e-4 the block's own gate uses — i.e. a collapsed state dtype is invisible
+    // to every tolerance in this file, which is exactly why it needs its own case.
+    CHECK(AnyDiffers(y2, tail, 0.0, 0.0));
   }
 }
 
@@ -918,73 +974,21 @@ TEST_CASE("NemotronH attention applies NO positional embedding") {
 
   CHECK(vllm::kNemotronHAttentionHasNoRope);
 
-  // A NeoX RoPE at the config's own rope_theta over the full head_dim, applied
-  // to the reference's q/k, is a different answer at every position but 0.
-  const std::vector<double> want_no_rope = RefAttention(r, p, hidden, T);
+  // (a) the un-rotated reference is the one the block matches.
+  const std::vector<double> want_no_rope = RefAttention(r, p, hidden, T, /*rope=*/false);
   ExpectClose("attention without rope", got, want_no_rope, 2e-4, 2e-4);
 
-  const int64_t H = p.hidden_size, Hq = p.num_attention_heads, Hkv = p.num_key_value_heads,
-                D = p.head_dim;
-  std::vector<float> qv(static_cast<size_t>(T * Hq * D)), kv(static_cast<size_t>(T * Hkv * D));
-  {
-    const std::vector<double> qd = RefLinear(hidden, r.q, T, H, Hq * D);
-    const std::vector<double> kd = RefLinear(hidden, r.k, T, H, Hkv * D);
-    for (size_t i = 0; i < qv.size(); ++i) qv[i] = static_cast<float>(qd[i]);
-    for (size_t i = 0; i < kv.size(); ++i) kv[i] = static_cast<float>(kd[i]);
+  // (b) the SAME reference with a NeoX rotation at the config's own inert
+  //     rope_theta / partial_rotary_factor is a measurably different answer, so
+  //     "no rope" is a claim this gate can actually falsify. Applying RoPE
+  //     changes no tensor SHAPE, so nothing but a numeric bound sees it.
+  const std::vector<double> want_roped = RefAttention(r, p, hidden, T, /*rope=*/true);
+  double maxd = 0.0;
+  for (size_t i = 0; i < got.size(); ++i) {
+    maxd = std::max(maxd, std::abs(static_cast<double>(got[i]) - want_roped[i]));
   }
-  std::vector<int32_t> pos(static_cast<size_t>(T));
-  std::iota(pos.begin(), pos.end(), 0);
-  {
-    vt::Tensor qt = vt::Tensor::Contiguous(qv.data(), DType::kF32, Cpu(), {T, Hq, D});
-    vt::Tensor kt = vt::Tensor::Contiguous(kv.data(), DType::kF32, Cpu(), {T, Hkv, D});
-    vt::Tensor pt = vt::Tensor::Contiguous(pos.data(), DType::kI32, Cpu(), {T});
-    vt::RopeArgs ra;
-    ra.base = static_cast<float>(p.rope_theta);
-    ra.rotary_dim = static_cast<int>(p.head_dim * p.partial_rotary_factor);
-    vt::RopeNeox(q, qt, kt, pt, ra);
-  }
-  // Re-run the causal core over the ROTATED q/k and confirm it disagrees. A
-  // forward that applied RoPE would land here instead.
-  std::vector<double> rotated(static_cast<size_t>(T * H), 0.0);
-  {
-    AttnRefWeights ident = r;
-    // Reuse the reference's tail (attention core + o_proj) by feeding it q/k/v
-    // through a hand-rolled repeat of the core; simplest is to inline it.
-    const double scale = 1.0 / std::sqrt(static_cast<double>(D));
-    const int64_t rep = Hq / Hkv;
-    const std::vector<double> vv = RefLinear(hidden, r.v, T, H, Hkv * D);
-    std::vector<float> ctx(static_cast<size_t>(T * Hq * D), 0.0f);
-    for (int64_t h = 0; h < Hq; ++h) {
-      const int64_t g = h / rep;
-      for (int64_t i = 0; i < T; ++i) {
-        std::vector<double> s(static_cast<size_t>(i + 1));
-        double mx = -std::numeric_limits<double>::infinity();
-        for (int64_t j = 0; j <= i; ++j) {
-          double dot = 0.0;
-          for (int64_t d = 0; d < D; ++d) {
-            dot += static_cast<double>(qv[static_cast<size_t>(i * Hq * D + h * D + d)]) *
-                   static_cast<double>(kv[static_cast<size_t>(j * Hkv * D + g * D + d)]);
-          }
-          s[static_cast<size_t>(j)] = dot * scale;
-          mx = std::max(mx, s[static_cast<size_t>(j)]);
-        }
-        double sum = 0.0;
-        for (int64_t j = 0; j <= i; ++j) {
-          s[static_cast<size_t>(j)] = std::exp(s[static_cast<size_t>(j)] - mx);
-          sum += s[static_cast<size_t>(j)];
-        }
-        for (int64_t d = 0; d < D; ++d) {
-          double acc = 0.0;
-          for (int64_t j = 0; j <= i; ++j) {
-            acc += (s[static_cast<size_t>(j)] / sum) * vv[static_cast<size_t>(j * Hkv * D + g * D + d)];
-          }
-          ctx[static_cast<size_t>(i * Hq * D + h * D + d)] = static_cast<float>(acc);
-        }
-      }
-    }
-    rotated = RefLinear(ctx, ident.o, T, Hq * D, H);
-  }
-  CHECK(AnyDiffers(got, rotated, 1e-3, 1e-3));
+  INFO("max |no-rope - roped| = " << maxd);
+  REQUIRE(AnyDiffers(got, want_roped, 1e-3, 1e-3));
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1008,13 +1012,24 @@ TEST_CASE("NemotronH MoE equals an independent non-gated relu^2 reference") {
   }
 }
 
-// TRAP 1. `apply_routed_scale_to_output=True` (nemotron_h.py:234). Folding the
-// same 2.5 into the router weights — which Laguna legitimately does
-// (laguna_ops.h:48), because Laguna passes NO shared expert — scales the shared
-// term too and is a different answer on every token. Folding it into the LOGITS
-// is different again: sigmoid is non-linear, so it moves the weights and can move
-// the SELECTION.
-TEST_CASE("NemotronH MoE: the routed scale is on the OUTPUT, not the weights or logits") {
+// TRAP 1. `apply_routed_scale_to_output=True` (nemotron_h.py:234). The scale
+// multiplies the ROUTED sum only; the shared term is added AFTER and UNSCALED
+// (moe_runner.py:402-406 then :722-725).
+//
+// TWO of the three plausible mis-ports are a different ANSWER and are gated
+// here. The third — folding the factor into each router weight, which Laguna
+// legitimately does (laguna_ops.h:48) — is EXACT-ARITHMETIC-EQUAL by linearity
+// EVEN WITH a shared expert, because the shared term is added after the routed
+// sum either way. MEASURED, not assumed: this case first asserted the fold
+// DIFFERED and that assertion failed, which is the same thing spec §6a already
+// recorded (mutation M6 "survived green ... the fold is exact-arithmetic-equal,
+// so nothing could see it"). The BITWISE separation lives where it can be made —
+// `tests/vt/test_ops_moe_nongated_relu2.cpp`, on decimal-grid data whose f32
+// products carry full mantissas. This case ASSERTS the equality rather than
+// pretending otherwise, so the next porter reads the real reason Laguna's habit
+// is legal here and still must not be copied blind: it is the SHARED-TERM
+// scaling below, not the fold, that a token gate would catch late.
+TEST_CASE("NemotronH MoE: the routed scale is on the OUTPUT, not the logits or the shared term") {
   NemotronHParams p = TinyParams();
   REQUIRE(p.routed_scaling_factor != 1.0);
   const int64_t T = 12;
@@ -1026,30 +1041,26 @@ TEST_CASE("NemotronH MoE: the routed scale is on the OUTPUT, not the weights or 
   const std::vector<float> got = vllm::NemotronHMoeMixer(w, p, hidden, T, dt, q);
 
   const std::vector<double> want = RefMoe(r, p, hidden, T);
-  ExpectClose("moe, scale on the output", got, want, 2e-4, 2e-4);
+  ExpectClose("moe, scale on the routed output", got, want, 2e-4, 2e-4);
 
-  // The fold-into-weights mis-port. The gate is only meaningful if the two
-  // expressions really differ, so REQUIRE that first — a shared expert is what
-  // separates them, which is why this case has one.
-  const std::vector<double> folded =
-      RefMoe(r, p, hidden, T, /*fold_scale_into_weights=*/true);
-  REQUIRE(AnyDiffers(got, folded, 1e-3, 1e-3));
+  // MIS-PORT A: scale the ASSEMBLED routed+shared sum (spec §6a M5). Different
+  // on every token whose shared term is non-zero, which is every token here.
+  const std::vector<double> shared_scaled =
+      RefMoe(r, p, hidden, T, /*fold_scale_into_weights=*/false, /*scale_logits=*/false,
+             /*scale_shared_too=*/true);
+  REQUIRE(AnyDiffers(got, shared_scaled, 1e-3, 1e-3));
 
-  // The scale-the-logits mis-port.
+  // MIS-PORT B: scale the router LOGITS. sigmoid is non-linear, so this moves
+  // the weights and can move the SELECTION.
   const std::vector<double> logit_scaled =
-      RefMoe(r, p, hidden, T, /*fold=*/false, /*scale_logits=*/true);
+      RefMoe(r, p, hidden, T, /*fold_scale_into_weights=*/false, /*scale_logits=*/true);
   REQUIRE(AnyDiffers(got, logit_scaled, 1e-3, 1e-3));
 
-  // With NO shared expert the fold is exact-arithmetic-equal — which is exactly
-  // why Laguna may do it and why a tolerance-based gate on a shared-expert-free
-  // config CANNOT see this defect. Pinned so the next porter does not "simplify"
-  // the block by copying Laguna.
-  const MoeRefWeights rn = BuildMoeRef(p, 3000, dt, /*shared=*/false);
-  const NemotronHMoeWeights wn = PackMoe(rn, p, dt);
-  const std::vector<float> gotn = vllm::NemotronHMoeMixer(wn, p, hidden, T, dt, q);
-  const std::vector<double> foldedn =
-      RefMoe(rn, p, hidden, T, /*fold_scale_into_weights=*/true);
-  ExpectClose("no-shared: the fold is indistinguishable", gotn, foldedn, 2e-4, 2e-4);
+  // NOT a mis-port any tolerance-based gate can see, shared expert or not —
+  // asserted EQUAL, for the reason above.
+  const std::vector<double> folded =
+      RefMoe(r, p, hidden, T, /*fold_scale_into_weights=*/true);
+  ExpectClose("the router-weight fold is exact-arithmetic-equal", got, folded, 2e-4, 2e-4);
 }
 
 // TRAP 2. `GateLinear(out_dtype=torch.float32, force_fp32_compute=True)`
