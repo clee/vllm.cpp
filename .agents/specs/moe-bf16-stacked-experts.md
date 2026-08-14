@@ -178,6 +178,150 @@ loader rather than a projection of it.
 - Do not claim Qwen3.8 runs. This row makes the architecture loadable and proves
   it at 35B; the 2.4T checkpoint remains unrunnable on size alone.
 
+## Slicing order, as established from the pinned oracle's source
+
+Phase 1's stop condition did not fire. The order is upstream's, read at the
+parity pin `555967922` in
+`vllm/model_executor/layers/fused_moe/routed_experts.py`:
+
+| Question | Answer | Anchor |
+|---|---|---|
+| Which half is gate? | chunk **0** is `w1` (gate), chunk 1 is `w3` (up) | `:1081-1082` |
+| `gate_up_proj` layout | normalized to `[E, 2I, H]`, hidden LAST | `:923-926` |
+| The split | `chunk(2, dim=1)` — halves of the `2I` axis | `:928` |
+| `down_proj` layout | normalized to `[E, H, I]`, hidden at dim -2 | `:929-932` |
+| Expert stride | dim 0 (`unbind()` defaults to dim 0) | `:942` |
+| Stacked detection | `loaded_weight.dim() == 3` | `:907` |
+
+The third element of a `fused_mapping` tuple is normally an expert id; for the
+two fused entries upstream **repurposes it as the chunk index**, and says so in
+its own comment at `:927`. That is what makes `chunk(2, dim=1)[expert_id]`
+coherent rather than out of range.
+
+Because a swapped gate/up loads cleanly and only shows up in logits, that one
+bit was confirmed three further ways: `_load_w13` narrowing w1 to destination
+offset 0 and w3 to `shard_size` (`:494-500`, with `SHARD_ID_TO_SHARDED_DIM` at
+`:656`); `unquantized_fused_moe_method.py:97-106` allocating `w13_weight` as
+`[num_experts, 2 * intermediate, hidden]`; and `activation.py:77,:161`
+dispatching SiLU to `silu_and_mul`, which applies SiLU to the FIRST half of the
+concatenated operand — a confirmation that does not depend on loader
+bookkeeping at all.
+
+Both published repos ship the **canonical** orientation, read from each shard's
+own safetensors header on 2026-08-14: `Qwen/Qwen3.8-2.4T-A95B` `gate_up_proj`
+BF16 `[512, 4096, 8192]` / `down_proj` `[512, 8192, 2048]`, and
+`Qwen/Qwen3.6-35B-A3B` `[256, 1024, 2048]` / `[256, 2048, 512]`. The transposed
+branch mirrors upstream's own `shape[-1] != hidden` probe and is exercised only
+synthetically.
+
+## The 2.4T load-plan dry run: result
+
+`PlanQwen3_5MoeLoad` walks the whole load for a config and reports every tensor
+it would fetch, without allocating or reading a weight byte. Against the pinned,
+verbatim `model.safetensors.index.json` (1609 tensors, 213 shards, 4.89 TB) plus
+a shape manifest captured from the shards' own headers, the partition is exact
+and clean:
+
+- **1014 planned BF16 tensors: every one present, with exactly the planned
+  shape.** That is the whole backbone this arm reads — embeds, norms, every
+  layernorm, the router gate, the shared-expert gate, the GDN's bf16 tail, both
+  attention norms, and the 184 stacked routed-expert tensors.
+- **All 184 loader-*enforced* expert shapes agree** at 512 experts / hidden 8192
+  / intermediate 2048 — `[512, 4096, 8192]` and `[512, 8192, 2048]`.
+- **1429 planned non-BF16 tensors: none satisfied** — 853 absent (`weight_scale`
+  / `weight_scale_2`, which a bf16 repo simply does not have) and 576 present
+  but BF16 where the loader demands U8 or F8_E4M3.
+- **The unsatisfied set is exactly the three out-of-scope arms**: the FP8
+  attention tower, the FP8 GDN tower, the NVFP4 shared expert, and the NVFP4
+  `lm_head`. Nothing outside them.
+- The only published tensors the plan does not want are `mtp.*` (19, the
+  separately-loaded draft head) and, on the 35B, `model.visual.*` (333, the
+  vision tower).
+
+**The spec's Phase-3 wording — "asserts that set is exactly satisfied by the
+index" — cannot hold as written while §Scope excludes the tower, shared expert
+and head.** A published repo is bf16 *throughout*. The dry run therefore asserts
+the honest form: every BF16 request resolves exactly, and every unsatisfied
+request is a named, already-owed arm. That is a stronger statement than a bare
+pass, because it enumerates precisely what a 2.4T load would still be missing
+rather than hiding it.
+
+The same dry run runs against the real `Qwen/Qwen3.6-35B-A3B` index, which says —
+**before anyone stages 71.9 GB** — that the binding gate's checkpoint will hit
+the same three owed arms.
+
+### Why the plan is a projection of the loader and not a second model of it
+
+The suite builds a checkpoint from the plan *alone* and requires the production
+`LoadQwen3_5Moe` to read it (the plan is sufficient), then removes each planned
+tensor in turn and requires the load to fail naming that tensor (the plan is
+necessary). A plan entry the loader never wanted survives its own deletion; a
+tensor the loader wants that the plan omits breaks the first load. Both
+directions are mutation-proven (M10, M11).
+
+The spec asked for this agreement to be shown against a real 35B load. That load
+needs the 72 GB checkpoint and the GPU box, so it is **owed to Phase 5**; the
+delete-one-at-a-time round trip is the CPU-side substitute and is strictly
+finer-grained.
+
+## Outcome
+
+**Implemented, CPU-gated, GPU gate NOT run.**
+
+Measured: 11/11 test cases, 30892 assertions, `Status: SUCCESS!`. RED captured
+first — the stacked cases threw the old refusal (2 cases / 6 assertions failed).
+15 mutations, every one RED, source restored byte-exact.
+
+**A fixture defect was found and fixed, and it matters.** The synthetic payload
+generator was `0x3d00 + ((i*37 + e*7) & 0x1ff)` — affine in the element index
+with period 512. Swapping gate/up shifts the source offset by `I*H` and dropping
+the expert stride by `2*I*H`; when those are multiples of the period, both
+defects land on identical values. Measured, not reasoned: with that generator,
+mutating the reader to swap gate/up *and* to read expert 0 for every expert left
+the suite fully green. The replacement is an xorshift-multiply finalizer, and
+the case now REQUIREs that the specific offsets the mutations exchange hold
+different values. M1 (gate/up swap) and M2 (stride dropped) both go RED.
+
+Rejected: narrowing `CheckMoeExpertLayoutSupported` by deleting its stacked
+branch's tests. The two refusal subcases were **retained with their subject
+narrowed** — a fully published index still refuses, one layer further in, at the
+unquantized `lm_head`. Deleting them would have dropped the only CPU-visible pin
+on the claim most likely to be over-read from this row.
+
+### What the CPU evidence does and does not establish
+
+Establishes: the stacked bf16 reader loads through the production entry point on
+both residency paths and both namespaces; the gate/up split, expert stride and
+both orientations are byte-exact against a payload derived independently of the
+loader; the layout is resolved once per checkpoint and threaded; a mixed index
+and a non-BF16 stacked tensor are refused by name; the NVFP4 arm is untouched;
+and every name and BF16 shape the reader would request from both published repos
+resolves, at their real dimensions.
+
+Does **not** establish: a single generated token. The binding token-exact gate on
+`Qwen/Qwen3.6-35B-A3B` bf16 has not run. A wrong gate/up split or expert stride
+is caught here only because the synthetic payload was built to catch it — at toy
+dimensions, against an expectation this row's author wrote. The oracle has not
+been consulted at runtime. Nothing here shows the 2.4T allocates, and nothing
+here claims Qwen3.8 runs.
+
 ## Now
 
-Row is `READY`. Spec committed; implementation not started.
+Row lifecycle is still recorded as `READY` above, deliberately. Phases 1-4 landed
+on `row/MODEL-MOE-BF16-STACKED-EXPERTS` — slicing order established from upstream
+source, stacked bf16 reader implemented and mutation-gated, the load-plan dry run
+running against both published indices, and the CPU suite green on a clean
+`-Werror` build — but the implementer's authority covered
+`qwen3_5_weights.{h,cpp}`, `tests/` and this spec only. **A lifecycle move owes
+`docs/STATUS.md`, `docs/BENCHMARKS.md` and the `.agents/roadmap_v1.md` row in the
+same change**, and those are the operator's to make; recording `ACTIVE` here
+without them would leave the projections disagreeing with the spec.
+
+**Owed, and needing the GB10:** stage `Qwen/Qwen3.6-35B-A3B` (71.9 GB, 26
+shards) and run the binding token-exact greedy gate against the pinned oracle;
+re-run the SACRED 27B / 35B / Coder gates and confirm goldens byte-identical.
+That gate will hit the three owed arms this row's dry run enumerates — the FP8
+attention and GDN towers, the NVFP4 shared expert and the NVFP4 `lm_head` — so
+loading a published bf16 repo end to end needs those arms too. They are separate
+rows, and the dry run now names them precisely rather than leaving them to be
+discovered.
