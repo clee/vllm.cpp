@@ -114,6 +114,44 @@ divergence, not as a load error.
    missing piece; the stacked shape no longer does.
 4. Inertness: 27B / 35B / Coder suites unchanged, golden md5 unchanged.
 
+## Loadability of the 2.4T itself, without 4.8 TB
+
+The developer's bar is explicit: **the 2.4T must be provably loadable on hardware
+that can hold it**, even though nothing here can. "It refuses honestly" is not
+that bar, and neither is "the reader works at 35B" on its own.
+
+Splitting the claim into the two halves that can each be proven:
+
+1. **Byte-level correctness of the reader** — proven token-exact at 35B on the
+   identical layout (see Gates below). This is what establishes that stacked bf16
+   experts are read, sliced and placed correctly at all.
+2. **Name, shape and dtype resolution for the 2.4T specifically** — proven by a
+   **load-plan dry run against the real published index**. `model.safetensors.index.json`
+   for `Qwen/Qwen3.8-2.4T-A95B` is ~1 MB and enumerates all 1609 tensors; it costs
+   nothing to fetch and pin. The loader must be able to resolve, for every tensor
+   it would request: the exact name, the shape implied by the config (92 layers,
+   512 experts, hidden 8192, `moe_intermediate_size` 2048, `num_experts_per_tok`
+   10), and the dtype — **without allocating or reading a single weight byte**.
+
+Requirement: a `--dry-run`-style plan path (or a test-only entry point) that walks
+the full load for a given config + index and reports every tensor it would fetch,
+with the shape and dtype it expects, then asserts that set is exactly satisfied by
+the index. Commit the pinned 2.4T index as a test fixture, as this row already
+does for the 2.4T `config.json`.
+
+This is the honest form of "it would load on adequate hardware": every name
+resolves, every shape agrees with the config, every dtype is one the reader
+handles, and the arithmetic that derives per-expert offsets from the stacked
+tensors is exercised at 2.4T's actual dimensions rather than 35B's.
+
+**What it deliberately does NOT claim:** a generated token, throughput, memory
+headroom, or that any allocation path survives at that scale. Those need the
+hardware. State that limit wherever the result is recorded.
+
+Do the same dry run for `Qwen/Qwen3.6-35B-A3B` bf16 and require it to agree with
+the real load that follows — otherwise the dry run is an unvalidated model of the
+loader rather than a projection of it.
+
 ## Gates
 
 - Focused suites plus the full serial gate.
