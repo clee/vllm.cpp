@@ -1257,6 +1257,47 @@ arm (W7). The committed `nemotron_35_lightning_greedy/oracle.json` goldens are
 W6's gate and were deliberately NOT consumed here. No speed claim is made or
 implied by this W.
 
+### 6c. Fresh-review residuals carried forward (2026-08-14)
+
+W4's fresh review returned **PASS** and proved its central claim by experiment:
+it reconstructed the inherited gate, made an attention block return all zeros,
+and watched **both bf16 arms accept it** — the released checkpoint's dtype. The
+repair holds; the same mutant now fails on all four arms. Four residuals are
+recorded rather than left in a reviewer's report:
+
+**R1 — the bf16 band is coarser than the defect class this file targets, and
+the f32 arm must never be dropped as redundant.** `test_nemotron_h_forward.cpp`
+compares bf16 at 3e-2 of peak. Demonstrated: a 2% attention-scale error
+(`args.scale *= 1.02`) fails both f32 arms and **passes both bf16 arms**.
+Corroborating: this file's own no-RoPE separation is **0.0210891**, *below* the
+bf16 band, so a RoPE mis-port would pass the bf16 comparison. The f32 arm
+(2e-4) and the dedicated no-RoPE guard catch both, which is why this is a
+residual and not a defect — but the asymmetry is now on the record so nobody
+prunes the f32 arm as duplicated coverage.
+
+**R2 — the self-certification is a structural identity, not a tightness
+measure.** Each comparison REQUIREs that its band reject all-zeros, which with
+a peak-relative band reduces exactly to `rel < 0.5`. It eliminates the precise
+defect it was written for and nothing more; at `rel = 0.49` it still passes
+everywhere. Honestly scoped, not a general guarantee of band quality.
+
+**R3 — the routed-scale CALL SITE is genuinely ungated.** Folding
+`routed_scaling_factor` into the router instead of `MoeCombine`'s
+`routed_scale` gives **13/13 cases, 254/254 assertions, SUCCESS** — the
+model-level gate cannot see it (peak-relative separation 1.91e-07). It is
+arithmetically equal post-renormalisation, which `layer.py:291-300` states
+outright by forcing the router factor to 1.0 "so it ends up being a nop". The
+bitwise instrument at `tests/vt/test_ops_moe_nongated_relu2.cpp:270` gates
+`vt::MoeCombine`'s own semantics, **not** this call site's choice — a
+distinction the earlier write-up blurred. Unavoidable here (the model-level
+reference is `double`, so no bitwise comparison exists), and recorded as
+uncovered rather than implied to be covered.
+
+**R4 — two comment magnitudes state no denominator.** "3.7e-5 relative" for the
+fold measures 1.91e-07 peak-relative; "25.3x the signal" for `scale_logits`
+measures 0.568. The qualitative claims are right and were independently
+verified; the numbers appear to be mean-relative or from an earlier fixture.
+
 ## 7. Now
 
 **State at this commit:** **W1 and W3 have LANDED on `main`; W2 is in
