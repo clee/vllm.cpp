@@ -53,6 +53,8 @@
 #include "vllm/model_executor/model_loader/safetensors_reader.h"
 #include "vllm/model_executor/models/model_registry.h"
 #include "vllm/model_executor/models/nemotron_h.h"
+#include "vllm/model_executor/models/nemotron_h_forward.h"
+#include "vllm/model_executor/models/nemotron_h_loader.h"
 #include "vllm/model_executor/models/qwen3_5.h"  // ForwardLogits, *KvCache
 #include "vllm/transformers_utils/hf_config.h"
 #include "vllm/v1/attention/backend.h"            // CommonAttentionMetadata
@@ -133,6 +135,71 @@ TEST_CASE("NemotronH: the REAL checkpoint loads and the forward produces logits"
   MESSAGE("peak RSS before load: " << rss_before_kib / 1024 << " MiB");
   MESSAGE("peak RSS after load:  " << rss_after_kib / 1024 << " MiB");
 
+  // ─── (1) EVERY tensor is materialized or deferred BY NAME ──────────────────
+  const vllm::NemotronHLoadReport& rep = vllm::NemotronHLoadReportOf(*model);
+  MESSAGE("host bytes: " << rep.host_bytes / (1024 * 1024) << " MiB, source "
+                         << rep.source_bytes / (1024 * 1024) << " MiB");
+  CHECK(rep.enumerated == 18487);
+  CHECK(rep.in_index == 18487);
+  CHECK(rep.materialized + rep.deferred == 18487);
+  // The MTP tower (W5): 270 unquantized bf16 tensors the `ignore` list's `mtp*`
+  // wildcard leaves unquantized. Deferred, counted, and NAMED — never silently
+  // dropped.
+  CHECK(rep.deferred == 270);
+  CHECK(rep.materialized == 18217);
+  REQUIRE(!rep.deferred_by_name.empty());
+  for (const std::string& tag : rep.deferred_by_name) {
+    CHECK(tag.find("W5") != std::string::npos);
+  }
+
+  // ─── (2) the per-scheme composition, against the CHECKPOINT's own format ───
+  //
+  // Reading MIXED_PRECISION as uniform NVFP4 is numerically plausible and
+  // token-invisible. These five rows are the scheme table of spec §1 turned into
+  // numbers, and they must sum to every materialized tensor with nothing left
+  // over.
+  //
+  // NVFP4 W4A16 g16: 23*128*2 routed + 23*2 shared + lm_head = 5935 projections,
+  // three tensors each (weight / weight_scale / weight_scale_2). Exactly the
+  // `{W4A16_NVFP4: 5935}` half of the histogram W1 measured over all 5981
+  // `quantized_layers` entries.
+  CHECK(rep.nvfp4_weights == 5935);
+  CHECK(rep.nvfp4_tensors == 5935 * 3);
+  // FP8 W8A8 static: the 23 mamba `in_proj` + 23 `out_proj` = 46 targets, the
+  // other half of that histogram. If this reads 0 the loader took the whole
+  // checkpoint as NVFP4; if it reads 5981 it took the whole thing as FP8.
+  CHECK(rep.fp8_weights == 46);
+  CHECK(rep.fp8_tensors == 46 * 3);
+  // The fp8 KV scheme: one k_scale + one v_scale on each of the 6 attention
+  // layers.
+  CHECK(rep.fp8_kv_scale_tensors == 12);
+  // The unquantized remainder, by the dtype it SHIPS in: 216 bf16 (embeddings,
+  // norm_f, 52 layer norms, and the 6 mamba/attention tensor families) and 46
+  // f32 (the 23 routers and their 23 score-correction biases).
+  CHECK(rep.bf16_tensors == 216);
+  CHECK(rep.f32_tensors == 46);
+  CHECK(rep.nvfp4_tensors + rep.fp8_tensors + rep.fp8_kv_scale_tensors +
+            rep.bf16_tensors + rep.f32_tensors ==
+        rep.materialized);
+
+  // ─── (3) the loaded dtypes are the SHIPPED ones, not wider ────────────────
+  //
+  // A too-WIDE dtype is numerically correct, invisible to a token comparison,
+  // and moves twice the bytes. The only widening the released checkpoint asks
+  // for is the three f32-by-contract SSM scalars on each of the 23 mamba
+  // layers — upstream's own polarity (`-torch.exp(self.A_log.float())`) and
+  // what `vt::Mamba2ChunkScan` validates. 23 * 3 = 69, and no more.
+  CHECK(rep.widened_tensors == 69);
+
+  // The two arithmetic facts that make keeping the quantized forms mandatory
+  // rather than tidy: the host mirror is within a few percent of the on-disk
+  // bytes, and the routed experts alone would be 58.7 GB at bf16.
+  CHECK(rep.host_bytes < 24LL * 1024 * 1024 * 1024);
+  CHECK(rep.host_bytes > 16LL * 1024 * 1024 * 1024);
+  // Peak RSS is the number a unified-memory box lives or dies by.
+  MESSAGE("peak RSS after load (GiB): " << static_cast<double>(rss_after_kib) /
+                                               (1024.0 * 1024.0));
+
   // The forward, through the SHARED registry seam — never a private entry point.
   const std::vector<int32_t> token_ids{1, 2, 3, 4};
   const std::vector<int32_t> positions{0, 1, 2, 3};
@@ -161,14 +228,19 @@ TEST_CASE("NemotronH: the REAL checkpoint loads and the forward produces logits"
 
   // Finite AND non-degenerate: a loader that materialized zeros would return a
   // perfectly finite constant row, and an argmax over it is still a token.
+  // Aggregated rather than one assertion per vocabulary entry: 131072 REQUIREs
+  // swamp the assertion count, and a changed assertion COUNT is itself the
+  // signal a mutation is read by ([[doctest-assertions-line-hides-thrown-cases]]).
   double lo = logits.host[0];
   double hi = logits.host[0];
+  int64_t nonfinite = 0;
   for (float v : logits.host) {
-    REQUIRE(std::isfinite(v));
+    if (!std::isfinite(v)) ++nonfinite;
     lo = std::min<double>(lo, v);
     hi = std::max<double>(hi, v);
   }
   MESSAGE("logits range: [" << lo << ", " << hi << "]");
+  CHECK(nonfinite == 0);
   CHECK(hi - lo > 1.0);
 
   MESSAGE("peak RSS at end: " << VmHwmKiB() / 1024 << " MiB");

@@ -836,6 +836,7 @@ add_library(vllm STATIC
   # config descent, the on-disk name map, the registry entry and the het-KV
   # topology. No forward: nemotron_h.cpp is W4.
   src/vllm/model_executor/models/nemotron_h.cpp
+  src/vllm/model_executor/models/nemotron_h_loader.cpp
   src/vllm/model_executor/models/nemotron_h_registry.cpp
   src/vllm/model_executor/models/nemotron_h_weights.cpp
   src/vllm/model_executor/models/glm4_registry.cpp
