@@ -52,33 +52,46 @@ direction (`static_cast<int>(type)`) is the SAFE one and is deliberately not
 counted: it is how the seam itself indexes its registry.
 
 WHAT `dev_cast` DOES SEE, in every spelling of the one conversion: the four cast
-keywords and the C-style, functional, brace and DECLARATION forms; the type
-written as `DeviceType`, `vt::DeviceType`, `::vt::DeviceType` or
-`enum vt::DeviceType`; an operand that is an identifier, a literal (`)1`), a
-signed literal (`)-1`) or a parenthesised expression; a target that is a POINTER,
-which is how `reinterpret_cast` puns an integer's bytes onto a DeviceType; and a
-cast clang-format has wrapped across two lines.
+keywords, `bit_cast`, and the C-style, functional, brace and DECLARATION forms;
+the type written as `DeviceType`, `vt::DeviceType`, `::vt::DeviceType` or
+`enum vt::DeviceType`, with `const`/`volatile` on EITHER side of the name; an
+operand that is an identifier, a literal (`)1`), a signed literal (`)-1`), a
+parenthesised expression or a unary expression (`)*cursor`, `)~mask`, `)!flag`);
+a target that is a POINTER, a POINTER-TO-POINTER or a REFERENCE, which is how
+`reinterpret_cast` puns an integer's bytes onto a DeviceType; and a cast
+clang-format has wrapped across two lines.
 
 WHAT `dev_cast` STILL CANNOT SEE, stated here because a checker's message is the
 authority on what it enforces and an instrument that hides its blind spot
-returns a false pass:
+returns a false pass. Each entry states the reason that is true OF THAT ENTRY,
+because a list whose shared reason is false for one member is the same false
+claim in a smaller font:
 
   * a cast whose target is a type ALIAS (`using DT = vt::DeviceType;` then
     `static_cast<DT>(x)`), a macro that expands to the type name, or a template
-    parameter that resolves to DeviceType;
-  * `std::bit_cast`, `memcpy` or a union punning an integer onto a DeviceType.
-    The POINTER-cast spelling of the same pun IS caught; these three are not,
-    because no spelling of the target type appears at the conversion site;
+    parameter that resolves to DeviceType. Reason: no spelling of the target
+    type appears at the conversion site;
+  * `memcpy` or a union punning an integer onto a DeviceType. Same reason: the
+    type is named at the declaration, never at the conversion. (`std::bit_cast`
+    DOES name it there, so it is a cast keyword above rather than an entry here,
+    and the `reinterpret_cast` pointer/reference puns are caught too.);
+  * a C-STYLE cast whose target is a pointer or reference, `*(vt::DeviceType*)&x`.
+    Reason: the C-style alternative must not swallow a parameter list, and its
+    two discriminators — the `(` not glued to an identifier, and no declarator
+    suffix after the `)` — cannot tell `void note (vt::DeviceType*) &` from a
+    pun, because both are `)` followed by `&`. The NAMED-cast spelling of the
+    same pun IS caught, which is why this is a narrow gap rather than the class;
   * a conversion that happens inside `src/vt/` and is merely CALLED from the
     shared layer — `src/vt/` is a device leg and is not scanned at all;
   * whether the operand really is an integer. Nothing here type-checks; the
     bucket flags every cast TO DeviceType and relies on `// DSR-ALLOW(<row>)`
     for the legitimate ones (a wire-format decode is the expected case). This is
-    also why a pointer target counts: `const_cast<DeviceType*>(p)` removes const
-    rather than converting an integer, and buys its exemption the same way.
+    also why a pointer or reference target counts: `const_cast<DeviceType&>(t)`
+    removes const rather than converting an integer, and buys its exemption the
+    same way.
 
 Those are gaps in a TEXT checker, not gaps that were traded away for
-convenience. tests/scripts/test_device_leakage.py M20-M33 pin what it does
+convenience. tests/scripts/test_device_leakage.py M20-M40 pin what it does
 catch, each spelling asserted on its own — including, in M29, the literal
 operand, because a discriminator tested only on the case it was tuned for is a
 guard that certifies itself.
@@ -132,7 +145,8 @@ RE_IS_CUDA = re.compile(r"\bis_cuda\s*\(\s*\)")
 # spelling of the same conversion, all anchored on the TARGET TYPE:
 #
 #   1. a named cast          static_cast<vt::DeviceType>(x) / <DeviceType> / …
-#                            and the POINTER form, *reinterpret_cast<DeviceType*>(&x)
+#                            and the INDIRECT forms, *reinterpret_cast<DeviceType*>(&x)
+#                            and reinterpret_cast<DeviceType&>(x)
 #   2. a C-style cast        (vt::DeviceType)x  and  (vt::DeviceType)1
 #   3. a functional cast     vt::DeviceType(x) / vt::DeviceType{x}, and the same
 #                            conversion spelled as a DECLARATION, `DeviceType d{x}`
@@ -158,11 +172,30 @@ RE_IS_CUDA = re.compile(r"\bis_cuda\s*\(\s*\)")
 # keywords that legitimately precede a parenthesised expression; and what follows
 # must not be a declarator suffix.
 #
-# (2)'s trailing class admits DIGITS and a leading SIGN, not just identifiers.
-# `(vt::DeviceType)1` — the device named by its literal enum value — is the
-# PUREST form of what this bucket polices, and an identifier-only lookahead
-# missed exactly it while catching `(vt::DeviceType)d`. Measured over
-# `src/vllm` + `include/vllm`: admitting `0-9+-` adds ZERO hits.
+# (2)'s trailing class admits DIGITS, a leading SIGN and the UNARY OPERATORS
+# `*`, `~` and `!`, not just identifiers. `(vt::DeviceType)1` — the device named
+# by its literal enum value — is the PUREST form of what this bucket polices, and
+# an identifier-only lookahead missed exactly it while catching
+# `(vt::DeviceType)d`; `(vt::DeviceType)*cursor` is the WIRE-DECODE spelling this
+# docstring itself names as the expected `DSR-ALLOW` case, and a class that could
+# not see it was refusing to police the one site it predicted. `&` is deliberately
+# NOT admitted: `) &` and `) &&` are ref-qualifiers on a member declarator, which
+# is the false positive the trailing guard exists to reject. Measured over
+# `src/vllm` + `include/vllm`: admitting `0-9+-*~!` adds ZERO hits.
+#
+# (1) and (2) both take the cv-qualifiers on EITHER SIDE of the type name, and (1)
+# takes any run of `*` and `&`. `vt::DeviceType const` is the same type as
+# `const vt::DeviceType`, and `reinterpret_cast<vt::DeviceType&>(raw)` is the same
+# pun as `*reinterpret_cast<vt::DeviceType*>(&raw)` — both COMPILE (checked, not
+# read), and a pattern that saw west const and one star while the docstring
+# claimed the target type is what it is anchored on would be asserting coverage it
+# did not have. That is #660's own defect turned on the instrument, which is why
+# the run of `[*&]` is a run and the cv-qualifier group is two-sided.
+#
+# `bit_cast` joins the four cast keywords for the same reason: `bit_cast` spells
+# the target type at the conversion site, so the blind-spot note below could not
+# honestly claim it as unreachable — `memcpy` and union punning still are, and
+# they are the cases where no spelling of the type appears at all.
 #
 # (3)'s DECLARATION form takes `{` only. `DeviceType d{x}` is a real conversion
 # (C++17 permits list-initialising a scoped enum with a fixed underlying type),
@@ -171,12 +204,15 @@ RE_IS_CUDA = re.compile(r"\bis_cuda\s*\(\s*\)")
 # every FUNCTION DEFINITION whose return type is DeviceType (measured: 3 false
 # positives, e.g. `vt::DeviceType MiniMaxH3VideoDeviceType(`).
 _DEVTYPE_QUAL = r"(?:enum\s+)?(?:::\s*)?(?:vt\s*::\s*)?"
+# cv-qualifiers, which C++ permits on either side of the type name.
+_CV_WEST = r"(?:(?:const|volatile)\s+)*"
+_CV_EAST = r"(?:\s*(?:const|volatile)\b)*"
 RE_DEVTYPE_CAST = re.compile(
-    r"(?:static_cast|reinterpret_cast|const_cast|dynamic_cast)\s*<\s*"
-    r"(?:const\s+)?" + _DEVTYPE_QUAL + r"DeviceType\b\s*\*?\s*>"
+    r"(?:static_cast|reinterpret_cast|const_cast|dynamic_cast|bit_cast)\s*<\s*"
+    + _CV_WEST + _DEVTYPE_QUAL + r"DeviceType\b" + _CV_EAST + r"(?:\s*[*&])*\s*>"
     r"|(?:(?<![\w])|(?<=return)|(?<=case)|(?<=throw)|(?<=delete))"
-    r"\(\s*(?:const\s+)?" + _DEVTYPE_QUAL + r"DeviceType\b\s*\)\s*"
-    r"(?!(?:const|volatile|noexcept|override|final|try)\b)(?=[A-Za-z_(0-9+\-])"
+    r"\(\s*" + _CV_WEST + _DEVTYPE_QUAL + r"DeviceType\b" + _CV_EAST + r"\s*\)\s*"
+    r"(?!(?:const|volatile|noexcept|override|final|try)\b)(?=[A-Za-z_(0-9+\-*~!])"
     r"|(?<![\w.:>])" + _DEVTYPE_QUAL + r"DeviceType\b\s*(?:\w+\s*\{|[({])\s*(?![)}])"
 )
 RE_CUDA_INCLUDE = re.compile(r'^\s*#\s*include\s*[<"](?:vt/cuda/|cuda_runtime)')
