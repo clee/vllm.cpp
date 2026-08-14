@@ -373,21 +373,28 @@ one-tile control IS exact, on both causality arms, ours and upstream's: `max|dif
 
 ### The gate
 
-**The `ctest -N` denominator is 424, not the 416 first recorded.** 416 was the ninja edge
-count of `ninja test_ltx2_tiling test_ltx2_vae test_ltx2_video`, whose last line is
-`[416/416] Linking CXX executable tests/test_ltx2_video` — a build number read as a test
-number, so "full ctest 416/416" described a run that never happened at that denominator.
-The configure line that produces 424, recorded because a denominator without one is not
+**The `ctest -N` denominator is 448 at this head, and it was never 416.** 416 was the
+ninja edge count of `ninja test_ltx2_tiling test_ltx2_vae test_ltx2_video`, whose last
+line is `[416/416] Linking CXX executable tests/test_ltx2_video` — a build number read as
+a test number, so "full ctest 416/416" described a run that never happened at that
+denominator. The configure line is recorded because a denominator without one is not
 reproducible:
 
 ```sh
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
-ctest --test-dir build -N | tail -1     # Total Tests: 424
+ctest --test-dir build -N | tail -1     # Total Tests: 448
 ```
+
+It read 424 the first time this gate ran and 448 after two forward-merges; that drift is
+main's, not this row's, and it is ATTRIBUTED rather than asserted:
+`git diff origin/main -- tests/CMakeLists.txt` is exactly `+7` lines — this row's
+`test_ltx2_tiling` registration — with no target added or removed anywhere else. So this
+branch is main's count plus one, by construction, at whatever main's count happens to be.
 
 Build: clean `rm -rf build` + reconfigure + `cmake --build build -j 4`, `BUILD_EXIT`
 captured separately from the run, log grepped for `No space left` / `BFD assertion`
-(count 0), `df -h /` recorded at 93% before and 89% after.
+(count 0) and for warnings (count 0), `df -h /` recorded at 89% before and 98% after.
+The build directory was deleted immediately after the gate.
 
 Focused, with COUNTS (a changed count is RED even when green):
 
@@ -398,18 +405,29 @@ Focused, with COUNTS (a changed count is RED even when green):
 | `test_ltx2_video` | 31 / 31 | 673 / 673 |
 | `test_ltx2_pipeline` | 37 / 37 | 2382 / 2382 |
 
-Full: `ctest --test-dir build --output-on-failure` -> **424/424 tests passed, 0 failed**,
-`CTEST_EXIT=0`, 222.72 s, 424 lines of `N/424 Test` in the log — the run's own
-denominator asserted against the `ctest -N` above. Two tests report `Skipped` by
-their own guards (`test_modelopt_mixed_precision_checkpoint`, `test_voxtral_e2e`).
+Full: `ctest --test-dir build --output-on-failure` -> **447 passed / 1 failed out of
+448**, 438.02 s, 448 lines of `N/448 Test` in the log — the run's own denominator
+asserted against the `ctest -N` above. Two tests report `Skipped` by their own guards
+(`test_modelopt_mixed_precision_checkpoint`, `test_voxtral_e2e`).
 
-One re-run was needed and is recorded rather than hidden: an earlier pass aborted at
-96/424 with `test_muse_glimmer_text` throwing
+The one failure is `test_op_parity`, and it is NOT this row's:
+
+```
+test_op_parity.cpp:1989: ERROR: test case THREW exception:
+  [json.exception.type_error.302] type must be string, but is null
+```
+
+a null field in the MiniMax-Music3 golden manifest landed on main the same day, already
+filed as **#737** and already reproduced on clean main by the operator (moving that
+golden aside takes the suite to 10/10 and its assertions from 70 to 123). This branch
+touches no parity path — `git diff origin/main --name-only` matches nothing under
+`tests/parity/` or any music3 file.
+
+An earlier pass of this gate aborted at 96/424 with `test_muse_glimmer_text` throwing
 `safetensors: empty file in /tmp/muse_glimmer_text_0.safetensors`. That fixture path is a
-FIXED name in shared `/tmp`, and six agents were compiling on the box at 98% disk; run
-serially the suite is 24/24, 528/528, SUCCESS. Not charged to this diff, which touches
-no muse_glimmer path — but the fixed `/tmp` name is real shared-state flakiness and is
-worth its own issue.
+FIXED name in shared `/tmp` and six agents were building on the box at 98% disk; run
+serially the suite is 24/24, 528/528, SUCCESS. Recorded rather than hidden, and the fixed
+`/tmp` name is real shared-state flakiness worth its own issue.
 
 ### The untiled-mapper mutation — RED, then restored (F2)
 
