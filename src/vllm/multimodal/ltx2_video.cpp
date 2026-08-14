@@ -168,6 +168,11 @@ struct StreamState {
   std::vector<float> latent, clean;  // [tokens, width]
   std::vector<float> mask;           // [tokens], patchified denoise mask
   std::vector<double> positions;     // [n_pos_dims, tokens, 2]
+  // `_first_frame_keyframes_mask` (tools.py:186-196), [tokens]. VIDEO only, and
+  // populated on EVERY generation — the rule has no branch on whether a keyframe
+  // was supplied. Empty on the audio stream, whose args preprocessor upstream
+  // builds with no keyframes_embedding_provider (model.py:333).
+  std::vector<float> keyframes_mask;
 };
 
 // `post_process_latent` (utils/helpers.py:462-464):
@@ -698,8 +703,8 @@ std::unique_ptr<Ltx2VideoEngine> Ltx2VideoEngine::Load(const VideoModelParams& p
     // `Ltx2AdoptDeclaredDitParams` (ltx2_loader.h) is the ONE place the adoption
     // rule lives, because the device gate drives `Ltx2StreamDitToDevice` without
     // this engine and owes the same check; two copies would be two rules.
-    const Ltx2DitParams declared = Ltx2AdoptDeclaredDitParams(
-        dit_config, im.dit.params, dit_options.allow_unported_modules, source);
+    const Ltx2DitParams declared =
+        Ltx2AdoptDeclaredDitParams(dit_config, im.dit.params, source);
     im.dit.params = declared;
   }
 
@@ -1249,8 +1254,9 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
         "these tokens the embedding contributes nothing, and porting it would not serve this "
         "arm. The tokens that DO reach it are the target's own first latent frame, marked "
         "unconditionally by `_first_frame_keyframes_mask` (ltx_core/tools.py:184-196) — which "
-        "is the frame the SERVED first-frame arm writes into. That omission is real and is "
-        "tracked as issue #658; it is not what blocks a last-frame keyframe.");
+        "is the frame the SERVED first-frame arm writes into. That omission WAS real; row "
+        "LTX25-KEYFRAMES-ABS-POS closed it on 2026-08-14 (issue #658), so the marker is now "
+        "applied on every render. It was never what blocks a last-frame keyframe.");
   }
   if (!gen.ref_image_paths.empty() || !gen.ref_video_dir.empty()) {
     Fail(
@@ -1461,6 +1467,13 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
       video.latent = Ltx2VideoPatchify(volume.data(), vshape, 1);
       video.clean = video.latent;
       video.mask.assign(static_cast<size_t>(video.tokens), 1.0F);
+      // tools.py:184 — `create_initial_state` returns the state with
+      // `keyframes_mask=self._first_frame_keyframes_mask(state)` ALWAYS, on the
+      // same line that builds it. Not conditioned on `wants_image`, not
+      // conditioned on any keyframe: the marker is a fact about the causal
+      // encoder's first latent frame, which spans a single pixel frame while
+      // every later one spans `temporal_scale_factor`.
+      video.keyframes_mask = Ltx2FirstFrameKeyframesMask(vshape, /*patch_size=*/1);
       const std::vector<int64_t> bounds = Ltx2VideoPatchBounds(vshape, 1);
       const std::vector<int64_t> pixels = Ltx2PixelCoords(bounds, 1, video.tokens, factors, true);
       // `positions = get_pixel_coords(...).float()` then
@@ -1628,6 +1641,14 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
       vin.sigma = &sigma_row;
       vin.positions = video.positions.data();
       vin.context = video_context;
+      // transformer_args.py:269 through modality.py:63. Handed over only when the
+      // model HAS the parameter: a mask on a model without one is refused by the
+      // forward, and upstream's own `supports_keyframes_abs_pos_embedding`
+      // (model.py:166-173) is exactly this condition. The mask itself is built
+      // unconditionally above, because it is data about the latent.
+      if (im.dit.params.use_keyframes_abs_pos_embedding) {
+        vin.keyframes_mask = video.keyframes_mask.data();
+      }
 
       Ltx2ModalityInput ain;
       ain.batch = 1;
