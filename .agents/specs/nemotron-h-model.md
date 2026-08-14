@@ -1298,6 +1298,214 @@ fold measures 1.91e-07 peak-relative; "25.3x the signal" for `scale_logits`
 measures 0.568. The qualitative claims are right and were independently
 verified; the numbers appear to be mean-relative or from an earlier fixture.
 
+## 6d. The WEIGHT LOADER — the checkpoint runs (2026-08-14)
+
+§6b closed with "the **weight loader** — nothing materializes the 18487
+enumerated tensors, so no checkpoint can be run and the forward refuses by name
+on every load", and §7 said the loader "§4's table does not name as a W of its
+own and should". This is that brick, built on `row/MODEL-NEMOTRON-H-LOADER` off
+`22367c551`.
+
+**RED first, off the real checkpoint.** Resolved through
+`parity::Nemotron35LightningSnapshot()` (content-pinned, #569) to
+`/mnt/nas_share/checkpoints/nemotron-3.5-lightning-30b-nvfp4`: `Status:
+FAILURE!`, exit 1, `THREW: NemotronHForCausalLM forward: host weights are not
+materialized`, peak RSS after "load" **29 MiB**. Note the instrument trap in the
+same output — `assertions: 3 | 3 passed | 0 failed` beside a red gate, because
+the case THREW ([[doctest-assertions-line-hides-thrown-cases]]).
+
+### The design decision, and why it is arithmetic rather than taste
+
+**Every weight is held in the memory format the checkpoint SHIPS it in.** Not
+because widening is untidy, but because a dequantize-at-load loader does not fit
+on any box this project owns: the 5888 routed-expert projections alone are
+29.4e9 parameters, **16.5 GiB packed against 58.7 GB at bf16**. On a
+unified-memory box that is not a failed load, it is a reboot
+([[gb10-unified-memory-oom-reboots-box]]).
+
+Measured host mirror: **18013 MiB**, against 18013 MiB read out of the shards —
+the mirror is the checkpoint, not a widened copy of it. Peak RSS **17.70 GiB**
+after the load and **18.38 GiB** at the end of a forward.
+
+The consequence is that the HOST reference forward, which composes
+`vt::MatmulBT` and has no NVFP4 and no FP8 entry point, widens a quantized
+operand TRANSIENTLY at the GEMM call site through the shared
+`model_loader/nvfp4_dequant.h` seam. That is a **declared** arm, named in
+`nemotron_h_loader.h` and `nemotron_h.cpp` and reported by the load report — not
+a silent fallback of the kind §8's stop condition forbids. The quantized GEMMs
+remain `kMoeGroupedGemmNvfp4Marlin` and the fp8-linear registration, which W6
+selects on the device path. `NemotronHOwned::View` now REFUSES a non-dense
+weight by name, so a packed buffer cannot be reinterpreted as the model dtype by
+a caller that did not think about it.
+
+One consequential wiring change followed: the routed-expert loop in
+`NemotronHMoeMixer` now visits its (token, slot) pairs **expert-major** rather
+than token-major, so one dequant of an NVFP4 expert serves all of that expert's
+rows. Each pair's own `NonGatedExpert` call is unchanged (one row against one
+expert), and each pair writes a disjoint `expert_out` slot and reads nothing
+another wrote, so the ORDER cannot change the result; `test_nemotron_h_forward`
+stays 13/13 and 254/254.
+
+### The structural gate, as hard numbers
+
+`tests/vllm/models/test_nemotron_h_loader.cpp`. It is gated STRUCTURALLY and not
+only by tokens, because a checkpoint read as uniform NVFP4 stays numerically
+plausible and still matches tokens while moving the wrong bytes.
+
+| Row | Measured |
+|---|---|
+| enumerated / in `model.safetensors.index.json` | **18487 / 18487** |
+| materialized + deferred | **18217 + 270 = 18487** |
+| deferred BY NAME (MTP tower, W5) | **270**, every tag naming W5 |
+| NVFP4 W4A16 g16 | **5935 projections / 17805 tensors** |
+| FP8 W8A8 static | **46 projections / 138 tensors** |
+| fp8 KV scales (`k_scale`/`v_scale`) | **12** |
+| unquantized bf16 / f32 on disk | **216 / 46** |
+| the five scheme rows sum to `materialized` | 18217 == 18217 |
+| widenings (bf16 on disk, f32 in memory) | **69**, and no more |
+| host bytes | **18,888,922,112** (17.59 GiB) |
+
+The `{W4A16_NVFP4: 5935, FP8: 46}` split is exactly the histogram W1 measured
+over all 5981 `quantized_layers` entries, now confirmed against the TENSORS
+rather than the config. The 69 widenings are the three f32-by-contract SSM
+scalars (`A_log`, `D`, `dt_bias`) on 23 mamba layers — upstream's own polarity
+(`-torch.exp(self.A_log.float())`) and what `vt::Mamba2ChunkScan` validates.
+
+**One finding worth carrying: `A_log`, `D` and `dt_bias` ship BF16 on disk.**
+The forward requires them f32, so the loader widens; a loader that inherited the
+model dtype instead produces a numerically plausible model. M3 below is the
+instrument.
+
+### EVIDENCE, not the W6 token gate
+
+For each of the three committed oracle prompts, ONE forward over its
+`prompt_token_ids` and the argmax of the last position against the golden's
+FIRST generated token:
+
+| Prompt | argmax | oracle |
+|---|---|---|
+| `The capital of France is` | 6993 | 6993 |
+| `Write the first five Fibonacci numbers:` | 1032 | 1032 |
+| `Explain what a state space model is, in one sentence:` | 1349 | 1349 |
+
+**3/3.** W6 still owns the token gate (identical prompts, counts, batching and
+sampling, oracle identity asserted, full 32-token greedy decode); this consumes
+one token per prompt and makes no speed claim. It is here because it is the only
+check that can fail for a reason the structural gate cannot see — every count can
+be right while a group scale is transposed or a nibble order is flipped.
+
+The doctest 2.5.2 `const char*` trap this row already repaired once (§"W1
+land-prep" LOW-2) bit again in the first run of exactly this line: the verdict
+printed as `oracle 69931`, the `1` being doctest rendering a `const char*`
+lvalue. Bound to a `std::string`.
+
+### Mutation proof (IMP-MUTATE)
+
+Each applied ALONE to the restored tree, rebuilt, run against the real
+checkpoint, then restored and the file's SHA-256 re-verified.
+
+| Mutation | Result |
+|---|---|
+| M1 mamba `in_proj` read as NVFP4 instead of FP8 (the "uniform NVFP4" defect) | **FAILURE!** — THREW `'backbone.layers.0.mixer.in_proj.weight' ships dtype F8_E4M3, not the U8 its scheme declares`; 1 case / 0 passed, assertions 2 |
+| M2 the 12 fp8-KV scales silently dropped | **FAILURE!** — THREW `'backbone.layers.5.mixer.k_proj.k_scale' (consumer 'attn.k_scale[fp8-kv]') is enumerated but no host slot claimed it`; assertions 2 |
+| M3 `A_log`/`D`/`dt_bias` inherit the model dtype (no widening) | **FAILURE!** — `rep.widened_tensors == 69` red, then THREW `weight 'mixer.A_log' has the wrong dtype for this arm`; assertions 35, 1 failed |
+| M4 NVFP4 nibble order flipped to `kHighFirst` | **FAILURE!** — **0/3** goldens (argmax 66822 / 60300 / 31645 vs 6993 / 1032 / 1349); assertions 46, exactly **1** failed |
+| M5 `weight_scale_2` read (so the accounting stays right) and then ignored | **FAILURE!** — **0/3** goldens (argmax 1321 / 2142 / 1321); assertions 46, exactly **1** failed |
+
+M1's first form — BOTH mamba projections switched — could not be COMPILED:
+`-Werror=unused-function` rejected the now-unreferenced `LoadFp8`. That is a
+real, if accidental, second gate, the same one W4's M8/M9/M14 hit; it was re-run
+with `out_proj` left on `LoadFp8`.
+
+**M4 and M5 are the pair that keeps the golden arm honest.** Both leave EVERY
+structural count correct — 45 of 46 assertions still pass, and the one that
+fails is `matched == total`. A loader gate built only out of counts would have
+called both of them clean, and both are exactly the "still numerically
+plausible, still the right shape, wrong bytes" class §1 warns about. M1-M3
+conversely are invisible to the golden arm, because they refuse before a token
+exists.
+
+**Restoration.** After each, the file was rewritten from the captured original
+and its SHA-256 re-verified (`186ae4cea4d7…` for `nemotron_h_loader.cpp`,
+`554d1c7fc65b…` for `nemotron_h.cpp`); `git status --porcelain` showed only the
+spec and `docs/FEATURES.md` edits this section is part of.
+
+### Gate evidence
+
+Local x86_64 CPU-only host (GNU 13.3, Ninja, `VLLM_CPP_CUDA=OFF`), disk recorded
+beside every number because this box has hit 100% mid-run before and a build
+that ENOSPCs leaves the PREVIOUS binary in place
+([[stale-binary-prints-green-status]]).
+
+| Arm | Result | disk free |
+|---|---|---|
+| Release `-Werror`, clean full build | **exit 0, 0 `warning:` lines, 0 `No space left` lines**, 891/891 targets | 53G / 88% |
+| `test_nemotron_h_loader` (Release, live checkpoint) | **1/1 cases, 46/46 assertions, `Status: SUCCESS!`**, 10:07 wall, VmHWM 19,270,444 KiB | 36G / 92% |
+| `test_nemotron_h_forward` (Release) | 13/13, 254/254, `Status: SUCCESS!` | 53G |
+| `test_nemotron_h_scaffold` (Release) | 12/12, 38285/38285, `Status: SUCCESS!` | 53G |
+| Debug (`-g0`, asserts unmasked) forward | **13/13, 254/254, `Status: SUCCESS!`** | 36G |
+| Debug (`-g0`) scaffold | **12/12, 38285/38285, `Status: SUCCESS!`** | 36G |
+| Debug (`-g0`) **loader, live checkpoint** | **1/1, 46/46, `Status: SUCCESS!`**, 3/3 goldens, 15:21 wall, VmHWM 19,277,028 KiB | 26G / 95% |
+| full `ctest -j4` | **449 of 451 passed**, then **450 of 451**: `test_engine_core_proc` failed under `-j4` and passes ALONE (14/14, 113/113, exit 0) — the known starvation set, and this box was running the Debug loader arm at the time. `test_op_parity` FAILED, **pre-existing on the base** (below). Skipped: `test_modelopt_mixed_precision_checkpoint`, `test_voxtral_e2e`; `test_nemotron_h_loader` passed vacuously with no `CHECKPOINT_ROOT` in that shell | 26G / 94% |
+
+The forward and scaffold counts are IDENTICAL to W4's (13/254, 12/38285), which
+is the evidence that the expert-major reorder is result-neutral rather than an
+assertion that it is.
+
+**Jetson Thor (`kairos-4db2`, aarch64, sm_110) — a CUDA build AND the real
+checkpoint.** Transferred by `git archive` and md5-verified on both ends
+(`1cdc92214540646cc1fb7c9e87c87b23`); the 20.1 GiB checkpoint staged to
+`/home/mudler/nemo-loader/ckpt` with its `.cache/huggingface/download/*.metadata`
+sidecars intact, so the CONTENT pin resolves there too. Container
+`vllmcpp-build:aarch64`, `--runtime=nvidia`, `NVIDIA_DISABLE_REQUIRE=1`, nvcc
+13.0.88, `-DVLLM_CPP_CUDA=ON -DVLLM_CPP_CUDA_ARCHITECTURES=110
+-DVLLM_CPP_TRITON=OFF`, no CUTLASS — the six `DISABLED (no requested arch in
+[110] provides it)` lines are CORRECT for sm_110, not a silent fallback. Disk
+408-439G free / 50-54% throughout; RAM 122 GiB, and the box was loaded ALONE.
+
+| Thor arm | Result |
+|---|---|
+| build | **`BUILD_EXIT=0`, 0 `warning:` lines, 0 `No space left` lines** |
+| `test_nemotron_h_forward` | **13/13, 254/254, `Status: SUCCESS!`** — identical to x86_64 |
+| `test_nemotron_h_scaffold` | **12/12, 38285/38285, `Status: SUCCESS!`** — identical to x86_64 |
+| `test_nemotron_h_loader`, **live checkpoint at `/w/ckpt`** | **1/1, 46/46, `Status: SUCCESS!`**, `LOADER_EXIT=0`, **3/3** goldens, 3:00 wall |
+| peak RSS on Thor | **17.85 GiB** after load, **18.53 GiB** at the end |
+
+Two cross-architecture agreements worth naming, because neither was arranged.
+`host bytes: 18013 MiB, source 18013 MiB` is byte-for-byte what x86_64 reported,
+and the logits range is **`[-9.4375, 8.75]` on both**. The 3:00 wall against
+x86_64's 10:07 is the storage, not the CPU: Thor reads the checkpoint off local
+NVMe and the x86 box reads it over SMB from the NAS.
+
+`/usr/bin/time` is NOT in that container — the first attempt exited **127** and
+would have read as a failed run to anyone grepping only for `SUCCESS`. The RSS
+above is the test's own `/proc/self/status` `VmHWM`, which is why it has one.
+
+**One honestly weak property, recorded rather than discovered.** With no
+checkpoint the gate emits a `MESSAGE` naming the missing export and RETURNS,
+so CTest records a PASS, not a *Skipped* — a CI run cannot tell it apart from a
+real pass without reading the log. That is the convention
+`test_nemotron_h_scaffold`'s live case already set for this same checkpoint on
+this same row, and matching it beat inventing a second one; the alternative is
+`test_modelopt_mixed_precision_checkpoint`'s exit-77, which needs a custom
+`main`. Named here so the next reader does not have to work it out.
+
+**`test_op_parity` is RED on the base and not this row's.** `RunGoldenPass`
+(`tests/parity/test_op_parity.cpp:1852-1860`) walks every subdirectory of the
+goldens root and does `std::string op = m["op"];` on any `manifest.json` it
+finds. `tests/parity/goldens/minimax_music3_oracle/manifest.json` has no `op`
+key — its keys are `captured_on, checkpoint, environment, generated_by, issue,
+model, oracle, request, result, spec, spec_disagreements, spec_facts` — so the
+pass throws `[json.exception.type_error.302] type must be string, but is null`.
+That manifest landed at `34dc57876` (`oracle(MODEL-MUSIC-MUSIC3)`, #672 / #708),
+which `git merge-base --is-ancestor 34dc57876 22367c551` confirms is an ancestor
+of this branch's base, and this branch's diff touches no file under
+`tests/parity/` or `src/vt/`. Reported rather than repaired: `tests/parity/` is
+outside this task's authority, the fix belongs to MODEL-MUSIC-MUSIC3 (either an
+`op` key or the `manifest.json` renamed so the op walker skips it as the
+tokenizer golden dirs already are), and repairing a pre-existing break inside a
+scoped loader change would hide it — the same call §5d finding 5 made.
+
 ## 7. Now
 
 **State at this commit:** **W1 and W3 have LANDED on `main`; W2 is in
@@ -1325,20 +1533,34 @@ no `STATUS`/`BENCHMARKS` write. **Oracle gateability is CLOSED** — §5a record
 the pinned oracle loading and running the checkpoint on GB10 with three greedy
 goldens committed, so W6 has a denominator whenever it is reached.
 
-**Next action:** **W4 is written and gated on `row/MODEL-NEMOTRON-H-W4B` (§6b)
-and needs a FRESH REVIEW** — never the agent that wrote it — which should mutate
-the self-certification (§6b M15) and the two anti-vacuity guards that were
-rewritten, because those are the claims this W changes rather than adds.
+**W4 has LANDED** (`ce8c8bf67`, #718), and the WEIGHT LOADER §7 named as "the
+next brick" is built and gated on `row/MODEL-NEMOTRON-H-LOADER` — **§6d is the
+authority on it**. The forward no longer refuses on a checkpoint load: 18487 of
+18487 tensors are accounted (18217 materialized in their shipped formats, 270
+deferred by name to W5), the real 20.1 GiB checkpoint runs at **17.70 GiB peak
+RSS**, and its first greedy token matches the pinned oracle's committed golden on
+**3 of 3** prompts.
 
-After W4 lands, the next brick is **the WEIGHT LOADER**, which §4's table does
-not name as a W of its own and should: W5 (MTP), W6 (the e2e token gate) and W7
-(GGUF) all sit behind it, and until it exists the forward refuses by name on
-every checkpoint load. Also carried forward, not resolved: the two OWED GPU items
-in §6a (`kMoeGroupedGemmNvfp4Marlin` on the real g16 tensors, and the end-to-end
-NemotronH MoE block on GB10), and the OWED GGUF k-quant arm tracked as W7 (§5b).
+**Next action:** the loader needs a **FRESH REVIEW** — never the agent that wrote
+it. The two claims it changes rather than adds, and which a review should mutate,
+are (a) `NemotronHOwned::View`'s refusal of a non-dense weight, which is the only
+thing standing between a packed NVFP4 buffer and a plausible-garbage GEMM operand,
+and (b) the expert-major reorder in `NemotronHMoeMixer`, whose result-neutrality
+is claimed from the disjointness of the output slots rather than measured.
 
-The row stays `INVENTORIED`: W4 changes no lifecycle state, because nothing runs
-end to end yet.
+Then W5 (the MTP head, whose 270 tensors the loader already names as owed), W6
+(the e2e token gate against the committed goldens, now unblocked — it has weights),
+and W7 (GGUF). Carried forward, not resolved: the two OWED GPU items in §6a
+(`kMoeGroupedGemmNvfp4Marlin` on the real g16 tensors, and the end-to-end
+NemotronH MoE block on GB10) — the loader now produces exactly those g16 tensors,
+so the first of them is reachable — and the OWED GGUF k-quant arm (§5b).
+
+**Reported, outside this task's authority to fix.** `test_op_parity` is RED on
+this row's base for a reason belonging to MODEL-MUSIC-MUSIC3 (#672); §6d's gate
+evidence has the diagnosis.
+
+The row stays `INVENTORIED`: the loader changes no lifecycle state, because the
+forward is still the HOST reference and nothing runs on the paged runner (W6).
 
 ## 8. Stop conditions
 

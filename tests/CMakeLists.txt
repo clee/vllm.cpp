@@ -543,6 +543,26 @@ vllm_cpp_add_test(test_nemotron_h_forward vllm/models/test_nemotron_h_forward.cp
 # USER_USAGE_PREFIXES surface (#515). Same call as the W1 resolver header.
 target_include_directories(test_nemotron_h_forward PRIVATE ${CMAKE_SOURCE_DIR}/src)
 
+# Nemotron-H WEIGHT LOADER gate (#517, .agents/specs/nemotron-h-model.md §5b and
+# §6b "Still owed after W4"): materializes the 18487 released tensors from the
+# REAL 20.1 GiB checkpoint and runs the registered forward on them. Gated
+# STRUCTURALLY, not by tokens — every tensor materialized or deferred BY NAME,
+# the per-scheme composition (5935 NVFP4 W4A16 g16 triples + 46 FP8 W8A8 static
+# triples + the bf16/f32 remainder) asserted against the checkpoint's own memory
+# format, and the loaded dtypes asserted to be the SHIPPED ones rather than
+# wider. The checkpoint resolves through the CONTENT-pinned
+# parity::Nemotron35LightningSnapshot (#569) and the gate SKIPS loudly when it is
+# absent, so CI never needs the NAS asset. Not the W6 token gate: no golden is
+# consumed and no speed claim is made.
+vllm_cpp_add_test(test_nemotron_h_loader vllm/models/test_nemotron_h_loader.cpp)
+target_compile_definitions(test_nemotron_h_loader PRIVATE
+  NEMOTRON_H_GOLDENS_DIR="${CMAKE_CURRENT_SOURCE_DIR}/parity/goldens/nemotron_35_lightning_greedy")
+# nemotron_h.h / nemotron_h_loader.h are MODEL-PRIVATE headers under src/, not
+# include/vllm/ (#515); tests/parity carries the content-pinned snapshot
+# resolver.
+target_include_directories(test_nemotron_h_loader PRIVATE
+  ${CMAKE_SOURCE_DIR}/tests/parity ${CMAKE_SOURCE_DIR}/src)
+
 # Kimi-Linear CPU REFERENCE FORWARD gates (W2-W6): the per-op reference forwards
 # (KDA layer vs the kimi_kda host-ref composition; NoPE-MLA vs a materialized-MHA
 # reference; sigmoid noaux_tc router + block vs a hand-computed case) and the whole
