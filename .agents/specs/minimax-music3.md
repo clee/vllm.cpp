@@ -10,7 +10,7 @@
 [#14456](https://github.com/huggingface/diffusers/pull/14456), head
 `c6da9936e4bda83107943a16eb8682e9a37d8527` — **OPEN, not merged**.
 **Cross-check:** SGLang-Omni `748a0b437e4a8faad44d7bbfd5a0ae55d1fef830`.
-**Status:** **W0 + W1 DONE, W3 DONE, W4 + W5 DONE, W6 DONE, W2 PARTIAL.** Spec committed, both oracles pinned, §1.1 resolved and confirmed at runtime, the diffusers oracle gateable against committed goldens, the modular loader in the tree, the autoregressive half's compute gated at reduced dimensions and against the real bf16 checkpoint, and the ACOUSTIC half — flow-matching DiT, scheduler, CFG, window bookkeeping, DAC Flow-VAE vocoder — gated at both scales against the committed capture. §5's token-exact gate is WITHDRAWN: upstream's AR stage has no greedy path, and the acoustic half never had one to withdraw. W6 has landed: the model is a registered `SpeechRegistry` family reachable through the new `vllm_speech_*` C ABI (v20) and `POST /v1/audio/speech`, and the denoise+decode composition reproduces the capture's waveform. The 8.6B language-model forward and W7 are owed.
+**Status:** **W0-W6 DONE. The model generates a song end to end.** Spec committed, both oracles pinned, §1.1 resolved and confirmed at runtime, the diffusers oracle gateable against committed goldens, the modular loader in the tree, the autoregressive half's compute gated at reduced dimensions and against the real bf16 checkpoint, and the ACOUSTIC half — flow-matching DiT, scheduler, CFG, window bookkeeping, DAC Flow-VAE vocoder — gated at both scales against the committed capture. §5's token-exact gate is WITHDRAWN: upstream's AR stage has no greedy path, and the acoustic half never had one to withdraw. W6 has landed: the model is a registered `SpeechRegistry` family reachable through the new `vllm_speech_*` C ABI (v20) and `POST /v1/audio/speech`, and the denoise+decode composition reproduces the capture's waveform. **W2's remainder has landed too**: the landed Qwen3 dense path grew an additive `inputs_embeds` entry, the autoregressive loop runs on it, and an HTTP request now returns a real 44100 Hz stereo WAV. W7 is owed.
 **Developer directive (2026-08-13):** "land minimax music 3 support complete, to
 vllm.cpp, wired to the ABI and to the example http server, merge to main, tested
 e2e." That fixes W6's shape (the ABI surface and the example server are in scope,
@@ -335,12 +335,14 @@ that no closed-form rounding model reproduced. Ours is 43.61% and 1.824e-03,
 inside that spread. Chasing a particular kernel's rounding below the control is
 not "more correct" (AGENTS.md's near-tie discipline).
 
-**Still owed on the LLM half:** the 8.6B `Qwen3ForCausalLM` forward itself.
-`frame_hiddens[:, :4096]` is the language model's own hidden state, and
-reproducing it means running that model teacher-forced on the golden codes
-through our landed Qwen3 path, which needs an `inputs_embeds` entry it does not
-have. That is the remainder of W2 and it is recorded here rather than discovered
-later.
+**The LLM half is now gated too, and the same way.** `frame_hiddens[:, :4096]`
+is the language model's own hidden state; it is reproduced by running the model
+TEACHER-FORCED on the golden codes through the landed Qwen3 dense path, reached
+by the additive `Qwen3DenseModel::ForwardEmbeds` entry (§`## Now`). The bound is
+in bf16 ULPs against a matched control, and it is joined by a RANK statistic that
+no scaling can pass: the oracle's own sampled semantic codes rank 2.48 on average
+under our reproduced guided logits, where chance over the 16384-entry semantic
+window is 8191.5.
 
 **Acoustic half — per-stage tensor parity.** No logits, no sampler, so no token
 gate exists to have. Each stage is compared against the oracle's own output for
@@ -369,12 +371,12 @@ the operator. Phases are separately claimable except where noted.
 | Phase | Scope | Done when |
 |---|---|---|
 | **W0** | This spec; both oracle records pinned; §1.1 sample rate settled from source (**DONE**) and confirmed at runtime (**DONE**); stand the diffusers oracle up and prove it builds and runs (**DONE**, `tools/oracle/music3_oracle.py`) | oracle executes the model and `diffusers.md` flips to `gateable = yes` with a path as evidence |
-| **W1** | Modular loader: the six-component layout, weight-norm folding, the fp32/bf16 policy of §2.1, native-arm refusal by name | every component loads with shapes asserted against §1; converted-vs-native tensor equality checked, not assumed |
-| **W2** | Global LLM on our landed Qwen3 path at vocab 200 000 | hidden-state parity vs `transformers`, then token-exact RVQ code parity vs the oracle |
-| **W3** | Condition mix (8-layer weighted) + RVQ depth decoder, 8 codebooks | per-stage tensor parity; the depth decoder's 16-position window exercised at its boundary |
+| **W1** (**DONE**) | Modular loader: the six-component layout, weight-norm folding, the fp32/bf16 policy of §2.1, native-arm refusal by name | every component loads with shapes asserted against §1; converted-vs-native tensor equality checked, not assumed |
+| **W2** (**DONE**) | Global LLM on our landed Qwen3 path at vocab 200 000 | hidden-state parity against the oracle capture — DONE: an additive `inputs_embeds` entry on the dense path (bit-identical to the token-id forward), 25 teacher-forced steps inside a measured torch-vs-torch control, and the oracle's own codes ranking 2.48 under our guided logits. The token-exact RVQ code parity this row once promised is WITHDRAWN (§5): upstream has no greedy path |
+| **W3** (**DONE**) | Condition mix (8-layer weighted) + RVQ depth decoder, 8 codebooks | per-stage tensor parity; the depth decoder's 16-position window exercised at its boundary |
 | **W4** (**DONE**) | Flow-matching DiT + `FlowMatchEulerDiscreteScheduler` with `invert_sigmas` | per-step latent parity against the oracle at a fixed seed — DONE: scheduler BIT-EXACT on both recorded steps, DiT guided velocity inside the measured torch-vs-torch control |
 | **W5** (**DONE**) | Vocoder **through the shared `vocoder1d` primitives** (§4.1): snake activations, weight-norm, `[8,8,4,2]` upsampling, the 128→2×64 stereo fold, at **44100 stereo** (§1.1) | waveform parity within a stated absolute tolerance, and H3/IndexTTS-2.5 behaviour byte-identical — DONE: 88 064 samples, 0 outside tolerance, `vocoder1d` unmodified. WAV WRITING itself is W6's, with the rest of the delivery surface |
-| **W6** | Register as a `SpeechRegistry` family; extend `SpeechGenParams` ADDITIVELY for lyrics + description + controls (§4.1); NEW `vllm_speech_*` **`include/vllm.h`** surface with the ABI version bump; **the example HTTP server as a thin ABI client** | a song generates end to end from an HTTP request; IndexTTS-2.5 unchanged; SGLang-Omni cross-check; speed axis recorded with values and ratios |
+| **W6** (**DONE**) | Register as a `SpeechRegistry` family; extend `SpeechGenParams` ADDITIVELY for lyrics + description + controls (§4.1); NEW `vllm_speech_*` **`include/vllm.h`** surface with the ABI version bump; **the example HTTP server as a thin ABI client** | a song generates end to end from an HTTP request; IndexTTS-2.5 unchanged; SGLang-Omni cross-check; speed axis recorded with values and ratios |
 | **W7** | Quantized arms — GGUF k-quants are a standing requirement, not a per-model choice | each arm gated, or refused by name and recorded as owed |
 
 **W0 blocks everything.** Until the oracle demonstrably runs, no phase can produce
@@ -544,13 +546,9 @@ engine supplies a seeded normal draw and the gate supplies the capture's own
 noise. That is the ONLY entry at which this pipeline is comparable to the oracle,
 and hiding it would have made the e2e gate impossible rather than inconvenient.
 
-**W2's remainder is REFUSED BY NAME, not silently absent.** `Synthesize` resolves
-the whole request — every field refusal, the frame budget, the assembled prompt —
-and then names the 8.6B `Qwen3ForCausalLM` forward, the `inputs_embeds` entry it
-needs, the phase that owes it and the issue. A real Music3 request over HTTP
-therefore gets that message, not a song and not silence. **Nothing generates a
-song end to end yet, and W6 did not change that** — it built everything around
-the one stage that is missing.
+**W2's remainder was REFUSED BY NAME by W6, and is now CLOSED.** What W6 shipped
+was a `Synthesize` that resolved the whole request and then named the missing
+8.6B forward. The section below is what closed it.
 
 **One coverage gap, named rather than discovered.** The MULTI-WINDOW arm of
 `Music3DenoiseChunks` and `Music3DecodeChunks` — the overlap blend, the carry
@@ -564,3 +562,119 @@ Two things are owed and neither is this phase's to close: **no speed number
 exists** — every capture so far ran on CPU because `dgx.casa` was down, so
 nothing here touches the speed axis — and SGLang-Omni remains `gateable = no`,
 read but never executed.
+
+---
+
+**W2 IS COMPLETE: the pipeline is WHOLE, and an HTTP request returns a song.**
+[`minimax_music3_llm.h`](../../include/vllm/model_executor/models/minimax_music3_llm.h)
+carries `MiniMaxMusic3SemanticGenerationStep.__call__` (`encoders.py:299-353`)
+and `_generate_depth_codes` (`:117-142`), driven through the landed Qwen3 dense
+path. `Synthesize` no longer refuses.
+
+**The door the dense path did not have.** Upstream calls
+`language_model.model(inputs_embeds=...)` twice and `input_ids` never
+(`encoders.py:311`, `:353`), because `_embed_audio_frame` (`:106-115`) is a SUM
+of one language-model embedding row and seven depth-decoder rows scaled by
+`num_codebooks^-0.5` — a continuous vector corresponding to no vocabulary entry,
+which no token id can spell. `Qwen3DenseModel::ForwardEmbeds` is that entry. The
+Qwen3 family already had it on its multimodal siblings
+([`qwen3_vl.h:145,159`](../../include/vllm/model_executor/models/qwen3_vl.h),
+`gemma4.h:210-218`, `muse_glimmer.h:369-380`); only the DENSE registration had
+never wired it, and upstream's own `Qwen3Model.forward` has always accepted
+either input. `out_hidden` is the second half of the same entry: the
+post-final-norm rows, from the forward that produced the logits, because upstream
+reads `last_hidden_state[:, -1]` and applies `lm_head` to that very row.
+
+**Additive, and proved rather than argued.** Five registrations —
+`Qwen3ForCausalLM`, `LlamaForCausalLM`, `MistralForCausalLM`,
+`InternLM2ForCausalLM`, `InternLM3ForCausalLM` — ride that one forward, and one
+of them is a ✅ token-exact row, so nothing less than bit-identity was
+acceptable. `tests/vllm/models/test_qwen3_forward.cpp` feeds the embedding OF
+THE SAME TOKEN IDS through the new entry and asserts it reproduces `Forward` bit
+for bit in the logits (500 of 500 identical) AND in the paged KV it wrote — the
+second half matters because a forward that agreed on this step's logits while
+writing a different cache would decode differently on the NEXT one, which no
+logits comparison can see. Three mutations were run against it and all three
+fire: an extra scale on the embedded rows (500 differing logits), the hidden
+tail ignoring the `logits_indices` gather (throws), and the shape refusal
+deleted (a different, less specific exception). A FOURTH mutation — scaling the
+rows by 1.0009 — did NOT move, and it is a BAD MUTATION rather than a coverage
+hole: bf16's relative spacing is 1/256, so a 9e-4 perturbation rounds back to
+the same bf16 value before anything can see it.
+
+**§1's "learned weighted mix over 8 LLM hidden layers" needs one correction, and
+it is the reading that would have cost a phase.** `num_condition_layers: 8` does
+NOT mean eight of the language model's 36 transformer layers. The eight rows of
+a `frame_hiddens` entry are `cat(last_hidden, depth_hidden_1..7)`
+(`encoders.py:343`) — ONE language-model hidden state and the SEVEN per-depth-step
+states of the RVQ decoder. So the Qwen3 stack needs no per-layer output capture
+at all, and `ForwardEmbeds` returning only the post-final-norm rows is
+sufficient. §1's phrase is about the condition encoder's own input width, not
+about where those rows come from; this paragraph is the disambiguation.
+
+**The gate: teacher-forced, and calibrated against a MATCHED CONTROL.** §5
+withdrew the token gate, so the codes are consumed as INPUTS here exactly as
+W2/W3 consumes them: `rvq_codes.npy` is fed back frame by frame and what is
+COMPARED is the model's hidden state at each step, against
+`frame_hiddens[:, :4096]`. That is 25 steps deep through 36 decoder layers over a
+61-token KV history, so an error at step 1 is carried by 24 further steps of
+attention over the cache it poisoned.
+
+| | bit-identical | mean\|d\| | max\|d\| | outside 2 ULP-or-2^-6 |
+|---|---|---|---|---|
+| **CONTROL** (upstream's own model, `sdpa_kernel(MATH)`, vs default-backend goldens) | 12 036 / 102 400 (11.75%) | 1.475e-02 | 5.000e-01 | 29 968 (29.27%) |
+| **OURS** | 9 337 / 102 400 (9.12%) | 1.763e-02 | 1.000 | 37 572 (36.69%) |
+| **NEGATIVE CONTROL** (ours, one-step-shifted alignment) | 201 / 98 304 (0.20%) | 8.025e-01 | 34.44 | 96 537 (98.20%) |
+
+Ours is 1.20x the control's mean absolute error — a near tie, and chasing one
+kernel's rounding below the control is not "more correct" (AGENTS.md). Two things
+make that a real result rather than a loose bound. **The per-step error does not
+grow**: step 0 mean|d| 1.794e-02, step 24 1.645e-02, which is the signature of a
+rounding floor and not of a compounding divergence — a wrong KV write would
+diverge, not plateau. And **the gate carries its own negative control**: the same
+bounds applied to a one-step-shifted alignment (our step k against the golden's
+k+1, every value a real hidden state of this very model on this very prompt, and
+exactly the off-by-one that `rvq_codes` having one more row than `frame_hiddens`
+invites) read 46x outside. A bf16 model this deep is noisy enough that a loose
+bound would be indistinguishable from no bound, so the gate demonstrates that its
+bound discriminates instead of asserting it.
+
+**The strongest statement is the RANK, and it is scale-free.** The oracle's own
+sampled semantic codes rank **2.48 on average** under our reproduced guided
+logits — worst 15, 10 of 25 at rank 0 — where chance over the 16384-entry
+semantic window is 8191.5 and `_AR_SAMPLING_TOP_K` is 50. Every code the oracle
+actually drew is inside our top 50, which is a distributional claim a uniformly
+scaled or slightly-wrong hidden state cannot satisfy. It is the same instrument
+W2/W3 used on the depth heads (mean rank 8.99 where chance is 511.5), at the
+stage above.
+
+**The prompt is not a variable.** The assembled prompt tokenizes to the SAME 61
+ids HF `transformers` 5.14.1's `Qwen2Tokenizer` produces on the identical string,
+verified both ways before the first hidden state was compared, so a tokenizer
+divergence could never present as a model divergence 25 steps later.
+
+**One recorded dtype deviation, mirrored rather than forked.** The shared Qwen3
+dense forward emits f32 logits from an f32-accumulating lm_head GEMM; upstream's
+`language_model.lm_head` is a bf16 `nn.Linear` whose output is bf16 and is only
+then widened by `.float()` (`encoders.py:312`). The shared seam is not forked for
+that — five registrations ride it — so the rounding is restored in the Music3 TU,
+on the way out, at the one place it is observable. It is a NARROWING, which is
+the direction `.agents/porting.md` cares about.
+
+**End to end, over HTTP.** `POST /v1/audio/speech` through
+`ApiServer::handle_audio_speech` returns real 44100 Hz 16-bit stereo audio. The
+request mapping was hoisted out of `server_main.cpp`'s lambda into
+`vllm::openai::SynthesizeSpeechRequest` so a gate can call the code HTTP runs
+rather than a test-only copy of it; the server is a one-line client of it now.
+The e2e case asserts the RIFF header, the length the request's duration implies,
+and four properties that each rule out a different way of returning a
+well-formed non-song: non-zero, unclipped (a scale error would otherwise hide
+behind the decode's own clamp), non-constant, and two channels that DIFFER.
+
+**Two things are still true and are not this phase's to change.** The
+multi-window coverage gap W6 named is unchanged — the capture is a single
+25-frame window. And there is **still no speed number**: every gate for this row
+was taken on CPU because `dgx.casa` was down throughout, the acoustic half is
+upstream's own fp32, and a CPU number against SGLang-Omni's CUDA-graphed compiled
+production configuration would be a dishonest denominator. `PENDING` on the
+hardware, not on the work. W7's quantized arms are owed.
