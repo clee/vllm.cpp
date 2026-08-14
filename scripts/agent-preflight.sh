@@ -120,6 +120,12 @@ SUITES=(
   test_cpu_x86_llamacpp_floor
   test_audit_live_rows
   test_check_gate_commands
+  # The GPU lock wrapper (#587). Registered here AND in `.github/workflows/ci.yml`
+  # for the same reason `test_main_baseline` is: it shipped in neither, so the
+  # tests guarding the one sanctioned way to take the GPU ran on no machine.
+  # CPU-only, no model, no network -- it takes a scratch lock under a temp dir
+  # and never touches $HOME/gpu.lock or /tmp/gpu.
+  test_gpu_lock
   test_main_baseline
 )
 

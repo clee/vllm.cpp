@@ -96,18 +96,32 @@ device-idleness probe, shared-host rules, and any service-quiescence procedure.
 Do not use an infrastructure-specific lock or manage a service merely because a
 historical entry names it.
 
-On Ettore's DGX profile, `${GPU_LOCK}` is `flock /tmp/gpu` and the detailed
-shared-host procedure lives at
-`/home/mudler/_git/skills/sharing-a-gpu-with-flock/SKILL.md`. That flock is an
-inter-agent mutex because the LocalAI worker is normally stopped. Other
+Take the lock with `scripts/gpu-lock.sh`, never a raw `flock`. It is the one
+sanctioned way to take the GPU (#587): it resolves one canonical path, refuses
+loudly rather than proceeding without the lock, and stamps the path it actually
+took, so a divergence is visible in the record instead of invisible until two
+jobs collide. The detailed shared-host procedure lives at
+`/home/mudler/_git/skills/sharing-a-gpu-with-flock/SKILL.md`. That mutex is an
+inter-agent one because the LocalAI worker is normally stopped. Other
 developers use their selected policy. A sole GPU owner may run correctness work
 lock-free after verifying the GPU is idle when preferences permit it;
 benchmark/A-B validity still requires an uncontended GPU either way.
 
+**The canonical file is `$HOME/gpu.lock`.** On Ettore's DGX profile `.env` still
+sets `GPU_LOCK=/tmp/gpu`, and `$GPU_LOCK` outranks the default, so an agent that
+loads `.env` resolves a different file from one that does not — #587 with a
+different filename, and the reason the issue is still open. Until `.env`, the
+four `dgx-*`/`opt-dgx-*` scripts and `.github/workflows/triton-aot-sync.yml` are
+repointed, do not read a clean `fuser $HOME/gpu.lock` as an idle box: check
+`nvidia-smi` and `fuser /tmp/gpu` too. The full enumeration is in
+[`specs/gpu-lock-wrapper.md`](specs/gpu-lock-wrapper.md); entries below this
+section that name `flock /tmp/gpu` are historical records of what was run, not
+instructions.
+
 | Work | Lock rule |
 |---|---|
 | Compile, sync files, inspect source, `ps`/`nvidia-smi` | No GPU lock needed |
-| CUDA tests, model load, server, benchmark, nsys/ncu | `${GPU_LOCK} <whole job>` when the selected policy requires it |
+| CUDA tests, model load, server, benchmark, nsys/ncu | `scripts/gpu-lock.sh -- <whole job>` when the selected policy requires it |
 | A/B or competitor series | One selected exclusion mechanism around every arm and trace; interleaved runs are void |
 | Long background run | Use the preference-selected durable lock/job mechanism |
 | Timeout | Inspect the selected lock holder; never kill an unowned PID |

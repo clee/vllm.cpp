@@ -45,7 +45,25 @@ afterwards. A same-binary A/B on this box survived #587 only because its
 conclusion rested on `diff -r -q` over two output directories — byte-identity is
 contention-immune — while the wall times printed beside it were not. Had the
 conclusion rested on the times, #587 would have voided it silently. Quote the
-lock stamp beside any number that a second job could have moved.
+lock stamp beside any number that a second job could have moved, and quote
+`requested-lock` and `lock-source` with it: they are what tell two arms that
+resolved *different* files apart afterwards, which is the whole of #587.
+
+**If the wait times out, read `<lock>.holder` before doing anything else.** The
+`TIMEOUT` block prints it for you. A live PID sitting at 0% GPU for hours is a
+ten-second conversation with its owner, not a lock to break; dead PIDs are a
+crashed hold that is safe to break; and no sidecar at all means a pre-wrapper
+holder, which is opaque and must be left alone. Never kill an unowned PID.
+
+**#587 is not closed and the wrapper does not close it.** A third spelling,
+`/tmp/gpu`, is still live in four `dgx-*` scripts, in
+`.github/workflows/triton-aot-sync.yml`, in this box's untracked `.env`
+(`GPU_LOCK=/tmp/gpu`, which the wrapper honours) and in 53 files under
+`.agents/specs/`. So a measurement taken under the wrapper does **not** exclude
+an online-serving or gdn-packed-component run, and two agents can still resolve
+different files depending on whether they loaded `.env`. Until the sweep in
+[`specs/gpu-lock-wrapper.md`](specs/gpu-lock-wrapper.md) lands, check
+`nvidia-smi` and `fuser /tmp/gpu` as well before calling a box idle.
 
 Calibrate the noise band from repeated identical legs *before* interpreting a
 delta. Discard cold legs for a named cause, never because they are

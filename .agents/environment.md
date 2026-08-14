@@ -140,30 +140,56 @@ environment:
     normal, stealing it is not. Compilation, source inspection and file
     transfer do not need the lock. Never kill an unowned PID.
   - **The canonical lock file is `$HOME/gpu.lock`** (`${GPU_LOCK}` overrides
-    it, and the wrapper stamps whichever it resolved). Never invent a second
-    spelling: until 2026-08-13 one job on this box took `/tmp/gpu.lock` while
-    everything else took `$HOME/gpu.lock`, so two jobs ran concurrently while
-    each believed it owned the GPU, and `fuser $HOME/gpu.lock` showed an empty
-    waiter list throughout (#587). On unified memory that is an OOM-reboot
-    mechanism, and it voids any contention-sensitive number silently.
-    `scripts/gpu-lock.sh` **refuses** (exit 78) rather than proceeding without
+    it, and the wrapper stamps whichever it resolved, plus a `lock-source` field
+    saying where the path came from). Never invent a second spelling: until
+    2026-08-13 one job on this box took `/tmp/gpu.lock` while everything else
+    took `$HOME/gpu.lock`, so two jobs ran concurrently while each believed it
+    owned the GPU, and `fuser $HOME/gpu.lock` showed an empty waiter list
+    throughout (#587). On unified memory that is an OOM-reboot mechanism, and it
+    voids any contention-sensitive number silently. `$HOME/gpu.lock` is canonical
+    because it is per-user and because `/tmp` is cleared by the very reboot the
+    lock exists to survive, so the evidence of who held it does not outlive the
+    incident. (`/tmp` is *sticky*, so a stranger cannot clobber your file; what
+    they can do is take the flock, or pre-create the file with modes that lock
+    you out of it.)
+  - `scripts/gpu-lock.sh` **refuses** (exit 78) rather than proceeding without
     the lock, times out with its own status (exit 75) rather than waiting
-    forever on a dead holder, propagates the wrapped command's exit code
-    unchanged — `137` still means SIGKILL, not "your code failed" — and stamps
-    the resolved lock path, the wait, `df -h /` and load average, and that exit
-    code **first**, so contention is at worst detectable afterwards. Do not
-    double-wrap by hand: a nested invocation on the same resolved path passes
-    through instead of deadlocking, and that is the only nesting that is safe.
-    Guarantees pinned by `tests/scripts/test_gpu_lock.py`.
-  - **A third spelling is still open (2026-08-13 sweep).** `/tmp/gpu`, with no
-    extension, is taken as `exec 9>/tmp/gpu` by `scripts/dgx-online-serving.sh`
-    and `scripts/dgx-gdn-packed-component.sh`, named by `scripts/opt-dgx-gate.sh`
-    and `scripts/dgx-sglang-low-concurrency.sh`, and recorded as this box's
-    `${GPU_LOCK}` in `coordination.md`. Until those are repointed at
-    `scripts/gpu-lock.sh`, a run under the wrapper does **not** exclude an
-    online-serving or gdn-packed-component run — #587 with different filenames.
-    Do not read a clean `fuser $HOME/gpu.lock` as an idle box; check
-    `nvidia-smi` and `fuser /tmp/gpu` too.
+    forever on a dead holder, uses exit 2 for a malformed command line, and
+    propagates the wrapped command's exit code unchanged — `137` still means
+    SIGKILL, not "your code failed". It stamps the resolved lock path, the
+    spelling that was asked for, the wait, `df -h /` and load average, and that
+    exit code **first**, so contention is at worst detectable afterwards. Its
+    own death is trapped: a signalled wrapper forwards the signal to the job,
+    emits a real `RELEASE` block and frees the lock instead of leaving an
+    orphan holding it. Do not double-wrap by hand: a nested invocation on the
+    same resolved path passes through instead of deadlocking, and only when the
+    recorded holder PID is a live ancestor — an environment variable that merely
+    names the path is refused, because a detached job inherits the variable and
+    not the descriptor. Guarantees pinned by `tests/scripts/test_gpu_lock.py`,
+    which runs in `scripts/agent-preflight.sh` and in CI.
+  - **While the lock is held, `<lock>.holder` says who holds it and why.** Read
+    it before you touch anything: sidecar with a live PID at 0% GPU for hours is
+    a ten-second conversation with its owner; sidecar with dead PIDs is a
+    crashed hold that is safe to break; **no** sidecar with the lock held is a
+    pre-wrapper holder — treat it as opaque and do not break it. Pass `--label`
+    so your entry says what the hold is for.
+  - **A third spelling is still open, so #587 is still open (2026-08-14 sweep).**
+    `/tmp/gpu`, with no extension, is taken as `exec 9>/tmp/gpu` by
+    `scripts/dgx-online-serving.sh` and `scripts/dgx-gdn-packed-component.sh`,
+    named by `scripts/opt-dgx-gate.sh` and
+    `scripts/dgx-sglang-low-concurrency.sh`, held by
+    `.github/workflows/triton-aot-sync.yml` (`flock -w 7200 /tmp/gpu`), recorded
+    as this box's `${GPU_LOCK}` in `coordination.md`, used as live gate
+    instructions in 53 files under `.agents/specs/`, and — the one that reaches
+    through the wrapper — set as `GPU_LOCK=/tmp/gpu` in this box's untracked
+    `.env`, which `.env.example` documents loading with `set -a; . ./.env`. So
+    an agent that loads `.env` and an agent that does not resolve DIFFERENT
+    files even when both use the wrapper. Until those are repointed, a run under
+    the wrapper does **not** exclude an online-serving or gdn-packed-component
+    run — #587 with different filenames. Do not read a clean
+    `fuser $HOME/gpu.lock` as an idle box; check `nvidia-smi` and
+    `fuser /tmp/gpu` too. Full enumeration:
+    [`specs/gpu-lock-wrapper.md`](specs/gpu-lock-wrapper.md).
   - Disk cleanup 2026-07-10 reclaimed ~368 GB from unrelated cached model sets,
     April-era autoresearch logits/F16-GGUF cache artifacts, the vLLM compile
     cache and stale rebuildable CUDA build trees. Active latency/PR workspaces,

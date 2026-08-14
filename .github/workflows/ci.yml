@@ -197,6 +197,20 @@ jobs:
         run: |
           python3 scripts/check-gemv-invocation-consistency.py
           python3 tests/scripts/test_check_gemv_invocation_consistency.py
+      - name: The one sanctioned way to take the GPU still refuses and records (#587)
+        # The wrapper's guarantees are claims about an INSTRUMENT -- it refuses
+        # rather than proceeding without the lock, it proves a pass-through
+        # instead of trusting an environment variable, and its own death still
+        # releases and records. It shipped with nothing running its suite: not
+        # in `scripts/agent-preflight.sh`, not here, and
+        # `test_check_test_registration` is CTest-scoped and never reaches
+        # `tests/scripts/`. A test nothing runs is not a gate.
+        #
+        # Needs no GPU, no model and no network: every case takes a scratch lock
+        # under its own temp directory, so this is safe on a shared runner and
+        # cannot collide with a real hold.
+        run: |
+          python3 tests/scripts/test_gpu_lock.py
       - name: The main baseline lane and its reader stay honest
         # Registered in TWO places, deliberately: here and in the `SUITES` array
         # of `scripts/agent-preflight.sh`. It shipped in neither, so the 24 tests
