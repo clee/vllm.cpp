@@ -18,15 +18,42 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
 #include <utility>
 
 #include "vt/ops.h"
+#include "vt/recipes.h"
 
 namespace vllm {
 namespace {
+
+// VT_FUSED_CHAIN_ADOPT (default ON, consistent with the framework): route the
+// residual add + RMSNorm preamble through the declared fusion recipe
+// (`kFusedAddRmsNormStd`) via `vt::FusedChain` rather than hand-calling the
+// residual overload of `vt::RmsNorm` — AGENTS.md, "Route model fusion through
+// `vt::FusedChain`", and the seam `scripts/check-fusion-consistency.py` enforces.
+//
+// Behaviour-preserving BY CONSTRUCTION: the recipe encodes exactly this op order
+// (`res += x; out = std-RMSNorm(res)`) and the default Tier-0 composite
+// dispatches to the SAME `vt::RmsNorm(..., &residual)` primitive, so the fused
+// path is bit-identical to the hand-call (tests/vt/test_ops_fused_chain.cpp).
+// `VT_FUSED_CHAIN_ADOPT=0` restores the exact hand-call as a same-binary A/B,
+// and the forward gate runs both arms.
+//
+// Defined file-locally rather than pulled from `dense_attn_block.h`: that header
+// is the DEVICE seam (device pool, resident weights, paged KV), and this is the
+// host reference forward. qwen3_5.cpp:1698 keeps its own reader for the same
+// reason; this is a five-line env read, not a second numeric path.
+bool FusedChainAdoptEnabled() {
+  static const bool on = [] {
+    const char* e = std::getenv("VT_FUSED_CHAIN_ADOPT");
+    return e == nullptr || e[0] != '0';
+  }();
+  return on;
+}
 
 using vt::DType;
 using vt::Queue;
@@ -699,12 +726,19 @@ std::vector<float> NemotronHForward(const NemotronHHostWeights& host,
       Tensor ot = normed.t(dev);
       Tensor wt = lw.norm.View(dev);
       if (l == 0) {
+        // `residual is None` (nemotron_h.py:627-631): the embedding IS the
+        // residual and the norm is UN-fused, so there is no add to fuse here.
         Tensor xt = residual.t(dev);
         vt::RmsNorm(queue, ot, xt, wt, nargs, nullptr);
       } else {
         Tensor xt = carry.t(dev);
         Tensor rt = residual.t(dev);
-        vt::RmsNorm(queue, ot, xt, wt, nargs, &rt);
+        if (FusedChainAdoptEnabled()) {
+          vt::FusedChain(queue, ot, xt, wt, &rt, vt::kFusedAddRmsNormStd,
+                         static_cast<float>(params.layer_norm_epsilon));
+        } else {
+          vt::RmsNorm(queue, ot, xt, wt, nargs, &rt);
+        }
       }
     }
 
@@ -744,7 +778,12 @@ std::vector<float> NemotronHForward(const NemotronHHostWeights& host,
     Tensor xt = carry.t(dev);
     Tensor rt = residual.t(dev);
     Tensor wt = host.norm_f.View(dev);
-    vt::RmsNorm(queue, ot, xt, wt, nargs, &rt);
+    if (FusedChainAdoptEnabled()) {
+      vt::FusedChain(queue, ot, xt, wt, &rt, vt::kFusedAddRmsNormStd,
+                     static_cast<float>(params.layer_norm_epsilon));
+    } else {
+      vt::RmsNorm(queue, ot, xt, wt, nargs, &rt);
+    }
   }
   if (trace != nullptr && trace->capture) trace->final_normed = UnpackF32(final_normed);
 

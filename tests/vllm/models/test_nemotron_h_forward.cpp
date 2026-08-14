@@ -88,24 +88,31 @@ Device Cpu() { return Device{DeviceType::kCPU, 0}; }
 Queue CpuQ() { return Queue{Cpu(), nullptr}; }
 
 // ─── comparison ─────────────────────────────────────────────────────────────
-// torch.testing.assert_close arithmetic, stated explicitly.
-void ExpectClose(const std::string& what, const std::vector<float>& got,
-                 const std::vector<double>& want, double atol, double rtol) {
-  REQUIRE(got.size() == want.size());
-  REQUIRE(!got.empty());
-  double worst = -std::numeric_limits<double>::infinity();
-  size_t worst_i = 0;
-  for (size_t i = 0; i < got.size(); ++i) {
-    const double g = static_cast<double>(got[i]);
-    const double slack = std::abs(g - want[i]) - (atol + rtol * std::abs(want[i]));
-    if (!std::isfinite(g) || slack > worst) {
-      worst = slack;
-      worst_i = i;
-    }
-  }
-  INFO(what << ": worst element " << worst_i << " got=" << got[worst_i]
-            << " want=" << want[worst_i] << " slack=" << worst);
-  CHECK(worst <= 0.0);
+//
+// THE BAND IS TIED TO THE REFERENCE'S OWN SCALE, and every comparison CERTIFIES
+// ITSELF. Both halves of that are repairs to the gate this file shipped with,
+// and the reason is measured rather than stylistic.
+//
+// As inherited, the tolerance was a flat pair — `{2e-4, 2e-4}` at f32 and
+// `{6e-2, 6e-2}` at bf16 — applied to references whose own magnitude nobody had
+// looked at. Measured against each comparison's actual scale, the bf16 arm was
+// judging a mamba2 mixer whose mean |reference| is 1.69e-2 with an absolute band
+// of 6e-2 (3.55x the signal), and an attention block whose mean |reference| is
+// 3.55e-4 with the same 6e-2 (169x). A block that returned ALL ZEROS passed
+// those arms. bf16 is the RELEASED checkpoint's model dtype, so the arm that
+// mattered most was the one that could not fail.
+//
+// So: `band = rel * max|want| + rel * |want[i]|`, which cannot be loose relative
+// to a signal it is derived from, and `ExpectCloseRel` REQUIREs that the same
+// band REJECTS an all-zeros answer before it accepts the real one. A gate that
+// cannot fail is now itself a test failure — the property is asserted at run
+// time rather than left to the next reader to re-derive.
+// [[gate-comparing-shared-helper-proves-consistency-not-correctness]]
+
+double MaxAbs(const std::vector<double>& v) {
+  double m = 0.0;
+  for (double x : v) m = std::max(m, std::abs(x));
+  return m;
 }
 
 // True when the two series differ somewhere by more than the band. Used to prove
@@ -118,6 +125,57 @@ bool AnyDiffers(const std::vector<float>& a, const std::vector<double>& b, doubl
     }
   }
   return false;
+}
+
+// The worst RELATIVE separation between two series, normalised by the reference's
+// own peak. Absolute separations are meaningless across blocks whose outputs span
+// four orders of magnitude here, and using one is what made the inherited
+// mis-port guards vacuous: the bf16-SSM-state defect separates by 2.4% of the
+// signal, which is 1.4e-6 in absolute terms against a guard band of 2e-4.
+double RelSeparation(const std::vector<float>& a, const std::vector<double>& b) {
+  REQUIRE(a.size() == b.size());
+  const double scale = MaxAbs(b);
+  REQUIRE(scale > 0.0);
+  double worst = 0.0;
+  for (size_t i = 0; i < a.size(); ++i) {
+    worst = std::max(worst, std::abs(static_cast<double>(a[i]) - b[i]));
+  }
+  return worst / scale;
+}
+
+// torch.testing.assert_close arithmetic over a band derived from `want`'s own
+// peak, plus the self-certification described above.
+void ExpectCloseRel(const std::string& what, const std::vector<float>& got,
+                    const std::vector<double>& want, double rel) {
+  REQUIRE(got.size() == want.size());
+  REQUIRE(!got.empty());
+  const double scale = MaxAbs(want);
+  // A reference that is identically zero cannot gate anything.
+  REQUIRE(scale > 0.0);
+  const double atol = rel * scale;
+
+  // SELF-CERTIFICATION: this exact band must REJECT an all-zeros answer. If it
+  // does not, the comparison below proves nothing and the failure is the gate's,
+  // not the code's.
+  const std::vector<float> zeros(got.size(), 0.0f);
+  INFO(what << ": non-vacuity — band atol=" << atol << " rel=" << rel
+            << " against max|want|=" << scale);
+  REQUIRE(AnyDiffers(zeros, want, atol, rel));
+
+  double worst = -std::numeric_limits<double>::infinity();
+  size_t worst_i = 0;
+  for (size_t i = 0; i < got.size(); ++i) {
+    const double g = static_cast<double>(got[i]);
+    const double slack = std::abs(g - want[i]) - (atol + rel * std::abs(want[i]));
+    if (!std::isfinite(g) || slack > worst) {
+      worst = slack;
+      worst_i = i;
+    }
+  }
+  INFO(what << ": worst element " << worst_i << " got=" << got[worst_i]
+            << " want=" << want[worst_i] << " slack=" << worst
+            << " (band atol=" << atol << " rel=" << rel << ")");
+  CHECK(worst <= 0.0);
 }
 
 double Sigmoid(double x) { return 1.0 / (1.0 + std::exp(-x)); }
@@ -196,6 +254,24 @@ std::vector<float> SynthVec(size_t n, int64_t salt, float k) {
 
 NemotronHOwned Own(const std::vector<float>& v, DType dt, std::vector<int64_t> shape) {
   return NemotronHOwned::FromF32(v, dt, std::move(shape));
+}
+
+// Read a packed owned tensor back out at its DECLARED dtype. Used to inspect the
+// carried recurrent state directly, which is the only place its dtype is
+// observable at all — see the SSM-cache-dtype subcase.
+std::vector<float> OwnedToFloat(const NemotronHOwned& o) {
+  std::vector<float> out(static_cast<size_t>(o.Numel()));
+  for (size_t i = 0; i < out.size(); ++i) {
+    out[i] = o.dtype == DType::kF32
+                 ? reinterpret_cast<const float*>(o.bytes.data())[i]
+                 : vt::BF16ToF32(reinterpret_cast<const uint16_t*>(o.bytes.data())[i]);
+  }
+  return out;
+}
+
+std::vector<double> OwnedToDouble(const NemotronHOwned& o) {
+  const std::vector<float> f = OwnedToFloat(o);
+  return std::vector<double>(f.begin(), f.end());
 }
 
 // The BF16-rounded value of every input, so a bf16 arm's reference sees the same
@@ -451,12 +527,34 @@ struct MoeRefWeights {
 
 // nemotron_h.py:126-256 with the grouped-topk router
 // (grouped_topk_router.py:80-161, n_group == 1 so the group mask is trivial).
-// `fold_scale_into_weights` and `scale_logits` are the two MIS-PORTS the case
-// below proves are different answers — never a mode of the real thing.
+//
+// THREE MIS-PORTS are expressible here, and they are NOT equally observable —
+// which is the whole point of the case below, and a correction to what this file
+// originally claimed:
+//   * `fold_scale_into_weights` — multiply each router weight by the factor
+//     instead of the assembled routed sum. Because the factor is applied AFTER
+//     renormalisation, this is EXACT-ARITHMETIC-EQUAL to the shipped form;
+//     measured separation on this fixture is 3.7e-5 relative, pure
+//     floating-point association (245 of 288 elements differ BITWISE, none
+//     numerically). It is a real defect and it is real work to catch — but the
+//     instrument for it is a BITWISE comparison on engineered data, which lives
+//     at the op level in tests/vt/test_ops_moe_nongated_relu2.cpp (spec §6a M6).
+//     A tolerance-based model-level gate cannot see it, and this file used to
+//     claim otherwise.
+//   * `scale_logits` — multiply the router LOGITS. sigmoid is non-linear, so
+//     this moves the weights and can move the SELECTION. Measured separation
+//     25.3x the signal.
+//   * `scale_shared_too` — apply the factor to the assembled output INCLUDING
+//     the shared-expert term instead of the routed sum only. This is the trap
+//     `apply_routed_scale_to_output=True` exists to name
+//     (moe_runner.py:402-406 scales `fused_output` alone, then :722-725 adds
+//     `shared_output`), it is the one a shared-expert-free architecture like
+//     Laguna cannot expose, and unlike the fold it is a LARGE numeric difference.
 std::vector<double> RefMoe(const MoeRefWeights& w, const NemotronHParams& p,
                            const std::vector<float>& hidden, int64_t T,
                            bool fold_scale_into_weights = false,
-                           bool scale_logits = false) {
+                           bool scale_logits = false,
+                           bool scale_shared_too = false) {
   const int64_t H = p.hidden_size;
   const int64_t E = p.n_routed_experts;
   const int64_t Kk = p.num_experts_per_tok;
@@ -550,7 +648,10 @@ std::vector<double> RefMoe(const MoeRefWeights& w, const NemotronHParams& p,
           acc += h[static_cast<size_t>(i)] *
                  static_cast<double>(w.shared_down[static_cast<size_t>(d * Is + i)]);
         }
-        out[static_cast<size_t>(t * H + d)] += acc;
+        // The shipped form adds the shared term UNSCALED (moe_runner.py:722-725).
+        // The mis-port scales it along with the routed sum.
+        out[static_cast<size_t>(t * H + d)] +=
+            scale_shared_too ? acc * p.routed_scaling_factor : acc;
       }
     }
   }
@@ -600,11 +701,25 @@ NemotronHMambaWeights PackMamba(const MambaRefWeights& r, const NemotronHParams&
   return w;
 }
 
+// THE q/k SCALE IS LOAD-BEARING, and it was measured rather than chosen. At the
+// inherited 0.2 the tiny model's attention logits came out at q.k*head_dim^-0.5
+// ~ 0.09, so the softmax was NEAR-UNIFORM and the block degenerated into an
+// unweighted mean of v. Two consequences, both measured: the output collapsed by
+// cancellation to a mean |value| of 3.5e-4 at T=48, and the block became almost
+// BLIND to anything that only moves attention WEIGHTS. Rotating q and k by a
+// measured max_abs of 0.288 (RopeNeox, 360 of 384 elements moved) shifted the
+// block's output by 9.4e-6 — which is why the no-RoPE guard below could not see
+// a defect it was written to catch.
+//
+// The real checkpoint does not have this problem: head_dim 128 and hidden 2688
+// put its logits in the selective regime by construction. 0.95 restores that
+// regime here (logits O(2), a genuinely peaked softmax), so q/k defects — RoPE,
+// the scale factor, causality — actually move the answer.
 AttnRefWeights BuildAttnRef(const NemotronHParams& p, int64_t salt, DType dt) {
   AttnRefWeights r;
   const int64_t qd = p.q_proj_out_features(), kd = p.kv_proj_out_features();
-  r.q = RoundTo(SynthVec(static_cast<size_t>(qd * p.hidden_size), salt + 1, 0.2f), dt);
-  r.k = RoundTo(SynthVec(static_cast<size_t>(kd * p.hidden_size), salt + 2, 0.2f), dt);
+  r.q = RoundTo(SynthVec(static_cast<size_t>(qd * p.hidden_size), salt + 1, 0.95f), dt);
+  r.k = RoundTo(SynthVec(static_cast<size_t>(kd * p.hidden_size), salt + 2, 0.95f), dt);
   r.v = RoundTo(SynthVec(static_cast<size_t>(kd * p.hidden_size), salt + 3, 0.2f), dt);
   r.o = RoundTo(SynthVec(static_cast<size_t>(p.hidden_size * qd), salt + 4, 0.2f), dt);
   return r;
@@ -746,14 +861,12 @@ std::vector<double> RefStack(const TinyWeights& tw, const NemotronHParams& p,
   return RefRmsNorm(residual, tw.norm_f, T, H, p.layer_norm_epsilon);
 }
 
-// f32 arm / bf16 arm tolerances. The f32 pair is the one that cannot hide a
-// reduction-order defect; the bf16 pair is the released model dtype.
-struct Tol {
-  double atol, rtol;
-};
-Tol TolFor(DType dt) {
-  return dt == DType::kF32 ? Tol{2e-4, 2e-4} : Tol{6e-2, 6e-2};
-}
+// The RELATIVE band per arm, as a fraction of the reference's own peak. The f32
+// arm is the one that cannot hide a reduction-order defect
+// ([[bf16-store-absorbs-reduction-order-defects]]); the bf16 arm is the released
+// checkpoint's model dtype and carries bf16's ~2^-8 relative resolution through
+// however many layers the case runs.
+double RelFor(DType dt) { return dt == DType::kF32 ? 2e-4 : 3e-2; }
 
 }  // namespace
 
@@ -775,9 +888,8 @@ TEST_CASE("NemotronH mamba2 mixer equals an independent sequential reference") {
     const std::vector<float> got =
         vllm::NemotronHMamba2Mixer(w, p, hidden, T, dt, q, nullptr);
     const std::vector<double> want = RefMamba2Mixer(r, p, hidden, T, nullptr);
-    const Tol tol = TolFor(dt);
-    ExpectClose(std::string("mamba2 mixer ") + (dt == DType::kF32 ? "f32" : "bf16"), got, want,
-                tol.atol, tol.rtol);
+    ExpectCloseRel(std::string("mamba2 mixer ") + (dt == DType::kF32 ? "f32" : "bf16"), got,
+                   want, RelFor(dt));
   }
 }
 
@@ -799,7 +911,7 @@ TEST_CASE("NemotronH mamba2 mixer is invariant to the SSD chunk size") {
     REQUIRE(T > chunk);
     const std::vector<float> got =
         vllm::NemotronHMamba2Mixer(w, pc, hidden, T, dt, q, nullptr);
-    ExpectClose("mamba2 chunk " + std::to_string(chunk), got, want, 2e-4, 2e-4);
+    ExpectCloseRel("mamba2 chunk " + std::to_string(chunk), got, want, 2e-4);
   }
 }
 
@@ -845,31 +957,55 @@ TEST_CASE("NemotronH mamba2 state: the SSM dtype is independent, and it is CARRI
     std::vector<double> want(whole.begin(), whole.end());
     std::vector<float> joined = y1;
     joined.insert(joined.end(), y2.begin(), y2.end());
-    ExpectClose("two-leg == whole", joined, want, 2e-4, 2e-4);
+    ExpectCloseRel("two-leg == whole", joined, want, 2e-4);
   }
 
-  SUBCASE("a bf16 SSM state is a DIFFERENT answer, so the dtype is load-bearing") {
-    // Same two legs, but the recurrent state stored at bf16 — exactly what the
-    // shared Qwen3.5 resolver silently produces here. If this were NOT different
-    // the case above would be vacuous.
+  // WHERE THE SSM CACHE DTYPE IS ACTUALLY OBSERVABLE, measured rather than
+  // assumed. The state is what the dtype names, so the state is what this gates.
+  //
+  // The inherited subcase asserted the defect downstream, on leg 2's OUTPUT.
+  // Measured, that separation is 3.16e-5 of the signal peak — BELOW the f32 arm's
+  // own 2e-4 band, so no downstream assertion here can be both honest and
+  // non-vacuous. The reason is the recurrence itself: A = -exp(A_log) puts the
+  // per-token decay near exp(-1), so a carried state is forgotten within a few
+  // tokens and its bf16 rounding never reaches most of leg 2. That is a property
+  // of Mamba2, not a weakness of the port, and asserting through it would be
+  // gating on noise.
+  //
+  // The STATE is where the dtype lives and where the difference is real: bf16
+  // carries ~2^-8 relative resolution, so the stored recurrent state differs
+  // materially from the f32 one on essentially every element. W6's paged decode
+  // reads that state on EVERY step rather than once per leg, which is what makes
+  // the dtype matter in production and what this pins.
+  SUBCASE("the SSM cache dtype is load-bearing IN THE STORED STATE") {
     NemotronHParams pb = p;
     pb.mamba_ssm_cache_dtype = "bfloat16";
     REQUIRE(vllm::NemotronHSsmCacheDType(pb, dt) == DType::kBF16);
     std::vector<float> h1(hidden.begin(),
                           hidden.begin() + static_cast<long>(T1 * p.hidden_size));
-    std::vector<float> h2(hidden.begin() + static_cast<long>(T1 * p.hidden_size), hidden.end());
-    NemotronHMambaState st;
-    (void)vllm::NemotronHMamba2Mixer(w, pb, h1, T1, dt, q, &st);
-    CHECK(st.ssm.dtype == DType::kBF16);
-    const std::vector<float> y2 = vllm::NemotronHMamba2Mixer(w, pb, h2, T2, dt, q, &st);
 
-    const std::vector<float> whole =
-        vllm::NemotronHMamba2Mixer(w, p, hidden, T, dt, q, nullptr);
-    std::vector<double> tail;
-    for (int64_t i = T1 * p.hidden_size; i < T * p.hidden_size; ++i) {
-      tail.push_back(whole[static_cast<size_t>(i)]);
-    }
-    CHECK(AnyDiffers(y2, tail, 2e-4, 2e-4));
+    NemotronHMambaState st_f32;
+    (void)vllm::NemotronHMamba2Mixer(w, p, h1, T1, dt, q, &st_f32);
+    NemotronHMambaState st_bf16;
+    (void)vllm::NemotronHMamba2Mixer(w, pb, h1, T1, dt, q, &st_bf16);
+
+    // The MEMORY FORMAT itself, asserted rather than inferred from matching
+    // numbers: a too-wide state is numerically correct and invisible downstream
+    // ([[token-gates-cannot-see-dequant-fallbacks]]).
+    CHECK(st_f32.ssm.dtype == DType::kF32);
+    CHECK(st_bf16.ssm.dtype == DType::kBF16);
+    REQUIRE(st_f32.ssm.Numel() == st_bf16.ssm.Numel());
+    // ...and the byte counts differ by exactly the factor the dtypes name, which
+    // is the assertion that caught the shared-resolver defect in W3 (spec §5c).
+    CHECK(st_f32.ssm.bytes.size() == 2 * st_bf16.ssm.bytes.size());
+
+    const std::vector<double> ref = OwnedToDouble(st_f32.ssm);
+    const std::vector<float> got = OwnedToFloat(st_bf16.ssm);
+    const double sep = RelSeparation(got, ref);
+    INFO("bf16 vs f32 stored SSM state: relative separation " << sep);
+    // bf16 resolves ~2^-8; anything at or below the f32 arm's 2e-4 band would
+    // mean the store is not actually happening at the resolved dtype.
+    CHECK(sep > 1e-3);
   }
 }
 
@@ -892,10 +1028,9 @@ TEST_CASE("NemotronH attention equals an independent causal GQA reference") {
       const std::vector<float> got =
           vllm::NemotronHAttentionMixer(w, p, hidden, T, dt, q);
       const std::vector<double> want = RefAttention(r, p, hidden, T);
-      const Tol tol = TolFor(dt);
-      ExpectClose("attention T=" + std::to_string(T) +
-                      (dt == DType::kF32 ? " f32" : " bf16"),
-                  got, want, tol.atol, tol.rtol);
+      ExpectCloseRel("attention T=" + std::to_string(T) +
+                         (dt == DType::kF32 ? " f32" : " bf16"),
+                     got, want, RelFor(dt));
     }
   }
 }
@@ -921,7 +1056,7 @@ TEST_CASE("NemotronH attention applies NO positional embedding") {
   // A NeoX RoPE at the config's own rope_theta over the full head_dim, applied
   // to the reference's q/k, is a different answer at every position but 0.
   const std::vector<double> want_no_rope = RefAttention(r, p, hidden, T);
-  ExpectClose("attention without rope", got, want_no_rope, 2e-4, 2e-4);
+  ExpectCloseRel("attention without rope", got, want_no_rope, 2e-4);
 
   const int64_t H = p.hidden_size, Hq = p.num_attention_heads, Hkv = p.num_key_value_heads,
                 D = p.head_dim;
@@ -984,7 +1119,19 @@ TEST_CASE("NemotronH attention applies NO positional embedding") {
     }
     rotated = RefLinear(ctx, ident.o, T, Hq * D, H);
   }
-  CHECK(AnyDiffers(got, rotated, 1e-3, 1e-3));
+  // The instrument first: prove RopeNeox actually ROTATED q. A guard that fails
+  // because its own rotation was a no-op would look exactly like a forward that
+  // correctly applies none ([[absent-hook-looks-like-armed-instrument]]).
+  {
+    const std::vector<double> q_unrot = RefLinear(hidden, r.q, T, H, Hq * D);
+    const double moved = RelSeparation(qv, q_unrot);
+    INFO("RopeNeox moved q by relative " << moved);
+    REQUIRE(moved > 1e-2);
+  }
+  // And now the finding: the shipped forward is NOT the rotated answer.
+  const double sep = RelSeparation(got, rotated);
+  INFO("no-rope forward vs a rope'd one: relative separation " << sep);
+  CHECK(sep > 1e-2);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1002,19 +1149,33 @@ TEST_CASE("NemotronH MoE equals an independent non-gated relu^2 reference") {
         RoundTo(SynthVec(static_cast<size_t>(T * p.hidden_size), 17, 0.6f), dt);
     const std::vector<float> got = vllm::NemotronHMoeMixer(w, p, hidden, T, dt, q);
     const std::vector<double> want = RefMoe(r, p, hidden, T);
-    const Tol tol = TolFor(dt);
-    ExpectClose(std::string("moe ") + (dt == DType::kF32 ? "f32" : "bf16"), got, want, tol.atol,
-                tol.rtol);
+    ExpectCloseRel(std::string("moe ") + (dt == DType::kF32 ? "f32" : "bf16"), got, want,
+                   RelFor(dt));
   }
 }
 
-// TRAP 1. `apply_routed_scale_to_output=True` (nemotron_h.py:234). Folding the
-// same 2.5 into the router weights — which Laguna legitimately does
-// (laguna_ops.h:48), because Laguna passes NO shared expert — scales the shared
-// term too and is a different answer on every token. Folding it into the LOGITS
-// is different again: sigmoid is non-linear, so it moves the weights and can move
-// the SELECTION.
-TEST_CASE("NemotronH MoE: the routed scale is on the OUTPUT, not the weights or logits") {
+// TRAP 1. `apply_routed_scale_to_output=True` (nemotron_h.py:234) — WHERE the
+// 2.5 is applied.
+//
+// This case previously asserted that folding the factor into the ROUTER WEIGHTS
+// "scales the shared term too and is a different answer on every token". That is
+// FALSE, and measuring it is what showed why: the factor is applied AFTER the
+// top-k renormalisation, so `scale * Σ w_j e_j` and `Σ (scale*w_j) e_j` are the
+// same expression. Measured separation on this fixture: 3.7e-5 relative,
+// 2.1e-8 absolute — pure floating-point association, with 245 of 288 elements
+// differing BITWISE and none numerically. The guard could never have passed, and
+// a tolerance-based model-level comparison is the wrong instrument for it; the
+// bitwise one is at the op level (spec §6a M6,
+// tests/vt/test_ops_moe_nongated_relu2.cpp). Recorded here so the next reader
+// does not re-derive it from a failing assertion.
+//
+// What IS observable at this level, and what this case now gates:
+//   * scaling the OUTPUT INCLUDING the shared term rather than the routed sum
+//     alone — the defect `apply_routed_scale_to_output=True` exists to prevent,
+//     and the one a shared-expert-free architecture cannot expose at all;
+//   * scaling the router LOGITS — sigmoid is non-linear, so it moves the weights
+//     and can move the SELECTION.
+TEST_CASE("NemotronH MoE: the routed scale is on the routed sum, not the shared term or logits") {
   NemotronHParams p = TinyParams();
   REQUIRE(p.routed_scaling_factor != 1.0);
   const int64_t T = 12;
@@ -1022,34 +1183,47 @@ TEST_CASE("NemotronH MoE: the routed scale is on the OUTPUT, not the weights or 
   const DType dt = DType::kF32;
   const MoeRefWeights r = BuildMoeRef(p, 3000, dt, /*shared=*/true);
   const NemotronHMoeWeights w = PackMoe(r, p, dt);
+  REQUIRE(r.has_shared);  // the shared term is what separates the mis-ports
   const std::vector<float> hidden = SynthVec(static_cast<size_t>(T * p.hidden_size), 17, 0.6f);
   const std::vector<float> got = vllm::NemotronHMoeMixer(w, p, hidden, T, dt, q);
 
   const std::vector<double> want = RefMoe(r, p, hidden, T);
-  ExpectClose("moe, scale on the output", got, want, 2e-4, 2e-4);
+  ExpectCloseRel("moe, scale on the routed sum only", got, want, 2e-4);
 
-  // The fold-into-weights mis-port. The gate is only meaningful if the two
-  // expressions really differ, so REQUIRE that first — a shared expert is what
-  // separates them, which is why this case has one.
-  const std::vector<double> folded =
-      RefMoe(r, p, hidden, T, /*fold_scale_into_weights=*/true);
-  REQUIRE(AnyDiffers(got, folded, 1e-3, 1e-3));
+  // MIS-PORT A: the factor applied to routed + shared.
+  const std::vector<double> shared_scaled =
+      RefMoe(r, p, hidden, T, /*fold=*/false, /*scale_logits=*/false,
+             /*scale_shared_too=*/true);
+  const double sep_shared = RelSeparation(got, shared_scaled);
+  INFO("scaling the shared term too: relative separation " << sep_shared);
+  CHECK(sep_shared > 1e-2);
 
-  // The scale-the-logits mis-port.
+  // MIS-PORT B: the factor applied to the router logits.
   const std::vector<double> logit_scaled =
       RefMoe(r, p, hidden, T, /*fold=*/false, /*scale_logits=*/true);
-  REQUIRE(AnyDiffers(got, logit_scaled, 1e-3, 1e-3));
+  const double sep_logits = RelSeparation(got, logit_scaled);
+  INFO("scaling the router logits: relative separation " << sep_logits);
+  CHECK(sep_logits > 1e-2);
 
-  // With NO shared expert the fold is exact-arithmetic-equal — which is exactly
-  // why Laguna may do it and why a tolerance-based gate on a shared-expert-free
-  // config CANNOT see this defect. Pinned so the next porter does not "simplify"
-  // the block by copying Laguna.
+  // And the fold, pinned as what it actually is: arithmetically INDISTINGUISHABLE
+  // here, with or without a shared expert. This is why Laguna may legitimately
+  // fold the same factor (laguna_ops.h:48) and why copying that is a BITWISE
+  // defect rather than a numeric one — the thing a tolerance gate must not be
+  // claimed to catch.
+  const std::vector<double> folded =
+      RefMoe(r, p, hidden, T, /*fold_scale_into_weights=*/true);
+  const double sep_fold = RelSeparation(got, folded);
+  INFO("folding into the router weights: relative separation " << sep_fold);
+  CHECK(sep_fold < 1e-3);
+  ExpectCloseRel("shared present: the fold is arithmetically indistinguishable", got, folded,
+                 2e-4);
+
   const MoeRefWeights rn = BuildMoeRef(p, 3000, dt, /*shared=*/false);
   const NemotronHMoeWeights wn = PackMoe(rn, p, dt);
   const std::vector<float> gotn = vllm::NemotronHMoeMixer(wn, p, hidden, T, dt, q);
   const std::vector<double> foldedn =
       RefMoe(rn, p, hidden, T, /*fold_scale_into_weights=*/true);
-  ExpectClose("no-shared: the fold is indistinguishable", gotn, foldedn, 2e-4, 2e-4);
+  ExpectCloseRel("no-shared: the fold is indistinguishable", gotn, foldedn, 2e-4);
 }
 
 // TRAP 2. `GateLinear(out_dtype=torch.float32, force_fp32_compute=True)`
@@ -1122,7 +1296,7 @@ TEST_CASE("NemotronH dense MLP is the same non-gated relu^2 shape") {
       want[static_cast<size_t>(t * H + d)] = acc;
     }
   }
-  ExpectClose("dense mlp", got, want, 2e-4, 2e-4);
+  ExpectCloseRel("dense mlp", got, want, 2e-4);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1152,10 +1326,9 @@ TEST_CASE("NemotronH forward: the hybrid stack computes through all three block 
       // is the per-layer-style numeric bound porting-a-model.md §3 asks for; a
       // tokens-only comparison could pass with a dropped mechanism.
       const std::vector<double> want_hidden = RefStack(tw, p, ids);
-      const Tol tol = TolFor(dt);
-      ExpectClose("final normed hidden T=" + std::to_string(T) +
-                      (dt == DType::kF32 ? " f32" : " bf16"),
-                  trace.final_normed, want_hidden, tol.atol, tol.rtol);
+      ExpectCloseRel("final normed hidden T=" + std::to_string(T) +
+                         (dt == DType::kF32 ? " f32" : " bf16"),
+                     trace.final_normed, want_hidden, RelFor(dt));
 
       // (b) every block kind ran, and every layer moved the stream. A mixer that
       // silently returned zeros would still produce plausible logits.
@@ -1174,8 +1347,8 @@ TEST_CASE("NemotronH forward: the hybrid stack computes through all three block 
       for (size_t i = 0; i < hf.size(); ++i) hf[i] = static_cast<float>(want_hidden[i]);
       const std::vector<double> want_logits =
           RefLinear(hf, tw.lm_head, T, p.hidden_size, p.vocab_size);
-      ExpectClose("logits T=" + std::to_string(T) + (dt == DType::kF32 ? " f32" : " bf16"),
-                  logits, want_logits, tol.atol * 10.0, tol.rtol * 10.0);
+      ExpectCloseRel("logits T=" + std::to_string(T) + (dt == DType::kF32 ? " f32" : " bf16"),
+                     logits, want_logits, RelFor(dt) * 10.0);
     }
   }
 }
@@ -1208,14 +1381,14 @@ TEST_CASE("NemotronH forward: the residual stream is SINGLE-branch per layer") {
   }
   for (size_t l = 0; l < trace.mixer.size(); ++l) {
     for (size_t i = 0; i < residual.size(); ++i) residual[i] += trace.mixer[l][i];
-    ExpectClose("residual after layer " + std::to_string(l), trace.hidden[l], residual, 2e-4,
-                2e-4);
+    ExpectCloseRel("residual after layer " + std::to_string(l), trace.hidden[l], residual,
+                   2e-4);
     // And the norm the NEXT layer sees is that residual, normed ONCE.
     if (l + 1 < trace.mixer.size()) {
       const std::vector<double> want =
           RefRmsNorm(residual, tw.norm[l + 1], T, H, p.layer_norm_epsilon);
-      ExpectClose("normed input of layer " + std::to_string(l + 1), trace.normed[l + 1], want,
-                  2e-4, 2e-4);
+      ExpectCloseRel("normed input of layer " + std::to_string(l + 1), trace.normed[l + 1],
+                     want, 2e-4);
     }
   }
 }
