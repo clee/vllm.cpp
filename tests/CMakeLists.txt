@@ -113,14 +113,20 @@ vllm_cpp_add_test(test_vocoder1d vllm/models/test_vocoder1d.cpp)
 vllm_cpp_add_test(test_speech_engine vllm/multimodal/test_speech_engine.cpp)
 vllm_cpp_add_test(test_indextts2_family vllm/models/test_indextts2_family.cpp)
 vllm_cpp_add_test(test_campplus vllm/models/test_campplus.cpp)
+vllm_cpp_add_test(test_emovec vllm/models/test_emovec.cpp)
 vllm_cpp_add_test(test_w2vbert vllm/models/test_w2vbert.cpp)
 vllm_cpp_add_test(test_fvq vllm/models/test_fvq.cpp)
+vllm_cpp_add_test(test_codec_encoder vllm/models/test_codec_encoder.cpp)
+vllm_cpp_add_test(test_w2v_fbank vllm/models/test_w2v_fbank.cpp)
 vllm_cpp_add_test(test_wavenet vllm/models/test_wavenet.cpp)
 vllm_cpp_add_test(test_dit_tail vllm/models/test_dit_tail.cpp)
 vllm_cpp_add_test(test_dit_skip vllm/models/test_dit_skip.cpp)
 vllm_cpp_add_test(test_dit_front vllm/models/test_dit_front.cpp)
 vllm_cpp_add_test(test_dit_stack vllm/models/test_dit_stack.cpp)
+vllm_cpp_add_test(test_bigvgan vllm/models/test_bigvgan.cpp)
 vllm_cpp_add_test(test_indextts2_s2mel_loader vllm/models/test_indextts2_s2mel_loader.cpp)
+vllm_cpp_add_test(test_indextts2_render vllm/models/test_indextts2_render.cpp)
+vllm_cpp_add_test(test_indextts2_e2e vllm/models/test_indextts2_e2e.cpp)
 vllm_cpp_add_test(test_indextts2_talker_loader vllm/models/test_indextts2_talker_loader.cpp)
 vllm_cpp_add_test(test_vocos vllm/models/test_vocos.cpp)
 vllm_cpp_add_test(test_lenreg vllm/models/test_lenreg.cpp)
@@ -128,6 +134,7 @@ vllm_cpp_add_test(test_cfm vllm/models/test_cfm.cpp)
 vllm_cpp_add_test(test_adaln vllm/models/test_adaln.cpp)
 vllm_cpp_add_test(test_dit vllm/models/test_dit.cpp)
 vllm_cpp_add_test(test_talker vllm/models/test_talker.cpp)
+vllm_cpp_add_test(test_tiktoken_bpe vllm/models/test_tiktoken_bpe.cpp)
 vllm_cpp_add_test(test_indextts2_pipeline vllm/models/test_indextts2_pipeline.cpp)
 target_include_directories(test_dit PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
 target_include_directories(test_adaln PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
@@ -135,10 +142,13 @@ target_include_directories(test_cfm PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vllm/mod
 target_include_directories(test_lenreg PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
 target_include_directories(test_vocos PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
 target_include_directories(test_fvq PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
+target_include_directories(test_codec_encoder PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
+target_include_directories(test_w2v_fbank PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
 target_include_directories(test_wavenet PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
 target_include_directories(test_dit_tail PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
 target_include_directories(test_dit_front PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
 target_include_directories(test_dit_stack PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
+target_include_directories(test_bigvgan PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
 target_include_directories(test_w2vbert PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
 target_include_directories(test_campplus PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
 vllm_cpp_add_test(test_gpt2 vllm/models/test_gpt2.cpp)
@@ -168,6 +178,37 @@ target_compile_definitions(test_minimax_music3_ar_real PRIVATE
   MUSIC3_GOLDENS_DIR="${CMAKE_SOURCE_DIR}/tests/parity/goldens/minimax_music3_oracle")
 target_include_directories(test_minimax_music3_ar_real PRIVATE
   ${CMAKE_SOURCE_DIR}/tests/parity)
+# MiniMax-Music3 W4+W5 (#672): the ACOUSTIC half — the flow-matching DiT, the
+# FlowMatchEulerDiscreteScheduler with invert_sigmas, the CFG mix, the denoise
+# loop's window bookkeeping and the DAC Flow-VAE vocoder — against goldens
+# produced by EXECUTING upstream's own classes at reduced dimensions in float32
+# (minimax_music3_acoustic_goldens.inc, no weight bytes). The full-scale fp32
+# companion is tests/parity/test_minimax_music3_acoustic_real.cpp.
+vllm_cpp_add_test(test_minimax_music3_acoustic vllm/models/test_minimax_music3_acoustic.cpp)
+target_include_directories(test_minimax_music3_acoustic PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
+# The FULL-SCALE companion: the REAL fp32 2.4B DiT and 0.054B vocoder driven on
+# the REAL inputs, against the committed oracle capture (denoise_{first,last}_*,
+# vocoder_input_chunk0, waveform). Checkpoint-gated exactly as the AR one is;
+# every case emits a loud SKIP when the 28.5 GB asset is absent, so CI still
+# compiles, links and runs it.
+vllm_cpp_add_test(test_minimax_music3_acoustic_real
+  parity/test_minimax_music3_acoustic_real.cpp)
+target_compile_definitions(test_minimax_music3_acoustic_real PRIVATE
+  MUSIC3_GOLDENS_DIR="${CMAKE_SOURCE_DIR}/tests/parity/goldens/minimax_music3_oracle")
+target_include_directories(test_minimax_music3_acoustic_real PRIVATE
+  ${CMAKE_SOURCE_DIR}/tests/parity)
+# W6 (#672): the SPEECH-FAMILY seam, the request contract and the chunk plan.
+# Pure or synthetic-tree only, so it needs neither the checkpoint nor a golden.
+vllm_cpp_add_test(test_minimax_music3_speech vllm/models/test_minimax_music3_speech.cpp)
+# W6's FULL-SCALE companion: the pipeline TAIL driven on the shipped weights,
+# against the capture's own waveform, and the WAV the delivery path emits.
+# Checkpoint-gated with a loud SKIP, exactly as the W4/W5 real gate is.
+vllm_cpp_add_test(test_minimax_music3_e2e_real parity/test_minimax_music3_e2e_real.cpp)
+target_compile_definitions(test_minimax_music3_e2e_real PRIVATE
+  MUSIC3_GOLDENS_DIR="${CMAKE_SOURCE_DIR}/tests/parity/goldens/minimax_music3_oracle")
+target_include_directories(test_minimax_music3_e2e_real PRIVATE
+  ${CMAKE_SOURCE_DIR}/tests/parity)
 # ARCH-ONE-SURFACE ROW 2 fold gate: the video seam == the replicated pre-fold
 # pipeline == the goldens the PRE-fold minimax-h3-gen binary rendered at the
 # branch base (frames + WAV byte-identical, mux argv pinned).
@@ -185,6 +226,13 @@ target_compile_definitions(test_video_engine PRIVATE
 # LTX-2.5 L7: the family behind the VideoEngine seam and the driving loop, run
 # over a reduced-dimension checkpoint set written in the SHIPPED file format.
 vllm_cpp_add_test(test_ltx2_video vllm/multimodal/test_ltx2_video.cpp)
+# LTX-2.5 image conditioning (row LTX25-IMAGE-COND, issue #644): the CHAIN from
+# PPM bytes to conditioned, noised tokens, gated against upstream ltx_core AND
+# ltx_pipelines executed at reduced dimensions. ltx2_image_cond_goldens.inc
+# lives next to the test source.
+vllm_cpp_add_test(test_ltx2_image_cond vllm/multimodal/test_ltx2_image_cond.cpp)
+target_include_directories(test_ltx2_image_cond
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vllm/multimodal)
 # LTX-2.5 DiT parity gate (row MODEL-DIFFUSION-LTX25, spec phase L2). The goldens
 # live next to the test source, like every other generated .inc.
 vllm_cpp_add_test(test_ltx2 vllm/models/test_ltx2.cpp)
@@ -214,6 +262,7 @@ target_include_directories(test_ltx2_pipeline PRIVATE ${CMAKE_CURRENT_SOURCE_DIR
 vllm_cpp_add_test(test_ltx2_loader vllm/models/test_ltx2_loader.cpp)
 target_include_directories(test_ltx2_loader PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
 vllm_cpp_add_test(test_video_api vllm/entrypoints/openai/test_video_api.cpp)
+vllm_cpp_add_test(test_speech_api vllm/entrypoints/openai/test_speech_api.cpp)
 target_include_directories(test_model_registry PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_platform vllm/platforms/test_platform.cpp)
 vllm_cpp_add_test(test_device_selection
@@ -1100,6 +1149,13 @@ if(VLLM_CPP_SERVER)
   vllm_cpp_add_test(test_serve_recipe_args
     vllm/entrypoints/openai/test_serve_recipe_args.cpp)
   target_include_directories(test_serve_recipe_args PRIVATE ${CMAKE_SOURCE_DIR}/src)
+  # ENG-MM-INPUT-PIPELINE wave L2 (#607): --language-model-only /
+  # --limit-mm-per-prompt. Same shape and the same reason as the row above — it
+  # re-execs the REAL VllmServerMain to observe the flags reaching the config and
+  # a malformed limit aborting before the load.
+  vllm_cpp_add_test(test_serve_mm_limits
+    vllm/entrypoints/openai/test_serve_mm_limits.cpp)
+  target_include_directories(test_serve_mm_limits PRIVATE ${CMAKE_SOURCE_DIR}/src)
 endif()
 vllm_cpp_add_test(test_outputs vllm/test_outputs.cpp)
 
