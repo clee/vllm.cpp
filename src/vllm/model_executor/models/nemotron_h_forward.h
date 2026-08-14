@@ -89,7 +89,8 @@ inline constexpr bool kNemotronHAttentionHasNoRope = true;
 //
 // It is also what makes the checkpoint fit at all. The 5888 routed-expert
 // projections alone are 29.4e9 parameters; dequantized to bf16 at load they are
-// 58.7 GB, against 16.5 GiB packed. So `kNvfp4W4A16G16` is not an optimization
+// 58.7 GB, against 16.5 GB packed (15.4 GiB — nibbles plus group scales, and
+// both figures here are DECIMAL GB). So `kNvfp4W4A16G16` is not an optimization
 // — a load that widens it does not run on any box this project owns.
 enum class NemotronHWeightForm : uint8_t {
   // `bytes` holds Numel() elements of `dtype`, contiguous. Every W4-era weight.

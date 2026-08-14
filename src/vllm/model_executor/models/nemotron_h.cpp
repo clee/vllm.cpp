@@ -202,9 +202,14 @@ void RequireWeight(const NemotronHOwned& w, const char* what, DType want,
 // the quantized GEMMs are the CUDA `kMoeGroupedGemmNvfp4Marlin` and fp8-linear
 // registrations W6 selects. Two properties keep it honest: the weight KEEPS its
 // quantized memory format in host memory (so RSS and the load report describe
-// the checkpoint, not a widened copy of it), and the dequant is counted and
-// named by the loader's report rather than being discoverable only by reading
-// this function.
+// the checkpoint, not a widened copy of it), and the arm is NAMED by the loader
+// header and reported by the load report rather than being discoverable only by
+// reading this function.
+//
+// What the report counts is the QUANTIZED WEIGHTS — 5935 NVFP4 W4A16 g16
+// projections and 46 FP8 W8A8 static ones, the population this widening can be
+// applied to. It does NOT count dequant EVENTS: a dequant here is transient and
+// per GEMM call, so its count is a property of the workload, not of the load.
 struct DenseOperand {
   std::vector<uint8_t> owned;  // non-empty only when a dequant happened
   Tensor view;

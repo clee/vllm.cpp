@@ -33,8 +33,15 @@
 // read cannot be reproduced. Absent checkpoint => a loud SKIP, never a
 // substitution.
 //
-// This is NOT the W6 token gate. It consumes no golden and makes no speed
-// claim; the committed `nemotron_35_lightning_greedy/oracle.json` stays W6's.
+// This is NOT the W6 token gate, and it makes no speed claim. It DOES consume
+// the committed `nemotron_35_lightning_greedy/oracle.json`, but only for its
+// smallest possible claim: ONE forward per prompt, and the argmax of the last
+// position against that prompt's FIRST generated token (case (6) below). The
+// full 32-token greedy decode against the pinned oracle — identical prompts,
+// counts, batching and sampling, with the oracle identity asserted — stays
+// W6's. The first-token arm is here because it is the only check that can fail
+// for a reason the structural gate cannot see: every count can be right while a
+// group scale is transposed or a nibble order is flipped.
 #include <doctest/doctest.h>
 
 #include <algorithm>
@@ -89,19 +96,80 @@ int64_t VmHwmKiB() {
   return -1;
 }
 
+// Every checkpoint-gated case in this TU, by name. A skip is a RESULT and has
+// to look like one: as this file shipped, a `ctest` run with no
+// `CHECKPOINT_ROOT` recorded `test_nemotron_h_loader ... Passed 0.00 sec` with
+// ZERO assertions, which is byte-for-byte what a real pass looks like from
+// outside. An instrument that cannot say how many things it examined has not
+// reported ([[the-state-was-not-the-one-you-believed]]).
+//
+// So the skip path runs assertions of its own — the case name is in this
+// registry, the refusal named a reason, and the count of skipped cases is
+// stated — and the closing case below asserts that every registered case
+// reached exactly one verdict. Modelled on `PendingRunnerOps()`
+// (tests/parity/test_op_parity.cpp:1834): a listed thing SKIPS loudly, an
+// unlisted one hard-FAILS.
+const std::set<std::string>& CheckpointGatedCases() {
+  static const std::set<std::string> kCases = {
+      "real_checkpoint_loads_and_forwards",
+  };
+  return kCases;
+}
+
+// Verdicts recorded so far, by case name: "RAN" or "SKIPPED(<reason>)".
+std::map<std::string, std::string>& Verdicts() {
+  static std::map<std::string, std::string> v;
+  return v;
+}
+
+// Record a LOUD, NAMED, COUNTED skip and return the number of cases skipped so
+// far. Asserts the case is one this TU declared, so a renamed case cannot skip
+// itself into invisibility.
+int NoteSkip(const std::string& case_name, const std::string& why) {
+  REQUIRE_MESSAGE(CheckpointGatedCases().count(case_name) == 1,
+                  "'" << case_name
+                      << "' is not a declared checkpoint-gated case -- add it to "
+                         "CheckpointGatedCases() before skipping it");
+  REQUIRE_MESSAGE(!why.empty(), "a skip must state WHY; an empty reason is not one");
+  Verdicts()[case_name] = "SKIPPED(" + why + ")";
+  int n = 0;
+  for (const auto& [name, verdict] : Verdicts()) {
+    (void)name;
+    if (verdict.rfind("SKIPPED", 0) == 0) ++n;
+  }
+  return n;
+}
+
+void NoteRan(const std::string& case_name) {
+  REQUIRE(CheckpointGatedCases().count(case_name) == 1);
+  Verdicts()[case_name] = "RAN";
+}
+
 }  // namespace
 
 TEST_CASE("NemotronH: the REAL checkpoint loads and the forward produces logits") {
+  const std::string kCase = "real_checkpoint_loads_and_forwards";
   std::string why;
   const std::string dir = parity::Nemotron35LightningSnapshot(&why);
   if (dir.empty()) {
-    MESSAGE("SKIP: no Nemotron-3.5-Lightning checkpoint at the pinned revision "
-            "29f2d1746d8f41e316523194b19018707749b1b1 -- "
-            << why
-            << ". Export CHECKPOINT_ROOT (set -a; . ./.env; set +a) or point "
-               "VT_NEMOTRON35_SNAPSHOT at the staged directory.");
+    const int skipped = NoteSkip(kCase, why);
+    MESSAGE("SKIPPED " << skipped << " of " << CheckpointGatedCases().size()
+                       << " checkpoint-gated case(s). '" << kCase
+                       << "': no Nemotron-3.5-Lightning checkpoint at the pinned "
+                          "revision 29f2d1746d8f41e316523194b19018707749b1b1 -- "
+                       << why
+                       << ". Export CHECKPOINT_ROOT (set -a; . ./.env; set +a) or "
+                          "point VT_NEMOTRON35_SNAPSHOT at the staged directory. "
+                          "Both gate hosts mount it at "
+                          "/usr/local/nas_share/checkpoints/"
+                          "nemotron-3.5-lightning-30b-nvfp4.");
+    // The load-bearing assertion of the skip path: this run examined ZERO
+    // checkpoint tensors, and says so with a check rather than with silence.
+    CHECK(skipped == 1);
+    CHECK(Verdicts().at(kCase).rfind("SKIPPED", 0) == 0);
     return;
   }
+  NoteRan(kCase);
   // The resolved directory is EVIDENCE, not a debug aid: VT_NEMOTRON35_SNAPSHOT
   // is deliberately never revision-checked, so a run that does not name the
   // directory it read cannot be reproduced or falsified.
@@ -316,4 +384,34 @@ TEST_CASE("NemotronH: the REAL checkpoint loads and the forward produces logits"
   CHECK(matched == total);
 
   MESSAGE("peak RSS at end: " << VmHwmKiB() / 1024 << " MiB");
+}
+
+// The accounting. Declared LAST so it runs after every checkpoint-gated case
+// above (doctest registers in declaration order within a TU). It exists so this
+// suite always states what it did: with the checkpoint present it reports every
+// case RAN, and without it every case SKIPPED, with the reason. Neither is
+// `Passed 0.00 sec` with nothing on the record.
+TEST_CASE("NemotronH loader: every checkpoint-gated case reached exactly one verdict") {
+  const std::set<std::string>& declared = CheckpointGatedCases();
+  CHECK(Verdicts().size() == declared.size());
+  int ran = 0;
+  int skipped = 0;
+  for (const std::string& name : declared) {
+    const auto it = Verdicts().find(name);
+    REQUIRE_MESSAGE(it != Verdicts().end(),
+                    "checkpoint-gated case '"
+                        << name
+                        << "' recorded NO verdict -- it neither ran nor skipped, "
+                           "which is the state this registry exists to make "
+                           "impossible");
+    MESSAGE(name << ": " << it->second);
+    if (it->second == "RAN") {
+      ++ran;
+    } else {
+      ++skipped;
+    }
+  }
+  MESSAGE("checkpoint-gated cases: " << ran << " ran, " << skipped << " skipped, of "
+                                     << declared.size());
+  CHECK(ran + skipped == static_cast<int>(declared.size()));
 }

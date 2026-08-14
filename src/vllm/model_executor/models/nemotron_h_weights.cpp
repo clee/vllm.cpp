@@ -29,6 +29,7 @@
 #include <vector>
 
 #include "vllm/model_executor/model_loader/nvfp4_dequant.h"
+#include "vt/unaligned.h"  // LoadUnaligned — safetensors offsets carry no alignment
 
 namespace vllm {
 namespace {
@@ -452,16 +453,29 @@ NemotronHOwned CopyDense(Loader& ld, const std::string& name, vt::DType want,
     if (t.nbytes != static_cast<size_t>(n) * 2) {
       RefuseLoad("'" + name + "' is BF16 but its byte count does not match its shape");
     }
-    const auto* src = reinterpret_cast<const uint16_t*>(t.data);
+    // NOT `reinterpret_cast<const uint16_t*>(t.data)`. `t.data` addresses the
+    // safetensors mmap at `8 + <JSON header length> + <sum of the preceding
+    // tensors' sizes>` (safetensors_reader.h) and NONE of those three terms is
+    // required to be even, so that pointer is one this loader may not form —
+    // undefined regardless of whether the access happens to fault, and a real
+    // fault on the strict-alignment targets this builds for
+    // (build-test-cpu-arm64, Jetson/Orin). Reads go through the shared
+    // `vt::LoadUnaligned` seam (a plain memcpy; #301 left it behind, #627 tracks
+    // the class, and fc903b8dd/#674 took the same repair in the LTX-2.5 VAE
+    // loader after `main` sat RED on `sanitize-cpu (address,undefined)` for it).
+    // The bulk `memcpy` below needs no typed pointer at all.
     if (want == vt::DType::kBF16) {
-      std::memcpy(w.bytes.data(), src, static_cast<size_t>(n) * 2);
+      std::memcpy(w.bytes.data(), t.data, static_cast<size_t>(n) * 2);
     } else if (want == vt::DType::kF32) {
       // A WIDENING. Counted, because the only ones the released checkpoint asks
       // for are the three f32-by-contract SSM scalars; a widening anywhere else
       // is a defect that a token gate would absorb.
       ld.report.widened_tensors += 1;
       auto* dst = reinterpret_cast<float*>(w.bytes.data());
-      for (int64_t i = 0; i < n; ++i) dst[i] = vt::BF16ToF32(src[i]);
+      for (int64_t i = 0; i < n; ++i) {
+        dst[i] = vt::BF16ToF32(
+            vt::LoadUnaligned<uint16_t>(t.data + static_cast<size_t>(i) * 2));
+      }
     } else {
       RefuseLoad("'" + name + "' cannot be materialized at the requested dtype");
     }
@@ -470,16 +484,20 @@ NemotronHOwned CopyDense(Loader& ld, const std::string& name, vt::DType want,
     if (t.nbytes != static_cast<size_t>(n) * 4) {
       RefuseLoad("'" + name + "' is F32 but its byte count does not match its shape");
     }
-    const auto* src = reinterpret_cast<const float*>(t.data);
+    // Same seam, same reason as the BF16 arm above: a 4-byte-aligned
+    // `const float*` into the mapping is not a pointer this loader may form.
     if (want == vt::DType::kF32) {
-      std::memcpy(w.bytes.data(), src, static_cast<size_t>(n) * 4);
+      std::memcpy(w.bytes.data(), t.data, static_cast<size_t>(n) * 4);
     } else if (want == vt::DType::kBF16) {
       // A NARROWING, which is what a bf16 model dtype asks for on a tensor the
       // producer happened to store wide. Never silent: it is the model dtype
       // every other layer inherits, and the router (the one f32 consumer) asks
       // for f32 explicitly.
       auto* dst = reinterpret_cast<uint16_t*>(w.bytes.data());
-      for (int64_t i = 0; i < n; ++i) dst[i] = vt::F32ToBF16(src[i]);
+      for (int64_t i = 0; i < n; ++i) {
+        dst[i] = vt::F32ToBF16(
+            vt::LoadUnaligned<float>(t.data + static_cast<size_t>(i) * 4));
+      }
     } else {
       RefuseLoad("'" + name + "' cannot be materialized at the requested dtype");
     }
@@ -580,15 +598,29 @@ NemotronHOwned LoadFp8(Loader& ld, const std::string& prefix, vt::DType logical,
 // ─── the blocks ─────────────────────────────────────────────────────────────
 
 void LoadMamba(Loader& ld, const NemotronHParams& p, const std::string& mixer,
-               vt::DType adt, NemotronHMambaWeights& out) {
+               vt::DType adt, bool quantized, NemotronHMambaWeights& out) {
   const int64_t H = p.hidden_size;
   const int64_t I = p.mamba_intermediate_size();
   const int64_t Cd = p.conv_dim();
   const int64_t K = p.conv_kernel;
   const int64_t Hh = p.mamba_num_heads;
 
-  out.in_proj = LoadFp8(ld, mixer + ".in_proj", adt, p.in_proj_out_features(), H);
-  out.out_proj = LoadFp8(ld, mixer + ".out_proj", adt, H, I);
+  // BRANCH ON `quantized`, exactly as `LoadExpert`/`LoadMlp` and the
+  // `ClaimFp8`/`ClaimNvfp4` enumeration do. `ClaimMamba` deliberately supports
+  // the unquantized case — hard-coding the FP8 companions there enumerated 92
+  // tensors a released bf16 checkpoint does not ship — so loading these two
+  // projections as FP8 unconditionally made the loader disagree with its own
+  // enumeration: a bf16 NemotronH refused with `'…in_proj.weight' ships dtype
+  // BF16, not the F8_E4M3 its scheme declares`, a DTYPE message for what is
+  // really the scheme the config declared.
+  if (quantized) {
+    out.in_proj = LoadFp8(ld, mixer + ".in_proj", adt, p.in_proj_out_features(), H);
+    out.out_proj = LoadFp8(ld, mixer + ".out_proj", adt, H, I);
+  } else {
+    out.in_proj =
+        CopyDense(ld, mixer + ".in_proj.weight", adt, {p.in_proj_out_features(), H});
+    out.out_proj = CopyDense(ld, mixer + ".out_proj.weight", adt, {H, I});
+  }
   // The conv weight ships [Cd, 1, K] and is consumed squeezed.
   out.conv1d_weight =
       CopyDense(ld, mixer + ".conv1d.weight", adt, {Cd, 1, K}, {Cd, K});
@@ -1027,7 +1059,7 @@ NemotronHHostWeights LoadNemotronHHostWeights(
     lw.norm = CopyDense(ld, layer + ".norm.weight", act_dtype, {p.hidden_size});
     switch (lw.block) {
       case NemotronHBlock::kMamba:
-        LoadMamba(ld, p, mixer, act_dtype, lw.mamba);
+        LoadMamba(ld, p, mixer, act_dtype, quantized, lw.mamba);
         break;
       case NemotronHBlock::kAttention:
         LoadAttention(ld, p, mixer, act_dtype,

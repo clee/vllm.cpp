@@ -1319,9 +1319,16 @@ the case THREW ([[doctest-assertions-line-hides-thrown-cases]]).
 **Every weight is held in the memory format the checkpoint SHIPS it in.** Not
 because widening is untidy, but because a dequantize-at-load loader does not fit
 on any box this project owns: the 5888 routed-expert projections alone are
-29.4e9 parameters, **16.5 GiB packed against 58.7 GB at bf16**. On a
+29.4e9 parameters, **16.5 GB packed against 58.7 GB at bf16**. On a
 unified-memory box that is not a failed load, it is a reboot
 ([[gb10-unified-memory-oom-reboots-box]]).
+
+Both of those are **decimal GB**, and the unit was wrong here and in two headers
+until the fresh review of this row caught it (`16.5 GiB`). The packed figure is
+14.7e9 bytes of nibbles (0.5 B/param) plus 1.84e9 bytes of group scales (1 B per
+16 params) = 16.54e9 bytes, which is **15.4 GiB**. A number quoted three times
+starts being treated as measured ([[a-number-quoted-often-becomes-treated-as-measured]]),
+so it is written out rather than left to be re-derived.
 
 Measured host mirror: **18013 MiB**, against 18013 MiB read out of the shards —
 the mirror is the checkpoint, not a widened copy of it. Peak RSS **17.70 GiB**
@@ -1426,9 +1433,29 @@ conversely are invisible to the golden arm, because they refuse before a token
 exists.
 
 **Restoration.** After each, the file was rewritten from the captured original
-and its SHA-256 re-verified (`186ae4cea4d7…` for `nemotron_h_loader.cpp`,
-`554d1c7fc65b…` for `nemotron_h.cpp`); `git status --porcelain` showed only the
-spec and `docs/FEATURES.md` edits this section is part of.
+and its SHA-256 re-verified; `git status --porcelain` showed only the spec and
+`docs/FEATURES.md` edits this section is part of.
+
+The filenames in that record were STALE, and the fresh review of this row was
+right to refuse a proof naming a file that does not exist. Re-anchored at HEAD:
+
+| Mutated file, as the record named it | What it is now | SHA-256 |
+|---|---|---|
+| `nemotron_h_loader.cpp` (M1–M3), the TU as it stood at `c4029deed` | `nemotron_h_weights.cpp` | `186ae4cea4d7…` **pre-rename** |
+| `nemotron_h_weights.cpp` at the landed head `9bffa2b60` | same file | `f8a87b15fb…` |
+| `nemotron_h.cpp` (M4, M5), unchanged since `cf95f59b8` | same file | `554d1c7fc65b…` |
+
+M1–M3 ARE anchored — `186ae4cea4d7…` is a real, reachable SHA
+(`git show c4029deed:src/vllm/model_executor/models/nemotron_h_loader.cpp | sha256sum`).
+What happened is that `08a65696d` then folded that TU into
+`nemotron_h_weights.cpp` as a documented **pure move** (its only edit being
+`Refuse` → `RefuseLoad` at 27 call sites), so the record kept a filename the
+tree no longer has. The mutations were NOT re-run after the move, and this
+section says so rather than implying they were. M4/M5's anchor never moved and
+the reviewer reproduced both argmax triples exactly.
+
+`f8a87b15fb…` is the sha of the reviewed head. The F1 repair below changes that
+file, so it is recorded as the anchor of the mutation campaign, not of `main`.
 
 ### Gate evidence
 
@@ -1481,14 +1508,16 @@ NVMe and the x86 box reads it over SMB from the NAS.
 would have read as a failed run to anyone grepping only for `SUCCESS`. The RSS
 above is the test's own `/proc/self/status` `VmHWM`, which is why it has one.
 
-**One honestly weak property, recorded rather than discovered.** With no
-checkpoint the gate emits a `MESSAGE` naming the missing export and RETURNS,
-so CTest records a PASS, not a *Skipped* — a CI run cannot tell it apart from a
-real pass without reading the log. That is the convention
-`test_nemotron_h_scaffold`'s live case already set for this same checkpoint on
-this same row, and matching it beat inventing a second one; the alternative is
+**One honestly weak property, recorded rather than discovered — and since
+REPAIRED (§6e F2b).** With no checkpoint the gate emitted a `MESSAGE` naming the
+missing export and RETURNED, so CTest recorded `Passed 0.00 sec` with **zero
+assertions** — indistinguishable from a real pass without reading the log. The
+convention was inherited from `test_nemotron_h_scaffold`'s live case, and
+matching it beat inventing a second one; the alternative is
 `test_modelopt_mixed_precision_checkpoint`'s exit-77, which needs a custom
-`main`. Named here so the next reader does not have to work it out.
+`main`. The fresh review was right that recording it is not the same as fixing
+it, and §6e replaces it with a named, counted skip plus a closing accounting
+case.
 
 **`test_op_parity` is RED on the base and not this row's.** `RunGoldenPass`
 (`tests/parity/test_op_parity.cpp:1852-1860`) walks every subdirectory of the
@@ -1505,6 +1534,195 @@ outside this task's authority, the fix belongs to MODEL-MUSIC-MUSIC3 (either an
 `op` key or the `manifest.json` renamed so the op walker skips it as the
 tokenizer golden dirs already are), and repairing a pre-existing break inside a
 scoped loader change would hide it — the same call §5d finding 5 made.
+
+## 6e. The fresh review of §6d, and the repairs (2026-08-14)
+
+PR #752 was reviewed at the immutable head `9bffa2b60` by an agent that neither
+wrote nor gated it. The review **confirmed the substance** — 18217 of 18487
+enumerated tensors materialized, 270 `mtp.*` deferred by name, every weight in
+its packed form (host bytes `18,888,922,112`, re-derived bit-exact from the 52
+safetensors headers), 5935 NVFP4 W4A16 g16 / 46 FP8 W8A8 / 12 fp8 KV scales /
+216 BF16 + 46 F32 / 69 widenings, and 3/3 first-token agreement on x86_64 and
+Thor — and returned two MEDIUM findings, three LOW and two NIT. All seven are
+repaired below; none was declined.
+
+### F1 — a pointer the loader may not form
+
+`CopyDense` read the safetensors mapping through
+`reinterpret_cast<const uint16_t*>(t.data)` and
+`reinterpret_cast<const float*>(t.data)`. `StTensor::data` is
+`8 + <JSON header length> + <sum of the preceding tensors' sizes>` and **none of
+those three terms is required to be even**, so forming either pointer is
+undefined whether or not the access faults. The same file's scalar read already
+used `memcpy`, so it was internally inconsistent.
+
+This is the class [#627](https://github.com/mudler/vllm.cpp/issues/627) tracks,
+whose THIRD recurrence closed on `main` the same day at `fc903b8dd` (#674) after
+`main` had sat RED on `sanitize-cpu (address,undefined)` since #641. That repair
+is mirrored exactly: reads go through `vt::LoadUnaligned` — the seam #301 left
+behind, already used by eight sibling loaders — and the two bulk `memcpy`s drop
+their typed pointer entirely (`memcpy` never needed one). No sanitizer
+configuration was touched and no scope was widened.
+
+Anchors re-derived at HEAD and asserted unique (count == 1), because recorded
+line numbers go stale within a PR: `nemotron_h_weights.cpp:455` (BF16 arm) and
+`:473` (F32 arm) at the reviewed head.
+
+**Evidence.** A standalone probe (`-fsanitize=address,undefined
+-fno-sanitize-recover=all`, GNU 13.3) over a deliberately ODD address, running
+both read forms of this file:
+
+| Form | Result |
+|---|---|
+| the shipped `reinterpret_cast<const uint16_t*>` | **exit 1**, `runtime error: load of misaligned address 0x521000000101 for type 'const short unsigned int', which requires 2 byte alignment` |
+| `vt::LoadUnaligned<uint16_t>` | **exit 0**, `data % 2 = 1`, sum `2006464` **matching the memcpy oracle exactly** |
+
+The reviewer measured this as LATENT rather than live — 0 of 216 BF16 and 0 of
+6085 F32 tensors land misaligned on this particular checkpoint — and that is
+recorded rather than used as a reason to leave it: the loader builds for
+`build-test-cpu-arm64`, and UBSan could never have caught it in CI because of
+F2. A project-configured `-DVLLM_CPP_SANITIZE='address,undefined'` build of the
+three Nemotron-H targets is clean (below).
+
+**Not changed, and why:** the remaining `reinterpret_cast`s in `nemotron_h.cpp`
+(:224, :256, :351) and the two write-side casts in `nemotron_h_weights.cpp` are
+over `std::vector<uint8_t>::data()`, which the default allocator returns
+suitably aligned for any scalar. They are not views into a mapping and are not
+in F1's class.
+
+### F2 — the guard was correct but UNARMED, and none of §6d's new code ran in CI
+
+The review proved the seams were unreachable without the 20.1 GiB checkpoint:
+deleting the `VT_CHECK` in `NemotronHOwned::View` left the live gate at 46/46
+with 3/3 goldens and both offline suites green, and a `ctest` run with no
+`CHECKPOINT_ROOT` recorded `test_nemotron_h_loader ... Passed 0.00 sec` with
+**zero assertions** — byte-for-byte what a real pass looks like from outside.
+The guard is not decorative: with it removed, `View` hands out a 128-element
+bf16 tensor over a 64-byte NVFP4 buffer, **192 bytes out of bounds**.
+
+**(a) `tests/vllm/models/test_nemotron_h_quantized_forms.cpp`** — a new OFFLINE
+gate needing no checkpoint, registered unconditionally in `tests/CMakeLists.txt`
+so it runs on every CI arm. It asserts that `View` refuses a non-dense weight BY
+NAME (message names the form and points at `DenseBf16`), that a dense weight is
+still viewed unchanged, and that `DenseBf16` reproduces a dequant derived
+**independently from the upstream formula** — the E2M1 table, an fp8-e4m3
+decoder and a bf16 RNE round all written out in the test from their format
+definitions rather than called out of `vt`/`vllm`, and anchored by hand
+(0x38 → 1.0, 0x40 → 2.0, nibble 0x7 → 6.0, bf16(1.5) = 0x3FC0). Every fixture
+value is dyadic, so every expected result is EXACT in bf16 and the comparison is
+on the BIT PATTERN — `doctest::Approx`'s ~1.19e-5 absolute floor
+([[doctest-approx-scale-term-floor]]) never enters. The three properties a
+counts-only gate cannot see are asserted individually: the nibble order (element
+2j is the LOW nibble), the per-16 group scale (two groups of one row, different
+fp8 scales), and `weight_scale_2` MULTIPLIED (not reciprocated, not ignored). A
+fifth case reaches the file-private `DenseFor`/`DenseCopy` through
+`NemotronHMlpMixer` and proves a quantized weight is actually widened at the
+GEMM call site — against a dense arm built from the INDEPENDENT reference, so a
+dequant defect cannot cancel itself out, and with the weight still packed
+afterwards.
+
+**RED-before, by mutation.** Every result carries the compile exit status beside
+it, because a mutation that fails to BUILD reads as a passing test
+([[mutation-build-failure-reads-as-a-passing-test]]), and `Status:` is grepped
+as well as `assertions:`, because a thrown case prints "N passed | 0 failed"
+beside a red status ([[doctest-assertions-line-hides-thrown-cases]]). The binary
+SHA is printed too, so a stale binary cannot print a green status
+([[stale-binary-prints-green-status]]) — all four differ.
+
+| Mutation (applied alone to `nemotron_h.cpp`, restored + sha-verified after) | BUILD_EXIT | binary sha | Result |
+|---|---|---|---|
+| baseline (unmutated) | 0 | — | 5 cases / **130 assertions**, `Status: SUCCESS!`, exit 0 |
+| **M4′** nibble order → `kHighFirst` | **0** | `f7e75e690a62` | **`Status: FAILURE!`**, 3 passed / **2 failed**, 4 assertions failed, exit 1 — **96 of 96** elements differ, and the probe pair reads exactly swapped (`16576` vs `16128`) |
+| **M5′** `weight_scale_2` ignored (passed as `1.0F`) | **0** | `c797cc44ec4b` | **`Status: FAILURE!`**, 3 passed / 2 failed, **36** assertions failed, exit 1 |
+| `View`'s `VT_CHECK` neutralized to `VT_CHECK(true, …)` | **0** | `0303eeaeff7d` | **`Status: FAILURE!`**, 4 passed / 1 failed, 5 assertions failed, exit 1 |
+| FP8 `input_scale` APPLIED (it must be carried, not applied) | **0** | `630495efa1a9` | **`Status: FAILURE!`**, 4 passed / 1 failed, 3 assertions failed, exit 1 |
+
+M4′ and M5′ are §6d's M4 and M5, the pair that a counts-only gate calls clean.
+They previously needed the 20.1 GiB checkpoint and three oracle prompts to
+detect; they are now caught in **0.01 s with no checkpoint at all**.
+
+**(b) the checkpoint-gated skip is now LOUD, NAMED and COUNTED.**
+`test_nemotron_h_loader` declares its checkpoint-gated cases in a
+`CheckpointGatedCases()` registry — the `PendingRunnerOps()` idiom
+(`tests/parity/test_op_parity.cpp:1834`) — records a verdict for each, asserts
+in the skip path that the case is declared and that its reason is non-empty, and
+closes with an accounting case that REQUIREs every declared case reached exactly
+one verdict and MESSAGEs the tally.
+
+With `CHECKPOINT_ROOT` unset it now reports **2 cases / 7 assertions,
+`Status: SUCCESS!`** and logs `checkpoint-gated cases: 0 ran, 1 skipped, of 1`,
+instead of `Passed 0.00 sec` with nothing on the record. The accounting is
+itself armed:
+
+| Mutation to `test_nemotron_h_loader.cpp` | BUILD_EXIT | binary sha | Result |
+|---|---|---|---|
+| the skip is announced but not RECORDED | 0 | `0fc726deb80f` | **`Status: FAILURE!`**, 0 of 2 cases passed, 4 of 6 assertions failed |
+| the pre-repair SILENT early return restored | 0 | `89cb559244b8` | **`Status: FAILURE!`**, 1 of 2 cases passed, **2 of 2 assertions failed** |
+
+### The LOWs and NITs
+
+**L1 — `LoadMamba` did not branch on `quantized`.** `ClaimMamba` deliberately
+supports the unquantized case (hard-coding the FP8 companions there enumerated
+92 tensors a released bf16 checkpoint does not ship), but the loader called
+`LoadFp8` unconditionally, so such a checkpoint refused with `'…in_proj.weight'
+ships dtype BF16, not the F8_E4M3 its scheme declares` — a DTYPE message for
+what is really the declared scheme. Repaired by branching, exactly as
+`LoadExpert`/`LoadMlp` and the enumeration do. **Still owed on that arm and named
+here rather than left to be found:** `mamba_proj_bias` is enumerated
+(`in_proj.bias`/`out_proj.bias`) and has no host slot, so a checkpoint that sets
+it refuses through the accounting path; the released one sets it false.
+
+**L2 — stale scope statements.** Both
+`tests/vllm/models/test_nemotron_h_loader.cpp:36` ("It consumes no golden…") and
+`tests/CMakeLists.txt:555` ("no golden is consumed") contradicted the file,
+which consumes `oracle.json` at :268-316 while the CMake block defines
+`NEMOTRON_H_GOLDENS_DIR`. Both now say what the code does: ONE forward per
+prompt and the argmax of the last position against that prompt's FIRST token;
+the full 32-token greedy decode stays W6's.
+
+**L3 — the restoration proof named a nonexistent file.** Repaired in §6d's
+Mutation-proof table above; `186ae4cea4d7…` turned out to be a REAL sha, of the
+pre-rename TU at `c4029deed`.
+
+**N1 — "16.5 GiB" is 16.5 GB.** Repaired in `nemotron_h_loader.h:39`,
+`nemotron_h_forward.h:92` and §6d above, with the arithmetic written out.
+
+**N2 — "counted … by the loader's report".** The report counts quantized
+WEIGHTS (5935 + 46), which is the population the widening applies to, not
+dequant EVENTS, which are per GEMM call and a property of the workload.
+`nemotron_h.cpp:205-206` now says that.
+
+### Carried forward — recorded, not repaired
+
+Two limits the review established, which belong in the record because neither is
+visible from the code or the counts:
+
+1. **The FP8 arm is weight-only on the host path.** `input_scale` is carried and
+   never applied, so it is NOT a bit-mirror of vLLM's W8A8 *static* GEMM, which
+   quantizes the activation with it. Nothing on the host path quantizes an
+   activation, so applying it here would scale the product by a factor upstream
+   applies to the OTHER operand. W6's device path is where the activation scale
+   becomes live, and where the mirror claim can be made.
+2. **The golden arm's reach is 3 prompts x 1 token.** That touches at most 78 of
+   the 128 experts per layer, never the dense `mlp` block (no released in-scope
+   checkpoint ships one), and never the MTP tower (deferred to W5). It is
+   evidence, not the token gate; W6 owns the token gate.
+
+### Re-gate evidence (the repair head)
+
+Local x86_64 CPU-only host (GNU 13.3, Ninja, `VLLM_CPP_CUDA=OFF`), disk recorded
+beside every number ([[enospc-makes-checkers-emit-false-policy-refusals]]).
+
+| Arm | Result | disk free |
+|---|---|---|
+| Release `-Werror`, clean full build | **exit 0, 0 `warning:` lines, 0 `No space left` lines** | 44G / 90% |
+| `test_nemotron_h_quantized_forms` (NEW) | **5/5 cases, 130/130 assertions, `Status: SUCCESS!`** | 44G |
+| `test_nemotron_h_loader`, `CHECKPOINT_ROOT` UNSET | **2/2, 7/7, `Status: SUCCESS!`**, "0 ran, 1 skipped, of 1" | 44G |
+| `-DVLLM_CPP_SANITIZE='address,undefined'`, the three Nemotron-H targets | build exit 0 / 0 warnings; `quantized_forms` 5/5 130/130, `loader` 2/2 7/7, `forward` 13/13 254/254, all `Status: SUCCESS!`, exit 0, **no sanitizer finding** | 41G |
+
+The live checkpoint gate was deliberately NOT re-run here: the operator runs it
+on GB10, and running it on a box already at 90% would risk an ENOSPC that leaves
+the previous binary in place.
 
 ## 7. Now
 

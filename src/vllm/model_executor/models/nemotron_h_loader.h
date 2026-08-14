@@ -36,7 +36,10 @@
 // ─── WHY THE QUANTIZED FORMS ARE KEPT, NOT DEQUANTIZED AT LOAD ───────────────
 //
 // Two reasons, and the first one is arithmetic. The 5888 routed-expert
-// projections are 29.4e9 parameters: 16.5 GiB packed, 58.7 GB at bf16. A
+// projections are 29.4e9 parameters: 16.5 GB packed (14.7 GB of nibbles at
+// 0.5 B/param plus 1.84 GB of group scales at 1 B per 16 — 15.4 GiB), against
+// 58.7 GB at bf16. Both figures are DECIMAL GB, and that unit is the point: the
+// same number written GiB is 7% wrong in the direction that flatters us. A
 // dequantize-at-load loader does not fit on any box this project owns, and on a
 // unified-memory box it takes the machine down rather than failing. The second
 // is the rule: a widened weight is numerically correct and invisible to a token
