@@ -27,6 +27,7 @@
 #include <doctest/doctest.h>
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -1361,6 +1362,86 @@ TEST_CASE("ltx2 docs/FEATURES.md never calls a REACHABLE refusal unrequestable")
   CHECK_MESSAGE(rows_examined == 1,
                 "expected exactly ONE LTX-2.5 'not requestable' row in docs/FEATURES.md, found "
                     << rows_examined);
+}
+
+// THE RETIREMENT NOTE'S OWN EVIDENCE, held to what upstream actually says.
+//
+// Retiring `kMultishot` rests on an ABSENCE claim about upstream, and the header
+// above the enum is where a porter reads it. That sentence shipped wrong: it said
+// the only `scene` hit upstream was PySceneDetect in the TRAINER. At
+// Lightricks/LTX-2 @ fd4ded7f `scene` has THREE senses, and the third —
+// prompt-writing guidance — lives in `ltx-core`, which ships at INFERENCE. So a
+// porter greps `scene`, finds "scene cuts" in a shipped prompt-enhancer prompt,
+// and concludes we missed a multi-shot path that our own header told them did not
+// exist. Third instance of #604 inside the row whose subject is retiring #604.
+//
+// The disposition did not move — it got STRONGER. Those prompts instruct the
+// enhancer NOT to describe scene cuts and to keep a "Single continuous take"
+// (gemma3_i2v:18, gemma3_t2v:24, gemma4_i2v:3), which is affirmative evidence
+// that no multi-shot generation mode exists.
+//
+// WHAT THIS CASE CAN AND CANNOT PROVE. It reads the shipped header and holds its
+// text, so the false sentence cannot come back and the true evidence cannot be
+// dropped. It CANNOT verify the upstream claim — no upstream checkout exists in
+// this tree — so the derivation, with the positive control in the same command,
+// lives in .agents/specs/ltx25-retire-dead-arms.md §1.1.
+TEST_CASE("ltx2 the kMultishot retirement note states the scene evidence correctly") {
+  std::ifstream in(LTX2_PIPELINE_HEADER_PATH);
+  REQUIRE_MESSAGE(in.good(), "cannot open " << LTX2_PIPELINE_HEADER_PATH);
+  std::stringstream buf;
+  buf << in.rdbuf();
+  const std::string header = buf.str();
+  REQUIRE(header.size() > 1000);
+
+  // The note is prose wrapped across comment lines, so every claim below is
+  // matched against a flattened copy: comment markers dropped, runs of whitespace
+  // collapsed to one space. Without this a reflow of the paragraph would silently
+  // turn every assertion vacuous.
+  std::string flat;
+  flat.reserve(header.size());
+  bool pending_space = false;
+  for (size_t i = 0; i < header.size(); ++i) {
+    const char c = header[i];
+    if (c == '/' && i + 1 < header.size() && header[i + 1] == '/') {
+      i += 1;
+      pending_space = true;
+      continue;
+    }
+    if (std::isspace(static_cast<unsigned char>(c)) != 0) {
+      pending_space = true;
+      continue;
+    }
+    if (pending_space && !flat.empty()) flat += ' ';
+    pending_space = false;
+    flat += c;
+  }
+
+  // ANTI-VACUOUS. Every assertion below is about ONE paragraph; if that paragraph
+  // is renamed or removed they all pass while proving nothing.
+  size_t notes = 0;
+  for (size_t at = flat.find("`kMultishot` — FABRICATED"); at != std::string::npos;
+       at = flat.find("`kMultishot` — FABRICATED", at + 1)) {
+    ++notes;
+  }
+  REQUIRE_MESSAGE(notes == 1,
+                  "expected exactly ONE `kMultishot` — FABRICATED retirement note in "
+                      << LTX2_PIPELINE_HEADER_PATH << ", found " << notes);
+
+  // The sentence that was false. It asserted an upstream absence from our own
+  // vocabulary, with no positive control, in a SHIPPED header.
+  CHECK_MESSAGE(flat.find("the only `scene` hit is PySceneDetect") == std::string::npos,
+                "the retired false claim is back: `scene` is not trainer-only upstream — "
+                "ltx-core's shipped gemma prompt files carry it, see "
+                ".agents/specs/ltx25-retire-dead-arms.md §1.1");
+  CHECK(flat.find("only `scene` hit") == std::string::npos);
+
+  // And the evidence that replaced it, by the three things a porter needs: that
+  // the narrative sense is PROMPT GUIDANCE, that it ships in `ltx-core` rather
+  // than only the trainer, and that the guidance FORBIDS scene cuts.
+  CHECK_MESSAGE(flat.find("scene cuts") != std::string::npos,
+                "the retirement note must name the prompt guidance it now rests on");
+  CHECK(flat.find("ltx-core") != std::string::npos);
+  CHECK(flat.find("system_prompt") != std::string::npos);
 }
 
 // ===========================================================================

@@ -10,11 +10,14 @@ Upstream pins:
 
 | Reference | Revision | Local checkout verified at |
 |---|---|---|
-| Lightricks/LTX-2 | `fd4ded7f2d88d3da713abcdd4ad41ecc4a9314ca` | `git rev-parse HEAD`, 2026-08-13 |
-| huggingface/diffusers | `3a2f35d4efa4c059c8bfb3bc0d6c906264895c81` | `git rev-parse HEAD`, 2026-08-13 |
+| Lightricks/LTX-2 | `fd4ded7f2d88d3da713abcdd4ad41ecc4a9314ca` | `git rev-parse HEAD`, 2026-08-13; re-verified 2026-08-14 |
+| huggingface/diffusers | `3a2f35d4efa4c059c8bfb3bc0d6c906264895c81` | `git rev-parse HEAD`, 2026-08-13; re-verified 2026-08-14 |
 
-Every anchor below was re-derived from those two checkouts by this row. A prior
-grounding pass reached the same conclusions; it is an input, not a result.
+Anchors here were derived from those two checkouts by this row. **Three of them
+were wrong and were found by review, not by the row** — see §7, which records
+what was not re-derived rather than claiming everything was. Where an ABSENCE is
+asserted, §1.1 carries the command and the control hits that prove the command
+ran; treat any absence in this file without that pairing as unverified.
 
 ## 0. What is wrong today
 
@@ -45,38 +48,93 @@ told nothing.
 ### 1.1 `multishot` — FABRICATED
 
 Searched as a **subject**, not as our own phrasing (the self-confirming-grep trap,
-#604):
+#604) — and **every absence below was re-derived on 2026-08-14 with a POSITIVE
+CONTROL in the same command**, after two of the claims in this section shipped
+false and a third was offered as exhaustive when it was not. A
+grep that returns nothing proves nothing on its own — the same command has to
+return the hits you know are there. The two commands, verbatim:
+
+```sh
+# LTX-2 @ fd4ded7f — `multishot` ABSENCE, controls `scene cuts` /
+# `single continuous take` / `DurationPredictor` in the SAME command.
+git grep -n -i -E 'multi[_ -]?shot|scene cuts|single continuous take|DurationPredictor'
+#   -> 0 lines matching multi[_ -]?shot, 22 control lines.
+# LTX-2 @ fd4ded7f — every `shot` FILE, control `DurationPredictor`.
+git grep -l -E '\bshots?\b'          # -> 7 files (see below)
+# LTX-2 @ fd4ded7f — `storyboard` ABSENCE, control `shot list` same command.
+git grep -n -i -E 'storyboard|shot list'   # -> 1 line, README.md:136, the control.
+# LTX-2 @ fd4ded7f — what the `multi` prefix actually attaches to.
+git grep -h -o -i -E 'multi[_ -]?(gpu|scale|stage|shot|clip|prompt|segment)' \
+  | sort | uniq -c | sort -rn
+#   -> 94 multigpu, 44 multi-GPU, 25 Multi-GPU, 4 MULTI_GPU, 2 multi-prompt.
+# diffusers @ 3a2f35d4 — same absence in the ltx2 pipelines package.
+git grep -n -i -E 'multi[_ -]?shot|scene cuts|hard cuts|single continuous take' \
+  -- src/diffusers/pipelines/ltx2/
+#   -> 0 lines matching multi[_ -]?shot, 4 control lines.
+```
 
 | Query | LTX-2 `fd4ded7f` | diffusers `3a2f35d4` |
 |---|---|---|
-| `multishot` / `multi_shot` / `multi-shot` (case-insensitive) | 0 hits | 0 hits |
-| `\bshots?\b` in `*.py` `*.md` `*.json` `*.yaml` | 5 files, none a generation mode | — |
-| `multi[_ -]?(gpu\|scale\|stage\|shot\|clip\|prompt\|segment)` | `multi-GPU` / `multi_gpu` only | — |
-| `scene` / `storyboard` | `ltx-trainer/scripts/split_scenes.py` (PySceneDetect, a **training-data** preprocessor) | — |
+| `multi[_ -]?shot` (case-insensitive) | 0 hits, alongside 22 control hits | 0 hits, alongside 4 control hits |
+| `\bshots?\b`, whole repository | **7 files**, none a generation mode | — |
+| `multi[_ -]?(gpu\|scale\|stage\|shot\|clip\|prompt\|segment)` | `multi[-_ ]?gpu` **167**, `multi-prompt` **2** — and nothing else | — |
+| `scene`, whole repository | **three senses, none a generation mode** — see §1.1a | only the prompt-guidance sense inside `pipelines/ltx2/` (`scene cuts` ×3, `scene opens` ×4) |
+| `storyboard` | 0 hits, alongside its control | 0 hits |
 
-The five `shot` files, with what the word means in each:
+An earlier revision of this table said the `multi` prefix attaches to
+`multi-GPU`/`multi_gpu` **only**. It does not: `multi-prompt` appears twice
+(`ltx-pipelines/utils/args.py:618`, "Helps multi-prompt enhance"; and
+`utils/denoisers.py:174`, "multi-prompt benchmark panels"). Both are *batching
+several captions through one run* — the enhancer's KV cache and a benchmark
+panel — not composing several takes into one output, so the conclusion is
+unaffected and the "only" was still wrong. Recorded rather than quietly
+corrected, for the same reason as everything else in this section.
+
+The **seven** `shot` files, with what the word means in each. An earlier revision
+of this list said five and presented that as exhaustive (review finding M1). The
+cause is recorded because it is reusable: that query was
+`\bshots?\b` **restricted to `*.py *.md *.json *.yaml`**, and upstream's prompt
+files are `.txt`. The filter, not the pattern, hid the answer — and it hid
+exactly the two files that matter most here, because they are the ones that ship
+at inference. Re-run without a path filter it is seven:
 
 - `ltx-core/duration_head/duration_head.py:1,5` — "predicts **shot** duration",
   i.e. the natural length of ONE camera take.
 - `ltx-core/duration_head/__init__.py:1` — same.
+- `ltx-core/text_encoders/gemma/encoders/prompts/gemma4_i2v_system_prompt.txt:13,14,17`
+  — camera **shot type** in the prompt-enhancer's instructions.
+- `ltx-core/text_encoders/gemma/encoders/prompts/gemma4_t2v_system_prompt.txt:11,12,15`
+  — same.
 - `ltx-pipelines/utils/blocks.py:804` — `DurationPredictor`, "Predicts **shot**
   duration (in frames)".
-- `ltx-trainer/src/ltx_trainer/captioning.py` — captioning prose.
+- `ltx-trainer/src/ltx_trainer/captioning.py:41,42,54,57` — captioning prose, for
+  describing an EXISTING video as training data.
 - `LTX-2/README.md:59,136` — an example prompt ("a medium close-up **shot**") and
   the prompting guide ("think like a cinematographer describing a **shot** list").
 
 Upstream's "shot" is a single continuous take. There is no multi-shot generation
 mode, and nothing that composes several takes into one output.
 
-diffusers says the same thing in its own vocabulary, which is the stronger check
-because the word is far more common there: every `shot` in
-`src/diffusers/pipelines/ltx2/` is a **camera shot type** in the prompt-enhancement
-guidance — `utils.py:217`, "Shot type (exactly one: extreme wide shot / wide shot
-/ medium shot / medium close-up / close-up / extreme close-up)" — or the duration
-head's own docstring, `duration_head.py:83`, "Predicts the natural duration of the
-**shot** implied by a caption". Its sixteen `ltx2/` modules are
-`pipeline_ltx2`, `_condition`, `_diffusion_decode`, `_hdr_lora`, `_ic_lora`,
-`_image2video`, `_latent_upsample`, plus the components. None is multi-shot.
+The nearest thing in either tree runs the other direction:
+`ltx-trainer/captioning.py:54` tells the CAPTIONER "the video contains multiple
+shots, describe each one in turn" — an instruction for describing an input video
+during dataset preparation, not for generating one. Named here so the next porter
+who greps `shots` does not have to re-derive that it is the trainer.
+
+**The `shot` claim, corrected on the diffusers side too.** This section used to
+call `utils.py:217` — "Shot type (exactly one: extreme wide shot / wide shot /
+medium shot / medium close-up / close-up / extreme close-up)" — the "stronger
+check" because it came from a second, independent reference. It is not
+independent: that sentence is **verbatim** LTX-2's own
+`gemma4_t2v_system_prompt.txt:12`, and `utils.py:251` is verbatim
+`gemma4_i2v_system_prompt.txt:14`. diffusers vendored Lightricks' gemma4 system
+prompts wholesale. It corroborates that upstream's `shot` is a camera shot type,
+and it does so at a second pin, but it is one source quoted twice, not two
+sources agreeing. diffusers' own contribution is the duration head's docstring,
+`duration_head.py:83`, "Predicts the natural duration of the **shot** implied by
+a caption", and its module list: `pipeline_ltx2`, `_condition`,
+`_diffusion_decode`, `_hdr_lora`, `_ic_lora`, `_image2video`, `_latent_upsample`,
+plus the components. None is multi-shot.
 
 `ltx-pipelines`' actual entry points, from `docs/pipelines.md` ("Full reference
 for all 11 pipelines") and the module list:
@@ -84,6 +142,47 @@ for all 11 pipelines") and the module list:
 `ti2vid_two_stages_mgpu`, `ti2vid_two_stages_hq_mgpu`, `distilled`,
 `distilled_mgpu`, `ic_lora`, `hdr_ic_lora`, `a2vid_two_stage`, `t2a_one_stage`,
 `dubit`, `retake`, `dfr_pipeline`, `keyframe_interpolation`. None is multi-shot.
+
+### 1.1a `scene` — three senses, and the one that was missed twice
+
+**This is the third #604 instance this row shipped, and the one that took three
+review rounds to find** (review finding B1). The header, this table and the PR
+body all said "the only `scene` hit is PySceneDetect in the TRAINER". That is
+false at `fd4ded7f`, and it was false in a SHIPPED header — the failure scenario
+being a porter who greps `scene`, finds "scene cuts" prohibited in an inference
+prompt, and concludes we missed a multi-shot path our own header denied.
+
+`scene` has three senses upstream, established by reading **every** hit of
+`git grep -n -i scene` — no path filter, since a path filter is what hid the
+`shot` answer above — rather than by grepping our own vocabulary. The anchors
+below are representative of each sense, not a transcript of every line; the
+command above is the transcript:
+
+| Sense | Where | Is it a generation mode? |
+|---|---|---|
+| `scene-linear` HDR colour (scene-referred light) | `ltx-core/color/hlg.py:1,5,44,74,93,256`, `ltx-core/hdr.py:29,132,146,162,171`, `ltx-pipelines/docs/hdr.md:15,16,34`, `utils/media_io/{color_config,encode,exr}.py`, `utils/args.py:813,861`, `ic_lora.py:422`, `retake.py:178`, `hdr_ic_lora.py:18`, `CHANGELOG.md:24` | no — colour science |
+| PySceneDetect splitting | `ltx-trainer/scripts/split_scenes.py`, `ltx-trainer/docs/*`, `ltx-trainer/pyproject.toml:28` (`scenedetect>=0.6.5.2`), `ltx-trainer/AGENTS.md:85`, `.claude/skills/train-model/**` | no — a **training-data** preprocessor, and the only CODE sense |
+| narrative prose, i.e. prompt-writing guidance | **`ltx-core`, which ships at INFERENCE**: `text_encoders/gemma/encoders/prompts/gemma3_i2v_system_prompt.txt:5,6,18,20`, `gemma3_t2v_system_prompt.txt:1,5,24,25`, `gemma4_i2v_system_prompt.txt:7,15,23,27`, `gemma4_t2v_system_prompt.txt:5,13,21,25`; plus `README.md:136` and `ltx-trainer/captioning.py:39` | no — instructions to the prompt enhancer |
+
+The third sense is the one the old sentence denied, and `README.md:136` is
+**the same line** the header cites two clauses earlier for "a cinematographer
+describing a shot list" — it reads "chronological descriptions of actions and
+scenes".
+
+**The disposition does not move; it is STRENGTHENED.** Read as a subject rather
+than as a keyword, the shipped enhancer prompts instruct the model *against*
+multi-shot output:
+
+- `gemma3_i2v_system_prompt.txt:6` — "Inaccurate descriptions may cause scene cuts."
+- `gemma3_i2v_system_prompt.txt:18`, `gemma3_t2v_system_prompt.txt:24` — "No
+  timestamps or cuts: DO NOT use timestamps or describe scene cuts unless
+  explicitly requested."
+- `gemma4_i2v_system_prompt.txt:3` — "**Single continuous take — no hard cuts.**"
+
+diffusers carries the same four lines (`utils.py:121,161,182,240`), because it
+vendored the same prompts. An upstream whose own prompt enhancer is told to
+produce one continuous take is affirmative evidence that no multi-shot generation
+mode exists — which is what `kMultishot` claimed to refuse.
 
 **Disposition: RETIRE.** This is a defect in our record, not a gap in our port.
 There is nothing to owe, so recording it as owed is the error. The enumerator is
@@ -94,8 +193,12 @@ no waiver registry").
 ### 1.2 `int8-convrot` — real absence, deliberately out of scope
 
 The inference quantization kinds LTX-2 defines, exhaustively
-(`ltx-pipelines/utils/quantization_factory.py:23-27`, a `str`-valued enum with an
-`assert_never` on the match):
+(`ltx-pipelines/utils/quantization_factory.py:22-26`, a `str`-valued enum with an
+`assert_never` at `:50`, the file's last line — re-derived 2026-08-14, review
+finding L1. The block quoted below starts at the `class` statement on `:22` and
+its four members are `:23-26`, which is the range the header comment and the
+shipped refusal message cite; `:23-27` was wrong at both ends and this spec was
+the last place still carrying it):
 
 ```python
 class QuantizationKind(str, Enum):
@@ -348,6 +451,14 @@ is a different row. Refusing is the cheap correct answer until then.
    reader anchors instead of writing them by hand (§2.1), and split the
    `docs/FEATURES.md` row so the public surface stops calling the two REACHABLE
    arms unrequestable (§1.6). No disposition changes.
+8. Added by the THIRD review round: correct the false `scene` absence in the
+   shipped header, in §1.1's table and in the PR body (§1.1a); correct the `shot`
+   enumeration from five files to seven and record the path filter that caused it
+   (§1.1); correct `quantization_factory.py:23-27` to `:22-26` (§1.2); replace
+   §7's "every claim in §1 was re-derived" with what actually happened; and gate
+   the header's retirement note with a RED-first case so the sentence cannot come
+   back. No disposition changes — the `scene` evidence strengthens the
+   `kMultishot` retirement rather than weakening it.
 
 **Out.**
 
@@ -413,6 +524,30 @@ Three more added by the review repair, each RED before its fix:
    one such LTX-2.5 row to exist, so renaming the row away fails it. **RED
    before**: both reachable arms found on `FEATURES.md:328`.
 
+One more added by the third review round:
+
+7. **`ltx2 the kMultishot retirement note states the scene evidence correctly`**
+   (new, `tests/vllm/models/test_ltx2_pipeline.cpp`). Reads
+   `include/vllm/model_executor/models/ltx2_pipeline.h` through a new
+   `LTX2_PIPELINE_HEADER_PATH` compile definition, flattens the comment block so a
+   reflow cannot make it vacuous, and requires the retired false sentence to be
+   absent and the replacement evidence — `scene cuts`, `ltx-core`,
+   `system_prompt` — to be present. Anti-vacuous: it first requires **exactly one**
+   ``kMultishot` — FABRICATED` note in the file, so deleting or renaming the
+   paragraph fails rather than passes. **RED before**: 4 of its 8 assertions
+   failed on `b718f580f` — `flat.find("the only \`scene\` hit is PySceneDetect")`
+   returned 29407 where npos was required, and `scene cuts` / `system_prompt`
+   both returned npos. **Anti-vacuity proven by mutation**: renaming the note's
+   marker in a staged copy gives `REQUIRE( 0 == 1 )`; the header was restored and
+   verified by sha256.
+
+   What it can and cannot prove is stated in the case's own comment: it holds the
+   header's TEXT, so the false sentence cannot return, but it cannot verify the
+   upstream claim — no upstream checkout exists in this tree. That verification is
+   §1.1's commands with their positive controls, run against the two pins, and it
+   is not automatable here. Saying so is better than a test that appears to gate
+   it and does not.
+
 ## 5. Risks
 
 | Risk | Mitigation |
@@ -432,11 +567,43 @@ Three more added by the review repair, each RED before its fix:
 
 ## 7. Outcome
 
-**Every claim in §1 was re-derived by this row against the two pinned checkouts;
-none was taken from the prior grounding pass.** Results:
+**Three of the claims in §1 were NOT re-derived, and three rounds of review found
+them one at a time.** The sentence that stood here said "every claim in §1 was
+re-derived"; it was written before the second and third rounds, and it was not
+true when it was written either. What actually happened:
 
-- `multishot`: **fabricated, confirmed.** 0 hits for the term in either reference;
-  the only upstream sense of "shot" is one camera take (§1.1). Retired.
+- Round 1 found the `hadamard` absence in §1.2 false, and the "int8 appears only
+  in the trainer" sentence false **in the shipped refusal message**.
+- Round 2 found nine reader anchors in §2.1 stale, cited in the file they were
+  wrong about.
+- Round 3 found `scene` asserted trainer-only **in the shipped header**, the
+  `shot` file list presented as exhaustive at five when it is seven, and a
+  `quantization_factory.py` range wrong at both ends. Re-deriving the rest of
+  §1.1's table in the same pass turned up a fourth: the `multi` prefix was
+  recorded as `multi-GPU`/`multi_gpu` **only**, and `multi-prompt` is there twice.
+  Nobody had asked about that row; it was wrong because the row had never been
+  re-run either.
+
+Every one of the three is the same defect: an absence asserted from our own
+vocabulary, with no positive control, and in two cases behind a path filter that
+excluded the files carrying the answer. **This row's stated purpose is retiring
+instances of [#604](https://github.com/mudler/vllm.cpp/issues/604), and it
+shipped three of them** — two of those into files a user or a porter reads. That
+self-record is worth more than the claim it replaces, because the claim was the
+mechanism: writing "every claim was re-derived" is what made the next reader stop
+checking. §1.1 now carries the commands with their positive controls inline, so
+the claim is reproducible instead of asserted, and
+`test_ltx2_pipeline`'s "the kMultishot retirement note states the scene evidence
+correctly" holds the header's text so the false sentence cannot come back.
+
+Results, as they now stand:
+
+- `multishot`: **fabricated, confirmed** — and the confirmation is now stronger
+  than the original. 0 hits for the term in either reference against 22 and 4
+  control hits in the same commands; the only upstream sense of "shot" is one
+  camera take across all seven files; and the shipped prompt-enhancer prompts
+  instruct the model to keep a "Single continuous take — no hard cuts"
+  (§1.1, §1.1a). Retired.
 - `int8-convrot`: **unreachable upstream, and the first wording of that was wrong.**
   Four inference quantization kinds exist and none is int8, and no rotation is
   exposed as one — but int8 is not trainer-only (a dead per-row int8 kernel lives
@@ -458,20 +625,35 @@ What this row deliberately did **not** do: construct a duration head. #611 stays
 open for that, with its user-visible half — silent substitution of the recipe
 default — closed.
 
-**The review's own finding, recorded because it is the point of the row.** Six
-findings came back and every one was evidence accuracy, not logic: a false absence
-inside the shipped refusal (§1.2), a false absence in this spec's §1.2 — the one
-search term that mattered — nine stale reader anchors cited in the file they were
-wrong about (§2.1), and a public-doc row that re-merged the split the ledger had
-just made. A row whose subject is #604 committed three instances of #604. That is
-not irony to note and move past; it is why the anchors are now derived rather than
-written, why the int8 absence is stated as UNREACHABLE with its dead kernel named,
-and why the `hadamard` search this spec got wrong is spelled out in full rather
-than quietly corrected.
+**The review's own findings, recorded because they are the point of the row.**
+Across three rounds every finding was evidence accuracy, not logic: a false
+absence inside the shipped refusal (§1.2), a false absence in this spec's §1.2 —
+the one search term that mattered — nine stale reader anchors cited in the file
+they were wrong about (§2.1), a public-doc row that re-merged the split the ledger
+had just made, a false absence inside the shipped HEADER (§1.1a), a five-item list
+offered as exhaustive when it is seven (§1.1), and a line range wrong at both ends
+(§1.2). A row whose subject is #604 committed three instances of #604, and each
+one survived at least one review that had already been told to look for exactly
+this. That is not irony to note and move past; it is why the anchors are now
+derived rather than written, why the int8 absence is stated as UNREACHABLE with
+its dead kernel named, why the `hadamard` search this spec got wrong is spelled
+out in full rather than quietly corrected, and why every absence in §1.1 now ships
+with the command that proves it AND the control hits that prove the command ran.
+
+The transferable lesson, in one line: **a path filter is an absence claim too.**
+The `shot` enumeration is the case where this is provable rather than inferred —
+the pattern `\bshots?\b` was right and the filter `*.py *.md *.json *.yaml` was
+wrong, over a tree whose prompt files are `.txt`, and it returns exactly the five
+files that were recorded. (The `scene` claim's original command was never written
+down, so why *it* missed `ltx-core` is not recoverable; that it was never
+reproduced is the point.) A grep that returns nothing has to be re-run without its
+narrowing, and with a control, before it is written down as an absence.
 
 ## Now
 
 Row `LTX25-RETIRE-DEAD-ARMS` is `DONE`. The ledger carries five entries, split by
 kind; `duration_head_path` is refused by name with a RED-first test; the
-`kKnownLoadExtras` inventory is recorded in §2.1. `.agents/specs/ltx-2-5.md` §2
-"Out" still lists `multishot` and is the operator's to correct, citing §1.1 here.
+`kKnownLoadExtras` inventory is recorded in §2.1; the header's `kMultishot`
+retirement note is gated by `test_ltx2_pipeline` against the false `scene`
+absence it shipped (§1.1a). `.agents/specs/ltx-2-5.md` §2 "Out" still lists
+`multishot` and is the operator's to correct, citing §1.1 here.

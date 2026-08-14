@@ -600,9 +600,23 @@ Ltx2PipelineRecipe ResolveLtx2PipelineRecipe(const std::string& pipeline_kind,
 //   exists in Lightricks/LTX-2 @ fd4ded7f or huggingface/diffusers @ 3a2f35d4.
 //   Searched as a SUBJECT rather than by our own phrasing: upstream's only sense
 //   of "shot" is ONE camera take (duration_head.py:1,5 "predicts shot duration";
-//   README.md:136 "a cinematographer describing a shot list"), and the only
-//   `scene` hit is PySceneDetect in the TRAINER. A defect in our record is not a
-//   gap in our port, so there was nothing to owe.
+//   README.md:136 "a cinematographer describing a shot list"). `scene` has THREE
+//   senses upstream and none is a generation mode: `scene-linear` HDR colour
+//   (ltx-core color/hlg.py, hdr.py), PySceneDetect in the TRAINER — the only CODE
+//   sense — and prompt-writing guidance, which ships at INFERENCE inside
+//   `ltx-core`, in text_encoders/gemma/encoders/prompts/ as
+//   gemma{3,4}_{i2v,t2v}_system_prompt.txt. That third sense is why the
+//   retirement HOLDS rather than being undermined: those prompts tell the
+//   enhancer NOT to describe scene cuts and to keep a "Single continuous take"
+//   (gemma3_i2v:6,18, gemma3_t2v:24, gemma4_i2v:3). A defect in our record is not
+//   a gap in our port, so there was nothing to owe.
+//
+//   Recorded because it is the row's own subject: this paragraph used to claim
+//   that `scene` appeared upstream ONLY as PySceneDetect in the trainer. It was
+//   an absence asserted from our own vocabulary with no positive control — #604 —
+//   shipped in the header of the row that exists to retire #604 instances, and it
+//   took a third review round to find. The derivation, with its positive control
+//   in the same command, is .agents/specs/ltx25-retire-dead-arms.md §1.1.
 //
 //   `kVideoEngineWiring` — LANDED. It said the end-to-end composition through
 //   `vllm::multimodal::VideoEngine` "is phase L7, not L5"; L7 shipped in

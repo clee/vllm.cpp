@@ -1698,6 +1698,17 @@ in particular is a ComfyUI-ecosystem format: upstream LTX-2's own inference
 quantization kinds are `fp8-cast`, `fp8-scaled-mm`, `nvfp4-cast` and
 `nvfp4-prequant`, and nothing wired upstream reaches int8 at all.
 
+What is **not** on that list, and why: **multi-shot or multi-scene generation.**
+A request that composes several camera takes into one output has no flag here
+because upstream LTX-2 has no such mode to mirror — its `shot` is one continuous
+take, and its own prompt-enhancement prompts instruct the model to keep a "single
+continuous take" and not to describe scene cuts. `scene` does appear across the
+upstream tree, in three unrelated senses (`scene-linear` HDR colour, PySceneDetect
+in the trainer's dataset preprocessor, and that prompt-writing guidance); none of
+them is a generation mode. This port carried a `multishot` refusal until
+2026-08-13, which was a defect in our own record rather than a gap, and it was
+retired. Generate one take per request.
+
 `prompt_embeds_valid_rows` is how many of the supplied conditioning rows are real
 tokens; absent, every row is. It matters because the embeddings connector
 substitutes its learnable register table at PADDED positions, so padding decides

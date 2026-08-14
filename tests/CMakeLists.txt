@@ -189,8 +189,12 @@ target_include_directories(test_ltx2_pipeline PRIVATE ${CMAKE_CURRENT_SOURCE_DIR
 # docs/FEATURES.md is where that distinction reaches a user. It had re-merged the two
 # into one "Declared, not requestable" row, so the public surface contradicted the
 # ledger it projects; the case below reads the doc and holds it to the split.
+# The ledger's RETIREMENT note carries an absence claim about upstream, and it
+# shipped false twice in the same header. The case that guards it reads the header
+# itself rather than a copy of the sentence kept in the test.
 target_compile_definitions(test_ltx2_pipeline PRIVATE
-  VLLM_CPP_FEATURES_DOC_PATH="${CMAKE_SOURCE_DIR}/docs/FEATURES.md")
+  VLLM_CPP_FEATURES_DOC_PATH="${CMAKE_SOURCE_DIR}/docs/FEATURES.md"
+  LTX2_PIPELINE_HEADER_PATH="${CMAKE_SOURCE_DIR}/include/vllm/model_executor/models/ltx2_pipeline.h")
 # LTX-2.5 L6: the quantized loaders, gated three ways — the SHIPPED checkpoints'
 # own manifests, a few hundred of their own bytes against torch, and synthetic
 # files for whole-model materialization. All three .inc files live beside the
