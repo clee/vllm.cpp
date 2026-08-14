@@ -248,7 +248,7 @@ had to change: `patchify_proj.weight` is NVFP4-**packed**, half its logical
 width, so `load_state_dict` raises on it and the state dict must be filtered to
 the unpacked parameters first — `scale_shift_table` is the neighbour that
 actually materialises. And the load needs upstream's own
-`LTXV_MODEL_COMFY_RENAMING_MAP` (`model_configurator.py:221-225`); without it
+`LTXV_MODEL_COMFY_RENAMING_MAP` (`model_configurator.py:222-226`); without it
 every key keeps its `model.diffusion_model.` prefix, nothing matches, and the
 probe reports "still on meta" for the WHOLE model — an instrument that agrees
 with the conclusion for the wrong reason.

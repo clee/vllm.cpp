@@ -167,7 +167,7 @@ def probe_meta_load(path: Path, facts: dict) -> None:
 
     # `StateDict` is upstream's immutable wrapper (loader/primitives.py:25-38);
     # `.sd` is the plain dict `load_state_dict` consumes. The SDOps is upstream's
-    # own key rewrite (model_configurator.py:221-225) — without it EVERY key keeps
+    # own key rewrite (model_configurator.py:222-226) — without it EVERY key keeps
     # its `model.diffusion_model.` prefix, nothing matches, and the control below
     # would report "still on meta" for the whole model. That is the shape of a
     # broken instrument agreeing with the conclusion.

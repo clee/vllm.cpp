@@ -832,7 +832,7 @@ PreparedStreamDev PrepareStreamDev(Ctx& c, const Ltx2LinearWeight& patchify,
     VT_CHECK(keyframes_embedding->dtype == out.x->t().dtype,
              "ltx2: keyframes_abs_pos_embedding is staged at a different dtype from the video "
              "stream; upstream casts the embedding to hidden_states.dtype and never widens it");
-    // vt::Add's ROW-BROADCAST shape is rank-1 [D] (ops.h:1886-1888), which is
+    // vt::Add's ROW-BROADCAST shape is rank-1 [D] (ops.h:1887-1889), which is
     // exactly `mask * embedding` over a run of MARKED rows. Walking contiguous
     // runs keeps the general mask exact while the first-frame rule — a prefix
     // (tools.py:194-195) — costs a single call.
