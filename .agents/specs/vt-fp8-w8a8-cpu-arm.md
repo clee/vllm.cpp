@@ -227,7 +227,20 @@ Base SHA `b1cd4d8f6bb7ec5f0bd923a75dcc140becc7fdd8`.
 | G3 fp8 GEMM vs lossy `double` reference | **PASS** |
 
 `test_ops_fp8_cpu`: 4 cases / 56 assertions / `Status: SUCCESS!`.
-`test_fused_chain_additivity`: 1 case / **25** assertions (was 19), `SUCCESS!`.
+`test_fused_chain_additivity`: 1 case / **25** assertions (was **21**), `SUCCESS!`.
+
+**The three replaced assertions are a FORCED consequence, and it is measured, not
+argued.** Checking out the BASE version of that test (the one carrying the three
+`CHECK_THROWS`) and running it against the new registrations gives
+`test cases: 1 | 0 passed | 1 failed`, `assertions: 21 | 18 passed | 3 failed`,
+`Status: FAILURE!` — exactly three failures, which are exactly the three
+`CHECK_THROWS`, with the other 18 assertions untouched. The registration makes
+those three claims false; it does not make them optional. They were replaced by
+the stronger byte-exact form, not deleted.
+
+(The implementation commit message says "19 -> 25". That arithmetic was wrong;
+the measured base count is 21. Corrected here rather than by rewriting pushed
+history.)
 
 ### Mutations — all applied ALONE to a restored tree, compiler exit recorded
 
@@ -241,6 +254,9 @@ Base SHA `b1cd4d8f6bb7ec5f0bd923a75dcc140becc7fdd8`.
 | M5a | kernel ignores `alpha` | 0 | 4 \| 3 \| **1 failed** | 56 \| 53 \| **3 failed** | **FAILURE!** |
 | M5b | caller folds `weight_scale` only | 0 | 4 \| 3 \| **1 failed** | 56 \| 53 \| **3 failed** | **FAILURE!** |
 | — | restored (green-after) | 0 | 4 \| **4 passed** \| 0 | 56 \| **56** \| 0 | **SUCCESS!** |
+
+Re-run in full on the post-merge tree (merge of `origin/main` @ `5da1d7f2f`):
+identical results, every row, and the restored tree green at 56/56.
 
 M0's assertion count DROPS to 6 rather than staying at 56 — a changed case count
 is signal, and it is why `Status:` is read alongside `assertions:`.
