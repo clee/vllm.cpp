@@ -1667,10 +1667,18 @@ supports the unquantized case (hard-coding the FP8 companions there enumerated
 `LoadFp8` unconditionally, so such a checkpoint refused with `'…in_proj.weight'
 ships dtype BF16, not the F8_E4M3 its scheme declares` — a DTYPE message for
 what is really the declared scheme. Repaired by branching, exactly as
-`LoadExpert`/`LoadMlp` and the enumeration do. **Still owed on that arm and named
-here rather than left to be found:** `mamba_proj_bias` is enumerated
-(`in_proj.bias`/`out_proj.bias`) and has no host slot, so a checkpoint that sets
-it refuses through the accounting path; the released one sets it false.
+`LoadExpert`/`LoadMlp` and the enumeration do.
+
+**That arm is REACHABLE and consistent with its enumeration, and it is NOT
+GATED — recorded here rather than left to be found.** No released bf16
+NemotronH checkpoint is within this project's reach and no synthetic one exists,
+so the branch is argued from the enumeration (`ClaimFp8`'s own `quantized`
+gate) rather than measured. Two things are owed with it: a checkpoint or
+synthetic fixture that executes it, and `mamba_proj_bias`, which is enumerated
+(`in_proj.bias`/`out_proj.bias`) with no host slot, so a checkpoint that sets it
+still refuses through the accounting path. The released checkpoint sets it
+false. `docs/FEATURES.md` deliberately does NOT claim the unquantized arm: an
+ungated branch is visible debt, not a supported surface.
 
 **L2 — stale scope statements.** Both
 `tests/vllm/models/test_nemotron_h_loader.cpp:36` ("It consumes no golden…") and
@@ -1708,6 +1716,54 @@ visible from the code or the counts:
    checkpoint ships one), and never the MTP tower (deferred to W5). It is
    evidence, not the token gate; W6 owns the token gate.
 
+### A merge that was CLEAN and did not BUILD the behaviour either side had (#818)
+
+Found by re-running the full gate after merging `origin/main` — not by reading
+the diff, which showed no conflict at all because the two changes touch
+different files.
+
+`#784` (`b1cd4d8f6`, part of #730) rewrote `test_nemotron_h_scaffold`'s refusal
+subcase to call the REAL `reg.factory->load_weights(reg, config, source)`
+instead of downcasting a fabricated `struct StubModel : vllm::LoadedModel`.
+UBSan was right about the stub, and the rewrite is correct **on `main`**, where
+`LoadNemotronHForCausalLM` reads only `source.kind` and never touches
+`source.safetensors`. §6d then gave NemotronH a loader that refuses an empty
+source BY NAME. Merged, #784's `ModelSource source; source.kind =
+kSafetensors;` hits exactly that refusal and the subcase THREW before ever
+reaching the forward:
+
+```
+test_nemotron_h_scaffold.cpp:666: ERROR: test case THREW exception:
+  Model architecture NemotronHForCausalLM: the safetensors source carries no shards
+```
+
+Neither parent is red. This is [[merge-tree-clean-is-not-builds]], and it is
+repaired here because here is where the two sides meet. The subcase is SPLIT
+rather than either side's guarantee deleted:
+
+- an empty safetensors source REFUSES AT LOAD, by name (`NemotronHForCausalLM`,
+  `carries no shards`). The guarantee moved EARLIER and is asserted where it now
+  lives, which is a stronger claim than the one it replaces;
+- the forward still refuses on unmaterialized weights, reached through the
+  exported `vllm::NemotronHForward` on a default-constructed
+  `NemotronHHostWeights`. That state is no longer reachable through the factory
+  at all now that the loader exists — `load_weights` either materializes or
+  refuses — so it is asserted on a REAL `NemotronHHostWeights`. #784's substance
+  is kept in full: no `StubModel`, no downcast onto an object that never was a
+  `NemotronHLoadedModel`, no UB.
+
+Both halves are ARMED, not decorative. Compile exit and binary sha printed
+beside each, and the two binaries differ:
+
+| Mutation | BUILD_EXIT | binary sha | Result |
+|---|---|---|---|
+| the `carries no shards` refusal replaced by `return model;` | 0 | `4e6cdbd93478` | **`Status: FAILURE!`**, 11 of 12 cases, 2 of 38289 assertions failed |
+| `VT_CHECK(host.materialized, …)` neutralized to `VT_CHECK(true, …)` | 0 | `84179116c90c` | **`Status: FAILURE!`**, 11 of 12 cases, 2 of 38289 assertions failed |
+
+The suite goes from 38285 assertions to **38289** — the split adds four, and the
+case count stays 12, which is the number to watch: a changed CASE count is
+signal ([[doctest-assertions-line-hides-thrown-cases]]).
+
 ### Re-gate evidence (the repair head)
 
 Local x86_64 CPU-only host (GNU 13.3, Ninja, `VLLM_CPP_CUDA=OFF`), disk recorded
@@ -1715,14 +1771,27 @@ beside every number ([[enospc-makes-checkers-emit-false-policy-refusals]]).
 
 | Arm | Result | disk free |
 |---|---|---|
-| Release `-Werror`, clean full build | **exit 0, 0 `warning:` lines, 0 `No space left` lines** | 44G / 90% |
-| `test_nemotron_h_quantized_forms` (NEW) | **5/5 cases, 130/130 assertions, `Status: SUCCESS!`** | 44G |
-| `test_nemotron_h_loader`, `CHECKPOINT_ROOT` UNSET | **2/2, 7/7, `Status: SUCCESS!`**, "0 ran, 1 skipped, of 1" | 44G |
+| Release `-Werror`, **clean full build from an empty tree**, at the merged head | **`BUILD_EXIT=0`, 0 `warning:` lines, 0 `error:` lines, 0 `No space left` lines** | 44G / 90% |
+| full `ctest -j4`, 469 tests | **468 passed, 1 failed** in 798 s. The one failure is `test_nemotron_h_scaffold` = the merge-induced #818 above, repaired after this run. Skipped: `test_modelopt_mixed_precision_checkpoint`, `test_voxtral_e2e`. **`test_op_parity` PASSED** — the `main`-inherited red (#755/#672) is gone at this merge base | 23G / 95% |
+| `test_nemotron_h_scaffold` (after the #818 repair) | **12/12 cases, 38289/38289 assertions, `Status: SUCCESS!`** | 23G |
+| `test_nemotron_h_forward` | **13/13, 254/254, `Status: SUCCESS!`** — identical to W4's | 23G |
+| `test_nemotron_h_loader`, `CHECKPOINT_ROOT` UNSET | **2/2, 7/7, `Status: SUCCESS!`**, logs "0 ran, 1 skipped, of 1" | 23G |
+| `test_nemotron_h_quantized_forms` (NEW) | **5/5, 134/134, `Status: SUCCESS!`** | 23G |
+| `ctest -R '^test_nemotron_h'` after the repair | **4 of 4 passed** | 23G |
 | `-DVLLM_CPP_SANITIZE='address,undefined'`, the three Nemotron-H targets | build exit 0 / 0 warnings; `quantized_forms` 5/5 130/130, `loader` 2/2 7/7, `forward` 13/13 254/254, all `Status: SUCCESS!`, exit 0, **no sanitizer finding** | 41G |
+| `scripts/agent-preflight.sh --staged` | all gates OK except `test_cpu_x86_llamacpp_floor`, which is ENVIRONMENTAL and base-inherited: it reproduces on the SHARED CHECKOUT at `main` with `NO_QUIET_WINDOW after 30s (busy=102% load=62.28 88.03 93.73)` on a box at load average 91-130 ([[cpu-x86-floor-test-reds-under-box-load]]) | — |
+
+The three test TUs edited after the clean full build (`test_nemotron_h_scaffold`,
+`test_nemotron_h_loader`, `test_nemotron_h_quantized_forms`) are leaf `.cpp`
+files with no dependents, and each was recompiled from source afterwards at
+`-Werror` with 0 warnings — a TU is compiled whole or not at all, so that is a
+clean compile of each, not an incremental one. No header changed after the clean
+build.
 
 The live checkpoint gate was deliberately NOT re-run here: the operator runs it
-on GB10, and running it on a box already at 90% would risk an ENOSPC that leaves
-the previous binary in place.
+on GB10, and this box finished the run at **95% full**, where an ENOSPC leaves
+the PREVIOUS binary in place and prints a green status
+([[stale-binary-prints-green-status]], [[enospc-makes-checkers-emit-false-policy-refusals]]).
 
 ## 7. Now
 

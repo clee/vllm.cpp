@@ -94,7 +94,8 @@ double RefF8E4M3(uint8_t byte) {
   const int sign = (byte & 0x80U) != 0 ? -1 : 1;
   const int exp = static_cast<int>((byte >> 3) & 0x0FU);
   const int man = static_cast<int>(byte & 0x07U);
-  if (exp == 0) return sign * (man / 8.0) * 0.0078125;  // 2^-6 subnormal step
+  // Subnormal: (m/8) * 2^(1-bias) = (m/8) * 2^-6. Normal: (1 + m/8) * 2^(e-7).
+  if (exp == 0) return sign * (man / 8.0) * std::ldexp(1.0, -6);
   return sign * (1.0 + man / 8.0) * std::ldexp(1.0, exp - 7);
 }
 
@@ -260,6 +261,13 @@ TEST_CASE("NemotronH quantized forms: the independent reference is anchored by h
   CHECK(RefF8E4M3(0x30) == doctest::Approx(0.5));   // 0 0110 000 -> 2^-1
   CHECK(RefF8E4M3(0xB8) == doctest::Approx(-1.0));  // sign bit set
   CHECK(RefF8E4M3(0x00) == doctest::Approx(0.0));
+  // Subnormals (exponent field 0), which no fixture below reaches — anchored so
+  // the reference is right rather than merely unexercised. 0x01 = (1/8)*2^-6.
+  CHECK(RefF8E4M3(0x01) == doctest::Approx(0.001953125));
+  CHECK(RefF8E4M3(0x07) == doctest::Approx(0.013671875));  // the largest subnormal
+  CHECK(RefF8E4M3(0x08) == doctest::Approx(0.015625));     // the smallest normal
+  // ...and the subnormal ladder is monotone into the normals.
+  CHECK(RefF8E4M3(0x07) < RefF8E4M3(0x08));
 
   // E2M1: {0, .5, 1, 1.5, 2, 3, 4, 6}, sign in bit 3.
   CHECK(RefE2M1(0x0) == doctest::Approx(0.0));

@@ -391,6 +391,11 @@ TEST_CASE("NemotronH: the REAL checkpoint loads and the forward produces logits"
 // suite always states what it did: with the checkpoint present it reports every
 // case RAN, and without it every case SKIPPED, with the reason. Neither is
 // `Passed 0.00 sec` with nothing on the record.
+//
+// It presumes the WHOLE TU ran, which is how ctest invokes this binary. Running
+// it alone under `--test-case=` deliberately FAILS: "no verdict recorded" is
+// exactly the state it exists to refuse, and making it pass in that case would
+// hand back the vacuous green it was written to remove.
 TEST_CASE("NemotronH loader: every checkpoint-gated case reached exactly one verdict") {
   const std::set<std::string>& declared = CheckpointGatedCases();
   CHECK(Verdicts().size() == declared.size());
