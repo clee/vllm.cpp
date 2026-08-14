@@ -815,6 +815,12 @@ PreparedStreamDev PrepareStreamDev(Ctx& c, const Ltx2LinearWeight& patchify,
            "keyframes_embedding_provider; :314 gives the video one). Refusing rather than "
            "rendering without a trained term.");
   if (keyframes_embedding != nullptr && m.keyframes_mask != nullptr) {
+    // Same pairing the host arm asserts: a declared flag and an unbound view
+    // cannot disagree, because together they ARE
+    // `supports_keyframes_abs_pos_embedding` (model.py:166-173). `CheckResident`
+    // deliberately no-ops on an unbound view, so it does not cover this.
+    VT_CHECK(keyframes_embedding->data != nullptr,
+             "ltx2: use_keyframes_abs_pos_embedding is set but the staged weight view is unbound");
     VT_CHECK(keyframes_embedding->rank == 2 && keyframes_embedding->shape[0] == 1 &&
                  keyframes_embedding->shape[1] == width,
              "ltx2: keyframes_abs_pos_embedding must be [1, stream width] (model.py:217-219)");

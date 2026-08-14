@@ -1269,6 +1269,24 @@ TEST_CASE("ltx2 keyframes: a marker with no parameter is REFUSED, not silently d
     m.video.keyframes_mask = vmask.data();
     CHECK_THROWS(Ltx2DitForward(Cpu(), p, set.weights, &m.video, &m.audio, vt::DType::kF32));
   }
+
+  SUBCASE("the flag set with the view UNBOUND, which is not a zero bias") {
+    // The pairing IS `supports_keyframes_abs_pos_embedding` (model.py:166-173):
+    // a config that says the parameter exists and a weight map that does not
+    // carry it cannot both be believed. A default-constructed `vt::Tensor` here
+    // would read as a zero-length bias — no bias at all — on a model whose
+    // config says it has one.
+    const Ltx2DitParams p = ReducedParamsKeyframes(Ltx2RopeType::kSplit, false);
+    WeightSet set = BuildWeights(p);
+    Modalities m;
+    BuildModalities(&m, false);
+    m.video.keyframes_mask = vmask.data();
+    // Bound is fine — the positive control for the swap below.
+    REQUIRE(set.weights.keyframes_abs_pos_embedding.data != nullptr);
+    CHECK_NOTHROW(Ltx2DitForward(Cpu(), p, set.weights, &m.video, &m.audio, vt::DType::kF32));
+    set.weights.keyframes_abs_pos_embedding = vt::Tensor{};
+    CHECK_THROWS(Ltx2DitForward(Cpu(), p, set.weights, &m.video, &m.audio, vt::DType::kF32));
+  }
 }
 
 // THE MEMORY-FORMAT CHECK. Upstream casts BOTH operands to `hidden_states.dtype`

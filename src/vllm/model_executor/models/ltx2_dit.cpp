@@ -539,6 +539,15 @@ PreparedStream PrepareStream(vt::Device device, const Ltx2DitParams& params,
     // `Ltx2WidenDitToF32` brings it to f32, so reading `Ptr<float>()` off an
     // unwidened view would consume two bf16 lanes per float — finite, plausible,
     // and invisible to any output check.
+    // BOUND, not merely declared. `BindLtx2DitWeights` binds this whenever the
+    // flag resolves true and throws by name when the map lacks it, so an unbound
+    // view here means a caller assembled `Ltx2DitWeights` itself and forgot one —
+    // and a default-constructed `vt::Tensor` would read as a zero-length bias,
+    // i.e. no bias at all, on a model whose config says it has one.
+    VT_CHECK(keyframes_embedding->data != nullptr,
+             "ltx2: use_keyframes_abs_pos_embedding is set but the weight view is unbound; "
+             "upstream's `supports_keyframes_abs_pos_embedding` (model.py:166-173) is exactly "
+             "the pair of these two facts and they cannot disagree");
     VT_CHECK(keyframes_embedding->dtype == vt::DType::kF32,
              "ltx2: keyframes_abs_pos_embedding must be f32 on the L2 forward, which computes in "
              "f32 throughout; a bf16 view read as f32 would silently halve its length");
