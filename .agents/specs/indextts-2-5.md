@@ -279,6 +279,38 @@ Neither network is ported, and neither is one this tree already has. The lesson
 is the one this campaign keeps re-learning: an architecture name settles what a
 *model* costs, and settles nothing about what a *checkpoint* contains.
 
+### Loading them: convert offline, never read pickle in the engine
+
+Upstream ships `.pth`, which is a ZIP around a Python pickle. This tree has no
+torch-pickle reader, and deliberately does not grow one. Pickle executes
+arbitrary code by construction, so a reader in the engine would run a
+attacker-controllable program inside the process that serves users, and every
+other lane here already loads safetensors or GGUF.
+
+So the conversion is OFFLINE and once:
+`scripts/convert-indextts2-checkpoint.py` flattens the nested state dicts with
+'.' -- which is exactly the naming the manifest above records, so the converted
+names ARE the manifest's names and the manifest checks the conversion -- and
+writes safetensors the existing reader can open. Measured on the shipped
+checkpoint:
+
+| Source | Tensors kept | Dropped | .pth | .safetensors |
+|---|---|---|---|---|
+| `gpt.pth` | 456 | 0 | 3108.60 MiB | 3108.45 MiB |
+| `codec.pth` | 243 | **729** | 579.16 MiB | **192.99 MiB** |
+| `s2mel.pth` | 284 | 0 | 395.69 MiB | 395.63 MiB |
+
+`codec.pth` is **75% optimizer state**: 729 of its 972 tensors are training
+residue, and dropping them takes the file from 579 MiB to 193 MiB. That is
+dropped loudly, with a count, and the drop prefix is gated from both sides --
+every optimizer key must match it, and no weight in `gpt.pth` or `s2mel.pth` may.
+
+The conversion needs torch and 4 GiB of weights, so CI cannot run it.
+`tests/scripts/test_indextts2_convert.py` holds the part where a silent mistake
+would be unrecoverable -- which tensors survive, under which names -- with fakes
+and no torch, because a dropped weight looks exactly like a weight that was
+never there.
+
 ### What the three .pth checkpoints actually hold
 
 `gpt.pth`, `codec.pth` and `s2mel.pth` are torch ZIPs: one small pickle names
@@ -301,10 +333,10 @@ they pass over a smaller network than the checkpoint holds:
 
 | Where | Unported | Note |
 |---|---|---|
-| `s2mel.pth` `net.cfm.estimator` | `wavenet.*` | A WaveNet conditioning stack inside the CFM estimator. Absent from the port map entirely |
-| same | `skip_linear`, `layers.N.skip_in_linear` | U-Net skip connections across DiT depth. Our `dit::Block` carries both residuals but no skip-in |
-| same | `t_embedder2` | A SECOND timestep embedder. `cfm::TimestepFeatures` modeled one |
-| same | `cond_embedder`, `content_mask_embedder`, `cond_projection`, `cond_x_merge_linear`, `res_projection`, `conv1`, `conv2` | The conditioning front end |
+| ~~`s2mel.pth` `net.cfm.estimator`~~ | ~~`wavenet.*`~~ | **PORTED** in `wavenet.cpp`, gated against upstream `WN` at reduced dims (3 cases / 133 assertions, 6 mutations caught). Not a conditioning stack but the DiT's FINAL LAYER: the config sets `final_layer_type: wavenet`, which is also what `t_embedder2`, `conv1` and `conv2` belong to |
+| ~~same~~ | ~~`skip_linear`, `layers.N.skip_in_linear`~~ | BOTH **PORTED**: the long skip in `dit_tail.cpp`, the per-layer U-Net skip in `dit_skip.cpp`. The routing was RECORDED from upstream's own Transformer rather than read off the formula (`scripts/gen-dit-skip-schedule.py`): at the shipped depth 13, layers 0-5 emit, 7-12 receive LIFO so layer 7 takes layer 5's output, and layer 6 does neither. At EVEN depth there is one more emitter than receiver and the earliest skip is never consumed; we report that rather than correct it |
+| ~~same~~ | ~~`t_embedder2`, `conv1`, `conv2`~~ | **PORTED** in `dit_tail.cpp` together with `skip_linear`, `res_projection` and `final_layer`, gated against upstream's own DiT modules end to end (4 cases, 6 mutations caught). Note the coupling upstream hides by setting both to 512: `final_layer` is sized at the WAVENET width but conditioned on `t1` at the DiT width, so the two must be equal. We refuse unequal widths by name |
+| ~~same~~ | ~~`cond_projection`, `cond_x_merge_linear`~~; `content_mask_embedder` | **PORTED** in `dit_front.cpp`, both the conditional and the CFG unconditional branch. **`cond_embedder` is DEAD in 2.5**: upstream forces `cond_in_module = cond_projection` and the `content_type` switch that would have selected it is commented out, so the tensor ships and is never read. A port that restored the switch would read a tensor this model does not use |
 | `s2mel.pth` `net.length_regulator` | `mask_token`, `embedding`, `content_in_proj` | Our `lenreg` port has the interpolate/GroupNorm/Mish stack and none of these |
 | `s2mel.pth` | `net.gpt_layer` | Three weight/bias pairs; unmodeled and unexplained |
 | `codec.pth` | `model.encoder.*`, `model.down`, `model.up` | Only the quantizer (`fvq`) and the Vocos-shaped decoder are ported |
@@ -320,6 +352,50 @@ render needs.
 The full manifest is 22 files: `gpt.pth`, `codec.pth`, `s2mel.pth`,
 `wav2vec2bert_stats.pt`, `feat1.pt`, `feat2.pt`, the tiktoken vocabulary, the
 Qwen emotion directory, and `config.yaml`.
+
+### The reference-audio path, read from the running code
+
+`infer_v2_5.py:280-295` and `:630`. Three facts here each produce a model that
+runs and sounds wrong, and none is visible from the architecture:
+
+**The features come from HIDDEN STATE 17, not the final layer.**
+`get_emb` takes `vq_emb.hidden_states[17]` out of `Wav2Vec2BertModel`. A port
+that used the encoder's output would get features of the right shape from the
+right model, conditioned on the wrong representation. Our `w2vbert::EncoderStack`
+returns the final state, so consuming it for this path needs an intermediate tap.
+
+**They are then normalized by STORED statistics**, not per-utterance ones:
+`feat = (feat - semantic_mean) / semantic_std`, where both come from
+`wav2vec2bert_stats.pt` in the checkpoint (`w2v_stat` in `config.yaml`). Using
+per-utterance statistics is the natural assumption and is wrong.
+
+**The feature extractor is KALDI-style, and this tree's existing one is not.**
+`SeamlessM4TFeatureExtractor` is fully specified by
+`transformers/models/seamless_m4t/feature_extraction_seamless_m4t.py`:
+
+| Parameter | Value |
+|---|---|
+| pre-scale | waveform x 2^15 (Kaldi expects 16-bit integers) |
+| window | `povey`, non-periodic, length 400 |
+| frame / hop / FFT | 400 / 160 / 512 |
+| preemphasis | 0.97, with `remove_dc_offset` |
+| power, log | 2.0, `log`, `mel_floor` 1.192092955078125e-07 |
+| mel bins | 80, then a **stride-2 stack** giving 160 columns |
+
+Measured: 4000 samples at 16 kHz produce 12 frames of 160.
+
+That differs from `Ltx2WaveformToLogMel`, which is the Slaney/torchaudio kind
+with no preemphasis and no DC removal. Reusing it would be the mistake this spec
+elsewhere warns about -- a gate that passes because both arms call the same
+helper proves consistency, not correctness -- so the extractor is a NEW unit and
+remains **unported**.
+
+**What IS ported on this path**: the w2v-bert Conformer itself
+(`w2vbert::FeatureProjection` and `w2vbert::EncoderStack`, including the
+relative-key attention, the causal left-only conv pad and the absent final
+norm), the semantic codec encoder and quantizer (`codec_encoder`, `fvq`), and
+CAMPPlus. What is missing between a WAV file and those is exactly the feature
+extractor above.
 
 ## Work breakdown
 
@@ -370,19 +446,29 @@ behind the pin.
 ## Now
 
 `INVENTORIED`, blocked on [#633](https://github.com/mudler/vllm.cpp/issues/633)
-for any parity or e2e claim.
+for any parity or e2e claim. **There is no render yet, and no route.**
 
-**Landed** (PR #681): W1, the shared 1-D vocoder core in `vllm::vocoder1d` with a
-structural anti-fork guard and hand-computed numerics; W2, the GPT-2 backbone
-host reference, token-exact against upstream at the parity pin and proven
-load-bearing by three mutations.
+**Landed.** W1 the shared 1-D vocoder core; W2 the GPT-2 talker backbone; W6a the
+`SpeechEngine` seam and family refusal; CAMPPlus, w2v-bert's Conformer, the
+semantic codec quantizer and encoder, Vocos, the length regulator, the CFM
+scaffolding and adaLN; the S2Mel DiT complete front to tail (front end, block
+stack with U-Net skips, wavenet final layer); BigVGAN; the offline checkpoint
+converter; and loaders that bind the real `s2mel.safetensors` and
+`gpt.safetensors`.
 
-**Next, in forced order:** W3 CAMPPlus (upstream of the talker, see the inventory
-above), then the w2v-bert-2.0 Conformer and EnhancedCodec, then W4 S2Mel, then W5
-compose. W6a/W6b (the `SpeechEngine` seam and ABI v19) need no oracle and can be
-taken in parallel by a second claim.
+**Two stages run on the REAL shipped weights**: the S2Mel DiT tail (80 x 8 mel,
+values in [-1.14, -0.31]) and the 24-layer talker backbone (6 tokens x 1280,
+[-1.25, 0.84]).
 
-**Groundwork done for whoever picks it up:** the reference implementation is
-cloned and its component sizes measured, the NAS is mounted, and
-`huggingface.co/IndexTeam/IndexTTS-2.5` resolves. What is NOT done: the ~6 GB
-checkpoint is not downloaded, and no golden generator exists past W2.
+**Not started or not finished**, in the order that unblocks a render:
+
+1. the SeamlessM4T feature extractor (above) -- the last gap between a reference
+   clip and the semantic codes;
+2. an intermediate-layer tap on `EncoderStack` for `hidden_states[17]`, plus the
+   stored-statistics normalization;
+3. the talker's emotion path: the `emo_conditioning_encoder` Conformer and the
+   `emo_perceiver_encoder` Perceiver resampler;
+4. the talker generate loop and its heads;
+5. BigVGAN's separate checkpoint, which is not in this repository;
+6. W6b, the two routes and ABI v19;
+7. W5 compose and W7 speed, both of which additionally need #633.
