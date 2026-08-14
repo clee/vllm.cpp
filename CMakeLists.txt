@@ -702,6 +702,7 @@ add_library(vllm STATIC
   src/vllm/config/scheduler.cpp
   src/vllm/config/device.cpp
   src/vllm/config/kv_transfer.cpp
+  src/vllm/config/multimodal.cpp
   src/vllm/config/speculative.cpp
   src/vllm/outputs.cpp
   src/vllm/transformers_utils/hf_config.cpp
@@ -769,10 +770,12 @@ add_library(vllm STATIC
   src/vllm/model_executor/models/vocoder1d.cpp
   src/vllm/model_executor/models/minimax_music3_loader.cpp
   src/vllm/model_executor/models/minimax_music3_ar.cpp
+  src/vllm/model_executor/models/minimax_music3_acoustic.cpp
   src/vllm/model_executor/models/gpt2.cpp
   src/vllm/multimodal/speech_engine.cpp
   src/vllm/model_executor/models/indextts2.cpp
   src/vllm/model_executor/models/campplus.cpp
+  src/vllm/model_executor/models/emovec.cpp
   src/vllm/model_executor/models/w2vbert.cpp
   src/vllm/model_executor/models/w2v_fbank.cpp
   src/vllm/model_executor/models/fvq.cpp
@@ -783,6 +786,7 @@ add_library(vllm STATIC
   src/vllm/model_executor/models/dit_front.cpp
   src/vllm/model_executor/models/dit_stack.cpp
   src/vllm/model_executor/models/bigvgan.cpp
+  src/vllm/model_executor/models/bigvgan_loader.cpp
   src/vllm/model_executor/models/indextts2_s2mel_loader.cpp
   src/vllm/model_executor/models/indextts2_talker_loader.cpp
   src/vllm/model_executor/models/vocos.cpp

@@ -1069,8 +1069,15 @@ clip goes through the SeamlessM4T feature extractor, the w2v-bert Conformer, the
 layer-17 hidden-state tap, the checkpoint's stored-statistics normalization and
 the semantic codec to discrete codes, and the talker's prompt is assembled from
 that conditioning plus the text -- but none of it is reachable from a command or
-a route yet, and nothing yet runs the generate loop that would turn the prompt
-into mel codes.
+a route yet. The greedy generate loop that turns the prompt into mel codes is
+ported too, and so is the STATED-emotion path -- eight weights selecting rows
+from the checkpoint's own speaker and emotion matrices by cosine similarity -- so
+text plus a reference clip and an emotion reaches mel CODES in the library. What
+is still missing is a step that drives the whole chain from text through to the
+vocoder in one go, and any command or route to call it from. The vocoder ITSELF
+now renders: the real BigVGAN checkpoint turns a mel into a bounded waveform at
+22.05 kHz, 256 samples per frame. Inferring the emotion from a clip instead of stating it needs a
+Conformer and a Perceiver that are not ported.
 
 There is **no `/v1/audio/speech`**. Text to speech is not servable: the
 IndexTTS-2.5 stages are ported and gated at reduced dimensions, with further
@@ -1163,6 +1170,8 @@ a stop token early.
 | `--reasoning-parser <name>` | `none` | Reasoning parser (`think_auto`, `deepseek_r1`, `deepseek_v3`, `holo2`, `mistral`, `minimax_m2`, `minimax_m2_append_think`, `step3`, `olmo3`, `muse_glimmer`, `qwen3`, `mimo`). `auto` detects, `none` disables. `qwen3` and its `mimo` alias are the engine-backed adapter (one upstream class, two registry names): thinking is ON, so a marker-less stream is reasoning and a `<tool_call>` ends reasoning with no `</think>`. `auto` never selects it — a generic `<think>` template resolves to `think_auto`, which is the right default for hybrid-thinking models that may answer with no think block at all |
 | `--kv-transfer-config '<json>'` | (unset) | External KV connector, same JSON as vLLM's flag. See [docs/KV-OFFLOAD.md](KV-OFFLOAD.md) |
 | `--speculative-config '<json>'` | (unset) | Speculative decoding (`mtp`, `dflash`, `ngram`), same JSON as vLLM's flag. `dspark` speculates on the Qwen3.6 gate models (native + Speculators drafts), token-identically to speculative-off, but is not gated on speed (currently ~2% behind at c1). A GGUF target, or a target with no aux multi-tap, is refused by name (`SPEC-DSPARK`). Its sequential Markov sampling runs on device by default; `VT_DSPARK_DEVICE_SAMPLE=0` restores the host loop (token-identical, cost only). The speculative verify runs from a captured CUDA graph, worth +12.2%/+3.5% on the 35B cells; `VT_SPEC_DECODE_GRAPH=0` restores the eager verify (also token-identical). See [docs/SPECULATIVE-DECODING.md](SPECULATIVE-DECODING.md) |
+| `--language-model-only` / `--no-language-model-only` | off | Disable all multimodal input by setting **every** modality limit to 0, mirroring vLLM's flag of the same name. It is not a "skip the encoder" switch: the server then **refuses** a multimodal request with ``400 At most 0 image(s) may be provided in one prompt. Set `--limit-mm-per-prompt` to increase this limit.`` It does **not** free VRAM yet — nothing gates tower construction on it ([#607](https://github.com/mudler/vllm.cpp/issues/607) wave L3) |
+| `--limit-mm-per-prompt '<json>'` | (unset ⇒ 999 per modality) | Maximum multimodal input items per prompt, per modality, as the same JSON object vLLM's flag takes: `'{"image": 2, "video": 0}'`, or with profiling options `'{"video": {"count": 1, "num_frames": 32}}'` (the options are validated and ignored — they size dummy inputs for memory profiling, which this engine does not do). A limit can only **lower** what the model/seam supports, never raise it. Malformed JSON, a negative count, or an unknown option on `image` / `video` / `audio` is refused at startup rather than defaulted. An unknown option on any other modality name is dropped rather than refused, mirroring upstream, whose fallback `BaseDummyOptions` is the one such dataclass without `extra="forbid"`. Upstream's dotted spelling (`--limit-mm-per-prompt.image 2`) is not accepted here, as for `--kv-transfer-config` and `--speculative-config` |
 | `--enable-log-requests` / `--disable-log-requests` | on | Log each incoming request. Mirrors vLLM's flag of the same name |
 | `--enable-log-outputs` | off | Also log the generated output, not just the request |
 | `--max-log-len N` | `256` | Truncate logged prompts and outputs to N characters |
@@ -1596,7 +1605,7 @@ vllm-server --model /path/to/text-model \
 ## Consuming it as a library (C ABI)
 
 Link `libvllm` (static or shared) and include [`include/vllm.h`](../include/vllm.h).
-It exposes a flat, exception-free, llama.cpp-style C ABI (`VLLM_ABI_VERSION 18`,
+It exposes a flat, exception-free, llama.cpp-style C ABI (`VLLM_ABI_VERSION 19`,
 36 exported functions) suitable for `dlopen` / FFI / LocalAI integration.
 
 ```c
@@ -1838,25 +1847,54 @@ Accepted part types (`src/vllm/entrypoints/openai/chat_mm.cpp`):
 | `video_url` | video |
 | `input_audio` / `audio_url` | audio |
 
-### Per-prompt input limits — the mechanism exists, the flags do not yet
+### Per-prompt input limits
 
 vLLM caps how many items of each modality one prompt may carry
 (`--limit-mm-per-prompt`), and `--language-model-only` is sugar for setting every
-one of those limits to 0, which makes the server refuse multimodal requests
-outright. **Neither flag is accepted yet** — `vllm-server` still exits on both,
-and there is no config key or C ABI field for them.
+one of those limits to 0. Both flags are accepted (#607, waves L1+L2) and both
+are enforced **on this server's chat path**, which is the one place that installs
+the multimodal chat seam the check runs behind.
 
-What landed (#607, wave L1) is the mechanism underneath, as library-internal
-headers only: `vllm::MultiModalConfig::GetLimitPerPrompt`
-([`config/multimodal.h`](../include/vllm/config/multimodal.h)) resolving
-upstream's precedence, and the refusal it carries
-([`multimodal/processing/context.h`](../include/vllm/multimodal/processing/context.h)),
-which raises `vllm::v1::InputValidationError` — the same type the API server
-answers with HTTP 400. Nothing constructs that config on a live request, so
-**today no request is limited or refused on item count**, and a chat request
-carrying several images still has all but the first silently dropped by
-`chat_mm.cpp`. Wave L2 adds the two flags, the C ABI field, and the call-site
-wiring that makes the limits take effect.
+Both are also C ABI fields (`vllm_model_params.language_model_only` /
+`.limit_mm_per_prompt`, ABI v19), and there they configure the engine — including
+a server built on it — but they do not change what a `vllm_chat` call returns:
+the C ABI has no multimodal request path yet, so an `image_url` content part sent
+through it is dropped and answered as text. The refusals below are the server's.
+
+The limits are the mechanism and the flag is the sugar, so it is worth stating
+what the flag actually does: it does not "skip the encoder", it makes the server
+**refuse** multimodal requests.
+
+```console
+$ curl -s localhost:8000/v1/chat/completions -d '{... three image_url parts ...}'
+{"error":{"type":"BadRequestError",
+          "message":"At most 1 image(s) may be provided in one prompt."}}   # HTTP 400
+
+$ vllm-server --model … --language-model-only     # then any image request:
+{"error":{"type":"BadRequestError",
+          "message":"At most 0 image(s) may be provided in one prompt. Set `--limit-mm-per-prompt` to increase this limit."}}
+```
+
+Two things follow from how the limit is computed
+(`min(user limit, what the model/seam supports)`):
+
+- A user limit can only **lower** the ceiling. `--limit-mm-per-prompt
+  '{"image": 99}'` on this server still refuses a second image, because the
+  OpenAI chat seam handles exactly one image today (video and audio parts are
+  not routed at all, so their limit is 0 and they are refused by name rather
+  than dropped — this is what closed
+  [#686](https://github.com/mudler/vllm.cpp/issues/686)).
+- The ``Set `--limit-mm-per-prompt` to increase this limit.`` hint appears only
+  when raising the limit would actually help — that is, when the seam could take
+  the items and the configuration is what refused them. Its absence is currently
+  the only way to tell an unimplemented arm from a configured limit; the
+  refusal message itself does not say which
+  ([#758](https://github.com/mudler/vllm.cpp/issues/758)).
+
+**Not yet:** `--language-model-only` frees no memory. Nothing gates vision-tower
+construction on the limits, so the flag today changes what the server accepts,
+not what it allocates ([#607](https://github.com/mudler/vllm.cpp/issues/607)
+wave L3, owed with a measured RSS reduction).
 
 ## MiniMax-H3 browser console (`vllm-video-studio`)
 
@@ -2385,6 +2423,17 @@ VLLM_CPP_INDEXTTS2_S2MEL=$CHECKPOINT_ROOT/IndexTTS-2.5-safetensors/s2mel.safeten
 
 VLLM_CPP_INDEXTTS2_GPT=$CHECKPOINT_ROOT/IndexTTS-2.5-safetensors/gpt.safetensors \
   ./build/tests/test_indextts2_talker_loader
+
+VLLM_CPP_INDEXTTS2_AUX=$CHECKPOINT_ROOT/IndexTTS-2.5-safetensors/aux.safetensors \
+  ./build/tests/test_emovec
+
+The vocoder is a SEPARATE download (`nvidia/bigvgan_v2_22khz_80band_256x`),
+which IndexTTS-2.5 fetches rather than ships. Convert it the same way, then:
+
+```sh
+VLLM_CPP_INDEXTTS2_BIGVGAN=$CHECKPOINT_ROOT/IndexTTS-2.5-safetensors/bigvgan.safetensors \
+  ./build/tests/test_bigvgan
+```
 ```
 
 ## MiniMax-Music3: the autoregressive half
@@ -2471,3 +2520,98 @@ bound is therefore
 calibrated against torch's own `sdpa_kernel(MATH)` arm on the identical inputs
 (46.34% bit-identical, mean absolute error 1.659e-03) rather than against a
 bit-exactness that no second implementation can reach.
+
+## MiniMax-Music3: the acoustic half
+
+Phases W4 and W5 of #672.
+`include/vllm/model_executor/models/minimax_music3_acoustic.h` is the rest of the
+pipeline: the 2.4B fp32 flow-matching DiT, the `FlowMatchEulerDiscreteScheduler`
+with `invert_sigmas`, the classifier-free-guidance mix, the denoise loop's
+overlapping-window bookkeeping, and the DAC Flow-VAE vocoder that turns latents
+into a **44100 Hz stereo** waveform. **It still does not generate a song end to
+end** — joining the two halves through `SpeechRegistry`, the `vllm_speech_*` ABI
+and the example server is W6, and the 8.6B `Qwen3ForCausalLM` forward is the
+remainder of W2.
+
+Configs are W1's (`MiniMaxMusic3TransformerConfig`,
+`MiniMaxMusic3VocoderConfig`, `MiniMaxMusic3SchedulerConfig`) rather than new
+ones, and every convolution, transposed convolution, pad and activation is a
+call into the shared `vllm::vocoder1d` primitives. Nothing in `vocoder1d` is
+modified, so MiniMax-H3 and IndexTTS-2.5 are byte-identical.
+
+### There is no token gate on this half, and that is not a gap
+
+A flow-matching denoise loop has no logits, no vocabulary and no sampler, so no
+token gate exists to have. (That is a *different* fact from the autoregressive
+half's withdrawn token gate above, which was withdrawn because upstream has no
+greedy path there. Two withdrawals, two causes.) What binds instead is per-stage
+tensor parity against the oracle capture, each stage against its own entry.
+
+### Running the gates
+
+The reduced-dimension gate needs no checkpoint. Its goldens come from executing
+upstream's own `MiniMaxMusic3Transformer1DModel`, `MiniMaxMusic3Vocoder`,
+`FlowMatchEulerDiscreteScheduler` and `ClassifierFreeGuidance` at small
+dimensions in float32:
+
+```sh
+cmake -S . -B build -DVLLM_CPP_BUILD_TESTS=ON
+cmake --build build -j 8 --target test_minimax_music3_acoustic
+./build/tests/test_minimax_music3_acoustic
+```
+
+The full-scale gate drives the real fp32 weights on the capture's own inputs and
+skips loudly without the checkpoint. Its scheduler and vocoder cases run in
+about ninety seconds:
+
+```sh
+VLLM_CPP_MUSIC3_CHECKPOINT=/path/to/minimax-music3 \
+  ./build/tests/test_minimax_music3_acoustic_real
+```
+
+The **DiT** cases are opt-in behind a second variable, because they load 9.1 GB
+of fp32 weights and run four 2.4B forwards on the host — about fifteen minutes,
+not ninety seconds:
+
+```sh
+VLLM_CPP_MUSIC3_CHECKPOINT=/path/to/minimax-music3 VLLM_CPP_MUSIC3_DIT=1 \
+  ./build/tests/test_minimax_music3_acoustic_real
+```
+
+Regenerate the reduced-dimension goldens with the pinned oracle's interpreter
+(see `tools/oracle/README.md`) after an upstream change:
+
+```sh
+~/venvs/music3-oracle/bin/python \
+  scripts/gen-minimax-music3-acoustic-goldens.py \
+  --out tests/vllm/models/minimax_music3_acoustic_goldens.inc
+```
+
+### Three things that will bite a later phase
+
+**float32 here is not a precision knob either, but it is the opposite polarity
+from the AR half.** The acoustic half runs fp32 because upstream does; there is
+no `Compute` parameter, because there is no second configuration. Separately,
+and on a different axis: every reduction accumulates in `double` and stores
+`float`, which is the tree's existing host-reference convention
+(`vocoder1d::Conv1d`, `music3::LinearNoBias`) and costs no memory. Short
+*elementwise* expressions — the sigma shift, the Euler step, the CFG mix, the
+overlap blend — are computed in `float` on purpose, because upstream computes
+them in float32 and the results are bit-exact there. Widening those to double
+produces a different number: `shift * s / (1 + (shift - 1) * s)` at shift 3 is
+`0.100000024` in float32 and `0.100000001` in double, and the goldens say the
+former.
+
+**A close-enough bound on an exactly-reproducible quantity hides real defects.**
+Measured here: at a 1e-5 relative tolerance, dropping upstream's `(1 - 1e-6)`
+factor from the overlap blend moves values by only 3.3e-07 relative and the
+mutation stays **green**. The blend has no reduction, so its gate is bit-exact
+instead. The same reasoning makes the Euler step and the DiT-to-vocoder handoff
+bit-exact assertions rather than tolerances.
+
+**The stereo fold is a contiguous split, not an interleave.** The 128 latent
+channels reshape into two 64-channel streams: the *first* 64 become the left
+channel and the second 64 the right, and each stream is decoded independently by
+the same weights (`minimax_music3_vocoder.py:110,115`). Interleaving them is the
+other obvious reading of "fold 128 into 2 x 64" and produces a correctly shaped,
+correctly ranged, wrong waveform that no length or dtype check can see.
