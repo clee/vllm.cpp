@@ -212,6 +212,15 @@ vllm_cpp_add_test(test_minimax_music3_speech vllm/models/test_minimax_music3_spe
 # W6's FULL-SCALE companion: the pipeline TAIL driven on the shipped weights,
 # against the capture's own waveform, and the WAV the delivery path emits.
 # Checkpoint-gated with a loud SKIP, exactly as the W4/W5 real gate is.
+# W7 of #672 -- the ONE quantized arm that is implemented, against the REAL
+# pinned artifact (audio-cpp/MiniMax-Music3-GGUF @c36aaeed,
+# rvq_depth_decoder_q4_k.gguf, 406 MB). Skips loudly without it. Proves the
+# QUANTIZED PATH IS TAKEN (resident ggml types + the Q4_K lattice), not merely
+# that the numbers land inside a tolerance.
+vllm_cpp_add_test(test_minimax_music3_quant_real parity/test_minimax_music3_quant_real.cpp)
+target_compile_definitions(test_minimax_music3_quant_real PRIVATE
+  MUSIC3_GOLDENS_DIR="${CMAKE_SOURCE_DIR}/tests/parity/goldens/minimax_music3_oracle")
+
 vllm_cpp_add_test(test_minimax_music3_e2e_real parity/test_minimax_music3_e2e_real.cpp)
 target_compile_definitions(test_minimax_music3_e2e_real PRIVATE
   MUSIC3_GOLDENS_DIR="${CMAKE_SOURCE_DIR}/tests/parity/goldens/minimax_music3_oracle")

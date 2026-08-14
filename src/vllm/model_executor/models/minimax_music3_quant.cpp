@@ -1,4 +1,5 @@
-// MiniMax-Music3 — the quantized arms' DETECTION and REFUSAL. See
+// MiniMax-Music3 — the quantized arms: DETECTION, REFUSAL, and the one arm that
+// is implemented (the RVQ depth decoder's GGUF Q4_K). See
 // minimax_music3_quant.h for the decisions and for the survey that establishes
 // which of these formats actually ships for this model; this file is the
 // mechanism.
@@ -6,13 +7,19 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstring>
 #include <filesystem>
+#include <map>
 #include <set>
 #include <stdexcept>
 #include <string>
+#include <variant>
 #include <vector>
 
 #include <nlohmann/json.hpp>
+
+#include "vllm/model_executor/model_loader/gguf_dequant.h"
+#include "vllm/model_executor/model_loader/gguf_reader.h"
 
 namespace vllm {
 namespace {
@@ -400,6 +407,181 @@ std::string MiniMaxMusic3QuantRefusal(const MiniMaxMusic3QuantFinding& finding) 
 void MiniMaxMusic3CheckQuantArm(const MiniMaxMusic3QuantFinding& finding) {
   if (finding.format == MiniMaxMusic3QuantFormat::kNone) return;
   throw std::runtime_error(MiniMaxMusic3QuantRefusal(finding));
+}
+
+// ---------------------------------------------------------------------------
+// The RVQ depth decoder's GGUF Q4_K arm. See the header for why this component
+// and only this component.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// The GGUF metadata keys that IDENTIFY the audio-cpp lineage. `general.architecture`
+// is deliberately NOT among them: spec section 9.2 measured it reading `audiocpp`,
+// `mm3`, `qwen3` and `wan` across GGUFs of this one model, and `wan` collides with
+// genuine Wan video checkpoints -- keying on it would bind another model's file.
+constexpr const char* kAudioCppFamilyKey = "audiocpp.model_spec.family";
+constexpr const char* kAudioCppFamily = "minimax_music3";
+constexpr const char* kAudioCppNameFormatKey = "audiocpp.tensor_name_format";
+
+const std::string* KvString(const GgufFile& file, const char* key) {
+  const GgufValue* value = file.FindKv(key);
+  if (value == nullptr) return nullptr;
+  return std::get_if<std::string>(&value->v);
+}
+
+std::string ShapeText(const std::vector<int64_t>& shape) {
+  std::string out = "[";
+  for (size_t i = 0; i < shape.size(); ++i) {
+    if (i != 0) out += ", ";
+    out += std::to_string(shape[i]);
+  }
+  return out + "]";
+}
+
+}  // namespace
+
+bool MiniMaxMusic3GgufIsNativeLineage(const GgufFile& file) {
+  const std::string* family = KvString(file, kAudioCppFamilyKey);
+  return family != nullptr && *family == kAudioCppFamily;
+}
+
+MiniMaxMusic3ComponentWeights MiniMaxMusic3LoadRvqDepthDecoderFromGguf(
+    const MiniMaxMusic3RvqDepthDecoderConfig& config, const GgufFile& file,
+    MiniMaxMusic3GgufLoadReport* report) {
+  // --- 1. LINEAGE. Refuse the other two by name rather than mis-binding. ---
+  if (!MiniMaxMusic3GgufIsNativeLineage(file)) {
+    const std::string* family = KvString(file, kAudioCppFamilyKey);
+    const GgufValue* arch = file.FindKv("general.architecture");
+    const std::string* arch_text = arch == nullptr ? nullptr : std::get_if<std::string>(&arch->v);
+    throw std::runtime_error(
+        std::string("minimax_music3: this GGUF is not the audio-cpp lineage (") +
+        kAudioCppFamilyKey + " is " +
+        (family == nullptr ? std::string("absent") : "\"" + *family + "\"") +
+        ", general.architecture is " +
+        (arch_text == nullptr ? std::string("absent") : "\"" + *arch_text + "\"") +
+        "). Only the audio-cpp lineage is implemented, because it declares "
+        "tensor_name_format=native and its 47 names match this port's enumeration "
+        "EXACTLY, so no rename table can hide a mis-binding. The other two published "
+        "lineages are OWED and refused here rather than mis-read: the `mm3` lineage "
+        "(scragnog) needs a rename table PLUS fused QKV to split and folded "
+        "weight-norm to invert, and the ComfyUI lineage (`diffusion_transformer.` + "
+        "`latent_conditioners.` prefixes) does not contain the rvq_depth_decoder at "
+        "all -- it ships the DiT and condition encoder ONLY, so it can never "
+        "generate audio however complete this arm becomes. NOTE that "
+        "general.architecture CANNOT identify a Music3 GGUF: it reads `audiocpp`, "
+        "`mm3`, `qwen3` and `wan` across files of this one model, and `wan` collides "
+        "with genuine Wan video GGUFs. See .agents/specs/minimax-music3.md section "
+        "9.2, issue #672.");
+  }
+  // `native` is the only name format whose tensors bind without a rename table.
+  if (const std::string* format = KvString(file, kAudioCppNameFormatKey);
+      format != nullptr && *format != "native") {
+    throw std::runtime_error(
+        std::string("minimax_music3: this GGUF declares ") + kAudioCppNameFormatKey +
+        " = \"" + *format +
+        "\", but this arm reads only \"native\" -- the format in which the tensor "
+        "names are the checkpoint's own. A renamed layout needs a name map that is "
+        "owed, not guessed: binding it by position would be a finite, correctly "
+        "shaped, WRONG model. Spec section 9.2, issue #672.");
+  }
+
+  // --- 2. ACCOUNT: enumerated == present, zero unaccounted. ---
+  // The same contract the safetensors arm uses, so a GGUF that lost a tensor
+  // cannot read as zeros. SHAPES are required; the per-tensor ggml TYPE is
+  // whatever the quantizer chose and is recorded rather than required.
+  const std::vector<MiniMaxMusic3TensorSpec> required =
+      EnumerateMiniMaxMusic3RvqDepthDecoderTensors(config);
+  std::map<std::string, const GgufTensorInfo*> present;
+  for (const GgufTensorInfo& info : file.Tensors()) {
+    if (!present.emplace(info.name, &info).second) {
+      throw std::runtime_error("minimax_music3: rvq_depth_decoder gguf: tensor " + info.name +
+                               " appears more than once");
+    }
+  }
+  std::set<std::string> accounted;
+  for (const MiniMaxMusic3TensorSpec& spec : required) {
+    const auto it = present.find(spec.name);
+    if (it == present.end()) {
+      throw std::runtime_error(
+          "minimax_music3: rvq_depth_decoder gguf: required tensor " + spec.name + " " +
+          ShapeText(spec.shape) +
+          " is MISSING. This arm reads the audio-cpp `native` layout, whose names are "
+          "the checkpoint's own; a file missing one is refused rather than zero-filled.");
+    }
+    // GgufTensorInfo::shape is ALREADY reversed into torch row-major order by the
+    // reader, so it compares directly against the enumeration. Reversing again
+    // here would silently transpose every projection.
+    if (it->second->shape != spec.shape) {
+      throw std::runtime_error("minimax_music3: rvq_depth_decoder gguf: tensor " + spec.name +
+                               " has shape " + ShapeText(it->second->shape) + " but the config "
+                               "implies " + ShapeText(spec.shape) +
+                               "; refusing rather than binding a different model");
+    }
+    accounted.insert(spec.name);
+  }
+  for (const auto& entry : present) {
+    if (accounted.count(entry.first) == 0) {
+      throw std::runtime_error(
+          "minimax_music3: rvq_depth_decoder gguf: tensor " + entry.first +
+          " is present but UNACCOUNTED for by the config's enumeration; a GGUF carrying "
+          "a tensor this port does not know is a different model, not a superset");
+    }
+  }
+
+  // --- 3. MATERIALIZE to bf16, mirroring the safetensors arm's runtime dtype. ---
+  MiniMaxMusic3ComponentWeights out;
+  out.component = "rvq_depth_decoder";
+  MiniMaxMusic3GgufLoadReport local;
+  for (const MiniMaxMusic3TensorSpec& spec : required) {
+    const GgufTensorInfo& info = *present.find(spec.name)->second;
+    int64_t numel = 1;
+    for (const int64_t dim : spec.shape) numel *= dim;
+
+    // NVFP4 (and anything else keeping its scale outside the block) would need a
+    // sidecar this arm has not resolved. Refuse rather than apply a scale of 1
+    // and hand back values off by ~1e4 that still look perfectly finite.
+    if (GgmlTypeNeedsGlobalScale(info.ggml_type)) {
+      throw std::runtime_error(
+          "minimax_music3: rvq_depth_decoder gguf: tensor " + spec.name + " has ggml type " +
+          std::to_string(info.ggml_type) +
+          ", whose blocks are NOT self-contained -- it needs a per-tensor scale sidecar "
+          "this arm does not resolve. Refused rather than dequantized with an assumed "
+          "scale of 1.0, which would return finite values off by orders of magnitude. "
+          "Owed: spec section 9.5, issue #672.");
+    }
+
+    // The shared seam does the decoding. Never a parallel path: a k-quant block
+    // decoder written here would be a second implementation of something
+    // gguf_dequant.h already owns and gates.
+    const std::vector<uint16_t> bf16 =
+        DequantGgufRowToBf16(info.ggml_type, info.data, numel);
+    ++local.dequant_calls;
+    if (static_cast<int64_t>(bf16.size()) != numel) {
+      throw std::runtime_error("minimax_music3: rvq_depth_decoder gguf: tensor " + spec.name +
+                               " dequantized to " + std::to_string(bf16.size()) +
+                               " elements, expected " + std::to_string(numel));
+    }
+
+    MiniMaxMusic3Tensor tensor;
+    tensor.dtype = "BF16";
+    tensor.shape = spec.shape;
+    tensor.bytes.resize(bf16.size() * sizeof(uint16_t));
+    std::memcpy(tensor.bytes.data(), bf16.data(), tensor.bytes.size());
+    out.tensors.emplace(spec.name, std::move(tensor));
+
+    ++local.tensors;
+    local.elements += numel;
+    local.resident_type[spec.name] = info.ggml_type;
+    if (info.ggml_type == kMusic3GgmlF16 || info.ggml_type == kMusic3GgmlBf16 ||
+        info.ggml_type == 0) {
+      ++local.unquantized;
+    } else {
+      ++local.quantized;
+    }
+  }
+  if (report != nullptr) *report = std::move(local);
+  return out;
 }
 
 }  // namespace vllm

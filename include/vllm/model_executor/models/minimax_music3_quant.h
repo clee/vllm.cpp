@@ -94,6 +94,7 @@
 #pragma once
 
 #include <cstdint>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -191,5 +192,105 @@ void MiniMaxMusic3CheckQuantArm(const MiniMaxMusic3QuantFinding& finding);
 // The refusal text, without throwing. Exposed so a caller can report rather
 // than abort, and so the message can be gated on its own.
 std::string MiniMaxMusic3QuantRefusal(const MiniMaxMusic3QuantFinding& finding);
+
+// ---------------------------------------------------------------------------
+// THE ONE ARM THAT IS IMPLEMENTED: the RVQ depth decoder, GGUF Q4_K
+// ---------------------------------------------------------------------------
+//
+// ─── WHY THIS COMPONENT AND ONLY THIS COMPONENT ─────────────────────────────
+//
+// It is the one arm whose bound can be CALIBRATED rather than asserted. W3
+// already gates the depth decoder at full scale against `frame_hiddens[:,4096:]`
+// (716 800 values) and its bf16 control is already MEASURED — torch against
+// itself with a different attention kernel, 46.34% bit-identical at
+// mean|d| 1.659e-03. A Q4_K arm therefore has a known baseline to sit outside
+// of, instead of a tolerance somebody chose. The other four components have no
+// such measured control, so implementing them here would mean asserting bounds
+// rather than deriving them; they stay refused and owed (spec section 9.5).
+//
+// ─── THE ARTIFACT IS PINNED, BECAUSE AN UNPINNED ORACLE IS NOT REPRODUCIBLE ──
+//
+//   repo      audio-cpp/MiniMax-Music3-GGUF
+//   revision  c36aaeed683f33b05796788e4204f4eeba8fa547
+//   file      rvq_depth_decoder_q4_k.gguf, 405 752 480 bytes
+//   sha256    4c5d41b27418d9c1046345f649cb61d7cde0e3bbda4af7f7cb142df2c70cbdd0
+//
+// The digest is ASSERTED by the gate, not merely recorded: a re-quantized file
+// under the same name is a different oracle, and this project has already been
+// bitten by a checkpoint silently re-quantized in place under an unchanged repo
+// id.
+//
+// ─── THREE LINEAGES, AND ONLY ONE IS READ ───────────────────────────────────
+//
+// Spec section 9.2 measured ten published Music3 GGUFs: they are three mutually
+// incompatible lineages and `general.architecture` CANNOT separate them (it
+// reads `audiocpp`, `mm3`, `qwen3` and `wan` for the same model, and `wan`
+// collides with genuine Wan video GGUFs, so keying on it would bind another
+// model's checkpoint).
+//
+// This arm reads the `audiocpp` lineage ONLY, identified by
+// `audiocpp.model_spec.family == "minimax_music3"`, and it is the right one to
+// start from for a reason that is measured rather than aesthetic: it declares
+// `audiocpp.tensor_name_format = native`, and all 47 tensor names match the
+// enumeration `EnumerateMiniMaxMusic3RvqDepthDecoderTensors` derives from
+// upstream source EXACTLY. **There is no rename table**, so a mis-binding
+// cannot hide in one. The other two lineages are refused BY NAME: `mm3` needs a
+// rename table plus fused QKV to split and folded weight-norm to invert, and the
+// ComfyUI lineage does not contain this component at all.
+//
+// ─── DTYPE: bf16 OUT, MIRRORING THE SAFETENSORS ARM ─────────────────────────
+//
+// The 36 quantized projections dequantize to bf16 and the 11 islands (9 BF16
+// norms, 2 F16 embeddings) convert to bf16. That is the component's runtime
+// dtype under spec section 2.1 and what the safetensors arm resolves, so the
+// quantized arm is substitutable rather than a second numeric regime. Producing
+// f32 here would be a WIDENING no measurement asked for, and AGENTS.md is
+// explicit that a token gate cannot catch a dtype that is too wide.
+
+class GgufFile;
+
+// What the load ACTUALLY did, per tensor and in totals.
+//
+// This struct exists for one reason: **a value gate cannot see a dequant
+// fallback.** Outputs that land inside tolerance prove nothing about which
+// bytes produced them, and this project has already been bitten by exactly
+// that. So the load reports the RESIDENT ggml type of every tensor it read and
+// counts the dequantizations it performed, and the gate asserts on those
+// directly rather than inferring them from the numbers.
+struct MiniMaxMusic3GgufLoadReport {
+  int64_t tensors = 0;        // tensors read
+  int64_t quantized = 0;      // tensors whose resident type was a k-quant
+  int64_t unquantized = 0;    // the F16/BF16/F32 islands
+  int64_t dequant_calls = 0;  // calls into the shared gguf_dequant seam
+  int64_t elements = 0;       // elements materialized
+  // name -> the ggml type id the FILE stores. A fallback that read a bf16
+  // sibling instead would show BF16(30) here where Q4_K(12) is expected.
+  std::map<std::string, uint32_t> resident_type;
+};
+
+// True when `file` is the audio-cpp `native` lineage carrying MiniMax-Music3.
+// Never throws: a caller may ask before committing.
+bool MiniMaxMusic3GgufIsNativeLineage(const GgufFile& file);
+
+// Load the RVQ depth decoder from a `native`-lineage GGUF, to bf16.
+//
+// Accounts before it materializes: every tensor the config OWES must exist at
+// its enumerated SHAPE, and every tensor present must be accounted for — the
+// same "enumerated == present, zero unaccounted" contract the safetensors arm
+// uses, so a GGUF that lost a tensor cannot read as zeros. The per-tensor DTYPE
+// is whatever the quantizer chose and is recorded rather than required.
+//
+// THROWS, naming the missing piece, when: the lineage is not `audiocpp`; the
+// file is a different component; a tensor is missing, extra, or wrongly shaped;
+// or a tensor's ggml type is one the shared dequant seam does not read.
+MiniMaxMusic3ComponentWeights MiniMaxMusic3LoadRvqDepthDecoderFromGguf(
+    const MiniMaxMusic3RvqDepthDecoderConfig& config, const GgufFile& file,
+    MiniMaxMusic3GgufLoadReport* report);
+
+// The ggml type ids this arm accepts, so a gate can assert against them without
+// hardcoding a magic number.
+inline constexpr uint32_t kMusic3GgmlF16 = 1;
+inline constexpr uint32_t kMusic3GgmlQ4K = 12;
+inline constexpr uint32_t kMusic3GgmlBf16 = 30;
 
 }  // namespace vllm

@@ -2518,18 +2518,36 @@ python3 scripts/gen-minimax-music3-manifest.py \
   --output tests/vllm/models/minimax_music3_manifest.inc
 ```
 
-### MiniMax-Music3: the quantized arms are REFUSED, by name
+### MiniMax-Music3: the quantized arms
 
-**There is no quantized MiniMax-Music3 arm.** Only the bf16/fp32 diffusers
-checkpoint loads — bf16 `language_model` + `rvq_depth_decoder` +
-`condition_encoder`, fp32 `transformer` + `vocoder`, ~28.5 GB resident.
+**One quantized arm loads: the RVQ depth decoder from a GGUF Q4_K file.**
+Everything else is the bf16/fp32 diffusers checkpoint — bf16 `language_model` +
+`rvq_depth_decoder` + `condition_encoder`, fp32 `transformer` + `vocoder`,
+~28.5 GB resident.
 
-That matters because quantized MiniMax-Music3 checkpoints **do exist**: a survey
-on 2026-08-14 found fourteen community repositories in five formats, including
-GGUF k-quants of all five components at roughly a third of the size. None is
-implemented here. Rather than mis-loading one or failing with a confusing shape
-error, `MiniMaxMusic3ResolveCheckpoint`, `MiniMaxMusic3AccountTensors` and
-`MiniMaxMusic3LoadConfig` each refuse it **by name**:
+The implemented arm is pinned to a specific artifact, because an unpinned
+quantized checkpoint is not reproducible:
+
+| Field | Value |
+|---|---|
+| repo | `audio-cpp/MiniMax-Music3-GGUF` |
+| revision | `c36aaeed683f33b05796788e4204f4eeba8fa547` |
+| file | `rvq_depth_decoder_q4_k.gguf` (405 752 480 bytes) |
+| sha256 | `4c5d41b27418d9c1046345f649cb61d7cde0e3bbda4af7f7cb142df2c70cbdd0` |
+
+`MiniMaxMusic3LoadRvqDepthDecoderFromGguf` reads it: 47 tensors as 36 Q4_K
+projections, 9 BF16 norms and 2 F16 embedding tables, dequantized to bf16
+through the shared `gguf_dequant.h` seam. Only the **audio-cpp lineage** is
+read, keyed on `audiocpp.model_spec.family == "minimax_music3"` — not on
+`general.architecture`, which reads `audiocpp`, `mm3`, `qwen3` *and* `wan` across
+GGUFs of this one model and collides with genuine Wan video checkpoints. The
+other two published lineages are refused by name.
+
+**The other quantized formats still refuse**, and quantized MiniMax-Music3
+checkpoints do exist in five formats — a survey on 2026-08-14 found fourteen
+community repositories. Rather than mis-loading one or failing with a confusing
+shape error, `MiniMaxMusic3ResolveCheckpoint`, `MiniMaxMusic3AccountTensors` and
+`MiniMaxMusic3LoadConfig` each refuse **by name**:
 
 ```
 minimax_music3: this checkpoint is QUANTIZED -- GGUF (evidence:
@@ -2563,12 +2581,28 @@ Note if you hold a ComfyUI-format Music3 GGUF: those ship the DiT and condition
 encoder only — no language model, no depth decoder, no vocoder — so they cannot
 generate audio even once a GGUF arm lands.
 
-Its gate needs no checkpoint and no network:
+The refusal gate needs no checkpoint and no network:
 
 ```sh
 cmake --build build -j 8 --target test_minimax_music3_quant
 ./build/tests/test_minimax_music3_quant
 ```
+
+The Q4_K arm's own gate needs the pinned GGUF and the bf16 checkpoint, and skips
+loudly without them:
+
+```sh
+CHECKPOINT_ROOT=/mnt/nas_share/checkpoints \
+  ./build/tests/test_minimax_music3_quant_real
+```
+
+It does not merely check that the numbers land inside a tolerance. It asserts
+the **resident ggml type** of all 47 tensors, checks the dequantized values lie
+on the **Q4_K lattice** (at most 16 distinct values per 32-element sub-block —
+a structure a bf16 read cannot produce), and bounds the output **two-sidedly**.
+The lower bound is the important one: a silent dequant fallback to the bf16
+weights lands *closer* to the golden (mean|d| 0.00182) than the genuine
+quantized arm (0.0324), so upper bounds alone cannot tell them apart.
 
 ### IndexTTS-2.5 goldens and checkpoint manifests
 

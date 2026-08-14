@@ -26,10 +26,12 @@
 #include <random>
 #include <set>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <doctest/doctest.h>
 
+#include "vllm/model_executor/model_loader/gguf_reader.h"
 #include "vllm/model_executor/models/minimax_music3_loader.h"
 #include "vllm/model_executor/models/minimax_music3_quant.h"
 
@@ -687,6 +689,163 @@ TEST_CASE("music3 quant hook: MiniMaxMusic3LoadConfig refuses a quantized compon
   CHECK(check.All());
   // The component is named from the config's own parent directory.
   CHECK(check.message.find("transformer") != std::string::npos);
+}
+
+// ===========================================================================
+// 3c. The GGUF ARM's lineage refusals, on SYNTHETIC files
+// ===========================================================================
+//
+// Added after mutation QM4 -- neutering the loader's lineage guard to
+// `if (false)` -- STAYED GREEN. The reason was a genuine coverage hole rather
+// than a bad mutation: the only GGUF the suite had was the real audio-cpp one,
+// which IS the accepted lineage, so removing the check that rejects the other
+// two changed nothing observable. Spec section 9.2 records that there are three
+// mutually incompatible published lineages and that `general.architecture`
+// CANNOT separate them, so a loader that stopped checking would bind an `mm3` or
+// ComfyUI file by position -- finite, correctly shaped, wrong. These fixtures
+// are the smallest GGUFs that prove the guard is load-bearing, and they need no
+// checkpoint and no network.
+
+namespace {
+
+// Build a minimal VALID GGUF v3 in memory: header, string metadata, one small
+// F32 tensor. Only the metadata is under test, but the file has to PARSE before
+// the lineage check can reject it -- a malformed file would be refused for the
+// wrong reason and would prove nothing about the guard.
+std::string BuildTinyGguf(const std::vector<std::pair<std::string, std::string>>& metadata) {
+  std::string out;
+  auto put_u32 = [&](uint32_t v) { out.append(reinterpret_cast<const char*>(&v), 4); };
+  auto put_u64 = [&](uint64_t v) { out.append(reinterpret_cast<const char*>(&v), 8); };
+  auto put_str = [&](const std::string& s) {
+    put_u64(s.size());
+    out += s;
+  };
+  out += "GGUF";
+  put_u32(3);                // version
+  put_u64(1);                // tensor_count
+  put_u64(metadata.size());  // metadata_kv_count
+  for (const auto& kv : metadata) {
+    put_str(kv.first);
+    put_u32(8);  // GGUF value type 8 == string
+    put_str(kv.second);
+  }
+  put_str("norm.weight");
+  put_u32(1);   // n_dims
+  put_u64(32);  // dims[0]
+  put_u32(0);   // ggml type 0 == F32
+  put_u64(0);   // offset into the data section
+  while (out.size() % 32 != 0) out += '\0';  // default GGUF alignment
+  out.append(32 * sizeof(float), '\0');
+  return out;
+}
+
+}  // namespace
+
+TEST_CASE("music3 gguf arm: a NON-audio-cpp lineage is refused, naming what is missing") {
+  struct Case {
+    const char* label;
+    std::vector<std::pair<std::string, std::string>> metadata;
+  };
+  const std::vector<Case> cases{
+      // The scragnog lineage: self-describing, but renamed with fused QKV.
+      {"mm3", {{"general.architecture", "mm3"}, {"mm3.model", "MiniMax-Music3"}}},
+      // The ComfyUI lineage, whose architecture key collides with real Wan GGUFs.
+      {"wan", {{"general.architecture", "wan"}}},
+      // A GGUF of the language-model half: a different component entirely.
+      {"qwen3", {{"general.architecture", "qwen3"}}},
+      // The right ARCHITECTURE string with no family key -- the case that shows
+      // why `general.architecture` is not the discriminator.
+      {"bare_audiocpp", {{"general.architecture", "audiocpp"}}},
+  };
+  int64_t refused = 0;
+  for (const Case& c : cases) {
+    CAPTURE(c.label);
+    ScratchDir dir(std::string("lineage_") + c.label);
+    const std::filesystem::path path = dir.path() / "candidate.gguf";
+    WriteFile(path, BuildTinyGguf(c.metadata));
+
+    const vllm::GgufFile file = vllm::GgufFile::Open(path.string());
+    CHECK_FALSE(vllm::MiniMaxMusic3GgufIsNativeLineage(file));
+
+    const vllm::MiniMaxMusic3RvqDepthDecoderConfig config;
+    vllm::MiniMaxMusic3GgufLoadReport report;
+    bool here = false;
+    try {
+      vllm::MiniMaxMusic3LoadRvqDepthDecoderFromGguf(config, file, &report);
+      FAIL("a non-audio-cpp GGUF must not load");
+    } catch (const std::runtime_error& error) {
+      const std::string message = error.what();
+      here = message.find("audio-cpp lineage") != std::string::npos &&
+             message.find("audiocpp.model_spec.family") != std::string::npos &&
+             message.find("#672") != std::string::npos &&
+             // It must name the OTHER lineages and why each is unreadable, or
+             // the person holding one has to re-derive it.
+             message.find("mm3") != std::string::npos &&
+             message.find("rename table") != std::string::npos &&
+             message.find("ComfyUI") != std::string::npos;
+      if (!here) MESSAGE("unhelpful refusal for " << c.label << ": " << message);
+    }
+    CHECK(here);
+    refused += here ? 1 : 0;
+  }
+  CHECK(refused == static_cast<int64_t>(cases.size()));
+  MESSAGE("non-native lineages refused by name: " << refused << " of " << cases.size());
+}
+
+TEST_CASE("music3 gguf arm: the right family with a RENAMED layout is still refused") {
+  // `tensor_name_format` is a SEPARATE guard from the family, and it has to be:
+  // a future audio-cpp export that renamed its tensors would carry the right
+  // family and bind to the wrong weights by position.
+  ScratchDir dir("renamed");
+  const std::filesystem::path path = dir.path() / "renamed.gguf";
+  WriteFile(path, BuildTinyGguf({{"general.architecture", "audiocpp"},
+                                 {"audiocpp.model_spec.family", "minimax_music3"},
+                                 {"audiocpp.tensor_name_format", "flattened"}}));
+  const vllm::GgufFile file = vllm::GgufFile::Open(path.string());
+  // The FAMILY is accepted...
+  CHECK(vllm::MiniMaxMusic3GgufIsNativeLineage(file));
+  // ...and the NAME FORMAT is what refuses.
+  const vllm::MiniMaxMusic3RvqDepthDecoderConfig config;
+  vllm::MiniMaxMusic3GgufLoadReport report;
+  bool refused = false;
+  std::string message;
+  try {
+    vllm::MiniMaxMusic3LoadRvqDepthDecoderFromGguf(config, file, &report);
+  } catch (const std::runtime_error& error) {
+    message = error.what();
+    refused = message.find("tensor_name_format") != std::string::npos &&
+              message.find("flattened") != std::string::npos &&
+              message.find("native") != std::string::npos &&
+              message.find("#672") != std::string::npos;
+  }
+  CHECK(refused);
+  MESSAGE("refusal: " << message);
+}
+
+TEST_CASE("music3 gguf arm: a native GGUF MISSING tensors is refused, not zero-filled") {
+  // The accounting contract, on a file that passes BOTH lineage guards. A
+  // one-tensor GGUF owes 47.
+  ScratchDir dir("short");
+  const std::filesystem::path path = dir.path() / "short.gguf";
+  WriteFile(path, BuildTinyGguf({{"general.architecture", "audiocpp"},
+                                 {"audiocpp.model_spec.family", "minimax_music3"},
+                                 {"audiocpp.tensor_name_format", "native"}}));
+  const vllm::GgufFile file = vllm::GgufFile::Open(path.string());
+  CHECK(vllm::MiniMaxMusic3GgufIsNativeLineage(file));
+  const vllm::MiniMaxMusic3RvqDepthDecoderConfig config;
+  vllm::MiniMaxMusic3GgufLoadReport report;
+  bool refused = false;
+  std::string message;
+  try {
+    vllm::MiniMaxMusic3LoadRvqDepthDecoderFromGguf(config, file, &report);
+  } catch (const std::runtime_error& error) {
+    message = error.what();
+    refused = message.find("is MISSING") != std::string::npos &&
+              message.find("rvq_depth_decoder gguf") != std::string::npos &&
+              message.find("zero-filled") != std::string::npos;
+  }
+  CHECK(refused);
+  MESSAGE("refusal: " << message);
 }
 
 // ===========================================================================
