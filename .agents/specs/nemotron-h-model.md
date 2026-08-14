@@ -1494,20 +1494,34 @@ no `STATUS`/`BENCHMARKS` write. **Oracle gateability is CLOSED** — §5a record
 the pinned oracle loading and running the checkpoint on GB10 with three greedy
 goldens committed, so W6 has a denominator whenever it is reached.
 
-**Next action:** **W4 is written and gated on `row/MODEL-NEMOTRON-H-W4B` (§6b)
-and needs a FRESH REVIEW** — never the agent that wrote it — which should mutate
-the self-certification (§6b M15) and the two anti-vacuity guards that were
-rewritten, because those are the claims this W changes rather than adds.
+**W4 has LANDED** (`ce8c8bf67`, #718), and the WEIGHT LOADER §7 named as "the
+next brick" is built and gated on `row/MODEL-NEMOTRON-H-LOADER` — **§6d is the
+authority on it**. The forward no longer refuses on a checkpoint load: 18487 of
+18487 tensors are accounted (18217 materialized in their shipped formats, 270
+deferred by name to W5), the real 20.1 GiB checkpoint runs at **17.70 GiB peak
+RSS**, and its first greedy token matches the pinned oracle's committed golden on
+**3 of 3** prompts.
 
-After W4 lands, the next brick is **the WEIGHT LOADER**, which §4's table does
-not name as a W of its own and should: W5 (MTP), W6 (the e2e token gate) and W7
-(GGUF) all sit behind it, and until it exists the forward refuses by name on
-every checkpoint load. Also carried forward, not resolved: the two OWED GPU items
-in §6a (`kMoeGroupedGemmNvfp4Marlin` on the real g16 tensors, and the end-to-end
-NemotronH MoE block on GB10), and the OWED GGUF k-quant arm tracked as W7 (§5b).
+**Next action:** the loader needs a **FRESH REVIEW** — never the agent that wrote
+it. The two claims it changes rather than adds, and which a review should mutate,
+are (a) `NemotronHOwned::View`'s refusal of a non-dense weight, which is the only
+thing standing between a packed NVFP4 buffer and a plausible-garbage GEMM operand,
+and (b) the expert-major reorder in `NemotronHMoeMixer`, whose result-neutrality
+is claimed from the disjointness of the output slots rather than measured.
 
-The row stays `INVENTORIED`: W4 changes no lifecycle state, because nothing runs
-end to end yet.
+Then W5 (the MTP head, whose 270 tensors the loader already names as owed), W6
+(the e2e token gate against the committed goldens, now unblocked — it has weights),
+and W7 (GGUF). Carried forward, not resolved: the two OWED GPU items in §6a
+(`kMoeGroupedGemmNvfp4Marlin` on the real g16 tensors, and the end-to-end
+NemotronH MoE block on GB10) — the loader now produces exactly those g16 tensors,
+so the first of them is reachable — and the OWED GGUF k-quant arm (§5b).
+
+**Reported, outside this task's authority to fix.** `test_op_parity` is RED on
+this row's base for a reason belonging to MODEL-MUSIC-MUSIC3 (#672); §6d's gate
+evidence has the diagnosis.
+
+The row stays `INVENTORIED`: the loader changes no lifecycle state, because the
+forward is still the HOST reference and nothing runs on the paged runner (W6).
 
 ## 8. Stop conditions
 
