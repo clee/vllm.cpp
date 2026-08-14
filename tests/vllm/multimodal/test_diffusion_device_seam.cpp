@@ -167,6 +167,16 @@ TEST_CASE("ltx2 video: a COMPLETE backend is not refused by the capability guard
   REQUIRE_FALSE(msg.empty());
   CHECK(msg.find("DECLINES") == std::string::npos);
   CHECK(msg.find("supports_model_architecture") == std::string::npos);
+  // POSITIVELY: the load got PAST the capability clause and failed on the thing
+  // that is genuinely wrong — the checkpoint that does not exist. Asserting only
+  // the two absences above would pass on any OTHER wrong failure (a refusal
+  // reworded, a throw from an earlier clause, a message that never mentions the
+  // path), which would leave "the guard does not refuse a working configuration"
+  // unproven while reading green. Case 1 at the top of this file asserts the
+  // mirror image of this line; the pair is what pins the guard to exactly one
+  // arm each.
+  CHECK(msg.find("/nonexistent/ltx2-dit-that-is-never-opened.safetensors") !=
+        std::string::npos);
 }
 
 TEST_CASE("minimax_h3 video: device 1 RESOLVES through the seam, it is not enum value 1") {

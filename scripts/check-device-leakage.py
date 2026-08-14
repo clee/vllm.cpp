@@ -51,22 +51,37 @@ the platform seam" and the property is what has to be caught. The reverse
 direction (`static_cast<int>(type)`) is the SAFE one and is deliberately not
 counted: it is how the seam itself indexes its registry.
 
+WHAT `dev_cast` DOES SEE, in every spelling of the one conversion: the four cast
+keywords and the C-style, functional, brace and DECLARATION forms; the type
+written as `DeviceType`, `vt::DeviceType`, `::vt::DeviceType` or
+`enum vt::DeviceType`; an operand that is an identifier, a literal (`)1`), a
+signed literal (`)-1`) or a parenthesised expression; a target that is a POINTER,
+which is how `reinterpret_cast` puns an integer's bytes onto a DeviceType; and a
+cast clang-format has wrapped across two lines.
+
 WHAT `dev_cast` STILL CANNOT SEE, stated here because a checker's message is the
 authority on what it enforces and an instrument that hides its blind spot
 returns a false pass:
 
   * a cast whose target is a type ALIAS (`using DT = vt::DeviceType;` then
-    `static_cast<DT>(x)`), or a template parameter that resolves to DeviceType;
-  * `std::bit_cast`, `memcpy` or a union punning an integer onto a DeviceType;
+    `static_cast<DT>(x)`), a macro that expands to the type name, or a template
+    parameter that resolves to DeviceType;
+  * `std::bit_cast`, `memcpy` or a union punning an integer onto a DeviceType.
+    The POINTER-cast spelling of the same pun IS caught; these three are not,
+    because no spelling of the target type appears at the conversion site;
   * a conversion that happens inside `src/vt/` and is merely CALLED from the
     shared layer — `src/vt/` is a device leg and is not scanned at all;
   * whether the operand really is an integer. Nothing here type-checks; the
     bucket flags every cast TO DeviceType and relies on `// DSR-ALLOW(<row>)`
-    for the legitimate ones (a wire-format decode is the expected case).
+    for the legitimate ones (a wire-format decode is the expected case). This is
+    also why a pointer target counts: `const_cast<DeviceType*>(p)` removes const
+    rather than converting an integer, and buys its exemption the same way.
 
 Those are gaps in a TEXT checker, not gaps that were traded away for
-convenience. tests/scripts/test_device_leakage.py M20-M28 pin what it does
-catch, each spelling asserted on its own.
+convenience. tests/scripts/test_device_leakage.py M20-M33 pin what it does
+catch, each spelling asserted on its own — including, in M29, the literal
+operand, because a discriminator tested only on the case it was tuned for is a
+guard that certifies itself.
 
 HOW THE RATCHET WORKS. `scripts/device-leakage-baseline.json` holds the accepted
 per-bucket counts. Any bucket ABOVE its baseline fails. Any bucket BELOW its
@@ -117,8 +132,16 @@ RE_IS_CUDA = re.compile(r"\bis_cuda\s*\(\s*\)")
 # spelling of the same conversion, all anchored on the TARGET TYPE:
 #
 #   1. a named cast          static_cast<vt::DeviceType>(x) / <DeviceType> / …
-#   2. a C-style cast        (vt::DeviceType)x
-#   3. a functional cast     vt::DeviceType(x)  and  vt::DeviceType{x}
+#                            and the POINTER form, *reinterpret_cast<DeviceType*>(&x)
+#   2. a C-style cast        (vt::DeviceType)x  and  (vt::DeviceType)1
+#   3. a functional cast     vt::DeviceType(x) / vt::DeviceType{x}, and the same
+#                            conversion spelled as a DECLARATION, `DeviceType d{x}`
+#
+# `_DEVTYPE_QUAL` absorbs the ways the SAME type can be written before its name:
+# `vt::DeviceType`, a global-scope-qualified `::vt::DeviceType`, and an
+# elaborated-type-specifier `enum vt::DeviceType`. All three name one type, so a
+# pattern that recognised only the first would be a spelling grep again — which
+# is the exact defect (#660) this bucket exists to answer.
 #
 # `\b` after the type name keeps `DeviceTypeName(t)` out. The lookbehind on (3)
 # keeps `X::DeviceType(` and `foo.DeviceType(` and `vector<DeviceType>(` out, so
@@ -134,13 +157,27 @@ RE_IS_CUDA = re.compile(r"\bis_cuda\s*\(\s*\)")
 # be glued to an identifier (that is a call or a declarator), except after the
 # keywords that legitimately precede a parenthesised expression; and what follows
 # must not be a declarator suffix.
+#
+# (2)'s trailing class admits DIGITS and a leading SIGN, not just identifiers.
+# `(vt::DeviceType)1` — the device named by its literal enum value — is the
+# PUREST form of what this bucket polices, and an identifier-only lookahead
+# missed exactly it while catching `(vt::DeviceType)d`. Measured over
+# `src/vllm` + `include/vllm`: admitting `0-9+-` adds ZERO hits.
+#
+# (3)'s DECLARATION form takes `{` only. `DeviceType d{x}` is a real conversion
+# (C++17 permits list-initialising a scoped enum with a fixed underlying type),
+# but `DeviceType d(x)` is ILL-FORMED — there is no implicit int→scoped-enum
+# conversion — so nothing is lost by excluding it, while allowing `(` would match
+# every FUNCTION DEFINITION whose return type is DeviceType (measured: 3 false
+# positives, e.g. `vt::DeviceType MiniMaxH3VideoDeviceType(`).
+_DEVTYPE_QUAL = r"(?:enum\s+)?(?:::\s*)?(?:vt\s*::\s*)?"
 RE_DEVTYPE_CAST = re.compile(
     r"(?:static_cast|reinterpret_cast|const_cast|dynamic_cast)\s*<\s*"
-    r"(?:const\s+)?(?:vt\s*::\s*)?DeviceType\b\s*>"
+    r"(?:const\s+)?" + _DEVTYPE_QUAL + r"DeviceType\b\s*\*?\s*>"
     r"|(?:(?<![\w])|(?<=return)|(?<=case)|(?<=throw)|(?<=delete))"
-    r"\(\s*(?:const\s+)?(?:vt\s*::\s*)?DeviceType\b\s*\)\s*"
-    r"(?!(?:const|volatile|noexcept|override|final|try)\b)(?=[A-Za-z_(])"
-    r"|(?<![\w.:>])(?:vt\s*::\s*)?DeviceType\b\s*[({]\s*(?![)}])"
+    r"\(\s*(?:const\s+)?" + _DEVTYPE_QUAL + r"DeviceType\b\s*\)\s*"
+    r"(?!(?:const|volatile|noexcept|override|final|try)\b)(?=[A-Za-z_(0-9+\-])"
+    r"|(?<![\w.:>])" + _DEVTYPE_QUAL + r"DeviceType\b\s*(?:\w+\s*\{|[({])\s*(?![)}])"
 )
 RE_CUDA_INCLUDE = re.compile(r'^\s*#\s*include\s*[<"](?:vt/cuda/|cuda_runtime)')
 RE_PP_IF = re.compile(r"^\s*#\s*(ifdef|ifndef|if)\b(.*)$")

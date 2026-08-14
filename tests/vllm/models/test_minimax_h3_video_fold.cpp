@@ -199,23 +199,41 @@ TEST_CASE("minimax_h3 video fold: ABI device selectors map through DeviceType") 
   // and this case asserts BOTH arms rather than skipping either — a skip here
   // would leave the CPU-only build, which is the one the defect hid on,
   // unmeasured.
-  const vt::DeviceType accelerator = vllm::platforms::CurrentPlatform().device_type();
-  const bool have_accelerator =
+  const vllm::platforms::Platform& platform = vllm::platforms::CurrentPlatform();
+  const vt::DeviceType accelerator = platform.device_type();
+  const bool have_backend =
       accelerator != vt::DeviceType::kCPU && vt::TryGetBackend(accelerator) != nullptr;
-  if (have_accelerator) {
+  // The THIRD question, asked here because the SOURCE asks it. A predicate that
+  // asks only the first two describes a different function than the one under
+  // test: on a PARTIAL backend (Metal, Tenstorrent) both of the first two are
+  // true, the source correctly refuses BY NAME, and a two-question predicate
+  // routes that correct refusal into the `== accelerator` arm — where it
+  // surfaces as an uncaught exception. That is a false RED on precisely the
+  // build class #659 exists to serve, and it is invisible on the CPU and CUDA
+  // boxes that run the gates, which is this row's own thesis about #659.
+  const bool accepts_architecture =
+      have_backend &&
+      platform.supports_model_architecture(vllm::multimodal::kMiniMaxH3VideoFamily);
+
+  if (accepts_architecture) {
     // On the CUDA box this is byte-for-byte the old answer.
     CHECK(vllm::multimodal::MiniMaxH3VideoDeviceType(1) == accelerator);
   } else {
-    // The assertion the cast could never make: on a CPU-only build, device 1 is
-    // REFUSED by name instead of returning kCUDA and failing one step later
-    // inside `vt::GetBackend(kCUDA)`.
+    // The assertion the cast could never make: device 1 is REFUSED by name
+    // instead of returning kCUDA and failing one step later inside
+    // `vt::GetBackend(kCUDA)`. WHICH refusal is itself asserted — a partial
+    // backend must be told it is partial, not told its backend is missing, and
+    // a right refusal for a wrong reason is a wrong diagnosis that reads as a
+    // right one.
+    const std::string want =
+        have_backend ? "DECLINES" : "no accelerator backend is registered";
     try {
       (void)vllm::multimodal::MiniMaxH3VideoDeviceType(1);
-      FAIL("device 1 must be refused when no accelerator backend is registered");
+      FAIL("device 1 must be refused when this build cannot honour it");
     } catch (const std::exception& e) {
       const std::string msg = e.what();
       INFO(msg);
-      CHECK(msg.find("no accelerator backend is registered") != std::string::npos);
+      CHECK(msg.find(want) != std::string::npos);
     }
   }
 }

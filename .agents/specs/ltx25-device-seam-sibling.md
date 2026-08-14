@@ -234,10 +234,75 @@ not be followed by a declarator suffix) and M29 pins both, together with the
 proof that the discriminators did not cost the real detection.
 
 **Residual blind spots are recorded in the checker's own docstring**, per §3's
-instruction: type aliases and template parameters that resolve to `DeviceType`,
-`bit_cast`/`memcpy`/union punning, conversions inside the unscanned `src/vt/`
-leg, and the fact that nothing type-checks the operand. The bucket flags every
-cast *to* `DeviceType` and relies on `DSR-ALLOW` for the legitimate ones.
+instruction: type aliases, macros and template parameters that resolve to
+`DeviceType`, `bit_cast`/`memcpy`/union punning, conversions inside the unscanned
+`src/vt/` leg, and the fact that nothing type-checks the operand. The bucket
+flags every cast *to* `DeviceType` and relies on `DSR-ALLOW` for the legitimate
+ones.
+
+## Findings from review (PR #671, head `094ac9e4`)
+
+**The bucket missed the purest form of the defect, and the test that ruled that
+out could not see it.** `(vt::DeviceType)d` scored 1; `(vt::DeviceType)1` scored
+**0**, because the C-style alternative's trailing lookahead admitted only
+`[A-Za-z_(]` and `1` is a digit. Naming a device by its literal enum value is
+precisely what this bucket exists to police. Worse, M29's "the discriminators did
+not cost the real detection" assertion used an *identifier* operand, so the test
+could not detect the gap it was written to rule out — a guard that certifies
+itself, which is the disease this row exists to fix, reproduced inside the row's
+own instrument. M29 now pins the literal and signed-literal operands first.
+
+**Four more plain spellings read GREEN in scanned files** and are closed rather
+than documented, each measured at zero new hits over `src/vllm` + `include/vllm`:
+global-scope qualification `static_cast<::vt::DeviceType>`, the
+elaborated-type-specifier `static_cast<enum vt::DeviceType>`, direct-list-init in
+a *declaration* (`vt::DeviceType dt{raw}` — M23 caught only the unnamed
+temporary), and pointer punning `*reinterpret_cast<vt::DeviceType*>(&raw)`.
+
+**The pointer form is what makes three of the four cast keywords real.**
+`reinterpret_cast`, `const_cast` and `dynamic_cast` to a scoped enum are
+ill-formed — compile-checked, all three rejected, with `static_cast` as a live
+control that compiles — so before this change those keywords could only ever
+match code that does not build, creating an appearance of coverage the pattern
+did not have. Matching a pointer target makes them live.
+
+**The declaration form takes `{` and never `(`, and that costs nothing.**
+`vt::DeviceType dt(raw)` is ill-formed (no implicit int→scoped-enum conversion),
+so excluding it loses no real spelling, whereas admitting `(` matched every
+function *definition* whose return type is `DeviceType` — measured, 3 false
+positives including `MiniMaxH3VideoDeviceType` and `ResolveExplicitDeviceType`.
+M34 pins that negative.
+
+**The fold test asked two of the three questions and so red on the build class
+#659 exists to serve.** `test_minimax_h3_video_fold.cpp`'s `have_accelerator`
+predicate tested only `device_type() != kCPU && TryGetBackend() != nullptr`. On
+Metal or Tenstorrent both are true, so the test took the `== accelerator` arm
+while the source *correctly* refused, and the refusal surfaced as an uncaught
+exception — a false RED, invisible on the CPU and CUDA boxes that run the gates,
+which is this row's own thesis about #659 turned against its own test. The
+predicate is now three-way and asserts *which* refusal, since a right refusal for
+a wrong reason is a wrong diagnosis that reads as a right one.
+
+**The decline CONSEQUENCE inverts the cited precedent, deliberately.** The PR
+described the change as mirroring `model_loader.cpp:97`, and it mirrors that
+site's *question* while inverting its *answer*. `:97`'s capability test lives on
+the `kAuto` path, whose response to a decline is to fall through to `:103` and
+**serve on CPU**; `metal.cpp:65-69` states that policy in as many words ("falls
+back to the CPU reference … and runs correctly, just slowly — which is strictly
+better than dying inside a kernel bind"). Both diffusion lanes instead **throw**.
+That is correct, but it is the *explicit-device* path's polarity, not the
+`kAuto` path's: `device = 1` is an explicit accelerator request, and
+`model_loader.cpp:71-72` already says of that path "an explicit accelerator whose
+queue cannot be created must FAIL the load loudly, never silently serve on CPU" —
+the same argument `ltx2_video.cpp:545-548` makes for refusing rather than serving
+the CPU forward behind an accelerator handle. So the lanes mirror the capability
+question from one path and the failure polarity from the other, and both halves
+are the seam's own.
+
+**Residual, not this row's to fix:** `vulkan.cpp` does not override
+`supports_model_architecture`, so it inherits `interface.h:263`'s default `true`
+and a partial Vulkan build still binds and dies inside a kernel. Only
+`metal.cpp:70` and `tenstorrent.cpp:52` narrow the claim.
 
 ## Now
 

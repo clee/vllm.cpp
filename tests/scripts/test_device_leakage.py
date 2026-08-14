@@ -20,7 +20,7 @@ The four things that must be true, and are each proven by a mutant below:
   4. The escape hatch is real, bounded and LOUD (M13-M15).
   5. The `dev_cast` bucket is derived from the PROPERTY — an integer becoming a
      `vt::DeviceType` outside the platform seam — and not from the one spelling
-     that happened to be in the tree when it was written (M20-M28, #660).
+     that happened to be in the tree when it was written (M20-M34, #660).
 
     python3 tests/scripts/test_device_leakage.py
 
@@ -499,15 +499,101 @@ class DsrRatchetMutationTests(unittest.TestCase):
             "using Fn = void(vt::DeviceType);\n",
         )
         self.assertEqual(self.tree.scan().counts["dev_cast"], 0)
-        # …and the discriminator must not have cost the real thing: the same file
-        # with an actual C-style cast still fails.
+        # …and the discriminator must not have cost the real thing. The operand
+        # asserted FIRST is a LITERAL, because that is the form the discriminator
+        # actually did cost: `(vt::DeviceType)1` — the device named by its raw
+        # enum value — is the PUREST case this bucket exists to police, and an
+        # identifier-only trailing class let it through while still catching
+        # `(vt::DeviceType)d`. A discriminator exercised only on the case it was
+        # tuned for is a guard that certifies itself, which is the disease this
+        # row is fixing; so both operand kinds are pinned here.
         self.tree.append(
             "src/vllm/model_executor/models/toy.cpp",
-            "vt::DeviceType R(int d) { return (vt::DeviceType)d; }\n",
+            "vt::DeviceType RLit(int d) { return (vt::DeviceType)1; }\n",
         )
         rc, _out, err = self.tree.run()
         self.assertEqual(rc, 1)
         self.require(err, "DSR REGRESSION in bucket 'dev_cast': 1 > baseline 0")
+        # A SIGNED literal is the same conversion with one more character.
+        self.tree.append(
+            "src/vllm/model_executor/models/toy.cpp",
+            "vt::DeviceType RNeg(int d) { return (vt::DeviceType)-1; }\n",
+        )
+        rc, _out, err = self.tree.run()
+        self.assertEqual(rc, 1)
+        self.require(err, "DSR REGRESSION in bucket 'dev_cast': 2 > baseline 0")
+        # And the identifier operand, in the SAME file as the false-positive
+        # fixture, so the two discriminators are shown not to have cost it.
+        self.tree.append(
+            "src/vllm/model_executor/models/toy.cpp",
+            "vt::DeviceType RId(int d) { return (vt::DeviceType)d; }\n",
+        )
+        rc, _out, err = self.tree.run()
+        self.assertEqual(rc, 1)
+        self.require(err, "DSR REGRESSION in bucket 'dev_cast': 3 > baseline 0")
+
+    def test_M30_a_global_scope_qualified_target_fails(self) -> None:
+        # `::vt::DeviceType` and `vt::DeviceType` name ONE type. A pattern that
+        # recognised only the second would be the token grep again, one
+        # qualification later.
+        rc, _out, err = self.plant(
+            "vt::DeviceType Resolve(int32_t d) {\n"
+            "  return static_cast<::vt::DeviceType>(d);\n"
+            "}\n"
+        )
+        self.assertEqual(rc, 1)
+        self.require(err, "DSR REGRESSION in bucket 'dev_cast': 1 > baseline 0")
+
+    def test_M31_an_elaborated_type_specifier_target_fails(self) -> None:
+        # `enum vt::DeviceType` is the same type spelled the C way. It compiles.
+        rc, _out, err = self.plant(
+            "vt::DeviceType Resolve(int32_t d) {\n"
+            "  return static_cast<enum vt::DeviceType>(d);\n"
+            "}\n"
+        )
+        self.assertEqual(rc, 1)
+        self.require(err, "DSR REGRESSION in bucket 'dev_cast': 1 > baseline 0")
+
+    def test_M32_list_initialising_a_NAMED_declaration_fails(self) -> None:
+        # M23 catches the UNNAMED temporary `vt::DeviceType{d}`. Giving the same
+        # conversion a name is the spelling a person would actually write, and it
+        # is the one M23 alone let through.
+        rc, _out, err = self.plant(
+            "vt::DeviceType Resolve(int32_t d) {\n"
+            "  vt::DeviceType dt{d};\n"
+            "  return dt;\n"
+            "}\n"
+        )
+        self.assertEqual(rc, 1)
+        self.require(err, "DSR REGRESSION in bucket 'dev_cast': 1 > baseline 0")
+
+    def test_M33_pointer_punning_onto_a_devicetype_fails(self) -> None:
+        # The ONE form `reinterpret_cast` can legally take: casting to a scoped
+        # enum directly is ill-formed, so without the pointer target the three
+        # non-`static_cast` keywords in the pattern are decoration — they could
+        # only ever match code that does not compile.
+        rc, _out, err = self.plant(
+            "vt::DeviceType Resolve(uint8_t r) {\n"
+            "  return *reinterpret_cast<vt::DeviceType*>(&r);\n"
+            "}\n"
+        )
+        self.assertEqual(rc, 1)
+        self.require(err, "DSR REGRESSION in bucket 'dev_cast': 1 > baseline 0")
+
+    def test_M34_a_function_RETURNING_DeviceType_is_not_a_conversion(self) -> None:
+        # The false positive M32's declaration form produces if it accepts `(` as
+        # well as `{`. These three shapes are all real sites in this repository
+        # (`MiniMaxH3VideoDeviceType`, `ResolveExplicitDeviceType`), and reading a
+        # function definition as a cast would red the tree for declaring the very
+        # seam this bucket wants people to use.
+        self.tree.append(
+            "src/vllm/model_executor/models/toy.cpp",
+            "vt::DeviceType MiniMaxH3VideoDeviceType(int32_t device);\n"
+            "vt::DeviceType ResolveExplicitDeviceType(const Params& p) { return kCpu; }\n"
+            "enum vt::DeviceType Named(int d);\n"
+            "::vt::DeviceType AlsoNamed(int d) { return kCpu; }\n",
+        )
+        self.assertEqual(self.tree.scan().counts["dev_cast"], 0)
 
     def test_M28_dsr_allow_exempts_a_dev_cast_and_says_so_loudly(self) -> None:
         # The legitimate case the risk register names: a deserialization boundary
