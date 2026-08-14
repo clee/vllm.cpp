@@ -1147,6 +1147,13 @@ VLLM_CPP_INDEXTTS2_GPT=... VLLM_CPP_INDEXTTS2_TIKTOKEN=... \
   ./build/tests/test_indextts2_e2e
 ```
 
+A REAL LIMITATION to know before using it: the reference clip is required and
+then IGNORED. Its encoders are ported and their checkpoints are staged, but the
+conditioning rows are zeros, so two different reference voices give the same
+output today. `campplus::LoadCampplus` reads its weights but
+`campplus::Forward` returns NaN on them, which is an open defect recorded in
+the spec and blocks the wiring.
+
 It asserts STRUCTURE, not quality: nothing is compared against vLLM-Omni, which
 is unpinned (#633). The TOKENIZER it uses:
 `tiktoken::LoadRanks` reads the shipped `.tiktoken` vocabulary and
@@ -1324,6 +1331,7 @@ a stop token early.
 | `--tool-call-parser <name>` | `hermes` | Tool-call dialect (42 names over 38 families). `auto` detects from the chat template, `none` disables. For `gemma4`, OpenAI chat uses the text-seam parser (wrapped `<\|tool_call>` **or** bare `call:NAME{ARGS}`) so free-form / detokenized tool bodies still become `tool_calls`. **`inkling` needs `"skip_special_tokens": false` on the request today** — its whole grammar is special tokens and we have no `adjust_request` seam to force the flag off for you, so at the `true` default the detokenizer strips the markers before the parser runs ([#695](https://github.com/mudler/vllm.cpp/issues/695)). `--reasoning-parser inkling` is not registered at all ([#703](https://github.com/mudler/vllm.cpp/issues/703)) |
 | `--reasoning-parser <name>` | `none` | Reasoning parser (`think_auto`, `deepseek_r1`, `deepseek_v3`, `holo2`, `mistral`, `minimax_m2`, `minimax_m2_append_think`, `step3`, `olmo3`, `muse_glimmer`, `qwen3`, `mimo`). `auto` detects, `none` disables. `qwen3` and its `mimo` alias are the engine-backed adapter (one upstream class, two registry names): thinking is ON, so a marker-less stream is reasoning and a `<tool_call>` ends reasoning with no `</think>`. `auto` never selects it — a generic `<think>` template resolves to `think_auto`, which is the right default for hybrid-thinking models that may answer with no think block at all |
 | `--kv-transfer-config '<json>'` | (unset) | External KV connector, same JSON as vLLM's flag. See [docs/KV-OFFLOAD.md](KV-OFFLOAD.md) |
+| `--offload-config '<json>'` | (unset) | vLLM's `OffloadConfig` for **weight** offload, the same JSON vLLM takes (distinct from `--kv-transfer-config`, which offloads KV blocks). `offload_backend` is `auto` (default), `uva` or `prefetch`; `uva.cpu_offload_gb` sets the per-GPU budget and `uva.cpu_offload_params` targets parameters by dotted name SEGMENT (`"experts"` matches `mlp.experts.w2_weight`, `"w2"` does not). Parsed AND validated at startup, so a malformed document, an unknown backend or a validator violation is refused before any model I/O; a backend/field mismatch is a WARNING, as upstream. **Accepted and inert today: nothing moves a weight yet** (`ENG-WEIGHT-OFFLOAD` W0b wires config end to end; the offloader is W2/W5), so setting `cpu_offload_gb` frees no memory. Said plainly because a silently-ignored budget is worse than a documented one ([spec](../.agents/specs/weight-offload-uva.md), [#797](https://github.com/mudler/vllm.cpp/issues/797)) |
 | `--speculative-config '<json>'` | (unset) | Speculative decoding (`mtp`, `dflash`, `ngram`), same JSON as vLLM's flag. `dspark` speculates on the Qwen3.6 gate models (native + Speculators drafts), token-identically to speculative-off, but is not gated on speed (currently ~2% behind at c1). A GGUF target, or a target with no aux multi-tap, is refused by name (`SPEC-DSPARK`). Its sequential Markov sampling runs on device by default; `VT_DSPARK_DEVICE_SAMPLE=0` restores the host loop (token-identical, cost only). The speculative verify runs from a captured CUDA graph, worth +12.2%/+3.5% on the 35B cells; `VT_SPEC_DECODE_GRAPH=0` restores the eager verify (also token-identical). See [docs/SPECULATIVE-DECODING.md](SPECULATIVE-DECODING.md) |
 | `--language-model-only` / `--no-language-model-only` | off | Disable all multimodal input by setting **every** modality limit to 0, mirroring vLLM's flag of the same name. It is not a "skip the encoder" switch: the server then **refuses** a multimodal request with ``400 At most 0 image(s) may be provided in one prompt. Set `--limit-mm-per-prompt` to increase this limit.`` It does **not** free VRAM yet — nothing gates tower construction on it ([#607](https://github.com/mudler/vllm.cpp/issues/607) wave L3) |
 | `--limit-mm-per-prompt '<json>'` | (unset ⇒ 999 per modality) | Maximum multimodal input items per prompt, per modality, as the same JSON object vLLM's flag takes: `'{"image": 2, "video": 0}'`, or with profiling options `'{"video": {"count": 1, "num_frames": 32}}'` (the options are validated and ignored — they size dummy inputs for memory profiling, which this engine does not do). A limit can only **lower** what the model/seam supports, never raise it. Malformed JSON, a negative count, or an unknown option on `image` / `video` / `audio` is refused at startup rather than defaulted. An unknown option on any other modality name is dropped rather than refused, mirroring upstream, whose fallback `BaseDummyOptions` is the one such dataclass without `extra="forbid"`. Upstream's dotted spelling (`--limit-mm-per-prompt.image 2`) is not accepted here, as for `--kv-transfer-config` and `--speculative-config` |
@@ -2524,6 +2532,92 @@ python3 scripts/gen-minimax-music3-manifest.py \
   --checkpoint /path/to/minimax-music3 \
   --output tests/vllm/models/minimax_music3_manifest.inc
 ```
+
+### MiniMax-Music3: the quantized arms
+
+**One quantized arm loads: the RVQ depth decoder from a GGUF Q4_K file.**
+Everything else is the bf16/fp32 diffusers checkpoint — bf16 `language_model` +
+`rvq_depth_decoder` + `condition_encoder`, fp32 `transformer` + `vocoder`,
+~28.5 GB resident.
+
+The implemented arm is pinned to a specific artifact, because an unpinned
+quantized checkpoint is not reproducible:
+
+| Field | Value |
+|---|---|
+| repo | `audio-cpp/MiniMax-Music3-GGUF` |
+| revision | `c36aaeed683f33b05796788e4204f4eeba8fa547` |
+| file | `rvq_depth_decoder_q4_k.gguf` (405 752 480 bytes) |
+| sha256 | `4c5d41b27418d9c1046345f649cb61d7cde0e3bbda4af7f7cb142df2c70cbdd0` |
+
+`MiniMaxMusic3LoadRvqDepthDecoderFromGguf` reads it: 47 tensors as 36 Q4_K
+projections, 9 BF16 norms and 2 F16 embedding tables, dequantized to bf16
+through the shared `gguf_dequant.h` seam. Only the **audio-cpp lineage** is
+read, keyed on `audiocpp.model_spec.family == "minimax_music3"` — not on
+`general.architecture`, which reads `audiocpp`, `mm3`, `qwen3` *and* `wan` across
+GGUFs of this one model and collides with genuine Wan video checkpoints. The
+other two published lineages are refused by name.
+
+**The other quantized formats still refuse**, and quantized MiniMax-Music3
+checkpoints do exist in five formats — a survey on 2026-08-14 found fourteen
+community repositories. Rather than mis-loading one or failing with a confusing
+shape error, `MiniMaxMusic3ResolveCheckpoint`, `MiniMaxMusic3AccountTensors` and
+`MiniMaxMusic3LoadConfig` each refuse **by name**:
+
+```
+minimax_music3: this checkpoint is QUANTIZED -- GGUF (evidence:
+condition_encoder.gguf, language_model_q4_k.gguf, ...; 5 of 5 entries examined
+carry the marker). NO quantized arm is implemented for MiniMax-Music3, so this
+is REFUSED rather than mis-loaded: a GGUF arm needs a name map, the
+GGUF-vs-torch dim reversal, a geometry source, and k-quant dequantization routed
+through vllm/model_executor/model_loader/gguf_dequant.h ...
+The supported arm is the bf16/fp32 diffusers arm ... The quantized arms are owed
+rather than forgotten: phase W7 of .agents/specs/minimax-music3.md, issue #672.
+```
+
+Eight formats are diagnosed — GGUF, NVFP4, MXFP4, FP8, INT8, AWQ/GPTQ,
+bitsandbytes and MLX — plus an `UNIDENTIFIED` case. Each message names the
+evidence found in *your* file, how many entries carried it, what a working arm
+would need, and the arm that does load. Detection happens in three places,
+because a quantized checkpoint announces itself in three different ways:
+
+| You point us at | Caught by | Because |
+|---|---|---|
+| a directory of `.gguf` files | the tree walk (depth 2, so `diffusion_models/` and `text_encoders/` count) | there is no component directory and no config to inspect |
+| a diffusers-shaped tree whose tensors are quantized | the manifest scan, from safetensors headers only | the sidecars (`weight_scale_2`, `weight_packed`, `qweight`, `absmax`) and the dtype-only formats (fp8, int8) are invisible to a shape check |
+| a checkpoint that *declares* it | the config parse | `quantization_config.quant_method`, or MLX's bare `quantization` |
+
+A bare `weight_scale` with no `weight_scale_2` and no `weight_packed` is
+reported as unidentified and the message names all three candidate schemes. It
+never picks one: guessing yields a finite, correctly shaped, correctly scaled,
+**wrong** result that no shape gate can see.
+
+Note if you hold a ComfyUI-format Music3 GGUF: those ship the DiT and condition
+encoder only — no language model, no depth decoder, no vocoder — so they cannot
+generate audio even once a GGUF arm lands.
+
+The refusal gate needs no checkpoint and no network:
+
+```sh
+cmake --build build -j 8 --target test_minimax_music3_quant
+./build/tests/test_minimax_music3_quant
+```
+
+The Q4_K arm's own gate needs the pinned GGUF and the bf16 checkpoint, and skips
+loudly without them:
+
+```sh
+CHECKPOINT_ROOT=/mnt/nas_share/checkpoints \
+  ./build/tests/test_minimax_music3_quant_real
+```
+
+It does not merely check that the numbers land inside a tolerance. It asserts
+the **resident ggml type** of all 47 tensors, checks the dequantized values lie
+on the **Q4_K lattice** (at most 16 distinct values per 32-element sub-block —
+a structure a bf16 read cannot produce), and bounds the output **two-sidedly**.
+The lower bound is the important one: a silent dequant fallback to the bf16
+weights lands *closer* to the golden (mean|d| 0.00182) than the genuine
+quantized arm (0.0324), so upper bounds alone cannot tell them apart.
 
 ### IndexTTS-2.5 goldens and checkpoint manifests
 
