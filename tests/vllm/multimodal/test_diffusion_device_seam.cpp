@@ -8,7 +8,7 @@
 // exists precisely so a partial backend can decline BY NAME — Metal registers 15
 // of 75 ops and Tenstorrent a comparable slice, and both name exactly two
 // architectures (src/vllm/platforms/metal.cpp:70,
-// src/vllm/platforms/tenstorrent.cpp:52). On such a build a `device = 1`
+// src/vllm/platforms/tenstorrent.cpp:55). On such a build a `device = 1`
 // diffusion load WAS refused by name and became a queue bind that dies later
 // inside a kernel with a shape error.
 //
