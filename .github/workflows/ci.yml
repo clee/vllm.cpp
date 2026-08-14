@@ -155,6 +155,17 @@ jobs:
         # so this needs no model, no GPU and no quiet box.
         run: |
           python3 tests/scripts/test_cpu_x86_llamacpp_floor.py
+      - name: The IndexTTS-2.5 port still matches the shipped checkpoint (#634)
+        # These three read committed copies of the checkpoint's own config and
+        # safetensors header, so they need no network, no weights and no GPU.
+        # They landed in #727 and earlier WITHOUT a CI line, which made them
+        # run-if-you-remember rather than gates; wiring them is the point.
+        run: |
+          python3 tests/scripts/test_indextts2_config_contract.py
+          python3 tests/scripts/test_indextts2_emotion_arch_covered.py
+          python3 tests/scripts/test_indextts2_pth_manifest.py
+          python3 tests/scripts/test_indextts2_convert.py
+          python3 tests/scripts/test_vocoder1d_single_home.py
       - name: Critical regression tests remain executable and CTest-registered
         run: |
           python3 scripts/check-test-registration.py
@@ -412,10 +423,11 @@ jobs:
           echo "OK: all new commits carry FOLLOWING_AGENTS_PROTOCOL."
   pr-size:
     # PR-only. The per-class LINE BUDGETS this job used to enforce were retired
-    # 2026-08-10 (see scripts/check-pr-size.py); the job name is kept because it
-    # is a required check. What it enforces now: explicit path classification,
-    # the fail-closed binary guard, the checker-change mutation-evidence
-    # contract, and the role check that keeps product paths on a PR.
+    # 2026-08-10, and the fail-closed BINARY GUARD was retired 2026-08-13 (see
+    # scripts/check-pr-size.py for both); the job name is kept because it is a
+    # required check. What it enforces now: explicit path classification, the
+    # checker-change mutation-evidence contract, and the role check that keeps
+    # product paths on a PR. Nothing here measures the size of a diff.
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     steps:
