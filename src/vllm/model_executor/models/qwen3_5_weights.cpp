@@ -605,9 +605,23 @@ void LoadMoeExpertsInto(const TensorResolver& get, const std::string& mlp,
 //              {"w1": 0, "w2": 1, "w3": 0}.
 //   unquantized_fused_moe_method.py:97-106 allocates `w13_weight` as
 //              [num_experts, 2 * intermediate, hidden] — the canonical form.
-//   activation.py:77,:161 dispatches SILU to `silu_and_mul`, which applies SiLU
-//              to the FIRST half of the concatenated operand. Rows [0, I) are
-//              therefore the gate, independently of any loader bookkeeping.
+//   activation.py:118-143 `SiluAndMul` is `silu(x[..., :d]) * x[..., d:]` with
+//              `d = x.shape[-1] // 2`, so SiLU lands on the FIRST half of the
+//              fused operand. Rows [0, I) are the gate independently of any
+//              loader bookkeeping.
+//
+// And HUGGINGFACE DECLARES THE AXIS ORDER OUTRIGHT, which is what makes
+// upstream's runtime `shape[-1] != hidden` probe a compatibility branch rather
+// than the authority — transformers 5.3.0
+// models/qwen3_5_moe/modeling_qwen3_5_moe.py:812-844:
+//   :820  self.gate_up_proj = nn.Parameter(
+//             torch.empty(num_experts, 2 * intermediate_dim, hidden_dim))
+//   :821  self.down_proj = nn.Parameter(
+//             torch.empty(num_experts, hidden_dim, intermediate_dim))
+//   :842  gate, up = linear(current_state, self.gate_up_proj[e]).chunk(2, -1)
+// `F.linear(x, W)` is `x @ W.T`, so output column j is row j of W: `gate` is
+// rows [0, I) of `gate_up_proj[e]`. `modular_qwen3_5_moe.py:164` names the same
+// split in its TP plan — "experts.gate_up_proj": "packed_colwise".
 //
 // Corroborated against the real published indices, read from each shard's own
 // safetensors header 2026-08-14 (the generator and the captured manifest are

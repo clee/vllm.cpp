@@ -497,7 +497,7 @@ std::vector<Spec> MoeSpecsWithBf16LmHead(const std::string& p) {
 // THE ROUTED-EXPERT INTERMEDIATE IS DELIBERATELY *NOT* `kMoeInter`. The loader
 // resolves a stacked tensor's orientation exactly as upstream does -- last dim
 // is hidden => `[E, 2I, H]`, else `[E, H, 2I]`
-// (vllm/model_executor/layers/fused_moe/routed_experts.py:925-936 @ 555967922)
+// (vllm/model_executor/layers/fused_moe/routed_experts.py:923-934 @ 555967922)
 // -- so a fixture with I == H makes the two orientations INDISTINGUISHABLE and
 // the expectation below unfalsifiable. 32 against a hidden of 16 keeps H (16),
 // I (32) and 2I (64) pairwise distinct, which is what lets the transposed
@@ -1325,19 +1325,31 @@ TEST_CASE("qwen3_8: the published stacked/unquantized MoE arm is REFUSED, and th
 //     THE SLICING ORDER IS NOT GUESSED FROM SHAPES. It is upstream's, read at
 //     the parity pin `555967922`:
 //
-//       vllm/model_executor/layers/fused_moe/routed_experts.py:1080-1083
+//       vllm/model_executor/layers/fused_moe/routed_experts.py:1081-1083
 //         (f"{w13}weight", f"experts.gate_up_proj", 0, "w1"),
 //         (f"{w13}weight", f"experts.gate_up_proj", 1, "w3"),
 //         (f"{w2}weight",  f"experts.down_proj",    0, "w2"),
-//       vllm/model_executor/layers/fused_moe/routed_experts.py:925-936
+//       vllm/model_executor/layers/fused_moe/routed_experts.py:923-934
 //         if fused_weight.shape[-1] != unpadded_hidden:
 //             fused_weight = fused_weight.transpose(-1, -2)
 //         experts_shard = fused_weight.chunk(2, dim=1)[expert_id]   # w1 | w3
 //         ...
 //         if fused_weight.shape[-2] != unpadded_hidden:
 //             fused_weight = fused_weight.transpose(-1, -2)
-//       vllm/model_executor/layers/fused_moe/routed_experts.py:944
+//       vllm/model_executor/layers/fused_moe/routed_experts.py:942
 //         loaded_experts = experts_shard.unbind()   # expert stride is dim 0
+//
+//     And the HuggingFace side declares the same axis order outright, which is
+//     what makes the runtime sniff above a compatibility branch rather than the
+//     authority — transformers 5.3.0
+//     models/qwen3_5_moe/modeling_qwen3_5_moe.py:820-821:
+//         self.gate_up_proj = nn.Parameter(
+//             torch.empty(num_experts, 2 * intermediate_dim, hidden_dim))
+//         self.down_proj = nn.Parameter(
+//             torch.empty(num_experts, hidden_dim, intermediate_dim))
+//     with :842 `linear(x, gate_up_proj[e]).chunk(2, dim=-1)` -> gate is rows
+//     [0, I) of that weight. `modular_qwen3_5_moe.py:164` names the same split
+//     in its TP plan: "layers.*.mlp.experts.gate_up_proj": "packed_colwise".
 //
 //     So: normalize `gate_up_proj` to `[E, 2I, H]` (last dim hidden), split it
 //     in half along dim 1 with the FIRST half gate/w1 and the second up/w3;
@@ -1722,6 +1734,20 @@ TEST_CASE("qwen3_8: the pinned 2.4T shape manifest agrees with the published ind
   CHECK(static_cast<int64_t>(index["metadata"]["total_size"].get<double>()) ==
         vllm_test::kQwen38_2_4TTotalSize);
   CHECK(vllm_test::kQwen38_2_4TTotalSize == 4892365451008LL);
+
+  // BOTH ARTIFACTS ARE PINNED TO A COMMIT, not to `main`. A published repo can
+  // be re-quantized under its own name — `unsloth/...-27B` went from NVFP4 to
+  // FP8 that way — and a manifest captured from a moving ref records shapes
+  // nobody can re-derive. The committed `model.safetensors.index.json` above is
+  // byte-identical to
+  //   https://huggingface.co/Qwen/Qwen3.8-2.4T-A95B/raw/<kQwen38_2_4TRevision>/
+  // and re-running the generator at these two revisions reproduces the manifest
+  // exactly. Asserting them here is what makes the pin falsifiable in tree: a
+  // regenerated fixture that silently moved to another revision fails this.
+  CHECK(std::string(vllm_test::kQwen38_2_4TRevision) ==
+        "207bd685a7e3696cfaff12ded7c6a7ea0f88c996");
+  CHECK(std::string(vllm_test::kQwen36_35BRevision) ==
+        "995ad96eacd98c81ed38be0c5b274b04031597b0");
 }
 
 namespace {

@@ -202,10 +202,25 @@ Because a swapped gate/up loads cleanly and only shows up in logits, that one
 bit was confirmed three further ways: `_load_w13` narrowing w1 to destination
 offset 0 and w3 to `shard_size` (`:494-500`, with `SHARD_ID_TO_SHARDED_DIM` at
 `:656`); `unquantized_fused_moe_method.py:97-106` allocating `w13_weight` as
-`[num_experts, 2 * intermediate, hidden]`; and `activation.py:77,:161`
-dispatching SiLU to `silu_and_mul`, which applies SiLU to the FIRST half of the
-concatenated operand — a confirmation that does not depend on loader
-bookkeeping at all.
+`[num_experts, 2 * intermediate, hidden]`; and `activation.py:118-143`, where
+`SiluAndMul` is `silu(x[..., :d]) * x[..., d:]` with `d = x.shape[-1] // 2`, so
+SiLU lands on the FIRST half of the fused operand — a confirmation that does not
+depend on loader bookkeeping at all. (An earlier revision of this section cited
+`activation.py:77,:161` for that last one; those lines are `FatreluAndMul` and
+`SiluAndMulWithClamp`. The claim was right and the anchor was wrong, and a wrong
+anchor is how a right claim stops being checkable.)
+
+**And HuggingFace declares the axis order outright**, which is what makes
+upstream's runtime `shape[-1] != hidden` probe a compatibility branch rather than
+the authority. transformers 5.3.0
+`models/qwen3_5_moe/modeling_qwen3_5_moe.py:820-821` declares `gate_up_proj` as
+`[num_experts, 2 * intermediate_dim, hidden_dim]` and `down_proj` as
+`[num_experts, hidden_dim, intermediate_dim]`, and `:842` consumes it as
+`linear(x, gate_up_proj[e]).chunk(2, dim=-1)` — `F.linear` being `x @ W.T`,
+output column j is row j of W, so gate is rows `[0, I)`.
+`modular_qwen3_5_moe.py:164` names the same split in its TP plan:
+`"experts.gate_up_proj": "packed_colwise"`. The identical declaration appears in
+`qwen3_next` (`:828-829`) and `qwen3_moe` (`:226-227`).
 
 Both published repos ship the **canonical** orientation, read from each shard's
 own safetensors header on 2026-08-14: `Qwen/Qwen3.8-2.4T-A95B` `gate_up_proj`
@@ -249,6 +264,34 @@ rather than hiding it.
 The same dry run runs against the real `Qwen/Qwen3.6-35B-A3B` index, which says —
 **before anyone stages 71.9 GB** — that the binding gate's checkpoint will hit
 the same three owed arms.
+
+### Both fixtures are pinned to a commit, and the manifest is reproducible
+
+The generator originally fetched `/resolve/main/`. That is the defect
+[#471](https://github.com/mudler/vllm.cpp/issues/471) exists for at the gate
+level and the one `unsloth/...-27B` demonstrated at the checkpoint level, where a
+repo was silently re-quantized from NVFP4 to FP8 under its own name: a manifest
+captured from a moving ref records shapes nobody can re-derive. Every fetch is
+now pinned, and the revisions are emitted into the generated header and asserted
+in the suite:
+
+| Repo | Revision | Published bytes |
+|---|---|---|
+| `Qwen/Qwen3.8-2.4T-A95B` | `207bd685a7e3696cfaff12ded7c6a7ea0f88c996` | 4,892,365,451,008 |
+| `Qwen/Qwen3.6-35B-A3B` | `995ad96eacd98c81ed38be0c5b274b04031597b0` | 71,903,645,408 |
+
+Verified rather than asserted, on 2026-08-14:
+
+- the committed `model.safetensors.index.json` is **byte-identical** (md5
+  `c5a85e3e3e255a2560ff6906b0f44577`) to
+  `huggingface.co/Qwen/Qwen3.8-2.4T-A95B/raw/207bd685.../model.safetensors.index.json`;
+- re-running the generator at both pinned revisions **reproduces
+  `qwen3_5_stacked_shapes.inc` byte for byte** (1609 tensors / 213 shards and
+  1045 / 26), with each repo's summed `numel * sizeof(dtype)` equal to the
+  `metadata.total_size` its own index declares.
+
+That is what makes the manifest usable as ground truth: it is a capture anyone
+can re-derive, not a transcription anyone must trust.
 
 ### Why the plan is a projection of the loader and not a second model of it
 

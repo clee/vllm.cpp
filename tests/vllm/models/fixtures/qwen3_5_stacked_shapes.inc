@@ -11,6 +11,10 @@
 // generator refuses to emit unless the summed `numel * sizeof(dtype)` over every
 // tensor equals it exactly. The C++ side re-checks the same sum, so this file
 // cannot drift from the published index without a test going red.
+//
+// Every fetch is PINNED to the commit revision named beside each repo below. A
+// capture from `main` records shapes nobody can re-derive once the repo moves,
+// and Qwen repos do move under their own names.
 #pragma once
 
 #include <cstdint>
@@ -26,8 +30,10 @@ struct StackedRepoTensor {
   int32_t rank;
 };
 
-// Qwen/Qwen3.8-2.4T-A95B -- 1609 tensors over 213 shards.
+// Qwen/Qwen3.8-2.4T-A95B @ 207bd685a7e3696cfaff12ded7c6a7ea0f88c996
+// -- 1609 tensors over 213 shards.
 inline constexpr const char* kQwen38_2_4TRepo = "Qwen/Qwen3.8-2.4T-A95B";
+inline constexpr const char* kQwen38_2_4TRevision = "207bd685a7e3696cfaff12ded7c6a7ea0f88c996";
 inline constexpr int64_t kQwen38_2_4TTensorCount = 1609;
 inline constexpr int64_t kQwen38_2_4TTotalSize = 4892365451008;
 inline constexpr StackedRepoTensor kQwen38_2_4TTensors[] = {
@@ -1642,8 +1648,10 @@ inline constexpr StackedRepoTensor kQwen38_2_4TTensors[] = {
     {"mtp.pre_fc_norm_hidden.weight", "BF16", {8192, 0, 0, 0, 0}, 1},
 };
 
-// Qwen/Qwen3.6-35B-A3B -- 1045 tensors over 26 shards.
+// Qwen/Qwen3.6-35B-A3B @ 995ad96eacd98c81ed38be0c5b274b04031597b0
+// -- 1045 tensors over 26 shards.
 inline constexpr const char* kQwen36_35BRepo = "Qwen/Qwen3.6-35B-A3B";
+inline constexpr const char* kQwen36_35BRevision = "995ad96eacd98c81ed38be0c5b274b04031597b0";
 inline constexpr int64_t kQwen36_35BTensorCount = 1045;
 inline constexpr int64_t kQwen36_35BTotalSize = 71903645408;
 inline constexpr StackedRepoTensor kQwen36_35BTensors[] = {

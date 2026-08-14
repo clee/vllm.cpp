@@ -28,10 +28,18 @@ import struct
 import sys
 import urllib.request
 
-# (C++ identifier infix, HF repo id, revision pinned in the .inc header).
+# (C++ identifier infix, HF repo id, PINNED commit revision).
+#
+# THE REVISION IS PART OF THE CAPTURE, not decoration. `main` is a moving target
+# -- `unsloth/...-27B` was silently re-quantized from NVFP4 to FP8 under its own
+# name -- so a manifest captured from `main` records shapes nobody can re-derive.
+# Every fetch below goes through `/resolve/<rev>/` and `/raw/<rev>/`, and the
+# revisions are emitted into the generated header so the C++ side names them too.
 REPOS = [
-    ("Qwen38_2_4T", "Qwen/Qwen3.8-2.4T-A95B"),
-    ("Qwen36_35B", "Qwen/Qwen3.6-35B-A3B"),
+    ("Qwen38_2_4T", "Qwen/Qwen3.8-2.4T-A95B",
+     "207bd685a7e3696cfaff12ded7c6a7ea0f88c996"),
+    ("Qwen36_35B", "Qwen/Qwen3.6-35B-A3B",
+     "995ad96eacd98c81ed38be0c5b274b04031597b0"),
 ]
 
 # Byte width of every safetensors dtype these repos use. A dtype outside this
@@ -62,8 +70,8 @@ def shard_header(base, shard):
     raise RuntimeError(f"could not read header of {shard}: {last}")
 
 
-def capture(repo):
-    base = f"https://huggingface.co/{repo}/resolve/main/"
+def capture(repo, revision):
+    base = f"https://huggingface.co/{repo}/resolve/{revision}/"
     index = json.loads(
         urllib.request.urlopen(base.replace("/resolve/", "/raw/") + "model.safetensors.index.json", timeout=90).read()
     )
@@ -105,6 +113,10 @@ def main():
         "// generator refuses to emit unless the summed `numel * sizeof(dtype)` over every",
         "// tensor equals it exactly. The C++ side re-checks the same sum, so this file",
         "// cannot drift from the published index without a test going red.",
+        "//",
+        "// Every fetch is PINNED to the commit revision named beside each repo below. A",
+        "// capture from `main` records shapes nobody can re-derive once the repo moves,",
+        "// and Qwen repos do move under their own names.",
         "#pragma once",
         "",
         "#include <cstdint>",
@@ -121,11 +133,13 @@ def main():
         "};",
         "",
     ]
-    for ident, repo in REPOS:
-        tensors, total, shards = capture(repo)
+    for ident, repo, revision in REPOS:
+        tensors, total, shards = capture(repo, revision)
         out += [
-            f"// {repo} -- {len(tensors)} tensors over {shards} shards.",
+            f"// {repo} @ {revision}",
+            f"// -- {len(tensors)} tensors over {shards} shards.",
             f'inline constexpr const char* k{ident}Repo = "{repo}";',
+            f'inline constexpr const char* k{ident}Revision = "{revision}";',
             f"inline constexpr int64_t k{ident}TensorCount = {len(tensors)};",
             f"inline constexpr int64_t k{ident}TotalSize = {total};",
             f"inline constexpr StackedRepoTensor k{ident}Tensors[] = {{",
