@@ -57,7 +57,7 @@ MATRICES = {
     # (324/373/356/310/261 is unchanged), because like the MuseGlimmer, KimiK3
     # and MiniMaxH3DiT rows they carry no pinned-registry target. Bumped
     # because seven new rows EXIST, never to make a transition pass.
-    # 363 since 2026-08-11: +`MODEL-DIFFUSION-ltx-2-5-ltx2-video-transformer-3d-model`
+    # 370 since 2026-08-13: +`MODEL-DIFFUSION-ltx-2-5-ltx2-video-transformer-3d-model`
     # (Lightricks LTX-2.5, 21.00B joint video+audio DiT, released 2026-08). A FOURTH
     # beyond-pin row, and like Muse Glimmer it is absent from `555967922` because it
     # did not exist yet. Unlike the others it is also out-of-repo: the architecture
@@ -65,6 +65,20 @@ MATRICES = {
     # stops at 2.3 (`ltx2_recipes.py:162-166`), with 2.5 still OPEN upstream at
     # vllm-omni#6066. Same lane as the MiniMax-H3 diffusion row. Bumped because a new
     # row EXISTS, never to make a transition pass.
+    #
+    # This entry READ `363 since 2026-08-11` until #651. Both halves were wrong,
+    # and 363 is a value this pin has never held at any commit in its history —
+    # so the entry described a transition that never happened, in a log whose
+    # whole job is to say why each bump was legitimate. Re-derived from git
+    # rather than carried forward, which is the only way any number in this
+    # block is ever allowed to move: `git log -S` on the row id finds exactly
+    # one commit, `cefacd2d0` (2026-08-13), and the pin reads 369 at
+    # `cefacd2d0~1` and 370 at `cefacd2d0`. What makes that checkable rather
+    # than plausible is the block itself — 358, 360, 361, 362, 369, 370, 372,
+    # 373, 375, 377 is the sequence of values this pin has actually held, in the
+    # order it held them, and an append-log that ran 369, 363, 372 was
+    # self-evidently not a history. `test_model_pin_log_records_only_transitions_that_happened`
+    # is what ties this entry to that sequence.
     # 372 since 2026-08-13: +2 for IndexTTS-2.5, which vLLM-Omni registers as TWO
     # architectures (`IndexTTS2TalkerForConditionalGeneration` stage 0 and
     # `IndexTTS2S2MelDecoder` stage 1), so a port described in prose as "a model"
@@ -97,7 +111,23 @@ MATRICES = {
     # longer carries would be false about the file it sits in, and
     # `Qwen35TextOnlyRowsAreCounted` is what ties this value to the two rows the
     # matrix actually holds.
-    "MODEL": (AGENTS / "model-matrix.md", 375),
+    # 377 since 2026-08-14, and RE-DERIVED rather than carried forward: +2 for
+    # dots3-note, which vLLM registers as TWO architectures
+    # (`Dots3NoteForCausalLM` and its speculative head `Dots3NoteMTPModel`),
+    # landing `SPIKE` and `INVENTORIED` respectively with the spec committed
+    # (#699). This is the collision the Music3/IndexTTS comment above warns
+    # about, happening again on the same day: the #490 branch took 373 -> 375
+    # for the Qwen3.5 text-only arms while the dots3 branch took 373 -> 375 for
+    # its own two rows. BOTH read 375 and neither was right -- the merged tree
+    # holds four new rows, so it is 377. An auto-merge keeping either side would
+    # have left this file internally consistent while silently short two real
+    # architectures, which is why the number is counted off the matrix AFTER the
+    # merge and why `test_dots3_rows_are_inside_the_model_ratchet` names the rows
+    # instead of trusting the count. dots3-note is beyond-pin (vLLM `main` only,
+    # vllm#51255, still being patched), carries no pinned-registry target, and
+    # leaves the at-the-pin inventory (324/373/356/310/261) unchanged. Bumped
+    # because two rows EXIST, never to make a transition pass.
+    "MODEL": (AGENTS / "model-matrix.md", 377),
     # 82 since 2026-07-21: +`QUANT-NVFP4-CT-W4A16` (compressed-tensors NVFP4A16 /
     # W4A16 — NVFP4 weights with BF16 activations, distinct from the existing
     # `QUANT-NVFP4-CT-W4A4` and `QUANT-NVFP4-MO-W4A16` rows in both scheme
@@ -265,7 +295,11 @@ MATRICES = {
     # row owing residual-RMS numerics evidence at the device boundary (rows>=32
     # bf16 device path vs CPU f32 oracle). Bot-flagged on #289; READY once the
     # RED-first probe lands.
-    "BACKEND": (AGENTS / "backend-matrix.md", 81),
+    # 82 since 2026-08-11: +`BACKEND-TENSTORRENT-MISTRAL`, allowlist
+    # MistralForCausalLM on TT + device-aware SACRED gate. Reuses Qwen3-dense
+    # forward; no new kernel. Pending 7B checkpoint + vLLM oracle for the e2e
+    # gate.
+    "BACKEND": (AGENTS / "backend-matrix.md", 82),
 }
 
 ENGINE_MATRIX = AGENTS / "engine-matrix.md"
@@ -451,7 +485,17 @@ ENGINE_PREFIXES = (
 # rows are real and neither replaces the other, which is why this line reads 154
 # rather than restating 153. `READY`, spec `specs/upstream-omni-pin.md`, issue #633.
 # Bumped for a real new row, never to make a failing state transition pass.
-ENGINE_ROWS = 154
+# 155 since 2026-08-14: +`ENG-HYBRID-PLACEMENT` (per-tensor-group device placement,
+# delivering routed-MoE expert COMPUTE on the CPU backend while the rest of the
+# model stays on GPU). Genuinely new, not a restatement of either offload row it
+# sits beside: `ENG-WEIGHT-OFFLOAD` and `ENG-EXPERT-STREAM` both move weights
+# toward the compute, and this row moves compute toward the weights, so no
+# existing row can express it. Surpass-track — vLLM ships CPU MoE kernels but
+# selects them platform-wide via `current_platform.is_cpu()`, so hybrid placement
+# is absent at the pin and the gate runs against llama.cpp `237ad9b96`.
+# `READY`, spec `specs/hybrid-placement.md`, issue #149.
+# Bumped for a real new row, never to make a failing state transition pass.
+ENGINE_ROWS = 155
 
 ENGINE_SUMMARY_SECTIONS = (
     ("Engine and scheduling", "Engine core and scheduling"),
