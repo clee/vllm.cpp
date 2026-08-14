@@ -212,6 +212,76 @@ result, because a mutation that fails to BUILD reads as a passing test.
 before and after. `test_op_parity` is RED on `main` at the base SHA
 (base-inherited, #755/#672) and is subtracted as a known baseline red.
 
+## Evidence
+
+Host: `mudler-ubuntu-box`, x86_64, GCC 13.3.0, **no CUDA device** (`nvidia-smi`
+absent). Build: `cmake -S . -B build -G Ninja -DVLLM_CPP_BUILD_TESTS=ON
+-DVLLM_CPP_BUILD_EXAMPLES=OFF -DVLLM_CPP_SERVER=OFF`, no `CMAKE_BUILD_TYPE`
+(so no `NDEBUG`, asserts live), `-Wall -Wextra -Werror`. Date 2026-08-14.
+Base SHA `b1cd4d8f6bb7ec5f0bd923a75dcc140becc7fdd8`.
+
+| Gate | Result |
+|---|---|
+| G1 bitwise quant | **PASS** |
+| G2 CPU vs CUDA bitwise | **PENDING — no GPU on this host.** Committed and CUDA-gated; the case prints the reason and still asserts the CPU registration so it can never be vacuous. Owed on `dgx.casa` (GB10/sm_121) or `192.168.68.23` (Thor/sm_110) |
+| G3 fp8 GEMM vs lossy `double` reference | **PASS** |
+
+`test_ops_fp8_cpu`: 4 cases / 56 assertions / `Status: SUCCESS!`.
+`test_fused_chain_additivity`: 1 case / **25** assertions (was 19), `SUCCESS!`.
+
+### Mutations — all applied ALONE to a restored tree, compiler exit recorded
+
+| # | Mutation | compile | `test cases` | `assertions` | `Status` |
+|---|---|---|---|---|---|
+| M0 | both registrations removed (the RED-BEFORE) | 0 | 4 \| 0 passed \| **4 failed** | 6 \| 1 \| **5 failed** | **FAILURE!** |
+| M1 | `input_scale` ignored | 0 | 4 \| 3 \| **1 failed** | 56 \| 32 \| **24 failed** | **FAILURE!** |
+| M2 | divide instead of reciprocal-multiply | 0 | 4 \| 3 \| **1 failed** | 56 \| 50 \| **6 failed** | **FAILURE!** |
+| M3 | saturation removed | 0 | 4 \| 3 \| **1 failed** | 56 \| 28 \| **28 failed** | **FAILURE!** |
+| M4 | RNE replaced by truncation | 0 | 4 \| 3 \| **1 failed** | 56 \| 28 \| **28 failed** | **FAILURE!** |
+| M5a | kernel ignores `alpha` | 0 | 4 \| 3 \| **1 failed** | 56 \| 53 \| **3 failed** | **FAILURE!** |
+| M5b | caller folds `weight_scale` only | 0 | 4 \| 3 \| **1 failed** | 56 \| 53 \| **3 failed** | **FAILURE!** |
+| — | restored (green-after) | 0 | 4 \| **4 passed** \| 0 | 56 \| **56** \| 0 | **SUCCESS!** |
+
+M0's assertion count DROPS to 6 rather than staying at 56 — a changed case count
+is signal, and it is why `Status:` is read alongside `assertions:`.
+
+**M1, M2 and M5a first failed to BUILD, not to assert** (`-Werror=unused-parameter`
+/ `-Wunused-variable` on the now-dead `input_scale` / `inv_scale` / `alpha`).
+A mutation that fails to build reads as a passing test, so each was re-expressed
+with an explicit `(void)` and re-run. Only the `compile_exit=0` rows above are
+verdicts.
+
+### What the mutation series measured, beyond pass/fail
+
+**M1 (`input_scale` ignored) changes ~99.7% of output bytes** at every scale
+except 1.0, where ignoring the scale is correctly a no-op: 4308/4319, 4311/4319,
+4311/4319 and 4299/4319 words at scales 0.5, 0.035, 0.0092 and 7.25, and 0/4319
+at 1.0. Overall 17229/21595 = 79.8%.
+
+**M2 (divide vs reciprocal-multiply) is nearly invisible, and that is the
+finding.** Over 20000 random values in [-2, 2] the two forms NEVER disagree, at
+any of 14 scales tried. The difference only appears where an input lands on an
+e4m3 tie after scaling — which is precisely what G1's constructed tie population
+is for — and even there it is scale-dependent: over that population **10 of 18
+candidate scales expose it at all**. Of the five scales G1 originally shipped
+with, **only 0.0092 did, at 24 of 209 words**, so the mutant died by 2
+assertions and the assertion protecting the reciprocal form was one scale-list
+edit away from being silently disarmed. 0.13 (78/209) and 0.77 (82/209) were
+measured as the strongest detectors and added, with the numbers recorded beside
+them in the test. M2 now dies by 6 assertions across 3 scales.
+
+This is the concrete answer to the question the spec's comment-repair section
+raised: the gate CAN see the exact defect the stale comment invites, but only
+because the input population contains constructed exact ties and the scale list
+contains a detector. Neither is decoration.
+
+**M3 exposed defense-in-depth in the pre-existing codec.** `F32ToFp8` saturates
+in TWO places — the early `a >= kFp8Max` return and a late `exp_field > 15`
+overflow guard — so removing either alone leaves saturation intact and the
+mutant survives. M3 removes both, which is what "saturation removed" has to mean
+for this codec, and then it dies by 28 assertions. Recorded because a reviewer
+mutating only the obvious guard would wrongly conclude the gate is blind.
+
 ## Stop conditions
 
 - G1 RED against the independent reference on any covered input ⇒ stop and
