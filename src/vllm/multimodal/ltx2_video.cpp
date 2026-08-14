@@ -1646,7 +1646,23 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
       // forward, and upstream's own `supports_keyframes_abs_pos_embedding`
       // (model.py:166-173) is exactly this condition. The mask itself is built
       // unconditionally above, because it is data about the latent.
+      //
+      // THE EMPTINESS IS CHECKED, and that is not defensive noise. Making the
+      // mask conditional — on `wants_image`, on a keyframe, on anything — is the
+      // one defect this module invites, and it is INVISIBLE to every output
+      // check: the render stays finite, the right shape, the right token count,
+      // and simply omits a trained term. Without this line a conditional mask
+      // reaches the DiT as `data()` on an empty vector, which is a null pointer
+      // and therefore upstream's legal "no token is marked" — a silent drop
+      // dressed as a supported path. MEASURED: with the mask made conditional
+      // and this check absent, all five LTX-2.5 suites stayed GREEN.
       if (im.dit.params.use_keyframes_abs_pos_embedding) {
+        VT_CHECK(static_cast<int64_t>(video.keyframes_mask.size()) == video.tokens,
+                 "ltx2 video: this DiT carries keyframes_abs_pos_embedding, so every forward owes "
+                 "the marker `_first_frame_keyframes_mask` builds (ltx_core/tools.py:184-196) — "
+                 "one value per video token, populated on EVERY generation whether or not a "
+                 "keyframe was supplied. Handing the forward no marker would render without a "
+                 "trained term and look exactly like a working render.");
         vin.keyframes_mask = video.keyframes_mask.data();
       }
 
