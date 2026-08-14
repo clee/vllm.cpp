@@ -279,6 +279,38 @@ Neither network is ported, and neither is one this tree already has. The lesson
 is the one this campaign keeps re-learning: an architecture name settles what a
 *model* costs, and settles nothing about what a *checkpoint* contains.
 
+### Loading them: convert offline, never read pickle in the engine
+
+Upstream ships `.pth`, which is a ZIP around a Python pickle. This tree has no
+torch-pickle reader, and deliberately does not grow one. Pickle executes
+arbitrary code by construction, so a reader in the engine would run a
+attacker-controllable program inside the process that serves users, and every
+other lane here already loads safetensors or GGUF.
+
+So the conversion is OFFLINE and once:
+`scripts/convert-indextts2-checkpoint.py` flattens the nested state dicts with
+'.' -- which is exactly the naming the manifest above records, so the converted
+names ARE the manifest's names and the manifest checks the conversion -- and
+writes safetensors the existing reader can open. Measured on the shipped
+checkpoint:
+
+| Source | Tensors kept | Dropped | .pth | .safetensors |
+|---|---|---|---|---|
+| `gpt.pth` | 456 | 0 | 3108.60 MiB | 3108.45 MiB |
+| `codec.pth` | 243 | **729** | 579.16 MiB | **192.99 MiB** |
+| `s2mel.pth` | 284 | 0 | 395.69 MiB | 395.63 MiB |
+
+`codec.pth` is **75% optimizer state**: 729 of its 972 tensors are training
+residue, and dropping them takes the file from 579 MiB to 193 MiB. That is
+dropped loudly, with a count, and the drop prefix is gated from both sides --
+every optimizer key must match it, and no weight in `gpt.pth` or `s2mel.pth` may.
+
+The conversion needs torch and 4 GiB of weights, so CI cannot run it.
+`tests/scripts/test_indextts2_convert.py` holds the part where a silent mistake
+would be unrecoverable -- which tensors survive, under which names -- with fakes
+and no torch, because a dropped weight looks exactly like a weight that was
+never there.
+
 ### What the three .pth checkpoints actually hold
 
 `gpt.pth`, `codec.pth` and `s2mel.pth` are torch ZIPs: one small pickle names
@@ -301,9 +333,9 @@ they pass over a smaller network than the checkpoint holds:
 
 | Where | Unported | Note |
 |---|---|---|
-| `s2mel.pth` `net.cfm.estimator` | `wavenet.*` | A WaveNet conditioning stack inside the CFM estimator. Absent from the port map entirely |
-| same | `skip_linear`, `layers.N.skip_in_linear` | U-Net skip connections across DiT depth. Our `dit::Block` carries both residuals but no skip-in |
-| same | `t_embedder2` | A SECOND timestep embedder. `cfm::TimestepFeatures` modeled one |
+| ~~`s2mel.pth` `net.cfm.estimator`~~ | ~~`wavenet.*`~~ | **PORTED** in `wavenet.cpp`, gated against upstream `WN` at reduced dims (3 cases / 133 assertions, 6 mutations caught). Not a conditioning stack but the DiT's FINAL LAYER: the config sets `final_layer_type: wavenet`, which is also what `t_embedder2`, `conv1` and `conv2` belong to |
+| ~~same~~ | ~~`skip_linear`, `layers.N.skip_in_linear`~~ | BOTH **PORTED**: the long skip in `dit_tail.cpp`, the per-layer U-Net skip in `dit_skip.cpp`. The routing was RECORDED from upstream's own Transformer rather than read off the formula (`scripts/gen-dit-skip-schedule.py`): at the shipped depth 13, layers 0-5 emit, 7-12 receive LIFO so layer 7 takes layer 5's output, and layer 6 does neither. At EVEN depth there is one more emitter than receiver and the earliest skip is never consumed; we report that rather than correct it |
+| ~~same~~ | ~~`t_embedder2`, `conv1`, `conv2`~~ | **PORTED** in `dit_tail.cpp` together with `skip_linear`, `res_projection` and `final_layer`, gated against upstream's own DiT modules end to end (4 cases, 6 mutations caught). Note the coupling upstream hides by setting both to 512: `final_layer` is sized at the WAVENET width but conditioned on `t1` at the DiT width, so the two must be equal. We refuse unequal widths by name |
 | same | `cond_embedder`, `content_mask_embedder`, `cond_projection`, `cond_x_merge_linear`, `res_projection`, `conv1`, `conv2` | The conditioning front end |
 | `s2mel.pth` `net.length_regulator` | `mask_token`, `embedding`, `content_in_proj` | Our `lenreg` port has the interpolate/GroupNorm/Mish stack and none of these |
 | `s2mel.pth` | `net.gpt_layer` | Three weight/bias pairs; unmodeled and unexplained |

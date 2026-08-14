@@ -27,7 +27,7 @@ are our reading of their documented behavior, not measurements.
 | Correctness gate | token-exact vs vLLM | reference | own | own |
 | Architectures | 38 registered, 27 gated | 130+ | 100+ | 100+ |
 | Downloadable server binaries | ✅ v0.0.2: eight indexed archives with checksums, provenance, manifests, and SBOMs. Windows ZIP downloads do not exist; native CPU/Vulkan lanes await hosted runtime, dry-run, prerelease, and authenticated audit gates | ✅ wheels/containers | ✅ wheels/containers | ✅ host-specific binaries |
-| Native Windows builds | ◐ CPU/Vulkan: `/MT /W4 /WX`, central `NOMINMAX`, UTF-8, aligned allocation, runtime ISA dispatch. Local closure includes the float-domain DeepSeek probe; hosted compile/runtime/release pending | ✅ | ✅ | ✅ |
+| Native Windows builds | ◐ CPU/Vulkan: `/MT /W4 /WX`, central `NOMINMAX`, UTF-8, aligned allocation, C++20 `std::numbers` pi, runtime ISA dispatch. Local closure includes the float-domain DeepSeek probe; hosted compile/runtime/release pending | ✅ | ✅ | ✅ |
 
 ## Serving and scheduling
 
@@ -177,6 +177,7 @@ Enumerated in `.agents/model-matrix.md`, not registered, no runnable GB10 gate:
 | `DeepseekV3ForCausalLM`, `DeepseekV32ForCausalLM` | DeepSeek-V3 / V3.2 | 671B, ~642 GiB fp8 vs 119 GiB unified; V3.2 also DSA-indexer dep-blocked |
 | `GlmMoeDsaForCausalLM` | GLM-5 (DSA) | ~1404 GiB bf16; dep-blocked (GLM-5.x is DeepSeek-V3.2 verbatim) |
 | `MiniMaxM2ForCausalLM` | MiniMax-M2 | ~230B, ~428 GiB bf16, ~4x over the unified pool |
+| `Dots3NoteForCausalLM`, `Dots3NoteMTPModel` | dots3-note (280B-A16B multimodal MoE) | ~576 GB bf16 / ~290 GB fp8 vs a 119-122 GiB ceiling on every host, no smaller checkpoint; also beyond-pin (vLLM `main` only). Scoped ([spec](../.agents/specs/dots3-note.md), #699) |
 
 27 of the 32 registered text-generation architectures carry a passing
 correctness gate today; the rest are honestly marked scaffold or blocked above.
@@ -195,7 +196,7 @@ on the committed fixture); reranking/classify models are not yet registered.
 | Video | ✅ correctness-gated | ✅ | ✅ | ☐ |
 | Audio | ✅ correctness-gated | ✅ | ◐ | ◐ |
 | Video+audio GENERATION (MiniMax-H3 DiT, LTX-2.5 DiT) | ◐ H3: all three modalities COHERENT on Q4_K_M (t2va, fl2va, ref2va; §8.20); the NVFP4 arm carries the patch grid; GGUF/NVFP4/bf16 loaders, pruned too (§8.21). LTX-2.5: a second lane, `SPIKE`, gated at reduced dims | ✅ H3 (vllm-omni, BF16-only, no quantized arm); LTX-2.5 only through the generic diffusers adapter, no native recipe ([vllm-omni#6066](https://github.com/vllm-project/vllm-omni/issues/6066)) | ☐ | ☐ |
-| Speech / audio GENERATION (TTS, vLLM-Omni lane) | ◐ IndexTTS-2.5 only: every stage ported and gated at reduced dims, composed structurally; the family still REFUSES by name. No loader, no render, no route (#634). Seven more inventoried (#610), which is not support | ✅ (vllm-omni: MOSS-TTS, Qwen3-TTS, Higgs Audio v3, Voxtral TTS, IndexTTS-2.5) | not assessed | not assessed |
+| Speech / audio GENERATION (TTS, vLLM-Omni lane) | ◐ IndexTTS-2.5 only: stages plus the whole DiT path, skips included, gated at reduced dims; more named missing by the manifest. REFUSES by name; no loader, render or route (#634). Seven more inventoried (#610) | ✅ (vllm-omni: MOSS-TTS, Qwen3-TTS, Higgs Audio v3, Voxtral TTS, IndexTTS-2.5) | not assessed | not assessed |
 | MUSIC generation (MiniMax-Music3) | ☐ not generating. The W1 checkpoint LOADER has landed ([spec](../.agents/specs/minimax-music3.md), #672); no stage runs yet. Lyrics plus a structured description in, a multi-minute stereo song out | ☐ absent from the pin, from vLLM `main` and from `vllm-omni` alike | ◐ served by SGLang-Omni, a third repository, which loads the NATIVE checkpoint layout | ☐ |
 | Multimodal over the OpenAI server | ◐ image request path wired, forward pending | ✅ | ✅ | ◐ |
 
