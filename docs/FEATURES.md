@@ -80,6 +80,7 @@ are our reading of their documented behavior, not measurements.
 | Merged fp8 projection folds per-column alpha in the GEMM epilogue | ◐ `VT_FP8_ALPHA_VEC_EPILOGUE`, CUDA only, default off, ungated; refuses split-K under a bf16-D equivalence claim (`claims_splitk1_premise`, default off) | n/a | n/a | n/a |
 | `vt::MulColVecF32` carries a bf16 store width | ✅ f32 arm byte-identical; bf16 arm rounds once; CPU + CUDA | n/a | ☐ | ☐ |
 | bf16 / fp16 | ✅ | ✅ | ✅ | ✅ |
+| Safetensors direct load, no conversion | ✅ a payload offset carries no alignment guarantee, so reads of the mapping go byte-wise ([#674](https://github.com/mudler/vllm.cpp/issues/674) VAE loader; [#627](https://github.com/mudler/vllm.cpp/issues/627) the rest) | ✅ | ✅ | ☐ |
 | Safetensors direct load, no conversion | ✅ at ANY tensor byte offset: the format aligns nothing, so the `*_weights.cpp` loaders never form a typed pointer into the mapping (#627). `voxtral.cpp`, `qwen3_vl.cpp`, `qwen3_5_mtp.cpp` still do and are OWED | ✅ | ✅ | ☐ |
 | Weights uploaded straight from the file mapping (no host copy first) | ◐ verbatim tensors only (37.8% of 27B BF16); arbitrary-offset reads are defined, including Laguna graph staging. Merged/transposed and merged FP4 weights still copy | ✅ | ✅ | ✅ mmap |
 
@@ -196,7 +197,7 @@ on the committed fixture); reranking/classify models are not yet registered.
 | Video | ✅ correctness-gated | ✅ | ✅ | ☐ |
 | Audio | ✅ correctness-gated | ✅ | ◐ | ◐ |
 | Video+audio GENERATION (MiniMax-H3 DiT, LTX-2.5 DiT) | ◐ H3: all three modalities COHERENT on Q4_K_M (t2va, fl2va, ref2va; §8.20); the NVFP4 arm carries the patch grid; GGUF/NVFP4/bf16 loaders, pruned too (§8.21). LTX-2.5: a second lane, `SPIKE`, gated at reduced dims | ✅ H3 (vllm-omni, BF16-only, no quantized arm); LTX-2.5 only through the generic diffusers adapter, no native recipe ([vllm-omni#6066](https://github.com/vllm-project/vllm-omni/issues/6066)) | ☐ | ☐ |
-| Speech / audio GENERATION (TTS, vLLM-Omni lane) | ◐ IndexTTS-2.5 only: the S2Mel DiT is COMPLETE front to tail and gated against upstream; its tail runs on REAL shipped weights. Other stages gated at reduced dims. No render, no route (#634) | ✅ (vllm-omni: MOSS-TTS, Qwen3-TTS, Higgs Audio v3, Voxtral TTS, IndexTTS-2.5) | not assessed | not assessed |
+| Speech / audio GENERATION (TTS, vLLM-Omni lane) | ◐ IndexTTS-2.5 only: reference path COMPLETE waveform to codes, talker prompt assembled, S2Mel DiT complete, BigVGAN ported. No render, no route (#634) | ✅ (vllm-omni: MOSS-TTS, Qwen3-TTS, Higgs Audio v3, Voxtral TTS, IndexTTS-2.5) | not assessed | not assessed |
 | MUSIC generation (MiniMax-Music3) | ☐ not generating e2e. W1 loader, W2/W3 AR half and W4/W5 acoustic half landed ([spec](../.agents/specs/minimax-music3.md), #672); the 8.6B LM forward and the engine seam are not. Lyrics in, a stereo song out | ☐ absent from the pin, from vLLM `main` and from `vllm-omni` alike | ◐ served by SGLang-Omni, a third repository, which loads the NATIVE checkpoint layout | ☐ |
 | Multimodal over the OpenAI server | ◐ image request path wired, forward pending | ✅ | ✅ | ◐ |
 
@@ -246,7 +247,7 @@ gets a refusal naming what is missing.
 | Vulkan | ◐ | ☐ | ☐ | ✅ |
 | ROCm | W0 verified on 5 gfx archs; dense and GDN models run all-native. Strict CPU parity is open in the measured near-tie regime (#269) | 44 registered ops including full GDN; ctest-green gfx1151/1103/1100/1201/1200 ([#41](https://github.com/mudler/vllm.cpp/issues/41)). APU managed allocation is unverified. [ROCM.md](ROCM.md) | ✅ | ✅ |
 | XPU / TPU | ☐ | ✅ | ◐ | ☐ |
-| Tenstorrent Blackhole | ◐ `ACTIVE`, OPT-125m STRICT 6/6 e2e; Qwen3-0.6B gate wired with device goldens. Full 16x16 rerun and residual-RMS numerics at the rows≥32 device boundary both owed ([spec](../.agents/specs/tenstorrent-backend.md)) | ✅ | ☐ | ☐ |
+| Tenstorrent Blackhole | ◐ `ACTIVE`, OPT-125m 6/6; Qwen3-0.6B wired; Mistral-7B-v0.3 16/16 on P150 ([spec](../.agents/specs/tenstorrent-mistral.md)). 16x16 rerun and residual-RMS owed ([spec](../.agents/specs/tenstorrent-backend.md)) | ✅ | ☐ | ☐ |
 
 CUDA runtime-verified on GB10 (sm_121a), Jetson Thor (sm_110) and Jetson AGX
 Orin (sm_87). sm_110 has no CUTLASS FP4 tensor-core kernels and no `fp4-mma`,

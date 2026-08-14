@@ -1064,6 +1064,14 @@ Registered in
 | GET | `/v1/videos/{id}` | Job status |
 | GET | `/v1/videos/{id}/content` | The finished MP4 (`video/mp4`) |
 
+The reference-audio side of IndexTTS-2.5 is complete in the library -- a 16 kHz
+clip goes through the SeamlessM4T feature extractor, the w2v-bert Conformer, the
+layer-17 hidden-state tap, the checkpoint's stored-statistics normalization and
+the semantic codec to discrete codes, and the talker's prompt is assembled from
+that conditioning plus the text -- but none of it is reachable from a command or
+a route yet, and nothing yet runs the generate loop that would turn the prompt
+into mel codes.
+
 There is **no `/v1/audio/speech`**. Text to speech is not servable: the
 IndexTTS-2.5 stages are ported and gated at reduced dimensions, with further
 stages named as missing by the checkpoint's own manifest, and no route is
@@ -2345,6 +2353,14 @@ DIT_SRC=/path/to/index-tts/indextts/s2mel/modules \
 
 DIT_SRC=/path/to/index-tts/indextts/s2mel/modules \
   python3 scripts/gen-dit-stack-goldens.py --out tests/vllm/models/dit_stack_goldens.inc
+
+BIGVGAN_SRC=/path/to/index-tts/indextts/s2mel/modules/bigvgan \
+  python3 scripts/gen-bigvgan-goldens.py --out tests/vllm/models/bigvgan_goldens.inc
+
+CODEC_SRC=/path/to/index-tts/indextts \
+  python3 scripts/gen-codec-encoder-goldens.py --out tests/vllm/models/codec_encoder_goldens.inc
+
+python3 scripts/gen-w2v-fbank-goldens.py --out tests/vllm/models/w2v_fbank_goldens.inc
 ```
 
 The U-Net skip routing is recorded rather than generated into an `.inc`: this
@@ -2366,6 +2382,9 @@ python3 scripts/convert-indextts2-checkpoint.py \
 
 VLLM_CPP_INDEXTTS2_S2MEL=$CHECKPOINT_ROOT/IndexTTS-2.5-safetensors/s2mel.safetensors \
   ./build/tests/test_indextts2_s2mel_loader
+
+VLLM_CPP_INDEXTTS2_GPT=$CHECKPOINT_ROOT/IndexTTS-2.5-safetensors/gpt.safetensors \
+  ./build/tests/test_indextts2_talker_loader
 ```
 
 ## MiniMax-Music3: the autoregressive half
