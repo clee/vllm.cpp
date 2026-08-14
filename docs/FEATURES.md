@@ -27,7 +27,7 @@ are our reading of their documented behavior, not measurements.
 | Correctness gate | token-exact vs vLLM | reference | own | own |
 | Architectures | 38 registered, 27 gated | 130+ | 100+ | 100+ |
 | Downloadable server binaries | ✅ v0.0.2: eight indexed archives with checksums, provenance, manifests, and SBOMs. Windows ZIP downloads do not exist; native CPU/Vulkan lanes await hosted runtime, dry-run, prerelease, and authenticated audit gates | ✅ wheels/containers | ✅ wheels/containers | ✅ host-specific binaries |
-| Native Windows builds | ◐ CPU/Vulkan: `/MT /W4 /WX`, central `NOMINMAX`, UTF-8, aligned allocation, runtime ISA dispatch. Local closure includes the float-domain DeepSeek probe; hosted compile/runtime/release pending | ✅ | ✅ | ✅ |
+| Native Windows builds | ◐ CPU/Vulkan: `/MT /W4 /WX`, central `NOMINMAX`, UTF-8, aligned allocation, C++20 `std::numbers` pi, runtime ISA dispatch. Local closure includes the float-domain DeepSeek probe; hosted compile/runtime/release pending | ✅ | ✅ | ✅ |
 
 ## Serving and scheduling
 
@@ -178,6 +178,7 @@ Enumerated in `.agents/model-matrix.md`, not registered, no runnable GB10 gate:
 | `DeepseekV3ForCausalLM`, `DeepseekV32ForCausalLM` | DeepSeek-V3 / V3.2 | 671B, ~642 GiB fp8 vs 119 GiB unified; V3.2 also DSA-indexer dep-blocked |
 | `GlmMoeDsaForCausalLM` | GLM-5 (DSA) | ~1404 GiB bf16; dep-blocked (GLM-5.x is DeepSeek-V3.2 verbatim) |
 | `MiniMaxM2ForCausalLM` | MiniMax-M2 | ~230B, ~428 GiB bf16, ~4x over the unified pool |
+| `Dots3NoteForCausalLM`, `Dots3NoteMTPModel` | dots3-note (280B-A16B multimodal MoE) | ~576 GB bf16 / ~290 GB fp8 vs a 119-122 GiB ceiling on every host, no smaller checkpoint; also beyond-pin (vLLM `main` only). Scoped ([spec](../.agents/specs/dots3-note.md), #699) |
 
 27 of the 32 registered text-generation architectures carry a passing
 correctness gate today; the rest are honestly marked scaffold or blocked above.
