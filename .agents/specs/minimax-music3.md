@@ -10,7 +10,7 @@
 [#14456](https://github.com/huggingface/diffusers/pull/14456), head
 `c6da9936e4bda83107943a16eb8682e9a37d8527` — **OPEN, not merged**.
 **Cross-check:** SGLang-Omni `748a0b437e4a8faad44d7bbfd5a0ae55d1fef830`.
-**Status:** W0 — spec committed, no engine code.
+**Status:** W0 — spec committed, diffusers oracle gateable, no engine code.
 **Developer directive (2026-08-13):** "land minimax music 3 support complete, to
 vllm.cpp, wired to the ABI and to the example http server, merge to main, tested
 e2e." That fixes W6's shape (the ABI surface and the example server are in scope,
@@ -29,10 +29,11 @@ from what is still assumed.
 **Measured** (safetensors headers by HTTP range request, and each component's
 `config.json`): every geometry and dtype in §1. **Read** (upstream source at the
 pinned SHAs): the component decomposition, the native↔diffusers relationship, and
-the dtype policy. **Not established:** that the oracle runs here at all — no
-diffusers execution of this model has happened on this project's hardware, which
-is why `.agents/oracles/diffusers.md` still records `gateable = no`. W0 is not
-complete until it does.
+the dtype policy. **Established 2026-08-14, after this section was
+written:** the oracle runs here — `tools/oracle/music3_oracle.py` loaded all seven
+components and generated audio, so `.agents/oracles/diffusers.md` records
+`gateable = yes` against a golden path. That measurement was taken on CPU;
+nothing about speed is established.
 
 **This model has no token-exact gate on its generative half.** Like MiniMax-H3, the
 acoustic path is a flow-matching denoise loop with no logits and no sampler, so the
@@ -242,7 +243,7 @@ the operator. Phases are separately claimable except where noted.
 
 | Phase | Scope | Done when |
 |---|---|---|
-| **W0** | This spec; both oracle records pinned; §1.1 sample rate settled from source (**DONE**); **stand the diffusers oracle up and prove it builds and runs** | oracle executes the model and `diffusers.md` flips to `gateable = yes` with a path as evidence |
+| **W0** | This spec; both oracle records pinned; §1.1 sample rate settled from source (**DONE**) and confirmed at runtime (**DONE**); stand the diffusers oracle up and prove it builds and runs (**DONE**, `tools/oracle/music3_oracle.py`) | oracle executes the model and `diffusers.md` flips to `gateable = yes` with a path as evidence |
 | **W1** | Modular loader: the six-component layout, weight-norm folding, the fp32/bf16 policy of §2.1, native-arm refusal by name | every component loads with shapes asserted against §1; converted-vs-native tensor equality checked, not assumed |
 | **W2** | Global LLM on our landed Qwen3 path at vocab 200 000 | hidden-state parity vs `transformers`, then token-exact RVQ code parity vs the oracle |
 | **W3** | Condition mix (8-layer weighted) + RVQ depth decoder, 8 codebooks | per-stage tensor parity; the depth decoder's 16-position window exercised at its boundary |
@@ -292,7 +293,20 @@ pinned SHA.
 
 ## Now
 
-W0 — spec committed, no engine code. Next: pin both oracles in `.agents/oracles/`,
-stand the diffusers oracle up far enough to prove it builds and runs this model,
-and resolve the sample-rate contradiction in §1.1 from source. W1 is not
-dispatched until W0's oracle is gateable.
+W0 — spec committed, the diffusers oracle **stood up and running**, no engine
+code. `.agents/oracles/diffusers.md` is `gateable = yes`: the oracle generated a
+44100 Hz stereo waveform from a fixed seed, §1's geometry and dtypes were
+re-derived from the loaded modules and agree, and the per-stage reference tensors
+W3–W5 gate against are committed under
+`tests/parity/goldens/minimax_music3_oracle/` with
+[`tools/oracle/music3_oracle.py`](../../tools/oracle/music3_oracle.py) as the
+reproducible recipe. §1.1 is confirmed at runtime, not merely from source: the
+pipeline returns 44100 Hz stereo with no resample.
+
+Two things W0 hands forward rather than closes. The on-disk dtype set of §2.1 is
+**not runnable through upstream's own pipeline** — the condition encoder and the
+depth decoder consume the language model's hidden states uncast, so they must
+share its dtype — which W1's loader has to mirror deliberately rather than
+inherit by accident. And the capture ran on CPU, so it is a correctness
+reference and no part of the speed axis. Still owed in W0: the SGLang-Omni
+oracle record. W1 is unblocked.
