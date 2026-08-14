@@ -1585,10 +1585,25 @@ F2. A project-configured `-DVLLM_CPP_SANITIZE='address,undefined'` build of the
 three Nemotron-H targets is clean (below).
 
 **Not changed, and why:** the remaining `reinterpret_cast`s in `nemotron_h.cpp`
-(:224, :256, :351) and the two write-side casts in `nemotron_h_weights.cpp` are
-over `std::vector<uint8_t>::data()`, which the default allocator returns
-suitably aligned for any scalar. They are not views into a mapping and are not
-in F1's class.
+and the two write-side casts in `nemotron_h_weights.cpp` are over
+`std::vector<uint8_t>::data()`, which the default allocator returns suitably
+aligned for any scalar. They are not views into a mapping and are not in F1's
+class.
+
+**No overlap with PR #815 / `row/FIX-UNALIGNED-LOADERS-772`, checked rather than
+assumed.** That branch closes the same CLASS at four other sites —
+`voxtral.cpp:51`, `voxtral.cpp:344`, `qwen3_vl.cpp:78`, `qwen3_5_mtp.cpp:71`,
+plus `minimax_h3_vae_loader.cpp`. Its complete file list contains no
+`nemotron_h_*` file at all, and `git log -S'nemotron_h_weights'` over
+`origin/main..origin/row/FIX-UNALIGNED-LOADERS-772` is empty. The reason is
+structural, not luck: #772's sweep was taken over `main`, and this site does not
+exist on `main` — it arrives with PR #752 itself. Established with a POSITIVE
+CONTROL rather than from a silent grep ([[never-assert-absence-from-a-failed-grep]]):
+the same regex that is silent on the repaired `nemotron_h_weights.cpp` FIRES on
+`voxtral.cpp:51`, `voxtral.cpp:344` and `qwen3_vl.cpp:78` — exactly #815's set —
+so the instrument works. The two changes are complementary and together close
+the class. Whichever lands second must re-resolve `docs/FEATURES.md` and
+`tests/CMakeLists.txt` BY KEY, the only two files both touch.
 
 ### F2 — the guard was correct but UNARMED, and none of §6d's new code ran in CI
 
@@ -1715,6 +1730,24 @@ visible from the code or the counts:
    the 128 experts per layer, never the dense `mlp` block (no released in-scope
    checkpoint ships one), and never the MTP tower (deferred to W5). It is
    evidence, not the token gate; W6 owns the token gate.
+3. **THE WEIGHTS LOAD; THE MODEL IS NOT REACHABLE FROM THE PUBLIC ABI (#810).**
+   An independent investigation established that NemotronH does not run end to
+   end through `include/vllm.h` — not on `main`, and not with this branch
+   merged. Both refuse at `src/vllm/v1/worker/gpu/runner.cpp:525`,
+   `runner: Qwen3.5 MambaSpec shapes disagree with model config`, a line this
+   branch does not touch. Proven on the real 21 GiB checkpoint on GB10: the
+   weights load fine (17.7 GiB RSS) and then ENGINE CONSTRUCTION refuses. So
+   "the real checkpoint runs" in §6d means the HOST REFERENCE FORWARD runs on
+   real weights, and it must not be read as "the server runs it".
+
+   That single `VT_CHECK` is the ONLY load-time blocker — neutering it alone
+   made `vllm_engine_load` succeed and reach the forward. **That is not a fix
+   and must not be done**: `ForwardNemotronHForCausalLM` ignores `attn_kv`,
+   `gdn_state`, `gdn_meta` and `num_reqs`, so a server past that check emits
+   silently wrong tokens from decode step 2 — the failure mode a token gate on
+   a 1-token prompt cannot see. The refusal is currently the only thing making
+   the gap visible. #810 owns it; W6 owns the paged/device runner. Explicitly
+   OUT OF SCOPE here.
 
 ### A merge that was CLEAN and did not BUILD the behaviour either side had (#818)
 
