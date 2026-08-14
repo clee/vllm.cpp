@@ -1529,11 +1529,18 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
   // 1024x1536 at 121 frames. Between 81 and 120 frames the render is tiled and is
   // NOT the render this path produced before tiling existed — measured on the
   // SHIPPED conv VAE at the AUTO layout, 64x64 / 81 frames, latent 11,2,2, by
-  // scripts/probe_ltx2_tiled_equivalence.cpp: 2 tiles, 2 chunks, max|diff| 0.716
-  // against the untiled decode on an output whose own |max| is 0.751, with 985849
-  // of 995328 floats not bit-identical. That is upstream's own behaviour (a
-  // receptive field wider than the overlap, blended at the seam) and not a defect
-  // here — but it is a different image, and the one-tile control does not cover it.
+  // scripts/probe_ltx2_tiled_equivalence.cpp: 2 tiles, 2 chunks, max|diff|
+  // 0.0503043234 against the untiled decode on an output whose own |max| is
+  // 0.7512672544 — 6.70% of that range — with 962983 of 995328 floats (96.75%)
+  // not bit-identical. That is upstream's own behaviour (a receptive field wider
+  // than the overlap, blended at the seam) and not a defect here — but it is a
+  // different image, and the one-tile control does not cover it.
+  //
+  // (This said 0.716 and "95% of the range" until the probe was re-derived: it
+  // reassembled the streamed chunks with a FLAT append, and a chunk is
+  // [C, t, H, W] channel-major, so the append is not [C, T, H, W] at C = 3 with
+  // 2 chunks. The 14x was the probe's own transposition. The conclusion stands,
+  // the magnitude did not — see ltx2_tiling.h for the full record.)
   //
   // What it buys, ABOVE ONE CHUNK: the full pixel volume is never materialized.
   // Each temporal chunk is written to disk and dropped, so the peak is about two

@@ -570,12 +570,41 @@ def _decode_arm(out, out_prefix: str, causal: bool, name_prefix: str) -> None:
     # And the arm upstream CANNOT run, recorded as the exception type it raises
     # rather than as prose. `emit_scalar` of the boolean is what the C++ refusal
     # test asserts its own refusal against.
+    #
+    # THE TYPE ALONE IS NOT THE MECHANISM. A bare `except TypeError` keeps this
+    # constant at 1 for ANY future `TypeError` from ANY line of `tiled_decode`,
+    # so the cited cause — `conv_video_decoder.py:424` subtracting the `None`
+    # stop `DEFAULT_MAPPING_OPERATION` handed it — could go stale silently while
+    # the golden still read "upstream raises". So the FILE, LINE and message of
+    # the innermost frame are pinned too, and the C++ suite asserts all three
+    # against the mechanism its own refusal message names.
+    untiled_frames_raise_file = ""
+    untiled_frames_raise_line = 0
+    untiled_frames_raise_message = ""
     try:
         with torch.no_grad():
             list(decoder.tiled_decode(latent, _untiled_axes_config()))
         untiled_frames_raises = 0
-    except TypeError:
+    except TypeError as exc:
         untiled_frames_raises = 1
+        tb = exc.__traceback__
+        while tb.tb_next is not None:  # the innermost frame is the one that raised
+            tb = tb.tb_next
+        untiled_frames_raise_file = Path(tb.tb_frame.f_code.co_filename).name
+        untiled_frames_raise_line = tb.tb_lineno
+        untiled_frames_raise_message = str(exc)
+    assert untiled_frames_raises == 1, (
+        "upstream's tiled_decode ran an UNTILED frames axis; the C++ refusal in "
+        "Ltx2ConvVideoDecodeTiled is now wrong and this assertion is what says so"
+    )
+    assert untiled_frames_raise_file == "conv_video_decoder.py", (
+        f"the untiled-frames TypeError now comes from {untiled_frames_raise_file}, not "
+        "conv_video_decoder.py — the refusal cites a mechanism that has moved"
+    )
+    assert "unsupported operand type" in untiled_frames_raise_message, (
+        f"the untiled-frames TypeError now reads {untiled_frames_raise_message!r}; it is no "
+        "longer the None-stop arithmetic the refusal cites"
+    )
 
     tiles = _prepare_tiles(TILING_LATENT, _tiling_config())
     groups = group_tiles_by_temporal_slice(tiles)
@@ -626,6 +655,13 @@ def _decode_arm(out, out_prefix: str, causal: bool, name_prefix: str) -> None:
         f"{untiled_spatial_gap:.9g};\n"
     )
     G.emit_scalar(out, out_prefix + "UpstreamUntiledFramesRaises", untiled_frames_raises)
+    G.emit_scalar(out, out_prefix + "UpstreamUntiledFramesRaiseLine", untiled_frames_raise_line)
+    out.write(
+        f"inline constexpr const char* {out_prefix}UpstreamUntiledFramesRaiseFile = "
+        f'"{untiled_frames_raise_file}";\n'
+        f"inline constexpr const char* {out_prefix}UpstreamUntiledFramesRaiseMessage = "
+        f'"{untiled_frames_raise_message}";\n'
+    )
     out.write("\n")
 
 

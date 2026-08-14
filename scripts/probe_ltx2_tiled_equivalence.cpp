@@ -24,6 +24,7 @@
 // line; only the .cpp changes.
 //
 //   /tmp/ltx2_equiv .../ltx-2.5-video-vae-conv-bf16.safetensors 81 64 64
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -104,16 +105,20 @@ int main(int argc, char** argv) {
       vllm::Ltx2ConvVideoDecode(cfg, weights, latent, lc, lt, lh, lw, &noise_a);
 
   ZeroNoise noise_b;
-  std::vector<float> streamed;
+  // The chunks are kept so they can be reassembled CHANNEL-MAJOR below. Holding
+  // them all is the opposite of what the product path does — the whole point of
+  // the sink is that a chunk dies when the callback returns — but a probe that
+  // compares against the untiled volume has to materialize the clip once, and
+  // tests/vllm/models/test_ltx2_tiling.cpp's `Collected::Concat` does the same
+  // thing for the same reason. That helper is the reference this mirrors.
+  std::vector<vllm::Ltx2VideoChunk> chunk_list;
   int64_t streamed_frames = 0;
-  int64_t chunks = 0;
   vllm::Ltx2VideoDecodeStreaming(kind, cfg, weights, latent, lc, lt, lh, lw, &noise_b, tiling,
                                  [&](const vllm::Ltx2VideoChunk& chunk) {
-                                   ++chunks;
                                    streamed_frames += chunk.frames.frames;
-                                   streamed.insert(streamed.end(), chunk.frames.data.begin(),
-                                                   chunk.frames.data.end());
+                                   chunk_list.push_back(chunk);
                                  });
+  const int64_t chunks = static_cast<int64_t>(chunk_list.size());
 
   std::fprintf(stderr,
                "[equiv] tiles=%zu groups=%zu  ->  untiled [%lld,%lld,%lld,%lld]  streamed "
@@ -123,14 +128,55 @@ int main(int argc, char** argv) {
                (long long)streamed_frames, (long long)untiled.height, (long long)untiled.width,
                (long long)chunks);
 
+  // ─── REASSEMBLY IS CHANNEL-MAJOR, AND THAT IS THE WHOLE MEASUREMENT ─────────
+  //
+  // `Ltx2VideoFrames` is [C, F, H, W] channel-major (ltx2_video_vae.h:211-219),
+  // and a chunk is [C, t, H, W] over its OWN t. So appending chunk buffers end to
+  // end yields [c0 t0..][c1 t0..][c2 t0..][c0 t1..].. — which is NOT [C, T, H, W]
+  // whenever C > 1 AND there is more than one chunk, and both hold here (C = 3,
+  // chunks = 2 at 81 frames). The first version of this probe did exactly that
+  // and carried a comment claiming the C-major layout made the comparison
+  // elementwise regardless. It does not: it compares channel 1 of the clip
+  // against channel 0's later frames, so the "difference" it reported was mostly
+  // the probe's own transposition, and the number it published was ~14x too
+  // large. The diagnostic below prints that wrong number too, labelled, so the
+  // artifact stays visible instead of being a paragraph nobody can re-derive.
+  if (static_cast<int64_t>(chunk_list.size()) == 0 || streamed_frames != untiled.frames) {
+    std::fprintf(stderr, "[equiv] FRAME COUNT MISMATCH %lld vs %lld over %lld chunks\n",
+                 (long long)streamed_frames, (long long)untiled.frames, (long long)chunks);
+    return 1;
+  }
+  const int64_t plane = untiled.height * untiled.width;
+  std::vector<float> streamed(static_cast<size_t>(untiled.channels * untiled.frames * plane));
+  int64_t written = 0;
+  for (const vllm::Ltx2VideoChunk& c : chunk_list) {
+    if (c.frames.channels != untiled.channels || c.frames.height != untiled.height ||
+        c.frames.width != untiled.width || c.first_frame != written) {
+      std::fprintf(stderr,
+                   "[equiv] CHUNK SHAPE MISMATCH [%lld,%lld,%lld,%lld] first_frame=%lld "
+                   "expected first_frame=%lld\n",
+                   (long long)c.frames.channels, (long long)c.frames.frames,
+                   (long long)c.frames.height, (long long)c.frames.width,
+                   (long long)c.first_frame, (long long)written);
+      return 1;
+    }
+    for (int64_t ch = 0; ch < untiled.channels; ++ch) {
+      for (int64_t f = 0; f < c.frames.frames; ++f) {
+        const size_t src = static_cast<size_t>((ch * c.frames.frames + f) * plane);
+        const size_t dst = static_cast<size_t>((ch * untiled.frames + written + f) * plane);
+        std::copy(c.frames.data.begin() + static_cast<ptrdiff_t>(src),
+                  c.frames.data.begin() + static_cast<ptrdiff_t>(src + static_cast<size_t>(plane)),
+                  streamed.begin() + static_cast<ptrdiff_t>(dst));
+      }
+    }
+    written += c.frames.frames;
+  }
+
   if (streamed.size() != untiled.data.size()) {
     std::fprintf(stderr, "[equiv] SIZE MISMATCH %zu vs %zu\n", streamed.size(),
                  untiled.data.size());
     return 1;
   }
-  // Concatenating the chunks reproduces the clip only because each chunk is a
-  // contiguous [C, t, H, W] block in frame order; the C-major layout means the
-  // comparison below is elementwise regardless.
   double max_diff = 0.0;
   size_t differing = 0;
   for (size_t i = 0; i < streamed.size(); ++i) {
@@ -143,6 +189,26 @@ int main(int argc, char** argv) {
   for (float v : untiled.data) span = std::max(span, std::fabs(static_cast<double>(v)));
   std::fprintf(stderr, "[equiv] max|diff| = %.17g   non-bit-identical floats = %zu / %zu\n",
                max_diff, differing, streamed.size());
-  std::fprintf(stderr, "[equiv] untiled |out|max = %.17g\n", span);
+  std::fprintf(stderr, "[equiv] untiled |out|max = %.17g   ratio = %.4f%%\n", span,
+               span > 0.0 ? 100.0 * max_diff / span : 0.0);
+
+  // The artifact, kept measurable rather than described: what a flat append of
+  // the chunk buffers would have reported on this same run.
+  std::vector<float> flat;
+  flat.reserve(streamed.size());
+  for (const vllm::Ltx2VideoChunk& c : chunk_list)
+    flat.insert(flat.end(), c.frames.data.begin(), c.frames.data.end());
+  double flat_diff = 0.0;
+  size_t flat_differing = 0;
+  for (size_t i = 0; i < flat.size() && i < untiled.data.size(); ++i) {
+    if (std::memcmp(&flat[i], &untiled.data[i], sizeof(float)) != 0) ++flat_differing;
+    const double d =
+        std::fabs(static_cast<double>(flat[i]) - static_cast<double>(untiled.data[i]));
+    if (d > flat_diff) flat_diff = d;
+  }
+  std::fprintf(stderr,
+               "[equiv] (a FLAT append of the chunk buffers — the WRONG layout, kept only to "
+               "show the size of the artifact — would report max|diff| = %.17g, %zu / %zu)\n",
+               flat_diff, flat_differing, flat.size());
   return 0;
 }

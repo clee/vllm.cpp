@@ -104,6 +104,17 @@ for (W, H, F) in [
 # So this walks the axis one latent frame at a time across the boundary and
 # ASSERTS both where the transition is and that it saw both sides of it. A sweep
 # that steps over its own binding point now fails instead of publishing a number.
+#
+# THE DENSITY IS ASSERTED, NOT COMMENTED. `range(1, 137, 8)` is one latent frame
+# per step only because `latent_t = (F - 1) // 8 + 1`, and nothing below used to
+# check that: changing the step 8 -> 80 left the walk visiting exactly TWO frame
+# counts (1 and 81), skipping latent_t 2..10 entirely, and it still printed
+# "first splits at 81 frames" and exited 0. `saw_untiled` and
+# `first_tiled is not None` cannot see that, because a coarse step that happens to
+# land on the boundary satisfies both. So the walk now asserts that consecutive
+# steps move latent_t by exactly 1, that it started at latent_t 1, and that the
+# step immediately BEFORE the transition was latent_t 10 — the short-circuit's own
+# bound. A lucky-but-coarse sweep is now a failure.
 # ---------------------------------------------------------------------------
 
 WALK_W, WALK_H = 1024, 576
@@ -116,9 +127,11 @@ print()
 print(f"temporal walk @ {WALK_W}x{WALK_H}, one latent frame per step:")
 first_tiled = None
 saw_untiled = False
+visited = []  # (frames, latent_t, interval_count), in walk order
 for F in range(1, 137, 8):  # (frames - 1) % 8 == 0 — exactly one latent frame per step
     lat_t = (F - 1) // SF.time + 1
     n = len(t_split(lat_t).intervals)
+    visited.append((F, lat_t, n))
     if n == 1:
         saw_untiled = True
     elif first_tiled is None:
@@ -129,13 +142,48 @@ for F in range(1, 137, 8):  # (frames - 1) % 8 == 0 — exactly one latent frame
         f"chunks={walk_cfg.video_chunks_number(F)}{mark}"
     )
 
+# THE WALK IS DENSE. Without this, a step that skips latent depths still satisfies
+# every assertion below by landing on the boundary from the outside.
+assert visited, "the walk visited no frame counts at all"
+assert visited[0][1] == 1, (
+    f"the walk starts at latent_t {visited[0][1]}, not 1; it cannot establish that the "
+    "untiled side it saw is the whole untiled side"
+)
+gaps = [
+    (prev, cur)
+    for prev, cur in zip(visited, visited[1:])
+    if cur[1] - prev[1] != 1
+]
+assert not gaps, (
+    f"the walk is NOT dense: latent_t jumps {[(p[1], c[1]) for p, c in gaps]} between "
+    f"frame counts {[(p[0], c[0]) for p, c in gaps]}. It visited "
+    f"{len(visited)} frame counts covering latent_t "
+    f"{[v[1] for v in visited]}. A walk that steps over latent depths can land on the "
+    "boundary by luck and report a threshold it never bracketed — which is exactly the "
+    "defect this block exists to prevent. Use a step of one latent frame (8 pixel frames)."
+)
 assert saw_untiled, "the walk never saw an untiled frame count; it cannot locate a boundary"
 assert first_tiled is not None, (
     "the walk never saw a tiled frame count; extend the range before trusting a threshold"
+)
+# ...and the step IMMEDIATELY before the transition is the short-circuit's own
+# bound, `latent_t <= 10` (tiling.py:239-240). Asserting the neighbour, not just
+# the frame count, is what ties the number to the mechanism that produces it.
+_idx = [i for i, v in enumerate(visited) if v[0] == first_tiled][0]
+assert _idx > 0, "the first tiled frame count is the walk's first step; it bracketed nothing"
+assert visited[_idx - 1][1] == 10 and visited[_idx][1] == 11, (
+    f"the transition is between latent_t {visited[_idx - 1][1]} and {visited[_idx][1]}, "
+    "not 10 -> 11; `split_temporal_causal` short-circuits while latent_t <= 10 "
+    "(tiling.py:239-240), so either upstream moved that bound or this walk is not "
+    "measuring it"
 )
 assert first_tiled == 81, (
     f"the temporal axis first splits at {first_tiled} frames, not 81 — reconcile "
     "ltx2_tiling.h, ltx2_video.cpp, docs/USAGE.md, docs/FEATURES.md and "
     ".agents/specs/ltx25-tiled-decode.md before publishing a new number"
 )
-print(f"  -> the temporal axis first splits at {first_tiled} frames (latent_t 11 > 10)")
+print(
+    f"  -> the temporal axis first splits at {first_tiled} frames "
+    f"(latent_t {visited[_idx - 1][1]} -> {visited[_idx][1]}, walked densely over "
+    f"{len(visited)} frame counts)"
+)

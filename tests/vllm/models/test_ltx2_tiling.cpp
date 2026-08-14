@@ -682,7 +682,10 @@ void RunDecodeArm(bool causal, const std::string& prefix, const char* const* par
                   const float* untiled_golden, size_t untiled_size, const float* tiled_golden,
                   size_t tiled_size, double upstream_gap, double upstream_control_gap,
                   int64_t control_chunk_count, double upstream_untiled_spatial_gap,
-                  int64_t untiled_spatial_chunk_count, int64_t upstream_untiled_frames_raises) {
+                  int64_t untiled_spatial_chunk_count, int64_t upstream_untiled_frames_raises,
+                  const char* upstream_untiled_frames_raise_file,
+                  int64_t upstream_untiled_frames_raise_line,
+                  const char* upstream_untiled_frames_raise_message) {
   const vllm::Ltx2ConvVideoDecoderConfig cfg = TilingFixtureConfig(causal, prefix);
   ParamBag bag = BuildFixtureParams(cfg);
   CheckManifest(bag, param_names, param_counts, param_size);
@@ -803,7 +806,20 @@ void RunDecodeArm(bool causal, const std::string& prefix, const char* const* par
   // cannot run it: `DEFAULT_MAPPING_OPERATION` hands it `slice(0, None)` and
   // conv_video_decoder.py:424 subtracts that `None`. The golden records that
   // upstream raises, so this is a mirrored refusal and not a local policy.
+  //
+  // THE MECHANISM IS PINNED, NOT JUST THE EXCEPTION TYPE. `raises == 1` alone
+  // stays 1 for any future `TypeError` from any line of `tiled_decode`, which
+  // would leave the refusal citing a cause that had silently moved. The
+  // generator now records the innermost raising frame, so the file, the line
+  // conv_video_decoder.py:424 and the None-stop arithmetic in the message are
+  // each asserted here — the same three facts the refusal message names.
   CHECK(upstream_untiled_frames_raises == 1);
+  CHECK(std::string(upstream_untiled_frames_raise_file) == "conv_video_decoder.py");
+  CHECK(upstream_untiled_frames_raise_line == 424);
+  const std::string raise_message(upstream_untiled_frames_raise_message);
+  INFO("upstream's untiled-frames TypeError: " << raise_message);
+  CHECK(raise_message.find("unsupported operand type") != std::string::npos);
+  CHECK(raise_message.find("NoneType") != std::string::npos);
   int64_t refused_emitted = 0;
   CHECK_THROWS(vllm::Ltx2ConvVideoDecodeTiled(
       cfg, bag.weights, latent, cfg.in_channels, kLatentT, kLatentH, kLatentW, &noise,
@@ -829,7 +845,10 @@ TEST_CASE("ltx2 tiled decode matches upstream ltx_core — CAUSAL") {
       vllm_test::kLtx2TileDecCausalControlChunkCount,
       vllm_test::kLtx2TileDecCausalUpstreamUntiledSpatialVsUntiled,
       vllm_test::kLtx2TileDecCausalUntiledSpatialChunkCount,
-      vllm_test::kLtx2TileDecCausalUpstreamUntiledFramesRaises);
+      vllm_test::kLtx2TileDecCausalUpstreamUntiledFramesRaises,
+      vllm_test::kLtx2TileDecCausalUpstreamUntiledFramesRaiseFile,
+      vllm_test::kLtx2TileDecCausalUpstreamUntiledFramesRaiseLine,
+      vllm_test::kLtx2TileDecCausalUpstreamUntiledFramesRaiseMessage);
 }
 
 TEST_CASE("ltx2 tiled decode matches upstream ltx_core — NON-CAUSAL, the shipped polarity") {
@@ -851,7 +870,10 @@ TEST_CASE("ltx2 tiled decode matches upstream ltx_core — NON-CAUSAL, the shipp
       vllm_test::kLtx2TileDecNonCausalControlChunkCount,
       vllm_test::kLtx2TileDecNonCausalUpstreamUntiledSpatialVsUntiled,
       vllm_test::kLtx2TileDecNonCausalUntiledSpatialChunkCount,
-      vllm_test::kLtx2TileDecNonCausalUpstreamUntiledFramesRaises);
+      vllm_test::kLtx2TileDecNonCausalUpstreamUntiledFramesRaises,
+      vllm_test::kLtx2TileDecNonCausalUpstreamUntiledFramesRaiseFile,
+      vllm_test::kLtx2TileDecNonCausalUpstreamUntiledFramesRaiseLine,
+      vllm_test::kLtx2TileDecNonCausalUpstreamUntiledFramesRaiseMessage);
 }
 
 TEST_CASE("ltx2 tiled decode: the diffusion decoder is REFUSED, never downgraded") {

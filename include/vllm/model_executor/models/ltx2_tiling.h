@@ -64,10 +64,22 @@
 // tiled render is not the same image as an untiled one (upstream's behaviour,
 // not a defect — see the equivalence note in tests/vllm/models/test_ltx2_tiling.cpp).
 // Measured on the shipped checkpoint at 64x64/81f by
-// scripts/probe_ltx2_tiled_equivalence.cpp: 2 chunks, max|diff| 0.716 against an
-// output whose own |max| is 0.751, with 985849 of 995328 channel values not
-// bit-identical. The ONE-TILE CONTROL therefore makes routing safe below 81
-// frames and NOT within 81..120.
+// scripts/probe_ltx2_tiled_equivalence.cpp: 2 chunks, max|diff| 0.0503043234
+// against an output whose own |max| is 0.7512672544 — 6.70% of the output's own
+// range — with 962983 of 995328 channel values (96.75%) not bit-identical. The
+// ONE-TILE CONTROL therefore makes routing safe below 81 frames and NOT within
+// 81..120.
+//
+// THAT NUMBER WAS 0.716 UNTIL IT WAS RE-DERIVED, and the correction is recorded
+// because the failure mode is reusable. The probe's first version reassembled the
+// streamed chunks by appending their buffers end to end, but a chunk is
+// [C, t, H, W] CHANNEL-MAJOR, so a flat append is not [C, T, H, W] once C > 1 and
+// there is more than one chunk — both true here. It was comparing channel 1
+// against channel 0's later frames, and the number it published was 14x the real
+// gap. Same run, same binary, corrected reassembly: 0.0503; the flat append the
+// probe still prints as a labelled diagnostic reproduces 0.716 exactly. The
+// QUALITATIVE conclusion is unchanged — 96.75% of values still move and the
+// one-tile control still does not cover 81..120 — but the magnitude was wrong.
 //
 // At 448x256/25f the latent is 8x14 against a 14x24 grid tile and
 // 4 frames against a 10-latent-frame temporal tile, so upstream calls `forward`

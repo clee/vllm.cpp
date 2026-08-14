@@ -183,10 +183,20 @@ void Ltx2ConvVideoDecodeTiled(const Ltx2ConvVideoDecoderConfig& config,
   // (conv_video_decoder.py:424) and raises `TypeError: unsupported operand
   // type(s) for -: 'NoneType' and 'int'`. Measured at the pinned SHA over all
   // eight (frames, height, width) x (tiled, untiled) combinations: every arm
-  // with frames untiled raises, every arm with frames tiled runs and reproduces
-  // `forward` exactly. The gate for both halves is
-  // `kLtx2TileDec*UpstreamUntiledFramesRaises` /
-  // `kLtx2TileDec*UpstreamUntiledSpatialVsUntiled`.
+  // with frames untiled RAISES, and every arm with frames tiled RUNS.
+  //
+  // "Runs" is the claim, and it is not "reproduces `forward` exactly". It
+  // reproduces `forward` exactly only where the frames tile exceeds the axis, so
+  // that ONE temporal group comes out — the one-tile control and the
+  // untiled-spatial control, both of which the goldens pin at max|diff| == 0
+  // (`kLtx2TileDec*UpstreamControlVsUntiled`,
+  // `kLtx2TileDec*UpstreamUntiledSpatialVsUntiled`). Where the frames axis
+  // actually splits, upstream's own tiled decode differs from its own `forward`
+  // by a lot: `kLtx2TileDecCausalUpstreamTiledVsUntiled` is 2.13274002 against an
+  // `OutputSpan` of 2.31735897, and the non-causal arm 2.07932711 against
+  // 2.14835119. That is upstream's behaviour and no bound is claimed over it. The
+  // gate for the refusal itself is `kLtx2TileDec*UpstreamUntiledFramesRaises`
+  // together with the raising file, line and message the generator records.
   //
   // Inventing a concrete stop here would be a behaviour upstream never produces,
   // on a public signature, with no oracle — so it refuses instead. The SPATIAL

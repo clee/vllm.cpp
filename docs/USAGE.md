@@ -599,9 +599,10 @@ memory number:
   inside it.** The default request is 1024x1536 at 121 frames. At 81 frames the
   latent is 11 frames deep against a 10 frame temporal tile, so it splits into two
   chunks. Measured on the shipped conv VAE at 64x64 / 81 frames: max abs diff
-  0.716 against the untiled decode, on an output whose own max is 0.751, with
-  985849 of 995328 channel values not bit identical. If you need the pre tiling
-  render back, ask for 73 frames or fewer.
+  0.0503 against the untiled decode, on an output whose own max is 0.7513 — 6.70%
+  of that range — with 962983 of 995328 channel values (96.75%) not bit identical.
+  So nearly every value moves, by a few percent of the signal. If you need the pre
+  tiling render back, ask for 73 frames or fewer.
 
 **The refusal that used to stand here is gone, and what replaced it is an owed
 ORACLE rather than an owed feature.** Through L10 this page said a prompt was

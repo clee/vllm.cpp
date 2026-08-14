@@ -78,13 +78,30 @@ true at 25 frames.
 >
 > ```
 > [equiv] tiles=2 groups=2 -> untiled [3,81,64,64]  streamed [3,81,64,64] chunks=2
-> [equiv] max|diff| = 0.71614238619804382   non-bit-identical floats = 985849 / 995328
+> [equiv] max|diff| = 0.050304323434829712   non-bit-identical floats = 962983 / 995328
+> [equiv] untiled |out|max = 0.75126725435256958   ratio = 6.6959%
 > ```
 >
-> 99.05% of the pixels move, by up to 0.716 on a signal of scale ~1. That is upstream's
-> behaviour and not a defect, but the ONE-TILE CONTROL's safety argument — "routing
-> through the streaming entry point is safe at every size the AUTO layout does not tile" —
-> **covers below 81 frames and does not cover 81..120**.
+> 96.75% of the pixels move, by up to 0.0503 on an output whose own max is 0.7513 — 6.70%
+> of its range. That is upstream's behaviour and not a defect, but the ONE-TILE CONTROL's
+> safety argument — "routing through the streaming entry point is safe at every size the
+> AUTO layout does not tile" — **covers below 81 frames and does not cover 81..120**.
+>
+> **Corrected again 2026-08-14 (review of PR #746): that number was 0.716 and it was
+> 14x too large.** The probe reassembled the streamed chunks with a flat
+> `insert(streamed.end(), chunk.data.begin(), chunk.data.end())`, and a chunk is
+> `[C, t, H, W]` CHANNEL-MAJOR (`ltx2_video_vae.h:211-219`), so appending buffers end to
+> end yields `[c0 t0..][c1 t0..][c2 t0..][c0 t1..]..` — not `[C, T, H, W]` once `C > 1`
+> AND there is more than one chunk, which is exactly this run (`C = 3`, `chunks = 2`). It
+> was comparing channel 1 against channel 0's later frames. The committed probe carried a
+> comment asserting "the C-major layout means the comparison below is elementwise
+> regardless"; that comment was the error, and the row's OWN test did the reassembly
+> correctly all along (`tests/vllm/models/test_ltx2_tiling.cpp`, `Collected::Concat`).
+> Both numbers come out of the SAME corrected binary on the same run — the probe now
+> prints the flat-append figure as a labelled diagnostic and it reproduces
+> `0.71614238619804382` exactly — so the artifact is measurable rather than argued. The
+> qualitative conclusion is untouched: 99.05% -> 96.75% of values still move, 81..120 is
+> still a tiled regime the one-tile control does not cover, and the refusal stands.
 
 **(b) The decoder's own buffers at that shape are ~2 orders of magnitude too small.**
 The shipped ladder is read from the checkpoint's own `__metadata__["config"]`
@@ -371,9 +388,64 @@ seconds" of memory fall cannot have been a completed decode.
 **4. Tiled decode is NOT an approximation of untiled decode** — §4.1, swept. The
 one-tile control IS exact, on both causality arms, ours and upstream's: `max|diff| == 0`.
 
+**5. The 81..120 gap is 6.70% of the output's range, not 95%.** Re-derived on the shipped
+checkpoint after the probe that produced the first figure was found to be reassembling
+the streamed chunks in the wrong memory layout. See the next subsection; the correction
+is the part of this row worth keeping.
+
+### The number that was 14x wrong, and the pattern it makes three of
+
+The figure this row published to justify its own refusal — `max|diff| = 0.716`, "95% of
+the output's own range" — was an artifact of the measuring instrument, not a property of
+the thing measured. `scripts/probe_ltx2_tiled_equivalence.cpp` reassembled the streamed
+chunks with a flat `insert(streamed.end(), chunk.frames.data.begin(), ...)`. A chunk is
+`[C, t, H, W]` CHANNEL-MAJOR, so that append produces `[c0 t0..][c1 t0..][c2 t0..][c0
+t1..]..`, which is not `[C, T, H, W]` whenever `C > 1` **and** there is more than one
+chunk. The published run is `[3, 81, 64, 64]` with `chunks = 2`, so both conditions hold
+and the comparison was reading channel 1 against channel 0's later frames. The probe even
+carried a comment asserting the opposite — "the C-major layout means the comparison below
+is elementwise regardless" — which is the error stated out loud, and the row's OWN test
+(`Collected::Concat` in `tests/vllm/models/test_ltx2_tiling.cpp`) had the correct
+reassembly the whole time.
+
+Corrected, on the same checkpoint and the same request:
+
+| | committed probe | corrected probe |
+|---|---|---|
+| `max\|diff\|` | 0.71614238619804382 | **0.050304323434829712** |
+| non-bit-identical | 985849 / 995328 (99.05%) | 962983 / 995328 (**96.75%**) |
+| untiled `\|out\|max` | 0.75126725435256958 | 0.75126725435256958 |
+| ratio | 95.3% of range | **6.70% of range** |
+
+The corrected probe prints the flat-append figure as a labelled diagnostic on every run,
+so the two columns above come out of ONE binary on ONE run and the artifact is
+reproducible rather than argued. The qualitative conclusion survives untouched: 96.75% of
+values still move, 81..120 frames is still a tiled regime the one-tile control does not
+cover, and the routing statement in `ltx2_tiling.h` / `ltx2_video.cpp` / `docs/USAGE.md`
+still has to say so. Only the magnitude was wrong — and it was wrong in the direction that
+made the argument look stronger.
+
+**This is the THIRD time in campaign #644 that a number, quoted often enough to be
+treated as measured, moved by a large factor the first time anyone re-derived it:**
+
+| claim | as published | as measured | factor |
+|---|---|---|---|
+| decode memory | 60 GiB | 361.72 MiB | 170x |
+| temporal binding point | 121 frames | 81 frames | — (skipped, not scaled) |
+| tiled-vs-untiled gap | 0.716, 95% of range | 0.0503, 6.70% of range | 14x |
+
+The common shape is not carelessness about arithmetic. In all three the instrument
+reported faithfully on a state it had been GIVEN — a different process's RSS, a sweep that
+never visited the binding point, a buffer in a layout the comparison did not have. Each
+was caught by re-deriving rather than by re-reading, and in each case the prose around the
+number had already been repeated into several files by the time it was checked. The rule
+this row ends on: a number that justifies a refusal, a default or a doc paragraph gets
+re-derived by whoever repeats it, and the probe that produced it gets a control it can
+fail.
+
 ### The gate
 
-**The `ctest -N` denominator is 448 at this head, and it was never 416.** 416 was the
+**The `ctest -N` denominator is 456 at this head, and it was never 416.** 416 was the
 ninja edge count of `ninja test_ltx2_tiling test_ltx2_vae test_ltx2_video`, whose last
 line is `[416/416] Linking CXX executable tests/test_ltx2_video` — a build number read as
 a test number, so "full ctest 416/416" described a run that never happened at that
@@ -382,33 +454,52 @@ reproducible:
 
 ```sh
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
-ctest --test-dir build -N | tail -1     # Total Tests: 448
+ctest --test-dir build -N | tail -1     # Total Tests: 456
 ```
 
-It read 424 the first time this gate ran and 448 after two forward-merges; that drift is
-main's, not this row's, and it is ATTRIBUTED rather than asserted:
-`git diff origin/main -- tests/CMakeLists.txt` is exactly `+7` lines — this row's
-`test_ltx2_tiling` registration — with no target added or removed anywhere else. So this
-branch is main's count plus one, by construction, at whatever main's count happens to be.
+It read 424, then 445, then 448, and now 456; that drift is main's, not this row's, and
+each recorded value describes only the head it was taken on. **456 was taken on the head
+this PR carries** — which is why the earlier 448 stopped describing anything: it was
+recorded at `68d0b6135`, and two later forward-merges moved main under it. Attributed
+directly rather than asserted, by measuring both sides with the same command:
 
-Build: clean `rm -rf build` + reconfigure + `cmake --build build -j 4`, `BUILD_EXIT`
-captured separately from the run, log grepped for `No space left` / `BFD assertion`
-(count 0) and for warnings (count 0), `df -h /` recorded at 89% before and 98% after.
-The build directory was deleted immediately after the gate.
+```sh
+# main @ 7b8919da0, this tree, main's own tests/CMakeLists.txt + CMakeLists.txt
+ctest --test-dir <scratch> -N | tail -1     # Total Tests: 455
+# this head
+ctest --test-dir build -N | tail -1         # Total Tests: 456
+```
+
+The one added listing is `Test #60: test_ltx2_tiling`, absent from main's listing and
+present in this one; `git diff origin/main -- tests/CMakeLists.txt` is exactly `+7` lines
+(that registration) with no target added or removed anywhere else, and
+`grep -c '^vllm_cpp_add_test('` goes **431 on main to 432 here**. The scratch tree was
+configure-only and deleted, and both `CMakeLists.txt` files were restored and verified by
+`sha256sum`, not by `git status`.
+
+Build: clean `rm -rf build` + reconfigure + `ninja -C build -j4`, `BUILD_EXIT=0` captured
+separately from the run, log grepped for `No space left` / `BFD assertion` (count **0**,
+against a positive control of 462 `Building` lines in the same log, because a null grep
+over a truncated log proves nothing) and for `warning:` (count **0**). `df -h /` 89%
+before, 96% at the end of the build. The build directory was deleted immediately after
+the gate.
 
 Focused, with COUNTS (a changed count is RED even when green):
 
-| suite | cases | assertions |
-|---|---|---|
-| `test_ltx2_tiling` | 10 / 10 | 907 / 907 |
-| `test_ltx2_vae` | 36 / 36 | 3039 / 3039 |
-| `test_ltx2_video` | 31 / 31 | 673 / 673 |
-| `test_ltx2_pipeline` | 37 / 37 | 2382 / 2382 |
+| suite | cases | assertions | vs the PR #746 head |
+|---|---|---|---|
+| `test_ltx2_tiling` | 10 / 10 | 915 / 915 | was 907; **+8** = the 4 new raise-mechanism CHECKs x 2 causality arms |
+| `test_ltx2_vae` | 36 / 36 | 3039 / 3039 | unchanged |
+| `test_ltx2_video` | 32 / 32 | 684 / 684 | was 31 / 673; the +1 case / +11 assertions arrive with `fc903b8dd` (#674) on main, not from this row |
+| `test_ltx2_pipeline` | 37 / 37 | 2382 / 2382 | unchanged |
 
-Full: `ctest --test-dir build --output-on-failure` -> **447 passed / 1 failed out of
-448**, 438.02 s, 448 lines of `N/448 Test` in the log — the run's own denominator
-asserted against the `ctest -N` above. Two tests report `Skipped` by their own guards
-(`test_modelopt_mixed_precision_checkpoint`, `test_voxtral_e2e`).
+Full: `ctest --test-dir build -j4 --output-on-failure` -> **455 passed / 1 failed out of
+456**, 31.03 s, `ctest` exit **8**, with **456** lines matching `^ *[0-9]+/456 Test` in
+the log. That last count is the whole point and is a plain `grep -c`, run here rather
+than described: the run's own denominator is compared against the `ctest -N` above
+instead of assumed equal to it. It is a technique with a recorded command, not a
+committed checker, and it is not cited as one. Two tests report `Skipped` by their own
+guards (`test_modelopt_mixed_precision_checkpoint`, `test_voxtral_e2e`).
 
 The one failure is `test_op_parity`, and it is NOT this row's:
 
@@ -420,8 +511,15 @@ test_op_parity.cpp:1989: ERROR: test case THREW exception:
 a null field in the MiniMax-Music3 golden manifest landed on main the same day, already
 filed as **#737** and already reproduced on clean main by the operator (moving that
 golden aside takes the suite to 10/10 and its assertions from 70 to 123). This branch
-touches no parity path — `git diff origin/main --name-only` matches nothing under
-`tests/parity/` or any music3 file.
+touches no parity path — `git diff --name-only origin/main...HEAD | grep -iE 'parity|music3'`
+matches nothing, and the same command without the filter lists this row's five doc and
+record files, so the null result is a real absence and not a broken pipeline.
+
+Note the shape of that failure, because it is a standing trap: `test_op_parity` prints
+`assertions: 70 | 70 passed | 0 failed` **while failing**. The case THREW, so its
+remaining assertions were never reached and never counted. The exit status is the
+authority, not the assertions line — here `ctest` exits **8** and the case line reads
+`10 | 9 passed | 1 failed`.
 
 An earlier pass of this gate aborted at 96/424 with `test_muse_glimmer_text` throwing
 `safetensors: empty file in /tmp/muse_glimmer_text_0.safetensors`. That fixture path is a
@@ -490,12 +588,15 @@ Reproduced on the shipped conv VAE by `scripts/probe_ltx2_tiled_equivalence.cpp`
 ```
 [equiv] 64x64, latent 11,2,2  AUTO h=768/64 w=768/64 f=80/24
 [equiv] tiles=2 groups=2  ->  untiled [3,81,64,64]  streamed [3,81,64,64] chunks=2
-[equiv] max|diff| = 0.71614238619804382   non-bit-identical floats = 985849 / 995328
-[equiv] untiled |out|max = 0.75126725435256958
+[equiv] max|diff| = 0.050304323434829712   non-bit-identical floats = 962983 / 995328
+[equiv] untiled |out|max = 0.75126725435256958   ratio = 6.6959%
 ```
 
-99.05% of pixels move, by up to 95% of the output's own range. Upstream's behaviour,
+96.75% of pixels move, by up to 6.70% of the output's own range. Upstream's behaviour,
 mirrored — but the one-tile control's safety argument covers **below 81 frames only**.
+The first published figure here was `0.71614238619804382`, "95% of the range"; it was a
+measurement artifact of the probe's own reassembly and is corrected in the §0 box and in
+"The number that was 14x wrong" below.
 
 **F2 (blocking) — the `!IsTiled()` mapper branches were shipped and ungated.**
 Reproduced first: with `map_t`/`map_s`'s `{1.0f}` broadcast masks mutated to `{0.0f}` —
@@ -542,6 +643,74 @@ writer at 81 frames. **F7** a previous render's frame tail is deleted before a n
 writes. **F8** the "never materialized" claim is bounded to the tiled case at both
 anchors. **F9** the compile line for both probes is recorded in their headers.
 **F10** the fixture's `res_x_y` block is disclosed in the test header.
+
+### The review of PR #746 — FAIL, and what closed each finding
+
+F2 was accepted as closed and is not re-litigated: the reviewer re-derived the
+asymmetry from scratch (all 8 `(h,w) x (tiled,untiled) x (causal,non-causal)`
+frames-untiled combinations raise `TypeError at conv_video_decoder.py:424`, all
+frames-tiled run; `default_mapping_operation`, `tiling.py:126-132`, returns
+`[slice(0, None)]`), confirmed the black-out mutation goes RED, and confirmed the goldens
+regenerate with 23 added and **zero changed** lines. F1's reasoning and its probe were
+likewise confirmed load-bearing — the probe fails in both directions when upstream's
+splitter is patched in-process (`size+1` -> "first splits at 89", `size-1` -> "73").
+
+**BLOCKING — the headline number was a measurement artifact of the probe's own
+reassembly.** Closed by fixing the probe, re-measuring on the real checkpoint, and
+correcting the number at all four published sites plus this spec. Full record in
+"The number that was 14x wrong" above; the corrected figure is
+`max|diff| = 0.050304323434829712` against an untiled `|out|max` of
+`0.75126725435256958`, i.e. **6.70%** of the output's own range, with 962983 / 995328
+(96.75%) values not bit-identical. The `// the C-major layout means the comparison below
+is elementwise regardless` comment that asserted the bug was harmless is deleted and
+replaced by the mechanism. Sites corrected: `include/vllm/model_executor/models/ltx2_tiling.h`,
+`src/vllm/multimodal/ltx2_video.cpp`, `docs/USAGE.md` (user-facing) and §0 / §"Outcome"
+here.
+
+**F1-b — the walk's density was a comment, not an assertion.** Reproduced first: the
+committed `scripts/probe_ltx2_tiling_layout.py` with its step changed `8 -> 80` and
+nothing else exits **0** and prints "the temporal axis first splits at 81 frames" after
+examining exactly two frame counts, skipping latent_t 2..10. `saw_untiled` and
+`first_tiled is not None` cannot see that, because a coarse step that lands on the
+boundary from outside satisfies both. The walk now asserts it starts at latent_t 1, that
+consecutive steps move latent_t by exactly 1, and that the step immediately before the
+transition is latent_t 10 against 11 after it — the short-circuit's own bound
+(`tiling.py:239-240`). The same `8 -> 80` mutation on the repaired probe exits **1**:
+`AssertionError: the walk is NOT dense: latent_t jumps [(1, 11)] ... It visited 2 frame
+counts covering latent_t [1, 11]`. Unmutated it exits 0 over 17 densely walked frame
+counts.
+
+**MODERATE — the recorded `ctest -N` no longer described the head.** Re-measured on this
+head (456) and attributed against main @ `7b8919da0` (455) with the same command; see
+"The gate". The `447/448 with 448 N/448 lines` line is restated as what it is — a `grep -c`
+run against `ctest -N`'s total, with both commands recorded — and is no longer described
+as a committed instrument.
+
+**MINOR — the "upstream raises" golden pinned the type, not the reason.** A bare
+`except TypeError` would keep `*UpstreamUntiledFramesRaises = 1` for any future
+`TypeError` from any line while the cited mechanism went stale. The generator now walks
+the traceback to the innermost frame and emits `*UpstreamUntiledFramesRaiseFile`,
+`*UpstreamUntiledFramesRaiseLine` and `*UpstreamUntiledFramesRaiseMessage` — measured as
+`conv_video_decoder.py`, **424**, `unsupported operand type(s) for -: 'NoneType' and
+'int'` — with generator-side assertions on the file and the message so a moved mechanism
+fails the regeneration rather than the review. `test_ltx2_tiling` asserts all three
+(+8 assertions, 907 -> 915). Both mutations go RED and were restored byte-for-byte,
+verified by `sha256sum`:
+
+| mutation (goldens only, scratch) | result |
+|---|---|
+| `RaiseLine = 424` -> `425` | 10 cases -> 8 passed / **2 failed**, 915 assertions -> **2 failed**, exit 1 |
+| `RaiseFile` -> `tiling.py` and `RaiseMessage` -> `something else entirely` | 10 cases -> 8 passed / **2 failed**, 915 assertions -> **6 failed**, exit 1 |
+| restored (`sha256` matches `bf2bdb4d…`), rebuilt | 10 / 10, 915 / 915, exit 0 |
+
+**MINOR — a committed comment contradicted a constant 60 lines away.**
+`ltx2_video_vae_tiled.cpp` said every frames-tiled arm "runs and reproduces `forward`
+exactly". That holds only where the frames tile exceeds the axis, so one temporal group
+comes out — the one-tile and untiled-spatial controls, both pinned at `max|diff| == 0`.
+Where the frames axis actually splits, upstream's own tiled decode differs from its own
+`forward` by `kLtx2TileDecCausalUpstreamTiledVsUntiled = 2.13274002` against an
+`OutputSpan` of `2.31735897` (non-causal: 2.07932711 against 2.14835119). The sentence is
+now bounded to the controls and names those constants.
 
 ### What is owed
 

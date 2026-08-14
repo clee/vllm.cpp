@@ -17886,6 +17886,9 @@ inline constexpr double kLtx2TileDecCausalUpstreamControlVsUntiled = 0;
 inline constexpr int64_t kLtx2TileDecCausalUntiledSpatialChunkCount = 1;
 inline constexpr double kLtx2TileDecCausalUpstreamUntiledSpatialVsUntiled = 0;
 inline constexpr int64_t kLtx2TileDecCausalUpstreamUntiledFramesRaises = 1;
+inline constexpr int64_t kLtx2TileDecCausalUpstreamUntiledFramesRaiseLine = 424;
+inline constexpr const char* kLtx2TileDecCausalUpstreamUntiledFramesRaiseFile = "conv_video_decoder.py";
+inline constexpr const char* kLtx2TileDecCausalUpstreamUntiledFramesRaiseMessage = "unsupported operand type(s) for -: 'NoneType' and 'int'";
 
 // --- section 7: the same, NON-CAUSAL — the polarity the shipped
 // ltx-2.5-video-vae-conv checkpoint actually sets (`causal_decoder: false`),
@@ -35363,5 +35366,8 @@ inline constexpr double kLtx2TileDecNonCausalUpstreamControlVsUntiled = 0;
 inline constexpr int64_t kLtx2TileDecNonCausalUntiledSpatialChunkCount = 1;
 inline constexpr double kLtx2TileDecNonCausalUpstreamUntiledSpatialVsUntiled = 0;
 inline constexpr int64_t kLtx2TileDecNonCausalUpstreamUntiledFramesRaises = 1;
+inline constexpr int64_t kLtx2TileDecNonCausalUpstreamUntiledFramesRaiseLine = 424;
+inline constexpr const char* kLtx2TileDecNonCausalUpstreamUntiledFramesRaiseFile = "conv_video_decoder.py";
+inline constexpr const char* kLtx2TileDecNonCausalUpstreamUntiledFramesRaiseMessage = "unsupported operand type(s) for -: 'NoneType' and 'int'";
 
 }  // namespace vllm_test
