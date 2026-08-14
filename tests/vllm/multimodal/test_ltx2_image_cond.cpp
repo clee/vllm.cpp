@@ -572,7 +572,7 @@ TEST_CASE("ltx2 image cond: the encoder config reads the LATENT width, not the R
   CHECK(cfg.encoder_blocks[1].multiplier == 2);
   // THE DEFAULT THAT DIVERGES FROM THE DECODER'S. `spatial_padding_mode` is
   // absent here, so the encoder must take `zeros` while the decoder takes
-  // `reflect` (model_configurator.py:63-67 vs :90).
+  // `reflect` (model_configurator.py:63-68 vs :92).
   CHECK(cfg.spatial_padding_mode == vllm::Ltx2PaddingMode::kZeros);
   CHECK(cfg.latent_log_var == vllm::Ltx2LogVarianceType::kUniform);
 
@@ -605,6 +605,30 @@ TEST_CASE("ltx2 image cond: the encoder config reads the LATENT width, not the R
   SUBCASE("an unknown latent_log_var is refused rather than mapped to the nearest") {
     config["vae"]["latent_log_var"] = "gaussian";
     CHECK_THROWS_AS(vllm::Ltx2ParseConvVideoEncoderConfig(config), std::runtime_error);
+  }
+  SUBCASE("a res_x block WITHOUT num_layers is refused, as upstream's subscript is") {
+    // `_make_encoder_block` reads `block_config["num_layers"]` — a SUBSCRIPT
+    // (video_vae.py:55) — so a `res_x` block that omits it is a config upstream
+    // cannot load either. This parser used to default it to 1, which silently
+    // built a one-layer `UNetMidBlock3D` instead; two lines below it, an absent
+    // `multiplier` is deliberately kept at a sentinel for exactly that reason.
+    // The two are consistent as of the review of #657.
+    config["vae"]["encoder_blocks"][0][1].erase("num_layers");
+    CHECK_THROWS_WITH_AS(vllm::Ltx2ParseConvVideoEncoderConfig(config),
+                         doctest::Contains("num_layers"), std::runtime_error);
+  }
+  SUBCASE("only res_x needs num_layers; no other block kind reads it") {
+    // The other half of the mirror, and the half a bare "make it strict" would
+    // get wrong: `_make_encoder_block`'s remaining branches (video_vae.py:61-145)
+    // never touch `num_layers`, so requiring it everywhere would refuse configs
+    // upstream loads.
+    config["vae"]["encoder_blocks"][1][1].erase("multiplier");
+    const vllm::Ltx2ConvVideoEncoderConfig lean =
+        vllm::Ltx2ParseConvVideoEncoderConfig(config);
+    REQUIRE(lean.encoder_blocks.size() == 2);
+    CHECK(lean.encoder_blocks[1].name == "compress_all_res");
+    CHECK(lean.encoder_blocks[1].num_layers == 1);
+    CHECK(lean.encoder_blocks[1].multiplier == 0);
   }
 }
 

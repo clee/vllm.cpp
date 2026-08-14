@@ -28,7 +28,7 @@
 //
 // ─── THE FIVE THINGS THAT FAIL SILENTLY ──────────────────────────────────────
 //  * THE ENCODER'S DEFAULT SPATIAL PADDING IS `zeros`; THE DECODER'S IS
-//    `reflect` (model_configurator.py:63-67 vs :90). They read the SAME
+//    `reflect` (model_configurator.py:63-68 vs :92). They read the SAME
 //    checkpoint key `spatial_padding_mode` on a flat CausalVideoAutoencoder
 //    config, so they only diverge when the key is ABSENT — and then they diverge
 //    silently, by a half-pixel border, in opposite directions.
@@ -218,7 +218,7 @@ bool Ltx2CheckpointHasVideoEncoder(const std::vector<std::string>& tensor_names)
 //     (:41-43). On a nested `CausalDiffusionVAE` config it is
 //     `vae.encoder.out_channels` (:46-49) — the same spelling, the other object.
 //   * `spatial_padding_mode`. The ENCODER's default is `zeros`; the decoder's is
-//     `reflect` (:63-67 vs :90). Both read the same checkpoint key on a flat
+//     `reflect` (:63-68 vs :92). Both read the same checkpoint key on a flat
 //     config, so they diverge only when the key is ABSENT, silently, by a
 //     half-pixel border, in opposite directions.
 Ltx2ConvVideoEncoderConfig Ltx2ParseConvVideoEncoderConfig(const nlohmann::json& config);

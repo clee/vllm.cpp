@@ -37,6 +37,7 @@
 #include "vllm/model_executor/models/ltx2_video_vae.h"
 #include "vllm/model_executor/models/ltx2_video_vae_encoder.h"
 #include "vllm/model_executor/models/minimax_h3.h"
+#include "vllm/platforms/interface.h"  // CurrentPlatform() — which accelerator, if any
 #include "vllm/tokenizer/tokenizer.h"
 
 namespace vllm::multimodal {
@@ -421,9 +422,10 @@ bool DetectLtx2Video(const VideoModelParams& params) {
 
 struct Ltx2VideoEngine::Impl {
   VideoModelParams params;
-  // CPU, or the CUDA device `params.device - 1` names. Phase L8 made the second
-  // real: the DiT is staged with `Ltx2StreamDitToDevice` and driven by
-  // `Ltx2DitForwardDevice`, so a CUDA handle now denotes a CUDA forward.
+  // CPU, or the accelerator index `params.device - 1` names on whichever device
+  // type the platform seam resolves. Phase L8 made the second real: the DiT is
+  // staged with `Ltx2StreamDitToDevice` and driven by `Ltx2DitForwardDevice`, so
+  // a non-zero handle now denotes a device-resident forward.
   vt::Device device;
   // The stream dtype the DiT was staged at, and the one the forward computes in.
   // bf16 on an accelerator — upstream resolves ONE model dtype and every layer
@@ -532,24 +534,46 @@ std::unique_ptr<Ltx2VideoEngine> Ltx2VideoEngine::Load(const VideoModelParams& p
 
   // ── where this engine runs (phase L8) ─────────────────────────────────────
   //
-  // `device` is 0 for the CPU and 1 + <cuda index> for an accelerator, which is
-  // the mapping the seam already documents. Phase L7 REFUSED anything but 0,
-  // because the f32-only forward and the bf16-only staging did not meet; phase
-  // L8 is the forward that closes that, so the refusal is gone and the handle
-  // now means what it says.
+  // `device` is 0 for the CPU and 1 + <accelerator index> for an accelerator,
+  // which is the mapping the seam already documents. Phase L7 REFUSED anything
+  // but 0, because the f32-only forward and the bf16-only staging did not meet;
+  // phase L8 is the forward that closes that, so the refusal is gone and the
+  // handle now means what it says.
   //
-  // What is NOT gone is the refusal to fake it: if the CUDA backend is not
-  // registered in this build, the load is refused BY NAME rather than served the
-  // CPU forward behind a CUDA-looking handle. That substitution is exactly what
-  // would make every later timing and every "it ran on the GPU" claim false.
+  // WHICH accelerator is the PLATFORM's question, not this model file's. This
+  // asked `TryGetBackend(kCUDA)` — the same defect work row M3a repaired in
+  // `SelectQueueForModel` (src/vllm/entrypoints/model_loader.cpp:75-104 — the
+  // full path matters, there is also a src/vllm/model_executor/model_loader/
+  // DIRECTORY and the bare file name sends a reader there), where a hardcoded
+  // `GetBackend(kCUDA)` was the one line standing between a complete non-NVIDIA
+  // backend and running a model. `CurrentPlatform()` walks the probe order
+  // {kCUDA, kROCM, kXPU, kVULKAN, kMETAL, kTENSTORRENT, kCPU}
+  // (src/vllm/platforms/platform.cpp:62-64) and returns the first one REGISTERED
+  // (:91-98) — and a platform registers only where its own probe found a device,
+  // e.g. src/vllm/platforms/cuda.cpp:136-138 returns early on a box with the CUDA
+  // toolkit and no usable GPU — so on a CUDA box this resolves EXACTLY the device
+  // the hardcoded lookup did.
+  // Nothing below this line names a device either: `Ltx2StreamDitToDevice` and
+  // `Ltx2DitForwardDevice` drive `vt::Queue` and the op table, so a backend that
+  // registers those ops reaches this forward with no edit here.
+  //
+  // What is NOT gone is the refusal to fake it: if this build registers no
+  // accelerator backend, the load is refused BY NAME rather than served the CPU
+  // forward behind an accelerator-looking handle. That substitution is exactly
+  // what would make every later timing and every "it ran on the GPU" claim false.
   im.on_device = params.device != 0;
   if (im.on_device) {
-    vt::Backend* backend = vt::TryGetBackend(vt::DeviceType::kCUDA);
-    if (backend == nullptr) {
+    const vt::DeviceType accelerator =
+        vllm::platforms::CurrentPlatform().device_type();
+    if (accelerator == vt::DeviceType::kCPU ||
+        vt::TryGetBackend(accelerator) == nullptr) {
       Fail("device " + std::to_string(params.device) +
-           " asks for CUDA, but no CUDA backend is registered in this build. The LTX-2.5 "
-           "device-resident forward is present (Ltx2DitForwardDevice); what is missing is "
-           "the backend. Refusing rather than running the CPU forward behind a CUDA handle.");
+           " asks for an accelerator, but no accelerator backend is registered in this "
+           "build (the platform seam resolves to '" +
+           std::string(vt::DeviceTypeName(accelerator)) +
+           "'). The LTX-2.5 device-resident forward is present (Ltx2DitForwardDevice); "
+           "what is missing is the backend. Refusing rather than running the CPU forward "
+           "behind an accelerator handle.");
     }
     // `vt::CreateQueue(Device)`, NOT `Backend::CreateQueue()`. backend.h:212-217
     // records the method as a "temporary index-0 migration shim" and says new
@@ -561,9 +585,10 @@ std::unique_ptr<Ltx2VideoEngine> Ltx2VideoEngine::Load(const VideoModelParams& p
     // has one GPU so it cannot be reached there, which is exactly why it has to
     // be right before a second device exists.
     const int32_t index = static_cast<int32_t>(params.device - 1);
-    im.device = vt::Device{vt::DeviceType::kCUDA, index};
+    im.device = vt::Device{accelerator, index};
     if (vt::TryGetBackend(im.device) == nullptr) {
-      Fail("device " + std::to_string(params.device) + " names CUDA device index " +
+      Fail("device " + std::to_string(params.device) + " names " +
+           std::string(vt::DeviceTypeName(accelerator)) + " device index " +
            std::to_string(index) +
            ", and no backend is registered for it. Refusing rather than creating a queue "
            "on device 0 and labelling it with an index nothing runs on.");
@@ -792,7 +817,7 @@ std::unique_ptr<Ltx2VideoEngine> Ltx2VideoEngine::Load(const VideoModelParams& p
              std::to_string(im.dit.params.in_channels) +
              ". `_prepare_video_encoder_kwargs` reads this from `vae.latent_channels`, never "
              "from the top-level `vae.out_channels`, which is the DECODER's RGB count "
-             "(video_vae/model_configurator.py:41-43).");
+             "(video_vae/model_configurator.py:41-42, and the flat-layout read at :52).");
       }
       // And its INPUT width, for the same reason in the other direction: the
       // encoder takes RGB, and a config declaring otherwise would silently
@@ -1180,31 +1205,60 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
   // silently ignored renders an unconditioned clip that looks like the feature
   // not working.
   //
-  // THESE MESSAGES ARE WRITTEN TO BE RE-CHECKABLE. Five refusals in this
-  // campaign have had their stated reason go stale, including the one that stood
-  // here: it said no encoder weights could be materialized, which was true when
-  // written and is what this row fixed. So each message below names the exact
-  // symbol or `file:line` that would have to change for it to become false,
-  // rather than a category.
+  // THESE MESSAGES ARE WRITTEN TO BE RE-CHECKABLE, and the count is now SIX
+  // refusals in this campaign whose stated reason turned out to be false or
+  // stale. Two of the six stood right here. The first said no encoder weights
+  // could be materialized — true when written, and what this row fixed. The
+  // second replaced it and blamed `keyframes_abs_pos_embedding`, which was
+  // verifiably NOT the blocker at the pin (see the last-frame message below for
+  // the three anchors that refute it), and a test had been written to assert
+  // that wrong reason by name.
+  //
+  // So: name the exact symbol or upstream `file:line` that would have to change
+  // for the refusal to become false, never a category — and where a plausible
+  // reason has already been ruled OUT, say so and cite what ruled it out, so the
+  // next reader re-checks the claim instead of re-deriving the refutation. Local
+  // anchors are SYMBOLS, not line numbers in this file: same-file line numbers
+  // drift on every edit, which is how the previous message's citation went stale.
   const bool wants_image = !gen.first_frame_path.empty() || !gen.first_frame_ppm.empty();
   if (!gen.last_frame_path.empty()) {
     Fail(
-        "a LAST-frame keyframe is not served. What is missing is no longer the encoder or the "
-        "placement — `Ltx2ConvVideoEncode` and `Ltx2ConditionVideoByKeyframe` are both ported "
-        "and gated, and this engine now materializes encoder weights through "
-        "Ltx2VideoVaeEncoderKeyRules. It is the DiT module: a keyframe is APPENDED as extra "
-        "tokens carrying their own positions (conditioning/types/keyframe_cond.py:39-90), and "
-        "the transformer reads those through `keyframes_abs_pos_embedding`, which "
-        "`ParseLtx2DitParams` refuses by name as unported (ltx2_loader.h). Conditioning on the "
-        "FIRST frame needs none of that — it REPLACES tokens that already exist — which is why "
-        "that arm is served and this one is not.");
+        "a LAST-frame keyframe is not served. What is missing is the TOKEN-APPEND machinery. "
+        "`Ltx2ConvVideoEncode` and `Ltx2ConditionVideoByKeyframe` are both ported and gated, "
+        "and this engine materializes encoder weights through Ltx2VideoVaeEncoderKeyRules, so "
+        "none of those is the gap. The gap is that `VideoConditionByKeyframeIndex.apply_to` "
+        "(conditioning/types/keyframe_cond.py:36-90) APPENDS tokens to the sequence: it "
+        "concatenates onto `latent`, `denoise_mask`, `positions` and `clean_latent` (:79-82), "
+        "gives the appended tokens their own pixel coordinates offset to `frame_idx` (:46-59), "
+        "and rebuilds the attention mask through `update_attention_mask` (:68-76) — and then "
+        "`clear_conditioning` (ltx_core/tools.py:88-105) trims those extra tokens back off "
+        "before unpatchify. This engine cannot do any of that yet: `Ltx2LatentState` has no "
+        "attention-mask field at all (see the note on its declaration in ltx2_conditioning.h), "
+        "and the phase loop is fixed at the target grid's token count — one "
+        "`Ltx2VideoTokenCount(vshape, 1)` feeds the sigma schedule, the `Ltx2ModalityInput` "
+        "handed to the DiT, and `Ltx2VideoUnpatchify`, with the clear step an explicit identity "
+        "because nothing was ever appended. Serving this arm means growing that sequence "
+        "through the DiT and trimming it back. Conditioning on the FIRST frame needs none of "
+        "it, which is why that arm IS served: `VideoConditionByLatentIndex` REPLACES tokens "
+        "that already exist (conditioning/types/latent_cond.py:38-39) and the token count never "
+        "changes. WHAT IS *NOT* THE REASON, because this refusal used to say it was: "
+        "`keyframes_abs_pos_embedding`. A SUPPLIED keyframe is appended with `marked=False` "
+        "(keyframe_cond.py:84-86, whose comment says given keyframe content carries no keyframe "
+        "marker), and its sole consumer adds `mask * embedding` with `mask = keyframes_mask > 0` "
+        "(model/transformer/transformer_args.py:42-43, called once at :269) — so on exactly "
+        "these tokens the embedding contributes nothing, and porting it would not serve this "
+        "arm. The tokens that DO reach it are the target's own first latent frame, marked "
+        "unconditionally by `_first_frame_keyframes_mask` (ltx_core/tools.py:184-196) — which "
+        "is the frame the SERVED first-frame arm writes into. That omission is real and is "
+        "tracked as issue #658; it is not what blocks a last-frame keyframe.");
   }
   if (!gen.ref_image_paths.empty() || !gen.ref_video_dir.empty()) {
     Fail(
         "reference-image / reference-video conditioning is not served. The encoder and the "
         "placement are both here — `Ltx2ConditionVideoByReference` is ported and gated — but "
         "it takes a `downscale_factor` and a `temporal_scale_factor` that must match what the "
-        "IC-LoRA was TRAINED with (conditioning/types/reference_video_cond.py:74, 80), and "
+        "IC-LoRA was TRAINED with (conditioning/types/reference_video_cond.py:36-37, applied at "
+        ":65-77), and "
         "upstream carries those in the LoRA's own metadata, which this project does not read. "
         "A guessed pair places the reference plausibly and wrongly, which no output check can "
         "see, so it is refused instead. Use first_frame_ppm / first_frame_path for "
@@ -1213,7 +1267,7 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
   if (!gen.ref_audio_path.empty() || !gen.ref_audio_wav.empty()) {
     Fail(
         "reference-AUDIO conditioning is not served. `Ltx2ConditionAudioByReference` is ported "
-        "and gated (conditioning/types/reference_audio_cond.py:33-65), and what it needs is an "
+        "and gated (conditioning/types/reference_audio_cond.py:34-65), and what it needs is an "
         "encoded waveform: `encode_audio` through the audio VAE's ENCODER "
         "(ltx-pipelines/utils/helpers.py:264-269). This row built the VIDEO encoder's load "
         "path only — there is no AUDIO_VAE_ENCODER key filter — so nothing can turn a WAV into "
@@ -1221,7 +1275,7 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
   }
 
   // The CRF, resolved the way `ImageConditioner.resolve_crf` resolves it
-  // (blocks.py:966-983) over `detect_params` (utils/constants.py:166-177): from
+  // (blocks.py:966-983) over `detect_params` (utils/constants.py:166-179): from
   // the CHECKPOINT's own generation when the caller left it unset. For LTX-2.5
   // that is 18, and 18 is not ported — so the DEFAULT REFUSES and a caller has
   // to ask for 0 knowingly. Resolved and checked BEFORE any pixel is read, so an
@@ -1391,7 +1445,7 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
       video_initial = up.data;
     }
 
-    // ── build the two states (create_noised_state, helpers.py:428-447) ───────
+    // ── build the two states (create_noised_state, helpers.py:428-445) ───────
     StreamState video;
     video.width = vshape.channels;  // patch_size 1 (VideoLatentPatchifier(1))
     video.tokens = Ltx2VideoTokenCount(vshape, 1);
@@ -1448,7 +1502,8 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
     // ── the image conditioning (issue #644) ─────────────────────────────────
     //
     // BEFORE THE NOISER AND AFTER THE STATE, which is upstream's order
-    // (blocks.py:576-580 -> helpers.py:428-447) and is not interchangeable: the
+    // (`create_noised_state`, helpers.py:428-445: initial state, THEN the
+    // conditioning items, THEN the noiser) and is not interchangeable: the
     // item writes ONLY `clean_latent` and `denoise_mask` (latent_cond.py:38-39)
     // and the noiser is what composes them into the noisy tensor
     // (components/noisers.py:31-34). Applying it afterwards leaves the
@@ -1457,8 +1512,11 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
     //
     // PER PHASE, and encoded per phase, because the two-stage recipe renders its
     // stages at DIFFERENT resolutions (`phase.spatial_downscale`) and upstream
-    // passes each stage's own height/width to `combined_image_conditionings`
-    // (helpers.py:274-275). Conditioning stage 1 only would let stage 2 re-noise
+    // passes each stage's own height/width to `combined_image_conditionings`,
+    // whose `height` / `width` are per-call parameters (helpers.py:274-275) that
+    // distilled.py fills differently per stage: `stage_1_w, stage_1_h = width //
+    // 2, height // 2` at :251 passed at :255-256, against the full-resolution
+    // `height` / `width` at :285-286. Conditioning stage 1 only would let stage 2 re-noise
     // the pinned frame away; conditioning stage 2 with stage 1's latent would
     // place a half-resolution image into a full-resolution grid.
     if (wants_image) {
@@ -1526,7 +1584,8 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
     }
 
     // The noiser draws VIDEO first, AUDIO second, from one generator
-    // (blocks.py:576-580 builds the video state before the audio one).
+    // (blocks.py:554-563 builds the video state before the audio one; :576-580,
+    // which this used to cite, is the TEARDOWN and proves nothing about order).
     const float noise_scale = static_cast<float>(phase.noise_scale);
     ApplyGaussianNoise(video, state_noise.Draw(static_cast<int64_t>(video.latent.size())),
                        noise_scale);

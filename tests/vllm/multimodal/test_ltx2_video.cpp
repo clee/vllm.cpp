@@ -41,6 +41,7 @@
 #include "vllm/model_executor/models/ltx2_upsampler.h"
 #include "vllm/model_executor/models/ltx2_video_vae.h"
 #include "vllm/model_executor/models/ltx2_video_vae_encoder.h"
+#include "vllm/platforms/interface.h"  // CurrentPlatform() — the seam the engine asks
 #include "vllm.h"
 #include "vt/backend.h"
 #include "vt/device.h"
@@ -359,26 +360,35 @@ TEST_CASE("ltx2 video: the second phase upsamples, and refuses when it cannot") 
 // L7 had to refuse `device = 1` outright: the forward was f32-only by
 // declaration and the staging was bf16 and refused to widen, so no combination
 // put the DiT on an accelerator. L8 is the device-resident forward that closes
-// that (`Ltx2DitForwardDevice`), so a CUDA handle now denotes a CUDA forward and
-// the load must SUCCEED where a CUDA backend exists.
+// that (`Ltx2DitForwardDevice`), so a non-zero handle now denotes a
+// device-resident forward and the load must SUCCEED where an accelerator backend
+// exists.
 //
-// What must never come back is the substitution: on a build with no CUDA backend
-// the load is still refused, and the refusal must name the missing BACKEND. If it
-// ever again names the f32/bf16 gap, the device forward has been un-wired; if it
-// silently succeeds with a CPU device, the engine is lying about where it ran.
-TEST_CASE("ltx2 video: device 1 runs on CUDA, and is refused by name without it") {
+// The DSR repair (#553) changed WHICH accelerator from a hardcoded `kCUDA` to
+// the platform seam's own answer, so this case now asks the seam the same
+// question the engine asks instead of naming a device itself. On a CUDA box that
+// resolves to kCUDA and the assertions below are the ones L8 shipped.
+//
+// What must never come back is the substitution: on a build with no accelerator
+// backend the load is still refused, and the refusal must name the missing
+// BACKEND. If it ever again names the f32/bf16 gap, the device forward has been
+// un-wired; if it silently succeeds with a CPU device, the engine is lying about
+// where it ran.
+TEST_CASE("ltx2 video: device 1 runs on the resolved accelerator, refused by name without one") {
   Workspace ws;
   vllm::multimodal::VideoModelParams mp = FixtureParams(ws.paths);
   mp.device = 1;
-  vt::Backend* cuda = vt::TryGetBackend(vt::DeviceType::kCUDA);
-  if (cuda == nullptr) {
+  const vt::DeviceType accelerator = vllm::platforms::CurrentPlatform().device_type();
+  const bool have_accelerator = accelerator != vt::DeviceType::kCPU &&
+                                vt::TryGetBackend(accelerator) != nullptr;
+  if (!have_accelerator) {
     try {
       (void)vllm::multimodal::LoadVideoEngine(mp);
-      FAIL("a CUDA load must be refused when no CUDA backend is registered");
+      FAIL("a device-1 load must be refused when no accelerator backend is registered");
     } catch (const std::exception& e) {
       const std::string msg = e.what();
       INFO(msg);
-      CHECK(msg.find("no CUDA backend") != std::string::npos);
+      CHECK(msg.find("no accelerator backend") != std::string::npos);
       // The L7 gap must NOT be what is named any more; naming it would mean the
       // device forward is no longer wired in.
       CHECK(msg.find("kF32") == std::string::npos);
@@ -388,8 +398,10 @@ TEST_CASE("ltx2 video: device 1 runs on CUDA, and is refused by name without it"
   const std::unique_ptr<vllm::multimodal::VideoEngine> engine =
       vllm::multimodal::LoadVideoEngine(mp);
   REQUIRE(engine != nullptr);
-  // The handle means what it says: a CUDA device, not a CPU one behind it.
-  CHECK(engine->device().type == vt::DeviceType::kCUDA);
+  // The handle means what it says: the accelerator the seam resolved, never a
+  // CPU device behind it.
+  CHECK(engine->device().type == accelerator);
+  CHECK(engine->device().type != vt::DeviceType::kCPU);
   CHECK(engine->family() == std::string(vllm::multimodal::kLtx2VideoFamily));
 }
 
@@ -687,7 +699,9 @@ std::string ConditioningPpm(int height, int width, unsigned seed) {
 // BOTH phases, which for image conditioning is not a detail: the two-stage
 // recipe renders its stages at DIFFERENT resolutions, so the image is decoded,
 // resized and encoded once per phase against that phase's own height and width
-// (ltx-pipelines/utils/helpers.py:274-275). A `max_phase = 0` fixture would
+// (ltx-pipelines/utils/helpers.py:274-275 are the parameters; distilled.py:251,
+// :255-256 and :285-286 are where the two stages pass different values). A
+// `max_phase = 0` fixture would
 // leave the second encode — and the whole reason the conditioning lives inside
 // the phase loop — untested.
 vllm::multimodal::VideoModelParams ConditioningParams(const ltx2_fixture::Paths& paths) {
@@ -724,18 +738,36 @@ TEST_CASE("ltx2 video: keyframe and reference conditioning is refused BY WHAT IS
     }
   };
 
-  SUBCASE("a LAST-frame keyframe names the unported DiT module") {
+  SUBCASE("a LAST-frame keyframe names the TOKEN-APPEND machinery, not the embedding") {
     const std::string msg = refusal("a last-frame keyframe",
                                     [](vllm::multimodal::VideoGenParams& g, const Workspace& w) {
                                       g.last_frame_path = w.paths.video_embeds;
                                     });
     INFO(msg);
-    // The encoder is NOT what is missing any more, and the message must not say
-    // it is. What IS missing is the positional-embedding module the appended
-    // keyframe tokens would be read through.
-    CHECK(msg.find("keyframes_abs_pos_embedding") != std::string::npos);
+    // THIS ASSERTION USED TO PIN A FALSE REASON. It required the message to
+    // blame `keyframes_abs_pos_embedding`, and at pin `fd4ded7f` that is not
+    // what blocks a supplied keyframe: `apply_to` appends it with
+    // `marked=False` (keyframe_cond.py:84-86) and the sole consumer adds
+    // `mask * embedding` (transformer_args.py:42-43, called at :269), so the
+    // embedding contributes exactly nothing to those tokens. Porting it would
+    // not serve this arm. The gate enforced the wrong thing, which is worse
+    // than not gating the message at all.
+    //
+    // What actually blocks it is the append: extended `positions`,
+    // `update_attention_mask`, extended `clean_latent` / `denoise_mask`, and
+    // `clear_conditioning` trimming back — none of which this engine's
+    // fixed-length phase loop can express.
+    CHECK(msg.find("update_attention_mask") != std::string::npos);
+    CHECK(msg.find("clear_conditioning") != std::string::npos);
     CHECK(msg.find("keyframe_cond.py") != std::string::npos);
     CHECK(msg.find("VAE_ENCODER_COMFY_KEYS_FILTER") == std::string::npos);
+    // The refuted reason may still be NAMED — it is worth telling a reader that
+    // it was ruled out — but never as the thing that is missing, and only next
+    // to the issue that tracks where the embedding really does bite (#658).
+    if (msg.find("keyframes_abs_pos_embedding") != std::string::npos) {
+      CHECK(msg.find("NOT* THE REASON") != std::string::npos);
+      CHECK(msg.find("#658") != std::string::npos);
+    }
   }
   SUBCASE("a reference video names the IC-LoRA metadata this project does not read") {
     const std::string msg = refusal("a reference video",
@@ -817,7 +849,21 @@ TEST_CASE("ltx2 video: an image at crf 0 conditions the render, and the ENCODER 
   CHECK(trace.completed);
   CHECK(trace.image_crf == 0);
   CHECK(trace.image_strength == 1.0);  // noise_aug defaults to 1.0 => the frame is PINNED
-  CHECK(trace.image_tokens > 0);
+  // WHICH PHASE this describes is the claim, and `image_tokens > 0` did not make
+  // it. MEASURED: changing the guard to `wants_image && phase_index == 0` — the
+  // shape of an obvious refactor that hoists the per-phase decode+encode out of
+  // the loop — left this whole binary at 32 cases / 550 assertions / exit 0
+  // while `refine`, the phase whose latent is actually rendered, ran with the
+  // pinned frame re-noised away. The design's own reason for living inside the
+  // loop (spec section 8.5) was gated by nothing.
+  //
+  // So the count is pinned to the LAST phase's per-latent-frame token count.
+  // This fixture's two-stage recipe runs `generate_lowres` at
+  // `spatial_downscale = 2` and `refine` at 1, so the latent grid doubles in
+  // each spatial dimension and the placed count is 1 then 4 — a per-phase value,
+  // which is exactly why `image_tokens == 4` falsifies a stage-1-only build.
+  constexpr int64_t kRefineImageTokens = 4;
+  CHECK(trace.image_tokens == kRefineImageTokens);
   CHECK(trace.image_digest != 0);
   // A conditioning that collapsed to zeros would give every image the same
   // digest and still satisfy every check below it, so the magnitude is asked for
@@ -825,6 +871,35 @@ TEST_CASE("ltx2 video: an image at crf 0 conditions the render, and the ENCODER 
   CHECK(trace.image_absmax > 0.0);
   // The render still produced its artifacts; conditioning is not a bypass.
   CHECK(result.frame_count == 9);
+
+  SUBCASE("the trace describes the LAST phase, and stage 1 is a different count") {
+    // The other half of the same claim, and the half a literal cannot make: the
+    // number above is not a constant of the fixture, it TRACKS the phase that
+    // ran last. Same request, capped at phase 0, must report stage 1's smaller
+    // count — and the ratio is checked between two MEASURED values rather than
+    // between two compile-time constants, which would assert nothing.
+    // `max_phase` is a LOAD-time extra, not a per-generation one, so the cap
+    // needs its own engine over the same fixture.
+    vllm::multimodal::VideoModelParams capped = ConditioningParams(ws.paths);
+    capped.extras[vllm::multimodal::kLtx2MaxPhaseExtra] = "0";
+    const std::unique_ptr<vllm::multimodal::VideoEngine> stage1_engine =
+        vllm::multimodal::LoadVideoEngine(capped);
+    auto* stage1_ltx2 =
+        dynamic_cast<vllm::multimodal::Ltx2VideoEngine*>(stage1_engine.get());
+    REQUIRE(stage1_ltx2 != nullptr);
+    vllm::multimodal::VideoGenParams lowres = FixtureGen(ws.root + "/img_stage1");
+    lowres.first_frame_ppm = ConditioningPpm(20, 28, 1);
+    lowres.extras[vllm::multimodal::kLtx2ImageCrfExtra] = "0";
+    (void)stage1_engine->Generate(lowres);
+    const vllm::multimodal::Ltx2ConditioningTrace stage1 = stage1_ltx2->last_conditioning();
+    CHECK(stage1.image_tokens == 1);
+    CHECK(trace.image_tokens == 4 * stage1.image_tokens);
+    // And it is a DIFFERENT encode, not the same one carried forward: the image
+    // is resized and encoded against each phase's own height and width
+    // (ltx-pipelines/utils/helpers.py:274-275, per-stage h/w at
+    // distilled.py:251, 255-256, 285-286).
+    CHECK(stage1.image_digest != trace.image_digest);
+  }
 
   SUBCASE("a DIFFERENT image is a different conditioning") {
     vllm::multimodal::VideoGenParams other = FixtureGen(ws.root + "/img2");
@@ -1132,10 +1207,12 @@ TEST_CASE("ltx2 video: the SHIPPED Lightricks checkpoints parse and load") {
     const vllm::SafetensorsFile file = vllm::SafetensorsFile::Open(path);
     vllm::Ltx2DitQuant quant = vllm::Ltx2DitQuant::kFp8;
     vllm::Ltx2DitParams from_shapes = vllm::Ltx2ParseDitParamsFromCheckpoint(file, &quant);
-    // The manifest parser leaves `use_prompt_adaln_single` at its default; the
-    // LOADER clears it for the contract (ltx2_loader.cpp), and so does the
-    // engine. Mirror that here so the two contracts are compared like for like.
-    from_shapes.use_prompt_adaln_single = false;
+    // MEASURED from this file's own header: it carries `prompt_adaln_single`, so
+    // the manifest parser resolves `use_prompt_adaln_single = TRUE` — and nothing
+    // clears it any more (.agents/specs/ltx25-prompt-adaln.md, issue #644). This
+    // line used to force it false on BOTH sides of the comparison below, which is
+    // what made a config/shape disagreement about it unobservable.
+    CHECK(from_shapes.use_prompt_adaln_single);
     CHECK(quant == vllm::Ltx2DitQuant::kNvfp4);
     CHECK(from_shapes.num_layers == 48);
     CHECK(from_shapes.inner_dim() == 4096);
@@ -1155,8 +1232,12 @@ TEST_CASE("ltx2 video: the SHIPPED Lightricks checkpoints parse and load") {
     config["transformer"]["use_keyframes_abs_pos_embedding"] = false;
     nlohmann::json wrapper;
     wrapper["config"] = config;
-    vllm::Ltx2DitParams declared = vllm::ParseLtx2DitParams(wrapper);
-    declared.use_prompt_adaln_single = false;
+    const vllm::Ltx2DitParams declared = vllm::ParseLtx2DitParams(wrapper);
+    // The shipped config OMITS `use_prompt_adaln_single`, so it resolves to
+    // upstream's TRUE default (model_configurator.py:76) — which is what the
+    // file's own tensors say. Asserted rather than forced: the two sides of the
+    // contract comparison below must AGREE about it, not be made to.
+    CHECK(declared.use_prompt_adaln_single);
     CHECK(declared.double_precision_rope);              // frequencies_precision float64
     CHECK(declared.av_ca_timestep_scale_multiplier == 1000);
     CHECK(declared.apply_gated_attention);

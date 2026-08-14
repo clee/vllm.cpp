@@ -13,6 +13,7 @@
 #include <cmath>
 #include <cstring>
 #include <limits>
+#include <numbers>
 #include <string>
 #include <vector>
 
@@ -69,7 +70,7 @@ float Silu(float x) { return x / (1.0f + std::exp(-x)); }
 // torch.nn.functional.gelu(..., approximate="tanh"), the activation
 // `activation_fn="gelu-approximate"` selects (gelu_approx.py:10).
 float GeluTanh(float x) {
-  const float kBeta = static_cast<float>(std::sqrt(2.0 / M_PI));
+  const float kBeta = static_cast<float>(std::sqrt(2.0 / std::numbers::pi_v<double>));
   const float kKappa = 0.044715f;
   const float inner = kBeta * (x + kKappa * x * x * x);
   return 0.5f * x * (1.0f + std::tanh(inner));
@@ -268,17 +269,21 @@ std::vector<Ltx2TensorSpec> EnumerateLtx2DitTensors(const Ltx2DitParams& p) {
   out.push_back({"scale_shift_table", {2, dim}});
   out.push_back({"audio_scale_shift_table", {2, adim}});
 
+  // model.py:222-226 / :252-256 — built only when BOTH flags hold, and always
+  // with embedding_coefficient 2 (shift + scale for the prompt K/V), never
+  // `adaln_embedding_coefficient()`.
+  const bool prompt_adaln = p.cross_attention_adaln && p.use_prompt_adaln_single;
+
   // _init_video (model.py:202-232), in child-registration order.
   PushLinear(out, "patchify_proj", dim, p.in_channels, true);
   PushAdaLayerNormSingle(out, "adaln_single", dim, coefficient);
-  VT_CHECK(!p.use_prompt_adaln_single,
-           "ltx2: use_prompt_adaln_single=true adds a prompt AdaLN MLP (model.py:223-227) whose "
-           "timestep term makes the cross-attention K/V uncacheable; not ported in phase L2");
+  if (prompt_adaln) PushAdaLayerNormSingle(out, "prompt_adaln_single", dim, 2);
   PushLinear(out, "proj_out", p.out_channels, dim, true);
 
   // _init_audio (model.py:234-262).
   PushLinear(out, "audio_patchify_proj", adim, p.audio_in_channels, true);
   PushAdaLayerNormSingle(out, "audio_adaln_single", adim, coefficient);
+  if (prompt_adaln) PushAdaLayerNormSingle(out, "audio_prompt_adaln_single", adim, 2);
   PushLinear(out, "audio_proj_out", p.audio_out_channels, adim, true);
 
   // _init_audio_video (model.py:264-287); num_scale_shift_values is 4 (:133).
@@ -482,9 +487,15 @@ Ltx2DitWeights BindLtx2DitWeights(const Ltx2DitParams& p,
   w.audio_scale_shift_table = Lookup(t, "audio_scale_shift_table");
   w.patchify_proj = BindLinear(t, "patchify_proj", true);
   w.adaln_single = BindAdaln(t, "adaln_single");
+  // model.py:222-226 / :252-256 — bound only when the module exists, exactly as
+  // the optional block tables above are. Left default-constructed otherwise, and
+  // the forward reads it only when `use_prompt_adaln_single` says it is there.
+  const bool prompt_adaln = p.cross_attention_adaln && p.use_prompt_adaln_single;
+  if (prompt_adaln) w.prompt_adaln_single = BindAdaln(t, "prompt_adaln_single");
   w.proj_out = BindLinear(t, "proj_out", true);
   w.audio_patchify_proj = BindLinear(t, "audio_patchify_proj", true);
   w.audio_adaln_single = BindAdaln(t, "audio_adaln_single");
+  if (prompt_adaln) w.audio_prompt_adaln_single = BindAdaln(t, "audio_prompt_adaln_single");
   w.audio_proj_out = BindLinear(t, "audio_proj_out", true);
   w.av_ca_video_scale_shift = BindAdaln(t, "av_ca_video_scale_shift_adaln_single");
   w.av_ca_audio_scale_shift = BindAdaln(t, "av_ca_audio_scale_shift_adaln_single");
@@ -544,7 +555,8 @@ std::vector<float> FreqGridPytorch(double theta, int64_t n_pos_dims, int64_t dim
     const float t = i < halfway ? step * static_cast<float>(i)
                                 : 1.0f - step * static_cast<float>(n - 1 - i);
     out[static_cast<size_t>(i)] =
-        std::pow(static_cast<float>(theta), t) * static_cast<float>(M_PI / 2.0);
+        std::pow(static_cast<float>(theta), t) *
+        static_cast<float>(std::numbers::pi_v<double> / 2.0);
   }
   return out;
 }
@@ -559,7 +571,8 @@ std::vector<float> FreqGridNumpy(double theta, int64_t n_pos_dims, int64_t dim) 
   for (int64_t i = 0; i < n; ++i) {
     // numpy's linspace is arange(n) * step, with the final sample forced to `stop`.
     const double t = (i == n - 1) ? 1.0 : step * static_cast<double>(i);
-    out[static_cast<size_t>(i)] = static_cast<float>(std::pow(theta, t) * (M_PI / 2.0));
+    out[static_cast<size_t>(i)] =
+        static_cast<float>(std::pow(theta, t) * (std::numbers::pi_v<double> / 2.0));
   }
   return out;
 }
