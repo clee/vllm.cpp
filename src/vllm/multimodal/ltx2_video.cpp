@@ -580,7 +580,7 @@ std::unique_ptr<Ltx2VideoEngine> Ltx2VideoEngine::Load(const VideoModelParams& p
     // both true on a PARTIAL backend — Metal registers 15 of 75 ops, Tenstorrent
     // a comparable slice — and both name exactly two text architectures in their
     // `supports_model_architecture` allow-lists (src/vllm/platforms/metal.cpp:70,
-    // src/vllm/platforms/tenstorrent.cpp:52). Before the seam landed, such a
+    // src/vllm/platforms/tenstorrent.cpp:55). Before the seam landed, such a
     // build asked `TryGetBackend(kCUDA)`, got nullptr, and REFUSED BY NAME; after
     // it, it is handed a queue and dies later inside a kernel bind with a shape
     // error that says nothing about what is missing. CUDA and CPU are unaffected:

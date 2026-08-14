@@ -33,7 +33,7 @@ precedent it cites, `SelectQueueForModel`, asks a third question —
 
 `supports_model_architecture` exists precisely so a **partial** backend can
 decline by name. Two platforms override it and both declare a short list:
-`src/vllm/platforms/metal.cpp:70` and `src/vllm/platforms/tenstorrent.cpp:52`.
+`src/vllm/platforms/metal.cpp:70` and `src/vllm/platforms/tenstorrent.cpp:55`.
 On such a build a `device = 1` LTX-2.5 load **was refused by name** and is now
 accepted, so the failure moves from a refusal that says which piece is missing
 into a kernel bind that says nothing. CUDA is unaffected, which is exactly why
@@ -51,7 +51,9 @@ spells its way past it.** `scripts/check-device-leakage.py:78` is
 RE_KCUDA = re.compile(r"\bkCUDA\b")
 ```
 
-`src/vllm/multimodal/minimax_h3_video.cpp:221-226` never writes that token:
+`src/vllm/multimodal/minimax_h3_video.cpp:221-226 @ 11cc1d589` — anchored on the
+base SHA, because this row is what removes it and an unanchored line number here
+would point at a blank line the moment it lands — never writes that token:
 
 ```cpp
 vt::DeviceType MiniMaxH3VideoDeviceType(int32_t device) {
@@ -302,14 +304,84 @@ are the seam's own.
 **Residual, not this row's to fix:** `vulkan.cpp` does not override
 `supports_model_architecture`, so it inherits `interface.h:263`'s default `true`
 and a partial Vulkan build still binds and dies inside a kernel. Only
-`metal.cpp:70` and `tenstorrent.cpp:52` narrow the claim.
+`metal.cpp:70` and `tenstorrent.cpp:55` narrow the claim.
+
+## Findings from review round 2 (PR #671, head `074ef1420`)
+
+**F5 — the row's own thesis came back for its instrument a THIRD time, and this
+one was in the checker's MESSAGE.** M33 had made the pointer target real, and the
+docstring then said the bucket is "anchored on the TARGET TYPE, not on the
+operand and not on one cast keyword", and listed `std::bit_cast` as unreachable
+"because no spelling of the target type appears at the conversion site". Nine
+spellings that DO write the target type at the conversion site scored **zero**.
+AGENTS.md makes a checker's own message the authority on what it enforces, so an
+over-claiming message is a defect in the gate, not a wording nit — and it is #660
+exactly, one sigil later.
+
+Each spelling was **compile-verified legal** (`g++ -std=c++20 -Wall -Wextra`,
+exit 0) before being called a miss, because a "miss" that does not compile is
+not a miss; and each measured **0 before / 1 after**, individually:
+
+| spelling | why it slipped |
+|---|---|
+| `reinterpret_cast<vt::DeviceType&>(raw)` | reference target; the standard *defines* it as M33's pointer pun, and `\*?` admits a star but not an ampersand |
+| `static_cast<vt::DeviceType const>(d)` | east const |
+| `static_cast<vt::DeviceType const&>(t)` | east const + reference — the form that compiles with **no** warning, so it survives a `-Werror` build where the plain east-const prvalue trips `-Wignored-qualifiers` |
+| `(vt::DeviceType const)d` | east const, C-style |
+| `(vt::DeviceType)*cursor` | the trailing class admitted a sign but not a dereference — **and this is the wire-decode spelling the docstring itself names as the expected `DSR-ALLOW` case**, so the one site the bucket predicted meeting was the one it could not see |
+| `(vt::DeviceType)~mask`, `(vt::DeviceType)!flag` | the same hole |
+| `reinterpret_cast<vt::DeviceType**>(p)` | `\*?` is one star |
+| `std::bit_cast<vt::DeviceType>(raw)` | the docstring's own reason was false for it: it spells the target in full |
+
+Three edits close them: the named-cast target takes cv-qualifiers on **either**
+side of the name and a **run** of `*`/`&`; the C-style trailing class admits
+`*~!`; `bit_cast` joins the cast keywords.
+
+**What was NOT closed, and why the docstring now says so per-entry.** `&` is
+deliberately absent from the C-style trailing class: `) &` and `) &&` are
+ref-qualifiers on a member declarator, which is precisely the false positive the
+trailing guard exists to reject, and the guard cannot tell
+`void note (vt::DeviceType*) &` from a pun. So the **C-style** pointer pun
+`*(vt::DeviceType*)&x` stays blind, and is named as blind with the reason that is
+true *of it* — the named-cast spelling of the same pun is caught, which is what
+makes it a narrow gap rather than the class. The old blind-spot list shared one
+reason across three entries and that reason was false for one of them; each entry
+now carries its own.
+
+**Measured, not asserted.** Over **740** files in `src/vllm` + `include/vllm`,
+with `\bDeviceType\b` = **162** matches as a positive control **in the same
+command**: **0 new, 0 lost**. Shipped hits 1, widened hits 1 — the same
+allowlisted `platform.cpp:85` registry-walk inverse. `dev_cast` stays 0, `total`
+stays 32, `scripts/device-leakage-baseline.json` is untouched by this round.
+
+**M35-M40**, one mutant per newly-closed spelling, each sub-spelling asserted
+**individually** (the M29 shape), because a mutant that only exercises the case
+the pattern was tuned for is a guard that certifies itself. RED-before is real
+rather than narrated: with the pattern reverted in-process to its pre-repair
+value, M35-M39 all go RED while M20, M33 and M40 stay GREEN — so a blanket
+failure cannot pass for five findings. M40 is the negative the widening could
+have cost: pointer- and reference-returning declarations, ref- and
+rvalue-ref-qualified members **with a space before the paren**, volatile
+members, and `std::vector<vt::DeviceType*>`.
+
+**Anchor drift, re-derived at the merge.** `9f2b9bb9a` moved
+`tenstorrent.cpp`'s `supports_model_architecture` from `:52` to `:55`; the four
+citations on this branch (`ltx2_video.cpp`, `test_diffusion_device_seam.cpp`, and
+§0 and the residual note above) are corrected. `metal.cpp:70`,
+`interface.h:263` and `model_loader.cpp:97` were re-derived on the merged tree
+and all three still hold. Every `path:NN` anchor in this row's files was
+resolved mechanically; the only remaining unresolvable ones are upstream Python
+paths and two `examples/*/main.cpp` citations that carry their own `@ fc636c76`
+and so are provenance rather than drift. The `minimax_h3_video.cpp:221-226`
+citation in §0 is now anchored on the base SHA for the same reason.
 
 ## Now
 
-`READY`, implemented and awaiting review on `row/LTX25-DEVICE-SEAM-SIBLING`
-(PR #671). All three changes are on the branch with their RED, GREEN and
-mutation evidence in the PR body; next is a fresh reviewer — not the implementer
-— on the immutable head, then the operator's own gate rerun.
+`READY`, implemented and awaiting a fresh review on
+`row/LTX25-DEVICE-SEAM-SIBLING` (PR #671). All three changes plus the F5 repair
+are on the branch with their RED, GREEN and mutation evidence in the PR body;
+next is a fresh reviewer — not the implementer — on the immutable head, then the
+operator's own gate rerun.
 
 The row stays `READY` in `roadmap_v1.md` deliberately. A lifecycle move to
 `ACTIVE` owes `docs/STATUS.md` and `docs/BENCHMARKS.md` in the same change
