@@ -242,10 +242,22 @@ TEST_CASE("G1: CPU QuantFp8Static is BYTE-identical to an independent e4m3 refer
   // here rather than surface as a confusing throw inside the helper.
   REQUIRE(vt::OpRegistered(vt::OpId::kQuantFp8Static, DeviceType::kCPU));
 
-  // Several scales, including 1.0 (where the tie inputs above land EXACTLY on
-  // e4m3 midpoints, so RNE is what decides every one of them) and a
-  // non-power-of-two production-shaped scale.
-  for (float s : {1.0f, 0.5f, 0.035f, 0.0092f, 7.25f}) {
+  // THE SCALE SET IS PART OF THE GATE, not decoration. 1.0 and 0.5 make the tie
+  // inputs above land EXACTLY on e4m3 midpoints, so RNE alone decides every one
+  // of them. 0.035 / 0.0092 are production-shaped per-tensor scales.
+  //
+  // 0.13 and 0.77 are here for ONE measured reason: they are what makes the
+  // `x/s` vs `x*(1/s)` defect visible. Both forms agree on almost every input —
+  // over 20000 random values in [-2,2] they NEVER disagree at any scale tried —
+  // so a gate can only see the difference where an input lands on an e4m3 tie
+  // after scaling, which is exactly what the tie population above constructs.
+  // Even then it is scale-dependent: measured over the structured population,
+  // 10 of 18 candidate scales expose it at all, and of {1.0, 0.5, 0.035, 0.0092,
+  // 7.25} only 0.0092 does, at 24 of 209 words. 0.13 (78/209) and 0.77 (82/209)
+  // are the strongest detectors found, so the mutation dies by a wide margin
+  // rather than by luck. DO NOT prune this list: removing the last detecting
+  // scale would silently disarm the assertion that keeps the reciprocal form.
+  for (float s : {1.0f, 0.5f, 0.035f, 0.0092f, 7.25f, 0.13f, 0.77f}) {
     CAPTURE(s);
     const auto x = G1Inputs(s, 1234u);
     CHECK(RunG1(x, s, DType::kF32) == 0u);
