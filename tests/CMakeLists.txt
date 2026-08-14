@@ -115,15 +115,23 @@ vllm_cpp_add_test(test_indextts2_family vllm/models/test_indextts2_family.cpp)
 vllm_cpp_add_test(test_campplus vllm/models/test_campplus.cpp)
 vllm_cpp_add_test(test_w2vbert vllm/models/test_w2vbert.cpp)
 vllm_cpp_add_test(test_fvq vllm/models/test_fvq.cpp)
+vllm_cpp_add_test(test_wavenet vllm/models/test_wavenet.cpp)
+vllm_cpp_add_test(test_dit_tail vllm/models/test_dit_tail.cpp)
 vllm_cpp_add_test(test_vocos vllm/models/test_vocos.cpp)
 vllm_cpp_add_test(test_lenreg vllm/models/test_lenreg.cpp)
 vllm_cpp_add_test(test_cfm vllm/models/test_cfm.cpp)
 vllm_cpp_add_test(test_adaln vllm/models/test_adaln.cpp)
+vllm_cpp_add_test(test_dit vllm/models/test_dit.cpp)
+vllm_cpp_add_test(test_talker vllm/models/test_talker.cpp)
+vllm_cpp_add_test(test_indextts2_pipeline vllm/models/test_indextts2_pipeline.cpp)
+target_include_directories(test_dit PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
 target_include_directories(test_adaln PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
 target_include_directories(test_cfm PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
 target_include_directories(test_lenreg PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
 target_include_directories(test_vocos PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
 target_include_directories(test_fvq PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
+target_include_directories(test_wavenet PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
+target_include_directories(test_dit_tail PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
 target_include_directories(test_w2vbert PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
 target_include_directories(test_campplus PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
 vllm_cpp_add_test(test_gpt2 vllm/models/test_gpt2.cpp)
@@ -261,6 +269,12 @@ foreach(_gateup_lever VT_DENSE_MARLIN_GATEUP VT_NVFP4_MARLIN VT_MOE_FUSED_W13)
     PROPERTIES ENVIRONMENT "${_gateup_lever}=0")
 endforeach()
 vllm_cpp_add_test(test_qwen35_plain_weights vllm/models/test_qwen35_plain_weights.cpp)
+vllm_cpp_add_test(test_qwen3_8_text_only vllm/models/test_qwen3_8_text_only.cpp)
+# The PUBLISHED `Qwen/Qwen3.8-2.4T-A95B` config.json, committed VERBATIM, so the
+# config-resolution case reads the real document (nested `rope_parameters`, 92
+# `layer_types`, transformers-4.57.3 `dtype`) instead of a paraphrase of it.
+target_compile_definitions(test_qwen3_8_text_only PRIVATE
+  QWEN3_8_CONFIG_FIXTURE="${CMAKE_CURRENT_SOURCE_DIR}/vllm/models/fixtures/qwen3_8_2_4t_a95b/config.json")
 # POOL-DEVICE-KEY (#516, .agents/specs/pool-device-key.md): the shared scratch
 # pool's free list must be keyed by DEVICE as well as size class, or a block
 # allocated through one backend is handed to a DBuf running on another —

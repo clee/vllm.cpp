@@ -140,6 +140,7 @@ token-for-token correctness against the pinned oracle.
 | InternLM2 dense (fused-`wqkv` interleaved split) | Correctness-complete, speed-pending | Token-exact 16/16 (internlm2-chat-1_8b): 12/16 strict + 4/16 bf16 near-tie (max gap 0.0 nats), 0 divergent; first InternLM model; ZERO new compute kernel (reuses the Llama dense forward; the only delta is a loader-side de-interleave of the fused `wqkv`, which packs q/k/v interleaved by KV-group) |
 | MiniMax-H3 (`MiniMaxH3DiTModel`, video+audio DIFFUSION) | **ABI v12 ONE SURFACE; device selector uses generic `DeviceType`; DSR 32.** t2va+fl2va COHERENT; bf16 shards STREAM | ref2va ckpt fidelity §8.12; encoder A/B §8.15; GB10 re-verify residual; CPU fold 6/137 (one queue + device provenance mutation-gated) |
 | LTX-2.5 (`LTX2VideoTransformer3DModel`, video+audio DIFFUSION) | **L1-L9c landed (#435).** 21.00B / 48 blocks. `VideoEngine` seam + ABI **v18**, DiT forward (CPU f32 parity, bf16 device-resident), Gemma-4 TE, both VAEs, the embeddings connector, pipeline, NVFP4/FP8 arms, `/v1/videos` | A shipped 21.00B FP8 DiT runs device-resident on GB10. The 320x192/25f frames ARE a scene, register-conditioned. L13 encodes a typed prompt, FIXTURE-gated; a prompted render is OWED. Speed and oracle parity `PENDING` |
+| MiniMax-Music3 (`MiniMaxMusic3ForConditionalGeneration`, text-to-MUSIC) | **`ACTIVE`: W0 + W1 landed (#672).** First row whose oracle is not vLLM: the OPEN diffusers PR #14456 `c6da9936`, which generates audio here | W2-W7 owed. Loader gated 1413/1413 on the real checkpoint; no speed number exists or is claimed |
 | Command-R / Cohere dense (`CohereForCausalLM`) | Implemented, gate-blocked | ZERO-new-kernel port grounded in vLLM `commandr.py`: weight-only Cohere LayerNorm + GPT-J full-width RoPE + PARALLEL residual + `logit_scale` + tied embeddings, all reuse; compiles, links, self-registers. No SACRED gate yet (real checkpoints HF-gated, ungated ones tiny-random, GPU box disk-full); oracle run-verified at W0. See docs/BENCHMARKS.md |
 | Phi-1 / Phi-2 dense (`PhiForCausalLM`, parallel residual) | Correctness-complete, speed-pending | Token-exact 16/16 (microsoft/phi-2): 9/16 strict + 7/16 bf16 near-ties (max gap 0.25 nats), 0 forward-divergent; the OLDER Microsoft Phi arch, DISTINCT from Phi-3/Phi-4; ZERO new compute kernel (GPT-J parallel residual, LayerNorm-with-bias, biased qkv/dense, partial NeoX rope 32/80, non-gated NewGELU MLP reusing `vt::GeluTanh`, untied biased lm_head); F16 dtype-aware loader |
 | MiniCPM dense (`MiniCPMForCausalLM`, three scalars) | Correctness-complete, speed-pending | Token-exact 16/16 (openbmb/MiniCPM-2B-sft-bf16): 10/16 strict + 6/16 bf16 near-ties (max gap 0.0 nats), 0 forward-divergent; first OpenBMB MiniCPM model; ZERO new compute kernel (the Llama/Granite dense forward plus three scalars: scale_emb, scale_depth/sqrt(layers) residual, dim_model_base logit scaling), tied lm_head; `.bin`-only weights converted to safetensors via trusted torch |
@@ -697,6 +698,52 @@ the Olmo-3 interleaved sliding-window path has since landed and runs, but is
 oracle-blocked for a gate (see the capability table above).
 
 ### Frontier and hardware-blocked families
+
+**Qwen3.5 text-only arms (`Qwen3_5ForCausalLM`, `Qwen3_5MoeForCausalLM`) —
+REGISTERED 2026-08-12, RUN GATE OWED (#490).** An ahead-of-pin forward port of
+upstream PR vllm#50210 (`ad5d29db7`), which registers both arms against the same
+`qwen3_5` module our gated `ForConditionalGeneration` wrappers already use. Two
+additive `REGISTER_VLLM_MODEL` lines against the EXISTING dense and MoE
+factories: no forward, no KV-cache spec, no loader fork.
+
+The other half is ONE backbone weight-namespace decision per checkpoint:
+`model.` for a text-only arm, `model.language_model.` for the wrappers, and a
+MIXED index refused rather than half-bound. `Qwen/Qwen3.8-2.4T-A95B` declares
+`Qwen3_5MoeForCausalLM` / `qwen3_5_moe_text` and is the token-exact
+Qwen3.6-35B-A3B GDN-hybrid MoE backbone at larger scale, every knob
+config-driven, with the BACKBONE weight names identical modulo that prefix.
+
+**CORRECTED 2026-08-12: the prefix is NOT the only thing between this code and
+`Qwen/Qwen3.8-2.4T-A95B`, and the first two commits of this row said it was.**
+The MoE loader reads only PER-EXPERT NVFP4 routed experts (`LoadMoeExpertsInto`
+-> `LoadNvfp4Raw`: `U8` weight + `F8_E4M3` `.weight_scale` + `.weight_scale_2`),
+with no stacked and no bf16 branch. The published indices (read live 2026-08-12)
+have neither: `Qwen/Qwen3.8-2.4T-A95B` carries 93x `mlp.experts.gate_up_proj` +
+93x `.down_proj` (3-D STACKED) and **zero** `weight_scale` / `input_scale`
+tensors, and `Qwen/Qwen3.6-35B-A3B` is the same under the VL prefix — our gated
+35B row reads the REQUANTIZED `nvidia/Qwen3.6-35B-A3B-NVFP4`.
+
+So the **bf16 / 3-D-stacked MoE routed-expert arm is NOT implemented and is
+OWED**, and a published MoE checkpoint is now REFUSED by a message naming it
+rather than dying on `expected U8 for lm_head.weight`. The DENSE arm is not
+affected: `LoadQwen3_5Dense` routes BF16 vs FP8 vs NVFP4 per projection by
+tensor presence, so it may genuinely load a flat bf16 checkpoint. That asymmetry
+is the record.
+
+What is claimed is dispatch, flat-config resolution, namespace resolution and
+the refusal, gated by `tests/vllm/models/test_qwen3_8_text_only.cpp`, with
+27B/35B/Coder inert and parity goldens md5-unchanged. **What is NOT claimed is a
+single generated token.** 2.4T bf16 is ~4.8 TB and the released FP8 variant
+~2.4 TB against 128 GB of unified memory, and no smaller Qwen3.8 sibling exists,
+so there is no token-exact oracle run and no speed number.
+
+Both rows therefore stay `PARTIAL`. The owed **DENSE** run gate closes when a
+`Qwen3_5ForCausalLM` checkpoint that fits GB10 appears. The **MoE** run gate
+needs more: a fitting *published* (bf16/stacked) MoE checkpoint would still be
+refused at load, so it needs a fitting checkpoint whose routed experts are
+per-expert NVFP4, or the owed stacked/bf16 arm implemented first. Also NOT
+implemented and recorded as owed: that stacked/bf16 MoE expert arm, and the MTP
+and GGUF arms for 3.8. This does not advance the parity pin.
 
 Larger DeepSeek / GLM / MiniMax / Gemma-4 variants are recorded as
 **hardware-blocked** (they do not fit 119 GiB of unified memory on this box) or

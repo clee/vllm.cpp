@@ -198,6 +198,26 @@ build/examples/vllm-cli \
 | `--repeat N` | `1` | Load once, then run N blocking completions. Use it to read a warm decode tok/s without paying model load each time. Not supported with `--stream`, which falls back to 1 |
 | `-h`, `--help` | | Print usage and exit |
 
+`--model` resolves a Qwen3.5-family checkpoint's backbone under EITHER weight
+namespace. The multimodal wrappers (`Qwen3_5ForConditionalGeneration`,
+`Qwen3_5MoeForConditionalGeneration`) publish the text backbone nested under
+`model.language_model.`; the text-only arms (`Qwen3_5ForCausalLM`,
+`Qwen3_5MoeForCausalLM`) publish it flat under `model.`. The loader decides which
+ONCE per checkpoint from the shard index, and REFUSES a checkpoint that carries
+backbone tensors under both rather than binding half the model from each.
+
+**Resolving the namespace is not the same as loading the checkpoint, and the
+MoE and dense arms differ.** The dense loader routes each projection to BF16,
+FP8 or NVFP4 by tensor presence, so a flat bf16 `Qwen3_5ForCausalLM` checkpoint
+is expected to load. The **MoE** loader reads only PER-EXPERT NVFP4 routed
+experts, while the published MoE repos (`Qwen/Qwen3.8-2.4T-A95B`,
+`Qwen/Qwen3.6-35B-A3B`) ship 3-D stacked, unquantized experts — that arm is
+**not implemented**, and such a checkpoint is refused at load with a message
+naming what is missing. Use an NVFP4 requant (e.g.
+`nvidia/Qwen3.6-35B-A3B-NVFP4`) for the MoE path. No text-only Qwen3.5
+checkpoint has been RUN here at all — see [STATUS.md](STATUS.md) for the owed
+run gates.
+
 GGUF and safetensors mapped-payload paths, plus safetensors index paths, use the
 host's native filesystem encoding, including Unicode paths on Windows. Native
 Windows release artifacts are not published yet; they will remain unavailable
@@ -1043,6 +1063,14 @@ Registered in
 | POST | `/v1/videos/sync` | Same, but runs to completion before answering |
 | GET | `/v1/videos/{id}` | Job status |
 | GET | `/v1/videos/{id}/content` | The finished MP4 (`video/mp4`) |
+
+There is **no `/v1/audio/speech`**. Text to speech is not servable: the
+IndexTTS-2.5 stages are ported and gated at reduced dimensions, with further
+stages named as missing by the checkpoint's own manifest, and no route is
+registered, the public ABI carries no synthesis entry point, and loading the
+family refuses with a message naming the missing pieces (#634). Asking a running server for speech
+today is a 404 at the route table, not a runtime error, and that is the accurate
+signal: the capability does not reach any surface yet.
 
 `prompt_logprobs` is accepted on `/v1/completions` and `/v1/chat/completions`
 and the engine computes it — every prompt position is scored against the token
@@ -2287,6 +2315,38 @@ only, so it does not stream the weights:
 python3 scripts/gen-minimax-music3-manifest.py \
   --checkpoint /path/to/minimax-music3 \
   --output tests/vllm/models/minimax_music3_manifest.inc
+```
+
+### IndexTTS-2.5 goldens and checkpoint manifests
+
+The speech lane is not servable yet (see `/v1/audio/speech` above); these
+regenerate its gates. `read-torch-manifest.py` reads a torch `.pth`'s tensor
+names and shapes from its pickle header over HTTP range requests, so it inspects
+a multi-GB checkpoint without downloading the weights:
+
+```sh
+python3 scripts/read-torch-manifest.py \
+  https://huggingface.co/IndexTeam/IndexTTS-2.5/resolve/main/s2mel.pth
+```
+
+The stage goldens need the upstream source checked out, and emit `.inc` files
+that carry no weight bytes: both sides rebuild parameters from one shared
+pseudo-random stream.
+
+```sh
+WAVENET_SRC=/path/to/index-tts/indextts/s2mel/modules \
+  python3 scripts/gen-wavenet-goldens.py --out tests/vllm/models/wavenet_goldens.inc
+
+DIT_SRC=/path/to/index-tts/indextts/s2mel/modules \
+  python3 scripts/gen-dit-tail-goldens.py --out tests/vllm/models/dit_tail_goldens.inc
+```
+
+The U-Net skip routing is recorded rather than generated into an `.inc`: this
+prints the schedule upstream's own Transformer actually performs, at several
+depths, and the expected values are quoted in `tests/vllm/models/test_dit_skip.cpp`.
+
+```sh
+python3 scripts/gen-dit-skip-schedule.py /path/to/index-tts/indextts/s2mel/modules
 ```
 
 ## MiniMax-Music3: the autoregressive half
