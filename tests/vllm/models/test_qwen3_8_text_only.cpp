@@ -186,7 +186,14 @@ size_t ElemSize(const std::string& dtype) {
 // ONLY on its position in `specs`, so two files built from the same specs with
 // different NAMES carry byte-identical payloads — which is what lets the
 // namespace test compare two loads for byte equality.
-std::string BuildSafetensors(const std::vector<Spec>& specs) {
+// `header_pad` appends that many SPACES after the header's closing brace.
+// Trailing whitespace is legal JSON and padding the header is exactly how real
+// writers move their payload, so this shifts every tensor's byte offset by
+// `header_pad` without changing one byte of content -- which is what lets the
+// odd-offset case below put a stacked expert tensor on an ODD address
+// (issues #627, #772; mirrors tests/vllm/models/test_loader_unaligned_offsets.cpp).
+std::string BuildSafetensors(const std::vector<Spec>& specs,
+                             size_t header_pad = 0) {
   std::string header = "{";
   std::string body;
   uint64_t offset = 0;
@@ -230,6 +237,7 @@ std::string BuildSafetensors(const std::vector<Spec>& specs) {
     }
   }
   header += "}";
+  header.append(header_pad, ' ');
   return U64Le(header.size()) + header + body;
 }
 
@@ -1413,6 +1421,68 @@ TEST_CASE("qwen3_8: 3-D stacked bf16 routed experts load, with upstream's gate/u
     // differently here, which is the failure this drives.
     run("model.", /*transposed=*/false, /*deferred=*/true);
     run("model.language_model.", /*transposed=*/false, /*deferred=*/true);
+  }
+
+  SUBCASE("the stacked payload begins on an ODD byte (#627, #772)") {
+    // WHY THIS IS NOT COVERED BY THE CASES ABOVE. Safetensors aligns nothing: a
+    // tensor starts at `8 + <header length> + <preceding sizes>`, and none of
+    // those is required to be even, so a BF16 tensor on an ODD address is an
+    // ordinary file. The stacked reader is the one that most obviously invites
+    // the mistake — it forms a per-expert base by pointer arithmetic and then
+    // reads 2-byte elements out of it — and `qwen3_5_weights.cpp` is itself the
+    // subject of #627, one of the FOUR recurrences
+    // tests/vllm/models/test_loader_unaligned_offsets.cpp enumerates. The other
+    // subcases here take whatever offset the writer happened to produce, which
+    // is an even one, so none of them can fail if a `uint16_t*` is formed.
+    //
+    // The offset is FORCED and then ASSERTED, never inferred: the header is
+    // padded with spaces (legal JSON, and how real writers move a payload) until
+    // the mapped address of `experts.gate_up_proj` is odd, and a fixture edit
+    // that made it even fails the REQUIRE instead of passing while covering
+    // nothing.
+    for (const bool transposed : {false, true}) {
+      CAPTURE(transposed);
+      const std::string p = "model.";
+      const std::vector<Spec> specs = StackedBf16MoeSpecs(p, transposed);
+      const std::string gu_name = p + "layers.0.mlp.experts.gate_up_proj";
+
+      size_t pad = 0;
+      for (; pad < 2; ++pad) {
+        const TempFile probe(BuildSafetensors(specs, pad), "stacked_odd_probe");
+        const vllm::SafetensorsFile shard =
+            vllm::SafetensorsFile::Open(probe.path());
+        const auto addr = reinterpret_cast<uintptr_t>(shard.Get(gu_name).data);
+        if ((addr & 1u) != 0u) break;
+      }
+      REQUIRE(pad < 2);  // one of the two parities must land odd
+
+      const TempFile file(BuildSafetensors(specs, pad), "stacked_odd");
+      std::vector<vllm::SafetensorsFile> shards;
+      shards.push_back(vllm::SafetensorsFile::Open(file.path()));
+      // The precondition, asserted on the very file the load below reads.
+      const auto gu_addr =
+          reinterpret_cast<uintptr_t>(shards[0].Get(gu_name).data);
+      REQUIRE((gu_addr & 1u) == 1u);
+
+      const vllm::Qwen3_5MoeWeights w =
+          vllm::LoadQwen3_5Moe(shards, OneLayerMoeConfig());
+      REQUIRE(w.layers.size() == 1u);
+      // VALUES, not merely "it returned".
+      //
+      // BE PRECISE ABOUT WHAT THIS CATCHES ON WHICH TARGET. x86_64 permits
+      // unaligned loads, so replacing `vt::LoadUnaligned` with a
+      // `reinterpret_cast<const uint16_t*>` here would still produce the right
+      // BYTES and this case would stay green on this box. What it buys is the
+      // other two halves of the guarantee: it is the only case that EXERCISES
+      // the stacked path from an odd base at all, which is what lets the
+      // sanitizer lane's `-fsanitize=alignment` fire on such a cast (all three
+      // recurrences before #772 were found exactly that way) and what makes the
+      // strict-alignment builds -- `build-test-cpu-arm64`, Jetson/Orin sm_110 --
+      // fault instead of quietly passing; and it catches any reader that
+      // "fixes" alignment by rounding the base pointer down, which no
+      // even-offset fixture can see. Mutation-proven in that last form.
+      CheckStackedExperts(w.layers[0].moe, specs, p, transposed);
+    }
   }
 
   SUBCASE("transposed [E,H,2I] / [E,I,H] — upstream's other orientation") {
