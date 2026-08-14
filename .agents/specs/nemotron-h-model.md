@@ -1802,10 +1802,18 @@ signal ([[doctest-assertions-line-hides-thrown-cases]]).
 Local x86_64 CPU-only host (GNU 13.3, Ninja, `VLLM_CPP_CUDA=OFF`), disk recorded
 beside every number ([[enospc-makes-checkers-emit-false-policy-refusals]]).
 
+FINAL, at the merged head `e3f2992af` over `origin/main` @ `c01e4be93`:
+
 | Arm | Result | disk free |
 |---|---|---|
-| Release `-Werror`, **clean full build from an empty tree**, at the merged head | **`BUILD_EXIT=0`, 0 `warning:` lines, 0 `error:` lines, 0 `No space left` lines** | 44G / 90% |
-| full `ctest -j4`, 469 tests | **468 passed, 1 failed** in 798 s. The one failure is `test_nemotron_h_scaffold` = the merge-induced #818 above, repaired after this run. Skipped: `test_modelopt_mixed_precision_checkpoint`, `test_voxtral_e2e`. **`test_op_parity` PASSED** — the `main`-inherited red (#755/#672) is gone at this merge base | 23G / 95% |
+| Release `-Werror`, **clean full build from an empty tree** | **`BUILD_EXIT=0`, 0 `warning:` lines, 0 `error:` lines, 0 `No space left` lines**, 1393/1393 targets | 103G / 77% |
+| full `ctest -j4` | **470 of 470 PASSED, `CTEST_EXIT=0`**, 124 s. Skipped: `test_modelopt_mixed_precision_checkpoint`, `test_voxtral_e2e`. `test_op_parity` PASSES (the `main`-inherited red #755/#672 is gone at this base); `test_cpu_threadpool` passes on an idle box | 103G / 76% |
+| `scripts/agent-preflight.sh` | **All gates green** — including `test_cpu_x86_llamacpp_floor`, which had RED earlier in this session at load average 91-130 and passes on the idle box, confirming it environmental rather than this row's ([[cpu-x86-floor-test-reds-under-box-load]]) | 103G |
+
+The earlier run of this same gate, on a contended box, is kept because a
+negative result is a result: `ctest` 468 of 469 with `test_nemotron_h_scaffold`
+red — that is how #818 was found, and it was found by RE-RUNNING the gate rather
+than by reading the merge diff, which showed no conflict at all.
 | `test_nemotron_h_scaffold` (after the #818 repair) | **12/12 cases, 38289/38289 assertions, `Status: SUCCESS!`** | 23G |
 | `test_nemotron_h_forward` | **13/13, 254/254, `Status: SUCCESS!`** — identical to W4's | 23G |
 | `test_nemotron_h_loader`, `CHECKPOINT_ROOT` UNSET | **2/2, 7/7, `Status: SUCCESS!`**, logs "0 ran, 1 skipped, of 1" | 23G |
