@@ -1445,7 +1445,8 @@ that ENOSPCs leaves the PREVIOUS binary in place
 | `test_nemotron_h_scaffold` (Release) | 12/12, 38285/38285, `Status: SUCCESS!` | 53G |
 | Debug (`-g0`, asserts unmasked) forward | **13/13, 254/254, `Status: SUCCESS!`** | 36G |
 | Debug (`-g0`) scaffold | **12/12, 38285/38285, `Status: SUCCESS!`** | 36G |
-| full `ctest -j4` | **444 of 445 passed**; `test_op_parity` FAILED, **pre-existing on the base** (below); skipped: `test_modelopt_mixed_precision_checkpoint`, `test_voxtral_e2e`, `test_nemotron_h_loader` (no `CHECKPOINT_ROOT` in that shell) | 46G / 90% |
+| Debug (`-g0`) **loader, live checkpoint** | **1/1, 46/46, `Status: SUCCESS!`**, 3/3 goldens, 15:21 wall, VmHWM 19,277,028 KiB | 26G / 95% |
+| full `ctest -j4` | **449 of 451 passed**, then **450 of 451**: `test_engine_core_proc` failed under `-j4` and passes ALONE (14/14, 113/113, exit 0) — the known starvation set, and this box was running the Debug loader arm at the time. `test_op_parity` FAILED, **pre-existing on the base** (below). Skipped: `test_modelopt_mixed_precision_checkpoint`, `test_voxtral_e2e`; `test_nemotron_h_loader` passed vacuously with no `CHECKPOINT_ROOT` in that shell | 26G / 94% |
 
 The forward and scaffold counts are IDENTICAL to W4's (13/254, 12/38285), which
 is the evidence that the expert-major reorder is result-neutral rather than an
