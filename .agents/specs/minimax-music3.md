@@ -153,20 +153,47 @@ assumed from reading the script.
 that layout is **refused by name** with a message saying so. It is not silently
 mis-loaded, and it is recorded as owed rather than discovered later.
 
-### 2.1 The dtype policy is upstream's, and it is deliberate
+### 2.1 dtype — ON DISK IS NOT RUNNABLE (corrected 2026-08-14 by the oracle)
 
-`convert_minimax_music3_to_diffusers.py:267` defaults `--dtype float32`; the
-transformer, condition encoder and vocoder take that dtype (`:208-211`) while the
-RVQ depth decoder is forced to bf16 regardless (`:214`). That matches the measured
-headers exactly, and SGLang-Omni's README states both of its placements "run the
-acoustic stage in FP32".
+**An earlier revision of this section was wrong, and the correction is the point.**
+It read the converter — `convert_minimax_music3_to_diffusers.py:267` defaults
+`--dtype float32`, transformer/condition_encoder/vocoder take it (`:208-211`), the
+RVQ depth decoder is forced to bf16 (`:214`) — saw that it matched the measured
+headers exactly, and concluded that the on-disk set *was* upstream's resolved
+runtime policy, to be mirrored as-is. Standing the oracle up refuted that.
 
-So fp32 on the DiT and the vocoder is **upstream's resolved choice, not a
-too-wide accident** — the case AGENTS.md warns about (a token gate cannot see a
-dtype that is too wide) does not apply here, because the oracle is fp32 too. Each
-fp32 buffer on this path still carries the one-line reason the policy requires,
-naming this section. Any future narrowing to bf16 is a measured change with its
-own evidence, never a silent default.
+**Loading the on-disk dtypes and running upstream's own pipeline raises**
+`RuntimeError: Input type (c10::BFloat16) and bias type (float) should be the
+same` at `condition_embedder_minimax_music3.py:64`. The reason is that upstream
+casts in exactly **two** places and nowhere else — `denoise.py:83` (condition →
+`transformer.dtype`) and `decoders.py:84` (latents → `vocoder.dtype`) — so the
+condition encoder and the depth decoder consume the language model's hidden states
+**uncast**.
+
+**The invariant every runnable configuration satisfies:**
+
+```
+dtype(language_model) == dtype(rvq_depth_decoder) == dtype(condition_encoder)
+```
+
+**The gated configuration is bf16 AR half / fp32 acoustic half**: language model,
+depth decoder and condition encoder in bf16; transformer and vocoder in fp32. That
+is the converter's default for the DiT and vocoder, and what SGLang-Omni states it
+runs ("both layouts run the acoustic stage in FP32").
+
+Two things follow, and they are the reason this correction is worth its space.
+**On-disk dtype and runtime dtype are different facts about this checkpoint**, and
+a per-tensor header read answers only the first — the measurement in §1 is still
+correct, the inference drawn from it was not. And **fp32 on the acoustic half is
+still upstream's choice rather than a too-wide accident**, so the original
+conclusion survives for the DiT and vocoder even though its reasoning did not;
+each fp32 buffer carries the one-line reason AGENTS.md requires, naming this
+section.
+
+**W1 therefore enforces the equality above at load time and refuses a violating
+configuration BY NAME**, naming the three components and their dtypes, rather than
+letting it surface as a type error deep inside a forward pass. The oracle keeps
+`--dtype-policy on-disk` selectable so the failure stays reproducible.
 
 ---
 
