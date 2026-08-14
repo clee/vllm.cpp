@@ -1440,16 +1440,54 @@ that ENOSPCs leaves the PREVIOUS binary in place
 | Arm | Result | disk free |
 |---|---|---|
 | Release `-Werror`, clean full build | **exit 0, 0 `warning:` lines, 0 `No space left` lines**, 891/891 targets | 53G / 88% |
-| `test_nemotron_h_loader` (Release, live checkpoint) | **1/1 cases, 46/46 assertions, `Status: SUCCESS!`**, 7:41 wall | 51G / 89% |
+| `test_nemotron_h_loader` (Release, live checkpoint) | **1/1 cases, 46/46 assertions, `Status: SUCCESS!`**, 10:07 wall, VmHWM 19,270,444 KiB | 36G / 92% |
 | `test_nemotron_h_forward` (Release) | 13/13, 254/254, `Status: SUCCESS!` | 53G |
 | `test_nemotron_h_scaffold` (Release) | 12/12, 38285/38285, `Status: SUCCESS!` | 53G |
-| Debug (`-g0`, asserts unmasked) forward | **13/13, 254/254, `Status: SUCCESS!`** | 12G |
-| Debug (`-g0`) scaffold | **12/12, 38285/38285, `Status: SUCCESS!`** | 12G |
+| Debug (`-g0`, asserts unmasked) forward | **13/13, 254/254, `Status: SUCCESS!`** | 36G |
+| Debug (`-g0`) scaffold | **12/12, 38285/38285, `Status: SUCCESS!`** | 36G |
 | full `ctest -j4` | **444 of 445 passed**; `test_op_parity` FAILED, **pre-existing on the base** (below); skipped: `test_modelopt_mixed_precision_checkpoint`, `test_voxtral_e2e`, `test_nemotron_h_loader` (no `CHECKPOINT_ROOT` in that shell) | 46G / 90% |
 
 The forward and scaffold counts are IDENTICAL to W4's (13/254, 12/38285), which
 is the evidence that the expert-major reorder is result-neutral rather than an
 assertion that it is.
+
+**Jetson Thor (`kairos-4db2`, aarch64, sm_110) — a CUDA build AND the real
+checkpoint.** Transferred by `git archive` and md5-verified on both ends
+(`1cdc92214540646cc1fb7c9e87c87b23`); the 20.1 GiB checkpoint staged to
+`/home/mudler/nemo-loader/ckpt` with its `.cache/huggingface/download/*.metadata`
+sidecars intact, so the CONTENT pin resolves there too. Container
+`vllmcpp-build:aarch64`, `--runtime=nvidia`, `NVIDIA_DISABLE_REQUIRE=1`, nvcc
+13.0.88, `-DVLLM_CPP_CUDA=ON -DVLLM_CPP_CUDA_ARCHITECTURES=110
+-DVLLM_CPP_TRITON=OFF`, no CUTLASS — the six `DISABLED (no requested arch in
+[110] provides it)` lines are CORRECT for sm_110, not a silent fallback. Disk
+408-439G free / 50-54% throughout; RAM 122 GiB, and the box was loaded ALONE.
+
+| Thor arm | Result |
+|---|---|
+| build | **`BUILD_EXIT=0`, 0 `warning:` lines, 0 `No space left` lines** |
+| `test_nemotron_h_forward` | **13/13, 254/254, `Status: SUCCESS!`** — identical to x86_64 |
+| `test_nemotron_h_scaffold` | **12/12, 38285/38285, `Status: SUCCESS!`** — identical to x86_64 |
+| `test_nemotron_h_loader`, **live checkpoint at `/w/ckpt`** | **1/1, 46/46, `Status: SUCCESS!`**, `LOADER_EXIT=0`, **3/3** goldens, 3:00 wall |
+| peak RSS on Thor | **17.85 GiB** after load, **18.53 GiB** at the end |
+
+Two cross-architecture agreements worth naming, because neither was arranged.
+`host bytes: 18013 MiB, source 18013 MiB` is byte-for-byte what x86_64 reported,
+and the logits range is **`[-9.4375, 8.75]` on both**. The 3:00 wall against
+x86_64's 10:07 is the storage, not the CPU: Thor reads the checkpoint off local
+NVMe and the x86 box reads it over SMB from the NAS.
+
+`/usr/bin/time` is NOT in that container — the first attempt exited **127** and
+would have read as a failed run to anyone grepping only for `SUCCESS`. The RSS
+above is the test's own `/proc/self/status` `VmHWM`, which is why it has one.
+
+**One honestly weak property, recorded rather than discovered.** With no
+checkpoint the gate emits a `MESSAGE` naming the missing export and RETURNS,
+so CTest records a PASS, not a *Skipped* — a CI run cannot tell it apart from a
+real pass without reading the log. That is the convention
+`test_nemotron_h_scaffold`'s live case already set for this same checkpoint on
+this same row, and matching it beat inventing a second one; the alternative is
+`test_modelopt_mixed_precision_checkpoint`'s exit-77, which needs a custom
+`main`. Named here so the next reader does not have to work it out.
 
 **`test_op_parity` is RED on the base and not this row's.** `RunGoldenPass`
 (`tests/parity/test_op_parity.cpp:1852-1860`) walks every subdirectory of the
