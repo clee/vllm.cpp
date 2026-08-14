@@ -140,7 +140,7 @@ token-for-token correctness against the pinned oracle.
 | InternLM2 dense (fused-`wqkv` interleaved split) | Correctness-complete, speed-pending | Token-exact 16/16 (internlm2-chat-1_8b): 12/16 strict + 4/16 bf16 near-tie (max gap 0.0 nats), 0 divergent; first InternLM model; ZERO new compute kernel (reuses the Llama dense forward; the only delta is a loader-side de-interleave of the fused `wqkv`, which packs q/k/v interleaved by KV-group) |
 | MiniMax-H3 (`MiniMaxH3DiTModel`, video+audio DIFFUSION) | **ABI v12 ONE SURFACE; device selector uses generic `DeviceType`; DSR 32.** t2va+fl2va COHERENT; bf16 shards STREAM | ref2va ckpt fidelity §8.12; encoder A/B §8.15; GB10 re-verify residual; CPU fold 6/137 (one queue + device provenance mutation-gated) |
 | LTX-2.5 (`LTX2VideoTransformer3DModel`, video+audio DIFFUSION) | **L1-L9c landed (#435).** 21.00B / 48 blocks. `VideoEngine` seam + ABI **v18**, DiT forward (CPU f32 parity, bf16 device-resident), Gemma-4 TE, both VAEs, the embeddings connector, pipeline, NVFP4/FP8 arms, `/v1/videos` | A shipped 21.00B FP8 DiT runs device-resident on GB10. The 320x192/25f frames ARE a scene, register-conditioned. L13 encodes a typed prompt, FIXTURE-gated; a prompted render is OWED. Speed and oracle parity `PENDING` |
-| MiniMax-Music3 (`MiniMaxMusic3ForConditionalGeneration`, text-to-MUSIC) | **`ACTIVE`: W0 + W1 landed (#672).** First row whose oracle is not vLLM: the OPEN diffusers PR #14456 `c6da9936`, which generates audio here | W2-W7 owed. Loader gated 1413/1413 on the real checkpoint; no speed number exists or is claimed |
+| MiniMax-Music3 (`MiniMaxMusic3ForConditionalGeneration`, text-to-MUSIC) | **`ACTIVE`: W0, W1, W2/W3 and W4/W5 landed (#672).** First row whose oracle is not vLLM: the OPEN diffusers PR #14456 `c6da9936`, which generates audio here | W2's LM forward, W6 and W7 owed. Loader 1413/1413, AR and acoustic halves gated on the real checkpoint; no speed number exists or is claimed |
 | Command-R / Cohere dense (`CohereForCausalLM`) | Implemented, gate-blocked | ZERO-new-kernel port grounded in vLLM `commandr.py`: weight-only Cohere LayerNorm + GPT-J full-width RoPE + PARALLEL residual + `logit_scale` + tied embeddings, all reuse; compiles, links, self-registers. No SACRED gate yet (real checkpoints HF-gated, ungated ones tiny-random, GPU box disk-full); oracle run-verified at W0. See docs/BENCHMARKS.md |
 | Phi-1 / Phi-2 dense (`PhiForCausalLM`, parallel residual) | Correctness-complete, speed-pending | Token-exact 16/16 (microsoft/phi-2): 9/16 strict + 7/16 bf16 near-ties (max gap 0.25 nats), 0 forward-divergent; the OLDER Microsoft Phi arch, DISTINCT from Phi-3/Phi-4; ZERO new compute kernel (GPT-J parallel residual, LayerNorm-with-bias, biased qkv/dense, partial NeoX rope 32/80, non-gated NewGELU MLP reusing `vt::GeluTanh`, untied biased lm_head); F16 dtype-aware loader |
 | MiniCPM dense (`MiniCPMForCausalLM`, three scalars) | Correctness-complete, speed-pending | Token-exact 16/16 (openbmb/MiniCPM-2B-sft-bf16): 10/16 strict + 6/16 bf16 near-ties (max gap 0.0 nats), 0 forward-divergent; first OpenBMB MiniCPM model; ZERO new compute kernel (the Llama/Granite dense forward plus three scalars: scale_emb, scale_depth/sqrt(layers) residual, dim_model_base logit scaling), tied lm_head; `.bin`-only weights converted to safetensors via trusted torch |
@@ -464,6 +464,12 @@ Parakeet ASR (2026-08-07): *CPU-correct, ON THE ONE SURFACE (ROW 1)*. Ids exact 
 ## Not supported yet
 
 LoRA (W1 CPU runtime brick landed; not yet usable end-to-end), multi-GPU,
+hybrid CPU+GPU device placement (`ENG-HYBRID-PLACEMENT` READY, spec only:
+routed-MoE expert COMPUTE on the CPU backend with the rest on GPU, the inverse
+of weight offload; #149's CPU-MoE half. Its speed floor vs llama.cpp `-ncmoe`
+needs a discrete-GPU rig, which unified-memory GB10 cannot provide, so that
+gate is blocked rather than pending
+[spec](../.agents/specs/hybrid-placement.md)),
 Vulkan (opt-125m exact; 25 native +8 GDN, both
 recurrences + fused attn preamble; 27B prefill 21.5x, decode
 4.36/4.35 MET; 27B load 100.8 -> 53.4 GiB; #125
@@ -473,7 +479,14 @@ Gemma-3 and Qwen3 all-native, with Gemma-3 strict 48/48 against two vLLM-ROCm
 oracles and Qwen3 in a measured near-tie regime; Qwen3.5-0.8B GDN runs all-native
 but its CPU/ROCm divergence remains open; gfx1201 Gemma-4 FP8 MoE is
 contributor-measured on 2x R9700 and CPU-link-verified our side;
-[guide](ROCM.md)), and the full tool-calling template surface. **Muse Glimmer's
+[guide](ROCM.md)), inference-time CPU weight offload (`ENG-WEIGHT-OFFLOAD`
+READY, spec only: vLLM's `cpu_offload_gb` UVA arm with dotted-segment
+`cpu_offload_params` targeting, plus the layer-group `PrefetchOffloader` — a
+pure mirror floor, and #149's dense half. Its memory and speed gates need a
+discrete-GPU rig, because on unified-memory GB10 offloading to "CPU" frees
+nothing, so those gates are blocked rather than pending
+[spec](../.agents/specs/weight-offload-uva.md)), and the full tool-calling
+template surface. **Muse Glimmer's
 GGUF arm generates coherently** (#347, #359), is NOT token-exact, and has
 only a llama.cpp bar (#333). Its CPU decode was **synchronisation-bound, not
 kernel-bound**: the threadpool's never-yielding spin-wait cost a full scheduler
@@ -526,48 +539,45 @@ token, 17 steps instead of 18), and our acceptance equals its modal value
 (48.6%, 4.94 tokens/step). Per-step the engines are aligned (30.4 vs ~30.1 ms,
 34.7 vs ~34.5). Under a LOW-NOISE harness (clocks pinned at 1800
 MHz, 30 reps, drift bracketed at -0.088%, the oracle's non-modal draws excluded)
-the code cell is **0.975x with NON-OVERLAPPING distributions** — a real gap, not
-noise, and the earlier "within resolution" reading was too generous. Ours slowed
+that session's code cell measured **0.975x with NON-OVERLAPPING
+distributions** — a real gap, not noise, and the earlier "within resolution"
+reading was too generous. It is one of four within-session ratios, listed
+below. Ours slowed
 more than the oracle when the clock was pinned, so the residual is
-SM-clock-sensitive work. PAIRED profiling localises it exactly: the SAME
-`marlin_moe_wna16::Marlin` kernel, the SAME 1520 launches, ours 249.22 ms vs
-upstream 230.39 ms -- **8.2% slower inside one kernel**, which at ~34% of wall is
-2.8% end-to-end and accounts for the whole measured 2.5%. Not an algorithm difference, and not the launch
-geometry either: the full template arguments match, `determine_exec_config` is
-byte-identical to the pinned upstream copy, and every OTHER kernel matches to
-0.2%. The inputs match too (scale bytes per expert,
-256-byte alignment, cudaMalloc residency), and the work counts were MEASURED:
-upstream loops 4.4% MORE blocks per launch (40.6 vs 38.9) and is still faster, so
-routing is refuted and normalising by work makes our deficit bigger -- **4.21 vs
-3.73 us per block, ~12.8% slower per unit of work**. Every source-level explanation is now
-eliminated -- kernel source, template instantiation, grid config, block size,
-shared-memory budget, reduction flags, scale layout, alignment, residency, CUDA
-toolkit (13.0 both) and arch all match -- and `ncu` plus cuobjdump then showed the
-COMPILED KERNELS ARE EQUIVALENT (94 registers and 3664 SASS instructions on both,
-upstream running its family-compatible sm_120 cubin against our sm_121a). The
-residual is therefore runtime and is now ATTRIBUTED: the kernel is DRAM-bound
-(L2 hit 9.5%) and we sustain **186.6 GB/s against upstream's 210.7**, a 12.9%
-effective-bandwidth gap that IS the whole per-unit-work difference. Weight
-residency is already staged correctly (cudaMalloc + one upload), and the slab itself is byte-for-byte the
-same size and stride as upstream's tensor (268 MB, no padding), so the cause is
-memory-system behaviour that no allocation change we can name would alter; upstream's ncu counters would settle it but its engine will not initialise under
-ncu in either replay mode. A C_tmp over-allocation (15-30 MB vs upstream's
-3.15 MB) was found and fixed, but an in-session A/B shows it is perf-NEUTRAL
-(+0.03%) -- an apparent +2.9% was machine drift, since GB10 cannot lock memory
-clocks. The ratio has now been measured WITHIN a single session three times --
-0.9757, 0.9646 and (ours->oracle->ours at free clocks, drift -0.89%) 0.9569 --
-so it is **~0.966 +/- 0.01, consistently below 1.0**, while the absolute numbers
-move up to 5% BETWEEN sessions for the same binary. Storage was raised as a
-possible distortion and is refuted: the weights are on local NVMe (no NAS mount
-exists on the box), a run reads 22.06 GB once at load, decode-time RSS is 4.8 GB
-because the mapping is released after upload, and 8 warm reps hold a 0.5%
-spread -- decode touches no storage. (That NVMe is 98% full, 76 GB free, which
-is its own operational risk given ENOSPC has previously produced a green report
-over a gate that never ran.) Editing
-the kernel, its launch config, layout or flags is NOT indicated: all are proven
-identical. (The repack kernels that appear to take 40% of a long run are
-LOAD-TIME.) NOT parity. The Gemma4 `1 + N` layout is coded and unit-tested but has
-never run on real weights.
+SM-clock-sensitive work. PAIRED profiling appeared to localise the residual to
+`marlin_moe_wna16::Marlin` (ours 249.22 ms vs upstream 230.39 ms over the same
+1520 launches), and every source-level explanation was eliminated -- kernel
+source, template instantiation, grid, block size, shared memory, flags, scale
+layout, alignment, residency, toolkit, arch -- with ncu and cuobjdump showing
+the compiled kernels EQUIVALENT (94 registers, 3664 SASS instructions on
+both). THAT LOCALISATION IS REFUTED. `scripts/marlin-moe-standalone.py` and
+`benchmarks/marlin_moe_standalone.cpp` drive each engine's own kernel outside
+its engine -- which is also what finally lets ncu attach to upstream,
+previously recorded as impossible in both replay modes -- and at matched work
+the two are indistinguishable: over 12 interleaved paired points ours averages
+5.3187 us/block against upstream's 5.3330, ratio 0.9973, sign flipping between
+runs, inside one standard deviation. The in-situ 8.2% therefore describes the
+RUNS, not the kernel, and so do the 12.8%-per-unit-work and 186.6-vs-210.7
+GB/s figures derived from it -- the latter also divided GRAPHED times by
+EAGER-mode block counts, so numerator and denominator came from different
+execution modes. END-TO-END, valid within-session paired ratios are 0.9757,
+0.9646, 0.9569 and 0.9889 (a fifth run was REJECTED on a -2.13% drift gate): a
+spread of 0.957-0.989 ACROSS BOOTS, with no single value being the ratio and
+the gap not resolved better than 1-4% on this hardware. An earlier claim here
+that the gap was 1.1% rather than 3.4% is WITHDRAWN: decomposed, our arm moved
++1.10% between those sessions while the ORACLE denominator moved -2.17%, so
+most of it was the oracle's boot state, and differencing ratios across boots
+is what this page forbids elsewhere. The warm-up arm does demonstrably remove
+a 6.6% WITHIN-RUN drift, which makes a run internally valid without moving the
+ratio. Standing traps: dram__bytes.sum reads n/a on GB10, so ncu's Memory
+Throughput % excludes DRAM traffic and is not a bandwidth utilisation; the GPU
+lock is $HOME/gpu.lock, and absolute timings from runs that took /tmp/gpu.lock
+ran unserialised and are LOWER bounds on achievable bandwidth, so a clean re-
+take can only raise the plateau; any MoE comparison that lets routing vary
+between arms measures the draw, not the change; and both blocks AND distinct
+experts must be controlled, since cost per distinct expert spans 4.47-7.50 us
+and is flat only above ~40 experts. NOT parity, and the row stays open.
+
 Multimodal
 (image/video/audio) is correctness-complete and its OpenAI-server wiring has
 landed all three CPU bricks (content-part parse + processor routing, the
@@ -1503,6 +1513,8 @@ Gemma4/ROCm env split: public `VT_GEMMA4_EXPERT_VRAM_MB` caps expert LRU in posi
 
 `BACKEND-TENSTORRENT`: `ACTIVE`: OPT-125m strict 6/6 on Blackhole; 17 ops. Qwen3 is wired; its full 16x16 gate and speed remain pending.
 
+`BACKEND-TENSTORRENT-MISTRAL`: `ACTIVE`: Mistral-7B-v0.3 gated on a Blackhole P150, 16/16 prompts (12/16 strict token-exact, 4/16 inside the near-tie band, 0 forward-divergent), max gap 0.062 nats. `MistralForCausalLM` is allowlisted by exact match, so `Mistral3ForConditionalGeneration` (#387, unported) still falls through. Correctness only -- no speed claim.
+
 **Platform SELECTION is the one non-additive site, and is now gated.** A
 platform missing from `CurrentPlatform()`'s hardcoded walk registers and answers
 correctly but is NEVER selected, with no compiler diagnostic. `test_platform`
@@ -1780,8 +1792,16 @@ runtime-verified yet.
   validation still fires — `--enable-auto-tool-choice` with
   `--tool-call-parser none` is refused, mirroring
   `vllm/entrypoints/openai/cli_args.py:395`. Not yet reviewed or gate-rerun by
-  the operator; `--language-model-only` (#607) is a real capability gap and is
-  deliberately NOT in this list.
+  the operator; `--language-model-only` was excluded from this list because it
+  is a real capability, not a no-op — and as of 2026-08-14 (#607 wave L2) it is
+  **implemented** rather than accepted-and-inert, alongside
+  `--limit-mm-per-prompt`. Both set `vllm::MultiModalConfig` and are ENFORCED: a
+  server started with `--language-model-only` answers a multimodal request with
+  HTTP 400 `At most 0 image(s) may be provided in one prompt.`, which is what
+  upstream's flag does. The 43 recipes that pass it now reach model load. It
+  does **not** free memory yet — nothing gates vision-tower construction on the
+  limits (wave L3, owed with a measured RSS reduction), so the flag must not be
+  described as a VRAM knob until that lands.
 - **Surface coverage (ONE SURFACE, `ARCH-ONE-SURFACE`,
   `.agents/specs/surface-coverage-2026-08-07.md`).** 21/30 text archs
   on-framework; the recurring defect (a capability in a per-model CLI) is in seven

@@ -702,6 +702,7 @@ add_library(vllm STATIC
   src/vllm/config/scheduler.cpp
   src/vllm/config/device.cpp
   src/vllm/config/kv_transfer.cpp
+  src/vllm/config/multimodal.cpp
   src/vllm/config/speculative.cpp
   src/vllm/outputs.cpp
   src/vllm/transformers_utils/hf_config.cpp
@@ -769,11 +770,15 @@ add_library(vllm STATIC
   src/vllm/model_executor/models/vocoder1d.cpp
   src/vllm/model_executor/models/minimax_music3_loader.cpp
   src/vllm/model_executor/models/minimax_music3_ar.cpp
+  src/vllm/model_executor/models/minimax_music3_acoustic.cpp
+  src/vllm/model_executor/models/minimax_music3_speech.cpp
   src/vllm/model_executor/models/gpt2.cpp
   src/vllm/multimodal/speech_engine.cpp
   src/vllm/model_executor/models/indextts2.cpp
   src/vllm/model_executor/models/campplus.cpp
+  src/vllm/model_executor/models/emovec.cpp
   src/vllm/model_executor/models/w2vbert.cpp
+  src/vllm/model_executor/models/w2v_fbank.cpp
   src/vllm/model_executor/models/fvq.cpp
   src/vllm/model_executor/models/codec_encoder.cpp
   src/vllm/model_executor/models/wavenet.cpp
@@ -782,7 +787,9 @@ add_library(vllm STATIC
   src/vllm/model_executor/models/dit_front.cpp
   src/vllm/model_executor/models/dit_stack.cpp
   src/vllm/model_executor/models/bigvgan.cpp
+  src/vllm/model_executor/models/bigvgan_loader.cpp
   src/vllm/model_executor/models/indextts2_s2mel_loader.cpp
+  src/vllm/model_executor/models/indextts2_render.cpp
   src/vllm/model_executor/models/indextts2_talker_loader.cpp
   src/vllm/model_executor/models/vocos.cpp
   src/vllm/model_executor/models/lenreg.cpp
@@ -790,6 +797,7 @@ add_library(vllm STATIC
   src/vllm/model_executor/models/adaln.cpp
   src/vllm/model_executor/models/dit.cpp
   src/vllm/model_executor/models/talker.cpp
+  src/vllm/model_executor/models/tiktoken_bpe.cpp
   src/vllm/model_executor/models/indextts2_pipeline.cpp
   src/vllm/model_executor/models/minimax_h3_video_vae.cpp
   src/vllm/model_executor/models/minimax_h3_video_vae_device.cpp
@@ -831,11 +839,19 @@ add_library(vllm STATIC
   # LTX-2.5 (ROW MODEL-DIFFUSION-LTX25, phase L11): the conditioning items that
   # place the VAE ENCODERS' output into the denoise state.
   src/vllm/model_executor/models/ltx2_conditioning.cpp
+  # LTX-2.5 (ROW LTX25-IMAGE-COND, issue #644): the video VAE ENCODER's LOAD
+  # path — key filter and config parser, which existed nowhere before — and the
+  # pixel front-end an image conditioning arrives through. Separate TUs rather
+  # than additions to ltx2_loader.cpp, which two concurrent rows of the same
+  # campaign need to edit.
+  src/vllm/model_executor/models/ltx2_video_vae_encoder_load.cpp
+  src/vllm/model_executor/models/ltx2_image_preprocess.cpp
   # LTX-2.5 (ROW MODEL-DIFFUSION-LTX25, phase L6): the quantized loaders — the
   # FP8 and torchao-NVFP4 DiT arms, the torchao-NVFP4 text encoder, and the
   # load-time device staging GB10's ATS penalty makes the default.
   src/vllm/model_executor/models/ltx2_loader.cpp
   src/vllm/entrypoints/openai/video_api.cpp
+  src/vllm/entrypoints/openai/speech_api.cpp
   src/vllm/model_executor/models/kimi_kda.cpp
   src/vllm/model_executor/models/kimi_linear_registry.cpp
   src/vllm/model_executor/models/kimi_linear_weights.cpp
