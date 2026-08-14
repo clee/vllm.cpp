@@ -1711,7 +1711,14 @@ The LTX-2.5 arm runs on the CPU in f32 and on CUDA in bf16. `device = 0` takes
 the f32 parity forward; `device = 1` stages the DiT to the GPU one tensor at a
 time and runs the device-resident forward, so a CUDA handle means a CUDA forward.
 On a build with no CUDA backend, `device = 1` is refused by name rather than
-served the CPU forward behind a CUDA handle. `encoder_path` loads the Gemma-4
+served the CPU forward behind a CUDA handle. It is also refused when the build's
+accelerator is a PARTIAL backend that declines this architecture — Metal and
+Tenstorrent each register the kernels for a named short list of models, and a
+backend that has not registered this one now says so by name instead of binding
+a queue and failing later inside a kernel. The same three questions decide
+`minimax-h3`'s `device = 1`, which resolves through the platform seam rather
+than reading the ABI selector as an enum value, so on a CPU-only build it throws
+instead of naming CUDA. `encoder_path` loads the Gemma-4
 text tower, and the request's own `prompt` then conditions the render; the tower
 itself runs on the CPU in f32 whichever device the DiT is on. Without one,
 conditioning comes from the two prompt-embeds files, which must agree on their

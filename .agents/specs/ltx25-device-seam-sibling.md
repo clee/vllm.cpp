@@ -192,7 +192,64 @@ count is RED even when it reads green.
   coverage.
 - `dgx.casa` is not required for any of this. Nothing here is a GPU measurement.
 
+## Findings from implementation
+
+**The brief and this spec disagreed on one line, and this spec won.** The
+dispatch brief said `test_minimax_h3_video_fold.cpp:161-164` must stay green
+*unchanged*, but §4.2 above enumerates what "the contract" means — `0 → kCPU`,
+`-1` and `2` throw — and separately requires that on a CPU-only build `1` is
+**refused**. Line 162 asserted `MiniMaxH3VideoDeviceType(1) == kCUDA`, which is
+precisely the cast's answer and cannot survive the change. It is now
+build-conditional and asserts BOTH arms: `== accelerator` where one is
+registered, refused-by-name where none is. 161/163/164 are untouched.
+
+**`test_minimax_h3_video_fold.cpp`'s CUDA-load case registered a BACKEND and no
+PLATFORM.** It could, because the cast never asked whether the build had an
+accelerator. It does now, so the fixture supplies both halves. That is the
+defect being visible rather than a harness concession: a build with a CUDA
+backend registered and no CUDA platform is not a build that runs on CUDA.
+
+**The architecture key is the FAMILY string** (`ltx-2.5`, `minimax-h3`), not an
+HF `architectures[0]` class name. The diffusion lanes are reached through
+`LoadVideoEngine`/`VideoModelParams::family` and never read an `architectures`
+entry, so the family slug is the only stable identifier they have. It does mean
+`supports_model_architecture`'s key space now mixes HF class names
+(`OPTForCausalLM`) with family slugs; the two cannot collide, and the refusal
+names the string the user actually typed. Flagged for the reviewer as the one
+judgement call in the row.
+
+**`metal.cpp` and `tenstorrent.cpp` run no diffusion model** — searched in their
+own vocabulary over `src/vllm/platforms/{metal,tenstorrent}.cpp` and
+`src/vt/{metal,tenstorrent}/` with `OPTForCausalLM` as a positive control in the
+same command: the control hit three times, `ltx|minimax|h3|diffus|video` hit
+zero. So §5's stop condition is not triggered: the guard refuses nothing that
+works today.
+
+**The `dev_cast` bucket produced one false positive on the real tree**, and it is
+the interesting kind. `kv_connector.h:225`'s
+`supports_worker_transfer_on(vt::DeviceType /*device*/) const` strips to
+`(vt::DeviceType )` followed by `const` — textually a C-style cast. Two
+discriminators fixed it (the `(` must not be glued to an identifier; the `)` must
+not be followed by a declarator suffix) and M29 pins both, together with the
+proof that the discriminators did not cost the real detection.
+
+**Residual blind spots are recorded in the checker's own docstring**, per §3's
+instruction: type aliases and template parameters that resolve to `DeviceType`,
+`bit_cast`/`memcpy`/union punning, conversions inside the unscanned `src/vt/`
+leg, and the fact that nothing type-checks the operand. The bucket flags every
+cast *to* `DeviceType` and relies on `DSR-ALLOW` for the legitimate ones.
+
 ## Now
 
-`READY`. Spec committed ahead of implementation; a fresh implementer works from
-this file, and a fresh reviewer — not the implementer — reviews the head.
+`READY`, implemented and awaiting review on `row/LTX25-DEVICE-SEAM-SIBLING`
+(PR #671). All three changes are on the branch with their RED, GREEN and
+mutation evidence in the PR body; next is a fresh reviewer — not the implementer
+— on the immutable head, then the operator's own gate rerun.
+
+The row stays `READY` in `roadmap_v1.md` deliberately. A lifecycle move to
+`ACTIVE` owes `docs/STATUS.md` and `docs/BENCHMARKS.md` in the same change
+(scripts/check-doc-checkpoint.py), and those are projections of what the project
+CLAIMS — which this row does not change until it lands. Writing them from an
+unmerged PR would also put two shared files under a lock for the length of a
+review. The operator moves the state, and writes those two surfaces, when it
+merges.
