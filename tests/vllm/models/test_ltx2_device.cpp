@@ -679,6 +679,55 @@ TEST_CASE("ltx2 device: the keyframe marker arm matches upstream on CUDA") {
   CheckKeyframesCases(q, "cuda");
 }
 
+// THE MEMORY-FORMAT CHECK ON THE ARM WHERE WIDTH IS A REAL CHOICE.
+//
+// Upstream casts BOTH operands to `hidden_states.dtype` (transformer_args.py:42-43).
+// On the device arm `hidden_states` is at the STREAM dtype, so an f32 addend under
+// a bf16 stream is the "too WIDE" case AGENTS.md names: numerically correct, so
+// every golden and every token gate agrees with it, while it moves twice the
+// bytes and — on CUDA, where vt's elementwise kernels require matching dtypes —
+// throws from inside a kernel instead of by name.
+//
+// MEASURED: with the equality check removed, all five LTX-2.5 suites stayed
+// GREEN. Nothing else in the tree looks at this operand's width, which is why
+// this case exists rather than a comment claiming the check is load-bearing.
+TEST_CASE("ltx2 device: an f32 keyframes embedding under a bf16 stream is REFUSED") {
+  vt::Queue q{Cpu(), nullptr};
+  Ltx2DitParams p = ReducedParams(Ltx2RopeType::kSplit, false);
+  p.use_keyframes_abs_pos_embedding = true;
+  WeightSet set = BuildWeights(p);
+  Ltx2DitDeviceWeights staged = Ltx2StageDitWeightsToDevice(q, p, set.views, vt::DType::kBF16);
+  REQUIRE(staged.weights.keyframes_abs_pos_embedding.dtype == vt::DType::kBF16);
+
+  Modalities m;
+  BuildModalities(&m, false);
+  std::vector<float> mask(
+      static_cast<size_t>(vllm_test::kLtx2Batch * vllm_test::kLtx2VideoTokens));
+  for (size_t i = 0; i < mask.size(); ++i) mask[i] = vllm_test::kLtx2KeyframesMask[i];
+  m.video.keyframes_mask = mask.data();
+
+  // Same values, same shape, f32 — which is exactly what a staging path that
+  // "kept the tables f32" would hand over. It is not a table.
+  const auto host = set.views.find("keyframes_abs_pos_embedding");
+  REQUIRE(host != set.views.end());
+  REQUIRE(host->second.dtype == vt::DType::kF32);
+  staged.weights.keyframes_abs_pos_embedding = host->second;
+  const std::string what = RefusalMessage([&] {
+    (void)Ltx2DitForwardDevice(q, p, staged.weights, &m.video, &m.audio, vt::DType::kBF16);
+  });
+  INFO("what: " << what);
+  CHECK(what.find("keyframes_abs_pos_embedding") != std::string::npos);
+  // Positive control for that substring search: the SAME helper over the SAME
+  // call with the bf16 view restored must return the empty string, so a refusal
+  // that names anything at all cannot be mistaken for this one.
+  staged.weights.keyframes_abs_pos_embedding =
+      Ltx2StageDitWeightsToDevice(q, p, set.views, vt::DType::kBF16)
+          .weights.keyframes_abs_pos_embedding;
+  CHECK(RefusalMessage([&] {
+          (void)Ltx2DitForwardDevice(q, p, staged.weights, &m.video, &m.audio, vt::DType::kBF16);
+        }).empty());
+}
+
 TEST_CASE("ltx2 device: the bf16 PRODUCTION stream matches upstream (CPU backend)") {
   vt::Queue q{Cpu(), nullptr};
   CheckBf16Stream(q, "cpu-backend bf16");
