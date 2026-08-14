@@ -49,6 +49,8 @@
 #include <string>
 #include <vector>
 
+#include <nlohmann/json.hpp>
+
 #include "hf_snapshot.h"
 #include "vllm/model_executor/model_loader/safetensors_reader.h"
 #include "vllm/model_executor/models/model_registry.h"
@@ -61,6 +63,11 @@
 #include "vllm/v1/attention/backends/gdn_attn.h"  // GDNAttentionMetadata
 #include "vt/device.h"
 #include "vt/dtype.h"
+
+#ifndef NEMOTRON_H_GOLDENS_DIR
+#define NEMOTRON_H_GOLDENS_DIR \
+  "tests/parity/goldens/nemotron_35_lightning_greedy"
+#endif
 
 namespace {
 
@@ -242,6 +249,71 @@ TEST_CASE("NemotronH: the REAL checkpoint loads and the forward produces logits"
   MESSAGE("logits range: [" << lo << ", " << hi << "]");
   CHECK(nonfinite == 0);
   CHECK(hi - lo > 1.0);
+
+  // ─── (6) EVIDENCE, not the W6 token gate: the first greedy token of each of
+  //         the three committed oracle prompts ────────────────────────────────
+  //
+  // W6 formally owns the token gate — identical prompts, counts, batching and
+  // sampling against the pinned oracle, with the oracle identity asserted. This
+  // is a much smaller claim on the same artifact: for each committed prompt,
+  // ONE forward over its `prompt_token_ids` and the argmax of the last position
+  // against the golden's FIRST generated token.
+  //
+  // It is here because it is the one check that can fail for a reason the
+  // structural gate above cannot see. Every count can be right — 5935 NVFP4
+  // triples bound to the right projections, 46 FP8 triples, 69 widenings and no
+  // more — while a group scale is transposed or a nibble order is flipped, and
+  // the answer stays finite and correctly shaped. A wrong argmax on all three
+  // prompts is what that looks like from outside.
+  const std::filesystem::path goldens =
+      std::filesystem::path(NEMOTRON_H_GOLDENS_DIR) / "oracle.json";
+  std::ifstream gin(goldens.string());
+  REQUIRE_MESSAGE(gin.good(), "cannot open " << goldens.string());
+  nlohmann::json oracle;
+  gin >> oracle;
+  // The goldens name the revision they belong to; the checkpoint resolver above
+  // pinned the same one by CONTENT. Assert they agree rather than assuming it.
+  CHECK(oracle.at("revision").get<std::string>() ==
+        std::string(parity::kNemotron35LightningNvfP4Revision));
+
+  int matched = 0;
+  int total = 0;
+  for (const nlohmann::json& g : oracle.at("golden")) {
+    const std::vector<int32_t> prompt =
+        g.at("prompt_token_ids").get<std::vector<int32_t>>();
+    const int32_t want = g.at("token_ids").at(0).get<int32_t>();
+    std::vector<int32_t> pos(prompt.size());
+    for (size_t i = 0; i < pos.size(); ++i) pos[i] = static_cast<int32_t>(i);
+    const std::vector<int32_t> last{static_cast<int32_t>(prompt.size()) - 1};
+    const vllm::ModelForwardInput in{.token_ids = prompt,
+                                     .positions = pos,
+                                     .attn_meta = attn_meta,
+                                     .gdn_meta = gdn_meta,
+                                     .attn_kv = attn_kv,
+                                     .gdn_state = gdn_state,
+                                     .config = config,
+                                     .queue = queue,
+                                     .logits_indices = last,
+                                     .num_reqs = 1};
+    const vllm::ForwardLogits out = vllm::ModelRegistry::Forward(*model, in);
+    REQUIRE(out.host.size() == static_cast<size_t>(params.vocab_size));
+    const int32_t got = static_cast<int32_t>(
+        std::max_element(out.host.begin(), out.host.end()) - out.host.begin());
+    ++total;
+    if (got == want) ++matched;
+    // `std::string`, NOT a `const char*` ternary: doctest 2.5.2 has no
+    // stringifier for a `const char*` lvalue and prints it as `1`, which is
+    // exactly what this line did on its first run — "oracle 69931" instead of
+    // "oracle 6993  MATCH". The same trap this row already repaired once (spec
+    // §"W1 land-prep", LOW-2).
+    const std::string verdict = got == want ? "  MATCH" : "  DIFFERS";
+    MESSAGE("prompt \"" << g.at("prompt").get<std::string>()
+                        << "\": argmax " << got << ", oracle " << want
+                        << verdict);
+  }
+  MESSAGE("first-token agreement with the committed oracle goldens: "
+          << matched << "/" << total);
+  CHECK(matched == total);
 
   MESSAGE("peak RSS at end: " << VmHwmKiB() / 1024 << " MiB");
 }

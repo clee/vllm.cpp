@@ -520,6 +520,8 @@ target_include_directories(test_nemotron_h_forward PRIVATE ${CMAKE_SOURCE_DIR}/s
 # absent, so CI never needs the NAS asset. Not the W6 token gate: no golden is
 # consumed and no speed claim is made.
 vllm_cpp_add_test(test_nemotron_h_loader vllm/models/test_nemotron_h_loader.cpp)
+target_compile_definitions(test_nemotron_h_loader PRIVATE
+  NEMOTRON_H_GOLDENS_DIR="${CMAKE_CURRENT_SOURCE_DIR}/parity/goldens/nemotron_35_lightning_greedy")
 # nemotron_h.h / nemotron_h_loader.h are MODEL-PRIVATE headers under src/, not
 # include/vllm/ (#515); tests/parity carries the content-pinned snapshot
 # resolver.
