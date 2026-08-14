@@ -30,6 +30,7 @@
 
 #include "capi/engine_handle.h"
 #include "vllm/config/device.h"
+#include "vllm/config/multimodal.h"
 #include "vllm/entrypoints/model_loader.h"
 #include "vllm/platforms/interface.h"
 #include "vllm/entrypoints/openai/serving_utils.h"
@@ -252,10 +253,10 @@ vllm_engine* MakeSyntheticEngine() {
 // Chat-capable synthetic engine: same stack, but the chat serving is built with
 // an IN-VOCAB prompt seam (the tiny fixture vocab cannot spell a real chat
 // template), mirroring the api-server harness's InVocabChatPrompt.
-vllm_engine* MakeSyntheticChatEngine() {
+vllm_engine* MakeSyntheticChatEngine(EngineParams p) {
   const HfConfig c = MakeConfig();
-  auto loaded = std::make_unique<LoadedEngine>(c, MakeWeights(c), BuildFixture(),
-                                               SyntheticParams());
+  auto loaded =
+      std::make_unique<LoadedEngine>(c, MakeWeights(c), BuildFixture(), p);
   return vllm::capi::MakeEngineHandle(
       std::move(loaded),
       [](const std::vector<vllm::entrypoints::openai::ChatMessage>& messages,
@@ -267,6 +268,10 @@ vllm_engine* MakeSyntheticChatEngine() {
           if (m.content.has_value()) p += *m.content;
         return p;
       });
+}
+
+vllm_engine* MakeSyntheticChatEngine() {
+  return MakeSyntheticChatEngine(SyntheticParams());
 }
 
 vllm_sampling_params GreedyParams(int32_t max_tokens) {
@@ -1245,6 +1250,142 @@ TEST_CASE("capi: enable_jump_forward=on reaches the engine; default is inert (AB
   }
 }
 
+// ── ABI v19: the multimodal input limits (#607 wave L2) ────────────────────
+//
+// Ported from vllm/config/multimodal.py:78,81,212-236,321-336 and the two flags
+// that set them (vllm/engine/arg_utils.py:555-556,1276-1279,1691-1692) @
+// 5559679229bc. Two fields, and the load-bearing property is that they and the
+// SERVER FLAGS land on ONE config object — EngineParams::multimodal ->
+// LoadedEngine::mm_config() — so the two entry points cannot resolve a limit
+// differently.
+TEST_CASE("capi: multimodal input limits (ABI v19)") {
+  // The zero values keep a pre-v19 caller byte-identical: the flag off and NO
+  // limits configured, which resolves to 999 per modality (multimodal.py:331-333)
+  // — NOT 0. An empty map is "no limits", not "nothing allowed".
+  vllm_model_params def = vllm_model_params_default();
+  CHECK(def.language_model_only == 0);
+  CHECK(def.limit_mm_per_prompt == nullptr);
+
+  // A well-formed limit reaches model load (which then fails on the missing
+  // directory) rather than being rejected as a caller error.
+  vllm_model_params ok = vllm_model_params_default();
+  ok.model_path = "/nonexistent/vllm-cpp/model/dir";
+  ok.limit_mm_per_prompt = "{\"image\": 2, \"video\": 0}";
+  vllm_engine* eng = nullptr;
+  CHECK(vllm_engine_load(&ok, &eng) == VLLM_ERR_MODEL_LOAD);
+  CHECK(eng == nullptr);
+
+  // ...and so does the flag, which needs no value at all.
+  vllm_model_params lm_only = vllm_model_params_default();
+  lm_only.model_path = "/nonexistent/vllm-cpp/model/dir";
+  lm_only.language_model_only = 1;
+  vllm_engine* eng_lm = nullptr;
+  CHECK(vllm_engine_load(&lm_only, &eng_lm) == VLLM_ERR_MODEL_LOAD);
+
+  // Every upstream validation is a CALLER error here, reported before any model
+  // I/O — never a silent default to 999, which would leave the caller believing
+  // they set a limit they did not.
+  for (const char* bad_value :
+       {"{not json", "[1,2]", "{\"image\": \"two\"}", "{\"image\": -1}",
+        "{\"video\": {\"fps\": 2}}", "{\"video\": {\"num_frames\": 0}}"}) {
+    CAPTURE(bad_value);
+    vllm_model_params bad = vllm_model_params_default();
+    bad.model_path = "/nonexistent/vllm-cpp/model/dir";
+    bad.limit_mm_per_prompt = bad_value;
+    vllm_engine* eng_bad = reinterpret_cast<vllm_engine*>(0x1);
+    CHECK(vllm_engine_load(&bad, &eng_bad) == VLLM_ERR_INVALID_ARGUMENT);
+    CHECK(eng_bad == nullptr);
+  }
+  CHECK(std::string(vllm_last_error()).find("limit_mm_per_prompt") !=
+        std::string::npos);
+}
+
+TEST_CASE("capi: EngineParams::multimodal reaches LoadedEngine::mm_config()") {
+  // The hop the ABI field and the two server flags SHARE. Without it the flags
+  // would be recorded on a struct nobody reads, which is exactly the
+  // "accepted and inert" failure the limits wave exists to avoid.
+  const HfConfig c = MakeConfig();
+  {
+    EngineParams p = SyntheticParams();
+    LoadedEngine e(c, MakeWeights(c), BuildFixture(), p);
+    // Default: no limits configured => 999 per modality, the pre-L2 behaviour.
+    CHECK(e.mm_config().GetLimitPerPrompt("image") ==
+          vllm::kDefaultLimitPerPrompt);
+  }
+  {
+    EngineParams p = SyntheticParams();
+    p.multimodal.limit_per_prompt = {{"image", 2}};
+    LoadedEngine e(c, MakeWeights(c), BuildFixture(), p);
+    CHECK(e.mm_config().GetLimitPerPrompt("image") == 2);
+    // A modality nobody named keeps the default — an explicit limit for one
+    // modality is not a global switch.
+    CHECK(e.mm_config().GetLimitPerPrompt("video") ==
+          vllm::kDefaultLimitPerPrompt);
+  }
+  {
+    // The precedence that matters (multimodal.py:326-327): the flag is checked
+    // BEFORE the map, so an explicit non-zero entry does not survive it.
+    EngineParams p = SyntheticParams();
+    p.multimodal.language_model_only = true;
+    p.multimodal.limit_per_prompt = {{"image", 4}};
+    LoadedEngine e(c, MakeWeights(c), BuildFixture(), p);
+    CHECK(e.mm_config().GetLimitPerPrompt("image") == 0);
+    CHECK(e.mm_config().GetLimitPerPrompt("video") == 0);
+  }
+}
+
+// The PIN for the ABI v19 paragraph in include/vllm.h. That paragraph is a
+// permanent public contract, and the thing it must not claim is that setting
+// these fields makes a C-ABI call REFUSE a multimodal request. It does not:
+// ValidateNumItems is reached only behind the multimodal chat seam, and
+// server_main.cpp is the sole caller of set_multimodal_chat_fn — vllm_chat and
+// vllm_chat_stream never install one, so serving_chat.cpp's `if (mm_chat_fn_)`
+// gate is never taken on this path and no MultiModalInputs is ever built.
+//
+// What a C-ABI caller gets today, asserted rather than described: the request
+// PARSES (protocol.cpp does read `image_url` content parts), the image part is
+// DROPPED, its text siblings still form the prompt, and the answer is an
+// ordinary 200-shaped chat.completion — with language_model_only set, which on
+// the server path would be an HTTP 400. Wire the seam into the ABI without
+// revisiting that paragraph and this case goes red, which is the point.
+TEST_CASE("capi: the v19 limits are RECORDED on a C-ABI engine; there is no "
+          "multimodal request path to enforce them on") {
+  EngineParams p = SyntheticParams();
+  p.multimodal.language_model_only = true;  // every modality limit => 0
+  vllm_engine* eng = MakeSyntheticChatEngine(p);
+  REQUIRE(eng != nullptr);
+
+  // A real OpenAI multimodal chat body: one text part, one image_url part.
+  const char* request =
+      "{\"messages\":[{\"role\":\"user\",\"content\":["
+      "{\"type\":\"text\",\"text\":\"hello\"},"
+      "{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:image/png;base64,"
+      "iVBORw0KGgo=\"}}"
+      "]}],\"temperature\":0,\"max_tokens\":6}";
+  char* response = nullptr;
+  const vllm_status st = vllm_chat(eng, request, &response);
+  CAPTURE(std::string(vllm_last_error() == nullptr ? "" : vllm_last_error()));
+  REQUIRE(st == VLLM_OK);
+  REQUIRE(response != nullptr);
+  const json body = json::parse(response);
+  CAPTURE(std::string(response));
+  // NOT a refusal: served as text, exactly as if the image part were absent.
+  CHECK(body.at("object") == "chat.completion");
+  CHECK(body.at("choices").size() == 1);
+  CHECK(!body.at("choices").at(0).at("message").at("content")
+             .get<std::string>()
+             .empty());
+  CHECK(body.count("error") == 0);
+  vllm_string_free(response);
+  vllm_engine_free(eng);
+
+  // The limits ARE on the config all the same — recorded, just not consulted by
+  // anything this ABI can reach. That is the exact wording include/vllm.h owes.
+  const HfConfig c = MakeConfig();
+  LoadedEngine e(c, MakeWeights(c), BuildFixture(), p);
+  CHECK(e.mm_config().GetLimitPerPrompt("image") == 0);
+}
+
 TEST_CASE("capi: kv_transfer_config parses and validates the connector name") {
   // A well-formed config naming a REGISTERED connector passes the gate and
   // reaches model load.
@@ -1307,6 +1448,9 @@ TEST_CASE("capi: version and abi-version are exposed") {
   // test_dlopen compare against the same macro and move with it (the #121
   // lesson: an == floor moves with the macro and proves nothing).
   CHECK(vllm_abi_version() >= 16);
+  // The multimodal input limits are ABI v19; the speech/music slice
+  // (vllm_speech_* / vllm_synthesize) is ABI v20.
+  CHECK(vllm_abi_version() >= 20);
 }
 
 // ─── ABI v16: KV-pool sizing knobs (ROAD-V1-MEM M1) ──────────────────────────
@@ -2176,4 +2320,203 @@ TEST_CASE("capi v15: vllm_embed argument contract") {
   CHECK(out.values == nullptr);
   CHECK(out.n_embeddings == 0);
   vllm_engine_free(eng);
+}
+
+// ─── ABI v20: speech + music generation (W6 of #672) ─────────────────────────
+//
+// The C face of vllm::multimodal::SpeechEngine. These cases use a SYNTHETIC
+// MiniMax-Music3 component tree (configs only, zero-byte shard placeholders):
+// the engine resolves the checkpoint, parses all six configs and enforces the
+// dtype invariant before a weight byte is read, so its declared contract is
+// reachable without the 28.5 GB asset.
+
+namespace {
+
+void WriteCapiFile(const std::filesystem::path& path, const std::string& text) {
+  std::filesystem::create_directories(path.parent_path());
+  std::ofstream out(path, std::ios::binary);
+  REQUIRE(out.good());
+  out << text;
+}
+
+// The RELEASED checkpoint's own configs, so a drift in the shipped values is a
+// CI failure rather than a surprise on the box that has the weights.
+std::filesystem::path WriteSyntheticMusic3(const char* tag) {
+  const std::filesystem::path root =
+      std::filesystem::temp_directory_path() / (std::string("vllm_capi_music3_") + tag);
+  std::error_code ec;
+  std::filesystem::remove_all(root, ec);
+  WriteCapiFile(root / "modular_model_index.json",
+                R"({"_class_name": "MiniMaxMusic3ModularPipeline"})");
+  WriteCapiFile(root / "condition_encoder" / "config.json",
+                R"({"_class_name": "MiniMaxMusic3ConditionEncoder", "condition_hidden_dim": 4096,
+                    "input_hop_length": 960, "input_sampling_rate": 24000,
+                    "num_condition_layers": 8, "out_dim": 2048, "output_hop_length": 512,
+                    "output_sampling_rate": 44100})");
+  WriteCapiFile(root / "condition_encoder" / "diffusion_pytorch_model.safetensors", "");
+  WriteCapiFile(root / "vocoder" / "config.json",
+                R"({"_class_name": "MiniMaxMusic3Vocoder", "decoder_hidden_dim": 1536,
+                    "decoder_input_dim": 1024, "latent_channels": 128, "sampling_rate": 44100,
+                    "upsampling_ratios": [8, 8, 4, 2]})");
+  WriteCapiFile(root / "vocoder" / "diffusion_pytorch_model.safetensors", "");
+  WriteCapiFile(root / "rvq_depth_decoder" / "config.json",
+                R"({"_class_name": "MiniMaxMusic3RVQDepthDecoder", "audio_vocab_size": 1024,
+                    "hidden_size": 4096, "intermediate_size": 6144,
+                    "max_position_embeddings": 16, "num_attention_heads": 16,
+                    "num_codebooks": 8, "num_layers": 4})");
+  WriteCapiFile(root / "rvq_depth_decoder" / "diffusion_pytorch_model.safetensors", "");
+  WriteCapiFile(root / "transformer" / "config.json",
+                R"({"_class_name": "MiniMaxMusic3Transformer1DModel", "attention_head_dim": 64,
+                    "condition_dim": 2048, "ff_inner_dim": 8192, "fourier_embedding_dim": 256,
+                    "in_channels": 128, "num_attention_heads": 32, "num_layers": 36,
+                    "rotary_dim": 32})");
+  WriteCapiFile(root / "transformer" / "diffusion_pytorch_model.safetensors", "");
+  WriteCapiFile(root / "language_model" / "config.json",
+                R"({"architectures": ["Qwen3ForCausalLM"], "dtype": "bfloat16", "head_dim": 128,
+                    "hidden_size": 4096, "intermediate_size": 12288,
+                    "max_position_embeddings": 10240, "model_type": "qwen3",
+                    "num_attention_heads": 32, "num_hidden_layers": 36,
+                    "num_key_value_heads": 8, "rms_norm_eps": 1e-06,
+                    "rope_parameters": {"rope_theta": 1000000, "rope_type": "default"},
+                    "tie_word_embeddings": false, "vocab_size": 200000})");
+  WriteCapiFile(root / "language_model" / "model.safetensors", "");
+  WriteCapiFile(root / "scheduler" / "scheduler_config.json",
+                R"({"_class_name": "FlowMatchEulerDiscreteScheduler", "invert_sigmas": true,
+                    "num_train_timesteps": 1, "shift": 1.0, "shift_terminal": null,
+                    "stochastic_sampling": false, "time_shift_type": "exponential",
+                    "use_dynamic_shifting": false})");
+  WriteCapiFile(root / "tokenizer" / "tokenizer_config.json", "{}");
+  return root;
+}
+
+}  // namespace
+
+TEST_CASE("capi: v20 speech params zero-fill to the FAMILY's defaults") {
+  const vllm_speech_model_params mp = vllm_speech_model_params_default();
+  CHECK(mp.path == nullptr);
+  CHECK(mp.family == nullptr);  // NULL => detect by inspecting the artifact
+
+  const vllm_speech_params p = vllm_speech_params_default();
+  CHECK(p.text == nullptr);
+  CHECK(p.lyrics == nullptr);
+  CHECK(p.description == nullptr);
+  CHECK(p.reference_audio == nullptr);
+  CHECK(p.n_reference_audio == 0);
+  CHECK(p.audio_duration_s == doctest::Approx(0.0));
+  CHECK(p.num_inference_steps == 0);
+  CHECK(p.seed == 0);
+  // 0 IS A LEGAL guidance scale, so the "family decides" signal is the FLAG.
+  // A zeroed struct must therefore leave the flag clear rather than requesting
+  // guidance 0, which would select the unconditional branch.
+  CHECK(p.has_guidance_scale == 0);
+}
+
+TEST_CASE("capi: v20 speech handles refuse null arguments without touching *out") {
+  vllm_speech_engine* eng = nullptr;
+  CHECK(vllm_speech_engine_load(nullptr, &eng) == VLLM_ERR_INVALID_ARGUMENT);
+  CHECK(eng == nullptr);
+  vllm_speech_model_params empty = vllm_speech_model_params_default();
+  CHECK(vllm_speech_engine_load(&empty, &eng) == VLLM_ERR_INVALID_ARGUMENT);
+  CHECK(vllm_speech_engine_load(&empty, nullptr) == VLLM_ERR_INVALID_ARGUMENT);
+
+  // A NULL handle answers, rather than crashing, and answers the SAFE value.
+  CHECK(vllm_speech_engine_family(nullptr) == nullptr);
+  CHECK(vllm_speech_engine_sample_rate(nullptr) == 0);
+  CHECK(vllm_speech_engine_requires_reference_audio(nullptr) == 0);
+  vllm_speech_engine_free(nullptr);
+
+  vllm_speech_result out;
+  std::memset(&out, 0xAB, sizeof(out));
+  const vllm_speech_params params = vllm_speech_params_default();
+  CHECK(vllm_synthesize(nullptr, &params, &out) == VLLM_ERR_INVALID_ARGUMENT);
+  CHECK(out.samples == nullptr);  // zeroed even though it arrived poisoned
+  CHECK(out.wav == nullptr);
+  CHECK(out.n_samples == 0);
+  vllm_speech_result_free(nullptr);
+  vllm_speech_result_free(&out);
+}
+
+TEST_CASE("capi: v20 refuses a directory no speech family claims, NAMING what was tried") {
+  const std::filesystem::path root =
+      std::filesystem::temp_directory_path() / "vllm_capi_speech_unclaimed";
+  std::error_code ec;
+  std::filesystem::remove_all(root, ec);
+  std::filesystem::create_directories(root);
+  WriteCapiFile(root / "config.json", R"({"architectures": ["Qwen3ForCausalLM"]})");
+
+  vllm_speech_model_params mp = vllm_speech_model_params_default();
+  const std::string path = root.string();
+  mp.path = path.c_str();
+  vllm_speech_engine* eng = nullptr;
+  CHECK(vllm_speech_engine_load(&mp, &eng) == VLLM_ERR_MODEL_LOAD);
+  CHECK(eng == nullptr);
+  const std::string why = vllm_last_error();
+  // The refusal is EVIDENCE: it names every family that was tried and points a
+  // text checkpoint at the entry point that does serve it.
+  CHECK(why.find("minimax-music3") != std::string::npos);
+  CHECK(why.find("indextts2") != std::string::npos);
+  CHECK(why.find("vllm_engine_load") != std::string::npos);
+
+  // An UNREGISTERED family name is refused too, never treated as a hint.
+  mp.family = "sora-audio";
+  CHECK(vllm_speech_engine_load(&mp, &eng) == VLLM_ERR_MODEL_LOAD);
+  CHECK(std::string(vllm_last_error()).find("sora-audio") != std::string::npos);
+  std::filesystem::remove_all(root, ec);
+}
+
+TEST_CASE("capi: v20 a loaded Music3 handle answers 44100 Hz and NO reference clip") {
+  const std::filesystem::path root = WriteSyntheticMusic3("declared");
+  vllm_speech_model_params mp = vllm_speech_model_params_default();
+  const std::string path = root.string();
+  mp.path = path.c_str();
+  vllm_speech_engine* eng = nullptr;
+  REQUIRE_MESSAGE(vllm_speech_engine_load(&mp, &eng) == VLLM_OK, vllm_last_error());
+  REQUIRE(eng != nullptr);
+
+  // Detection resolved it without being told, which is what NULL family means.
+  CHECK(std::string(vllm_speech_engine_family(eng)) == "minimax-music3");
+  // The NATIVE rate (spec §1.1), not 22050 and not SGLang-Omni's 32000.
+  CHECK(vllm_speech_engine_sample_rate(eng) == 44100);
+  // 0 — Music3 conditions on text alone. This is the value that DIFFERS from a
+  // voice-cloning family's, so a pass proves the override was reached.
+  CHECK(vllm_speech_engine_requires_reference_audio(eng) == 0);
+
+  // A DECLARED family loads the same checkpoint identically.
+  vllm_speech_engine* declared = nullptr;
+  mp.family = "minimax-music3";
+  REQUIRE_MESSAGE(vllm_speech_engine_load(&mp, &declared) == VLLM_OK, vllm_last_error());
+  CHECK(std::string(vllm_speech_engine_family(declared)) == "minimax-music3");
+  vllm_speech_engine_free(declared);
+
+  // And the owed stage is a RUNTIME refusal naming the missing piece, not a
+  // silent zero-length waveform.
+  vllm_speech_params params = vllm_speech_params_default();
+  params.lyrics = "[Verse]\nMorning light\n";
+  params.description = "Genre: acoustic pop. BPM: 96.";
+  params.audio_duration_s = 12.5;   // differs from the family's 60.0
+  params.num_inference_steps = 4;   // differs from the family's 30
+  params.seed = 7;
+  vllm_speech_result out;
+  std::memset(&out, 0xAB, sizeof(out));
+  CHECK(vllm_synthesize(eng, &params, &out) == VLLM_ERR_RUNTIME);
+  CHECK(out.samples == nullptr);
+  CHECK(out.wav == nullptr);
+  CHECK(std::string(vllm_last_error()).find("Qwen3ForCausalLM") != std::string::npos);
+
+  // A field the family cannot honour is refused BY NAME rather than dropped.
+  vllm_speech_params with_text = params;
+  with_text.text = "sing something";
+  CHECK(vllm_synthesize(eng, &with_text, &out) == VLLM_ERR_RUNTIME);
+  CHECK(std::string(vllm_last_error()).find("`text` is not this family's input") !=
+        std::string::npos);
+
+  // n_reference_audio without a buffer is a CALLER error, caught before the
+  // family sees it.
+  vllm_speech_params bad_ref = params;
+  bad_ref.n_reference_audio = 4;
+  CHECK(vllm_synthesize(eng, &bad_ref, &out) == VLLM_ERR_INVALID_ARGUMENT);
+
+  vllm_speech_engine_free(eng);
+  std::error_code ec;
+  std::filesystem::remove_all(root, ec);
 }

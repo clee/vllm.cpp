@@ -140,6 +140,7 @@ token-for-token correctness against the pinned oracle.
 | InternLM2 dense (fused-`wqkv` interleaved split) | Correctness-complete, speed-pending | Token-exact 16/16 (internlm2-chat-1_8b): 12/16 strict + 4/16 bf16 near-tie (max gap 0.0 nats), 0 divergent; first InternLM model; ZERO new compute kernel (reuses the Llama dense forward; the only delta is a loader-side de-interleave of the fused `wqkv`, which packs q/k/v interleaved by KV-group) |
 | MiniMax-H3 (`MiniMaxH3DiTModel`, video+audio DIFFUSION) | **ABI v12 ONE SURFACE; device selector uses generic `DeviceType`; DSR 32.** t2va+fl2va COHERENT; bf16 shards STREAM | ref2va ckpt fidelity §8.12; encoder A/B §8.15; GB10 re-verify residual; CPU fold 6/137 (one queue + device provenance mutation-gated) |
 | LTX-2.5 (`LTX2VideoTransformer3DModel`, video+audio DIFFUSION) | **L1-L9c landed (#435).** 21.00B / 48 blocks. `VideoEngine` seam + ABI **v18**, DiT forward (CPU f32 parity, bf16 device-resident), Gemma-4 TE, both VAEs, the embeddings connector, pipeline, NVFP4/FP8 arms, `/v1/videos` | A shipped 21.00B FP8 DiT runs device-resident on GB10. The 320x192/25f frames ARE a scene, register-conditioned. L13 encodes a typed prompt, FIXTURE-gated; a prompted render is OWED. Speed and oracle parity `PENDING` |
+| MiniMax-Music3 (`MiniMaxMusic3ForConditionalGeneration`, text-to-MUSIC) | **`ACTIVE`: W0, W1, W2/W3 and W4/W5 landed (#672).** First row whose oracle is not vLLM: the OPEN diffusers PR #14456 `c6da9936`, which generates audio here | W2's LM forward, W6 and W7 owed. Loader 1413/1413, AR and acoustic halves gated on the real checkpoint; no speed number exists or is claimed |
 | Command-R / Cohere dense (`CohereForCausalLM`) | Implemented, gate-blocked | ZERO-new-kernel port grounded in vLLM `commandr.py`: weight-only Cohere LayerNorm + GPT-J full-width RoPE + PARALLEL residual + `logit_scale` + tied embeddings, all reuse; compiles, links, self-registers. No SACRED gate yet (real checkpoints HF-gated, ungated ones tiny-random, GPU box disk-full); oracle run-verified at W0. See docs/BENCHMARKS.md |
 | Phi-1 / Phi-2 dense (`PhiForCausalLM`, parallel residual) | Correctness-complete, speed-pending | Token-exact 16/16 (microsoft/phi-2): 9/16 strict + 7/16 bf16 near-ties (max gap 0.25 nats), 0 forward-divergent; the OLDER Microsoft Phi arch, DISTINCT from Phi-3/Phi-4; ZERO new compute kernel (GPT-J parallel residual, LayerNorm-with-bias, biased qkv/dense, partial NeoX rope 32/80, non-gated NewGELU MLP reusing `vt::GeluTanh`, untied biased lm_head); F16 dtype-aware loader |
 | MiniCPM dense (`MiniCPMForCausalLM`, three scalars) | Correctness-complete, speed-pending | Token-exact 16/16 (openbmb/MiniCPM-2B-sft-bf16): 10/16 strict + 6/16 bf16 near-ties (max gap 0.0 nats), 0 forward-divergent; first OpenBMB MiniCPM model; ZERO new compute kernel (the Llama/Granite dense forward plus three scalars: scale_emb, scale_depth/sqrt(layers) residual, dim_model_base logit scaling), tied lm_head; `.bin`-only weights converted to safetensors via trusted torch |
@@ -162,7 +163,7 @@ token-for-token correctness against the pinned oracle.
 | KV-cache events (for external routers) | Built, off by default; generation and payload gated, live ZMQ transport deferred | Block store/remove/clear events (`BlockStored`/`BlockRemoved`/`AllBlocksCleared`) emitted at the prefix-cache sites when enabled, with a `msgpack` payload byte-identical to vLLM's `msgspec` encoding. Behind a publisher seam faithful to `--kv-events-config`; the live ZMQ transport is not wired yet. Off by default, so the prefix-cache path is byte-identical. |
 | Sampling | Supported | Greedy, temperature, top-k/p, min-p, presence/frequency/repetition penalties, seed, stop/stop_token_ids, min_tokens, logit_bias, allowed_token_ids, bad_words, in vLLM's exact order. Custom logits processors are supported through a per-request C-ABI callback (`vllm_logits_processor`, ABI v8), absent by default (byte-identical). Sample logprobs are emitted end-to-end for `/v1/completions` and `/v1/chat/completions` (`logprobs`/`top_logprobs`). A request may instead score an EXPLICIT set of vocab ids (`logprob_token_ids`, generative scoring): exactly those ids plus the sampled token, whose rank is still over the full vocab, and no full-vocab sort — library surface only, the OpenAI request field is not wired yet. Parallel sampling (`n>1`) is supported, returned as n indexed `choices` (`n==1` byte-identical). Beam search is supported through the `BeamSearch` driver — an outer engine loop that scores beams by cumulative logprob with a length penalty and returns the top `beam_width` sequences (deterministic, token-exact vs vLLM's algorithm); it is wired on the OpenAI `use_beam_search` request field for `/v1/completions` and `/v1/chat/completions` over BOTH the synchronous engine AND the production AsyncLLM HTTP server (an async `BeamSearchAsync` driver, token-identical); the C-ABI beam params and streaming beam are not exposed yet; per-beam concurrent stepping is a named residual — beams are stepped sequentially). `best_of` is supported on both endpoints (`best_of==n` is the default no-op). `prompt_logprobs` is computed and returned on `RequestOutput`; the OpenAI `echo` serialization is not wired yet. All four `logprobs_mode` values work (`processed_*` shows the top-k mask); in-library only. |
 | Structured output | Supported (subset), engine-enforced; xgrammar backend W1 (CPU, not yet production-wired) | JSON schema, JSON object, regex, choice, GBNF grammar. Constrained decoding runs in the production engine (native grammar backend, per-step logits bitmask) and is reachable from OpenAI `response_format` and the C ABI (ABI v2 `structured_*` fields). A second, xgrammar-faithful backend (`XgrammarStructuredOutputBackend`, vLLM's default `auto`) is built behind the same seam: it reuses the native pushdown-FSM/trie matcher (xgrammar's own algorithm) and adds the xgrammar JSON-schema→EBNF converter that preserves property declaration order + `any_whitespace` + the `basic_*` grammar, closing the key-order/whitespace/exotic-schema parity gap. CPU-gated (`test_backend_xgrammar` 6/6, RED-first); production wiring + the `auto` fallback + GPU oracle parity are the named residuals (see `.agents/specs/xgrammar-backend.md`) |
-| Tool-call parsing (`TOOLS-PARSER-BREADTH`, PARTIAL) | 37 parser families / 41 accepted names, streaming | 39 of upstream's 44 registered names at the pin, plus 2 that upstream's registry does not carry there (`qwen3`, our alias for the Hermes-JSON Qwen dialect, and `muse_glimmer`) = 41 accepted names; pure-text parsers ported 1:1, the engine-backed families reimplemented from their wire formats. FIVE upstream names are NOT ported, and only ONE of them is a port we could make from vLLM source: `inkling`, a ParserEngine adapter. `minimax_m3` is backed by upstream's Rust crate; `openai` (`GptOssToolParser`) is a declared Harmony stub that raises on both methods; `cohere_command3` and `cohere_command4` are shims over the out-of-tree `cohere_melody` package. So for four of the five there is no grammar in vLLM source to mirror — tracked as W1/W2 in `.agents/specs/tool-parser-breadth.md`, which records the decision each one owes. Upstream's shared `ToolParserTestConfig` harness is also unported, so the per-parser test floor is set file by file rather than enforced (W3). Selection via `--tool-call-parser` (server), `tool_parser` (C ABI), or template auto-detection over a 27-row ordered marker table; native-syntax forced tool_choice where expressible. Tables: docs/BENCHMARKS.md |
+| Tool-call parsing (`TOOLS-PARSER-BREADTH`, PARTIAL) | 38 parser families / 42 accepted names, streaming | 40 of upstream's 44 registered names at the pin, plus 2 that upstream's registry does not carry there (`qwen3`, our alias for the Hermes-JSON Qwen dialect, and `muse_glimmer`) = 42 accepted names; pure-text parsers ported 1:1, the engine-backed families reimplemented from their wire formats. `inkling` landed 2026-08-13 (W1) as a `ParserEngineToolAdapter` over the already-ported Inkling ParserEngine — the only one of the five upstream-only names that was a port from vLLM source at all. FOUR remain NOT ported, and none of them has its GRAMMAR in vLLM source: `minimax_m3` is backed by upstream's Rust crate; `openai` (`GptOssToolParser`) is a stub that raises on both methods and delegates to `vllm/parser/harmony.py`, which IS vLLM source (and has its own test) but itself wraps the out-of-tree `openai_harmony` package; `cohere_command3` and `cohere_command4` are shims over the out-of-tree `cohere_melody` package — tracked as W1-remaining/W2 in `.agents/specs/tool-parser-breadth.md`, which records the decision each one owes. Upstream's shared `ToolParserTestConfig` harness is also unported, so the per-parser test floor is set file by file rather than enforced (W3). Selection via `--tool-call-parser` (server), `tool_parser` (C ABI), or template auto-detection over a 27-row ordered marker table (`inkling` is EXPLICIT-ONLY: it has no jinja chat template upstream, so there is nothing to sniff); native-syntax forced tool_choice where expressible. Tables: docs/BENCHMARKS.md |
 | Reasoning parsing (`SAMPLE-REASONING`, ACTIVE, partial coverage) | 12 names, streaming | think_auto (auto-detect default: content unless markers appear), deepseek_r1, deepseek_v3 (passthrough) / holo2 (thinking→R1), mistral ([THINK]), minimax_m2 (+append_think), step3, olmo3, muse_glimmer, and qwen3 / mimo - reasoning split engine-side BEFORE tool parsing, streamed as `reasoning` deltas in the chat chunks. qwen3+mimo are the first ENGINE-BACKED adapter (one reasoning face over the shared `src/vllm/parser/engine/` parser, so `<tool_call>` ends reasoning with no `</think>`); the rest are text parsers. Coverage: 12 of upstream's ~28 registered names (remaining engine-backed adapters + text families tracked as W3/W2 in specs/reasoning-parsers.md); each ported parser doctest-gated vs its tests/reasoning case |
 | Unified streaming parser engine | Core, assembly, serving-SSE dispatch landed, gated; all 10 engine-backed families ported (family parity closed); JSON-schema tool-arg type coercion landed | The vLLM 0.26 declarative `parser/engine/` (shared state machine plus all 10 configs: qwen3, seed_oss, kimi_k2, minimax_m2, glm47_moe, deepseek_v4/v32, nemotron_v3, gemma4, inkling) and assembly layer, gated field-for-field vs vLLM 0.26. An engine-backed `--tool-call-parser` name drives the live chat SSE chunks, off by default. When a request's tools declare typed parameters, the assembled tool-call arguments are coerced to the declared JSON types (int/number/bool/string/array/null) 1:1 with vLLM `_fix_arg_types`, in both streaming and one-shot; no schema means the arguments pass through as strings unchanged. Details: .agents/specs/parser-assembly-c8.md |
 | OpenAI server | Subset; v0.0.2 publishes eight server bundles; Windows v0.0.3-pre.1 pending | Completion/chat (SSE), models, health/version/ping, metrics, tokenize/detokenize, tokenizer/server info, prefix-cache reset, abort, and Sora-shaped video creation/content. Tokenizer info and abort are flag-gated; cache reset lacks live async backing. Details: docs/USAGE.md |
@@ -525,48 +526,45 @@ token, 17 steps instead of 18), and our acceptance equals its modal value
 (48.6%, 4.94 tokens/step). Per-step the engines are aligned (30.4 vs ~30.1 ms,
 34.7 vs ~34.5). Under a LOW-NOISE harness (clocks pinned at 1800
 MHz, 30 reps, drift bracketed at -0.088%, the oracle's non-modal draws excluded)
-the code cell is **0.975x with NON-OVERLAPPING distributions** — a real gap, not
-noise, and the earlier "within resolution" reading was too generous. Ours slowed
+that session's code cell measured **0.975x with NON-OVERLAPPING
+distributions** — a real gap, not noise, and the earlier "within resolution"
+reading was too generous. It is one of four within-session ratios, listed
+below. Ours slowed
 more than the oracle when the clock was pinned, so the residual is
-SM-clock-sensitive work. PAIRED profiling localises it exactly: the SAME
-`marlin_moe_wna16::Marlin` kernel, the SAME 1520 launches, ours 249.22 ms vs
-upstream 230.39 ms -- **8.2% slower inside one kernel**, which at ~34% of wall is
-2.8% end-to-end and accounts for the whole measured 2.5%. Not an algorithm difference, and not the launch
-geometry either: the full template arguments match, `determine_exec_config` is
-byte-identical to the pinned upstream copy, and every OTHER kernel matches to
-0.2%. The inputs match too (scale bytes per expert,
-256-byte alignment, cudaMalloc residency), and the work counts were MEASURED:
-upstream loops 4.4% MORE blocks per launch (40.6 vs 38.9) and is still faster, so
-routing is refuted and normalising by work makes our deficit bigger -- **4.21 vs
-3.73 us per block, ~12.8% slower per unit of work**. Every source-level explanation is now
-eliminated -- kernel source, template instantiation, grid config, block size,
-shared-memory budget, reduction flags, scale layout, alignment, residency, CUDA
-toolkit (13.0 both) and arch all match -- and `ncu` plus cuobjdump then showed the
-COMPILED KERNELS ARE EQUIVALENT (94 registers and 3664 SASS instructions on both,
-upstream running its family-compatible sm_120 cubin against our sm_121a). The
-residual is therefore runtime and is now ATTRIBUTED: the kernel is DRAM-bound
-(L2 hit 9.5%) and we sustain **186.6 GB/s against upstream's 210.7**, a 12.9%
-effective-bandwidth gap that IS the whole per-unit-work difference. Weight
-residency is already staged correctly (cudaMalloc + one upload), and the slab itself is byte-for-byte the
-same size and stride as upstream's tensor (268 MB, no padding), so the cause is
-memory-system behaviour that no allocation change we can name would alter; upstream's ncu counters would settle it but its engine will not initialise under
-ncu in either replay mode. A C_tmp over-allocation (15-30 MB vs upstream's
-3.15 MB) was found and fixed, but an in-session A/B shows it is perf-NEUTRAL
-(+0.03%) -- an apparent +2.9% was machine drift, since GB10 cannot lock memory
-clocks. The ratio has now been measured WITHIN a single session three times --
-0.9757, 0.9646 and (ours->oracle->ours at free clocks, drift -0.89%) 0.9569 --
-so it is **~0.966 +/- 0.01, consistently below 1.0**, while the absolute numbers
-move up to 5% BETWEEN sessions for the same binary. Storage was raised as a
-possible distortion and is refuted: the weights are on local NVMe (no NAS mount
-exists on the box), a run reads 22.06 GB once at load, decode-time RSS is 4.8 GB
-because the mapping is released after upload, and 8 warm reps hold a 0.5%
-spread -- decode touches no storage. (That NVMe is 98% full, 76 GB free, which
-is its own operational risk given ENOSPC has previously produced a green report
-over a gate that never ran.) Editing
-the kernel, its launch config, layout or flags is NOT indicated: all are proven
-identical. (The repack kernels that appear to take 40% of a long run are
-LOAD-TIME.) NOT parity. The Gemma4 `1 + N` layout is coded and unit-tested but has
-never run on real weights.
+SM-clock-sensitive work. PAIRED profiling appeared to localise the residual to
+`marlin_moe_wna16::Marlin` (ours 249.22 ms vs upstream 230.39 ms over the same
+1520 launches), and every source-level explanation was eliminated -- kernel
+source, template instantiation, grid, block size, shared memory, flags, scale
+layout, alignment, residency, toolkit, arch -- with ncu and cuobjdump showing
+the compiled kernels EQUIVALENT (94 registers, 3664 SASS instructions on
+both). THAT LOCALISATION IS REFUTED. `scripts/marlin-moe-standalone.py` and
+`benchmarks/marlin_moe_standalone.cpp` drive each engine's own kernel outside
+its engine -- which is also what finally lets ncu attach to upstream,
+previously recorded as impossible in both replay modes -- and at matched work
+the two are indistinguishable: over 12 interleaved paired points ours averages
+5.3187 us/block against upstream's 5.3330, ratio 0.9973, sign flipping between
+runs, inside one standard deviation. The in-situ 8.2% therefore describes the
+RUNS, not the kernel, and so do the 12.8%-per-unit-work and 186.6-vs-210.7
+GB/s figures derived from it -- the latter also divided GRAPHED times by
+EAGER-mode block counts, so numerator and denominator came from different
+execution modes. END-TO-END, valid within-session paired ratios are 0.9757,
+0.9646, 0.9569 and 0.9889 (a fifth run was REJECTED on a -2.13% drift gate): a
+spread of 0.957-0.989 ACROSS BOOTS, with no single value being the ratio and
+the gap not resolved better than 1-4% on this hardware. An earlier claim here
+that the gap was 1.1% rather than 3.4% is WITHDRAWN: decomposed, our arm moved
++1.10% between those sessions while the ORACLE denominator moved -2.17%, so
+most of it was the oracle's boot state, and differencing ratios across boots
+is what this page forbids elsewhere. The warm-up arm does demonstrably remove
+a 6.6% WITHIN-RUN drift, which makes a run internally valid without moving the
+ratio. Standing traps: dram__bytes.sum reads n/a on GB10, so ncu's Memory
+Throughput % excludes DRAM traffic and is not a bandwidth utilisation; the GPU
+lock is $HOME/gpu.lock, and absolute timings from runs that took /tmp/gpu.lock
+ran unserialised and are LOWER bounds on achievable bandwidth, so a clean re-
+take can only raise the plateau; any MoE comparison that lets routing vary
+between arms measures the draw, not the change; and both blocks AND distinct
+experts must be controlled, since cost per distinct expert spans 4.47-7.50 us
+and is flat only above ~40 experts. NOT parity, and the row stays open.
+
 Multimodal
 (image/video/audio) is correctness-complete and its OpenAI-server wiring has
 landed all three CPU bricks (content-part parse + processor routing, the
@@ -697,6 +695,52 @@ the Olmo-3 interleaved sliding-window path has since landed and runs, but is
 oracle-blocked for a gate (see the capability table above).
 
 ### Frontier and hardware-blocked families
+
+**Qwen3.5 text-only arms (`Qwen3_5ForCausalLM`, `Qwen3_5MoeForCausalLM`) —
+REGISTERED 2026-08-12, RUN GATE OWED (#490).** An ahead-of-pin forward port of
+upstream PR vllm#50210 (`ad5d29db7`), which registers both arms against the same
+`qwen3_5` module our gated `ForConditionalGeneration` wrappers already use. Two
+additive `REGISTER_VLLM_MODEL` lines against the EXISTING dense and MoE
+factories: no forward, no KV-cache spec, no loader fork.
+
+The other half is ONE backbone weight-namespace decision per checkpoint:
+`model.` for a text-only arm, `model.language_model.` for the wrappers, and a
+MIXED index refused rather than half-bound. `Qwen/Qwen3.8-2.4T-A95B` declares
+`Qwen3_5MoeForCausalLM` / `qwen3_5_moe_text` and is the token-exact
+Qwen3.6-35B-A3B GDN-hybrid MoE backbone at larger scale, every knob
+config-driven, with the BACKBONE weight names identical modulo that prefix.
+
+**CORRECTED 2026-08-12: the prefix is NOT the only thing between this code and
+`Qwen/Qwen3.8-2.4T-A95B`, and the first two commits of this row said it was.**
+The MoE loader reads only PER-EXPERT NVFP4 routed experts (`LoadMoeExpertsInto`
+-> `LoadNvfp4Raw`: `U8` weight + `F8_E4M3` `.weight_scale` + `.weight_scale_2`),
+with no stacked and no bf16 branch. The published indices (read live 2026-08-12)
+have neither: `Qwen/Qwen3.8-2.4T-A95B` carries 93x `mlp.experts.gate_up_proj` +
+93x `.down_proj` (3-D STACKED) and **zero** `weight_scale` / `input_scale`
+tensors, and `Qwen/Qwen3.6-35B-A3B` is the same under the VL prefix — our gated
+35B row reads the REQUANTIZED `nvidia/Qwen3.6-35B-A3B-NVFP4`.
+
+So the **bf16 / 3-D-stacked MoE routed-expert arm is NOT implemented and is
+OWED**, and a published MoE checkpoint is now REFUSED by a message naming it
+rather than dying on `expected U8 for lm_head.weight`. The DENSE arm is not
+affected: `LoadQwen3_5Dense` routes BF16 vs FP8 vs NVFP4 per projection by
+tensor presence, so it may genuinely load a flat bf16 checkpoint. That asymmetry
+is the record.
+
+What is claimed is dispatch, flat-config resolution, namespace resolution and
+the refusal, gated by `tests/vllm/models/test_qwen3_8_text_only.cpp`, with
+27B/35B/Coder inert and parity goldens md5-unchanged. **What is NOT claimed is a
+single generated token.** 2.4T bf16 is ~4.8 TB and the released FP8 variant
+~2.4 TB against 128 GB of unified memory, and no smaller Qwen3.8 sibling exists,
+so there is no token-exact oracle run and no speed number.
+
+Both rows therefore stay `PARTIAL`. The owed **DENSE** run gate closes when a
+`Qwen3_5ForCausalLM` checkpoint that fits GB10 appears. The **MoE** run gate
+needs more: a fitting *published* (bf16/stacked) MoE checkpoint would still be
+refused at load, so it needs a fitting checkpoint whose routed experts are
+per-expert NVFP4, or the owed stacked/bf16 arm implemented first. Also NOT
+implemented and recorded as owed: that stacked/bf16 MoE expert arm, and the MTP
+and GGUF arms for 3.8. This does not advance the parity pin.
 
 Larger DeepSeek / GLM / MiniMax / Gemma-4 variants are recorded as
 **hardware-blocked** (they do not fit 119 GiB of unified memory on this box) or
@@ -1456,6 +1500,8 @@ Gemma4/ROCm env split: public `VT_GEMMA4_EXPERT_VRAM_MB` caps expert LRU in posi
 
 `BACKEND-TENSTORRENT`: `ACTIVE`: OPT-125m strict 6/6 on Blackhole; 17 ops. Qwen3 is wired; its full 16x16 gate and speed remain pending.
 
+`BACKEND-TENSTORRENT-MISTRAL`: `ACTIVE`: Mistral-7B-v0.3 gated on a Blackhole P150, 16/16 prompts (12/16 strict token-exact, 4/16 inside the near-tie band, 0 forward-divergent), max gap 0.062 nats. `MistralForCausalLM` is allowlisted by exact match, so `Mistral3ForConditionalGeneration` (#387, unported) still falls through. Correctness only -- no speed claim.
+
 **Platform SELECTION is the one non-additive site, and is now gated.** A
 platform missing from `CurrentPlatform()`'s hardcoded walk registers and answers
 correctly but is NEVER selected, with no compiler diagnostic. `test_platform`
@@ -1733,8 +1779,16 @@ runtime-verified yet.
   validation still fires — `--enable-auto-tool-choice` with
   `--tool-call-parser none` is refused, mirroring
   `vllm/entrypoints/openai/cli_args.py:395`. Not yet reviewed or gate-rerun by
-  the operator; `--language-model-only` (#607) is a real capability gap and is
-  deliberately NOT in this list.
+  the operator; `--language-model-only` was excluded from this list because it
+  is a real capability, not a no-op — and as of 2026-08-14 (#607 wave L2) it is
+  **implemented** rather than accepted-and-inert, alongside
+  `--limit-mm-per-prompt`. Both set `vllm::MultiModalConfig` and are ENFORCED: a
+  server started with `--language-model-only` answers a multimodal request with
+  HTTP 400 `At most 0 image(s) may be provided in one prompt.`, which is what
+  upstream's flag does. The 43 recipes that pass it now reach model load. It
+  does **not** free memory yet — nothing gates vision-tower construction on the
+  limits (wave L3, owed with a measured RSS reduction), so the flag must not be
+  described as a VRAM knob until that lands.
 - **Surface coverage (ONE SURFACE, `ARCH-ONE-SURFACE`,
   `.agents/specs/surface-coverage-2026-08-07.md`).** 21/30 text archs
   on-framework; the recurring defect (a capability in a per-model CLI) is in seven

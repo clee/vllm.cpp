@@ -63,6 +63,7 @@
 #include "vllm.h"
 #include "vllm/config/device.h"
 #include "vllm/config/kv_transfer.h"
+#include "vllm/config/multimodal.h"
 #include "vllm/config/scheduler.h"
 #include "vllm/entrypoints/chat_template.h"
 #include "vllm/entrypoints/model_loader.h"
@@ -86,6 +87,10 @@
 #include "vllm/multimodal/minimax_h3_video.h"
 #include "vllm/multimodal/parakeet_transcription.h"
 #include "vllm/multimodal/video_engine.h"
+#include "vllm/multimodal/speech_engine.h"
+#include "vllm/model_executor/models/minimax_music3_speech.h"
+#include "vllm/entrypoints/openai/speech_api.h"
+#include "vllm/model_executor/models/minimax_h3.h"
 #include "vllm/tokenizer/tokenizer.h"
 #include "vllm/version.h"
 #include "vllm/v1/core/kv_cache_utils.h"
@@ -200,6 +205,17 @@ struct Args {
   // and what every pre-L9B invocation gets. See the --video-family block below
   // for why it now exists.
   std::string video_family;
+  // ── Speech + music generation (W6 of #672). OPT-IN: absent =>
+  // /v1/audio/speech is never registered and the server answers 404 exactly as
+  // it did before this flag existed. ────────────────────────────────────────
+  // The checkpoint SET directory (MiniMax-Music3 ships six component
+  // directories beside a modular_model_index.json).
+  std::string speech_model;
+  // The family to load. EMPTY keeps DETECTION, which inspects the artifact; an
+  // unregistered name is refused at ParseArgs naming what is registered, and is
+  // never treated as a hint, because the wrong family would not fail — it would
+  // render noise.
+  std::string speech_family;
   // FAMILY-SPECIFIC load knobs, `--video-extra KEY=VALUE`, repeatable. Pinning a
   // family is useless if that family's required load knobs are unreachable:
   // LTX-2.5 cannot load without `dit_config_path` (the shipped FP8 DiT carries
@@ -269,6 +285,17 @@ struct Args {
   // JSON object vLLM takes (e.g. '{"method":"mtp","num_speculative_tokens":1}').
   // Empty (default) == no speculation == the inert production path (SPEC-MTP I5d).
   std::string speculative_config;
+  // ── Multimodal input limits (ENG-MM-INPUT-PIPELINE wave L2, #607) ─────────
+  // --language-model-only (arg_utils.py:555,1276,1691) and --limit-mm-per-prompt
+  // (arg_utils.py:556,1279,1692), the two flags 43 of the 157 official recipes
+  // need. They are sugar over vllm::MultiModalConfig, which is the mechanism:
+  // the flag sets every modality limit to 0, and the REFUSAL those zeros produce
+  // (BaseProcessingInfo::ValidateNumItems, #607 L1) is the observable effect.
+  //
+  // Defaults reproduce today's behaviour exactly: language_model_only false and
+  // an empty map resolve to the 999-per-modality default, so a server started
+  // without either flag refuses nothing it used to serve.
+  vllm::MultiModalConfig multimodal;
 };
 
 // ── Accepted-and-inert serve arguments (SERVE-RECIPE-ARGS, #606) ────────────
@@ -360,6 +387,10 @@ const InertArg* FindAcceptedInertArg(const std::string& flag) {
          "               [--reasoning-parser <name>|auto|none]\n"
          "               [--kv-transfer-config '<json>']\n"
          "               [--speculative-config '<json>']\n"
+         "               [--[no-]language-model-only]\n"
+         "               [--limit-mm-per-prompt '<json>']\n"
+         "               [--speech-model <checkpoint-dir>] "
+         "[--speech-family <name>]\n"
          "               [--version]\n"
          "  accepted for published-recipe compatibility, NO effect: "
          "--enable-auto-tool-choice, --trust-remote-code\n";
@@ -444,6 +475,10 @@ Args ParseArgs(int argc, char** argv) {
       a.video_partition = NextArg(argc, argv, i, argv[0]);
     } else if (flag == "--video-family") {
       a.video_family = NextArg(argc, argv, i, argv[0]);
+    } else if (flag == "--speech-model") {
+      a.speech_model = NextArg(argc, argv, i, argv[0]);
+    } else if (flag == "--speech-family") {
+      a.speech_family = NextArg(argc, argv, i, argv[0]);
     } else if (flag == "--video-extra") {
       const std::string kv = NextArg(argc, argv, i, argv[0]);
       const std::string::size_type eq = kv.find('=');
@@ -524,6 +559,53 @@ Args ParseArgs(int argc, char** argv) {
       a.kv_transfer_config = NextArg(argc, argv, i, argv[0]);
     } else if (flag == "--speculative-config") {
       a.speculative_config = NextArg(argc, argv, i, argv[0]);
+    } else if (flag == "--language-model-only" ||
+               flag == "--no-language-model-only") {
+      // arg_utils.py:1276 over a bool field, which _compute_kwargs gives
+      // argparse.BooleanOptionalAction (arg_utils.py:346-348) — so upstream
+      // accepts BOTH spellings and the negative one is the default. Mirrored,
+      // rather than accepting only the positive: a recipe that switches the flag
+      // off explicitly must not die on an unknown argument.
+      a.multimodal.language_model_only = flag == "--language-model-only";
+    } else if (flag == "--limit-mm-per-prompt") {
+      // arg_utils.py:1279 over a dict field => type=parse_type(json.loads)
+      // (arg_utils.py:379-381 — the plain-dict branch, NOT the
+      // `union_dict_and_str` one at :374-378, which needs a `str` arm or a
+      // non-builtin hint that `dict[str, BaseDummyOptions]` does not have):
+      // the value is a JSON OBJECT. Parsed HERE, before
+      // the multi-GB model load, for the same reason the parser dialects are:
+      // a malformed limit costs a second rather than a full load, and it is
+      // REFUSED rather than defaulted — a typo that silently became 999 is a
+      // limit that is not there.
+      //
+      // NAMED RESIDUAL, and it is not this flag's: upstream's dotted spelling
+      // (`--limit-mm-per-prompt.image 2`) is a FlexibleArgumentParser feature
+      // that rewrites any dotted key into the JSON form before argparse sees it
+      // (argparse_utils.py:389-425). It applies equally to --kv-transfer-config
+      // and --speculative-config, which this server also takes as JSON only, so
+      // adding it for one flag would be the bespoke path. It belongs to a parser
+      // brick covering all three.
+      const std::string value = NextArg(argc, argv, i, argv[0]);
+      std::vector<std::string> ignored_options;
+      try {
+        a.multimodal.limit_per_prompt =
+            vllm::ParseLimitMmPerPromptJson(value, &ignored_options);
+      } catch (const std::exception& e) {
+        std::cerr << "server: --limit-mm-per-prompt: " << e.what() << "\n";
+        Usage(argv[0], 2);
+      }
+      // Accepting is ANNOUNCED (the kAcceptedInertArgs rule, applied to a
+      // partially-inert VALUE): the dummy-profiling options are validated and
+      // then dropped, so a reader learns `num_frames` did nothing here instead
+      // of inferring that it worked.
+      for (const std::string& key : ignored_options) {
+        std::cerr << "server: --limit-mm-per-prompt " << key
+                  << " accepted and IGNORED: only the modality's count is read "
+                     "here. A key upstream DECLARES sizes dummy inputs for "
+                     "memory profiling, a surface this engine does not have; a "
+                     "key it does not declare is one its BaseDummyOptions "
+                     "fallback drops too\n";
+      }
     } else if (flag == "--version") {
       std::cout << "vllm.cpp " << vllm::Version()
                 << " c-abi=" << VLLM_ABI_VERSION << "\n";
@@ -594,6 +676,23 @@ Args ParseArgs(int argc, char** argv) {
       Usage(argv[0], 2);
     }
   }
+  if (!a.speech_family.empty()) {
+    vllm::multimodal::SpeechRegistry& registry = vllm::multimodal::GlobalSpeechRegistry();
+    vllm::models::music3::RegisterBuiltinSpeechFamilies(registry);
+    const std::vector<std::string> registered = registry.families();
+    if (std::find(registered.begin(), registered.end(), a.speech_family) == registered.end()) {
+      std::cerr << "server: --speech-family '" << a.speech_family
+                << "' is not a registered speech family. Registered families:";
+      for (const std::string& name : registered) std::cerr << " " << name;
+      std::cerr << "\n";
+      Usage(argv[0], 2);
+    }
+  }
+  if (!a.speech_family.empty() && a.speech_model.empty()) {
+    std::cerr << "server: --speech-family names a family but --speech-model names no "
+                 "checkpoint; there is nothing to load it from\n";
+    Usage(argv[0], 2);
+  }
   // Mirrors vllm/entrypoints/openai/cli_args.py:395 — upstream raises
   //   TypeError("Error: --enable-auto-tool-choice requires --tool-call-parser")
   // when the flag is set and `args.tool_call_parser` is falsy. Upstream's falsy
@@ -654,6 +753,37 @@ int VllmServerMain(int argc, char** argv) {
                 << " max_log_len=" << log_cfg.max_log_len
                 << " debug_stages=" << (log_cfg.debug_stages ? "ON" : "OFF")
                 << "\n";
+    }
+
+    // The RESOLVED multimodal limits, printed before the model load so the
+    // startup log records what the two flags actually produced rather than what
+    // was typed. GetLimitPerPrompt is the single accessor every consumer asks
+    // (multimodal.py:321-336), so printing through it is what makes the flag's
+    // PRECEDENCE visible: --language-model-only alongside an explicit
+    // `image=4` prints image=0, because the flag is checked before the map.
+    {
+      std::cerr << "server: multimodal limits language-model-only="
+                << (args.multimodal.language_model_only ? "ON" : "OFF");
+      // Print every modality the user named, plus the ones the flag zeroes even
+      // though nobody named them, so "--language-model-only" is not a line that
+      // says only "ON" with no consequence next to it.
+      std::vector<std::string> shown;
+      for (const auto& [modality, unused] : args.multimodal.limit_per_prompt) {
+        (void)unused;
+        shown.push_back(modality);
+      }
+      if (shown.empty() && args.multimodal.language_model_only) {
+        shown = {"audio", "image", "video"};
+      }
+      for (const std::string& modality : shown) {
+        std::cerr << " " << modality << "="
+                  << args.multimodal.GetLimitPerPrompt(modality);
+      }
+      if (shown.empty()) {
+        std::cerr << " (no per-modality limit set; default "
+                  << vllm::kDefaultLimitPerPrompt << ")";
+      }
+      std::cerr << "\n";
     }
 
     const fs::path dir = NativeUtf8Path(args.model_dir);
@@ -805,6 +935,10 @@ int VllmServerMain(int argc, char** argv) {
     engine_params.max_num_seqs = args.max_num_seqs;
     engine_params.max_num_batched_tokens = args.max_num_batched_tokens;
     engine_params.enable_prefix_caching = args.enable_prefix_caching;
+    // #607 L2: the multimodal input limits go onto the ENGINE, not into a
+    // server-local variable, so the C ABI and this server resolve one limit the
+    // same way and the chat seam can borrow the engine's copy.
+    engine_params.multimodal = args.multimodal;
     // --device: explicit device selection (ARCH-ONE-SURFACE ROW 8). "auto"
     // (default) keeps the accelerator-first probe byte-identical; an unknown
     // name throws HERE (a startup error), and an explicitly named ABSENT
@@ -967,6 +1101,19 @@ int VllmServerMain(int argc, char** argv) {
     // tower + merge + MRoPE/DeepStack on the GPU worker consuming
     // Request.mm_features) is the remaining MM-SERVE-E2E residual — the engine
     // model runner has no mm-forward path yet. Kept alive for the server loop.
+    //
+    // #607 L2 / #686: the seam now REFUSES rather than truncates. It is
+    // constructed with a BaseProcessingInfo folding the engine's limits
+    // (loaded->mm_config(), where --limit-mm-per-prompt / --language-model-only
+    // landed) against this seam's own ceiling (Qwen3VLChatSupportedMmLimits —
+    // one image, no video, no audio), so a three-image request is answered with
+    // HTTP 400 "At most 1 image(s) may be provided in one prompt." instead of
+    // being served with its first image. Declared AFTER `loaded` so it is
+    // destroyed BEFORE the MultiModalConfig it references. It shares
+    // `mm_image_proc`'s lifetime shape exactly — both are borrowed by the
+    // closure `chat` holds and both outlive the server loop, which is the only
+    // time the closure runs.
+    std::unique_ptr<vllm::multimodal::BaseProcessingInfo> mm_proc_info;
     std::unique_ptr<vllm::multimodal::Qwen3VLImageProcessor> mm_image_proc;
     const std::string preprocessor_config_path =
         PathUtf8(dir / "preprocessor_config.json");
@@ -1002,8 +1149,16 @@ int VllmServerMain(int argc, char** argv) {
               "multimodal image: container-format decode (PNG/JPEG -> RGB) is a "
               "named MM-SERVE residual; supply raw RGB (image/x-raw-rgb)");
         };
+        mm_proc_info =
+            std::make_unique<vllm::multimodal::BaseProcessingInfo>(
+                loaded->mm_config(), oai::Qwen3VLChatSupportedMmLimits());
         chat.set_multimodal_chat_fn(oai::MakeQwen3VLImageChatFn(
-            *mm_image_proc, tokenizer, chat_prompt_fn, std::move(codec)));
+            *mm_image_proc, tokenizer, chat_prompt_fn, std::move(codec),
+            *mm_proc_info));
+        for (const auto& [modality, limit] : mm_proc_info->AllowedMmLimits()) {
+          std::cerr << "server: multimodal limit " << modality << "=" << limit
+                    << " (over the request limit for this seam)\n";
+        }
         std::cerr << "server: multimodal image seam wired (Qwen3-VL processor "
                      "from "
                   << preprocessor_config_path << ")\n";
@@ -1120,6 +1275,69 @@ int VllmServerMain(int argc, char** argv) {
         }
         return out.mux_output_path;
       });
+    }
+
+    // ── Speech + music generation (W6 of #672). OPT-IN: with no --speech-model
+    // the route is never registered and the server is byte-identical to one
+    // built before this existed. ─────────────────────────────────────────────
+    std::shared_ptr<vllm::multimodal::SpeechEngine> speech_engine;
+    if (!args.speech_model.empty()) {
+      vllm::multimodal::SpeechRegistry& registry = vllm::multimodal::GlobalSpeechRegistry();
+      vllm::models::music3::RegisterBuiltinSpeechFamilies(registry);
+      vllm::multimodal::SpeechModelParams smp;
+      smp.path = args.speech_model;
+      smp.family = args.speech_family;  // empty => DETECT by inspecting the artifact
+      std::string why;
+      std::unique_ptr<vllm::multimodal::SpeechEngine> loaded = registry.Load(smp, &why);
+      if (loaded == nullptr) {
+        // `why` names every family that was tried and the path, so a startup
+        // failure is evidence rather than a verdict.
+        throw std::runtime_error("server: --speech-model " + args.speech_model + ": " + why);
+      }
+      speech_engine = std::move(loaded);
+      vllm::openai::SpeechCapabilities caps;
+      caps.family = speech_engine->family();
+      caps.sample_rate = speech_engine->sample_rate();
+      caps.requires_reference_audio = speech_engine->requires_reference_audio();
+      std::cerr << "server: /v1/audio/speech on (family=" << caps.family << ", "
+                << caps.sample_rate << " Hz, "
+                << (caps.requires_reference_audio ? "reference clip REQUIRED"
+                                                  : "text-only synthesis")
+                << ", speech family "
+                << (args.speech_family.empty() ? "DETECTED" : "DECLARED (--speech-family)")
+                << ")\n";
+      server.set_synthesizer(
+          [speech_engine](const vllm::openai::SpeechRequest& req)
+              -> vllm::openai::SpeechResponse {
+            // The library-owned request mapping: the route validated the
+            // ENVELOPE, the family validates its own fields and refuses by name.
+            vllm::multimodal::SpeechGenParams gen;
+            gen.text = req.text;
+            gen.language = req.language;
+            gen.lyrics = req.lyrics;
+            gen.description = req.description;
+            gen.reference_audio = req.reference_audio;
+            gen.reference_sample_rate = req.reference_sample_rate;
+            gen.audio_duration_s = req.audio_duration_s;
+            gen.num_inference_steps = req.num_inference_steps;
+            // NEGATIVE means "the family decides": 0 is a legal guidance scale.
+            gen.guidance_scale = req.has_guidance_scale ? req.guidance_scale : -1.0;
+            gen.seed = req.seed;
+            const vllm::multimodal::SpeechResult result = speech_engine->Synthesize(gen);
+            vllm::openai::SpeechResponse out;
+            out.sample_rate = result.sample_rate;
+            out.channels = result.channels;
+            out.samples_per_channel =
+                result.channels > 0
+                    ? static_cast<int64_t>(result.samples.size()) / result.channels
+                    : 0;
+            // The SHARED RIFF writer the H3 and LTX-2.5 audio paths already
+            // use, so HTTP and the ABI cannot emit different bytes.
+            out.wav = vllm::MiniMaxH3WriteWav(result.samples, out.channels,
+                                              out.samples_per_channel, out.sample_rate);
+            return out;
+          },
+          caps);
     }
 
     oai::UtilityEndpointOptions endpoint_opts;
