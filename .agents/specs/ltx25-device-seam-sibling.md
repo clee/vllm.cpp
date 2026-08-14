@@ -451,10 +451,21 @@ exactly **6** mutants go RED (M36, M41-M45) and M20/M33/M40/M46 stay GREEN, so a
 blanket failure cannot pass for six findings; applied, 0 RED. Suite 48 → **54**
 tests, the +6 fully attributed to M41-M46.
 
-**File count re-derived.** #660's roadmap row and this spec both said "740
-files"; the scanned set is **760**, measured with `\bDeviceType\b` = **162** and
-`\bkCUDA\b` = **18** as positive controls in the same pass (the 162 is why the
-old number's other figures still hold). Both records are corrected.
+**File count re-derived, and anchored to a SHA, because it rots.** #660's
+roadmap row and this spec both said "740 files". The scanned set is **760 at
+`79ebbce42`** and **765 at the merge below**, because main added five source
+files under the scan roots in between. Both numbers were measured with
+`\bDeviceType\b` = **162** and `\bkCUDA\b` = **18** as positive controls in the
+same pass, and both are unchanged by those five files, which is why every other
+figure in this section holds across the merge.
+
+That drift is the finding, not an errand. A file count of one tree stored inside
+another file is a measurement that every unrelated pull request invalidates,
+which is the shape AGENTS.md forbids under "never store a measurement of one
+file inside another file". "740" was not wrong when it was written; it rotted.
+So both records now carry the SHA the number was measured at, and a reader who
+finds a mismatch knows to re-derive rather than to distrust the rest. The
+durable statement is the ratio the controls give, not the absolute count.
 
 ## Now
 
