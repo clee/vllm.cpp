@@ -1,4 +1,5 @@
-// Nemotron-H (`NemotronHForCausalLM`) — the WEIGHT LOADER
+// Nemotron-H (`NemotronHForCausalLM`) — the WEIGHT LOADER (implemented in
+// `nemotron_h_weights.cpp`, beside the enumeration it must agree with)
 // ([spec](../../../../.agents/specs/nemotron-h-model.md) §5b, §6b "Still owed
 // after W4"; issue #517).
 //
