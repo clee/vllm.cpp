@@ -18,8 +18,21 @@ The four things that must be true, and are each proven by a mutant below:
   3. A REDUCTION also fails until the baseline is lowered in the same commit,
      which is what makes it a ratchet rather than a threshold (M10-M12).
   4. The escape hatch is real, bounded and LOUD (M13-M15).
+  5. The `dev_cast` bucket is derived from the PROPERTY — an integer becoming a
+     `vt::DeviceType` outside the platform seam — and not from the one spelling
+     that happened to be in the tree when it was written (M20-M28, #660).
 
     python3 tests/scripts/test_device_leakage.py
+
+WHY (5) IS ASSERTED SO HARD. `kcuda` is the token grep `\bkCUDA\b`.
+`minimax_h3_video.cpp` wrote `static_cast<vt::DeviceType>(device)` against
+`kCUDA = 1` and scored ZERO in that bucket while the TEST that asserted the same
+mapping spelled the token honestly and was counted — the gate read the confession
+and missed the act (#660). A bucket that closed only `static_cast<vt::DeviceType>`
+would be that same defect one spelling later: a regression test wearing a gate's
+clothes. So every mutant below is a spelling that is NOT in the tree, and each is
+asserted on its own rather than in a batch, because a batch passes when one
+alternative in the pattern works.
 """
 
 from __future__ import annotations
@@ -64,6 +77,14 @@ BASE_TREE: dict[str, str] = {
     ),
     "src/vllm/platforms/platform.cpp": (
         "static const DeviceType kOrder[] = {DeviceType::kCUDA, DeviceType::kCPU};\n"
+        # The registry-walk inverse: an array INDEXED by DeviceType turned back
+        # into its type. Allowlisted at exactly one `dev_cast`, so the fixture
+        # has to carry it or the two-way allowlist ratchet reads the synthetic
+        # tree as a platform leg that lost its cast.
+        "Platform* Find(std::string_view n) {\n"
+        "  const DeviceType type = static_cast<DeviceType>(i);\n"
+        "  return nullptr;\n"
+        "}\n"
     ),
     "include/vllm/platforms/interface.h": (
         "bool is_cuda() const { return device_type() == DeviceType::kCUDA; }\n"
@@ -86,7 +107,7 @@ BASE_TREE: dict[str, str] = {
 
 # The synthetic tree's own DSR: one `kCUDA` in toy.cpp; everything else is either
 # allowlisted platform leg or outside the scanned roots.
-BASE_BUCKETS = {"kcuda": 1, "is_cuda": 0, "cuda_inc": 0, "vt_ifdef": 0}
+BASE_BUCKETS = {"kcuda": 1, "is_cuda": 0, "dev_cast": 0, "cuda_inc": 0, "vt_ifdef": 0}
 
 
 class Tree:
@@ -356,6 +377,152 @@ class DsrRatchetMutationTests(unittest.TestCase):
         rc, _out, err = self.tree.run()
         self.assertEqual(rc, 0, err)
 
+    # --- 5. `dev_cast` is a PROPERTY, not a spelling (#660) ------------------
+    #
+    # The spelling already in the tree when this bucket was written was
+    # `static_cast<vt::DeviceType>(device)`. NONE of the mutants below use it.
+    # Each is asserted individually: a single test that planted all of them at
+    # once would pass while four of the five alternatives were dead.
+
+    def plant(self, body: str) -> tuple[int, str, str]:
+        self.tree.append("src/vllm/model_executor/models/toy.cpp", body)
+        return self.tree.run()
+
+    def test_M20_c_style_cast_to_devicetype_fails(self) -> None:
+        rc, _out, err = self.plant(
+            "vt::DeviceType Resolve(int32_t d) { return (vt::DeviceType)d; }\n"
+        )
+        self.assertEqual(rc, 1)
+        self.require(err, "DSR REGRESSION in bucket 'dev_cast': 1 > baseline 0")
+
+    def test_M21_functional_cast_to_devicetype_fails(self) -> None:
+        rc, _out, err = self.plant(
+            "vt::DeviceType Resolve(int32_t d) { return vt::DeviceType(d); }\n"
+        )
+        self.assertEqual(rc, 1)
+        self.require(err, "DSR REGRESSION in bucket 'dev_cast': 1 > baseline 0")
+
+    def test_M22_cast_of_an_intermediate_int_variable_fails(self) -> None:
+        # The operand is neither a literal nor the parameter, so a pattern
+        # anchored on WHAT IS CAST rather than on the TARGET TYPE would miss it.
+        # The qualifier is dropped too: `DeviceType`, not `vt::DeviceType`.
+        rc, _out, err = self.plant(
+            "vt::DeviceType Resolve(const Params& p) {\n"
+            "  int raw = p.device;\n"
+            "  raw = raw ? 1 : 0;\n"
+            "  return static_cast<DeviceType>(raw);\n"
+            "}\n"
+        )
+        self.assertEqual(rc, 1)
+        self.require(err, "DSR REGRESSION in bucket 'dev_cast': 1 > baseline 0")
+
+    def test_M23_brace_initialized_cast_to_devicetype_fails(self) -> None:
+        # C++17 permits list-initialising a scoped enum with a fixed underlying
+        # type from an integer, so this is a real, compiling laundering route.
+        rc, _out, err = self.plant(
+            "vt::DeviceType Resolve(int32_t d) { return vt::DeviceType{d}; }\n"
+        )
+        self.assertEqual(rc, 1)
+        self.require(err, "DSR REGRESSION in bucket 'dev_cast': 1 > baseline 0")
+
+    def test_M24_cast_split_across_lines_fails(self) -> None:
+        # clang-format wraps long casts. A line-oriented matcher reads the two
+        # halves as two innocent lines; the bucket matches over the whole
+        # comment-stripped text and maps the offset back to a line.
+        rc, _out, err = self.plant(
+            "vt::DeviceType Resolve(int32_t device_selector_from_the_public_abi) {\n"
+            "  return static_cast<\n"
+            "      vt::DeviceType>(device_selector_from_the_public_abi);\n"
+            "}\n"
+        )
+        self.assertEqual(rc, 1)
+        self.require(err, "DSR REGRESSION in bucket 'dev_cast': 1 > baseline 0")
+
+    # --- and the negatives, which are what keep the bucket usable ------------
+
+    def test_M25_casting_a_devicetype_TO_an_integer_does_not_count(self) -> None:
+        # The safe direction. `std::to_string(static_cast<int>(type))` is in the
+        # platform seam itself; a bucket that counted it would be unlivable.
+        self.tree.append(
+            "src/vllm/model_executor/models/toy.cpp",
+            "int Index(vt::DeviceType t) { return static_cast<int>(t); }\n"
+            "size_t Slot(vt::DeviceType t) { return static_cast<size_t>(t); }\n"
+            "const char* N(vt::DeviceType t) { return vt::DeviceTypeName(t); }\n"
+            "std::vector<vt::DeviceType> All() { return kOrder; }\n",
+        )
+        self.assertEqual(self.tree.scan().counts["dev_cast"], 0)
+
+    def test_M26_a_devicetype_cast_in_prose_or_a_string_does_not_count(self) -> None:
+        self.tree.append(
+            "src/vllm/model_executor/models/toy.cpp",
+            "// history: this was (vt::DeviceType)device before the seam landed\n"
+            "/* static_cast<vt::DeviceType>(1) is what #660 was about */\n"
+            'void D() { VT_CHECK(ok, "never write vt::DeviceType(raw) here"); }\n',
+        )
+        self.assertEqual(self.tree.scan().counts["dev_cast"], 0)
+
+    def test_M27_the_platform_registry_walk_is_allowlisted_exactly(self) -> None:
+        # platform.cpp turns a REGISTRY INDEX back into a DeviceType. That is the
+        # seam's own inverse, not a model file hardcoding a device — but it is
+        # budgeted at exactly one, so a second cast in that file still fails.
+        self.tree.write(
+            "src/vllm/platforms/platform.cpp",
+            "static const DeviceType kOrder[] = {DeviceType::kCUDA, DeviceType::kCPU};\n"
+            "Platform* Find(std::string_view n) {\n"
+            "  const DeviceType type = static_cast<DeviceType>(i);\n"
+            "  return nullptr;\n"
+            "}\n",
+        )
+        rc, _out, err = self.tree.run()
+        self.assertEqual(rc, 0, err)
+        self.tree.append(
+            "src/vllm/platforms/platform.cpp",
+            "DeviceType Sneak(int d) { return (DeviceType)d; }\n",
+        )
+        rc, _out, err = self.tree.run()
+        self.assertEqual(rc, 1)
+        self.require(err, "ALLOWLIST STALE: src/vllm/platforms/platform.cpp")
+        self.require(err, "bucket 'dev_cast' has 2 reference(s)")
+
+    def test_M29_a_parameter_declaration_is_not_a_c_style_cast(self) -> None:
+        # The false positive this bucket actually produced on the real tree, kept
+        # as a mutant so it cannot come back. `(vt::DeviceType /*device*/)` strips
+        # to `(vt::DeviceType )` and is then textually a cast applied to `const`.
+        # Both discriminators are exercised: the `(` glued to the function name,
+        # and the declarator suffix after the `)`.
+        self.tree.append(
+            "src/vllm/model_executor/models/toy.cpp",
+            "struct Sink {\n"
+            "  virtual bool supports_on(vt::DeviceType /*device*/) const { return true; }\n"
+            "  virtual void note (vt::DeviceType) const noexcept;\n"
+            "};\n"
+            "using Fn = void(vt::DeviceType);\n",
+        )
+        self.assertEqual(self.tree.scan().counts["dev_cast"], 0)
+        # …and the discriminator must not have cost the real thing: the same file
+        # with an actual C-style cast still fails.
+        self.tree.append(
+            "src/vllm/model_executor/models/toy.cpp",
+            "vt::DeviceType R(int d) { return (vt::DeviceType)d; }\n",
+        )
+        rc, _out, err = self.tree.run()
+        self.assertEqual(rc, 1)
+        self.require(err, "DSR REGRESSION in bucket 'dev_cast': 1 > baseline 0")
+
+    def test_M28_dsr_allow_exempts_a_dev_cast_and_says_so_loudly(self) -> None:
+        # The legitimate case the risk register names: a deserialization boundary
+        # that reads a device off the wire. It buys an exemption only with a row
+        # id and a reason, and it is printed on every run.
+        self.tree.append(
+            "src/vllm/model_executor/models/toy.cpp",
+            "// DSR-ALLOW(S9): wire-format decode, validated against kNumDeviceTypes\n"
+            "vt::DeviceType Decode(uint8_t b) { return (vt::DeviceType)b; }\n",
+        )
+        rc, out, err = self.tree.run()
+        self.assertEqual(rc, 0, err)
+        self.require(out, "DSR-ALLOW exemptions in force: 1")
+        self.require(out, "[dev_cast]")
+
 
 class RealTreeTests(unittest.TestCase):
     """Hard expectations about THIS repository, not a synthetic mutant."""
@@ -405,6 +572,27 @@ class RealTreeTests(unittest.TestCase):
                 or (index and dl.RE_DSR_ALLOW.search(lines[index - 1])),
                 f"line {index + 1} has no DSR-ALLOW on it or directly above it",
             )
+
+    def test_the_diffusion_lanes_resolve_device_through_the_seam(self) -> None:
+        # #660's actual site, pinned as a fact about THIS tree rather than as a
+        # number in a baseline. The positive control is in the same assertion:
+        # the pattern must still fire on the defect's own text, or a null result
+        # below would prove only that the regex is broken.
+        defect = "return static_cast<vt::DeviceType>(device);"
+        self.assertTrue(
+            dl.RE_DEVTYPE_CAST.search(defect),
+            "positive control failed: the dev_cast pattern no longer matches the "
+            "very line #660 was filed about, so its absence below proves nothing",
+        )
+        for rel in (
+            "src/vllm/multimodal/minimax_h3_video.cpp",
+            "src/vllm/multimodal/ltx2_video.cpp",
+        ):
+            code = "\n".join(
+                dl.strip_comments_and_strings((ROOT / rel).read_text(encoding="utf-8"))
+            )
+            found = [m.group(0) for m in dl.RE_DEVTYPE_CAST.finditer(code)]
+            self.assertEqual(found, [], f"{rel} casts an integer into a DeviceType")
 
     def test_every_allowlisted_path_exists(self) -> None:
         # A stale allowlist entry is a silent exemption for a file that may later

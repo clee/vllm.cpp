@@ -58,8 +58,14 @@ namespace vllm::multimodal {
 inline constexpr char kMiniMaxH3VideoFamily[] = "minimax-h3";
 
 // Map the stable public video ABI device selector onto the runtime's generic
-// backend key. The ABI remains 0=CPU / 1=CUDA; callers below this seam dispatch
-// only through the returned DeviceType.
+// backend key. The ABI is unchanged — 0 is the CPU, 1 is the accelerator, and
+// anything else throws — but 1 is RESOLVED through the platform seam
+// (`CurrentPlatform().device_type()` + `TryGetBackend` +
+// `supports_model_architecture`), never cast from the integer. It therefore
+// THROWS on a build with no accelerator backend, or one whose partial backend
+// declines this architecture, instead of naming a device that build cannot run
+// (#659, #660). Callers below this seam dispatch only through the returned
+// DeviceType.
 vt::DeviceType MiniMaxH3VideoDeviceType(int32_t device);
 
 // ── Load-time parameters (the checkpoint set; the C ABI mirror is

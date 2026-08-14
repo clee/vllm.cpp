@@ -19,19 +19,54 @@ since the previous study with **no bad commit**: DeepSeek-V2, Qwen3-Coder and th
 attention-registry work each added a device test in passing. Leakage grows
 silently under well-executed work, so it needs a ratchet, not a cleanup.
 
-WHAT IT COUNTS. Four buckets, over non-comment / non-string-literal source:
+WHAT IT COUNTS. Five buckets, over non-comment / non-string-literal source:
 
   kcuda      textual `DeviceType::kCUDA` (or bare `kCUDA`) references
   is_cuda    `is_cuda()` call sites
+  dev_cast   an integer converted into a `vt::DeviceType` by a cast, in any
+             spelling — the device named by ENUM VALUE instead of by the
+             platform seam
   cuda_inc   `#include "vt/cuda/…"` / `<cuda_runtime…>` NOT inside a CUDA or
              VT_* preprocessor guard (i.e. a non-CUDA build cannot compile)
   vt_ifdef   `#ifdef VT_*` / `#if defined(VT_*)` build-time kernel-feature gates
 
-Comments and string literals are stripped before matching in the first two
+Comments and string literals are stripped before matching in the first three
 buckets. That is a DELIBERATE correction to the audit's composition, which
 excluded comment lines from `is_cuda` but not from `kCUDA` — a prose mention of
 a device name is not device leakage, and making the rule uniform is what keeps
 the metric honest in both directions.
+
+WHY `dev_cast` EXISTS (#660). `kcuda` is a TOKEN grep. `DeviceType` is
+`enum class DeviceType : uint8_t { kCPU = 0, kCUDA = 1, … }`
+(include/vt/device.h), so `static_cast<vt::DeviceType>(device)` on the public
+0/1 ABI selector hardcodes CUDA *by enum value* and never writes the token. That
+is exactly what `src/vllm/multimodal/minimax_h3_video.cpp` did: it scored ZERO in
+`kcuda` while the test asserting the same mapping spelled `kCUDA` honestly and
+WAS counted. The gate read the confession and missed the act. It is also an
+enum-ordering hazard — reordering the enum silently re-points every such site.
+
+`dev_cast` is anchored on the TARGET TYPE, not on the operand and not on one
+cast keyword, because the property is "an integer becomes a DeviceType outside
+the platform seam" and the property is what has to be caught. The reverse
+direction (`static_cast<int>(type)`) is the SAFE one and is deliberately not
+counted: it is how the seam itself indexes its registry.
+
+WHAT `dev_cast` STILL CANNOT SEE, stated here because a checker's message is the
+authority on what it enforces and an instrument that hides its blind spot
+returns a false pass:
+
+  * a cast whose target is a type ALIAS (`using DT = vt::DeviceType;` then
+    `static_cast<DT>(x)`), or a template parameter that resolves to DeviceType;
+  * `std::bit_cast`, `memcpy` or a union punning an integer onto a DeviceType;
+  * a conversion that happens inside `src/vt/` and is merely CALLED from the
+    shared layer — `src/vt/` is a device leg and is not scanned at all;
+  * whether the operand really is an integer. Nothing here type-checks; the
+    bucket flags every cast TO DeviceType and relies on `// DSR-ALLOW(<row>)`
+    for the legitimate ones (a wire-format decode is the expected case).
+
+Those are gaps in a TEXT checker, not gaps that were traded away for
+convenience. tests/scripts/test_device_leakage.py M20-M28 pin what it does
+catch, each spelling asserted on its own.
 
 HOW THE RATCHET WORKS. `scripts/device-leakage-baseline.json` holds the accepted
 per-bucket counts. Any bucket ABOVE its baseline fails. Any bucket BELOW its
@@ -73,10 +108,40 @@ BASELINE_PATH = ROOT / "scripts/device-leakage-baseline.json"
 SCAN_ROOTS = ("src/vllm", "include/vllm")
 SOURCE_SUFFIXES = {".h", ".hpp", ".cpp", ".cc", ".cu", ".cuh"}
 
-BUCKETS = ("kcuda", "is_cuda", "cuda_inc", "vt_ifdef")
+BUCKETS = ("kcuda", "is_cuda", "dev_cast", "cuda_inc", "vt_ifdef")
 
 RE_KCUDA = re.compile(r"\bkCUDA\b")
 RE_IS_CUDA = re.compile(r"\bis_cuda\s*\(\s*\)")
+
+# `dev_cast`: an integer becoming a DeviceType. Three alternatives, one per C++
+# spelling of the same conversion, all anchored on the TARGET TYPE:
+#
+#   1. a named cast          static_cast<vt::DeviceType>(x) / <DeviceType> / …
+#   2. a C-style cast        (vt::DeviceType)x
+#   3. a functional cast     vt::DeviceType(x)  and  vt::DeviceType{x}
+#
+# `\b` after the type name keeps `DeviceTypeName(t)` out. The lookbehind on (3)
+# keeps `X::DeviceType(` and `foo.DeviceType(` and `vector<DeviceType>(` out, so
+# a qualified spelling is matched once at its `vt::`, not twice. The negative
+# lookahead keeps a zero-argument `DeviceType()` value-initialisation out — that
+# converts nothing. Matched over the WHOLE comment-stripped text rather than
+# line by line, so a clang-format-wrapped cast cannot slip between two lines.
+#
+# (2) needs two guards, because `(Type)ident` and a PARAMETER LIST are textually
+# the same thing. `supports_worker_transfer_on(vt::DeviceType /*device*/) const`
+# in kv_connector.h is a declaration whose parameter name is commented out; after
+# stripping it reads exactly like a cast applied to `const`. So the `(` must not
+# be glued to an identifier (that is a call or a declarator), except after the
+# keywords that legitimately precede a parenthesised expression; and what follows
+# must not be a declarator suffix.
+RE_DEVTYPE_CAST = re.compile(
+    r"(?:static_cast|reinterpret_cast|const_cast|dynamic_cast)\s*<\s*"
+    r"(?:const\s+)?(?:vt\s*::\s*)?DeviceType\b\s*>"
+    r"|(?:(?<![\w])|(?<=return)|(?<=case)|(?<=throw)|(?<=delete))"
+    r"\(\s*(?:const\s+)?(?:vt\s*::\s*)?DeviceType\b\s*\)\s*"
+    r"(?!(?:const|volatile|noexcept|override|final|try)\b)(?=[A-Za-z_(])"
+    r"|(?<![\w.:>])(?:vt\s*::\s*)?DeviceType\b\s*[({]\s*(?![)}])"
+)
 RE_CUDA_INCLUDE = re.compile(r'^\s*#\s*include\s*[<"](?:vt/cuda/|cuda_runtime)')
 RE_PP_IF = re.compile(r"^\s*#\s*(ifdef|ifndef|if)\b(.*)$")
 RE_PP_ELIF = re.compile(r"^\s*#\s*elif\b(.*)$")
@@ -114,6 +179,12 @@ ALLOWLIST: dict[str, dict[str, tuple[object, str]]] = {
                      "`{kCUDA, kXPU, kVULKAN, kMETAL, kCPU}` — a data list that "
                      "names every platform equally, mirroring upstream's "
                      "`platforms/__init__.py` import probe."),
+        "dev_cast": (1, "`FindPlatformByName`'s `static_cast<DeviceType>(i)`: the "
+                        "registry is an array indexed BY DeviceType, so turning a "
+                        "slot index back into its type is the seam's own inverse, "
+                        "not a model file naming a device by enum value. Budgeted "
+                        "at exactly one — a second cast in this file is not the "
+                        "registry walk and fails."),
     },
     "include/vllm/platforms/interface.h": {
         "kcuda": (1, "the `is_cuda()` DEFINITION itself "
@@ -334,6 +405,15 @@ def scan(root: Path) -> Result:
             for m in RE_IS_CUDA.finditer(code):
                 del m
                 found["is_cuda"].append(Hit(rel, lineno, "is_cuda", raw_lines[lineno - 1].strip()))
+        # `dev_cast` matches over the WHOLE stripped text, not line by line: a
+        # cast wrapped across two lines is the same conversion, and a
+        # line-oriented matcher would read the halves as two innocent lines.
+        # The match offset is mapped back to a 1-based line for reporting.
+        joined = "\n".join(code_lines)
+        for m in RE_DEVTYPE_CAST.finditer(joined):
+            lineno = joined.count("\n", 0, m.start()) + 1
+            text = raw_lines[lineno - 1].strip() if lineno <= len(raw_lines) else m.group(0)
+            found["dev_cast"].append(Hit(rel, lineno, "dev_cast", text))
         for lineno, line in enumerate(raw_lines, start=1):
             if RE_CUDA_INCLUDE.match(line) and not guarded[lineno - 1]:
                 found["cuda_inc"].append(Hit(rel, lineno, "cuda_inc", line.strip()))
