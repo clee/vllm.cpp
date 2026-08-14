@@ -46,9 +46,16 @@ The **diffusers arm** only — `condition_encoder/`, `language_model/`,
 plus `modular_model_index.json`; ~26.6 GiB. The native arm (`qwen_7B/`,
 `flowmatching_vae.pth`, `dav.pth`) is deliberately not fetched — spec §2.
 
+Naming the components is what was actually used to fetch this copy, and it is the
+safer direction: an allow-list cannot pick up a 29 GB native arm that a new
+exclude pattern fails to match.
+
 ```sh
 hf download MiniMaxAI/MiniMax-Music3 --local-dir "$CHECKPOINT_ROOT/minimax-music3" \
-    --exclude 'qwen_7B/*' --exclude '*.pth'
+    --include 'condition_encoder/*' --include 'language_model/*' \
+    --include 'rvq_depth_decoder/*' --include 'scheduler/*' --include 'tokenizer/*' \
+    --include 'transformer/*' --include 'vocoder/*' \
+    --include 'modular_model_index.json' --include 'config.json'
 ```
 
 `modular_model_index.json` embeds the *hub repo id* in every component spec, so
