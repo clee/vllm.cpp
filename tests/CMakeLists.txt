@@ -200,6 +200,14 @@ target_include_directories(test_minimax_music3_acoustic_real PRIVATE
   ${CMAKE_SOURCE_DIR}/tests/parity)
 # W6 (#672): the SPEECH-FAMILY seam, the request contract and the chunk plan.
 # Pure or synthetic-tree only, so it needs neither the checkpoint nor a golden.
+# W7 of #672 -- the QUANTIZED ARMS. Nothing here loads a quantized weight:
+# no quantized MiniMax-Music3 checkpoint is staged, and none is implemented.
+# What it gates is that every quantized format a user can obtain today is
+# DIAGNOSED BY NAME and refused, instead of surfacing as the generic
+# "missing seven diffusers directories" or as a shape mismatch on an
+# unrelated tensor. Needs no checkpoint and no network.
+vllm_cpp_add_test(test_minimax_music3_quant vllm/models/test_minimax_music3_quant.cpp)
+
 vllm_cpp_add_test(test_minimax_music3_speech vllm/models/test_minimax_music3_speech.cpp)
 # W6's FULL-SCALE companion: the pipeline TAIL driven on the shipped weights,
 # against the capture's own waveform, and the WAV the delivery path emits.

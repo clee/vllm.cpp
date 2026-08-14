@@ -10,7 +10,7 @@
 [#14456](https://github.com/huggingface/diffusers/pull/14456), head
 `c6da9936e4bda83107943a16eb8682e9a37d8527` — **OPEN, not merged**.
 **Cross-check:** SGLang-Omni `748a0b437e4a8faad44d7bbfd5a0ae55d1fef830`.
-**Status:** **W0 + W1 DONE, W3 DONE, W4 + W5 DONE, W6 DONE, W2 PARTIAL.** Spec committed, both oracles pinned, §1.1 resolved and confirmed at runtime, the diffusers oracle gateable against committed goldens, the modular loader in the tree, the autoregressive half's compute gated at reduced dimensions and against the real bf16 checkpoint, and the ACOUSTIC half — flow-matching DiT, scheduler, CFG, window bookkeeping, DAC Flow-VAE vocoder — gated at both scales against the committed capture. §5's token-exact gate is WITHDRAWN: upstream's AR stage has no greedy path, and the acoustic half never had one to withdraw. W6 has landed: the model is a registered `SpeechRegistry` family reachable through the new `vllm_speech_*` C ABI (v20) and `POST /v1/audio/speech`, and the denoise+decode composition reproduces the capture's waveform. The 8.6B language-model forward and W7 are owed.
+**Status:** **W0 + W1 DONE, W3 DONE, W4 + W5 DONE, W6 DONE, W7 DONE (as a refusal), W2 PARTIAL.** Spec committed, both oracles pinned, §1.1 resolved and confirmed at runtime, the diffusers oracle gateable against committed goldens, the modular loader in the tree, the autoregressive half's compute gated at reduced dimensions and against the real bf16 checkpoint, and the ACOUSTIC half — flow-matching DiT, scheduler, CFG, window bookkeeping, DAC Flow-VAE vocoder — gated at both scales against the committed capture. §5's token-exact gate is WITHDRAWN: upstream's AR stage has no greedy path, and the acoustic half never had one to withdraw. W6 has landed: the model is a registered `SpeechRegistry` family reachable through the new `vllm_speech_*` C ABI (v20) and `POST /v1/audio/speech`, and the denoise+decode composition reproduces the capture's waveform. W7 has landed as a REFUSAL and not as an arm (§9): quantized checkpoints for this model exist in five formats, none is implemented, and each is now refused by name with the missing piece rather than surfacing as a confusing shape error. The 8.6B language-model forward and the GGUF k-quant arm itself are owed.
 **Developer directive (2026-08-13):** "land minimax music 3 support complete, to
 vllm.cpp, wired to the ABI and to the example http server, merge to main, tested
 e2e." That fixes W6's shape (the ABI surface and the example server are in scope,
@@ -375,7 +375,7 @@ the operator. Phases are separately claimable except where noted.
 | **W4** (**DONE**) | Flow-matching DiT + `FlowMatchEulerDiscreteScheduler` with `invert_sigmas` | per-step latent parity against the oracle at a fixed seed — DONE: scheduler BIT-EXACT on both recorded steps, DiT guided velocity inside the measured torch-vs-torch control |
 | **W5** (**DONE**) | Vocoder **through the shared `vocoder1d` primitives** (§4.1): snake activations, weight-norm, `[8,8,4,2]` upsampling, the 128→2×64 stereo fold, at **44100 stereo** (§1.1) | waveform parity within a stated absolute tolerance, and H3/IndexTTS-2.5 behaviour byte-identical — DONE: 88 064 samples, 0 outside tolerance, `vocoder1d` unmodified. WAV WRITING itself is W6's, with the rest of the delivery surface |
 | **W6** | Register as a `SpeechRegistry` family; extend `SpeechGenParams` ADDITIVELY for lyrics + description + controls (§4.1); NEW `vllm_speech_*` **`include/vllm.h`** surface with the ABI version bump; **the example HTTP server as a thin ABI client** | a song generates end to end from an HTTP request; IndexTTS-2.5 unchanged; SGLang-Omni cross-check; speed axis recorded with values and ratios |
-| **W7** | Quantized arms — GGUF k-quants are a standing requirement, not a per-model choice | each arm gated, or refused by name and recorded as owed |
+| **W7** (**DONE — as a REFUSAL**) | Quantized arms — GGUF k-quants are a standing requirement, not a per-model choice | each arm gated, or refused by name and recorded as owed — DONE by the second branch, and §9 says so plainly: quantized checkpoints for this model DO exist (14 repos, 5 formats, surveyed with counts in §9.1) and NONE is implemented, because none is staged here and fetching one needs authority. Every format is now diagnosed and refused BY NAME with the missing piece, 26 cases / 112 assertions, 10 of 10 mutations RED. The GGUF k-quant arm is recorded as the row's highest-priority debt with its unblocking decision costed in §9.5 |
 
 **W0 blocks everything.** Until the oracle demonstrably runs, no phase can produce
 evidence, and an implementer told to "gate against diffusers" would have nothing
@@ -413,6 +413,186 @@ invalidates the SGLang-Omni cross-check and this spec's §2 decision.
 Stop and report `NEEDS_CONTEXT` if the checkpoint cannot be fetched to the box the
 gate runs on, or if a component's upstream class has no readable definition at the
 pinned SHA.
+
+---
+
+## 9. W7 — the quantized arms: the survey, and what is owed
+
+### 9.1 The survey, and why it is written down rather than summarized
+
+W7 opened with the question AGENTS.md forces: *which* quantized arms does this
+checkpoint family actually ship? The H3 precedent (§0 of
+[minimax-h3.md](minimax-h3.md)) is why the question is asked before any code is
+written — there, third-party GGUF and NVFP4 arms changed a row's verdict from
+"hardware-blocked" to "reachable", and reasoning from the first-party release
+alone had produced the wrong conclusion.
+
+**Every query is recorded with its result count**, because an absence claimed
+from a search nobody can re-run is not evidence. Queries were run against the
+HuggingFace HTTP API (authoritative; `search=` is substring-over-repo-id) on
+2026-08-14, with web search used only as a labelled cross-check and every repo id
+it produced re-verified against the API.
+
+| Query | Endpoint | Results | Notable |
+|---|---|---|---|
+| `?author=MiniMaxAI&limit=200` | models | 30 | `MiniMaxAI/MiniMax-Music3` (the base repo); **no quantized repo under the org** |
+| `?author=MiniMax&limit=200` / `?author=MiniMax-AI&limit=200` | models | 0 / 0 | the org id is `MiniMaxAI` |
+| `?search=music3&limit=100` | models | 68 | 14 are MiniMax-Music3 derivatives |
+| `?search=minimax-music&limit=100` | models | 42 | |
+| `?search=MiniMax-Music3&limit=100` | models | 27 | |
+| `?filter=gguf&search=minimax` | models | 11 | 6 are Music3 |
+| `?filter=gguf&search=music3` | models | 6 | |
+| `?search=music3-gguf` / `-nvfp4` / `-awq` / `-fp8` / `-int8` / `-w4a8` | models | 6 / 0 / 0 / 0 / 1 / 2 | |
+| `?author=<quantizer>` for QuantStack, city96, calcuis, Kijai, mradermacher, bartowski, unsloth, nvidia, RedHatAI | models | 9 authors swept, **0 Music3 repos** | the usual quantizers had not touched it |
+
+**The finding is that first-party ships bf16/fp32 ONLY, and the community had
+already published fourteen quantized repositories in five formats within days of
+the release.** The relevant ones:
+
+| Format | Repos | Coverage |
+|---|---|---|
+| GGUF | `audio-cpp/MiniMax-Music3-GGUF` | **all five components**, one GGUF each, bf16 and Q4_K arms |
+| GGUF | `scragnog/MiniMax-Music3-GGUF` | 2-file split (`mm3-lm-*` / `mm3-synth-*`), 13 tiers incl. MXFP4 and NVFP4 as GGML tensor types |
+| GGUF | `Abiray/…`, `realrebelai/MiniMax-Music-3_GGUFs`, `molbal/…`, `ChrisColeTech/…` | the 2.46B **DiT alone**, ComfyUI-style, Q2_K…Q8_0 (0.9–2.7 GB) |
+| int8 / w4a8 | `Comfy-Org/MiniMax-Music-3` (`_int8_convrot`), `NidAll/MiniMax-Music3-W4A8`, `dummy9996/…-w4a8-bf16-comfyui` | DiT |
+| MLX 4/6/8-bit | `ddalcu/…`, `vanch007/…`, `elishabjm/…` | |
+| proprietary | `infosave/MiniMax-Music-3-cmf` (Cortiq 4-bit) | not implementable; recorded only |
+
+**NOT found by the queries above**: AWQ, GPTQ, compressed-tensors, fp8 /
+`fp8_e4m3fn` / `fp8_scaled`, or bitsandbytes. That is "not found by these
+queries on this date", never "does not exist".
+
+### 9.2 The GGUF headers, MEASURED — and the finding that matters
+
+Ten published GGUFs had their **headers read by HTTP range request** (56 MiB
+total; the metadata and tensor-info table sit at the start of the file, so no
+weight byte was fetched). This is the same instrument §1 used for the bf16 arm's
+geometry, and it is what turns §9.1's repo list into a contract.
+
+**"The GGUF arm" is THREE MUTUALLY INCOMPATIBLE LINEAGES, and
+`general.architecture` cannot separate them.** It reads `audiocpp`, `mm3`,
+`qwen3` and `wan` across files of the same model — and `wan` collides with
+genuine Wan video GGUFs, so keying on it would bind another model's checkpoint.
+The usable discriminators are:
+
+* `audiocpp.model_spec.family == "minimax_music3"` — **EXACT diffusers tensor
+  names, no rename table**, but the geometry lives only in the sibling
+  `config.json`, so the file is not self-describing;
+* `mm3.model == "MiniMax-Music3"` — **fully self-describing metadata**, but it
+  needs a rename table *plus* fused QKV to split and folded weight-norm to
+  invert;
+* co-occurring `diffusion_transformer.` + `latent_conditioners.` prefixes — the
+  ComfyUI lineage, which ships **the DiT and condition encoder only**: no
+  language model, no depth decoder, no vocoder, so it **cannot generate audio by
+  itself** whatever we implement.
+
+Two further measurements: `comfy.gguf.orig_shape.*` — the H3 arm's shape-override
+key — is **absent from all ten files** (0 occurrences), so H3's reshape handling
+does not carry over; and scragnog's NVFP4 tier uses GGML tensor type id **40**,
+which is not a standard llama.cpp id and would need its own resolution.
+
+### 9.3 What W7 implemented, and what it deliberately did not
+
+**No quantized arm is implemented. That is the honest answer and it is the
+recorded one.** Not one quantized checkpoint is staged on this box, fetching one
+needs authority (§9.5), and an arm loaded but never value-gated is exactly the
+"dequant fallback a token gate cannot see" this project has already been bitten
+by. Manufacturing one to look productive would have been the worse outcome.
+
+**What W7 did implement is the refusal**, which AGENTS.md makes non-optional
+whether or not a checkpoint exists: *"an arm that is not implemented is refused
+with a message naming the missing piece and recorded as owed, never left to be
+discovered later."*
+
+`minimax_music3_quant.{h,cpp}` is a **separate translation unit**, per
+[porting-a-model.md](../porting-a-model.md) ("GGUF is its own translation unit,
+not an afterthought bolted onto the safetensors loader") and per the H3 layout
+(`minimax_h3_gguf.cpp`, `minimax_h3_nvfp4.cpp`). When an arm lands it lands
+beside this file and the detector routes to it; the detection is not embedded in
+W1's loader, so the first real arm is not a rewrite of W1.
+
+**Three detectors, because a quantized checkpoint announces itself in three
+places and no single detector sees all three:**
+
+| Level | Sees | What it caught that W1 could not |
+|---|---|---|
+| TREE | `.gguf` files (nested to depth 2), and any `config.json` declaring a quantization | a GGUF tree has **none** of the seven diffusers directories, so W1 told it "missing transformer, condition_encoder, …" — seven directories the user does not have and never will, with no mention of GGUF |
+| MANIFEST | the NVFP4 triple, MXFP4 packs, AWQ `qweight`, bitsandbytes `absmax`, and **dtype-only** formats (fp8, int8) | a real NVFP4 `condition_encoder` refused on **`layer_scale`** — a tensor that is not quantized, is not wrong, and has nothing to do with the problem; it is simply the name that sorts first |
+| CONFIG | `quantization_config.quant_method`, and MLX's bare `quantization` | nothing: W1 ignored both, so an MLX or compressed-tensors tree fell through to a shape mismatch |
+
+**What the detector refuses to guess.** A bare `weight_scale` with no
+`weight_scale_2` and no `weight_packed` is consistent with NVFP4 missing its
+global scale, with a compressed-tensors block scheme, and with a per-channel int8
+scale. It resolves to `kUnknownScheme` and the refusal **names all three
+candidates rather than picking one** — `ltx2_loader.h:232-268` records what
+picking one costs: a finite, correctly shaped, correctly scaled, WRONG result
+that no shape gate can see.
+
+### 9.4 Evidence
+
+`tests/vllm/models/test_minimax_music3_quant.cpp` — **26 cases / 112 assertions**,
+no checkpoint and no network.
+
+RED first, against the tree as it stood: a probe asserting that a GGUF tree, an
+NVFP4 component and an fp8 component are each diagnosed by format failed **8 of
+8** checks, and printed the three misleading messages quoted in §9.3's table. The
+same probe passes 8 of 8 after the change.
+
+**Ten mutations, all ten RED** — each hook removed, each detection rule
+neutered, each clause of the refusal text deleted; both sources restored and
+verified `sha256`-identical, final rebuild green. Two are worth recording rather
+than counting:
+
+* **One mutation initially STAYED GREEN** and it was a genuine coverage hole:
+  hardcoding `matched = 1` passed every case in the file, because each happened
+  to carry exactly one marker. The count was reported but never *discriminated*,
+  so a refusal reading "1 of 400" on a fully quantized checkpoint would have read
+  as one stray tensor. A 36-marker case was added; the mutation then fires.
+* **One mutation was INVALID as first written** — reverting the config hook by
+  deleting its only caller tripped `-Werror` unused-function, so the *compiler*
+  refused it and the gate never got to speak. A build failure is not a red gate.
+  Re-run as neutering the call while keeping the function used: RED.
+
+The negatives are gated too, because a detector that fired on the shipped
+checkpoint would refuse every real load: the bf16/fp32 dtypes, the real
+transformer config, a `null` quantization_config, and — specifically — the
+vocoder's 30 legacy `weight_g`/`weight_v` weight-norm pairs, which are a
+*parameterization* and not a quantization. The existing suites are unchanged:
+loader 21/1393, AR 25/338, acoustic 27/265, speech 9/222.
+
+### 9.5 What is OWED, and what unblocks it
+
+**The GGUF k-quant arm is the highest-priority debt on this row.** The bf16/fp32
+arm is ~28.5 GB; the same weights at Q4_K are ~9 GB. That is the difference
+between a model most users cannot run and one they can, and it is what a
+quant-matched llama.cpp comparison needs. AGENTS.md makes GGUF k-quants a
+standing requirement rather than a per-model choice.
+
+**What blocks it is not knowledge — §9.2 measured the contract — it is that no
+quantized checkpoint is staged and fetching one needs authority.** The decision
+this row needs, with sizes, so nobody re-derives it:
+
+| Candidate | Size | Why |
+|---|---|---|
+| `audio-cpp/MiniMax-Music3-GGUF` → `rvq_depth_decoder_q4_k` | **406 MB** | the cheapest arm that can be **value-gated against an existing golden**: W3 already gates the depth decoder full-scale against `frame_hiddens[:, 4096:]` (716 800 values), so a Q4_K arm is comparable on day one. EXACT diffusers names, so no rename table |
+| `audio-cpp/…` → `transformer_q4_k` | 1 396 MB | the DiT, gateable against W4's per-step latents |
+| `audio-cpp/…` → `language_model_q4_k` | 7 184 MB | the 8.6B half; blocked behind W2's LM forward regardless |
+
+Recommended first step is the 406 MB depth decoder, because it is the one arm
+where a **calibrated numeric tolerance can be derived rather than asserted** —
+the bf16 control for that tensor is already measured (§5), so a Q4_K arm's
+looser bound can be stated against a known baseline instead of guessed.
+
+**No tolerance is claimed here, because nothing quantized was gated.** W7 states
+no numeric bound at all rather than an unmeasured one.
+
+Also owed, and recorded rather than discovered later: **the ComfyUI-lineage GGUFs
+can never be a complete arm** (§9.2 — DiT and condition encoder only), so a user
+pointing one at us must be told that even a finished GGUF arm would not make
+their file generate audio; the Cortiq `.cmf` format is proprietary and is
+recorded as not implementable rather than owed; and MLX and bitsandbytes are
+**new shared seams** this project implements for no model, so they are not
+per-model additions.
 
 ---
 
@@ -564,3 +744,34 @@ Two things are owed and neither is this phase's to close: **no speed number
 exists** — every capture so far ran on CPU because `dgx.casa` was down, so
 nothing here touches the speed axis — and SGLang-Omni remains `gateable = no`,
 read but never executed.
+
+**W7 is complete AS A REFUSAL, and the distinction is the whole finding.**
+§9 records it in full. The short form: **quantized MiniMax-Music3 checkpoints DO
+exist** — the survey found 14 community repositories in 5 formats within days of
+the release, with counts per query in §9.1 — and **none is implemented here**,
+because none is staged on this box and fetching one needs authority. Nothing was
+manufactured to look productive, and **no numeric tolerance is claimed, because
+nothing quantized was gated**.
+
+What landed is `minimax_music3_quant.{h,cpp}`, a SEPARATE translation unit per
+[porting-a-model.md](../porting-a-model.md), diagnosing every format at the three
+places a quantized checkpoint announces itself — the TREE (`.gguf` files), the
+MANIFEST (sidecar tensors, and the dtype-only formats no name carries), and the
+CONFIG (`quantization_config.quant_method`, and MLX's bare `quantization`). Each
+is refused BY NAME with the missing piece, the supported arm, the phase and the
+issue. 26 cases / 112 assertions; RED first at 8 of 8 probe checks; **10 of 10
+mutations fire**.
+
+**Three things W7 measured that a later phase would otherwise re-derive.**
+(1) "The GGUF arm" is THREE MUTUALLY INCOMPATIBLE LINEAGES and
+`general.architecture` cannot separate them — it reads `audiocpp`, `mm3`,
+`qwen3` and `wan` for the same model, and `wan` collides with genuine Wan video
+GGUFs. (2) The ComfyUI lineage ships **the DiT and condition encoder only**, so it
+can never generate audio however complete our arm becomes. (3) `comfy.gguf.orig_shape.*`,
+which the H3 GGUF arm depends on, is absent from all ten files measured.
+
+**The unblocking decision is costed rather than deferred** (§9.5): the 406 MB
+`rvq_depth_decoder_q4_k` is the cheapest arm that can be value-gated against an
+existing golden on day one, because W3 already gates that tensor at full scale
+and its bf16 control is already measured — so a Q4_K bound could be *calibrated*
+against a known baseline instead of guessed.

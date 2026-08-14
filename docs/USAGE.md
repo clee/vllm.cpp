@@ -2518,6 +2518,58 @@ python3 scripts/gen-minimax-music3-manifest.py \
   --output tests/vllm/models/minimax_music3_manifest.inc
 ```
 
+### MiniMax-Music3: the quantized arms are REFUSED, by name
+
+**There is no quantized MiniMax-Music3 arm.** Only the bf16/fp32 diffusers
+checkpoint loads — bf16 `language_model` + `rvq_depth_decoder` +
+`condition_encoder`, fp32 `transformer` + `vocoder`, ~28.5 GB resident.
+
+That matters because quantized MiniMax-Music3 checkpoints **do exist**: a survey
+on 2026-08-14 found fourteen community repositories in five formats, including
+GGUF k-quants of all five components at roughly a third of the size. None is
+implemented here. Rather than mis-loading one or failing with a confusing shape
+error, `MiniMaxMusic3ResolveCheckpoint`, `MiniMaxMusic3AccountTensors` and
+`MiniMaxMusic3LoadConfig` each refuse it **by name**:
+
+```
+minimax_music3: this checkpoint is QUANTIZED -- GGUF (evidence:
+condition_encoder.gguf, language_model_q4_k.gguf, ...; 5 of 5 entries examined
+carry the marker). NO quantized arm is implemented for MiniMax-Music3, so this
+is REFUSED rather than mis-loaded: a GGUF arm needs a name map, the
+GGUF-vs-torch dim reversal, a geometry source, and k-quant dequantization routed
+through vllm/model_executor/model_loader/gguf_dequant.h ...
+The supported arm is the bf16/fp32 diffusers arm ... The quantized arms are owed
+rather than forgotten: phase W7 of .agents/specs/minimax-music3.md, issue #672.
+```
+
+Eight formats are diagnosed — GGUF, NVFP4, MXFP4, FP8, INT8, AWQ/GPTQ,
+bitsandbytes and MLX — plus an `UNIDENTIFIED` case. Each message names the
+evidence found in *your* file, how many entries carried it, what a working arm
+would need, and the arm that does load. Detection happens in three places,
+because a quantized checkpoint announces itself in three different ways:
+
+| You point us at | Caught by | Because |
+|---|---|---|
+| a directory of `.gguf` files | the tree walk (depth 2, so `diffusion_models/` and `text_encoders/` count) | there is no component directory and no config to inspect |
+| a diffusers-shaped tree whose tensors are quantized | the manifest scan, from safetensors headers only | the sidecars (`weight_scale_2`, `weight_packed`, `qweight`, `absmax`) and the dtype-only formats (fp8, int8) are invisible to a shape check |
+| a checkpoint that *declares* it | the config parse | `quantization_config.quant_method`, or MLX's bare `quantization` |
+
+A bare `weight_scale` with no `weight_scale_2` and no `weight_packed` is
+reported as unidentified and the message names all three candidate schemes. It
+never picks one: guessing yields a finite, correctly shaped, correctly scaled,
+**wrong** result that no shape gate can see.
+
+Note if you hold a ComfyUI-format Music3 GGUF: those ship the DiT and condition
+encoder only — no language model, no depth decoder, no vocoder — so they cannot
+generate audio even once a GGUF arm lands.
+
+Its gate needs no checkpoint and no network:
+
+```sh
+cmake --build build -j 8 --target test_minimax_music3_quant
+./build/tests/test_minimax_music3_quant
+```
+
 ### IndexTTS-2.5 goldens and checkpoint manifests
 
 The speech lane is not servable yet (see `/v1/audio/speech` above); these
