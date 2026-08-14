@@ -95,7 +95,7 @@ memory format against the oracle explicitly.
 | MoE | `nemotron_h.py:126-256` (`NemotronHMoE`), decoder layer `:317` |
 | non-gated activation | `activation_without_mul(config.mlp_hidden_act)` -> `ReLUSquaredActivation` (`layers/activation.py`) |
 | expert ckpt naming | `ckpt_names=("up_proj", "down_proj", "")` (`nemotron_h.py:220`) |
-| routed scale applied to OUTPUT | `apply_routed_scale_to_output=True` (`nemotron_h.py:246`) |
+| routed scale applied to OUTPUT | `apply_routed_scale_to_output=True` (`nemotron_h.py:234`), factor `:233` |
 | router dtype | `GateLinear(..., out_dtype=torch.float32, force_fp32_compute=True)` (`nemotron_h.py:150-156`) |
 | state shape / dtype | `mamba_utils.py:174-199`, `:73-81` |
 | MTP | `models/nemotron_h_mtp.py::NemotronHMTP` (`registry.py:638`) |
@@ -179,9 +179,9 @@ cannot.
 | W | Content | Gate | Depends on |
 |---|---|---|---|
 | **W1** | ModelOpt `MIXED_PRECISION` resolver: parse `quantization_config`, resolve per-module `quant_algo` (direct then shard-prefix), expose it to weight loading. Refuse an unknown algo by name | unit tests on the REAL `config.json` (committed as a fixture, weights not needed): every one of the 5981 entries resolves, the `ignore` list resolves to unquantized, an unknown algo refuses | — |
-| **W2** | Non-gated `relu²` grouped MoE through `MlpGateUpMethodBase` / `vt::MergedGemmGroup`; bf16 arm then NVFP4 W4A16 g16 | byte/tolerance tests vs a host reference; `relu²` mutation caught; routed scale applied to the OUTPUT, not the logits | — |
+| **W2** | Non-gated `relu²` grouped MoE; bf16 arm then NVFP4 W4A16 g16. **As built it is NOT a merged pair** — the planned `MlpGateUpMethodBase` / `vt::MergedGemmGroup` routing was refuted during implementation and the arm is the EXISTING grouped GEMM plus a new `vt::MoeRelu2`; §6a is the authority on the seam | byte/tolerance tests vs a host reference; `relu²` mutation caught; routed scale applied to the OUTPUT, not the logits | — |
 | **W3** | `nemotron_h_weights.cpp` + `_registry.cpp`: `layers_block_type` dispatch, `backbone.` prefix, het-KV group construction (1 Mamba group + 1 full-attn group over 6 layers), enumeration gate vs the released index | enumeration: every tensor in `model.safetensors.index.json` is claimed or explicitly refused; KV spec shapes match `mamba2_state_shape` | #496 W1 |
-| **W4** | `nemotron_h.cpp` forward: hybrid layer loop, Mamba2 mixer wiring, 6 attention layers, MoE layers | CPU forward runs; per-layer activations vs a dumped oracle reference | #496 W1, W2, W3 |
+| **W4** | `nemotron_h.cpp` forward: hybrid layer loop, Mamba2 mixer wiring, 6 attention layers, MoE layers. **DONE — §6b is the authority on what was gated and how** | CPU forward runs; every block compared ELEMENTWISE against a reference written independently in `double` from the upstream formulas, both dtype arms, short AND long prompts. NOT against a dumped oracle activation reference as this row originally planned: that needs the WEIGHT LOADER, which does not exist yet, so it is owed to W6 alongside the token gate | #496 W1, W2, W3 |
 | **W5** | MTP head (`mtp.layers.0`, `eh_proj`/`enorm`/`hnorm`) on the existing spec-decode seam | draft acceptance non-zero; spec-off and spec-on token-identical | W4 |
 | **W6** | **GB10 e2e token gate vs the pinned oracle** | token-exact greedy, identical prompts/counts/batching/sampling; oracle identity asserted | #496 W2 (CUDA), W4, W5 |
 | **W7** | GGUF k-quant / i-quant arm through the shared GGUF loader (see §5b); refused by name until it lands | quant-matched load + token gate | W4 |
@@ -879,15 +879,466 @@ Read `Status:`.
   non-attention layers and may not move tokens on short prompts. Gate with a
   long-prompt arm, not only a 6-token one.
 
+## 6a. W2 note — the non-gated `relu²` expert, as built
+
+**Seam verdict: the non-gated expert is NOT a merged pair, and does not get a
+`MergedGemmGroup` descriptor.** `MergedGemmGroup` describes N GEMMs *sharing
+operand A* collapsed into one launch (`merged_gemm.h:1-22`). NemotronH's expert
+has exactly one projection — `ckpt_names=("up_proj", "down_proj", "")`
+(`nemotron_h.py:220`, the empty third entry being the absent gate) — so with
+N == 1 there is nothing to merge and no launch to save; an arity-1 descriptor
+would name a fusion that does not exist. `MlpGateUpMethodBase`
+(`linear.h:82-86`) is likewise a *merged `[2I,H]` gate_up* seam and has no pair
+to hold either.
+
+The arm is therefore the **existing** grouped projection plus the activation we
+did not have — exactly the shape the gated bf16 archs had before their pair was
+folded (`kMoeGroupedGemmBf16` + `kMoeSiluMul`):
+
+```
+up   : kMoeGroupedGemmBf16   (bf16)  |  kMoeGroupedGemmNvfp4Marlin (W4A16 g16)
+act  : kMoeRelu2                          <- NEW, the only new kernel
+down : kMoeGroupedGemmBf16   (bf16)  |  kMoeGroupedGemmNvfp4Marlin (W4A16 g16)
+comb : kMoeCombine(..., routed_scale)     <- routed scale on the OUTPUT
+```
+
+No parallel MoE path was added. The reasoning is recorded next to the seam it
+excludes (`merged_gemm.h`, the note after the bf16-sibling block).
+
+**`vt::MoeRelu2` (`OpId::kMoeRelu2`, CPU + CUDA).** Mirrors
+`ReLUSquaredActivation` (`layers/activation.py:609-628`) as the fused-MoE path
+reaches it: `activation_without_mul("relu2")` → `MoEActivation.RELU2_NO_MUL`
+(`layers/fused_moe/activation.py:34`; `activation_without_mul` is `:98`, the
+enumerator at `:33` is `GELU_TANH_NO_MUL`) → `apply_moe_activation`'s (`:184`)
+`F.relu(input, inplace=True); torch.square(input, out=output)`. The **dtype
+order is the mirrored part**: upstream's kernel
+(`csrc/libtorch_stable/activation_kernels.cu:673-678`) widens to f32, clamps at
+zero in f32, squares in f32 and rounds ONCE on the store. No new f32 buffer is
+introduced — the op reads and writes the caller's dtype and only its arithmetic
+is f32, which is what `LoadF32`/`StoreF32` already are elsewhere in `vt`.
+
+**`routed_scaling_factor` is applied to the OUTPUT**
+(`apply_routed_scale_to_output=True`, `nemotron_h.py:234`). `vt::MoeCombine`
+gained a trailing `routed_scale` (default `1.0f`, so every landed caller is
+byte-identical) which multiplies the routed sum *before* the shared term is
+added — literally `moe_runner.py:390-407` (`:402-406` `fused_output *= routed_scaling_factor`,
+`shared_output` untouched) followed by `:722-725` (`shared_output + fused_output`).
+Upstream forces the ROUTER's factor to `1.0` in exactly this case
+(`layer.py:291-300`), so `MoeRouterTopKArgs::routed_scaling_factor` stays 1.0 on
+this path. Note this is the *opposite* polarity from Laguna, which folds the same
+factor into the router weights by linearity (`laguna_ops.h:48`); NemotronH takes
+the literal upstream form.
+
+**`group_size=16` NVFP4 — SUPPORTED, risk closed by source.** `MoeMarlinArgs`
+already defaults to `group_size = 16` with `mxfp4 = false` (`ops.h`), and
+`cuda_moe_marlin.cu:7,115-129` documents and consumes exactly that
+(`group_blocks=1`, `s_type = kFE4M3fn`, `num_groups = size_k / group_size`); 32
+is reachable only via the MXFP4 branch. It is the configuration the landed
+NVFP4 MoE archs (Laguna, Qwen3.5) already run. A unit test pins the default so a
+later widening cannot silently re-point these experts.
+
+**CUDA arms — what was actually run, and by whom.** The implementer did NOT
+compile them: their worktree had no `nvcc`, so at `e2d68404` the CUDA arms were
+*written and reviewed*, never built, and the earlier wording here
+("compiled-and-reviewed") overstated it. They have since been compiled and
+GPU-verified **by the fresh reviewer**, on `dgx.casa` (GB10, nvcc 13.0.88), from
+a `git archive` of `e2d68404`:
+
+- Release `-DVLLM_CPP_CUDA=ON -DVLLM_CPP_CUDA_ARCHITECTURES=121a
+  -DVLLM_CPP_CUTLASS_DIR=$HOME/cutlass-4.5.0 -DVLLM_CPP_TRITON=ON` exited 0 with
+  **671/671 targets and zero warnings**; `cuda_moe.cu.o` compiled under
+  `-Werror=all-warnings`.
+- A reviewer-authored GPU parity test proved `MoeRelu2` CUDA == CPU
+  **bit-for-bit** over 4097 elements in all four dtype arms; that CUDA
+  `routed_scale` scales the routed sum only; and that the `1.0f` default is
+  byte-identical to the landed 4-arg call across all 8 dtype combinations.
+- Branch tests on the GPU box: `test_ops_moe_nongated_relu2` 10/10,
+  `test_ops_moe` 9/9 with 33451 assertions.
+
+**That GPU build is NOT a proof about this head, and the merge messages that
+implied otherwise were wrong (corrected 2026-08-13).** Four of this branch's
+land-prep merge commits carry a sentence of the form "`src/vt/cuda/cuda_moe.cu`
+and `vt/ops.h` are untouched by this merge, so the CUDA arm the fresh reviewer
+compiled and GPU-verified on GB10 at `e2d68404` is unchanged." Each half is
+individually true — `git diff --shortstat <merge>^1 <merge> -- include/vt/ops.h`
+is empty for `57e4301489`, `40908db153`, `6ac8eed85e`, `721f44d38d` and
+`f6a7f87090` — but the CONCLUSION does not follow, because the compile inputs
+moved in commits those merges do not cover. Measured on this branch:
+
+| Since `e2d68404` (the GPU-verified tree) | Delta |
+|---|---|
+| `include/vt/ops.h` | **+180 / −1** (`git diff --numstat e2d68404 HEAD`) |
+| `src/vt/cuda/cuda_moe.cu` | **+7 / −1** |
+
+The header movement is `d3cd442e6`, the merge that brought Mamba2 SSD W1
+(`fe81bd3b5`, #496) — a merge that DID touch `include/vt/ops.h`, by +179 lines
+against its first parent (`git show --stat d3cd442e6`) — and the `.cu` movement
+is this row's own `dd7a6477d` repair. So `cuda_moe.cu` has been compiled at
+`e2d68404` and nowhere since, and no local GPU host is reachable to redo it
+(`dgx.casa` is down). The standing evidence for the CUDA arm at THIS head is
+therefore the PR's `cuda-fat-build` CI job, which compiles `cuda_moe.cu`
+against the merged `include/vt/ops.h` for 10 architectures under
+`-Werror=all-warnings`; the GB10 run remains the evidence for the arm's
+RUNTIME behaviour at `e2d68404`, which the eight-line `.cu` delta since is a
+comment change plus the `routed_scale` parameter the reviewer's own GPU parity
+test exercised.
+
+**Scope of the "bit-for-bit" claim.** The reviewer's GPU parity result is a
+MEASUREMENT on GB10, not a guarantee the build flags provide: `-ffp-contract=off`
+is pinned for CXX, HIP and OBJCXX (`CMakeLists.txt:55`, `:393`, `:467`) but
+nothing passes nvcc `--fmad=false`, and `CMakeLists.txt:41-56` carves CUDA out
+deliberately ("GPU parity tests compare GPU-vs-GPU"). `MoeRelu2` is safe by
+construction — a compare-select and one multiply, with no multiply-add to
+contract — and the `routed_scale` step is one standalone multiply on the
+finished accumulator, which is why §6a's evidence is stated for exactly those
+two. `MoeCombine`'s `acc += w * Load(...)` reduction is the contractable one
+and is NOT covered; the comment in `cuda_moe.cu` claiming it was has been
+narrowed to what holds. The flag gap itself is repo-wide and tracked as **#591**
+(found independently in `cuda_mamba2_ssd.cuh`); it is not repaired here.
+
+**Still OWED** (no GPU in the implementer/repair worktrees, and not covered by
+the above): `kMoeGroupedGemmNvfp4Marlin` exercised on the real NemotronH g16
+tensors, and the end-to-end NemotronH MoE block on GB10. Both remain owed to W6
+or an earlier GPU-host spot check. The `group_size` unit test pins the default
+only — it is not a run of the Marlin arm.
+
+**Evidence.** `tests/vt/test_ops_moe_nongated_relu2.cpp` (**12 cases / 81
+assertions**): the activation against hand-computed exact values, the
+`relu`/`silu` mis-ports, a bf16-in/f32-out arm that catches narrowing the square,
+a bf16-out raw-bit arm, the shape/dtype/**device** contract refusals, the routed
+scale on the routed sum only, the routed scale on the **assembled sum rather than
+each router weight** (bitwise), the f16-out refusal that makes upstream's fp16
+arm unreachable, the 1.0 default being byte-identical to the landed call, and the
+whole expert `up → relu² → down → scaled combine` against an
+independently-written scalar reference.
+
+Mutations executed and caught (Release, `-ffp-contract=off`; every one restored
+and md5-verified afterwards):
+
+| # | Mutation | Target | Result |
+|---|---|---|---|
+| M1 | `relu` (square dropped) | `test_ops_moe_nongated_relu2` | RED 5 cases / 27 assertions |
+| M2 | `silu` (the gated family's activation) | same | RED 5 / 35 |
+| M3 | square narrowed through bf16 | same | RED 2 / 20 |
+| M4 | `routed_scale` dropped | same | RED 3 / 32 |
+| M5 | `routed_scale` applied to routed **+ shared** | same | RED 2 / 29 |
+| M6 | `routed_scale` **folded into each router weight** | same | RED 1 / 4 |
+| M7 | routed scale folded into the router **logits** | `test_ops_moe_router_grouped` | RED 3 / **525** (was recorded 498 — see below) |
+| M8 | NVFP4 `group_size` default 16 → 32 | `test_ops_moe_nongated_relu2` | RED 1 / 1 |
+| M9 | `MoeRelu2` device `VT_CHECK` dropped | same | RED 1 / 2 |
+| M10 | `IsOutFloat` widened to admit `kF16` | same | RED 1 / 2 |
+
+M6 is the one this repair added. At `e2d68404` it **survived green** (10/10
+cases, 71/71 assertions): the landed cases all compared with a tolerance, and the
+fold is exact-arithmetic-equal, so nothing could see it. It is also the most
+likely W4 mistake, because Laguna performs exactly that fold
+(`laguna_ops.h:48`) — legally, since Laguna passes no `shared`. The new case
+pins it bitwise on decimal-grid data whose f32 products carry full mantissas
+(rows separate by 10 and 4 ULP), with a `REQUIRE` that the data separates the two
+forms so the green cannot be vacuous. M7 does NOT red the NemotronH file by
+design — this path forces the router factor to 1.0 (`layer.py:291-300`), so the
+router's own suite is where that defect is visible.
+
+**M7's assertion count was recorded wrong (repaired 2026-08-13).** The table and
+the `dd7a6477d` commit message both said `RED 3 / 498`. Three independent
+re-measurements — the fresh review's, the operator's, and this repair's — all
+read **3 cases / 525 assertions** failing, out of the unchanged 14 / 941
+baseline. The CASE count was right; only the assertion count was wrong, and 498
+is reproducible by nobody. `tests/vt/test_ops_moe_router_grouped.cpp` and the
+grouped-router kernel it exercises have not moved since `e2d68404`
+(`git log --oneline e2d68404..HEAD -- tests/vt/test_ops_moe_router_grouped.cpp`
+is empty), so the count is stable and the original entry was a transcription
+slip, not drift. Re-measured here by folding
+`args.routed_scaling_factor` into the logits fed to sigmoid/softmax in
+`MoeRouterGroupedTopKKernel` (`cpu_ops.cpp:2325-2339`) and disabling the
+post-renormalize weight scale (`:2430-2434`); Release, `-ffp-contract=off`;
+tree restored and md5-verified (`cd409b9465c00834be373cf3ecfb4c1d`), rebuilt,
+back to 14/941 SUCCESS.
+
+## 6b. W4 result — the forward COMPUTES, and the gate around it did not (2026-08-14)
+
+W4 was built on `row/MODEL-NEMOTRON-H-W4B` from the rescued WIP commit
+`d8c0d13f2` — 2411 lines committed by a session that died mid-build with no gate
+ever executed — re-merged onto `origin/main`.
+
+**The inherited forward compiles and is numerically RIGHT.** First clean Release
+`-Werror` build: 416/416 targets, **0 `warning:` lines**, ninja exit 0. First run
+of its gate: **13 cases, 10 passed, 3 failed, 161 assertions, `Status: FAILURE!`,
+exit 1** — and every one of the POSITIVE comparisons against the independently
+written `double` references passed on that first run: the Mamba2 mixer, SSD
+chunk-size invariance, the carried two-leg state, GQA attention, the non-gated
+relu² MoE, the dense MLP, the whole hybrid stack (short + long, f32 + bf16), the
+single-branch residual structure, the refusals, and greedy determinism.
+
+### The three failures were all anti-vacuity guards, and chasing them found the real defect
+
+Each `AnyDiffers(...)` guard asserts "the mis-port is a DIFFERENT answer". All
+three returned false. Measured separations:
+
+| Guard | max_abs | max_rel | bitwise differing | Verdict |
+|---|---|---|---|---|
+| bf16 SSM state vs f32 | 1.42e-6 | 2.38e-2 | 192/192 | REAL, but judged by an ABSOLUTE band 140x larger than the largest difference the defect can produce |
+| RoPE-rotated attention | 9.41e-6 | 3.18 | 383/384 | attention was DEGENERATE in the fixture (below) |
+| routed scale folded into router weights | 2.09e-8 | 3.68e-5 | 245/288 | the fold is EXACT-ARITHMETIC-EQUAL; the test's claim was FALSE |
+| routed scale folded into logits | 8.55e-2 | 25.3 | 288/288 | genuinely different — this guard was sound |
+
+RopeNeox demonstrably DID rotate q (360 of 384 elements moved), so no guard
+failed because its own instrument was dead
+([[absent-hook-looks-like-armed-instrument]]).
+
+**What that exposed: the bf16 arms could not fail at all.** `TolFor(bf16)` was a
+flat `{atol 6e-2, rtol 6e-2}` applied to references whose own magnitude nobody
+had measured:
+
+| Comparison | max abs(want) | mean abs(want) | atol | atol/mean | all-zeros answer |
+|---|---|---|---|---|---|
+| attention T=48 bf16 | 0.0109 | 3.55e-4 | 0.06 | **169** | PASSES |
+| attention T=6 bf16 | 0.0109 | 1.85e-3 | 0.06 | **32.4** | PASSES |
+| mamba2 mixer bf16 | 0.0447 | 1.69e-2 | 0.06 | **3.55** | PASSES |
+| logits T=6 bf16 | 0.950 | 0.377 | 0.6 | **1.59** | PASSES |
+| logits T=40 bf16 | 1.03 | 0.425 | 0.6 | **1.41** | PASSES |
+| attention T=48 f32 | 0.0106 | 3.60e-4 | 2e-4 | 0.556 | weak |
+
+bf16 is the RELEASED checkpoint's model dtype. On that arm a mixer returning all
+zeros passed. The f32 arms carried all the gating there ever was. This is
+[[gate-comparing-shared-helper-proves-consistency-not-correctness]] in a new
+shape: not a shared helper, but a band larger than the signal.
+
+### Five repairs
+
+1. **Bands are RELATIVE to the reference's own peak**, not flat absolutes.
+2. **Every comparison SELF-CERTIFIES.** `ExpectCloseRel` REQUIREs that its own
+   band REJECTS an all-zeros answer before it accepts the real one. A gate that
+   cannot fail is now itself a test failure, asserted at run time rather than
+   left for the next reader to re-derive. M15 below proves it works.
+3. **The attention fixture was degenerate.** At q/k weight scale 0.2 the tiny
+   model's logits were ~0.09, so the softmax was near-UNIFORM and the block was
+   an unweighted mean of v — tiny by cancellation, and nearly blind to anything
+   that only moves attention WEIGHTS (RoPE, the scale factor, causality). The
+   real checkpoint is not in that regime: `head_dim=128` and `hidden_size=2688`
+   put it in the selective one by construction. Raised to 0.95 to restore it.
+4. **The routed-scale case asserted something false.** `routed_scaling_factor`
+   is applied AFTER the top-k renormalisation, so folding it into the router
+   weights and scaling the assembled routed sum are the SAME expression; the
+   separation is floating-point association only. The bitwise instrument for it
+   is at the op level (§6a M6). The case now gates the two things that ARE
+   observable here — scaling the SHARED term (which
+   `apply_routed_scale_to_output=True` exists to prevent, and which a
+   shared-expert-free architecture like Laguna cannot expose) and scaling the
+   LOGITS — and pins the fold as arithmetically indistinguishable.
+5. **The SSM-cache-dtype guard asserted in the wrong place.** Downstream, the
+   separation is 3.16e-5 of the signal peak, BELOW the f32 arm's own 2e-4 band,
+   because `A = -exp(A_log)` decays a carried state within a few tokens. It now
+   gates the STORED STATE, where the dtype actually lives: the dtype itself, the
+   exact 2x byte-count ratio (the assertion that caught the shared-resolver
+   defect in §5c), and a relative separation above bf16's resolution.
+
+### Seams
+
+- **`vt::FusedChain`** — the two residual add+RMSNorm sites now route through
+  `kFusedAddRmsNormStd` behind `VT_FUSED_CHAIN_ADOPT`, per AGENTS.md. The
+  inherited code hand-called `vt::RmsNorm(..., &residual)` and
+  `scripts/check-fusion-consistency.py` was RED on it. Both arms are green and
+  the Tier-0 composite dispatches to the same primitive.
+- **`ModelRegistry::Forward`** — `ForwardNemotronHForCausalLM` reaches the
+  forward through the shared seam (inherited from the WIP, kept).
+- **`dense_attn::AttnBlock` — NOT APPLICABLE AT W4, recorded rather than
+  skipped.** That seam is the DEVICE/PAGED full-attention block: it requires a
+  `PagedKvCache`, a `slot_mapping`, a `block_table`, `StepInputs`, and a
+  `Qwen3DenseAttnWeights` built from `OwnedTensor`s a loader produced. W4 is the
+  HOST reference forward and owns none of those. This is the same boundary
+  Kimi-Linear's `kimi_linear_forward.cpp` and DeepSeek-V4's
+  `DeepseekV4ForwardHost` sit on, and W6 is where `AttnBlock` applies.
+- **`layers::MlpGateUpMethodBase` / `vt::MergedGemmGroup`** — not applicable;
+  §6a already settled that a non-gated expert has no pair to merge.
+- **`scripts/runner-routing-allowlist.txt`** — a DEVIATION from the W4 task's
+  stated authority, argued in the commit that makes it. Wiring the registry
+  forward to the host reference makes the model visible to
+  `check-runner-routing-consistency` as off-framework host logits. It cannot
+  return device-resident logits because there is no NemotronH weight loader at
+  all; the entry names W6 as what removes it.
+
+### RED-first
+
+With the five forward entry points reverted to W3's refusal, the suite is
+**12 of 13 cases FAILING, `Status: FAILURE!`, exit 1**. Note the instrument
+trap: the assertion count collapses **254 -> 16** and prints
+`14 passed | 2 failed`, because the cases THREW — `grep 'assertions:'` reads a
+fully red gate as nearly clean ([[doctest-assertions-line-hides-thrown-cases]]).
+Read `Status:`. Tree restored, SHA-256 re-verified, worktree proven clean,
+rebuilt back to green.
+
+### Mutation proof (IMP-MUTATE) — 15 applied alone, rebuilt, run, restored
+
+Every one RED; after each, the file was restored, its SHA-256 re-verified against
+the baseline, and the whole worktree proven clean before the next.
+
+| Mutation | Result |
+|---|---|
+| M1 `routed_scale` dropped from `MoeCombine` | FAILURE 3 cases / 14 assertions |
+| M2 routed factor ALSO folded into the router weights (double-scale) | FAILURE 3 / 14 |
+| M3 router weight dtype inherited from the model instead of f32 | FAILURE 3 cases, assertions 254 -> **188** (threw) |
+| M4 attention scale `1/Dh` instead of `1/sqrt(Dh)` | FAILURE 3 / 9 |
+| M5 attention causality dropped | FAILURE 3 / 11 |
+| M6 conv silu activation dropped | FAILURE 3 / 13 |
+| M7 `dt_softplus` dropped | FAILURE 3 / 11 |
+| M8 `D` skip-connection dropped from the SSD scan | FAILURE 3 / 13 |
+| M9 `dt_bias` dropped from the SSD scan | FAILURE 3 / 8 |
+| M10 gated group norm collapsed to `n_groups=1` | FAILURE 3 / 8 |
+| M11 `A = +exp(A_log)` (decay sign inverted) | FAILURE 6 cases, assertions 254 -> **87** (threw) |
+| M12 relu² bypassed in the non-gated expert | FAILURE 4 / 15 |
+| M13 B and C swapped in the conv-output split | FAILURE 3 / 10 |
+| M14 final `norm_f` loses its residual fold | FAILURE 1 / 8 |
+| M15 **self-certification**: bf16 band widened to 3.0 (makes the gate vacuous) | FAILURE 4 cases / 4 assertions — the non-vacuity REQUIREs fire |
+
+M15 is the one that keeps the others honest: it proves the self-certification
+added above actually detects a band that can no longer fail. M3 and M11 are the
+instrument trap again — their assertion COUNTS fall because cases threw.
+
+M8, M9 and M14 additionally could not be COMPILED in their first form: each left
+a `Tensor` unused and `-Werror` rejected it. That is a real, if accidental,
+second gate; the mutations were re-run with the variable consumed.
+
+### Gate evidence
+
+Local x86_64 CPU-only Release `-Werror` (GNU 13.3, Ninja), plus a Debug arm with
+asserts unmasked. Disk is recorded beside every number because this box hit
+**100% mid-run**: the first full build reported `FULL_BUILD_EXIT=1` with
+`fatal error: error writing to /tmp/ccvKMX4g.s: No space left on device`, while
+the harness notification for that same job read "exit code 0" — the wrapper's
+status, not ninja's ([[unit-success-is-not-script-success]]). Space was reclaimed
+and every number below comes from a re-run with headroom.
+
+| Arm | Result | disk free |
+|---|---|---|
+| Release `-Werror`, clean full build | **exit 0, 0 `warning:` lines, 0 ENOSPC lines** | 8.9G / 98% |
+| `test_nemotron_h_forward` (Release) | **13/13 cases, 254/254 assertions, `Status: SUCCESS!`** | 8.9G |
+| same, `VT_FUSED_CHAIN_ADOPT=0` A/B | **13/13, 254/254, `Status: SUCCESS!`** | 8.9G |
+| `test_nemotron_h_scaffold` (Release) | **12/12, 38285/38285, `Status: SUCCESS!`** | 9.1G |
+| Debug (`-g0`, asserts unmasked) forward | **13/13, 254/254, `Status: SUCCESS!`** | 5.0G |
+| Debug (`-g0`) scaffold | **12/12, 38285/38285, `Status: SUCCESS!`** | 5.0G |
+| full `ctest -j4` | **100% tests passed, 0 failed out of 430** (skipped: `test_modelopt_mixed_precision_checkpoint`, `test_voxtral_e2e` — neither asset present) | 5.6G / 99% |
+
+**The CUDA arm, on Jetson Thor (`kairos-4db2`, aarch64, sm_110).** Transferred by
+`git archive` and md5-verified on both ends. Container `vllmcpp-build:aarch64`,
+`--runtime=nvidia`, `NVIDIA_DISABLE_REQUIRE=1`; GPU visible inside as **NVIDIA
+Thor, compute_cap 11.0**, nvcc **13.0.88**. Configured `-DVLLM_CPP_CUDA=ON
+-DVLLM_CPP_CUDA_ARCHITECTURES=110 -DVLLM_CPP_TRITON=OFF`, no CUTLASS — the log's
+`CUTLASS not found ... NVFP4 GEMM + FA2 disabled` and three `DISABLED (no
+requested arch in [110] provides it)` lines are CORRECT for sm_110, not a silent
+fallback. Disk 472-476G free / 46% throughout.
+
+| Thor arm | Result |
+|---|---|
+| build, 455 targets | **`BUILD_EXIT=0`, 0 `warning:` lines** (CUDA TUs incl. `cuda_ops.cu`, `cuda_paged_attn.cu`, `cuda_gdn.cu`, Marlin) |
+| `test_nemotron_h_forward` | **13/13, 254/254, `Status: SUCCESS!`** — IDENTICAL counts to x86_64 |
+| `test_nemotron_h_scaffold` | **12/12, 38285/38285, `Status: SUCCESS!`** — IDENTICAL to x86_64 |
+| `test_ops_mamba2_ssd` | 12/12, **2095** assertions, SUCCESS |
+| `test_ops_mamba2_gated_norm` | 12/12, **3723**, SUCCESS |
+| `test_ops_mamba2_state_update` | 10/10, **5965**, SUCCESS |
+| `test_ops_moe_nongated_relu2` | 12/12, 81, SUCCESS |
+
+The three Mamba2 counts reproduce the GB10 precedent (12/2095, 10/5965, 12/3723)
+exactly, on a different architecture and toolchain.
+
+**What Thor does NOT prove, stated plainly.** `NemotronHForward` asserts a CPU
+queue by design — the device/paged path is W6 — so Thor's value here is a
+CUDA-ENABLED BUILD and a second architecture executing the suite, not GPU
+execution of the forward. The vt primitives the forward composes
+(`Mamba2ChunkScan`, `RmsNormGatedGroup`, `Mamba2StateUpdate`, `MoeRelu2`) DO have
+CUDA arms and are gated above.
+
+### Still owed after W4
+
+The **weight loader** — nothing materializes the 18487 enumerated tensors, so no
+checkpoint can be run and the forward refuses by name on every load. Then the MTP
+head (W5), the e2e token gate against the committed goldens (W6), and the GGUF
+arm (W7). The committed `nemotron_35_lightning_greedy/oracle.json` goldens are
+W6's gate and were deliberately NOT consumed here. No speed claim is made or
+implied by this W.
+
+### 6c. Fresh-review residuals carried forward (2026-08-14)
+
+W4's fresh review returned **PASS** and proved its central claim by experiment:
+it reconstructed the inherited gate, made an attention block return all zeros,
+and watched **both bf16 arms accept it** — the released checkpoint's dtype. The
+repair holds; the same mutant now fails on all four arms. Four residuals are
+recorded rather than left in a reviewer's report:
+
+**R1 — the bf16 band is coarser than the defect class this file targets, and
+the f32 arm must never be dropped as redundant.** `test_nemotron_h_forward.cpp`
+compares bf16 at 3e-2 of peak. Demonstrated: a 2% attention-scale error
+(`args.scale *= 1.02`) fails both f32 arms and **passes both bf16 arms**.
+Corroborating: this file's own no-RoPE separation is **0.0210891**, *below* the
+bf16 band, so a RoPE mis-port would pass the bf16 comparison. The f32 arm
+(2e-4) and the dedicated no-RoPE guard catch both, which is why this is a
+residual and not a defect — but the asymmetry is now on the record so nobody
+prunes the f32 arm as duplicated coverage.
+
+**R2 — the self-certification is a structural identity, not a tightness
+measure.** Each comparison REQUIREs that its band reject all-zeros, which with
+a peak-relative band reduces exactly to `rel < 0.5`. It eliminates the precise
+defect it was written for and nothing more; at `rel = 0.49` it still passes
+everywhere. Honestly scoped, not a general guarantee of band quality.
+
+**R3 — the routed-scale CALL SITE is genuinely ungated.** Folding
+`routed_scaling_factor` into the router instead of `MoeCombine`'s
+`routed_scale` gives **13/13 cases, 254/254 assertions, SUCCESS** — the
+model-level gate cannot see it (peak-relative separation 1.91e-07). It is
+arithmetically equal post-renormalisation, which `layer.py:291-300` states
+outright by forcing the router factor to 1.0 "so it ends up being a nop". The
+bitwise instrument at `tests/vt/test_ops_moe_nongated_relu2.cpp:270` gates
+`vt::MoeCombine`'s own semantics, **not** this call site's choice — a
+distinction the earlier write-up blurred. Unavoidable here (the model-level
+reference is `double`, so no bitwise comparison exists), and recorded as
+uncovered rather than implied to be covered.
+
+**R4 — two comment magnitudes state no denominator.** "3.7e-5 relative" for the
+fold measures 1.91e-07 peak-relative; "25.3x the signal" for `scale_logits`
+measures 0.568. The qualitative claims are right and were independently
+verified; the numbers appear to be mean-relative or from an earlier fixture.
+
 ## 7. Now
 
-**State at this commit:** spec committed, implementation **not started**. The
-row stays `INVENTORIED`; this commit changes no lifecycle state. The checkpoint
-is staged on the NAS and the oracle smoke run is queued behind the GPU lock.
+**State at this commit:** **W1 and W3 have LANDED on `main`; W2 is in
+re-review.** The `MIXED_PRECISION` resolver landed at `1bc5ef82c` (#561) and the
+W3 scaffold at `c6b240edd` (#576); both are merged into this branch, and their
+spec sections (§4's three W1 subsections, §5c/§5d/§5e) are main's, carried here
+byte for byte. The Mamba2 SSD kernel work W1 landed earlier at `47960a009`
+(#496), so `include/vt/ops.h` carries main's
+`kMamba2ChunkScan`/`kMamba2StateUpdate`/`kRmsNormGatedGroup` first and appends
+`kMoeRelu2` after them; no existing op id shifted. W2 (the non-gated `relu²`
+expert, §6a) was reviewed PASS at `e2d68404`, repaired for that review's six
+findings at `dd7a6477d`, and this branch is its land-prep: re-merged onto
+`origin/main` and fully re-gated. A second fresh review (PR #586 @ `f6a7f8709`)
+returned **PASS** — it established that the repair delta changes zero executable
+lines — with four RECORD findings, all repaired on
+`row/MODEL-NEMOTRON-H-W2-RECORDS`: two stale `activation.py:33` anchors
+(`include/vt/ops.h`, this spec), M7's assertion count (§6a), §4's W2 seam text
+contradicting §6a, and an overstated bit-identity comment in `cuda_moe.cu`
+(#591). That repair touches comments and this spec only; no executable line
+moved. `tests/vt/test_ops_moe_nongated_relu2.cpp:12` already carried the
+corrected anchors and needed no change.
 
-**Next action:** dispatch fresh implementers for **W1** and **W2** (both
-independent of #496) as soon as `row/KERNEL-SSM-MAMBA-SSD-W1` clears review,
-so the ops-header churn does not collide.
+The row stays `INVENTORIED`; this commit changes no lifecycle state, so it owes
+no `STATUS`/`BENCHMARKS` write. **Oracle gateability is CLOSED** — §5a records
+the pinned oracle loading and running the checkpoint on GB10 with three greedy
+goldens committed, so W6 has a denominator whenever it is reached.
+
+**Next action:** **W4 is written and gated on `row/MODEL-NEMOTRON-H-W4B` (§6b)
+and needs a FRESH REVIEW** — never the agent that wrote it — which should mutate
+the self-certification (§6b M15) and the two anti-vacuity guards that were
+rewritten, because those are the claims this W changes rather than adds.
+
+After W4 lands, the next brick is **the WEIGHT LOADER**, which §4's table does
+not name as a W of its own and should: W5 (MTP), W6 (the e2e token gate) and W7
+(GGUF) all sit behind it, and until it exists the forward refuses by name on
+every checkpoint load. Also carried forward, not resolved: the two OWED GPU items
+in §6a (`kMoeGroupedGemmNvfp4Marlin` on the real g16 tensors, and the end-to-end
+NemotronH MoE block on GB10), and the OWED GGUF k-quant arm tracked as W7 (§5b).
+
+The row stays `INVENTORIED`: W4 changes no lifecycle state, because nothing runs
+end to end yet.
 
 ## 8. Stop conditions
 

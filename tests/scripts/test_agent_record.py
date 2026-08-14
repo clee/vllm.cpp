@@ -269,6 +269,57 @@ class AgentRecordMutationTests(unittest.TestCase):
         self.assertEqual(len(recipe), 1)
         self.assertEqual(recipe[0].path.name, "engine-matrix.md")
 
+    def test_omni_pin_row_is_inside_the_engine_ratchet(self) -> None:
+        """The #633 row and its 153 -> 154 ratchet bump are one semantic change.
+
+        Same shape as the #117 and #606 assertions above, and it carries one
+        extra hazard worth pinning. This bump COLLIDED: `main` took the constant
+        152 -> 153 for `SERVE-RECIPE-ARGS` while the omni-pin branch took the
+        same 152 -> 153 for its own row, so both sides read 153 and the merge
+        looked clean. Resolving it by keeping either 153 would have dropped a
+        real row while leaving the matrix internally consistent, which is
+        exactly the state no other assertion here can see. Naming BOTH rows is
+        what makes 154 checkable rather than plausible.
+        """
+
+        errors: list[str] = []
+        rows, _ = agent_record.check_matrices(errors)
+        self.assertEqual([error for error in errors if "engine rows" in error], [])
+
+        for item_id in ("ENG-UPSTREAM-OMNI-PIN", "SERVE-RECIPE-ARGS"):
+            found = [row for row in rows if row.item_id == item_id]
+            self.assertEqual(len(found), 1, item_id)
+            self.assertEqual(found[0].path.name, "engine-matrix.md", item_id)
+
+    def test_music3_and_indextts_rows_both_survive_their_collision(self) -> None:
+        """373 needs BOTH rows named, because the merge that produced it collided.
+
+        The same hazard the omni-pin assertion above records, on the MODEL pin
+        and on the same day. `main` took the constant 370 -> 372 for IndexTTS-2.5
+        (two architectures) while the Music3 branch took 370 -> 371 for its own
+        row. Neither side was wrong about its own change, and neither number was
+        373 -- so whichever side an auto-merge kept, the tree would have been
+        internally consistent while silently short a real architecture.
+
+        A count assertion alone cannot see that: it only knows the pin matches
+        the rows it can find. Naming the three rows is what makes 373 checkable
+        rather than plausible.
+        """
+
+        errors: list[str] = []
+        rows, _ = agent_record.check_matrices(errors)
+        self.assertEqual([error for error in errors if "MODEL rows" in error], [])
+
+        collided = (
+            "MODEL-MUSIC-minimax-music3-mini-max-music3-for-conditional-generation",
+            "MODEL-MM-indextts2-index-tts2-talker-for-conditional-generation",
+            "MODEL-MM-indextts2-index-tts2-s2-mel-decoder",
+        )
+        for item_id in collided:
+            found = [row for row in rows if row.item_id == item_id]
+            self.assertEqual(len(found), 1, item_id)
+            self.assertEqual(found[0].path.name, "model-matrix.md", item_id)
+
     def test_model_row_ratchet_is_load_bearing(self) -> None:
         """The MODEL row pin must catch a row appearing or vanishing.
 
@@ -277,8 +328,11 @@ class AgentRecordMutationTests(unittest.TestCase):
         architecture re-pins it by hand. Muse Glimmer took it 361 -> 362
         (`c8fc24a50`); the seven recipe architectures that had no row at all took
         it 362 -> 369 (#609, #610, `eba6ab7c7`); LTX-2.5 took it 369 -> 370
-        (#435, `cefacd2d0`). Without this, bumping the number to silence a
-        failure is indistinguishable from bumping it because a row really landed.
+        (#435, `cefacd2d0`); IndexTTS-2.5 took it 370 -> 372, being two
+        architectures (#634); MiniMax-Music3 took it to 373 (#672); and the two
+        text-only Qwen3.5 arms took it 373 -> 375 (#490). Without this,
+        bumping the number to silence a failure is indistinguishable from bumping
+        it because a row really landed.
         """
         clean: list[str] = []
         agent_record.check_matrices(clean)
@@ -300,6 +354,33 @@ class AgentRecordMutationTests(unittest.TestCase):
         ):
             agent_record.check_matrices(errors)
         require(errors, r"\d+ MODEL rows; expected \d+")
+
+    def test_indextts_rows_are_inside_the_model_ratchet(self) -> None:
+        """The #634 rows and the 370 -> 372 bump are one semantic change.
+
+        IndexTTS-2.5 is registered by vLLM-Omni as TWO architectures, a talker
+        and an S2Mel decoder, so it moves the pin by two rather than one. That
+        is the hazard worth pinning: a port described in prose as "a model" is
+        the shape that lands one row and a bump of two, and the count alone
+        cannot tell that from two rows landing. Both are named here, and both
+        are asserted `INVENTORIED` rather than `SPIKE` — they are unclaimed and
+        blocked on #633, and `SPIKE` would owe a `CLAIM-*` owner they do not
+        have.
+        """
+        errors: list[str] = []
+        rows, _ = agent_record.check_matrices(errors)
+        self.assertEqual([error for error in errors if "MODEL rows" in error], [])
+
+        for item_id in (
+            "MODEL-MM-indextts2-index-tts2-talker-for-conditional-generation",
+            "MODEL-MM-indextts2-index-tts2-s2-mel-decoder",
+        ):
+            found = [row for row in rows if row.item_id == item_id]
+            self.assertEqual(len(found), 1, item_id)
+            self.assertEqual(found[0].path.name, "model-matrix.md", item_id)
+            self.assertEqual(
+                found[0].field("state").strip().strip("`"), "INVENTORIED", item_id
+            )
 
     def test_recipe_backfill_rows_are_inside_the_model_ratchet(self) -> None:
         """The #609/#610 rows and the 362 -> 369 bump are one semantic change.
@@ -805,6 +886,53 @@ class TenstorrentResidualGoldenRowIsCounted(unittest.TestCase):
             any("backend rows" in e.lower() for e in errors),
             f"the BACKEND pin must bind; got {errors}",
         )
+
+
+class Qwen35TextOnlyRowsAreCounted(unittest.TestCase):
+    """The MODEL ratchet bump 373 -> 375 is backed by two real rows (#490).
+
+    Same shape, and the same reason, as the BACKEND class above: the count is
+    re-pinned by hand, so a bump with nothing behind it is indistinguishable
+    from a bump for rows that really landed. `test_model_row_ratchet_is_
+    load_bearing` proves the pin BINDS by moving it, which holds for any value
+    of the pin; it cannot say whether THIS value is the right one. These two
+    tests do, by tying the pin to the rows the matrix actually carries.
+    """
+
+    ROWS = (
+        "MODEL-TEXT-qwen3-5-qwen3-5-for-causal-lm",
+        "MODEL-TEXT-qwen3-5-qwen3-5-moe-for-causal-lm",
+    )
+
+    def test_both_text_only_rows_exist_in_the_model_matrix(self) -> None:
+        lines = (
+            (ROOT / ".agents/model-matrix.md")
+            .read_text(encoding="utf-8")
+            .splitlines()
+        )
+        for row in self.ROWS:
+            matching = [line for line in lines if line.startswith(f"| `{row}` |")]
+            self.assertEqual(len(matching), 1, f"{row} must appear exactly once")
+
+    def test_the_model_pin_equals_the_rows_the_matrix_carries(self) -> None:
+        """MUTATION: the pin and the tree disagreeing by one row must be RED.
+
+        Counted the way `check_matrices` counts, so a pin left behind by a
+        landing row -- or moved ahead of one -- fails here and not only inside
+        the checker's own error list.
+        """
+        path, expected = agent_record.MATRICES["MODEL"]
+        errors: list[str] = []
+        rows, _ = agent_record.check_matrices(errors)
+        actual = sum(
+            row.item_id.startswith("MODEL-") for row in rows if row.path == path
+        )
+        self.assertEqual(
+            actual,
+            expected,
+            "the MODEL pin must equal the MODEL rows model-matrix.md carries",
+        )
+        self.assertEqual([error for error in errors if "MODEL rows" in error], [])
 
 
 if __name__ == "__main__":
