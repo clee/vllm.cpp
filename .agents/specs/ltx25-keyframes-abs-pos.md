@@ -223,7 +223,88 @@ finding about the gate, not a pass).
   three times on 2026-08-13; treat GPU evidence as best-effort and gate the row
   on the fixture goldens.
 
+## Outcome
+
+Implemented 2026-08-14 on `row/LTX25-KEYFRAMES-ABS-POS`.
+
+**§2 reproduced, and it is now a script rather than a paragraph.**
+`scripts/measure-ltx2-keyframes-meta.py` runs upstream's own `create_meta_model`
++ `SafetensorsModelStateDictLoader` against the real NVFP4 file at pin
+`fd4ded7f`:
+
+```
+declared - state_dict          : 1 key(s)
+    keyframes_abs_pos_embedding
+loadable at declared shape     : 2914 of 7876
+neighbour scale_shift_table    : device=cpu is_meta=False   <- the CONTROL
+keyframes_abs_pos_embedding    : device=meta is_meta=True
+in missing_keys                : True
+reading the value RAISES       : Tensor.item() cannot be called on meta tensors
+supports_... BEFORE / AFTER    : False / False
+```
+
+Two corrections to §2's recipe, both discovered by running it. The control key
+had to change: `patchify_proj.weight` is NVFP4-**packed**, half its logical
+width, so `load_state_dict` raises on it and the state dict must be filtered to
+the unpacked parameters first — `scale_shift_table` is the neighbour that
+actually materialises. And the load needs upstream's own
+`LTXV_MODEL_COMFY_RENAMING_MAP` (`model_configurator.py:221-225`); without it
+every key keeps its `model.diffusion_model.` prefix, nothing matches, and the
+probe reports "still on meta" for the WHOLE model — an instrument that agrees
+with the conclusion for the wrong reason.
+
+**The FP8 header, re-measured on the bytes:** `F8_E4M3 [1, 4096]`, 4096 of 4096
+bytes non-zero, plus `keyframes_abs_pos_embedding_scale` `F32` rank-0. That
+scalar-scale shape is exactly what `MaterializeDitTensor`'s existing `F8_E4M3`
+arm reads (`ReadScalarF32` + `DequantFp8ToBf16` → `kBF16`), so the stop condition
+in §7 did not fire: **no second dequant convention was invented.**
+
+**Resolution rule.** `Ltx2DitParams::use_keyframes_abs_pos_embedding` means
+`supports_keyframes_abs_pos_embedding` (`model.py:166-173`), not the raw config
+flag. `Ltx2AdoptDeclaredDitParams` resolves a declared flag against what the file
+carries; the `allow_unported_modules` force-clear is gone, and so is that
+parameter — a render's opt-in must not decide a correctness question. Three
+outcomes, all upstream's: declared+present → applied; declared+absent → nothing
+applied, no refusal; not declared → nothing applied. The **rejected** fourth is
+§6's tempting middle: allocating a zero tensor because the code path wants one.
+
+**Goldens.** `gen-ltx2-goldens.py` gains section 7, which TRAINS the parameter
+rather than leaving it at upstream's zero-init — a zero bias is an exact no-op
+because the term is ADDED, so a zero arm would gate nothing. Regeneration is
+reproducible: two runs at the pin differ only in the recorded argv line, and the
+run against the pre-change generator reproduced the checked-in file
+byte-for-byte on the same one line. §6's risk did **not** materialise as feared:
+the diff is +650/−8 and **all eight removed lines are `// --- forward case ...`
+banner comments** that gained two fields. **Zero existing golden VALUES changed**,
+because the deterministic weight stream is keyed by parameter NAME, so adding a
+parameter perturbs nothing else. Measured magnitude: the marker moves the DiT
+video output by 0.278 (71.5% of max|unmarked|) and the audio output by 1.49%,
+the latter only through the audio↔video cross attention.
+
+**Two gate holes, found by mutation and closed in-flow.**
+
+1. **A CONDITIONAL marker was invisible.** Wrapping the engine's mask in
+   `if (wants_image)` compiled clean and left all five LTX-2.5 suites GREEN
+   (43/43, 17/17, 28/28, 35/35, 36/36). Two causes: the fixture DiT did not carry
+   the parameter, so no engine render could observe a drop; and an empty
+   `std::vector`'s `data()` is `nullptr`, which is upstream's *legal* "no token is
+   marked" — the defect arrives wearing a supported path's costume. Fixed by
+   giving `ReducedDitParams` the flag (as the shipped FP8 DiT resolves it) and by
+   refusing an empty marker by name. Re-run: 11 RED cases in `test_ltx2_video`.
+2. **Nothing looked at the DEVICE addend's WIDTH.** Removing the
+   `dtype == out.x->t().dtype` equality left all five suites green. That is the
+   too-WIDE case exactly: an f32 addend under a bf16 stream is numerically
+   correct, agrees with every golden, and moves twice the bytes. A dedicated case
+   now stages at bf16, swaps in the f32 view of the same values, and requires a
+   refusal by name — with a positive control for its own substring search.
+
+**Not in scope and still owed:** keyframe *conditioning* as a user feature
+(supplying slots), which needs the token-APPEND machinery `ltx2_video.cpp`'s
+last-frame refusal describes. The DiT FORWARD on the shipped 21.00B geometry is
+still out of reach on this box, so the real-checkpoint evidence stops at load.
+
 ## Now
 
-`READY`. Spec committed ahead of implementation; a fresh implementer works from
-this file, and a fresh reviewer — not the implementer — reviews the head.
+`DONE` pending fresh review. Implemented, gated on CPU, and pushed as
+`row/LTX25-KEYFRAMES-ABS-POS`; a fresh reviewer — not the implementer — reviews
+the head, and the operator reruns the gate itself.
