@@ -1802,12 +1802,18 @@ signal ([[doctest-assertions-line-hides-thrown-cases]]).
 Local x86_64 CPU-only host (GNU 13.3, Ninja, `VLLM_CPP_CUDA=OFF`), disk recorded
 beside every number ([[enospc-makes-checkers-emit-false-policy-refusals]]).
 
-FINAL, at the merged head `e3f2992af` over `origin/main` @ `c01e4be93`:
+FINAL, at the merged head over `origin/main` @ `ca01719e6` -- re-run in full
+because `origin/main` moved again before the push AND landed a checker this
+branch had never been measured against (`scripts/check-commit-style.py`,
+POLICY-SINGLE-PR-AND-STYLE `ddff09093`):
 
 | Arm | Result | disk free |
 |---|---|---|
-| Release `-Werror`, **clean full build from an empty tree** | **`BUILD_EXIT=0`, 0 `warning:` lines, 0 `error:` lines, 0 `No space left` lines**, 1393/1393 targets | 103G / 77% |
-| full `ctest -j4` | **470 of 470 PASSED, `CTEST_EXIT=0`**, 124 s. Skipped: `test_modelopt_mixed_precision_checkpoint`, `test_voxtral_e2e`. `test_op_parity` PASSES (the `main`-inherited red #755/#672 is gone at this base); `test_cpu_threadpool` passes on an idle box | 103G / 76% |
+| Release `-Werror`, **clean full build from an empty tree** | **`BUILD_EXIT=0`, 0 `warning:` lines, 0 `error:` lines, 0 `No space left` lines**, 1395/1395 targets | 100G / 77% |
+| full `ctest -j4` | **471 of 471 PASSED, `CTEST_EXIT=0`**, 111 s. Skipped: `test_modelopt_mixed_precision_checkpoint`, `test_voxtral_e2e`. `test_op_parity` PASSES (the `main`-inherited red #755/#672 is gone at this base); `test_cpu_threadpool` passes on an idle box | 100G / 77% |
+| the four Nemotron-H suites in that run | scaffold **12/12**, forward **13/13**, loader **2/2**, quantized_forms **5/5**, all Passed | 100G |
+| `scripts/check-commit-style.py --range ca01719e6..HEAD` (NEW gate) | **`OK: commit writing style`** | — |
+| `scripts/check-commit-trailers.py --range origin/main..HEAD` | **`OK: commit trailer contract`** | — |
 | `scripts/agent-preflight.sh` | **All gates green** — including `test_cpu_x86_llamacpp_floor`, which had RED earlier in this session at load average 91-130 and passes on the idle box, confirming it environmental rather than this row's ([[cpu-x86-floor-test-reds-under-box-load]]) | 103G |
 
 The earlier run of this same gate, on a contended box, is kept because a
