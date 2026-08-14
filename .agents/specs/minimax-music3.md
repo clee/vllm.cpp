@@ -671,6 +671,21 @@ and four properties that each rule out a different way of returning a
 well-formed non-song: non-zero, unclipped (a scale error would otherwise hide
 behind the decode's own clamp), non-constant, and two channels that DIFFER.
 
+**Why the CPU run is slow, named rather than left to be rediscovered.** The
+autoregressive half's host GEMM (`LinearNoBias`, `minimax_music3_ar.cpp`) is a
+scalar triple loop with a DOUBLE accumulator under `-ffp-contract=off` — it does
+not vectorize, by construction, because W2/W3 needed a reproducible reduction
+order to gate rounding against torch. That is fine for the W2/W3 gate, which
+makes 25 calls at sequence length 8. The GENERATION loop makes 42 calls at
+sequence lengths 2..8, and the depth decoder streams its whole 2.3 GB of weights
+per call, so the short sequences get roughly 4x less arithmetic per streamed byte
+than the gate's single seq-8 call does. MEASURED on this box: the AR half of one
+0.1 s request is ~1500 s of single-threaded CPU, and the `vt` CPU backend's
+threadpool is idle throughout it because none of this code goes through `vt`.
+This is a correctness-first implementation doing exactly what it was written to
+do; it is recorded here because the obvious first read of a slow run is "the
+language model is slow", and the language model is not the part that is slow.
+
 **Two things are still true and are not this phase's to change.** The
 multi-window coverage gap W6 named is unchanged — the capture is a single
 25-frame window. And there is **still no speed number**: every gate for this row

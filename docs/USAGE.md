@@ -1266,10 +1266,16 @@ missing pieces.
 
 **It runs on CPU and it is slow.** Every gate this row has was taken on CPU
 (`dgx.casa` was down throughout), and the acoustic half is upstream's own fp32.
-A 0.1 s request takes minutes; no speed number exists and none is claimed. Two
-things dominate: the language model's prefill, and the 2.4B fp32 DiT, which runs
-twice per denoise step under classifier-free guidance. Ask for a short duration
-and few `num_inference_steps` while you are checking that it works.
+A 0.1 s request takes tens of minutes; no speed number exists and none is
+claimed. Ask for a short duration and few `num_inference_steps` while you are
+checking that it works.
+
+The part that dominates is *not* the one you would guess. The 8.6B language
+model goes through `vt` and uses the CPU threadpool; the RVQ depth decoder and
+the DiT do not — they are scalar host loops with a double accumulator, written
+that way in W2-W5 so their reduction order is reproducible against torch, and
+they run single-threaded. In one 0.1 s request the depth decoder alone is the
+majority of the wall clock.
 
 The same seam is reachable from the C ABI at v20 — `vllm_speech_engine_load`,
 `vllm_speech_engine_family` / `_sample_rate` / `_requires_reference_audio`,
