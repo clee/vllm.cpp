@@ -773,6 +773,7 @@ add_library(vllm STATIC
   src/vllm/model_executor/models/indextts2.cpp
   src/vllm/model_executor/models/campplus.cpp
   src/vllm/model_executor/models/w2vbert.cpp
+  src/vllm/model_executor/models/fvq.cpp
   src/vllm/model_executor/models/minimax_h3_video_vae.cpp
   src/vllm/model_executor/models/minimax_h3_video_vae_device.cpp
   src/vllm/model_executor/models/minimax_h3_vae_cnn.cpp
@@ -1104,6 +1105,7 @@ add_library(vllm STATIC
   src/vllm/entrypoints/openai/tool_parsers/gemma4.cpp
   src/vllm/entrypoints/openai/tool_parsers/seed_oss.cpp
   src/vllm/entrypoints/openai/tool_parsers/muse_glimmer.cpp
+  src/vllm/entrypoints/openai/tool_parsers/parser_engine_adapter.cpp
   src/vllm/entrypoints/openai/reasoning_parsers/muse_glimmer.cpp
   src/vllm/parser/engine/incremental_lexer.cpp
   src/vllm/parser/engine/token_id_scanner.cpp

@@ -114,6 +114,8 @@ vllm_cpp_add_test(test_speech_engine vllm/multimodal/test_speech_engine.cpp)
 vllm_cpp_add_test(test_indextts2_family vllm/models/test_indextts2_family.cpp)
 vllm_cpp_add_test(test_campplus vllm/models/test_campplus.cpp)
 vllm_cpp_add_test(test_w2vbert vllm/models/test_w2vbert.cpp)
+vllm_cpp_add_test(test_fvq vllm/models/test_fvq.cpp)
+target_include_directories(test_fvq PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
 target_include_directories(test_w2vbert PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
 target_include_directories(test_campplus PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
 vllm_cpp_add_test(test_gpt2 vllm/models/test_gpt2.cpp)
@@ -870,6 +872,8 @@ vllm_cpp_add_test(test_longcat
   vllm/entrypoints/openai/tool_parsers/test_longcat.cpp)
 vllm_cpp_add_test(test_kimi_k2
   vllm/entrypoints/openai/tool_parsers/test_kimi_k2.cpp)
+vllm_cpp_add_test(test_tool_parser_inkling
+  vllm/entrypoints/openai/tool_parsers/test_inkling.cpp)
 vllm_cpp_add_test(test_granite_tool_parser
   vllm/entrypoints/openai/tool_parsers/test_granite_tool_parser.cpp)
 vllm_cpp_add_test(test_granite4_tool_parser
