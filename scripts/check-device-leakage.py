@@ -45,56 +45,103 @@ is exactly what `src/vllm/multimodal/minimax_h3_video.cpp` did: it scored ZERO i
 WAS counted. The gate read the confession and missed the act. It is also an
 enum-ordering hazard — reordering the enum silently re-points every such site.
 
-`dev_cast` is anchored on the TARGET TYPE, not on the operand and not on one
-cast keyword, because the property is "an integer becomes a DeviceType outside
-the platform seam" and the property is what has to be caught. The reverse
-direction (`static_cast<int>(type)`) is the SAFE one and is deliberately not
-counted: it is how the seam itself indexes its registry.
+The reverse direction (`static_cast<int>(type)`) is the SAFE one and is
+deliberately not counted: it is how the seam itself indexes its registry.
 
-WHAT `dev_cast` DOES SEE, in every spelling of the one conversion: the four cast
-keywords, `bit_cast`, and the C-style, functional, brace and DECLARATION forms;
-the type written as `DeviceType`, `vt::DeviceType`, `::vt::DeviceType` or
-`enum vt::DeviceType`, with `const`/`volatile` on EITHER side of the name; an
-operand that is an identifier, a literal (`)1`), a signed literal (`)-1`), a
-parenthesised expression or a unary expression (`)*cursor`, `)~mask`, `)!flag`);
-a target that is a POINTER, a POINTER-TO-POINTER or a REFERENCE, which is how
-`reinterpret_cast` puns an integer's bytes onto a DeviceType; and a cast
-clang-format has wrapped across two lines.
+WHAT `dev_cast` ENFORCES, EXACTLY. It is a regular expression over
+comment-stripped text, so what it enforces is a SET OF SPELLINGS. It does NOT
+enforce the property it was written for — "an integer becomes a DeviceType
+outside the platform seam" — and it cannot: it cannot resolve a name to a type,
+cannot tell an integer operand from a DeviceType one, and cannot see a conversion
+whose target type is not written at the conversion site. Read a green `dev_cast`
+as "none of the spellings enumerated below is present", never as "no integer
+becomes a DeviceType here". #828 tracks the AST-level check (clang tooling),
+where the destination type canonicalises and the source type is known, and which
+is what would enforce the property. This pattern is the INTERIM, and says so.
+
+That distinction is measured, not defensive. FOUR review rounds of this one
+bucket each found a spelling the previous round's message already claimed to
+cover. #660 shipped it; round 1 found the literal operand `(vt::DeviceType)1`,
+and the mutant written to rule that out used an IDENTIFIER operand, so it could
+not see the gap it existed to close; round 2 found nine more that all write the
+target type the docstring named as its anchor; round 3 found eight more (counted,
+not rounded), including a FOURTH place a cv-qualifier can sit while the mutant
+asserted "all three".
+Every one of them closed at ZERO hits on the scanned tree, so none was a
+coverage-versus-false-positive trade — there was simply always another spelling.
+So the list below is an enumeration of what was MEASURED, not a claim about a
+class.
+
+WHAT `dev_cast` DOES SEE. Each entry is pinned by its own mutant in
+tests/scripts/test_device_leakage.py, asserted individually:
+
+  * the named casts `static_cast`, `reinterpret_cast`, `const_cast`,
+    `dynamic_cast` and `bit_cast`, plus the builtin spelling
+    `__builtin_bit_cast(vt::DeviceType, x)`. `bit_cast` is a FUNCTION template
+    with two parameters, so its second template argument (`From`) may be
+    written — as long as it is on one line and contains no nested angle
+    brackets;
+  * the C-style cast `(vt::DeviceType)x`, the functional casts
+    `vt::DeviceType(x)` and `vt::DeviceType{x}`, and the same conversion spelled
+    as a DECLARATION, `vt::DeviceType d{x}`;
+  * the type written `DeviceType`, `vt::DeviceType`, `::vt::DeviceType` or
+    `enum vt::DeviceType`, with `const`/`volatile` on EITHER side of the name in
+    ALL of those forms — the declaration form included, which is the fourth
+    cv-position and the one round 3 found (`vt::DeviceType const kD{1}`);
+  * an operand that is an identifier, a literal (`)1`), a signed literal (`)-1`),
+    a parenthesised expression, or a unary expression (`)*cursor`, `)~mask`,
+    `)!flag`);
+  * a target that is a POINTER, a POINTER-TO-POINTER or a REFERENCE — the pun
+    `reinterpret_cast` performs on an integer's bytes — in the named-cast form
+    AND the C-style form, with cv-qualifiers anywhere inside the `*`/`&` run
+    (`reinterpret_cast<vt::DeviceType* const&>(p)`);
+  * a cast clang-format has wrapped across two lines.
 
 WHAT `dev_cast` STILL CANNOT SEE, stated here because a checker's message is the
 authority on what it enforces and an instrument that hides its blind spot
-returns a false pass. Each entry states the reason that is true OF THAT ENTRY,
-because a list whose shared reason is false for one member is the same false
-claim in a smaller font:
+returns a false pass. Every entry states the reason that is true OF THAT ENTRY
+ALONE, and no entry binds two cases whose reasons differ — a list whose shared
+reason is false for one member is the same false claim in a smaller font, and
+that is precisely what rounds 2 and 3 each found here:
 
   * a cast whose target is a type ALIAS (`using DT = vt::DeviceType;` then
-    `static_cast<DT>(x)`), a macro that expands to the type name, or a template
-    parameter that resolves to DeviceType. Reason: no spelling of the target
-    type appears at the conversion site;
-  * `memcpy` or a union punning an integer onto a DeviceType. Same reason: the
-    type is named at the declaration, never at the conversion. (`std::bit_cast`
-    DOES name it there, so it is a cast keyword above rather than an entry here,
-    and the `reinterpret_cast` pointer/reference puns are caught too.);
-  * a C-STYLE cast whose target is a pointer or reference, `*(vt::DeviceType*)&x`.
-    Reason: the C-style alternative must not swallow a parameter list, and its
-    two discriminators — the `(` not glued to an identifier, and no declarator
-    suffix after the `)` — cannot tell `void note (vt::DeviceType*) &` from a
-    pun, because both are `)` followed by `&`. The NAMED-cast spelling of the
-    same pun IS caught, which is why this is a narrow gap rather than the class;
+    `static_cast<DT>(x)`), a MACRO that expands to the type name, or a TEMPLATE
+    PARAMETER that resolves to DeviceType. Reason: no spelling of the target
+    type appears at the conversion site, so there is nothing to anchor on;
+  * `memcpy` or a UNION punning an integer onto a DeviceType. Reason: there is
+    no cast EXPRESSION to anchor on. (Not "the type is not named at the site":
+    the idiomatic `std::memcpy(&dt, &raw, sizeof(vt::DeviceType))` names it right
+    there, and matching that would mean matching a bare `sizeof(vt::DeviceType)`,
+    which converts nothing. The old entry gave `bit_cast`'s reason to `memcpy`,
+    and `bit_cast` is now a keyword above.);
+  * the C-style POINTER PUN whose operand begins with `&`, `*(vt::DeviceType*)&x`.
+    Reason: closing it needs `&` in the trailing class, and `) &` / `) &&` are
+    ref-qualifiers on a member declarator — `void note (vt::DeviceType*) &;`
+    compiles, and admitting `&` turns it into a false positive (measured: 2).
+    Every OTHER C-style pointer or reference cast IS caught — `(vt::DeviceType&)`
+    and `(vt::DeviceType*)` both — as is the named-cast spelling of this same
+    pun, so this is one operand shape rather than the class;
+  * a CHARACTER-LITERAL operand, `(vt::DeviceType)'\x01'`. Reason: character
+    literals are blanked to whitespace by `strip_comments_and_strings` before the
+    pattern ever runs, so the operand is gone by match time and no trailing class
+    could see it. `(vt::DeviceType)buf[0]` is caught, so this is that one literal
+    kind, not the wire-decode shape;
   * a conversion that happens inside `src/vt/` and is merely CALLED from the
-    shared layer — `src/vt/` is a device leg and is not scanned at all;
-  * whether the operand really is an integer. Nothing here type-checks; the
-    bucket flags every cast TO DeviceType and relies on `// DSR-ALLOW(<row>)`
+    shared layer. Reason: `src/vt/` is a device leg and is not scanned at all;
+  * whether the operand really is an integer. Reason: nothing here type-checks.
+    The bucket flags every cast TO DeviceType and relies on `// DSR-ALLOW(<row>)`
     for the legitimate ones (a wire-format decode is the expected case). This is
     also why a pointer or reference target counts: `const_cast<DeviceType&>(t)`
     removes const rather than converting an integer, and buys its exemption the
-    same way.
+    same way;
+  * any spelling that is not on the list above. Reason: this is a spelling list,
+    and four rounds of finding a new one is the evidence that a spelling list is
+    not the class. That gap does not close by widening; it closes at #828.
 
-Those are gaps in a TEXT checker, not gaps that were traded away for
-convenience. tests/scripts/test_device_leakage.py M20-M40 pin what it does
-catch, each spelling asserted on its own — including, in M29, the literal
-operand, because a discriminator tested only on the case it was tuned for is a
-guard that certifies itself.
+tests/scripts/test_device_leakage.py M20-M46 pin what it does catch, each
+spelling asserted on its own — including, in M29, the literal operand, because a
+discriminator tested only on the case it was tuned for is a guard that certifies
+itself.
 
 HOW THE RATCHET WORKS. `scripts/device-leakage-baseline.json` holds the accepted
 per-bucket counts. Any bucket ABOVE its baseline fails. Any bucket BELOW its
@@ -141,13 +188,18 @@ BUCKETS = ("kcuda", "is_cuda", "dev_cast", "cuda_inc", "vt_ifdef")
 RE_KCUDA = re.compile(r"\bkCUDA\b")
 RE_IS_CUDA = re.compile(r"\bis_cuda\s*\(\s*\)")
 
-# `dev_cast`: an integer becoming a DeviceType. Three alternatives, one per C++
+# `dev_cast`: an integer becoming a DeviceType. Four alternatives, one per C++
 # spelling of the same conversion, all anchored on the TARGET TYPE:
 #
 #   1. a named cast          static_cast<vt::DeviceType>(x) / <DeviceType> / …
 #                            and the INDIRECT forms, *reinterpret_cast<DeviceType*>(&x)
 #                            and reinterpret_cast<DeviceType&>(x)
-#   2. a C-style cast        (vt::DeviceType)x  and  (vt::DeviceType)1
+#   1b. __builtin_bit_cast   __builtin_bit_cast(vt::DeviceType, x) — the same
+#                            conversion as (1)'s `bit_cast`, but a two-argument
+#                            BUILTIN rather than a template-id, so (1)'s `<…>`
+#                            anchor cannot reach it
+#   2. a C-style cast        (vt::DeviceType)x, (vt::DeviceType)1,
+#                            (vt::DeviceType&)raw and (vt::DeviceType*)vp
 #   3. a functional cast     vt::DeviceType(x) / vt::DeviceType{x}, and the same
 #                            conversion spelled as a DECLARATION, `DeviceType d{x}`
 #
@@ -183,37 +235,76 @@ RE_IS_CUDA = re.compile(r"\bis_cuda\s*\(\s*\)")
 # is the false positive the trailing guard exists to reject. Measured over
 # `src/vllm` + `include/vllm`: admitting `0-9+-*~!` adds ZERO hits.
 #
-# (1) and (2) both take the cv-qualifiers on EITHER SIDE of the type name, and (1)
-# takes any run of `*` and `&`. `vt::DeviceType const` is the same type as
-# `const vt::DeviceType`, and `reinterpret_cast<vt::DeviceType&>(raw)` is the same
-# pun as `*reinterpret_cast<vt::DeviceType*>(&raw)` — both COMPILE (checked, not
-# read), and a pattern that saw west const and one star while the docstring
-# claimed the target type is what it is anchored on would be asserting coverage it
-# did not have. That is #660's own defect turned on the instrument, which is why
-# the run of `[*&]` is a run and the cv-qualifier group is two-sided.
+# (2)'s TARGET, by contrast, does take a run of `*` and `&` — INSIDE the parens,
+# where no declarator can be confused with it. That is the split the blind-spot
+# entry used to get wrong: the old note bound "pointer or reference" together
+# under the single reason "both are `)` followed by `&`", which is true of
+# `*(vt::DeviceType*)&x` and FALSE of `(vt::DeviceType&)raw`, whose next character
+# is an identifier. Widening only inside the parens catches the reference form and
+# `(vt::DeviceType*)vp` at zero cost; the ref-qualifier negatives
+# `void note (vt::DeviceType*) &;` and `… &&;` stay at zero because `&` is still
+# out of the TRAILING class. Both halves compile-verified, both measured.
 #
-# `bit_cast` joins the four cast keywords for the same reason: `bit_cast` spells
-# the target type at the conversion site, so the blind-spot note below could not
-# honestly claim it as unreachable — `memcpy` and union punning still are, and
-# they are the cases where no spelling of the type appears at all.
+# `sizeof (vt::DeviceType) + 1` was ALREADY a false positive before that widening
+# — `sizeof` is not glued to its paren there, so the identifier discriminator
+# passes, and `+` is in the trailing class — and admitting `*` inside the parens
+# would have extended it to `sizeof (vt::DeviceType*) + 1`. A `sizeof` or
+# `alignof` converts nothing, so both are excluded outright rather than left as a
+# gap the widening made wider. The lookbehinds are fixed-width, so they cover the
+# one-space spelling clang-format produces; `sizeof(` with no space was already
+# blocked by the glued-identifier discriminator. Measured: removing these two
+# costs nothing on the tree (dev_cast stays at its single allowlisted hit).
+#
+# (1) and (2) and (3) all take the cv-qualifiers on EITHER SIDE of the type name,
+# and (1) takes any run of `*`, `&` and cv-qualifiers INTERLEAVED.
+# `vt::DeviceType const` is the same type as `const vt::DeviceType`;
+# `reinterpret_cast<vt::DeviceType&>(raw)` is the same pun as
+# `*reinterpret_cast<vt::DeviceType*>(&raw)`; and `vt::DeviceType* const&` puts a
+# cv-qualifier one position further right than a `[*&]`-only run can reach — all
+# COMPILE (checked, not read). (3) is where the fourth cv-position hides:
+# `vt::DeviceType const d{raw}` is a declaration, and a group present on (1) and
+# (2) but absent from (3) is a docstring claiming three places while the code
+# covers two.
+#
+# `bit_cast` joins the four cast keywords because it spells the target type at the
+# conversion site, so the blind-spot note below could not honestly claim it as
+# unreachable. It is a FUNCTION template, not a cast operator, so `From` may also
+# be written — `std::bit_cast<vt::DeviceType, std::uint8_t>(raw)` compiles — and
+# the optional `,` tail is what lets (1) reach that form. `__builtin_bit_cast`
+# gets its own alternative because it is not a template-id at all. `memcpy` and
+# union punning stay blind, and their reason is now their own: there is no cast
+# expression to anchor on.
 #
 # (3)'s DECLARATION form takes `{` only. `DeviceType d{x}` is a real conversion
 # (C++17 permits list-initialising a scoped enum with a fixed underlying type),
 # but `DeviceType d(x)` is ILL-FORMED — there is no implicit int→scoped-enum
 # conversion — so nothing is lost by excluding it, while allowing `(` would match
 # every FUNCTION DEFINITION whose return type is DeviceType (measured: 3 false
-# positives, e.g. `vt::DeviceType MiniMaxH3VideoDeviceType(`).
+# positives, e.g. `vt::DeviceType MiniMaxH3VideoDeviceType(`). Adding the east
+# cv-group to (3) does not reopen that: `vt::DeviceType const Frozen(int);` still
+# scores 0, because `{` is still the only initialiser admitted.
 _DEVTYPE_QUAL = r"(?:enum\s+)?(?:::\s*)?(?:vt\s*::\s*)?"
 # cv-qualifiers, which C++ permits on either side of the type name.
 _CV_WEST = r"(?:(?:const|volatile)\s+)*"
 _CV_EAST = r"(?:\s*(?:const|volatile)\b)*"
+# A named cast's target suffix: `*`, `&` and cv-qualifiers, any number, any order.
+# `vt::DeviceType* const&` needs the cv-qualifier INSIDE the run, not before it.
+_TARGET_SUFFIX = r"(?:\s*(?:const\b|volatile\b|[*&]))*"
+# `bit_cast`'s second template parameter (`From`), which may be written out.
+# One line, no nested angle brackets — deliberately narrow, since the scanned
+# roots contain zero `bit_cast` occurrences and a greedy tail would be the only
+# way this could cost a false positive.
+_TEMPLATE_TAIL = r"(?:\s*,[^<>;{}\n]*)?"
 RE_DEVTYPE_CAST = re.compile(
     r"(?:static_cast|reinterpret_cast|const_cast|dynamic_cast|bit_cast)\s*<\s*"
-    + _CV_WEST + _DEVTYPE_QUAL + r"DeviceType\b" + _CV_EAST + r"(?:\s*[*&])*\s*>"
-    r"|(?:(?<![\w])|(?<=return)|(?<=case)|(?<=throw)|(?<=delete))"
-    r"\(\s*" + _CV_WEST + _DEVTYPE_QUAL + r"DeviceType\b" + _CV_EAST + r"\s*\)\s*"
+    + _CV_WEST + _DEVTYPE_QUAL + r"DeviceType\b" + _TARGET_SUFFIX + _TEMPLATE_TAIL + r"\s*>"
+    r"|__builtin_bit_cast\s*\(\s*"
+    + _CV_WEST + _DEVTYPE_QUAL + r"DeviceType\b" + _CV_EAST + r"\s*,"
+    r"|(?:(?<![\w])|(?<=return)|(?<=case)|(?<=throw)|(?<=delete))(?<!sizeof\s)(?<!alignof\s)"
+    r"\(\s*" + _CV_WEST + _DEVTYPE_QUAL + r"DeviceType\b" + _CV_EAST + r"(?:\s*[*&])*\s*\)\s*"
     r"(?!(?:const|volatile|noexcept|override|final|try)\b)(?=[A-Za-z_(0-9+\-*~!])"
-    r"|(?<![\w.:>])" + _DEVTYPE_QUAL + r"DeviceType\b\s*(?:\w+\s*\{|[({])\s*(?![)}])"
+    r"|(?<![\w.:>])" + _DEVTYPE_QUAL + r"DeviceType\b" + _CV_EAST
+    + r"\s*(?:\w+\s*\{|[({])\s*(?![)}])"
 )
 RE_CUDA_INCLUDE = re.compile(r'^\s*#\s*include\s*[<"](?:vt/cuda/|cuda_runtime)')
 RE_PP_IF = re.compile(r"^\s*#\s*(ifdef|ifndef|if)\b(.*)$")

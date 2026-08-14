@@ -20,7 +20,12 @@ The four things that must be true, and are each proven by a mutant below:
   4. The escape hatch is real, bounded and LOUD (M13-M15).
   5. The `dev_cast` bucket is derived from the PROPERTY — an integer becoming a
      `vt::DeviceType` outside the platform seam — and not from the one spelling
-     that happened to be in the tree when it was written (M20-M40, #660).
+     that happened to be in the tree when it was written (M20-M46, #660) — and
+     that what it actually enforces is a SET OF SPELLINGS rather than that
+     property, which is why M46 pins the DECLARED BLIND SPOTS as still blind:
+     the checker's message is the authority on what it enforces, so the message
+     and the pattern have to be able to disagree loudly. #828 tracks the
+     AST-level check that would enforce the property itself.
 
     python3 tests/scripts/test_device_leakage.py
 
@@ -622,11 +627,18 @@ class DsrRatchetMutationTests(unittest.TestCase):
     def test_M36_an_EAST_const_target_fails(self) -> None:
         # `vt::DeviceType const` and `const vt::DeviceType` are ONE type. The
         # pattern took the west spelling only, so the east one laundered the same
-        # conversion. Asserted in all three places a cv-qualifier can sit: the
-        # named cast, the named cast with a reference (the form that compiles
-        # WITHOUT -Wignored-qualifiers, so it survives a -Werror build), and the
-        # C-style cast. Each is asserted on its own, so one working alternative
-        # cannot certify the other two.
+        # conversion.
+        #
+        # This comment used to say "all three places a cv-qualifier can sit" and
+        # then list three. There are FOUR: the named cast, the named cast with a
+        # reference (the form that compiles WITHOUT -Wignored-qualifiers, so it
+        # survives a -Werror build), the C-style cast — and the DECLARATION form,
+        # `vt::DeviceType const d{raw}`, which had no cv-group in the pattern at
+        # all. An enumeration that certifies its own completeness is the exact
+        # defect this row exists to fix (it is M29's disease, one round later), so
+        # the count is now the measured one and the fourth case is asserted below.
+        # Each is asserted on its own, so one working alternative cannot certify
+        # the others.
         rc, _out, err = self.plant(
             "vt::DeviceType Resolve(int32_t d) { return static_cast<vt::DeviceType const>(d); }\n"
         )
@@ -644,6 +656,33 @@ class DsrRatchetMutationTests(unittest.TestCase):
         )
         self.assertEqual(rc, 1)
         self.require(err, "DSR REGRESSION in bucket 'dev_cast': 3 > baseline 0")
+        # The FOURTH place, and the one the "all three" comment above hid: the
+        # DECLARATION form. `vt::DeviceType const d{raw}` and
+        # `vt::DeviceType volatile d{raw}` both compile (g++ -std=c++20 -Wall
+        # -Wextra, exit 0) and both scored 0, because alternative (3) carried no
+        # cv-group. The member-declaration spelling — a named device CONSTANT
+        # initialised from the literal `1` — is the one a person actually writes.
+        rc, _out, err = self.plant(
+            "vt::DeviceType DeclConst(uint8_t raw) {\n"
+            "  vt::DeviceType const d{raw};\n"
+            "  return d;\n"
+            "}\n"
+        )
+        self.assertEqual(rc, 1)
+        self.require(err, "DSR REGRESSION in bucket 'dev_cast': 4 > baseline 0")
+        rc, _out, err = self.plant(
+            "uint8_t DeclVol(uint8_t raw) {\n"
+            "  vt::DeviceType volatile d{raw};\n"
+            "  return static_cast<uint8_t>(d);\n"
+            "}\n"
+        )
+        self.assertEqual(rc, 1)
+        self.require(err, "DSR REGRESSION in bucket 'dev_cast': 5 > baseline 0")
+        rc, _out, err = self.plant(
+            "struct Cfg { vt::DeviceType const kD{1}; };\n"
+        )
+        self.assertEqual(rc, 1)
+        self.require(err, "DSR REGRESSION in bucket 'dev_cast': 6 > baseline 0")
 
     def test_M37_a_UNARY_operand_after_a_c_style_cast_fails(self) -> None:
         # `(vt::DeviceType)*cursor` is the WIRE-FORMAT DECODE the checker's own
@@ -713,6 +752,143 @@ class DsrRatchetMutationTests(unittest.TestCase):
             "std::vector<vt::DeviceType*> AllPtrs();\n",
         )
         self.assertEqual(self.tree.scan().counts["dev_cast"], 0)
+
+    # --- M41-M46: round 4. The blind-spot ENTRY bound two members under one
+    #
+    # reason, and the reason was true of only one of them. The old note covered
+    # "a C-STYLE cast whose target is a pointer OR REFERENCE" with the single
+    # reason "both are `)` followed by `&`" — true of `*(vt::DeviceType*)&x`,
+    # false of `(vt::DeviceType&)raw`, whose next character is an identifier. So
+    # the reference form was reachable by widening only INSIDE the parens, at
+    # zero cost, while the entry declared it blind. That is the same defect as
+    # rounds 1-3, moved from the pattern into the per-entry REASON, which is why
+    # every closure below is paired with an assertion that its blind-spot twin is
+    # STILL blind (M46) rather than with a wider claim.
+    #
+    # Every mutant below is compile-verified legal C++ (g++ -std=c++20 -Wall
+    # -Wextra -fsyntax-only, exit 0) and measured individually at 0 before / 1
+    # after, over the same 760-file scan roots that keep `dev_cast` at its single
+    # allowlisted hit.
+
+    def test_M41_a_C_STYLE_pointer_or_reference_target_fails(self) -> None:
+        # Widening INSIDE the parens, where no declarator can be confused with a
+        # target. `(vt::DeviceType&)raw` is the C-style spelling of M35's pun and
+        # `(vt::DeviceType*)vp` is a plain pointer cast off a `void*`; both
+        # compile, both scored 0. Asserted separately, because one alternative
+        # working is not the other one working.
+        rc, _out, err = self.plant(
+            "vt::DeviceType Ref(uint8_t& raw) { return (vt::DeviceType&)raw; }\n"
+        )
+        self.assertEqual(rc, 1)
+        self.require(err, "DSR REGRESSION in bucket 'dev_cast': 1 > baseline 0")
+        rc, _out, err = self.plant(
+            "vt::DeviceType* Ptr(void* vp) { return (vt::DeviceType*)vp; }\n"
+        )
+        self.assertEqual(rc, 1)
+        self.require(err, "DSR REGRESSION in bucket 'dev_cast': 2 > baseline 0")
+
+    def test_M42_bit_cast_may_name_its_SOURCE_type_too(self) -> None:
+        # M39 added `bit_cast` on the argument that it spells the target type at
+        # the conversion site. It is a FUNCTION template with TWO parameters, not
+        # a cast operator with one, so `From` may be written — and terminating the
+        # target at `>` assumed the one-argument shape the four real casts have.
+        # `std::bit_cast<vt::DeviceType, std::uint8_t>(raw)` compiles and scored
+        # 0. Over-matching is not a risk: the scanned roots contain ZERO
+        # `bit_cast` and ZERO `__builtin_bit_cast` occurrences — measured over the
+        # comment-stripped text of all 760 files, with `static_cast` = 9950 as the
+        # positive control in the same pass, so the zero is an absence and not a
+        # broken grep.
+        rc, _out, err = self.plant(
+            "vt::DeviceType Pun(uint8_t raw) {\n"
+            "  return std::bit_cast<vt::DeviceType, std::uint8_t>(raw);\n"
+            "}\n"
+        )
+        self.assertEqual(rc, 1)
+        self.require(err, "DSR REGRESSION in bucket 'dev_cast': 1 > baseline 0")
+
+    def test_M43_a_cv_qualifier_INSIDE_the_pointer_run_fails(self) -> None:
+        # M35 made the target suffix a run of `[*&]`, and the docstring then
+        # claimed a REFERENCE target. `vt::DeviceType* const&` is exactly that —
+        # a reference to a const pointer — and the run stopped at the first
+        # cv-qualifier. One position to the right of round 2's own finding.
+        rc, _out, err = self.plant(
+            "vt::DeviceType* const& Slot(vt::DeviceType** p) {\n"
+            "  return reinterpret_cast<vt::DeviceType* const&>(*p);\n"
+            "}\n"
+        )
+        self.assertEqual(rc, 1)
+        self.require(err, "DSR REGRESSION in bucket 'dev_cast': 1 > baseline 0")
+
+    def test_M44_the_BUILTIN_spelling_of_bit_cast_fails(self) -> None:
+        # `__builtin_bit_cast(vt::DeviceType, raw)` compiles under g++ 13.3 and
+        # names the target type at the conversion site just as fully as
+        # `std::bit_cast` does — but it is not a template-id, so alternative (1)'s
+        # `<…>` anchor cannot reach it and alternative (2)'s glued-identifier
+        # discriminator rejects it. Listing `bit_cast` as caught while this
+        # spelling scored 0 would be the same overclaim in a smaller font.
+        rc, _out, err = self.plant(
+            "vt::DeviceType Pun(uint8_t raw) {\n"
+            "  return __builtin_bit_cast(vt::DeviceType, raw);\n"
+            "}\n"
+        )
+        self.assertEqual(rc, 1)
+        self.require(err, "DSR REGRESSION in bucket 'dev_cast': 1 > baseline 0")
+
+    def test_M45_sizeof_and_alignof_convert_nothing(self) -> None:
+        # A false positive the widening WOULD have grown. `sizeof (vt::DeviceType)
+        # + 1` already scored 1 before this round — `sizeof` is not glued to its
+        # paren, so the identifier discriminator passes, and `+` is in the
+        # trailing class — and admitting `*` inside the parens would have extended
+        # it to the pointer spelling. `sizeof` and `alignof` convert nothing, so
+        # both are excluded outright rather than left as a gap made wider. The
+        # first two of these are RED against the SHIPPED pattern.
+        self.tree.append(
+            "src/vllm/model_executor/models/toy.cpp",
+            "size_t A() { return sizeof (vt::DeviceType) + 1; }\n"
+            "size_t B() { return alignof (vt::DeviceType) + 1; }\n"
+            "size_t C() { return sizeof (vt::DeviceType*) + 1; }\n"
+            "size_t D() { return sizeof(vt::DeviceType) + 1; }\n",
+        )
+        self.assertEqual(self.tree.scan().counts["dev_cast"], 0)
+
+    def test_M46_the_declared_blind_spots_are_STILL_blind(self) -> None:
+        # The other half of a per-entry reason: the docstring says these three
+        # score 0, so this pins that they do. If a later widening closes one, this
+        # test goes RED and the message has to be corrected in the same change —
+        # which is the only mechanism that keeps a checker's message the authority
+        # on what it enforces. It is not an argument that they SHOULD stay blind.
+        #
+        #   * `*(vt::DeviceType*)&x` — closing it needs `&` in the TRAILING class,
+        #     which is what makes `void note (vt::DeviceType*) &;` a false
+        #     positive (M40 pins that negative);
+        #   * `(vt::DeviceType)'\x01'` — character literals are blanked to
+        #     whitespace by strip_comments_and_strings before the pattern runs, so
+        #     the operand is gone by match time;
+        #   * `std::memcpy(&dt, &raw, sizeof(vt::DeviceType))` — there is no cast
+        #     EXPRESSION to anchor on. Note it DOES name the type at the site, so
+        #     the old shared reason ("the type is named at the declaration, never
+        #     at the conversion") was false for it.
+        #
+        # All three compile (g++ -std=c++20 -Wall -Wextra -fsyntax-only, exit 0).
+        self.tree.append(
+            "src/vllm/model_executor/models/toy.cpp",
+            "vt::DeviceType Pun(uint8_t x) { return *(vt::DeviceType*)&x; }\n"
+            "vt::DeviceType Chr() { return (vt::DeviceType)'\\x01'; }\n"
+            "vt::DeviceType Mem(uint8_t raw) {\n"
+            "  vt::DeviceType dt{};\n"
+            "  std::memcpy(&dt, &raw, sizeof(vt::DeviceType));\n"
+            "  return dt;\n"
+            "}\n",
+        )
+        self.assertEqual(self.tree.scan().counts["dev_cast"], 0)
+        # The positive control for that zero, in the same test: the pattern is
+        # alive, and one character more of operand IS caught. A null result from a
+        # dead regex would otherwise prove nothing.
+        self.tree.append(
+            "src/vllm/model_executor/models/toy.cpp",
+            "vt::DeviceType Buf(const uint8_t* b) { return (vt::DeviceType)b[0]; }\n",
+        )
+        self.assertEqual(self.tree.scan().counts["dev_cast"], 1)
 
     def test_M28_dsr_allow_exempts_a_dev_cast_and_says_so_loudly(self) -> None:
         # The legitimate case the risk register names: a deserialization boundary
