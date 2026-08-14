@@ -2045,8 +2045,8 @@ int RunGoldenPass(Device dev, int* non_op_out = nullptr) {
   // through this macro as `1`.
   MESSAGE("golden pass ("
           << std::string(dev.type == DeviceType::kCUDA ? "cuda" : "cpu")
-                          << "): " << cases << " op cases ran, " << non_op
-                          << " declared non-op manifest(s) skipped by name");
+          << "): " << cases << " op cases ran, " << non_op
+          << " declared non-op manifest(s) skipped by name");
   if (non_op_out != nullptr) *non_op_out = non_op;
   return cases;
 }
