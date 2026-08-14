@@ -503,11 +503,16 @@ values in [-1.14, -0.31]) and the 24-layer talker backbone (6 tokens x 1280,
 2. ~~BigVGAN's separate checkpoint~~ DOWNLOADED, converted and LOADED:
    `nvidia/bigvgan_v2_22khz_80band_256x`, 783 tensors, and it renders a bounded
    waveform through `bigvgan::Forward`;
-3. W5 compose: the S2Mel HALF is done -- the real estimator (front, stack,
-   tail) produces a mel and the real BigVGAN turns it into a waveform. What
-   remains is joining the talker's mel CODES to that estimator through the
-   length regulator and the CFM Euler loop, and writing the WAV;
-4. W6b, the two routes and ABI v19;
+3. ~~W5 compose~~ DONE for the library path: `indextts2::Render` joins the
+   talker's OWN codes to the regulator, the CFG'd CFM loop over the real
+   estimator with a REAL rotary table, and BigVGAN. Measured 6 codes ->
+   6144 samples, 0.279 s at 22.05 kHz. NOT measured against the oracle;
+4. the `exact` flag on `tiktoken::Pretokenize` is NOT proven load-bearing: a
+   mutation disabling every range check still passes. The flag is kept and
+   the gap is recorded in the test; a case that fails without it is owed;
+5. W6b, the two routes and the ABI entry points. The SEAM is populated now --
+   the family loads and describes itself -- so what is left is the C API and
+   the HTTP surface, plus a tiktoken reader before text can reach the render;
 5. W7 speed, which additionally needs #633;
 6. the INFERRED emotion path (Path A): the `emo_conditioning_encoder` Conformer
    and the `emo_perceiver_encoder` Perceiver. BEHIND a render, not in front of
