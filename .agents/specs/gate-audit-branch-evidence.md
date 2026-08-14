@@ -157,6 +157,33 @@ absorbed: [#788](https://github.com/mudler/vllm.cpp/issues/788).
 CPU-only. No GPU, no oracle, no model artifacts: nothing here executes a model,
 so runtime/performance/parity axes are `VOID`.
 
+### 6.1 Evidence
+
+RED at `af026e524` with the spec committed and the tests added: 26 of 57 cases
+fail, 25 as `TypeError`/`AttributeError` on the absent parameter and the two
+absent functions, 1 as the workflow assertion. GREEN after: `Ran 57 tests … OK`.
+
+End-to-end, in a checkout built to the `agent-record` job's shape — a tree
+holding only `scripts/`, `.agents/`, `.github/` and `tests/scripts/`, a git dir
+whose objects are the real repository's, and exactly the refs the job would
+have:
+
+| # | Refs present | HEAD | Verdict for `ENG-FORGE-COAUTHOR` | Exit |
+|---|---|---|---|---|
+| A | `origin/main` only — today's job | `= origin/main` | **before:** `ABANDONED`, "no branch, no commit on main mentioning the row ID" / **after:** aborts, naming the refspec | 1 / 1 |
+| B | `origin/main` + 270 `origin/row/*` — the job after §3.3 | `= origin/main` | `IN-FLIGHT`, `unmerged commits on origin/row/ENG-FORGE-COAUTHOR` | 0 |
+| C | as B, minus `origin/row/ENG-FORGE-COAUTHOR` — the **fork** shape | `refs/pull/N/merge` over a commit naming the row | `IN-FLIGHT`, `unmerged commits on HEAD: 8f2c940e0 feat(ENG-FORGE-COAUTHOR): …` | 0 |
+| D | as C — **control** | same merge shape over `docs(readme): fix a typo` | `ABANDONED` | **1** |
+
+A and D are what make the rest mean something. A shows the failure this row
+exists to fix, and that it is now loud instead of wrong. D holds every variable
+of C fixed except whether a commit names the row, and the gate still fails —
+so the fix widened the *evidence*, not the failing condition.
+
+C's merge subject is `Merge <sha> into <sha>`, which is what GitHub actually
+writes for `refs/pull/N/merge`; it names no row, so the verdict has to come from
+the contributor's own commit, as it would on a real fork PR.
+
 ## 7. `ENG-FORGE-COAUTHOR`, and why it is not fixed here
 
 `main` at `af026e524` reports `1 abandoned ACTIVE`, and reproducing #726's CI
