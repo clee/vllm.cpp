@@ -1878,9 +1878,21 @@ class WindowsPortabilityCheckerTest(unittest.TestCase):
             ),
             "exact unsupported-tier probe body",
         ))
+        # The checker reads `$calls.Add(` inside the `$good` scriptblock of
+        # Invoke-UnsupportedTierContractTests (`good_runner`), and NOWHERE
+        # else. `script.replace(..., 1)` mutates the first occurrence in the
+        # file, which since #583 added Invoke-CheckedContractTests (#512) is a
+        # DIFFERENT function the checker never looks at -- so the checker
+        # stayed green and this case has been failing on main ever since
+        # (#680). Anchor the mutation to the governed occurrence, and assert
+        # that occurrence is unique rather than assuming it.
+        governed_at = script.index("function Invoke-UnsupportedTierContractTests")
+        self.assertEqual(script[governed_at:].count("$calls.Add("), 1)
         mutations.extend((
             (
-                script.replace("$calls.Add(", "$calls.Append(", 1),
+                script[:governed_at] + script[governed_at:].replace(
+                    "$calls.Add(", "$calls.Append(", 1
+                ),
                 "fake runner call recording",
             ),
             (
