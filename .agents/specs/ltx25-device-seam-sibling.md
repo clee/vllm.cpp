@@ -348,9 +348,10 @@ makes it a narrow gap rather than the class. The old blind-spot list shared one
 reason across three entries and that reason was false for one of them; each entry
 now carries its own.
 
-**Measured, not asserted.** Over **740** files in `src/vllm` + `include/vllm`,
-with `\bDeviceType\b` = **162** matches as a positive control **in the same
-command**: **0 new, 0 lost**. Shipped hits 1, widened hits 1 — the same
+**Measured, not asserted.** Over the files in `src/vllm` + `include/vllm`, with
+`\bDeviceType\b` = **162** matches as a positive control **in the same
+command**: **0 new, 0 lost**. (This round said "740 files"; the scanned set is
+**760** — see round 3 below, which re-derived it.) Shipped hits 1, widened hits 1 — the same
 allowlisted `platform.cpp:85` registry-walk inverse. `dev_cast` stays 0, `total`
 stays 32, `scripts/device-leakage-baseline.json` is untouched by this round.
 
@@ -374,6 +375,86 @@ resolved mechanically; the only remaining unresolvable ones are upstream Python
 paths and two `examples/*/main.cpp` citations that carry their own `@ fc636c76`
 and so are provenance rather than drift. The `minimax_h3_video.cpp:221-226`
 citation in §0 is now anchored on the base SHA for the same reason.
+
+## Findings from review round 3 (PR #671, head `79ebbce42`)
+
+**The blind-spot ENTRY bound two members under one reason, and the reason was
+true of only one of them.** The note covered "a C-STYLE cast whose target is a
+pointer **or reference**" with the single reason "both are `)` followed by `&`".
+That is true of `*(vt::DeviceType*)&x` and **false** of `(vt::DeviceType&)raw`,
+whose next character is `r`. The reviewer **constructed the feared false
+positive** instead of accepting the argument, which split the entry cleanly:
+widening only **inside the parens** catches the reference form *and*
+`(vt::DeviceType*)vp` at **zero** new hits, while the ref-qualifier negatives
+`void note (vt::DeviceType*) &;` and `… &&;` stay at zero because `&` is still
+out of the **trailing** class. So the trailing-class exclusion is justified, the
+C-style **pointer pun** legitimately stays blind, and the entry is now two
+entries with a reason each. Round 2 closed with "the old blind-spot list shared
+one reason across three entries and that reason was false for one of them; each
+entry now carries its own" — and the entry it wrote to replace them did the same
+thing to two. The spec paragraph was accurate about the pointer pun; the
+**checker's own message**, which is the authority, said "pointer or reference".
+
+**Eight more spellings — counted, not rounded; the table groups two of them on
+one row because they share a reason — each compile-verified legal (`g++ 13.3
+-std=c++20 -Wall -Wextra -fsyntax-only`, exit 0) and each measured 0 before / 1
+after, individually:**
+
+| spelling | why it slipped |
+|---|---|
+| `(vt::DeviceType&)raw` | the C-style target admitted no `*`/`&` run at all |
+| `(vt::DeviceType*)vp` | same |
+| `vt::DeviceType const d{raw}` | alternative (3), the DECLARATION form, had **no cv-group** — a **fourth** place a cv-qualifier can sit, while M36 asserted "all three places". An enumeration certifying its own completeness, which is M29's defect returning |
+| `vt::DeviceType volatile d{raw}`, `struct Cfg { vt::DeviceType const kD{1}; }` | same, and the member form is the one a person actually writes |
+| `std::bit_cast<vt::DeviceType, std::uint8_t>(raw)` | round 2 added `bit_cast` *because* it spells the target at the site, then terminated the target at `>` on the assumption every cast takes one template argument. `bit_cast` is a **function template with two parameters** |
+| `reinterpret_cast<vt::DeviceType* const&>(p)` | the `[*&]` run stopped at the first cv-qualifier, so the reference-to-const-pointer the docstring claimed was not reachable |
+| `__builtin_bit_cast(vt::DeviceType, raw)` | not a template-id at all, so (1)'s `<…>` anchor cannot reach it and (2)'s glued-identifier discriminator rejects it |
+
+**One pre-existing FALSE positive, closed rather than widened.**
+`sizeof (vt::DeviceType) + 1` already scored **1** before this round — `sizeof`
+is not glued to its paren, so the identifier discriminator passes, and `+` is in
+the trailing class — and admitting `*` inside the parens would have extended it
+to `sizeof (vt::DeviceType*) + 1`. `sizeof` and `alignof` convert nothing, so
+both are excluded outright. M45 pins it, and is RED against the shipped pattern.
+
+**What is NOT closed, and why the checker now says so as a PROPERTY.** Four
+rounds have each found a spelling the previous round's message already claimed,
+and every one closed at **zero** hits — so none was a coverage/false-positive
+trade; there was simply always another spelling. Widening again is not the
+answer to that, and the docstring no longer implies it is. It now: (a)
+enumerates the forms it **measured** itself matching, (b) gives every blind spot
+a reason true of that entry alone — the C-style pointer pun `*(vt::DeviceType*)&x`
+(closing it needs `&` in the trailing class, which is the ref-qualifier false
+positive), a **character-literal** operand `(vt::DeviceType)'\x01'` (character
+literals are blanked to whitespace by `strip_comments_and_strings` before the
+pattern ever runs, so the operand is gone by match time), `memcpy`/union (no cast
+**expression** to anchor on — *not* "the type is not named at the site", which is
+false for the idiomatic `std::memcpy(&dt, &raw, sizeof(vt::DeviceType))`), the
+unscanned `src/vt/` leg, and the absence of any type check — and (c) states the
+residual as a property: **a text checker enforces a set of SPELLINGS, not "an
+integer becomes a `vt::DeviceType`"**, so a green `dev_cast` means "none of the
+listed spellings is present" and never "no integer becomes a DeviceType here".
+The structural answer is an **AST-level check** (clang tooling, where the
+destination type canonicalises and the source type is known), filed as
+[#828](https://github.com/mudler/vllm.cpp/issues/828) with all four rounds'
+evidence, since "we kept finding more spellings" *is* the argument for it. Not
+built here.
+
+**M41-M46 and the M36 repair**, one mutant per newly-closed spelling, each
+asserted individually. **M46 is the new shape**: it pins that the **declared
+blind spots are still blind**, with `(vt::DeviceType)buf[0]` as a positive
+control in the same test — so if a later widening closes one, M46 goes RED and
+the message must be corrected in the same change. That is the only mechanism
+that keeps a checker's message the authority on what it enforces. RED-before is
+real, not narrated: with `RE_DEVTYPE_CAST` reverted in-process to `79ebbce42`,
+exactly **6** mutants go RED (M36, M41-M45) and M20/M33/M40/M46 stay GREEN, so a
+blanket failure cannot pass for six findings; applied, 0 RED. Suite 48 → **54**
+tests, the +6 fully attributed to M41-M46.
+
+**File count re-derived.** #660's roadmap row and this spec both said "740
+files"; the scanned set is **760**, measured with `\bDeviceType\b` = **162** and
+`\bkCUDA\b` = **18** as positive controls in the same pass (the 162 is why the
+old number's other figures still hold). Both records are corrected.
 
 ## Now
 
