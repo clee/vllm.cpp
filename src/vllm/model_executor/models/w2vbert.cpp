@@ -147,6 +147,130 @@ std::vector<float> ConvModule(const std::vector<float>& x, int64_t frames, int64
   return out;
 }
 
+
+std::vector<float> SelfAttentionRelativeKey(const std::vector<float>& x, int64_t frames,
+                                            int64_t hidden, int64_t heads, int64_t left_max,
+                                            int64_t right_max, const SelfAttentionWeights& w) {
+  VT_CHECK(hidden % heads == 0, "w2vbert: hidden must divide by heads");
+  const int64_t head_dim = hidden / heads;
+  const double scale = 1.0 / std::sqrt(static_cast<double>(head_dim));
+
+  const std::vector<float> q = Linear(x, frames, hidden, hidden, w.q_w, w.q_b);
+  const std::vector<float> k = Linear(x, frames, hidden, hidden, w.k_w, w.k_b);
+  const std::vector<float> v = Linear(x, frames, hidden, hidden, w.v_w, w.v_b);
+
+  std::vector<float> ctx(static_cast<size_t>(frames * hidden));
+  for (int64_t h = 0; h < heads; ++h) {
+    for (int64_t i = 0; i < frames; ++i) {
+      std::vector<double> scores(static_cast<size_t>(frames));
+      for (int64_t j = 0; j < frames; ++j) {
+        double dot = 0.0;
+        for (int64_t d = 0; d < head_dim; ++d) {
+          dot += static_cast<double>(q[static_cast<size_t>(i * hidden + h * head_dim + d)]) *
+                 static_cast<double>(k[static_cast<size_t>(j * hidden + h * head_dim + d)]);
+        }
+        dot *= scale;
+
+        // distance is key MINUS query, clamped asymmetrically, then shifted into
+        // the embedding table by +left_max.
+        int64_t dist = j - i;
+        if (dist < -left_max) dist = -left_max;
+        if (dist > right_max) dist = right_max;
+        const int64_t row = dist + left_max;
+        double rel = 0.0;
+        for (int64_t d = 0; d < head_dim; ++d) {
+          rel += static_cast<double>(q[static_cast<size_t>(i * hidden + h * head_dim + d)]) *
+                 static_cast<double>(
+                     w.distance_embedding[static_cast<size_t>(row * head_dim + d)]);
+        }
+        // divided by sqrt(d) AGAIN, separately from the score above.
+        scores[static_cast<size_t>(j)] = dot + rel * scale;
+      }
+
+      double best = scores[0];
+      for (const double s : scores) best = std::max(best, s);
+      double denom = 0.0;
+      for (double& s : scores) { s = std::exp(s - best); denom += s; }
+      for (int64_t d = 0; d < head_dim; ++d) {
+        double acc = 0.0;
+        for (int64_t j = 0; j < frames; ++j) {
+          acc += scores[static_cast<size_t>(j)] *
+                 static_cast<double>(v[static_cast<size_t>(j * hidden + h * head_dim + d)]);
+        }
+        ctx[static_cast<size_t>(i * hidden + h * head_dim + d)] =
+            static_cast<float>(acc / denom);
+      }
+    }
+  }
+  return Linear(ctx, frames, hidden, hidden, w.out_w, w.out_b);
+}
+
+
+std::vector<float> EncoderLayer(const std::vector<float>& x, int64_t frames, int64_t hidden,
+                                int64_t heads, int64_t intermediate, int64_t conv_kernel,
+                                int64_t left_max, int64_t right_max, const EncoderLayerWeights& w,
+                                double eps) {
+  std::vector<float> h = x;
+
+  // 1. macaron feed-forward, HALF weighted.
+  {
+    const std::vector<float> n = LayerNorm(h, frames, hidden, w.ffn1_ln_gamma, w.ffn1_ln_beta, eps);
+    const std::vector<float> f = FeedForward(n, frames, hidden, intermediate, w.ffn1_in_w,
+                                             w.ffn1_in_b, w.ffn1_out_w, w.ffn1_out_b);
+    for (size_t i = 0; i < h.size(); ++i) h[i] = f[i] * 0.5F + h[i];
+  }
+
+  // 2. self-attention, FULL residual.
+  {
+    const std::vector<float> n = LayerNorm(h, frames, hidden, w.attn_ln_gamma, w.attn_ln_beta, eps);
+    const std::vector<float> a =
+        SelfAttentionRelativeKey(n, frames, hidden, heads, left_max, right_max, w.attn);
+    for (size_t i = 0; i < h.size(); ++i) h[i] = a[i] + h[i];
+  }
+
+  // 3. convolution module -- it applies its OWN layer_norm internally, so there
+  //    is no norm here; adding one would double-normalize.
+  {
+    const std::vector<float> c = ConvModule(h, frames, hidden, conv_kernel, w.conv, eps);
+    for (size_t i = 0; i < h.size(); ++i) h[i] = h[i] + c[i];
+  }
+
+  // 4. second macaron feed-forward, HALF weighted.
+  {
+    const std::vector<float> n = LayerNorm(h, frames, hidden, w.ffn2_ln_gamma, w.ffn2_ln_beta, eps);
+    const std::vector<float> f = FeedForward(n, frames, hidden, intermediate, w.ffn2_in_w,
+                                             w.ffn2_in_b, w.ffn2_out_w, w.ffn2_out_b);
+    for (size_t i = 0; i < h.size(); ++i) h[i] = f[i] * 0.5F + h[i];
+  }
+
+  return LayerNorm(h, frames, hidden, w.final_ln_gamma, w.final_ln_beta, eps);
+}
+
+
+std::vector<float> FeatureProjection(const std::vector<float>& x, int64_t frames, int64_t in_dim,
+                                     int64_t hidden, const std::vector<float>& ln_gamma,
+                                     const std::vector<float>& ln_beta,
+                                     const std::vector<float>& proj_w,
+                                     const std::vector<float>& proj_b, double eps,
+                                     std::vector<float>* norm_out) {
+  const std::vector<float> normed = LayerNorm(x, frames, in_dim, ln_gamma, ln_beta, eps);
+  if (norm_out != nullptr) *norm_out = normed;
+  return Linear(normed, frames, in_dim, hidden, proj_w, proj_b);
+}
+
+std::vector<float> EncoderStack(const std::vector<float>& x, int64_t frames, int64_t hidden,
+                                int64_t heads, int64_t intermediate, int64_t conv_kernel,
+                                int64_t left_max, int64_t right_max,
+                                const std::vector<EncoderLayerWeights>& layers, double eps) {
+  std::vector<float> h = x;
+  for (const EncoderLayerWeights& l : layers) {
+    h = EncoderLayer(h, frames, hidden, heads, intermediate, conv_kernel, left_max, right_max, l,
+                     eps);
+  }
+  // No final layer norm: the encoder returns the last layer's output directly.
+  return h;
+}
+
 }  // namespace w2vbert
 }  // namespace models
 }  // namespace vllm

@@ -22,7 +22,8 @@ import argparse
 from pathlib import Path
 import numpy as np, torch
 from transformers import Wav2Vec2BertConfig
-from transformers.models.wav2vec2_bert.modeling_wav2vec2_bert import Wav2Vec2BertEncoderLayer
+from transformers.models.wav2vec2_bert.modeling_wav2vec2_bert import (
+    Wav2Vec2BertEncoderLayer, Wav2Vec2BertFeatureProjection, Wav2Vec2BertEncoder)
 
 MASK = (1 << 64) - 1
 def fnv(n: str) -> int:
@@ -67,6 +68,12 @@ def main() -> int:
     tap = {}
     layer.ffn1.register_forward_hook(lambda m, i, o: tap.__setitem__("ffn1", o.detach().clone()))
     layer.conv_module.register_forward_hook(lambda m, i, o: tap.__setitem__("conv", o.detach().clone()))
+    layer.self_attn.register_forward_hook(lambda m, i, o: tap.__setitem__("attn", o[0].detach().clone()))
+    attn_in = {}
+    # self_attn is called with KEYWORD args, so a positional pre-hook sees an
+    # empty tuple; the preceding layer_norm's OUTPUT is the same tensor.
+    layer.self_attn_layer_norm.register_forward_hook(
+        lambda m, i, o: attn_in.__setitem__("x", o.detach().clone()))
     with torch.no_grad():
         out, _ = layer(x)
     # the conv module's INPUT is the post-attention state; capture it so the
@@ -76,6 +83,33 @@ def main() -> int:
         lambda m, i: conv_in.__setitem__("x", i[0].detach().clone()))
     with torch.no_grad():
         layer(x)
+
+    # ---- feature projection + a 2-layer encoder stack ----
+    # `embed_positions` is None for relative_key (only "relative"/"rotary" build
+    # one), and the encoder applies NO final norm after the stack.
+    IN_DIM = 10
+    cfg2 = Wav2Vec2BertConfig(
+        hidden_size=cfg.hidden_size, num_attention_heads=cfg.num_attention_heads,
+        intermediate_size=cfg.intermediate_size,
+        conv_depthwise_kernel_size=cfg.conv_depthwise_kernel_size,
+        position_embeddings_type="relative_key", hidden_act="swish",
+        layer_norm_eps=cfg.layer_norm_eps, feature_projection_input_dim=IN_DIM,
+        num_hidden_layers=2,
+    )
+    proj = Wav2Vec2BertFeatureProjection(cfg2).eval()
+    enc = Wav2Vec2BertEncoder(cfg2).eval()
+    pman = []
+    with torch.no_grad():
+        for mod, pre in ((proj, "fp"), (enc, "enc")):
+            for n, q in list(mod.named_parameters()) + list(mod.named_buffers()):
+                if n.endswith("num_batches_tracked"): continue
+                nm = pre + "." + n
+                v = P(nm, tuple(q.shape) if q.dim() else (1,))
+                q.copy_(v.reshape(q.shape)); pman.append((nm, list(q.shape)))
+    feats_in = P("feats_in", (1, T, IN_DIM), 1.0)
+    with torch.no_grad():
+        projected, _ = proj(feats_in)
+        stacked = enc(projected).last_hidden_state
 
     def emit(f, name, t):
         arr = np.asarray(t.detach().numpy(), dtype=np.float32).reshape(-1)
@@ -104,10 +138,25 @@ def main() -> int:
             d = list(sh) + [1, 1, 1]
             f.write(f'    {{"{nm}", {len(sh)}, {d[0]}, {d[1]}, {d[2]}}},\n')
         f.write("};\n\n")
+        f.write(f"inline constexpr int64_t kLeftMax = {cfg.left_max_position_embeddings};\n")
+        f.write(f"inline constexpr int64_t kRightMax = {cfg.right_max_position_embeddings};\n\n")
+        emit(f, "kAttnIn", attn_in["x"])
+        emit(f, "kAttnOut", tap["attn"])
         emit(f, "kFfn1Out", tap["ffn1"])
         emit(f, "kConvIn", conv_in["x"])
         emit(f, "kConvOut", tap["conv"])
         emit(f, "kLayerOut", out)
+        f.write(f"inline constexpr int64_t kInDim = {IN_DIM};\n")
+        f.write("inline constexpr int64_t kNumLayers = 2;\n")
+        f.write(f"inline constexpr int64_t kModelManifestSize = {len(pman)};\n\n")
+        f.write("inline constexpr ManifestEntry kModelManifest[] = {\n")
+        for nm, sh in pman:
+            d = list(sh) + [1, 1, 1]
+            f.write(f'    {{"{nm}", {len(sh)}, {d[0]}, {d[1]}, {d[2]}}},\n')
+        f.write("};\n\n")
+        emit(f, "kFeatsIn", feats_in)
+        emit(f, "kProjected", projected)
+        emit(f, "kStacked", stacked)
         f.write("}  // namespace w2vbert_goldens\n")
     print(f"wrote {p}: {len(manifest)} tensors, T={T}, hidden={cfg.hidden_size}")
     return 0
