@@ -425,7 +425,7 @@ tokens quietly.
 | Architecture | Why it refuses |
 |---|---|
 | `KimiK3ForConditionalGeneration` | Needs ~1.56 TB (MXFP4); no host here can run it |
-| `NemotronHForCausalLM` | The hybrid forward is ported (#517 W4) but there is no weight LOADER yet, so a checkpoint still cannot be run: loading leaves the weights unmaterialized and the forward refuses by name. Safetensors resolve and parse; a GGUF file is refused by name, since no GGUF arm exists for it |
+| `NemotronHForCausalLM` | The hybrid forward is ported (#517 W4) but there is no weight LOADER yet, so a checkpoint still cannot be run: loading leaves the weights unmaterialized and the forward refuses by name. Safetensors resolve and parse; a `nemotron_h` or `nemotron_h_moe` GGUF is refused by name, since no GGUF arm exists for it |
 
 This is a deliberate state, not a bug: registering the architecture is what lets
 the config parse and weight-name mapping be tested before the forward exists.
@@ -1376,7 +1376,7 @@ a stop token early.
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--model <dir>` | (required) | Model directory (safetensors or `.gguf`) |
+| `--model <dir>` | (required) | Model directory (safetensors or `.gguf`). A `.gguf` file's `general.architecture` selects the loader: `deepseek4`, `muse-glimmer`, `qwen35`, `qwen35moe`, `qwen3next`. Any other value is refused by name, and the message repeats this list |
 | `--host H` | `0.0.0.0` | Bind host |
 | `--port P` | `8000` | Bind port |
 | `--served-model-name N` | model dir basename | Model id in `/v1/models` and responses |
