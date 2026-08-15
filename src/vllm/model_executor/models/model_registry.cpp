@@ -12,6 +12,8 @@
 // rather than a fixed in-file array.
 #include "vllm/model_executor/models/model_registry.h"
 
+#include "vllm/model_executor/weight_offloader.h"
+
 #include <algorithm>
 #include <array>
 #include <memory>
@@ -310,6 +312,14 @@ std::unique_ptr<LoadedModel> ModelRegistry::Load(const HfConfig& config,
 void ModelRegistry::Prepare(LoadedModel& model, const HfConfig& config,
                             vt::Queue& queue) {
   model.registration().factory->prepare(model, config, queue);
+  // ENG-WEIGHT-OFFLOAD: the post-load hook, upstream's `post_init`
+  // (offloader/base.py:68-76). This is NOT where a weight is offloaded. The
+  // offload decision is asked during LOADING, through
+  // `WeightOffloader::ConsiderWeight`, because a weight that reached here has
+  // already paid the device allocation the feature exists to avoid. The default
+  // instance is the no-op, so this line is inert until an engine installs a
+  // backend.
+  GetWeightOffloader().OnModelPrepared(model);
 }
 
 ForwardLogits ModelRegistry::Forward(LoadedModel& model,
