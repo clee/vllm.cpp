@@ -103,4 +103,61 @@ a finding.
 
 ## Now
 
-Row is `READY`. Spec committed; implementation not started.
+Row stays `PARTIAL`. **Implementation landed (#891); the binding gate is OWED.**
+
+Landed:
+
+- `LoadQwen3_5MoeVision` reads the checkpoint's `model.visual.*` through the
+  SHARED `LoadQwen3VLVisionWeights` the dense 27B arm is gated on at image 32/32
+  + video 32/32. The dense tower WAS reusable, so no second tower was written.
+  Geometry comes from the checkpoint's `vision_config`; `out_hidden_size` is the
+  text hidden size (2048 on the 35B, 5120 on the 27B), the one field the two arms
+  disagree on. A checkpoint with NO `model.visual.*` tensor is refused naming
+  them.
+- `Qwen3_5MoeVLGenerateGreedy[Video]`, forked and gated on mm input. The dense
+  arm's greedy core is now TEMPLATED on the weights arm rather than copied, and
+  the image/video prefill plan (mask, row-count check, MRoPE index, decode delta)
+  is one shared implementation. `ForwardLayers` gained the `mrope_cos_sin`
+  injection point its dense sibling already had; `nullptr` on every text and
+  graph-captured caller. The MoE decode graph is taken only where
+  `ForwardQwen3_5Moe` itself takes it (fp4 CUDA).
+
+Evidence obtained:
+
+- Full CPU suite **479/479 passed, 0 failed**, SERIAL `ctest`, exit 0, on a clean
+  out-of-tree `-Werror` build (0 warnings, 0 errors).
+- `test_qwen3_5_moe_vision` **7 cases / 38 assertions**. The forward gate is an
+  EXACT reduction, not a "the output moved" heuristic: one visual token on a
+  1x1x1 LLM grid makes MRoPE degenerate to 1-D positions, so scattering
+  `embed_tokens[k]` must reproduce a plain TEXT greedy run over the substituted
+  prompt token for token. The complementary 8x8-grid case requires the VL run to
+  DIFFER from the 1-D run, which is what sees the MRoPE cache.
+- Four mutations driven RED and restored byte-exact: killing the scatter (2 cases
+  red), ignoring the injected MRoPE cache (1 case red -- the degenerate case
+  cannot see it, which is why the second case exists), dropping the absent-tower
+  refusal, dropping the row-count check.
+- Thor (`kairos-4db2`, sm_110): clean CUDA build; `test_qwen3_5_moe_vision_hw`
+  loads the real 333 `model.visual.*` tensors off `Qwen/Qwen3.6-35B-A3B` and runs
+  the tower on the committed fixture image. **sm_110 has fa2 and
+  cutlass-fp8/nvfp4 legitimately DISABLED, so that ran the FALLBACK attention
+  path** -- valid for correctness, and NOT coverage of the shipped GB10 path. No
+  speed number was taken.
+
+**OWED, and nothing here substitutes for it: the image and video token-exact
+gates vs the pinned oracle at 35B.** Both blockers are external, not a missing
+implementation:
+
+- the pinned oracle cannot run on Thor -- vLLM does not import there
+  (`libcuda.so.1` absent on the host; `torch.cuda.is_available()` is False), so
+  no 35B mm golden can be captured on that box and none is committed;
+- the vision-inclusive bf16 35B is ~67 GiB, against Thor's documented ceiling
+  (`.agents/environment.md`: this box REBOOTS instead of OOM-killing, and a 52 GB
+  load took it down three times). The full e2e case in
+  `test_qwen3_5_moe_vision_hw` is therefore behind `VLLM_MOE_VISION_E2E=1` and
+  was NOT run;
+- `dgx.casa`, where the dense arm's 32/32 goldens were captured, was mid-run on a
+  sibling row's owed gates and off-limits.
+
+**A tower that loads but is never invoked passes every offline test and still
+answers image prompts from text alone.** The CPU reduction above closes that on
+the synthetic model; only the oracle comparison closes it on the real one.
