@@ -178,6 +178,17 @@ target_compile_definitions(test_minimax_music3_ar_real PRIVATE
   MUSIC3_GOLDENS_DIR="${CMAKE_SOURCE_DIR}/tests/parity/goldens/minimax_music3_oracle")
 target_include_directories(test_minimax_music3_ar_real PRIVATE
   ${CMAKE_SOURCE_DIR}/tests/parity)
+# MiniMax-Music3 W2's remainder (#672): the 8.6B `Qwen3ForCausalLM` forward
+# itself, driven through the ADDITIVE `Qwen3DenseModel::ForwardEmbeds` entry and
+# TEACHER-FORCED on the capture's own rvq_codes, against frame_hiddens[:, :4096].
+# Checkpoint-gated like its two siblings; every case emits a loud SKIP when the
+# 28.5 GB asset is absent, so CI still compiles, links and runs it. SEPARATE from
+# test_minimax_music3_ar_real because it stages 18.5 GB that gate does not need.
+vllm_cpp_add_test(test_minimax_music3_llm_real parity/test_minimax_music3_llm_real.cpp)
+target_compile_definitions(test_minimax_music3_llm_real PRIVATE
+  MUSIC3_GOLDENS_DIR="${CMAKE_SOURCE_DIR}/tests/parity/goldens/minimax_music3_oracle")
+target_include_directories(test_minimax_music3_llm_real PRIVATE
+  ${CMAKE_SOURCE_DIR}/tests/parity)
 # MiniMax-Music3 W4+W5 (#672): the ACOUSTIC half — the flow-matching DiT, the
 # FlowMatchEulerDiscreteScheduler with invert_sigmas, the CFG mix, the denoise
 # loop's window bookkeeping and the DAC Flow-VAE vocoder — against goldens
@@ -223,7 +234,11 @@ target_compile_definitions(test_minimax_music3_quant_real PRIVATE
 
 vllm_cpp_add_test(test_minimax_music3_e2e_real parity/test_minimax_music3_e2e_real.cpp)
 target_compile_definitions(test_minimax_music3_e2e_real PRIVATE
-  MUSIC3_GOLDENS_DIR="${CMAKE_SOURCE_DIR}/tests/parity/goldens/minimax_music3_oracle")
+  MUSIC3_GOLDENS_DIR="${CMAKE_SOURCE_DIR}/tests/parity/goldens/minimax_music3_oracle"
+  # Where the e2e case writes the WAV it generated, so a human can listen to it.
+  # The BUILD tree, never the source tree: it is an artifact of a run and not a
+  # golden, and nothing under tests/parity/goldens/ is created or replaced.
+  BUILD_ARTIFACT_DIR="${CMAKE_BINARY_DIR}/music3")
 target_include_directories(test_minimax_music3_e2e_real PRIVATE
   ${CMAKE_SOURCE_DIR}/tests/parity)
 # ARCH-ONE-SURFACE ROW 2 fold gate: the video seam == the replicated pre-fold
@@ -625,6 +640,49 @@ vllm_cpp_add_test(test_nemotron_h_forward vllm/models/test_nemotron_h_forward.cp
 # USER_USAGE_PREFIXES surface (#515). Same call as the W1 resolver header.
 target_include_directories(test_nemotron_h_forward PRIVATE ${CMAKE_SOURCE_DIR}/src)
 
+# Nemotron-H WEIGHT LOADER gate (#517, .agents/specs/nemotron-h-model.md §5b and
+# §6b "Still owed after W4"): materializes the 18487 released tensors from the
+# REAL 20.1 GiB checkpoint and runs the registered forward on them. Gated
+# STRUCTURALLY, not by tokens — every tensor materialized or deferred BY NAME,
+# the per-scheme composition (5935 NVFP4 W4A16 g16 triples + 46 FP8 W8A8 static
+# triples + the bf16/f32 remainder) asserted against the checkpoint's own memory
+# format, and the loaded dtypes asserted to be the SHIPPED ones rather than
+# wider. The checkpoint resolves through the CONTENT-pinned
+# parity::Nemotron35LightningSnapshot (#569) and the gate SKIPS loudly when it is
+# absent -- a NAMED, COUNTED skip with a closing accounting case, because a skip
+# that prints `Passed 0.00 sec` with zero assertions is indistinguishable from a
+# real pass -- so CI never needs the NAS asset. Not the W6 token gate and no
+# speed claim: it consumes the committed oracle.json for ONE forward per prompt
+# and the argmax of the last position against that prompt's FIRST token; the
+# full 32-token greedy decode stays W6's.
+vllm_cpp_add_test(test_nemotron_h_loader vllm/models/test_nemotron_h_loader.cpp)
+target_compile_definitions(test_nemotron_h_loader PRIVATE
+  NEMOTRON_H_GOLDENS_DIR="${CMAKE_CURRENT_SOURCE_DIR}/parity/goldens/nemotron_35_lightning_greedy")
+# nemotron_h.h / nemotron_h_loader.h are MODEL-PRIVATE headers under src/, not
+# include/vllm/ (#515); tests/parity carries the content-pinned snapshot
+# resolver.
+target_include_directories(test_nemotron_h_loader PRIVATE
+  ${CMAKE_SOURCE_DIR}/tests/parity ${CMAKE_SOURCE_DIR}/src)
+
+# Nemotron-H MIXED_PRECISION MEMORY FORMS, OFFLINE (#517,
+# .agents/specs/nemotron-h-model.md §6d). The loader's design claim — every
+# weight held in the format it SHIPS in, widened only TRANSIENTLY at the GEMM
+# call site — lived entirely behind the 20.1 GiB checkpoint gate above, so on a
+# runner with no CHECKPOINT_ROOT it was not executed at all: deleting
+# NemotronHOwned::View's refusal left the whole suite green. This gate needs NO
+# checkpoint and therefore runs on EVERY arm. It asserts that View REFUSES a
+# non-dense weight by name, and that DenseBf16 reproduces a dequant derived
+# INDEPENDENTLY from the upstream ModelOpt formula — the nibble order, the
+# per-16 group scale, the multiplied weight_scale_2, and the FP8 input_scale
+# that is carried and NOT applied. Those are exactly §6d's M4/M5 defects, which
+# leave every structural count correct. CPU-only, no golden, no speed claim.
+vllm_cpp_add_test(test_nemotron_h_quantized_forms
+  vllm/models/test_nemotron_h_quantized_forms.cpp)
+# nemotron_h.h / nemotron_h_forward.h are MODEL-PRIVATE headers under src/, not
+# include/vllm/ (#515).
+target_include_directories(test_nemotron_h_quantized_forms PRIVATE
+  ${CMAKE_SOURCE_DIR}/src)
+
 # Kimi-Linear CPU REFERENCE FORWARD gates (W2-W6): the per-op reference forwards
 # (KDA layer vs the kimi_kda host-ref composition; NoPE-MLA vs a materialized-MHA
 # reference; sigmoid noaux_tc router + block vs a hand-computed case) and the whole
@@ -906,6 +964,7 @@ vllm_cpp_add_test(test_speculative_dspark vllm/config/test_speculative_dspark.cp
 # language_model_only ⇒ 0 BEFORE the map, else the map, else the 999 default.
 vllm_cpp_add_test(test_multimodal_config vllm/config/test_multimodal_config.cpp)
 vllm_cpp_add_test(test_offload_config vllm/config/test_offload_config.cpp)
+vllm_cpp_add_test(test_weight_offloader vllm/model_executor/test_weight_offloader.cpp)
 # ENG-MM-INPUT-PIPELINE L1 (#607): the refusal those limits carry — the min()
 # fold against the model's own ceiling, upstream's exact message, and both call
 # sites with the enable_mm_embeds escape.

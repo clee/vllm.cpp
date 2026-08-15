@@ -155,8 +155,19 @@ loader rather than a projection of it.
 ## Gates
 
 - Focused suites plus the full serial gate.
-- **Binding: token-exact greedy on `Qwen/Qwen3.6-35B-A3B` bf16 vs the pinned
-  oracle.** Both arms identical prompts, token counts, sampling and batching.
+- **The token-exact gate on `Qwen/Qwen3.6-35B-A3B` bf16 is OWED, not met, and
+  cannot be met by this row.** This spec was internally inconsistent when
+  written and the contradiction is recorded rather than quietly dropped: §Scope
+  excludes the attention tower, the shared expert and `lm_head`, while this
+  section made a token gate on that checkpoint binding. Both cannot hold. The
+  published repo has **zero** scale tensors anywhere — verified against its
+  pinned index — so it is bf16 *throughout*, not merely in its experts, while
+  `LoadQwen3_5Moe` still requires per-tensor FP8 for the towers and NVFP4 for
+  the shared expert and `lm_head`. Such a checkpoint therefore still refuses at
+  load, and downloading 71.9 GB would buy a refusal the dry run already proves
+  for free at the real index and the real dimensions.
+  The remaining bf16 arms are owed to their own row; until then **no token has
+  been generated through the stacked reader on any checkpoint.** Both arms identical prompts, token counts, sampling and batching.
 - SACRED 27B / 35B / Coder re-run on the GPU box; goldens byte-identical.
 - The synthetic tests alone do not close this row. A stacked reader that loads
   without error and produces wrong logits passes every CPU test in this list.
