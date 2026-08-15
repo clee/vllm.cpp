@@ -814,6 +814,21 @@ bf16 CPU probe agreed, but is recorded as secondary only: every runner-up gap it
 printed was a multiple of 0.125, one bf16 ULP, so it could not have resolved a
 real gap below that and could not have reported anything but a tie.
 
+**Speed: one of three concurrency cells is established, and the reason the other
+two are not is a defect of ours.** Against vLLM's production graphed config on
+GB10, clocks pinned at 2184 MHz, c4 is the only cell where both arms completed
+every request: **0.963x** output throughput and **1.008x** median ITL. At c1 and
+c8 our server failed 1 of 6 in all three reps and 12/11/12 of 48 where vLLM failed none, so
+those throughput cells are **withheld, not quoted**
+([#931](https://github.com/mudler/vllm.cpp/issues/931)) — the metric divides
+tokens by a duration that still contains the dead request, which is why c1 reads
+0.677x while median TPOT in the same file reads 1.014x in our favour.
+
+Resource axes on the same series: cold start to first `/health` **53 s vs
+780 s = 14.7x**, and host memory after warmup **42.5 vs 110.1 GiB = 2.59x** —
+the latter with the caveat that vLLM's figure is set by
+`--gpu-memory-utilization 0.85` pre-reserving KV on a unified-memory box.
+
 Larger DeepSeek / GLM / MiniMax / Gemma-4 variants are recorded as
 **hardware-blocked** (they do not fit 119 GiB of unified memory on this box) or
 **spiked-only**, per the [model matrix](../.agents/model-matrix.md).
