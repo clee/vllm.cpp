@@ -21,7 +21,7 @@ before any anchor below was taken.
 This row makes a supplied audio file **drive** an LTX-2.5 render. It does not
 claim reference-audio conditioning, which is a different upstream mechanism
 (`ReferenceAudioConditioning`, appends tokens) and stays refused by name at
-`src/vllm/multimodal/ltx2_video.cpp:1348`. It does not claim `RetakePipeline`
+`src/vllm/multimodal/ltx2_video.cpp:1404`. It does not claim `RetakePipeline`
 (#924) or text-to-audio (`t2a_one_stage.py:43,109`), both recorded as owed under `## Owed`.
 
 **Upstream ships no tests at this pin.** `find . -iname '*test*' -not -path
@@ -60,7 +60,7 @@ not.
 | `AudioEncoder.forward` | `ltx2_audio_vae.cpp:1114` | `audio_vae.py:190-246` |
 | mel front-end | `Ltx2WaveformToLogMel`, `ltx2_audio_vae.cpp:1019` | `ops.py:44-55` |
 | slaney filterbank | `Ltx2SlaneyMelFilterbank`, `ltx2_audio_vae.cpp:970` | `torchaudio`, reached from `ops.py:20-34` |
-| latent frame count | `ltx2_video.cpp:1476-1483` | `types.py:164-181` |
+| latent frame count | `ltx2_video.cpp:1610` | `types.py:164-181` |
 | a stereo-capable PCM16 WAV reader | `MiniMaxH3ReadWav`, `minimax_h3_wav.cpp:89` | `media_io/decode.py:240-300` |
 
 `MiniMaxH3ReadWav` matters: `ltx2_video.cpp` already includes `minimax_h3.h`
@@ -76,14 +76,14 @@ encoder's `in_channels = 2`.
 **Missing:**
 
 1. **The audio VAE encoder load path.** `Ltx2AudioVaeDecoderKeyRules`
-   (`ltx2_loader.cpp:1295-1300`) materializes `audio_vae.decoder.` and
+   (`ltx2_loader.cpp:1296`) materializes `audio_vae.decoder.` and
    `audio_vae.per_channel_statistics.` only. No `Ltx2AudioVaeEncoderKeyRules`
    and no `Ltx2ParseAudioEncoderConfig` exist anywhere. The ported encoder
    therefore has no weights, which is precisely what the reference-audio refusal
-   names at `ltx2_video.cpp:1352-1354`.
+   names at `ltx2_video.cpp:1404`.
 2. **Ingestion.** Nothing turns a file path into a waveform for LTX-2.
 3. **Per-modality noise control.** The engine applies **one** `phase.noise_scale`
-   to both streams (`ltx2_video.cpp:1708-1712`). Upstream's `ModalitySpec`
+   to both streams (`ltx2_video.cpp:1874`). Upstream's `ModalitySpec`
    carries `noise_scale` and `frozen` per modality
    (`ltx-pipelines/utils/types.py:99-112`), and A2Vid needs the difference: at
    stage 2 video is noised to `stage_2_sigmas[0]` while audio is
@@ -94,15 +94,24 @@ encoder's `in_channels = 2`.
 
 ### The two upstream details that fail silently if guessed
 
-**Truncation is one-sided.** A2Vid does
-`encoded_audio_latent[:, :, : audio_shape.frames]` (`a2vid_two_stage.py:202`):
-it **truncates and never pads**. Retake's helper `_conform_latent_length`
-(`ltx-pipelines/utils/helpers.py:149-162`) truncates *or* zero-pads. They are
-different functions with different polarity, and A2Vid does not call the
-padding one. Short audio therefore yields a **short** audio latent, and
-"helpfully" padding it to the video duration is a divergence no output check can
-see. This row mirrors the truncate-only behaviour and pins it with a test whose
-input is deliberately shorter than the video.
+**Truncation is one-sided, and the line after it decides what that means.**
+A2Vid does `encoded_audio_latent[:, :, : audio_shape.frames]`
+(`a2vid_two_stage.py:202`): it **truncates and never pads**. Retake's helper
+`_conform_latent_length` (`ltx-pipelines/utils/helpers.py:149-162`) truncates
+*or* zero-pads, and A2Vid does not call it.
+
+Read alone, that says a short take yields a short latent. It does not, and this
+spec said it did until the next hop was read. `AudioLatentTools.create_initial_state`
+**asserts** `initial_latent.shape == self.target_shape.to_torch_shape()`
+(`ltx-core/tools.py:253-255`). The slice can only shorten, so a take shorter than
+the clip trips that assertion: **short audio is an ERROR upstream, not a short
+latent.** The two lines have to be read together, and truncate-only is not
+permission to under-fill.
+
+So this row truncates a long take, and **refuses** a short one by name with the
+shortfall in seconds. Zero-padding is the tempting repair and is wrong twice: it
+diverges from upstream, and it welds silence onto the end of the take while the
+render finishes normally. Both halves are pinned by tests.
 
 **`frozen` is not the same as `noise_scale = 0`.** Upstream's own docstring says
 `frozen=True` "zeros the denoise mask and marks the resulting `LatentState` so
@@ -114,13 +123,29 @@ stepped by the sampler. Both are mirrored.
 
 ## 2. Scope
 
-**In.** A new translation unit for the pipeline, mirroring upstream's file
-structure rather than growing `ltx2_video.cpp`. The audio VAE encoder load path
-as its own TU, mirroring the precedent `ltx2_video_vae_encoder_load.cpp` set
-(that file's `:5-12` states it is a separate TU precisely to avoid locking
-`ltx2_loader.cpp`). Ingestion with upstream's `start_time` / `max_duration`
-window. Per-modality freeze in the phase recipe. The `a2vid_two_stage` recipe
-row. Reachability through `include/vllm.h` and `ltx2-gen`.
+**In.** A new translation unit per concern, mirroring upstream's file structure
+rather than growing `ltx2_video.cpp`. The audio VAE encoder load path as its own
+TU, mirroring the precedent `ltx2_video_vae_encoder_load.cpp` set (that file's
+`:5-12` states it is a separate TU precisely to avoid locking `ltx2_loader.cpp`).
+Ingestion with upstream's `start_time` / `max_duration` window. The per-modality
+freeze. Reachability through `include/vllm.h` and `ltx2-gen`.
+
+**In scope and NOT delivered, so it is owed rather than implied.** This row ports
+the audio-conditioning *mechanism* of `A2VidPipelineTwoStage` — decode, encode,
+truncate, freeze — and it does **not** add an `a2vid_two_stage` entry to
+`ResolveLtx2PipelineRecipe`. Audio conditioning is orthogonal to the recipe here:
+a supplied take rides whichever `(kind, version)` the checkpoint resolves, which
+in practice is `distilled_two_stage`.
+
+That is not the same schedule upstream's A2Vid runs, and the difference is
+nameable. Upstream's stage 1 is **caller-configured and guided** —
+`self._scheduler.execute(steps=num_inference_steps)` with a `GuidedDenoiser` and
+`MultiModalGuiderParams` whose `modality_scale` is the CLI's `a2v_guidance_scale`
+(`a2vid_two_stage.py:226-240`, `:353-360`) — while stage 2 is
+`STAGE_2_DISTILLED_SIGMAS` with a `SimpleDenoiser` (`:164`, `:278`). Our
+`distilled_two_stage` recipe fixes both stages' sigmas. So the conditioning is
+upstream's and the trajectory is not, and no claim is made that a render here
+reproduces upstream's A2Vid output. Recorded under `## Owed`.
 
 **Out, and refused by name rather than dropped.** Resampling: upstream resamples
 with `torchaudio.functional.resample` (`ops.py:40`), an arbitrary-ratio polyphase
@@ -176,9 +201,20 @@ Mirroring upstream call order exactly (`a2vid_two_stage.py:196-202`):
 4. Truncate to `AudioLatentShape.from_duration(batch=1, duration=num_frames /
    frame_rate, channels=8, mel_bins=16).frames` (`a2vid_two_stage.py:201-202`),
    `latents_per_second = 16000 / 160 / 4 = 25.0` (`types.py:174`). The engine
-   already computes this count at `ltx2_video.cpp:1476-1483`; the row reuses it
+   already computes this count at `ltx2_video.cpp:1610`; the row reuses it
    rather than re-deriving it.
 5. Seed the audio stream with the result and freeze it for **every** phase.
+6. **Return the caller's own waveform as the soundtrack, and do not run the audio
+   VAE decoder or the vocoder at all.** Upstream states the reason in as many
+   words: "Return the original input audio instead of VAE-decoded audio to
+   preserve fidelity" (`a2vid_two_stage.py:301-303`). The latent was frozen the
+   whole way, so the reconstruction can at best equal the file the caller already
+   has, and in practice loses an encode and a vocoder pass to it. Skipping the
+   chain is upstream's behaviour rather than an optimisation, and it is
+   observable: the BWE vocoder emits 48 kHz where the take went in at 16 kHz, so
+   `VideoResult::sample_rate` is the give-away a test can hold. What is returned
+   is the **windowed** take, because that is what `decode_audio_from_file`
+   produced (`:196`, `:303`).
 
 The phase recipe grows a per-modality shape. `phase.noise_scale` keeps its
 meaning for video; audio gains `audio_noise_scale` and `audio_frozen`, defaulted
@@ -193,7 +229,7 @@ existing for exactly this ("No ABI change was needed for it, which is what this
 parallel-array shape exists for"). Keys: `audio_path`, `audio_start_time`,
 `audio_max_duration`. This keeps the footprint on `include/vllm.h` to the
 LTX-2.5 extras doc comment, which matters because sibling rows are editing that
-header concurrently. `CheckUnservedExtras` (`ltx2_video.cpp:336-356`) already
+header concurrently. `CheckUnservedExtras` (`ltx2_video.cpp:357`) already
 refuses an unknown key, so a typo is refused rather than ignored.
 
 `audio_max_duration` defaults to `num_frames / frame_rate` when absent, which is
@@ -205,8 +241,8 @@ what upstream's CLI passes (`a2vid_two_stage.py:369-371`) — note it is the
 
 ## 4. Risks
 
-**The `READER ANCHORS` gate.** `ltx2_video.cpp:283-284` carries a line-number
-list re-derived and string-compared by `test_ltx2_video.cpp:855-879`. Any line
+**The `READER ANCHORS` gate.** `ltx2_video.cpp:304-305` carries a line-number
+list re-derived and string-compared by `test_ltx2_video.cpp:873`. Any line
 inserted above 1100 shifts it, and a clean `git merge` will not warn. Mitigation:
 re-derive the list at the final tree after the last merge of `origin/main`, and
 treat it as a merge hazard in the PR body.
@@ -260,6 +296,51 @@ Every mutation records three facts: `git diff --stat`, whether it BUILT with any
 compile error beside it, and the exit code. A mutation that fails to compile is
 recorded as such and never counted as a passing test.
 
+### What the mutation pass actually found
+
+Focused gate `./build/tests/test_ltx2_video --test-case=*audio*`, 3 cases /
+54 assertions green on the unmutated tree. Each mutation applied to one file,
+built, run, then restored and the restore **verified by sha256** rather than
+assumed.
+
+| Mutation | `git diff --stat` | BUILT | exit | verdict |
+|---|---|---|---|---|
+| M1 delete the production call site (`a2v_audio_volume = encoded.data;`) | `ltx2_video.cpp \| 2 +-` | YES | 1 | DETECTED |
+| M2 never zero the audio denoise mask | `ltx2_video.cpp \| 2 +-` | YES | 1 | DETECTED |
+| M3 leave the frozen stream at the schedule's scalar sigma | `ltx2_video.cpp \| 2 +-` | YES | 1 | DETECTED |
+| M4 zero-pad a short take instead of refusing | `ltx2_audio_input.cpp \| 2 +-` | YES | 1 | DETECTED |
+| M5 accept any channel count | `ltx2_audio_input.cpp \| 2 +-` | YES | 1 | DETECTED |
+| M6 accept any sample rate | `ltx2_audio_input.cpp \| 2 +-` | YES | 1 | DETECTED |
+| M7 accept a window knob with no file | `ltx2_video.cpp \| 2 +-` | YES | 1 | DETECTED |
+
+**M2 and M3 SURVIVED on the first run, and that is the useful part of this
+section.** Both are the freeze claim, and both were made in a comment and
+observed by nothing:
+
+- **M2** survived because the trace was written *above* the noiser and reported
+  the REQUEST's `audio_frozen` flag rather than the state's mask. So a build that
+  noised and denoised the caller's take left the suite at 3 cases / 51
+  assertions / exit 0. Fixed by moving the trace below `ApplyGaussianNoise` and
+  deriving `audio_frozen` from the mask the loop actually uses.
+- **M3** survived because upstream's `frozen` sets the scalar `Modality.sigma`
+  as well as the per-token timesteps (`utils/types.py:104-106`), and the denoise
+  mask cannot reach that input. Nothing observed it. Fixed by adding
+  `audio_sigma_max` to the trace and asserting it is 0 on the frozen path and
+  positive on the ordinary one — a control, so a build that pinned the sigma to
+  zero unconditionally is caught too.
+
+Two further notes on the harness, because both are the kind of failure that
+reports as a verdict about the code:
+
+- The first run crashed on non-UTF-8 output (a `CHECK` comparing two binary PPM
+  buffers dumps raw pixels) **between applying M1 and restoring it**, leaving the
+  mutation in the tree. The next gate run then showed 8 failures that read as the
+  change's own. The harness now restores in a `finally`, and the test compares a
+  count of differing bytes rather than two binary strings.
+- `git diff --stat` read `(no diff)` for every mutation to `ltx2_audio_input.cpp`
+  while that file was still untracked — the first of the three facts silently
+  reporting nothing. Re-run after `git add`.
+
 ---
 
 ## 6. Gates
@@ -279,14 +360,61 @@ charged to this row.
 
 ---
 
+## 6b. Reachability — the sentence the records must carry
+
+**A production entry point reaches this, and the test enters through it.**
+
+The chain, by hand and with no unreached hop in it:
+
+```
+include/vllm.h  vllm_video_generate                    (:969)
+  -> src/capi/vllm_c.cpp                               (:1646, engine->Generate(gen))
+    -> vllm::multimodal::VideoEngine::Generate         (video_engine.h:157)
+      -> Ltx2VideoEngine::Generate                     (ltx2_video.cpp)
+        -> Ltx2DecodeAudioWav / Ltx2EncodeAudioToLatent
+          -> a2v_audio_volume -> the audio StreamState -> Ltx2DitForward
+```
+
+The command-line arm is the same call: `ltx2-gen --audio-path` sets the
+per-generation extra and calls `vllm_video_generate`, as a thin ABI client that
+includes no internal header.
+
+**The reachability mutation is M1 above.** Deleting the production call site —
+the one line where the encoded latent reaches the stream — turns the focused gate
+RED (exit 1). The gate therefore measures a capability rather than a class. That
+matters here specifically: `Ltx2AudioEncoderForward` has had six test call sites
+and **no** production one since `cefacd2d0`, which is exactly the "test-only
+driver" shape `.agents/reachability.md` names, and this row is what ends it.
+
+**What is NOT reachable, stated rather than left to be found.** The OpenAI
+`/v1/videos` route cannot carry this, because
+`VideoGenParamsFromRequest` (`video_engine.cpp:349-385`) never forwards
+`VideoRequest::metadata` to `VideoGenParams::extras` — no per-generation LTX
+extra reaches that route today, `image_crf` included. That is a pre-existing
+defect of the route rather than of this row, it is recorded as S5 in §9, and the
+reach claim above is worded to exclude it.
+
 ## 7. Quantized arms
 
 The audio VAE is f32 on both halves by upstream's own choice
 (`vocoder.py:585-595`, mirrored in `ltx2_audio_vae.cpp:1-12`), so the audio
-encoder introduces no new quantized arm. The DiT arms this row must not break
-are NVFP4 and FP8, which the A2V path reaches unchanged because it only seeds a
-latent. Any arm this row cannot exercise is named under `## Owed` rather than left to be
-discovered.
+encoder introduces no new quantized arm and the encoder loads through the same
+`Ltx2LoadVaeWeights` path the decoder already uses.
+
+Arm by arm, so none is left to be discovered:
+
+| Arm | Disposition |
+|---|---|
+| bf16 / f32 safetensors | **ported** — the shipped audio VAE is this, and the encoder reads it |
+| NVFP4, FP8 (the DiT tower) | **unaffected and unbroken.** This row seeds a latent and freezes a stream; it adds no GEMM and changes no dtype on the DiT path. Both arms reach the A2V path exactly as they reach the ordinary one |
+| GGUF k-quants | **not applicable**, and not merely undone. Upstream ships no GGUF arm for any LTX-2 component: `quantization_factory.py:23-26` enumerates the inference kinds exhaustively as fp8-cast, fp8-scaled-mm, nvfp4-cast and nvfp4-prequant, with `assert_never` at `:50`. There is no upstream behaviour to mirror and no quant-matched llama.cpp comparison to serve, because llama.cpp does not carry this architecture |
+| int8-convrot | **out of scope**, unchanged by this row and already refused by name at `ltx2_pipeline.cpp`'s `kInt8ConvRot` |
+
+The one dtype question this row does owe an answer to: the ingestion and the
+encoder are **f32 throughout**, which matches the decoder half it shares every
+primitive with and matches upstream, where `encode_audio` runs the mel front-end
+in the waveform's own dtype (`ops.py:54`) and the encoder in the parameters'
+(`audio_vae.py:260`, `:273`). No buffer here is wider than the arm it feeds.
 
 ---
 
@@ -295,6 +423,15 @@ discovered.
 - **`RetakePipeline`** — [#924](https://github.com/mudler/vllm.cpp/issues/924).
   Reasoning in §2.
 - **Text-to-audio** (`t2a_one_stage.py:43,109`) — absent, not absorbed here.
+- **The `a2vid_two_stage` RECIPE.** This row ports the audio-conditioning
+  mechanism and rides the checkpoint's own resolved recipe; upstream's A2Vid
+  stage 1 is a caller-configured guided schedule with `a2v_guidance_scale` as the
+  guider's `modality_scale` (`a2vid_two_stage.py:226-240`, `:353-360`), which
+  `distilled_two_stage` does not reproduce. Reasoning in §2. Needs the recipe
+  table entry, the two guider-parameter sets, and a `steps`/`cfg` surface to
+  carry them — and it should land with a real-checkpoint comparison rather than
+  before one, because a sigma table with no render to check it against is the
+  kind of plausible-and-wrong this campaign has already paid for twice.
 - **A real-checkpoint A2V render.** Gated on fixtures only; the GPU was out of
   bounds for this row.
 - **Arbitrary-ratio resampling** — refused by name; needs the polyphase kaiser
@@ -303,12 +440,17 @@ discovered.
 - **`Ltx2CreateAudioLatentState` and `Ltx2ConditionAudioByReference` remain
   test-only.** Both have exactly one call site each and it is a test
   (`test_ltx2_vae.cpp:2412`, `:2431`). This row does not wire them, because the
-  engine's `StreamState` (`ltx2_video.cpp:167-178`) is a different type from
+  engine's `StreamState` (`ltx2_video.cpp:168`) is a different type from
   `Ltx2LatentState` (`ltx2_conditioning.h:61-69`) — `double` positions, no
   `pos_dims`, an extra `keyframes_mask` — and bridging them is its own change.
   Recorded so the next reader can tell a deliberate deferral from an oversight.
 - **The silent-ignore paths found while surveying**, each filed rather than
-  fixed in flow because each is a different owner's surface: see §9.
+  fixed in flow because each needs a contract decision this row has no mandate to
+  make: [#927](https://github.com/mudler/vllm.cpp/issues/927) (seven typed
+  `VideoGenParams` / `VideoModelParams` fields LTX-2.5 accepts and never reads,
+  all seven of which H3 does read) and
+  [#928](https://github.com/mudler/vllm.cpp/issues/928) (`/v1/videos` forwards no
+  per-generation extra to any engine). Detail and read/write sites in §9.
 
 ## 9. Silent-ignore paths found in the audio surface (see `## Owed` above)
 
@@ -316,9 +458,9 @@ Recorded here because the row that finds them owes a statement of who owns them.
 
 | # | Path | Status |
 |---|---|---|
-| S2 | `VideoModelParams::audio_vae_config_path` is written by `ltx2-gen --audio-vae-config` and `server_main.cpp:1231` and **read by nothing** in the LTX-2 engine, which takes the config from the checkpoint's `__metadata__` instead. H3 does read it. Same defect for `video_vae_config_path`. | filed |
-| S4 | `audio_flow_shift` is parsed, validated positive (`video_api.cpp:227-236`), threaded to `gen.audio_flow_shift` (`video_engine.cpp:360`) and **read by nothing** in `ltx2_video.cpp`. Same for `flow_shift` and `task`. H3 reads all three. | filed |
-| S5 | `VideoRequest::metadata` is **never forwarded** to `VideoGenParams::extras`, so no per-generation LTX extra is reachable over HTTP at all — `image_crf` included. | filed |
+| S2 | `VideoModelParams::audio_vae_config_path` is written by `ltx2-gen --audio-vae-config` and `server_main.cpp:1231` and **read by nothing** in the LTX-2 engine, which takes the config from the checkpoint's `__metadata__` instead. H3 does read it. Same defect for `video_vae_config_path`. | [#927](https://github.com/mudler/vllm.cpp/issues/927) |
+| S4 | `audio_flow_shift` is parsed, validated positive (`video_api.cpp:227-236`), threaded to `gen.audio_flow_shift` (`video_engine.cpp:360`) and **read by nothing** in `ltx2_video.cpp`. Same for `flow_shift` and `task`. H3 reads all three. Seven such fields in total. | [#927](https://github.com/mudler/vllm.cpp/issues/927) |
+| S5 | `VideoRequest::metadata` is **never forwarded** to `VideoGenParams::extras` (`video_engine.cpp:349-385`), so no per-generation LTX extra is reachable over HTTP at all. `image_crf` included, which makes image-to-video unreachable over the route entirely, since the only served value cannot be sent. | [#928](https://github.com/mudler/vllm.cpp/issues/928) |
 
 S5 bounds this row's reach claim honestly: the capability is reachable from
 `include/vllm.h` and from `ltx2-gen`, and **not** from `/v1/videos` until S5 is
