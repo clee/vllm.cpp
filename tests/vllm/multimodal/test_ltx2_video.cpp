@@ -25,8 +25,10 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <cctype>
 #include <fstream>
 #include <memory>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -38,6 +40,7 @@
 #include "vllm/model_executor/model_loader/safetensors_reader.h"
 #include "vllm/model_executor/models/ltx2_loader.h"
 #include "vllm/model_executor/models/ltx2_text_encoder.h"
+#include "vllm/model_executor/models/ltx2_tiling.h"
 #include "vllm/model_executor/models/ltx2_upsampler.h"
 #include "vllm/model_executor/models/ltx2_video_vae.h"
 #include "vllm/model_executor/models/ltx2_video_vae_encoder.h"
@@ -324,6 +327,82 @@ TEST_CASE("ltx2 video: an auto-detected load renders frames, a WAV and a mux arg
   CHECK(joined.find(result.mux_output_path) != std::string::npos);
 }
 
+TEST_CASE("ltx2 video: a MULTI-CHUNK render numbers its frames globally, and clears the last one") {
+  // The fixture above is 9 frames — ONE temporal chunk — so the render path's
+  // `chunk.first_frame + f` (ltx2_video.cpp, the streaming sink) was never driven
+  // through the PPM writer with more than one chunk. Per-chunk numbering would
+  // restart at frame_000000 for the second chunk, overwrite the first chunk's
+  // files and leave the clip's tail missing, and every assertion in the 9-frame
+  // case would still pass.
+  //
+  // 81 frames is the smallest request that chunks, and that is not a coincidence:
+  // `latent_t = (81 - 1) / 8 + 1 = 11` against the AUTO layout's 80-frame / 10
+  // latent-frame temporal tile. It is asserted below rather than assumed, because
+  // a test that silently stopped chunking would be green and vacuous.
+  Workspace ws;
+  vllm::multimodal::VideoModelParams mp = FixtureParams(ws.paths);
+  mp.extras[vllm::multimodal::kLtx2MaxPhaseExtra] = "0";
+  const std::unique_ptr<vllm::multimodal::VideoEngine> engine =
+      vllm::multimodal::LoadVideoEngine(mp);
+  REQUIRE(engine != nullptr);
+
+  // The fixture's factors, as documented at `FixtureGen`: (8, 32, 32). Phase 0
+  // halves the spatial request, so 64x64 decodes at 32x32 — one latent cell each
+  // way — and only the temporal axis can chunk here.
+  const vllm::Ltx2ScaleFactors factors{8, 32, 32};
+  const vllm::Ltx2TileSizeConfig layout = vllm::Ltx2AutoTileSizeConfig(32, 32, factors);
+  const int64_t latent_t = (81 - 1) / factors.time + 1;
+  CHECK(latent_t == 11);
+  const std::vector<vllm::Ltx2Tile> tiles =
+      vllm::Ltx2CreateTiles(latent_t, 1, 1, layout, factors);
+  const size_t groups = vllm::Ltx2GroupTilesByTemporalSlice(tiles).size();
+  REQUIRE_MESSAGE(groups > 1u, "this request no longer chunks; the case below proves nothing");
+
+  const std::string out_dir = ws.root + "/multichunk";
+  vllm::multimodal::VideoGenParams gen = FixtureGen(out_dir);
+  gen.num_frames = 81;
+  const vllm::multimodal::VideoResult result = engine->Generate(gen);
+  REQUIRE(result.frame_count == 81);
+
+  // EVERY global index exists exactly once, and the one past the end does not.
+  // Per-chunk numbering fails here on both counts at the same time.
+  for (int64_t f = 0; f < result.frame_count; ++f) {
+    char name[64];
+    std::snprintf(name, sizeof(name), "/frame_%06lld.ppm", static_cast<long long>(f));
+    std::ifstream in(out_dir + name, std::ios::binary);
+    CHECK_MESSAGE(in.good(), "frame ", f, " of a ", result.frame_count,
+                  "-frame streamed render is missing");
+  }
+  {
+    std::ifstream beyond(out_dir + "/frame_000081.ppm", std::ios::binary);
+    CHECK(!beyond.good());
+  }
+  // ...and the last frame is not a copy of the first, which is what a writer that
+  // reused chunk-local indices would leave behind after the overwrite.
+  CHECK(ReadAll(out_dir + "/frame_000080.ppm") != ReadAll(out_dir + "/frame_000000.ppm"));
+
+  // THE STALE TAIL. Rendering a SHORTER clip into the same directory must not
+  // leave the longer render's frames behind: `mux.frame_pattern` is
+  // `frame_%06d.ppm` with no count, so ffmpeg would mux 72 frames past the end of
+  // a clip that reported 9. Pre-existing, and widened by streaming — a chunk that
+  // throws mid-render leaves a partial clip on disk too.
+  const vllm::multimodal::VideoResult shorter = engine->Generate(FixtureGen(out_dir));
+  REQUIRE(shorter.frame_count == 9);
+  for (int64_t f = 9; f < 81; ++f) {
+    char name[64];
+    std::snprintf(name, sizeof(name), "/frame_%06lld.ppm", static_cast<long long>(f));
+    std::ifstream stale(out_dir + name, std::ios::binary);
+    CHECK_MESSAGE(!stale.good(), "frame ", f, " survived a shorter re-render into the same "
+                                              "directory and would be muxed past its end");
+  }
+  for (int64_t f = 0; f < 9; ++f) {
+    char name[64];
+    std::snprintf(name, sizeof(name), "/frame_%06lld.ppm", static_cast<long long>(f));
+    std::ifstream in(out_dir + name, std::ios::binary);
+    CHECK_MESSAGE(in.good(), "the cleanup removed frame ", f, ", which the new render owns");
+  }
+}
+
 TEST_CASE("ltx2 video: the second phase upsamples, and refuses when it cannot") {
   Workspace ws;
   SUBCASE("without an upsampler the phase is refused BY NAME, not skipped") {
@@ -338,6 +417,82 @@ TEST_CASE("ltx2 video: the second phase upsamples, and refuses when it cannot") 
       INFO(msg);
       CHECK(msg.find("upsampler_path") != std::string::npos);
       CHECK(msg.find("refine") != std::string::npos);
+    }
+  }
+  SUBCASE("a TEMPORAL upsampler checkpoint is refused BY NAME, not shape-mismatched") {
+    // The temporal x2 arm is ported and gated (test_ltx2_pipeline.cpp, "ltx2 the
+    // latent temporal upsampler reproduces upstream") but NOTHING drives it. It
+    // shares the class name and the `upsampler.0.*` tensor names with the
+    // spatial arm, so this checkpoint loads and runs; what it returns is
+    // [c, 2f-1, h, w] where the phase needs [c, f, 2h, 2w]. Without the guard
+    // the caller gets a shape mismatch and has to work out that they handed over
+    // the wrong file.
+    vllm::Ltx2UpsamplerConfig temporal =
+        ltx2_fixture::ReducedUpsamplerConfig(ltx2_fixture::ReducedDitParams().in_channels);
+    temporal.spatial_upsample = false;
+    temporal.temporal_upsample = true;
+    const std::string path = ws.root + "/temporal_upsampler.safetensors";
+    ltx2_fixture::WriteReducedUpsampler(temporal, path);
+
+    vllm::multimodal::VideoModelParams mp = FixtureParams(ws.paths);
+    mp.extras["upsampler_path"] = path;
+    const std::unique_ptr<vllm::multimodal::VideoEngine> engine =
+        vllm::multimodal::LoadVideoEngine(mp);
+    try {
+      (void)engine->Generate(FixtureGen(ws.root + "/temporal_ups"));
+      FAIL("a temporal upsampler checkpoint must be refused, not run for this phase");
+    } catch (const std::exception& e) {
+      const std::string msg = e.what();
+      INFO(msg);
+      CHECK(msg.find("temporal_upsample=true") != std::string::npos);
+      CHECK(msg.find("SPATIAL") != std::string::npos);
+      // The message must not be the generic shape complaint — that is the
+      // failure mode this guard exists to replace.
+      CHECK(msg.find("the upsampled latent is") == std::string::npos);
+    }
+  }
+  // THE ARM THE GUARD ABOVE WAS SHADOWING, and the reason this subcase exists at
+  // all. `if (im.upsampler_cfg.temporal_upsample)` is satisfied by a BOTH-flags
+  // checkpoint as well as a temporal-only one, so a genuine SPATIOTEMPORAL
+  // checkpoint was told it is the temporal x2 upsampler and pointed at the spatial
+  // one. Wrong on both counts: it is neither, it is the third arm, and the ledger
+  // refusal that names it (`ltx2_upsampler.cpp:465`) sat behind a guard that could
+  // not be reached from a request.
+  //
+  // The defect is an IMPLICATION between two guards over one variable, which no
+  // fixture could see because nothing drove a both-flags config through
+  // `LoadVideoEngine` — a review could prove the ledger refusal unmutated but not
+  // separate "unreachable" from "untested". This subcase closes that: it is the
+  // both-flags checkpoint, driven through the product path, asserting the caller
+  // is told which arm they actually supplied.
+  SUBCASE("a SPATIOTEMPORAL upsampler checkpoint is refused as SPATIOTEMPORAL, not as temporal") {
+    vllm::Ltx2UpsamplerConfig spatiotemporal =
+        ltx2_fixture::ReducedUpsamplerConfig(ltx2_fixture::ReducedDitParams().in_channels);
+    spatiotemporal.spatial_upsample = true;
+    spatiotemporal.temporal_upsample = true;
+    const std::string path = ws.root + "/spatiotemporal_upsampler.safetensors";
+    ltx2_fixture::WriteReducedUpsampler(spatiotemporal, path);
+
+    vllm::multimodal::VideoModelParams mp = FixtureParams(ws.paths);
+    mp.extras["upsampler_path"] = path;
+    const std::unique_ptr<vllm::multimodal::VideoEngine> engine =
+        vllm::multimodal::LoadVideoEngine(mp);
+    try {
+      (void)engine->Generate(FixtureGen(ws.root + "/spatiotemporal_ups"));
+      FAIL("a spatiotemporal upsampler checkpoint must be refused by name");
+    } catch (const std::exception& e) {
+      const std::string msg = e.what();
+      INFO(msg);
+      // The arm they ACTUALLY supplied, which is the whole repair.
+      CHECK(msg.find("SPATIOTEMPORAL") != std::string::npos);
+      // ...and NOT the temporal-only diagnosis, which is what the shadowing guard
+      // produced. Asserted on the sentence that only that guard emits, because
+      // both messages legitimately contain the word `temporal`.
+      CHECK(msg.find("it is the TEMPORAL x2 upsampler") == std::string::npos);
+      CHECK(msg.find("Supply the spatial upsampler") == std::string::npos);
+      // Not a shape complaint either: the refusal has to land before any weight
+      // is touched, which is what the ledger arm promises.
+      CHECK(msg.find("the upsampled latent is") == std::string::npos);
     }
   }
   SUBCASE("with one, the render lands at the FULL requested size") {
@@ -487,6 +642,266 @@ TEST_CASE("ltx2 video: an unknown extra is refused, not ignored") {
     INFO(msg);
     CHECK(msg.find("partition") != std::string::npos);
   }
+}
+
+// A key this family DEFINES but does not serve is the worse half of the same
+// defect, and the one an "unknown extra" check cannot see. `duration_head_path`
+// was in `kKnownLoadExtras` and read by NOTHING (#611): supplying a duration head
+// loaded no head, opened no file, and handed back the recipe default with no
+// diagnostic. AGENTS.md requires an unimplemented arm to be refused with a
+// message naming the missing piece, so it is refused rather than accepted.
+//
+// Dropping the key from `kKnownLoadExtras` instead would produce "unknown load
+// extra", which is a DIFFERENT and wrong claim — the family defines the key and
+// understands what it means; what is missing is the head. Hence the assertion on
+// the missing piece and the alternative, not only on the key.
+TEST_CASE("ltx2 video: duration_head_path is REFUSED by name, not silently ignored") {
+  Workspace ws;
+  vllm::multimodal::VideoModelParams mp = FixtureParams(ws.paths);
+  // Any path at all: the point is that NOTHING opens it. Naming a file that does
+  // exist keeps a not-found error from standing in for the refusal.
+  mp.extras["duration_head_path"] = ws.paths.dit;
+  try {
+    (void)vllm::multimodal::LoadVideoEngine(mp);
+    FAIL("duration_head_path is served by no code; accepting it substitutes the recipe default");
+  } catch (const std::exception& e) {
+    const std::string msg = e.what();
+    INFO(msg);
+    CHECK(msg.find("duration_head_path") != std::string::npos);
+    // The MISSING PIECE, which is what separates this from "unknown key".
+    CHECK(msg.find("duration head") != std::string::npos);
+    // And what to use instead, so the refusal is actionable.
+    CHECK(msg.find("num_frames") != std::string::npos);
+    // Not the unknown-key message: that one would say the family does not define
+    // it, and this family does.
+    CHECK(msg.find("unknown load extra") == std::string::npos);
+  }
+}
+
+// The INVENTORY, so the defect above cannot come back as a different key. Every
+// extra this family accepts is either read by something or refused by name; a
+// tenth decorative key fails this case rather than waiting to be discovered by
+// the caller who supplies it.
+//
+// The audit behind it is in .agents/specs/ltx25-retire-dead-arms.md §2.1: nine of
+// the ten keys have a reader and `duration_head_path` was the only one with none.
+// The reader LINES are deliberately not repeated here — they moved twice while
+// this row was in review. They live in one place, the READER ANCHORS comment in
+// `ltx2_video.cpp`, and the case below derives them and holds that comment to it.
+TEST_CASE("ltx2 video: every accepted load extra is READ by something") {
+  Workspace ws;
+  // The keys with a reader.
+  const std::vector<std::string> served = {
+      vllm::multimodal::kLtx2AudioPromptEmbedsExtra, vllm::multimodal::kLtx2PipelineKindExtra,
+      vllm::multimodal::kLtx2ModelVersionExtra,      vllm::multimodal::kLtx2AllowUnportedExtra,
+      vllm::multimodal::kLtx2MaxPhaseExtra,          vllm::multimodal::kLtx2DitConfigPathExtra,
+      vllm::multimodal::kLtx2PromptValidRowsExtra,   vllm::multimodal::kLtx2EncoderConfigPathExtra,
+      "upsampler_path",
+  };
+  // The keys the family defines and does NOT serve. Growing this list is a
+  // deliberate act; growing it silently is the defect #611 records.
+  const std::vector<std::string> refused = {"duration_head_path"};
+
+  // THE HANDLE ON THE REAL ARRAY. The unknown-extra refusal builds its listing
+  // from `kKnownLoadExtras` itself, so parsing that listing gates the ACTUAL
+  // accepted set rather than a copy of it maintained here. Without this the two
+  // vectors above would be true by construction and would gate nothing.
+  std::string listing;
+  {
+    vllm::multimodal::VideoModelParams mp = FixtureParams(ws.paths);
+    mp.extras["definitely_not_a_key"] = "1";
+    try {
+      (void)vllm::multimodal::LoadVideoEngine(mp);
+      FAIL("an unknown extra must be refused");
+    } catch (const std::exception& e) {
+      const std::string msg = e.what();
+      const size_t at = msg.find("This family defines: ");
+      REQUIRE(at != std::string::npos);
+      listing = msg.substr(at + std::string("This family defines: ").size());
+    }
+  }
+  INFO("listing = " << listing);
+  // Every name this row inventoried is still accepted...
+  for (const std::string& key : served) CHECK(listing.find(key) != std::string::npos);
+  for (const std::string& key : refused) CHECK(listing.find(key) != std::string::npos);
+  // ...and there is no ELEVENTH name that this inventory has never seen. The
+  // separator is ", ", so the count is one more than the separators.
+  size_t names = 1;
+  for (size_t at = listing.find(", "); at != std::string::npos; at = listing.find(", ", at + 2)) {
+    ++names;
+  }
+  CHECK_MESSAGE(names == served.size() + refused.size(),
+                "kKnownLoadExtras grew; add the key to `served` (with its reader) or to "
+                "`refused` (with a by-name refusal), per .agents/specs/ltx25-retire-dead-arms.md");
+
+  // And the unserved half is refused rather than accepted.
+  for (const std::string& key : refused) {
+    vllm::multimodal::VideoModelParams mp = FixtureParams(ws.paths);
+    mp.extras[key] = ws.paths.dit;
+    INFO("key = " << key);
+    try {
+      (void)vllm::multimodal::LoadVideoEngine(mp);
+      FAIL("an accepted-but-unread extra must be refused by name");
+    } catch (const std::exception& e) {
+      const std::string msg = e.what();
+      INFO(msg);
+      CHECK(msg.find(key) != std::string::npos);
+      CHECK(msg.find("unknown load extra") == std::string::npos);
+    }
+  }
+}
+
+// THE ANCHORS FOR THAT INVENTORY, DERIVED RATHER THAN TRUSTED.
+//
+// The case above proves each key is accepted or refused; it cannot prove WHERE a
+// key is read, and "nine of ten reach a reader at these lines" is the claim this
+// row rests on. That claim shipped wrong: the recorded anchors were nine lines
+// that named no reader at all, in the very file they were recorded in. Then, in
+// review, a merge of `origin/main` moved all nine again. A `file:line` written by
+// hand is stale by the next commit, so this derives them from the source and
+// holds the recorded list to what it finds. When it fails it prints the answer.
+//
+// It does NOT assert absolute line numbers of its own — nothing here to rot. The
+// only obligation it creates is on whoever moves a reader: update the one comment
+// block in the same file they are already editing.
+namespace {
+
+std::string ReadSourceFile(const char* path) {
+  std::ifstream in(path);
+  REQUIRE_MESSAGE(in.good(), "cannot open " << path);
+  std::stringstream buf;
+  buf << in.rdbuf();
+  return buf.str();
+}
+
+std::vector<std::string> SplitLines(const std::string& text) {
+  std::vector<std::string> lines;
+  size_t at = 0;
+  while (at <= text.size()) {
+    const size_t end = text.find('\n', at);
+    lines.push_back(text.substr(at, end == std::string::npos ? std::string::npos : end - at));
+    if (end == std::string::npos) break;
+    at = end + 1;
+  }
+  return lines;
+}
+
+// 1-based index of the ONLY line containing `needle`, or 0. Uniqueness is the
+// point: an anchor that matches twice anchors nothing, and existence alone is
+// what let the stale numbers survive.
+size_t UniqueLineWith(const std::vector<std::string>& lines, const std::string& needle) {
+  size_t found = 0;
+  size_t count = 0;
+  for (size_t i = 0; i < lines.size(); ++i) {
+    if (lines[i].find(needle) != std::string::npos) {
+      ++count;
+      found = i + 1;
+    }
+  }
+  return count == 1 ? found : 0;
+}
+
+std::string JoinNumbers(const std::vector<size_t>& v) {
+  std::string s;
+  for (size_t n : v) s += (s.empty() ? "" : " ") + std::to_string(n);
+  return s;
+}
+
+}  // namespace
+
+TEST_CASE("ltx2 video: the recorded reader anchors are the ones in the source") {
+  const std::string source = ReadSourceFile(LTX2_VIDEO_SOURCE_PATH);
+  const std::vector<std::string> lines = SplitLines(source);
+  REQUIRE(lines.size() > 500);
+
+  // Everything is measured relative to the accepted-keys array, so a stray
+  // mention in the file header cannot be mistaken for a reader.
+  const size_t array_line = UniqueLineWith(lines, "const char* const kKnownLoadExtras[] = {");
+  REQUIRE_MESSAGE(array_line != 0, "kKnownLoadExtras[] declaration is not unique in the source");
+  size_t array_end = 0;
+  for (size_t i = array_line; i < lines.size(); ++i) {
+    if (lines[i] == "};") {
+      array_end = i + 1;
+      break;
+    }
+  }
+  REQUIRE(array_end > array_line);
+
+  // The nine SERVED keys, by the token each is spelled with in the source. Order
+  // is irrelevant — the comparison is on the sorted set — so this list is not a
+  // second place the anchors live.
+  const std::vector<std::string> served_tokens = {
+      "kLtx2AudioPromptEmbedsExtra", "kLtx2PipelineKindExtra",  "kLtx2ModelVersionExtra",
+      "kLtx2AllowUnportedExtra",     "kLtx2MaxPhaseExtra",      "kLtx2DitConfigPathExtra",
+      "kLtx2PromptValidRowsExtra",   "kLtx2EncoderConfigPathExtra", "\"upsampler_path\"",
+  };
+  std::vector<size_t> derived;
+  for (const std::string& token : served_tokens) {
+    size_t first = 0;
+    for (size_t i = array_end; i < lines.size(); ++i) {
+      if (lines[i].find(token) != std::string::npos) {
+        first = i + 1;
+        break;
+      }
+    }
+    INFO("token = " << token);
+    CHECK_MESSAGE(first != 0, "no reader found after kKnownLoadExtras for " << token);
+    if (first != 0) derived.push_back(first);
+  }
+  REQUIRE(derived.size() == served_tokens.size());
+  std::sort(derived.begin(), derived.end());
+
+  // The RECORDED list, parsed out of the one comment line that carries it.
+  const size_t marker = UniqueLineWith(lines, "READER ANCHORS (derived and gated by");
+  REQUIRE_MESSAGE(marker != 0,
+                  "the READER ANCHORS comment marker is missing or not unique in the source");
+  const std::string recorded_line = lines[marker];  // the line AFTER the marker (1-based)
+  std::vector<size_t> recorded;
+  for (size_t i = 0; i < recorded_line.size();) {
+    if (std::isdigit(static_cast<unsigned char>(recorded_line[i]))) {
+      size_t j = i;
+      while (j < recorded_line.size() && std::isdigit(static_cast<unsigned char>(recorded_line[j]))) {
+        ++j;
+      }
+      recorded.push_back(static_cast<size_t>(std::stoul(recorded_line.substr(i, j - i))));
+      i = j;
+    } else {
+      ++i;
+    }
+  }
+  std::sort(recorded.begin(), recorded.end());
+  CHECK_MESSAGE(recorded == derived, "the reader anchors recorded in ltx2_video.cpp are STALE. "
+                                     "Recorded: ["
+                                         << JoinNumbers(recorded) << "]. Actual: ["
+                                         << JoinNumbers(derived)
+                                         << "]. Paste the actual list into the READER ANCHORS "
+                                            "comment; the spec's §2.1 table is dated and stays.");
+
+  // And the UNSERVED key is touched only by the refusal, never by a reader. This
+  // is the half a "has a reader" sweep cannot express.
+  const size_t refuse_line = UniqueLineWith(lines, "void CheckUnservedExtras(");
+  REQUIRE(refuse_line != 0);
+  size_t refuse_end = 0;
+  for (size_t i = refuse_line; i < lines.size(); ++i) {
+    if (lines[i] == "}") {
+      refuse_end = i + 1;
+      break;
+    }
+  }
+  REQUIRE(refuse_end > refuse_line);
+  size_t duration_hits = 0;
+  for (size_t i = array_end; i < lines.size(); ++i) {
+    if (lines[i].find("kLtx2DurationHeadPathExtra") == std::string::npos) continue;
+    ++duration_hits;
+    const size_t at = i + 1;
+    const bool inside_refusal = (at >= refuse_line) && (at <= refuse_end);
+    CHECK_MESSAGE(inside_refusal,
+                  "ltx2_video.cpp:" << at
+                                    << " touches the duration-head extra OUTSIDE "
+                                       "CheckUnservedExtras; if it now has a real reader, move "
+                                       "it to the served list and drop the refusal (#611)");
+  }
+  CHECK(duration_hits > 0);
 }
 
 // ─── the config the SHAPES cannot see ───────────────────────────────────────
@@ -1193,6 +1608,15 @@ TEST_CASE("ltx2 video: an ABI client loads, detects and generates through vllm.h
 // It is NOT interchangeable with the `vonkaiser` FP8 copy — they differ in a
 // TRAINED `keyframes_abs_pos_embedding` (spec section 3.1) — so the file this
 // case reads is named here and in every report of its result.
+// WHEN QUOTING THIS SUITE'S ASSERTION COUNT, QUOTE THE CONFIGURATION WITH IT.
+// This case skips by default, and it is most of the suite: with the variable
+// UNSET the binary measures 37 cases / 784 assertions, and with it SET, 37 /
+// 9031 — measured 2026-08-15, exit 0 both ways. So the CASE count is identical in
+// both configurations and only the assertion count moves; an unchanged case count
+// across a change therefore says nothing about whether the real headers were read.
+// Quote the number WITH its configuration and its date: these figures move
+// whenever a case is added here, and they already have (they read 30 / 502 and
+// 30 / 8734 before the keyframe-bias port, issue #658).
 TEST_CASE("ltx2 video: the SHIPPED Lightricks checkpoints parse and load") {
   const char* root_env = std::getenv("LTX2_CHECKPOINT_ROOT");
   if (root_env == nullptr) {
@@ -1224,15 +1648,25 @@ TEST_CASE("ltx2 video: the SHIPPED Lightricks checkpoints parse and load") {
     // cannot see. The two must agree on the weight contract.
     CHECK(vllm::Ltx2ReadCheckpointModelVersion(file) == "2.5.0");
     nlohmann::json config = vllm::Ltx2ReadCheckpointConfig(file);
-    // The shipped DiT DECLARES `use_keyframes_abs_pos_embedding: true`, which
-    // `ParseLtx2DitParams` refuses by name because the module is unported. The
-    // engine clears it in a copy under `allow_unported_modules`; this mirrors
-    // that, and asserting the file declares it is the point.
+    // The shipped DiT DECLARES `use_keyframes_abs_pos_embedding: true` while
+    // carrying NO tensor for it — which is upstream-LEGAL and means "apply
+    // nothing": the parameter is built on the meta device and
+    // `supports_keyframes_abs_pos_embedding` is False both before and after the
+    // load (model.py:166-173; reproduce with
+    // scripts/measure-ltx2-keyframes-meta.py).
+    //
+    // This test used to CLEAR the flag by hand here, mirroring an engine that
+    // cleared it under `allow_unported_modules`. Both are gone (row
+    // LTX25-KEYFRAMES-ABS-POS, issue #658): `Ltx2AdoptDeclaredDitParams` resolves
+    // it against the file's own shapes, so the declared config is adopted
+    // VERBATIM and the contracts agree with no hand edit at all.
     REQUIRE(config["transformer"]["use_keyframes_abs_pos_embedding"].get<bool>());
-    config["transformer"]["use_keyframes_abs_pos_embedding"] = false;
-    nlohmann::json wrapper;
-    wrapper["config"] = config;
-    const vllm::Ltx2DitParams declared = vllm::ParseLtx2DitParams(wrapper);
+    REQUIRE_FALSE(from_shapes.use_keyframes_abs_pos_embedding);  // the file carries no tensor
+    const vllm::Ltx2DitParams declared = vllm::Ltx2AdoptDeclaredDitParams(
+        config, from_shapes, "the shipped NVFP4 DiT's own __metadata__[\"config\"]");
+    // RESOLVED to FALSE, which is `supports_...`. Not a refusal, and not a
+    // synthesised zero — the two failure modes spec §6 names.
+    CHECK_FALSE(declared.use_keyframes_abs_pos_embedding);
     // The shipped config OMITS `use_prompt_adaln_single`, so it resolves to
     // upstream's TRUE default (model_configurator.py:76) — which is what the
     // file's own tensors say. Asserted rather than forced: the two sides of the
@@ -1254,6 +1688,77 @@ TEST_CASE("ltx2 video: the SHIPPED Lightricks checkpoints parse and load") {
     MESSAGE("shipped NVFP4 DiT: " << a.size() << " contract tensors, "
             << file.Names().size() << " in the file");
   }
+
+  // THE CLAIM THIS ROW EXISTS TO MAKE TRUE (row LTX25-KEYFRAMES-ABS-POS, issue
+  // #658): the shipped DiT loads INSIDE THE CONTRACT — no `allow_unported_modules`
+  // — which neither shipped copy could do before. `Ltx2LoadDitFromSafetensors`
+  // with default options is precisely "no opt-in".
+  //
+  // The full load reads ~19 GB. It is the same file the subcase above parses; if
+  // this box cannot hold it, that shows up as a load failure and not as a pass.
+  SUBCASE("the first-party NVFP4 DiT loads with NO allow_unported_modules") {
+    const std::string path =
+        root + "/diffusion_models/ltx-2.5-22b-distilled-transformer-nvfp4.safetensors";
+    const vllm::SafetensorsFile file = vllm::SafetensorsFile::Open(path);
+    const vllm::Ltx2DitCheckpoint ck = vllm::Ltx2LoadDitFromSafetensors(file);
+    CHECK(ck.unported.empty());
+    // Absent from the file, so nothing is bound and nothing will be applied.
+    CHECK_FALSE(ck.params.use_keyframes_abs_pos_embedding);
+    CHECK(ck.weights.keyframes_abs_pos_embedding.data == nullptr);
+    MESSAGE("shipped NVFP4 DiT loaded inside the contract, unported=" << ck.unported.size());
+  }
+}
+
+// The OTHER shipped DiT, which lives under a different publisher root and so
+// takes its own env. It is the one that carries the TRAINED
+// `keyframes_abs_pos_embedding` — `F8_E4M3 [1, 4096]` with a scalar `F32` scale,
+// 4096 of 4096 bytes non-zero — and it was refused from the opposite direction:
+// "the checkpoint carries modules this port does NOT carry".
+//
+// CI SETS NEITHER ENV (issue #673), so this is host-local evidence, not a gate.
+TEST_CASE("ltx2 video: the SHIPPED vonkaiser FP8 DiT loads with NO allow_unported_modules") {
+  const char* dit_env = std::getenv("LTX2_FP8_DIT");
+  if (dit_env == nullptr) {
+    MESSAGE("SKIPPED: set LTX2_FP8_DIT to the vonkaiser ltx-2.5-22b-distilled-fp8.safetensors");
+    return;
+  }
+  const vllm::SafetensorsFile file = vllm::SafetensorsFile::Open(std::string(dit_env));
+  // It carries no `__metadata__` at all, which is why its config always arrives
+  // separately and why the manifest is the only evidence about this flag.
+  CHECK(file.Metadata().count("config") == 0);
+
+  const vllm::Ltx2DitCheckpoint ck = vllm::Ltx2LoadDitFromSafetensors(file);
+  CHECK(ck.unported.empty());
+  // RESOLVED TRUE from the file's own shapes — `supports_...` holds here.
+  CHECK(ck.params.use_keyframes_abs_pos_embedding);
+  REQUIRE(ck.weights.keyframes_abs_pos_embedding.data != nullptr);
+  REQUIRE(ck.weights.keyframes_abs_pos_embedding.rank == 2);
+  CHECK(ck.weights.keyframes_abs_pos_embedding.shape[0] == 1);
+  CHECK(ck.weights.keyframes_abs_pos_embedding.shape[1] == ck.params.inner_dim());
+  // Dequantized through the ONE existing FP8 convention — F8_E4M3 plus a scalar
+  // F32 `<name>_scale`, `DequantFp8ToBf16` — so the view is BF16.
+  CHECK(ck.weights.keyframes_abs_pos_embedding.dtype == vt::DType::kBF16);
+  // TRAINED, not `torch.zeros`. A zero bias would be an exact no-op because the
+  // term is ADDED, so this is the assertion that makes the port matter at all.
+  {
+    const uint16_t* p = ck.weights.keyframes_abs_pos_embedding.Ptr<uint16_t>();
+    int64_t nonzero = 0;
+    for (int64_t i = 0; i < ck.params.inner_dim(); ++i) {
+      if (p[i] != 0) ++nonzero;
+    }
+    MESSAGE("shipped FP8 keyframes_abs_pos_embedding: " << nonzero << " of "
+            << ck.params.inner_dim() << " non-zero");
+    CHECK(nonzero > 0);
+  }
+}
+
+TEST_CASE("ltx2 video: the SHIPPED Lightricks VAEs and upsampler load") {
+  const char* root_env = std::getenv("LTX2_CHECKPOINT_ROOT");
+  if (root_env == nullptr) {
+    MESSAGE("SKIPPED: set LTX2_CHECKPOINT_ROOT to the Lightricks/LTX-2.5 tree to run this");
+    return;
+  }
+  const std::string root = root_env;
 
   SUBCASE("the Conv video VAE loads and configures from its own metadata") {
     const std::string path = root + "/vae/ltx-2.5-video-vae-conv-bf16.safetensors";
@@ -1565,6 +2070,78 @@ TEST_CASE("ltx2 video: the render READS the checkpoint's connector weights") {
   // ...and the same render twice is byte-identical, which is what makes the
   // inequality above a statement about the connector rather than about noise.
   CHECK(RenderBytes(a, ws.root + "/conn_a2") == frames_a);
+}
+
+// ─── the keyframe marker, measured at the PIXELS ────────────────────────────
+//
+// WHY THIS CASE EXISTS, and it is not a duplicate of the DiT-level goldens.
+// Every other check in this file is RELATIVE — `digest != digest`, `absmax > 0`,
+// "the frames are not one flat value" — and none of them is anchored to what the
+// render is SUPPOSED to contain. That is why a defect measured on this head was
+// invisible: the engine builds `video.keyframes_mask` unconditionally, and the
+// guard beside it asserts the VECTOR is populated, so making the mask
+// conditional REDs 11 cases here while making the HANDOVER conditional — one
+// line lower, `if (wants_image) vin.keyframes_mask = ...` — compiled clean and
+// left all five LTX-2.5 suites GREEN. The pixels moved (frame 0 flat 127 → flat
+// 130) and nothing in the tree said so.
+//
+// The fix in `ltx2_video.cpp` closes that one line. THIS CASE CLOSES THE CLASS,
+// because it does not look at any line: it compares a render whose DiT carries
+// the parameter against a render whose DiT does not, on a request with NO image
+// and NO keyframe — upstream's unconditional case. Any route by which the
+// trained term fails to reach the forward collapses the two renders into one and
+// REDs here, whether the drop is in the mask, the handover, the binding, or the
+// add.
+//
+// The two checkpoints differ in exactly one thing. `Param()` seeds every tensor
+// from its own NAME, so dropping `keyframes_abs_pos_embedding` from the contract
+// perturbs no other value; the DiT config's flag follows the shapes because both
+// come from the same `Ltx2DitParams`.
+TEST_CASE("ltx2 video: the keyframe marker reaches the PIXELS with no image supplied") {
+  Workspace ws;
+  const vllm::Ltx2DitParams marked = ltx2_fixture::ReducedDitParams();
+  // The fixture's own default, asserted rather than assumed: with the flag off
+  // this whole case would compare two identical renders and pass vacuously.
+  REQUIRE(marked.use_keyframes_abs_pos_embedding);
+
+  vllm::Ltx2DitParams unmarked = marked;
+  unmarked.use_keyframes_abs_pos_embedding = false;
+  const std::string unmarked_dit = ws.root + "/dit_no_keyframes.safetensors";
+  ltx2_fixture::WriteReducedDit(unmarked, unmarked_dit, ltx2_fixture::ReducedDitOptions{});
+
+  vllm::multimodal::VideoModelParams with_marker = FixtureParams(ws.paths);
+  vllm::multimodal::VideoModelParams without_marker = with_marker;
+  without_marker.dit_path = unmarked_dit;
+
+  // `FixtureGen` supplies no image and no keyframe, which is the whole point:
+  // upstream marks the first latent frame "independently of whether any keyframe
+  // slots exist" (tools.py:186-196). A port that marked it only when something
+  // was conditioned would be silently wrong on every plain text-to-video render,
+  // and that is the render this case takes.
+  const std::string with = RenderBytes(with_marker, ws.root + "/kf_marked");
+  const std::string without = RenderBytes(without_marker, ws.root + "/kf_unmarked");
+  REQUIRE(with.size() == without.size());
+
+  size_t differing = 0;
+  for (size_t i = 0; i < with.size(); ++i) {
+    if (with[i] != without[i]) ++differing;
+  }
+  MESSAGE("keyframe marker moves " << differing << " of " << with.size()
+                                   << " artifact bytes");
+  // Strictly greater than zero, and no count floor above it. A count-based
+  // tolerance would bound nothing — it would red on unrelated numerical drift and
+  // still admit a term applied to the wrong frame — and the frame the marker
+  // belongs on is gated by the DiT goldens, which mark one frame and check the
+  // others are untouched. What this case owns is the ENGINE-to-PIXEL route, and
+  // for that the question is binary: did the trained term reach the render at
+  // all.
+  CHECK_MESSAGE(differing > 0,
+                "the DiT that carries keyframes_abs_pos_embedding rendered the same bytes as the "
+                "DiT that does not, so the trained term never reached the forward");
+
+  // ...and the same DiT twice is byte-identical, which is what makes the
+  // inequality a statement about the marker rather than about noise.
+  CHECK(RenderBytes(with_marker, ws.root + "/kf_marked2") == with);
 }
 
 TEST_CASE("ltx2 video: the connector's positional bound comes from the CONFIG") {

@@ -352,7 +352,7 @@ in the tree, default-OFF, for reproducibility; detail in the benchmark record.
 | MTP | Qwen3.6-27B NVFP4 | token-identical to vLLM MTP, **~4% faster at c1**; on-par at c2-c8 | `DONE` |
 | DFlash | Qwen3.6-27B NVFP4 | **2.9x over spec-off** (10.16 → 29.32 tok/s), at/above vLLM DFlash-on (**1.003x**, non-overlapping bands) | `DONE` |
 | n-gram | Qwen3.6-27B NVFP4 | draft-free (`SPEC-NGRAM`); 27B 5/5 STRICT our-ngram-ON == vLLM-ngram-ON, 180/180 drafts accepted (correctness only, no speed row yet) | `DONE` |
-| DSpark | 27B NVFP4 dense k=15; 35B-A3B MoE k=8 | MoE 35B-A3B: within-session ratios **0.957-0.989** across boots, NOT parity. Re-measurement BLOCKED: gate host reimaged 2026-08-14, oracle and checkpoints gone (#442) | `ACTIVE` |
+| DSpark | 27B NVFP4 dense k=15; 35B-A3B MoE k=8 | MoE 35B-A3B: **0.835x** paired on kairos-17dd (matched 89 tokens, warm oracle cache). Prior 0.957-0.989 came from a different machine with a cold oracle (#442) | `ACTIVE` |
 | Breadth (EAGLE1/3, suffix, ngram-gpu, dynamic-k, ...) | n/a | enumerated from vLLM source + `INVENTORIED` 2026-08-06 (`.agents/specs/spec-decode-inventory.md`), unmeasured | `INVENTORIED` |
 
 ## How we measure
@@ -425,7 +425,10 @@ built on it rather than keeping the flattering one.
 | CPU keep-quant MoE decode | **No number owed**: correctness-only P0. The grouped keep-quant GEMM read activations as f32 whatever their dtype, so CPU MoE decode emitted token-0 garbage from `b4f5610a` (2026-07-31) | Speed unmeasured and unclaimed; `test_ops_quant_dot` GREEN (150224 assertions) |
 | Accepted-and-inert serve args (`SERVE-RECIPE-ARGS`, #606) | **No number owed**: argument parsing only, so nothing to time and no oracle leg. Correctness gate 4 cases / 58 asserts GREEN, RED-first, mutation-proven | None. A speed axis would be fabricated; closes on review plus the operator gate rerun |
 | DeepSeek-V2-Lite MLA | Attributed miss, `ACTIVE` | Throughput at every concurrency |
-| Qwen3.5 text-only arms (#490) | **No number; gates OWED**, both `PARTIAL` | No fitting ckpt: no denominator; MoE needs NVFP4 experts: published REFUSED (§9 17e) |
+| Qwen3.5 text-only arms (#490) | **No number; run gates OWED**, both `PARTIAL`. The loader half is CLOSED (#740, #864 `DONE`), so what blocks these is hardware, not a refusal | No fitting ckpt for either causal-LM arm: no denominator. `Qwen3.8-2.4T-A95B` is ~4.8 TB vs 128 GB; its load plan resolves, which is not a token |
+| Qwen3.6-35B-A3B published BF16 (#740, #864) | **No number, and none was owed: the 2026-08-15 gate measured TOKENS.** Correctness MET vs the pinned oracle: 6/7 prompts STRICT 16/16, the 7th an exact tie (#910); SACRED 3/3 byte-identical | A throughput / latency / memory grid on this checkpoint. Nothing is measured, so nothing is claimed |
+| MoE vision tower image + video (#891) | **NOT gated, no number.** The 333 `model.visual.*` tensors load and the tower computes, on sm_110 FALLBACK attention, not the shipped GB10 path. The token-exact mm gates never ran | Both modality gates on GB10 through the shipped fast path, then a per-modality speed grid |
+| Dense image/video after the #891 merge (#908) | **UNVERIFIED, network-blocked.** Dense TEXT is 235/235 at `2f2bce926`, a true before/after (binary md5 `db889909d4…` vs `49ded1ece8…`, 500 TUs recompiled). The modality arms were not re-run | Re-run the dense image and video gates once the fixtures are reachable |
 | Qwen3.5 upstream throughput levers (roadmap C10) | NOT MEASURED. vLLM's 2026-08-06 25K tok/s/GPU is a GB200/NVLink72 disaggregated cluster result, not comparable to one GB10, and is NOT adopted as our bar | Advance the parity pin past `555967922` so the referenced PRs exist, re-capture goldens at zero drift, then port the GDN prefill kernel |
 | DeepSeek-V4-Flash | **Parity with ds4 (0.997x)** | Optional beat-path: f16 tensor-core DSA/router (near-tie class) |
 | DeepSeek-V4-Flash vs vLLM | Infeasible on one Spark | 2x GB10 with TP2 over the NCCL seam |

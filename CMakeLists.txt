@@ -704,6 +704,10 @@ add_library(vllm STATIC
   src/vllm/config/kv_transfer.cpp
   src/vllm/config/offload.cpp
   src/vllm/model_executor/weight_offloader.cpp
+  src/vllm/model_executor/weight_offload_policy.cpp
+  src/vllm/model_executor/expert_slot_cache.cpp
+  src/vllm/model_executor/model_loader/gguf_expert_span.cpp
+  src/vllm/model_executor/expert_streamer.cpp
   src/vllm/config/multimodal.cpp
   src/vllm/config/speculative.cpp
   src/vllm/outputs.cpp
@@ -829,6 +833,12 @@ add_library(vllm STATIC
   # VAE and its vocoder. Additive files mirroring ltx_core's own structure.
   src/vllm/model_executor/models/ltx2_audio_vae.cpp
   src/vllm/model_executor/models/ltx2_video_vae.cpp
+  # LTX-2.5 (ROW LTX25-TILED-DECODE, issue #644): the tiling algebra and the
+  # STREAMING tiled decode. Own translation units so the untiled decode above
+  # stays the gated reference and the tiled path cannot drift from it by sharing
+  # an internal helper only one of them exercises.
+  src/vllm/model_executor/models/ltx2_tiling.cpp
+  src/vllm/model_executor/models/ltx2_video_vae_tiled.cpp
   # LTX-2.5 (ROW MODEL-DIFFUSION-LTX25, phase L3): the Gemma-4 multi-layer feature
   # aggregation, the two caption projections and the embedded asset pack. An
   # additive file mirroring ltx_core's own structure.
