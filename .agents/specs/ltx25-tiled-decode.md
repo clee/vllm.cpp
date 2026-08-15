@@ -446,31 +446,46 @@ fail.
 
 ### The gate
 
-**Re-measured on the merged head. The `ctest -N` denominator is 473 here and 472 on main
-@ `51e0cb5b1`**, measured with the same command in the same tree: `test_ltx2_tiling` is
-`Test #72` in this listing and absent from main's, `git diff <pinned main> --
-tests/CMakeLists.txt` is exactly `+7` lines (that one registration) with no target added
-or removed anywhere else, and `grep -c '^vllm_cpp_add_test('` goes **447 on main to 448
-here**. Main's side was measured by configuring main's own two `CMakeLists.txt` files into
-a scratch build directory, which was deleted; both files were restored and verified by
-`sha256sum`, not by `git status`. Build: clean `rm -rf build` + reconfigure +
-`ninja -C build`, `BUILD_EXIT=0` captured separately, `[1403/1403]` reached and `ninja -n`
-reporting "no work to do", `No space left|BFD assertion` count **0** against a positive
-control of **942** `Building CXX` lines in the same log, `warning:` count **0**,
-`df -h /` 95G free (78%), `uptime` load average 51.6 at build end. Focused, with counts:
-`test_ltx2_tiling` **10 / 915**, `test_ltx2_vae` **36 / 3039**, `test_ltx2_video`
-**34 / 747**, `test_ltx2_pipeline` **37 / 2382**. `test_ltx2_video`'s move from 32 / 684
-is MAIN's: `grep -c '^TEST_CASE('` is 33 on main and 34 here, and the diff against main
-adds exactly one `TEST_CASE` and removes none. Full: **472 passed / 1 failed out of 473**,
-344.70 s, `ctest` exit **8**, with 473 lines matching `^ *[0-9]+/473 Test`. The one failure
-is `test_serve_low_tools`, `-j` starvation under load average 90-133 with several agents
-on the shared box: it PASSES serially in 23.54 s, exit 0. `test_op_parity` is GREEN here
-(`Test #422 ... Passed 1.04 sec`), which is F-C above. The equivalence probe was rebuilt
-from `build/libvllm.a` on this head by its recorded recipe and re-run against the
-checkpoint asserted by `sha256`; it reproduces `max|diff| = 0.050304323434829712`,
-`962983 / 995328`, `|out|max = 0.75126725435256958`, `ratio = 6.6959%`, and the labelled
-flat-append diagnostic `0.71614238619804382`, `985849 / 995328`, on the same run. The
-build directory was deleted immediately after the gate.
+**Re-measured on the head this PR carries, `e34e10e37`, which merges main @ `b5a5f3b18`.**
+Clean `rm -rf build` + `cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release` +
+`ninja -C build`. `BUILD_EXIT=0` captured separately from the run, `[1407/1407]` reached,
+`No space left|BFD assertion` count **0** against a positive control of **925**
+`Building CXX` lines in the SAME log, `warning:` count **0**, `df -h /` 80G free (82%),
+`uptime` load average 30.2 at build end.
+
+`ctest -N` is **474** here and **473** on main @ `b5a5f3b18`, measured with the same
+command in the same tree. `test_ltx2_tiling` is `Test #73` in this listing and absent from
+main's (`grep -c` 1 here, 0 there), `git diff b5a5f3b18 -- tests/CMakeLists.txt` is exactly
+`+7` lines — that one registration — with no target added or removed anywhere else, and
+`grep -c '^vllm_cpp_add_test('` goes **448 on main to 449 here**. Main's side was measured
+by configuring main's own two `CMakeLists.txt` files into a scratch build directory, which
+was deleted; both files were restored and verified by `sha256sum`, not by `git status`.
+
+Focused, with COUNTS: `test_ltx2_tiling` **10 / 915**, `test_ltx2_vae` **36 / 3039**,
+`test_ltx2_video` **34 / 747**, `test_ltx2_pipeline` **37 / 2382**, every one exit 0.
+`test_ltx2_video`'s move from 32 / 684 is MAIN's, not this row's:
+`grep -c '^TEST_CASE('` is 33 on main and 34 here, and the diff against main adds exactly
+one `TEST_CASE` and removes none.
+
+Full: `ctest --test-dir build -j6 --output-on-failure` -> **474 passed / 0 failed out of
+474**, 168.50 s, `ctest` exit **0**, with **474** lines matching `^ *[0-9]+/474 Test` in
+the log, so the run's own denominator is compared against `ctest -N` rather than assumed
+equal to it. Two tests report `Skipped` by their own guards
+(`test_modelopt_mixed_precision_checkpoint`, `test_voxtral_e2e`). `test_op_parity` is GREEN
+(F-C above). There is no known-red left in this gate.
+
+The equivalence probe was rebuilt from THIS head's `build/libvllm.a` by its own recorded
+recipe and re-run against the checkpoint asserted by `sha256`
+`685b06ee3d9b2039647698fc4ea33175112462fc374e2777312c907897dfce8d`. Its output is quoted
+in §0 and in the pull request body; the flat-append artifact reproduces on the same run
+from the same binary, which is what makes the 14x measurable rather than argued. The build
+directory was deleted immediately after the gate.
+
+An intermediate gate at `0bf0eb9a8` (merging main @ `51e0cb5b1`) read `ctest -N` 473
+against main's 472, and full **472 passed / 1 failed of 473** in 344.70 s at `ctest` exit
+8. That one failure was `test_serve_low_tools`, `-j` starvation under load average 90-133
+with several agents on the shared box: it passed serially in 23.54 s, exit 0, and it does
+not recur in the 474/474 run above.
 
 The rest of this section records the gate at the PRE-MERGE head `70fddfa32` and is kept
 because each recorded denominator describes only the head it was taken on.
