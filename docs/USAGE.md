@@ -671,7 +671,8 @@ memory number:
 ORACLE rather than an owed feature.** Through L10 this page said a prompt was
 refused because the `Embeddings1DConnector` weights, which ship inside the DiT
 file, were among the modules the DiT loader would not load. They are loaded
-(`ltx2_loader.cpp:416-427` carries them as their own contract, outside the DiT's),
+(`Ltx2LoadConnectorWeights`, `ltx2_loader.cpp:1221`, enumerates their own
+contract at `:1224`, outside the DiT's),
 so `encoder_path` is accepted, `has_encoder()` is true, and a prompt no longer
 needs a matching pair of embeds files. The gap that remains is a numeric one: the
 tower, the connector's forward and both caption projections each have an oracle
