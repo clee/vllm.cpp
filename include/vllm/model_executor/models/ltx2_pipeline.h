@@ -565,6 +565,27 @@ struct Ltx2PipelineRecipe {
   int64_t max_spatial_downscale() const;
 };
 
+// `assert_resolution` (ltx-pipelines utils/helpers.py:540-551). Upstream calls it
+// at the TOP of every pipeline's `__call__`, before any work is paid for — ten
+// call sites, among them ti2vid_two_stages.py:184 and ti2vid_two_stages_hq.py:199
+// (both `is_two_stage=True`) against ti2vid_one_stage.py:156 (`False`).
+//
+// Upstream spells the divisor as a literal 64 or 32 chosen by a bool. That pair
+// is not two constants: it is the VAE spatial factor (32,
+// ltx_core/types.py:31-33) times the worst spatial downscale any phase applies.
+// A two-stage pipeline runs stage 1 at `width // 2`
+// (ti2vid_two_stages.py:226-228), so the request must survive being halved and
+// still divide the grid — hence 32 * 2. Taking the divisor as a parameter lets
+// the caller derive it from the recipe it actually holds, which reproduces
+// upstream's two numbers on the two shipped arms and stays correct for a recipe
+// whose phases downscale by more. A hardcoded pair would restate the answer and
+// silently be wrong for that recipe.
+//
+// This is a REFUSAL and not a rounding on purpose. Integer division is what the
+// engine did before, and it renders a clip at a size nobody asked for
+// (#919) — 80 became 64, successfully, with the wrong size reported back.
+void Ltx2AssertResolution(int64_t height, int64_t width, int64_t divisor);
+
 // resolve_ltx_pipeline_recipe (ltx2_recipes.py:170-175). Keyed on the EXACT
 // (pipeline_kind, model_version) pair and throwing by name on anything else —
 // never defaulting. The table:

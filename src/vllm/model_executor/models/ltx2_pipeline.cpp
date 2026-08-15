@@ -967,6 +967,30 @@ int64_t Ltx2PhaseRecipe::num_inference_steps() const {
   return sigmas.empty() ? -1 : static_cast<int64_t>(sigmas.size()) - 1;
 }
 
+void Ltx2AssertResolution(int64_t height, int64_t width, int64_t divisor) {
+  Require(divisor >= 1, "ltx2 resolution: the divisor must be at least 1, got " +
+                            std::to_string(divisor));
+  // Upstream checks both axes against one divisor and names both in one message
+  // (helpers.py:546-551). Naming the OFFENDING axis as well, because a caller who
+  // passed two numbers cannot tell from "(80x64) is not divisible by 64" which of
+  // them to change — and the fix is a different number on each axis.
+  if (height % divisor != 0 || width % divisor != 0) {
+    const std::string bad = (height % divisor != 0)
+                                ? (width % divisor != 0 ? "width and height" : "height")
+                                : "width";
+    Refuse("ltx-2.5 video: the requested resolution " + std::to_string(width) + "x" +
+           std::to_string(height) + " (width x height) is not divisible by " +
+           std::to_string(divisor) + "; the " + bad + " is not. That divisor is this " +
+           "recipe's worst phase downscale times the VAE's spatial factor, so both axes " +
+           "must be multiples of " + std::to_string(divisor) +
+           ". Nearest legal size at or below the request: " +
+           std::to_string((width / divisor) * divisor) + "x" +
+           std::to_string((height / divisor) * divisor) +
+           " (`assert_resolution`, ltx-pipelines utils/helpers.py:540-551). Rounding it " +
+           "here would render a clip at a size nobody asked for");
+  }
+}
+
 int64_t Ltx2PipelineRecipe::max_spatial_downscale() const {
   int64_t worst = 1;
   for (const Ltx2PhaseRecipe& phase : phases) {

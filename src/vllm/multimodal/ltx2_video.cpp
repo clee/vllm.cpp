@@ -1424,6 +1424,35 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
   const Ltx2ScaleFactors factors;  // VIDEO_SCALE_FACTORS (types.py:70) — the conv
                                    // arm's fixed (8, 32, 32), not derived
                                    // (utils/helpers.py:66-72)
+
+  // `assert_resolution` (utils/helpers.py:540-551), at the position upstream
+  // calls it from: the top of `__call__`, before any work is paid for. The
+  // divisor is DERIVED — the VAE spatial factor times the worst downscale this
+  // recipe's phases apply — which is upstream's own 64 for a two-stage recipe and
+  // 32 for a one-stage one, reached by upstream's reasoning rather than restated
+  // as two literals.
+  //
+  // FRAMES ARE DELIBERATELY NOT CHECKED HERE, and the asymmetry is upstream's.
+  // `resolve_num_frames` (utils/blocks.py:908-928) returns an explicit count
+  // verbatim and `VideoLatentShape.from_pixel_shape` (types.py:113) then floors it
+  // exactly as line ~1461 below does; `snap_frames_to_grid` (helpers.py:554-562)
+  // is reached only from the AUTO-duration path. Adding a refusal here would be a
+  // divergence from the reference, not a mirror of it — so `docs/USAGE.md` carries
+  // the rounding as documented behaviour instead (#919).
+  // ONE divisor for both axes, as upstream has (`divisor = 64 if is_two_stage
+  // else 32`). That is a mirror and not a simplification: upstream's
+  // VIDEO_SCALE_FACTORS is (8, 32, 32), so its single spatial divisor already
+  // covers both axes. The equality is asserted rather than assumed, because a VAE
+  // whose axes differed would otherwise have its width checked against the height
+  // factor and no test would see it.
+  if (factors.height != factors.width) {
+    Fail("the VAE's spatial scale factors differ (" + std::to_string(factors.height) +
+         " high, " + std::to_string(factors.width) +
+         " wide), so one resolution divisor cannot cover both axes the way "
+         "`assert_resolution` (utils/helpers.py:540-551) does");
+  }
+  Ltx2AssertResolution(height, width, factors.height * recipe.max_spatial_downscale());
+
   // `AudioLatentShape.from_video_pixel_shape` (types.py:184-200) and
   // `VideoLatentShape.from_pixel_shape` (:108-123) defaults. Asserted against the
   // DiT rather than assumed: the audio latent's channels x mel_bins IS the audio

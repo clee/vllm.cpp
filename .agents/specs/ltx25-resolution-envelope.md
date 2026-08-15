@@ -41,7 +41,8 @@ the production entry point, plus the published envelope.
    absent. §5 and #921.
 2. **A raised resolution ceiling.** There is no code cap to lift. The only
    geometry guard in the LTX path today is a **lower** bound
-   (`ltx2_video.cpp:1464-1471`). The real ceiling is host memory and decode
+   (`ltx2_video.cpp:1464-1471 @ 5a0ffe9e3`; `:1494-1501` after this row, which
+   inserted the guard above it). The real ceiling is host memory and decode
    throughput, it is already measured, and it is already **unattributed** — §4.
    Attributing it needs the GPU, which this row must not use.
 
@@ -116,9 +117,14 @@ outputs are multiples of 64, as `assert_resolution` requires of a two-stage call
 
 ### 1.2 What our code assumes, and what actually binds
 
+Every repo-local anchor in this section is pinned `@ 5a0ffe9e3`, this row's base
+SHA, because the row edits the file it cites and an unpinned anchor into a file
+you are yourself moving is stale by default (#911). The post-change positions are
+given where they matter.
+
 `vllm_video_generate` resolves geometry at
-`src/vllm/multimodal/ltx2_video.cpp:1401-1422` and turns it into a latent grid at
-`:1455-1463`:
+`src/vllm/multimodal/ltx2_video.cpp:1401-1422 @ 5a0ffe9e3` and turns it into a
+latent grid at `:1455-1463 @ 5a0ffe9e3` (`:1485-1493` after this row):
 
 ```cpp
 const int64_t phase_h = height / phase.spatial_downscale;
@@ -131,17 +137,31 @@ vshape.width  = phase_w / factors.width;
 
 Three binding constraints, and only one of them is a check:
 
-1. **A lower bound**, `:1464-1471` — the request must reach one latent cell.
-   Present, correct, and gated.
-2. **`frames < 1`**, `:1422`. Present.
-3. **Divisibility — absent.** Integer division is the whole of it. On the
-   distilled two-stage recipe (`phase.spatial_downscale = 2`,
-   `factors.height = 32`) a requested 100x100 renders 96x96, silently.
+1. **A lower bound**, `:1464-1471 @ 5a0ffe9e3` (`:1494-1501` after this row) —
+   the request must reach one latent cell. Present, correct, and gated.
+2. **`frames < 1`**, `:1422 @ 5a0ffe9e3`. Present.
+3. **Divisibility — absent.** Integer division is the whole of it.
 
-`docs/USAGE.md:625-627` already documents the divide-by-64 rule as though
-something enforced it. Nothing does. That gap between a published promise and the
-tree is the defect (#919), and it is the one thing in this story that is a
-source-and-refusal question rather than a measurement one.
+**MEASURED, not reasoned.** The defect has two faces, and which one a request
+gets depends on whether its floor is consistent across the phases. Both were
+observed on the reduced fixture at `5a0ffe9e3`, before the guard existed:
+
+| Request | Recipe | What happened |
+|---|---|---|
+| width 80 | distilled two-stage | rendered **64x64**, exit success |
+| width 100 | one-stage | rendered **96x64**, exit success |
+| width 96 | distilled two-stage | threw `the upsampled latent is 4x2x2x2 but phase 'refine' needs 4x2x2x3` |
+
+The third is not a silent floor but it is not a usable error either: stage 1
+floors 48 to one latent cell while stage 2 needs three, so the upsampler's shape
+check fires with a true statement about latents and no mention of the width the
+caller passed. One guard at the entry point closes both faces, which is why the
+test case carries all three sizes.
+
+`docs/USAGE.md:626-629 @ 5a0ffe9e3` already documents the divide-by-64 rule as
+though something enforced it. Nothing does. That gap between a published promise
+and the tree is the defect (#919), and it is the one thing in this story that is
+a source-and-refusal question rather than a measurement one.
 
 ## 2. Scope
 
@@ -162,7 +182,7 @@ source-and-refusal question rather than a measurement one.
 
 - The res_2s denoising loop and the HQ preset — #921, `## Owed`.
 - `TI2VidTwoStagesPipeline` as a distinct recipe row. Our
-  `DistilledTwoStageRecipe` (`ltx2_pipeline.cpp:1060-1107`) already carries the
+  `DistilledTwoStageRecipe` (`ltx2_pipeline.cpp:1084-1131`) already carries the
   two-phase spatial-upsample shape; the non-distilled variant differs in its
   stage-1 schedule and guidance, and is a recipe row rather than a geometry
   question. Not bundled.
@@ -184,14 +204,21 @@ resolve and before anything consumes them — which is where upstream calls it,
 at the top of `__call__` before any work is paid for.
 
 **The divisor is derived, not restated.** `recipe.max_spatial_downscale()`
-(`ltx2_pipeline.cpp:970-976`) already reports the worst `spatial_downscale` over
+(`ltx2_pipeline.cpp:994-1000`) already reports the worst `spatial_downscale` over
 a recipe's phases: 2 for `distilled_two_stage`, 1 for `one_stage` and `dmd2`.
 Multiplied by `factors.height` (32) it is 64 and 32 — upstream's two numbers,
 reached by upstream's reasoning. A hardcoded pair would restate the answer and
 would silently be wrong for any future recipe whose phases downscale by more.
 
-`factors.height` and `factors.width` are both 32 today; the check uses each
-against its own axis so an asymmetric future VAE does not need this line changed.
+**One divisor covers both axes**, as upstream has it (`divisor = 64 if
+is_two_stage else 32`). That is the mirror and not a simplification: upstream's
+VIDEO_SCALE_FACTORS is `(8, 32, 32)`, so its single spatial divisor already
+covers both. The plan here first said the check would use each factor against its
+own axis; that would have been a divergence dressed as future-proofing. What
+landed instead asserts `factors.height == factors.width` at the call site and
+fails by name if a VAE ever breaks it, so the assumption is checked rather than
+carried silently — a VAE with differing axes would otherwise have its width
+measured against the height factor and no test would see it.
 
 ### 3.2 Frames: the doc moves, the code does not
 
@@ -251,19 +278,42 @@ Red-first, entering through the production entry point per
    scratch copy and rerun the focused gate. A green gate would mean the test
    measures the function rather than the capability.
 
-No upstream test is ported, because there is none to port: `Lightricks/LTX-2` at
-`fd4ded7f` contains **zero** `test_*.py` files anywhere in the repository.
-Recorded as a fact rather than as a silent omission of the standing "port the
-upstream tests in the same change" obligation.
+**No upstream test is ported, because there is none to port.** `Lightricks/LTX-2`
+at `fd4ded7f` contains **zero** `test_*.py` files anywhere in the repository —
+`find /home/mudler/_git/LTX-2 -name 'test_*.py'` returns nothing. Recorded as a
+fact rather than as a silent omission of the standing "port the upstream tests in
+the same change" obligation.
+
+What replaces that obligation, at the same bar: the tests are written **against
+upstream anchors** rather than ported from a suite. Only the provenance changes.
+Each still fails for the intended reason before the change, still enters through
+`vllm_video_generate` rather than constructing the type, and each asserted
+behaviour still names the upstream `file:line` that justifies it — the divisors
+and the raise from `helpers.py:540-551`, the halved stage-1 geometry from
+`ti2vid_two_stages.py:226-228`, the spatial factor from `ltx_core/types.py:31-33`,
+and the frames non-check from `blocks.py:908-928` with `types.py:113`.
+
+Two of the fixture sizes are **measured rather than reasoned**: width 80 rendering
+64x64 and one-stage width 100 rendering 96x64 were observed on this fixture before
+the guard existed, which is why the case uses those and not the obvious 96 that
+takes a different path entirely.
 
 ## 6. Records
 
 - `docs/USAGE.md` — the envelope, and the frames correction. Keyed record;
   scoped edit reapplied by key with unrelated keys proven byte-identical.
-- `docs/FEATURES.md` — **not edited**. This row changes no feature, model,
-  backend or quantization surface, and the file is a known lock (#595). In
-  particular the "Temporal x2 ups gated, UNDRIVEN" cell stays exactly as it is:
-  this row does not drive that arm and does not change that fact.
+- `docs/FEATURES.md` — **one row appended** to the LTX-2.5 gap table, and nothing
+  else touched. The row was not in the original plan: this row's first pass
+  declared FEATURES.md out of scope on the grounds that a refusal changes no
+  feature surface, and `check-doc-checkpoint` disagreed and was right. A size that
+  used to render and now refuses is exactly a change in what the project
+  supports, and the file already carries the LTX-2.5 refusal table that is its
+  home. Recorded rather than quietly done, because the plan said otherwise.
+
+  The **"Temporal x2 ups gated, UNDRIVEN" cell is untouched**, byte for byte.
+  This row does not drive that arm and does not change that fact. The file is a
+  known lock (#595), so the edit is one appended row rather than a rewrite, to
+  keep the conflict surface with the sibling rows editing it at a single line.
 - `.agents/issue-index.md` — append-only, two rows appended, zero removed.
 - No lifecycle change, so `docs/STATUS.md`, `docs/BENCHMARKS.md` and `## Now`
   are untouched.

@@ -508,6 +508,154 @@ TEST_CASE("ltx2 video: the second phase upsamples, and refuses when it cannot") 
   }
 }
 
+// A request whose size does not divide the latent grid used to RENDER at a size
+// nobody asked for (#919). `ltx2_video.cpp` integer-divides the request into
+// `Ltx2VideoLatentShape` and only ever checked the LOWER bound, so the floor was
+// silent and the call returned success.
+//
+// MEASURED on this fixture before the guard existed, which is why these sizes and
+// not the obvious ones: a two-stage request of width 80 rendered 64x64, and a
+// one-stage request of width 100 rendered 96x64. Width 96 on the two-stage arm
+// does NOT reach that state — stage 1 floors 48 to one latent cell while stage 2
+// needs three — so the upsampler's shape check catches it and reports "the
+// upsampled latent is 4x2x2x2 but phase 'refine' needs 4x2x2x3", a true statement
+// about latents and no help at all to a caller who passed a width. The defect has
+// two faces, a silent floor and an unreadable downstream throw, and one guard at
+// the entry point closes both.
+//
+// Upstream raises instead, at the top of every pipeline's `__call__` and before
+// any work is paid for: `assert_resolution` (ltx-pipelines utils/helpers.py:540-551)
+// takes a divisor of 64 for a two-stage pipeline and 32 for a one-stage one,
+// across ten call sites including ti2vid_two_stages.py:184 and
+// ti2vid_two_stages_hq.py:199.
+//
+// Those two divisors are NOT two constants. They are the VAE spatial factor (32,
+// ltx_core/types.py:31-33) times the worst spatial downscale any phase applies —
+// a two-stage pipeline runs stage 1 at `width // 2` (ti2vid_two_stages.py:226-228),
+// so the request must survive being halved and still divide the grid. The last two
+// subcases gate that DERIVATION rather than the numbers, by driving the same width
+// 96 through both recipes and requiring opposite answers.
+TEST_CASE("ltx2 video: a size that does not divide the latent grid is REFUSED, per recipe") {
+  Workspace ws;
+
+  SUBCASE("a two-stage width that is not a multiple of 64 is refused BY VALUE") {
+    vllm::multimodal::VideoModelParams mp = FixtureParams(ws.paths);
+    mp.extras["upsampler_path"] = ws.paths.upsampler;
+    const std::unique_ptr<vllm::multimodal::VideoEngine> engine =
+        vllm::multimodal::LoadVideoEngine(mp);
+    vllm::multimodal::VideoGenParams gen = FixtureGen(ws.root + "/w80");
+    gen.width = 80;
+    try {
+      (void)engine->Generate(gen);
+      FAIL("width 80 rendered 64x64 before the guard; it must be refused, not floored");
+    } catch (const std::exception& e) {
+      const std::string msg = e.what();
+      INFO(msg);
+      // The offending value, the divisor, and the axis. A message that says only
+      // "bad resolution" leaves the caller to guess which of the two numbers they
+      // passed is wrong and what a right one would be.
+      CHECK(msg.find("80") != std::string::npos);
+      CHECK(msg.find("64") != std::string::npos);
+      CHECK(msg.find("width") != std::string::npos);
+      // The suggested size, and that it is the NEAREST legal one rather than the
+      // request echoed back. Without this the arithmetic is unmeasured: a mutation
+      // replacing `(width / divisor) * divisor` with `width` left all fifteen
+      // other assertions green, and a wrong suggestion here sends the caller
+      // straight to another illegal size.
+      CHECK(msg.find("64x64") != std::string::npos);
+    }
+  }
+
+  SUBCASE("a two-stage height that is not a multiple of 64 is refused BY VALUE") {
+    vllm::multimodal::VideoModelParams mp = FixtureParams(ws.paths);
+    mp.extras["upsampler_path"] = ws.paths.upsampler;
+    const std::unique_ptr<vllm::multimodal::VideoEngine> engine =
+        vllm::multimodal::LoadVideoEngine(mp);
+    vllm::multimodal::VideoGenParams gen = FixtureGen(ws.root + "/h80");
+    gen.height = 80;
+    try {
+      (void)engine->Generate(gen);
+      FAIL("height 80 must be refused, not floored to 64");
+    } catch (const std::exception& e) {
+      const std::string msg = e.what();
+      INFO(msg);
+      CHECK(msg.find("80") != std::string::npos);
+      CHECK(msg.find("height") != std::string::npos);
+    }
+  }
+
+  // The other face of the same defect: 96 reaches the upsampler's shape check
+  // today. After the guard it is refused at the entry point, by the value the
+  // caller actually passed.
+  SUBCASE("a two-stage width of 96 is refused BY VALUE, not by latent shape") {
+    vllm::multimodal::VideoModelParams mp = FixtureParams(ws.paths);
+    mp.extras["upsampler_path"] = ws.paths.upsampler;
+    const std::unique_ptr<vllm::multimodal::VideoEngine> engine =
+        vllm::multimodal::LoadVideoEngine(mp);
+    vllm::multimodal::VideoGenParams gen = FixtureGen(ws.root + "/w96");
+    gen.width = 96;
+    try {
+      (void)engine->Generate(gen);
+      FAIL("96 is not a multiple of 64 and must be refused at the entry point");
+    } catch (const std::exception& e) {
+      const std::string msg = e.what();
+      INFO(msg);
+      CHECK(msg.find("96") != std::string::npos);
+      CHECK(msg.find("width") != std::string::npos);
+      CHECK(msg.find("upsampled latent") == std::string::npos);
+    }
+  }
+
+  SUBCASE("a one-stage width that is not a multiple of 32 is refused BY VALUE") {
+    vllm::multimodal::VideoModelParams mp = FixtureParams(ws.paths);
+    mp.extras[vllm::multimodal::kLtx2PipelineKindExtra] = "one_stage";
+    const std::unique_ptr<vllm::multimodal::VideoEngine> engine =
+        vllm::multimodal::LoadVideoEngine(mp);
+    vllm::multimodal::VideoGenParams gen = FixtureGen(ws.root + "/os100");
+    gen.width = 100;
+    try {
+      (void)engine->Generate(gen);
+      FAIL("one-stage width 100 rendered 96x64 before the guard; it must be refused");
+    } catch (const std::exception& e) {
+      const std::string msg = e.what();
+      INFO(msg);
+      CHECK(msg.find("100") != std::string::npos);
+      CHECK(msg.find("32") != std::string::npos);
+      CHECK(msg.find("width") != std::string::npos);
+      // 96, not 64: the nearest legal size follows the recipe's own divisor.
+      CHECK(msg.find("96x64") != std::string::npos);
+    }
+  }
+
+  // The guard is not a blanket one. Without this, every subcase above is
+  // satisfied by a check that refuses everything.
+  SUBCASE("a multiple of 64 still renders on the two-stage recipe") {
+    vllm::multimodal::VideoModelParams mp = FixtureParams(ws.paths);
+    mp.extras["upsampler_path"] = ws.paths.upsampler;
+    const std::unique_ptr<vllm::multimodal::VideoEngine> engine =
+        vllm::multimodal::LoadVideoEngine(mp);
+    const vllm::multimodal::VideoResult result = engine->Generate(FixtureGen(ws.root + "/ok64"));
+    CHECK(result.width == 64);
+    CHECK(result.height == 64);
+  }
+
+  // The SAME width 96 the two-stage arm refuses, on a recipe whose only phase
+  // runs at the requested size. 96 = 3 * 32, so it divides that grid and must be
+  // served. A hardcoded 64 would refuse it here too: this is the assertion that
+  // separates the derivation from the constant.
+  SUBCASE("96 is a legal ONE-STAGE size, because that divisor is 32") {
+    vllm::multimodal::VideoModelParams mp = FixtureParams(ws.paths);
+    mp.extras[vllm::multimodal::kLtx2PipelineKindExtra] = "one_stage";
+    const std::unique_ptr<vllm::multimodal::VideoEngine> engine =
+        vllm::multimodal::LoadVideoEngine(mp);
+    vllm::multimodal::VideoGenParams gen = FixtureGen(ws.root + "/one_stage_96");
+    gen.width = 96;
+    const vllm::multimodal::VideoResult result = engine->Generate(gen);
+    CHECK(result.width == 96);
+    CHECK(result.height == 64);
+  }
+}
+
 // ─── the refusals, each of which would otherwise RENDER ─────────────────────
 
 // PHASE L8 CHANGED WHAT THIS CASE ASSERTS, and the change is the phase.
