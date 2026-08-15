@@ -5,8 +5,10 @@
 ([#517](https://github.com/mudler/vllm.cpp/issues/517), parent spec
 [nemotron-h-model.md](nemotron-h-model.md)) — this spec owns what that spec's
 §6e carried forward as item 3 and explicitly put out of its own scope.
-**Also repaired here:** [#775](https://github.com/mudler/vllm.cpp/issues/775) —
-see §7 R2.
+**Depends on an in-flight fix:** [#775](https://github.com/mudler/vllm.cpp/issues/775)
+is already repaired by **open PR
+[#868](https://github.com/mudler/vllm.cpp/pull/868)** — see §7 R2. A1 consumes it,
+it does not redo it.
 **Base:** `origin/main` @ `2e9d95e74c7aee133e21771182a6a587fe74c67b`.
 **Pinned oracle:** `${VLLM_SOURCE}` = `/home/mudler/_git/vllm` @
 `5559679229bc961848b121ccdeaa8fa5d79bec98` (vLLM 0.26.0.dev0), verified at HEAD
@@ -183,7 +185,7 @@ function, and neither is separately testable on the driver model:
 
 They fail together, they are proven by the same test pair, and splitting them
 manufactures a commit that cannot be gated. **A1 = S1 + S2 + the G-SAFE
-interlock + the #775 repair, in one commit.**
+interlock, in one commit, on top of #868.**
 
 | In A1 | Out of A1 |
 |---|---|
@@ -191,7 +193,7 @@ interlock + the #775 repair, in one commit.**
 | the config cross-check at `:523-527` **deleted**, not widened; the three `Qwen3.5`-named messages at `:516`, `:525`, `:535` renamed to name the architecture | any new HF-config field, and specifically **no** NemotronH branch in `hf_config.cpp` (§0.2) |
 | per-layer recurrent membership derived from `KVCacheGroupSpec::layer_names` | the device forward (A2) |
 | the G-SAFE by-name refusal in `ForwardNemotronHForCausalLM` | the MTP head (parent W5) and GGUF (parent W7) |
-| the #775 `static_cast` repair at `nemotron_h_registry.cpp:122` (§7 R2) | a tree-wide sweep of the same cast class (§7 R2) |
+| the interlock opened through `vllm::ModelAs<>` from PR #868 (§7 R2) | re-fixing #775, and the tree-wide sweep of the cast class (#847) |
 | a by-name refusal in `MakeKVCacheMaybeSpec` for a speculative non-Qwen3.5 config (§1.2) | making speculative NemotronH actually work |
 
 **What A1 unblocks:** every hybrid whose config does not speak Qwen3.5's
@@ -241,14 +243,15 @@ the interlock deleted is not an acceptable split.
 ### 1.1 Dependency order
 
 ```
-A1 (runner refactor + interlock + #775)  ──►  A2 (device/paged forward)  ──►  A3 (ABI e2e token gate)
-        │                                              │                          └── same PR as A2
-        │                                              ├── requires KERNEL-SSM-MAMBA (#496) W2, the CUDA arm
-        │                                              └── requires the conv-state dtype reconciliation (§5.3b)
-        └── requires nothing beyond main + bc570da0d
+A1 (runner refactor + interlock)  ──►  A2 (device/paged forward)  ──►  A3 (ABI e2e token gate)
+        │                                        │                          └── same PR as A2
+        │                                        ├── requires KERNEL-SSM-MAMBA (#496) W2, the CUDA arm
+        │                                        └── requires the conv-state dtype reconciliation (§5.3b)
+        └── requires main + bc570da0d, and PR #868 for `vllm::ModelAs<>` (§7 R2)
 ```
 
-A1 is independent of #496 and can land immediately. A2 cannot: the parent spec's
+A1 is independent of #496. Its only dependency is PR #868 (§7 R2), which is a
+small in-flight fix rather than a campaign, so A1 is claimable now. A2 cannot: the parent spec's
 §0 hard blocker holds — the CUDA Mamba2 SSD arm is W2 of
 [#496](https://github.com/mudler/vllm.cpp/issues/496)
 ([spec](mamba2-ssd.md)). **Re-verify #496 W2's state against the current head and
@@ -624,7 +627,7 @@ three times in one campaign here
 | M4 | membership taken from group **index** instead of `layer_names` | NemotronH arm |
 | M5 | the G-SAFE refusal in `ForwardNemotronHForCausalLM` replaced by a fall-through | the interlock test |
 | M6 | the `MakeKVCacheMaybeSpec` speculative refusal removed | the §1.2 refusal test |
-| M7 | the #775 `dynamic_cast` guard reverted to `static_cast` | the UBSan leg, under `-DVLLM_CPP_SANITIZE='address,undefined'` |
+| M7 | the interlock's `vllm::ModelAs<>` reverted to an unchecked `static_cast` | the interlock test, and the UBSan leg under `-DVLLM_CPP_SANITIZE='address,undefined'`. This mutation belongs to A1 only if #868 has landed; if A1 declares #868 its base, #868 owns its own equivalent and A1 does not restate it |
 | M8 (A2) | the carried SSM state zeroed at the start of every step | the A3 multi-step token gate — see §5.2 |
 | M9 (A2) | every request's state slot forced to 0 | the A3 batched token gate |
 | M10 (A2) | the batch treated as one concatenated causal sequence | the A3 batched token gate |
@@ -811,34 +814,47 @@ claimed.
 converts a loud refusal into a silently wrong server. §0 is the gate; a reviewer
 who cannot point at the interlock returns FAIL.
 
-**R2 — #775 is open in the exact function A1 rewrites, and `main` is RED on
-`sanitize-cpu` because of it.** `ForwardNemotronHForCausalLM` downcasts
-unconditionally at `nemotron_h_registry.cpp:122`
-(`static_cast<NemotronHLoadedModel&>(model)`), and UBSan names the member call
-that goes through it at `:130-132`. `ModelRegistry::Forward`
-(`model_registry.cpp:324-327`) performs no type check.
+**R2 — the #775 repair is ALREADY IN FLIGHT as PR
+[#868](https://github.com/mudler/vllm.cpp/pull/868); A1 consumes it rather than
+redoing it.** An earlier draft of this spec told A1 to fix #775 in flow. That was
+wrong, and the correction is recorded rather than quietly applied, because the
+way it was wrong is a standing trap: an issue-and-open-PR search that stops at
+issues finds #775 OPEN and concludes the work is unclaimed
+([[verify-gap-against-open-prs-not-just-issues]]).
 
-> **Decision: A1 repairs #775 in the same change and closes it.** Three reasons,
-> all pointing the same way. It is in the exact function A1 must edit to install
-> the interlock — and the interlock is *itself* a guard placed before those
-> member calls, so writing it correctly means establishing the dynamic type
-> first, which is the fix. AGENTS.md is explicit that a bug found in flow is
-> fixed in flow, referenced in the commit and closed. And it stops `main` staying
-> red on a lane this row's own later gates need green.
+The facts as measured. `ForwardNemotronHForCausalLM` does downcast
+unconditionally at `nemotron_h_registry.cpp:122`, and `ModelRegistry::Forward`
+(`model_registry.cpp:324-327`) performs no type check — §0 is accurate. But
+branch `row/FIX-NEMOTRON-H-FORWARD-DOWNCAST-775` (`0923af27c`, merged forward to
+`829bbd527`) already carries a complete, gated repair, and PR #868 is open on it.
+What it introduces matters to A1 directly:
+
+- **`vllm::ModelAs<Model>` in the shared registry header** — a `dynamic_cast`
+  plus a branch, with the refusal authored once and out of line in
+  `RaiseModelTypeMismatch`. It mirrors the local `dynamic_cast`-with-refusal
+  idiom already used by `kv_cache_spec_registry.cpp`,
+  `single_type_kv_cache_manager.cpp` and `attention/backend.cpp`.
+- A test handing `reg.factory->forward` a complete `ForeignLoadedModel` and
+  requiring a named refusal.
+- The rejected alternative, written down: comparing
+  `model.registration().architecture` against the expected name answers what the
+  *registration claims*, not what the object *is*, and the realistic defect
+  carries the right architecture string on the wrong object.
+
+> **Decision: A1 depends on #868 and opens the interlock with
+> `vllm::ModelAs<NemotronHLoadedModel>`.** The G-SAFE refusal is a guard placed
+> before exactly the member calls #868 makes safe, so writing it on top of
+> `ModelAs` is both correct and one line. **Confirm #868's state before claiming
+> A1.** If it has landed, use the helper. If it is still open, A1 either waits or
+> declares #868 its base and says so in the PR body — it must not reimplement the
+> helper, and it must not reintroduce the cast.
 >
-> **The safe idiom already exists in the same file:** `NemotronHLoadReportOf`
-> (`nemotron_h_registry.cpp:146-153`) uses `dynamic_cast` + throw. Mirror that.
->
-> **The same unconditional cast is repo-wide** — e.g.
-> `kimi_linear_registry.cpp:90`. #775 says so itself: *"if the other entry points
-> have the same unconditional `static_cast`, that is a class"* — and **the class
-> is already filed as
-> [#847](https://github.com/mudler/vllm.cpp/issues/847)**, "34 registry entry
-> points still downcast a type-erased `LoadedModel` with an unchecked
-> `static_cast`". So A1 fixes the NemotronH site, closes #775, and references
-> #847 without widening into it. Do not silently turn A1 into a tree-wide sweep;
-> #847 owns that, to be swept the way #627 and #772 handled the unaligned-read
-> class.
+> **The class is #847, and it is not mechanical.** #868's own message records why
+> the 34 sibling sites across 32 model TUs were not swept with it:
+> `llama_registry`, `qwen3_5_dense` and `gemma4_registry` each register three
+> architectures against one forward, so those sites have no single architecture
+> name to refuse under. #847 carries the three candidate answers. A1 references
+> it and does not widen into it.
 
 **R3 — A2 is blocked on #496 W2 and the block may still hold.** Re-verify
 against the current head and issue state before claiming A2. If the CUDA Mamba2
@@ -890,7 +906,7 @@ these are the obligations of the implementing changes.
 
 | Change | Owes |
 |---|---|
-| **A1** | nothing in `docs/` — it edits `src/` and `tests/` only and changes no lifecycle state. It **does** owe: this spec's `## Outcome` opened with the byte-identity result and the §3.4 mutation table; a note in the parent spec's W5 section recording the §1.2 refusal and the repair still owed; #775 referenced and closed in the commit; a new issue filed for §1.3 (the `static_cast` class is already #847) |
+| **A1** | nothing in `docs/` — it edits `src/` and `tests/` only and changes no lifecycle state. It **does** owe: this spec's `## Outcome` opened with the byte-identity result and the §3.4 mutation table; a note in the parent spec's W5 section recording the §1.2 refusal and the repair still owed; the §1.3 issue filed; #775/#868 referenced as a dependency, never re-fixed (the class stays with #847) |
 | **A2 + A3** | a lifecycle change, so: `docs/STATUS.md`, `docs/BENCHMARKS.md` (pending, failed or void is a result — silence is not), the row spec's `## Now`, and the row + checklist entry + rollup in `.agents/model-matrix.md:285` in the **same** change (`scripts/check-model-checklist.py` enforces the rollup). Plus `docs/FEATURES.md:141`, whose `NemotronHForCausalLM` row currently reads "CPU host forward returns logits … W6 owns the token gate"; the removal of `scripts/runner-routing-allowlist.txt:26`; and `docs/USAGE.md` if `scripts/check-doc-checkpoint.py` classifies the new example as a user-facing surface — note `kimi-linear-gen` is not currently documented there, so run the checker rather than assuming either way |
 | **both** | `.agents/issue-index.md` row for #810 (appended by this spec's commit); #810 linked from the spec and the PR body; this spec's `## Outcome` recording what was measured, what was rejected and why, and why each default is what it is |
 
@@ -906,8 +922,8 @@ claimable immediately against `main` + `bc570da0d`; A2 is blocked on #496 W2, an
 that block must be re-verified rather than inherited from this sentence.
 
 **Next action:** a fresh implementer claims A1 from §1, captures the §3.1 red
-first, and lands it with the G-SAFE interlock and the #775 repair in the same
-commit. A fresh reviewer — never the implementer — runs the §3.4 mutations and
+first, confirms #868's state per §7 R2, and lands A1 with the G-SAFE interlock
+opened through `vllm::ModelAs<NemotronHLoadedModel>`. A fresh reviewer — never the implementer — runs the §3.4 mutations and
 reports M3 as a pair.
 
 ## 10. Outcome
