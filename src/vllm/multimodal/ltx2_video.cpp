@@ -5,6 +5,7 @@
 #include "vllm/multimodal/ltx2_video.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -34,6 +35,7 @@
 #include "vllm/model_executor/models/ltx2_pipeline.h"
 #include "vllm/model_executor/models/ltx2_text_encoder.h"
 #include "vllm/model_executor/models/ltx2_upsampler.h"
+#include "vllm/model_executor/models/ltx2_tiling.h"
 #include "vllm/model_executor/models/ltx2_video_vae.h"
 #include "vllm/model_executor/models/ltx2_video_vae_encoder.h"
 #include "vllm/model_executor/models/minimax_h3.h"
@@ -168,6 +170,11 @@ struct StreamState {
   std::vector<float> latent, clean;  // [tokens, width]
   std::vector<float> mask;           // [tokens], patchified denoise mask
   std::vector<double> positions;     // [n_pos_dims, tokens, 2]
+  // `_first_frame_keyframes_mask` (tools.py:186-196), [tokens]. VIDEO only, and
+  // populated on EVERY generation — the rule has no branch on whether a keyframe
+  // was supplied. Empty on the audio stream, whose args preprocessor upstream
+  // builds with no keyframes_embedding_provider (model.py:333).
+  std::vector<float> keyframes_mask;
 };
 
 // `post_process_latent` (utils/helpers.py:462-464):
@@ -250,15 +257,36 @@ int64_t ExtraInt(const std::map<std::string, std::string>& extras, const std::st
   }
 }
 
+// The one key this family DEFINES and does not SERVE. `Ltx2DurationPredict` is
+// ported and gated as a brick (`ltx2_duration_head.h`), but nothing here
+// constructs one, so a supplied path names a file the engine never opens.
+constexpr char kLtx2DurationHeadPathExtra[] = "duration_head_path";
+
 // Every extra key this family DEFINES. An extra outside this set is refused
 // rather than ignored, for the same reason H3 refuses one
 // (minimax_h3_video.cpp): a mistyped knob that is silently dropped renders the
 // DEFAULT and looks like the feature not working.
+//
+// DEFINED IS NOT THE SAME AS SERVED, and conflating the two was #611: nine of
+// these ten reach a reader, and `duration_head_path` reached none, so supplying a
+// duration head substituted the recipe default in silence — the failure mode this
+// very list exists to prevent, one level in. It stays in the list because the
+// family DOES define the key and DOES know what it means; `CheckUnservedExtras`
+// refuses it by name instead, which is a different and truer message than
+// "unknown load extra". The full audit is in
+// .agents/specs/ltx25-retire-dead-arms.md §2.1.
+//
+// The first hand-written set of these anchors named nine lines that were readers
+// of NOTHING, in this very file, and a later merge moved the real ones again. So
+// they are no longer trusted: the list below is derived from this file on every
+// run and compared, and the failure prints the replacement to paste in.
+// READER ANCHORS (derived and gated by test_ltx2_video):
+// 660 715 811 827 829 899 924 1029 1070
 const char* const kKnownLoadExtras[] = {
     kLtx2AudioPromptEmbedsExtra, kLtx2PipelineKindExtra,   kLtx2ModelVersionExtra,
     kLtx2AllowUnportedExtra,     kLtx2MaxPhaseExtra,       kLtx2DitConfigPathExtra,
     kLtx2PromptValidRowsExtra,   kLtx2EncoderConfigPathExtra,
-    "upsampler_path",            "duration_head_path",
+    "upsampler_path",            kLtx2DurationHeadPathExtra,
 };
 
 // FNV-1a over the raw bytes of a float buffer — the `Ltx2ConditioningTrace`
@@ -294,6 +322,27 @@ void CheckKnownExtras(const std::map<std::string, std::string>& extras) {
       for (const char* name : kKnownLoadExtras) listing += std::string(listing.empty() ? "" : ", ") + name;
       Fail("unknown load extra '" + kv.first + "'. This family defines: " + listing);
     }
+  }
+}
+
+// A key this family DEFINES but does not SERVE, refused BY NAME when supplied
+// (#611). The alternative — accepting it — is the worst of the three options:
+// worse than refusing, and worse than not defining the key, because the caller
+// pointed at a specific file and got the recipe default with no diagnostic.
+//
+// Deliberately NOT the "unknown load extra" path above. That message says the
+// family does not define the key, which is false here and would send the reader
+// looking for a typo instead of for the unported head.
+void CheckUnservedExtras(const std::map<std::string, std::string>& extras) {
+  const std::string duration_head = VideoExtra(extras, kLtx2DurationHeadPathExtra);
+  if (!duration_head.empty()) {
+    Fail("the '" + std::string(kLtx2DurationHeadPathExtra) + "' extra names '" + duration_head +
+         "', but the duration head is NOT WIRED into this engine: `Ltx2DurationPredict` is ported "
+         "and gated as a brick (ltx2_duration_head.h, upstream duration_head.py:89-118) and "
+         "nothing here constructs one, so that file would never be opened and an AUTO duration "
+         "would fall back to the recipe default. Give 'num_frames', or 'duration' (exact "
+         "arithmetic against the recipe frame rate), instead. Refused rather than ignored; "
+         "recorded as owed in .agents/specs/ltx25-retire-dead-arms.md (#611).");
   }
 }
 
@@ -526,6 +575,7 @@ Ltx2ConditioningTrace Ltx2VideoEngine::last_conditioning() const {
 std::unique_ptr<Ltx2VideoEngine> Ltx2VideoEngine::Load(const VideoModelParams& params) {
   if (params.dit_path.empty()) Fail("dit_path is required");
   CheckKnownExtras(params.extras);
+  CheckUnservedExtras(params.extras);
 
   auto engine = std::unique_ptr<Ltx2VideoEngine>(new Ltx2VideoEngine());
   engine->impl_ = std::make_unique<Impl>();
@@ -698,8 +748,8 @@ std::unique_ptr<Ltx2VideoEngine> Ltx2VideoEngine::Load(const VideoModelParams& p
     // `Ltx2AdoptDeclaredDitParams` (ltx2_loader.h) is the ONE place the adoption
     // rule lives, because the device gate drives `Ltx2StreamDitToDevice` without
     // this engine and owes the same check; two copies would be two rules.
-    const Ltx2DitParams declared = Ltx2AdoptDeclaredDitParams(
-        dit_config, im.dit.params, dit_options.allow_unported_modules, source);
+    const Ltx2DitParams declared =
+        Ltx2AdoptDeclaredDitParams(dit_config, im.dit.params, source);
     im.dit.params = declared;
   }
 
@@ -1249,8 +1299,9 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
         "these tokens the embedding contributes nothing, and porting it would not serve this "
         "arm. The tokens that DO reach it are the target's own first latent frame, marked "
         "unconditionally by `_first_frame_keyframes_mask` (ltx_core/tools.py:184-196) — which "
-        "is the frame the SERVED first-frame arm writes into. That omission is real and is "
-        "tracked as issue #658; it is not what blocks a last-frame keyframe.");
+        "is the frame the SERVED first-frame arm writes into. That omission WAS real; row "
+        "LTX25-KEYFRAMES-ABS-POS closed it on 2026-08-14 (issue #658), so the marker is now "
+        "applied on every render. It was never what blocks a last-frame keyframe.");
   }
   if (!gen.ref_image_paths.empty() || !gen.ref_video_dir.empty()) {
     Fail(
@@ -1330,12 +1381,12 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
     // needs an encoded prompt this engine cannot produce", and since `has_encoder`
     // above the engine produces exactly that. What is missing now is the head
     // itself — `ltx2_duration_head.h` is ported and gated as a brick, but nothing
-    // here constructs one, and `duration_head_path` is accepted in
-    // `kKnownLoadExtras` while NO code reads it (grep: it appears at that one
-    // site). So the extra is inert rather than wired, and that is recorded as owed
-    // rather than left to be discovered by someone who supplies it and gets the
-    // recipe default. An explicit duration is exact arithmetic, so it is served;
-    // the AUTO path is what is missing, and `num_frames` is how to avoid it.
+    // here constructs one. `duration_head_path` used to be ACCEPTED while no code
+    // read it, so a caller who supplied a head silently landed on this line
+    // instead; `CheckUnservedExtras` now refuses that key by name at load (#611,
+    // .agents/specs/ltx25-retire-dead-arms.md §2). What remains owed is the head
+    // itself. An explicit duration is exact arithmetic, so it is served; the AUTO
+    // path is what is missing, and `num_frames` is how to avoid it.
     frames = static_cast<int64_t>(std::llround(gen.duration_seconds * fps));
   }
   if (frames < 1) Fail("num_frames resolved to " + std::to_string(frames));
@@ -1420,6 +1471,37 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
              "Supply 'upsampler_path', or stop before this phase with '" +
              std::string(kLtx2MaxPhaseExtra) + "'.");
       }
+      // The phase wants the SPATIAL x2 upsampler. The temporal x2 arm is a
+      // different model with the same class name and the same tensor NAMES
+      // (`upsampler.0.*`), so pointing 'upsampler_path' at
+      // `ltx-2.5-latent-temporal-upscaler-x2-bf16-1.0.safetensors` loads and runs
+      // cleanly and returns `[c, 2f-1, h, w]` where this phase needs
+      // `[c, f, 2h, 2w]`. The shape check below would catch it, but it would
+      // report a mismatch and leave the caller guessing; naming the swap here is
+      // the difference between "you gave me the wrong checkpoint" and "something
+      // is 3 frames short". Ported and gated, not driven — see
+      // .agents/specs/ltx25-temporal-upsampler.md section 7.
+      //
+      // `&& !spatial_upsample` IS LOAD-BEARING. This guard used to test
+      // `temporal_upsample` alone, which every BOTH-flags config also satisfies,
+      // so it fired by implication over the same variable and told the caller who
+      // supplied a genuine SPATIOTEMPORAL checkpoint that they had handed over the
+      // temporal one — wrong on both counts, and pointing them at the arm they
+      // already had. It also shadowed the ledger refusal at
+      // `ltx2_upsampler.cpp:465`, which names the spatiotemporal arm and was
+      // therefore unreachable from any request. Narrowed here so a both-flags
+      // config falls THROUGH to that refusal. Gated by test_ltx2_video's
+      // "a SPATIOTEMPORAL upsampler checkpoint is refused as SPATIOTEMPORAL".
+      if (im.upsampler_cfg.temporal_upsample && !im.upsampler_cfg.spatial_upsample) {
+        Fail("phase '" + phase.name +
+             "' needs the latent SPATIAL x2 upsampler, but the checkpoint at 'upsampler_path' "
+             "declares temporal_upsample=true, i.e. it is the TEMPORAL x2 upsampler. That arm "
+             "upsamples the frame axis and drops the first frame "
+             "(model/upsampler/model.py:68-71, 109-113); no phase of any recipe this engine "
+             "serves consumes it, because its only upstream consumer is DFRPipeline's rounds "
+             "loop, which is not ported. Supply the spatial upsampler "
+             "('ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors').");
+      }
       Ltx2LatentVolume in;
       in.batch = 1;
       in.channels = video_lc;
@@ -1461,6 +1543,13 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
       video.latent = Ltx2VideoPatchify(volume.data(), vshape, 1);
       video.clean = video.latent;
       video.mask.assign(static_cast<size_t>(video.tokens), 1.0F);
+      // tools.py:184 — `create_initial_state` returns the state with
+      // `keyframes_mask=self._first_frame_keyframes_mask(state)` ALWAYS, on the
+      // same line that builds it. Not conditioned on `wants_image`, not
+      // conditioned on any keyframe: the marker is a fact about the causal
+      // encoder's first latent frame, which spans a single pixel frame while
+      // every later one spans `temporal_scale_factor`.
+      video.keyframes_mask = Ltx2FirstFrameKeyframesMask(vshape, /*patch_size=*/1);
       const std::vector<int64_t> bounds = Ltx2VideoPatchBounds(vshape, 1);
       const std::vector<int64_t> pixels = Ltx2PixelCoords(bounds, 1, video.tokens, factors, true);
       // `positions = get_pixel_coords(...).float()` then
@@ -1628,6 +1717,54 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
       vin.sigma = &sigma_row;
       vin.positions = video.positions.data();
       vin.context = video_context;
+      // transformer_args.py:269 through modality.py:63. Handed over only when the
+      // model HAS the parameter: a mask on a model without one is refused by the
+      // forward, and upstream's own `supports_keyframes_abs_pos_embedding`
+      // (model.py:166-173) is exactly this condition. The mask itself is built
+      // unconditionally above, because it is data about the latent.
+      //
+      // THE EMPTINESS IS CHECKED, and that is not defensive noise. Making the
+      // mask conditional — on `wants_image`, on a keyframe, on anything — is the
+      // one defect this module invites, and it is INVISIBLE to every output
+      // check: the render stays finite, the right shape, the right token count,
+      // and simply omits a trained term. Without this line a conditional mask
+      // reaches the DiT as `data()` on an empty vector, which is a null pointer
+      // and therefore upstream's legal "no token is marked" — a silent drop
+      // dressed as a supported path. MEASURED: with the mask made conditional
+      // and this check absent, all five LTX-2.5 suites stayed GREEN.
+      if (im.dit.params.use_keyframes_abs_pos_embedding) {
+        VT_CHECK(static_cast<int64_t>(video.keyframes_mask.size()) == video.tokens,
+                 "ltx2 video: this DiT carries keyframes_abs_pos_embedding, so every forward owes "
+                 "the marker `_first_frame_keyframes_mask` builds (ltx_core/tools.py:184-196) — "
+                 "one value per video token, populated on EVERY generation whether or not a "
+                 "keyframe was supplied. Handing the forward no marker would render without a "
+                 "trained term and look exactly like a working render.");
+        vin.keyframes_mask = video.keyframes_mask.data();
+      }
+      // AND THE HANDOVER IS CHECKED SEPARATELY FROM THE CONSTRUCTION, because the
+      // check above cannot see the handover. It reads `video.keyframes_mask` — the
+      // VECTOR — so it fires when the mask is built conditionally and stays silent
+      // when the ASSIGNMENT is. MEASURED: with the vector left unconditional and
+      // this assignment written `if (wants_image) vin.keyframes_mask = ...`, all
+      // five LTX-2.5 suites stayed GREEN while the rendered pixels moved — frame 0
+      // went from a flat 127 to a flat 130 — so the drop was real and nothing in
+      // the tree named it. Two sites, one invariant, and the earlier guard covered
+      // only one of them.
+      //
+      // `vin.keyframes_mask` is the field `Ltx2DitForward` reads, so it is the only
+      // fact that decides whether the trained term is applied. The condition stays
+      // on the flag rather than becoming a bare `!= nullptr`: a DiT that does NOT
+      // carry the parameter must reach the forward with a null marker, which is
+      // upstream's `keyframes_mask is None` exit and is itself gated at
+      // `ltx2_dit.cpp`'s `m.keyframes_mask == nullptr || keyframes_embedding !=
+      // nullptr`. Handing that model a marker would be a refusal, not a fix.
+      VT_CHECK(!im.dit.params.use_keyframes_abs_pos_embedding || vin.keyframes_mask != nullptr,
+               "ltx2 video: this DiT carries keyframes_abs_pos_embedding, so the forward owes the "
+               "marker on EVERY step — and this forward was handed none. "
+               "`_first_frame_keyframes_mask` (ltx_core/tools.py:184-196) is built on the same "
+               "line as the state, unconditionally, whether or not a keyframe or an image was "
+               "supplied. A marker that is BUILT and then not HANDED OVER renders without a "
+               "trained term and looks exactly like a working render.");
 
       Ltx2ModalityInput ain;
       ain.batch = 1;
@@ -1742,10 +1879,134 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
   }
 
   // ── decode (distilled.py:314-315) ─────────────────────────────────────────
+  //
+  // STREAMED, through upstream's own AUTO tiling, mirroring
+  // `ti2vid_two_stages.py:365-376`: the pipeline passes `AUTO_TILING` and the
+  // consumer takes chunks straight out of `decode_video` instead of a whole clip.
+  //
+  // AT THE SIZES THIS PROJECT HAS RUN, THIS CHANGES NOTHING, and that is a
+  // measured statement rather than a hope. `Ltx2AutoTileSizeConfig` is upstream's
+  // Conv layout (768px tile / 64px overlap on the long side, 80 frames / 24
+  // overlap — helpers.py:59-88), and `split_by_size` returns ONE interval when the
+  // axis is no bigger than the tile (tiling.py:199-200). At 448x256/25f the latent
+  // is 8x14 against a 14x24 grid tile and 4 frames against a 10-latent-frame
+  // temporal tile, so exactly one tile and one chunk come out — and the ONE-TILE
+  // CONTROL in tests/vllm/models/test_ltx2_tiling.cpp proves that path reproduces
+  // the untiled decode BIT FOR BIT (max|diff| == 0, on both causality arms, and
+  // upstream's own value for the same control is 0 too).
+  //
+  // TILING FIRST DOES ANYTHING AT 896x512 SPATIALLY AND AT **81 FRAMES**
+  // TEMPORALLY — 81, not 121. `latent_t = (frames - 1) / 8 + 1` is 11 at 81
+  // frames and `split_temporal_causal` short-circuits only while `latent_t <= 10`
+  // (tiling.py:239-240). The row's own golden `kLtx2AutoCases` has said so since
+  // it was generated (`768x768/81f -> t_intervals = 2`); the prose here said 121
+  // because the probe sweep that produced it stepped 25 -> 121 and never sampled
+  // the binding point.
+  //
+  // SO THE "CHANGES NOTHING" ABOVE IS BOUNDED BY 81 FRAMES, AND A DEFAULT REQUEST
+  // IS NOT INSIDE THAT BOUND. `docs/USAGE.md` records the recipe default as
+  // 1024x1536 at 121 frames. Between 81 and 120 frames the render is tiled and is
+  // NOT the render this path produced before tiling existed — measured on the
+  // SHIPPED conv VAE at the AUTO layout, 64x64 / 81 frames, latent 11,2,2, by
+  // scripts/probe_ltx2_tiled_equivalence.cpp: 2 tiles, 2 chunks, max|diff|
+  // 0.0503043234 against the untiled decode on an output whose own |max| is
+  // 0.7512672544 — 6.70% of that range — with 962983 of 995328 floats (96.75%)
+  // not bit-identical. That is upstream's own behaviour (a receptive field wider
+  // than the overlap, blended at the seam) and not a defect here — but it is a
+  // different image, and the one-tile control does not cover it.
+  //
+  // (This said 0.716 and "95% of the range" until the probe was re-derived: it
+  // reassembled the streamed chunks with a FLAT append, and a chunk is
+  // [C, t, H, W] channel-major, so the append is not [C, T, H, W] at C = 3 with
+  // 2 chunks. The 14x was the probe's own transposition. The conclusion stands,
+  // the magnitude did not — see ltx2_tiling.h for the full record.)
+  //
+  // What it buys, ABOVE ONE CHUNK: the full pixel volume is never materialized.
+  // Each temporal chunk is written to disk and dropped, so the peak is about two
+  // chunks rather than [3, F, H, W] — which is what makes the long clips
+  // upstream's 80/24 layout exists for reachable at all. At exactly one chunk the
+  // chunk IS the volume and nothing is saved; that is the regime below 81 frames,
+  // and it is no worse than the buffered path it replaced.
   EngineNoiseStream decode_noise(seed ^ 0x1D7Cull);
-  const Ltx2VideoFrames rendered =
-      Ltx2VideoDecode(im.video_kind, im.video_cfg, im.video_weights, video_latent_volume, video_lc,
-                      video_lf, video_lh, video_lw, &decode_noise);
+  const Ltx2ScaleFactors video_factors =
+      Ltx2VideoScaleFactorsFromBlocks(im.video_cfg.decoder_blocks, im.video_cfg.patch_size);
+  const int64_t rendered_h = video_lh * video_factors.height;
+  const int64_t rendered_w = video_lw * video_factors.width;
+
+  // ── artifacts (the library WRITES these, spawns nothing) ──────────────────
+  // Hoisted ABOVE the decode because the decode now writes into it chunk by
+  // chunk; a directory created after the first chunk arrived would be too late.
+  std::error_code ec;
+  std::filesystem::create_directories(gen.output_dir, ec);
+  if (ec) Fail("cannot create " + gen.output_dir + ": " + ec.message());
+
+  // A PREVIOUS RENDER'S TAIL IS DELETED BEFORE THIS ONE STARTS, and it has to be.
+  //
+  // The muxer is handed `frame_%06d.ppm` with no frame count (see `mux.frame_pattern`
+  // below), so it takes whatever consecutive files it finds. A 121-frame render
+  // followed by a 25-frame render into the same directory would leave
+  // frame_000025..frame_000120 on disk and mux a clip that runs 96 frames past its
+  // own end — silently, and looking like the longer render succeeded. Streaming
+  // widened this: a chunk that throws now also leaves a partial render behind,
+  // where the old buffered path wrote nothing until the whole decode had finished.
+  //
+  // Scoped deliberately: only `frame_<digits>.ppm`, only in the directory this
+  // render is about to write, and nothing else in it is touched. Collected first
+  // and removed after, because unlinking the entry the iterator is standing on is
+  // not something the directory iterator promises to survive.
+  {
+    std::vector<std::filesystem::path> stale;
+    for (const std::filesystem::directory_entry& entry :
+         std::filesystem::directory_iterator(gen.output_dir, ec)) {
+      if (ec) break;
+      if (!entry.is_regular_file()) continue;
+      const std::string name = entry.path().filename().string();
+      // "frame_" + at least one digit + ".ppm" is 11 characters.
+      if (name.size() < 11) continue;
+      if (name.rfind("frame_", 0) != 0) continue;
+      if (name.compare(name.size() - 4, 4, ".ppm") != 0) continue;
+      bool all_digits = true;
+      for (size_t i = 6; i + 4 < name.size(); ++i) {
+        if (std::isdigit(static_cast<unsigned char>(name[i])) == 0) all_digits = false;
+      }
+      if (!all_digits) continue;
+      stale.push_back(entry.path());
+    }
+    for (const std::filesystem::path& p : stale) {
+      std::error_code rm;
+      std::filesystem::remove(p, rm);
+    }
+    ec.clear();
+  }
+
+  int64_t rendered_frames = 0;
+  int64_t rendered_channels = 0;
+  Ltx2VideoDecodeStreaming(
+      im.video_kind, im.video_cfg, im.video_weights, video_latent_volume, video_lc, video_lf,
+      video_lh, video_lw, &decode_noise,
+      Ltx2AutoTileSizeConfig(rendered_h, rendered_w, video_factors),
+      [&](const Ltx2VideoChunk& chunk) {
+        MiniMaxH3VideoFrameShape shape;
+        shape.channels = chunk.frames.channels;
+        shape.t = chunk.frames.frames;
+        shape.h = chunk.frames.height;
+        shape.w = chunk.frames.width;
+        for (int64_t f = 0; f < chunk.frames.frames; ++f) {
+          char name[64];
+          // The GLOBAL frame index, which the chunk carries so the writer does not
+          // have to count. Numbering per-chunk would silently reorder the clip.
+          std::snprintf(name, sizeof(name), "frame_%06lld.ppm",
+                        static_cast<long long>(chunk.first_frame + f));
+          // The PPM/WAV/mux writers are the SHARED serialization the spec's §5
+          // reuse list names, not H3 behaviour: they take a buffer and a shape and
+          // contain no model. Reimplementing them here would be the parallel path
+          // §"Shared seams" forbids.
+          WriteFileBytes(JoinPath(gen.output_dir, name),
+                         MiniMaxH3WritePpmFrame(chunk.frames.data, shape, f));
+        }
+        rendered_frames += chunk.frames.frames;
+        rendered_channels = chunk.frames.channels;
+      });
 
   const Ltx2AudioSpectrogram mel = Ltx2AudioDecoderForward(
       im.audio_cfg, im.audio_weights, audio_latent_volume, audio_lc, audio_lf, audio_lm);
@@ -1754,35 +2015,24 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
       Ltx2VocoderWithBweForward(im.vocoder_cfg, im.vocoder_weights, mel.data, mel.channels,
                                 mel.frames, mel.mel_bins, &audio_samples);
 
-  // ── artifacts (the library WRITES these, spawns nothing) ──────────────────
-  std::error_code ec;
-  std::filesystem::create_directories(gen.output_dir, ec);
-  if (ec) Fail("cannot create " + gen.output_dir + ": " + ec.message());
-
   VideoResult result;
   result.frame_dir = gen.output_dir;
-  MiniMaxH3VideoFrameShape shape;
-  shape.channels = rendered.channels;
-  shape.t = rendered.frames;
-  shape.h = rendered.height;
-  shape.w = rendered.width;
-  for (int64_t f = 0; f < rendered.frames; ++f) {
-    char name[64];
-    std::snprintf(name, sizeof(name), "frame_%06lld.ppm", static_cast<long long>(f));
-    // The PPM/WAV/mux writers are the SHARED serialization the spec's §5 reuse
-    // list names, not H3 behaviour: they take a buffer and a shape and contain
-    // no model. Reimplementing them here would be the parallel path §"Shared
-    // seams" forbids.
-    WriteFileBytes(JoinPath(gen.output_dir, name),
-                   MiniMaxH3WritePpmFrame(rendered.data, shape, f));
+  // The streamed chunks must have covered exactly the clip the latent implies. A
+  // decode that dropped or duplicated a temporal group would otherwise show up
+  // only as a short mp4.
+  const int64_t expect_frames = (video_lf - 1) * video_factors.time + 1;
+  if (rendered_frames != expect_frames || rendered_channels != im.video_cfg.out_channels) {
+    Fail("the streamed video decode produced " + std::to_string(rendered_frames) + " frames x " +
+         std::to_string(rendered_channels) + " channels, but the latent implies " +
+         std::to_string(expect_frames) + " x " + std::to_string(im.video_cfg.out_channels));
   }
   result.audio_path = JoinPath(gen.output_dir, "audio.wav");
   WriteFileBytes(result.audio_path,
                  MiniMaxH3WriteWav(waveform, mel.channels, audio_samples,
                                    im.vocoder_cfg.output_sampling_rate));
-  result.frame_count = rendered.frames;
-  result.width = rendered.width;
-  result.height = rendered.height;
+  result.frame_count = rendered_frames;
+  result.width = rendered_w;
+  result.height = rendered_h;
   result.fps = static_cast<int64_t>(std::llround(fps));
   result.sample_rate = im.vocoder_cfg.output_sampling_rate;
 

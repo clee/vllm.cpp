@@ -178,6 +178,17 @@ target_compile_definitions(test_minimax_music3_ar_real PRIVATE
   MUSIC3_GOLDENS_DIR="${CMAKE_SOURCE_DIR}/tests/parity/goldens/minimax_music3_oracle")
 target_include_directories(test_minimax_music3_ar_real PRIVATE
   ${CMAKE_SOURCE_DIR}/tests/parity)
+# MiniMax-Music3 W2's remainder (#672): the 8.6B `Qwen3ForCausalLM` forward
+# itself, driven through the ADDITIVE `Qwen3DenseModel::ForwardEmbeds` entry and
+# TEACHER-FORCED on the capture's own rvq_codes, against frame_hiddens[:, :4096].
+# Checkpoint-gated like its two siblings; every case emits a loud SKIP when the
+# 28.5 GB asset is absent, so CI still compiles, links and runs it. SEPARATE from
+# test_minimax_music3_ar_real because it stages 18.5 GB that gate does not need.
+vllm_cpp_add_test(test_minimax_music3_llm_real parity/test_minimax_music3_llm_real.cpp)
+target_compile_definitions(test_minimax_music3_llm_real PRIVATE
+  MUSIC3_GOLDENS_DIR="${CMAKE_SOURCE_DIR}/tests/parity/goldens/minimax_music3_oracle")
+target_include_directories(test_minimax_music3_llm_real PRIVATE
+  ${CMAKE_SOURCE_DIR}/tests/parity)
 # MiniMax-Music3 W4+W5 (#672): the ACOUSTIC half — the flow-matching DiT, the
 # FlowMatchEulerDiscreteScheduler with invert_sigmas, the CFG mix, the denoise
 # loop's window bookkeeping and the DAC Flow-VAE vocoder — against goldens
@@ -223,7 +234,11 @@ target_compile_definitions(test_minimax_music3_quant_real PRIVATE
 
 vllm_cpp_add_test(test_minimax_music3_e2e_real parity/test_minimax_music3_e2e_real.cpp)
 target_compile_definitions(test_minimax_music3_e2e_real PRIVATE
-  MUSIC3_GOLDENS_DIR="${CMAKE_SOURCE_DIR}/tests/parity/goldens/minimax_music3_oracle")
+  MUSIC3_GOLDENS_DIR="${CMAKE_SOURCE_DIR}/tests/parity/goldens/minimax_music3_oracle"
+  # Where the e2e case writes the WAV it generated, so a human can listen to it.
+  # The BUILD tree, never the source tree: it is an artifact of a run and not a
+  # golden, and nothing under tests/parity/goldens/ is created or replaced.
+  BUILD_ARTIFACT_DIR="${CMAKE_BINARY_DIR}/music3")
 target_include_directories(test_minimax_music3_e2e_real PRIVATE
   ${CMAKE_SOURCE_DIR}/tests/parity)
 # ARCH-ONE-SURFACE ROW 2 fold gate: the video seam == the replicated pre-fold
@@ -243,6 +258,13 @@ target_compile_definitions(test_video_engine PRIVATE
 # LTX-2.5 L7: the family behind the VideoEngine seam and the driving loop, run
 # over a reduced-dimension checkpoint set written in the SHIPPED file format.
 vllm_cpp_add_test(test_ltx2_video vllm/multimodal/test_ltx2_video.cpp)
+# The reader-anchor claim this suite gates is a claim ABOUT a source file, so it
+# reads that file. Recorded `file:line` anchors go stale within the same PR here
+# (a merge of origin/main moved all nine of these by 25 lines mid-review), which
+# is why the anchors are derived from the source and compared with the recorded
+# ones rather than trusted.
+target_compile_definitions(test_ltx2_video PRIVATE
+  LTX2_VIDEO_SOURCE_PATH="${CMAKE_SOURCE_DIR}/src/vllm/multimodal/ltx2_video.cpp")
 # LTX-2.5 image conditioning (row LTX25-IMAGE-COND, issue #644): the CHAIN from
 # PPM bytes to conditioned, noised tokens, gated against upstream ltx_core AND
 # ltx_pipelines executed at reduced dimensions. ltx2_image_cond_goldens.inc
@@ -262,6 +284,13 @@ vllm_cpp_add_test(test_ltx2_device vllm/models/test_ltx2_device.cpp)
 # dimensions. ltx2_vae_goldens.inc lives next to the test source.
 vllm_cpp_add_test(test_ltx2_vae vllm/models/test_ltx2_vae.cpp)
 target_include_directories(test_ltx2_vae PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
+# LTX25-TILED-DECODE (issue #644): the tiling algebra, the AUTO layout and the
+# STREAMING tiled decode, gated against upstream ltx_core executed at reduced
+# dimensions. Its own target so the decode arms — which run the reduced decoder 18
+# times per arm — do not lengthen test_ltx2_vae's recorded case count.
+# ltx2_tiling_goldens.inc lives next to the test source.
+vllm_cpp_add_test(test_ltx2_tiling vllm/models/test_ltx2_tiling.cpp)
+target_include_directories(test_ltx2_tiling PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
 # LTX-2.5 L3: the text conditioning path, gated against upstream ltx_core executed
 # at reduced dimensions. ltx2_text_goldens.inc lives next to the test source.
 vllm_cpp_add_test(test_ltx2_text_encoder vllm/models/test_ltx2_text_encoder.cpp)
@@ -272,6 +301,23 @@ target_include_directories(test_ltx2_text_encoder PRIVATE ${CMAKE_CURRENT_SOURCE
 # next to the test source.
 vllm_cpp_add_test(test_ltx2_pipeline vllm/models/test_ltx2_pipeline.cpp)
 target_include_directories(test_ltx2_pipeline PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
+# The out-of-scope ledger separates a REACHABLE refusal from a declared marker, and
+# docs/FEATURES.md is where that distinction reaches a user. It had re-merged the two
+# into one "Declared, not requestable" row, so the public surface contradicted the
+# ledger it projects; the case below reads the doc and holds it to the split.
+# The ledger's RETIREMENT note carries an absence claim about upstream, and it
+# shipped false twice in the same header. The case that guards it reads the header
+# itself rather than a copy of the sentence kept in the test.
+# The ledger's reachable/marker split is a claim about the PRODUCT TREE — that
+# something calls the function holding a reachable refusal, and that nothing calls
+# the one holding a marker. It was wrong about `kBetaScheduler` for the whole of
+# this row because it was maintained by hand, so the case now walks src/, include/
+# and examples/ under this root and derives it, with two positive controls in the
+# same walk (an absence claim about our own tree is still an absence claim).
+target_compile_definitions(test_ltx2_pipeline PRIVATE
+  VLLM_CPP_FEATURES_DOC_PATH="${CMAKE_SOURCE_DIR}/docs/FEATURES.md"
+  LTX2_PIPELINE_HEADER_PATH="${CMAKE_SOURCE_DIR}/include/vllm/model_executor/models/ltx2_pipeline.h"
+  VLLM_CPP_SOURCE_ROOT="${CMAKE_SOURCE_DIR}")
 # LTX-2.5 L6: the quantized loaders, gated three ways — the SHIPPED checkpoints'
 # own manifests, a few hundred of their own bytes against torch, and synthetic
 # files for whole-model materialization. All three .inc files live beside the
@@ -288,6 +334,9 @@ vllm_cpp_add_test(test_linear_method vllm/model_executor/layers/test_linear_meth
 target_include_directories(test_linear_method PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_decode_graph_sizes vllm/models/test_decode_graph_sizes.cpp)
 vllm_cpp_add_test(test_qwen35_paged_forward vllm/models/test_qwen35_paged_forward.cpp)
+# MoE vision tower (#891): the tower is loaded (and its ABSENCE refused by name)
+# and the forked VL forward actually CONSUMES the merger rows.
+vllm_cpp_add_test(test_qwen3_5_moe_vision vllm/models/test_qwen3_5_moe_vision.cpp)
 # SPEC-MTP I5a: GDN layer spec routing (GdnBlockPaged spec branch) — needs the
 # internal header under src/ for the GdnBlockPagedForTest entry point.
 vllm_cpp_add_test(test_qwen3_5_gdn_spec_routing vllm/models/test_qwen3_5_gdn_spec_routing.cpp)
@@ -358,8 +407,12 @@ vllm_cpp_add_test(test_qwen3_8_text_only vllm/models/test_qwen3_8_text_only.cpp)
 # The PUBLISHED `Qwen/Qwen3.8-2.4T-A95B` config.json, committed VERBATIM, so the
 # config-resolution case reads the real document (nested `rope_parameters`, 92
 # `layer_types`, transformers-4.57.3 `dtype`) instead of a paraphrase of it.
+# Its `model.safetensors.index.json` (1609 tensors, 213 shards, 4.89 TB) is
+# committed the same way, so the load-plan dry run resolves every name against
+# the real document rather than a summary of it (#740).
 target_compile_definitions(test_qwen3_8_text_only PRIVATE
-  QWEN3_8_CONFIG_FIXTURE="${CMAKE_CURRENT_SOURCE_DIR}/vllm/models/fixtures/qwen3_8_2_4t_a95b/config.json")
+  QWEN3_8_CONFIG_FIXTURE="${CMAKE_CURRENT_SOURCE_DIR}/vllm/models/fixtures/qwen3_8_2_4t_a95b/config.json"
+  QWEN3_8_INDEX_FIXTURE="${CMAKE_CURRENT_SOURCE_DIR}/vllm/models/fixtures/qwen3_8_2_4t_a95b/model.safetensors.index.json")
 # POOL-DEVICE-KEY (#516, .agents/specs/pool-device-key.md): the shared scratch
 # pool's free list must be keyed by DEVICE as well as size class, or a block
 # allocated through one backend is handed to a DBuf running on another —
@@ -621,6 +674,49 @@ vllm_cpp_add_test(test_nemotron_h_forward vllm/models/test_nemotron_h_forward.cp
 # USER_USAGE_PREFIXES surface (#515). Same call as the W1 resolver header.
 target_include_directories(test_nemotron_h_forward PRIVATE ${CMAKE_SOURCE_DIR}/src)
 
+# Nemotron-H WEIGHT LOADER gate (#517, .agents/specs/nemotron-h-model.md §5b and
+# §6b "Still owed after W4"): materializes the 18487 released tensors from the
+# REAL 20.1 GiB checkpoint and runs the registered forward on them. Gated
+# STRUCTURALLY, not by tokens — every tensor materialized or deferred BY NAME,
+# the per-scheme composition (5935 NVFP4 W4A16 g16 triples + 46 FP8 W8A8 static
+# triples + the bf16/f32 remainder) asserted against the checkpoint's own memory
+# format, and the loaded dtypes asserted to be the SHIPPED ones rather than
+# wider. The checkpoint resolves through the CONTENT-pinned
+# parity::Nemotron35LightningSnapshot (#569) and the gate SKIPS loudly when it is
+# absent -- a NAMED, COUNTED skip with a closing accounting case, because a skip
+# that prints `Passed 0.00 sec` with zero assertions is indistinguishable from a
+# real pass -- so CI never needs the NAS asset. Not the W6 token gate and no
+# speed claim: it consumes the committed oracle.json for ONE forward per prompt
+# and the argmax of the last position against that prompt's FIRST token; the
+# full 32-token greedy decode stays W6's.
+vllm_cpp_add_test(test_nemotron_h_loader vllm/models/test_nemotron_h_loader.cpp)
+target_compile_definitions(test_nemotron_h_loader PRIVATE
+  NEMOTRON_H_GOLDENS_DIR="${CMAKE_CURRENT_SOURCE_DIR}/parity/goldens/nemotron_35_lightning_greedy")
+# nemotron_h.h / nemotron_h_loader.h are MODEL-PRIVATE headers under src/, not
+# include/vllm/ (#515); tests/parity carries the content-pinned snapshot
+# resolver.
+target_include_directories(test_nemotron_h_loader PRIVATE
+  ${CMAKE_SOURCE_DIR}/tests/parity ${CMAKE_SOURCE_DIR}/src)
+
+# Nemotron-H MIXED_PRECISION MEMORY FORMS, OFFLINE (#517,
+# .agents/specs/nemotron-h-model.md §6d). The loader's design claim — every
+# weight held in the format it SHIPS in, widened only TRANSIENTLY at the GEMM
+# call site — lived entirely behind the 20.1 GiB checkpoint gate above, so on a
+# runner with no CHECKPOINT_ROOT it was not executed at all: deleting
+# NemotronHOwned::View's refusal left the whole suite green. This gate needs NO
+# checkpoint and therefore runs on EVERY arm. It asserts that View REFUSES a
+# non-dense weight by name, and that DenseBf16 reproduces a dequant derived
+# INDEPENDENTLY from the upstream ModelOpt formula — the nibble order, the
+# per-16 group scale, the multiplied weight_scale_2, and the FP8 input_scale
+# that is carried and NOT applied. Those are exactly §6d's M4/M5 defects, which
+# leave every structural count correct. CPU-only, no golden, no speed claim.
+vllm_cpp_add_test(test_nemotron_h_quantized_forms
+  vllm/models/test_nemotron_h_quantized_forms.cpp)
+# nemotron_h.h / nemotron_h_forward.h are MODEL-PRIVATE headers under src/, not
+# include/vllm/ (#515).
+target_include_directories(test_nemotron_h_quantized_forms PRIVATE
+  ${CMAKE_SOURCE_DIR}/src)
+
 # Kimi-Linear CPU REFERENCE FORWARD gates (W2-W6): the per-op reference forwards
 # (KDA layer vs the kimi_kda host-ref composition; NoPE-MLA vs a materialized-MHA
 # reference; sigmoid noaux_tc router + block vs a hand-computed case) and the whole
@@ -769,6 +865,12 @@ vllm_cpp_add_test(test_qwen3_5_vl_e2e vllm/multimodal/test_qwen3_5_vl_e2e.cpp)
 target_compile_definitions(test_qwen3_5_vl_e2e PRIVATE
   MM_FIXTURE_DIR="${CMAKE_SOURCE_DIR}/tests/vllm/multimodal/fixtures/qwen3vl"
   GOLD_FIXTURE_DIR="${CMAKE_SOURCE_DIR}/tests/vllm/multimodal/fixtures/qwen3_5_27b")
+# MoE vision tower (#891) — the HARDWARE gate on Qwen/Qwen3.6-35B-A3B bf16: the
+# 333 model.visual.* tensors load and the tower runs; the full ~67 GiB e2e is
+# opt-in behind VLLM_MOE_VISION_E2E=1. Skipped without the checkpoint.
+vllm_cpp_add_test(test_qwen3_5_moe_vision_hw vllm/multimodal/test_qwen3_5_moe_vl_hw.cpp)
+target_compile_definitions(test_qwen3_5_moe_vision_hw PRIVATE
+  MM_FIXTURE_DIR="${CMAKE_SOURCE_DIR}/tests/vllm/multimodal/fixtures/qwen3vl")
 # Vision-tower SPEED A-B (CLAIM-MULTIMODAL-SPEED-TOWER): baseline host-weights
 # forward (per-call marshal+compute) vs the resident-weights fast forward (compute
 # only), on the Qwen3.6-27B vision tower. Timing only; correctness is proven by
@@ -902,6 +1004,8 @@ vllm_cpp_add_test(test_speculative_dspark vllm/config/test_speculative_dspark.cp
 # language_model_only ⇒ 0 BEFORE the map, else the map, else the 999 default.
 vllm_cpp_add_test(test_multimodal_config vllm/config/test_multimodal_config.cpp)
 vllm_cpp_add_test(test_offload_config vllm/config/test_offload_config.cpp)
+vllm_cpp_add_test(test_weight_offloader vllm/model_executor/test_weight_offloader.cpp)
+vllm_cpp_add_test(test_weight_offload_policy vllm/model_executor/test_weight_offload_policy.cpp)
 # ENG-MM-INPUT-PIPELINE L1 (#607): the refusal those limits carry — the min()
 # fold against the model's own ceiling, upstream's exact message, and both call
 # sites with the enable_mm_embeds escape.
@@ -1927,3 +2031,14 @@ target_compile_definitions(test_qwen3_32b_nvfp4a16_paged_engine PRIVATE
   PARITY_GOLDENS_DIR="${CMAKE_SOURCE_DIR}/tests/parity/goldens")
 target_include_directories(test_qwen3_32b_nvfp4a16_paged_engine PRIVATE
   ${CMAKE_SOURCE_DIR}/tests/parity ${CMAKE_SOURCE_DIR}/src)
+
+# The registry type-confusion CLASS gate (#847, .agents/specs/registry-downcast-sweep.md).
+# One case per SHAPE of the swept `static_cast<XLoadedModel&>(model)` site — const
+# and non-const binding, `prepare` and `forward`, an alias family that shares one
+# factory across two registered architectures, and the one inline-call site that a
+# uniform search-and-replace over the other 33 would step past. Every case enters
+# through the production seam (`reg.factory->forward` / `->prepare`, what
+# `ModelRegistry::Forward` calls) and refuses before any weight is touched, so it is
+# CPU-only and needs no checkpoint.
+vllm_cpp_add_test(test_registry_downcast_refusal
+  vllm/models/test_registry_downcast_refusal.cpp)

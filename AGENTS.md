@@ -55,14 +55,25 @@ spec and run `git log -S`. Do not derive the history again.
 
 **Do not start work without an open GitHub issue.** Before you claim a row or
 write code, make sure that an issue tracks the work. Open one if none exists.
-Link the issue in three places that must agree: the issue table in
-[`.agents/roadmap_v1.md`](.agents/roadmap_v1.md), the row's spec, and the pull
+Link the issue in three places that must agree: the index in
+[`.agents/issue-index.md`](.agents/issue-index.md), the row's spec, and the pull
 request body.
+
+The index is append-only and carries `merge=union`, so two branches that each
+append a row merge without a conflict. Append a row at the end. Never edit a row
+and never delete one, because GitHub holds the open and closed state and an
+edited row is duplicated rather than merged.
 
 A bug that you find during other work still needs an issue. Filing the issue
 does not defer the fix. File it, fix it in the same flow, reference it in the
 commit, and close it. The person who found the bug has the context to fix it.
 Traceability is the goal, not another round trip.
+
+**An issue you do not fix in the same flow has to say who owns it.** Every index
+row names an owning row ID, or names a spec that lists the issue under `##
+Owed`. `scripts/check-agent-record.py` counts the rows that do neither and
+refuses a count above the recorded mark. Filing without fixing is therefore a
+gate failure rather than a habit.
 
 This in-flow rule applies to small and clear fixes. Use the normal row, spec,
 and fresh-review path for a surprising fix. Use that path when a fix needs its
@@ -307,6 +318,31 @@ unimplemented arm with a message that names the missing part. Record the arm as
 owed. Never leave the missing path to be discovered later. Use
 [`.agents/porting-a-model.md`](.agents/porting-a-model.md) as the checklist.
 
+## Nothing lands dead
+
+A shared seam says where a capability routes. This section says whether anything
+reaches it. The two failures are different, and this tree has carried the second
+one green.
+
+What lands is reachable from a production entry point at its own merge commit:
+`include/vllm.h`, the loader, `ModelRegistry::Forward`, or a registered server
+or command-line path on its default configuration. An example's internals are
+not one, and a test is not one. The smallest failing test enters the new code
+through that entry point. A unit test that constructs the type by hand proves
+that the class works, never that anything reaches it.
+
+A staged slice may land unreached only when the commit body and the pull request
+body name what is unreached, the row ID that owns the wiring, and the issue that
+tracks it, and the row's spec lists it under `## Owed`. There is no registry, and
+silence is not an exception.
+
+The fresh reviewer mutates for this. Delete the production call site in a scratch
+copy and rerun the focused gate. A gate that stays green without the call site
+measures a class, not a capability.
+
+Method, the shapes dead code takes, and why no checker enforces this:
+[`.agents/reachability.md`](.agents/reachability.md).
+
 ## Records
 
 Every inventory item has a stable ID. It records the upstream source, local
@@ -363,9 +399,19 @@ lifecycle write.
 
 ## Work happens in a worktree
 
-**Do every unit of work in its own linked worktree and task branch.** This rule
-includes a feature, fix, policy, document, record, and one-line gate repair. A
-claimed row uses `row/<ID>`. Pin the base SHA when you create the worktree.
+**Do every unit of work in its own linked worktree and task branch.** A unit of
+work is one issue's change together with the records that change invalidates. A
+feature, a fix, a policy change, a document, and a one-line gate repair are each
+a unit. A claimed row uses `row/<ID>`. Pin the base SHA when you create the
+worktree.
+
+**A record edit rides in the pull request whose change made the record stale.**
+It is not a unit of work by itself. A record-only pull request is still correct
+when the record is the work: a stale row, a corrected pin, a newly filed gap. It
+is wrong when it only restates what just landed, because that costs a branch, a
+gate run, and a fresh review to say something the landing change already knew.
+This narrows what counts as a unit. It never licenses bundling unrelated work
+into one branch.
 
 Keep the shared checkout on a clean `main`. **Never use it as a work surface.**
 Other worktrees branch from it, so it must remain current and safe. Never edit,
@@ -393,6 +439,20 @@ it does not authorize cleanup.
 Merge each verified pull request in the current session. Close an obsolete pull
 request and record the reason. Never end a session with a verified, unmerged
 pull request.
+
+**The pull request body is the landed commit message.** The repository sets
+`squash_merge_commit_message = PR_BODY`, so write the body to the same standard
+as a commit message and end it with the trailer block below. This setting is
+part of the contract, not a convenience. Under the previous `COMMIT_MESSAGES`
+value GitHub wrote a `---------` separator between the concatenated commit
+messages, and on a multi-commit squash the last one fell between the trailer
+block and the `Co-authored-by:` line GitHub appends. That orphaned the block,
+and the gate reported trailers the commit plainly carried as missing.
+
+No gate can hold that setting, because reading it needs a network call and no
+checker here may make one. If the landed commits start failing the trailer gate
+again, read the setting first. `tests/scripts/test_check_commit_trailers.py`
+pins both squash shapes, so the difference between them is executable.
 
 Every commit contains a bare `FOLLOWING_AGENTS_PROTOCOL` paragraph and these
 trailers:
@@ -450,6 +510,7 @@ Read the guide for the current job.
 | Porting a MODEL (the coverage checklist) | [`.agents/porting-a-model.md`](.agents/porting-a-model.md) |
 | Porting a model, kernel, or feature from vLLM | [`.agents/porting.md`](.agents/porting.md) |
 | Running gates, proving correctness, reviewing | [`.agents/verification.md`](.agents/verification.md) |
+| Proving a change is reached | [`.agents/reachability.md`](.agents/reachability.md) |
 | Measuring performance | [`.agents/benchmarking.md`](.agents/benchmarking.md) |
 | Fixing a bug | [`.agents/bugfixing.md`](.agents/bugfixing.md) |
 | Working on a specific host or GPU | [`.agents/environment.md`](.agents/environment.md) |
