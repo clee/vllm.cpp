@@ -289,6 +289,35 @@ sequence and trim it back. What is and is not in the way:
 That work is **shared with the last-frame keyframe arm**, which is blocked on the
 identical machinery. It is therefore its own row rather than a tail of this one.
 
+## 6.1 What `hdr_ic_lora` and `dubit` would need from this seam
+
+Both were read (not ported) so the adapter path would not have to be rewritten
+for them. Neither is in scope; this records what they would ask for, so a later
+row can tell an extension from a redesign.
+
+**What this row already gives them.** Both fuse a LoRA at load, and both take
+exactly one — `dubit.py:364-365` refuses any other count and
+`hdr_ic_lora.py:271-272` hard-codes a single adapter at strength 1.0. So
+`Ltx2LoraSpec` + `Ltx2DitLoadOptions::loras` is the right shape for both as it
+stands, and neither needs the N-adapter work owed below.
+
+**What they would need added.**
+
+| need | who | why the current shape does not cover it |
+|---|---|---|
+| the raw `__metadata__` map, not just two typed factors | `hdr_ic_lora` | it reads `hdr_transform` and `use_hdr_transform` (`hdr_ic_lora.py:201-208`) and does NOT use `iclora_utils`' readers at all. `Ltx2LoraAdapter::metadata()` already returns the whole map, so this is **already covered** — which is why the accessor exposes the map rather than the two ints |
+| per-stage adapter sets | both | `ic_lora.py:115-119` gives stage 2 `loras=()`, `hdr_ic_lora.py:293-312` gives both stages the same adapter, and `dubit` reuses ONE stage for both. Nothing here hard-codes "stage 2 has no LoRA" — the adapter is a load option on one DiT — so a two-DiT pipeline would carry two `Ltx2DitLoadOptions`. No change to this file |
+| an audio conditioning item with negative RoPE positions | `dubit` | `AudioConditionByReferenceLatent` is ported (`ltx2_conditioning.h`), but `dubit.py:335-354` shifts positions by `-aud_dur - 0.04`, and the audio VAE **encoder** has no load path here at all (the reference-audio refusal says so). Unrelated to the LoRA seam |
+| a frozen modality and cross-stage latent carry | `dubit` | `ModalitySpec{frozen, noise_scale, initial_latent}` (`dubit.py:321-327`). A pipeline concern, not an adapter one |
+| tiled diffusion, per-tile seeds, conditioning slicing | `hdr_ic_lora` | `hdr_ic_lora.py:485-596`. Its stage 2 is a phase LIST with per-phase tiling and a `use_ic_lora` flag, and it SLICES the reference conditioning per tile, dividing the slice indices by `reference_downscale_factor` (`:567-568`). That factor is the one this row reads, so the seam feeds it correctly; the slicing itself is pipeline work |
+| a text-context provider that is not the Gemma tower | `hdr_ic_lora` | it loads `video_context` / `audio_context` from a safetensors file and runs no text encoder (`hdr_ic_lora.py:274-281`) |
+
+**The conclusion that matters:** nothing either file needs would change the
+adapter reader or the fusion hook. Their requirements land on the pipeline and
+the conditioning state, not here. The one place the seam was deliberately shaped
+for them is `metadata()` returning the whole map rather than the two factors
+`ic_lora.py` happens to want.
+
 ## Owed
 
 Each is owed by this row and named in the commit and pull request bodies.
