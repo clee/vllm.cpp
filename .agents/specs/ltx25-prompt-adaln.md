@@ -204,6 +204,18 @@ second way: a checkpoint whose config declares `use_prompt_adaln_single=false`
 while its shapes carry the tensors now produces two DIFFERENT contracts and is
 refused, instead of both sides being forced to the same cleared value.
 
+**SUPERSEDED 2026-08-15 by `LTX25-KEYFRAMES-ABS-POS`
+([#658](https://github.com/mudler/vllm.cpp/issues/658), landed as `98f8e046d`).**
+`keyframes_abs_pos_embedding` is PORTED, so the "sole flag still cleared" above
+is now cleared by nothing: `Ltx2AdoptDeclaredDitParams` resolves the declared
+flag against what the file carries instead of force-clearing it, and neither
+shipped DiT needs `allow_unported_modules` any more. This paragraph is kept as
+the state at the time this row ran; the current disposition is
+[`ltx25-keyframes-abs-pos.md`](ltx25-keyframes-abs-pos.md) §2. What is unchanged
+is the guard in §3.2, which is what makes the scoping structural — and which is
+why the keyframes port could retire the clear without re-opening this row's
+defect.
+
 ## 4. Memory format
 
 Mirrors the existing L2 parity forward exactly: f32 host, f32/bf16 device stream
@@ -428,12 +440,20 @@ measures **30 cases / 8734 assertions**, both before and after this repair
 (re-measured on this branch, exit 0 in both configurations). Any future quote of
 this suite's count owes the configuration alongside it.
 
+**Both figures MOVED, and that is the point of quoting the date with them.**
+Re-measured 2026-08-15 on this merge commit, after `LTX25-KEYFRAMES-ABS-POS`
+(#658) added cases here: `LTX2_CHECKPOINT_ROOT` unset gives **37 cases / 784
+assertions**, set gives **37 / 9031**, exit 0 both ways. The CASE count is the
+same in both configurations, so an unchanged case count never distinguishes them.
+The 2026-08-13 figures above are kept as what was measured then.
+
 **And CI never sets it — [#673](https://github.com/mudler/vllm.cpp/issues/673),
 filed 2026-08-13 as visible debt rather than repaired here.** `grep -rn
 CHECKPOINT_ROOT .github/` exits 1 with zero hits while the same pattern matches in
 `tests/` and `.agents/` (positive control run in the same command, so this is not
-an assertion from a failed grep). CI therefore executes **502 of 8734 assertions —
-5.7%** of this suite, at an unchanged case count of 30, and
+an assertion from a failed grep). CI therefore executes **784 of 9031 assertions —
+8.7%** of this suite (2026-08-15; it was 502 of 8734, 5.7%, on 2026-08-13), at an
+identical case count in both configurations, and
 `scripts/measure-ltx2-prompt-adaln.py` — which produces every shipped-weights
 number in this Outcome — is a manual tool no gate invokes (`grep -rn
 measure-ltx2-prompt-adaln` hits only its own usage string and this file). So this
@@ -477,9 +497,22 @@ config/shape equality check.
 the opt-in for it. What changed is that it can no longer switch a ported feature
 off: the loader asserts the flag against the file instead of clearing it, and
 `Ltx2AdoptDeclaredDitParams` clears exactly one flag, for a module nothing
-applies.
+applies. (**SUPERSEDED 2026-08-15**, §3.3: that last module is ported, the opt-in
+is needed by neither shipped DiT, and `Ltx2AdoptDeclaredDitParams` clears
+nothing.)
 
 ### The keyframes claim next door, corrected 2026-08-13
+
+**READ THE SUPERSESSION FIRST.** Everything below is the state on 2026-08-13,
+when `keyframes_abs_pos_embedding` was unported and both shipped DiTs were
+refused. `LTX25-KEYFRAMES-ABS-POS`
+([#658](https://github.com/mudler/vllm.cpp/issues/658), `98f8e046d`) ported the
+module on 2026-08-14, retired both refusals and committed
+`scripts/measure-ltx2-keyframes-meta.py`, which re-runs the meta-device
+observation below on demand instead of quoting it. The FINDING stands and that
+port confirms it; the DISPOSITION it argues for — refuse by tensor presence, keep
+the opt-in — is retired. Current disposition:
+[`ltx25-keyframes-abs-pos.md`](ltx25-keyframes-abs-pos.md) §2.
 
 `ltx2.h` carried, in the same paragraph this row rewrote, *"LTX-2.5's checkpoint
 does not carry the parameter"* about `keyframes_abs_pos_embedding`. It is FALSE —
@@ -549,10 +582,21 @@ measured rather than read:
   `:43`), so **real** zeros would be inert — the mechanism claim fails on `meta`,
   not on additivity.
 
-  This **strengthens** the row's conclusion and changes nothing downstream: the
-  refusal stays keyed on tensor presence for the FP8 file, and the NVFP4 file is
-  refused by flag in `ParseLtx2DitParams` (`ltx2.cpp:192-198`) — where upstream,
-  had it loaded, would carry a parameter its own guard reports as unsupported.
+  This **strengthens** the row's conclusion and changed nothing downstream on
+  2026-08-13: the refusal stayed keyed on tensor presence for the FP8 file, and
+  the NVFP4 file was refused by flag in `ParseLtx2DitParams` — where upstream, had
+  it loaded, would carry a parameter its own guard reports as unsupported. Both
+  refusals are GONE as of `98f8e046d` (#658), and the meta observation above is
+  what let that row load the NVFP4 file and apply nothing rather than refuse it or
+  synthesise a zero. It is now re-runnable rather than quoted:
+  `scripts/measure-ltx2-keyframes-meta.py`, committed by #658 and RE-RUN on this
+  merge commit against both shipped files, exit 0. It reproduces every line of
+  the transcript above and carries its own positive control — a neighbour
+  (`scale_shift_table`) that materialises `device=cpu is_meta=False` on the same
+  load, so `is_meta=True` on `keyframes_abs_pos_embedding` is the parameter's
+  state and not a loader that never ran. It also settles the FP8 half by
+  execution: 2 of 6124 keys match, `[1, 4096]` `F8_E4M3` with 4096 of 4096 bytes
+  NON-ZERO plus a rank-0 `F32` scale, against `__metadata__ keys : NONE`.
 
 It is also not a keyframe-only feature: `transformer_args.py:269` applies it on
 every `prepare` whose `keyframes_mask` is set, and `tools.py:186-196` sets that
@@ -560,15 +604,21 @@ mask unconditionally on the target's first latent frame. (Diffusers' own pipelin
 does not consume it — `.agents/specs/ltx-2-5.md` §3.1 records that — but `ltx_core`
 is what this campaign ports, and `ltx_core` does.)
 
-**The refusal keying does NOT change, and that is the decision, not an omission.**
-`ltx2_loader.cpp`'s `RefuseUnported` fires on the TENSORS the file carries. Keying
-it on the resolved flag instead would, on the FP8 DiT, read a DEFAULT rather than
-the file — because that file declares nothing — and would therefore load it
-silently while discarding a trained `[1, 4096]` parameter. Tensor presence is the
-only signal that file actually carries, and refusing loudly with an opt-in is
-strictly safer than resolving quietly. No behaviour changed, so no new gate is
-owed; the refusal MESSAGE changed, because it asserted the implication that is
-false in both directions.
+**The refusal keying did NOT change here, and that was the decision, not an
+omission.** `ltx2_loader.cpp`'s `RefuseUnported` fired on the TENSORS the file
+carries. Keying it on the resolved flag instead would, on the FP8 DiT, read a
+DEFAULT rather than the file — because that file declares nothing — and would
+therefore have loaded it silently while discarding a trained `[1, 4096]`
+parameter. Tensor presence was the only signal that file actually carries, and
+refusing loudly with an opt-in was strictly safer than resolving quietly. No
+behaviour changed in this row, so no new gate was owed; the refusal MESSAGE
+changed, because it asserted the implication that is false in both directions.
+
+**RETIRED 2026-08-14 by #658.** Both refusals are gone, because the module is
+ported: nothing is keyed on the tensors and nothing is keyed on the flag, and the
+declared flag is now RESOLVED against what the file carries
+(`Ltx2AdoptDeclaredDitParams`). The reasoning above is why the port had to settle
+the NVFP4 arm by EXECUTION before it could retire either refusal.
 
 ### The claims repair's own gate (2026-08-13)
 
@@ -608,7 +658,134 @@ tree vanished under it is not a result; it was rebuilt and re-run from scratch.
   mirror, and it is named here so it is not later mistaken for ported behaviour.
 - **We refuse `keyframes_abs_pos_embedding` by tensor presence** where upstream
   would take an out-of-band config's word for it (above). Same shape of
-  divergence, same reason it stands.
+  divergence, same reason it stood. **RETIRED 2026-08-14 by #658**: the module is
+  ported, nothing refuses it, and the declared flag is resolved against the file
+  the way upstream's own `supports_keyframes_abs_pos_embedding` resolves it. Only
+  the first divergence survives.
+
+### The reconciliation onto `main`, and its gate (2026-08-15)
+
+The branch sat 120 commits behind and conflicted on ten files. Its port half had
+already landed as `65e79eee5` (#654), and `98f8e046d` (#658) then ported
+`keyframes_abs_pos_embedding`, which is why four of the five SOURCE conflicts were
+this branch re-asserting retired refusals. All five took `main`'s side;
+`tests/vllm/models/ltx2_goldens.inc` was REGENERATED with the committed command
+against `ltx_core` `fd4ded7f` (`REGEN_EXIT=0`) rather than hand-merged, and
+differs from `main` by 12 insertions and 7 deletions, all comment lines: every
+golden VALUE on both sides byte-identical.
+
+Every published number was re-derived on the merged tree rather than carried
+forward, and none moved: the shipped-weights table above via
+`scripts/measure-ltx2-prompt-adaln.py` (exit 0), and the audio fixture
+denominator 40.6068% by importing the generator so no weight is re-drawn.
+
+Suite counts on the merged tree, exit 0 each, against the 2026-08-13 figures:
+
+| Suite | 2026-08-13 | 2026-08-15 (this merge) |
+|---|---|---|
+| `test_ltx2` | 35 / 2435 | 43 / 4388 |
+| `test_ltx2_loader` | 26 / 4826 | 28 / 4978 |
+| `test_ltx2_device` | 15 / 523 | 18 / 546 |
+| `test_ltx2_video` | 30 / 502 unset, 30 / 8734 set | 37 / 784 unset, 37 / 9031 set |
+
+The growth is #658's, not this reconciliation's: no `src/` or `include/` file
+differs from `origin/main` on this branch.
+
+All five mutations re-run on this tree, each BUILT, each restored byte-for-byte:
+
+| # | Mutation | BUILT | Result |
+|---|---|---|---|
+| M1 | host `ModulateContext` ignores `prompt_mod` | YES | RED — `test_ltx2` 3/43 cases, 6/4388 assertions, exit 1 |
+| M2 | device path takes the static-only branch always | YES | RED — `test_ltx2_device` 1/18, 6/546, exit 1 |
+| M3 | re-add `use_prompt_adaln_single = false` before the guard | YES | RED — `test_ltx2_loader` 1/28 cases, exit 1, and `test_ltx2_video` 29/37, exit 1 |
+| M4 | prompt AdaLN driven by `m.timesteps` instead of `m.sigma` | YES | RED — `test_ltx2` 2/43, 4/4388, exit 1 |
+| M5 | shift and scale rows swapped in the `[2, width]` row | YES | RED — `test_ltx2` 2/43, 4/4388, exit 1 |
+
+**M5's first attempt was a silent NO-OP and is recorded rather than dropped.** The
+harness's substitution spanned two lines and never matched, so the tree was
+unchanged, the build succeeded and `test_ltx2` reported 43/43 SUCCESS — a GREEN
+that says nothing about the guarantee. It was caught because the harness prints
+`git diff --stat` for every mutation and that line was absent. Re-applied as a
+real edit (`1 file changed, 2 insertions(+), 2 deletions(-)`) it is RED. An
+unmoved mutation is not evidence of anything.
+
+M3 also shows the doctest counting trap: the case THROWS, so its assertions stop
+being counted and the total DROPS 4978 → 4967 while `0 failed` is printed. The
+exit code and the `test cases:` line are the authority, not `assertions:`.
+
+### Reachability, checked 2026-08-15 against `AGENTS.md` `## Nothing lands dead`
+
+That rule and [`reachability.md`](../reachability.md) post-date this row
+(`8f49ac3be`, [#886](https://github.com/mudler/vllm.cpp/issues/886)), so the
+question is answered here rather than assumed. The prompt-side AdaLN is REACHED
+from a production entry point on its DEFAULT configuration, and the chain is
+`file:line` at this merge commit:
+
+1. `include/vllm.h:962` — `vllm_video_generate`, the shipped C ABI entry point.
+2. `src/capi/vllm_c.cpp:1646` — that entry point calls `VideoEngine::Generate` on
+   the registry-detected engine.
+3. `src/vllm/multimodal/ltx2_video.cpp:1063` — `Ltx2VideoEngine::Generate`.
+4. `src/vllm/multimodal/ltx2_video.cpp:1730` and `:1732` — the denoise loop calls
+   `Ltx2DitForwardDevice` or `Ltx2DitForward`. Both arms carry the term.
+5. `src/vllm/model_executor/models/ltx2_dit.cpp:785` (host) and
+   `ltx2_device.cpp:1152` (device) — `prompt_adaln = params.cross_attention_adaln
+   && params.use_prompt_adaln_single`, and that flag DEFAULTS TRUE at
+   `include/vllm/model_executor/models/ltx2.h:133`. This is the default
+   configuration, not an opt-in.
+6. `src/vllm/model_executor/models/ltx2_dit.cpp:581` — `PrepareTimestep` runs the
+   prompt-side MLP on the stream's own `sigma`.
+7. `src/vllm/model_executor/models/ltx2_dit.cpp:205` → `:140` —
+   `ModulateContext` adds that row to the static table, on every block of both
+   streams.
+
+The loader half is reached the same way: `Ltx2VideoEngine::Load`
+(`src/vllm/multimodal/ltx2_video.cpp:533`) calls `Ltx2LoadDitFromSafetensors` at
+`:624`, so §3.2's guard runs for every real checkpoint. Both shipped DiTs take
+that path with NO opt-in as of #658.
+
+Every anchor above was re-derived at this merge commit and asserted UNIQUE — the
+quoted text matches exactly once in its file — against a positive control that
+reports `STALE` on a deliberately wrong line. `git grep` alone would not have
+answered this; the chain was followed by hand.
+
+**The second half of the rule is NOT satisfied, and the mutation says so.** The
+rule also requires that the smallest failing test ENTER through that entry point.
+It does not here. The reachability mutation from `reachability.md` — delete the
+production call site, `ltx2_dit.cpp:140` `if (prompt_mod != nullptr) {` becomes
+`if (false) {`, so `ModulateContext` ignores the term entirely — was run on a
+scratch copy and **BUILT=YES, compile_err=NO**, so this is a test result:
+
+| suite | enters through | result |
+|---|---|---|
+| `test_ltx2` | `Ltx2DitForward`, by hand | RED — 3 of 43 cases, 6 of 4388 assertions, exit 1 |
+| `test_ltx2_video` | `vllm_video_generate` / the ABI | **GREEN** — 37 of 37, 784 of 784, exit 0 |
+
+The entry-point suite drives the path — its fixture sets the flag TRUE
+(`tests/vllm/multimodal/ltx2_video_fixture.h:258`) — and asserts no value the
+term can move, so it measures that the pipeline runs rather than that this
+capability is in it. Filed as
+[#900](https://github.com/mudler/vllm.cpp/issues/900) and listed below rather
+than repaired here: closing it means designing an ABI-level value oracle
+red-first, which is a row with its own spec and not a record repair.
+
+The LOADER half does satisfy both halves. Re-adding
+`use_prompt_adaln_single = false` in front of §3.2's guard (M3 below) takes
+`test_ltx2_video` to 29 of 37 cases failing, exit 1 — that gate enters through the
+production load path and observes the guard.
+
+## Owed
+
+- [#673](https://github.com/mudler/vllm.cpp/issues/673) — this row's
+  checkpoint-derived evidence is manual and host-local. `LTX2_CHECKPOINT_ROOT` is
+  set by no workflow, so the `test_ltx2_video` shipped-header case skips in CI and
+  `scripts/measure-ltx2-prompt-adaln.py` is a manual tool no gate invokes. Filed
+  as visible debt; wiring checkpoints into CI is explicitly not in this row.
+- [#900](https://github.com/mudler/vllm.cpp/issues/900) — the prompt-AdaLN term is
+  REACHED from `vllm_video_generate` (chain above) but no test ENTERS through that
+  entry point and observes it: deleting the term's only consumer leaves
+  `test_ltx2_video` green at 37 of 37. That is the second half of `AGENTS.md`
+  `## Nothing lands dead`, whose rule and guide post-date this row (`8f49ac3be`,
+  #886). Closing it needs an ABI-level value oracle designed red-first.
 
 ## Now
 
