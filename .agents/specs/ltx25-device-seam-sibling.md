@@ -16,9 +16,10 @@ the lane it was aimed at and left two things standing.
 
 **(a) #659 — the seam was adopted, its companion guard was not.**
 `src/vllm/multimodal/ltx2_video.cpp:549-562 @ 11cc1d589` — anchored on the base
-SHA for the same reason `:54` below is, because this row rewrites that block and
-an unanchored number would point into the middle of the repair the moment it
-lands — now asks two questions:
+SHA for the same reason §0(b)'s `minimax_h3_video.cpp:221-226 @ 11cc1d589`
+citation below is, because this row rewrites that block and an unanchored number
+would point into the middle of the repair the moment it lands — now asks two
+questions:
 
 ```cpp
 const vt::DeviceType accelerator = vllm::platforms::CurrentPlatform().device_type();
@@ -49,7 +50,7 @@ property one level down: it is a device claim the build cannot honour.
 
 **(b) #660 — the gate that certified (a) is a token grep, and the sibling lane
 spells its way past it.** `scripts/check-device-leakage.py:78 @ 62406c30e` —
-anchored, because this row rewrites that file's head and the line is now `:188`
+anchored, because this row rewrites that file's head and the line is now `:224`
 — is
 
 ```python
@@ -391,8 +392,9 @@ two `examples/*/main.cpp` citations". `be9b0a6fd` repeated it as "thirty-one
 citations, five did not hold", and both were counting a set that did not include
 the citations this branch's own edits had just rotted. Round 4 found six more
 (§"Findings from review round 4"), all of them stale *inside this pull request*,
-two of them seven and fifteen lines from the `:54` citation that SHA-anchors
-itself with exactly the reasoning that applies to them. An enumeration that
+two of them seven and fifteen lines (measured at `7502004aa`) from §0(b)'s
+`minimax_h3_video.cpp:221-226 @ 11cc1d589` citation, which SHA-anchors itself
+with exactly the reasoning that applies to them. An enumeration that
 certifies its own completeness is the defect this row keeps finding in its own
 instruments, and it found it here in the record rather than in the checker.
 No paragraph in this spec now claims that every anchor was checked; §"Findings
@@ -538,12 +540,13 @@ point and neither skips the registry hop.
 
 **F3 — the anchor sweep that claimed completeness was incomplete, and its own
 edits are what falsified it.** Six citations were stale, all of them rotted
-INSIDE this pull request. Two of them sat seven and fifteen lines from `:54`,
+INSIDE this pull request. Two of them sat seven and fifteen lines (measured at
+`7502004aa`) from §0(b)'s `minimax_h3_video.cpp:221-226 @ 11cc1d589` citation,
 which SHA-anchors itself with exactly the reasoning that applies to them.
 
 | citation | was | is |
 |---|---|---|
-| `check-device-leakage.py:78` (`RE_KCUDA`) | unanchored | `@ 62406c30e` (on the branch: `:188`) |
+| `check-device-leakage.py:78` (`RE_KCUDA`) | unanchored | `@ 62406c30e` (on the branch: `:224`) |
 | `test_minimax_h3_video_fold.cpp:162` (the `kCUDA` assertion) | unanchored | `@ 62406c30e` (on the branch: `:220`, `== accelerator`) |
 | `test_minimax_h3_video_fold.cpp:161-164`, twice | unanchored | `@ 62406c30e` (on the branch: the three untouched at `:192-194`, the two arms replacing `:162` at `:218-238`) |
 | `ltx2_video.cpp:549-562` (the two questions) | unanchored | `@ 11cc1d589` |
@@ -577,15 +580,28 @@ the merge rather than before it, and a run whose denominator moves afterwards
 proves nothing. So the merge is taken FIRST and the anchors are derived at the
 tree that is pushed.
 
-Two limits of the method, stated because the previous sweep's failure was
+Three limits of the method, stated because the previous sweep's failure was
 believing it had none. The extractor reads a `path:NN` token; it cannot tell a
 LIVE citation from one being QUOTED — the `was` column of the table above writes
 `:97`, `:562-565` and two unanchored fold-test numbers deliberately, as the
 record of what was wrong, and a later sweep will resolve them to the wrong lines
-and must not "repair" them. And the count of citations is itself a measurement of
+and must not "repair" them. The count of citations is itself a measurement of
 one tree, so it is not stored here: re-derive it rather than compare against a
 number that rots for reasons unrelated to this row, which is the same rule the
 scanned-file count above already carries.
+
+And — the limit that let round 5 find two more — **a bare `:NN` whose path sits
+in a NEIGHBOURING token is never extracted at all.** The pattern requires the
+path and the number to be glued, so `` `:224` `` written one line below
+`check-device-leakage.py:78`, and a bare `` `:54` `` pointing at this file
+itself, are invisible to it. They are not a rare shape — on the tree this
+paragraph is pushed on they are a large minority of this spec's citations, and
+the exact figure is deliberately NOT stored here for the reason the limit above
+already gives. Re-derive it. That class is what the sweep which wrote this
+paragraph could not see, and both of round 5's anchor findings belong to it. An
+extractor for them must carry the antecedent path forward and must report when
+there is none, because "no antecedent" is exactly the signature of a citation
+into this file rather than into the tree.
 
 **F4 — `## Now` pointed at a closed pull request** (#671) and the pre-rebuild
 branch. Corrected, with the relationship between the two stated rather than the
@@ -621,6 +637,45 @@ issue a row files and does not fix.
 
 **F8** — an inverted sentence in the test header, which read as though the
 refusal and the kernel death both happened.
+
+## Findings from review round 5 (PR #898, head `bf77c944e`)
+
+Every code, test and checker repair passed. All four findings are record
+defects, and two of them are the same one: **an anchor into a file the change is
+itself editing is stale by default, and this one rotted between the two halves
+of a SINGLE commit.**
+
+**FF1 — `check-device-leakage.py`'s `RE_KCUDA` was recorded at `:188` and the
+recording commit is what moved it to `:224`.** `f0b465029` carries both the F3
+anchor table, which writes `:188`, and the F5 `WHAT dev_cast OVER-MATCHES`
+docstring section, which adds 36 lines above `RE_KCUDA`. So the F5 half
+falsified the F3 half of the same commit, and no merge was involved — the usual
+suspect for anchor drift, and here it was innocent. Corrected to `:224` in both
+places and in the pull request body, re-derived at the tree that is pushed.
+
+**FF4 — the `:54` self-citation pointed at a blank line, and it is the paragraph
+used as the exemplar of GOOD anchoring practice.** Three places cited "the `:54`
+citation that SHA-anchors itself". At `7502004aa`, `:54` was §0(b)'s
+`minimax_h3_video.cpp:221-226 @ 11cc1d589` citation, and the distances "seven
+and fifteen lines" resolve against it exactly. `f0b465029` then added the very
+anchors F3 asked for, §0 grew, and `:54` became blank. It is now named in PROSE
+rather than by line number, because a number pointing into this file is the one
+citation no re-derivation of the TREE can ever check, and this row has now
+rotted it twice.
+
+**Method.** Every citation was extracted — bare continuations included, which is
+the change — and every live repo-local one re-derived at the pushed tree, with
+the needle for each derived from what this
+spec CLAIMS the span contains rather than read back out of the cited file — a
+validator that reads its expectation from its target re-derives `f(x) == f(x)`
+and cannot fail. A deliberately wrong row was carried as a positive control in
+the same run and reported STALE, so the harness is known to discriminate. 50
+rows FRESH, control STALE. Two further observations, reported and NOT repaired
+because neither is wrong: `ltx2_video.cpp:609-657` opens one line inside the
+preceding comment separator rather than on the block head at `:614` (the round-4
+repair was to its TAIL, which is correct at `:657`), and
+`check-device-leakage.py:58,139,158` is a genuine three-way citation whose needle
+cannot be unique by construction.
 
 ## Owed
 
