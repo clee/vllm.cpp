@@ -831,10 +831,14 @@ that goes through it at `:130-132`. `ModelRegistry::Forward`
 >
 > **The same unconditional cast is repo-wide** — e.g.
 > `kimi_linear_registry.cpp:90`. #775 says so itself: *"if the other entry points
-> have the same unconditional `static_cast`, that is a class"*. **A1 fixes the
-> NemotronH site and files an issue for the class**, to be swept the way #627 and
-> #772 handled the unaligned-read class. Do not silently widen A1 into a
-> tree-wide sweep; do not leave the class undiscovered either.
+> have the same unconditional `static_cast`, that is a class"* — and **the class
+> is already filed as
+> [#847](https://github.com/mudler/vllm.cpp/issues/847)**, "34 registry entry
+> points still downcast a type-erased `LoadedModel` with an unchecked
+> `static_cast`". So A1 fixes the NemotronH site, closes #775, and references
+> #847 without widening into it. Do not silently turn A1 into a tree-wide sweep;
+> #847 owns that, to be swept the way #627 and #772 handled the unaligned-read
+> class.
 
 **R3 — A2 is blocked on #496 W2 and the block may still hold.** Re-verify
 against the current head and issue state before claiming A2. If the CUDA Mamba2
@@ -886,7 +890,7 @@ these are the obligations of the implementing changes.
 
 | Change | Owes |
 |---|---|
-| **A1** | nothing in `docs/` — it edits `src/` and `tests/` only and changes no lifecycle state. It **does** owe: this spec's `## Outcome` opened with the byte-identity result and the §3.4 mutation table; a note in the parent spec's W5 section recording the §1.2 refusal and the repair still owed; #775 referenced and closed in the commit; new issues filed for §1.3 and for the `static_cast` class in R2 |
+| **A1** | nothing in `docs/` — it edits `src/` and `tests/` only and changes no lifecycle state. It **does** owe: this spec's `## Outcome` opened with the byte-identity result and the §3.4 mutation table; a note in the parent spec's W5 section recording the §1.2 refusal and the repair still owed; #775 referenced and closed in the commit; a new issue filed for §1.3 (the `static_cast` class is already #847) |
 | **A2 + A3** | a lifecycle change, so: `docs/STATUS.md`, `docs/BENCHMARKS.md` (pending, failed or void is a result — silence is not), the row spec's `## Now`, and the row + checklist entry + rollup in `.agents/model-matrix.md:285` in the **same** change (`scripts/check-model-checklist.py` enforces the rollup). Plus `docs/FEATURES.md:141`, whose `NemotronHForCausalLM` row currently reads "CPU host forward returns logits … W6 owns the token gate"; the removal of `scripts/runner-routing-allowlist.txt:26`; and `docs/USAGE.md` if `scripts/check-doc-checkpoint.py` classifies the new example as a user-facing surface — note `kimi-linear-gen` is not currently documented there, so run the checker rather than assuming either way |
 | **both** | `.agents/issue-index.md` row for #810 (appended by this spec's commit); #810 linked from the spec and the PR body; this spec's `## Outcome` recording what was measured, what was rejected and why, and why each default is what it is |
 
