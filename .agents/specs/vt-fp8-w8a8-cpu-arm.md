@@ -358,6 +358,34 @@ argued away.
   past this file, so it is written next to the case rather than only here: a gate
   that selects nothing and prints SUCCESS is the worst failure mode available.
 
+### Two defects this row found in its OWN evidence, not in the code
+
+Both are recorded because each made a green result mean less than it looked.
+
+**The gate ran a REDUCED configuration for most of this row's life.** Every full
+run before the final one configured `-DVLLM_CPP_BUILD_EXAMPLES=OFF
+-DVLLM_CPP_SERVER=OFF`, chosen while the box sat at 100% disk. CI configures
+`cmake -S . -B build -DVLLM_CPP_BUILD_TESTS=ON` and lets both default ON. The
+reduced form builds **925 targets and runs 463 tests**; the CI form builds
+**1422 and runs 481**. The difference is not cosmetic: `test_minimax_music3_e2e_real`
+links `ApiServer` and cannot BUILD without the server, so under the reduced flags
+the gate reported `100% tests passed` while a target it never compiled was
+sitting in the tree. Same class as F6 -- an instrument reporting on a state it
+was not given. The binding numbers in `## Evidence` are the CI-configuration run
+only.
+
+**The relocated intake table changed its MERGE CONTRACT, not just its path.**
+`.agents/issue-index.md` is append-only and carries `merge=union` in
+`.gitattributes`; its own preamble says "Never edit a row". This row moved its
+`#468` edit from `roadmap_v1.md` into that file and carried the keyed-record
+discipline with it, which `scripts/check-issue-index-append-only.py` correctly
+refused. The review had prescribed "the target's file is a strict PREFIX of the
+result", which is precisely the append-only test, and this row substituted a
+weaker in-place-diff check on the grounds that a prefix test was vacuous for an
+edit-in-place. The prescribed check was right and the adaptation was wrong. The
+resolution is to make no edit at all: main's `#468` row already carries the
+linkage AGENTS.md requires.
+
 ## Stop conditions
 
 - G1 RED against the independent reference on any covered input ⇒ stop and
