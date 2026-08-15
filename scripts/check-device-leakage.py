@@ -153,7 +153,7 @@ the other direction: the reader takes a RED as proof of leakage.
 
     This is NOT narrowed, and the reason is that narrowing it would delete a real
     catch. `vt::DeviceType d{raw}` — the declaration spelling of the conversion,
-    which review round 3 found and M36/M41 pin — is textually identical to
+    which review rounds 1 and 3 found and M32/M36 pin — is textually identical to
     `vt::DeviceType d{other}`. A text checker cannot tell the two apart, which is
     the same statement as "nothing here type-checks", and is exactly what #828
     resolves. The `const_cast<DeviceType&>(t)` entry above is the other side of

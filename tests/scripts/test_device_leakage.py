@@ -900,7 +900,7 @@ class DsrRatchetMutationTests(unittest.TestCase):
         # proof of leakage is misled by a message that omits it.
         #
         # It is not narrowed, and the reason is that `vt::DeviceType d{raw}` —
-        # the declaration spelling of the real conversion, which M36 and M41 pin
+        # the declaration spelling of the real conversion, which M32 and M36 pin
         # — is textually identical. Narrowing to remove the false positive
         # deletes the true positive with it. So this test pins the CURRENT
         # behaviour: if a later change makes any of these stop firing, it goes

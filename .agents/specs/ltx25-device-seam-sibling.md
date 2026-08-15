@@ -214,7 +214,7 @@ which is precisely the cast's answer and cannot survive the change. It is now
 build-conditional and asserts BOTH arms: `== accelerator` where one is
 registered, refused-by-name where none is. 161/163/164 are untouched. Every
 number in this paragraph is `@ 62406c30e`: on the branch the four assertions sit
-at `:191-193` and the two arms at `:215-238`.
+at `:192-194` and the two arms that replace `:162` at `:218-238`.
 
 **`test_minimax_h3_video_fold.cpp`'s CUDA-load case registered a BACKEND and no
 PLATFORM.** It could, because the cast never asked whether the build had an
@@ -307,7 +307,7 @@ That is correct, but it is the *explicit-device* path's polarity, not the
 `kAuto` path's: `device = 1` is an explicit accelerator request, and
 `model_loader.cpp:72-73` already says of that path "an explicit accelerator whose
 queue cannot be created must FAIL the load loudly, never silently serve on CPU" —
-the same argument `ltx2_video.cpp:567-570` makes for refusing rather than serving
+the same argument `ltx2_video.cpp:610-613` makes for refusing rather than serving
 the CPU forward behind an accelerator handle. So the lanes mirror the capability
 question from one path and the failure polarity from the other, and both halves
 are the seam's own.
@@ -545,9 +545,9 @@ which SHA-anchors itself with exactly the reasoning that applies to them.
 |---|---|---|
 | `check-device-leakage.py:78` (`RE_KCUDA`) | unanchored | `@ 62406c30e` (on the branch: `:188`) |
 | `test_minimax_h3_video_fold.cpp:162` (the `kCUDA` assertion) | unanchored | `@ 62406c30e` (on the branch: `:220`, `== accelerator`) |
-| `test_minimax_h3_video_fold.cpp:161-164`, twice | unanchored | `@ 62406c30e` (on the branch: `:191-193` / `:215-238`) |
+| `test_minimax_h3_video_fold.cpp:161-164`, twice | unanchored | `@ 62406c30e` (on the branch: the three untouched at `:192-194`, the two arms replacing `:162` at `:218-238`) |
 | `ltx2_video.cpp:549-562` (the two questions) | unanchored | `@ 11cc1d589` |
-| `ltx2_video.cpp:562-565` (the refusal-to-fake-it argument) | `:562-565` | `:567-570` |
+| `ltx2_video.cpp:562-565` (the refusal-to-fake-it argument) | `:562-565` | `:610-613` |
 | `model_loader.cpp:97` (the capability clause), twice | `:97` | `:98` |
 
 Four more were tightened rather than repaired, because a range citation that
@@ -555,8 +555,9 @@ starts on the wrong line is the same defect one size smaller: `model_loader.cpp`
 `SelectQueueForModel` is `:60-105` and was cited `:59-104`; its auto arm is
 `:76-104` and was cited `:75-104`; the `kAuto` fall-through to CPU is `:104` and
 was cited `:103`; and `ltx2_video.cpp`'s device block runs to the end of the
-capability refusal at `:614`, where the citation stopped at `:610` and cut the
-`Fail` in half.
+capability refusal, where the citation stopped four lines short and cut the
+`Fail` in half. That last one is now `:609-657`, having been `:566-614` for the
+length of one merge — see the next paragraph.
 
 The completeness sentence is withdrawn, above, with the reason. What replaces it
 is a statement of METHOD and of what the method cannot see: every `path:NN` on a
@@ -567,6 +568,14 @@ upstream Python anchors and the other rows' C++ anchors in the same files —
 because re-deriving those is a different row's work, and folding them in is how
 the last sweep came to believe it had checked everything. A citation this row
 inherits and did not touch is therefore NOT covered by this paragraph.
+
+**It rotted again during this round, which is the paragraph's own point made
+twice.** `0785cfc4d` (`LTX25-RETIRE-DEAD-ARMS`) landed on main mid-gate and
+edited `ltx2_video.cpp` above this branch's device block, moving all four of its
+live line anchors by 43. The re-derivation caught it because it was re-run after
+the merge rather than before it, and a run whose denominator moves afterwards
+proves nothing. So the merge is taken FIRST and the anchors are derived at the
+tree that is pushed.
 
 Two limits of the method, stated because the previous sweep's failure was
 believing it had none. The extractor reads a `path:NN` token; it cannot tell a
@@ -587,7 +596,7 @@ were made against #671's heads and a reader needs to be able to find them.
 `vt::DeviceType d{other}` — a local copy, a member default-init, or an init from
 a call returning `DeviceType` — fires alternative (3) while converting nothing.
 Measured: 1 hit each, against 0 for `vt::DeviceType d{}`. It is NOT narrowed,
-because `vt::DeviceType d{raw}` is the real conversion M36/M41 pin and is
+because `vt::DeviceType d{raw}` is the real conversion M32/M36 pin and is
 textually identical; narrowing to remove the false positive deletes the true
 positive. The docstring gains a third section, `WHAT dev_cast OVER-MATCHES`,
 stating it with its cost — `dev_cast`'s baseline is a hard 0, so the first such
