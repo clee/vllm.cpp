@@ -262,6 +262,20 @@ complaint: an NVFP4 attention or GDN tower, an FP8 shared expert, an FP8
 `lm_head`, a per-expert-but-unquantized routed layout, and a non-BF16 stacked
 expert tensor.
 
+**The MoE arm's VISION TOWER.** `LoadQwen3_5Moe` reads the text backbone only.
+`Qwen/Qwen3.6-35B-A3B` ships 333 `model.visual.*` tensors alongside it, and until
+issue #891 they were dropped without a word — the load succeeded and produced a
+text-only model. `LoadQwen3_5MoeVision` now reads them, through the SAME
+`LoadQwen3VLVisionWeights` the dense `Qwen3_5ForConditionalGeneration` arm uses,
+with the tower geometry from the checkpoint's `vision_config` (depth 27, hidden
+1152, 16 heads, intermediate 4304, patch 16, spatial merge 2, EMPTY
+`deepstack_visual_indexes`) and `out_hidden_size` taken from the text hidden size
+because the merger writes into the text residual stream. A checkpoint carrying NO
+`model.visual.*` tensor is REFUSED naming them, rather than quietly loading a
+model that answers image prompts from text alone — `nvidia/Qwen3.6-35B-A3B-NVFP4`
+declares `vision_config` and ships no `visual.*` weights, and is exactly that
+case.
+
 **What is and is not proven about a published bf16 MoE repo.** Every arm is
 byte-exact on synthetic fixtures, and the real published `Qwen/Qwen3.6-35B-A3B`
 and `Qwen/Qwen3.8-2.4T-A95B` indices satisfy the load plan completely — every
@@ -2018,11 +2032,26 @@ only when it reproduces the identical weight contract the shapes describe, and
 supplying one for a checkpoint that already declares its own is refused rather
 than ordered.
 
+`vllm_video_model_params.device` is `0` for the CPU and `1` for **the
+accelerator this build resolves** — not for CUDA. The value is unchanged and it
+is CUDA on a CUDA build, but it is read through the platform seam rather than as
+an enum value, so the same `1` selects Metal, Vulkan or Tenstorrent on a build
+that registers one of those, and is refused by name on a build that registers
+none. The C ABI's text-generation `vllm_model_params.device` is a separate,
+later selector with its own `0 = auto / 1 = cpu / 2 = cuda` numbering.
+
 The LTX-2.5 arm runs on the CPU in f32 and on CUDA in bf16. `device = 0` takes
 the f32 parity forward; `device = 1` stages the DiT to the GPU one tensor at a
 time and runs the device-resident forward, so a CUDA handle means a CUDA forward.
-On a build with no CUDA backend, `device = 1` is refused by name rather than
-served the CPU forward behind a CUDA handle. `encoder_path` loads the Gemma-4
+On a build with no accelerator backend, `device = 1` is refused by name rather
+than served the CPU forward behind an accelerator handle. It is also refused when the build's
+accelerator is a PARTIAL backend that declines this architecture — Metal and
+Tenstorrent each register the kernels for a named short list of models, and a
+backend that has not registered this one now says so by name instead of binding
+a queue and failing later inside a kernel. The same three questions decide
+`minimax-h3`'s `device = 1`, which resolves through the platform seam rather
+than reading the ABI selector as an enum value, so on a CPU-only build it throws
+instead of naming CUDA. `encoder_path` loads the Gemma-4
 text tower, and the request's own `prompt` then conditions the render; the tower
 itself runs on the CPU in f32 whichever device the DiT is on. Without one,
 conditioning comes from the two prompt-embeds files, which must agree on their
