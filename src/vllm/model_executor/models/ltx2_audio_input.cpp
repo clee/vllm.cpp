@@ -128,11 +128,20 @@ Ltx2DecodedAudio Ltx2DecodeAudioWav(const std::string& bytes, const std::string&
   if (start_time > 0.0) skip = static_cast<int64_t>(std::llround(start_time * rate));
   if (skip < 0) skip = 0;
   if (skip >= samples_per_channel) {
+    // The upstream chain, READ rather than assumed, because a refusal that
+    // misstates its reason sends the next reader to the wrong file. Every
+    // decoded frame ends before `start_time`, so the decode loop's
+    // `if frame_end < start_time: continue` (decode.py:271-272) drops all of
+    // them, `if not samples: return None` (decode.py:281-282) fires, and the
+    // pipeline's `if decoded_audio is None: raise ValueError`
+    // (a2vid_two_stage.py:197-198) is what the caller actually sees.
     Fail("'" + label + "' has " +
          std::to_string(static_cast<double>(samples_per_channel) / rate) +
          " s of audio and audio_start_time is " + std::to_string(start_time) +
          " s, so the requested window begins past the end of the stream. Upstream's decode "
-         "returns no samples here and the pipeline raises (a2vid_two_stage.py:196-198)");
+         "drops every frame that ends before start_time and then returns None "
+         "(decode.py:271-272, :281-282), and the pipeline raises "
+         "(a2vid_two_stage.py:197-198)");
   }
   int64_t keep = samples_per_channel - skip;
   if (max_duration > 0.0) {
@@ -140,9 +149,24 @@ Ltx2DecodedAudio Ltx2DecodeAudioWav(const std::string& bytes, const std::string&
     keep = std::min(keep, cap);
   }
   if (keep <= 0) {
+    // A DIFFERENT upstream path from the one above, and saying "the pipeline
+    // raises at :198" here would be wrong. `max_samples = round(max_duration *
+    // sample_rate)` can be 0, and `audio[..., :0]` (decode.py:295-296) is an
+    // `Audio` with zero samples rather than `None` — so `decoded_audio is None`
+    // is FALSE and a2vid_two_stage.py:197-198 never fires. Upstream still fails,
+    // one or two hops later: the mel front-end and `vae_encode_audio` run on an
+    // empty waveform and, if anything survives that, the empty latent trips
+    // `AudioLatentTools.create_initial_state`'s shape assertion
+    // (tools.py:253-255). We refuse HERE, which is stricter than upstream by the
+    // distance between those two points and is stated as such rather than
+    // dressed up as a mirror.
     Fail("'" + label + "' yields no audio samples for the requested window (audio_start_time " +
          std::to_string(start_time) + " s, audio_max_duration " + std::to_string(max_duration) +
-         " s). Upstream raises rather than rendering silence (a2vid_two_stage.py:196-198)");
+         " s). Upstream would hand on a ZERO-SAMPLE take here rather than raising "
+         "(decode.py:295-296 returns an empty Audio, so a2vid_two_stage.py:197-198 does not "
+         "fire) and fail later in the encode or at the latent shape assertion "
+         "(tools.py:253-255); this refuses at the window instead, which is STRICTER than "
+         "upstream and reports the knob that is wrong");
   }
 
   if (skip != 0 || keep != samples_per_channel) {

@@ -424,10 +424,18 @@ struct Ltx2ConditioningTrace {
   uint64_t audio_latent_digest = 0;
   double audio_latent_absmax = 0.0;
 
-  // The LARGEST scalar `Modality.sigma` the audio stream was handed across the
-  // last phase's steps — upstream's `Modality.sigma`, the second half of
+  // The LARGEST scalar `Modality.sigma` the audio stream was handed across
+  // EVERY step of EVERY phase — upstream's `Modality.sigma`, the second half of
   // `frozen` (utils/types.py:104-106), which is a separate DiT input from the
   // per-token timesteps and which the denoise mask cannot reach.
+  //
+  // ALL PHASES, and that is deliberate, so it is the ONE field in this block
+  // that is not last-phase-only. Every sibling above reports the conditioning as
+  // the final phase saw it, because that is the state the rendered clip came
+  // from. This one is an assertion about a FREEZE, and a freeze that holds in
+  // the last phase and broke in the first is not a freeze — a per-phase reset
+  // would make exactly that build read as frozen. There is no reset in the loop
+  // and none is wanted; the wider window is the stronger claim.
   //
   // A MAXIMUM rather than the last value, because the last step's schedule sigma
   // is 0 anyway: reporting that would read as frozen on every render. MEASURED:

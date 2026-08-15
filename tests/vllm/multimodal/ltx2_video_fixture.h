@@ -989,10 +989,50 @@ inline void WriteReducedAudioVae(const vllm::Ltx2AudioDecoderConfig& cfg,
   dd["mel_bins"] = cfg.mel_bins;
   nlohmann::json audio_vae;
   audio_vae["model"]["params"]["ddconfig"] = dd;
-  audio_vae["model"]["params"]["sampling_rate"] = 16000;
+
+  // ── THE MEL FRONT-END, WRITTEN TO BE OBSERVABLE ───────────────────────────
+  //
+  // `Ltx2ParseAudioEncoderConfig` states in its own comment that these three
+  // values come from three different objects and that the obvious-looking
+  // neighbours are wrong. Written the shipped way — `sampling_rate = 16000`,
+  // no `filter_length` at all, `mel.n_mel_channels` equal to `ddconfig.mel_bins`
+  // — that claim is unobservable, because EVERY wrong reading lands on the same
+  // number as the right one: 16000 is also the parser's default, an absent
+  // `filter_length` and an absent `n_fft` both fall to the default 1024, and the
+  // two mel-bin sources agree so the `or` chain's ORDER cannot be seen. Three
+  // mutations of the parser then pass a full-suite gate.
+  //
+  // So this fixture DELIBERATELY differs from the shipped checkpoint on exactly
+  // those three axes, and says so rather than looking like a transcription
+  // error:
+  //
+  //   * `sampling_rate = 24000`, not the shipped 16000 and not the parser's
+  //     default. A decoy 16000 sits on `preprocessing.mel` — the neighbour a
+  //     reader reaches for — so "read it from the mel block" and "read nothing
+  //     and take the default" are the SAME wrong answer and both are caught.
+  //     24000 rather than something below 16000 because the audio latent grid is
+  //     fixed at 16000/160/4 = 25 frames/s by upstream's own constants
+  //     (types.py:174), so a lower rate would make every take too short and turn
+  //     the conditioning cases into refusals.
+  //   * `stft.filter_length = 512`, with a decoy `stft.n_fft = 1024` beside it.
+  //     `n_fft` is the name torchaudio uses and the one a reader writes from
+  //     memory; upstream's key is `filter_length`, and 1024 is also the default,
+  //     so the decoy carries both wrong answers at once.
+  //   * `mel.n_mel_channels = 32`, a decoy that DISAGREES with
+  //     `ddconfig.mel_bins`. The `or` chain reads ddconfig first
+  //     (model_configurator.py:160); with the two equal, a chain reordered to
+  //     read the mel block first is invisible.
+  //
+  // None of the three reaches the DECODER or the vocoder: the decoder's own
+  // `or` chain takes `ddconfig.mel_bins` first (ltx2_loader.cpp:1435-1440), and
+  // the vocoder rates live under `vocoder.bwe` (:1480-1498).
+  audio_vae["model"]["params"]["sampling_rate"] = 24000;
   audio_vae["preprocessing"]["stft"]["hop_length"] = 160;
   audio_vae["preprocessing"]["stft"]["causal"] = true;
-  audio_vae["preprocessing"]["mel"]["n_mel_channels"] = cfg.mel_bins;
+  audio_vae["preprocessing"]["stft"]["filter_length"] = 512;
+  audio_vae["preprocessing"]["stft"]["n_fft"] = 1024;             // DECOY
+  audio_vae["preprocessing"]["mel"]["sampling_rate"] = 16000;     // DECOY
+  audio_vae["preprocessing"]["mel"]["n_mel_channels"] = 32;       // DECOY
 
   auto vocoder_json = [](const vllm::Ltx2VocoderConfig& v) {
     nlohmann::json j;

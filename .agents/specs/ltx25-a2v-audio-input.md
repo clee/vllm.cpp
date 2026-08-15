@@ -64,8 +64,11 @@ not.
 | a stereo-capable PCM16 WAV reader | `MiniMaxH3ReadWav`, `minimax_h3_wav.cpp:89` | `media_io/decode.py:240-300` |
 
 `MiniMaxH3ReadWav` matters: `ltx2_video.cpp` already includes `minimax_h3.h`
-(`:40`) and already calls its sibling `MiniMaxH3WriteWav` (`:2060`), so reusing
-it adds no dependency edge. It emits **channel-major** float, which is exactly
+(`ltx2_video.cpp:42`) and already calls its sibling `MiniMaxH3WriteWav`
+(`ltx2_video.cpp:2292`), so reusing it adds no dependency edge. Both anchors are
+written out in full rather than as a bare `:NN` continuation, because a bare one
+reads as a continuation of the LAST file named — here `minimax_h3.h`, not
+`ltx2_video.cpp` — and that is precisely the class of stale anchor #911 records. It emits **channel-major** float, which is exactly
 the layout `Ltx2WaveformToLogMel` takes, and it refuses a sample-rate mismatch
 rather than resampling (`minimax_h3_wav.cpp:128-131`) — the same policy
 `Ltx2WaveformToLogMel` already declares (`ltx2_audio_vae_encoder.h:171-177`).
@@ -83,7 +86,7 @@ encoder's `in_channels = 2`.
    names at `ltx2_video.cpp:1404`.
 2. **Ingestion.** Nothing turns a file path into a waveform for LTX-2.
 3. **Per-modality noise control.** The engine applies **one** `phase.noise_scale`
-   to both streams (`ltx2_video.cpp:1874`). Upstream's `ModalitySpec`
+   to both streams (`ltx2_video.cpp:1708-1712 @ 5a0ffe9e`). Upstream's `ModalitySpec`
    carries `noise_scale` and `frozen` per modality
    (`ltx-pipelines/utils/types.py:99-112`), and A2Vid needs the difference: at
    stage 2 video is noised to `stage_2_sigmas[0]` while audio is
@@ -260,9 +263,11 @@ None is visible in the output. Mitigation: value-level goldens from executed
 upstream, plus a lower bound on the latent so a zero or constant tensor cannot
 pass (a token-shaped check cannot see a dequant-shaped fallback).
 
-**The fixture writes no encoder tensors** (`ltx2_video_fixture.h:805-810`), so
-an end-to-end test needs it extended; forgetting that yields a load failure that
-reads as a code defect.
+**The fixture writes no encoder tensors** (`ltx2_video_fixture.h:805-810 @
+5a0ffe9e`), so an end-to-end test needs it extended; forgetting that yields a
+load failure that reads as a code defect. SHA-anchored because this row EDITS
+that file, which is the case #911 records: an anchor into a file the row is
+itself changing is stale the moment the change lands.
 
 ---
 
@@ -276,18 +281,25 @@ Focused gate: `test_ltx2_video`, `test_ltx2_vae`, `test_ltx2_pipeline`,
    render consumed it. It fails first because the extra is refused as unknown.
    Per [`reachability.md`](../reachability.md), reachability is then proven by
    deleting the production call site and showing the test goes RED.
-2. **Truncation polarity**: audio deliberately shorter than the video; asserts
-   the latent frame count is the *audio's*, not the video's, and that no
-   zero-padding was appended.
+2. **Truncation polarity**, in two halves, because the second one is the half a
+   digest cannot make. A take shorter than the clip is refused rather than
+   padded. A take LONGER than the clip keeps its *leading* frames
+   (`a2vid_two_stage.py:202`), and that is pinned by encoding the same file at a
+   longer `audio_max_duration` and requiring the truncated latent to be
+   bit-identical to the shorter window's — which a tail slice cannot produce,
+   because the two encodes it slices have different lengths.
 3. **Freeze**: the audio latent after the last phase is bit-identical to the
    encoded input. A mutation that noises the audio stream must turn this red.
 4. **Refusals, each asserting the missing part is named**: wrong sample rate
    (both rates in the message), non-RIFF/compressed container, no audio stream,
    a mono file against a two-channel encoder, and `a2vid_two_stage` requested
    against a version the table does not carry.
-5. **Value goldens** from a generator that IMPORTS and EXECUTES the upstream
-   modules at reduced dimensions, in the shape `scripts/gen-ltx2-vae-goldens.py`
-   already uses.
+5. **Config-parse observability.** The fixture's audio VAE deliberately declares
+   a `sampling_rate`, an FFT size and a mel-bin count that differ from both the
+   shipped values and the parser's own defaults, with a decoy on each
+   obvious-looking neighbour. Without that, all three readings resolve to the
+   same number whether they are right or wrong and the parser is unmutatable.
+   The fixture carries the reasoning.
 6. **A lower bound** on the encoded latent's magnitude, so a silently zeroed or
    constant tensor fails. A correlation or count-based check cannot see a scale
    error and is not used alone.
@@ -434,6 +446,20 @@ in the waveform's own dtype (`ops.py:54`) and the encoder in the parameters'
   kind of plausible-and-wrong this campaign has already paid for twice.
 - **A real-checkpoint A2V render.** Gated on fixtures only; the GPU was out of
   bounds for this row.
+- **Value goldens from executed upstream for the INGESTION path.** §5 promised
+  these and this row does not deliver them, so they are owed here rather than
+  left as a claim nobody checked. What already exists is not the same thing:
+  `Ltx2AudioEncoderForward` and the mel front-end are golden-gated against
+  executed upstream by `scripts/gen-ltx2-vae-goldens.py` (cases 7a–7d) from an
+  earlier row, and this row rides those. What has NO executed-upstream golden is
+  the part this row added — the config parse, the `start_time`/`max_duration`
+  window, and the truncation. Those are pinned instead by upstream `file:line`
+  anchors plus the differential assertions in §5.2, which is weaker: an anchor
+  proves the line was read and a differential proves the direction, and neither
+  proves the value. Needs a generator that instantiates
+  `AudioEncoderConfigurator.from_metadata` and `decode_audio_from_file` at
+  reduced dimensions, which needs PyAV and a written fixture file, and is why it
+  did not ride here.
 - **Arbitrary-ratio resampling** — refused by name; needs the polyphase kaiser
   resampler upstream uses at `ops.py:40`.
 - **Compressed audio containers** — refused by name; no demuxer is vendored.

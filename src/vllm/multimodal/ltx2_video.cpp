@@ -1772,8 +1772,23 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
       // it: `ApplyGaussianNoise` leaves the latent at `clean`, so
       // `noise_scale=0.0` needs no separate branch; `TimestepsFromMask` yields
       // per-token timestep 0, so the DiT sees the audio as clean conditioning;
-      // and `PostProcessLatent` blends back to `clean` every step, so the Euler
-      // update cannot move it. The SECOND half — the scalar `Modality.sigma` —
+      // and the STEP cannot move the latent either.
+      //
+      // That third one holds by a DIFFERENT argument on each stepper arm, and
+      // "`PostProcessLatent` blends it back every step" — which this comment
+      // used to say — is true of only one of them. On `kEulerAncestral` the
+      // stepped latent IS passed back through `PostProcessLatent`, which
+      // restores `clean` wherever the mask is 0. The plain `kEuler` arm never
+      // calls it, and does not need to: `a_denoised` is itself post-processed,
+      // so on a frozen stream `a_denoised == clean == latent`, the Euler
+      // derivative `d = (x - denoised) / sigma` is exactly 0, and
+      // `x + (sigma_next - sigma) * d` returns `x` unchanged. Two arms, two
+      // reasons, one invariant — and the weaker one is the one that had to be
+      // written down, because a reader who checks the strong claim against
+      // `kEuler` finds no `PostProcessLatent` there and concludes the freeze
+      // leaks.
+      //
+      // The SECOND half — the scalar `Modality.sigma` —
       // is not expressible through the mask and is applied at the forward
       // below; upstream's parenthesis says exactly that the two are different.
       audio.mask.assign(static_cast<size_t>(audio.tokens), audio_frozen ? 0.0F : 1.0F);

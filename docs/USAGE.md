@@ -631,6 +631,14 @@ round trip. `--audio-start-time` seeks into the file and `--audio-max-duration`
 caps how much is read; both default to covering exactly the clip's duration, and
 either without `--audio-path` is refused rather than ignored.
 
+What is upstream's here is the **conditioning mechanism** — decode, encode,
+truncate to the clip, freeze — and not the denoise schedule. Upstream's
+audio-to-video stage 1 is a caller-configured guided one, with its
+`a2v_guidance_scale` acting as the guider's modality scale, while a take here
+rides whichever recipe the checkpoint resolves, in practice `distilled_two_stage`
+with fixed sigmas. So the audio drives the render, and no claim is made that the
+result reproduces upstream's own audio-to-video output.
+
 The WAV has to match the checkpoint already: 16-bit PCM RIFF/WAVE, the audio
 VAE's own sample rate (16 kHz on the shipped one), its encoder's channel count
 (2), and at least as long as the clip. None of the four is converted. There is

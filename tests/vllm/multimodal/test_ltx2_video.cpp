@@ -2719,6 +2719,13 @@ TEST_CASE("ltx2 video: a trace for a render that never completed says so") {
 
 namespace {
 
+// The rate the FIXTURE's audio VAE declares on `audio_vae.model.params`, which
+// is deliberately NOT the shipped 16000 and not the parser's default either —
+// see the long note beside it in `ltx2_video_fixture.h`. Named here so a reader
+// who changes one changes the other, and so no `24000` in this file reads as a
+// magic number.
+constexpr int64_t kFixtureAudioRate = 24000;
+
 // A canonical 16-bit PCM RIFF/WAVE buffer, CHANNEL-INTERLEAVED as the format
 // requires. Deterministic and NOT silent: an all-zero take encodes to a latent
 // dominated by the mel log clamp (log(1e-5), `ltx2_audio_vae_encoder.h:142`) and
@@ -2785,7 +2792,7 @@ TEST_CASE("ltx2 video: a supplied audio file CONDITIONS the render, and stays FR
   auto* ltx2 = dynamic_cast<vllm::multimodal::Ltx2VideoEngine*>(engine.get());
   REQUIRE(ltx2 != nullptr);
 
-  const std::string wav = WriteWav(ws.root + "/drive.wav", 2, 16000, 2.0);
+  const std::string wav = WriteWav(ws.root + "/drive.wav", 2, kFixtureAudioRate, 2.0);
   vllm::multimodal::VideoGenParams gen = FixtureGen(ws.root + "/a2v");
   gen.extras[vllm::multimodal::kLtx2AudioPathExtra] = wav;
   const vllm::multimodal::VideoResult result = engine->Generate(gen);
@@ -2814,34 +2821,90 @@ TEST_CASE("ltx2 video: a supplied audio file CONDITIONS the render, and stays FR
   // Upstream states the reason outright — "Return the original input audio
   // instead of VAE-decoded audio to preserve fidelity"
   // (a2vid_two_stage.py:301-303) — and the observable consequence is the SAMPLE
-  // RATE: the vocoder's BWE arm emits 48 kHz and the take went in at 16 kHz. A
-  // build that ran the decode and the vocoder anyway would report 48000 here and
-  // still hand back a plausible clip with a plausible soundtrack.
-  CHECK(result.sample_rate == 16000);
+  // RATE: the vocoder's BWE arm emits 48 kHz and the take went in at the audio
+  // VAE's own rate. A build that ran the decode and the vocoder anyway would
+  // report 48000 here and still hand back a plausible clip with a plausible
+  // soundtrack.
+  CHECK(result.sample_rate == kFixtureAudioRate);
   const std::string rendered_audio = ReadAll(std::string(result.audio_path));
   const std::string source_audio = ReadAll(wav);
   // It is the take WINDOWED to the clip, not the whole 2 s file: upstream
   // returns `decoded_audio.waveform`, which is what `decode_audio_from_file`
   // produced AFTER `max_duration` (a2vid_two_stage.py:196, :303), and
   // `audio_max_duration` defaults to `num_frames / frame_rate` (:369-371). This
-  // fixture is 9 frames at 24 fps, so 0.375 s at 16 kHz stereo 16-bit = 6000
-  // samples per channel = 24000 PCM bytes.
-  constexpr size_t kPcmBytes = 6000 * 2 * 2;
+  // fixture is 9 frames at 24 fps, so 0.375 s of stereo 16-bit at the audio
+  // VAE's rate.
+  constexpr size_t kWindowSamples = static_cast<size_t>(kFixtureAudioRate) * 375 / 1000;
+  constexpr size_t kPcmBytes = kWindowSamples * 2 * 2;
   constexpr size_t kHeader = 44;
   INFO("rendered " << rendered_audio.size() << " B, source " << source_audio.size() << " B");
   CHECK(rendered_audio.size() == kHeader + kPcmBytes);
   REQUIRE(source_audio.size() >= kHeader + kPcmBytes);
   // And those bytes are the SOURCE's leading samples, unaltered. This is the
   // assertion the sample rate alone cannot make: a build that resampled or
-  // re-encoded the take would still report 16000 and still write 24000 bytes.
-  // Counted rather than compared with `!=`, so a failure prints a number instead
-  // of a screenful of PCM.
+  // re-encoded the take would still report the same rate and the same byte
+  // count. Counted rather than compared with `!=`, so a failure prints a number
+  // instead of a screenful of PCM.
   size_t audio_differing = 0;
   for (size_t i = 0; i < kPcmBytes; ++i) {
     if (rendered_audio[kHeader + i] != source_audio[kHeader + i]) ++audio_differing;
   }
   INFO("audio PCM bytes differing: " << audio_differing << " of " << kPcmBytes);
   CHECK(audio_differing == 0);
+
+  SUBCASE("the truncation keeps the HEAD of the encode, not the tail") {
+    // THE LINE THIS ROW EXISTS TO PORT, and until this subcase existed its
+    // DIRECTION was asserted by nothing. Upstream slices
+    // `encoded_audio_latent[:, :, : audio_shape.frames]` (a2vid_two_stage.py:202)
+    // — the LEADING frames. Every assertion above survives a tail slice
+    // unchanged: `audio_latent_digest != 0` and `audio_latent_absmax > 0.0` hold
+    // for either window, and the "different start time gives a different digest"
+    // control holds too, because BOTH windows shift by the same amount. MEASURED:
+    // a build truncating to the tail passed the whole 484-test gate.
+    //
+    // The reference is the SAME take encoded from a LONGER window. The take is
+    // 2 s; the clip is 0.375 s; the render above read exactly the clip's worth
+    // and this one reads all 2 s. Both are truncated to the SAME target frame
+    // count, so under a head slice both must be the take's first
+    // `target_frames` latent frames — bit-identical — and under a tail slice
+    // this one is the last frames of a five-times-longer encode, which is a
+    // different second of the file entirely.
+    //
+    // Bit-identical is not a hope, it is a property of the chain: `Ltx2SlaneyMel`
+    // framing is `center=True` with a FIXED n_fft/2 lookahead, the encoder's
+    // convolutions pad on the leading edge only (`causality_axis = height`,
+    // ltx2_audio_vae.cpp:146-151 and :926-931), this config carries no attention
+    // at any level, and PixelNorm is per-(t, f) location — so latent frame `t`
+    // is a function of a bounded prefix of the waveform and NOT of how much
+    // audio follows it. The one length-dependent effect is the reflect pad at
+    // the waveform's right edge, and it cannot reach the kept frames: it touches
+    // mel frames within n_fft/2 of the end, and the target frames span only the
+    // first ~4 * target_frames mel frames of a 57-frame short encode.
+    vllm::multimodal::VideoGenParams whole = FixtureGen(ws.root + "/a2v_whole");
+    whole.extras[vllm::multimodal::kLtx2AudioPathExtra] = wav;
+    whole.extras[vllm::multimodal::kLtx2AudioMaxDurationExtra] = "2.0";
+    (void)engine->Generate(whole);
+    const vllm::multimodal::Ltx2ConditioningTrace whole_trace = ltx2->last_conditioning();
+    CHECK(whole_trace.audio_conditioned);
+    // Same grid either way: the token count comes from the CLIP (types.py:164-181).
+    CHECK(whole_trace.audio_tokens == trace.audio_tokens);
+    // AND THE SAME CONTENT. This is the whole assertion: a tail slice cannot
+    // produce it, because the two encodes it slices are of different lengths.
+    CHECK(whole_trace.audio_latent_digest == trace.audio_latent_digest);
+    CHECK(whole_trace.audio_latent_absmax == trace.audio_latent_absmax);
+
+    // And the equality is not vacuous — the digest DOES move when the head of
+    // the window moves. Without this control, a build that hashed a constant
+    // would satisfy the equality above for the wrong reason.
+    vllm::multimodal::VideoGenParams later = FixtureGen(ws.root + "/a2v_later");
+    later.extras[vllm::multimodal::kLtx2AudioPathExtra] = wav;
+    later.extras[vllm::multimodal::kLtx2AudioStartTimeExtra] = "1.0";
+    later.extras[vllm::multimodal::kLtx2AudioMaxDurationExtra] = "1.0";
+    (void)engine->Generate(later);
+    const vllm::multimodal::Ltx2ConditioningTrace later_trace = ltx2->last_conditioning();
+    CHECK(later_trace.audio_tokens == trace.audio_tokens);
+    CHECK(later_trace.audio_latent_digest != trace.audio_latent_digest);
+  }
 
   SUBCASE("a DIFFERENT window of the take produces a DIFFERENT latent") {
     // The half a single digest cannot make. Without it, a build that ignored the
@@ -2929,14 +2992,19 @@ TEST_CASE("ltx2 video: every audio-input mismatch is refused BY WHAT IS WRONG") 
 
   SUBCASE("a sample rate the mel front-end does not target") {
     // Upstream RESAMPLES here (ops.py:40) with an arbitrary-ratio polyphase
-    // kaiser resampler this project has not ported. Reading 44.1 kHz samples as
-    // 16 kHz pitches and time-shifts the conditioning while every shape checks
-    // out, so both rates go in the message.
+    // kaiser resampler this project has not ported. Reading 44.1 kHz samples at
+    // the checkpoint's rate pitches and time-shifts the conditioning while every
+    // shape checks out, so both rates go in the message.
+    //
+    // The TARGET rate asserted here is the fixture's 24000, which is neither the
+    // shipped 16000 nor `Ltx2ParseAudioEncoderConfig`'s own default. That is the
+    // point: with the fixture at 16000 this assertion passed against a parser
+    // that never read `params.sampling_rate` at all.
     const std::string wav = WriteWav(ws.root + "/44k.wav", 2, 44100, 2.0);
     const std::string message = refusal("rate", just_path, wav);
     INFO("refusal: " << message);
     CHECK(message.find("44100") != std::string::npos);
-    CHECK(message.find("16000") != std::string::npos);
+    CHECK(message.find(std::to_string(kFixtureAudioRate)) != std::string::npos);
     CHECK(message.find("ops.py:40") != std::string::npos);
   }
 
@@ -2945,7 +3013,7 @@ TEST_CASE("ltx2 video: every audio-input mismatch is refused BY WHAT IS WRONG") 
     // (minimax_h3.h:1839-1845). That is H3's contract; LTX-2 hands the file's own
     // channel count to a conv declaring 2, so a mono file is an error upstream
     // too, and duplicating it would condition on audio nobody supplied.
-    const std::string wav = WriteWav(ws.root + "/mono.wav", 1, 16000, 2.0);
+    const std::string wav = WriteWav(ws.root + "/mono.wav", 1, kFixtureAudioRate, 2.0);
     const std::string message = refusal("channels", just_path, wav);
     INFO("refusal: " << message);
     CHECK(message.find("1 audio channel") != std::string::npos);
@@ -2958,7 +3026,7 @@ TEST_CASE("ltx2 video: every audio-input mismatch is refused BY WHAT IS WRONG") 
     // `tools.py:253-255` then asserts the latent matches the target shape — so a
     // short take is an ERROR upstream, not a short latent. Padding it here would
     // weld silence onto the end of the take and still render.
-    const std::string wav = WriteWav(ws.root + "/short.wav", 2, 16000, 0.04);
+    const std::string wav = WriteWav(ws.root + "/short.wav", 2, kFixtureAudioRate, 0.04);
     const std::string message = refusal("short", just_path, wav);
     INFO("refusal: " << message);
     CHECK(message.find("tools.py:253-255") != std::string::npos);
@@ -2978,7 +3046,7 @@ TEST_CASE("ltx2 video: every audio-input mismatch is refused BY WHAT IS WRONG") 
   }
 
   SUBCASE("a window that starts past the end of the take") {
-    const std::string wav = WriteWav(ws.root + "/late.wav", 2, 16000, 1.0);
+    const std::string wav = WriteWav(ws.root + "/late.wav", 2, kFixtureAudioRate, 1.0);
     const std::string message = refusal(
         "late",
         [](vllm::multimodal::VideoGenParams& g, const std::string& w) {
@@ -2988,6 +3056,40 @@ TEST_CASE("ltx2 video: every audio-input mismatch is refused BY WHAT IS WRONG") 
         wav);
     INFO("refusal: " << message);
     CHECK(message.find("past the end") != std::string::npos);
+    // The REASON is pinned as well as the fact, because a refusal that names the
+    // wrong upstream line sends the next reader to the wrong file and no test
+    // that checks only "it threw" can see that. Read at the pin: every decoded
+    // frame ends before `start_time`, so the loop's `if frame_end < start_time:
+    // continue` drops all of them and `if not samples: return None`
+    // (decode.py:271-272, :281-282) fires — and THAT is what makes
+    // `decoded_audio is None` true at a2vid_two_stage.py:197-198.
+    CHECK(message.find("decode.py:271-272") != std::string::npos);
+    CHECK(message.find("a2vid_two_stage.py:197-198") != std::string::npos);
+  }
+
+  SUBCASE("a window whose DURATION rounds to no samples") {
+    // The sibling of the case above, and a DIFFERENT upstream path — which is
+    // the whole reason it has its own case. `max_samples = round(max_duration *
+    // sample_rate)` is 0 here, and `audio[..., :0]` (decode.py:295-296) is an
+    // `Audio` carrying zero samples rather than `None`, so `decoded_audio is
+    // None` is FALSE and a2vid_two_stage.py:197-198 never fires. Upstream fails
+    // one or two hops later instead. We refuse at the window, which is STRICTER
+    // than upstream, and the message has to SAY that rather than borrowing the
+    // other path's citation.
+    const std::string wav = WriteWav(ws.root + "/tiny.wav", 2, kFixtureAudioRate, 1.0);
+    const std::string message = refusal(
+        "tiny",
+        [](vllm::multimodal::VideoGenParams& g, const std::string& w) {
+          g.extras[vllm::multimodal::kLtx2AudioPathExtra] = w;
+          g.extras[vllm::multimodal::kLtx2AudioMaxDurationExtra] = "0.00001";
+        },
+        wav);
+    INFO("refusal: " << message);
+    CHECK(message.find("no audio samples") != std::string::npos);
+    CHECK(message.find("STRICTER") != std::string::npos);
+    CHECK(message.find("decode.py:295-296") != std::string::npos);
+    // And it must NOT claim the raise the other path gets.
+    CHECK(message.find("does not") != std::string::npos);
   }
 
   SUBCASE("a window knob WITHOUT a file cannot do anything, so it is refused") {
@@ -3008,7 +3110,7 @@ TEST_CASE("ltx2 video: every audio-input mismatch is refused BY WHAT IS WRONG") 
   SUBCASE("a start time that is not a number is refused, not truncated") {
     // `ExtraInt` would take "0.5s" apart differently; a seconds knob parsed as an
     // integer would window the wrong second of the take and still render.
-    const std::string wav = WriteWav(ws.root + "/num.wav", 2, 16000, 2.0);
+    const std::string wav = WriteWav(ws.root + "/num.wav", 2, kFixtureAudioRate, 2.0);
     const std::string message = refusal(
         "nan",
         [](vllm::multimodal::VideoGenParams& g, const std::string& w) {
@@ -3036,7 +3138,7 @@ TEST_CASE("ltx2 video: audio_path on a decoder-only checkpoint names the missing
   const std::unique_ptr<vllm::multimodal::VideoEngine> engine =
       vllm::multimodal::LoadVideoEngine(ConditioningParams(ws.paths));
 
-  const std::string wav = WriteWav(ws.root + "/drive.wav", 2, 16000, 2.0);
+  const std::string wav = WriteWav(ws.root + "/drive.wav", 2, kFixtureAudioRate, 2.0);
   vllm::multimodal::VideoGenParams gen = FixtureGen(ws.root + "/noenc");
   gen.extras[vllm::multimodal::kLtx2AudioPathExtra] = wav;
   std::string message;

@@ -12,7 +12,7 @@
 // `ltx2_loader.cpp` keeps in its own anonymous namespace and does not export.
 //
 // ─── WHY THIS DID NOT EXIST ──────────────────────────────────────────────────
-// The reference-audio refusal at `ltx2_video.cpp:1352-1354` names this exact
+// The reference-audio refusal at `ltx2_video.cpp:1402-1409` names this exact
 // gap: "there is no AUDIO_VAE_ENCODER key filter — so nothing can turn a WAV
 // into audio latents here". `Ltx2AudioEncoderForward` and the mel front-end have
 // been ported and gated since `cefacd2d0`; what they never had was weights.
@@ -52,7 +52,7 @@ bool StartsWith(const std::string& value, const std::string& prefix) {
 }
 
 // `config.get(key, fallback)`, refusing a present-but-wrong-typed value rather
-// than falling back. Same polarity as `ltx2_loader.cpp:845-856` and
+// than falling back. Same polarity as `ltx2_loader.cpp:883-893` and
 // `ltx2_video_vae_encoder_load.cpp:43-56`, for the same reason: a checkpoint
 // that says `"z_channels": "8"` means something, and treating it as absent
 // builds a different latent.
