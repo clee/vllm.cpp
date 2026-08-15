@@ -5,6 +5,7 @@
 #include "vllm/multimodal/ltx2_video.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -26,13 +27,17 @@
 #include "vllm/model_executor/models/device_pool.h"  // ActivePool(b)/DevicePool::Drain
 #include "vllm/model_executor/models/ltx2.h"
 #include "vllm/model_executor/models/ltx2_audio_vae.h"
+#include "vllm/model_executor/models/ltx2_conditioning.h"
 #include "vllm/model_executor/models/ltx2_connector.h"
 #include "vllm/model_executor/models/ltx2_device.h"
+#include "vllm/model_executor/models/ltx2_image_preprocess.h"
 #include "vllm/model_executor/models/ltx2_loader.h"
 #include "vllm/model_executor/models/ltx2_pipeline.h"
 #include "vllm/model_executor/models/ltx2_text_encoder.h"
 #include "vllm/model_executor/models/ltx2_upsampler.h"
+#include "vllm/model_executor/models/ltx2_tiling.h"
 #include "vllm/model_executor/models/ltx2_video_vae.h"
+#include "vllm/model_executor/models/ltx2_video_vae_encoder.h"
 #include "vllm/model_executor/models/minimax_h3.h"
 #include "vllm/platforms/interface.h"  // CurrentPlatform() — which accelerator, if any
 #include "vllm/tokenizer/tokenizer.h"
@@ -165,6 +170,11 @@ struct StreamState {
   std::vector<float> latent, clean;  // [tokens, width]
   std::vector<float> mask;           // [tokens], patchified denoise mask
   std::vector<double> positions;     // [n_pos_dims, tokens, 2]
+  // `_first_frame_keyframes_mask` (tools.py:186-196), [tokens]. VIDEO only, and
+  // populated on EVERY generation — the rule has no branch on whether a keyframe
+  // was supplied. Empty on the audio stream, whose args preprocessor upstream
+  // builds with no keyframes_embedding_provider (model.py:333).
+  std::vector<float> keyframes_mask;
 };
 
 // `post_process_latent` (utils/helpers.py:462-464):
@@ -243,7 +253,7 @@ int64_t ExtraInt(const std::map<std::string, std::string>& extras, const std::st
     if (consumed != raw.size()) throw std::invalid_argument("trailing");
     return static_cast<int64_t>(value);
   } catch (const std::exception&) {
-    Fail("the load extra '" + key + "' is '" + raw + "', which is not an integer");
+    Fail("the extra '" + key + "' is '" + raw + "', which is not an integer");
   }
 }
 
@@ -440,6 +450,18 @@ struct Ltx2VideoEngine::Impl {
   Ltx2VideoDecoderKind video_kind = Ltx2VideoDecoderKind::kConv;
   Ltx2ConvVideoDecoderConfig video_cfg;
   Ltx2VaeWeights video_weights;
+
+  // The ENCODER half of the same file (row LTX25-IMAGE-COND, issue #644). Its
+  // absence is what every conditioning arm was refused for: before this row the
+  // load below materialized `Ltx2VideoVaeDecoderKeyRules()` alone and no encoder
+  // key filter existed anywhere in the tree, so `Ltx2ConvVideoEncode` — ported
+  // and gated since phase L11 — had no weights to run on.
+  //
+  // A Comfy-split `vae/` file may carry the decoder alone, so this is OPTIONAL
+  // and its absence is reported by name at the request rather than guessed at.
+  bool has_video_encoder = false;
+  Ltx2ConvVideoEncoderConfig video_encoder_cfg;
+  Ltx2VaeWeights video_encoder_weights;
 
   Ltx2AudioDecoderConfig audio_cfg;
   Ltx2VaeWeights audio_weights;
@@ -683,8 +705,8 @@ std::unique_ptr<Ltx2VideoEngine> Ltx2VideoEngine::Load(const VideoModelParams& p
     // `Ltx2AdoptDeclaredDitParams` (ltx2_loader.h) is the ONE place the adoption
     // rule lives, because the device gate drives `Ltx2StreamDitToDevice` without
     // this engine and owes the same check; two copies would be two rules.
-    const Ltx2DitParams declared = Ltx2AdoptDeclaredDitParams(
-        dit_config, im.dit.params, dit_options.allow_unported_modules, source);
+    const Ltx2DitParams declared =
+        Ltx2AdoptDeclaredDitParams(dit_config, im.dit.params, source);
     im.dit.params = declared;
   }
 
@@ -773,8 +795,46 @@ std::unique_ptr<Ltx2VideoEngine> Ltx2VideoEngine::Load(const VideoModelParams& p
   if (params.video_vae_path.empty()) Fail("video_vae_path is required");
   {
     const SafetensorsFile f = SafetensorsFile::Open(params.video_vae_path);
-    im.video_cfg = Ltx2ParseConvVideoDecoderConfig(Ltx2ReadCheckpointConfig(f), &im.video_kind);
+    const nlohmann::json vae_config = Ltx2ReadCheckpointConfig(f);
+    im.video_cfg = Ltx2ParseConvVideoDecoderConfig(vae_config, &im.video_kind);
     im.video_weights = Ltx2LoadVaeWeights(f, Ltx2VideoVaeDecoderKeyRules());
+
+    // `ImageConditioner` builds its VideoEncoder from the SAME checkpoint with
+    // `VAE_ENCODER_COMFY_KEYS_FILTER` (blocks.py:956-961). It builds it lazily
+    // and frees it after the callable returns (:988-993); this engine keeps it
+    // resident instead, because the encoder is small next to the DiT and a
+    // conditioning image arrives per request. That is a deliberate divergence
+    // from upstream's lifecycle and nothing else: same filter, same
+    // configurator, same weights.
+    if (Ltx2CheckpointHasVideoEncoder(f.Names())) {
+      im.video_encoder_cfg = Ltx2ParseConvVideoEncoderConfig(vae_config);
+      im.video_encoder_weights = Ltx2LoadVaeWeights(f, Ltx2VideoVaeEncoderKeyRules());
+      im.has_video_encoder = true;
+
+      // The encoder's LATENT WIDTH against the DiT's input, asserted rather
+      // than assumed. `_prepare_video_encoder_kwargs` reads it from
+      // `latent_channels` and NOT from the top-level `out_channels`
+      // (model_configurator.py:41-43); a config that got that wrong builds a
+      // 3-channel-latent encoder that still runs, still returns a latent, and
+      // conditions the DiT on a tensor of the wrong width.
+      if (im.video_encoder_cfg.out_channels != im.dit.params.in_channels) {
+        Fail("the video VAE encoder emits " +
+             std::to_string(im.video_encoder_cfg.out_channels) +
+             " latent channels but the DiT takes " +
+             std::to_string(im.dit.params.in_channels) +
+             ". `_prepare_video_encoder_kwargs` reads this from `vae.latent_channels`, never "
+             "from the top-level `vae.out_channels`, which is the DECODER's RGB count "
+             "(video_vae/model_configurator.py:41-42, and the flat-layout read at :52).");
+      }
+      // And its INPUT width, for the same reason in the other direction: the
+      // encoder takes RGB, and a config declaring otherwise would silently
+      // reinterpret the image planes.
+      if (im.video_encoder_cfg.in_channels != 3) {
+        Fail("the video VAE encoder declares " +
+             std::to_string(im.video_encoder_cfg.in_channels) +
+             " input channels; this seam supplies RGB");
+      }
+    }
   }
   if (im.video_cfg.in_channels != im.dit.params.out_channels) {
     Fail("the video VAE takes " + std::to_string(im.video_cfg.in_channels) +
@@ -1005,9 +1065,17 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
   std::lock_guard<std::mutex> guard(im.mutex);
 
   if (gen.output_dir.empty()) Fail("output_dir is required");
-  if (!gen.extras.empty()) {
-    Fail("unknown per-generation extra '" + gen.extras.begin()->first +
-         "' (this family defines none)");
+  for (const auto& kv : gen.extras) {
+    // `image_crf` is the only per-generation extra this family defines (row
+    // LTX25-IMAGE-COND). Everything else is refused rather than ignored, for the
+    // reason `CheckKnownExtras` gives for the load side: a mistyped knob that is
+    // silently dropped renders the DEFAULT and looks like the feature not
+    // working — and for THIS knob the default is a refusal, so a typo would turn
+    // a served request into an unexplained one.
+    if (kv.first != kLtx2ImageCrfExtra) {
+      Fail("unknown per-generation extra '" + kv.first + "'. This family defines: " +
+           std::string(kLtx2ImageCrfExtra));
+    }
   }
   if (!gen.prompt.empty() && !im.has_encoder) {
     Fail(
@@ -1135,27 +1203,126 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
     im.trace.video_absmax = AbsMax(v);
     im.trace.audio_absmax = AbsMax(a);
   }
-  // Image / reference conditioning is `ImageConditioner` upstream
-  // (ltx-pipelines/utils/blocks.py:936-993, called at distilled.py:212). The
-  // ENCODER it needs is no longer what is missing — phase L11 ported it as
-  // `Ltx2ConvVideoEncode` — so the refusal names what actually is: this engine
-  // holds no encoder to call. Refused by name rather than dropped: a keyframe
-  // that is silently ignored renders an unconditioned clip that looks like the
-  // feature not working.
-  if (!gen.first_frame_path.empty() || !gen.first_frame_ppm.empty() ||
-      !gen.last_frame_path.empty() || !gen.ref_image_paths.empty() ||
-      !gen.ref_video_dir.empty() || !gen.ref_audio_path.empty() || !gen.ref_audio_wav.empty()) {
+  // ── conditioning on pixels (row LTX25-IMAGE-COND, issue #644) ─────────────
+  //
+  // Upstream this is `ImageConditioner` (ltx-pipelines/utils/blocks.py:936-993,
+  // called at distilled.py:212) feeding `combined_image_conditionings`
+  // (utils/helpers.py:272-308). ONE of its four arms is served here, and the
+  // other three are refused BY NAME rather than dropped — a keyframe that is
+  // silently ignored renders an unconditioned clip that looks like the feature
+  // not working.
+  //
+  // THESE MESSAGES ARE WRITTEN TO BE RE-CHECKABLE, and the count is now SIX
+  // refusals in this campaign whose stated reason turned out to be false or
+  // stale. Two of the six stood right here. The first said no encoder weights
+  // could be materialized — true when written, and what this row fixed. The
+  // second replaced it and blamed `keyframes_abs_pos_embedding`, which was
+  // verifiably NOT the blocker at the pin (see the last-frame message below for
+  // the three anchors that refute it), and a test had been written to assert
+  // that wrong reason by name.
+  //
+  // So: name the exact symbol or upstream `file:line` that would have to change
+  // for the refusal to become false, never a category — and where a plausible
+  // reason has already been ruled OUT, say so and cite what ruled it out, so the
+  // next reader re-checks the claim instead of re-deriving the refutation. Local
+  // anchors are SYMBOLS, not line numbers in this file: same-file line numbers
+  // drift on every edit, which is how the previous message's citation went stale.
+  const bool wants_image = !gen.first_frame_path.empty() || !gen.first_frame_ppm.empty();
+  if (!gen.last_frame_path.empty()) {
     Fail(
-        "keyframe / reference conditioning is not ported for this family. The video VAE "
-        "ENCODER itself landed in phase L11 (Ltx2ConvVideoEncode), but nothing can reach it "
-        "from here: this engine materializes the DECODER key filter only, so no "
-        "VAE_ENCODER_COMFY_KEYS_FILTER / VideoEncoderConfigurator path "
-        "(video_vae/model_configurator.py:72, 267) puts encoder weights in memory, and "
-        "upstream resolves each image conditioning's CRF against the checkpoint's "
-        "default_image_crf when the caller left it unset (ImageConditioner.resolve_crf, "
-        "ltx-pipelines/utils/blocks.py:977-983) and then re-compresses through an H.264 "
-        "round trip unless that CRF is 0 (media_io/decode.py:413-435, from "
-        "load_image_and_preprocess :75), which this build does not do. Recorded as owed.");
+        "a LAST-frame keyframe is not served. What is missing is the TOKEN-APPEND machinery. "
+        "`Ltx2ConvVideoEncode` and `Ltx2ConditionVideoByKeyframe` are both ported and gated, "
+        "and this engine materializes encoder weights through Ltx2VideoVaeEncoderKeyRules, so "
+        "none of those is the gap. The gap is that `VideoConditionByKeyframeIndex.apply_to` "
+        "(conditioning/types/keyframe_cond.py:36-90) APPENDS tokens to the sequence: it "
+        "concatenates onto `latent`, `denoise_mask`, `positions` and `clean_latent` (:79-82), "
+        "gives the appended tokens their own pixel coordinates offset to `frame_idx` (:46-59), "
+        "and rebuilds the attention mask through `update_attention_mask` (:68-76) — and then "
+        "`clear_conditioning` (ltx_core/tools.py:88-105) trims those extra tokens back off "
+        "before unpatchify. This engine cannot do any of that yet: `Ltx2LatentState` has no "
+        "attention-mask field at all (see the note on its declaration in ltx2_conditioning.h), "
+        "and the phase loop is fixed at the target grid's token count — one "
+        "`Ltx2VideoTokenCount(vshape, 1)` feeds the sigma schedule, the `Ltx2ModalityInput` "
+        "handed to the DiT, and `Ltx2VideoUnpatchify`, with the clear step an explicit identity "
+        "because nothing was ever appended. Serving this arm means growing that sequence "
+        "through the DiT and trimming it back. Conditioning on the FIRST frame needs none of "
+        "it, which is why that arm IS served: `VideoConditionByLatentIndex` REPLACES tokens "
+        "that already exist (conditioning/types/latent_cond.py:38-39) and the token count never "
+        "changes. WHAT IS *NOT* THE REASON, because this refusal used to say it was: "
+        "`keyframes_abs_pos_embedding`. A SUPPLIED keyframe is appended with `marked=False` "
+        "(keyframe_cond.py:84-86, whose comment says given keyframe content carries no keyframe "
+        "marker), and its sole consumer adds `mask * embedding` with `mask = keyframes_mask > 0` "
+        "(model/transformer/transformer_args.py:42-43, called once at :269) — so on exactly "
+        "these tokens the embedding contributes nothing, and porting it would not serve this "
+        "arm. The tokens that DO reach it are the target's own first latent frame, marked "
+        "unconditionally by `_first_frame_keyframes_mask` (ltx_core/tools.py:184-196) — which "
+        "is the frame the SERVED first-frame arm writes into. That omission WAS real; row "
+        "LTX25-KEYFRAMES-ABS-POS closed it on 2026-08-14 (issue #658), so the marker is now "
+        "applied on every render. It was never what blocks a last-frame keyframe.");
+  }
+  if (!gen.ref_image_paths.empty() || !gen.ref_video_dir.empty()) {
+    Fail(
+        "reference-image / reference-video conditioning is not served. The encoder and the "
+        "placement are both here — `Ltx2ConditionVideoByReference` is ported and gated — but "
+        "it takes a `downscale_factor` and a `temporal_scale_factor` that must match what the "
+        "IC-LoRA was TRAINED with (conditioning/types/reference_video_cond.py:36-37, applied at "
+        ":65-77), and "
+        "upstream carries those in the LoRA's own metadata, which this project does not read. "
+        "A guessed pair places the reference plausibly and wrongly, which no output check can "
+        "see, so it is refused instead. Use first_frame_ppm / first_frame_path for "
+        "image-to-video.");
+  }
+  if (!gen.ref_audio_path.empty() || !gen.ref_audio_wav.empty()) {
+    Fail(
+        "reference-AUDIO conditioning is not served. `Ltx2ConditionAudioByReference` is ported "
+        "and gated (conditioning/types/reference_audio_cond.py:34-65), and what it needs is an "
+        "encoded waveform: `encode_audio` through the audio VAE's ENCODER "
+        "(ltx-pipelines/utils/helpers.py:264-269). This row built the VIDEO encoder's load "
+        "path only — there is no AUDIO_VAE_ENCODER key filter — so nothing can turn a WAV into "
+        "audio latents here. Recorded as owed.");
+  }
+
+  // The CRF, resolved the way `ImageConditioner.resolve_crf` resolves it
+  // (blocks.py:966-983) over `detect_params` (utils/constants.py:166-179): from
+  // the CHECKPOINT's own generation when the caller left it unset. For LTX-2.5
+  // that is 18, and 18 is not ported — so the DEFAULT REFUSES and a caller has
+  // to ask for 0 knowingly. Resolved and checked BEFORE any pixel is read, so an
+  // unsupported request costs nothing and reports the same thing every time.
+  int64_t image_crf = 0;
+  double image_strength = 0.0;
+  std::string image_bytes;
+  if (wants_image) {
+    if (!im.has_video_encoder) {
+      Fail(
+          "an image conditioning was supplied but the video VAE checkpoint at '" +
+          im.params.video_vae_path +
+          "' carries no ENCODER half: no tensor in it is named `vae.encoder.*` or `encoder.*`, "
+          "which is what `VAE_ENCODER_COMFY_KEYS_FILTER` matches "
+          "(video_vae/model_configurator.py:267-276). A Comfy-split `vae/` file holding the "
+          "decoder alone reads exactly like this. Supply the monolithic VAE checkpoint, or the "
+          "encoder file, rather than rendering unconditioned.");
+    }
+    image_crf = ExtraInt(gen.extras, kLtx2ImageCrfExtra,
+                         Ltx2ResolveDefaultImageCrf(Ltx2ParseModelVersion(im.model_version)));
+    // Throws by name at any non-zero value, naming the unported codec round
+    // trip and saying that 0 is the supported — and out-of-distribution — one.
+    Ltx2PreprocessImageCrf(image_crf);
+
+    // `ImageConditioningInput.strength` (utils/args.py:64). The seam's
+    // `noise_aug` is documented as "keyframe pinning strength; <= 0 => 1.0"
+    // (include/vllm.h), which is the same polarity: 1 pins, and the item turns
+    // it into `denoise_mask = 1 - strength` (latent_cond.py:41).
+    image_strength = gen.noise_aug > 0.0 ? gen.noise_aug : 1.0;
+    if (image_strength > 1.0) {
+      Fail("the image conditioning strength is " + std::to_string(image_strength) +
+           "; upstream's denoise mask is `1 - strength` (latent_cond.py:41) and a strength "
+           "above 1 makes it negative, which the noiser extrapolates PAST the clean latent "
+           "rather than toward it (components/noisers.py:33)");
+    }
+    image_bytes = gen.first_frame_ppm.empty() ? ReadFileBytes("first_frame", gen.first_frame_path)
+                                              : gen.first_frame_ppm;
+    im.trace.image_crf = image_crf;
+    im.trace.image_strength = image_strength;
   }
 
   // ── geometry ──────────────────────────────────────────────────────────────
@@ -1261,6 +1428,26 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
              "Supply 'upsampler_path', or stop before this phase with '" +
              std::string(kLtx2MaxPhaseExtra) + "'.");
       }
+      // The phase wants the SPATIAL x2 upsampler. The temporal x2 arm is a
+      // different model with the same class name and the same tensor NAMES
+      // (`upsampler.0.*`), so pointing 'upsampler_path' at
+      // `ltx-2.5-latent-temporal-upscaler-x2-bf16-1.0.safetensors` loads and runs
+      // cleanly and returns `[c, 2f-1, h, w]` where this phase needs
+      // `[c, f, 2h, 2w]`. The shape check below would catch it, but it would
+      // report a mismatch and leave the caller guessing; naming the swap here is
+      // the difference between "you gave me the wrong checkpoint" and "something
+      // is 3 frames short". Ported and gated, not driven — see
+      // .agents/specs/ltx25-temporal-upsampler.md section 7.
+      if (im.upsampler_cfg.temporal_upsample) {
+        Fail("phase '" + phase.name +
+             "' needs the latent SPATIAL x2 upsampler, but the checkpoint at 'upsampler_path' "
+             "declares temporal_upsample=true, i.e. it is the TEMPORAL x2 upsampler. That arm "
+             "upsamples the frame axis and drops the first frame "
+             "(model/upsampler/model.py:68-71, 109-113); no phase of any recipe this engine "
+             "serves consumes it, because its only upstream consumer is DFRPipeline's rounds "
+             "loop, which is not ported. Supply the spatial upsampler "
+             "('ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors').");
+      }
       Ltx2LatentVolume in;
       in.batch = 1;
       in.channels = video_lc;
@@ -1286,7 +1473,7 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
       video_initial = up.data;
     }
 
-    // ── build the two states (create_noised_state, helpers.py:428-447) ───────
+    // ── build the two states (create_noised_state, helpers.py:428-445) ───────
     StreamState video;
     video.width = vshape.channels;  // patch_size 1 (VideoLatentPatchifier(1))
     video.tokens = Ltx2VideoTokenCount(vshape, 1);
@@ -1302,6 +1489,13 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
       video.latent = Ltx2VideoPatchify(volume.data(), vshape, 1);
       video.clean = video.latent;
       video.mask.assign(static_cast<size_t>(video.tokens), 1.0F);
+      // tools.py:184 — `create_initial_state` returns the state with
+      // `keyframes_mask=self._first_frame_keyframes_mask(state)` ALWAYS, on the
+      // same line that builds it. Not conditioned on `wants_image`, not
+      // conditioned on any keyframe: the marker is a fact about the causal
+      // encoder's first latent frame, which spans a single pixel frame while
+      // every later one spans `temporal_scale_factor`.
+      video.keyframes_mask = Ltx2FirstFrameKeyframesMask(vshape, /*patch_size=*/1);
       const std::vector<int64_t> bounds = Ltx2VideoPatchBounds(vshape, 1);
       const std::vector<int64_t> pixels = Ltx2PixelCoords(bounds, 1, video.tokens, factors, true);
       // `positions = get_pixel_coords(...).float()` then
@@ -1340,8 +1534,93 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
       audio.positions.assign(timings.begin(), timings.end());
     }
 
+    // ── the image conditioning (issue #644) ─────────────────────────────────
+    //
+    // BEFORE THE NOISER AND AFTER THE STATE, which is upstream's order
+    // (`create_noised_state`, helpers.py:428-445: initial state, THEN the
+    // conditioning items, THEN the noiser) and is not interchangeable: the
+    // item writes ONLY `clean_latent` and `denoise_mask` (latent_cond.py:38-39)
+    // and the noiser is what composes them into the noisy tensor
+    // (components/noisers.py:31-34). Applying it afterwards leaves the
+    // conditioned tokens pinned to NOISE, with an identical clean tensor and an
+    // identical mask — so nothing but the noised latent itself can see it.
+    //
+    // PER PHASE, and encoded per phase, because the two-stage recipe renders its
+    // stages at DIFFERENT resolutions (`phase.spatial_downscale`) and upstream
+    // passes each stage's own height/width to `combined_image_conditionings`,
+    // whose `height` / `width` are per-call parameters (helpers.py:274-275) that
+    // distilled.py fills differently per stage: `stage_1_w, stage_1_h = width //
+    // 2, height // 2` at :251 passed at :255-256, against the full-resolution
+    // `height` / `width` at :285-286. Conditioning stage 1 only would let stage 2 re-noise
+    // the pinned frame away; conditioning stage 2 with stage 1's latent would
+    // place a half-resolution image into a full-resolution grid.
+    if (wants_image) {
+      const std::vector<float> pixels = Ltx2LoadImageAndPreprocess(
+          "first_frame", image_bytes, phase_h, phase_w, image_crf);
+      int64_t cropped = 0;
+      const Ltx2LatentVolume encoded = Ltx2ConvVideoEncode(
+          im.video_encoder_cfg, im.video_encoder_weights, pixels,
+          im.video_encoder_cfg.in_channels, /*frame_count=*/1, phase_h, phase_w, &cropped);
+      if (encoded.frames != 1) {
+        Fail("the video VAE encoder returned " + std::to_string(encoded.frames) +
+             " latent frames for a single image; `VideoConditionByLatentIndex` places one "
+             "(ltx-pipelines/utils/helpers.py:294-300)");
+      }
+      if (encoded.channels != vshape.channels || encoded.height != vshape.height ||
+          encoded.width != vshape.width) {
+        Fail("the encoded image is " + std::to_string(encoded.channels) + "x" +
+             std::to_string(encoded.height) + "x" + std::to_string(encoded.width) +
+             " but phase '" + phase.name + "' needs " + std::to_string(vshape.channels) + "x" +
+             std::to_string(vshape.height) + "x" + std::to_string(vshape.width) +
+             ". Upstream raises ConditioningError on exactly this "
+             "(conditioning/types/latent_cond.py:25-30): the encoder's spatial factor and the "
+             "pipeline's VIDEO_SCALE_FACTORS must agree, and they do not.");
+      }
+
+      // `Ltx2ConditionVideoByLatentIndex` writes `clean` and `mask` and reads
+      // `tokens` / `width`; `latent` and `positions` are carried so the struct
+      // is coherent rather than half-filled, not because the item consults them.
+      Ltx2LatentState state;
+      state.tokens = video.tokens;
+      state.width = video.width;
+      state.pos_dims = 3;
+      state.latent = video.latent;
+      state.clean = video.clean;
+      state.mask = video.mask;
+      Ltx2ConditionVideoByLatentIndex(&state, vshape, /*patch_size=*/1, encoded, image_strength,
+                                      /*latent_idx=*/0);
+      video.clean = state.clean;
+      video.mask = state.mask;
+
+      // The witness, taken from the TOKENS THAT WERE WRITTEN rather than from
+      // `encoded` — and the difference is not cosmetic. Digesting the encoder's
+      // output would answer "was an image encoded", which stays true of a build
+      // that encodes an image and then never places it: the render would be
+      // unconditioned and every field here would look healthy. Digesting the
+      // conditioned slice of the clean latent answers "did those tokens reach
+      // the state", which is the question. Filled on the LAST phase, so it
+      // describes the conditioning the finished latent carries.
+      //
+      // IT IS STILL A CHANGE DETECTOR, not a value gate — the same limit the two
+      // prompt digests carry. What the placed tokens should NUMERICALLY be is
+      // gated against executed upstream in `test_ltx2_image_cond`, which drives
+      // these very functions; MEASURED, because a mutation that moved the
+      // composition inside this loop and left `test_ltx2_video` green is how
+      // this comment came to be here.
+      const int64_t placed = Ltx2VideoTokenCount({1, vshape.channels, 1, vshape.height,
+                                                  vshape.width},
+                                                 1);
+      const std::vector<float> written(
+          video.clean.begin(),
+          video.clean.begin() + static_cast<ptrdiff_t>(placed * video.width));
+      im.trace.image_tokens = placed;
+      im.trace.image_digest = DigestF32(written);
+      im.trace.image_absmax = AbsMax(written);
+    }
+
     // The noiser draws VIDEO first, AUDIO second, from one generator
-    // (blocks.py:576-580 builds the video state before the audio one).
+    // (blocks.py:554-563 builds the video state before the audio one; :576-580,
+    // which this used to cite, is the TEARDOWN and proves nothing about order).
     const float noise_scale = static_cast<float>(phase.noise_scale);
     ApplyGaussianNoise(video, state_noise.Draw(static_cast<int64_t>(video.latent.size())),
                        noise_scale);
@@ -1384,6 +1663,54 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
       vin.sigma = &sigma_row;
       vin.positions = video.positions.data();
       vin.context = video_context;
+      // transformer_args.py:269 through modality.py:63. Handed over only when the
+      // model HAS the parameter: a mask on a model without one is refused by the
+      // forward, and upstream's own `supports_keyframes_abs_pos_embedding`
+      // (model.py:166-173) is exactly this condition. The mask itself is built
+      // unconditionally above, because it is data about the latent.
+      //
+      // THE EMPTINESS IS CHECKED, and that is not defensive noise. Making the
+      // mask conditional — on `wants_image`, on a keyframe, on anything — is the
+      // one defect this module invites, and it is INVISIBLE to every output
+      // check: the render stays finite, the right shape, the right token count,
+      // and simply omits a trained term. Without this line a conditional mask
+      // reaches the DiT as `data()` on an empty vector, which is a null pointer
+      // and therefore upstream's legal "no token is marked" — a silent drop
+      // dressed as a supported path. MEASURED: with the mask made conditional
+      // and this check absent, all five LTX-2.5 suites stayed GREEN.
+      if (im.dit.params.use_keyframes_abs_pos_embedding) {
+        VT_CHECK(static_cast<int64_t>(video.keyframes_mask.size()) == video.tokens,
+                 "ltx2 video: this DiT carries keyframes_abs_pos_embedding, so every forward owes "
+                 "the marker `_first_frame_keyframes_mask` builds (ltx_core/tools.py:184-196) — "
+                 "one value per video token, populated on EVERY generation whether or not a "
+                 "keyframe was supplied. Handing the forward no marker would render without a "
+                 "trained term and look exactly like a working render.");
+        vin.keyframes_mask = video.keyframes_mask.data();
+      }
+      // AND THE HANDOVER IS CHECKED SEPARATELY FROM THE CONSTRUCTION, because the
+      // check above cannot see the handover. It reads `video.keyframes_mask` — the
+      // VECTOR — so it fires when the mask is built conditionally and stays silent
+      // when the ASSIGNMENT is. MEASURED: with the vector left unconditional and
+      // this assignment written `if (wants_image) vin.keyframes_mask = ...`, all
+      // five LTX-2.5 suites stayed GREEN while the rendered pixels moved — frame 0
+      // went from a flat 127 to a flat 130 — so the drop was real and nothing in
+      // the tree named it. Two sites, one invariant, and the earlier guard covered
+      // only one of them.
+      //
+      // `vin.keyframes_mask` is the field `Ltx2DitForward` reads, so it is the only
+      // fact that decides whether the trained term is applied. The condition stays
+      // on the flag rather than becoming a bare `!= nullptr`: a DiT that does NOT
+      // carry the parameter must reach the forward with a null marker, which is
+      // upstream's `keyframes_mask is None` exit and is itself gated at
+      // `ltx2_dit.cpp`'s `m.keyframes_mask == nullptr || keyframes_embedding !=
+      // nullptr`. Handing that model a marker would be a refusal, not a fix.
+      VT_CHECK(!im.dit.params.use_keyframes_abs_pos_embedding || vin.keyframes_mask != nullptr,
+               "ltx2 video: this DiT carries keyframes_abs_pos_embedding, so the forward owes the "
+               "marker on EVERY step — and this forward was handed none. "
+               "`_first_frame_keyframes_mask` (ltx_core/tools.py:184-196) is built on the same "
+               "line as the state, unconditionally, whether or not a keyframe or an image was "
+               "supplied. A marker that is BUILT and then not HANDED OVER renders without a "
+               "trained term and looks exactly like a working render.");
 
       Ltx2ModalityInput ain;
       ain.batch = 1;
@@ -1498,10 +1825,134 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
   }
 
   // ── decode (distilled.py:314-315) ─────────────────────────────────────────
+  //
+  // STREAMED, through upstream's own AUTO tiling, mirroring
+  // `ti2vid_two_stages.py:365-376`: the pipeline passes `AUTO_TILING` and the
+  // consumer takes chunks straight out of `decode_video` instead of a whole clip.
+  //
+  // AT THE SIZES THIS PROJECT HAS RUN, THIS CHANGES NOTHING, and that is a
+  // measured statement rather than a hope. `Ltx2AutoTileSizeConfig` is upstream's
+  // Conv layout (768px tile / 64px overlap on the long side, 80 frames / 24
+  // overlap — helpers.py:59-88), and `split_by_size` returns ONE interval when the
+  // axis is no bigger than the tile (tiling.py:199-200). At 448x256/25f the latent
+  // is 8x14 against a 14x24 grid tile and 4 frames against a 10-latent-frame
+  // temporal tile, so exactly one tile and one chunk come out — and the ONE-TILE
+  // CONTROL in tests/vllm/models/test_ltx2_tiling.cpp proves that path reproduces
+  // the untiled decode BIT FOR BIT (max|diff| == 0, on both causality arms, and
+  // upstream's own value for the same control is 0 too).
+  //
+  // TILING FIRST DOES ANYTHING AT 896x512 SPATIALLY AND AT **81 FRAMES**
+  // TEMPORALLY — 81, not 121. `latent_t = (frames - 1) / 8 + 1` is 11 at 81
+  // frames and `split_temporal_causal` short-circuits only while `latent_t <= 10`
+  // (tiling.py:239-240). The row's own golden `kLtx2AutoCases` has said so since
+  // it was generated (`768x768/81f -> t_intervals = 2`); the prose here said 121
+  // because the probe sweep that produced it stepped 25 -> 121 and never sampled
+  // the binding point.
+  //
+  // SO THE "CHANGES NOTHING" ABOVE IS BOUNDED BY 81 FRAMES, AND A DEFAULT REQUEST
+  // IS NOT INSIDE THAT BOUND. `docs/USAGE.md` records the recipe default as
+  // 1024x1536 at 121 frames. Between 81 and 120 frames the render is tiled and is
+  // NOT the render this path produced before tiling existed — measured on the
+  // SHIPPED conv VAE at the AUTO layout, 64x64 / 81 frames, latent 11,2,2, by
+  // scripts/probe_ltx2_tiled_equivalence.cpp: 2 tiles, 2 chunks, max|diff|
+  // 0.0503043234 against the untiled decode on an output whose own |max| is
+  // 0.7512672544 — 6.70% of that range — with 962983 of 995328 floats (96.75%)
+  // not bit-identical. That is upstream's own behaviour (a receptive field wider
+  // than the overlap, blended at the seam) and not a defect here — but it is a
+  // different image, and the one-tile control does not cover it.
+  //
+  // (This said 0.716 and "95% of the range" until the probe was re-derived: it
+  // reassembled the streamed chunks with a FLAT append, and a chunk is
+  // [C, t, H, W] channel-major, so the append is not [C, T, H, W] at C = 3 with
+  // 2 chunks. The 14x was the probe's own transposition. The conclusion stands,
+  // the magnitude did not — see ltx2_tiling.h for the full record.)
+  //
+  // What it buys, ABOVE ONE CHUNK: the full pixel volume is never materialized.
+  // Each temporal chunk is written to disk and dropped, so the peak is about two
+  // chunks rather than [3, F, H, W] — which is what makes the long clips
+  // upstream's 80/24 layout exists for reachable at all. At exactly one chunk the
+  // chunk IS the volume and nothing is saved; that is the regime below 81 frames,
+  // and it is no worse than the buffered path it replaced.
   EngineNoiseStream decode_noise(seed ^ 0x1D7Cull);
-  const Ltx2VideoFrames rendered =
-      Ltx2VideoDecode(im.video_kind, im.video_cfg, im.video_weights, video_latent_volume, video_lc,
-                      video_lf, video_lh, video_lw, &decode_noise);
+  const Ltx2ScaleFactors video_factors =
+      Ltx2VideoScaleFactorsFromBlocks(im.video_cfg.decoder_blocks, im.video_cfg.patch_size);
+  const int64_t rendered_h = video_lh * video_factors.height;
+  const int64_t rendered_w = video_lw * video_factors.width;
+
+  // ── artifacts (the library WRITES these, spawns nothing) ──────────────────
+  // Hoisted ABOVE the decode because the decode now writes into it chunk by
+  // chunk; a directory created after the first chunk arrived would be too late.
+  std::error_code ec;
+  std::filesystem::create_directories(gen.output_dir, ec);
+  if (ec) Fail("cannot create " + gen.output_dir + ": " + ec.message());
+
+  // A PREVIOUS RENDER'S TAIL IS DELETED BEFORE THIS ONE STARTS, and it has to be.
+  //
+  // The muxer is handed `frame_%06d.ppm` with no frame count (see `mux.frame_pattern`
+  // below), so it takes whatever consecutive files it finds. A 121-frame render
+  // followed by a 25-frame render into the same directory would leave
+  // frame_000025..frame_000120 on disk and mux a clip that runs 96 frames past its
+  // own end — silently, and looking like the longer render succeeded. Streaming
+  // widened this: a chunk that throws now also leaves a partial render behind,
+  // where the old buffered path wrote nothing until the whole decode had finished.
+  //
+  // Scoped deliberately: only `frame_<digits>.ppm`, only in the directory this
+  // render is about to write, and nothing else in it is touched. Collected first
+  // and removed after, because unlinking the entry the iterator is standing on is
+  // not something the directory iterator promises to survive.
+  {
+    std::vector<std::filesystem::path> stale;
+    for (const std::filesystem::directory_entry& entry :
+         std::filesystem::directory_iterator(gen.output_dir, ec)) {
+      if (ec) break;
+      if (!entry.is_regular_file()) continue;
+      const std::string name = entry.path().filename().string();
+      // "frame_" + at least one digit + ".ppm" is 11 characters.
+      if (name.size() < 11) continue;
+      if (name.rfind("frame_", 0) != 0) continue;
+      if (name.compare(name.size() - 4, 4, ".ppm") != 0) continue;
+      bool all_digits = true;
+      for (size_t i = 6; i + 4 < name.size(); ++i) {
+        if (std::isdigit(static_cast<unsigned char>(name[i])) == 0) all_digits = false;
+      }
+      if (!all_digits) continue;
+      stale.push_back(entry.path());
+    }
+    for (const std::filesystem::path& p : stale) {
+      std::error_code rm;
+      std::filesystem::remove(p, rm);
+    }
+    ec.clear();
+  }
+
+  int64_t rendered_frames = 0;
+  int64_t rendered_channels = 0;
+  Ltx2VideoDecodeStreaming(
+      im.video_kind, im.video_cfg, im.video_weights, video_latent_volume, video_lc, video_lf,
+      video_lh, video_lw, &decode_noise,
+      Ltx2AutoTileSizeConfig(rendered_h, rendered_w, video_factors),
+      [&](const Ltx2VideoChunk& chunk) {
+        MiniMaxH3VideoFrameShape shape;
+        shape.channels = chunk.frames.channels;
+        shape.t = chunk.frames.frames;
+        shape.h = chunk.frames.height;
+        shape.w = chunk.frames.width;
+        for (int64_t f = 0; f < chunk.frames.frames; ++f) {
+          char name[64];
+          // The GLOBAL frame index, which the chunk carries so the writer does not
+          // have to count. Numbering per-chunk would silently reorder the clip.
+          std::snprintf(name, sizeof(name), "frame_%06lld.ppm",
+                        static_cast<long long>(chunk.first_frame + f));
+          // The PPM/WAV/mux writers are the SHARED serialization the spec's §5
+          // reuse list names, not H3 behaviour: they take a buffer and a shape and
+          // contain no model. Reimplementing them here would be the parallel path
+          // §"Shared seams" forbids.
+          WriteFileBytes(JoinPath(gen.output_dir, name),
+                         MiniMaxH3WritePpmFrame(chunk.frames.data, shape, f));
+        }
+        rendered_frames += chunk.frames.frames;
+        rendered_channels = chunk.frames.channels;
+      });
 
   const Ltx2AudioSpectrogram mel = Ltx2AudioDecoderForward(
       im.audio_cfg, im.audio_weights, audio_latent_volume, audio_lc, audio_lf, audio_lm);
@@ -1510,35 +1961,24 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
       Ltx2VocoderWithBweForward(im.vocoder_cfg, im.vocoder_weights, mel.data, mel.channels,
                                 mel.frames, mel.mel_bins, &audio_samples);
 
-  // ── artifacts (the library WRITES these, spawns nothing) ──────────────────
-  std::error_code ec;
-  std::filesystem::create_directories(gen.output_dir, ec);
-  if (ec) Fail("cannot create " + gen.output_dir + ": " + ec.message());
-
   VideoResult result;
   result.frame_dir = gen.output_dir;
-  MiniMaxH3VideoFrameShape shape;
-  shape.channels = rendered.channels;
-  shape.t = rendered.frames;
-  shape.h = rendered.height;
-  shape.w = rendered.width;
-  for (int64_t f = 0; f < rendered.frames; ++f) {
-    char name[64];
-    std::snprintf(name, sizeof(name), "frame_%06lld.ppm", static_cast<long long>(f));
-    // The PPM/WAV/mux writers are the SHARED serialization the spec's §5 reuse
-    // list names, not H3 behaviour: they take a buffer and a shape and contain
-    // no model. Reimplementing them here would be the parallel path §"Shared
-    // seams" forbids.
-    WriteFileBytes(JoinPath(gen.output_dir, name),
-                   MiniMaxH3WritePpmFrame(rendered.data, shape, f));
+  // The streamed chunks must have covered exactly the clip the latent implies. A
+  // decode that dropped or duplicated a temporal group would otherwise show up
+  // only as a short mp4.
+  const int64_t expect_frames = (video_lf - 1) * video_factors.time + 1;
+  if (rendered_frames != expect_frames || rendered_channels != im.video_cfg.out_channels) {
+    Fail("the streamed video decode produced " + std::to_string(rendered_frames) + " frames x " +
+         std::to_string(rendered_channels) + " channels, but the latent implies " +
+         std::to_string(expect_frames) + " x " + std::to_string(im.video_cfg.out_channels));
   }
   result.audio_path = JoinPath(gen.output_dir, "audio.wav");
   WriteFileBytes(result.audio_path,
                  MiniMaxH3WriteWav(waveform, mel.channels, audio_samples,
                                    im.vocoder_cfg.output_sampling_rate));
-  result.frame_count = rendered.frames;
-  result.width = rendered.width;
-  result.height = rendered.height;
+  result.frame_count = rendered_frames;
+  result.width = rendered_w;
+  result.height = rendered_h;
   result.fps = static_cast<int64_t>(std::llround(fps));
   result.sample_rate = im.vocoder_cfg.output_sampling_rate;
 

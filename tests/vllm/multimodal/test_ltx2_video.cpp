@@ -38,8 +38,10 @@
 #include "vllm/model_executor/model_loader/safetensors_reader.h"
 #include "vllm/model_executor/models/ltx2_loader.h"
 #include "vllm/model_executor/models/ltx2_text_encoder.h"
+#include "vllm/model_executor/models/ltx2_tiling.h"
 #include "vllm/model_executor/models/ltx2_upsampler.h"
 #include "vllm/model_executor/models/ltx2_video_vae.h"
+#include "vllm/model_executor/models/ltx2_video_vae_encoder.h"
 #include "vllm/platforms/interface.h"  // CurrentPlatform() — the seam the engine asks
 #include "vllm.h"
 #include "vt/backend.h"
@@ -323,6 +325,82 @@ TEST_CASE("ltx2 video: an auto-detected load renders frames, a WAV and a mux arg
   CHECK(joined.find(result.mux_output_path) != std::string::npos);
 }
 
+TEST_CASE("ltx2 video: a MULTI-CHUNK render numbers its frames globally, and clears the last one") {
+  // The fixture above is 9 frames — ONE temporal chunk — so the render path's
+  // `chunk.first_frame + f` (ltx2_video.cpp, the streaming sink) was never driven
+  // through the PPM writer with more than one chunk. Per-chunk numbering would
+  // restart at frame_000000 for the second chunk, overwrite the first chunk's
+  // files and leave the clip's tail missing, and every assertion in the 9-frame
+  // case would still pass.
+  //
+  // 81 frames is the smallest request that chunks, and that is not a coincidence:
+  // `latent_t = (81 - 1) / 8 + 1 = 11` against the AUTO layout's 80-frame / 10
+  // latent-frame temporal tile. It is asserted below rather than assumed, because
+  // a test that silently stopped chunking would be green and vacuous.
+  Workspace ws;
+  vllm::multimodal::VideoModelParams mp = FixtureParams(ws.paths);
+  mp.extras[vllm::multimodal::kLtx2MaxPhaseExtra] = "0";
+  const std::unique_ptr<vllm::multimodal::VideoEngine> engine =
+      vllm::multimodal::LoadVideoEngine(mp);
+  REQUIRE(engine != nullptr);
+
+  // The fixture's factors, as documented at `FixtureGen`: (8, 32, 32). Phase 0
+  // halves the spatial request, so 64x64 decodes at 32x32 — one latent cell each
+  // way — and only the temporal axis can chunk here.
+  const vllm::Ltx2ScaleFactors factors{8, 32, 32};
+  const vllm::Ltx2TileSizeConfig layout = vllm::Ltx2AutoTileSizeConfig(32, 32, factors);
+  const int64_t latent_t = (81 - 1) / factors.time + 1;
+  CHECK(latent_t == 11);
+  const std::vector<vllm::Ltx2Tile> tiles =
+      vllm::Ltx2CreateTiles(latent_t, 1, 1, layout, factors);
+  const size_t groups = vllm::Ltx2GroupTilesByTemporalSlice(tiles).size();
+  REQUIRE_MESSAGE(groups > 1u, "this request no longer chunks; the case below proves nothing");
+
+  const std::string out_dir = ws.root + "/multichunk";
+  vllm::multimodal::VideoGenParams gen = FixtureGen(out_dir);
+  gen.num_frames = 81;
+  const vllm::multimodal::VideoResult result = engine->Generate(gen);
+  REQUIRE(result.frame_count == 81);
+
+  // EVERY global index exists exactly once, and the one past the end does not.
+  // Per-chunk numbering fails here on both counts at the same time.
+  for (int64_t f = 0; f < result.frame_count; ++f) {
+    char name[64];
+    std::snprintf(name, sizeof(name), "/frame_%06lld.ppm", static_cast<long long>(f));
+    std::ifstream in(out_dir + name, std::ios::binary);
+    CHECK_MESSAGE(in.good(), "frame ", f, " of a ", result.frame_count,
+                  "-frame streamed render is missing");
+  }
+  {
+    std::ifstream beyond(out_dir + "/frame_000081.ppm", std::ios::binary);
+    CHECK(!beyond.good());
+  }
+  // ...and the last frame is not a copy of the first, which is what a writer that
+  // reused chunk-local indices would leave behind after the overwrite.
+  CHECK(ReadAll(out_dir + "/frame_000080.ppm") != ReadAll(out_dir + "/frame_000000.ppm"));
+
+  // THE STALE TAIL. Rendering a SHORTER clip into the same directory must not
+  // leave the longer render's frames behind: `mux.frame_pattern` is
+  // `frame_%06d.ppm` with no count, so ffmpeg would mux 72 frames past the end of
+  // a clip that reported 9. Pre-existing, and widened by streaming — a chunk that
+  // throws mid-render leaves a partial clip on disk too.
+  const vllm::multimodal::VideoResult shorter = engine->Generate(FixtureGen(out_dir));
+  REQUIRE(shorter.frame_count == 9);
+  for (int64_t f = 9; f < 81; ++f) {
+    char name[64];
+    std::snprintf(name, sizeof(name), "/frame_%06lld.ppm", static_cast<long long>(f));
+    std::ifstream stale(out_dir + name, std::ios::binary);
+    CHECK_MESSAGE(!stale.good(), "frame ", f, " survived a shorter re-render into the same "
+                                              "directory and would be muxed past its end");
+  }
+  for (int64_t f = 0; f < 9; ++f) {
+    char name[64];
+    std::snprintf(name, sizeof(name), "/frame_%06lld.ppm", static_cast<long long>(f));
+    std::ifstream in(out_dir + name, std::ios::binary);
+    CHECK_MESSAGE(in.good(), "the cleanup removed frame ", f, ", which the new render owns");
+  }
+}
+
 TEST_CASE("ltx2 video: the second phase upsamples, and refuses when it cannot") {
   Workspace ws;
   SUBCASE("without an upsampler the phase is refused BY NAME, not skipped") {
@@ -337,6 +415,38 @@ TEST_CASE("ltx2 video: the second phase upsamples, and refuses when it cannot") 
       INFO(msg);
       CHECK(msg.find("upsampler_path") != std::string::npos);
       CHECK(msg.find("refine") != std::string::npos);
+    }
+  }
+  SUBCASE("a TEMPORAL upsampler checkpoint is refused BY NAME, not shape-mismatched") {
+    // The temporal x2 arm is ported and gated (test_ltx2_pipeline.cpp, "ltx2 the
+    // latent temporal upsampler reproduces upstream") but NOTHING drives it. It
+    // shares the class name and the `upsampler.0.*` tensor names with the
+    // spatial arm, so this checkpoint loads and runs; what it returns is
+    // [c, 2f-1, h, w] where the phase needs [c, f, 2h, 2w]. Without the guard
+    // the caller gets a shape mismatch and has to work out that they handed over
+    // the wrong file.
+    vllm::Ltx2UpsamplerConfig temporal =
+        ltx2_fixture::ReducedUpsamplerConfig(ltx2_fixture::ReducedDitParams().in_channels);
+    temporal.spatial_upsample = false;
+    temporal.temporal_upsample = true;
+    const std::string path = ws.root + "/temporal_upsampler.safetensors";
+    ltx2_fixture::WriteReducedUpsampler(temporal, path);
+
+    vllm::multimodal::VideoModelParams mp = FixtureParams(ws.paths);
+    mp.extras["upsampler_path"] = path;
+    const std::unique_ptr<vllm::multimodal::VideoEngine> engine =
+        vllm::multimodal::LoadVideoEngine(mp);
+    try {
+      (void)engine->Generate(FixtureGen(ws.root + "/temporal_ups"));
+      FAIL("a temporal upsampler checkpoint must be refused, not run for this phase");
+    } catch (const std::exception& e) {
+      const std::string msg = e.what();
+      INFO(msg);
+      CHECK(msg.find("temporal_upsample=true") != std::string::npos);
+      CHECK(msg.find("SPATIAL") != std::string::npos);
+      // The message must not be the generic shape complaint — that is the
+      // failure mode this guard exists to replace.
+      CHECK(msg.find("the upsampled latent is") == std::string::npos);
     }
   }
   SUBCASE("with one, the render lands at the FULL requested size") {
@@ -683,38 +793,305 @@ TEST_CASE("ltx2 video: the recipe comes from the CHECKPOINT's own model_version"
   }
 }
 
-TEST_CASE("ltx2 video: keyframe and reference conditioning is refused by name") {
+// A binary PPM the engine can actually condition on. Deliberately NOT the
+// generation's own resolution: `load_image_and_preprocess` aspect-fills and
+// centre-crops to the phase's height/width (media_io/resize.py:41-73), and an
+// image that already fits would leave that untested.
+std::string ConditioningPpm(int height, int width, unsigned seed) {
+  std::string out = "P6\n" + std::to_string(width) + " " + std::to_string(height) + "\n255\n";
+  for (int i = 0; i < height * width * 3; ++i) {
+    out.push_back(static_cast<char>((i * 37 + static_cast<int>(seed) * 101) % 251));
+  }
+  return out;
+}
+
+// BOTH phases, which for image conditioning is not a detail: the two-stage
+// recipe renders its stages at DIFFERENT resolutions, so the image is decoded,
+// resized and encoded once per phase against that phase's own height and width
+// (ltx-pipelines/utils/helpers.py:274-275 are the parameters; distilled.py:251,
+// :255-256 and :285-286 are where the two stages pass different values). A
+// `max_phase = 0` fixture would
+// leave the second encode — and the whole reason the conditioning lives inside
+// the phase loop — untested.
+vllm::multimodal::VideoModelParams ConditioningParams(const ltx2_fixture::Paths& paths) {
+  vllm::multimodal::VideoModelParams mp = FixtureParams(paths);
+  mp.extras["upsampler_path"] = paths.upsampler;
+  return mp;
+}
+
+TEST_CASE("ltx2 video: keyframe and reference conditioning is refused BY WHAT IS MISSING") {
+  // Row LTX25-IMAGE-COND (#644) SPLIT this refusal. It used to cover every
+  // conditioning kind with one message whose reason was "no encoder weights can
+  // be materialized here" — true when written, and no longer: this engine now
+  // loads them through `Ltx2VideoVaeEncoderKeyRules`, and the first-frame arm is
+  // served (see the case below).
+  //
+  // So each surviving refusal is held to naming a DIFFERENT missing piece. The
+  // point is not that the message is long; it is that a later reader can go and
+  // check the named symbol and find out whether the reason still holds — which
+  // is the thing five refusals in this campaign failed at.
   Workspace ws;
   const std::unique_ptr<vllm::multimodal::VideoEngine> engine =
-      vllm::multimodal::LoadVideoEngine(FixtureParams(ws.paths));
-  vllm::multimodal::VideoGenParams gen = FixtureGen(ws.root + "/keyframed");
-  gen.first_frame_path = ws.paths.video_embeds;  // any path: the refusal precedes the read
-  try {
-    (void)engine->Generate(gen);
-    FAIL("keyframe conditioning must be refused while no encoder is reachable from here");
-  } catch (const std::exception& e) {
-    const std::string msg = e.what();
+      vllm::multimodal::LoadVideoEngine(ConditioningParams(ws.paths));
+
+  auto refusal = [&](const char* what,
+                     void (*arm)(vllm::multimodal::VideoGenParams&, const Workspace&)) {
+    vllm::multimodal::VideoGenParams gen = FixtureGen(ws.root + "/refused");
+    arm(gen, ws);
+    try {
+      (void)engine->Generate(gen);
+      FAIL_CHECK(what << " must be refused, never dropped");
+      return std::string();
+    } catch (const std::exception& e) {
+      return std::string(e.what());
+    }
+  };
+
+  SUBCASE("a LAST-frame keyframe names the TOKEN-APPEND machinery, not the embedding") {
+    const std::string msg = refusal("a last-frame keyframe",
+                                    [](vllm::multimodal::VideoGenParams& g, const Workspace& w) {
+                                      g.last_frame_path = w.paths.video_embeds;
+                                    });
     INFO(msg);
-    CHECK(msg.find("ImageConditioner") != std::string::npos);
-    // A refusal whose stated REASON has gone stale is worse than a vague one: it
-    // sends the next reader to build something that already exists. Phase L11
-    // ported the video VAE encoder, so the message may no longer claim the
-    // encoder is missing, and these two assertions hold it to the pieces that
-    // actually are — the loader path that would put encoder weights in memory,
-    // and the CRF re-compression upstream applies before encoding.
-    CHECK(msg.find("VAE_ENCODER_COMFY_KEYS_FILTER") != std::string::npos);
-    CHECK(msg.find("default_image_crf") != std::string::npos);
-    // And the QUALIFIER on that re-compression, which the two substrings above do
-    // not reach: `preprocess` returns the image UNTOUCHED at `crf == 0`
-    // (media_io/decode.py:413-435, the `if crf == 0:` early return at :425-426 —
-    // NOT the one at :427-428, which is the degenerate-size guard), so "re-compresses
-    // before encoding" is only true of a nonzero resolved CRF. Naming the round
-    // trip without naming its exception overstates what is unported and sends the
-    // next reader to build an H.264 path for a case that needs none — the same
-    // failure mode as a stale reason, one step subtler. Gated here so deleting the
-    // qualifier goes RED rather than quietly restoring the overstatement.
-    CHECK(msg.find("unless that CRF is 0") != std::string::npos);
+    // THIS ASSERTION USED TO PIN A FALSE REASON. It required the message to
+    // blame `keyframes_abs_pos_embedding`, and at pin `fd4ded7f` that is not
+    // what blocks a supplied keyframe: `apply_to` appends it with
+    // `marked=False` (keyframe_cond.py:84-86) and the sole consumer adds
+    // `mask * embedding` (transformer_args.py:42-43, called at :269), so the
+    // embedding contributes exactly nothing to those tokens. Porting it would
+    // not serve this arm. The gate enforced the wrong thing, which is worse
+    // than not gating the message at all.
+    //
+    // What actually blocks it is the append: extended `positions`,
+    // `update_attention_mask`, extended `clean_latent` / `denoise_mask`, and
+    // `clear_conditioning` trimming back — none of which this engine's
+    // fixed-length phase loop can express.
+    CHECK(msg.find("update_attention_mask") != std::string::npos);
+    CHECK(msg.find("clear_conditioning") != std::string::npos);
+    CHECK(msg.find("keyframe_cond.py") != std::string::npos);
+    CHECK(msg.find("VAE_ENCODER_COMFY_KEYS_FILTER") == std::string::npos);
+    // The refuted reason may still be NAMED — it is worth telling a reader that
+    // it was ruled out — but never as the thing that is missing, and only next
+    // to the issue that tracks where the embedding really does bite (#658).
+    if (msg.find("keyframes_abs_pos_embedding") != std::string::npos) {
+      CHECK(msg.find("NOT* THE REASON") != std::string::npos);
+      CHECK(msg.find("#658") != std::string::npos);
+    }
   }
+  SUBCASE("a reference video names the IC-LoRA metadata this project does not read") {
+    const std::string msg = refusal("a reference video",
+                                    [](vllm::multimodal::VideoGenParams& g, const Workspace& w) {
+                                      g.ref_video_dir = w.root;
+                                    });
+    INFO(msg);
+    CHECK(msg.find("temporal_scale_factor") != std::string::npos);
+    CHECK(msg.find("LoRA") != std::string::npos);
+  }
+  SUBCASE("reference audio names the AUDIO encoder, which this row did not build") {
+    const std::string msg = refusal("reference audio",
+                                    [](vllm::multimodal::VideoGenParams& g, const Workspace& w) {
+                                      g.ref_audio_path = w.paths.audio_embeds;
+                                    });
+    INFO(msg);
+    CHECK(msg.find("audio VAE") != std::string::npos);
+    CHECK(msg.find("encode_audio") != std::string::npos);
+  }
+  SUBCASE("a non-zero CRF names the codec round trip, and says 0 is supported") {
+    // AND THIS IS THE DEFAULT PATH. An LTX-2.5 checkpoint resolves
+    // `default_image_crf = 18` (constants.py:37/124/130-133), so a caller who
+    // says nothing about the CRF lands here — which is what makes the
+    // out-of-distribution `crf = 0` arm a deliberate request rather than a
+    // silent downgrade.
+    vllm::multimodal::VideoGenParams gen = FixtureGen(ws.root + "/crf");
+    gen.first_frame_ppm = ConditioningPpm(20, 28, 3);
+    try {
+      (void)engine->Generate(gen);
+      FAIL("an unset CRF resolves 18 for a 2.5 checkpoint and must be refused");
+    } catch (const std::exception& e) {
+      const std::string msg = e.what();
+      INFO(msg);
+      CHECK(msg.find("CRF 18") != std::string::npos);
+      CHECK(msg.find("encode_single_frame") != std::string::npos);
+      CHECK(msg.find("CRF 0 IS supported") != std::string::npos);
+    }
+  }
+  SUBCASE("an explicit non-zero CRF is refused just as an unset one is") {
+    vllm::multimodal::VideoGenParams gen = FixtureGen(ws.root + "/crf33");
+    gen.first_frame_ppm = ConditioningPpm(20, 28, 4);
+    gen.extras[vllm::multimodal::kLtx2ImageCrfExtra] = "33";
+    CHECK_THROWS_WITH_AS((void)engine->Generate(gen), doctest::Contains("CRF 33"),
+                         std::runtime_error);
+  }
+  SUBCASE("a mistyped per-generation extra is refused, not ignored") {
+    vllm::multimodal::VideoGenParams gen = FixtureGen(ws.root + "/typo");
+    gen.first_frame_ppm = ConditioningPpm(20, 28, 5);
+    gen.extras["image_crf_"] = "0";
+    CHECK_THROWS_WITH_AS((void)engine->Generate(gen), doctest::Contains("image_crf_"),
+                         std::runtime_error);
+  }
+}
+
+TEST_CASE("ltx2 video: an image at crf 0 conditions the render, and the ENCODER weights are read") {
+  // The arm row LTX25-IMAGE-COND (#644) opened. Two separate claims are made
+  // here and they are NOT the same claim:
+  //
+  //   1. the conditioning REACHES the render — the trace reports the encoded
+  //      image, and a different image gives a different digest; and
+  //   2. the ENCODER WEIGHTS are READ — perturbing ONE encoder tensor in the
+  //      checkpoint moves the digest, with every byte of the REQUEST identical.
+  //
+  // (2) is the one that is easy to fake. A path that loaded the weights and then
+  // conditioned on something else — zeros, the raw pixels, a re-used decoder
+  // tensor — satisfies (1) completely.
+  Workspace ws;
+  const std::unique_ptr<vllm::multimodal::VideoEngine> engine =
+      vllm::multimodal::LoadVideoEngine(ConditioningParams(ws.paths));
+  auto* ltx2 = dynamic_cast<vllm::multimodal::Ltx2VideoEngine*>(engine.get());
+  REQUIRE(ltx2 != nullptr);
+
+  vllm::multimodal::VideoGenParams gen = FixtureGen(ws.root + "/img");
+  gen.first_frame_ppm = ConditioningPpm(20, 28, 1);
+  gen.extras[vllm::multimodal::kLtx2ImageCrfExtra] = "0";
+  const vllm::multimodal::VideoResult result = engine->Generate(gen);
+
+  const vllm::multimodal::Ltx2ConditioningTrace trace = ltx2->last_conditioning();
+  CHECK(trace.completed);
+  CHECK(trace.image_crf == 0);
+  CHECK(trace.image_strength == 1.0);  // noise_aug defaults to 1.0 => the frame is PINNED
+  // WHICH PHASE this describes is the claim, and `image_tokens > 0` did not make
+  // it. MEASURED: changing the guard to `wants_image && phase_index == 0` — the
+  // shape of an obvious refactor that hoists the per-phase decode+encode out of
+  // the loop — left this whole binary at 32 cases / 550 assertions / exit 0
+  // while `refine`, the phase whose latent is actually rendered, ran with the
+  // pinned frame re-noised away. The design's own reason for living inside the
+  // loop (spec section 8.5) was gated by nothing.
+  //
+  // So the count is pinned to the LAST phase's per-latent-frame token count.
+  // This fixture's two-stage recipe runs `generate_lowres` at
+  // `spatial_downscale = 2` and `refine` at 1, so the latent grid doubles in
+  // each spatial dimension and the placed count is 1 then 4 — a per-phase value,
+  // which is exactly why `image_tokens == 4` falsifies a stage-1-only build.
+  constexpr int64_t kRefineImageTokens = 4;
+  CHECK(trace.image_tokens == kRefineImageTokens);
+  CHECK(trace.image_digest != 0);
+  // A conditioning that collapsed to zeros would give every image the same
+  // digest and still satisfy every check below it, so the magnitude is asked for
+  // separately — the same reason `video_absmax` exists next to `video_digest`.
+  CHECK(trace.image_absmax > 0.0);
+  // The render still produced its artifacts; conditioning is not a bypass.
+  CHECK(result.frame_count == 9);
+
+  SUBCASE("the trace describes the LAST phase, and stage 1 is a different count") {
+    // The other half of the same claim, and the half a literal cannot make: the
+    // number above is not a constant of the fixture, it TRACKS the phase that
+    // ran last. Same request, capped at phase 0, must report stage 1's smaller
+    // count — and the ratio is checked between two MEASURED values rather than
+    // between two compile-time constants, which would assert nothing.
+    // `max_phase` is a LOAD-time extra, not a per-generation one, so the cap
+    // needs its own engine over the same fixture.
+    vllm::multimodal::VideoModelParams capped = ConditioningParams(ws.paths);
+    capped.extras[vllm::multimodal::kLtx2MaxPhaseExtra] = "0";
+    const std::unique_ptr<vllm::multimodal::VideoEngine> stage1_engine =
+        vllm::multimodal::LoadVideoEngine(capped);
+    auto* stage1_ltx2 =
+        dynamic_cast<vllm::multimodal::Ltx2VideoEngine*>(stage1_engine.get());
+    REQUIRE(stage1_ltx2 != nullptr);
+    vllm::multimodal::VideoGenParams lowres = FixtureGen(ws.root + "/img_stage1");
+    lowres.first_frame_ppm = ConditioningPpm(20, 28, 1);
+    lowres.extras[vllm::multimodal::kLtx2ImageCrfExtra] = "0";
+    (void)stage1_engine->Generate(lowres);
+    const vllm::multimodal::Ltx2ConditioningTrace stage1 = stage1_ltx2->last_conditioning();
+    CHECK(stage1.image_tokens == 1);
+    CHECK(trace.image_tokens == 4 * stage1.image_tokens);
+    // And it is a DIFFERENT encode, not the same one carried forward: the image
+    // is resized and encoded against each phase's own height and width
+    // (ltx-pipelines/utils/helpers.py:274-275, per-stage h/w at
+    // distilled.py:251, 255-256, 285-286).
+    CHECK(stage1.image_digest != trace.image_digest);
+  }
+
+  SUBCASE("a DIFFERENT image is a different conditioning") {
+    vllm::multimodal::VideoGenParams other = FixtureGen(ws.root + "/img2");
+    other.first_frame_ppm = ConditioningPpm(20, 28, 2);
+    other.extras[vllm::multimodal::kLtx2ImageCrfExtra] = "0";
+    (void)engine->Generate(other);
+    CHECK(ltx2->last_conditioning().image_digest != trace.image_digest);
+  }
+
+  SUBCASE("the SAME image is the same conditioning") {
+    vllm::multimodal::VideoGenParams again = FixtureGen(ws.root + "/img3");
+    again.first_frame_ppm = ConditioningPpm(20, 28, 1);
+    again.extras[vllm::multimodal::kLtx2ImageCrfExtra] = "0";
+    (void)engine->Generate(again);
+    CHECK(ltx2->last_conditioning().image_digest == trace.image_digest);
+  }
+
+  SUBCASE("the ENCODER's own weights decide the conditioning") {
+    // ONE tensor of the encoder half, perturbed in a SECOND fixture, with the
+    // request byte-identical. If the engine were conditioning on anything but
+    // the encoder's output — or had loaded the DECODER's tensors under the
+    // encoder's names — this digest would not move.
+    Workspace mutated;
+    const std::string path = mutated.paths.video_vae;
+    std::string bytes = ReadAll(path);
+    // The PAYLOAD is what gets perturbed, and its position is READ from the
+    // safetensors header rather than guessed at. An earlier revision of this
+    // case searched for the tensor's NAME and flipped a byte a fixed distance
+    // past it, which lands inside the JSON header of whatever tensor happens to
+    // be stored next — the file still parsed, the render still ran, and the
+    // digest did not move. The case failed, which is the only reason that is a
+    // footnote and not a false green.
+    REQUIRE(bytes.size() > 8);
+    uint64_t header_len = 0;
+    std::memcpy(&header_len, bytes.data(), sizeof(header_len));
+    REQUIRE(8 + header_len <= bytes.size());
+    const nlohmann::json header =
+        nlohmann::json::parse(bytes.substr(8, static_cast<size_t>(header_len)));
+    const std::string needle = "encoder.conv_in.conv.weight";
+    REQUIRE_MESSAGE(header.contains(needle),
+                    "the fixture must carry an encoder half for this to prove anything");
+    const size_t data_start =
+        8 + static_cast<size_t>(header_len) +
+        header.at(needle).at("data_offsets").at(0).get<size_t>();
+    REQUIRE(data_start + 1 < bytes.size());
+    // bf16 is stored little-endian, so byte 0 of a word carries the mantissa's
+    // top bits; flipping 0x40 there moves that ONE weight by ~50% without any
+    // risk of manufacturing an Inf or a NaN out of the exponent — which would
+    // change the digest for a reason that has nothing to do with this claim.
+    bytes[data_start] = static_cast<char>(bytes[data_start] ^ 0x40);
+    {
+      std::ofstream out(path, std::ios::binary | std::ios::trunc);
+      REQUIRE(out.good());
+      out.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+    }
+    const std::unique_ptr<vllm::multimodal::VideoEngine> other =
+        vllm::multimodal::LoadVideoEngine(ConditioningParams(mutated.paths));
+    auto* other_ltx2 = dynamic_cast<vllm::multimodal::Ltx2VideoEngine*>(other.get());
+    REQUIRE(other_ltx2 != nullptr);
+    vllm::multimodal::VideoGenParams same = FixtureGen(mutated.root + "/img");
+    same.first_frame_ppm = ConditioningPpm(20, 28, 1);
+    same.extras[vllm::multimodal::kLtx2ImageCrfExtra] = "0";
+    (void)other->Generate(same);
+    CHECK(other_ltx2->last_conditioning().image_digest != trace.image_digest);
+  }
+}
+
+TEST_CASE("ltx2 video: a request WITHOUT an image leaves the trace's image fields empty") {
+  // Otherwise "this render was conditioned on an image" and "this render was
+  // not" would be indistinguishable after the fact, which is the one question
+  // `Ltx2ConditioningTrace` exists to answer.
+  Workspace ws;
+  const std::unique_ptr<vllm::multimodal::VideoEngine> engine =
+      vllm::multimodal::LoadVideoEngine(ConditioningParams(ws.paths));
+  auto* ltx2 = dynamic_cast<vllm::multimodal::Ltx2VideoEngine*>(engine.get());
+  REQUIRE(ltx2 != nullptr);
+  (void)engine->Generate(FixtureGen(ws.root + "/plain"));
+  const vllm::multimodal::Ltx2ConditioningTrace trace = ltx2->last_conditioning();
+  CHECK(trace.completed);
+  CHECK(trace.image_tokens == 0);
+  CHECK(trace.image_digest == 0);
+  CHECK(trace.image_absmax == 0.0);
+  CHECK(trace.image_strength == 0.0);
 }
 
 
@@ -961,15 +1338,25 @@ TEST_CASE("ltx2 video: the SHIPPED Lightricks checkpoints parse and load") {
     // cannot see. The two must agree on the weight contract.
     CHECK(vllm::Ltx2ReadCheckpointModelVersion(file) == "2.5.0");
     nlohmann::json config = vllm::Ltx2ReadCheckpointConfig(file);
-    // The shipped DiT DECLARES `use_keyframes_abs_pos_embedding: true`, which
-    // `ParseLtx2DitParams` refuses by name because the module is unported. The
-    // engine clears it in a copy under `allow_unported_modules`; this mirrors
-    // that, and asserting the file declares it is the point.
+    // The shipped DiT DECLARES `use_keyframes_abs_pos_embedding: true` while
+    // carrying NO tensor for it — which is upstream-LEGAL and means "apply
+    // nothing": the parameter is built on the meta device and
+    // `supports_keyframes_abs_pos_embedding` is False both before and after the
+    // load (model.py:166-173; reproduce with
+    // scripts/measure-ltx2-keyframes-meta.py).
+    //
+    // This test used to CLEAR the flag by hand here, mirroring an engine that
+    // cleared it under `allow_unported_modules`. Both are gone (row
+    // LTX25-KEYFRAMES-ABS-POS, issue #658): `Ltx2AdoptDeclaredDitParams` resolves
+    // it against the file's own shapes, so the declared config is adopted
+    // VERBATIM and the contracts agree with no hand edit at all.
     REQUIRE(config["transformer"]["use_keyframes_abs_pos_embedding"].get<bool>());
-    config["transformer"]["use_keyframes_abs_pos_embedding"] = false;
-    nlohmann::json wrapper;
-    wrapper["config"] = config;
-    const vllm::Ltx2DitParams declared = vllm::ParseLtx2DitParams(wrapper);
+    REQUIRE_FALSE(from_shapes.use_keyframes_abs_pos_embedding);  // the file carries no tensor
+    const vllm::Ltx2DitParams declared = vllm::Ltx2AdoptDeclaredDitParams(
+        config, from_shapes, "the shipped NVFP4 DiT's own __metadata__[\"config\"]");
+    // RESOLVED to FALSE, which is `supports_...`. Not a refusal, and not a
+    // synthesised zero — the two failure modes spec §6 names.
+    CHECK_FALSE(declared.use_keyframes_abs_pos_embedding);
     // The shipped config OMITS `use_prompt_adaln_single`, so it resolves to
     // upstream's TRUE default (model_configurator.py:76) — which is what the
     // file's own tensors say. Asserted rather than forced: the two sides of the
@@ -991,6 +1378,77 @@ TEST_CASE("ltx2 video: the SHIPPED Lightricks checkpoints parse and load") {
     MESSAGE("shipped NVFP4 DiT: " << a.size() << " contract tensors, "
             << file.Names().size() << " in the file");
   }
+
+  // THE CLAIM THIS ROW EXISTS TO MAKE TRUE (row LTX25-KEYFRAMES-ABS-POS, issue
+  // #658): the shipped DiT loads INSIDE THE CONTRACT — no `allow_unported_modules`
+  // — which neither shipped copy could do before. `Ltx2LoadDitFromSafetensors`
+  // with default options is precisely "no opt-in".
+  //
+  // The full load reads ~19 GB. It is the same file the subcase above parses; if
+  // this box cannot hold it, that shows up as a load failure and not as a pass.
+  SUBCASE("the first-party NVFP4 DiT loads with NO allow_unported_modules") {
+    const std::string path =
+        root + "/diffusion_models/ltx-2.5-22b-distilled-transformer-nvfp4.safetensors";
+    const vllm::SafetensorsFile file = vllm::SafetensorsFile::Open(path);
+    const vllm::Ltx2DitCheckpoint ck = vllm::Ltx2LoadDitFromSafetensors(file);
+    CHECK(ck.unported.empty());
+    // Absent from the file, so nothing is bound and nothing will be applied.
+    CHECK_FALSE(ck.params.use_keyframes_abs_pos_embedding);
+    CHECK(ck.weights.keyframes_abs_pos_embedding.data == nullptr);
+    MESSAGE("shipped NVFP4 DiT loaded inside the contract, unported=" << ck.unported.size());
+  }
+}
+
+// The OTHER shipped DiT, which lives under a different publisher root and so
+// takes its own env. It is the one that carries the TRAINED
+// `keyframes_abs_pos_embedding` — `F8_E4M3 [1, 4096]` with a scalar `F32` scale,
+// 4096 of 4096 bytes non-zero — and it was refused from the opposite direction:
+// "the checkpoint carries modules this port does NOT carry".
+//
+// CI SETS NEITHER ENV (issue #673), so this is host-local evidence, not a gate.
+TEST_CASE("ltx2 video: the SHIPPED vonkaiser FP8 DiT loads with NO allow_unported_modules") {
+  const char* dit_env = std::getenv("LTX2_FP8_DIT");
+  if (dit_env == nullptr) {
+    MESSAGE("SKIPPED: set LTX2_FP8_DIT to the vonkaiser ltx-2.5-22b-distilled-fp8.safetensors");
+    return;
+  }
+  const vllm::SafetensorsFile file = vllm::SafetensorsFile::Open(std::string(dit_env));
+  // It carries no `__metadata__` at all, which is why its config always arrives
+  // separately and why the manifest is the only evidence about this flag.
+  CHECK(file.Metadata().count("config") == 0);
+
+  const vllm::Ltx2DitCheckpoint ck = vllm::Ltx2LoadDitFromSafetensors(file);
+  CHECK(ck.unported.empty());
+  // RESOLVED TRUE from the file's own shapes — `supports_...` holds here.
+  CHECK(ck.params.use_keyframes_abs_pos_embedding);
+  REQUIRE(ck.weights.keyframes_abs_pos_embedding.data != nullptr);
+  REQUIRE(ck.weights.keyframes_abs_pos_embedding.rank == 2);
+  CHECK(ck.weights.keyframes_abs_pos_embedding.shape[0] == 1);
+  CHECK(ck.weights.keyframes_abs_pos_embedding.shape[1] == ck.params.inner_dim());
+  // Dequantized through the ONE existing FP8 convention — F8_E4M3 plus a scalar
+  // F32 `<name>_scale`, `DequantFp8ToBf16` — so the view is BF16.
+  CHECK(ck.weights.keyframes_abs_pos_embedding.dtype == vt::DType::kBF16);
+  // TRAINED, not `torch.zeros`. A zero bias would be an exact no-op because the
+  // term is ADDED, so this is the assertion that makes the port matter at all.
+  {
+    const uint16_t* p = ck.weights.keyframes_abs_pos_embedding.Ptr<uint16_t>();
+    int64_t nonzero = 0;
+    for (int64_t i = 0; i < ck.params.inner_dim(); ++i) {
+      if (p[i] != 0) ++nonzero;
+    }
+    MESSAGE("shipped FP8 keyframes_abs_pos_embedding: " << nonzero << " of "
+            << ck.params.inner_dim() << " non-zero");
+    CHECK(nonzero > 0);
+  }
+}
+
+TEST_CASE("ltx2 video: the SHIPPED Lightricks VAEs and upsampler load") {
+  const char* root_env = std::getenv("LTX2_CHECKPOINT_ROOT");
+  if (root_env == nullptr) {
+    MESSAGE("SKIPPED: set LTX2_CHECKPOINT_ROOT to the Lightricks/LTX-2.5 tree to run this");
+    return;
+  }
+  const std::string root = root_env;
 
   SUBCASE("the Conv video VAE loads and configures from its own metadata") {
     const std::string path = root + "/vae/ltx-2.5-video-vae-conv-bf16.safetensors";
@@ -1032,6 +1490,34 @@ TEST_CASE("ltx2 video: the SHIPPED Lightricks checkpoints parse and load") {
     // upstream's SDOps drop it.
     CHECK(!weights.Has("encoder.conv_in.conv.weight"));
     MESSAGE("shipped conv video VAE: " << weights.tensors.size() << " decoder tensors");
+
+    // ...and the ENCODER half of the SAME file resolves through the other
+    // filter (row LTX25-IMAGE-COND, #644). This is the only place the encoder
+    // load path meets a real shipped checkpoint rather than the fixture, so it
+    // is the only place the CHANNEL arithmetic can be wrong in a way the fixture
+    // agrees with: `latent_channels` is 128 while the top-level `out_channels`
+    // is 3, and reading the second builds a 3-channel-latent encoder that runs.
+    REQUIRE(vllm::Ltx2CheckpointHasVideoEncoder(file.Names()));
+    const vllm::Ltx2ConvVideoEncoderConfig enc =
+        vllm::Ltx2ParseConvVideoEncoderConfig(vllm::Ltx2ReadCheckpointConfig(file));
+    CHECK(enc.out_channels == 128);
+    CHECK(enc.in_channels == 3);
+    CHECK(enc.patch_size == cfg.patch_size);
+    // The encoder's block list must multiply out to the SAME scale factors the
+    // decoder's does, or an encoded image does not fit the grid it is placed in.
+    CHECK(vllm::Ltx2VideoSpatialScaleFactor(enc.encoder_blocks, enc.patch_size) == spatial);
+    CHECK(vllm::Ltx2VideoTemporalScaleFactor(enc.encoder_blocks) == temporal);
+    const vllm::Ltx2VaeWeights enc_weights =
+        vllm::Ltx2LoadVaeWeights(file, vllm::Ltx2VideoVaeEncoderKeyRules());
+    CHECK(enc_weights.Has("conv_in.conv.weight"));
+    CHECK(enc_weights.Has("conv_out.conv.weight"));
+    // The encoder normalizes its output by these (video_vae.py:336), so the
+    // filter has to carry them even though they are not `encoder.*` keys.
+    CHECK(enc_weights.Has("per_channel_statistics.std-of-means"));
+    // And the DECODER's half must be dropped, or the two bags would collide on
+    // names like `conv_in.conv.weight` and bind half a model to the other half.
+    CHECK(!enc_weights.Has("decoder.conv_in.conv.weight"));
+    MESSAGE("shipped conv video VAE: " << enc_weights.tensors.size() << " encoder tensors");
   }
 
   SUBCASE("the audio VAE and its BWE vocoder load and configure") {
@@ -1090,6 +1576,116 @@ TEST_CASE("ltx2 video: the SHIPPED Lightricks checkpoints parse and load") {
     INFO("first missing: " << first_missing);
     CHECK(missing == 0);
     MESSAGE("shipped upsampler: " << weights.tensors.size() << " tensors");
+  }
+}
+
+// ─── the payload has NO alignment guarantee (issue #674) ────────────────────
+//
+// A tensor's first byte sits at `8 + <JSON header length> + <sum of the
+// preceding tensors' sizes>`. Not one of those three terms is required to be
+// even, so a BF16 tensor beginning on an ODD address is an ordinary safetensors
+// file and not a corrupt one. `Ltx2LoadVaeWeights` formed a `const uint16_t*`
+// over that address and dereferenced it, which is undefined behaviour on every
+// target and a real fault on the strict-alignment ones this project builds for
+// (`build-test-cpu-arm64`, Jetson/Orin sm_110). UBSan reported it as
+//
+//   ltx2_loader.cpp:1288:91: runtime error: load of misaligned address ...
+//   for type 'const uint16_t', which requires 2 byte alignment
+//
+// and the `sanitize-cpu (address,undefined)` lane had been red on it since
+// `cefacd2d0`. Third recurrence of one class: #301 (closed, and the source of
+// the `vt::LoadUnaligned` seam) and #627 (`qwen3_5_weights.cpp`) are the others,
+// and `minimax_h3_vae_loader.cpp:87-101` already carries the repair AND the
+// reason in prose.
+//
+// WHY THIS CASE EXISTS AT ALL, given the suite above already reached the defect:
+// it reached it BY ACCIDENT. `ltx2_fixture`'s JSON header happens to land one
+// VAE tensor on an odd byte today, and any rename or reshape in that fixture
+// silently retires the coverage while leaving every assertion green. So here the
+// odd offset is FORCED, and the parity it depends on is ASSERTED — an edit that
+// makes the address even fails the REQUIRE instead of passing while covering
+// nothing.
+namespace {
+
+// A bare temp directory. Deliberately NOT `Workspace`: writing the whole LTX-2.5
+// fixture here would make this case depend on the very fixture whose accidental
+// coverage it exists to replace.
+struct TempDir {
+  std::string root;
+  TempDir() {
+    static int counter = 0;
+    root = "/tmp/vllm_ltx2_align_" + std::to_string(::getpid()) + "_" +
+           std::to_string(counter++);
+    ::mkdir(root.c_str(), 0755);
+  }
+  ~TempDir() {
+    const int rc = std::system(("rm -rf '" + root + "'").c_str());
+    (void)rc;
+  }
+};
+
+// safetensors written by hand, so the header length — and with it the payload's
+// parity — is ours to choose. `header_pad` spaces are appended INSIDE the
+// counted header; trailing whitespace is legal JSON and padding the header is
+// exactly how real writers align their payloads. Returns the absolute file
+// offset of the single tensor's first byte.
+size_t WriteOneBf16Safetensors(const std::string& path, const std::string& name,
+                               const std::vector<float>& values, size_t header_pad) {
+  std::string header = "{\"" + name + "\":{\"dtype\":\"BF16\",\"shape\":[" +
+                       std::to_string(values.size()) + "],\"data_offsets\":[0," +
+                       std::to_string(values.size() * sizeof(uint16_t)) + "]}}";
+  header.append(header_pad, ' ');
+  std::string payload;
+  for (const float v : values) {
+    const uint16_t b = ltx2_fixture::F32ToBf16(v);
+    payload.append(reinterpret_cast<const char*>(&b), sizeof(b));
+  }
+  std::string out;
+  const uint64_t len = header.size();
+  for (int i = 0; i < 8; ++i) out.push_back(static_cast<char>((len >> (8 * i)) & 0xFFU));
+  out += header;
+  out += payload;
+  ltx2_fixture::WriteFileBytes(path, out);
+  return 8 + header.size();
+}
+
+}  // namespace
+
+TEST_CASE("ltx2 VAE weights load from an ODD safetensors payload offset (#674)") {
+  TempDir ws;
+  // Values chosen so every one survives a bf16 store EXACTLY, which is what lets
+  // the check below be equality rather than a tolerance: a wrong-by-one-byte
+  // read is then a hard failure and not something a band could absorb.
+  const std::vector<float> values = {1.0F, -2.0F, 0.5F, 384.0F, -0.125F, 3.0F, -48.0F};
+  const std::string name = "decoder.conv_in.conv.weight";
+
+  // The unpadded header lands the payload on some parity; one space flips it.
+  // Write both and keep whichever is ODD, so this does not depend on the exact
+  // length of the JSON above.
+  const std::string a = ws.root + "/odd_offset_a.safetensors";
+  const std::string b = ws.root + "/odd_offset_b.safetensors";
+  const size_t off_a = WriteOneBf16Safetensors(a, name, values, 0);
+  const size_t off_b = WriteOneBf16Safetensors(b, name, values, 1);
+  REQUIRE((off_a % 2) != (off_b % 2));
+  const std::string path = (off_a % 2 == 1) ? a : b;
+
+  const vllm::SafetensorsFile file = vllm::SafetensorsFile::Open(path);
+  // The fixture really is what this case claims: the tensor's mapped address is
+  // ODD, so the loader below cannot satisfy a `uint16_t`'s alignment by luck.
+  // Page-aligned mmap base means file-offset parity IS address parity, but assert
+  // the address rather than infer it.
+  REQUIRE((reinterpret_cast<uintptr_t>(file.Get(name).data) % 2) == 1);
+
+  const vllm::Ltx2VaeWeights weights =
+      vllm::Ltx2LoadVaeWeights(file, vllm::Ltx2VideoVaeDecoderKeyRules());
+  // `decoder.` is rewritten away by the video-VAE rules, exactly as upstream's
+  // SDOps do.
+  REQUIRE(weights.Has("conv_in.conv.weight"));
+  const std::vector<float>& got = weights.Get("conv_in.conv.weight");
+  REQUIRE(got.size() == values.size());
+  for (size_t i = 0; i < values.size(); ++i) {
+    INFO("element " << i);
+    CHECK(got[i] == doctest::Approx(values[i]).scale(0.0));
   }
 }
 
@@ -1164,6 +1760,78 @@ TEST_CASE("ltx2 video: the render READS the checkpoint's connector weights") {
   // ...and the same render twice is byte-identical, which is what makes the
   // inequality above a statement about the connector rather than about noise.
   CHECK(RenderBytes(a, ws.root + "/conn_a2") == frames_a);
+}
+
+// ─── the keyframe marker, measured at the PIXELS ────────────────────────────
+//
+// WHY THIS CASE EXISTS, and it is not a duplicate of the DiT-level goldens.
+// Every other check in this file is RELATIVE — `digest != digest`, `absmax > 0`,
+// "the frames are not one flat value" — and none of them is anchored to what the
+// render is SUPPOSED to contain. That is why a defect measured on this head was
+// invisible: the engine builds `video.keyframes_mask` unconditionally, and the
+// guard beside it asserts the VECTOR is populated, so making the mask
+// conditional REDs 11 cases here while making the HANDOVER conditional — one
+// line lower, `if (wants_image) vin.keyframes_mask = ...` — compiled clean and
+// left all five LTX-2.5 suites GREEN. The pixels moved (frame 0 flat 127 → flat
+// 130) and nothing in the tree said so.
+//
+// The fix in `ltx2_video.cpp` closes that one line. THIS CASE CLOSES THE CLASS,
+// because it does not look at any line: it compares a render whose DiT carries
+// the parameter against a render whose DiT does not, on a request with NO image
+// and NO keyframe — upstream's unconditional case. Any route by which the
+// trained term fails to reach the forward collapses the two renders into one and
+// REDs here, whether the drop is in the mask, the handover, the binding, or the
+// add.
+//
+// The two checkpoints differ in exactly one thing. `Param()` seeds every tensor
+// from its own NAME, so dropping `keyframes_abs_pos_embedding` from the contract
+// perturbs no other value; the DiT config's flag follows the shapes because both
+// come from the same `Ltx2DitParams`.
+TEST_CASE("ltx2 video: the keyframe marker reaches the PIXELS with no image supplied") {
+  Workspace ws;
+  const vllm::Ltx2DitParams marked = ltx2_fixture::ReducedDitParams();
+  // The fixture's own default, asserted rather than assumed: with the flag off
+  // this whole case would compare two identical renders and pass vacuously.
+  REQUIRE(marked.use_keyframes_abs_pos_embedding);
+
+  vllm::Ltx2DitParams unmarked = marked;
+  unmarked.use_keyframes_abs_pos_embedding = false;
+  const std::string unmarked_dit = ws.root + "/dit_no_keyframes.safetensors";
+  ltx2_fixture::WriteReducedDit(unmarked, unmarked_dit, ltx2_fixture::ReducedDitOptions{});
+
+  vllm::multimodal::VideoModelParams with_marker = FixtureParams(ws.paths);
+  vllm::multimodal::VideoModelParams without_marker = with_marker;
+  without_marker.dit_path = unmarked_dit;
+
+  // `FixtureGen` supplies no image and no keyframe, which is the whole point:
+  // upstream marks the first latent frame "independently of whether any keyframe
+  // slots exist" (tools.py:186-196). A port that marked it only when something
+  // was conditioned would be silently wrong on every plain text-to-video render,
+  // and that is the render this case takes.
+  const std::string with = RenderBytes(with_marker, ws.root + "/kf_marked");
+  const std::string without = RenderBytes(without_marker, ws.root + "/kf_unmarked");
+  REQUIRE(with.size() == without.size());
+
+  size_t differing = 0;
+  for (size_t i = 0; i < with.size(); ++i) {
+    if (with[i] != without[i]) ++differing;
+  }
+  MESSAGE("keyframe marker moves " << differing << " of " << with.size()
+                                   << " artifact bytes");
+  // Strictly greater than zero, and no count floor above it. A count-based
+  // tolerance would bound nothing — it would red on unrelated numerical drift and
+  // still admit a term applied to the wrong frame — and the frame the marker
+  // belongs on is gated by the DiT goldens, which mark one frame and check the
+  // others are untouched. What this case owns is the ENGINE-to-PIXEL route, and
+  // for that the question is binary: did the trained term reach the render at
+  // all.
+  CHECK_MESSAGE(differing > 0,
+                "the DiT that carries keyframes_abs_pos_embedding rendered the same bytes as the "
+                "DiT that does not, so the trained term never reached the forward");
+
+  // ...and the same DiT twice is byte-identical, which is what makes the
+  // inequality a statement about the marker rather than about noise.
+  CHECK(RenderBytes(with_marker, ws.root + "/kf_marked2") == with);
 }
 
 TEST_CASE("ltx2 video: the connector's positional bound comes from the CONFIG") {
@@ -1681,11 +2349,17 @@ TEST_CASE("ltx2 video: a trace for a render that never completed says so") {
   // was never produced, and every field would look entirely healthy: real
   // prompt, non-zero absmax, plausible digests.
   //
-  // THE PROBE IS A REAL REFUSAL, not an injected one. Keyframe / reference
-  // conditioning is refused by name (ltx2_video.cpp, the `ImageConditioner`
-  // note) and that refusal sits AFTER the trace is written, so a prompted
-  // request carrying a reference image walks the whole encode path, fills the
-  // trace, and then fails — exactly the shape this flag exists to report.
+  // THE PROBE IS A REAL REFUSAL, not an injected one. Reference conditioning is
+  // refused by name (ltx2_video.cpp, the `ImageConditioner` note) and that
+  // refusal sits AFTER the trace is written, so a prompted request carrying a
+  // reference image walks the whole encode path, fills the trace, and then
+  // fails — exactly the shape this flag exists to report.
+  //
+  // IT IS STILL A REFUSAL AFTER ROW LTX25-IMAGE-COND (#644), which served the
+  // first-frame arm and would have made a `first_frame_ppm` probe stop
+  // refusing. The reference arm stays refused for a reason this row did not
+  // touch (the IC-LoRA scale factors), so the probe was moved to it rather than
+  // to whatever happened to still throw.
   Workspace ws;
   const vllm::multimodal::VideoModelParams mp = EncoderParams(ws.paths);
   const std::unique_ptr<vllm::multimodal::VideoEngine> engine =
@@ -1698,11 +2372,11 @@ TEST_CASE("ltx2 video: a trace for a render that never completed says so") {
   gen.ref_image_paths.push_back(ws.root + "/nonexistent-reference.png");
   try {
     (void)engine->Generate(gen);
-    FAIL("keyframe / reference conditioning must be refused");
+    FAIL("reference conditioning must be refused");
   } catch (const std::exception& e) {
     const std::string msg = e.what();
     INFO(msg);
-    CHECK(msg.find("reference conditioning") != std::string::npos);
+    CHECK(msg.find("reference-image / reference-video conditioning") != std::string::npos);
   }
 
   const vllm::multimodal::Ltx2ConditioningTrace trace = ltx->last_conditioning();

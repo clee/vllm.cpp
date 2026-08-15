@@ -109,7 +109,138 @@ vllm_cpp_add_test(test_gguf_qwen36_loader vllm/test_gguf_qwen36_loader.cpp)
 vllm_cpp_add_test(test_gguf_keep_quant vllm/test_gguf_keep_quant.cpp)
 vllm_cpp_add_test(test_model_loader_gguf vllm/test_model_loader_gguf.cpp)
 vllm_cpp_add_test(test_model_registry vllm/models/test_model_registry.cpp)
+vllm_cpp_add_test(test_vocoder1d vllm/models/test_vocoder1d.cpp)
+vllm_cpp_add_test(test_speech_engine vllm/multimodal/test_speech_engine.cpp)
+vllm_cpp_add_test(test_indextts2_family vllm/models/test_indextts2_family.cpp)
+vllm_cpp_add_test(test_campplus vllm/models/test_campplus.cpp)
+vllm_cpp_add_test(test_emovec vllm/models/test_emovec.cpp)
+vllm_cpp_add_test(test_w2vbert vllm/models/test_w2vbert.cpp)
+vllm_cpp_add_test(test_fvq vllm/models/test_fvq.cpp)
+vllm_cpp_add_test(test_codec_encoder vllm/models/test_codec_encoder.cpp)
+vllm_cpp_add_test(test_w2v_fbank vllm/models/test_w2v_fbank.cpp)
+vllm_cpp_add_test(test_wavenet vllm/models/test_wavenet.cpp)
+vllm_cpp_add_test(test_dit_tail vllm/models/test_dit_tail.cpp)
+vllm_cpp_add_test(test_dit_skip vllm/models/test_dit_skip.cpp)
+vllm_cpp_add_test(test_dit_front vllm/models/test_dit_front.cpp)
+vllm_cpp_add_test(test_dit_stack vllm/models/test_dit_stack.cpp)
+vllm_cpp_add_test(test_bigvgan vllm/models/test_bigvgan.cpp)
+vllm_cpp_add_test(test_indextts2_s2mel_loader vllm/models/test_indextts2_s2mel_loader.cpp)
+vllm_cpp_add_test(test_indextts2_render vllm/models/test_indextts2_render.cpp)
+vllm_cpp_add_test(test_indextts2_e2e vllm/models/test_indextts2_e2e.cpp)
+vllm_cpp_add_test(test_indextts2_talker_loader vllm/models/test_indextts2_talker_loader.cpp)
+vllm_cpp_add_test(test_vocos vllm/models/test_vocos.cpp)
+vllm_cpp_add_test(test_lenreg vllm/models/test_lenreg.cpp)
+vllm_cpp_add_test(test_cfm vllm/models/test_cfm.cpp)
+vllm_cpp_add_test(test_adaln vllm/models/test_adaln.cpp)
+vllm_cpp_add_test(test_dit vllm/models/test_dit.cpp)
+vllm_cpp_add_test(test_talker vllm/models/test_talker.cpp)
+vllm_cpp_add_test(test_tiktoken_bpe vllm/models/test_tiktoken_bpe.cpp)
+vllm_cpp_add_test(test_indextts2_pipeline vllm/models/test_indextts2_pipeline.cpp)
+target_include_directories(test_dit PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
+target_include_directories(test_adaln PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
+target_include_directories(test_cfm PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
+target_include_directories(test_lenreg PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
+target_include_directories(test_vocos PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
+target_include_directories(test_fvq PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
+target_include_directories(test_codec_encoder PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
+target_include_directories(test_w2v_fbank PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
+target_include_directories(test_wavenet PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
+target_include_directories(test_dit_tail PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
+target_include_directories(test_dit_front PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
+target_include_directories(test_dit_stack PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
+target_include_directories(test_bigvgan PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
+target_include_directories(test_w2vbert PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
+target_include_directories(test_campplus PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
+vllm_cpp_add_test(test_gpt2 vllm/models/test_gpt2.cpp)
+target_include_directories(test_gpt2 PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
 vllm_cpp_add_test(test_minimax_h3 vllm/models/test_minimax_h3.cpp)
+# MiniMax-Music3 W1 (#672): the six-component diffusers-arm loader, gated against
+# the REAL checkpoint's headers (minimax_music3_manifest.inc, 1012 tensors, no
+# weight bytes) so CI never needs the 28.5 GB asset.
+vllm_cpp_add_test(test_minimax_music3_loader vllm/models/test_minimax_music3_loader.cpp)
+target_include_directories(test_minimax_music3_loader PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
+# MiniMax-Music3 W2+W3 (#672): the AUTOREGRESSIVE half — prompt assembly, the
+# semantic CFG logit pipeline, the learned 8-layer condition mix and the RVQ
+# depth decoder — against goldens produced by EXECUTING upstream's own classes at
+# reduced dimensions in float32 (minimax_music3_ar_goldens.inc, no weight bytes).
+# The full-scale bf16 companion is tests/parity/test_minimax_music3_ar_real.cpp.
+vllm_cpp_add_test(test_minimax_music3_ar vllm/models/test_minimax_music3_ar.cpp)
+target_include_directories(test_minimax_music3_ar PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
+# The FULL-SCALE companion: the REAL bf16 checkpoint driven on the REAL inputs,
+# against the committed oracle capture (frame_hiddens / condition_chunk0 /
+# rvq_codes). Checkpoint-gated on MUSIC3_CHECKPOINT or CHECKPOINT_ROOT; every
+# case emits a loud SKIP when the 28.5 GB asset is absent, so CI still compiles,
+# links and runs it.
+vllm_cpp_add_test(test_minimax_music3_ar_real parity/test_minimax_music3_ar_real.cpp)
+target_compile_definitions(test_minimax_music3_ar_real PRIVATE
+  MUSIC3_GOLDENS_DIR="${CMAKE_SOURCE_DIR}/tests/parity/goldens/minimax_music3_oracle")
+target_include_directories(test_minimax_music3_ar_real PRIVATE
+  ${CMAKE_SOURCE_DIR}/tests/parity)
+# MiniMax-Music3 W2's remainder (#672): the 8.6B `Qwen3ForCausalLM` forward
+# itself, driven through the ADDITIVE `Qwen3DenseModel::ForwardEmbeds` entry and
+# TEACHER-FORCED on the capture's own rvq_codes, against frame_hiddens[:, :4096].
+# Checkpoint-gated like its two siblings; every case emits a loud SKIP when the
+# 28.5 GB asset is absent, so CI still compiles, links and runs it. SEPARATE from
+# test_minimax_music3_ar_real because it stages 18.5 GB that gate does not need.
+vllm_cpp_add_test(test_minimax_music3_llm_real parity/test_minimax_music3_llm_real.cpp)
+target_compile_definitions(test_minimax_music3_llm_real PRIVATE
+  MUSIC3_GOLDENS_DIR="${CMAKE_SOURCE_DIR}/tests/parity/goldens/minimax_music3_oracle")
+target_include_directories(test_minimax_music3_llm_real PRIVATE
+  ${CMAKE_SOURCE_DIR}/tests/parity)
+# MiniMax-Music3 W4+W5 (#672): the ACOUSTIC half — the flow-matching DiT, the
+# FlowMatchEulerDiscreteScheduler with invert_sigmas, the CFG mix, the denoise
+# loop's window bookkeeping and the DAC Flow-VAE vocoder — against goldens
+# produced by EXECUTING upstream's own classes at reduced dimensions in float32
+# (minimax_music3_acoustic_goldens.inc, no weight bytes). The full-scale fp32
+# companion is tests/parity/test_minimax_music3_acoustic_real.cpp.
+vllm_cpp_add_test(test_minimax_music3_acoustic vllm/models/test_minimax_music3_acoustic.cpp)
+target_include_directories(test_minimax_music3_acoustic PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
+# The FULL-SCALE companion: the REAL fp32 2.4B DiT and 0.054B vocoder driven on
+# the REAL inputs, against the committed oracle capture (denoise_{first,last}_*,
+# vocoder_input_chunk0, waveform). Checkpoint-gated exactly as the AR one is;
+# every case emits a loud SKIP when the 28.5 GB asset is absent, so CI still
+# compiles, links and runs it.
+vllm_cpp_add_test(test_minimax_music3_acoustic_real
+  parity/test_minimax_music3_acoustic_real.cpp)
+target_compile_definitions(test_minimax_music3_acoustic_real PRIVATE
+  MUSIC3_GOLDENS_DIR="${CMAKE_SOURCE_DIR}/tests/parity/goldens/minimax_music3_oracle")
+target_include_directories(test_minimax_music3_acoustic_real PRIVATE
+  ${CMAKE_SOURCE_DIR}/tests/parity)
+# W6 (#672): the SPEECH-FAMILY seam, the request contract and the chunk plan.
+# Pure or synthetic-tree only, so it needs neither the checkpoint nor a golden.
+# W7 of #672 -- the QUANTIZED ARMS. Nothing here loads a quantized weight:
+# no quantized MiniMax-Music3 checkpoint is staged, and none is implemented.
+# What it gates is that every quantized format a user can obtain today is
+# DIAGNOSED BY NAME and refused, instead of surfacing as the generic
+# "missing seven diffusers directories" or as a shape mismatch on an
+# unrelated tensor. Needs no checkpoint and no network.
+vllm_cpp_add_test(test_minimax_music3_quant vllm/models/test_minimax_music3_quant.cpp)
+
+vllm_cpp_add_test(test_minimax_music3_speech vllm/models/test_minimax_music3_speech.cpp)
+# W6's FULL-SCALE companion: the pipeline TAIL driven on the shipped weights,
+# against the capture's own waveform, and the WAV the delivery path emits.
+# Checkpoint-gated with a loud SKIP, exactly as the W4/W5 real gate is.
+# W7 of #672 -- the ONE quantized arm that is implemented, against the REAL
+# pinned artifact (audio-cpp/MiniMax-Music3-GGUF @c36aaeed,
+# rvq_depth_decoder_q4_k.gguf, 406 MB). Skips loudly without it. Proves the
+# QUANTIZED PATH IS TAKEN (resident ggml types + the Q4_K lattice), not merely
+# that the numbers land inside a tolerance.
+vllm_cpp_add_test(test_minimax_music3_quant_real parity/test_minimax_music3_quant_real.cpp)
+target_compile_definitions(test_minimax_music3_quant_real PRIVATE
+  MUSIC3_GOLDENS_DIR="${CMAKE_SOURCE_DIR}/tests/parity/goldens/minimax_music3_oracle")
+
+vllm_cpp_add_test(test_minimax_music3_e2e_real parity/test_minimax_music3_e2e_real.cpp)
+target_compile_definitions(test_minimax_music3_e2e_real PRIVATE
+  MUSIC3_GOLDENS_DIR="${CMAKE_SOURCE_DIR}/tests/parity/goldens/minimax_music3_oracle"
+  # Where the e2e case writes the WAV it generated, so a human can listen to it.
+  # The BUILD tree, never the source tree: it is an artifact of a run and not a
+  # golden, and nothing under tests/parity/goldens/ is created or replaced.
+  BUILD_ARTIFACT_DIR="${CMAKE_BINARY_DIR}/music3")
+target_include_directories(test_minimax_music3_e2e_real PRIVATE
+  ${CMAKE_SOURCE_DIR}/tests/parity)
 # ARCH-ONE-SURFACE ROW 2 fold gate: the video seam == the replicated pre-fold
 # pipeline == the goldens the PRE-fold minimax-h3-gen binary rendered at the
 # branch base (frames + WAV byte-identical, mux argv pinned).
@@ -127,6 +258,13 @@ target_compile_definitions(test_video_engine PRIVATE
 # LTX-2.5 L7: the family behind the VideoEngine seam and the driving loop, run
 # over a reduced-dimension checkpoint set written in the SHIPPED file format.
 vllm_cpp_add_test(test_ltx2_video vllm/multimodal/test_ltx2_video.cpp)
+# LTX-2.5 image conditioning (row LTX25-IMAGE-COND, issue #644): the CHAIN from
+# PPM bytes to conditioned, noised tokens, gated against upstream ltx_core AND
+# ltx_pipelines executed at reduced dimensions. ltx2_image_cond_goldens.inc
+# lives next to the test source.
+vllm_cpp_add_test(test_ltx2_image_cond vllm/multimodal/test_ltx2_image_cond.cpp)
+target_include_directories(test_ltx2_image_cond
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vllm/multimodal)
 # LTX-2.5 DiT parity gate (row MODEL-DIFFUSION-LTX25, spec phase L2). The goldens
 # live next to the test source, like every other generated .inc.
 vllm_cpp_add_test(test_ltx2 vllm/models/test_ltx2.cpp)
@@ -139,6 +277,13 @@ vllm_cpp_add_test(test_ltx2_device vllm/models/test_ltx2_device.cpp)
 # dimensions. ltx2_vae_goldens.inc lives next to the test source.
 vllm_cpp_add_test(test_ltx2_vae vllm/models/test_ltx2_vae.cpp)
 target_include_directories(test_ltx2_vae PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
+# LTX25-TILED-DECODE (issue #644): the tiling algebra, the AUTO layout and the
+# STREAMING tiled decode, gated against upstream ltx_core executed at reduced
+# dimensions. Its own target so the decode arms — which run the reduced decoder 18
+# times per arm — do not lengthen test_ltx2_vae's recorded case count.
+# ltx2_tiling_goldens.inc lives next to the test source.
+vllm_cpp_add_test(test_ltx2_tiling vllm/models/test_ltx2_tiling.cpp)
+target_include_directories(test_ltx2_tiling PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
 # LTX-2.5 L3: the text conditioning path, gated against upstream ltx_core executed
 # at reduced dimensions. ltx2_text_goldens.inc lives next to the test source.
 vllm_cpp_add_test(test_ltx2_text_encoder vllm/models/test_ltx2_text_encoder.cpp)
@@ -156,6 +301,7 @@ target_include_directories(test_ltx2_pipeline PRIVATE ${CMAKE_CURRENT_SOURCE_DIR
 vllm_cpp_add_test(test_ltx2_loader vllm/models/test_ltx2_loader.cpp)
 target_include_directories(test_ltx2_loader PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
 vllm_cpp_add_test(test_video_api vllm/entrypoints/openai/test_video_api.cpp)
+vllm_cpp_add_test(test_speech_api vllm/entrypoints/openai/test_speech_api.cpp)
 target_include_directories(test_model_registry PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_platform vllm/platforms/test_platform.cpp)
 vllm_cpp_add_test(test_device_selection
@@ -218,6 +364,28 @@ foreach(_gateup_lever VT_DENSE_MARLIN_GATEUP VT_NVFP4_MARLIN VT_MOE_FUSED_W13)
     PROPERTIES ENVIRONMENT "${_gateup_lever}=0")
 endforeach()
 vllm_cpp_add_test(test_qwen35_plain_weights vllm/models/test_qwen35_plain_weights.cpp)
+# UNALIGNED SAFETENSORS PAYLOADS (#772, fourth recurrence after #301/#627/#674).
+# The four loaders that formed a `const uint16_t*` over an mmap'd tensor, driven
+# over checkpoints whose payload parity is FORCED odd by one space of JSON header
+# padding. Two of the four launder every access through `memcpy`, so UBSan cannot
+# see them and only these value checks can — which is why this is a suite of its
+# own and not another sanitizer sweep.
+vllm_cpp_add_test(test_loader_unaligned_offsets
+  vllm/models/test_loader_unaligned_offsets.cpp)
+# The two Voxtral loader steps are declared in an INTERNAL header (src/, not
+# include/): they are not public ABI and must not become so for a test's sake.
+target_include_directories(test_loader_unaligned_offsets PRIVATE
+  ${CMAKE_SOURCE_DIR}/src)
+vllm_cpp_add_test(test_qwen3_8_text_only vllm/models/test_qwen3_8_text_only.cpp)
+# The PUBLISHED `Qwen/Qwen3.8-2.4T-A95B` config.json, committed VERBATIM, so the
+# config-resolution case reads the real document (nested `rope_parameters`, 92
+# `layer_types`, transformers-4.57.3 `dtype`) instead of a paraphrase of it.
+# Its `model.safetensors.index.json` (1609 tensors, 213 shards, 4.89 TB) is
+# committed the same way, so the load-plan dry run resolves every name against
+# the real document rather than a summary of it (#740).
+target_compile_definitions(test_qwen3_8_text_only PRIVATE
+  QWEN3_8_CONFIG_FIXTURE="${CMAKE_CURRENT_SOURCE_DIR}/vllm/models/fixtures/qwen3_8_2_4t_a95b/config.json"
+  QWEN3_8_INDEX_FIXTURE="${CMAKE_CURRENT_SOURCE_DIR}/vllm/models/fixtures/qwen3_8_2_4t_a95b/model.safetensors.index.json")
 # POOL-DEVICE-KEY (#516, .agents/specs/pool-device-key.md): the shared scratch
 # pool's free list must be keyed by DEVICE as well as size class, or a block
 # allocated through one backend is handed to a DBuf running on another —
@@ -462,6 +630,65 @@ target_compile_definitions(test_nemotron_h_scaffold PRIVATE
 # (#515). Same call as the W1 resolver header.
 target_include_directories(test_nemotron_h_scaffold PRIVATE
   ${CMAKE_SOURCE_DIR}/tests/parity ${CMAKE_SOURCE_DIR}/src)
+
+# Nemotron-H W4 FORWARD gate (#517, .agents/specs/nemotron-h-model.md §4 W4): the
+# hybrid layer loop over all three block kinds, every block compared ELEMENTWISE
+# against a reference written independently in `double` from the upstream
+# formulas — not against a second call of the code under test, and not through a
+# helper both arms share. Both dtype arms (f32 and the released bf16) on every
+# case; a LONG-prompt arm as well as a short one, because only 6 of 52 layers are
+# attention; the SSD chunk-size invariance; the SSM state dtype carried across
+# two legs, which is the only way it is observable at all; the routed scale on
+# the OUTPUT rather than the router weights or logits; the f32 router; and the
+# no-RoPE finding. CPU-only, no checkpoint, no speed claim.
+vllm_cpp_add_test(test_nemotron_h_forward vllm/models/test_nemotron_h_forward.cpp)
+# nemotron_h.h / nemotron_h_forward.h are MODEL-PRIVATE headers under src/, not
+# include/vllm/: W4 ships nothing on the public ABI and include/vllm/ is a
+# USER_USAGE_PREFIXES surface (#515). Same call as the W1 resolver header.
+target_include_directories(test_nemotron_h_forward PRIVATE ${CMAKE_SOURCE_DIR}/src)
+
+# Nemotron-H WEIGHT LOADER gate (#517, .agents/specs/nemotron-h-model.md §5b and
+# §6b "Still owed after W4"): materializes the 18487 released tensors from the
+# REAL 20.1 GiB checkpoint and runs the registered forward on them. Gated
+# STRUCTURALLY, not by tokens — every tensor materialized or deferred BY NAME,
+# the per-scheme composition (5935 NVFP4 W4A16 g16 triples + 46 FP8 W8A8 static
+# triples + the bf16/f32 remainder) asserted against the checkpoint's own memory
+# format, and the loaded dtypes asserted to be the SHIPPED ones rather than
+# wider. The checkpoint resolves through the CONTENT-pinned
+# parity::Nemotron35LightningSnapshot (#569) and the gate SKIPS loudly when it is
+# absent -- a NAMED, COUNTED skip with a closing accounting case, because a skip
+# that prints `Passed 0.00 sec` with zero assertions is indistinguishable from a
+# real pass -- so CI never needs the NAS asset. Not the W6 token gate and no
+# speed claim: it consumes the committed oracle.json for ONE forward per prompt
+# and the argmax of the last position against that prompt's FIRST token; the
+# full 32-token greedy decode stays W6's.
+vllm_cpp_add_test(test_nemotron_h_loader vllm/models/test_nemotron_h_loader.cpp)
+target_compile_definitions(test_nemotron_h_loader PRIVATE
+  NEMOTRON_H_GOLDENS_DIR="${CMAKE_CURRENT_SOURCE_DIR}/parity/goldens/nemotron_35_lightning_greedy")
+# nemotron_h.h / nemotron_h_loader.h are MODEL-PRIVATE headers under src/, not
+# include/vllm/ (#515); tests/parity carries the content-pinned snapshot
+# resolver.
+target_include_directories(test_nemotron_h_loader PRIVATE
+  ${CMAKE_SOURCE_DIR}/tests/parity ${CMAKE_SOURCE_DIR}/src)
+
+# Nemotron-H MIXED_PRECISION MEMORY FORMS, OFFLINE (#517,
+# .agents/specs/nemotron-h-model.md §6d). The loader's design claim — every
+# weight held in the format it SHIPS in, widened only TRANSIENTLY at the GEMM
+# call site — lived entirely behind the 20.1 GiB checkpoint gate above, so on a
+# runner with no CHECKPOINT_ROOT it was not executed at all: deleting
+# NemotronHOwned::View's refusal left the whole suite green. This gate needs NO
+# checkpoint and therefore runs on EVERY arm. It asserts that View REFUSES a
+# non-dense weight by name, and that DenseBf16 reproduces a dequant derived
+# INDEPENDENTLY from the upstream ModelOpt formula — the nibble order, the
+# per-16 group scale, the multiplied weight_scale_2, and the FP8 input_scale
+# that is carried and NOT applied. Those are exactly §6d's M4/M5 defects, which
+# leave every structural count correct. CPU-only, no golden, no speed claim.
+vllm_cpp_add_test(test_nemotron_h_quantized_forms
+  vllm/models/test_nemotron_h_quantized_forms.cpp)
+# nemotron_h.h / nemotron_h_forward.h are MODEL-PRIVATE headers under src/, not
+# include/vllm/ (#515).
+target_include_directories(test_nemotron_h_quantized_forms PRIVATE
+  ${CMAKE_SOURCE_DIR}/src)
 
 # Kimi-Linear CPU REFERENCE FORWARD gates (W2-W6): the per-op reference forwards
 # (KDA layer vs the kimi_kda host-ref composition; NoPE-MLA vs a materialized-MHA
@@ -740,6 +967,16 @@ vllm_cpp_add_test(test_speculative_draft_max_position_embeddings
 # SPEC-DSPARK W1: the DSpark config slice (method acceptance, block-size floor,
 # lookahead slots, draft identity).
 vllm_cpp_add_test(test_speculative_dspark vllm/config/test_speculative_dspark.cpp)
+# ENG-MM-INPUT-PIPELINE L1 (#607): get_limit_per_prompt precedence —
+# language_model_only ⇒ 0 BEFORE the map, else the map, else the 999 default.
+vllm_cpp_add_test(test_multimodal_config vllm/config/test_multimodal_config.cpp)
+vllm_cpp_add_test(test_offload_config vllm/config/test_offload_config.cpp)
+vllm_cpp_add_test(test_weight_offloader vllm/model_executor/test_weight_offloader.cpp)
+vllm_cpp_add_test(test_weight_offload_policy vllm/model_executor/test_weight_offload_policy.cpp)
+# ENG-MM-INPUT-PIPELINE L1 (#607): the refusal those limits carry — the min()
+# fold against the model's own ceiling, upstream's exact message, and both call
+# sites with the enable_mm_embeds escape.
+vllm_cpp_add_test(test_processing_limits vllm/multimodal/test_processing_limits.cpp)
 vllm_cpp_add_test(test_request_queue vllm/v1/test_request_queue.cpp)
 vllm_cpp_add_test(test_sched_output vllm/v1/test_sched_output.cpp)
 vllm_cpp_add_test(test_scheduler vllm/v1/test_scheduler.cpp)
@@ -848,6 +1085,8 @@ vllm_cpp_add_test(test_longcat
   vllm/entrypoints/openai/tool_parsers/test_longcat.cpp)
 vllm_cpp_add_test(test_kimi_k2
   vllm/entrypoints/openai/tool_parsers/test_kimi_k2.cpp)
+vllm_cpp_add_test(test_tool_parser_inkling
+  vllm/entrypoints/openai/tool_parsers/test_inkling.cpp)
 vllm_cpp_add_test(test_granite_tool_parser
   vllm/entrypoints/openai/tool_parsers/test_granite_tool_parser.cpp)
 vllm_cpp_add_test(test_granite4_tool_parser
@@ -968,6 +1207,13 @@ if(VLLM_CPP_SERVER)
   vllm_cpp_add_test(test_serve_recipe_args
     vllm/entrypoints/openai/test_serve_recipe_args.cpp)
   target_include_directories(test_serve_recipe_args PRIVATE ${CMAKE_SOURCE_DIR}/src)
+  # ENG-MM-INPUT-PIPELINE wave L2 (#607): --language-model-only /
+  # --limit-mm-per-prompt. Same shape and the same reason as the row above — it
+  # re-execs the REAL VllmServerMain to observe the flags reaching the config and
+  # a malformed limit aborting before the load.
+  vllm_cpp_add_test(test_serve_mm_limits
+    vllm/entrypoints/openai/test_serve_mm_limits.cpp)
+  target_include_directories(test_serve_mm_limits PRIVATE ${CMAKE_SOURCE_DIR}/src)
 endif()
 vllm_cpp_add_test(test_outputs vllm/test_outputs.cpp)
 
@@ -1282,6 +1528,7 @@ vllm_cpp_add_test(test_ops_moe_grouped vt/test_ops_moe_grouped.cpp)
 vllm_cpp_add_test(test_ops_moe_grouped_bf16 vt/test_ops_moe_grouped_bf16.cpp)
 vllm_cpp_add_test(test_ops_moe_grouped_bf16_gate_up_silu
                   vt/test_ops_moe_grouped_bf16_gate_up_silu.cpp)
+vllm_cpp_add_test(test_ops_moe_nongated_relu2 vt/test_ops_moe_nongated_relu2.cpp)
 vllm_cpp_add_test(test_ops_rmsnorm vt/test_ops_rmsnorm.cpp)
 vllm_cpp_add_test(test_ops_fused_chain vt/test_ops_fused_chain.cpp)
 vllm_cpp_add_test(test_ops_layernorm vt/test_ops_layernorm.cpp)

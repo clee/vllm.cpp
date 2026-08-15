@@ -44,60 +44,6 @@
 //     attention.py:545-552 `perturbation_mask`). L2 runs the no-perturbation
 //     configuration, whose masks are all-ones and whose flags are all false —
 //     upstream's own `perturbations=None` path (model.py:509-511).
-//   - `use_keyframes_abs_pos_embedding` (transformer_args.py:23-43). The
-//     enumeration refuses a config that asks for it.
-//
-//     CORRECTED 2026-08-13 (issue #644). This line read "LTX-2.5's checkpoint
-//     does not carry the parameter", which is FALSE, and it is the same class of
-//     claim the prompt-AdaLN repair below exists to remove. The two shipped DiTs
-//     disagree with each other and each contradicts one half of it, read straight
-//     off their safetensors headers:
-//       * FP8 (`vonkaiser`, ltx-2.5-22b-distilled-fp8): CARRIES
-//         `keyframes_abs_pos_embedding` `F8_E4M3 [1, 4096]` plus its F32 scale,
-//         and declares NO `__metadata__` at all — so it ships no config, and
-//         upstream's own `LTXModelConfigurator.from_metadata` cannot configure it
-//         (run 2026-08-13: `KeyError: 'caption_channels'`, raised by
-//         `_build_caption_projections` on the empty dict, BEFORE the flag at
-//         model_configurator.py:82 is ever read). What that file's flag resolves
-//         to therefore depends on a config it does not ship.
-//       * NVFP4 (first-party Lightricks): DECLARES the flag `true` (at
-//         `config.transformer`, not at the top level) and does NOT carry the
-//         tensor — 0 of its 7876 entries match `keyframes_abs_pos`.
-//
-//         CORRECTED AGAIN 2026-08-13, same issue. This bullet said the parameter
-//         "stays its `torch.zeros(1, inner_dim)` initialiser (model.py:217-219)"
-//         and that `load_state_dict(..., strict=False)`
-//         (loader/single_gpu_model_builder.py:98) "leaves it zero — a no-op".
-//         IT IS NOT A NO-OP. That quote dropped the `assign=True` that is ON THE
-//         SAME LINE, and upstream builds on the META DEVICE — helpers.py:84-95,
-//         `create_meta_model`, `with torch.device("meta"):
-//         configurator.from_metadata(...)` at :90-91. A key absent from the state
-//         dict is never materialised at all. What this path leaves is an
-//         UNMATERIALISED META PARAMETER, not a silent zero.
-//         RUN 2026-08-13 through upstream's own `create_meta_model` on this
-//         file's real `__metadata__`: `[1, 4096]` f32 `device=meta`; after
-//         `load_state_dict(sd, strict=False, assign=True)` still `is_meta=True`,
-//         present in `missing_keys`, and reading it raises `RuntimeError:
-//         Tensor.item() cannot be called on meta tensors`.
-//         Upstream states this itself and then never asks:
-//         `supports_keyframes_abs_pos_embedding` (model.py:166-173) returns FALSE
-//         for "a model whose config set the flag but whose checkpoint carried no
-//         weight for it (the parameter would still be on `meta`)" (:170), and
-//         `enable_keyframes_abs_pos_embedding` (model.py:175-200) exists because
-//         such a parameter "would fail at the first forward" (:182). BOTH ARE
-//         DEFINED AND NEVER CALLED — one `grep -rn` hit each across the whole
-//         Lightricks/LTX-2 checkout at fd4ded7f, the definition itself.
-//         Polarity is not what fails: `apply_keyframes_absolute_embedding` is
-//         `hidden_states + mask * embedding` (transformer_args.py:23-43, the sum
-//         at :43), so REAL zeros would be inert. The claim fails on `meta`, not
-//         on additivity.
-//         This STRENGTHENS the refusals below rather than changing them: this
-//         file is refused by FLAG in `ParseLtx2DitParams` (ltx2.cpp:192-198) and
-//         the FP8 file by TENSOR PRESENCE, and upstream's own guard would report
-//         a model loaded this way as not supporting the feature at all.
-//     It is also NOT a keyframe-only feature: `transformer_args.py:269` applies it
-//     on EVERY prepare whenever `keyframes_mask` is non-None, and `tools.py:186-196`
-//     marks the target's first latent frame unconditionally.
 //   - The caption projections (text_projection.py:31-38). LTX-2.5 is a 22B-form
 //     checkpoint: `caption_proj_before_connector=true` puts them in the TEXT
 //     ENCODER, so the DiT has none (model_configurator.py:199-219). They are
@@ -110,6 +56,15 @@
 // model_configurator.py:76/:138, diffusers transformer_ltx2.py:1185) and the
 // shipped DiT carries the module's tensors. See
 // .agents/specs/ltx25-prompt-adaln.md and issue #644.
+//
+// PORTED 2026-08-14 — `keyframes_abs_pos_embedding` (model.py:217-219,
+// transformer_args.py:23-43 called once at :269), which this list previously
+// carried as unported on the strength of "LTX-2.5's checkpoint does not carry
+// the parameter". THAT WAS FALSE for the shipped vonkaiser FP8 DiT, which
+// carries it `F8_E4M3 [1, 4096]` with an `F32` scale and 4096 of 4096 bytes
+// NON-ZERO — a trained bias added to every token of the target's first latent
+// frame, on every forward. See .agents/specs/ltx25-keyframes-abs-pos.md and
+// issue #658.
 #pragma once
 
 #include <cstdint>
@@ -180,6 +135,23 @@ struct Ltx2DitParams {
   // audio_ff_bias at its true default; the checkpoint's shapes agree.
   bool ff_bias = true;
   bool audio_ff_bias = true;
+  // model_configurator.py:82/:142 (`config.get("use_keyframes_abs_pos_embedding",
+  // False)`) and model.py:80/:101. When set, `_init_video` builds a
+  // `(1, inner_dim)` parameter (model.py:217-219) that the VIDEO preprocessor —
+  // and only the video one (model.py:314 supplies the provider, :333 does not) —
+  // adds to every token the keyframes mask marks.
+  //
+  // RESOLVED, NOT MERELY DECLARED. This field means what
+  // `supports_keyframes_abs_pos_embedding` (model.py:166-173) means: the model has
+  // a USABLE embedding. A config that declares the flag over a checkpoint carrying
+  // no tensor is upstream-LEGAL and resolves FALSE here, because upstream builds
+  // on the meta device (loader/helpers.py:84-95) and loads with
+  // `strict=False, assign=True`, so the absent parameter stays on `meta` and the
+  // add is never reached. That is the shipped first-party NVFP4 DiT exactly, and
+  // it is why `Ltx2AdoptDeclaredDitParams` clears the declared flag rather than
+  // refusing the file or synthesising a zero. See
+  // .agents/specs/ltx25-keyframes-abs-pos.md §2.
+  bool use_keyframes_abs_pos_embedding = false;
 
   int64_t inner_dim() const { return num_attention_heads * attention_head_dim; }
   int64_t audio_inner_dim() const { return audio_num_attention_heads * audio_attention_head_dim; }
@@ -280,6 +252,10 @@ struct Ltx2DitWeights {
   // prompt K/V), NOT `adaln_embedding_coefficient()`. Left unbound otherwise.
   Ltx2AdaLayerNormSingleWeights prompt_adaln_single;
   Ltx2AdaLayerNormSingleWeights audio_prompt_adaln_single;
+  // model.py:217-219 — [1, dim], built and bound only when
+  // `use_keyframes_abs_pos_embedding` RESOLVES true (see that field). Left
+  // default-constructed otherwise, which is upstream's `None` provider result.
+  vt::Tensor keyframes_abs_pos_embedding;
   vt::Tensor scale_shift_table;  // [2, dim] — the OUTPUT table (:230), not the block's [9, dim]
   Ltx2LinearWeight audio_patchify_proj, audio_proj_out;
   Ltx2AdaLayerNormSingleWeights audio_adaln_single;
@@ -484,6 +460,28 @@ struct Ltx2ModalityInput {
   // bias exactly as _prepare_self_attention_mask does (transformer_args.py:208-237).
   const float* attention_mask = nullptr;
   int64_t attention_mask_rows = 0;  // `tokens` for the dense form, 1 for key-only
+  // Modality.keyframes_mask (modality.py:63), [batch, tokens] — upstream's
+  // (B, T, 1) with its trailing broadcast axis dropped, because the marker is
+  // per TOKEN and the embedding it selects is per channel.
+  //
+  // `nullptr` is upstream's `keyframes_mask is None`, which
+  // `apply_keyframes_absolute_embedding` short-circuits (transformer_args.py:37-38).
+  // Only the VIDEO stream ever carries one: `_init_preprocessors` gives the video
+  // preprocessor a `keyframes_embedding_provider` (model.py:314) and the audio one
+  // none (:333), so a mask on the audio input is REFUSED rather than applied.
+  //
+  // `_keyframes_embedding` is handed over at TWO sites, and BOTH are video. The
+  // `:314` above is the joint audio+video arm's `MultiModalTransformerArgsPreprocessor`;
+  // the video-ONLY arm builds a plain `TransformerArgsPreprocessor` and passes the
+  // same provider at `:349`. Their audio counterparts (`:316-334` and `:352-365`)
+  // take none. The split is by MODALITY, not by which arm ran, so a grep for the
+  // `:314` anchor that lands on `:349` has found the same rule, not a second one.
+  //
+  // The rule that fills it is `_first_frame_keyframes_mask` (tools.py:186-196) —
+  // the target's first latent frame, marked UNCONDITIONALLY, whether or not any
+  // keyframe was supplied. `Ltx2FirstFrameKeyframesMask` (ltx2_conditioning.h) is
+  // that rule; do not re-derive it at a call site.
+  const float* keyframes_mask = nullptr;
   bool enabled = true;              // Modality.enabled -> TransformerArgs.enabled
 };
 

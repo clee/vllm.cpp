@@ -256,6 +256,22 @@ inline vllm::Ltx2DitParams ReducedDitParams() {
   // than a configuration nothing ships, and the whole video engine renders
   // through the prompt-side AdaLN path (.agents/specs/ltx25-prompt-adaln.md).
   p.use_prompt_adaln_single = true;
+  // TRUE, exactly as the shipped vonkaiser FP8 DiT resolves it: that file carries
+  // `keyframes_abs_pos_embedding` `F8_E4M3 [1, 4096]` with 4096 of 4096 bytes
+  // NON-ZERO, so `supports_keyframes_abs_pos_embedding` (model.py:166-173) holds
+  // for it and the marker is live on every forward.
+  //
+  // THE FIXTURE CARRIES IT SO THE ENGINE PATH IS EXERCISED AT ALL. With the flag
+  // off, `Ltx2VideoEngine` never hands the DiT a marker, and a defect that made
+  // the marker CONDITIONAL — the one this module invites — was measured to leave
+  // all five LTX-2.5 suites green. With it on, every e2e render in this file goes
+  // through `apply_keyframes_absolute_embedding`
+  // (.agents/specs/ltx25-keyframes-abs-pos.md, issue #658).
+  //
+  // The first-party NVFP4 DiT is the OTHER case and is covered by its own
+  // env-gated test: it declares the flag and carries no tensor, which upstream's
+  // meta-device load turns into "apply nothing".
+  p.use_keyframes_abs_pos_embedding = true;
   p.ff_bias = false;                // LTX-2.5 (gemma4) sets ff_bias=false
   p.audio_ff_bias = true;
   return p;
@@ -402,6 +418,11 @@ inline nlohmann::json ReducedDitTransformerConfig(
   transformer["audio_cross_attention_dim"] = params.audio_cross_attention_dim;
   transformer["apply_gated_attention"] = params.apply_gated_attention;
   transformer["cross_attention_adaln"] = params.cross_attention_adaln;
+  // Written EXPLICITLY, because `Ltx2AdoptDeclaredDitParams` resolves this key
+  // against the file's shapes: a config that omitted it while the fixture writes
+  // the tensor would describe a different weight contract and be refused. The
+  // shipped first-party NVFP4 config declares it TRUE the same way.
+  transformer["use_keyframes_abs_pos_embedding"] = params.use_keyframes_abs_pos_embedding;
   transformer["ff_bias"] = params.ff_bias;
   transformer["rope_type"] = "split";
   transformer["use_middle_indices_grid"] = params.use_middle_indices_grid;
@@ -628,6 +649,55 @@ inline void WriteReducedVideoVae(const vllm::Ltx2ConvVideoDecoderConfig& cfg,
   put("conv_out.conv.weight", {patch_out, channels, 3, 3, 3}, 0.1);
   put("conv_out.conv.bias", {patch_out}, 0.05);
 
+  // ── the ENCODER half (row LTX25-IMAGE-COND, issue #644) ──────────────────
+  //
+  // A monolithic LTX-2 VAE file carries both halves and the two key filters
+  // separate them (video_vae/model_configurator.py:255-276). Before this row the
+  // fixture wrote the decoder alone, so nothing in this suite could have noticed
+  // that no encoder key filter existed — which is a fair description of how the
+  // gap survived.
+  //
+  // These are written under the BARE `encoder.` prefix rather than
+  // `vae.encoder.`, matching the shipped Comfy-split spelling and exercising the
+  // third of the four encoder rules; the decoder half above is likewise bare.
+  auto put_enc = [&](const std::string& name, const std::vector<int64_t>& shape, double scale,
+                     double offset = 0.0) {
+    int64_t numel = 1;
+    for (const int64_t d : shape) numel *= d;
+    entries.push_back(
+        {"encoder." + name, "BF16", shape, Param("ltx2.vvaeenc." + name, numel, scale, offset)});
+  };
+  // The FORWARD mirror of the decoder's block list, reduced to plain strided
+  // convolutions so the encoder runs at the latent width throughout. It must
+  // multiply out to the SAME (8, 32, 32) the pipeline derives every latent shape
+  // from, or an encoded image would not fit the grid it is placed into.
+  const std::vector<std::string> encoder_blocks = {
+      "res_x", "compress_space", "compress_time", "compress_all", "compress_all",
+  };
+  const int64_t latent = cfg.in_channels;
+  const int64_t patched_in = 3 * cfg.patch_size * cfg.patch_size;
+  put_enc("conv_in.conv.weight", {latent, patched_in, 3, 3, 3}, 0.1);
+  put_enc("conv_in.conv.bias", {latent}, 0.05);
+  for (size_t i = 0; i < encoder_blocks.size(); ++i) {
+    const std::string bp = "down_blocks." + std::to_string(i);
+    if (encoder_blocks[i] == "res_x") {
+      put_enc(bp + ".res_blocks.0.conv1.conv.weight", {latent, latent, 3, 3, 3}, 0.1);
+      put_enc(bp + ".res_blocks.0.conv1.conv.bias", {latent}, 0.05);
+      put_enc(bp + ".res_blocks.0.conv2.conv.weight", {latent, latent, 3, 3, 3}, 0.1);
+      put_enc(bp + ".res_blocks.0.conv2.conv.bias", {latent}, 0.05);
+    } else {
+      // The plain strided path reads `<block>.conv.weight`, NOT `.conv.conv.*`
+      // — that second spelling belongs to the `*_res` family's
+      // SpaceToDepthDownsample (ltx2_video_vae.cpp).
+      put_enc(bp + ".conv.weight", {latent, latent, 3, 3, 3}, 0.1);
+      put_enc(bp + ".conv.bias", {latent}, 0.05);
+    }
+  }
+  // `latent_log_var` defaults to `uniform`, so conv_out emits one extra channel
+  // and the mean split drops it (video_vae.py:308-315).
+  put_enc("conv_out.conv.weight", {latent + 1, latent, 3, 3, 3}, 0.1);
+  put_enc("conv_out.conv.bias", {latent + 1}, 0.05);
+
   nlohmann::json vae;
   vae["_class_name"] = "CausalVideoAutoencoder";
   vae["dims"] = 3;
@@ -651,6 +721,13 @@ inline void WriteReducedVideoVae(const vllm::Ltx2ConvVideoDecoderConfig& cfg,
     blocks.push_back(nlohmann::json::array({b.name, params}));
   }
   vae["decoder_blocks"] = blocks;
+  nlohmann::json enc_blocks = nlohmann::json::array();
+  for (const std::string& name : encoder_blocks) {
+    nlohmann::json params = nlohmann::json::object();
+    if (name == "res_x") params["num_layers"] = 1;
+    enc_blocks.push_back(nlohmann::json::array({name, params}));
+  }
+  vae["encoder_blocks"] = enc_blocks;
   nlohmann::json config;
   config["vae"] = vae;
   nlohmann::json metadata;
