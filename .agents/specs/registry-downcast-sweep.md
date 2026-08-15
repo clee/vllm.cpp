@@ -36,11 +36,19 @@ watching. The other 34 were latent by the same luck.
 `Prepare*`/`Forward*` whose first parameter is `LoadedModel& model`, and every
 site casts that same `model`. There is no `const`-reference spelling and no
 pointer spelling, so the grep is the whole class. 14 sites bind the result to a
-`const auto&`, 20 to a plain `auto&`; 29 are `forward` entry points and 5 are
-`prepare`.
+`const auto&` and 20 to a plain `auto&`; 30 are `forward` entry points and 4 are
+`prepare` (`gemma4_registry.cpp:104`, `qwen3_5_dense.cpp:109`,
+`qwen3_5_moe.cpp:91`, `qwen3_vl_registry.cpp:105`).
 
 **None of the 34 turned out to be safe.** Each one is a real downcast of a
 type-erased handle, reached through a live `ModelFactory` function pointer.
+
+One is reached conditionally and is still swept: `gemma4_registry.cpp:104` sits
+behind an early return unless `VT_GEMMA4_RESIDENT_EXPERTS=1`, so it is off on the
+default path. That makes it harder to reach, not safe — the cast is the defect,
+not the state it casts into — and it is why the class gate uses
+`qwen3_5_moe.cpp:91` for the `prepare` shape rather than this one, which would
+have needed the environment variable set to run at all.
 
 ### Three corrections to #847's description of the shape
 
