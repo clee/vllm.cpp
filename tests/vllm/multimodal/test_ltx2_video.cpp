@@ -1254,7 +1254,7 @@ TEST_CASE("ltx2 video: GENERATED keyframe slots are refused BY WHAT IS MISSING, 
   // builds only `VideoConditionByKeyframeIndex` items through
   // `image_conditionings_by_adding_guiding_latent` (utils/helpers.py:343-367)
   // and does not appear in the feature's own applies-to list
-  // (ltx-pipelines/docs/conditioning.md:53-57).
+  // (ltx-pipelines/docs/conditioning.md:47-51).
   //
   // Upstream reaches it as `--num-generated-keyframes`, `type=int`, `default=0`
   // (ltx-pipelines/utils/args.py:833-844), forwarded to the FIRST diffusion

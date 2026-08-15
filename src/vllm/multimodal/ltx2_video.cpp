@@ -1195,7 +1195,7 @@ void CheckGeneratedKeyframes(const std::map<std::string, std::string>& extras) {
       "into `LatentState.generated_keyframes` as (B, C, K, H, W) BEFORE trimming (tools.py:97, "
       ":115, validated at :203-241), and each frame must then be decoded as a STANDALONE "
       "one-frame clip — a K-frame causal decode would blend slots that were never temporally "
-      "adjacent (types.py:269-273, docs/conditioning.md:60-61). Neither piece exists here, so a "
+      "adjacent (types.py:269-272, docs/conditioning.md:59-61). Neither piece exists here, so a "
       "port that grew the sequence and stopped would generate the slots and then discard them. "
       "WHAT IS *NOT* THE REASON: `keyframes_abs_pos_embedding`. It is ported and applied on "
       "every render (row LTX25-KEYFRAMES-ABS-POS, issue #658), because "

@@ -40,7 +40,7 @@ latent frame. `KeyframeInterpolationPipeline`
 `image_conditionings_by_adding_guiding_latent` (`utils/helpers.py:343-367`),
 contains no reference to `generated_keyframe` or `keyframes_abs_pos` anywhere in
 its 362 lines, and is absent from the feature's own "where it applies" list
-(`ltx-pipelines/docs/conditioning.md:53-57`, which names
+(`ltx-pipelines/docs/conditioning.md:47-51`, which names
 `TI2VidOneStagePipeline`, `TI2VidTwoStagesPipeline`, `TI2VidTwoStagesHQPipeline`,
 `DistilledPipeline` and the multi-GPU runners). Recorded here because the
 opposite was the working assumption when this row was dispatched.
@@ -100,7 +100,7 @@ increasing, non-negative — and an optional `initial_keyframes` of shape
 denoised slot content into `generated_keyframes` *before* trimming the extra
 tokens (`:97`, `:115`), validating the layout against the live token count and
 the target resolution (`tools.py:203-241`). Each frame must then be decoded as a
-standalone one-frame clip — `types.py:269-273` and `conditioning.md:60-61` both
+standalone one-frame clip — `types.py:269-272` and `conditioning.md:59-61` both
 warn that a K-frame causal decode blends slots that were never adjacent.
 
 **The request surface.** `--num-generated-keyframes`, `type=int`, `default=0`
@@ -124,7 +124,7 @@ re-checks as a backstop for callers that build items directly. The reason it
 refuses rather than degrades is stated at `keyframe_slots.py:9-12`: on a
 checkpoint without the marker *"the slots would be denoised as unmarked tokens
 and the extra compute would be wasted"* — and each slot costs one latent frame
-of tokens to buy one pixel frame (`docs/conditioning.md:44-47`: about +16%
+of tokens to buy one pixel frame (`docs/conditioning.md:43-46`: about +16%
 tokens at 512x768/241 frames, +31% at 1088x1920/121).
 
 ## 3. Scope
