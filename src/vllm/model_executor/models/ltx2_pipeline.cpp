@@ -1138,7 +1138,13 @@ Ltx2PipelineRecipe ResolveLtx2PipelineRecipe(const std::string& pipeline_kind,
 
 void Ltx2RefuseUnportedPipelineFeature(Ltx2UnportedPipelineFeature feature) {
   const std::string owed =
-      " Not ported by phase L5; recorded as owed in .agents/specs/ltx-2-5.md.";
+      " Recorded as owed in .agents/specs/ltx-2-5.md; grounded against Lightricks/LTX-2 "
+      "fd4ded7f in .agents/specs/ltx25-retire-dead-arms.md.";
+  // A marker is not a refusal a caller can trip, and saying so is the point: this
+  // enum used to read as six live refusals when only two had a product call site.
+  const std::string marker =
+      " DECLARED, NOT REQUESTABLE: no request field or load extra asks for this, so nothing "
+      "but the out-of-scope ledger reaches this message.";
   switch (feature) {
     case Ltx2UnportedPipelineFeature::kSpatiotemporalUpsampler:
       Refuse("ltx2: the SPATIOTEMPORAL latent upsampler (spatial_upsample AND "
@@ -1148,24 +1154,51 @@ void Ltx2RefuseUnportedPipelineFeature(Ltx2UnportedPipelineFeature feature) {
              "and PixelShuffleND(1). Owed and recorded in "
              ".agents/specs/ltx25-temporal-upsampler.md section 2, under the campaign "
              ".agents/specs/ltx-2-5.md.");
-    case Ltx2UnportedPipelineFeature::kLoraFusion:
-      Refuse("ltx2: LoRA fusion (loader/LoraPathStrengthAndSDOps) is out of scope." + owed);
-    case Ltx2UnportedPipelineFeature::kMultishot:
-      Refuse("ltx2: multishot generation is out of scope." + owed);
-    case Ltx2UnportedPipelineFeature::kInt8ConvRot:
-      Refuse("ltx2: the int8-convrot quantization (ComfyUI-only) is out of scope." + owed);
-    case Ltx2UnportedPipelineFeature::kCfgParallelism:
-      Refuse("ltx2: CFG / multi-GPU parallelism (ltx-pipelines/multigpu) is out of scope." +
-             owed);
-    case Ltx2UnportedPipelineFeature::kVideoEngineWiring:
-      Refuse("ltx2: end-to-end wiring through vllm::multimodal::VideoEngine is phase L7, not "
-             "L5." +
-             owed);
     case Ltx2UnportedPipelineFeature::kBetaScheduler:
       Refuse("ltx2: BetaScheduler (components/schedulers.py:91-120) is not ported. It inverts "
              "a Beta CDF through scipy.stats.beta.ppf, and no ltx-pipelines entry point "
              "constructs it." +
              owed);
+    case Ltx2UnportedPipelineFeature::kLoraFusion:
+      Refuse("ltx2: LoRA fusion (ltx-core loader/primitives.py:160 LoraPathStrengthAndSDOps, "
+             "fused by loader/fuse_loras.py) is out of scope." +
+             marker + owed);
+    case Ltx2UnportedPipelineFeature::kInt8ConvRot:
+      // VERIFIED UNREACHABLE so nobody re-audits it, and stated as UNREACHABLE rather
+      // than ABSENT because absent is what the first version of this message claimed
+      // and it was false. At LTX-2 @ fd4ded7f: `convrot` / `conv_rot` / `quarot` /
+      // `spinquant` really are 0 hits, and the four inference quantization kinds are
+      // exhaustive (quantization_factory.py:23-26, `assert_never` at :50). But int8
+      // is NOT trainer-only. `ltx-kernels` — an inference package — carries a per-row
+      // int8 quantize kernel with fp32 scales (blockwise/triton_ops.py:25-50, out
+      // dtype `torch.int8` at :43), aliased `rowwise_int_quantize_triton` at :436.
+      // That alias is its ONLY reference: blockwise/functional.py:12-18 re-exports
+      // five names and not this one, so nothing constructs it. The package is a fork
+      // of Lightricks' int8 kernel library retargeted to fp8/fp6/nvfp4 — its custom-op
+      // namespace is still literally `q8_kernels_ops` (functional.py:25) — and the
+      // int8 half is what was left behind. Nothing wired reaches int8, which is why
+      // the disposition is unchanged; only the sentence was wrong.
+      Refuse("ltx2: the int8-convrot quantization is out of scope. It is a ComfyUI-ecosystem "
+             "format, not an LTX-2 arm: upstream's own inference kinds are fp8-cast, "
+             "fp8-scaled-mm, nvfp4-cast and nvfp4-prequant (ltx-pipelines/utils/"
+             "quantization_factory.py:23-26), and int8 is UNREACHABLE upstream — trainer-only "
+             "for anything wired (ltx-trainer gemma_8bit.py:33-36, quantization.py:11-15), plus "
+             "one DEAD per-row int8 quantize kernel in the ltx-kernels inference package "
+             "(blockwise/triton_ops.py:35,43, reached only by its own alias at :436)." +
+             marker + owed);
+    case Ltx2UnportedPipelineFeature::kMultiGpuParallelism:
+      // The old spelling was `kCfgParallelism`, which named something upstream does
+      // not do. There is no CFG pass to split here in the first place: the distilled
+      // recipe denoises with SimpleDenoiser at both stages (distilled.py:266,295),
+      // "single transformer call, no guidance" (utils/denoisers.py:3).
+      Refuse("ltx2: single-node multi-GPU parallelism (ltx-pipelines/multigpu) is out of "
+             "scope. Upstream has three forms and none of them is CFG batching: "
+             "sequence-parallel (multigpu/sp_builder.py:25), tiled data parallel "
+             "(multigpu/tdp_builder.py:25, upscale stage only) and distributed VAE decode "
+             "(ltx-core multigpu/vae/distributed_decoder.py:204-256). It is a LATENCY tool, "
+             "not a memory tool (docs/multigpu/README.md:5-16), and this port targets one "
+             "GB10." +
+             marker + owed);
   }
   Refuse("ltx2: unknown unported pipeline feature." + owed);
 }

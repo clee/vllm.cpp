@@ -27,11 +27,14 @@
 #include <doctest/doctest.h>
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <fstream>
 #include <iterator>
 #include <limits>
+#include <sstream>
 #include <string>
 #include <utility>
 #include <vector>
@@ -1231,26 +1234,292 @@ TEST_CASE("ltx2 the two references disagree on the default negative prompt, and 
 // Out-of-scope refusals
 // ===========================================================================
 
-TEST_CASE("ltx2 every L5 out-of-scope feature is refused BY NAME") {
-  // Spec section 2 "Out", plus the L7 boundary. A silent downgrade of any of
-  // these produces a video, which is exactly why none of them may fall back.
-  const std::vector<std::pair<vllm::Ltx2UnportedPipelineFeature, std::string>> owed = {
-      {vllm::Ltx2UnportedPipelineFeature::kSpatiotemporalUpsampler, "temporal"},
-      {vllm::Ltx2UnportedPipelineFeature::kLoraFusion, "LoRA"},
-      {vllm::Ltx2UnportedPipelineFeature::kMultishot, "multishot"},
-      {vllm::Ltx2UnportedPipelineFeature::kInt8ConvRot, "int8-convrot"},
-      {vllm::Ltx2UnportedPipelineFeature::kCfgParallelism, "parallelism"},
-      {vllm::Ltx2UnportedPipelineFeature::kVideoEngineWiring, "VideoEngine"},
+// THE LIST SHRANK FROM SEVEN TO FIVE on 2026-08-13, and the shrink is the point.
+// Two enumerators were retired by row LTX25-RETIRE-DEAD-ARMS (#644):
+// `kMultishot`, which refused a feature that exists in NEITHER reference, and
+// `kVideoEngineWiring`, whose subject shipped in `cefacd2d0`. See
+// .agents/specs/ltx25-retire-dead-arms.md §1.1 and §1.5. A CHANGED CASE COUNT
+// here is that retirement, not a lost assertion.
+TEST_CASE("ltx2 every out-of-scope feature is refused BY NAME") {
+  // Spec section 2 "Out". A silent downgrade of any of these produces a video,
+  // which is exactly why none of them may fall back.
+  //
+  // REACHABLE REFUSALS: a product path constructs the condition, so a caller can
+  // trip these. The call sites are `ltx2_upsampler.cpp:465` and
+  // `ltx2_pipeline.cpp:199`.
+  const std::vector<std::pair<vllm::Ltx2UnportedPipelineFeature, std::string>> reachable = {
+      {vllm::Ltx2UnportedPipelineFeature::kSpatiotemporalUpsampler, "SPATIOTEMPORAL"},
       {vllm::Ltx2UnportedPipelineFeature::kBetaScheduler, "BetaScheduler"},
   };
-  for (const auto& item : owed) {
+  // DECLARED-OUT-OF-SCOPE MARKERS: nothing a caller can send reaches these, so
+  // the message must not claim otherwise. Recording them as refusals overstated
+  // what this port has, which is the defect this row closes.
+  const std::vector<std::pair<vllm::Ltx2UnportedPipelineFeature, std::string>> markers = {
+      {vllm::Ltx2UnportedPipelineFeature::kLoraFusion, "LoRA"},
+      {vllm::Ltx2UnportedPipelineFeature::kInt8ConvRot, "int8-convrot"},
+      {vllm::Ltx2UnportedPipelineFeature::kMultiGpuParallelism, "multi-GPU"},
+  };
+
+  std::vector<std::pair<vllm::Ltx2UnportedPipelineFeature, std::string>> all = reachable;
+  all.insert(all.end(), markers.begin(), markers.end());
+  for (const auto& item : all) {
     const std::string message =
         RefusalMessage([&] { vllm::Ltx2RefuseUnportedPipelineFeature(item.first); });
     INFO("feature = ", item.second, " refusal = ", message);
     CHECK(Mentions(message, item.second));
     // Naming WHERE the work is owed is what keeps it from being rediscovered.
     CHECK(Mentions(message, "ltx-2-5.md"));
+    // The RETIRED arm must not come back: a refusal that cites a feature neither
+    // reference has sends the next reader looking upstream for it.
+    CHECK_FALSE(Mentions(message, "multishot"));
   }
+  for (const auto& item : reachable) {
+    const std::string message =
+        RefusalMessage([&] { vllm::Ltx2RefuseUnportedPipelineFeature(item.first); });
+    INFO("reachable = ", item.second, " refusal = ", message);
+    CHECK_FALSE(Mentions(message, "DECLARED, NOT REQUESTABLE"));
+  }
+  for (const auto& item : markers) {
+    const std::string message =
+        RefusalMessage([&] { vllm::Ltx2RefuseUnportedPipelineFeature(item.first); });
+    INFO("marker = ", item.second, " refusal = ", message);
+    CHECK(Mentions(message, "DECLARED, NOT REQUESTABLE"));
+  }
+
+  // THE ABSENCE THIS MESSAGE STATES IS ITSELF EVIDENCE, so it is gated. The first
+  // version of this marker ended "int8 appears upstream only in the trainer" — a
+  // false-absence claim of exactly the kind row LTX25-RETIRE-DEAD-ARMS exists to
+  // retire (#604), shipped inside a user-visible refusal. LTX-2 @ fd4ded7f carries
+  // a per-row int8 quantize kernel with fp32 scales in `ltx-kernels`, which is an
+  // INFERENCE package, not the trainer: `blockwise/triton_ops.py:35,43`, aliased
+  // `rowwise_int_quantize_triton` at `:436`. It is dead — that alias is its only
+  // reference and `blockwise/functional.py:12-18` does not re-export it — so the
+  // disposition is unchanged and only the sentence was wrong. See
+  // .agents/specs/ltx25-retire-dead-arms.md §1.2.
+  {
+    const std::string message = RefusalMessage([] {
+      vllm::Ltx2RefuseUnportedPipelineFeature(vllm::Ltx2UnportedPipelineFeature::kInt8ConvRot);
+    });
+    INFO("int8 marker = ", message);
+    CHECK_FALSE(Mentions(message, "only in the trainer"));
+    // The true statement names where the one inference-side int8 lives, so a
+    // reader who greps upstream and finds it is not left thinking we missed it.
+    CHECK(Mentions(message, "ltx-kernels"));
+  }
+}
+
+// THE PUBLIC SURFACE MUST NOT RE-MERGE WHAT THE LEDGER SPLIT. `docs/FEATURES.md`
+// is where the reachable/marker distinction reaches a user, and it carried ONE
+// "Declared, not requestable" row listing all five arms — including the two a
+// caller CAN trip. That is the same conflation the ledger above stopped making,
+// reintroduced one surface out. Gated here rather than left to review because a
+// doc row and an enum drift silently.
+//
+// Deliberately narrow: it asserts only that no row calling something
+// unrequestable names a REACHABLE arm. It does not police the wording of the doc.
+TEST_CASE("ltx2 docs/FEATURES.md never calls a REACHABLE refusal unrequestable") {
+  std::ifstream in(VLLM_CPP_FEATURES_DOC_PATH);
+  REQUIRE_MESSAGE(in.good(), "cannot open " << VLLM_CPP_FEATURES_DOC_PATH);
+  std::stringstream buf;
+  buf << in.rdbuf();
+  const std::string doc = buf.str();
+  REQUIRE(doc.size() > 1000);
+
+  // The two arms with a product call site: `ltx2_upsampler.cpp:465` constructs the
+  // SPATIOTEMPORAL upsampler condition and `ltx2_pipeline.cpp:199` the
+  // BetaScheduler one. Named by the words the doc uses for them, since that is
+  // what a reader sees.
+  //
+  // `spatiotemporal upsampler`, NOT a bare `upsampler`, and that is the whole
+  // repair. `2e9d95e74` ported the TEMPORAL-ONLY x2 upsampler on this same issue
+  // and renamed the enumerator, so there are now two upsampler arms in this
+  // model: one refused, one shipped-but-undriven. A bare `upsampler` matches both
+  // and therefore cannot tell a refusal from a shipped feature — it fires on a
+  // correct sentence about the ported arm and stays silent on the distinction it
+  // exists to police. Matched case-insensitively because the doc capitalizes the
+  // word for emphasis in one row and not the other.
+  const std::vector<std::string> reachable_words = {"spatiotemporal upsampler", "betascheduler"};
+
+  auto lowered = [](const std::string& text) {
+    std::string out = text;
+    for (char& c : out) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    return out;
+  };
+
+  size_t rows_examined = 0;
+  size_t reachable_rows = 0;
+  size_t line_no = 0;
+  size_t at = 0;
+  while (at <= doc.size()) {
+    const size_t end = doc.find('\n', at);
+    const std::string line = doc.substr(at, end == std::string::npos ? std::string::npos : end - at);
+    ++line_no;
+    const std::string lower = lowered(line);
+    // A table row that makes the not-requestable claim, in either casing the doc
+    // uses for it.
+    const bool is_row = !line.empty() && line[0] == '|';
+    const bool claims_unrequestable = lower.find("not requestable") != std::string::npos;
+    const bool is_ltx = line.find("LTX-2.5") != std::string::npos;
+    if (is_row && claims_unrequestable && is_ltx) {
+      ++rows_examined;
+      for (const std::string& word : reachable_words) {
+        INFO("FEATURES.md:" << line_no << " = " << line);
+        CHECK_MESSAGE(lower.find(word) == std::string::npos,
+                      "a row claiming 'not requestable' names the REACHABLE arm '"
+                          << word
+                          << "'; split the reachable refusals out, per "
+                             ".agents/specs/ltx25-retire-dead-arms.md §1.6");
+      }
+    }
+    // AND THE REACHABLE ROW ITSELF, because the defect this repair closes was
+    // produced by a MERGE rather than by an author: `2e9d95e74` landed the
+    // temporal-only arm while this row's doc edit still called that arm refused,
+    // and both files auto-merged clean, so nothing said a word. Publishing a
+    // refusal for a shipped feature is #604 in the most user-facing surface there
+    // is, which is why the doc must name the arm that is ACTUALLY refused.
+    if (is_row && is_ltx && lower.find("refused by name at the call site") != std::string::npos) {
+      ++reachable_rows;
+      INFO("FEATURES.md:" << line_no << " = " << line);
+      CHECK_MESSAGE(lower.find("spatiotemporal") != std::string::npos,
+                    "the LTX-2.5 reachable-refusal row must name the SPATIOTEMPORAL upsampler. "
+                    "The temporal-only x2 arm is PORTED (2e9d95e74); a row that calls it "
+                    "refused publishes a refusal for a shipped feature");
+    }
+    if (end == std::string::npos) break;
+    at = end + 1;
+  }
+  // ANTI-VACUOUS. Without these the case passes when a row is renamed away and
+  // proves nothing — the failure mode this whole row is about.
+  CHECK_MESSAGE(rows_examined == 1,
+                "expected exactly ONE LTX-2.5 'not requestable' row in docs/FEATURES.md, found "
+                    << rows_examined);
+  CHECK_MESSAGE(reachable_rows == 1,
+                "expected exactly ONE LTX-2.5 'refused by name at the call site' row in "
+                "docs/FEATURES.md, found "
+                    << reachable_rows);
+}
+
+// THE RETIREMENT NOTE'S OWN EVIDENCE, held to what upstream actually says.
+//
+// Retiring `kMultishot` rests on an ABSENCE claim about upstream, and the header
+// above the enum is where a porter reads it. That sentence shipped wrong: it said
+// the only `scene` hit upstream was PySceneDetect in the TRAINER. At
+// Lightricks/LTX-2 @ fd4ded7f `scene` has THREE senses, and the third —
+// prompt-writing guidance — lives in `ltx-core`, which ships at INFERENCE. So a
+// porter greps `scene`, finds "scene cuts" in a shipped prompt-enhancer prompt,
+// and concludes we missed a multi-shot path that our own header told them did not
+// exist. Third instance of #604 inside the row whose subject is retiring #604.
+//
+// The disposition did not move — it got STRONGER. Those prompts instruct the
+// enhancer NOT to describe scene cuts and to keep a "Single continuous take"
+// (gemma3_i2v:18, gemma3_t2v:24, gemma4_i2v:3), which is affirmative evidence
+// that no multi-shot generation mode exists.
+//
+// WHAT THIS CASE CAN AND CANNOT PROVE. It reads the shipped header and holds its
+// text, so the false sentence cannot come back and the true evidence cannot be
+// dropped. It CANNOT verify the upstream claim — no upstream checkout exists in
+// this tree — so the derivation, with the positive control in the same command,
+// lives in .agents/specs/ltx25-retire-dead-arms.md §1.1.
+TEST_CASE("ltx2 the kMultishot retirement note states the scene evidence correctly") {
+  std::ifstream in(LTX2_PIPELINE_HEADER_PATH);
+  REQUIRE_MESSAGE(in.good(), "cannot open " << LTX2_PIPELINE_HEADER_PATH);
+  std::stringstream buf;
+  buf << in.rdbuf();
+  const std::string header = buf.str();
+  REQUIRE(header.size() > 1000);
+
+  // The note is prose wrapped across comment lines, so every claim below is
+  // matched against a flattened copy: comment markers dropped, runs of whitespace
+  // collapsed to one space. Without this a reflow of the paragraph would silently
+  // turn every assertion vacuous.
+  std::string flat;
+  flat.reserve(header.size());
+  bool pending_space = false;
+  for (size_t i = 0; i < header.size(); ++i) {
+    const char c = header[i];
+    if (c == '/' && i + 1 < header.size() && header[i + 1] == '/') {
+      i += 1;
+      pending_space = true;
+      continue;
+    }
+    if (std::isspace(static_cast<unsigned char>(c)) != 0) {
+      pending_space = true;
+      continue;
+    }
+    if (pending_space && !flat.empty()) flat += ' ';
+    pending_space = false;
+    flat += c;
+  }
+
+  // ANTI-VACUOUS. Every assertion below is about ONE paragraph; if that paragraph
+  // is renamed or removed they all pass while proving nothing.
+  size_t notes = 0;
+  for (size_t at = flat.find("`kMultishot` — FABRICATED"); at != std::string::npos;
+       at = flat.find("`kMultishot` — FABRICATED", at + 1)) {
+    ++notes;
+  }
+  REQUIRE_MESSAGE(notes == 1,
+                  "expected exactly ONE `kMultishot` — FABRICATED retirement note in "
+                      << LTX2_PIPELINE_HEADER_PATH << ", found " << notes);
+
+  // The sentence that was false. It asserted an upstream absence from our own
+  // vocabulary, with no positive control, in a SHIPPED header.
+  CHECK_MESSAGE(flat.find("the only `scene` hit is PySceneDetect") == std::string::npos,
+                "the retired false claim is back: `scene` is not trainer-only upstream — "
+                "ltx-core's shipped gemma prompt files carry it, see "
+                ".agents/specs/ltx25-retire-dead-arms.md §1.1");
+  CHECK(flat.find("only `scene` hit") == std::string::npos);
+
+  // SCOPE THE POSITIVE CHECKS TO THE NOTE. Searching the whole flattened header
+  // for a positive phrase is what made the `ltx-core` assertion below structurally
+  // unable to fail: `ltx-core` occurs SIX times in this header — the upstream map
+  // at :8 and :28, `parse_model_version` at :452, `kLoraFusion` at :629, and twice
+  // inside the note — so a file-wide `find` survived deleting the clause it exists
+  // to hold. Proved by mutation: rewriting the note to say the guidance ships
+  // "inside the TRAINER ONLY" left the case GREEN at 8/8. It also never went red
+  // in this row's own red-first run (4 of 8 failed; this was not one of them).
+  //
+  // The paragraph runs from the retirement marker to the NEXT enumerator heading,
+  // derived rather than pinned to a line number, because a recorded anchor in this
+  // header went stale inside this very pull request.
+  const size_t note_at = flat.find("`kMultishot` — FABRICATED");
+  REQUIRE(note_at != std::string::npos);
+  const std::string heading_tail = "` — ";
+  size_t note_end = std::string::npos;
+  for (size_t at = flat.find("`k", note_at + 1); at != std::string::npos;
+       at = flat.find("`k", at + 1)) {
+    const size_t close = flat.find('`', at + 1);
+    if (close == std::string::npos) break;
+    if (flat.compare(close, heading_tail.size(), heading_tail) == 0) {
+      note_end = at;
+      break;
+    }
+  }
+  if (note_end == std::string::npos) note_end = flat.size();
+  const std::string note = flat.substr(note_at, note_end - note_at);
+  // ANTI-VACUOUS, again: an empty or truncated slice would pass a negative check
+  // and fail a positive one for the wrong reason. The note is a long paragraph.
+  REQUIRE_MESSAGE(note.size() > 400,
+                  "the `kMultishot` retirement note sliced to " << note.size()
+                                                                << " chars; the slice is wrong");
+
+  // And the evidence that replaced it, by the three things a porter needs: that
+  // the narrative sense is PROMPT GUIDANCE, that it ships in `ltx-core` rather
+  // than only the trainer, and that the guidance FORBIDS scene cuts.
+  //
+  // The middle one is asserted as the CLAIM, not as the package name. The axis it
+  // holds — the guidance ships at inference, it is not trainer-only — is exactly
+  // the axis that shipped false for two review rounds, and a bare `ltx-core` does
+  // not hold it: neither sibling below covers it either, since both survive the
+  // trainer-only mutation.
+  CHECK_MESSAGE(note.find("scene cuts") != std::string::npos,
+                "the retirement note must name the prompt guidance it now rests on");
+  CHECK_MESSAGE(note.find("ships at INFERENCE inside `ltx-core`") != std::string::npos,
+                "the note must state WHERE the third `scene` sense ships. Trainer-only is what "
+                "it wrongly said for two rounds, and `ltx-core` shipping at inference is the "
+                "whole reason the retirement holds — see "
+                ".agents/specs/ltx25-retire-dead-arms.md §1.1");
+  CHECK(note.find("system_prompt") != std::string::npos);
 }
 
 // ===========================================================================
