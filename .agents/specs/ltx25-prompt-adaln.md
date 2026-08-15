@@ -454,8 +454,7 @@ upsampler load` carries a byte-identical `LTX2_CHECKPOINT_ROOT` gate at
 neither. That ambiguity was already there when the anchor read `:1316-1319`;
 widening by one line to the case name, which occurs exactly once, is what makes
 the citation resolvable.) With the variable pointing at the Lightricks tree the
-same binary
-measures **30 cases / 8734 assertions**, both before and after this repair
+same binary measures **30 cases / 8734 assertions**, both before and after this repair
 (re-measured on this branch, exit 0 in both configurations). Any future quote of
 this suite's count owes the configuration alongside it.
 
@@ -772,7 +771,8 @@ MOVED under the 2026-08-15 merge of `origin/main`, and the numbers above are the
 POST-merge ones.** `0785cfc4d` (#882) added 70 lines to `ltx2_video.cpp` and 306
 to `test_ltx2_video.cpp`, ahead of every anchor here: `:1063 → :1106`,
 `:1730/:1732 → :1784/:1786`, `:533 → :575`, `:624 → :667`, and in the test
-`:1316-1319 → :1622-1625`, `:1302-1303 → :1608-1609`. Each was CORRECT at
+`:1316-1319 → :1620-1625` (widened by one line as well; see `### The gate`) and
+`:1302-1303 → :1608-1609`. Each was CORRECT at
 `00613767d` and each was WRONG the moment the merge landed, which is the point:
 a re-derivation is only true of the tree it ran on, and the merge is part of
 landing. They were caught by comparing each span's TEXT against the claim beside
@@ -780,6 +780,31 @@ it. A checker that reads the span out of the file and then looks for that span
 in the same file is a tautology — it returns unique-and-at-the-cited-line for
 every anchor, including the ones now pointing at unrelated code. The expected
 text has to come from the CLAIM.
+
+**The second half of the rule is NOT satisfied, and the mutation says so.** The
+rule also requires that the smallest failing test ENTER through that entry point.
+It does not here. The reachability mutation from `reachability.md` — delete the
+production call site, `ltx2_dit.cpp:140` `if (prompt_mod != nullptr) {` becomes
+`if (false) {`, so `ModulateContext` ignores the term entirely — was run on a
+scratch copy and **BUILT=YES, compile_err=NO**, so this is a test result:
+
+| suite | enters through | result |
+|---|---|---|
+| `test_ltx2` | `Ltx2DitForward`, by hand | RED — 3 of 43 cases, 6 of 4388 assertions, exit 1 |
+| `test_ltx2_video` | `vllm_video_generate` / the ABI | **GREEN** — 37 of 37, 784 of 784, exit 0 |
+
+The entry-point suite drives the path — its fixture sets the flag TRUE
+(`tests/vllm/multimodal/ltx2_video_fixture.h:258`) — and asserts no value the
+term can move, so it measures that the pipeline runs rather than that this
+capability is in it. Filed as
+[#900](https://github.com/mudler/vllm.cpp/issues/900) and listed below rather
+than repaired here: closing it means designing an ABI-level value oracle
+red-first, which is a row with its own spec and not a record repair.
+
+The LOADER half does satisfy both halves. Re-adding
+`use_prompt_adaln_single = false` in front of §3.2's guard (M3 below) takes
+`test_ltx2_video` to 29 of 37 cases failing, exit 1 — that gate enters through the
+production load path and observes the guard.
 
 ### Every repo-local citation in this file, re-derived (2026-08-15)
 
@@ -811,31 +836,6 @@ Upstream citations (`model.py`, `transformer_args.py`, `transformer.py`,
 `adaln.py`, `transformer_ltx2.py`, and the rest) are NOT covered by that run.
 They are pinned to `fd4ded7f` / `3a2f35d4` and audited separately under
 [#794](https://github.com/mudler/vllm.cpp/issues/794).
-
-**The second half of the rule is NOT satisfied, and the mutation says so.** The
-rule also requires that the smallest failing test ENTER through that entry point.
-It does not here. The reachability mutation from `reachability.md` — delete the
-production call site, `ltx2_dit.cpp:140` `if (prompt_mod != nullptr) {` becomes
-`if (false) {`, so `ModulateContext` ignores the term entirely — was run on a
-scratch copy and **BUILT=YES, compile_err=NO**, so this is a test result:
-
-| suite | enters through | result |
-|---|---|---|
-| `test_ltx2` | `Ltx2DitForward`, by hand | RED — 3 of 43 cases, 6 of 4388 assertions, exit 1 |
-| `test_ltx2_video` | `vllm_video_generate` / the ABI | **GREEN** — 37 of 37, 784 of 784, exit 0 |
-
-The entry-point suite drives the path — its fixture sets the flag TRUE
-(`tests/vllm/multimodal/ltx2_video_fixture.h:258`) — and asserts no value the
-term can move, so it measures that the pipeline runs rather than that this
-capability is in it. Filed as
-[#900](https://github.com/mudler/vllm.cpp/issues/900) and listed below rather
-than repaired here: closing it means designing an ABI-level value oracle
-red-first, which is a row with its own spec and not a record repair.
-
-The LOADER half does satisfy both halves. Re-adding
-`use_prompt_adaln_single = false` in front of §3.2's guard (M3 below) takes
-`test_ltx2_video` to 29 of 37 cases failing, exit 1 — that gate enters through the
-production load path and observes the guard.
 
 ## Owed
 
