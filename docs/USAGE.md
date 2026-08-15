@@ -514,7 +514,23 @@ DiT's unported `keyframes_abs_pos_embedding`. That was wrong: a supplied keyfram
 is appended unmarked, so the embedding never applies to it. Where the embedding
 does bite is the FIRST latent frame of every render, which was a separate gap;
 it was closed on 2026-08-14 under issue #658, so the marker is now applied on
-every render.) Three encoder-level limits are worth
+every render.)
+
+**Generated keyframe slots are a different feature, and also refused.** Upstream
+also lets the model *generate* extra frames at interior positions —
+`--num-generated-keyframes N` upstream, the per-generation extra
+`num_generated_keyframes` here. That is not a keyframe you supply; it is one you
+ask the model to invent, and each slot relaxes the effective temporal
+compression at its position at the cost of a full latent frame of tokens for one
+pixel frame. `0` is the default and means off, so passing it explicitly renders
+normally. A positive count is refused by name, and the message names two missing
+pieces rather than one: the token-APPEND machinery shared with the last-frame
+arm above, and the readback — the slots are the output, so they must be located
+by their recorded layout, extracted before the extra tokens are trimmed, and
+then each decoded as a standalone one-frame clip, because a multi-frame causal
+decode would blend slots that were never temporally adjacent. A negative count
+is refused separately with upstream's own reason, since a malformed request and
+an unported arm are different answers. Three encoder-level limits are worth
 stating in advance because they are refusals rather than approximations. A
 reference waveform whose sample rate differs from the audio VAE's is refused
 rather than resampled, since upstream uses a polyphase kaiser resampler this

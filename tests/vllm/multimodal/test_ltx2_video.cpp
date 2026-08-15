@@ -1237,6 +1237,116 @@ TEST_CASE("ltx2 video: keyframe and reference conditioning is refused BY WHAT IS
   }
 }
 
+TEST_CASE("ltx2 video: GENERATED keyframe slots are refused BY WHAT IS MISSING, not as a typo") {
+  // Row LTX25-GENERATED-KEYFRAMES (#920). This is the OTHER feature called
+  // "keyframe", and the distinction is the whole point of the case above:
+  //
+  //   supplied  -> `VideoConditionByKeyframeIndex`, content from the caller,
+  //                appended with `marked=False` (keyframe_cond.py:84-86)
+  //   GENERATED -> `VideoGeneratedKeyframeSlots`, content from the MODEL,
+  //                appended with `marked=True` (keyframe_slots.py:121)
+  //
+  // `extend_keyframes_mask`'s `marked` argument (conditioning/mask_utils.py:76-107)
+  // is the only difference, and `keyframe_slots.py:121` is upstream's only call
+  // site that passes True. So generated slots are the ONLY user-facing feature
+  // that puts #658's trained marker on a token other than the target's own first
+  // latent frame -- and `KeyframeInterpolationPipeline` is NOT that feature: it
+  // builds only `VideoConditionByKeyframeIndex` items through
+  // `image_conditionings_by_adding_guiding_latent` (utils/helpers.py:343-367)
+  // and does not appear in the feature's own applies-to list
+  // (ltx-pipelines/docs/conditioning.md:53-57).
+  //
+  // Upstream reaches it as `--num-generated-keyframes`, `type=int`, `default=0`
+  // (ltx-pipelines/utils/args.py:833-844), forwarded to the FIRST diffusion
+  // stage only. That is a per-CALL argument, so it is a per-generation extra
+  // here rather than a load option.
+  Workspace ws;
+  vllm::multimodal::VideoModelParams mp = FixtureParams(ws.paths);
+  // Phase 0 only: this case is about the REQUEST being resolved, and the
+  // zero-is-off arm has to complete a render to prove it. The upsampler is a
+  // second, unrelated refusal.
+  mp.extras[vllm::multimodal::kLtx2MaxPhaseExtra] = "0";
+  const std::unique_ptr<vllm::multimodal::VideoEngine> engine =
+      vllm::multimodal::LoadVideoEngine(mp);
+  REQUIRE(engine != nullptr);
+
+  auto refusal = [&](const char* value, const char* dir) {
+    vllm::multimodal::VideoGenParams gen = FixtureGen(ws.root + "/" + dir);
+    gen.extras[vllm::multimodal::kLtx2GeneratedKeyframesExtra] = value;
+    try {
+      (void)engine->Generate(gen);
+      FAIL_CHECK("num_generated_keyframes=" << value << " must be refused, never dropped");
+      return std::string();
+    } catch (const std::exception& e) {
+      return std::string(e.what());
+    }
+  };
+
+  SUBCASE("a positive count names the TOKEN-APPEND machinery and the READBACK") {
+    const std::string msg = refusal("2", "gk2");
+    INFO(msg);
+    // The upstream symbols, so a later reader can go and check whether the
+    // reason still holds rather than re-deriving it. This is the bar the
+    // LAST-frame refusal set and the one five refusals in this campaign failed.
+    CHECK(msg.find("VideoGeneratedKeyframeSlots") != std::string::npos);
+    CHECK(msg.find("keyframe_slots.py") != std::string::npos);
+    // Blocker 1: the sequence grows and is trimmed back.
+    CHECK(msg.find("update_attention_mask") != std::string::npos);
+    CHECK(msg.find("clear_conditioning") != std::string::npos);
+    // Blocker 2: readback, which the SUPPLIED arm does not need. A message that
+    // named only blocker 1 would read as "same gap as the last-frame arm" and a
+    // reader who closed that one would find this arm still broken.
+    CHECK(msg.find("generated_keyframes") != std::string::npos);
+    // Named because it is shared, so whoever closes it closes both.
+    const bool names_the_shared_arm = msg.find("last-frame") != std::string::npos ||
+                                      msg.find("LAST-frame") != std::string::npos;
+    CHECK(names_the_shared_arm);
+    // The refuted reason may be NAMED -- it is worth telling a reader the marker
+    // was ruled out -- but never as the thing that is missing. Same guard the
+    // LAST-frame case carries.
+    if (msg.find("keyframes_abs_pos_embedding") != std::string::npos) {
+      CHECK(msg.find("NOT* THE REASON") != std::string::npos);
+      CHECK(msg.find("#658") != std::string::npos);
+    }
+  }
+  SUBCASE("and it is NOT the generic unknown-extra message") {
+    // THE ASSERTION THIS ROW EXISTS FOR. Without it the case above passes
+    // against the message the tree already has, because "unknown per-generation
+    // extra 'num_generated_keyframes'. This family defines: image_crf" contains
+    // no upstream symbol at all -- and a refusal that says the family does not
+    // define the key sends the reader looking for a typo instead of for the
+    // unported machinery. That is the distinction `CheckUnservedExtras` was
+    // written for on the load side (#611).
+    const std::string msg = refusal("1", "gk1");
+    INFO(msg);
+    CHECK(msg.find("unknown per-generation extra") == std::string::npos);
+  }
+  SUBCASE("zero is upstream's DEFAULT and must not refuse") {
+    // args.py:836 is `default=0`, and `has_generated_keyframes`
+    // (utils/helpers.py:384-391) reads 0 as off. A caller that plumbs the
+    // default through must get a render, not a refusal. This is the half a
+    // naive port breaks -- "the key is present, so refuse" is one line shorter
+    // and wrong.
+    vllm::multimodal::VideoGenParams gen = FixtureGen(ws.root + "/gk0");
+    gen.extras[vllm::multimodal::kLtx2GeneratedKeyframesExtra] = "0";
+    const vllm::multimodal::VideoResult result = engine->Generate(gen);
+    CHECK(result.frame_count == 9);
+    CHECK(result.width == 32);
+    CHECK(result.height == 32);
+  }
+  SUBCASE("a negative count gets upstream's OWN reason, not the unported one") {
+    // `evenly_spaced_keyframe_positions` raises "num_keyframes must be
+    // non-negative" (utils/helpers.py:372-373) before anything looks at the
+    // checkpoint. A malformed request and an unported arm are different
+    // answers, and collapsing them would tell a caller who typed `-1` to go
+    // read about attention masks.
+    const std::string msg = refusal("-1", "gkneg");
+    INFO(msg);
+    CHECK(msg.find("non-negative") != std::string::npos);
+    CHECK(msg.find("update_attention_mask") == std::string::npos);
+  }
+}
+
 TEST_CASE("ltx2 video: an image at crf 0 conditions the render, and the ENCODER weights are read") {
   // The arm row LTX25-IMAGE-COND (#644) opened. Two separate claims are made
   // here and they are NOT the same claim:
