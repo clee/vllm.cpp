@@ -859,6 +859,8 @@ add_library(vllm STATIC
   # than additions to ltx2_loader.cpp, which two concurrent rows of the same
   # campaign need to edit.
   src/vllm/model_executor/models/ltx2_video_vae_encoder_load.cpp
+  src/vllm/model_executor/models/ltx2_audio_vae_encoder_load.cpp
+  src/vllm/model_executor/models/ltx2_audio_input.cpp
   src/vllm/model_executor/models/ltx2_image_preprocess.cpp
   # LTX-2.5 (ROW MODEL-DIFFUSION-LTX25, phase L6): the quantized loaders — the
   # FP8 and torchao-NVFP4 DiT arms, the torchao-NVFP4 text encoder, and the
@@ -877,7 +879,7 @@ add_library(vllm STATIC
   # config descent, the on-disk name map, the registry entry and the het-KV
   # topology. No forward: nemotron_h.cpp is W4.
   src/vllm/model_executor/models/nemotron_h.cpp
-  # A2α (#810): the DEVICE arm — the residual stream, the 52 norms, the
+  # A2-R (#810): the DEVICE arm — the residual stream, the 52 norms, the
   # embedding lookup and the 6 GQA attention blocks. Mamba/MoE/lm_head stay
   # host; see the file header for why the line falls where it does.
   src/vllm/model_executor/models/nemotron_h_device.cpp
