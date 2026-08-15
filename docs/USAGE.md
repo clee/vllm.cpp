@@ -639,6 +639,34 @@ because that would hand back a lower quality render as if it were the one you
 asked for. Keyframe and reference conditioning is refused for the same reason: it
 runs through the video VAE's encoder, and only the decoder is ported.
 
+**The convolutional decode is TILED and STREAMED, on upstream's own defaults, and
+there is no knob.** The layout is the one `ltx_pipelines` builds for a Conv VAE
+when you pass `AUTO_TILING`: a 768 px tile with a 64 px overlap on the long side,
+aspect coupled to the short one, and 80 frame temporal chunks overlapping by 24.
+Each temporal chunk is written to its PPM files and dropped, so the full pixel
+volume never exists at once. Two consequences worth knowing before you read a
+memory number:
+
+- **Below a 768 px long side and 81 frames the layout does not tile at all.** A
+  single tile comes out, and that path reproduces the untiled decode bit for bit
+  (`test_ltx2_tiling`'s one tile control, on both causality settings). So
+  448x256/25f renders byte identically to how it rendered before tiling existed,
+  and its memory is unchanged. Tiling starts doing something at 896x512, and
+  temporal chunking at 81 frames.
+- **A tiled render is not the same image as an untiled one**, and that is
+  upstream's behaviour, not a defect here. Each tile decodes a crop of the latent,
+  the decoder's receptive field is wider than the 64 px overlap, and the seam is
+  blended rather than eliminated. Do not compare a 1920x1088 render against a
+  hypothetical untiled one and read the difference as an error.
+- **81 to 120 frames is already the tiled regime, and the recipe default is
+  inside it.** The default request is 1024x1536 at 121 frames. At 81 frames the
+  latent is 11 frames deep against a 10 frame temporal tile, so it splits into two
+  chunks. Measured on the shipped conv VAE at 64x64 / 81 frames: max abs diff
+  0.0503 against the untiled decode, on an output whose own max is 0.7513 — 6.70%
+  of that range — with 962983 of 995328 channel values (96.75%) not bit identical.
+  So nearly every value moves, by a few percent of the signal. If you need the pre
+  tiling render back, ask for 73 frames or fewer.
+
 **The refusal that used to stand here is gone, and what replaced it is an owed
 ORACLE rather than an owed feature.** Through L10 this page said a prompt was
 refused because the `Embeddings1DConnector` weights, which ship inside the DiT
@@ -1259,13 +1287,26 @@ A family with no text-only synthesis — IndexTTS-2.5 is one — is refused
 `reference_audio`, which is supplied as a `data:` URL carrying a 16-bit PCM mono
 WAV.
 
-**What this does NOT do yet.** No family renders a song from a prompt.
-MiniMax-Music3's condition mix, flow-matching DiT, scheduler, window
-bookkeeping and DAC vocoder are implemented and gated against the oracle's own
-waveform, but the 8.6B `Qwen3ForCausalLM` forward that produces the frame
-hidden states is not, so a request is answered with a 500 naming that stage, the
-phase that owes it (W2 of `.agents/specs/minimax-music3.md`) and issue #672.
-IndexTTS-2.5 refuses naming its own missing pieces.
+**Every stage of MiniMax-Music3 is implemented and gated**, and a request
+reaches all of them: the 8.6B `Qwen3ForCausalLM` autoregressive stage, the RVQ
+depth decoder, the learned condition mix, the flow-matching DiT and the DAC
+Flow-VAE vocoder. **A composed request has not yet been observed to completion
+on CPU** — see the caveat below, and `.agents/specs/minimax-music3.md`. There is
+no by-name refusal left: nothing here is unimplemented. IndexTTS-2.5 still
+refuses naming its own missing pieces.
+
+**It runs on CPU and it is slow.** Every gate this row has was taken on CPU
+(`dgx.casa` was down throughout), and the acoustic half is upstream's own fp32.
+A 0.1 s request takes tens of minutes; no speed number exists and none is
+claimed. Ask for a short duration and few `num_inference_steps` while you are
+checking that it works.
+
+The part that dominates is *not* the one you would guess. The 8.6B language
+model goes through `vt` and uses the CPU threadpool; the RVQ depth decoder and
+the DiT do not — they are scalar host loops with a double accumulator, written
+that way in W2-W5 so their reduction order is reproducible against torch, and
+they run single-threaded. In one 0.1 s request the depth decoder alone is the
+majority of the wall clock.
 
 The same seam is reachable from the C ABI at v20 — `vllm_speech_engine_load`,
 `vllm_speech_engine_family` / `_sample_rate` / `_requires_reference_audio`,
@@ -2540,6 +2581,92 @@ python3 scripts/gen-minimax-music3-manifest.py \
   --output tests/vllm/models/minimax_music3_manifest.inc
 ```
 
+### MiniMax-Music3: the quantized arms
+
+**One quantized arm loads: the RVQ depth decoder from a GGUF Q4_K file.**
+Everything else is the bf16/fp32 diffusers checkpoint — bf16 `language_model` +
+`rvq_depth_decoder` + `condition_encoder`, fp32 `transformer` + `vocoder`,
+~28.5 GB resident.
+
+The implemented arm is pinned to a specific artifact, because an unpinned
+quantized checkpoint is not reproducible:
+
+| Field | Value |
+|---|---|
+| repo | `audio-cpp/MiniMax-Music3-GGUF` |
+| revision | `c36aaeed683f33b05796788e4204f4eeba8fa547` |
+| file | `rvq_depth_decoder_q4_k.gguf` (405 752 480 bytes) |
+| sha256 | `4c5d41b27418d9c1046345f649cb61d7cde0e3bbda4af7f7cb142df2c70cbdd0` |
+
+`MiniMaxMusic3LoadRvqDepthDecoderFromGguf` reads it: 47 tensors as 36 Q4_K
+projections, 9 BF16 norms and 2 F16 embedding tables, dequantized to bf16
+through the shared `gguf_dequant.h` seam. Only the **audio-cpp lineage** is
+read, keyed on `audiocpp.model_spec.family == "minimax_music3"` — not on
+`general.architecture`, which reads `audiocpp`, `mm3`, `qwen3` *and* `wan` across
+GGUFs of this one model and collides with genuine Wan video checkpoints. The
+other two published lineages are refused by name.
+
+**The other quantized formats still refuse**, and quantized MiniMax-Music3
+checkpoints do exist in five formats — a survey on 2026-08-14 found fourteen
+community repositories. Rather than mis-loading one or failing with a confusing
+shape error, `MiniMaxMusic3ResolveCheckpoint`, `MiniMaxMusic3AccountTensors` and
+`MiniMaxMusic3LoadConfig` each refuse **by name**:
+
+```
+minimax_music3: this checkpoint is QUANTIZED -- GGUF (evidence:
+condition_encoder.gguf, language_model_q4_k.gguf, ...; 5 of 5 entries examined
+carry the marker). NO quantized arm is implemented for MiniMax-Music3, so this
+is REFUSED rather than mis-loaded: a GGUF arm needs a name map, the
+GGUF-vs-torch dim reversal, a geometry source, and k-quant dequantization routed
+through vllm/model_executor/model_loader/gguf_dequant.h ...
+The supported arm is the bf16/fp32 diffusers arm ... The quantized arms are owed
+rather than forgotten: phase W7 of .agents/specs/minimax-music3.md, issue #672.
+```
+
+Eight formats are diagnosed — GGUF, NVFP4, MXFP4, FP8, INT8, AWQ/GPTQ,
+bitsandbytes and MLX — plus an `UNIDENTIFIED` case. Each message names the
+evidence found in *your* file, how many entries carried it, what a working arm
+would need, and the arm that does load. Detection happens in three places,
+because a quantized checkpoint announces itself in three different ways:
+
+| You point us at | Caught by | Because |
+|---|---|---|
+| a directory of `.gguf` files | the tree walk (depth 2, so `diffusion_models/` and `text_encoders/` count) | there is no component directory and no config to inspect |
+| a diffusers-shaped tree whose tensors are quantized | the manifest scan, from safetensors headers only | the sidecars (`weight_scale_2`, `weight_packed`, `qweight`, `absmax`) and the dtype-only formats (fp8, int8) are invisible to a shape check |
+| a checkpoint that *declares* it | the config parse | `quantization_config.quant_method`, or MLX's bare `quantization` |
+
+A bare `weight_scale` with no `weight_scale_2` and no `weight_packed` is
+reported as unidentified and the message names all three candidate schemes. It
+never picks one: guessing yields a finite, correctly shaped, correctly scaled,
+**wrong** result that no shape gate can see.
+
+Note if you hold a ComfyUI-format Music3 GGUF: those ship the DiT and condition
+encoder only — no language model, no depth decoder, no vocoder — so they cannot
+generate audio even once a GGUF arm lands.
+
+The refusal gate needs no checkpoint and no network:
+
+```sh
+cmake --build build -j 8 --target test_minimax_music3_quant
+./build/tests/test_minimax_music3_quant
+```
+
+The Q4_K arm's own gate needs the pinned GGUF and the bf16 checkpoint, and skips
+loudly without them:
+
+```sh
+CHECKPOINT_ROOT=/mnt/nas_share/checkpoints \
+  ./build/tests/test_minimax_music3_quant_real
+```
+
+It does not merely check that the numbers land inside a tolerance. It asserts
+the **resident ggml type** of all 47 tensors, checks the dequantized values lie
+on the **Q4_K lattice** (at most 16 distinct values per 32-element sub-block —
+a structure a bf16 read cannot produce), and bounds the output **two-sidedly**.
+The lower bound is the important one: a silent dequant fallback to the bf16
+weights lands *closer* to the golden (mean|d| 0.00182) than the genuine
+quantized arm (0.0324), so upper bounds alone cannot tell them apart.
+
 ### IndexTTS-2.5 goldens and checkpoint manifests
 
 The speech lane is not servable yet (see `/v1/audio/speech` above); these
@@ -2705,10 +2832,10 @@ Phases W4 and W5 of #672.
 pipeline: the 2.4B fp32 flow-matching DiT, the `FlowMatchEulerDiscreteScheduler`
 with `invert_sigmas`, the classifier-free-guidance mix, the denoise loop's
 overlapping-window bookkeeping, and the DAC Flow-VAE vocoder that turns latents
-into a **44100 Hz stereo** waveform. **It still does not generate a song end to
-end** — joining the two halves through `SpeechRegistry`, the `vllm_speech_*` ABI
-and the example server is W6, and the 8.6B `Qwen3ForCausalLM` forward is the
-remainder of W2.
+into a **44100 Hz stereo** waveform. Joining the two halves through
+`SpeechRegistry`, the `vllm_speech_*` ABI and the example server is W6, and the
+8.6B `Qwen3ForCausalLM` forward at the front of the pipeline is the rest of W2 —
+see [the language model](#minimax-music3-the-language-model-and-the-end-to-end-path).
 
 Configs are W1's (`MiniMaxMusic3TransformerConfig`,
 `MiniMaxMusic3VocoderConfig`, `MiniMaxMusic3SchedulerConfig`) rather than new
@@ -2792,3 +2919,90 @@ channel and the second 64 the right, and each stream is decoded independently by
 the same weights (`minimax_music3_vocoder.py:110,115`). Interleaving them is the
 other obvious reading of "fold 128 into 2 x 64" and produces a correctly shaped,
 correctly ranged, wrong waveform that no length or dtype check can see.
+
+## MiniMax-Music3: the language model, and the end-to-end path
+
+The rest of phase W2 of #672, and the piece that made the pipeline whole.
+`include/vllm/model_executor/models/minimax_music3_llm.h` carries the
+autoregressive loop itself (`encoders.py:299-353`) and the 8.6B
+`Qwen3ForCausalLM` at its centre. With it, a request generates a song.
+
+### The `inputs_embeds` entry the dense path did not have
+
+Upstream calls `language_model.model(inputs_embeds=...)` twice and
+`input_ids` never (`encoders.py:311`, `:353`), because the frame feedback
+`_embed_audio_frame` is a *sum* of one language-model embedding row and seven
+depth-decoder rows scaled by `num_codebooks^-0.5` — a continuous vector that
+corresponds to no vocabulary entry and that no token id can spell.
+
+`Qwen3DenseModel::ForwardEmbeds` is that door. The Qwen3 family already had it
+on its multimodal siblings — `qwen3_vl.h` takes `inputs_embeds_bf16` after
+scattering the vision tower's rows into it, and Gemma-4 and Muse-Glimmer do the
+same — because upstream's own `Qwen3Model.forward` accepts either input. Only the
+**dense** registration had never wired it.
+
+It is additive, and that is asserted rather than argued: feeding the embedding
+*of the same token ids* through the new entry reproduces `Forward` **bit for
+bit**, in the logits and in the paged KV it wrote, and
+`tests/vllm/models/test_qwen3_forward.cpp` checks both. `Qwen3ForCausalLM`,
+`LlamaForCausalLM`, `MistralForCausalLM`, `InternLM2ForCausalLM` and
+`InternLM3ForCausalLM` all ride that one forward, so nothing less than
+bit-identity would do.
+
+`out_hidden` is the second half of the same entry: the post-final-norm rows,
+returned from the forward that produced the logits. Music3 reads
+`last_hidden_state[:, -1]` and then applies `lm_head` to that very row, so
+fetching the two halves with two 8.6B passes would be pure waste.
+
+### `num_condition_layers: 8` does not mean eight transformer layers
+
+Worth stating because it is the reading a fresh implementer reaches for. The
+eight rows of a `frame_hiddens` entry are `cat(last_hidden, depth_hidden_1..7)`
+(`encoders.py:343`) — **one** language-model hidden state and the **seven**
+per-depth-step states of the RVQ decoder. Nothing captures per-layer outputs
+from the Qwen3 stack, and nothing needs to.
+
+### Running the gates
+
+The language-model gate drives the real 8.6B bf16 weights **teacher-forced** on
+the capture's own `rvq_codes.npy`, and skips loudly without the checkpoint:
+
+```sh
+VLLM_CPP_MUSIC3_CHECKPOINT=/path/to/minimax-music3 \
+  ./build/tests/test_minimax_music3_llm_real
+```
+
+It stages ~18.5 GB and runs 25 decode steps on CPU — several minutes, most of it
+the prefill. It compares 102 400 values against `frame_hiddens[:, :4096]`, ranks
+the oracle's own sampled codes under the reproduced guided logits, and pushes the
+result through the condition mix to `condition_chunk0.npy`.
+
+The end-to-end gate posts a request at `POST /v1/audio/speech` and asserts the
+WAV that comes back:
+
+```sh
+VLLM_CPP_MUSIC3_CHECKPOINT=/path/to/minimax-music3 \
+  VLLM_CPP_MUSIC3_DIT=1 \
+  ./build/tests/test_minimax_music3_e2e_real
+```
+
+`VLLM_CPP_MUSIC3_DIT=1` is required because the DiT arm is four to eight 2.4B
+fp32 host forwards. The generated WAV is written to `build/music3/` so you can
+listen to it; nothing under `tests/parity/goldens/` is created or replaced.
+
+### Why no gate compares a generated song to the oracle's
+
+Twice over, and both reasons are structural. The autoregressive codes are a
+seeded `torch.multinomial` draw (`encoders.py:94-103`) and the denoise loop's
+initial latents are a seeded `randn_tensor` (`denoise.py:117-121`). So both the
+code draw and the noise draw are **parameters** — `Music3CodeSampler` and
+`Music3NoiseSource` — and a gate supplies the capture's own values where the
+engine supplies a seeded draw of its own. That is the only entry at which this
+pipeline is comparable to the oracle at all.
+
+What an end-to-end request can honestly be held to is therefore what the gate
+asserts: that every stage runs, that the WAV is 44100 Hz 16-bit stereo, that its
+length is the one the request's duration implies, and that it is **real audio** —
+non-zero, unclipped, non-constant, and with two channels that differ (the stereo
+fold is a contiguous split of the 128 latent channels, and an interleave produces
+a correctly shaped, correctly ranged, wrong song).
