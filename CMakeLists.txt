@@ -702,6 +702,8 @@ add_library(vllm STATIC
   src/vllm/config/scheduler.cpp
   src/vllm/config/device.cpp
   src/vllm/config/kv_transfer.cpp
+  src/vllm/config/offload.cpp
+  src/vllm/model_executor/weight_offloader.cpp
   src/vllm/config/multimodal.cpp
   src/vllm/config/speculative.cpp
   src/vllm/outputs.cpp
@@ -769,8 +771,10 @@ add_library(vllm STATIC
   src/vllm/model_executor/models/minimax_h3_audio_vae.cpp
   src/vllm/model_executor/models/vocoder1d.cpp
   src/vllm/model_executor/models/minimax_music3_loader.cpp
+  src/vllm/model_executor/models/minimax_music3_quant.cpp
   src/vllm/model_executor/models/minimax_music3_ar.cpp
   src/vllm/model_executor/models/minimax_music3_acoustic.cpp
+  src/vllm/model_executor/models/minimax_music3_llm.cpp
   src/vllm/model_executor/models/minimax_music3_speech.cpp
   src/vllm/model_executor/models/gpt2.cpp
   src/vllm/multimodal/speech_engine.cpp
@@ -852,6 +856,7 @@ add_library(vllm STATIC
   src/vllm/model_executor/models/ltx2_loader.cpp
   src/vllm/entrypoints/openai/video_api.cpp
   src/vllm/entrypoints/openai/speech_api.cpp
+  src/vllm/entrypoints/openai/speech_api_synthesize.cpp
   src/vllm/model_executor/models/kimi_kda.cpp
   src/vllm/model_executor/models/kimi_linear_registry.cpp
   src/vllm/model_executor/models/kimi_linear_weights.cpp
