@@ -36,6 +36,7 @@
 #include <filesystem>
 #include <fstream>
 #include <map>
+#include <memory>
 #include <set>
 #include <string>
 #include <system_error>
@@ -675,17 +676,53 @@ TEST_CASE("NemotronH: the unported arms REFUSE BY NAME") {
                          std::runtime_error);
   }
 
-  SUBCASE("the forward is W4's, and REFUSES rather than returning zeros") {
-    // The case title says "arms", plural, but until now only the GGUF arm was
-    // exercised. `ForwardNemotronHForCausalLM` is an unconditional VT_CHECK,
-    // which throws std::runtime_error (vt/dtype.h:11-17), so it is directly
-    // callable: a stub LoadedModel is enough because the forward consumes
-    // neither the model nor the input. A forward that silently returned `{}`
-    // would produce zero logits and a plausible-looking garbage token.
-    struct StubModel : vllm::LoadedModel {
-      explicit StubModel(const vllm::ModelRegistration& r) : LoadedModel(r) {}
-    };
-    StubModel model(reg);
+  SUBCASE("the forward still REFUSES on a checkpoint load, rather than returning zeros") {
+    // UPDATED BY W4 (#517). W3 pinned this refusal when
+    // `ForwardNemotronHForCausalLM` was an unconditional VT_CHECK reading
+    // "forward is not implemented yet". W4 ports the forward MECHANISM
+    // (nemotron_h.cpp) and reaches it through this same
+    // `ModelRegistry::Forward` seam, so the unconditional refusal is gone — but
+    // a checkpoint STILL cannot be run, because there is no NemotronH weight
+    // LOADER at all. Every load therefore leaves `NemotronHHostWeights`
+    // unmaterialized and the forward refuses THERE instead, naming the piece
+    // that is actually missing rather than the whole feature.
+    //
+    // The guarantee this subcase exists for is UNCHANGED and is the one that
+    // matters: reaching the registered forward without a materialized
+    // checkpoint THROWS and NAMES the gap. A forward that silently returned
+    // `{}` would produce zero logits and a plausible-looking garbage token.
+    // What moved is only which piece the message names.
+    // The model handed to `factory->forward` MUST be the one
+    // `factory->load_weights` produced. `ForwardNemotronHForCausalLM`
+    // (nemotron_h_registry.cpp:100) opens the handle with
+    // `static_cast<NemotronHLoadedModel&>(model)` — the universal registry seam,
+    // shared verbatim by every other arch's forward — and that downcast is
+    // undefined behaviour on any object that is not really a
+    // `NemotronHLoadedModel`. Two DISTINCT lines, and the sanitizer names the
+    // second, not the first: the cast is nemotron_h_registry.cpp:102, while the
+    // member call made THROUGH the resulting reference — where the vptr check
+    // actually fires, and what the report quoted below is anchored to — is
+    // nemotron_h_registry.cpp:112:30, `nh.params()`.
+    // This subcase used to fabricate a bare
+    // `struct StubModel : vllm::LoadedModel` instead, which W3 got away with
+    // only because the forward was then an unconditional `VT_CHECK(false)` that
+    // never touched `model`. W4 added the downcast, and the stub turned it into
+    // a live type-confusion: UBSan's vptr check reported "member call on address
+    // ... which does not point to an object of type 'NemotronHLoadedModel'" and
+    // `-fno-sanitize-recover=all` aborted the process (issue #730).
+    //
+    // `LoadNemotronHForCausalLM` reads only `source.kind` and the config — there
+    // is no NemotronH weight loader yet — so it builds a REAL
+    // `NemotronHLoadedModel` with `NemotronHHostWeights` unmaterialized without
+    // touching a checkpoint. That is exactly the state this subcase is about,
+    // and it reaches the refusal through the real object rather than a
+    // look-alike, so the guarantee below is now asserted on the production type.
+    vllm::ModelSource source;
+    source.kind = vllm::ModelSource::Kind::kSafetensors;
+    const std::unique_ptr<vllm::LoadedModel> loaded =
+        reg.factory->load_weights(reg, config, source);
+    REQUIRE(loaded != nullptr);
+    vllm::LoadedModel& model = *loaded;
     const std::vector<int32_t> token_ids{0};
     const std::vector<int32_t> positions{0};
     const std::vector<int32_t> logits_indices{0};
@@ -704,10 +741,15 @@ TEST_CASE("NemotronH: the unported arms REFUSE BY NAME") {
                                         .queue = queue,
                                         .logits_indices = logits_indices,
                                         .num_reqs = 1};
-    // The message must NAME the missing piece, not just fail.
+    // The message must NAME the missing piece, not just fail. After W4 the
+    // missing piece is the WEIGHT LOAD, not the forward.
     CHECK_THROWS_WITH_AS(reg.factory->forward(model, input),
-                         doctest::Contains("NemotronHForCausalLM forward is "
-                                           "not implemented yet"),
+                         doctest::Contains("host weights are not materialized"),
+                         std::runtime_error);
+    // ...and it must still say so in NemotronH's own name, so a refusal from
+    // some shared helper cannot be mistaken for this one.
+    CHECK_THROWS_WITH_AS(reg.factory->forward(model, input),
+                         doctest::Contains("NemotronHForCausalLM forward"),
                          std::runtime_error);
     CHECK_THROWS_WITH_AS(reg.factory->forward(model, input),
                          doctest::Contains("nemotron-h-model.md"),

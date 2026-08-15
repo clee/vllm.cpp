@@ -12,6 +12,7 @@
 // .agents/specs/minimax-h3.md sections 0 and 4.
 #include "vllm/model_executor/models/dense_nvfp4_gemm.h"  // W-FP4a: W4A16 exec stats
 #include "vllm/model_executor/models/minimax_h3.h"
+#include "vllm/model_executor/models/vocoder1d.h"
 
 #include <doctest/doctest.h>
 
@@ -1851,7 +1852,7 @@ TEST_CASE("minimax_h3: the audio VAE decoder matches the checkpoint's own remote
   // The kaiser-sinc filter is COMPUTED, not loaded. Prove it first: if the filter
   // is wrong, every anti-aliased activation is wrong and the decoder mismatch
   // would be impossible to localize.
-  const std::vector<float> filter = vllm::MiniMaxH3KaiserSincFilter1d(0.5 / 2, 0.6 / 2, 12);
+  const std::vector<float> filter = vllm::vocoder1d::KaiserSincFilter1d(0.5 / 2, 0.6 / 2, 12);
   REQUIRE(filter.size() == std::size(vllm_test::kH3AudioVaeUpFilterGolden));
   double filter_err = 0.0;
   double filter_sum = 0.0;
@@ -1929,7 +1930,7 @@ TEST_CASE("minimax_h3: the audio VAE decoder matches the checkpoint's own remote
   // Weight-norm materialization: ||w_c|| must equal g_c exactly.
   const std::vector<float> g = {2.0f, 0.5f};
   const std::vector<float> v = {3.0f, 4.0f, 0.0f, 1.0f};  // rows [3,4] and [0,1]
-  const std::vector<float> w = vllm::MiniMaxH3MaterializeWeightNorm(g, v, 2);
+  const std::vector<float> w = vllm::vocoder1d::MaterializeWeightNorm(g, v, 2);
   REQUIRE(w.size() == 4);
   CHECK(w[0] == doctest::Approx(2.0f * 3.0f / 5.0f));
   CHECK(w[1] == doctest::Approx(2.0f * 4.0f / 5.0f));
@@ -6594,7 +6595,7 @@ TEST_CASE("minimax_h3: the audio-VAE ENCODER loader materializes weights that RU
       const std::vector<float> g = MakeParam("stenc.encoder.block.0.weight_g", cfg.encoder_dim,
                                              0.03, 0.15);
       const std::vector<float> materialized =
-          vllm::MiniMaxH3MaterializeWeightNorm(g, v, cfg.encoder_dim);
+          vllm::vocoder1d::MaterializeWeightNorm(g, v, cfg.encoder_dim);
       folded.push_back({"encoder.block.0.weight", e.shape,
                         std::string(reinterpret_cast<const char*>(materialized.data()),
                                     materialized.size() * sizeof(float))});
@@ -6709,7 +6710,7 @@ TEST_CASE("minimax_h3: the audio-VAE loader accepts a MATERIALIZED weight-norm t
 
   // THE POINT: running the decoder's own materialization on the reconstructed pair
   // must return the checkpoint's weight. Anything else is a silently wrong conv.
-  const std::vector<float> back = vllm::MiniMaxH3MaterializeWeightNorm(
+  const std::vector<float> back = vllm::vocoder1d::MaterializeWeightNorm(
       got.Get("conv_pre.parametrizations.weight.original0"),
       got.Get("conv_pre.parametrizations.weight.original1"), 4);
   REQUIRE(back.size() == w.size());
