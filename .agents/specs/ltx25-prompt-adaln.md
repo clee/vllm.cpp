@@ -465,12 +465,33 @@ assertions**, set gives **37 / 9031**, exit 0 both ways. The CASE count is the
 same in both configurations, so an unchanged case count never distinguishes them.
 The 2026-08-13 figures above are kept as what was measured then.
 
+**AND THEY MOVED AGAIN, one merge later — the figures in this paragraph are
+SUPERSEDED and are kept only as what was measured on the previous merge.**
+`0785cfc4d` (#882) added 306 lines to `tests/vllm/multimodal/test_ltx2_video.cpp`
+between `00613767d` and the merge that lands, taking it from **37 to 40**
+`TEST_CASE`s (`grep -c '^TEST_CASE'` on both revisions; the same grep returns
+matches on `origin/main`, so the count is not a failed pattern). That source
+count is what is MEASURED here. The doctest CASE and ASSERTION totals in both
+configurations were **NOT re-run** on this merge and are therefore UNKNOWN — not
+37 / 784 and 37 / 9031. A number that has moved twice in three days is not one to
+carry forward on the argument that it probably did not move a third time, and
+this file's own rule is that a count owes its configuration AND its date. Owed
+under [#673](https://github.com/mudler/vllm.cpp/issues/673), where this suite's
+configuration debt already lives; the `set` arm needs the 18.72 GB NVFP4 and
+23 GB FP8 DiTs under `$CHECKPOINT_ROOT`, so no CI host can close it.
+`test_ltx2_loader.cpp` and `test_ltx2_device.cpp` are byte-identical across those
+two revisions — `git diff --numstat` reports nothing on either, against a
+positive control that reports `62 8` on `ltx2_video.cpp` — so their counts below
+are unaffected, and `test_ltx2.cpp` differs only by this branch's own edit.
+
 **And CI never sets it — [#673](https://github.com/mudler/vllm.cpp/issues/673),
 filed 2026-08-13 as visible debt rather than repaired here.** `grep -rn
 CHECKPOINT_ROOT .github/` exits 1 with zero hits while the same pattern matches in
 `tests/` and `.agents/` (positive control run in the same command, so this is not
 an assertion from a failed grep). CI therefore executes **784 of 9031 assertions —
-8.7%** of this suite (2026-08-15; it was 502 of 8734, 5.7%, on 2026-08-13), at an
+8.7%** of this suite (measured on the PREVIOUS merge, 2026-08-15; it was 502 of
+8734, 5.7%, on 2026-08-13; both SUPERSEDED and un-remeasured after #882, see
+above — the RATIO is the finding and it does not depend on the exact totals), at an
 identical case count in both configurations, and
 `scripts/measure-ltx2-prompt-adaln.py` — which produces every shipped-weights
 number in this Outcome — is a manual tool no gate invokes (`grep -rn
@@ -704,7 +725,7 @@ Suite counts on the merged tree, exit 0 each, against the 2026-08-13 figures:
 | `test_ltx2` | 35 / 2435 | 43 / 4388 |
 | `test_ltx2_loader` | 26 / 4826 | 28 / 4978 |
 | `test_ltx2_device` | 15 / 523 | 18 / 546 |
-| `test_ltx2_video` | 30 / 502 unset, 30 / 8734 set | 37 / 784 unset, 37 / 9031 set |
+| `test_ltx2_video` | 30 / 502 unset, 30 / 8734 set | 37 / 784 unset, 37 / 9031 set — **SUPERSEDED, not re-run after #882 took the file to 40 `TEST_CASE`s** |
 
 The growth is #658's, not this reconciliation's: no `src/` or `include/` file
 differs from `origin/main` on this branch.
@@ -791,7 +812,7 @@ scratch copy and **BUILT=YES, compile_err=NO**, so this is a test result:
 | suite | enters through | result |
 |---|---|---|
 | `test_ltx2` | `Ltx2DitForward`, by hand | RED — 3 of 43 cases, 6 of 4388 assertions, exit 1 |
-| `test_ltx2_video` | `vllm_video_generate` / the ABI | **GREEN** — 37 of 37, 784 of 784, exit 0 |
+| `test_ltx2_video` | `vllm_video_generate` / the ABI | **GREEN** — 37 of 37, 784 of 784, exit 0 (on the previous merge; #882 has since added 3 cases, and the mutation was NOT re-run — the finding is that the suite is green with the term deleted, which more cases cannot undo) |
 
 The entry-point suite drives the path — its fixture sets the flag TRUE
 (`tests/vllm/multimodal/ltx2_video_fixture.h:258`) — and asserts no value the
