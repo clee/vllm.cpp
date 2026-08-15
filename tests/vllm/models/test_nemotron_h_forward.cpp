@@ -1733,8 +1733,8 @@ TEST_CASE("NemotronH A2-R: the device attention block matches the host reference
     // ── THE NO-ROPE PROPERTY IS GATED NUMERICALLY, NOT BY TOKENS ────────────
     // Applying rope_theta/partial_rotary_factor changes no tensor SHAPE and on
     // a short prompt need not move a token at all (spec §6b). So the property
-    // is proven by SEPARATION: the device block's answer must be far from the
-    // answer a rotated block would give, by much more than the band above.
+    // is proven by SEPARATION: the band above must REJECT the answer a rotated
+    // block would give, and the device's own answer must sit outside it.
     //
     // The instrument is checked before the property: if this rotation were a
     // no-op, a forward that correctly applies none would look identical to one
