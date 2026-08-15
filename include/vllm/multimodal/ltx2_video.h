@@ -411,7 +411,7 @@ struct Ltx2ConditioningTrace {
   // over on the LAST phase — the target grid plus whatever an appending
   // conditioning item added (keyframe_cond.py:79-82). `schedule_tokens` is the
   // count the sigma schedule read, which upstream fixes at the TARGET: its shift
-  // comes from `math.prod(latent.shape[2:])` (schedulers.py:38-39), the
+  // comes from `math.prod(latent.shape[2:])` (schedulers.py:32), the
   // UNPATCHIFIED target latent, and the pipelines compute sigmas before any state
   // exists (ti2vid_one_stage.py:207, distilled.py:200-201). So a render that
   // appends must show `video_tokens > schedule_tokens`, and a build that let the

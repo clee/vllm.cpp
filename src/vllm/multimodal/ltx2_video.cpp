@@ -1722,7 +1722,8 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
     // equal to it and is GROWN by any appending conditioning item. Row
     // LTX25-TOKEN-APPEND (#930) split the two, and the two places that must keep
     // reading the target rather than the grown count are the sigma schedule
-    // (schedulers.py:38-39 derives its shift from the unpatchified target, and
+    // (schedulers.py:32-39 reads the unpatchified target at :32 and turns it into
+    // the shift at :39, and
     // the pipelines compute sigmas before the state exists at all) and the trim
     // at the bottom of the loop (`clear_conditioning`, tools.py:101).
     const int64_t target_tokens = Ltx2VideoTokenCount(vshape, 1);
@@ -1973,6 +1974,35 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
                "token. A buffer that did not grow with the others is invisible to the render's "
                "SHAPE — the clip comes out the right size and simply describes the wrong "
                "tokens.");
+
+      // AND IT LANDED ON THE LAST FRAME. Everything above proves the sequence
+      // grew and stayed self-consistent; none of it can see WHERE the appended
+      // tokens sit in time, and that is the whole content of this arm. MEASURED:
+      // mutation M10 changed `frame_idx` from `frames - 1` to `0` and the suite
+      // stayed GREEN — both renders still differed from the no-op control and
+      // from each other, and the token count was identical, because a keyframe
+      // pinned to the FIRST frame appends exactly as many tokens as one pinned
+      // to the last.
+      //
+      // The expectation is recomputed from `frames` and `fps`, NOT read back
+      // from the `frame_idx` argument above, so the two are independent
+      // expressions and a mutation of the argument alone moves one and not the
+      // other. `Ltx2ConditionVideoByKeyframe` offsets the item's temporal
+      // coordinates by `frame_idx` in integer PIXEL space and then divides the
+      // temporal axis by fps (keyframe_cond.py:52-58), so the first appended
+      // token's temporal START is `frame_idx / fps`. Positions are
+      // [pos_dims, tokens, 2] concatenated PER DIMENSION, so the temporal axis
+      // is dimension 0 and the first appended token sits at `target_tokens * 2`.
+      const double want_t0 = static_cast<double>(static_cast<float>(
+          static_cast<double>(frames - 1) / fps));
+      const double got_t0 = video.positions[static_cast<size_t>(target_tokens * 2)];
+      VT_CHECK(std::abs(got_t0 - want_t0) <= 1e-5 * std::max(1.0, std::abs(want_t0)),
+               "ltx2 video: the last-frame keyframe's appended tokens must carry the temporal "
+               "position of pixel frame `frames - 1` (" +
+                   std::to_string(want_t0) + "), but the first appended token starts at " +
+                   std::to_string(got_t0) +
+                   ". A keyframe that appends the right number of tokens at the wrong TIME "
+                   "renders a clip of the right length that pins the image to the wrong end");
     }
 
     // The noiser draws VIDEO first, AUDIO second, from one generator
@@ -2015,7 +2045,7 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
       if (steps < 1) Fail("num_inference_steps resolved to " + std::to_string(steps));
       // `target_tokens`, NOT `video.tokens`, and this line sits AFTER the
       // conditioning block so the distinction is live. Upstream's shift comes
-      // from `tokens = math.prod(latent.shape[2:])` (schedulers.py:38-39) — the
+      // from `tokens = math.prod(latent.shape[2:])` (schedulers.py:32) — the
       // UNPATCHIFIED target latent, which by construction cannot see appended
       // tokens — and every pipeline computes its sigmas before a state exists at
       // all (ti2vid_one_stage.py:207 passes no latent; distilled.py:200-201 uses

@@ -2282,7 +2282,9 @@ TEST_CASE("ltx2 video: a LAST-frame keyframe is APPENDED, and the sequence is tr
 
   SUBCASE("the sigma schedule keeps reading the TARGET count, not the grown one") {
     // The distilled two-stage recipe carries its own frozen sigmas
-    // (ltx2_recipes.py:125-158), so it never computes a schedule and cannot show
+    // (distilled.py:200-201 defaults both stages to the `DISTILLED_SIGMAS` /
+    // `STAGE_2_DISTILLED_SIGMAS` constants of utils/constants.py:17-23), so it
+    // never computes a schedule and cannot show
     // this. `one_stage` does: `phase.sigmas` is empty, so the engine calls
     // `Ltx2SigmaSchedule`, whose shift is a function of the token count
     // (schedulers.py:37-39).

@@ -182,10 +182,16 @@ void Ltx2ExtendKeyframesMask(Ltx2LatentState* state, int64_t num_new_tokens, boo
 //
 // TWO THINGS HERE ARE NOT A TRUNCATION and a port that only slices gets both
 // wrong. The denoise mask comes back as `torch.ones_like(...)[:, :num_tokens]`
-// (:103) — ALL ONES, not the conditioned mask sliced — because the returned
-// state describes a finished latent in which every target token is denoised.
-// And `keyframes_mask` is dropped to None (:112), because the marker described a
-// sequence that no longer exists.
+// (tools.py:104) — ALL ONES, not the conditioned mask sliced — because the
+// returned state describes a finished latent in which every target token is
+// denoised. And `keyframes_mask` is dropped to None (tools.py:113), because the
+// marker described a sequence that no longer exists.
+//
+// Both anchors are spelled with their FILE rather than left as bare `:NN`
+// continuations. The nearest file named above them is `blocks.py`, and
+// `blocks.py:104` and `blocks.py:113` are both real import statements, so a bare
+// form would send a reader who checks to a plausible wrong place rather than to
+// nothing — which is the failure mode worth spending eight characters on.
 void Ltx2ClearConditioning(Ltx2LatentState* state, int64_t target_tokens);
 
 // AudioConditionByReferenceLatent (reference_audio_cond.py:33-65): APPEND already

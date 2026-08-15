@@ -2479,7 +2479,9 @@ TEST_CASE("ltx2 conditioning: extend_keyframes_mask mirrors BOTH of upstream's N
     CHECK(state.keyframes_mask.empty());
   }
   SUBCASE("no existing mask and MARKED zero-fills first, then marks the new tokens") {
-    // `existing = torch.zeros_like(latent_state.denoise_mask)` (:100-101) sized
+    // `existing = torch.zeros_like(latent_state.denoise_mask)`
+    // (mask_utils.py:100-101 — named in full because the nearest file above is
+    // `tools.py`, whose :100-101 is a real but unrelated statement) sized
     // by the state BEFORE the append, then ones for the new tokens. The one
     // upstream caller that passes true is `VideoGeneratedKeyframeSlots`
     // (keyframe_slots.py:121).
@@ -2512,13 +2514,37 @@ TEST_CASE("ltx2 conditioning: clear_conditioning TRIMS an append back to the tar
   REQUIRE(target_tokens == vllm_test::kLtx2CondVideoBaseTokens);
   const std::vector<float> target_positions = state.positions;
 
+  // A CONDITIONED MASK VALUE INSIDE THE TARGET RANGE, and without it the
+  // all-ones assertion below gates NOTHING. `Ltx2CreateVideoLatentState` already
+  // fills every target token's mask with 1.0, and the keyframe append writes its
+  // `1 - strength` only at the TAIL, which a slice to `target_tokens` drops
+  // anyway — so "restore all ones" and "slice" produce identical bytes over the
+  // range the loop walks, and a slicing build passes. MEASURED: mutation M6
+  // sliced instead of restoring and this case stayed GREEN.
+  //
+  // `Ltx2ConditionVideoByLatentIndex` is the fix because it writes `1 - strength`
+  // at `start .. start + count` INSIDE the target (latent_cond.py:41; ours at
+  // ltx2_conditioning.cpp, the `state->mask[i] = 1.0 - strength` loop). At
+  // `latent_idx = 0` that is `start = 0`, `count = 1*2*2 = 4` of the 12 target
+  // tokens, so a slice leaves 0.4 at token 0 and the loop below REDs.
+  const vllm::Ltx2LatentVolume first = CondVolume("ltx2.cond.first", 4, 1, 2, 2);
+  vllm::Ltx2ConditionVideoByLatentIndex(&state, target, kCondPatch, first, /*strength=*/0.6,
+                                        /*latent_idx=*/0);
+  // THE INSTRUMENT IS ARMED, asserted rather than assumed. If this ever came
+  // back 1.0 the all-ones loop below would silently return to gating nothing,
+  // which is the exact state this case was repaired out of.
+  REQUIRE(state.mask.front() == doctest::Approx(0.4F));
+
   const vllm::Ltx2LatentVolume keyframe = CondVolume("ltx2.cond.keyframe", 4, 1, 2, 2);
   vllm::Ltx2ConditionVideoByKeyframe(&state, keyframe, kCondPatch, factors, kCondFps,
                                      vllm_test::kLtx2CondKeyframeFrameIdx, /*strength=*/0.6,
                                      /*num_pixel_frames=*/1, /*causal_fix=*/true);
   REQUIRE(state.tokens > target_tokens);
-  // The appended tokens carry `1 - strength` = 0.4, which is what makes the
-  // all-ones assertion below a real check rather than a restatement.
+  // The APPENDED tokens carry `1 - strength` = 0.4 too. This one is a check on
+  // the append, NOT on the clear: `.back()` sits past `target_tokens`, so the
+  // trim drops it under either implementation and it can say nothing about
+  // all-ones-versus-slice. The value that separates those is `mask.front()`
+  // above.
   REQUIRE(state.mask.back() == doctest::Approx(0.4F));
 
   vllm::Ltx2ClearConditioning(&state, target_tokens);

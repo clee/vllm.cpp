@@ -118,8 +118,11 @@ In scope:
 * The engine's phase loop: a `target_tokens` that the sigma schedule and the
   trim both read, a grown `video.tokens` through the DiT, and the trim before
   `Ltx2VideoUnpatchify`.
-* The **last-frame keyframe** arm, lifted, driven from `VideoGenParams::last_frame_path`
-  / `last_frame_ppm`.
+* The **last-frame keyframe** arm, lifted, driven from
+  `VideoGenParams::last_frame_path` **alone**. There is no `last_frame_ppm`
+  field: `video_engine.h:90-91` declares `first_frame_path, last_frame_path` and
+  a `first_frame_ppm` for the server's `data:` URLs, and the in-memory
+  alternative exists on the first-frame side only.
 
 Out of scope, and refused as today:
 
@@ -139,8 +142,8 @@ Out of scope, and refused as today:
   per slot (`types.py:269-273`). The seam this row builds is its prerequisite,
   not its implementation.
 * **Reference audio.** Blocked on the audio VAE encoder key filter, untouched.
-* Any `include/vllm.h` growth. `last_frame` / `last_frame_ppm` already exist on
-  the ABI; nothing new is exposed.
+* Any `include/vllm.h` growth. `last_frame` already exists on the ABI
+  (`vllm.h:910`); nothing new is exposed.
 
 ## 3. Design
 
@@ -213,8 +216,8 @@ which is the production entry point.
 1. **`test_ltx2_vae` — the seam, at the unit.** `Ltx2ExtendKeyframesMask` on
    both `marked` polarities and on the empty-mask branch (`mask_utils.py:74-105`).
    `Ltx2ClearConditioning` restores the target token count, restores an
-   **all-ones** mask rather than the conditioned one (`tools.py:103`), trims
-   positions per dimension, and drops the keyframes mask (`tools.py:112`).
+   **all-ones** mask rather than the conditioned one (`tools.py:104`), trims
+   positions per dimension, and drops the keyframes mask (`tools.py:113`).
    `AppendTokens` keeps `keyframes_mask.size() == tokens` across an append.
 2. **`test_ltx2_video` — the arm, through the entry point.** A last-frame
    keyframe renders instead of refusing, and the refusal case's last-frame
@@ -270,6 +273,36 @@ Planned mutations:
 | M4 | point the sigma schedule back at `video.tokens` | RED |
 | M5 | append with `marked=true` instead of `false` | RED |
 
+Two more were added by the fresh review, and both were **GREEN** on the first
+implementation. They are recorded here because each names a guarantee this row
+advertises, and a guarantee no mutation can move is a comment rather than a
+gate:
+
+| id | mutation | expected |
+|---|---|---|
+| M6 | `Ltx2ClearConditioning` SLICES the mask instead of restoring all ones | RED |
+| M10 | the last-frame arm's `frame_idx` becomes `0` instead of `frames - 1` | RED |
+
+**Why M6 was green.** `Ltx2CreateVideoLatentState` already fills every target
+token's mask with `1.0`, and the append writes `1 - strength` only at the TAIL,
+which the trim drops under either implementation. So over the range the test
+walked, "restore all ones" and "slice" produce identical bytes. The repair
+conditions a token INSIDE the target first, with
+`Ltx2ConditionVideoByLatentIndex` at `latent_idx = 0`, which writes
+`1 - strength` at `start .. start + count` (`latent_cond.py:41`); a slice then
+leaves `0.4` at token 0. The case also `REQUIRE`s that value BEFORE the trim, so
+a future change that stops arming the instrument fails loudly rather than
+returning the case to gating nothing.
+
+**Why M10 was green.** Both renders still differed from the no-op control and
+from each other, and the token count was identical, because a keyframe pinned to
+the FIRST frame appends exactly as many tokens as one pinned to the last. The
+pixel witness can see THAT an append happened and WHAT was appended; it cannot
+see WHERE. The repair asserts the first appended token's temporal position at
+the engine, recomputed from `frames` and `fps` rather than read back from the
+`frame_idx` argument, so the check and the thing it checks are independent
+expressions.
+
 ## 7. Stop conditions
 
 * Stop and report `NEEDS_DECISION` rather than lifting the reference-video arm:
@@ -324,5 +357,15 @@ caller.** See `## Owed`.
 ## 10. Now
 
 `ACTIVE` — spec committed before implementation; implementation, docs and tests
-on the same branch; PR [#948](https://github.com/mudler/vllm.cpp/pull/948) open
-and awaiting a fresh review.
+on the same branch; PR [#948](https://github.com/mudler/vllm.cpp/pull/948) open.
+
+A fresh review returned `FAIL` on six findings and all six are repaired. The
+seam itself survived: every upstream design decision checked out and the pixel
+witness reproduced exactly. What did not survive was the evidence around it —
+two advertised guarantees had no mutation that could move them (§6, M6 and M10),
+four records carried anchors that resolve to real-but-different upstream
+statements, and `origin/main` advanced to `c2019b0e3` (#935) mid-review so the
+branch stopped merging. The anchor sweep was redone from the claims rather than
+trusted, and it found two more the review had not: a citation to
+`ltx2_recipes.py`, which exists neither upstream nor here, and a bare `:100-101`
+whose nearest named file was the wrong one.
