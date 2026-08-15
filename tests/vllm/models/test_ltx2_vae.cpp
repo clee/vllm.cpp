@@ -2406,6 +2406,151 @@ TEST_CASE("ltx2 conditioning: a REFERENCE VIDEO is translated into the target's 
   CHECK(plain.positions != state.positions);
 }
 
+// ─── the token-APPEND seam (row LTX25-TOKEN-APPEND, issue #930) ─────────────
+//
+// UPSTREAM SHIPS NO TESTS. `find /home/mudler/_git/LTX-2 -name 'test_*.py'`
+// returns 0 across the whole repository at pin `fd4ded7f`, so there is no suite
+// to port and each case below is written against an upstream ANCHOR instead:
+// every assertion names the `file:line` that justifies the behaviour it checks.
+//
+// These are the two halves of an append the conditioning items could not do for
+// themselves. The items concatenate; nothing extended the per-token marker
+// alongside them, and nothing trimmed the sequence back.
+
+TEST_CASE("ltx2 conditioning: an APPEND extends the per-token keyframes marker") {
+  const vllm::Ltx2VideoLatentShape target = CondVideoTarget();
+  const vllm::Ltx2ScaleFactors factors;
+  vllm::Ltx2LatentState state =
+      vllm::Ltx2CreateVideoLatentState(target, kCondPatch, factors, kCondFps, true);
+
+  // `create_initial_state` returns the marker ON the state (tools.py:184), not
+  // beside it. A port that only filled the out-parameter would leave an
+  // appending item with nothing to extend.
+  REQUIRE(static_cast<int64_t>(state.keyframes_mask.size()) == state.tokens);
+  const std::vector<float> before = state.keyframes_mask;
+
+  const vllm::Ltx2LatentVolume keyframe = CondVolume("ltx2.cond.keyframe", 4, 1, 2, 2);
+  vllm::Ltx2ConditionVideoByKeyframe(&state, keyframe, kCondPatch, factors, kCondFps,
+                                     vllm_test::kLtx2CondKeyframeFrameIdx, /*strength=*/0.6,
+                                     /*num_pixel_frames=*/1, /*causal_fix=*/true);
+
+  // ONE VALUE PER TOKEN, still. This is the invariant `extend_keyframes_mask`
+  // exists for, in upstream's own words: "otherwise the per-token marker goes
+  // out of sync with the token sequence" (mask_utils.py:83-85). Out of sync is
+  // invisible to every shape check downstream — the render stays the right size
+  // and applies a trained term to the wrong tokens.
+  CHECK(static_cast<int64_t>(state.keyframes_mask.size()) == state.tokens);
+  REQUIRE(state.tokens == vllm_test::kLtx2CondKeyframeTokens);
+
+  // The ORIGINAL values are untouched...
+  for (size_t i = 0; i < before.size(); ++i) {
+    INFO("target token " << i);
+    CHECK(state.keyframes_mask[i] == before[i]);
+  }
+  // ...and every appended token is UNMARKED. `marked=False` for given keyframe
+  // content (keyframe_cond.py:85-86, whose comment says given keyframe content
+  // carries no keyframe marker). Marking them would add a trained bias to
+  // tokens upstream leaves alone, and the render would still be finite and the
+  // right shape.
+  for (size_t i = before.size(); i < state.keyframes_mask.size(); ++i) {
+    INFO("appended token " << i);
+    CHECK(state.keyframes_mask[i] == 0.0F);
+  }
+}
+
+TEST_CASE("ltx2 conditioning: extend_keyframes_mask mirrors BOTH of upstream's None branches") {
+  // The branches are not symmetric and a port that treats them as one gets the
+  // generated-slot arm silently wrong (mask_utils.py:96-101).
+  SUBCASE("no existing mask and UNMARKED stays None") {
+    // `if existing is None and not marked: return None`
+    // (conditioning/mask_utils.py:98-99). An audio state carries no marker:
+    // `AudioLatentTools.create_initial_state` (tools.py:246-280) returns
+    // `self.patchify(LatentState(...))` with no `keyframes_mask` argument at
+    // all, where the video tools' own `create_initial_state` sets one on the
+    // line that builds the state (tools.py:184). Appending reference audio must
+    // therefore not materialise a zero mask, because a zero mask IS a mask and
+    // the DiT would read it as one.
+    const vllm::Ltx2AudioLatentShape target = CondAudioTarget();
+    const vllm::Ltx2AudioPatchifierParams params;
+    vllm::Ltx2LatentState state = vllm::Ltx2CreateAudioLatentState(target, params);
+    REQUIRE(state.keyframes_mask.empty());
+
+    vllm::Ltx2ExtendKeyframesMask(&state, /*num_new_tokens=*/3, /*marked=*/false);
+    CHECK(state.keyframes_mask.empty());
+  }
+  SUBCASE("no existing mask and MARKED zero-fills first, then marks the new tokens") {
+    // `existing = torch.zeros_like(latent_state.denoise_mask)` (:100-101) sized
+    // by the state BEFORE the append, then ones for the new tokens. The one
+    // upstream caller that passes true is `VideoGeneratedKeyframeSlots`
+    // (keyframe_slots.py:121).
+    const vllm::Ltx2AudioLatentShape target = CondAudioTarget();
+    const vllm::Ltx2AudioPatchifierParams params;
+    vllm::Ltx2LatentState state = vllm::Ltx2CreateAudioLatentState(target, params);
+    const int64_t before = state.tokens;
+    REQUIRE(before > 0);
+
+    vllm::Ltx2ExtendKeyframesMask(&state, /*num_new_tokens=*/3, /*marked=*/true);
+    REQUIRE(static_cast<int64_t>(state.keyframes_mask.size()) == before + 3);
+    for (int64_t i = 0; i < before; ++i) {
+      INFO("pre-existing token " << i);
+      CHECK(state.keyframes_mask[static_cast<size_t>(i)] == 0.0F);
+    }
+    for (int64_t i = before; i < before + 3; ++i) {
+      INFO("new token " << i);
+      CHECK(state.keyframes_mask[static_cast<size_t>(i)] == 1.0F);
+    }
+  }
+}
+
+TEST_CASE("ltx2 conditioning: clear_conditioning TRIMS an append back to the target grid") {
+  const vllm::Ltx2VideoLatentShape target = CondVideoTarget();
+  const vllm::Ltx2ScaleFactors factors;
+  vllm::Ltx2LatentState state =
+      vllm::Ltx2CreateVideoLatentState(target, kCondPatch, factors, kCondFps, true);
+
+  const int64_t target_tokens = state.tokens;
+  REQUIRE(target_tokens == vllm_test::kLtx2CondVideoBaseTokens);
+  const std::vector<float> target_positions = state.positions;
+
+  const vllm::Ltx2LatentVolume keyframe = CondVolume("ltx2.cond.keyframe", 4, 1, 2, 2);
+  vllm::Ltx2ConditionVideoByKeyframe(&state, keyframe, kCondPatch, factors, kCondFps,
+                                     vllm_test::kLtx2CondKeyframeFrameIdx, /*strength=*/0.6,
+                                     /*num_pixel_frames=*/1, /*causal_fix=*/true);
+  REQUIRE(state.tokens > target_tokens);
+  // The appended tokens carry `1 - strength` = 0.4, which is what makes the
+  // all-ones assertion below a real check rather than a restatement.
+  REQUIRE(state.mask.back() == doctest::Approx(0.4F));
+
+  vllm::Ltx2ClearConditioning(&state, target_tokens);
+
+  // `latent`, `clean_latent` and `positions` truncated to
+  // `patchifier.get_token_count(target_shape)` (tools.py:101-105).
+  CHECK(state.tokens == target_tokens);
+  CHECK(static_cast<int64_t>(state.latent.size()) == target_tokens * state.width);
+  CHECK(static_cast<int64_t>(state.clean.size()) == target_tokens * state.width);
+
+  // THE MASK COMES BACK ALL ONES, not the conditioned mask sliced
+  // (tools.py:104 — `torch.ones_like(latent_state.denoise_mask)[:, :num_tokens]`).
+  // Slicing instead would leave 0.4 on nothing here, but on the two-stage recipe
+  // it would carry a conditioned mask into the next phase's initial latent.
+  REQUIRE(static_cast<int64_t>(state.mask.size()) == target_tokens);
+  for (int64_t i = 0; i < target_tokens; ++i) {
+    INFO("mask token " << i);
+    CHECK(state.mask[static_cast<size_t>(i)] == 1.0F);
+  }
+
+  // POSITIONS ARE TRIMMED PER DIMENSION. They are [pos_dims, tokens, 2], so a
+  // plain resize keeps the first dimension's APPENDED tokens and drops the last
+  // dimension's real ones — and the result still has the right length. Held to
+  // the target's own positions byte for byte, which is the only statement that
+  // can see the difference.
+  REQUIRE(state.positions.size() == target_positions.size());
+  CHECK(state.positions == target_positions);
+
+  // `keyframes_mask=None` (tools.py:113).
+  CHECK(state.keyframes_mask.empty());
+}
+
 TEST_CASE("ltx2 conditioning: the audio state and its REFERENCE AUDIO append") {
   const vllm::Ltx2AudioLatentShape target = CondAudioTarget();
   const vllm::Ltx2AudioPatchifierParams params;
