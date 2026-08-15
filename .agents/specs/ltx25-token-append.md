@@ -297,6 +297,32 @@ Planned mutations:
   discovered later, per `.agents/reachability.md` `## Landing a slice that is not
   reached yet`. Owner: row `LTX25-GENERATED-KEYFRAMES`, issue #920.
 
-## 9. Now
+## 9. What the mutation pass could NOT reach
 
-`ACTIVE` — spec committed, implementation to follow on the same branch.
+Recorded because a reviewer should press on it rather than rediscover it.
+
+**The sigma-schedule binding has a residual.** `schedule_tokens` is a local that
+feeds both `Ltx2SigmaSchedule` and the trace, so the ordinary mutation — changing
+what the local is initialised from — moves both and REDs (M4). A mutation that
+edited only the *call argument* and left the local alone would not be caught by
+that field. Nothing local can close this: the instrument and the thing it
+measures would have to be the same expression, and then it would measure nothing.
+The pixel witness does not close it either, because it has no
+correct-schedule render to compare against.
+
+**The trim is gated on a guard, not on pixels.** Appended tokens sit at the tail
+of a contiguous `[tokens, width]` buffer and `Ltx2VideoUnpatchify` takes a bare
+pointer, so an un-trimmed state unpatchifies the same head bytes and renders
+pixel-identical frames. M3 therefore REDs on the `VT_CHECK` at the unpatchify
+boundary rather than on any output difference. That is the honest description:
+the trim's correctness on this engine's path is an invariant this row asserts,
+not a difference this row can observe.
+
+**`Ltx2ExtendKeyframesMask(marked=true)` has a unit driver and no production
+caller.** See `## Owed`.
+
+## 10. Now
+
+`ACTIVE` — spec committed before implementation; implementation, docs and tests
+on the same branch; PR [#948](https://github.com/mudler/vllm.cpp/pull/948) open
+and awaiting a fresh review.
