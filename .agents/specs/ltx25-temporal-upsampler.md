@@ -358,8 +358,8 @@ this row adds no real-weight arm to it. Nothing here claims one.
 
 ### 8.6 Counts, against the denominator
 
-Re-measured on the merged tree, merge commit `0fdce00b0`, base
-`51e0cb5b15fef9dd76c9aa1727b4dbc9e59cdff2`. The first row of figures below was
+Re-measured on the merged tree, merge commit `288bcba8d`, base
+`6e6bba63d7c1a198b292207f53727aff79eb73c0`. The first row of figures below was
 taken against a base about ninety commits older, so every denominator had moved
 under it. A changed count is a red result until it is attributed, so each delta
 names what it belongs to.
@@ -367,9 +367,14 @@ names what it belongs to.
 | Suite | at this base | on this branch | this row's delta |
 |---|---|---|---|
 | `test_ltx2_pipeline` | 37 cases / 2382 assertions (older base) | 38 / 2443 | +1 case, +61 assertions |
-| `test_ltx2_video` | **33 / 576, measured at this base** | 33 / 579 | +0 cases, +3 assertions |
+| `test_ltx2_video` | **33 / 576, measured** | 33 / 579 | +0 cases, +3 assertions |
 
-Both `RUN_EXIT=0`.
+Both `RUN_EXIT=0`. The base figure was measured at
+`51e0cb5b1` and still applies here, because the two commits that advanced the
+base to `6e6bba63d` touch neither focused suite: the diff of
+`test_ltx2_video.cpp` and `test_ltx2_pipeline.cpp` across them is empty, while
+the same command over `tests/` names eight other files, so the empty result is a
+measurement and not a mistyped path.
 
 `test_ltx2_video` grew from the 30 / 502 recorded above to 33 / 576 on `main`
 while this branch was open, and none of that growth is this row's. The base
@@ -383,27 +388,31 @@ row's only edit to that file is one additive `SUBCASE` carrying three `CHECK`s,
 and the measurement returns exactly three. A `SUBCASE` adds no case, which is why
 the case count is flat on both sides of the row.
 
-`ctest -N` = **472**, and none of it is this row's. The 423 recorded earlier was
-`-N` at the older base. This branch changes no build file at all — the diff of
-`CMakeLists.txt`, `tests/CMakeLists.txt` and `examples/CMakeLists.txt` against
-the base is empty — so it registers no binary and its `-N` is the base's by
-construction.
+`ctest -N` = **473**, and none of it is this row's. The 423 recorded earlier was
+`-N` at the older base, and 472 was `-N` one base ago. This branch changes no
+build file at all — the diff of `CMakeLists.txt`, `tests/CMakeLists.txt` and
+`examples/CMakeLists.txt` against the base is empty — so it registers no binary
+and its `-N` is whatever the base registers. The 472 to 473 step is the base's
+own: the two commits that advanced it edited both `CMakeLists.txt` and
+`tests/CMakeLists.txt`, which is the positive control for the empty diff above.
 
-Full gate on the merged tree: `ctest -j 4` = **472/472 passed, 0 failed**,
-`CTEST_EXIT=0`, 766 s, with `test_modelopt_mixed_precision_checkpoint` and
-`test_voxtral_e2e` skipped by their own guards and nothing else skipped. The
-`-j 8` starvation flake recorded above did not need re-running serially, because
-nothing failed at `-j 4`. The run was taken on a heavily contended host — one
-minute load average between 8 and 64 across it — and still returned zero
-failures, which makes the green stronger than a quiet-box green rather than
-weaker. Disk 81 GB free after the build; the build log contains no
-`No space left` and no `BFD assertion`, over 2614 lines of real output.
+Full gate on the merged tree: `ctest -j 4` = **473/473 passed, 0 failed**,
+`CTEST_EXIT=0`, 765.03 s, with `test_modelopt_mixed_precision_checkpoint` and
+`test_voxtral_e2e` skipped by their own guards and nothing else skipped. Nothing
+in the standing known-red set fired: `test_op_parity` passed in 1.40 s because
+its fix arrived with the merge, and the parallel-starvation set needed no serial
+re-run because nothing failed. The `-j 8` flake recorded above therefore did not
+have to be re-tested. The run spanned a one-minute load average from 10 to 92 on
+a host shared with another session, and still returned zero failures, which makes
+this green harder to obtain than a quiet-box green rather than softer.
 
-The gate ran before the commits on this branch were reordered so that the record
-edit rides with the sources it describes, as `check-doc-checkpoint.py` requires.
-The tree it ran on differs from this one in `docs/USAGE.md` and nothing else:
-`git diff --name-only` between them names that one file, and no test reads it.
-`BUILD_EXIT=0` with zero errors and zero warnings.
+The build was a clean rebuild from a wiped directory, not an incremental one,
+because the base advanced across `qwen3.h`, two Music3 headers and
+`speech_api.h`, and an incremental green over a changed header is not a clean
+green. `BUILD_EXIT=0` with zero errors and zero warnings; the 1879-line build log
+contains no `No space left` and no `BFD assertion`, against 477 `Built target`
+lines from the same grep. Disk 87 GB free, load 11.73 / 4.21 / 2.50 at build
+time.
 
 ### 8.7 What was NOT done, and why
 
