@@ -651,8 +651,9 @@ report what was actually rendered, not what was requested.
 Omitting all three renders the recipe default, which is 1024x1536 at 121 frames
 and is a much larger request than it looks.
 
-**What is legal is not what fits.** The table below separates the two, because
-only the first column is a property of this port:
+**What is legal is not what fits.** The first two rows below are a property of
+this port and are enforced. The rest are scale markers, and the last two are
+measurements of one box rather than limits of the code:
 
 | | Value |
 |---|---|
