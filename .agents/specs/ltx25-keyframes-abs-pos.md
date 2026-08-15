@@ -372,7 +372,14 @@ without editing `docs/FEATURES.md`, which `scripts/check-doc-checkpoint.py`
 rejects. Both checkers walk the branch's own commits, both are required checks,
 and repairing a commit message rewrites history, which `AGENTS.md` forbids
 pushing over a branch. So the content was rebuilt on
-`row/LTX25-KEYFRAMES-ABS-POS-V2` with a tree hash identical to `46a096715`'s
-(`8c188b13eb3d5789eb0bd2dddd3da423f83a7101`) apart from this section and the
-issue-index row it also repairs, and `row/LTX25-KEYFRAMES-ABS-POS` was closed as
-a record. The operator reruns the gate on the replacement and lands it.
+`row/LTX25-KEYFRAMES-ABS-POS-V2`. Applying `46a096715`'s tree onto `main` gave
+`git write-tree` = `8c188b13eb3d5789eb0bd2dddd3da423f83a7101`, byte-identical to
+`46a096715^{tree}`, and the replacement then differs from that head in exactly
+three files: this `## Outcome` and `## Now`, the issue-index row it repairs, and
+one word in `docs/FEATURES.md`. That word is `SERVED`, which fell out of "IMAGE
+cond SERVED `crf=0`" when this row's rewrite hit the 220-character
+`MAX_CELL_CHARS` cap and then appeared nowhere in `FEATURES.md` or `STATUS.md`. A
+budget is the wrong author for deciding which fact survives, so it is restored at
+the cost of two redundant words in the same cell, and the entry is 217
+characters. `row/LTX25-KEYFRAMES-ABS-POS` was closed as a record. The operator
+reruns the gate on the replacement and lands it.
