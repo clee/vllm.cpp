@@ -13,7 +13,7 @@ Upstream pins:
 | Lightricks/LTX-2 | `fd4ded7f2d88d3da713abcdd4ad41ecc4a9314ca` | `git rev-parse HEAD`, 2026-08-13; re-verified 2026-08-14 |
 | huggingface/diffusers | `3a2f35d4efa4c059c8bfb3bc0d6c906264895c81` | `git rev-parse HEAD`, 2026-08-13; re-verified 2026-08-14 |
 
-Anchors here were derived from those two checkouts by this row. **Three of them
+Anchors here were derived from those two checkouts by this row. **Four of them
 were wrong and were found by review, not by the row** — see §7, which records
 what was not re-derived rather than claiming everything was. Where an ABSENCE is
 asserted, §1.1 carries the command and the control hits that prove the command
@@ -30,7 +30,7 @@ more than is true, in four separate ways:
    point exists. Neither does the symbol, the string, or the concept.
 2. **One arm's anchor names something upstream does not do.** `kCfgParallelism`
    is anchored to `ltx-pipelines/multigpu`, which contains no CFG batching at
-   all — the three real parallelisms are orthogonal to guidance, and the recipe
+   all — the four real parallelisms are orthogonal to guidance, and the recipe
    this port runs uses no guidance in the first place.
 3. **One arm is stale.** `kVideoEngineWiring` says the end-to-end wiring "is
    phase L7, not L5". L7 landed in `cefacd2d0`.
@@ -58,7 +58,11 @@ return the hits you know are there. The two commands, verbatim:
 # LTX-2 @ fd4ded7f — `multishot` ABSENCE, controls `scene cuts` /
 # `single continuous take` / `DurationPredictor` in the SAME command.
 git grep -n -i -E 'multi[_ -]?shot|scene cuts|single continuous take|DurationPredictor'
-#   -> 0 lines matching multi[_ -]?shot, 22 control lines.
+#   -> 0 lines matching multi[_ -]?shot, 24 control lines.
+#   RE-MEASURED 2026-08-15: this said 22. The verbatim command returns 24 (0 either
+#   way), and the count is the positive control, so a wrong control is a defect in
+#   the evidence even when the conclusion holds. Split: `git grep -c` on the
+#   control alternation alone is also 24, so all 24 are controls.
 # LTX-2 @ fd4ded7f — every `shot` FILE, control `DurationPredictor`.
 git grep -l -E '\bshots?\b'          # -> 7 files (see below)
 # LTX-2 @ fd4ded7f — `storyboard` ABSENCE, control `shot list` same command.
@@ -75,7 +79,7 @@ git grep -n -i -E 'multi[_ -]?shot|scene cuts|hard cuts|single continuous take' 
 
 | Query | LTX-2 `fd4ded7f` | diffusers `3a2f35d4` |
 |---|---|---|
-| `multi[_ -]?shot` (case-insensitive) | 0 hits, alongside 22 control hits | 0 hits, alongside 4 control hits |
+| `multi[_ -]?shot` (case-insensitive) | 0 hits, alongside 24 control hits | 0 hits, alongside 4 control hits |
 | `\bshots?\b`, whole repository | **7 files**, none a generation mode | — |
 | `multi[_ -]?(gpu\|scale\|stage\|shot\|clip\|prompt\|segment)` | `multi[-_ ]?gpu` **167**, `multi-prompt` **2** — and nothing else | — |
 | `scene`, whole repository | **three senses, none a generation mode** — see §1.1a | only the prompt-guidance sense inside `pipelines/ltx2/` (`scene cuts` ×3, `scene opens` ×4) |
@@ -277,17 +281,57 @@ declared-out-of-scope marker, not a reachable refusal.
 
 ### 1.3 CFG parallelism — the name describes something upstream does not do
 
-`cfg` (case-insensitive, word) is **0 hits** in both multi-GPU trees:
-`ltx-pipelines/src/ltx_pipelines/multigpu/` and
-`ltx-core/src/ltx_core/multigpu/`.
+**THE ORIGINAL VERSION OF THIS SECTION SAID `cfg` IS 0 HITS IN BOTH MULTI-GPU
+TREES, AND IT WAS WRONG (#892, review finding F3).** The claim was scoped to
+`ltx-pipelines/src/ltx_pipelines/multigpu/` and `ltx-core/src/ltx_core/multigpu/`,
+which are the two SOURCE trees — and that path filter excludes
+`ltx-pipelines/docs/multigpu/`, where the answer is written out in prose. Fourth
+instance of #604 in this row, and the one that proves the row's own lesson twice
+over: a path filter is an absence claim too, and this section is where that
+sentence was written.
 
-The three parallelisms upstream actually implements:
+Re-derived without the filter, with the file list as the positive control in the
+same pass:
+
+```sh
+# LTX-2 @ fd4ded7f — every `multigpu` path, no source/docs split.
+git ls-files -- '*multigpu*'          # -> 33 files, the CONTROL
+git grep -n -i cfg -- '*multigpu*'    # -> 5 lines, NOT 0
+```
+
+Three of the five are the incidental `model_cfg` local in a documentation code
+block (`docs/multigpu/sequence-parallel.md:81,84,85`). **Two are substantive**,
+and they are the ones that matter:
+
+> `docs/multigpu/gemma.md:103-104` — "Batch-parallel is beneficial only when there
+> is **more than one prompt to encode** — the typical **CFG** case, positive +
+> negative (B=2 on 2 ranks = one prompt per rank, both forwards concurrent). The
+> **distilled** pipeline runs **without CFG**: its `__call__` accepts a single
+> `prompt` and no `negative_prompt`, so there is only one prompt to encode and no
+> work to partition."
+
+That paragraph is better evidence than the absence ever was. It says in upstream's
+own words that the recipe this port runs has no CFG pair, which is the reason CFG
+batching is inapplicable here — a reason, rather than a claim that a string does
+not appear.
+
+**And there are FOUR forms, not three.** The fourth sits in the very directory the
+refusal cites:
 
 | Form | Anchor | What it splits |
 |---|---|---|
 | Sequence parallel | `multigpu/sp_builder.py:25` (`SequenceParallelBuilder`), `ltx-core multigpu/transformer/sequence_parallel.py`, all-to-all attention | the token axis of one denoise step |
 | Tiled data parallel | `multigpu/tdp_builder.py:25` (`TiledDataParallelBuilder`) | spatial tiles, **upscale stage only** |
 | Distributed VAE decode | `ltx-core multigpu/vae/distributed_decoder.py:204-256` (`DistributedVideoDecoder.decode_video`) | latent tiles across ranks, driver blends |
+| **Batch-parallel Gemma encoding** | `multigpu/bp_gemma_builder.py:42` (`BatchParallelGemmaBuilder`), wrapping `ltx-core multigpu/gemma/batch_parallel_wrapper.py` | a **prompt list** across ranks, one replica per rank |
+
+The four `BuilderProtocol`/`DelegatingBuilder` implementors under
+`ltx-pipelines/src/ltx_pipelines/multigpu/` are exactly these, verified by
+`git grep -n 'BuilderProtocol' -- packages/ltx-pipelines/src/ltx_pipelines/multigpu/`.
+The fourth is the closest thing upstream has to CFG batching, which is precisely
+why omitting it made the "none of them is CFG batching" sentence weaker rather
+than safer: the honest statement is that the form which WOULD carry a CFG pair is
+the one upstream tells you not to use for the distilled pipeline.
 
 Upstream states the purpose in its own words
 (`ltx-pipelines/docs/multigpu/README.md:7`, inside the ⚠️ block at `:5-16`):
@@ -315,9 +359,17 @@ code was ever going to be CFG parallelism, and why the old enumerator name could
 not have been right for any recipe.
 
 **Disposition: RENAME + re-anchor.** `kCfgParallelism` → `kMultiGpuParallelism`,
-anchored to the three real forms, with the reason it is out of scope stated as
+anchored to the four real forms, with the reason it is out of scope stated as
 what it is: a single-node multi-GPU **latency** feature, on a port whose target is
-one GB10.
+one GB10. The disposition never moved across the F3 repair; only the evidence
+under it was wrong, and the corrected evidence supports it more strongly.
+
+Gated by `test_ltx2_pipeline`'s "the multi-GPU marker note states the CFG evidence
+correctly" (the header) and by the multi-GPU block in "ltx2 every out-of-scope
+feature is refused BY NAME" (the shipped message), on the same shape as the int8
+marker: the retired sentence must be absent and the replacement evidence present.
+Neither can verify the upstream fact — there is no upstream checkout in this tree
+— so the commands above, with their control, remain the derivation.
 
 ### 1.4 `kLoraFusion` — real upstream, correctly refused
 
@@ -359,18 +411,76 @@ issue (#644) and renamed the enumerator `kTemporalUpsampler` →
 Re-derived against `origin/main` `9a8615672`, the reachable call site is
 `src/vllm/model_executor/models/ltx2_upsampler.cpp:465` and the enumerator is the
 spatiotemporal one; `kBetaScheduler` is unmoved at `ltx2_pipeline.cpp:199`. The
-split this section establishes is unchanged — two reachable, three markers — and
-the ported temporal arm is reachable from no shipped pipeline, which is why
+ported temporal arm is reachable from no shipped pipeline, which is why
 `docs/FEATURES.md` still records it as gated and UNDRIVEN.
 
-The five are enumerated only by `tests/vllm/models/test_ltx2_pipeline.cpp:1237-1244`.
-There is no request field, load extra, or CLI flag that asks for a LoRA, an
-int8-convrot checkpoint, or a second GPU, so no caller can trip them.
+**THE SPLIT WAS ONE REACHABLE AND FOUR MARKERS, NOT TWO AND THREE (#889, review
+finding F1).** The table above answers "does this enumerator appear in `src/`?",
+and that is the wrong question. A refusal is reachable only if something CALLS
+the function that holds it, and `kBetaScheduler`'s call site
+`ltx2_pipeline.cpp:199` sits inside `Ltx2Schedule`, which has **zero** call sites
+in `src/`, `include/` or `examples/`. The engine bypasses the dispatcher and calls
+`Ltx2SigmaSchedule` directly, in `ltx2_video.cpp`'s phase driver; no ABI field, load extra or
+CLI flag carries a scheduler kind. The only thing that ever trips the arm is
+`test_ltx2_pipeline`'s "ltx2 the Beta scheduler is refused by name, never substituted", constructing the enumerator by
+hand — the **test-only driver** shape that AGENTS.md `## Nothing lands dead` and
+[`.agents/reachability.md`](../reachability.md) name.
+
+The corrected table, with the question stated the way it has to be asked:
+
+| Enumerator | Site of the refusal | Function holding it | Product callers of that function | Kind |
+|---|---|---|---|---|
+| `kSpatiotemporalUpsampler` | `ltx2_upsampler.cpp:465` | `Ltx2LatentUpsample` ← `Ltx2UpsampleVideoLatent` | `ltx2_video.cpp`, the refine phase | **reachable** |
+| `kBetaScheduler` | `ltx2_pipeline.cpp:199` | `Ltx2Schedule` | **none** | marker |
+| `kLoraFusion` | — | — | — | marker |
+| `kInt8ConvRot` | — | — | — | marker |
+| `kMultiGpuParallelism` | — | — | — | marker |
+
+**UPSTREAM SETTLES IT, WHICH IS WHY THE REPAIR IS A RECLASSIFICATION AND NOT A
+WIRING.** The alternative repair — route the engine through `Ltx2Schedule` so the
+claim becomes true — would have to invent a scheduler-selection surface that
+upstream does not have. At Lightricks/LTX-2 `fd4ded7f`, `BetaScheduler` is defined
+at `ltx-core components/schedulers.py:91` and **constructed nowhere in the
+repository**; all seven `ltx-pipelines` entry points hard-code `LTX2Scheduler()`
+(`ti2vid_one_stage.py:81`, `ti2vid_two_stages.py:87`, `ti2vid_two_stages_hq.py:90`,
+`a2vid_two_stage.py:78`, `t2a_one_stage.py:67`, `keyframe_interpolation.py:82`,
+`retake.py:96`), verified by
+`git grep -n 'LTX2Scheduler\|LinearQuadraticScheduler\|BetaScheduler'` with the
+definition file excluded — a command whose own output is its control, since it
+returns the seven `LTX2Scheduler()` constructions it must. vLLM-Omni `a4ea67a21`
+has **zero** hits for the name, against 81 files containing `ltx` as the control.
+Mirroring upstream therefore means this port has no scheduler-kind field either,
+and `kBetaScheduler` records an unported upstream component rather than a refusal
+a request can trip.
+
+`Ltx2Schedule` itself is then an unreached dispatcher, disclosed under `## Owed`
+and tracked by #893 as required by `## Nothing lands dead`. No wiring wave is
+coming for it, because there is nothing upstream to wire it to; the open decision
+is retire-or-keep.
+
+**The classification is now derived rather than written.**
+`test_ltx2_pipeline`'s "the reachable/marker split matches the source" walks
+`src/`, `include/` and `examples/`, counts callers of each arm's entry function,
+and requires the message to agree with what it finds — in both directions, so a
+caller appearing later fails the marker wording just as its absence failed the
+reachable wording. Two positive controls ride in the same walk, because this is an
+absence claim about our own tree and this row has shipped four of those already.
+It is the anti-tautological shape #691 asks for, applied to the beta arm; #691
+stays open for the other three markers, which have no call site at all to derive.
+
+The five are enumerated only by the `reachable`/`markers` vectors in
+`test_ltx2_pipeline`'s "ltx2 every out-of-scope feature is refused BY NAME". The
+line numbers that used to be written here are deliberately gone: they went stale
+twice inside this pull request, and a case name is stable where a line range is
+not. There is no request field, load extra, CLI flag or scheduler kind that asks
+for a LoRA, an int8-convrot checkpoint, a second GPU or a Beta schedule, so no
+caller can trip any of the four.
 
 That is not a defect on its own — a declared boundary is worth having. The defect
 is calling it a refusal. The header and the messages now distinguish:
 
-- **reachable refusal** — a product path constructs the condition and throws;
+- **reachable refusal** — a product path constructs the condition and throws, and
+  something a user arrives through calls the function that holds it;
 - **declared-out-of-scope marker** — a record of what upstream has and this port
   does not, reached only by the ledger test.
 
@@ -410,9 +520,16 @@ derives them from the source on every run and fails with the replacement list
 printed. The table above stays because a spec is a dated record and the SHA is
 named; the code comment is the live one.
 
-One documentation gap found by the same sweep and fixed here:
-`docs/USAGE.md:1650-1654` lists the LTX-2.5 extras and omits `encoder_config_path`
-entirely, though it is defined and read.
+One documentation gap found by the same sweep and fixed here: the paragraph in
+`docs/USAGE.md` beginning "Two families are registered." lists the LTX-2.5 extras
+and omitted `encoder_config_path` entirely, though it is defined and read.
+
+That paragraph was cited as `docs/USAGE.md:1650-1654`, and it is not there — at
+this row's head it starts at `:1949` and the extras list runs to `:1955`. A third
+stale anchor in the same spec (review finding, nit). Named by its OPENING WORDS
+here rather than re-pinned to a number, for the reason §2.1 already gives about
+the reader anchors: this file moved twice inside one pull request, and a phrase
+survives a merge that a line number does not.
 
 ### 2.2 Why it is inert
 
@@ -542,10 +659,20 @@ One more added by the third review round:
    `include/vllm/model_executor/models/ltx2_pipeline.h` through a new
    `LTX2_PIPELINE_HEADER_PATH` compile definition, flattens the comment block so a
    reflow cannot make it vacuous, and requires the retired false sentence to be
-   absent and the replacement evidence — `scene cuts`, `ltx-core`,
-   `system_prompt` — to be present. Anti-vacuous: it first requires **exactly one**
-   ``kMultishot` — FABRICATED` note in the file, so deleting or renaming the
-   paragraph fails rather than passes. **RED before**: 4 of its 8 assertions
+   absent and the replacement evidence to be present. Anti-vacuous: it first
+   requires **exactly one** ``kMultishot` — FABRICATED` note in the file, so
+   deleting or renaming the paragraph fails rather than passes.
+
+   The three positive assertions are SCOPED TO THE NOTE, not run over the whole
+   flattened header, and the description above used to say otherwise. A file-wide
+   `find` could not fail for `ltx-core`, which occurs six times in this header, so
+   that assertion survived deleting the clause it exists to hold — proven by
+   mutation, which left the case green at 8/8. The shipped case slices the
+   paragraph from its marker to the next enumerator heading and asserts
+   `scene cuts`, the CLAIM `ships at INFERENCE inside \`ltx-core\`` rather than
+   the bare package name, and `system_prompt` inside that slice, with a
+   `note.size() > 400` guard so a bad slice fails loudly instead of quietly
+   passing. **RED before**: 4 of its 8 assertions
    failed on `b718f580f` — `flat.find("the only \`scene\` hit is PySceneDetect")`
    returned 29407 where npos was required, and `scene cuts` / `system_prompt`
    both returned npos. **Anti-vacuity proven by mutation**: renaming the note's
@@ -558,6 +685,51 @@ One more added by the third review round:
    §1.1's commands with their positive controls, run against the two pins, and it
    is not automatable here. Saying so is better than a test that appears to gate
    it and does not.
+
+Three more added by the fourth review round (F1 #889, F2 #890, F3 #892), each RED
+before its fix:
+
+8. **`ltx2 the reachable/marker split matches the source`** (new,
+   `tests/vllm/models/test_ltx2_pipeline.cpp`). The gate F1 was missing. It walks
+   `src/`, `include/` and `examples/` under a new `VLLM_CPP_SOURCE_ROOT` compile
+   definition, counts product callers of each arm's ENTRY FUNCTION — not
+   occurrences of the enumerator, which is the question that gave the wrong answer
+   — and requires the refusal message to agree, **in both directions**: no caller
+   demands `DECLARED, NOT REQUESTABLE`, and a caller appearing later forbids it.
+   Two positive controls ride in the same walk, plus a `files.size() > 100` floor,
+   because a walk that opened nothing reports every symbol as unreachable.
+   **RED before**: the walk printed `Ltx2UpsampleVideoLatent callers =
+   ltx2_video.cpp:1515`, `Ltx2SigmaSchedule callers = ltx2_video.cpp:1689`,
+   `Ltx2Schedule callers = <none>` — both controls live, the claim zero — and the
+   `DECLARED, NOT REQUESTABLE` assertion failed against the shipped message.
+9. **`ltx2 video: a SPATIOTEMPORAL upsampler checkpoint is refused as
+   SPATIOTEMPORAL, not as temporal`** (new subcase in
+   `tests/vllm/multimodal/test_ltx2_video.cpp`). Closes the hole F2's reviewer
+   named in their own evidence: no fixture drove a BOTH-FLAGS checkpoint through
+   the product path, so a mutation could not separate "unreachable" from
+   "untested". It writes a both-flags upsampler with `WriteReducedUpsampler` and
+   drives it through `LoadVideoEngine` + `Generate` — the production entry point,
+   per `## Nothing lands dead`, not a direct call to `Ltx2LatentUpsample`.
+   Asserts the message names `SPATIOTEMPORAL` and is neither the temporal-only
+   diagnosis nor a shape complaint. **RED before**: `it is the TEMPORAL x2
+   upsampler` and `Supply the spatial upsampler` both matched, and `SPATIOTEMPORAL`
+   did not.
+10. **`ltx2 the multi-GPU marker note states the CFG evidence correctly`** (new,
+    `tests/vllm/models/test_ltx2_pipeline.cpp`) plus a multi-GPU block in the
+    ledger case. Same shape as the int8 marker's evidence gate, for the same class
+    of defect: the retired sentence must be absent from the header and the shipped
+    message must carry `four forms`, `BatchParallelGemmaBuilder` and `gemma.md`.
+    Anti-vacuous twice — exactly one `kMultiGpuParallelism` enumerator must exist,
+    and the positive checks are SCOPED to the sliced note, because `kInt8ConvRot`'s
+    own comment already contains the word `four`. **RED before**: 4 assertions in
+    the ledger case (`three forms` present, `four forms` / `BatchParallelGemmaBuilder`
+    / `gemma.md` absent) and `flat.find("zero \`cfg\` hits")` returned 32030 where
+    npos was required.
+
+    One consequence worth recording, because it cost a build: the header may not
+    QUOTE the retired sentence while explaining it. A text gate matches text and
+    cannot tell a quotation from a claim, so the corrected note describes the old
+    sentence instead of reproducing it, and says why in the comment.
 
 ## 5. Risks
 
@@ -578,9 +750,9 @@ One more added by the third review round:
 
 ## 7. Outcome
 
-**Three of the claims in §1 were NOT re-derived, and three rounds of review found
+**Four of the claims in §1 were NOT re-derived, and four rounds of review found
 them one at a time.** The sentence that stood here said "every claim in §1 was
-re-derived"; it was written before the second and third rounds, and it was not
+re-derived"; it was written before the later rounds, and it was not
 true when it was written either. What actually happened:
 
 - Round 1 found the `hadamard` absence in §1.2 false, and the "int8 appears only
@@ -594,12 +766,18 @@ true when it was written either. What actually happened:
   recorded as `multi-GPU`/`multi_gpu` **only**, and `multi-prompt` is there twice.
   Nobody had asked about that row; it was wrong because the row had never been
   re-run either.
+- Round 4 found the `cfg` absence in §1.3 false and a fourth multigpu form
+  omitted, from a grep PATH-FILTERED to the two source trees — the same mechanism
+  as the `shot` list in round 3, in a section that had already written the lesson
+  down. It also found the reachable/marker split itself wrong about
+  `kBetaScheduler`, and the guard at `ltx2_video.cpp` shadowing the one refusal
+  the split was still right about.
 
-Every one of the three is the same defect: an absence asserted from our own
-vocabulary, with no positive control, and in two cases behind a path filter that
+Every one of the four is the same defect: an absence asserted from our own
+vocabulary, with no positive control, and in three cases behind a path filter that
 excluded the files carrying the answer. **This row's stated purpose is retiring
 instances of [#604](https://github.com/mudler/vllm.cpp/issues/604), and it
-shipped three of them** — two of those into files a user or a porter reads. That
+shipped four of them** — three of those into files a user or a porter reads. That
 self-record is worth more than the claim it replaces, because the claim was the
 mechanism: writing "every claim was re-derived" is what made the next reader stop
 checking. §1.1 now carries the commands with their positive controls inline, so
@@ -610,7 +788,7 @@ correctly" holds the header's text so the false sentence cannot come back.
 Results, as they now stand:
 
 - `multishot`: **fabricated, confirmed** — and the confirmation is now stronger
-  than the original. 0 hits for the term in either reference against 22 and 4
+  than the original. 0 hits for the term in either reference against 24 and 4
   control hits in the same commands; the only upstream sense of "shot" is one
   camera take across all seven files; and the shipped prompt-enhancer prompts
   instruct the model to keep a "Single continuous take — no hard cuts"
@@ -621,13 +799,25 @@ Results, as they now stand:
   in the `ltx-kernels` inference package) and `hadamard` is not 0 hits (a whole
   quantization-coupled Hadamard family is vendored, and wired to nothing). Both
   corrections are in §1.2; neither moves the disposition. Kept, re-anchored.
-- CFG parallelism: **the name was wrong, the exclusion is right.** 0 `cfg` hits in
-  either multi-GPU tree; upstream's own README calls MGPU a latency tool; the
-  distilled recipe runs `SimpleDenoiser` with no guidance at all, so there is no
-  CFG pass to parallelize (§1.3). Renamed and re-anchored.
+- CFG parallelism: **the name was wrong, the exclusion is right, and the evidence
+  under it was wrong twice.** Not 0 `cfg` hits but 5, against 33 files as the
+  control, because the grep was path-filtered past `docs/multigpu/`; and four
+  forms, not three, the fourth being `BatchParallelGemmaBuilder`. Upstream's own
+  README calls MGPU a latency tool, the distilled recipe runs `SimpleDenoiser`
+  with no guidance, and `gemma.md:104` states outright that the distilled pipeline
+  "runs without CFG" — which is a reason where the old sentence was an absence
+  (§1.3, #892). Renamed and re-anchored.
 - `kVideoEngineWiring`: **stale, confirmed.** L7 landed in `cefacd2d0`. Retired.
-- Five enumerators had no product call site (§1.6). The ledger now says which
-  kind each is, because "refused by name" overstated a marker.
+- The reachable/marker split: **one reachable and four markers, and the row
+  shipped it as two and three.** The ledger now says which kind each is, because
+  "refused by name" overstated a marker — and the fourth review round found that
+  the corrected ledger still overstated one, because §1.6 asked whether an
+  enumerator appears in `src/` when the question is whether anything CALLS the
+  function holding it. `kBetaScheduler` sits in `Ltx2Schedule`, which nothing
+  calls (§1.6, #889). Upstream constructs `BetaScheduler` nowhere either, so the
+  repair is the reclassification and not a wiring; `Ltx2Schedule` is disclosed as
+  unreached under `## Owed` (#893). The split is now derived from the tree by a
+  test rather than maintained by hand in two vectors.
 - `duration_head_path` was the **only** unread key of ten (§2.1). Now refused by
   name. The full inventory is the durable half of this row: it means the next
   person asking "which extras are decorative?" reads a table instead of grepping.
@@ -637,34 +827,93 @@ open for that, with its user-visible half — silent substitution of the recipe
 default — closed.
 
 **The review's own findings, recorded because they are the point of the row.**
-Across three rounds every finding was evidence accuracy, not logic: a false
+Across four rounds all but one finding was evidence accuracy, not logic: a false
 absence inside the shipped refusal (§1.2), a false absence in this spec's §1.2 —
 the one search term that mattered — nine stale reader anchors cited in the file
 they were wrong about (§2.1), a public-doc row that re-merged the split the ledger
 had just made, a false absence inside the shipped HEADER (§1.1a), a five-item list
-offered as exhaustive when it is seven (§1.1), and a line range wrong at both ends
-(§1.2). A row whose subject is #604 committed three instances of #604, and each
-one survived at least one review that had already been told to look for exactly
-this. That is not irony to note and move past; it is why the anchors are now
-derived rather than written, why the int8 absence is stated as UNREACHABLE with
-its dead kernel named, why the `hadamard` search this spec got wrong is spelled
-out in full rather than quietly corrected, and why every absence in §1.1 now ships
-with the command that proves it AND the control hits that prove the command ran.
+offered as exhaustive when it is seven (§1.1), a line range wrong at both ends
+(§1.2), and a `cfg` absence plus a missing fourth form in §1.3 and the shipped
+header (#892). A row whose subject is #604 committed four instances of #604, and
+each one survived at least one review that had already been told to look for
+exactly this. That is not irony to note and move past; it is why the anchors are
+now derived rather than written, why the int8 absence is stated as UNREACHABLE
+with its dead kernel named, why the `hadamard` search this spec got wrong is
+spelled out in full rather than quietly corrected, and why every absence in §1.1
+now ships with the command that proves it AND the control hits that prove the
+command ran.
 
-The transferable lesson, in one line: **a path filter is an absence claim too.**
-The `shot` enumeration is the case where this is provable rather than inferred —
-the pattern `\bshots?\b` was right and the filter `*.py *.md *.json *.yaml` was
-wrong, over a tree whose prompt files are `.txt`, and it returns exactly the five
-files that were recorded. (The `scene` claim's original command was never written
-down, so why *it* missed `ltx-core` is not recoverable; that it was never
-reproduced is the point.) A grep that returns nothing has to be re-run without its
-narrowing, and with a control, before it is written down as an absence.
+**The exception is round 4's other two findings, and they are a different
+defect.** F1 (#889) and F2 (#890) were not inaccurate evidence — they were
+CLASSIFICATION and CONTROL FLOW. `kBetaScheduler` was published as reachable
+because §1.6 asked whether an enumerator appears in `src/`, which is a question
+whose true answer is the wrong answer. And the one arm that genuinely was
+reachable had its refusal shadowed by a guard on `temporal_upsample` that every
+both-flags config also satisfies, so between them the ledger's reachable column
+was empty in practice while both surfaces published two entries. A record can be
+false without a single false citation in it, and this row had been correcting
+citations for three rounds while the thing the citations described was wrong.
+
+The transferable lessons, now two:
+
+**A path filter is an absence claim too.** The `shot` enumeration is the case
+where this is provable rather than inferred — the pattern `\bshots?\b` was right
+and the filter `*.py *.md *.json *.yaml` was wrong, over a tree whose prompt files
+are `.txt`, and it returns exactly the five files that were recorded. §1.3's `cfg`
+claim is the second provable case: the pattern was right and the filter to the two
+SOURCE trees excluded the `docs/` tree that answers it. (The `scene` claim's
+original command was never written down, so why *it* missed `ltx-core` is not
+recoverable; that it was never reproduced is the point.) A grep that returns
+nothing has to be re-run without its narrowing, and with a control, before it is
+written down as an absence.
+
+**Reachability is a claim about CALLERS, and `git grep` for the symbol does not
+answer it.** `Ltx2Schedule` holds the beta refusal, appears in the header and the
+source, is covered by a passing unit test, and is called by nothing. AGENTS.md
+`## Nothing lands dead` and [`.agents/reachability.md`](../reachability.md) landed
+in `8f49ac3be` naming this exact shape — the test-only driver — while this repair
+was in flight. The gate this row now ships derives the split by counting callers
+of each arm's entry function, with positive controls in the same walk, and fails
+in both directions.
+
+## Owed
+
+Disclosed under AGENTS.md `## Nothing lands dead`, which requires the unreached
+thing, its owning row and its issue to be named rather than left for the next
+reader:
+
+- **`Ltx2Schedule` / `Ltx2SchedulerKind` are unreached** —
+  [#893](https://github.com/mudler/vllm.cpp/issues/893), owned by this row. The
+  dispatcher at `src/vllm/model_executor/models/ltx2_pipeline.cpp:191` has zero
+  call sites in `src/`, `include/` or `examples/`; the engine calls
+  `Ltx2SigmaSchedule` directly and its only driver is its own unit test. This is
+  not a staged slice awaiting a wiring wave: upstream selects no scheduler
+  anywhere (§1.6), so there is nothing to wire it to, and the open decision is
+  whether to retire it the way `kMultishot` was or keep it as a deliberately
+  unreached mirror of upstream's `SchedulerProtocol`. Deciding that is a behavior
+  change with its own red-first evidence, which is why the F1 repair labelled the
+  arm honestly and did not also delete the dispatcher.
+- **`kLoraFusion`, `kInt8ConvRot` and `kMultiGpuParallelism` have no call site at
+  all** — [#691](https://github.com/mudler/vllm.cpp/issues/691), owned by this
+  row. The derived split gates the beta arm because there is a function to count
+  callers of; the other three markers have nothing to derive from, so their kind
+  is still asserted rather than proven. #691 stays open for exactly that gap.
+- **A duration head is still not constructed** —
+  [#611](https://github.com/mudler/vllm.cpp/issues/611), owned by this row. Its
+  user-visible half, silent substitution of the recipe default, is closed.
+- **`.agents/specs/ltx-2-5.md` §2 "Out" still lists `multishot`** —
+  [#692](https://github.com/mudler/vllm.cpp/issues/692). Operator-owned file.
 
 ## Now
 
-Row `LTX25-RETIRE-DEAD-ARMS` is `DONE`. The ledger carries five entries, split by
-kind; `duration_head_path` is refused by name with a RED-first test; the
-`kKnownLoadExtras` inventory is recorded in §2.1; the header's `kMultishot`
-retirement note is gated by `test_ltx2_pipeline` against the false `scene`
-absence it shipped (§1.1a). `.agents/specs/ltx-2-5.md` §2 "Out" still lists
-`multishot` and is the operator's to correct, citing §1.1 here.
+Row `LTX25-RETIRE-DEAD-ARMS` is `DONE`. The ledger carries five entries split by
+kind — **one reachable, four markers** — and the split is derived from the tree by
+`test_ltx2_pipeline`'s "the reachable/marker split matches the source" rather than
+maintained by hand. The one reachable arm is no longer shadowed: a both-flags
+upsampler checkpoint driven through `LoadVideoEngine` is refused as
+SPATIOTEMPORAL. `duration_head_path` is refused by name with a RED-first test; the
+`kKnownLoadExtras` inventory is recorded in §2.1; the header's `kMultishot` and
+`kMultiGpuParallelism` notes are both gated by `test_ltx2_pipeline` against the
+false absences they shipped (§1.1a, §1.3). Owed items are listed above.
+`.agents/specs/ltx-2-5.md` §2 "Out" still lists `multishot` and is the operator's
+to correct, citing §1.1 here.

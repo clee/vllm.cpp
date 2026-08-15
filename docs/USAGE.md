@@ -1961,17 +1961,22 @@ which silently substituted the recipe default for the file you named. Give
 `num_frames` (or `duration`, which is exact arithmetic against the recipe's frame
 rate) instead. Every other key in that list reaches a reader.
 
-Two LTX-2.5 arms are refused where a render would otherwise silently downgrade:
-the spatiotemporal latent upsampler and `BetaScheduler`. Both are reachable — a
-render asking for either gets a refusal naming the missing piece. The
+One LTX-2.5 arm is refused where a render would otherwise silently downgrade:
+the spatiotemporal latent upsampler. It is reachable — supplying that checkpoint
+as `upsampler_path` gets a refusal naming the arm you actually supplied. The
 spatiotemporal upsampler is the arm with `spatial_upsample` AND
 `temporal_upsample` set, which upstream builds as a different operator
 (`Conv3d(mid, 8*mid)` + `PixelShuffleND(3)`). The temporal-only x2 upsampler is
 **ported** and is not refused; nothing shipped drives it yet, so it is gated
-rather than served. Three more are
+rather than served. Four more are
 recorded as out of scope but are **not requestable**, so no flag or extra can
-reach them: LoRA fusion, `int8-convrot`, and single-node multi-GPU. Their messages
-say `DECLARED, NOT REQUESTABLE` so the two kinds are not confused. `int8-convrot`
+reach them: LoRA fusion, `int8-convrot`, single-node multi-GPU, and
+`BetaScheduler`. Their messages
+say `DECLARED, NOT REQUESTABLE` so the two kinds are not confused.
+`BetaScheduler` is in that group rather than the reachable one because upstream
+selects it nowhere: every `ltx-pipelines` entry point hard-codes
+`LTX2Scheduler()`, so there is no scheduler-kind field to mirror and nothing here
+carries one either. `int8-convrot`
 in particular is a ComfyUI-ecosystem format: upstream LTX-2's own inference
 quantization kinds are `fp8-cast`, `fp8-scaled-mm`, `nvfp4-cast` and
 `nvfp4-prequant`, and nothing wired upstream reaches int8 at all.

@@ -308,9 +308,16 @@ target_include_directories(test_ltx2_pipeline PRIVATE ${CMAKE_CURRENT_SOURCE_DIR
 # The ledger's RETIREMENT note carries an absence claim about upstream, and it
 # shipped false twice in the same header. The case that guards it reads the header
 # itself rather than a copy of the sentence kept in the test.
+# The ledger's reachable/marker split is a claim about the PRODUCT TREE — that
+# something calls the function holding a reachable refusal, and that nothing calls
+# the one holding a marker. It was wrong about `kBetaScheduler` for the whole of
+# this row because it was maintained by hand, so the case now walks src/, include/
+# and examples/ under this root and derives it, with two positive controls in the
+# same walk (an absence claim about our own tree is still an absence claim).
 target_compile_definitions(test_ltx2_pipeline PRIVATE
   VLLM_CPP_FEATURES_DOC_PATH="${CMAKE_SOURCE_DIR}/docs/FEATURES.md"
-  LTX2_PIPELINE_HEADER_PATH="${CMAKE_SOURCE_DIR}/include/vllm/model_executor/models/ltx2_pipeline.h")
+  LTX2_PIPELINE_HEADER_PATH="${CMAKE_SOURCE_DIR}/include/vllm/model_executor/models/ltx2_pipeline.h"
+  VLLM_CPP_SOURCE_ROOT="${CMAKE_SOURCE_DIR}")
 # LTX-2.5 L6: the quantized loaders, gated three ways — the SHIPPED checkpoints'
 # own manifests, a few hundred of their own bytes against torch, and synthetic
 # files for whole-model materialization. All three .inc files live beside the

@@ -1141,7 +1141,11 @@ void Ltx2RefuseUnportedPipelineFeature(Ltx2UnportedPipelineFeature feature) {
       " Recorded as owed in .agents/specs/ltx-2-5.md; grounded against Lightricks/LTX-2 "
       "fd4ded7f in .agents/specs/ltx25-retire-dead-arms.md.";
   // A marker is not a refusal a caller can trip, and saying so is the point: this
-  // enum used to read as six live refusals when only two had a product call site.
+  // enum used to read as six live refusals when only ONE has a product call site.
+  // "Two" is what this said until review found that the second, `kBetaScheduler`,
+  // sits inside `Ltx2Schedule`, which nothing calls — see the case below its
+  // enumerator in the header, and `test_ltx2_pipeline`'s "the reachable/marker
+  // split matches the source", which derives that from the tree.
   const std::string marker =
       " DECLARED, NOT REQUESTABLE: no request field or load extra asks for this, so nothing "
       "but the out-of-scope ledger reaches this message.";
@@ -1155,10 +1159,22 @@ void Ltx2RefuseUnportedPipelineFeature(Ltx2UnportedPipelineFeature feature) {
              ".agents/specs/ltx25-temporal-upsampler.md section 2, under the campaign "
              ".agents/specs/ltx-2-5.md.");
     case Ltx2UnportedPipelineFeature::kBetaScheduler:
-      Refuse("ltx2: BetaScheduler (components/schedulers.py:91-120) is not ported. It inverts "
-             "a Beta CDF through scipy.stats.beta.ppf, and no ltx-pipelines entry point "
-             "constructs it." +
-             owed);
+      // A MARKER, not a reachable refusal, and the correction is upstream's. This
+      // case label is inside `Ltx2Schedule`, which no product code calls: the
+      // engine calls `Ltx2SigmaSchedule` directly, in `ltx2_video.cpp`'s phase
+      // driver, and no ABI field, load extra or CLI flag carries a kind. That mirrors LTX-2
+      // @ fd4ded7f, where `BetaScheduler` is DEFINED at ltx-core
+      // components/schedulers.py:91 and CONSTRUCTED nowhere: all seven pipelines
+      // hard-code `LTX2Scheduler()` (ti2vid_one_stage.py:81, ti2vid_two_stages.py:87,
+      // ti2vid_two_stages_hq.py:90, a2vid_two_stage.py:78, t2a_one_stage.py:67,
+      // keyframe_interpolation.py:82, retake.py:96), and vLLM-Omni @ a4ea67a21 has
+      // zero hits for the name. Publishing this as reachable would have promised a
+      // selection surface that upstream does not have.
+      Refuse("ltx2: BetaScheduler (ltx-core components/schedulers.py:91-120) is not ported. It "
+             "inverts a Beta CDF through scipy.stats.beta.ppf. Upstream constructs it nowhere — "
+             "every ltx-pipelines entry point hard-codes LTX2Scheduler() — so mirroring upstream "
+             "means this port has no scheduler-kind field either." +
+             marker + owed);
     case Ltx2UnportedPipelineFeature::kLoraFusion:
       Refuse("ltx2: LoRA fusion (ltx-core loader/primitives.py:160 LoraPathStrengthAndSDOps, "
              "fused by loader/fuse_loras.py) is out of scope." +
@@ -1191,11 +1207,30 @@ void Ltx2RefuseUnportedPipelineFeature(Ltx2UnportedPipelineFeature feature) {
       // not do. There is no CFG pass to split here in the first place: the distilled
       // recipe denoises with SimpleDenoiser at both stages (distilled.py:266,295),
       // "single transformer call, no guidance" (utils/denoisers.py:3).
+      //
+      // THIS MESSAGE SAID "three forms and none of them is CFG batching", AND BOTH
+      // HALVES WERE WRONG. The count missed `BatchParallelGemmaBuilder`
+      // (multigpu/bp_gemma_builder.py:42), a fourth `BuilderProtocol` in the very
+      // directory cited above. And the CFG half rested on a grep PATH-FILTERED to
+      // the two source trees, which excluded `ltx-pipelines/docs/multigpu/`: re-run
+      // over `-- '*multigpu*'` (33 files, the control) it is 5 hits, not 0, two of
+      // them prose about CFG at docs/multigpu/gemma.md:103-104.
+      //
+      // The disposition did not move; it got stronger. gemma.md:104 says the
+      // distilled pipeline runs "without CFG", so the one form that WOULD batch a
+      // CFG pair is the one upstream tells you not to use for the recipe this port
+      // runs. Stating the reason beats asserting an absence — §1.3 of the row spec.
       Refuse("ltx2: single-node multi-GPU parallelism (ltx-pipelines/multigpu) is out of "
-             "scope. Upstream has three forms and none of them is CFG batching: "
-             "sequence-parallel (multigpu/sp_builder.py:25), tiled data parallel "
-             "(multigpu/tdp_builder.py:25, upscale stage only) and distributed VAE decode "
-             "(ltx-core multigpu/vae/distributed_decoder.py:204-256). It is a LATENCY tool, "
+             "scope. Upstream has four forms: sequence-parallel "
+             "(multigpu/sp_builder.py:25), tiled data parallel "
+             "(multigpu/tdp_builder.py:25, upscale stage only), distributed VAE decode "
+             "(ltx-core multigpu/vae/distributed_decoder.py:204-256) and batch-parallel Gemma "
+             "encoding (multigpu/bp_gemma_builder.py:42 BatchParallelGemmaBuilder), which "
+             "partitions a PROMPT LIST across ranks. None is CFG batching, and the fourth is "
+             "the closest thing to it: upstream's own docs/multigpu/gemma.md:103-104 calls a "
+             "positive+negative pair 'the typical CFG case' and then records that the DISTILLED "
+             "pipeline — the one this port runs — takes no negative_prompt and so 'runs without "
+             "CFG', leaving nothing to partition. It is a LATENCY tool, "
              "not a memory tool (docs/multigpu/README.md:5-16), and this port targets one "
              "GB10." +
              marker + owed);
