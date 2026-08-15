@@ -177,7 +177,7 @@ Tensor F32V(std::vector<float>& v, vt::Device dev, std::vector<int64_t> shape) {
   return t;
 }
 
-// A2α (#810): the same three checks for the weights that moved to the shared
+// A2-R (#810): the same three checks for the weights that moved to the shared
 // `OwnedTensor` residency type (embeddings, the 53 norms, attention q/k/v/o).
 // An overload rather than a template so the refusal messages stay byte-identical
 // to the NemotronHOwned arm below — diffing the two should show one difference,
@@ -299,13 +299,24 @@ Buf Linear(Queue& q, const Buf& a, const NemotronHOwned& w, int64_t M, int64_t K
   return out;
 }
 
-// A2α: the OwnedTensor arm. There is NO DenseFor here and that is the point —
+// A2-R: the OwnedTensor arm. There is NO DenseFor here and that is the point —
 // an OwnedTensor weight is dense by construction, so this arm has no dequant
 // branch to take and cannot silently widen anything. `View()` yields a host/CPU
 // tensor, which is what this HOST reference forward's queue is.
 Buf Linear(Queue& q, const Buf& a, const OwnedTensor& w, int64_t M, int64_t K,
            int64_t N, const char* what) {
   RequireWeight(w, what, a.dtype, {N, K});
+  // `nk` IS CONSUMED HERE, not merely recorded. `vt::MatmulBT` reads `b` as
+  // [N=out, K=in] — the raw torch-Linear orientation `nk = true` names
+  // (qwen3_5_weights.h:57-61). A weight the loader recorded as [K, N] is a
+  // TRANSPOSED GEMM operand: same byte count, same shape, a plausible wrong
+  // answer. Refused by name, as qwen3_5.cpp:3353 / :3611 / :7638 refuse the
+  // same thing for their own MatmulBT operands. Before this check `nk` had no
+  // reader on this path at all, so flipping it in the loader changed nothing
+  // any gate could see.
+  VT_CHECK(w.nk, std::string("NemotronHForCausalLM forward: weight '") + what +
+                     "' is not in the [out, in] torch-Linear orientation "
+                     "vt::MatmulBT consumes");
   Buf out(a.dtype, {M, N});
   Tensor at = a.t(q.device, {M, K});
   Tensor wt = w.View();
@@ -998,7 +1009,7 @@ std::vector<float> NemotronHForward(const NemotronHHostWeights& host,
                     static_cast<size_t>(want[static_cast<size_t>(r)] * H) * esz,
                 static_cast<size_t>(H) * esz);
   }
-  // A2α: through the SHARED projection, so the host reference and the device
+  // A2-R: through the SHARED projection, so the host reference and the device
   // arm cannot drift apart in their output layer. `UnpackF32` here and
   // `PackF32` inside the helper are exact inverses for both admitted dtypes
   // (bf16->f32->bf16 is lossless; f32 is the identity), so this is
@@ -1020,7 +1031,7 @@ std::vector<float> NemotronHHostLmHead(const NemotronHHostWeights& host,
   VT_CHECK(queue.device.type == vt::DeviceType::kCPU,
            "NemotronH lm_head: this projection is the HOST arm and requires a "
            "CPU queue — `lm_head` is NVFP4 W4A16 g16 on the released checkpoint "
-           "and the device NVFP4 arm is not ported (#810 A2β)");
+           "and the device NVFP4 arm is not ported (#810 A2-Q)");
   RequireWeight(host.lm_head, "lm_head.weight", adt, {V, H});
   const Buf gathered = PackF32(gathered_normed, adt, {num_rows, H});
   const Buf logits =

@@ -47,7 +47,7 @@
 #include "vllm/model_executor/models/nemotron_h.h"
 // OwnedTensor — the tree's SHARED weight-residency type (qwen3_5_weights.h:47),
 // included here exactly as gemma3.h / glm4.h / qwen3.h / deepseek_v2.h include
-// it. A2α (#810, .agents/specs/nemotron-h-abi-e2e.md) moves the weights the
+// it. A2-R (#810, .agents/specs/nemotron-h-abi-e2e.md) moves the weights the
 // DEVICE path consumes onto it so they upload ONCE through
 // `dense_attn::ResidentWeight`. See the residency note on NemotronHOwned below
 // for why the quantized weights deliberately stay behind.
@@ -123,9 +123,9 @@ enum class NemotronHWeightForm : uint8_t {
   kFp8W8A8Static,
 };
 
-// ─── RESIDENCY: why some weights are OwnedTensor and this one is not (A2α) ───
+// ─── RESIDENCY: why some weights are OwnedTensor and this one is not (A2-R) ───
 //
-// A2α (#810) puts embeddings, the 53 RMSNorm weights and the 6 GQA attention
+// A2-R (#810) puts embeddings, the 53 RMSNorm weights and the 6 GQA attention
 // layers' q/k/v/o on the DEVICE. Those are the weights that ship plain bf16, so
 // they move to the tree's shared `OwnedTensor` and upload once through
 // `dense_attn::ResidentWeight` (dense_attn_block.h:178). Nothing is hand-rolled:
@@ -142,7 +142,7 @@ enum class NemotronHWeightForm : uint8_t {
 // arms land they move to the shared `Nvfp4Weight` / `Fp8Weight`
 // (qwen3_5_weights.h:198, :273), never to OwnedTensor.
 //
-// The arithmetic behind that boundary, which is also why A2α stops at the 6
+// The arithmetic behind that boundary, which is also why A2-R stops at the 6
 // attention layers: the 5935 NVFP4 projections are 30.19e9 parameters, 15.8 GiB
 // packed and 56.2 GiB dequantized to bf16. There is no device NVFP4->bf16
 // dequant kernel in vt at all, so a "bf16 everywhere" device forward would mean
@@ -233,7 +233,7 @@ struct NemotronHMambaWeights {
 // `qkv_proj` at load through its stacked-params mapping), so they are separate
 // here too — that is the shape `EnumerateNemotronHTensors` already claims.
 struct NemotronHAttentionWeights {
-  // A2α: OwnedTensor, because these four are what the DEVICE attention block
+  // A2-R: OwnedTensor, because these four are what the DEVICE attention block
   // (NemotronHAttnBlock) consumes and they ship plain bf16 on the released
   // checkpoint — 140.4e6 parameters over the 6 layers, 280.8 MB. `nk` stays
   // false-by-name here: the shape below is the raw torch-Linear [out, in] the
@@ -286,7 +286,7 @@ struct NemotronHMlpWeights {
 
 struct NemotronHLayerWeights {
   NemotronHBlock block = NemotronHBlock::kMamba;
-  // The layer's SINGLE norm (`self.norm`, one per decoder layer). A2α:
+  // The layer's SINGLE norm (`self.norm`, one per decoder layer). A2-R:
   // OwnedTensor — every one of the 52 is consumed by the device residual
   // stream, whatever kind of mixer the layer carries.
   OwnedTensor norm;  // [hidden_size]
@@ -302,15 +302,15 @@ struct NemotronHHostWeights {
   // bf16 is the released checkpoint's; the gate also sweeps f32, because a bf16
   // store absorbs reduction-order defects.
   vt::DType act_dtype = vt::DType::kBF16;
-  // A2α: OwnedTensor. The embedding table is the single largest DENSE tensor in
+  // A2-R: OwnedTensor. The embedding table is the single largest DENSE tensor in
   // the checkpoint (131072 x 2688 bf16 = 704.6 MB) and the device stream reads
   // it on every step, so it is the one that most needs uploading once.
   OwnedTensor embeddings;  // [vocab_size, hidden_size]
   std::vector<NemotronHLayerWeights> layers;
   OwnedTensor norm_f;  // [hidden_size]
   // STAYS NemotronHOwned: NVFP4 W4A16 g16 on the released checkpoint, so the
-  // final projection runs on the HOST in A2α and the device stream hands its
-  // gathered rows back before it. This is the reason A2α's token gate is
+  // final projection runs on the HOST in A2-R and the device stream hands its
+  // gathered rows back before it. This is the reason A2-R's token gate is
   // meaningful — both arms end in the identical host projection, so any token
   // difference is attributable to the 6 device attention blocks.
   NemotronHOwned lm_head;  // [vocab_size, hidden_size]
@@ -411,7 +411,7 @@ std::vector<int32_t> NemotronHGreedyDecode(const NemotronHHostWeights& host,
                                            const std::vector<int32_t>& prompt,
                                            int num_new, vt::Queue& queue);
 
-// ─── A2α: the DEVICE arm (#810, .agents/specs/nemotron-h-abi-e2e.md) ────────
+// ─── A2-R: the DEVICE arm (#810, .agents/specs/nemotron-h-abi-e2e.md) ────────
 //
 // WHAT RUNS WHERE, and this split is the unit's whole scope:
 //   DEVICE  embeddings, all 52 layer norms + norm_f, and the 6 GQA attention
@@ -429,7 +429,7 @@ std::vector<int32_t> NemotronHGreedyDecode(const NemotronHHostWeights& host,
 // NON-PAGED, SINGLE REQUEST. Nothing here consumes `attn_kv`, `gdn_state`,
 // `gdn_meta`, `gdn_state_slots` or `num_reqs`, so the G-SAFE interlock in
 // `ForwardNemotronHForCausalLM` (nemotron_h_registry.cpp:161-170) keeps ALL
-// THREE of its clauses. A2α does not create the capability that interlock
+// THREE of its clauses. A2-R does not create the capability that interlock
 // guards, so it does not narrow it.
 
 // One NemotronH GQA attention block, computed on `dev_queue`, with host-side
@@ -451,7 +451,7 @@ std::vector<float> NemotronHAttnBlockHostIO(const NemotronHAttentionWeights& w,
 //
 // It exists so that there is exactly ONE lm_head implementation and BOTH arms
 // call it. `lm_head` is NVFP4 W4A16 g16 on the released checkpoint, so it stays
-// on the host in A2α — and because the host reference and the device arm end in
+// on the host in A2-R — and because the host reference and the device arm end in
 // the identical projection, a token difference between them is attributable to
 // the device attention blocks and the device residual stream alone. A second
 // copy of this projection would quietly destroy that property.

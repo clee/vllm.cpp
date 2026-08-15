@@ -1,4 +1,4 @@
-// Nemotron-H (`NemotronHForCausalLM`) — A2α, the DEVICE arm
+// Nemotron-H (`NemotronHForCausalLM`) — A2-R, the DEVICE arm
 // ([spec](../../../../.agents/specs/nemotron-h-abi-e2e.md), issue #810; parent
 // row #517).
 //
@@ -67,7 +67,7 @@
 // recomputes Q/K/V over the whole sequence every call, exactly as the host
 // reference does. So it does not create the capability the interlock at
 // `nemotron_h_registry.cpp:161-170` guards, and all three of that interlock's
-// clauses stay exactly as they are. A2γ narrows them; A2α does not.
+// clauses stay exactly as they are. A2-P narrows them; A2-R does not.
 #include "vllm/model_executor/models/nemotron_h_forward.h"
 
 #include <cmath>
@@ -103,14 +103,25 @@ int64_t NumelOf(const std::vector<int64_t>& shape) {
 
 // VT_FUSED_CHAIN_ADOPT, read exactly as the host arm reads it
 // (nemotron_h.cpp:55). This is NOT an incidental duplicate: the whole point of
-// A2α's gate is that the two arms compose the IDENTICAL vt:: op sequence and
+// A2-R's gate is that the two arms compose the IDENTICAL vt:: op sequence and
 // differ only in which backend runs it. A device arm that hand-called
 // `vt::RmsNorm(..., &residual)` while the host arm routed the same chain
 // through `vt::FusedChain` would be comparing two different compositions and
 // calling the result an equivalence — and `scripts/check-fusion-consistency.py`
 // refuses it outright (AGENTS.md, "Route model fusion through `vt::FusedChain`").
-// Both readers key on the same env and the same default, so the two arms flip
-// together and can never straddle the branch.
+//
+// PRECISELY WHAT IS AND IS NOT GUARANTEED. These are TWO file-local
+// function-local statics with byte-identical predicates — this one and
+// `nemotron_h.cpp:56` — each latching on its own first call. They read the same
+// variable with the same default, so within one process they resolve the same
+// way and the equivalence gate below compares like with like. What is NOT true,
+// and an earlier draft of this comment claimed, is that they "can never
+// straddle": a caller that changed `VT_FUSED_CHAIN_ADOPT` between the two first
+// calls would latch two different answers. Nothing in this tree does that, and
+// the duplication is the tree's idiom for this env read (qwen3_5.cpp:1699), but
+// the property is a convention rather than an impossibility. Hoisting the
+// predicate into one shared reader would make it an impossibility, and that is
+// a tree-wide change, not this row's.
 bool FusedChainAdoptEnabled() {
   static const bool on = [] {
     const char* e = std::getenv("VT_FUSED_CHAIN_ADOPT");
@@ -214,7 +225,7 @@ void RequireDeviceWeight(const OwnedTensor& w, const char* what, DType want,
 //   (e) NON-PAGED. No `PagedKvCache`, no `ReshapeAndCache`, no slot mapping: a
 //       dense causal `vt::Attention` over the whole [T,·], which is exactly
 //       what the host reference does (nemotron_h.cpp:615-626). That is what
-//       keeps this arm inside G-SAFE, and it is A2γ that makes it paged.
+//       keeps this arm inside G-SAFE, and it is A2-P that makes it paged.
 //   (f) Every geometry and epsilon comes from `NemotronHParams`, never from
 //       `HfConfig` — the defect class of #810 and #941.
 DBuf NemotronHAttnBlock(Dev d, const NemotronHAttentionWeights& w,
@@ -240,6 +251,16 @@ DBuf NemotronHAttnBlock(Dev d, const NemotronHAttentionWeights& w,
   RequireDeviceWeight(w.k_proj, "mixer.k_proj", adt, {kvdim, H});
   RequireDeviceWeight(w.v_proj, "mixer.v_proj", adt, {kvdim, H});
   RequireDeviceWeight(w.o_proj, "mixer.o_proj", adt, {H, qdim});
+
+  // `nk` IS CONSUMED HERE, exactly as the host arm consumes it
+  // (nemotron_h.cpp:306). All four projections below go through `vt::MatmulBT`,
+  // which reads `b` as [N=out, K=in] — the raw torch-Linear orientation
+  // `nk = true` names. A weight recorded as [K, N] is a transposed GEMM operand
+  // with the same shape and the same byte count, so nothing else here would
+  // notice it.
+  VT_CHECK(w.q_proj.nk && w.k_proj.nk && w.v_proj.nk && w.o_proj.nk,
+           "NemotronH device forward: an attention projection is not in the "
+           "[out, in] torch-Linear orientation vt::MatmulBT consumes");
 
   // THE RESIDENCY SEAM. Each of the four uploads ONCE, on the first step, and
   // every later step reuses the same device allocation. This is the shared
@@ -404,12 +425,17 @@ std::vector<float> NemotronHDeviceForward(const NemotronHHostWeights& host,
       nvec = DownloadF32(d, normed, adt, T * H);
     }
 
-    DBuf mixer_out(d, adt, {T, H});
+    // Assigned STRAIGHT INTO `carry`, which is the only thing that reads the
+    // mixer output. A `DBuf mixer_out(d, adt, {T, H})` declared here and
+    // move-assigned over on both branches was one dead device allocation per
+    // layer per step; the previous `carry` block still returns to the pool at
+    // exactly the same statement it did before, after every enqueue for this
+    // layer, so the lifetimes are unchanged. No speed claim is made or implied.
     std::vector<float> mvec;
     if (lw.block == NemotronHBlock::kAttention) {
-      mixer_out = NemotronHAttnBlock(d, lw.attn, params, normed.t(), T, adt);
+      carry = NemotronHAttnBlock(d, lw.attn, params, normed.t(), T, adt);
       if (trace != nullptr && trace->capture) {
-        mvec = DownloadF32(d, mixer_out, adt, T * H);
+        mvec = DownloadF32(d, carry, adt, T * H);
       }
     } else {
       switch (lw.block) {
@@ -425,9 +451,8 @@ std::vector<float> NemotronHDeviceForward(const NemotronHHostWeights& host,
         case NemotronHBlock::kAttention:
           break;  // handled above
       }
-      mixer_out = UploadAs(d, mvec, adt, {T, H});
+      carry = UploadAs(d, mvec, adt, {T, H});
     }
-    carry = std::move(mixer_out);
 
     if (trace != nullptr && trace->capture) {
       trace->normed[static_cast<size_t>(l)] = std::move(nvec);
@@ -453,7 +478,7 @@ std::vector<float> NemotronHDeviceForward(const NemotronHHostWeights& host,
 
   // --- lm_head, on the HOST: it is NVFP4 W4A16 g16 on the released
   // checkpoint. Both arms therefore end in the IDENTICAL host projection, which
-  // is what makes A2α's token gate attributable: a token difference can only
+  // is what makes A2-R's token gate attributable: a token difference can only
   // have come from the 6 device attention blocks and the device residual
   // stream, never from the output projection.
   std::vector<int64_t> want;

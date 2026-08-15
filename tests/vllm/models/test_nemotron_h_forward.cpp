@@ -79,7 +79,7 @@ using vllm::NemotronHMlpWeights;
 using vllm::NemotronHMoeWeights;
 using vllm::NemotronHOwned;
 using vllm::NemotronHParams;
-// A2α (#810): the SHARED residency type the device-consumed weights moved to.
+// A2-R (#810): the SHARED residency type the device-consumed weights moved to.
 using vllm::OwnedBytes;
 using vllm::OwnedTensor;
 using vt::Device;
@@ -259,7 +259,7 @@ NemotronHOwned Own(const std::vector<float>& v, DType dt, std::vector<int64_t> s
   return NemotronHOwned::FromF32(v, dt, std::move(shape));
 }
 
-// A2α (#810): the same synthetic weight in the SHARED residency type, for the
+// A2-R (#810): the same synthetic weight in the SHARED residency type, for the
 // weights the device arm consumes (embeddings, the 53 norms, attention
 // q/k/v/o). Built by packing through NemotronHOwned::FromF32 and MOVING the
 // bytes across, so a fixture weight is byte-identical whichever holder it lands
@@ -536,6 +536,99 @@ std::vector<double> RefAttention(const AttnRefWeights& w, const NemotronHParams&
   std::vector<float> cf(ctx.size());
   for (size_t i = 0; i < ctx.size(); ++i) cf[i] = static_cast<float>(ctx[i]);
   return RefLinear(cf, w.o, T, Hq * D, H);
+}
+
+// The answer this same fixture would give IF the NeoX rotation
+// `kNemotronHAttentionHasNoRope` forbids were applied — the counterfactual the
+// no-RoPE property is measured AGAINST.
+//
+// It carries its own INSTRUMENT: `q_moved` is how far `vt::RopeNeox` actually
+// moved q on this fixture. If the rotation were a no-op the counterfactual would
+// be indistinguishable from the real answer, and a forward that correctly
+// applies no rotation would look exactly like a forward whose guard is broken
+// ([[absent-hook-looks-like-armed-instrument]]). Every caller REQUIREs the
+// instrument before reading the separation.
+struct RotatedAttnRef {
+  std::vector<double> out;  // the rope'd answer, in double
+  double q_moved = 0.0;     // relative movement RopeNeox applied to q
+};
+
+RotatedAttnRef RefAttentionRotated(const AttnRefWeights& w, const NemotronHParams& p,
+                                   const std::vector<float>& hidden, int64_t T,
+                                   Queue& cpu_q) {
+  const int64_t H = p.hidden_size;
+  const int64_t Hq = p.num_attention_heads;
+  const int64_t Hkv = p.num_key_value_heads;
+  const int64_t D = p.head_dim;
+  const std::vector<double> q_unrot = RefLinear(hidden, w.q, T, H, Hq * D);
+  const std::vector<double> k_unrot = RefLinear(hidden, w.k, T, H, Hkv * D);
+  const std::vector<double> v = RefLinear(hidden, w.v, T, H, Hkv * D);
+
+  std::vector<float> qv(q_unrot.size()), kv(k_unrot.size());
+  for (size_t i = 0; i < qv.size(); ++i) qv[i] = static_cast<float>(q_unrot[i]);
+  for (size_t i = 0; i < kv.size(); ++i) kv[i] = static_cast<float>(k_unrot[i]);
+  std::vector<int32_t> pos(static_cast<size_t>(T));
+  std::iota(pos.begin(), pos.end(), 0);
+  {
+    vt::Tensor qt = vt::Tensor::Contiguous(qv.data(), DType::kF32, Cpu(), {T, Hq, D});
+    vt::Tensor kt = vt::Tensor::Contiguous(kv.data(), DType::kF32, Cpu(), {T, Hkv, D});
+    vt::Tensor pt = vt::Tensor::Contiguous(pos.data(), DType::kI32, Cpu(), {T});
+    vt::RopeArgs ra;
+    ra.base = static_cast<float>(p.rope_theta);
+    ra.rotary_dim = static_cast<int>(p.head_dim * p.partial_rotary_factor);
+    vt::RopeNeox(cpu_q, qt, kt, pt, ra);
+  }
+
+  RotatedAttnRef r;
+  r.q_moved = RelSeparation(qv, q_unrot);
+
+  // The same causal GQA core as RefAttention above, over the ROTATED q/k.
+  const double scale = 1.0 / std::sqrt(static_cast<double>(D));
+  const int64_t rep = Hq / Hkv;
+  std::vector<double> ctx(static_cast<size_t>(T * Hq * D), 0.0);
+  for (int64_t h = 0; h < Hq; ++h) {
+    const int64_t g = h / rep;
+    for (int64_t i = 0; i < T; ++i) {
+      std::vector<double> s(static_cast<size_t>(i + 1));
+      double mx = -std::numeric_limits<double>::infinity();
+      for (int64_t j = 0; j <= i; ++j) {
+        double dot = 0.0;
+        for (int64_t d = 0; d < D; ++d) {
+          dot += static_cast<double>(qv[static_cast<size_t>(i * Hq * D + h * D + d)]) *
+                 static_cast<double>(kv[static_cast<size_t>(j * Hkv * D + g * D + d)]);
+        }
+        s[static_cast<size_t>(j)] = dot * scale;
+        mx = std::max(mx, s[static_cast<size_t>(j)]);
+      }
+      double sum = 0.0;
+      for (int64_t j = 0; j <= i; ++j) {
+        s[static_cast<size_t>(j)] = std::exp(s[static_cast<size_t>(j)] - mx);
+        sum += s[static_cast<size_t>(j)];
+      }
+      for (int64_t d = 0; d < D; ++d) {
+        double acc = 0.0;
+        for (int64_t j = 0; j <= i; ++j) {
+          acc += (s[static_cast<size_t>(j)] / sum) *
+                 v[static_cast<size_t>(j * Hkv * D + g * D + d)];
+        }
+        ctx[static_cast<size_t>(i * Hq * D + h * D + d)] = acc;
+      }
+    }
+  }
+  std::vector<float> cf(ctx.size());
+  for (size_t i = 0; i < ctx.size(); ++i) cf[i] = static_cast<float>(ctx[i]);
+  r.out = RefLinear(cf, w.o, T, Hq * D, H);
+  return r;
+}
+
+// `std::vector<double>` seen as floats, so a double reference can be the LEFT
+// operand of RelSeparation / ExpectCloseRel. Only used to compare two references
+// with each other; the separations involved are ~1e-2, four orders above the
+// 1e-7 this conversion costs.
+std::vector<float> AsFloat(const std::vector<double>& v) {
+  std::vector<float> f(v.size());
+  for (size_t i = 0; i < v.size(); ++i) f[i] = static_cast<float>(v[i]);
+  return f;
 }
 
 struct MoeRefWeights {
@@ -1078,78 +1171,14 @@ TEST_CASE("NemotronH attention applies NO positional embedding") {
   const std::vector<double> want_no_rope = RefAttention(r, p, hidden, T);
   ExpectCloseRel("attention without rope", got, want_no_rope, 2e-4);
 
-  const int64_t H = p.hidden_size, Hq = p.num_attention_heads, Hkv = p.num_key_value_heads,
-                D = p.head_dim;
-  std::vector<float> qv(static_cast<size_t>(T * Hq * D)), kv(static_cast<size_t>(T * Hkv * D));
-  {
-    const std::vector<double> qd = RefLinear(hidden, r.q, T, H, Hq * D);
-    const std::vector<double> kd = RefLinear(hidden, r.k, T, H, Hkv * D);
-    for (size_t i = 0; i < qv.size(); ++i) qv[i] = static_cast<float>(qd[i]);
-    for (size_t i = 0; i < kv.size(); ++i) kv[i] = static_cast<float>(kd[i]);
-  }
-  std::vector<int32_t> pos(static_cast<size_t>(T));
-  std::iota(pos.begin(), pos.end(), 0);
-  {
-    vt::Tensor qt = vt::Tensor::Contiguous(qv.data(), DType::kF32, Cpu(), {T, Hq, D});
-    vt::Tensor kt = vt::Tensor::Contiguous(kv.data(), DType::kF32, Cpu(), {T, Hkv, D});
-    vt::Tensor pt = vt::Tensor::Contiguous(pos.data(), DType::kI32, Cpu(), {T});
-    vt::RopeArgs ra;
-    ra.base = static_cast<float>(p.rope_theta);
-    ra.rotary_dim = static_cast<int>(p.head_dim * p.partial_rotary_factor);
-    vt::RopeNeox(q, qt, kt, pt, ra);
-  }
-  // Re-run the causal core over the ROTATED q/k and confirm it disagrees. A
-  // forward that applied RoPE would land here instead.
-  std::vector<double> rotated(static_cast<size_t>(T * H), 0.0);
-  {
-    AttnRefWeights ident = r;
-    // Reuse the reference's tail (attention core + o_proj) by feeding it q/k/v
-    // through a hand-rolled repeat of the core; simplest is to inline it.
-    const double scale = 1.0 / std::sqrt(static_cast<double>(D));
-    const int64_t rep = Hq / Hkv;
-    const std::vector<double> vv = RefLinear(hidden, r.v, T, H, Hkv * D);
-    std::vector<float> ctx(static_cast<size_t>(T * Hq * D), 0.0f);
-    for (int64_t h = 0; h < Hq; ++h) {
-      const int64_t g = h / rep;
-      for (int64_t i = 0; i < T; ++i) {
-        std::vector<double> s(static_cast<size_t>(i + 1));
-        double mx = -std::numeric_limits<double>::infinity();
-        for (int64_t j = 0; j <= i; ++j) {
-          double dot = 0.0;
-          for (int64_t d = 0; d < D; ++d) {
-            dot += static_cast<double>(qv[static_cast<size_t>(i * Hq * D + h * D + d)]) *
-                   static_cast<double>(kv[static_cast<size_t>(j * Hkv * D + g * D + d)]);
-          }
-          s[static_cast<size_t>(j)] = dot * scale;
-          mx = std::max(mx, s[static_cast<size_t>(j)]);
-        }
-        double sum = 0.0;
-        for (int64_t j = 0; j <= i; ++j) {
-          s[static_cast<size_t>(j)] = std::exp(s[static_cast<size_t>(j)] - mx);
-          sum += s[static_cast<size_t>(j)];
-        }
-        for (int64_t d = 0; d < D; ++d) {
-          double acc = 0.0;
-          for (int64_t j = 0; j <= i; ++j) {
-            acc += (s[static_cast<size_t>(j)] / sum) * vv[static_cast<size_t>(j * Hkv * D + g * D + d)];
-          }
-          ctx[static_cast<size_t>(i * Hq * D + h * D + d)] = static_cast<float>(acc);
-        }
-      }
-    }
-    rotated = RefLinear(ctx, ident.o, T, Hq * D, H);
-  }
-  // The instrument first: prove RopeNeox actually ROTATED q. A guard that fails
-  // because its own rotation was a no-op would look exactly like a forward that
-  // correctly applies none ([[absent-hook-looks-like-armed-instrument]]).
-  {
-    const std::vector<double> q_unrot = RefLinear(hidden, r.q, T, H, Hq * D);
-    const double moved = RelSeparation(qv, q_unrot);
-    INFO("RopeNeox moved q by relative " << moved);
-    REQUIRE(moved > 1e-2);
-  }
+  // The counterfactual: the answer the same fixture gives with the rotation
+  // applied. The instrument comes back with it and is checked FIRST.
+  const RotatedAttnRef rot = RefAttentionRotated(r, p, hidden, T, q);
+  INFO("RopeNeox moved q by relative " << rot.q_moved);
+  REQUIRE(rot.q_moved > 1e-2);
+
   // And now the finding: the shipped forward is NOT the rotated answer.
-  const double sep = RelSeparation(got, rotated);
+  const double sep = RelSeparation(got, rot.out);
   INFO("no-rope forward vs a rope'd one: relative separation " << sep);
   CHECK(sep > 1e-2);
 }
@@ -1487,9 +1516,30 @@ TEST_CASE("NemotronH greedy decode is deterministic and in range") {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// 8. A2α — THE DEVICE ARM (#810, .agents/specs/nemotron-h-abi-e2e.md)
+// 8. A2-R — THE DEVICE ARM (#810, .agents/specs/nemotron-h-abi-e2e.md)
 //
-// A2α puts the embedding lookup, the 52 layer norms + norm_f and the 6 GQA
+// ─── THE UNIT NAMES, BECAUSE THE OBVIOUS ONES COLLIDE ──────────────────────
+//
+// The spec's §1 "permitted split" (lines 236-241) already defines an `A2a` and
+// an `A2b`, and they are NOT this campaign's units. The spec's `A2a` is the
+// PAGED unit — the one that NARROWS the G-SAFE interlock. An earlier draft of
+// this work also called itself `A2a`, so a reader grepping `A2a` landed here
+// and expected the interlock to have moved. It has not. `A2b` is taken twice
+// over: the spec's batching unit, and Laguna's unrelated "Brick A2b"
+// (src/vt/cuda/cuda_laguna.cu:368). So this campaign uses names that collide
+// with neither:
+//
+//   A2-R  residency  — THIS unit. Dense weights on the shared OwnedTensor
+//                      seam, the 6 GQA blocks on the device. Interlock UNTOUCHED.
+//   A2-Q  quantized  — the NVFP4 / FP8 device arms (nemotron_h.cpp:1023).
+//   A2-P  paged      — the spec's `A2a`. NARROWS the interlock.
+//   A2-B  batching   — the spec's `A2b`. Drops the `num_reqs` clause.
+//
+// `nemotron_h_registry.cpp:159` still says `A2b`, in the spec's own sense, and
+// is deliberately not touched: that file carries the G-SAFE interlock, and its
+// being byte-identical to `main` is itself evidence a reviewer reads.
+//
+// A2-R puts the embedding lookup, the 52 layer norms + norm_f and the 6 GQA
 // attention blocks on the DEVICE, and leaves the 23 Mamba2 blocks, the 23 MoE
 // blocks and lm_head on the host. The cases below gate exactly that and nothing
 // more; see the file header of nemotron_h_device.cpp for why the line falls
@@ -1529,14 +1579,21 @@ namespace {
 //         difference entirely ([[bf16-store-absorbs-reduction-order-defects]])
 // f32 1e-5 leaves ~4x over the measured separation; bf16 4e-3 is about one bf16
 // ULP, the smallest band that cannot flake on another GPU's reduction order.
-// Both sit far below 2.11e-2, and that margin is ASSERTED in the case below so
-// a future widening fails there instead of silently disarming the property.
+//
+// NOTHING HERE ASSERTS THE MARGIN. An earlier draft of this repair carried a
+// `constexpr kRopeSeparation = 2.11e-2` beside these bands and checked
+// `DevRelFor(dt) * 5 < kRopeSeparation`. Both operands were compile-time
+// constants, so the check observed nothing about the running system; and
+// 2.11e-2 was the F32 arm's number, ~6% too large for bf16, whose separation
+// measures 1.97e-2. A constant anyone can edit to restore the hole is not a
+// guard, and an invented `* 5` is not one either — measured live, the bf16
+// ratio is 4.93x, so that factor redded a correctly-armed arm.
+//
+// The case instead builds the rotated counterfactual from the same per-dtype
+// fixture and requires THESE BANDS TO REJECT IT, through the same arithmetic
+// that accepted the real answer. That is the property itself, per dtype, per
+// run, with no stored twin and no safety factor.
 double DevRelFor(DType dt) { return dt == DType::kF32 ? 1e-5 : 4e-3; }
-
-// The separation a wrongly-applied NeoX rotation produces on this fixture,
-// MEASURED on Thor sm_110 under mutation M2 (#810 A2α). A constant so the band
-// margin is checkable rather than remembered.
-constexpr double kRopeSeparation = 2.11e-2;
 
 // A CUDA queue when a device is present. A GPU-less box must SKIP LOUDLY: a
 // device case that silently reports a pass over zero device work is
@@ -1555,16 +1612,24 @@ bool TryCudaQueue(Queue* q) {
 // (test_nemotron_h_loader.cpp:112-146).
 void NoteDeviceSkip(const std::string& case_name) {
   MESSAGE("SKIPPED '" << case_name
-                      << "': no CUDA device on this box. A2α's device arm is "
+                      << "': no CUDA device on this box. A2-R's device arm is "
                          "gated on dgx.casa (GB10 sm_121a) and 192.168.68.23 "
                          "(Thor sm_110); the local x86_64 box is a development "
-                         "arm and an A2α result from it is not an A2α result.");
+                         "arm and an A2-R result from it is not an A2-R result.");
   CHECK(true);  // the skip path ran and said so
 }
 
 }  // namespace
 
-TEST_CASE("NemotronH A2a: the device-consumed weights are held in the shared residency type") {
+// WHAT THIS CASE GATES, AND WHAT IT CANNOT. The fixture builds its OwnedTensors
+// with the test-local `OwnT` (:267), NOT with the loader's `CopyDenseOwned`
+// (`nemotron_h_weights.cpp:532`). So this case proves the device arm CONSUMES
+// the shared residency type correctly; it cannot see a defect in how the loader
+// PRODUCES it. Truncating every payload in production `CopyDenseOwned` to half
+// left this whole file 16/16 green. The producer is gated against the real
+// checkpoint in `test_nemotron_h_loader.cpp`, which is where the production
+// helper actually runs.
+TEST_CASE("NemotronH A2-R: the device-consumed weights are held in the shared residency type") {
   const NemotronHParams p = TinyParams();
   for (DType dt : {DType::kF32, DType::kBF16}) {
     const TinyWeights tw = BuildTiny(p, dt);
@@ -1610,12 +1675,13 @@ TEST_CASE("NemotronH A2a: the device-consumed weights are held in the shared res
       check_owned(aw.k_proj, ar.k, {kd, p.hidden_size}, "k_proj");
       check_owned(aw.v_proj, ar.v, {kd, p.hidden_size}, "v_proj");
       check_owned(aw.o_proj, ar.o, {p.hidden_size, qd}, "o_proj");
-      // `nk` records the raw torch-Linear [out, in] orientation both arms
-      // consume through vt::MatmulBT. A flipped orientation is a transposed
-      // GEMM operand, which is the defect a synthetic-fixture-only gate is
-      // blind to and which this records explicitly.
-      CHECK(aw.q_proj.nk);
-      CHECK(aw.o_proj.nk);
+      // NO `nk` ASSERTION HERE, DELIBERATELY. `nk` on this fixture is set by
+      // the test's own `OwnT`, so asserting it compares the fixture with
+      // itself: flipping the loader's `nk` at
+      // `nemotron_h_weights.cpp:686-689` left this case green, which is what a
+      // check that cannot fail looks like from outside. The orientation the
+      // LOADER records is gated where the loader actually runs —
+      // `test_nemotron_h_loader.cpp`, against the real checkpoint.
     }
 
     // 1 embeddings + 1 norm_f + 5 layer norms + 4 projections on the single
@@ -1625,14 +1691,14 @@ TEST_CASE("NemotronH A2a: the device-consumed weights are held in the shared res
     CHECK(examined > 0);
 
     // lm_head deliberately did NOT convert: it is NVFP4 W4A16 g16 on the real
-    // checkpoint and stays on the host in A2α. Asserted through the type's own
+    // checkpoint and stays on the host in A2-R. Asserted through the type's own
     // API so the boundary is a gated property rather than a comment.
     CHECK(!tw.host.lm_head.Empty());
     CHECK(tw.host.lm_head.IsDense());  // synthetic fixture; real one is kNvfp4W4A16G16
   }
 }
 
-TEST_CASE("NemotronH A2a: the device attention block matches the host reference block for block") {
+TEST_CASE("NemotronH A2-R: the device attention block matches the host reference block for block") {
   Queue dq{Device{DeviceType::kCPU, 0}, nullptr};
   if (!TryCudaQueue(&dq)) {
     NoteDeviceSkip("device attention block equivalence");
@@ -1673,50 +1739,52 @@ TEST_CASE("NemotronH A2a: the device attention block matches the host reference 
     // The instrument is checked before the property: if this rotation were a
     // no-op, a forward that correctly applies none would look identical to one
     // that applies it ([[absent-hook-looks-like-armed-instrument]]).
-    const int64_t H = p.hidden_size, Hq = p.num_attention_heads,
-                  Hkv = p.num_key_value_heads, D = p.head_dim;
-    std::vector<float> qv(static_cast<size_t>(T * Hq * D)),
-        kv(static_cast<size_t>(T * Hkv * D));
-    const std::vector<double> q_unrot = RefLinear(hidden, r.q, T, H, Hq * D);
-    {
-      const std::vector<double> kd = RefLinear(hidden, r.k, T, H, Hkv * D);
-      for (size_t i = 0; i < qv.size(); ++i) qv[i] = static_cast<float>(q_unrot[i]);
-      for (size_t i = 0; i < kv.size(); ++i) kv[i] = static_cast<float>(kd[i]);
-    }
-    std::vector<int32_t> pos(static_cast<size_t>(T));
-    std::iota(pos.begin(), pos.end(), 0);
-    {
-      vt::Tensor qt = vt::Tensor::Contiguous(qv.data(), DType::kF32, Cpu(), {T, Hq, D});
-      vt::Tensor kt = vt::Tensor::Contiguous(kv.data(), DType::kF32, Cpu(), {T, Hkv, D});
-      vt::Tensor pt = vt::Tensor::Contiguous(pos.data(), DType::kI32, Cpu(), {T});
-      vt::RopeArgs ra;
-      ra.base = static_cast<float>(p.rope_theta);
-      ra.rotary_dim = static_cast<int>(p.head_dim * p.partial_rotary_factor);
-      vt::RopeNeox(hq, qt, kt, pt, ra);
-    }
-    {
-      const double moved = RelSeparation(qv, q_unrot);
-      INFO("RopeNeox moved q by relative " << moved << " at " << tag);
-      REQUIRE(moved > 1e-2);
-    }
-    // The band the equivalence above accepted, and the separation a rotation
-    // would produce, must not overlap. Stated as a ratio so a future widening
-    // of RelFor(dt) cannot silently swallow the property.
+    const RotatedAttnRef rot = RefAttentionRotated(r, p, hidden, T, hq);
+    INFO("RopeNeox moved q by relative " << rot.q_moved << " at " << tag);
+    REQUIRE(rot.q_moved > 1e-2);
+
+    // THE SEPARATION A ROTATION PRODUCES, MEASURED IN THIS RUN ON THIS DTYPE'S
+    // OWN FIXTURE. Reported, not asserted against a stored twin — it differs
+    // per arm (f32 2.09e-2, bf16 1.97e-2 measured on Thor sm_110), which is
+    // the ~6% a single stored f32 constant got wrong for the bf16 arm.
+    const double rope_sep = RelSeparation(AsFloat(rot.out), RefAttention(r, p, hidden, T));
+    INFO("a rotation would move this block by relative " << rope_sep << " at " << tag);
+    REQUIRE(rope_sep > 1e-2);
+
     const double sep = RelSeparation(dev_out, want);
-    INFO("device-vs-host separation " << sep << " at " << tag
-                                      << " (band " << DevRelFor(dt) << ")");
+    INFO("device-vs-host separation " << sep << " at " << tag << " (band "
+                                      << DevRelFor(dt) << ", rope separation " << rope_sep
+                                      << ", ratio " << rope_sep / DevRelFor(dt) << "x)");
     CHECK(sep < DevRelFor(dt));
 
-    // THE BAND IS ARMED, ASSERTED HERE RATHER THAN REMEMBERED. A rotation moves
-    // this block by kRopeSeparation; if the band ever creeps up to within 5x of
-    // that, the gate stops being able to see one and THIS check fails first.
-    INFO("band " << DevRelFor(dt) << " vs measured rope separation "
-                 << kRopeSeparation << " at " << tag);
-    CHECK(DevRelFor(dt) * 5.0 < kRopeSeparation);
+    // ── THE BAND IS PROVEN TO REJECT A ROTATION, NOT COMPARED TO ONE ────────
+    //
+    // The first repair of this guard asserted `DevRelFor(dt) * 5 < rope_sep`.
+    // That is a PROXY with an invented safety factor, and measuring `rope_sep`
+    // live is what showed the trap: the bf16 ratio is 4.93x, so a factor picked
+    // to sound safe REDDED an arm that is in fact correctly armed. Lowering 5
+    // to 2 to get green would be widening a scope to turn a gate green, which
+    // AGENTS.md forbids outright.
+    //
+    // So the property is asserted DIRECTLY, with no factor at all: run the
+    // rotated counterfactual through the SAME arithmetic `ExpectCloseRel` used
+    // to ACCEPT the real answer, and require that it comes out REJECTED. That
+    // is exactly "this band can still see a rotation", measured on this dtype's
+    // own fixture in this run, with no number anyone can edit. Widen the band
+    // to `RelFor(kBF16)` = 3e-2 and it swallows the 1.97e-2 separation and this
+    // check reds — the historical hole, reproduced by construction.
+    const double atol = DevRelFor(dt) * MaxAbs(want);
+    INFO("does the band " << DevRelFor(dt) << " REJECT a rotated answer at " << tag << "?");
+    CHECK(AnyDiffers(AsFloat(rot.out), want, atol, DevRelFor(dt)));
+
+    // And the property itself, on the DEVICE's own answer: it sits outside that
+    // same band from a rotated one. Same arithmetic, no floor constant.
+    INFO("is the DEVICE answer outside the band from a rotated one at " << tag << "?");
+    CHECK(AnyDiffers(dev_out, rot.out, DevRelFor(dt) * MaxAbs(rot.out), DevRelFor(dt)));
   }
 }
 
-TEST_CASE("NemotronH A2a: the hybrid device forward matches the host reference token for token") {
+TEST_CASE("NemotronH A2-R: the hybrid device forward matches the host reference token for token") {
   Queue dq{Device{DeviceType::kCPU, 0}, nullptr};
   if (!TryCudaQueue(&dq)) {
     NoteDeviceSkip("hybrid device forward token identity");

@@ -514,7 +514,7 @@ NemotronHOwned CopyDense(Loader& ld, const std::string& name, vt::DType want,
   return CopyDense(ld, name, want, shape, shape);
 }
 
-// A2α (#810): the same dense copy, delivered in the tree's SHARED residency
+// A2-R (#810): the same dense copy, delivered in the tree's SHARED residency
 // type so the weight can be uploaded once by `dense_attn::ResidentWeight`.
 //
 // It DELEGATES to CopyDense rather than duplicating it. That is deliberate:
@@ -546,7 +546,7 @@ OwnedTensor CopyDenseOwned(Loader& ld, const std::string& name, vt::DType want,
 // Bytes resident for an OwnedTensor-held weight. The NemotronHOwned twin is
 // `HostBytes()` (payload + scales); a dense OwnedTensor has no scales, so this
 // is just the payload — exactly what HostBytes() returned for the same weight
-// before A2α converted it, which is why the load report's total is unchanged.
+// before A2-R converted it, which is why the load report's total is unchanged.
 int64_t OwnedHostBytes(const OwnedTensor& t) {
   return static_cast<int64_t>(t.bytes.size());
 }
@@ -681,7 +681,7 @@ void LoadAttention(Loader& ld, const NemotronHParams& p, const std::string& mixe
   const int64_t H = p.hidden_size;
   const int64_t qd = p.q_proj_out_features();
   const int64_t kvd = p.kv_proj_out_features();
-  // A2α: OwnedTensor, nk=true — raw torch Linear [out, in], consumed via
+  // A2-R: OwnedTensor, nk=true — raw torch Linear [out, in], consumed via
   // vt::MatmulBT by both the host mixer and the device NemotronHAttnBlock.
   out.q_proj = CopyDenseOwned(ld, mixer + ".q_proj.weight", adt, {qd, H}, true);
   out.k_proj = CopyDenseOwned(ld, mixer + ".k_proj.weight", adt, {kvd, H}, true);
@@ -743,7 +743,7 @@ void LoadMlp(Loader& ld, const NemotronHParams& p, const std::string& mixer,
 }
 
 int64_t HostBytesOf(const NemotronHHostWeights& h) {
-  // A2α: embeddings / norm_f / per-layer norm / attention q,k,v,o are now
+  // A2-R: embeddings / norm_f / per-layer norm / attention q,k,v,o are now
   // OwnedTensor, so they are counted through OwnedHostBytes. Same bytes, same
   // total — the conversion changed the holder, not the payload.
   int64_t n = OwnedHostBytes(h.embeddings) + OwnedHostBytes(h.norm_f) +
