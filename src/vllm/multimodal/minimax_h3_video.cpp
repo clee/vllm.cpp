@@ -223,7 +223,7 @@ void FillNoise(std::vector<float>& out, uint64_t seed) {
 //
 // `device` is the public video ABI's selector: 0 is the CPU, 1 is "the
 // accelerator". WHICH accelerator is the PLATFORM's question, not this model
-// file's — the same question `ltx2_video.cpp:549-580` and `SelectQueueForModel`
+// file's — the same question `ltx2_video.cpp:566-610` and `SelectQueueForModel`
 // (src/vllm/entrypoints/model_loader.cpp:75-104) ask.
 //
 // This used to be `static_cast<vt::DeviceType>(device)`, which is not a mapping

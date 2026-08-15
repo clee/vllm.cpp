@@ -25,7 +25,7 @@ if (accelerator == vt::DeviceType::kCPU ||
 
 That is "is there an accelerator, and is a backend registered for it". The
 precedent it cites, `SelectQueueForModel`, asks a third question —
-`src/vllm/entrypoints/model_loader.cpp:97`:
+`src/vllm/entrypoints/model_loader.cpp:98`:
 
 ```cpp
 (architecture.empty() || plat.supports_model_architecture(architecture))
@@ -82,7 +82,7 @@ about the token and a weaker statement about the property than it appears to be.
 1. `minimax_h3_video.cpp` resolves its device through the platform seam rather
    than by integer cast, mirroring what `ltx2_video.cpp` now does. The public
    `MiniMaxH3VideoDeviceType(int32_t)` contract in
-   `include/vllm/multimodal/minimax_h3_video.h:63` is preserved — `0` is CPU,
+   `include/vllm/multimodal/minimax_h3_video.h:69` is preserved — `0` is CPU,
    anything else is refused or resolved, never cast.
 2. `ltx2_video.cpp` asks `supports_model_architecture` alongside the two
    questions it already asks, and refuses **by name**, naming the platform and
@@ -294,9 +294,9 @@ back to the CPU reference … and runs correctly, just slowly — which is stric
 better than dying inside a kernel bind"). Both diffusion lanes instead **throw**.
 That is correct, but it is the *explicit-device* path's polarity, not the
 `kAuto` path's: `device = 1` is an explicit accelerator request, and
-`model_loader.cpp:71-72` already says of that path "an explicit accelerator whose
+`model_loader.cpp:72-73` already says of that path "an explicit accelerator whose
 queue cannot be created must FAIL the load loudly, never silently serve on CPU" —
-the same argument `ltx2_video.cpp:545-548` makes for refusing rather than serving
+the same argument `ltx2_video.cpp:562-565` makes for refusing rather than serving
 the CPU forward behind an accelerator handle. So the lanes mirror the capability
 question from one path and the failure polarity from the other, and both halves
 are the seam's own.
@@ -467,6 +467,20 @@ So both records now carry the SHA the number was measured at, and a reader who
 finds a mismatch knows to re-derive rather than to distrust the rest. The
 durable statement is the ratio the controls give, not the absolute count.
 
+**Re-derived again at the `4a4ab89cb` merge, and it rotted again — as predicted.**
+The scanned set is **776 files**, with the controls at `\bDeviceType\b` = **163**
+and `\bkCUDA\b` = **18**. `kCUDA` is unchanged across seventeen commits of main
+and `DeviceType` moved by one, which is the invariant this section actually
+claims; the file count moved by eleven, which is the thing it says will rot. Two
+notes for the next reader, because each cost a probe here and each made a correct
+figure look wrong. The controls are counted over the
+**comment-and-string-stripped** text — the text the pattern is actually matched
+against — and NOT over raw source, where the same two patterns read **177 / 82**.
+And the enumeration must be the checker's own `rglob` over `SCAN_ROOTS`: a
+`git ls-tree` walk filtered with a string prefix returns **777**, because
+`include/vllm.h` starts with the characters `include/vllm` while sitting outside
+the `include/vllm` root. That off-by-one is the probe's, not the record's.
+
 ## Now
 
 `READY`, implemented and awaiting a fresh review on
@@ -475,10 +489,25 @@ are on the branch with their RED, GREEN and mutation evidence in the PR body;
 next is a fresh reviewer — not the implementer — on the immutable head, then the
 operator's own gate rerun.
 
-The row stays `READY` in `roadmap_v1.md` deliberately. A lifecycle move to
-`ACTIVE` owes `docs/STATUS.md` and `docs/BENCHMARKS.md` in the same change
+The row stays `READY` deliberately. A lifecycle move to `ACTIVE` owes
+`docs/STATUS.md` and `docs/BENCHMARKS.md` in the same change
 (scripts/check-doc-checkpoint.py), and those are projections of what the project
 CLAIMS — which this row does not change until it lands. Writing them from an
 unmerged PR would also put two shared files under a lock for the length of a
 review. The operator moves the state, and writes those two surfaces, when it
 merges.
+
+**This row now writes no record file at all, and that is the correct outcome
+rather than an omission.** It previously annotated the `#659` and `#660` rows of
+`roadmap_v1.md`'s `## Open issues` table in place. `#840`
+(`POLICY-ISSUE-INTAKE`, spec [`issue-intake.md`](issue-intake.md)) moved that
+table out to `.agents/issue-index.md`, which is append-only and carries
+`merge=union`: a row is appended and never edited, and GitHub holds the open and
+closed state, so closing `#659` and `#660` costs the index no edit. The in-place
+annotation this row carried is exactly the `FIXED IN FLOW` shape that spec
+retired, and under a union driver it would have been duplicated rather than
+merged. The two index rows are therefore left byte-for-byte as `origin/main`
+holds them, `LTX25-DEVICE-SEAM-SIBLING` has no portfolio row in `roadmap_v1.md`
+(checked, with `ENG-WEIGHT-OFFLOAD` at two hits as a positive control in the same
+command), and the evidence that annotation carried lives here, in the surface
+that owns it.
