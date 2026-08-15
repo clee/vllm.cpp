@@ -1519,9 +1519,13 @@ void RmsNormGatedQuantFp8(Queue& q, Tensor& out_fp8, const Tensor& x, const Tens
 // K,N multiples of 16 (128-bit fp8 alignment). CUDA (sm120a) + a CPU CORRECTNESS
 // REFERENCE (f32 accumulate, naive triple loop — no speed claim, and no
 // production model routes through it; it exists so the fp8 seam resolves on a
-// CPU queue and can be gated without a GPU, #468). The CPU arm agrees with the
-// CUDA kernel to fp8/bf16 tolerance, NOT byte-for-byte: the CUDA arm reduces K
-// in tensor-core order and rounds its epilogue through bf16.
+// CPU queue and can be gated without a GPU, #468). The CPU arm is EXPECTED to
+// agree with the CUDA kernel to fp8/bf16 tolerance and NOT byte-for-byte, because
+// the CUDA arm reduces K in tensor-core order and rounds its epilogue through
+// bf16 — but that agreement is DECLARED AND OWED, not measured. No committed run
+// has compared the two arms: gate G2 of .agents/specs/vt-fp8-w8a8-cpu-arm.md is
+// PENDING for want of a GPU. Treat the tolerance above as the claim to be tested,
+// not as a result.
 void MatmulFp8Cutlass(Queue& q, Tensor& out, const Tensor& a_fp8, const Tensor& b_fp8,
                       float alpha);
 

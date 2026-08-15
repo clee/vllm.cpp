@@ -8,11 +8,16 @@ model-layer wiring #468 found untestable),
 [`portable-fusion-framework.md`](portable-fusion-framework.md) §3b/§6 (the
 "backend-negotiated fp8 tail" this row retires on CPU).
 
-#468 lists two ways to close its coverage debt. This row is **option 1**: *"a CPU
-registration for the fp8 matmul sufficient to exercise the wiring (which has
-value well beyond this lever — it would make the whole fp8 model path
-CPU-testable)"*. It does not do option 2, and it does not touch the parked
-`VT_GDN_FP8_ALPHA_IN_CONV` lever.
+#468 lists two ways to close its coverage debt. This row takes the **first half of
+option 1**, and the distinction matters. #468 asks for *"a CPU registration for the
+fp8 matmul sufficient to exercise the wiring (which has value well beyond this
+lever — it would make the whole fp8 model path CPU-testable)"*. This row delivers
+the registration, and the parenthetical benefit is now real at the OP tier. It is
+**not sufficient to exercise the wiring**: the GEMM registered here is
+`kMatmulFp8Cutlass`, while the model-layer predicate keys on
+`kMatmulFp8CublasLt`, so the `mixed_scale` call sites #468 set out to cover remain
+unreachable. See §Residual gap. It does not do option 2, and it does not touch the
+parked `VT_GDN_FP8_ALPHA_IN_CONV` lever.
 
 ## Scope
 
@@ -158,10 +163,39 @@ already false today:
 
 | Risk | Mitigation |
 |---|---|
-| A CPU registration silently becomes a reference-tier fallback on unified-memory accelerators (`MaybeInstallReferenceTier`, `src/vt/op_provider.cpp:204-225`), turning a hard refusal into a slow silent success on e.g. Metal/Vulkan | Not silent by construction: the tier is announced once per (op, device) on stderr as `[vt reference-tier] … running the PORTABLE CPU fallback (correct but slow)` and counted (`op_provider.cpp:516-528`). Recorded here as an intended, visible consequence rather than left to be discovered |
+| A CPU registration becomes a reference-tier fallback on unified-memory accelerators (`MaybeInstallReferenceTier`, `src/vt/op_provider.cpp:204-225`) | **THIS ROW WAS WRONG. See the refutation below.** |
 | The three `CHECK_THROWS` in `test_fused_chain_additivity.cpp` are "fixed" by deletion, weakening the additivity proof | They are REPLACED by full-composite byte-exact checks and the `cpu_full` flags flip to `true`; the case's `== 9` catalog count guard is untouched. Assertion count goes UP, not down, and that is recorded in the evidence |
 | `F32ToFp8`'s comment claims it bit-matches `vllm::F32ToF8E4M3`, and the claim was never tested against an INDEPENDENT reference | G1 is exactly that test, and its reference is derived from the format definition + upstream's clamp, not from either of our two codecs |
 | A CPU-vs-CUDA byte divergence exists and nobody sees it, because this box has no GPU | G2 is declared, and reported PENDING with the reason rather than skipped. It is not counted as satisfied |
+
+### REFUTED by measurement: the reference-tier row above understated the risk
+
+The risk table originally read: *"Not silent by construction: the tier is announced
+once per (op, device) on stderr as `[vt reference-tier] … running the PORTABLE CPU
+fallback (correct but slow)` and counted. Recorded here as an intended, visible
+consequence."* That reasoned from the ANNOUNCEMENT and never tested the
+CONSEQUENCE, and the consequence is not slowness.
+
+`MaybeInstallReferenceTier` declines only while the CPU provider count is zero
+(`op_provider.cpp:213-214`, `if (cpu.count == 0) return false;`). Before this row
+that count was 0 for `kQuantFp8Static` and `kMatmulFp8Cutlass`, so a unified-memory
+accelerator lacking a native kernel got the refuse-by-name path. **This row's
+registrations make the count 1.** Those ops therefore flip from refusing by name to
+installing a host kernel that dereferences what may be device pointers.
+
+Measured, not reasoned: **SIGSEGV on GB10, exit 139** ([#844](https://github.com/mudler/vllm.cpp/issues/844)).
+So the real consequence is a crash, or worse a silent wrong answer, on a device
+whose memory does not alias the host — and a `correct but slow` banner printed
+immediately before it is not mitigation, it is a misleading label. The tier's
+safety gate is `ReferenceTierEligible` (`op_provider.cpp:774-780`), not the
+announcement.
+
+This is not fixed here. #844 owns it, it is broader than this row (every CPU
+registration widens the same surface), and fixing the tier's device-pointer
+contract inside a row about fp8 registration would be exactly the silent scope
+widening the stop conditions forbid. Recorded as debt this row CREATES, which is
+the honest framing: the row is still worth landing for CPU testability, and it
+makes an existing latent defect reachable for two more ops.
 
 ## Tests and gates
 
@@ -297,6 +331,32 @@ overflow guard — so removing either alone leaves saturation intact and the
 mutant survives. M3 removes both, which is what "saturation removed" has to mean
 for this codec, and then it dies by 28 assertions. Recorded because a reviewer
 mutating only the obvious guard would wrongly conclude the gate is blind.
+
+### Review findings folded in (PR #842)
+
+A fresh review returned FAIL on three blockers. All are addressed here rather than
+argued away.
+
+- **F2** the branch was `CONFLICTING`. Resolved by merging `origin/main` at
+  `2f2bce926` and following the intake table, which main RELOCATED from
+  `roadmap_v1.md` to `issue-index.md`; see that merge commit for the four-way
+  verification and for why a strict-PREFIX check is vacuous on an in-place row edit.
+- **F3** two shipped comments asserted CPU/CUDA equivalence as fact while G2 has
+  never run. Both downgraded to "declared and owed under G2"
+  (`cuda_matmul_fp8_cutlass.cu`, `include/vt/ops.h`). This was the row's own
+  thesis turned on the row: it repaired a comment asserting an unverified
+  contract, then shipped two more.
+- **F4** the reference-tier risk row was refuted by measurement; see above and #844.
+- **F5** the "option 1 verbatim" framing is softened wherever it appears. What
+  landed is the OP seam; the registered GEMM is `kMatmulFp8Cutlass` while the model
+  predicate keys on `kMatmulFp8CublasLt`, so the `mixed_scale` wiring #468 set out
+  to cover REMAINS UNREACHABLE. See §Residual gap, which said so from the start.
+- **F6** the G2 case name contained a comma. doctest splits `-tc=` on commas, so
+  the one gate this row still owes was UNSELECTABLE by name: measured
+  `test cases: 0 | 0 passed | 0 failed | 4 skipped`, `Status: SUCCESS!`, exit 0.
+  Renamed comma-free; the same selector now returns 1 case. The lesson generalizes
+  past this file, so it is written next to the case rather than only here: a gate
+  that selects nothing and prints SUCCESS is the worst failure mode available.
 
 ## Stop conditions
 

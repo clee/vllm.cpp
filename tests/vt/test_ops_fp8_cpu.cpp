@@ -269,7 +269,14 @@ TEST_CASE("G1: CPU QuantFp8Static is BYTE-identical to an independent e4m3 refer
 // G2 — the CPU registration must agree with the CUDA kernel BIT for BIT on the
 // same input. This is the arm that says the CPU path is a mirror of what ships,
 // not merely self-consistent with a host reference.
-TEST_CASE("G2: CPU QuantFp8Static == CUDA QuantFp8Static, byte for byte") {
+// NAME THIS CASE WITHOUT A COMMA. doctest splits `-tc=` on commas, so a comma in
+// a case name makes the name unselectable: the filter becomes two patterns that
+// each match nothing, and the binary then reports
+//   test cases: 0 | 0 passed | 0 failed | 4 skipped ... Status: SUCCESS!
+// with exit 0. That is the worst failure mode available to a gate -- the ONE
+// arm this row still owes would have selected nothing and reported success.
+// Measured on this file before the rename (#468 review F6).
+TEST_CASE("G2: CPU QuantFp8Static equals CUDA QuantFp8Static byte for byte") {
   if (!HasCuda()) {
     // NOT a silent skip. The CPU registration is still asserted so the case can
     // never be vacuous, and the banner names what is owed.
