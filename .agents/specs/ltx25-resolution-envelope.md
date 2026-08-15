@@ -342,3 +342,32 @@ takes a different path entirely.
 - Any need for the GPU. Report and stop.
 - If the derived divisor disagrees with upstream's 64/32 on any shipped recipe,
   stop and report rather than special-casing a recipe.
+
+## Outcome
+
+**The geometry half landed; the sampler half is owed and named.**
+
+What was measured, and what it changed. The defect was expected to be a single
+silent floor and is two failure modes, split by whether a request's floor is
+consistent across the phases (§1.2). Width 96 on the two-stage arm — the obvious
+test value — takes the *other* path and never floors at all, so a case written
+from reasoning rather than measurement would have gated the wrong thing and still
+gone green. The fixture sizes are the measured ones for that reason.
+
+What was rejected. A frames refusal, because upstream floors an explicit count
+identically and validates it nowhere; adding one would have been a divergence
+wearing the costume of a fix. Per-axis divisors, for the same reason — upstream
+has one divisor, and the first draft's "future-proofing" was a divergence too;
+what landed asserts the equality the single divisor assumes. And a `two_stage_hq`
+recipe row, which would have been selectable by nothing, because the sampler that
+makes it HQ is not ported (#921).
+
+Why the divisor is a parameter rather than a constant: upstream's 64 and 32 are
+derived quantities spelled as literals, and spelling them as literals here would
+restate the answer instead of the reason. The one mutation that survived the
+first pass (§5) was against the message's *suggested* size, not the check — worth
+recording, because it is the half of a refusal that gets written once and never
+tested, and a suggestion that is not itself legal is worse than none.
+
+State: complete for its scope. No lifecycle row moves, so `docs/STATUS.md`,
+`docs/BENCHMARKS.md` and `.agents/NOW.md` are untouched by design.
