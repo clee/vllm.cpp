@@ -1488,11 +1488,25 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
   //
   // FRAMES ARE DELIBERATELY NOT CHECKED HERE, and the asymmetry is upstream's.
   // `resolve_num_frames` (utils/blocks.py:908-928) returns an explicit count
-  // verbatim and `VideoLatentShape.from_pixel_shape` (types.py:113) then floors it
-  // exactly as line ~1461 below does; `snap_frames_to_grid` (helpers.py:554-562)
-  // is reached only from the AUTO-duration path. Adding a refusal here would be a
-  // divergence from the reference, not a mirror of it — so `docs/USAGE.md` carries
-  // the rounding as documented behaviour instead (#919).
+  // verbatim (utils/blocks.py:920-921) and `VideoLatentShape.from_pixel_shape`
+  // (ltx_core/types.py:113)
+  // then floors it exactly as the `vshape.frames = (frames - 1) / factors.time + 1`
+  // line in the phase loop below does. Adding a refusal here would be a divergence
+  // from the reference, not a mirror of it — so `docs/USAGE.md` carries the
+  // rounding as documented behaviour instead (#919).
+  //
+  // `snap_frames_to_grid` (utils/helpers.py:554-562) does NOT contradict that,
+  // and the reason is not the one it is easy to give. It has three callers, not
+  // one: utils/helpers.py:581 inside `seconds_to_clamped_num_frames`, which is the
+  // auto-duration path, and dubit.py:215 and :396, the second of which is inside
+  // `DubitPipeline.__call__` three lines after its own `assert_resolution`. So
+  // "only the auto-duration path snaps" is false. What holds is sharper:
+  // `DubitPipeline.__call__` takes NO `num_frames` at all (dubit.py:194-210) and
+  // snaps a count it read from the reference video's container metadata. Counted
+  // at the pin, it is the only pipeline `__call__` that snaps, and the only one
+  // with no `num_frames` parameter — every `__call__` that does take one leaves it
+  // unsnapped. An explicit frame count is floored upstream and here, and validated
+  // in neither.
   // ONE divisor for both axes, as upstream has (`divisor = 64 if is_two_stage
   // else 32`). That is a mirror and not a simplification: upstream's
   // VIDEO_SCALE_FACTORS is (8, 32, 32), so its single spatial divisor already

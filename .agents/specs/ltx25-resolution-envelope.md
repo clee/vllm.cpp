@@ -41,8 +41,10 @@ the production entry point, plus the published envelope.
    absent. §5 and #921.
 2. **A raised resolution ceiling.** There is no code cap to lift. The only
    geometry guard in the LTX path today is a **lower** bound
-   (`ltx2_video.cpp:1464-1471 @ 5a0ffe9e3`; `:1494-1501` after this row, which
-   inserted the guard above it). The real ceiling is host memory and decode
+   (`ltx2_video.cpp:1464-1471 @ 5a0ffe9e3` — after this row, the
+   `if (vshape.frames < 1 || vshape.height < 1 || vshape.width < 1)` refusal
+   inside the phase loop, which this row's guard now sits above). The real
+   ceiling is host memory and decode
    throughput, it is already measured, and it is already **unattributed** — §4.
    Attributing it needs the GPU, which this row must not use.
 
@@ -68,13 +70,33 @@ def assert_resolution(height: int, width: int, is_two_stage: bool) -> None:
         raise ValueError(...)
 ```
 
-It is not help text and it is not advisory. There are **ten** call sites, one at
-the top of every pipeline's `__call__`, including the two this row's brief named:
-`ti2vid_two_stages.py:184` (`is_two_stage=True`) and
+It is not help text and it is not advisory. There are **nine invocations**, each
+near the top of a pipeline's `__call__`, including the two this row's brief
+named: `ti2vid_two_stages.py:184` (`is_two_stage=True`) and
 `ti2vid_two_stages_hq.py:199` (`is_two_stage=True`), against
 `ti2vid_one_stage.py:156` (`is_two_stage=False`). The CLI's `args.py` help text
 carries the same rule, but the pipeline is what enforces it, and a caller who
 reaches `__call__` from library code gets the `ValueError` either way.
+
+**Nine, and the other numbers in circulation are wrong.** `grep -rn
+assert_resolution` at the pin returns **21** lines, and this row's first pass read
+that as a call-site count in one place and as "ten" in another. Counted:
+
+| Kind | Count | Where |
+|---|---|---|
+| Invocations | **9** | `a2vid_two_stage.py:168`, `dfr_pipeline.py:291`, `distilled.py:213`, `dubit.py:212`, `ic_lora.py:229`, `keyframe_interpolation.py:170`, `ti2vid_one_stage.py:156`, `ti2vid_two_stages.py:184`, `ti2vid_two_stages_hq.py:199` |
+| Definition | 1 | `utils/helpers.py:540` |
+| Imports | 10 | one per calling module, plus `utils/__init__.py:12` |
+| `__all__` string | 1 | `utils/__init__.py:44` |
+
+"Every pipeline's `__call__`" is wrong too. **13** pipeline `__call__`s take a
+height and a width, and four of them never call the guard:
+`distilled_mgpu.py:143`, `ti2vid_two_stages_mgpu.py:163`,
+`ti2vid_two_stages_hq_mgpu.py:164` and `hdr_ic_lora.py:352`. (`retake.py:151` and
+`t2a_one_stage.py:109` take no resolution at all and are excluded from the 13.)
+So the guard is what every pipeline a caller reaches for a single-GPU
+text/image-to-video render runs, and not a universal one — which changes nothing
+about mirroring it, and does change what this document may claim.
 
 **Where 64 and 32 come from.** The VAE spatial factor is 32
 (`SpatioTemporalScaleFactors.default()` = `time=8, height=32, width=32`,
@@ -97,11 +119,27 @@ height = shape.height // scale_factors.height
 width  = shape.width  // scale_factors.width
 ```
 
-`snap_frames_to_grid` (`helpers.py:554-562`), which encodes
-`(frames - 1) % time == 0`, is reached only from `seconds_to_clamped_num_frames`
-(`:565-580`), which is the **auto-duration** path. So upstream floors an explicit
-frame count exactly as we do, and validates it nowhere. §3.2 takes the
-consequence.
+`snap_frames_to_grid` (`utils/helpers.py:554-562`) encodes
+`(frames - 1) % time == 0`,
+and this row's first pass said it "is reached only from the AUTO-duration path".
+**That premise is false**, and it was published in `docs/USAGE.md` and asserted
+in a source comment before a fresh review caught it. There are three callers:
+
+| Caller | Path |
+|---|---|
+| `utils/helpers.py:581` | inside `seconds_to_clamped_num_frames` (`utils/helpers.py:565-585`) — the auto-duration path, as claimed |
+| `dubit.py:215` | inside `DubitPipeline.__call__` (`:194-210`), three lines after its own `assert_resolution` at `:212` |
+| `dubit.py:396` | the module's `main`, sizing the encoder's chunk count |
+
+**The decision it was used to justify survives, on a different and checkable
+reason.** `DubitPipeline.__call__` (`dubit.py:194-210`) takes **no `num_frames`
+parameter at all**; it reads a frame count from the reference video's container
+metadata (`get_videostream_metadata`) and snaps that. Counted at the pin, it is
+the only pipeline `__call__` that snaps and the only one with no `num_frames`
+parameter — every `__call__` that *does* take one leaves it unsnapped, and the
+six that route it through `resolve_num_frames` get it back verbatim
+(`utils/blocks.py:920-921`). So no caller-supplied frame count is validated anywhere
+upstream, which is the claim §3.2 actually needs. It floors, exactly as we do.
 
 **Upstream's own defaults**, which are the scale the envelope is measured
 against (`utils/constants.py`):
@@ -119,12 +157,23 @@ outputs are multiples of 64, as `assert_resolution` requires of a two-stage call
 
 Every repo-local anchor in this section is pinned `@ 5a0ffe9e3`, this row's base
 SHA, because the row edits the file it cites and an unpinned anchor into a file
-you are yourself moving is stale by default (#911). The post-change positions are
-given where they matter.
+you are yourself moving is stale by default (#911).
+
+**The post-change positions are named by their code, not by a line number**, and
+that spelling is itself a repair. The first pass gave them as
+`ltx2_video.cpp:1485-1493` and `ltx2_video.cpp:1494-1501`; they were
+`ltx2_video.cpp:1484-1492` and `ltx2_video.cpp:1493-1500` on that tree, and then
+`origin/main` moved for #935 and put both of them past `ltx2_video.cpp:1600`. A
+post-change
+line number in a file the row is editing goes stale twice over — once from the
+row's own insertions and again from every merge before it lands — so this section
+states the expression instead, which the reader can find with one grep and which
+no merge can move.
 
 `vllm_video_generate` resolves geometry at
 `src/vllm/multimodal/ltx2_video.cpp:1401-1422 @ 5a0ffe9e3` and turns it into a
-latent grid at `:1455-1463 @ 5a0ffe9e3` (`:1485-1493` after this row):
+latent grid at `:1455-1463 @ 5a0ffe9e3` — after this row, the `phase_h`/`phase_w`
+divisions and the three `vshape.*` assignments at the head of the phase loop:
 
 ```cpp
 const int64_t phase_h = height / phase.spatial_downscale;
@@ -137,8 +186,11 @@ vshape.width  = phase_w / factors.width;
 
 Three binding constraints, and only one of them is a check:
 
-1. **A lower bound**, `:1464-1471 @ 5a0ffe9e3` (`:1494-1501` after this row) —
-   the request must reach one latent cell. Present, correct, and gated.
+1. **A lower bound**, `:1464-1471 @ 5a0ffe9e3` — after this row, the
+   `if (vshape.frames < 1 || vshape.height < 1 || vshape.width < 1)` refusal
+   immediately below that block. The request must reach one latent cell. Present,
+   correct, and gated. It is also where a caller sent to a size of 0 by the old
+   suggestion wording landed (§3.1).
 2. **`frames < 1`**, `:1422 @ 5a0ffe9e3`. Present.
 3. **Divisibility — absent.** Integer division is the whole of it.
 
@@ -173,7 +225,8 @@ a source-and-refusal question rather than a measurement one.
   **derived** as `factors.height * recipe.max_spatial_downscale()` rather than
   hardcoded, which reproduces upstream's 64 and 32 on the two-stage and one-stage
   recipes respectively.
-- A red-first test entering through `vllm_video_generate`, plus the reachability
+- A red-first test entering through `LoadVideoEngine` + `VideoEngine::Generate`,
+  which is what `vllm_video_generate` itself calls, plus the reachability
   mutation.
 - `docs/USAGE.md`: the published envelope, and the correction of the frames
   claim to what upstream and this tree both actually do.
@@ -182,7 +235,9 @@ a source-and-refusal question rather than a measurement one.
 
 - The res_2s denoising loop and the HQ preset — #921, `## Owed`.
 - `TI2VidTwoStagesPipeline` as a distinct recipe row. Our
-  `DistilledTwoStageRecipe` (`ltx2_pipeline.cpp:1084-1131`) already carries the
+  `DistilledTwoStageRecipe` (`ltx2_pipeline.cpp`, one definition, cited by name
+  because `:1084-1131` was already mid-function at the base SHA and this row
+  moves the file again) already carries the
   two-phase spatial-upsample shape; the non-distilled variant differs in its
   stage-1 schedule and guidance, and is a recipe row rather than a geometry
   question. Not bundled.
@@ -204,11 +259,30 @@ resolve and before anything consumes them — which is where upstream calls it,
 at the top of `__call__` before any work is paid for.
 
 **The divisor is derived, not restated.** `recipe.max_spatial_downscale()`
-(`ltx2_pipeline.cpp:994-1000`) already reports the worst `spatial_downscale` over
-a recipe's phases: 2 for `distilled_two_stage`, 1 for `one_stage` and `dmd2`.
-Multiplied by `factors.height` (32) it is 64 and 32 — upstream's two numbers,
-reached by upstream's reasoning. A hardcoded pair would restate the answer and
-would silently be wrong for any future recipe whose phases downscale by more.
+already reports the worst `spatial_downscale` over a recipe's phases: 2 for
+`distilled_two_stage`, 1 for `one_stage` and `dmd2`. Multiplied by
+`factors.height` (32) it is 64 and 32 — upstream's two numbers, reached by
+upstream's reasoning rather than spelled as literals.
+
+**It reproduces upstream's numbers; it does not generalise past them, and this
+row does not claim it does.** The first pass wrote that the derivation "stays
+correct for a recipe whose phases downscale by more", and that is stronger than
+the code. The quantity a request must survive is the **least common multiple** of
+the phase downscales, not the maximum. The two agree on every shipped recipe,
+whose downscales are drawn from {1, 2}. They part on a recipe with phases at 2
+and 3: `max` gives a divisor of 96, a 96-wide request passes, and the
+downscale-2 phase then floors 48 onto one latent cell — the exact defect this
+guard exists to stop.
+
+**Not implemented, and the reason is reachability rather than effort.** No
+shipped recipe has a non-power-of-two spatial downscale, so an lcm form would
+change no behaviour any production entry point can reach, and no test entering
+through `LoadVideoEngine` could gate it. Landing it would put an unreachable
+branch in the tree and a class-level test beside it, which
+[`.agents/reachability.md`](../reachability.md) names as the failure to avoid.
+Recorded here and in the header comment on `Ltx2AssertResolution` as a stated
+limit; it becomes live work the day a recipe with such a phase is added, and the
+recipe row that adds one owns it.
 
 **One divisor covers both axes**, as upstream has it (`divisor = 64 if
 is_two_stage else 32`). That is the mirror and not a simplification: upstream's
@@ -219,6 +293,30 @@ landed instead asserts `factors.height == factors.width` at the call site and
 fails by name if a VAE ever breaks it, so the assumption is checked rather than
 carried silently — a VAE with differing axes would otherwise have its width
 measured against the height factor and no test would see it.
+
+**The message is part of the contract, and two halves of it were unheld.** A
+refusal that a public document advertises is a promise, so each clause needs a
+needle a test can hold and a value a caller can act on.
+
+*The axis phrase carries its own verb.* The first shape was `"; the " + bad +
+" is not"` with `bad` a bare noun. Every refusal this function emits also carries
+the literal `" (width x height) "` label, so `msg.find("width")` and
+`msg.find("height")` are satisfied by that constant regardless of which axis was
+named — a mutation swapping the two names stayed green, and `docs/USAGE.md`
+published "the refusal names the offending axis" as a contract no test held. The
+phrase now comes out whole: `"the width is not"`, `"the height is not"`, or
+`"the width and height are not"`. That third branch is grammatical rather than a
+noun spliced into a fixed tail, and it is the branch a caller who passes a square
+off-grid size reaches.
+
+*The suggested size has to be legal.* `(width / divisor) * divisor` is **0** for
+any axis below the divisor, so a two-stage width-32 request was told "Nearest
+legal size at or below the request: 0x64" — and 0 is refused by the lower bound
+in the phase loop a few dozen lines later. That is one illegal size handed out in
+place of another, which §Outcome's own standard rejects: a suggestion that is not
+itself legal is worse than none. When either floored axis is 0 the message now
+says no legal size at or below the request exists, and names the smallest legal
+size, which is the divisor on both axes.
 
 ### 3.2 Frames: the doc moves, the code does not
 
@@ -265,18 +363,43 @@ to each other rather than only the legal one.
 ## 5. Tests
 
 Red-first, entering through the production entry point per
-[`.agents/reachability.md`](../reachability.md):
+[`.agents/reachability.md`](../reachability.md).
 
-1. **`test_ltx2_video`**, through `vllm_video_generate` on the distilled
-   two-stage recipe: a request whose width is not a multiple of 64 is refused,
-   and the message names the divisor and the offending value. Red before the
-   check exists, because today it renders a floored clip and returns success.
+**Which entry point, stated exactly**, because the first pass said
+"`vllm_video_generate`" and that is not what the file does.
+`tests/vllm/multimodal/test_ltx2_video.cpp:19` includes
+`vllm/multimodal/ltx2_video.h`, not `vllm.h`, and every subcase enters at
+`LoadVideoEngine` + `engine->Generate`. That is the production entry: the C ABI's
+`vllm_video_generate` is a marshalling shell over the same
+`VideoEngine::Generate` (`src/capi/vllm_c.cpp:1646` — `engine->engine->Generate(gen)`),
+and `tests/capi/test_capi.cpp` gates the ABI hop itself. So reachability holds and
+the sentence was wrong, not the test. Nothing constructs `Ltx2AssertResolution`'s
+arguments by hand; the divisor a subcase exercises is the one the loaded recipe
+produced.
+
+1. **`test_ltx2_video`** on the distilled two-stage recipe: a request whose width
+   is not a multiple of 64 is refused, and the message names the divisor and the
+   offending value. Red before the check exists, because today it renders a
+   floored clip and returns success.
 2. The one-stage divisor of 32 on the same entry point, so the derivation is
    gated on both arms and not only on the arm that ships by default.
 3. A multiple-of-64 request still resolves, so the refusal is not a blanket one.
 4. **Reachability mutation**: delete the `Ltx2AssertResolution` call site in a
    scratch copy and rerun the focused gate. A green gate would mean the test
    measures the function rather than the capability.
+5. **The message's axis phrase, per axis.** A needle of `msg.find("width")` is a
+   tautology: the message carries the literal `" (width x height) "` label in
+   every refusal, so both axis words are present whichever axis the guard blamed.
+   A mutation swapping the two names is green against such needles. Each subcase
+   therefore asserts the phrase — `"the width is not"` or `"the height is not"` —
+   and asserts the *other* phrase absent, and a both-axes subcase (80x80) covers
+   the `"the width and height are not"` branch no other subcase executes.
+6. **The suggested size is legal.** `(width / divisor) * divisor` is 0 for any
+   axis below the divisor, and 0 is refused by the lower bound in the phase loop,
+   so the suggestion handed one illegal size out in place of another. Sub-divisor
+   subcases on both recipes assert the "no legal size at or below the request"
+   wording, the smallest legal size (64x64 and 32x32 respectively, so the value
+   is proven to follow the derived divisor), and that no `x0` appears.
 
 **No upstream test is ported, because there is none to port.** `Lightricks/LTX-2`
 at `fd4ded7f` contains **zero** `test_*.py` files anywhere in the repository —
@@ -321,10 +444,11 @@ takes a different path entirely.
 ## Owed
 
 - [#921](https://github.com/mudler/vllm.cpp/issues/921) — the res_2s denoising
-  loop (`samplers.py:208-447`): the `phi` / `get_res2s_coefficients` exponential
-  integrator (`res2s.py:1-60`), the second transformer evaluation per step at
-  `sub_sigma = sqrt(sigma * sigma_next)`, the bong anchor refinement, and the
-  `Ltx2StepperKind` enumerator to select any of it. Until it lands,
+  loop (`samplers.py:206-447`): the `phi` / `get_res2s_coefficients` exponential
+  integrator (`res2s.py:4-62`), the second transformer evaluation per step at
+  `sub_sigma = sqrt(sigma * sigma_next)` (`samplers.py:315`, `:380-386`), the bong
+  anchor refinement (`samplers.py:357-364`), and the `Ltx2StepperKind` enumerator
+  to select any of it. Until it lands,
   `TI2VidTwoStagesHQPipeline` cannot be served, and serving `LTX_2_3_HQ_PARAMS`
   on the Euler loop would render a plausible clip that is quietly not HQ at
   roughly half the model evaluations the preset was tuned for. No HQ recipe row
@@ -336,6 +460,13 @@ takes a different path entirely.
   #644 already owns "close every refused arm".
 - Attribution of the 60 GiB decode loss and the single-threaded decode
   throughput (§4). Both need the GPU; both are measurement rows.
+- **The lcm form of the divisor** (§3.1). `max_spatial_downscale()` is the
+  maximum where the correct quantity is the least common multiple of the phase
+  downscales. The two agree on every shipped recipe and part on a recipe with
+  phases at 2 and 3. Not filed as an issue and not implemented, because no
+  production entry point can reach the difference today: the recipe row that adds
+  a phase with a non-power-of-two spatial downscale owns it, and this limit is
+  stated in the header comment on `Ltx2AssertResolution` so that row finds it.
 
 ## Stop conditions
 
@@ -368,6 +499,37 @@ restate the answer instead of the reason. The one mutation that survived the
 first pass (§5) was against the message's *suggested* size, not the check — worth
 recording, because it is the half of a refusal that gets written once and never
 tested, and a suggestion that is not itself legal is worse than none.
+
+**What the fresh review changed, recorded rather than quietly fixed.** The guard
+itself survived unchanged in position, derivation and reachability. Everything
+the review moved was around it, and the pattern is worth naming: *a claim is not
+evidence, and a needle read out of the file it validates is not a test.*
+
+- **The axis-naming assertions were tautologies.** Four subcases asserted
+  `msg.find("width")` / `msg.find("height")` against a message that carries
+  `" (width x height) "` in every refusal it emits. Swapping the two names in the
+  guard was **green** across the whole file. The needles are now phrases, each
+  subcase asserts the other axis absent, and a both-axes subcase covers a branch
+  no test executed. `docs/USAGE.md` had already published "the refusal names the
+  offending axis" as a contract, so this was a published promise nothing held.
+- **The suggested size could be illegal.** §3.1. Measured at the unmutated head,
+  not reasoned: a two-stage width-32 request was told to render at `0x64`.
+- **Three counts and one premise were wrong, and none of them came from the
+  code.** "Ten call sites" is nine invocations; "every pipeline's `__call__`" is
+  nine of thirteen; `snap_frames_to_grid` has three callers and not one. Each was
+  a number or a sentence carried forward rather than counted, which is the
+  failure mode `.agents/verification.md` warns about — the count nobody ran.
+  §1.1 and §1.2 now show the counting, so the next reader can check it.
+- **Every repo-local anchor in the appended issue-index rows is now SHA-pinned.**
+  They were correct at the base SHA and wrong at the landing tree, because the
+  row inserts lines above them and then `origin/main` moved again for #935. The
+  index is append-only: a row that lands wrong cannot be corrected (#911).
+- **A bare `:NN` continuation is only as good as its antecedent.** The first
+  repair pass of this document introduced four of them with no named file in
+  scope at all, and three more whose nearest named file was ambiguous — upstream
+  has several `helpers.py` and `blocks.py`. Found by sweeping the anchors this
+  branch *adds*, resolving each against the tree it claims. Reading them out of
+  the cited file would have reported all of them fresh.
 
 State: complete for its scope. No lifecycle row moves, so `docs/STATUS.md`,
 `docs/BENCHMARKS.md` and `.agents/NOW.md` are untouched by design.

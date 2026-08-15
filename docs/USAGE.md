@@ -657,8 +657,10 @@ whose first phase runs at half resolution, and **32 on a one-stage recipe**. Tho
 are upstream's own two numbers (`assert_resolution`,
 `ltx-pipelines utils/helpers.py:540-551`), reached by upstream's derivation rather
 than hardcoded, so a recipe that downscaled further would tighten the divisor with
-it. The refusal names the offending axis, the divisor and the nearest legal size
-at or below the request.
+it. The refusal names the offending axis — width, height, or both — the divisor,
+and a size you can actually pass: the nearest legal one at or below the request,
+or, when an axis is smaller than the divisor and no such size exists, the
+smallest legal size there is.
 
 Until 2026-08-15 nothing enforced this and the engine floored instead: a
 two-stage request of width 80 rendered 64 and returned success, and a one-stage
@@ -667,11 +669,13 @@ request of width 100 rendered 96 ([#919](https://github.com/mudler/vllm.cpp/issu
 **`--frames` is NOT enforced, and it rounds.** A frame count is floored onto the
 VAE's temporal grid, `(frames - 1) / 8 * 8 + 1`, so 100 frames renders 97. This
 mirrors upstream, which floors an explicit `num_frames` identically
-(`ltx_core/types.py:113`) and validates it nowhere — its `snap_frames_to_grid`
-helper is reached only from the auto-duration path this port does not serve. Pass
-a value of the form `8k + 1` to get exactly what you asked for. The rounding is
-observable either way: `result.frame_count`, `result.width` and `result.height`
-report what was actually rendered, not what was requested.
+(`ltx_core/types.py:113`) and validates it nowhere: its `snap_frames_to_grid`
+helper is called from the auto-duration path and from the dubbing pipeline, and
+that pipeline takes no frame count at all — it snaps one read from a reference
+video's container. No frame count a caller supplies is snapped or checked, in
+either project. Pass a value of the form `8k + 1` to get exactly what you asked
+for. The rounding is observable either way: `result.frame_count`, `result.width`
+and `result.height` report what was actually rendered, not what was requested.
 
 Omitting all three renders the recipe default, which is 1024x1536 at 121 frames
 and is a much larger request than it looks.
