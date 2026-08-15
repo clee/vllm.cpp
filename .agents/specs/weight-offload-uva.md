@@ -188,7 +188,19 @@ Structural deviations, and why each is forced:
   several loaders, and one that forgets to consult the policy silently does not
   offload, so the application leaves owe a totality argument like the
   `-Werror=switch` one `gguf_keep_quant.cpp` already uses.
-- **W1's `PrepareModel(LoadedModel&)` hook is therefore NOT where the UVA arm
+- **The seam was refactored once that was understood (2026-08-15).** The ABC
+  now carries `ConsiderWeight(canonical_name, bytes)`, which a loader asks per
+  weight, and ONE post-load hook, `OnModelPrepared`, which is upstream's
+  `post_init`. Two defects were removed. `PrepareModel` was a port of
+  `wrap_modules` that nothing could implement once the decision moved into the
+  loaders, and it duplicated `PostInit`. And `WeightOffloadPolicy` had become a
+  SECOND public surface answering "is this weight offloaded" beside the
+  offloader itself, which is the parallel path this protocol forbids; it is now
+  the concrete backend's internal state, reached only through `ConsiderWeight`.
+  `NoopWeightOffloader::ConsiderWeight` refuses every weight, so the existing
+  engine path is unchanged BY CONSTRUCTION rather than by a flag a caller must
+  remember to check.
+- **The earlier `PrepareModel(LoadedModel&)` hook was NOT where the UVA arm
   acts.** The rest of W1 stands: the process-global, the factory, the
   config-to-backend resolution, the no-op default and the graph hooks are all
   still correct and needed. The hook itself was built against the assumption
@@ -340,7 +352,23 @@ an untargeted weight that consumes budget, targeting checked before the budget,
 a budget compared against the weight size, and a negative size advancing the
 total.
 
-Still owed for W2: the application itself, in the loaders.
+**W2b landed** (2026-08-15): `UvaWeightOffloader`, the concrete arm that owns a
+`WeightOffloadPolicy` and answers `ConsiderWeight` through it. The factory now
+builds it for the `uva` backend, so `uva` is no longer reported as a backend
+this build lacks; `prefetch` still is, and W5 owns that.
+
+The engine now distinguishes two cases that both offload nothing, because a bug
+report needs to name the right one: a backend this build cannot construct at
+all, and a backend that IS constructed but that no loader consults yet.
+
+W1's "the factory NAMES a requested backend it cannot honour yet" case was
+UPDATED rather than deleted. It encoded W1's state, where neither backend
+existed. The expectation moved and the assertion stayed, because that assertion
+is what the two engine messages rest on.
+
+Still owed for W2 (W2c): the first loader that asks `ConsiderWeight` and honours
+the answer, plus the pinned-host-copy and device-view halves of upstream's arm
+(uva.py:97-105), which belong to whoever owns the buffer.
 
 **W1 landed** (2026-08-14): the offloader seam. `WeightOffloader` interface,
 `NoopWeightOffloader` default, the process-global `Get`/`SetWeightOffloader`,
