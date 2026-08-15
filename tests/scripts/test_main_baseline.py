@@ -928,20 +928,26 @@ class SuiteRegistrationTests(unittest.TestCase):
         job = job_block(workflow_text(), "agent-record")
         self.assertIn(f"python3 tests/scripts/{self.NAME}.py", job)
 
-    def test_the_agent_record_job_runs_on_every_lane_that_has_work(self) -> None:
+    def test_the_agent_record_job_is_unconditional(self) -> None:
         """A CI registration behind an `if:` is not a registration.
 
-        The job gained a condition in #822: a CLOSED pull request produces a run
-        whose only purpose is to enter the concurrency group and supersede the
-        in-flight one, and it must execute no gate. That is the one permitted
-        condition. Gating on `github.event_name` here would un-register the job
-        for a whole lane, which is what this case exists to prevent.
+        #865 replaced this assertion with one permitting a condition, and three
+        pre-existing checkers went RED on `main` (#873): `check-release-binary-
+        contract.py` and `check-test-registration.py` credit a checker to CI
+        only through `_unconditional_ci_run_blocks`, which drops every job
+        carrying an `if:` at all. So this is not a style pin -- ANY condition
+        here, including the closed-pull-request one, un-registers every checker
+        this job owns.
+
+        #822's closed-PR skip is still enforced, by `needs:`. `last-gated-
+        commit` excludes the closed action, and a skipped dependency skips this
+        job with it, which `ConcurrencySemanticsTests.test_a_closed_pull_
+        request_executes_no_gate` asserts. `always()` would defeat that, so its
+        absence is asserted here too.
         """
         job = job_block(workflow_text(), "agent-record")
-        condition = re.search(r"(?m)^    if: (.+)$", job)
-        self.assertIsNotNone(condition)
-        self.assertNotIn("github.event_name", condition.group(1))
-        self.assertIn("closed", condition.group(1))
+        self.assertNotRegex(job, r"(?m)^    if:")
+        self.assertRegex(job, r"(?m)^    needs: \[last-gated-commit\]$")
 
 
 class ConcurrencySemanticsTests(unittest.TestCase):
@@ -1050,6 +1056,42 @@ class ConcurrencySemanticsTests(unittest.TestCase):
         self.assertNotIn("schedule", cancel)
         self.assertIn("github.event_name", self.ci["concurrency"]["group"])
 
+    # The exception, pinned so a third job cannot join it silently. The ENTIRE
+    # job mapping of these two is compared for equality against a literal by
+    # `scripts/check-release-workflow.py::validate_pr_ci` -- the read-only
+    # native Windows PR proof schema, which is how the PR lane proves it holds
+    # no release, upload, write-token or OIDC authority (#117). The schema
+    # admits no extra key, so `needs:` is rejected, and it fixes the `if:`
+    # string, so a closed-action clause is rejected. #865 added one anyway and
+    # left that checker and `test_release_pipeline.py` RED on `main` (#873).
+    # The pinned authority schema outranks a cost optimisation; the residual --
+    # two Windows runners started per closed pull request -- is #874.
+    UNGUARDABLE_JOBS = ("windows-msvc-cpu", "windows-msvc-vulkan")
+
+    def _skipped_on_a_closed_pull_request(self, name: str, seen: frozenset) -> bool:
+        """A job executes no gate on a closed PR if it says so itself, or if it
+        `needs:` a job that does -- a skipped dependency skips its dependents.
+
+        `always()` is the one thing that breaks the transitive form: it runs the
+        job even when a dependency was skipped. A job leaning on `needs:` must
+        therefore not carry it, and this returns False when it does.
+        """
+        if name in seen:
+            return False
+        job = self.ci["jobs"][name]
+        condition = str(job.get("if", ""))
+        if "closed" in condition:
+            return True
+        if "always()" in condition:
+            return False
+        needs = job.get("needs") or []
+        if isinstance(needs, str):
+            needs = [needs]
+        return any(
+            self._skipped_on_a_closed_pull_request(dependency, seen | {name})
+            for dependency in needs
+        )
+
     def test_a_closed_pull_request_executes_no_gate(self) -> None:
         on = self.ci[True] if True in self.ci else self.ci["on"]
         pr = on.get("pull_request") or {}
@@ -1058,9 +1100,20 @@ class ConcurrencySemanticsTests(unittest.TestCase):
             "the pull_request trigger must list `closed`, or a closed PR never "
             "enters the concurrency group and its run is never superseded",
         )
-        for name, job in self.ci["jobs"].items():
+        for name in self.ci["jobs"]:
             with self.subTest(job=name):
-                self.assertIn("closed", str(job.get("if", "")))
+                if name in self.UNGUARDABLE_JOBS:
+                    self.assertNotIn(
+                        "closed", str(self.ci["jobs"][name].get("if", "")),
+                        f"{name} carries the guard, so it is no longer the "
+                        "byte-exact Windows PR proof schema (#874)",
+                    )
+                    continue
+                self.assertTrue(
+                    self._skipped_on_a_closed_pull_request(name, frozenset()),
+                    f"{name} runs on a closed pull request: neither its own "
+                    "`if:` nor any job it needs excludes that action",
+                )
 
     def test_no_workflow_has_a_duplicate_mapping_key(self) -> None:
         """PyYAML keeps the LAST duplicate key and says nothing. GitHub rejects
