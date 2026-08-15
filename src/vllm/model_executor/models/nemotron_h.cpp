@@ -177,6 +177,26 @@ Tensor F32V(std::vector<float>& v, vt::Device dev, std::vector<int64_t> shape) {
   return t;
 }
 
+// A2α (#810): the same three checks for the weights that moved to the shared
+// `OwnedTensor` residency type (embeddings, the 53 norms, attention q/k/v/o).
+// An overload rather than a template so the refusal messages stay byte-identical
+// to the NemotronHOwned arm below — diffing the two should show one difference,
+// the shape accessor.
+void RequireWeight(const OwnedTensor& w, const char* what, DType want,
+                   std::vector<int64_t> shape) {
+  VT_CHECK(!w.Empty(), std::string("NemotronHForCausalLM forward: weight '") + what +
+                           "' is not materialized (the safetensors/quantized "
+                           "weight load is owed; see "
+                           ".agents/specs/nemotron-h-model.md §5b)");
+  VT_CHECK(w.dtype == want,
+           std::string("NemotronHForCausalLM forward: weight '") + what +
+               "' has the wrong dtype for this arm");
+  VT_CHECK(w.rank == static_cast<int>(shape.size()) &&
+               std::equal(shape.begin(), shape.end(), w.shape),
+           std::string("NemotronHForCausalLM forward: weight '") + what +
+               "' has the wrong shape");
+}
+
 void RequireWeight(const NemotronHOwned& w, const char* what, DType want,
                    std::vector<int64_t> shape) {
   VT_CHECK(!w.Empty(), std::string("NemotronHForCausalLM forward: weight '") + what +
@@ -276,6 +296,21 @@ Buf Linear(Queue& q, const Buf& a, const NemotronHOwned& w, int64_t M, int64_t K
   const DenseOperand wd = DenseFor(w, a.dtype, q.device);
   Tensor ot = out.t(q.device);
   vt::MatmulBT(q, ot, at, wd.view);
+  return out;
+}
+
+// A2α: the OwnedTensor arm. There is NO DenseFor here and that is the point —
+// an OwnedTensor weight is dense by construction, so this arm has no dequant
+// branch to take and cannot silently widen anything. `View()` yields a host/CPU
+// tensor, which is what this HOST reference forward's queue is.
+Buf Linear(Queue& q, const Buf& a, const OwnedTensor& w, int64_t M, int64_t K,
+           int64_t N, const char* what) {
+  RequireWeight(w, what, a.dtype, {N, K});
+  Buf out(a.dtype, {M, N});
+  Tensor at = a.t(q.device, {M, K});
+  Tensor wt = w.View();
+  Tensor ot = out.t(q.device);
+  vt::MatmulBT(q, ot, at, wt);
   return out;
 }
 
@@ -851,7 +886,7 @@ std::vector<float> NemotronHForward(const NemotronHHostWeights& host,
       VT_CHECK(id >= 0 && id < V, "NemotronHForCausalLM forward: token id out of range");
     }
     Tensor ot = residual.t(dev);
-    Tensor tab = host.embeddings.View(dev);
+    Tensor tab = host.embeddings.View();
     Tensor it = I32(ids, dev, {T});
     vt::Embedding(queue, ot, tab, it);
   }
@@ -880,7 +915,7 @@ std::vector<float> NemotronHForward(const NemotronHHostWeights& host,
     Buf normed(adt, {T, H});
     {
       Tensor ot = normed.t(dev);
-      Tensor wt = lw.norm.View(dev);
+      Tensor wt = lw.norm.View();
       if (l == 0) {
         // `residual is None` (nemotron_h.py:627-631): the embedding IS the
         // residual and the norm is UN-fused, so there is no add to fuse here.
@@ -933,7 +968,7 @@ std::vector<float> NemotronHForward(const NemotronHHostWeights& host,
     Tensor ot = final_normed.t(dev);
     Tensor xt = carry.t(dev);
     Tensor rt = residual.t(dev);
-    Tensor wt = host.norm_f.View(dev);
+    Tensor wt = host.norm_f.View();
     if (FusedChainAdoptEnabled()) {
       vt::FusedChain(queue, ot, xt, wt, &rt, vt::kFusedAddRmsNormStd,
                      static_cast<float>(params.layer_norm_epsilon));
@@ -963,7 +998,33 @@ std::vector<float> NemotronHForward(const NemotronHHostWeights& host,
                     static_cast<size_t>(want[static_cast<size_t>(r)] * H) * esz,
                 static_cast<size_t>(H) * esz);
   }
-  const Buf logits = Linear(queue, gathered, host.lm_head, R, H, V, "lm_head.weight");
+  // A2α: through the SHARED projection, so the host reference and the device
+  // arm cannot drift apart in their output layer. `UnpackF32` here and
+  // `PackF32` inside the helper are exact inverses for both admitted dtypes
+  // (bf16->f32->bf16 is lossless; f32 is the identity), so this is
+  // bit-identical to the direct `Linear` call it replaces.
+  return NemotronHHostLmHead(host, params, UnpackF32(gathered), R, queue);
+}
+
+std::vector<float> NemotronHHostLmHead(const NemotronHHostWeights& host,
+                                       const NemotronHParams& params,
+                                       const std::vector<float>& gathered_normed,
+                                       int64_t num_rows, vt::Queue& queue) {
+  CheckActDType(host.act_dtype);
+  const DType adt = host.act_dtype;
+  const int64_t H = params.hidden_size;
+  const int64_t V = params.vocab_size;
+  VT_CHECK(num_rows > 0, "NemotronH lm_head: no rows requested");
+  VT_CHECK(static_cast<int64_t>(gathered_normed.size()) == num_rows * H,
+           "NemotronH lm_head: gathered row count does not match hidden_size");
+  VT_CHECK(queue.device.type == vt::DeviceType::kCPU,
+           "NemotronH lm_head: this projection is the HOST arm and requires a "
+           "CPU queue — `lm_head` is NVFP4 W4A16 g16 on the released checkpoint "
+           "and the device NVFP4 arm is not ported (#810 A2β)");
+  RequireWeight(host.lm_head, "lm_head.weight", adt, {V, H});
+  const Buf gathered = PackF32(gathered_normed, adt, {num_rows, H});
+  const Buf logits =
+      Linear(queue, gathered, host.lm_head, num_rows, H, V, "lm_head.weight");
   return UnpackF32(logits);
 }
 
