@@ -257,15 +257,36 @@ int64_t ExtraInt(const std::map<std::string, std::string>& extras, const std::st
   }
 }
 
+// The one key this family DEFINES and does not SERVE. `Ltx2DurationPredict` is
+// ported and gated as a brick (`ltx2_duration_head.h`), but nothing here
+// constructs one, so a supplied path names a file the engine never opens.
+constexpr char kLtx2DurationHeadPathExtra[] = "duration_head_path";
+
 // Every extra key this family DEFINES. An extra outside this set is refused
 // rather than ignored, for the same reason H3 refuses one
 // (minimax_h3_video.cpp): a mistyped knob that is silently dropped renders the
 // DEFAULT and looks like the feature not working.
+//
+// DEFINED IS NOT THE SAME AS SERVED, and conflating the two was #611: nine of
+// these ten reach a reader, and `duration_head_path` reached none, so supplying a
+// duration head substituted the recipe default in silence — the failure mode this
+// very list exists to prevent, one level in. It stays in the list because the
+// family DOES define the key and DOES know what it means; `CheckUnservedExtras`
+// refuses it by name instead, which is a different and truer message than
+// "unknown load extra". The full audit is in
+// .agents/specs/ltx25-retire-dead-arms.md §2.1.
+//
+// The first hand-written set of these anchors named nine lines that were readers
+// of NOTHING, in this very file, and a later merge moved the real ones again. So
+// they are no longer trusted: the list below is derived from this file on every
+// run and compared, and the failure prints the replacement to paste in.
+// READER ANCHORS (derived and gated by test_ltx2_video):
+// 690 745 841 857 859 929 954 1059 1100
 const char* const kKnownLoadExtras[] = {
     kLtx2AudioPromptEmbedsExtra, kLtx2PipelineKindExtra,   kLtx2ModelVersionExtra,
     kLtx2AllowUnportedExtra,     kLtx2MaxPhaseExtra,       kLtx2DitConfigPathExtra,
     kLtx2PromptValidRowsExtra,   kLtx2EncoderConfigPathExtra,
-    "upsampler_path",            "duration_head_path",
+    "upsampler_path",            kLtx2DurationHeadPathExtra,
 };
 
 // FNV-1a over the raw bytes of a float buffer — the `Ltx2ConditioningTrace`
@@ -301,6 +322,27 @@ void CheckKnownExtras(const std::map<std::string, std::string>& extras) {
       for (const char* name : kKnownLoadExtras) listing += std::string(listing.empty() ? "" : ", ") + name;
       Fail("unknown load extra '" + kv.first + "'. This family defines: " + listing);
     }
+  }
+}
+
+// A key this family DEFINES but does not SERVE, refused BY NAME when supplied
+// (#611). The alternative — accepting it — is the worst of the three options:
+// worse than refusing, and worse than not defining the key, because the caller
+// pointed at a specific file and got the recipe default with no diagnostic.
+//
+// Deliberately NOT the "unknown load extra" path above. That message says the
+// family does not define the key, which is false here and would send the reader
+// looking for a typo instead of for the unported head.
+void CheckUnservedExtras(const std::map<std::string, std::string>& extras) {
+  const std::string duration_head = VideoExtra(extras, kLtx2DurationHeadPathExtra);
+  if (!duration_head.empty()) {
+    Fail("the '" + std::string(kLtx2DurationHeadPathExtra) + "' extra names '" + duration_head +
+         "', but the duration head is NOT WIRED into this engine: `Ltx2DurationPredict` is ported "
+         "and gated as a brick (ltx2_duration_head.h, upstream duration_head.py:89-118) and "
+         "nothing here constructs one, so that file would never be opened and an AUTO duration "
+         "would fall back to the recipe default. Give 'num_frames', or 'duration' (exact "
+         "arithmetic against the recipe frame rate), instead. Refused rather than ignored; "
+         "recorded as owed in .agents/specs/ltx25-retire-dead-arms.md (#611).");
   }
 }
 
@@ -533,6 +575,7 @@ Ltx2ConditioningTrace Ltx2VideoEngine::last_conditioning() const {
 std::unique_ptr<Ltx2VideoEngine> Ltx2VideoEngine::Load(const VideoModelParams& params) {
   if (params.dit_path.empty()) Fail("dit_path is required");
   CheckKnownExtras(params.extras);
+  CheckUnservedExtras(params.extras);
 
   auto engine = std::unique_ptr<Ltx2VideoEngine>(new Ltx2VideoEngine());
   engine->impl_ = std::make_unique<Impl>();
@@ -570,8 +613,8 @@ std::unique_ptr<Ltx2VideoEngine> Ltx2VideoEngine::Load(const VideoModelParams& p
   // what would make every later timing and every "it ran on the GPU" claim false.
   im.on_device = params.device != 0;
   if (im.on_device) {
-    const vt::DeviceType accelerator =
-        vllm::platforms::CurrentPlatform().device_type();
+    const vllm::platforms::Platform& platform = vllm::platforms::CurrentPlatform();
+    const vt::DeviceType accelerator = platform.device_type();
     if (accelerator == vt::DeviceType::kCPU ||
         vt::TryGetBackend(accelerator) == nullptr) {
       Fail("device " + std::to_string(params.device) +
@@ -581,6 +624,36 @@ std::unique_ptr<Ltx2VideoEngine> Ltx2VideoEngine::Load(const VideoModelParams& p
            "'). The LTX-2.5 device-resident forward is present (Ltx2DitForwardDevice); "
            "what is missing is the backend. Refusing rather than running the CPU forward "
            "behind an accelerator handle.");
+    }
+    // The THIRD question, which the seam's own precedent asks and this file did
+    // not (#659). "Is there an accelerator" and "is a backend registered" are
+    // both true on a PARTIAL backend — Metal registers 15 of 75 ops, Tenstorrent
+    // a comparable slice — and both name exactly two text architectures in their
+    // `supports_model_architecture` allow-lists (src/vllm/platforms/metal.cpp:70,
+    // src/vllm/platforms/tenstorrent.cpp:55). Before the seam landed, such a
+    // build asked `TryGetBackend(kCUDA)`, got nullptr, and REFUSED BY NAME; after
+    // it, it is handed a queue and dies later inside a kernel bind with a shape
+    // error that says nothing about what is missing. CUDA and CPU are unaffected:
+    // `supports_model_architecture` defaults to true (interface.h:263) and is a
+    // claim only a partial backend ever narrows.
+    //
+    // The refusal above argues that serving the CPU forward behind an accelerator
+    // handle "would make every later timing and every 'it ran on the GPU' claim
+    // false". A partial backend that binds and dies is the same thing one level
+    // down: a device claim this build cannot honour.
+    //
+    // The key is the FAMILY string — this lane's stable registry name
+    // (`VideoModelParams::family`) — because the diffusion engines are reached
+    // through `LoadVideoEngine`, not through ModelRegistry's HF `architectures`.
+    if (!platform.supports_model_architecture(kLtx2VideoFamily)) {
+      Fail("device " + std::to_string(params.device) + " resolves to platform '" +
+           std::string(vt::DeviceTypeName(accelerator)) +
+           "', and that platform DECLINES the architecture '" +
+           std::string(kLtx2VideoFamily) +
+           "' (Platform::supports_model_architecture): it is a PARTIAL backend that has "
+           "not registered the kernels this model needs. The build is partial, not "
+           "broken. Refusing by name rather than binding a queue that would die inside a "
+           "kernel bind with an error that names none of this.");
     }
     // `vt::CreateQueue(Device)`, NOT `Backend::CreateQueue()`. backend.h:212-217
     // records the method as a "temporary index-0 migration shim" and says new
@@ -1338,12 +1411,12 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
     // needs an encoded prompt this engine cannot produce", and since `has_encoder`
     // above the engine produces exactly that. What is missing now is the head
     // itself — `ltx2_duration_head.h` is ported and gated as a brick, but nothing
-    // here constructs one, and `duration_head_path` is accepted in
-    // `kKnownLoadExtras` while NO code reads it (grep: it appears at that one
-    // site). So the extra is inert rather than wired, and that is recorded as owed
-    // rather than left to be discovered by someone who supplies it and gets the
-    // recipe default. An explicit duration is exact arithmetic, so it is served;
-    // the AUTO path is what is missing, and `num_frames` is how to avoid it.
+    // here constructs one. `duration_head_path` used to be ACCEPTED while no code
+    // read it, so a caller who supplied a head silently landed on this line
+    // instead; `CheckUnservedExtras` now refuses that key by name at load (#611,
+    // .agents/specs/ltx25-retire-dead-arms.md §2). What remains owed is the head
+    // itself. An explicit duration is exact arithmetic, so it is served; the AUTO
+    // path is what is missing, and `num_frames` is how to avoid it.
     frames = static_cast<int64_t>(std::llround(gen.duration_seconds * fps));
   }
   if (frames < 1) Fail("num_frames resolved to " + std::to_string(frames));
@@ -1438,7 +1511,18 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
       // the difference between "you gave me the wrong checkpoint" and "something
       // is 3 frames short". Ported and gated, not driven — see
       // .agents/specs/ltx25-temporal-upsampler.md section 7.
-      if (im.upsampler_cfg.temporal_upsample) {
+      //
+      // `&& !spatial_upsample` IS LOAD-BEARING. This guard used to test
+      // `temporal_upsample` alone, which every BOTH-flags config also satisfies,
+      // so it fired by implication over the same variable and told the caller who
+      // supplied a genuine SPATIOTEMPORAL checkpoint that they had handed over the
+      // temporal one — wrong on both counts, and pointing them at the arm they
+      // already had. It also shadowed the ledger refusal at
+      // `ltx2_upsampler.cpp:465`, which names the spatiotemporal arm and was
+      // therefore unreachable from any request. Narrowed here so a both-flags
+      // config falls THROUGH to that refusal. Gated by test_ltx2_video's
+      // "a SPATIOTEMPORAL upsampler checkpoint is refused as SPATIOTEMPORAL".
+      if (im.upsampler_cfg.temporal_upsample && !im.upsampler_cfg.spatial_upsample) {
         Fail("phase '" + phase.name +
              "' needs the latent SPATIAL x2 upsampler, but the checkpoint at 'upsampler_path' "
              "declares temporal_upsample=true, i.e. it is the TEMPORAL x2 upsampler. That arm "

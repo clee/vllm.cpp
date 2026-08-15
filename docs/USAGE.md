@@ -262,6 +262,20 @@ complaint: an NVFP4 attention or GDN tower, an FP8 shared expert, an FP8
 `lm_head`, a per-expert-but-unquantized routed layout, and a non-BF16 stacked
 expert tensor.
 
+**The MoE arm's VISION TOWER.** `LoadQwen3_5Moe` reads the text backbone only.
+`Qwen/Qwen3.6-35B-A3B` ships 333 `model.visual.*` tensors alongside it, and until
+issue #891 they were dropped without a word — the load succeeded and produced a
+text-only model. `LoadQwen3_5MoeVision` now reads them, through the SAME
+`LoadQwen3VLVisionWeights` the dense `Qwen3_5ForConditionalGeneration` arm uses,
+with the tower geometry from the checkpoint's `vision_config` (depth 27, hidden
+1152, 16 heads, intermediate 4304, patch 16, spatial merge 2, EMPTY
+`deepstack_visual_indexes`) and `out_hidden_size` taken from the text hidden size
+because the merger writes into the text residual stream. A checkpoint carrying NO
+`model.visual.*` tensor is REFUSED naming them, rather than quietly loading a
+model that answers image prompts from text alone — `nvidia/Qwen3.6-35B-A3B-NVFP4`
+declares `vision_config` and ships no `visual.*` weights, and is exactly that
+case.
+
 **What is and is not proven about a published bf16 MoE repo.** Every arm is
 byte-exact on synthetic fixtures, and the real published `Qwen/Qwen3.6-35B-A3B`
 and `Qwen/Qwen3.8-2.4T-A95B` indices satisfy the load plan completely — every
@@ -442,15 +456,20 @@ tokens quietly.
 | Architecture | Why it refuses |
 |---|---|
 | `KimiK3ForConditionalGeneration` | Needs ~1.56 TB (MXFP4); no host here can run it |
-| `NemotronHForCausalLM` | The hybrid forward is ported (#517 W4) but there is no weight LOADER yet, so a checkpoint still cannot be run: loading leaves the weights unmaterialized and the forward refuses by name. Safetensors resolve and parse; a `nemotron_h` or `nemotron_h_moe` GGUF is refused by name, since no GGUF arm exists for it |
+| `NemotronHForCausalLM` | The hybrid forward is ported (#517 W4) and the weight loader materializes the real checkpoint, but that forward is a HOST reference: it recomputes K/V over the whole sequence every step, carries no recurrent state between steps and treats a batch as one causal sequence. Engine construction now SUCCEEDS — the KV allocation reads the model's own recurrent spec (#810) — and the first step then refuses by name, naming the paged/batched decode path as the missing piece rather than returning plausible wrong tokens. Safetensors resolve and parse; a `nemotron_h` or `nemotron_h_moe` GGUF is refused by name through the real dispatch (#809), since no GGUF arm exists for it |
 
 This is a deliberate state, not a bug: registering the architecture is what lets
 the config parse and weight-name mapping be tested before the forward exists.
 
-A refusal here is always a thrown message you can read. `NemotronHForCausalLM`
-also refuses when it is handed a model some other architecture loaded, naming
-both itself and the architecture the passed model claims, instead of reading
-that model as though it were its own (#775).
+A refusal here is always a thrown message you can read. Every registered
+architecture also refuses when it is handed a model some other architecture
+loaded, naming both itself and the architecture the passed model claims, instead
+of reading that model as though it were its own (#775, swept across the
+remaining 34 entry points in #847). Where two architecture names share one
+implementation — `Olmo2ForCausalLM` and `Olmo3ForCausalLM`, or
+`LlamaForCausalLM` and `InternLM3ForCausalLM` — the refusal names the family's
+primary architecture as the one that refused, and the alias you asked for as
+what the passed model claimed.
 
 ### LTX-2.5: what runs, and what it cannot do
 
@@ -1400,7 +1419,7 @@ a stop token early.
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--model <dir>` | (required) | Model directory (safetensors or `.gguf`). A `.gguf` file's `general.architecture` selects the loader: `deepseek4`, `muse-glimmer`, `qwen35`, `qwen35moe`, `qwen3next`. Any other value is refused by name, and the message repeats this list |
+| `--model <dir>` | (required) | Model directory (safetensors or `.gguf`) |
 | `--host H` | `0.0.0.0` | Bind host |
 | `--port P` | `8000` | Bind port |
 | `--served-model-name N` | model dir basename | Model id in `/v1/models` and responses |
@@ -1419,7 +1438,7 @@ a stop token early.
 | `--reasoning-parser <name>` | `none` | Reasoning parser (`think_auto`, `deepseek_r1`, `deepseek_v3`, `holo2`, `mistral`, `minimax_m2`, `minimax_m2_append_think`, `step3`, `olmo3`, `muse_glimmer`, `qwen3`, `mimo`). `auto` detects, `none` disables. `qwen3` and its `mimo` alias are the engine-backed adapter (one upstream class, two registry names): thinking is ON, so a marker-less stream is reasoning and a `<tool_call>` ends reasoning with no `</think>`. `auto` never selects it — a generic `<think>` template resolves to `think_auto`, which is the right default for hybrid-thinking models that may answer with no think block at all |
 | `--kv-transfer-config '<json>'` | (unset) | External KV connector, same JSON as vLLM's flag. See [docs/KV-OFFLOAD.md](KV-OFFLOAD.md) |
 | `--offload-config '<json>'` | (unset) | Weight offload, the same JSON vLLM's `OffloadConfig` takes (distinct from `--kv-transfer-config`, which offloads KV blocks). Parsed and validated at startup, so a malformed document, an unknown backend or a validator violation is refused before any model I/O; a backend/field mismatch is a warning, as upstream. **Accepted and inert today: no weight moves yet**, and on unified memory such as GB10 it cannot help at all because host and device share one pool. See [docs/WEIGHT-OFFLOAD.md](WEIGHT-OFFLOAD.md) |
-| `--speculative-config '<json>'` | (unset) | Speculative decoding (`mtp`, `dflash`, `ngram`), same JSON as vLLM's flag. `dspark` speculates on the Qwen3.6 gate models (native + Speculators drafts), token-identically to speculative-off, but is not gated on speed (currently ~2% behind at c1). A GGUF target, or a target with no aux multi-tap, is refused by name (`SPEC-DSPARK`). Its sequential Markov sampling runs on device by default; `VT_DSPARK_DEVICE_SAMPLE=0` restores the host loop (token-identical, cost only). The speculative verify runs from a captured CUDA graph, worth +12.2%/+3.5% on the 35B cells; `VT_SPEC_DECODE_GRAPH=0` restores the eager verify (also token-identical). See [docs/SPECULATIVE-DECODING.md](SPECULATIVE-DECODING.md) |
+| `--speculative-config '<json>'` | (unset) | Speculative decoding (`mtp`, `dflash`, `ngram`), same JSON as vLLM's flag. `dspark` speculates on the Qwen3.6 gate models (native + Speculators drafts), token-identically to speculative-off, but is not gated on speed: the cross-engine ratio is UNSETTLED, with a matched-and-warm paired measurement of 0.834x against the pinned oracle and the earlier 0.957x-0.989x figures taken against a single COLD oracle invocation on a machine that has since been reimaged. A GGUF target, or a target with no aux multi-tap, is refused by name (`SPEC-DSPARK`). Its sequential Markov sampling runs on device by default; `VT_DSPARK_DEVICE_SAMPLE=0` restores the host loop (token-identical, cost only). The speculative verify runs from a captured CUDA graph, worth +12.2%/+3.5% on the 35B cells; `VT_SPEC_DECODE_GRAPH=0` restores the eager verify (also token-identical). See [docs/SPECULATIVE-DECODING.md](SPECULATIVE-DECODING.md) |
 | `--language-model-only` / `--no-language-model-only` | off | Disable all multimodal input by setting **every** modality limit to 0, mirroring vLLM's flag of the same name. It is not a "skip the encoder" switch: the server then **refuses** a multimodal request with ``400 At most 0 image(s) may be provided in one prompt. Set `--limit-mm-per-prompt` to increase this limit.`` It does **not** free VRAM yet — nothing gates tower construction on it ([#607](https://github.com/mudler/vllm.cpp/issues/607) wave L3) |
 | `--limit-mm-per-prompt '<json>'` | (unset ⇒ 999 per modality) | Maximum multimodal input items per prompt, per modality, as the same JSON object vLLM's flag takes: `'{"image": 2, "video": 0}'`, or with profiling options `'{"video": {"count": 1, "num_frames": 32}}'` (the options are validated and ignored — they size dummy inputs for memory profiling, which this engine does not do). A limit can only **lower** what the model/seam supports, never raise it. Malformed JSON, a negative count, or an unknown option on `image` / `video` / `audio` is refused at startup rather than defaulted. An unknown option on any other modality name is dropped rather than refused, mirroring upstream, whose fallback `BaseDummyOptions` is the one such dataclass without `extra="forbid"`. Upstream's dotted spelling (`--limit-mm-per-prompt.image 2`) is not accepted here, as for `--kv-transfer-config` and `--speculative-config` |
 | `--enable-log-requests` / `--disable-log-requests` | on | Log each incoming request. Mirrors vLLM's flag of the same name |
@@ -1950,14 +1969,47 @@ knobs from `extras`. H3 takes `partition`. LTX-2.5 takes
 `audio_prompt_embeds_path` (the audio stream's conditioning, the twin of the
 seam's `prompt_embeds_path`, which carries the video stream), `pipeline_kind`
 (default `distilled_two_stage`), `model_version` (only for a checkpoint that
-declares none), `dit_config_path`, `allow_unported_modules`, `max_phase`,
-`prompt_embeds_valid_rows`, `upsampler_path` and `duration_head_path`. An extra a
-family does not define is refused, never ignored. One caveat inside that set:
-`duration_head_path` is accepted but INERT — the duration head is ported and gated
-as a brick, nothing in the video engine constructs one, and no code reads that
-key, so supplying it neither loads a head nor enables an AUTO duration. Give
+declares none), `dit_config_path`, `encoder_config_path`,
+`allow_unported_modules`, `max_phase`, `prompt_embeds_valid_rows`,
+`upsampler_path` and `duration_head_path`. An extra a family does not define is
+refused, never ignored. One caveat inside that set: `duration_head_path` is
+defined but UNSERVED — the duration head is ported and gated as a brick, and
+nothing in the video engine constructs one — so supplying it is **refused by
+name** at load rather than accepted. It used to be accepted and read by nothing,
+which silently substituted the recipe default for the file you named. Give
 `num_frames` (or `duration`, which is exact arithmetic against the recipe's frame
-rate) instead.
+rate) instead. Every other key in that list reaches a reader.
+
+One LTX-2.5 arm is refused where a render would otherwise silently downgrade:
+the spatiotemporal latent upsampler. It is reachable — supplying that checkpoint
+as `upsampler_path` gets a refusal naming the arm you actually supplied. The
+spatiotemporal upsampler is the arm with `spatial_upsample` AND
+`temporal_upsample` set, which upstream builds as a different operator
+(`Conv3d(mid, 8*mid)` + `PixelShuffleND(3)`). The temporal-only x2 upsampler is
+**ported** and is not refused; nothing shipped drives it yet, so it is gated
+rather than served. Four more are
+recorded as out of scope but are **not requestable**, so no flag or extra can
+reach them: LoRA fusion, `int8-convrot`, single-node multi-GPU, and
+`BetaScheduler`. Their messages
+say `DECLARED, NOT REQUESTABLE` so the two kinds are not confused.
+`BetaScheduler` is in that group rather than the reachable one because upstream
+selects it nowhere: every `ltx-pipelines` entry point hard-codes
+`LTX2Scheduler()`, so there is no scheduler-kind field to mirror and nothing here
+carries one either. `int8-convrot`
+in particular is a ComfyUI-ecosystem format: upstream LTX-2's own inference
+quantization kinds are `fp8-cast`, `fp8-scaled-mm`, `nvfp4-cast` and
+`nvfp4-prequant`, and nothing wired upstream reaches int8 at all.
+
+What is **not** on that list, and why: **multi-shot or multi-scene generation.**
+A request that composes several camera takes into one output has no flag here
+because upstream LTX-2 has no such mode to mirror — its `shot` is one continuous
+take, and its own prompt-enhancement prompts instruct the model to keep a "single
+continuous take" and not to describe scene cuts. `scene` does appear across the
+upstream tree, in three unrelated senses (`scene-linear` HDR colour, PySceneDetect
+in the trainer's dataset preprocessor, and that prompt-writing guidance); none of
+them is a generation mode. This port carried a `multishot` refusal until
+2026-08-13, which was a defect in our own record rather than a gap, and it was
+retired. Generate one take per request.
 
 `prompt_embeds_valid_rows` is how many of the supplied conditioning rows are real
 tokens; absent, every row is. It matters because the embeddings connector
@@ -1980,11 +2032,26 @@ only when it reproduces the identical weight contract the shapes describe, and
 supplying one for a checkpoint that already declares its own is refused rather
 than ordered.
 
+`vllm_video_model_params.device` is `0` for the CPU and `1` for **the
+accelerator this build resolves** — not for CUDA. The value is unchanged and it
+is CUDA on a CUDA build, but it is read through the platform seam rather than as
+an enum value, so the same `1` selects Metal, Vulkan or Tenstorrent on a build
+that registers one of those, and is refused by name on a build that registers
+none. The C ABI's text-generation `vllm_model_params.device` is a separate,
+later selector with its own `0 = auto / 1 = cpu / 2 = cuda` numbering.
+
 The LTX-2.5 arm runs on the CPU in f32 and on CUDA in bf16. `device = 0` takes
 the f32 parity forward; `device = 1` stages the DiT to the GPU one tensor at a
 time and runs the device-resident forward, so a CUDA handle means a CUDA forward.
-On a build with no CUDA backend, `device = 1` is refused by name rather than
-served the CPU forward behind a CUDA handle. `encoder_path` loads the Gemma-4
+On a build with no accelerator backend, `device = 1` is refused by name rather
+than served the CPU forward behind an accelerator handle. It is also refused when the build's
+accelerator is a PARTIAL backend that declines this architecture — Metal and
+Tenstorrent each register the kernels for a named short list of models, and a
+backend that has not registered this one now says so by name instead of binding
+a queue and failing later inside a kernel. The same three questions decide
+`minimax-h3`'s `device = 1`, which resolves through the platform seam rather
+than reading the ABI selector as an enum value, so on a CPU-only build it throws
+instead of naming CUDA. `encoder_path` loads the Gemma-4
 text tower, and the request's own `prompt` then conditions the render; the tower
 itself runs on the CPU in f32 whichever device the DiT is on. Without one,
 conditioning comes from the two prompt-embeds files, which must agree on their
