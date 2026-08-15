@@ -432,8 +432,9 @@ re-checking its md5 (`03324d42…`, identical before and after):
 | `test_ltx2_video` | 30 / 502 | 30 / 502 | unchanged — see below; 502 is the SKIPPED default |
 
 **What `30 / 502` does and does not say (corrected 2026-08-13).** The
-shipped-checkpoint case is env-gated: with `LTX2_CHECKPOINT_ROOT` unset it prints
-`SKIPPED` and returns at `test_ltx2_video.cpp:917-921`, so `30 / 502` means the
+shipped-checkpoint case `ltx2 video: the SHIPPED Lightricks checkpoints parse and
+load` is env-gated: with `LTX2_CHECKPOINT_ROOT` unset it prints
+`SKIPPED` and returns at `test_ltx2_video.cpp:1316-1319`, so `30 / 502` means the
 whole real-header case DID NOT RUN — not "it ran and no assertion counted the
 module". With the variable pointing at the Lightricks tree the same binary
 measures **30 cases / 8734 assertions**, both before and after this repair
@@ -518,7 +519,7 @@ the opt-in — is retired. Current disposition:
 does not carry the parameter"* about `keyframes_abs_pos_embedding`. It is FALSE —
 the same class of claim as the `use_prompt_adaln_single=false` assertion this row
 exists to remove — and the tree already contradicted it twice
-(`.agents/model-matrix.md`, `tests/vllm/multimodal/test_ltx2_video.cpp:913-914`).
+(`.agents/model-matrix.md`, `tests/vllm/multimodal/test_ltx2_video.cpp:1302-1303`).
 Read straight off both files' headers, and run through upstream's own loader and
 configurator:
 
