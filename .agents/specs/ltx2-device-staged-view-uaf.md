@@ -75,17 +75,64 @@ A teardown-races-an-in-flight-op defect would attribute the free to the case's
 closing brace at line 729, where the *named* `staged` dies. It attributes to
 724, before the read at 726. The named `staged` is never the freed object.
 
-Which thread performs the read is not the signal, and reading it as one is how
-#904 reached the threadpool. `ParallelForRows` dispatches rows to workers and
-blocks until they finish, so a worker frame under a synchronous `vt::Add` is
-ordinary. #904 captured the read on worker `T2`; CI run `31885935312` captured
-the same defect with the whole read chain inline on `T0`
-(`Threadpool::Run` → `ParallelForRows` → `AddKernel`). Same address, same
-`LoadF32At` frame, same free site — because the thread was never the variable.
+### There was never a race, and `ParallelForRows` cannot produce one
 
-`Ltx2StageDitWeightsToDevice` has 14 other call sites, all in this same test
-file. Line 724 is the only one that does not bind the result to a named object,
-which is also why exactly one case aborts.
+#904 reads the worker frame in the stack as a race — "a race in principle and
+not in practice on this box". It is neither, and the dispatch path says so at
+`src/vt/cpu/cpu_threadpool.cpp`. `ParallelForRows` (`:413`) hands the body to
+`tp.Run(...)` (`:427`). `Threadpool::Run` (`:354`) runs it on the **caller**, as
+worker 0, through `ComputeThread(workers_[0])` (`:383`). Every participating
+thread's `ComputeThread` (`:220`) ends in `Barrier()` (`:234`), and that
+barrier's exit is a full seq-cst fence (`:208-212`). So `Run` returns only after
+every worker has passed the barrier — its own comment at `:352-353` calls the
+return "the completion point for every output element". Nothing dispatched can
+still be reading once `Run` has returned, so no teardown sequenced after it can
+race one. The join #904 asks for is already there.
+
+The thread id in an ASan report is incidental, not the signal, and reading it as
+one is how #904 reached the threadpool. #904 recorded the read on worker
+`T1`/`T2`; CI run `31885935312` at `04be1390b` recorded the same defect with the
+whole chain inline on the main thread (`Threadpool::Run` → `ParallelForRows` →
+`AddKernel` in one stack). Same address, same `LoadF32At` frame, same free site,
+because the thread was never the variable.
+
+The decisive check is that the **thread** sanitizer was asked and answered no.
+The `sanitize-cpu (thread)` arm of that run reports
+`ThreadSanitizer: heap-use-after-free`, the read `by main thread`, and
+`ThreadSanitizer: reported 2 warnings` — of which **zero** are a data race.
+Control for that absence, because a null search otherwise only proves the search
+term wrong: the same log yields 5 matches for `ThreadSanitizer`, so the term was
+searched in a log that does carry TSan output. The tool whose entire job is
+finding data races found none in the run that caught this defect.
+
+### The call-site count
+
+`Ltx2StageDitWeightsToDevice` has **12** other call sites, all in this same test
+file. Neither 14 nor 13 is that number, and both are easy to land on:
+`tests/vllm/models/test_ltx2_device.cpp` holds 14 occurrences of the identifier,
+of which one is the `using` declaration at `:64` and so is not a call, and one
+of the 13 remaining call expressions is the offending site itself.
+
+Method, because a count that lands in a commit message cannot be corrected
+afterwards: separate occurrences (`grep -o` on the identifier, 14) from call
+syntax (`grep -o` on the identifier followed by optional whitespace and `(`,
+13), then print the difference rather than assume it — it is the `using` line.
+Each of the 13 was then read in context and sits in initializer position, so
+none is a redeclaration. The pair is 14/13 at `5a0ffe9e3` and 14/13 again at
+this row's head. Control, so that a miscount cannot hide: appending one call
+expression and one comment mention to a scratch copy moves the pair to 16/14 —
+occurrences up by 2, calls up by 1, which is the only way both classes can be
+distinguished — and a deliberately misspelled needle returns 0 rather than a
+plausible number.
+
+Outside this test file the identifier appears only as its declaration
+(`include/vllm/model_executor/models/ltx2_device.h:107`), its definition
+(`src/vllm/model_executor/models/ltx2_device.cpp:1056`), and three prose
+mentions. No call expression exists anywhere else, which is what makes "all in
+this same test file" true rather than merely unchallenged.
+
+Line 724 at `5a0ffe9e3` is the only one of the 13 that does not bind its result
+to a named object, which is also why exactly one case aborts.
 
 ## 3. The change
 
@@ -205,18 +252,38 @@ One test file, 8 lines added and 2 removed, including the comment that says why
 
 ## 8. Now
 
-`main` is red on `sanitize-cpu` on both arms because of this case. With §3
-applied the lane's remaining known reds are the ones tracked elsewhere; this row
-claims only its own.
+`main` is red on `sanitize-cpu` on **both** arms because of this case, and both
+arms are measured rather than one generalised to the pair. Scheduled run
+[`31885935312`](https://github.com/mudler/vllm.cpp/actions/runs/31885935312) at
+the main-lane SHA `04be1390b`:
+
+| arm | ctest | failing test | report |
+|---|---|---|---|
+| `sanitize-cpu (address,undefined)` | 1 failed out of 478 | `71 - test_ltx2_device` | `AddressSanitizer: heap-use-after-free` at `cpu_layernorm.cpp:33 in LoadF32At`, address `0x50a000038c40` |
+| `sanitize-cpu (thread)` | 1 failed out of 478 | `71 - test_ltx2_device` | `ThreadSanitizer: heap-use-after-free` at the same `cpu_layernorm.cpp:33 in LoadF32At` |
+
+Exactly one test fails on each arm, it is the same test on both, and it is this
+row's. So the two arms carry the same single cause, and removing it is what
+"green on both arms" rests on. With §3 applied the lane's remaining known reds
+are the ones tracked elsewhere; this row claims only its own.
 
 ## Owed
 
 - A guard against a borrowed `vt::Tensor` outliving the object that owns its
-  storage. Nothing in the tree refuses it, and it took ASan on a lane that has
-  been cancelled on every `main` run for weeks to find this one instance. Not
-  filed as a separate issue by this row, because scoping it is a `vt` design
-  question rather than a defect report, and the row that takes it will need to
-  decide between a type change, a checker, and a convention.
+  storage — filed as [#949](https://github.com/mudler/vllm.cpp/issues/949) and
+  indexed in [`.agents/issue-index.md`](../issue-index.md). Nothing in the tree
+  refuses it, and it took ASan on a lane that has been cancelled on every `main`
+  run for weeks to find this one instance. The review of this row sharpened the
+  scope with a measurement rather than an argument: with §3 reverted, a plain
+  Release build with no sanitizer runs the case `18` passed of `18`, `546`
+  assertions, `rc=0`, because `dtype` lives in the `vt::Tensor` struct and not
+  in the freed buffer, so even the refusal path cannot notice garbage. The only
+  instrument that sees this defect is therefore a lane that is
+  `continue-on-error`, which is how #904 reached `main` at all. #949 weighs
+  three remedies — promoting the lane once it has a `main` baseline, a test that
+  fails without a sanitizer, and a static check for the pattern — rather than
+  presuming one; scoping it stays a `vt` design question, which is why it is an
+  issue on its own and not a task inside this row.
 
 #904's stated cause is not owed anything — it is corrected in §2 and in the
 pull request body, so the correction carries its evidence and its date in Git
