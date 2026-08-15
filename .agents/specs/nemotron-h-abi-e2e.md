@@ -246,7 +246,7 @@ the interlock deleted is not an acceptable split.
 A1 (runner refactor + interlock)  ──►  A2 (device/paged forward)  ──►  A3 (ABI e2e token gate)
         │                                        │                          └── same PR as A2
         │                                        ├── requires KERNEL-SSM-MAMBA (#496) W2, the CUDA arm
-        │                                        └── requires the conv-state dtype reconciliation (§5.3b)
+        │                                        └── requires the conv-state dtype mirror (§2.7)
         └── requires main + bc570da0d, and PR #868 for `vllm::ModelAs<>` (§7 R2)
 ```
 
