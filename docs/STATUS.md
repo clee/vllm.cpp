@@ -194,7 +194,7 @@ concurrency-1 A/B our-on 29.32 tok/s vs vLLM-on 29.24, non-overlapping bands,
 vLLM 0.26.0.dev0 stack (which resolves vllm#40898), and it remains gated behind
 a spike while its user-facing serving surface is finalized.
 
-**Method surface (enumerated from vLLM source 2026-08-06, `.agents/specs/spec-decode-inventory.md`).** Of the 13 vLLM `SpeculativeMethod` strings we ship MTP (k=1), DFlash and n-gram; draft_model is a CPU brick and Medusa a spike; EAGLE1/EAGLE3, ngram-gpu, suffix, dspark, custom_class, extract_hidden_states, dynamic-k and the synthetic/block acceptance variants are INVENTORIED; mlp_speculator is upstream-deprecated (no V1 proposer). Draft DEPTH (k>1, dynamic, adaptive) unbuilt (`ROAD-V1-D3-SPEC-K`, #81).
+**Method surface (enumerated from vLLM source 2026-08-06, `.agents/specs/spec-decode-inventory.md`).** Of the 13 vLLM `SpeculativeMethod` strings we ship MTP (k=1), DFlash, DSpark and n-gram; draft_model is a CPU brick and Medusa a spike; EAGLE1/EAGLE3, ngram-gpu, suffix, custom_class, extract_hidden_states, dynamic-k and the synthetic/block acceptance variants are INVENTORIED; mlp_speculator is upstream-deprecated (no V1 proposer). Draft DEPTH (k>1, dynamic, adaptive) unbuilt (`ROAD-V1-D3-SPEC-K`, #81).
 
 **DeepSeek-V4 native MTP** (`DeepSeekV4MTPModel`, ACTIVE — W1 self-spec wiring,
 2026-07-30) has its nextn draft head wired to the same lossless spec-decode path.
@@ -580,15 +580,25 @@ take can only raise the plateau; any MoE comparison that lets routing vary
 between arms measures the draw, not the change; and both blocks AND distinct
 experts must be controlled, since cost per distinct expert spans 4.47-7.50 us
 and is flat only above ~40 experts. NOT parity, and the row stays open.
-MEASUREMENT IS CURRENTLY IMPOSSIBLE: the gate host was REIMAGED on 2026-08-14
-(new COS partition layout, /home created 13:37 UTC, ~/work empty), destroying
-the pinned oracle venv, the pinned vLLM source, the 35B and draft checkpoints,
-our engine build and every run log, so the Evidence paths in the benchmark
-record point at nothing. The RESULTS stand, because the harnesses
-(scripts/marlin-moe-standalone.py, benchmarks/marlin_moe_standalone.cpp,
-scripts/dspark-paired-e2e.sh) and the per-rep values are in-tree; resuming
-needs the checkpoints re-fetched, the oracle rebuilt at pinned commit
-555967922, and its identity re-asserted before any number is trusted.
+The environment was REBUILT after the reimage (engine, both checkpoints at the
+pinned revision, and the TRUE pinned oracle 555967922 + torch 2.13.0 +
+flashinfer 0.6.15.post1, built from source because vllm==0.26.0 hard-pins
+torch==2.11.0). On it, with generation length MATCHED at 89 tokens and the
+container compile cache PERSISTED, the oracle is stable at 171.4 tok/s and our
+engine at 143.2, a paired ratio of **0.835** -- far below the 0.957-0.989 this
+row recorded. Two causes are possible and this data cannot separate them:
+every earlier paired run invoked the oracle ONCE, so a cold-JIT denominator
+would have been handicapped ~17%; and the BOX IS NOT THE SAME MACHINE, since
+dgx.casa now resolves to kairos-17dd while the recorded ratios were taken on
+promaxgb10-4ad8, which no longer exists. Our arm reads ~142 on both, which
+argues against a pure hardware explanation without excluding one. Safe to say:
+on this box, matched and warm, we are at 0.835 of the pinned oracle, NOT
+parity. Not safe to say: that the older numbers were wrong, since cross-
+machine ratios cannot be differenced any more than cross-boot absolutes can.
+Owed: re-run the pre-reimage single-cold-invocation protocol HERE -- ~0.97
+would convict cold JIT, ~0.83 would mean the machine changed.
+
+
 
 Multimodal
 (image/video/audio) is correctness-complete and its OpenAI-server wiring has
