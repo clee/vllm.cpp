@@ -138,7 +138,43 @@ that is precisely what rounds 2 and 3 each found here:
     and four rounds of finding a new one is the evidence that a spelling list is
     not the class. That gap does not close by widening; it closes at #828.
 
-tests/scripts/test_device_leakage.py M20-M46 pin what it does catch, each
+WHAT `dev_cast` OVER-MATCHES. The two lists above answer "what is caught" and
+"what is missed". Neither answers "what is caught that is not the defect", and a
+gate whose message omits its own false positives is the same instrument fault in
+the other direction: the reader takes a RED as proof of leakage.
+
+  * a plain COPY-INITIALISATION whose target is a DeviceType and whose operand
+    ALREADY IS one — `vt::DeviceType d{other}`, a member default-init
+    `struct S { vt::DeviceType d{kCPU}; }`, or an init from a call
+    `vt::DeviceType d{platform.device_type()}`. Alternative (3) fires and nothing
+    is converted. Measured on this pattern: 1 hit each; `vt::DeviceType d{}`
+    scores 0, because the empty-braces lookahead already rejects a
+    value-initialisation.
+
+    This is NOT narrowed, and the reason is that narrowing it would delete a real
+    catch. `vt::DeviceType d{raw}` — the declaration spelling of the conversion,
+    which review round 3 found and M36/M41 pin — is textually identical to
+    `vt::DeviceType d{other}`. A text checker cannot tell the two apart, which is
+    the same statement as "nothing here type-checks", and is exactly what #828
+    resolves. The `const_cast<DeviceType&>(t)` entry above is the other side of
+    it and must keep firing for the same reason.
+
+    The COST is not zero, so it is stated rather than dismissed: `dev_cast`'s
+    baseline is a hard 0 outside the one allowlisted `platform.cpp` hit, so the
+    FIRST such copy-init written under `src/vllm/` or `include/vllm/` fails the
+    ratchet as a `DSR REGRESSION`. The remedy is `// DSR-ALLOW(<row-id>): <why>`
+    on the line, which is the same remedy the wire-decode case gets, and it is
+    visible in CI output rather than in the diff. Nothing in the scanned tree
+    writes this form today — a repo-wide probe over the scan roots finds
+    `dev_cast` at exactly its allowlisted hit — so this is a documented cost of
+    the next line, not a live failure.
+
+    M47 pins it, with `vt::DeviceType d{}` as the negative control in the same
+    test: if a later change makes the copy-init form stop firing, M47 goes RED
+    and this entry must be corrected in the same change. That is the M46 shape,
+    applied to a false positive instead of a blind spot.
+
+tests/scripts/test_device_leakage.py M20-M47 pin what it does catch, each
 spelling asserted on its own — including, in M29, the literal operand, because a
 discriminator tested only on the case it was tuned for is a guard that certifies
 itself.

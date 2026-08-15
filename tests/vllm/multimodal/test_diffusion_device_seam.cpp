@@ -9,8 +9,8 @@
 // of 75 ops and Tenstorrent a comparable slice, and both name exactly two
 // architectures (src/vllm/platforms/metal.cpp:70,
 // src/vllm/platforms/tenstorrent.cpp:55). On such a build a `device = 1`
-// diffusion load WAS refused by name and became a queue bind that dies later
-// inside a kernel with a shape error.
+// diffusion load was NO LONGER refused by name, and became a queue bind that
+// dies later inside a kernel with a shape error.
 //
 // CUDA cannot see any of this: `supports_model_architecture` defaults to true,
 // so on the box that runs the gates all three questions have always passed. That
@@ -26,6 +26,19 @@
 // (include/vt/device.h: kCPU = 0, kCUDA = 1). `kXPU` is 4. So an assertion that
 // device 1 resolves to kXPU is one the old integer cast could not satisfy under
 // any circumstances — it is the seam being asked, not a constant being returned.
+//
+// WHERE EACH CASE ENTERS (AGENTS.md `## Nothing lands dead`). Both lanes are
+// entered through a PRODUCTION entry point, not by calling the resolver:
+// `vllm_video_engine_load` (include/vllm.h) → `LoadVideoEngine`
+// (src/vllm/multimodal/video_engine.cpp) → the family registration → the
+// engine's `Load`, which is where each lane's device question is asked. The
+// direct `MiniMaxH3VideoDeviceType(1)` cases below stay, because they localise a
+// failure — but they are NOT the reach proof, and on their own they measure a
+// free function rather than a capability. Measured: replacing H3's `Load`-time
+// `MiniMaxH3VideoDeviceType(params.device)` with the pre-row
+// `params.device == 0 ? kCPU : kCUDA` left every direct case, and the whole of
+// test_minimax_h3_video_fold, GREEN. The case that enters at `LoadVideoEngine`
+// is the one that goes RED.
 #include <doctest/doctest.h>
 
 #include <cstdlib>
@@ -37,6 +50,7 @@
 
 #include "vllm/multimodal/ltx2_video.h"
 #include "vllm/multimodal/minimax_h3_video.h"
+#include "vllm/multimodal/video_engine.h"
 #include "vllm/platforms/interface.h"
 #include "vt/backend.h"
 #include "vt/device.h"
@@ -118,13 +132,53 @@ vllm::multimodal::VideoModelParams DeviceOneParams() {
   return mp;
 }
 
+// The H3 sibling of DeviceOneParams(), entered through the SAME generic struct
+// so it can go in at `LoadVideoEngine` with the family declared. The path does
+// not exist for the same reason: a load that got past the capability clause
+// would die opening it, with a different message.
+vllm::multimodal::VideoModelParams H3DeviceOneParams() {
+  vllm::multimodal::VideoModelParams mp;
+  mp.family = vllm::multimodal::kMiniMaxH3VideoFamily;
+  mp.dit_path = "/nonexistent/h3-dit-that-is-never-opened.gguf";
+  mp.device = 1;
+  return mp;
+}
+
+// The PRODUCTION entry, for BOTH lanes: `vllm_video_engine_load`
+// (include/vllm.h) calls `LoadVideoEngine` through src/capi/vllm_c.cpp, and it
+// dispatches on the declared family to the registration in the engine's own TU,
+// which calls that engine's `Load`. Nothing in this helper names an engine type,
+// which is the point — it is the path a user arrives on, and entering at
+// `Ltx2VideoEngine::Load` or `MiniMaxH3VideoEngine::Load` instead would skip the
+// registry hop and prove one link less.
 std::string LoadError(const vllm::multimodal::VideoModelParams& mp) {
   try {
-    (void)vllm::multimodal::Ltx2VideoEngine::Load(mp);
+    (void)vllm::multimodal::LoadVideoEngine(mp);
   } catch (const std::exception& e) {
     return e.what();
   }
   return "";
+}
+
+// The architecture name in the refusal's QUOTED SLOT, rather than anywhere in
+// the message.
+//
+// `Fail()` in src/vllm/multimodal/ltx2_video.cpp prefixes EVERY message it
+// throws with "ltx-2.5 video: ", and `kLtx2VideoFamily` is the string
+// "ltx-2.5". So `msg.find(kLtx2VideoFamily)` is satisfied by that boilerplate on
+// every refusal this file can produce — including the two refusals the
+// assertions below exist to distinguish this one FROM — and no defect in the
+// message can make it fail. Measured: replacing the family name with
+// "<redacted>" inside the DECLINES `Fail` left it GREEN.
+//
+// The row's thesis for #659 is that a partial backend declines BY NAME, so the
+// assertion has to be that the architecture appears where the refusal names it.
+// The H3 pair happens not to collide — its prefix spells the family with an
+// underscore ("minimax_h3 video: ") while the family is hyphenated
+// ("minimax-h3") — but that is a coincidence of spelling and not a property, so
+// the H3 cases are built the same way.
+std::string QuotedArchitecture(std::string_view family) {
+  return std::string("architecture '") + std::string(family) + "'";
 }
 
 }  // namespace
@@ -146,7 +200,8 @@ TEST_CASE("ltx2 video: a platform that DECLINES the architecture refuses device 
   // BY NAME: the platform, the architecture, and the fact that the backend
   // declined rather than that something was malformed.
   CHECK(msg.find("xpu") != std::string::npos);
-  CHECK(msg.find(vllm::multimodal::kLtx2VideoFamily) != std::string::npos);
+  CHECK(msg.find(QuotedArchitecture(vllm::multimodal::kLtx2VideoFamily)) !=
+        std::string::npos);
   CHECK(msg.find("DECLINES") != std::string::npos);
   CHECK(msg.find("supports_model_architecture") != std::string::npos);
   // And it must not be the OTHER refusal: a backend IS registered here, so
@@ -205,10 +260,62 @@ TEST_CASE("minimax_h3 video: a platform that DECLINES the architecture refuses d
   }
   INFO(msg);
   CHECK(msg.find("xpu") != std::string::npos);
-  CHECK(msg.find(vllm::multimodal::kMiniMaxH3VideoFamily) != std::string::npos);
+  CHECK(msg.find(QuotedArchitecture(vllm::multimodal::kMiniMaxH3VideoFamily)) !=
+        std::string::npos);
   CHECK(msg.find("DECLINES") != std::string::npos);
   CHECK(msg.find("no accelerator backend is registered") == std::string::npos);
 
   // 0 still resolves, because the CPU asks none of these questions.
   CHECK(vllm::multimodal::MiniMaxH3VideoDeviceType(0) == vt::DeviceType::kCPU);
+}
+
+// ── REACH (AGENTS.md `## Nothing lands dead`) ────────────────────────────────
+//
+// The two cases above call `MiniMaxH3VideoDeviceType` directly, which measures
+// the free function and NOT whether anything routes to it. The H3 engine's
+// `Load` is the only production caller (src/vllm/multimodal/minimax_h3_video.cpp,
+// the `MiniMaxH3VideoDeviceType(params.device)` line), and it is reached from
+// `vllm_video_engine_load` → `LoadVideoEngine` → the `minimax_h3` registration.
+// Delete that one call and every other H3 device assertion in this tree stays
+// green; this case is what turns red.
+//
+// It is the H3 mirror of the two LTX cases at the top of this file, and it
+// exists because the LTX half already had this proof and the H3 half did not.
+TEST_CASE("minimax_h3 video: a DECLINING platform refuses device 1 through LoadVideoEngine") {
+  RegisterPartialAccelerator(/*accepts_everything=*/false);
+
+  REQUIRE(vllm::platforms::CurrentPlatform().device_type() == vt::DeviceType::kXPU);
+  REQUIRE(vt::TryGetBackend(vt::DeviceType::kXPU) != nullptr);
+  REQUIRE_FALSE(vllm::platforms::CurrentPlatform().supports_model_architecture(
+      vllm::multimodal::kMiniMaxH3VideoFamily));
+
+  const std::string msg = LoadError(H3DeviceOneParams());
+  INFO(msg);
+  REQUIRE_FALSE(msg.empty());
+  CHECK(msg.find("xpu") != std::string::npos);
+  CHECK(msg.find(QuotedArchitecture(vllm::multimodal::kMiniMaxH3VideoFamily)) !=
+        std::string::npos);
+  CHECK(msg.find("DECLINES") != std::string::npos);
+  CHECK(msg.find("supports_model_architecture") != std::string::npos);
+  // Not the OTHER refusal: a backend IS registered for the resolved platform, so
+  // blaming a missing one is a wrong diagnosis that reads as a right one.
+  CHECK(msg.find("no accelerator backend is registered") == std::string::npos);
+  // Nor the failure the guard exists to prevent, one step further on. Reverting
+  // the `Load` call site to the integer cast lands here instead: `kCUDA` with no
+  // CUDA backend registered in this process.
+  CHECK(msg.find("/nonexistent/") == std::string::npos);
+}
+
+TEST_CASE("minimax_h3 video: a COMPLETE backend is not refused through LoadVideoEngine") {
+  // The mirror arm, for the same reason the LTX pair has one: two absences pass
+  // on any OTHER wrong failure, so the guard's "does not refuse a working
+  // configuration" half needs a POSITIVE assertion about where the load got to.
+  RegisterPartialAccelerator(/*accepts_everything=*/true);
+
+  const std::string msg = LoadError(H3DeviceOneParams());
+  INFO(msg);
+  REQUIRE_FALSE(msg.empty());
+  CHECK(msg.find("DECLINES") == std::string::npos);
+  CHECK(msg.find("supports_model_architecture") == std::string::npos);
+  CHECK(msg.find("/nonexistent/h3-dit-that-is-never-opened.gguf") != std::string::npos);
 }

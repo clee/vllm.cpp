@@ -890,6 +890,44 @@ class DsrRatchetMutationTests(unittest.TestCase):
         )
         self.assertEqual(self.tree.scan().counts["dev_cast"], 1)
 
+    def test_M47_the_declared_OVER_MATCH_still_fires(self) -> None:
+        # M46's shape, applied to a FALSE POSITIVE instead of a blind spot.
+        #
+        # Alternative (3) matches `vt::DeviceType d{x}` on the target type alone,
+        # so a plain COPY-INITIALISATION whose operand is already a DeviceType
+        # fires while converting nothing. The docstring's "WHAT `dev_cast`
+        # OVER-MATCHES" section states that, because a reader who takes a RED as
+        # proof of leakage is misled by a message that omits it.
+        #
+        # It is not narrowed, and the reason is that `vt::DeviceType d{raw}` —
+        # the declaration spelling of the real conversion, which M36 and M41 pin
+        # — is textually identical. Narrowing to remove the false positive
+        # deletes the true positive with it. So this test pins the CURRENT
+        # behaviour: if a later change makes any of these stop firing, it goes
+        # RED and the docstring entry must be corrected in the same change.
+        #
+        # All five compile (g++ 13.3 -std=c++20 -Wall -Wextra -fsyntax-only,
+        # exit 0), and each is asserted on its OWN file rather than appended to a
+        # shared one, so a spelling that stopped firing cannot be hidden by the
+        # next one still firing.
+        probe = "src/vllm/model_executor/models/probe.cpp"
+        for source in (
+            "void L(vt::DeviceType other) { vt::DeviceType d{other}; (void)d; }\n",
+            "struct S { vt::DeviceType d{vt::DeviceType::kCPU}; };\n",
+            "void F(const Plat& p) { vt::DeviceType d{p.device_type()}; (void)d; }\n",
+            "struct T { vt::DeviceType const d{vt::DeviceType::kCPU}; };\n",
+        ):
+            with self.subTest(source=source.strip()):
+                self.tree.write(probe, source)
+                self.assertEqual(self.tree.scan().counts["dev_cast"], 1)
+        # The NEGATIVE control in the same test, and the boundary of the entry: a
+        # value-initialisation converts nothing AND does not fire, because the
+        # empty-braces lookahead already rejects it. Without this line the four
+        # assertions above would be consistent with "alternative (3) matches every
+        # `vt::DeviceType` declaration", which is a different and larger claim.
+        self.tree.write(probe, "void V() { vt::DeviceType d{}; (void)d; }\n")
+        self.assertEqual(self.tree.scan().counts["dev_cast"], 0)
+
     def test_M28_dsr_allow_exempts_a_dev_cast_and_says_so_loudly(self) -> None:
         # The legitimate case the risk register names: a deserialization boundary
         # that reads a device off the wire. It buys an exemption only with a row

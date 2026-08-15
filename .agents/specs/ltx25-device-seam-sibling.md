@@ -15,7 +15,10 @@ because they are in this lane and this campaign owns them.
 the lane it was aimed at and left two things standing.
 
 **(a) #659 — the seam was adopted, its companion guard was not.**
-`src/vllm/multimodal/ltx2_video.cpp:549-562` now asks two questions:
+`src/vllm/multimodal/ltx2_video.cpp:549-562 @ 11cc1d589` — anchored on the base
+SHA for the same reason `:54` below is, because this row rewrites that block and
+an unanchored number would point into the middle of the repair the moment it
+lands — now asks two questions:
 
 ```cpp
 const vt::DeviceType accelerator = vllm::platforms::CurrentPlatform().device_type();
@@ -45,7 +48,9 @@ the GPU' claim false". A partial backend that binds and dies has the same
 property one level down: it is a device claim the build cannot honour.
 
 **(b) #660 — the gate that certified (a) is a token grep, and the sibling lane
-spells its way past it.** `scripts/check-device-leakage.py:78` is
+spells its way past it.** `scripts/check-device-leakage.py:78 @ 62406c30e` —
+anchored, because this row rewrites that file's head and the line is now `:188`
+— is
 
 ```python
 RE_KCUDA = re.compile(r"\bkCUDA\b")
@@ -66,8 +71,11 @@ It hardcodes the ABI's `0/1` into the enum by integer cast and scores **zero**
 in the `kcuda` bucket. The same defect, in the sibling diffusion lane, under a
 different spelling.
 
-**The sharpest form of it:** `tests/vllm/models/test_minimax_h3_video_fold.cpp:162`
-asserts `MiniMaxH3VideoDeviceType(1) == vt::DeviceType::kCUDA`. The *test* spells
+**The sharpest form of it:**
+`tests/vllm/models/test_minimax_h3_video_fold.cpp:162 @ 62406c30e` asserts
+`MiniMaxH3VideoDeviceType(1) == vt::DeviceType::kCUDA` — anchored, because this
+row is what rewrites that assertion and the file now carries it at `:220`
+reading `== accelerator`. The *test* spells
 the token honestly and is counted; the *source* launders it and is not. The gate
 therefore reads the confession and misses the act.
 
@@ -109,7 +117,7 @@ about the token and a weaker statement about the property than it appears to be.
 
 There is no upstream for this: vLLM has no LTX-2.5 or MiniMax-H3 video engine,
 and the device seam is ours. The mirror source is therefore **our own
-`SelectQueueForModel`** (`src/vllm/entrypoints/model_loader.cpp:59-104`), which
+`SelectQueueForModel`** (`src/vllm/entrypoints/model_loader.cpp:60-105`), which
 is the shape every other model path already uses, and
 `include/vllm/platforms/interface.h:263`, which defines the capability question.
 Mirroring an internal seam is what "route it through the shared surface" means;
@@ -159,8 +167,9 @@ RED-first for each of the three.
    constructible in the CPU test build, the test injects a stub platform rather
    than skipping — a skipped test here is the whole finding.
 2. `MiniMaxH3VideoDeviceType` keeps its contract: `0` → `kCPU`, `-1` and `2`
-   throw (`test_minimax_h3_video_fold.cpp:161-164` already assert this and must
-   stay green **unchanged**), and `1` resolves through the seam rather than by
+   throw (`test_minimax_h3_video_fold.cpp:161-164 @ 62406c30e` already assert
+   this and must stay green **unchanged**), and `1` resolves through the seam
+   rather than by
    cast. The new assertion is that on a CPU-only build `1` is **refused**, which
    the cast could never do.
 3. The checker's three-spelling adversarial test above, each spelling asserted
@@ -197,13 +206,15 @@ count is RED even when it reads green.
 ## Findings from implementation
 
 **The brief and this spec disagreed on one line, and this spec won.** The
-dispatch brief said `test_minimax_h3_video_fold.cpp:161-164` must stay green
-*unchanged*, but §4.2 above enumerates what "the contract" means — `0 → kCPU`,
-`-1` and `2` throw — and separately requires that on a CPU-only build `1` is
-**refused**. Line 162 asserted `MiniMaxH3VideoDeviceType(1) == kCUDA`, which is
-precisely the cast's answer and cannot survive the change. It is now
+dispatch brief said `test_minimax_h3_video_fold.cpp:161-164 @ 62406c30e` must
+stay green *unchanged*, but §4.2 above enumerates what "the contract" means —
+`0 → kCPU`, `-1` and `2` throw — and separately requires that on a CPU-only build
+`1` is **refused**. Line 162 asserted `MiniMaxH3VideoDeviceType(1) == kCUDA`,
+which is precisely the cast's answer and cannot survive the change. It is now
 build-conditional and asserts BOTH arms: `== accelerator` where one is
-registered, refused-by-name where none is. 161/163/164 are untouched.
+registered, refused-by-name where none is. 161/163/164 are untouched. Every
+number in this paragraph is `@ 62406c30e`: on the branch the four assertions sit
+at `:191-193` and the two arms at `:215-238`.
 
 **`test_minimax_h3_video_fold.cpp`'s CUDA-load case registered a BACKEND and no
 PLATFORM.** It could, because the cast never asked whether the build had an
@@ -286,9 +297,9 @@ predicate is now three-way and asserts *which* refusal, since a right refusal fo
 a wrong reason is a wrong diagnosis that reads as a right one.
 
 **The decline CONSEQUENCE inverts the cited precedent, deliberately.** The PR
-described the change as mirroring `model_loader.cpp:97`, and it mirrors that
-site's *question* while inverting its *answer*. `:97`'s capability test lives on
-the `kAuto` path, whose response to a decline is to fall through to `:103` and
+described the change as mirroring `model_loader.cpp:98`, and it mirrors that
+site's *question* while inverting its *answer*. `:98`'s capability test lives on
+the `kAuto` path, whose response to a decline is to fall through to `:104` and
 **serve on CPU**; `metal.cpp:65-69` states that policy in as many words ("falls
 back to the CPU reference … and runs correctly, just slowly — which is strictly
 better than dying inside a kernel bind"). Both diffusion lanes instead **throw**.
@@ -296,7 +307,7 @@ That is correct, but it is the *explicit-device* path's polarity, not the
 `kAuto` path's: `device = 1` is an explicit accelerator request, and
 `model_loader.cpp:72-73` already says of that path "an explicit accelerator whose
 queue cannot be created must FAIL the load loudly, never silently serve on CPU" —
-the same argument `ltx2_video.cpp:562-565` makes for refusing rather than serving
+the same argument `ltx2_video.cpp:567-570` makes for refusing rather than serving
 the CPU forward behind an accelerator handle. So the lanes mirror the capability
 question from one path and the failure polarity from the other, and both halves
 are the seam's own.
@@ -369,12 +380,24 @@ members, and `std::vector<vt::DeviceType*>`.
 `tenstorrent.cpp`'s `supports_model_architecture` from `:52` to `:55`; the four
 citations on this branch (`ltx2_video.cpp`, `test_diffusion_device_seam.cpp`, and
 §0 and the residual note above) are corrected. `metal.cpp:70`,
-`interface.h:263` and `model_loader.cpp:97` were re-derived on the merged tree
-and all three still hold. Every `path:NN` anchor in this row's files was
-resolved mechanically; the only remaining unresolvable ones are upstream Python
-paths and two `examples/*/main.cpp` citations that carry their own `@ fc636c76`
-and so are provenance rather than drift. The `minimax_h3_video.cpp:221-226`
-citation in §0 is now anchored on the base SHA for the same reason.
+`interface.h:263` and `model_loader.cpp:98` were re-derived on the merged tree
+and all three still hold. The `minimax_h3_video.cpp:221-226 @ 11cc1d589`
+citation in §0 is anchored on the base SHA for the same reason.
+
+**The completeness claim this paragraph originally carried was false, and round 4
+withdrew it.** It said "Every `path:NN` anchor in this row's files was resolved
+mechanically; the only remaining unresolvable ones are upstream Python paths and
+two `examples/*/main.cpp` citations". `be9b0a6fd` repeated it as "thirty-one
+citations, five did not hold", and both were counting a set that did not include
+the citations this branch's own edits had just rotted. Round 4 found six more
+(§"Findings from review round 4"), all of them stale *inside this pull request*,
+two of them seven and fifteen lines from the `:54` citation that SHA-anchors
+itself with exactly the reasoning that applies to them. An enumeration that
+certifies its own completeness is the defect this row keeps finding in its own
+instruments, and it found it here in the record rather than in the checker.
+No paragraph in this spec now claims that every anchor was checked; §"Findings
+from review round 4" states what was re-derived, how, and what the method cannot
+see.
 
 ## Findings from review round 3 (PR #671, head `79ebbce42`)
 
@@ -481,12 +504,138 @@ And the enumeration must be the checker's own `rglob` over `SCAN_ROOTS`: a
 `include/vllm.h` starts with the characters `include/vllm` while sitting outside
 the `include/vllm` root. That off-by-one is the probe's, not the record's.
 
+## Findings from review round 4 (PR #898, head `7502004aa`)
+
+The review returned **FAIL** on a change it found correct and a gate it found
+honest. All eight findings are record, test-strength or message defects, and
+every one of them is this row's own thesis pointed back at the row.
+
+**F1 — the "refuses BY NAME" assertion could not fail.** The LTX case asserted
+`msg.find(kLtx2VideoFamily)`, and `Fail()` in `ltx2_video.cpp` prefixes EVERY
+message with `"ltx-2.5 video: "`, which contains the family string verbatim. So
+the assertion was satisfied by boilerplate on every refusal the file can throw,
+including the two the same case asserts it is NOT. Proven, not deduced:
+substituting `"<redacted>"` for the family name in the DECLINES `Fail` BUILT and
+left the suite GREEN. The H3 side escaped only by a spelling coincidence — its
+prefix is `"minimax_h3 video: "` with an underscore against a hyphenated
+`"minimax-h3"` family — which is not a property and is now not relied on. Both
+lanes assert the QUOTED SLOT, `architecture '<family>'`, through one
+`QuotedArchitecture()` helper that carries the reason.
+
+**F2 — the H3 half violated `## Nothing lands dead`.** The chain existed
+(`vllm_video_engine_load` → `LoadVideoEngine` → the `minimax_h3` registration →
+`MiniMaxH3VideoEngine::Load` → `MiniMaxH3VideoDeviceType`), but nothing entered
+through it: every H3 device assertion called the resolver directly. Replacing the
+`Load`-time call with the pre-row defect `params.device == 0 ? kCPU : kCUDA`
+BUILT and left `test_diffusion_device_seam` and `test_minimax_h3_video_fold`
+GREEN. The fold suite's `CUDA load creates exactly one queue` case does enter
+through `Load`, but its `FakeCudaPlatform` reports `kCUDA`, so the seam and the
+cast return the same answer and it cannot separate them. Two H3 cases now enter
+at `LoadVideoEngine` against the declining `PartialXpuPlatform`, mirroring the
+two LTX cases; and the two LTX cases were moved from `Ltx2VideoEngine::Load` to
+`LoadVideoEngine` as well, so both lanes are entered at the same production
+point and neither skips the registry hop.
+
+**F3 — the anchor sweep that claimed completeness was incomplete, and its own
+edits are what falsified it.** Six citations were stale, all of them rotted
+INSIDE this pull request. Two of them sat seven and fifteen lines from `:54`,
+which SHA-anchors itself with exactly the reasoning that applies to them.
+
+| citation | was | is |
+|---|---|---|
+| `check-device-leakage.py:78` (`RE_KCUDA`) | unanchored | `@ 62406c30e` (on the branch: `:188`) |
+| `test_minimax_h3_video_fold.cpp:162` (the `kCUDA` assertion) | unanchored | `@ 62406c30e` (on the branch: `:220`, `== accelerator`) |
+| `test_minimax_h3_video_fold.cpp:161-164`, twice | unanchored | `@ 62406c30e` (on the branch: `:191-193` / `:215-238`) |
+| `ltx2_video.cpp:549-562` (the two questions) | unanchored | `@ 11cc1d589` |
+| `ltx2_video.cpp:562-565` (the refusal-to-fake-it argument) | `:562-565` | `:567-570` |
+| `model_loader.cpp:97` (the capability clause), twice | `:97` | `:98` |
+
+Four more were tightened rather than repaired, because a range citation that
+starts on the wrong line is the same defect one size smaller: `model_loader.cpp`'s
+`SelectQueueForModel` is `:60-105` and was cited `:59-104`; its auto arm is
+`:76-104` and was cited `:75-104`; the `kAuto` fall-through to CPU is `:104` and
+was cited `:103`; and `ltx2_video.cpp`'s device block runs to the end of the
+capability refusal at `:614`, where the citation stopped at `:610` and cut the
+`Fail` in half.
+
+The completeness sentence is withdrawn, above, with the reason. What replaces it
+is a statement of METHOD and of what the method cannot see: every `path:NN` on a
+line this pull request ADDS was extracted mechanically from
+`git diff -U0 $(git merge-base e8048ef63 HEAD)`, resolved at the final tree, and
+read. It deliberately excludes citations this row did not write — the LTX lane's
+upstream Python anchors and the other rows' C++ anchors in the same files —
+because re-deriving those is a different row's work, and folding them in is how
+the last sweep came to believe it had checked everything. A citation this row
+inherits and did not touch is therefore NOT covered by this paragraph.
+
+Two limits of the method, stated because the previous sweep's failure was
+believing it had none. The extractor reads a `path:NN` token; it cannot tell a
+LIVE citation from one being QUOTED — the `was` column of the table above writes
+`:97`, `:562-565` and two unanchored fold-test numbers deliberately, as the
+record of what was wrong, and a later sweep will resolve them to the wrong lines
+and must not "repair" them. And the count of citations is itself a measurement of
+one tree, so it is not stored here: re-derive it rather than compare against a
+number that rots for reasons unrelated to this row, which is the same rule the
+scanned-file count above already carries.
+
+**F4 — `## Now` pointed at a closed pull request** (#671) and the pre-rebuild
+branch. Corrected, with the relationship between the two stated rather than the
+old number silently swapped out, because the round-1 to round-3 findings above
+were made against #671's heads and a reader needs to be able to find them.
+
+**F5 — `dev_cast` over-matches a plain copy-initialisation.**
+`vt::DeviceType d{other}` — a local copy, a member default-init, or an init from
+a call returning `DeviceType` — fires alternative (3) while converting nothing.
+Measured: 1 hit each, against 0 for `vt::DeviceType d{}`. It is NOT narrowed,
+because `vt::DeviceType d{raw}` is the real conversion M36/M41 pin and is
+textually identical; narrowing to remove the false positive deletes the true
+positive. The docstring gains a third section, `WHAT dev_cast OVER-MATCHES`,
+stating it with its cost — `dev_cast`'s baseline is a hard 0, so the first such
+line under the scan roots fails the ratchet and needs `DSR-ALLOW` — and M47 pins
+it in the M46 shape, with the value-init as the negative control in the same
+test. Nothing in the tree writes the form today.
+
+**F6 — `include/vllm.h` still called the selector CUDA.** The public ABI field
+`vllm_video_model_params.device`, the v14 `vllm_model_params.device` note that
+cites it as precedent, `video_engine.h`'s mirror and `minimax_h3_video.h:88`
+nineteen lines below the docstring this row rewrote all read `1 cuda`.
+`include/vllm/config/device.h:19` repeats the same sentence and is corrected with
+them; it is the fifth instance of one claim, not a fifth claim.
+
+**F7 — #828 was cited in product code and indexed nowhere.**
+`check-device-leakage.py:58,139,158` and this spec name it as what closes the
+declared blind spot, and it had no row in `.agents/issue-index.md`.
+`check-agent-record.py` passed only because an absent row is nothing to count,
+which is the instrument fault this row keeps finding. Appended with no owning row
+and listed under `## Owed` below, which is the shape the protocol defines for an
+issue a row files and does not fix.
+
+**F8** — an inverted sentence in the test header, which read as though the
+refusal and the kernel death both happened.
+
+## Owed
+
+- [#828](https://github.com/mudler/vllm.cpp/issues/828) — the AST-level
+  `dev_cast` check. `check-device-leakage.py:58,139,158` and §"Findings from
+  review round 3" both name it as what closes the declared blind spot, and
+  `scripts/check-device-leakage.py`'s docstring names it as what would enforce
+  the property rather than a spelling list. It is **not built here**: this row
+  ships the interim regular expression, its measured spelling list, its declared
+  blind spots and its declared over-match. Filed with all four rounds' evidence,
+  because "we kept finding more spellings" is the argument for it. Indexed in
+  [`issue-index.md`](../issue-index.md) with no owning row, which is why it is
+  listed here.
+
 ## Now
 
 `READY`, implemented and awaiting a fresh review on
-`row/LTX25-DEVICE-SEAM-SIBLING` (PR #671). All three changes plus the F5 repair
-are on the branch with their RED, GREEN and mutation evidence in the PR body;
-next is a fresh reviewer — not the implementer — on the immutable head, then the
+`row/LTX25-DEVICE-SEAM-SIBLING-REBUILD` ([PR
+#898](https://github.com/mudler/vllm.cpp/pull/898)). PR #671, named by the
+earlier rounds above, is CLOSED — it carried the same work on the pre-rebuild
+branch, and the round-1 to round-3 findings recorded above were made against its
+heads. All three changes plus the F5 repair and the round-4 repairs are on the
+rebuild branch with their RED, GREEN and mutation evidence in the PR body; next
+is a fresh reviewer — not the implementer — on the immutable head, then the
 operator's own gate rerun.
 
 The row stays `READY` deliberately. A lifecycle move to `ACTIVE` owes
