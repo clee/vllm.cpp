@@ -288,7 +288,27 @@ this is latent, not live. **Out of scope. File an issue when A1 is claimed** —
 AGENTS.md requires an issue for a bug found in flow, and this one is not
 fixable in flow because no model exercises it.
 
-### 1.4 Explicitly out of scope
+### 1.4 Spec and implementation are SEPARATE pull requests (decided, do not re-litigate)
+
+`porting-a-model.md` §0 says to ask the developer at row claim whether the spec
+and the implementation share one pull request, and to record the answer.
+**Asked and answered on 2026-08-15: separate. Spec first, implementation after.**
+
+The reason is recorded here so the next row claim does not re-open it. It is not
+a preference — it falls out of two AGENTS.md rules that compose only one way:
+*"the spec is committed **before** implementation, never written up afterwards"*,
+and *"a **fresh implementer** works from the committed spec"*. A fresh implementer
+is not fresh if it also authored the spec, and a spec shipping in the same pull
+request as its implementation is being reviewed alongside the code it was
+supposed to constrain — which is the review this protocol exists to avoid. The
+general recommendation in `porting-a-model.md` §0 covers the ordinary case where
+a spec is a paragraph of scope; this row's spec is the artifact a different agent
+works from.
+
+So: **this PR carries the spec and no product code. A1 is a separate PR by a
+different agent**, and its reviewer is a third.
+
+### 1.5 Explicitly out of scope
 
 Speed (no ratio is recorded by this row); the MTP head; the GGUF k-quant arm
 (parent §5b/W7, still refused by name); `NemotronHPuzzleForCausalLM`; TP
@@ -360,7 +380,15 @@ for shape, dtype in zip(self.get_state_shape(), self.get_state_dtype()):
 ```
 
 **The upstream runner literally cannot perform our cross-check** — it never
-holds a conv shape. That is why `MambaSpec` carries `shapes` and `dtypes`
+holds a conv shape. **That is the argument for DELETING the check, not for
+relocating it.** A cross-check that upstream is structurally incapable of
+expressing is not a safety net we happen to have and they happen to lack; it is
+a second, independent derivation of a number the model already published, and a
+second derivation is exactly the thing that can disagree. Widening it to accept
+NemotronH's geometry, or moving it behind a per-architecture switch, would keep
+the defect and add a maintenance surface. It goes.
+
+That is also why `MambaSpec` carries `shapes` and `dtypes`
 (`vllm/v1/kv_cache_interface.py:690-696`) and `page_size_bytes` is their sum
 (`:699-703`), and why our `MambaSpec`
 (`include/vllm/v1/kv_cache_interface.h:302-323`) mirrors those fields and
@@ -520,16 +548,33 @@ conflict explicit rather than latent:
 > the persistent page the registry declares is bf16 — and it says outright that
 > reconciling the two belongs to the paged-decode work, i.e. **A2**.
 
-**Decision, and it follows from AGENTS.md rather than from taste.** vLLM resolves
-one dtype and every layer inherits it; `f32` is a rare, annotated escape, and a
-buffer that names `f32` on a model path owes a one-line reason. The upstream
-answer is bf16. **A2 therefore gives `vt::CausalConv1dFwd` a bf16 conv-state
-arm** and stores the conv state at the cache dtype; it does not widen the page to
-f32 to satisfy a local kernel precondition. If that arm turns out to be
-materially harder than it looks, the fallback is an f32 conv page with the
-one-line reason and the cost **stated in bytes per token** in §10 — never an
-unannotated widening. A token gate cannot see this either way, which is exactly
-why it is decided here in the spec and not during implementation.
+**Decision (developer-directed 2026-08-15): mirror upstream. A2 gives
+`vt::CausalConv1dFwd` a bf16 conv-state arm and stores the conv state at the
+cache dtype.** This is a correctness obligation under AGENTS.md, **not a
+scheduling call**, and it is not to be re-litigated as one when the kernel work
+turns out to be real.
+
+The reasoning follows from the rules rather than from taste:
+
+- AGENTS.md: *"vLLM resolves ONE model dtype and every layer inherits it"*, and
+  `f32` is a rare, annotated escape. The upstream answer here is measured, not
+  inferred — `mamba_utils.py:96-107`, conv state carries `mamba_cache_dtype`,
+  default `auto` → the model dtype → bf16 for this checkpoint.
+- AGENTS.md again, and this is the whole point: *"a token gate cannot catch a
+  dtype that is too WIDE — it is still numerically correct, so tokens match,
+  goldens pass, and we move twice the bytes."* An f32 conv state where upstream
+  uses bf16 is **precisely** that defect. Every gate this row owns is blind to
+  it, which is why it is settled in the spec rather than during implementation.
+- **The registry is right and the precondition is the bug.**
+  `nemotron_h_registry.cpp:167` declares `kBF16` and mirrors upstream correctly.
+  What forces f32 is a *local* precondition — `vt::CausalConv1dFwd` validating
+  its conv state as f32 — and a local precondition contradicting a correct
+  mirror is a defect in the precondition, not a reason to widen the page to
+  satisfy it.
+
+**The f32 fallback survives only as an annotated escape**, never as the default:
+if it is taken it owes a one-line reason at the buffer and its cost **stated in
+bytes per token** in §10. A silent widening is not one of the options.
 
 ---
 
@@ -557,7 +602,14 @@ its shape half is a **self-consistency gate**
 
 The **dtype** half of that same case *is* genuinely armed — `MakeKvConfig(c,
 kBF16, kF16)` passes dtypes the config cannot produce, and `:528-529` honours
-them. That asymmetry is the shape of the repair, in the same file.
+them.
+
+**Its dtype half being armed while its shape half is inert is the cheapest
+RED-first anchor in this row**, and it is worth saying in exactly those terms.
+The two halves sit in one `TEST_CASE`, five lines apart, testing one function.
+One of them already does the right thing. So the repair needs no new harness, no
+new fixture and no new file — it needs the shape half to be given inputs the
+config cannot produce, which is what the dtype half is already doing next to it.
 
 **This is the RED-first anchor and it is cheap.** Add a subcase whose `MambaSpec`
 shapes are **not derivable from the config**: `linear_*` zeroed, `layer_types`
@@ -667,10 +719,13 @@ Correctness first, always. No throughput number is recorded by this row.
 ### 5.1 A1's gate — unit, deterministic, no checkpoint
 
 `ctest -R '^test_runner$'` plus `ctest -R '^test_nemotron_h'`, plus the full
-`scripts/agent-preflight.sh`. It sees shapes, dtypes, counts, byte totals and
-layer→group routing. **It cannot see whether the state is ever used** — that is
-why G-SAFE exists, and A1's gate must never be reported as evidence that
-NemotronH runs.
+`scripts/agent-preflight.sh` — read §5.5 first and subtract the inherited
+baseline. This gate runs anywhere, including the local development box; it needs
+no GPU and no checkpoint.
+
+It sees shapes, dtypes, counts, byte totals and layer→group routing. **It cannot
+see whether the state is ever used** — that is why G-SAFE exists, and A1's gate
+must never be reported as evidence that NemotronH runs.
 
 ### 5.2 A3's token gate — multi-step and multi-request, deliberately
 
@@ -713,10 +768,15 @@ A3 asserts:
    against what the pinned oracle reports for the same checkpoint, read from the
    **running** engine's resolved config, not from source
    ([`porting.md`](../porting.md)).
-5. **Oracle identity asserted, aborting on mismatch.** Use `vllm-oracle-next`,
-   never `$HOME/venvs/vllm-oracle`, which symlinks to a 0.25.0 rollback
-   predating `NemotronHMoEDecoderLayer` and fails in a way that reads as "the
-   model is unsupported" (parent spec §5a). A v1 driver script needs
+5. **Oracle identity asserted BY COMMIT, aborting on mismatch.** Use
+   `vllm-oracle-next`, never `$HOME/venvs/vllm-oracle`, which symlinks to a
+   0.25.0 rollback predating `NemotronHMoEDecoderLayer` and fails in a way that
+   reads as "the model is unsupported" (parent spec §5a). **Assert the commit,
+   not the version string:** `environment.md` records (2026-08-12) that the pin
+   reports `0.23.1rc1.dev1511+g555967922`, a `setuptools_scm`
+   nearest-ancestor-tag artefact — HEAD *is* `5559679229bc`, and the recorded
+   `0.26.0.dev0` string will never match. A version-string assertion here fails
+   with nothing wrong. A v1 driver script also needs
    `if __name__ == "__main__":` or EngineCore's spawn re-imports it and the
    failure names neither vLLM nor the caller.
 
@@ -743,21 +803,84 @@ parameters, modes, fixtures, tolerances, failure cases and the revision anchor:
   oracle golden instead. That is a search result with the paths named, not an
   assumption.
 
-### 5.4 The gate hosts, and the discipline
+### 5.4 The gate hosts (developer-directed 2026-08-15), and the discipline
 
-Both arms of A3 run on **both gate hosts**: the local x86_64 CPU-only Release
-host (CPU backend) and `dgx.casa` / GB10 sm_121a (CUDA). Requiring both is not
-ceremony — the same 32 tokens on both backends is also the CUDA==CPU equivalence
-check, and it is free once the gate exists.
+**The two gate hosts are `dgx.casa` (GB10, sm_121a) and `192.168.68.23` (Jetson
+Thor, sm_110).** Both arms of A3 run on both.
 
-GPU discipline on dgx, all mandatory: `flock $HOME/gpu.lock` — the lock is
+**The local x86_64 box is a development arm, not a gate host.** It has no GPU, so
+it cannot see anything device-side, and an A3 result from it is not an A3 result.
+Run A1's unit gate and the preflight there all you like; do not report a token
+gate from it.
+
+**GB10 still provides the CUDA==CPU equivalence check** — it runs both backends,
+so nothing is lost by dropping the local box.
+
+**Thor is not a second CUDA host, it is the PORTABLE path.** It builds with
+`-DVLLM_CPP_CUDA_ARCHITECTURES=110 -DVLLM_CPP_CUDA=ON -DVLLM_CPP_TRITON=OFF` and
+**no cutlass — every sm_110 fast-path cell resolves EMPTY**
+(`environment.md`, verified 2026-08-11). So Thor exercises the fallback kernels
+that GB10's fast paths hide, which is exactly why the loader row took its
+evidence on both, and A3 does the same. A conv/SSM path that only works through
+a fast path is a path that does not work.
+
+Thor's operational facts, none of them optional:
+
+- **The GPU is reachable only from inside a container.** No host CUDA toolkit, no
+  `nvcc`, no `cmake`. Use `sudo docker` (the user is in group `admin`, not
+  `docker`), **`--runtime=nvidia`** — `--gpus all` is refused outright — and
+  **`-e NVIDIA_DISABLE_REQUIRE=1`**, because the image's `NVIDIA_REQUIRE_CUDA`
+  tops out at `driver<576` and the box runs 595.78.
+- **★ THIS BOX REBOOTS INSTEAD OF OOM-KILLING.** `vm.overcommit_memory=1` with
+  zero swap: touching memory the kernel could not back takes the whole machine
+  down, with `exit=255`, `OOMKilled=false` and no `dmesg` OOM line. Observed three
+  times on 2026-08-11. The rule recorded there is **no >25 GB model plus a second
+  checkpoint**. The driver checkpoint is 20.1 GiB and A3 loads it **alone** — the
+  MTP drafter is parent W5 and out of scope here — so A3 fits, but a future
+  spec-on run on this box does not. Size for it before pressing enter.
+- No `local-ai-worker` and no `~/gpu.lock` on Thor in its current state; the
+  worker-restore discipline below is dgx-only.
+- Move code with `git archive`, never rsync ([[dgx-transfer-git-archive-not-rsync]]);
+  weights move dgx→Thor with `tar -ch | ssh ... tar -x` into a FRESH directory.
+- `nsys` in that image is 2024.2.3 and **cannot trace CUDA here**. Irrelevant to
+  A3, which records no number — noted so nobody plans one.
+
+**GPU discipline on dgx**, all mandatory: `flock $HOME/gpu.lock` — the lock is
 `$HOME/gpu.lock`, **not** `/tmp/gpu.lock`; `local-ai-worker` parked and restored
 at the end; one log per run; never a large oracle alongside `ctest`, because
-`gpu_memory_utilization` reserves HOST RAM on GB10 and has OOM-rebooted the box;
-CUDA `ctest` with `-j 1`. `df -h` before and after every build — an ENOSPC leaves
-the previous binary in place and prints a green status
+`gpu_memory_utilization` reserves HOST RAM on GB10 and has OOM-rebooted that box
+too; CUDA `ctest` with `-j 1`. `df -h` before and after every build on either
+host — an ENOSPC leaves the previous binary in place and prints a green status
 ([[stale-binary-prints-green-status]],
 [[enospc-makes-checkers-emit-false-policy-refusals]]).
+
+### 5.5 The inherited baseline — subtract it, do not chase it
+
+At the time this spec was written, `main` @ **`0141cb4b4`** is **RED on six
+gates**, all of them consequences of the `#865` `ci.yml` rewrite and none of them
+anything an implementer of this row can cause:
+
+```
+check-release-binary-contract     check-release-workflow     check-test-registration
+test_check_release_binary_contract   test_release_manifest   test_release_pipeline
+```
+
+Reproduced in a detached worktree at `0141cb4b4` **with zero modifications**;
+preflight was green on the immediately preceding base `e8f3b4a75` in the same
+session on the same box. Filed as
+[#873](https://github.com/mudler/vllm.cpp/issues/873), and a repair is being
+dispatched separately.
+
+**Subtract them as an inherited baseline; do not chase them, and do not report
+them as this row's.** Equally: do not subtract them *blindly*. #775 is the exact
+precedent — a lane stayed red long enough that people learned to discount it, and
+by the time the cause had changed underneath, anyone subtracting "the known red"
+was subtracting the wrong thing. Re-measure at your own base and name what you
+actually saw.
+
+**If the #873 repair lands before A1 is claimed, this section is historical
+rather than operative** — the correct action is then a clean green preflight, and
+a red on any of the six is yours.
 
 ---
 
@@ -768,7 +891,8 @@ the previous binary in place and prints a green status
 > 32-token goldens at
 > `tests/parity/goldens/nemotron_35_lightning_greedy/oracle.json` token-exact
 > for all three prompts, with `VT_NEMOTRON35_SNAPSHOT` UNSET so the revision
-> check binds, on both gate hosts.**
+> check binds, on **both gate hosts — `dgx.casa` (GB10, sm_121a) and
+> `192.168.68.23` (Thor, sm_110, no CUTLASS, `TRITON=OFF`)**, per §5.4.**
 
 `VT_NEMOTRON35_SNAPSHOT` is deliberately never revision-checked
 (`tests/parity/test_hf_snapshot_pinning.cpp:62`), so setting it during the gate
@@ -861,13 +985,17 @@ against the current head and issue state before claiming A2. If the CUDA Mamba2
 arm has not landed, A2 stops and reports; a device forward gated only against a
 host reference is not the gate this row claims.
 
-**R4 — the conv-state dtype conflict is live, and it is A2's to resolve** (§2.7).
-`nemotron_h_registry.cpp:167` declares the page `kBF16`;
-`nemotron_h_forward.h:284-296` says the host path's conv state must be f32
-because `vt::CausalConv1dFwd` validates it as f32; the scaffold test asserts
-bf16 at `test_nemotron_h_scaffold.cpp:652`. Upstream's answer is bf16. A2 gives
-the kernel a bf16 conv-state arm; any f32 fallback carries its one-line reason
-and its cost in bytes per token, in §10.
+**R4 — the conv-state dtype conflict is live, it is A2's to resolve, and the
+answer is already decided** (§2.7). `nemotron_h_registry.cpp:167` declares the
+page `kBF16`; `nemotron_h_forward.h:284-296` says the host path's conv state must
+be f32 because `vt::CausalConv1dFwd` validates it as f32; the scaffold test
+asserts bf16 at `test_nemotron_h_scaffold.cpp:652`. Upstream's answer is bf16
+(`mamba_utils.py:96-107`), so **A2 gives the kernel a bf16 conv-state arm**. The
+risk this entry records is not *which way* — that is settled — but that the
+kernel arm is unplanned work an implementer may be tempted to trade away under
+schedule pressure. It is not tradeable: a too-wide dtype passes every gate this
+row owns. Any f32 fallback carries its one-line reason and its cost in bytes per
+token, in §10.
 
 **R5 — the fixture must be the checkpoint the changed path loads.** Pin revision
 `29f2d174` explicitly. A repo silently re-quantized under the same name has cost
@@ -917,14 +1045,24 @@ lifecycle write.
 
 ## 9. Now
 
-**State at this commit:** spec only. No product code, no lifecycle change. A1 is
-claimable immediately against `main` + `bc570da0d`; A2 is blocked on #496 W2, and
-that block must be re-verified rather than inherited from this sentence.
+**State at this commit:** spec only. No product code, no lifecycle change. Per
+§1.4 the implementation is a **separate** pull request by a **different** agent;
+this one carries the spec.
+
+A1 is claimable now against `main` + `bc570da0d`, with PR #868 as its base
+(§7 R2). A2 is blocked on #496 W2, and that block must be re-verified rather than
+inherited from this sentence.
+
+**Three things to read before the first edit**, because each has already cost
+somebody a cycle: §5.5, so the six `#873` gates are subtracted rather than
+chased; §5.4, so the token gate is planned for `dgx.casa` and Thor and not for
+the local box, which cannot see anything device-side; and §7 R2, so #775 is
+consumed rather than re-fixed.
 
 **Next action:** a fresh implementer claims A1 from §1, captures the §3.1 red
-first, confirms #868's state per §7 R2, and lands A1 with the G-SAFE interlock
-opened through `vllm::ModelAs<NemotronHLoadedModel>`. A fresh reviewer — never the implementer — runs the §3.4 mutations and
-reports M3 as a pair.
+first, and lands A1 with the G-SAFE interlock opened through
+`vllm::ModelAs<NemotronHLoadedModel>`. A fresh reviewer — never the implementer —
+runs the §3.4 mutations and reports M3 as a pair.
 
 ## 10. Outcome
 
