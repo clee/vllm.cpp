@@ -447,6 +447,11 @@ tokens quietly.
 This is a deliberate state, not a bug: registering the architecture is what lets
 the config parse and weight-name mapping be tested before the forward exists.
 
+A refusal here is always a thrown message you can read. `NemotronHForCausalLM`
+also refuses when it is handed a model some other architecture loaded, naming
+both itself and the architecture the passed model claims, instead of reading
+that model as though it were its own (#775).
+
 ### LTX-2.5: what runs, and what it cannot do
 
 LTX-2.5 is reachable as video family `ltx-2.5`, through the same
@@ -488,8 +493,9 @@ read; reference audio additionally needs the AUDIO VAE's encoder key filter,
 which is not built. (Until 2026-08-13 this said a last-frame keyframe needs the
 DiT's unported `keyframes_abs_pos_embedding`. That was wrong: a supplied keyframe
 is appended unmarked, so the embedding never applies to it. Where the embedding
-does bite is the FIRST latent frame of every render, which is a separate gap,
-tracked as issue #658.) Three encoder-level limits are worth
+does bite is the FIRST latent frame of every render, which was a separate gap;
+it was closed on 2026-08-14 under issue #658, so the marker is now applied on
+every render.) Three encoder-level limits are worth
 stating in advance because they are refusals rather than approximations. A
 reference waveform whose sample rate differs from the audio VAE's is refused
 rather than resampled, since upstream uses a polyphase kaiser resampler this
@@ -579,7 +585,7 @@ the loader refuses and `--dit-config` supplies LTX-2.5's declared values.
 ```sh
 ltx2-gen --dit  ltx-2.5-22b-distilled-fp8.safetensors \
          --dit-config ltx-2.5-transformer-config.json \
-         --model-version 2.5 --allow-unported \
+         --model-version 2.5 \
          --video-vae ltx-2.5-video-vae-conv-bf16.safetensors \
          --audio-vae ltx-2.5-audio-vae-bf16.safetensors \
          --upsampler ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors \
@@ -709,7 +715,8 @@ memory number:
 ORACLE rather than an owed feature.** Through L10 this page said a prompt was
 refused because the `Embeddings1DConnector` weights, which ship inside the DiT
 file, were among the modules the DiT loader would not load. They are loaded
-(`ltx2_loader.cpp:416-427` carries them as their own contract, outside the DiT's),
+(`Ltx2LoadConnectorWeights`, `ltx2_loader.cpp:1221`, enumerates their own
+contract at `:1224`, outside the DiT's),
 so `encoder_path` is accepted, `has_encoder()` is true, and a prompt no longer
 needs a matching pair of embeds files. The gap that remains is a numeric one: the
 tower, the connector's forward and both caption projections each have an oracle
@@ -1411,7 +1418,7 @@ a stop token early.
 | `--tool-call-parser <name>` | `hermes` | Tool-call dialect (42 names over 38 families). `auto` detects from the chat template, `none` disables. For `gemma4`, OpenAI chat uses the text-seam parser (wrapped `<\|tool_call>` **or** bare `call:NAME{ARGS}`) so free-form / detokenized tool bodies still become `tool_calls`. **`inkling` needs `"skip_special_tokens": false` on the request today** — its whole grammar is special tokens and we have no `adjust_request` seam to force the flag off for you, so at the `true` default the detokenizer strips the markers before the parser runs ([#695](https://github.com/mudler/vllm.cpp/issues/695)). `--reasoning-parser inkling` is not registered at all ([#703](https://github.com/mudler/vllm.cpp/issues/703)) |
 | `--reasoning-parser <name>` | `none` | Reasoning parser (`think_auto`, `deepseek_r1`, `deepseek_v3`, `holo2`, `mistral`, `minimax_m2`, `minimax_m2_append_think`, `step3`, `olmo3`, `muse_glimmer`, `qwen3`, `mimo`). `auto` detects, `none` disables. `qwen3` and its `mimo` alias are the engine-backed adapter (one upstream class, two registry names): thinking is ON, so a marker-less stream is reasoning and a `<tool_call>` ends reasoning with no `</think>`. `auto` never selects it — a generic `<think>` template resolves to `think_auto`, which is the right default for hybrid-thinking models that may answer with no think block at all |
 | `--kv-transfer-config '<json>'` | (unset) | External KV connector, same JSON as vLLM's flag. See [docs/KV-OFFLOAD.md](KV-OFFLOAD.md) |
-| `--offload-config '<json>'` | (unset) | vLLM's `OffloadConfig` for **weight** offload, the same JSON vLLM takes (distinct from `--kv-transfer-config`, which offloads KV blocks). `offload_backend` is `auto` (default), `uva` or `prefetch`; `uva.cpu_offload_gb` sets the per-GPU budget and `uva.cpu_offload_params` targets parameters by dotted name SEGMENT (`"experts"` matches `mlp.experts.w2_weight`, `"w2"` does not). Parsed AND validated at startup, so a malformed document, an unknown backend or a validator violation is refused before any model I/O; a backend/field mismatch is a WARNING, as upstream. **Accepted and inert today: nothing moves a weight yet** (`ENG-WEIGHT-OFFLOAD` W0b wires config end to end; the offloader is W2/W5), so setting `cpu_offload_gb` frees no memory. Said plainly because a silently-ignored budget is worse than a documented one ([spec](../.agents/specs/weight-offload-uva.md), [#797](https://github.com/mudler/vllm.cpp/issues/797)) |
+| `--offload-config '<json>'` | (unset) | Weight offload, the same JSON vLLM's `OffloadConfig` takes (distinct from `--kv-transfer-config`, which offloads KV blocks). Parsed and validated at startup, so a malformed document, an unknown backend or a validator violation is refused before any model I/O; a backend/field mismatch is a warning, as upstream. **Accepted and inert today: no weight moves yet**, and on unified memory such as GB10 it cannot help at all because host and device share one pool. See [docs/WEIGHT-OFFLOAD.md](WEIGHT-OFFLOAD.md) |
 | `--speculative-config '<json>'` | (unset) | Speculative decoding (`mtp`, `dflash`, `ngram`), same JSON as vLLM's flag. `dspark` speculates on the Qwen3.6 gate models (native + Speculators drafts), token-identically to speculative-off, but is not gated on speed (currently ~2% behind at c1). A GGUF target, or a target with no aux multi-tap, is refused by name (`SPEC-DSPARK`). Its sequential Markov sampling runs on device by default; `VT_DSPARK_DEVICE_SAMPLE=0` restores the host loop (token-identical, cost only). The speculative verify runs from a captured CUDA graph, worth +12.2%/+3.5% on the 35B cells; `VT_SPEC_DECODE_GRAPH=0` restores the eager verify (also token-identical). See [docs/SPECULATIVE-DECODING.md](SPECULATIVE-DECODING.md) |
 | `--language-model-only` / `--no-language-model-only` | off | Disable all multimodal input by setting **every** modality limit to 0, mirroring vLLM's flag of the same name. It is not a "skip the encoder" switch: the server then **refuses** a multimodal request with ``400 At most 0 image(s) may be provided in one prompt. Set `--limit-mm-per-prompt` to increase this limit.`` It does **not** free VRAM yet — nothing gates tower construction on it ([#607](https://github.com/mudler/vllm.cpp/issues/607) wave L3) |
 | `--limit-mm-per-prompt '<json>'` | (unset ⇒ 999 per modality) | Maximum multimodal input items per prompt, per modality, as the same JSON object vLLM's flag takes: `'{"image": 2, "video": 0}'`, or with profiling options `'{"video": {"count": 1, "num_frames": 32}}'` (the options are validated and ignored — they size dummy inputs for memory profiling, which this engine does not do). A limit can only **lower** what the model/seam supports, never raise it. Malformed JSON, a negative count, or an unknown option on `image` / `video` / `audio` is refused at startup rather than defaulted. An unknown option on any other modality name is dropped rather than refused, mirroring upstream, whose fallback `BaseDummyOptions` is the one such dataclass without `extra="forbid"`. Upstream's dotted spelling (`--limit-mm-per-prompt.image 2`) is not accepted here, as for `--kv-transfer-config` and `--speculative-config` |
@@ -1842,8 +1849,13 @@ vllm-server --model /path/to/text-model \
   --video-encoder gemma4-12b-with-proj-nvfp4-torchao.safetensors \
   --video-extra encoder_config_path=ltx-2.5-gemma4-text-config.json \
   --video-extra dit_config_path=ltx-2.5-transformer-config.json \
-  --video-extra model_version=2.5 --video-extra allow_unported_modules=1
+  --video-extra model_version=2.5
 ```
+
+`allow_unported_modules=1` is no longer needed for either shipped LTX-2.5 DiT —
+`keyframes_abs_pos_embedding`, the last family that demanded it, was ported on
+2026-08-14 (issue #658). The flag still exists for a checkpoint that carries
+something else this port does not.
 
 ## Consuming it as a library (C ABI)
 
@@ -2409,18 +2421,26 @@ Only the LTX-2.5 DiT is gated against an independent oracle here, so treat any
 other marker-less NVFP4 checkpoint as unsupported until it is. See
 `.agents/specs/nvfp4-nibble-order.md`.
 
-Two behaviours a caller has to know. `Ltx2LoadDitFromSafetensors` REFUSES the
-shipped DiT by default, because that file carries **one** module family this port
-does not carry (`keyframes_abs_pos_embedding`); pass
-`Ltx2DitLoadOptions::allow_unported_modules`
-to load the ported subset, which still reports every one of them in
-`Ltx2DitCheckpoint::unported`. `prompt_adaln_single` and
-`audio_prompt_adaln_single` were on that list until 2026-08-13 and are now
-PORTED, so a checkpoint carrying them needs no opt-in on their account, and the
-opt-in no longer disables them. The two `*_embeddings_connector` towers are
+Two behaviours a caller has to know. `Ltx2LoadDitFromSafetensors` ACCEPTS both
+shipped DiTs with no opt-in as of 2026-08-14. `Ltx2DitLoadOptions::allow_unported_modules`
+still exists, and still loads the ported subset while reporting every dropped
+family in `Ltx2DitCheckpoint::unported`, but neither shipped LTX-2.5 checkpoint
+needs it any more. `keyframes_abs_pos_embedding` was the last family on that
+list; it is PORTED (issue #658), and `prompt_adaln_single` /
+`audio_prompt_adaln_single` left the list the same way on 2026-08-13. The two
+DiTs used to be refused from OPPOSITE directions — the vonkaiser FP8 copy for
+carrying a trained `keyframes_abs_pos_embedding` this port did not apply, and the
+first-party NVFP4 copy for declaring `use_keyframes_abs_pos_embedding` while
+carrying no tensor at all. The second case is upstream-legal and means "apply
+nothing": upstream builds the parameter on the meta device and
+`supports_keyframes_abs_pos_embedding` stays False, so
+`Ltx2AdoptDeclaredDitParams` resolves the declared flag against what the file
+actually carries rather than refusing it or inventing a zero. The two
+`*_embeddings_connector` towers are
 **not** among them and never will be:
-`UnportedFamilies` filters them out at `ltx2_loader.cpp:439` (`LoadedElsewhere`),
-`RefuseUnported`'s own message says so in capitals at `ltx2_loader.cpp:461-464`,
+`UnportedFamilies` filters them out at `ltx2_loader.cpp:527` through
+`LoadedElsewhere` (`ltx2_loader.cpp:514`), `RefuseUnported`
+(`ltx2_loader.cpp:537`) says so in its own message at `ltx2_loader.cpp:553-557`,
 and `Ltx2LoadConnectorWeights` loads them under their own contract — which is
 what the video engine calls, so a checkpoint this port reads completely is never
 made to ask for `allow_unported_modules` on their account. (The "five" this
