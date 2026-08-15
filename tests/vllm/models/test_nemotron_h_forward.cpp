@@ -1507,6 +1507,37 @@ TEST_CASE("NemotronH greedy decode is deterministic and in range") {
 
 namespace {
 
+// THE DEVICE-VS-HOST BAND, AND WHY IT IS NOT RelFor(dt).
+//
+// RelFor is calibrated for a forward compared against an INDEPENDENT f64
+// reference, so it has to absorb the whole accumulated error of the port. A
+// device-vs-host comparison is a far tighter thing: the two arms compose the
+// IDENTICAL vt:: op sequence in the IDENTICAL dtype and differ only in which
+// backend runs it.
+//
+// Using RelFor here was a MEASURED coverage hole, not a hypothetical one. On
+// Thor (sm_110) the rotation `kNemotronHAttentionHasNoRope` forbids moves this
+// block's output by relative 2.11e-2, while RelFor(kBF16) is 3e-2 — so the bf16
+// arm, which is the RELEASED CHECKPOINT'S OWN MODEL DTYPE, accepted a fully
+// rope'd answer. The M2 mutation reded f32 and stayed GREEN at bf16 until this
+// band replaced it.
+//
+// The values are set from what the two arms actually agree to, measured on Thor
+// with the band driven to 1e-9:
+//   f32   worst element slack 2.42e-08, whole-output separation 2.29e-06
+//   bf16  passes at 1e-9 outright — the bf16 store absorbs the f32-level
+//         difference entirely ([[bf16-store-absorbs-reduction-order-defects]])
+// f32 1e-5 leaves ~4x over the measured separation; bf16 4e-3 is about one bf16
+// ULP, the smallest band that cannot flake on another GPU's reduction order.
+// Both sit far below 2.11e-2, and that margin is ASSERTED in the case below so
+// a future widening fails there instead of silently disarming the property.
+double DevRelFor(DType dt) { return dt == DType::kF32 ? 1e-5 : 4e-3; }
+
+// The separation a wrongly-applied NeoX rotation produces on this fixture,
+// MEASURED on Thor sm_110 under mutation M2 (#810 A2α). A constant so the band
+// margin is checkable rather than remembered.
+constexpr double kRopeSeparation = 2.11e-2;
+
 // A CUDA queue when a device is present. A GPU-less box must SKIP LOUDLY: a
 // device case that silently reports a pass over zero device work is
 // indistinguishable from a real one ([[the-state-was-not-the-one-you-believed]]).
@@ -1631,7 +1662,7 @@ TEST_CASE("NemotronH A2a: the device attention block matches the host reference 
     // ExpectCloseRel self-certifies: it REQUIREs that this band rejects an
     // all-zeros answer, so a band wide enough to accept anything fails here
     // rather than passing quietly.
-    ExpectCloseRel("device attention vs host reference " + tag, dev_out, want, RelFor(dt));
+    ExpectCloseRel("device attention vs host reference " + tag, dev_out, want, DevRelFor(dt));
 
     // ── THE NO-ROPE PROPERTY IS GATED NUMERICALLY, NOT BY TOKENS ────────────
     // Applying rope_theta/partial_rotary_factor changes no tensor SHAPE and on
@@ -1673,8 +1704,15 @@ TEST_CASE("NemotronH A2a: the device attention block matches the host reference 
     // of RelFor(dt) cannot silently swallow the property.
     const double sep = RelSeparation(dev_out, want);
     INFO("device-vs-host separation " << sep << " at " << tag
-                                      << " (band " << RelFor(dt) << ")");
-    CHECK(sep < RelFor(dt));
+                                      << " (band " << DevRelFor(dt) << ")");
+    CHECK(sep < DevRelFor(dt));
+
+    // THE BAND IS ARMED, ASSERTED HERE RATHER THAN REMEMBERED. A rotation moves
+    // this block by kRopeSeparation; if the band ever creeps up to within 5x of
+    // that, the gate stops being able to see one and THIS check fails first.
+    INFO("band " << DevRelFor(dt) << " vs measured rope separation "
+                 << kRopeSeparation << " at " << tag);
+    CHECK(DevRelFor(dt) * 5.0 < kRopeSeparation);
   }
 }
 
@@ -1703,7 +1741,7 @@ TEST_CASE("NemotronH A2a: the hybrid device forward matches the host reference t
     std::vector<double> want(host_logits.size());
     for (size_t i = 0; i < host_logits.size(); ++i) want[i] = static_cast<double>(host_logits[i]);
     ExpectCloseRel("hybrid device logits vs host reference " + tag, dev_logits, want,
-                   RelFor(dt));
+                   DevRelFor(dt));
 
     // TOKEN IDENTITY, per position. Reported as a count so the case states how
     // many positions it actually compared rather than asserting on one.
