@@ -1245,10 +1245,20 @@ std::unique_ptr<LoadedEngine> LoadedEngine::FromModelDir(
     vllm::WeightOffloaderChoice choice = vllm::CreateWeightOffloader(
         params.offload_config.value_or(vllm::OffloadConfig{}));
     if (!choice.selected_backend_pending.empty()) {
+      // A backend this build cannot construct at all.
       std::cerr << "engine: offload_config selected backend \""
                 << choice.selected_backend_pending
-                << "\" but this build has no weight offloader yet "
-                   "(ENG-WEIGHT-OFFLOAD W2/W5); NO weight is offloaded"
+                << "\" but this build has no offloader for it "
+                   "(ENG-WEIGHT-OFFLOAD W5); NO weight is offloaded"
+                << std::endl;
+    } else if (choice.offloader != nullptr && choice.offloader->moves_weights()) {
+      // A backend that IS constructed but that no loader consults yet. The
+      // distinction matters to whoever set a budget: the first case is "not
+      // built", the second is "built and not wired". Both offload nothing, and
+      // saying so differently is what lets a bug report name the right one.
+      std::cerr << "engine: offload_config installed " << choice.offloader->name()
+                << " but no loader consults it yet "
+                   "(ENG-WEIGHT-OFFLOAD W2c); NO weight is offloaded"
                 << std::endl;
     }
     vllm::SetWeightOffloader(std::move(choice.offloader));
@@ -1392,6 +1402,16 @@ std::unique_ptr<LoadedEngine> LoadedEngine::FromModelDir(
   }
   HfConfig config = vllm::LoadHfConfig(config_path);
   const ModelRegistration& registration = ModelRegistry::Resolve(config);
+  // ENG-WEIGHT-OFFLOAD totality guard. Refuse a configured offload against a
+  // model whose loader does not consult the offloader, BEFORE any weight I/O.
+  // Without this the budget would be accepted and free nothing, with no error
+  // anywhere, because there is no single upload seam that could enforce the
+  // obligation structurally.
+  vllm::RefuseUnsupportedWeightOffload(
+      params.offload_config.value_or(vllm::OffloadConfig{}),
+      registration.architecture,
+      registration.factory != nullptr &&
+          registration.factory->supports_weight_offload);
   tok::Tokenizer tokenizer = tok::Tokenizer::FromHfJson(tokenizer_path);
 
   // Shared ownership so a loader may retain the mmap'd shards past the load: the
