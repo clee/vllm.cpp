@@ -16,7 +16,8 @@ IMPORTS and EXECUTES the LTX-2 modules rather than restating them.
 
 ## 0. What is wrong today
 
-`src/vllm/model_executor/models/ltx2_loader.cpp:988` sets, unconditionally:
+`src/vllm/model_executor/models/ltx2_loader.cpp:988 @ baa92ccf7` sets,
+unconditionally:
 
 ```cpp
 declared.use_prompt_adaln_single = false;
@@ -36,7 +37,7 @@ The shipped FP8 DiT carries the 18 tensors the flag builds (12
 `tests/vllm/models/ltx2_fp8_dit_manifest.inc:232-240,286-294`), so the flag is
 TRUE for the checkpoint this campaign renders. `ltx2.cpp:274-276` refuses those
 tensors by name, so a real render needs `allow_unported_modules=1`
-(`src/vllm/multimodal/ltx2_video.cpp:570`) — which reaches the loader lines above
+(`src/vllm/multimodal/ltx2_video.cpp:617`) — which reaches the loader lines above
 and **silently clears the flag**.
 
 Net effect: every render drops the timestep-conditioned half of the prompt K/V
@@ -168,12 +169,12 @@ golden valid.
 The **order of the two additions** is upstream's: the table and the timestep row
 are summed FIRST (`:443`), and only then does `(1 + scale)` apply. Folding it the
 other way would round differently — the same trap `ProcessOutput`
-(`ltx2_dit.cpp:530-540`) already documents.
+(`ltx2_dit.cpp:640-642`) already documents.
 
 ### 3.2 The prompt-K/V cache, and what replaces the cleared flag
 
 `Ltx2DitForward` already refuses a cache when the flag is on
-(`ltx2_dit.cpp:672-676`); with the flag no longer cleared, that refusal becomes
+(`ltx2_dit.cpp:775-780`); with the flag no longer cleared, that refusal becomes
 *reachable* rather than dead, and it is correct: the K/V now carry a timestep
 term. Nothing in the shipped pipeline passes a cache (`grep` over
 `ltx2_pipeline.cpp` finds none), so no caller regresses.
@@ -195,7 +196,7 @@ and setting it with the tensors absent would bind missing weights.
 
 After this row it is scoped to genuinely-unported modules only: the sole flag it
 still clears in a config copy is `use_keyframes_abs_pos_embedding`
-(`ltx2_loader.cpp:979-984`), whose module really is unported. The guard in §3.2
+(`ltx2_loader.cpp:1033-1035`), whose module really is unported. The guard in §3.2
 is what makes that scoping structural rather than a comment — the extra `= false`
 cannot come back without going red.
 
