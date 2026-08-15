@@ -281,7 +281,7 @@ constexpr char kLtx2DurationHeadPathExtra[] = "duration_head_path";
 // they are no longer trusted: the list below is derived from this file on every
 // run and compared, and the failure prints the replacement to paste in.
 // READER ANCHORS (derived and gated by test_ltx2_video):
-// 655 710 806 822 824 894 919 1024 1065
+// 660 715 811 827 829 899 924 1029 1070
 const char* const kKnownLoadExtras[] = {
     kLtx2AudioPromptEmbedsExtra, kLtx2PipelineKindExtra,   kLtx2ModelVersionExtra,
     kLtx2AllowUnportedExtra,     kLtx2MaxPhaseExtra,       kLtx2DitConfigPathExtra,
@@ -1481,7 +1481,18 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
       // the difference between "you gave me the wrong checkpoint" and "something
       // is 3 frames short". Ported and gated, not driven — see
       // .agents/specs/ltx25-temporal-upsampler.md section 7.
-      if (im.upsampler_cfg.temporal_upsample) {
+      //
+      // `&& !spatial_upsample` IS LOAD-BEARING. This guard used to test
+      // `temporal_upsample` alone, which every BOTH-flags config also satisfies,
+      // so it fired by implication over the same variable and told the caller who
+      // supplied a genuine SPATIOTEMPORAL checkpoint that they had handed over the
+      // temporal one — wrong on both counts, and pointing them at the arm they
+      // already had. It also shadowed the ledger refusal at
+      // `ltx2_upsampler.cpp:465`, which names the spatiotemporal arm and was
+      // therefore unreachable from any request. Narrowed here so a both-flags
+      // config falls THROUGH to that refusal. Gated by test_ltx2_video's
+      // "a SPATIOTEMPORAL upsampler checkpoint is refused as SPATIOTEMPORAL".
+      if (im.upsampler_cfg.temporal_upsample && !im.upsampler_cfg.spatial_upsample) {
         Fail("phase '" + phase.name +
              "' needs the latent SPATIAL x2 upsampler, but the checkpoint at 'upsampler_path' "
              "declares temporal_upsample=true, i.e. it is the TEMPORAL x2 upsampler. That arm "

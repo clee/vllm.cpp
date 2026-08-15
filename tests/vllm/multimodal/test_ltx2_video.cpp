@@ -451,6 +451,50 @@ TEST_CASE("ltx2 video: the second phase upsamples, and refuses when it cannot") 
       CHECK(msg.find("the upsampled latent is") == std::string::npos);
     }
   }
+  // THE ARM THE GUARD ABOVE WAS SHADOWING, and the reason this subcase exists at
+  // all. `if (im.upsampler_cfg.temporal_upsample)` is satisfied by a BOTH-flags
+  // checkpoint as well as a temporal-only one, so a genuine SPATIOTEMPORAL
+  // checkpoint was told it is the temporal x2 upsampler and pointed at the spatial
+  // one. Wrong on both counts: it is neither, it is the third arm, and the ledger
+  // refusal that names it (`ltx2_upsampler.cpp:465`) sat behind a guard that could
+  // not be reached from a request.
+  //
+  // The defect is an IMPLICATION between two guards over one variable, which no
+  // fixture could see because nothing drove a both-flags config through
+  // `LoadVideoEngine` — a review could prove the ledger refusal unmutated but not
+  // separate "unreachable" from "untested". This subcase closes that: it is the
+  // both-flags checkpoint, driven through the product path, asserting the caller
+  // is told which arm they actually supplied.
+  SUBCASE("a SPATIOTEMPORAL upsampler checkpoint is refused as SPATIOTEMPORAL, not as temporal") {
+    vllm::Ltx2UpsamplerConfig spatiotemporal =
+        ltx2_fixture::ReducedUpsamplerConfig(ltx2_fixture::ReducedDitParams().in_channels);
+    spatiotemporal.spatial_upsample = true;
+    spatiotemporal.temporal_upsample = true;
+    const std::string path = ws.root + "/spatiotemporal_upsampler.safetensors";
+    ltx2_fixture::WriteReducedUpsampler(spatiotemporal, path);
+
+    vllm::multimodal::VideoModelParams mp = FixtureParams(ws.paths);
+    mp.extras["upsampler_path"] = path;
+    const std::unique_ptr<vllm::multimodal::VideoEngine> engine =
+        vllm::multimodal::LoadVideoEngine(mp);
+    try {
+      (void)engine->Generate(FixtureGen(ws.root + "/spatiotemporal_ups"));
+      FAIL("a spatiotemporal upsampler checkpoint must be refused by name");
+    } catch (const std::exception& e) {
+      const std::string msg = e.what();
+      INFO(msg);
+      // The arm they ACTUALLY supplied, which is the whole repair.
+      CHECK(msg.find("SPATIOTEMPORAL") != std::string::npos);
+      // ...and NOT the temporal-only diagnosis, which is what the shadowing guard
+      // produced. Asserted on the sentence that only that guard emits, because
+      // both messages legitimately contain the word `temporal`.
+      CHECK(msg.find("it is the TEMPORAL x2 upsampler") == std::string::npos);
+      CHECK(msg.find("Supply the spatial upsampler") == std::string::npos);
+      // Not a shape complaint either: the refusal has to land before any weight
+      // is touched, which is what the ledger arm promises.
+      CHECK(msg.find("the upsampled latent is") == std::string::npos);
+    }
+  }
   SUBCASE("with one, the render lands at the FULL requested size") {
     vllm::multimodal::VideoModelParams mp = FixtureParams(ws.paths);
     mp.extras["upsampler_path"] = ws.paths.upsampler;
