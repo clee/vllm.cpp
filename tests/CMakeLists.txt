@@ -211,10 +211,27 @@ target_include_directories(test_minimax_music3_acoustic_real PRIVATE
   ${CMAKE_SOURCE_DIR}/tests/parity)
 # W6 (#672): the SPEECH-FAMILY seam, the request contract and the chunk plan.
 # Pure or synthetic-tree only, so it needs neither the checkpoint nor a golden.
+# W7 of #672 -- the QUANTIZED ARMS. Nothing here loads a quantized weight:
+# no quantized MiniMax-Music3 checkpoint is staged, and none is implemented.
+# What it gates is that every quantized format a user can obtain today is
+# DIAGNOSED BY NAME and refused, instead of surfacing as the generic
+# "missing seven diffusers directories" or as a shape mismatch on an
+# unrelated tensor. Needs no checkpoint and no network.
+vllm_cpp_add_test(test_minimax_music3_quant vllm/models/test_minimax_music3_quant.cpp)
+
 vllm_cpp_add_test(test_minimax_music3_speech vllm/models/test_minimax_music3_speech.cpp)
 # W6's FULL-SCALE companion: the pipeline TAIL driven on the shipped weights,
 # against the capture's own waveform, and the WAV the delivery path emits.
 # Checkpoint-gated with a loud SKIP, exactly as the W4/W5 real gate is.
+# W7 of #672 -- the ONE quantized arm that is implemented, against the REAL
+# pinned artifact (audio-cpp/MiniMax-Music3-GGUF @c36aaeed,
+# rvq_depth_decoder_q4_k.gguf, 406 MB). Skips loudly without it. Proves the
+# QUANTIZED PATH IS TAKEN (resident ggml types + the Q4_K lattice), not merely
+# that the numbers land inside a tolerance.
+vllm_cpp_add_test(test_minimax_music3_quant_real parity/test_minimax_music3_quant_real.cpp)
+target_compile_definitions(test_minimax_music3_quant_real PRIVATE
+  MUSIC3_GOLDENS_DIR="${CMAKE_SOURCE_DIR}/tests/parity/goldens/minimax_music3_oracle")
+
 vllm_cpp_add_test(test_minimax_music3_e2e_real parity/test_minimax_music3_e2e_real.cpp)
 target_compile_definitions(test_minimax_music3_e2e_real PRIVATE
   MUSIC3_GOLDENS_DIR="${CMAKE_SOURCE_DIR}/tests/parity/goldens/minimax_music3_oracle"
@@ -340,6 +357,18 @@ foreach(_gateup_lever VT_DENSE_MARLIN_GATEUP VT_NVFP4_MARLIN VT_MOE_FUSED_W13)
     PROPERTIES ENVIRONMENT "${_gateup_lever}=0")
 endforeach()
 vllm_cpp_add_test(test_qwen35_plain_weights vllm/models/test_qwen35_plain_weights.cpp)
+# UNALIGNED SAFETENSORS PAYLOADS (#772, fourth recurrence after #301/#627/#674).
+# The four loaders that formed a `const uint16_t*` over an mmap'd tensor, driven
+# over checkpoints whose payload parity is FORCED odd by one space of JSON header
+# padding. Two of the four launder every access through `memcpy`, so UBSan cannot
+# see them and only these value checks can — which is why this is a suite of its
+# own and not another sanitizer sweep.
+vllm_cpp_add_test(test_loader_unaligned_offsets
+  vllm/models/test_loader_unaligned_offsets.cpp)
+# The two Voxtral loader steps are declared in an INTERNAL header (src/, not
+# include/): they are not public ABI and must not become so for a test's sake.
+target_include_directories(test_loader_unaligned_offsets PRIVATE
+  ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_qwen3_8_text_only vllm/models/test_qwen3_8_text_only.cpp)
 # The PUBLISHED `Qwen/Qwen3.8-2.4T-A95B` config.json, committed VERBATIM, so the
 # config-resolution case reads the real document (nested `rope_parameters`, 92
@@ -888,6 +917,7 @@ vllm_cpp_add_test(test_speculative_dspark vllm/config/test_speculative_dspark.cp
 # language_model_only ⇒ 0 BEFORE the map, else the map, else the 999 default.
 vllm_cpp_add_test(test_multimodal_config vllm/config/test_multimodal_config.cpp)
 vllm_cpp_add_test(test_offload_config vllm/config/test_offload_config.cpp)
+vllm_cpp_add_test(test_weight_offloader vllm/model_executor/test_weight_offloader.cpp)
 # ENG-MM-INPUT-PIPELINE L1 (#607): the refusal those limits carry — the min()
 # fold against the model's own ceiling, upstream's exact message, and both call
 # sites with the enable_mm_embeds escape.
