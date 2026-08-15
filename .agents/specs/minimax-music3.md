@@ -10,7 +10,7 @@
 [#14456](https://github.com/huggingface/diffusers/pull/14456), head
 `c6da9936e4bda83107943a16eb8682e9a37d8527` — **OPEN, not merged**.
 **Cross-check:** SGLang-Omni `748a0b437e4a8faad44d7bbfd5a0ae55d1fef830`.
-**Status:** **W0-W6 DONE. The model generates a song end to end.** Spec committed, both oracles pinned, §1.1 resolved and confirmed at runtime, the diffusers oracle gateable against committed goldens, the modular loader in the tree, the autoregressive half's compute gated at reduced dimensions and against the real bf16 checkpoint, and the ACOUSTIC half — flow-matching DiT, scheduler, CFG, window bookkeeping, DAC Flow-VAE vocoder — gated at both scales against the committed capture. §5's token-exact gate is WITHDRAWN: upstream's AR stage has no greedy path, and the acoustic half never had one to withdraw. W6 has landed: the model is a registered `SpeechRegistry` family reachable through the new `vllm_speech_*` C ABI (v20) and `POST /v1/audio/speech`, and the denoise+decode composition reproduces the capture's waveform. **W2's remainder has landed too**: the landed Qwen3 dense path grew an additive `inputs_embeds` entry, the autoregressive loop runs on it, and an HTTP request now returns a real 44100 Hz stereo WAV. W7 is owed.
+**Status:** **W0-W6 DONE. Every stage is implemented and gated; a COMPOSED request is not yet observed to completion on CPU.** Spec committed, both oracles pinned, §1.1 resolved and confirmed at runtime, the diffusers oracle gateable against committed goldens, the modular loader in the tree, the autoregressive half's compute gated at reduced dimensions and against the real bf16 checkpoint, and the ACOUSTIC half — flow-matching DiT, scheduler, CFG, window bookkeeping, DAC Flow-VAE vocoder — gated at both scales against the committed capture. §5's token-exact gate is WITHDRAWN: upstream's AR stage has no greedy path, and the acoustic half never had one to withdraw. W6 has landed: the model is a registered `SpeechRegistry` family reachable through the new `vllm_speech_*` C ABI (v20) and `POST /v1/audio/speech`, and the denoise+decode composition reproduces the capture's waveform. **W2's remainder has landed too**: the landed Qwen3 dense path grew an additive `inputs_embeds` entry and the autoregressive loop runs on it, gated teacher-forced against the capture. What is NOT yet observed is a COMPOSED request running to a WAV on this box; see `## Now`. W7 is owed.
 **Developer directive (2026-08-13):** "land minimax music 3 support complete, to
 vllm.cpp, wired to the ABI and to the example http server, merge to main, tested
 e2e." That fixes W6's shape (the ABI surface and the example server are in scope,
@@ -565,7 +565,7 @@ read but never executed.
 
 ---
 
-**W2 IS COMPLETE: the pipeline is WHOLE, and an HTTP request returns a song.**
+**W2 IS COMPLETE: the pipeline is WHOLE. What is NOT claimed is a request observed to completion.**
 [`minimax_music3_llm.h`](../../include/vllm/model_executor/models/minimax_music3_llm.h)
 carries `MiniMaxMusic3SemanticGenerationStep.__call__` (`encoders.py:299-353`)
 and `_generate_depth_codes` (`:117-142`), driven through the landed Qwen3 dense
@@ -661,15 +661,47 @@ that — five registrations ride it — so the rounding is restored in the Music
 on the way out, at the one place it is observable. It is a NARROWING, which is
 the direction `.agents/porting.md` cares about.
 
-**End to end, over HTTP.** `POST /v1/audio/speech` through
-`ApiServer::handle_audio_speech` returns real 44100 Hz 16-bit stereo audio. The
-request mapping was hoisted out of `server_main.cpp`'s lambda into
-`vllm::openai::SynthesizeSpeechRequest` so a gate can call the code HTTP runs
+**End to end, over HTTP — WRITTEN AND WIRED, NOT YET OBSERVED. Read this
+before believing anything about a running request.** The gate exists
+(`tests/parity/test_minimax_music3_e2e_real.cpp`, "an HTTP request generates a
+real 44100 Hz stereo WAV"): it posts a body at `ApiServer::handle_audio_speech`,
+and it asserts the RIFF header, the length the request's duration implies, and
+four properties that each rule out a different way of returning a well-formed
+non-song — non-zero, unclipped (a scale error would otherwise hide behind the
+decode's own clamp), non-constant, and two channels that DIFFER. The request
+mapping was hoisted out of `server_main.cpp`'s lambda into
+`vllm::openai::SynthesizeSpeechRequest` so the gate calls the code HTTP runs
 rather than a test-only copy of it; the server is a one-line client of it now.
-The e2e case asserts the RIFF header, the length the request's duration implies,
-and four properties that each rule out a different way of returning a
-well-formed non-song: non-zero, unclipped (a scale error would otherwise hide
-behind the decode's own clamp), non-constant, and two channels that DIFFER.
+
+**IT HAS NOT BEEN SEEN TO PASS.** Two runs were taken on this box, at the
+shortest request that still enters every stage (0.1 s of audio -> 2 AR frames,
+2 denoise steps, a 26-token prompt). Both were stopped, at 85 and 34 minutes,
+and neither reached a waveform. The evidence about WHERE they were is specific
+rather than inferred: the four `language_model/*.safetensors` file descriptors
+were still OPEN, so `Music3LoadArWeights` had not returned; the depth decoder's
+file was never opened; resident size was flat at 17.38 GiB; and ~1.9 cores were
+burning. That places both runs inside `LoadQwen3ForCausalLMWeights`, after the
+bytes are materialized — so in the qkv/gate_up merges or the 200000 x 4096
+`lm_head` transpose — and NOT in any Music3 code.
+
+The first run was self-inflicted (a full `ctest -j 6` and a full build were
+running against the same 18.5 GB working set, forcing reclaim). The second was
+not: the box was quiet, and a sequential `cat` of the same 17.2 GB completes in
+20.6 s, so the mount is not the bottleneck either. It is therefore REPRODUCIBLE
+and unexplained, and the honest statement is that it is unexplained.
+
+**What makes this a performance question and not a correctness one** is that the
+same `Music3LmSession`, the same `ForwardEmbeds`, and the same weights DO load
+and run in `tests/parity/test_minimax_music3_llm_real.cpp`, which loads in about
+3 minutes and completes 25 teacher-forced decode steps — so the load path and the
+forward are both exercised end to end there, against the oracle. Every stage
+below the language model was already gated by W3-W6 against the capture. What is
+missing is one observation of the composition, and NOT a stage.
+
+**Owed, and named rather than discovered:** find out why
+`LoadQwen3ForCausalLMWeights` takes 30+ minutes on this checkpoint in one binary
+and ~3 in another, then run the e2e case and record its numbers here. Until that
+is done, no document in this tree may say this model has produced a song.
 
 **Why the CPU run is slow, named rather than left to be rediscovered.** The
 autoregressive half's host GEMM (`LinearNoBias`, `minimax_music3_ar.cpp`) is a

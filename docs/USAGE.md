@@ -1258,11 +1258,13 @@ A family with no text-only synthesis — IndexTTS-2.5 is one — is refused
 `reference_audio`, which is supplied as a `data:` URL carrying a 16-bit PCM mono
 WAV.
 
-**MiniMax-Music3 renders a song from a prompt.** The whole path runs — the
-8.6B `Qwen3ForCausalLM` autoregressive stage, the RVQ depth decoder, the learned
-condition mix, the flow-matching DiT and the DAC Flow-VAE vocoder — and the
-response is a real 44100 Hz stereo WAV. IndexTTS-2.5 still refuses naming its own
-missing pieces.
+**Every stage of MiniMax-Music3 is implemented and gated**, and a request
+reaches all of them: the 8.6B `Qwen3ForCausalLM` autoregressive stage, the RVQ
+depth decoder, the learned condition mix, the flow-matching DiT and the DAC
+Flow-VAE vocoder. **A composed request has not yet been observed to completion
+on CPU** — see the caveat below, and `.agents/specs/minimax-music3.md`. There is
+no by-name refusal left: nothing here is unimplemented. IndexTTS-2.5 still
+refuses naming its own missing pieces.
 
 **It runs on CPU and it is slow.** Every gate this row has was taken on CPU
 (`dgx.casa` was down throughout), and the acoustic half is upstream's own fp32.
