@@ -1648,6 +1648,78 @@ TEST_CASE("ltx2 video: the render READS the checkpoint's connector weights") {
   CHECK(RenderBytes(a, ws.root + "/conn_a2") == frames_a);
 }
 
+// ─── the keyframe marker, measured at the PIXELS ────────────────────────────
+//
+// WHY THIS CASE EXISTS, and it is not a duplicate of the DiT-level goldens.
+// Every other check in this file is RELATIVE — `digest != digest`, `absmax > 0`,
+// "the frames are not one flat value" — and none of them is anchored to what the
+// render is SUPPOSED to contain. That is why a defect measured on this head was
+// invisible: the engine builds `video.keyframes_mask` unconditionally, and the
+// guard beside it asserts the VECTOR is populated, so making the mask
+// conditional REDs 11 cases here while making the HANDOVER conditional — one
+// line lower, `if (wants_image) vin.keyframes_mask = ...` — compiled clean and
+// left all five LTX-2.5 suites GREEN. The pixels moved (frame 0 flat 127 → flat
+// 130) and nothing in the tree said so.
+//
+// The fix in `ltx2_video.cpp` closes that one line. THIS CASE CLOSES THE CLASS,
+// because it does not look at any line: it compares a render whose DiT carries
+// the parameter against a render whose DiT does not, on a request with NO image
+// and NO keyframe — upstream's unconditional case. Any route by which the
+// trained term fails to reach the forward collapses the two renders into one and
+// REDs here, whether the drop is in the mask, the handover, the binding, or the
+// add.
+//
+// The two checkpoints differ in exactly one thing. `Param()` seeds every tensor
+// from its own NAME, so dropping `keyframes_abs_pos_embedding` from the contract
+// perturbs no other value; the DiT config's flag follows the shapes because both
+// come from the same `Ltx2DitParams`.
+TEST_CASE("ltx2 video: the keyframe marker reaches the PIXELS with no image supplied") {
+  Workspace ws;
+  const vllm::Ltx2DitParams marked = ltx2_fixture::ReducedDitParams();
+  // The fixture's own default, asserted rather than assumed: with the flag off
+  // this whole case would compare two identical renders and pass vacuously.
+  REQUIRE(marked.use_keyframes_abs_pos_embedding);
+
+  vllm::Ltx2DitParams unmarked = marked;
+  unmarked.use_keyframes_abs_pos_embedding = false;
+  const std::string unmarked_dit = ws.root + "/dit_no_keyframes.safetensors";
+  ltx2_fixture::WriteReducedDit(unmarked, unmarked_dit, ltx2_fixture::ReducedDitOptions{});
+
+  vllm::multimodal::VideoModelParams with_marker = FixtureParams(ws.paths);
+  vllm::multimodal::VideoModelParams without_marker = with_marker;
+  without_marker.dit_path = unmarked_dit;
+
+  // `FixtureGen` supplies no image and no keyframe, which is the whole point:
+  // upstream marks the first latent frame "independently of whether any keyframe
+  // slots exist" (tools.py:186-196). A port that marked it only when something
+  // was conditioned would be silently wrong on every plain text-to-video render,
+  // and that is the render this case takes.
+  const std::string with = RenderBytes(with_marker, ws.root + "/kf_marked");
+  const std::string without = RenderBytes(without_marker, ws.root + "/kf_unmarked");
+  REQUIRE(with.size() == without.size());
+
+  size_t differing = 0;
+  for (size_t i = 0; i < with.size(); ++i) {
+    if (with[i] != without[i]) ++differing;
+  }
+  MESSAGE("keyframe marker moves " << differing << " of " << with.size()
+                                   << " artifact bytes");
+  // Strictly greater than zero, and no count floor above it. A count-based
+  // tolerance would bound nothing — it would red on unrelated numerical drift and
+  // still admit a term applied to the wrong frame — and the frame the marker
+  // belongs on is gated by the DiT goldens, which mark one frame and check the
+  // others are untouched. What this case owns is the ENGINE-to-PIXEL route, and
+  // for that the question is binary: did the trained term reach the render at
+  // all.
+  CHECK_MESSAGE(differing > 0,
+                "the DiT that carries keyframes_abs_pos_embedding rendered the same bytes as the "
+                "DiT that does not, so the trained term never reached the forward");
+
+  // ...and the same DiT twice is byte-identical, which is what makes the
+  // inequality a statement about the marker rather than about noise.
+  CHECK(RenderBytes(with_marker, ws.root + "/kf_marked2") == with);
+}
+
 TEST_CASE("ltx2 video: the connector's positional bound comes from the CONFIG") {
   // `connector_positional_embedding_max_pos` divides every token index
   // (rope.py:132-141). LTX-2.5 declares [4096]; the class default is [1], which

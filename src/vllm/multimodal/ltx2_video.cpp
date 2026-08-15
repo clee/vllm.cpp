@@ -1665,6 +1665,30 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
                  "trained term and look exactly like a working render.");
         vin.keyframes_mask = video.keyframes_mask.data();
       }
+      // AND THE HANDOVER IS CHECKED SEPARATELY FROM THE CONSTRUCTION, because the
+      // check above cannot see the handover. It reads `video.keyframes_mask` — the
+      // VECTOR — so it fires when the mask is built conditionally and stays silent
+      // when the ASSIGNMENT is. MEASURED: with the vector left unconditional and
+      // this assignment written `if (wants_image) vin.keyframes_mask = ...`, all
+      // five LTX-2.5 suites stayed GREEN while the rendered pixels moved — frame 0
+      // went from a flat 127 to a flat 130 — so the drop was real and nothing in
+      // the tree named it. Two sites, one invariant, and the earlier guard covered
+      // only one of them.
+      //
+      // `vin.keyframes_mask` is the field `Ltx2DitForward` reads, so it is the only
+      // fact that decides whether the trained term is applied. The condition stays
+      // on the flag rather than becoming a bare `!= nullptr`: a DiT that does NOT
+      // carry the parameter must reach the forward with a null marker, which is
+      // upstream's `keyframes_mask is None` exit and is itself gated at
+      // `ltx2_dit.cpp`'s `m.keyframes_mask == nullptr || keyframes_embedding !=
+      // nullptr`. Handing that model a marker would be a refusal, not a fix.
+      VT_CHECK(!im.dit.params.use_keyframes_abs_pos_embedding || vin.keyframes_mask != nullptr,
+               "ltx2 video: this DiT carries keyframes_abs_pos_embedding, so the forward owes the "
+               "marker on EVERY step — and this forward was handed none. "
+               "`_first_frame_keyframes_mask` (ltx_core/tools.py:184-196) is built on the same "
+               "line as the state, unconditionally, whether or not a keyframe or an image was "
+               "supplied. A marker that is BUILT and then not HANDED OVER renders without a "
+               "trained term and looks exactly like a working render.");
 
       Ltx2ModalityInput ain;
       ain.batch = 1;

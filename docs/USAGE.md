@@ -2352,8 +2352,9 @@ nothing": upstream builds the parameter on the meta device and
 actually carries rather than refusing it or inventing a zero. The two
 `*_embeddings_connector` towers are
 **not** among them and never will be:
-`UnportedFamilies` filters them out at `ltx2_loader.cpp:439` (`LoadedElsewhere`),
-`RefuseUnported`'s own message says so in capitals at `ltx2_loader.cpp:461-464`,
+`UnportedFamilies` filters them out at `ltx2_loader.cpp:527` through
+`LoadedElsewhere` (`ltx2_loader.cpp:514`), `RefuseUnported`
+(`ltx2_loader.cpp:537`) says so in its own message at `ltx2_loader.cpp:553-557`,
 and `Ltx2LoadConnectorWeights` loads them under their own contract — which is
 what the video engine calls, so a checkpoint this port reads completely is never
 made to ask for `allow_unported_modules` on their account. (The "five" this

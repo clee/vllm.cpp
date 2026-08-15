@@ -470,6 +470,13 @@ struct Ltx2ModalityInput {
   // preprocessor a `keyframes_embedding_provider` (model.py:314) and the audio one
   // none (:333), so a mask on the audio input is REFUSED rather than applied.
   //
+  // `_keyframes_embedding` is handed over at TWO sites, and BOTH are video. The
+  // `:314` above is the joint audio+video arm's `MultiModalTransformerArgsPreprocessor`;
+  // the video-ONLY arm builds a plain `TransformerArgsPreprocessor` and passes the
+  // same provider at `:349`. Their audio counterparts (`:316-334` and `:352-365`)
+  // take none. The split is by MODALITY, not by which arm ran, so a grep for the
+  // `:314` anchor that lands on `:349` has found the same rule, not a second one.
+  //
   // The rule that fills it is `_first_frame_keyframes_mask` (tools.py:186-196) —
   // the target's first latent frame, marked UNCONDITIONALLY, whether or not any
   // keyframe was supplied. `Ltx2FirstFrameKeyframesMask` (ltx2_conditioning.h) is
