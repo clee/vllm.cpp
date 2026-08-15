@@ -33,7 +33,7 @@ discovered later.
    other one: every *appending* conditioning item is blocked on token-append
    machinery the engine does not have. `VideoConditionByReferenceLatent` appends
    (`reference_video_cond.py:97-100`, ported at `ltx2_conditioning.cpp:265` via
-   `AppendTokens`), so the reference arm needs it too. §6 sizes it and §7 records
+   `AppendTokens`), so the reference arm needs it too. §6 sizes it and `## Owed` records
    it as owed. Closing only the metadata half and lifting the refusal would ship
    a wrong render.
 2. **No render-quality claim, and no real-weights claim.** The evidence here is
@@ -165,7 +165,7 @@ and §5.2 mutates that choice to prove the gate can see it.
   this.
 - **Exactly one LoRA**, with a second refused by name. Upstream's own `dubit.py`
   enforces the same (`dubit.py:364-365`) and `hdr_ic_lora.py` takes exactly one
-  (`hdr_ic_lora.py:271-272`). N-LoRA fusion is recorded as owed in §7 rather than
+  (`hdr_ic_lora.py:271-272`). N-LoRA fusion is recorded under `## Owed` rather than
   half-built; the conflict-detection loop this row ports (`ic_lora.py:155-173`)
   is what N-LoRA needs and is written to take a list already.
 
@@ -289,17 +289,17 @@ sequence and trim it back. What is and is not in the way:
 That work is **shared with the last-frame keyframe arm**, which is blocked on the
 identical machinery. It is therefore its own row rather than a tail of this one.
 
-## 7. Owed
+## Owed
 
 Each is owed by this row and named in the commit and pull request bodies.
 
 | owed | issue |
 |---|---|
-| token-append grow-and-trim in the phase loop; until it lands, the reference-video and reference-image arms stay refused, with the refusal rewritten to name this cause instead of the metadata one this row closed | filed as part of this row's delivery, see the pull request body |
-| the `conditioning_attention_mask` / `conditioning_attention_strength < 1.0` arm, which needs `Ltx2LatentState` to carry a mask and `build_attention_mask`'s block structure (`mask_utils.py:170-243`) | same |
-| N-LoRA fusion (more than one adapter) | same |
-| GGUF k-quant LoRA fusion — not applicable rather than owed: the LTX-2.5 DiT ships FP8 and NVFP4, and no GGUF LTX DiT exists to fuse into | n/a |
-| a real-weights IC-LoRA fusion measurement | blocked on GPU authority; this row had none |
+| token-append grow-and-trim in the phase loop. Until it lands the reference-video and reference-image arms stay refused, with the refusal rewritten to name this cause instead of the metadata one this row closed. Shared with the last-frame keyframe arm, which is why it is its own row | [#930](https://github.com/mudler/vllm.cpp/issues/930) |
+| the `conditioning_attention_mask` / `conditioning_attention_strength < 1.0` arm, which needs `Ltx2LatentState` to carry a mask and `build_attention_mask`'s block structure (`mask_utils.py:170-243`) | [#932](https://github.com/mudler/vllm.cpp/issues/932) |
+| N-adapter fusion, which additionally needs upstream's SECOND rounding pattern (`addmm_` with `alpha`, `fuse_loras.py:115`) that this row refuses rather than guesses | [#932](https://github.com/mudler/vllm.cpp/issues/932) |
+| GGUF k-quant LoRA fusion — **not applicable** rather than owed: the LTX-2.5 DiT ships FP8 and NVFP4, and no GGUF LTX DiT exists to fuse into | n/a |
+| a real-weights IC-LoRA fusion measurement | blocked on GPU authority; `dgx.casa` was under a long render for this row's duration and this row had no GPU authority |
 
 ## 8. Stop conditions
 

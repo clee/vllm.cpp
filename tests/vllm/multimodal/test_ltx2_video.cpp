@@ -697,6 +697,10 @@ TEST_CASE("ltx2 video: every accepted load extra is READ by something") {
       vllm::multimodal::kLtx2MaxPhaseExtra,          vllm::multimodal::kLtx2DitConfigPathExtra,
       vllm::multimodal::kLtx2PromptValidRowsExtra,   vllm::multimodal::kLtx2EncoderConfigPathExtra,
       "upsampler_path",
+      // Row LTX25-IC-LORA (#923): the IC-LoRA adapter and its strength. Both
+      // have readers -- `lora_path` builds an `Ltx2LoraSpec` and `lora_strength`
+      // is parsed into it -- so they belong here and not in `refused`.
+      vllm::multimodal::kLtx2LoraPathExtra,          vllm::multimodal::kLtx2LoraStrengthExtra,
   };
   // The keys the family defines and does NOT serve. Growing this list is a
   // deliberate act; growing it silently is the defect #611 records.
@@ -724,7 +728,7 @@ TEST_CASE("ltx2 video: every accepted load extra is READ by something") {
   // Every name this row inventoried is still accepted...
   for (const std::string& key : served) CHECK(listing.find(key) != std::string::npos);
   for (const std::string& key : refused) CHECK(listing.find(key) != std::string::npos);
-  // ...and there is no ELEVENTH name that this inventory has never seen. The
+  // ...and there is no THIRTEENTH name that this inventory has never seen. The
   // separator is ", ", so the count is one more than the separators.
   size_t names = 1;
   for (size_t at = listing.find(", "); at != std::string::npos; at = listing.find(", ", at + 2)) {
@@ -827,13 +831,14 @@ TEST_CASE("ltx2 video: the recorded reader anchors are the ones in the source") 
   }
   REQUIRE(array_end > array_line);
 
-  // The nine SERVED keys, by the token each is spelled with in the source. Order
+  // The eleven SERVED keys, by the token each is spelled with in the source. Order
   // is irrelevant — the comparison is on the sorted set — so this list is not a
   // second place the anchors live.
   const std::vector<std::string> served_tokens = {
       "kLtx2AudioPromptEmbedsExtra", "kLtx2PipelineKindExtra",  "kLtx2ModelVersionExtra",
       "kLtx2AllowUnportedExtra",     "kLtx2MaxPhaseExtra",      "kLtx2DitConfigPathExtra",
       "kLtx2PromptValidRowsExtra",   "kLtx2EncoderConfigPathExtra", "\"upsampler_path\"",
+      "kLtx2LoraPathExtra",          "kLtx2LoraStrengthExtra",
   };
   std::vector<size_t> derived;
   for (const std::string& token : served_tokens) {
@@ -1184,14 +1189,27 @@ TEST_CASE("ltx2 video: keyframe and reference conditioning is refused BY WHAT IS
       CHECK(msg.find("#658") != std::string::npos);
     }
   }
-  SUBCASE("a reference video names the IC-LoRA metadata this project does not read") {
+  SUBCASE("a reference video names TOKEN-APPEND, and no longer blames the LoRA metadata") {
+    // REPLACED, not relaxed (row LTX25-IC-LORA, #923). This subcase used to
+    // assert the refusal blamed the unread IC-LoRA metadata. That reason was
+    // true and is now false: `lora_path` reads the adapter's
+    // `reference_downscale_factor` / `reference_temporal_scale_factor`
+    // (iclora_utils.py:30-49) and carries them on the checkpoint. The arm is
+    // still refused, on the cause the message did not previously name.
     const std::string msg = refusal("a reference video",
                                     [](vllm::multimodal::VideoGenParams& g, const Workspace& w) {
                                       g.ref_video_dir = w.root;
                                     });
     INFO(msg);
-    CHECK(msg.find("temporal_scale_factor") != std::string::npos);
-    CHECK(msg.find("LoRA") != std::string::npos);
+    // The cause that actually remains, and the upstream symbol that has it.
+    CHECK(msg.find("TOKEN-APPEND") != std::string::npos);
+    CHECK(msg.find("reference_video_cond.py") != std::string::npos);
+    CHECK(msg.find("clear_conditioning") != std::string::npos);
+    // And the retired reason must NOT come back as the thing that is missing.
+    // A refusal that names a blocker the tree no longer has is the defect row
+    // LTX25-RETIRE-DEAD-ARMS exists to retire, arriving from the other side.
+    CHECK(msg.find("which this project does not read") == std::string::npos);
+    CHECK(msg.find("NOT the IC-LoRA metadata") != std::string::npos);
   }
   SUBCASE("reference audio names the AUDIO encoder, which this row did not build") {
     const std::string msg = refusal("reference audio",
@@ -2700,4 +2718,241 @@ TEST_CASE("ltx2 video: a trace for a render that never completed says so") {
   CHECK(trace.video_absmax > 0.0);
   // ...and yet no render came out of it. This is the whole assertion.
   CHECK_FALSE(trace.completed);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// IC-LoRA reachability (row LTX25-IC-LORA, issue #923)
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// THE QUESTION THIS ANSWERS is not "does the fuser work" — test_ltx2_lora
+// answers that by calling it. It is "does anything a USER can do reach it",
+// which a unit test constructing an `Ltx2LoraAdapter` by hand cannot establish
+// (.agents/reachability.md).
+//
+// So this enters through the production entry point, `LoadVideoEngine`, with a
+// `lora_path` LOAD EXTRA — the same path `vllm_video_engine_load` and
+// `ltx2-gen --lora` take — and asserts the RENDER moves. The reachability
+// mutation is deleting the `dit_options.loras.push_back` call site in
+// `ltx2_video.cpp`; that leaves the fuser and its whole unit suite green and
+// REDs the cases below, which is the difference between measuring a class and
+// measuring a capability.
+namespace {
+
+// Write an IC-LoRA adapter targeting one REAL tensor of the reduced DiT
+// contract, with its shape derived from the contract rather than hard-coded, so
+// a fixture geometry change cannot leave this silently targeting nothing.
+std::string WriteFixtureLora(const std::string& path, const std::string& target,
+                             float scale,
+                             const std::map<std::string, std::string>& metadata = {}) {
+  const vllm::Ltx2DitParams params = ltx2_fixture::ReducedDitParams();
+  std::vector<int64_t> shape;
+  for (const vllm::Ltx2TensorSpec& spec : vllm::EnumerateLtx2DitTensors(params)) {
+    if (spec.name == target) shape = spec.shape;
+  }
+  REQUIRE_MESSAGE(shape.size() == 2,
+                  "the fixture LoRA target '", target,
+                  "' is not a rank-2 tensor of the reduced DiT contract");
+  const int64_t out_features = shape[0];
+  const int64_t in_features = shape[1];
+  const int64_t rank = 2;
+
+  // B [out, rank] and A [rank, in], both constant, so the delta is a uniform
+  // `scale * rank` on every element — large enough that the render cannot be
+  // numerically indistinguishable from the unfused one.
+  std::vector<ltx2_fixture::Entry> entries = {
+      {"diffusion_model." + target.substr(0, target.size() - std::string(".weight").size()) +
+           ".lora_A.weight",
+       "BF16",
+       {rank, in_features},
+       std::vector<float>(static_cast<size_t>(rank * in_features), 1.0F),
+       {}},
+      {"diffusion_model." + target.substr(0, target.size() - std::string(".weight").size()) +
+           ".lora_B.weight",
+       "BF16",
+       {out_features, rank},
+       std::vector<float>(static_cast<size_t>(out_features * rank), scale),
+       {}},
+  };
+  std::string metadata_json;
+  if (!metadata.empty()) {
+    metadata_json = "{";
+    bool first = true;
+    for (const auto& kv : metadata) {
+      if (!first) metadata_json += ",";
+      first = false;
+      metadata_json += "\"" + kv.first + "\":\"" + kv.second + "\"";
+    }
+    metadata_json += "}";
+  }
+  ltx2_fixture::WriteSafetensors(entries, metadata_json, path);
+  return path;
+}
+
+// The target every case uses: the first block's query projection, which every
+// render must read.
+const char* const kFixtureLoraTarget = "transformer_blocks.0.attn1.to_q.weight";
+
+}  // namespace
+
+TEST_CASE("ltx2 video: an IC-LoRA supplied through the LOAD EXTRA reaches the PIXELS") {
+  // THE WITNESS IS THE RENDERED ARTIFACT, not `last_conditioning()`. The
+  // conditioning trace is filled BEFORE the denoise loop runs, so it is a
+  // function of the prompt and the conditioning items and cannot see a fused
+  // weight at all — a first version of this case compared `video_digest` and
+  // found every arm identical, which reads exactly like "the LoRA does nothing"
+  // and was in fact "the instrument cannot see it". `RenderBytes` takes the
+  // decoded output, which is downstream of the DiT weights.
+  Workspace ws;
+
+  const std::string lora =
+      WriteFixtureLora(ws.root + "/ic.safetensors", kFixtureLoraTarget, 1.0F);
+  vllm::multimodal::VideoModelParams fused = ConditioningParams(ws.paths);
+  fused.extras[vllm::multimodal::kLtx2LoraPathExtra] = lora;
+
+  const std::string plain = RenderBytes(ConditioningParams(ws.paths), ws.root + "/plain");
+  const std::string with_lora = RenderBytes(fused, ws.root + "/fused");
+  REQUIRE(plain.size() == with_lora.size());
+  REQUIRE(plain.size() > 0);
+
+  size_t differing = 0;
+  for (size_t i = 0; i < plain.size(); ++i) {
+    if (plain[i] != with_lora[i]) ++differing;
+  }
+  MESSAGE("the IC-LoRA moves " << differing << " of " << plain.size() << " artifact bytes");
+  // THE REACHABILITY CLAIM. Every byte of the REQUEST is identical; the only
+  // difference is the `lora_path` LOAD EXTRA. Deleting the
+  // `dit_options.loras.push_back` call site in ltx2_video.cpp leaves the whole
+  // of test_ltx2_lora green and REDs this, which is the difference between
+  // measuring a class and measuring a capability (.agents/reachability.md).
+  //
+  // Strictly greater than zero and no count floor above it: a count-based
+  // tolerance would bound nothing.
+  CHECK(differing > 0);
+}
+
+TEST_CASE("ltx2 video: the IC-LoRA strength reaches the PIXELS, and 0 is a no-op") {
+  Workspace ws;
+  const std::string lora =
+      WriteFixtureLora(ws.root + "/ic.safetensors", kFixtureLoraTarget, 1.0F);
+
+  const auto render = [&](const char* strength, const char* out) {
+    vllm::multimodal::VideoModelParams mp = ConditioningParams(ws.paths);
+    mp.extras[vllm::multimodal::kLtx2LoraPathExtra] = lora;
+    if (strength != nullptr) {
+      mp.extras[vllm::multimodal::kLtx2LoraStrengthExtra] = strength;
+    }
+    return RenderBytes(mp, std::string(ws.root) + "/" + out);
+  };
+
+  // A no-adapter control, so "strength 0 renders the base model" is asserted
+  // against the base model rather than against itself.
+  const std::string baseline = RenderBytes(ConditioningParams(ws.paths), ws.root + "/plain");
+  const std::string full = render(nullptr, "full");
+  const std::string half = render("0.5", "half");
+  const std::string zero = render("0.0", "zero");
+
+  // Strength 0 fuses a zero delta, so the weights are the base model's again.
+  // This is what proves the strength is READ rather than accepted and dropped:
+  // an implementation that ignored it would give `zero == full != baseline`.
+  CHECK(zero == baseline);
+  CHECK(full != baseline);
+  CHECK(half != full);
+  CHECK(half != baseline);
+}
+
+TEST_CASE("ltx2 video: the IC-LoRA load extras refuse by name on misuse") {
+  Workspace ws;
+
+  SUBCASE("a strength with no adapter refuses rather than doing nothing") {
+    vllm::multimodal::VideoModelParams mp = FixtureParams(ws.paths);
+    mp.extras[vllm::multimodal::kLtx2LoraStrengthExtra] = "0.5";
+    try {
+      (void)vllm::multimodal::LoadVideoEngine(mp);
+      FAIL("a strength with no adapter must be refused");
+    } catch (const std::exception& e) {
+      const std::string msg = e.what();
+      INFO(msg);
+      CHECK(msg.find("lora_strength") != std::string::npos);
+      CHECK(msg.find("lora_path") != std::string::npos);
+    }
+  }
+
+  SUBCASE("a non-numeric strength refuses BY NAME") {
+    const std::string lora = WriteFixtureLora(ws.root + "/ic.safetensors", kFixtureLoraTarget,
+                                              1.0F);
+    vllm::multimodal::VideoModelParams mp = FixtureParams(ws.paths);
+    mp.extras[vllm::multimodal::kLtx2LoraPathExtra] = lora;
+    mp.extras[vllm::multimodal::kLtx2LoraStrengthExtra] = "strong";
+    try {
+      (void)vllm::multimodal::LoadVideoEngine(mp);
+      FAIL("a non-numeric strength must be refused");
+    } catch (const std::exception& e) {
+      const std::string msg = e.what();
+      INFO(msg);
+      CHECK(msg.find("lora_strength") != std::string::npos);
+      CHECK(msg.find("not a finite number") != std::string::npos);
+    }
+  }
+
+  SUBCASE("an adapter naming a module the DiT does not bind refuses BY NAME") {
+    // The divergence from upstream's silent skip (fuse_loras.py:135-137),
+    // observed through the PRODUCTION load rather than through the reader.
+    const std::string path = ws.root + "/bad.safetensors";
+    ltx2_fixture::WriteSafetensors(
+        {
+            {"diffusion_model.transformer_blocks.0.not_a_module.lora_A.weight",
+             "BF16",
+             {2, 4},
+             std::vector<float>(8, 1.0F),
+             {}},
+            {"diffusion_model.transformer_blocks.0.not_a_module.lora_B.weight",
+             "BF16",
+             {4, 2},
+             std::vector<float>(8, 1.0F),
+             {}},
+        },
+        std::string(), path);
+    vllm::multimodal::VideoModelParams mp = FixtureParams(ws.paths);
+    mp.extras[vllm::multimodal::kLtx2LoraPathExtra] = path;
+    try {
+      (void)vllm::multimodal::LoadVideoEngine(mp);
+      FAIL("an adapter targeting an unbound module must be refused");
+    } catch (const std::exception& e) {
+      const std::string msg = e.what();
+      INFO(msg);
+      CHECK(msg.find("transformer_blocks.0.not_a_module.weight") != std::string::npos);
+      CHECK(msg.find("does not bind") != std::string::npos);
+    }
+  }
+}
+
+TEST_CASE("ltx2 video: the IC-LoRA reference factors are read from the adapter's metadata") {
+  // The two numbers the reference refusal used to name as unreadable. Read
+  // through the PRODUCTION load, and reported back out through the refusal
+  // itself, which is the only user-visible surface that carries them today.
+  Workspace ws;
+  const std::string lora =
+      WriteFixtureLora(ws.root + "/ic.safetensors", kFixtureLoraTarget, 1.0F,
+                       {{"reference_downscale_factor", "2"},
+                        {"reference_temporal_scale_factor", "4"}});
+  vllm::multimodal::VideoModelParams mp = FixtureParams(ws.paths);
+  mp.extras[vllm::multimodal::kLtx2LoraPathExtra] = lora;
+  const std::unique_ptr<vllm::multimodal::VideoEngine> engine =
+      vllm::multimodal::LoadVideoEngine(mp);
+
+  vllm::multimodal::VideoGenParams gen = FixtureGen(ws.root + "/ref");
+  gen.ref_video_dir = ws.root;
+  try {
+    (void)engine->Generate(gen);
+    FAIL("the reference-video arm is still refused");
+  } catch (const std::exception& e) {
+    const std::string msg = e.what();
+    INFO(msg);
+    // The factors the adapter declared, echoed back — so this asserts the READ
+    // happened, not merely that a refusal fired.
+    CHECK(msg.find("downscale=2") != std::string::npos);
+    CHECK(msg.find("temporal=4") != std::string::npos);
+    // And the refusal still names the cause that genuinely remains.
+    CHECK(msg.find("TOKEN-APPEND") != std::string::npos);
+  }
 }

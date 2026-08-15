@@ -507,8 +507,10 @@ the token-APPEND machinery — a keyframe is appended to the sequence with its o
 positions and a rebuilt attention mask, then trimmed back off, and this engine's
 phase loop is fixed at the target grid's token count — while the served
 first-frame arm only REPLACES tokens that already exist; the reference arms need
-the IC-LoRA's scale factors, which live in LoRA metadata this project does not
-read; reference audio additionally needs the AUDIO VAE's encoder key filter,
+that SAME token-append machinery, because a reference latent is appended too
+(their old reason - the IC-LoRA scale factors living in adapter metadata this
+project could not read - was closed on 2026-08-15 by `--lora`, which reads
+them); reference audio additionally needs the AUDIO VAE's encoder key filter,
 which is not built. (Until 2026-08-13 this said a last-frame keyframe needs the
 DiT's unported `keyframes_abs_pos_embedding`. That was wrong: a supplied keyframe
 is appended unmarked, so the embedding never applies to it. Where the embedding
@@ -627,6 +629,29 @@ own CRF 18 and refuses — see the out-of-distribution note above.
 64 (32 for the VAE, twice that because the distilled recipe's first phase runs at
 half resolution). Omitting all three renders the recipe default, which is
 1024x1536 at 121 frames and is a much larger request than it looks.
+
+`--lora ic-lora.safetensors [STRENGTH]` fuses an IC-LoRA adapter into the DiT at
+load, mirroring upstream's `--lora PATH [STRENGTH]`
+(`ltx-pipelines/utils/args.py:600-611`). The strength is optional and defaults to
+1.0. It is a LOAD-time flag, not a per-request one, because the adapter is fused
+into the weights and cannot vary between generations - upstream takes it as a
+`DiffusionStage.from_checkpoint` constructor argument for the same reason
+(`ic_lora.py:104-114`).
+
+The adapter is a safetensors file of `.lora_A.weight` / `.lora_B.weight` pairs,
+with or without ComfyUI's `diffusion_model.` prefix. It works on every arm the
+DiT loads - bf16, FP8 and NVFP4 alike - because those are all dequantized to
+bf16 before the delta is added. Three things REFUSE by name rather than
+proceeding quietly: an adapter naming a module this port does not bind (upstream
+would skip it, and a skip cannot be told apart from a typo), an adapter that
+fuses into nothing at all, and a second `--lora`, since only one adapter is
+accepted so far.
+
+Supplying an adapter also reads its `reference_downscale_factor` and
+`reference_temporal_scale_factor` metadata (`iclora_utils.py:30-49`). Those are
+what a reference video needs, and reading them was what the reference refusal
+used to say was missing - it now names the token-append machinery instead, which
+is the cause that actually remains.
 
 `--upsampler` is what the distilled recipe's second phase needs. Without it that
 phase refuses rather than skipping: its three-step refinement is what makes the
@@ -1989,8 +2014,9 @@ spatiotemporal upsampler is the arm with `spatial_upsample` AND
 **ported** and is not refused; nothing shipped drives it yet, so it is gated
 rather than served. Four more are
 recorded as out of scope but are **not requestable**, so no flag or extra can
-reach them: LoRA fusion, `int8-convrot`, single-node multi-GPU, and
-`BetaScheduler`. Their messages
+reach them: `int8-convrot`, single-node multi-GPU, and
+`BetaScheduler`. (LoRA fusion was in that list until 2026-08-15 and is now
+SERVED - see `--lora` above - so its marker was retired rather than moved.) Their messages
 say `DECLARED, NOT REQUESTABLE` so the two kinds are not confused.
 `BetaScheduler` is in that group rather than the reachable one because upstream
 selects it nowhere: every `ltx-pipelines` entry point hard-codes
@@ -2071,6 +2097,8 @@ batch-wide payload by rows. The second argument is the requested row count;
 each row keeps the source tensor's independent `num_tokens_per_position`
 width.
 
+(That brick is the TEXT decode path and is a different mechanism from LTX-2.5's
+IC-LoRA, which fuses into the weights at load and IS served - see `--lora`.)
 The LoRA adapter headers ([`lora/lora_weights.h`](../include/vllm/lora/lora_weights.h),
 [`lora/punica.h`](../include/vllm/lora/punica.h),
 [`lora/layers.h`](../include/vllm/lora/layers.h)) are present but **not yet wired

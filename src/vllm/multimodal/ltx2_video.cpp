@@ -257,6 +257,24 @@ int64_t ExtraInt(const std::map<std::string, std::string>& extras, const std::st
   }
 }
 
+// The IC-LoRA strength (utils/args.py:600-611). Upstream's `LoraAction` parses
+// it as a plain float and applies no range clamp, so neither does this: a
+// negative or >1 strength is a legitimate, if unusual, request that upstream
+// honours, and refusing it here would diverge. What IS refused is a value that
+// is not a number at all, which upstream's `float()` would raise on too.
+double ParseLoraStrength(const std::string& raw) {
+  try {
+    size_t consumed = 0;
+    const double value = std::stod(raw, &consumed);
+    if (consumed != raw.size()) throw std::invalid_argument("trailing");
+    if (!std::isfinite(value)) throw std::invalid_argument("non-finite");
+    return value;
+  } catch (const std::exception&) {
+    Fail("the extra '" + std::string(kLtx2LoraStrengthExtra) + "' is '" + raw +
+         "', which is not a finite number");
+  }
+}
+
 // The one key this family DEFINES and does not SERVE. `Ltx2DurationPredict` is
 // ported and gated as a brick (`ltx2_duration_head.h`), but nothing here
 // constructs one, so a supplied path names a file the engine never opens.
@@ -281,12 +299,13 @@ constexpr char kLtx2DurationHeadPathExtra[] = "duration_head_path";
 // they are no longer trusted: the list below is derived from this file on every
 // run and compared, and the failure prints the replacement to paste in.
 // READER ANCHORS (derived and gated by test_ltx2_video):
-// 690 745 841 857 859 929 954 1059 1100
+// 709 719 720 782 878 894 896 966 991 1096 1137
 const char* const kKnownLoadExtras[] = {
     kLtx2AudioPromptEmbedsExtra, kLtx2PipelineKindExtra,   kLtx2ModelVersionExtra,
     kLtx2AllowUnportedExtra,     kLtx2MaxPhaseExtra,       kLtx2DitConfigPathExtra,
     kLtx2PromptValidRowsExtra,   kLtx2EncoderConfigPathExtra,
     "upsampler_path",            kLtx2DurationHeadPathExtra,
+    kLtx2LoraPathExtra,          kLtx2LoraStrengthExtra,
 };
 
 // FNV-1a over the raw bytes of a float buffer — the `Ltx2ConditioningTrace`
@@ -693,6 +712,24 @@ std::unique_ptr<Ltx2VideoEngine> Ltx2VideoEngine::Load(const VideoModelParams& p
   // `Ltx2StreamDitToDevice` dequantizes and uploads ONE TENSOR AT A TIME, so peak
   // residency is the device copy plus one tensor rather than two whole models.
   dit_options.widen_to_f32 = !im.on_device;
+  // The IC-LoRA adapter, fused into the weights as they are materialized. This
+  // is the production call site for the whole `ltx2_lora.h` family: deleting it
+  // makes the adapter unreachable, which is what the reachability mutation in
+  // the row's spec §5.3 checks.
+  const std::string lora_path = VideoExtra(params.extras, kLtx2LoraPathExtra);
+  const std::string lora_strength = VideoExtra(params.extras, kLtx2LoraStrengthExtra);
+  if (lora_path.empty() && !lora_strength.empty()) {
+    Fail("'" + std::string(kLtx2LoraStrengthExtra) + "' was given without '" +
+         std::string(kLtx2LoraPathExtra) +
+         "'. A strength with no adapter fuses nothing, and silently doing nothing is what "
+         "this refusal exists to prevent.");
+  }
+  if (!lora_path.empty()) {
+    Ltx2LoraSpec spec;
+    spec.path = lora_path;
+    if (!lora_strength.empty()) spec.strength = ParseLoraStrength(lora_strength);
+    dit_options.loras.push_back(std::move(spec));
+  }
   im.dit = im.on_device ? Ltx2StreamDitToDevice(*im.queue, dit_file, dit_options)
                         : Ltx2LoadDitFromSafetensors(dit_file, dit_options);
 
@@ -1334,16 +1371,45 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
         "applied on every render. It was never what blocks a last-frame keyframe.");
   }
   if (!gen.ref_image_paths.empty() || !gen.ref_video_dir.empty()) {
+    // WHAT CHANGED, AND WHAT DID NOT. This refusal used to blame the IC-LoRA
+    // metadata: the `downscale_factor` and `temporal_scale_factor` that
+    // `Ltx2ConditionVideoByReference` needs live in the adapter's own
+    // `__metadata__` (iclora_utils.py:30-49) and nothing here read it. Row
+    // LTX25-IC-LORA (#923) closed that — supply `lora_path` and the factors are
+    // read, resolved and carried on the checkpoint — so blaming it now would be
+    // a refusal asserting something the tree no longer has.
+    //
+    // The arm is still refused, because there was a SECOND cause the old message
+    // did not name, and it is the one the LAST-FRAME refusal above already
+    // spells out in full: `VideoConditionByReferenceLatent` APPENDS tokens
+    // (reference_video_cond.py:97-100, ported at ltx2_conditioning.cpp via
+    // AppendTokens), and this phase loop is fixed at the target grid's token
+    // count — one `Ltx2VideoTokenCount(vshape, 1)` feeds the sigma schedule, the
+    // `Ltx2ModalityInput` handed to the DiT, and `Ltx2VideoUnpatchify`. Serving
+    // it means growing that sequence through the DiT and trimming it back
+    // (`clear_conditioning`, ltx_core/tools.py:88-105). That machinery is shared
+    // with the last-frame keyframe arm and is owed by its own row.
+    std::string factors = "no adapter was supplied, so none were read";
+    if (im.dit.lora_fused_tensors > 0) {
+      factors = "the supplied adapter declares downscale=" +
+                std::to_string(im.dit.lora_reference.downscale) +
+                " temporal=" + std::to_string(im.dit.lora_reference.temporal) +
+                ", fused into " + std::to_string(im.dit.lora_fused_tensors) + " tensors";
+    }
     Fail(
-        "reference-image / reference-video conditioning is not served. The encoder and the "
-        "placement are both here — `Ltx2ConditionVideoByReference` is ported and gated — but "
-        "it takes a `downscale_factor` and a `temporal_scale_factor` that must match what the "
-        "IC-LoRA was TRAINED with (conditioning/types/reference_video_cond.py:36-37, applied at "
-        ":65-77), and "
-        "upstream carries those in the LoRA's own metadata, which this project does not read. "
-        "A guessed pair places the reference plausibly and wrongly, which no output check can "
-        "see, so it is refused instead. Use first_frame_ppm / first_frame_path for "
-        "image-to-video.");
+        "reference-image / reference-video conditioning is not served. What is missing is "
+        "the TOKEN-APPEND machinery, and NOT the IC-LoRA metadata, which this engine now "
+        "reads (" + factors +
+        "). `Ltx2ConvVideoEncode` and `Ltx2ConditionVideoByReference` are both ported and "
+        "gated, and the adapter's `downscale_factor` / `temporal_scale_factor` are resolved "
+        "at load (iclora_utils.py:30-49). The gap is that "
+        "`VideoConditionByReferenceLatent.apply_to` APPENDS tokens to the sequence "
+        "(conditioning/types/reference_video_cond.py:97-100) and this phase loop is fixed at "
+        "the target grid's token count, so the appended tokens have nowhere to go and "
+        "`clear_conditioning` (ltx_core/tools.py:88-105) has nothing to trim. That is the "
+        "SAME obstruction the last-frame keyframe arm names above, and it is owed by its own "
+        "row rather than by LTX25-IC-LORA, which closed the metadata half. Use "
+        "first_frame_ppm / first_frame_path for image-to-video.");
   }
   if (!gen.ref_audio_path.empty() || !gen.ref_audio_wav.empty()) {
     Fail(
