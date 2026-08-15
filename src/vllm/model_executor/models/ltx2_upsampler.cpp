@@ -283,14 +283,14 @@ Volume PixelShuffle1d(const Volume& in, int64_t up_f) {
   return out;
 }
 
-// `x = x[:, :, 1:, :, :]` (model.py:110-112): "remove the first frame after
+// `x = x[:, :, 1:, :, :]` (model.py:111-113): "remove the first frame after
 // upsampling. This is done because the first frame encodes one pixel frame."
 // Frames go 2F -> 2F - 1, which is exactly the count the only upstream consumer
 // keeps for itself (`num_frames = 2 * (num_frames - 1) + 1`, dfr_pipeline.py:408).
 Volume DropFirstFrame(const Volume& in) {
   Require(in.frames >= 2,
           "ltx2 upsampler: the temporal arm drops the first frame after upsampling "
-          "(model/upsampler/model.py:109-112), so it needs at least 2 frames out of the "
+          "(model/upsampler/model.py:109-113), so it needs at least 2 frames out of the "
           "shuffle");
   Volume out;
   out.channels = in.channels;
@@ -499,10 +499,10 @@ Ltx2LatentVolume Ltx2LatentUpsample(const Ltx2UpsamplerConfig& config,
     }
 
     if (config.temporal_upsample) {
-      // model.py:107-112, and the branch order is upstream's: `if
-      // self.temporal_upsample` is tested BEFORE the resampler check. A full 3-D
-      // conv (not per-frame): the temporal arm's `upsampler.0` is a Conv3d
-      // (model.py:69), unlike the spatial arm's Conv2d.
+      // model.py:109-113, and the branch order is upstream's: `if
+      // self.temporal_upsample` (:109) is tested BEFORE the resampler check
+      // (:114). A full 3-D conv (not per-frame): the temporal arm's
+      // `upsampler.0` is a Conv3d (model.py:70), unlike the spatial arm's Conv2d.
       x = Conv3dPad1(x, kLtx2UpsamplerTemporalFactor * config.mid_channels,
                      weights.Get(p + "upsampler.0.weight"), weights.Get(p + "upsampler.0.bias"));
       x = PixelShuffle1d(x, kLtx2UpsamplerTemporalFactor);

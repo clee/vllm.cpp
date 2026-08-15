@@ -14,7 +14,7 @@
 //   (SpatialRationalResampler)  <-  spatial_rational_resampler.py:40-47
 //   (PixelShuffleND, dims 2)    <-  pixel_shuffle.py:40-46
 //   (PixelShuffleND, dims 1)    <-  pixel_shuffle.py:47-52
-//   (the first-frame drop)      <-  model.py:107-112
+//   (the first-frame drop)      <-  model.py:111-113
 //   (BlurDownsample)            <-  blur_downsample.py:29-53
 //   Ltx2RationalForScale        <-  spatial_rational_resampler.py:10-14
 //   Ltx2UpsampleVideoLatent     <-  model.py:129-143 (upsample_video)
@@ -23,9 +23,9 @@
 // NOTHING, today, and that is stated here rather than only in the spec because a
 // header is what the next reader opens. It is ported and gated against executed
 // upstream at reduced dimensions, and `Ltx2ParseUpsamplerConfig`
-// (ltx2_loader.cpp:1415-1428) reads `temporal_upsample` off a checkpoint. But the
+// (ltx2_loader.cpp:1431-1444) reads `temporal_upsample` off a checkpoint. But the
 // engine's ONE upsampler call site is the `kSpatialUpsample` phase input
-// transform (multimodal/ltx2_video.cpp:1224-1261), which shape-checks the result
+// transform (multimodal/ltx2_video.cpp:1408-1466), which shape-checks the result
 // against a SPATIALLY doubled latent and fails otherwise; and upstream's only
 // consumer is `DFRPipeline`'s rounds loop (ltx-pipelines/dfr_pipeline.py:235-245,
 // 402-407), which is not ported. The shipped temporal checkpoint
@@ -52,7 +52,7 @@
 //    (pixel_shuffle.py:41-47). Swapping them transposes every 2x2 block. The
 //    dims=1 arm has the same trap on one axis: `(c p1)` -> `(f p1)` puts p1
 //    FASTEST in both groupings (pixel_shuffle.py:47-52).
-//  * The temporal arm DROPS THE FIRST FRAME after the shuffle (model.py:109-112),
+//  * The temporal arm DROPS THE FIRST FRAME after the shuffle (model.py:109-113),
 //    so `f` frames in produce `2f - 1` out and not `2f`.
 //
 // ─── NOT PORTED, refused by name ─────────────────────────────────────────────

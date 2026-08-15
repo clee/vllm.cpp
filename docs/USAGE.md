@@ -433,9 +433,8 @@ latents into the token stream, and its pipeline layer (the sigma schedule, the
 diffusion steps, guidance, the latent spatial x2 upsampler, the duration head and
 the embeddings connector) are implemented and gated. The latent **temporal** x2
 upsampler is implemented and gated too, but no pipeline here drives it — see the
-`--upsampler` note below. Several limits decide what
-you can actually ask for, and each refuses by name rather than rendering
-something else.
+`--upsampler` note below. Several limits decide what you can actually ask for,
+and each refuses by name rather than rendering something else.
 
 **Image conditioning (image-to-video) runs at `image_crf=0`, and only there.**
 Pass a first frame as binary PPM (`first_frame_path` / `first_frame_ppm`) plus
@@ -592,7 +591,9 @@ It must be the **spatial** upsampler,
 class with `temporal_upsample: true` in its config and the same
 `upsampler.0.*` tensor names — so it loads and runs, and returns a latent with
 `2f - 1` frames at the ORIGINAL resolution where this phase needs the original
-frame count at double resolution. Passing it is refused by name rather than
+frame count at double resolution. It is `2f - 1` and not `2f` because that arm
+doubles the frame axis and then drops the first frame, which upstream encodes as
+a single pixel frame. Passing it is refused by name rather than
 reported as a shape mismatch. The temporal arm itself is implemented and gated
 against upstream, but **nothing drives it**: its only upstream consumer is
 `DFRPipeline`'s multi-round loop, which is not ported, so there is no flag that

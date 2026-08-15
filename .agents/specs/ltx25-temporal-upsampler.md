@@ -30,7 +30,7 @@ support:
    `temporal_upsample_rounds ∈ {0,1,2}` loop also doubles the fps, rescales the
    carried keyframe positions and re-tiles the canvas. We have no DFR pipeline.
    Our engine's one upsampler call site is the `kSpatialUpsample` phase input
-   transform (`src/vllm/multimodal/ltx2_video.cpp:1224-1261`), which shape-checks
+   transform (`src/vllm/multimodal/ltx2_video.cpp:1408-1466`), which shape-checks
    the result against a **spatially** doubled latent shape and fails otherwise.
    So after this row: **ported, loader-parsed and gated; not reachable from any
    pipeline this project ships.** §7 states this in the exact terms the records
@@ -68,7 +68,7 @@ else:
     raise ValueError("Either spatial_upsample or temporal_upsample must be True")
 ```
 
-and in `forward` (`model.py:107-112`):
+and in `forward` (`model.py:109-113`):
 
 ```python
 if self.temporal_upsample:
@@ -123,7 +123,7 @@ comment.
 
 - `PixelShuffleND(1)` — the temporal reshape/permute (`pixel_shuffle.py:47-52`).
 - The temporal-only branch of `LatentUpsampler.__init__` (`model.py:68-71`) and of
-  `forward`, including the first-frame drop (`model.py:107-112`).
+  `forward`, including the first-frame drop (`model.py:109-113`).
 - `EnumerateLtx2UpsamplerTensors` for that branch — the loader-side contract.
 - An executed-upstream golden at reduced dims, plus the shape and manifest.
 
@@ -161,7 +161,7 @@ the matching `upsampler.0.*` pair at `{2·mid, mid, 3, 3, 3}`.
 
 No new public entry point: `Ltx2LatentUpsample` and `Ltx2UpsampleVideoLatent`
 already take the config, and `Ltx2ParseUpsamplerConfig`
-(`src/vllm/model_executor/models/ltx2_loader.cpp:1415-1428`) already reads
+(`src/vllm/model_executor/models/ltx2_loader.cpp:1431-1444`) already reads
 `temporal_upsample` off the checkpoint config, mirroring
 `model_configurator.py:19`. The loader arm therefore needs no change — it needed
 none because it was ported key-for-key rather than for the one arm in scope.
@@ -200,11 +200,32 @@ environment drift.
 
 Gate: `tests/vllm/models/test_ltx2_pipeline.cpp`.
 
-- The `Temporal` arm joins `LTX2_UPS_ARM`, so it is checked on out-shape (5
-  scalars), parameter manifest (names AND element counts), and `max|diff|`
-  against the golden — a **MAX**, not a fraction of elements.
+- The `Temporal` arm gets **its own `TEST_CASE`** — "ltx2 the latent temporal
+  upsampler reproduces upstream" (`test_ltx2_pipeline.cpp:1441`) — and does
+  **not** join `LTX2_UPS_ARM` (`:1413-1422`). The macro cannot carry it, for
+  three reasons that are properties of the macro and not preferences:
+  1. It expands to `kLtx2Ups<TAG>Rational` and `kLtx2Ups<TAG>Scale`, which the
+     temporal arm has no analogue of and the generator therefore does not emit
+     — `LTX2_UPS_ARM(Temporal)` would not compile.
+  2. Its `run` lambda captures ONE latent, `ReducedUpsamplerLatent()` at
+     `F = 2`, shared by every arm; the temporal arm needs the `F = 3` fixture
+     named above, because at `F = 2` a kept first frame would not be a shape
+     failure.
+  3. Its config comes from `ReducedUpsamplerConfig(rational, scale, prefix)`,
+     which has no temporal flag, and it lives inside the case named "the latent
+     **spatial** upsampler reproduces upstream".
+
+  The separate case does everything the macro does — parameter manifest (names
+  AND element counts), all five out-shape scalars, and `max|diff|` against the
+  golden, a **MAX** and not a fraction of elements — and adds the two checks the
+  macro has no slot for: `2F - 1` asserted as a RELATION against the input
+  (`got.frames == kLtx2UpsTemporalFactor * latent.frames - 1`) and not only as a
+  golden scalar, and `kLtx2UpsamplerTemporalFactor` pinned against the factor the
+  generator read off `PixelShuffleND.__init__`'s own signature.
 - The refusal case gains the spatial+temporal arm and keeps `dims=2` and
-  "neither".
+  "neither". `dims=2` is checked a second time through the TEMPORAL config,
+  because the two arms take different branches and a `dims` guard placed inside
+  the spatial branch would let a 2-D temporal config through.
 
 **Mutations owed** (RED, restore, GREEN, with real doctest output and both the
 assertion and the case counts):
@@ -337,16 +358,46 @@ this row adds no real-weight arm to it. Nothing here claims one.
 
 ### 8.6 Counts, against the denominator
 
-| Suite | before (origin/main) | after |
-|---|---|---|
-| `test_ltx2_pipeline` | 37 cases / 2382 assertions | 38 / 2443 |
-| `test_ltx2_video` | 30 cases / 502 assertions | 30 / 505 |
+Re-measured on the merged tree at `5720d099b`, base
+`51e0cb5b15fef9dd76c9aa1727b4dbc9e59cdff2`. The first row of figures below was
+taken against a base about ninety commits older, so every denominator had moved
+under it. A changed count is a red result until it is attributed, so each delta
+names what it belongs to.
 
-Both `RUN_EXIT=0`. Full gate: `ctest -N` = **423**, `ctest -j 4` = 423/423
-passed, `CTEST_EXIT=0`, with `test_modelopt_mixed_precision_checkpoint` and
-`test_voxtral_e2e` skipped by their own guards. At `-j 8` the run reported
-`test_engine_core_proc` failed; it passes on its own and is the recorded
-parallel-starvation flake, which is why the accepted run is the `-j 4` one.
+| Suite | at this base | on this branch | this row's delta |
+|---|---|---|---|
+| `test_ltx2_pipeline` | 37 cases / 2382 assertions (older base) | 38 / 2443 | +1 case, +61 assertions |
+| `test_ltx2_video` | **33 / 576, measured at this base** | 33 / 579 | +0 cases, +3 assertions |
+
+Both `RUN_EXIT=0`.
+
+`test_ltx2_video` grew from the 30 / 502 recorded above to 33 / 576 on `main`
+while this branch was open, and none of that growth is this row's. The base
+figure is measured rather than derived: the file was replaced by the base
+version, the target rebuilt (`BUILD_EXIT=0`, zero compile errors, and a CHANGED
+binary sha256 — so the replacement really ran rather than reading as a pass), the
+suite run, and the tree restored to source sha256
+`8c676f3e2b158326e9060949cc7ffae953c2e8038fcc608d875e2e5fe652bfe3` and binary
+sha256 `dcc0192fb1cefeabbb9c2482296495c2952444da1e7cfd379d6632735f03f4eb`. This
+row's only edit to that file is one additive `SUBCASE` carrying three `CHECK`s,
+and the measurement returns exactly three. A `SUBCASE` adds no case, which is why
+the case count is flat on both sides of the row.
+
+`ctest -N` = **472**, and none of it is this row's. The 423 recorded earlier was
+`-N` at the older base. This branch changes no build file at all — the diff of
+`CMakeLists.txt`, `tests/CMakeLists.txt` and `examples/CMakeLists.txt` against
+the base is empty — so it registers no binary and its `-N` is the base's by
+construction.
+
+Full gate on the merged tree: `ctest -j 4` = **472/472 passed, 0 failed**,
+`CTEST_EXIT=0`, 766 s, with `test_modelopt_mixed_precision_checkpoint` and
+`test_voxtral_e2e` skipped by their own guards and nothing else skipped. The
+`-j 8` starvation flake recorded above did not need re-running serially, because
+nothing failed at `-j 4`. The run was taken on a heavily contended host — one
+minute load average between 8 and 64 across it — and still returned zero
+failures, which makes the green stronger than a quiet-box green rather than
+weaker. Disk 81 GB free after the build; the build log contains no
+`No space left` and no `BFD assertion`, over 2614 lines of real output.
 
 ### 8.7 What was NOT done, and why
 

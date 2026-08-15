@@ -1440,7 +1440,8 @@ TEST_CASE("ltx2 the latent spatial upsampler reproduces upstream") {
 
 TEST_CASE("ltx2 the latent temporal upsampler reproduces upstream") {
   // model.py:68-71 builds `Conv3d(mid, 2*mid, k=3, p=1)` + `PixelShuffleND(1)`,
-  // and :107-112 drops the first frame after it. Everything else in the class is
+  // and :113 drops the first frame after it (:109-113 is the whole branch).
+  // Everything else in the class is
   // the same module set the three spatial arms above already gate, so this case
   // is aimed at exactly two things: the temporal shuffle and the slice.
   const vllm::Ltx2UpsamplerConfig config = TemporalUpsamplerConfig("ltx2.ups.Temporal.");

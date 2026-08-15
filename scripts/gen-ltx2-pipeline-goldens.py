@@ -1036,7 +1036,7 @@ _UPS_F, _UPS_H, _UPS_W = 2, 4, 6
 # frame axis carry information the other two axes cannot supply: it differs from
 # H (4) and W (6), so an axis mix-up is a SHAPE failure rather than a value one,
 # and `2F - 1 = 5` differs from `2F = 6`, so the dropped first frame
-# (model.py:109-112) is visible in the shape as well as in the values.
+# (model.py:113) is visible in the shape as well as in the values.
 _UPS_TEMPORAL_F = 3
 
 
@@ -1127,7 +1127,7 @@ def section_upsampler(out) -> None:
         blur = BlurDownsample(dims=2, stride=2, kernel_size=size)
         emit_f32(out, f"kLtx2UpsBlurKernel{size}", blur.kernel.numpy())
 
-    # ---- the TEMPORAL x2 arm (model.py:68-71, 107-112) --------------------
+    # ---- the TEMPORAL x2 arm (model.py:68-71, 109-113) --------------------
     #
     # `spatial_upsample=False, temporal_upsample=True` selects
     # `Conv3d(mid, 2*mid, k=3, p=1)` + `PixelShuffleND(1)`, and then `forward`

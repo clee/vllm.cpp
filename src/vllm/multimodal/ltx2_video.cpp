@@ -1435,7 +1435,7 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
              "' needs the latent SPATIAL x2 upsampler, but the checkpoint at 'upsampler_path' "
              "declares temporal_upsample=true, i.e. it is the TEMPORAL x2 upsampler. That arm "
              "upsamples the frame axis and drops the first frame "
-             "(model/upsampler/model.py:68-71, 109-112); no phase of any recipe this engine "
+             "(model/upsampler/model.py:68-71, 109-113); no phase of any recipe this engine "
              "serves consumes it, because its only upstream consumer is DFRPipeline's rounds "
              "loop, which is not ported. Supply the spatial upsampler "
              "('ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors').");
