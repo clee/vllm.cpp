@@ -121,6 +121,104 @@ itself a defect.
 - Do not claim `Qwen/Qwen3.8-2.4T-A95B` runs. This row makes the architecture
   loadable and proves it at 35B; the 2.4T remains unrunnable on size alone.
 
+## Outcome
+
+**All four arms landed, selected by tensor presence, and the CPU gate is
+green.** `LoadQwen3_5Moe` now resolves the GDN tower, the attention tower, the
+shared expert and `lm_head` ONCE per checkpoint from the shard index, through
+`ResolveQwen3_5MoeTowerDtypes` / `ClassifyQwen3_5Projection`, and threads the
+decision the way #740 threads the routed-expert layout. `DenseNativeEnabled()`
+was not touched.
+
+### What was measured
+
+- RED captured per component on the base commit `b4220cf45`, each failing for
+  its own reason: `expected F8_E4M3 for ...self_attn.q_proj.weight`,
+  `expected F8_E4M3 for ...linear_attn.in_proj_qkv.weight`,
+  `expected U8 for ...mlp.shared_expert.gate_proj.weight`, and
+  `an unquantized lm_head is not implemented ...`.
+- `test_qwen3_8_text_only` went 11 cases / 37,118 assertions to 18 cases /
+  67,816 assertions, Status SUCCESS.
+- The PUBLISHED `Qwen/Qwen3.6-35B-A3B` (1045 tensors) and
+  `Qwen/Qwen3.8-2.4T-A95B` (1609 tensors) manifests now satisfy the load plan
+  COMPLETELY — `missing` and `mismatched` both empty, where before this row both
+  were required to be non-empty. All four components resolve BF16 from the real
+  manifests' own dtypes, and neither repo carries a `weight_scale`,
+  `input_scale` or `scale_inv` tensor anywhere.
+
+### What was rejected, and why
+
+**One decision for the whole checkpoint.** §Tests asks for "a checkpoint
+quantized in some components and bf16 in others" to be refused. It is NOT, and
+deliberately: `nvidia/Qwen3.6-27B-NVFP4` is `modelopt_mixed` — an FP8 attention
+tower beside an NVFP4 MLP and a BF16 GDN in-projection — and the dense arm reads
+it by asking per projection. Refusing a cross-component mix would diverge from
+the dense ladder this row's own §Stop-conditions require it to mirror, and would
+refuse a checkpoint that already loads through the sibling loader. So the four
+components are four INDEPENDENT decisions, and what is refused is a component
+that disagrees with ITSELF — layer 0's `q_proj` BF16 beside layer 4's F8_E4M3 —
+naming both projections and both dtypes. That is the failure the once-per-
+checkpoint discipline exists to prevent; a cross-component mix is not.
+
+**Reuse of the dense classifier by call rather than by mirror.**
+`IsNvfp4Projection` lives in `qwen3_5_dense_weights.cpp`'s anonymous namespace
+and that file was outside this task's authority, so `ClassifyQwen3_5Projection`
+mirrors the ladder instead and a test BINDS the two behaviorally: the same
+synthetic projection is loaded through the production dense loader and the slot
+it filled is compared against what the classifier says, for BF16, FP8 and
+ModelOpt NVFP4. Comparing the classifier with itself would prove nothing.
+Routing the dense arm's own ladder through the shared function is owed and needs
+its own row.
+
+**Why the head is not `LoadDenseLmHead`.** That entry point applies
+`DenseLmHeadFp4Enabled()`, sets `keep_dequant_b`, and zeroes `alpha`; adopting it
+would change the NVFP4 head behavior of three gated rows. The NVFP4 arm stays
+`LoadNvfp4Raw` byte-unchanged and the bf16 arm is `LoadBf16Transposed`.
+
+### One defect found and fixed in flow
+
+The plan-deletion sweep showed that removing an NVFP4 projection's
+`weight_scale_2` made the classifier fall through to BF16 and report
+`expected BF16 for lm_head.weight` — the exact shape of complaint #490 exists to
+stop, because it reads as a corrupt checkpoint rather than an absent tensor. The
+DENSE arm has the same hole. `ClassifyQwen3_5Projection` now refuses a `.weight`
+that is neither BF16 nor absent, naming the missing `weight_scale_2` /
+`weight_packed` / `weight_scale` companion. No well-formed projection changes
+answer.
+
+### What the CPU evidence does NOT establish
+
+No token, no throughput, no memory headroom, and no weight byte of a real
+checkpoint. Every failure mode of these four arms except a missing tensor — a
+wrong dtype path, a missing dequant, a transpose that loads cleanly — produces
+WRONG LOGITS rather than an error. Only the binding token-exact gate closes
+those, and a green suite must not be read as correctness.
+
 ## Now
 
-Row is `READY`. Spec committed; implementation not started.
+Row lifecycle is still recorded as `READY` above, deliberately, for the same
+reason [`moe-bf16-stacked-experts.md`](moe-bf16-stacked-experts.md) records its
+own: **a lifecycle move owes `docs/STATUS.md`, `docs/BENCHMARKS.md` and the
+`.agents/roadmap_v1.md` row in the same change**, and the implementer's
+authority covered `qwen3_5_weights.{h,cpp}`, `tests/`, this spec and the
+`docs/FEATURES.md` / `docs/USAGE.md` feature surfaces only. Recording `ACTIVE`
+here without the projections would leave them disagreeing with the spec.
+
+Phases 1-3 landed on `row/MOE-BF16-TOWER-ARMS`: all four arms implemented and
+selected by tensor presence, RED captured per component on the base commit,
+per-arm byte-exact assertions, the self-disagreement refusal, the behavioral
+probe-agreement binding against the dense loader, and a clean `-Werror` CPU
+build with the full serial suite at 476/476.
+
+**Owed, and needing the GB10:** the binding token-exact greedy gate on
+`Qwen/Qwen3.6-35B-A3B` bf16 against the pinned oracle, and the SACRED
+27B / 35B / Coder re-run with byte-identical goldens. The checkpoint IS staged
+and verified at `$CHECKPOINT_ROOT/qwen3.6-35b-a3b-bf16`, revision
+`995ad96eacd98c81ed38be0c5b274b04031597b0` — the same revision the committed
+shape manifest pins — with all 26 shard sha256 digests recomputed against the
+Hugging Face download metadata and the summed tensor bytes equal to the index's
+declared `71,903,645,408`. It did not run in this session because `dgx.casa`
+was carrying another campaign at the time (an `ltx2-gen` render, 78 GiB of 119
+GiB resident); 71.9 GB of bf16 weights is ~2x the fp8 footprint and a global
+kernel OOM on that box has already killed an unrelated process, so the run was
+reported rather than stacked.
