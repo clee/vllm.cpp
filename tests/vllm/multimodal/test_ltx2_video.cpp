@@ -3033,6 +3033,36 @@ TEST_CASE("ltx2 video: every audio-input mismatch is refused BY WHAT IS WRONG") 
     CHECK(message.find("a2vid_two_stage.py:202") != std::string::npos);
   }
 
+  SUBCASE("the take is measured against the checkpoint's OWN FFT size") {
+    // This case exists to make `stft.filter_length` observable, and it took a
+    // surviving mutation to find out that nothing else can. MEASURED: reading
+    // `stft.n_fft` — the name torchaudio uses, the name a reader writes from
+    // memory, and NOT upstream's key — instead of `stft.filter_length` passed
+    // the focused gate at 3 cases / 95 assertions with the decoy already in the
+    // fixture. The decoy is necessary and it is not sufficient.
+    //
+    // The reason is worth writing down: the FFT size moves the mel VALUES and
+    // not the frame count, because `frames = 1 + (samples + 2 * (n_fft / 2) -
+    // n_fft) / hop` and the pad cancels the window exactly. Every other audio
+    // assertion in this file is DIFFERENTIAL — one render against another — so a
+    // wrong FFT size moves both sides together and nothing notices.
+    //
+    // What it does change is which takes are decodable at all. `center=True`
+    // reflect-pads by `n_fft / 2` and torch.stft requires the waveform to be
+    // longer than that pad. 360 samples sits BETWEEN the two half-windows: it is
+    // longer than the fixture's declared 512/2 and shorter than the decoy's
+    // 1024/2. So a build reading the decoy refuses this take at the mel front
+    // end, where the correct one carries it through to the clip-length check —
+    // and THAT difference is the assertion.
+    const std::string wav = WriteWav(ws.root + "/hairline.wav", 2, kFixtureAudioRate, 0.015);
+    const std::string message = refusal("hairline", just_path, wav);
+    INFO("refusal: " << message);
+    // It reached the LENGTH check, which means the mel front-end accepted it.
+    CHECK(message.find("tools.py:253-255") != std::string::npos);
+    // And it did NOT stop at the front end's own reflect-pad constraint.
+    CHECK(message.find("center=True") == std::string::npos);
+  }
+
   SUBCASE("a file that is not RIFF/WAVE") {
     const std::string path = ws.root + "/not.wav";
     {
