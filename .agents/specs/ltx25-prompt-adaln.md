@@ -32,13 +32,23 @@ and `:573` / `:626` do the same on the two manifest paths. The flag defaults
   default, and `model_configurator.py:76` / `:138` read it as
   `config.get("use_prompt_adaln_single", True)`
 
-The shipped FP8 DiT carries the 18 tensors the flag builds (12
-`prompt_adaln_single.*`, 6 `audio_prompt_adaln_single.*`; see
-`tests/vllm/models/ltx2_fp8_dit_manifest.inc:232-240,286-294`), so the flag is
-TRUE for the checkpoint this campaign renders. `ltx2.cpp:274-276` refuses those
-tensors by name, so a real render needs `allow_unported_modules=1`
-(`src/vllm/multimodal/ltx2_video.cpp:617`) — which reaches the loader lines above
+The shipped FP8 DiT carries the 18 tensors the flag builds — **9
+`audio_prompt_adaln_single.*` at
+`tests/vllm/models/ltx2_fp8_dit_manifest.inc:232-240` and 9
+`prompt_adaln_single.*` at `:286-294`**, each stream contributing 6 parameters
+(`linear_1`, `linear_2`, `linear`, weight and bias) plus the 3 `F32`
+`weight_scale` entries the FP8 file carries beside them. So the flag is TRUE for
+the checkpoint this campaign renders. `ltx2.cpp:274-276 @ baa92ccf7` refuses
+those tensors by name, so a real render needs `allow_unported_modules=1`
+(`src/vllm/multimodal/ltx2_video.cpp:660`) — which reaches the loader lines above
 and **silently clears the flag**.
+
+(The split read `12` / `6` until 2026-08-15. It is `9` / `9`: `grep -c` over the
+two families in that file returns 9 apiece, and the two cited spans are nine
+lines each. The TOTAL of 18 was always right, and so was every conclusion drawn
+from it; the breakdown was not. Corrected here because the anchor beside it was
+being re-derived anyway, and a citation whose own span contradicts the sentence
+that carries it is the defect this repair exists to remove.)
 
 Net effect: every render drops the timestep-conditioned half of the prompt K/V
 modulation, keeping only the static `prompt_scale_shift_table`. Nothing observes
@@ -73,8 +83,8 @@ not `adaln_embedding_coefficient()` — shift and scale for the K/V only.
 diffusers twin: `transformer_ltx2.py:1255-1259`, `num_mod_params=2`.
 
 Registration order inside `_init_video` puts it between `adaln_single` and
-`proj_out`, which is where `EnumerateLtx2DitTensors` already reserves its slot
-(the `VT_CHECK` at `ltx2.cpp:274-276`).
+`proj_out`, which is where `EnumerateLtx2DitTensors` already reserved its slot
+(the `VT_CHECK` at `ltx2.cpp:274-276 @ baa92ccf7`).
 
 ### 1.2 The producer
 
@@ -145,7 +155,7 @@ Layout consequence: the flat `[B, 1, 2 * dim]` row is read as `[2, dim]` with
    (`ltx2_dit.cpp`) and device (`ltx2_device.cpp`) paths.
 4. The three loader `= false` assignments are deleted, and replaced by a guard
    (§3.2) that makes a future silent clear impossible.
-5. The `ltx2.cpp:274-276` refusal is deleted for these two families.
+5. The `ltx2.cpp:274-276 @ baa92ccf7` refusal is deleted for these two families.
 6. Goldens executed from upstream at reduced dims, with a mutation proving the
    new term is load-bearing, and a measured magnitude.
 
@@ -435,9 +445,16 @@ re-checking its md5 (`03324d42…`, identical before and after):
 **What `30 / 502` does and does not say (corrected 2026-08-13).** The
 shipped-checkpoint case `ltx2 video: the SHIPPED Lightricks checkpoints parse and
 load` is env-gated: with `LTX2_CHECKPOINT_ROOT` unset it prints
-`SKIPPED` and returns at `test_ltx2_video.cpp:1316-1319`, so `30 / 502` means the
+`SKIPPED` and returns at `test_ltx2_video.cpp:1620-1625`, so `30 / 502` means the
 whole real-header case DID NOT RUN — not "it ran and no assertion counted the
-module". With the variable pointing at the Lightricks tree the same binary
+module". (The span starts on the `TEST_CASE` line deliberately. The four gate
+lines alone are **not unique** — `ltx2 video: the SHIPPED Lightricks VAEs and
+upsampler load` carries a byte-identical `LTX2_CHECKPOINT_ROOT` gate at
+`:1757-1760` — so an anchor on the gate alone names two places and identifies
+neither. That ambiguity was already there when the anchor read `:1316-1319`;
+widening by one line to the case name, which occurs exactly once, is what makes
+the citation resolvable.) With the variable pointing at the Lightricks tree the
+same binary
 measures **30 cases / 8734 assertions**, both before and after this repair
 (re-measured on this branch, exit 0 in both configurations). Any future quote of
 this suite's count owes the configuration alongside it.
@@ -520,7 +537,7 @@ the opt-in — is retired. Current disposition:
 does not carry the parameter"* about `keyframes_abs_pos_embedding`. It is FALSE —
 the same class of claim as the `use_prompt_adaln_single=false` assertion this row
 exists to remove — and the tree already contradicted it twice
-(`.agents/model-matrix.md`, `tests/vllm/multimodal/test_ltx2_video.cpp:1302-1303`).
+(`.agents/model-matrix.md`, `tests/vllm/multimodal/test_ltx2_video.cpp:1608-1609`).
 Read straight off both files' headers, and run through upstream's own loader and
 configurator:
 
@@ -726,8 +743,8 @@ from a production entry point on its DEFAULT configuration, and the chain is
 1. `include/vllm.h:962` — `vllm_video_generate`, the shipped C ABI entry point.
 2. `src/capi/vllm_c.cpp:1646` — that entry point calls `VideoEngine::Generate` on
    the registry-detected engine.
-3. `src/vllm/multimodal/ltx2_video.cpp:1063` — `Ltx2VideoEngine::Generate`.
-4. `src/vllm/multimodal/ltx2_video.cpp:1730` and `:1732` — the denoise loop calls
+3. `src/vllm/multimodal/ltx2_video.cpp:1106` — `Ltx2VideoEngine::Generate`.
+4. `src/vllm/multimodal/ltx2_video.cpp:1784` and `:1786` — the denoise loop calls
    `Ltx2DitForwardDevice` or `Ltx2DitForward`. Both arms carry the term.
 5. `src/vllm/model_executor/models/ltx2_dit.cpp:785` (host) and
    `ltx2_device.cpp:1152` (device) — `prompt_adaln = params.cross_attention_adaln
@@ -741,14 +758,59 @@ from a production entry point on its DEFAULT configuration, and the chain is
    streams.
 
 The loader half is reached the same way: `Ltx2VideoEngine::Load`
-(`src/vllm/multimodal/ltx2_video.cpp:533`) calls `Ltx2LoadDitFromSafetensors` at
-`:624`, so §3.2's guard runs for every real checkpoint. Both shipped DiTs take
+(`src/vllm/multimodal/ltx2_video.cpp:575`) calls `Ltx2LoadDitFromSafetensors` at
+`:667`, so §3.2's guard runs for every real checkpoint. Both shipped DiTs take
 that path with NO opt-in as of #658.
 
 Every anchor above was re-derived at this merge commit and asserted UNIQUE — the
 quoted text matches exactly once in its file — against a positive control that
 reports `STALE` on a deliberately wrong line. `git grep` alone would not have
 answered this; the chain was followed by hand.
+
+**All seven `ltx2_video.cpp` / `test_ltx2_video.cpp` anchors in this section
+MOVED under the 2026-08-15 merge of `origin/main`, and the numbers above are the
+POST-merge ones.** `0785cfc4d` (#882) added 70 lines to `ltx2_video.cpp` and 306
+to `test_ltx2_video.cpp`, ahead of every anchor here: `:1063 → :1106`,
+`:1730/:1732 → :1784/:1786`, `:533 → :575`, `:624 → :667`, and in the test
+`:1316-1319 → :1622-1625`, `:1302-1303 → :1608-1609`. Each was CORRECT at
+`00613767d` and each was WRONG the moment the merge landed, which is the point:
+a re-derivation is only true of the tree it ran on, and the merge is part of
+landing. They were caught by comparing each span's TEXT against the claim beside
+it. A checker that reads the span out of the file and then looks for that span
+in the same file is a tautology — it returns unique-and-at-the-cited-line for
+every anchor, including the ones now pointing at unrelated code. The expected
+text has to come from the CLAIM.
+
+### Every repo-local citation in this file, re-derived (2026-08-15)
+
+Not only this section's. **33 repo-local citations** were re-derived at the
+merge commit that lands: 27 live (25 full-form plus the `:1786`, `:140` and
+`:667` bare continuations), 4 SHA-anchored occurrences into `baa92ccf7`
+(`ltx2_loader.cpp:988` once, `ltx2.cpp:274-276` three times) and 2 bare
+continuations of the SHA-anchored loader claim (`:573`, `:626`). All 33 FRESH.
+
+The rule applied: the expected text is taken from the CLAIM, then required to
+occur exactly once in the cited file at the cited revision, beginning on the
+cited line. Two consequences worth stating, because each is a finding rather
+than a formality:
+
+- `ltx2_loader.cpp:573` and `:626` are the one citation whose text is
+  DELIBERATELY not unique — both lines read
+  `out.params.use_prompt_adaln_single = false;`, which is exactly what §0 claims
+  ("`:573` / `:626` do the same"). Uniqueness is asserted as "exactly these two
+  lines", not "exactly one".
+- The env-gate anchor was widened from the four gate lines to `:1620-1625` so
+  that it resolves at all; see the note in `### The gate`.
+
+The check is armed, not decorative: shifting four anchors by one line
+(`ltx2_video.cpp:660`, `:1106`, `ltx2.h:133`, `ltx2.cpp:274-276`) takes it to
+6 STALE of 33 — six because the `ltx2.cpp` anchor is cited three times, which is
+also why SHA-anchoring it once fixed three sentences.
+
+Upstream citations (`model.py`, `transformer_args.py`, `transformer.py`,
+`adaln.py`, `transformer_ltx2.py`, and the rest) are NOT covered by that run.
+They are pinned to `fd4ded7f` / `3a2f35d4` and audited separately under
+[#794](https://github.com/mudler/vllm.cpp/issues/794).
 
 **The second half of the rule is NOT satisfied, and the mutation says so.** The
 rule also requires that the smallest failing test ENTER through that entry point.
@@ -788,6 +850,22 @@ production load path and observes the guard.
   `test_ltx2_video` green at 37 of 37. That is the second half of `AGENTS.md`
   `## Nothing lands dead`, whose rule and guide post-date this row (`8f49ac3be`,
   #886). Closing it needs an ABI-level value oracle designed red-first.
+- [#911](https://github.com/mudler/vllm.cpp/issues/911) — this spec is the worked
+  example for a class, not an outlier. It shipped EIGHT stale repo-local anchors
+  across two repair commits (`7a6165dab`, `00613767d`), every one introduced by
+  the row's own commits and moved by its own `020381676` and by `98f8e046d`
+  (#658), and then SEVEN more that were correct at `00613767d` and wrong at the
+  merge of `origin/main` in this commit. Spec BODIES are checked by nothing:
+  `check-agent-record.py`'s `MATRIX_PATHS` (`:521`, `:529-530`) covers the five
+  matrices, `feature-matrix.md` and `specs/model-family-inventory.md`, so 4772
+  line-carrying citations across 315 `.agents/specs/*.md` are unexamined. The
+  rule the issue asks for is one sentence — an anchor into a file the row is
+  editing is stale until re-derived at the tree that LANDS, merge included — and
+  the two dispositions are already in use here unwritten: `path:NN @ <sha>` for a
+  historical claim, claim-sourced uniqueness re-derivation for a live one. Filed
+  rather than fixed: a repo-wide sweep and a checker change each need their own
+  spec and red-before evidence, and #632's `ENG-RECORD-ANCHOR-RATCHET` is the row
+  that should absorb it.
 
 ## Now
 
