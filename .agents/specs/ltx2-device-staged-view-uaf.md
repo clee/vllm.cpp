@@ -146,13 +146,42 @@ The mutation compiled, applied to exactly one line, and the named case failed.
 The tree was restored byte-for-byte afterwards (`git diff --stat` shows only the
 test file).
 
+### The full-suite sweep, and the run of it that had to be thrown away
+
+`ctest --test-dir build-sanitize` over all 484 tests: **483 passed, 2 skipped**
+(`test_modelopt_mixed_precision_checkpoint`, `test_voxtral_e2e`), and
+`test_ltx2_device` reported `***Failed`.
+
+**That failure was an artefact of this session's own instrument, not a defect.**
+Its output is the mutation's signature to the digit — `16 passed | 2 failed`,
+`528` assertions, the same two `CHECK`s — because the mutant was still linked
+in. The mutated source had been restored with `cp`/`mv`, which gave the restored
+file an **mtime older than the object built from the mutant**, so `ninja` judged
+it up to date, exited 0 having compiled nothing, and left the mutation in
+`libvllm.a`. `git diff` on the source was empty the whole time; only
+`stat` disagreed — the object was 24 s newer than the source it came from.
+
+Corrected by `touch`ing the source, rebuilding (399 translation units, including
+`ltx2_device.cpp.o`), and rerunning the affected family. `ctest -R 'ltx2|
+diffusion'`: **10 of 10 passed, 0 failed**, `test_ltx2_device` among them.
+
+Only `ltx2_device.cpp` carried the mutation, and the sole other translation unit
+that reaches it is `src/vllm/multimodal/ltx2_video.cpp`; both are covered by
+those 10. The other 479 results stand.
+
+Recorded here because a build that compiles nothing and exits 0 defeats every
+ordinary discriminator for a stale binary, and because the sweep is the only
+thing in §5 that was mitigating the risk of a second finding hiding behind the
+abort.
+
 ## 5. Risks
 
 **Low.** One test-local lifetime change; no production file is touched, so no
 shipped behaviour can move. The residual risk is that another sanitizer red
 hides behind this abort — ASan stops the process at the first report, so the
-rest of the binary's cases never ran in the RED. Mitigated by running the full
-`build-sanitize` ctest suite, not just this target.
+rest of the binary's cases never ran in the RED. §4 discharges it: the full
+`build-sanitize` suite is green apart from the two skips, and the 18 cases of
+`test_ltx2_device` itself now run to completion rather than stopping at case 15.
 
 ## 6. Rejected alternatives
 
