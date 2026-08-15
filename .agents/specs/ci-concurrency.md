@@ -194,7 +194,12 @@ with a strict loader, because no `safe_load`-based assertion ever can.
   the artifact that proves the PR lane holds no release, upload, write-token or
   OIDC authority (#117). The schema admits no extra key, so `needs:` is
   rejected, and it fixes the `if:` string, so a closed-action clause is
-  rejected. There is no third mechanism. #865 added the clause anyway and left
+  rejected. No third mechanism reaches these two jobs *while the schema stands
+  as written* -- which is the whole cost, and not an impossibility: the literal
+  is pinned in exactly seven places (`scripts/check-release-workflow.py:178` and
+  `tests/scripts/test_release_pipeline.py:278,316,332,338,637,651`), and
+  advancing all seven would NARROW the condition while leaving `validate_pr_ci`'s
+  whole-mapping equality exactly as strong. #865 added the clause anyway and left
   that checker and `test_release_pipeline.py` red; #873 restores the schema,
   because a pinned authority proof outranks a cost optimisation. The residual is
   two Windows runners started per closed pull request, which is still less than

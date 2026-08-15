@@ -1068,13 +1068,70 @@ class ConcurrencySemanticsTests(unittest.TestCase):
     # two Windows runners started per closed pull request -- is #874.
     UNGUARDABLE_JOBS = ("windows-msvc-cpu", "windows-msvc-vulkan")
 
+    def test_every_unguardable_job_is_one_the_pinned_schema_owns(self) -> None:
+        """The list above is an ALLOWLIST, and prose is not a ratchet.
+
+        The exemption is justified by one mechanical fact: `validate_pr_ci`
+        compares these jobs' WHOLE mapping against a literal, so neither
+        `needs:` nor a closed clause can be added to them. Assert that fact
+        rather than the two names, and a job can only be exempted by actually
+        being in that schema. Without this, appending a name to the tuple
+        exempts any job at all and every gate stays green -- measured.
+
+        `contracts` is a local inside the checker, so this PARSES the checker
+        instead of importing it. Exposing it would mean editing `scripts/`,
+        and the whole subject of this row is that a test may not reshape the
+        thing it pins in order to pin it.
+        """
+        import ast
+
+        checker = ROOT / "scripts/check-release-workflow.py"
+        pinned = {
+            entry.elts[0].value
+            for function in ast.walk(ast.parse(checker.read_text(encoding="utf-8")))
+            if isinstance(function, ast.FunctionDef)
+            and function.name == "validate_pr_ci"
+            for node in ast.walk(function)
+            if isinstance(node, ast.Assign)
+            and any(getattr(t, "id", None) == "contracts" for t in node.targets)
+            for entry in node.value.elts
+        }
+        self.assertTrue(
+            pinned,
+            f"no `contracts` tuple found in {checker.name}::validate_pr_ci; the "
+            "exemption below cannot be justified against a schema this cannot read",
+        )
+        self.assertLessEqual(
+            set(self.UNGUARDABLE_JOBS), pinned,
+            "UNGUARDABLE_JOBS may only name jobs whose whole mapping is pinned "
+            f"byte-for-byte by validate_pr_ci (it pins {sorted(pinned)}); every "
+            "other job can carry the closed guard and must (#874)",
+        )
+
+    # GitHub skips a job whose `needs:` dependency was skipped -- UNLESS the
+    # job's own `if:` calls a status check function. `always()` is not the only
+    # one: `!cancelled()`, `failure()` and `success() || failure()` resurrect a
+    # dependent exactly the same way, and a `documentation-checkpoint` written
+    # as `${{ !cancelled() && (...) }}` with no closed clause at all passed
+    # every gate before this landed.
+    #
+    # So this permits a SHAPE instead of forbidding four names: a job leaning on
+    # the transitive form may carry no expression call at all. Everything that
+    # defeats skip propagation is a call, which makes this a superset of
+    # `success` / `failure` / `cancelled` / `always` and keeps it correct if
+    # GitHub ever adds a fifth. It fails CLOSED -- a harmless `contains(...)` is
+    # refused too -- and the answer to that is to carry the closed clause
+    # directly, which every job but the two pinned Windows proofs can do.
+    _CALLS_AN_EXPRESSION_FUNCTION = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\s*\(")
+
     def _skipped_on_a_closed_pull_request(self, name: str, seen: frozenset) -> bool:
         """A job executes no gate on a closed PR if it says so itself, or if it
         `needs:` a job that does -- a skipped dependency skips its dependents.
 
-        `always()` is the one thing that breaks the transitive form: it runs the
-        job even when a dependency was skipped. A job leaning on `needs:` must
-        therefore not carry it, and this returns False when it does.
+        The transitive form is only load-bearing while the dependent's own `if:`
+        cannot override the skip. A status check function is exactly what
+        overrides it, so a job leaning on `needs:` must call no function at all,
+        and this returns False when it does.
         """
         if name in seen:
             return False
@@ -1082,7 +1139,7 @@ class ConcurrencySemanticsTests(unittest.TestCase):
         condition = str(job.get("if", ""))
         if "closed" in condition:
             return True
-        if "always()" in condition:
+        if self._CALLS_AN_EXPRESSION_FUNCTION.search(condition):
             return False
         needs = job.get("needs") or []
         if isinstance(needs, str):

@@ -102,6 +102,14 @@ jobs:
     # lane, so a closed pull request skips it and skips this job with it, while
     # push, pull_request and the baseline lane all still run it. That is also
     # why `always()` must NOT come back here: it would defeat the skip.
+    #
+    # The asymmetry that buys is deliberate but real: without `always()` the
+    # implicit `success()` couples this job to `last-gated-commit` SUCCEEDING,
+    # not merely running, while `documentation-checkpoint` and
+    # `commit-protocol-tag` on the same `needs:` keep `always()` and run
+    # regardless. A failure in the sha resolver therefore silences this job's
+    # checkers rather than reding them -- which is why that job does nothing but
+    # resolve a string and falls back instead of failing.
     needs: [last-gated-commit]
     runs-on: ubuntu-latest
     steps:
