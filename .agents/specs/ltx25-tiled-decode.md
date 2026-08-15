@@ -320,8 +320,9 @@ trustworthy — and the full-size run confirms it in `## Outcome`.
 ## Now
 
 `DONE` — the mechanism is ported, gated against executed upstream, and routed through the
-pipeline. The FAIL review of PR #656 is answered in `## Outcome`; both blocking findings
-are closed with reproduced RED/GREEN evidence. Three axes stay open and are named there:
+pipeline. The FAIL review of PR #656 and the records FAIL review of PR #746 are both
+answered in `## Outcome`; every blocking finding is closed with reproduced RED/GREEN
+evidence. Three axes stay open and are named there:
 the 60 GiB is **not** attributed (it is not in the decode), the reference decoder's
 ~30 CPU-minute 448x256/25f decode is a separate newly measured problem, and a tiled
 decode over a NOISE-DRAWING config has no gate.
@@ -445,7 +446,36 @@ fail.
 
 ### The gate
 
-**The `ctest -N` denominator is 456 at this head, and it was never 416.** 416 was the
+**Re-measured on the merged head. The `ctest -N` denominator is 473 here and 472 on main
+@ `51e0cb5b1`**, measured with the same command in the same tree: `test_ltx2_tiling` is
+`Test #72` in this listing and absent from main's, `git diff <pinned main> --
+tests/CMakeLists.txt` is exactly `+7` lines (that one registration) with no target added
+or removed anywhere else, and `grep -c '^vllm_cpp_add_test('` goes **447 on main to 448
+here**. Main's side was measured by configuring main's own two `CMakeLists.txt` files into
+a scratch build directory, which was deleted; both files were restored and verified by
+`sha256sum`, not by `git status`. Build: clean `rm -rf build` + reconfigure +
+`ninja -C build`, `BUILD_EXIT=0` captured separately, `[1403/1403]` reached and `ninja -n`
+reporting "no work to do", `No space left|BFD assertion` count **0** against a positive
+control of **942** `Building CXX` lines in the same log, `warning:` count **0**,
+`df -h /` 95G free (78%), `uptime` load average 51.6 at build end. Focused, with counts:
+`test_ltx2_tiling` **10 / 915**, `test_ltx2_vae` **36 / 3039**, `test_ltx2_video`
+**34 / 747**, `test_ltx2_pipeline` **37 / 2382**. `test_ltx2_video`'s move from 32 / 684
+is MAIN's: `grep -c '^TEST_CASE('` is 33 on main and 34 here, and the diff against main
+adds exactly one `TEST_CASE` and removes none. Full: **472 passed / 1 failed out of 473**,
+344.70 s, `ctest` exit **8**, with 473 lines matching `^ *[0-9]+/473 Test`. The one failure
+is `test_serve_low_tools`, `-j` starvation under load average 90-133 with several agents
+on the shared box: it PASSES serially in 23.54 s, exit 0. `test_op_parity` is GREEN here
+(`Test #422 ... Passed 1.04 sec`), which is F-C above. The equivalence probe was rebuilt
+from `build/libvllm.a` on this head by its recorded recipe and re-run against the
+checkpoint asserted by `sha256`; it reproduces `max|diff| = 0.050304323434829712`,
+`962983 / 995328`, `|out|max = 0.75126725435256958`, `ratio = 6.6959%`, and the labelled
+flat-append diagnostic `0.71614238619804382`, `985849 / 995328`, on the same run. The
+build directory was deleted immediately after the gate.
+
+The rest of this section records the gate at the PRE-MERGE head `70fddfa32` and is kept
+because each recorded denominator describes only the head it was taken on.
+
+**The `ctest -N` denominator is 456 at the pre-merge head, and it was never 416.** 416 was the
 ninja edge count of `ninja test_ltx2_tiling test_ltx2_vae test_ltx2_video`, whose last
 line is `[416/416] Linking CXX executable tests/test_ltx2_video` — a build number read as
 a test number, so "full ctest 416/416" described a run that never happened at that
@@ -711,6 +741,92 @@ Where the frames axis actually splits, upstream's own tiled decode differs from 
 `forward` by `kLtx2TileDecCausalUpstreamTiledVsUntiled = 2.13274002` against an
 `OutputSpan` of `2.31735897` (non-causal: 2.07932711 against 2.14835119). The sentence is
 now bounded to the controls and names those constants.
+
+### The records review of PR #746 — FAIL on records, and what closed each finding
+
+The engineering was verified independently a second time and is not re-opened. Both
+blocking findings were about surfaces outside the tree, and both are mechanical.
+
+**F-A (BLOCKING) — the pull request description still published the number this cycle
+exists to retract.** The tree was corrected at five sites; the surface a merger actually
+reads was not. `gh pr view 746` still carried `max|diff| = 0.71614238619804382`,
+"99.05% of channel values move, by up to 95% of the output's own range", and a `ctest -N`
+of 448 — this row's own defining failure, a 14x-wrong headline on a reader-facing
+surface, live on the pull request whose entire subject is repairing it. The concrete
+scenario is not hypothetical: this campaign has three instances of a figure being quoted
+onward out of a merge record. Closed by rewriting the body from a FRESH run of
+`scripts/probe_ltx2_tiled_equivalence.cpp` by its own recorded recipe on the merged head,
+against the checkpoint asserted by hash
+(`685b06ee3d9b2039647698fc4ea33175112462fc374e2777312c907897dfce8d`). The flat-append
+figure stays in the body, NAMED AS REFUTED, because a correction that deletes the wrong
+number teaches nothing.
+
+**F-B (BLOCKING) — 48 commits behind main, with two keyed records in conflict.**
+`git merge-tree --write-tree` exited 1 on `.agents/roadmap_v1.md` and `docs/FEATURES.md`,
+both keyed records, which never take an automatic three-way merge. Resolved against a
+PINNED `origin/main` = `51e0cb5b15fef9dd76c9aa1727b4dbc9e59cdff2` rather than the moving
+ref, because this is a shared checkout and a peer's fetch advances `origin/main`
+mid-operation.
+
+* `.agents/roadmap_v1.md` took main's file whole and is byte-identical to it. This
+  branch's only edit to it was one row of the issue intake table, and #846 moved that
+  table out into the append-only `.agents/issue-index.md`. The #644 row is already there
+  and already current. `check-issue-index-append-only.py` refuses an edit to an existing
+  row, because `merge=union` duplicates one rather than merging it, and
+  `check_issue_index` refuses a second #644 row. The scoped edit therefore has no
+  admissible target on the new surface, and the Row 2 prose lives in this spec, which is
+  where it belongs.
+* `docs/FEATURES.md` took main's file whole and then reapplied exactly one key, this
+  row's `LTX-2.5 tiled + streaming Conv VAE decode` line. `git diff <pinned main> --
+  docs/FEATURES.md` is that one added line and nothing else, so every unrelated key is
+  byte-identical — including the `Safetensors direct load, no conversion` row, which was
+  DUPLICATED at the old head and is single on main (#769): taking main whole resolves it
+  without this branch either fixing or multiplying it.
+
+Five files auto-merged silently against `c629b5d0f`, the same campaign's image
+conditioning row, and a clean `merge-tree` is not a tree that builds. Checked by
+semantics: `CMakeLists.txt` `+6` and `tests/CMakeLists.txt` `+7` are this row's two
+translation units and its one test target; `src/vllm/multimodal/ltx2_video.cpp` drops the
+`rendered` buffer the counterparty never referenced, hoists the only `std::error_code ec`
+in `Generate`, and adds `video_factors`, which does not collide with the pre-existing
+`factors` at `:1345`; `tests/vllm/multimodal/test_ltx2_video.cpp` appends one case using
+only helpers the counterparty left in place; `docs/USAGE.md` appends after the
+counterparty's own conditioning prose. The merged tree was then rebuilt clean and
+re-gated from scratch.
+
+**F-C — the recorded `test_op_parity` red was a MISSING FIX, not a standing red.**
+`043e56862` (`fix(GATE-OP-PARITY-MANIFEST)`, closes #755) is in main and is not in the old
+head's ancestry: `git merge-base --is-ancestor 043e56862 70fddfa32` exits **1**, with the
+positive control on the merge base `7b8919da0` exiting **0**, and
+`git merge-base --is-ancestor 043e56862 <pinned main>` exiting **0**. So the 1-of-456
+failure was expected at that head by construction and disappears on the re-merge. Recorded
+that way rather than as a standing known-red.
+
+**F-D (nit) — the density assertion's message named only one of its two causes.** The walk
+requires `latent_t` to advance by exactly 1 per step, so a step FINER than 8 pixel frames
+repeats a depth and fails too. That is correct for the anti-fake purpose, but a future
+editor tightening the sweep would read the failure as "upstream moved the bound". The
+message now names both directions and the fix each needs. Reproduced in both:
+
+| mutation (scratch copy) | result |
+|---|---|
+| step `8 -> 80` | exit **1**, `latent_t jumps [(1, 11)]`, 2 frame counts visited |
+| step `8 -> 4` | exit **1**, 17 zero-jumps, 34 frame counts visited |
+| unmutated | exit **0**, 17 densely walked frame counts, "first splits at 81 frames" |
+
+The reviewed tree was never mutated; each mutant is a copy outside it, and the tree's
+`sha256` was verified unchanged after each run.
+
+**F-E (nit) — the raise-mechanism goldens were emitted into C string literals unescaped.**
+`untiled_frames_raise_file` and `untiled_frames_raise_message` are both UPSTREAM text, so
+a future `TypeError` message or a checkout path carrying a `"` or a backslash would have
+produced a golden that does not compile while the generator reported success. Both now go
+through `json.dumps`. Byte-identity on today's values is proven rather than argued: a full
+regeneration to a scratch path produces `sha256`
+`bf2bdb4d43e73d4da73e360a816ee20e5f4b9224902fab9486fb173822a41d12`, equal to the committed
+file, `diff` exit 0. The negative control shows the old form emitting
+`"a "quoted" word and a \ backslash"` where the new one emits
+`"a \"quoted\" word and a \\ backslash"`.
 
 ### What is owed
 

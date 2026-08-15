@@ -48,6 +48,7 @@ from __future__ import annotations
 
 import argparse
 import importlib.util
+import json
 import subprocess
 import sys
 from pathlib import Path
@@ -656,11 +657,16 @@ def _decode_arm(out, out_prefix: str, causal: bool, name_prefix: str) -> None:
     )
     G.emit_scalar(out, out_prefix + "UpstreamUntiledFramesRaises", untiled_frames_raises)
     G.emit_scalar(out, out_prefix + "UpstreamUntiledFramesRaiseLine", untiled_frames_raise_line)
+    # `json.dumps` and not an f-string quote: both of these are UPSTREAM text, so a
+    # future `TypeError` message carrying a `"` or a `\` — or a checkout path that
+    # does — would otherwise emit a C string literal that does not compile, and the
+    # generator would look like it succeeded. JSON string escaping is a subset of
+    # C's for these bytes, so on today's values the output is byte-identical.
     out.write(
         f"inline constexpr const char* {out_prefix}UpstreamUntiledFramesRaiseFile = "
-        f'"{untiled_frames_raise_file}";\n'
+        f"{json.dumps(untiled_frames_raise_file)};\n"
         f"inline constexpr const char* {out_prefix}UpstreamUntiledFramesRaiseMessage = "
-        f'"{untiled_frames_raise_message}";\n'
+        f"{json.dumps(untiled_frames_raise_message)};\n"
     )
     out.write("\n")
 

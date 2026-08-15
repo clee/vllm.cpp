@@ -160,7 +160,11 @@ assert not gaps, (
     f"{len(visited)} frame counts covering latent_t "
     f"{[v[1] for v in visited]}. A walk that steps over latent depths can land on the "
     "boundary by luck and report a threshold it never bracketed — which is exactly the "
-    "defect this block exists to prevent. Use a step of one latent frame (8 pixel frames)."
+    "defect this block exists to prevent. Use a step of one latent frame (8 pixel frames). "
+    "A jump of 0 is the OPPOSITE failure and is not upstream moving anything: a step FINER "
+    "than 8 pixel frames repeats a latent depth, because latent_t = (frames - 1) // 8 + 1 "
+    "is constant across 8 consecutive frame counts. Widen the step back to 8; do not "
+    "relax this assertion."
 )
 assert saw_untiled, "the walk never saw an untiled frame count; it cannot locate a boundary"
 assert first_tiled is not None, (
