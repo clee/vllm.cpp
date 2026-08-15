@@ -358,7 +358,7 @@ this row adds no real-weight arm to it. Nothing here claims one.
 
 ### 8.6 Counts, against the denominator
 
-Re-measured on the merged tree at `5720d099b`, base
+Re-measured on the merged tree, merge commit `0fdce00b0`, base
 `51e0cb5b15fef9dd76c9aa1727b4dbc9e59cdff2`. The first row of figures below was
 taken against a base about ninety commits older, so every denominator had moved
 under it. A changed count is a red result until it is attributed, so each delta
@@ -398,6 +398,12 @@ minute load average between 8 and 64 across it — and still returned zero
 failures, which makes the green stronger than a quiet-box green rather than
 weaker. Disk 81 GB free after the build; the build log contains no
 `No space left` and no `BFD assertion`, over 2614 lines of real output.
+
+The gate ran before the commits on this branch were reordered so that the record
+edit rides with the sources it describes, as `check-doc-checkpoint.py` requires.
+The tree it ran on differs from this one in `docs/USAGE.md` and nothing else:
+`git diff --name-only` between them names that one file, and no test reads it.
+`BUILD_EXIT=0` with zero errors and zero warnings.
 
 ### 8.7 What was NOT done, and why
 
