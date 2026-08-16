@@ -498,13 +498,35 @@ R1 and R2 are the reachability evidence `.agents/reachability.md` asks for: the
 production CALL SITE is deleted, not the implementation, and the focused gate
 goes red. A green there would have meant the DFR path is a test-only driver.
 
-**Two mutations were run against the engine suite and stayed GREEN, and both
-were then re-run against a suite that can see them.** M5 is a no-op on phase 0,
-which is the only phase the engine's DFR case runs, and M8 needs an appending
-item AFTER the slot item, which only the #975 reference arm provides. Neither is
-a coverage hole in `test_ltx2_video`; both are statements about what this port
-can currently reach, and both are gated in `test_ltx2_dfr` with that reasoning
-written beside them.
+**Two mutations stayed GREEN against the engine suite, and the first explanation
+for one of them was wrong.** Both are recorded with what was actually measured,
+because a green mutation with a confident story attached is worse than one with
+none.
+
+**M8** needs an appending item AFTER the slot item, and upstream has exactly one:
+`VideoConditionByReferenceLatent` (`dfr_pipeline.py:366-373`), whose arm #975
+owes. Until that lands the slots always trail and the two readings agree. Gated
+in `test_ltx2_dfr`, which builds that configuration by hand and where M8 goes
+RED.
+
+**M5** was first explained as "a no-op on phase 0, which is the only phase the
+engine's DFR case runs". That explanation predicted that a TWO-PHASE engine case
+would make it RED. A two-phase case was written — it uses the fixture spatial
+upsampler, renders at full resolution and asserts stage 2 places and reads back
+its own slots — **and M5 stayed GREEN with it present, 52/52, exit 0.**
+
+So the real reason is different and it is a property of the pipeline. Stage 2
+re-noises to `stage_2_sigmas[0]`, about 0.909, so the seed is almost entirely
+replaced by noise before the first step and the denoise loop generates the rest.
+The assertions an engine test can make about a slot are structural — counts,
+positions, resolutions — and the seed moves none of them. There is no A/B
+available either, because the seed is internal rather than a request field.
+
+The two-phase case is kept, and its comment now says exactly this: it REACHES
+the seeded path, which no other engine test does, and it does not DETECT the
+seed. M5 is gated in `test_ltx2_dfr`, on the property that actually belongs to
+the port — the seed lands in `latent` and not in `clean` — and it goes RED
+there.
 
 ## Owed
 

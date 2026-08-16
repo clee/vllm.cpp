@@ -1822,6 +1822,67 @@ TEST_CASE("ltx2 video: the DFR pipeline pads its canvas, places slots on it, and
     }
   }
 
+  SUBCASE("BOTH stages run, and stage 2's slots are SEEDED from stage 1's") {
+    // The two-stage DFR flow, through the production entry point, with the
+    // fixture spatial upsampler. Upstream's stage 2 passes
+    // `initial_keyframes=upsampled_slot_keyframes` (dfr_pipeline.py:364), which
+    // are stage 1's own denoised slots run through the SPATIAL latent upsampler
+    // (:348) — the same object and the same call as the video latent on the line
+    // after it.
+    //
+    // WHAT THIS CASE DOES AND DOES NOT ESTABLISH, stated because the first
+    // version of this comment claimed more. It REACHES the seeded path: without
+    // it, `initial_keyframes` is null on every engine test, because phase 0 has
+    // no previous phase to seed from. It does NOT DETECT the seed's content.
+    // Measured, not assumed: mutation M5, which stops the seed reaching
+    // `latent`, leaves this suite at 52/52, exit 0, WITH this case present.
+    //
+    // The reason is a property of the pipeline rather than a hole in this file.
+    // Stage 2 re-noises to `stage_2_sigmas[0]`, about 0.909, so the seed is
+    // almost entirely replaced by noise before the first step and the denoise
+    // loop generates the rest; the assertions available here are structural —
+    // counts, positions, resolutions — and the seed moves none of them. Where
+    // the seed IS gated is `test_ltx2_dfr`, which checks that it lands in
+    // `latent` and not in `clean`, and where M5 goes RED.
+    //
+    // A separate engine is loaded because `max_phase` is a LOAD extra and the
+    // outer one pins phase 0.
+    vllm::multimodal::VideoModelParams two = FixtureParams(ws.paths);
+    two.extras[vllm::multimodal::kLtx2PipelineKindExtra] = "dfr";
+    two.extras["upsampler_path"] = ws.paths.upsampler;
+    const std::unique_ptr<vllm::multimodal::VideoEngine> full =
+        vllm::multimodal::LoadVideoEngine(two);
+    REQUIRE(full != nullptr);
+    auto* ltx2_full = dynamic_cast<vllm::multimodal::Ltx2VideoEngine*>(full.get());
+    REQUIRE(ltx2_full != nullptr);
+
+    vllm::multimodal::VideoGenParams gen = FixtureGen(ws.root + "/dfr2");
+    const vllm::multimodal::VideoResult result = full->Generate(gen);
+
+    // Stage 2 renders at FULL resolution, where phase 0 alone renders at half.
+    // That is what proves both phases ran, and it is read off the artifact
+    // rather than off a flag.
+    CHECK(result.frame_count == 9);
+    CHECK(result.width == 64);
+    CHECK(result.height == 64);
+
+    const vllm::multimodal::Ltx2ConditioningTrace trace = ltx2_full->last_conditioning();
+    // The trace describes the LAST phase that ran, so a slot count here means
+    // stage 2 placed slots of its own rather than inheriting stage 1's tokens.
+    REQUIRE(trace.slot_positions.size() == 1);
+    CHECK(trace.slot_positions[0] == 24);
+    CHECK(trace.canvas_frames == 25);
+    // And stage 2 read its slots back too, which is what the next round would
+    // carry forward if the rounds were served.
+    CHECK(trace.slot_tokens_extracted == 1);
+    // Stage 2's slot is 4 tokens where stage 1's is 1: the latent grid is 2x2 at
+    // full resolution against 1x1 at half. Derived from the result's own size so
+    // a mutation of the phase geometry moves this and not just the count.
+    const int64_t per_frame = (result.width / 32) * (result.height / 32);
+    CHECK(per_frame == 4);
+    CHECK(trace.slot_marked_tokens == per_frame);
+  }
+
   SUBCASE("the soundtrack is CUT to the picture, not to the padded canvas") {
     // `dfr_pipeline.py:552-560`, whose own reason is the consequence rather than
     // the mechanism: "Audio was generated for the padded canvas, so cut it to
