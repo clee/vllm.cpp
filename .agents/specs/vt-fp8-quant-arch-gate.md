@@ -319,6 +319,13 @@ reproduce it exactly.
 
 ## Now
 
-Landed on `main` via the row branch. `QuantFp8Static` is registered for CUDA on
-every arch; the FP8 W8A8 arm is unblocked on non-cutlass-fp8 CUDA archs, which is
-the base #810/#517 A2-Q1 needs. #844's class remains open.
+Open as [#991](https://github.com/mudler/vllm.cpp/pull/991), on
+`row/VT-FP8-QUANT-ARCH-GATE-960-V2`, awaiting a fresh review and an operator
+merge. Measured on both gate hosts and green; the only red CI lanes are
+`windows-msvc-cpu` / `windows-msvc-vulkan`, which fail at the identical step on
+unrelated open PRs (#988, #982) and are #968 under #584's PR-only lane, with a
+fix already open as #983.
+
+`QuantFp8Static` is registered for CUDA on every arch, so the FP8 W8A8 arm is
+reachable on a non-cutlass-fp8 CUDA arch — the base #810/#517 A2-Q1 needs.
+#844's class remains open, and nothing here narrows it.
