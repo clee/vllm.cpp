@@ -117,6 +117,12 @@ std::vector<float> ReadFloats(const std::string& path) {
   return out;
 }
 
+void WriteBytes(const std::string& path, const std::string& bytes) {
+  std::ofstream out(path, std::ios::binary);
+  REQUIRE_MESSAGE(out.good(), "cannot write ", path);
+  out.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+}
+
 void WriteFloats(const std::string& path, const std::vector<float>& values) {
   std::ofstream out(path, std::ios::binary);
   REQUIRE_MESSAGE(out.good(), "cannot write ", path);
@@ -505,6 +511,252 @@ TEST_CASE("ltx2 video: the second phase upsamples, and refuses when it cannot") 
     CHECK(result.width == 64);
     CHECK(result.height == 64);
     CHECK(result.frame_count == 9);
+  }
+}
+
+// A request whose size does not divide the latent grid used to RENDER at a size
+// nobody asked for (#919). `ltx2_video.cpp` integer-divides the request into
+// `Ltx2VideoLatentShape` and only ever checked the LOWER bound, so the floor was
+// silent and the call returned success.
+//
+// MEASURED on this fixture before the guard existed, which is why these sizes and
+// not the obvious ones: a two-stage request of width 80 rendered 64x64, and a
+// one-stage request of width 100 rendered 96x64. Width 96 on the two-stage arm
+// does NOT reach that state — stage 1 floors 48 to one latent cell while stage 2
+// needs three — so the upsampler's shape check catches it and reports "the
+// upsampled latent is 4x2x2x2 but phase 'refine' needs 4x2x2x3", a true statement
+// about latents and no help at all to a caller who passed a width. The defect has
+// two faces, a silent floor and an unreadable downstream throw, and one guard at
+// the entry point closes both.
+//
+// Upstream raises instead, at the top of a pipeline's `__call__` and before any
+// work is paid for: `assert_resolution` (ltx-pipelines utils/helpers.py:540-551)
+// takes a divisor of 64 for a two-stage pipeline and 32 for a one-stage one,
+// across NINE invocations including ti2vid_two_stages.py:184 and
+// ti2vid_two_stages_hq.py:199. Nine, counted at the pin: a grep for the name
+// returns 21 lines, which are 9 invocations + 1 definition + 10 imports + 1
+// `__all__` string. Nor is the guard on every pipeline — 13 pipeline `__call__`s
+// take a height and a width, and distilled_mgpu.py:143,
+// ti2vid_two_stages_mgpu.py:163, ti2vid_two_stages_hq_mgpu.py:164 and
+// hdr_ic_lora.py:352 do not call it.
+//
+// Those two divisors are NOT two constants. They are the VAE spatial factor (32,
+// ltx_core/types.py:31-33) times the worst spatial downscale any phase applies —
+// a two-stage pipeline runs stage 1 at `width // 2` (ti2vid_two_stages.py:226-228),
+// so the request must survive being halved and still divide the grid. The last two
+// subcases gate that DERIVATION rather than the numbers, by driving the same width
+// 96 through both recipes and requiring opposite answers.
+//
+// EVERY AXIS ASSERTION HERE IS A PHRASE AND NOT A WORD, and that is the whole
+// point of the spelling. The message carries the literal "(width x height)" label
+// in every refusal it ever emits, so `msg.find("width")` and `msg.find("height")`
+// are both satisfied by that constant no matter which axis the guard named — a
+// mutation swapping the two names in `Ltx2AssertResolution` stayed green against
+// needles spelt that way, and a height-80 request would have reported "the width
+// is not" with nothing to see it.
+TEST_CASE("ltx2 video: a size that does not divide the latent grid is REFUSED, per recipe") {
+  Workspace ws;
+
+  SUBCASE("a two-stage width that is not a multiple of 64 is refused BY VALUE") {
+    vllm::multimodal::VideoModelParams mp = FixtureParams(ws.paths);
+    mp.extras["upsampler_path"] = ws.paths.upsampler;
+    const std::unique_ptr<vllm::multimodal::VideoEngine> engine =
+        vllm::multimodal::LoadVideoEngine(mp);
+    vllm::multimodal::VideoGenParams gen = FixtureGen(ws.root + "/w80");
+    gen.width = 80;
+    try {
+      (void)engine->Generate(gen);
+      FAIL("width 80 rendered 64x64 before the guard; it must be refused, not floored");
+    } catch (const std::exception& e) {
+      const std::string msg = e.what();
+      INFO(msg);
+      // The offending value, the divisor, and the axis. A message that says only
+      // "bad resolution" leaves the caller to guess which of the two numbers they
+      // passed is wrong and what a right one would be.
+      CHECK(msg.find("80") != std::string::npos);
+      CHECK(msg.find("64") != std::string::npos);
+      // The PHRASE. Only the width offends here, so the message must say so and
+      // must not name the height.
+      CHECK(msg.find("the width is not") != std::string::npos);
+      CHECK(msg.find("the height is not") == std::string::npos);
+      // The suggested size, and that it is the NEAREST legal one rather than the
+      // request echoed back. Without this the arithmetic is unmeasured: a mutation
+      // replacing `(width / divisor) * divisor` with `width` left all fifteen
+      // other assertions green, and a wrong suggestion here sends the caller
+      // straight to another illegal size.
+      CHECK(msg.find("Nearest legal size at or below the request: 64x64") != std::string::npos);
+    }
+  }
+
+  SUBCASE("a two-stage height that is not a multiple of 64 is refused BY VALUE") {
+    vllm::multimodal::VideoModelParams mp = FixtureParams(ws.paths);
+    mp.extras["upsampler_path"] = ws.paths.upsampler;
+    const std::unique_ptr<vllm::multimodal::VideoEngine> engine =
+        vllm::multimodal::LoadVideoEngine(mp);
+    vllm::multimodal::VideoGenParams gen = FixtureGen(ws.root + "/h80");
+    gen.height = 80;
+    try {
+      (void)engine->Generate(gen);
+      FAIL("height 80 must be refused, not floored to 64");
+    } catch (const std::exception& e) {
+      const std::string msg = e.what();
+      INFO(msg);
+      CHECK(msg.find("80") != std::string::npos);
+      // The axis the guard NAMED, not the axis label the message always carries.
+      // This is the assertion the swap mutation has to move: the width is 64 here
+      // and legal, so a message that blames it is wrong.
+      CHECK(msg.find("the height is not") != std::string::npos);
+      CHECK(msg.find("the width is not") == std::string::npos);
+      CHECK(msg.find("Nearest legal size at or below the request: 64x64") != std::string::npos);
+    }
+  }
+
+  // BOTH axes off the grid. This branch of the axis phrase is executed by no
+  // other subcase, and it is the one a caller passing a square off-grid size
+  // reaches — the commonest shape of the mistake.
+  SUBCASE("a two-stage request with BOTH axes off the grid names both") {
+    vllm::multimodal::VideoModelParams mp = FixtureParams(ws.paths);
+    mp.extras["upsampler_path"] = ws.paths.upsampler;
+    const std::unique_ptr<vllm::multimodal::VideoEngine> engine =
+        vllm::multimodal::LoadVideoEngine(mp);
+    vllm::multimodal::VideoGenParams gen = FixtureGen(ws.root + "/wh80");
+    gen.width = 80;
+    gen.height = 80;
+    try {
+      (void)engine->Generate(gen);
+      FAIL("80x80 is off the grid on both axes and must be refused");
+    } catch (const std::exception& e) {
+      const std::string msg = e.what();
+      INFO(msg);
+      CHECK(msg.find("the width and height are not") != std::string::npos);
+      CHECK(msg.find("Nearest legal size at or below the request: 64x64") != std::string::npos);
+    }
+  }
+
+  // A SUB-DIVISOR axis, where the suggestion the refusal makes is the thing under
+  // test. `(width / divisor) * divisor` is 0 for any width below the divisor, and
+  // 0 is not a legal size: a caller who followed the old "Nearest legal size at or
+  // below the request: 0x64" landed on the LOWER-bound refusal in the phase loop,
+  // one illegal size handed out in place of another. No subcase reached this
+  // branch, because every measured size in this case is above its divisor.
+  SUBCASE("a two-stage width BELOW the divisor is not told to render at zero") {
+    vllm::multimodal::VideoModelParams mp = FixtureParams(ws.paths);
+    mp.extras["upsampler_path"] = ws.paths.upsampler;
+    const std::unique_ptr<vllm::multimodal::VideoEngine> engine =
+        vllm::multimodal::LoadVideoEngine(mp);
+    vllm::multimodal::VideoGenParams gen = FixtureGen(ws.root + "/w32");
+    gen.width = 32;
+    try {
+      (void)engine->Generate(gen);
+      FAIL("width 32 is below the two-stage divisor of 64 and must be refused");
+    } catch (const std::exception& e) {
+      const std::string msg = e.what();
+      INFO(msg);
+      CHECK(msg.find("the width is not") != std::string::npos);
+      // What it must NOT say. `0x64` is the old suggestion, and `x0` catches the
+      // mirrored case on the height axis.
+      CHECK(msg.find("0x64") == std::string::npos);
+      CHECK(msg.find("x0") == std::string::npos);
+      // What it must say instead: that no legal size at or below the request
+      // exists, and what the smallest legal one is.
+      CHECK(msg.find("No legal size at or below the request exists") != std::string::npos);
+      CHECK(msg.find("Smallest legal size: 64x64") != std::string::npos);
+    }
+  }
+
+  // The same branch on the other recipe, so the smallest legal size is proven to
+  // follow the DERIVED divisor rather than being a second hardcoded 64.
+  SUBCASE("a one-stage width BELOW the divisor names 32 as the smallest legal size") {
+    vllm::multimodal::VideoModelParams mp = FixtureParams(ws.paths);
+    mp.extras[vllm::multimodal::kLtx2PipelineKindExtra] = "one_stage";
+    const std::unique_ptr<vllm::multimodal::VideoEngine> engine =
+        vllm::multimodal::LoadVideoEngine(mp);
+    vllm::multimodal::VideoGenParams gen = FixtureGen(ws.root + "/os16");
+    gen.width = 16;
+    try {
+      (void)engine->Generate(gen);
+      FAIL("width 16 is below the one-stage divisor of 32 and must be refused");
+    } catch (const std::exception& e) {
+      const std::string msg = e.what();
+      INFO(msg);
+      CHECK(msg.find("the width is not") != std::string::npos);
+      CHECK(msg.find("No legal size at or below the request exists") != std::string::npos);
+      CHECK(msg.find("Smallest legal size: 32x32") != std::string::npos);
+      CHECK(msg.find("x0") == std::string::npos);
+    }
+  }
+
+  // The other face of the same defect: 96 reaches the upsampler's shape check
+  // today. After the guard it is refused at the entry point, by the value the
+  // caller actually passed.
+  SUBCASE("a two-stage width of 96 is refused BY VALUE, not by latent shape") {
+    vllm::multimodal::VideoModelParams mp = FixtureParams(ws.paths);
+    mp.extras["upsampler_path"] = ws.paths.upsampler;
+    const std::unique_ptr<vllm::multimodal::VideoEngine> engine =
+        vllm::multimodal::LoadVideoEngine(mp);
+    vllm::multimodal::VideoGenParams gen = FixtureGen(ws.root + "/w96");
+    gen.width = 96;
+    try {
+      (void)engine->Generate(gen);
+      FAIL("96 is not a multiple of 64 and must be refused at the entry point");
+    } catch (const std::exception& e) {
+      const std::string msg = e.what();
+      INFO(msg);
+      CHECK(msg.find("96") != std::string::npos);
+      CHECK(msg.find("the width is not") != std::string::npos);
+      CHECK(msg.find("the height is not") == std::string::npos);
+      CHECK(msg.find("upsampled latent") == std::string::npos);
+    }
+  }
+
+  SUBCASE("a one-stage width that is not a multiple of 32 is refused BY VALUE") {
+    vllm::multimodal::VideoModelParams mp = FixtureParams(ws.paths);
+    mp.extras[vllm::multimodal::kLtx2PipelineKindExtra] = "one_stage";
+    const std::unique_ptr<vllm::multimodal::VideoEngine> engine =
+        vllm::multimodal::LoadVideoEngine(mp);
+    vllm::multimodal::VideoGenParams gen = FixtureGen(ws.root + "/os100");
+    gen.width = 100;
+    try {
+      (void)engine->Generate(gen);
+      FAIL("one-stage width 100 rendered 96x64 before the guard; it must be refused");
+    } catch (const std::exception& e) {
+      const std::string msg = e.what();
+      INFO(msg);
+      CHECK(msg.find("100") != std::string::npos);
+      CHECK(msg.find("32") != std::string::npos);
+      CHECK(msg.find("the width is not") != std::string::npos);
+      CHECK(msg.find("the height is not") == std::string::npos);
+      // 96, not 64: the nearest legal size follows the recipe's own divisor.
+      CHECK(msg.find("Nearest legal size at or below the request: 96x64") != std::string::npos);
+    }
+  }
+
+  // The guard is not a blanket one. Without this, every subcase above is
+  // satisfied by a check that refuses everything.
+  SUBCASE("a multiple of 64 still renders on the two-stage recipe") {
+    vllm::multimodal::VideoModelParams mp = FixtureParams(ws.paths);
+    mp.extras["upsampler_path"] = ws.paths.upsampler;
+    const std::unique_ptr<vllm::multimodal::VideoEngine> engine =
+        vllm::multimodal::LoadVideoEngine(mp);
+    const vllm::multimodal::VideoResult result = engine->Generate(FixtureGen(ws.root + "/ok64"));
+    CHECK(result.width == 64);
+    CHECK(result.height == 64);
+  }
+
+  // The SAME width 96 the two-stage arm refuses, on a recipe whose only phase
+  // runs at the requested size. 96 = 3 * 32, so it divides that grid and must be
+  // served. A hardcoded 64 would refuse it here too: this is the assertion that
+  // separates the derivation from the constant.
+  SUBCASE("96 is a legal ONE-STAGE size, because that divisor is 32") {
+    vllm::multimodal::VideoModelParams mp = FixtureParams(ws.paths);
+    mp.extras[vllm::multimodal::kLtx2PipelineKindExtra] = "one_stage";
+    const std::unique_ptr<vllm::multimodal::VideoEngine> engine =
+        vllm::multimodal::LoadVideoEngine(mp);
+    vllm::multimodal::VideoGenParams gen = FixtureGen(ws.root + "/one_stage_96");
+    gen.width = 96;
+    const vllm::multimodal::VideoResult result = engine->Generate(gen);
+    CHECK(result.width == 96);
+    CHECK(result.height == 64);
   }
 }
 
@@ -1158,36 +1410,31 @@ TEST_CASE("ltx2 video: keyframe and reference conditioning is refused BY WHAT IS
     }
   };
 
-  SUBCASE("a LAST-frame keyframe names the TOKEN-APPEND machinery, not the embedding") {
-    const std::string msg = refusal("a last-frame keyframe",
-                                    [](vllm::multimodal::VideoGenParams& g, const Workspace& w) {
-                                      g.last_frame_path = w.paths.video_embeds;
-                                    });
-    INFO(msg);
-    // THIS ASSERTION USED TO PIN A FALSE REASON. It required the message to
-    // blame `keyframes_abs_pos_embedding`, and at pin `fd4ded7f` that is not
-    // what blocks a supplied keyframe: `apply_to` appends it with
-    // `marked=False` (keyframe_cond.py:84-86) and the sole consumer adds
-    // `mask * embedding` (transformer_args.py:42-43, called at :269), so the
-    // embedding contributes exactly nothing to those tokens. Porting it would
-    // not serve this arm. The gate enforced the wrong thing, which is worse
-    // than not gating the message at all.
+  SUBCASE("a LAST-frame keyframe is no longer refused — it is SERVED") {
+    // THIS SUBCASE USED TO ASSERT A REFUSAL, and before that it asserted a FALSE
+    // one: it required the message to blame `keyframes_abs_pos_embedding`, which
+    // at pin `fd4ded7f` is not what blocks a supplied keyframe — `apply_to`
+    // appends it with `marked=False` (keyframe_cond.py:84-86) and the sole
+    // consumer adds `mask * embedding` (transformer_args.py:42-43, called at
+    // :269), so the embedding contributes nothing to those tokens.
     //
-    // What actually blocks it is the append: extended `positions`,
-    // `update_attention_mask`, extended `clean_latent` / `denoise_mask`, and
-    // `clear_conditioning` trimming back — none of which this engine's
-    // fixed-length phase loop can express.
-    CHECK(msg.find("update_attention_mask") != std::string::npos);
-    CHECK(msg.find("clear_conditioning") != std::string::npos);
-    CHECK(msg.find("keyframe_cond.py") != std::string::npos);
-    CHECK(msg.find("VAE_ENCODER_COMFY_KEYS_FILTER") == std::string::npos);
-    // The refuted reason may still be NAMED — it is worth telling a reader that
-    // it was ruled out — but never as the thing that is missing, and only next
-    // to the issue that tracks where the embedding really does bite (#658).
-    if (msg.find("keyframes_abs_pos_embedding") != std::string::npos) {
-      CHECK(msg.find("NOT* THE REASON") != std::string::npos);
-      CHECK(msg.find("#658") != std::string::npos);
-    }
+    // The reason it then named — the token-APPEND machinery — was the true one,
+    // and row LTX25-TOKEN-APPEND (#930) built it. So the arm is checked here for
+    // NOT refusing, and what it actually does is gated by "a LAST-frame keyframe
+    // is APPENDED, and the sequence is trimmed back", which compares rendered
+    // bytes against a no-op control.
+    //
+    // The check is kept in THIS case rather than only in that one because this
+    // is the case a reader consults to ask "which conditioning arms are refused
+    // today", and an arm that silently disappeared from it would leave that
+    // question answered wrongly.
+    vllm::multimodal::VideoGenParams gen = FixtureGen(ws.root + "/served_last_frame");
+    const std::string ppm = ws.root + "/served_last_frame.ppm";
+    WriteBytes(ppm, ConditioningPpm(20, 28, 9));
+    gen.last_frame_path = ppm;
+    gen.extras[vllm::multimodal::kLtx2ImageCrfExtra] = "0";
+    const vllm::multimodal::VideoResult result = engine->Generate(gen);
+    CHECK(result.frame_count == 9);
   }
   SUBCASE("a reference video names TOKEN-APPEND, and no longer blames the LoRA metadata") {
     // REPLACED, not relaxed (row LTX25-IC-LORA, #923). This subcase used to
@@ -2052,6 +2299,25 @@ std::string RenderBytes(vllm::multimodal::VideoModelParams mp, const std::string
   return all;
 }
 
+// The same render, driven by a REQUEST the caller chose. `RenderBytes` fixes the
+// request at `FixtureGen`, which is what the connector cases want and what a
+// conditioning case cannot use.
+std::string RenderBytesWithGen(vllm::multimodal::VideoModelParams mp,
+                               const vllm::multimodal::VideoGenParams& gen) {
+  mp.extras[vllm::multimodal::kLtx2MaxPhaseExtra] = "0";
+  const std::unique_ptr<vllm::multimodal::VideoEngine> engine =
+      vllm::multimodal::LoadVideoEngine(mp);
+  const vllm::multimodal::VideoResult result = engine->Generate(gen);
+  std::string all;
+  for (int64_t f = 0; f < result.frame_count; ++f) {
+    char name[64];
+    std::snprintf(name, sizeof(name), "/frame_%06lld.ppm", static_cast<long long>(f));
+    all += ReadAll(gen.output_dir + name);
+  }
+  all += ReadAll(result.audio_path);
+  return all;
+}
+
 std::string RefusalOf(const vllm::multimodal::VideoModelParams& mp) {
   try {
     (void)vllm::multimodal::LoadVideoEngine(mp);
@@ -2160,6 +2426,160 @@ TEST_CASE("ltx2 video: the keyframe marker reaches the PIXELS with no image supp
   // ...and the same DiT twice is byte-identical, which is what makes the
   // inequality a statement about the marker rather than about noise.
   CHECK(RenderBytes(with_marker, ws.root + "/kf_marked2") == with);
+}
+
+// ─── the token-APPEND seam (row LTX25-TOKEN-APPEND, issue #930) ─────────────
+//
+// UPSTREAM SHIPS NO TESTS at pin `fd4ded7f` — `find /home/mudler/_git/LTX-2
+// -name 'test_*.py'` returns 0 across the whole repository — so nothing is
+// ported here. Every assertion cites the upstream `file:line` that justifies it
+// instead.
+//
+// THE WITNESS IS ON RENDERED BYTES, and that is the whole design. `Ltx2ConditioningTrace`
+// is filled before the denoise loop for every field except the handful written
+// inside it, so a witness built on the trace cannot observe what the loop does —
+// a sibling row's first attempt at exactly this found every arm identical for
+// that reason.
+//
+// AND IT CARRIES A NO-OP CONTROL, which is the correction that made the sibling's
+// result diagnosable. Their arms came out identical INCLUDING the control, which
+// is what said "the instrument is blind" rather than "the feature is weak".
+// Without the control those two read the same, and the wrong one is the one that
+// ships. So the comparison set below is {no keyframe, keyframe A, keyframe B}:
+//
+//   * every arm equal, control included  => the instrument is blind;
+//   * kf_a != noop                       => the append reached the maths;
+//   * kf_a != kf_b                       => the appended CONTENT reached it,
+//                                           not merely the token count.
+TEST_CASE("ltx2 video: a LAST-frame keyframe is APPENDED, and the sequence is trimmed back") {
+  Workspace ws;
+
+  // Deliberately not the render's own resolution: `load_image_and_preprocess`
+  // aspect-fills and centre-crops to the phase's height/width
+  // (media_io/resize.py:41-73).
+  const std::string kf_a_path = ws.root + "/kf_a.ppm";
+  const std::string kf_b_path = ws.root + "/kf_b.ppm";
+  WriteBytes(kf_a_path, ConditioningPpm(20, 28, 21));
+  WriteBytes(kf_b_path, ConditioningPpm(20, 28, 22));
+
+  auto request = [&](const std::string& tag, const std::string& keyframe) {
+    vllm::multimodal::VideoGenParams gen = FixtureGen(ws.root + "/" + tag);
+    if (!keyframe.empty()) {
+      gen.last_frame_path = keyframe;
+      // The codec round trip is unported and an LTX-2.5 checkpoint RESOLVES 18,
+      // so the supported arm has to be asked for. Same rule as the first-frame
+      // arm, because upstream resolves the CRF once for the whole `images` list
+      // (blocks.py:966-983).
+      gen.extras[vllm::multimodal::kLtx2ImageCrfExtra] = "0";
+    }
+    return gen;
+  };
+
+  const vllm::multimodal::VideoModelParams mp = FixtureParams(ws.paths);
+  const std::string noop = RenderBytesWithGen(mp, request("kf_noop", ""));
+  const std::string kf_a = RenderBytesWithGen(mp, request("kf_a", kf_a_path));
+  const std::string kf_b = RenderBytesWithGen(mp, request("kf_b", kf_b_path));
+  REQUIRE(noop.size() == kf_a.size());
+  REQUIRE(noop.size() == kf_b.size());
+
+  // THE CONTROL FIRST. A re-render of the no-keyframe request must be byte
+  // identical, otherwise every inequality below is noise and this case says
+  // nothing about appends.
+  REQUIRE_MESSAGE(RenderBytesWithGen(mp, request("kf_noop2", "")) == noop,
+                  "the same request rendered twice is not byte-identical, so this instrument "
+                  "cannot measure anything");
+
+  auto differing = [](const std::string& a, const std::string& b) {
+    size_t n = 0;
+    for (size_t i = 0; i < a.size(); ++i) {
+      if (a[i] != b[i]) ++n;
+    }
+    return n;
+  };
+  MESSAGE("kf_a vs noop: " << differing(kf_a, noop) << " of " << noop.size() << " bytes; "
+                           << "kf_a vs kf_b: " << differing(kf_a, kf_b));
+
+  // The appended tokens take part in self-attention over the WHOLE sequence, so
+  // a keyframe that reached the maths moves the target tokens' own output. This
+  // is the claim the refusal that stood here was about: the engine could not
+  // grow the sequence through the DiT.
+  CHECK_MESSAGE(differing(kf_a, noop) > 0,
+                "a last-frame keyframe rendered the same bytes as a render with no keyframe at "
+                "all, so the appended tokens never reached the forward");
+  // ...and it is the keyframe's CONTENT that reached it. Two keyframes append
+  // the same NUMBER of tokens, so a build that grew the sequence with zeros —
+  // or that appended the wrong buffer — passes the check above and fails this
+  // one.
+  CHECK_MESSAGE(differing(kf_a, kf_b) > 0,
+                "two DIFFERENT last-frame keyframes rendered identical bytes, so the appended "
+                "tokens carry no content from the keyframe");
+
+  SUBCASE("the sequence GROWS through the DiT and comes back to the target grid") {
+    vllm::multimodal::VideoModelParams capped = FixtureParams(ws.paths);
+    capped.extras[vllm::multimodal::kLtx2MaxPhaseExtra] = "0";
+
+    auto tokens_of = [&](const std::string& tag, const std::string& keyframe) {
+      const std::unique_ptr<vllm::multimodal::VideoEngine> engine =
+          vllm::multimodal::LoadVideoEngine(capped);
+      auto* ltx2 = dynamic_cast<vllm::multimodal::Ltx2VideoEngine*>(engine.get());
+      REQUIRE(ltx2 != nullptr);
+      const vllm::multimodal::VideoResult result = engine->Generate(request(tag, keyframe));
+      // The artifact is the other half of the claim: the trim is what lets
+      // `Ltx2VideoUnpatchify` produce a target-shaped volume, and the frame
+      // count is that shape observed from outside.
+      CHECK(result.frame_count == 9);
+      return ltx2->last_conditioning().video_tokens;
+    };
+
+    const int64_t plain = tokens_of("tok_noop", "");
+    const int64_t with_kf = tokens_of("tok_kf", kf_a_path);
+
+    // The fixture's phase 0 runs at `spatial_downscale = 2`, so 64x64 pixels is a
+    // 1x1 latent grid and 9 frames is 2 latent frames: 2 target tokens. One
+    // encoded keyframe is one latent frame at that grid, so it appends exactly
+    // `tokens_per_latent_frame` = 1 (tools.py:198-201).
+    CHECK(plain == 2);
+    CHECK_MESSAGE(with_kf == plain + 1,
+                  "a keyframe must append one latent frame's worth of tokens "
+                  "(keyframe_cond.py:79-82); got " << with_kf << " against a target of " << plain);
+  }
+
+  SUBCASE("the sigma schedule keeps reading the TARGET count, not the grown one") {
+    // The distilled two-stage recipe carries its own frozen sigmas
+    // (distilled.py:200-201 defaults both stages to the `DISTILLED_SIGMAS` /
+    // `STAGE_2_DISTILLED_SIGMAS` constants of utils/constants.py:17-23), so it
+    // never computes a schedule and cannot show
+    // this. `one_stage` does: `phase.sigmas` is empty, so the engine calls
+    // `Ltx2SigmaSchedule`, whose shift is a function of the token count
+    // (schedulers.py:37-39).
+    //
+    // Upstream fixes that count at the TARGET twice over: the argument is
+    // `math.prod(latent.shape[2:])` of the UNPATCHIFIED target, which cannot
+    // contain appended tokens, and `ti2vid_one_stage.py:207` computes the
+    // schedule before any state exists. A port that read the grown count would
+    // re-shift the entire trajectory the moment a keyframe was supplied.
+    vllm::multimodal::VideoModelParams one_stage = FixtureParams(ws.paths);
+    one_stage.extras[vllm::multimodal::kLtx2PipelineKindExtra] = "one_stage";
+
+    const std::unique_ptr<vllm::multimodal::VideoEngine> engine =
+        vllm::multimodal::LoadVideoEngine(one_stage);
+    auto* ltx2 = dynamic_cast<vllm::multimodal::Ltx2VideoEngine*>(engine.get());
+    REQUIRE(ltx2 != nullptr);
+
+    vllm::multimodal::VideoGenParams gen = request("one_stage_kf", kf_a_path);
+    gen.steps = 2;  // one_stage admits a step override; 50 would gate nothing extra
+    (void)engine->Generate(gen);
+    const vllm::multimodal::Ltx2ConditioningTrace trace = ltx2->last_conditioning();
+
+    // Both numbers are MEASURED, and the statement is the relation between them.
+    // Pinning either to a literal would pass on a build that read the grown
+    // count everywhere.
+    CHECK(trace.schedule_tokens > 0);
+    CHECK_MESSAGE(trace.video_tokens > trace.schedule_tokens,
+                  "the DiT ran over " << trace.video_tokens << " tokens and the schedule was "
+                                      << "built for " << trace.schedule_tokens
+                                      << "; equal means the append re-shifted the schedule");
+  }
 }
 
 TEST_CASE("ltx2 video: the connector's positional bound comes from the CONFIG") {
@@ -2955,4 +3375,487 @@ TEST_CASE("ltx2 video: the IC-LoRA reference factors are read from the adapter's
     // And the refusal still names the cause that genuinely remains.
     CHECK(msg.find("TOKEN-APPEND") != std::string::npos);
   }
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// AUDIO-TO-VIDEO — row LTX25-A2V-AUDIO-INPUT, issue #922.
+//
+// Upstream: `A2VidPipelineTwoStage` (Lightricks/LTX-2 @ fd4ded7f,
+// ltx-pipelines/src/ltx_pipelines/a2vid_two_stage.py:53, called at :143).
+//
+// These cases enter through the PRODUCTION path — `LoadVideoEngine` +
+// `VideoEngine::Generate`, which is what `vllm_video_generate` calls straight
+// through (`vllm_c.cpp:1646`) — and not by constructing `Ltx2DecodeAudioWav` or
+// `Ltx2AudioEncoderForward` by hand. Per `.agents/reachability.md`, a unit test
+// over those two proves the functions work and never that a request can arrive
+// at them; `Ltx2AudioEncoderForward` has had exactly that shape since
+// `cefacd2d0`, with six test call sites and no production one.
+// ───────────────────────────────────────────────────────────────────────────
+
+namespace {
+
+// The rate the FIXTURE's audio VAE declares on `audio_vae.model.params`, which
+// is deliberately NOT the shipped 16000 and not the parser's default either —
+// see the long note beside it in `ltx2_video_fixture.h`. Named here so a reader
+// who changes one changes the other, and so no `24000` in this file reads as a
+// magic number.
+constexpr int64_t kFixtureAudioRate = 24000;
+
+// A canonical 16-bit PCM RIFF/WAVE buffer, CHANNEL-INTERLEAVED as the format
+// requires. Deterministic and NOT silent: an all-zero take encodes to a latent
+// dominated by the mel log clamp (log(1e-5), `ltx2_audio_vae_encoder.h:142`) and
+// would satisfy a digest check while proving nothing about whether the samples
+// were read at all.
+std::string MakeWavPcm16(int64_t channels, int64_t sample_rate, double seconds) {
+  const int64_t frames = static_cast<int64_t>(sample_rate * seconds);
+  const int64_t data_bytes = frames * channels * 2;
+  std::string out;
+  auto le = [&](uint32_t value, int n) {
+    for (int i = 0; i < n; ++i) out.push_back(static_cast<char>((value >> (8 * i)) & 0xFF));
+  };
+  out += "RIFF";
+  le(static_cast<uint32_t>(36 + data_bytes), 4);
+  out += "WAVE";
+  out += "fmt ";
+  le(16, 4);
+  le(1, 2);  // WAVE_FORMAT_PCM
+  le(static_cast<uint32_t>(channels), 2);
+  le(static_cast<uint32_t>(sample_rate), 4);
+  le(static_cast<uint32_t>(sample_rate * channels * 2), 4);  // byte rate
+  le(static_cast<uint32_t>(channels * 2), 2);                // block align
+  le(16, 2);                                                 // bits per sample
+  out += "data";
+  le(static_cast<uint32_t>(data_bytes), 4);
+  for (int64_t f = 0; f < frames; ++f) {
+    for (int64_t c = 0; c < channels; ++c) {
+      // A tone plus a per-channel offset, so the two channels DIFFER and a build
+      // that read one of them twice cannot match a build that read both.
+      const double t = static_cast<double>(f) / static_cast<double>(sample_rate);
+      const double v = 0.4 * std::sin(6.2831853 * 220.0 * t) + 0.1 * static_cast<double>(c);
+      const auto s = static_cast<int16_t>(std::lround(v * 32767.0));
+      le(static_cast<uint32_t>(static_cast<uint16_t>(s)), 2);
+    }
+  }
+  return out;
+}
+
+std::string WriteWav(const std::string& path, int64_t channels, int64_t sample_rate,
+                     double seconds) {
+  const std::string bytes = MakeWavPcm16(channels, sample_rate, seconds);
+  std::ofstream out(path, std::ios::binary);
+  REQUIRE(out.good());
+  out.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+  out.close();
+  return path;
+}
+
+}  // namespace
+
+TEST_CASE("ltx2 video: a supplied audio file CONDITIONS the render, and stays FROZEN") {
+  // The claim is in three parts, and only the third is hard to fake:
+  //   (1) the request is accepted and renders;
+  //   (2) the audio stream carries the ENCODED FILE rather than zeros;
+  //   (3) it is FROZEN — upstream's `ModalitySpec(frozen=True, noise_scale=0.0)`
+  //       at a2vid_two_stage.py:251-256 and :291-296, identical on both stages.
+  //
+  // A build that encoded the file and then let the sampler denoise it satisfies
+  // (1) and (2) completely, and produces a soundtrack drifting away from the
+  // caller's own take that no frame count can see.
+  Workspace ws;
+  const std::unique_ptr<vllm::multimodal::VideoEngine> engine =
+      vllm::multimodal::LoadVideoEngine(ConditioningParams(ws.paths));
+  auto* ltx2 = dynamic_cast<vllm::multimodal::Ltx2VideoEngine*>(engine.get());
+  REQUIRE(ltx2 != nullptr);
+
+  const std::string wav = WriteWav(ws.root + "/drive.wav", 2, kFixtureAudioRate, 2.0);
+  vllm::multimodal::VideoGenParams gen = FixtureGen(ws.root + "/a2v");
+  gen.extras[vllm::multimodal::kLtx2AudioPathExtra] = wav;
+  const vllm::multimodal::VideoResult result = engine->Generate(gen);
+
+  const vllm::multimodal::Ltx2ConditioningTrace trace = ltx2->last_conditioning();
+  CHECK(trace.completed);
+  CHECK(trace.audio_conditioned);
+  CHECK(trace.audio_frozen);
+  CHECK(trace.audio_tokens > 0);
+  // A latent that collapsed to zeros would give every take the same digest and
+  // still satisfy both flags, so the MAGNITUDE is asked for separately — the
+  // same reason `image_absmax` sits beside `image_digest`. This is the lower
+  // bound the spec's §5 requires: a silently zeroed or constant tensor fails it.
+  CHECK(trace.audio_latent_absmax > 0.0);
+  CHECK(trace.audio_latent_digest != 0);
+  // The SECOND half of `frozen`, and a separate DiT input from the denoise mask
+  // (utils/types.py:104-106). Asserted on its own because the mask cannot reach
+  // it: a build that zeroed the mask and still handed the forward the schedule's
+  // sigma tells the model the caller's clean take is noisy, and every other
+  // assertion in this case passes.
+  CHECK(trace.audio_sigma_max == 0.0);
+  // The render still produced its artifacts; conditioning is not a bypass.
+  CHECK(result.frame_count == 9);
+
+  // THE SOUNDTRACK IS THE CALLER'S OWN FILE, not a VAE round trip of it.
+  // Upstream states the reason outright — "Return the original input audio
+  // instead of VAE-decoded audio to preserve fidelity"
+  // (a2vid_two_stage.py:301-303) — and the observable consequence is the SAMPLE
+  // RATE: the vocoder's BWE arm emits 48 kHz and the take went in at the audio
+  // VAE's own rate. A build that ran the decode and the vocoder anyway would
+  // report 48000 here and still hand back a plausible clip with a plausible
+  // soundtrack.
+  CHECK(result.sample_rate == kFixtureAudioRate);
+  const std::string rendered_audio = ReadAll(std::string(result.audio_path));
+  const std::string source_audio = ReadAll(wav);
+  // It is the take WINDOWED to the clip, not the whole 2 s file: upstream
+  // returns `decoded_audio.waveform`, which is what `decode_audio_from_file`
+  // produced AFTER `max_duration` (a2vid_two_stage.py:196, :303), and
+  // `audio_max_duration` defaults to `num_frames / frame_rate` (:369-371). This
+  // fixture is 9 frames at 24 fps, so 0.375 s of stereo 16-bit at the audio
+  // VAE's rate.
+  constexpr size_t kWindowSamples = static_cast<size_t>(kFixtureAudioRate) * 375 / 1000;
+  constexpr size_t kPcmBytes = kWindowSamples * 2 * 2;
+  constexpr size_t kHeader = 44;
+  INFO("rendered " << rendered_audio.size() << " B, source " << source_audio.size() << " B");
+  CHECK(rendered_audio.size() == kHeader + kPcmBytes);
+  REQUIRE(source_audio.size() >= kHeader + kPcmBytes);
+  // And those bytes are the SOURCE's leading samples, unaltered. This is the
+  // assertion the sample rate alone cannot make: a build that resampled or
+  // re-encoded the take would still report the same rate and the same byte
+  // count. Counted rather than compared with `!=`, so a failure prints a number
+  // instead of a screenful of PCM.
+  size_t audio_differing = 0;
+  for (size_t i = 0; i < kPcmBytes; ++i) {
+    if (rendered_audio[kHeader + i] != source_audio[kHeader + i]) ++audio_differing;
+  }
+  INFO("audio PCM bytes differing: " << audio_differing << " of " << kPcmBytes);
+  CHECK(audio_differing == 0);
+
+  SUBCASE("the truncation keeps the HEAD of the encode, not the tail") {
+    // THE LINE THIS ROW EXISTS TO PORT, and until this subcase existed its
+    // DIRECTION was asserted by nothing. Upstream slices
+    // `encoded_audio_latent[:, :, : audio_shape.frames]` (a2vid_two_stage.py:202)
+    // — the LEADING frames. Every assertion above survives a tail slice
+    // unchanged: `audio_latent_digest != 0` and `audio_latent_absmax > 0.0` hold
+    // for either window, and the "different start time gives a different digest"
+    // control holds too, because BOTH windows shift by the same amount. MEASURED:
+    // a build truncating to the tail passed the whole 484-test gate.
+    //
+    // The reference is the SAME take encoded from a LONGER window. The take is
+    // 2 s; the clip is 0.375 s; the render above read exactly the clip's worth
+    // and this one reads all 2 s. Both are truncated to the SAME target frame
+    // count, so under a head slice both must be the take's first
+    // `target_frames` latent frames — bit-identical — and under a tail slice
+    // this one is the last frames of a five-times-longer encode, which is a
+    // different second of the file entirely.
+    //
+    // Bit-identical is not a hope, it is a property of the chain: `Ltx2SlaneyMel`
+    // framing is `center=True` with a FIXED n_fft/2 lookahead, the encoder's
+    // convolutions pad on the leading edge only (`causality_axis = height`,
+    // ltx2_audio_vae.cpp:146-151 and :926-931), this config carries no attention
+    // at any level, and PixelNorm is per-(t, f) location — so latent frame `t`
+    // is a function of a bounded prefix of the waveform and NOT of how much
+    // audio follows it. The one length-dependent effect is the reflect pad at
+    // the waveform's right edge, and it cannot reach the kept frames: it touches
+    // mel frames within n_fft/2 of the end, and the target frames span only the
+    // first ~4 * target_frames mel frames of a 57-frame short encode.
+    vllm::multimodal::VideoGenParams whole = FixtureGen(ws.root + "/a2v_whole");
+    whole.extras[vllm::multimodal::kLtx2AudioPathExtra] = wav;
+    whole.extras[vllm::multimodal::kLtx2AudioMaxDurationExtra] = "2.0";
+    (void)engine->Generate(whole);
+    const vllm::multimodal::Ltx2ConditioningTrace whole_trace = ltx2->last_conditioning();
+    CHECK(whole_trace.audio_conditioned);
+    // Same grid either way: the token count comes from the CLIP (types.py:164-181).
+    CHECK(whole_trace.audio_tokens == trace.audio_tokens);
+    // AND THE SAME CONTENT. This is the whole assertion: a tail slice cannot
+    // produce it, because the two encodes it slices are of different lengths.
+    CHECK(whole_trace.audio_latent_digest == trace.audio_latent_digest);
+    CHECK(whole_trace.audio_latent_absmax == trace.audio_latent_absmax);
+
+    // And the equality is not vacuous — the digest DOES move when the head of
+    // the window moves. Without this control, a build that hashed a constant
+    // would satisfy the equality above for the wrong reason.
+    vllm::multimodal::VideoGenParams later = FixtureGen(ws.root + "/a2v_later");
+    later.extras[vllm::multimodal::kLtx2AudioPathExtra] = wav;
+    later.extras[vllm::multimodal::kLtx2AudioStartTimeExtra] = "1.0";
+    later.extras[vllm::multimodal::kLtx2AudioMaxDurationExtra] = "1.0";
+    (void)engine->Generate(later);
+    const vllm::multimodal::Ltx2ConditioningTrace later_trace = ltx2->last_conditioning();
+    CHECK(later_trace.audio_tokens == trace.audio_tokens);
+    CHECK(later_trace.audio_latent_digest != trace.audio_latent_digest);
+  }
+
+  SUBCASE("a DIFFERENT window of the take produces a DIFFERENT latent") {
+    // The half a single digest cannot make. Without it, a build that ignored the
+    // file and hashed a constant passes every assertion above. The shapes stay
+    // equal and only the SAMPLES move, so this isolates "were the samples read".
+    vllm::multimodal::VideoGenParams shifted = FixtureGen(ws.root + "/a2v_shifted");
+    shifted.extras[vllm::multimodal::kLtx2AudioPathExtra] = wav;
+    shifted.extras[vllm::multimodal::kLtx2AudioStartTimeExtra] = "0.5";
+    (void)engine->Generate(shifted);
+    const vllm::multimodal::Ltx2ConditioningTrace shifted_trace = ltx2->last_conditioning();
+    CHECK(shifted_trace.audio_conditioned);
+    CHECK(shifted_trace.audio_tokens == trace.audio_tokens);
+    CHECK(shifted_trace.audio_latent_digest != trace.audio_latent_digest);
+  }
+
+  SUBCASE("without an audio file the stream is neither conditioned nor frozen") {
+    // The negative control. `audio_frozen` has to TRACK the request; pinned true
+    // it would make the case above assert a constant, and pinned false it would
+    // silently denoise a supplied take.
+    vllm::multimodal::VideoGenParams plain = FixtureGen(ws.root + "/plain");
+    const vllm::multimodal::VideoResult plain_result = engine->Generate(plain);
+    const vllm::multimodal::Ltx2ConditioningTrace plain_trace = ltx2->last_conditioning();
+    CHECK_FALSE(plain_trace.audio_conditioned);
+    CHECK_FALSE(plain_trace.audio_frozen);
+    // And the sigma control is a CONTROL: a build that pinned the audio sigma to
+    // zero unconditionally would pass the frozen case above while silently
+    // changing every ordinary joint render.
+    CHECK(plain_trace.audio_sigma_max > 0.0);
+    // Same token count either way: the audio grid comes from the CLIP's duration
+    // (types.py:164-181), not from the file, so a differing count here would mean
+    // the supplied take had resized the stream.
+    CHECK(plain_trace.audio_tokens == trace.audio_tokens);
+    CHECK(plain_trace.audio_latent_digest != trace.audio_latent_digest);
+
+    // AND THE PIXELS MOVED. Everything above this line is read off a trace, and
+    // a trace is a change detector: a build that encoded the file, recorded it
+    // faithfully and then handed the DiT the zero latent it always had would
+    // satisfy every assertion so far. LTX-2.5 joins the two streams by explicit
+    // audio<->video cross-attention, so a conditioned audio stream MUST move the
+    // video — same seed, same prompt, same geometry, and the only difference is
+    // the take. This is the assertion that says the conditioning reached the
+    // forward rather than reaching a struct.
+    const std::string with_audio = ReadAll(std::string(result.frame_dir) + "/frame_000000.ppm");
+    const std::string without =
+        ReadAll(std::string(plain_result.frame_dir) + "/frame_000000.ppm");
+    CHECK(with_audio.size() == without.size());
+    // Compared as a COUNT of differing bytes rather than as two strings, because
+    // doctest prints the operands of a failing CHECK and these are binary PPMs:
+    // a plain `!=` turns one regression into a screenful of raw pixel bytes and,
+    // worse, non-UTF-8 output that a harness reading the log can choke on.
+    size_t differing = 0;
+    const size_t common = std::min(with_audio.size(), without.size());
+    for (size_t i = 0; i < common; ++i) {
+      if (with_audio[i] != without[i]) ++differing;
+    }
+    INFO("frame_000000.ppm differs in " << differing << " of " << common << " bytes");
+    CHECK(differing > 0);
+  }
+}
+
+TEST_CASE("ltx2 video: every audio-input mismatch is refused BY WHAT IS WRONG") {
+  // Each of these renders a finished clip if it is accepted, which is why every
+  // one is a refusal rather than a conversion. The assertions hold each message
+  // to naming the numbers a reader needs, not merely to throwing.
+  Workspace ws;
+  const std::unique_ptr<vllm::multimodal::VideoEngine> engine =
+      vllm::multimodal::LoadVideoEngine(ConditioningParams(ws.paths));
+
+  auto refusal = [&](const std::string& dir,
+                     void (*arm)(vllm::multimodal::VideoGenParams&, const std::string&),
+                     const std::string& wav) {
+    vllm::multimodal::VideoGenParams gen = FixtureGen(ws.root + "/" + dir);
+    arm(gen, wav);
+    try {
+      (void)engine->Generate(gen);
+      FAIL_CHECK("expected a refusal for " << dir);
+      return std::string();
+    } catch (const std::exception& e) {
+      return std::string(e.what());
+    }
+  };
+  auto just_path = [](vllm::multimodal::VideoGenParams& g, const std::string& w) {
+    g.extras[vllm::multimodal::kLtx2AudioPathExtra] = w;
+  };
+
+  SUBCASE("a sample rate the mel front-end does not target") {
+    // Upstream RESAMPLES here (ops.py:40) with an arbitrary-ratio polyphase
+    // kaiser resampler this project has not ported. Reading 44.1 kHz samples at
+    // the checkpoint's rate pitches and time-shifts the conditioning while every
+    // shape checks out, so both rates go in the message.
+    //
+    // The TARGET rate asserted here is the fixture's 24000, which is neither the
+    // shipped 16000 nor `Ltx2ParseAudioEncoderConfig`'s own default. That is the
+    // point: with the fixture at 16000 this assertion passed against a parser
+    // that never read `params.sampling_rate` at all.
+    const std::string wav = WriteWav(ws.root + "/44k.wav", 2, 44100, 2.0);
+    const std::string message = refusal("rate", just_path, wav);
+    INFO("refusal: " << message);
+    CHECK(message.find("44100") != std::string::npos);
+    CHECK(message.find(std::to_string(kFixtureAudioRate)) != std::string::npos);
+    CHECK(message.find("ops.py:40") != std::string::npos);
+  }
+
+  SUBCASE("a channel count the encoder does not declare") {
+    // `MiniMaxH3ReadWav` would REPEAT a mono take across both channels
+    // (minimax_h3.h:1839-1845). That is H3's contract; LTX-2 hands the file's own
+    // channel count to a conv declaring 2, so a mono file is an error upstream
+    // too, and duplicating it would condition on audio nobody supplied.
+    const std::string wav = WriteWav(ws.root + "/mono.wav", 1, kFixtureAudioRate, 2.0);
+    const std::string message = refusal("channels", just_path, wav);
+    INFO("refusal: " << message);
+    CHECK(message.find("1 audio channel") != std::string::npos);
+    CHECK(message.find("in_channels = 2") != std::string::npos);
+  }
+
+  SUBCASE("a take SHORTER than the clip") {
+    // The subtle one, and the reason the truncation and the assertion have to be
+    // read together. `a2vid_two_stage.py:202` truncates and never pads, and
+    // `tools.py:253-255` then asserts the latent matches the target shape — so a
+    // short take is an ERROR upstream, not a short latent. Padding it here would
+    // weld silence onto the end of the take and still render.
+    const std::string wav = WriteWav(ws.root + "/short.wav", 2, kFixtureAudioRate, 0.04);
+    const std::string message = refusal("short", just_path, wav);
+    INFO("refusal: " << message);
+    CHECK(message.find("tools.py:253-255") != std::string::npos);
+    CHECK(message.find("a2vid_two_stage.py:202") != std::string::npos);
+  }
+
+  SUBCASE("the take is measured against the checkpoint's OWN FFT size") {
+    // This case exists to make `stft.filter_length` observable, and it took a
+    // surviving mutation to find out that nothing else can. MEASURED: reading
+    // `stft.n_fft` — the name torchaudio uses, the name a reader writes from
+    // memory, and NOT upstream's key — instead of `stft.filter_length` passed
+    // the focused gate at 3 cases / 95 assertions with the decoy already in the
+    // fixture. The decoy is necessary and it is not sufficient.
+    //
+    // The reason is worth writing down: the FFT size moves the mel VALUES and
+    // not the frame count, because `frames = 1 + (samples + 2 * (n_fft / 2) -
+    // n_fft) / hop` and the pad cancels the window exactly. Every other audio
+    // assertion in this file is DIFFERENTIAL — one render against another — so a
+    // wrong FFT size moves both sides together and nothing notices.
+    //
+    // What it does change is which takes are decodable at all. `center=True`
+    // reflect-pads by `n_fft / 2` and torch.stft requires the waveform to be
+    // longer than that pad. 360 samples sits BETWEEN the two half-windows: it is
+    // longer than the fixture's declared 512/2 and shorter than the decoy's
+    // 1024/2. So a build reading the decoy refuses this take at the mel front
+    // end, where the correct one carries it through to the clip-length check —
+    // and THAT difference is the assertion.
+    const std::string wav = WriteWav(ws.root + "/hairline.wav", 2, kFixtureAudioRate, 0.015);
+    const std::string message = refusal("hairline", just_path, wav);
+    INFO("refusal: " << message);
+    // It reached the LENGTH check, which means the mel front-end accepted it.
+    CHECK(message.find("tools.py:253-255") != std::string::npos);
+    // And it did NOT stop at the front end's own reflect-pad constraint.
+    CHECK(message.find("center=True") == std::string::npos);
+  }
+
+  SUBCASE("a file that is not RIFF/WAVE") {
+    const std::string path = ws.root + "/not.wav";
+    {
+      std::ofstream out(path, std::ios::binary);
+      out << "ID3\x04\x00\x00 this is not a wav file at all, honestly, not even close";
+    }
+    const std::string message = refusal("container", just_path, path);
+    INFO("refusal: " << message);
+    CHECK(message.find("RIFF/WAVE") != std::string::npos);
+    CHECK(message.find("demuxer") != std::string::npos);
+  }
+
+  SUBCASE("a window that starts past the end of the take") {
+    const std::string wav = WriteWav(ws.root + "/late.wav", 2, kFixtureAudioRate, 1.0);
+    const std::string message = refusal(
+        "late",
+        [](vllm::multimodal::VideoGenParams& g, const std::string& w) {
+          g.extras[vllm::multimodal::kLtx2AudioPathExtra] = w;
+          g.extras[vllm::multimodal::kLtx2AudioStartTimeExtra] = "5.0";
+        },
+        wav);
+    INFO("refusal: " << message);
+    CHECK(message.find("past the end") != std::string::npos);
+    // The REASON is pinned as well as the fact, because a refusal that names the
+    // wrong upstream line sends the next reader to the wrong file and no test
+    // that checks only "it threw" can see that. Read at the pin: every decoded
+    // frame ends before `start_time`, so the loop's `if frame_end < start_time:
+    // continue` drops all of them and `if not samples: return None`
+    // (decode.py:271-272, :281-282) fires — and THAT is what makes
+    // `decoded_audio is None` true at a2vid_two_stage.py:197-198.
+    CHECK(message.find("decode.py:271-272") != std::string::npos);
+    CHECK(message.find("a2vid_two_stage.py:197-198") != std::string::npos);
+  }
+
+  SUBCASE("a window whose DURATION rounds to no samples") {
+    // The sibling of the case above, and a DIFFERENT upstream path — which is
+    // the whole reason it has its own case. `max_samples = round(max_duration *
+    // sample_rate)` is 0 here, and `audio[..., :0]` (decode.py:295-296) is an
+    // `Audio` carrying zero samples rather than `None`, so `decoded_audio is
+    // None` is FALSE and a2vid_two_stage.py:197-198 never fires. Upstream fails
+    // one or two hops later instead. We refuse at the window, which is STRICTER
+    // than upstream, and the message has to SAY that rather than borrowing the
+    // other path's citation.
+    const std::string wav = WriteWav(ws.root + "/tiny.wav", 2, kFixtureAudioRate, 1.0);
+    const std::string message = refusal(
+        "tiny",
+        [](vllm::multimodal::VideoGenParams& g, const std::string& w) {
+          g.extras[vllm::multimodal::kLtx2AudioPathExtra] = w;
+          g.extras[vllm::multimodal::kLtx2AudioMaxDurationExtra] = "0.00001";
+        },
+        wav);
+    INFO("refusal: " << message);
+    CHECK(message.find("no audio samples") != std::string::npos);
+    CHECK(message.find("STRICTER") != std::string::npos);
+    CHECK(message.find("decode.py:295-296") != std::string::npos);
+    // And it must NOT claim the raise the other path gets.
+    CHECK(message.find("does not") != std::string::npos);
+  }
+
+  SUBCASE("a window knob WITHOUT a file cannot do anything, so it is refused") {
+    // The silent-ignore shape this whole extras surface exists to prevent: an
+    // accepted knob that cannot affect the render reads as "the feature does not
+    // work" rather than as "it needs the other flag".
+    const std::string message = refusal(
+        "orphan",
+        [](vllm::multimodal::VideoGenParams& g, const std::string&) {
+          g.extras[vllm::multimodal::kLtx2AudioStartTimeExtra] = "1.0";
+        },
+        std::string());
+    INFO("refusal: " << message);
+    CHECK(message.find("audio_path") != std::string::npos);
+    CHECK(message.find("ignored") != std::string::npos);
+  }
+
+  SUBCASE("a start time that is not a number is refused, not truncated") {
+    // `ExtraInt` would take "0.5s" apart differently; a seconds knob parsed as an
+    // integer would window the wrong second of the take and still render.
+    const std::string wav = WriteWav(ws.root + "/num.wav", 2, kFixtureAudioRate, 2.0);
+    const std::string message = refusal(
+        "nan",
+        [](vllm::multimodal::VideoGenParams& g, const std::string& w) {
+          g.extras[vllm::multimodal::kLtx2AudioPathExtra] = w;
+          g.extras[vllm::multimodal::kLtx2AudioStartTimeExtra] = "0.5s";
+        },
+        wav);
+    INFO("refusal: " << message);
+    CHECK(message.find("audio_start_time") != std::string::npos);
+  }
+}
+
+TEST_CASE("ltx2 video: audio_path on a decoder-only checkpoint names the missing WEIGHTS") {
+  // The refusal that separates "this feature is unported" from "this CHECKPOINT
+  // cannot do it" — a distinction #758 records this project as repeatedly
+  // getting wrong. `Ltx2AudioEncoderForward` and its mel front-end have been
+  // ported and gated since `cefacd2d0`; a decoder-only audio VAE is missing the
+  // WEIGHTS, and the message has to say so, or a reader goes looking for code
+  // that is already there.
+  Workspace ws;
+  // The audio VAE as EVERY LTX-2.5 checkpoint looked before this row.
+  ltx2_fixture::WriteReducedAudioVae(ltx2_fixture::ReducedAudioDecoderConfig(),
+                                     ltx2_fixture::ReducedVocoderBweConfig(),
+                                     ws.paths.audio_vae, /*with_encoder=*/false);
+  const std::unique_ptr<vllm::multimodal::VideoEngine> engine =
+      vllm::multimodal::LoadVideoEngine(ConditioningParams(ws.paths));
+
+  const std::string wav = WriteWav(ws.root + "/drive.wav", 2, kFixtureAudioRate, 2.0);
+  vllm::multimodal::VideoGenParams gen = FixtureGen(ws.root + "/noenc");
+  gen.extras[vllm::multimodal::kLtx2AudioPathExtra] = wav;
+  std::string message;
+  try {
+    (void)engine->Generate(gen);
+    FAIL_CHECK("a decoder-only audio VAE must refuse audio_path");
+  } catch (const std::exception& e) {
+    message = e.what();
+  }
+  INFO("refusal: " << message);
+  CHECK(message.find("audio_vae.encoder.") != std::string::npos);
+  CHECK(message.find("WEIGHTS") != std::string::npos);
+  // And it must NOT send the reader after unwritten code: the forward is ported.
+  CHECK(message.find("audio_vae.py:190-246") != std::string::npos);
 }

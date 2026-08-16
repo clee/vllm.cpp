@@ -501,22 +501,39 @@ and documents an explicit `0` as "skip re-compression entirely") but conditions
 the model on pixels it was not trained to see. That is a render-quality cost, and
 it is stated rather than applied silently.
 
-Keyframe, reference-image, reference-video and reference-audio conditioning are
-still refused, each naming a different missing piece: a last-frame keyframe needs
-the token-APPEND machinery — a keyframe is appended to the sequence with its own
-positions and a rebuilt attention mask, then trimmed back off, and this engine's
-phase loop is fixed at the target grid's token count — while the served
-first-frame arm only REPLACES tokens that already exist; the reference arms need
-that SAME token-append machinery, because a reference latent is appended too
-(their old reason - the IC-LoRA scale factors living in adapter metadata this
-project could not read - was closed on 2026-08-15 by `--lora`, which reads
-them); reference audio additionally needs the AUDIO VAE's encoder key filter,
-which is not built. (Until 2026-08-13 this said a last-frame keyframe needs the
-DiT's unported `keyframes_abs_pos_embedding`. That was wrong: a supplied keyframe
-is appended unmarked, so the embedding never applies to it. Where the embedding
-does bite is the FIRST latent frame of every render, which was a separate gap;
-it was closed on 2026-08-14 under issue #658, so the marker is now applied on
-every render.) Three encoder-level limits are worth
+A **last-frame keyframe is served** as of the token-APPEND seam. A keyframe is
+*appended* to the token sequence with its own pixel positions, denoised as part
+of a longer sequence, and trimmed back off before the latent is unpatchified,
+where the first-frame arm only REPLACES tokens that already exist. It takes the
+same `image_crf=0` and `noise_aug` as the first-frame arm, and both may be
+supplied at once. Two things a previous version of this paragraph got wrong are
+worth naming, because a reader may have acted on them: there is no rebuilt
+attention mask — a supplied keyframe passes `attention_mask=None` and upstream
+returns no mask for it — and the sigma schedule keeps reading the TARGET token
+count rather than the grown one, because upstream derives its shift from the
+unpatchified target. (Until 2026-08-13 this paragraph said a last-frame keyframe
+needs the DiT's unported `keyframes_abs_pos_embedding`. That was wrong: a
+supplied keyframe is appended unmarked, so the embedding never applies to it.
+Where the embedding does bite is the FIRST latent frame of every render, which
+was a separate gap; it was closed on 2026-08-14 under issue #658, so the marker
+is now applied on every render.)
+
+Reference-image, reference-video and reference-audio conditioning are still
+refused, each naming a different missing piece. **Two reasons this page used to
+give are now false and are recorded rather than deleted**, because a reader may
+have planned around them: the IC-LoRA scale factors are read as of `--lora`
+(2026-08-15), and the token-APPEND machinery landed with the last-frame keyframe
+above (2026-08-16). What is left for reference VIDEO and reference IMAGE is a
+pixel path and a stage split. Nothing here turns a clip into latents: upstream
+decodes the reference at `height/downscale x width/downscale`, keeps frame 0 and
+then every Nth frame, and encodes the result
+(`ltx_pipelines/iclora_utils.py:87-89`, `:106-146`), and this engine's only
+pixel-to-latent route encodes exactly one frame at the phase's full resolution.
+And the reference item belongs to stage 1 only: upstream fuses the adapter into
+stage 1 and gives stage 2 `loras=()` and no reference item at all
+(`ic_lora.py:108`, `:119`, `:314-321`), while this engine holds ONE DiT, fused
+at load, that every phase runs. Reference audio additionally needs the AUDIO
+VAE's encoder key filter, which is not built. Three encoder-level limits are worth
 stating in advance because they are refusals rather than approximations. A
 reference waveform whose sample rate differs from the audio VAE's is refused
 rather than resampled, since upstream uses a polyphase kaiser resampler this
@@ -625,10 +642,81 @@ binary P6 at maxval 255 (no PNG/JPEG codec is vendored); `--image-crf 0` is
 required and is not the default, because omitting it resolves the checkpoint's
 own CRF 18 and refuses — see the out-of-distribution note above.
 
-`--frames` must satisfy `(frames - 1) % 8 == 0` and width/height must divide by
-64 (32 for the VAE, twice that because the distilled recipe's first phase runs at
-half resolution). Omitting all three renders the recipe default, which is
-1024x1536 at 121 frames and is a much larger request than it looks.
+Add `--audio-path take.wav` for **audio-to-video**: the render is conditioned on
+a soundtrack you supply rather than one the model invents. The take is encoded
+through the audio VAE's encoder and then held frozen through every denoise
+phase, and the `audio.wav` that comes back is your own input rather than a VAE
+round trip. `--audio-start-time` seeks into the file and `--audio-max-duration`
+caps how much is read; both default to covering exactly the clip's duration, and
+either without `--audio-path` is refused rather than ignored.
+
+What is upstream's here is the **conditioning mechanism** — decode, encode,
+truncate to the clip, freeze — and not the denoise schedule. Upstream's
+audio-to-video stage 1 is a caller-configured guided one, with its
+`a2v_guidance_scale` acting as the guider's modality scale, while a take here
+rides whichever recipe the checkpoint resolves, in practice `distilled_two_stage`
+with fixed sigmas. So the audio drives the render, and no claim is made that the
+result reproduces upstream's own audio-to-video output.
+
+The WAV has to match the checkpoint already: 16-bit PCM RIFF/WAVE, the audio
+VAE's own sample rate (16 kHz on the shipped one), its encoder's channel count
+(2), and at least as long as the clip. None of the four is converted. There is
+no resampler for an arbitrary ratio here and no demuxer at all, and a take
+shorter than the clip is an error upstream too, so each mismatch is refused with
+both numbers in the message — a resampled-wrong, upmixed or silence-padded take
+renders a finished clip conditioned on audio nobody supplied. This needs an
+audio VAE that carries encoder weights; a decoder-only one refuses by name.
+
+#### The supported resolution envelope
+
+**`--width` and `--height` are enforced, and an unsupported value is refused by
+name.** Both must be multiples of the VAE's spatial factor (32) times the worst
+downscale the recipe's phases apply — so **64 on the distilled two-stage recipe**,
+whose first phase runs at half resolution, and **32 on a one-stage recipe**. Those
+are upstream's own two numbers (`assert_resolution`,
+`ltx-pipelines utils/helpers.py:540-551`), reached by upstream's derivation rather
+than hardcoded, so a recipe that downscaled further would tighten the divisor with
+it. The refusal names the offending axis — width, height, or both — the divisor,
+and a size you can actually pass: the nearest legal one at or below the request,
+or, when an axis is smaller than the divisor and no such size exists, the
+smallest legal size there is.
+
+Until 2026-08-15 nothing enforced this and the engine floored instead: a
+two-stage request of width 80 rendered 64 and returned success, and a one-stage
+request of width 100 rendered 96 ([#919](https://github.com/mudler/vllm.cpp/issues/919)).
+
+**`--frames` is NOT enforced, and it rounds.** A frame count is floored onto the
+VAE's temporal grid, `(frames - 1) / 8 * 8 + 1`, so 100 frames renders 97. This
+mirrors upstream, which floors an explicit `num_frames` identically
+(`ltx_core/types.py:113`) and validates it nowhere: its `snap_frames_to_grid`
+helper is called from the auto-duration path and from the dubbing pipeline, and
+that pipeline takes no frame count at all — it snaps one read from a reference
+video's container. No frame count a caller supplies is snapped or checked, in
+either project. Pass a value of the form `8k + 1` to get exactly what you asked
+for. The rounding is observable either way: `result.frame_count`, `result.width`
+and `result.height` report what was actually rendered, not what was requested.
+
+Omitting all three renders the recipe default, which is 1024x1536 at 121 frames
+and is a much larger request than it looks.
+
+**What is legal is not what fits.** The first two rows below are a property of
+this port and are enforced. The rest are scale markers, and the last two are
+measurements of one box rather than limits of the code:
+
+| | Value |
+|---|---|
+| Legal sizes | any multiple of 64 (two-stage) or 32 (one-stage), on both axes |
+| Legal frame counts | any; non-`8k + 1` values floor onto the temporal grid |
+| Upstream's default output | 1024x1536 at 121 frames (`utils/constants.py:42-76`) |
+| Upstream's HQ preset output | 1088x1920 at 121 frames (`utils/constants.py:95-98`) |
+| **Measured to complete on one GB10** | **320x192 at 25 frames** |
+| Measured NOT to complete | 448x256 at 25 frames — the denoise finishes, then the decode loses about 59 GB in 24 s |
+
+That gap between the legal envelope and the measured one is a decode problem, not
+a resolution cap: there is no maximum-size check anywhere in this path, and the
+60 GB is **not attributed** — the decode's own heap peak at that size is 361.72
+MiB, some 170x too small to account for it. See the note below on what bounds a
+render, and `.agents/specs/ltx25-tiled-decode.md`.
 
 `--lora ic-lora.safetensors [STRENGTH]` fuses an IC-LoRA adapter into the DiT at
 load, mirroring upstream's `--lora PATH [STRENGTH]`
@@ -650,8 +738,9 @@ accepted so far.
 Supplying an adapter also reads its `reference_downscale_factor` and
 `reference_temporal_scale_factor` metadata (`iclora_utils.py:30-49`). Those are
 what a reference video needs, and reading them was what the reference refusal
-used to say was missing - it now names the token-append machinery instead, which
-is the cause that actually remains.
+used to say was missing. It no longer says that, and it does not say
+token-append either: that seam landed too. What it names now is the reference
+CLIP's own pixel path and the stage split, both above.
 
 `--upsampler` is what the distilled recipe's second phase needs. Without it that
 phase refuses rather than skipping: its three-step refinement is what makes the
@@ -1330,9 +1419,24 @@ identical to one built before it existed. See
 
 ### Speech and music generation
 
+A **music-only server**, which is what you almost certainly want:
+
+    vllm-server --speech-model /path/to/minimax-music3 \
+      [--speech-family minimax-music3] [--port 8000]
+
+**`--model` is not required here**, and that is deliberate. Upstream's own recipe
+is `sgl-omni serve --model MiniMaxAI/MiniMax-Music3` and nothing else: a music
+model is not an accessory to a text model. With `--speech-model` alone this
+server loads the music checkpoint, registers `/v1/audio/speech`, and registers
+**nothing else** — no `/v1/completions`, no `/v1/chat/completions`. That is the
+same task-conditional shape a pooling checkpoint (`/v1/embeddings` only) and a
+Parakeet checkpoint (`/v1/audio/transcriptions` only) already take here, and the
+same one vLLM's `api_server.py:255-265` uses.
+
+Attach it to a text server instead, and one process serves both surfaces:
+
     vllm-server --model /path/to/text-model \
-      --speech-model /path/to/minimax-music3 \
-      [--speech-family minimax-music3]
+      --speech-model /path/to/minimax-music3
 
 `--speech-model` names the checkpoint **set** — MiniMax-Music3 ships six
 component directories beside a `modular_model_index.json`, so this is not a
@@ -1340,7 +1444,38 @@ single model directory. `--speech-family` is optional: omitted, the family is
 **detected** by inspecting the artifact, and a directory no registered family
 claims is refused at startup naming every family that was tried. A name that is
 not registered is refused too; it is never treated as a hint, because the wrong
-family would not fail — it would render noise.
+family would not fail — it would render noise. `--speech-family` without
+`--speech-model` is still an error: there is nothing to load it from.
+
+In the speech-only form the served model name defaults to the **family**
+(`minimax-music3`) rather than to a directory basename, because there is no
+`config.json` to take one from. `--served-model-name` still wins.
+
+A successful music-only start prints what it resolved, so you can tell a working
+server from a listening one without sending a request:
+
+    server: speech/music-only model (family=minimax-music3, 44100 Hz,
+            text-only synthesis, family DETECTED); serving /v1/audio/speech
+    server: listening on http://0.0.0.0:8000 (model 'minimax-music3')
+
+`family DETECTED` means the artifact was inspected; `family DECLARED` means you
+passed `--speech-family`. `text-only synthesis` is the answer to
+`requires_reference_audio()` — a family that needs a reference clip says
+`reference clip REQUIRED` there instead, and refuses a clipless request before
+anything stages.
+
+Or skip HTTP entirely. `minimax-music3-gen` drives the same seam through the C
+ABI and writes the WAV itself:
+
+    minimax-music3-gen --model /path/to/minimax-music3 --out song.wav \
+      --lyrics @lyrics.txt --description "Genre: acoustic pop. BPM: 96." \
+      --duration 8 --steps 8 --seed 7
+
+`--lyrics` and `--description` take literal text or `@path` to read a file,
+because lyrics are multi-line and a `[Verse]` tag inside an argv is easy to
+mangle. It prints the delivered length, rate, channels, RMS, peak and wall clock
+to stderr — the *delivered* length, not the requested one, because a duration
+resolves to a whole number of 25 Hz frames and is therefore quantized.
 
 The route is OpenAI's `createSpeech` shape, with the two **music** inputs as
 additional named fields:
@@ -1357,18 +1492,45 @@ The response body is RIFF/WAVE 16-bit PCM at the family's **native** rate
 (44100 Hz stereo for MiniMax-Music3, never resampled), with content type
 `audio/wav`.
 
-`lyrics` and `description` are separate fields rather than one `input` behind a
-separator because upstream runs a different normalizer over each. A
-one-utterance family keeps using OpenAI's `input`. `prompt` is the documented
-alias for `description`, and supplying both with different values is a 400
-rather than a silent winner.
+**Every field, and what it does.** Anything not in this table is refused by name
+rather than ignored — see below the table for why that polarity matters here.
 
-Refused by name rather than ignored, because honouring any of them silently
-would return audio the caller did not ask for: `voice` (no registered family
-exposes named voices), `speed` (no family implements a rate control), `stream` /
-`stream_format` (MiniMax-Music3 generates the whole song before the first sample
-exists, so buffering it would be a stream in name only) and any
-`response_format` other than `"wav"` (no mp3/opus/aac/flac encoder is vendored).
+| field | type | default | what it does |
+|---|---|---|---|
+| `lyrics` | string | **required** for MiniMax-Music3 | the sung text, with `[Verse]` / `[Chorus]` section tags. An empty lyric normalizes to a bare `[start]` prompt, so it is a 400 rather than an instrumental |
+| `description` (alias `prompt`) | string | **required** for MiniMax-Music3 | genre, BPM, key, instrumentation, mood. NOT a voice or speaker description. Supplying both spellings with different values is a 400, never a silent winner |
+| `audio_duration` (alias `duration`) | number, seconds | `60` | resolved to `int(seconds x 25)` autoregressive frames, then **clamped** to the 9000-frame ceiling — the same silent clamp upstream applies (`encoders.py:287`). Shorter than one frame (0.04 s) is a 400 |
+| `num_inference_steps` | integer | `30` | flow-matching Euler steps in the acoustic half. Must be > 0 |
+| `guidance_scale` | number | `1.7` | classifier-free guidance on the DiT. **0 is legal** and selects the unconditional branch, so omitting the field is how you ask for the default — not sending 0 |
+| `seed` | integer | `0` | seeds the autoregressive top-k draw *and* the initial denoise latents. A fixed seed, not a random one: 0 is as deterministic as any other value |
+| `model` | string | — | echoed; the route does not check it |
+| `response_format` | string | `"wav"` | `"wav"` is the only accepted value |
+
+`lyrics` and `description` are separate fields rather than one `input` behind a
+separator because upstream runs a different normalizer over each — `_clean_caption`
+on the description, `_normalize_lyrics` on the lyrics (`encoders.py:54-91`). A
+one-utterance family keeps using OpenAI's `input`; MiniMax-Music3 refuses it, so
+a request cannot half-arrive.
+
+**We expose `guidance_scale` where neither upstream arm does.** In diffusers it
+is frozen into the guider component at 1.7 (`denoise.py:180`); in SGLang-Omni it
+is a serve-time knob (`dit_cfg_scale`) and not a request field. It is a genuine
+per-request control here, and its default is upstream's 1.7.
+
+**Every refusal, and the one rule behind them.** A knob the server will not
+honour must not come back behind a 200. Silently dropping one returns audio the
+caller did not ask for with nothing to say so — and this project has already paid
+for that once (#925), which is why the list is long rather than convenient.
+
+| refused | why |
+|---|---|
+| `audio_duration_s` | the name of the *field* the key fills, not a key. It is the misspelling you reach for by reading the struct instead of the docs, and dropping it silently returned the 60 s default: 0.1 s became 60 s, 2 autoregressive frames became 1500, and this project's own e2e gate spent four multi-hour runs inside a 750x job it read as a hung weight load (#852, #925) |
+| `voice` | no registered family exposes named voices, and there is no enumeration endpoint to pick one from. Upstream refuses it too (`request_builders.py:90-92`) |
+| `speed` | no family implements a rate control. Upstream accepts only `1.0` (`request_builders.py:83-89`) |
+| `stream`, `stream_format` | MiniMax-Music3 generates the whole song before the first sample exists, so buffering it into chunks would be a stream in name only. **Upstream has no streaming either** — SGLang-Omni declares `supports_streaming_vocoder=False` and rejects `stream=true` by name (`request_builders.py:115-116`) |
+| `response_format` other than `"wav"` | no mp3/opus/aac/flac encoder is vendored, and relabelling RIFF bytes is worse than refusing |
+| `temperature`, `top_p`, `top_k`, `repetition_penalty` | this model's autoregressive stage has ONE sampler — a fixed top-50 draw (`encoders.py:48,94-103`). There is no temperature to set and no nucleus branch to widen, so the knob can be neither honoured nor honestly ignored. Upstream refuses all four (`request_builders.py:14-19,109-114`). Use `seed` to control the draw |
+| `max_new_tokens` | SGLang-Omni's spelling of the length, counted in 25 Hz **frames** rather than seconds (`request_builders.py:56-68`). This route takes `audio_duration` in seconds — divide by 25. Two spellings of one meaning on one route is exactly what #925 was |
 
 A family with no text-only synthesis — IndexTTS-2.5 is one — is refused
 **before** anything stages: the route asks the loaded engine's
@@ -1379,10 +1541,26 @@ WAV.
 **Every stage of MiniMax-Music3 is implemented and gated**, and a request
 reaches all of them: the 8.6B `Qwen3ForCausalLM` autoregressive stage, the RVQ
 depth decoder, the learned condition mix, the flow-matching DiT and the DAC
-Flow-VAE vocoder. **A composed request has not yet been observed to completion
-on CPU** — see the caveat below, and `.agents/specs/minimax-music3.md`. There is
-no by-name refusal left: nothing here is unimplemented. IndexTTS-2.5 still
-refuses naming its own missing pieces.
+Flow-VAE vocoder. **A composed request has been observed to completion** — an
+HTTP POST returns a real 44100 Hz stereo WAV (#852) — and the end-to-end gate
+now runs it over a real socket against a music-only server. There is no by-name
+refusal left: nothing here is unimplemented. IndexTTS-2.5 still refuses naming
+its own missing pieces.
+
+**What no gate compares is the music itself.** The autoregressive codes are a
+seeded `torch.multinomial` draw and the denoise loop's initial latents are a
+seeded normal draw, so a request's waveform can never equal the oracle's golden
+— twice over, and structurally rather than by omission. Every *stage* is gated
+against the capture on the capture's own recorded inputs; a **generated** song
+is evidence that the pipeline runs, not that the notes are right. Believe the
+stage gates, and listen with that in mind.
+
+**Ask for less than 8 seconds while you are exploring.** `Music3ChunkPlan` only
+splits past 200 autoregressive frames, which is 8 s of audio, and the
+multi-window composition — the overlap blend, the carry span, the waveform crop
+across windows — is this row's one named coverage gap: each primitive is gated
+individually, the composition across windows is not, because the oracle capture
+is a single 25-frame window.
 
 **It runs on CPU and it is slow.** Every gate this row has was taken on CPU
 (`dgx.casa` was down throughout), and the acoustic half is upstream's own fp32.
@@ -1396,6 +1574,31 @@ the DiT do not — they are scalar host loops with a double accumulator, written
 that way in W2-W5 so their reduction order is reproducible against torch, and
 they run single-threaded. In one 0.1 s request the depth decoder alone is the
 majority of the wall clock.
+
+**A first sample, measured.** Two seconds of stereo music, generated by this
+engine through `minimax-music3-gen` on an idle-to-busy 20-core x86 CPU box:
+
+| property | value |
+|---|---|
+| duration | 1.9969 s (88 064 frames per channel) |
+| rate / channels | 44 100 Hz, 2 channels, 16-bit PCM |
+| RMS | 0.03169 full-scale |
+| peak | 0.97437 full-scale, **0 clipped samples** |
+| L != R | 84 073 of 88 064 positions, so the stereo fold is real rather than a duplicated channel |
+| wall clock | **3286 s** (54.8 min) for 2.0 s of audio, at `--steps 2`, load average 40-150 throughout |
+
+**Its samples are compared to nothing.** The token gate this row once promised
+was withdrawn — upstream's autoregressive stage has no greedy path — and a
+generated waveform can never equal the oracle's golden anyway, because both the
+codes and the initial latents are seeded random draws. So the numbers above
+demonstrate that the pipeline runs end to end and produces a well-formed,
+non-silent, non-clipped, genuinely stereo signal. They say nothing about whether
+the music is right. The per-stage gates are what say that.
+
+The clip is **not committed**: `scripts/check-pr-size.py` classifies every
+repository path, and no classified path accepts a `.wav` outside `tests/`, where
+a file compared to nothing would sit beside the goldens and imply it was one.
+Regenerate it instead — the command above is the whole recipe.
 
 The same seam is reachable from the C ABI at v20 — `vllm_speech_engine_load`,
 `vllm_speech_engine_family` / `_sample_rate` / `_requires_reference_audio`,
@@ -1462,7 +1665,7 @@ a stop token early.
 | `--tool-call-parser <name>` | `hermes` | Tool-call dialect (42 names over 38 families). `auto` detects from the chat template, `none` disables. For `gemma4`, OpenAI chat uses the text-seam parser (wrapped `<\|tool_call>` **or** bare `call:NAME{ARGS}`) so free-form / detokenized tool bodies still become `tool_calls`. **`inkling` needs `"skip_special_tokens": false` on the request today** — its whole grammar is special tokens and we have no `adjust_request` seam to force the flag off for you, so at the `true` default the detokenizer strips the markers before the parser runs ([#695](https://github.com/mudler/vllm.cpp/issues/695)). `--reasoning-parser inkling` is not registered at all ([#703](https://github.com/mudler/vllm.cpp/issues/703)) |
 | `--reasoning-parser <name>` | `none` | Reasoning parser (`think_auto`, `deepseek_r1`, `deepseek_v3`, `holo2`, `mistral`, `minimax_m2`, `minimax_m2_append_think`, `step3`, `olmo3`, `muse_glimmer`, `qwen3`, `mimo`). `auto` detects, `none` disables. `qwen3` and its `mimo` alias are the engine-backed adapter (one upstream class, two registry names): thinking is ON, so a marker-less stream is reasoning and a `<tool_call>` ends reasoning with no `</think>`. `auto` never selects it — a generic `<think>` template resolves to `think_auto`, which is the right default for hybrid-thinking models that may answer with no think block at all |
 | `--kv-transfer-config '<json>'` | (unset) | External KV connector, same JSON as vLLM's flag. See [docs/KV-OFFLOAD.md](KV-OFFLOAD.md) |
-| `--offload-config '<json>'` | (unset) | Weight offload, the same JSON vLLM's `OffloadConfig` takes (distinct from `--kv-transfer-config`, which offloads KV blocks). Parsed and validated at startup, so a malformed document, an unknown backend or a validator violation is refused before any model I/O; a backend/field mismatch is a warning, as upstream. **Accepted and inert today: no weight moves yet**, and on unified memory such as GB10 it cannot help at all because host and device share one pool. See [docs/WEIGHT-OFFLOAD.md](WEIGHT-OFFLOAD.md) |
+| `--offload-config '<json>'` | (unset) | Weight offload, the same JSON vLLM's `OffloadConfig` takes (distinct from `--kv-transfer-config`, which offloads KV blocks). Parsed and validated at startup, so a malformed document, an unknown backend or a validator violation is refused before any model I/O; a backend/field mismatch is a warning, as upstream. **Enabling it fails startup on every model today**: no loader consults the offloader, so the engine refuses the configuration by architecture name rather than accept a budget that frees nothing. A config that leaves offloading disabled still parses and reports normally. On unified memory such as GB10 offload cannot help at all, because host and device share one pool. See [docs/WEIGHT-OFFLOAD.md](WEIGHT-OFFLOAD.md) |
 | `--speculative-config '<json>'` | (unset) | Speculative decoding (`mtp`, `dflash`, `ngram`), same JSON as vLLM's flag. `dspark` speculates on the Qwen3.6 gate models (native + Speculators drafts), token-identically to speculative-off, but is not gated on speed: the cross-engine ratio is UNSETTLED, with a matched-and-warm paired measurement of 0.834x against the pinned oracle and the earlier 0.957x-0.989x figures taken against a single COLD oracle invocation on a machine that has since been reimaged. A GGUF target, or a target with no aux multi-tap, is refused by name (`SPEC-DSPARK`). Its sequential Markov sampling runs on device by default; `VT_DSPARK_DEVICE_SAMPLE=0` restores the host loop (token-identical, cost only). The speculative verify runs from a captured CUDA graph, worth +12.2%/+3.5% on the 35B cells; `VT_SPEC_DECODE_GRAPH=0` restores the eager verify (also token-identical). See [docs/SPECULATIVE-DECODING.md](SPECULATIVE-DECODING.md) |
 | `--language-model-only` / `--no-language-model-only` | off | Disable all multimodal input by setting **every** modality limit to 0, mirroring vLLM's flag of the same name. It is not a "skip the encoder" switch: the server then **refuses** a multimodal request with ``400 At most 0 image(s) may be provided in one prompt. Set `--limit-mm-per-prompt` to increase this limit.`` It does **not** free VRAM yet — nothing gates tower construction on it ([#607](https://github.com/mudler/vllm.cpp/issues/607) wave L3) |
 | `--limit-mm-per-prompt '<json>'` | (unset ⇒ 999 per modality) | Maximum multimodal input items per prompt, per modality, as the same JSON object vLLM's flag takes: `'{"image": 2, "video": 0}'`, or with profiling options `'{"video": {"count": 1, "num_frames": 32}}'` (the options are validated and ignored — they size dummy inputs for memory profiling, which this engine does not do). A limit can only **lower** what the model/seam supports, never raise it. Malformed JSON, a negative count, or an unknown option on `image` / `video` / `audio` is refused at startup rather than defaulted. An unknown option on any other modality name is dropped rather than refused, mirroring upstream, whose fallback `BaseDummyOptions` is the one such dataclass without `extra="forbid"`. Upstream's dotted spelling (`--limit-mm-per-prompt.image 2`) is not accepted here, as for `--kv-transfer-config` and `--speculative-config` |
@@ -2628,6 +2831,112 @@ NVFP4) and misses `.bias` (BF16, so a different unpack path) while the config
 still says the projection is biased. Without the refusal that renders a plausible
 video for the wrong prompt: every conditioning row is shifted by the missing bias
 and every padded row projects to 0 instead of to the bias.
+
+## MiniMax-Music3: the exact weights (so a song is reproducible)
+
+**The repository is 57.4 GB and the arm we load is 28.5 GB**, because
+`MiniMaxAI/MiniMax-Music3` ships the same weights **twice**: a native
+`AbabForCausalLM` + `.pth` layout that SGLang-Omni serves, and a `diffusers`
+six-component layout. They are the same numbers in a different arrangement —
+diffusers' own `scripts/convert_minimax_music3_to_diffusers.py` renames tensors
+and does nothing else — and this port loads the diffusers one. So the download
+is 57.4 GB unless you filter, and what has to fit is 28.5 GB.
+
+### The arm that loads: `diffusers`, bf16 + fp32
+
+Repository [MiniMaxAI/MiniMax-Music3](https://huggingface.co/MiniMaxAI/MiniMax-Music3),
+revision **`fbdf52fbaaca799592917417eb05f1899f1255ec`**. First-party. A repo id
+alone is not a pin — checkpoints do get re-quantized in place under an unchanged
+name — so the revision is recorded, and it was verified rather than copied:
+`condition_encoder/diffusion_pytorch_model.safetensors` on disk here hashes to
+`83179c5eaa9a68a370affe0c1b96c2179f659ea4175666b31071490a202c2a4d`, which is
+that revision's own LFS record for the file.
+
+| component | file(s) | size | dtype on disk |
+|---|---|---|---|
+| `language_model/` | `model-0000{1,2,3,4}-of-00004.safetensors` + index | **17.17 GB** | BF16 |
+| `transformer/` | `diffusion_pytorch_model-0000{1,2}-of-00002.safetensors` + index | **9.73 GB** | **F32** |
+| `rvq_depth_decoder/` | `diffusion_pytorch_model.safetensors` | **1.29 GB** | BF16 |
+| `vocoder/` | `diffusion_pytorch_model.safetensors` | **217 MB** | F32 |
+| `condition_encoder/` | `diffusion_pytorch_model.safetensors` | **101 MB** | F32 |
+| `tokenizer/` | `tokenizer.json` + `tokenizer_config.json` + `chat_template.jinja` | **11 MB** | — |
+| `scheduler/` | `scheduler_config.json` | 483 B | — |
+| the root itself | `modular_model_index.json`, `config.json`, `README.md` | 14 KB | — |
+| | **resident total** | **28.5 GB** (28 517 617 303 B) | |
+
+The transformer being 9.73 GB for a 2.4B model is **fp32 storage, not a 4.9B
+model** — that is upstream's own choice for the acoustic half and we mirror it.
+The download:
+
+    hf download MiniMaxAI/MiniMax-Music3 --revision fbdf52fb \
+      --local-dir "$CHECKPOINT_ROOT/minimax-music3" \
+      --exclude 'qwen_7B/*' '*.pth'
+
+Two components are BF16 and three are F32, and **that set is not runnable as
+stored**. Upstream casts in exactly two places, so the language model, the RVQ
+depth decoder and the condition encoder must share one dtype; the gated
+configuration is bf16 for those three and fp32 for the transformer and vocoder.
+The loader enforces it and refuses a violation by name. The section below has
+the detail.
+
+### The arm that is REFUSED: the native `.pth` layout
+
+The same repository's other 28.9 GB. **We refuse it by name** — a tree in this
+shape is diagnosed as the native arm, told which diffusers components it lacks,
+and pointed at the conversion script. It is never silently mis-loaded.
+
+| file | size | what it holds |
+|---|---|---|
+| `qwen_7B/qwen_7B/` | ~17 GB | `AbabForCausalLM` shards; the RVQ depth decoder and the audio embedding live *inside* them as `model.audio_decoder.*` / `model.audio_extra_embedding` |
+| `flowmatching_vae.pth` | ~9.7 GB | the DiT plus the condition projection |
+| `dav.pth` | ~0.2 GB | the DAC Flow-VAE decoder |
+
+**SGLang-Omni serves this arm exclusively.** If you are comparing against
+`sgl-omni serve`, that is the layout it reads — same weights, so the comparison
+is valid, but not the same files.
+
+### The quantized arm that IS implemented: GGUF Q4_K, one component
+
+| field | value |
+|---|---|
+| repo | [audio-cpp/MiniMax-Music3-GGUF](https://huggingface.co/audio-cpp/MiniMax-Music3-GGUF) — **third party**, not MiniMaxAI |
+| revision | `c36aaeed683f33b05796788e4204f4eeba8fa547` |
+| file | `rvq_depth_decoder_q4_k.gguf` |
+| size | 405 752 480 bytes (406 MB, against 1.29 GB bf16) |
+| sha256 | `4c5d41b27418d9c1046345f649cb61d7cde0e3bbda4af7f7cb142df2c70cbdd0` |
+| contents | 47 tensors: 36 Q4_K projections, 9 BF16 norms, 2 F16 embedding tables |
+
+It is the **only** quantized arm implemented, and one component is not a
+quantized model. The remaining four are refused by name and owed; the section
+"MiniMax-Music3: the quantized arms" below records what each refusal says.
+
+### The quantized arms that are REFUSED — and they are all third-party
+
+**MiniMaxAI ships bf16/fp32 only.** A HuggingFace survey on 2026-08-14 found
+**fourteen community repositories in five formats**, published within days of the
+release, and none of them is from the model's authors. Every one carries
+different provenance from a first-party release, and every one except the single
+Q4_K file above is refused by name.
+
+| format | repositories | coverage | state |
+|---|---|---|---|
+| GGUF, `audiocpp` lineage | [audio-cpp/MiniMax-Music3-GGUF](https://huggingface.co/audio-cpp/MiniMax-Music3-GGUF) | all five components, bf16 and Q4_K arms | `rvq_depth_decoder_q4_k` **LOADS**; `transformer_q4_k` (1 396 MB), `language_model_q4_k` (7 184 MB), `vocoder` (217 MB) and `condition_encoder` (101 MB) are **OWED**. Note the last two are bf16 GGUF, not k-quant — same size as the safetensors, so they buy nothing |
+| GGUF, `mm3` lineage | [scragnog/MiniMax-Music3-GGUF](https://huggingface.co/scragnog/MiniMax-Music3-GGUF) | 2-file split (`mm3-lm-*` / `mm3-synth-*`), 13 tiers incl. MXFP4 and NVFP4 as GGML tensor types | **REFUSED**: needs a rename table *plus* fused QKV to split and folded weight-norm to invert. Its NVFP4 tier uses GGML type id 40, which is not a standard llama.cpp id |
+| GGUF, ComfyUI lineage | [Abiray](https://huggingface.co/Abiray), [realrebelai/MiniMax-Music-3_GGUFs](https://huggingface.co/realrebelai/MiniMax-Music-3_GGUFs), [molbal](https://huggingface.co/molbal), [ChrisColeTech](https://huggingface.co/ChrisColeTech) | the 2.46B **DiT alone**, Q2_K…Q8_0, 0.9-2.7 GB | **REFUSED, and it can never be a complete arm**: these files carry the DiT and condition encoder only — no language model, no depth decoder, no vocoder — so even a finished GGUF arm would not make them generate audio |
+| int8 / w4a8 | [Comfy-Org/MiniMax-Music-3](https://huggingface.co/Comfy-Org/MiniMax-Music-3) (`_int8_convrot`), [NidAll/MiniMax-Music3-W4A8](https://huggingface.co/NidAll/MiniMax-Music3-W4A8), [dummy9996/…-w4a8-bf16-comfyui](https://huggingface.co/dummy9996) | DiT | **REFUSED** by name |
+| MLX 4/6/8-bit | [ddalcu](https://huggingface.co/ddalcu), [vanch007](https://huggingface.co/vanch007), [elishabjm](https://huggingface.co/elishabjm) | | **REFUSED**: MLX is a shared seam this project implements for no model, so it is not a per-model addition |
+| proprietary | [infosave/MiniMax-Music-3-cmf](https://huggingface.co/infosave/MiniMax-Music-3-cmf) (Cortiq 4-bit) | | **not implementable**, recorded rather than owed |
+
+**"The GGUF arm" is three mutually incompatible lineages, and
+`general.architecture` cannot separate them** — it reads `audiocpp`, `mm3`,
+`qwen3` and `wan` across files of the same model, and `wan` collides with genuine
+Wan video GGUFs. That is why the detector keys on
+`audiocpp.model_spec.family` instead, and why pointing a `.gguf` at this loader
+gets a refusal naming the lineage rather than a shape error.
+
+**NOT found** by those queries on that date: AWQ, GPTQ, compressed-tensors, fp8 /
+`fp8_e4m3fn` / `fp8_scaled`, bitsandbytes. That is "not found by these queries on
+this date", never "does not exist".
 
 ## MiniMax-Music3: the checkpoint loader
 
