@@ -4161,12 +4161,13 @@ vllm::multimodal::VideoModelParams RetakeParams(const ltx2_fixture::Paths& paths
 // `vllm_video_params::ref_video` has always meant and what `minimax-h3-gen`
 // writes. 9 frames satisfies 8k+1 and 64x64 is a multiple of 32, so the
 // fixture's (8, 32, 32) factors give a 2 x 2 x 2 latent — 8 tokens.
-std::string WriteRetakeClip(const std::string& dir, int frames, int height, int width) {
+std::string WriteRetakeClip(const std::string& dir, int frames, int height, int width,
+                            unsigned seed_base = 41) {
   ::mkdir(dir.c_str(), 0755);
   for (int i = 0; i < frames; ++i) {
     char name[64];
     std::snprintf(name, sizeof(name), "/frame_%06d.ppm", i);
-    WriteBytes(dir + name, ConditioningPpm(height, width, static_cast<unsigned>(41 + i)));
+    WriteBytes(dir + name, ConditioningPpm(height, width, seed_base + static_cast<unsigned>(i)));
   }
   return dir;
 }
@@ -4223,6 +4224,59 @@ TEST_CASE("ltx2 retake: a time window REGENERATES and the render carries the sou
   // The geometry came from the CLIP, not from the recipe's params table and not
   // from the request, which carried none.
   CHECK(result.frame_count == 9);
+
+  // THE RENDER DEPENDS ON THE SOURCE CLIP'S PIXELS, and this is the assertion
+  // the trace above cannot make. `retake_latent_absmax` observes the ENCODE; it
+  // says nothing about whether the encoded latent was ever handed to the phase.
+  // A build that read the clip, encoded it, recorded the digest and then seeded
+  // the stream with zeros satisfies every other check in this case and renders a
+  // clip of the right length with the right mask. Two DIFFERENT sources at the
+  // same seed and the same window must therefore produce different pixels; on
+  // that build both start from zeros and produce identical ones.
+  //
+  // This survived as a mutation before it was written (M2 in the row's table),
+  // which is why it is here rather than in a comment.
+  const std::string other = WriteRetakeClip(ws.root + "/clip_b", 9, 64, 64, /*seed_base=*/113);
+  REQUIRE(ReadAll(clip + "/frame_000000.ppm") != ReadAll(other + "/frame_000000.ppm"));
+  const vllm::multimodal::VideoResult from_other =
+      engine->Generate(RetakeGen(ws.root + "/out_b", other, 0.05, 0.10));
+  const std::string frame_a = ReadAll(std::string(result.frame_dir) + "/frame_000000.ppm");
+  const std::string frame_b = ReadAll(std::string(from_other.frame_dir) + "/frame_000000.ppm");
+  REQUIRE(frame_a.size() == frame_b.size());
+  size_t differing = 0;
+  for (size_t i = 0; i < frame_a.size(); ++i) {
+    if (frame_a[i] != frame_b[i]) ++differing;
+  }
+  CHECK_MESSAGE(differing > 0,
+                "two different source clips rendered byte-identical frames at the same seed and "
+                "window, so the encoded source latent never reached the phase");
+}
+
+TEST_CASE("ltx2 retake: the mask takes the CALL SITE's causal_fix, not the function's") {
+  // The two upstream defaults disagree — `get_pixel_coords` declares False
+  // (patchifiers.py:140) and `TemporalRegionMask` calls it with True
+  // (noise_mask_cond.py:33) — and the case above cannot tell them apart: at 24
+  // fps the window [0.05, 0.10) selects one latent frame either way. This one
+  // picks a window where the two DISAGREE about the count.
+  //
+  // 9 pixel frames is a 2-frame latent. WITH the fix, frame 0 spans pixel frames
+  // [0, 1) and frame 1 spans [1, 9), i.e. [0, 0.0417) s and [0.0417, 0.375) s.
+  // WITHOUT it, frame 0 spans [0, 8) and frame 1 spans [8, 16), i.e. [0, 0.333) s
+  // and [0.333, 0.667) s. The window [0.30, 0.40) therefore selects ONE frame
+  // with the fix and BOTH without it.
+  Workspace ws;
+  const std::unique_ptr<vllm::multimodal::VideoEngine> engine =
+      vllm::multimodal::LoadVideoEngine(RetakeParams(ws.paths));
+  auto* ltx2 = dynamic_cast<vllm::multimodal::Ltx2VideoEngine*>(engine.get());
+  REQUIRE(ltx2 != nullptr);
+  const std::string clip = WriteRetakeClip(ws.root + "/clip", 9, 64, 64);
+
+  (void)engine->Generate(RetakeGen(ws.root + "/late", clip, 0.30, 0.40));
+  const vllm::multimodal::Ltx2ConditioningTrace trace = ltx2->last_conditioning();
+  CHECK(trace.retake_total_tokens == 8);
+  CHECK_MESSAGE(trace.retake_masked_tokens == 4,
+                "the production call site passed causal_fix=false: without the causal rewrite "
+                "this window overlaps BOTH latent frames and masks all 8 tokens");
 }
 
 TEST_CASE("ltx2 retake: regenerate_video=0 FREEZES the clip, mask and scalar sigma both") {
