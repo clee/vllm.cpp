@@ -1436,27 +1436,95 @@ TEST_CASE("ltx2 video: keyframe and reference conditioning is refused BY WHAT IS
     const vllm::multimodal::VideoResult result = engine->Generate(gen);
     CHECK(result.frame_count == 9);
   }
-  SUBCASE("a reference video names TOKEN-APPEND, and no longer blames the LoRA metadata") {
-    // REPLACED, not relaxed (row LTX25-IC-LORA, #923). This subcase used to
-    // assert the refusal blamed the unread IC-LoRA metadata. That reason was
-    // true and is now false: `lora_path` reads the adapter's
-    // `reference_downscale_factor` / `reference_temporal_scale_factor`
-    // (iclora_utils.py:30-49) and carries them on the checkpoint. The arm is
-    // still refused, on the cause the message did not previously name.
+  SUBCASE("a reference video may not blame a seam THIS ENGINE demonstrably has") {
+    // WHAT THIS CASE USED TO DO, AND WHY THAT WAS THE DEFECT. It asserted five
+    // SUBSTRINGS of the refusal: `reference_video_cond.py`, `clear_conditioning`,
+    // `TOKEN-APPEND`, `NOT the IC-LoRA metadata`, and the absence of one retired
+    // phrase. Two of those five are UPSTREAM symbol names, which are present in
+    // the pinned checkout whatever this engine can do, and the other three are
+    // literals the message declares about itself. So not one of them could go
+    // red when the ENGINE changed — and the engine did change, twice, in two
+    // days: #923 made the metadata readable and #930 (`c7cb59fbb`) built the
+    // token-append seam. A reviewer replaced the local-cause sentence with a
+    // self-declared falsehood, kept all five substrings, and the whole suite
+    // stayed green.
+    //
+    // SO THIS CASE MEASURES THE ENGINE FIRST and only then constrains the
+    // message. The measurement is the same instrument the token-append row
+    // gates itself with: `video_tokens` is written INSIDE the phase loop, so it
+    // can observe what the loop does, unlike every field filled before denoise.
+    const vllm::multimodal::VideoModelParams cond_params = ConditioningParams(ws.paths);
+    const std::string kf = ws.root + "/append_witness.ppm";
+    WriteBytes(kf, ConditioningPpm(20, 28, 31));
+
+    auto tokens_of = [&](const std::string& tag, const std::string& keyframe) {
+      const std::unique_ptr<vllm::multimodal::VideoEngine> own =
+          vllm::multimodal::LoadVideoEngine(cond_params);
+      auto* ltx2 = dynamic_cast<vllm::multimodal::Ltx2VideoEngine*>(own.get());
+      REQUIRE(ltx2 != nullptr);
+      vllm::multimodal::VideoGenParams g = FixtureGen(ws.root + "/" + tag);
+      if (!keyframe.empty()) {
+        g.last_frame_path = keyframe;
+        g.extras[vllm::multimodal::kLtx2ImageCrfExtra] = "0";
+      }
+      const vllm::multimodal::VideoResult result = own->Generate(g);
+      // THE TRIM, observed from outside: the volume handed to unpatchify is the
+      // target grid, so the clip comes back at the requested length whether or
+      // not anything was appended.
+      CHECK(result.frame_count == 9);
+      return ltx2->last_conditioning().video_tokens;
+    };
+
+    const int64_t plain = tokens_of("ref_witness_plain", "");
+    const int64_t grown = tokens_of("ref_witness_grown", kf);
+    // THE GROWTH. Both numbers are measured; pinning either to a literal would
+    // pass on a build that never grew anything.
+    REQUIRE_MESSAGE(grown > plain,
+                    "this engine's phase loop did not grow its token sequence for an appending "
+                    "conditioning item ("
+                        << grown << " against a target of " << plain
+                        << "), so the rest of this case cannot say what the refusal may claim");
+
     const std::string msg = refusal("a reference video",
                                     [](vllm::multimodal::VideoGenParams& g, const Workspace& w) {
                                       g.ref_video_dir = w.root;
                                     });
     INFO(msg);
-    // The cause that actually remains, and the upstream symbol that has it.
-    CHECK(msg.find("TOKEN-APPEND") != std::string::npos);
-    CHECK(msg.find("reference_video_cond.py") != std::string::npos);
-    CHECK(msg.find("clear_conditioning") != std::string::npos);
-    // And the retired reason must NOT come back as the thing that is missing.
-    // A refusal that names a blocker the tree no longer has is the defect row
-    // LTX25-RETIRE-DEAD-ARMS exists to retire, arriving from the other side.
+
+    // BECAUSE THE TWO MEASUREMENTS ABOVE HOLD, the refusal may not CLAIM the
+    // phase loop. It may still MENTION it — the message's own convention is to
+    // record a ruled-out cause under `WHAT IS *NOT* THE REASON` so the next
+    // reader re-checks rather than re-derives — so the property asserted here is
+    // positional: every occurrence of a closed cause sits after that marker.
+    //
+    // That is what makes this case red for the mutation that motivated it.
+    // Restoring the pre-repair message leaves no marker at all AND puts
+    // `TOKEN-APPEND` in the first sentence, so both halves fire.
+    const size_t ruled_out = msg.find("WHAT IS *NOT* THE REASON");
+    REQUIRE_MESSAGE(ruled_out != std::string::npos,
+                    "the refusal carries no `WHAT IS *NOT* THE REASON` section, so a cause this "
+                    "engine has already closed cannot be told apart from one it still has");
+    for (const char* closed : {"TOKEN-APPEND", "fixed at the target grid's token count",
+                               "nowhere to go", "nothing to trim"}) {
+      const size_t at = msg.find(closed);
+      const bool only_as_ruled_out = (at == std::string::npos) || (at > ruled_out);
+      CHECK_MESSAGE(only_as_ruled_out,
+                    "the refusal states '"
+                        << std::string(closed)
+                        << "' as a cause rather than as a ruled-out one, and this case has just "
+                           "MEASURED that the loop grows ("
+                        << plain << " -> " << grown << ") and trims back to the target grid");
+    }
+    // The metadata half, same shape: the factors printed are READ from the
+    // adapter at load, so this asserts the read happened rather than asserting
+    // a sentence about it. `factors` says "no adapter was supplied" here.
+    CHECK(msg.find("no adapter was supplied") != std::string::npos);
     CHECK(msg.find("which this project does not read") == std::string::npos);
-    CHECK(msg.find("NOT the IC-LoRA metadata") != std::string::npos);
+    // And the two causes that DO remain are named, by the upstream anchors a
+    // reader can go and check.
+    CHECK(msg.find("iclora_utils.py:116-117") != std::string::npos);
+    CHECK(msg.find("ic_lora.py:108") != std::string::npos);
+    CHECK(msg.find("ref_video_dir") != std::string::npos);
   }
   SUBCASE("reference audio names the AUDIO encoder, which this row did not build") {
     const std::string msg = refusal("reference audio",
@@ -3372,8 +3440,13 @@ TEST_CASE("ltx2 video: the IC-LoRA reference factors are read from the adapter's
     // happened, not merely that a refusal fired.
     CHECK(msg.find("downscale=2") != std::string::npos);
     CHECK(msg.find("temporal=4") != std::string::npos);
-    // And the refusal still names the cause that genuinely remains.
-    CHECK(msg.find("TOKEN-APPEND") != std::string::npos);
+    CHECK(msg.find("fused into") != std::string::npos);
+    // And it does NOT reintroduce the reason this row closed. The cause that
+    // genuinely remains is gated by "a reference video may not blame a seam THIS
+    // ENGINE demonstrably has", which measures the engine before it reads the
+    // message; asserting the remaining cause by NAME here as well would be the
+    // second copy of the mistake that case exists to correct.
+    CHECK(msg.find("which this project does not read") == std::string::npos);
   }
 }
 

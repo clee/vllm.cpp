@@ -579,6 +579,54 @@ TEST_CASE("ltx2 lora: an F32 adapter is NARROWED to bf16, not kept f32") {
   std::remove(path.c_str());
 }
 
+TEST_CASE("ltx2 lora: the matmul RESULT is rounded to bf16 before the weight is added") {
+  // THE THIRD ROUNDING, and the one the two cases above cannot see. Upstream's
+  // aggregation dtype binds three separate places, not one:
+  //
+  //   1. `B * strength`  -> bf16   (fuse_loras.py:113; gated above by the
+  //                                 strength case and the F32-adapter case)
+  //   2. the MATMUL RESULT -> bf16 (fuse_loras.py:113's `.to(dtype=dtype)`,
+  //                                 which is `aggregation_dtype`)  <- THIS CASE
+  //   3. `deltas.add_(weight)` -> bf16 (fuse_loras.py:67-68; gated below)
+  //
+  // MEASURED: widening only (2) - keeping the f32 accumulator and adding the
+  // weight to it before the single store - left `test_ltx2_lora` at 13/13 and
+  // `test_ltx2_loader` at 31/31. Both of the other roundings survived that
+  // mutation, which is why neither of their cases moved.
+  //
+  // THE CONSTRUCTION. Rank 2, with the two products chosen so the SUM sits
+  // exactly on a bf16 tie and the weight then pushes the two arms to different
+  // sides of the next one:
+  //
+  //   acc  = 1.0 * 1.0 + 2^-8 * 1.0 = 1.00390625   (exact in f32)
+  //   w    = 2^-9                   = 0.001953125  (exact in bf16)
+  //
+  //   ported: bf16(acc) = 1.0 by ties-to-even (2^-8 is half of the 2^-7 step at
+  //           1.0, and 1.0's mantissa is the even one), then
+  //           bf16(1.0 + 2^-9) = 1.0
+  //   f32 acc: bf16(1.00390625 + 0.001953125) = bf16(1.005859375) = 1.0078125
+  //
+  // One bf16 step apart in the STORED result, so the final store cannot absorb
+  // it - which is exactly how a first attempt at this case would fail.
+  const float kHalfStep = 1.0F / 256.0F;   // 2^-8
+  const float kQuarterStep = 1.0F / 512.0F;  // 2^-9
+  const std::string path = WriteAdapter(/*out_features=*/1, /*rank=*/2, /*in_features=*/1,
+                                        /*b=*/{1.0F, kHalfStep}, /*a=*/{1.0F, 1.0F});
+  vllm::Ltx2LoraSpec spec;
+  spec.path = path;
+  spec.strength = 1.0;
+  std::vector<vllm::Ltx2LoraAdapter> adapters;
+  adapters.push_back(vllm::Ltx2LoraAdapter::Open(spec, ContractWith(kTarget)));
+
+  const std::vector<float> got = FuseBf16(adapters, kTarget, 1, 1, {kQuarterStep});
+  CHECK(vt::F32ToBF16(got[0]) == vt::F32ToBF16(1.0F));
+  CHECK(vt::F32ToBF16(got[0]) != vt::F32ToBF16(1.0F + 4.0F * kQuarterStep));
+  // Stated as the value an f32 accumulator would produce, so a reader can see
+  // which number this case is separating 1.0 from.
+  CHECK(vt::BF16ToF32(vt::F32ToBF16(1.0F + kHalfStep + kQuarterStep)) == doctest::Approx(1.0078125));
+  std::remove(path.c_str());
+}
+
 TEST_CASE("ltx2 lora: the f32 target branch rounds through the bf16 accumulator") {
   // The scale_shift tables are the only F32 tensors in the contract. Upstream's
   // `_bf16_fuse` does `deltas.add_(weight)` IN PLACE on the bf16 aggregator and

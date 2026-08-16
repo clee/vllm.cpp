@@ -26,16 +26,16 @@ absent, and it is the shared prerequisite for `ic_lora.py`, `hdr_ic_lora.py` and
 It does **not** ship video-to-video. Three statements up front so nothing is
 discovered later.
 
-1. **The reference-video arm has a SECOND blocker, and the brief for this row did
-   not account for it.** The refusal at `ltx2_video.cpp:1336-1346` names one
-   cause — the LoRA metadata is unread — and that cause is true and is closed
-   here. But `ltx2_video.cpp:1305-1335`, thirty lines earlier, documents the
-   other one: every *appending* conditioning item is blocked on token-append
-   machinery the engine does not have. `VideoConditionByReferenceLatent` appends
-   (`reference_video_cond.py:97-100`, ported at `ltx2_conditioning.cpp:265` via
-   `AppendTokens`), so the reference arm needs it too. §6 sizes it and `## Owed` records
-   it as owed. Closing only the metadata half and lifting the refusal would ship
-   a wrong render.
+1. **The reference-video arm has TWO further blockers, and neither is the one
+   this spec first named.** The refusal named one cause — the LoRA metadata is
+   unread — and that cause was true and is closed here. This spec then rewrote it
+   onto the token-APPEND machinery, which was true on 2026-08-15 and false on
+   2026-08-16: row `LTX25-TOKEN-APPEND` (#930) landed that seam in `c7cb59fbb`
+   and the LAST-frame keyframe is now served on it. §6 is rewritten against the
+   current tree and now names what genuinely remains — the reference clip's own
+   pixel path, and the stage split that gives stage 2 no adapter — recorded as
+   [#975](https://github.com/mudler/vllm.cpp/issues/975). Closing the metadata
+   half and lifting the refusal would still ship a wrong render.
 2. **No render-quality claim, and no real-weights claim.** The evidence here is
    numeric parity against upstream's fusion arithmetic plus mutation gates on
    synthetic fixtures. No IC-LoRA checkpoint was fused on real weights, because
@@ -234,6 +234,8 @@ test.
 | a LoRA naming an absent module refuses by name | §4.1 |
 | a LoRA matching zero tensors refuses by name | §4 |
 | the metadata factors are read, absent ⇒ 1 | `iclora_utils.py:30-49` |
+| **the matmul RESULT is rounded to bf16 before the weight is added** — rank 2, `acc = 1 + 2^-8` on a bf16 tie, `w = 2^-9`, so a bf16 aggregator stores 1.0 and an f32 one stores 1.0078125 | upstream's `.to(dtype=aggregation_dtype)` at `fuse_loras.py:113`. This is the THIRD rounding the aggregation dtype binds; widening only it left `test_ltx2_lora` 13/13 and `test_ltx2_loader` 31/31, which is what made the case necessary |
+| **the reference refusal may not name a seam this engine has** — the case measures `video_tokens` with and without an appending item, and only then forbids the message from blaming the loop | the repair for the review finding that five substring assertions could not go red when the ENGINE changed |
 | a second `lora_path` refuses by name | §3.3 |
 | **the FP8 arm fuses** — an FP8 fixture plus a LoRA changes the materialized weight | that the hook is after dequant, on the arm most users run |
 | **the NVFP4 arm fuses** | the same for NVFP4 |
@@ -262,32 +264,59 @@ Known-red on `main` at the base SHA `95b7366`, proven pre-existing by running
 `check-test-registration`, `test_check_release_binary_contract`,
 `test_release_manifest`, `test_release_pipeline`, `test_check_test_registration`.
 
-## 6. The second blocker, sized
+## 6. What still blocks reference video, re-derived at `c90e3fc02`
 
-Recorded here so the next agent does not re-derive it.
+**This section was wrong once and is rewritten rather than patched.** Its first
+version named the token-APPEND machinery, which row `LTX25-TOKEN-APPEND` (#930)
+then landed in `c7cb59fbb`. The determination below is re-derived against the
+merged tree, not read out of the earlier record, and it is
+[#975](https://github.com/mudler/vllm.cpp/issues/975).
 
-Serving a reference video needs the engine's phase loop to carry a **grown** token
-sequence and trim it back. What is and is not in the way:
+**Ruled OUT, with what ruled each one out.**
 
 - **The DiT is not in the way.** `Ltx2ModalityInput::tokens` is a per-call field,
-  and the DiT already accepts a self-attention strength mask
-  (`ltx2.h:458-462`, implemented `ltx2_dit.cpp:588-593`, mirroring
-  `_prepare_self_attention_mask`, `transformer_args.py:208-237`).
-- **The conditioning item is not in the way.** It is ported and gated.
+  and the DiT already accepts a self-attention strength mask.
+- **The conditioning item is not in the way.** `Ltx2ConditionVideoByReference`
+  (`ltx2_conditioning.cpp:221`) is ported and gated.
+- **The phase loop is no longer in the way.** `c7cb59fbb` binds a `target_tokens`
+  local, grows `video.tokens` past it on an appending item, carries the grown
+  count through denoise, and trims back through `Ltx2ClearConditioning`
+  (`ltx_core/tools.py:88-117`) before unpatchify. The LAST-frame keyframe arm is
+  SERVED on exactly that machinery, which is the executable proof it exists.
 - **`Ltx2LatentState` having no attention-mask field is not in the way for the
-  DEFAULT arm.** At `conditioning_attention_strength == 1.0` with no mask,
-  upstream computes `attn_mask = None` (`iclora_utils.py:157-160`) and
-  `update_attention_mask` returns `None` (`mask_utils.py:141-143`), so the
-  default arm needs no mask at all.
-- **The phase loop is in the way.** One `Ltx2VideoTokenCount(vshape, 1)` feeds
-  the sigma schedule, the `Ltx2ModalityInput` and `Ltx2VideoUnpatchify`
-  (`ltx2_video.cpp:1305-1322` documents this for the keyframe arm, and it is the
-  same obstruction). It must instead carry `state.tokens` through denoise and
-  trim to the target count before unpatchify, mirroring `clear_conditioning`
-  (`ltx_core/tools.py:88-105`).
+  DEFAULT arm.** At `conditioning_attention_strength >= 1.0` with no latent mask,
+  upstream sets `attn_mask = None` (`iclora_utils.py:159-160`) and applies
+  `ConditioningItemAttentionStrengthWrapper` only `if attn_mask is not None`
+  (`:168-169`). The sub-1.0 arm is #932 and is not what blocks this one.
 
-That work is **shared with the last-frame keyframe arm**, which is blocked on the
-identical machinery. It is therefore its own row rather than a tail of this one.
+**What IS in the way.**
+
+1. **The reference clip has no pixel path.** Upstream reads the reference at
+   `height // scale` by `width // scale` (`iclora_utils.py:116-117`), refuses a
+   target either axis of which the factor does not divide (`:112-115`), keeps
+   frame 0 and then every Nth frame (`temporal_subsample`, `:87-89`, called at
+   `:144`), and encodes the whole clip (`:145-148`). This engine's only
+   pixel-to-latent route is `Ltx2LoadImageAndPreprocess` followed by
+   `Ltx2ConvVideoEncode` at `frame_count = 1` and the phase's OWN height and
+   width, and it refuses an encode returning more than one latent frame. Nothing
+   anywhere reads `ref_video_dir` (`src/vllm/multimodal/video_engine.cpp:375`),
+   which is a directory of `frame_%06d.ppm`. `Ltx2ConvVideoEncode` already takes
+   a `frame_count`, so the encoder is not the gap; the reader, the resize target
+   and the subsample are.
+2. **The reference item is a STAGE-1 item, and stage 2 must run UNFUSED.**
+   `ICLoraPipeline` builds two `DiffusionStage`s from one checkpoint and gives
+   stage 1 `loras=tuple(loras)` (`ic_lora.py:108`) and stage 2 `loras=()`
+   (`:119`); stage 1 takes `_create_conditionings`, which appends the reference
+   item (`:269-278`, `:377-402`), and stage 2 takes plain
+   `combined_image_conditionings` with no reference item (`:314-321`). This
+   engine holds ONE `Ltx2Dit`, fused at load, that every phase of the recipe
+   runs. Serving the arm on the two-phase distilled recipe therefore needs a
+   second unfused DiT or a phase-scoped adapter, and serving it on phase 0 alone
+   is upstream's `skip_stage_2` (`:302-308`), a different request.
+
+Piece 2 changes how the engine HOLDS its DiT, not how it conditions, so this is
+its own row rather than a tail of this one. It also carries a memory decision a
+conditioning change does not: a second resident DiT is ~21 B parameters.
 
 ## 6.1 What `hdr_ic_lora` and `dubit` would need from this seam
 
@@ -324,7 +353,7 @@ Each is owed by this row and named in the commit and pull request bodies.
 
 | owed | issue |
 |---|---|
-| token-append grow-and-trim in the phase loop. Until it lands the reference-video and reference-image arms stay refused, with the refusal rewritten to name this cause instead of the metadata one this row closed. Shared with the last-frame keyframe arm, which is why it is its own row | [#930](https://github.com/mudler/vllm.cpp/issues/930) |
+| serving the reference-image and reference-video arms: the reference CLIP's own pixel path (read, resize to `height // scale`, temporal subsample, multi-frame encode) and the stage split that gives stage 2 no adapter. §6 derives both. Token-append is NOT part of it any more — #930 landed in `c7cb59fbb` | [#975](https://github.com/mudler/vllm.cpp/issues/975) |
 | the `conditioning_attention_mask` / `conditioning_attention_strength < 1.0` arm, which needs `Ltx2LatentState` to carry a mask and `build_attention_mask`'s block structure (`mask_utils.py:170-243`) | [#932](https://github.com/mudler/vllm.cpp/issues/932) |
 | N-adapter fusion, which additionally needs upstream's SECOND rounding pattern (`addmm_` with `alpha`, `fuse_loras.py:115`) that this row refuses rather than guesses | [#932](https://github.com/mudler/vllm.cpp/issues/932) |
 | GGUF k-quant LoRA fusion — **not applicable** rather than owed: the LTX-2.5 DiT ships FP8 and NVFP4, and no GGUF LTX DiT exists to fuse into | n/a |
@@ -333,9 +362,14 @@ Each is owed by this row and named in the commit and pull request bodies.
 ## 8. Stop conditions
 
 - Stop and report `NEEDS_DECISION` if closing the metadata half would require
-  lifting the reference refusal before the token-append machinery exists. **This
-  fired**; §0.1 and §6 are the result, and the refusal is rewritten rather than
-  lifted.
+  lifting the reference refusal before the machinery it needs exists. **This
+  fired twice.** The first time it named token-append; §6's first version was the
+  result. The second time, in review repair, that cause had itself landed
+  (`c7cb59fbb`) and the determination had to be made again from the tree. §6 is
+  rewritten, the refusal is rewritten onto the two causes that remain, and
+  serving the arm is reported as `NEEDS_DECISION` under
+  [#975](https://github.com/mudler/vllm.cpp/issues/975) because a second resident
+  DiT is a change to how the engine holds its weights, not a conditioning change.
 - Stop if `docs/FEATURES.md` cannot be reapplied by key with unrelated keys
   byte-identical.
 - Do not use the GPU. `dgx.casa` was under a long render for this row's duration.
@@ -343,4 +377,5 @@ Each is owed by this row and named in the commit and pull request bodies.
 ## Now
 
 `ACTIVE` — the adapter path is implemented and gated; the reference arm stays
-refused on the cause named in §6.
+refused on the two causes §6 derives, which are #975 and are neither of the two
+this refusal has previously given.

@@ -1417,14 +1417,27 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
   // silently ignored renders an unconditioned clip that looks like the feature
   // not working.
   //
-  // THESE MESSAGES ARE WRITTEN TO BE RE-CHECKABLE, and the count is now SIX
+  // THESE MESSAGES ARE WRITTEN TO BE RE-CHECKABLE, and the count is now SEVEN
   // refusals in this campaign whose stated reason turned out to be false or
-  // stale. Two of the six stood right here. The first said no encoder weights
+  // stale. Three of the seven stood right here. The first said no encoder weights
   // could be materialized — true when written, and what this row fixed. The
   // second replaced it and blamed `keyframes_abs_pos_embedding`, which was
   // verifiably NOT the blocker at the pin (see the last-frame message below for
   // the three anchors that refute it), and a test had been written to assert
   // that wrong reason by name.
+  //
+  // THE SEVENTH IS THE REFERENCE REFUSAL BELOW, and it is worth reading closely
+  // because it went stale in under a day and for the same reason as the second:
+  // a test asserted the reason by NAME, so nothing could notice. Row
+  // LTX25-IC-LORA (#923) rewrote it onto the token-append machinery on
+  // 2026-08-15 — accurate that day — and row LTX25-TOKEN-APPEND (#930) landed
+  // that machinery in `c7cb59fbb` on 2026-08-16, before #923 merged. Both
+  // reasons the message had ever given were then false at once, and its five
+  // assertions were four upstream symbol names plus a literal the message
+  // declared about itself, none of which can go red when the ENGINE changes
+  // underneath. The repair is in the test, not only here: the case now measures
+  // that the loop grows and trims and then forbids the message from stating it
+  // as a cause rather than as a ruled-out one.
   //
   // So: name the exact symbol or upstream `file:line` that would have to change
   // for the refusal to become false, never a category — and where a plausible
@@ -1450,24 +1463,32 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
   const bool wants_last_frame = !gen.last_frame_path.empty();
   const bool wants_image = wants_first_frame || wants_last_frame;
   if (!gen.ref_image_paths.empty() || !gen.ref_video_dir.empty()) {
-    // WHAT CHANGED, AND WHAT DID NOT. This refusal used to blame the IC-LoRA
-    // metadata: the `downscale_factor` and `temporal_scale_factor` that
-    // `Ltx2ConditionVideoByReference` needs live in the adapter's own
-    // `__metadata__` (iclora_utils.py:30-49) and nothing here read it. Row
-    // LTX25-IC-LORA (#923) closed that — supply `lora_path` and the factors are
-    // read, resolved and carried on the checkpoint — so blaming it now would be
-    // a refusal asserting something the tree no longer has.
+    // TWO CAUSES REMAIN, AND NEITHER IS ONE THIS MESSAGE HAS EVER GIVEN. The
+    // message names both, and then names the three ruled-out reasons with what
+    // ruled each one out, because a reader who arrives here in a month should
+    // re-check the claim rather than re-derive the refutation for a third time.
     //
-    // The arm is still refused, because there was a SECOND cause the old message
-    // did not name, and it is the one the LAST-FRAME refusal above already
-    // spells out in full: `VideoConditionByReferenceLatent` APPENDS tokens
-    // (reference_video_cond.py:97-100, ported at ltx2_conditioning.cpp via
-    // AppendTokens), and this phase loop is fixed at the target grid's token
-    // count — one `Ltx2VideoTokenCount(vshape, 1)` feeds the sigma schedule, the
-    // `Ltx2ModalityInput` handed to the DiT, and `Ltx2VideoUnpatchify`. Serving
-    // it means growing that sequence through the DiT and trimming it back
-    // (`clear_conditioning`, ltx_core/tools.py:88-105). That machinery is shared
-    // with the last-frame keyframe arm and is owed by its own row.
+    // 1. THE REFERENCE CLIP HAS NO PIXEL PATH. Upstream resolves the reference
+    //    at `height // scale` by `width // scale` (iclora_utils.py:116-117),
+    //    refuses a target either axis of which the factor does not divide
+    //    (:112-115), keeps frame 0 and then every Nth frame (`temporal_subsample`,
+    //    :87-89, called at :144), and encodes the whole clip (:145-148). This
+    //    engine's only pixel-to-latent route is `Ltx2LoadImageAndPreprocess`
+    //    followed by `Ltx2ConvVideoEncode` at `frame_count = 1` and the phase's
+    //    OWN height and width, and it refuses an encode that returns more than
+    //    one latent frame. Nothing anywhere reads `ref_video_dir`, which is a
+    //    directory of `frame_%06d.ppm`.
+    //
+    // 2. THE REFERENCE ITEM BELONGS TO STAGE 1, AND STAGE 2 MUST RUN UNFUSED.
+    //    `ICLoraPipeline` builds two `DiffusionStage`s from the same checkpoint
+    //    and gives stage 1 `loras=tuple(loras)` (ic_lora.py:108) and stage 2
+    //    `loras=()` (:119); stage 1 takes `_create_conditionings`, which appends
+    //    the reference item (:269-278, :377-402), and stage 2 takes plain
+    //    `combined_image_conditionings` with no reference item at all
+    //    (:314-321). This engine holds ONE `Ltx2Dit`, fused at load, that every
+    //    phase of the recipe runs. Serving the arm on a two-phase recipe needs a
+    //    second unfused DiT or a phase-scoped adapter, and serving it on one
+    //    phase only is upstream's `skip_stage_2` (:302-308), a different request.
     std::string factors = "no adapter was supplied, so none were read";
     if (im.dit.lora_fused_tensors > 0) {
       factors = "the supplied adapter declares downscale=" +
@@ -1476,19 +1497,35 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
                 ", fused into " + std::to_string(im.dit.lora_fused_tensors) + " tensors";
     }
     Fail(
-        "reference-image / reference-video conditioning is not served. What is missing is "
-        "the TOKEN-APPEND machinery, and NOT the IC-LoRA metadata, which this engine now "
-        "reads (" + factors +
-        "). `Ltx2ConvVideoEncode` and `Ltx2ConditionVideoByReference` are both ported and "
-        "gated, and the adapter's `downscale_factor` / `temporal_scale_factor` are resolved "
-        "at load (iclora_utils.py:30-49). The gap is that "
-        "`VideoConditionByReferenceLatent.apply_to` APPENDS tokens to the sequence "
-        "(conditioning/types/reference_video_cond.py:97-100) and this phase loop is fixed at "
-        "the target grid's token count, so the appended tokens have nowhere to go and "
-        "`clear_conditioning` (ltx_core/tools.py:88-105) has nothing to trim. That is the "
-        "SAME obstruction the last-frame keyframe arm names above, and it is owed by its own "
-        "row rather than by LTX25-IC-LORA, which closed the metadata half. Use "
-        "first_frame_ppm / first_frame_path for image-to-video.");
+        "reference-image / reference-video conditioning is not served. TWO things are "
+        "missing. FIRST, the reference CLIP has no pixel path: upstream reads it at "
+        "`height // reference_downscale_factor` by `width // reference_downscale_factor` "
+        "(iclora_utils.py:116-117), refuses a target the factor does not divide (:112-115), "
+        "keeps frame 0 and then every Nth frame (`temporal_subsample`, :87-89, called at "
+        ":144) and encodes the whole clip (:145-148), while this engine's only "
+        "pixel-to-latent route encodes exactly ONE frame at the phase's own resolution and "
+        "nothing reads `ref_video_dir` at all. SECOND, the reference item is a STAGE-1 item "
+        "and stage 2 must run with NO adapter: `ICLoraPipeline` gives stage 1 "
+        "`loras=tuple(loras)` (ic_lora.py:108) and the reference conditioning (:269-278), "
+        "and gives stage 2 `loras=()` (:119) and `combined_image_conditionings` with no "
+        "reference item (:314-321) — and this engine holds one DiT, fused at load, that "
+        "every phase runs. WHAT IS *NOT* THE REASON, because this refusal has now given two "
+        "reasons that later became false: (a) the IC-LoRA METADATA. Row LTX25-IC-LORA (#923) "
+        "closed that; supply `lora_path` and the factors are read at load "
+        "(iclora_utils.py:30-49) — right now, " + factors +
+        ". (b) the TOKEN-APPEND machinery. This message blamed it on 2026-08-15 and row "
+        "LTX25-TOKEN-APPEND (#930) landed it in `c7cb59fbb` the next day: the phase loop "
+        "now binds a `target_tokens` local, grows `video.tokens` past it on an appending "
+        "item, carries the grown count through denoise, and trims back through "
+        "`Ltx2ClearConditioning` (ltx_core/tools.py:88-117) before unpatchify. The "
+        "last-frame keyframe arm is SERVED on exactly that machinery, which is the "
+        "executable proof it exists. (c) `Ltx2LatentState` carrying no attention-mask "
+        "field. On the DEFAULT arm upstream builds no mask: at "
+        "`conditioning_attention_strength >= 1.0` with no latent mask `attn_mask` is None "
+        "(iclora_utils.py:159-160) and `ConditioningItemAttentionStrengthWrapper` is "
+        "applied only `if attn_mask is not None` (:168-169). The sub-1.0 arm is owed by "
+        "#932, and it is not what blocks this one. Use first_frame_ppm / first_frame_path "
+        "for image-to-video, and last_frame_path for a closing keyframe.");
   }
   if (!gen.ref_audio_path.empty() || !gen.ref_audio_wav.empty()) {
     Fail(
