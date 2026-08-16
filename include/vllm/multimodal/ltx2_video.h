@@ -738,6 +738,24 @@ struct Ltx2ConditioningTrace {
   //
   // holds in x0 space (`X0Model.forward`, ltx-core model/transformer/
   // model.py:590-604) and fails in velocity space.
+  //
+  // ONE (velocity, x0) PAIR PER ARM. The default T2A guider runs THREE forwards
+  // per step, and the equation above decides only the pass it names. A build
+  // that converts the conditional pass and leaves the UNCONDITIONAL or the
+  // PERTURBED one in velocity space renders a different waveform with a healthy
+  // forward count, a correct `t2a_first_cond`, and nothing else to see it by —
+  // which is #1039 again, one arm over.
+  //
+  // `t2a_first_next_latent` is `Ltx2EulerStep`'s output, and it makes what the
+  // sampler CONSUMED checkable:
+  //
+  //     next == latent + (latent - denoised)/sigma * (sigma_next - sigma)
+  //
+  // A second `to_denoised` applied to the guider's result on the way into the
+  // step moves this field and no other.
+  //
+  // The uncond and perturbed vectors are EMPTY when the guider does not ask for
+  // that arm, because the forward did not run.
   bool t2a_rendered = false;
   bool t2a_video_stream_present = false;
   int64_t t2a_cond_forwards = 0;
@@ -747,7 +765,12 @@ struct Ltx2ConditioningTrace {
   std::vector<float> t2a_first_latent;
   std::vector<float> t2a_first_velocity;
   std::vector<float> t2a_first_cond;
+  std::vector<float> t2a_first_uncond_velocity;
+  std::vector<float> t2a_first_uncond;
+  std::vector<float> t2a_first_perturbed_velocity;
+  std::vector<float> t2a_first_perturbed;
   std::vector<float> t2a_first_denoised;
+  std::vector<float> t2a_first_next_latent;
   double t2a_first_sigma = 0.0;
 
   // True only once the `Generate` that produced this conditioning RETURNED. The

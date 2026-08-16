@@ -3665,7 +3665,12 @@ VideoResult Ltx2VideoEngine::GenerateAudioOnly(Impl& im, const VideoGenParams& g
   im.trace.t2a_first_latent = rendered.first_step_latent;
   im.trace.t2a_first_velocity = rendered.first_step_velocity;
   im.trace.t2a_first_cond = rendered.first_step_cond;
+  im.trace.t2a_first_uncond_velocity = rendered.first_step_uncond_velocity;
+  im.trace.t2a_first_uncond = rendered.first_step_uncond;
+  im.trace.t2a_first_perturbed_velocity = rendered.first_step_perturbed_velocity;
+  im.trace.t2a_first_perturbed = rendered.first_step_perturbed;
   im.trace.t2a_first_denoised = rendered.first_step_denoised;
+  im.trace.t2a_first_next_latent = rendered.first_step_next_latent;
   im.trace.t2a_first_sigma = rendered.first_step_sigma;
   im.trace.audio_tokens = rendered.audio_tokens;
   im.trace.audio_latent_digest = rendered.latent_digest;

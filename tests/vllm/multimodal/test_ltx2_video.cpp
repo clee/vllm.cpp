@@ -5301,6 +5301,28 @@ TEST_CASE("ltx2 t2a: the guider is handed x0 predictions and not raw velocities"
   // whole sample. No fixture scale satisfies it by accident, a zeroed velocity
   // collapses it to `cond == latent` and is refused by the lower bound below,
   // and a zeroed `cond` fails it outright.
+  //
+  // ALL THREE ARMS, AND THE STEP THAT CONSUMES THEM. An earlier draft of this
+  // case asserted the equation for the CONDITIONAL pass alone. The default T2A
+  // arm runs three forwards per step, so that draft held the file's own
+  // "applied to EVERY PASS" claim for one third of the passes, and three
+  // mutations survived it at 10 cases / 526 assertions / exit 0:
+  //
+  //   A1  the PERTURBED pass alone left in velocity space
+  //   A2  the UNCONDITIONAL pass alone left in velocity space
+  //   R1b `ToDenoised` applied a SECOND time to the guider's output, between the
+  //       step-0 recording and the Euler step
+  //
+  // and a fourth found while closing them:
+  //
+  //   R1c the same double application placed ABOVE the step-0 recording, so the
+  //       recorded `t2a_first_denoised` is itself doubly converted
+  //
+  // Each renders a different waveform of exactly the right length, through a
+  // guider whose `cond` term is impeccable. So the equation is applied to every
+  // recorded arm; the guider's own output is reproduced from the three recorded
+  // arms through the shipped seam, which is what R1c moves; and the Euler step's
+  // input is recovered from the latent it wrote, which is what R1b moves.
   Workspace ws;
   const vllm::multimodal::VideoModelParams mp = T2aParams(ws.paths);
 
@@ -5308,17 +5330,19 @@ TEST_CASE("ltx2 t2a: the guider is handed x0 predictions and not raw velocities"
   // off a render: `rescale_scale = 0.7` on the 2.3/2.4/2.5 lineage
   // (ltx-pipelines utils/constants.py:63, and the `--audio-rescale-scale`
   // default at utils/args.py:1101-1106).
-  {
-    const vllm::Ltx2PipelineRecipe t2a = vllm::ResolveLtx2PipelineRecipe("t2a_one_stage", "2.5");
-    REQUIRE(t2a.phases.size() == 1);
-    CHECK(t2a.phases[0].audio_guidance.rescale_scale == 0.7);
-  }
+  const vllm::Ltx2PipelineRecipe t2a_recipe =
+      vllm::ResolveLtx2PipelineRecipe("t2a_one_stage", "2.5");
+  REQUIRE(t2a_recipe.phases.size() == 1);
+  CHECK(t2a_recipe.phases[0].audio_guidance.rescale_scale == 0.7);
 
   // Through the production entry point — `LoadVideoEngine` then
   // `VideoEngine::Generate`, which is what `vllm_video_generate` calls. Nothing
-  // here constructs a guider, a DiT or a modality by hand. NO extra is touched
-  // either, so the render takes the recipe's own guider and the assertion sits
-  // on the shipped path rather than on one this test configured into existence.
+  // here constructs a guider, a DiT or a modality by hand. `rescale_scale` is
+  // the recipe's own 0.7, pinned just above and left untouched by `T2aGen`,
+  // which is the field this case turns on. (`T2aGen` does set
+  // `audio_stg_blocks`, and that IS a guider field — the two-block fixture
+  // cannot take the params table's `[28]` — but it selects WHICH block the
+  // perturbed forward skips, not how the arms are combined.)
   const std::unique_ptr<vllm::multimodal::VideoEngine> engine =
       vllm::multimodal::LoadVideoEngine(mp);
   REQUIRE(engine != nullptr);
@@ -5334,53 +5358,160 @@ TEST_CASE("ltx2 t2a: the guider is handed x0 predictions and not raw velocities"
   REQUIRE(t.t2a_first_velocity.size() == n);
   REQUIRE(t.t2a_first_cond.size() == n);
   REQUIRE(t.t2a_first_denoised.size() == n);
+  REQUIRE(t.t2a_first_next_latent.size() == n);
   const double sigma = t.t2a_first_sigma;
   REQUIRE(sigma > 0.0);
 
   double latent_span = 0.0;
-  double velocity_span = 0.0;
-  double err_x0 = 0.0;  // |cond - (latent - sigma*velocity)|  -> 0 in x0 space
-  double err_v = 0.0;   // |cond - velocity|                   -> 0 in velocity space
   for (size_t i = 0; i < n; ++i) {
-    const double lat = static_cast<double>(t.t2a_first_latent[i]);
-    const double vel = static_cast<double>(t.t2a_first_velocity[i]);
-    const double cond = static_cast<double>(t.t2a_first_cond[i]);
-    latent_span = std::max(latent_span, std::abs(lat));
-    velocity_span = std::max(velocity_span, std::abs(vel));
-    err_x0 = std::max(err_x0, std::abs(cond - (lat - sigma * vel)));
-    err_v = std::max(err_v, std::abs(cond - vel));
+    latent_span = std::max(latent_span, std::abs(static_cast<double>(t.t2a_first_latent[i])));
   }
-
-  INFO("sigma = " << sigma << "  max|latent| = " << latent_span
-                  << "  max|velocity| = " << velocity_span
-                  << "  |cond - (latent - sigma*velocity)| = " << err_x0
-                  << "  |cond - velocity| = " << err_v << "  elements = " << n);
-
-  // 1. THE FIXTURE CAN DECIDE THIS. The two candidate tensors are
-  //    `latent - sigma*velocity` and `velocity`; they coincide when the sample
-  //    is zero and `to_denoised` is the identity when the velocity is. Both are
-  //    REQUIREs, because the checks below mean nothing once either fails.
+  // THE FIXTURE CAN DECIDE THIS AT ALL. The two candidate tensors for every arm
+  // are `latent - sigma*velocity` and `velocity`, and they coincide when the
+  // sample is zero. A REQUIRE, because nothing below discriminates once it
+  // fails. (Its per-arm partner, "the DiT returned no velocity", is next to each
+  // arm's own check: a zero velocity makes `to_denoised` the identity for THAT
+  // arm alone.)
   REQUIRE_MESSAGE(latent_span > 1e-3,
                   "the step-0 sample is zero, so the two candidate tensors coincide and nothing "
                   "below discriminates");
-  REQUIRE_MESSAGE(sigma * velocity_span > 1e-6,
-                  "the DiT returned no velocity, so `to_denoised` is the identity here and the "
-                  "two candidate tensors coincide");
-  // 2. THE GUIDER WAS HANDED THE X0 PREDICTION, exactly — `to_denoised` on the
-  //    way out of the forward, which is `X0Model.forward` (model.py:602-603).
-  CHECK_MESSAGE(err_x0 <= 1e-5 * latent_span,
-                "the tensor handed to `Ltx2MultiModalGuidance` is not `latent - sigma*velocity`, "
-                "which is what `X0Model.forward` returns (#1039): residual "
-                    << err_x0 << " against a tolerance of " << (1e-5 * latent_span));
-  // 3. AND IT WAS NOT THE RAW VELOCITY. Said separately from check 2, because a
-  //    build handing the guider some THIRD tensor fails 2 and would pass a lone
-  //    "not the velocity" check; the pair says which of the two happened.
-  CHECK_MESSAGE(err_v > 1e-2 * latent_span,
-                "the tensor handed to `Ltx2MultiModalGuidance` IS the raw DiT velocity, so the "
-                "guidance is combined in velocity space and converted once afterwards (#1039)");
-  // 4. And the guider MOVED what it was handed, so the tensor checked above is
-  //    a real input to the combination rather than a recorded value beside one.
-  CHECK(t.t2a_first_denoised != t.t2a_first_cond);
+
+  // ── the equation, once per guidance pass ──────────────────────────────────
+  //
+  // EVERY ARM THE RENDER RAN, not only the conditional one. The default T2A
+  // guider runs three forwards per step (ltx2_t2a.h item 2), `x0_model` claims
+  // to convert EVERY PASS, and a conditional-only assertion holds that claim for
+  // one of the three. `t2a_first_uncond` / `t2a_first_perturbed` are empty when
+  // the guider did not ask for that arm; this render asks for both, which is
+  // asserted rather than assumed — an arm silently skipped would otherwise
+  // vacate its own check.
+  REQUIRE(t.t2a_uncond_forwards > 0);
+  REQUIRE(t.t2a_perturbed_forwards > 0);
+  struct Arm {
+    const char* name;
+    const std::vector<float>& velocity;
+    const std::vector<float>& x0;
+  };
+  const Arm arms[] = {
+      {"cond", t.t2a_first_velocity, t.t2a_first_cond},
+      {"uncond", t.t2a_first_uncond_velocity, t.t2a_first_uncond},
+      {"perturbed", t.t2a_first_perturbed_velocity, t.t2a_first_perturbed},
+  };
+  for (const Arm& arm : arms) {
+    INFO("arm = " << arm.name);
+    REQUIRE(arm.velocity.size() == n);
+    REQUIRE(arm.x0.size() == n);
+
+    double velocity_span = 0.0;
+    double err_x0 = 0.0;  // |x0 - (latent - sigma*velocity)|  -> 0 in x0 space
+    double err_v = 0.0;   // |x0 - velocity|                   -> 0 in velocity space
+    for (size_t i = 0; i < n; ++i) {
+      const double lat = static_cast<double>(t.t2a_first_latent[i]);
+      const double vel = static_cast<double>(arm.velocity[i]);
+      const double x0 = static_cast<double>(arm.x0[i]);
+      velocity_span = std::max(velocity_span, std::abs(vel));
+      err_x0 = std::max(err_x0, std::abs(x0 - (lat - sigma * vel)));
+      err_v = std::max(err_v, std::abs(x0 - vel));
+    }
+    INFO("sigma = " << sigma << "  max|latent| = " << latent_span
+                    << "  max|velocity| = " << velocity_span
+                    << "  |x0 - (latent - sigma*velocity)| = " << err_x0
+                    << "  |x0 - velocity| = " << err_v << "  elements = " << n);
+
+    // 1. `to_denoised` IS NOT THE IDENTITY ON THIS ARM. The second half of the
+    //    non-vacuity guard, per arm: a zeroed velocity collapses the equation to
+    //    `x0 == latent` and would let a stub satisfy it.
+    REQUIRE_MESSAGE(sigma * velocity_span > 1e-6,
+                    "the DiT returned no velocity on this arm, so `to_denoised` is the identity "
+                    "here and the two candidate tensors coincide");
+    // 2. THE GUIDER WAS HANDED THE X0 PREDICTION, exactly — `to_denoised` on the
+    //    way out of the forward, which is `X0Model.forward` (model.py:602-603).
+    CHECK_MESSAGE(err_x0 <= 1e-5 * latent_span,
+                  "the tensor handed to `Ltx2MultiModalGuidance` on this arm is not "
+                  "`latent - sigma*velocity`, which is what `X0Model.forward` returns (#1039): "
+                  "residual "
+                      << err_x0 << " against a tolerance of " << (1e-5 * latent_span));
+    // 3. AND IT WAS NOT THE RAW VELOCITY. Said separately from check 2, because a
+    //    build handing the guider some THIRD tensor fails 2 and would pass a lone
+    //    "not the velocity" check; the pair says which of the two happened.
+    CHECK_MESSAGE(err_v > 1e-2 * latent_span,
+                  "the tensor handed to `Ltx2MultiModalGuidance` on this arm IS the raw DiT "
+                  "velocity, so the guidance is combined in velocity space and converted once "
+                  "afterwards (#1039)");
+  }
+
+  // ── the guider's output is the guider's output ────────────────────────────
+  //
+  // The three recorded arms, through the SHIPPED `Ltx2MultiModalGuidance` on the
+  // recipe's own params, must reproduce `t2a_first_denoised` bit for bit. This
+  // does not gate the guider's arithmetic — `Ltx2Rescale`'s own cases and the
+  // seam case below do that — it gates that the pipeline handed the guider these
+  // tensors and passed its result on UNTOUCHED. A second `to_denoised` applied
+  // to the combination is invisible in every per-arm check above, because it
+  // moves nothing the guider was handed.
+  //
+  // `stg_blocks` is the one guider field `T2aGen` overrides and the one
+  // `Ltx2MultiModalGuidance` does not read (it selects the perturbed forward's
+  // blocks, not the combination), so the recipe's params are the render's params
+  // for this call.
+  {
+    const std::vector<float> replayed = vllm::Ltx2MultiModalGuidance(
+        t2a_recipe.phases[0].audio_guidance, t.t2a_first_cond.data(), t.t2a_first_uncond.data(),
+        t.t2a_first_perturbed.data(), /*uncond_modality=*/nullptr, static_cast<int64_t>(n));
+    REQUIRE(replayed.size() == n);
+    double worst = 0.0;
+    for (size_t i = 0; i < n; ++i) {
+      worst = std::max(worst, std::abs(static_cast<double>(replayed[i]) -
+                                       static_cast<double>(t.t2a_first_denoised[i])));
+    }
+    INFO("max|replayed guidance - t2a_first_denoised| = " << worst);
+    // EXACT, not a tolerance: it is the same function over the same f32 inputs,
+    // so any non-zero residual is another operation this pipeline applied.
+    CHECK_MESSAGE(worst == 0.0,
+                  "`t2a_first_denoised` is not `Ltx2MultiModalGuidance` over the three recorded "
+                  "arms, so something else was applied to the guider's result (#1039)");
+    // And the combination MOVED what it was handed, so the arms checked above are
+    // real inputs to it rather than recorded values beside one.
+    CHECK(t.t2a_first_denoised != t.t2a_first_cond);
+  }
+
+  // ── and the sampler consumed exactly that ─────────────────────────────────
+  //
+  // `Ltx2EulerStep` is `x + (x - denoised)/sigma * (sigma_next - sigma)`
+  // (ltx2_pipeline.cpp, `EulerDiffusionStep` at ltx-pipelines
+  // utils/blocks.py:524-527). Recovering `t2a_first_next_latent` from
+  // `t2a_first_denoised` pins WHICH tensor the step was handed. `ToDenoised`
+  // applied a second time between the recording and the step leaves every field
+  // above untouched and moves only this one.
+  //
+  // The schedule is re-derived from the shared seam rather than read off the
+  // render, and tied to it by the sigma the render recorded.
+  {
+    const std::vector<float> sigmas = vllm::Ltx2SigmaSchedule(/*steps=*/2, /*tokens=*/0);
+    REQUIRE(sigmas.size() == 3);  // `T2aGen` renders two steps
+    REQUIRE(static_cast<double>(sigmas[0]) == sigma);
+    const double dt = static_cast<double>(sigmas[1]) - static_cast<double>(sigmas[0]);
+    REQUIRE_MESSAGE(std::abs(dt) > 1e-3,
+                    "the first two sigmas coincide, so the Euler step is the identity and this "
+                    "check cannot see what it consumed");
+    double worst = 0.0;
+    double scale = 0.0;
+    for (size_t i = 0; i < n; ++i) {
+      const double lat = static_cast<double>(t.t2a_first_latent[i]);
+      const double den = static_cast<double>(t.t2a_first_denoised[i]);
+      const double expected = lat + (lat - den) / sigma * dt;
+      worst = std::max(worst, std::abs(static_cast<double>(t.t2a_first_next_latent[i]) - expected));
+      scale = std::max(scale, std::abs(expected));
+    }
+    INFO("sigma = " << sigma << " -> " << sigmas[1] << "  max|next - Euler(latent, denoised)| = "
+                    << worst << "  scale = " << scale);
+    REQUIRE_MESSAGE(scale > 1e-3,
+                    "the recomputed Euler output is zero, so the residual below bounds nothing");
+    CHECK_MESSAGE(worst <= 1e-5 * scale,
+                  "the latent `Ltx2EulerStep` wrote is not the step over `t2a_first_denoised`, so "
+                  "the sampler was handed some other tensor (#1039): residual "
+                      << worst << " against a tolerance of " << (1e-5 * scale));
+  }
 }
 
 TEST_CASE("ltx2 t2a: rescale_scale 0 is the control because both spaces agree there") {

@@ -326,10 +326,21 @@ a checkpoint the pipeline cannot use. `audio_vae_path` stays required, because
 **The `READER ANCHORS` gate.** `ltx2_video.cpp` carries a derived line-number
 list re-derived and string-compared by `test_ltx2_video.cpp`. Any line inserted
 above the last anchored line shifts it, and a clean `git merge` will not warn.
-Mitigation: the engine edit is a branch at the TOP of `Generate`, which is below
-every anchor; the list is re-derived at the final tree after the last merge of
+Mitigation: the list is re-derived at the final tree after the last merge of
 `origin/main` with the test's own walk rather than by arithmetic, and it is named
 as a merge hazard in the PR body.
+
+**AND THE ANCHORS DID MOVE.** The mitigation above once claimed the engine edit
+is "a branch at the TOP of `Generate`, which is below every anchor", and the
+list is `781 791 792 854 950 966 968 1046 1071 1176 1217` on `origin/main`
+against `782 792 793 855 951 967 969 1060 1085 1190 1231` here. Two hunks sit
+ABOVE the last anchor: the `ltx2_t2a.h` include at `@@ -36,6 +36,7`, which shifts
+every anchor by one, and the audio-only video-VAE exception at
+`@@ -974,8 +975,21`, which adds thirteen more and moves the last four by
+fourteen. `@@ -1018,7 +1032,7` is above 1231 as well and is net zero. The
+anchors were correctly RE-DERIVED with the test's own walk and the gate passes
+23/23, so the outcome is right; only the stated reason was false, and a false
+reason is what makes the next reader skip the re-derivation.
 
 **A silently wrong render.** Every failure mode here produces a playable WAV of
 the right length: a guider that never runs its uncond pass, an STG pass that
@@ -527,10 +538,26 @@ defect of the route rather than of this row, and the reach claim above is worded
 to exclude it. Whether the route's LOAD path was exercised end to end here is
 recorded in the final report as measured or unverified — it is not asserted.
 
-**This row ends a test-only-driver.** `Ltx2MultiModalGuidance`, `Ltx2CfgDelta`,
-`Ltx2StgDelta` and `Ltx2BatchedPerturbationConfig` have had test call sites and
-no product one since they landed, which is exactly the shape
-`.agents/reachability.md` names.
+**This row ends ONE test-only driver, and leaves three standing.** An earlier
+draft of this section claimed all four, and the tree contradicts it:
+
+| Symbol | Production call site after this row |
+|---|---|
+| `Ltx2MultiModalGuidance` | **yes** — `src/vllm/model_executor/models/ltx2_t2a.cpp`, in the guided step. This is the one this row ends |
+| `Ltx2CfgDelta` | no — reached only through `Ltx2Guidance` (`ltx2_pipeline.cpp:532`) and from `tests/vllm/models/test_ltx2_pipeline.cpp:615` |
+| `Ltx2StgDelta` | no — the same, at `ltx2_pipeline.cpp:534` and `test_ltx2_pipeline.cpp:630` |
+| `Ltx2BatchedPerturbationConfig` | no — constructed nowhere outside `test_ltx2_pipeline.cpp:832-859`. T2A uses `Ltx2DitPerturbation`, which is a different type |
+
+`Ltx2Guidance` itself is the reason the two deltas stay dead: its only caller in
+the tree is `tests/vllm/models/test_ltx2_pipeline.cpp:710`, so the switch that
+would route a configured guider kind to them is reached from no product path.
+
+**This row does not owe that wiring.** All four landed with #641, before this row
+existed, and none of them is on the T2A path — T2A resolves a
+`Ltx2MultiModalGuiderParams` and calls `Ltx2MultiModalGuidance` directly, exactly
+as `_guided_denoise` does upstream. Recorded here because the spec must not
+assert what `git grep` refutes, and listed under `## Owed` with the issue that
+tracks it.
 
 ## 7. Quantized arms
 
@@ -696,6 +723,63 @@ tests/vllm/multimodal/test_ltx2_video.cpp:5378: ERROR:
 `Ltx2MultiModalGuidance` WAS the raw DiT velocity. Green after, on the same
 filter: 1 case, 16 assertions, 0 failed, exit 0.
 
+### The #1039 gate covered ONE of the three guidance arms
+
+The fresh review of `c1fe35592` passed on the correctness of the fix and
+returned one blocking finding: the case above recorded `first_step_velocity` and
+`first_step_cond` for the CONDITIONAL pass, nothing observed the other two arms,
+and nothing pinned what `Ltx2EulerStep` consumed. `ltx2_t2a.cpp:41-43` claims the
+conversion is applied to EVERY PASS, and the gate held that claim for one third
+of them.
+
+Reproduced before the repair, on the same filter as the green run
+(`--test-case=ltx2 t2a*`, comma-free, 10 cases / 526 assertions at
+`c1fe35592`). Each mutation applied to ONE file, `git diff --stat` taken against
+the pre-mutation working tree rather than against `HEAD`, rebuilt with the
+`: error:` count printed beside the verdict, exit code captured directly, and
+restored from a content snapshot with `os.utime(now)` and a sha256 compare.
+
+| Mutation | before the repair | after |
+|---|---|---|
+| A1 the PERTURBED (STG) pass alone left in velocity space | SURVIVED, exit 0, 10/526 | DETECTED, exit 1 |
+| A2 the UNCONDITIONAL pass alone left in velocity space | SURVIVED, exit 0, 10/526 | DETECTED, exit 1 |
+| R1b `ToDenoised` applied a SECOND time to the guider's output, between the step-0 record and the Euler step | SURVIVED, exit 0, 10/526 | DETECTED, exit 1 |
+| R1c the same double application ABOVE the step-0 record, so the recorded `t2a_first_denoised` is itself doubly converted | SURVIVED, exit 0, 10/526 | DETECTED, exit 1 |
+| A4 the perturbed arm's recorded velocity ZEROED — the guard, not a defect | n/a (the field did not exist) | DETECTED, exit 1, by the `REQUIRE` |
+
+R1c is not from the review. It was found while closing R1b: the reviewer's R1b
+sits between the record and the step, so the recovered-Euler-input check sees
+it, and moving the same edit one statement earlier does not. That is why the
+repair adds a second, independent check rather than one.
+
+**The repair is observability plus three checks, not a change to the fix.**
+`Ltx2T2aResult` and the trace gain a (velocity, x0) pair for the unconditional
+and perturbed arms and the latent the Euler step wrote. The case then applies the
+SAME equation to every arm, replays `Ltx2MultiModalGuidance` over the three
+recorded arms and requires bit equality with `t2a_first_denoised`, and recovers
+`t2a_first_next_latent` from `t2a_first_denoised` through the Euler formula.
+
+**Non-vacuity, per arm rather than once.** `latent_span > 1e-3` stays shared —
+a zero sample makes the two candidate tensors coincide on every arm. Its partner
+`sigma * velocity_span > 1e-6` moves INSIDE the per-arm loop, because a zero
+velocity makes `to_denoised` the identity for that arm alone, and "expected zero,
+and a stub also produces zero" is the trap this campaign has hit twice. A4 is the
+mutation that proves that guard is armed: zeroing one arm's recorded velocity
+takes the case red through the `REQUIRE`, at 538 assertions rather than 548
+because the `REQUIRE` aborts the case. The replay check adds its own
+(`t2a_first_denoised != t2a_first_cond`, the guider MOVED what it was handed) and
+the Euler check adds two (`|dt| > 1e-3`, so the step is not the identity, and
+`scale > 1e-3`, so the residual bounds something).
+
+**The rescale's numeric difference is still NOT asserted, and the reason was
+re-measured.** `std(cond)/std(pred)` is 1 to printed precision on this fixture,
+so `factor = 0.7*1 + 0.3 = 1`, the rescale is an exact no-op in BOTH spaces, and
+the difference term `(factor - 1) * latent` is identically zero. Owed against the
+real-checkpoint render, as before.
+
+Green after: `--test-case=ltx2 t2a*` at 10 cases / **548** assertions / 0 failed
+/ exit 0, up from 526.
+
 ## Owed
 
 - **The rescale's numeric consequence END TO END.** Gated at the seam (0.352
@@ -738,6 +822,36 @@ filter: 1 case, 16 assertions, 0 failed, exit 0.
 - **The `dmd2` recipe's `noise_scale`**, see §7b.
 - **A real-checkpoint T2A render.** Gated on the reduced fixture only; the GPU
   was out of bounds for this row.
+- **THE LTX-2.5 CHECKPOINT PIN.** `docs/USAGE.md` names six LTX-2.5 artifacts by
+  bare file name and gives no HuggingFace repo, no revision and no sha256 for
+  any of them — `:663-670` and `:2183-2188` on `origin/main` at `d1b0ea3a8`,
+  plus the text-to-audio recipe this row added at `:853-857`. AGENTS.md
+  § *Say which weights, and from where* requires all three, per arm. It is
+  campaign-wide and pre-existing rather than introduced here: `grep -n sha256
+  docs/USAGE.md` returns two checkpoint hashes and both belong to
+  MiniMax-Music3 (`:3127`, `:3269`), while MiniMax-H3 (`:1950-1993`) and
+  MiniMax-Music3 (`:3123-3149`) each carry a full table and LTX-2.5 carries
+  none. RECORDED AND NOT FABRICATED: this row claims no render on real weights,
+  so there is no checkpoint it was gated against to pin, and inventing a repo id
+  would be worse than the gap. The real-checkpoint render owed above is what
+  closes it. Tracked by
+  [#1048](https://github.com/mudler/vllm.cpp/issues/1048).
+- **`Ltx2Guidance` and the two deltas it gates are DEAD in production**, and so
+  is `Ltx2BatchedPerturbationConfig`. See §6b for the measured table. All four
+  landed with #641, none is on the T2A path, and this row ends only
+  `Ltx2MultiModalGuidance`'s test-only-driver state. Tracked by
+  [#1049](https://github.com/mudler/vllm.cpp/issues/1049).
+- **The guider rescale's `std` comment states an impossible consequence.**
+  `ltx2_pipeline.cpp:505-506` and `ltx2_pipeline.h:319-322` say torch's unbiased
+  (N-1) `std` matters and the biased one "would be a small, everywhere,
+  resolution-dependent gain error". `factor = std(cond)/std(pred)` divides two
+  `std`s over the same count, so the `(n-1)` cancels exactly and the two
+  estimators give the same ratio. A review mutation from biased to unbiased
+  survived because it is an IDENTITY, not because the gate is blind — which is
+  worth writing down, because a survivor at that site otherwise reads as a blind
+  instrument and costs another investigation. The CODE is right; the COMMENT is
+  the defect. Pre-existing from `cefacd2d0` (#641) and out of this row's scope.
+  Tracked by [#1050](https://github.com/mudler/vllm.cpp/issues/1050).
 - **Value goldens from executed upstream for the T2A COMPOSITION.** The bricks
   either side have them; the chain does not. What would close it is a section in
   `scripts/gen-ltx2-pipeline-goldens.py` that instantiates

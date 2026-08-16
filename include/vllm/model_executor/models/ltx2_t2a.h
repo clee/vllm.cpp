@@ -175,15 +175,17 @@ struct Ltx2T2aResult {
   double latent_absmax = 0.0;
 
   // EVERYTHING STEP 0 PRODUCED, in the order it produced it: the sampler's
-  // input, the conditional pass's RAW DiT output, the tensor that pass handed
-  // the guider, and the guider's result. They exist because #1039 is invisible
-  // in every other field here — combining the guidance passes in VELOCITY space
-  // and converting once afterwards produces a waveform of the right length, the
-  // right channel count, the right sample rate and a perfectly healthy forward
-  // count — and together they make the question decidable by arithmetic rather
-  // than by magnitude:
+  // input, EVERY GUIDANCE PASS as a (raw velocity, x0 prediction) pair, the
+  // guider's result, and the latent the Euler step wrote. They exist because
+  // #1039 is invisible in every other field here — combining the guidance passes
+  // in VELOCITY space and converting once afterwards produces a waveform of the
+  // right length, the right channel count, the right sample rate and a perfectly
+  // healthy forward count — and together they make the question decidable by
+  // arithmetic rather than by magnitude:
   //
-  //     first_step_cond == first_step_latent - sigma * first_step_velocity
+  //     first_step_cond      == first_step_latent - sigma * first_step_velocity
+  //     first_step_uncond    == first_step_latent - sigma * first_step_uncond_velocity
+  //     first_step_perturbed == first_step_latent - sigma * first_step_perturbed_velocity
   //
   // holds when the guider is handed X0 PREDICTIONS, as `X0Model.forward` does
   // (model.py:590-604, over the `X0Model(...)` that utils/blocks.py:480-482
@@ -191,13 +193,42 @@ struct Ltx2T2aResult {
   // also upstream's own `DenoisedLatentResult.cond` (utils/denoisers.py:206),
   // rather than a field invented for a test.
   //
+  // ONE PAIR PER ARM, AND NOT ONLY THE CONDITIONAL ONE. The default T2A arm runs
+  // THREE forwards per step (header item 2), and a build that converts the
+  // conditional pass and leaves either of the other two in velocity space
+  // renders a different waveform through a guider whose cond term is impeccable.
+  // A single recorded pair holds the claim "`to_denoised` on the way out of the
+  // forward" for one third of the passes it is made about; the review that found
+  // #1039 mutated exactly those other two arms and the gate stayed green.
+  //
+  // `first_step_next_latent` is what `Ltx2EulerStep` WROTE, and it is here so
+  // that what the sampler CONSUMED is checkable rather than assumed:
+  //
+  //     first_step_next_latent
+  //         == latent + (latent - first_step_denoised)/sigma * (sigma_next - sigma)
+  //
+  // A second `ToDenoised` applied to the guider's output on the way into the
+  // step — the residue a partial #1039 repair leaves behind — moves this and
+  // nothing else.
+  //
   // STEP 0 SPECIFICALLY, because it is the one step whose inputs do not depend
   // on any earlier step, so two renders that differ only in a guider parameter
   // share a bit-identical step-0 latent and bit-identical DiT passes.
+  //
+  // The uncond and perturbed pairs stay EMPTY when the guider does not ask for
+  // that arm (`cfg_scale == 1.0`, `stg_scale == 0.0`), because the forward did
+  // not run. An empty vector is the honest record of a pass that never happened;
+  // a zero-filled one of the right length would be indistinguishable from a
+  // forward that returned zeros.
   std::vector<float> first_step_latent;
   std::vector<float> first_step_velocity;
   std::vector<float> first_step_cond;
+  std::vector<float> first_step_uncond_velocity;
+  std::vector<float> first_step_uncond;
+  std::vector<float> first_step_perturbed_velocity;
+  std::vector<float> first_step_perturbed;
   std::vector<float> first_step_denoised;
+  std::vector<float> first_step_next_latent;
   double first_step_sigma = 0.0;
 };
 

@@ -345,7 +345,13 @@ Ltx2T2aResult Ltx2T2aGenerate(const Ltx2T2aRequest& req) {
       if (want_uncond) {
         Ltx2ModalityInput nin = ain;
         nin.context = req.negative_context;
-        uncond_text = x0_model(/*video=*/nullptr, &nin, /*p=*/nullptr);
+        // The velocity of THIS arm, recorded beside its x0 exactly as the
+        // conditional pass's is. Recorded per arm rather than once, because the
+        // conversion is per pass and a claim made about "every pass" from one
+        // recorded pass is a claim about a third of them (see the header).
+        uncond_text = x0_model(/*video=*/nullptr, &nin, /*p=*/nullptr,
+                               step == 0 ? &result.first_step_uncond_velocity : nullptr);
+        if (step == 0) result.first_step_uncond = uncond_text;
         ++result.uncond_forwards;
       }
       if (want_perturbed) {
@@ -353,7 +359,9 @@ Ltx2T2aResult Ltx2T2aGenerate(const Ltx2T2aRequest& req) {
         // perturbs the MODEL, never the conditioning (guiders.py:244-273 takes
         // `uncond_perturbed` from a forward whose `perturbations` differ and
         // whose context does not).
-        uncond_perturbed = x0_model(/*video=*/nullptr, &ain, &perturbation);
+        uncond_perturbed = x0_model(/*video=*/nullptr, &ain, &perturbation,
+                                    step == 0 ? &result.first_step_perturbed_velocity : nullptr);
+        if (step == 0) result.first_step_perturbed = uncond_perturbed;
         ++result.perturbed_forwards;
       }
       denoised = Ltx2MultiModalGuidance(g, cond.data(),
@@ -379,6 +387,11 @@ Ltx2T2aResult Ltx2T2aGenerate(const Ltx2T2aRequest& req) {
     // nothing.
     latent = Ltx2EulerStep(latent.data(), last_denoised.data(), sigmas.data(), sigma_count, step,
                            static_cast<int64_t>(latent.size()));
+    // What the sampler WROTE, recorded after the step rather than derived from
+    // what was recorded before it. It is the only observable that says which
+    // tensor `Ltx2EulerStep` was actually handed: a second `ToDenoised` applied
+    // to `denoised` on the way in leaves every other field here untouched.
+    if (step == 0) result.first_step_next_latent = latent;
   }
 
   result.latent_digest = DigestF32(latent);

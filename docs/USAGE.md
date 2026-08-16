@@ -851,12 +851,24 @@ is nothing to mux.
 
 ```sh
 ltx2-gen --dit ltx-2.5-dit.safetensors \
-         --audio-vae ltx-2.5-audio-vae.safetensors \
+         --audio-vae ltx-2.5-audio-vae-bf16.safetensors \
          --encoder gemma4-12b-with-proj.safetensors --encoder-config gemma4.json \
          --pipeline-kind t2a_one_stage --device cpu \
          --frames 121 --steps 30 --prompt "rain on a tin roof, distant thunder" \
          --workdir /tmp/t2a
 ```
+
+**These file names are not a checkpoint pin, and no LTX-2.5 recipe in this
+document is.** None of them names a HuggingFace repo, a revision or a sha256,
+which AGENTS.md § *Say which weights, and from where* requires; MiniMax-H3 and
+MiniMax-Music3 below each carry a full table and LTX-2.5 carries none. That is
+campaign-wide and pre-existing rather than particular to this recipe, and it is
+recorded rather than invented, because no LTX-2.5 arm here has been rendered on
+real weights yet. Tracked by
+[#1048](https://github.com/mudler/vllm.cpp/issues/1048); read `--dit` above as
+"the LTX-2.5 transformer", which the other recipes on this page spell as
+`ltx-2.5-22b-distilled-fp8.safetensors` together with the `--dit-config` its
+missing `__metadata__` requires.
 
 **No `--video-vae` is needed**, and none is loaded: upstream's pipeline never
 constructs a video VAE. `--width` and `--height` are **refused** rather than
