@@ -753,8 +753,61 @@ Wiring is not the missing step; the arm does not exist.
 
 **How much of the render this accounts for.** ~89% of a completed 320x192/49f
 render's wall is a flat-memory phase at load ~1.1 on 20 cores (§1.4). Whether
-that phase is host compute or GPU-blocking is what rung 2 decides, and the
-answer is recorded there rather than asserted here.
+that phase is host compute or GPU-blocking is what rung 2 decides.
+
+**Rung 2's answer is broader than the question, and it is measured.** Over the
+first 1192 s of the 320x192/25f render, across 347 per-PID samples at 2 s:
+
+* GPU utilization **never exceeded 2%**, and was **exactly 0 in 321 of 347
+  samples**;
+* every one of the 26 non-zero samples falls **inside the DiT staging window**
+  (t <= 251 s), where it is incidental copy traffic;
+* from t = 251 s onward — **over 15 minutes and counting** — GPU utilization is
+  **0 in every sample**, while `capp_mib` sits flat at 36396 MiB and the process
+  holds **exactly 1.00 core** of 20 (`utime` +116.7 s over 117 s, +142.2 s over
+  142 s across consecutive windows);
+* no frame had been written.
+
+So this is not merely a host VAE decode at 0% GPU. **Nothing after the weight
+staging has used the GPU for compute at all**, on a run that staged 35.54 GiB of
+transformer weights onto that GPU and was invoked with `--device cuda`. The
+weights are resident on a device that then does no work.
+
+**The instrument caveat, stated before the conclusion leans on it.** This row has
+**no positive control that `utilization.gpu` reports a high value for a real
+compute kernel on GB10.** It is demonstrably live — it moved between 0% and 3%
+during staging — but "live" is not "correctly scaled", and this box already has
+form here: `nvidia-smi --query-gpu=memory.used` returns `[N/A]` on it (§4.3).
+A 0% reading from an uncalibrated counter is exactly the shape of a broken
+instrument producing a verdict about the code. **That control is owed**, and it
+is one command under the lock: run any known GPU-saturating job and confirm the
+counter reads high.
+
+**The CPU column does not depend on that counter, and it carries the claim on its
+own.** The process holds **exactly 1.00 core of 20** for 15+ minutes with
+`capp_mib` flat. A host thread that had handed the work to the device would not
+accumulate a full core of time *and* leave the device counter unchanged *and*
+produce no output; the three together are only consistent with the host doing
+the arithmetic. The GPU-utilization column corroborates that reading rather than
+establishing it.
+
+**What that does and does not establish.** It establishes, for this
+configuration and this build (`0e1bee42f`), that the render's post-load wall is
+single-threaded host execution end to end. It does **not** by itself identify
+which phase the sampled window is in — the run had not reached a frame, and the
+engine emits nothing that timestamps a phase boundary (#1010), which is exactly
+why that issue is ranked as the precondition it is. Attributing the window
+between the connector and the first frame needs either #1010's instrumentation
+or a completed run whose frame mtimes bound the decode. Rung 2's completion is
+recorded in §1.3 when it returns.
+
+This is filed as [#1024](https://github.com/mudler/vllm.cpp/issues/1024),
+including the owed positive control.
+
+**One thing follows immediately and does not wait for that.** `docs/USAGE.md`'s
+*"most of a 320x192/25f render is spent single-threaded in the host VAE decode
+at 0% GPU"* understates the problem. The 0% GPU is not a property of the decode
+phase. It is a property of the whole render after load.
 
 **Why 2681 s is not mysterious once the arithmetic is done.** One 448x256/25f
 decode is **~7.25 TFLOP** of dense 3x3x3 convolution across 42 conv calls
@@ -774,6 +827,7 @@ magnitude arguments from arithmetic and from what the oracles run.
 
 | # | Lever | Expected magnitude | Reasoning | Upstream anchor | Size | What would prove it |
 |---|---|---|---|---|---|---|
+| 0 | [#1024](https://github.com/mudler/vllm.cpp/issues/1024) **Find out why the GPU is idle for the whole post-load render.** 35.54 GiB staged onto it; 0% utilization in 321/347 samples, all 26 non-zero ones inside staging. | Bounds every other lever: if the denoise is also on the host, #1007 alone does not close the render | MEASURED rung 2 (§5); disjunction stated, not guessed | `ltx2_video.cpp:2946` vs `:2948`; `:786` | **small to diagnose** | #1010's phase timings, plus the owed `utilization.gpu` positive control |
 | 1 | [#1007](https://github.com/mudler/vllm.cpp/issues/1007) **Give the video VAE decode a device arm.** It has none; production runs the CPU reference. | The dominant term. 7.25 TFLOP that upstream runs on an accelerator in a fraction of a second | §5 arithmetic; every oracle is GPU-resident | `blocks.py:1139` + `single_gpu_model_builder.py:273`; `decoding_av.py:71`; `interface.py:92` | **large** — a new `vt::` conv3d op plus CUDA/CPU arms, mirroring `cuda_ltx2.cu`'s seam | end-to-end wall at 320x192/25f, same seed, same frames, byte-compared pixels against the f32 reference |
 | 2 | [#1008](https://github.com/mudler/vllm.cpp/issues/1008) **Drop f64 accumulation to the checkpoint dtype, and NCDHW to NDHWC.** 8 `double acc` sites, 29 `static_cast<double>`, f32 buffers. | Large on the host arm; on a device arm it decides which cuDNN family runs | f64 appears in no oracle; NDHWC is upstream's default-on fast path | `conv_video_decoder.py:282-284`; `normalization.py:32-40`; `memory_efficient_decode.py:617-627`, `:655-656` | **small-to-medium**, and it is the cheapest large win available today | per-stage byte counters plus wall, against the existing goldens — the goldens cannot see this, so it needs its own instrument |
 | 3 | [#1009](https://github.com/mudler/vllm.cpp/issues/1009) **Route the decode through `ParallelForRows`.** Exists, synchronous, used by 10+ CPU kernels, unused here. | Bounded by core count; 20 on GB10 | §5; `cpu_conv2d.cpp:78` is the same shape | none — this is a local seam, not an upstream mirror | **small** | wall at fixed thread counts, plus `max\|diff\| == 0` against the serial arm |
@@ -915,7 +969,8 @@ this row has no implementation authority and no fresh review (§8).
 | [#1014](https://github.com/mudler/vllm.cpp/issues/1014) | 5 — the 59 GiB: decode excluded, residency excluded, three hypotheses ranked | owed |
 | [#1015](https://github.com/mudler/vllm.cpp/issues/1015) | 5a — `Ltx2WidenDitToF32` holds bf16 and f32 at once | owed |
 | [#1016](https://github.com/mudler/vllm.cpp/issues/1016) | 5b — LTX loaders never release mmap source pages | owed, MEASURED at +10.83 GiB in rung 1 |
-| [#1021](https://github.com/mudler/vllm.cpp/issues/1021) | 8 — DiT staging is 7.5 min at ~52 MiB/s, GPU idle, 0.15 cores | owed |
+| [#1021](https://github.com/mudler/vllm.cpp/issues/1021) | 5c — DiT staging is 7.5 min at ~52 MiB/s, GPU idle, 0.15 cores | owed |
+| [#1024](https://github.com/mudler/vllm.cpp/issues/1024) | 0 — the GPU is idle for the WHOLE post-load render, not only the decode | owed; carries the owed `utilization.gpu` positive control |
 
 * **The 60 GiB attribution.** Carried forward from
   [`ltx25-tiled-decode.md`](ltx25-tiled-decode.md) `## Outcome`, now with the
