@@ -342,6 +342,12 @@ target_compile_definitions(test_ltx2_pipeline PRIVATE
 # own manifests, a few hundred of their own bytes against torch, and synthetic
 # files for whole-model materialization. All three .inc files live beside the
 # test source.
+# LTX25-RETAKE (#924): the ported pieces at value level — the temporal region
+# mask under both coordinate conventions, the truncate-or-pad conform and the
+# CLI-stage validations. Its own target rather than cases inside
+# test_ltx2_pipeline, which several concurrent rows of this campaign edit. The
+# REACHABILITY proof for the same row lives in test_ltx2_video.
+vllm_cpp_add_test(test_ltx2_retake vllm/models/test_ltx2_retake.cpp)
 vllm_cpp_add_test(test_ltx2_lora vllm/models/test_ltx2_lora.cpp)
 vllm_cpp_add_test(test_ltx2_loader vllm/models/test_ltx2_loader.cpp)
 target_include_directories(test_ltx2_loader PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
@@ -1030,6 +1036,7 @@ vllm_cpp_add_test(test_weight_offload_policy vllm/model_executor/test_weight_off
 vllm_cpp_add_test(test_expert_slot_cache vllm/model_executor/test_expert_slot_cache.cpp)
 vllm_cpp_add_test(test_gguf_expert_span vllm/model_executor/test_gguf_expert_span.cpp)
 vllm_cpp_add_test(test_expert_streamer vllm/model_executor/test_expert_streamer.cpp)
+vllm_cpp_add_test(test_host_expert_slot_store vllm/model_executor/test_host_expert_slot_store.cpp)
 # ENG-MM-INPUT-PIPELINE L1 (#607): the refusal those limits carry — the min()
 # fold against the model's own ceiling, upstream's exact message, and both call
 # sites with the enable_mm_embeds escape.
