@@ -402,6 +402,20 @@ TEST_CASE("decode REACHES the expert streamer, and the step clock advances") {
   // cache whose step never ends protects every entry forever, refuses every
   // slice once full, and silently serves the mapping instead.
   CHECK(s.exhausted == 0);
+
+#if defined(__unix__)
+  // F5: the MADV_WILLNEED hint is ACCEPTED, not merely issued.
+  //
+  // madvise(2) returns EINVAL on an address that is not page-aligned, and GGUF
+  // tensor data is aligned to `general.alignment`, default 32
+  // (gguf_reader.cpp:401), so a slice address is essentially never a page
+  // boundary. The call was made on the raw address with its return value
+  // discarded, which is a hint that never fired and never said so. This counts
+  // only the calls the kernel took.
+  //
+  // NO SPEEDUP IS ASSERTED, here or anywhere. This says the call is well formed.
+  CHECK(s.advised > 0);
+#endif
 }
 
 TEST_CASE("a streamed slice and the tower view produce IDENTICAL logits") {
