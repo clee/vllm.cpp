@@ -221,7 +221,17 @@ Run TWICE. A merge that brings in new source is a new binary, so the extraction'
 | `a0693813a` (extraction) | exit 0, 0 warnings under `-Werror` | 485/485 passed, 0 failed | 828.96 s |
 | `018c9d1cb` (post-merge, `origin/main` @ `e5351776c`) | exit 0, 0 warnings under `-Werror` | 485/485 passed, 0 failed | 682.90 s |
 
-Both skip the same 2 absent-fixture tests (`test_modelopt_mixed_precision_checkpoint`, `test_voxtral_e2e`). Disk 91% before, 99% at peak, 93% after the second run; the build tree was removed afterwards.
+| `66c1e805c` (post-merge, `origin/main` @ `c90e3fc02`) | exit 0, 0 warnings under `-Werror` | 487/488 passed, **1 failed** | 837.59 s |
+
+All three skip the same 2 absent-fixture tests (`test_modelopt_mixed_precision_checkpoint`, `test_voxtral_e2e`). The third run's 488 is 485 plus the 3 tests `origin/main` @ `c90e3fc02` brought in.
+
+**The one failure is the tracked flake [#294](https://github.com/mudler/vllm.cpp/issues/294)**, not a regression, and it was re-run before being called that, per [`verification.md`](../verification.md) ("tests that starve under `ctest -j` are re-run serially before being called a regression"):
+
+- #294 records `test_async_llm` reusing an aborted request id as racing the core abort, at a **26% failure rate under contention, on main**.
+- It PASSED in both earlier full runs of this same tree (0.14 s and 0.37 s) and FAILED in 0.31 s only in the third, which ran with the box at load average 29-35 from concurrent sessions.
+- Re-run serially **3/3 green**, 15/15 assertions each.
+
+Disk 91% before, 99% at peak, 93% after; the build tree was removed afterwards.
 
 Pre-existing suites at `c7cb59fbb` -> `a0693813a`, identical: `test_qwen3_5_gdn_spec_routing` 6/52, `test_ops_fp8_cpu` 4/56, `test_qwen27_paged_forward` 29/765, `test_qwen27_dense_forward` 9/583, every one `Status: SUCCESS!`. `test_linear_method` 6/76 -> 8/88 (two new cases, additive).
 
