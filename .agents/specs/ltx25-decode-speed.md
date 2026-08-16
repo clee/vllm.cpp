@@ -58,13 +58,21 @@ this row is willing to rank a lever on a computed number.
 ### 1.2 A number that does NOT survive as stated
 
 `docs/USAGE.md:873-874` says a 448x256/25f render *"loses about 59 GB in 24
-seconds inside the decode"*. The **59 GiB** is real and is visible in every
-render log. **"Inside the decode" is not established by anything in the tree**,
-and [`ltx25-tiled-decode.md`](ltx25-tiled-decode.md) `## Outcome` item 3 already
-said so in as many words — *"the reported '24 seconds' of memory fall cannot
-have been a completed decode"* — because the decode at that size takes 2681 s,
-not 24. The doc sentence attributes to the decode a fall the same repository had
-already shown the decode cannot have caused. §4 replaces the attribution.
+seconds inside the decode"*. The sentence is **half supported, and the half that
+fails is the one that has been driving work.**
+
+*Supported:* the 59 GiB is real, and the fall is on the decode **side** of the
+denoise-to-decode boundary — `benchmark-record.md:21150-21160` shows both
+denoise phases finishing and draining first (§4.2).
+
+*Not supported:* that the decode **allocates** it. It cannot —
+`Ltx2ConvVideoDecode`'s exact heap peak at that size is 361.72 MiB, a factor of
+170 (§4.1), and [`ltx25-tiled-decode.md`](ltx25-tiled-decode.md) `## Outcome`
+item 3 had already noted the 24-second fall *"cannot have been a completed
+decode"*, which takes 2681 s.
+
+"On the decode side of a boundary" and "inside the decode" are different claims,
+and the doc collapses them. §4 keeps the first and replaces the second.
 
 ### 1.3 What this row measured itself
 
@@ -514,15 +522,14 @@ path (§2.1). That is 2x the bytes per element and a different kernel family, an
 it is exactly the difference AGENTS.md says a token gate structurally cannot
 report.
 
-## 4. The 60 GiB — attributed away from the decode, and where it actually is
+## 4. The 60 GiB — excluded from the decode, and NOT the residency either
 
-**The decode is excluded, twice over, by two independent methods.**
+### 4.1 The decode is excluded, twice, by two independent methods
 
-1. *Measured.* Exact `operator new` accounting over a real 448x256/25f decode to
-   completion gives a heap peak of **361.72 MiB**
+1. *Measured.* Exact `operator new` accounting over a real 448x256/25f decode
+   run to completion gives a heap peak of **361.72 MiB**
    ([`ltx25-tiled-decode.md`](ltx25-tiled-decode.md) `## Outcome` item 2) — a
-   factor of **170** below 60 GiB. Process RSS stayed flat at 4.9 GB while
-   `MemAvailable` fell.
+   factor of **170** below 60 GiB.
 2. *Computed, as an upper bound.* Summing **every** intermediate the LTX-2.5
    conv decoder ever produces at 448x256/25f and assuming **nothing is ever
    freed**, in f32:
@@ -535,56 +542,121 @@ report.
    | everything else | 0.964 |
    | **total** | **9.649** |
 
-   That is the pathological ceiling for the entire conv decode with no frees at
-   all, and it is still **6x short of 59 GiB**. The realistic upstream peak is
-   ~95 MiB bf16 on the workspace path, ~200-300 MiB on the plain path — which
-   makes our measured 361.72 MiB the right order for a correct f32 NCDHW port
-   rather than evidence of a leak.
+   The pathological ceiling for the entire conv decode with no frees at all, and
+   still **6x short of 59 GiB**. The realistic upstream peak is ~95 MiB bf16 on
+   the workspace path and ~200-300 MiB on the plain path, which makes our
+   measured 361.72 MiB the right order for a correct f32 NCDHW port rather than
+   evidence of a leak.
 
-**So `memory_efficient_decode.py` cannot be the missing 59 GiB, and this row
-closes that hypothesis rather than carrying it.** The dispatch named it as the
-obvious candidate; the arithmetic above is what a guess would have skipped.
-Porting it remains worth doing for byte traffic and for the NDHWC memory format
-it carries (§6 lever 4) — it is simply not a memory-attribution lever at this
-size.
+**So `memory_efficient_decode.py` cannot be the missing 59 GiB**, and this row
+closes that hypothesis (#1011) rather than carrying it. The dispatch named it as
+the obvious candidate; the arithmetic above is what a guess would have skipped.
 
-**Where the bytes actually are.** The render's own documentation already
-accounts for ~68 GiB before a single decode instruction runs —
-`docs/USAGE.md:862-864` at `332aed738`: *"Staging the 21.00B FP8 transformer
-costs about 44 GB on a 119 GB GB10, and `--encoder` adds the text tower on top
-of that — roughly 24 GB of host bf16 that stays resident, because a prompt
-arrives per request."*
+### 4.2 The shape of the fall, which rules out the answer this row first reached
 
-The completed 49-frame render (§1.4) is consistent with exactly that and with
-nothing else: `MemAvailable` falls 115 -> 43 GiB, a **72 GiB** acquisition, in
-the first ten minutes — during load, before any decode — and then **does not
-move for two hours** while one thread computes. Weights that are staged and held
-do not show as a decode allocation, do not appear in the decode's `operator new`
-accounting, and are exactly the shape of *"flat process RSS while MemAvailable
-fell"*.
+The richest record of it is **not** in either LTX spec. It is
+`.agents/benchmark-record.md:21144-21160`, and it is more specific than the
+summaries that quote it. At 448x256/25f, on the prompt-embeds path with no text
+tower on the machine at all:
 
-**The hypothesis this row carries forward** is therefore: *the 59 GiB is model
-residency — the staged DiT plus the resident text tower — held across a decode
-that needs neither, and the 448x256/25f failure is that residency plus the
-decode's own footprint crossing the 119 GiB unified pool, not a decode
-allocation.*
+* both denoise phases finished and drained normally;
+* `MemAvailable` was **flat at 75.2 GiB through all of it**;
+* then, **after the last drain**:
 
-**It is stated as a hypothesis, not a finding, and this row does not close it.**
-What settles it is the rung-1 probe of §1.3: `MemAvailable`, the render
-process's `VmRSS` and `Anonymous`, and the CUDA compute-app footprint sampled on
-one clock across the load/denoise/decode boundary. If the fall lands in
-`Anonymous` during load and the level then holds flat into the decode, the
-hypothesis is confirmed and the lever is releasing the DiT and the text tower
-before the decode (§6 lever 5). If the fall lands at the decode boundary
-instead, the hypothesis is refuted and the next one is a CUDA or `mmap` mapping,
-which is where [`ltx25-tiled-decode.md`](ltx25-tiled-decode.md) `## Outcome`
-item 2 already pointed. Either outcome is a result; neither is a guess.
+```
+03:47:11 avail_kB=73014000 rss_kB=4972520
+03:47:21 avail_kB=57800944 rss_kB=4972520
+03:47:31 avail_kB=27711644 rss_kB=4899272
+03:47:35 WATCHDOG_KILL avail_kB=13774472 floor=18000000
+```
 
-**Two things this row will not do.** It will not restate `docs/USAGE.md:873-874`'s
-"inside the decode" as though it were measured (§1.2), and it will not declare
-the 448x256 ceiling a limit — per AGENTS.md, an apparent ceiling is an
-unresolved implementation difference, and the next traceable hypothesis is named
-above.
+**~59 GB in 24 seconds with the process's own RSS flat at 4.9 GB.** The fall is
+on the decode side of the denoise-to-decode boundary — which is the one part of
+`docs/USAGE.md:873-874` that *is* supported — but no frame was ever written, and
+`Ltx2ConvVideoDecode` at that size cannot allocate it (§4.1).
+
+**A plateau followed by a cliff refutes the hypothesis this row reached first.**
+The render's documented residency is large and real — `docs/USAGE.md:862-864`
+gives ~44 GB for the staged transformer and ~24 GB for the text tower — and it
+is tempting to sum the resident objects and land on "about 60 GiB". **That sum
+is a load-time total and cannot explain a fall that starts after a flat
+plateau.** The residency was already paid for at 75.2 GiB. This row wrote the
+residency hypothesis down before reading `benchmark-record.md`, and records the
+correction here rather than quietly deleting it, because the sum is exactly the
+attractive wrong answer the next reader will also reach.
+
+The 320x192/49f trace of §1.4 is a **different shape and not a counter-example**:
+it ran *with* `--encoder`, so its fall is during load and it then plateaus and
+completes. Only the plateau-then-cliff shape fails.
+
+### 4.3 The mechanism that fits, and why nobody has seen it
+
+**`Backend::Alloc` on CUDA is a raw `cudaMalloc`** —
+`src/vt/cuda/cuda_backend.cu:77-81`. On a GB10's unified pool that consumes the
+same bytes as host RAM and **does not appear in `VmRSS`** the way a
+`std::vector` does. So *"flat process RSS at 4.9 GB while MemAvailable fell
+60 GiB"* is not evidence that nothing allocated. It is the **signature** of a
+device-class allocation on this box, and it is why every RSS sampler pointed at
+this has come back empty.
+
+The instrument that would have caught it does not exist here, and
+`benchmark-record.md:21146-21150` says so: **`nvidia-smi --query-gpu=memory.used`
+returns `[N/A]` on GB10.** There is no per-process device-memory reading, so
+device usage has only ever been observable as `MemAvailable` — *"which moves for
+anything on the machine"*.
+
+**Two things follow, and the second is uncomfortable.** First, the fall has never
+been attributed to *our process* at all; a system-wide counter on a shared box
+cannot do that, and the same record notes the box was saturated with other
+coordinators' `ctest` work during that session. Second,
+`--query-compute-apps=used_memory` **does** return a real figure on this box —
+verified this row at 50419 MiB for an unrelated `llama-imatrix` — so a
+per-process device reading was available the whole time and was not used.
+
+### 4.4 Next hypotheses, ranked, and the instrument that separates them
+
+Stated as hypotheses. This row does not close the axis, and per AGENTS.md the
+448x256 result is a measurement and not a ceiling.
+
+1. **A device/unified allocation between the last drain and the first frame.**
+   Fits the RSS-flat signature exactly (§4.3). Against it: the decode is host
+   C++ that touches no device, and the pool drain runs *before* the fall and
+   returns only 0.14 GiB (`benchmark-record.md:21111`).
+2. **Another process on the box.** The counter is system-wide, the box is
+   shared, and this has already voided one figure in this campaign — the same
+   spec's own probe lost 11.1 GiB of its `MemAvailable` delta to a concurrent
+   build ([`ltx25-tiled-decode.md`](ltx25-tiled-decode.md) `## Outcome` item 2).
+3. **File-backed pages faulted and never released.** §4.5 defect 2 is real and
+   unfixed; whether `MemAvailable` (which discounts reclaimable pages) can fall
+   this far from it is exactly what the `Anonymous`-vs-`Rss_File` split decides.
+
+**The instrument, which is queued (§1.3) and is the one all three of the records
+above lacked:** per-PID at 2 s, `smaps_rollup`'s `Anonymous` separated from
+`VmRSS` (which conflates anonymous with file-backed),
+`--query-compute-apps=used_memory` for the device side, `MemAvailable` for the
+pool, and the written frame count — all on **one clock**, under the GPU lock, on
+a box whose other load is recorded rather than assumed.
+
+### 4.5 Two residency defects found while doing this, real regardless of the 59 GiB
+
+Neither is the fall. Both are genuine and are filed.
+
+* **`Ltx2WidenDitToF32` holds the bf16 originals and the f32 copies at the same
+  time, permanently.** `src/vllm/model_executor/models/ltx2_loader.cpp:694-710`:
+  it allocates a widened buffer, repoints `view.data` at it, and **appends** it
+  with `checkpoint.storage.push_back(std::move(widened))` at `:707`. Nothing
+  drops the original. At 18.95B parameters that is 2 + 4 bytes each —
+  **~105.9 GiB (COMPUTED) on a 119 GiB box**, of which ~37.9 GB is dead the
+  instant widening finishes. Reached on every host-arm load via
+  `ltx2_video.cpp:786` (`widen_to_f32 = !on_device`).
+* **The LTX loaders never release their mmap source pages.** `grep -c
+  MaybeReleaseSourcePages` returns **0** for both `ltx2_loader.cpp` and
+  `ltx2_video.cpp`. *Positive control:* the same symbol appears in **15** other
+  files under `src/vllm` (`muse_glimmer_weights.cpp`, `phi_weights.cpp`,
+  `gemma4_weights.cpp`, `nemotron_h_weights.cpp`, `kimi_linear_weights.cpp`,
+  `qwen3_5_dense_weights.cpp`, `olmo2_weights.cpp` among them) — the symbol and
+  the path set are right, and the calls genuinely are not there. The whole DiT
+  file stays faulted resident alongside the growing device copy.
 
 ## 5. Why the decode is single-threaded and on the host
 
@@ -635,7 +707,9 @@ magnitude arguments from arithmetic and from what the oracles run.
 | 2 | [#1008](https://github.com/mudler/vllm.cpp/issues/1008) **Drop f64 accumulation to the checkpoint dtype, and NCDHW to NDHWC.** 8 `double acc` sites, 29 `static_cast<double>`, f32 buffers. | Large on the host arm; on a device arm it decides which cuDNN family runs | f64 appears in no oracle; NDHWC is upstream's default-on fast path | `conv_video_decoder.py:282-284`; `normalization.py:32-40`; `memory_efficient_decode.py:617-627`, `:655-656` | **small-to-medium**, and it is the cheapest large win available today | per-stage byte counters plus wall, against the existing goldens — the goldens cannot see this, so it needs its own instrument |
 | 3 | [#1009](https://github.com/mudler/vllm.cpp/issues/1009) **Route the decode through `ParallelForRows`.** Exists, synchronous, used by 10+ CPU kernels, unused here. | Bounded by core count; 20 on GB10 | §5; `cpu_conv2d.cpp:78` is the same shape | none — this is a local seam, not an upstream mirror | **small** | wall at fixed thread counts, plus `max\|diff\| == 0` against the serial arm |
 | 4 | [#1011](https://github.com/mudler/vllm.cpp/issues/1011) **Port `memory_efficient_decode.py`.** Workspace reuse, in-place norm/SiLU, free-before-conv, temporal conv chunking, NDHWC. On by DEFAULT upstream. | Byte traffic, not the 60 GiB — §4 closes that | `blocks.py:1059` default True; the four optimizations at `:1-20` | `memory_efficient_decode.py:1-20`, `:91-105`, `:122-204`, `:234-248`, `:541-609`, `:617-627` | **medium** — it is a second independent rewrite of `CausalConv3d` | peak-heap counter at a fixed size, against the current 361.72 MiB |
-| 5 | [#1014](https://github.com/mudler/vllm.cpp/issues/1014) **Release the DiT and text tower before the decode.** ~68 GiB documented as staged and resident; ~72 GiB observed acquired and held. | Decides whether 448x256/25f completes at all | `docs/USAGE.md:862-864`; §1.4 trace | upstream offloads transformer weights (`installation.md:90`) and never the VAE | **medium** | rung 1 of §1.3 — and this lever is **conditional on that probe confirming §4's hypothesis** |
+| 5 | [#1014](https://github.com/mudler/vllm.cpp/issues/1014) **Attribute the 59 GiB, then release what holds it.** Decode excluded twice (§4.1); residency excluded by the plateau (§4.2); mechanism candidate is a device-class allocation invisible to `VmRSS` (§4.3). | Decides whether 448x256/25f completes at all | `benchmark-record.md:21150-21160`; `src/vt/cuda/cuda_backend.cu:77-81` | upstream offloads transformer weights (`installation.md:90`) and never the VAE | **medium** | rung 1 of §1.3. **The lever is not yet known** — §4.4 names three hypotheses and the one instrument that separates them |
+| 5a | [#1015](https://github.com/mudler/vllm.cpp/issues/1015) **`Ltx2WidenDitToF32` holds bf16 and f32 at once, permanently** — ~105.9 GiB on a 119 GiB box, ~37.9 GB of it dead. | Not the 59 GiB; a real residency defect on the host arm | `ltx2_loader.cpp:694-710`, append at `:707` | — | **small** | peak RSS across a host-arm load |
+| 5b | [#1016](https://github.com/mudler/vllm.cpp/issues/1016) **The LTX loaders never call `MaybeReleaseSourcePages`** — 0 hits against 15 other files under `src/vllm`. | Not the 59 GiB; the DiT file stays faulted resident beside its device copy | `ltx2_loader.cpp:738-756` | — | **small** | `Rss_File` across a load |
 | 6 | [#1010](https://github.com/mudler/vllm.cpp/issues/1010) **Emit phase timings and peak memory from the render path.** A 2.5-hour render wrote **one** line to `run.log`. | No speedup. It is the precondition for measuring any of 1-5 | — | — | **small** | its own output |
 | 7 | [#655](https://github.com/mudler/vllm.cpp/issues/655) + [#1012](https://github.com/mudler/vllm.cpp/issues/1012) **Register `ltx_core` as an oracle and install it on the gate host.** | No speedup. It is the precondition for any *ratio* (§7) | AGENTS.md oracle table; issue #655 | — | **small-to-medium** | a recorded pin plus a gateability measurement |
 
@@ -766,14 +840,23 @@ this row has no implementation authority and no fresh review (§8).
 | [#1010](https://github.com/mudler/vllm.cpp/issues/1010) | 6 — one log line per 2.5-hour render | owed, and it should land first |
 | [#1011](https://github.com/mudler/vllm.cpp/issues/1011) | 4 — `memory_efficient_decode.py`, re-ranked | owed |
 | [#1012](https://github.com/mudler/vllm.cpp/issues/1012) | record: `diffusers` implements LTX-2.5 | owed |
-| [#1014](https://github.com/mudler/vllm.cpp/issues/1014) | 5 — the 59 GiB, decode excluded, one hypothesis named | owed |
+| [#1014](https://github.com/mudler/vllm.cpp/issues/1014) | 5 — the 59 GiB: decode excluded, residency excluded, three hypotheses ranked | owed |
+| [#1015](https://github.com/mudler/vllm.cpp/issues/1015) | 5a — `Ltx2WidenDitToF32` holds bf16 and f32 at once | owed |
+| [#1016](https://github.com/mudler/vllm.cpp/issues/1016) | 5b — LTX loaders never release mmap source pages | owed |
 
 * **The 60 GiB attribution.** Carried forward from
   [`ltx25-tiled-decode.md`](ltx25-tiled-decode.md) `## Outcome`, now with the
-  decode excluded by two independent methods (§4) and one named hypothesis plus
-  the exact measurement that settles it.
-* **`docs/USAGE.md:873-874`'s "inside the decode".** Not established (§1.2).
-  Owed to the row that closes §4.
+  decode excluded by two independent methods (§4.1), the residency answer
+  excluded by the plateau (§4.2), the RSS-flat signature explained (§4.3), and
+  three ranked hypotheses with the one instrument that separates them (§4.4).
+* **`docs/USAGE.md:873-874`'s "inside the decode".** Half supported: the fall is
+  on the decode side of the boundary, and the decode does not allocate it
+  (§1.2). Owed to the row that closes §4.
+* **Whether the 59 GiB is even our process.** The counter is system-wide,
+  `nvidia-smi --query-gpu=memory.used` returns `[N/A]` on GB10, and this
+  campaign has already lost 11.1 GiB of one such delta to a concurrent build.
+  A per-process device reading was available the whole time
+  (`--query-compute-apps=used_memory`) and was never used (§4.3).
 * **A throughput number for LTX-2.5 on any axis.** `docs/BENCHMARKS.md` carries
   one LTX line, under `## Open gaps`. It stays there, and §7 says why.
 * **`memory_efficient_decode.py`.** Still unported; re-ranked by §4 as byte
