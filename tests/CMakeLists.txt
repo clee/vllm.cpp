@@ -1063,6 +1063,11 @@ vllm_cpp_add_test(test_expert_stream_wiring vllm/model_executor/test_expert_stre
 # The lane's observability seam lives in the internal header beside the model,
 # the same arrangement test_model_registry uses.
 target_include_directories(test_expert_stream_wiring PRIVATE ${CMAKE_SOURCE_DIR}/src)
+# ENG-EXPERT-STREAM F7 (#912): its own binary too, and specifically one that does
+# NOT set VT_MOE_EXPERT_STREAM_SLOT_BYTES -- that override is what would hide the
+# defect, and the store is built from the FIRST model a process runs.
+vllm_cpp_add_test(test_expert_stream_mixed_slot vllm/model_executor/test_expert_stream_mixed_slot.cpp)
+target_include_directories(test_expert_stream_mixed_slot PRIVATE ${CMAKE_SOURCE_DIR}/src)
 # ENG-MM-INPUT-PIPELINE L1 (#607): the refusal those limits carry — the min()
 # fold against the model's own ceiling, upstream's exact message, and both call
 # sites with the enable_mm_embeds escape.
