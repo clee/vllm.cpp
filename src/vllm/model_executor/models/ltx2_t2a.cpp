@@ -36,12 +36,16 @@ double AbsMax(const std::vector<float>& values) {
   return m;
 }
 
-// `to_denoised` (ltx-core model/transformer/utils.py:38-50) through
-// `X0Model.forward` (model.py:590-604): the DiT emits a VELOCITY and the sampler
-// wants the x0 prediction. Identical arithmetic to the joint driver's own
-// `ToDenoised`; kept here rather than shared because the joint one is a static in
-// `ltx2_video.cpp`'s anonymous namespace and hoisting it would move lines above
-// that file's gated READER ANCHORS list for no behavioural reason.
+// `to_denoised` (ltx-core utils.py:39-52) as `X0Model.forward` applies it
+// (model.py:590-604): the DiT emits a VELOCITY and everything downstream — the
+// guider AND the sampler — wants the x0 prediction. It is therefore applied to
+// EVERY PASS, on the way out of the forward, and not once to the guider's
+// output: see ltx2_t2a.h item 4 (#1039).
+//
+// Identical arithmetic to the joint driver's own `ToDenoised`; kept here rather
+// than shared because the joint one is a static in `ltx2_video.cpp`'s anonymous
+// namespace and hoisting it would move lines above that file's gated READER
+// ANCHORS list for no behavioural reason.
 std::vector<float> ToDenoised(const std::vector<float>& sample, const std::vector<float>& velocity,
                               const std::vector<float>& timesteps, int64_t tokens, int64_t width) {
   VT_CHECK(velocity.size() == sample.size(), "ltx2 t2a: the velocity is the wrong size");
@@ -300,30 +304,48 @@ Ltx2T2aResult Ltx2T2aGenerate(const Ltx2T2aRequest& req) {
     // upstream's `run_v2a` tests PRESENCE (transformer.py:269), so a
     // present-but-disabled stream still feeds video->audio cross attention.
     //
+    // AND EVERY PASS IS CONVERTED TO X0 *HERE*, BEFORE THE GUIDER SEES IT. This
+    // lambda is `X0Model` (model.py:590-604): upstream never hands the denoiser
+    // the raw velocity model, it hands `X0Model(builder.build(...))`
+    // (utils/blocks.py:480-482), so `_guided_denoise`'s
+    // `all_v, all_a = transformer(...)` at utils/denoisers.py:188 already
+    // carries DENOISED tensors and `audio_guider.calculate(...)` at `:203`
+    // combines those. See ltx2_t2a.h item 4 for why converting once after the
+    // guider instead is a different function on the DEFAULT arm (#1039).
+    //
     // EVERY FORWARD GOES THROUGH THIS ONE LAMBDA, and that is what makes
     // `video_stream_present` an OBSERVATION rather than a restatement. Written
     // as `result.video_stream_present = false` beside a `nullptr` literal it
     // would be a comment that compiles: a build that started passing a stream
     // would report `false` and stay green. Derived at the call, a mutation that
     // hands any forward a video stream flips it.
-    const auto forward = [&](const Ltx2ModalityInput* video, const Ltx2ModalityInput* audio,
-                             const Ltx2DitPerturbation* p) {
+    const auto x0_model = [&](const Ltx2ModalityInput* video, const Ltx2ModalityInput* audio,
+                              const Ltx2DitPerturbation* p,
+                              std::vector<float>* velocity_out = nullptr) {
       if (video != nullptr) result.video_stream_present = true;
-      return Ltx2DitForward(req.device, params, *req.dit_weights, video, audio, req.compute_dtype,
-                            /*cache=*/nullptr, p);
+      const Ltx2DitOutputs out = Ltx2DitForward(req.device, params, *req.dit_weights, video, audio,
+                                                req.compute_dtype, /*cache=*/nullptr, p);
+      // The RAW velocity, before the conversion, recorded only where a caller
+      // asked for it. It is the other half of the pair that makes "which space
+      // did the guider combine" an arithmetic question — see the header.
+      if (velocity_out != nullptr) *velocity_out = out.audio;
+      // `to_denoised(audio.latent, ax, audio.timesteps)` (model.py:603).
+      return ToDenoised(latent, out.audio, timesteps, tokens, width);
     };
 
-    const Ltx2DitOutputs cond = forward(/*video=*/nullptr, &ain, /*p=*/nullptr);
+    const std::vector<float> cond = x0_model(
+        /*video=*/nullptr, &ain, /*p=*/nullptr,
+        step == 0 ? &result.first_step_velocity : nullptr);
     ++result.cond_forwards;
 
-    std::vector<float> velocity = cond.audio;
+    std::vector<float> denoised = cond;
     if (want_uncond || want_perturbed) {
       std::vector<float> uncond_text;
       std::vector<float> uncond_perturbed;
       if (want_uncond) {
         Ltx2ModalityInput nin = ain;
         nin.context = req.negative_context;
-        uncond_text = forward(/*video=*/nullptr, &nin, /*p=*/nullptr).audio;
+        uncond_text = x0_model(/*video=*/nullptr, &nin, /*p=*/nullptr);
         ++result.uncond_forwards;
       }
       if (want_perturbed) {
@@ -331,26 +353,31 @@ Ltx2T2aResult Ltx2T2aGenerate(const Ltx2T2aRequest& req) {
         // perturbs the MODEL, never the conditioning (guiders.py:244-273 takes
         // `uncond_perturbed` from a forward whose `perturbations` differ and
         // whose context does not).
-        uncond_perturbed = forward(/*video=*/nullptr, &ain, &perturbation).audio;
+        uncond_perturbed = x0_model(/*video=*/nullptr, &ain, &perturbation);
         ++result.perturbed_forwards;
       }
-      velocity = Ltx2MultiModalGuidance(g, cond.audio.data(),
+      denoised = Ltx2MultiModalGuidance(g, cond.data(),
                                         want_uncond ? uncond_text.data() : nullptr,
                                         want_perturbed ? uncond_perturbed.data() : nullptr,
                                         /*uncond_modality=*/nullptr,
-                                        static_cast<int64_t>(cond.audio.size()));
+                                        static_cast<int64_t>(cond.size()));
     }
 
     // Kept for the next step's `should_skip_step` branch, which reuses it rather
     // than recomputing (utils/denoisers.py:85-91).
-    last_denoised = ToDenoised(latent, velocity, timesteps, tokens, width);
-    const std::vector<float>& denoised = last_denoised;
+    if (step == 0) {
+      result.first_step_latent = latent;
+      result.first_step_cond = cond;
+      result.first_step_denoised = denoised;
+      result.first_step_sigma = static_cast<double>(sigma);
+    }
+    last_denoised = std::move(denoised);
     // `EulerDiffusionStep()` — `DiffusionStage.__call__`'s own default
     // (utils/blocks.py:524-527), which T2A does not override (it passes no
     // `stepper`, t2a_one_stage.py:154-170). The ancestral sampler that
     // `distilled.py` selects for generation 2.5 reaches this pipeline through
     // nothing.
-    latent = Ltx2EulerStep(latent.data(), denoised.data(), sigmas.data(), sigma_count, step,
+    latent = Ltx2EulerStep(latent.data(), last_denoised.data(), sigmas.data(), sigma_count, step,
                            static_cast<int64_t>(latent.size()));
   }
 

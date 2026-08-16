@@ -21,6 +21,7 @@
 #include <doctest/doctest.h>
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -5258,4 +5259,209 @@ TEST_CASE("ltx2 t2a: the one_stage recipes noise their initial latent (#1013)") 
     CHECK(t2a.audio_only);
     CHECK_FALSE(one.audio_only);
   }
+}
+
+TEST_CASE("ltx2 t2a: the guider is handed x0 predictions and not raw velocities") {
+  // #1039. Upstream hands the denoiser an `X0Model` (ltx-pipelines
+  // utils/blocks.py:480-482), so `_guided_denoise` combines DENOISED tensors:
+  // `all_v, all_a = transformer(...)` at utils/denoisers.py:188 and
+  // `audio_guider.calculate(cond_a, uncond_a, ptb_a, mod_a)` at `:203`, over an
+  // `X0Model.forward` that already applied `to_denoised(latent, v, timesteps)`
+  // (ltx-core model/transformer/model.py:590-604, `to_denoised` at
+  // ltx-core utils.py:39-52 — `sample - velocity * sigma`).
+  //
+  // This port combined raw DiT VELOCITIES and converted once afterwards. That is
+  // the same function only while `rescale_scale == 0`, because `calculate`'s
+  // linear terms are invariant under `x0 = latent - sigma*v`. The rescale branch
+  // is not: scaling the x0 by `factor` gives `factor*(latent - sigma*v)`,
+  // scaling the velocity gives `latent - sigma*factor*v`, and the two differ by
+  // `(factor - 1) * latent`.
+  //
+  // WHAT THIS CASE ASSERTS, AND WHY IT IS NOT THE RESCALE ARITHMETIC ITSELF.
+  // The rescale's numeric consequence is NOT resolvable on the reduced fixture,
+  // and that was MEASURED rather than assumed. The first draft of this case
+  // computed both candidate step-0 predictions in full — `factor * x0_pred` and
+  // `latent - sigma*factor_v*v_pred` — and its own separation guard refused
+  // them: this fixture's DiT responds to the conditioning at ~1e-5 of its own
+  // output, so `std(cond)/std(pred)` is 1.0 to 1e-5 in BOTH spaces, both
+  // factors land within 1e-5 of 1.0, and the two candidates sit 7.6e-07 apart
+  // against a span of 3.41. An assertion on that difference would be an
+  // assertion about f32 noise, and it would have been GREEN either way.
+  //
+  // So the rescale's consequence is gated at the seam by the case below, which
+  // measures 0.35 relative disagreement at `rescale_scale = 0.7` against
+  // 1.5e-07 at 0.0. This case gates what the fixture CAN decide exactly, which
+  // is the same defect one step earlier: WHICH TENSOR THE GUIDER WAS HANDED.
+  //
+  // WHAT MAKES THAT UNREACHABLE BY ACCIDENT — the sibling trap on this campaign
+  // was a test whose expectation a zero-filled stub also met.
+  // `cond == latent - sigma*velocity` is an equation between three recorded
+  // tensors, not a magnitude. It is exact in x0 space; in velocity space `cond`
+  // IS the velocity and the residual is `|latent - 2*sigma*velocity|`, i.e. the
+  // whole sample. No fixture scale satisfies it by accident, a zeroed velocity
+  // collapses it to `cond == latent` and is refused by the lower bound below,
+  // and a zeroed `cond` fails it outright.
+  Workspace ws;
+  const vllm::multimodal::VideoModelParams mp = T2aParams(ws.paths);
+
+  // The arm this case sits on, pinned as a LOCAL fact before anything is read
+  // off a render: `rescale_scale = 0.7` on the 2.3/2.4/2.5 lineage
+  // (ltx-pipelines utils/constants.py:63, and the `--audio-rescale-scale`
+  // default at utils/args.py:1101-1106).
+  {
+    const vllm::Ltx2PipelineRecipe t2a = vllm::ResolveLtx2PipelineRecipe("t2a_one_stage", "2.5");
+    REQUIRE(t2a.phases.size() == 1);
+    CHECK(t2a.phases[0].audio_guidance.rescale_scale == 0.7);
+  }
+
+  // Through the production entry point — `LoadVideoEngine` then
+  // `VideoEngine::Generate`, which is what `vllm_video_generate` calls. Nothing
+  // here constructs a guider, a DiT or a modality by hand. NO extra is touched
+  // either, so the render takes the recipe's own guider and the assertion sits
+  // on the shipped path rather than on one this test configured into existence.
+  const std::unique_ptr<vllm::multimodal::VideoEngine> engine =
+      vllm::multimodal::LoadVideoEngine(mp);
+  REQUIRE(engine != nullptr);
+  engine->Generate(T2aGen(ws.root + "/x0_space", "a b c"));
+  const auto* ltx = dynamic_cast<const vllm::multimodal::Ltx2VideoEngine*>(engine.get());
+  REQUIRE(ltx != nullptr);
+  const vllm::multimodal::Ltx2ConditioningTrace t = ltx->last_conditioning();
+  REQUIRE(t.completed);
+  REQUIRE(t.t2a_rendered);
+
+  const size_t n = t.t2a_first_latent.size();
+  REQUIRE(n > 0);
+  REQUIRE(t.t2a_first_velocity.size() == n);
+  REQUIRE(t.t2a_first_cond.size() == n);
+  REQUIRE(t.t2a_first_denoised.size() == n);
+  const double sigma = t.t2a_first_sigma;
+  REQUIRE(sigma > 0.0);
+
+  double latent_span = 0.0;
+  double velocity_span = 0.0;
+  double err_x0 = 0.0;  // |cond - (latent - sigma*velocity)|  -> 0 in x0 space
+  double err_v = 0.0;   // |cond - velocity|                   -> 0 in velocity space
+  for (size_t i = 0; i < n; ++i) {
+    const double lat = static_cast<double>(t.t2a_first_latent[i]);
+    const double vel = static_cast<double>(t.t2a_first_velocity[i]);
+    const double cond = static_cast<double>(t.t2a_first_cond[i]);
+    latent_span = std::max(latent_span, std::abs(lat));
+    velocity_span = std::max(velocity_span, std::abs(vel));
+    err_x0 = std::max(err_x0, std::abs(cond - (lat - sigma * vel)));
+    err_v = std::max(err_v, std::abs(cond - vel));
+  }
+
+  INFO("sigma = " << sigma << "  max|latent| = " << latent_span
+                  << "  max|velocity| = " << velocity_span
+                  << "  |cond - (latent - sigma*velocity)| = " << err_x0
+                  << "  |cond - velocity| = " << err_v << "  elements = " << n);
+
+  // 1. THE FIXTURE CAN DECIDE THIS. The two candidate tensors are
+  //    `latent - sigma*velocity` and `velocity`; they coincide when the sample
+  //    is zero and `to_denoised` is the identity when the velocity is. Both are
+  //    REQUIREs, because the checks below mean nothing once either fails.
+  REQUIRE_MESSAGE(latent_span > 1e-3,
+                  "the step-0 sample is zero, so the two candidate tensors coincide and nothing "
+                  "below discriminates");
+  REQUIRE_MESSAGE(sigma * velocity_span > 1e-6,
+                  "the DiT returned no velocity, so `to_denoised` is the identity here and the "
+                  "two candidate tensors coincide");
+  // 2. THE GUIDER WAS HANDED THE X0 PREDICTION, exactly — `to_denoised` on the
+  //    way out of the forward, which is `X0Model.forward` (model.py:602-603).
+  CHECK_MESSAGE(err_x0 <= 1e-5 * latent_span,
+                "the tensor handed to `Ltx2MultiModalGuidance` is not `latent - sigma*velocity`, "
+                "which is what `X0Model.forward` returns (#1039): residual "
+                    << err_x0 << " against a tolerance of " << (1e-5 * latent_span));
+  // 3. AND IT WAS NOT THE RAW VELOCITY. Said separately from check 2, because a
+  //    build handing the guider some THIRD tensor fails 2 and would pass a lone
+  //    "not the velocity" check; the pair says which of the two happened.
+  CHECK_MESSAGE(err_v > 1e-2 * latent_span,
+                "the tensor handed to `Ltx2MultiModalGuidance` IS the raw DiT velocity, so the "
+                "guidance is combined in velocity space and converted once afterwards (#1039)");
+  // 4. And the guider MOVED what it was handed, so the tensor checked above is
+  //    a real input to the combination rather than a recorded value beside one.
+  CHECK(t.t2a_first_denoised != t.t2a_first_cond);
+}
+
+TEST_CASE("ltx2 t2a: rescale_scale 0 is the control because both spaces agree there") {
+  // #1039's control, executable rather than asserted in prose. The case above
+  // would be testing something OTHER than the defect if it also fired at
+  // `rescale_scale = 0`, because `MultiModalGuider.calculate`'s linear terms
+  // (guiders.py:261-266) are invariant under `x0 = latent - sigma*v`:
+  //
+  //   latent - sigma*(c + a(c-u) + b(c-p))  ==  x0c + a(x0c-x0u) + b(x0c-x0p)
+  //
+  // The rescale at `:268-271` is the only part that is not. This case measures
+  // both, on the real seam, with a latent that makes the difference visible.
+  const int64_t n = 512;
+  std::vector<float> latent(static_cast<size_t>(n));
+  std::vector<float> v_cond(static_cast<size_t>(n));
+  std::vector<float> v_uncond(static_cast<size_t>(n));
+  std::vector<float> v_ptb(static_cast<size_t>(n));
+  // Deterministic and NON-CONSTANT. A zero latent erases `(factor - 1) * latent`
+  // entirely and a constant one reduces it to a uniform offset; either would
+  // make the disagreement below unmeasurable and the control meaningless.
+  uint64_t s = 0x9E3779B97F4A7C15ULL;
+  const auto next = [&s]() {
+    s ^= s << 13;
+    s ^= s >> 7;
+    s ^= s << 17;
+    return static_cast<float>(static_cast<double>(s >> 11) / 9007199254740992.0 * 2.0 - 1.0);
+  };
+  for (int64_t i = 0; i < n; ++i) {
+    const size_t j = static_cast<size_t>(i);
+    latent[j] = 2.0F * next();
+    v_cond[j] = next();
+    v_uncond[j] = next();
+    v_ptb[j] = next();
+  }
+  const float sigma = 0.83F;
+  std::vector<float> x_cond(static_cast<size_t>(n));
+  std::vector<float> x_uncond(static_cast<size_t>(n));
+  std::vector<float> x_ptb(static_cast<size_t>(n));
+  for (int64_t i = 0; i < n; ++i) {
+    const size_t j = static_cast<size_t>(i);
+    x_cond[j] = latent[j] - sigma * v_cond[j];
+    x_uncond[j] = latent[j] - sigma * v_uncond[j];
+    x_ptb[j] = latent[j] - sigma * v_ptb[j];
+  }
+
+  vllm::Ltx2MultiModalGuiderParams params;
+  params.cfg_scale = 7.0;  // the T2A defaults (utils/constants.py:58-66)
+  params.stg_scale = 1.0;
+  params.modality_scale = 1.0;
+  params.skip_step = 0;
+
+  const auto compare = [&](double rescale) {
+    params.rescale_scale = rescale;
+    // Upstream's shape: combine the X0 predictions.
+    const std::vector<float> x0_space = vllm::Ltx2MultiModalGuidance(
+        params, x_cond.data(), x_uncond.data(), x_ptb.data(), /*uncond_modality=*/nullptr, n);
+    // The shape this port shipped: combine the VELOCITIES and convert once after.
+    const std::vector<float> v_space = vllm::Ltx2MultiModalGuidance(
+        params, v_cond.data(), v_uncond.data(), v_ptb.data(), /*uncond_modality=*/nullptr, n);
+    double worst = 0.0;
+    double scale = 0.0;
+    for (int64_t i = 0; i < n; ++i) {
+      const size_t j = static_cast<size_t>(i);
+      const double converted = static_cast<double>(latent[j]) -
+                               static_cast<double>(sigma) * static_cast<double>(v_space[j]);
+      worst = std::max(worst, std::abs(static_cast<double>(x0_space[j]) - converted));
+      scale = std::max(scale, std::abs(static_cast<double>(x0_space[j])));
+    }
+    REQUIRE(scale > 1e-3);
+    return worst / scale;
+  };
+
+  const double at_zero = compare(0.0);
+  const double at_default = compare(0.7);
+  INFO("relative disagreement: at rescale 0.0 = " << at_zero
+                                                  << "  at rescale 0.7 = " << at_default);
+  // AT 0.0 THE TWO SPACES ARE THE SAME FUNCTION, to f32 rounding. An assertion
+  // that fires here is not about #1039.
+  CHECK(at_zero < 1e-4);
+  // AT THE SHIPPED 0.7 THEY ARE NOT, by orders of magnitude more. That is the
+  // whole of the defect, and it is why the case above can sit on the default.
+  CHECK(at_default > 1e-2);
+  CHECK(at_default > 100.0 * at_zero);
 }

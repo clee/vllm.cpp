@@ -723,12 +723,32 @@ struct Ltx2ConditioningTrace {
   // off the request's `stg_blocks`: a count alone cannot tell "perturbed block
   // 1" from "perturbed block 0", and which block is perturbed is the whole of
   // STG.
+  //
+  // The `t2a_first_*` block is everything step 0 produced, and it is the only
+  // observable that separates upstream's x0-space guidance combination from a
+  // velocity-space one (#1039). Every other field here — the forward counts,
+  // the perturbed blocks, the latent absmax, the waveform's length, channel
+  // count and sample rate — is identical between the two forms, and on a
+  // reduced fixture so is the rendered audio, because the guidance deltas are
+  // ~1e-5 of the prediction and the rescale factor lands within 1e-5 of 1.0 in
+  // BOTH spaces. What is not identical, and is not a matter of degree, is which
+  // tensor the guider was handed:
+  //
+  //     t2a_first_cond == t2a_first_latent - sigma * t2a_first_velocity
+  //
+  // holds in x0 space (`X0Model.forward`, ltx-core model/transformer/
+  // model.py:590-604) and fails in velocity space.
   bool t2a_rendered = false;
   bool t2a_video_stream_present = false;
   int64_t t2a_cond_forwards = 0;
   int64_t t2a_uncond_forwards = 0;
   int64_t t2a_perturbed_forwards = 0;
   std::vector<int64_t> t2a_perturbed_blocks;
+  std::vector<float> t2a_first_latent;
+  std::vector<float> t2a_first_velocity;
+  std::vector<float> t2a_first_cond;
+  std::vector<float> t2a_first_denoised;
+  double t2a_first_sigma = 0.0;
 
   // True only once the `Generate` that produced this conditioning RETURNED. The
   // trace is filled immediately after the connector and BEFORE the denoise loop,

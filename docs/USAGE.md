@@ -881,6 +881,13 @@ outside the DiT's own layer count is refused rather than clamped. There is no
 `modality_scale` knob: upstream pins it to 1.0 for this pipeline, because
 audio-only generation has no video modality to isolate.
 
+`--audio-rescale-scale` acts on the **denoised (x0) prediction**, not on the
+DiT's velocity, because upstream's guider sits behind an `X0Model` and combines
+already-converted tensors. The distinction is invisible at `0.0`, where the two
+readings agree exactly, and it changes the render at every other value — so a
+recipe or a script that was tuned against the velocity reading will not
+reproduce here at the default `0.7` (issue #1039).
+
 Being per-generation, those six reach the CLI and the C ABI and **not**
 `/v1/videos`, which forwards no per-generation extra to any engine (issue #928).
 `pipeline_kind` is a LOAD knob and does reach the server, so a server started

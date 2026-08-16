@@ -575,8 +575,136 @@ here. Left as-is and named rather than corrected by analogy: a recipe whose
 upstream nobody read is exactly where a plausible fix lands wrong. Recorded in
 #1013.
 
+## 7c. The second bug this row found and fixed in flow
+
+[#1039](https://github.com/mudler/vllm.cpp/issues/1039). **The guidance passes
+were combined in VELOCITY space, and upstream combines x0.** Found by review of
+pull request #1032 at `3d9d9c9bb`, before the branch landed.
+
+Upstream never hands the denoiser the raw velocity model. `DiffusionStage`
+builds `X0Model(self._prepared_builder().build(device=target, **kwargs))`
+(`ltx-pipelines/utils/blocks.py:480-482`), and `X0Model.forward` returns
+`to_denoised(audio.latent, ax, audio.timesteps)` (`ltx-core
+model/transformer/model.py:590-604`), which is `sample - velocity * sigma`
+(`ltx-core utils.py:39-52`). So `_guided_denoise`'s
+`all_v, all_a = transformer(...)` (`ltx-pipelines/utils/denoisers.py:188`)
+already carries DENOISED tensors, and `audio_guider.calculate(cond_a, uncond_a,
+ptb_a, mod_a)` at `:203` combines those.
+
+`Ltx2T2aGenerate` took `Ltx2DitForward`'s velocities straight into
+`Ltx2MultiModalGuidance` and applied `ToDenoised` once to the result.
+
+**Why no existing gate saw it, and why the row's own §5 could not.**
+`MultiModalGuider.calculate`'s linear terms (`guiders.py:261-266`) are invariant
+under `x0 = latent - sigma*v`, so the two forms agree EXACTLY while
+`rescale_scale == 0`. The rescale at `:268-271` is not invariant: upstream's
+`factor` is `std(x0_cond)/std(x0_pred)` and it scales the whole x0, giving
+`factor*(latent - sigma*v)`, where scaling the velocity gives
+`latent - sigma*factor*v`. The two differ by `(factor - 1) * latent` — zero
+only where the latent is zero, which on this path it never is, because the state
+IS the unit-variance noise (§3.2 item 6). `rescale_scale = 0.7` is the shipped
+default (`utils/constants.py:63`, `utils/args.py:1101-1106`), so the DEFAULT arm
+took the divergent branch. Everything §5 observes — the three forward counters,
+`t2a_video_stream_present`, `t2a_perturbed_blocks`, the latent absmax, the
+waveform's length, channel count and sample rate — is identical between the two
+forms.
+
+**Fixed by moving the conversion, not by moving the rescale.** The mirror is
+structural: the per-pass `x0_model` lambda in `ltx2_t2a.cpp` IS `X0Model`, it
+applies `ToDenoised` on the way out of every forward, and
+`Ltx2MultiModalGuidance` stays a faithful port of `calculate` over whatever the
+model returned. Reaching the same numbers by moving the rescale inside the
+guidance seam would put `to_denoised` inside `calculate`, where upstream does not
+have it, and would make the seam correct only for this one composition.
+
+**The VIDEO arm is unaffected, and that was checked rather than assumed.**
+`git grep -n Ltx2MultiModalGuidance -- src include` returns exactly one
+production call site, `ltx2_t2a.cpp`. `Ltx2PipelineParams::video_guider` and
+`Ltx2PhaseRecipe::video_guidance` are carried by the recipe and read by nothing:
+the joint driver in `ltx2_video.cpp` runs ONE unguided `Ltx2DitForward` per step
+and applies `ToDenoised` to that single velocity (`:3034-3036`), which is the
+same tensor in both spaces because there is no combination to be invariant
+under. There is therefore no second instance of this defect to fix, and there
+will be one the moment a guided video denoiser is wired — noted here because
+that wiring is a live campaign item.
+
+**What the gate is, and what it deliberately is not.** The reduced fixture
+CANNOT resolve the rescale's numeric consequence, and that is measured rather
+than assumed: its DiT responds to the conditioning at ~1e-5 of its own output,
+so `std(cond)/std(pred)` is 1.0 to 1e-5 in BOTH spaces, both factors land within
+1e-5 of 1.0, and the two candidate step-0 predictions sit 7.6e-07 apart against
+a span of 3.41. The first draft of the test asserted exactly that difference and
+its own separation guard refused it — a case that would have been green either
+way. So the row gates the defect at two places instead:
+
+1. `test_ltx2_video` "the guider is handed x0 predictions and not raw
+   velocities" — end to end through `LoadVideoEngine` and
+   `VideoEngine::Generate`, on the recipe's own guider with no extra touched. It
+   pins the EQUATION `cond == latent - sigma*velocity` between three recorded
+   step-0 tensors. That is exact in x0 space and off by the whole sample in
+   velocity space, so no fixture scale satisfies it by accident; a zeroed
+   velocity or a zero sample fails the two `REQUIRE`s that precede it rather
+   than passing it.
+2. `test_ltx2_video` "rescale_scale 0 is the control because both spaces agree
+   there" — the numeric consequence, on the real `Ltx2MultiModalGuidance` seam
+   with a latent that makes it visible. MEASURED: relative disagreement between
+   the two spaces is **1.50e-07 at `rescale_scale = 0.0`** and **0.352 at the
+   shipped 0.7**. This is what makes 0.0 the control rather than the assertion
+   site.
+
+The observability this needed is four step-0 fields on `Ltx2T2aResult` and the
+trace: the sample, the conditional pass's RAW velocity, the tensor handed to the
+guider, and the guider's result, plus step 0's sigma. `first_step_cond` is
+upstream's own `DenoisedLatentResult.cond` (`utils/denoisers.py:206`).
+
+### Mutations for #1039
+
+Focused gate: three comma-free `--test-case` filters, each asserting a non-zero
+case count. Each mutation applied to ONE file, rebuilt, run, restored in a
+`finally` and the restore verified by **sha256**. `git diff --stat` is scoped to
+the mutated file and measured against the committed fix, so the numbers are the
+mutation's own.
+
+| Mutation | `git diff --stat` | BUILT | exit | verdict |
+|---|---|---|---|---|
+| N1 revert to velocity-space guidance (the defect) | `ltx2_t2a.cpp \| 4 ++--` | YES (0 errors) | 1 | DETECTED by case 1 |
+| N2 delete the production call site | `ltx2_video.cpp \| 2 +-` | YES (0 errors) | 1 | DETECTED by case 1 AND the render case |
+| N3 take x0 against a ZERO sample instead of the latent | `ltx2_t2a.cpp \| 2 +-` | YES (0 errors) | 1 | DETECTED by case 1 |
+| N4 drop the rescale branch entirely (`guiders.py:268-271`) | `ltx2_pipeline.cpp \| 2 +-` | YES (0 errors) | 1 | DETECTED by the control case |
+
+N4 is the row that proves the control case is not decorative: it is the only one
+of the four that case 1 does not see, and the only one the control does.
+
+**N1 is the RED-before**, and this is what it printed:
+
+```
+tests/vllm/multimodal/test_ltx2_video.cpp:5371: ERROR:
+  CHECK( err_x0 <= 1e-5 * latent_span ) is NOT correct!
+  values: CHECK( 3.43642 <= 3.38677e-05 )
+  logged: sigma = 1  max|latent| = 3.38677  max|velocity| = 0.415609
+          |cond - (latent - sigma*velocity)| = 3.43642  |cond - velocity| = 0
+          elements = 3328
+tests/vllm/multimodal/test_ltx2_video.cpp:5378: ERROR:
+  CHECK( err_v > 1e-2 * latent_span ) is NOT correct!
+  values: CHECK( 0 >  0.0338677 )
+[doctest] test cases:  1 |  0 passed | 1 failed | 66 skipped
+[doctest] assertions: 16 | 14 passed | 2 failed |
+[doctest] Status: FAILURE!    exit 1
+```
+
+`|cond - velocity| = 0` **exactly** is the whole finding: the tensor handed to
+`Ltx2MultiModalGuidance` WAS the raw DiT velocity. Green after, on the same
+filter: 1 case, 16 assertions, 0 failed, exit 0.
+
 ## Owed
 
+- **The rescale's numeric consequence END TO END.** Gated at the seam (0.352
+  relative at the shipped 0.7) and at the space (exactly, through the engine),
+  and NOT on a render, because the reduced fixture's guidance deltas are ~1e-5
+  of the prediction and both rescale factors land within 1e-5 of 1.0. What would
+  close it is the real-checkpoint render already owed below, where the DiT's
+  velocity is comparable to the sample. Tracked by
+  [#1039](https://github.com/mudler/vllm.cpp/issues/1039).
 - **The DEVICE arm.** `Ltx2DitForwardDevice` dereferences `*video`
   unconditionally from its first `PrepareStreamDev` call onward
   (`src/vllm/model_executor/models/ltx2_device.cpp`, the two `PrepareStreamDev`

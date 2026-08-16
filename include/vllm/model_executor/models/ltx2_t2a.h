@@ -11,8 +11,12 @@
 //                                   (T2AOneStagePipeline.__call__)
 //   the guided step             <-  ltx-core components/guiders.py:244-273
 //                                   (MultiModalGuider.calculate), reached through
-//                                   ltx-pipelines utils/denoisers.py
+//                                   ltx-pipelines utils/denoisers.py:188-203
 //                                   (FactoryGuidedDenoiser)
+//   the x0 wrapper on each pass <-  ltx-core model/transformer/model.py:590-604
+//                                   (X0Model.forward), which is what
+//                                   ltx-pipelines utils/blocks.py:480-482 builds
+//                                   and hands the denoiser
 //   the STG pass                <-  ltx-core model/transformer/attention.py:552-577
 //   the audio latent shape      <-  ltx-core types.py:164-200
 //                                   (AudioLatentShape.from_video_pixel_shape)
@@ -33,7 +37,7 @@
 // branches inside it would be nine chances to leave one behind, and a missed one
 // renders.
 //
-// ─── THE THREE THINGS THAT FAIL SILENTLY IF GUESSED ──────────────────────────
+// ─── THE FOUR THINGS THAT FAIL SILENTLY IF GUESSED ───────────────────────────
 //
 // 1. `video = nullptr`, NOT `video->enabled = false`. Upstream's predicate is
 //    `run_v2a = run_ax and (video is not None and vx.numel() > 0)`
@@ -57,6 +61,26 @@
 //    (t2a_one_stage.py:200-202). The params table's own value is 3.0, so
 //    inheriting it would turn on a fourth forward against a modality that is not
 //    there.
+//
+// 4. THE GUIDER COMBINES X0, NOT VELOCITY (#1039). Upstream builds the
+//    denoiser's transformer as `X0Model(...)` (ltx-pipelines
+//    utils/blocks.py:480-482), so every pass `_guided_denoise` hands
+//    `MultiModalGuider.calculate` has ALREADY been converted with
+//    `to_denoised(latent, v, timesteps)` (model.py:590-604, `to_denoised` at
+//    ltx-core utils.py:39-52) before it is combined
+//    (utils/denoisers.py:188-203).
+//
+//    Combining raw velocities and converting once afterwards is the SAME
+//    FUNCTION only while `rescale_scale == 0`, because `calculate`'s linear
+//    terms are invariant under `x0 = latent - sigma*v`. The rescale branch is
+//    not invariant: upstream computes `factor` from `std(x0_cond)/std(x0_pred)`
+//    and scales the whole x0, giving `factor*(latent - sigma*v)`; scaling the
+//    velocity instead gives `latent - sigma*factor*v`. The two differ by
+//    `(factor - 1) * latent` — zero only where the latent is zero, which on
+//    this path it never is (the state IS the unit-variance noise, item above).
+//    `rescale_scale = 0.7` is the shipped T2A default (utils/constants.py:63,
+//    utils/args.py:1101-1106), so this is the DEFAULT arm rather than an
+//    exotic one, and nothing about the rendered waveform separates the two.
 #pragma once
 
 #include <cstdint>
@@ -149,6 +173,32 @@ struct Ltx2T2aResult {
   // because a latent that collapsed to zeros has a perfectly stable digest.
   uint64_t latent_digest = 0;
   double latent_absmax = 0.0;
+
+  // EVERYTHING STEP 0 PRODUCED, in the order it produced it: the sampler's
+  // input, the conditional pass's RAW DiT output, the tensor that pass handed
+  // the guider, and the guider's result. They exist because #1039 is invisible
+  // in every other field here — combining the guidance passes in VELOCITY space
+  // and converting once afterwards produces a waveform of the right length, the
+  // right channel count, the right sample rate and a perfectly healthy forward
+  // count — and together they make the question decidable by arithmetic rather
+  // than by magnitude:
+  //
+  //     first_step_cond == first_step_latent - sigma * first_step_velocity
+  //
+  // holds when the guider is handed X0 PREDICTIONS, as `X0Model.forward` does
+  // (model.py:590-604, over the `X0Model(...)` that utils/blocks.py:480-482
+  // builds), and fails when it is handed the velocities. `first_step_cond` is
+  // also upstream's own `DenoisedLatentResult.cond` (utils/denoisers.py:206),
+  // rather than a field invented for a test.
+  //
+  // STEP 0 SPECIFICALLY, because it is the one step whose inputs do not depend
+  // on any earlier step, so two renders that differ only in a guider parameter
+  // share a bit-identical step-0 latent and bit-identical DiT passes.
+  std::vector<float> first_step_latent;
+  std::vector<float> first_step_velocity;
+  std::vector<float> first_step_cond;
+  std::vector<float> first_step_denoised;
+  double first_step_sigma = 0.0;
 };
 
 // `T2AOneStagePipeline.__call__` (t2a_one_stage.py:109-172). Throws
