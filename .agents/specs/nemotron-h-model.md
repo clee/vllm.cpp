@@ -1,8 +1,9 @@
 # Nemotron-H — the first hybrid Mamba2 model, and the first MIXED_PRECISION checkpoint
 
 **Claim:** `CLAIM-MODEL-NEMOTRON-H`. **Model row:**
-`MODEL-TEXT-nemotron-h-nemotron-hfor-causal-lm` (existing, stays `INVENTORIED`
-at this spec commit). **Issue:** [#517](https://github.com/mudler/vllm.cpp/issues/517).
+`MODEL-TEXT-nemotron-h-nemotron-hfor-causal-lm`, which read `INVENTORIED` when
+this spec was committed and moved to `PARTIAL` on 2026-08-16 (see `## Now`).
+**Issue:** [#517](https://github.com/mudler/vllm.cpp/issues/517).
 **Gate-infrastructure issues this row depends on:**
 [#569](https://github.com/mudler/vllm.cpp/issues/569) (checkpoint pinned by
 CONTENT — **closed**, `751325460`; W6 must run with `VT_NEMOTRON35_SNAPSHOT`
@@ -1302,7 +1303,7 @@ verified; the numbers appear to be mean-relative or from an earlier fixture.
 
 §6b closed with "the **weight loader** — nothing materializes the 18487
 enumerated tensors, so no checkpoint can be run and the forward refuses by name
-on every load", and §7 said the loader "§4's table does not name as a W of its
+on every load", and § Now said the loader "§4's table does not name as a W of its
 own and should". This is that brick, built on `row/MODEL-NEMOTRON-H-LOADER` off
 `22367c551`.
 
@@ -1955,9 +1956,52 @@ inside a red-lane repair would have made the repair unreviewable. This follows
 how the unaligned-read class was handled — named site in #674/PR #688, residue
 filed as #772 — rather than widening silently.
 
-## 7. Now
+## Now
 
-**State at this commit:** **W1 and W3 have LANDED on `main`; W2 is in
+**RECONCILED 2026-08-16 (#1074). The row moved `INVENTORIED` -> `PARTIAL`, and
+everything below this block is the earlier, superseded position, kept because it
+records how each brick was gated.** The row had described `main` as of
+2026-08-12 while 23 Nemotron commits landed after it. What that text got wrong,
+checked against `main` at `100026481` rather than inherited:
+
+- **The `KERNEL-SSM-MAMBA` block is gone.** #496 W1 landed the three host
+  references at `47960a009` and **W2 landed the CUDA arm at `43a6c5518`**. The
+  kernel is `src/vt/cuda/cuda_mamba2_ssd.cuh`, a 692-line `.cuh` included by
+  `src/vt/cuda/cuda_gdn.cu:48` and registered at `cuda_gdn.cu:6655-6665`, so a
+  `src/vt/*mamba*` file glob finds nothing and reports absence. This forward
+  calls `vt::Mamba2ChunkScan` and `vt::RmsNormGatedGroup` at
+  `nemotron_h.cpp:597,620` today. #496 stays open for W3, a GENERIC `MambaSpec`
+  producer, and for a fresh review of W2; neither blocks this row, because A1
+  made the runner read this model's OWN KV spec and `MakeNemotronHKVCache`
+  (`nemotron_h_registry.cpp:210`) builds it directly.
+- **The non-gated `relu²` MoE exists** (`4d0c399e1`, W2), and **ModelOpt
+  `MIXED_PRECISION` per-module loading exists** (`1bc5ef82c`, W1). Two of the
+  three "none of which exist locally" items are therefore false.
+- **The MTP head is still genuinely owed (W5).** No MTP forward exists; the
+  loader enumerates the tower and defers its 270 tensors by name at
+  `nemotron_h_weights.cpp:989`.
+
+**The state this row claims, and no more.** `PARTIAL` and `🚧`, not `ACTIVE`:
+`scripts/check-agent-record.py` requires an `ACTIVE` row to name a `CLAIM-*` row
+that a claim source carries, and no claim record claims this row. Authoring one
+for another session's in-flight work would be a fabricated record, so the state
+is the one the existing evidence backs. The model is **NOT reachable end to
+end**: the forward reached through `ModelRegistry::Forward` is the HOST
+reference, so `nemotron_h_registry.cpp:162` refuses paged or batched decode by
+name; there is no `examples/nemotron_h_gen` (`nemotron-h-abi-e2e.md` §6.1) and
+no ABI token gate. `scripts/runner-routing-allowlist.txt:26` still carries
+`nemotron_h` as a routing exception, and removing that line is part of what
+A2 + A3 mean by done, so its presence is the standing record that this forward
+does not route device-resident. `docs/BENCHMARKS.md` carried no Nemotron number
+before this reconcile, correctly.
+
+**Next action:** A2-P, the device/paged forward, is the blocker for everything
+downstream — it is what narrows the `nemotron_h_registry.cpp:162` guard, and A3
+is what proves the narrowing. `nemotron-h-abi-e2e.md` §1 holds its scope and
+§8's records table holds what its landing owes.
+
+**State at the earlier commit (SUPERSEDED, kept for its evidence):** **W1 and W3
+have LANDED on `main`; W2 is in
 re-review.** The `MIXED_PRECISION` resolver landed at `1bc5ef82c` (#561) and the
 W3 scaffold at `c6b240edd` (#576); both are merged into this branch, and their
 spec sections (§4's three W1 subsections, §5c/§5d/§5e) are main's, carried here
@@ -1982,7 +2026,7 @@ no `STATUS`/`BENCHMARKS` write. **Oracle gateability is CLOSED** — §5a record
 the pinned oracle loading and running the checkpoint on GB10 with three greedy
 goldens committed, so W6 has a denominator whenever it is reached.
 
-**W4 has LANDED** (`ce8c8bf67`, #718), and the WEIGHT LOADER §7 named as "the
+**W4 has LANDED** (`ce8c8bf67`, #718), and the WEIGHT LOADER § Now named as "the
 next brick" is built and gated on `row/MODEL-NEMOTRON-H-LOADER` — **§6d is the
 authority on it**. The forward no longer refuses on a checkpoint load: 18487 of
 18487 tensors are accounted (18217 materialized in their shipped formats, 270
@@ -2023,6 +2067,18 @@ forward is still the HOST reference and nothing runs on the paged runner (W6).
   `NEEDS_DECISION`, do not fork a parallel MoE path.
 
 ## Owed
+
+- [#1080](https://github.com/mudler/vllm.cpp/issues/1080) —
+  `scripts/check-doc-checkpoint.py`'s `NOW_SECTION` regex is `^##\s+Now\s*$`, so
+  it cannot match the `## N. Now` spelling thirteen committed specs used, and it
+  reports a missing section that is present. This spec was the thirteenth and is
+  repaired here — its heading is now `## Now` — because this reconcile is what
+  makes it the spec a moving row links, and the next lifecycle move on this row
+  would otherwise red on a section it is looking straight at. The other twelve
+  are untouched and stay owed: repairing them is either a rename across twelve
+  specs or a checker-semantics change, and the second needs its own spec, a
+  red-before test and green-after evidence. `tests/scripts/` covers
+  `NOW_SECTION` nowhere, which is why the mismatch survived.
 
 - [#847](https://github.com/mudler/vllm.cpp/issues/847) — **SWEPT, no longer
   owed here.** Row `FIX-REGISTRY-DOWNCAST-SWEEP` claimed the registry

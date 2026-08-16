@@ -848,6 +848,34 @@ Resource axes on the same series: cold start to first `/health` **53 s vs
 the latter with the caveat that vLLM's figure is set by
 `--gpu-memory-utilization 0.85` pre-reserving KV on a unified-memory box.
 
+**NemotronH / Nemotron-3.5-Lightning-30B-A3B-NVFP4 — engaged, and NOT reachable
+end to end (2026-08-16, [#1074](https://github.com/mudler/vllm.cpp/issues/1074)).** This row read
+`INVENTORIED` and blocked on an unported Mamba2 SSD core while 23 Nemotron
+commits landed. It is now `PARTIAL`: registered, config-parsed and KV-shaped;
+the hybrid 23-Mamba2 / 6-GQA / 23-relu² MoE forward computes; and the real
+20.1 GiB `MIXED_PRECISION` checkpoint loads in its SHIPPED formats — 18487 of
+18487 tensors accounted, 270 MTP deferred by name — at 17.70 GiB peak RSS,
+first greedy token matching the pinned oracle's committed golden on 3 of 3
+prompts.
+
+**The Mamba2 SSD block is gone, and a file listing is what hid it.**
+[#496](https://github.com/mudler/vllm.cpp/issues/496) landed the three host references at
+`47960a009` and the CUDA arm at `43a6c5518`. The kernel is
+`src/vt/cuda/cuda_mamba2_ssd.cuh`, a `.cuh` included by `cuda_gdn.cu` rather
+than a translation unit of its own, so a `src/vt/*mamba*` glob finds nothing
+and reports absence. NemotronH calls those ops today. #496 stays open for a
+GENERIC `MambaSpec` producer, which this model does not need, because it
+builds its own KV spec.
+
+**What it still cannot do, stated plainly.** The forward reached through
+`ModelRegistry::Forward` is the HOST reference: it recomputes K/V over the
+whole sequence every step and carries no recurrent state, so the step refuses
+paged or batched decode BY NAME instead of returning plausible wrong tokens.
+There is no `nemotron_h_gen` example, no ABI token gate, and no throughput,
+latency or memory number — none is claimed. Owed: the device/paged forward
+(A2-P), batching, the FP8 and NVFP4 arms, the e2e token gate, the MTP head and
+the GGUF k-quant arm.
+
 Larger DeepSeek / GLM / MiniMax / Gemma-4 variants are recorded as
 **hardware-blocked** (they do not fit 119 GiB of unified memory on this box) or
 **spiked-only**, per the [model matrix](../.agents/model-matrix.md).
