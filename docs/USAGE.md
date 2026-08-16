@@ -2725,13 +2725,19 @@ ingestion arm rather than a substitute, and three things follow from it:
 folder carries no audio, so the soundtrack is generated fresh; and
 `regenerate_audio` therefore has no observable effect on this arm.
 
-| extra | meaning |
-|---|---|
-| `retake_start_time` | window start in seconds, inclusive; supplying it selects the retake path |
-| `retake_end_time` | window end in seconds, exclusive; must be greater than the start |
-| `retake_frame_rate` | the source folder's frame rate; required |
-| `regenerate_video` | `1` (default) regenerates inside the window, `0` freezes the clip |
-| `regenerate_audio` | `1` (default); no effect while the source is a frame folder |
+| `ltx2-gen` flag | per-generation extra | meaning |
+|---|---|---|
+| `--ref-video` | `vllm_video_params::ref_video` | the source clip DIRECTORY |
+| `--retake-start-time` | `retake_start_time` | window start in seconds, inclusive; supplying it selects the retake path |
+| `--retake-end-time` | `retake_end_time` | window end in seconds, exclusive; must be greater than the start |
+| `--retake-frame-rate` | `retake_frame_rate` | the source folder's frame rate; required |
+| `--regenerate-video` | `regenerate_video` | `1` (default) regenerates inside the window, `0` freezes the clip |
+| `--regenerate-audio` | `regenerate_audio` | `1` (default); no effect while the source is a frame folder |
+
+The extras ride the per-generation `extra_keys` / `extra_values` array on
+`vllm_video_params`, so the C ABI reaches the same path with no new field.
+`/v1/videos` forwards no engine extras today ([#928](https://github.com/mudler/vllm.cpp/issues/928)),
+so the CLI and the C ABI are the reachable surfaces.
 
 A retake takes its width, height, frame count and duration from the clip and
 refuses a request that also names any of them. The clip's frame count must
