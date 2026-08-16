@@ -841,6 +841,18 @@ Green after: `--test-case=ltx2 t2a*` at 10 cases / **548** assertions / 0 failed
   landed with #641, none is on the T2A path, and this row ends only
   `Ltx2MultiModalGuidance`'s test-only-driver state. Tracked by
   [#1049](https://github.com/mudler/vllm.cpp/issues/1049).
+- **`test_engine_core_proc`'s immediate-shutdown case is load-dependent**, and
+  no issue named it until now. Its abort frame is searched for over a FIXED 1000
+  dequeues while a `max_tokens=100000` request keeps producing token deltas, so
+  the budget is a bet on scheduling. MEASURED at `37e680cab`, same binary
+  throughout: 2 failures in 3 `ctest -j4` runs of the full suite, 0 in 25 solo
+  runs on an idle box, 0 in 25 solo runs against 20 spinning processes, and 0 in
+  two `ctest -R` runs. The third `-j4` run failed `test_cpu_threadpool` INSTEAD,
+  so the identity of the failing test rotates between runs of an unchanged
+  binary. This branch touches no file under `tests/vllm/v1/` or `src/vllm/v1/`.
+  The earlier revision of the PR body attributed it to #294, which is a
+  DIFFERENT defect in `test_async_llm`. Tracked by
+  [#1052](https://github.com/mudler/vllm.cpp/issues/1052).
 - **The guider rescale's `std` comment states an impossible consequence.**
   `ltx2_pipeline.cpp:505-506` and `ltx2_pipeline.h:319-322` say torch's unbiased
   (N-1) `std` matters and the biased one "would be a small, everywhere,
