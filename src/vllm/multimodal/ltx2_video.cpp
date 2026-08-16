@@ -315,6 +315,28 @@ double ExtraDouble(const std::map<std::string, std::string>& extras, const std::
   }
 }
 
+// The IC-LoRA strength (utils/args.py:600-611). Upstream's `LoraAction` parses
+// it as a plain float and applies no range clamp, so neither does this: a
+// negative or >1 strength is a legitimate, if unusual, request that upstream
+// honours, and refusing it here would diverge. What IS refused is a value that
+// is not a number at all, which upstream's `float()` would raise on too.
+//
+// Not `ExtraDouble` above, and deliberately: that one reports "not a finite
+// number of SECONDS", which is the wrong noun for a strength, and it defaults a
+// missing key while this one is only ever called on a key that is present.
+double ParseLoraStrength(const std::string& raw) {
+  try {
+    size_t consumed = 0;
+    const double value = std::stod(raw, &consumed);
+    if (consumed != raw.size()) throw std::invalid_argument("trailing");
+    if (!std::isfinite(value)) throw std::invalid_argument("non-finite");
+    return value;
+  } catch (const std::exception&) {
+    Fail("the extra '" + std::string(kLtx2LoraStrengthExtra) + "' is '" + raw +
+         "', which is not a finite number");
+  }
+}
+
 // The one key this family DEFINES and does not SERVE. `Ltx2DurationPredict` is
 // ported and gated as a brick (`ltx2_duration_head.h`), but nothing here
 // constructs one, so a supplied path names a file the engine never opens.
@@ -339,12 +361,13 @@ constexpr char kLtx2DurationHeadPathExtra[] = "duration_head_path";
 // they are no longer trusted: the list below is derived from this file on every
 // run and compared, and the failure prints the replacement to paste in.
 // READER ANCHORS (derived and gated by test_ltx2_video):
-// 756 811 907 923 925 1003 1028 1133 1174
+// 779 789 790 852 948 964 966 1044 1069 1174 1215
 const char* const kKnownLoadExtras[] = {
     kLtx2AudioPromptEmbedsExtra, kLtx2PipelineKindExtra,   kLtx2ModelVersionExtra,
     kLtx2AllowUnportedExtra,     kLtx2MaxPhaseExtra,       kLtx2DitConfigPathExtra,
     kLtx2PromptValidRowsExtra,   kLtx2EncoderConfigPathExtra,
     "upsampler_path",            kLtx2DurationHeadPathExtra,
+    kLtx2LoraPathExtra,          kLtx2LoraStrengthExtra,
 };
 
 // FNV-1a over the raw bytes of a float buffer — the `Ltx2ConditioningTrace`
@@ -759,6 +782,24 @@ std::unique_ptr<Ltx2VideoEngine> Ltx2VideoEngine::Load(const VideoModelParams& p
   // `Ltx2StreamDitToDevice` dequantizes and uploads ONE TENSOR AT A TIME, so peak
   // residency is the device copy plus one tensor rather than two whole models.
   dit_options.widen_to_f32 = !im.on_device;
+  // The IC-LoRA adapter, fused into the weights as they are materialized. This
+  // is the production call site for the whole `ltx2_lora.h` family: deleting it
+  // makes the adapter unreachable, which is what the reachability mutation in
+  // the row's spec §5.3 checks.
+  const std::string lora_path = VideoExtra(params.extras, kLtx2LoraPathExtra);
+  const std::string lora_strength = VideoExtra(params.extras, kLtx2LoraStrengthExtra);
+  if (lora_path.empty() && !lora_strength.empty()) {
+    Fail("'" + std::string(kLtx2LoraStrengthExtra) + "' was given without '" +
+         std::string(kLtx2LoraPathExtra) +
+         "'. A strength with no adapter fuses nothing, and silently doing nothing is what "
+         "this refusal exists to prevent.");
+  }
+  if (!lora_path.empty()) {
+    Ltx2LoraSpec spec;
+    spec.path = lora_path;
+    if (!lora_strength.empty()) spec.strength = ParseLoraStrength(lora_strength);
+    dit_options.loras.push_back(std::move(spec));
+  }
   im.dit = im.on_device ? Ltx2StreamDitToDevice(*im.queue, dit_file, dit_options)
                         : Ltx2LoadDitFromSafetensors(dit_file, dit_options);
 
@@ -1207,25 +1248,123 @@ std::unique_ptr<Ltx2VideoEngine> Ltx2VideoEngine::Load(const VideoModelParams& p
   return engine;
 }
 
+namespace {
+
+// GENERATED keyframe slots, refused BY WHAT IS MISSING.
+//
+// Deliberately a second anonymous namespace rather than an addition to the one
+// at the top of this file: the READER ANCHORS comment above `kKnownLoadExtras`
+// carries derived LINE NUMBERS into this file and is gated by
+// `test_ltx2_video`, so a definition inserted up there would move every anchor
+// under it and break that gate for a reason that has nothing to do with this
+// row. Everything here sits below the last anchored line.
+//
+// This resolves the request BEFORE any arm is selected, so the FP8, NVFP4 and
+// bf16 arms cannot reach the unported machinery by different routes — there is
+// one answer for the family, not one per arm.
+void CheckGeneratedKeyframes(const std::map<std::string, std::string>& extras) {
+  if (VideoExtra(extras, kLtx2GeneratedKeyframesExtra).empty()) return;
+  const int64_t count = ExtraInt(extras, kLtx2GeneratedKeyframesExtra, 0);
+
+  // ZERO IS UPSTREAM'S DEFAULT, AND IT IS OFF. `args.py:836` is `default=0` and
+  // `has_generated_keyframes` (utils/helpers.py:384-391) reads 0 as "no slots
+  // requested". A caller that plumbs the default through must get a render.
+  // Refusing on the mere presence of the key is one line shorter and wrong.
+  if (count == 0) return;
+
+  // A MALFORMED REQUEST AND AN UNPORTED ARM ARE DIFFERENT ANSWERS, and upstream
+  // gives this one first: `evenly_spaced_keyframe_positions` raises
+  // "num_keyframes must be non-negative" (utils/helpers.py:372-373) before
+  // anything looks at the checkpoint. Collapsing the two would tell a caller who
+  // typed -1 to go and read about attention masks.
+  if (count < 0) {
+    Fail("the '" + std::string(kLtx2GeneratedKeyframesExtra) + "' extra is " +
+         std::to_string(count) + ", and num_keyframes must be non-negative — upstream's own "
+         "refusal, raised by `evenly_spaced_keyframe_positions` "
+         "(ltx-pipelines/utils/helpers.py:370-381) before the checkpoint is consulted. Use 0 "
+         "to turn generated keyframes off, which is upstream's default (utils/args.py:836).");
+  }
+
+  Fail(
+      "generated keyframe slots are not served. This is upstream's "
+      "`VideoGeneratedKeyframeSlots` (ltx-core/conditioning/types/keyframe_slots.py:27-174), "
+      "reached from the CLI as `--num-generated-keyframes` (ltx-pipelines/utils/args.py:833-844) "
+      "and documented at ltx-pipelines/docs/conditioning.md:29-61 — the model GENERATES extra "
+      "frames at interior positions, which is a different feature from a SUPPLIED keyframe "
+      "image and is refused for a different reason. WHAT IS MISSING IS THE READBACK, and the "
+      "supplied arm needs none of it. The slots are the OUTPUT rather than conditioning, so "
+      "`apply_to` (keyframe_slots.py:71-150) records a `GeneratedKeyframeLayout` (:143-147, "
+      "defined at ltx_core/types.py:220-247) that locates them EXACTLY rather than assuming they "
+      "trail — items are applied in list order and each appends, so a state carrying slots AND a "
+      "supplied keyframe has no fixed trailing layout. `clear_conditioning` (ltx_core/"
+      "tools.py:88-117) then extracts them into `LatentState.generated_keyframes` as "
+      "(B, C, K, H, W) BEFORE it trims the extra tokens (tools.py:97, :115, by "
+      "`extract_generated_keyframes` at :203-230, which validates the layout against the live "
+      "token count and the target resolution), and each frame must then be decoded as a "
+      "STANDALONE one-frame clip — a K-frame causal decode would blend slots that were never "
+      "temporally adjacent (ltx_core/types.py:269-272, docs/conditioning.md:59-61). None of that "
+      "exists here, so a port that grew the sequence and stopped would generate the slots and "
+      "then throw them away, which is worse than refusing. "
+      "TWO PLAUSIBLE REASONS ARE RULED OUT, each with what ruled it out, so the next reader "
+      "re-checks the claim instead of re-deriving the refutation. FIRST, NOT the TOKEN-APPEND "
+      "machinery. Row LTX25-TOKEN-APPEND (issue #930) landed it and the LAST-frame "
+      "supplied-keyframe arm is SERVED through it today: `Ltx2ExtendKeyframesMask` and "
+      "`Ltx2ClearConditioning` grow the sequence and trim it back, and the phase loop binds a "
+      "`target_tokens` the grown count is measured against, so `apply_to`'s concatenation onto "
+      "`latent`, `denoise_mask`, `positions` and `clean_latent` (keyframe_slots.py:136-140), its "
+      "explicit [t, t+1) span with `causal_fix=False` (:152-174) and its `denoise_mask = 1` "
+      "(:118-119) all have a seam to land on. Two SMALL pieces of that seam are owed to THIS row "
+      "rather than to #930, and neither is the blocker above: the `marked=true` branch of "
+      "`Ltx2ExtendKeyframesMask` (upstream `keyframe_slots.py:121`) has no production caller yet, "
+      "and `update_attention_mask` (:123-131) has no local counterpart because `Ltx2LatentState` "
+      "carries no attention-mask field — deliberately, since the only upstream route to a "
+      "non-None mask is the IC-LoRA wrapper this engine does not mirror. SECOND, and this is the "
+      "one this campaign pinned falsely once already, WHAT IS *NOT* THE REASON: "
+      "`keyframes_abs_pos_embedding`. It is ported and applied on every render (row "
+      "LTX25-KEYFRAMES-ABS-POS, issue #658), because `_first_frame_keyframes_mask` "
+      "(ltx_core/tools.py:184-196) marks the target's first latent frame unconditionally. What "
+      "generated slots would add is MORE marked tokens — `keyframe_slots.py:121` is upstream's "
+      "only `extend_keyframes_mask(..., marked=True)` call site, against `marked=False` for "
+      "supplied content at keyframe_cond.py:84-86 — not the marker itself. "
+      "LOCAL FACTS, and the gate re-derives every one of them from "
+      "`ltx2_conditioning.h`'s DECLARATIONS with comment lines stripped, because a comment can "
+      "name a symbol the header does not declare. This clause exists because the reason above is "
+      "the part that goes stale: the refusal this one replaces named a token-append gap that "
+      "#930 had already closed, and the suite stayed GREEN through it because every assertion was "
+      "on an UPSTREAM symbol name, which no change to this tree can move. DECLARED HERE: "
+      "Ltx2ExtendKeyframesMask, Ltx2ClearConditioning, Ltx2LatentState. ABSENT HERE: "
+      "GeneratedKeyframe, generated_keyframe. "
+      "Tracked as owed by issue #920.");
+}
+
+}  // namespace
+
 VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
   Impl& im = *impl_;
   std::lock_guard<std::mutex> guard(im.mutex);
 
   if (gen.output_dir.empty()) Fail("output_dir is required");
   for (const auto& kv : gen.extras) {
-    // `image_crf` is the only per-generation extra this family defines (row
-    // LTX25-IMAGE-COND). Everything else is refused rather than ignored, for the
+    // The per-generation extras this family DEFINES, and the list is the one
+    // below rather than this sentence: `image_crf` (row LTX25-IMAGE-COND), the
+    // three audio-to-video knobs (row LTX25-A2V-AUDIO-INPUT, #922) and
+    // `num_generated_keyframes` (row LTX25-GENERATED-KEYFRAMES, #920). DEFINED
+    // is not SERVED — the last one is defined so that its own refusal can name
+    // what is missing, exactly as `CheckUnservedExtras` does on the load side
+    // (#611). Everything OUTSIDE the list is refused rather than ignored, for the
     // reason `CheckKnownExtras` gives for the load side: a mistyped knob that is
     // silently dropped renders the DEFAULT and looks like the feature not
     // working — and for THIS knob the default is a refusal, so a typo would turn
     // a served request into an unexplained one.
     const bool known = kv.first == kLtx2ImageCrfExtra || kv.first == kLtx2AudioPathExtra ||
                        kv.first == kLtx2AudioStartTimeExtra ||
-                       kv.first == kLtx2AudioMaxDurationExtra;
+                       kv.first == kLtx2AudioMaxDurationExtra ||
+                       kv.first == kLtx2GeneratedKeyframesExtra;
     if (!known) {
       Fail("unknown per-generation extra '" + kv.first + "'. This family defines: " +
            std::string(kLtx2ImageCrfExtra) + ", " + kLtx2AudioPathExtra + ", " +
-           kLtx2AudioStartTimeExtra + ", " + kLtx2AudioMaxDurationExtra);
+           kLtx2AudioStartTimeExtra + ", " + kLtx2AudioMaxDurationExtra + ", " +
+           kLtx2GeneratedKeyframesExtra);
     }
   }
   // The two audio WINDOW knobs only mean something alongside a file. Accepting
@@ -1241,6 +1380,7 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
       }
     }
   }
+  CheckGeneratedKeyframes(gen.extras);
   if (!gen.prompt.empty() && !im.has_encoder) {
     Fail(
         "a prompt was supplied but no text tower is loaded, so it cannot condition this "
@@ -1376,7 +1516,7 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
   // silently ignored renders an unconditioned clip that looks like the feature
   // not working.
   //
-  // THESE MESSAGES ARE WRITTEN TO BE RE-CHECKABLE, and the count is now SIX
+  // THESE MESSAGES ARE WRITTEN TO BE RE-CHECKABLE, and the count is still SIX
   // refusals in this campaign whose stated reason turned out to be false or
   // stale. Two of the six stood right here. The first said no encoder weights
   // could be materialized — true when written, and what this row fixed. The
@@ -1384,6 +1524,21 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
   // verifiably NOT the blocker at the pin (see the last-frame message below for
   // the three anchors that refute it), and a test had been written to assert
   // that wrong reason by name.
+  //
+  // IT STAYS AT SIX, AND TWO MORE NEARLY JOINED IT ON THE SAME DAY. `c7cb59fbb`
+  // (row LTX25-TOKEN-APPEND, #930) built the append seam and falsified the
+  // stated cause of TWO refusals that were open in review when it landed: the
+  // generated-keyframe-slot one (#920) and the reference one below (#923).
+  // Neither reached `main`, so neither is counted; both are recorded, because
+  // the MECHANISM is the point and it was identical. Each had been rewritten
+  // onto token-append days earlier, and each was gated by assertions on
+  // UPSTREAM symbol names and on literals the message declared about itself —
+  // and no change to THIS engine can move either kind. Both repairs have the
+  // same shape: assert a property of this tree, then constrain the message
+  // against it. The reference case below measures that the phase loop grows and
+  // trims before it reads one character of the refusal; the slot case re-derives
+  // the message's own `DECLARED HERE` / `ABSENT HERE` lists out of
+  // `ltx2_conditioning.h`.
   //
   // So: name the exact symbol or upstream `file:line` that would have to change
   // for the refusal to become false, never a category — and where a plausible
@@ -1409,16 +1564,69 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
   const bool wants_last_frame = !gen.last_frame_path.empty();
   const bool wants_image = wants_first_frame || wants_last_frame;
   if (!gen.ref_image_paths.empty() || !gen.ref_video_dir.empty()) {
+    // TWO CAUSES REMAIN, AND NEITHER IS ONE THIS MESSAGE HAS EVER GIVEN. The
+    // message names both, and then names the three ruled-out reasons with what
+    // ruled each one out, because a reader who arrives here in a month should
+    // re-check the claim rather than re-derive the refutation for a third time.
+    //
+    // 1. THE REFERENCE CLIP HAS NO PIXEL PATH. Upstream resolves the reference
+    //    at `height // scale` by `width // scale` (iclora_utils.py:116-117),
+    //    refuses a target either axis of which the factor does not divide
+    //    (:112-115), keeps frame 0 and then every Nth frame (`temporal_subsample`,
+    //    :87-89, called at :144), and encodes the whole clip (:145-148). This
+    //    engine's only pixel-to-latent route is `Ltx2LoadImageAndPreprocess`
+    //    followed by `Ltx2ConvVideoEncode` at `frame_count = 1` and the phase's
+    //    OWN height and width, and it refuses an encode that returns more than
+    //    one latent frame. Nothing anywhere reads `ref_video_dir`, which is a
+    //    directory of `frame_%06d.ppm`.
+    //
+    // 2. THE REFERENCE ITEM BELONGS TO STAGE 1, AND STAGE 2 MUST RUN UNFUSED.
+    //    `ICLoraPipeline` builds two `DiffusionStage`s from the same checkpoint
+    //    and gives stage 1 `loras=tuple(loras)` (ic_lora.py:108) and stage 2
+    //    `loras=()` (:119); stage 1 takes `_create_conditionings`, which appends
+    //    the reference item (:269-278, :377-402), and stage 2 takes plain
+    //    `combined_image_conditionings` with no reference item at all
+    //    (:314-321). This engine holds ONE `Ltx2Dit`, fused at load, that every
+    //    phase of the recipe runs. Serving the arm on a two-phase recipe needs a
+    //    second unfused DiT or a phase-scoped adapter, and serving it on one
+    //    phase only is upstream's `skip_stage_2` (:302-308), a different request.
+    std::string factors = "no adapter was supplied, so none were read";
+    if (im.dit.lora_fused_tensors > 0) {
+      factors = "the supplied adapter declares downscale=" +
+                std::to_string(im.dit.lora_reference.downscale) +
+                " temporal=" + std::to_string(im.dit.lora_reference.temporal) +
+                ", fused into " + std::to_string(im.dit.lora_fused_tensors) + " tensors";
+    }
     Fail(
-        "reference-image / reference-video conditioning is not served. The encoder and the "
-        "placement are both here — `Ltx2ConditionVideoByReference` is ported and gated — but "
-        "it takes a `downscale_factor` and a `temporal_scale_factor` that must match what the "
-        "IC-LoRA was TRAINED with (conditioning/types/reference_video_cond.py:36-37, applied at "
-        ":65-77), and "
-        "upstream carries those in the LoRA's own metadata, which this project does not read. "
-        "A guessed pair places the reference plausibly and wrongly, which no output check can "
-        "see, so it is refused instead. Use first_frame_ppm / first_frame_path for "
-        "image-to-video.");
+        "reference-image / reference-video conditioning is not served. TWO things are "
+        "missing. FIRST, the reference CLIP has no pixel path: upstream reads it at "
+        "`height // reference_downscale_factor` by `width // reference_downscale_factor` "
+        "(iclora_utils.py:116-117), refuses a target the factor does not divide (:112-115), "
+        "keeps frame 0 and then every Nth frame (`temporal_subsample`, :87-89, called at "
+        ":144) and encodes the whole clip (:145-148), while this engine's only "
+        "pixel-to-latent route encodes exactly ONE frame at the phase's own resolution and "
+        "nothing reads `ref_video_dir` at all. SECOND, the reference item is a STAGE-1 item "
+        "and stage 2 must run with NO adapter: `ICLoraPipeline` gives stage 1 "
+        "`loras=tuple(loras)` (ic_lora.py:108) and the reference conditioning (:269-278), "
+        "and gives stage 2 `loras=()` (:119) and `combined_image_conditionings` with no "
+        "reference item (:314-321) — and this engine holds one DiT, fused at load, that "
+        "every phase runs. WHAT IS *NOT* THE REASON, because this refusal has now given two "
+        "reasons that later became false: (a) the IC-LoRA METADATA. Row LTX25-IC-LORA (#923) "
+        "closed that; supply `lora_path` and the factors are read at load "
+        "(iclora_utils.py:30-49) — right now, " + factors +
+        ". (b) the TOKEN-APPEND machinery. This message blamed it on 2026-08-15 and row "
+        "LTX25-TOKEN-APPEND (#930) landed it in `c7cb59fbb` the next day: the phase loop "
+        "now binds a `target_tokens` local, grows `video.tokens` past it on an appending "
+        "item, carries the grown count through denoise, and trims back through "
+        "`Ltx2ClearConditioning` (ltx_core/tools.py:88-117) before unpatchify. The "
+        "last-frame keyframe arm is SERVED on exactly that machinery, which is the "
+        "executable proof it exists. (c) `Ltx2LatentState` carrying no attention-mask "
+        "field. On the DEFAULT arm upstream builds no mask: at "
+        "`conditioning_attention_strength >= 1.0` with no latent mask `attn_mask` is None "
+        "(iclora_utils.py:159-160) and `ConditioningItemAttentionStrengthWrapper` is "
+        "applied only `if attn_mask is not None` (:168-169). The sub-1.0 arm is owed by "
+        "#932, and it is not what blocks this one. Use first_frame_ppm / first_frame_path "
+        "for image-to-video, and last_frame_path for a closing keyframe.");
   }
   if (!gen.ref_audio_path.empty() || !gen.ref_audio_wav.empty()) {
     Fail(

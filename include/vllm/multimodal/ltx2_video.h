@@ -201,6 +201,22 @@ inline constexpr char kLtx2AllowUnportedExtra[] = "allow_unported_modules";
 // say so rather than skipping the phase silently.
 inline constexpr char kLtx2MaxPhaseExtra[] = "max_phase";
 
+// An IC-LoRA adapter to FUSE into the DiT, and its strength
+// (ltx-core loader/primitives.py:160-167 `LoraPathStrengthAndSDOps`, fused by
+// loader/fuse_loras.py:119-150; the CLI pair is ltx-pipelines utils/args.py:600-611).
+//
+// LOAD extras rather than generation fields, because upstream takes the LoRAs as
+// a `DiffusionStage.from_checkpoint` CONSTRUCTOR argument (ic_lora.py:104-114)
+// and fuses them into the weights, so the adapter is a property of the loaded
+// model and cannot vary per request. A per-generation field would promise
+// something the mechanism cannot do.
+//
+// `lora_strength` absent is 1.0, upstream's DEFAULT_LORA_STRENGTH. Supplying a
+// strength without a path refuses, because a strength alone is a request that
+// silently did nothing.
+inline constexpr char kLtx2LoraPathExtra[] = "lora_path";
+inline constexpr char kLtx2LoraStrengthExtra[] = "lora_strength";
+
 // How many of the supplied prompt-embeds rows are REAL tokens; the rest are
 // padding. Absent means every row is real.
 //
@@ -294,6 +310,39 @@ inline constexpr char kLtx2AudioStartTimeExtra[] = "audio_start_time";
 // Mirrored at the same layer, so a caller who omits it gets exactly as much
 // audio as the clip is long.
 inline constexpr char kLtx2AudioMaxDurationExtra[] = "audio_max_duration";
+
+// GENERATED keyframe slots — the OTHER upstream feature called "keyframe", and
+// the one this port does not serve. Row LTX25-GENERATED-KEYFRAMES (#920).
+//
+// Not to be confused with the SUPPLIED keyframe arm. The two differ by one
+// argument, and it is the argument that decides whether the trained marker is
+// applied at all:
+//
+//   supplied  `VideoConditionByKeyframeIndex` — the caller hands in an image
+//             for a frame index; appended `marked=False` (keyframe_cond.py:84-86)
+//   GENERATED `VideoGeneratedKeyframeSlots`   — the MODEL generates extra frames
+//             at interior positions; appended `marked=True` (keyframe_slots.py:121)
+//
+// `extend_keyframes_mask` (conditioning/mask_utils.py:76-107) documents the
+// polarity, and `keyframe_slots.py:121` is upstream's ONLY call site that passes
+// True. So this is the only user-facing feature that puts
+// `keyframes_abs_pos_embedding` on a token other than the target's own first
+// latent frame — which `Ltx2FirstFrameKeyframesMask` already marks on every
+// render, unconditionally, mirroring `tools.py:184-196`.
+//
+// THIS KEY IS DEFINED AND NOT SERVED, and it is defined precisely so the refusal
+// can name what is missing. Falling through the per-generation extras check
+// would produce "unknown per-generation extra", which asserts the family does
+// not define the key and sends the reader hunting a typo — the distinction
+// `CheckUnservedExtras` exists for on the load side (#611).
+//
+// Spelled and typed as upstream's CLI spells it: `--num-generated-keyframes`,
+// `type=int`, `default=0` (ltx-pipelines/utils/args.py:833-844). It is a
+// per-CALL argument upstream, forwarded to the FIRST diffusion stage only, so it
+// belongs on the per-generation surface rather than on load. `0` is upstream's
+// own default and means OFF (`has_generated_keyframes`, utils/helpers.py:384-391)
+// — an explicit 0 must therefore RENDER, not refuse.
+inline constexpr char kLtx2GeneratedKeyframesExtra[] = "num_generated_keyframes";
 
 // WHAT THE LAST `Generate()` ACTUALLY HANDED THE DiT's CROSS-ATTENTION.
 //

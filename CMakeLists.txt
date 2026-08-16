@@ -866,6 +866,10 @@ add_library(vllm STATIC
   # FP8 and torchao-NVFP4 DiT arms, the torchao-NVFP4 text encoder, and the
   # load-time device staging GB10's ATS penalty makes the default.
   src/vllm/model_executor/models/ltx2_loader.cpp
+  # LTX-2.5 (ROW LTX25-IC-LORA, issue #923): reading an IC-LoRA adapter and its
+  # `__metadata__`, and the bf16 delta the loader fuses into every arm. Its own
+  # TU for the same reason as the two above.
+  src/vllm/model_executor/models/ltx2_lora.cpp
   src/vllm/entrypoints/openai/video_api.cpp
   src/vllm/entrypoints/openai/speech_api.cpp
   src/vllm/entrypoints/openai/speech_api_synthesize.cpp
@@ -879,6 +883,10 @@ add_library(vllm STATIC
   # config descent, the on-disk name map, the registry entry and the het-KV
   # topology. No forward: nemotron_h.cpp is W4.
   src/vllm/model_executor/models/nemotron_h.cpp
+  # A2-R (#810): the DEVICE arm — the residual stream, the 52 norms, the
+  # embedding lookup and the 6 GQA attention blocks. Mamba/MoE/lm_head stay
+  # host; see the file header for why the line falls where it does.
+  src/vllm/model_executor/models/nemotron_h_device.cpp
   src/vllm/model_executor/models/nemotron_h_registry.cpp
   src/vllm/model_executor/models/nemotron_h_weights.cpp
   src/vllm/model_executor/models/glm4_registry.cpp

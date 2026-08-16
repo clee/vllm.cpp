@@ -468,7 +468,7 @@ tokens quietly.
 | Architecture | Why it refuses |
 |---|---|
 | `KimiK3ForConditionalGeneration` | Needs ~1.56 TB (MXFP4); no host here can run it |
-| `NemotronHForCausalLM` | The hybrid forward is ported (#517 W4) and the weight loader materializes the real checkpoint, but that forward is a HOST reference: it recomputes K/V over the whole sequence every step, carries no recurrent state between steps and treats a batch as one causal sequence. Engine construction now SUCCEEDS — the KV allocation reads the model's own recurrent spec (#810) — and the first step then refuses by name, naming the paged/batched decode path as the missing piece rather than returning plausible wrong tokens. Safetensors resolve and parse; a GGUF file is refused by name, since no GGUF arm exists for it |
+| `NemotronHForCausalLM` | The hybrid forward is ported (#517 W4) and the weight loader materializes the real checkpoint, but that forward is a HOST reference: it recomputes K/V over the whole sequence every step, carries no recurrent state between steps and treats a batch as one causal sequence. Engine construction now SUCCEEDS — the KV allocation reads the model's own recurrent spec (#810) — and the first step then refuses by name, naming the paged/batched decode path as the missing piece rather than returning plausible wrong tokens. **That refusal is UNCHANGED by A2-R (#810)**: A2-R adds a partial device arm (embedding lookup, the 52 layer norms + `norm_f`, and the 6 GQA attention blocks; Mamba2, MoE and `lm_head` stay on the host), but it is non-paged and single-request, so it creates none of the capability the refusal guards and is not reachable through `include/vllm.h`. It is exercised only by `test_nemotron_h_forward`, and it records no throughput number. Safetensors resolve and parse; a GGUF file is refused by name, since no GGUF arm exists for it |
 
 This is a deliberate state, not a bug: registering the architecture is what lets
 the config parse and weight-name mapping be tested before the forward exists.
@@ -530,11 +530,39 @@ Where the embedding does bite is the FIRST latent frame of every render, which
 was a separate gap; it was closed on 2026-08-14 under issue #658, so the marker
 is now applied on every render.)
 
+**Generated keyframe slots are a different feature, and they are refused.**
+Upstream also lets the model *generate* extra frames at interior positions —
+`--num-generated-keyframes N` there, the per-generation extra
+`num_generated_keyframes` here. That is not a keyframe you supply; it is one you
+ask the model to invent, and each slot buys one pixel frame at the cost of a
+full latent frame of tokens. `0` is upstream's own default and means off, so
+passing it explicitly renders normally. A positive count is refused by name, and
+what the refusal names is the **readback**: the slots are the OUTPUT, so they
+have to be located by the layout the append recorded, extracted before the extra
+tokens are trimmed off, and then each decoded as a standalone one-frame clip,
+because a multi-frame causal decode would blend slots that were never temporally
+adjacent. Two plausible reasons are ruled out rather than left for a reader to
+re-derive: the token-APPEND machinery, which the last-frame arm above uses
+today, and the trained keyframe marker, which issue #658 landed and which every
+render already applies. A negative count is refused separately with upstream's
+own reason, since a malformed request and an unported arm are different answers.
+
 Reference-image, reference-video and reference-audio conditioning are still
-refused, each naming a different missing piece: the reference arms need the
-IC-LoRA's scale factors, which live in LoRA metadata this project does not
-read; reference audio additionally needs the AUDIO VAE's encoder key filter,
-which is not built. Three encoder-level limits are worth
+refused, each naming a different missing piece. **Two reasons this page used to
+give are now false and are recorded rather than deleted**, because a reader may
+have planned around them: the IC-LoRA scale factors are read as of `--lora`
+(2026-08-15), and the token-APPEND machinery landed with the last-frame keyframe
+above (2026-08-16). What is left for reference VIDEO and reference IMAGE is a
+pixel path and a stage split. Nothing here turns a clip into latents: upstream
+decodes the reference at `height/downscale x width/downscale`, keeps frame 0 and
+then every Nth frame, and encodes the result
+(`ltx_pipelines/iclora_utils.py:87-89`, `:112-148`), and this engine's only
+pixel-to-latent route encodes exactly one frame at the phase's full resolution.
+And the reference item belongs to stage 1 only: upstream fuses the adapter into
+stage 1 and gives stage 2 `loras=()` and no reference item at all
+(`ic_lora.py:108`, `:119`, `:314-321`), while this engine holds ONE DiT, fused
+at load, that every phase runs. Reference audio additionally needs the AUDIO
+VAE's encoder key filter, which is not built. Three encoder-level limits are worth
 stating in advance because they are refusals rather than approximations. A
 reference waveform whose sample rate differs from the audio VAE's is refused
 rather than resampled, since upstream uses a polyphase kaiser resampler this
@@ -718,6 +746,30 @@ a resolution cap: there is no maximum-size check anywhere in this path, and the
 60 GB is **not attributed** — the decode's own heap peak at that size is 361.72
 MiB, some 170x too small to account for it. See the note below on what bounds a
 render, and `.agents/specs/ltx25-tiled-decode.md`.
+
+`--lora ic-lora.safetensors [STRENGTH]` fuses an IC-LoRA adapter into the DiT at
+load, mirroring upstream's `--lora PATH [STRENGTH]`
+(`ltx-pipelines/utils/args.py:600-611`). The strength is optional and defaults to
+1.0. It is a LOAD-time flag, not a per-request one, because the adapter is fused
+into the weights and cannot vary between generations - upstream takes it as a
+`DiffusionStage.from_checkpoint` constructor argument for the same reason
+(`ic_lora.py:104-114`).
+
+The adapter is a safetensors file of `.lora_A.weight` / `.lora_B.weight` pairs,
+with or without ComfyUI's `diffusion_model.` prefix. It works on every arm the
+DiT loads - bf16, FP8 and NVFP4 alike - because those are all dequantized to
+bf16 before the delta is added. Three things REFUSE by name rather than
+proceeding quietly: an adapter naming a module this port does not bind (upstream
+would skip it, and a skip cannot be told apart from a typo), an adapter that
+fuses into nothing at all, and a second `--lora`, since only one adapter is
+accepted so far.
+
+Supplying an adapter also reads its `reference_downscale_factor` and
+`reference_temporal_scale_factor` metadata (`iclora_utils.py:30-49`). Those are
+what a reference video needs, and reading them was what the reference refusal
+used to say was missing. It no longer says that, and it does not say
+token-append either: that seam landed too. What it names now is the reference
+CLIP's own pixel path and the stage split, both above.
 
 `--upsampler` is what the distilled recipe's second phase needs. Without it that
 phase refuses rather than skipping: its three-step refinement is what makes the
@@ -2194,8 +2246,9 @@ spatiotemporal upsampler is the arm with `spatial_upsample` AND
 **ported** and is not refused; nothing shipped drives it yet, so it is gated
 rather than served. Four more are
 recorded as out of scope but are **not requestable**, so no flag or extra can
-reach them: LoRA fusion, `int8-convrot`, single-node multi-GPU, and
-`BetaScheduler`. Their messages
+reach them: `int8-convrot`, single-node multi-GPU, and
+`BetaScheduler`. (LoRA fusion was in that list until 2026-08-15 and is now
+SERVED - see `--lora` above - so its marker was retired rather than moved.) Their messages
 say `DECLARED, NOT REQUESTABLE` so the two kinds are not confused.
 `BetaScheduler` is in that group rather than the reachable one because upstream
 selects it nowhere: every `ltx-pipelines` entry point hard-codes
@@ -2276,6 +2329,8 @@ batch-wide payload by rows. The second argument is the requested row count;
 each row keeps the source tensor's independent `num_tokens_per_position`
 width.
 
+(That brick is the TEXT decode path and is a different mechanism from LTX-2.5's
+IC-LoRA, which fuses into the weights at load and IS served - see `--lora`.)
 The LoRA adapter headers ([`lora/lora_weights.h`](../include/vllm/lora/lora_weights.h),
 [`lora/punica.h`](../include/vllm/lora/punica.h),
 [`lora/layers.h`](../include/vllm/lora/layers.h)) are present but **not yet wired
@@ -2737,11 +2792,48 @@ cmake --build build --target test_ltx2_loader && ./build/tests/test_ltx2_loader
 
 ## SSE keepalives on long prefill
 
-Async chat/completion streams may emit SSE **comment** frames (`:\n\n`) while
-waiting on the engine (long prefill / TTFT). Interval is `VT_SERVER_SSE_PING_S`
-(default 15s; `0` disables). Comment frames are not `data:` events and do not
-carry tokens. Token streaming still uses a timed wait on the request collector
-so deltas are not collapsed by a poll loop.
+Async chat/completion streams can emit SSE **comment** frames (`:\n\n`) while
+waiting on the engine (long prefill / TTFT), so a proxy with an inactivity
+timeout sees body bytes before the first token. Interval is
+`VT_SERVER_SSE_PING_S`, **default `0` — off**; a positive value enables it and
+is clamped to 600.
+
+**It is off by default, and it should stay off unless a proxy forces your
+hand.** vLLM's streaming endpoints emit no comment frame at any point, so a
+server that sends one is putting a byte on the wire that OpenAI-compatible
+clients written against vLLM have never had to parse. vLLM's own benchmark
+client is one of them: `vllm bench serve` strips each network chunk before
+parsing, which destroys the `\n\n` separator at chunk boundaries, and its only
+resynchronisation path looks for a `data: ` prefix — so one comment frame
+arriving before a request's first token makes it report
+`Never received a valid chunk to calculate TTFT` and count that request
+**failed**, while this server completes it normally and logs nothing. The
+requests that reach a keepalive are by construction the slowest ones, so the
+effect is to delete your own worst latencies from a measurement
+([#931](https://github.com/mudler/vllm.cpp/issues/931),
+[#577](https://github.com/mudler/vllm.cpp/issues/577)).
+
+Comment frames are not `data:` events and carry no tokens, and neither setting
+turns token streaming into a poll loop. At the `0` default both streams take the
+blocking `get_output()` on that request's own collector
+(`serving_completion.cpp:39-43`, `serving_chat.cpp:333-337`), which returns the
+instant the engine has something for that request. A positive interval swaps in
+`get_output_for()`, the same wait with a timeout attached, and the timeout only
+expires when the collector produced nothing at all. Deltas are therefore never
+collapsed or delayed either way.
+
+**A value the server cannot parse disables the keepalive; it is not an error.**
+`VT_SERVER_SSE_PING_S=fifteen`, an empty value and an unset variable all resolve
+to `0`, so if you enable this and no comment frames appear, check the spelling
+before looking anywhere else. The fallback points at OFF deliberately: under the
+previous default a typo silently switched the keepalive ON, and that is the
+direction that costs you requests.
+
+**The interval bounds silence on one request's stream, not its time to first
+token.** Each wait restarts whenever anything reaches that request, so a long
+prefill that keeps producing intermediate results never pings however long its
+first token takes, while a request whose stream goes quiet for the whole
+interval does.
 
 ## Gemma4 FP8 on ROCm (RDNA4)
 
