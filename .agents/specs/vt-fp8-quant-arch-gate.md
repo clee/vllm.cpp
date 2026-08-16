@@ -257,8 +257,10 @@ just the sha.
 ### Local (CPU-only)
 
 Release-equivalent CPU build (`-DVLLM_CPP_BUILD_TESTS=ON`), `BUILD_EXIT=0`,
-**0 warnings**: `ctest` **489/489 passed, 0 failed** (2 skipped for absent
-checkpoints: `test_modelopt_mixed_precision_checkpoint`, `test_voxtral_e2e`).
+**0 warnings**: `ctest` **489/489 passed, 0 failed** at the first base, and
+**491/491 passed, 0 failed** after merging `3ce1cf7c7` (which adds two suites),
+both with 2 skipped for absent checkpoints
+(`test_modelopt_mixed_precision_checkpoint`, `test_voxtral_e2e`).
 `test_ops_fp8_cpu` reads 4 cases / 56 assertions here — G4 compiles out on a
 non-CUDA build, which is correct and is why it is `#if defined(VLLM_CPP_CUDA)`.
 
@@ -321,10 +323,15 @@ reproduce it exactly.
 
 Open as [#991](https://github.com/mudler/vllm.cpp/pull/991), on
 `row/VT-FP8-QUANT-ARCH-GATE-960-V2`, awaiting a fresh review and an operator
-merge. Measured on both gate hosts and green; the only red CI lanes are
-`windows-msvc-cpu` / `windows-msvc-vulkan`, which fail at the identical step on
-unrelated open PRs (#988, #982) and are #968 under #584's PR-only lane, with a
-fix already open as #983.
+merge. Measured on both gate hosts. CI at `078d539e7`'s parent ran every job
+green except `windows-msvc-cpu` / `windows-msvc-vulkan`, and those two are
+inherited: MSVC raises `warning C4244: '=': conversion from 'const double' to
+'float'` inside its own `<vector>` while compiling
+`src/vllm/multimodal/ltx2_video.cpp`, promoted to `error C2220` by `/WX`. That is
+#968, under #584's PR-only lane so `main` carries no baseline for it, a fix is
+already open as #983, and the matched arm is measured rather than assumed —
+#988 and #982 fail at the byte-identical step name and neither shares any file
+with this row.
 
 `QuantFp8Static` is registered for CUDA on every arch, so the FP8 W8A8 arm is
 reachable on a non-cutlass-fp8 CUDA arch — the base #810/#517 A2-Q1 needs.
