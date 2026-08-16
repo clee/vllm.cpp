@@ -1822,6 +1822,68 @@ TEST_CASE("ltx2 video: the DFR pipeline pads its canvas, places slots on it, and
     }
   }
 
+  SUBCASE("the soundtrack is CUT to the picture, not to the padded canvas") {
+    // `dfr_pipeline.py:552-560`, whose own reason is the consequence rather than
+    // the mechanism: "Audio was generated for the padded canvas, so cut it to
+    // the video's duration or the muxed container outlasts the picture."
+    //
+    // This case exists because the first version of this row got it wrong and
+    // said so in a comment. The video trim moves `frames`; the audio latent's
+    // frame count was derived from the PADDED `frames` inside the phase loop and
+    // the vocoder runs over all of it, so trimming the video touches nothing
+    // about the sound. A 9-frame DFR request emitted 9 frames of picture beside
+    // 25 frames' worth of audio, and NOTHING about the render's shape, its frame
+    // count or its exit status could see it — it shows up only in a muxed
+    // container this library does not produce.
+    //
+    // The bound is derived from the RESULT's own fields rather than from the
+    // canvas, so a mutation of the cut cannot move both sides together.
+    vllm::multimodal::VideoGenParams gen = FixtureGen(ws.root + "/dfraudio");
+    const vllm::multimodal::VideoResult result = engine->Generate(gen);
+    REQUIRE(result.frame_count == 9);
+    REQUIRE(result.sample_rate > 0);
+    REQUIRE(result.fps > 0);
+
+    const std::string wav = ReadAll(result.audio_path);
+    REQUIRE(wav.size() > 44);  // canonical RIFF/WAVE header
+    const double seconds_of_picture =
+        static_cast<double>(result.frame_count) / static_cast<double>(result.fps);
+
+    // The duration is READ OUT OF THE FILE rather than assumed, and the first
+    // draft of this case got that wrong in a way worth recording: it took the
+    // channel count as 1, calling that "the loosest reading and therefore the
+    // safe direction". It is the opposite. Dividing by too FEW channels reports
+    // a longer file than exists, so the bound false-fails on a correct cut,
+    // which is exactly what it did — 0.375 s of picture against a reported
+    // 0.75 s of sound on a 2-channel file that was already the right length.
+    auto u16 = [&](size_t at) {
+      return static_cast<int64_t>(static_cast<unsigned char>(wav[at])) |
+             (static_cast<int64_t>(static_cast<unsigned char>(wav[at + 1])) << 8);
+    };
+    auto u32 = [&](size_t at) { return u16(at) | (u16(at + 2) << 16); };
+    REQUIRE(wav.compare(0, 4, "RIFF") == 0);
+    REQUIRE(wav.compare(8, 4, "WAVE") == 0);
+    const int64_t channels = u16(22);
+    const int64_t rate = u32(24);
+    const int64_t bits = u16(34);
+    const int64_t data_bytes = u32(40);
+    REQUIRE(channels >= 1);
+    REQUIRE(bits == 16);
+    REQUIRE(rate == result.sample_rate);
+    REQUIRE(data_bytes > 0);
+    REQUIRE(static_cast<size_t>(data_bytes) <= wav.size() - 44);
+    const double seconds_of_sound = static_cast<double>(data_bytes) /
+                                    (static_cast<double>(bits / 8) *
+                                     static_cast<double>(channels) * static_cast<double>(rate));
+    INFO("picture ", seconds_of_picture, "s, sound ", seconds_of_sound, "s, ", channels,
+         " channels at ", rate, " Hz");
+    // One frame of slack for the rounding in `llround`, and no more. Before the
+    // cut this was the PADDED canvas's duration, about 2.8x the picture.
+    CHECK(seconds_of_sound <= seconds_of_picture + (1.0 / static_cast<double>(result.fps)) + 1e-6);
+    // And it is not EMPTY, which a cut that computed zero would also satisfy.
+    CHECK(seconds_of_sound > 0.0);
+  }
+
   SUBCASE("a request wrong on BOTH axes hears about the RESOLUTION first") {
     // Upstream's order, and it is an order rather than a set: `assert_resolution`
     // is at dfr_pipeline.py:291 and `resolve_canvas` at :314. A request that is

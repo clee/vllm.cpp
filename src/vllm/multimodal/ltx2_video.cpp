@@ -2905,11 +2905,14 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
       frames = target_frames;
     }
     // The audio was generated for the PADDED canvas, so it outlasts the picture
-    // and upstream cuts it to the video's duration (dfr_pipeline.py:555-560).
-    // Recorded here rather than done here: this engine decodes audio from the
-    // same `frames`/`fps` pair below, so the cut is already implied by the
-    // trimmed `frames`. Named so a reader who checks upstream finds the line
-    // accounted for rather than missing.
+    // and upstream cuts it to the video's duration (dfr_pipeline.py:552-560).
+    // That cut is done AFTER the vocoder, beside the waveform it applies to;
+    // see the block above `VideoResult result` at the end of this function.
+    //
+    // This comment used to say the cut was "already implied by the trimmed
+    // `frames`" and that was FALSE: `audio_lf` carries the padded count out of
+    // the phase loop and the vocoder runs over all of it, so trimming the video
+    // latent here changes nothing about the soundtrack.
   }
 
   // ── decode (distilled.py:314-315) ─────────────────────────────────────────
@@ -3067,6 +3070,45 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
                                          mel.channels, mel.frames, mel.mel_bins, &audio_samples);
     audio_channels = mel.channels;
     audio_rate = im.vocoder_cfg.output_sampling_rate;
+  }
+
+  // ── DFR: cut the soundtrack to the picture (#986) ─────────────────────────
+  //
+  // `dfr_pipeline.py:552-560`, and upstream states the consequence rather than
+  // the mechanism: "Audio was generated for the padded canvas, so cut it to the
+  // video's duration or the muxed container outlasts the picture."
+  //
+  // THE AUDIO IS NOT COVERED BY THE VIDEO TRIM ABOVE, and a comment here claimed
+  // it was until this was checked. `ashape.frames` is derived from the PADDED
+  // `frames` inside the phase loop, `audio_lf` carries that padded count out of
+  // the loop, and the vocoder above runs over all of it. Trimming the video
+  // latent moves `frames` and touches none of that, so a 9-frame DFR request
+  // would emit 9 frames of picture beside 25 frames' worth of sound. Nothing in
+  // the render's shape, its frame count or its exit status can see it; it shows
+  // up only in the muxed container, which this library does not produce.
+  //
+  // `min` because the waveform may already be shorter — upstream takes the same
+  // min, and a cut that grew the buffer would read past its end.
+  if (is_dfr && audio_rate > 0 && audio_samples > 0) {
+    const double video_seconds = static_cast<double>(frames) / fps;
+    const int64_t want = std::min<int64_t>(
+        audio_samples, static_cast<int64_t>(std::llround(video_seconds *
+                                                         static_cast<double>(audio_rate))));
+    if (want > 0 && want != audio_samples) {
+      // The waveform is [channels, samples_per_channel] and the cut is per
+      // CHANNEL, which is upstream's `waveform[..., :audio_samples]`. A flat
+      // resize would keep channel 0 whole and truncate the last one to nothing,
+      // and the result is still a playable file.
+      std::vector<float> cut(static_cast<size_t>(audio_channels * want));
+      for (int64_t c = 0; c < audio_channels; ++c) {
+        const size_t src = static_cast<size_t>(c * audio_samples);
+        std::copy(waveform.begin() + static_cast<ptrdiff_t>(src),
+                  waveform.begin() + static_cast<ptrdiff_t>(src) + static_cast<ptrdiff_t>(want),
+                  cut.begin() + static_cast<ptrdiff_t>(c * want));
+      }
+      waveform.swap(cut);
+      audio_samples = want;
+    }
   }
 
   VideoResult result;

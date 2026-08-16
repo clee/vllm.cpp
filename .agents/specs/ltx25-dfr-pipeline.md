@@ -419,6 +419,38 @@ reader who removes either construct would otherwise have no way to tell.
 Both are mirrored anyway, to follow upstream's text rather than its algebra, and
 both now carry a gated invariant so the corrected claim cannot drift back.
 
+### 12.3a Two defects this row shipped and then found in itself
+
+Both were found after the first push, by re-deriving this row's own upstream
+anchors at the final tree rather than trusting the ones written during
+implementation. All 44 resolve into their cited spans, 0 stale — and twice the
+ANCHOR was right while the code was not.
+
+**The refusal order was reversed.** The DFR canvas was resolved before
+`Ltx2AssertResolution`, where upstream calls `assert_resolution` at
+`dfr_pipeline.py:291` and `resolve_canvas` at `:314`. A caller wrong on both the
+resolution and the frame count heard the wrong one of two correct refusals.
+Invisible to everything else, because on that input neither port renders. Gated
+by M14.
+
+**The soundtrack was not cut to the picture.** `dfr_pipeline.py:552-560` cuts the
+decoded audio to `num_frames / playback_fps`, and upstream states the consequence
+rather than the mechanism: *"Audio was generated for the padded canvas, so cut it
+to the video's duration or the muxed container outlasts the picture."* This row's
+video trim moves `frames`; `ashape.frames` was derived from the PADDED count
+inside the phase loop, `audio_lf` carries it out, and the vocoder runs over all
+of it. **A comment in this row asserted the cut was "already implied by the
+trimmed `frames`", and that was false.** A 9-frame DFR request emitted 0.375 s of
+picture beside 1.01 s of sound. Nothing about the render's shape, its frame count
+or its exit status could see it — it shows up only in a muxed container this
+library does not produce. Fixed, and gated by M15, whose RED prints both numbers.
+
+The second one is the more useful record. It is not that the port missed a line;
+it is that the port missed a line AND wrote a comment explaining why the line was
+unnecessary. A reader who checked upstream would have found `:552-560` accounted
+for and stopped. The gate that catches it reads the WAV header rather than
+trusting the engine's own report of what it wrote.
+
 ### 12.4 Mutations — every one with three facts
 
 Layout suite, `test_ltx2_dfr` (green: 11 cases / 652 assertions, `RUN_EXIT=0`).
@@ -459,6 +491,8 @@ Engine suite, `test_ltx2_video` (green: 52 cases / 1243 assertions, `RUN_EXIT=0`
 | M6 | the slot append passes `marked=false` | RED | 1 |
 | M9 | the slots are extracted AFTER the trim instead of before | RED | 1 |
 | M10 | the DFR trim is dropped | did NOT BUILD, 1 compile error — establishes nothing |
+| M14 | the canvas is resolved BEFORE `assert_resolution` (upstream's order reversed) | RED | 1 |
+| M15 | the DFR audio cut is disabled | RED, `picture 0.375s, sound 1.01s` | 1 |
 
 R1 and R2 are the reachability evidence `.agents/reachability.md` asks for: the
 production CALL SITE is deleted, not the implementation, and the focused gate
