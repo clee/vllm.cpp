@@ -1529,31 +1529,122 @@ TEST_CASE("ltx2 video: GENERATED keyframe slots are refused BY WHAT IS MISSING, 
     }
   };
 
-  SUBCASE("a positive count names the TOKEN-APPEND machinery and the READBACK") {
+  SUBCASE("a positive count names the READBACK, and rules the other reasons out") {
     const std::string msg = refusal("2", "gk2");
     INFO(msg);
     // The upstream symbols, so a later reader can go and check whether the
     // reason still holds rather than re-deriving it. This is the bar the
-    // LAST-frame refusal set and the one five refusals in this campaign failed.
+    // LAST-frame refusal set and the one six refusals in this campaign failed.
     CHECK(msg.find("VideoGeneratedKeyframeSlots") != std::string::npos);
     CHECK(msg.find("keyframe_slots.py") != std::string::npos);
-    // Blocker 1: the sequence grows and is trimmed back.
+    // The BLOCKER: the readback, which the SUPPLIED arm needs none of.
+    CHECK(msg.find("GeneratedKeyframeLayout") != std::string::npos);
+    CHECK(msg.find("generated_keyframes") != std::string::npos);
+    CHECK(msg.find("extract_generated_keyframes") != std::string::npos);
+    // The two RULED-OUT reasons, each of which a reader would otherwise reach
+    // for first. Both must be present and both must be marked as ruled out.
+    CHECK(msg.find("RULED OUT") != std::string::npos);
     CHECK(msg.find("update_attention_mask") != std::string::npos);
     CHECK(msg.find("clear_conditioning") != std::string::npos);
-    // Blocker 2: readback, which the SUPPLIED arm does not need. A message that
-    // named only blocker 1 would read as "same gap as the last-frame arm" and a
-    // reader who closed that one would find this arm still broken.
-    CHECK(msg.find("generated_keyframes") != std::string::npos);
-    // Named because it is shared, so whoever closes it closes both.
-    const bool names_the_shared_arm = msg.find("last-frame") != std::string::npos ||
+    CHECK(msg.find("#930") != std::string::npos);
+    const bool names_the_served_arm = msg.find("last-frame") != std::string::npos ||
                                       msg.find("LAST-frame") != std::string::npos;
-    CHECK(names_the_shared_arm);
+    CHECK(names_the_served_arm);
     // The refuted reason may be NAMED -- it is worth telling a reader the marker
     // was ruled out -- but never as the thing that is missing. Same guard the
     // LAST-frame case carries.
     if (msg.find("keyframes_abs_pos_embedding") != std::string::npos) {
       CHECK(msg.find("NOT* THE REASON") != std::string::npos);
       CHECK(msg.find("#658") != std::string::npos);
+    }
+  }
+  SUBCASE("its claims about THIS tree are re-derived from this tree") {
+    // THE ASSERTION THIS REPAIR EXISTS FOR, and it is a different assertion from
+    // every one above.
+    //
+    // The refusal this one replaces named the token-append machinery as its
+    // first blocker. That was true when it was written and FALSE by the time it
+    // reached review: `c7cb59fbb` (row LTX25-TOKEN-APPEND, #930) landed the
+    // append seam, served the LAST-frame arm through it, and turned the clear
+    // step from an identity into a real trim. Nothing went red. Every assertion
+    // in the case above is on an UPSTREAM symbol name -- `update_attention_mask`,
+    // `clear_conditioning` -- and no change to THIS tree can move one, so the
+    // suite could not see it. A reviewer's mutation confirmed the hole directly:
+    // replacing the local-cause sentence with a self-declared falsehood, leaving
+    // the upstream names alone, kept the suite GREEN at 18/18.
+    //
+    // So the message states its local claims in a form the gate can re-derive,
+    // and re-derives them from `ltx2_conditioning.h` -- a DIFFERENT file from the
+    // one the message lives in, which is what stops the check from being the
+    // tautology .agents/issue-index.md #911 records (reading a span out of the
+    // file it validates reports everything fresh).
+    //
+    // Comment lines are stripped before the scan. Without that the ABSENT half
+    // is answered by prose: this very header's comment at `Ltx2ExtendKeyframesMask`
+    // names upstream's `VideoGeneratedKeyframeSlots`, so an unstripped search for
+    // `GeneratedKeyframe` finds a hit and the check silently inverts.
+    const std::string msg = refusal("2", "gkclaims");
+    INFO(msg);
+    const std::vector<std::string> header_lines =
+        SplitLines(ReadSourceFile(LTX2_CONDITIONING_HEADER_PATH));
+    REQUIRE(header_lines.size() > 100);
+    std::string declarations;
+    for (const std::string& line : header_lines) {
+      const size_t first = line.find_first_not_of(" \t");
+      if (first != std::string::npos && line.compare(first, 2, "//") == 0) continue;
+      declarations += line;
+      declarations += '\n';
+    }
+    // The header must still be mostly declarations after stripping, or a
+    // reformat that turned it into one comment block would answer ABSENT for
+    // free. Positive control on the instrument itself.
+    REQUIRE_MESSAGE(declarations.find("struct Ltx2LatentState") != std::string::npos,
+                    "comment stripping removed the declarations it was meant to keep");
+
+    // The claimed names are read OUT OF THE MESSAGE, never listed here: a list
+    // here would be a second place the claim lives, and the two would drift.
+    auto names_after = [&](const std::string& marker) {
+      std::vector<std::string> out;
+      const size_t at = msg.find(marker);
+      REQUIRE_MESSAGE(at != std::string::npos,
+                      "the refusal no longer carries its '" << marker << "' clause");
+      const size_t start = at + marker.size();
+      const size_t stop = msg.find('.', start);
+      REQUIRE(stop != std::string::npos);
+      std::string list = msg.substr(start, stop - start);
+      size_t from = 0;
+      while (from <= list.size()) {
+        const size_t comma = list.find(',', from);
+        std::string name = list.substr(from, comma == std::string::npos ? std::string::npos
+                                                                        : comma - from);
+        const size_t b = name.find_first_not_of(" \t");
+        const size_t e = name.find_last_not_of(" \t");
+        if (b != std::string::npos) out.push_back(name.substr(b, e - b + 1));
+        if (comma == std::string::npos) break;
+        from = comma + 1;
+      }
+      return out;
+    };
+
+    const std::vector<std::string> declared = names_after("DECLARED HERE: ");
+    const std::vector<std::string> absent = names_after("ABSENT HERE: ");
+    // A count floor, because an empty list satisfies every "for each" below and
+    // reports a pass over nothing.
+    CHECK(declared.size() >= 3);
+    CHECK(absent.size() >= 2);
+    for (const std::string& name : declared) {
+      INFO("claimed DECLARED: " << name);
+      CHECK_MESSAGE(declarations.find(name) != std::string::npos,
+                    "the refusal claims ltx2_conditioning.h declares '"
+                        << name << "', and it does not. The message is stale about THIS tree");
+    }
+    for (const std::string& name : absent) {
+      INFO("claimed ABSENT: " << name);
+      CHECK_MESSAGE(declarations.find(name) == std::string::npos,
+                    "the refusal claims ltx2_conditioning.h has no '"
+                        << name
+                        << "', and it does. If the readback landed, this refusal is no longer "
+                           "true and must be rewritten or removed");
     }
   }
   SUBCASE("and it is NOT the generic unknown-extra message") {
