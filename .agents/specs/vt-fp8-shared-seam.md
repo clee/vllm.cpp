@@ -194,10 +194,54 @@ change hidden in a move that this row's gate cannot see. Filed separately.
   not on the production path and the byte-identity claim is vacuous. Do not
   land; re-wire until a mutation bites.
 
+## Evidence
+
+### CPU gate (this box)
+
+Clean Ninja configure + `cmake --build build -j 12` at `a0693813a`: exit 0, **0 warnings** under `-Werror`. `ctest -j 4`: **485/485 passed, 0 failed**, 828.96 s; 2 skipped (`test_modelopt_mixed_precision_checkpoint`, `test_voxtral_e2e`, both absent-fixture skips). Disk 91% before, 99% at peak, 91% after teardown.
+
+Pre-existing suites at `c7cb59fbb` -> `a0693813a`, identical: `test_qwen3_5_gdn_spec_routing` 6/52, `test_ops_fp8_cpu` 4/56, `test_qwen27_paged_forward` 29/765, `test_qwen27_dense_forward` 9/583, every one `Status: SUCCESS!`. `test_linear_method` 6/76 -> 8/88 (two new cases, additive).
+
+### Mutation table
+
+Host: `dgx.casa`, GB10 sm_121a, CUDA 13.0.88, image `vllmcpp-build:gb10`, `-j 4`, `$HOME/gpu.lock` held with `flock -n` for every run. Configure log printed `cutlass-fp8: ENABLED for [121a]`, `cutlass-nvfp4: ENABLED`, `fa2: ENABLED`, `CUTLASS found at /cutlass`, `Triton AOT: ... sm_121a` — so no arm is voided. Tree at `a0693813a`; the seam header was restored byte-for-byte after every arm (`diff -q` clean, and the final BASE re-run reproduced its first binary sha exactly).
+
+CPU arms are `test_linear_method` on this box; GPU arms are `test_qwen3_5_gdn_spec_routing`.
+
+| Arm | Perturbation | `compile_exit` | `error:` | binary sha16 | `[doctest] test cases:` | `[doctest] assertions:` | `Status:` / exit |
+|---|---|---|---|---|---|---|---|
+| **CONTROL** | none, and `qwen3_5.cpp` replaced by its `c7cb59fbb` (pre-extraction) content in the SAME tree, SAME flags | 0 | 0 | `8b740f86eeb7da5d` | `12 \| 11 passed \| 1 failed` | `123 \| 119 passed \| 4 failed` | `FAILURE!` / 1 |
+| **BASE** | none | 0 | 0 | `090bc6e47a478cb2` | `12 \| 11 passed \| 1 failed` | `123 \| 119 passed \| 4 failed` | `FAILURE!` / 1 |
+| M1 (CPU) | delete the CUDA guard in `MatmulFp8CutlassD` | 0 | 0 | `12f8bf1089529d52` | `8 \| 7 passed \| 1 failed` | `88 \| 87 passed \| 1 failed` | `FAILURE!` |
+| M2 (CPU) | delete the CUDA guard in `MatmulFp8CutlassPreQuantD` | 0 | 0 | `d2d80d9ba566756d` | `8 \| 7 passed \| 1 failed` | `88 \| 87 passed \| 1 failed` | `FAILURE!` |
+| M3 (GPU) | drop the `input_scale`: `QuantFp8Static(..., w.input_scale)` → `..., 1.0F` | 0 | 0 | `91cfeeb337fec5a3` | `12 \| 11 passed \| 1 failed` | `123 \| 107 passed \| 16 failed` | `FAILURE!` / 1 |
+| M4 (GPU) | change the alpha fold: `w.alpha` → `w.alpha * 2.0F` in `MatmulFp8CutlassD` | 0 | 0 | `6a7fb2f31de34576` | `12 \| 11 passed \| 1 failed` | `123 \| 107 passed \| 16 failed` | `FAILURE!` / 1 |
+| M5 (GPU) | same alpha fold in `MatmulFp8CutlassPreQuantD` | 0 | 0 | `ecebc93903e7d801` | `12 \| 11 passed \| 1 failed` | `123 \| 119 passed \| 4 failed` | **UNCHANGED vs BASE — negative result** |
+| M7 (GPU) | `VT_CHECK(false, ...)` as the first statement of `MatmulFp8CutlassPreQuantD` | 0 | 0 | `84fd9f9d2d7386f7` | `12 \| 9 passed \| 3 failed` | `103 \| 99 passed \| 4 failed` | `FAILURE!` / 1 |
+| M8 (GPU) | `VT_CHECK(false, ...)` as the first statement of `MatmulFp8CutlassD` | 0 | 0 | `dc8bcfc1e97fafac` | `12 \| 11 passed \| 1 failed` | `91 \| 91 passed \| 0 failed` | `FAILURE!` / 1 |
+
+**Reading it.**
+
+*The BASE red is inherited, not introduced.* `test_qwen3_5_gdn_spec_routing` reads 119/123 on GB10 at `main`, which is exactly what #907 already records for this box. The CONTROL row proves it in the same tree rather than by citation: pre-extraction `qwen3_5.cpp`, same build directory, same flags, distinct binary, and the result is identical down to the individual mismatch counts (`30504`, `48756`, `30504`, `48756`) and the same four `H=5120 / T=3` combinations. **That equality is the byte-identity evidence** — the extraction reproduces the production numerics including a pre-existing defect.
+
+*The seam is on the live Qwen3.5 path.* M3 and M4 each take the failures from 4 to **16** (every combination in the case), from a source change inside `dense_fp8_gemm.h`, with a clean compile and a distinct binary. The split arm of `ProjectGdnFp8QkvzForTest` (`qwen3_5.cpp:6693-6694`) calls the extracted `MatmulFp8CutlassD` while the merged arm does not, so perturbing the seam breaks their bitwise equality. A seam sitting dead beside the model cannot do that.
+
+*M5 is a negative result and is reported as one.* Doubling alpha in the pre-quantized arm changed nothing. M7 explains why rather than leaving it ambiguous: forcing that function to throw turns **two additional cases** red — `GDN gate POLARITY on the FP8 tail: GdnBlockPaged (CUDA)` and `... the MIXED spec batch (CUDA)`. So the arm IS reached; those cases compare a silu arm against a sigmoid arm that both run the same GEMM, so a common scale factor cancels out of the comparison. Reached but not observable through that assertion, which is a coverage gap in the existing suite, not evidence about this change.
+
+*M8 is also the reason to read cases and not just assertions.* It prints `assertions: 91 | 91 passed | 0 failed` — and `Status: FAILURE!` with exit 1, because the throw aborted the case before its `CHECK`s ran. An assertion-only reading of that line would have called a fully-blocked GEMM a pass.
+
+### The inherited red
+
+`test_qwen3_5_gdn_spec_routing` is 119/123 on GB10 at `main` and is already recorded as such by [#907](https://github.com/mudler/vllm.cpp/issues/907). It was NOT inherited on trust: the CONTROL arm above reproduces it from the pre-extraction `qwen3_5.cpp` in the same build tree, with the identical four failing combinations and the identical mismatch counts. Nothing here narrows or widens it.
+
+### Owed
+
+The pre-quantized arm is REACHED by two CUDA cases (M7) but no available assertion is SENSITIVE to its arithmetic (M5). A gate that compares the pre-quantized arm against the plain arm on the same activation — the equality the header's own comment claims — is owed. That is coverage the extraction did not create and did not close.
+
 ## Outcome
 
 Landed as a pure extraction. See §Evidence in the PR for the before/after
-assertion counts, the four-row mutation table, and the full-gate result.
+assertion counts, the four-row mutation table, and the full-gate result. The gate was met: Qwen3.5's CUDA result is identical to the pre-extraction control down to the individual mismatch counts, and two independent perturbations inside the extracted code move it, so the seam is on the production path rather than beside it.
 
 ## Now
 
