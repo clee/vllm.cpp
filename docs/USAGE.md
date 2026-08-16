@@ -870,8 +870,18 @@ and has to be stopped. The denoise itself is flat at either size. Unified memory
 makes those host bytes and this class of box reboots rather than OOM-killing, so
 start small and grow, and put a memory watchdog in front of anything larger. The
 recipe default (1024x1536 at 121 frames) is far beyond what one GB10 holds today.
-Expect minutes, not seconds: most of a 320x192/25f render is spent single-threaded
-in the host VAE decode at 0% GPU.
+Expect minutes, not seconds: most of a 320x192/25f render is spent in the host
+VAE decode at 0% GPU, because that decode has no device arm
+([#1007](https://github.com/mudler/vllm.cpp/issues/1007)).
+
+It is no longer *single-threaded*, which is what this paragraph used to say. The
+decode's convolutions now dispatch across `VLLM_CPP_CPU_THREADS` workers
+(default `hardware_concurrency`), bit-identical at every worker count —
+[#1009](https://github.com/mudler/vllm.cpp/issues/1009), measured at **9.14x on
+20 workers** against one. Read that as a decode figure and not a render one: the
+wall above was recorded on GB10 before the change and has not been re-measured,
+and the 9.14x was taken on a synthetic decode shape on a 20-core x86 host. Set
+`VLLM_CPP_CPU_THREADS` lower if the render has to share the box.
 
 *The render behind those numbers was NOT prompted, and it renders a scene without
 rendering YOUR scene.* It was the EMBEDS path — `--prompt-embeds` with
