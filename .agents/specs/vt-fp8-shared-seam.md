@@ -160,7 +160,7 @@ declared as such.
 | `test_ops_fp8_cpu` | 4 / 56 | 4 / 56 |
 | `test_qwen27_paged_forward` | 29 / 765 | 29 / 765 |
 | `test_qwen27_dense_forward` | 9 / 583 | 9 / 583 |
-| `test_linear_method` | 6 / 76 | 8 / 88 (+2 new cases) |
+| `test_linear_method` (CPU box; dgx adds 2 `VT_MARLIN_NVFP4` cases / 9 assertions) | 6 / 76 | 8 / 88 (+2 new cases) |
 
 Full CPU gate: clean configure + `cmake --build build -j 12` (0 warnings under
 `-Werror`) + `ctest -j 4`.
@@ -173,8 +173,8 @@ Mutation table (the "the seam is LIVE" proof) is recorded in §Evidence.
 `Alloc` + `Copy` the fp8 weight bytes to the device without calling
 `vllm::load_stats::AddDeviceUpload` and without the post-upload
 `AdoptDeviceBytesAsHost` step. Both are performed by every other resident-weight
-helper in the same file: `ResidentWeight` (`qwen3_5.cpp:1009,1016 @ c7cb59fbb`)
-and `ResidentNvfp4` (`:1106,1111,1116,1121`), and `dense_nvfp4_gemm.h:294-328`
+helper in the same file: `ResidentWeight` (`qwen3_5.cpp:1008,1015 @ c7cb59fbb`)
+and `ResidentNvfp4` (`:1105,1110,1115,1120`), and `dense_nvfp4_gemm.h:294-328`
 carries the comment explaining why the pair is mandatory ("this is the one
 host->device move of those bytes and it must be accounted and followed by the
 same post-upload residency step every other qualifying weight gets", ENG-LOAD
@@ -182,8 +182,14 @@ same post-upload residency step every other qualifying weight gets", ENG-LOAD
 
 Consequences, both plausible and neither measured here: the 35B fp8 tower's
 upload is missing from load accounting, and its device pages are never re-tagged,
-which is the shape of the GB10 weight-residency ATS penalty. Carried across
-UNCHANGED — repairing it inside an extraction would be exactly the behaviour
+which is the shape of the GB10 weight-residency ATS penalty. The first is
+BOUNDED, and #974 says so: `load_stats` has exactly one non-test consumer,
+`PrintLoadBytes` (`src/vllm/entrypoints/model_loader.cpp:133`), a stderr
+diagnostic line behind `LoadStatsEnabled()`. Nothing allocates, sizes or
+schedules on that counter, so the under-report costs the accuracy of a
+diagnostic, not a decision. The second consequence carries no such bound.
+
+Carried across UNCHANGED — repairing it inside an extraction would be exactly the behaviour
 change hidden in a move that this row's gate cannot see. Filed as
 [#974](https://github.com/mudler/vllm.cpp/issues/974).
 
@@ -196,11 +202,54 @@ change hidden in a move that this row's gate cannot see. Filed as
   §Found, not fixed.
 - **A gate sensitive to the pre-quantized arm's arithmetic.** M7 proves
   `MatmulFp8CutlassPreQuantD` is REACHED by two CUDA cases; M5 proves no
-  available assertion can SEE a change to its folded alpha, because those cases
-  compare a silu arm against a sigmoid arm that both run it, so a common scale
-  factor cancels. The missing gate is the equality the header's own comment
-  claims: pre-quantized arm vs plain arm on the same activation. Coverage this
-  extraction did not create and did not close.
+  available assertion can SEE a change to its folded alpha. The mechanism is
+  **scale invariance of each predicate, NOT cancellation between the two arms.**
+  Those cases compare nothing: each arm carries its own predicate, and both are
+  invariant under a rescale of the arm they watch —
+  `CHECK(silu_nonzero == 0)` (`tests/vllm/models/test_qwen3_5_gdn_spec_routing.cpp:895`)
+  holds under ANY non-zero scalar, and `CHECK(max_sigmoid > 0.0)` (`:904`) holds
+  under any POSITIVE one. `w.alpha * 2.0F` is positive and non-zero, so M5 could
+  not have moved either.
+
+  M9 is the disproof of the cancellation reading, because `w.alpha` → `0.0F` is
+  a factor COMMON to both arms — exactly what cancellation predicts would stay
+  green — and it turns those two cases RED, the only new failures being
+  `CHECK(max_sigmoid > 0.0)` at `:904` while `CHECK(silu_nonzero == 0)` at
+  `:895` stays green. Recorded as M9 in §Evidence.
+
+  So what is owed is a gate sensitive to **any positive rescale** of that arm,
+  not merely to a factor the two arms do not share. A per-projection
+  `weight_scale` error is exactly that case: positive, non-zero, and invisible to
+  both predicates above. The equality the header's own comment claims is the
+  shape of it — `MatmulFp8CutlassPreQuantD(QuantFp8Static(x, w.input_scale), w)`
+  against `MatmulFp8CutlassD(x, w)` on the same activation, which is sensitive to
+  every positive factor. Coverage this extraction did not create and did not
+  close.
+
+## Protocol deviation: this spec was not committed before the implementation
+
+AGENTS.md §"Spec before code": *"Commit the spec before implementation. Never
+write the spec after the implementation."* This file does not satisfy that. It
+was added in `a0693813a`, the SAME commit as the extraction, and the superseded
+attempt (PR #972) had the same shape. Commit order is what proves the spec came
+first when one pull request carries both, and here it proves the opposite.
+
+It is recorded rather than repaired because it cannot be repaired: `main` is
+never force-pushed and neither is a branch under review, so the history that
+shows one commit cannot be rewritten into two. Renaming it would be worse — a
+reviewer reading `git log` would see a spec commit that never existed.
+
+What the deviation cost, stated plainly so a reviewer can price it: the scope,
+the byte-identity gate and the two deliberate divergences below were argued
+AFTER the code existed, so none of them constrained the implementation the way a
+committed spec would have. What it did not cost: the mutation table in §Evidence
+was designed and run against the landed code by a session that did not write it,
+and the fresh review reproduced it independently, so the claims here are
+measured rather than asserted. That is evidence about the code, not an excuse
+for the ordering.
+
+This is visible debt, not success. A reviewer who does not accept the argument
+does not merge it.
 
 ## Stop conditions
 
@@ -214,13 +263,12 @@ change hidden in a move that this row's gate cannot see. Filed as
 
 ### CPU gate (this box)
 
-Run TWICE. A merge that brings in new source is a new binary, so the extraction's own green does not cover the post-merge tree.
+Run THREE times. A merge that brings in new source is a new binary, so the extraction's own green does not cover either post-merge tree.
 
 | At | build (`-j 12`, Ninja, clean configure) | `ctest -j 4` | time |
 |---|---|---|---|
 | `a0693813a` (extraction) | exit 0, 0 warnings under `-Werror` | 485/485 passed, 0 failed | 828.96 s |
 | `018c9d1cb` (post-merge, `origin/main` @ `e5351776c`) | exit 0, 0 warnings under `-Werror` | 485/485 passed, 0 failed | 682.90 s |
-
 | `66c1e805c` (post-merge, `origin/main` @ `c90e3fc02`) | exit 0, 0 warnings under `-Werror` | 487/488 passed, **1 failed** | 837.59 s |
 
 All three skip the same 2 absent-fixture tests (`test_modelopt_mixed_precision_checkpoint`, `test_voxtral_e2e`). The third run's 488 is 485 plus the 3 tests `origin/main` @ `c90e3fc02` brought in.
@@ -233,25 +281,31 @@ All three skip the same 2 absent-fixture tests (`test_modelopt_mixed_precision_c
 
 Disk 91% before, 99% at peak, 93% after; the build tree was removed afterwards.
 
-Pre-existing suites at `c7cb59fbb` -> `a0693813a`, identical: `test_qwen3_5_gdn_spec_routing` 6/52, `test_ops_fp8_cpu` 4/56, `test_qwen27_paged_forward` 29/765, `test_qwen27_dense_forward` 9/583, every one `Status: SUCCESS!`. `test_linear_method` 6/76 -> 8/88 (two new cases, additive).
+Pre-existing suites at `c7cb59fbb` -> `a0693813a`, identical: `test_qwen3_5_gdn_spec_routing` 6/52, `test_ops_fp8_cpu` 4/56, `test_qwen27_paged_forward` 29/765, `test_qwen27_dense_forward` 9/583, every one `Status: SUCCESS!`. `test_linear_method` 6/76 -> 8/88 (two new cases, additive) — the CPU-only box's shape; on dgx the same suite reads 10 / 97 because `VT_MARLIN_NVFP4` adds 2 cases and 9 assertions.
 
 ### Mutation table
 
-Host: `dgx.casa`, GB10 sm_121a, CUDA 13.0.88, image `vllmcpp-build:gb10`, `-j 4`, `$HOME/gpu.lock` held with `flock -n` for every run. Configure log printed `cutlass-fp8: ENABLED for [121a]`, `cutlass-nvfp4: ENABLED`, `fa2: ENABLED`, `CUTLASS found at /cutlass`, `Triton AOT: ... sm_121a` — so no arm is voided. Tree at `a0693813a`; the seam header was restored byte-for-byte after every arm (`diff -q` clean, and the final BASE re-run reproduced its first binary sha exactly).
+**Every arm below ran on `dgx.casa`**, GB10 sm_121a, CUDA 13.0.88, image `vllmcpp-build:gb10`, `-j 4`, `$HOME/gpu.lock` held with `flock -n` for every test run. Both configure logs printed `CUDA feature cutlass-fp8: ENABLED for [121a]`, `cutlass-nvfp4: ENABLED for [121a]`, `fa2: ENABLED for [121a]`, `CUTLASS found at /cutlass` and `Triton AOT: ... sm_121a` — so no arm is voided. The seam header was restored byte-for-byte after every arm and verified against a pristine `sha256`, and each series' BASE re-run reproduced its own first binary sha exactly.
 
-CPU arms are `test_linear_method` on this box; GPU arms are `test_qwen3_5_gdn_spec_routing`.
+CPU arms are `test_linear_method`; GPU arms are `test_qwen3_5_gdn_spec_routing`. **Each kind carries its own BASE control measured in the same tree**, because a mutation row on a box with pre-existing failures cannot be read without one.
 
-| Arm | Perturbation | `compile_exit` | `error:` | binary sha16 | `[doctest] test cases:` | `[doctest] assertions:` | `Status:` / exit |
-|---|---|---|---|---|---|---|---|
-| **CONTROL** | none, and `qwen3_5.cpp` replaced by its `c7cb59fbb` (pre-extraction) content in the SAME tree, SAME flags | 0 | 0 | `8b740f86eeb7da5d` | `12 \| 11 passed \| 1 failed` | `123 \| 119 passed \| 4 failed` | `FAILURE!` / 1 |
-| **BASE** | none | 0 | 0 | `090bc6e47a478cb2` | `12 \| 11 passed \| 1 failed` | `123 \| 119 passed \| 4 failed` | `FAILURE!` / 1 |
-| M1 (CPU) | delete the CUDA guard in `MatmulFp8CutlassD` | 0 | 0 | `12f8bf1089529d52` | `8 \| 7 passed \| 1 failed` | `88 \| 87 passed \| 1 failed` | `FAILURE!` |
-| M2 (CPU) | delete the CUDA guard in `MatmulFp8CutlassPreQuantD` | 0 | 0 | `d2d80d9ba566756d` | `8 \| 7 passed \| 1 failed` | `88 \| 87 passed \| 1 failed` | `FAILURE!` |
-| M3 (GPU) | drop the `input_scale`: `QuantFp8Static(..., w.input_scale)` → `..., 1.0F` | 0 | 0 | `91cfeeb337fec5a3` | `12 \| 11 passed \| 1 failed` | `123 \| 107 passed \| 16 failed` | `FAILURE!` / 1 |
-| M4 (GPU) | change the alpha fold: `w.alpha` → `w.alpha * 2.0F` in `MatmulFp8CutlassD` | 0 | 0 | `6a7fb2f31de34576` | `12 \| 11 passed \| 1 failed` | `123 \| 107 passed \| 16 failed` | `FAILURE!` / 1 |
-| M5 (GPU) | same alpha fold in `MatmulFp8CutlassPreQuantD` | 0 | 0 | `ecebc93903e7d801` | `12 \| 11 passed \| 1 failed` | `123 \| 119 passed \| 4 failed` | **UNCHANGED vs BASE — negative result** |
-| M7 (GPU) | `VT_CHECK(false, ...)` as the first statement of `MatmulFp8CutlassPreQuantD` | 0 | 0 | `84fd9f9d2d7386f7` | `12 \| 9 passed \| 3 failed` | `103 \| 99 passed \| 4 failed` | `FAILURE!` / 1 |
-| M8 (GPU) | `VT_CHECK(false, ...)` as the first statement of `MatmulFp8CutlassD` | 0 | 0 | `dc8bcfc1e97fafac` | `12 \| 11 passed \| 1 failed` | `91 \| 91 passed \| 0 failed` | `FAILURE!` / 1 |
+Two trees, stated per row. **T1 = `a0693813a`** (the extraction) carries CONTROL, BASE, M3, M4, M5, M7, M8. **T2 = `32980afda`** (this branch's reviewed head, transferred with `git archive`, clean configure + full build, `build rc=0`, 0 `error:`, 0 `warning:`) carries GDN_BASE, LM_BASE, M1, M2 and M9. Binary shas are comparable WITHIN a tree, never across the two.
+
+| Arm | Tree | Perturbation | `compile_exit` | `error:` | binary sha16 | `[doctest] test cases:` | `[doctest] assertions:` | `Status:` / exit |
+|---|---|---|---|---|---|---|---|---|
+| **CONTROL** (GPU) | T1 | none, and `qwen3_5.cpp` replaced by its `c7cb59fbb` (pre-extraction) content in the SAME tree, SAME flags | 0 | 0 | `8b740f86eeb7da5d` | `12 \| 11 passed \| 1 failed` | `123 \| 119 passed \| 4 failed` | `FAILURE!` / 1 |
+| **BASE** (GPU) | T1 | none | 0 | 0 | `090bc6e47a478cb2` | `12 \| 11 passed \| 1 failed` | `123 \| 119 passed \| 4 failed` | `FAILURE!` / 1 |
+| M3 (GPU) | T1 | drop the `input_scale`: `QuantFp8Static(..., w.input_scale)` → `..., 1.0F` | 0 | 0 | `91cfeeb337fec5a3` | `12 \| 11 passed \| 1 failed` | `123 \| 107 passed \| 16 failed` | `FAILURE!` / 1 |
+| M4 (GPU) | T1 | change the alpha fold: `w.alpha` → `w.alpha * 2.0F` in `MatmulFp8CutlassD` | 0 | 0 | `6a7fb2f31de34576` | `12 \| 11 passed \| 1 failed` | `123 \| 107 passed \| 16 failed` | `FAILURE!` / 1 |
+| M5 (GPU) | T1 | same alpha fold in `MatmulFp8CutlassPreQuantD` | 0 | 0 | `ecebc93903e7d801` | `12 \| 11 passed \| 1 failed` | `123 \| 119 passed \| 4 failed` | **UNCHANGED vs BASE — negative result** |
+| M7 (GPU) | T1 | `VT_CHECK(false, ...)` as the first statement of `MatmulFp8CutlassPreQuantD` | 0 | 0 | `84fd9f9d2d7386f7` | `12 \| 9 passed \| 3 failed` | `103 \| 99 passed \| 4 failed` | `FAILURE!` / 1 |
+| M8 (GPU) | T1 | `VT_CHECK(false, ...)` as the first statement of `MatmulFp8CutlassD` | 0 | 0 | `dc8bcfc1e97fafac` | `12 \| 11 passed \| 1 failed` | `91 \| 91 passed \| 0 failed` | `FAILURE!` / 1 |
+| **GDN_BASE** (GPU) | T2 | none | 0 | 0 | `47a9960ac92d4b66` | `12 \| 11 passed \| 1 failed` | `123 \| 119 passed \| 4 failed` | `FAILURE!` / 1 |
+| **LM_BASE** (CPU) | T2 | none | 0 | 0 | `f8f5b2d3a0116980` | `10 \| 9 passed \| 1 failed` | `97 \| 95 passed \| 2 failed` | `FAILURE!` / 1 |
+| M1 (CPU) | T2 | delete the CUDA guard in `MatmulFp8CutlassD` | 0 | 0 | `2a3a1a8e5df413fd` | `10 \| 8 passed \| 2 failed` | `97 \| 94 passed \| 3 failed` | `FAILURE!` / 1 |
+| M2 (CPU) | T2 | delete the CUDA guard in `MatmulFp8CutlassPreQuantD` | 0 | 0 | `15d702dd127b1c35` | `10 \| 8 passed \| 2 failed` | `97 \| 94 passed \| 3 failed` | `FAILURE!` / 1 |
+| M9 (GPU) | T2 | zero the alpha fold: `w.alpha` → `0.0F` in `MatmulFp8CutlassPreQuantD` (both GEMM arms; anchor count asserted `== 2`) | 0 | 0 | `6c9335e8b6a53228` | `12 \| 9 passed \| 3 failed` | `123 \| 115 passed \| 8 failed` | `FAILURE!` / 1 |
+| **GDN_BASE re-run** (GPU) | T2 | none, after every T2 mutation was reverted | 0 | 0 | `47a9960ac92d4b66` (identical to GDN_BASE) | `12 \| 11 passed \| 1 failed` | `123 \| 119 passed \| 4 failed` | `FAILURE!` / 1 |
 
 **Reading it.**
 
@@ -259,9 +313,17 @@ CPU arms are `test_linear_method` on this box; GPU arms are `test_qwen3_5_gdn_sp
 
 *The seam is on the live Qwen3.5 path.* M3 and M4 each take the failures from 4 to **16** (every combination in the case), from a source change inside `dense_fp8_gemm.h`, with a clean compile and a distinct binary. The split arm of `ProjectGdnFp8QkvzForTest` (`qwen3_5.cpp:6693-6694`) calls the extracted `MatmulFp8CutlassD` while the merged arm does not, so perturbing the seam breaks their bitwise equality. A seam sitting dead beside the model cannot do that.
 
-*M5 is a negative result and is reported as one.* Doubling alpha in the pre-quantized arm changed nothing. M7 explains why rather than leaving it ambiguous: forcing that function to throw turns **two additional cases** red — `GDN gate POLARITY on the FP8 tail: GdnBlockPaged (CUDA)` and `... the MIXED spec batch (CUDA)`. So the arm IS reached; those cases compare a silu arm against a sigmoid arm that both run the same GEMM, so a common scale factor cancels out of the comparison. Reached but not observable through that assertion, which is a coverage gap in the existing suite, not evidence about this change.
+*M5 is a negative result and is reported as one.* Doubling alpha in the pre-quantized arm changed nothing. M7 shows the arm is nevertheless REACHED: forcing that function to throw turns **two additional cases** red — `GDN gate POLARITY on the FP8 tail: GdnBlockPaged (CUDA)` and `... the MIXED spec batch (CUDA)`.
+
+*M9 is why nothing SAW the doubling, and it corrects the first reading of M5.* The mechanism is **scale invariance of each predicate, not cancellation between the two arms** — those two cases compare their arms against nothing at all. Each arm has its own predicate: `CHECK(silu_nonzero == 0)` (`tests/vllm/models/test_qwen3_5_gdn_spec_routing.cpp:895`), invariant under ANY non-zero rescale, and `CHECK(max_sigmoid > 0.0)` (`:904`), invariant under any POSITIVE one. `w.alpha * 2.0F` is positive and non-zero, so M5 could not have moved either.
+
+M9 sets that same alpha to `0.0F` — a factor COMMON to both arms, which the cancellation reading predicts would stay green — and it turns those two cases RED. The failure detail is what settles it: the four NEW assertion failures are all `:904 CHECK( max_sigmoid > 0.0 )` with `values: CHECK( 0 > 0 )` and `max_sigmoid := 0` (two dims each in both fp8 polarity cases), while `CHECK(silu_nonzero == 0)` at `:895` stays green with `silu_nonzero := 0`. The pre-existing four at `:525` (`30504`, `48756`, `30504`, `48756`) are untouched, which is how `123 | 119 passed | 4 failed` becomes `123 | 115 passed | 8 failed`. What the suite therefore owes is a gate sensitive to any POSITIVE rescale of that arm — see §Owed.
 
 *M8 is also the reason to read cases and not just assertions.* It prints `assertions: 91 | 91 passed | 0 failed` — and `Status: FAILURE!` with exit 1, because the throw aborted the case before its `CHECK`s ran. An assertion-only reading of that line would have called a fully-blocked GEMM a pass.
+
+*M1 and M2, corrected.* As first recorded these two rows were attributed to `dgx.casa` and read `8 | 7 passed | 1 failed` / `88 | 87 passed | 1 failed`. That is the CPU-ONLY box's shape, not this host's: `test_linear_method` puts 2 cases and 9 assertions behind `VT_MARLIN_NVFP4` (`tests/vllm/model_executor/layers/test_linear_method.cpp:105-272`), so a CUDA build here reads 10 cases / 97 assertions, and the 2 pre-existing failures sit inside one of those Marlin cases — `linear_method: MXFP4 fused gate_up ~= split`, both at `:247 CHECK( after == before + 1 )` with `values: CHECK( 0 == 1 )`. Those two are #907's `test_linear_method 83 of 85` plus this row's 12 additive assertions, all passing (85 + 12 = 97, 83 + 12 = 95). The rows above are RE-RUNS on `dgx.casa` against the `LM_BASE` control measured in the same tree, and the conclusion is unchanged: each guard deletion turns exactly ONE further case red, `linear_method: the fp8 w8a8 method reaches the shared seam in both arms`, at the `CHECK_THROWS_WITH_AS` that pins that guard's message (`:540` for M1, `:550` for M2) — the deleted guard lets the call reach `vt::MatmulFp8CublasLt`, which throws a different message.
+
+*M6 is unused, and no arm is missing.* The labels run M1-M5 and M7-M9. Nothing was measured under an M6 label and nothing was withheld: the number was skipped when the GPU arms were planned, and the gap went unexplained until this round. It stays unused rather than renumbered, because `73d67f9d2` and this row's fresh review both cite M7 and M8 by those labels, and renumbering would silently break every citation. M9 continues the sequence.
 
 ### The inherited red
 
@@ -269,8 +331,34 @@ CPU arms are `test_linear_method` on this box; GPU arms are `test_qwen3_5_gdn_sp
 
 ## Outcome
 
-Landed as a pure extraction. See §Evidence in the PR for the before/after
-assertion counts, the four-row mutation table, and the full-gate result. The gate was met: Qwen3.5's CUDA result is identical to the pre-extraction control down to the individual mismatch counts, and two independent perturbations inside the extracted code move it, so the seam is on the production path rather than beside it.
+Landed as a pure extraction. **§Evidence above** carries the before/after
+assertion counts, the mutation table — thirteen rows: the pre-extraction
+CONTROL, three BASE baselines, one restoration re-run, and eight mutation arms
+M1-M5 and M7-M9 — and the full-gate result; `73d67f9d2` moved
+that evidence out of the PR body and into this file, so this section points here
+and not there.
+
+**Measured.** The gate was met: Qwen3.5's CUDA result is identical to the
+pre-extraction CONTROL down to the individual mismatch counts, and two
+independent perturbations inside the extracted code (M3, M4) move it, so the
+seam is on the production path rather than beside it. M7 and M8 show both entry
+points are reached; M1, M2 and M9 show three further guarantees are gated.
+
+**Rejected.** A non-template header, because `qwen3_5.cpp`'s
+anonymous-namespace `Dev`/`DBuf` are distinct types from the shared ones, so a
+non-template seam could only have been COPIED into the production TU — the dead
+seam beside the path that #940 exists to prevent. Also rejected:
+`quantization/schemes/fp8.h`, a directory that mirrors nothing upstream, and
+repairing the #974 accounting gap in-flow, because a byte-identity gate is blind
+to exactly that class of change.
+
+**Defaults.** None were introduced. `VT_DENSE_CUBLASLT_FP8` keeps its spelling
+and its ON default, and the CUDA-only refusal keyed on `kMatmulFp8CublasLt`
+keeps its condition; both travelled with the code they belong to. The one
+textual change in the moved bodies is `MakeTensor` → `dense_attn::MakeTensor`.
+
+**Owed and open**: #974, the gate sensitive to any positive rescale of the
+pre-quantized arm (§Owed), and the protocol deviation recorded above.
 
 ## Now
 
