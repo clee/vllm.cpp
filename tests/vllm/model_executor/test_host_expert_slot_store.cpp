@@ -1,3 +1,6 @@
+#include <cstdlib>
+#include <fcntl.h>
+#include <unistd.h>
 // ENG-EXPERT-STREAM W4: the host slot store, and the raw-span Ensure the decode
 // path uses. RED-first: both are new surfaces with no coverage.
 #define DOCTEST_CONFIG_IMPLEMENT
@@ -119,4 +122,50 @@ int main(int argc, char** argv) {
   doctest::Context c;
   c.applyCommandLine(argc, argv);
   return c.run();
+}
+
+TEST_CASE("EnsureFile preads the slice STRAIGHT into the slot") {
+  // The whole point of this overload: the bytes come from the file descriptor,
+  // never through a mapping, so no page of the source is faulted on the way.
+  char path[] = "/tmp/vllm_iq1_pread_XXXXXX";
+  const int fd = ::mkstemp(path);
+  REQUIRE(fd >= 0);
+  std::vector<uint8_t> file(256);
+  for (size_t i = 0; i < file.size(); ++i) file[i] = static_cast<uint8_t>(i);
+  REQUIRE(::write(fd, file.data(), file.size()) ==
+          static_cast<ssize_t>(file.size()));
+
+  ExpertSlotCache cache(2);
+  HostExpertSlotStore store(2, 64);
+  ExpertStreamer st(cache, store);
+
+  // Read the third 64-byte slice, so a wrong offset is visible in the bytes
+  // rather than only in a length.
+  const ExpertStreamer::Result r = st.EnsureFile(ExpertKey{0, 3}, fd, 128, 64);
+  REQUIRE(r.slot >= 0);
+  CHECK(r.filled);
+  CHECK_FALSE(r.hit);
+  CHECK(st.bytes_filled() == 64);
+  for (int i = 0; i < 64; ++i)
+    REQUIRE(store.Slot(r.slot)[i] == static_cast<uint8_t>(128 + i));
+
+  // A hit costs no syscall and moves no bytes.
+  const ExpertStreamer::Result hit = st.EnsureFile(ExpertKey{0, 3}, fd, 128, 64);
+  CHECK(hit.hit);
+  CHECK(st.bytes_filled() == 64);
+  CHECK(st.fills() == 1);
+
+  // A read that runs past EOF is a SHORT read and must throw: a partially
+  // filled slot decodes to garbage silently, which is the failure this whole
+  // row is built to avoid.
+  CHECK_THROWS_AS(st.EnsureFile(ExpertKey{0, 4}, fd, 224, 64),
+                  std::runtime_error);
+  CHECK_THROWS_AS(st.EnsureFile(ExpertKey{0, 5}, -1, 0, 64),
+                  std::invalid_argument);
+  // Size is still checked BEFORE the cache is touched.
+  CHECK_THROWS_AS(st.EnsureFile(ExpertKey{0, 6}, fd, 0, 65),
+                  std::invalid_argument);
+
+  ::close(fd);
+  ::unlink(path);
 }

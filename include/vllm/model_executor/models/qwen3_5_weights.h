@@ -93,6 +93,16 @@ struct OwnedTensor {
   // tied-expansion borrow must not be (see AdoptDeviceBytesAsHost).
   mutable const void* mmap_src = nullptr;
   mutable size_t mmap_src_bytes = 0;
+  // Where those borrowed bytes physically live, for a consumer that wants to
+  // READ them rather than fault them in: the owning shard's descriptor and the
+  // byte offset of this weight within that shard. Set only on the mmap-borrow
+  // path; -1 means "no descriptor, read through the mapping".
+  //
+  // Expert streaming is the consumer. Filling a slot by memcpy from the mapping
+  // traps every 4 KiB page on the way, which is the whole reason W4 moved no
+  // faster than the mmap path it replaced; a pread lands the slice in one call.
+  mutable int mmap_fd = -1;
+  mutable size_t mmap_file_offset = 0;
 
   bool Empty() const { return bytes.empty() && !host_released; }
   bool HasHostBytes() const { return !bytes.empty(); }
