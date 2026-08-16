@@ -61,23 +61,40 @@ ExpertStreamer::Result ExpertStreamer::EnsureFile(const ExpertKey& key, int fd,
   // pread in a loop: a short read is legal and must be finished, not accepted.
   // The destination is the slot itself, so the bytes never pass through a
   // staging buffer or the page tables of the mapping.
+  //
+  // THE ACQUISITION IS UNDONE IF THE READ THROWS, and that is the whole reason
+  // this loop sits inside a try. Acquire must run first, because the read needs
+  // a destination, so at this point the cache already says the key is resident.
+  // A throw from here would unwind past that claim and leave the entry standing
+  // over a slot holding `done` correct bytes and `bytes - done` bytes of the
+  // expert that used to live there. Nothing reads the exception as data: the
+  // next acquisition of the same key is an ordinary HIT, no read is issued
+  // because a hit moves no bytes, and the GEMM multiplies half of one expert
+  // spliced onto half of another. That is silent, plausible, and wrong, which is
+  // the exact failure this row exists to prevent. Undoing the acquisition turns
+  // it into a retryable miss instead.
   uint8_t* dst = store_.SlotForWrite(acq.slot);
   size_t done = 0;
-  while (done < bytes) {
-    const ssize_t n = ::pread(fd, dst + done, bytes - done,
-                              static_cast<off_t>(file_offset + done));
-    if (n < 0) {
-      if (errno == EINTR) continue;
-      throw std::runtime_error("expert streamer: pread failed with errno " +
-                               std::to_string(errno));
+  try {
+    while (done < bytes) {
+      const ssize_t n = ::pread(fd, dst + done, bytes - done,
+                                static_cast<off_t>(file_offset + done));
+      if (n < 0) {
+        if (errno == EINTR) continue;
+        throw std::runtime_error("expert streamer: pread failed with errno " +
+                                 std::to_string(errno));
+      }
+      if (n == 0) {
+        throw std::runtime_error(
+            "expert streamer: short read, " + std::to_string(done) + " of " +
+            std::to_string(bytes) + " bytes at offset " +
+            std::to_string(file_offset));
+      }
+      done += static_cast<size_t>(n);
     }
-    if (n == 0) {
-      throw std::runtime_error(
-          "expert streamer: short read, " + std::to_string(done) + " of " +
-          std::to_string(bytes) + " bytes at offset " +
-          std::to_string(file_offset));
-    }
-    done += static_cast<size_t>(n);
+  } catch (...) {
+    cache_.Invalidate(key);
+    throw;
   }
 
   bytes_filled_ += static_cast<int64_t>(bytes);

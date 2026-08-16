@@ -49,6 +49,13 @@ void OwnedTensor::ReleaseHost() const {
     self.bytes.Reset();
     self.mmap_src = nullptr;  // nothing borrows the mapping through this tensor now
     self.mmap_src_bytes = 0;
+    // The FILE descriptor goes with the mapping. It describes where these host
+    // bytes came from, and there are no host bytes now. Left set, it outlives
+    // its own subject: `bytes.data()` is null, so an expert-stream slice would
+    // pread the recorded offset (which belongs to a tensor nothing is reading
+    // any more) and would key every released tower on TowerId(nullptr) == 0.
+    self.mmap_fd = -1;
+    self.mmap_file_offset = 0;
     self.host_released = true;
     return;
   }
@@ -148,6 +155,11 @@ void AdoptDeviceBytesAsHost(vt::Backend& backend, const OwnedTensor& w) {
                                     nb, std::move(keep));
     self.mmap_src = nullptr;
     self.mmap_src_bytes = 0;
+    // `bytes` now points at DEVICE memory, so the file offset no longer
+    // describes it. See the note in ReleaseHost: a descriptor that outlives its
+    // mapping reads as a valid source and is not one.
+    self.mmap_fd = -1;
+    self.mmap_file_offset = 0;
     return;
   }
   if (!backend.DeviceMemoryIsHostAddressable()) return;
