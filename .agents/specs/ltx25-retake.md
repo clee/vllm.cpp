@@ -265,12 +265,33 @@ zeroing the mask outside the window is therefore the whole of the mechanism.
 
 ### 3.3 The clip reader
 
-`ReadReferenceClipChw` (`src/vllm/multimodal/minimax_h3_video.cpp:135`) already
-walks `frame_%06d.ppm` and returns `[C, T, H, W]` in `[-1, 1]`. It sits in that
-file's anonymous namespace. Rather than write a second walker by hand — which
-`AGENTS.md` `## Shared seams` forbids — this row lifts the frame-directory walk
-into a shared surface and has both engines call it, with the H3 behaviour proven
-unchanged by that engine's own suite.
+**This section changed during implementation, and the change is recorded rather
+than quietly made.** It first said: lift `ReadReferenceClipChw`
+(`src/vllm/multimodal/minimax_h3_video.cpp:135`) out of MiniMax-H3's anonymous
+namespace into a shared surface, because writing a second walker by hand is what
+`AGENTS.md` `## Shared seams` forbids.
+
+Reading both sides made that the wrong shared seam. H3's walker returns raw
+`[-1, 1]` pixels at whatever size the files are; upstream's video ingestion runs
+each frame through `video_preprocess` -> `resize_and_center_crop` to the target
+height and width (`utils/helpers.py:228`, and `:202` says the EXR arm's
+centre-crop is chosen to match it). This tree already has that chain, on the LTX
+side, as `Ltx2LoadImageAndPreprocess` (`ltx2_image_preprocess.h:87`): decode ->
+CRF -> f32 -> resize-and-centre-crop -> `/127.5 - 1`, returning exactly the
+`[3, H, W]` layout `Ltx2ConvVideoEncode` takes. So the LTX seam to reuse is that
+one, and `Ltx2ReadFrameDirectory` composes it per frame and transposes
+frame-major to channel-major.
+
+Lifting H3's walker would have shared the *file loop*, which is six lines, and
+NOT shared the preprocessing, which is the part with an upstream anchor and the
+part that fails silently. It would also have touched a second engine's
+translation unit for no behavioural gain. The duplication that remains is a
+`frame_%06d.ppm` probe-until-missing loop in two files, and it is named here so
+the next reader can see it was weighed rather than missed.
+
+`crf` is 0 and is not a parameter: `crf` is a knob on an *image* conditioning
+input (`ImageConditioningInput.crf`, `blocks.py:977-983`) and upstream's video
+ingestion path never applies one.
 
 ### 3.4 Where the request enters
 
@@ -396,6 +417,76 @@ Reported with `CONFIGURE_EXIT`, `BUILD_EXIT`, the `: error:` count, `ctest -N`,
 
 ---
 
+## 8. What the mutation pass actually found
+
+Focused gate on the unmutated merged tree: `test_ltx2_video --test-case=*retake*`
+5 cases / 188 assertions, exit 0; `test_ltx2_retake` 4 cases / 69 assertions,
+exit 0. Each mutation was applied to one file, built, run, then restored, and the
+restore verified by `sha256sum` of both product files rather than assumed. Exit
+codes were captured directly, never through a pipe. Filters are comma-free, and
+the case count is printed beside every exit code, so a filter that matched
+nothing cannot read as a pass.
+
+| # | mutation | `git diff --stat` | BUILT | exit (video / retake) | verdict |
+|---|---|---|---|---|---|
+| M1 | delete the production call site `video.mask = Ltx2TemporalRegionMaskVideo(...)` | `ltx2_video.cpp \| 2 --` | YES, `compile_err=0` | 1 / 0 | DETECTED |
+| M2 | never seed `video_initial` with the encoded source clip | `ltx2_video.cpp \| 2 +-` | YES, `compile_err=0` | **0 / 0**, then 1 / 0 | **SURVIVED**, then DETECTED |
+| M3 | take `get_pixel_coords`' own `causal_fix=false` at the call site | `ltx2_video.cpp \| 2 +-` | YES, `compile_err=0` | **0 / 0**, then 1 / 0 | **SURVIVED**, then DETECTED |
+| M4 | leave the frozen video stream at the schedule's scalar sigma | `ltx2_video.cpp \| 2 +-` | YES, `compile_err=0` | 1 / 0 | DETECTED |
+| M5 | conform truncates only, never pads | `ltx2_retake.cpp \| 1 +` | YES, `compile_err=0` | 0 / 1 | DETECTED |
+| M6 | containment instead of overlap | `ltx2_retake.cpp \| 2 +-` | YES, `compile_err=0` | 1 / 1 | DETECTED |
+| M7 | ignore `initial_audio_latent is not None` in the audio predicates | `ltx2_retake.cpp \| 4 ++--` | **NO, `compile_err=1`**, then YES `compile_err=0` | — , then 0 / 1 | **NOT ESTABLISHED**, then DETECTED |
+| M8 | drop the `!wants_retake` guard on the reference refusal | `ltx2_video.cpp \| 2 +-` | YES, `compile_err=0` | 1 / 0 | DETECTED |
+| M9 | the `8k+1` refusal rounds the snapped value UP | `ltx2_retake.cpp \| 2 +-` | YES, `compile_err=0` | 1 / 1 | DETECTED |
+| M10 | conform pads the whole buffer once instead of per channel | `ltx2_retake.cpp \| 4 ++++` | YES, `compile_err=0` | 0 / 1 | DETECTED |
+
+**M2 and M3 survived on the first run, and that is the useful part of this
+section.** Both were claims made in a comment and observed by nothing.
+
+M2 is the sharper of the two. The suite recorded `retake_latent_absmax`, which
+observes the ENCODE, and inferred from it that the latent reached the phase. It
+does not follow: a build that reads the clip, encodes it, records the digest and
+then starts the stream from zeros passes every other assertion and renders a clip
+of the right length with the right mask. The repair renders two DIFFERENT sources
+at the same seed and the same window and requires the pixels to differ.
+
+M3 is narrower and is the one a reader would predict was already covered. The
+unit case for `causal_fix` polarity existed and was already red under the flip —
+but it calls the function directly, so it says nothing about the argument the
+PRODUCTION call site passes. The end-to-end case used the window [0.05, 0.10),
+which selects the same single latent frame under both polarities, so it could not
+see the flip. A second window, [0.30, 0.40), separates them: one latent frame
+with the causal rewrite, both without it.
+
+M7 failed to build, because dropping `has_audio_latent` leaves a parameter unused
+under `-Werror`. That is recorded as NOT ESTABLISHED rather than counted as a
+pass, and re-run with the parameter still referenced.
+
+### Reachability
+
+[`reachability.md`](../reachability.md) asks two questions and they are answered
+separately.
+
+**Does a production entry point reach this?** `vllm_video_generate`
+(`include/vllm.h:969`) -> `src/capi/vllm_c.cpp` -> `Ltx2VideoEngine::Generate`
+(`src/vllm/multimodal/ltx2_video.cpp`), where the retake knobs are parsed, the
+clip is read through `Ltx2ReadFrameDirectory`, encoded, conformed, and the mask
+assigned into `video.mask` inside the phase loop. The clip rides
+`vllm_video_params::ref_video` (`include/vllm.h:912`), an ABI field that already
+existed and that this engine previously only tested for emptiness. `ltx2-gen`
+reaches the same path on its default configuration through `--pipeline-kind
+retake`, `--ref-video` and the three window flags, added here. `/v1/videos`
+forwards no engine extras today (#928), so the CLI and the C ABI are what this
+row claims and the HTTP surface is not.
+
+**Does a test enter through it?** Yes — the five `test_ltx2_video` cases start at
+`LoadVideoEngine` and `Generate`, not at `Ltx2TemporalRegionMaskVideo`. M1 is the
+reachability mutation: deleting the production call site turns that suite RED
+(exit 1) while `test_ltx2_retake` stays green (exit 0), which is exactly the
+split the guide predicts and the reason the unit suite is not the proof.
+
+---
+
 ## Owed
 
 - **A container demuxer.** Without it the audio half of retake cannot exist:
@@ -412,5 +503,9 @@ Reported with `CONFIGURE_EXIT`, `BUILD_EXIT`, the `: error:` count, `ctest -N`,
 
 ## Now
 
-`SPIKE` -> `ACTIVE`. The row is claimed, the spec is committed before any
-implementation, and the pull request carries both.
+The arm is implemented, gated and reachable, on one pull request that carries the
+spec first. The campaign row `ROAD-V1-LTX25` does NOT change lifecycle state
+here and is not edited: it stays `SPIKE` because the render on real weights it is
+waiting for is still owed, and this row adds one more capability to the same
+spike rather than completing it. `docs/STATUS.md` therefore has nothing to
+record, which is why this change does not touch it.
