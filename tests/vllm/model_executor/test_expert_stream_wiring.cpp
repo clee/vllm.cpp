@@ -77,7 +77,11 @@ struct EnableExpertStreaming {
     // `exhausted` nonzero for an honest reason and mask the defect under test.
     ::setenv("VT_MOE_EXPERT_STREAM_SLOTS", "64", 1);
     ::setenv("VT_MOE_EXPERT_STREAM_SLOT_BYTES", "8192", 1);
-    ::setenv("VT_MOE_EXPERT_STREAM_STATS_EVERY", "0", 1);  // quiet under ctest
+    // Quiet under ctest, but overwrite=0 so an operator who sets this var
+    // still gets the line -- which is the only way to SEE the statistics
+    // this row added, and a gate that suppresses its own evidence is a
+    // smaller version of the defect it was written for.
+    ::setenv("VT_MOE_EXPERT_STREAM_STATS_EVERY", "0", 0);  // quiet under ctest
     // The grouped keep-quant path stages the whole tower and cannot stream; the
     // production code already disables it when streaming is requested. Being
     // explicit here keeps the test honest about which path it is measuring.

@@ -54,7 +54,11 @@ struct EnableExpertStreaming {
     // DELIBERATELY NOT SET: VT_MOE_EXPERT_STREAM_SLOT_BYTES. The whole point is
     // to let the store size itself, which is where the defect lives.
     ::unsetenv("VT_MOE_EXPERT_STREAM_SLOT_BYTES");
-    ::setenv("VT_MOE_EXPERT_STREAM_STATS_EVERY", "0", 1);
+    // Quiet under ctest, but overwrite=0 so an operator who sets this var
+    // still gets the line -- which is the only way to SEE the statistics
+    // this row added, and a gate that suppresses its own evidence is a
+    // smaller version of the defect it was written for.
+    ::setenv("VT_MOE_EXPERT_STREAM_STATS_EVERY", "0", 0);
     ::setenv("VT_QWEN35_GROUPED_MOE", "0", 1);
   }
 };
