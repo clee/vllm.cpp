@@ -15,7 +15,7 @@
 //     method here covers every spelling our loader accepts)
 //   vllm/model_executor/layers/quantization/base_config.py:180
 //     QuantizationConfig.get_quant_method(layer, prefix) — the selection
-//     MakeFp8LinearMethod below mirrors: pick the method ONCE from the
+//     MakeLinearMethod below mirrors: pick the method ONCE from the
 //     checkpoint, not per call
 //
 // Our loader accepts both spellings (`LoadFp8Raw`,
@@ -85,7 +85,7 @@ class Fp8W8A8LinearMethod : public LinearMethodBase {
 // The scheme is chosen ONCE, here, from the checkpoint's populated weights:
 // exactly one of {bf16, fp8} is present per projection (`LoadFp8Raw` fills the
 // fp8 field and leaves the bf16 one EMPTY, and the dequant-at-load fallback does
-// the reverse — qwen3_5_weights.cpp:391-414), so a non-empty fp8 weight selects
+// the reverse — qwen3_5_weights.cpp:391-405), so a non-empty fp8 weight selects
 // the quantized method. Same shape as MakeLinearMethod for NVFP4 in
 // compressed_tensors/schemes/nvfp4.h; overloaded on the weight type, so a model
 // including both headers gets the right one by argument type.

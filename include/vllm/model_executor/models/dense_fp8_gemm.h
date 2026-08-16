@@ -28,8 +28,9 @@
 //       `self.fp8_linear.apply_weights`)
 //   * generic fp8 linear           vllm/model_executor/layers/quantization/
 //       fp8.py:267,446  (`Fp8LinearMethod`)
-//   * static per-tensor act quant  vllm/model_executor/layers/quantization/
-//       input_quant_fp8.py (`kFp8StaticTensorSym`) — our vt::QuantFp8Static
+//   * static per-tensor act quant  vllm/model_executor/layers/quantization/utils/
+//       quant_utils.py:124 (`kFp8StaticTensorSym`), which modelopt.py:511-512
+//       hands to `init_fp8_linear_kernel` — our vt::QuantFp8Static
 //   * per-tensor scaled epilogue   the folded `alpha = input_scale *
 //       weight_scale` scalar, mirroring vLLM's per-tensor ScaledEpilogue
 // The local primitives this drives are vt::QuantFp8Static + vt::MatmulFp8CublasLt
