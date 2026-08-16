@@ -27,7 +27,7 @@ nothing.
 
 **Not in scope, and deliberately so.** The *storage* dtype stays f32. Upstream
 stores bf16 (§1), and moving this file to bf16 storage is the production arm
-that `ltx2_video_vae.cpp:46-49` already books as phase L6 debt. That is a
+that `ltx2_video_vae.cpp:63-66` already books as phase L6 debt. That is a
 different change with a different risk profile, and this row does not take it.
 Narrowing the *arithmetic* is separable from narrowing the *storage*, and only
 the first can be done without a second dtype for every buffer.
@@ -195,7 +195,7 @@ bf16 (§1), so the case gates a mirrored property and not a local convention.
 as `Volume` would be wrong.**
 
 `Volume` is a file-local struct in an anonymous namespace
-(`ltx2_video_vae.cpp:68-76`) whose `At()` is a single indexing function with 16
+(`ltx2_video_vae.cpp:85-93`) whose `At()` is a single indexing function with 16
 call sites. That much is cheap. What is not cheap:
 
 1. **A shared helper hard-codes NCDHW in its signature.**
@@ -209,7 +209,8 @@ call sites. That much is cheap. What is not cheap:
    which spends what the layout was meant to save. This is a shared-seam
    decision, not a local one.
 2. **Ten layout-dependent sites bypass `At()`** with open-coded `c * n + i`
-   arithmetic — `Linear3d` (`:203,:206`), `ApplyAdaLn` (`:361-362`), the
+   arithmetic, at §2's `ff264cb82` base anchors rather than this section's
+   final-tree ones — `Linear3d` (`:203,:206`), `ApplyAdaLn` (`:361-362`), the
    denormalize (`:645-648`), `SpaceToDepthDownsample` (`:919,:921`), the
    encoder normalize (`:1129-1130`) — plus the local scratch buffers `padded`,
    `normed`, `q`, `k`, `v` and `attended`, which carry their own layouts and
@@ -255,7 +256,7 @@ see and a memory-format change across a shared seam are two independent reviews.
 | **A width gate for the nine sites that have none** (§8.2). `Linear3d` was widened back to `double` and **40/40 cases passed**. | One separable-reduction case per site, in the shape §3 established for the convolution. |
 | **A blocked summation order for the sites that still sum naively** (§8.1) — `Linear3d`, the attention block, `PixelNorm`. `CausalConv3d` has one; the others do not, and their reductions are shorter but not short. | The same treatment, measured the same way. None of them is near tolerance today. |
 | NDHWC / `channels_last_3d` (§5) | its own row, after or with a SIMD or device arm |
-| bf16 *storage*, the phase L6 production arm (`ltx2_video_vae.cpp:46-49`) | [#1007](https://github.com/mudler/vllm.cpp/issues/1007) and the L6 row |
+| bf16 *storage*, the phase L6 production arm (`ltx2_video_vae.cpp:63-66`) | [#1007](https://github.com/mudler/vllm.cpp/issues/1007) and the L6 row |
 | The `.agents/issue-index.md` row for [#1008](https://github.com/mudler/vllm.cpp/issues/1008) | It is **deliberately not appended here.** The row exists on PR #1018, which filed the issue and is unmerged. `.gitattributes:7` sets `merge=union` on that file and `scripts/check-agent-record.py:1437-1442` refuses a duplicate issue number with "duplicate is what two branches appending the same issue look like". Appending it here would turn `main` red for every branch the moment #1018 merges — the exact failure a duplicate #995 row caused. The link lives in this spec and in the pull request body; the index link arrives with #1018. |
 
 ## 8. Outcome — what was measured
