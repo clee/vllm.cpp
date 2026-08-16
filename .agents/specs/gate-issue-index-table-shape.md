@@ -35,6 +35,16 @@ correct; only its argument list was short. Changing it would widen a gate to
 make a red go green, which is the one move
 [`AGENTS.md`](../../CLAUDE.md) § *Changing the rules or a checker* forbids.
 
+Also out of scope, and for a different reason: **making the checker report all
+findings instead of stopping at the first**. #1033 attributes the two-day
+concealment partly to that shape. It measured false. `main()` threads one
+`errors` list through every check and prints all of it after the last one; the
+`if not errors:` guard above the block covers only the missing-canonical-record
+case, where continuing would raise on a file that is not there. Measured in
+`## Evidence` rather than read off the source, because reading is how the wrong
+premise got into the issue. There is nothing here to contain, so nothing is
+changed.
+
 ## Upstream anchors
 
 None. This is a repository checker, not a ported behavior. vLLM has no
@@ -79,6 +89,13 @@ carries **four** unescaped pipes inside code spans, at columns 2705, 3106, 3115
 and 3338 — one in a regex alternation over the word `match`, two delimiting a
 quoted table cell, and one in a character-class alternation. The repair escapes
 each of the four and changes nothing else.
+
+They are **not** the spans the dispatch named, which placed all four inside a
+single `git diff … | grep …` code span. This row carries `git diff` spans and
+`git grep` spans, and none of them is piped into anything. Same row, same count,
+different spans. The four were located by re-running the checker's own regex
+over the line rather than by searching for the quoted text, which is the only
+reason the discrepancy is visible at all.
 
 GFM replaces an escaped pipe with a literal pipe inside a table cell before
 inline parsing, so each code span then renders exactly as its author wrote it.
@@ -159,6 +176,27 @@ both written and read back.
 Captured verbatim with exit codes in the pull request body. No gate command
 whose status is needed is piped: `cmd | head` reports `head`'s status, which is
 how this tree has produced false green verdicts before.
+
+### The checker does not stop at the first finding
+
+Measured, not read. A scratch index carrying three defects at once — a duplicate
+key, a row that lost its trailing pipe, and the unrepaired `#1003` row — reports
+all three in one run of `python3 scripts/check-agent-record.py`:
+
+```
+ERROR: .agents/issue-index.md: issue #168 listed twice. Under `merge=union` a duplicate is what two branches appending the same issue look like
+ERROR: .agents/issue-index.md:279: table has 9 pipes; expected 5
+ERROR: .agents/issue-index.md:307: table has 3 pipes; expected 5
+RC=1
+```
+
+The two synthetic rows were appended to a working copy and reverted with
+`git checkout --` immediately after, and `check_issue_index` reported the
+duplicate on the row it was given rather than the number of the real issue.
+
+So the concealment #1033 describes was real and its cause was not ordering: it
+was solely that `check_table_shapes` never saw this path. One reporting run,
+three findings, exit 1 once.
 
 Accounted-for failures:
 
