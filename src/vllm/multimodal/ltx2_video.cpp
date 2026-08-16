@@ -1853,41 +1853,17 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
 
   // ── DFR: the canvas, and the slot grid it decides (#986) ──────────────────
   //
-  // `resolve_canvas` (dfr_layout.py:60-81) at `dfr_pipeline.py:314`, immediately
-  // after `resolve_num_frames` and before the first stage. It PADS the request
-  // up to a whole number of keyframe segments, so the canvas this engine
-  // denoises is generally LONGER than what the caller asked for, and `:534`
-  // trims back at the end. Both halves are needed: dropping the pad would put
-  // the terminal keyframe off a segment boundary, and dropping the trim would
-  // hand the caller a clip longer than the one they requested.
+  // Declared here and RESOLVED below `Ltx2AssertResolution`, because upstream's
+  // order is `assert_resolution` at dfr_pipeline.py:291 and `resolve_canvas` at
+  // :314, in that order. A request that is wrong on BOTH axes must hear about
+  // the resolution first, exactly as it would upstream; otherwise the two ports
+  // give different answers to the same bad request and only one of them matches
+  // the reference.
   //
   // `requested_frames` is captured BEFORE the pad, because it is the contract.
   const bool is_dfr = im.pipeline_kind == "dfr";
   const int64_t requested_frames = frames;
   std::vector<int64_t> slot_positions;
-  if (is_dfr) {
-    // Upstream's admission gate, at upstream's position: the top of `__call__`,
-    // before the text encoder runs and before a weight is touched
-    // (dfr_pipeline.py:315).
-    AssertGeneratedKeyframesSupported(im.dit.params.use_keyframes_abs_pos_embedding,
-                                      im.params.dit_path);
-    const Ltx2DfrCanvas canvas = Ltx2DfrResolveCanvas(frames, factors.time);
-    frames = canvas.num_frames;
-    slot_positions = canvas.positions;
-    im.trace.canvas_frames = canvas.num_frames;
-    im.trace.canvas_segment = canvas.segment;
-  } else {
-    // Every other pipeline takes the slot COUNT and spaces the positions evenly
-    // (`resolve_generated_keyframes`, utils/helpers.py:394-411). Resolved here
-    // rather than in the extras check because the count needs `frames`, which is
-    // not known at that point.
-    slot_positions = EvenlySpacedKeyframePositions(
-        ExtraInt(gen.extras, kLtx2GeneratedKeyframesExtra, 0), frames);
-    if (!slot_positions.empty()) {
-      AssertGeneratedKeyframesSupported(im.dit.params.use_keyframes_abs_pos_embedding,
-                                        im.params.dit_path);
-    }
-  }
 
   // `assert_resolution` (utils/helpers.py:540-551), at the position upstream
   // calls it from: the top of `__call__`, before any work is paid for. The
@@ -1930,6 +1906,39 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
          "`assert_resolution` (utils/helpers.py:540-551) does");
   }
   Ltx2AssertResolution(height, width, factors.height * recipe.max_spatial_downscale());
+
+  // ── DFR: resolve the canvas (#986) ────────────────────────────────────────
+  //
+  // `resolve_canvas` (dfr_layout.py:60-81) at `dfr_pipeline.py:314`, after
+  // `assert_resolution` and before the first stage. It PADS the request up to a
+  // whole number of keyframe segments, so the canvas this engine denoises is
+  // generally LONGER than what the caller asked for, and `:534` trims back at
+  // the end. Both halves are needed: dropping the pad would put the terminal
+  // keyframe off a segment boundary, and dropping the trim would hand the caller
+  // a clip longer than the one they requested.
+  if (is_dfr) {
+    // Upstream's admission gate, at upstream's position: the pipeline preamble,
+    // before any weight is built (`assert_generated_keyframes_supported`,
+    // utils/blocks.py:405-419, called from dfr_pipeline.py:315).
+    AssertGeneratedKeyframesSupported(im.dit.params.use_keyframes_abs_pos_embedding,
+                                      im.params.dit_path);
+    const Ltx2DfrCanvas canvas = Ltx2DfrResolveCanvas(frames, factors.time);
+    frames = canvas.num_frames;
+    slot_positions = canvas.positions;
+    im.trace.canvas_frames = canvas.num_frames;
+    im.trace.canvas_segment = canvas.segment;
+  } else {
+    // Every other pipeline takes the slot COUNT and spaces the positions evenly
+    // (`resolve_generated_keyframes`, utils/helpers.py:394-411). Resolved here
+    // rather than in the extras check because the count needs `frames`, which is
+    // not known at that point.
+    slot_positions = EvenlySpacedKeyframePositions(
+        ExtraInt(gen.extras, kLtx2GeneratedKeyframesExtra, 0), frames);
+    if (!slot_positions.empty()) {
+      AssertGeneratedKeyframesSupported(im.dit.params.use_keyframes_abs_pos_embedding,
+                                        im.params.dit_path);
+    }
+  }
 
   // `AudioLatentShape.from_video_pixel_shape` (types.py:184-200) and
   // `VideoLatentShape.from_pixel_shape` (:108-123) defaults. Asserted against the

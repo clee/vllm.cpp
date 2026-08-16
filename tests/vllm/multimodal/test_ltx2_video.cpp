@@ -1822,6 +1822,31 @@ TEST_CASE("ltx2 video: the DFR pipeline pads its canvas, places slots on it, and
     }
   }
 
+  SUBCASE("a request wrong on BOTH axes hears about the RESOLUTION first") {
+    // Upstream's order, and it is an order rather than a set: `assert_resolution`
+    // is at dfr_pipeline.py:291 and `resolve_canvas` at :314. A request that is
+    // wrong on both the resolution and the frame count therefore gets the
+    // resolution refusal upstream, and must get it here too.
+    //
+    // This is gated because it is invisible otherwise. Both refusals are
+    // correct, both name a real defect in the request, and a port that resolved
+    // the canvas first would look completely healthy to every other case in this
+    // file while giving a different answer from the reference to the same input.
+    vllm::multimodal::VideoGenParams gen = FixtureGen(ws.root + "/dfrboth");
+    gen.width = 96;      // not a multiple of 64, which a two-stage recipe needs
+    gen.num_frames = 10; // and not on the x8 border either
+    try {
+      (void)engine->Generate(gen);
+      FAIL_CHECK("a request wrong on both axes must be refused");
+    } catch (const std::exception& e) {
+      const std::string msg = e.what();
+      INFO(msg);
+      // The RESOLUTION refusal, not the canvas one.
+      CHECK(msg.find("96") != std::string::npos);
+      CHECK(msg.find("dfr_layout.py:71-72") == std::string::npos);
+    }
+  }
+
   SUBCASE("num_generated_keyframes is refused on dfr, which owns its own grid") {
     // `DFRPipeline.__call__` takes no such argument and its CLI exposes no
     // `--num-generated-keyframes` (dfr_pipeline.py:268-283, :565-591). Honouring
