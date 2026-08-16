@@ -766,6 +766,122 @@ into the stack (`blk.87.ffn_up_exps.weight` in the incomplete-checkpoint dry
 run). Architecture resolution, split merging, tensor naming and both new
 encodings are not the blocker. Capacity is.
 
+## First run: Qwen3.8-2.4T-A95B loads and generates on one DGX Spark
+
+16 August 2026, dgx.casa, GB10, 119 GiB unified memory, `UD-Q1_0` (370 GiB, 10
+shards, sha256-verified) on local NVMe, CPU device, `--max-num-seqs 1
+--max-model-len 512`, `VT_GGUF_PREFAULT=0`, server entry point.
+
+**It loads, it serves, and it is correct.**
+
+```
+prompt: "Q: What is the capital of France? A:"
+output: " Paris. Q: What"
+```
+
+| Axis | Measured |
+|---|---|
+| load to serving | 13 min |
+| resident anonymous memory | **62 GiB** of 119 GiB |
+| TTFT (token 1) | **3318 s** |
+| steady decode | **66.7 s/token** (66.5, 66.9, 66.8) |
+| decode rate | **0.015 tok/s** |
+| expert read bandwidth during decode | ~100 MB/s (measured 50 MiB/s at one sample, 914 % CPU) |
+
+### Why a 370 GiB model fits in 119 GiB
+
+Because the experts are never copied. They are BORROWED from the mmap and
+demand-paged by the kernel, costing zero anonymous memory. What is resident is
+the dense remainder, and it matches the prediction from the checkpoint's own
+tensor table:
+
+| Component | Predicted |
+|---|---|
+| `attn_qkv` expanded to bf16 | 21.56 GiB |
+| `ssm_out` expanded to bf16 | 17.25 GiB |
+| `token_embd` + F32 norms | 5.81 GiB |
+| predicted total | 44.6 GiB |
+| measured, with KV and runtime | **62 GiB** |
+
+This closes the question the earlier measurement left open, and corrects the
+conclusion drawn from it. The load was previously stopped at 53 GiB on the
+extrapolation that it was heading for 370 GiB. It was not; it plateaus. The
+extrapolation was wrong, the data was not, and the difference was letting it
+finish.
+
+### What the speed says, precisely
+
+0.015 tok/s is not a streaming result. It is the result of having NO streaming
+lane: every token needs roughly 6.7 GB of expert bytes (10 experts x 3 matrices
+x 93 layers), and the kernel serves them as 4 KiB demand faults in router order.
+That yields about 100 MB/s against an NVMe that sustains ~5 GB/s, so **the gap
+is about 50x and it is entirely access pattern.**
+
+The steady-state number is the useful one. 66.5, 66.9 and 66.8 seconds for three
+consecutive tokens is not noise; it is the same working set being re-faulted
+every step, which is exactly the behaviour a resident expert cache removes.
+
+TTFT of 3318 s is prefill plus the cold set and should not be quoted as a decode
+number.
+
+### What this changes for the row
+
+Streaming is NOT what makes this model fit. Borrowing already does. Streaming is
+what makes it FAST, and the size of that prize is now measured rather than
+assumed: 50x of pure I/O access pattern, before any cache-hit benefit. The c1
+target of 3 to 6 tok/s needs roughly a 200 to 400x improvement, so it needs both
+the explicit batched reads AND the hit rate the hotness cache is designed for.
+
+Everything the lane needs is already in tree and unwired: `ExpertSlotCache`
+(W1), `GgufExpertSpanOf` (W2) and `ExpertStreamer` (W3). W4 now has a measured
+baseline to beat and a working end-to-end vehicle to beat it on.
+
+## W4 measured: correct, 4.5x on TTFT, and NO steady-state gain (and why)
+
+16 August 2026, dgx.casa, same vehicle and config as the first run, streaming
+enabled with 8000 slots (`[expert-stream] ON slots=8000 slot_bytes=2490368
+resident=18.55 GiB`).
+
+| Axis | Baseline (no streaming) | Streaming ON |
+|---|---|---|
+| output | `" Paris. Q: What"` | `" Paris. Q:"` (**identical tokens**) |
+| TTFT | 3318.1 s | **733.4 s** (4.5x) |
+| steady decode | 66.5 / 66.9 / 66.8 s | 68.7 / 67.7 s (**unchanged**) |
+
+**Correctness holds**: the slot path is byte-faithful, which is the precondition
+for caring about the rest.
+
+**The steady-state result is a negative one, and the cause is this
+implementation rather than the design.** `EnsureSpan` copies from `base +
+offset`, a pointer INTO the mmap, so filling a slot still takes the page fault
+it was meant to avoid. What was actually changed is fault ORDER (random to
+sequential) plus an extra 2.49 MiB memcpy, and that combination measures the
+same ~103 MB/s the mmap path already did.
+
+The spec said this on the first page and the implementation did not follow it:
+"Reads are plain `pread(2)` against the model fd", with an O_DIRECT variant and
+an aligned staging buffer. ds4 preads from the FILE DESCRIPTOR. Copying from the
+mapping inherits the exact fault path the lane exists to bypass.
+
+**A second bound is independent of that fix.** Each token needs 2790 slices
+(10 experts x 3 matrices x 93 layers) at 2.49 MiB, so **6.9 GB per token**,
+against a 19.9 GiB cache: under three tokens of working set, with top-10-of-512
+routing making consecutive tokens rarely reuse an expert. Even perfect
+sequential I/O leaves the hit rate to be won separately, by a larger budget, the
+hotlist preload (W5) or lookahead prefetch.
+
+So the ordering for the next attempt is now measured rather than guessed:
+
+1. **pread from the fd**, not memcpy from the mapping. This is the one that
+   makes the I/O rate move at all, and until it lands no cache size matters.
+2. **Overlap** the read with compute, which is what the async pool in the
+   original design is for; a synchronous fill serialises I/O behind every layer.
+3. **Hit rate** last, because it multiplies a bandwidth that is currently wrong.
+
+TTFT improving 4.5x while decode did not is consistent with all of this: prefill
+touches a wide expert set once, where sequential order and slot reuse both help,
+while decode re-reads a fresh 6.9 GB every step.
+
 ## Risks/decisions
 
 | Risk / decision | Call |
