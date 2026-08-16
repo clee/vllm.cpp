@@ -555,22 +555,32 @@ Where the embedding does bite is the FIRST latent frame of every render, which
 was a separate gap; it was closed on 2026-08-14 under issue #658, so the marker
 is now applied on every render.)
 
-**Generated keyframe slots are a different feature, and they are refused.**
-Upstream also lets the model *generate* extra frames at interior positions —
-`--num-generated-keyframes N` there, the per-generation extra
+**Generated keyframe slots are a different feature, and they are now SERVED.**
+Upstream also lets the model *generate* extra frames at interior positions,
+`--num-generated-keyframes N` there and the per-generation extra
 `num_generated_keyframes` here. That is not a keyframe you supply; it is one you
 ask the model to invent, and each slot buys one pixel frame at the cost of a
 full latent frame of tokens. `0` is upstream's own default and means off, so
-passing it explicitly renders normally. A positive count is refused by name, and
-what the refusal names is the **readback**: the slots are the OUTPUT, so they
-have to be located by the layout the append recorded, extracted before the extra
-tokens are trimmed off, and then each decoded as a standalone one-frame clip,
-because a multi-frame causal decode would blend slots that were never temporally
-adjacent. Two plausible reasons are ruled out rather than left for a reader to
-re-derive: the token-APPEND machinery, which the last-frame arm above uses
-today, and the trained keyframe marker, which issue #658 landed and which every
-render already applies. A negative count is refused separately with upstream's
-own reason, since a malformed request and an unported arm are different answers.
+passing it explicitly renders normally. A positive count places that many
+evenly spaced INTERIOR slots: both endpoints are dropped, because frame 0
+already spans a single pixel frame under causal encoding and the last frame is
+the clip's own end. The slots are marked with the trained keyframe embedding,
+denoised with the video, and read back out of the state before the extra tokens
+are trimmed away.
+
+Two refusals remain, and they are upstream's own rather than ours. A negative
+count is refused, and so is a count the clip is too short for: every slot is an
+interior position, so `N + 2` frames are the minimum.
+
+**This page said until 2026-08-16 that a positive count was refused, and it is
+recorded rather than deleted** because a reader may have planned around it. The
+refusal named the readback as its one blocker, and it was right: what landed
+under issue #986 is the layout that locates the slots exactly and the extraction
+that runs before the trim. One third of what that refusal named is still owed,
+and it is a different surface rather than a smaller version of this one, the
+standalone single-frame decode that would hand you slot PIXELS. Nothing here
+returns those: the slots stay in latent space, which is what DFR below wants
+from them.
 
 Reference-image, reference-video and reference-audio conditioning are still
 refused, each naming a different missing piece. **Two reasons this page used to
@@ -813,8 +823,59 @@ doubles the frame axis and then drops the first frame, which upstream encodes as
 a single pixel frame. Passing it is refused by name rather than
 reported as a shape mismatch. The temporal arm itself is implemented and gated
 against upstream, but **nothing drives it**: its only upstream consumer is
-`DFRPipeline`'s multi-round loop, which is not ported, so there is no flag that
-makes a request use it and no reason to pass that file today.
+`DFRPipeline`'s multi-round loop. The DFR pipeline's BASE is ported as of issue
+#986 and is described below, and the rounds loop is not, so there is still no
+flag that makes a request use that file and no reason to pass it today. The
+checkpoint is also not published beside the spatial one on the mirror this port
+was built against, so nothing here has run it on real weights.
+
+### The DFR pipeline: `--pipeline-kind dfr`
+
+Detail-fidelity rendering. It is upstream's `DFRPipeline`, and it differs from
+the ordinary distilled two-stage recipe in its CONDITIONING rather than in its
+schedule: both stages run the same sigmas, and stage 1 is the same half
+resolution. What DFR adds is a keyframe grid.
+
+**The canvas is padded, and this is the part that surprises people.** DFR lays
+keyframes on a segment grid, 24 or 32 frames per segment, whichever pads least,
+and it pads `num_frames - 1` up to a whole number of segments before it renders
+anything. A 9-frame request therefore denoises a 25-frame canvas and is trimmed
+back to 9 before you see it. Ask for 121 frames and you get 121; ask for 9 and
+the machine does about three times the work you might expect.
+
+**Frame counts are refused here rather than floored.** Everywhere else in this
+engine a frame count that is not `8k + 1` is floored onto the latent grid, and
+that is documented above as the behaviour. DFR cannot live with it: every
+keyframe position it emits has to land on a latent border, so `--frames 10` is
+refused with the reason rather than quietly rendered as 9.
+
+**`num_generated_keyframes` is refused on this pipeline.** DFR chooses its own
+slot positions from the canvas, one per segment boundary, and the whole pipeline
+is indexed by that grid. An override would leave the slots and the canvas
+describing different frames, and the render would still finish. Use
+`--pipeline-kind distilled_two_stage` or `one_stage` if you want to place slots
+by count. An explicit `0` still passes, because that is upstream's default.
+
+**How to reach it.** `pipeline_kind` is a LOAD knob, not a per-generation one, so
+all three surfaces carry it: `ltx2-gen --pipeline-kind dfr`, the C ABI's
+`vllm_video_model_params.extra_keys` / `extra_values`, and the server's
+`--video-extra pipeline_kind=dfr` at launch. A server started that way renders
+every `/v1/videos` request through DFR.
+
+The two knobs beside it are per-GENERATION and therefore CLI and ABI only, because
+`/v1/videos` forwards no per-generation extra to any engine yet (issue #928):
+`num_generated_keyframes` on the other pipelines, and `temporal_upsample_rounds`
+below.
+
+**What is not served.** `temporal_upsample_rounds` is defined and refused above
+`0`: the rounds loop that temporally doubles the latent, re-tiles the canvas and
+stitches it back is not ported. The refusal names it, and it names three things
+that are NOT the reason, because each is the one a reader reaches for first: the
+temporal upsampler operator is ported and gated, the canvas and tiling
+arithmetic is ported and gated in this same change, and the generated keyframe
+slots are served. What has no counterpart here is the per-tile denoise pass as a
+callable. Stage 2's x2 spatial detailing IC-LoRA is refused separately, for the
+reasons the reference-video arm is refused above.
 
 On the server, `--video-family ltx-2.5` pins the family instead of detecting it,
 and `--video-extra KEY=VALUE` (repeatable) carries the same family-specific load
@@ -1476,7 +1537,7 @@ identical to one built before it existed. See
 A **music-only server**, which is what you almost certainly want:
 
     vllm-server --speech-model /path/to/minimax-music3 \
-      [--speech-family minimax-music3] [--port 8000]
+      [--speech-family minimax-music3] [--speech-device 0|1] [--port 8000]
 
 **`--model` is not required here**, and that is deliberate. Upstream's own recipe
 is `sgl-omni serve --model MiniMaxAI/MiniMax-Music3` and nothing else: a music
@@ -1501,6 +1562,17 @@ not registered is refused too; it is never treated as a hint, because the wrong
 family would not fail — it would render noise. `--speech-family` without
 `--speech-model` is still an error: there is nothing to load it from.
 
+`--speech-device` says **where** the family runs. `0` is the default and the CPU
+arm; `1` is the accelerator this build resolves. It is refused rather than
+substituted: `--speech-device 1` on a build with no accelerator backend, or on a
+partial backend that has not registered this family's kernels, fails at startup
+naming the piece that is missing. `--speech-device` without `--speech-model` is
+an error for the same reason `--speech-family` is — a knob that applies to
+nothing reads as one that was honoured. What device 1 currently moves for
+MiniMax-Music3 is documented under
+[What runs on the device](#what-runs-on-the-device-and-what-does-not), and it is
+**not the whole model**.
+
 In the speech-only form the served model name defaults to the **family**
 (`minimax-music3`) rather than to a directory basename, because there is no
 `config.json` to take one from. `--served-model-name` still wins.
@@ -1509,27 +1581,33 @@ A successful music-only start prints what it resolved, so you can tell a working
 server from a listening one without sending a request:
 
     server: speech/music-only model (family=minimax-music3, 44100 Hz,
-            text-only synthesis, family DETECTED); serving /v1/audio/speech
+            text-only synthesis, family DETECTED, device cpu);
+            serving /v1/audio/speech
     server: listening on http://0.0.0.0:8000 (model 'minimax-music3')
 
 `family DETECTED` means the artifact was inspected; `family DECLARED` means you
 passed `--speech-family`. `text-only synthesis` is the answer to
 `requires_reference_audio()` — a family that needs a reference clip says
 `reference clip REQUIRED` there instead, and refuses a clipless request before
-anything stages.
+anything stages. `device` is what the load **granted**, not what you asked for:
+a build that cannot serve `--speech-device 1` refuses at startup rather than
+printing `cuda` and running on the CPU.
 
 Or skip HTTP entirely. `minimax-music3-gen` drives the same seam through the C
 ABI and writes the WAV itself:
 
     minimax-music3-gen --model /path/to/minimax-music3 --out song.wav \
       --lyrics @lyrics.txt --description "Genre: acoustic pop. BPM: 96." \
-      --duration 8 --steps 8 --seed 7
+      --duration 8 --steps 8 --seed 7 [--device 0|1]
 
 `--lyrics` and `--description` take literal text or `@path` to read a file,
 because lyrics are multi-line and a `[Verse]` tag inside an argv is easy to
 mangle. It prints the delivered length, rate, channels, RMS, peak and wall clock
 to stderr — the *delivered* length, not the requested one, because a duration
-resolves to a whole number of 25 Hz frames and is therefore quantized.
+resolves to a whole number of 25 Hz frames and is therefore quantized. It also
+prints the device the handle **resolved to** rather than the one `--device`
+asked for, which is the difference between timing two arms and timing one arm
+twice.
 
 The route is OpenAI's `createSpeech` shape, with the two **music** inputs as
 additional named fields:
@@ -1629,6 +1707,62 @@ that way in W2-W5 so their reduction order is reproducible against torch, and
 they run single-threaded. In one 0.1 s request the depth decoder alone is the
 majority of the wall clock.
 
+#### What runs on the device, and what does not
+
+`--speech-device 1` (or `minimax-music3-gen --device 1`, or
+`vllm_speech_model_params.device = 1`) is **a partial arm, and this table is the
+whole of it**. Reading it as "the model runs on the GPU" would be wrong in the
+direction that matters.
+
+| stage | where `--speech-device 1` runs it |
+|---|---|
+| 8.6B `Qwen3ForCausalLM` (prefill + every decode step, its paged KV) | **device** |
+| guided-logit pipeline, top-k draw, frame feedback embedding | host (two 200 000-wide rows per step; not the cost) |
+| 0.646B RVQ depth decoder (7 steps per frame) | **host**, scalar loops |
+| condition mix, 2.4B fp32 flow-matching DiT, scheduler | **host**, scalar loops |
+| DAC Flow-VAE vocoder (`Conv1d` / `ConvTranspose1d`) | **host**, scalar loops |
+
+The language model reaches the device because it is already routed through the
+shared `Qwen3DenseModel` forward that five text registrations ride — nothing was
+forked for it, and the only thing this option changes is which queue that
+forward is handed and where its KV cache is allocated. The other stages do not,
+for two different reasons, and both are owed rather than hidden:
+
+* the depth decoder and the DiT are host `std::vector<float>` reference loops
+  under `-ffp-contract=off`, kept that way so their reduction order stays
+  reproducible against torch. Moving them means routing them through the shared
+  `vt` GEMM seam with device-resident weights, not adding a flag;
+* the vocoder needs `ConvTranspose1d`, and **`vt` has no such op at all** — the
+  1-D convolutions it does have (`vt::DepthwiseConv1d`, `vt::CausalConv1dFwd`)
+  are depthwise or causal-with-state, and `vt::Conv2d` and `vt::DepthwiseConv1d`
+  are registered for the **CPU only**. There is no CUDA kernel behind the op
+  this stage would need, so it is named here rather than hand-rolled outside the
+  seam.
+
+Because the host stages are unchanged, the CPU arm is **bit-identical** to the
+one every Music3 correctness gate was taken on, and the device arm's output
+differs from it exactly where the language model's own arithmetic differs — one
+stage, not five.
+
+**The two arms do not produce the same song, and that is structural.** The
+autoregressive stage has no greedy path upstream: it ends every draw in a seeded
+multinomial, so a different logit changes the drawn code and everything after it.
+Do not compare the two WAVs sample by sample. What *is* comparable is the
+language model's own hidden state against the oracle capture, and
+`tests/parity/test_minimax_music3_llm_real.cpp` runs that comparison on either
+arm — `VLLM_CPP_MUSIC3_DEVICE=1` selects the device one, unset is the CPU one —
+at the same bounds, with the same negative control. Numbers for both are in
+[BENCHMARKS](BENCHMARKS.md).
+
+**Measured, so expectations are calibrated rather than hoped for.** On a Jetson
+Thor (sm_110, 14 cores) the device arm was *slower* on a two-frame request
+(846.6 s vs 835.1 s) and 5.4 % faster on a ten-frame one (1430.4 s vs 1512.1 s).
+The difference between the arms works out to about 11.7 s saved per
+autoregressive frame against a fixed cost of about 35 s, so it breaks even
+around three frames — roughly 0.12 s of audio. If you are generating an actual
+song the device arm helps; if you are smoke-testing the shortest request that
+enters every stage, it does not.
+
 **A first sample, measured.** Two seconds of stereo music, generated by this
 engine through `minimax-music3-gen` on an idle-to-busy 20-core x86 CPU box:
 
@@ -1654,10 +1788,12 @@ repository path, and no classified path accepts a `.wav` outside `tests/`, where
 a file compared to nothing would sit beside the goldens and imply it was one.
 Regenerate it instead — the command above is the whole recipe.
 
-The same seam is reachable from the C ABI at v20 — `vllm_speech_engine_load`,
-`vllm_speech_engine_family` / `_sample_rate` / `_requires_reference_audio`,
-`vllm_synthesize` and `vllm_speech_result_free` — so HTTP and FFI drive one
-implementation. `vllm_speech_result` carries both the float waveform and the
+The same seam is reachable from the C ABI at v21 — `vllm_speech_engine_load`,
+`vllm_speech_engine_family` / `_sample_rate` / `_requires_reference_audio` /
+`_device`, `vllm_synthesize` and `vllm_speech_result_free` — so HTTP and FFI
+drive one implementation. `vllm_speech_model_params.device` is the same 0 = CPU
+/ 1 = accelerator selector `--speech-device` sets, and
+`vllm_speech_engine_device` reports what the load granted. `vllm_speech_result` carries both the float waveform and the
 RIFF/WAVE bytes, so an embedder writes a playable file without a second encoder.
 
 
