@@ -1370,6 +1370,19 @@ In the speech-only form the served model name defaults to the **family**
 (`minimax-music3`) rather than to a directory basename, because there is no
 `config.json` to take one from. `--served-model-name` still wins.
 
+A successful music-only start prints what it resolved, so you can tell a working
+server from a listening one without sending a request:
+
+    server: speech/music-only model (family=minimax-music3, 44100 Hz,
+            text-only synthesis, family DETECTED); serving /v1/audio/speech
+    server: listening on http://0.0.0.0:8000 (model 'minimax-music3')
+
+`family DETECTED` means the artifact was inspected; `family DECLARED` means you
+passed `--speech-family`. `text-only synthesis` is the answer to
+`requires_reference_audio()` — a family that needs a reference clip says
+`reference clip REQUIRED` there instead, and refuses a clipless request before
+anything stages.
+
 Or skip HTTP entirely. `minimax-music3-gen` drives the same seam through the C
 ABI and writes the WAV itself:
 
