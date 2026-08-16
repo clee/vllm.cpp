@@ -148,10 +148,6 @@ speed-pending, which [BENCHMARKS.md](BENCHMARKS.md) tracks.
 | `CohereForCausalLM` | Command-R / Cohere (and Cohere2) | scaffold: W0 tiny-random oracle run-verified; real-checkpoint gate blocked | no run |
 <!-- supported-arch-table:end -->
 
-The Qwen3.5 MoE loader also builds under Apple Clang with project warnings
-promoted to errors. Its layout-refusal path uses the same messages and behavior
-on every platform.
-
 ### Standalone and non-registered lanes
 
 These run through dedicated forwards, not the `REGISTER_VLLM_MODEL` registry, so
@@ -173,6 +169,7 @@ in `ltx2_text_encoder.cpp` is the call that would have to change.
 | LTX-2.5 DFR base + generated keyframe slots | LTX-2.5 (21.00B video+audio) | gated vs EXECUTED upstream `dfr_layout` + 3 `dfr_pipeline` helpers @ `fd4ded7f` (`test_ltx2_dfr` 11/11, 652 assertions); canvas, tiles, stitch, carry-forward as EXACT index vectors, since each defect is plausible| `--pipeline-kind dfr`. Canvas PADS 9 to 25 then trims back; slots on the x8 grid, MARKED, read back BEFORE the trim. `num_generated_keyframes` SERVED elsewhere. Temporal ROUNDS refused (#986); detail LoRA refused (#975)|
 | LTX-2.5 tiled + streaming Conv VAE decode | LTX-2.5 video VAE | gated vs executed upstream `ltx_core` @ `fd4ded7f` (`test_ltx2_tiling` 10/10, 915 assertions); one-tile and untiled-spatial controls BIT-EXACT vs untiled on both causality arms; an untiled frames axis is REFUSED | Streams temporal chunks through upstream's AUTO layout (768/64 px, 80/24 frames); above one tile the pixel volume is never materialized. NO-OP below 768px and 81 frames; 81-120 IS tiled, differing 6.70% of range |
 | LTX-2.5 Conv VAE decode arithmetic width | LTX-2.5 video VAE | `test_ltx2_vae` "the decode's convolution accumulates in f32", entering through `Ltx2VideoDecodeStreaming`; widening the accumulator to `double`, or deleting the production call site, each turns it RED | **f32**, the width `F.conv3d` uses at f32 AND bf16 (MEASURED). Was f64 at 8 sites ([#1008](https://github.com/mudler/vllm.cpp/issues/1008)). Conv sums BLOCKED per input channel, as torch's. STORAGE stays f32; bf16 owed |
+| LTX-2.5 Conv VAE decode threading | LTX-2.5 video VAE | `test_ltx2_vae` "the decode DISPATCHES its convolutions to the CPU threadpool" and "...BIT-IDENTICAL across thread counts", through `Ltx2VideoDecodeStreaming`; 34 golden margins UNCHANGED; TSan clean | **Parallel** over CONV output lines via `vt::cpu::ParallelForRows` ([#1009](https://github.com/mudler/vllm.cpp/issues/1009)). ~9x at 16-20 workers, contended box, 21-23% spread. Bit-identical at any count |
 | LTX-2.5 retake (`RetakePipeline`, regenerate a time window) | LTX-2.5 DiT + video VAE encoder | `test_ltx2_retake` 4/4 (69 assertions) and 4 `test_ltx2_video` cases entering through `Generate`; mask, conform and the four-way plan pinned to upstream `fd4ded7f` | `--pipeline-kind retake` on `ltx2-gen`. Source is a `frame_%06d.ppm` DIRECTORY; a container is REFUSED (no demuxer). Geometry comes from the clip. A folder has no audio, so the soundtrack is generated |
 | LTX-2.5 text-to-audio (`T2AOneStagePipeline`) | LTX-2.5 DiT + audio VAE, no video VAE | `test_ltx2_video`'s `ltx2 t2a:` cases, entering through `Generate`; 18 mutations, 17 DETECTED (four by review of a conditional-only #1039 gate) and the 18th proven an identity, not a blind spot | `--pipeline-kind t2a_one_stage`. NO picture: 0 frames, no mux argv. The only GUIDED arm (CFG + STG, 3 forwards/step), so it needs a text tower. CPU only; the device forward is refused by name |
 | LTX-2.5 T2A guidance space | LTX-2.5 DiT (T2A arm) | `test_ltx2_video` "the guider is handed x0 predictions" through `Generate`, on all 3 arms plus the guider output and the Euler input; a seam case puts the two spaces 1.5e-07 apart at rescale 0 and 0.352 at 0.7 | Combines **denoised (x0)**, mirroring `X0Model` (`model.py:590-604`). Was velocity space, which agrees only at rescale 0 ([#1039](https://github.com/mudler/vllm.cpp/issues/1039)) |
@@ -255,7 +252,7 @@ both refuse, naming what is missing.
 |---|---|---|---|---|
 | CUDA | ✅ sm_80 to sm_121a | ✅ | ✅ | ✅ |
 | CPU (x86, Arm i8mm; A76 assembly correct/default, llama speed gate open, and the closed 20-core floor ran a SUPERSEDED fork denominator rather than the stock `b10451` pin, re-take owed #1003) | ✅ | ◐ | ☐ | ✅ |
-| Metal (Apple Silicon) | ✅ | ☐ | ☐ | ✅ |
+| Metal (Apple Silicon) | ✅ builds under Apple Clang with project warnings promoted to errors, the Qwen3.5 MoE loader included; its layout-refusal path uses the same messages and behavior on every platform (#1054) | ☐ | ☐ | ✅ |
 | Vulkan | ◐ | ☐ | ☐ | ✅ |
 | ROCm | W0 verified on 5 gfx archs; dense and GDN models run all-native. Strict CPU parity is open in the measured near-tie regime (#269) | 44 registered ops including full GDN; ctest-green gfx1151/1103/1100/1201/1200 ([#41](https://github.com/mudler/vllm.cpp/issues/41)). APU managed allocation is unverified. [ROCM.md](ROCM.md) | ✅ | ✅ |
 | XPU / TPU | ☐ | ✅ | ◐ | ☐ |
