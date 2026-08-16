@@ -184,7 +184,23 @@ Consequences, both plausible and neither measured here: the 35B fp8 tower's
 upload is missing from load accounting, and its device pages are never re-tagged,
 which is the shape of the GB10 weight-residency ATS penalty. Carried across
 UNCHANGED — repairing it inside an extraction would be exactly the behaviour
-change hidden in a move that this row's gate cannot see. Filed separately.
+change hidden in a move that this row's gate cannot see. Filed as
+[#974](https://github.com/mudler/vllm.cpp/issues/974).
+
+## Owed
+
+- [#974](https://github.com/mudler/vllm.cpp/issues/974) — the FP8 resident
+  helpers upload without `load_stats::AddDeviceUpload` and without
+  `AdoptDeviceBytesAsHost`, which every other resident-weight helper in the same
+  file performs. Found here, carried across unchanged, and detailed under
+  §Found, not fixed.
+- **A gate sensitive to the pre-quantized arm's arithmetic.** M7 proves
+  `MatmulFp8CutlassPreQuantD` is REACHED by two CUDA cases; M5 proves no
+  available assertion can SEE a change to its folded alpha, because those cases
+  compare a silu arm against a sigmoid arm that both run it, so a common scale
+  factor cancels. The missing gate is the equality the header's own comment
+  claims: pre-quantized arm vs plain arm on the same activation. Coverage this
+  extraction did not create and did not close.
 
 ## Stop conditions
 
@@ -233,10 +249,6 @@ CPU arms are `test_linear_method` on this box; GPU arms are `test_qwen3_5_gdn_sp
 ### The inherited red
 
 `test_qwen3_5_gdn_spec_routing` is 119/123 on GB10 at `main` and is already recorded as such by [#907](https://github.com/mudler/vllm.cpp/issues/907). It was NOT inherited on trust: the CONTROL arm above reproduces it from the pre-extraction `qwen3_5.cpp` in the same build tree, with the identical four failing combinations and the identical mismatch counts. Nothing here narrows or widens it.
-
-### Owed
-
-The pre-quantized arm is REACHED by two CUDA cases (M7) but no available assertion is SENSITIVE to its arithmetic (M5). A gate that compares the pre-quantized arm against the plain arm on the same activation — the equality the header's own comment claims — is owed. That is coverage the extraction did not create and did not close.
 
 ## Outcome
 
