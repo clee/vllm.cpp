@@ -518,6 +518,23 @@ Where the embedding does bite is the FIRST latent frame of every render, which
 was a separate gap; it was closed on 2026-08-14 under issue #658, so the marker
 is now applied on every render.)
 
+**Generated keyframe slots are a different feature, and they are refused.**
+Upstream also lets the model *generate* extra frames at interior positions —
+`--num-generated-keyframes N` there, the per-generation extra
+`num_generated_keyframes` here. That is not a keyframe you supply; it is one you
+ask the model to invent, and each slot buys one pixel frame at the cost of a
+full latent frame of tokens. `0` is upstream's own default and means off, so
+passing it explicitly renders normally. A positive count is refused by name, and
+what the refusal names is the **readback**: the slots are the OUTPUT, so they
+have to be located by the layout the append recorded, extracted before the extra
+tokens are trimmed off, and then each decoded as a standalone one-frame clip,
+because a multi-frame causal decode would blend slots that were never temporally
+adjacent. Two plausible reasons are ruled out rather than left for a reader to
+re-derive: the token-APPEND machinery, which the last-frame arm above uses
+today, and the trained keyframe marker, which issue #658 landed and which every
+render already applies. A negative count is refused separately with upstream's
+own reason, since a malformed request and an unported arm are different answers.
+
 Reference-image, reference-video and reference-audio conditioning are still
 refused, each naming a different missing piece. **Two reasons this page used to
 give are now false and are recorded rather than deleted**, because a reader may
@@ -527,7 +544,7 @@ above (2026-08-16). What is left for reference VIDEO and reference IMAGE is a
 pixel path and a stage split. Nothing here turns a clip into latents: upstream
 decodes the reference at `height/downscale x width/downscale`, keeps frame 0 and
 then every Nth frame, and encodes the result
-(`ltx_pipelines/iclora_utils.py:87-89`, `:106-146`), and this engine's only
+(`ltx_pipelines/iclora_utils.py:87-89`, `:112-148`), and this engine's only
 pixel-to-latent route encodes exactly one frame at the phase's full resolution.
 And the reference item belongs to stage 1 only: upstream fuses the adapter into
 stage 1 and gives stage 2 `loras=()` and no reference item at all
