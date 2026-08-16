@@ -1022,7 +1022,16 @@ existed. The CPU tests digest the HOST symbols, and nothing read
 when a weight sample happened to address the drifted entry. Replaying the CUDA
 gate's own `std::mt19937(0x5EED)` stream, 266 of the 2048 `d_iq1s_grid` entries
 (13.0 %) are never addressed, which is why drifting entry 0 is caught and
-drifting entry 3 stays green at 150032/150032 assertions. The seal now exists
+drifting entry 3 stays green at 150032/150032 assertions. That figure came from
+the review and was re-derived here rather than quoted: replaying the stream over
+the dense gate's widest weight (16 rows times 8 super-blocks, 128 blocks, 4096
+grid draws) gives 1782 distinct entries and 266 never addressed.
+
+The new grouped gate widens the same weight to 64 rows (E=4, N=16), which is 512
+blocks and 16384 draws, and that reaches all 2048 entries. Recorded because it is
+true, not because it closes anything. It is coverage by accident of shape rather
+than by contract, one shape change away from shrinking again, and it says nothing
+at all about the other seven tables. The seal now exists
 (`src/vt/cuda/cuda_iq_table_seal.h` plus the gate case), it covers all eight
 device codebooks byte for byte, and both false comments were corrected.
 
