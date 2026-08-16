@@ -1282,3 +1282,18 @@ invisible for exactly as long as nobody reads the log.
 Fixed in flow: the inner declaration is renamed, with a comment saying why the
 name is not `loaded`. No detector weakened, no warning suppressed, no behaviour
 changed.
+
+**And behind it, a second one (#968).** With the `C4456` gone the same two jobs
+failed again, now on `C4244: conversion from 'const double' to 'float'` raised
+inside MSVC's own `<vector>` from `ltx2_video.cpp:203,214` — two narrowing
+`positions.assign` calls that `c7cb59fbb` (#964) landed on `main` while this row
+was in flight. **Not this row's**, and not fixed here: #964's own comment
+reasons that the round trip reproduces the bits, so the narrowing is deliberate
+and a silencing cast is a claim about that reasoning. The matched arm splits
+exactly on the merge base — #966 and #951 (on `c7cb59fbb`) fail, #967/#956/#950/
+#939/#938 (before it) do not.
+
+Two independent causes were stacked behind one habitually-red job name and the
+first hid the second, which is the finding worth carrying: **a known-red list
+tells you a job is often red, never that today's red is the same one.** Only
+reading the log does.
