@@ -1357,9 +1357,20 @@ TEST_CASE("ltx2 vae: the decode is BIT-IDENTICAL across thread counts") {
   //
   // Worker count 1 short-circuits ParallelForRows to `body(0, nr)` on the caller
   // (cpu_threadpool.cpp:423-426), so the 1-thread arm IS the pre-#1009 serial code
-  // path byte for byte, and every other arm is compared against it. The counts are
-  // not all powers of two on purpose: 3 and 5 do not divide the row counts, so the
-  // chunk boundaries land in different places on every arm.
+  // path byte for byte, and every other arm is compared against it.
+  //
+  // WHY 3 AND 5, STATED CORRECTLY. It is NOT that they fail to divide the row
+  // counts — they divide both of this fixture's conv row counts exactly. conv_in
+  // partitions 24*3*5 = 360 output lines and conv_out 1*3*5 = 15, and 3 and 5
+  // divide each of those. The mechanism is that a chunk boundary is a function of
+  // `nth * 4`, not of `nth`: ParallelForRows takes four chunks per thread
+  // (cpu_threadpool.cpp:428-431), so `dr = ceil(nr / nchunk)` (:443) with
+  // `nchunk = ceil(nr / ceil(nr / (nth*4)))`. At nr = 360 that is a stride of 45
+  // at 2 workers, 30 at 3, 18 at 5 and 12 at 8 — four DIFFERENT partitions of the
+  // same output, which is what the memcmp needs. Do NOT "fix" the fixture's row
+  // counts to make them indivisible by 3 and 5: that would change the shape for a
+  // reason that was never true, and 4 distinct strides is the property that
+  // matters.
   const Ltx2ThreadFixture f = MakeLtx2ThreadFixture();
 
   std::vector<float> base;

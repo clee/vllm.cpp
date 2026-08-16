@@ -877,10 +877,13 @@ VAE decode at 0% GPU, because that decode has no device arm
 It is no longer *single-threaded*, which is what this paragraph used to say. The
 decode's convolutions now dispatch across `VLLM_CPP_CPU_THREADS` workers
 (default `hardware_concurrency`), bit-identical at every worker count —
-[#1009](https://github.com/mudler/vllm.cpp/issues/1009), measured at **9.14x on
-20 workers** against one. Read that as a decode figure and not a render one: the
-wall above was recorded on GB10 before the change and has not been re-measured,
-and the 9.14x was taken on a synthetic decode shape on a 20-core x86 host. Set
+[#1009](https://github.com/mudler/vllm.cpp/issues/1009), measured at **roughly
+9x on 16 to 20 workers** against one. Take the band rather than a decimal: the
+medians are 9.15x at 16 and 9.14x at 20, but those two counts spread 21-23% run
+to run on a box that was not idle, where every count at or below 8 spreads under
+7%. Read it as a decode figure and not a render one: the wall above was recorded
+on GB10 before the change and has not been re-measured, and the ~9x was taken on
+a synthetic decode shape on a contended 20-core x86 host. Set
 `VLLM_CPP_CPU_THREADS` lower if the render has to share the box.
 
 *The render behind those numbers was NOT prompted, and it renders a scene without

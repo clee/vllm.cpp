@@ -7,9 +7,12 @@ Parent: lever 3 of the `LTX25-DECODE-SPEED` investigation
 ([#1006](https://github.com/mudler/vllm.cpp/issues/1006)), which filed this
 issue and lists it under `## Owed`. That spec is
 `.agents/specs/ltx25-decode-speed.md` on [PR
-#1018](https://github.com/mudler/vllm.cpp/pull/1018) and is **not yet on
-`main`**, so it is cited by pull request rather than by relative link, exactly as
-the sibling dtype row ([`ltx25-decode-dtype.md`](ltx25-decode-dtype.md)) does.
+#1038](https://github.com/mudler/vllm.cpp/pull/1038), branch
+`row/LTX25-DECODE-SPEED-R2`, and is **not yet on `main`**, so it is cited by pull
+request rather than by relative link, exactly as the sibling dtype row
+([`ltx25-decode-dtype.md`](ltx25-decode-dtype.md)) does. It was PR #1018 while
+this row was implemented; that pull request is now **closed** and #1038
+supersedes it, so every citation here names the open one.
 
 Sibling, and the reason this row is riskier than it looks:
 [`ltx25-decode-dtype.md`](ltx25-decode-dtype.md) (#1008) landed at `d1b0ea3a8`
@@ -20,9 +23,11 @@ change a summation order.
 ## Now
 
 `DONE`, pending review. The three convolution sites dispatch, the numerics are
-byte-identical to the serial arm, and the CPU A/B is in `## Outcome`: **9.14x at
-20 workers and 9.67x at the checkpoint's real channel width**, measured, on this
-box, at a recorded load. No end-to-end render number, and none is claimed.
+byte-identical to the serial arm, and the CPU A/B is in `## Outcome`: **~9x at 16
+to 20 workers**, medians 9.15x and 9.14x, on a box that was not idle and where
+those two counts spread 21-23% run to run. A second channel width corroborates at
+9.67x on n=3. Read the band, not the decimals; §8.3 carries both with the load
+they were taken at. No end-to-end render number, and none is claimed.
 
 ## 0. Scope
 
@@ -55,7 +60,7 @@ at fixed thread counts on 20 local cores (§6).
 
 Every oracle runs this decoder on an accelerator and none of them has a
 host-parallel arm to port. The four anchors below are the parent investigation's
-([`ltx25-decode-speed.md` on PR #1018](https://github.com/mudler/vllm.cpp/pull/1018) §2), read there at the
+([`ltx25-decode-speed.md` on PR #1038](https://github.com/mudler/vllm.cpp/pull/1038) §2), read there at the
 revisions named; none of these repositories is checked out on this box, so this
 row cites them rather than re-deriving them. `ltx_core` has no
 `.agents/oracles/` file at all — that pin is owed by
@@ -76,7 +81,7 @@ lists both.
   (`ltx2_diffusion_decoder.py:208-209`, *"No CPU path"*).
 
 So this row is a **local seam**, not an upstream mirror, and
-[`ltx25-decode-speed.md` on PR #1018](https://github.com/mudler/vllm.cpp/pull/1018) §6 lever 3 records it as such.
+[`ltx25-decode-speed.md` on PR #1038](https://github.com/mudler/vllm.cpp/pull/1038) §6 lever 3 records it as such.
 What it does mirror is *this tree's own* CPU convolution:
 `src/vt/cpu/cpu_conv2d.cpp:75-78 @ d1b0ea3a8` partitions a 2-D convolution over
 `n * cout * hout` output lines through the same call, with the same comment this
@@ -268,21 +273,45 @@ large-render host, and no installed `ltx_core`.
 | A SIMD inner tap loop | Separate summation-order question; see §0. |
 | The composition of this row with #1008 | the parent spec §6 warns that a threaded arm may become memory-bound where the scalar arm was ALU-bound. This row measures its own axis only. |
 | An end-to-end render number | `dgx.casa` unreachable; no GPU here. |
+| A per-SITE dispatch gate — [#1044](https://github.com/mudler/vllm.cpp/issues/1044) | §8.6's T1/T2/T3 measured it: reverting any ONE of the three sites is detected by nothing, because Case A reads one cursor the whole pool shares. Correctness stays gated; what is ungated is a site silently going serial again. Closing it needs a per-dispatch `Threadpool::RunCount()` and an EXACT expected count, plus a `res_x_y` fixture for `Linear3d`. A new gate needs its own red-before evidence and its own review, so it is a row rather than an in-flow repair. |
 
 No `.agents/issue-index.md` row is appended for #1009. That row already exists at
-`.agents/issue-index.md:275` on PR
-[#1018](https://github.com/mudler/vllm.cpp/pull/1018), which filed the issue and
-is unmerged. `.gitattributes` sets `merge=union` on that file and
+`.agents/issue-index.md:279` on PR
+[#1038](https://github.com/mudler/vllm.cpp/pull/1038), branch
+`row/LTX25-DECODE-SPEED-R2`, which is the open successor to the closed PR #1018
+and is unmerged. `.gitattributes` sets `merge=union` on that file and
 `scripts/check-agent-record.py` refuses a duplicate issue number, so appending a
-second copy here would turn `main` red for every branch the moment #1018 merges —
+second copy here would turn `main` red for every branch the moment #1038 merges —
 which is exactly what a duplicate #995 row did on 2026-08-16. The sibling dtype
 row made the same call for #1008 and recorded it in its pull request body.
+
+**#1044 is different and IS appended.** It is a new issue this change filed, it
+is not one of the ids #1038 appends (#1006-#1012, #1014-#1016, #1021, #1024,
+#1040), and its index row names `LTX25-DECODE-THREADS` as the owning row. The
+owner has to be named in the row rather than left to this section, because
+`owed_issues()` in `scripts/check-agent-record.py` splits on a bare `\n## Owed`
+and this spec's heading is numbered, so nothing listed here is visible to that
+ratchet.
 
 ## 8. Outcome — what was measured
 
 Everything below was measured on the shared 20-core development box on
-2026-08-16, at branch head `dac85969c`. No GPU was involved and none was
-available; `dgx.casa` was unreachable for this row's whole duration.
+2026-08-16, at **`d653f7319`**, the implementation commit on this branch. No GPU
+was involved and none was available; `dgx.casa` was unreachable for this row's
+whole duration.
+
+**The commit the measurement ran on was `dac85969c`, and that SHA is deliberately
+not the citation.** It was rewritten out of the branch and is not an ancestor of
+the head (`git merge-base --is-ancestor dac85969c HEAD` exits **1**), so it does
+not resolve in a fresh clone and citing it would name evidence nobody can reach.
+The measurement transfers because the two commits are **byte-identical in
+`src/` and `tests/`**: `git rev-parse dac85969c:src d653f7319:src` both give
+`7444ffa171b0c2868c505b5b9ea1113fa39c5477` and both `:tests` give
+`f0e5eac268119e9fe94da478c50e2d668a2e64b3`, and
+`git diff --stat dac85969c d653f7319` touches only
+`.agents/specs/ltx25-decode-threads.md`, `docs/BENCHMARKS.md`,
+`docs/FEATURES.md` and `docs/USAGE.md`. Every number below came out of a binary
+built from the code `d653f7319` carries.
 
 ### 8.1 The numerics did not move at all, and that is the point
 
@@ -359,6 +388,11 @@ convolutions, 8.930 GFLOP.
 A second shape at the checkpoint's real `base_channels`, 3 runs each:
 `c = 128`, latent `128 x 5 x 32 x 32`, 22.755 GFLOP — 5.1015 s at one thread
 against 0.5276 s at twenty, **9.67x**.
+
+**That 9.67x is the weakest number this row produced, and it is labelled as
+such wherever it is projected.** `n = 3` against the table's 14, no min/median/max
+recorded, and the same contended box — so it corroborates the table's shape at a
+second channel width and is not independently a three-significant-figure result.
 
 **The load this was taken at.** One-minute load average 4.03 to 6.77 across both
 sweeps, on a box whose one-minute average had been between 2 and 52 earlier the
@@ -445,7 +479,8 @@ unrelated `unused-function` complaints hundreds of lines away. The runner
 refused to draw a verdict, printed the errors and restored the tree. Had it run
 the stale binary instead, it would have printed a plausible 42/42.
 
-**T1, T2 and T3 are an honest gap, and it is owed.** Case A observes one
+**T1, T2 and T3 are an honest gap, and it is owed as
+[#1044](https://github.com/mudler/vllm.cpp/issues/1044)** (§7). Case A observes one
 work-stealing cursor, and the cursor is shared: reverting any single site leaves
 the other two dispatching, so the case reads non-zero and passes. It gates *"at
 least one of the three sites dispatches partitioned work"*, not each site
