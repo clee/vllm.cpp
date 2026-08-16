@@ -5171,10 +5171,25 @@ class Qwen35ExpertStream {
   // Returns the slot's bytes for `expert` of the tower based at `base`, or
   // nullptr when the cache is exhausted for this step (the caller then reads
   // the tower directly, which is correct but slow, and is counted).
+  // `fd`/`file_offset` describe where the slice lives on DISK. When they are
+  // valid the slot is filled by pread, which is the form the design specified
+  // and the only one that changes the I/O: a memcpy from the mapping still
+  // traps every 4 KiB page of its source, which is why W4 measured no decode
+  // gain. The mapping copy stays as the fallback for a weight with no
+  // descriptor (an expanded or repacked tensor owns its bytes outright).
   uint8_t* Slice(const uint8_t* base, int64_t expert, size_t offset,
-                 size_t bytes) {
+                 size_t bytes, int fd, size_t file_offset) {
     const int32_t tower = TowerId(base);
     const ExpertKey key{tower, static_cast<int32_t>(expert)};
+    if (fd >= 0) {
+      const ExpertStreamer::Result r =
+          streamer_->EnsureFile(key, fd, file_offset + offset, bytes);
+      if (r.slot < 0) {
+        ++exhausted_;
+        return nullptr;
+      }
+      return store_->Slot(r.slot);
+    }
     // Ask the kernel for the WHOLE slice up front, before the copy touches it.
     //
     // This is the difference between one readahead and 608 demand faults. The
@@ -5256,7 +5271,7 @@ Tensor KqExpertSlice(Dev d, const OwnedTensor& w, int64_t N, int64_t K,
       const uint8_t* base = w.bytes.data();
       if (uint8_t* slot = st->Slice(base, expert,
                                     static_cast<size_t>(row_off) * row_bytes,
-                                    bytes)) {
+                                    bytes, w.mmap_fd, w.mmap_file_offset)) {
         Tensor wt = ResidentWeight(d, w);  // inherit dtype/device/repack markers
         wt.data = static_cast<void*>(slot);
         wt.rank = 2;
