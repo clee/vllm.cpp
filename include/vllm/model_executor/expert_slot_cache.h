@@ -85,6 +85,13 @@ class ExpertSlotCache {
   // protected by the current step. That means the budget is smaller than one
   // step's working set, which is a configuration error the caller must refuse
   // rather than work around.
+  // Is `key` resident RIGHT NOW, without touching its hotness or LRU order?
+  //
+  // A pure query, deliberately separate from Acquire: a caller that wants to
+  // know whether a fill is coming (to prefetch, or to count) must not perturb
+  // the eviction order by asking. Acquire is the only thing that scores.
+  bool Contains(const ExpertKey& key) const;
+
   bool capacity_exhausted() const { return capacity_exhausted_; }
 
   bool IsResident(const ExpertKey& key) const {

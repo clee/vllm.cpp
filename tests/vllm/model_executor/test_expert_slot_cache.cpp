@@ -247,3 +247,31 @@ TEST_CASE("a realistic top-k step: repeated experts cost one slot, not k") {
   // The same step again is now free.
   for (int32_t e : selected) CHECK(c.Acquire(K(5, e)).hit);
 }
+
+TEST_CASE("Contains is a PURE probe: it must not change what gets evicted") {
+  // The prefetch caller asks "will this be a fill?" before every slice. If the
+  // asking scored the entry, the probe would decide the eviction order it was
+  // only meant to observe, and the hotness policy would be measuring itself.
+  vllm::ExpertSlotCache c(2);
+  REQUIRE(c.Acquire(K(0, 1)).slot >= 0);  // A
+  REQUIRE(c.Acquire(K(0, 2)).slot >= 0);  // B
+  c.EndStep();
+
+  const int64_t hits_before = c.hits();
+  for (int i = 0; i < 50; ++i) CHECK(c.Contains(K(0, 2)));
+  CHECK_FALSE(c.Contains(K(0, 99)));
+  // A probe is not a hit: the counters a benchmark reads must not move.
+  CHECK(c.hits() == hits_before);
+
+  // Make A genuinely hotter by ACQUIRING it, then admit C. The victim must be
+  // B, which only the probe ever touched. If Contains had scored, those 50
+  // probes would have made B the survivor and A the victim instead.
+  REQUIRE(c.Acquire(K(0, 1)).hit);
+  c.EndStep();
+  const vllm::ExpertAcquisition ev = c.Acquire(K(0, 3));
+  REQUIRE(ev.slot >= 0);
+  REQUIRE(ev.evicted.has_value());
+  CHECK(ev.evicted->expert == 2);
+  CHECK(c.Contains(K(0, 1)));
+  CHECK_FALSE(c.Contains(K(0, 2)));
+}
