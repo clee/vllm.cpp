@@ -81,7 +81,7 @@ Three blockers, each named by the symbol that has to change. None of them is
 
 ### 2.1 `Ltx2DitForward` refuses a one-stream call, and its stated reason does not describe T2A
 
-`src/vllm/model_executor/models/ltx2_dit.cpp:765` is
+`src/vllm/model_executor/models/ltx2_dit.cpp:765 @ 332aed738` is
 
 ```
 VT_CHECK(video != nullptr && audio != nullptr, "... LTXModelType.VideoOnly and
@@ -110,15 +110,15 @@ already handles the case.
 
 **The forward already handles it.** Every line of `Ltx2DitForward` below the
 check is written against `video != nullptr` / `have_both`
-(`ltx2_dit.cpp:786-869`), and `Ltx2TransformerBlockForward` computes
+(`ltx2_dit.cpp:786-869 @ 332aed738`), and `Ltx2TransformerBlockForward` computes
 `run_vx` / `run_a2v` / `run_v2a` from `video_x != nullptr && tv > 0`
-(`ltx2_dit.cpp:248-251`). Lifting the check reaches a path that was already
+(`ltx2_dit.cpp:248-251 @ 332aed738`). Lifting the check reaches a path that was already
 written; it does not add one.
 
 ### 2.2 `enabled = false` is NOT the same shape, and the difference renders
 
 The refusal's own message says to "use `enabled` to run one stream of an AV
-model", and `include/vllm/model_executor/models/ltx2.h:506-508` repeats it. That
+model", and `include/vllm/model_executor/models/ltx2.h:506-508 @ 332aed738` repeats it. That
 advice is correct for the A2V and joint pipelines. **It is wrong for T2A**, and
 this is the detail that fails silently if guessed.
 
@@ -132,7 +132,7 @@ It tests `video is not None`, **not** `video.enabled`. So an AV forward handed a
 present-but-disabled video stream still runs video->audio cross attention, taking
 its context from a video latent that T2A never intended to exist — and returns a
 finished waveform. Our port mirrors that polarity exactly at
-`ltx2_dit.cpp:251`, so the same trap is live here.
+`ltx2_dit.cpp:251 @ 332aed738`, so the same trap is live here.
 
 `video = nullptr` is the only shape that reproduces `LTXModel.forward(video=None,
 ...)` (`model.py:492-538`, the `video_args = ... if video is not None else None`
@@ -160,7 +160,7 @@ T2A builds a `FactoryGuidedDenoiser` (`t2a_one_stage.py:154-161`) over
 `audio_guider_params` — `cfg_scale=7.0`, `stg_scale=1.0`, `rescale_scale=0.7`,
 `stg_blocks=[28]` on the 2.3/2.4/2.5 lineage (`utils/constants.py:58-66`,
 `:82-87`, `:118`) — with `modality_scale` pinned to **1.0** by the CLI itself
-(`t2a_one_stage.py:200-203`: "Audio-only generation has no video modality, so the
+(`t2a_one_stage.py:200-202`: "Audio-only generation has no video modality, so the
 video->audio (v2a) cross-modal guidance is meaningless here. 1.0 disables it").
 
 Read against `guiders.py:275-287`, those defaults mean
@@ -172,13 +172,13 @@ would be a different trajectory from upstream's default, and no shape, token
 count or file length could see it.
 
 The bricks exist and are gated; the WIRING does not. `Ltx2MultiModalGuidance`
-(`ltx2_pipeline.h:323`), `Ltx2CfgDelta`, `Ltx2StgDelta`,
+(`ltx2_pipeline.h:323 @ 332aed738`), `Ltx2CfgDelta`, `Ltx2StgDelta`,
 `Ltx2GuiderParamsForSigma`, `Ltx2PerturbationConfig` and
 `Ltx2BatchedPerturbationConfig` are all ported with goldens and have **no product
 caller** — the "test-only driver" shape `.agents/reachability.md` enumerates. What
 is genuinely absent is one thing: the DiT forward runs upstream's
 `perturbations=None` path only, and says so at
-`include/vllm/model_executor/models/ltx2.h:42-46`.
+`include/vllm/model_executor/models/ltx2.h:42-46 @ 332aed738`.
 
 ---
 
@@ -248,7 +248,7 @@ Per step, mirroring `FactoryGuidedDenoiser` over `MultiModalGuider.calculate`
 | `uncond_perturbed` | `DoPerturbedGeneration()` | positive context, audio self-attn perturbed on `stg_blocks` |
 | `uncond_modality` | `DoIsolatedModalityGeneration()` | — **refused by name**, see §7 |
 
-`ShouldSkipStep(step)` (`guiders.py:288-291`) short-circuits to the plain
+`ShouldSkipStep(step)` (`guiders.py:287-291`) short-circuits to the plain
 conditional prediction, and `skip_step` defaults to 0 so it never fires on the
 default path — which is why the branch is written to be reachable from the extra
 rather than left implicit.
@@ -292,7 +292,7 @@ Two per-generation extras are added, both upstream CLI arguments:
   (`utils/args.py:1089-1119`). Absent means the params table's own value.
 
 `modality_scale` gets NO extra, and that is not an omission: the CLI pins it to
-1.0 at `t2a_one_stage.py:200-203` and there is no upstream surface that varies it
+1.0 at `t2a_one_stage.py:200-202` and there is no upstream surface that varies it
 on this pipeline.
 
 ### 3.6 The recipe
@@ -306,7 +306,7 @@ run down the video path by accident.
 
 The 2.0 and 2.3 rows take `kOmniNegativePrompt` and the 2.4/2.5 rows take
 `LightricksNegativePrompt()`, which is what `ResolveLtx2PipelineRecipe`'s
-`one_stage` arm already does (`ltx2_pipeline.cpp:1239-1247`) — the negative prompt
+`one_stage` arm already does (`ltx2_pipeline.cpp:1239-1247 @ 332aed738`) — the negative prompt
 travels with the generation, not with the pipeline.
 
 ### 3.7 Load
@@ -402,6 +402,56 @@ nothing and is recorded as such. `-tc` filters are comma-free and the case count
 is asserted non-zero, because doctest splits on a comma and runs UNRELATED cases
 to a green SUCCESS.
 
+### What the mutation pass actually found
+
+Focused gate `./build/tests/test_ltx2_video "--test-case=*t2a*"`, unmutated at
+7 cases / 496 assertions / exit 0. Each mutation applied to ONE file, rebuilt,
+run, restored in a `finally` and the restore verified by **sha256** rather than
+assumed. The harness rebuilds the restored tree before anything else measures it.
+
+| Mutation | `git diff --stat` | BUILT | exit | verdict |
+|---|---|---|---|---|
+| M1 delete the production call site (the reachability mutation) | `ltx2_video.cpp \| 2 +-` | YES (0 errors) | 1 | DETECTED, 3 of 6 cases failed |
+| M2 hand the forward a present-but-DISABLED video stream instead of `nullptr` | `ltx2_t2a.cpp \| 3 ++-` | YES (0 errors) | 1 | DETECTED |
+| M3 never run the unconditional forward | `ltx2_t2a.cpp \| 2 +-` | YES (0 errors) | 1 | DETECTED |
+| M4 ignore `stg_blocks` and perturb EVERY block | `ltx2_t2a.cpp \| 2 +-` | YES (0 errors) | 1 | DETECTED |
+| M5 `all_perturbed` falls through to ordinary attention | `ltx2.cpp \| 2 +-` | YES (0 errors) | 1 | DETECTED |
+| M6 revert the `one_stage` `noise_scale` to the struct default (#1013) | `ltx2_pipeline.cpp \| 2 +-` | YES (0 errors) | 1 | DETECTED |
+| M7 scale the initial latent by `sigmas[0]` | `ltx2_t2a.cpp \| 1 +` | YES (0 errors) | 0 | **SURVIVED** — see below |
+| M8 write a frame on the audio-only path | `ltx2_video.cpp \| 1 +` | YES (0 errors) | 1 | DETECTED |
+
+**M7 SURVIVED, and the resolution is the useful part.** It is the mutation a
+reader coming from another flow-matching sampler expects to be REQUIRED — scaling
+the initial noise by the first sigma — and it changed nothing. The reason is not
+a blind gate: it is an identity. `LTX2Scheduler` starts at `linspace(1, 0, steps
++ 1)[0] == 1`; the shift map sends 1 to `exp(s)/(exp(s) + (1/1 - 1))`, exactly 1
+(`schedulers.py:41-45`); the stretch sends it to `1 - (1 - 1)/scale_factor`,
+again exactly 1 (`:47-55`). So `sigmas[0]` is 1.0 for every step count.
+
+Rather than record "a mutation survived", the identity is now GATED — the case
+"the schedule starts at exactly 1.0" pins `sigmas.front() == 1.0F` across four
+step counts. If upstream ever moves the first sigma off 1, that fires and the two
+forms stop agreeing.
+
+**And that case found a second thing.** `steps = 1` returns `-nan`, on both
+sides: the non-zero sigma list is `[1.0]`, so `one_minus_z` is `[0.0]`,
+`scale_factor = 0 / (1 - terminal)` is 0, and the stretch computes `1 - 0/0`
+(`schedulers.py:49-54`). It is upstream's own arithmetic, not a defect here, and
+it is excluded from the pin with the reason written beside it rather than
+silently skipped. A one-step schedule is recorded under `## Owed`.
+
+**Two harness notes, because both would otherwise read as verdicts about the
+code.** A `.pyc` for `scripts/agent-start.py` was truncated to exactly 4096 bytes
+on this shared box, and `scripts/agent-preflight.sh` reported
+`FAIL test_agent_start` with an `EOFError: marshal data too short` — a corrupt
+byte-cache presenting as a failing gate. Removing the file made it pass 20/20.
+And M4's first form asserted the STG perturbation on a latent filled with a
+constant: self-attention over identical rows returns a weighted average of
+identical values, which IS the value projection, so the perturbation was a
+numeric no-op and the case reported "the perturbation changed nothing" about a
+correct build. The fixture latent now varies per element, and the reason is in
+the test.
+
 ---
 
 ## 6. Gates
@@ -469,6 +519,33 @@ f32 by upstream's own choice (`vocoder.py:585-595`, mirrored in
 
 ---
 
+## 7b. The bug this row found and fixed in flow
+
+[#1013](https://github.com/mudler/vllm.cpp/issues/1013). `OneStagePhase`
+(`ltx2_pipeline.cpp`) left `Ltx2PhaseRecipe::noise_scale` at the struct default
+of **0.0**, and 0.0 is not "no extra noise": `Ltx2GaussianNoise` is
+`latent + noise_scale * (noise - latent)`, so at 0.0 the state stays exactly as
+`create_initial_state` wrote it, which with no initial latent is **all zeros**.
+A `one_stage` render therefore denoised a zero tensor on both streams.
+
+Upstream's `ModalitySpec.noise_scale` defaults to 1.0
+(`ltx-pipelines/utils/types.py:110`) and `TI2VidOneStagePipeline.__call__`
+constructs both specs without it (`ti2vid_one_stage.py:233-239`). The two
+neighbouring recipes set it explicitly, which is what made the omission legible.
+
+Fixed here rather than deferred, per AGENTS.md § *Every change starts from an
+issue*, because the `t2a_one_stage` rows are built FROM `OneStageRecipe` and
+would have inherited it. No gate saw it because every end-to-end test loads
+`distilled_two_stage`, and a zero-initialized denoise still returns a finite clip
+of the right size, frame count and sample rate. M6 above is the mutation that now
+holds it.
+
+**NOT claimed for `dmd2`.** `PositiveOnlyRecipe` leaves the same field at 0.0 and
+its source is vLLM-Omni's `LTX_POSITIVE_ONLY_RECIPE`, which is not checked out
+here. Left as-is and named rather than corrected by analogy: a recipe whose
+upstream nobody read is exactly where a plausible fix lands wrong. Recorded in
+#1013.
+
 ## Owed
 
 - **The DEVICE arm.** `Ltx2DitForwardDevice` dereferences `*video`
@@ -489,12 +566,19 @@ f32 by upstream's own choice (`vocoder.py:585-595`, mirrored in
 - **`uncond_modality` (isolated-modality guidance).** REFUSED BY NAME on this
   pipeline, and the refusal is upstream's own reasoning rather than a local
   limit: `modality_scale` is pinned to 1.0 for T2A because there is no video
-  modality to isolate (`t2a_one_stage.py:200-203`). A caller who reaches it
+  modality to isolate (`t2a_one_stage.py:200-202`). A caller who reaches it
   through another pipeline gets a message naming the missing fourth forward.
 - **AUTO duration.** `resolve_num_frames`' predicting arm needs a constructed
   `DurationPredictor`; `Ltx2DurationHeadForward` is ported and gated (including
   the audio-only case, `kLtx2DurAudioOnlyGolden`) and nothing constructs one.
   Inherited from the engine, not introduced here.
+- **A one-step schedule.** `Ltx2SigmaSchedule(1, ...)` returns `-nan` as its
+  first sigma, mirroring upstream's own division by zero
+  (`schedulers.py:49-54`). Neither side is checked against it; a T2A request with
+  `steps = 1` therefore produces NaN. Named rather than defended against,
+  because the correct behaviour is upstream's to decide and this port does not
+  get to invent one.
+- **The `dmd2` recipe's `noise_scale`**, see §7b.
 - **A real-checkpoint T2A render.** Gated on the reduced fixture only; the GPU
   was out of bounds for this row.
 - **Value goldens from executed upstream for the T2A COMPOSITION.** The bricks

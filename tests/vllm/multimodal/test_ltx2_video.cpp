@@ -4794,3 +4794,421 @@ TEST_CASE("ltx2 retake: the wrong recipe refuses, and the reference arm still do
     }
   }
 }
+
+// ─── TEXT-TO-AUDIO (row LTX25-T2A-ONE-STAGE, issue #1005) ────────────────────
+//
+// `T2AOneStagePipeline` (ltx-pipelines t2a_one_stage.py:43, `__call__` at :109)
+// at Lightricks/LTX-2 @ fd4ded7f. UPSTREAM SHIPS NO TESTS at that pin — `find
+// /home/mudler/_git/LTX-2 -name 'test_*.py'` returns 0 — so there is nothing to
+// port, and what follows pins upstream's BEHAVIOURS against `file:line` anchors
+// instead. At least one assertion in each refusal case is tied to a LOCAL fact,
+// because a case that asserts only upstream symbol names cannot see a refusal
+// whose claim about THIS tree has gone stale.
+namespace {
+
+// A t2a engine on the shipped fixture. NO `video_vae_path`, which is the load
+// half of the row: upstream's `T2AOneStagePipeline.__init__` never calls
+// `model_paths.video_vae()` (t2a_one_stage.py:68-107).
+vllm::multimodal::VideoModelParams T2aParams(const ltx2_fixture::Paths& paths) {
+  vllm::multimodal::VideoModelParams mp;
+  mp.dit_path = paths.dit;
+  mp.audio_vae_path = paths.audio_vae;
+  mp.encoder_path = paths.encoder;
+  mp.extras[vllm::multimodal::kLtx2EncoderConfigPathExtra] = paths.encoder_config;
+  mp.extras[vllm::multimodal::kLtx2PipelineKindExtra] = "t2a_one_stage";
+  mp.device = 0;
+  return mp;
+}
+
+vllm::multimodal::VideoGenParams T2aGen(const std::string& out_dir, const std::string& prompt) {
+  vllm::multimodal::VideoGenParams gen;
+  gen.prompt = prompt;
+  gen.num_frames = 25;
+  gen.steps = 2;  // two sigma intervals is enough to exercise the loop
+  gen.has_seed = true;
+  gen.seed = 11;
+  gen.output_dir = out_dir;
+  // The reduced DiT has TWO blocks (ltx2_video_fixture.h `ReducedDitParams`), so
+  // the params table's own `stg_blocks = [28]` is out of range here. Named
+  // explicitly rather than by turning STG off, because the default-block refusal
+  // is its own case below and this one is about the render.
+  gen.extras[vllm::multimodal::kLtx2AudioStgBlocksExtra] = "1";
+  // The recipe's own default negative prompt is upstream's
+  // `DEFAULT_NEGATIVE_PROMPT` — an English sentence — and this fixture's
+  // tokenizer carries a three-token vocabulary. Overriding it here is what the
+  // `--negative-prompt` flag is for (utils/args.py:1083-1088), and the DEFAULT's
+  // reachability is asserted separately on the recipe rather than by pushing an
+  // out-of-vocabulary string through a reduced tokenizer.
+  gen.extras[vllm::multimodal::kLtx2NegativePromptExtra] = "c b a";
+  return gen;
+}
+
+}  // namespace
+
+TEST_CASE("ltx2 t2a: an audio-only render returns a waveform and NO picture") {
+  Workspace ws;
+  const std::unique_ptr<vllm::multimodal::VideoEngine> engine =
+      vllm::multimodal::LoadVideoEngine(T2aParams(ws.paths));
+  REQUIRE(engine != nullptr);
+  const auto* ltx = dynamic_cast<const vllm::multimodal::Ltx2VideoEngine*>(engine.get());
+  REQUIRE(ltx != nullptr);
+  CHECK(ltx->pipeline_kind() == "t2a_one_stage");
+
+  const std::string out = ws.root + "/t2a";
+  const vllm::multimodal::VideoResult result = engine->Generate(T2aGen(out, "a b c"));
+
+  // 1. NO PICTURE, said three ways, because each catches a different build.
+  //    `frame_count` catches a render that produced frames; the empty
+  //    `frame_dir` and `mux_argv` catch one that produced none and still handed
+  //    the caller a directory and an ffmpeg command over a pattern matching no
+  //    file.
+  CHECK(result.frame_count == 0);
+  CHECK(result.frame_dir.empty());
+  CHECK(result.mux_argv.empty());
+  CHECK(result.mux_output_path.empty());
+  CHECK(result.width == 0);
+  CHECK(result.height == 0);
+  // ...AND NO FRAME ON DISK. This is the half the fields cannot make: a build
+  // that wrote `frame_000000.ppm` and reported zero passes every check above.
+  {
+    std::ifstream frame(out + "/frame_000000.ppm", std::ios::binary);
+    CHECK_MESSAGE(!frame.good(), "an audio-only render wrote a frame");
+  }
+
+  // 2. THERE IS SOUND, at the vocoder's own output rate, and it is not silence.
+  //    The lower bound is the assertion a size or a rate cannot make: a
+  //    zero-initialized decode produces a perfectly well-formed WAV of exactly
+  //    the right length.
+  CHECK(result.sample_rate == 48000);
+  const std::string wav = ReadAll(result.audio_path);
+  REQUIRE(wav.size() > 44);
+  CHECK(wav.compare(0, 4, "RIFF") == 0);
+  {
+    int peak = 0;
+    for (size_t i = 44; i + 1 < wav.size(); i += 2) {
+      int16_t s = 0;
+      std::memcpy(&s, wav.data() + i, sizeof(s));
+      peak = std::max(peak, s < 0 ? -static_cast<int>(s) : static_cast<int>(s));
+    }
+    CHECK_MESSAGE(peak > 0, "the rendered waveform is digital silence");
+  }
+
+  const vllm::multimodal::Ltx2ConditioningTrace trace = ltx->last_conditioning();
+  CHECK(trace.completed);
+  CHECK(trace.t2a_rendered);
+
+  // 3. NO VIDEO STREAM EVER REACHED THE DiT. This is the whole reason the field
+  //    exists: upstream's `run_v2a` tests PRESENCE, not `enabled`
+  //    (transformer.py:269), so a build that handed the forward a
+  //    present-but-disabled video stream would feed video->audio cross attention
+  //    from a latent this pipeline never meant to exist — and would return a
+  //    waveform of exactly the right length, channel count and sample rate.
+  CHECK_FALSE(trace.t2a_video_stream_present);
+
+  // 4. THE GUIDER RAN, arm by arm. The counters are incremented at the forward,
+  //    so this is a statement about the passes that were issued rather than
+  //    about the parameters that were meant to drive them.
+  CHECK(trace.t2a_cond_forwards == 2);
+  CHECK(trace.t2a_uncond_forwards == 2);
+  CHECK(trace.t2a_perturbed_forwards == 2);
+  //    ...and STG perturbed the block that was ASKED for. A count alone cannot
+  //    tell block 1 from block 0, and which block is perturbed is the whole of
+  //    STG.
+  REQUIRE(trace.t2a_perturbed_blocks.size() == 1);
+  CHECK(trace.t2a_perturbed_blocks[0] == 1);
+
+  // 5. The latent is populated. A digest alone is stable across a collapse to
+  //    zeros; the absmax is the bound that is not.
+  CHECK(trace.audio_tokens > 0);
+  CHECK(trace.audio_latent_absmax > 1e-6);
+}
+
+TEST_CASE("ltx2 t2a: the guidance ARMS are separable, and each one moves the render") {
+  Workspace ws;
+  const vllm::multimodal::VideoModelParams mp = T2aParams(ws.paths);
+
+  struct Out {
+    vllm::multimodal::Ltx2ConditioningTrace trace;
+    std::string wav;
+  };
+  const auto render = [&](const std::string& tag,
+                          const std::map<std::string, std::string>& overrides) {
+    const std::unique_ptr<vllm::multimodal::VideoEngine> engine =
+        vllm::multimodal::LoadVideoEngine(mp);
+    REQUIRE(engine != nullptr);
+    vllm::multimodal::VideoGenParams gen = T2aGen(ws.root + "/" + tag, "a b c");
+    for (const auto& kv : overrides) gen.extras[kv.first] = kv.second;
+    const vllm::multimodal::VideoResult result = engine->Generate(gen);
+    const auto* ltx = dynamic_cast<const vllm::multimodal::Ltx2VideoEngine*>(engine.get());
+    REQUIRE(ltx != nullptr);
+    return Out{ltx->last_conditioning(), ReadAll(result.audio_path)};
+  };
+
+  const Out full = render("g_full", {});
+  // `cfg_scale = 1.0` is `math.isclose(cfg_scale, 1.0)` — upstream's OWN
+  // predicate for "no unconditional generation" (guiders.py:275-277), and NOT an
+  // exact `!= 1.0` comparison.
+  const Out no_cfg = render("g_nocfg", {{vllm::multimodal::kLtx2AudioCfgScaleExtra, "1.0"}});
+  const Out no_stg = render("g_nostg", {{vllm::multimodal::kLtx2AudioStgScaleExtra, "0.0"}});
+
+  // Each arm turns off exactly its own forward, and leaves the others alone.
+  CHECK(no_cfg.trace.t2a_uncond_forwards == 0);
+  CHECK(no_cfg.trace.t2a_perturbed_forwards == full.trace.t2a_perturbed_forwards);
+  CHECK(no_stg.trace.t2a_perturbed_forwards == 0);
+  CHECK(no_stg.trace.t2a_uncond_forwards == full.trace.t2a_uncond_forwards);
+  CHECK(no_cfg.trace.t2a_cond_forwards == full.trace.t2a_cond_forwards);
+
+  // AND EACH ONE CHANGES THE RENDER. Without this, a build that issued the extra
+  // forwards and then discarded them would pass every counter above — which is
+  // exactly the "recorded value is not a reached one" failure this campaign has
+  // already paid for once.
+  CHECK(full.wav.size() == no_cfg.wav.size());
+  CHECK(full.wav != no_cfg.wav);
+  CHECK(full.wav != no_stg.wav);
+  CHECK(no_cfg.wav != no_stg.wav);
+
+  // The STG DELTA depends on WHICH block is perturbed. Two builds that perturb
+  // different blocks issue the same three forwards and differ only here, so a
+  // port that ignored `stg_blocks` and perturbed everything (or nothing) would
+  // pass every assertion above.
+  const Out block0 = render("g_b0", {{vllm::multimodal::kLtx2AudioStgBlocksExtra, "0"}});
+  REQUIRE(block0.trace.t2a_perturbed_blocks.size() == 1);
+  CHECK(block0.trace.t2a_perturbed_blocks[0] == 0);
+  CHECK(block0.wav != full.wav);
+}
+
+TEST_CASE("ltx2 t2a: the refusals name what is missing, and each is checked HERE") {
+  Workspace ws;
+  const vllm::multimodal::VideoModelParams mp = T2aParams(ws.paths);
+  const std::unique_ptr<vllm::multimodal::VideoEngine> engine =
+      vllm::multimodal::LoadVideoEngine(mp);
+  REQUIRE(engine != nullptr);
+
+  const auto refuses = [&](vllm::multimodal::VideoGenParams gen,
+                           const char* needle) -> std::string {
+    // `needle` is a `const char*`, and doctest stringifies a bare `char*` as a
+    // BOOL — a failure would print `true` instead of the string that was looked
+    // for. Bound to a std::string before it reaches any doctest macro.
+    const std::string want(needle);
+    INFO("needle = " << want);
+    try {
+      (void)engine->Generate(gen);
+      FAIL_CHECK("expected a refusal naming: " << want);
+      return std::string();
+    } catch (const std::exception& e) {
+      const std::string msg = e.what();
+      INFO("refusal = " << msg);
+      CHECK_MESSAGE(msg.find(want) != std::string::npos, "the refusal did not name the needle");
+      return msg;
+    }
+  };
+
+  SUBCASE("a resolution is refused rather than accepted and ignored") {
+    vllm::multimodal::VideoGenParams gen = T2aGen(ws.root + "/r_res", "a b c");
+    gen.width = 64;
+    gen.height = 64;
+    refuses(gen, "height/width are unused");
+  }
+
+  SUBCASE("the params table's own STG block is out of range on THIS DiT") {
+    // The LOCAL fact, and it is what makes this case able to see staleness. The
+    // fixture's DiT has two blocks; upstream's default `stg_blocks` is [28]. The
+    // refusal must name the range it checked against, so a build that silently
+    // clamped or ignored the index would not produce this message.
+    vllm::multimodal::VideoGenParams gen = T2aGen(ws.root + "/r_stg", "a b c");
+    gen.extras.erase(vllm::multimodal::kLtx2AudioStgBlocksExtra);
+    const std::string msg = refuses(gen, "STG block index 28 is outside [0, ");
+    // Derived from the tree rather than restated: the range in the message is
+    // the DiT the engine actually loaded, not a literal this test also knows.
+    const auto* ltx = dynamic_cast<const vllm::multimodal::Ltx2VideoEngine*>(engine.get());
+    REQUIRE(ltx != nullptr);
+    CHECK(msg.find("[0, " + std::to_string(ltx->dit_params().num_layers) + ")") !=
+          std::string::npos);
+  }
+
+  SUBCASE("a perturbed pass over NO block is refused, not run as a no-op") {
+    vllm::multimodal::VideoGenParams gen = T2aGen(ws.root + "/r_empty", "a b c");
+    gen.extras[vllm::multimodal::kLtx2AudioStgBlocksExtra] = "";
+    refuses(gen, "the STG delta would be exactly zero");
+  }
+
+  SUBCASE("isolated-modality guidance has no second modality to run over") {
+    // Not reachable through an extra by design — there is no `modality_scale`
+    // knob — so this asserts the RECIPE pinned it, which is the thing that keeps
+    // the refusal unreachable. `Ltx2DetectPipelineParams("2.5")` carries 3.0.
+    const vllm::Ltx2PipelineRecipe t2a = vllm::ResolveLtx2PipelineRecipe("t2a_one_stage", "2.5");
+    REQUIRE(t2a.audio_only);
+    REQUIRE(t2a.phases.size() == 1);
+    CHECK(t2a.phases[0].audio_guidance.modality_scale == 1.0);
+    CHECK(vllm::Ltx2DetectPipelineParams("2.5").audio_guider.modality_scale == 3.0);
+  }
+
+  SUBCASE("a video-only knob on a t2a engine is refused rather than ignored") {
+    vllm::multimodal::VideoGenParams gen = T2aGen(ws.root + "/r_crf", "a b c");
+    gen.extras[vllm::multimodal::kLtx2ImageCrfExtra] = "0";
+    refuses(gen, "no meaning on a text-to-audio render");
+  }
+
+  SUBCASE("a keyframe has no stream to condition") {
+    vllm::multimodal::VideoGenParams gen = T2aGen(ws.root + "/r_kf", "a b c");
+    gen.first_frame_ppm = "P6\n1 1\n255\n\x01\x02\x03";
+    refuses(gen, "`video=None`");
+  }
+}
+
+TEST_CASE("ltx2 t2a: a t2a-only knob is refused on the video pipelines") {
+  Workspace ws;
+  const vllm::multimodal::VideoModelParams mp = EncoderParams(ws.paths);
+  const std::unique_ptr<vllm::multimodal::VideoEngine> engine =
+      vllm::multimodal::LoadVideoEngine(mp);
+  REQUIRE(engine != nullptr);
+  vllm::multimodal::VideoGenParams gen = PromptedGen(ws.root + "/x", "a b c");
+  gen.extras[vllm::multimodal::kLtx2AudioCfgScaleExtra] = "5.0";
+  try {
+    (void)engine->Generate(gen);
+    FAIL_CHECK("a t2a guider knob must be refused on a video pipeline");
+  } catch (const std::exception& e) {
+    const std::string msg = e.what();
+    INFO(msg);
+    CHECK(msg.find("text-to-audio's alone") != std::string::npos);
+    // It names the pipeline the ENGINE resolved, so a message that guessed
+    // would say something else.
+    const auto* ltx = dynamic_cast<const vllm::multimodal::Ltx2VideoEngine*>(engine.get());
+    REQUIRE(ltx != nullptr);
+    CHECK(msg.find("'" + ltx->pipeline_kind() + "'") != std::string::npos);
+  }
+}
+
+TEST_CASE("ltx2 t2a: the DiT forward runs ONE stream, and the old guard's reason was wrong") {
+  // The lifted refusal, checked against a LOCAL fact rather than against
+  // upstream symbol names alone. `Ltx2DitForward` used to demand BOTH streams
+  // and blamed the AudioOnly weight contract; the contract is not what blocked
+  // it, and the way to see that is that the AV weights this fixture writes are
+  // enough to run the audio stream by itself.
+  Workspace ws;
+  const vllm::SafetensorsFile dit_file = vllm::SafetensorsFile::Open(ws.paths.dit);
+  vllm::Ltx2DitLoadOptions options;
+  options.widen_to_f32 = true;  // `Ltx2DitForward` is f32 by declaration
+  const vllm::Ltx2DitCheckpoint ckpt = vllm::Ltx2LoadDitFromSafetensors(dit_file, options);
+
+  const int64_t tokens = 3;
+  // VARYING PER TOKEN, and that is load bearing rather than tidy. A latent whose
+  // rows are all equal makes self-attention return a weighted average of
+  // identical values — which is exactly the value projection — so the STG
+  // perturbation below would be a numeric no-op and the case would report
+  // "the perturbation changed nothing" about a build that applies it correctly.
+  // Measured: with a constant 0.25 fill this assertion failed on the working
+  // implementation.
+  std::vector<float> latent(static_cast<size_t>(tokens * ckpt.params.audio_in_channels));
+  for (size_t i = 0; i < latent.size(); ++i) {
+    latent[i] = 0.25F + 0.01F * static_cast<float>(i % 7) - 0.02F * static_cast<float>(i % 3);
+  }
+  std::vector<float> timesteps(static_cast<size_t>(tokens), 0.5F);
+  std::vector<double> positions(static_cast<size_t>(tokens * 2));
+  for (int64_t t = 0; t < tokens; ++t) {
+    positions[static_cast<size_t>(t * 2)] = static_cast<double>(t) * 0.04;
+    positions[static_cast<size_t>(t * 2 + 1)] = static_cast<double>(t + 1) * 0.04;
+  }
+  const int64_t ctx = 4;
+  std::vector<float> context(
+      static_cast<size_t>(ctx * ckpt.params.audio_cross_attention_dim), 0.1F);
+  const float sigma = 0.5F;
+
+  vllm::Ltx2ModalityInput ain;
+  ain.tokens = tokens;
+  ain.context_tokens = ctx;
+  ain.latent = latent.data();
+  ain.timesteps = timesteps.data();
+  ain.sigma = &sigma;
+  ain.positions = positions.data();
+  ain.context = context.data();
+
+  const vllm::Ltx2DitOutputs out = vllm::Ltx2DitForward(
+      vt::Device{}, ckpt.params, ckpt.weights, /*video=*/nullptr, &ain, vt::DType::kF32);
+  CHECK(out.video.empty());
+  REQUIRE(out.audio.size() == static_cast<size_t>(tokens * ckpt.params.audio_out_channels));
+  for (const float v : out.audio) REQUIRE(std::isfinite(v));
+
+  // BOTH null is still refused, which is upstream's own refusal
+  // (transformer.py:259-260) rather than a leftover of the old one.
+  CHECK_THROWS(vllm::Ltx2DitForward(vt::Device{}, ckpt.params, ckpt.weights, nullptr, nullptr,
+                                    vt::DType::kF32));
+
+  // And the STG perturbation MOVES the forward. Without this the flag would be
+  // a field nothing reads: a build that plumbed it and never applied it returns
+  // the same finite tensor of the same shape.
+  vllm::Ltx2DitPerturbation p;
+  p.audio_self_attn.assign(static_cast<size_t>(ckpt.params.num_layers), 0);
+  p.audio_self_attn[0] = 1;
+  const vllm::Ltx2DitOutputs perturbed =
+      vllm::Ltx2DitForward(vt::Device{}, ckpt.params, ckpt.weights, nullptr, &ain,
+                           vt::DType::kF32, /*cache=*/nullptr, &p);
+  REQUIRE(perturbed.audio.size() == out.audio.size());
+  bool moved = false;
+  for (size_t i = 0; i < out.audio.size(); ++i) {
+    if (perturbed.audio[i] != out.audio[i]) moved = true;
+  }
+  CHECK_MESSAGE(moved, "the STG perturbation changed nothing");
+
+  // A vector of the wrong length is refused rather than indexed defensively.
+  vllm::Ltx2DitPerturbation bad;
+  bad.audio_self_attn.assign(static_cast<size_t>(ckpt.params.num_layers + 1), 0);
+  CHECK_THROWS(vllm::Ltx2DitForward(vt::Device{}, ckpt.params, ckpt.weights, nullptr, &ain,
+                                    vt::DType::kF32, /*cache=*/nullptr, &bad));
+}
+
+TEST_CASE("ltx2 t2a: the schedule starts at exactly 1.0") {
+  // WHY THIS EXISTS, and it is a mutation result rather than a tidiness rule. A
+  // mutation that scaled the initial latent by `sigmas[0]` — the thing a reader
+  // coming from another flow-matching sampler expects to see — SURVIVED the
+  // focused gate at 6 cases / 484 assertions / exit 0. It survived because it is
+  // an IDENTITY, not because the gate is blind: `LTX2Scheduler` starts at
+  // `linspace(1, 0, steps + 1)[0] == 1`, the shift map sends 1 to exactly 1
+  // (schedulers.py:41-45) and the stretch sends it to `1 - (1 - 1)/scale`, again
+  // exactly 1 (`:47-55`).
+  //
+  // Pinning the identity is what turns "a mutation survived" into a checked
+  // fact. If upstream ever moves the first sigma off 1, this fires and the two
+  // forms stop agreeing.
+  // NOT `steps = 1`, and the exclusion is upstream's arithmetic rather than a
+  // convenience. At one step the non-zero sigma list is `[1.0]`, so
+  // `one_minus_z` is `[0.0]`, `scale_factor = 0 / (1 - terminal)` is 0, and the
+  // stretch computes `1 - 0/0` — NaN, on both sides (schedulers.py:49-54).
+  // Measured here: `Ltx2SigmaSchedule(1, 0).front()` is `-nan`. Pinning it would
+  // be pinning a division by zero as if it were a value; a one-step schedule is
+  // a separate question and is recorded in the row spec rather than asserted.
+  for (const int64_t steps : {2, 4, 30, 40}) {
+    INFO("steps = " << steps);
+    const std::vector<float> sigmas = vllm::Ltx2SigmaSchedule(steps, /*tokens=*/0);
+    REQUIRE(sigmas.size() == static_cast<size_t>(steps) + 1);
+    CHECK(sigmas.front() == 1.0F);
+    CHECK(sigmas.back() == 0.0F);
+  }
+}
+
+TEST_CASE("ltx2 t2a: the one_stage recipes noise their initial latent (#1013)") {
+  // A one_stage render used to start from ZEROS: `OneStagePhase` left
+  // `noise_scale` at the struct default of 0.0, and `Ltx2GaussianNoise` is
+  // `latent + noise_scale * (noise - latent)`, so at 0.0 the state stays exactly
+  // as `create_initial_state` wrote it. Upstream's `ModalitySpec.noise_scale`
+  // defaults to 1.0 (ltx-pipelines/utils/types.py:110) and
+  // `TI2VidOneStagePipeline.__call__` constructs both specs without it
+  // (ti2vid_one_stage.py:233-239).
+  //
+  // Gated on the RECIPE rather than on a render, because the value is what the
+  // engine reads and a render's own noise is not separable from it by eye.
+  for (const char* version : {"2", "2.3", "2.4", "2.5"}) {
+    INFO("version = ", version);
+    const vllm::Ltx2PipelineRecipe one = vllm::ResolveLtx2PipelineRecipe("one_stage", version);
+    REQUIRE(one.phases.size() == 1);
+    CHECK(one.phases[0].noise_scale == 1.0);
+    // And the t2a rows inherit it, which is the reason they are built FROM the
+    // one_stage recipe rather than beside it.
+    const vllm::Ltx2PipelineRecipe t2a =
+        vllm::ResolveLtx2PipelineRecipe("t2a_one_stage", version);
+    REQUIRE(t2a.phases.size() == 1);
+    CHECK(t2a.phases[0].noise_scale == 1.0);
+    CHECK(t2a.audio_only);
+    CHECK_FALSE(one.audio_only);
+  }
+}
