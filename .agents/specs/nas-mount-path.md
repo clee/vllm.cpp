@@ -108,8 +108,22 @@ and the reachability of each default.
 | `.agents/environment.md` holds no `/mnt` path | `grep -n '/mnt' .agents/environment.md` returns nothing |
 | `$CHECKPOINT_ROOT` is an existing convention, not a new one | four sibling scripts already write it; listed in §3 |
 | the gate tests do read `CHECKPOINT_ROOT` | `getenv("CHECKPOINT_ROOT")` at `tests/parity/test_minimax_music3_ar_real.cpp:162`, `_e2e_real.cpp:170`, `_llm_real.cpp:137`, `tests/vllm/models/test_ltx2_text_encoder.cpp:2299` |
-| the changed gate still skips loudly | `test_minimax_music3_quant_real` builds and runs with `CHECKPOINT_ROOT` unset, and the skip message names both variables |
-| the tokenizer tool still refuses cleanly | `dump_tokenizer_gpt4o.py --help` and a no-argument run with `CHECKPOINT_ROOT` unset |
+| the changed gate still skips loudly | `test_minimax_music3_quant_real` builds warning-free and runs. With the root unset, 6 cases, `SKIP music3 q4_k artifact identity: VLLM_CPP_MUSIC3_GGUF and CHECKPOINT_ROOT are both unset`. With `CHECKPOINT_ROOT=/usr/local/nas_share/checkpoints`, the same 6 name the composed path `…/minimax-music3-gguf/rvq_depth_decoder_q4_k.gguf` |
+| the tokenizer tool still refuses cleanly | with `CHECKPOINT_ROOT` unset and no arguments, `error: the following arguments are required: --tokenizer-json`; with it set, `--help` prints the `$CHECKPOINT_ROOT/muse-glimmer-30b/tokenizer.json` default |
+
+## 5b. One defect found in flow and fixed here
+
+[#1079](https://github.com/mudler/vllm.cpp/issues/1079). Those six skip
+messages printed `SKIP 1` and named no case, because the helper streamed its
+`const char*` argument into doctest `MESSAGE` and doctest 2.5.2 stringifies a
+`const char*` through its bool overload. It is pre-existing at `100026481` and
+is repaired here rather than left, because this row rewrites those exact
+messages and would otherwise carry the defect forward under a changed line. The
+binary reports `6 passed` with `assertions: 0` when the checkpoint is absent, so
+the message text is what separates a skipped run from a gated one. Scope was
+measured before the fix: `grep -rn 'MESSAGE("SKIP " << what' tests/` returns 4
+hits, all in this file. The fix streams `std::string(what)`, and the output
+above is the after.
 
 ## 6. Now
 
