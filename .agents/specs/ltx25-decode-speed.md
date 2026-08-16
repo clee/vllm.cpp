@@ -76,25 +76,87 @@ and the doc collapses them. §4 keeps the first and replaces the second.
 
 ### 1.3 What this row measured itself
 
-A probe was queued on `dgx.casa` behind `$HOME/gpu.lock` (never jumped; it
-waited out a `llama-imatrix` holder and its own 85 GiB sustained-headroom
-guard). It samples GPU utilization, GPU clock, `MemAvailable`, the render
-process's `VmRSS` / `Anonymous` / `utime` / `Threads`, the CUDA compute-app
-footprint, and the written frame count onto **one clock**, so the phases can be
-cut against each other rather than inferred.
+A probe was queued on `dgx.casa` behind `$HOME/gpu.lock`. It never jumped the
+queue: it waited out a `llama-imatrix` holder and two other waiters, plus its
+own 85 GiB sustained-headroom guard, and acquired the lock at 10:59:57Z.
 
 Host: `kairos-17dd`, GB10, driver `580.173.02`, `clocks.max.sm` 3003 MHz,
 persistence mode **Disabled**, boot id `03717c9d-63c8-4652-a8fe-a63d012c5718`,
-20 cores. Build `0e1bee42f`, CUDA on, arch `121a`, run in `vllmcpp-build:gb10`.
-
-Rung 1 is 448x256/25f with a watchdog that kills the render below 40 GiB
-`MemAvailable` — the diagnostic is the fall, not a finished render. Rung 2 is
-320x192/25f, which completes.
+20 cores. Build `0e1bee42f`, CUDA on, arch `121a`, `vllmcpp-build:gb10`, the
+recipe of `~/work/ltx25-e2e` with `--device cuda` and the full `--encoder`.
 
 **Per the benchmarking guide, nothing here is a throughput ratio.** There is no
 denominator (§7), so these are one-sided phase attributions of our own engine.
-They say where our time and bytes go. They do not say what the gap to a
-reference is, and this row does not claim one.
+They say where our bytes and time go; they do not say what the gap to a
+reference is, and this row claims none.
+
+**The instrument had a defect, and it is recorded because it is the exact
+failure this project keeps paying for.** The sampler found its target with
+`pgrep -f ltx2-gen`, which matches the **`sudo`/`docker` wrapper** — whose RSS is
+meaningless — rather than the workload inside the container. Its per-PID columns
+came back empty, and an empty `Anonymous` column reads as *"the process
+allocated nothing"*. A side-car sampler using `pgrep -x` (comm name, so it finds
+the real `ltx2-gen`) was started alongside, and every per-PID figure below comes
+from it. **A broken instrument fails toward a verdict about the code.**
+
+#### Rung 1 — 448x256/25f, the size that fails
+
+It failed, and **not where anyone has been looking**. The watchdog fired at
+t=701 s with `MemAvailable` at 38.36 GiB, **during the text-tower load, before a
+single denoise step**. 0 frames, `EXIT=137`. 248 per-PID samples at 2 s.
+
+| | phase A: DiT staging to device | phase B: host text tower |
+|---|---|---|
+| window | t 0 -> 450 s | t 453 -> 617 s |
+| CUDA compute-app footprint | 4.22 -> **35.20 GiB** (+30.98) | 35.48 -> 35.54 (+0.06) |
+| process `VmRSS` | 2.11 -> 12.94 (+10.83) | 13.04 -> **44.77** (+31.73) |
+| process `Anonymous` | 0.26 -> 0.27 (**+0.01**) | 0.14 -> **27.57** (+27.43) |
+| `MemAvailable` | 110.25 -> 66.75 (**-43.50**) | 66.69 -> 39.91 (-26.78) |
+| GPU utilization | mean 0.2%, **zero in 164/192 samples** | mean 0.0%, **zero in 56/56** |
+| CPU busy | **0.15 cores** of 20 | **0.39 cores** of 20 |
+| threads | 3 | 3 |
+
+**Three findings, each measured rather than argued.**
+
+1. **§4.3's mechanism is confirmed, and it is stronger than stated there.** Over
+   the staging phase the anonymous heap grew by **0.01 GiB against a 43.50 GiB
+   fall — 0.0% of it.** The fall is the device counter (+30.98) plus file-backed
+   RSS (+10.83), which together account for **96%**. Any sampler reading `VmRSS`
+   or `Anonymous` is structurally blind to this, which is why every previous
+   attempt came back empty. `--query-compute-apps=used_memory` reports it
+   per-PID on this box and was available the whole time.
+2. **#1016 is no longer merely "not excluded" — it is measured.** The +10.83 GiB
+   of file-backed RSS during staging is the mmap source pages that no `ltx2_*`
+   loader ever releases, growing in lockstep with the device copy **on the same
+   unified pool**. It is ~25% of the load-phase fall.
+3. **The staged total lands within 1% of the computed figure.** The plateau is
+   36396 MiB = **35.54 GiB**, against 35.32 GiB derived from the loader's own
+   contract. The device-side model is validated.
+
+**A separate lever falls out of phase A that no record names:** the DiT takes
+**450 s — 7.5 minutes — to stage**, at ~52 MiB/s, with the GPU idle in 85% of
+samples and 0.15 of one core busy. It is neither GPU-bound nor CPU-bound. That
+is the serial per-tensor `Alloc` + copy + `Synchronize` loop at
+`ltx2_loader.cpp:738-756` (`backend.Alloc` at `:747`, `backend.Synchronize` at
+`:749`), ~3,504 round trips. It is filed as [#1021](https://github.com/mudler/vllm.cpp/issues/1021),
+alongside [#1016](https://github.com/mudler/vllm.cpp/issues/1016), which is the
+same loop.
+
+**And the shape of the 448x256/25f failure is not what the record says.** With
+the text tower on the path, the render is out of headroom **at load**: 35.54 GiB
+device plus 44.77 GiB host RSS is **~80 GiB before any compute at all**. The
+`benchmark-record.md` trace §4.2 quotes was a *prompt-embeds* run with no tower,
+which is why it had 75.2 GiB free to plateau at. **These are two different
+failures at the same resolution**, and conflating them is available to anyone
+reading either trace alone.
+
+#### Rung 2 — 320x192/25f, the size that completes
+
+Queued behind the same headroom guard, no watchdog. It is the arm that answers
+whether the long flat phase is host compute or GPU-blocking (§1.4), and it is
+the phase breakdown this row was asked for. **At the time of writing it has not
+returned.** Where it is unfinished, §5 says so rather than borrowing phase A's
+confidence.
 
 ### 1.4 Evidence that already existed and had not been read as evidence
 
@@ -613,6 +675,15 @@ coordinators' `ctest` work during that session. Second,
 verified this row at 50419 MiB for an unrelated `llama-imatrix` — so a
 per-process device reading was available the whole time and was not used.
 
+**This is no longer a hypothesis about the mechanism.** Rung 1 (§1.3) measured
+it directly: over the DiT staging phase the process's `Anonymous` grew by
+**0.01 GiB against a 43.50 GiB `MemAvailable` fall — 0.0% of it** — while the
+device counter grew 30.98 GiB and file-backed RSS grew 10.83 GiB, together 96%
+of the fall. An RSS- or `Anonymous`-based sampler cannot see any of it. What
+remains open is not *how* bytes can vanish from `MemAvailable` without touching
+the heap, but *which* allocation does it in the post-denoise window §4.2
+describes.
+
 ### 4.4 Next hypotheses, ranked, and the instrument that separates them
 
 Stated as hypotheses. This row does not close the axis, and per AGENTS.md the
@@ -710,6 +781,7 @@ magnitude arguments from arithmetic and from what the oracles run.
 | 5 | [#1014](https://github.com/mudler/vllm.cpp/issues/1014) **Attribute the 59 GiB, then release what holds it.** Decode excluded twice (§4.1); residency excluded by the plateau (§4.2); mechanism candidate is a device-class allocation invisible to `VmRSS` (§4.3). | Decides whether 448x256/25f completes at all | `benchmark-record.md:21150-21160`; `src/vt/cuda/cuda_backend.cu:77-81` | upstream offloads transformer weights (`installation.md:90`) and never the VAE | **medium** | rung 1 of §1.3. **The lever is not yet known** — §4.4 names three hypotheses and the one instrument that separates them |
 | 5a | [#1015](https://github.com/mudler/vllm.cpp/issues/1015) **`Ltx2WidenDitToF32` holds bf16 and f32 at once, permanently** — ~105.9 GiB on a 119 GiB box, ~37.9 GB of it dead. | Not the 59 GiB; a real residency defect on the host arm | `ltx2_loader.cpp:694-710`, append at `:707` | — | **small** | peak RSS across a host-arm load |
 | 5b | [#1016](https://github.com/mudler/vllm.cpp/issues/1016) **The LTX loaders never call `MaybeReleaseSourcePages`** — 0 hits against 15 other files under `src/vllm`. | Not the 59 GiB; the DiT file stays faulted resident beside its device copy | `ltx2_loader.cpp:738-756` | — | **small** | `Rss_File` across a load |
+| 5c | [#1021](https://github.com/mudler/vllm.cpp/issues/1021) **Overlap and batch the DiT device staging.** ~3,504 serial `Alloc`+copy+`Synchronize` round trips. | 7.5 min off the front of every render and every gate run | MEASURED rung 1: 450 s, ~52 MiB/s, GPU idle in 164/192 samples, 0.15 cores | `ltx2_loader.cpp:738-756`, `:747`, `:749`; `cuda_backend.cu:77-81` | **medium** | staging wall and `capp_mib` slope, plus a byte-compare of the staged weights |
 | 6 | [#1010](https://github.com/mudler/vllm.cpp/issues/1010) **Emit phase timings and peak memory from the render path.** A 2.5-hour render wrote **one** line to `run.log`. | No speedup. It is the precondition for measuring any of 1-5 | — | — | **small** | its own output |
 | 7 | [#655](https://github.com/mudler/vllm.cpp/issues/655) + [#1012](https://github.com/mudler/vllm.cpp/issues/1012) **Register `ltx_core` as an oracle and install it on the gate host.** | No speedup. It is the precondition for any *ratio* (§7) | AGENTS.md oracle table; issue #655 | — | **small-to-medium** | a recorded pin plus a gateability measurement |
 
@@ -842,7 +914,8 @@ this row has no implementation authority and no fresh review (§8).
 | [#1012](https://github.com/mudler/vllm.cpp/issues/1012) | record: `diffusers` implements LTX-2.5 | owed |
 | [#1014](https://github.com/mudler/vllm.cpp/issues/1014) | 5 — the 59 GiB: decode excluded, residency excluded, three hypotheses ranked | owed |
 | [#1015](https://github.com/mudler/vllm.cpp/issues/1015) | 5a — `Ltx2WidenDitToF32` holds bf16 and f32 at once | owed |
-| [#1016](https://github.com/mudler/vllm.cpp/issues/1016) | 5b — LTX loaders never release mmap source pages | owed |
+| [#1016](https://github.com/mudler/vllm.cpp/issues/1016) | 5b — LTX loaders never release mmap source pages | owed, MEASURED at +10.83 GiB in rung 1 |
+| [#1021](https://github.com/mudler/vllm.cpp/issues/1021) | 8 — DiT staging is 7.5 min at ~52 MiB/s, GPU idle, 0.15 cores | owed |
 
 * **The 60 GiB attribution.** Carried forward from
   [`ltx25-tiled-decode.md`](ltx25-tiled-decode.md) `## Outcome`, now with the
