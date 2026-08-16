@@ -1,4 +1,4 @@
-# LTX25-DFR-PIPELINE — detail-fidelity rendering, and the upsampler it drives
+# LTX25-DFR-PIPELINE — detail-fidelity rendering, and the upsampler it still does not drive
 
 Row: `LTX25-DFR-PIPELINE`. Issue:
 [#986](https://github.com/mudler/vllm.cpp/issues/986). Campaign:
@@ -20,13 +20,24 @@ returns that SHA — **before any anchor below was read**.
 Written before implementation, so neither half can be discovered later as a claim
 the row did not support.
 
-1. **The temporal upsampler becomes DRIVEN.** That is the row's headline and it
-   is a claim about a code path, not about a rendered clip. `DFRPipeline`'s
-   rounds loop is upstream's only consumer of a temporally-configured
-   `LatentUpsampler` (`dfr_pipeline.py:235-245, 402-407`), and this row ports
-   that loop and reaches it from a production entry point. Section 7 states the
-   sentence the records will carry, and it is narrower than "temporal upsampling
-   works".
+1. **The temporal upsampler was INTENDED to become driven, and it did not.**
+   This bullet is left standing with its correction attached rather than
+   rewritten, because the whole purpose of a section 0 is that a later reader can
+   see what the row set out to claim.
+   *As written before implementation:* "`DFRPipeline`'s rounds loop is upstream's
+   only consumer of a temporally-configured `LatentUpsampler`
+   (`dfr_pipeline.py:235-245, 402-407`), and this row ports that loop and reaches
+   it from a production entry point. Section 7 states the sentence the records
+   will carry."
+   *What happened:* the rounds loop is **not** ported. It needs the per-tile
+   denoise pass as a callable, which this engine does not have — its denoise is
+   inline inside one 680-line per-phase loop — and extracting it is a refactor of
+   the render path rather than an addition to it. The loop is refused by name and
+   owed by #986, the temporal upsampler stays UNDRIVEN, and `docs/FEATURES.md`
+   is UNCHANGED on that point. §12.1 carries the sentence the records actually
+   take, and §12.2 states the scope decision rather than leaving it silent.
+   What DID land is the DFR base: the padded keyframe canvas, the generated
+   keyframe slots and their readback, and the trim back to the caller's count.
 2. **There is no real-weight temporal result and there will not be one here.**
    `/mnt/nas_share/checkpoints/ltx-2.5/lightricks-ltx-2.5/latent_upscale_models/`
    holds `ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors` and nothing
@@ -298,16 +309,23 @@ Nothing in `docs/` may say more than that.
   re-derived at the merge tree, and ruled-out causes take the
   `WHAT IS *NOT* THE REASON` shape.
 
-## 9. The record this row contradicts
+## 9. The record this row expected to contradict, and did not
 
-`.agents/specs/ltx25-resolution-envelope.md:436` records, as evidence for that
-row, that *"The 'Temporal x2 ups gated, UNDRIVEN' cell is untouched, byte for
-byte."* That was true of that row and this row makes it false, deliberately. The
-row being contradicted is `LTX25-RESOLUTION-ENVELOPE`
-([#919](https://github.com/mudler/vllm.cpp/issues/919), merged as `e5351776c`),
-and the contradiction is in its EVIDENCE section rather than in its behaviour —
-nothing that row gated changes. Named here because a later reader who greps that
-sentence must find the row that moved it rather than conclude the cell drifted.
+*Written before implementation:* `.agents/specs/ltx25-resolution-envelope.md:436`
+records, as evidence for that row, that *"The 'Temporal x2 ups gated, UNDRIVEN'
+cell is untouched, byte for byte."* This row expected to make that false.
+
+**It did not, and the prediction is left here rather than deleted.** The rounds
+loop is out of scope (§12.2), so the UNDRIVEN cell is still accurate and this row
+does not touch it. `LTX25-RESOLUTION-ENVELOPE`
+([#919](https://github.com/mudler/vllm.cpp/issues/919), merged as `e5351776c`)
+keeps its evidence intact.
+
+What this row DOES change in `docs/FEATURES.md` is a different, adjacent claim in
+the same row: the LTX-2.5 cell said `GENkf/DiffVAE/ref refused`, and generated
+keyframes are now served, so `GENkf/` is removed and a new per-feature row
+carries the DFR base. The edit is scoped by key, six characters long, and leaves
+every other cell byte-identical — including the UNDRIVEN one.
 
 ## 10. Gates
 
@@ -338,15 +356,137 @@ before being charged: `test_openai_conformance`, `test_cpu_threadpool`,
 | GGUF k-quants | **not applicable to this family.** LTX-2.5 ships no GGUF: the quantization kinds upstream defines are fp8-cast, fp8-scaled-mm, nvfp4-cast and nvfp4-prequant (`quantization_factory.py:23-26`), and no published LTX-2.5 checkpoint is a GGUF. Owed for LTX-2.5 as a whole under #644 only if such a checkpoint appears |
 | detailing IC-LoRA | **refused by name**, pointing at #975 |
 
+## 12. Outcome
+
+**The DFR base landed and the temporal rounds did not.** §7's target sentence is
+therefore NOT the sentence this row can carry, and §12.1 states what replaces it.
+That is the row's most important result and it is stated first.
+
+### 12.1 Reachability — the sentence the records actually carry
+
+> The LTX-2.5 **DFR base pipeline** is reachable from `vllm_video_generate` with
+> the `pipeline_kind` extra set to `dfr`, and from `ltx2-gen --pipeline-kind
+> dfr`. It resolves upstream's padded keyframe canvas, places generated keyframe
+> slots on the segment grid, marks them, reads them back before the trim, and
+> trims the canvas to the caller's own frame count. **Generated keyframe slots
+> are SERVED** on every pipeline, which retires the #920 refusal.
+>
+> The **temporal x2 latent upsampler is still UNDRIVEN**. DFR's rounds loop is
+> refused by name and owed by #986. `docs/FEATURES.md`'s
+> `Temporal x2 ups gated, UNDRIVEN` cell is therefore **unchanged**, and
+> `.agents/specs/ltx25-resolution-envelope.md:436`, which asserts that cell is
+> untouched, remains true. §9 of this spec predicted a contradiction that did
+> not happen, and is left standing rather than deleted so the prediction and its
+> outcome sit together.
+
+### 12.2 What was NOT done, and why — the scope decision, stated rather than silent
+
+The rounds loop is out. `AGENTS.md` asks for `NEEDS_DECISION` on a material
+disagreement rather than a silent scope change, so the reasoning is here rather
+than absent:
+
+1. **The loop needs a seam this engine does not have.** Upstream's rounds
+   invoke the same `DiffusionStage.__call__` the two stages use, per tile, with
+   their own sigmas, stepper and seed (`dfr_pipeline.py:480-499`). This engine's
+   denoise is written inline inside one per-phase loop of roughly 680 lines with
+   no callable a tile can enter through. Extracting it is the correct change and
+   it is a refactor of the render path, not an addition to it.
+2. **There is no checkpoint.** §0.2 — re-verified again at the end of this row,
+   not only at its start.
+3. **A refused arm beats a half-built one.** The refusal names the loop, names
+   three ruled-out causes with what ruled each one out, and is gated by
+   `test_ltx2_video` including a case that re-derives its LOCAL claims from
+   `ltx2_dfr.h`. That is visible debt with an instrument on it.
+
+### 12.3 The two upstream comments that overstate themselves
+
+Both were found by mutations that stayed GREEN, and in both cases the green is a
+fact about the code rather than a hole in the test. Recorded because a later
+reader who removes either construct would otherwise have no way to tell.
+
+- **The first tile's lead-in** (`dfr_layout.py:177`). `lead_segments if index > 0
+  else 0` reads as load-bearing and is redundant with the `max(0, own_lo - lead)`
+  clamp beside it: for tile 0 the window and the drop prefix are identical for
+  every lead. Measured against executed upstream — `_build_tile` with lead 0, 1
+  and 5 returns three `TileRange`s that compare EQUAL. `ltx2_dfr.h` carried the
+  opposite claim until this mutation refuted it.
+- **The slot span's `causal_fix=False`** (`keyframe_slots.py:161-163`), whose
+  comment says the fix "must not also be applied". Measured on a one-latent-frame
+  shape against executed upstream: computing with `causal_fix=True` and then
+  applying the explicit `[t, t+1)` span gives a BYTE-IDENTICAL tensor, because
+  the fix touches only the temporal axis and the span overwrites it in full.
+
+Both are mirrored anyway, to follow upstream's text rather than its algebra, and
+both now carry a gated invariant so the corrected claim cannot drift back.
+
+### 12.4 Mutations — every one with three facts
+
+Layout suite, `test_ltx2_dfr` (green: 11 cases / 652 assertions, `RUN_EXIT=0`).
+Every mutation BUILT with `': error:' count = 0` unless stated, and the binary
+sha256 CHANGED on each rebuild, so none of these is a stale binary reporting the
+previous result. The tree restored byte-identical (`git diff --stat` empty) and
+the binary returned to its baseline sha.
+
+| # | mutation | result | exit |
+|---|---|---|---|
+| M1 | `choose_segment_length` tie takes the SMALLER candidate | RED | 1 |
+| M2 | `_build_tile` keeps boundary 0 as an anchor | RED | 1 |
+| M3 | `drop_latent_prefix` omits the seam handover `+1` | RED, 18 failed | 1 |
+| M4 | NEGATIVE CONTROL: the first tile is given a lead-in | GREEN | 0 |
+| M4b | the lead-in is dropped from EVERY tile | RED | 1 |
+| M11 | the slot seed rounds half-away-from-zero, not half-to-even | RED | 1 |
+| M12 | the carry-forward merge lets the ANCHOR win a shared position | RED | 1 |
+| M13 | CONTROL: a no-op edit | GREEN | 0 |
+
+Conditioning suite, `test_ltx2_dfr`:
+
+| # | mutation | result | exit |
+|---|---|---|---|
+| M5 | the slot seed never reaches `latent` | RED | 1 |
+| M5b | the slot seed ALSO goes into `clean` | RED | 1 |
+| M6 | the slot append passes `marked=false` | RED | 1 |
+| M7 | NEGATIVE CONTROL: the slot span applies the causal fix | GREEN | 0 |
+| M7b | the slot span is a full latent frame, not one pixel frame | RED | 1 |
+| M8 | the extraction ASSUMES the slots trail | RED | 1 |
+| M8b | the layout records the wrong `first_token` | RED | 1 |
+
+Engine suite, `test_ltx2_video` (green: 52 cases / 1243 assertions, `RUN_EXIT=0`):
+
+| # | mutation | result | exit |
+|---|---|---|---|
+| **R1** | **REACHABILITY: the production `Ltx2DfrResolveCanvas` call site is deleted** | **RED** | 1 |
+| **R2** | **REACHABILITY: the production slot-conditioning call site is deleted** | **RED** | 1 |
+| M6 | the slot append passes `marked=false` | RED | 1 |
+| M9 | the slots are extracted AFTER the trim instead of before | RED | 1 |
+| M10 | the DFR trim is dropped | did NOT BUILD, 1 compile error — establishes nothing |
+
+R1 and R2 are the reachability evidence `.agents/reachability.md` asks for: the
+production CALL SITE is deleted, not the implementation, and the focused gate
+goes red. A green there would have meant the DFR path is a test-only driver.
+
+**Two mutations were run against the engine suite and stayed GREEN, and both
+were then re-run against a suite that can see them.** M5 is a no-op on phase 0,
+which is the only phase the engine's DFR case runs, and M8 needs an appending
+item AFTER the slot item, which only the #975 reference arm provides. Neither is
+a coverage hole in `test_ltx2_video`; both are statements about what this port
+can currently reach, and both are gated in `test_ltx2_dfr` with that reasoning
+written beside them.
+
 ## Owed
 
+- [#986](https://github.com/mudler/vllm.cpp/issues/986) — **DFR's temporal
+  refinement rounds** (`dfr_pipeline.py:402-529`), which is what would DRIVE the
+  temporal x2 latent upsampler. Refused by name at the request surface. What is
+  unreached is the rounds loop itself; the operator, the canvas layout and the
+  slots it needs are all ported and gated here. §12.2 says why it is not in this
+  row, and `docs/FEATURES.md`'s UNDRIVEN cell is correct until it lands.
 - [#986](https://github.com/mudler/vllm.cpp/issues/986) — the standalone
   single-frame decode of a generated keyframe slot, and the surface that would
-  return slot pixels to a caller. DFR keeps its slots in latent space (§2b), so
+  return slot PIXELS to a caller. DFR keeps its slots in latent space (§2b), so
   nothing here reaches it and nothing here needs it.
 - [#975](https://github.com/mudler/vllm.cpp/issues/975) — DFR's stage-2 x2
   spatial detailing IC-LoRA, which needs the reference-latent arm that issue
-  owns.
+  owns. Refused by name, pointing at #975.
 
 ## Stop conditions
 
@@ -362,4 +502,7 @@ before being charged: `test_openai_conformance`, `test_cpu_threadpool`,
 
 ## Now
 
-`ACTIVE`. Spec committed before implementation on `row/LTX25-DFR-PIPELINE`.
+`ACTIVE`. The DFR base and the generated keyframe slots are implemented and
+gated on `row/LTX25-DFR-PIPELINE`, in review. The temporal rounds are refused
+by name and owed above, so the temporal upsampler remains UNDRIVEN and
+`docs/FEATURES.md` still says so.
