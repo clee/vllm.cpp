@@ -252,13 +252,100 @@ see and a memory-format change across a shared seam are two independent reviews.
 | owed | what would settle it |
 |---|---|
 | **The speed magnitude of this change. UNMEASURED.** No number is claimed. | One `Ltx2ConvVideoDecode` wall at a fixed size on an idle host, same binary, f64 arm against f32 arm. `dgx.casa` was unreachable for this row's whole duration; any host that can run the decode settles it, and #1010's phase timings make it readable from a render. |
+| **A width gate for the nine sites that have none** (§8.2). `Linear3d` was widened back to `double` and **40/40 cases passed**. | One separable-reduction case per site, in the shape §3 established for the convolution. |
+| **A blocked summation order for the sites that still sum naively** (§8.1) — `Linear3d`, the attention block, `PixelNorm`. `CausalConv3d` has one; the others do not, and their reductions are shorter but not short. | The same treatment, measured the same way. None of them is near tolerance today. |
 | NDHWC / `channels_last_3d` (§5) | its own row, after or with a SIMD or device arm |
 | bf16 *storage*, the phase L6 production arm (`ltx2_video_vae.cpp:46-49`) | [#1007](https://github.com/mudler/vllm.cpp/issues/1007) and the L6 row |
 | The `.agents/issue-index.md` row for [#1008](https://github.com/mudler/vllm.cpp/issues/1008) | It is **deliberately not appended here.** The row exists on PR #1018, which filed the issue and is unmerged. `.gitattributes:7` sets `merge=union` on that file and `scripts/check-agent-record.py:1437-1442` refuses a duplicate issue number with "duplicate is what two branches appending the same issue look like". Appending it here would turn `main` red for every branch the moment #1018 merges — the exact failure a duplicate #995 row caused. The link lives in this spec and in the pull request body; the index link arrives with #1018. |
 
-## 8. Stop conditions
+## 8. Outcome — what was measured
+
+### 8.1 The numerics moved, and by how much
+
+They did not stay put, and §4 named this as the risk that could change the
+design. Both arms were run with `kLtx2GoldenTol` temporarily set to `0.0` so
+every case reports its `max|diff|` rather than only its verdict. Same binary
+recipe, same host, one build each.
+
+| golden arm | f64 acc (before) | f32 acc, NAIVE serial | f32 acc, BLOCKED (shipped) | tol |
+|---|---|---|---|---|
+| Conv video decoder | 1.40071e-06 | 4.12762e-06 | **1.72853e-06** | 5e-06 |
+| non-causal Conv video decoder | 1.81794e-06 | 3.51667e-06 | 2.08616e-06 | 5e-06 |
+| norm_eps-binding video decoder | 9.05246e-07 | 1.16974e-06 | 1.54972e-06 | 5e-06 |
+| tiled decode, untiled control A | 2.08616e-06 | **5.00679e-06 FAIL** | 2.74181e-06 | 5e-06 |
+| tiled decode, untiled control B | 2.62260e-06 | (same case) | 2.80142e-06 | 5e-06 |
+| cropped video encoder | 4.17233e-07 | 8.94070e-07 | 4.76837e-07 | 5e-06 |
+| video encoder (`*_res`) | 4.17233e-07 | 8.94070e-07 | 4.76837e-07 | 5e-06 |
+| causal-arm video encoder | 2.98023e-07 | 3.83705e-07 | 4.17233e-07 | 5e-06 |
+| video encoder (strided convs) | 5.96046e-07 | 5.96046e-07 | 8.34465e-07 | 5e-06 |
+| all 13 audio arms | unchanged | unchanged | unchanged | untouched by this row |
+
+**The risk §4 named as design-changing actually bound, and it changed the
+design.** Narrowing the width while keeping the naive serial summation order
+pushed `test_ltx2_tiling`'s non-causal untiled control to **5.00679e-06 against a
+5e-06 tolerance** — over by 0.14%, a genuine RED in the full gate, not a near
+miss. The tolerance was not touched.
+
+**The fix is the summation ORDER, and it is a closer mirror rather than a looser
+one.** `CausalConv3d` now keeps one partial sum per input channel and adds the
+partials, so a `ci * kernel^3` reduction accumulates error with `sqrt(kernel^3)`
+per block instead of `sqrt(ci * kernel^3)` across the whole length. That is what
+torch's f32 convolution does — it is a blocked GEMM, which is exactly why §1's
+probe found `torch.sum` returning 2.0999999 where a naive serial f32 sum returns
+0.0. The width and the order are two separate mirroring questions and this row
+had to answer both.
+
+**The result is that the numerics essentially did not move.** Against the f64 arm
+the shipped blocked-f32 arm is 1.07x to 1.31x on every video arm, where the naive
+arm was 1.9x to 2.9x. The worst arm sits at 56% of tolerance — a 1.8x margin,
+against 1.9x for the f64 arm it replaces and 1.0x for the naive attempt. No
+headroom was meaningfully spent, and no tolerance was widened.
+
+### 8.2 What is gated, and what is not
+
+Stated plainly because the answer is uneven and a summary would hide it. Each
+narrowed site was widened back to `double` on its own, rebuilt, and rerun.
+
+| mutation | built | exit | detected by |
+|---|---|---|---|
+| W1 — `CausalConv3d` accumulator widened | yes, 0 errors | 1 | the new width case (1.03473 vs 7) |
+| W2 — `Linear3d` accumulator widened | yes, 0 errors | **0** | **nothing. 40/40 cases pass** |
+| W3 — `PixelNorm` `mean_sq` widened | yes, 0 errors | 1 | the Conv video decoder golden, incidentally |
+| R — the production call site deleted | yes, 0 errors | 1 | the new width case (7 vs 7-minus-nothing) |
+
+**W2 is an honest gap and it is owed.** Only the convolution's width is gated on
+purpose; `PixelNorm` is caught by accident, because a mixed-width path happens to
+diverge from torch further than a uniformly f32 one; and `Linear3d`, the
+attention block's four accumulators, the timestep Linears and the encoder's group
+mean have no gate on their width at all. They are narrowed on upstream grounding
+and on review, not on a test. Closing that needs one separable-reduction case per
+site, in the shape §3 established.
+
+### 8.3 The reachability case that passed while measuring nothing
+
+Worth recording because it nearly shipped. The first draft of the width case
+expected **zero**, which is what an f32 accumulator produces on the engineered
+reduction. Mutation R replaced the production `Ltx2ConvVideoDecode` call with a
+zero-filled buffer — and the case **passed**, because a decode that never ran
+produces zeros too. The case measured nothing and reported success.
+
+The fix is `conv_out.conv.bias = 7`, which moves the expectation off zero: the
+f32 arm must return exactly 7, the f64 arm returns 8.03473, and a stub returns 0.
+All three are now distinguishable. A recorded value is not a reached one, and an
+expectation that coincides with the zero value of an absent computation is not an
+assertion.
+
+The first attempt at mutation R also **failed to build** (3 `-Werror` unused-
+parameter errors) while the stale binary still ran and printed a plausible
+verdict. Both facts are why every mutation above reports whether it built.
+
+## 9. Stop conditions
 
 * Report `NEEDS_DECISION` rather than widening `kLtx2GoldenTol` if a narrowed
-  site pushes a golden past it.
+  site pushes a golden past it. **This fired** (§8.1). It was resolved by
+  mirroring upstream's summation order, which this spec had already named as the
+  remedy, rather than by touching the tolerance or restoring the f64 width — so
+  it is recorded here as a stop condition that triggered and was answered within
+  the row's own design, not as one that was waived.
 * Do not claim any wall-clock or throughput result. There is no host.
 * Do not build the NDHWC change here (§5).
