@@ -3,6 +3,7 @@
 // (.agents/specs/qwen36-forward-notes.md §6).
 #include "vllm/model_executor/models/qwen3_5_weights.h"
 
+#include <atomic>
 #include <cctype>
 #include <cstdint>
 #include <cstdlib>
@@ -32,6 +33,19 @@ int64_t OwnedTensor::Numel() const {
   int64_t n = 1;
   for (int i = 0; i < rank; ++i) n *= shape[i];
   return n;
+}
+
+uint64_t OwnedTensor::TowerUid() const {
+  // See the field comment: an ADDRESS is not an identity for a cache that
+  // outlives the model, because the allocator reuses addresses. A counter is,
+  // because it never goes backwards.
+  static std::atomic<uint64_t> next{1};
+  const uint8_t* p = bytes.data();
+  if (tower_uid == 0 || tower_uid_for != p) {
+    tower_uid = next.fetch_add(1, std::memory_order_relaxed);
+    tower_uid_for = p;
+  }
+  return tower_uid;
 }
 
 void OwnedTensor::ReleaseHost() const {

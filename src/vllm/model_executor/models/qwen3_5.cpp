@@ -5231,13 +5231,13 @@ class Qwen35ExpertStream {
   // traps every 4 KiB page of its source, which is why W4 measured no decode
   // gain. The mapping copy stays as the fallback for a weight with no
   // descriptor (an expanded or repacked tensor owns its bytes outright).
-  uint8_t* Slice(const uint8_t* base, int64_t expert, size_t offset,
-                 size_t bytes, int fd, size_t file_offset) {
+  uint8_t* Slice(const uint8_t* base, uint64_t tower_uid, int64_t expert,
+                 size_t offset, size_t bytes, int fd, size_t file_offset) {
     if (ForceFallback()) {
       ++exhausted_;
       return nullptr;
     }
-    const int32_t tower = TowerId(base);
+    const int32_t tower = TowerId(tower_uid);
     const ExpertKey key{tower, static_cast<int32_t>(expert)};
     if (fd >= 0) {
       const ExpertStreamer::Result r =
@@ -5380,18 +5380,31 @@ class Qwen35ExpertStream {
                  slots, slot_bytes, store_->resident_bytes() / 1073741824.0);
   }
 
-  int32_t TowerId(const uint8_t* base) {
-    auto it = tower_ids_.find(base);
+  // A tower's cache identity, compacted into the int32 the key carries.
+  //
+  // The argument is the tensor's PROCESS-UNIQUE uid, not its base pointer. A
+  // pointer was wrong here in a way no single-model test could see. This store
+  // is a process-lifetime singleton, so it outlives any one model, and the
+  // allocator hands out an address again as soon as the first model is freed.
+  // The second model's tower then hit the FIRST model's entries and was served
+  // another checkpoint's weights, as a HIT, which by contract moves no bytes and
+  // so leaves nothing downstream to notice. Measured on two synthetic models in
+  // one process: 24 towers occupied 21 distinct addresses, and 20 of 222 slices
+  // came back wrong. The comment this replaces asserted the opposite, and its
+  // premise ("stable for the model's life") was true; the CACHE is simply not
+  // scoped to one model's life.
+  int32_t TowerId(uint64_t uid) {
+    auto it = tower_ids_.find(uid);
     if (it != tower_ids_.end()) return it->second;
     const int32_t id = next_tower_id_++;
-    tower_ids_.emplace(base, id);
+    tower_ids_.emplace(uid, id);
     return id;
   }
 
   std::unique_ptr<HostExpertSlotStore> store_;
   std::unique_ptr<ExpertSlotCache> cache_;
   std::unique_ptr<ExpertStreamer> streamer_;
-  std::unordered_map<const uint8_t*, int32_t> tower_ids_;
+  std::unordered_map<uint64_t, int32_t> tower_ids_;
   int32_t next_tower_id_ = 0;
   int64_t exhausted_ = 0;
   int64_t advised_ = 0;
@@ -5434,7 +5447,7 @@ Tensor KqExpertSlice(Dev d, const OwnedTensor& w, int64_t N, int64_t K,
   if (vllm::platforms::GetPlatform(d.q.device.type).is_cpu()) {
     if (Qwen35ExpertStream* st = Qwen35ExpertStream::Get(bytes)) {
       const uint8_t* base = w.bytes.data();
-      if (uint8_t* slot = st->Slice(base, expert,
+      if (uint8_t* slot = st->Slice(base, w.TowerUid(), expert,
                                     static_cast<size_t>(row_off) * row_bytes,
                                     bytes, w.mmap_fd, w.mmap_file_offset)) {
         Tensor wt = ResidentWeight(d, w);  // inherit dtype/device/repack markers
