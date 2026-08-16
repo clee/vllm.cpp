@@ -699,7 +699,8 @@ TEST_CASE("grouped keep-quant golden writes over a poisoned buffer (CPU arm)") {
   for (const WeightCase& c : kCases) {
     const int64_t k = 8 * c.block_elems;
     for (const GroupedShape& g : kGroupedShapes) {
-      CAPTURE(std::string(c.name));
+      const std::string case_name(c.name);
+      CAPTURE(case_name);
       CAPTURE(g.P);
       CAPTURE(g.n);
       CAPTURE(g.bcast);
@@ -765,7 +766,8 @@ TEST_CASE("CUDA grouped keep-quant GEMM == CPU grouped golden and it WRITES the 
   for (const WeightCase& c : kCases) {
     const int64_t k = 8 * c.block_elems;
     for (const GroupedShape& g : kGroupedShapes) {
-      CAPTURE(std::string(c.name));
+      const std::string case_name(c.name);
+      CAPTURE(case_name);
       CAPTURE(g.P);
       CAPTURE(g.n);
       CAPTURE(g.E);
@@ -849,7 +851,8 @@ TEST_CASE("CUDA fused MoE gate+up+SwiGLU == CPU golden and it WRITES the output"
       // limit=+inf is the plain silu(g)*u MLP; a finite limit exercises both
       // clamp arms of the epilogue.
       for (float limit : {std::numeric_limits<float>::infinity(), 3.0F}) {
-        CAPTURE(std::string(c.name));
+        const std::string case_name(c.name);
+        CAPTURE(case_name);
         CAPTURE(g.P);
         CAPTURE(g.n);
         CAPTURE(g.bcast);
@@ -1083,8 +1086,11 @@ TEST_CASE("CUDA device codebooks == the CPU host tables (byte-exact)") {
   vt::cuda::SnapshotIqTablesFromDevice(snap.get());
 
   int sealed = 0;
-  auto seal = [&](const char* name, const void* dev, const void* host, size_t bytes) {
-    CAPTURE(std::string(name));
+  // `name` is a const& parameter, so the caller's temporary outlives the CAPTURE;
+  // a `CAPTURE(std::string(...))` would dangle, because doctest reads the
+  // captured expression at FAILURE time, not at capture time.
+  auto seal = [&](const std::string& name, const void* dev, const void* host, size_t bytes) {
+    CAPTURE(name);
     CHECK(std::memcmp(dev, host, bytes) == 0);
     ++sealed;
   };
