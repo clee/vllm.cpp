@@ -262,9 +262,12 @@ per-tensor FP8 W8A8 residency and GEMM entry points live in
 `include/vllm/model_executor/models/dense_fp8_gemm.h`, with the scheme policy in
 `include/vllm/model_executor/layers/quantization/fp8.h`, so any model binds them
 through `layers::MakeLinearMethod(bf16_weight, fp8_weight)` — the same shape the
-NVFP4 W4A16 seam already had. Nothing about running Qwen3.5 changes: the levers
-(`VT_DENSE_NATIVE`, `VT_DENSE_CUBLASLT_FP8`) keep their names and defaults, and
-the path stays CUDA-only.
+NVFP4 W4A16 seam already had. The bound method exposes two arms: `Apply`, which
+quantizes the activation itself with the checkpoint's `input_scale`, and
+`ApplyPreQuantized`, which takes an activation a preceding fused epilogue already
+quantized and runs only the GEMM. Nothing about running Qwen3.5 changes: the
+levers (`VT_DENSE_NATIVE`, `VT_DENSE_CUBLASLT_FP8`) keep their names and
+defaults, and the path stays CUDA-only.
 
 Still OWED for the MoE arm, and refused BY NAME rather than discovered as a dtype
 complaint: an NVFP4 attention or GDN tower, an FP8 shared expert, an FP8

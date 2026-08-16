@@ -91,7 +91,7 @@ here covers every spelling:
 | compressed-tensors scheme | `compressed_tensors/schemes/compressed_tensors_w8a8_fp8.py:60,201-207` |
 | ModelOpt scheme | `modelopt.py:444,531-537` |
 | generic fp8 linear | `fp8.py:267,446` |
-| static per-tensor act quant | `input_quant_fp8.py` (`kFp8StaticTensorSym`) → our `vt::QuantFp8Static` |
+| static per-tensor act quant | `utils/quant_utils.py:124` `kFp8StaticTensorSym`, handed to `init_fp8_linear_kernel` at `modelopt.py:511-512` → our `vt::QuantFp8Static` |
 | per-tensor scaled epilogue | the folded `alpha = input_scale * weight_scale` |
 | scheme selection | `base_config.py:180` `get_quant_method` → `MakeLinearMethod` |
 
