@@ -1035,6 +1035,44 @@ at all about the other seven tables. The seal now exists
 (`src/vt/cuda/cuda_iq_table_seal.h` plus the gate case), it covers all eight
 device codebooks byte for byte, and both false comments were corrected.
 
+## Readahead attempt: landed, UNMEASURED, blocked on host contention
+
+16 August 2026. W4's decode result showed that filling a slot by memcpy from the
+mapping keeps the fault path: sequential order, but still 608 four-KiB traps per
+2.49 MiB slice. The spec's answer is `pread(2)` from the fd, which needs an fd
+accessor on `ReadOnlyFileMapping` and a path from the model's `OwnedTensor` back
+to its file offset, because `OwnedBytes::owner` is a type-erased
+`shared_ptr<const void>`. That is a real plumbing change.
+
+`madvise(MADV_WILLNEED)` attacks the same root cause in three lines: it hands
+the whole slice to the kernel's readahead in ONE call instead of trapping page
+by page, which is the same lever `PrefaultBorrowedSpan` already uses at load,
+applied per slice at decode. It is advisory and read-only, so it cannot change a
+byte.
+
+**It is not measured, and this note exists so nobody assumes otherwise.** Three
+consecutive attempts on dgx.casa were killed by the kernel OOM at 48.6 GiB anon,
+because another session's `ltx2-gen` holds 32.6 GiB and this model needs about
+62 GiB on a 119 GiB box. Further attempts were stopped rather than retried: the
+OOM killer picks the largest consumer, and repeatedly loading a 62 GiB model
+next to someone else's 33 GiB job risks taking THEIR work down.
+
+So the readahead lever is landed behind the default-off streaming flag with its
+reasoning stated, and its number is owed. Re-run when dgx is quiet. If it does
+NOT move decode, that is the evidence that the fault path itself must be
+bypassed and the `pread` plumbing is necessary rather than merely preferable.
+
+One supporting piece IS tested. `ExpertSlotCache::Contains` is a pure residency
+probe so the prefetch can ask "will this be a fill?" without scoring the entry.
+If asking scored, the probe would decide the eviction order it was only meant to
+observe, and the hotness policy would be measuring itself. The test probes one
+entry fifty times and asserts the OTHER one is still the survivor.
+
+An operational note that cost a diagnosis: the first attempt ran with
+`docker --rm`, so when it died the logs died with it and the failure was
+unreadable. A container that erases its own evidence on failure is not a usable
+instrument for a run that might fail.
+
 ## Risks/decisions
 
 | Risk / decision | Call |

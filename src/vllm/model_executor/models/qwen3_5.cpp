@@ -1,3 +1,6 @@
+#if defined(__unix__)
+#include <sys/mman.h>
+#endif
 // vllm.cpp original; see qwen3_5.h. Forward math mirrored 1:1 from the pinned
 // upstream (qwen3_next.py::Qwen3NextDecoderLayer / Qwen3NextModel.forward,
 // qwen_gdn_linear_attn.py, qwen3_next.py::Qwen3NextAttention /
@@ -5171,8 +5174,25 @@ class Qwen35ExpertStream {
   uint8_t* Slice(const uint8_t* base, int64_t expert, size_t offset,
                  size_t bytes) {
     const int32_t tower = TowerId(base);
-    const ExpertStreamer::Result r = streamer_->EnsureSpan(
-        ExpertKey{tower, static_cast<int32_t>(expert)}, base + offset, bytes);
+    const ExpertKey key{tower, static_cast<int32_t>(expert)};
+    // Ask the kernel for the WHOLE slice up front, before the copy touches it.
+    //
+    // This is the difference between one readahead and 608 demand faults. The
+    // W4 measurement showed that filling a slot by memcpy from the mapping
+    // inherits the fault path streaming exists to bypass: the copy is
+    // sequential, but each 4 KiB page still traps. MADV_WILLNEED hands the
+    // range to the kernel's readahead in one call, which is the same lever
+    // `PrefaultBorrowedSpan` already uses at load, applied per slice at decode.
+    //
+    // Advisory and read-only, so it cannot change a byte. Skipped on a hit,
+    // where nothing will be read at all.
+#if defined(__unix__)
+    if (!cache_->Contains(key)) {
+      ::madvise(const_cast<uint8_t*>(base + offset), bytes, MADV_WILLNEED);
+    }
+#endif
+    const ExpertStreamer::Result r =
+        streamer_->EnsureSpan(key, base + offset, bytes);
     if (r.slot < 0) {
       ++exhausted_;
       return nullptr;

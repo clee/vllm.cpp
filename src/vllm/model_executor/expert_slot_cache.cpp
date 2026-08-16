@@ -49,6 +49,13 @@ std::optional<int32_t> ExpertSlotCache::SlotOf(const ExpertKey& key) const {
   return entries_[static_cast<size_t>(it->second)].slot;
 }
 
+bool ExpertSlotCache::Contains(const ExpertKey& key) const {
+  // Deliberately does NOT touch score, last_used or the protection flag. A
+  // caller asking "will this be a fill?" must not change the answer to "which
+  // entry gets evicted next", which is what any of those writes would do.
+  return index_.find(key) != index_.end();
+}
+
 ExpertAcquisition ExpertSlotCache::Acquire(const ExpertKey& key) {
   ExpertAcquisition out;
   capacity_exhausted_ = false;
