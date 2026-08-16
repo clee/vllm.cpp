@@ -214,7 +214,14 @@ change hidden in a move that this row's gate cannot see. Filed as
 
 ### CPU gate (this box)
 
-Clean Ninja configure + `cmake --build build -j 12` at `a0693813a`: exit 0, **0 warnings** under `-Werror`. `ctest -j 4`: **485/485 passed, 0 failed**, 828.96 s; 2 skipped (`test_modelopt_mixed_precision_checkpoint`, `test_voxtral_e2e`, both absent-fixture skips). Disk 91% before, 99% at peak, 91% after teardown.
+Run TWICE. A merge that brings in new source is a new binary, so the extraction's own green does not cover the post-merge tree.
+
+| At | build (`-j 12`, Ninja, clean configure) | `ctest -j 4` | time |
+|---|---|---|---|
+| `a0693813a` (extraction) | exit 0, 0 warnings under `-Werror` | 485/485 passed, 0 failed | 828.96 s |
+| `018c9d1cb` (post-merge, `origin/main` @ `e5351776c`) | exit 0, 0 warnings under `-Werror` | 485/485 passed, 0 failed | 682.90 s |
+
+Both skip the same 2 absent-fixture tests (`test_modelopt_mixed_precision_checkpoint`, `test_voxtral_e2e`). Disk 91% before, 99% at peak, 93% after the second run; the build tree was removed afterwards.
 
 Pre-existing suites at `c7cb59fbb` -> `a0693813a`, identical: `test_qwen3_5_gdn_spec_routing` 6/52, `test_ops_fp8_cpu` 4/56, `test_qwen27_paged_forward` 29/765, `test_qwen27_dense_forward` 9/583, every one `Status: SUCCESS!`. `test_linear_method` 6/76 -> 8/88 (two new cases, additive).
 
