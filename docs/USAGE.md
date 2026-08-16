@@ -456,7 +456,7 @@ tokens quietly.
 | Architecture | Why it refuses |
 |---|---|
 | `KimiK3ForConditionalGeneration` | Needs ~1.56 TB (MXFP4); no host here can run it |
-| `NemotronHForCausalLM` | The hybrid forward is ported (#517 W4) but there is no weight LOADER yet, so a checkpoint still cannot be run: loading leaves the weights unmaterialized and the forward refuses by name. Safetensors resolve and parse; a GGUF file is refused by name, since no GGUF arm exists for it |
+| `NemotronHForCausalLM` | The hybrid forward is ported (#517 W4) and the weight loader materializes the real checkpoint, but that forward is a HOST reference: it recomputes K/V over the whole sequence every step, carries no recurrent state between steps and treats a batch as one causal sequence. Engine construction now SUCCEEDS — the KV allocation reads the model's own recurrent spec (#810) — and the first step then refuses by name, naming the paged/batched decode path as the missing piece rather than returning plausible wrong tokens. Safetensors resolve and parse; a GGUF file is refused by name, since no GGUF arm exists for it |
 
 This is a deliberate state, not a bug: registering the architecture is what lets
 the config parse and weight-name mapping be tested before the forward exists.
@@ -501,36 +501,28 @@ and documents an explicit `0` as "skip re-compression entirely") but conditions
 the model on pixels it was not trained to see. That is a render-quality cost, and
 it is stated rather than applied silently.
 
-Keyframe, reference-image, reference-video and reference-audio conditioning are
-still refused, each naming a different missing piece: a last-frame keyframe needs
-the token-APPEND machinery — a keyframe is appended to the sequence with its own
-positions and a rebuilt attention mask, then trimmed back off, and this engine's
-phase loop is fixed at the target grid's token count — while the served
-first-frame arm only REPLACES tokens that already exist; the reference arms need
-the IC-LoRA's scale factors, which live in LoRA metadata this project does not
-read; reference audio additionally needs the AUDIO VAE's encoder key filter,
-which is not built. (Until 2026-08-13 this said a last-frame keyframe needs the
-DiT's unported `keyframes_abs_pos_embedding`. That was wrong: a supplied keyframe
-is appended unmarked, so the embedding never applies to it. Where the embedding
-does bite is the FIRST latent frame of every render, which was a separate gap;
-it was closed on 2026-08-14 under issue #658, so the marker is now applied on
-every render.)
+A **last-frame keyframe is served** as of the token-APPEND seam. A keyframe is
+*appended* to the token sequence with its own pixel positions, denoised as part
+of a longer sequence, and trimmed back off before the latent is unpatchified,
+where the first-frame arm only REPLACES tokens that already exist. It takes the
+same `image_crf=0` and `noise_aug` as the first-frame arm, and both may be
+supplied at once. Two things a previous version of this paragraph got wrong are
+worth naming, because a reader may have acted on them: there is no rebuilt
+attention mask — a supplied keyframe passes `attention_mask=None` and upstream
+returns no mask for it — and the sigma schedule keeps reading the TARGET token
+count rather than the grown one, because upstream derives its shift from the
+unpatchified target. (Until 2026-08-13 this paragraph said a last-frame keyframe
+needs the DiT's unported `keyframes_abs_pos_embedding`. That was wrong: a
+supplied keyframe is appended unmarked, so the embedding never applies to it.
+Where the embedding does bite is the FIRST latent frame of every render, which
+was a separate gap; it was closed on 2026-08-14 under issue #658, so the marker
+is now applied on every render.)
 
-**Generated keyframe slots are a different feature, and also refused.** Upstream
-also lets the model *generate* extra frames at interior positions —
-`--num-generated-keyframes N` upstream, the per-generation extra
-`num_generated_keyframes` here. That is not a keyframe you supply; it is one you
-ask the model to invent, and each slot relaxes the effective temporal
-compression at its position at the cost of a full latent frame of tokens for one
-pixel frame. `0` is the default and means off, so passing it explicitly renders
-normally. A positive count is refused by name, and the message names two missing
-pieces rather than one: the token-APPEND machinery shared with the last-frame
-arm above, and the readback — the slots are the output, so they must be located
-by their recorded layout, extracted before the extra tokens are trimmed, and
-then each decoded as a standalone one-frame clip, because a multi-frame causal
-decode would blend slots that were never temporally adjacent. A negative count
-is refused separately with upstream's own reason, since a malformed request and
-an unported arm are different answers. Three encoder-level limits are worth
+Reference-image, reference-video and reference-audio conditioning are still
+refused, each naming a different missing piece: the reference arms need the
+IC-LoRA's scale factors, which live in LoRA metadata this project does not
+read; reference audio additionally needs the AUDIO VAE's encoder key filter,
+which is not built. Three encoder-level limits are worth
 stating in advance because they are refusals rather than approximations. A
 reference waveform whose sample rate differs from the audio VAE's is refused
 rather than resampled, since upstream uses a polyphase kaiser resampler this
@@ -639,10 +631,81 @@ binary P6 at maxval 255 (no PNG/JPEG codec is vendored); `--image-crf 0` is
 required and is not the default, because omitting it resolves the checkpoint's
 own CRF 18 and refuses — see the out-of-distribution note above.
 
-`--frames` must satisfy `(frames - 1) % 8 == 0` and width/height must divide by
-64 (32 for the VAE, twice that because the distilled recipe's first phase runs at
-half resolution). Omitting all three renders the recipe default, which is
-1024x1536 at 121 frames and is a much larger request than it looks.
+Add `--audio-path take.wav` for **audio-to-video**: the render is conditioned on
+a soundtrack you supply rather than one the model invents. The take is encoded
+through the audio VAE's encoder and then held frozen through every denoise
+phase, and the `audio.wav` that comes back is your own input rather than a VAE
+round trip. `--audio-start-time` seeks into the file and `--audio-max-duration`
+caps how much is read; both default to covering exactly the clip's duration, and
+either without `--audio-path` is refused rather than ignored.
+
+What is upstream's here is the **conditioning mechanism** — decode, encode,
+truncate to the clip, freeze — and not the denoise schedule. Upstream's
+audio-to-video stage 1 is a caller-configured guided one, with its
+`a2v_guidance_scale` acting as the guider's modality scale, while a take here
+rides whichever recipe the checkpoint resolves, in practice `distilled_two_stage`
+with fixed sigmas. So the audio drives the render, and no claim is made that the
+result reproduces upstream's own audio-to-video output.
+
+The WAV has to match the checkpoint already: 16-bit PCM RIFF/WAVE, the audio
+VAE's own sample rate (16 kHz on the shipped one), its encoder's channel count
+(2), and at least as long as the clip. None of the four is converted. There is
+no resampler for an arbitrary ratio here and no demuxer at all, and a take
+shorter than the clip is an error upstream too, so each mismatch is refused with
+both numbers in the message — a resampled-wrong, upmixed or silence-padded take
+renders a finished clip conditioned on audio nobody supplied. This needs an
+audio VAE that carries encoder weights; a decoder-only one refuses by name.
+
+#### The supported resolution envelope
+
+**`--width` and `--height` are enforced, and an unsupported value is refused by
+name.** Both must be multiples of the VAE's spatial factor (32) times the worst
+downscale the recipe's phases apply — so **64 on the distilled two-stage recipe**,
+whose first phase runs at half resolution, and **32 on a one-stage recipe**. Those
+are upstream's own two numbers (`assert_resolution`,
+`ltx-pipelines utils/helpers.py:540-551`), reached by upstream's derivation rather
+than hardcoded, so a recipe that downscaled further would tighten the divisor with
+it. The refusal names the offending axis — width, height, or both — the divisor,
+and a size you can actually pass: the nearest legal one at or below the request,
+or, when an axis is smaller than the divisor and no such size exists, the
+smallest legal size there is.
+
+Until 2026-08-15 nothing enforced this and the engine floored instead: a
+two-stage request of width 80 rendered 64 and returned success, and a one-stage
+request of width 100 rendered 96 ([#919](https://github.com/mudler/vllm.cpp/issues/919)).
+
+**`--frames` is NOT enforced, and it rounds.** A frame count is floored onto the
+VAE's temporal grid, `(frames - 1) / 8 * 8 + 1`, so 100 frames renders 97. This
+mirrors upstream, which floors an explicit `num_frames` identically
+(`ltx_core/types.py:113`) and validates it nowhere: its `snap_frames_to_grid`
+helper is called from the auto-duration path and from the dubbing pipeline, and
+that pipeline takes no frame count at all — it snaps one read from a reference
+video's container. No frame count a caller supplies is snapped or checked, in
+either project. Pass a value of the form `8k + 1` to get exactly what you asked
+for. The rounding is observable either way: `result.frame_count`, `result.width`
+and `result.height` report what was actually rendered, not what was requested.
+
+Omitting all three renders the recipe default, which is 1024x1536 at 121 frames
+and is a much larger request than it looks.
+
+**What is legal is not what fits.** The first two rows below are a property of
+this port and are enforced. The rest are scale markers, and the last two are
+measurements of one box rather than limits of the code:
+
+| | Value |
+|---|---|
+| Legal sizes | any multiple of 64 (two-stage) or 32 (one-stage), on both axes |
+| Legal frame counts | any; non-`8k + 1` values floor onto the temporal grid |
+| Upstream's default output | 1024x1536 at 121 frames (`utils/constants.py:42-76`) |
+| Upstream's HQ preset output | 1088x1920 at 121 frames (`utils/constants.py:95-98`) |
+| **Measured to complete on one GB10** | **320x192 at 25 frames** |
+| Measured NOT to complete | 448x256 at 25 frames — the denoise finishes, then the decode loses about 59 GB in 24 s |
+
+That gap between the legal envelope and the measured one is a decode problem, not
+a resolution cap: there is no maximum-size check anywhere in this path, and the
+60 GB is **not attributed** — the decode's own heap peak at that size is 361.72
+MiB, some 170x too small to account for it. See the note below on what bounds a
+render, and `.agents/specs/ltx25-tiled-decode.md`.
 
 `--upsampler` is what the distilled recipe's second phase needs. Without it that
 phase refuses rather than skipping: its three-step refinement is what makes the
@@ -1354,6 +1417,14 @@ one-utterance family keeps using OpenAI's `input`. `prompt` is the documented
 alias for `description`, and supplying both with different values is a 400
 rather than a silent winner.
 
+The duration key is `audio_duration`, in seconds, with `duration` accepted as an
+alias. Omit it and the family's own default applies, which is 60 s for
+MiniMax-Music3. **`audio_duration_s` is refused**: that is the name of the field
+the key fills, not a key, and accepting it would return the default duration
+behind a 200 with nothing to tell the caller its request had been dropped. That
+is not hypothetical, it cost this project's own end-to-end gate four multi-hour
+runs, because 0.1 s silently became 60 s.
+
 Refused by name rather than ignored, because honouring any of them silently
 would return audio the caller did not ask for: `voice` (no registered family
 exposes named voices), `speed` (no family implements a rate control), `stream` /
@@ -1453,7 +1524,7 @@ a stop token early.
 | `--tool-call-parser <name>` | `hermes` | Tool-call dialect (42 names over 38 families). `auto` detects from the chat template, `none` disables. For `gemma4`, OpenAI chat uses the text-seam parser (wrapped `<\|tool_call>` **or** bare `call:NAME{ARGS}`) so free-form / detokenized tool bodies still become `tool_calls`. **`inkling` needs `"skip_special_tokens": false` on the request today** — its whole grammar is special tokens and we have no `adjust_request` seam to force the flag off for you, so at the `true` default the detokenizer strips the markers before the parser runs ([#695](https://github.com/mudler/vllm.cpp/issues/695)). `--reasoning-parser inkling` is not registered at all ([#703](https://github.com/mudler/vllm.cpp/issues/703)) |
 | `--reasoning-parser <name>` | `none` | Reasoning parser (`think_auto`, `deepseek_r1`, `deepseek_v3`, `holo2`, `mistral`, `minimax_m2`, `minimax_m2_append_think`, `step3`, `olmo3`, `muse_glimmer`, `qwen3`, `mimo`). `auto` detects, `none` disables. `qwen3` and its `mimo` alias are the engine-backed adapter (one upstream class, two registry names): thinking is ON, so a marker-less stream is reasoning and a `<tool_call>` ends reasoning with no `</think>`. `auto` never selects it — a generic `<think>` template resolves to `think_auto`, which is the right default for hybrid-thinking models that may answer with no think block at all |
 | `--kv-transfer-config '<json>'` | (unset) | External KV connector, same JSON as vLLM's flag. See [docs/KV-OFFLOAD.md](KV-OFFLOAD.md) |
-| `--offload-config '<json>'` | (unset) | Weight offload, the same JSON vLLM's `OffloadConfig` takes (distinct from `--kv-transfer-config`, which offloads KV blocks). Parsed and validated at startup, so a malformed document, an unknown backend or a validator violation is refused before any model I/O; a backend/field mismatch is a warning, as upstream. **Accepted and inert today: no weight moves yet**, and on unified memory such as GB10 it cannot help at all because host and device share one pool. See [docs/WEIGHT-OFFLOAD.md](WEIGHT-OFFLOAD.md) |
+| `--offload-config '<json>'` | (unset) | Weight offload, the same JSON vLLM's `OffloadConfig` takes (distinct from `--kv-transfer-config`, which offloads KV blocks). Parsed and validated at startup, so a malformed document, an unknown backend or a validator violation is refused before any model I/O; a backend/field mismatch is a warning, as upstream. **Enabling it fails startup on every model today**: no loader consults the offloader, so the engine refuses the configuration by architecture name rather than accept a budget that frees nothing. A config that leaves offloading disabled still parses and reports normally. On unified memory such as GB10 offload cannot help at all, because host and device share one pool. See [docs/WEIGHT-OFFLOAD.md](WEIGHT-OFFLOAD.md) |
 | `--speculative-config '<json>'` | (unset) | Speculative decoding (`mtp`, `dflash`, `ngram`), same JSON as vLLM's flag. `dspark` speculates on the Qwen3.6 gate models (native + Speculators drafts), token-identically to speculative-off, but is not gated on speed: the cross-engine ratio is UNSETTLED, with a matched-and-warm paired measurement of 0.834x against the pinned oracle and the earlier 0.957x-0.989x figures taken against a single COLD oracle invocation on a machine that has since been reimaged. A GGUF target, or a target with no aux multi-tap, is refused by name (`SPEC-DSPARK`). Its sequential Markov sampling runs on device by default; `VT_DSPARK_DEVICE_SAMPLE=0` restores the host loop (token-identical, cost only). The speculative verify runs from a captured CUDA graph, worth +12.2%/+3.5% on the 35B cells; `VT_SPEC_DECODE_GRAPH=0` restores the eager verify (also token-identical). See [docs/SPECULATIVE-DECODING.md](SPECULATIVE-DECODING.md) |
 | `--language-model-only` / `--no-language-model-only` | off | Disable all multimodal input by setting **every** modality limit to 0, mirroring vLLM's flag of the same name. It is not a "skip the encoder" switch: the server then **refuses** a multimodal request with ``400 At most 0 image(s) may be provided in one prompt. Set `--limit-mm-per-prompt` to increase this limit.`` It does **not** free VRAM yet — nothing gates tower construction on it ([#607](https://github.com/mudler/vllm.cpp/issues/607) wave L3) |
 | `--limit-mm-per-prompt '<json>'` | (unset ⇒ 999 per modality) | Maximum multimodal input items per prompt, per modality, as the same JSON object vLLM's flag takes: `'{"image": 2, "video": 0}'`, or with profiling options `'{"video": {"count": 1, "num_frames": 32}}'` (the options are validated and ignored — they size dummy inputs for memory profiling, which this engine does not do). A limit can only **lower** what the model/seam supports, never raise it. Malformed JSON, a negative count, or an unknown option on `image` / `video` / `audio` is refused at startup rather than defaulted. An unknown option on any other modality name is dropped rather than refused, mirroring upstream, whose fallback `BaseDummyOptions` is the one such dataclass without `extra="forbid"`. Upstream's dotted spelling (`--limit-mm-per-prompt.image 2`) is not accepted here, as for `--kv-transfer-config` and `--speculative-config` |

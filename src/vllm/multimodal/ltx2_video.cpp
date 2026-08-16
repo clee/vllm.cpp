@@ -26,6 +26,7 @@
 #include "vllm/model_executor/model_loader/safetensors_reader.h"
 #include "vllm/model_executor/models/device_pool.h"  // ActivePool(b)/DevicePool::Drain
 #include "vllm/model_executor/models/ltx2.h"
+#include "vllm/model_executor/models/ltx2_audio_input.h"
 #include "vllm/model_executor/models/ltx2_audio_vae.h"
 #include "vllm/model_executor/models/ltx2_conditioning.h"
 #include "vllm/model_executor/models/ltx2_connector.h"
@@ -177,6 +178,43 @@ struct StreamState {
   std::vector<float> keyframes_mask;
 };
 
+// ── StreamState <-> Ltx2LatentState (row LTX25-TOKEN-APPEND, issue #930) ────
+//
+// The conditioning items take `Ltx2LatentState`; the loop runs on `StreamState`.
+// ONE statement of the mapping, in both directions, because the first-frame arm
+// used to open-code the copy and an appending arm needs three more fields than
+// it carried — `positions`, `keyframes_mask` and a `tokens` that comes BACK
+// changed. A second open-coded copy is how one of them gets forgotten, and a
+// forgotten `keyframes_mask` is invisible to every shape check downstream.
+//
+// THE POSITIONS ROUND TRIP IS EXACT and that is not luck. `StreamState` holds
+// them as `double` only because the DiT's `positions` field takes one; every
+// value in it was produced by widening a `float` (see where the temporal axis is
+// divided by fps, below), and upstream's own positions are `float32`
+// (tools.py:169-174). So double -> float -> double reproduces the bits.
+Ltx2LatentState ToLatentState(const StreamState& s, int64_t pos_dims) {
+  Ltx2LatentState out;
+  out.tokens = s.tokens;
+  out.width = s.width;
+  out.pos_dims = pos_dims;
+  out.latent = s.latent;
+  out.clean = s.clean;
+  out.mask = s.mask;
+  out.positions.assign(s.positions.begin(), s.positions.end());
+  out.keyframes_mask = s.keyframes_mask;
+  return out;
+}
+
+void FromLatentState(const Ltx2LatentState& in, StreamState* s) {
+  s->tokens = in.tokens;
+  s->width = in.width;
+  s->latent = in.latent;
+  s->clean = in.clean;
+  s->mask = in.mask;
+  s->positions.assign(in.positions.begin(), in.positions.end());
+  s->keyframes_mask = in.keyframes_mask;
+}
+
 // `post_process_latent` (utils/helpers.py:462-464):
 //   denoised * mask + clean * (1 - mask)
 // The mask is PER TOKEN and the latent is per token x channel, so the mask
@@ -257,6 +295,26 @@ int64_t ExtraInt(const std::map<std::string, std::string>& extras, const std::st
   }
 }
 
+// The same, for a SECONDS-valued knob. Separate from `ExtraInt` rather than
+// folded into it, because the two disagree about what "3" means to a parser and
+// silently truncating `audio_start_time=1.5` to 1 would window the wrong second
+// of a take and still render. `consumed != size` catches the trailing-garbage
+// case that `stod` otherwise accepts.
+double ExtraDouble(const std::map<std::string, std::string>& extras, const std::string& key,
+                   double fallback) {
+  const std::string raw = VideoExtra(extras, key);
+  if (raw.empty()) return fallback;
+  try {
+    size_t consumed = 0;
+    const double value = std::stod(raw, &consumed);
+    if (consumed != raw.size()) throw std::invalid_argument("trailing");
+    if (!std::isfinite(value)) throw std::invalid_argument("not finite");
+    return value;
+  } catch (const std::exception&) {
+    Fail("the extra '" + key + "' is '" + raw + "', which is not a finite number of seconds");
+  }
+}
+
 // The one key this family DEFINES and does not SERVE. `Ltx2DurationPredict` is
 // ported and gated as a brick (`ltx2_duration_head.h`), but nothing here
 // constructs one, so a supplied path names a file the engine never opens.
@@ -281,7 +339,7 @@ constexpr char kLtx2DurationHeadPathExtra[] = "duration_head_path";
 // they are no longer trusted: the list below is derived from this file on every
 // run and compared, and the failure prints the replacement to paste in.
 // READER ANCHORS (derived and gated by test_ltx2_video):
-// 690 745 841 857 859 929 954 1059 1100
+// 756 811 907 923 925 1003 1028 1133 1174
 const char* const kKnownLoadExtras[] = {
     kLtx2AudioPromptEmbedsExtra, kLtx2PipelineKindExtra,   kLtx2ModelVersionExtra,
     kLtx2AllowUnportedExtra,     kLtx2MaxPhaseExtra,       kLtx2DitConfigPathExtra,
@@ -509,6 +567,14 @@ struct Ltx2VideoEngine::Impl {
   Ltx2VaeWeights audio_weights;
   Ltx2VocoderBweConfig vocoder_cfg;
   Ltx2VaeWeights vocoder_weights;
+
+  // The ANALYSIS half, for audio-to-video (row LTX25-A2V-AUDIO-INPUT, #922).
+  // Present only when the audio VAE checkpoint carries `audio_vae.encoder.`
+  // tensors; a decoder-only checkpoint leaves this false and `audio_path` is
+  // then refused BY NAME rather than rendering an unconditioned clip.
+  bool has_audio_encoder = false;
+  Ltx2AudioEncoderLoad audio_encoder_cfg;
+  Ltx2VaeWeights audio_encoder_weights;
 
   bool has_upsampler = false;
   Ltx2UpsamplerConfig upsampler_cfg;
@@ -923,6 +989,14 @@ std::unique_ptr<Ltx2VideoEngine> Ltx2VideoEngine::Load(const VideoModelParams& p
     im.audio_weights = Ltx2LoadVaeWeights(f, Ltx2AudioVaeDecoderKeyRules());
     im.vocoder_cfg = Ltx2ParseVocoderBweConfig(config);
     im.vocoder_weights = Ltx2LoadVaeWeights(f, Ltx2VocoderKeyRules());
+    // The ENCODER half, when the checkpoint carries it (#922). Loaded from the
+    // same file and the same metadata object, so the encoder and its mel
+    // front-end cannot disagree with the decoder about sample rate or mel bins.
+    if (Ltx2CheckpointHasAudioEncoder(f.Names())) {
+      im.audio_encoder_cfg = Ltx2ParseAudioEncoderConfig(config);
+      im.audio_encoder_weights = Ltx2LoadVaeWeights(f, Ltx2AudioVaeEncoderKeyRules());
+      im.has_audio_encoder = true;
+    }
   }
 
   // ── the optional latent spatial upsampler (the two-stage recipe's phase 2) ─
@@ -1220,9 +1294,28 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
     // silently dropped renders the DEFAULT and looks like the feature not
     // working — and for THIS knob the default is a refusal, so a typo would turn
     // a served request into an unexplained one.
-    if (kv.first != kLtx2ImageCrfExtra && kv.first != kLtx2GeneratedKeyframesExtra) {
+    const bool known = kv.first == kLtx2ImageCrfExtra || kv.first == kLtx2AudioPathExtra ||
+                       kv.first == kLtx2AudioStartTimeExtra ||
+                       kv.first == kLtx2AudioMaxDurationExtra ||
+                       kv.first == kLtx2GeneratedKeyframesExtra;
+    if (!known) {
       Fail("unknown per-generation extra '" + kv.first + "'. This family defines: " +
-           std::string(kLtx2ImageCrfExtra) + ", " + std::string(kLtx2GeneratedKeyframesExtra));
+           std::string(kLtx2ImageCrfExtra) + ", " + kLtx2AudioPathExtra + ", " +
+           kLtx2AudioStartTimeExtra + ", " + kLtx2AudioMaxDurationExtra + ", " +
+           kLtx2GeneratedKeyframesExtra);
+    }
+  }
+  // The two audio WINDOW knobs only mean something alongside a file. Accepting
+  // one on its own would silently do nothing, which is the defect the whole
+  // extras surface refuses by name elsewhere.
+  {
+    const std::string path = VideoExtra(gen.extras, kLtx2AudioPathExtra);
+    for (const char* dependent : {kLtx2AudioStartTimeExtra, kLtx2AudioMaxDurationExtra}) {
+      if (path.empty() && !VideoExtra(gen.extras, dependent).empty()) {
+        Fail("the '" + std::string(dependent) + "' extra was supplied without '" +
+             std::string(kLtx2AudioPathExtra) +
+             "', so there is no audio for it to window. Refused rather than ignored");
+      }
     }
   }
   CheckGeneratedKeyframes(gen.extras);
@@ -1376,39 +1469,23 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
   // next reader re-checks the claim instead of re-deriving the refutation. Local
   // anchors are SYMBOLS, not line numbers in this file: same-file line numbers
   // drift on every edit, which is how the previous message's citation went stale.
-  const bool wants_image = !gen.first_frame_path.empty() || !gen.first_frame_ppm.empty();
-  if (!gen.last_frame_path.empty()) {
-    Fail(
-        "a LAST-frame keyframe is not served. What is missing is the TOKEN-APPEND machinery. "
-        "`Ltx2ConvVideoEncode` and `Ltx2ConditionVideoByKeyframe` are both ported and gated, "
-        "and this engine materializes encoder weights through Ltx2VideoVaeEncoderKeyRules, so "
-        "none of those is the gap. The gap is that `VideoConditionByKeyframeIndex.apply_to` "
-        "(conditioning/types/keyframe_cond.py:36-90) APPENDS tokens to the sequence: it "
-        "concatenates onto `latent`, `denoise_mask`, `positions` and `clean_latent` (:79-82), "
-        "gives the appended tokens their own pixel coordinates offset to `frame_idx` (:46-59), "
-        "and rebuilds the attention mask through `update_attention_mask` (:68-76) — and then "
-        "`clear_conditioning` (ltx_core/tools.py:88-105) trims those extra tokens back off "
-        "before unpatchify. This engine cannot do any of that yet: `Ltx2LatentState` has no "
-        "attention-mask field at all (see the note on its declaration in ltx2_conditioning.h), "
-        "and the phase loop is fixed at the target grid's token count — one "
-        "`Ltx2VideoTokenCount(vshape, 1)` feeds the sigma schedule, the `Ltx2ModalityInput` "
-        "handed to the DiT, and `Ltx2VideoUnpatchify`, with the clear step an explicit identity "
-        "because nothing was ever appended. Serving this arm means growing that sequence "
-        "through the DiT and trimming it back. Conditioning on the FIRST frame needs none of "
-        "it, which is why that arm IS served: `VideoConditionByLatentIndex` REPLACES tokens "
-        "that already exist (conditioning/types/latent_cond.py:38-39) and the token count never "
-        "changes. WHAT IS *NOT* THE REASON, because this refusal used to say it was: "
-        "`keyframes_abs_pos_embedding`. A SUPPLIED keyframe is appended with `marked=False` "
-        "(keyframe_cond.py:84-86, whose comment says given keyframe content carries no keyframe "
-        "marker), and its sole consumer adds `mask * embedding` with `mask = keyframes_mask > 0` "
-        "(model/transformer/transformer_args.py:42-43, called once at :269) — so on exactly "
-        "these tokens the embedding contributes nothing, and porting it would not serve this "
-        "arm. The tokens that DO reach it are the target's own first latent frame, marked "
-        "unconditionally by `_first_frame_keyframes_mask` (ltx_core/tools.py:184-196) — which "
-        "is the frame the SERVED first-frame arm writes into. That omission WAS real; row "
-        "LTX25-KEYFRAMES-ABS-POS closed it on 2026-08-14 (issue #658), so the marker is now "
-        "applied on every render. It was never what blocks a last-frame keyframe.");
-  }
+  // TWO ARMS OF ONE UPSTREAM LOOP. `combined_image_conditionings`
+  // (ltx-pipelines/utils/helpers.py:272-308) iterates one `images` list and
+  // branches per item: `frame_idx == 0` takes `VideoConditionByLatentIndex`,
+  // anything else takes `VideoConditionByKeyframeIndex`. So the CRF, the
+  // strength polarity, the preprocess and the encode are shared by construction
+  // upstream, and they are shared here for the same reason rather than
+  // duplicated per arm.
+  //
+  // Row LTX25-TOKEN-APPEND (#930) opened the second branch. The refusal that
+  // stood here named the token-append machinery, and that refusal was accurate:
+  // a keyframe APPENDS (keyframe_cond.py:79-82) where an image at latent frame 0
+  // REPLACES (latent_cond.py:38-39), and this loop had no way to grow the
+  // sequence and trim it back. `Ltx2ExtendKeyframesMask` and
+  // `Ltx2ClearConditioning` are the two halves it was missing.
+  const bool wants_first_frame = !gen.first_frame_path.empty() || !gen.first_frame_ppm.empty();
+  const bool wants_last_frame = !gen.last_frame_path.empty();
+  const bool wants_image = wants_first_frame || wants_last_frame;
   if (!gen.ref_image_paths.empty() || !gen.ref_video_dir.empty()) {
     Fail(
         "reference-image / reference-video conditioning is not served. The encoder and the "
@@ -1439,7 +1516,7 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
   // unsupported request costs nothing and reports the same thing every time.
   int64_t image_crf = 0;
   double image_strength = 0.0;
-  std::string image_bytes;
+  std::string image_bytes, last_frame_bytes;
   if (wants_image) {
     if (!im.has_video_encoder) {
       Fail(
@@ -1468,8 +1545,12 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
            "above 1 makes it negative, which the noiser extrapolates PAST the clean latent "
            "rather than toward it (components/noisers.py:33)");
     }
-    image_bytes = gen.first_frame_ppm.empty() ? ReadFileBytes("first_frame", gen.first_frame_path)
-                                              : gen.first_frame_ppm;
+    if (wants_first_frame) {
+      image_bytes = gen.first_frame_ppm.empty()
+                        ? ReadFileBytes("first_frame", gen.first_frame_path)
+                        : gen.first_frame_ppm;
+    }
+    if (wants_last_frame) last_frame_bytes = ReadFileBytes("last_frame", gen.last_frame_path);
     im.trace.image_crf = image_crf;
     im.trace.image_strength = image_strength;
   }
@@ -1500,6 +1581,49 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
   const Ltx2ScaleFactors factors;  // VIDEO_SCALE_FACTORS (types.py:70) — the conv
                                    // arm's fixed (8, 32, 32), not derived
                                    // (utils/helpers.py:66-72)
+
+  // `assert_resolution` (utils/helpers.py:540-551), at the position upstream
+  // calls it from: the top of `__call__`, before any work is paid for. The
+  // divisor is DERIVED — the VAE spatial factor times the worst downscale this
+  // recipe's phases apply — which is upstream's own 64 for a two-stage recipe and
+  // 32 for a one-stage one, reached by upstream's reasoning rather than restated
+  // as two literals.
+  //
+  // FRAMES ARE DELIBERATELY NOT CHECKED HERE, and the asymmetry is upstream's.
+  // `resolve_num_frames` (utils/blocks.py:908-928) returns an explicit count
+  // verbatim (utils/blocks.py:920-921) and `VideoLatentShape.from_pixel_shape`
+  // (ltx_core/types.py:113)
+  // then floors it exactly as the `vshape.frames = (frames - 1) / factors.time + 1`
+  // line in the phase loop below does. Adding a refusal here would be a divergence
+  // from the reference, not a mirror of it — so `docs/USAGE.md` carries the
+  // rounding as documented behaviour instead (#919).
+  //
+  // `snap_frames_to_grid` (utils/helpers.py:554-562) does NOT contradict that,
+  // and the reason is not the one it is easy to give. It has three callers, not
+  // one: utils/helpers.py:581 inside `seconds_to_clamped_num_frames`, which is the
+  // auto-duration path, and dubit.py:215 and :396, the second of which is inside
+  // `DubitPipeline.__call__` three lines after its own `assert_resolution`. So
+  // "only the auto-duration path snaps" is false. What holds is sharper:
+  // `DubitPipeline.__call__` takes NO `num_frames` at all (dubit.py:194-210) and
+  // snaps a count it read from the reference video's container metadata. Counted
+  // at the pin, it is the only pipeline `__call__` that snaps, and the only one
+  // with no `num_frames` parameter — every `__call__` that does take one leaves it
+  // unsnapped. An explicit frame count is floored upstream and here, and validated
+  // in neither.
+  // ONE divisor for both axes, as upstream has (`divisor = 64 if is_two_stage
+  // else 32`). That is a mirror and not a simplification: upstream's
+  // VIDEO_SCALE_FACTORS is (8, 32, 32), so its single spatial divisor already
+  // covers both axes. The equality is asserted rather than assumed, because a VAE
+  // whose axes differed would otherwise have its width checked against the height
+  // factor and no test would see it.
+  if (factors.height != factors.width) {
+    Fail("the VAE's spatial scale factors differ (" + std::to_string(factors.height) +
+         " high, " + std::to_string(factors.width) +
+         " wide), so one resolution divisor cannot cover both axes the way "
+         "`assert_resolution` (utils/helpers.py:540-551) does");
+  }
+  Ltx2AssertResolution(height, width, factors.height * recipe.max_spatial_downscale());
+
   // `AudioLatentShape.from_video_pixel_shape` (types.py:184-200) and
   // `VideoLatentShape.from_pixel_shape` (:108-123) defaults. Asserted against the
   // DiT rather than assumed: the audio latent's channels x mel_bins IS the audio
@@ -1526,6 +1650,85 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
   int64_t video_lc = 0, video_lf = 0, video_lh = 0, video_lw = 0;
   std::vector<float> audio_latent_volume;  // [C, F, M], unpatchified
   int64_t audio_lc = 0, audio_lf = 0, audio_lm = 0;
+
+  // ── AUDIO-TO-VIDEO: the driving waveform (#922) ────────────────────────────
+  //
+  // `A2VidPipelineTwoStage.__call__` lines 196-202: decode the file, encode it
+  // through the audio VAE, truncate it to the clip's own duration. The result
+  // then rides FROZEN through every phase (`ModalitySpec(frozen=True,
+  // noise_scale=0.0)`, :251-256 and :291-296), which is what makes this
+  // audio-to-video rather than joint generation: the soundtrack is an input, and
+  // the video is denoised around it.
+  //
+  // Done ONCE, before the phase loop, and deliberately not per phase: upstream
+  // encodes once at :200 and hands the SAME tensor to both stages. Re-encoding
+  // per phase would be pure waste on a path where the latent cannot change.
+  std::vector<float> a2v_audio_volume;
+  // The take as DECODED, kept for the output. Upstream returns the caller's own
+  // waveform rather than the VAE's reconstruction of it, in as many words:
+  // "Return the original input audio instead of VAE-decoded audio to preserve
+  // fidelity" (a2vid_two_stage.py:301-303). Round-tripping a file the caller
+  // already has through an encoder and a vocoder can only lose to it.
+  Ltx2DecodedAudio a2v_source;
+  const std::string a2v_audio_path = VideoExtra(gen.extras, kLtx2AudioPathExtra);
+  if (!a2v_audio_path.empty()) {
+    if (!im.has_audio_encoder) {
+      Fail("'" + std::string(kLtx2AudioPathExtra) + "' names '" + a2v_audio_path +
+           "', but the audio VAE checkpoint loaded here carries no `audio_vae.encoder.` "
+           "tensors, so there is nothing to turn that waveform into latents with. "
+           "`Ltx2AudioEncoderForward` and its mel front-end are ported and gated "
+           "(audio_vae.py:190-246, ops.py:8-55); what this checkpoint is missing is the "
+           "WEIGHTS. Supply an audio VAE that carries the encoder half. Refused rather than "
+           "rendering the clip unconditioned, which would look like the feature working");
+    }
+    // `AudioLatentShape.from_duration` (types.py:164-181), the same expression
+    // the phase loop uses for `ashape.frames` below. Computed here so the
+    // truncation target and the stream's token count cannot drift apart.
+    const Ltx2AudioPatchifierParams ap;
+    const double latents_per_second = static_cast<double>(ap.sample_rate) /
+                                      static_cast<double>(ap.hop_length) /
+                                      static_cast<double>(ap.audio_latent_downsample_factor);
+    const int64_t target_frames = static_cast<int64_t>(
+        std::llround(static_cast<double>(frames) / fps * latents_per_second));
+
+    // `--audio-max-duration` defaults to the CLIP's duration, and that default
+    // is applied by upstream's CLI (a2vid_two_stage.py:369-371), not by the
+    // pipeline, whose own default is None (:157). Mirrored at the same layer.
+    const double start_time =
+        ExtraDouble(gen.extras, kLtx2AudioStartTimeExtra, 0.0);
+    const double max_duration =
+        ExtraDouble(gen.extras, kLtx2AudioMaxDurationExtra, static_cast<double>(frames) / fps);
+    if (start_time < 0.0) {
+      Fail("'" + std::string(kLtx2AudioStartTimeExtra) + "' is " + std::to_string(start_time) +
+           "; it is a position in seconds and cannot be negative");
+    }
+    if (max_duration <= 0.0) {
+      Fail("'" + std::string(kLtx2AudioMaxDurationExtra) + "' is " + std::to_string(max_duration) +
+           "; it is a duration in seconds and must be positive");
+    }
+
+    a2v_source = Ltx2DecodeAudioWav(
+        ReadFileBytes(kLtx2AudioPathExtra, a2v_audio_path), a2v_audio_path,
+        im.audio_encoder_cfg.encoder.in_channels,
+        im.audio_encoder_cfg.processor.target_sample_rate, start_time, max_duration);
+
+    const Ltx2AudioSpectrogram encoded = Ltx2EncodeAudioToLatent(
+        im.audio_encoder_cfg.encoder, im.audio_encoder_cfg.processor, im.audio_encoder_weights,
+        a2v_source, target_frames);
+
+    // The DiT's audio stream is `channels x mel_bins` wide and the engine
+    // already refuses a checkpoint whose product disagrees. Check the encoder's
+    // OWN output against the same two numbers rather than only the product: a
+    // (16, 8) latent has the same width as an (8, 16) one and unpatchifies into
+    // a different tensor.
+    if (encoded.channels != kAudioLatentChannels || encoded.mel_bins != kAudioLatentMelBins) {
+      Fail("the audio VAE encoder produced a " + std::to_string(encoded.channels) + " x " +
+           std::to_string(encoded.mel_bins) +
+           " latent and this DiT's audio stream takes " + std::to_string(kAudioLatentChannels) +
+           " x " + std::to_string(kAudioLatentMelBins) + " (types.py:184-200)");
+    }
+    a2v_audio_volume = encoded.data;
+  }
 
   for (int64_t phase_index = 0; phase_index <= last_phase; ++phase_index) {
     const Ltx2PhaseRecipe& phase = recipe.phases[static_cast<size_t>(phase_index)];
@@ -1634,9 +1837,20 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
     }
 
     // ── build the two states (create_noised_state, helpers.py:428-445) ───────
+    //
+    // `target_tokens` is `patchifier.get_token_count(target_shape)` — the count
+    // of the TARGET GRID, which is fixed for this phase. `video.tokens` starts
+    // equal to it and is GROWN by any appending conditioning item. Row
+    // LTX25-TOKEN-APPEND (#930) split the two, and the two places that must keep
+    // reading the target rather than the grown count are the sigma schedule
+    // (schedulers.py:32-39 reads the unpatchified target at :32 and turns it into
+    // the shift at :39, and
+    // the pipelines compute sigmas before the state exists at all) and the trim
+    // at the bottom of the loop (`clear_conditioning`, tools.py:101).
+    const int64_t target_tokens = Ltx2VideoTokenCount(vshape, 1);
     StreamState video;
     video.width = vshape.channels;  // patch_size 1 (VideoLatentPatchifier(1))
-    video.tokens = Ltx2VideoTokenCount(vshape, 1);
+    video.tokens = target_tokens;
     {
       std::vector<float> volume(static_cast<size_t>(vshape.channels) *
                                 static_cast<size_t>(vshape.frames) *
@@ -1671,6 +1885,9 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
       }
     }
 
+    // Hoisted out of the state block below because the FORWARD needs it too:
+    // upstream's `frozen` sets the scalar `Modality.sigma` as well as the mask.
+    const bool audio_frozen = !a2v_audio_volume.empty();
     StreamState audio;
     audio.width = ashape.channels * ashape.mel_bins;
     audio.tokens = ashape.frames;
@@ -1687,12 +1904,57 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
         }
         volume = audio_latent_volume;
       }
+      // ── audio-to-video: the supplied take, FROZEN (#922) ──────────────────
+      //
+      // `ModalitySpec(context=..., frozen=True, noise_scale=0.0,
+      // initial_latent=encoded_audio_latent)` — a2vid_two_stage.py:251-256 for
+      // stage 1 and :291-296 for stage 2, identical on both. It replaces the
+      // carry-over above rather than adding to it: upstream hands the SAME
+      // encoded tensor to both stages, so phase 2 must not inherit phase 1's
+      // audio state.
+      if (audio_frozen) {
+        if (a2v_audio_volume.size() != volume.size()) {
+          Fail("the encoded audio latent is " + std::to_string(a2v_audio_volume.size()) +
+               " values and phase '" + phase.name + "' wants " + std::to_string(volume.size()));
+        }
+        volume = a2v_audio_volume;
+      }
       audio.latent = Ltx2AudioPatchify(volume.data(), ashape);
       audio.clean = audio.latent;
-      audio.mask.assign(static_cast<size_t>(audio.tokens), 1.0F);
+      // `frozen=True` "zeros the denoise mask and marks the resulting
+      // LatentState so Modality.sigma is forced to 0 (not only per-token
+      // timesteps)" — upstream's own words at utils/types.py:104-106. The
+      // zeroed mask is the whole of the first half here, and it is load-bearing
+      // three times over, because every consumer of `mask` already broadcasts
+      // it: `ApplyGaussianNoise` leaves the latent at `clean`, so
+      // `noise_scale=0.0` needs no separate branch; `TimestepsFromMask` yields
+      // per-token timestep 0, so the DiT sees the audio as clean conditioning;
+      // and the STEP cannot move the latent either.
+      //
+      // That third one holds by a DIFFERENT argument on each stepper arm, and
+      // "`PostProcessLatent` blends it back every step" — which this comment
+      // used to say — is true of only one of them. On `kEulerAncestral` the
+      // stepped latent IS passed back through `PostProcessLatent`, which
+      // restores `clean` wherever the mask is 0. The plain `kEuler` arm never
+      // calls it, and does not need to: `a_denoised` is itself post-processed,
+      // so on a frozen stream `a_denoised == clean == latent`, the Euler
+      // derivative `d = (x - denoised) / sigma` is exactly 0, and
+      // `x + (sigma_next - sigma) * d` returns `x` unchanged. Two arms, two
+      // reasons, one invariant — and the weaker one is the one that had to be
+      // written down, because a reader who checks the strong claim against
+      // `kEuler` finds no `PostProcessLatent` there and concludes the freeze
+      // leaks.
+      //
+      // The SECOND half — the scalar `Modality.sigma` —
+      // is not expressible through the mask and is applied at the forward
+      // below; upstream's parenthesis says exactly that the two are different.
+      audio.mask.assign(static_cast<size_t>(audio.tokens), audio_frozen ? 0.0F : 1.0F);
       const std::vector<float> timings = Ltx2AudioPatchTimings(ashape, Ltx2AudioPatchifierParams{});
       audio.positions.assign(timings.begin(), timings.end());
     }
+
+    im.trace.audio_conditioned = !a2v_audio_volume.empty();
+    im.trace.audio_tokens = audio.tokens;
 
     // ── the image conditioning (issue #644) ─────────────────────────────────
     //
@@ -1714,43 +1976,55 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
     // `height` / `width` at :285-286. Conditioning stage 1 only would let stage 2 re-noise
     // the pinned frame away; conditioning stage 2 with stage 1's latent would
     // place a half-resolution image into a full-resolution grid.
-    if (wants_image) {
-      const std::vector<float> pixels = Ltx2LoadImageAndPreprocess(
-          "first_frame", image_bytes, phase_h, phase_w, image_crf);
+    // ONE ITERATION of upstream's `images` loop (helpers.py:283-291): load,
+    // preprocess to THIS phase's height and width, encode. Shared by both arms
+    // because upstream shares it — the branch is on `frame_idx`, below, and it
+    // is the only thing that differs between them.
+    auto encode_conditioning_image = [&](const char* label,
+                                         const std::string& bytes) -> Ltx2LatentVolume {
+      const std::vector<float> pixels =
+          Ltx2LoadImageAndPreprocess(label, bytes, phase_h, phase_w, image_crf);
       int64_t cropped = 0;
       const Ltx2LatentVolume encoded = Ltx2ConvVideoEncode(
           im.video_encoder_cfg, im.video_encoder_weights, pixels,
           im.video_encoder_cfg.in_channels, /*frame_count=*/1, phase_h, phase_w, &cropped);
       if (encoded.frames != 1) {
         Fail("the video VAE encoder returned " + std::to_string(encoded.frames) +
-             " latent frames for a single image; `VideoConditionByLatentIndex` places one "
+             " latent frames for a single image; both arms of "
+             "`combined_image_conditionings` place exactly one "
              "(ltx-pipelines/utils/helpers.py:294-300)");
       }
+      // The REPLACE arm needs this to hold because upstream raises
+      // ConditioningError otherwise (latent_cond.py:25-30). The APPEND arm does
+      // not — `VideoConditionByKeyframeIndex` derives its own shape from the
+      // keyframe tensor (keyframe_cond.py:41-44) and never compares it to the
+      // target — so for that arm this is a consistency assertion rather than a
+      // capability limit, and it cannot falsely fire: the preprocess above
+      // targets this phase's own height and width, so a disagreement here means
+      // the encoder's spatial factor and VIDEO_SCALE_FACTORS disagree, which
+      // would place the keyframe's tokens at the wrong RoPE positions.
       if (encoded.channels != vshape.channels || encoded.height != vshape.height ||
           encoded.width != vshape.width) {
-        Fail("the encoded image is " + std::to_string(encoded.channels) + "x" +
-             std::to_string(encoded.height) + "x" + std::to_string(encoded.width) +
+        Fail(std::string("the encoded ") + label + " is " + std::to_string(encoded.channels) +
+             "x" + std::to_string(encoded.height) + "x" + std::to_string(encoded.width) +
              " but phase '" + phase.name + "' needs " + std::to_string(vshape.channels) + "x" +
              std::to_string(vshape.height) + "x" + std::to_string(vshape.width) +
              ". Upstream raises ConditioningError on exactly this "
              "(conditioning/types/latent_cond.py:25-30): the encoder's spatial factor and the "
              "pipeline's VIDEO_SCALE_FACTORS must agree, and they do not.");
       }
+      return encoded;
+    };
 
-      // `Ltx2ConditionVideoByLatentIndex` writes `clean` and `mask` and reads
-      // `tokens` / `width`; `latent` and `positions` are carried so the struct
-      // is coherent rather than half-filled, not because the item consults them.
-      Ltx2LatentState state;
-      state.tokens = video.tokens;
-      state.width = video.width;
-      state.pos_dims = 3;
-      state.latent = video.latent;
-      state.clean = video.clean;
-      state.mask = video.mask;
+    if (wants_first_frame) {
+      const Ltx2LatentVolume encoded = encode_conditioning_image("first_frame", image_bytes);
+
+      // `frame_idx == 0` -> `VideoConditionByLatentIndex` (helpers.py:295-300).
+      // It REPLACES tokens that already exist and the token count never changes.
+      Ltx2LatentState state = ToLatentState(video, /*pos_dims=*/3);
       Ltx2ConditionVideoByLatentIndex(&state, vshape, /*patch_size=*/1, encoded, image_strength,
                                       /*latent_idx=*/0);
-      video.clean = state.clean;
-      video.mask = state.mask;
+      FromLatentState(state, &video);
 
       // The witness, taken from the TOKENS THAT WERE WRITTEN rather than from
       // `encoded` — and the difference is not cosmetic. Digesting the encoder's
@@ -1778,21 +2052,137 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
       im.trace.image_absmax = AbsMax(written);
     }
 
+    // ── the LAST-frame keyframe (row LTX25-TOKEN-APPEND, issue #930) ────────
+    //
+    // The other branch of the same upstream loop: anything but `frame_idx == 0`
+    // takes `VideoConditionByKeyframeIndex` (helpers.py:301-305), which APPENDS
+    // rather than replaces. `frame_idx` is a PIXEL frame, so the last frame of
+    // the output is `frames - 1`; `num_pixel_frames` stays at upstream's default
+    // of 1, which is what narrows the appended tokens' temporal extent to
+    // `[start, start + 1)` instead of the VAE-scaled range
+    // (keyframe_cond.py:53-56).
+    //
+    // AFTER the first-frame arm, because upstream applies conditioning items in
+    // list order (`state_with_conditionings`, helpers.py:448-458) and both arms
+    // can be supplied at once — `--image` is repeatable. Order matters here for
+    // a reason a shape check cannot see: the appended tokens land at the END of
+    // the sequence, and `clear_conditioning` trims from the end, so an item that
+    // appended BEFORE a replace would still be trimmed correctly while an item
+    // that appended before another append would swap their positions.
+    if (wants_last_frame) {
+      const Ltx2LatentVolume encoded = encode_conditioning_image("last_frame", last_frame_bytes);
+
+      Ltx2LatentState state = ToLatentState(video, /*pos_dims=*/3);
+      Ltx2ConditionVideoByKeyframe(&state, encoded, /*patch_size=*/1, factors, fps,
+                                   /*frame_idx=*/frames - 1, image_strength,
+                                   /*num_pixel_frames=*/1, /*causal_fix=*/true);
+      FromLatentState(state, &video);
+
+      // THE SEQUENCE GREW, and every consumer below reads `video.tokens` rather
+      // than the target count. Asserted rather than assumed, because a converter
+      // that dropped the grown count would leave a state whose buffers are
+      // longer than the count that describes them — and the DiT would then read
+      // a prefix, render a plausible clip, and never mention the keyframe.
+      VT_CHECK(video.tokens > target_tokens,
+               "ltx2 video: a keyframe conditioning must APPEND tokens "
+               "(keyframe_cond.py:79-82) and this one left the sequence length unchanged");
+      VT_CHECK(static_cast<int64_t>(video.latent.size()) == video.tokens * video.width &&
+                   static_cast<int64_t>(video.clean.size()) == video.tokens * video.width &&
+                   static_cast<int64_t>(video.mask.size()) == video.tokens &&
+                   static_cast<int64_t>(video.keyframes_mask.size()) == video.tokens &&
+                   static_cast<int64_t>(video.positions.size()) == 3 * video.tokens * 2,
+               "ltx2 video: after an append every per-token buffer must have one entry per "
+               "token. A buffer that did not grow with the others is invisible to the render's "
+               "SHAPE — the clip comes out the right size and simply describes the wrong "
+               "tokens.");
+
+      // AND IT LANDED ON THE LAST FRAME. Everything above proves the sequence
+      // grew and stayed self-consistent; none of it can see WHERE the appended
+      // tokens sit in time, and that is the whole content of this arm. MEASURED:
+      // mutation M10 changed `frame_idx` from `frames - 1` to `0` and the suite
+      // stayed GREEN — both renders still differed from the no-op control and
+      // from each other, and the token count was identical, because a keyframe
+      // pinned to the FIRST frame appends exactly as many tokens as one pinned
+      // to the last.
+      //
+      // The expectation is recomputed from `frames` and `fps`, NOT read back
+      // from the `frame_idx` argument above, so the two are independent
+      // expressions and a mutation of the argument alone moves one and not the
+      // other. `Ltx2ConditionVideoByKeyframe` offsets the item's temporal
+      // coordinates by `frame_idx` in integer PIXEL space and then divides the
+      // temporal axis by fps (keyframe_cond.py:52-58), so the first appended
+      // token's temporal START is `frame_idx / fps`. Positions are
+      // [pos_dims, tokens, 2] concatenated PER DIMENSION, so the temporal axis
+      // is dimension 0 and the first appended token sits at `target_tokens * 2`.
+      const double want_t0 = static_cast<double>(static_cast<float>(
+          static_cast<double>(frames - 1) / fps));
+      const double got_t0 = video.positions[static_cast<size_t>(target_tokens * 2)];
+      VT_CHECK(std::abs(got_t0 - want_t0) <= 1e-5 * std::max(1.0, std::abs(want_t0)),
+               "ltx2 video: the last-frame keyframe's appended tokens must carry the temporal "
+               "position of pixel frame `frames - 1` (" +
+                   std::to_string(want_t0) + "), but the first appended token starts at " +
+                   std::to_string(got_t0) +
+                   ". A keyframe that appends the right number of tokens at the wrong TIME "
+                   "renders a clip of the right length that pins the image to the wrong end");
+    }
+
     // The noiser draws VIDEO first, AUDIO second, from one generator
     // (blocks.py:554-563 builds the video state before the audio one; :576-580,
     // which this used to cite, is the TEARDOWN and proves nothing about order).
+    // The length the DiT will actually run over on this phase, recorded BEFORE
+    // the trim and after every conditioning item, so the last phase's value is
+    // the one a reader sees. Written inside the loop for the same reason
+    // `image_tokens` is: the rest of the trace is filled before denoise and
+    // cannot observe anything that happens in here.
+    im.trace.video_tokens = video.tokens;
+
     const float noise_scale = static_cast<float>(phase.noise_scale);
     ApplyGaussianNoise(video, state_noise.Draw(static_cast<int64_t>(video.latent.size())),
                        noise_scale);
     ApplyGaussianNoise(audio, state_noise.Draw(static_cast<int64_t>(audio.latent.size())),
                        noise_scale);
 
+    // The audio arm of the trace (#922), read AFTER the noiser and off the mask
+    // the loop will actually use.
+    //
+    // BOTH OF THOSE ARE THE POINT, and neither was true when this block sat
+    // above the noiser and reported the REQUEST's `audio_frozen` flag. MEASURED:
+    // with the trace there, a mutation that never zeroed the denoise mask —
+    // i.e. that noised and denoised the caller's take instead of holding it —
+    // left this suite at 3 cases / 51 assertions / exit 0. The digest was taken
+    // before the noise it was supposed to detect, and the flag restated the
+    // request rather than observing the state. Reading the mask makes the
+    // instrument answer the question the freeze claim actually makes.
+    im.trace.audio_frozen =
+        !audio.mask.empty() &&
+        std::all_of(audio.mask.begin(), audio.mask.end(), [](float m) { return m == 0.0F; });
+    im.trace.audio_latent_digest = DigestF32(audio.latent);
+    im.trace.audio_latent_absmax = AbsMax(audio.latent);
+
     // ── the schedule ────────────────────────────────────────────────────────
     std::vector<float> sigmas = phase.sigmas;
     if (sigmas.empty()) {
       int64_t steps = gen.steps > 0 ? gen.steps : recipe.num_inference_steps;
       if (steps < 1) Fail("num_inference_steps resolved to " + std::to_string(steps));
-      sigmas = Ltx2SigmaSchedule(steps, video.tokens);
+      // `target_tokens`, NOT `video.tokens`, and this line sits AFTER the
+      // conditioning block so the distinction is live. Upstream's shift comes
+      // from `tokens = math.prod(latent.shape[2:])` (schedulers.py:32) — the
+      // UNPATCHIFIED target latent, which by construction cannot see appended
+      // tokens — and every pipeline computes its sigmas before a state exists at
+      // all (ti2vid_one_stage.py:207 passes no latent; distilled.py:200-201 uses
+      // frozen constants). Reading the grown count here would re-shift the whole
+      // trajectory the moment a keyframe was supplied, which no shape check and
+      // no frame count can see.
+      // ONE local feeds both the schedule and the trace, deliberately. If the
+      // reported number were written independently of the number passed, a
+      // change to the argument alone would leave the trace still reporting the
+      // target and the gate still green — the instrument would be describing a
+      // build that no longer exists. Bound here so the ordinary mutation moves
+      // both. (It does not defend against an edit to the call argument only;
+      // nothing local can, and that residual is recorded in the row's spec.)
+      const int64_t schedule_tokens = target_tokens;
+      sigmas = Ltx2SigmaSchedule(steps, schedule_tokens);
+      im.trace.schedule_tokens = schedule_tokens;
     } else if (gen.steps > 0 && !recipe.allow_request_sigmas) {
       // `fixed_num_inference_steps` (ltx2_recipes.py:53-87): a distilled recipe's
       // schedule is trained INTO the model, so honouring a step override would
@@ -1878,7 +2268,20 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
       ain.context_tokens = context_tokens;
       ain.latent = audio.latent.data();
       ain.timesteps = a_timesteps.data();
-      ain.sigma = &sigma_row;
+      // The SECOND half of upstream's `frozen` (utils/types.py:104-106): the
+      // per-modality scalar sigma is forced to 0, "not only per-token
+      // timesteps". The zeroed denoise mask above already carries the per-token
+      // half through `TimestepsFromMask`, and this scalar is a separate input to
+      // the DiT that the mask cannot reach. Leaving it at the schedule's sigma
+      // would tell the model the audio it is conditioning on is noisy when it is
+      // the caller's own clean take — a wrong conditioning signal that still
+      // renders a finished clip.
+      const float audio_sigma_row = audio_frozen ? 0.0F : sigma_row;
+      ain.sigma = &audio_sigma_row;
+      // Observed, not asserted in prose: see `audio_sigma_max` in the header for
+      // the mutation that survived while this was only a comment.
+      im.trace.audio_sigma_max =
+          std::max(im.trace.audio_sigma_max, static_cast<double>(audio_sigma_row));
       ain.positions = audio.positions.data();
       ain.context = audio_context;
 
@@ -1930,9 +2333,33 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
       }
     }
 
-    // `clear_conditioning` + `unpatchify` (blocks.py:575-580). There are no
-    // conditioning tokens on this path, so the clear is the identity; the
-    // unpatchify is not.
+    // `clear_conditioning` + `unpatchify` (blocks.py:575-580, in that order).
+    //
+    // The clear used to be an explicit identity because nothing could append.
+    // Row LTX25-TOKEN-APPEND (#930) made it real: it truncates `latent`, `clean`
+    // and `positions` back to the target grid and restores an all-ones denoise
+    // mask (tools.py:101-105).
+    //
+    // WHY THE GUARD IS HERE AND NOT LEFT IMPLICIT. `Ltx2VideoUnpatchify` takes a
+    // BARE POINTER, so it cannot tell a target-length buffer from a longer one —
+    // and the appended tokens sit at the tail of a contiguous [tokens, width]
+    // buffer, so an un-trimmed state would unpatchify the same head bytes and
+    // render pixel-identical frames. That is exactly the shape of defect this
+    // project keeps finding: correct output for the wrong reason, with no
+    // instrument that can see the difference. The check is what turns "the head
+    // happens to be right" into "the buffer IS the target grid", and it is what
+    // makes deleting the trim a RED rather than a silent pass.
+    {
+      Ltx2LatentState finished = ToLatentState(video, /*pos_dims=*/3);
+      Ltx2ClearConditioning(&finished, target_tokens);
+      FromLatentState(finished, &video);
+    }
+    VT_CHECK(video.tokens == target_tokens &&
+                 static_cast<int64_t>(video.latent.size()) == target_tokens * video.width,
+             "ltx2 video: the latent handed to unpatchify must be exactly the target grid. "
+             "`clear_conditioning` (ltx_core/tools.py:88-117) is what establishes that after an "
+             "appending conditioning item, and `Ltx2VideoUnpatchify` takes a bare pointer that "
+             "cannot check it.");
     video_latent_volume = Ltx2VideoUnpatchify(video.latent.data(), vshape, 1);
     video_lc = vshape.channels;
     video_lf = vshape.frames;
@@ -2114,12 +2541,32 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
         rendered_channels = chunk.frames.channels;
       });
 
-  const Ltx2AudioSpectrogram mel = Ltx2AudioDecoderForward(
-      im.audio_cfg, im.audio_weights, audio_latent_volume, audio_lc, audio_lf, audio_lm);
+  // ── the soundtrack ────────────────────────────────────────────────────────
+  //
+  // On the AUDIO-TO-VIDEO path the caller's own take is returned UNCHANGED, and
+  // the audio VAE decode and the vocoder do not run at all. Upstream says why in
+  // as many words: "Return the original input audio instead of VAE-decoded audio
+  // to preserve fidelity" (a2vid_two_stage.py:301-303). The latent was frozen
+  // all the way through, so the reconstruction could at best equal the file the
+  // caller already has, and in practice loses an encode and a vocoder pass to
+  // it. Skipping the chain is upstream's behaviour, not an optimisation.
+  int64_t audio_channels = 0;
   int64_t audio_samples = 0;
-  const std::vector<float> waveform =
-      Ltx2VocoderWithBweForward(im.vocoder_cfg, im.vocoder_weights, mel.data, mel.channels,
-                                mel.frames, mel.mel_bins, &audio_samples);
+  int64_t audio_rate = 0;
+  std::vector<float> waveform;
+  if (!a2v_audio_volume.empty()) {
+    waveform = a2v_source.samples;
+    audio_channels = a2v_source.channels;
+    audio_samples = a2v_source.samples_per_channel;
+    audio_rate = a2v_source.sample_rate;
+  } else {
+    const Ltx2AudioSpectrogram mel = Ltx2AudioDecoderForward(
+        im.audio_cfg, im.audio_weights, audio_latent_volume, audio_lc, audio_lf, audio_lm);
+    waveform = Ltx2VocoderWithBweForward(im.vocoder_cfg, im.vocoder_weights, mel.data,
+                                         mel.channels, mel.frames, mel.mel_bins, &audio_samples);
+    audio_channels = mel.channels;
+    audio_rate = im.vocoder_cfg.output_sampling_rate;
+  }
 
   VideoResult result;
   result.frame_dir = gen.output_dir;
@@ -2134,13 +2581,12 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
   }
   result.audio_path = JoinPath(gen.output_dir, "audio.wav");
   WriteFileBytes(result.audio_path,
-                 MiniMaxH3WriteWav(waveform, mel.channels, audio_samples,
-                                   im.vocoder_cfg.output_sampling_rate));
+                 MiniMaxH3WriteWav(waveform, audio_channels, audio_samples, audio_rate));
   result.frame_count = rendered_frames;
   result.width = rendered_w;
   result.height = rendered_h;
   result.fps = static_cast<int64_t>(std::llround(fps));
-  result.sample_rate = im.vocoder_cfg.output_sampling_rate;
+  result.sample_rate = audio_rate;
 
   MiniMaxH3MuxRequest mux;
   mux.frame_pattern = JoinPath(gen.output_dir, "frame_%06d.ppm");
