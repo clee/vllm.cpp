@@ -10,9 +10,12 @@ review. The reason for that split is in §8.
 
 ## Now
 
-`SPIKE`. The source half is complete and is recorded below. The runtime half is
-recorded in §1.3 with its own state; where it is unfinished the axis says so
-rather than borrowing the source half's confidence.
+`SPIKE`. The source half is complete. The runtime half ran both rungs and is
+recorded in §1.3: rung 1 settled the memory *mechanism* and rung 2 mapped four
+post-load compute regimes, none of which uses the GPU. Rung 2 then exited 1 and
+the gate host went unreachable before its log could be read, so its failure
+reason is **`REMOTE_UNVERIFIED`** and stays that way. Where an axis is
+unfinished it says so rather than borrowing another axis's confidence.
 
 ## 0. What was asked, and what was actually wrong with the question
 
@@ -150,13 +153,47 @@ which is why it had 75.2 GiB free to plateau at. **These are two different
 failures at the same resolution**, and conflating them is available to anyone
 reading either trace alone.
 
-#### Rung 2 — 320x192/25f, the size that completes
+#### Rung 2 — 320x192/25f, the size that was expected to complete
 
-Queued behind the same headroom guard, no watchdog. It is the arm that answers
-whether the long flat phase is host compute or GPU-blocking (§1.4), and it is
-the phase breakdown this row was asked for. **At the time of writing it has not
-returned.** Where it is unfinished, §5 says so rather than borrowing phase A's
-confidence.
+It did not. `LOCK_ACQUIRED 11:14:41Z avail=104 GiB`, then **`EXIT=1`, 0 frames,
+elapsed 2407 s, 1082 sampler rows.** No watchdog was armed on this rung, so the
+non-zero exit is the engine's own.
+
+**The failure reason is `REMOTE_UNVERIFIED`.** `dgx.casa` became unreachable
+minutes after the probe printed `PROBE END` and has not answered since — `ssh`
+returns *"No route to host"* and `ping` loses 100% of packets across repeated
+attempts. `run.log` was never read. Per AGENTS.md, unknown is not absence and is
+not success: **this row does not know why rung 2 exited 1**, and it does not
+guess. The CSV and `run.log` are on the box and are recoverable when it returns.
+Whether the box rebooted, and whether this render or a peer's job caused it, are
+both unverified. Note that `MemAvailable` had risen to 66.51 GiB shortly before
+the exit, which does not fit a memory exhaustion at that moment.
+
+**What the 1082 rows did establish before it exited**, all per-PID at 2 s from
+the side-car, and all independent of the reason for the exit:
+
+| t | regime | evidence |
+|---|---|---|
+| 0-251 s | DiT staging to device | `capp_mib` 4322 -> 36396 (35.54 GiB); GPU 0-2%; 0.15 cores |
+| ~251-460 s | host tower load | `Anonymous` -> ~15 GiB; GPU 0 |
+| ~460-620 s | **host text encode, multi-threaded** | 22 threads, `utime` +327 s over 113 s = **2.9 cores**; GPU 0 |
+| ~700-2250 s | **one thread, for ~26 minutes** | `utime` +116.7/117 s, then +142.2/142 s, then +648.9/649 s = **1.000 core** each window; RSS, `Anonymous` and `capp_mib` all flat; GPU 0 |
+| ~2260-2390 s | **a 15-core burst** | `utime` +1991.9 s over 132 s = **15.1 cores**; RSS 37.8 -> 43.7; GPU 0 |
+| ~2390-2490 s | **~30 GiB released** | RSS 43.7 -> 13.9, `Anonymous` 39.9 -> 13.5, `MemAvailable` -> 66.51 |
+
+Two things are worth carrying forward from that table even without the exit
+reason. **The engine does release the text tower** — the ~30 GiB drop at the end
+is it — so lever 5's "held across the decode" framing is wrong for this
+configuration too, and #1014 should be read against this. And **the render has
+at least four distinct compute regimes after load** (2.9 cores, 1.0 core, 15.1
+cores, then a free), **none of which uses the GPU**, which is the disjunction
+#1024 records: nothing in the tree timestamps which phase any of them is.
+
+**The 1.000-core window is the single largest block of the run** — roughly 26 of
+the 40 minutes — and it is the one this row was dispatched to explain. It cannot
+yet be *named* as the VAE decode, because no frame was written and no phase
+boundary is emitted (#1010). Naming it is the first thing the follow-up row
+should do, and it needs #1010 rather than another probe.
 
 ### 1.4 Evidence that already existed and had not been read as evidence
 
@@ -991,3 +1028,12 @@ this row has no implementation authority and no fresh review (§8).
   traffic and memory format rather than as the 60 GiB.
 * **Gateability of `ltx_core` and of `diffusers` for LTX-2.5 on `dgx.casa`.**
   Neither is installed there today.
+* **Rung 2's exit reason.** `EXIT=1`, 0 frames, 2407 s. `REMOTE_UNVERIFIED` —
+  the host went unreachable before `run.log` was read. The file is on the box.
+* **A positive control that `utilization.gpu` reads high for a real kernel on
+  GB10.** One command under the lock; it gates how much weight §5's 0% carries.
+  Filed with [#1024](https://github.com/mudler/vllm.cpp/issues/1024).
+* **Naming the 1.000-core window.** ~26 of rung 2's 40 minutes, and the block
+  this row was dispatched to explain. It needs
+  [#1010](https://github.com/mudler/vllm.cpp/issues/1010)'s phase timestamps,
+  not another probe.
