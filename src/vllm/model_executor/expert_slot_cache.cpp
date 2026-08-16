@@ -49,11 +49,23 @@ std::optional<int32_t> ExpertSlotCache::SlotOf(const ExpertKey& key) const {
   return entries_[static_cast<size_t>(it->second)].slot;
 }
 
-bool ExpertSlotCache::Contains(const ExpertKey& key) const {
-  // Deliberately does NOT touch score, last_used or the protection flag. A
-  // caller asking "will this be a fill?" must not change the answer to "which
-  // entry gets evicted next", which is what any of those writes would do.
-  return index_.find(key) != index_.end();
+bool ExpertSlotCache::Invalidate(const ExpertKey& key) {
+  auto it = index_.find(key);
+  if (it == index_.end()) return false;
+  const size_t idx = static_cast<size_t>(it->second);
+  // Hand the slot back before the entry disappears, or the usable budget would
+  // shrink by one every time a fill fails.
+  free_slots_.push_back(entries_[idx].slot);
+  index_.erase(it);
+  // The same compaction Acquire's eviction uses, so entries_ stays dense and
+  // every index_ value keeps pointing at its own entry.
+  const size_t last = entries_.size() - 1;
+  if (idx != last) {
+    entries_[idx] = entries_[last];
+    index_[entries_[idx].key] = static_cast<int32_t>(idx);
+  }
+  entries_.pop_back();
+  return true;
 }
 
 ExpertAcquisition ExpertSlotCache::Acquire(const ExpertKey& key) {
