@@ -104,6 +104,30 @@ struct OwnedTensor {
   mutable int mmap_fd = -1;
   mutable size_t mmap_file_offset = 0;
 
+  // A process-unique identity for this tensor's CURRENT bytes, for a cache that
+  // outlives the model.
+  //
+  // The expert slot cache is a process-lifetime singleton keyed by (tower,
+  // expert), and it used to derive the tower half from the buffer's ADDRESS.
+  // That is stable for one model's life, which is what its comment claimed, but
+  // the cache is not scoped to one model's life: free a model, load another, and
+  // the allocator hands a new tower an address the old one used. Every entry the
+  // cache still holds for that address is then served to a DIFFERENT model's
+  // expert, silently, as a hit that moves no bytes. Measured on two synthetic
+  // models in one process: 21 distinct addresses for 24 towers, and 20 of 222
+  // slices returned another tower's bytes.
+  //
+  // A counter cannot collide because it never goes backwards, and re-stamping
+  // when `bytes` moves keeps a COPY of a tensor from inheriting the original's
+  // identity along with a different buffer. Assigned lazily, so a weight that is
+  // never streamed never pays for one.
+  mutable uint64_t tower_uid = 0;
+  mutable const uint8_t* tower_uid_for = nullptr;
+
+  // `tower_uid`, assigned on first use and re-assigned if `bytes` has moved.
+  // Never returns 0, so a caller can treat 0 as "no identity".
+  uint64_t TowerUid() const;
+
   bool Empty() const { return bytes.empty() && !host_released; }
   bool HasHostBytes() const { return !bytes.empty(); }
   int64_t Numel() const;
