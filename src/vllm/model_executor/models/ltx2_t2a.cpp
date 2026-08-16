@@ -245,6 +245,10 @@ Ltx2T2aResult Ltx2T2aGenerate(const Ltx2T2aRequest& req) {
   const std::vector<double> positions(positions_f.begin(), positions_f.end());
 
   // ── the denoise loop (samplers.py:39-79) ──────────────────────────────────
+  //
+  // `last_denoised_audio` (utils/denoisers.py:85-91): a step the guider SKIPS
+  // reuses the previous step's denoised prediction instead of running a forward.
+  std::vector<float> last_denoised;
   for (int64_t step = 0; step + 1 < sigma_count; ++step) {
     const float sigma = sigmas[static_cast<size_t>(step)];
     // Every token carries the schedule's own sigma: the mask is all ones, so
@@ -262,12 +266,35 @@ Ltx2T2aResult Ltx2T2aGenerate(const Ltx2T2aRequest& req) {
     ain.context = req.context;
 
     // `should_skip_step` (guiders.py:287-291). `skip_step` defaults to 0, which
-    // never skips, so this is reachable only from an explicit request — and it
-    // is written as a real branch rather than left implicit because the arm it
-    // selects is "the conditional prediction alone", which is what a build with
-    // NO guider also produces. Conflating them would make the default path and
-    // the skipped path indistinguishable in the counters below.
+    // never skips, so this is reachable only from an explicit request.
+    //
+    // A SKIPPED STEP RUNS NO FORWARD AT ALL AND REUSES THE PREVIOUS STEP'S
+    // DENOISED PREDICTION. This draft ran the CONDITIONAL forward and used it,
+    // which is a plausible reading of "skip the guidance" and is not what
+    // upstream does: `_guided_denoise` returns
+    // `DenoisedLatentResult.result_or_none(denoised=last_denoised_audio)` when
+    // every guider skips (`utils/denoisers.py:85-91`), before it assembles a
+    // single pass. The difference is a whole DiT forward per skipped step and a
+    // different trajectory, on a render that finishes either way.
+    //
+    // `step == 0` can never skip — `0 % (skip_step + 1)` is 0 — so
+    // `last_denoised` is always populated by the time this branch is taken. The
+    // guard is kept anyway, because "the arithmetic makes it impossible" is
+    // exactly the reasoning that a later change to `ShouldSkipStep` would
+    // silently invalidate, and the failure would be a read of an empty vector.
     const bool skip = g.ShouldSkipStep(step);
+    if (skip && last_denoised.empty()) {
+      Fail("step " + std::to_string(step) +
+           " is a skipped step and no earlier step produced a denoised prediction to reuse. "
+           "`should_skip_step` is `step % (skip_step + 1) != 0` (guiders.py:287-291), which is "
+           "false at step 0, so this is unreachable through the request surface and is a defect "
+           "rather than a bad request");
+    }
+    if (skip) {
+      latent = Ltx2EulerStep(latent.data(), last_denoised.data(), sigmas.data(), sigma_count, step,
+                             static_cast<int64_t>(latent.size()));
+      continue;
+    }
 
     // THE VIDEO STREAM IS `nullptr`, NOT A DISABLED ONE. See ltx2_t2a.h item 1:
     // upstream's `run_v2a` tests PRESENCE (transformer.py:269), so a
@@ -290,7 +317,7 @@ Ltx2T2aResult Ltx2T2aGenerate(const Ltx2T2aRequest& req) {
     ++result.cond_forwards;
 
     std::vector<float> velocity = cond.audio;
-    if (!skip && (want_uncond || want_perturbed)) {
+    if (want_uncond || want_perturbed) {
       std::vector<float> uncond_text;
       std::vector<float> uncond_perturbed;
       if (want_uncond) {
@@ -314,7 +341,10 @@ Ltx2T2aResult Ltx2T2aGenerate(const Ltx2T2aRequest& req) {
                                         static_cast<int64_t>(cond.audio.size()));
     }
 
-    const std::vector<float> denoised = ToDenoised(latent, velocity, timesteps, tokens, width);
+    // Kept for the next step's `should_skip_step` branch, which reuses it rather
+    // than recomputing (utils/denoisers.py:85-91).
+    last_denoised = ToDenoised(latent, velocity, timesteps, tokens, width);
+    const std::vector<float>& denoised = last_denoised;
     // `EulerDiffusionStep()` — `DiffusionStage.__call__`'s own default
     // (utils/blocks.py:524-527), which T2A does not override (it passes no
     // `stepper`, t2a_one_stage.py:154-170). The ancestral sampler that

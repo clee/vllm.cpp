@@ -136,8 +136,8 @@ finished waveform. Our port mirrors that polarity exactly at
 
 `video = nullptr` is the only shape that reproduces `LTXModel.forward(video=None,
 ...)` (`model.py:492-538`, the `video_args = ... if video is not None else None`
-at `:501`). It is also what makes `_init_preprocessors`' AudioOnly arm
-(`model.py:350-365`, a plain `TransformerArgsPreprocessor` with no
+at `:505`). It is also what makes `_init_preprocessors`' AudioOnly arm
+(`model.py:351-365`, a plain `TransformerArgsPreprocessor` with no
 `cross_scale_shift_adaln` and no `cross_gate_adaln`) equivalent to our
 `have_both == false` path, which passes `other = nullptr` into `PrepareStream`
 and therefore builds neither.
@@ -248,10 +248,11 @@ Per step, mirroring `FactoryGuidedDenoiser` over `MultiModalGuider.calculate`
 | `uncond_perturbed` | `DoPerturbedGeneration()` | positive context, audio self-attn perturbed on `stg_blocks` |
 | `uncond_modality` | `DoIsolatedModalityGeneration()` | — **refused by name**, see §7 |
 
-`ShouldSkipStep(step)` (`guiders.py:287-291`) short-circuits to the plain
-conditional prediction, and `skip_step` defaults to 0 so it never fires on the
-default path — which is why the branch is written to be reachable from the extra
-rather than left implicit.
+`ShouldSkipStep(step)` (`guiders.py:287-291`) runs NO forward at all and reuses
+the previous step's denoised prediction (`utils/denoisers.py:85-91`), which is
+not the same as "skip the guidance and keep the conditional pass" — see M9 in §5.
+`skip_step` defaults to 0, so it never fires on the default path and is reachable
+only from the extra.
 
 The combination is `Ltx2MultiModalGuidance`, which already carries the two
 details a re-derivation gets wrong: the `(scale - 1)` polarity on CFG and modality
@@ -404,26 +405,54 @@ to a green SUCCESS.
 
 ### What the mutation pass actually found
 
-Focused gate `./build/tests/test_ltx2_video "--test-case=*t2a*"`, unmutated at
-7 cases / 496 assertions / exit 0. Each mutation applied to ONE file, rebuilt,
-run, restored in a `finally` and the restore verified by **sha256** rather than
-assumed. The harness rebuilds the restored tree before anything else measures it.
+Focused gate `./build/tests/test_ltx2_video "--test-case=*t2a*"`. Each mutation
+applied to ONE file, rebuilt, run, restored in a `finally` and the restore
+verified by **sha256** rather than assumed. The harness rebuilds the restored
+tree before anything else measures it.
+
+**Measured at 8 cases / 505 assertions / exit 0 unmutated**, on the tree this
+pull request ships. The table was re-run at that tree rather than carried forward
+from the earlier 6-case measurement, because a count carried forward while the
+suite grows is exactly how this campaign's previous mutation records went stale.
 
 | Mutation | `git diff --stat` | BUILT | exit | verdict |
 |---|---|---|---|---|
-| M1 delete the production call site (the reachability mutation) | `ltx2_video.cpp \| 2 +-` | YES (0 errors) | 1 | DETECTED, 3 of 6 cases failed |
-| M2 hand the forward a present-but-DISABLED video stream instead of `nullptr` | `ltx2_t2a.cpp \| 3 ++-` | YES (0 errors) | 1 | DETECTED |
-| M3 never run the unconditional forward | `ltx2_t2a.cpp \| 2 +-` | YES (0 errors) | 1 | DETECTED |
-| M4 ignore `stg_blocks` and perturb EVERY block | `ltx2_t2a.cpp \| 2 +-` | YES (0 errors) | 1 | DETECTED |
-| M5 `all_perturbed` falls through to ordinary attention | `ltx2.cpp \| 2 +-` | YES (0 errors) | 1 | DETECTED |
-| M6 revert the `one_stage` `noise_scale` to the struct default (#1013) | `ltx2_pipeline.cpp \| 2 +-` | YES (0 errors) | 1 | DETECTED |
-| M7 scale the initial latent by `sigmas[0]` | `ltx2_t2a.cpp \| 1 +` | YES (0 errors) | 0 | **SURVIVED** — see below |
-| M8 write a frame on the audio-only path | `ltx2_video.cpp \| 1 +` | YES (0 errors) | 1 | DETECTED |
+| M1 delete the production call site (the reachability mutation) | `ltx2_video.cpp \| 2 +-` | YES (0 errors) | 1 | DETECTED, 4 of 8 cases red |
+| M2 hand the forward a present-but-DISABLED video stream instead of `nullptr` | `ltx2_t2a.cpp` (see note) | YES (0 errors) | 1 | DETECTED, 3 red |
+| M3 never run the unconditional forward | `ltx2_t2a.cpp` (see note) | YES (0 errors) | 1 | DETECTED, 2 red |
+| M4 ignore `stg_blocks` and perturb EVERY block | `ltx2_t2a.cpp` (see note) | YES (0 errors) | 1 | DETECTED, 3 red |
+| M5 `all_perturbed` falls through to ordinary attention | `ltx2.cpp \| 2 +-` | YES (0 errors) | 1 | DETECTED, 2 red |
+| M6 revert the `one_stage` `noise_scale` to the struct default (#1013) | `ltx2_pipeline.cpp \| 2 +-` | YES (0 errors) | 1 | DETECTED, 1 red |
+| M7 scale the initial latent by `sigmas[0]` | `ltx2_t2a.cpp` (see note) | YES (0 errors) | 0 | **SURVIVED** — see below |
+| M8 write a frame on the audio-only path | `ltx2_video.cpp \| 1 +` | YES (0 errors) | 1 | DETECTED, 1 red |
+| M9 a skipped step RECOMPUTES the conditional forward instead of reusing | `ltx2_t2a.cpp \| 39 +++---` | YES (0 errors) | 1 | DETECTED, 1 red |
+
+**A note on the first fact for the `ltx2_t2a.cpp` rows, because it reported
+something misleading and that is worth writing down rather than tidying away.**
+`git diff --stat` is measured against `HEAD`, not against the pre-mutation
+working tree, so on a run where that file also carried an uncommitted change the
+stat reports 45-47 lines rather than the mutation's own 1-3. The number is
+therefore not a measurement of the mutation on those rows. It is kept, with this
+note, instead of being replaced by a prettier one: the fact the protocol asks for
+is what the command printed. The M1, M5, M6, M8 and M9 rows were measured against
+a clean file and their stats are the mutations'.
+
+**M9 is the mutation for a defect this port ACTUALLY SHIPPED in its first
+draft**, rather than an invented one. `should_skip_step` (`guiders.py:287-291`)
+does not mean "skip the guidance and keep the conditional prediction". Upstream
+returns `DenoisedLatentResult.result_or_none(denoised=last_denoised_audio)`
+(`utils/denoisers.py:85-91`) BEFORE it assembles any pass, so a skipped step runs
+**no DiT forward at all** and reuses the previous step's denoised prediction. The
+first draft ran the conditional forward and used it: a whole extra forward per
+skipped step, on a different trajectory, producing a finished waveform of exactly
+the right length. Nothing about the output separates the two, and the FORWARD
+COUNT is the only thing that does.
 
 **M7 SURVIVED, and the resolution is the useful part.** It is the mutation a
 reader coming from another flow-matching sampler expects to be REQUIRED — scaling
 the initial noise by the first sigma — and it changed nothing. The reason is not
-a blind gate: it is an identity. `LTX2Scheduler` starts at `linspace(1, 0, steps
+a blind gate: it is an identity, and it STAYS survived after the pin below,
+because a pin on an identity cannot turn one arm red. `LTX2Scheduler` starts at `linspace(1, 0, steps
 + 1)[0] == 1`; the shift map sends 1 to `exp(s)/(exp(s) + (1/1 - 1))`, exactly 1
 (`schedulers.py:41-45`); the stretch sends it to `1 - (1 - 1)/scale_factor`,
 again exactly 1 (`:47-55`). So `sigmas[0]` is 1.0 for every step count.

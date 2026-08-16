@@ -5157,6 +5157,53 @@ TEST_CASE("ltx2 t2a: the DiT forward runs ONE stream, and the old guard's reason
                                     vt::DType::kF32, /*cache=*/nullptr, &bad));
 }
 
+TEST_CASE("ltx2 t2a: a SKIPPED step runs no forward and reuses the last prediction") {
+  // `should_skip_step` is `step % (skip_step + 1) != 0` (guiders.py:287-291), so
+  // `skip_step = 1` skips every ODD step. Upstream then returns
+  // `DenoisedLatentResult.result_or_none(denoised=last_denoised_audio)`
+  // (utils/denoisers.py:85-91) BEFORE it assembles a pass, so a skipped step
+  // costs no DiT forward at all.
+  //
+  // WHY A COUNT AND NOT A DIGEST. A build that "skipped the guidance" by running
+  // the conditional forward and using it — which is the plausible misreading,
+  // and what this port did on its first draft — produces a finished waveform of
+  // exactly the right length on a different trajectory. Nothing about the output
+  // separates the two. The FORWARD COUNT does, and it is the only thing that
+  // does.
+  Workspace ws;
+  const vllm::multimodal::VideoModelParams mp = T2aParams(ws.paths);
+  const std::unique_ptr<vllm::multimodal::VideoEngine> engine =
+      vllm::multimodal::LoadVideoEngine(mp);
+  REQUIRE(engine != nullptr);
+  const auto* ltx = dynamic_cast<const vllm::multimodal::Ltx2VideoEngine*>(engine.get());
+  REQUIRE(ltx != nullptr);
+
+  vllm::multimodal::VideoGenParams gen = T2aGen(ws.root + "/skip", "a b c");
+  gen.steps = 4;  // four sigma intervals: steps 0..3, so 1 and 3 skip
+  gen.extras[vllm::multimodal::kLtx2AudioSkipStepExtra] = "1";
+  (void)engine->Generate(gen);
+  const vllm::multimodal::Ltx2ConditioningTrace skipped = ltx->last_conditioning();
+
+  // Two of the four steps ran, and each ran all three arms.
+  CHECK(skipped.t2a_cond_forwards == 2);
+  CHECK(skipped.t2a_uncond_forwards == 2);
+  CHECK(skipped.t2a_perturbed_forwards == 2);
+
+  // The control: the same request with no skipping runs all four.
+  vllm::multimodal::VideoGenParams full = T2aGen(ws.root + "/noskip", "a b c");
+  full.steps = 4;
+  (void)engine->Generate(full);
+  const vllm::multimodal::Ltx2ConditioningTrace every = ltx->last_conditioning();
+  CHECK(every.t2a_cond_forwards == 4);
+  CHECK(every.t2a_uncond_forwards == 4);
+  CHECK(every.t2a_perturbed_forwards == 4);
+
+  // A negative skip is refused rather than taken modulo a non-positive divisor.
+  vllm::multimodal::VideoGenParams bad = T2aGen(ws.root + "/badskip", "a b c");
+  bad.extras[vllm::multimodal::kLtx2AudioSkipStepExtra] = "-1";
+  CHECK_THROWS(engine->Generate(bad));
+}
+
 TEST_CASE("ltx2 t2a: the schedule starts at exactly 1.0") {
   // WHY THIS EXISTS, and it is a mutation result rather than a tidiness rule. A
   // mutation that scaled the initial latent by `sigmas[0]` — the thing a reader
