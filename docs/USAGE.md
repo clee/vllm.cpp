@@ -831,6 +831,17 @@ describing different frames, and the render would still finish. Use
 `--pipeline-kind distilled_two_stage` or `one_stage` if you want to place slots
 by count. An explicit `0` still passes, because that is upstream's default.
 
+**How to reach it.** `pipeline_kind` is a LOAD knob, not a per-generation one, so
+all three surfaces carry it: `ltx2-gen --pipeline-kind dfr`, the C ABI's
+`vllm_video_model_params.extra_keys` / `extra_values`, and the server's
+`--video-extra pipeline_kind=dfr` at launch. A server started that way renders
+every `/v1/videos` request through DFR.
+
+The two knobs beside it are per-GENERATION and therefore CLI and ABI only, because
+`/v1/videos` forwards no per-generation extra to any engine yet (issue #928):
+`num_generated_keyframes` on the other pipelines, and `temporal_upsample_rounds`
+below.
+
 **What is not served.** `temporal_upsample_rounds` is defined and refused above
 `0`: the rounds loop that temporally doubles the latent, re-tiles the canvas and
 stitches it back is not ported. The refusal names it, and it names three things
