@@ -136,7 +136,9 @@ it can go stale when the fleet changes. That is accepted rather than avoided.
 The alternative is a condition a reader can only evaluate with the client, and
 this row exists because that condition sent a client-less reader to the wrong
 mutex. The list sits beside the fleet table in `.agents/environment.md`, which
-already carries the same three names and the date it was read.
+already carries the same three names and the date it was read. Both files also
+say the list is a LOWER bound, so a fleet that grows past it widens the rule
+rather than exempting the new device.
 
 If the conditional rule cannot be written without a second mutex statement, stop
 and return `NEEDS_DECISION`. Do not weaken the checker.
