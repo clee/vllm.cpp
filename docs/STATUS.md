@@ -131,6 +131,7 @@ token-for-token correctness against the pinned oracle.
 | GLM-4 dense (sandwich norms, partial rope) | Correctness-complete, speed-pending | Token-exact 16/16 (GLM-4-9B-0414); first GLM-family model; partial interleaved RoPE + Gemma2 sandwich norms + biased qkv |
 | GLM-4.7-Flash (MLA + GLM MoE) | Correctness-complete, speed-pending | Token-exact 8/8 (GLM-4.7-Flash, 31.2B); reuses the DeepSeek-V2 MLA stack; first e2e coverage of the q_lora query branch + noaux_tc sigmoid router with routed-scaling |
 | Kimi-Linear-48B-A3B (KDA + NoPE-MLA + MoE hybrid) | **RUNNER FOLD LANDS (ROW 7 §21, #122): engine==CLI 128/128 byte-identical; golden 122/128 (near-tie profile); FA2 MLA default-ON; `vllm_complete_tokens` (ABI v13).** Grouped-router top-k block-parallel (byte-identical); no binding speed number: ckpt is tiktoken-only, so no warm-server harness. STRICT stays CLOSED. Server 19.0 tok/s wall (~0.90× vLLM floor) = speed open | paged suite 8/8·206; SACRED post-fold 35B 315/315 + 27B 235/235; thin ABI client (ratchet 8) |
+| Nemotron-3.5-Lightning-30B-A3B (Mamba2 + GQA + relu2 MoE) | **Paged forward lands (#810 A2-P); e2e token gate PENDING on gate-host contention** | K/V and the conv + SSM rows now live in the runner's pages, so decode step 2 keeps state; G-SAFE narrows to `num_reqs <= 1`. CPU gate 12/12, 9/9 mutations RED |
 | Gemma-3 dense (GeGLU, dual rope, sandwich norms) | Correctness-complete, speed-pending | STRICT token-exact 48/48 greedy (gemma-3-1b-it); first Gemma-family model; GeGLU (gelu_pytorch_tanh) + dual per-layer RoPE theta + Gemma-RMSNorm sandwich norms + sqrt(hidden) embed-scale + query_pre_attn_scalar scaling |
 | Gemma-2 dense (attn + final logit soft-cap) | Correctness-complete, speed-pending | Near-tie-band 48/48 (gemma-2-2b-it): 44/48 strict on vLLM's greedy + 4/48 at 0.0-nat ties in vLLM's own logits; proves the attention + final logit soft-cap primitives (attn_logit_softcapping 50 + final 30); the inverse of Gemma-3 (both soft-caps, no QK-norm) |
 | Gemma-1 dense (the original Gemma) | Correctness-complete, speed-pending | STRICT token-exact 48/48 greedy (gemma-2b); two fused norms/layer, head_dim scale, GeGLU + sqrt(hidden) embed-scale, tied lm_head; no soft-cap/QK-norm/sliding. **D1 (2026-07-31): the whole Gemma family (1/2/3/4) folded to the default-ON bf16 merged-QKV descriptor (`MergedQkvEnabled`); re-gated Gemma-2 SACRED 48/48 (global+sliding) + Gemma-4 STRICT 32/32 — its existing gate held** |
@@ -143,7 +144,7 @@ token-for-token correctness against the pinned oracle.
 | InternLM2 dense (fused-`wqkv` interleaved split) | Correctness-complete, speed-pending | Token-exact 16/16 (internlm2-chat-1_8b): 12/16 strict + 4/16 bf16 near-tie (max gap 0.0 nats), 0 divergent; first InternLM model; ZERO new compute kernel (reuses the Llama dense forward; the only delta is a loader-side de-interleave of the fused `wqkv`, which packs q/k/v interleaved by KV-group) |
 | MiniMax-H3 (`MiniMaxH3DiTModel`, video+audio DIFFUSION) | **ABI v12 ONE SURFACE; device selector uses generic `DeviceType`; DSR 32.** t2va+fl2va COHERENT; bf16 shards STREAM | ref2va ckpt fidelity §8.12; encoder A/B §8.15; GB10 re-verify residual; CPU fold 6/137 (one queue + device provenance mutation-gated) |
 | LTX-2.5 (`LTX2VideoTransformer3DModel`, video+audio DIFFUSION) | **L1-L9c landed (#435).** 21.00B / 48 blocks. `VideoEngine` seam + ABI **v18**, DiT forward (CPU f32 parity, bf16 device-resident), Gemma-4 TE, both VAEs, connector, pipeline, NVFP4/FP8, keyframe bias (#658) | BOTH shipped DiTs now load inside the contract, no `allow_unported`. One runs device-resident on GB10; those 320x192/25f frames ARE a scene. A prompted render is OWED; speed and oracle parity `PENDING` |
-| MiniMax-Music3 (`MiniMaxMusic3ForConditionalGeneration`, text-to-MUSIC) | **`ACTIVE`: W0-W7 landed; every stage including the 8.6B LM forward is implemented and gated (#672).** Oracle is the OPEN diffusers PR #14456 `c6da9936` | GGUF arms for 4 components owed. LM forward gated in a control; HTTP OBSERVED (#852). PARTIAL device arm, Thor sm_110 (#672): 8.6B LM only. CPU kernels 10.7x on the vocoder chain, same song BYTES. No reference number |
+| MiniMax-Music3 (`MiniMaxMusic3ForConditionalGeneration`, text-to-MUSIC) | **`ACTIVE`: W0-W7 landed; every stage including the 8.6B LM forward is implemented and gated (#672).** Oracle is the OPEN diffusers PR #14456 `c6da9936` | GGUF arms for 4 components owed. LM forward gated in a control; HTTP OBSERVED (#852). PARTIAL device arm, Thor sm_110 (#672): 8.6B LM + 2.4B fp32 DiT (§14). CPU kernels 10.7x on the vocoder chain. No reference number |
 | Command-R / Cohere dense (`CohereForCausalLM`) | Implemented, gate-blocked | ZERO-new-kernel port grounded in vLLM `commandr.py`: weight-only Cohere LayerNorm + GPT-J full-width RoPE + PARALLEL residual + `logit_scale` + tied embeddings, all reuse; compiles, links, self-registers. No SACRED gate yet (real checkpoints HF-gated, ungated ones tiny-random, GPU box disk-full); oracle run-verified at W0. See docs/BENCHMARKS.md |
 | Phi-1 / Phi-2 dense (`PhiForCausalLM`, parallel residual) | Correctness-complete, speed-pending | Token-exact 16/16 (microsoft/phi-2): 9/16 strict + 7/16 bf16 near-ties (max gap 0.25 nats), 0 forward-divergent; the OLDER Microsoft Phi arch, DISTINCT from Phi-3/Phi-4; ZERO new compute kernel (GPT-J parallel residual, LayerNorm-with-bias, biased qkv/dense, partial NeoX rope 32/80, non-gated NewGELU MLP reusing `vt::GeluTanh`, untied biased lm_head); F16 dtype-aware loader |
 | MiniCPM dense (`MiniCPMForCausalLM`, three scalars) | Correctness-complete, speed-pending | Token-exact 16/16 (openbmb/MiniCPM-2B-sft-bf16): 10/16 strict + 6/16 bf16 near-ties (max gap 0.0 nats), 0 forward-divergent; first OpenBMB MiniCPM model; ZERO new compute kernel (the Llama/Granite dense forward plus three scalars: scale_emb, scale_depth/sqrt(layers) residual, dim_model_base logit scaling), tied lm_head; `.bin`-only weights converted to safetensors via trusted torch |
@@ -189,9 +190,19 @@ at k=1..4. A token-identity gate cannot see a clamped drafter, so each arm
 carries TWO witnesses: the `k-1` draft decode forwards per propose call catch a
 propose that never ran the loop, and a varied-draft counter over the DELIVERED
 rows catches one that ran it and then padded. Neither proves that column j came
-from forward j, and no draft is ACCEPTED at any depth here, so provenance and
-the accept path both await the owed DGX gate. The DEFAULT is unchanged at k=1
-and **no speed number is claimed above it**.
+from forward j, and no draft is ACCEPTED at any depth in the CPU gate, so
+provenance and the accept path both await the owed DGX gate. The DEFAULT is
+unchanged at k=1 and **no speed number is claimed above it**.
+
+On real 27B NVFP4 weights the depth arms DO accept: re-measured 2026-08-17 with
+all seven arms in one uncontended window, k=2 gives depth-0 0.878, depth-1 0.731.
+**The token gate is still NOT claimed**: our spec-ON is not token-identical to
+our spec-OFF on 3 of 4 prompts, at the same positions for every k, and the vLLM
+leg that would attribute the split has never run here. Three passes failed to run
+it: the reimaged box has no C compiler, so the oracle's Triton JIT dies after the
+weights load, and once that is fixed the oracle consumes the whole 119 GiB host
+in the step after `torch.compile`. `gpu_memory_utilization` does NOT control that
+second one: an A/B at 0.30 collapsed as 0.75 did, and rebooted the box.
 
 Speculative decoding is available on the Qwen3.5/3.6 checkpoints via
 `--speculative-config`. **MTP (k=1)** is end-to-end token-exact vs vLLM on
@@ -492,7 +503,10 @@ on 5 gfx archs; the APU unified-memory fix remains unverified; gfx1200 runs
 Gemma-3 and Qwen3 all-native, with Gemma-3 strict 48/48 against two vLLM-ROCm
 oracles and Qwen3 in a measured near-tie regime; Qwen3.5-0.8B GDN runs all-native
 but its CPU/ROCm divergence remains open; gfx1201 Gemma-4 FP8 MoE is
-contributor-measured on 2x R9700 and CPU-link-verified our side;
+contributor-measured on 2x R9700 and CPU-link-verified our side; a `head_dim=128`
+decode arm lands opt-in behind `VT_ATTN_DECODE_D128`, default OFF, which moves
+gfx1200 per-token decode from 6.35x to 1.75x slower than the pinned vLLM oracle
+on one shape, a directional figure that leaves the ROCm throughput axis PENDING;
 [guide](ROCM.md)), inference-time CPU weight offload (`ENG-WEIGHT-OFFLOAD`
 ACTIVE; the config surface landed W0a (the backend enum, both sub-configs, the
 validator's two errors and three warnings, and the dot-anchored segment match),

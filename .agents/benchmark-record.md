@@ -22255,3 +22255,323 @@ and cannot hold a 370 GiB checkpoint, and three earlier attempts on that box wer
 OOM-killed at 48.6 GiB anon beside another session's 32.6 GiB job. Tracked under
 `## Owed` in [`expert-streaming.md`](specs/expert-streaming.md). No new
 performance number is claimed by the repair that produced this retraction.
+
+## SPEC-MTP-K-GT-1 — the k>1 depth arms re-measured in ONE uncontended window (throughput VOID lifted); the vLLM leg failed on a HOST TOOLCHAIN gap, not on the model (2026-08-17, `row/SPEC-MTP-K-GT-1-DGX`, GB10 sm_121, #81 M1)
+
+Third DGX pass. `dgx.casa` was clean for the first time in three passes: no
+compute apps, no containers, mutex free, 115 GiB of 119 available, loadavg 0.16.
+
+**Window 1 (`WINDOW_RC=0`, 07:15:27Z to 07:47:55Z, boot_id `5bbdc432`).** All
+three device preconditions passed on the acquire, clocks pinned at 2100, trap
+reset them. Seven arms, every one exit 0:
+
+| Leg | Exit | loadavg at start |
+|---|---|---|
+| `ours_off` | 0 | 0.16 |
+| `ours_on_k2` | 0 | 1.86 |
+| `ours_on_k3` | 0 | 1.77 |
+| `ours_on_k4` | 0 | 1.53 |
+| `padded_k2` | 0 | 1.19 |
+| `padded_k3` | 0 | 1.61 |
+| `padded_k4` | 0 | 1.86 |
+
+`ours_on_k2` per-depth: `SPEC_DEPTH 0 proposed=197 accepted=173 rate=0.878173`,
+`SPEC_DEPTH 1 proposed=197 accepted=144 rate=0.730964`.
+
+**This LIFTS the VOID the first pass carried on `padded_k3`/`padded_k4`
+throughput.** That void existed because those arms started at loadavg 10.77 and
+20.41 while the real arms ran at 1.5 to 2.9, so the two sides were not
+comparable. Here all seven ran inside one window in a band of 0.16 to 1.86.
+
+**The ON/OFF divergence reproduced EXACTLY on independently generated streams**:
+1718 divergent positions, 18 adjudicable (first per arm and prompt), 3 distinct
+probe points; prompt 0 position 12 `79733`→`279`, prompt 1 position 1 `25`→`7318`
+at k=2, prompt 2 position 69 `15336`→`1727`, prompt 3 identical throughout. It is
+deterministic across sessions and boots, not a flake.
+
+**The adjudication and all four oracle legs FAILED, and neither failure is a
+verdict about the model.** The reimaged host carries NO C compiler: no `gcc`,
+`cc`, `clang`, `ninja` or `nvcc` anywhere, `/usr/include` without `stdio.h` or
+`python3.12/Python.h`, no crt objects, and a Triton 3.7.1 shipping only `ptxas`,
+`cuobjdump` and `nvdisasm`. Triton's JIT therefore died AFTER the weights loaded
+and vLLM reported `Engine core initialization failed. See root cause above.
+Failed core proc(s): {}`. A reader who did not open the traceback would have
+scored four `ORACLE_EXIT=1` legs as "the oracle cannot run this configuration".
+`enforce_eager` would have walked past it and was NOT used: it is forbidden as a
+denominator and this is the denominator. A second, independent caller defect hit
+the OFF leg only, which passed an empty `k` and died on `int('')`.
+
+**Window 2 proved the repair and then lost the box.** Queued at 07:35:04Z with
+`flock -w 21600`, BLOCKED on the mutex rather than jumping it, acquired 07:47:55Z
+in the same second window 1 released. Running the pinned venv inside a container
+carrying the toolchain gave `TOOLCHAIN gcc=13 ninja=1.11.1 CC=/usr/bin/gcc
+python=Python 3.12.3`, oracle identity `0.23.1rc1.dev1511+g555967922`, 6/6 arms
+loaded, and the engine passed the point that killed every window 1 leg into
+`torch.compile` (`Dynamo bytecode transform time: 20.80 s`). At approximately
+07:56Z the host stopped completing an SSH banner exchange while still answering
+ICMP, and had not returned when this entry was written.
+
+**The cause was then MEASURED.** The box returned at 08:38Z after about 42
+minutes and had NOT rebooted: `uptime` read `up 11:28` and `boot_id` was still
+`5bbdc432`, so this is the thrash case, not the documented OOM-reboot. It came
+back at `load average: 260.22` with 118 of 119 GiB used and 0 available, our
+container still up and still holding the mutex, 26147 MiB on the device, clocks
+still pinned. It was not progressing: `torch.compile` finished at 07:53:41 in
+122.46 s and the log did not advance for the 45 minutes after, stuck in the
+memory-profiling and KV-sizing step that follows. Its own timeout had fired,
+`ADJUDICATE_EXIT=124`, and `timeout` had signalled `docker run` while the
+CONTAINER outlived it.
+
+Killing our own container took the host from 118 of 119 GiB used to 4 of 119 in
+under ten seconds. **The engine was holding roughly 110 GiB of HOST RAM while
+`nvidia-smi` showed 26 GiB on the device.** That much is measured and stands.
+
+**The attribution to `gpu_memory_utilization=0.75` was then TESTED AND REFUTED.**
+`adjudicate.py` exposes `--gpu-mem-util` as an argument, so a third window ran the
+byte-identical instrument at **0.30**, with a 5-second host-memory sampler that
+window 2 had lacked. It collapsed the same way: `avail_mb` 87683 at 09:00:47 and
+**0** at 09:02:25, loadavg 1.19 to 39.90. Weight loading finished with 66 GiB
+free (`Loading weights took 170.12 seconds`) and `torch.compile` finished with
+88 GiB free (`took 118.96 s in total`), so the collapse is in NEITHER. Lowering
+the fraction bought a later start and changed nothing.
+
+What the A/B did buy is a tighter localisation: the step immediately AFTER
+compilation, insensitive to the KV-pool fraction, which points at the profiling
+forward and graph capture (`max_num_batched_tokens=8192`,
+`cudagraph_capture_sizes: [1, 2, 4, 8]`, all host-backed on GB10). **That is a
+hypothesis with a located step, not a result.** Vary those one at a time with the
+sampler running. No oracle leg in any pass has reached KV-cache allocation here,
+so nothing about this step had been exercised on this box before.
+
+**And the 0.30 run REBOOTED the box, which the 0.75 run did not.** Evidenced
+rather than inferred: `boot_id` moved `5bbdc432...` to `bd5c6e7a...` and
+`journalctl --list-boots` shows boot `-1` ending 09:10:15Z against boot `0`
+beginning 09:13:55Z. The lower fraction therefore did not merely fail to help,
+it did not prevent the worst outcome either: 0.75 thrashed 42 minutes and
+survived, 0.30 took the machine down. Treat every attempt here as at risk.
+
+State after the reboot, verified: mutex FREE, no containers, no compute apps,
+115 GiB available, loadavg 0.71, clocks at the boot default 208 MHz, 0 of our
+processes, and everything under `~/mtpgate/final/` intact.
+
+**A trap defect, found by watching it fail.** `SIGTERM` to the driver reset the
+clocks and the driver then started its NEXT leg on a box with no memory left,
+because `trap cleanup EXIT INT TERM` runs `cleanup` and returns without exiting.
+The chain needed `SIGKILL` and the container needed stopping separately. Both DGX
+drivers share this shape.
+
+Only our own processes were signalled. Final state verified: no matching
+processes, no containers, `fuser $HOME/gpu.lock` with no holders so the mutex is
+FREE, no compute apps, clocks reset (`nvidia-smi -rgc` reporting `All done.`),
+115 GiB available, loadavg falling 260 to 42.
+
+**Padded control, PAID at every depth in that one window.** Margin fixed at 0.10
+absolute before the run. Real depth-1 acceptance 0.730964 (k=2), 0.682635 (k=3),
+0.750000 (k=4); depth-2 0.538922 (k=3), 0.617647 (k=4); depth-3 0.507353 (k=4).
+Control 0.000000 at every depth >= 1 while its depth-0 rate MATCHES the real arm
+(0.892 to 0.925 against 0.868 to 0.878), which is what a control isolating
+columns >= 1 must look like. All six margins clear by +0.5074 to +0.7500.
+`compare.py`: **`CHECKS_RUN=21 CHECKS_FAILED=11 VERDICT=FAIL`** — 10 pass (three
+per-depth counter checks, six control margins, one token-production check), 3
+fail on the unadjudicated ON/OFF divergence and 8 on `arm missing` from the
+oracle that never produced a file.
+
+**No parity number is claimed and the token gate is still unclaimed.**
+`our-ON == our-OFF` remains FALSE and unattributed. Owed detail lives under
+`## Owed` in [`mtp-k-gt-1.md`](specs/mtp-k-gt-1.md).
+## MUSIC3-DIT-DEVICE — the 2.4B fp32 DiT on `thor:gpu0`, per-forward A/B against the host reference (2026-08-17, `row/MUSIC3-DIT-DEVICE`, #672)
+
+**Not a parity ratio.** There is no reference leg: SGLang-Omni is `gateable = no`
+and serves the native layout, so this is an INTERNAL two-arm number about our own
+host reference vs our own device arm. Every axis in `docs/BENCHMARKS.md` against
+the reference stays `PENDING`.
+
+### Device, named because a number without one is meaningless here
+
+**`thor:gpu0` — NVIDIA Thor, sm_110, aarch64, 14 cores, ~122 GB UNIFIED, driver
+595.78.** Nothing below is compared to a `dgx:gpu0` (GB10) or `orin:gpu0` number;
+the three boxes are different machines. Image `vllmcpp-thor:cuda13.0.1`, nvcc
+13.0.88, `-DVLLM_CPP_CUDA=ON -DVLLM_CPP_CUDA_ARCHITECTURES=110
+-DVLLM_CPP_TRITON=OFF -DVLLM_CPP_SERVER=ON`, no cutlass. Checkpoint mounted
+read-only from the NAS. Same binary, same weights, same committed inputs on both
+arms; the arms never overlapped.
+
+**Lease discipline, recorded because it was imperfect.** The CUDA build, the
+two-arm correctness series and the first timing runs were driven over `ssh` under
+`flock $HOME/gpu.lock`, which is what this row's brief specified and which the
+`rc` lease system has since superseded — during that window the fleet reported
+`thor:gpu0` as FREE while it was in use. The device-arm timing series that the
+speed claim rests on was run under a real `rc hold` on `thor:gpu0`
+(`a91d21dc`, taken 10:32Z, released 10:54Z on completion). The hold carried no
+`--reason` string and a 75 m TTL for ~22 m of work; both are recorded as errors,
+and single commands should go through `rc run --max-runtime` instead.
+
+### What is timed
+
+`VLLM_CPP_MUSIC3_DIT_REPEAT=R` runs the guided velocity R times per timestep in
+`tests/parity/test_minimax_music3_acoustic_real.cpp`. The timer brackets ONLY
+that loop: the 9.7 GB checkpoint load and the weight staging are outside it, and
+staging is timed separately. NOTE, corrected in fresh review: the golden reads
+(4x `LoadF32Npy`, 2x `Compare`, 2x `ReportInto`) are INSIDE the bracket
+(`test_minimax_music3_acoustic_real.cpp:592-606`), which inflates the intercept
+and makes the reported per-forward number conservative, not inflated. One guided velocity is TWO
+DiT forwards (the conditional and the unconditional CFG branch).
+
+| arm | repeats | forwards | loop | per forward | staging | box load |
+|---|---|---|---|---|---|---|
+| CPU (`VLLM_CPP_MUSIC3_DEVICE=0`) | 1 | 4 | 819.818584 s | **204.954646 s** | 0 (no-op) | 3.42 |
+| CPU (`=0`) | 1 | 4 | 819.992 s | **204.998 s** | 0 (no-op) | 10.37 |
+| CUDA (`=1`) | 1 | 4 | 0.749077 s | **0.187269 s** | 0.603561 s | 4.79 |
+| CUDA (`=1`) | 3 | 12 | 2.110301 s | **0.175858 s** | 0.660600 s | 5.32 |
+| CUDA (`=1`) | 1 | 4 | 0.743367 s | **0.185842 s** | 0.609463 s | 5.1 |
+| CUDA (`=1`) | 1 | 4 | 0.743881 s | **0.185970 s** | 0.612787 s | 4.44 |
+
+Two-point fit over the device arm's 4- and 12-forward runs:
+
+    slope = 0.170607 s per forward        intercept = 0.063012 s
+
+**Per DiT forward at the capture's geometry (latent length 86, sequence 87):
+204.955 s host vs 0.1706-0.1873 s device — 1102x on the matched R=1 pair, 1201x
+on the fitted slope.** The device R=1 point was taken THREE times across two
+sessions, bracketing R=3, at 0.749077 / 0.743367 / 0.743881 s: a 0.77 % spread.
+
+**The contention asymmetry was measured away, not argued away.** The first CPU
+point sat at box load 10.37 against the device arm's 4.4-5.3, which would have
+inflated the ratio if it mattered. Re-taken on an idle box (load 3.42) with the
+fixed instrument it reads **204.954646 s against 204.998 s — 0.021 %**. The host
+DiT forward is single-threaded on a 14-core box, so a load of 10 still leaves it
+a core. Both points are in the table rather than the convenient one.
+
+### The weights are staged ONCE, as a measurement
+
+One staging costs 0.60-0.66 s. The entire FOUR-forward loop costs 0.745 s and the
+TWELVE-forward loop 2.110 s; twelve stagings would be 7.35 s by themselves. The
+loop's fitted intercept is 0.063 s, a tenth of a single staging. A per-forward
+or per-window upload is excluded arithmetically, not by reading the code.
+
+### The whole-process ratios — lower, and the honest ceiling on what a user sees
+
+Same gate binary end to end, including the identical 9.7 GB NAS load on both
+arms: 1054-1071 s (CPU) vs 238-298 s (CUDA), **3.5-4.5x** — the spread is NAS
+cache state, not compute. The earlier full two-arm
+correctness series, identical scripts throughout: 49 min 17 s vs 15 min 49 s,
+**3.12x**. Load averages across the series 4.0-5.1, box otherwise idle apart from
+`k3s`; `uptime` recorded on both sides of every run and the host never rebooted.
+
+The distance between 1100x on the DiT and 4x on the process IS the owed list: the
+checkpoint load, the DAC vocoder and the RVQ depth decoder are unchanged and now
+dominate.
+
+### Extrapolation, labelled as one
+
+The only geometry measured is the capture's single 86-frame window. Applying the
+fit to the 660 forwards a 45 s clip runs at the shipped defaults (30 steps x 2 CFG
+x 11 windows) gives **~37.6 h of DiT on the host against ~113 s on the device**,
+with the one-time staging 0.53 % of the device total. That is an extrapolation
+from one window geometry and is not a measured clip-level result.
+
+**No end-to-end song pair is offered, and that is a limit rather than an
+omission.** At 30 steps the host arm's DiT alone is ~37.6 h, so an e2e pair is
+not runnable on the CPU arm at a realistic setting; at a setting short enough to
+run, the DiT is a small enough share that the pair would be measuring the
+vocoder.
+
+### Correctness taken in the same series, at bounds that did not move
+
+Full scale, the real 2.4B fp32 checkpoint against the committed oracle capture,
+11 008 values per step, `kDitRelTol` 1e-4 / `kDitAbsFloor` 5e-5 /
+`kDitMeanAbsTol` 5e-6 — all unchanged:
+
+| arm | step | bit-identical | mean\|d\| | max\|d\| | outside |
+|---|---|---|---|---|---|
+| Thor CPU | first | 423 (3.843 %) | 1.71434e-06 | 2.38419e-05 | 0 |
+| Thor CPU | last | 235 (2.135 %) | 2.22396e-06 | 2.83718e-05 | 0 |
+| Thor CUDA | first | 473 (4.297 %) | 1.64344e-06 | 2.47955e-05 | 0 |
+| Thor CUDA | last | 222 (2.017 %) | 2.44677e-06 | 2.59876e-05 | 0 |
+| CONTROL torch-vs-torch | first | 15.416 % | 7.526e-07 | 7.153e-06 | — |
+| CONTROL torch-vs-torch | last | 5.596 % | 1.424e-06 | 1.335e-05 | — |
+
+The Thor CPU arm reproduces the x86-64 numbers already recorded for this gate
+VALUE FOR VALUE, so the CPU path is unchanged across two architectures.
+
+### Instrument defect found and fixed inside this series
+
+The first timing line printed `DIT_TIMING arm=1` on the CPU run: a `const char*`
+in a doctest `MESSAGE` chain takes the bool conversion. It is the SAME defect
+§11.5 recorded for this row's arm banner, reintroduced by a fresh `<<` chain.
+Both lines are now assembled as one `std::string`. EVERY number in the table was
+then re-taken with the fixed instrument, and the CPU arm's pre-fix point is kept
+beside its post-fix twin rather than replaced by it, because the pair is what
+proves the label defect never touched the values: 819.992 s against
+819.818584 s.
+
+---
+
+## BACKEND-ROCM — the `d=128` decode arm against the pinned oracle: 6.35x -> 1.75x slower on per-token decode, both sides in ONE container; the "container/glibc" blocker was RETRACTED (2026-08-14, `row/ROCM-DECODE-ATTN-D128-IMPL`, gfx1200 / RX 9060 XT / ROCm 7.2.3, PR #767, issues #382 / #488)
+
+Recorded here from [the #767 comment of
+2026-08-14](https://github.com/mudler/vllm.cpp/pull/767#issuecomment-5295395139)
+because it was the strongest evidence in that pull request and lived only in a
+GitHub thread, which a squash merge does not carry into the tree. Spec:
+[`specs/rocm-decode-attn-d128.md`](specs/rocm-decode-attn-d128.md) §5.
+
+**The blocker this row previously recorded does not exist.** PR #767's body and
+the spec's §6 said the post-change oracle re-measure was blocked on a
+Nix-glibc-vs-container ABI mismatch. Its author retracted that diagnosis in the
+comment above: our binary runs inside the pinned oracle container, and the
+earlier failures were self-inflicted — `LD_LIBRARY_PATH` exported
+container-wide, which breaks the container's own tools, plus a bind mount that
+silently yielded nothing and presented as a missing ELF interpreter. A false
+blocker in the record is worse than no record, because it stops the next person
+from trying. §6 of the spec now says "not run — NOT blocked".
+
+### The substitution was proved inert before it was used
+
+Running our binary against the CONTAINER's ROCm rather than the host's is a
+substitution, so it gets a control. Qwen3-0.6B, 1024 in / 128 out, concurrency 1:
+
+| TPOT | native | in container |
+|---|---|---|
+| flag unset | 42.53 ms | 42.79 ms |
+| `VT_ATTN_DECODE_D128=1` | 11.78 ms | 12.03 ms |
+
+### Both sides in that container, matched workload
+
+Qwen3-0.6B, 1024 in / 128 out, concurrency 1, **8 prompts**, warmup discarded,
+**3 reps**. Oracle = vLLM `555967922` — the parity pin — in its PRODUCTION
+configuration, driven by `vllm bench serve`.
+
+| | TPOT reps | mean | vs oracle |
+|---|---|---|---|
+| ours, flag unset (`PagedAttnOnline`) | 42.54 / 42.46 / 42.19 | 42.40 ms | 6.35x slower |
+| ours, `VT_ATTN_DECODE_D128=1` | 11.97 / 11.38 / 11.66 | **11.67 ms** | **1.75x slower** |
+| vLLM `555967922` | 6.57 / 6.90 / 6.58 | 6.68 ms | — |
+
+The `d=128` decode arm closes the ROCm decode gap on this shape from **6.35x to
+1.75x**. It is the first oracle-relative ROCm decode figure this row has, and
+the arm ships **default OFF**, so it is not a shipped-behaviour number.
+
+### What this is NOT, carried forward verbatim from the author's own caveats
+
+- **Not the same-tool per-call kernel trace.** This is LATENCY, taken with each
+  side's own harness. AGENTS.md wants matching traces before a throughput
+  comparison. `rocprofv3` is present in the container and our binary traces
+  under it, but the oracle side still needs decode-phase windowing — bucket
+  dispatches over time, take the final burst — or it compares our decode
+  against vLLM's model load and graph capture. Reachable, and still owed.
+- **Harness asymmetry.** The oracle runs over HTTP via `vllm bench serve`; ours
+  is in-process. TPOT is the comparable axis. TTFT, E2EL and end-to-end
+  throughput carry the oracle's HTTP and tokenizer overhead and are
+  DIRECTIONAL ONLY.
+- **Not a #488 closure.** [#488](https://github.com/mudler/vllm.cpp/issues/488)
+  asks for a PER-CALL kernel comparison; this is PER-TOKEN latency. The ROCm
+  throughput axis in `docs/BENCHMARKS.md` stays **PENDING/OPEN**.
+- Single board, single model shape, one host.
+
+### The prompt count is load-bearing, and this is why
+
+At `--num-prompts 2` the oracle returned TPOT **6.96 ms and 13.45 ms on
+consecutive reps** — a ~2x spread that averages to a plausible-looking and
+entirely fictional number. The figures above use 8 prompts with a discarded
+warmup, where both sides hold to ~±0.3 ms. A two-request rate harness is not a
+measurement of this axis; it is a coin flip with a mean.

@@ -416,6 +416,48 @@ a silent fallback cannot post a plausible number:
   on the gate clip, so turn it on only where encoder latency matters more than exact
   reproduction of the default output.
 
+Every build — not only a Vulkan one — additionally gets `vocoder-conv-ab`, the
+same-binary A/B for the shared 1-D BigVGAN vocoder convolution chain that
+MiniMax-Music3, MiniMax-H3's audio VAE, LTX-2.5's audio VAE and IndexTTS-2.5 all
+decode through. `VLLM_CPP_VOCODER_DEVICE` is the only variable, and the binary
+prints the arm it RESOLVED rather than the one that was asked for, so a silent
+fallback to the host cannot post a plausible pair of timings:
+
+```sh
+VLLM_CPP_VOCODER_DEVICE=cpu  ./build/vocoder-conv-ab --frames 96 --reps 3
+VLLM_CPP_VOCODER_DEVICE=cuda ./build/vocoder-conv-ab --frames 96 --reps 3
+```
+
+It runs the four upsample stages at the shipped decoder's real channel counts and
+strides, and prints a per-stage checksum so two arms that report the same time can
+still be told apart if one of them computed something else. The transposed
+convolution it times is 88.5 % of MiniMax-Music3's acoustic-half profile.
+
+### Running the vocoder convolutions on the GPU
+
+`VLLM_CPP_VOCODER_DEVICE=cuda` routes `vt::Conv1d` and `vt::ConvTranspose1d` to
+their CUDA providers for every model that decodes through the shared vocoder
+core. It needs a CUDA build; asking for it without one throws by name rather than
+falling back silently, because a silent fallback means an operator who asked for
+a device never learns they did not get one.
+
+The knob is not CUDA-specific. It accepts any device name `vt` knows (`cpu`,
+`cuda`, `metal`, `vulkan`, `xpu`, `rocm`, `tenstorrent`) and refuses one whose
+device carries no registered provider in the build in front of it, so a Metal or
+Vulkan provider becomes reachable here by being registered and nothing else.
+
+The default is `cpu`, and deliberately so — not because the device arm is
+approximate. The two providers are **byte-identical**: one f64 accumulator per
+output element walked in the same order on both, with the host pinned
+`-ffp-contract=off` and the device kernel pinned with `__dmul_rn`/`__dadd_rn`, so
+`tests/vt/test_ops_conv1d_general.cpp` gates them with `memcmp` rather than a
+tolerance (8 cases / 385 assertions on Jetson Thor sm_110, against 8 / 347 on a
+CPU-only box — the 38-assertion difference IS the device arm). It stays opt-in
+because flipping four shipped audio models onto a device arm needs its own
+re-gate against each one's committed goldens, which is owed to the row that
+wires it ([#672](https://github.com/mudler/vllm.cpp/issues/672),
+[.agents/specs/minimax-music3.md](../.agents/specs/minimax-music3.md) §13).
+
 ### Quantized checkpoints: which weight forms load
 ### How long a load takes, and how to see where it goes
 
@@ -941,13 +983,17 @@ ignored — upstream passes a 512x512 placeholder whose height and width it
 documents as unused, and only the frame count and the recipe's frame rate are
 read, to derive the duration.
 
-**It is the only GUIDED arm, and that changes what it costs and what it needs.**
-The distilled video recipes run one DiT forward per step. This one runs
-**three** by default — conditional, unconditional, and one with the audio
+**It is a GUIDED arm, and that changes what it costs and what it needs.** The
+distilled video recipes run one DiT forward per step. This one runs **three** by
+default — conditional, unconditional, and one with the audio
 self-attention perturbed (STG) — so it is roughly 3x the work per step, and it
 **requires a text tower**, because the unconditional pass conditions on the
 negative prompt. Loading with `prompt_embeds_path` alone gets a refusal naming
 `--audio-cfg-guidance-scale 1.0` as the way to turn the unconditional pass off.
+
+It was the only guided arm here until row LTX25-GUIDED-VIDEO
+([#1092](https://github.com/mudler/vllm.cpp/issues/1092)) gave the joint video
+path its own denoiser; see *LTX-2.5 video guidance* below.
 
 Six per-generation knobs mirror upstream's own CLI, and each takes the
 checkpoint generation's value when absent: `--negative-prompt`,
@@ -974,6 +1020,99 @@ at the recipe's own guider values.
 **The accelerator is refused by name.** `device = 1` gets a refusal on this
 pipeline: the device forward takes both streams by reference and this pipeline
 has no video stream to give it. Use `--device cpu`.
+
+### LTX-2.5 video guidance: `--pipeline-kind one_stage`
+
+`one_stage` mirrors upstream's `TI2VidOneStagePipeline`, which builds a
+`FactoryGuidedDenoiser` from the params table's own video and audio guiders. On
+the 2.4/2.5 lineage those resolve to `cfg_scale = 3.0`, `stg_scale = 1.0`,
+`rescale_scale = 0.7` and `modality_scale = 3.0`.
+
+Until [#1092](https://github.com/mudler/vllm.cpp/issues/1092) this port read none
+of it: the joint denoise loop ran one unguided forward per step. A `one_stage`
+render therefore finished, at the right size and frame count, along a different
+trajectory than upstream's. It now runs **four** forwards per step and combines
+them per modality:
+
+| Pass | What differs | Selected by |
+|---|---|---|
+| conditional | nothing | always |
+| unconditional | the negative conditioning | `cfg_scale != 1.0` |
+| perturbed | video/audio self-attention skipped on `stg_blocks` | `stg_scale != 0.0` |
+| isolated modality | the audio<->video cross attention off in every block | `modality_scale != 1.0` |
+
+Seven per-generation knobs mirror upstream's `default_1_stage_arg_parser` and
+each takes the checkpoint generation's value when absent. The audio row and
+`--negative-prompt` are shared with text-to-audio and are no longer refused on a
+video pipeline; upstream's parser carries both rows side by side, and the old
+refusal rested on a reading of upstream that was wrong and harmless only while
+nothing here read them.
+
+| `ltx2-gen` flag | per-generation extra | meaning |
+|---|---|---|
+| `--video-cfg-guidance-scale` | `video_cfg_guidance_scale` | video `cfg_scale`; `1.0` turns the unconditional forward off |
+| `--video-stg-guidance-scale` | `video_stg_guidance_scale` | video `stg_scale`; `0.0` turns the perturbed forward off |
+| `--video-rescale-scale` | `video_rescale_scale` | video `rescale_scale`, applied to the DENOISED prediction |
+| `--video-skip-step` | `video_skip_step` | `0` never skips; `n` runs every `n+1`-th step |
+| `--video-stg-blocks` | `video_stg_blocks` | comma separated block indices; EMPTY disables STG, see below |
+| `--a2v-guidance-scale` | `a2v_guidance_scale` | video `modality_scale`; `1.0` turns the isolated-modality forward off |
+| `--v2a-guidance-scale` | `v2a_guidance_scale` | audio `modality_scale` |
+| `--negative-prompt` | `negative_prompt` | the unconditional forward's conditioning |
+
+The audio row is the same six spellings with `audio_` in place of `video_`:
+`audio_cfg_guidance_scale`, `audio_stg_guidance_scale`, `audio_rescale_scale`,
+`audio_skip_step`, `audio_stg_blocks`, and `v2a_guidance_scale` for its
+`modality_scale`.
+
+Those extras ride the per-generation `extra_keys` / `extra_values` array on
+`vllm_video_params`, so the C ABI reaches the same path with no new field. They
+are per-GENERATION and therefore reach the CLI and the C ABI and **not**
+`/v1/videos`, which forwards no per-generation extra to any engine
+([#928](https://github.com/mudler/vllm.cpp/issues/928)). `pipeline_kind` is a
+LOAD knob and does reach the server, so a server started with
+`--video-extra pipeline_kind=one_stage` renders every request through the guided
+denoiser at the recipe's own guider values and no request can change them.
+
+**An EMPTY `--video-stg-blocks` is accepted and means "perturb no block".** That
+is upstream's own idiom — `docs/multimodal-guidance.md:13` says "Set to `[]` to
+disable STG", the field defaults to `[]`, the flags are `nargs="*"`, and the
+shipped HQ params row uses it — and it stays distinct from OMITTING the flag,
+which takes the params table's value. It disables the STG signal and not the STG
+cost: upstream selects the perturbed pass from `stg_scale` alone, so the forward
+still runs and contributes exactly zero. Set the scale to `0.0` to skip the
+forward as well. This page and this port refused the empty list until
+2026-08-17.
+
+**The unconditional forward needs a negative conditioning, and there are two
+ways to supply one.** With a text tower, `--negative-prompt` (or the recipe's
+own default) is encoded through the same chain as the positive prompt. Without
+one, `--negative-prompt-embeds` and `--negative-audio-prompt-embeds` — the LOAD
+extras `negative_prompt_embeds_path` and `negative_audio_prompt_embeds_path` —
+are the negative half of the `prompt_embeds_path` fallback: two files at the
+DiT's two cross-attention widths, the same row count as the positive pair. Being
+LOAD extras they DO reach the server, through `--video-extra`. With neither, a
+`cfg_scale` other than 1.0 is **refused by name** rather than served the positive
+context twice, which would leave the whole classifier-free term at exactly zero.
+
+**A block index the checkpoint does not have is refused**, which is the case the
+empty list above is NOT. `stg_blocks` is a membership test upstream, so naming
+block 28 on a model with fewer blocks perturbs nothing and leaves
+`stg_scale * (cond - perturbed)` at exactly zero — the same zero, reached by a
+request that disagrees with the checkpoint rather than by a caller who asked for
+no perturbation. Upstream never meets it because it only ships 48-block
+checkpoints, so this refusal is local to this port and is named as such.
+
+**The distilled and retake recipes refuse every one of these flags.** Their
+guidance is distilled into the weights, so honouring an override would sample a
+trajectory the weights were never trained for. Their guiders are upstream's
+positive-only one, so they still issue one forward per step and their output is
+unchanged by this row.
+
+**The accelerator is refused for the perturbed and isolated-modality passes.**
+`Ltx2DitForwardDevice` takes no perturbation argument, so those two passes on
+`device = 1` would run an unperturbed forward and leave both terms at zero.
+Classifier-free guidance alone is a different context and no perturbation, and
+runs on both arms.
 
 **What is not served.** `temporal_upsample_rounds` is defined and refused above
 `0`: the rounds loop that temporally doubles the latent, re-tiles the canvas and
@@ -1849,11 +1988,16 @@ claimed. Ask for a short duration and few `num_inference_steps` while you are
 checking that it works.
 
 The part that dominates is *not* the one you would guess. The 8.6B language
-model goes through `vt` and uses the CPU threadpool; the RVQ depth decoder and
-the DiT do not — they are scalar host loops with a double accumulator, written
-that way in W2-W5 so their reduction order is reproducible against torch, and
-they run single-threaded. In one 0.1 s request the depth decoder alone is the
-majority of the wall clock.
+model goes through `vt` and uses the CPU threadpool; the RVQ depth decoder does
+not — it is a scalar host loop with a double accumulator, written that way in
+W2/W3 so its reduction order is reproducible against torch. In one 0.1 s request
+the depth decoder alone is the majority of the wall clock.
+
+At a *real* duration the DiT is the whole story instead, which is why it is the
+stage that moved first: a 45 s clip at the default 30 inference steps runs the
+DiT 660 times (30 steps x 2 CFG branches x 11 windows) for roughly 634 TFLOP
+against about 29 TFLOP for the entire autoregressive half. On the host loops
+that is measured in hours. `--speech-device 1` puts it on the accelerator.
 
 #### What runs on the device, and what does not
 
@@ -1866,20 +2010,34 @@ direction that matters.
 |---|---|
 | 8.6B `Qwen3ForCausalLM` (prefill + every decode step, its paged KV) | **device** |
 | guided-logit pipeline, top-k draw, frame feedback embedding | host (two 200 000-wide rows per step; not the cost) |
+| **2.4B fp32 flow-matching DiT** (every denoise step, both CFG branches) | **device**, weights staged ONCE |
 | 0.646B RVQ depth decoder (7 steps per frame) | **host**, scalar loops |
-| condition mix, 2.4B fp32 flow-matching DiT, scheduler | **host**, scalar loops |
+| condition mix (once per window), scheduler, CFG mix, Euler step | **host** |
 | DAC Flow-VAE vocoder (`Conv1d` / `ConvTranspose1d`) | **host**, scalar loops |
 
 The language model reaches the device because it is already routed through the
 shared `Qwen3DenseModel` forward that five text registrations ride — nothing was
 forked for it, and the only thing this option changes is which queue that
-forward is handed and where its KV cache is allocated. The other stages do not,
-for two different reasons, and both are owed rather than hidden:
+forward is handed and where its KV cache is allocated.
 
-* the depth decoder and the DiT are host `std::vector<float>` reference loops
-  under `-ffp-contract=off`, kept that way so their reduction order stays
-  reproducible against torch. Moving them means routing them through the shared
-  `vt` GEMM seam with device-resident weights, not adding a flag;
+The DiT reaches it the same way: through shared `vt` ops only
+(`MatmulBT`, `LayerNorm`, `AttentionCross`, `RopeFromCache`, `SiluAndMul`,
+`Add`), with **no new kernel**. Its 9.7 GB of fp32 weights are uploaded once per
+request, before the window loop, and the host copy is released as each tensor
+lands — a 45 s clip runs that forward 660 times, so a per-step or even
+per-window upload would cost more than the compute it enables. `fp32 stays
+fp32`: the acoustic half is float32 because upstream chose float32 for it, and
+this arm mirrors that rather than buying speed with a narrower dtype.
+
+The remaining stages do not move, for two different reasons, and both are owed
+rather than hidden:
+
+* the depth decoder and the condition mix are host `std::vector<float>`
+  reference loops under `-ffp-contract=off`, and they run at
+  `ArCompute::kBFloat16` — every op's *result* is rounded to bf16, which is what
+  upstream stores. Routing them through an f32 GEMM would silently drop that
+  rounding, so mirroring them needs bf16 storage, which is a dtype decision with
+  its own numeric evidence rather than a transcription;
 * the vocoder needs `ConvTranspose1d`, and **`vt` has no such op at all** — the
   1-D convolutions it does have (`vt::DepthwiseConv1d`, `vt::CausalConv1dFwd`)
   are depthwise or causal-with-state, and `vt::Conv2d` and `vt::DepthwiseConv1d`
@@ -1887,10 +2045,16 @@ for two different reasons, and both are owed rather than hidden:
   this stage would need, so it is named here rather than hand-rolled outside the
   seam.
 
-Because the host stages are unchanged, the CPU arm is **bit-identical** to the
-one every Music3 correctness gate was taken on, and the device arm's output
-differs from it exactly where the language model's own arithmetic differs — one
-stage, not five.
+Because the host stages are unchanged — and because `--speech-device 0` takes
+the same `DitForward` it always did, source byte for source byte — the CPU arm
+is **bit-identical** to the one every Music3 correctness gate was taken on. The
+device arm's output differs from it exactly where the language model's and the
+DiT's own arithmetic differ: two stages, not six, and neither difference is a
+shape or an ordering defect. The DiT's device forward is gated against the same
+upstream goldens at the same tolerance as the host one; nothing was widened for
+it, and `VLLM_CPP_MUSIC3_DEVICE=1` runs that comparison on either arm
+(`tests/parity/test_minimax_music3_acoustic_real.cpp`, with
+`VLLM_CPP_MUSIC3_DIT=1`).
 
 **The two arms do not produce the same song, and that is structural.** The
 autoregressive stage has no greedy path upstream: it ends every draw in a seeded
@@ -2537,9 +2701,11 @@ or without the ComfyUI `model.diffusion_model.` prefix. Each family reads its ow
 knobs from `extras`. H3 takes `partition`. LTX-2.5 takes
 `audio_prompt_embeds_path` (the audio stream's conditioning, the twin of the
 seam's `prompt_embeds_path`, which carries the video stream), `pipeline_kind`
-(default `distilled_two_stage`; also `one_stage`, `dmd2`, `dfr`, `retake` and
-`t2a_one_stage`), `model_version` (only for a checkpoint that
+(default `distilled_two_stage`; also `one_stage`, `res2s_two_stage`, `dmd2`,
+`dfr`, `retake` and `t2a_one_stage`), `model_version` (only for a checkpoint that
 declares none), `dit_config_path`, `encoder_config_path`,
+`negative_prompt_embeds_path` and `negative_audio_prompt_embeds_path` (the
+negative half of the same fallback, for the unconditional forward),
 `allow_unported_modules`, `max_phase`, `prompt_embeds_valid_rows`,
 `upsampler_path`, `duration_head_path`, `lora_path` and `lora_strength` — twelve
 keys, which is `kKnownLoadExtras` (`ltx2_video.cpp:377-383`) in order. The two
@@ -3027,17 +3193,19 @@ CHECKPOINT_ROOT=... VLLM_CPP_LTX2_TOWER_E2E=1 \
 
 Recipes resolve on an EXACT `(pipeline_kind, model_version)` pair and refuse
 anything else by name rather than defaulting, because a plausible but wrong sigma
-schedule or guidance scale renders a video instead of failing. **Fifteen** pairs
-resolve, derived from `ResolveLtx2PipelineRecipe` (`ltx2_pipeline.cpp:1288-1333`):
+schedule or guidance scale renders a video instead of failing. **Twenty** pairs
+resolve, derived from `ResolveLtx2PipelineRecipe`:
 
-| `pipeline_kind` | resolving `model_version` |
-|---|---|
-| `one_stage` | 2, 2.3, 2.4, 2.5 |
-| `distilled_two_stage` | 2, 2.5 |
-| `dfr` | **2.5 only** |
-| `dmd2` | 2, 2.3 |
-| `retake` | 2, 2.5 |
-| `t2a_one_stage` | 2, 2.3, 2.4, 2.5 |
+| `pipeline_kind` | resolving `model_version` | what it also needs |
+|---|---|---|
+| `one_stage` | 2, 2.3, 2.4, 2.5 | — |
+| `distilled_two_stage` | 2, 2.5 | `upsampler_path` for its second phase |
+| `res2s_two_stage` | **2.5 only** | `upsampler_path` for its second phase |
+| `dfr` | **2.5 only** | `upsampler_path` |
+| `dmd2` | 2, 2.3 | — |
+| `retake` | 2, 2.5 | a source clip as a `frame_%06d.ppm` directory |
+| `t2a_one_stage` | 2, 2.3, 2.4, 2.5 | a text tower; no video VAE is asked for |
+| `a2vid_two_stage` | 2, 2.3, 2.4, 2.5 | `upsampler_path`, `lora_path`, and an `audio_path` on every request |
 
 This list ran to ten until 2026-08-17, omitting `dfr` entirely and all four
 `t2a_one_stage` rows. **`dfr` at 2 is refused deliberately, not by oversight**:
@@ -3045,7 +3213,112 @@ DFR's base stage rests on generated keyframe slots, which need a checkpoint
 declaring `use_keyframes_abs_pos_embedding`, and the 2.0 distilled row predates
 that parameter — so resolving DFR onto it would build a recipe the engine must
 then refuse at load. Refusing at the recipe table names the version instead
-(`ltx2_pipeline.cpp:1306-1313`).
+(the `dfr` arm of `ResolveLtx2PipelineRecipe`, named rather than given as a line
+range because this row's own insertions above it staled the range once already).
+
+### `res2s_two_stage`: the high-quality preset, and why it is a sampler
+
+`res2s_two_stage` is `TI2VidTwoStagesHQPipeline`. Against the plain two-stage
+pipeline it changes the SAMPLER on both stages — the `res_2s` second-order
+method instead of Euler — and takes `LTX_2_3_HQ_PARAMS`: 15 steps, STG off,
+video rescale 0.45, cfg 3.0 video / 7.0 audio, modality 3.0. Those are not the
+only differences (stage 1 also loads the distilled LoRA, derives its schedule
+from the stage-1 latent shape, and runs a `GuidedDenoiser` where the plain
+pipeline runs a `FactoryGuidedDenoiser`), so do not read the sampler swap as an
+exhaustive list. It resolves at 2.5 only, because that preset is a plain
+constant upstream with no per-generation lineage to spread it over.
+
+Fifteen steps is not fewer forwards, and it is not even 15 model calls. The
+`res_2s` loop evaluates the denoiser TWICE per step — once at the step's sigma
+and once at the geometric mean of that sigma and the next — and once more at a
+terminal sigma the schedule injects. Stage 1's 15 steps is therefore 31 denoiser
+calls, and stage 2's frozen 3-step schedule adds 7, for **38 calls per render**.
+Stage 1 is also GUIDED, so each of its calls is three transformer forwards
+(conditional, unconditional, isolated-modality) against stage 2's one: **100
+transformer forwards** for a full render, where `one_stage` at its own 30-step
+default runs 30 calls. Expect the HQ preset to cost several times the 30-step
+arm and to look better, not to be faster.
+
+That is also why the preset cannot be reached by passing its numbers to another
+kind. `--steps 15` on `one_stage` renders a finished, correctly sized, plausible
+clip at a fraction of the model evaluations the preset was tuned for, and no
+property of the output says so. Ask for the pipeline, not for its step count.
+
+```sh
+ltx2-gen --pipeline-kind res2s_two_stage \
+         --prompt "a cinematic shot of ..." \
+         --height 1088 --width 1920 --frames 121
+```
+
+`pipeline_kind` is a LOAD knob, so this reaches the C API and the server too: a
+server started with `--video-extra pipeline_kind=res2s_two_stage` renders every
+request on the HQ preset.
+
+Three limits, stated rather than left to be found. The stage-2 spatial upsample
+is the same one `distilled_two_stage` uses and carries the same refusal when the
+checkpoint has no latent upsampler. The loop's SDE noise is drawn from this
+port's own generator rather than upstream's seeded `torch.randn`, so a render is
+not bit-comparable with Lightricks' — the same limit the ancestral arm already
+ships with. And stage 1's guidance asks for an isolated-modality pass, which the
+device-resident forward cannot perturb, so this preset is host-only until that
+is closed; both are recorded in `.agents/specs/ltx25-res2s-loop.md`.
+
+### Audio-to-video: rendering a clip around a soundtrack you supply
+
+`a2vid_two_stage` is `A2VidPipelineTwoStage`. Stage 1 denoises video at half
+resolution, guided, on a schedule derived from the recipe's own step count;
+stage 2 upsamples 2x and refines with the distilled three-sigma schedule. The
+soundtrack is your file throughout: it is encoded once, frozen at both stages,
+and handed back unchanged rather than round-tripped through the VAE.
+
+```sh
+ltx2-gen --dit ltx-2.5-22b-distilled-fp8.safetensors \
+         --dit-config ltx-2.5-transformer-config.json \
+         --video-vae ltx-2.5-video-vae-conv-bf16.safetensors \
+         --audio-vae ltx-2.5-audio-vae-bf16.safetensors \
+         --upsampler ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors \
+         --lora ltx-2.5-22b-distilled-lora-450-bf16.safetensors \
+         --pipeline-kind a2vid_two_stage --audio-path take.wav \
+         --prompt "a drummer in a small club" \
+         --width 128 --height 128 --frames 25 --out out/a2v
+```
+
+**No render on real weights is claimed for this recipe.** It is gated on reduced
+fixtures. Upstream's stage 1 runs the base `-dev-` transformer and puts the
+distilled adapter on stage 2 only; the command above names the distilled
+checkpoint this tree has measured elsewhere, so it is a shape to copy rather than
+a reproduced result.
+
+Three things this kind demands, each refused by name rather than defaulted:
+
+| What | Why | Where upstream says so |
+|---|---|---|
+| `--audio-path` on **every** request | the pipeline is "denoise video around this take"; without one the soundtrack is generated and the clip looks finished | `--audio-path` is `required=True`, `a2vid_two_stage.py:312-317` |
+| `--lora` naming the distilled adapter | stage 2 is a three-sigma refinement the base weights were never distilled for | `--distilled-lora` is `required=True`, `utils/args.py:1140-1153` |
+| `--upsampler` | stage 2's input is the upsampled stage-1 latent | `a2vid_two_stage.py:261` |
+
+`--audio-start-time` and `--audio-max-duration` window the take; the window
+defaults to the clip's own duration. A take shorter than the clip is refused
+rather than padded, and a longer one keeps its leading frames.
+
+**One divergence, and it is not repairable from the request.** Upstream fuses
+the distilled adapter into stage 2 alone and leaves stage 1 on the base weights;
+this engine fuses adapters once at load, so stage 1 sees it too. Expect frames
+that differ from the ones upstream renders for the same checkpoint, take and
+seed. Nothing in the shape of the output shows it — the clip comes back at the
+size, frame count and sample rate you asked for, and no error is raised — so the
+only instrument that sees this is a side-by-side render against upstream.
+Tracked as [#1118](https://github.com/mudler/vllm.cpp/issues/1118).
+
+The guider flags (`--video-cfg-guidance-scale` and the rest, spelled as the
+`video_cfg_guidance_scale` extras over the C API) reach stage 1 and are ignored
+by stage 2, which runs no guider at all — unlike `distilled_two_stage` and
+`retake`, which refuse them outright. `pipeline_kind` is a LOAD knob and reaches
+a server through `--video-extra pipeline_kind=a2vid_two_stage`, but `audio_path`
+is a per-generation extra and `/v1/videos` forwards none
+([#928](https://github.com/mudler/vllm.cpp/issues/928)), so every request to such
+a server is refused for the missing take. This kind is reachable from the C API
+and from `ltx2-gen`, and not over HTTP.
 
 ### Retake: regenerating a time window of an existing clip
 
@@ -3206,23 +3479,51 @@ and therefore cannot stream. The engine says that once on stderr rather than
 silently doing no streaming.
 
 **Read the statistics line before you believe any number you measure with it.**
-Every `VT_MOE_EXPERT_STREAM_STATS_EVERY` steps (default 16, `0` silences it) the
-engine prints:
+The engine prints one every `VT_MOE_EXPERT_STREAM_STATS_EVERY` steps (default
+16, `0` silences the periodic line), and **exactly one more when the process
+ends**, whatever the run did:
 
 ```text
 [expert-stream] steps=64 hits=141230 misses=37312 evictions=29312 fills=37312 bytes=92876505088 exhausted=0 advised=37312
 ```
 
-Two of those fields decide whether the run is measuring anything at all:
+**The final line is the one to read**, because it is the only one you are
+guaranteed to get. The periodic line is skipped whenever the step count is not a
+multiple of the interval, so a healthy five-token run prints none of them at the
+default 16; and it used to be skipped on `steps == 0` as well, which meant the
+one run that most needed reporting — the one where the step boundary is never
+reached — printed nothing at all. Treating absence as failure therefore reported
+VOID on a working lane. The final line crosses both of those skips, so it is
+printed even on a run of zero steps.
 
-- `steps` must advance. If it stays at 0 the decode step boundary is not being
-  reached and the cache will stop serving as soon as it fills.
+Two of the fields decide whether the run is measuring anything at all:
+
+- `steps` must advance. If the final line says `steps=0` the decode step
+  boundary is not being reached, and the cache stops serving as soon as it
+  fills — it will fall back to the memory mapping for the rest of the run.
 - `exhausted` must stay 0. Anything above 0 means slices were refused and read
   from the memory mapping instead, which is the slow path streaming exists to
   replace. The usual cause is a budget smaller than one step's working set:
   raise `VT_MOE_EXPERT_STREAM_SLOTS`.
 
-A run whose `steps` is 0 or whose `exhausted` is large is not a measurement of
+Read it together with the `[expert-stream] ON slots=...` banner, which is printed
+once when the lane builds its store. The four shapes are:
+
+| Banner | Final line | What happened |
+|---|---|---|
+| absent | absent | Nothing reached the streamed seam. A CUDA run (a device-resident expert is served unchanged), a checkpoint whose experts are not keep-quant towers, or a prompt that never reached an MoE layer |
+| present | present | The lane ran. Read `steps` and `exhausted` |
+| present | absent, and nothing called `ExpertStreamFlushStats` | The process did not reach its static destructors: a crash, a signal, or `_exit` |
+| present | absent, because `ExpertStreamFlushStats` was called | The internal gate seam took the process's single print, so teardown had none left to make. No shipped command or server path calls it, so an operator never reaches this shape |
+
+The last two shapes are keyed on the CALL and not on what stderr looks like,
+because stderr cannot separate them. `ExpertStreamFlushStats` prints the same
+line in the same shape as the periodic report, so "a statistics line already
+appeared mid-run" is also what a healthy run of 16 steps that then crashes
+produces. What distinguishes the two is whether the seam was called, and only a
+gate calls it.
+
+A run whose `steps` is 0, or whose `exhausted` is large, is not a measurement of
 streaming, whatever the startup line said. See
 [`docs/ENVIRONMENT.md`](ENVIRONMENT.md) for every knob and its parsing rules.
 
@@ -3275,8 +3576,12 @@ interval does.
 
 Dual-GPU resident FP8 MoE and SharedK-WMMA prefill are controlled via
 ENVIRONMENT.md (`VT_GEMMA4_RESIDENT_*`, `VT_ATTN_*`). Defaults stay safe off RDNA4.
-This PR does **not** restructure the Gemma-4 layer loop or enable decode hipGraph
-(those stay lab-only until a CUDA token-exact gate can land them).
+GetBlas keeps two per-thread hipBLAS handles (`tls_slots[2]`, device 1 → slot 1)
+so a 0→1 hop does not destroy GPU0's handle. `ProductGetBlasHandle` is the
+test accessor for that file-local `GetBlas`. HIP live probe is a separate CTest
+target (exit 77 if `HIP_VISIBLE_DEVICES` empty); it enters capture so production `StreamIsCapturing` is load-bearing. No new env. This PR does **not**
+restructure the Gemma-4 layer loop or enable decode hipGraph (those stay lab-only
+until a CUDA token-exact gate can land them).
 
 ## LTX-2.5 text conditioning
 

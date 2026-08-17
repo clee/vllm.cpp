@@ -30,11 +30,13 @@
 #include "vllm/model_executor/models/ltx2_audio_vae.h"
 #include "vllm/model_executor/models/ltx2_conditioning.h"
 #include "vllm/model_executor/models/ltx2_connector.h"
+#include "vllm/model_executor/models/ltx2_denoisers.h"
 #include "vllm/model_executor/models/ltx2_device.h"
 #include "vllm/model_executor/models/ltx2_dfr.h"
 #include "vllm/model_executor/models/ltx2_image_preprocess.h"
 #include "vllm/model_executor/models/ltx2_loader.h"
 #include "vllm/model_executor/models/ltx2_pipeline.h"
+#include "vllm/model_executor/models/ltx2_samplers.h"
 #include "vllm/model_executor/models/ltx2_retake.h"
 #include "vllm/model_executor/models/ltx2_t2a.h"
 #include "vllm/model_executor/models/ltx2_text_encoder.h"
@@ -231,13 +233,22 @@ void FromLatentState(const Ltx2LatentState& in, StreamState* s) {
 //   denoised * mask + clean * (1 - mask)
 // The mask is PER TOKEN and the latent is per token x channel, so the mask
 // broadcasts along the channel axis exactly as torch's trailing-axis rule does.
-std::vector<float> PostProcessLatent(const std::vector<float>& denoised, const StreamState& state) {
-  std::vector<float> out(denoised.size());
+// TEMPLATED ON THE VALUE TYPE because upstream calls this at two widths and the
+// res_2s loop reaches both: at the model dtype on a denoiser result
+// (samplers.py:305, :390, :441) and at `hp` on a sample inside
+// `_inject_sde_noise` (samplers.py:203). One implementation, two
+// instantiations; a second copy of the blend is the shape this campaign has
+// recorded going wrong. The mask is 0 or 1 on every LTX-2.5 path, so the result
+// is exactly one operand or the other and the two widths agree.
+template <typename Value>
+std::vector<Value> PostProcessLatent(const std::vector<Value>& denoised,
+                                     const StreamState& state) {
+  std::vector<Value> out(denoised.size());
   for (int64_t t = 0; t < state.tokens; ++t) {
-    const float m = state.mask[static_cast<size_t>(t)];
+    const Value m = static_cast<Value>(state.mask[static_cast<size_t>(t)]);
     for (int64_t c = 0; c < state.width; ++c) {
       const size_t i = static_cast<size_t>(t * state.width + c);
-      out[i] = denoised[i] * m + state.clean[i] * (1.0F - m);
+      out[i] = denoised[i] * m + static_cast<Value>(state.clean[i]) * (static_cast<Value>(1) - m);
     }
   }
   return out;
@@ -373,13 +384,15 @@ constexpr char kLtx2DurationHeadPathExtra[] = "duration_head_path";
 // they are no longer trusted: the list below is derived from this file on every
 // run and compared, and the failure prints the replacement to paste in.
 // READER ANCHORS (derived and gated by test_ltx2_video):
-// 791 801 802 864 960 976 978 1069 1094 1199 1240
+// 809 819 820 882 978 994 1029 1120 1145 1250 1291 1333 1335
+
 const char* const kKnownLoadExtras[] = {
     kLtx2AudioPromptEmbedsExtra, kLtx2PipelineKindExtra,   kLtx2ModelVersionExtra,
     kLtx2AllowUnportedExtra,     kLtx2MaxPhaseExtra,       kLtx2DitConfigPathExtra,
     kLtx2PromptValidRowsExtra,   kLtx2EncoderConfigPathExtra,
     "upsampler_path",            kLtx2DurationHeadPathExtra,
     kLtx2LoraPathExtra,          kLtx2LoraStrengthExtra,
+    kLtx2NegativePromptEmbedsExtra, kLtx2NegativeAudioPromptEmbedsExtra,
 };
 
 // FNV-1a over the raw bytes of a float buffer — the `Ltx2ConditioningTrace`
@@ -624,6 +637,11 @@ struct Ltx2VideoEngine::Impl {
   // did on every checkpoint.
   std::vector<float> video_prompt_embeds, audio_prompt_embeds;
   int64_t prompt_tokens = 0;
+  // The NEGATIVE half of the same fallback (row LTX25-GUIDED-VIDEO, #1092).
+  // Empty when the load supplied none, which is what makes a guider that asks
+  // for the unconditional forward a refusal rather than a silent reuse of the
+  // positive context.
+  std::vector<float> negative_video_prompt_embeds, negative_audio_prompt_embeds;
 
   // The connector's CONFIGURATION is kept; its WEIGHTS are not. They are ~8 GB
   // of f32 at the shipped widths (ltx2_loader.h), the conditioning they process
@@ -975,6 +993,39 @@ std::unique_ptr<Ltx2VideoEngine> Ltx2VideoEngine::Load(const VideoModelParams& p
   im.model_version = RecipeVersionKey(version);
   im.pipeline_kind = VideoExtra(params.extras, kLtx2PipelineKindExtra, "distilled_two_stage");
   im.recipe = ResolveLtx2PipelineRecipe(im.pipeline_kind, im.model_version);
+  // ── the adapter a two-stage pipeline cannot run without (#1117) ───────────
+  //
+  // `--distilled-lora` is `required=True` on the parser `A2VidPipelineTwoStage`
+  // selects (utils/args.py:1140-1153, reached through `default_2_stage_arg_parser`
+  // at `:1123` from a2vid_two_stage.py:311), and the reason is what stage 2 is:
+  // a THREE-sigma refinement (`:164`) that only the distilled weights can
+  // complete. Run it on a checkpoint carrying no adapter and it returns a clip
+  // of the right size, the right frame count and the right sample rate.
+  //
+  // Keyed on `recipe.requires_distilled_lora` rather than on the kind STRING, so
+  // the next recipe off this parser inherits it — `ti2vid_two_stages` (#1093)
+  // and `keyframe_interpolation` (#1096) are both already waiting.
+  //
+  // WHAT THIS CANNOT MIRROR, and it is filed rather than left here:
+  // `stage_2_loras = (*loras, *distilled_lora)` (`:114`) puts the adapter on
+  // stage 2 ALONE, against `loras=tuple(loras)` for stage 1 (`:107`). This
+  // engine fuses at load into ONE weight set, so the adapter reaches both
+  // phases. Owed by https://github.com/mudler/vllm.cpp/issues/1118.
+  if (im.recipe.requires_distilled_lora &&
+      VideoExtra(params.extras, kLtx2LoraPathExtra).empty()) {
+    Fail("the '" + im.pipeline_kind +
+         "' pipeline needs a distilled LoRA and none was supplied. Upstream's "
+         "`--distilled-lora` is `required=True` on the parser this pipeline selects "
+         "(ltx-pipelines utils/args.py:1140-1153) and its stage 2 is a three-sigma "
+         "refinement (a2vid_two_stage.py:164) that the base weights were never distilled "
+         "for. Supply it through the '" +
+         std::string(kLtx2LoraPathExtra) +
+         "' load extra. Refused rather than rendered, because a distilled schedule on "
+         "undistilled weights returns a clip of the right size, frame count and sample rate. "
+         "NOTE the divergence this cannot express: upstream fuses that adapter into stage 2 "
+         "ALONE (a2vid_two_stage.py:114 against :107) and this engine fuses once at load, so "
+         "stage 1 sees it too — https://github.com/mudler/vllm.cpp/issues/1118.");
+  }
   im.max_phase = ExtraInt(params.extras, kLtx2MaxPhaseExtra, -1);
   if (im.max_phase >= static_cast<int64_t>(im.recipe.phases.size())) {
     Fail("the '" + std::string(kLtx2MaxPhaseExtra) + "' extra is " +
@@ -1269,6 +1320,60 @@ std::unique_ptr<Ltx2VideoEngine> Ltx2VideoEngine::Load(const VideoModelParams& p
       im.video_prompt_embeds = encoded.video;
       im.audio_prompt_embeds = encoded.audio;
     }
+
+    // ── the NEGATIVE half (row LTX25-GUIDED-VIDEO, #1092) ──────────────────
+    //
+    // The same two files for upstream's second encoding. Loaded here, INSIDE the
+    // positive block, because a negative pair without a positive one conditions
+    // nothing: `prompt_embeds_path` is what a tower-less engine renders from.
+    // The two negative files follow the positive pair's own rule — supplied
+    // together or not at all — and must agree with it on row count, because the
+    // guidance delta subtracts them elementwise.
+    const std::string negative_video_path =
+        VideoExtra(params.extras, kLtx2NegativePromptEmbedsExtra);
+    const std::string negative_audio_path =
+        VideoExtra(params.extras, kLtx2NegativeAudioPromptEmbedsExtra);
+    if (negative_video_path.empty() != negative_audio_path.empty()) {
+      Fail("the '" + std::string(kLtx2NegativePromptEmbedsExtra) + "' and '" +
+           std::string(kLtx2NegativeAudioPromptEmbedsExtra) +
+           "' extras are supplied together or not at all, for the same reason the positive pair "
+           "is: LTX-2.5 conditions TWO streams at two widths and one of them alone would leave a "
+           "stream unconditioned on the unconditional forward, which renders.");
+    }
+    if (!negative_video_path.empty()) {
+      im.negative_video_prompt_embeds =
+          ReadF32File(kLtx2NegativePromptEmbedsExtra, negative_video_path);
+      im.negative_audio_prompt_embeds =
+          ReadF32File(kLtx2NegativeAudioPromptEmbedsExtra, negative_audio_path);
+      if (static_cast<int64_t>(im.negative_video_prompt_embeds.size()) != v_rows * vw ||
+          static_cast<int64_t>(im.negative_audio_prompt_embeds.size()) != a_rows * aw) {
+        Fail("the negative prompt embeds hold " +
+             std::to_string(im.negative_video_prompt_embeds.size()) + " / " +
+             std::to_string(im.negative_audio_prompt_embeds.size()) +
+             " floats and the positive pair holds " +
+             std::to_string(im.video_prompt_embeds.size()) + " / " +
+             std::to_string(im.audio_prompt_embeds.size()) +
+             " at widths " + std::to_string(vw) + " / " + std::to_string(aw) +
+             ". Upstream encodes `[prompt, negative_prompt]` in ONE call, so the two halves "
+             "share a padded width by construction and `(cfg_scale - 1) * (cond - uncond)` "
+             "subtracts them elementwise");
+      }
+      if (im.has_connector) {
+        // Through the SAME connector, with the SAME mask. A negative stream that
+        // skipped it would be compared against a positive stream that did not,
+        // and the delta would be dominated by the connector rather than by the
+        // prompt.
+        std::vector<float> additive(static_cast<size_t>(v_rows), 0.0f);
+        for (int64_t s = im.prompt_valid_rows; s < v_rows; ++s) {
+          additive[static_cast<size_t>(s)] = -std::numeric_limits<float>::max();
+        }
+        const Ltx2ConnectorEmbeddings encoded = RunConnector(
+            dit_file, im.video_connector_cfg, im.audio_connector_cfg,
+            im.negative_video_prompt_embeds, im.negative_audio_prompt_embeds, additive, v_rows);
+        im.negative_video_prompt_embeds = encoded.video;
+        im.negative_audio_prompt_embeds = encoded.audio;
+      }
+    }
   }
   return engine;
 }
@@ -1433,6 +1538,167 @@ void AssertGeneratedKeyframesSupported(bool has_embedding, const std::string& di
        "admitted upstream (#902). Supply a generated-keyframe checkpoint, or drop the request.");
 }
 
+// ── the guiders (row LTX25-GUIDED-VIDEO, #1092) ────────────────────────────
+
+// `--*-stg-blocks`, `nargs="*"` (utils/args.py:979-985, :1039-1045). An extra
+// that is PRESENT and empty is upstream's empty list — "perturb nothing" — and
+// stays distinct from an ABSENT extra, which takes the params table's own value.
+// Collapsing the two would make `video_stg_blocks=` silently mean block 28.
+void ApplyStgBlocksExtra(const std::map<std::string, std::string>& extras, const char* key,
+                         std::vector<int64_t>* blocks) {
+  const auto at = extras.find(key);
+  if (at == extras.end()) return;
+  blocks->clear();
+  const std::string& raw = at->second;
+  for (size_t i = 0; i < raw.size();) {
+    const size_t comma = raw.find(',', i);
+    const std::string token = raw.substr(i, comma == std::string::npos ? comma : comma - i);
+    if (!token.empty()) {
+      try {
+        blocks->push_back(std::stoll(token));
+      } catch (const std::exception&) {
+        Fail("'" + std::string(key) + "' holds '" + token +
+             "', which is not an integer block index");
+      }
+    }
+    if (comma == std::string::npos) break;
+    i = comma + 1;
+  }
+}
+
+// One CLI flag each, from `default_1_stage_arg_parser` (utils/args.py:947-1066:
+// the video row's six flags open at :948 and the audio row's at :1008). Each extra overrides ONE
+// field of the phase's own resolved guider, which is what one flag does.
+//
+// REFUSED WHOLESALE on a phase that fixes its guidance. `allow_guidance_override
+// = false` is set by the distilled two-stage and retake recipes
+// (ltx2_recipes.py:125-158, retake.py:53) whose guidance is distilled INTO the
+// weights, and until this row nothing read it. Honouring an override there would
+// sample a trajectory the weights were never trained for — the same argument
+// `fixed_num_inference_steps` already makes about the schedule, and the same
+// reason it is a refusal rather than a silent clamp.
+void ApplyGuidanceOverrides(const std::map<std::string, std::string>& extras,
+                            const Ltx2PhaseRecipe& phase, Ltx2MultiModalGuiderParams* video,
+                            Ltx2MultiModalGuiderParams* audio) {
+  static const char* const kVideoKeys[] = {
+      kLtx2VideoCfgScaleExtra, kLtx2VideoStgScaleExtra,  kLtx2VideoRescaleScaleExtra,
+      kLtx2VideoSkipStepExtra, kLtx2VideoStgBlocksExtra, kLtx2A2vGuidanceScaleExtra,
+      kLtx2AudioCfgScaleExtra, kLtx2AudioStgScaleExtra,  kLtx2AudioRescaleScaleExtra,
+      kLtx2AudioSkipStepExtra, kLtx2AudioStgBlocksExtra, kLtx2V2aGuidanceScaleExtra};
+  if (!phase.allow_guidance_override) {
+    for (const char* key : kVideoKeys) {
+      if (extras.find(key) == extras.end()) continue;
+      Fail("phase '" + phase.name +
+           "' fixes its own guidance, so the '" + std::string(key) +
+           "' extra is refused rather than applied. This recipe's scales are distilled INTO the "
+           "weights (ltx2_recipes.py:125-158), and a render that honoured the override would "
+           "sample a trajectory they were never trained for.");
+    }
+    return;
+  }
+  // IGNORED, not refused, on a phase whose denoiser takes no params. This is
+  // `SimpleDenoiser` (utils/denoisers.py:3) and the a2vid stage 2 is the one
+  // phase in the table that reaches it: the flags exist on that pipeline's
+  // parser (a2vid_two_stage.py:311 -> utils/args.py:947-1006) and they reach
+  // stage 1's guider alone (`:233-236`), because stage 2 constructs
+  // `SimpleDenoiser(v_context_p, a_context_p)` (`:278`). Applying them here
+  // instead would switch on a guidance pass upstream's stage 2 does not run —
+  // and it would do it invisibly, since an extra forward changes no output
+  // shape, frame count or sample rate.
+  if (phase.denoiser == Ltx2PhaseDenoiser::kSimple) return;
+  video->cfg_scale = ExtraDouble(extras, kLtx2VideoCfgScaleExtra, video->cfg_scale);
+  video->stg_scale = ExtraDouble(extras, kLtx2VideoStgScaleExtra, video->stg_scale);
+  video->rescale_scale = ExtraDouble(extras, kLtx2VideoRescaleScaleExtra, video->rescale_scale);
+  video->modality_scale = ExtraDouble(extras, kLtx2A2vGuidanceScaleExtra, video->modality_scale);
+  video->skip_step = ExtraInt(extras, kLtx2VideoSkipStepExtra, video->skip_step);
+  ApplyStgBlocksExtra(extras, kLtx2VideoStgBlocksExtra, &video->stg_blocks);
+
+  audio->cfg_scale = ExtraDouble(extras, kLtx2AudioCfgScaleExtra, audio->cfg_scale);
+  audio->stg_scale = ExtraDouble(extras, kLtx2AudioStgScaleExtra, audio->stg_scale);
+  audio->rescale_scale = ExtraDouble(extras, kLtx2AudioRescaleScaleExtra, audio->rescale_scale);
+  audio->modality_scale = ExtraDouble(extras, kLtx2V2aGuidanceScaleExtra, audio->modality_scale);
+  audio->skip_step = ExtraInt(extras, kLtx2AudioSkipStepExtra, audio->skip_step);
+  ApplyStgBlocksExtra(extras, kLtx2AudioStgBlocksExtra, &audio->stg_blocks);
+
+  const auto check_skip = [](const char* key, int64_t value) {
+    if (value >= 0) return;
+    Fail("'" + std::string(key) + "' is " + std::to_string(value) +
+         "; `should_skip_step` is `step % (skip_step + 1)` (guiders.py:287-291) and a negative "
+         "value would take the modulus of a non-positive divisor");
+  };
+  check_skip(kLtx2VideoSkipStepExtra, video->skip_step);
+  check_skip(kLtx2AudioSkipStepExtra, audio->skip_step);
+  // AN EMPTY LIST IS NOT REFUSED, and this function refused it until 2026-08-17.
+  //
+  // The refusal read: an empty `stg_blocks` beside a non-zero STG scale is a
+  // perturbed pass identical to the conditional one, so it is a wasted forward
+  // and a guidance term of exactly zero. Every clause of that is true and none
+  // of it makes the configuration illegal upstream, which is the only question
+  // a mirror gets to ask. Measured at Lightricks/LTX-2 `fd4ded7f`:
+  //
+  //   - `packages/ltx-pipelines/docs/multimodal-guidance.md:13` documents it as
+  //     THE way to turn STG off: "Set to `[]` to disable STG", in the same table
+  //     and the same idiom as `stg_scale` -> 0.0 and `cfg_scale` -> 1.0.
+  //   - `MultiModalGuiderParams.stg_blocks` DEFAULTS to `[]`
+  //     (guiders.py:204, `field(default_factory=list)`).
+  //   - `--video-stg-blocks` / `--audio-stg-blocks` are `nargs="*"`
+  //     (args.py:979-985, :1039-1045, :1107-1113), so the flag with zero values
+  //     parses to `[]`. `nargs="+"` was the one-character way to forbid it.
+  //   - `LTX_2_3_HQ_PARAMS` SHIPS `stg_blocks=[]` on both modalities
+  //     (constants.py:105, :113).
+  //   - There is no validation of `stg_blocks` anywhere in that tree: no
+  //     emptiness check, no length check, no range check against the block
+  //     count.
+  //
+  // Upstream's semantics are unambiguous and are the reason `[]` is meaningful:
+  // `blocks=None` means EVERY block and `blocks=[]` means NO block
+  // (perturbations.py:26-33). The empty list is how a caller says the second
+  // thing, and `ApplyStgBlocksExtra` above exists to keep PRESENT-and-empty
+  // distinct from ABSENT for exactly that reason. Refusing it here made that
+  // distinction unreachable.
+  //
+  // WHAT IS STILL REFUSED, one layer down in `Ltx2GuidedDenoise`: a list that
+  // NAMES blocks and reaches none of them, e.g. `[28]` on a two-block DiT. That
+  // is a local condition rather than an upstream one — upstream only ever runs
+  // 48-block checkpoints and this port runs reduced ones — and it is a mismatch
+  // between a request and a checkpoint rather than an expressed intent.
+}
+
+// Everything step 0 of phase 0 produced, for the gate that decides WHICH SPACE
+// each arm was combined in. Derived at the call from what the seam returned, so
+// a mutation to any arm moves a recorded field rather than leaving a comment
+// that compiles.
+void RecordFirstGuidedStep(Ltx2ConditioningTrace* trace, const Ltx2GuidedDenoiseResult& guided,
+                           const std::vector<float>& latent,
+                           const std::vector<float>& timesteps, double sigma,
+                           const std::vector<float>& stepper_input) {
+  const auto slot = [](Ltx2DenoisePass pass) { return static_cast<size_t>(pass); };
+  trace->video_guided = true;
+  trace->video_cond_forwards = guided.pass_ran[slot(Ltx2DenoisePass::kCond)] ? 1 : 0;
+  trace->video_uncond_forwards = guided.pass_ran[slot(Ltx2DenoisePass::kUncond)] ? 1 : 0;
+  trace->video_perturbed_forwards = guided.pass_ran[slot(Ltx2DenoisePass::kPerturbed)] ? 1 : 0;
+  trace->video_modality_forwards = guided.pass_ran[slot(Ltx2DenoisePass::kModality)] ? 1 : 0;
+  trace->video_perturbed_blocks = guided.perturbed_video_blocks;
+  trace->video_audio_perturbed_blocks = guided.perturbed_audio_blocks;
+  trace->video_modality_skipped_a2v = guided.modality_pass_skipped_a2v;
+  trace->video_modality_skipped_v2a = guided.modality_pass_skipped_v2a;
+  trace->video_first_latent = latent;
+  trace->video_first_timesteps = timesteps;
+  trace->video_first_cond = guided.video_pass[slot(Ltx2DenoisePass::kCond)];
+  trace->video_first_cond_velocity = guided.video_pass_velocity[slot(Ltx2DenoisePass::kCond)];
+  trace->video_first_uncond = guided.video_pass[slot(Ltx2DenoisePass::kUncond)];
+  trace->video_first_uncond_velocity = guided.video_pass_velocity[slot(Ltx2DenoisePass::kUncond)];
+  trace->video_first_perturbed = guided.video_pass[slot(Ltx2DenoisePass::kPerturbed)];
+  trace->video_first_perturbed_velocity =
+      guided.video_pass_velocity[slot(Ltx2DenoisePass::kPerturbed)];
+  trace->video_first_modality = guided.video_pass[slot(Ltx2DenoisePass::kModality)];
+  trace->video_first_modality_velocity =
+      guided.video_pass_velocity[slot(Ltx2DenoisePass::kModality)];
+  trace->video_first_denoised = guided.video_denoised;
+  trace->video_first_stepper_input = stepper_input;
+  trace->video_first_sigma = sigma;
+}
+
 }  // namespace
 
 VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
@@ -1467,7 +1733,17 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
                        kv.first == kLtx2AudioStgScaleExtra ||
                        kv.first == kLtx2AudioRescaleScaleExtra ||
                        kv.first == kLtx2AudioSkipStepExtra ||
-                       kv.first == kLtx2AudioStgBlocksExtra;
+                       kv.first == kLtx2AudioStgBlocksExtra ||
+                       // The VIDEO guider's row (row LTX25-GUIDED-VIDEO, #1092),
+                       // from the same parser as the audio row above
+                       // (utils/args.py:947-1066).
+                       kv.first == kLtx2VideoCfgScaleExtra ||
+                       kv.first == kLtx2VideoStgScaleExtra ||
+                       kv.first == kLtx2VideoRescaleScaleExtra ||
+                       kv.first == kLtx2VideoSkipStepExtra ||
+                       kv.first == kLtx2VideoStgBlocksExtra ||
+                       kv.first == kLtx2A2vGuidanceScaleExtra ||
+                       kv.first == kLtx2V2aGuidanceScaleExtra;
     if (!known) {
       Fail("unknown per-generation extra '" + kv.first + "'. This family defines: " +
            std::string(kLtx2ImageCrfExtra) + ", " + kLtx2AudioPathExtra + ", " +
@@ -1478,41 +1754,50 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
            kLtx2RegenerateAudioExtra + ", " + kLtx2NegativePromptExtra + ", " +
            kLtx2AudioCfgScaleExtra + ", " + kLtx2AudioStgScaleExtra + ", " +
            kLtx2AudioRescaleScaleExtra + ", " + kLtx2AudioSkipStepExtra + ", " +
-           kLtx2AudioStgBlocksExtra);
+           kLtx2AudioStgBlocksExtra + ", " + kLtx2VideoCfgScaleExtra + ", " +
+           kLtx2VideoStgScaleExtra + ", " + kLtx2VideoRescaleScaleExtra + ", " +
+           kLtx2VideoSkipStepExtra + ", " + kLtx2VideoStgBlocksExtra + ", " +
+           kLtx2A2vGuidanceScaleExtra + ", " + kLtx2V2aGuidanceScaleExtra);
     }
   }
-  // ── the TEXT-TO-AUDIO knobs belong to ONE pipeline (#1005) ────────────────
+  // ── the knobs that belong to ONE pipeline (#1005, corrected by #1092) ─────
   //
   // `pipeline_kind` is a LOAD extra, so which pipeline runs is settled before a
-  // request arrives and this is a decidable question rather than a guess. The
-  // guard runs in BOTH directions: the six T2A knobs are refused off a
-  // `t2a_one_stage` engine, and every other per-generation knob is refused ON
-  // one. Neither is padding. Upstream's `T2AOneStagePipeline.__call__` takes no
-  // image, no reference, no keyframe and no window (t2a_one_stage.py:109-122),
-  // and its guider arguments have no counterpart in any other `__call__`, so a
-  // knob crossing either way would silently do nothing to a render that still
-  // finishes.
+  // request arrives and this is a decidable question rather than a guess.
+  //
+  // WHAT #1092 CORRECTED, and why the old list was defensible until it was not.
+  // Row LTX25-T2A-ONE-STAGE refused `negative_prompt` and the five `audio_*`
+  // guider knobs on ANY non-t2a engine, reasoning that "no other pipeline
+  // `__call__` upstream takes a guider argument at all". That sentence was
+  // FALSE about upstream and TRUE about this port. Upstream's
+  // `default_1_stage_arg_parser` carries `--negative-prompt`
+  // (utils/args.py:937-946) and the whole audio guider row
+  // (`:1011-1075`) alongside the video one, and `TI2VidOneStagePipeline`
+  // consumes both through `audio_guider_params` (ti2vid_one_stage.py:215-218).
+  // What made the refusal harmless was that NOTHING HERE READ THEM on a joint
+  // render — the video denoise loop was unguided. Row LTX25-GUIDED-VIDEO makes
+  // them live, so the refusal would now reject a flag upstream serves.
+  //
+  // The guard therefore keeps one direction and drops the other: the knobs that
+  // describe a PICTURE are refused on a text-to-audio engine, which produces
+  // none. `T2AOneStagePipeline.__call__` takes a prompt, a negative prompt, a
+  // seed, a frame rate, a step count, the audio guider and a frame count
+  // (t2a_one_stage.py:109-122) and nothing else.
   {
-    const char* const kT2aOnly[] = {kLtx2NegativePromptExtra,   kLtx2AudioCfgScaleExtra,
-                                    kLtx2AudioStgScaleExtra,    kLtx2AudioRescaleScaleExtra,
-                                    kLtx2AudioSkipStepExtra,    kLtx2AudioStgBlocksExtra};
     const char* const kNotOnT2a[] = {kLtx2ImageCrfExtra,        kLtx2AudioPathExtra,
                                      kLtx2AudioStartTimeExtra,  kLtx2AudioMaxDurationExtra,
                                      kLtx2GeneratedKeyframesExtra, kLtx2TemporalRoundsExtra,
                                      kLtx2RetakeStartTimeExtra, kLtx2RetakeEndTimeExtra,
                                      kLtx2RetakeFrameRateExtra, kLtx2RegenerateVideoExtra,
-                                     kLtx2RegenerateAudioExtra};
-    for (const char* key : kT2aOnly) {
-      if (!im.recipe.audio_only && !VideoExtra(gen.extras, key).empty()) {
-        Fail("the '" + std::string(key) +
-             "' extra is text-to-audio's alone (ltx-pipelines utils/args.py:1083-1119, the "
-             "`default_1_stage_t2a_arg_parser`), and this engine was loaded with pipeline_kind '" +
-             im.pipeline_kind +
-             "'. Refused rather than ignored: no other pipeline `__call__` upstream takes a "
-             "guider argument at all, so accepting it here would report a configured render "
-             "that ran the recipe's own values");
-      }
-    }
+                                     kLtx2RegenerateAudioExtra,
+                                     // The VIDEO guider's own row: there is no
+                                     // video stream to guide, and upstream's t2a
+                                     // parser exposes none of them
+                                     // (utils/args.py:1083-1119).
+                                     kLtx2VideoCfgScaleExtra,   kLtx2VideoStgScaleExtra,
+                                     kLtx2VideoRescaleScaleExtra, kLtx2VideoSkipStepExtra,
+                                     kLtx2VideoStgBlocksExtra,  kLtx2A2vGuidanceScaleExtra,
+                                     kLtx2V2aGuidanceScaleExtra};
     for (const char* key : kNotOnT2a) {
       if (im.recipe.audio_only && !VideoExtra(gen.extras, key).empty()) {
         Fail("the '" + std::string(key) +
@@ -2226,6 +2511,31 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
   // already has through an encoder and a vocoder can only lose to it.
   Ltx2DecodedAudio a2v_source;
   const std::string a2v_audio_path = VideoExtra(gen.extras, kLtx2AudioPathExtra);
+  // REQUIRED on a recipe that says so (#1117). `--audio-path` is `required=True`
+  // (a2vid_two_stage.py:312-317), and the pipeline's whole shape is "denoise
+  // video AROUND this take": both stages freeze the audio stream on it
+  // (`:251-256`, `:291-296`) and the soundtrack handed back is the caller's own
+  // file (`:301-303`).
+  //
+  // Checked HERE and not at load, because `pipeline_kind` is a LOAD extra and
+  // `audio_path` is a per-generation one, so the question is only decidable once
+  // a request exists. Keyed on the recipe flag rather than on the kind string,
+  // for the reason `audio_only` gives in the header.
+  //
+  // WITHOUT THE TAKE THE RENDER STILL FINISHES. The audio stream is generated
+  // rather than supplied, which is ordinary joint generation, and the result is
+  // a clip of the right size with the right frame count and the right sample
+  // rate — indistinguishable from audio-to-video that ignored its input.
+  if (im.recipe.requires_audio_input && a2v_audio_path.empty()) {
+    Fail("the '" + im.pipeline_kind + "' pipeline is driven BY a waveform and no '" +
+         std::string(kLtx2AudioPathExtra) +
+         "' extra was supplied. Upstream's `--audio-path` is `required=True` "
+         "(ltx-pipelines a2vid_two_stage.py:312-317) and both of its stages freeze the audio "
+         "stream on the encoded take (`:251-256`, `:291-296`). Refused rather than rendered: "
+         "without it the soundtrack is GENERATED, and a generated one is a finished clip at the "
+         "right size, frame count and sample rate with nothing to show that the input was "
+         "ignored. Supply the take, or load with a `pipeline_kind` that generates audio.");
+  }
   if (!a2v_audio_path.empty()) {
     if (!im.has_audio_encoder) {
       Fail("'" + std::string(kLtx2AudioPathExtra) + "' names '" + a2v_audio_path +
@@ -2321,6 +2631,145 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
     im.trace.retake_conditioned = retake_plan.video_conditioned;
     im.trace.retake_latent_digest = DigestF32(retake_video_volume);
     im.trace.retake_latent_absmax = AbsMax(retake_video_volume);
+  }
+
+  // ── THE GUIDERS, and the negative conditioning they ask for (#1092) ───────
+  //
+  // `create_multimodal_guider_factory(params=..., negative_context=...)` once per
+  // stream, before the stage runs (ti2vid_one_stage.py:210-218). Resolved for
+  // EVERY phase up front rather than inside the loop, because the negative
+  // encode below is a host-side pass over the text tower and must happen once
+  // for the whole render if ANY phase asks for it.
+  //
+  // A phase whose recipe sets no guidance keeps `Ltx2MultiModalGuiderParams`'s
+  // own defaults — `cfg 1.0 / stg 0.0 / modality 1.0 / rescale 0.0` — which is
+  // exactly `_POSITIVE_ONLY_GUIDER` (denoisers.py:25-28). Only `OneStagePhase`
+  // sets real scales, so `distilled_two_stage`, `dfr`, `retake` and `dmd2` run
+  // ONE forward per step through the guided seam and combine it with a guider
+  // whose every term is zero, which is `SimpleDenoiser`'s output. Upstream
+  // selects `SimpleDenoiser` by PIPELINE (distilled.py:266,295) rather than by
+  // params; the two agree here because the recipes that select it are exactly
+  // the recipes whose guidance is the no-op one.
+  struct PhaseGuidance {
+    Ltx2MultiModalGuiderParams video;
+    Ltx2MultiModalGuiderParams audio;
+  };
+  std::vector<PhaseGuidance> phase_guidance(recipe.phases.size());
+  bool wants_negative = false;
+  bool wants_perturbation = false;
+  for (size_t p = 0; p < recipe.phases.size(); ++p) {
+    phase_guidance[p].video = recipe.phases[p].video_guidance;
+    phase_guidance[p].audio = recipe.phases[p].audio_guidance;
+    ApplyGuidanceOverrides(gen.extras, recipe.phases[p], &phase_guidance[p].video,
+                           &phase_guidance[p].audio);
+    if (phase_guidance[p].video.DoUnconditionalGeneration() ||
+        phase_guidance[p].audio.DoUnconditionalGeneration()) {
+      wants_negative = true;
+    }
+    if (phase_guidance[p].video.DoPerturbedGeneration() ||
+        phase_guidance[p].audio.DoPerturbedGeneration() ||
+        phase_guidance[p].video.DoIsolatedModalityGeneration() ||
+        phase_guidance[p].audio.DoIsolatedModalityGeneration()) {
+      wants_perturbation = true;
+    }
+  }
+
+  // REFUSED BY NAME, not degraded. `Ltx2DitForwardDevice` (ltx2_device.h:136)
+  // takes no `perturbations` argument, so the perturbed and isolated-modality
+  // passes on the device arm would run an UNPERTURBED forward — a finite clip
+  // whose `stg_scale * (cond - perturbed)` and `(modality_scale - 1) * (cond -
+  // mod)` terms are identically zero, and which is indistinguishable from a
+  // working render at every output this engine has. Classifier-free guidance
+  // alone is a different CONTEXT and no perturbation, so it is served on both
+  // arms.
+  if (im.on_device && wants_perturbation) {
+    Fail("this render's guidance needs a PERTURBED forward (STG, or the isolated-modality pass "
+         "that `modality_scale != 1.0` selects) and `Ltx2DitForwardDevice` takes no "
+         "`perturbations` argument, so the device-resident arm cannot run one. Refusing rather "
+         "than running an unperturbed forward, which would leave the STG and modality terms "
+         "exactly zero and render. Set '" +
+         std::string(kLtx2VideoStgScaleExtra) + "' and '" +
+         std::string(kLtx2AudioStgScaleExtra) + "' to 0.0 and '" +
+         std::string(kLtx2A2vGuidanceScaleExtra) + "' and '" +
+         std::string(kLtx2V2aGuidanceScaleExtra) +
+         "' to 1.0 to run classifier-free guidance alone on this arm, or load with device 0. "
+         "Owed by row LTX25-GUIDED-VIDEO (#1092).");
+  }
+
+  // The second half of upstream's ONE `PromptEncoder` call over
+  // `[prompt, negative_prompt]` (ti2vid_one_stage.py:166-174). Encoded ONLY when
+  // a guider asks: `do_unconditional_generation` is `not isclose(cfg_scale, 1.0)`
+  // (guiders.py:275-277), and at 1.0 there is no unconditional forward, so
+  // encoding it would be a wasted host-side 12B pass per request.
+  std::vector<float> negative_video, negative_audio;
+  const float* negative_video_context = nullptr;
+  const float* negative_audio_context = nullptr;
+  if (wants_negative) {
+    if (!im.negative_video_prompt_embeds.empty() && gen.prompt.empty()) {
+      // The embeds fallback's own second half. Taken only when the request
+      // carries no prompt, which is the same polarity the POSITIVE fallback has
+      // above: a typed prompt encodes both halves through the tower.
+      if (im.prompt_tokens != context_tokens) {
+        Fail("the negative prompt embeds hold " + std::to_string(im.prompt_tokens) +
+             " rows and this request's conditioning holds " + std::to_string(context_tokens) +
+             "; the guidance delta would subtract tensors that do not correspond");
+      }
+      negative_video_context = im.negative_video_prompt_embeds.data();
+      negative_audio_context = im.negative_audio_prompt_embeds.data();
+    } else if (!im.has_encoder) {
+      Fail("this render needs an unconditional forward (the video cfg scale is " +
+           std::to_string(phase_guidance[0].video.cfg_scale) + " and the audio one is " +
+           std::to_string(phase_guidance[0].audio.cfg_scale) +
+           "), which needs the NEGATIVE prompt encoded — and no text tower is loaded. The "
+           "positive `prompt_embeds_path` fallback carries ONE conditioning pair; supply the "
+           "second through '" +
+           std::string(kLtx2NegativePromptEmbedsExtra) + "' and '" +
+           std::string(kLtx2NegativeAudioPromptEmbedsExtra) +
+           "', load with encoder_path, or set '" + std::string(kLtx2VideoCfgScaleExtra) +
+           "' and '" + std::string(kLtx2AudioCfgScaleExtra) +
+           "' to 1.0, which turns the unconditional pass off (guiders.py:275-277)");
+    } else {
+      const std::string negative =
+          VideoExtra(gen.extras, kLtx2NegativePromptExtra, recipe.negative_prompt);
+      if (negative.empty()) {
+        Fail("this render needs a negative prompt and neither the '" +
+             std::string(kLtx2NegativePromptExtra) +
+             "' extra nor the recipe carries one. An EMPTY negative prompt is not the same as no "
+             "CFG: it still encodes and still steers, and upstream's CLI always supplies "
+             "`DEFAULT_NEGATIVE_PROMPT` (utils/args.py:937-946)");
+      }
+      if (!recipe.allow_negative_prompt) {
+        Fail("this recipe takes no negative prompt (`prompts_to_encode` is `[prompt]` alone), so "
+             "a guider asking for the unconditional forward is a contradiction rather than a "
+             "request this engine can serve");
+      }
+      vt::Queue text_queue{vt::Device{vt::DeviceType::kCPU, 0}, nullptr};
+      const Ltx2PromptConditioning encoded = Ltx2EncodePromptToConditioning(
+          *im.tower, *im.tokenizer, im.gemma_ids, im.caption_projections, im.feature_cfg,
+          negative, text_queue);
+      negative_video = encoded.conditioning.video;
+      negative_audio = encoded.conditioning.audio;
+      if (encoded.seq != context_tokens) {
+        // Upstream's two encodings come from ONE tokenization of a two-element
+        // list, so they share a padded width by construction. A mismatch means
+        // the two ran different geometries and the guidance delta would subtract
+        // tensors that do not correspond.
+        Fail("the negative prompt encoded to " + std::to_string(encoded.seq) +
+             " context rows and the prompt to " + std::to_string(context_tokens) +
+             "; upstream encodes both in one call and they cannot differ");
+      }
+      if (im.has_connector) {
+        const Ltx2ConnectorEmbeddings through =
+            RunConnector(SafetensorsFile::Open(im.params.dit_path), im.video_connector_cfg,
+                         im.audio_connector_cfg, encoded.conditioning.video,
+                         encoded.conditioning.audio, encoded.conditioning.additive_mask,
+                         context_tokens);
+        negative_video = through.video;
+        negative_audio = through.audio;
+      }
+      negative_video_context = negative_video.data();
+      negative_audio_context = negative_audio.data();
+    }
   }
 
   for (int64_t phase_index = 0; phase_index <= last_phase; ++phase_index) {
@@ -2927,14 +3376,98 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
            phase.name + "'), so a `steps` override is refused rather than applied");
     }
 
-    // ── the denoise loop (samplers.py:39-79 / :488-558) ─────────────────────
-    // The ancestral arm's loop generator is seeded from the pipeline seed plus
-    // the recipe's own offset (distilled.py:69-73, :177-183) — a separate stream
-    // from the state noise, so its first draw is not the initial latent's.
-    SplitMixGaussian loop_noise(seed + static_cast<uint64_t>(phase.noise_seed_offset));
-    const int64_t sigma_count = static_cast<int64_t>(sigmas.size());
-    for (int64_t step = 0; step + 1 < sigma_count; ++step) {
-      const float sigma = sigmas[static_cast<size_t>(step)];
+    // This phase's two guiders, resolved once. `GuidedDenoiser` is constructed
+    // per stage upstream and holds its guiders for the whole loop
+    // (ti2vid_one_stage.py:221-226, ti2vid_two_stages_hq.py:271-281), so
+    // resolving them per step would let a request override change meaning
+    // halfway down a schedule.
+    const Ltx2MultiModalGuiderParams& video_guidance =
+        phase_guidance[static_cast<size_t>(phase_index)].video;
+    const Ltx2MultiModalGuiderParams& audio_guidance =
+        phase_guidance[static_cast<size_t>(phase_index)].audio;
+    if (phase_index == 0) {
+      im.trace.video_guidance_cfg_scale = video_guidance.cfg_scale;
+      im.trace.video_guidance_stg_scale = video_guidance.stg_scale;
+      im.trace.video_guidance_rescale_scale = video_guidance.rescale_scale;
+      im.trace.video_guidance_modality_scale = video_guidance.modality_scale;
+    }
+
+    // `_last_denoised_video` / `_last_denoised_audio` (denoisers.py:274-275):
+    // per DENOISER, so per phase, and empty until the first step fills them. A
+    // skipped step reuses them instead of running a forward.
+    std::vector<float> last_denoised_video;
+    std::vector<float> last_denoised_audio;
+    // Phase 0's FIRST evaluation is what `RecordFirstGuidedStep` describes. On
+    // the first-order arm that is step 0, which is what this was before the
+    // res_2s loop existed; on the res_2s arm it is the first of that step's TWO
+    // evaluations (samplers.py:301), because the second one runs over a midpoint
+    // state and at a substep sigma and would describe a different call.
+    // AND THE SECOND EVALUATION IS RECORDED SEPARATELY, which is why this is a
+    // counter rather than a bool. The res_2s substep runs over `x_mid`, a state
+    // that never becomes the stream's own latent (samplers.py:369-378), so the
+    // x0 conversion there is the one place in this file where "the latent" and
+    // "the latent this evaluation was handed" are different tensors. MEASURED:
+    // with the conversion reading `video.latent` instead, the whole
+    // `test_ltx2_video` suite stayed GREEN at 74 cases and 2234 assertions —
+    // the clip, the counts, the eval sigmas and the bong count are all blind to
+    // it, because the loop's own arithmetic is gated with a FIXTURE denoiser and
+    // the engine's conversion is not in that loop.
+    int64_t phase_evaluation_index = 0;
+
+    // ── ONE EVALUATION, SHARED BY EVERY SAMPLER ─────────────────────────────
+    //
+    // Upstream's samplers all take a `Denoiser` callable and never reach for a
+    // model (samplers.py:213-214, :45), which is why the loops differ only in
+    // how many times, at which sigmas and at which step indices they call it.
+    // This lambda is that callable, and BOTH arms below go through it: the
+    // first-order loop calls it once per step, `Ltx2Res2sDenoisingLoop` calls it
+    // twice per step plus once at the end.
+    //
+    // AND IT IS THE GUIDED DENOISER, on both arms. Upstream's HQ stage 1 hands
+    // `res2s_audio_video_denoising_loop` a `GuidedDenoiser`
+    // (ti2vid_two_stages_hq.py:271-281, :292) exactly as the one-stage pipeline
+    // hands its Euler loop one (ti2vid_one_stage.py:221-226), so the sampler
+    // decides HOW MANY denoiser calls happen and the denoiser decides how many
+    // forwards each call is. Routing res_2s around `Ltx2GuidedDenoise` would
+    // make the HQ preset the only unguided video arm in the tree — a plausible
+    // clip at cfg 1.0 where the preset was tuned at 3.0 — and the evaluation
+    // count, which is what this row's gate reads, would not move by one.
+    //
+    // Hoisted rather than duplicated because a second forward path written by
+    // hand would be a second place to forget the keyframe marker, the frozen
+    // scalar sigma or the device/host split — and every one of those omissions
+    // renders a finished clip. It also makes `dit_evaluations` a single
+    // increment that no arm can bypass.
+    //
+    // It takes the latent as an ARGUMENT rather than reading `video.latent`,
+    // because the res_2s loop's second evaluation runs over a MIDPOINT state
+    // that never becomes the stream's own latent (samplers.py:369-378).
+    //
+    // `sigma` is a `double` on the way in and narrows here. That narrowing is
+    // upstream's own boundary rather than a shortcut: `Modality.sigma` reaches
+    // the DiT as a tensor of the model's dtype, and this port's
+    // `Ltx2ModalityInput::sigma` is a `const float*`. The res_2s substep sigma
+    // is float64 up to this line (samplers.py:315, :384) and float32 after it.
+    //
+    // `step_index` IS THE DENOISER'S OWN ARGUMENT, not the sampler's loop
+    // counter. Upstream's `Denoiser` signature is
+    // `denoiser(transformer, video_state, audio_state, sigmas, step_index)`, and
+    // the res_2s loop passes THREE different values for it: `step_idx` at the
+    // first evaluation (samplers.py:301), a literal `0` at the substep
+    // evaluation beside a one-element schedule (samplers.py:384-385), and
+    // `n_full_steps` at the terminal one (samplers.py:437). It is read by
+    // `should_skip_step` (`step % (skip_step + 1) != 0`, guiders.py:287-291), so
+    // the substep evaluation is NEVER skipped whatever `skip_step` is. That is
+    // inert on the HQ preset, whose `skip_step` is 0 (constants.py:104, :112),
+    // and it is NOT inert for a request that sets `video_skip_step`. Passing the
+    // loop counter here instead would skip half of a res_2s step's evaluations
+    // on such a request and render at the first-order method's cost with the
+    // second-order sampler's schedule.
+    const auto Evaluate = [&](const std::vector<float>& v_latent,
+                              const std::vector<float>& a_latent, double sigma_hp,
+                              int64_t step_index, std::vector<float>& v_denoised,
+                              std::vector<float>& a_denoised) {
+      const float sigma = static_cast<float>(sigma_hp);
       const std::vector<float> v_timesteps = TimestepsFromMask(video, sigma);
       const std::vector<float> a_timesteps = TimestepsFromMask(audio, sigma);
       // The SECOND half of upstream's `frozen` on the VIDEO side
@@ -2952,7 +3485,7 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
       vin.batch = 1;
       vin.tokens = video.tokens;
       vin.context_tokens = context_tokens;
-      vin.latent = video.latent.data();
+      vin.latent = v_latent.data();
       vin.timesteps = v_timesteps.data();
       vin.sigma = &sigma_row;
       vin.positions = video.positions.data();
@@ -3010,7 +3543,7 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
       ain.batch = 1;
       ain.tokens = audio.tokens;
       ain.context_tokens = context_tokens;
-      ain.latent = audio.latent.data();
+      ain.latent = a_latent.data();
       ain.timesteps = a_timesteps.data();
       // The SECOND half of upstream's `frozen` (utils/types.py:104-106): the
       // per-modality scalar sigma is forced to 0, "not only per-token
@@ -3029,51 +3562,281 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
       ain.positions = audio.positions.data();
       ain.context = audio_context;
 
+      // ── the X0 MODEL (model.py:590-604), and the guided denoiser ──────────
+      //
+      // `DiffusionStage` never hands the loop the raw velocity model: it hands
+      // `X0Model(builder.build(...))` (utils/blocks.py:480-482, the forward it
+      // wraps at ltx-core model/transformer/model.py:590-604). So `to_denoised`
+      // belongs HERE, inside the wrapper, applied to EVERY pass on its way out of
+      // the forward — and the guider downstream combines already-denoised
+      // tensors. Converting once after the guider instead is a DIFFERENT function
+      // wherever `rescale_scale != 0` (guiders.py:268-271), which is 0.7 on every
+      // video row of the params table. That defect shipped on the audio arm of
+      // this tree and is #1039.
+      //
       // One graph, two residencies. On the CPU this is the L2 parity forward in
       // its declared f32; on an accelerator it is the phase-L8 device-resident
       // forward over the bf16 the DiT was STAGED at, and the two agree on
-      // everything but where the bytes live and how wide they are.
-      const Ltx2DitOutputs velocity =
-          im.on_device ? Ltx2DitForwardDevice(*im.queue, im.dit.params, im.dit.weights, &vin,
-                                              &ain, im.compute_dtype)
-                       : Ltx2DitForward(im.device, im.dit.params, im.dit.weights, &vin, &ain,
-                                        im.compute_dtype);
+      // everything but where the bytes live and how wide they are. The device
+      // forward takes no `perturbations`, which is why a guider that asks for the
+      // perturbed or isolated-modality pass on that arm is refused before the
+      // loop rather than served an unperturbed forward.
+      const Ltx2X0Model x0_model = [&](const Ltx2ModalityInput* v, const Ltx2ModalityInput* a,
+                                       const Ltx2DitPerturbation* p) {
+        // The refusal above is a statement about the RECIPE; this is a statement
+        // about the CALL, and the two are not the same check. A pass that reached
+        // here with a perturbation on the device arm would have it silently
+        // dropped by the argument list below, which is the shape of defect this
+        // file keeps finding: correct output for the wrong reason, with the STG
+        // and modality terms at exactly zero and nothing in the frames, the
+        // shapes or the counts to show for it.
+        VT_CHECK(!im.on_device || p == nullptr,
+                 "ltx2 video: a perturbed forward reached the device-resident arm, where "
+                 "`Ltx2DitForwardDevice` has no `perturbations` argument to take it. The guidance "
+                 "resolution refuses this before the loop, so reaching it is a defect rather than "
+                 "a bad request. Owed by row LTX25-GUIDED-VIDEO (#1092).");
+        const Ltx2DitOutputs velocity =
+            im.on_device ? Ltx2DitForwardDevice(*im.queue, im.dit.params, im.dit.weights, v, a,
+                                                im.compute_dtype)
+                         : Ltx2DitForward(im.device, im.dit.params, im.dit.weights, v, a,
+                                          im.compute_dtype, /*cache=*/nullptr, p);
+        // EVERY ACTUAL DiT FORWARD IS COUNTED HERE, and that is a different
+        // number from `dit_evaluations` one level up. One denoiser evaluation is
+        // one to four forwards (cond, uncond, ptb, mod — denoisers.py:100-137),
+        // so the two counters answer two questions that no output can: WHICH
+        // SAMPLER ran, and WHETHER THE ARM WAS GUIDED. An unguided HQ render
+        // keeps `dit_evaluations` at 2n+1 and drops this one from 3(2n+1) to
+        // 2n+1, and nothing else about the clip changes.
+        im.trace.dit_forwards += 1;
+        Ltx2X0Outputs out;
+        out.video_velocity = velocity.video;
+        out.audio_velocity = velocity.audio;
+        // The PER-TOKEN timesteps, not the schedule scalar: a conditioned token
+        // sits at timestep 0 and using the scalar there re-noises it.
+        //
+        // AND THE LATENT IS THE ONE THIS EVALUATION WAS HANDED, not the stream's
+        // own. They are the same tensor on the first-order arm and on the res_2s
+        // first evaluation, and they are NOT the same on the res_2s substep
+        // evaluation, which runs over `x_mid` (samplers.py:369-378). Reading
+        // `video.latent` here would convert the substep's velocity against the
+        // wrong sample and still return a finite, correctly shaped prediction.
+        out.video = ToDenoised(v_latent, velocity.video, v_timesteps, video.tokens, video.width);
+        out.audio = ToDenoised(a_latent, velocity.audio, a_timesteps, audio.tokens, audio.width);
+        return out;
+      };
 
-      const std::vector<float> v_denoised = PostProcessLatent(
-          ToDenoised(video.latent, velocity.video, v_timesteps, video.tokens, video.width), video);
-      const std::vector<float> a_denoised = PostProcessLatent(
-          ToDenoised(audio.latent, velocity.audio, a_timesteps, audio.tokens, audio.width), audio);
+      Ltx2GuidedDenoiseInputs denoise_in;
+      denoise_in.video = &vin;
+      denoise_in.audio = &ain;
+      denoise_in.video_negative_context = negative_video_context;
+      denoise_in.audio_negative_context = negative_audio_context;
+      denoise_in.video_guider = video_guidance;
+      denoise_in.audio_guider = audio_guidance;
+      denoise_in.num_blocks = im.dit.params.num_layers;
+      denoise_in.step_index = step_index;
+      denoise_in.last_denoised_video = &last_denoised_video;
+      denoise_in.last_denoised_audio = &last_denoised_audio;
+      const Ltx2GuidedDenoiseResult guided = Ltx2GuidedDenoise(x0_model, denoise_in);
 
-      const bool terminal = sigmas[static_cast<size_t>(step + 1)] == 0.0F;
-      if (phase.stepper == Ltx2StepperKind::kEulerAncestral) {
-        if (terminal) {
-          // samplers.py:545-547 — the terminal step IS the denoised prediction;
-          // taking an ancestral step there would re-noise the finished latent.
-          video.latent = v_denoised;
-          audio.latent = a_denoised;
-          continue;
+      // THE ONE PLACE A DENOISER EVALUATION IS COUNTED. Every sampler reaches
+      // it, so a build that ran the wrong number of them cannot report the right
+      // count. This is the only observable that separates the res_2s sampler
+      // from the first-order one — the clip, its shape, its frame count, its
+      // sample rate and its file size are identical between them — which is why
+      // it is a counter rather than a comment. `dit_forwards` inside the x0
+      // model above is the other half: this one counts CALLS, that one counts
+      // FORWARDS, and only the second moves when guidance is dropped.
+      im.trace.dit_evaluations += 1;
+
+      // `last_denoised_*` keeps what the GUIDER returned, before the
+      // post-process, because that is what `_last_denoised_video` holds
+      // (denoisers.py:299-300) and what a skipped step reuses.
+      last_denoised_video = guided.video_denoised;
+      last_denoised_audio = guided.audio_denoised;
+
+      if (phase_index == 0 && phase_evaluation_index == 0) {
+        // `stepper_input` is the POST-PROCESSED prediction, which is what both
+        // samplers hand their stepper: the first-order loop through
+        // `_step_state` (samplers.py:35) and the res_2s loop at :305. Computed
+        // here rather than taken from the caller so the res_2s arm, whose
+        // post-process runs inside the sampler at f64, records the same quantity
+        // the Euler arm does.
+        RecordFirstGuidedStep(&im.trace, guided, v_latent, v_timesteps,
+                              static_cast<double>(sigma),
+                              PostProcessLatent<float>(guided.video_denoised, video));
+      }
+      // THE SUBSTEP EVALUATION, whose x0 conversion has no other observable.
+      // Recorded on the res_2s arm alone, because on a first-order arm the
+      // second evaluation is just step 1 and `video_first_*` already describes
+      // the shape. See `res2s_substep_*` in ltx2_video.h.
+      if (phase_index == 0 && phase_evaluation_index == 1 &&
+          phase.stepper == Ltx2StepperKind::kRes2s) {
+        const size_t cond = static_cast<size_t>(Ltx2DenoisePass::kCond);
+        im.trace.res2s_substep_latent = v_latent;
+        im.trace.res2s_substep_timesteps = v_timesteps;
+        im.trace.res2s_substep_cond = guided.video_pass[cond];
+        im.trace.res2s_substep_cond_velocity = guided.video_pass_velocity[cond];
+        im.trace.res2s_substep_sigma = static_cast<double>(sigma);
+      }
+      phase_evaluation_index += 1;
+
+      // RAW, not post-processed. `post_process_latent` belongs to the SAMPLER
+      // upstream, not to the denoiser: the first-order loop applies it inside
+      // `_step_state` (samplers.py:35) and the res_2s loop applies it at four
+      // separate points (:305, :390, :203, :441), one of which is after an SDE
+      // injection rather than after an evaluation. Folding it in here would put
+      // it in three of those four places and silently drop the fourth.
+      v_denoised = guided.video_denoised;
+      a_denoised = guided.audio_denoised;
+    };
+
+    // ── the denoise loop ────────────────────────────────────────────────────
+    // The ancestral arm's loop generator is seeded from the pipeline seed plus
+    // the recipe's own offset (distilled.py:69-73, :178-184) — a separate stream
+    // from the state noise, so its first draw is not the initial latent's.
+    SplitMixGaussian loop_noise(seed + static_cast<uint64_t>(phase.noise_seed_offset));
+    const int64_t sigma_count = static_cast<int64_t>(sigmas.size());
+
+    if (phase.stepper == Ltx2StepperKind::kRes2s) {
+      // ── the res_2s second-order sampler (samplers.py:208-447) ─────────────
+      //
+      // Row LTX25-RES2S-LOOP, issue #921. `TI2VidTwoStagesHQPipeline` passes
+      // `loop=res2s_audio_video_denoising_loop` to BOTH of its stages
+      // (ti2vid_two_stages_hq.py:292, :335), and this is that loop.
+      //
+      // THE PARAMETERS ARE THE LOOP'S OWN DEFAULTS, DELIBERATELY.
+      // `DiffusionStage.__call__` hands the loop six keyword arguments and no
+      // others (utils/blocks.py:566-573), so nothing on the HQ path overrides
+      // eta, bongmath, the iteration cap, the noise function or the seeds.
+      // Passing anything else here would be this port inventing a knob.
+      //
+      // THE SEEDS ARE CONSTANTS AND NOT `seed`. `noise_seed` defaults to -1
+      // (samplers.py:215) and the substep stream to -1 + 10000
+      // (samplers.py:265-266), so the res_2s SDE injections do not depend on the
+      // request's seed at all — the initial latent still does, through the
+      // noiser. The ancestral arm one branch up does the opposite. Mirrored
+      // rather than made consistent, because consistency here would be a
+      // divergence.
+      SplitMixGaussian res2s_step_noise(static_cast<uint64_t>(kLtx2Res2sNoiseSeed));
+      SplitMixGaussian res2s_substep_noise(
+          static_cast<uint64_t>(kLtx2Res2sNoiseSeed + kLtx2Res2sNoiseSeedSubstepOffset));
+
+      Ltx2Res2sHooks hooks;
+      hooks.denoise = Evaluate;
+      hooks.post_process = [&](std::vector<double> x, bool is_video) {
+        return PostProcessLatent<double>(x, is_video ? video : audio);
+      };
+      // `_get_new_noise` (samplers.py:164-170): draw, then normalize. The DRAW
+      // is this port's `SplitMixGaussian` rather than upstream's seeded
+      // `torch.randn`, so the stream differs — as it already does on the
+      // shipped ancestral arm — and only the normalization is mirrored. Which
+      // NOISE FUNCTION each loop uses is mirrored too, and the two loops do not
+      // agree: the ancestral one defaults to the un-normalized
+      // `_get_plain_noise` (samplers.py:574).
+      hooks.new_noise = [&](int64_t count, bool /*is_video*/, bool substep) {
+        SplitMixGaussian& stream = substep ? res2s_substep_noise : res2s_step_noise;
+        const std::vector<float> raw = stream.Draw(count);
+        std::vector<double> noise =
+            Ltx2Res2sNormalizeNoise(std::vector<double>(raw.begin(), raw.end()));
+        // OBSERVED, not asserted in prose. Whether this hook normalizes is
+        // invisible in the rendered clip, the token count and the evaluation
+        // count alike, and a build that returned `raw` here left the whole
+        // end-to-end suite green. See `res2s_noise_moment_error`.
+        double mean = 0.0;
+        for (const double v : noise) mean += v;
+        mean /= static_cast<double>(noise.size());
+        double sq = 0.0;
+        for (const double v : noise) sq += (v - mean) * (v - mean);
+        const double sd = std::sqrt(sq / static_cast<double>(noise.size() - 1));
+        im.trace.res2s_noise_moment_error = std::max(
+            im.trace.res2s_noise_moment_error, std::max(std::fabs(mean), std::fabs(sd - 1.0)));
+        return noise;
+      };
+
+      Ltx2Res2sModality res2s_video{video.latent, true};
+      Ltx2Res2sModality res2s_audio{audio.latent, true};
+      // TWO INDEPENDENT COUNTERS, and the check below is only worth running
+      // because they are independent. `stats.evaluations` is the LOOP's own
+      // count; `im.trace.dit_evaluations` is incremented inside `Evaluate`, i.e.
+      // by the ENGINE, once per call the loop actually made. This delta is what
+      // makes the comparison an observation rather than an identity: the
+      // previous form of this check compared `stats.evaluations` against
+      // `stats.full_steps`, both fields of the same struct, and `2n + 1 > n`
+      // holds for every n >= 1, so it could not fail for any build.
+      const int64_t evaluations_before = im.trace.dit_evaluations;
+      const Ltx2Res2sLoopStats stats =
+          Ltx2Res2sDenoisingLoop(sigmas, res2s_video, res2s_audio, hooks);
+      video.latent = std::move(res2s_video.latent);
+      audio.latent = std::move(res2s_audio.latent);
+      const int64_t engine_evaluations = im.trace.dit_evaluations - evaluations_before;
+      VT_CHECK(engine_evaluations == stats.evaluations,
+               "ltx2 video: the res_2s loop reports " + std::to_string(stats.evaluations) +
+                   " denoiser evaluations and the engine counted " +
+                   std::to_string(engine_evaluations) + ". The loop counts its own calls and the "
+                   "engine counts the ones that reached `Evaluate`, so a disagreement means a "
+                   "call was made without reaching the shared evaluation — the one place the "
+                   "keyframe marker, the frozen scalar sigma, the guided denoiser and the "
+                   "host/device split are all applied.");
+      VT_CHECK(engine_evaluations > stats.full_steps,
+               "ltx2 video: the res_2s sampler evaluates the denoiser TWICE per step plus once at "
+               "a terminal zero sigma (samplers.py:301, :380-386, :437), so the engine cannot "
+               "count as many evaluations as the loop has steps. A count at or below the step "
+               "count means the second evaluation was skipped, which renders a finished, "
+               "correctly sized, plausible clip at half the model evaluations the HQ preset was "
+               "tuned for.");
+      im.trace.res2s_bong_steps += stats.bong_steps;
+    } else {
+      for (int64_t step = 0; step + 1 < sigma_count; ++step) {
+        const float sigma = sigmas[static_cast<size_t>(step)];
+        std::vector<float> v_raw, a_raw;
+        // `step` IS the denoiser's `step_index` on this arm — upstream's
+        // first-order loop passes its own loop counter straight through
+        // (samplers.py:45, :503) — which is what `should_skip_step` reads.
+        Evaluate(video.latent, audio.latent, static_cast<double>(sigma), step, v_raw, a_raw);
+        // `_step_state` (samplers.py:35) blends before it steps.
+        const std::vector<float> v_denoised = PostProcessLatent<float>(v_raw, video);
+        const std::vector<float> a_denoised = PostProcessLatent<float>(a_raw, audio);
+
+        const bool terminal = sigmas[static_cast<size_t>(step + 1)] == 0.0F;
+        if (phase.stepper == Ltx2StepperKind::kEulerAncestral) {
+          if (terminal) {
+            // samplers.py:545-547 — the terminal step IS the denoised
+            // prediction; taking an ancestral step there would re-noise the
+            // finished latent.
+            video.latent = v_denoised;
+            audio.latent = a_denoised;
+            if (phase_index == 0 && step == 0) im.trace.video_first_next_latent = video.latent;
+            continue;
+          }
+          const std::vector<float> v_noise =
+              loop_noise.Draw(static_cast<int64_t>(video.latent.size()));
+          const std::vector<float> a_noise =
+              loop_noise.Draw(static_cast<int64_t>(audio.latent.size()));
+          video.latent = PostProcessLatent<float>(
+              Ltx2EulerAncestralStep(video.latent.data(), v_denoised.data(), sigmas.data(),
+                                     sigma_count, step,
+                                     static_cast<int64_t>(video.latent.size()),
+                                     phase.stepper_eta, phase.stepper_s_noise, v_noise.data()),
+              video);
+          audio.latent = PostProcessLatent<float>(
+              Ltx2EulerAncestralStep(audio.latent.data(), a_denoised.data(), sigmas.data(),
+                                     sigma_count, step,
+                                     static_cast<int64_t>(audio.latent.size()),
+                                     phase.stepper_eta, phase.stepper_s_noise, a_noise.data()),
+              audio);
+        } else {
+          video.latent = Ltx2EulerStep(video.latent.data(), v_denoised.data(), sigmas.data(),
+                                       sigma_count, step,
+                                       static_cast<int64_t>(video.latent.size()));
+          audio.latent = Ltx2EulerStep(audio.latent.data(), a_denoised.data(), sigmas.data(),
+                                       sigma_count, step,
+                                       static_cast<int64_t>(audio.latent.size()));
         }
-        const std::vector<float> v_noise =
-            loop_noise.Draw(static_cast<int64_t>(video.latent.size()));
-        const std::vector<float> a_noise =
-            loop_noise.Draw(static_cast<int64_t>(audio.latent.size()));
-        video.latent = PostProcessLatent(
-            Ltx2EulerAncestralStep(video.latent.data(), v_denoised.data(), sigmas.data(),
-                                   sigma_count, step, static_cast<int64_t>(video.latent.size()),
-                                   phase.stepper_eta, phase.stepper_s_noise, v_noise.data()),
-            video);
-        audio.latent = PostProcessLatent(
-            Ltx2EulerAncestralStep(audio.latent.data(), a_denoised.data(), sigmas.data(),
-                                   sigma_count, step, static_cast<int64_t>(audio.latent.size()),
-                                   phase.stepper_eta, phase.stepper_s_noise, a_noise.data()),
-            audio);
-      } else {
-        video.latent = Ltx2EulerStep(video.latent.data(), v_denoised.data(), sigmas.data(),
-                                     sigma_count, step,
-                                     static_cast<int64_t>(video.latent.size()));
-        audio.latent = Ltx2EulerStep(audio.latent.data(), a_denoised.data(), sigmas.data(),
-                                     sigma_count, step,
-                                     static_cast<int64_t>(audio.latent.size()));
+        // What the sampler WROTE, recorded after the step rather than derived
+        // from what was recorded before it. It is the only observable that says
+        // which tensor the stepper was actually handed: a second `ToDenoised` on
+        // the way in leaves every other recorded field untouched.
+        if (phase_index == 0 && step == 0) im.trace.video_first_next_latent = video.latent;
       }
     }
 
