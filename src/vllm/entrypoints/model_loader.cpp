@@ -1254,6 +1254,51 @@ vllm::v1::AsyncLLM& LoadedEngine::async_engine() {
 
 std::unique_ptr<LoadedEngine> LoadedEngine::FromModelDir(
     const std::string& model_dir, const EngineParams& params) {
+  // ENG-RESIDENCY-CONFIG (#1110): install the host-RAM -> DISK residency config
+  // FIRST — before the offloader below, before the device resolution, before any
+  // path or weight operation.
+  //
+  // The ordering is the whole requirement, not tidiness. Each knob this config
+  // feeds (`VT_GGUF_MMAP`, `VT_GGUF_PREFAULT`, `VT_MOE_EXPERT_STREAM` and its two
+  // sizes) is read during weight load, and the expert-stream decision is cached in
+  // a function-local static that latches on first use. A config installed after
+  // that point would be silently ignored, which is why
+  // `SetWeightResidencyConfig` throws on a late non-empty install rather than
+  // accepting one. It is placed ahead of `CreateWeightOffloader` deliberately:
+  // that call can THROW for a configured-but-unwired backend, and a document
+  // carrying both tiers must still have installed its residency half first.
+  //
+  // Absent (the default, and every caller that predates this row) installs
+  // nothing, so every knob resolves exactly as it did before.
+  if (params.weight_residency.has_value() &&
+      !params.weight_residency->empty()) {
+    vllm::SetWeightResidencyConfig(*params.weight_residency);
+    // ONE line, naming what was installed. Also names any environment variable
+    // that SHADOWS a field of it: the environment deliberately wins (those
+    // variables exist so a benchmark arm is switchable without a restart), and a
+    // document silently overridden by something exported weeks ago is the one way
+    // that precedence hurts. It reports the variable's PRESENCE and not a resolved
+    // value, because resolving here would latch every knob ahead of the load.
+    //
+    // IT READS BACK THE INSTALLED CONFIG, not `params`. That is the difference
+    // between a line that reports what the engine will use and a line that reports
+    // what somebody asked for. Measured: with the line printing from `params`, the
+    // reachability mutation — deleting the `SetWeightResidencyConfig` call above —
+    // left the server-level suite GREEN, because the log and the install were
+    // independent statements. Reading the global back makes the line evidence.
+    const vllm::WeightResidencyConfig& installed =
+        vllm::ActiveWeightResidencyConfig();
+    if (!installed.empty()) {
+      std::cerr << "engine: weight residency (offload_config vllm_cpp): "
+                << installed.Describe() << std::endl;
+      const std::string shadowed = installed.DescribeEnvOverrides();
+      if (!shadowed.empty()) {
+        std::cerr << "engine: weight residency: the environment OVERRIDES the "
+                     "config for "
+                  << shadowed << std::endl;
+      }
+    }
+  }
   // ENG-WEIGHT-OFFLOAD W1: install the weight offloader BEFORE any weight I/O,
   // mirroring vLLM setting the process-global at
   // v1/worker/gpu_model_runner.py:939. `ModelRegistry::Prepare` reads it back

@@ -217,15 +217,48 @@ New tests, each red before its implementation:
   stderr for a `--offload-config` document carrying only a `vllm_cpp` key. This
   is the test the reachability mutation deletes the call site under.
 
+**Two existing suites gain the observable their knob never had.** Both were found
+by the mutation pass, not by reading, and both are gaps that predate this row —
+the old inline `getenv` calls were equally unwatched:
+
+- `tests/vllm/test_gguf_keep_quant.cpp`, the prefault case. With the prefault site
+  mutated to never consult its resolver, `test_gguf_keep_quant` (39/39),
+  `test_gguf_qwen36_loader` (6/6) and `test_gguf_expert_span` (11/11) all stayed
+  GREEN, because byte-transparency is equally true of a prefault that never ran.
+  A span counter (`GgufPrefaultedSpanCount`) is the observable: the operation reads
+  pages and writes nothing, so there is nothing else to see. Its two arms also
+  genuinely differ now that the site no longer latches.
+- `tests/vllm/model_executor/test_expert_stream_mixed_slot.cpp`, the slot count.
+  It set `VT_MOE_EXPERT_STREAM_SLOTS=64`, which is the default, so the value was
+  indistinguishable from the site ignoring the variable — mutating the site to a
+  hardcoded 64 left it green. It now sets a non-default 96 and asserts the geometry
+  the store was built with (`BuiltExpertStreamGeometry`).
+
 ## Gates
 
 Correctness only. This row moves the *source* of a value; it changes no kernel,
 no dtype, no allocation and no token, so it has no throughput axis of its own and
 claims none.
 
-1. Full gate: `cmake --build build -j 8 && ctest -j 6`, exit 0, no case-count
-   regression against the pre-change baseline on the same tree.
-2. The three new suites green with non-zero case counts, each red first.
+1. Full gate, the documented CPU recipe:
+
+   ```sh
+   cmake -S . -B build -G Ninja
+   cmake --build build -j 8
+   ctest --test-dir build -j 6
+   ```
+
+   Exit 0, and no case-count regression against the pre-change baseline taken on
+   the same tree.
+2. The focused suites, by name, green with non-zero case counts, each red first:
+
+   ```sh
+   ./build/tests/test_weight_residency_config
+   ./build/tests/test_weight_residency_reach
+   ./build/tests/test_serve_residency_config
+   ./build/tests/test_gguf_keep_quant
+   ./build/tests/test_expert_stream_mixed_slot
+   ```
 3. Every guarantee mutation-proven: for each added test, delete or invert the
    behavior it names, rebuild, require its suite red with a non-zero case count,
    restore by byte copy and verify by sha256. A mutation that fails to compile is
@@ -291,6 +324,61 @@ a parser nothing reaches.
   and the resolver it calls is named for what it does. Recorded as debt, not
   hidden.
 
+## Evidence
+
+CPU host, documented recipe (`cmake -S . -B build -G Ninja`, no build type, so
+asserts are live), 20 cores. Executables are linked with `-Wl,-s`; that strips
+symbol tables only, and it was needed because the box had 8 GB free at the time.
+
+**Red first.** Every declaration in the new header was stubbed — parser returns an
+empty config, install records nothing, every resolver ignores the config — and the
+three suites were built and run against it. All three RED for the intended reason,
+with non-zero case counts: `test_weight_residency_config` rc 1, 11 cases / 1
+passed / 10 failed, 111 assertions / 53 failed; `test_weight_residency_reach` rc
+1, 4 cases / 3 failed; `test_serve_residency_config` rc 1, 5 cases / 3 failed.
+Then the real implementation was restored (sha256
+`fa1373d2e6acf2ead050bd1a435dafa52abe3351263e0d0be09068d1aa45103a`, verified),
+rebuilt, and all three went GREEN.
+
+**Mutations.** Each applied alone, the file's sha256 printed before and after so a
+never-applied edit cannot read as a pass, the build's own exit status printed
+beside every result so a non-building mutation is INVALID rather than a pass, a
+non-zero doctest case count required, and the tree restored by byte copy from a
+pristine snapshot with the sha256 compared against the pre-mutation value.
+
+| # | Mutation | Result |
+|---|---|---|
+| M1 | delete the install call site in `FromModelDir` (the reachability mutation) | reach RED 5 cases / 2 failed; serve RED 5 / 3 |
+| M2 | the server flag parses the extension and drops it | serve RED 5 / 3 |
+| M3 | the C ABI parses the extension and drops it | reach RED 5 / 1 |
+| M4 | unknown-key refusal removed (ignore them, as the mirrored parser does) | config RED 11 / 1; reach RED 5 / 1; serve RED 5 / 1 |
+| M5 | precedence inverted (config beats the environment) | config RED 11 / 2; reach RED 5 / 1 |
+| M6 | the late-install throw removed (accept and silently ignore) | config RED 11 / 2 |
+| M7 | the expert-stream first-character rule normalised onto whole-value | config RED 11 / 1 |
+| M8 | `ResolveGgufMmap` drops the config half | config RED 11 / 1; reach RED 5 / 1 |
+| M9 | `ResolveGgufPrefault` drops the config half | config RED 11 / 1 |
+| M10 | a non-positive `slots`/`slot_bytes` is accepted instead of refused | config RED 11 / 1; reach RED 5 / 1 |
+| M11 | the mmap SITE reverts to `EnvOnOr`, bypassing the resolver | reach RED 5 / 1 (`test_gguf_keep_quant` GREEN, it has no config arm) |
+| M12 | the prefault SITE never consults its resolver | **first run GREEN across three suites** (39/39, 6/6, 11/11); RED 39 / 1 after the span counter was added |
+| M13 | the expert-stream SITE hardcoded off | `test_expert_stream_mixed_slot` RED 1 / 1 |
+| M14 | the slot-count SITE hardcoded to the default 64 | **first run GREEN** 1/1; RED 1 / 1 after the suite was moved to a non-default 96 and made to assert the built geometry |
+| M15 | the slot-bytes SITE bypasses its resolver | GREEN, and correctly so: with neither the variable nor the config set the resolver returns the caller's computed default, so the mutation is behaviour-identical. The defect-detecting forms are M10 and M16 |
+| M16 | `ResolveExpertStreamSlots` drops the config half | config RED 11 / 1 |
+
+M1, M12 and M14 were findings rather than confirmations, and each was repaired in
+this change rather than recorded: the log line now reads the installed global back
+instead of `params`, the prefault gained a span counter, and the mixed-slot suite
+gained a non-default slot count plus a geometry assertion.
+
+**Focused green.** `test_weight_residency_config` 11 cases / 138 assertions,
+`test_weight_residency_reach` 5 / 39, `test_serve_residency_config` 5 / 55 (1
+skipped, the re-exec'd child), `test_gguf_keep_quant` 39 / 6093,
+`test_expert_stream_mixed_slot` 1 / 181. All rc 0, all case counts read from the
+LAST `test cases:` match so a failing child's summary cannot be mistaken for the
+parent's, and every rc captured directly rather than through a pipe.
+
+**Full gate.** See `## Now`.
+
 ## Owed
 
 - **The measured big-model reproduction.** The headline case
@@ -303,14 +391,11 @@ a parser nothing reaches.
   `ENG-RESIDENCY-CONFIG`, issue
   [#1110](https://github.com/mudler/vllm.cpp/issues/1110).
 - **`GgufLoadPolicy::FromEnv`'s name.** See Risks. Owned by this row.
-- **A positive on-versus-off observation of the prefault.** The tree has never had
-  one. The only prefault case asserts byte-transparency, which holds whether the
-  prefault runs or not, and under the function-local static its second arm could
-  not differ from its first anyway. This row removes the static, so the case's two
-  arms now genuinely differ, and it adds a resolver-level test of the decision —
-  but nothing yet observes the *residency effect* (an `mincore()`-style check over
-  the borrowed pages, as `test_load_direct_upload` already does for the release
-  path). Owned by `ENG-RESIDENCY-CONFIG`, issue
+- **A residency-level observation of the prefault.** The span counter this row
+  added proves the prefault RAN or did not; it does not prove the pages ended up
+  resident. `test_load_direct_upload` already does the harder version with
+  `mincore()` over a host mirror, and the same instrument would apply here. Owned
+  by `ENG-RESIDENCY-CONFIG`, issue
   [#1110](https://github.com/mudler/vllm.cpp/issues/1110).
 
 ## Now

@@ -11,6 +11,36 @@ Unless stated otherwise, a flag-style knob is read as on when its value is a
 non-empty, non-`0`/`false`/`off` string, and the listed default applies when the
 variable is unset. None of these are required to run the engine.
 
+## Five of these are also config keys, and the environment wins
+
+The weight-residency knobs `VT_GGUF_MMAP`, `VT_GGUF_PREFAULT`,
+`VT_MOE_EXPERT_STREAM`, `VT_MOE_EXPERT_STREAM_SLOTS` and
+`VT_MOE_EXPERT_STREAM_SLOT_BYTES` can also be set in the server's JSON config,
+under the `vllm_cpp` key of `--offload-config`. That is the **documented
+deployment surface**; these variables are the **override**:
+
+```text
+environment variable  >  --offload-config's vllm_cpp key  >  built-in default
+```
+
+The polarity is deliberate. These variables exist so a benchmark arm is
+switchable without restarting the server with a new document, so an override that
+could not turn a configured knob back off would be useless. `VT_X=0` therefore
+beats a config `true`, and the engine prints one line at startup naming any
+variable that shadows a field the document set — a configuration silently
+overridden by something exported weeks ago is the one way this precedence hurts.
+
+See [USAGE.md](USAGE.md#streaming-routed-experts-from-disk-capacity-mode) for the
+config form and
+[`.agents/specs/weight-residency-config.md`](../.agents/specs/weight-residency-config.md)
+for why the extension is a namespaced key rather than a field on vLLM's mirrored
+`OffloadConfig`.
+
+`VT_MOE_EXPERT_STREAM_STATS_EVERY` is deliberately **not** a config key. Every
+knob above changes what memory the process reserves or where a weight lives,
+which is a deployment decision; that one changes only how often a diagnostic line
+reaches stderr. It is the instrument, not the configuration.
+
 ## Deployment knobs
 
 These change how the engine runs and have no CLI flag (or complement one).
@@ -46,8 +76,8 @@ the [quantization format table](BUILD.md#quantization-formats).
 | `VT_GGUF_NVFP4_FP4` | on where the device can run the NVFP4 GEMM (CUDA; a CPU build expands) | The NVFP4 analog of `VT_GGUF_KEEP_QUANT`: keep an NVFP4 GGUF's weights in native fp4 residency and run `kMatmulNvfp4`, instead of expanding to BF16. `0` is the same-binary opt-out (expand to BF16); forced off under `VT_CPU_REF` so the oracle load stays byte-identical. See [.agents/specs/gguf-nvfp4-native-compute.md](../.agents/specs/gguf-nvfp4-native-compute.md) |
 | `VT_GGUF_NVFP4_W4A4` | on (only meaningful when `VT_GGUF_NVFP4_FP4` is on) | Selects which of vLLM's two NVFP4 modes the fp4-resident weights compute in: on = true W4A4 (fp4 activations, using the GGUF's `<stem>.input_scale` sidecars, mirroring the sibling compressed-tensors container); `0` = W4A16 (BF16 activations over the fp4 weights). No effect when the fp4 residency is off |
 | `VT_GGUF_KEEP_F16` | on (when weights expand) | Keep F16 GGUF weights in F16 rather than promoting them, an RSS/perf tradeoff |
-| `VT_GGUF_MMAP` | on when weights stay quantized | Keep the GGUF file mmap-resident instead of copying weight bytes into owned buffers, trading RSS for page-cache residency |
-| `VT_GGUF_PREFAULT` | off | Pre-fault the mmap-resident weight pages at load, trading a slower load for steadier first-token latency |
+| `VT_GGUF_MMAP` | on when weights stay quantized | Keep the GGUF file mmap-resident instead of copying weight bytes into owned buffers, trading RSS for page-cache residency. This is what makes a checkpoint larger than host RAM loadable at all: the weights are borrowed from the mapping and never copied. Also settable as `--offload-config`'s `vllm_cpp.mmap.enabled`; this variable overrides it. Forced off under `VT_CPU_REF` regardless, so the oracle load stays byte-identical |
+| `VT_GGUF_PREFAULT` | **on** with mmap residency | Pre-fault the mmap-resident weight pages at load, trading a slower load for steadier first-token latency — without it those first-touch faults land in the TIMED prefill. Unset reads as ENABLED; `0`/`false`/`off` disables it. **Set it off for a model larger than memory**, where prefaulting would read the whole borrowed tower to populate a page cache that cannot hold it. Also settable as `--offload-config`'s `vllm_cpp.mmap.prefault`; this variable overrides it. This row said "off" until 2026-08-17 and the code has always defaulted it on ([#1109](https://github.com/mudler/vllm.cpp/issues/1109)) |
 | `VT_H3_DROP_PAGES` | off (MiniMax-H3 device staging) | Set (to any value) to opt the mapping into page release while streaming the H3 DiT weights to the device, so the read-once file pages do not accumulate against the same unified pool the weights live in. Without it the `DropSpanResidency` calls are no-ops. **Off by default deliberately, not by oversight:** it was enabled once and the load was SIGKILLed early at only ~21 GB peak, which is not a memory ceiling, so it stays gated until that is understood rather than left on by faith |
 | `VT_H3_NVFP4_LOWNIBBLE` | off = swap ON (MiniMax-H3 NVFP4 loaders) | The community `lilcheaty/MiniMax-H3-NVFP4` checkpoint (metadata `converted_by: "Star Ultimate Model Converter Pro"`) packs the two fp4 elements per byte HIGH-first (element 2i in the high nibble) — the opposite of the modelopt standard `DequantNvfp4ToBf16` and the Marlin W4A16 path assume. By DEFAULT the three H3 NVFP4 loaders swap the two nibbles of every packed byte at load, turning the file's high-first bytes into the standard low-first (byte-verified against an independent oracle and the coherent FL2VA GGUF: reading low-first gives elementwise corr 0.000, high-first sign-agreement 1.000 over 115M+ weights). `=1` disables the swap (the pre-fix low-first read) for A/B. H3-scoped: the shared modelopt NVFP4 arms (Laguna / DeepSeek-V4 / Qwen3-32B) are low-first and untouched |
 
@@ -76,10 +106,10 @@ allocated up front and never grown — the engine prints the resolved values as
 
 | Variable | Default | What it does |
 |---|---|---|
-| `VT_MOE_EXPERT_STREAM` | off | `=1` serves routed expert slices from the bounded host slot cache instead of reading them straight out of the mmap'd tower. Read once per process, and only the FIRST character is examined: a value starting with `0`, and an empty value, are off; anything else is on. Only the CPU path streams — on a device platform the expert slice is already device-resident and is served unchanged. Turning it on also **disables the default-on grouped-MoE path** (`VT_QWEN35_GROUPED_MOE`), which stages the whole tower and therefore cannot stream; the engine says so once on stderr rather than silently doing no streaming. Set `VT_MOE_EXPERT_STREAM=0` to keep grouping |
-| `VT_MOE_EXPERT_STREAM_SLOTS` | `64` | How many expert slices stay resident. Parsed as a decimal integer; unset, empty, zero, negative and unparseable values all keep `64`. Every slot acquired during a step is protected from eviction until the step ends, so a budget smaller than one step's working set exhausts the cache: those slices fall back to reading the tower directly, which is correct but slow, and is counted. Sized against a real model this wants to be large — the measured run used `8000` |
-| `VT_MOE_EXPERT_STREAM_SLOT_BYTES` | the LARGEST of the gate/up/down slices of the first MoE layer reached | Bytes reserved per slot, fixed for the process's life. Parsed as a decimal integer; unset, empty, zero, negative and unparseable values all keep the default. The default is the largest of the three slices rather than the first one taken, because a dynamic (UD) quant keeps `down_proj` at a higher precision than the gate/up pair and sizing from a gate slice then refuses the first down slice mid-decode. A slice that still does not fit is refused BY NAME (`vt: expert stream: a slice of N bytes exceeds the slot budget of M; raise VT_MOE_EXPERT_STREAM_SLOT_BYTES`) rather than truncated or silently routed back to the mmap path, so a streaming benchmark cannot quietly measure the mmap path instead |
-| `VT_MOE_EXPERT_STREAM_STATS_EVERY` | `16` | How many decode steps between the expert-stream statistics line on stderr; `0` silences it. Parsed as a decimal integer; unset, empty, negative and unparseable values all keep `16`. The line is `[expert-stream] steps=N hits=H misses=M evictions=E fills=F bytes=B exhausted=X advised=A`. It exists because the row's first published decode figure was measured on a cache that had switched itself off partway through the third token, and nothing in the run could have said so: the process printed one line at startup and none afterwards. **`steps == 0` or `exhausted > 0` means the lane is not streaming**, whatever the startup line claimed |
+| `VT_MOE_EXPERT_STREAM` | off | `=1` serves routed expert slices from the bounded host slot cache instead of reading them straight out of the mmap'd tower. Read once per process, and only the FIRST character is examined: a value starting with `0`, and an empty value, are off; anything else is on. Only the CPU path streams — on a device platform the expert slice is already device-resident and is served unchanged. Turning it on also **disables the default-on grouped-MoE path** (`VT_QWEN35_GROUPED_MOE`), which stages the whole tower and therefore cannot stream; the engine says so once on stderr rather than silently doing no streaming. Set `VT_MOE_EXPERT_STREAM=0` to keep grouping. Also settable as `--offload-config`'s `vllm_cpp.expert_stream.enabled`; this variable overrides it |
+| `VT_MOE_EXPERT_STREAM_SLOTS` | `64` | How many expert slices stay resident. Parsed as a decimal integer; unset, empty, zero, negative and unparseable values all keep `64`. Every slot acquired during a step is protected from eviction until the step ends, so a budget smaller than one step's working set exhausts the cache: those slices fall back to reading the tower directly, which is correct but slow, and is counted. Sized against a real model this wants to be large — the measured run used `8000`. Also settable as `--offload-config`'s `vllm_cpp.expert_stream.slots`, which unlike this variable REFUSES a zero or negative value at startup instead of silently keeping `64`; this variable overrides it |
+| `VT_MOE_EXPERT_STREAM_SLOT_BYTES` | the LARGEST of the gate/up/down slices of the first MoE layer reached | Bytes reserved per slot, fixed for the process's life. Parsed as a decimal integer; unset, empty, zero, negative and unparseable values all keep the default. The default is the largest of the three slices rather than the first one taken, because a dynamic (UD) quant keeps `down_proj` at a higher precision than the gate/up pair and sizing from a gate slice then refuses the first down slice mid-decode. A slice that still does not fit is refused BY NAME (`vt: expert stream: a slice of N bytes exceeds the slot budget of M; raise VT_MOE_EXPERT_STREAM_SLOT_BYTES`) rather than truncated or silently routed back to the mmap path, so a streaming benchmark cannot quietly measure the mmap path instead. Also settable as `--offload-config`'s `vllm_cpp.expert_stream.slot_bytes`, which refuses a non-positive value at startup; this variable overrides it |
+| `VT_MOE_EXPERT_STREAM_STATS_EVERY` | `16` | How many decode steps between the expert-stream statistics line on stderr; `0` silences it. Parsed as a decimal integer; unset, empty, negative and unparseable values all keep `16`. The line is `[expert-stream] steps=N hits=H misses=M evictions=E fills=F bytes=B exhausted=X advised=A`. It exists because the row's first published decode figure was measured on a cache that had switched itself off partway through the third token, and nothing in the run could have said so: the process printed one line at startup and none afterwards. **`steps == 0` or `exhausted > 0` means the lane is not streaming**, whatever the startup line claimed. Environment-ONLY by decision: it changes a diagnostic cadence rather than what the process reserves, so it is the instrument and not the configuration, and `--offload-config` refuses it as an unknown key rather than accepting and dropping it |
 
 ## Rollback and bisect switches
 
