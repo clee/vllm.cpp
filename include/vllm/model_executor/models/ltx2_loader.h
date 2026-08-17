@@ -537,7 +537,7 @@ Ltx2DitCheckpoint Ltx2StreamDitToDevice(vt::Queue& queue, const SafetensorsFile&
 // this function returns having done nothing — stage 2 renders at stage 1's
 // strength, with no refusal, no shape change and no wrong-looking output.
 //
-// So growing this seam for https://github.com/mudler/vllm.cpp/issues/921 needs
+// So growing this seam for https://github.com/mudler/vllm.cpp/issues/1144 needs
 // TWO changes beyond a new field on `Ltx2PhaseRecipe`: `fuse` must become a type
 // that can carry a STRENGTH, and `Ltx2DitCheckpoint` must record WHICH adapter
 // state is applied rather than merely whether one is. That is modest growth, not

@@ -23,7 +23,8 @@ adapter. One record repair: the reference-conditioning refusal in
 
 **Out.** `ti2vid_two_stages` (#1093) and `keyframe_interpolation` (#1096) — both
 additionally need checkpoints that are not on the NAS. The HQ arm's per-phase
-STRENGTH (#921). N-adapter subsets. The reference clip's pixel path, which is
+STRENGTH (#921 when this was written; #1144 since that issue closed).
+N-adapter subsets. The reference clip's pixel path, which is
 the reference refusal's FIRST reason and stays refused.
 
 ## Upstream chain
@@ -94,7 +95,7 @@ because `Ltx2ResolveLoraReferenceFactors` refuses more than one adapter by name
 needs one (0.25 at `:92-96`, 0.5 at `:97-101`), and no recipe this row ships
 would set it, so adding the field now lands a branch nothing can select — the
 argument `ltx2_lora.h:41-44` already makes for the second product form. Owed
-below, against #921.
+below, against #1144 (#921 when this was written).
 
 ### The mechanism
 
@@ -417,7 +418,14 @@ shift.
 ## Owed
 
 - **Per-phase adapter STRENGTH**, which `ti2vid_two_stages_hq.py:92-101` needs
-  and this field cannot express. Owned by #921.
+  and this field cannot express. **Owned by
+  [#1144](https://github.com/mudler/vllm.cpp/issues/1144), not by #921.** This
+  spec said #921 until 2026-08-17, and #921 was closed as completed that same
+  day by `LTX25-RES2S-LOOP` (`4d7748646`, PR #1125), which landed the res_2s
+  sampler. That row named the distilled LoRA per stage as out of scope and was
+  right to leave it, but did not list it under its own `## Owed` — so the debt
+  outlived its issue with no open owner until #1144 was filed. An `## Owed` item
+  pointing at a closed issue is not owned; it only looks owned.
 
   **A NEW FIELD IS NOT ENOUGH, and the seam's own no-op is why.**
   `Ltx2RebindDitLoras` early-returns on `if (currently_fused == fuse) return;`,
@@ -430,13 +438,13 @@ shift.
   would silently render at stage 1's strength, with no refusal and nothing wrong
   in the shape of the output.
 
-  So #921 needs two changes beyond the field: `bool fuse` must become a type
+  So #1144 needs two changes beyond the field: `bool fuse` must become a type
   that can carry a strength, and `Ltx2DitCheckpoint` must record WHICH adapter
   state is applied rather than merely whether one is. That is modest growth, not
   a redesign — the re-materialize-and-write-back mechanism is untouched, because
   re-materializing from the pristine file already reaches any strength in one
-  pass. The trap is written beside the early return in `ltx2_loader.h` and
-  noted on #921 so it is inherited rather than rediscovered.
+  pass. The trap is written beside the early return in `ltx2_loader.h`, in
+  #1144's body, and on #921 so it is inherited rather than rediscovered.
 
 - **`res2s_two_stage` runs BOTH stages at strength 1.0 where upstream runs 0.25
   and 0.5.** `Res2sTwoStageRecipe` is this tree's port of
@@ -444,8 +452,10 @@ shift.
   to `kAllAdapters`, and the load carries ONE strength for the whole engine
   (`lora_strength` absent is 1.0, `ltx2_video.h:214-218`). Pre-existing and not
   worsened by this row — the field this row adds is a set, and a set cannot
-  express a strength — but it was unstated anywhere until now. Owned by #921
-  with the item above.
+  express a strength — but it was unstated anywhere until now. Owned by
+  [#1144](https://github.com/mudler/vllm.cpp/issues/1144) with the item above,
+  and it is the reason that issue is a `bug` rather than an enhancement: this is
+  a live divergence from upstream on a shipped arm, not a missing feature.
 - **N-adapter per-phase SUBSETS**, upstream's `(*loras, *distilled_lora)` where
   `loras` is the user's own list and rides both stages. Blocked on the adapter
   arity refusal (`ltx2_lora.h:167-172`), which is upstream-faithful for the

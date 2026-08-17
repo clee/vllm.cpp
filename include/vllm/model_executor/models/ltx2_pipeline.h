@@ -638,7 +638,11 @@ enum class Ltx2PhaseDenoiser { kGuided, kSimple };
 // 0.25 at `:92-96` and 0.5 at `:97-101` — and no recipe this tree ships would
 // set it, so adding the field now lands a branch nothing can select. That is the
 // argument `ltx2_lora.h:41-44` already makes for the second product form. Owed
-// by https://github.com/mudler/vllm.cpp/issues/921.
+// by https://github.com/mudler/vllm.cpp/issues/1144 — NOT #921, which was closed
+// as completed the same day this landed and would have left the debt looking
+// owned while owning nothing. The trap that makes it more than a new field is
+// written beside `Ltx2RebindDitLoras` in `ltx2_loader.h`: that function's no-op
+// test is a BOOLEAN, and HQ needs both stages fused at different strengths.
 enum class Ltx2PhaseLoraScope {
   // Every adapter the load supplied. The DEFAULT, because `distilled.py:131`
   // builds ONE stage set and so every recipe that predates this field —
