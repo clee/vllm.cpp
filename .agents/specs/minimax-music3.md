@@ -1468,6 +1468,16 @@ its own gate, and it took `vocoder1d::Conv1d` with it.
 provider, and every `vocoder1d` consumer routes through them. The DiT row closed
 in §14.
 
+**A coverage hole in this row, found by fresh review and filed as #1131.** The
+DiT device arm's kernels and staging are gated — eight mutations against them go
+RED — but its **production switch is not**. Setting `on_device = false` in
+`Music3DenoiseChunks`, or disabling the half-set refusal, leaves every suite
+GREEN. A change that silently stopped the DiT reaching the device would be
+invisible, and the arm would run on the host with every number still looking
+right. The gate that closes it must assert the device path was TAKEN (invocation
+count or resident dtype), not merely that outputs agree — the two arms agree
+numerically by design.
+
 **Only the depth decoder remains, and its "blocked on" entry above is now known
 to be WRONG in one respect**, corrected in §14.5: it is not "nothing but the
 work". The shipped depth decoder runs `ArCompute::kBFloat16`, which rounds the
@@ -2388,8 +2398,16 @@ committed inputs on both arms; the arms never overlapped.
 
 **What is timed is the DiT and only the DiT.** `VLLM_CPP_MUSIC3_DIT_REPEAT=R`
 makes the gate run its guided velocity R times per timestep instead of once, and
-the timer brackets ONLY that loop — the 9.7 GB checkpoint load, the golden reads
-and the staging are all outside it, and the staging is timed separately.
+the timer brackets that loop — the 9.7 GB checkpoint load and the weight staging
+are outside it, and the staging is timed separately.
+
+**Corrected in fresh review:** an earlier revision of this paragraph also claimed
+the GOLDEN READS were outside the bracket. They are not — four `LoadF32Npy`
+calls, two `Compare` and two `ReportInto` sit INSIDE the `t0`/`loop_s` bracket
+(`test_minimax_music3_acoustic_real.cpp:592-606`). That inflates the intercept and
+makes the per-forward number SLOWER than the pure forward, so the headline ratio
+is conservative rather than inflated — but the sentence was wrong as written, and
+a reader checking the intercept against the fit would have been misled.
 
 | arm | repeats | forwards | loop | per forward | staging | box load |
 |---|---|---|---|---|---|---|
@@ -2401,8 +2419,10 @@ and the staging are all outside it, and the staging is timed separately.
 | CUDA (`device 1`) | 1 | 4 | **0.743881 s** | **0.185970 s** | 0.612787 s | 4.44 |
 
 **Per DiT forward at the capture's geometry (latent length 86, seq 87):
-204.955 s on the host, 0.1706-0.1873 s on the device — between 1102x and
-1201x.** The two-point fit over the device arm's 4- and 12-forward runs gives
+204.955 s on the host, 0.1706-0.1873 s on the device — between 1094x and
+1201x.** (An earlier revision wrote the low end as 1102x. That is the ratio at
+the FASTEST R=1 point, 0.185970 s; the range's slow end is 0.187269 s, and
+204.954646 / 0.187269 = 1094x. Caught in fresh review.) The two-point fit over the device arm's 4- and 12-forward runs gives
 
     slope = 0.170607 s per forward     intercept = 0.063012 s
 

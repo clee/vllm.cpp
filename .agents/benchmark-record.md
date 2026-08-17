@@ -22410,8 +22410,11 @@ and single commands should go through `rc run --max-runtime` instead.
 
 `VLLM_CPP_MUSIC3_DIT_REPEAT=R` runs the guided velocity R times per timestep in
 `tests/parity/test_minimax_music3_acoustic_real.cpp`. The timer brackets ONLY
-that loop: the 9.7 GB checkpoint load, the golden reads and the weight staging
-are all outside it, and staging is timed separately. One guided velocity is TWO
+that loop: the 9.7 GB checkpoint load and the weight staging are outside it, and
+staging is timed separately. NOTE, corrected in fresh review: the golden reads
+(4x `LoadF32Npy`, 2x `Compare`, 2x `ReportInto`) are INSIDE the bracket
+(`test_minimax_music3_acoustic_real.cpp:592-606`), which inflates the intercept
+and makes the reported per-forward number conservative, not inflated. One guided velocity is TWO
 DiT forwards (the conditional and the unconditional CFG branch).
 
 | arm | repeats | forwards | loop | per forward | staging | box load |
