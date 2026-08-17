@@ -3496,8 +3496,20 @@ below that, where weights stay borrowed out of the file mapping.
 
 Every field is optional, and an absent field means unchanged, so an
 `--offload-config` without a `vllm_cpp` key behaves exactly as it did before this
-surface existed. The same C ABI field carries it: `vllm_model_params.offload_config`
-is one string holding both halves, so a library client needs no new field.
+surface existed — with one difference, described below: a misspelled key is now an
+error rather than being ignored. The same C ABI field carries it:
+`vllm_model_params.offload_config` is one string holding both halves, so a library
+client needs no new field.
+
+**A second engine in one process is legal.** "Absent means unchanged" applies to the
+install as well as to the parse: a later document is merged field by field over the
+installed one, so `{"vllm_cpp":{"mmap":{"enabled":true}}}` on a second engine changes
+`mmap` and leaves the first engine's `expert_stream` and slot count alone. Only two
+things cannot be changed once a model has used them — whether expert streaming is on,
+which is cached the first time it is asked, and the slot store's `slots x slot_bytes`
+reservation, which is fixed when the store is built. A document that would change
+either is refused at startup, naming the field and the value in force; a document that
+omits it, or asks for exactly what is in force, is accepted.
 
 **Precedence is `environment variable > config > built-in default`**, and it is
 deliberate: the `VT_*` variables exist so a benchmark arm is switchable without
@@ -3506,11 +3518,14 @@ config `"enabled": true`. The engine prints one line at startup naming the field
 of the document it installed, and a second naming every variable that would win
 over one of them, because a configuration silently overridden by something
 exported weeks ago is the one way this precedence hurts. The first line reports
-what was ASKED FOR, not what the engine resolves: every knob resolves lazily
-during weight load and the streaming answer is cached on first read, so resolving
-at startup would move that decision ahead of the load. Read the two lines
-together — `expert_stream=on` beside `VT_MOE_EXPERT_STREAM (expert_stream)
-OVERRIDES` means the document said on and the variable decides.
+what was ASKED FOR, not what the engine resolves: the streaming answer is cached the
+first time it is asked, so resolving it at startup would move that decision ahead of
+the weight load. That constraint binds `expert_stream` alone — `prefault` and `slots`
+could be resolved at startup, and `mmap` and `slot_bytes` need a built-in default only
+their caller knows — and the line reports the document for all five so it reports one
+kind of thing rather than a mixture. Read the two lines together: `expert_stream=on`
+beside `VT_MOE_EXPERT_STREAM (expert_stream) OVERRIDES` means the document said on and
+the variable decides.
 
 **Where the config form reaches, and where it does not.** It reaches the
 generate/chat server path (`vllm-server`) and the C ABI's
@@ -3521,7 +3536,7 @@ document at all — the mirrored `uva`/`prefetch` half is dropped there too, and
 been since before this key existed. On those three, use the environment form
 above. Recorded under `## Owed` in
 [`.agents/specs/weight-residency-config.md`](../.agents/specs/weight-residency-config.md)
-with [#1122](https://github.com/mudler/vllm.cpp/issues/1122).
+with [#1135](https://github.com/mudler/vllm.cpp/issues/1135).
 
 **A misspelled key is refused at startup, not ignored — at every level of the
 document.** vLLM's own parser ignores a key it does not recognise, which is what
@@ -3534,11 +3549,17 @@ So the whole document is enumerated and the offender is named:
 ```text
 offload config: unknown key "vllm_cpp.mmapp" (expected one of: mmap expert_stream)
 offload config: unknown key "vllm-cpp" (expected one of: offload_backend uva prefetch vllm_cpp)
+offload config: unknown key "uva.cpu_offload_GB" (expected one of: cpu_offload_gb cpu_offload_params)
 ```
+
+Every level means every level, the mirrored sub-objects included. The enumeration once
+stopped at the top level and inside `vllm_cpp`, which left the same hole one step down:
+`{"uva":{"cpu_offload_GB":10}}` started a server with a 0 GiB offload budget the
+operator believed was set.
 
 The four legal top-level keys are `offload_backend`, `uva`, `prefetch` and
 `vllm_cpp` — vLLM's three plus this extension — so a typo in the mirrored half
-(`uvaa`) is refused on the same terms. Refusing is what upstream does with its own
+(`uvaa`, or `cpu_offload_gbb` inside it) is refused on the same terms. Refusing is what upstream does with its own
 JSON config flags: vLLM builds its config dataclasses with a decorator that sets
 `ConfigDict(extra="forbid")` (`vllm/config/utils.py:68-69`), which is why
 `--kv-transfer-config` refuses an unknown key — and upstream has no

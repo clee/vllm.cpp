@@ -15,23 +15,29 @@
 // "mirror is untouched" cases below assert directly.
 //
 // THE THREE GUARANTEES, each of which has its own mutation:
-//   1. PARSE + REFUSE. Every field round-trips, and an unknown key is an ERROR —
-//      at the TOP LEVEL of the document as well as inside `vllm_cpp`. The refusal
+//   1. PARSE + REFUSE. Every field round-trips, and an unknown key is an ERROR at
+//      EVERY level of the document: the top level, inside `vllm_cpp` and its two
+//      sub-objects, and inside the MIRRORED `uva` and `prefetch` objects. The refusal
 //      is the load-bearing half: parse_offload_config_json ignores a key it does
 //      not know (which is what lets this extension share the flag), so
 //      `{"vllm-cpp":...}` or `{"vllm_cpp":{"mmapp":...}}` would otherwise SILENTLY
-//      disable the tier that keeps a 370 GiB model inside 119 GB. The hyphen is
+//      disable the tier that keeps a 370 GiB model inside 119 GB, and
+//      `{"uva":{"cpu_offload_GB":10}}` would silently offload nothing. The hyphen is
 //      the likeliest of those typos, because every flag around it is hyphenated.
 //   2. PRECEDENCE: env > config > built-in default, in both directions. `VT_X=0`
 //      must beat a config `true`, because an override that cannot turn a thing
 //      OFF is not one, and that is the direction a benchmark arm needs.
-//   3. THE LATCH, and only where there IS one. `expert_stream` is read through a
-//      function-local static and the slot store is built once per process, so a
-//      config that would change either after the fact must THROW rather than be
-//      ignored. `mmap` and `prefault` latch NOTHING — `GgufLoadPolicy::FromEnv()`
-//      runs per load and the prefault site no longer caches — so a second engine
-//      in one process may still set them, and refusing that would fail a legal
-//      two-model load. Both halves are asserted below.
+//   3. THE LATCH, and only where there IS one, and only for what a document SAYS.
+//      `expert_stream` is read through a function-local static and the slot store is
+//      built once per process, so a document that would CHANGE either after the fact
+//      must THROW rather than be ignored. Three things must NOT throw, and each was a
+//      real failure on a legal two-model load: `mmap` and `prefault` latch nothing
+//      (`GgufLoadPolicy::FromEnv()` runs per load and the prefault site no longer
+//      caches); a document that OMITS a decided field is not a change to it; and a
+//      document asking for exactly what the process decided is not one either. The
+//      install also MERGES rather than replacing, so a partial second document does
+//      not drop the first engine's fields. Every one of those is asserted below, and
+//      the two-partial-documents case is where the last two were caught (#1133).
 #include <doctest/doctest.h>
 
 #include <cstdlib>
@@ -204,6 +210,22 @@ TEST_CASE("residency config: a misspelled TOP-LEVEL key is REFUSED, never ignore
       R"({"uvaa":{"cpu_offload_gb":10}})",
       R"({"prefetchh":{"offload_group_size":8}})",
       R"({"offload_backends":"uva"})",
+      // ...and a typo INSIDE the mirrored half, which the enumeration used to stop
+      // one level short of. `parse_offload_config_json` reads `uva.cpu_offload_gb`
+      // and the four `prefetch.*` fields BY NAME with a fallback
+      // (src/vllm/config/offload.cpp:272-281), so each of these left the field at
+      // its default while the operator believed the document set it — a budget of 0
+      // GiB, or a group size of 0, i.e. no offloading at all. Upstream refuses them:
+      // `UVAOffloadConfig` (offload.py:15-16) and `PrefetchOffloadConfig` (:47-48)
+      // each carry `@config`, whose body sets `ConfigDict(extra="forbid")`
+      // (utils.py:68-69).
+      R"({"uva":{"cpu_offload_gbb":1}})",
+      R"({"uva":{"cpu_offload_GB":10}})",
+      R"({"uva":{"cpu_offload_gb":10,"cpu_offload_param":["experts"]}})",
+      R"({"prefetch":{"offload_groupsize":8}})",
+      R"({"prefetch":{"offload_group_size":8,"offload_num_in_groups":2}})",
+      R"({"prefetch":{"offload_group_size":8,"offload_prefetch_steps":1}})",
+      R"({"prefetch":{"offload_group_size":8,"offload_param":["experts"]}})",
   };
   for (const char* doc : refused) {
     CAPTURE(doc);
@@ -219,11 +241,25 @@ TEST_CASE("residency config: a misspelled TOP-LEVEL key is REFUSED, never ignore
   CHECK_FALSE(Mentions(hyphen, "vllm-cpp.vllm-cpp"));
   CHECK(Mentions(hyphen, "vllm_cpp"));  // the spelling that was meant
 
-  // ...and the four legal top-level keys still parse, in every combination, so the
+  // The nested ones name the DOTTED path, so the operator is told which key of
+  // which sub-object is wrong, and are listed against the mirrored parser's own
+  // spelling rather than this extension's.
+  const std::string nested_uva =
+      RefusalMessage(R"({"uva":{"cpu_offload_gbb":1}})");
+  CHECK(Mentions(nested_uva, "unknown key \"uva.cpu_offload_gbb\""));
+  CHECK(Mentions(nested_uva, "expected one of: cpu_offload_gb cpu_offload_params"));
+  CHECK(Mentions(RefusalMessage(R"({"prefetch":{"offload_groupsize":8}})"),
+                 "unknown key \"prefetch.offload_groupsize\""));
+
+  // ...and the four legal top-level keys still parse, in every combination, with
+  // every field of the two mirrored sub-objects spelled correctly, so the
   // enumeration refuses a typo rather than the document.
   CHECK_NOTHROW(vllm::parse_weight_residency_extension_json(
-      R"({"offload_backend":"uva","uva":{"cpu_offload_gb":10},)"
-      R"("prefetch":{"offload_group_size":8},"vllm_cpp":{"mmap":{"enabled":true}}})"));
+      R"({"offload_backend":"uva",)"
+      R"("uva":{"cpu_offload_gb":10,"cpu_offload_params":["experts"]},)"
+      R"("prefetch":{"offload_group_size":8,"offload_num_in_group":2,)"
+      R"("offload_prefetch_step":1,"offload_params":["experts"]},)"
+      R"("vllm_cpp":{"mmap":{"enabled":true}}})"));
 }
 
 TEST_CASE("residency config: a wrong-typed or non-positive field is REFUSED") {
@@ -539,6 +575,14 @@ TEST_CASE("residency config: install is readable, and a LATE install of a LATCHE
   // But a knob that latched NOTHING is still settable — this is the two-model
   // process the coarse check used to fail. `mmap` and `prefault` are resolved per
   // load, so a second engine may change them even after streaming latched.
+  //
+  // NOTE THE COPY, and note what it therefore does NOT cover. `mmap_too` carries
+  // `cfg`'s `expert_stream` and `expert_stream_slots` as well as the two new fields,
+  // so the second install sets the latched field to the value it already had. That is
+  // a real shape — one document, two engines — but it is not the shape a second
+  // engine with its OWN partial document has, and both of the #1133 behaviour defects
+  // lived in the difference. "TWO DIFFERENT PARTIAL documents in one process", below,
+  // is the case that covers it.
   vllm::WeightResidencyConfig mmap_too = cfg;
   mmap_too.mmap = true;
   mmap_too.prefault = false;
@@ -555,7 +599,9 @@ TEST_CASE("residency config: install is readable, and a LATE install of a LATCHE
   // It must be a NO-OP rather than an overwrite. A second engine in the same
   // process carries no residency config of its own, and clearing the first one's
   // would change what the expert slot store reads — it is built lazily, on the
-  // first slice taken, which can be long after a second engine loaded.
+  // first slice taken, which can be long after a second engine loaded. Since the
+  // install merges field by field, this now holds by construction rather than by a
+  // special case for the empty document.
   CHECK(vllm::ActiveWeightResidencyConfig() == mmap_too);
 }
 
@@ -584,11 +630,210 @@ TEST_CASE("residency config: the SLOT GEOMETRY latches when the store is built, 
   resize.expert_stream_slots = 96;
   CHECK_THROWS_AS(vllm::SetWeightResidencyConfig(resize), std::logic_error);
 
-  // ...while mmap, which the geometry does not freeze, still installs.
+  // ...while mmap, which the geometry does not freeze, still installs. Another COPY
+  // (`= sizes`), so like `mmap_too` above it re-states the frozen `slots` at its
+  // existing value instead of omitting it; the two-partial-documents case below is
+  // the one that omits it.
   vllm::WeightResidencyConfig mmap_only = sizes;
   mmap_only.mmap = true;
   CHECK_NOTHROW(vllm::SetWeightResidencyConfig(mmap_only));
   CHECK(vllm::ActiveWeightResidencyConfig() == mmap_only);
+}
+
+TEST_CASE("residency config: TWO DIFFERENT PARTIAL documents in one process") {
+  ResidencyFixture fx;
+  ::unsetenv("VT_MOE_EXPERT_STREAM");
+  ::unsetenv("VT_MOE_EXPERT_STREAM_SLOTS");
+  ::unsetenv("VT_MOE_EXPERT_STREAM_SLOT_BYTES");
+  ::unsetenv("VT_GGUF_MMAP");
+  ::unsetenv("VT_GGUF_PREFAULT");
+
+  // THE SHAPE NO CASE IN THIS FILE HAD, and both #1133 behaviour defects hid in
+  // exactly the gap it leaves. Every other latch case here either re-installs a
+  // COPY of the first document (`mmap_too = cfg`, `mmap_only = sizes`) or installs
+  // the empty one, so the second install always carried the latched field with the
+  // same value it already had — and the two ways `optional` was misused are both
+  // invisible to that. `FrozenFields` compared `in.expert_stream` against the
+  // STORED optional, and `nullopt != engaged` is true, so a document that merely
+  // OMITS the latched field was refused. The install then assigned wholesale, so a
+  // document that omitted a field CLEARED it. A copy of the first document triggers
+  // neither. A genuinely partial one triggers both.
+  //
+  // Engine A: the reproduction document from #1110, parsed rather than hand-built.
+  const vllm::WeightResidencyConfig a =
+      vllm::parse_weight_residency_extension_json(
+          R"({"vllm_cpp":{"mmap":{"enabled":true,"prefault":false},)"
+          R"("expert_stream":{"enabled":true,"slots":8000}}})");
+  vllm::SetWeightResidencyConfig(a);
+
+  // A's load takes both decisions: the streaming answer on the first routed slice,
+  // the geometry when the slot store is constructed. Both are taken through the
+  // production functions, so this is the state a real first engine leaves behind.
+  //
+  // `decided` is READ rather than assumed. The streaming answer is a per-process
+  // static, so its value depends on which case in this binary reached it first, and
+  // a case that hardcoded `true` would pass or fail on test ORDER rather than on the
+  // code. Every assertion below is relative to it.
+  const bool decided = vllm::ResolveExpertStreamRequested();
+  REQUIRE(vllm::WeightResidencyLatched(vllm::ResidencyLatch::kExpertStream));
+  vllm::NoteExpertStreamGeometry(vllm::ResolveExpertStreamSlots(),
+                                 vllm::ResolveExpertStreamSlotBytes(12582912));
+  REQUIRE(vllm::WeightResidencyLatched(vllm::ResidencyLatch::kExpertStreamGeometry));
+  REQUIRE(vllm::BuiltExpertStreamGeometry().slots == 8000);
+
+  // Engine B: mmap only. Not a copy of A — it sets one field and omits four.
+  vllm::WeightResidencyConfig b;
+  b.mmap = false;
+  CHECK_NOTHROW(vllm::SetWeightResidencyConfig(b));
+  {
+    // ACCEPTED (#1133 H1: this threw std::logic_error out of FromModelDir, so a
+    // legal second engine returned VLLM_ERR_MODEL_LOAD)...
+    const vllm::WeightResidencyConfig now = vllm::ActiveWeightResidencyConfig();
+    REQUIRE(now.mmap.has_value());
+    CHECK(*now.mmap == false);
+    // ...and A's four other fields SURVIVED (#1133 H2: `expert_stream=on` with
+    // 8000 slots became OFF with 64, with no diagnostic).
+    REQUIRE(now.prefault.has_value());
+    CHECK(*now.prefault == false);
+    REQUIRE(now.expert_stream.has_value());
+    CHECK(*now.expert_stream == true);
+    REQUIRE(now.expert_stream_slots.has_value());
+    CHECK(*now.expert_stream_slots == 8000);
+  }
+  // The resolvers are what the slot store reads, and it reads them LAZILY — on the
+  // first slice taken, which can be long after a second engine loaded. So the drop
+  // is asserted where it would be felt, not only on the stored struct.
+  CHECK(vllm::ResolveExpertStreamSlots() == 8000);
+  CHECK(vllm::ResolveGgufMmap(/*builtin_default=*/true) == false);
+
+  // Engine C: prefault only. THE SECOND, DIFFERENT partial document — this is the
+  // half that makes the case the shape the review named, because it also proves the
+  // merge accumulates rather than remembering only the first two installs.
+  vllm::WeightResidencyConfig c;
+  c.prefault = true;
+  CHECK_NOTHROW(vllm::SetWeightResidencyConfig(c));
+  {
+    const vllm::WeightResidencyConfig now = vllm::ActiveWeightResidencyConfig();
+    REQUIRE(now.prefault.has_value());
+    CHECK(*now.prefault == true);
+    // B's field survived C, as A's survived B.
+    REQUIRE(now.mmap.has_value());
+    CHECK(*now.mmap == false);
+    REQUIRE(now.expert_stream.has_value());
+    CHECK(*now.expert_stream == true);
+    REQUIRE(now.expert_stream_slots.has_value());
+    CHECK(*now.expert_stream_slots == 8000);
+  }
+  CHECK(vllm::ResolveGgufPrefault() == true);
+  CHECK(vllm::ResolveExpertStreamSlots() == 8000);
+
+  // And the refusal still fires on what it can justify: a document that would make
+  // a resolver return something OTHER than the decision already taken.
+  vllm::WeightResidencyConfig flip;
+  flip.expert_stream = !decided;
+  CHECK_THROWS_AS(vllm::SetWeightResidencyConfig(flip), std::logic_error);
+  vllm::WeightResidencyConfig resize;
+  resize.expert_stream_slots = 96;
+  try {
+    vllm::SetWeightResidencyConfig(resize);
+    FAIL("resizing the built slot store must throw");
+  } catch (const std::logic_error& e) {
+    CHECK(Mentions(e.what(), "expert_stream_slots"));
+    // The message quotes THE DECISION THE ENGINE TOOK, which is the number the
+    // operator has to reconcile their document against. It used to quote the stored
+    // document while asserting the engine was not running it.
+    CHECK(Mentions(e.what(), "expert_stream_slots=8000"));
+  }
+  // Neither refused install recorded anything.
+  const vllm::WeightResidencyConfig after = vllm::ActiveWeightResidencyConfig();
+  REQUIRE(after.expert_stream_slots.has_value());
+  CHECK(*after.expert_stream_slots == 8000);
+  REQUIRE(after.expert_stream.has_value());
+  CHECK(*after.expert_stream == true);
+}
+
+TEST_CASE("residency config: a document that AGREES with the decision taken is accepted") {
+  ResidencyFixture fx;
+  ::unsetenv("VT_MOE_EXPERT_STREAM");
+
+  // THE PRODUCTION SHAPE: streaming turned on by the ENVIRONMENT, so engine A
+  // installs no document at all and the decision is taken with the stored config
+  // EMPTY. Engine B then arrives with `{"vllm_cpp":{"expert_stream":{"enabled":
+  // true}}}` — asking for exactly what the process resolved — and was refused with
+  // a message saying "accepting this would record a configuration the engine is not
+  // running". The engine WAS running it.
+  //
+  // Reproduced without the variable, because the streaming answer is a per-process
+  // static that this binary can observe only once: the reset clears the stored
+  // config and both latch flags, the second call re-marks the latch and returns the
+  // SAME cached answer, and that pair — a decision taken, nothing stored — is the
+  // state the variable produces. `decided` is read, never assumed, for the same
+  // reason as in the case above.
+  const bool decided = vllm::ResolveExpertStreamRequested();
+  vllm::ResetWeightResidencyConfigForTesting();
+  REQUIRE(vllm::ActiveWeightResidencyConfig().empty());
+  REQUIRE(vllm::ResolveExpertStreamRequested() == decided);
+  REQUIRE(vllm::WeightResidencyLatched(vllm::ResidencyLatch::kExpertStream));
+
+  // The DISAGREEING document first, while nothing is stored, because that is the one
+  // moment the refusal MESSAGE can be checked against the right thing. With the
+  // stored document empty, quoting it produced "environment/default" — no number and
+  // no answer for the operator to reconcile against. It now quotes the DECISION.
+  vllm::WeightResidencyConfig disagrees;
+  disagrees.expert_stream = !decided;
+  try {
+    vllm::SetWeightResidencyConfig(disagrees);
+    FAIL("a document that would change the decided answer must throw");
+  } catch (const std::logic_error& e) {
+    CHECK(Mentions(e.what(), decided ? "expert_stream=on" : "expert_stream=off"));
+    CHECK_FALSE(Mentions(e.what(), "environment/default"));
+  }
+
+  // ...and the AGREEING one installs. The pair is the point: "equal to the stored
+  // document" and "equal to the decision" are different predicates, and only the
+  // second is what the refusal can justify.
+  vllm::WeightResidencyConfig agrees;
+  agrees.expert_stream = decided;
+  CHECK_NOTHROW(vllm::SetWeightResidencyConfig(agrees));
+  REQUIRE(vllm::ActiveWeightResidencyConfig().expert_stream.has_value());
+  CHECK(*vllm::ActiveWeightResidencyConfig().expert_stream == decided);
+}
+
+TEST_CASE("residency config: a document the ENVIRONMENT overrides is not a change") {
+  ResidencyFixture fx;
+  ::unsetenv("VT_MOE_EXPERT_STREAM");
+  ::unsetenv("VT_MOE_EXPERT_STREAM_SLOTS");
+
+  // The refusal asks what the document WOULD RESOLVE TO, not what it says, and this
+  // case is the difference. With the knob's variable exported the resolver's answer
+  // cannot change whatever the document says, so a document that contradicts the
+  // decision changes nothing and there is nothing to refuse. Refusing it would fail a
+  // legal load for a document with no effect.
+  const bool decided = vllm::ResolveExpertStreamRequested();
+  REQUIRE(vllm::WeightResidencyLatched(vllm::ResidencyLatch::kExpertStream));
+
+  ::setenv("VT_MOE_EXPERT_STREAM", decided ? "1" : "0", 1);
+  vllm::WeightResidencyConfig flip;
+  flip.expert_stream = !decided;
+  CHECK_NOTHROW(vllm::SetWeightResidencyConfig(flip));
+  ::unsetenv("VT_MOE_EXPERT_STREAM");
+  // ...and WITHOUT the variable the same document is refused, which is what shows the
+  // acceptance above came from the variable rather than from an absent check.
+  CHECK_THROWS_AS(vllm::SetWeightResidencyConfig(flip), std::logic_error);
+
+  // The same for a COUNT, through the same tolerant predicate the resolver uses.
+  vllm::NoteExpertStreamGeometry(8000, 12582912);
+  REQUIRE(vllm::BuiltExpertStreamGeometry().slots == 8000);
+  vllm::WeightResidencyConfig resize;
+  resize.expert_stream_slots = 96;
+  ::setenv("VT_MOE_EXPERT_STREAM_SLOTS", "8000", 1);
+  CHECK_NOTHROW(vllm::SetWeightResidencyConfig(resize));
+  // A garbage value is NOT an override — the resolver falls through to the config —
+  // so the document takes effect again and is refused again.
+  ::setenv("VT_MOE_EXPERT_STREAM_SLOTS", "banana", 1);
+  CHECK_THROWS_AS(vllm::SetWeightResidencyConfig(resize), std::logic_error);
+  ::unsetenv("VT_MOE_EXPERT_STREAM_SLOTS");
+  CHECK_THROWS_AS(vllm::SetWeightResidencyConfig(resize), std::logic_error);
 }
 
 TEST_CASE("residency config: reading mmap or prefault latches NOTHING, so a second engine may set them") {

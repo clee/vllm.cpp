@@ -448,18 +448,25 @@ typedef struct vllm_model_params {
    * Precedence per field is environment variable > this document > built-in
    * default, so an exported VT_GGUF_MMAP / VT_GGUF_PREFAULT / VT_MOE_EXPERT_STREAM
    * / VT_MOE_EXPERT_STREAM_SLOTS / VT_MOE_EXPERT_STREAM_SLOT_BYTES still wins; the
-   * engine prints one line on stderr naming what it installed and any variable
-   * that overrides it. The engine acts on it during weight load, so it must be
-   * installed before then, which vllm_engine_load does.
+   * engine prints one line on stderr naming what it installed, plus a second line
+   * naming the variables that override it when there are any. The engine acts on it
+   * during weight load, so it must be installed before then, which vllm_engine_load
+   * does. Loading a SECOND engine in one process is legal: an absent field means
+   * unchanged, so a partial document is merged over what is installed rather than
+   * replacing it, and only a document that would CHANGE a decision the process has
+   * already taken — the streaming answer, or the slot store's geometry — is refused.
    *
    * REFUSALS ADDED WITH THAT KEY, all VLLM_ERR_INVALID_ARGUMENT before any model
-   * I/O: an UNKNOWN key anywhere in the document, including a misspelling of a
-   * top-level key (`{"vllm-cpp":...}` with a hyphen, `{"uvaa":...}`) and of a
-   * nested one (`{"vllm_cpp":{"mmapp":...}}`); a wrong-typed field; and a
-   * non-positive `slots` or `slot_bytes`. A typo is refused rather than defaulted
-   * because a silently disabled residency tier is met as an out-of-memory kill
-   * rather than as an error. The four legal top-level keys are `offload_backend`,
-   * `uva`, `prefetch` and `vllm_cpp`. See docs/USAGE.md.
+   * I/O: an UNKNOWN key anywhere in the document — a misspelled top-level key
+   * (`{"vllm-cpp":...}` with a hyphen, `{"uvaa":...}`), a misspelled key inside
+   * `vllm_cpp` (`{"vllm_cpp":{"mmapp":...}}`), and a misspelled key inside the
+   * mirrored `uva` or `prefetch` object (`{"uva":{"cpu_offload_GB":10}}`); a
+   * wrong-typed field; and a non-positive `slots` or `slot_bytes`. A typo is refused
+   * rather than defaulted because a silently disabled residency tier, or a budget
+   * the operator believes is set, is met as an out-of-memory kill rather than as an
+   * error. Upstream refuses one too: every vLLM config dataclass carries
+   * `extra="forbid"`. The four legal top-level keys are `offload_backend`, `uva`,
+   * `prefetch` and `vllm_cpp`. See docs/USAGE.md.
    * Borrowed for the call only. */
   const char* offload_config;
   /* ── Jump-forward decoding (ABI v10) ───────────────────────────────────────

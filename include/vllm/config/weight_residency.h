@@ -25,8 +25,22 @@
 //                 "expert_stream": {"enabled": bool, "slots": int,
 //                                   "slot_bytes": int}}}
 //
-// Every field is optional and an absent field means UNCHANGED, so an absent
-// `vllm_cpp` key is byte-identical to the engine before this row existed.
+// Every field is optional and an absent field means UNCHANGED. That sentence
+// binds TWO pieces of code, and the first two shapes of this row broke it in both
+// directions (#1133 H1, H2, each measured through `LoadedEngine::FromModelDir`).
+// At install time the stored config is MERGED field by field, so a document that
+// omits a field leaves the installed value alone — it does not clear it. At refusal
+// time a field is scored only when the document SETS it, so omitting a field is not
+// a change to it. `nullopt` is the absence of a request, never a request for the
+// default.
+//
+// An `--offload-config` with no `vllm_cpp` key therefore installs nothing and every
+// knob resolves exactly as it did before this row existed. One thing about such a
+// document DID change: the PARSE now refuses an unknown key at every level, so
+// `--offload-config '{"typo":1}'` used to start a server and now aborts at startup.
+// That refusal is the point of the row's H1 repair rather than an exception to the
+// paragraph above, but it is a behaviour change, so what is byte-identical is the
+// ENGINE a legal document produces and not the SET of documents accepted.
 //
 // PRECEDENCE, and it is deliberate: **environment variable > JSON config >
 // built-in default**. The environment keeps winning because several of these
@@ -47,10 +61,12 @@
 // THE LATCH, which is the one real hazard here — and it covers TWO of the five
 // knobs, not all five. What genuinely freezes:
 //
-//   * `expert_stream`, because `Qwen35ExpertStreamRequested` caches the answer in a
-//     function-local static. It decides both whether an ~18 GiB slot store is built
-//     and whether the default-on grouped-MoE path is disabled, and those two must
-//     not be able to disagree later in one process.
+//   * `expert_stream`, because `ResolveExpertStreamRequested` below caches the
+//     answer in a function-local static. (`Qwen35ExpertStreamRequested` is the
+//     model-side name and, since this row, a pure delegation to it; the static is
+//     not there.) It decides both whether an ~18 GiB slot store is built and
+//     whether the default-on grouped-MoE path is disabled, and those two must not
+//     be able to disagree later in one process.
 //   * `expert_stream.slots` and `.slot_bytes`, from the moment the slot STORE is
 //     built: the reservation is process-lifetime and cannot be resized. Reading the
 //     two sizes freezes nothing; building the store does.
@@ -60,13 +76,25 @@
 // that site's function-local static (see `ResolveGgufPrefault` below). A second
 // engine in one process may therefore still set either of them.
 //
-// So the refusal is scoped to what it can actually justify. `SetWeightResidencyConfig`
-// THROWS only when an incoming config would CHANGE a field that a taken decision has
-// already fixed; an equal re-install, an empty install, and a document touching only
-// the unlatched knobs are all accepted. The first shape of this check marked one
-// process-wide flag inside the shared resolvers, which made an ordinary first load
-// refuse a second engine's whole document — a hard failure on a legal load, for a
-// reason that was untrue for two of the five knobs (#1122 M1). Install at
+// So the refusal is scoped to what it can actually justify, and it took three
+// shapes to get there. `SetWeightResidencyConfig` THROWS only when the incoming
+// document SETS a decided field AND the value it sets would make that field's
+// resolver return something OTHER than the decision already taken. Everything else
+// installs: an empty document, an equal re-install, a document touching only
+// `mmap`/`prefault`, a document that OMITS the decided field, and a document that
+// asks for exactly what the process decided.
+//
+// The first shape marked one process-wide flag inside the shared resolvers, so an
+// ordinary first load refused a second engine's whole document — a hard failure on
+// a legal load, for a reason untrue of two of the five knobs (#1122 M1). The second
+// shape narrowed that to the two real decisions but compared `in.<field>` against
+// the STORED optional, and `nullopt != engaged` is true, so it still refused a
+// second engine whose document merely omitted the latched field, and it refused a
+// document asking for what the engine was already running while telling the operator
+// the engine was not running it (#1133 H1). The comparison is now against the
+// decision, resolved through the same rule the production resolver uses — which also
+// makes it right about the environment, since a document `VT_MOE_EXPERT_STREAM`
+// overrides changes nothing and is not refused. Install at
 // `LoadedEngine::FromModelDir`, in the same block that installs the weight
 // offloader, which is already before any weight I/O.
 #ifndef VLLM_CONFIG_WEIGHT_RESIDENCY_H_
@@ -129,9 +157,12 @@ struct WeightResidencyConfig {
   // latch, which keeps the line ahead of the weight load where it belongs.
   std::string DescribeEnvOverrides() const;
 
-  // Field-by-field equality. Used by the install to allow a repeated install of
-  // an EQUAL config after a latch (see the header note) while still refusing a
-  // different one.
+  // Field-by-field equality, INCLUDING which fields are set: two documents that
+  // resolve the same way are not equal unless they say the same thing. Used by tests
+  // to compare an installed document against the one they built. The install does
+  // NOT use it — "equal to the stored document" was the wrong predicate for the
+  // refusal, because it makes an omitted field a change (#1133 H1); the install
+  // compares each SET field against the decision that was taken.
   bool operator==(const WeightResidencyConfig& other) const;
   bool operator!=(const WeightResidencyConfig& other) const {
     return !(*this == other);
@@ -143,9 +174,14 @@ struct WeightResidencyConfig {
 // key yields an empty (inert) config.
 //
 // Throws std::invalid_argument on a malformed document, a non-object document, a
-// `vllm_cpp` that is not an object, an UNKNOWN key inside `vllm_cpp` or inside
-// either sub-object, a field of the wrong type, or a non-positive `slots` /
-// `slot_bytes`.
+// `vllm_cpp` that is not an object, an UNKNOWN key at ANY level of the document, a
+// field of the wrong type, or a non-positive `slots` / `slot_bytes`. "Any level"
+// means the top level, the inside of `vllm_cpp`, the inside of `vllm_cpp.mmap` and
+// `vllm_cpp.expert_stream`, and the inside of the two MIRRORED sub-objects `uva` and
+// `prefetch`. The last of those was missing while this comment already claimed it,
+// so `{"uva":{"cpu_offload_GB":10}}` started a server with a 0 GiB budget the
+// operator believed was set (#1133 H3). TYPE checking inside `uva`/`prefetch` stays
+// with the mirrored parser that owns those fields; this one only enumerates names.
 //
 // The unknown-key refusal is the load-bearing half, and it enumerates the WHOLE
 // document, not only the inside of `vllm_cpp`. `parse_offload_config_json` ignores
@@ -172,16 +208,25 @@ struct WeightResidencyConfig {
 WeightResidencyConfig parse_weight_residency_extension_json(
     const std::string& json_text);
 
-// Install the process-global config. Call BEFORE any weight I/O.
+// Install the process-global config, MERGING it field by field over what is already
+// installed. Call BEFORE any weight I/O.
 //
-// Throws std::logic_error when the incoming config would CHANGE a field that a
-// taken decision has already frozen (see THE LATCH above): `expert_stream` once the
-// streaming answer has been read, and the two sizes once the slot store has been
-// built. Honouring such a call would record a configuration the engine is not
-// running. Everything else is accepted — an empty config (the no-op every default
-// load performs), a re-install of an equal one (what lets a process load two engines
-// with one configuration), and a document that touches only `mmap` or `prefault`,
-// neither of which freezes anything.
+// The merge is the schema's "absent means unchanged" applied to the install. An
+// earlier shape assigned wholesale, so a second engine's partial document silently
+// dropped the first engine's fields — `expert_stream=on` with 8000 slots became OFF
+// with 64 — and the slot store reads those values lazily, on the first slice taken,
+// which can be long after the second engine loaded (#1133 H2). An empty document is
+// therefore a no-op by construction rather than by a special case.
+//
+// Throws std::logic_error only when the config SETS a field a taken decision has
+// already fixed (see THE LATCH above) AND the value it sets would resolve differently
+// from that decision: `expert_stream` once the streaming answer has been read, and
+// the two sizes once the slot store has been built. Honouring such a call would
+// record a configuration the engine is not running, and the message names the
+// decision the engine took rather than the document it holds. Everything else is
+// accepted — an empty config, an equal re-install, a document that touches only
+// `mmap` or `prefault`, a document that OMITS the decided field, and a document
+// asking for exactly what was decided.
 void SetWeightResidencyConfig(const WeightResidencyConfig& config);
 
 // The installed config, BY VALUE. Empty until something installs one. A reference
@@ -192,8 +237,9 @@ WeightResidencyConfig ActiveWeightResidencyConfig();
 // The decisions that genuinely freeze, one enumerator each. There is no `kMmap` or
 // `kPrefault`, and their absence is the contract: those two resolve per load.
 enum class ResidencyLatch {
-  // `Qwen35ExpertStreamRequested`'s function-local static, via
-  // `ResolveExpertStreamRequested`.
+  // `ResolveExpertStreamRequested`'s own function-local static. The flag behind it
+  // also carries WHICH answer was cached, because the refusal has to compare an
+  // incoming document against the decision rather than against the stored document.
   kExpertStream,
   // The slot store's `slots x slot_bytes` reservation, via
   // `NoteExpertStreamGeometry` when the store is built.
@@ -206,11 +252,14 @@ bool WeightResidencyLatched(ResidencyLatch knob);
 // True once ANY of them has.
 bool WeightResidencyLatched();
 
-// Drop the installed config AND both latches. Tests only: a latch is process-wide,
-// so a suite with more than one case needs to be able to clear it. It cannot undo
-// the function-local static inside `ResolveExpertStreamRequested`, which is why the
-// value that resolver returns is observable exactly once per process and has a test
-// binary of its own.
+// Drop the installed config, both latches, and the recorded slot geometry. Tests
+// only: a latch is process-wide, so a suite with more than one case needs to be able
+// to clear it. It cannot undo the function-local static inside
+// `ResolveExpertStreamRequested`, which is why the value that resolver returns is
+// observable exactly once per process and has a test binary of its own — a case that
+// resets and calls it again gets the SAME cached answer with the latch re-marked,
+// which is a state a production process can also be in (streaming decided by the
+// environment, nothing installed).
 void ResetWeightResidencyConfigForTesting();
 
 // env var (if set) > `configured` (if set) > `builtin_default`.
@@ -311,7 +360,9 @@ void NoteGgufPrefaultedSpan();
 // LATCHING, deliberately: the answer decides whether an ~18 GiB slot store is
 // built and whether the default-on grouped-MoE path is disabled, and those two
 // must not be able to disagree with each other later in the same process. That
-// latch is exactly why `SetWeightResidencyConfig` refuses a late install.
+// latch is exactly why `SetWeightResidencyConfig` refuses a late CHANGE to this
+// field — not a late install, which it accepts, and not a late document that omits
+// the field or agrees with what was decided.
 bool ResolveExpertStreamRequested();
 
 // The pure decision behind `ResolveExpertStreamRequested`, with the environment

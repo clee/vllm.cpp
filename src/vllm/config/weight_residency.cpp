@@ -45,7 +45,7 @@ struct Global {
   std::mutex mu;
   WeightResidencyConfig config;
 
-  // TWO LATCHES, NOT ONE, and mmap and prefault are in NEITHER. A single flag set
+  // TWO DECISIONS, NOT ONE, and mmap and prefault are in NEITHER. A single flag set
   // by every resolver refused a legal second load: `GgufLoadPolicy::FromEnv()` runs
   // per load and this change removed the prefault site's static, so those two knobs
   // freeze nothing, yet the coarse flag let an ordinary first load block a second
@@ -63,11 +63,22 @@ struct Global {
   //
   // RELAXED is enough, and the reason is NOT a synchronises-with edge. A relaxed
   // store made outside `mu` is not ordered by a later acquire of `mu`, so the
-  // earlier claim to that effect was wrong (#1122 L2). Two facts carry it instead.
-  // No config state is published through these flags — they carry one bit, "a
-  // decision was taken", and the config itself is read and written under `mu`. And
-  // each flag is monotonic: set to true, never cleared except by the test reset, so
-  // no ordering between two of them can be observed.
+  // earlier claim to that effect was wrong (#1122 L2). Three facts carry it instead.
+  //
+  // NOTHING IS PUBLISHED THROUGH a flag, even though each decision now carries its
+  // answer. The streaming answer is a value IN the tri-state atomic itself, read by
+  // the same single relaxed load that reads the fact; the geometry's two numbers live
+  // in `built_geometry`, written and read under `mu` by the same function that sets
+  // the geometry flag. So there is no second location a reader could see out of order
+  // with the flag.
+  //
+  // Each store is IDEMPOTENT. `ResolveExpertStreamRequested` writes the value of a
+  // function-local static, and thread-safe static initialisation — which is a real
+  // synchronising edge — makes that value identical on every call, so a concurrent
+  // reader sees either "nothing decided" or the one final answer.
+  //
+  // And each is MONOTONIC: it moves off its initial value once and never back except
+  // by the test reset, so no ordering between the two can be observed.
   //
   // WHAT IS NOT GUARANTEED, stated because it is a real window rather than a
   // theoretical one now that a second engine may install while a first decodes: an
@@ -79,17 +90,38 @@ struct Global {
   // whoever got there first decides. Every production path installs before the model
   // exists, so the window needs a caller that loads a second engine at the instant
   // the first one starts streaming.
-  std::atomic<bool> latched_expert_stream{false};
+  //
+  // THE STREAMING FLAG IS TRI-STATE, and that is what lets the refusal compare an
+  // incoming document against THE DECISION rather than against the stored document.
+  // 0 = nothing decided, 1 = decided OFF, 2 = decided ON. One atomic carries both
+  // the fact and the answer, so a reader takes ONE relaxed load and there is no
+  // ordering question between a "latched" flag and a separate "value" — which there
+  // would be if the answer lived in a second atomic. It still transitions exactly
+  // once (0 -> 1 or 0 -> 2, never back except by the test reset), so the monotonicity
+  // argument above is unchanged.
+  std::atomic<int> expert_stream_decision{0};
   std::atomic<bool> latched_geometry{false};
+
+  // The geometry the store was built with, under `mu`. It is the geometry ANSWER,
+  // the counterpart of the tri-state above, and it lives here rather than in a
+  // file-static so that `FrozenFields` — which already holds `mu` — can read it.
+  ExpertStreamGeometry built_geometry;
 
   bool Latched(ResidencyLatch knob) const {
     switch (knob) {
       case ResidencyLatch::kExpertStream:
-        return latched_expert_stream.load(std::memory_order_relaxed);
+        return expert_stream_decision.load(std::memory_order_relaxed) != 0;
       case ResidencyLatch::kExpertStreamGeometry:
         return latched_geometry.load(std::memory_order_relaxed);
     }
     return false;
+  }
+
+  // The streaming answer this process actually cached. Only meaningful once
+  // `Latched(kExpertStream)`; it reads false before that, which no caller relies on
+  // because every caller checks the latch first.
+  bool DecidedExpertStream() const {
+    return expert_stream_decision.load(std::memory_order_relaxed) == 2;
   }
 
   bool AnyLatched() const {
@@ -314,6 +346,36 @@ WeightResidencyConfig parse_weight_residency_extension_json(
   RejectUnknownKeys(doc, "",
                     {"offload_backend", "uva", "prefetch", "vllm_cpp"});
 
+  // ONE LEVEL INTO THE MIRRORED SUB-OBJECTS TOO, for the same reason and on the same
+  // authority. Closing only the top level left the identical hole one level down:
+  // `parse_offload_config_json` reads `uva.cpu_offload_gb` and the four `prefetch.*`
+  // fields BY NAME with a fallback (src/vllm/config/offload.cpp:272-281), so
+  // `{"uva":{"cpu_offload_GB":10}}` yielded a 0 GiB budget and
+  // `{"prefetch":{"offload_groupsize":8}}` a group size of 0 — no offloading at all,
+  // under a document the operator believes configures it, and under a public ABI
+  // comment that said an unknown key anywhere is refused (#1133 H3).
+  //
+  // Refusing them is MIRROR-FAITHFUL, not extra strictness: `UVAOffloadConfig`
+  // (vllm/config/offload.py:15-16 @ 555967922) and `PrefetchOffloadConfig` (:47-48)
+  // each carry `@config`, whose body sets `ConfigDict(extra="forbid")`
+  // (vllm/config/utils.py:68-69). Upstream refuses a nested typo, so the tolerance
+  // was the deviation.
+  //
+  // The names below are the mirrored parser's own — `cpu_offload_gb` (offload.py:23),
+  // `cpu_offload_params` (:34), `offload_group_size` (:54), `offload_num_in_group`
+  // (:62), `offload_prefetch_step` (:66), `offload_params` (:70) — and enumerating
+  // them HERE is exactly what keeps that parser a byte-faithful transcription. This
+  // one checks NAMES only; the mirrored parser keeps sole ownership of their types,
+  // defaults and bounds, so there is no second place a type rule could drift.
+  if (const nlohmann::json* u = ExtObject(doc, "uva", "")) {
+    RejectUnknownKeys(*u, "uva", {"cpu_offload_gb", "cpu_offload_params"});
+  }
+  if (const nlohmann::json* p = ExtObject(doc, "prefetch", "")) {
+    RejectUnknownKeys(*p, "prefetch",
+                      {"offload_group_size", "offload_num_in_group",
+                       "offload_prefetch_step", "offload_params"});
+  }
+
   const nlohmann::json* ext = ExtObject(doc, "vllm_cpp", "");
   if (ext == nullptr) return cfg;
   RejectUnknownKeys(*ext, "vllm_cpp", {"mmap", "expert_stream"});
@@ -337,27 +399,79 @@ WeightResidencyConfig parse_weight_residency_extension_json(
 
 namespace {
 
-// Which fields of an incoming config a taken decision has already frozen. `mmap`
+// Which fields of an incoming document a taken decision has already fixed. `mmap`
 // and `prefault` are in no branch here, and that is the whole point of the
 // function: they resolve per load, so a later engine may still set them.
+//
+// TWO PREDICATES CHANGED HERE, and they are the same root cause seen twice: absent
+// means UNCHANGED (#1133 H1).
+//
+// A field is scored only when the DOCUMENT SETS IT. `in.expert_stream !=
+// g.config.expert_stream` made `nullopt != engaged` true, so a second engine whose
+// document merely OMITTED the latched field was refused — the same hard failure on a
+// legal two-model load that #1122 M1 narrowed rather than removed, now reached by a
+// partial document instead of by a full one.
+//
+// And the comparison is against THE DECISION ACTUALLY TAKEN, resolved through the
+// same rule the production resolver applies, rather than against the stored document.
+// That fixes two things at once. A document asking for exactly what the process
+// resolved is accepted, where before it was refused by a message asserting the engine
+// was not running it — the engine was. And the environment comes out right in both
+// directions: `VT_MOE_EXPERT_STREAM=1` decided the answer, so a document that
+// variable overrides cannot change anything and is not refused, while a document that
+// WOULD change the answer still is.
 std::string FrozenFields(const Global& g, const WeightResidencyConfig& in) {
   std::string out;
   const auto note = [&out](const char* field) {
     if (!out.empty()) out += ", ";
     out += field;
   };
-  if (g.Latched(ResidencyLatch::kExpertStream) &&
-      in.expert_stream != g.config.expert_stream) {
-    note("expert_stream");
+  if (g.Latched(ResidencyLatch::kExpertStream) && in.expert_stream.has_value()) {
+    // The same function the resolver calls, with the same variable, so the two
+    // cannot disagree about what accepting this document would mean.
+    const bool would_resolve = ExpertStreamRequestedFrom(
+        std::getenv("VT_MOE_EXPERT_STREAM"), in.expert_stream);
+    if (would_resolve != g.DecidedExpertStream()) note("expert_stream");
   }
   if (g.Latched(ResidencyLatch::kExpertStreamGeometry)) {
-    if (in.expert_stream_slots != g.config.expert_stream_slots) {
-      note("expert_stream_slots");
+    // `EnvCountThatWins` is the same predicate `ResolveResidencyCount` uses, so a
+    // count the variable overrides is not a change either.
+    if (in.expert_stream_slots.has_value()) {
+      const int64_t would_resolve =
+          EnvCountThatWins("VT_MOE_EXPERT_STREAM_SLOTS")
+              .value_or(*in.expert_stream_slots);
+      if (would_resolve != g.built_geometry.slots) note("expert_stream_slots");
     }
-    if (in.expert_stream_slot_bytes != g.config.expert_stream_slot_bytes) {
-      note("expert_stream_slot_bytes");
+    if (in.expert_stream_slot_bytes.has_value()) {
+      const int64_t would_resolve =
+          EnvCountThatWins("VT_MOE_EXPERT_STREAM_SLOT_BYTES")
+              .value_or(*in.expert_stream_slot_bytes);
+      if (would_resolve != g.built_geometry.slot_bytes) {
+        note("expert_stream_slot_bytes");
+      }
     }
   }
+  return out;
+}
+
+// What the engine DECIDED, for the refusal message. It used to print the stored
+// document, which is the wrong thing to show beside "the engine is not running this":
+// the operator has to reconcile their document against the values in force, and after
+// the merge the stored document is not those values either.
+std::string DecisionSummary(const Global& g) {
+  std::string out;
+  if (g.Latched(ResidencyLatch::kExpertStream)) {
+    out += std::string("expert_stream=") +
+           (g.DecidedExpertStream() ? "on" : "off");
+  }
+  if (g.Latched(ResidencyLatch::kExpertStreamGeometry)) {
+    if (!out.empty()) out += " ";
+    out += "expert_stream_slots=" + std::to_string(g.built_geometry.slots) +
+           " expert_stream_slot_bytes=" +
+           std::to_string(g.built_geometry.slot_bytes);
+  }
+  // Unreachable from the one caller, which runs only when a decision was taken.
+  if (out.empty()) out = "nothing decided yet";
   return out;
 }
 
@@ -366,34 +480,46 @@ std::string FrozenFields(const Global& g, const WeightResidencyConfig& in) {
 void SetWeightResidencyConfig(const WeightResidencyConfig& config) {
   Global& g = State();
   std::lock_guard<std::mutex> lk(g.mu);
-  if (config.empty()) {
-    // An EMPTY install after a latch is a NO-OP, not an overwrite. A second engine
-    // in the same process carries no residency config of its own, and letting it
-    // clear the first one's would change what a store built LATER reads: the expert
-    // slot store is constructed lazily, on the first slice taken, which can be long
-    // after a second engine loaded. So the stored value survives.
-    if (g.AnyLatched()) return;
-    g.config = config;
-    return;
-  }
-  // REFUSE ONLY WHAT CANNOT BE HONOURED. An equal re-install changes no field and
-  // passes; so does a document that touches only knobs nothing has frozen, which is
-  // the ordinary two-engine load. A field a taken decision has fixed is refused,
-  // because recording it would publish a configuration the engine is not running —
-  // the invisible-fallback shape this tree refuses everywhere else.
+  // REFUSE ONLY WHAT CANNOT BE HONOURED. A document that sets a decided field to a
+  // value that would resolve differently from the decision is refused, because
+  // recording it would publish a configuration the engine is not running — the
+  // invisible-fallback shape this tree refuses everywhere else. Everything else
+  // passes: an equal re-install, a document touching only unfrozen knobs (the
+  // ordinary two-engine load), a document that OMITS a decided field, and one that
+  // asks for what was decided. The empty document needs no special case at all now:
+  // it sets nothing, so `FrozenFields` scores nothing and the merge below copies
+  // nothing.
   const std::string frozen = FrozenFields(g, config);
   if (!frozen.empty()) {
     throw std::logic_error(
         "weight residency config: " + frozen +
-        " cannot be changed after this process already latched that decision (" +
-        (g.config.empty() ? std::string("environment/default")
-                          : g.config.Describe()) +
+        " cannot be changed after this process already decided it (" +
+        DecisionSummary(g) +
         "). The streaming answer is cached on first read and the slot store is "
         "built once, so accepting this would record a configuration the engine "
-        "is not running. Install it before any weight I/O. `mmap` and "
-        "`prefault` are NOT latched and can still be set by a later engine");
+        "is not running. Install it before any weight I/O. A document that OMITS "
+        "a decided field, or asks for what was decided, is accepted; so are "
+        "`mmap` and `prefault`, which no decision fixes");
   }
-  g.config = config;
+  // MERGE, FIELD BY FIELD, because an absent field means UNCHANGED. `g.config =
+  // config` replaced wholesale, so a second engine's partial document silently
+  // dropped the first engine's fields: `expert_stream=on` with 8000 slots became OFF
+  // with 64, with no diagnostic, and the slot store reads those values LAZILY — on
+  // the first slice taken, which can be long after the second engine loaded (#1133
+  // H2). The wholesale replace predates the per-field refusal, but that narrowing
+  // widened its reach: before it, any differing document after a decision threw, so
+  // the drop could not happen once anything had been decided.
+  if (config.mmap.has_value()) g.config.mmap = config.mmap;
+  if (config.prefault.has_value()) g.config.prefault = config.prefault;
+  if (config.expert_stream.has_value()) {
+    g.config.expert_stream = config.expert_stream;
+  }
+  if (config.expert_stream_slots.has_value()) {
+    g.config.expert_stream_slots = config.expert_stream_slots;
+  }
+  if (config.expert_stream_slot_bytes.has_value()) {
+    g.config.expert_stream_slot_bytes = config.expert_stream_slot_bytes;
+  }
 }
 
 // BY VALUE, and copied under the lock. Returning a reference and then releasing
@@ -416,8 +542,16 @@ void ResetWeightResidencyConfigForTesting() {
   Global& g = State();
   std::lock_guard<std::mutex> lk(g.mu);
   g.config = WeightResidencyConfig{};
-  g.latched_expert_stream.store(false, std::memory_order_relaxed);
+  g.expert_stream_decision.store(0, std::memory_order_relaxed);
   g.latched_geometry.store(false, std::memory_order_relaxed);
+  // The geometry ANSWER goes with its flag. Leaving it behind would make
+  // `BuiltExpertStreamGeometry()` report a store this process no longer claims to
+  // have built, which contradicts the accessor's own "both zero until something
+  // builds one". NO TEST OBSERVES THIS, and the mutation that removes the line stays
+  // GREEN: the numbers are read only while the geometry latch is set, and the reset
+  // clears that too. It is coherence between an accessor and its documented contract,
+  // not a gated guarantee, and it is recorded as such rather than claimed as tested.
+  g.built_geometry = ExpertStreamGeometry{};
 }
 
 // NEITHER of these two helpers marks a latch. A latch is a property of the SITE
@@ -466,24 +600,20 @@ void NoteGgufPrefaultedSpan() {
   PrefaultedSpans().fetch_add(1, std::memory_order_relaxed);
 }
 
-namespace {
-ExpertStreamGeometry& BuiltGeometry() {
-  static ExpertStreamGeometry g;
-  return g;
-}
-}  // namespace
-
 ExpertStreamGeometry BuiltExpertStreamGeometry() {
   Global& g = State();
   std::lock_guard<std::mutex> lk(g.mu);
-  return BuiltGeometry();
+  return g.built_geometry;
 }
 
 void NoteExpertStreamGeometry(int64_t slots, int64_t slot_bytes) {
   Global& g = State();
   std::lock_guard<std::mutex> lk(g.mu);
-  BuiltGeometry().slots = slots;
-  BuiltGeometry().slot_bytes = slot_bytes;
+  // Into `Global` rather than a file-static, so `FrozenFields` — which already holds
+  // `mu` — can compare an incoming document against what was actually built instead
+  // of against what was stored.
+  g.built_geometry.slots = slots;
+  g.built_geometry.slot_bytes = slot_bytes;
   // THE GEOMETRY LATCH, and this is the moment it happens: the store now holds a
   // `slots x slot_bytes` reservation for the life of the process and cannot be
   // resized. Reading the two sizes freezes nothing; building the store does. Marked
@@ -515,15 +645,16 @@ bool ResolveExpertStreamRequested() {
         std::getenv("VT_MOE_EXPERT_STREAM"),
         ActiveWeightResidencyConfig().expert_stream);
   }();
-  // Mark the latch even on a cached call. Whether the value came from this call
-  // or an earlier one, the process's answer is fixed from here, and that is the
-  // fact SetWeightResidencyConfig has to refuse a late CHANGE against.
+  // Record the decision AND its answer even on a cached call. Whether the value came
+  // from this call or an earlier one, the process's answer is fixed from here, and
+  // that pair is what SetWeightResidencyConfig compares a late document against. The
+  // store is idempotent: `on` is a static, so every call writes the same enumerator.
   //
-  // THIS IS WHY THE FLAG IS ATOMIC. This function is reached once per expert slice
+  // THIS IS WHY IT IS AN ATOMIC. This function is reached once per expert slice
   // through `KqExpertSlice`, so taking the process-wide mutex here would put a lock
   // in the decode loop of the lane the row is about. A relaxed store costs nothing
   // measurable and carries the only guarantee the install needs.
-  State().latched_expert_stream.store(true, std::memory_order_relaxed);
+  State().expert_stream_decision.store(on ? 2 : 1, std::memory_order_relaxed);
   return on;
 }
 
