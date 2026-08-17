@@ -848,6 +848,13 @@ add_library(vllm STATIC
   # the latent spatial upsampler, the duration head and the embeddings
   # connector. Additive files mirroring ltx_core's own structure.
   src/vllm/model_executor/models/ltx2_pipeline.cpp
+  # LTX-2.5 (ROW LTX25-RES2S-LOOP, issue #921): the res_2s second-order sampler.
+  # Its own TU because upstream partitions it that way — a STEPPER advances one
+  # substep and lives in ltx-core/components/diffusion_steps.py, which
+  # ltx2_pipeline.cpp mirrors, while a SAMPLER decides how many substeps there
+  # are and what is evaluated between them and lives in
+  # ltx-pipelines/utils/samplers.py. Two upstream packages, two files here.
+  src/vllm/model_executor/models/ltx2_samplers.cpp
   src/vllm/model_executor/models/ltx2_upsampler.cpp
   # LTX-2.5 (ROW LTX25-DFR-PIPELINE, issue #986): the DFR canvas layout — the
   # keyframe segment grid, the temporal tile ranges and the latent stitch. Its
@@ -1235,6 +1242,9 @@ add_library(vllm STATIC
   # translation units, reached through vllm's INTERFACE --whole-archive option.
   src/vt/cpu/cpu_conv2d.cpp
   src/vt/cpu/cpu_conv1d_depthwise.cpp
+  # BigVGAN / DAC vocoder 1-D convolutions (#672). Self-registering, reached the
+  # same --whole-archive way as the conformer kernels above.
+  src/vt/cpu/cpu_conv1d_general.cpp
   src/vt/cpu/cpu_attn_relpos.cpp
   src/vt/cpu/cpu_cache.cpp
   src/vt/cpu/cpu_mla_attn.cpp
@@ -1631,6 +1641,9 @@ if(VLLM_CPP_CUDA)
     src/vt/cuda/cuda_laguna.cu
     src/vt/cuda/cuda_minimax_h3.cu
     src/vt/cuda/cuda_ltx2.cu
+    # BigVGAN / DAC vocoder 1-D convolutions (#672) — the first transposed 1-D
+    # convolution in the tree on any device.
+    src/vt/cuda/cuda_conv1d_general.cu
     src/vt/cuda/cuda_attention_cross.cu)
   find_package(CUDAToolkit REQUIRED)
   # cublasLt is linked now so the Task 4 matmul lands without a build change.
