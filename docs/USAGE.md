@@ -3472,8 +3472,10 @@ the one arm where the target grid is correct.
 Upstream runs this pipeline on the FULL model
 (`ltx-2.5-22b-dev-transformer-bf16.safetensors`, 42,018,190,584 bytes, 4349
 tensors, 21.004 B parameters, pure BF16, `model_version` `2.5.0`), which is on
-the NAS and header-verified. **It cannot be loaded yet**: `PlanDit` refuses a
-pure-BF16 DiT ([#1148](https://github.com/mudler/vllm.cpp/issues/1148)). Do
+the NAS and header-verified, and which `LTX25-BF16-DIT`
+([#1148](https://github.com/mudler/vllm.cpp/issues/1148)) made loadable. **What
+is owed is the run**: a comparison against upstream's own render on the same
+checkpoint, prompt and seed. Nothing here has been measured against it. Do
 **not** substitute a distilled transformer to try the arm out — the distilled
 scales are trained into those weights, so a CFG-guided stage 1 on top samples a
 trajectory they were never trained for and renders a plausible clip with nothing

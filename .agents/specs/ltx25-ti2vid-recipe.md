@@ -23,9 +23,9 @@ pipeline is the first arm whose upstream schedule anchor this engine cannot
 already express. The docs and the CLI help that list the kinds.
 
 **Out.** The three arms #1150 leaves divergent on that same anchor — see
-`## Owed`. Per-phase adapter STRENGTH (#1144). The real-weights render, blocked
-by #1148 — see `## What is NOT verified`. `ti2vid_two_stages_mgpu.py`, which is
-`kMultiGpuParallelism`.
+`## Owed`. Per-phase adapter STRENGTH (#1144). The real-weights render, which
+needs a GPU lease — see `## What is NOT verified`. `ti2vid_two_stages_mgpu.py`,
+which is `kMultiGpuParallelism`.
 
 ## Why it is not a recipe we already ship
 
@@ -361,9 +361,17 @@ byte-verified (42,018,190,584 B, 4349 tensors, 21.004 B params, pure BF16;
 `ltx25-phase-lora.md` `## Owed` records the header read), and the distilled
 adapter is beside it (8,899,889,568 B). So the artifacts are no longer missing.
 
-**`PlanDit` refuses a pure-BF16 DiT**, which is
-[#1148](https://github.com/mudler/vllm.cpp/issues/1148), in flight in parallel,
-and it blocks every Full-model arm including this one.
+**`PlanDit` used to refuse a pure-BF16 DiT**, which was
+[#1148](https://github.com/mudler/vllm.cpp/issues/1148) and was named here as
+this row's blocker. **It closed while this row was in flight**, at `40a796aa9`
+(row `LTX25-BF16-DIT`), which this branch merged before pushing. So the load
+path is no longer the obstacle and the paragraph that said it was would have
+shipped stale.
+
+**What remains owed is therefore the RUN, not a fix and not an artifact**: a GPU
+lease, a build on that host, upstream's render and ours on the same checkpoint,
+prompt and seed, and the comparison. `dgx:gpu0` reads `unhealthy` and no GPU
+work is in this row's scope, so it is owed rather than attempted.
 
 **Running this arm against a DISTILLED checkpoint instead would be worse than
 not running it.** The distilled scales are trained INTO those weights, so a
@@ -475,8 +483,12 @@ RED before the recipe landed, captured on the same binaries: `test_ltx2_pipeline
   additionally need is their own goldens and their own fresh review, because
   flipping them re-samples five shipped arms.
 - **The real-weights comparison against upstream's own render** on the dev
-  transformer, same seed and prompt — owed on #1148, and the run rather than the
-  artifacts.
+  transformer, same checkpoint, prompt and seed. Neither the artifacts nor the
+  load path is missing any more: #1148 closed at `40a796aa9` while this row was
+  in flight, and this branch merged it. What is owed is a GPU lease and the two
+  renders. No owning issue is filed for it, because #644 owns the standing
+  "close every refused arm" sweep and every LTX arm shipped to date carries the
+  same debt; filing one per arm would be six issues saying one thing.
 - **Per-phase adapter STRENGTH**, [#1144](https://github.com/mudler/vllm.cpp/issues/1144).
   Not needed here: upstream gives this pipeline `loras=tuple(loras)` against
   `(*loras, *distilled_lora)`, i.e. ABSENT vs PRESENT, which
