@@ -461,6 +461,70 @@ void Ltx2WidenDitToF32(Ltx2DitCheckpoint& checkpoint);
 Ltx2DitCheckpoint Ltx2StreamDitToDevice(vt::Queue& queue, const SafetensorsFile& file,
                                          const Ltx2DitLoadOptions& options = {});
 
+// Bring an ALREADY-LOADED checkpoint to the adapter state one PHASE wants.
+//
+// ─── WHY THIS EXISTS ─────────────────────────────────────────────────────────
+//
+// `options.loras` is a property of the LOAD, and upstream's is a property of the
+// STAGE. Four pipelines build two `DiffusionStage`s from one checkpoint and hand
+// them different adapter sets, read at Lightricks/LTX-2 fd4ded7f:
+//
+//   a2vid_two_stage.py:107      `loras=tuple(loras)`
+//   a2vid_two_stage.py:114        vs `(*loras, *distilled_lora)`
+//   ti2vid_two_stages.py:140    `loras=tuple(loras)`
+//   ti2vid_two_stages.py:151      vs `(*tuple(loras), *distilled_lora)`
+//   ti2vid_two_stages_hq.py:154 `(*loras, distilled_lora_stage_1)`
+//   ti2vid_two_stages_hq.py:165   vs `(*loras, distilled_lora_stage_2)`
+//   ic_lora.py:108              `loras=tuple(loras)`
+//   ic_lora.py:119                vs `loras=()`   <- the mirror image
+//
+// Upstream pays for that with a SECOND `from_checkpoint` call against THE SAME
+// FILE — `model_paths.transformer()` at `a2vid_two_stage.py:104` and `:116`,
+// `ti2vid_two_stages.py:137` and `:148` — differing only in the adapter tuple.
+// It is a second MATERIALIZATION, not a second model, and that is exactly what
+// this function is. A second resident weight set would be a heavier
+// architecture than the reference: the DiT is 18.7 GB nvfp4, 21.0 GB fp8 and
+// ~39 GB bf16, against one GB10's 119 GB of unified memory with no swap.
+//
+// ─── WHAT IT DOES, AND WHY NOT THE TWO CHEAPER THINGS ────────────────────────
+//
+// For every contract tensor the adapters target it re-materializes the tensor
+// from `file` through the SAME `MaterializeDitTensor` the load uses, fuses the
+// adapters back in when `fuse` is true, and writes the result into the buffer
+// the view ALREADY points at. So:
+//
+//   * the view pointer never moves, and `checkpoint.weights` — a pure view
+//     struct — stays valid without being re-bound;
+//   * peak residency rises by ONE tensor plus the adapter's own A/B factors,
+//     never by a second weight set;
+//   * each phase gets `round_bf16(W + delta)` computed from the PRISTINE base,
+//     which is upstream's arithmetic rather than an approximation of it.
+//
+// NOT by SUBTRACTING the delta, which needs no file read and is wrong:
+// `round_bf16(round_bf16(W + d) - d)` is not `W`. The rounding is the whole
+// reason the accumulator dtype is pinned in `ltx2_lora.h`, and a subtract would
+// spend it twice. `test_ltx2_loader` compares byte-for-byte against a fresh
+// unfused load precisely so that implementation fails.
+//
+// NOT by applying the adapter UNFUSED at run time, which is `Wx + s*B(Ax)`
+// against upstream's `round_bf16(W + s*BA)x`. That is a rounding divergence AND
+// a different GEMM path, and it would change every arm's numerics to serve one
+// recipe.
+//
+// A tensor no adapter names is not touched at all, because for those the fused
+// and unfused images are equal by construction.
+//
+// `queue` is non-null exactly when the checkpoint was staged to a device, in
+// which case the write back is a `Copy` into the same device allocation. Passing
+// a queue for a host checkpoint, or none for a staged one, refuses by name
+// rather than writing to the wrong address space.
+//
+// Calling this with the state the checkpoint is already in is a no-op it detects
+// itself, so a single-phase recipe pays nothing.
+void Ltx2RebindDitLoras(vt::Queue* queue, const SafetensorsFile& file,
+                        const Ltx2DitLoadOptions& options, bool fuse,
+                        Ltx2DitCheckpoint& checkpoint);
+
 // ---------------------------------------------------------------------------
 // The text encoder
 // ---------------------------------------------------------------------------

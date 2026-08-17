@@ -269,12 +269,50 @@ Blocks #1093, #1096. Bounds #921.
 | Unfused runtime LoRA, phase-selectable | + the adapter | `Wx + s*B(Ax)` against upstream's `round_bf16(W + s*BA)x` | REJECTED |
 | Re-materialize the affected tensors at the phase boundary | none | exact | CHOSEN |
 
-Shape A is not viable on one GB10: 119 GB unified, `vm.overcommit_memory=1`,
-zero swap, and no OOM line — the box goes down when memory is oversubscribed,
-twice in the week this row was written. Shape B is a rounding divergence AND a
-different GEMM path, so it would change every arm's numerics to serve one
-recipe. Shape C spends wall-clock at a boundary that happens once or twice per
-render, and on this fleet wall-clock is not the constraint that reboots the box.
+**The premise that shape A mirrors upstream is FALSE, and correcting it removes
+the only argument that made shape A look principled.** The dispatch that opened
+this row, and #1118 itself, both describe upstream as paying "two
+`DiffusionStage.from_checkpoint` calls" as though it held two models. It does
+not. Both calls name the SAME file:
+
+```text
+a2vid_two_stage.py:103   self.stage_1 = DiffusionStage.from_checkpoint(
+a2vid_two_stage.py:104       model_paths.transformer(),
+a2vid_two_stage.py:107       loras=tuple(loras),
+a2vid_two_stage.py:114   stage_2_loras = (*tuple(loras), *tuple(distilled_lora))
+a2vid_two_stage.py:115   self.stage_2 = DiffusionStage.from_checkpoint(
+a2vid_two_stage.py:116       model_paths.transformer(),
+a2vid_two_stage.py:119       loras=stage_2_loras,
+```
+
+`ti2vid_two_stages.py:136`/`:147` has the identical shape. So upstream pays two
+MATERIALIZATIONS of one checkpoint with different adapter tuples, which is what
+shape C is. Shape C is therefore the faithful mirror rather than the cheap
+substitute, and shape A would invent a heavier architecture than the reference.
+
+Shape A is also not viable on one GB10 regardless: 119 GB unified,
+`vm.overcommit_memory=1`, zero swap, and no OOM line — the box goes down when
+memory is oversubscribed, twice in the week this row was written. Shape B is a
+rounding divergence AND a different GEMM path, so it would change every arm's
+numerics to serve one recipe. Shape C spends wall-clock at a boundary that
+happens once or twice per render, and on this fleet wall-clock is not the
+constraint that reboots the box.
+
+**The field is a per-phase SET, not a per-phase boolean, and the difference is
+load-bearing.** Upstream needs two placements, not one:
+
+| Placement | Pipelines | `ltx-pipelines/CLAUDE.md` |
+|---|---|---|
+| adapter on stage 2 ONLY | TI2Vid, A2Vid, Keyframe | `:48` |
+| adapter on BOTH stages | HQ, DFR | `:49`, `:50-51` |
+
+`Ltx2PhaseLoraScope` expresses both: stage 1 `kNoAdapters` with stage 2
+defaulted gives the first, and both phases defaulted gives the second. Two
+enumerators are the COMPLETE space here rather than a boolean standing in for a
+set, because the adapter arity is capped at one by a gated refusal
+(`ltx2_lora.h:167-172`, case "ltx2 lora: more than one adapter refuses BY
+NAME"), so the powerset of the load's adapters has exactly two members. The day
+that cap lifts, the third value goes here.
 
 **What shape C actually costs, stated rather than waved at.** The rebind
 re-reads the adapter file and re-materializes only the tensors that adapter
