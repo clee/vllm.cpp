@@ -18,11 +18,23 @@ lease exists to remove. The procedure is in the `leasing-a-gpu` skill, which
 this repository deliberately does not copy, because a copy goes stale without
 saying so.
 
-`AGENTS.md` §`Work on a GPU happens inside a lease` holds the rule, and it is
-conditional. Where the host has `rc`, the lease is the required path and it
-replaces the file mutex as the default. Where the host does not have `rc`, take
-`${GPU_LOCK:-$HOME/gpu.lock}` as before. Run `rc devices` to find out which case
-you are in. A `command not found` answer is the second case.
+`AGENTS.md` §`Work on a GPU happens inside a lease` holds the rule, and its
+condition is the DEVICE rather than the shell you are typing in. `dgx:gpu0`,
+`thor:gpu0` and `orin:gpu0` are the fleet devices, so a lease is the required
+path to each of them and it replaces the file mutex as the default. The three
+names are listed in both files so that membership stays checkable when the
+client is not at hand. On a GPU that is not one of them, take
+`${GPU_LOCK:-$HOME/gpu.lock}` as before.
+
+`rc devices` lists the fleet when your shell has the client AND the controller
+answers, so it reports your access and not the device's membership. It fails in
+at least three ways that a reader must not collapse into one: `command not
+found` means this shell lacks the client, and a timeout or a refused
+authentication means the controller is not answering. `thor:gpu0` read `unknown
+(no contact 1m0s)` on 2026-08-17, so lost contact is a live state. On a fleet
+device every one of those answers means get the client or report the controller
+down. None of them means take the file mutex over `ssh`, because that is the
+collision below, in which two mutexes could not see each other.
 
 **This REPLACED the `ssh <host>` plus `flock` mechanism that the profiles later
 in this file still describe.** Read a historical recipe as evidence of what ran
@@ -87,8 +99,13 @@ pinned oracle venv lives at `~/venvs/vllm-oracle-pin-555967922` on the dgx HOST,
 and a leased worker cannot see it. The dgx host has carried no toolchain since
 the 2026-08-14 reimage, so host-side oracle work needs `sudo -n docker run`
 against `vllmcpp-build:gb10` or `nvidia/cuda:13.0.1-devel-ubuntu24.04`, reached
-over `ssh`, which is the bypass. **So no vLLM leg of any row can currently run
-on `dgx.casa` by any lease-compliant path** ([#1129](https://github.com/mudler/vllm.cpp/issues/1129)).
+over `ssh`, which is the bypass. **No vLLM leg of any row can currently run on
+`dgx.casa` by a lease-compliant path, because nothing has staged a runtime on
+the NAS** ([#1129](https://github.com/mudler/vllm.cpp/issues/1129)). Read that
+reason carefully, because it is no longer the worker's missing toolchain. "The
+lease carries bytes, and the exec bit is a mount option" below measures staged
+content starting under the dynamic loader and after a copy to `/tmp`, so what
+blocks the oracle is that nothing has put a runtime where a lease can see it.
 That is why recent GPU work reached for `ssh`, and the bypass is a symptom of
 this gap rather than a discipline problem. Do not design the migration here. The
 row that takes #1129 owns it.

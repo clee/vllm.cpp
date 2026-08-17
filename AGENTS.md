@@ -411,17 +411,27 @@ lifecycle write.
 
 The shared GPUs are managed by
 [resource-controller](https://github.com/mudler/resource-controller), whose
-client is `rc`. **When the host has `rc`, claim the device with `rc run` or
-`rc hold` before any GPU work, and never `ssh` to a GPU box to run work
-directly.** The lease is the required path there, and it replaces the `flock`
-file mutex as the default.
+client is `rc`. **`dgx:gpu0`, `thor:gpu0` and `orin:gpu0` are the fleet devices.
+Claim a fleet device with `rc run` or `rc hold` before any GPU work, and never
+`ssh` to one to run work directly.** The lease is the required path to those
+boxes, and it replaces the `flock` file mutex as the default. The three names
+are written here so that membership stays checkable when the client is not at
+hand.
 
-**When the host does not have `rc`, take the file mutex
-`${GPU_LOCK:-$HOME/gpu.lock}` instead.** The rule is conditional because the
-hosts are not identical, and a reader on a box without the tool still needs an
-instruction. Where both exist, the mutex runs inside the lease and never instead
-of one. The lease decides who gets the box. The mutex serialises the work of
-whoever holds it.
+**The condition is the device, not the shell you are typing in.** A missing
+local `rc`, a controller that does not answer, and a refused authentication are
+each a reason to get the client or to report the controller down. None of them
+turns a fleet device into a box you may reach by `ssh` plus `flock`, because the
+fleet cannot see that mutex. `thor:gpu0` read `unknown (no contact 1m0s)` on
+2026-08-17, so a controller that loses contact is a live state and not a
+hypothetical.
+
+**On a GPU that is not a fleet device, take the file mutex
+`${GPU_LOCK:-$HOME/gpu.lock}`.** The rule is conditional because the hosts are
+not identical, and a reader on a personal machine still needs an instruction.
+Where both apply, the mutex runs inside the lease and never instead of one. The
+lease decides who gets the box. The mutex serialises the work of whoever holds
+it.
 
 **Two mutexes that do not exclude each other are worse than one, and this
 already cost a measurement.** On 2026-08-17 one session took the file mutex over
