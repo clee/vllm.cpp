@@ -20,15 +20,35 @@
 // they are different files here.
 //
 // ─── THE SAMPLER *IS* THE HQ VARIANT ─────────────────────────────────────────
-// `TI2VidTwoStagesHQPipeline` differs from `TI2VidTwoStagesPipeline` in exactly
-// three things (ti2vid_two_stages_hq.py:258, :292/:335, and LTX_2_3_HQ_PARAMS at
-// utils/constants.py:95-115). Two of them are this loop. So a build that served
-// the HQ preset's 15 steps and 0.45 rescale on the Euler loop would render a
-// plausible clip at HALF the model evaluations the preset was tuned for, and
-// there is no shape, frame count, sample rate or pixel that says so. The one
-// observable that separates the two samplers is the number of DiT evaluations,
-// which is why `Ltx2Res2sLoopStats::evaluations` exists and why the suite asserts
-// an exact number rather than a bound.
+// `TI2VidTwoStagesHQPipeline` differs from `TI2VidTwoStagesPipeline` in SEVERAL
+// things, and this loop is two of them: `stepper=Res2sDiffusionStep()`
+// (ti2vid_two_stages_hq.py:258) and `loop=res2s_audio_video_denoising_loop`
+// passed to both stages (:292, :335). The others, measured by diffing the two
+// files at `fd4ded7f` rather than asserted: `LTX_2_3_HQ_PARAMS`
+// (utils/constants.py:95-115); stage 1 loads the distilled LoRA at
+// `distilled_lora_strength_stage_1` where the plain pipeline loads none on that
+// stage (:92-101 against ti2vid_two_stages.py:140); the stage-1 schedule is
+// derived as `execute(latent=empty_latent, steps=...)` against the plain
+// pipeline's `execute(steps=...)`, which `schedulers.py:32` makes a
+// RESOLUTION-DEPENDENT shift rather than the 4096-token default; and
+// `GuidedDenoiser` (:271-281) replaces `FactoryGuidedDenoiser`. This comment
+// said "exactly three things" until 2026-08-17, and the count was wrong in a
+// load-bearing way, because it was the argument for what this row had to port.
+//
+// So a build that served the HQ preset's 15 steps and 0.45 rescale on the Euler
+// loop would render a plausible clip at HALF the denoiser calls the preset was
+// tuned for, and there is no shape, frame count, sample rate or pixel that says
+// so. The one observable that separates the two samplers is the number of
+// denoiser evaluations, which is why `Ltx2Res2sLoopStats::evaluations` exists
+// and why the suite asserts an exact number rather than a bound.
+//
+// AND THE COUNT OF EVALUATIONS CANNOT SEE THE OTHER HALF. Each evaluation on
+// the HQ stage 1 is THREE transformer forwards, because `GuidedDenoiser` runs
+// the conditional, unconditional and isolated-modality passes
+// (denoisers.py:100-137) at cfg 3.0 and modality 3.0. An arm that ran this
+// sampler around a bare unguided forward reports the same evaluation count this
+// file gates. `Ltx2ConditioningTrace::dit_forwards` is the second counter, and
+// it is what the engine's gate reads.
 //
 // ─── DTYPE, AND WHY IT IS NOT f32 HERE ───────────────────────────────────────
 // This is the one LTX-2.5 path whose interior is DOUBLE, and that is upstream's
@@ -36,11 +56,25 @@
 // with the comment "float64 on CUDA/CPU for ODE numerical stability"
 // (samplers.py:261-262). Every anchor, epsilon, midpoint and combination below
 // is `double`; the LATENT that enters and leaves is f32, which is this port's
-// `model_dtype`, matching upstream's `.to(model_dtype)` at :370, :375, :431,
-// :433, :442 and :445.
+// `model_dtype`, at the positions upstream writes `.to(model_dtype)` — :370,
+// :375, :431, :433, :442 and :445.
+//
+// AND THE TWO `model_dtype`s ARE NOT THE SAME WIDTH. Upstream's loop declares
+// `model_dtype: torch.dtype = torch.bfloat16` (samplers.py:221) and the HQ
+// pipeline overrides nothing (`DiffusionStage.__call__` passes six keyword
+// arguments, utils/blocks.py:566-573), so upstream stores this latent at bf16
+// where this port stores it at f32 — twice the bytes on the largest buffer in
+// the loop. That is a PORT-WIDE pre-existing choice, not this row's: every
+// LTX-2.5 host path here is f32 (`ltx2.h`), and narrowing one loop's storage
+// would put a bf16 tensor into an f32 pipeline. It is stated here because
+// `AGENTS.md` "Inherit vLLM defaults" says a wider dtype is invisible to every
+// correctness gate this project owns, so it has to be written down where the
+// divergence lives rather than discovered later.
 //
 // The already-ported ANCESTRAL loop does the opposite and steps in float32
-// (samplers.py:550-551 calls `.float()` on both operands). Two loops, two
+// (samplers.py:550 calls `.float()` on the SAMPLE; the denoised operand was
+// already floated at :484, so only one `.float()` sits at the step call and a
+// reader looking for two at :550-551 finds one). Two loops, two
 // precisions, in one file. Neither is a widening choice made here.
 #pragma once
 
@@ -80,7 +114,8 @@ namespace vllm {
 // is observable and the suite pins it. Do not "fix" this function.
 double Ltx2Phi(int64_t j, double neg_h);
 
-// The `phi_cache` upstream threads through the loop (res2s.py:29, :37-44),
+// The `phi_cache` upstream threads through the loop (res2s.py:25 the parameter,
+// :37-44 the lookup; `:29` is the docstring line for `h`, not the cache),
 // keyed on `(j, neg_h)` exactly as upstream keys it (res2s.py:39). It changes no
 // value — every hit returns what a recompute would — and it is mirrored because
 // the loop OWNS one across iterations (samplers.py:287) and a reader comparing
@@ -163,14 +198,28 @@ inline constexpr float kLtx2Res2sTerminalSigma = 0.0011f;
 struct Ltx2Res2sHooks {
   // `denoiser(transformer, video_state, audio_state, sigmas, step_index)`
   // (samplers.py:301, :380-386). Writes each modality's DENOISED prediction —
-  // upstream's `X0Model` returns x0, not velocity (blocks.py:480-482) — at the
+  // upstream's `X0Model` returns x0, not velocity (ltx-core
+  // model/transformer/model.py:590-604 is the forward that converts;
+  // utils/blocks.py:480-482 only shows that the loop is handed that TYPE, and
+  // the `utils/` prefix matters because a second `blocks.py` exists under
+  // ltx-core model/video_vae/transformer/) — at the
   // model dtype, which here is f32.
   //
-  // A SCALAR SIGMA, not a schedule and an index, because both upstream call
-  // sites reduce to `sigmas[step_index]` inside the denoiser
-  // (utils/denoisers.py:237) and the second one already passes a ONE-element
+  // A SCALAR SIGMA, not a schedule and an index into it, because all three
+  // upstream call sites reduce to `sigmas[step_index]` inside the denoiser
+  // (utils/denoisers.py:237) and the substep one already passes a ONE-element
   // schedule with index 0 (samplers.py:384-385). Handing a pair to this hook
   // would invite a caller to index it differently from upstream.
+  //
+  // `step_index` IS STILL PASSED, because it is a SECOND argument upstream's
+  // `Denoiser` takes and the denoiser reads it for something other than the
+  // sigma: `should_skip_step` is `step % (skip_step + 1) != 0`
+  // (guiders.py:287-291). The three call sites pass three different things —
+  // `step_idx` (samplers.py:301), a literal `0` (samplers.py:385) and
+  // `n_full_steps` (samplers.py:437) — so the substep evaluation is never
+  // skipped whatever the request's `skip_step` is. Deriving it here from the
+  // loop counter instead would silently skip half of a step's evaluations on a
+  // request that sets `skip_step`, and no rendered frame would show it.
   //
   // `double`, AND THE NARROWING BELONGS TO THE CALLER. The two evaluations are
   // handed different widths upstream: the first gets an entry of the float32
@@ -180,7 +229,7 @@ struct Ltx2Res2sHooks {
   // happen somewhere; it happens at that interface, in the engine, and not here,
   // so the loop stays the shape upstream's is.
   std::function<void(const std::vector<float>& video_latent,
-                     const std::vector<float>& audio_latent, double sigma,
+                     const std::vector<float>& audio_latent, double sigma, int64_t step_index,
                      std::vector<float>& denoised_video,
                      std::vector<float>& denoised_audio)>
       denoise;
@@ -234,6 +283,15 @@ struct Ltx2Res2sLoopStats {
   // `sqrt(sigma * sigma_next)` (samplers.py:315), so a build that evaluated
   // twice at the SAME sigma is visible here and nowhere else.
   std::vector<double> eval_sigmas;
+  // The `step_index` each evaluation was handed, in the same call order. It is
+  // NOT the position in this vector and it is not the loop counter: upstream
+  // passes `step_idx`, then a literal `0` for the substep, then `n_full_steps`
+  // for the terminal evaluation (samplers.py:301, :385, :437). The denoiser
+  // reads it through `should_skip_step` (guiders.py:287-291), so on a request
+  // with `skip_step != 0` the sequence decides which evaluations run a forward
+  // at all — and nothing in the returned latents, the evaluation count or a
+  // rendered frame records which value was passed.
+  std::vector<int64_t> eval_step_indices;
 };
 
 // Loop parameters, in upstream's own declaration order and with upstream's own

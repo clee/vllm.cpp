@@ -1,5 +1,5 @@
-// GENERATED from Lightricks/LTX-2 @ fd4ded7f by the script recorded in
-// .agents/specs/ltx25-res2s-loop.md section 5. Do not hand-edit.
+// GENERATED from Lightricks/LTX-2 @ fd4ded7f by
+// scripts/gen-ltx2-res2s-goldens.py. Do not hand-edit.
 #pragma once
 
 #include <cstdint>
@@ -64,6 +64,9 @@ inline constexpr int64_t kLtx2Res2sBongOnEvaluations = 6;
 inline constexpr double kLtx2Res2sBongOnEvalSigmas[] = {
     0.8999999761581421, 0.8485281325067245, 0.800000011920929,
     0.7483314765582876, 0.699999988079071, 0.658786760603827};
+inline constexpr int64_t kLtx2Res2sBongOnEvalStepIndices[] = {
+    0, 0, 1,
+    0, 2, 0};
 inline constexpr float kLtx2Res2sBongOnVideo[] = {
     -0.322195023f, 0.323642969f, 0.699999988f,
     0.249027193f, 0.400000006f, 0.576920807f};
@@ -85,6 +88,9 @@ inline constexpr int64_t kLtx2Res2sBongOffByHEvaluations = 6;
 inline constexpr double kLtx2Res2sBongOffByHEvalSigmas[] = {
     0.8999999761581421, 0.670820384364601, 0.5,
     0.3535533905932738, 0.25, 0.1732050788211701};
+inline constexpr int64_t kLtx2Res2sBongOffByHEvalStepIndices[] = {
+    0, 0, 1,
+    0, 2, 0};
 inline constexpr float kLtx2Res2sBongOffByHVideo[] = {
     0.241032124f, 0.415953547f, 0.699999988f,
     0.426735073f, 0.400000006f, 0.526328683f};
@@ -106,6 +112,9 @@ inline constexpr int64_t kLtx2Res2sBongOffBySigmaEvaluations = 6;
 inline constexpr double kLtx2Res2sBongOffBySigmaEvalSigmas[] = {
     0.029999999329447746, 0.028982753615772204, 0.02800000086426735,
     0.026981475821224496, 0.026000000536441803, 0.025495098020929436};
+inline constexpr int64_t kLtx2Res2sBongOffBySigmaEvalStepIndices[] = {
+    0, 0, 1,
+    0, 2, 0};
 inline constexpr float kLtx2Res2sBongOffBySigmaVideo[] = {
     0.119263649f, 0.260755271f, 0.699999988f,
     0.486651659f, 0.400000006f, 0.701571345f};
@@ -128,6 +137,10 @@ inline constexpr double kLtx2Res2sTerminalZeroEvalSigmas[] = {
     1.0, 0.8660254037844386, 0.75,
     0.6123724356957945, 0.5, 0.3535533905932738,
     0.25, 0.016583123906848306, 0.0010999999940395355};
+inline constexpr int64_t kLtx2Res2sTerminalZeroEvalStepIndices[] = {
+    0, 0, 1,
+    0, 2, 0,
+    3, 0, 4};
 inline constexpr float kLtx2Res2sTerminalZeroVideo[] = {
     0.445208162f, 0.445210904f, 0.699999988f,
     0.44826746f, 0.400000006f, 0.451412231f};
@@ -149,6 +162,9 @@ inline constexpr int64_t kLtx2Res2sEta1Evaluations = 6;
 inline constexpr double kLtx2Res2sEta1EvalSigmas[] = {
     0.8999999761581421, 0.8485281325067245, 0.800000011920929,
     0.7483314765582876, 0.699999988079071, 0.658786760603827};
+inline constexpr int64_t kLtx2Res2sEta1EvalStepIndices[] = {
+    0, 0, 1,
+    0, 2, 0};
 inline constexpr float kLtx2Res2sEta1Video[] = {
     -0.513900995f, 0.366209567f, 0.699999988f,
     0.682274103f, 0.400000006f, -0.190410003f};

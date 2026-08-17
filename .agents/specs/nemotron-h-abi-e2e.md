@@ -255,9 +255,31 @@ fix it does not need.
 |---|---|---|
 | A2-Q1 — FP8 W8A8 mamba | [`nemotron-h-a2q1-fp8-mamba.md`](nemotron-h-a2q1-fp8-mamba.md) | [#960](https://github.com/mudler/vllm.cpp/issues/960), declared as a base |
 | A2-Q2 — NVFP4 MoE + `lm_head` | [`nemotron-h-a2q2-nvfp4-moe-lmhead.md`](nemotron-h-a2q2-nvfp4-moe-lmhead.md) | none for the build; the Thor leg is PENDING [#962](https://github.com/mudler/vllm.cpp/issues/962) |
+| A2-P — paged KV, carried recurrent state, device logits | [`nemotron-h-a2p-paged-forward.md`](nemotron-h-a2p-paged-forward.md) | none; #496 W2 landed at `43a6c5518`, so R3 below is CLEARED |
 
-Both leave G-SAFE fully intact, and both inherit A2-R's unreached posture — the
-device forward still has no production caller until A2-P.
+Both A2-Q halves leave G-SAFE fully intact, and both inherit A2-R's unreached
+posture — the device forward still has no production caller until A2-P.
+
+**A2-P is the unit that narrows the interlock**, that removes or narrows
+`scripts/runner-routing-allowlist.txt:26`, and that gives every device arm its
+first production caller. It carries two corrections to this file, measured at
+`10002648199cfbbaf1e423f7c80cacb2f4b56366` and argued in
+[`nemotron-h-a2p-paged-forward.md`](nemotron-h-a2p-paged-forward.md):
+
+- **§2's `dense_attn::AttnBlock` seam claim is WRONG for this architecture** and
+  is superseded by A2-P §2.3. That block applies `vt::RopeNeox` unconditionally
+  (`dense_attn_block.h:497` — the `:496` cited in-tree is a comment line) and
+  reads a `cfg.rms_norm_eps` that `hf_config.cpp:551` defaults to `0.0` for a
+  checkpoint shipping `layer_norm_epsilon` instead. NemotronH has no RoPE at all.
+  Filed as [#941](https://github.com/mudler/vllm.cpp/issues/941); A2-R already
+  took the model-local road, and A2-P extends that block rather than migrating.
+- **§2.7's R4 named an unplanned kernel arm that already exists.**
+  `vt::CausalConv1dFwd` admits a bf16 conv state wherever the backend answers
+  `SupportsCompressedConvState()` (`src/vt/ops.cpp:1644-1650`), which CUDA
+  (`cuda_backend.cu:117`), Vulkan (`vulkan_backend.cpp:142`) and ROCm
+  (`rocm_backend.hip:333`) all do. It landed at `908bad0ac` on 2026-08-09, six
+  days before this spec was written. The decision — a bf16 persistent conv page,
+  never widened to f32 — is unchanged; only its cost was mis-stated.
 
 ### 1.1 Dependency order
 
@@ -594,6 +616,24 @@ The reasoning follows from the rules rather than from taste:
 **The f32 fallback survives only as an annotated escape**, never as the default:
 if it is taken it owes a one-line reason at the buffer and its cost **stated in
 bytes per token** in §10. A silent widening is not one of the options.
+
+> **★ CORRECTED BY A2-P (2026-08-17), and the correction is the point.** This
+> section's R4 warned that giving `vt::CausalConv1dFwd` a bf16 conv-state arm
+> was unplanned work an implementer might be tempted to trade away. **That work
+> had already landed six days before this section was written** — `908bad0ac`
+> on 2026-08-09, `src/vt/ops.cpp:1644-1650`, admitting a bf16 conv state on any
+> backend whose `SupportsCompressedConvState()` answers true (CUDA, Vulkan and
+> ROCm all do). A `grep` for that predicate would have refuted the blocker at
+> the time. See
+> [`nemotron-h-a2p-paged-forward.md`](nemotron-h-a2p-paged-forward.md) §4.4.
+>
+> A2-P therefore takes neither branch this section anticipated. The persistent
+> conv page stays **bf16**, exactly as `MakeNemotronHKVCache` declares it, and
+> the f32 the conv kernel wants is the TRANSIENT working row `vt::GdnStateGather`
+> produces — which is what `ops.cpp:1641-1642` names as the alternative to a
+> compressed-state backend arm, and which the CPU leg needs anyway. **No page is
+> widened, and no `f32` escape is taken, so no bytes-per-token cost is owed.**
+> Re-measure a stated blocker at your own base.
 
 ---
 

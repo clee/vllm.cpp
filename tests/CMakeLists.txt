@@ -771,6 +771,40 @@ vllm_cpp_add_test(test_nemotron_h_quantized_forms
 target_include_directories(test_nemotron_h_quantized_forms PRIVATE
   ${CMAKE_SOURCE_DIR}/src)
 
+# A2-Q2a (#810): the DEVICE MoE arm on a SYNTHETIC NVFP4 fixture — the cheap RED
+# in front of the real-checkpoint gate. It exists because `BuildTiny` in
+# test_nemotron_h_forward.cpp is all-`kDense` (:892 -> PackMoe :873) and so
+# cannot reach the NVFP4 arena at all; without it the 21 GB checkpoint would be
+# the ONLY instrument and every RED would cost a GB10 window. Its geometry
+# (hidden 128, moe_intermediate 64) is the smallest that resolves on Marlin's
+# thread configs, which `TinyParams` (24 / 10) does not. Skips LOUDLY with a
+# reason on a GPU-less box.
+vllm_cpp_add_test(test_nemotron_h_moe_device
+  vllm/models/test_nemotron_h_moe_device.cpp)
+target_include_directories(test_nemotron_h_moe_device PRIVATE
+  ${CMAKE_SOURCE_DIR}/src)
+
+# A2-P (#810, .agents/specs/nemotron-h-a2p-paged-forward.md): the PAGED forward,
+# gated through the PRODUCTION entry point. Every case builds a real
+# NemotronHLoadedModel from a synthetic checkpoint, hands it to a real
+# GPUModelRunner, and drives execute_model / sample_tokens — so the paged
+# forward is reached at runner.cpp:1465 through ModelRegistry::Forward, never
+# through a fabricated ModelForwardInput. That is the difference AGENTS.md
+# §"Nothing lands dead" is about: before this change NemotronHDeviceForward had
+# ONE non-declaration call site in the whole tree and it was a test.
+#
+# The multi-step arm is the only one that can see a DROPPED CARRY (with one leg
+# and fresh state the recurrent half is unobservable — nemotron_h_forward.h
+# says so outright), the per-block numeric arm is the only one that can see a
+# dropped mechanism whose argmax is unchanged, and the page dtypes are asserted
+# directly because a too-WIDE page is numerically correct and invisible to both.
+# CPU-only, no checkpoint, no speed claim: the A3 end-to-end token gate against
+# the released checkpoint is the on-box binding gate.
+vllm_cpp_add_test(test_nemotron_h_paged_forward
+  vllm/models/test_nemotron_h_paged_forward.cpp)
+target_include_directories(test_nemotron_h_paged_forward PRIVATE
+  ${CMAKE_SOURCE_DIR}/src)
+
 # Kimi-Linear CPU REFERENCE FORWARD gates (W2-W6): the per-op reference forwards
 # (KDA layer vs the kimi_kda host-ref composition; NoPE-MLA vs a materialized-MHA
 # reference; sigmoid noaux_tc router + block vs a hand-computed case) and the whole
@@ -1080,6 +1114,12 @@ target_include_directories(test_expert_stream_wiring PRIVATE ${CMAKE_SOURCE_DIR}
 # defect, and the store is built from the FIRST model a process runs.
 vllm_cpp_add_test(test_expert_stream_mixed_slot vllm/model_executor/test_expert_stream_mixed_slot.cpp)
 target_include_directories(test_expert_stream_mixed_slot PRIVATE ${CMAKE_SOURCE_DIR}/src)
+# ENG-EXPERT-STREAM (#1091): the step clock at the MoE entry points ForwardLayers
+# does NOT cover, and the final statistics line. Its own binary because it is the
+# only one that can observe `steps == 0` -- the store is a process-lifetime
+# singleton, so a case asking that question must run before anything ends a step.
+vllm_cpp_add_test(test_expert_stream_steps vllm/model_executor/test_expert_stream_steps.cpp)
+target_include_directories(test_expert_stream_steps PRIVATE ${CMAKE_SOURCE_DIR}/src)
 # ENG-MM-INPUT-PIPELINE L1 (#607): the refusal those limits carry — the min()
 # fold against the model's own ceiling, upstream's exact message, and both call
 # sites with the enable_mm_embeds escape.

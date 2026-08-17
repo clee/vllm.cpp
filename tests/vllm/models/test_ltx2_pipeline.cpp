@@ -2689,6 +2689,13 @@ struct Res2sFixture {
   std::vector<float> video_mask, video_clean, audio_mask, audio_clean;
   int64_t evaluations = 0;
   std::vector<double> eval_sigmas;
+  // The `step_index` each call was handed, recorded by the DENOISER rather than
+  // read back off `Ltx2Res2sLoopStats`. Two independent records of the same
+  // fact: the stats vector says what the loop believes it passed and this one
+  // says what arrived, so a build that recorded one value and passed another is
+  // visible. It matters because `should_skip_step` reads it
+  // (guiders.py:287-291) and nothing in the returned latents does.
+  std::vector<int64_t> eval_step_indices;
   // One counter per upstream generator (samplers.py:267-268).
   int64_t step_draws = 0, substep_draws = 0;
 
@@ -2709,10 +2716,11 @@ struct Res2sFixture {
     // operation order the generator used. QUADRATIC and not affine on purpose,
     // so a build that evaluated once and reused the result cannot land on the
     // same trajectory by luck.
-    hooks.denoise = [this](const std::vector<float>& v, const std::vector<float>& a,
-                           double sigma, std::vector<float>& dv, std::vector<float>& da) {
+    hooks.denoise = [this](const std::vector<float>& v, const std::vector<float>& a, double sigma,
+                           int64_t step_index, std::vector<float>& dv, std::vector<float>& da) {
       evaluations += 1;
       eval_sigmas.push_back(sigma);
+      eval_step_indices.push_back(step_index);
       dv.resize(v.size());
       for (size_t i = 0; i < v.size(); ++i) {
         dv[i] = 0.5f * v[i] + 0.25f - 0.125f * (v[i] * v[i]);
@@ -2940,22 +2948,27 @@ TEST_CASE("ltx2 res2s the loop evaluates the transformer TWICE per step") {
     int64_t sigma_count;
     int64_t evaluations;
     const double* eval_sigmas;
+    const int64_t* eval_step_indices;
     int64_t full_steps;
   };
   const Case cases[] = {
       {"BongOn", vllm_test::kLtx2Res2sBongOnSigmas, vllm_test::kLtx2Res2sBongOnSigmaCount,
-       vllm_test::kLtx2Res2sBongOnEvaluations, vllm_test::kLtx2Res2sBongOnEvalSigmas, 3},
+       vllm_test::kLtx2Res2sBongOnEvaluations, vllm_test::kLtx2Res2sBongOnEvalSigmas,
+       vllm_test::kLtx2Res2sBongOnEvalStepIndices, 3},
       {"BongOffByH", vllm_test::kLtx2Res2sBongOffByHSigmas,
        vllm_test::kLtx2Res2sBongOffByHSigmaCount, vllm_test::kLtx2Res2sBongOffByHEvaluations,
-       vllm_test::kLtx2Res2sBongOffByHEvalSigmas, 3},
+       vllm_test::kLtx2Res2sBongOffByHEvalSigmas,
+       vllm_test::kLtx2Res2sBongOffByHEvalStepIndices, 3},
       {"BongOffBySigma", vllm_test::kLtx2Res2sBongOffBySigmaSigmas,
        vllm_test::kLtx2Res2sBongOffBySigmaSigmaCount,
        vllm_test::kLtx2Res2sBongOffBySigmaEvaluations,
-       vllm_test::kLtx2Res2sBongOffBySigmaEvalSigmas, 3},
+       vllm_test::kLtx2Res2sBongOffBySigmaEvalSigmas,
+       vllm_test::kLtx2Res2sBongOffBySigmaEvalStepIndices, 3},
       {"TerminalZero", vllm_test::kLtx2Res2sTerminalZeroSigmas,
        vllm_test::kLtx2Res2sTerminalZeroSigmaCount,
        vllm_test::kLtx2Res2sTerminalZeroEvaluations,
-       vllm_test::kLtx2Res2sTerminalZeroEvalSigmas, 4},
+       vllm_test::kLtx2Res2sTerminalZeroEvalSigmas,
+       vllm_test::kLtx2Res2sTerminalZeroEvalStepIndices, 4},
   };
 
   for (const Case& c : cases) {
@@ -3004,6 +3017,46 @@ TEST_CASE("ltx2 res2s the loop evaluates the transformer TWICE per step") {
                               ? static_cast<double>(sigmas[static_cast<size_t>(i / 2 + 1)])
                               : static_cast<double>(vllm::kLtx2Res2sTerminalSigma);
       CHECK(std::fabs(stats.eval_sigmas[i + 1] - std::sqrt(sigma * next)) < 1e-9);
+    }
+
+    // THE `step_index` EACH EVALUATION WAS HANDED, which is a SECOND argument
+    // upstream's `Denoiser` takes and which nothing about the returned latents,
+    // the evaluation count or a rendered frame records. Upstream passes three
+    // different things for it — `step_idx` at the first evaluation
+    // (samplers.py:301), a LITERAL 0 at the substep (samplers.py:385, beside a
+    // one-element schedule) and `n_full_steps` at the terminal one
+    // (samplers.py:437) — and the goldens carry the sequence upstream's own loop
+    // produced.
+    //
+    // IT IS NOT COSMETIC. The denoiser reads it through `should_skip_step`,
+    // which is `step % (skip_step + 1) != 0` (guiders.py:287-291). At the HQ
+    // preset's `skip_step = 0` every value behaves alike, so this whole
+    // distinction is INERT on the shipped arm — and it is live the moment a
+    // request sets `video_skip_step`, where passing the loop counter at the
+    // substep would skip half of a res_2s step's evaluations and render the
+    // first-order trajectory under the second-order sampler's schedule.
+    //
+    // Asserted against BOTH records: `stats` says what the loop believes it
+    // passed and `fixture` says what arrived, so a build that recorded one value
+    // and passed another fails rather than agreeing with itself.
+    REQUIRE(stats.eval_step_indices.size() == static_cast<size_t>(c.evaluations));
+    REQUIRE(fixture.eval_step_indices.size() == static_cast<size_t>(c.evaluations));
+    for (int64_t i = 0; i < c.evaluations; ++i) {
+      INFO("fixture = ", c.tag, " evaluation ", i, " step_index ", stats.eval_step_indices[i],
+           " want ", c.eval_step_indices[i]);
+      CHECK(stats.eval_step_indices[i] == c.eval_step_indices[i]);
+      CHECK(fixture.eval_step_indices[i] == c.eval_step_indices[i]);
+    }
+    // And the RULE the goldens encode, derived here rather than only read, so
+    // the two check each other: every substep evaluation is at index 0, every
+    // full-step evaluation is at its own step, and the terminal one is at
+    // `n_full_steps`.
+    for (int64_t step = 0; step < c.full_steps; ++step) {
+      CHECK(stats.eval_step_indices[2 * step] == step);
+      CHECK(stats.eval_step_indices[2 * step + 1] == 0);
+    }
+    if (c.evaluations == 2 * c.full_steps + 1) {
+      CHECK(stats.eval_step_indices[c.evaluations - 1] == c.full_steps);
     }
   }
 }

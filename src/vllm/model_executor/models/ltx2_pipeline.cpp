@@ -1345,10 +1345,30 @@ Ltx2PipelineRecipe RetakeRecipe(const std::string& version) {
 // Row LTX25-RES2S-LOOP, issue #921.
 //
 // ─── WHAT MAKES IT HQ, VERIFIED RATHER THAN INHERITED ────────────────────────
-// It differs from `TI2VidTwoStagesPipeline` in exactly three things, and two of
-// them are the SAMPLER: `stepper=Res2sDiffusionStep()` (:258) and
+// Two of the differences from `TI2VidTwoStagesPipeline` are the SAMPLER:
+// `stepper=Res2sDiffusionStep()` (:258) and
 // `loop=res2s_audio_video_denoising_loop` passed to BOTH stages (:292, :335).
-// The third is `LTX_2_3_HQ_PARAMS` (utils/constants.py:95-115).
+// A third is `LTX_2_3_HQ_PARAMS` (utils/constants.py:95-115). THEY ARE NOT THE
+// ONLY THREE, and this comment said they were until 2026-08-17. Diffing the two
+// files at `fd4ded7f` also shows: stage 1 loads the distilled LoRA at
+// `distilled_lora_strength_stage_1` (:92-101, :151-154) where the plain
+// pipeline loads none on that stage; stage 1's schedule is derived as
+// `execute(latent=empty_latent, steps=...)` (:260-267) against the plain
+// pipeline's `execute(steps=...)`, which `schedulers.py:32` turns into a
+// resolution-dependent shift instead of the 4096-token default; and
+// `GuidedDenoiser` (:271-281) replaces `FactoryGuidedDenoiser`.
+//
+// Two of those four are ALREADY what this recipe does and one is out of scope.
+// The schedule: this engine always derives from `target_tokens`
+// (`ltx2_video.cpp`'s `Ltx2SigmaSchedule` call), which is the latent-aware form,
+// so stage 1 coincides with upstream here — the divergence, if any, is on the
+// PLAIN two-stage arm and is not this recipe's to move. The denoiser: stage 1's
+// `video_guidance` below reaches `Ltx2GuidedDenoise`, which is
+// `_guided_denoise` — the one function `GuidedDenoiser` and
+// `FactoryGuidedDenoiser` share (utils/denoisers.py:61-211) — so the difference
+// between the two upstream classes is WHERE the params come from and not what
+// runs. The distilled LoRA per stage is out of scope for every LTX row here and
+// is named in the row's spec section 2 rather than silently absent.
 //
 // So this recipe is NOT the distilled two-stage one with different numbers. The
 // res_2s loop evaluates the transformer TWICE per step, which is the whole

@@ -806,11 +806,27 @@ into the weights and cannot vary between generations - upstream takes it as a
 The adapter is a safetensors file of `.lora_A.weight` / `.lora_B.weight` pairs,
 with or without ComfyUI's `diffusion_model.` prefix. It works on every arm the
 DiT loads - bf16, FP8 and NVFP4 alike - because those are all dequantized to
-bf16 before the delta is added. Three things REFUSE by name rather than
+bf16 before the delta is added. Two things REFUSE by name rather than
 proceeding quietly: an adapter naming a module this port does not bind (upstream
-would skip it, and a skip cannot be told apart from a typo), an adapter that
-fuses into nothing at all, and a second `--lora`, since only one adapter is
-accepted so far.
+would skip it, and a skip cannot be told apart from a typo), and an adapter that
+fuses into nothing at all.
+
+**A second `--lora` does NOT refuse, and this page said it did until 2026-08-17.**
+Only one adapter is accepted, and the library enforces that
+(`ltx2_lora.cpp:243-248` fails on more than one, citing `dubit.py:364-365` and
+`hdr_ic_lora.py:271-272`). But `ltx2-gen` cannot construct the two-adapter vector
+that trips it: `SetExtra` (`examples/ltx2_gen/main.cpp:212-221`) overwrites an
+existing key in place, so `--lora a --lora b` leaves one `lora_path` extra
+holding `b`, silently fuses `b`, and exits 0. Pass one adapter.
+
+The C ABI cannot reach it either, and that is the wider half of the finding:
+`ltx2_video.cpp:813` is the ONLY `dit_options.loras.push_back` in the tree and it
+runs at most once, under `if (!lora_path.empty())`. So `loras.size()` is 0 or 1
+on every production path — CLI, `vllm_video_engine_load` and the server alike —
+and the more-than-one refusal is reached only by `test_ltx2_lora`. It is correct
+code guarding a state nothing can currently construct, which is the shape
+N-adapter fusion ([#932](https://github.com/mudler/vllm.cpp/issues/932)) will
+need. Tracked as [#1097](https://github.com/mudler/vllm.cpp/issues/1097).
 
 Supplying an adapter also reads its `reference_downscale_factor` and
 `reference_temporal_scale_factor` metadata (`iclora_utils.py:30-49`). Those are
@@ -875,10 +891,12 @@ all three surfaces carry it: `ltx2-gen --pipeline-kind dfr`, the C ABI's
 `--video-extra pipeline_kind=dfr` at launch. A server started that way renders
 every `/v1/videos` request through DFR.
 
-The two knobs beside it are per-GENERATION and therefore CLI and ABI only, because
+The two knobs beside it are per-GENERATION and therefore **ABI only**, because
 `/v1/videos` forwards no per-generation extra to any engine yet (issue #928):
 `num_generated_keyframes` on the other pipelines, and `temporal_upsample_rounds`
-below.
+below. This paragraph said "CLI and ABI only" until 2026-08-17, and the CLI half
+was never true — `examples/ltx2_gen/main.cpp` carries no flag for either name, so
+`vllm_video_gen_params.extra_keys` is the only surface that reaches them.
 
 ### LTX-2.5 text-to-audio: a render with no picture
 
@@ -892,9 +910,18 @@ ltx2-gen --dit ltx-2.5-dit.safetensors \
          --audio-vae ltx-2.5-audio-vae-bf16.safetensors \
          --encoder gemma4-12b-with-proj.safetensors --encoder-config gemma4.json \
          --pipeline-kind t2a_one_stage --device cpu \
-         --frames 121 --steps 30 --prompt "rain on a tin roof, distant thunder" \
+         --frames 121 --prompt "rain on a tin roof, distant thunder" \
          --workdir /tmp/t2a
 ```
+
+**`ltx2-gen` has no `--steps` flag, and this recipe carried one until 2026-08-17.**
+The step count comes from the resolved recipe (`ltx2_video.cpp:2900`), and the
+`vllm_video_gen_params.num_inference_steps` field that would override it
+(`include/vllm.h:1072`) has no flag on this binary — `minimax-h3-gen` and
+`music3-gen` both expose `--steps`, which is where the published line came from.
+An unknown argument is not ignored here: `examples/ltx2_gen/main.cpp:318-321`
+prints `unknown argument` and exits 2, so the command as published could not run
+at all. Overriding the step count needs the C ABI today.
 
 **These file names are not a checkpoint pin, and no LTX-2.5 recipe in this
 document is.** None of them names a HuggingFace repo, a revision or a sha256,
@@ -914,13 +941,17 @@ ignored — upstream passes a 512x512 placeholder whose height and width it
 documents as unused, and only the frame count and the recipe's frame rate are
 read, to derive the duration.
 
-**It is the only GUIDED arm, and that changes what it costs and what it needs.**
-The distilled video recipes run one DiT forward per step. This one runs
-**three** by default — conditional, unconditional, and one with the audio
+**It is a GUIDED arm, and that changes what it costs and what it needs.** The
+distilled video recipes run one DiT forward per step. This one runs **three** by
+default — conditional, unconditional, and one with the audio
 self-attention perturbed (STG) — so it is roughly 3x the work per step, and it
 **requires a text tower**, because the unconditional pass conditions on the
 negative prompt. Loading with `prompt_embeds_path` alone gets a refusal naming
 `--audio-cfg-guidance-scale 1.0` as the way to turn the unconditional pass off.
+
+It was the only guided arm here until row LTX25-GUIDED-VIDEO
+([#1092](https://github.com/mudler/vllm.cpp/issues/1092)) gave the joint video
+path its own denoiser; see *LTX-2.5 video guidance* below.
 
 Six per-generation knobs mirror upstream's own CLI, and each takes the
 checkpoint generation's value when absent: `--negative-prompt`,
@@ -947,6 +978,99 @@ at the recipe's own guider values.
 **The accelerator is refused by name.** `device = 1` gets a refusal on this
 pipeline: the device forward takes both streams by reference and this pipeline
 has no video stream to give it. Use `--device cpu`.
+
+### LTX-2.5 video guidance: `--pipeline-kind one_stage`
+
+`one_stage` mirrors upstream's `TI2VidOneStagePipeline`, which builds a
+`FactoryGuidedDenoiser` from the params table's own video and audio guiders. On
+the 2.4/2.5 lineage those resolve to `cfg_scale = 3.0`, `stg_scale = 1.0`,
+`rescale_scale = 0.7` and `modality_scale = 3.0`.
+
+Until [#1092](https://github.com/mudler/vllm.cpp/issues/1092) this port read none
+of it: the joint denoise loop ran one unguided forward per step. A `one_stage`
+render therefore finished, at the right size and frame count, along a different
+trajectory than upstream's. It now runs **four** forwards per step and combines
+them per modality:
+
+| Pass | What differs | Selected by |
+|---|---|---|
+| conditional | nothing | always |
+| unconditional | the negative conditioning | `cfg_scale != 1.0` |
+| perturbed | video/audio self-attention skipped on `stg_blocks` | `stg_scale != 0.0` |
+| isolated modality | the audio<->video cross attention off in every block | `modality_scale != 1.0` |
+
+Seven per-generation knobs mirror upstream's `default_1_stage_arg_parser` and
+each takes the checkpoint generation's value when absent. The audio row and
+`--negative-prompt` are shared with text-to-audio and are no longer refused on a
+video pipeline; upstream's parser carries both rows side by side, and the old
+refusal rested on a reading of upstream that was wrong and harmless only while
+nothing here read them.
+
+| `ltx2-gen` flag | per-generation extra | meaning |
+|---|---|---|
+| `--video-cfg-guidance-scale` | `video_cfg_guidance_scale` | video `cfg_scale`; `1.0` turns the unconditional forward off |
+| `--video-stg-guidance-scale` | `video_stg_guidance_scale` | video `stg_scale`; `0.0` turns the perturbed forward off |
+| `--video-rescale-scale` | `video_rescale_scale` | video `rescale_scale`, applied to the DENOISED prediction |
+| `--video-skip-step` | `video_skip_step` | `0` never skips; `n` runs every `n+1`-th step |
+| `--video-stg-blocks` | `video_stg_blocks` | comma separated block indices; EMPTY disables STG, see below |
+| `--a2v-guidance-scale` | `a2v_guidance_scale` | video `modality_scale`; `1.0` turns the isolated-modality forward off |
+| `--v2a-guidance-scale` | `v2a_guidance_scale` | audio `modality_scale` |
+| `--negative-prompt` | `negative_prompt` | the unconditional forward's conditioning |
+
+The audio row is the same six spellings with `audio_` in place of `video_`:
+`audio_cfg_guidance_scale`, `audio_stg_guidance_scale`, `audio_rescale_scale`,
+`audio_skip_step`, `audio_stg_blocks`, and `v2a_guidance_scale` for its
+`modality_scale`.
+
+Those extras ride the per-generation `extra_keys` / `extra_values` array on
+`vllm_video_params`, so the C ABI reaches the same path with no new field. They
+are per-GENERATION and therefore reach the CLI and the C ABI and **not**
+`/v1/videos`, which forwards no per-generation extra to any engine
+([#928](https://github.com/mudler/vllm.cpp/issues/928)). `pipeline_kind` is a
+LOAD knob and does reach the server, so a server started with
+`--video-extra pipeline_kind=one_stage` renders every request through the guided
+denoiser at the recipe's own guider values and no request can change them.
+
+**An EMPTY `--video-stg-blocks` is accepted and means "perturb no block".** That
+is upstream's own idiom — `docs/multimodal-guidance.md:13` says "Set to `[]` to
+disable STG", the field defaults to `[]`, the flags are `nargs="*"`, and the
+shipped HQ params row uses it — and it stays distinct from OMITTING the flag,
+which takes the params table's value. It disables the STG signal and not the STG
+cost: upstream selects the perturbed pass from `stg_scale` alone, so the forward
+still runs and contributes exactly zero. Set the scale to `0.0` to skip the
+forward as well. This page and this port refused the empty list until
+2026-08-17.
+
+**The unconditional forward needs a negative conditioning, and there are two
+ways to supply one.** With a text tower, `--negative-prompt` (or the recipe's
+own default) is encoded through the same chain as the positive prompt. Without
+one, `--negative-prompt-embeds` and `--negative-audio-prompt-embeds` — the LOAD
+extras `negative_prompt_embeds_path` and `negative_audio_prompt_embeds_path` —
+are the negative half of the `prompt_embeds_path` fallback: two files at the
+DiT's two cross-attention widths, the same row count as the positive pair. Being
+LOAD extras they DO reach the server, through `--video-extra`. With neither, a
+`cfg_scale` other than 1.0 is **refused by name** rather than served the positive
+context twice, which would leave the whole classifier-free term at exactly zero.
+
+**A block index the checkpoint does not have is refused**, which is the case the
+empty list above is NOT. `stg_blocks` is a membership test upstream, so naming
+block 28 on a model with fewer blocks perturbs nothing and leaves
+`stg_scale * (cond - perturbed)` at exactly zero — the same zero, reached by a
+request that disagrees with the checkpoint rather than by a caller who asked for
+no perturbation. Upstream never meets it because it only ships 48-block
+checkpoints, so this refusal is local to this port and is named as such.
+
+**The distilled and retake recipes refuse every one of these flags.** Their
+guidance is distilled into the weights, so honouring an override would sample a
+trajectory the weights were never trained for. Their guiders are upstream's
+positive-only one, so they still issue one forward per step and their output is
+unchanged by this row.
+
+**The accelerator is refused for the perturbed and isolated-modality passes.**
+`Ltx2DitForwardDevice` takes no perturbation argument, so those two passes on
+`device = 1` would run an unperturbed forward and leave both terms at zero.
+Classifier-free guidance alone is a different context and no perturbation, and
+runs on both arms.
 
 **What is not served.** `temporal_upsample_rounds` is defined and refused above
 `0`: the rounds loop that temporally doubles the latent, re-tiles the canvas and
@@ -1038,8 +1162,19 @@ one is implemented; the higher quality diffusion one (`NADiffusionDecoder`) is
 not, and asking for it fails with a message naming the missing
 neighborhood-attention kernel. It never falls back to the convolutional decoder,
 because that would hand back a lower quality render as if it were the one you
-asked for. Keyframe and reference conditioning is refused for the same reason: it
-runs through the video VAE's encoder, and only the decoder is ported.
+asked for.
+
+**The sentence that used to follow was stale and is retired here.** It said
+keyframe and reference conditioning were refused because "only the decoder is
+ported". The video VAE **encoder** is ported and is kept resident
+(`ltx2_video.cpp:1007-1012`), the first-frame and last-frame keyframe arms are
+SERVED — the same page says so at the image-conditioning section above — and what
+remains refused is REFERENCE conditioning, for reasons that have nothing to do
+with the encoder: the reference clip has no pixel path and stage 2 must run
+unfused (`ltx2_video.cpp:1955-1990`,
+[#975](https://github.com/mudler/vllm.cpp/issues/975)). Reference AUDIO is refused
+separately (`ltx2_video.cpp:1991-2004`). A refusal whose stated reason has been
+removed is worse than no reason, because a reader plans around it.
 
 **The convolutional decode is TILED and STREAMED, on upstream's own defaults, and
 there is no knob.** The layout is the one `ltx_pipelines` builds for a Conv VAE
@@ -1073,8 +1208,8 @@ memory number:
 ORACLE rather than an owed feature.** Through L10 this page said a prompt was
 refused because the `Embeddings1DConnector` weights, which ship inside the DiT
 file, were among the modules the DiT loader would not load. They are loaded
-(`Ltx2LoadConnectorWeights`, `ltx2_loader.cpp:1221`, enumerates their own
-contract at `:1224`, outside the DiT's),
+(`Ltx2LoadConnectorWeights`, `ltx2_loader.cpp:1292 @ b5756ea8c`, enumerates their
+own contract at `:1295`, outside the DiT's),
 so `encoder_path` is accepted, `has_encoder()` is true, and a prompt no longer
 needs a matching pair of embeds files. The gap that remains is a numeric one: the
 tower, the connector's forward and both caption projections each have an oracle
@@ -2407,8 +2542,11 @@ something else this port does not.
 ## Consuming it as a library (C ABI)
 
 Link `libvllm` (static or shared) and include [`include/vllm.h`](../include/vllm.h).
-It exposes a flat, exception-free, llama.cpp-style C ABI (`VLLM_ABI_VERSION 19`,
-36 exported functions) suitable for `dlopen` / FFI / LocalAI integration.
+It exposes a flat, exception-free, llama.cpp-style C ABI (`VLLM_ABI_VERSION 21`,
+`include/vllm.h:273`; **46** exported functions, the count of `^VLLM_API `
+declarations in that header) suitable for `dlopen` / FFI / LocalAI integration.
+This line read `19` and `36` until 2026-08-17; both numbers were last true
+several ABI additions ago, and neither is derived by any gate.
 
 ```c
 #include "vllm.h"
@@ -2499,8 +2637,15 @@ seam's `prompt_embeds_path`, which carries the video stream), `pipeline_kind`
 (default `distilled_two_stage`; also `one_stage`, `res2s_two_stage`, `dmd2`,
 `dfr`, `retake` and `t2a_one_stage`), `model_version` (only for a checkpoint that
 declares none), `dit_config_path`, `encoder_config_path`,
+`negative_prompt_embeds_path` and `negative_audio_prompt_embeds_path` (the
+negative half of the same fallback, for the unconditional forward),
 `allow_unported_modules`, `max_phase`, `prompt_embeds_valid_rows`,
-`upsampler_path` and `duration_head_path`. An extra a family does not define is
+`upsampler_path`, `duration_head_path`, `lora_path` and `lora_strength` — twelve
+keys, which is `kKnownLoadExtras` (`ltx2_video.cpp:377-383`) in order. The two
+LoRA keys landed with issue #923 and were missing from this list until
+2026-08-17; the array's own neighbouring comment still says "nine of these ten",
+which is [#1097](https://github.com/mudler/vllm.cpp/issues/1097).
+An extra a family does not define is
 refused, never ignored. One caveat inside that set: `duration_head_path` is
 defined but UNSERVED — the duration head is ported and gated as a brick, and
 nothing in the video engine constructs one — so supplying it is **refused by
@@ -2516,11 +2661,16 @@ spatiotemporal upsampler is the arm with `spatial_upsample` AND
 `temporal_upsample` set, which upstream builds as a different operator
 (`Conv3d(mid, 8*mid)` + `PixelShuffleND(3)`). The temporal-only x2 upsampler is
 **ported** and is not refused; nothing shipped drives it yet, so it is gated
-rather than served. Four more are
+rather than served. **Three** more are
 recorded as out of scope but are **not requestable**, so no flag or extra can
 reach them: `int8-convrot`, single-node multi-GPU, and
 `BetaScheduler`. (LoRA fusion was in that list until 2026-08-15 and is now
-SERVED - see `--lora` above - so its marker was retired rather than moved.) Their messages
+SERVED - see `--lora` above - so its marker was retired rather than moved. This
+sentence still said "Four more" until 2026-08-17, counting the retired marker in
+the same breath as it explained the retirement.) That is four
+`Ltx2UnportedPipelineFeature` enumerators in total, one reachable and three
+markers (`ltx2_pipeline.h:768-803`), and the split is derived from the tree by
+`test_ltx2_pipeline` rather than restated here. Their messages
 say `DECLARED, NOT REQUESTABLE` so the two kinds are not confused.
 `BetaScheduler` is in that group rather than the reachable one because upstream
 selects it nowhere: every `ltx-pipelines` entry point hard-codes
@@ -2864,9 +3014,9 @@ routes stay unregistered.
 render path ships and is documented above under
 [LTX-2.5: what runs, and what it cannot do](#ltx-25-what-runs-and-what-it-cannot-do):
 `ltx-2.5` is one of the two registered video families
-(`REGISTER_VLLM_VIDEO_FAMILY` at `src/vllm/multimodal/ltx2_video.cpp:1529`), the
-Gemma-4 text tower loads from `--encoder` and sets `has_encoder`
-(`ltx2_video.cpp:893`), both VAEs and the pipeline layer are implemented
+(`REGISTER_VLLM_VIDEO_FAMILY` at `src/vllm/multimodal/ltx2_video.cpp:3723 @ b5756ea8c`), the
+Gemma-4 text tower loads from `--encoder` (`ltx2_video.cpp:1149`) and sets
+`has_encoder` (`ltx2_video.cpp:1191`), both VAEs and the pipeline layer are implemented
 (`ltx2_video_vae.cpp`, `ltx2_audio_vae.cpp`, `ltx2_pipeline.cpp`), and the
 `/v1/videos` routes register for whatever family `--video-dit` resolves —
 `server_main.cpp` calls the family-agnostic `LoadVideoEngine` and then prints the
@@ -2976,30 +3126,53 @@ CHECKPOINT_ROOT=... VLLM_CPP_LTX2_TOWER_E2E=1 \
 
 Recipes resolve on an EXACT `(pipeline_kind, model_version)` pair and refuse
 anything else by name rather than defaulting, because a plausible but wrong sigma
-schedule or guidance scale renders a video instead of failing. The pairs that
-resolve are `one_stage` at 2, 2.3, 2.4 and 2.5, `distilled_two_stage` at 2 and
-2.5, `res2s_two_stage` at 2.5, `dmd2` at 2 and 2.3, and `retake` at 2 and 2.5.
+schedule or guidance scale renders a video instead of failing. **Sixteen** pairs
+resolve, derived from `ResolveLtx2PipelineRecipe`:
+
+| `pipeline_kind` | resolving `model_version` |
+|---|---|
+| `one_stage` | 2, 2.3, 2.4, 2.5 |
+| `distilled_two_stage` | 2, 2.5 |
+| `res2s_two_stage` | **2.5 only** |
+| `dfr` | **2.5 only** |
+| `dmd2` | 2, 2.3 |
+| `retake` | 2, 2.5 |
+| `t2a_one_stage` | 2, 2.3, 2.4, 2.5 |
+
+This list ran to ten until 2026-08-17, omitting `dfr` entirely and all four
+`t2a_one_stage` rows. **`dfr` at 2 is refused deliberately, not by oversight**:
+DFR's base stage rests on generated keyframe slots, which need a checkpoint
+declaring `use_keyframes_abs_pos_embedding`, and the 2.0 distilled row predates
+that parameter — so resolving DFR onto it would build a recipe the engine must
+then refuse at load. Refusing at the recipe table names the version instead.
 
 ### `res2s_two_stage`: the high-quality preset, and why it is a sampler
 
-`res2s_two_stage` is `TI2VidTwoStagesHQPipeline`. It differs from the two-stage
-pipeline in three things and two of them are the SAMPLER: it runs the `res_2s`
-second-order method on both stages instead of Euler, and it takes
-`LTX_2_3_HQ_PARAMS` — 15 steps, STG off, video rescale 0.45. It resolves at 2.5
-only, because that preset is a plain constant upstream with no per-generation
-lineage to spread it over.
+`res2s_two_stage` is `TI2VidTwoStagesHQPipeline`. Against the plain two-stage
+pipeline it changes the SAMPLER on both stages — the `res_2s` second-order
+method instead of Euler — and takes `LTX_2_3_HQ_PARAMS`: 15 steps, STG off,
+video rescale 0.45, cfg 3.0 video / 7.0 audio, modality 3.0. Those are not the
+only differences (stage 1 also loads the distilled LoRA, derives its schedule
+from the stage-1 latent shape, and runs a `GuidedDenoiser` where the plain
+pipeline runs a `FactoryGuidedDenoiser`), so do not read the sampler swap as an
+exhaustive list. It resolves at 2.5 only, because that preset is a plain
+constant upstream with no per-generation lineage to spread it over.
 
-Fifteen steps is not fewer forwards. The `res_2s` loop evaluates the transformer
-TWICE per step, once at the step's sigma and once at the geometric mean of that
-sigma and the next, and once more at a terminal sigma the schedule injects — so
-15 steps is 31 transformer evaluations against `one_stage`'s 30 at its own
-default. Expect it to cost about the same as the 30-step arm and to look better,
-not to be faster.
+Fifteen steps is not fewer forwards, and it is not even 15 model calls. The
+`res_2s` loop evaluates the denoiser TWICE per step — once at the step's sigma
+and once at the geometric mean of that sigma and the next — and once more at a
+terminal sigma the schedule injects. Stage 1's 15 steps is therefore 31 denoiser
+calls, and stage 2's frozen 3-step schedule adds 7, for **38 calls per render**.
+Stage 1 is also GUIDED, so each of its calls is three transformer forwards
+(conditional, unconditional, isolated-modality) against stage 2's one: **100
+transformer forwards** for a full render, where `one_stage` at its own 30-step
+default runs 30 calls. Expect the HQ preset to cost several times the 30-step
+arm and to look better, not to be faster.
 
 That is also why the preset cannot be reached by passing its numbers to another
 kind. `--steps 15` on `one_stage` renders a finished, correctly sized, plausible
-clip at half the model evaluations the preset was tuned for, and no property of
-the output says so. Ask for the pipeline, not for its step count.
+clip at a fraction of the model evaluations the preset was tuned for, and no
+property of the output says so. Ask for the pipeline, not for its step count.
 
 ```sh
 ltx2-gen --pipeline-kind res2s_two_stage \
@@ -3011,12 +3184,14 @@ ltx2-gen --pipeline-kind res2s_two_stage \
 server started with `--video-extra pipeline_kind=res2s_two_stage` renders every
 request on the HQ preset.
 
-Two limits, stated rather than left to be found. The stage-2 spatial upsample is
-the same one `distilled_two_stage` uses and carries the same refusal when the
-checkpoint has no latent upsampler. And the loop's SDE noise is drawn from this
+Three limits, stated rather than left to be found. The stage-2 spatial upsample
+is the same one `distilled_two_stage` uses and carries the same refusal when the
+checkpoint has no latent upsampler. The loop's SDE noise is drawn from this
 port's own generator rather than upstream's seeded `torch.randn`, so a render is
 not bit-comparable with Lightricks' — the same limit the ancestral arm already
-ships with, recorded in `.agents/specs/ltx25-res2s-loop.md`.
+ships with. And stage 1's guidance asks for an isolated-modality pass, which the
+device-resident forward cannot perturb, so this preset is host-only until that
+is closed; both are recorded in `.agents/specs/ltx25-res2s-loop.md`.
 
 ### Retake: regenerating a time window of an existing clip
 
@@ -3070,9 +3245,26 @@ LTX-2.5 checkpoints: the FP8 DiT, both NVFP4 DiTs, and the torchao-NVFP4 Gemma-4
 text encoder with its embedded tokenizer. These are the entry points the render
 path itself drives: `--dit` (`--video-dit` on the server) reaches
 `Ltx2StreamDitToDevice` / `Ltx2LoadDitFromSafetensors` at
-`ltx2_video.cpp:576-577`, and `--encoder` (`--video-encoder`) reaches
-`Ltx2LoadTextEncoderFromSafetensors` at `ltx2_video.cpp:851`. This section
+`ltx2_video.cpp:815-816 @ b5756ea8c`, and `--encoder` (`--video-encoder`) reaches
+`Ltx2LoadTextEncoderFromSafetensors` at `ltx2_video.cpp:1149`. This section
 documents them at the library level, where the gate below runs.
+
+**Ten coordinates into `ltx2_video.cpp` and `ltx2_loader.cpp` were wrong, at
+eleven citation sites on this page** — `ltx2_video.cpp:893` was cited twice.
+Five of the replacements carry `@ b5756ea8c`, one per affected passage; the bare
+`:NNN` beside a pinned one belongs to the same file at the same revision.
+Nothing else on this page is pinned, so read an unpinned coordinate as
+unverified.
+
+They were re-derived on 2026-08-17 from the sentence making each claim rather
+than by reading whatever sat at the cited line, and they were off by 40 to 2200
+lines: the family registry was cited at `:1529` and lives at `:3723`, and
+`has_encoder` was cited at `:893` where the assignment is at `:1191`. Every
+symbol existed, so every citation looked plausible; the tell was only that
+nothing at the cited line mentioned it. No gate here checks a documentation
+anchor ([#632](https://github.com/mudler/vllm.cpp/issues/632),
+[#911](https://github.com/mudler/vllm.cpp/issues/911)), so a pin is the only
+thing that lets a reader tell a stale coordinate from a moved one.
 
 The two NVFP4 checkpoints were written by different producers that disagree about
 both the group-scale framing and which nibble holds which weight, so the loader
@@ -3112,9 +3304,9 @@ nothing": upstream builds the parameter on the meta device and
 actually carries rather than refusing it or inventing a zero. The two
 `*_embeddings_connector` towers are
 **not** among them and never will be:
-`UnportedFamilies` filters them out at `ltx2_loader.cpp:527` through
-`LoadedElsewhere` (`ltx2_loader.cpp:514`), `RefuseUnported`
-(`ltx2_loader.cpp:537`) says so in its own message at `ltx2_loader.cpp:553-557`,
+`UnportedFamilies` (`ltx2_loader.cpp:573 @ b5756ea8c`) filters them out at `:582`
+through `LoadedElsewhere` (`ltx2_loader.cpp:569`), `RefuseUnported`
+(`ltx2_loader.cpp:592`) says so in its own message at `ltx2_loader.cpp:608-611`,
 and `Ltx2LoadConnectorWeights` loads them under their own contract — which is
 what the video engine calls, so a checkpoint this port reads completely is never
 made to ask for `allow_unported_modules` on their account. (The "five" this
@@ -3133,7 +3325,7 @@ checkout (the two nibble-order authorities); it reads a few hundred bytes at
 their own offsets and never a payload:
 
 ```sh
-python3 scripts/gen-ltx2-quant-goldens.py --vllm ~/_git/vllm --ltx2 ~/_git/LTX-2 --checkpoint-root /mnt/nas_share/checkpoints --out tests/vllm/models/ltx2_quant_goldens.inc
+python3 scripts/gen-ltx2-quant-goldens.py --vllm ~/_git/vllm --ltx2 ~/_git/LTX-2 --checkpoint-root "$CHECKPOINT_ROOT" --out tests/vllm/models/ltx2_quant_goldens.inc
 cmake --build build --target test_ltx2_loader && ./build/tests/test_ltx2_loader
 ```
 
@@ -3160,23 +3352,51 @@ and therefore cannot stream. The engine says that once on stderr rather than
 silently doing no streaming.
 
 **Read the statistics line before you believe any number you measure with it.**
-Every `VT_MOE_EXPERT_STREAM_STATS_EVERY` steps (default 16, `0` silences it) the
-engine prints:
+The engine prints one every `VT_MOE_EXPERT_STREAM_STATS_EVERY` steps (default
+16, `0` silences the periodic line), and **exactly one more when the process
+ends**, whatever the run did:
 
 ```text
 [expert-stream] steps=64 hits=141230 misses=37312 evictions=29312 fills=37312 bytes=92876505088 exhausted=0 advised=37312
 ```
 
-Two of those fields decide whether the run is measuring anything at all:
+**The final line is the one to read**, because it is the only one you are
+guaranteed to get. The periodic line is skipped whenever the step count is not a
+multiple of the interval, so a healthy five-token run prints none of them at the
+default 16; and it used to be skipped on `steps == 0` as well, which meant the
+one run that most needed reporting — the one where the step boundary is never
+reached — printed nothing at all. Treating absence as failure therefore reported
+VOID on a working lane. The final line crosses both of those skips, so it is
+printed even on a run of zero steps.
 
-- `steps` must advance. If it stays at 0 the decode step boundary is not being
-  reached and the cache will stop serving as soon as it fills.
+Two of the fields decide whether the run is measuring anything at all:
+
+- `steps` must advance. If the final line says `steps=0` the decode step
+  boundary is not being reached, and the cache stops serving as soon as it
+  fills — it will fall back to the memory mapping for the rest of the run.
 - `exhausted` must stay 0. Anything above 0 means slices were refused and read
   from the memory mapping instead, which is the slow path streaming exists to
   replace. The usual cause is a budget smaller than one step's working set:
   raise `VT_MOE_EXPERT_STREAM_SLOTS`.
 
-A run whose `steps` is 0 or whose `exhausted` is large is not a measurement of
+Read it together with the `[expert-stream] ON slots=...` banner, which is printed
+once when the lane builds its store. The four shapes are:
+
+| Banner | Final line | What happened |
+|---|---|---|
+| absent | absent | Nothing reached the streamed seam. A CUDA run (a device-resident expert is served unchanged), a checkpoint whose experts are not keep-quant towers, or a prompt that never reached an MoE layer |
+| present | present | The lane ran. Read `steps` and `exhausted` |
+| present | absent, and nothing called `ExpertStreamFlushStats` | The process did not reach its static destructors: a crash, a signal, or `_exit` |
+| present | absent, because `ExpertStreamFlushStats` was called | The internal gate seam took the process's single print, so teardown had none left to make. No shipped command or server path calls it, so an operator never reaches this shape |
+
+The last two shapes are keyed on the CALL and not on what stderr looks like,
+because stderr cannot separate them. `ExpertStreamFlushStats` prints the same
+line in the same shape as the periodic report, so "a statistics line already
+appeared mid-run" is also what a healthy run of 16 steps that then crashes
+produces. What distinguishes the two is whether the seam was called, and only a
+gate calls it.
+
+A run whose `steps` is 0, or whose `exhausted` is large, is not a measurement of
 streaming, whatever the startup line said. See
 [`docs/ENVIRONMENT.md`](ENVIRONMENT.md) for every knob and its parsing rules.
 
@@ -3238,7 +3458,7 @@ This documents **one brick of the shipped render path** — the text conditionin
 the DiT consumes — and how to reproduce its gate. The render itself is above
 under [LTX-2.5: what runs, and what it cannot do](#ltx-25-what-runs-and-what-it-cannot-do);
 `--encoder` is what puts this brick on that path, and `has_encoder` is set at
-`ltx2_video.cpp:893` once the tower loads.
+`ltx2_video.cpp:1191 @ b5756ea8c` once the tower loads.
 
 LTX-2.5 does not condition on a text encoder's last hidden state. It takes every
 Gemma-4 hidden state (the embedding output plus all 48 decoder outputs, 49 in
@@ -3560,7 +3780,7 @@ The Q4_K arm's own gate needs the pinned GGUF and the bf16 checkpoint, and skips
 loudly without them:
 
 ```sh
-CHECKPOINT_ROOT=/mnt/nas_share/checkpoints \
+CHECKPOINT_ROOT=... \
   ./build/tests/test_minimax_music3_quant_real
 ```
 

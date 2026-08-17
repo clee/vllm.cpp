@@ -54,11 +54,14 @@ functions and pin their output.
 
 ## 1. What upstream does, with anchors on both sides
 
-### 1.1 The pipeline, and the three things that make it HQ
+### 1.1 The pipeline, and what makes it HQ
 
-`TI2VidTwoStagesHQPipeline` (`ti2vid_two_stages_hq.py:59`) differs from
-`TI2VidTwoStagesPipeline` in exactly three things, and the row verified each at
-the pin rather than inheriting them from #921:
+**This section said "exactly three things" until 2026-08-17 and the count was
+wrong.** It was load bearing, because it was the argument for what this row had
+to port, and it is corrected here by *diffing the two files* at the pin rather
+than by adding to a list. `diff ti2vid_two_stages.py ti2vid_two_stages_hq.py`
+at `fd4ded7f` shows at least seven differences. Three are the ones this row
+took:
 
 1. `stepper = Res2sDiffusionStep()` (`ti2vid_two_stages_hq.py:258`), passed to
    both stages (`:285`, `:319`).
@@ -67,6 +70,31 @@ the pin rather than inheriting them from #921:
 3. `LTX_2_3_HQ_PARAMS` (`utils/constants.py:95-115`): 15 steps, stage 1 at
    `1088 // 2` x `1920 // 2`, STG off on both modalities, video rescale 0.45,
    audio rescale 1.0, cfg 3.0 / 7.0, modality 3.0.
+
+And these are the others, each with its disposition:
+
+4. **Stage 1 loads the distilled LoRA at `distilled_lora_strength_stage_1`**
+   (`:92-101`, `:151-154`) where the plain pipeline loads none on that stage
+   (`ti2vid_two_stages.py:140`). The distilled LoRA is out of scope for every
+   LTX row here and is already named under §2 Out; the substance is unchanged,
+   the count was not.
+5. **Stage 1's schedule is `execute(latent=empty_latent, steps=...)`**
+   (`:260-267`) against the plain pipeline's `execute(steps=...)`.
+   `schedulers.py:32` is `tokens = math.prod(latent.shape[2:]) if latent is not
+   None else default_number_of_tokens`, and `default_number_of_tokens` is 4096,
+   so this is a **resolution-dependent shift** rather than a fixed one. This
+   port's engine always derives from `target_tokens`, so stage 1 **coincides**
+   with upstream here. The divergence, if any, is on the PLAIN two-stage arm and
+   is not this row's to move; recorded so the next reader does not read the
+   coincidence as a design.
+6. **`GuidedDenoiser` (`:271-281`) replaces `FactoryGuidedDenoiser`.** Both
+   reduce to `_guided_denoise` (`utils/denoisers.py:61-211`) — the difference is
+   whether the guider params are constant or built per sigma — so the port takes
+   the same seam either way. This is the item §3.5 below is about.
+7. `hq_2_stage_arg_parser` replaces `default_2_stage_arg_parser` +
+   `resolve_cli_params`, and the guider parameters are typed
+   `MultiModalGuiderParams` rather than `... | MultiModalGuiderFactory`. A CLI
+   surface, not a behaviour.
 
 Stage 1 runs at `width // 2, height // 2` (`:238-243`) under a `GuidedDenoiser`
 with a negative context (`:271-281`); stage 2 runs at full resolution under a
@@ -92,6 +120,13 @@ default on the shipped arm:
 | `bongmath_max_iter` | `100` | `samplers.py:219` |
 | `new_noise_fn` | `_get_new_noise` (normalized), **not** `_get_plain_noise` | `samplers.py:220`, `:164-170` |
 | `model_dtype` | `torch.bfloat16` | `samplers.py:221` |
+
+**`model_dtype` is `torch.bfloat16` upstream and f32 here**, so this loop stores
+its latent at twice upstream's width. That is a port-wide pre-existing choice
+rather than this row's — every LTX-2.5 host path in this tree is f32 — and it is
+named because `AGENTS.md` "Inherit vLLM defaults" says a dtype that is too WIDE
+is invisible to every correctness gate this project owns. Stated at the code in
+`ltx2_samplers.h` as well, not only here.
 | `legacy_mode` | `True` | `samplers.py:222` |
 
 Two of these are load bearing and would be easy to get wrong by analogy with the
@@ -194,7 +229,9 @@ no rendered clip can tell the two samplers apart.
 The loop works in `hp` = float64 on CPU (`samplers.py:262`, "float64 on CUDA/CPU
 for ODE numerical stability"), and writes back to `model_dtype`. The
 already-ported ancestral loop does the opposite and steps in **float32**
-(`samplers.py:550-551`, `.float()` on both operands). Two loops, two precisions,
+(`samplers.py:550` floats the SAMPLE; the denoised operand was already floated
+at `:484`, so a reader looking for two `.float()` calls at `:550-551` finds
+one). Two loops, two precisions,
 stated by upstream at both sites.
 
 Inside the loop the SDE coefficients themselves split again, and this one is
@@ -260,7 +297,7 @@ live in different packages upstream.
 ### 3.2 The loop takes hooks, because upstream's takes a `denoiser`
 
 `res2s_audio_video_denoising_loop` is a free function whose model access is a
-`Denoiser` callable (`samplers.py:213-214`). Mirroring that shape is also what
+`Denoiser` callable (`samplers.py:214`). Mirroring that shape is also what
 makes the evaluation count gateable: a test supplies a counting denoiser and
 asserts an exact number.
 
@@ -268,7 +305,8 @@ asserts an exact number.
 struct Ltx2Res2sHooks {
   // `denoiser(transformer, video_state, audio_state, sigmas, step_index)`
   std::function<void(const std::vector<float>&, const std::vector<float>&,
-                     float sigma, std::vector<float>&, std::vector<float>&)> denoise;
+                     double sigma, int64_t step_index,
+                     std::vector<float>&, std::vector<float>&)> denoise;
   // `post_process_latent` (utils/helpers.py:461-463)
   std::function<std::vector<double>(std::vector<double>, bool is_video)> post_process;
   // `new_noise_fn` (samplers.py:220)
@@ -277,11 +315,15 @@ struct Ltx2Res2sHooks {
 ```
 
 `denoise` takes a **scalar** sigma rather than a schedule plus an index, because
-both upstream call sites reduce to `sigmas[step_index]` at
+all three upstream call sites reduce to `sigmas[step_index]` at
 `SimpleDenoiser.__call__` / `GuidedDenoiser.__call__` (`utils/denoisers.py:237`)
-and the second call site already passes a one-element schedule with index 0
+and the substep call site already passes a one-element schedule with index 0
 (`samplers.py:384-385`). Passing the pair would invite a caller to index it
 differently from upstream.
+
+**`step_index` is still passed, and that is §3.6.** It is a *second* argument
+upstream's `Denoiser` takes, and the denoiser reads it for something other than
+the sigma.
 
 The step arithmetic is one templated core in `ltx2_pipeline.cpp`:
 
@@ -296,9 +338,9 @@ selection is an enum named after the two upstream call sites, not a bare bool.
 
 ### 3.3 The engine hoists its per-evaluation body
 
-`ltx2_video.cpp`'s phase loop currently builds `Ltx2ModalityInput`, runs
-`Ltx2DitForward*`, and post-processes, all inline in the step loop. This row
-hoists that into one `Evaluate(video_latent, audio_latent, sigma)` lambda that
+`ltx2_video.cpp`'s phase loop currently builds `Ltx2ModalityInput`, runs the
+denoiser, and post-processes, all inline in the step loop. This row hoists that
+into one `Evaluate(video_latent, audio_latent, sigma, step_index)` lambda that
 **both** arms call: the Euler/ancestral loop calls it once per step, the res_2s
 loop calls it through `hooks.denoise`. No second forward path is written by
 hand, and the keyframe-mask guards, the frozen-sigma handling and the trace
@@ -306,6 +348,68 @@ updates are reached identically from both.
 
 `im.trace.dit_evaluations` increments inside `Evaluate`, so it counts every arm,
 across every phase.
+
+### 3.5 The res_2s evaluations go through `Ltx2GuidedDenoise`
+
+**Added 2026-08-17 at the merge onto `main`.** `daeff67f2` (#1092/#1102) landed
+the guided video denoiser into the same phase-loop region this row edits, so
+this row and that one both own the body of `Evaluate`. Resolving the conflict
+*textually* — keeping this row's bare `Ltx2DitForward` — would have made the HQ
+preset **the only unguided video arm in the tree**, at cfg 1.0 where upstream
+tunes it at 3.0, and **no gate this row had could see it**: the evaluation count
+is the sampler's factor, not the denoiser's.
+
+Upstream's HQ stage 1 builds a `GuidedDenoiser` and hands it to
+`res2s_audio_video_denoising_loop` (`ti2vid_two_stages_hq.py:271-281`, `:292`),
+exactly as `ti2vid_one_stage.py:221-226` hands one to the Euler loop. The
+sampler decides how many denoiser calls happen; the denoiser decides how many
+forwards each call is. So `Evaluate` builds the `Ltx2X0Model` lambda and calls
+`Ltx2GuidedDenoise`, and both samplers reach it.
+
+Stage 2 is a `SimpleDenoiser` upstream (`:316`). Here that is the recipe's
+default-constructed `Ltx2MultiModalGuiderParams` — `_POSITIVE_ONLY_GUIDER`
+(`denoisers.py:25-28`), cfg 1.0 / stg 0.0 / modality 1.0 — which assembles ONE
+pass and a `calculate` whose every term is zero. That equivalence is
+`ltx25-guided-video.md` §10's, not a new claim here.
+
+**The gate is a SECOND counter, because the first one cannot move.**
+`Ltx2ConditioningTrace::dit_forwards` counts actual `Ltx2DitForward` calls
+inside the x0 lambda; `dit_evaluations` counts denoiser calls. On the HQ stage 1
+they are `3 * (2n + 1)` and `2n + 1` — cond, uncond and mod, because cfg is 3.0
+and modality is 3.0 and stg is 0.0 — and an unguided arm makes them EQUAL. §5.2
+asserts both exactly on two step counts, and §8's mutation strips the guidance
+and shows RED.
+
+### 3.6 The second evaluation's `step_index`: upstream's literal 0
+
+Upstream's `Denoiser` signature is
+`denoiser(transformer, video_state, audio_state, sigmas, step_index)` and the
+res_2s loop passes **three different values** for it:
+
+| Evaluation | `sigmas` | `step_index` | Anchor |
+|---|---|---|---|
+| first | the loop's schedule | `step_idx` | `samplers.py:301` |
+| substep | `torch.stack([sub_sigma])` | **`0`**, a literal | `samplers.py:384-385` |
+| terminal | the loop's schedule | `n_full_steps` | `samplers.py:437` |
+
+**The decision is to mirror this exactly, including the literal 0.** It is not
+cosmetic: the denoiser reads `step_index` through `should_skip_step`, which is
+`step % (skip_step + 1) != 0` (`guiders.py:287-291`), so `0 % anything == 0`
+makes the substep evaluation **unskippable at any `skip_step`**.
+
+On the shipped HQ preset this is **inert**: `LTX_2_3_HQ_PARAMS` sets
+`skip_step = 0` on both modalities (`constants.py:104`, `:112`) and
+`should_skip_step` returns False for every step. It is **not** inert for a
+request that sets `video_skip_step` or `audio_skip_step`, which
+`ltx25-guided-video.md` §4.5 exposes. There, passing the loop counter at the
+substep would skip the same steps the first evaluation skipped and render the
+first-order trajectory under the second-order sampler's schedule — at the right
+evaluation count, the right shape and the right frame count.
+
+Gated by `Ltx2Res2sLoopStats::eval_step_indices` plus the fixture's own record
+of what arrived, against goldens taken from upstream's own loop. Two independent
+records, so a build that recorded one value and passed another fails rather than
+agreeing with itself.
 
 ### 3.4 The `res2s_two_stage` recipe
 
@@ -380,8 +484,33 @@ capability and its refusal.
 ## 5. Tests and evidence
 
 All goldens are generated by running **upstream's own code** at the pin. The
-generator is `gen_goldens.py`, recorded in this section, and the substitutions it
-makes are §0's three.
+generator is [`scripts/gen-ltx2-res2s-goldens.py`](../../scripts/gen-ltx2-res2s-goldens.py),
+committed beside the nine other `scripts/gen-ltx2-*.py`, and the header of
+`tests/vllm/models/ltx2_res2s_goldens.inc` names it.
+
+**This section previously said the generator was "recorded in this section" and
+it was not** — not in this file, not in `scripts/`, not anywhere in the tree, so
+a later reader could not regenerate a single number. Repaired on 2026-08-17 by
+writing the generator and checking it against the committed file: at `fd4ded7f`
+it reproduces `ltx2_res2s_goldens.inc` **byte for byte** apart from the header
+line naming it and the `EvalStepIndices` arrays §3.6 adds. That reproduction is
+the evidence the committed goldens are what upstream produced; a generator that
+merely ran would not have been.
+
+Regenerate and diff with:
+
+```
+python3 scripts/gen-ltx2-res2s-goldens.py --ltx2 /path/to/LTX-2 \
+    --out tests/vllm/models/ltx2_res2s_goldens.inc
+```
+
+It refuses a dirty upstream checkout and refuses a revision that is not the pin,
+because a SHA in the header that does not describe the code that ran reads as a
+pin while the oracle is whatever was in the working tree.
+
+The substitutions are §0's three plus `model_dtype`: upstream's loop declares
+`torch.bfloat16` (`samplers.py:221`) and the generator passes `torch.float32`,
+this port's model dtype. §1.2 records that divergence.
 
 ### 5.1 `test_ltx2_pipeline`
 
@@ -438,8 +567,18 @@ makes are §0's three.
    `pipeline_kind=res2s_two_stage` load on the reduced-dimension fixture,
    `engine->Generate(...)`, and `trace.dit_evaluations` asserted against the
    number the two phases' schedules imply. Compared **against the same render on
-   `distilled_two_stage`**, which must report strictly fewer, so the assertion
-   cannot pass by both arms being the same.
+   `one_stage`**, which must report strictly fewer, so the assertion cannot pass
+   by both arms being the same.
+9. **"ltx2 video: the HQ pipeline stage 1 is GUIDED, three forwards per
+   evaluation"** — the §3.5 gate. `dit_evaluations` and `dit_forwards` asserted
+   EXACTLY on two step counts (7/21 and 11/33), the relation
+   `forwards == 3 * evaluations` derived rather than only read, the four HQ
+   guider scales, and `pass_ran` for `cond`/`uncond`/`mod` with `ptb` absent.
+   `forwards != evaluations` is stated as its own assertion, because that is the
+   sentence an unguided arm's RED has to print.
+10. **"ltx2 video: the res_2s SUBSTEP converts x0 against the midpoint, not the
+    state"** — §9.3. The per-arm invariant over the four `res2s_substep_*`
+    vectors, with the midpoint displacement as the non-vacuity bound.
 
 ### 5.3 Reachability
 
@@ -485,10 +624,18 @@ a variable — because a mutation that fails to build and one that never applied
 both read exactly like a passing test. This row adds a fourth column, the doctest
 CASE and ASSERTION counts, and it earned its place in round 2 (see M6b).
 
-Restores are `git checkout --` against a fully staged index, verified by sha256
-and re-stamped with `os.utime`, because a restored file older than its object
-makes ninja skip the rebuild and carry the previous mutation's binary forward.
-The harness is `mutate.py`, recorded beside the golden generator.
+Restores are `git checkout --` against a clean tree, verified by sha256 and
+re-stamped with `os.utime`, because a restored file older than its object makes
+ninja skip the rebuild and carry the previous mutation's binary forward. The
+harness is [`scripts/mutation-harness.py`](../../scripts/mutation-harness.py).
+
+**This section previously said the harness was `mutate.py`, "recorded beside the
+golden generator", and neither file existed.** Repaired on 2026-08-17 by writing
+the harness. It refuses a dirty working tree, refuses a mutation whose anchor is
+absent or ambiguous rather than running a clean tree and reporting a pass, runs
+the WHOLE binary rather than a `--test-case` filter, and refuses to score
+anything as a survivor when the case or assertion count is zero — the four
+false-green shapes this campaign has paid for, in one place.
 
 | # | Mutation | BUILT | cc-err | EXIT | cases | asserts | Verdict |
 |---|---|---|---|---|---|---|---|
@@ -610,6 +757,87 @@ the server takes `--video-extra pipeline_kind=res2s_two_stage`.
   distinct behaviour on a rank-2 latent; it exists because a batched latent would
   make it real, and nothing here can tell.
 
+## 9. The merge onto `main`, and the review repair (2026-08-17)
+
+The fresh review confirmed the sampler itself: upstream's own
+`res2s_audio_video_denoising_loop` imported at `fd4ded7f` and run, 6/6/6/9/6
+evaluations, eval-sigma sequences matching at max diff `0.000e+00`, final
+latents within 4.9e-10, `bong_moved` matching on all five fixtures, 14/14 phi
+rows and 11/11 coefficient rows bit-exact, 11/11 mutations detected. None of
+that is revisited. Three findings were repaired.
+
+### 9.1 The merge is not textual (§3.5)
+
+`daeff67f2` (#1092/#1102) landed the guided video denoiser into this row's
+phase-loop region. `git merge-tree` reported three conflict hunks in
+`src/vllm/multimodal/ltx2_video.cpp` plus `tests/vllm/multimodal/test_ltx2_video.cpp`,
+`docs/USAGE.md` and `docs/FEATURES.md`. Resolved deliberately per §3.5 and §3.6.
+
+### 9.2 The mutation table for the repair
+
+Run with [`scripts/mutation-harness.py`](../../scripts/mutation-harness.py),
+which prints all four facts and refuses a mutation whose anchor is absent.
+Baselines: `test_ltx2_video` 75 cases / 2249 assertions / exit 0,
+`test_ltx2_pipeline` 50 cases / 2961 assertions / exit 0.
+
+| # | Mutation | Binary | BUILT | cc-err | EXIT | cases/asserts | Verdict |
+|---|---|---|---|---|---|---|---|
+| M1 | the HQ arm alone is UNGUIDED, i.e. the naive textual merge | video | YES | 0 | **1** | 75/1F | 2249/8F | DETECTED |
+| M2 | delete the `kRes2s` dispatch (reachability) | video | YES | 0 | **1** | 75/2F | 2249/12F | DETECTED |
+| M3 | stop counting `dit_forwards` | video | YES | 0 | **1** | 75/1F | 2249/6F | DETECTED |
+| M4 | the substep x0 converts against the STREAM latent | video | YES | 0 | **1** | 75/1F | 2249/2F | DETECTED — **was a SURVIVOR, see 9.3** |
+| M5 | the loop under-counts the substep evaluation | video | YES | 0 | **1** | 75/3F | 2188/0F | DETECTED |
+| M6 | never advance the per-phase evaluation index | video | YES | 0 | **1** | 75/2F | 2233/2F | DETECTED |
+| M7 | give the HQ recipe's stage 1 the Euler stepper | video | YES | 0 | **1** | 75/3F | 2237/13F | DETECTED |
+| M8 | **M5 beside the OLD tautological check** | video | YES | 0 | **0** | 75/0F | 2249/0F | **SURVIVED — see 9.4** |
+| P1 | the substep passes the loop counter, records 0 | pipeline | YES | 0 | **1** | 50/1F | 2961/9F | DETECTED |
+| P2 | the substep passes AND records the loop counter | pipeline | YES | 0 | **1** | 50/1F | 2961/27F | DETECTED |
+| P3 | the terminal evaluation passes `step_index` 0 | pipeline | YES | 0 | **1** | 50/1F | 2961/1F | DETECTED |
+
+### 9.3 M4 was a survivor, and what it found
+
+**On the first pass M4 was GREEN**: exit 0, 74 cases, 2234 assertions, nothing
+failed. The substep evaluation runs over `x_mid` (`samplers.py:369-378`) and its
+x0 conversion must use the latent that evaluation was handed. Reading
+`video.latent` instead moves the whole substep prediction by
+`x_mid - x_anchor` and **no instrument in this tree could see it**: the loop's
+own arithmetic is gated with a FIXTURE denoiser that never performs a
+conversion, and the engine's counters, eval sigmas, bong count and rendered clip
+are all invariant under it.
+
+Closed by `Ltx2ConditioningTrace::res2s_substep_*` and a case that asserts
+`cond == latent - timesteps * velocity` over the four recorded vectors, with the
+midpoint displacement as the non-vacuity bound. M4 is now RED.
+
+### 9.4 M8 is why the engine's `VT_CHECK` was rewritten
+
+The check beside `Ltx2Res2sDenoisingLoop` read
+`stats.evaluations > stats.full_steps`. Both operands are fields of the same
+struct and `2n + 1 > n` holds for every `n >= 1`, so it could not fail for any
+build. Its own comment claimed it "checks the two counters agree", and
+`im.trace.dit_evaluations` was never compared against anything.
+
+**Measured rather than argued.** M8 applies M5's defect — the loop stops
+counting its substep evaluation — beside the restored old check, and the suite
+is **GREEN at exit 0, 75 cases, 2249 assertions**. The same defect against the
+trace-delta form is exit 1. The check now compares
+`im.trace.dit_evaluations - evaluations_before` against `stats.evaluations`,
+which is the engine's count against the loop's.
+
+## Owed, added by the review repair
+
+* **The HQ preset is host-only.** Its `modality_scale = 3.0` asks for the
+  isolated-modality pass, and `Ltx2DitForwardDevice` takes no `perturbations`
+  argument, so the guidance resolution refuses that arm before the loop. That is
+  `ltx25-guided-video.md`'s owed device work (#1092's follow-up), inherited here
+  rather than newly incurred; `docs/USAGE.md` states it.
+* **The merge commit `da54d350e161` carries no trailer block** and
+  `scripts/check-commit-trailers.py` walks merge commits. It cannot be repaired
+  in place without a force-push, which this project forbids. Reported to the
+  operator; the sanctioned route is a fresh branch and a superseding pull
+  request, which is not this row's decision to take.
+
 ## Now
 
-`ACTIVE` — implemented on `row/LTX25-RES2S-LOOP`, awaiting fresh review.
+`ACTIVE` — implemented on `row/LTX25-RES2S-LOOP`, review findings repaired,
+merged onto `origin/main` at `2e025247e`, awaiting re-review.

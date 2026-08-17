@@ -131,6 +131,7 @@ token-for-token correctness against the pinned oracle.
 | GLM-4 dense (sandwich norms, partial rope) | Correctness-complete, speed-pending | Token-exact 16/16 (GLM-4-9B-0414); first GLM-family model; partial interleaved RoPE + Gemma2 sandwich norms + biased qkv |
 | GLM-4.7-Flash (MLA + GLM MoE) | Correctness-complete, speed-pending | Token-exact 8/8 (GLM-4.7-Flash, 31.2B); reuses the DeepSeek-V2 MLA stack; first e2e coverage of the q_lora query branch + noaux_tc sigmoid router with routed-scaling |
 | Kimi-Linear-48B-A3B (KDA + NoPE-MLA + MoE hybrid) | **RUNNER FOLD LANDS (ROW 7 §21, #122): engine==CLI 128/128 byte-identical; golden 122/128 (near-tie profile); FA2 MLA default-ON; `vllm_complete_tokens` (ABI v13).** Grouped-router top-k block-parallel (byte-identical); no binding speed number: ckpt is tiktoken-only, so no warm-server harness. STRICT stays CLOSED. Server 19.0 tok/s wall (~0.90× vLLM floor) = speed open | paged suite 8/8·206; SACRED post-fold 35B 315/315 + 27B 235/235; thin ABI client (ratchet 8) |
+| Nemotron-3.5-Lightning-30B-A3B (Mamba2 + GQA + relu2 MoE) | **Paged forward lands (#810 A2-P); e2e token gate PENDING on gate-host contention** | K/V and the conv + SSM rows now live in the runner's pages, so decode step 2 keeps state; G-SAFE narrows to `num_reqs <= 1`. CPU gate 12/12, 9/9 mutations RED |
 | Gemma-3 dense (GeGLU, dual rope, sandwich norms) | Correctness-complete, speed-pending | STRICT token-exact 48/48 greedy (gemma-3-1b-it); first Gemma-family model; GeGLU (gelu_pytorch_tanh) + dual per-layer RoPE theta + Gemma-RMSNorm sandwich norms + sqrt(hidden) embed-scale + query_pre_attn_scalar scaling |
 | Gemma-2 dense (attn + final logit soft-cap) | Correctness-complete, speed-pending | Near-tie-band 48/48 (gemma-2-2b-it): 44/48 strict on vLLM's greedy + 4/48 at 0.0-nat ties in vLLM's own logits; proves the attention + final logit soft-cap primitives (attn_logit_softcapping 50 + final 30); the inverse of Gemma-3 (both soft-caps, no QK-norm) |
 | Gemma-1 dense (the original Gemma) | Correctness-complete, speed-pending | STRICT token-exact 48/48 greedy (gemma-2b); two fused norms/layer, head_dim scale, GeGLU + sqrt(hidden) embed-scale, tied lm_head; no soft-cap/QK-norm/sliding. **D1 (2026-07-31): the whole Gemma family (1/2/3/4) folded to the default-ON bf16 merged-QKV descriptor (`MergedQkvEnabled`); re-gated Gemma-2 SACRED 48/48 (global+sliding) + Gemma-4 STRICT 32/32 — its existing gate held** |
@@ -189,9 +190,19 @@ at k=1..4. A token-identity gate cannot see a clamped drafter, so each arm
 carries TWO witnesses: the `k-1` draft decode forwards per propose call catch a
 propose that never ran the loop, and a varied-draft counter over the DELIVERED
 rows catches one that ran it and then padded. Neither proves that column j came
-from forward j, and no draft is ACCEPTED at any depth here, so provenance and
-the accept path both await the owed DGX gate. The DEFAULT is unchanged at k=1
-and **no speed number is claimed above it**.
+from forward j, and no draft is ACCEPTED at any depth in the CPU gate, so
+provenance and the accept path both await the owed DGX gate. The DEFAULT is
+unchanged at k=1 and **no speed number is claimed above it**.
+
+On real 27B NVFP4 weights the depth arms DO accept: re-measured 2026-08-17 with
+all seven arms in one uncontended window, k=2 gives depth-0 0.878, depth-1 0.731.
+**The token gate is still NOT claimed**: our spec-ON is not token-identical to
+our spec-OFF on 3 of 4 prompts, at the same positions for every k, and the vLLM
+leg that would attribute the split has never run here. Three passes failed to run
+it: the reimaged box has no C compiler, so the oracle's Triton JIT dies after the
+weights load, and once that is fixed the oracle consumes the whole 119 GiB host
+in the step after `torch.compile`. `gpu_memory_utilization` does NOT control that
+second one: an A/B at 0.30 collapsed as 0.75 did, and rebooted the box.
 
 Speculative decoding is available on the Qwen3.5/3.6 checkpoints via
 `--speculative-config`. **MTP (k=1)** is end-to-end token-exact vs vLLM on

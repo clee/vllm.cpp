@@ -140,7 +140,10 @@ Ltx2Res2sLoopStats Ltx2Res2sDenoisingLoop(const std::vector<float>& sigmas_in,
   Require(static_cast<bool>(hooks.denoise) && static_cast<bool>(hooks.post_process) &&
               static_cast<bool>(hooks.new_noise),
           "ltx2 res2s loop: the denoiser, post_process_latent and new_noise hooks are all "
-          "required; upstream takes all three (samplers.py:213-220)");
+          "required. Two of the three are upstream PARAMETERS — `denoiser` (samplers.py:214) and "
+          "`new_noise_fn` (:220); `post_process_latent` is a module-level import upstream calls "
+          "directly (:305, :390, :441), and it is a hook here only because the engine already "
+          "owns the mask and the clean latent");
   Require(sigmas_in.size() >= 2,
           "ltx2 res2s loop: a schedule needs at least two sigmas, got " +
               std::to_string(sigmas_in.size()));
@@ -196,9 +199,11 @@ Ltx2Res2sLoopStats Ltx2Res2sDenoisingLoop(const std::vector<float>& sigmas_in,
     // ── STAGE 1: evaluate at the current point (samplers.py:298-307) ────────
     denoised_v.clear();
     denoised_a.clear();
-    hooks.denoise(video.latent, audio.latent, sigma, denoised_v, denoised_a);
+    // :301 — the loop's OWN counter is this call's `step_index`.
+    hooks.denoise(video.latent, audio.latent, sigma, step_idx, denoised_v, denoised_a);
     stats.evaluations += 1;
     stats.eval_sigmas.push_back(sigma);
+    stats.eval_step_indices.push_back(step_idx);
     // :304-307 — post_process at the MODEL DTYPE, hence the narrowing back.
     if (video.present && !denoised_v.empty()) {
       denoised_v = ToModelDtype(hooks.post_process(ToHp(denoised_v), true));
@@ -309,9 +314,22 @@ Ltx2Res2sLoopStats Ltx2Res2sDenoisingLoop(const std::vector<float>& sigmas_in,
     const std::vector<float> mid_a =
         (audio.present && !x_mid_a.empty()) ? ToModelDtype(x_mid_a) : audio.latent;
     std::vector<float> denoised_v2, denoised_a2;
-    hooks.denoise(mid_v, mid_a, sub_sigma, denoised_v2, denoised_a2);
+    // A LITERAL ZERO, not `step_idx` (samplers.py:385). Upstream builds a
+    // one-element schedule `torch.stack([sub_sigma])` for this call and indexes
+    // it at 0, so the pair `(sigmas, step_index)` the denoiser receives is
+    // `([sub_sigma], 0)` on EVERY step. The scalar sigma above carries the first
+    // half of that; this carries the second, and it is not cosmetic: the
+    // denoiser reads `step_index` through `should_skip_step`
+    // (guiders.py:287-291), so `0 % (skip_step + 1) == 0` makes the substep
+    // evaluation unskippable at any `skip_step`. Passing the loop counter here
+    // would skip it on the same steps the first evaluation is skipped on, which
+    // is a first-order trajectory wearing the second-order sampler's schedule.
+    // Inert on the HQ preset itself, whose `skip_step` is 0 (constants.py:104,
+    // :112), and live for a request that overrides it.
+    hooks.denoise(mid_v, mid_a, sub_sigma, /*step_index=*/0, denoised_v2, denoised_a2);
     stats.evaluations += 1;
     stats.eval_sigmas.push_back(sub_sigma);
+    stats.eval_step_indices.push_back(0);
     if (video.present && !denoised_v2.empty()) {
       denoised_v2 = ToModelDtype(hooks.post_process(ToHp(denoised_v2), true));
     }
@@ -367,11 +385,14 @@ Ltx2Res2sLoopStats Ltx2Res2sDenoisingLoop(const std::vector<float>& sigmas_in,
   if (terminal_zero) {
     denoised_v.clear();
     denoised_a.clear();
+    // :437 — `n_full_steps`, which is one past the last full step's index and is
+    // the position the injected 0.0011 now occupies.
     hooks.denoise(video.latent, audio.latent,
-                  static_cast<double>(sigmas[static_cast<size_t>(stats.full_steps)]), denoised_v,
-                  denoised_a);
+                  static_cast<double>(sigmas[static_cast<size_t>(stats.full_steps)]),
+                  stats.full_steps, denoised_v, denoised_a);
     stats.evaluations += 1;
     stats.eval_sigmas.push_back(static_cast<double>(sigmas[static_cast<size_t>(stats.full_steps)]));
+    stats.eval_step_indices.push_back(stats.full_steps);
     if (video.present && !denoised_v.empty()) {
       video.latent = ToModelDtype(hooks.post_process(ToHp(denoised_v), true));
     }
