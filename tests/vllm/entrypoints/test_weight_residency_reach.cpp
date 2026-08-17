@@ -173,8 +173,13 @@ TEST_CASE("residency reach: a SECOND engine can still install, because a first l
   ::unsetenv("VT_CPU_REF");
 
   // THE TWO-MODEL PROCESS, driven through the loader. Engine A carries no residency
-  // document; its weight load reads the GGUF load policy, exactly as every GGUF load
-  // in the tree does. Engine B then arrives WITH one.
+  // document and stops on the missing checkpoint BEFORE any weight I/O, so the case
+  // calls `GgufLoadPolicy::FromEnv()` itself two lines below to stand in for the read
+  // a real load would perform. That is the point of the case rather than a weakness
+  // in it: the resolver being read is what the first implementation latched on, so
+  // reading it here is precisely the state that made engine B throw. What the case
+  // does NOT prove is that a completed weight load reads it — no checkpoint small
+  // enough to load lives in this suite.
   //
   // The first pass refused engine B. One process-wide flag was marked by every
   // resolver, so the ordinary `GgufLoadPolicy::FromEnv()` of load A made load B
@@ -207,6 +212,80 @@ TEST_CASE("residency reach: a SECOND engine can still install, because a first l
   REQUIRE(active.expert_stream_slots.has_value());
   CHECK(*active.expert_stream_slots == 8000);
   CHECK_FALSE(vllm::GgufLoadPolicy::FromEnv().mmap_residency);
+}
+
+TEST_CASE("residency reach: two DIFFERENT PARTIAL documents after a streaming latch") {
+  ResidencyFixture fx;
+  ::unsetenv("VT_GGUF_MMAP");
+  ::unsetenv("VT_GGUF_PREFAULT");
+  ::unsetenv("VT_CPU_REF");
+  ::unsetenv("VT_MOE_EXPERT_STREAM");
+
+  // The #1133 H1/H2 shape, driven through the two production entry points rather
+  // than through `SetWeightResidencyConfig` directly. The unit case in
+  // `test_weight_residency_config.cpp` proves the merge; this one proves an
+  // operator can reach it, because both defects were reported against
+  // `LoadedEngine::FromModelDir` and `vllm_engine_load`.
+  //
+  // Engine A carries the full document.
+  vllm::entrypoints::EngineParams a;
+  a.weight_residency =
+      vllm::parse_weight_residency_extension_json(kResidencyJson);
+  CHECK_THROWS(vllm::entrypoints::LoadedEngine::FromModelDir(kMissingModel, a));
+  REQUIRE(vllm::ActiveWeightResidencyConfig().expert_stream_slots.has_value());
+
+  // A's decode then takes the streaming decision. A load that stops on a missing
+  // checkpoint never reaches a routed expert slice, so the decision is taken here
+  // through the same resolver `Qwen35ExpertStreamRequested` calls.
+  const bool decided = vllm::ResolveExpertStreamRequested();
+  (void)decided;
+  REQUIRE(vllm::WeightResidencyLatched(vllm::ResidencyLatch::kExpertStream));
+
+  // Engine B arrives through the public C ABI with a GENUINELY PARTIAL document:
+  // `mmap.enabled` and nothing else.
+  //
+  // THE RETURN CODE CANNOT TELL THE TWO OUTCOMES APART, and that is why the
+  // assertions below read the global. A refused install throws `std::logic_error`
+  // out of `FromModelDir`, which leaves `vllm_engine_load` by the same path a
+  // missing checkpoint does, so both spell VLLM_ERR_MODEL_LOAD. The discriminator
+  // is `mmap`: B asks for FALSE where A installed TRUE, so the value is A's when
+  // the install was refused and B's when it ran.
+  vllm_model_params p = vllm_model_params_default();
+  p.model_path = kMissingModel;
+  p.offload_config = R"({"vllm_cpp":{"mmap":{"enabled":false}}})";
+  vllm_engine* eng = nullptr;
+  CHECK(vllm_engine_load(&p, &eng) == VLLM_ERR_MODEL_LOAD);
+  CHECK(eng == nullptr);
+  {
+    const vllm::WeightResidencyConfig now = vllm::ActiveWeightResidencyConfig();
+    REQUIRE(now.mmap.has_value());
+    CHECK(*now.mmap == false);
+    // ...and engine A's streaming fields, which B said nothing about, are still
+    // there for the slot store to read when it is finally built.
+    REQUIRE(now.expert_stream.has_value());
+    CHECK(*now.expert_stream == true);
+    REQUIRE(now.expert_stream_slots.has_value());
+    CHECK(*now.expert_stream_slots == 8000);
+    REQUIRE(now.prefault.has_value());
+    CHECK(*now.prefault == false);
+  }
+  CHECK_FALSE(vllm::GgufLoadPolicy::FromEnv().mmap_residency);
+
+  // Engine C: a SECOND, DIFFERENT partial document, this time through the loader.
+  vllm::entrypoints::EngineParams c;
+  c.weight_residency = vllm::parse_weight_residency_extension_json(
+      R"({"vllm_cpp":{"mmap":{"prefault":true}}})");
+  CHECK_THROWS(vllm::entrypoints::LoadedEngine::FromModelDir(kMissingModel, c));
+  {
+    const vllm::WeightResidencyConfig now = vllm::ActiveWeightResidencyConfig();
+    REQUIRE(now.prefault.has_value());
+    CHECK(*now.prefault == true);
+    REQUIRE(now.mmap.has_value());
+    CHECK(*now.mmap == false);
+    REQUIRE(now.expert_stream_slots.has_value());
+    CHECK(*now.expert_stream_slots == 8000);
+  }
+  CHECK(vllm::ResolveExpertStreamSlots() == 8000);
 }
 
 TEST_CASE("residency reach: the C ABI REFUSES a mistyped extension at the boundary") {

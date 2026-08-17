@@ -40,8 +40,11 @@ Three findings shape the change:
   invisible to both. This is what makes the namespaced key possible rather than a
   sibling flag, and it is also the one hazard the extension parser has to close
   itself: a *misspelled* key is silently ignored by both parsers, so the extension
-  parser enumerates the **whole document** — the four legal top-level keys plus its
-  own two levels — and refuses anything else by name. Enumerating only inside
+  parser enumerates the **whole document** — the four legal top-level keys, its own
+  two levels, and the fields of the two MIRRORED sub-objects `uva` and `prefetch` —
+  and refuses anything else by name. It enumerates NAMES only inside the mirrored
+  pair; `parse_offload_config_json` keeps sole ownership of their types, defaults and
+  bounds. Enumerating only inside
   `vllm_cpp` was the first shape and it left the worst spelling accepted:
   `{"vllm-cpp":{…}}` with a hyphen parsed to an empty config and started a server
   running this tier at its defaults — prefault ON, streaming OFF (#1122 H1). Refusing is also the mirror-faithful
@@ -51,21 +54,28 @@ Three findings shape the change:
   `ConfigDict(extra="forbid")` (`vllm/config/utils.py:68-69`). `OffloadConfig`
   (`offload.py:80`) and `KVTransferConfig` (`kv_transfer.py:22-23`) both carry it.
 - **Two of these five knobs latch a decision; three do not, and the difference is
-  the whole contract of the install.** `Qwen35ExpertStreamRequested()`
-  (`qwen3_5.cpp:5146-5154`) caches its answer in a function-local static, and the
-  slot store is built once per process so its `slots x slot_bytes` reservation
-  cannot be resized. Those two freeze. `mmap` does not, because
+  the whole contract of the install.** `ResolveExpertStreamRequested()` caches its
+  answer in a function-local static — `Qwen35ExpertStreamRequested()` is the
+  model-side name and is a pure delegation to it — and the slot store is built once
+  per process so its `slots x slot_bytes` reservation cannot be resized. Those two
+  freeze. `mmap` does not, because
   `GgufLoadPolicy::FromEnv()` is called per load; nor does `prefault`, because this
   row deliberately removes `PrefaultBorrowedSpan`'s `enabled` static
   (`qwen3_5_gguf_weights.cpp:37-44`). A config that would change a *frozen* field is
   not merely late — honouring it would record a configuration the engine is not
   running, the invisible-fallback shape this tree refuses everywhere else — so
-  `SetWeightResidencyConfig` **throws** for exactly those fields and accepts
-  everything else, including a second engine's `mmap`/`prefault` document. Marking
+  `SetWeightResidencyConfig` **throws** when a document SETS one of those two fields
+  to a value that would resolve differently from the decision already taken, and
+  accepts everything else: a second engine's `mmap`/`prefault` document, a document
+  that OMITS the frozen field, one that asks for what was decided, and one the
+  environment overrides anyway. Everything accepted is MERGED field by field, so an
+  omitted field keeps the value already installed. Marking
   one process-wide flag in the shared resolvers instead made an ordinary first load
-  refuse a legal second load (#1122 M1). The install site is the first statement
-  block of `LoadedEngine::FromModelDir`, beside the weight-offloader install, which
-  is already documented as being before any weight I/O.
+  refuse a legal second load (#1122 M1); comparing against the stored document rather
+  than the decision, and replacing rather than merging, then produced the same hard
+  failure and a silent field drop (#1133 H1, H2). The install site is the first
+  statement block of `LoadedEngine::FromModelDir`, beside the weight-offloader
+  install, which is already documented as being before any weight I/O.
 
 ## Scope
 
@@ -101,7 +111,7 @@ which is why an unknown key inside `vllm_cpp` is an error.
 The knobs themselves are ports and already carry their anchors: the load-time
 prefault mirrors llama.cpp's mmap prefetch under `use_mmap`
 (`src/llama-mmap.cpp:451` @ `237ad9b96`), recorded at
-`qwen3_5_gguf_weights.cpp:27-36`; the expert slot cache is the surpass-track
+`qwen3_5_gguf_weights.cpp:28-36`; the expert slot cache is the surpass-track
 `ENG-EXPERT-STREAM` lane, whose absence upstream is recorded in the engine
 matrix. This row adds no upstream behavior, so it inherits their anchors rather
 than claiming new ones.
@@ -112,20 +122,20 @@ Measured on this tree at `281e6a120`.
 
 | Knob | Read at | Latches | Default |
 |---|---|---|---|
-| `VT_GGUF_MMAP` | `gguf_keep_quant.cpp:248` (`GgufLoadPolicy::FromEnv`) | no — `FromEnv()` is called per load | `p.keep_quant`, i.e. on wherever the device can execute the quantized GEMM; forced off by `VT_CPU_REF` |
+| `VT_GGUF_MMAP` | `gguf_keep_quant.cpp:163` (`GgufLoadPolicy::FromEnv`) | no — `FromEnv()` is called per load | `p.keep_quant`, i.e. on wherever the device can execute the quantized GEMM; forced off by `VT_CPU_REF` |
 | `VT_GGUF_PREFAULT` | `qwen3_5_gguf_weights.cpp:39` (`PrefaultBorrowedSpan`) | **yes**, function-local static | **on** — unset reads as enabled — and `docs/ENVIRONMENT.md:50` says off, which is [#1109](https://github.com/mudler/vllm.cpp/issues/1109) |
-| `VT_MOE_EXPERT_STREAM` | `qwen3_5.cpp:5148` (`Qwen35ExpertStreamRequested`) | **yes**, function-local static | off |
-| `VT_MOE_EXPERT_STREAM_SLOTS` | `qwen3_5.cpp:5365` (`Qwen35ExpertStream` ctor) | effectively — the store is a process-lifetime singleton built once | 64 |
-| `VT_MOE_EXPERT_STREAM_SLOT_BYTES` | `qwen3_5.cpp:5359` (same ctor) | same | the largest of the first MoE layer's gate/up/down slices |
-| `VT_MOE_EXPERT_STREAM_STATS_EVERY` | `qwen3_5.cpp:5370` (same ctor) | same | 16 |
+| `VT_MOE_EXPERT_STREAM` | `qwen3_5.cpp:5149` (`Qwen35ExpertStreamRequested`) | **yes**, function-local static | off |
+| `VT_MOE_EXPERT_STREAM_SLOTS` | `qwen3_5.cpp:5471` (`Qwen35ExpertStream` ctor) | effectively — the store is a process-lifetime singleton built once | 64 |
+| `VT_MOE_EXPERT_STREAM_SLOT_BYTES` | `qwen3_5.cpp:5470` (same ctor) | same | the largest of the first MoE layer's gate/up/down slices |
+| `VT_MOE_EXPERT_STREAM_STATS_EVERY` | `qwen3_5.cpp:5476` (same ctor) | same | 16 |
 
 The config side already exists and is wired: `--offload-config`
 (`server_main.cpp:579`) → `parse_offload_config_json` + `Validate`
 (`:1101-1108`) → `EngineParams::offload_config`
-(`include/vllm/entrypoints/model_loader.h:155`) → `LoadedEngine::FromModelDir`
-(`model_loader.cpp:1256-1288`), which installs the offloader **before any weight
+(`include/vllm/entrypoints/model_loader.h:156`) → `LoadedEngine::FromModelDir`
+(`model_loader.cpp:1255-1318`), which installs the offloader **before any weight
 I/O** and says so. The C ABI carries the same string
-(`include/vllm.h:436`, `src/capi/vllm_c.cpp:638-645`). So the plumbing this row
+(`include/vllm.h:413-470` documents it, `:471` is the field, `src/capi/vllm_c.cpp:638-645` parses it). So the plumbing this row
 needs is one field wide, and the install point is already chosen and already
 documented for exactly this ordering reason.
 
@@ -203,7 +213,7 @@ rather than an omission.
 
 **`slot_bytes` is IN, and that is not obvious.** It looks like an internal sizing
 detail, but the code refuses a slice that exceeds it **by name** and tells the
-operator to raise it (`qwen3_5.cpp:5204-5207`), and a dynamic (UD) quant is
+operator to raise it (`qwen3_5.cpp:5223-5227`), and a dynamic (UD) quant is
 precisely the case where the computed default is wrong. A knob a documented error
 message tells you to change is a user surface.
 
@@ -347,9 +357,15 @@ a parser nothing reaches.
   flags for one concept and still needs the same disclaimer.
 - **Env-wins precedence can surprise a user whose config is being overridden by
   an exported variable they forgot.** Accepted, and mitigated where it is
-  cheapest to see: the install line prints the RESOLVED values, so a run whose
-  config was overridden says so on stderr at startup. The opposite polarity was
-  rejected because it breaks a measurement in flight.
+  cheapest to see: the install prints the DOCUMENT it installed on one line and, on a
+  second, every variable that would win over a field of it, so a run whose config was
+  overridden says so on stderr at startup. It does not print resolved values — the
+  streaming answer is cached the first time it is asked, so resolving it at install
+  would move that decision ahead of the weight load. That constraint binds
+  `expert_stream` alone; `prefault` and `slots` could be resolved at install and
+  `mmap`/`slot_bytes` need a default only their caller has, so reporting the document
+  for all five is a consistency choice on top of the one real constraint. The opposite
+  precedence polarity was rejected because it breaks a measurement in flight.
 - **The late-install throw must not fire on a legal second load, and the first
   shape of it did.** A second `FromModelDir` in one process cannot be honored for a
   field a taken decision has already frozen — `expert_stream` once the streaming
@@ -364,6 +380,41 @@ a parser nothing reaches.
   `kExpertStreamGeometry` by `NoteExpertStreamGeometry` when the store is built, and
   the shared resolvers mark nothing. An equal re-install and an empty install remain
   accepted, the first so the ordinary two-engine test binaries do not trip on it.
+- **It fired on a legal second load a second time, and the same misuse of `optional`
+  also silently dropped the first engine's fields.** Both are one root cause: an
+  absent field means UNCHANGED, and the code meant two other things by it (#1133 H1,
+  H2, both measured through `LoadedEngine::FromModelDir`). `FrozenFields` compared
+  `in.expert_stream` against the stored optional, and `nullopt != engaged` is true, so
+  `{"vllm_cpp":{"mmap":{"enabled":true}}}` on a second engine threw
+  `std::logic_error` and returned `VLLM_ERR_MODEL_LOAD` — while the message asserted
+  the engine was not running the configuration it was in fact running. The install
+  then did `g.config = config`, so a partial second document turned
+  `expert_stream=on slots=8000` into OFF with 64, with no diagnostic and read lazily
+  by a store built long afterwards. Repaired as ONE thing: a field is scored only
+  when the document SETS it, the comparison is against the DECISION taken (resolved
+  through the same rule the production resolver uses, so a document the environment
+  overrides is not a change either), and the install MERGES field by field. The
+  wholesale replace predated the per-field narrowing; the narrowing widened its reach,
+  because before it any differing document after a decision threw. What made both
+  survive a fresh review and eight mutations was the test shape: every latch case
+  installed a COPY of the first document or the empty one, so the second install always
+  restated the frozen field at the value it already had. "Two DIFFERENT partial
+  documents in one process" is the case shape that distinguishes them, at the unit
+  level and again through `FromModelDir` and `vllm_engine_load`.
+- **The unknown-key enumeration stopped one level short of what the ABI promised.**
+  `include/vllm.h` claimed an unknown key ANYWHERE in the document is refused, and the
+  top level plus the inside of `vllm_cpp` were closed while the inside of the mirrored
+  `uva` and `prefetch` objects was not: `{"uva":{"cpu_offload_GB":10}}` and
+  `{"prefetch":{"offload_groupsize":8}}` were ACCEPTED, giving a 0 GiB budget or a
+  group size of 0 under a document the operator believes configures offloading
+  (#1133 H3). Closed rather than scoped down, because refusing is the mirror-faithful
+  polarity here too: `UVAOffloadConfig` (`offload.py:15-16`) and
+  `PrefetchOffloadConfig` (`:47-48`) each carry `@config`, whose body sets
+  `ConfigDict(extra="forbid")` (`utils.py:68-69`), so upstream refuses a nested typo
+  and the tolerance was the deviation. The enumeration stays in the EXTENSION parser
+  and lists names only: `parse_offload_config_json` is untouched and keeps sole
+  ownership of those fields' types, defaults and bounds, so no type rule exists in two
+  places.
 - **`GgufLoadPolicy::FromEnv` keeps its name while no longer being env-only.**
   Renaming it touches 30 call sites across tests and four model loaders for no
   behavior change, which is a bigger diff than this row's whole subject. The
@@ -518,6 +569,121 @@ reachable in principle.
 assertions, `test_expert_stream_latch` 1 / 9, `test_weight_residency_reach` 6 / 54,
 `test_serve_residency_config` 6 / 64 (1 skipped, the re-exec'd child). All rc 0.
 
+### The second fresh review, and the second repair pass (#1133)
+
+**FAIL again**: 2 behaviour defects, 1 false ABI guarantee, 2 medium, 8 low, and 21
+of 55 sentences about the code wrong. Both behaviour defects were ONE root cause —
+"absent means unchanged", implemented as "absent is a change" in `FrozenFields` and
+as "absent is a clear" in the install — and both are recorded under Risks above.
+
+**Red first, and each red is the review's own measurement reproduced through product
+code.** Seven documents with a typo inside `uva` or `prefetch` were added to the
+parser's `refused[]` list and each was ACCEPTED (`CHECK_THROWS_AS ... did NOT throw at
+all`), which is H3. The new two-partial-documents case threw
+`std::logic_error: expert_stream, expert_stream_slots cannot be changed ... (mmap=on
+prefault=off expert_stream=on expert_stream_slots=8000) ... accepting this would record
+a configuration the engine is not running` on an `mmap`-only second document, which is
+H1 — and the message is the sentence the review called false. The reach case, driven
+through `vllm_engine_load`, found `mmap` still at engine A's `true` after engine B
+asked for `false`, which is H1 at the production entry point and the proof that the
+return code cannot discriminate. `test_weight_residency_config` rc 1, 16 cases / 3
+failed / 19 assertions failed; `test_weight_residency_reach` rc 1, 7 cases / 1 failed.
+
+**Sixteen mutations for the second repair.** Same harness discipline as above, with one
+addition: `git diff --stat` is printed beside the sha256 pair, because a
+never-applied edit and an applied one can share an unchanged-looking result line.
+Every row below reports `applied`, the build's own rc, an ENOSPC count, a NON-ZERO
+doctest case count taken from the LAST `test cases:` match, and each binary's rc
+captured directly. `config` = `test_weight_residency_config` (17 cases, 250 assertions green),
+`reach` = `test_weight_residency_reach` (7), `latch` = `test_expert_stream_latch` (1),
+`serve` = `test_serve_residency_config` (6), `mixed` =
+`test_expert_stream_mixed_slot` (1).
+
+| # | Mutation | Result |
+|---|---|---|
+| R1 | `FrozenFields` compares `in.expert_stream` against the stored optional again (the H1 defect) | config RED 3 failed; reach RED 1; latch GREEN (it never installs a partial document) |
+| R2 | the comparison targets the stored document instead of the decision | config RED 2 (the AGREES and ENVIRONMENT cases, exactly the two guarantees it targets) |
+| R3 | the install replaces wholesale instead of merging (the H2 defect) | config RED 2; reach RED 1 |
+| R4 | the nested `uva` enumeration removed | config RED 1 |
+| R5 | the nested `prefetch` enumeration removed | config RED 1 |
+| R6 | the refusal never fires | **INVALID**: `-Werror=unused-function` on `FrozenFields`. Re-run as R6b keeping the call and discarding the result: config RED 5, latch RED 1 |
+| R7 | the store never records the geometry it built | config RED 3; mixed RED 1 |
+| R8 | the flag records the fact but the wrong answer (always "decided off") | config RED 4; latch RED 1 |
+| R9 | the decision is never recorded at all | config RED 4; latch RED 1 |
+| R10 | `FrozenFields` ignores `VT_MOE_EXPERT_STREAM` | config RED 1 |
+| R11 | the count comparison ignores `VT_MOE_EXPERT_STREAM_SLOTS` | config RED 1 |
+| R12 | the refusal message quotes the stored document again | **INVALID** (`-Werror` on `DecisionSummary`), then **GREEN** as R12b — see below — then RED 1 as R12c |
+| R13 | the install call site in `FromModelDir` deleted (the reachability mutation) | reach RED 4; serve RED 3 |
+| R14 | `ResolveExpertStreamRequested` reads `.mmap`, the adjacent field (round two's survivor, re-run) | latch RED 1; config RED 1 |
+| R15 | the reset leaves a stale built geometry | **GREEN**, and recorded as such — see below |
+| R16 | the nested `uva` path built from a phantom `vllm_cpp` prefix | config RED 1 |
+
+**R12 is the one worth reading.** The first message assertion was
+`Mentions(e.what(), "expert_stream_slots=8000")`, and it passed with the mutation
+applied: at that point the stored document also held `expert_stream_slots=8000`, so
+quoting the document produced a string containing the same substring. The assertion
+was insensitive, not the code wrong. It moved to the one moment where the two differ —
+a refusal taken while nothing is stored, where quoting the document produced
+`environment/default` — and now asserts the decision is named and that phrase is
+absent. R12c is that mutation against that assertion.
+
+**R15 is GREEN and correctly so.** The reset clearing `built_geometry` is coherence
+with `BuiltExpertStreamGeometry()`'s own "both zero until something builds one", not a
+behavioural guarantee: the numbers are read only while the geometry latch is set and
+the reset clears that too, so nothing can observe the difference. The comment says so
+in the code rather than leaving a reader to assume a gate exists. A green mutation is a
+statement about the tests, not about the code.
+
+**TEN stale or imprecise `path:line` anchors in this spec, found by checking them last
+against the final tree, as the round required.** All ten were already wrong at the
+reviewed head `c7fa7084b`, so none is damage the repair did; it is the class
+`ENG-RECORD-ANCHOR-RATCHET` (#632) exists for, found in this row's own Port map. For
+`qwen3_5.cpp` and `include/vllm.h` that was verified by reading the same line numbers
+out of `git show HEAD~1:<path>`; for `gguf_keep_quant.cpp`,
+`include/vllm/entrypoints/model_loader.h` and `qwen3_5_gguf_weights.cpp` it follows
+from those files being untouched by this change, so their lines cannot have moved. The
+count was written as eight before this paragraph was audited against the actual
+corrections, which is the same defect class the round exists to stop.
+
+The Port map's four `VT_MOE_EXPERT_STREAM*` rows pointed at a comment line and at three
+lines of the statistics printer rather than at the constructor beside them;
+`slot_bytes`' "refuses by name" citation pointed at magic-static commentary;
+`GgufLoadPolicy::FromEnv` was cited 85 lines past itself; the
+`EngineParams::offload_config` field was off by one; `include/vllm.h:436` fell
+mid-sentence in a paragraph rather than on the field; the `FromModelDir` range started
+one line late and ended 30 lines early; and the llama.cpp-provenance range opened on a
+blank line. Corrected to `qwen3_5.cpp:5149`, `:5470`, `:5471`, `:5476`, `:5223-5227`,
+`model_loader.cpp:1255-1318`, `gguf_keep_quant.cpp:163`, `model_loader.h:156`,
+`qwen3_5_gguf_weights.cpp:28-36`, and `include/vllm.h:413-470` plus
+`:471`. The four upstream anchors this change ADDS were verified in the local checkout
+at the pin before being written: `offload.py:15-16` and `:47-48` are the two `@config`
+decorators, `utils.py:68-69` is the comment and the `ConfigDict(extra="forbid")` line,
+and the six mirrored field names sit at `offload.py:23`, `:34`, `:54`, `:62`, `:66`,
+`:70`.
+
+**Three stale anchors OUTSIDE this row are left alone, deliberately, and named so
+nobody has to rediscover them.** `qwen3_5.cpp:8907` cites `qwen3_5.cpp:7151` for
+`BuildPaddedDecode`, which is at `:9303`. Four places cite `include/vllm.h:912` for
+`vllm_video_params::ref_video`, which is at `:972`. `docs/USAGE.md:962` cites
+`include/vllm.h:1072`. All three were already stale at `c7fa7084b` — 53 lines off for
+`ref_video` there — and each belongs to another row's prose (spec decode, `LTX25-RETAKE`,
+MiniMax-H3). This change makes the last two worse by exactly the seven lines its
+`include/vllm.h` prose repair adds, and the first by six, which is unavoidable: any edit
+to a file shifts every bare `path:line` citation below it, and that is #632's whole
+subject. Correcting three other rows' comments would widen this diff into three
+subsystems it has no reason to touch, so they are reported rather than edited.
+
+**Two low findings have no mutation, and the reason is that they are prose.** L3's
+stale `ctest` count is in a landed commit body, which cannot be corrected in place
+without rewriting the reviewed head; the correct count is in this change's body and in
+the pull request body, which is what the squash lands. The other prose repairs (M1,
+M2, L1, L2, L4-L7) change comments and documents, and their gate is a reader.
+
+**Focused green after the second repair.** `test_weight_residency_config` 17 cases /
+250 assertions, `test_weight_residency_reach` 7 / 76, `test_expert_stream_latch` 1 / 9,
+`test_serve_residency_config` 6 / 64 (1 skipped, the re-exec'd child). All rc 0, every
+count from the last `test cases:` match.
+
 ## Owed
 
 - **The measured big-model reproduction.** The headline case
@@ -549,7 +715,10 @@ assertions, `test_expert_stream_latch` 1 / 9, `test_weight_residency_reach` 6 / 
   the offload parse ahead of the architecture branch, which is
   `ENG-WEIGHT-OFFLOAD`'s surface as much as this one's. Owned by
   `ENG-RESIDENCY-CONFIG`, issue
-  [#1122](https://github.com/mudler/vllm.cpp/issues/1122).
+  [#1135](https://github.com/mudler/vllm.cpp/issues/1135) — filed for this gap
+  specifically, because it was previously listed against
+  [#1122](https://github.com/mudler/vllm.cpp/issues/1122), the review issue this pull
+  request closes, so on landing the gap would have had no open issue (#1133 L8).
 
 ## Now
 
@@ -561,10 +730,20 @@ prefault, expert-stream, slots and slot-bytes knobs all resolve through it, and 
 expert-stream knob's own wiring to its own field now has a gate of its own.
 `stats_every` stays environment-only by decision, recorded in Port map.
 `docs/ENVIRONMENT.md`'s `VT_GGUF_PREFAULT` default is corrected here, closing
-#1109. The fresh review's findings (#1122) are repaired: the top-level typo is
+#1109. The first fresh review's findings (#1122) are repaired: the top-level typo is
 refused, the late-install refusal is scoped to the two decisions that genuinely
 freeze, and the public ABI comment says which half of `offload_config` moves
 weights.
+
+The second fresh review's findings (#1133) are repaired too, and its two behaviour
+defects were one root cause. "Absent means unchanged" now binds both halves of the
+install: a field is scored frozen only when the document SETS it and only when the
+value would resolve differently from the decision already taken, and the stored config
+is MERGED field by field. So a second engine's partial document installs instead of
+throwing, and it no longer drops the first engine's fields. The unknown-key
+enumeration reaches the mirrored `uva`/`prefetch` sub-objects, which makes the ABI's
+"anywhere in the document" true. `#1135` now owns the unreached-entry-point gap that
+was listed against the closing review issue.
 
 What keeps it `ACTIVE` rather than `DONE` is what is above under `## Owed`: nobody
 has yet driven the 370 GiB checkpoint through the JSON form on the box that can

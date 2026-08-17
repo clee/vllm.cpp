@@ -5155,13 +5155,19 @@ inline bool Qwen35ExpertStreamRequested() {
   // docs/ENVIRONMENT.md documents, so it is transcribed rather than normalised
   // onto the tree's whole-value polarity.
   //
-  // It still latches on first call, and that is deliberate — the answer decides
+  // The answer is still cached on first call, and that is deliberate — it decides
   // whether an ~18 GiB slot store is built and whether the default-on grouped-MoE
   // path is disabled, and those two must not be able to disagree later in the same
-  // process. The latch is why `SetWeightResidencyConfig` REFUSES a config that
-  // arrives after a decision was taken, instead of recording one the engine is not
-  // running; the loader installs it in `FromModelDir`'s first block, ahead of all
-  // weight I/O, so the ordering holds by construction.
+  // process. The function-local static lives in `ResolveExpertStreamRequested`, not
+  // here; this is a pure delegation.
+  //
+  // That cached answer is why `SetWeightResidencyConfig` refuses a config that would
+  // CHANGE it — not one that arrives late. A document that omits `expert_stream`, or
+  // asks for exactly what was decided, or that the environment overrides anyway, is
+  // accepted; only one that would make this function's answer differ from the value
+  // already returned is refused, because recording that would publish a
+  // configuration the engine is not running. The loader installs in `FromModelDir`'s
+  // first block, ahead of all weight I/O, so the ordering holds by construction.
   return ResolveExpertStreamRequested();
 }
 

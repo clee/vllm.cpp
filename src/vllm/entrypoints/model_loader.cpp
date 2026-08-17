@@ -1264,9 +1264,12 @@ std::unique_ptr<LoadedEngine> LoadedEngine::FromModelDir(
   // expert-stream decision is cached in a function-local static, and the slot
   // store's geometry is fixed when the store is built. A config that arrived after
   // either would be silently ignored, which is why `SetWeightResidencyConfig`
-  // throws on a late CHANGE to one of those fields rather than accepting it. (It
-  // accepts a late `mmap` or `prefault`, which resolve per load — a second engine
-  // in one process is legal.) It is placed ahead of `CreateWeightOffloader`
+  // throws when a document would CHANGE one of those two decisions rather than
+  // accepting it. It throws on nothing else: a second engine in one process is legal,
+  // so a late `mmap` or `prefault` (both resolved per load), a document that omits a
+  // decided field, and a document that asks for what was decided are all installed,
+  // and the install MERGES field by field so a partial document does not drop the
+  // first engine's. It is placed ahead of `CreateWeightOffloader`
   // deliberately:
   // that call can THROW for a configured-but-unwired backend, and a document
   // carrying both tiers must still have installed its residency half first.
@@ -1285,12 +1288,15 @@ std::unique_ptr<LoadedEngine> LoadedEngine::FromModelDir(
     // overridden by something exported weeks ago is the one way that precedence
     // hurts.
     //
-    // It cannot print RESOLVED values, and that is a constraint rather than a
-    // shortcut: every knob resolves lazily during weight load, and the streaming
-    // answer is cached on first read, so resolving here would move that decision
-    // ahead of the load — the exact ordering this block exists to hold. So an
-    // operator reading `expert_stream=on` beside `VT_MOE_EXPERT_STREAM (...)
-    // OVERRIDES` is being told the document said on and the variable decides.
+    // It does not print RESOLVED values, and ONE of the five is the reason:
+    // `expert_stream` is cached on first read, so resolving it here would move that
+    // decision ahead of the load — the exact ordering this block exists to hold. The
+    // other four could be resolved at this point (`prefault` and `slots` outright;
+    // `mmap` and `slot_bytes` need a built-in default only their caller has), so
+    // printing the document rather than a mixture of asked-for and resolved values is
+    // a consistency decision on top of that one constraint. An operator reading
+    // `expert_stream=on` beside `VT_MOE_EXPERT_STREAM (...) OVERRIDES` is being told
+    // the document said on and the variable decides.
     //
     // IT READS BACK THE INSTALLED GLOBAL, not `params`, and that is what makes the
     // line evidence that the install RAN. Measured: with the line printing from

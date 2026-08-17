@@ -50,10 +50,12 @@ constexpr const char* kPostParseBanner = "server: request logging";
 
 // The install line. It names the DOCUMENT that was installed — the fields the
 // operator set — and, on a second line, every variable that would win over one of
-// them. It does NOT name resolved values: every knob resolves lazily during weight
-// load and the streaming answer is cached on first read, so resolving at install
-// would move that decision ahead of the load. The pair of lines is what lets a run
-// whose document was overridden say so; see CASE 5.
+// them. It does NOT name resolved values: the streaming answer is cached the first
+// time it is asked, so resolving it at install would move that decision ahead of the
+// weight load. That constraint binds `expert_stream` alone; the line reports the
+// document for all five fields so it reports one kind of thing rather than a mixture.
+// The pair of lines is what lets a run whose document was overridden say so; see
+// CASE 5.
 constexpr const char* kInstallLine = "engine: weight residency";
 
 constexpr const char* kUnknownArgument = "server: unknown argument";
