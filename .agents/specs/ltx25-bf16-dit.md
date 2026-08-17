@@ -219,6 +219,40 @@ Red-first. Every case runs as part of a WHOLE binary; no `--test-case` filter.
 - **The memory envelope is unmeasured.** 42 GB bf16 against the distilled copy's
   ~21 GB is arithmetic, not a measurement, and nothing has run either through
   `Ltx2StreamDitToDevice` on a device that could hold them.
+- **Four of the five DiT artifacts cannot be pinned by CONTENT from here** —
+  [#1048](https://github.com/mudler/vllm.cpp/issues/1048). See §8; it needs an
+  authenticated hub fetch.
+
+## 8. The hub's content hash for this repo is a FABRICATION, and it type-checks
+
+Found while writing the `docs/USAGE.md` pin AGENTS.md §*Say which weights, and
+from where* requires. `Lightricks/LTX-2.5` is a **gated** repo: an
+unauthenticated `resolve` returns `Access to model Lightricks/LTX-2.5 is
+restricted`. Its `/api/models/.../tree` listing still answers, still carries
+real `size` values — and returns an `lfs.oid` that is **one character repeated
+64 times**.
+
+It is 64 characters. It is lowercase hex. `re.fullmatch(r"[0-9a-f]{64}", oid)`
+passes. A pinning script that reads that field writes five different checkpoints
+into a document under one invented digest and exits 0.
+
+The tell is cheap and it is the only one: **all 14 LFS files in the repo return
+the SAME oid**. The first draft of this row's `docs/USAGE.md` table carried five
+sha256 columns filled from that field, and the assertion that caught it was
+`dev_oid != distilled_oid` — written for an unrelated reason, because the two
+bf16 transformers are the same SIZE (42,018,190,584 bytes each) and the row
+wanted to say that a size check cannot separate them. That assertion firing is
+what turned a plausible table into a measured one.
+
+So `docs/USAGE.md` publishes exactly one sha256 — the LOCAL copy's,
+`792a2bad501ca03262c0bc2ce7a2949e85b142ce18e30894aad5bc849c8e7584`, over all
+42,018,190,584 bytes — labelled as the local copy, because there is nothing
+here to compare it against. The other four rows say "not obtainable here"
+rather than carrying a number.
+
+This is the [#1148 lesson](https://github.com/mudler/vllm.cpp/issues/1148) in a
+second place: an instrument that fails toward a well-formed answer is worse than
+one that errors, and `len(oid) == 64` is not a check.
 
 ## 7. Stop conditions
 
@@ -229,6 +263,44 @@ Red-first. Every case runs as part of a WHOLE binary; no `--test-case` filter.
    branches, and the full gate is the check.
 3. The corrected refusal cannot be made truthful without inventing a class
    signal. It can: it names the dtypes the file holds.
+
+## 9. Mutations
+
+Harness: `build/_agentlogs/mutate.py` (not committed; it lives in the build
+tree). Every row prints `git diff --stat`, whether it BUILT, the compile-error
+count and the exit code captured directly from the process, because each of
+those three has separately produced a green-that-proves-nothing here. The anchor
+is asserted UNIQUE before substitution, and the tree is restored byte-for-byte
+(sha256-verified) with its mtime bumped so ninja cannot skip the rebuild.
+
+| # | Mutation | Target | Built | `: error:` | Exit | Result |
+|---|---|---|---|---:|---:|---|
+| M1 | restore the refusal this row removed | `test_ltx2_loader` | yes | 0 | 1 | DETECTED (3 of 37 cases) |
+| M1 | " | `test_ltx2_video` | yes | 0 | 1 | **DETECTED (1 of 80)** — the reachability proof |
+| M2 | materialize bf16 weights as ZEROS | `test_ltx2_loader` | yes | 0 | 1 | DETECTED (5 of 37) |
+| M3 | widen the bf16 arm to f32, values correct | `test_ltx2_loader` | yes | 0 | 1 | DETECTED (5 of 37) |
+| M4 | let a mixed U8+F8 checkpoint through | `test_ltx2_loader` | yes | 0 | 1 | DETECTED (1 of 37) |
+| M5 | put "use the L2 path" back in the refusal | `test_ltx2_loader` | yes | 0 | 1 | DETECTED (1 of 37) — **after a repair, see below** |
+| M8 | the dtype refusal never fires | `test_ltx2_loader` | yes | 0 | 1 | DETECTED (1 of 37) |
+| M6 | make the fixture's `unquantized` flag inert | `test_ltx2_video` | yes | 0 | 1 | DETECTED (1 of 80) |
+| M7 | delete the production DiT call site | `test_ltx2_video` | yes | 0 | 1 | DETECTED (61 of 80) |
+
+**M5 CHANGED A TEST, WHICH IS WHY IT WAS RUN.** On the first pass it was NOT
+DETECTED: 37 of 37 passed at exit 0 with "use the L2 path" back in the surviving
+refusal. The cause was in the test, not the code. The F16 case retyped only the
+`BF16` entries, which left the F32 `scale_shift_table` families in place — so
+`PlanDit` still saw a dtype it reads, resolved `kNone`, and the refusal that
+fired came from `MaterializeDitTensor` instead. Both messages satisfy both of
+that case's assertions, so it passed while the branch it exists for was never
+reached, and the new `PlanDit` refusal was unexercised code with a message
+nothing checked.
+
+The repair retypes EVERY entry including the tables, halving the F32 payloads
+because `safetensors_reader.cpp:165-173` cross-checks `numel * dtype_size ==
+nbytes`, and asserts the message is `PlanDit`'s (`no weight this loader can
+read`) before asserting anything about its content. M5 and M8 both DETECT after
+it. This is the third shape of "green proves nothing" this campaign has hit and
+the first where the passing test named the right symptom for the wrong reason.
 
 ## Now
 
