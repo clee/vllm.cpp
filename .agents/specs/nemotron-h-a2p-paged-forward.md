@@ -865,12 +865,32 @@ nobody routes this architecture through a block that ropes.
 
 - **The §5.4 A3 end-to-end token gate**, and the §5.7 sm_121a leg with it. Owned
   by this row, tracked on [#810](https://github.com/mudler/vllm.cpp/issues/810).
-  Nothing about the released checkpoint is claimed until it runs.
+  Nothing about the released checkpoint is claimed until it runs. **The recorded
+  PENDING CAUSE IS NO LONGER TRUE and was re-measured rather than inherited**
+  (2026-08-17): §10 records contention — `dgx.casa` at loadavg 211 with 3 of
+  119 GB — and the box now answers at **loadavg 0.36 with 115 of 119 GB
+  available and the GPU at 0%**, with the checkpoint present and its revision
+  verified against its own LFS record. The gate is blocked on something else
+  entirely: **there is no CUDA toolchain to build a gate binary with.** The host
+  carries no `nvcc` and no `cmake` since the 14 Aug reimage
+  ([#1019](https://github.com/mudler/vllm.cpp/issues/1019)), and the `rc` worker
+  container it schedules through carries no compiler, no libc headers and no
+  network egress, so the recorded recipe's `docker run nvidia/cuda:*-devel` on
+  the host is the only remaining path. This is the #775 shape the governing spec
+  §5.5 warns about — a pending cause outliving its own truth — so it is
+  corrected here rather than re-quoted.
 - **`examples/nemotron_h_gen`** (§3.6) and the `docs/USAGE.md` weights block that
-  rides with it. Not written: the ABI surface it would exercise
-  (`vllm_engine_load` + `vllm_complete_tokens`) is the same surface the A3 gate
-  drives, so writing the example before that gate can run would ship a client
-  for a path nobody has watched produce a token. Owned by this row, tracked on
+  rides with it — **both LANDED 2026-08-17** by `MODEL-NEMOTRON-H-ABI-A3-E2E`.
+  The reason recorded here for deferring them — that shipping a client for a
+  path nobody has watched produce a token is premature — was overtaken by the
+  measurement above: the gate is blocked on a host toolchain rather than on
+  anything about the code, and a driver that does not exist cannot be run the
+  moment that host is repaired. The example therefore lands with its counting
+  guards proven ARMED against a real engine on a small local checkpoint — a
+  full-width match exits 0, a divergence exits 1, a row that matched every token
+  it looked at but looked at HALF exits 4, and five malformed-golden shapes each
+  exit 2 — and with **no claim whatsoever** about what the released 30B
+  checkpoint emits. Owned by this row, tracked on
   [#810](https://github.com/mudler/vllm.cpp/issues/810).
 - **The device `lm_head`** stays A2-Q2b's, which is why
   `scripts/runner-routing-allowlist.txt` is narrowed rather than removed and why
