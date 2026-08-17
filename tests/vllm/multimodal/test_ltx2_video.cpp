@@ -7009,10 +7009,20 @@ TEST_CASE("ltx2 a2vid: every requirement the recipe adds refuses BY WHAT IS MISS
 
     REQUIRE(plain_bytes.size() > 0);
     REQUIRE(plain_bytes.size() == restated_bytes.size());
-    CHECK_MESSAGE(plain_bytes == restated_bytes,
-                  "restating stage 1's OWN stg_scale changed the render, so the override reached "
-                  "stage 2 — which runs `SimpleDenoiser` upstream (a2vid_two_stage.py:278) and "
-                  "has no guidance to switch on");
+    // A COUNT of differing bytes, never the two buffers. These are PPM pixels
+    // and a WAV, so a failing `CHECK(a == b)` dumps raw binary into the report —
+    // which killed a mutation harness on the sibling row between applying a
+    // mutation and restoring it, and left the tree mutated.
+    size_t differing = 0;
+    for (size_t i = 0; i < plain_bytes.size(); ++i) {
+      if (plain_bytes[i] != restated_bytes[i]) ++differing;
+    }
+    CHECK_MESSAGE(differing == 0,
+                  "restating stage 1's OWN stg_scale moved " << differing << " of "
+                      << plain_bytes.size()
+                      << " artifact bytes, so the override reached stage 2 — which runs "
+                         "`SimpleDenoiser` upstream (a2vid_two_stage.py:278) and has no "
+                         "guidance to switch on");
     // THE CONTROL for the same request on a recipe that FIXES its guidance: the
     // distilled kind refuses the identical extra, so the acceptance above is
     // this recipe's and not a weakening of that refusal.
