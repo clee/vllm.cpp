@@ -266,12 +266,26 @@ one that errors, and `len(oid) == 64` is not a check.
 
 ## 9. Mutations
 
-Harness: `build/_agentlogs/mutate.py` (not committed; it lives in the build
-tree). Every row prints `git diff --stat`, whether it BUILT, the compile-error
-count and the exit code captured directly from the process, because each of
-those three has separately produced a green-that-proves-nothing here. The anchor
-is asserted UNIQUE before substitution, and the tree is restored byte-for-byte
-(sha256-verified) with its mtime bumped so ninja cannot skip the rebuild.
+The harness ran inside the build tree and is not committed, so its method is
+recorded here rather than by a path that no longer exists. For each row it
+substitutes one anchor, then prints four facts, because three of them have
+separately produced a green-that-proves-nothing in this campaign:
+
+- `git diff --stat` for the mutated file — a mutation that never applied reads
+  as a passing test;
+- whether the target BUILT, and the `: error:` count — a mutation that fails to
+  build reads as a passing test;
+- the exit code captured DIRECTLY from the process, never through a pipe;
+- doctest's `test cases:` and `Status:` lines, since a thrown case prints
+  `0 failed` beside `Status: FAILURE!`.
+
+The anchor is asserted to occur EXACTLY ONCE in the file before substitution: a
+non-unique anchor mutates a different function on a sibling row and presents as
+a compile error about the code under test. After each row the original text is
+written back, the file's mtime is bumped so ninja cannot skip the rebuild, and
+the restored file's sha256 is compared against the pre-mutation tree. Whole
+binaries are run; no `--test-case` filter is used anywhere, because a filter
+matching zero cases prints `SUCCESS!` at exit 0.
 
 | # | Mutation | Target | Built | `: error:` | Exit | Result |
 |---|---|---|---|---:|---:|---|
