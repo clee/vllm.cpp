@@ -332,19 +332,154 @@ gated, and upstream gives all of them one stage set (`distilled.py:131`). A
 default that moves a landed arm would be the same class of defect this row
 exists to fix.
 
+## Outcome
+
+Row `DONE`. Recorded here because neither the code nor the Git history carries
+it: what the gate MEASURED, what it is standing on, and what the fresh review
+checked and found sound so that nobody derives it a second time.
+
+### The distinguishing gate's margins are ONE byte and ELEVEN bytes
+
+The case "ltx2 a2vid: the distilled adapter rides stage 2 ALONE" prints both
+counts with `MESSAGE`, and the fresh review ran the mutations against head
+`851b15da7`. The numbers below are those doctest lines, not a summary of them.
+
+| Run | stage 1 alone | both stages | Result |
+|---|---|---|---|
+| head, unmutated | **0** of 63809 | **11** of 146753 | `SUCCESS!`, 2420 assertions, 0 failed |
+| M1 — `stage1.loras = kNoAdapters` deleted | **1** of 63809 | 14 of 146753 | `FAILURE!`, `CHECK(s1_differing == 0)` RED |
+| M2 — the phase loop's rebind call deleted | **1** of 63809 | 14 of 146753 | `FAILURE!`, same assertion RED |
+| M3 — the rebind never fuses | 0 of 63809 | **0** of 146753 | `FAILURE!`, `CHECK(both_differing > 0)` RED |
+
+**So the half that catches this row's own defect catches it by ONE byte in
+63,809 — 0.0016%.** Reverting to fusion at load moves exactly that much of the
+artifact, and the assertion is the difference between 0 and 1.
+
+That assertion cannot go falsely RED. The render is deterministic, so the count
+is 0 or it is not, and there is no tolerance to drift. What it can do is go
+falsely GREEN: anything that lowers the artifact's sensitivity to a stage-1
+weight change takes the 1 to 0 and the gate then passes on the defect it exists
+to catch. The candidates are the fixture's block count, its 2-step schedule, its
+sigma table, and the PPM's 8-bit quantization, which is where a sub-LSB
+trajectory difference is rounded away. **Anyone who moves the a2vid fixture owes
+a re-run of M1 and a look at the printed count, not a look at the green.**
+
+**The pair does not fail open together**, which is why this is recorded rather
+than repaired here. `CHECK(both_differing > 0)` carries 11 of 146,753 and M3
+drives it to 0, so an implementation that simply stopped fusing is still caught
+after the first half has gone blind. The two counts are one instrument. A
+stage-1 count of 0 is evidence only while the both-stages count is above 0.
+
+### The wall-clock trade is stated and UNMEASURED
+
+A two-stage a2vid render pays **two** rebinds, not one: the load fuses, phase 0
+rebinds off, phase 1 rebinds back on, and the DiT is left fused so the next
+render pays the same two. Each rebind re-opens the adapter and reads every A/B
+factor pair (`Ltx2LoraAdapter::Open` -> `ReadFactorAsBf16`), and the shipped
+distilled adapter is 8,899,889,568 bytes. Upstream pays its second
+materialization ONCE per process instead, because it keeps two
+`DiffusionStage`s. That is the trade `## Risks and decisions` accepted, and **no
+number was measured for it** — this row is gated on CPU fixtures and claims no
+wall-clock result. A later performance row owns it.
+
+### Checked by the fresh review and found sound
+
+Recorded so they are not re-derived.
+
+- **The f32-widen branch's direct write is not a missing `Copy`.** It writes
+  `static_cast<float*>(view.data)` rather than going through `backend->Copy`,
+  and it cannot be reached with a device queue: `Ltx2StreamDitToDevice` refuses
+  `widen_to_f32` by name (`ltx2_loader.cpp:714-720`) and `Load` sets
+  `widen_to_f32 = !im.on_device`, so an f32 view implies a HOST checkpoint,
+  which the rebind's own address-space refusal already pins to `queue ==
+  nullptr`.
+- **Contract drift between the load and the rebind cannot occur.**
+  `Ltx2AdoptDeclaredDitParams` refuses unless the enumerated tensor names AND
+  shapes are identical (`ltx2_loader.cpp:1218-1231`), so `ContractOf(
+  checkpoint.params)` inside the rebind enumerates what the load bound.
+- **One cosmetic message drift, on a path that refuses anyway.**
+  `lora_fused_tensors` doubles as the state bit, so after a `max_phase = 0`
+  render it is 0 and a later reference-conditioning refusal prints "no adapter
+  was supplied, so none were read" for a load that did supply one.
+  `lora_reference` itself is untouched by the rebind and stays correct; it is
+  simply not read on that branch. Message-only, and the refusal refuses either
+  way.
+
+### Not re-measured by this repair
+
+The margins above are read from the review's own doctest logs at head
+`851b15da7`, not re-run. The repair that recorded them changes prose, one header
+comment and one source comment, and no build can change a `MESSAGE` count. The
+`READER ANCHORS` list was re-derived with a faithful port of the test's own walk
+and is unchanged, with an armed control proving the port detects a one-line
+shift.
+
 ## Owed
 
 - **Per-phase adapter STRENGTH**, which `ti2vid_two_stages_hq.py:92-101` needs
   and this field cannot express. Owned by #921.
+
+  **A NEW FIELD IS NOT ENOUGH, and the seam's own no-op is why.**
+  `Ltx2RebindDitLoras` early-returns on `if (currently_fused == fuse) return;`,
+  and the header says calling it with the state the checkpoint is already in is
+  a no-op it detects itself. That state is a BOOLEAN, so it means "already
+  fused" and never "already fused AT THIS STRENGTH". HQ's case is stage 1 at
+  0.25 and stage 2 at 0.5 (`ti2vid_two_stages_hq.py:92-101`, handed to `:154`
+  and `:165`; the CLI defaults are at `utils/args.py:1174-1184`) — **both
+  fused**. The early return would therefore no-op the transition and stage 2
+  would silently render at stage 1's strength, with no refusal and nothing wrong
+  in the shape of the output.
+
+  So #921 needs two changes beyond the field: `bool fuse` must become a type
+  that can carry a strength, and `Ltx2DitCheckpoint` must record WHICH adapter
+  state is applied rather than merely whether one is. That is modest growth, not
+  a redesign — the re-materialize-and-write-back mechanism is untouched, because
+  re-materializing from the pristine file already reaches any strength in one
+  pass. The trap is written beside the early return in `ltx2_loader.h` and
+  noted on #921 so it is inherited rather than rediscovered.
+
+- **`res2s_two_stage` runs BOTH stages at strength 1.0 where upstream runs 0.25
+  and 0.5.** `Res2sTwoStageRecipe` is this tree's port of
+  `ti2vid_two_stages_hq.py`, neither of its phases sets `loras`, so both default
+  to `kAllAdapters`, and the load carries ONE strength for the whole engine
+  (`lora_strength` absent is 1.0, `ltx2_video.h:214-218`). Pre-existing and not
+  worsened by this row — the field this row adds is a set, and a set cannot
+  express a strength — but it was unstated anywhere until now. Owned by #921
+  with the item above.
 - **N-adapter per-phase SUBSETS**, upstream's `(*loras, *distilled_lora)` where
   `loras` is the user's own list and rides both stages. Blocked on the adapter
   arity refusal (`ltx2_lora.h:167-172`), which is upstream-faithful for the
   pipelines that take exactly one and is not lifted here.
 - **A real-weights comparison against upstream's own render** on the same
   checkpoint, take and seed — upstream's stage 1 on base weights against ours.
-  This is the instrument `ltx25-a2vid-recipe.md` section 4.4 named, and it needs
-  the distilled adapter checkpoint, which `find /mnt/nas_share/checkpoints
-  -iname '*lora*'` returns nothing for. Owed against #1093's checkpoint
-  dependency.
+  This is the instrument `ltx25-a2vid-recipe.md` section 4.4 named.
+
+  **WHAT IS OWED IS THE RUN, NOT THE ARTIFACTS.** An earlier draft of this
+  bullet said the comparison needs the distilled adapter checkpoint, "which
+  `find /mnt/nas_share/checkpoints -iname '*lora*'` returns nothing for". That
+  control now returns two adapters, and both were verified by reading the
+  safetensors header on 2026-08-17:
+
+  | File | Bytes | Header |
+  |---|---|---|
+  | `ltx-2.5/lightricks-ltx-2.5/loras/ltx-2.5-22b-distilled-lora-450-bf16.safetensors` | 8,899,889,568 | 3320 BF16 tensors = 1660 `lora_A`/`lora_B` pairs, 4.450 B params, `lora_rank`/`lora_alpha` 450, `model_version` 2.5.0, data end == file size |
+  | `ltx-2.5/lightricks-ltx-2.5/ic_loras/ltx-2.5-22b-ic-lora-pixel-spatial-upscaler-x2-1.0.safetensors` | 327,322,640 | the IC-LoRA, a different adapter and not this row's |
+
+  The first IS the file this row needs: the a2vid recipe's single `lora_path`
+  slot is upstream's `distilled_lora` (`--distilled-lora required=True`,
+  `utils/args.py:1140-1153`), which is what `requires_distilled_lora` mirrors.
+
+  The full/dev transformer that upstream's stage 1 runs has since completed too,
+  at `ltx-2.5/lightricks-ltx-2.5/diffusion_models/ltx-2.5-22b-dev-transformer-bf16.safetensors`,
+  42,018,190,584 bytes, header verified the same day: 4349 tensors, 21.004 B
+  params, BF16 4059 / F32 290, `model_version` 2.5.0,
+  `model.diffusion_model.keyframes_abs_pos_embedding` present, data end ==
+  file size.
+
+  So nothing is blocked on an artifact any more. What is owed is a GPU lease, a
+  build, both renders and the comparison. Note that the append-only index rows
+  for #1093 (`issue-index.md:318`) and #1118 (`:330`) still carry the
+  pre-arrival control, and those rows cannot be edited — this is the correction,
+  and it lives here.
 - **The reference clip's PIXEL path**, reason 1 of the refusal this row
   narrows. Still owed by #975.

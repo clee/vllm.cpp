@@ -2825,7 +2825,17 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
     // ever paid against weights the phase did not ask for. A no-op when the
     // load supplied no adapter, and a no-op when the DiT is already in the
     // requested state — so a one-stage recipe and every recipe that predates
-    // this field cost nothing, and a two-stage render pays exactly one rebind.
+    // this field cost nothing.
+    //
+    // WHAT A TWO-STAGE RENDER PAYS IS TWO REBINDS, not one, and the count is
+    // written out because it is the wall-clock half of the trade the row's spec
+    // accepted. `a2vid_two_stage` loads FUSED, phase 0 asks `kNoAdapters` and
+    // rebinds off, phase 1 asks `kAllAdapters` and rebinds back on; the DiT is
+    // left fused, so the NEXT render pays the same two. Each one re-opens the
+    // adapter and reads every A/B factor pair (`Ltx2LoraAdapter::Open` ->
+    // `ReadFactorAsBf16`), and the shipped distilled adapter is 8.9 GB. That
+    // cost is UNMEASURED on real weights; the row claims no wall-clock result
+    // and a later perf row owns the number.
     //
     // The emptiness test is HERE as well as inside the rebind so that a load
     // with no adapter does not re-open the checkpoint once per phase to be told

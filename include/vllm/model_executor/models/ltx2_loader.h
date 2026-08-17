@@ -521,6 +521,29 @@ Ltx2DitCheckpoint Ltx2StreamDitToDevice(vt::Queue& queue, const SafetensorsFile&
 //
 // Calling this with the state the checkpoint is already in is a no-op it detects
 // itself, so a single-phase recipe pays nothing.
+//
+// ─── AND THAT NO-OP IS THE TRAP THE NEXT ROW WALKS INTO ──────────────────────
+//
+// The state this detects is a BOOLEAN — `fuse` here, `lora_fused_tensors > 0` on
+// the checkpoint — so "already in that state" means "already FUSED" and never
+// "already fused AT THIS STRENGTH". Adding a per-phase strength on top of this
+// signature therefore does not work, and it fails SILENTLY rather than by name.
+//
+// `TI2VidTwoStagesHQPipeline` is the case: it builds the SAME adapter twice, at
+// `distilled_lora_strength_stage_1` and `distilled_lora_strength_stage_2`
+// (`ti2vid_two_stages_hq.py:92-101`), and hands one to each stage (`:154`,
+// `:165`). The CLI defaults them 0.25 and 0.5 (`utils/args.py:1174-1184`). BOTH
+// stages are fused, so `currently_fused == fuse` holds at the stage boundary and
+// this function returns having done nothing — stage 2 renders at stage 1's
+// strength, with no refusal, no shape change and no wrong-looking output.
+//
+// So growing this seam for https://github.com/mudler/vllm.cpp/issues/921 needs
+// TWO changes beyond a new field on `Ltx2PhaseRecipe`: `fuse` must become a type
+// that can carry a STRENGTH, and `Ltx2DitCheckpoint` must record WHICH adapter
+// state is applied rather than merely whether one is. That is modest growth, not
+// a redesign — the re-materialize-and-write-back mechanism above is untouched by
+// it, because re-materializing from the pristine file already reaches any
+// strength in one pass.
 void Ltx2RebindDitLoras(vt::Queue* queue, const SafetensorsFile& file,
                         const Ltx2DitLoadOptions& options, bool fuse,
                         Ltx2DitCheckpoint& checkpoint);
