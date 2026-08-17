@@ -3425,6 +3425,18 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
       // loop rather than served an unperturbed forward.
       const Ltx2X0Model x0_model = [&](const Ltx2ModalityInput* v, const Ltx2ModalityInput* a,
                                        const Ltx2DitPerturbation* p) {
+        // The refusal above is a statement about the RECIPE; this is a statement
+        // about the CALL, and the two are not the same check. A pass that reached
+        // here with a perturbation on the device arm would have it silently
+        // dropped by the argument list below, which is the shape of defect this
+        // file keeps finding: correct output for the wrong reason, with the STG
+        // and modality terms at exactly zero and nothing in the frames, the
+        // shapes or the counts to show for it.
+        VT_CHECK(!im.on_device || p == nullptr,
+                 "ltx2 video: a perturbed forward reached the device-resident arm, where "
+                 "`Ltx2DitForwardDevice` has no `perturbations` argument to take it. The guidance "
+                 "resolution refuses this before the loop, so reaching it is a defect rather than "
+                 "a bad request. Owed by row LTX25-GUIDED-VIDEO (#1092).");
         const Ltx2DitOutputs velocity =
             im.on_device ? Ltx2DitForwardDevice(*im.queue, im.dit.params, im.dit.weights, v, a,
                                                 im.compute_dtype)

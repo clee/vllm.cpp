@@ -6135,6 +6135,139 @@ TEST_CASE("ltx2 one_stage: rescale_scale 0 is the control, and the MODALITY term
   CHECK(at_default > 100.0 * at_zero);
 }
 
+TEST_CASE("ltx2 one_stage: post_process_latent runs AFTER the guider, not per arm (#1092)") {
+  // WHERE `post_process_latent` IS APPLIED, gated on a render that has something
+  // for it to move. The unconditioned case above cannot see this at all: every
+  // denoise mask entry is 1 there, so `x*mask + clean*(1-mask)`
+  // (utils/helpers.py:462-464) is a literal no-op and any placement of it passes.
+  //
+  // TWO THINGS ARE TRUE HERE AND THEY ARE EASY TO CONFUSE, so both are asserted.
+  //
+  // (1) Applying it to each ARM is an IDENTITY, and that is not a gap in this
+  //     case -- it is arithmetic. A conditioned token arrives with its per-token
+  //     sigma at 0 (`timesteps_from_mask`, utils/helpers.py:494-503), so
+  //     `X0Model` returns `latent - 0*v`, which is `latent`; and a conditioned
+  //     token's `latent` IS its clean value, which is what the conditioner wrote
+  //     and what the Euler step preserves. So every arm already equals what
+  //     post-processing would write. MEASURED: adding it per arm runs the whole
+  //     suite to 71 cases / 2145 assertions / exit 0, and the arm assertion below
+  //     is what says WHY rather than leaving the green unexplained.
+  //
+  // (2) Applying it after the GUIDER is emphatically not an identity, and that is
+  //     the thing worth gating. The guider's rescale (guiders.py:268-271) is a
+  //     scalar over the WHOLE tensor, so it multiplies the conditioned tokens too
+  //     -- `pred = latent * factor` there, because every guidance term is zero on
+  //     a token where all four arms agree. `post_process_latent` is what pins
+  //     them back to `clean`. Take it out, or move it a level down into the
+  //     denoiser, and the conditioned tokens leave the step scaled by a number
+  //     nobody asked for, on a render that finishes.
+  //
+  // So this case asserts that the arms were NOT touched and that the guider's
+  // result WAS, on exactly the mask-0 tokens.
+  Workspace ws;
+  const std::unique_ptr<vllm::multimodal::VideoEngine> engine =
+      vllm::multimodal::LoadVideoEngine(OneStageParams(ws.paths));
+  REQUIRE(engine != nullptr);
+  vllm::multimodal::VideoGenParams gen = OneStageGen(ws.root + "/conditioned");
+  gen.first_frame_ppm = ConditioningPpm(20, 28, 1);
+  gen.extras[vllm::multimodal::kLtx2ImageCrfExtra] = "0";
+  (void)engine->Generate(gen);
+  const auto* ltx = dynamic_cast<const vllm::multimodal::Ltx2VideoEngine*>(engine.get());
+  REQUIRE(ltx != nullptr);
+  const vllm::multimodal::Ltx2ConditioningTrace t = ltx->last_conditioning();
+  REQUIRE(t.completed);
+  REQUIRE(t.video_guided);
+  // The same four arms as the case above, not a degenerate set.
+  CHECK(t.video_uncond_forwards == 1);
+  CHECK(t.video_perturbed_forwards == 1);
+  CHECK(t.video_modality_forwards == 1);
+
+  const size_t tokens = t.video_first_timesteps.size();
+  REQUIRE(tokens > 0);
+  const size_t n = t.video_first_latent.size();
+  REQUIRE(n > 0);
+  const size_t width = n / tokens;
+  REQUIRE(width * tokens == n);
+
+  // NON-VACUITY, both ends. With no conditioned token this case is the one above
+  // again; with every token conditioned there is nothing left to denoise.
+  size_t conditioned = 0;
+  for (size_t token = 0; token < tokens; ++token) {
+    if (t.video_first_timesteps[token] == 0.0F) ++conditioned;
+  }
+  INFO("conditioned tokens = " << conditioned << " of " << tokens);
+  REQUIRE_MESSAGE(conditioned > 0,
+                  "no token arrived at the denoiser with a zero timestep, so the image "
+                  "conditioning did not reach the denoise mask and this case tests nothing");
+  REQUIRE_MESSAGE(conditioned < tokens,
+                  "EVERY token is conditioned, so there is nothing left to denoise");
+
+  // (2), AND THE POSITIVE CONTROL FOR THE WHOLE CASE. `post_process_latent` MOVES
+  // something on this render: the tensor the stepper was handed is not the
+  // guider's own output. Without this, every assertion here would be satisfied by
+  // a render where post-processing happened to be a no-op, which is exactly what
+  // the unconditioned case above is.
+  REQUIRE(t.video_first_stepper_input.size() == n);
+  REQUIRE_MESSAGE(t.video_first_stepper_input != t.video_first_denoised,
+                  "`post_process_latent` changed nothing on this render, so it cannot matter "
+                  "WHERE it was applied and this case discriminates nothing");
+
+  // AND IT MOVED ONLY THE CONDITIONED TOKENS, which is what makes the next
+  // assertion a statement about placement rather than about some third operation.
+  for (size_t token = 0; token < tokens; ++token) {
+    const bool is_conditioned = t.video_first_timesteps[token] == 0.0F;
+    for (size_t c = 0; c < width; ++c) {
+      const size_t i = token * width + c;
+      const bool moved = t.video_first_stepper_input[i] != t.video_first_denoised[i];
+      if (moved == is_conditioned) continue;
+      INFO("token = " << token << " channel = " << c);
+      FAIL_CHECK("`post_process_latent` moved a token whose denoise mask does not match: it is "
+                 "`x*mask + clean*(1-mask)` and must move exactly the mask-0 tokens");
+      break;
+    }
+  }
+
+  // (1). Every arm the forward returned is `latent - sigma*velocity`, INCLUDING
+  // on the conditioned tokens, where that is `latent` itself. This is what makes
+  // the per-arm placement an identity rather than an undetected defect, and it is
+  // asserted rather than argued because the argument depends on a conditioned
+  // token's `latent` being its clean value -- a property of the CONDITIONER, one
+  // file away, that nothing here would otherwise hold.
+  const std::vector<float>* arms[] = {&t.video_first_cond, &t.video_first_uncond,
+                                      &t.video_first_perturbed, &t.video_first_modality};
+  const std::vector<float>* velocities[] = {
+      &t.video_first_cond_velocity, &t.video_first_uncond_velocity,
+      &t.video_first_perturbed_velocity, &t.video_first_modality_velocity};
+  const char* names[] = {"cond", "uncond", "perturbed", "modality"};
+  for (size_t k = 0; k < 4; ++k) {
+    INFO("arm = " << names[k]);
+    REQUIRE(arms[k]->size() == n);
+    REQUIRE(velocities[k]->size() == n);
+    double worst = 0.0;
+    for (size_t token = 0; token < tokens; ++token) {
+      const double sigma = static_cast<double>(t.video_first_timesteps[token]);
+      for (size_t c = 0; c < width; ++c) {
+        const size_t i = token * width + c;
+        // `ToDenoised` subtracts in double and STORES f32, so the expectation is
+        // rounded the same way. Comparing against the unrounded double leaves one
+        // ULP of disagreement -- measured at 5.96e-08, which is 2^-24 -- and a
+        // tolerance wide enough to absorb it would also absorb a real defect an
+        // order of magnitude away.
+        const float expected = static_cast<float>(static_cast<double>(t.video_first_latent[i]) -
+                                                  sigma * static_cast<double>((*velocities[k])[i]));
+        worst = std::max(worst, std::abs(static_cast<double>((*arms[k])[i]) -
+                                         static_cast<double>(expected)));
+      }
+    }
+    INFO("max|arm - (latent - sigma*velocity)| = " << worst);
+    CHECK_MESSAGE(worst == 0.0,
+                  "this arm is not `latent - sigma*velocity` on every token, so something was "
+                  "applied to it between the forward and the guider -- and if that something is "
+                  "`post_process_latent`, it has stopped being an identity on the arms and the "
+                  "per-arm placement is now a real divergence rather than a harmless one");
+  }
+}
+
 TEST_CASE("ltx2 guided video: the refusals that would otherwise RENDER (#1092)") {
   Workspace ws;
 

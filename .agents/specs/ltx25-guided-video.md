@@ -436,6 +436,74 @@ Stop and report `NEEDS_DECISION` rather than narrowing silently if:
   guidance arithmetic is gated against upstream **source**, not against upstream
   **output**, and that is the ceiling on this row's evidence.
 
+## 10. What the implementation actually did, against §4
+
+Three things moved from the design, and each is recorded here rather than left
+for a reader to diff.
+
+**The seam runs on EVERY video render, not only the guided ones.** §4 left this
+open. The implementation routes the phase loop through `Ltx2GuidedDenoise`
+unconditionally, because a phase whose recipe sets no guidance keeps
+`Ltx2MultiModalGuiderParams`'s own defaults and those ARE
+`_POSITIVE_ONLY_GUIDER` (`denoisers.py:25-28`): one pass, and a `calculate` whose
+every term is zero. Upstream selects `SimpleDenoiser` by PIPELINE
+(`distilled.py:266,295`) rather than by params, and the two agree here because
+the recipes that select it are exactly the recipes whose guidance is the no-op
+one. **Measured, not argued:** every existing golden in `test_ltx2_video` held
+unchanged across the change, including the `distilled_two_stage` renders and the
+DFR and retake ones.
+
+**Two refusals that upstream does not have.** Both are cases where upstream's
+behaviour is a silent zero rather than an error, and where the render finishes:
+
+- an `stg_blocks` list naming no block this checkpoint has. Upstream's
+  `Perturbation.is_perturbed` is a membership test (`perturbations.py:26-33`), so
+  `[28]` on a two-block DiT perturbs nothing and leaves
+  `stg_scale * (cond - perturbed)` at exactly zero. Upstream never meets it
+  because it only runs 48-block checkpoints; this port runs reduced ones.
+- an EMPTY `stg_blocks` beside a non-zero STG scale, for the same reason.
+
+**A cross perturbation that differs between blocks is refused rather than
+widened.** `Ltx2DitPerturbation` carries one boolean per direction, which is
+sound only while the config says the same thing on every block — which
+`blocks=None` guarantees. That is checked in the seam rather than assumed.
+
+## 11. Outcome
+
+Landed on `row/LTX25-GUIDED-VIDEO`. Twelve mutations, eleven RED and one proven
+an IDENTITY; the table with all three facts per mutation is in the pull request
+body.
+
+**The one green, and what chasing it changed.** `post_process_latent` ADDED per
+arm, with the after-guider application left in place, runs the whole suite to
+71 cases / 2145 assertions / exit 0. Two readings of that green were tried and
+the first one was wrong.
+
+The first reading was that the gate could not see it, so a check was added that
+replays the guider over arms REBUILT from `latent` and the four raw velocities --
+independent of anything applied to the arms alike. It did not move the green
+either, which was the clue.
+
+The second reading, measured rather than argued, is that the mutation is a NO-OP.
+`post_process_latent` is `x*mask + clean*(1-mask)`, so it can only touch a token
+whose denoise mask is 0; such a token's per-token sigma is 0
+(`timesteps_from_mask`, `utils/helpers.py:494-503`), so `X0Model` returns
+`latent - 0*v`, which is `latent`; and a conditioned token's `latent` IS its
+clean value. Every arm already equals what post-processing would write.
+
+**What that produced is a better test, not a waived mutation.** The tempting
+proof of the above -- "so applying it anywhere is the same" -- is false for the
+guider's RESULT, because the rescale (`guiders.py:268-271`) is a scalar over the
+whole tensor and multiplies the conditioned tokens too. Take the after-guider
+application away, or move it down into the denoiser, and those tokens leave the
+step scaled by a number nobody asked for. The row therefore carries a CONDITIONED
+`one_stage` case which asserts both halves: that no arm was touched, and that the
+guider's result was, on exactly the mask-0 tokens. The MOVE mutation is RED
+against it (71 cases / 2133 assertions / exit 1); the ADD mutation stays green
+and the case now says why in an assertion instead of leaving it unexplained.
+
+**A residual, stated.** Nothing here compares against a running oracle; see §0.
+
 ## Now
 
-Spec committed. Implementation and gate follow on the same pull request.
+Implementation and gate landed on the branch; the row awaits a fresh review.
