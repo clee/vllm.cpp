@@ -16,11 +16,20 @@ on it, which is the exact failure the lease exists to remove. The procedure is
 in the `leasing-a-gpu` skill.
 
 **This REPLACED the `ssh <host>` plus `flock` mechanism that the profiles later
-in this file still describe.** Every GPU run recorded in this repository before
-2026-08-17 took that older path. Read a historical recipe as evidence of what
-ran at the time, not as an instruction for what to run now. The file mutex is
-still real and still required, and it now lives INSIDE a lease rather than
-instead of one.
+in this file still describe.** Read a historical recipe as evidence of what ran
+at the time, not as an instruction for what to run now. The file mutex is still
+real and still required, and it now lives INSIDE a lease rather than instead of
+one.
+
+**The bypass has already voided a measurement, so this is a measured cost and
+not a rule for its own sake.** `.agents/specs/minimax-music3.md` §13.10 records
+a whole speed axis retained as VOID on 2026-08-17: those runs went in by `ssh`
+plus `docker run` serialised by the old mutex, while a concurrent session held
+the SAME box through `rc`. The two sessions took different mutexes and neither
+excluded the other, which is verbatim the #777 failure, and it is the likely
+cause of a 3x swing in the samples. `.agents/benchmark-record.md` records the
+other half of that row taking a real `rc hold` on `thor:gpu0` and reports the
+window in which the fleet showed `thor:gpu0` FREE while it was in use.
 
 The fleet, read from `rc devices` and `rc describe` on 2026-08-17:
 
@@ -71,9 +80,19 @@ the 2026-08-14 reimage, so host-side oracle work needs `sudo -n docker run`
 against `vllmcpp-build:gb10` or `nvidia/cuda:13.0.1-devel-ubuntu24.04`, reached
 over `ssh`, which is the bypass. **So no vLLM leg of any row can currently run
 on `dgx.casa` by any lease-compliant path** ([#1129](https://github.com/mudler/vllm.cpp/issues/1129)).
-That is why every recent GPU run reached for `ssh`, and the bypass is a symptom
-of this gap rather than a discipline problem. Do not design the migration here.
-The row that takes #1129 owns it.
+That is why recent GPU work reached for `ssh`, and the bypass is a symptom of
+this gap rather than a discipline problem. Do not design the migration here. The
+row that takes #1129 owns it.
+
+**This confirms and extends a finding that already landed, rather than making a
+new one.** `.agents/specs/minimax-music3.md` §13.10 probed `thor`'s worker on
+2026-08-17 and found the same absence (`no gcc / g++ / cmake / ninja / nvcc /
+make`), reported that the `$HOME` build tree is not mounted inside the worker,
+and named what a valid re-measurement needs: either a worker image carrying the
+CUDA devel toolchain, or the build placed on `/workspace` by something that
+already has one. This row measured `dgx`'s worker and adds the part that turns
+an open gap into a blocker for the parity gates, which is that the ORACLE VENV
+is also unreachable from a lease.
 
 ### The `flock` orphan hazard that motivated the replacement
 
