@@ -276,9 +276,14 @@ the DiT saw it, on THIS arm, at every phase:
   encoded once, and `audio_latent_absmax > 0` so a zeroed latent cannot pass a
   digest comparison against another zeroed latent.
 
-The control is the same three fields on a render of the same kind with the take
-supplied at a different `audio_start_time`: a build that ignored the take gives
-both renders the same digest.
+Two controls, because one of them alone is passable by a constant:
+
+- **the same take at a different SEED gives a bit-identical audio latent.** It is
+  the encoded file, not a sample. A build that noised the audio stream, or that
+  generated it and let the take decorate the trace, moves this digest and moves
+  nothing a caller can see.
+- **a different `audio_start_time` gives a different one.** Without this the first
+  control passes on any constant tensor.
 
 ### 5.3 The guidance arms, per arm and in x0 space
 
@@ -312,7 +317,24 @@ coincide.
 Each mutation reports three facts: `git diff --stat`, whether it BUILT with the
 compile-error count, and the exit code captured directly. A mutation that fails
 to compile, and a mutation that never applied, both read exactly like a passing
-test.
+test. The mutations are run against the COMMITTED head, so that first fact is
+the mutation's own diff rather than the whole uncommitted change.
+
+**Measured: twelve applied, twelve DETECTED, and one of them by one binary
+only.** M6 — the stepper — is SURVIVED by the end-to-end case and DETECTED by the
+recipe case (`test_ltx2_pipeline`, exit 1, 44 cases / 2598 assertions). That is
+recorded as it measured rather than as it would read better: the stepper is a
+recipe field, the end-to-end case has no baseline to compare a trajectory
+against, and this recipe's `noise_seed_offset` is 0, so the ancestral arm moves
+no digest the trace carries.
+
+**One harness defect, found and fixed in flow.** §4.5's artifact comparison was
+written as `CHECK(a == b)` over PPM pixels and a WAV. A failing one dumps raw
+bytes into the doctest report, and that killed the harness with a
+`UnicodeDecodeError` between applying M12 and restoring it — the shape
+[`ltx25-a2v-audio-input.md`](ltx25-a2v-audio-input.md) §5 already records. The
+`finally` restored the tree, the comparison is now a differing-byte COUNT, and
+the harness decodes with `errors="replace"`.
 
 ## 5b. Reachability — the sentence the records must carry
 
