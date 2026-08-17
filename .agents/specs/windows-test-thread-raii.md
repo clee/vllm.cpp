@@ -103,6 +103,44 @@ The doctest case-count assertion is explicit rather than "it passed", and the
 count is asserted non-zero, because a `-tc` filter that matches nothing prints
 `SUCCESS!`.
 
+## Measured
+
+Host `mudler-desktop`, Linux, GCC, `cmake -S . -B build-584
+-DVLLM_CPP_BUILD_TESTS=ON` — the CI `build-test-cpu` configuration, so `NDEBUG`
+is NOT defined and `httplib`'s `assert` is live. Same build directory for every
+arm below, target `test_openai_api_server`, `-j 4`. Base
+`affc2a7fdfaa1a75c6c2b8bacd2e79b2990446f7`. Zero compiler warnings.
+
+**Case count, unchanged and non-zero.** Both arms report the same totals, so the
+conversion added no case and removed none:
+
+| arm | run |
+|---|---|
+| before | `test cases: 62 \| 62 passed \| 0 failed \| 0 skipped`, `assertions: 733 \| 733 passed \| 0 failed`, `Status: SUCCESS!` |
+| after | `test cases: 62 \| 62 passed \| 0 failed \| 0 skipped`, `assertions: 733 \| 733 passed \| 0 failed`, `Status: SUCCESS!` |
+
+**The mutation.** One assertion inside the socket-smoke case is made to fail
+while the server thread is still joinable — `CHECK(res->status == 200)` on
+`/health` becomes `REQUIRE(res->status == 999)`. `git diff --stat` confirmed one
+changed line in each arm, and each arm compiled with rc 0, so neither reading is
+a build failure wearing a pass.
+
+| arm | exit | what the run printed |
+|---|---|---|
+| before | **134** (`SIGABRT`) | `terminate called without an active exception`, then `test case CRASHED: SIGABRT` |
+| after | **1** | the named failure and nothing else: `FATAL ERROR: REQUIRE( res->status == 999 ) is NOT correct! values: REQUIRE( 200 == 999 )` |
+
+`terminate called without an active exception` names the mechanism exactly: it
+is `~thread` on a joinable thread, not an escaped exception. The `after` arm
+exits 1 through the ordinary failure path with no abort at all.
+
+**Why this has been invisible on Linux.** The `before` arm still printed its
+assertion, because `SIGABRT` is catchable and doctest's POSIX handler reports it
+and flushes. MSVC's `__fastfail` is not catchable and bypasses SEH, so the same
+`std::terminate` prints nothing there. The defect is platform-independent; only
+its reportability is not, which is why a decade of green Linux runs is not
+evidence against it.
+
 ## Gates
 
 - `scripts/agent-preflight.sh`
