@@ -811,14 +811,22 @@ binary sha distinct from baseline, a non-zero case count, and the tree restored
 byte-identically afterwards.
 
 **What is NOT gated, and it is the row's stop condition:** the §5.4 A3
-end-to-end token gate. `dgx.casa` answered at 07:21 on the implementing day and
-then stopped answering SSH (banner-exchange timeout) for the rest of the
-session, so the 32-token x 3-prompt golden never ran and neither did the
-sm_121a unit leg. That is §8.1's "cannot run on `dgx.casa` for a reason other
-than contention" only if the cause is not load; the cause was not established,
-so it is recorded as PENDING on the host rather than as a decision. **A2-P is
-not DONE until that gate is green**, and no `## Outcome` is written here until
-it is.
+end-to-end token gate, and the §5.7 sm_121a leg with it.
+
+**The cause is CONTENTION, and it is measured rather than inferred**, which is
+what decides §8.1's branch. `dgx.casa` answered at 07:21 with 74 of 119 GB
+available and loadavg 1.34, then stopped answering SSH entirely
+(banner-exchange timeout) for the next hour. When it answered again its uptime
+was 11h28m — **the same boot**, so it did not reboot — at **loadavg 211.44 with
+3 GB of 119 available**, falling to loadavg 20 and 115 GB free minutes later as
+another job finished. A 20.1 GiB checkpoint cannot load into 3 GB, and starting
+a heavy job beside a saturated box is how this project has OOM-REBOOTED it.
+
+§8.1 makes `NEEDS_DECISION` the answer only when the gate cannot run for a
+reason OTHER than contention. This was contention, so the result recorded is the
+other one §"Gates" allows: **pending a named external resource**, written into
+`docs/BENCHMARKS.md` rather than left as silence. **A2-P is not DONE until that
+gate is green**, and no `## Outcome` is written here until it is.
 
 **The one measured surprise, and it is a finding rather than a pass.** The §5.1
 token arms could NOT see the recurrent carry on the synthetic fixture: with both
