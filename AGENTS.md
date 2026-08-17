@@ -407,6 +407,36 @@ lifecycle change owes `STATUS`, `BENCHMARKS`, and the moved row spec's `## Now`.
 `.agents/NOW.md` is authored only at operator cadence and is never a per-row
 lifecycle write.
 
+## Work on a GPU happens inside a lease
+
+The shared GPUs are managed by
+[resource-controller](https://github.com/mudler/resource-controller), whose
+client is `rc`. **When the host has `rc`, claim the device with `rc run` or
+`rc hold` before any GPU work, and never `ssh` to a GPU box to run work
+directly.** The lease is the required path there, and it replaces the `flock`
+file mutex as the default.
+
+**When the host does not have `rc`, take the file mutex
+`${GPU_LOCK:-$HOME/gpu.lock}` instead.** The rule is conditional because the
+hosts are not identical, and a reader on a box without the tool still needs an
+instruction. Where both exist, the mutex runs inside the lease and never instead
+of one. The lease decides who gets the box. The mutex serialises the work of
+whoever holds it.
+
+**Two mutexes that do not exclude each other are worse than one, and this
+already cost a measurement.** On 2026-08-17 one session took the file mutex over
+`ssh` while another session held the same box through `rc`. Neither mutex
+excluded the other, and `.agents/specs/minimax-music3.md` §13.10 retains a whole
+speed axis as VOID because of it. That is the #777 failure again, in which this
+repository carried two GPU mutexes and neither serialised the other. A bypass
+also makes the fleet report the box free while somebody is on it.
+
+**A lease carries bytes, not executables.** The leased worker reads and writes
+the shared `/workspace`, and it has no compiler, no downloader and no Python, so
+it cannot produce a runtime in place. Plan staging around that limit.
+[`.agents/environment.md`](.agents/environment.md) carries the fleet, the
+measurement, and the procedure.
+
 ## Work happens in a worktree
 
 **Do every unit of work in its own linked worktree and task branch.** A unit of
@@ -537,6 +567,7 @@ scripts/agent-preflight.sh                      # before edits
 scripts/agent-preflight.sh --staged             # before commit
 python3 scripts/agent-ready.py                  # before remote handoff
 python3 scripts/agent-integration.py --base origin/main
+rc devices                                      # the GPU fleet, and who holds it
 ```
 
 Never push, merge, manage services, use external compute, or download large

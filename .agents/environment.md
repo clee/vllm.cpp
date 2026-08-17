@@ -9,11 +9,20 @@ use only the current local host and mark unavailable hardware gates `PENDING`.
 
 ## Reaching a GPU: claim a lease, never `ssh`
 
-The shared GPUs are managed by the `rc` fleet manager. **Claim a device with
-`rc run` or `rc hold` before any GPU work, and never `ssh` to a GPU box to run
-work directly.** A bypass makes the fleet report the box free while somebody is
-on it, which is the exact failure the lease exists to remove. The procedure is
-in the `leasing-a-gpu` skill.
+The shared GPUs are managed by
+[resource-controller](https://github.com/mudler/resource-controller), whose
+client is `rc`. **Claim a device with `rc run` or `rc hold` before any GPU work,
+and never `ssh` to a GPU box to run work directly.** A bypass makes the fleet
+report the box free while somebody is on it, which is the exact failure the
+lease exists to remove. The procedure is in the `leasing-a-gpu` skill, which
+this repository deliberately does not copy, because a copy goes stale without
+saying so.
+
+`AGENTS.md` §`Work on a GPU happens inside a lease` holds the rule, and it is
+conditional. Where the host has `rc`, the lease is the required path and it
+replaces the file mutex as the default. Where the host does not have `rc`, take
+`${GPU_LOCK:-$HOME/gpu.lock}` as before. Run `rc devices` to find out which case
+you are in. A `command not found` answer is the second case.
 
 **This REPLACED the `ssh <host>` plus `flock` mechanism that the profiles later
 in this file still describe.** Read a historical recipe as evidence of what ran
