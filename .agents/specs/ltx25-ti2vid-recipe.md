@@ -254,10 +254,21 @@ fixture geometry a `res2s_two_stage` render reports a DIFFERENT, non-4096 count.
 Both halves are load-bearing. The equality alone passes on a build that
 hard-codes 4096 everywhere; the inequality alone passes on today's tree.
 
-The stronger half is recomputation rather than comparison: rebuild the schedule
-with `Ltx2SigmaSchedule(steps, 4096)` and require it equal to what the render
-sampled, so the assertion is over the sigma VALUES and not over the counter that
-reports them.
+The stronger half is recomputation rather than comparison, and its limit has to
+be stated because it is easy to overclaim. `Ltx2ConditioningTrace` exposes
+`schedule_tokens`, a COUNT, and no sampled sigmas, so there is nothing on the
+render side to compare sigma values against. What the case can do, and does, is
+rebuild TWO schedules — `Ltx2SigmaSchedule(steps, 4096)` and
+`Ltx2SigmaSchedule(steps, hq_small)` — and require them to DIFFER, which fails
+on a build whose shift arithmetic has been flattened and on which selecting the
+anchor would be inert. The render-to-trajectory link therefore runs through the
+counter alone.
+
+Two things keep that from being vacuous. `steps` is the count the RENDER ran at,
+returned out of the render lambda rather than restated as a literal, so the
+recomputation cannot drift away from what was sampled. And `steps > 2` is
+asserted directly, because at two steps `stretch` pins both non-zero sigmas and
+the two schedules are equal for every token count.
 
 ### 3. The per-arm x0 invariant on stage 1 (`test_ltx2_video.cpp`)
 
@@ -316,6 +327,10 @@ which renders — otherwise the case passes on any load failure.
 5. The `ti2vid_two_stage` branch deleted from `ResolveLtx2PipelineRecipe` — the
    standing reachability mutation. Tests 2, 3, 4, 5 RED.
 6. `Ltx2GuidedDenoise` left in velocity space on one arm. Test 3 RED.
+7. Test 2's `gen.steps` 3 -> 2 — the mutation that the FIRST head passed. Test 2
+   RED, on both `at_anchor != at_target` and `rendered_steps > 2`. A version of
+   test 2 that recomputes at a literal is green under it and gates nothing about
+   the step count it renders at.
 
 Every mutation prints FOUR facts: `git diff --stat`, whether it BUILT, the
 compile-error count, and the exit code captured directly. A mutation that fails
@@ -411,10 +426,24 @@ fixture's usual step count is 2.
 
 So a version of this case that asserted only the counters would have been green,
 correct, and unable to see whether the anchor reached anything. Three steps is
-the shortest schedule with an interior sigma. The degeneracy is now pinned by an
-assertion in the direction that fails loudly if it ever stops holding, because
-the obvious future edit — dropping back to 2 steps to make the case faster —
-silently turns the trajectory claim into a tautology.
+the shortest schedule with an interior sigma.
+
+**The first fix for that was itself vacuous, and a fresh review caught it.** The
+case pinned the degeneracy by asserting that a 2-step schedule is
+token-independent — true, load-bearing against a future scheduler change, and
+silent about this case's own step count, because the trajectory half recomputed
+at the LITERAL 3 while the render read `gen.steps`. Mutating `gen.steps` from 3
+to 2 was NOT DETECTED: 83 cases, 2577 assertions, exit 0. Nothing the case
+asserted depended on the step count it rendered at, and the only render-derived
+observable in it is `schedule_tokens`, a count that does not move with steps at
+all. The pull request body claimed the opposite, which under
+`squash_merge_commit_message = PR_BODY` would have become the permanent commit
+message of the row whose headline finding is about vacuous gates.
+
+The step count now comes back OUT of the render lambda and the recomputation
+runs at it, and `steps > 2` is asserted by name. Both assertions fire on the
+mutation, so lowering the step count to make the case faster is refused rather
+than deprecated.
 
 **This bounds #1150 as well.** A short distilled schedule cannot see the anchor
 either, which is part of why three shipped arms carried the divergence with
@@ -441,7 +470,16 @@ Focused, at the head this row pushes:
 | Binary | cases | assertions | exit |
 |---|---|---|---|
 | `test_ltx2_pipeline` | 54 | 3182 | 0 |
-| `test_ltx2_video` | 82 | 2496 | 0 |
+| `test_ltx2_video` | 83 | 2581 | 0 |
+
+The `test_ltx2_video` row was recorded as 82 / 2496 through the review and was
+wrong on both numbers at every head this row ever pushed; the fresh review
+caught it. 83 / 2577 was the head under review, and the four assertions that
+close the step-count decoupling above bring it to 2581.
+
+Full gate at the same head: `CONFIGURE_EXIT=0`, `BUILD_EXIT=0`, `: error:` count
+0, `ctest -N` 506, `CTEST_EXIT=0`, `100% tests passed, 0 tests failed out of
+506`, `No space left` and `BFD` each 0 against injected controls that returned 1.
 
 RED before the recipe landed, captured on the same binaries: `test_ltx2_pipeline`
 54 cases / 3063 assertions, `Status: FAILURE!`, exit 1, both new cases throwing
@@ -502,13 +540,14 @@ RED before the recipe landed, captured on the same binaries: `test_ltx2_pipeline
   refusal lifts (`ltx2_lora.h:167-172`).
 - **`keyframe_interpolation`** (#1096), the fourth pipeline on this parser.
 - **`allow_request_latents` has no reader in `src/`**, on any recipe, owned by
-  [#1152](https://github.com/mudler/vllm.cpp/issues/1152). Five assignments,
-  zero readers, against a positive control (`allow_request_sigmas`, declared one
-  line above) that has a real reader at `ltx2_video.cpp:3476`. So
-  `res2s_two_stage`'s `true` against everything else's `false` is a disagreement
-  nothing can detect. This row writes `false`, which is what
-  `ti2vid_two_stages.py:159-181` supports, and adds a sixth write to a dead
-  field rather than leaving the default `true` standing as a wrong record.
+  [#1152](https://github.com/mudler/vllm.cpp/issues/1152). Four assignments on
+  `origin/main` and five with this row's, zero readers in either count, against
+  a positive control (`allow_request_sigmas`, declared one line above) that has
+  a real reader at `ltx2_video.cpp:3476`. So `res2s_two_stage`'s `true` against
+  everything else's `false` is a disagreement nothing can detect. This row
+  writes `false`, which is what `ti2vid_two_stages.py:159-181` supports, and
+  adds a fifth write to a dead field rather than leaving the default `true`
+  standing as a wrong record.
   Not fixed in flow: both closes — give it a reader, or delete it and its gated
   assertions — touch five landed recipes.
 

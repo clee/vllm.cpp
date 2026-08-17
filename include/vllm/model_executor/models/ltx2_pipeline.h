@@ -777,7 +777,7 @@ struct Ltx2PipelineRecipe {
   // sites, for the reason `audio_only` gives above. The second one already has a
   // second user waiting: `ti2vid_two_stages` (#1093) and
   // `keyframe_interpolation` (#1096) both select a parser where
-  // `--distilled-lora` is `required=True` (utils/args.py:1140-1153).
+  // `--distilled-lora` is `required=True` (utils/args.py:1140-1155).
   //
   // WITHOUT THE TAKE the render still finishes. It returns a clip of the right
   // size, the right frame count and the right sample rate, with the soundtrack
@@ -786,7 +786,7 @@ struct Ltx2PipelineRecipe {
   // input.
   bool requires_audio_input = false;
   // `--distilled-lora` is `required=True` on the two-stage parser this pipeline
-  // selects (utils/args.py:1140-1153, `default_2_stage_arg_parser` at `:1123`),
+  // selects (utils/args.py:1140-1155, `default_2_stage_arg_parser` at `:1123`),
   // and stage 2's three-sigma refinement (`:164`) is what that adapter was
   // trained for. A recipe that fixes this flag cannot render on a checkpoint
   // carrying no adapter without running a distilled schedule on undistilled

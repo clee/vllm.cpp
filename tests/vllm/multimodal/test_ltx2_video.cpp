@@ -7384,7 +7384,7 @@ TEST_CASE("ltx2 a2vid: every requirement the recipe adds refuses BY WHAT IS MISS
       WriteFixtureLora(ws.root + "/distilled.safetensors", kFixtureLoraTarget, 1.0F);
   const std::string wav = WriteWav(ws.root + "/take.wav", 2, kFixtureAudioRate, 2.0);
 
-  // ── no distilled adapter, refused at LOAD (utils/args.py:1140-1153) ────────
+  // ── no distilled adapter, refused at LOAD (utils/args.py:1140-1155) ────────
   {
     vllm::multimodal::VideoModelParams mp = A2VidParams(ws.paths, lora);
     mp.extras.erase(vllm::multimodal::kLtx2LoraPathExtra);
@@ -7541,7 +7541,7 @@ TEST_CASE("ltx2 a2vid: the distilled adapter rides stage 2 ALONE") {
   //
   // WHY STRENGTH 0 IS THE CONTROL and not "no adapter": `requires_distilled_lora`
   // refuses an a2vid load carrying no `lora_path` at all (upstream's
-  // `--distilled-lora required=True`, utils/args.py:1140-1153), so the base-
+  // `--distilled-lora required=True`, utils/args.py:1140-1155), so the base-
   // weights arm has to be spelled some other way. Strength 0 fuses a ZERO delta,
   // and that it reproduces the base model is already gated independently by
   // "ltx2 video: the IC-LoRA strength reaches the PIXELS, and 0 is a no-op".
@@ -7840,7 +7840,20 @@ TEST_CASE("ltx2 ti2vid: stage 1's sigma shift takes the 4096 anchor, not the tar
   const int64_t kSmall = 64;
   const int64_t kLarge = 128;
 
-  auto schedule_tokens_for = [&](const char* kind, int64_t size, const std::string& tag) {
+  // TWO NUMBERS OUT OF EACH RENDER, AND THE SECOND ONE IS WHAT KEEPS THE
+  // TRAJECTORY HALF OF THIS CASE HONEST. The recomputations at the end run at
+  // the step count the RENDER used. Restating that count as a literal down
+  // there decouples it from `gen.steps`: lowering the render to 2 steps would
+  // then leave every assertion in this case green while making the trajectory
+  // claim vacuous, which is precisely the degeneracy the comment beside
+  // `gen.steps` warns about.
+  struct Rendered {
+    int64_t schedule_tokens;
+    int64_t steps;
+  };
+
+  auto rendered_for = [&](const char* kind, int64_t size,
+                          const std::string& tag) -> Rendered {
     vllm::multimodal::VideoModelParams mp = Ti2VidParams(ws.paths, lora);
     mp.extras[vllm::multimodal::kLtx2PipelineKindExtra] = kind;
     const std::unique_ptr<vllm::multimodal::VideoEngine> engine =
@@ -7853,7 +7866,9 @@ TEST_CASE("ltx2 ti2vid: stage 1's sigma shift takes the 4096 anchor, not the tar
     // `terminal` = 0.1 (schedulers.py:48-55), so a 2-step schedule is
     // {1, 0.1, 0} for EVERY token count and the anchor cannot reach the
     // trajectory at all. Three steps is the shortest schedule with an interior
-    // sigma for the shift to move.
+    // sigma for the shift to move. Lowering this number is REFUSED rather than
+    // deprecated: it comes back out of this lambda and the trajectory
+    // assertions recompute at it, so 2 here reds them by name.
     gen.steps = 3;
     // `ti2vid_two_stage` resolves `stg_blocks = [28]` (constants.py:86-87) and
     // this fixture's DiT has TWO blocks, so its perturbed pass is refused by
@@ -7873,13 +7888,26 @@ TEST_CASE("ltx2 ti2vid: stage 1's sigma shift takes the 4096 anchor, not the tar
     // carrying frozen sigmas leaves it 0. Stage 2 of both recipes does, which is
     // why what lands here is stage 1's.
     REQUIRE(t.schedule_tokens > 0);
-    return t.schedule_tokens;
+    return Rendered{t.schedule_tokens, gen.steps};
   };
 
-  const int64_t ti_small = schedule_tokens_for("ti2vid_two_stage", kSmall, "ti_small");
-  const int64_t ti_large = schedule_tokens_for("ti2vid_two_stage", kLarge, "ti_large");
-  const int64_t hq_small = schedule_tokens_for("res2s_two_stage", kSmall, "hq_small");
-  const int64_t hq_large = schedule_tokens_for("res2s_two_stage", kLarge, "hq_large");
+  const Rendered ti_small_r = rendered_for("ti2vid_two_stage", kSmall, "ti_small");
+  const Rendered ti_large_r = rendered_for("ti2vid_two_stage", kLarge, "ti_large");
+  const Rendered hq_small_r = rendered_for("res2s_two_stage", kSmall, "hq_small");
+  const Rendered hq_large_r = rendered_for("res2s_two_stage", kLarge, "hq_large");
+
+  const int64_t ti_small = ti_small_r.schedule_tokens;
+  const int64_t ti_large = ti_large_r.schedule_tokens;
+  const int64_t hq_small = hq_small_r.schedule_tokens;
+  const int64_t hq_large = hq_large_r.schedule_tokens;
+
+  // The step count the four renders ACTUALLY ran at, read back out of them
+  // rather than restated below. All four have to agree, or "the step count" is
+  // not one number and nothing below can be recomputed at it.
+  const int64_t rendered_steps = ti_small_r.steps;
+  REQUIRE(ti_large_r.steps == rendered_steps);
+  REQUIRE(hq_small_r.steps == rendered_steps);
+  REQUIRE(hq_large_r.steps == rendered_steps);
 
   MESSAGE("ti2vid: " << ti_small << " / " << ti_large << "   res2s: " << hq_small << " / "
                      << hq_large);
@@ -7906,14 +7934,17 @@ TEST_CASE("ltx2 ti2vid: stage 1's sigma shift takes the 4096 anchor, not the tar
   // so two token counts give two schedules — unless the shift arithmetic has
   // been flattened, in which case selecting the anchor would be inert and every
   // assertion above would still pass.
-  const std::vector<float> at_anchor = vllm::Ltx2SigmaSchedule(/*steps=*/3, anchor);
-  const std::vector<float> at_target = vllm::Ltx2SigmaSchedule(/*steps=*/3, hq_small);
+  // AT `rendered_steps`, NOT AT A LITERAL. The step count comes back out of the
+  // renders above, so this comparison cannot drift away from what they sampled.
+  // A literal here would let someone lower `gen.steps` and keep this green.
+  const std::vector<float> at_anchor = vllm::Ltx2SigmaSchedule(rendered_steps, anchor);
+  const std::vector<float> at_target = vllm::Ltx2SigmaSchedule(rendered_steps, hq_small);
   REQUIRE(at_anchor.size() == at_target.size());
   CHECK_MESSAGE(at_anchor != at_target,
                 "the 4096 anchor and the target grid produce the SAME schedule on this fixture, "
                 "so nothing above measures which one was taken");
 
-  // AND THE STEP COUNT ABOVE IS LOAD-BEARING, WHICH IS WORTH AN ASSERTION
+  // AND THE RENDER'S STEP COUNT IS LOAD-BEARING, WHICH IS WORTH AN ASSERTION
   // RATHER THAN A COMMENT. `stretch` renormalises so that sigma[0] is 1.0 and
   // the LAST non-zero sigma is exactly `terminal` = 0.1 (schedulers.py:48-55).
   // A 2-step schedule has only those two non-zero entries, so it is {1, 0.1, 0}
@@ -7922,9 +7953,16 @@ TEST_CASE("ltx2 ti2vid: stage 1's sigma shift takes the 4096 anchor, not the tar
   // ancestor — the counters were already correct and the trajectory claim was
   // vacuous.
   //
-  // Anyone who lowers the step count to make this case faster silently turns
-  // the trajectory half of it into a tautology, so the degeneracy is pinned in
-  // the direction that fails LOUDLY when it stops being true.
+  // TWO ASSERTIONS, BECAUSE THEY FAIL FOR DIFFERENT REASONS. The first names
+  // the render's own step count, so lowering `gen.steps` to make this case
+  // faster fails HERE, by name, rather than silently turning the comparison
+  // above into a value against itself. The second pins the degeneracy itself,
+  // so it fails if a scheduler change ever makes a 2-step schedule
+  // token-dependent and this whole paragraph stops being true.
+  CHECK_MESSAGE(rendered_steps > 2,
+                "the renders above ran at " << rendered_steps << " steps, and a schedule that "
+                "short is {1, 0.1, 0} for EVERY token count (schedulers.py:48-55), so the "
+                "trajectory comparison above compares a value with itself");
   CHECK_MESSAGE(vllm::Ltx2SigmaSchedule(/*steps=*/2, anchor) ==
                     vllm::Ltx2SigmaSchedule(/*steps=*/2, hq_small),
                 "a 2-step schedule now DOES depend on the token count, so the stretch no longer "
@@ -7935,7 +7973,7 @@ TEST_CASE("ltx2 ti2vid: stage 1's sigma shift takes the 4096 anchor, not the tar
   // engine now passes and the sentinel are the same schedule. Pinned because the
   // engine deliberately passes the concrete value, so that the trace reports an
   // anchor rather than a sentinel.
-  CHECK(vllm::Ltx2SigmaSchedule(/*steps=*/3, 0) == at_anchor);
+  CHECK(vllm::Ltx2SigmaSchedule(rendered_steps, 0) == at_anchor);
 }
 
 TEST_CASE("ltx2 ti2vid: the distilled-LoRA requirement refuses BY WHAT IS MISSING") {

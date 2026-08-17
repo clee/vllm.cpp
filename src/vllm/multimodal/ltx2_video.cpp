@@ -1010,7 +1010,7 @@ std::unique_ptr<Ltx2VideoEngine> Ltx2VideoEngine::Load(const VideoModelParams& p
   // ── the adapter a two-stage pipeline cannot run without (#1117) ───────────
   //
   // `--distilled-lora` is `required=True` on the parser `A2VidPipelineTwoStage`
-  // selects (utils/args.py:1140-1153, reached through `default_2_stage_arg_parser`
+  // selects (utils/args.py:1140-1155, reached through `default_2_stage_arg_parser`
   // at `:1123` from a2vid_two_stage.py:311), and the reason is what stage 2 is:
   // a THREE-sigma refinement (`:164`) that only the distilled weights can
   // complete. Run it on a checkpoint carrying no adapter and it returns a clip

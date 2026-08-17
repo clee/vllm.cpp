@@ -3468,7 +3468,7 @@ TEST_CASE("ltx2 a2vid: the recipe is upstream's TWO stages, not the distilled on
   CHECK_FALSE(a2v.negative_prompt.empty());
   CHECK_FALSE(distilled.allow_negative_prompt);
   CHECK_FALSE(a2v.allow_request_latents);
-  // `--audio-path` (:312-317) and `--distilled-lora` (utils/args.py:1140-1153)
+  // `--audio-path` (:312-317) and `--distilled-lora` (utils/args.py:1140-1155)
   // are BOTH `required=True`, and neither has a value this port can invent.
   CHECK(a2v.requires_audio_input);
   CHECK(a2v.requires_distilled_lora);

@@ -3371,7 +3371,7 @@ Three things this kind demands, each refused by name rather than defaulted:
 | What | Why | Where upstream says so |
 |---|---|---|
 | `--audio-path` on **every** request | the pipeline is "denoise video around this take"; without one the soundtrack is generated and the clip looks finished | `--audio-path` is `required=True`, `a2vid_two_stage.py:312-317` |
-| `--lora` naming the distilled adapter | stage 2 is a three-sigma refinement the base weights were never distilled for | `--distilled-lora` is `required=True`, `utils/args.py:1140-1153` |
+| `--lora` naming the distilled adapter | stage 2 is a three-sigma refinement the base weights were never distilled for | `--distilled-lora` is `required=True`, `utils/args.py:1140-1155` |
 | `--upsampler` | stage 2's input is the upsampled stage-1 latent | `a2vid_two_stage.py:261` |
 
 `--audio-start-time` and `--audio-max-duration` window the take; the window

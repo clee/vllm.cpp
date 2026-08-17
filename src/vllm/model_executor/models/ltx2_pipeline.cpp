@@ -1545,7 +1545,7 @@ Ltx2PipelineRecipe A2VidTwoStageRecipe(const Ltx2PipelineParams& params,
   // against stage 2's `(*loras, *distilled_lora)` (`:114`). The adapter this
   // engine's single `lora_path` slot carries for this recipe IS that
   // `distilled_lora`, which is what `requires_distilled_lora` declares by
-  // mirroring `--distilled-lora required=True` (utils/args.py:1140-1153).
+  // mirroring `--distilled-lora required=True` (utils/args.py:1140-1155).
   //
   // THIS LINE IS THE ROW. Deleting it reverts to one fused weight set for both
   // stages, which is #1118 exactly, and it renders: stage 1's 40-step guided
