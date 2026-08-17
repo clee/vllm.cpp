@@ -190,7 +190,7 @@ schedules.
 - the combination per modality with that modality's own guider (`:203-204`).
 
 Perturbations route through `Ltx2BatchedPerturbationConfig`: one config built
-over all N passes (`denuoisers.py:172-176`), then `BatchSlice(i, i+1)` per pass,
+over all N passes (`denoisers.py:172-176`), then `BatchSlice(i, i+1)` per pass,
 then flattened into the `Ltx2DitPerturbation` the forward takes. At batch 1 the
 slice is the pass's own mask, which is exactly the degeneracy `ltx2.h` already
 records.

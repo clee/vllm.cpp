@@ -914,13 +914,17 @@ ignored — upstream passes a 512x512 placeholder whose height and width it
 documents as unused, and only the frame count and the recipe's frame rate are
 read, to derive the duration.
 
-**It is the only GUIDED arm, and that changes what it costs and what it needs.**
-The distilled video recipes run one DiT forward per step. This one runs
-**three** by default — conditional, unconditional, and one with the audio
+**It is a GUIDED arm, and that changes what it costs and what it needs.** The
+distilled video recipes run one DiT forward per step. This one runs **three** by
+default — conditional, unconditional, and one with the audio
 self-attention perturbed (STG) — so it is roughly 3x the work per step, and it
 **requires a text tower**, because the unconditional pass conditions on the
 negative prompt. Loading with `prompt_embeds_path` alone gets a refusal naming
 `--audio-cfg-guidance-scale 1.0` as the way to turn the unconditional pass off.
+
+It was the only guided arm here until row LTX25-GUIDED-VIDEO
+([#1092](https://github.com/mudler/vllm.cpp/issues/1092)) gave the joint video
+path its own denoiser; see *LTX-2.5 video guidance* below.
 
 Six per-generation knobs mirror upstream's own CLI, and each takes the
 checkpoint generation's value when absent: `--negative-prompt`,
@@ -947,6 +951,61 @@ at the recipe's own guider values.
 **The accelerator is refused by name.** `device = 1` gets a refusal on this
 pipeline: the device forward takes both streams by reference and this pipeline
 has no video stream to give it. Use `--device cpu`.
+
+### LTX-2.5 video guidance: `--pipeline-kind one_stage`
+
+`one_stage` mirrors upstream's `TI2VidOneStagePipeline`, which builds a
+`FactoryGuidedDenoiser` from the params table's own video and audio guiders. On
+the 2.4/2.5 lineage those resolve to `cfg_scale = 3.0`, `stg_scale = 1.0`,
+`rescale_scale = 0.7` and `modality_scale = 3.0`.
+
+Until [#1092](https://github.com/mudler/vllm.cpp/issues/1092) this port read none
+of it: the joint denoise loop ran one unguided forward per step. A `one_stage`
+render therefore finished, at the right size and frame count, along a different
+trajectory than upstream's. It now runs **four** forwards per step and combines
+them per modality:
+
+| Pass | What differs | Selected by |
+|---|---|---|
+| conditional | nothing | always |
+| unconditional | the negative conditioning | `cfg_scale != 1.0` |
+| perturbed | video/audio self-attention skipped on `stg_blocks` | `stg_scale != 0.0` |
+| isolated modality | the audio<->video cross attention off in every block | `modality_scale != 1.0` |
+
+Seven per-generation knobs mirror upstream's `default_1_stage_arg_parser` and
+each takes the checkpoint generation's value when absent:
+`--video-cfg-guidance-scale`, `--video-stg-guidance-scale`,
+`--video-rescale-scale`, `--video-skip-step`, `--video-stg-blocks` (comma
+separated), `--a2v-guidance-scale` and `--v2a-guidance-scale`. The audio row and
+`--negative-prompt` are shared with text-to-audio and are no longer refused on a
+video pipeline; upstream's parser carries both rows side by side, and the old
+refusal rested on a reading of upstream that was wrong and harmless only while
+nothing here read them.
+
+**The unconditional forward needs a negative conditioning, and there are two
+ways to supply one.** With a text tower, `--negative-prompt` (or the recipe's
+own default) is encoded through the same chain as the positive prompt. Without
+one, `--negative-prompt-embeds` and `--negative-audio-prompt-embeds` are the
+negative half of the `prompt_embeds_path` fallback: two files at the DiT's two
+cross-attention widths, the same row count as the positive pair. With neither, a
+`cfg_scale` other than 1.0 is **refused by name** rather than served the positive
+context twice, which would leave the whole classifier-free term at exactly zero.
+
+**A block index the checkpoint does not have is refused.** `stg_blocks` is a
+membership test upstream, so naming block 28 on a model with fewer blocks
+perturbs nothing and leaves `stg_scale * (cond - perturbed)` at exactly zero.
+
+**The distilled and retake recipes refuse every one of these flags.** Their
+guidance is distilled into the weights, so honouring an override would sample a
+trajectory the weights were never trained for. Their guiders are upstream's
+positive-only one, so they still issue one forward per step and their output is
+unchanged by this row.
+
+**The accelerator is refused for the perturbed and isolated-modality passes.**
+`Ltx2DitForwardDevice` takes no perturbation argument, so those two passes on
+`device = 1` would run an unperturbed forward and leave both terms at zero.
+Classifier-free guidance alone is a different context and no perturbation, and
+runs on both arms.
 
 **What is not served.** `temporal_upsample_rounds` is defined and refused above
 `0`: the rounds loop that temporally doubles the latent, re-tiles the canvas and
@@ -2499,6 +2558,8 @@ seam's `prompt_embeds_path`, which carries the video stream), `pipeline_kind`
 (default `distilled_two_stage`; also `one_stage`, `dmd2`, `dfr`, `retake` and
 `t2a_one_stage`), `model_version` (only for a checkpoint that
 declares none), `dit_config_path`, `encoder_config_path`,
+`negative_prompt_embeds_path` and `negative_audio_prompt_embeds_path` (the
+negative half of the same fallback, for the unconditional forward),
 `allow_unported_modules`, `max_phase`, `prompt_embeds_valid_rows`,
 `upsampler_path` and `duration_head_path`. An extra a family does not define is
 refused, never ignored. One caveat inside that set: `duration_head_path` is
