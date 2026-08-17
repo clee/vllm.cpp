@@ -537,10 +537,11 @@ enum class Ltx2StepperKind { kEuler, kEulerAncestral };
 // because `allow_guidance_override` alone cannot express the a2vid case. That
 // field answers "does this pipeline's CLI carry the guider flags at all":
 // `distilled.py` selects `default_2_stage_distilled_arg_parser`
-// (utils/args.py:1187), which never adds them, so an override there names a knob
+// (utils/args.py:1188), which never adds them, so an override there names a knob
 // the pipeline has no surface for and is REFUSED. `a2vid_two_stage.py:311`
-// selects `default_2_stage_arg_parser`, which DOES carry them
-// (utils/args.py:947-996) — and they reach stage 1's guider alone (`:233-236`),
+// selects `default_2_stage_arg_parser` (utils/args.py:1123), which DOES carry
+// them (utils/args.py:947-1006, the six video-guider flags) — and they reach
+// stage 1's guider alone (`:233-236`),
 // because stage 2 constructs `SimpleDenoiser(v_context_p, a_context_p)`
 // (`:278`) and takes no params at all. So on that phase the flag is legal and
 // simply does not arrive. Neither value of a boolean says that: refusing would

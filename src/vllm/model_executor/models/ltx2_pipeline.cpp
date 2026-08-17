@@ -1165,7 +1165,7 @@ Ltx2PipelineRecipe DistilledTwoStageRecipe(const std::string& version) {
   stage1.noise_scale = 1.0;
   // `SimpleDenoiser` on BOTH stages (distilled.py:266, :295). Recorded for the
   // reader rather than read by anything on this recipe: the refusal below fires
-  // first, because `default_2_stage_distilled_arg_parser` (utils/args.py:1187)
+  // first, because `default_2_stage_distilled_arg_parser` (utils/args.py:1188)
   // never adds the guider flags in the first place.
   stage1.denoiser = Ltx2PhaseDenoiser::kSimple;
   stage1.allow_guidance_override = false;
@@ -1444,14 +1444,21 @@ Ltx2PipelineRecipe ResolveLtx2PipelineRecipe(const std::string& pipeline_kind,
   } else if (pipeline_kind == "retake") {
     if (model_version == "2" || model_version == "2.5") return RetakeRecipe(model_version);
   } else if (pipeline_kind == "a2vid_two_stage") {
-    // All four generations the params table distinguishes, mirroring the
-    // `t2a_one_stage` rows and for the same reason: `A2VidPipelineTwoStage`
-    // takes whatever `resolve_cli_params()` read off the checkpoint
-    // (a2vid_two_stage.py:311), exactly as `T2AOneStagePipeline` does at
-    // t2a_one_stage.py:178-179. There is no "which generations support
-    // audio-to-video" question upstream, so restricting these rows would be a
-    // local invention. This differs from `distilled_two_stage`'s TWO rows, which
-    // are two because two different references supply them.
+    // All four generations this table KEYS, mirroring the `t2a_one_stage` rows
+    // and for the same reason: `A2VidPipelineTwoStage` takes whatever
+    // `resolve_cli_params()` read off the checkpoint (a2vid_two_stage.py:311),
+    // exactly as `T2AOneStagePipeline` does at t2a_one_stage.py:178-179. There
+    // is no "which generations support audio-to-video" question upstream, so
+    // restricting these rows would be a local invention. This differs from
+    // `distilled_two_stage`'s TWO rows, which are two because two different
+    // references supply them.
+    //
+    // Four KEYS, not four params objects. `_PARAMS_SINCE_VERSION`
+    // (utils/constants.py:130-133) has rows for (2,4) and (2,3) only, falling
+    // through to LTX_2_PARAMS at :179 — so 2.5 has no params row of its own and
+    // resolves onto the 2.4 one, which is what `Ltx2DetectPipelineParams` above
+    // mirrors and says. The four keys exist because the RECIPE table refuses an
+    // unknown (kind, version) by name rather than defaulting.
     if (model_version == "2") return A2VidTwoStageRecipe(Ltx2Params20(), kOmniNegativePrompt);
     if (model_version == "2.3") return A2VidTwoStageRecipe(Ltx2Params23(), kOmniNegativePrompt);
     if (model_version == "2.4") {

@@ -6702,7 +6702,9 @@ vllm::multimodal::VideoModelParams A2VidParams(const ltx2_fixture::Paths& paths,
 //     That this is accepted at all is part of what the case asserts — the
 //     distilled recipe refuses a `steps` override.
 //   * the STG block list, because the reduced DiT has TWO blocks and the params
-//     table names block 29. `OneStageFixtureGuidance` carries the whole
+//     row this recipe resolves names block 28 — LTX_2_3_PARAMS overrides 2.0's
+//     [29] to [28] (utils/constants.py:86) and 2.4, the row 2.5 resolves onto,
+//     inherits it (:124). `OneStageFixtureGuidance` carries the whole
 //     argument; the override reaching stage 1 and being IGNORED by stage 2 is
 //     itself gated below.
 vllm::multimodal::VideoGenParams A2VidGen(const std::string& out_dir, const std::string& wav,
@@ -6958,7 +6960,7 @@ TEST_CASE("ltx2 a2vid: every requirement the recipe adds refuses BY WHAT IS MISS
   // ── the guider override REACHES stage 1 and is IGNORED by stage 2 ──────────
   //
   // Upstream's `--video-cfg-guidance-scale` exists on this pipeline's parser
-  // (a2vid_two_stage.py:311 -> utils/args.py:947-996) and reaches stage 1's
+  // (a2vid_two_stage.py:311 -> utils/args.py:947-1006) and reaches stage 1's
   // guider alone (`:233-236`), because stage 2 is `SimpleDenoiser(...)` (`:278`).
   // A build that REFUSED it would reject a request upstream accepts; a build
   // that applied it to stage 2 would run an unconditional forward upstream's

@@ -56,7 +56,9 @@ and [`ltx25-guided-video.md`](ltx25-guided-video.md) `## Owed` records
 **Two anchors in the dispatch that sent this row were wrong and are corrected
 here rather than propagated.** The a2v guidance default is NOT 0.0 and is not at
 `a2vid_two_stage.py:318-323`; `:318-323` is `--audio-start-time`, whose default
-is 0.0. `--a2v-guidance-scale` lives at `utils/args.py:987-996` and defaults to
+is 0.0. `--a2v-guidance-scale` lives at `utils/args.py:986-995` — the
+`parser.add_argument(` call opens at `:986`, the flag is named at `:987` and the
+default is set at `:989` — and it defaults to
 `video_guider.modality_scale`, which is **3.0** (`utils/constants.py:54`,
 `:64`). And "audio conditioning built at `:53`, called at `:143`" names the class
 statement and the `__call__` signature; the `AudioConditioner` is constructed at
@@ -74,7 +76,7 @@ Upstream's two stages, and the `Ltx2PhaseRecipe` each becomes.
 | `use_official_sigma_schedule` | true | false | as above |
 | `noise_scale` | 1.0 | 0.909375 | `ModalitySpec.noise_scale` default (`utils/types.py:110`) since `:247-250` sets none; `stage_2_sigmas[0].item()` at `:288` |
 | `input_transform` | `kInitial` | `kSpatialUpsample` | `self.upsampler(video_state.latent[:1])` at `:261` |
-| `video_guidance` | the params table's video row | defaults | `MultiModalGuider(params=video_guider_params, negative_context=v_context_n)` at `:233-236`, fed from `utils/args.py:947-996`; `SimpleDenoiser(v_context_p, a_context_p)` at `:278` |
+| `video_guidance` | the params table's video row | defaults | `MultiModalGuider(params=video_guider_params, negative_context=v_context_n)` at `:233-236`, fed from `utils/args.py:947-1006` (the six video-guider flags, `--video-cfg-guidance-scale` at `:948` through `--video-skip-step` at `:997`; the audio group starts at `:1007`); `SimpleDenoiser(v_context_p, a_context_p)` at `:278` |
 | `audio_guidance` | defaults | defaults | `MultiModalGuider(params=MultiModalGuiderParams())` at `:237-239` |
 | `allow_guidance_override` | true | false | the CLI passes six video guider fields at `:353-360`; stage 2 takes no guider at all |
 | `stepper` | `kEuler` | `kEuler` | `:229-258` and `:277-297` pass no `stepper`, so `EulerDiffusionStep()` applies (`utils/blocks.py:526-527`) |
@@ -103,7 +105,7 @@ Recipe-level fields:
 |---|---|---|
 | `height` / `width` | `params.stage_2_*` | `parser.set_defaults(height=params.stage_2_height, ...)` at `utils/args.py:1128` |
 | `num_inference_steps` | `params.num_inference_steps` | `:152`, consumed at `:226` |
-| `negative_prompt` | `LightricksNegativePrompt()` | `--negative-prompt` default `DEFAULT_NEGATIVE_PROMPT` (`utils/args.py:937-946`), consumed at `:176-183` |
+| `negative_prompt` | `kOmniNegativePrompt` on the `2` and `2.3` rows, `LightricksNegativePrompt()` on `2.4` and `2.5` | `--negative-prompt` default `DEFAULT_NEGATIVE_PROMPT` (`utils/args.py:937-946`), consumed at `:176-183`. Which string is a question of WHICH REFERENCE owns the row, per the header's "which upstream owns which value": vLLM-Omni supplies the pre-2.4 rows and Lightricks the 2.4 and 2.5 ones. `t2a_one_stage` splits the same way at the same four versions (its arm of `ResolveLtx2PipelineRecipe`), and these rows mirror it one for one |
 | `allow_negative_prompt` | true | `:146` is a parameter and `:183` reads `ctx_n` into the video guider |
 | `allow_request_sigmas` | true | stage 1's schedule IS `num_inference_steps` (`:226`); stage 2's is a constant and carries its own explicit `sigmas`, which the engine reads before the override branch |
 | `fixed_num_inference_steps` | false | as above |
@@ -112,14 +114,25 @@ Recipe-level fields:
 | `requires_audio_input` | true | `--audio-path` `required=True` at `:312-317` |
 | `requires_distilled_lora` | true | `--distilled-lora` `required=True` at `utils/args.py:1140-1153` |
 
-**Which versions.** All four the params table distinguishes — `2`, `2.3`, `2.4`,
-`2.5` — mirroring the `t2a_one_stage` rows and for the same reason:
+**Which versions.** All four this table KEYS — `2`, `2.3`, `2.4`, `2.5` —
+mirroring the `t2a_one_stage` rows and for the same reason:
 `A2VidPipelineTwoStage` takes whatever `resolve_cli_params()` read off the
 checkpoint (`:311`), exactly as `T2AOneStagePipeline` does at
 `t2a_one_stage.py:178-179`. There is no "which generations support A2V" question
 upstream, and restricting the rows would be a local invention. This differs from
 `distilled_two_stage`'s two rows, which are two rows because two DIFFERENT
 references supply them.
+
+Four KEYS is not four params objects, and the earlier wording — "all four the
+params table distinguishes" — claimed the second. `_PARAMS_SINCE_VERSION`
+(`utils/constants.py:130-133`) carries exactly TWO rows, `(2,4)` and `(2,3)`,
+with `LTX_2_PARAMS` as the fall-through at `:179`. So 2.5 does not have a params
+row of its own: it is at or above `(2,4)` and resolves onto the 2.4 one.
+`Ltx2DetectPipelineParams` (`ltx2_pipeline.cpp:947-956`) mirrors that shape
+exactly and its own comment already says so — "this is what gives LTX-2.5 the 2.4
+params". The four keys exist because the RECIPE table refuses an unknown
+`(kind, version)` by name rather than defaulting, not because upstream reads four
+different parameter sets.
 
 ## 3. What already exists and is reused unchanged
 
@@ -179,13 +192,26 @@ distilled one. Upstream does not either: `--distilled-lora` takes any path.
 on stage 2 ALONE; stage 1 gets `loras=tuple(loras)` at `:107`. This engine fuses
 at load into ONE weight set — `ltx2_video.cpp:816-820` is the only
 `dit_options.loras.push_back` in the tree — so the adapter reaches both phases.
-Stage 1's 40-step guided schedule therefore runs against base + distilled LoRA
-where upstream runs it against the base alone.
+Stage 1's guided schedule therefore runs against base + distilled LoRA where
+upstream runs it against the base alone — 30 steps of it on 2.5, since
+`LTX_2_3_PARAMS` sets `num_inference_steps=30` (`utils/constants.py:85`) and 2.4
+inherits it at `:124`, which is the row 2.5 resolves onto.
 
-That divergence RENDERS. It changes the trajectory and changes nothing about the
-frame count, the shapes, the sample rate or any digest a caller can read, so it
-is [#1118](https://github.com/mudler/vllm.cpp/issues/1118) and `## Owed` rather
-than a comment. It bounds #1093 and #921 the same way.
+That divergence RENDERS, and the PIXELS it renders are not upstream's. It changes
+the trajectory, so the frames themselves differ; what it leaves untouched is the
+frame count, the shapes, the sample rate and the errors — nothing in the SHAPE of
+the result says anything is wrong. It is therefore
+[#1118](https://github.com/mudler/vllm.cpp/issues/1118) and `## Owed` rather than
+a comment. It bounds #1093 and #921 the same way.
+
+**Say what a gate could see, not that none could.** "Changes nothing a caller can
+read" would be false and would be the more damaging kind of false, because it
+implies no instrument could ever detect this. A caller reads pixels. The gate
+that WOULD detect it is the real-weights comparison against upstream's own render
+that §0 and `## Owed` record this row as not having: same checkpoint, same take,
+same seed, upstream's stage 1 on the base weights against ours on base +
+distilled. That comparison is owed, not impossible, and #1118 is the row that
+owes it.
 
 Refusing the whole kind instead was considered and rejected: it would land the
 recipe dead, and the rule that forbids dead code is not satisfied by a capability
@@ -203,10 +229,11 @@ that only became visible once the recipe was written.
 
 That boolean answers "does this pipeline's CLI carry the guider flags at all".
 `distilled.py` selects `default_2_stage_distilled_arg_parser`
-(`utils/args.py:1187`), which never adds them, so an override there names a knob
-the pipeline has no surface for and the engine refuses it — correctly, and that
-refusal is landed and gated. `a2vid_two_stage.py:311` selects
-`default_2_stage_arg_parser`, which DOES carry them (`utils/args.py:947-996`),
+(`utils/args.py:1188`; `:1187` is blank), which never adds them, so an override
+there names a knob the pipeline has no surface for and the engine refuses it —
+correctly, and that refusal is landed and gated. `a2vid_two_stage.py:311` selects
+`default_2_stage_arg_parser` (`utils/args.py:1123`), which DOES carry them
+(`utils/args.py:947-1006`),
 and they reach stage 1's guider alone (`:233-236`) because stage 2 constructs
 `SimpleDenoiser(v_context_p, a_context_p)` (`:278`) and takes no params at all.
 
@@ -405,7 +432,9 @@ Report `NEEDS_DECISION` rather than narrowing silently if:
   the kind unreachable in-tree and the row becomes seam-only;
 - stage 1's derived schedule cannot be exercised on the fixture without the
   guided seam refusing (the fixture DiT has two blocks and the params row names
-  block 29), because then the guided arm of this recipe is gated by nothing.
+  block 28 — `LTX_2_3_PARAMS` overrides 2.0's `[29]` to `[28]` at
+  `utils/constants.py:86`, and 2.4, which 2.5 resolves onto, inherits it at
+  `:124`), because then the guided arm of this recipe is gated by nothing.
 
 ## Owed
 

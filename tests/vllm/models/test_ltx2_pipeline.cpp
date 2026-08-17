@@ -2668,7 +2668,9 @@ TEST_CASE("ltx2 a2vid: the recipe is upstream's TWO stages, not the distilled on
   // `self._scheduler.execute(steps=num_inference_steps)` (:225-227): DERIVED at
   // run time. The distilled recipe's stage 1 carries a frozen 9-sigma list, and
   // handing that to a full model that was never distilled is the difference
-  // between 40 steps and 8.
+  // between 30 steps and 8 on the 2.5 row resolved above — LTX_2_3_PARAMS sets
+  // num_inference_steps=30 (utils/constants.py:85) and 2.4, which 2.5 resolves
+  // onto, inherits it (:124). 40 is 2.0's own default (:47), not this row's.
   CHECK(s1.sigmas.empty());
   CHECK(s1.use_official_sigma_schedule);
   CHECK_FALSE(distilled.phases[0].sigmas.empty());  // the control for that claim
@@ -2687,7 +2689,7 @@ TEST_CASE("ltx2 a2vid: the recipe is upstream's TWO stages, not the distilled on
   CHECK(s1.noise_seed_offset == 0);
   // `MultiModalGuider(params=video_guider_params, ...)` (:233-236), whose six
   // fields are the params table's video row through the CLI defaults
-  // (utils/args.py:947-996). Asserted against `one_stage`'s phase, which is
+  // (utils/args.py:947-1006). Asserted against `one_stage`'s phase, which is
   // built from the same row, so a change to the table moves both.
   CHECK(s1.video_guidance.cfg_scale == one.phases[0].video_guidance.cfg_scale);
   CHECK(s1.video_guidance.stg_scale == one.phases[0].video_guidance.stg_scale);
@@ -2748,7 +2750,7 @@ TEST_CASE("ltx2 a2vid: the recipe is upstream's TWO stages, not the distilled on
   // stage 2 does not run, and `kSimple` above is what stops that.
   CHECK(s2.allow_guidance_override);
   // The control on the OTHER polarity: `distilled.py` selects
-  // `default_2_stage_distilled_arg_parser` (utils/args.py:1187), which never adds
+  // `default_2_stage_distilled_arg_parser` (utils/args.py:1188), which never adds
   // the flags at all, so both of its phases REFUSE — and they are `kSimple` too,
   // which is exactly why the refusal has to be tested before the skip.
   CHECK_FALSE(distilled.phases[1].allow_guidance_override);

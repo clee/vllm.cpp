@@ -3145,7 +3145,8 @@ DFR's base stage rests on generated keyframe slots, which need a checkpoint
 declaring `use_keyframes_abs_pos_embedding`, and the 2.0 distilled row predates
 that parameter — so resolving DFR onto it would build a recipe the engine must
 then refuse at load. Refusing at the recipe table names the version instead
-(`ltx2_pipeline.cpp:1306-1313`).
+(the `dfr` arm of `ResolveLtx2PipelineRecipe`, named rather than given as a line
+range because this row's own insertions above it staled the range once already).
 
 ### Audio-to-video: rendering a clip around a soundtrack you supply
 
@@ -3187,8 +3188,12 @@ rather than padded, and a longer one keeps its leading frames.
 
 **One divergence, and it is not repairable from the request.** Upstream fuses
 the distilled adapter into stage 2 alone and leaves stage 1 on the base weights;
-this engine fuses adapters once at load, so stage 1 sees it too. Tracked as
-[#1118](https://github.com/mudler/vllm.cpp/issues/1118).
+this engine fuses adapters once at load, so stage 1 sees it too. Expect frames
+that differ from the ones upstream renders for the same checkpoint, take and
+seed. Nothing in the shape of the output shows it — the clip comes back at the
+size, frame count and sample rate you asked for, and no error is raised — so the
+only instrument that sees this is a side-by-side render against upstream.
+Tracked as [#1118](https://github.com/mudler/vllm.cpp/issues/1118).
 
 The guider flags (`--video-cfg-guidance-scale` and the rest, spelled as the
 `video_cfg_guidance_scale` extras over the C API) reach stage 1 and are ignored

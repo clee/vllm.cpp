@@ -1588,7 +1588,7 @@ void ApplyGuidanceOverrides(const std::map<std::string, std::string>& extras,
   // IGNORED, not refused, on a phase whose denoiser takes no params. This is
   // `SimpleDenoiser` (utils/denoisers.py:3) and the a2vid stage 2 is the one
   // phase in the table that reaches it: the flags exist on that pipeline's
-  // parser (a2vid_two_stage.py:311 -> utils/args.py:947-996) and they reach
+  // parser (a2vid_two_stage.py:311 -> utils/args.py:947-1006) and they reach
   // stage 1's guider alone (`:233-236`), because stage 2 constructs
   // `SimpleDenoiser(v_context_p, a_context_p)` (`:278`). Applying them here
   // instead would switch on a guidance pass upstream's stage 2 does not run —
