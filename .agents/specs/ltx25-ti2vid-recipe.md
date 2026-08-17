@@ -369,6 +369,82 @@ refused the same substitution and was right to.
 So the claim this row makes is: gated on CPU goldens, correct against the
 upstream SOURCE line by line, and NOT measured against upstream's own render.
 
+## Outcome
+
+Row `DONE`. Recorded here because neither the code nor the Git history carries
+it: what the gate MEASURED, and the two things this row found that its dispatch
+did not know.
+
+### The schedule anchor is INVISIBLE at two steps, and the gate was written at two
+
+The 2x2 in test 2 reports, from the case's own `MESSAGE` line:
+
+```text
+ti2vid: 4096 / 4096   res2s: 2 / 8
+```
+
+Exactly the intended split — this arm's anchor does not move with resolution and
+the HQ arm's does, 2 tokens at 64x64 and 8 at 128x128.
+
+**And the trajectory half of the same case went RED, with the counters already
+correct.** `Ltx2SigmaSchedule(2, 4096)` and `Ltx2SigmaSchedule(2, 2)` are both
+`{1, 0.1, 0}`. The scheduler's `stretch` pins sigma[0] at 1.0 and renormalises
+so the LAST non-zero sigma is exactly `terminal` = 0.1 (`schedulers.py:48-55`),
+and a 2-step schedule has only those two non-zero entries — so the shift is
+entirely absorbed and **every token count produces the same schedule**. The
+fixture's usual step count is 2.
+
+So a version of this case that asserted only the counters would have been green,
+correct, and unable to see whether the anchor reached anything. Three steps is
+the shortest schedule with an interior sigma. The degeneracy is now pinned by an
+assertion in the direction that fails loudly if it ever stops holding, because
+the obvious future edit — dropping back to 2 steps to make the case faster —
+silently turns the trajectory claim into a tautology.
+
+**This bounds #1150 as well.** A short distilled schedule cannot see the anchor
+either, which is part of why three shipped arms carried the divergence with
+every gate green.
+
+### The refusal message was a third stale #1118 site
+
+`requires_distilled_lora`'s refusal still told callers that this engine fuses
+once at load so stage 1 sees the adapter — false since `4ae0f54ab` — and it
+hard-coded `a2vid_two_stage.py`'s line numbers into a message deliberately keyed
+on the flag so that this row would inherit it. `ltx25-phase-lora.md` repaired the
+reference-conditioning refusal, which carried the identical claim about 1100
+lines away, and named only that one. The `ltx2-gen --help` text carried it too.
+Filed as #1151 and fixed in flow, because this row is the first caller the
+wrong-pipeline half would have misled.
+
+**The a2vid test asserted the stale string was PRESENT** (`message.find("1118")
+!= npos`), so the record was gated into place. It now asserts absence.
+
+### What the gate measured
+
+Focused, at the head this row pushes:
+
+| Binary | cases | assertions | exit |
+|---|---|---|---|
+| `test_ltx2_pipeline` | 54 | 3182 | 0 |
+| `test_ltx2_video` | 82 | 2496 | 0 |
+
+RED before the recipe landed, captured on the same binaries: `test_ltx2_pipeline`
+54 cases / 3063 assertions, `Status: FAILURE!`, exit 1, both new cases throwing
+`Unsupported LTX pipeline kind/version: 'ti2vid_two_stage'/'2.5'`;
+`test_ltx2_video` 82 / 2432, exit 1.
+
+### Two things a later reader should not re-derive
+
+- **`allow_request_latents = false` here and `true` on `res2s_two_stage`** is not
+  an inconsistency this row introduced. Neither pipeline's `__call__` takes an
+  initial latent, and the field has **no reader in `src/`** — it is asserted in
+  tests only. This row matched `a2vid_two_stage`, whose value is the one derived
+  from the signature. The res_2s row's `true` is unexamined rather than wrong,
+  and moving it is not this row's to do.
+- **`READER ANCHORS` moved by 13 lines** and the instrument caught it unprompted,
+  which is the arming evidence: the gate went RED on a real shift before it was
+  re-derived, and the printed list was pasted rather than computed by hand.
+
 ## Dependencies
 
 - #1118 (`LTX25-PHASE-LORA`), landed at `4ae0f54ab`. Supplies
@@ -406,6 +482,16 @@ upstream SOURCE line by line, and NOT measured against upstream's own render.
   `distilled_lora`; the second list has no spelling here until the adapter arity
   refusal lifts (`ltx2_lora.h:167-172`).
 - **`keyframe_interpolation`** (#1096), the fourth pipeline on this parser.
+- **`allow_request_latents` has no reader in `src/`**, on any recipe, owned by
+  [#1152](https://github.com/mudler/vllm.cpp/issues/1152). Five assignments,
+  zero readers, against a positive control (`allow_request_sigmas`, declared one
+  line above) that has a real reader at `ltx2_video.cpp:3476`. So
+  `res2s_two_stage`'s `true` against everything else's `false` is a disagreement
+  nothing can detect. This row writes `false`, which is what
+  `ti2vid_two_stages.py:159-181` supports, and adds a sixth write to a dead
+  field rather than leaving the default `true` standing as a wrong record.
+  Not fixed in flow: both closes — give it a reader, or delete it and its gated
+  assertions — touch five landed recipes.
 
 ## Stop conditions
 
