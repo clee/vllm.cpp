@@ -194,6 +194,45 @@ distilled refinement on a checkpoint that was never distilled is the
 plausible-and-wrong shape [`ltx25-a2v-audio-input.md`](ltx25-a2v-audio-input.md)
 `## Owed` warned this row about by name.
 
+### 4.5 What the implementation added that §4 did not foresee
+
+`Ltx2PhaseDenoiser { kGuided, kSimple }`, a new phase field naming which of
+upstream's two denoiser classes (`utils/denoisers.py`) a phase constructs. It
+exists because **`allow_guidance_override` cannot express a2vid's stage 2**, and
+that only became visible once the recipe was written.
+
+That boolean answers "does this pipeline's CLI carry the guider flags at all".
+`distilled.py` selects `default_2_stage_distilled_arg_parser`
+(`utils/args.py:1187`), which never adds them, so an override there names a knob
+the pipeline has no surface for and the engine refuses it — correctly, and that
+refusal is landed and gated. `a2vid_two_stage.py:311` selects
+`default_2_stage_arg_parser`, which DOES carry them (`utils/args.py:947-996`),
+and they reach stage 1's guider alone (`:233-236`) because stage 2 constructs
+`SimpleDenoiser(v_context_p, a_context_p)` (`:278`) and takes no params at all.
+
+Neither value of the boolean says that. `false` refuses a request upstream
+accepts. `true` applies the override to stage 2's positive-only params and
+switches on a guidance pass upstream's stage 2 does not run — invisibly, since an
+extra forward changes no output shape, frame count or sample rate. So a2vid's
+stage 2 is `allow_guidance_override = true` **and** `kSimple`, and
+`ApplyGuidanceOverrides` skips a `kSimple` phase AFTER the refusal check. The
+order matters: every existing recipe that refuses is also `kSimple`, so testing
+the skip first would silently turn three landed refusals into silent ignores.
+
+The field is populated on every phase in the table from the upstream line that
+constructs the denoiser, and it is read in exactly one place.
+
+**How it is gated, and why the obvious gate is vacuous.** The claim is that an
+override reaches stage 1 and not stage 2, and no trace field records what the
+second phase did. The instrument is a pair of renders whose only difference is a
+value that is ALREADY stage 1's own: `video_stg_scale = 1.0` is what this
+recipe's stage 1 carries (`utils/constants.py:52`), so applying it there changes
+nothing, while stage 2's own STG scale is 0.0 and applying it THERE adds a
+perturbed forward per step. Equal artifact bytes therefore mean the override
+stopped at stage 1. The case `REQUIRE`s both of those recipe values first, so a
+table change that made the restated value differ from stage 1's turns the
+comparison into a failure rather than into a tautology.
+
 ## 5. Tests and gates
 
 Focused: `ctest --test-dir build -R 'ltx2' --output-on-failure`, and the whole
@@ -259,7 +298,7 @@ coincide.
 |---|---|---|
 | M1 | the `a2vid_two_stage` dispatch row deleted (reachability) | the whole e2e case |
 | M2 | stage 1's `spatial_downscale` set to 1 | the phase-shape assertions |
-| M3 | stage 1 given `DistilledSigmas()` instead of the derived schedule | the step-count assertion |
+| M3 | stage 1 given `DistilledSigmas()` instead of the derived schedule | the schedule assertions |
 | M4 | stage 1's `allow_guidance_override` set to false | the override case |
 | M5 | stage 1's audio guider taken from the params table | the audio-guider assertion |
 | M6 | stage 1's stepper set to `kEulerAncestral` | the stepper assertion |
@@ -267,8 +306,8 @@ coincide.
 | M8 | `requires_distilled_lora` never checked | the no-LoRA refusal case |
 | M9 | the frozen take's denoise mask left at 1 on this arm | §5.2 `audio_frozen` |
 | M10 | the frozen scalar sigma left at the schedule's | §5.2 `audio_sigma_max` |
-| M11 | the `cond` arm left in velocity space | §5.3 cond row |
-| M12 | the `modality` arm left in velocity space | §5.3 modality row |
+| M11 | every guidance arm left in velocity space | §5.3, all four rows |
+| M12 | the `kSimple` skip deleted, so an override reaches stage 2 | §4.5's artifact comparison |
 
 Each mutation reports three facts: `git diff --stat`, whether it BUILT with the
 compile-error count, and the exit code captured directly. A mutation that fails

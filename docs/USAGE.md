@@ -3126,17 +3126,18 @@ CHECKPOINT_ROOT=... VLLM_CPP_LTX2_TOWER_E2E=1 \
 
 Recipes resolve on an EXACT `(pipeline_kind, model_version)` pair and refuse
 anything else by name rather than defaulting, because a plausible but wrong sigma
-schedule or guidance scale renders a video instead of failing. **Fifteen** pairs
-resolve, derived from `ResolveLtx2PipelineRecipe` (`ltx2_pipeline.cpp:1288-1333`):
+schedule or guidance scale renders a video instead of failing. **Nineteen** pairs
+resolve, derived from `ResolveLtx2PipelineRecipe`:
 
-| `pipeline_kind` | resolving `model_version` |
-|---|---|
-| `one_stage` | 2, 2.3, 2.4, 2.5 |
-| `distilled_two_stage` | 2, 2.5 |
-| `dfr` | **2.5 only** |
-| `dmd2` | 2, 2.3 |
-| `retake` | 2, 2.5 |
-| `t2a_one_stage` | 2, 2.3, 2.4, 2.5 |
+| `pipeline_kind` | resolving `model_version` | what it also needs |
+|---|---|---|
+| `one_stage` | 2, 2.3, 2.4, 2.5 | — |
+| `distilled_two_stage` | 2, 2.5 | `upsampler_path` for its second phase |
+| `dfr` | **2.5 only** | `upsampler_path` |
+| `dmd2` | 2, 2.3 | — |
+| `retake` | 2, 2.5 | a source clip as a `frame_%06d.ppm` directory |
+| `t2a_one_stage` | 2, 2.3, 2.4, 2.5 | a text tower; no video VAE is asked for |
+| `a2vid_two_stage` | 2, 2.3, 2.4, 2.5 | `upsampler_path`, `lora_path`, and an `audio_path` on every request |
 
 This list ran to ten until 2026-08-17, omitting `dfr` entirely and all four
 `t2a_one_stage` rows. **`dfr` at 2 is refused deliberately, not by oversight**:
@@ -3145,6 +3146,59 @@ declaring `use_keyframes_abs_pos_embedding`, and the 2.0 distilled row predates
 that parameter — so resolving DFR onto it would build a recipe the engine must
 then refuse at load. Refusing at the recipe table names the version instead
 (`ltx2_pipeline.cpp:1306-1313`).
+
+### Audio-to-video: rendering a clip around a soundtrack you supply
+
+`a2vid_two_stage` is `A2VidPipelineTwoStage`. Stage 1 denoises video at half
+resolution, guided, on a schedule derived from the recipe's own step count;
+stage 2 upsamples 2x and refines with the distilled three-sigma schedule. The
+soundtrack is your file throughout: it is encoded once, frozen at both stages,
+and handed back unchanged rather than round-tripped through the VAE.
+
+```sh
+ltx2-gen --dit ltx-2.5-22b-distilled-fp8.safetensors \
+         --dit-config ltx-2.5-transformer-config.json \
+         --video-vae ltx-2.5-video-vae-conv-bf16.safetensors \
+         --audio-vae ltx-2.5-audio-vae-bf16.safetensors \
+         --upsampler ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors \
+         --lora ltx-2.5-22b-distilled-lora-450-bf16.safetensors \
+         --pipeline-kind a2vid_two_stage --audio-path take.wav \
+         --prompt "a drummer in a small club" \
+         --width 128 --height 128 --frames 25 --out out/a2v
+```
+
+**No render on real weights is claimed for this recipe.** It is gated on reduced
+fixtures. Upstream's stage 1 runs the base `-dev-` transformer and puts the
+distilled adapter on stage 2 only; the command above names the distilled
+checkpoint this tree has measured elsewhere, so it is a shape to copy rather than
+a reproduced result.
+
+Three things this kind demands, each refused by name rather than defaulted:
+
+| What | Why | Where upstream says so |
+|---|---|---|
+| `--audio-path` on **every** request | the pipeline is "denoise video around this take"; without one the soundtrack is generated and the clip looks finished | `--audio-path` is `required=True`, `a2vid_two_stage.py:312-317` |
+| `--lora` naming the distilled adapter | stage 2 is a three-sigma refinement the base weights were never distilled for | `--distilled-lora` is `required=True`, `utils/args.py:1140-1153` |
+| `--upsampler` | stage 2's input is the upsampled stage-1 latent | `a2vid_two_stage.py:261` |
+
+`--audio-start-time` and `--audio-max-duration` window the take; the window
+defaults to the clip's own duration. A take shorter than the clip is refused
+rather than padded, and a longer one keeps its leading frames.
+
+**One divergence, and it is not repairable from the request.** Upstream fuses
+the distilled adapter into stage 2 alone and leaves stage 1 on the base weights;
+this engine fuses adapters once at load, so stage 1 sees it too. Tracked as
+[#1118](https://github.com/mudler/vllm.cpp/issues/1118).
+
+The guider flags (`--video-cfg-guidance-scale` and the rest, spelled as the
+`video_cfg_guidance_scale` extras over the C API) reach stage 1 and are ignored
+by stage 2, which runs no guider at all — unlike `distilled_two_stage` and
+`retake`, which refuse them outright. `pipeline_kind` is a LOAD knob and reaches
+a server through `--video-extra pipeline_kind=a2vid_two_stage`, but `audio_path`
+is a per-generation extra and `/v1/videos` forwards none
+([#928](https://github.com/mudler/vllm.cpp/issues/928)), so every request to such
+a server is refused for the missing take. This kind is reachable from the C API
+and from `ltx2-gen`, and not over HTTP.
 
 ### Retake: regenerating a time window of an existing clip
 
