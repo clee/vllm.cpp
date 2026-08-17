@@ -27,7 +27,15 @@ bool EnvTruth(const char* value) {
 struct Global {
   std::mutex mu;
   WeightResidencyConfig config;
-  bool latched = false;
+  // ATOMIC, not a bool under `mu`, because `ResolveExpertStreamRequested` marks
+  // this on EVERY call and that function sits on the per-expert-slice decode path
+  // (`KqExpertSlice` -> `Qwen35ExpertStream::Get`). A process-wide mutex there
+  // would serialise the lane this row exists to make configurable, and a row whose
+  // whole claim is "changes no kernel, no allocation and no perf axis" must not
+  // quietly add a lock to a hot loop. Relaxed ordering is enough: the flag only has
+  // to be observed as true by a LATER install, and that install takes `mu` and
+  // therefore synchronises with nothing weaker than it needs.
+  std::atomic<bool> latched{false};
 };
 
 Global& State() {
@@ -218,7 +226,7 @@ WeightResidencyConfig parse_weight_residency_extension_json(
 void SetWeightResidencyConfig(const WeightResidencyConfig& config) {
   Global& g = State();
   std::lock_guard<std::mutex> lk(g.mu);
-  if (!g.latched) {
+  if (!g.latched.load(std::memory_order_relaxed)) {
     g.config = config;
     return;
   }
@@ -250,25 +258,19 @@ const WeightResidencyConfig& ActiveWeightResidencyConfig() {
 }
 
 bool WeightResidencyLatched() {
-  Global& g = State();
-  std::lock_guard<std::mutex> lk(g.mu);
-  return g.latched;
+  return State().latched.load(std::memory_order_relaxed);
 }
 
 void ResetWeightResidencyConfigForTesting() {
   Global& g = State();
   std::lock_guard<std::mutex> lk(g.mu);
   g.config = WeightResidencyConfig{};
-  g.latched = false;
+  g.latched.store(false, std::memory_order_relaxed);
 }
 
 bool ResolveResidencyBool(const char* env_name, std::optional<bool> configured,
                           bool builtin_default) {
-  {
-    Global& g = State();
-    std::lock_guard<std::mutex> lk(g.mu);
-    g.latched = true;
-  }
+  State().latched.store(true, std::memory_order_relaxed);
   const char* v = std::getenv(env_name);
   if (v != nullptr) return EnvTruth(v);
   if (configured.has_value()) return *configured;
@@ -278,11 +280,7 @@ bool ResolveResidencyBool(const char* env_name, std::optional<bool> configured,
 int64_t ResolveResidencyCount(const char* env_name,
                               std::optional<int64_t> configured,
                               int64_t builtin_default) {
-  {
-    Global& g = State();
-    std::lock_guard<std::mutex> lk(g.mu);
-    g.latched = true;
-  }
+  State().latched.store(true, std::memory_order_relaxed);
   const char* v = std::getenv(env_name);
   if (v != nullptr && *v != '\0') {
     // atol, and a non-positive result ignored, is what the existing readers do
@@ -366,11 +364,12 @@ bool ResolveExpertStreamRequested() {
   // Mark the latch even on a cached call. Whether the value came from this call
   // or an earlier one, the process's answer is fixed from here, and that is the
   // fact SetWeightResidencyConfig has to refuse a late install against.
-  {
-    Global& g = State();
-    std::lock_guard<std::mutex> lk(g.mu);
-    g.latched = true;
-  }
+  //
+  // THIS IS WHY THE FLAG IS ATOMIC. This function is reached once per expert slice
+  // through `KqExpertSlice`, so taking the process-wide mutex here would put a lock
+  // in the decode loop of the lane the row is about. A relaxed store costs nothing
+  // measurable and carries the only guarantee the install needs.
+  State().latched.store(true, std::memory_order_relaxed);
   return on;
 }
 

@@ -364,6 +364,16 @@ pristine snapshot with the sha256 compared against the pre-mutation value.
 | M14 | the slot-count SITE hardcoded to the default 64 | **first run GREEN** 1/1; RED 1 / 1 after the suite was moved to a non-default 96 and made to assert the built geometry |
 | M15 | the slot-bytes SITE bypasses its resolver | GREEN, and correctly so: with neither the variable nor the config set the resolver returns the caller's computed default, so the mutation is behaviour-identical. The defect-detecting forms are M10 and M16 |
 | M16 | `ResolveExpertStreamSlots` drops the config half | config RED 11 / 1 |
+| M17 | the latch is never marked, so a late install is accepted | config RED 11 / 2 |
+
+A fourth finding came from reading rather than from a mutation, and is repaired
+here too. `ResolveExpertStreamRequested` marked the latch under the process-wide
+mutex on EVERY call, and that function sits on the per-expert-slice decode path
+(`KqExpertSlice` -> `Qwen35ExpertStream::Get`). A row whose whole claim is that it
+changes no kernel, no allocation and no performance axis must not put a lock in
+the loop of the lane it exists to configure, so the flag is a relaxed
+`std::atomic<bool>`. M6 and M17 were re-run against the atomic form and both stay
+RED.
 
 M1, M12 and M14 were findings rather than confirmations, and each was repaired in
 this change rather than recorded: the log line now reads the installed global back
