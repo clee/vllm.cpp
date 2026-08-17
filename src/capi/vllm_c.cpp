@@ -649,7 +649,7 @@ VLLM_API vllm_status vllm_engine_load(const vllm_model_params* params,
         // flag does, so a library client gains the surface without an ABI bump.
         // Refused HERE for the same reason the mirrored half is — a mistyped key
         // is a CALLER error and must be INVALID_ARGUMENT before any model I/O, not
-        // a server that quietly does not borrow its weights.
+        // a server quietly running this tier at its defaults.
         vllm::WeightResidencyConfig res_cfg =
             vllm::parse_weight_residency_extension_json(params->offload_config);
         if (!res_cfg.empty()) ep.weight_residency = std::move(res_cfg);

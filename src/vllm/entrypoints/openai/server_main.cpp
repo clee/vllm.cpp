@@ -1118,7 +1118,7 @@ int VllmServerMain(int argc, char** argv) {
       // costs a second rather than a full load. The extension REFUSES a key it
       // does not know, which the mirrored parser does not do — and that refusal is
       // load-bearing, because a silently ignored `{"vllm_cpp":{"mmapp":...}}`
-      // starts a server that does not borrow its weights and is discovered as an
+      // starts a server running this tier at its defaults and is discovered as an
       // out-of-memory kill instead of an error.
       vllm::WeightResidencyConfig res_cfg =
           vllm::parse_weight_residency_extension_json(args.offload_config);

@@ -32,35 +32,50 @@ Three findings shape the change:
   therefore lives in its own struct in its own file, under its own namespaced
   JSON key, and `OffloadConfig` gains no field.
 - **An unknown top-level key is already accepted, so option 2 of the issue is
-  workable.** `parse_offload_config_json` (`src/vllm/config/offload.cpp:234-283`)
+  workable — and closing that tolerance is this row's job.**
+  `parse_offload_config_json` (`src/vllm/config/offload.cpp:234-283`)
   looks up `offload_backend`, `uva` and `prefetch` by name and never enumerates
   the document's keys; `validate_offload_config`'s mirror
   (`OffloadConfig::Validate`) reads fields, not keys. A `vllm_cpp` sibling is
   invisible to both. This is what makes the namespaced key possible rather than a
   sibling flag, and it is also the one hazard the extension parser has to close
-  itself: a *misspelled* extension key would be silently ignored by both parsers,
-  so the extension parser refuses an unknown key inside `vllm_cpp` by name.
-- **Every one of these knobs latches in a function-local static, and two of them
-  latch during weight load.** `Qwen35ExpertStreamRequested()`
-  (`qwen3_5.cpp:5146-5154`) and `PrefaultBorrowedSpan`'s `enabled`
-  (`qwen3_5_gguf_weights.cpp:37-44`) both compute once, on first call, and cache
-  forever. A config installed after the first call is not merely late — it is
-  *silently* ignored, which is the invisible-fallback shape this tree refuses
-  everywhere else. So the resolver records that a decision was latched and
-  `SetWeightResidencyConfig` **throws** when a non-empty config arrives after
-  one, rather than being quietly discarded. The install site is the first
-  statement block of `LoadedEngine::FromModelDir`, beside the weight-offloader
-  install, which is already documented as being before any weight I/O.
+  itself: a *misspelled* key is silently ignored by both parsers, so the extension
+  parser enumerates the **whole document** — the four legal top-level keys plus its
+  own two levels — and refuses anything else by name. Enumerating only inside
+  `vllm_cpp` was the first shape and it left the worst spelling accepted:
+  `{"vllm-cpp":{…}}` with a hyphen parsed to an empty config and started a server
+  running this tier at its defaults — prefault ON, streaming OFF (#1122 H1). Refusing is also the mirror-faithful
+  polarity: upstream has no `--offload-config` flag at the pin — the string appears
+  nowhere in the tree, so the whole JSON document is vllm.cpp's own — and vLLM builds
+  its config dataclasses with the `@config` decorator, whose body sets
+  `ConfigDict(extra="forbid")` (`vllm/config/utils.py:68-69`). `OffloadConfig`
+  (`offload.py:80`) and `KVTransferConfig` (`kv_transfer.py:22-23`) both carry it.
+- **Two of these five knobs latch a decision; three do not, and the difference is
+  the whole contract of the install.** `Qwen35ExpertStreamRequested()`
+  (`qwen3_5.cpp:5146-5154`) caches its answer in a function-local static, and the
+  slot store is built once per process so its `slots x slot_bytes` reservation
+  cannot be resized. Those two freeze. `mmap` does not, because
+  `GgufLoadPolicy::FromEnv()` is called per load; nor does `prefault`, because this
+  row deliberately removes `PrefaultBorrowedSpan`'s `enabled` static
+  (`qwen3_5_gguf_weights.cpp:37-44`). A config that would change a *frozen* field is
+  not merely late — honouring it would record a configuration the engine is not
+  running, the invisible-fallback shape this tree refuses everywhere else — so
+  `SetWeightResidencyConfig` **throws** for exactly those fields and accepts
+  everything else, including a second engine's `mmap`/`prefault` document. Marking
+  one process-wide flag in the shared resolvers instead made an ordinary first load
+  refuse a legal second load (#1122 M1). The install site is the first statement
+  block of `LoadedEngine::FromModelDir`, beside the weight-offloader install, which
+  is already documented as being before any weight I/O.
 
 ## Scope
 
 | Field | Content |
 |---|---|
 | Row ID | `ENG-RESIDENCY-CONFIG` (engine-matrix, KV cache and memory). Issue [#1110](https://github.com/mudler/vllm.cpp/issues/1110); fixes [#1109](https://github.com/mudler/vllm.cpp/issues/1109) in flow |
-| In | A vllm.cpp-original `WeightResidencyConfig` under the `vllm_cpp` key of the existing `--offload-config` document; its parser, with unknown-key and wrong-type refusal; a process-global install/resolve seam with a defined config-vs-env precedence and a late-install refusal; the three call sites that resolve these knobs today (`GgufLoadPolicy::FromEnv` for `mmap`, `PrefaultBorrowedSpan` for `prefault`, `Qwen35ExpertStreamRequested` + the `Qwen35ExpertStream` constructor for the streaming lane); the flag→`EngineParams`→install chain through both production entry points (`server_main.cpp` and the C ABI's `offload_config`); `docs/USAGE.md` and `docs/ENVIRONMENT.md` |
+| In | A vllm.cpp-original `WeightResidencyConfig` under the `vllm_cpp` key of the existing `--offload-config` document; its parser, which refuses an unknown key at every level of the document (the four legal top-level keys included) and a wrong-typed or non-positive field; a process-global install/resolve seam with a defined config-vs-env precedence and a late-install refusal; the three call sites that resolve these knobs today (`GgufLoadPolicy::FromEnv` for `mmap`, `PrefaultBorrowedSpan` for `prefault`, `Qwen35ExpertStreamRequested` + the `Qwen35ExpertStream` constructor for the streaming lane); the flag→`EngineParams`→install chain through both production entry points (`server_main.cpp` and the C ABI's `offload_config`); `docs/USAGE.md` and `docs/ENVIRONMENT.md` |
 | Out | Any change to `OffloadConfig`, `UVAOffloadConfig`, `PrefetchOffloadConfig` or their validator — the mirror stays byte-faithful. Any change to what the knobs *do*: this row moves where their value comes from and nothing else. A new flag. `VT_MOE_EXPERT_STREAM_STATS_EVERY` (see below). `VT_GGUF_KEEP_QUANT`, `VT_CPU_REF`, `VT_GGUF_KEEP_F16` and the rest of the load-transform family — they are a different tier and a different row |
 | Supported modes | `{"vllm_cpp":{"mmap":{"enabled":bool,"prefault":bool},"expert_stream":{"enabled":bool,"slots":int,"slot_bytes":int}}}`. Every field is optional and every absent field means "unchanged", so an absent `vllm_cpp` key is byte-identical to today |
-| Dispatch behavior | Resolved once, at first read, from **env var if set, else config if set, else the built-in default**. Nothing is resolved when neither is set, so the default engine path is byte-identical |
+| Dispatch behavior | Resolved from **env var if set, else config if set, else the built-in default**, at each read. `mmap` and `prefault` are read per load and per span; `expert_stream` is cached on first read and the two sizes are fixed when the slot store is built. Nothing is resolved when neither input is set, so the default engine path is byte-identical |
 | Regimes served | A checkpoint larger than host RAM on a single box: the mmap-borrowed weight tower plus the bounded expert slot cache. CPU keep-quant expert towers today; a device platform serves the slice device-resident and is unaffected |
 
 ## Upstream chain
@@ -138,7 +153,7 @@ knob gets one function in the new header that owns its environment NAME and its
 exact historical rule, and each becomes the sole reader of its variable. That is
 not decoration. `VT_GGUF_MMAP` and `VT_GGUF_PREFAULT` compare the whole value
 against `""`, `"0"`, `"false"` and `"off"` (the tree's `EnvOn`,
-`gguf_keep_quant.cpp:60-65`). `VT_MOE_EXPERT_STREAM` examines only the **first
+`gguf_keep_quant.cpp:61-66`). `VT_MOE_EXPERT_STREAM` examines only the **first
 character** — `v[0] != '0' && v[0] != '\0'` — so `VT_MOE_EXPERT_STREAM=false`
 reads as ON, and `docs/ENVIRONMENT.md` states that explicitly. Routing all five
 through one generic helper would silently normalise the odd one, and a row whose
@@ -147,6 +162,15 @@ So the odd rule is transcribed, and it is additionally exposed in a pure form
 (`ExpertStreamRequestedFrom(env_value, configured)`) because its wrapper latches
 and can be exercised only once per process — which is exactly how a
 normalisation there would have escaped a test.
+
+That once-per-process budget also decides where the WRAPPER is gated. The pure form
+covers the decision and the wrapper's environment name is covered by the precedence
+cases; the FIELD the wrapper reads was covered by nothing, and rewiring it to the
+adjacent `.mmap` left all four suites green (#1122 M2). So the one observation a
+process gets is spent on that, in a binary of its own:
+`tests/vllm/config/test_expert_stream_latch.cpp` installs
+`{"expert_stream":{"enabled":true}}` with no variable set, leaves `mmap` unset so the
+mutated form resolves OFF, and asserts `ResolveExpertStreamRequested() == true`.
 
 **The prefault resolve stops latching, deliberately.** `PrefaultBorrowedSpan`
 cached its answer in a function-local static. Dropping the cache costs one
@@ -204,13 +228,26 @@ New tests, each red before its implementation:
     both unset ⇒ built-in default; env set to `0` beats a config `true` (an
     override has to be able to turn a thing OFF, which is the direction a
     benchmark arm usually needs);
-  - **the latch**: a non-empty install after a resolve throws; an empty install
-    after a resolve does not (it is the no-op the default path performs); a
-    re-install of the same config does not.
+  - **the latch, and its scope**: an install that would CHANGE `expert_stream`
+    after `ResolveExpertStreamRequested` has read it throws, as does one that would
+    change `slots`/`slot_bytes` after the store's geometry was noted; an install
+    that touches only `mmap`/`prefault` does not, whatever has been resolved,
+    because neither of those freezes anything and refusing them would fail a legal
+    two-model load; an empty install does not (it is the no-op the default path
+    performs); a re-install of the same config does not.
+- `tests/vllm/config/test_expert_stream_latch.cpp` — the expert-stream knob's own
+  binary, because `ResolveExpertStreamRequested` caches its answer and a process can
+  therefore observe what it resolved exactly once. It installs
+  `{"expert_stream":{"enabled":true}}` through the parser with no variable set and
+  `mmap` deliberately unset, and asserts the resolver returns true and marked its
+  latch. Added by the #1122 repair, after rewiring the resolver to the adjacent
+  `.mmap` left all four other suites green.
 - `tests/vllm/entrypoints/test_weight_residency_reach.cpp` — reachability
   through `LoadedEngine::FromModelDir` on a nonexistent model directory: the
   install happens before the load fails, so the process-global carries the
-  parsed values afterwards.
+  parsed values afterwards. It also carries the TWO-MODEL case: a first load's
+  ordinary `GgufLoadPolicy::FromEnv()` must not stop a second engine installing a
+  document, because reading a knob is not taking a decision.
 - `tests/vllm/entrypoints/openai/test_serve_residency_config.cpp` — reachability
   through the REAL `VllmServerMain`, re-exec'ing the test binary as
   `test_serve_recipe_args.cpp` does, asserting the install line on the child's
@@ -254,6 +291,7 @@ claims none.
 
    ```sh
    ./build/tests/test_weight_residency_config
+   ./build/tests/test_expert_stream_latch
    ./build/tests/test_weight_residency_reach
    ./build/tests/test_serve_residency_config
    ./build/tests/test_gguf_keep_quant
@@ -312,11 +350,20 @@ a parser nothing reaches.
   cheapest to see: the install line prints the RESOLVED values, so a run whose
   config was overridden says so on stderr at startup. The opposite polarity was
   rejected because it breaks a measurement in flight.
-- **The late-install throw could fire in a process that loads twice.** A second
-  `FromModelDir` in one process with a *different* non-empty residency config
-  cannot be honored — the knobs latched during the first load — so throwing is
-  the correct answer, not a defect. Re-installing an EQUAL config is allowed
-  precisely so the ordinary two-engine test binaries do not trip on it.
+- **The late-install throw must not fire on a legal second load, and the first
+  shape of it did.** A second `FromModelDir` in one process cannot be honored for a
+  field a taken decision has already frozen — `expert_stream` once the streaming
+  answer has been read, the two sizes once the store is built — so throwing for
+  those is the correct answer. It is NOT correct for `mmap` or `prefault`:
+  `GgufLoadPolicy::FromEnv()` runs per load and this row removed the prefault
+  static, so nothing about them is fixed. The first implementation marked one
+  process-wide flag inside the shared resolvers, so the ordinary `FromEnv()` of a
+  first load made a second engine's whole document throw — measured through
+  `vllm_engine_load` (#1122 M1). The refusal is therefore scoped per latched field:
+  `ResidencyLatch::kExpertStream` is marked by `ResolveExpertStreamRequested`,
+  `kExpertStreamGeometry` by `NoteExpertStreamGeometry` when the store is built, and
+  the shared resolvers mark nothing. An equal re-install and an empty install remain
+  accepted, the first so the ordinary two-engine test binaries do not trip on it.
 - **`GgufLoadPolicy::FromEnv` keeps its name while no longer being env-only.**
   Renaming it touches 30 call sites across tests and four model loaders for no
   behavior change, which is a bigger diff than this row's whole subject. The
@@ -380,7 +427,8 @@ this change rather than recorded: the log line now reads the installed global ba
 instead of `params`, the prefault gained a span counter, and the mixed-slot suite
 gained a non-default slot count plus a geometry assertion.
 
-**Focused green.** `test_weight_residency_config` 11 cases / 138 assertions,
+**Focused green, first pass** (the repair pass's counts are below).
+`test_weight_residency_config` 11 cases / 138 assertions,
 `test_weight_residency_reach` 5 / 39, `test_serve_residency_config` 5 / 55 (1
 skipped, the re-exec'd child), `test_gguf_keep_quant` 39 / 6093,
 `test_expert_stream_mixed_slot` 1 / 181. All rc 0, all case counts read from the
@@ -388,6 +436,87 @@ LAST `test cases:` match so a failing child's summary cannot be mistaken for the
 parent's, and every rc captured directly rather than through a pipe.
 
 **Full gate.** See `## Now`.
+
+### The fresh review, and the repair pass (#1122)
+
+The fresh review returned **FAIL**: 2 high, 3 medium, 8 low, and **14 of 69
+sentences about the code wrong**. It reproduced this table, including the three
+findings above, and then found what the table could not see. The two that mattered:
+
+- **H1.** `RejectUnknownKeys` enumerated only INSIDE `vllm_cpp`, so a misspelled
+  TOP-LEVEL key was accepted with an empty config and no refusal, while the header
+  said a typo "is an error". Measured through the product parser: `{"vllm-cpp":…}`,
+  `{"VLLM_CPP":…}`, `{"vllm_ccp":…}` and `{"vllmcpp":…}` all ACCEPTED. The
+  hyphenated spelling is the likeliest of all, because every flag around it is
+  hyphenated. **Decision: make the claim true** rather than delete it. The
+  precondition was checked first, as the finding required: there is no
+  `--offload-config` flag anywhere in the vLLM tree at the pin, so the whole JSON
+  document is vllm.cpp's own and no upstream-legal document can be broken; and vLLM
+  builds its config dataclasses with `@config`, whose body sets
+  `ConfigDict(extra="forbid")` (`vllm/config/utils.py:68-69`), so refusing is the
+  mirror-faithful polarity and the tolerance was the deviation. The enumeration
+  lives in the EXTENSION parser, which reads the same string at both entry points,
+  so `parse_offload_config_json` stays a byte-faithful transcription.
+- **M2.** Nothing gated the headline knob reaching its decision: rewiring
+  `ResolveExpertStreamRequested` to read `.mmap` instead of `.expert_stream` left
+  all four suites green. Repaired with a binary of its own, which the
+  once-per-process observability of that latch requires (see Port map).
+
+**M1 was a decision, not only a repair.** The late-install throw fired on a
+legitimate two-model process — load A with no residency config, load B carrying
+`vllm_cpp`, and B could not load — and its stated reason was false for two of the
+five knobs. **Decision: narrow it**, because a hard failure on a legal load is
+worse than the thing it prevents, and because the reason can then be true. The
+latch became per-decision (`ResidencyLatch::kExpertStream`,
+`kExpertStreamGeometry`), the shared resolvers mark nothing, and the refusal fires
+only on a field a taken decision has frozen. The alternative — keep the throw and
+correct three sentences plus a test name — would have kept a refusal that no longer
+had a reason for `mmap` or `prefault`.
+
+**M3 was a sentence, not a mechanism.** The install line prints the installed
+DOCUMENT, and reading the global back is what proves the install ran; three
+sentences claimed it reported what the engine will use. The sentences are corrected
+and the mechanism is unchanged.
+
+Mutations for the repair, each applied alone, with `git diff --stat` and the
+file's sha256 printed before and after so a never-applied edit cannot read as a
+pass, the build's exit status and an ENOSPC count printed beside every result so a
+non-building mutation is INVALID rather than a pass, the LAST `test cases:` match
+read, every rc captured directly, and the tree restored by byte copy with the
+sha256 compared:
+
+| # | Mutation | Result |
+|---|---|---|
+| N1 | `ResolveExpertStreamRequested` reads `.mmap`, the adjacent field (the surviving mutation) | latch RED 1 / 1, 9 assertions / 2 failed |
+| N2 | the top-level enumeration removed | config RED 14 / 1 (10 assertions), reach RED 6 / 1, serve RED 6 / 1 |
+| N3 | the top-level path built from a hardcoded `vllm_cpp` prefix | config RED 14 / 1 |
+| N4 | the coarse latch restored, marked inside `ResolveResidencyBool` | config RED 14 / 1, reach RED 6 / 1 |
+| N5 | the geometry latch never marked when the store is built | config RED 14 / 1 |
+| N6 | `DescribeEnvOverrides` reports env PRESENCE again instead of "would win" | config RED 14 / 1 (4 assertions) |
+| N7 | the install call site in `FromModelDir` deleted (the reachability mutation, re-run) | reach RED 6 / 3, serve RED 6 / 3 |
+| N8 | the narrowed refusal never throws | config RED 14 / 2, latch RED 1 / 1 |
+
+N4 first left the reach suite GREEN while the config suite went red, because the
+per-field comparison is insensitive to WHERE the flag is marked unless the incoming
+document changes the frozen field. The reach case was widened to carry
+`expert_stream` as well — which is the shape the reviewer actually measured, a
+second engine arriving with a `vllm_cpp` document — and it then goes red too. The
+first result is recorded because it is the interesting one: a green mutation is a
+statement about the test, not about the code.
+
+**L3 has no mutation, and that is a limit rather than an omission.**
+`ActiveWeightResidencyConfig` returning by value instead of by reference removes an
+unsynchronised read behind a lock that looked like it covered one; a single-threaded
+suite cannot distinguish the two, and a test that could would be a race detector
+rather than a gate. The relaxed-atomic reason (L2) is the same shape: the code was
+already sound and only the stated reason was wrong, so the repair is the sentence.
+The comment now also records the window that ordering cannot close — a second engine
+installing at the instant a first starts streaming — which the narrowing made
+reachable in principle.
+
+**Focused green after the repair.** `test_weight_residency_config` 14 cases / 188
+assertions, `test_expert_stream_latch` 1 / 9, `test_weight_residency_reach` 6 / 54,
+`test_serve_residency_config` 6 / 64 (1 skipped, the re-exec'd child). All rc 0.
 
 ## Owed
 
@@ -407,17 +536,37 @@ parent's, and every rc captured directly rather than through a pipe.
   `mincore()` over a host mirror, and the same instrument would apply here. Owned
   by `ENG-RESIDENCY-CONFIG`, issue
   [#1110](https://github.com/mudler/vllm.cpp/issues/1110).
+- **The config form does not reach three entry points, and two of them are
+  server-side.** `--offload-config` is parsed once, after the architecture
+  resolution, so the server's POOLING/embedding path
+  (`server_main.cpp`, the `if (pooling_model)` block) and its transcription-only
+  path build their `EngineParams` without it — the MIRRORED `uva`/`prefetch` half is
+  dropped there too, and has been since before this key existed, so this is a
+  pre-existing gap that the new key inherits rather than a regression. `vllm-cli`
+  has no such flag at all, which is a deliberate scope line (this row adds no new
+  flag) but is unrecorded. Both are documented in `docs/USAGE.md` beside the config
+  form so a reader is not left to discover it. Fixing the server half means moving
+  the offload parse ahead of the architecture branch, which is
+  `ENG-WEIGHT-OFFLOAD`'s surface as much as this one's. Owned by
+  `ENG-RESIDENCY-CONFIG`, issue
+  [#1122](https://github.com/mudler/vllm.cpp/issues/1122).
 
 ## Now
 
-`ACTIVE`. The config surface exists, parses, refuses a typo, defines its
-precedence, and is reachable from both production entry points — the server flag
-and the C ABI — with the reachability proven by deleting the install call site
-and watching the server-level suite go red. The mmap, prefault, expert-stream,
-slots and slot-bytes knobs all resolve through it. `stats_every` stays
-environment-only by decision, recorded in Port map. `docs/ENVIRONMENT.md`'s
-`VT_GGUF_PREFAULT` default is corrected here, closing #1109.
+`ACTIVE`. The config surface exists, parses, refuses a typo ANYWHERE in the
+document, defines its precedence, and is reachable from both production entry
+points — the server flag and the C ABI — with the reachability proven by deleting
+the install call site and watching the server-level suite go red. The mmap,
+prefault, expert-stream, slots and slot-bytes knobs all resolve through it, and the
+expert-stream knob's own wiring to its own field now has a gate of its own.
+`stats_every` stays environment-only by decision, recorded in Port map.
+`docs/ENVIRONMENT.md`'s `VT_GGUF_PREFAULT` default is corrected here, closing
+#1109. The fresh review's findings (#1122) are repaired: the top-level typo is
+refused, the late-install refusal is scoped to the two decisions that genuinely
+freeze, and the public ABI comment says which half of `offload_config` moves
+weights.
 
-What keeps it `ACTIVE` rather than `DONE` is the one thing above under `## Owed`:
-nobody has yet driven the 370 GiB checkpoint through the JSON form on the box
-that can hold it.
+What keeps it `ACTIVE` rather than `DONE` is what is above under `## Owed`: nobody
+has yet driven the 370 GiB checkpoint through the JSON form on the box that can
+hold it, and the config form still does not reach the pooling, transcription or
+`vllm-cli` entry points.

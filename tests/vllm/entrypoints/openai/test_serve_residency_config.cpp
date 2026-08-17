@@ -48,8 +48,12 @@ constexpr const char* kMissingModel =
 // parsing succeeded and control reached engine construction.
 constexpr const char* kPostParseBanner = "server: request logging";
 
-// The install line. It names the RESOLVED residency, which is the only way a run
-// whose config was overridden by an exported environment variable can say so.
+// The install line. It names the DOCUMENT that was installed — the fields the
+// operator set — and, on a second line, every variable that would win over one of
+// them. It does NOT name resolved values: every knob resolves lazily during weight
+// load and the streaming answer is cached on first read, so resolving at install
+// would move that decision ahead of the load. The pair of lines is what lets a run
+// whose document was overridden say so; see CASE 5.
 constexpr const char* kInstallLine = "engine: weight residency";
 
 constexpr const char* kUnknownArgument = "server: unknown argument";
@@ -145,9 +149,10 @@ TEST_CASE("serve: --offload-config's vllm_cpp extension reaches the loader") {
   CHECK(Contains(run.output, kPostParseBanner));
   CHECK(Contains(run.output, "server: loading model from"));
 
-  // The install happened, and it named the RESOLVED values rather than merely
-  // announcing itself. A line that said only "installed" could not tell an
-  // operator that an exported VT_MOE_EXPERT_STREAM=0 had overridden the document.
+  // The install happened, and it named the FIELDS OF THE DOCUMENT rather than
+  // merely announcing itself. A line that said only "installed" could not tell an
+  // operator which half of a two-tier document had reached this tier, and CASE 5's
+  // override note would have nothing to sit beside.
   CHECK(Contains(run.output, kInstallLine));
   CHECK(Contains(run.output, "mmap=on"));
   CHECK(Contains(run.output, "prefault=off"));
@@ -192,7 +197,7 @@ TEST_CASE("serve: no --offload-config prints no residency line at all") {
 // STARTUP, before the multi-GB load, with a message naming the key. The mirrored
 // parser ignores a key it does not know — which is what lets this extension share
 // the flag — so without an explicit refusal `{"vllm_cpp":{"mmapp":...}}` would
-// start a server that silently does not borrow its weights, and the operator would
+// start a server silently running this tier at its defaults, and the operator would
 // discover it as an out-of-memory kill rather than as an error.
 TEST_CASE("serve: a mistyped vllm_cpp key aborts at startup, naming the key") {
   const ChildRun run =
@@ -223,6 +228,29 @@ TEST_CASE("serve: a mistyped vllm_cpp key aborts at startup, naming the key") {
   INFO("child output:\n" << ok.output);
   CHECK(Contains(ok.output, kInstallLine));
   CHECK(Contains(ok.output, kLoaderReached));
+}
+
+// CASE 4b — the TOP-LEVEL misspelling, on the real server. This is the one the
+// first pass shipped as an accept: `vllm-cpp` with a hyphen parsed to an empty
+// config, the server started, and the tier the operator asked for was off with no
+// diagnostic anywhere. The hyphen is the likeliest spelling of all, because every
+// flag around it is hyphenated, and the consequence is an out-of-memory kill
+// minutes later rather than a message at startup.
+TEST_CASE("serve: a misspelled TOP-LEVEL key aborts at startup, naming the key") {
+  const ChildRun run =
+      RunServer(std::string(kMissingModel) +
+                R"( --offload-config {"vllm-cpp":{"mmap":{"enabled":true}}})");
+  INFO("child output:\n" << run.output);
+
+  CHECK(Contains(run.output, "server: fatal:"));
+  CHECK(Contains(run.output, "unknown key \"vllm-cpp\""));
+  // The message lists the four keys the document may carry, so the operator can
+  // see the spelling that was meant.
+  CHECK(Contains(run.output,
+                 "expected one of: offload_backend uva prefetch vllm_cpp"));
+  CHECK_FALSE(Contains(run.output, kInstallLine));
+  CHECK_FALSE(Contains(run.output, "model path is not a directory"));
+  CHECK_FALSE(Contains(run.output, "SERVE_RC=0"));
 }
 
 // CASE 5 — the environment WINS over the document, and the server SAYS SO at

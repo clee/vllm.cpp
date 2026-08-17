@@ -167,6 +167,48 @@ TEST_CASE("residency reach: the GGUF load POLICY consults the installed config")
   ::unsetenv("VT_CPU_REF");
 }
 
+TEST_CASE("residency reach: a SECOND engine can still install, because a first load latches nothing") {
+  ResidencyFixture fx;
+  ::unsetenv("VT_GGUF_MMAP");
+  ::unsetenv("VT_CPU_REF");
+
+  // THE TWO-MODEL PROCESS, driven through the loader. Engine A carries no residency
+  // document; its weight load reads the GGUF load policy, exactly as every GGUF load
+  // in the tree does. Engine B then arrives WITH one.
+  //
+  // The first pass refused engine B. One process-wide flag was marked by every
+  // resolver, so the ordinary `GgufLoadPolicy::FromEnv()` of load A made load B
+  // throw — a hard failure on a legal second load, for a reason that was untrue of
+  // the knob that had been read: `FromEnv()` runs per load and caches nothing.
+  //
+  // Reading a knob is not taking a decision. The two decisions that CANNOT be
+  // retaken are the streaming answer (a function-local static) and the slot store's
+  // geometry, and neither is reached by a load that fails on a missing checkpoint. So
+  // engine B's whole document — including `expert_stream`, which is latchABLE but
+  // has not been latched in this process — must install.
+  vllm::entrypoints::EngineParams a;
+  CHECK_THROWS(vllm::entrypoints::LoadedEngine::FromModelDir(kMissingModel, a));
+  const vllm::GgufLoadPolicy policy_a = vllm::GgufLoadPolicy::FromEnv();
+  (void)policy_a;
+
+  vllm::entrypoints::EngineParams b;
+  b.weight_residency = vllm::parse_weight_residency_extension_json(
+      R"({"vllm_cpp":{"mmap":{"enabled":false,"prefault":false},)"
+      R"("expert_stream":{"enabled":true,"slots":8000}}})");
+  // It fails on the missing checkpoint, NOT on a refused install...
+  CHECK_THROWS(vllm::entrypoints::LoadedEngine::FromModelDir(kMissingModel, b));
+  // ...and the whole document took, which is what makes accepting it correct rather
+  // than merely permissive: engine B's own load reads the values it asked for.
+  const vllm::WeightResidencyConfig active = vllm::ActiveWeightResidencyConfig();
+  REQUIRE(active.mmap.has_value());
+  CHECK(*active.mmap == false);
+  REQUIRE(active.expert_stream.has_value());
+  CHECK(*active.expert_stream == true);
+  REQUIRE(active.expert_stream_slots.has_value());
+  CHECK(*active.expert_stream_slots == 8000);
+  CHECK_FALSE(vllm::GgufLoadPolicy::FromEnv().mmap_residency);
+}
+
 TEST_CASE("residency reach: the C ABI REFUSES a mistyped extension at the boundary") {
   ResidencyFixture fx;
 
@@ -178,6 +220,11 @@ TEST_CASE("residency reach: the C ABI REFUSES a mistyped extension at the bounda
       R"({"vllm_cpp":{"mmapp":{"enabled":true}}})",
       R"({"vllm_cpp":{"expert_stream":{"slots":0}}})",
       R"({"vllm_cpp":{"expert_stream":{"enabled":"yes"}}})",
+      // The TOP-LEVEL typo, through the public ABI. This is the one that used to
+      // return MODEL_LOAD — i.e. the document was accepted, empty — so a library
+      // client got an engine running this tier at its defaults and no diagnostic.
+      R"({"vllm-cpp":{"mmap":{"enabled":true}}})",
+      R"({"VLLM_CPP":{"mmap":{"enabled":true}}})",
   };
   for (const char* doc : refused) {
     CAPTURE(doc);

@@ -15,17 +15,23 @@
 // "mirror is untouched" cases below assert directly.
 //
 // THE THREE GUARANTEES, each of which has its own mutation:
-//   1. PARSE + REFUSE. Every field round-trips, and an unknown key is an ERROR.
-//      The refusal is the load-bearing half: parse_offload_config_json ignores a
-//      key it does not know (which is what lets this extension share the flag),
-//      so `{"vllm-cpp":...}` or `{"vllm_cpp":{"mmapp":...}}` would otherwise
-//      SILENTLY disable the tier that keeps a 370 GiB model inside 119 GB.
+//   1. PARSE + REFUSE. Every field round-trips, and an unknown key is an ERROR —
+//      at the TOP LEVEL of the document as well as inside `vllm_cpp`. The refusal
+//      is the load-bearing half: parse_offload_config_json ignores a key it does
+//      not know (which is what lets this extension share the flag), so
+//      `{"vllm-cpp":...}` or `{"vllm_cpp":{"mmapp":...}}` would otherwise SILENTLY
+//      disable the tier that keeps a 370 GiB model inside 119 GB. The hyphen is
+//      the likeliest of those typos, because every flag around it is hyphenated.
 //   2. PRECEDENCE: env > config > built-in default, in both directions. `VT_X=0`
 //      must beat a config `true`, because an override that cannot turn a thing
 //      OFF is not one, and that is the direction a benchmark arm needs.
-//   3. THE LATCH. Every consumer reads its knob through a function-local static,
-//      so a config installed after the first read cannot take effect. It must
-//      THROW rather than be ignored.
+//   3. THE LATCH, and only where there IS one. `expert_stream` is read through a
+//      function-local static and the slot store is built once per process, so a
+//      config that would change either after the fact must THROW rather than be
+//      ignored. `mmap` and `prefault` latch NOTHING — `GgufLoadPolicy::FromEnv()`
+//      runs per load and the prefault site no longer caches — so a second engine
+//      in one process may still set them, and refusing that would fail a legal
+//      two-model load. Both halves are asserted below.
 #include <doctest/doctest.h>
 
 #include <cstdlib>
@@ -47,6 +53,26 @@ struct ResidencyFixture {
     ::unsetenv("VT_RESIDENCY_TEST_COUNT");
   }
 };
+
+// The refusal MESSAGE, not merely the fact of a throw. A parser can refuse the
+// right document for the wrong reason, and one of these did: `{"vllm_cpp": 5}`
+// reported `"vllm_cpp.vllm_cpp" must be a JSON object` from a hardcoded prefix,
+// which CHECK_THROWS_AS cannot see. The operator reads the message, so the
+// message is the guarantee.
+std::string RefusalMessage(const char* doc) {
+  try {
+    vllm::parse_weight_residency_extension_json(doc);
+  } catch (const std::invalid_argument& e) {
+    return e.what();
+  } catch (const std::exception& e) {
+    return std::string("WRONG EXCEPTION TYPE: ") + e.what();
+  }
+  return "ACCEPTED (no throw)";
+}
+
+bool Mentions(const std::string& haystack, const std::string& needle) {
+  return haystack.find(needle) != std::string::npos;
+}
 
 }  // namespace
 
@@ -72,8 +98,10 @@ TEST_CASE("residency config: every field parses out of the vllm_cpp key") {
   CHECK(*c.expert_stream_slot_bytes == 12582912);
   CHECK_FALSE(c.empty());
 
-  // The install line has to name what the operator set, because the resolved
-  // values are the only way a run whose config was overridden can say so.
+  // The install line names WHAT THE OPERATOR SET, field by field. It is not the
+  // resolved value — a variable can still override any of these, which is what the
+  // second line of the install reports — and this string is the half that says which
+  // fields of a two-tier document reached this tier.
   const std::string described = c.Describe();
   CHECK(described.find("mmap=on") != std::string::npos);
   CHECK(described.find("prefault=off") != std::string::npos);
@@ -116,8 +144,8 @@ TEST_CASE("residency config: a partial extension leaves the rest unchanged") {
 
 TEST_CASE("residency config: an unknown or mistyped key is REFUSED, never ignored") {
   // Each of these would be silently accepted by a parser that only looks its own
-  // keys up, and each one silently turns the tier OFF while the operator believes
-  // it is on.
+  // keys up, and each one leaves the field the operator meant to set at its DEFAULT
+  // while the operator believes the document set it.
   const char* refused[] = {
       R"({"vllm_cpp":{"mmapp":{"enabled":true}}})",
       R"({"vllm_cpp":{"mmap":{"enable":true}}})",
@@ -137,6 +165,65 @@ TEST_CASE("residency config: an unknown or mistyped key is REFUSED, never ignore
   // (it changes only how often a diagnostic line prints, moves no byte and
   // reserves nothing), so the config surface must refuse it rather than accept
   // and drop it.
+
+  // Refused BY NAME, and the name is the one the operator typed. A message that
+  // invented a prefix would send them hunting through a document that does not
+  // contain the key it names.
+  const std::string mmapp =
+      RefusalMessage(R"({"vllm_cpp":{"mmapp":{"enabled":true}}})");
+  CHECK(Mentions(mmapp, "unknown key \"vllm_cpp.mmapp\""));
+  CHECK(Mentions(mmapp, "expected one of: mmap expert_stream"));
+}
+
+TEST_CASE("residency config: a misspelled TOP-LEVEL key is REFUSED, never ignored") {
+  // THE ONE THE FIRST PASS MISSED, and the worst of the set. The extension
+  // enumerated its own keys but nothing enumerated the DOCUMENT, so a typo in
+  // `vllm_cpp` itself parsed to an empty config and started a server that does not
+  // borrow its weights — met by the operator as an out-of-memory kill rather than
+  // as an error. The hyphen is the likeliest spelling of all: every flag around it
+  // (`--offload-config`, `--kv-transfer-config`) is hyphenated.
+  //
+  // Refusing is also the MIRROR-FAITHFUL polarity, not a local invention. Upstream
+  // has no `--offload-config` flag at all (there is no such string anywhere in the
+  // vLLM tree at the pin, so no upstream-legal document exists to break), and vLLM
+  // builds its config dataclasses with the `@config` decorator, whose body sets
+  // `ConfigDict(extra="forbid")` under the comment "Extra fields are forbidden by
+  // default" (vllm/config/utils.py:68-69 @ 555967922). `OffloadConfig`
+  // (offload.py:80) and `KVTransferConfig` (kv_transfer.py:22-23) both carry it, so
+  // `--kv-transfer-config` refuses an unknown key. It is this parser's silence that
+  // was the deviation.
+  const char* refused[] = {
+      // The hyphen, the case, two transpositions, and the run-together spelling.
+      R"({"vllm-cpp":{"mmap":{"enabled":true}}})",
+      R"({"VLLM_CPP":{"mmap":{"enabled":true}}})",
+      R"({"vllm_ccp":{"mmap":{"enabled":true}}})",
+      R"({"vllmcpp":{"mmap":{"enabled":true}}})",
+      R"({"vllm.cpp":{"mmap":{"enabled":true}}})",
+      // And a typo in the MIRRORED half, which the same document carries and which
+      // has exactly the same consequence: a budget the operator believes is set.
+      R"({"uvaa":{"cpu_offload_gb":10}})",
+      R"({"prefetchh":{"offload_group_size":8}})",
+      R"({"offload_backends":"uva"})",
+  };
+  for (const char* doc : refused) {
+    CAPTURE(doc);
+    CHECK_THROWS_AS(vllm::parse_weight_residency_extension_json(doc),
+                    std::invalid_argument);
+  }
+
+  // The message names the offender WITHOUT a phantom prefix, and lists the four
+  // keys the document may carry — the three mirrored ones and the extension.
+  const std::string hyphen =
+      RefusalMessage(R"({"vllm-cpp":{"mmap":{"enabled":true}}})");
+  CHECK(Mentions(hyphen, "unknown key \"vllm-cpp\""));
+  CHECK_FALSE(Mentions(hyphen, "vllm-cpp.vllm-cpp"));
+  CHECK(Mentions(hyphen, "vllm_cpp"));  // the spelling that was meant
+
+  // ...and the four legal top-level keys still parse, in every combination, so the
+  // enumeration refuses a typo rather than the document.
+  CHECK_NOTHROW(vllm::parse_weight_residency_extension_json(
+      R"({"offload_backend":"uva","uva":{"cpu_offload_gb":10},)"
+      R"("prefetch":{"offload_group_size":8},"vllm_cpp":{"mmap":{"enabled":true}}})"));
 }
 
 TEST_CASE("residency config: a wrong-typed or non-positive field is REFUSED") {
@@ -163,6 +250,22 @@ TEST_CASE("residency config: a wrong-typed or non-positive field is REFUSED") {
     CHECK_THROWS_AS(vllm::parse_weight_residency_extension_json(doc),
                     std::invalid_argument);
   }
+
+  // The PATH in each message is the path in the document. The first pass built the
+  // top-level one from a hardcoded `vllm_cpp.` prefix and reported
+  // `"vllm_cpp.vllm_cpp" must be a JSON object`, which every CHECK_THROWS_AS above
+  // passed over: a refusal for the right document with the wrong reason.
+  const std::string scalar_ext = RefusalMessage(R"({"vllm_cpp": 5})");
+  CHECK(Mentions(scalar_ext, "\"vllm_cpp\" must be a JSON object"));
+  CHECK_FALSE(Mentions(scalar_ext, "vllm_cpp.vllm_cpp"));
+
+  const std::string scalar_sub = RefusalMessage(R"({"vllm_cpp":{"mmap": true}})");
+  CHECK(Mentions(scalar_sub, "\"vllm_cpp.mmap\" must be a JSON object"));
+
+  CHECK(Mentions(RefusalMessage(R"({"vllm_cpp":{"mmap":{"enabled":"yes"}}})"),
+                 "\"vllm_cpp.mmap.enabled\" must be a boolean"));
+  CHECK(Mentions(RefusalMessage(R"({"vllm_cpp":{"expert_stream":{"slots":0}}})"),
+                 "\"vllm_cpp.expert_stream.slots\" must be positive (got 0)"));
 }
 
 TEST_CASE("residency config: the MIRRORED offload config is untouched by the extension") {
@@ -281,11 +384,12 @@ TEST_CASE("residency config: each knob's own resolver keeps its own env name and
   CHECK(vllm::ResolveExpertStreamSlots() == 64);
   CHECK(vllm::ResolveExpertStreamSlotBytes(12582912) == 12582912);
 
-  // Now the config, which must reach every one of them. The reset is REQUIRED and
-  // is itself part of the contract: the resolves above latched, and installing
-  // after a latch throws. In production the loader installs first and nothing has
-  // resolved yet; a test that walks the phases in the other order has to clear the
-  // latch between them, exactly as it would have to clear a process boundary.
+  // Now the config, which must reach every one of them. Installing after those
+  // resolves is LEGAL and that is itself part of the contract: not one of them
+  // latches anything. `GgufLoadPolicy::FromEnv()` is called per load, the prefault
+  // site no longer caches, and the two sizes are frozen by the slot STORE being
+  // built rather than by being read. The reset below only clears the installed
+  // document so the assertions start from a known state.
   vllm::ResetWeightResidencyConfigForTesting();
   vllm::WeightResidencyConfig cfg;
   cfg.mmap = true;
@@ -343,7 +447,58 @@ TEST_CASE("residency config: the expert-stream FIRST-CHARACTER env rule survives
   CHECK(vllm::ExpertStreamRequestedFrom("1", false) == true);
 }
 
-TEST_CASE("residency config: install is readable, and a LATE non-empty install throws") {
+TEST_CASE("residency config: an override is reported only when it would WIN") {
+  ResidencyFixture fx;
+  ::unsetenv("VT_GGUF_MMAP");
+  ::unsetenv("VT_MOE_EXPERT_STREAM_SLOTS");
+
+  vllm::WeightResidencyConfig cfg;
+  cfg.mmap = true;
+  cfg.expert_stream_slots = 8000;
+  // Installed as well as described, so the report below can be checked against what
+  // the resolver actually does with the same variable.
+  vllm::SetWeightResidencyConfig(cfg);
+
+  // Nothing exported: nothing shadowed. This is the line the overwhelming majority
+  // of runs never print.
+  CHECK(cfg.DescribeEnvOverrides().empty());
+
+  // A BOOLEAN takes any value, so presence is exact.
+  ::setenv("VT_GGUF_MMAP", "0", 1);
+  CHECK(Mentions(cfg.DescribeEnvOverrides(), "VT_GGUF_MMAP (mmap)"));
+  ::unsetenv("VT_GGUF_MMAP");
+
+  // A COUNT does not. Under the tolerant parse the existing readers have always
+  // used, an empty, garbage or non-positive value falls THROUGH to the config, so it
+  // overrides NOTHING and announcing it sends the operator after a line the resolver
+  // ignores. Each of these is checked against the resolver in the same breath, so
+  // the report and the resolution cannot drift.
+  for (const char* junk : {"banana", "0", "-5", ""}) {
+    CAPTURE(junk);
+    ::setenv("VT_MOE_EXPERT_STREAM_SLOTS", junk, 1);
+    // The resolver keeps the CONFIG's value, so the variable overrode nothing...
+    CHECK(vllm::ResolveExpertStreamSlots() == 8000);
+    // ...and the report says nothing.
+    CHECK(cfg.DescribeEnvOverrides().empty());
+  }
+
+  // ...and a value that DOES win is reported, by the same predicate.
+  ::setenv("VT_MOE_EXPERT_STREAM_SLOTS", "128", 1);
+  CHECK(vllm::ResolveExpertStreamSlots() == 128);
+  CHECK(Mentions(cfg.DescribeEnvOverrides(),
+                 "VT_MOE_EXPERT_STREAM_SLOTS (expert_stream_slots)"));
+  ::unsetenv("VT_MOE_EXPERT_STREAM_SLOTS");
+
+  // A variable that shadows a field the document did NOT set is not an override
+  // either: there is nothing for it to override.
+  vllm::WeightResidencyConfig only_mmap;
+  only_mmap.mmap = true;
+  ::setenv("VT_MOE_EXPERT_STREAM_SLOTS", "128", 1);
+  CHECK(only_mmap.DescribeEnvOverrides().empty());
+  ::unsetenv("VT_MOE_EXPERT_STREAM_SLOTS");
+}
+
+TEST_CASE("residency config: install is readable, and a LATE install of a LATCHED knob throws") {
   ResidencyFixture fx;
 
   CHECK(vllm::ActiveWeightResidencyConfig().empty());
@@ -356,23 +511,43 @@ TEST_CASE("residency config: install is readable, and a LATE non-empty install t
   CHECK(vllm::ActiveWeightResidencyConfig() == cfg);
   CHECK_FALSE(vllm::WeightResidencyLatched());
 
-  // The first resolve latches. Everything that consumes these knobs reads them
-  // through a function-local static, so from here the process's answers are fixed.
-  CHECK(vllm::ResolveResidencyBool(
-            "VT_RESIDENCY_TEST_BOOL",
-            vllm::ActiveWeightResidencyConfig().expert_stream, false) == true);
+  // Resolving the STREAMING knob latches, because that answer is cached in a
+  // function-local static and it decides both whether an ~18 GiB slot store is
+  // built and whether the grouped-MoE path is disabled. Reading it through the
+  // production resolver is what marks the latch, so this is not a test hook.
+  CHECK(vllm::ResolveExpertStreamRequested() == true);
+  CHECK(vllm::WeightResidencyLatched(vllm::ResidencyLatch::kExpertStream));
   CHECK(vllm::WeightResidencyLatched());
+  // The GEOMETRY is a separate latch: the store is built once per process, and
+  // nothing is frozen until it is.
+  CHECK_FALSE(
+      vllm::WeightResidencyLatched(vllm::ResidencyLatch::kExpertStreamGeometry));
 
-  // A DIFFERENT non-empty config afterwards cannot be honoured, so it throws
-  // instead of being recorded and ignored.
+  // A config that would CHANGE the latched answer cannot be honoured, so it throws
+  // instead of being recorded and ignored, and the message names the field.
   vllm::WeightResidencyConfig later;
   later.expert_stream = false;
   CHECK_THROWS_AS(vllm::SetWeightResidencyConfig(later), std::logic_error);
   CHECK(vllm::ActiveWeightResidencyConfig() == cfg);
+  try {
+    vllm::SetWeightResidencyConfig(later);
+    FAIL("a late expert_stream change must throw");
+  } catch (const std::logic_error& e) {
+    CHECK(Mentions(e.what(), "expert_stream"));
+  }
+
+  // But a knob that latched NOTHING is still settable — this is the two-model
+  // process the coarse check used to fail. `mmap` and `prefault` are resolved per
+  // load, so a second engine may change them even after streaming latched.
+  vllm::WeightResidencyConfig mmap_too = cfg;
+  mmap_too.mmap = true;
+  mmap_too.prefault = false;
+  CHECK_NOTHROW(vllm::SetWeightResidencyConfig(mmap_too));
+  CHECK(vllm::ActiveWeightResidencyConfig() == mmap_too);
 
   // Re-installing the SAME config is fine — that is what a process loading two
   // engines with one configuration does.
-  CHECK_NOTHROW(vllm::SetWeightResidencyConfig(cfg));
+  CHECK_NOTHROW(vllm::SetWeightResidencyConfig(mmap_too));
 
   // And an EMPTY install is always fine: it is the no-op every default load
   // performs, and refusing it would break every engine that has no config.
@@ -381,24 +556,62 @@ TEST_CASE("residency config: install is readable, and a LATE non-empty install t
   // process carries no residency config of its own, and clearing the first one's
   // would change what the expert slot store reads — it is built lazily, on the
   // first slice taken, which can be long after a second engine loaded.
-  CHECK(vllm::ActiveWeightResidencyConfig() == cfg);
+  CHECK(vllm::ActiveWeightResidencyConfig() == mmap_too);
 }
 
-TEST_CASE("residency config: a latch caused by nothing but the default path still allows an install") {
+TEST_CASE("residency config: the SLOT GEOMETRY latches when the store is built, and only then") {
   ResidencyFixture fx;
 
-  // The ordering hazard in the other direction. A resolve with no config
-  // installed latches too — that is what makes a later install dangerous — but
-  // the FIRST engine in a process must still be able to install, so the check
-  // has to be about a CHANGE, not about the latch alone.
-  CHECK(vllm::ResolveResidencyBool("VT_RESIDENCY_TEST_BOOL", std::nullopt,
-                                   false) == false);
-  CHECK(vllm::WeightResidencyLatched());
+  // Reading the two sizes freezes nothing. The store does, and it reports what it
+  // was built with — which is the only observable the sizes have.
+  CHECK(vllm::ResolveExpertStreamSlots() == 64);
+  CHECK(vllm::ResolveExpertStreamSlotBytes(12582912) == 12582912);
+  CHECK_FALSE(
+      vllm::WeightResidencyLatched(vllm::ResidencyLatch::kExpertStreamGeometry));
+
+  vllm::WeightResidencyConfig sizes;
+  sizes.expert_stream_slots = 8000;
+  CHECK_NOTHROW(vllm::SetWeightResidencyConfig(sizes));
+  CHECK(vllm::ResolveExpertStreamSlots() == 8000);
+
+  // The store's constructor reports the geometry it used. From here the reservation
+  // exists and its size cannot change.
+  vllm::NoteExpertStreamGeometry(8000, 12582912);
+  CHECK(vllm::WeightResidencyLatched(vllm::ResidencyLatch::kExpertStreamGeometry));
+  CHECK(vllm::BuiltExpertStreamGeometry().slots == 8000);
+
+  vllm::WeightResidencyConfig resize;
+  resize.expert_stream_slots = 96;
+  CHECK_THROWS_AS(vllm::SetWeightResidencyConfig(resize), std::logic_error);
+
+  // ...while mmap, which the geometry does not freeze, still installs.
+  vllm::WeightResidencyConfig mmap_only = sizes;
+  mmap_only.mmap = true;
+  CHECK_NOTHROW(vllm::SetWeightResidencyConfig(mmap_only));
+  CHECK(vllm::ActiveWeightResidencyConfig() == mmap_only);
+}
+
+TEST_CASE("residency config: reading mmap or prefault latches NOTHING, so a second engine may set them") {
+  ResidencyFixture fx;
+  ::unsetenv("VT_GGUF_MMAP");
+  ::unsetenv("VT_GGUF_PREFAULT");
+
+  // THE CASE THE COARSE LATCH FAILED. The first pass marked a process-wide latch
+  // inside the shared resolvers, so ANY resolve — including the `GgufLoadPolicy`
+  // read that every GGUF load performs — refused every later non-empty install.
+  // Measured through the public ABI at the time: load model A with no residency
+  // config, then load model B carrying `vllm_cpp`, and B could not load. Neither of
+  // these two knobs freezes anything, so neither may block.
+  CHECK(vllm::ResolveGgufMmap(/*builtin_default=*/true) == true);
+  CHECK(vllm::ResolveGgufPrefault() == true);
+  CHECK_FALSE(vllm::WeightResidencyLatched());
 
   vllm::WeightResidencyConfig cfg;
-  cfg.mmap = true;
-  // It DOES throw, and that is the point: the mmap decision for this process was
-  // already taken. A silent accept here is how an operator ends up reading a
-  // config the engine never used.
-  CHECK_THROWS_AS(vllm::SetWeightResidencyConfig(cfg), std::logic_error);
+  cfg.mmap = false;
+  cfg.prefault = false;
+  CHECK_NOTHROW(vllm::SetWeightResidencyConfig(cfg));
+  // And the new document is what the next load reads, which is the whole reason
+  // accepting it is correct rather than merely permissive.
+  CHECK(vllm::ResolveGgufMmap(/*builtin_default=*/true) == false);
+  CHECK(vllm::ResolveGgufPrefault() == false);
 }

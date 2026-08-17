@@ -1260,11 +1260,14 @@ std::unique_ptr<LoadedEngine> LoadedEngine::FromModelDir(
   //
   // The ordering is the whole requirement, not tidiness. Each knob this config
   // feeds (`VT_GGUF_MMAP`, `VT_GGUF_PREFAULT`, `VT_MOE_EXPERT_STREAM` and its two
-  // sizes) is read during weight load, and the expert-stream decision is cached in
-  // a function-local static that latches on first use. A config installed after
-  // that point would be silently ignored, which is why
-  // `SetWeightResidencyConfig` throws on a late non-empty install rather than
-  // accepting one. It is placed ahead of `CreateWeightOffloader` deliberately:
+  // sizes) is read during weight load, and two of them cannot be taken back: the
+  // expert-stream decision is cached in a function-local static, and the slot
+  // store's geometry is fixed when the store is built. A config that arrived after
+  // either would be silently ignored, which is why `SetWeightResidencyConfig`
+  // throws on a late CHANGE to one of those fields rather than accepting it. (It
+  // accepts a late `mmap` or `prefault`, which resolve per load — a second engine
+  // in one process is legal.) It is placed ahead of `CreateWeightOffloader`
+  // deliberately:
   // that call can THROW for a configured-but-unwired backend, and a document
   // carrying both tiers must still have installed its residency half first.
   //
@@ -1273,20 +1276,28 @@ std::unique_ptr<LoadedEngine> LoadedEngine::FromModelDir(
   if (params.weight_residency.has_value() &&
       !params.weight_residency->empty()) {
     vllm::SetWeightResidencyConfig(*params.weight_residency);
-    // ONE line, naming what was installed. Also names any environment variable
-    // that SHADOWS a field of it: the environment deliberately wins (those
-    // variables exist so a benchmark arm is switchable without a restart), and a
-    // document silently overridden by something exported weeks ago is the one way
-    // that precedence hurts. It reports the variable's PRESENCE and not a resolved
-    // value, because resolving here would latch every knob ahead of the load.
+    // ONE line, naming THE DOCUMENT THAT WAS INSTALLED — the fields the operator
+    // set, not the values the engine will resolve. The two differ exactly when a
+    // variable overrides the document, which is why the second line exists: it
+    // names every variable that would WIN over a field of it, by variable and by
+    // field. The environment deliberately wins (those variables exist so a
+    // benchmark arm is switchable without a restart), and a document silently
+    // overridden by something exported weeks ago is the one way that precedence
+    // hurts.
     //
-    // IT READS BACK THE INSTALLED CONFIG, not `params`. That is the difference
-    // between a line that reports what the engine will use and a line that reports
-    // what somebody asked for. Measured: with the line printing from `params`, the
-    // reachability mutation — deleting the `SetWeightResidencyConfig` call above —
-    // left the server-level suite GREEN, because the log and the install were
-    // independent statements. Reading the global back makes the line evidence.
-    const vllm::WeightResidencyConfig& installed =
+    // It cannot print RESOLVED values, and that is a constraint rather than a
+    // shortcut: every knob resolves lazily during weight load, and the streaming
+    // answer is cached on first read, so resolving here would move that decision
+    // ahead of the load — the exact ordering this block exists to hold. So an
+    // operator reading `expert_stream=on` beside `VT_MOE_EXPERT_STREAM (...)
+    // OVERRIDES` is being told the document said on and the variable decides.
+    //
+    // IT READS BACK THE INSTALLED GLOBAL, not `params`, and that is what makes the
+    // line evidence that the install RAN. Measured: with the line printing from
+    // `params`, the reachability mutation — deleting the `SetWeightResidencyConfig`
+    // call above — left the server-level suite GREEN, because the log and the
+    // install were independent statements.
+    const vllm::WeightResidencyConfig installed =
         vllm::ActiveWeightResidencyConfig();
     if (!installed.empty()) {
       std::cerr << "engine: weight residency (offload_config vllm_cpp): "

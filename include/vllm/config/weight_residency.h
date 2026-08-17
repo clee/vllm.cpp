@@ -15,7 +15,9 @@
 // the SAME document `--offload-config` already carries, which keeps one
 // user-facing flag for one user-facing concept while leaving the mirrored fields
 // byte-identical. `parse_offload_config_json` looks its three keys up by name
-// and never enumerates the document, so a `vllm_cpp` sibling is invisible to it.
+// and never enumerates the document, so a `vllm_cpp` sibling is invisible to it —
+// and, because the same tolerance would swallow a TYPO, this parser enumerates the
+// whole document instead of only its own half (see the parser's comment below).
 //
 // THE SCHEMA:
 //
@@ -42,16 +44,31 @@
 // and it is the thing an operator flips while watching a run. Recorded so a
 // later reader sees a decision rather than an omission.
 //
-// THE LATCH, which is the one real hazard here. Every knob below is read through
-// a function-local static in the code that consumes it
-// (`Qwen35ExpertStreamRequested`, `PrefaultBorrowedSpan`'s `enabled`, the
-// `Qwen35ExpertStream` constructor's one-shot store), so the FIRST read decides
-// the process's answer forever. A config installed after that first read would
-// not merely be late, it would be SILENTLY ignored — the invisible-fallback
-// shape this tree refuses everywhere else. So `Resolve*` records that a decision
-// was latched and `SetWeightResidencyConfig` THROWS when a non-empty config
-// arrives afterwards. Install at `LoadedEngine::FromModelDir`, in the same block
-// that installs the weight offloader, which is already before any weight I/O.
+// THE LATCH, which is the one real hazard here — and it covers TWO of the five
+// knobs, not all five. What genuinely freezes:
+//
+//   * `expert_stream`, because `Qwen35ExpertStreamRequested` caches the answer in a
+//     function-local static. It decides both whether an ~18 GiB slot store is built
+//     and whether the default-on grouped-MoE path is disabled, and those two must
+//     not be able to disagree later in one process.
+//   * `expert_stream.slots` and `.slot_bytes`, from the moment the slot STORE is
+//     built: the reservation is process-lifetime and cannot be resized. Reading the
+//     two sizes freezes nothing; building the store does.
+//
+// What does NOT freeze: `mmap`, because `GgufLoadPolicy::FromEnv()` is called per
+// load and always has been, and `prefault`, because this row deliberately removed
+// that site's function-local static (see `ResolveGgufPrefault` below). A second
+// engine in one process may therefore still set either of them.
+//
+// So the refusal is scoped to what it can actually justify. `SetWeightResidencyConfig`
+// THROWS only when an incoming config would CHANGE a field that a taken decision has
+// already fixed; an equal re-install, an empty install, and a document touching only
+// the unlatched knobs are all accepted. The first shape of this check marked one
+// process-wide flag inside the shared resolvers, which made an ordinary first load
+// refuse a second engine's whole document — a hard failure on a legal load, for a
+// reason that was untrue for two of the five knobs (#1122 M1). Install at
+// `LoadedEngine::FromModelDir`, in the same block that installs the weight
+// offloader, which is already before any weight I/O.
 #ifndef VLLM_CONFIG_WEIGHT_RESIDENCY_H_
 #define VLLM_CONFIG_WEIGHT_RESIDENCY_H_
 
@@ -99,16 +116,17 @@ struct WeightResidencyConfig {
   // an empty string for an empty config.
   std::string Describe() const;
 
-  // The environment variables that are SET and that shadow a field this config
-  // sets, as `VT_NAME (field)` pairs; empty when nothing is shadowed.
+  // The environment variables that WOULD WIN over a field this config sets, as
+  // `VT_NAME (field)` pairs; empty when nothing is shadowed.
   //
   // This is the whole mitigation for the env-wins precedence, and it is the one
   // way that precedence hurts: a document silently shadowed by a variable
-  // somebody exported weeks ago. It deliberately reports PRESENCE rather than a
-  // resolved value, because resolving here would latch every knob at install time
-  // and move the latch ahead of the weight load — the exact ordering this header
-  // is careful about. Presence is also the fact the operator is missing; the
-  // value they can read off their own shell.
+  // somebody exported weeks ago. "Would win" and not "is set": for a boolean any
+  // value wins, so presence is exact, but a COUNT variable that is empty, garbage
+  // or non-positive falls THROUGH to the config under the tolerant parse the
+  // existing readers use, so `VT_MOE_EXPERT_STREAM_SLOTS=banana` overrides nothing
+  // and must not be announced as though it did. It calls no `Resolve*` and marks no
+  // latch, which keeps the line ahead of the weight load where it belongs.
   std::string DescribeEnvOverrides() const;
 
   // Field-by-field equality. Used by the install to allow a repeated install of
@@ -129,50 +147,88 @@ struct WeightResidencyConfig {
 // either sub-object, a field of the wrong type, or a non-positive `slots` /
 // `slot_bytes`.
 //
-// The unknown-key refusal is the load-bearing half. `parse_offload_config_json`
-// ignores a key it does not know, which is what lets this extension exist at
-// all — and it is also what would make `{"vllm-cpp":{...}}` or
-// `{"vllm_cpp":{"mmapp":{...}}}` silently do nothing. A typo that quietly
-// disables the tier keeping a 370 GiB model in 119 GB is worse than a startup
-// error, so it is an error. Same polarity as the mirrored parser refusing an
-// unknown `offload_backend`.
+// The unknown-key refusal is the load-bearing half, and it enumerates the WHOLE
+// document, not only the inside of `vllm_cpp`. `parse_offload_config_json` ignores
+// a key it does not know, which is what lets this extension exist at all — and it
+// is also what made `{"vllm-cpp":{...}}` and `{"vllm_cpp":{"mmapp":{...}}}` parse
+// to an empty config and start a server running this tier at its DEFAULTS — mmap
+// residency riding the caller's availability predicate, prefault ON and streaming
+// OFF — and the last two are exactly what the 370 GiB case exists to change, so the
+// operator meets the typo as an out-of-memory kill rather than as an error. The hyphen is the likeliest spelling of
+// all, because every flag around it is hyphenated. A typo that quietly disables the
+// tier keeping a 370 GiB model in 119 GB is worse than a startup error, so it is an
+// error.
+//
+// The four legal top-level keys are `offload_backend`, `uva`, `prefetch` and
+// `vllm_cpp`: the three the mirrored parser reads by name, plus this extension.
+// Refusing the rest is the MIRROR-FAITHFUL polarity rather than a local invention.
+// Upstream has no `--offload-config` flag at the pin — the whole JSON document is
+// vllm.cpp's own, so no upstream-legal document exists to break — and vLLM builds
+// its config dataclasses with `@config`, whose body sets `ConfigDict(extra="forbid")`
+// (vllm/config/utils.py:68-69 @ 555967922). `OffloadConfig` (offload.py:80) and
+// `KVTransferConfig` (kv_transfer.py:22-23) both carry it, so `--kv-transfer-config`,
+// the JSON-document flag next door, refuses an unknown key. This parser closes the document while `parse_offload_config_json` stays a
+// byte-faithful transcription; both read the same string at both entry points.
 WeightResidencyConfig parse_weight_residency_extension_json(
     const std::string& json_text);
 
 // Install the process-global config. Call BEFORE any weight I/O.
 //
-// Throws std::logic_error when a NON-EMPTY config that differs from the
-// installed one arrives after any Resolve* call has already latched a decision,
-// because the latched knobs cannot be changed and honouring the call would be a
-// lie. An empty config, or a re-install of an equal one, is always accepted: the
-// first is the no-op every default load performs, and the second is what lets a
-// process load two engines with the same configuration.
+// Throws std::logic_error when the incoming config would CHANGE a field that a
+// taken decision has already frozen (see THE LATCH above): `expert_stream` once the
+// streaming answer has been read, and the two sizes once the slot store has been
+// built. Honouring such a call would record a configuration the engine is not
+// running. Everything else is accepted — an empty config (the no-op every default
+// load performs), a re-install of an equal one (what lets a process load two engines
+// with one configuration), and a document that touches only `mmap` or `prefault`,
+// neither of which freezes anything.
 void SetWeightResidencyConfig(const WeightResidencyConfig& config);
 
-// The installed config. Empty until something installs one.
-const WeightResidencyConfig& ActiveWeightResidencyConfig();
+// The installed config, BY VALUE. Empty until something installs one. A reference
+// would be read after the lock was released, which is an unsynchronised read behind
+// a lock that looks like it covers one; the copy is five optionals.
+WeightResidencyConfig ActiveWeightResidencyConfig();
 
-// True once any Resolve* call has read the config, i.e. once a residency
-// decision has been latched somewhere in the process.
+// The decisions that genuinely freeze, one enumerator each. There is no `kMmap` or
+// `kPrefault`, and their absence is the contract: those two resolve per load.
+enum class ResidencyLatch {
+  // `Qwen35ExpertStreamRequested`'s function-local static, via
+  // `ResolveExpertStreamRequested`.
+  kExpertStream,
+  // The slot store's `slots x slot_bytes` reservation, via
+  // `NoteExpertStreamGeometry` when the store is built.
+  kExpertStreamGeometry,
+};
+
+// True once the named decision has been taken in this process.
+bool WeightResidencyLatched(ResidencyLatch knob);
+
+// True once ANY of them has.
 bool WeightResidencyLatched();
 
-// Drop the installed config AND the latch. Tests only: the latch is
-// process-wide, so a suite with more than one case needs to be able to clear it.
+// Drop the installed config AND both latches. Tests only: a latch is process-wide,
+// so a suite with more than one case needs to be able to clear it. It cannot undo
+// the function-local static inside `ResolveExpertStreamRequested`, which is why the
+// value that resolver returns is observable exactly once per process and has a test
+// binary of its own.
 void ResetWeightResidencyConfigForTesting();
 
 // env var (if set) > `configured` (if set) > `builtin_default`.
 //
 // The env var's value is read with the tree's existing polarity: "", "0",
-// "false" and "off" are FALSE, anything else is TRUE. Marks the config latched.
+// "false" and "off" are FALSE, anything else is TRUE. Marks NO latch: a latch
+// belongs to the site that caches an answer, not to reading a variable.
 bool ResolveResidencyBool(const char* env_name, std::optional<bool> configured,
                           bool builtin_default);
 
-// The integer form, same precedence. A non-positive or unparseable ENV value is
-// ignored and falls through to the config, then to `builtin_default` — the
-// tolerant parsing the existing knobs already document, kept byte-for-byte so
-// this row changes no behaviour for an environment-only run. A non-positive
-// CONFIG value cannot reach here: the parser refuses it at startup, where the
-// operator can still see the message.
+// The integer form, same precedence, and the same absence of a latch. A
+// non-positive or unparseable ENV value is ignored and falls through to the config,
+// then to `builtin_default` — the tolerant parsing the existing knobs already
+// document, kept byte-for-byte so this row changes no behaviour for an
+// environment-only run. Such a value is therefore NOT an override, which is why
+// `DescribeEnvOverrides` asks the same predicate rather than reporting presence. A
+// non-positive CONFIG value cannot reach here: the parser refuses it at startup,
+// where the operator can still see the message.
 int64_t ResolveResidencyCount(const char* env_name,
                               std::optional<int64_t> configured,
                               int64_t builtin_default);
@@ -186,7 +242,7 @@ int64_t ResolveResidencyCount(const char* env_name,
 // First, the polarities are NOT the same and one of them is deliberately odd.
 // `VT_GGUF_MMAP` and `VT_GGUF_PREFAULT` compare the whole value against "", "0",
 // "false" and "off" (the tree's `EnvOn`,
-// gguf_keep_quant.cpp:60-65). `VT_MOE_EXPERT_STREAM` examines only the FIRST
+// gguf_keep_quant.cpp:61-66). `VT_MOE_EXPERT_STREAM` examines only the FIRST
 // CHARACTER — `v[0] != '0' && v[0] != '\0'` — so `VT_MOE_EXPERT_STREAM=false`
 // reads as ON, which docs/ENVIRONMENT.md states explicitly. That is documented
 // behaviour, not an accident, so it is preserved rather than tidied: a row whose
