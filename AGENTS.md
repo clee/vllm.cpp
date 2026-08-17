@@ -424,7 +424,9 @@ each a reason to get the client or to report the controller down. None of them
 turns a fleet device into a box you may reach by `ssh` plus `flock`, because the
 fleet cannot see that mutex. `thor:gpu0` read `unknown (no contact 1m0s)` on
 2026-08-17, so a controller that loses contact is a live state and not a
-hypothetical.
+hypothetical. The list of three is a lower bound and never an upper one. A
+device that `rc devices` reports is a fleet device even when this file has not
+caught up with the fleet.
 
 **On a GPU that is not a fleet device, take the file mutex
 `${GPU_LOCK:-$HOME/gpu.lock}`.** The rule is conditional because the hosts are

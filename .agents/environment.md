@@ -23,7 +23,9 @@ condition is the DEVICE rather than the shell you are typing in. `dgx:gpu0`,
 `thor:gpu0` and `orin:gpu0` are the fleet devices, so a lease is the required
 path to each of them and it replaces the file mutex as the default. The three
 names are listed in both files so that membership stays checkable when the
-client is not at hand. On a GPU that is not one of them, take
+client is not at hand, and they are a lower bound rather than an upper one: a
+device that `rc devices` reports is a fleet device even when this list has not
+caught up. On a GPU that is not one of them, take
 `${GPU_LOCK:-$HOME/gpu.lock}` as before.
 
 `rc devices` lists the fleet when your shell has the client AND the controller
