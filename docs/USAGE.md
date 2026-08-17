@@ -3315,6 +3315,29 @@ engine still holds ONE DiT — upstream does too, since both of its
 re-materializes the adapter's target tensors at the phase boundary instead of
 keeping a second weight set.
 
+**What that costs you, per render.** Moving one DiT between the two states is
+paid in wall-clock rather than in memory: a two-stage render does **two**
+rebinds, one at each phase boundary, and each re-opens `--lora` and reads every
+`lora_A`/`lora_B` factor pair before re-materializing the tensors they target.
+The adapter above is 8,899,889,568 bytes, so this is not free, and the DiT is
+left in stage 2's state so the next render pays the same two. **No number is
+published for it** — this recipe is gated on reduced fixtures and nothing has
+timed the boundary on real weights. Upstream spends memory here instead, holding
+two `DiffusionStage`s over one checkpoint, which does not fit one GB10.
+
+**The adapter `--lora` wants**, pinned by content rather than by name, because a
+LoRA repository can be re-quantized in place under an unchanged filename:
+`ltx-2.5-22b-distilled-lora-450-bf16.safetensors`, 8,899,889,568 bytes, 3320
+BF16 tensors forming 1660 `lora_A`/`lora_B` pairs,
+`__metadata__` `lora_rank` and `lora_alpha` both `450` and `model_version`
+`2.5.0`. This is upstream's `distilled_lora`, the one `--distilled-lora`
+(`required=True`) names. It is **not** the IC-LoRA
+(`ltx-2.5-22b-ic-lora-pixel-spatial-upscaler-x2-1.0.safetensors`, 327,322,640
+bytes), which is a different adapter for a different arm. Nothing here checks
+which one you passed: `requires_distilled_lora` refuses a load carrying **no**
+`--lora`, and that is the whole of it, so the two are told apart by the header
+facts above and not by the engine.
+
 The guider flags (`--video-cfg-guidance-scale` and the rest, spelled as the
 `video_cfg_guidance_scale` extras over the C API) reach stage 1 and are ignored
 by stage 2, which runs no guider at all — unlike `distilled_two_stage` and
