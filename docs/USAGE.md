@@ -3103,11 +3103,12 @@ path itself drives: `--dit` (`--video-dit` on the server) reaches
 `Ltx2LoadTextEncoderFromSafetensors` at `ltx2_video.cpp:1149`. This section
 documents them at the library level, where the gate below runs.
 
-**Nine anchors into `ltx2_video.cpp` and `ltx2_loader.cpp` on this page were
-wrong, and the nine that replaced them carry `@ b5756ea8c`** — the first anchor
-in each affected passage is pinned, and the bare `:NNN` beside it belongs to the
-same file at the same revision. Nothing else on this page is pinned, so read an
-unpinned coordinate as unverified.
+**Ten coordinates into `ltx2_video.cpp` and `ltx2_loader.cpp` were wrong, at
+eleven citation sites on this page** — `ltx2_video.cpp:893` was cited twice.
+Five of the replacements carry `@ b5756ea8c`, one per affected passage; the bare
+`:NNN` beside a pinned one belongs to the same file at the same revision.
+Nothing else on this page is pinned, so read an unpinned coordinate as
+unverified.
 
 They were re-derived on 2026-08-17 from the sentence making each claim rather
 than by reading whatever sat at the cited line, and they were off by 40 to 2200
