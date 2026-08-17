@@ -2701,8 +2701,8 @@ or without the ComfyUI `model.diffusion_model.` prefix. Each family reads its ow
 knobs from `extras`. H3 takes `partition`. LTX-2.5 takes
 `audio_prompt_embeds_path` (the audio stream's conditioning, the twin of the
 seam's `prompt_embeds_path`, which carries the video stream), `pipeline_kind`
-(default `distilled_two_stage`; also `one_stage`, `dmd2`, `dfr`, `retake` and
-`t2a_one_stage`), `model_version` (only for a checkpoint that
+(default `distilled_two_stage`; also `one_stage`, `res2s_two_stage`, `dmd2`,
+`dfr`, `retake` and `t2a_one_stage`), `model_version` (only for a checkpoint that
 declares none), `dit_config_path`, `encoder_config_path`,
 `negative_prompt_embeds_path` and `negative_audio_prompt_embeds_path` (the
 negative half of the same fallback, for the unconditional forward),
@@ -3193,13 +3193,14 @@ CHECKPOINT_ROOT=... VLLM_CPP_LTX2_TOWER_E2E=1 \
 
 Recipes resolve on an EXACT `(pipeline_kind, model_version)` pair and refuse
 anything else by name rather than defaulting, because a plausible but wrong sigma
-schedule or guidance scale renders a video instead of failing. **Fifteen** pairs
-resolve, derived from `ResolveLtx2PipelineRecipe` (`ltx2_pipeline.cpp:1288-1333`):
+schedule or guidance scale renders a video instead of failing. **Sixteen** pairs
+resolve, derived from `ResolveLtx2PipelineRecipe`:
 
 | `pipeline_kind` | resolving `model_version` |
 |---|---|
 | `one_stage` | 2, 2.3, 2.4, 2.5 |
 | `distilled_two_stage` | 2, 2.5 |
+| `res2s_two_stage` | **2.5 only** |
 | `dfr` | **2.5 only** |
 | `dmd2` | 2, 2.3 |
 | `retake` | 2, 2.5 |
@@ -3210,8 +3211,54 @@ This list ran to ten until 2026-08-17, omitting `dfr` entirely and all four
 DFR's base stage rests on generated keyframe slots, which need a checkpoint
 declaring `use_keyframes_abs_pos_embedding`, and the 2.0 distilled row predates
 that parameter — so resolving DFR onto it would build a recipe the engine must
-then refuse at load. Refusing at the recipe table names the version instead
-(`ltx2_pipeline.cpp:1306-1313`).
+then refuse at load. Refusing at the recipe table names the version instead.
+
+### `res2s_two_stage`: the high-quality preset, and why it is a sampler
+
+`res2s_two_stage` is `TI2VidTwoStagesHQPipeline`. Against the plain two-stage
+pipeline it changes the SAMPLER on both stages — the `res_2s` second-order
+method instead of Euler — and takes `LTX_2_3_HQ_PARAMS`: 15 steps, STG off,
+video rescale 0.45, cfg 3.0 video / 7.0 audio, modality 3.0. Those are not the
+only differences (stage 1 also loads the distilled LoRA, derives its schedule
+from the stage-1 latent shape, and runs a `GuidedDenoiser` where the plain
+pipeline runs a `FactoryGuidedDenoiser`), so do not read the sampler swap as an
+exhaustive list. It resolves at 2.5 only, because that preset is a plain
+constant upstream with no per-generation lineage to spread it over.
+
+Fifteen steps is not fewer forwards, and it is not even 15 model calls. The
+`res_2s` loop evaluates the denoiser TWICE per step — once at the step's sigma
+and once at the geometric mean of that sigma and the next — and once more at a
+terminal sigma the schedule injects. Stage 1's 15 steps is therefore 31 denoiser
+calls, and stage 2's frozen 3-step schedule adds 7, for **38 calls per render**.
+Stage 1 is also GUIDED, so each of its calls is three transformer forwards
+(conditional, unconditional, isolated-modality) against stage 2's one: **100
+transformer forwards** for a full render, where `one_stage` at its own 30-step
+default runs 30 calls. Expect the HQ preset to cost several times the 30-step
+arm and to look better, not to be faster.
+
+That is also why the preset cannot be reached by passing its numbers to another
+kind. `--steps 15` on `one_stage` renders a finished, correctly sized, plausible
+clip at a fraction of the model evaluations the preset was tuned for, and no
+property of the output says so. Ask for the pipeline, not for its step count.
+
+```sh
+ltx2-gen --pipeline-kind res2s_two_stage \
+         --prompt "a cinematic shot of ..." \
+         --height 1088 --width 1920 --frames 121
+```
+
+`pipeline_kind` is a LOAD knob, so this reaches the C API and the server too: a
+server started with `--video-extra pipeline_kind=res2s_two_stage` renders every
+request on the HQ preset.
+
+Three limits, stated rather than left to be found. The stage-2 spatial upsample
+is the same one `distilled_two_stage` uses and carries the same refusal when the
+checkpoint has no latent upsampler. The loop's SDE noise is drawn from this
+port's own generator rather than upstream's seeded `torch.randn`, so a render is
+not bit-comparable with Lightricks' — the same limit the ancestral arm already
+ships with. And stage 1's guidance asks for an isolated-modality pass, which the
+device-resident forward cannot perturb, so this preset is host-only until that
+is closed; both are recorded in `.agents/specs/ltx25-res2s-loop.md`.
 
 ### Retake: regenerating a time window of an existing clip
 
@@ -3469,8 +3516,12 @@ interval does.
 
 Dual-GPU resident FP8 MoE and SharedK-WMMA prefill are controlled via
 ENVIRONMENT.md (`VT_GEMMA4_RESIDENT_*`, `VT_ATTN_*`). Defaults stay safe off RDNA4.
-This PR does **not** restructure the Gemma-4 layer loop or enable decode hipGraph
-(those stay lab-only until a CUDA token-exact gate can land them).
+GetBlas keeps two per-thread hipBLAS handles (`tls_slots[2]`, device 1 → slot 1)
+so a 0→1 hop does not destroy GPU0's handle. `ProductGetBlasHandle` is the
+test accessor for that file-local `GetBlas`. HIP live probe is a separate CTest
+target (exit 77 if `HIP_VISIBLE_DEVICES` empty); it enters capture so production `StreamIsCapturing` is load-bearing. No new env. This PR does **not**
+restructure the Gemma-4 layer loop or enable decode hipGraph (those stay lab-only
+until a CUDA token-exact gate can land them).
 
 ## LTX-2.5 text conditioning
 
