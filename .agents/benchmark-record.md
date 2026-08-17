@@ -33,31 +33,61 @@ recorded cause is no longer true, and this is the #775 shape the governing spec
 §5.5 warns about: a pending reason that outlives its own truth and gets
 subtracted by everyone who reads it afterwards.
 
-**What actually blocks the gate is that no CUDA binary can be built for that
-host.** Three paths were checked, and all three are closed:
+**★ THIS ENTRY WAS FIRST WRITTEN WITH A FALSE BLOCKER AND IS CORRECTED IN PLACE.**
+It claimed "no CUDA binary can be built for that host" over three closed paths.
+**Two of those three were wrong**, and the error has one root: *the dgx HOST and
+the `rc` worker CONTAINER are different machines, and host findings were reported
+as container findings.* The correction is kept beside the claim rather than
+substituted for it, because the failure mode is the interesting part.
 
-1. **The host toolchain.** No `nvcc`, no `cmake`, no `g++` since the 14 Aug
-   reimage. Already filed as
-   [#1019](https://github.com/mudler/vllm.cpp/issues/1019), whose title says the
-   dgx profile "mandates a CUDA toolkit and a CUTLASS path that do not exist".
-2. **The `rc` worker container**, which is what `rc run` schedules into. Probed
-   directly: `gcc`, `g++`, `cc`, `cmake`, `ninja`, `make`, `nvcc`, `python3`,
-   `git` and `docker` are all ABSENT, `/usr/include/stdio.h` does not exist, and
-   `getent hosts pypi.org` fails, so it cannot even fetch one. `/workspace` maps
-   to `/usr/local/nas_share/rc` on the host and carries no checkpoint.
-3. **The recorded container build** (`$HOME/a2r/gb10_build.sh`:
-   `sudo -n docker run --runtime=nvidia nvidia/cuda:13.0.1-devel-ubuntu24.04`).
-   This is the only remaining path and it needs the host docker socket. `id` on
-   dgx reports `groups=1002(mudler),900(admin)`, **not `docker`**, so it
-   requires `sudo`, and `sudo docker` is refused by this agent's own permission
-   layer. That last clause is an agent-access fact, not a host fact, and is
-   reported as such rather than filed against the box.
+1. **The host toolchain — this part was RIGHT and stands.** Measured on
+   `ssh dgx.casa`: `nvcc ABSENT   cmake ABSENT   g++ ABSENT   ninja ABSENT`.
+   Already filed as [#1019](https://github.com/mudler/vllm.cpp/issues/1019),
+   whose title says the dgx profile "mandates a CUDA toolkit and a CUTLASS path
+   that do not exist". **But the host is not where work runs**, so this never
+   blocked the gate the way this entry first said.
+2. **The `rc` worker container — the original claim here was FALSE.** It said
+   `gcc`, `g++`, `cc`, `cmake`, `ninja`, `make`, `python3`, `git` were all
+   absent, that `/usr/include/stdio.h` did not exist, and that DNS failed.
+   Measured inside `rc run`, the container is Ubuntu 24.04, runs as **uid 0**,
+   and carries `gcc`, `g++`, `cmake`, `ninja`, `make`, `python3`, `pip3`, `git`
+   and `apt`; `nvidia-smi` reports the GB10; DNS resolves and
+   `developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/arm64/` answers
+   `HTTP/2 200`. **Only `nvcc` is genuinely absent**, and apt's own
+   `nvidia-cuda-toolkit` is 12.0.140, too old for sm_121a (GB10 needs 12.8+/13.x)
+   — so the toolkit is installed from the NVIDIA repo, which is a step, not a
+   wall.
+3. **`docker` and `sudo` are NOT NEEDED AT ALL, and asking for them was the
+   error compounding.** You are root in the container; the recorded
+   `sudo -n docker run …` recipe in `$HOME/a2r/gb10_build.sh` belongs to the
+   pre-`rc` era.
+
+**The lesson, stated plainly for the next reader:** a probe that runs somewhere
+other than where the work will run answers a question nobody asked. Re-derive
+inside `rc run`, and do not let a host `ssh` result stand in for it.
 
 **What WAS verified on the gate host**, all of it cheap and under short leases:
 
-- The checkpoint is present at `/home/mudler/ckpt/nemotron-3.5-lightning-30b-nvfp4`
-  (**not** `$CHECKPOINT_ROOT=/usr/local/nas_share/checkpoints`, which does not
-  exist there; there are no cifs/nfs mounts at all).
+- **The checkpoint is present under BOTH paths, and `.env` is CORRECT.** An
+  earlier revision of this entry claimed the opposite — that only
+  `/home/mudler/ckpt/...` held it and that "there are no cifs/nfs mounts at
+  all". `findmnt` on the host says otherwise:
+
+  ```
+  /usr/local/nas_share //192.168.68.102/Data cifs rw,relatime,vers=3.1.1,
+    cache=strict,username=anonymous,uid=0,forceuid,gid=10001,forcegid,
+    addr=192.168.68.102,file_mode=0664,dir_mode=0775,iocharset=utf8,soft,nounix
+  ```
+
+  and the checkpoint resolves at
+  `/usr/local/nas_share/checkpoints/nemotron-3.5-lightning-30b-nvfp4`,
+  `/usr/local/nas_share/checkpoints/nemotron-3.5-lightning-30b-gguf` and
+  `/home/mudler/ckpt/nemotron-3.5-lightning-30b-nvfp4`. So
+  `CHECKPOINT_ROOT=/usr/local/nas_share/checkpoints` in `.env` is right and must
+  not be "fixed".
+- **Whether the container can SEE that path is still OPEN.** No probe has
+  answered it: the one queued to do so was killed to free the queue. Nothing is
+  claimed here either way, and step 6 of the A3 job is what will answer it.
 - **21 583 809 748 bytes**, 52 safetensors shards.
 - The revision is **verified, not copied**:
   `model-00001-of-00052.safetensors` hashes to

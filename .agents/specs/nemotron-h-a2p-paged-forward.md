@@ -870,15 +870,26 @@ nobody routes this architecture through a block that ropes.
   (2026-08-17): §10 records contention — `dgx.casa` at loadavg 211 with 3 of
   119 GB — and the box now answers at **loadavg 0.36 with 115 of 119 GB
   available and the GPU at 0%**, with the checkpoint present and its revision
-  verified against its own LFS record. The gate is blocked on something else
-  entirely: **there is no CUDA toolchain to build a gate binary with.** The host
-  carries no `nvcc` and no `cmake` since the 14 Aug reimage
-  ([#1019](https://github.com/mudler/vllm.cpp/issues/1019)), and the `rc` worker
-  container it schedules through carries no compiler, no libc headers and no
-  network egress, so the recorded recipe's `docker run nvidia/cuda:*-devel` on
-  the host is the only remaining path. This is the #775 shape the governing spec
-  §5.5 warns about — a pending cause outliving its own truth — so it is
-  corrected here rather than re-quoted.
+  verified against its own LFS record. So the contention cause is dead; this is
+  the #775 shape the governing spec §5.5 warns about — a pending cause outliving
+  its own truth — and it is corrected rather than re-quoted.
+
+  **What replaced it was ALSO wrong for one revision, and that matters more.**
+  This bullet briefly claimed "there is no CUDA toolchain to build a gate binary
+  with", citing an `rc` worker container with no compiler, no libc headers and no
+  egress. **That was a host measurement reported as a container measurement.**
+  Inside `rc run` the container is Ubuntu 24.04 running as uid 0, with `gcc`,
+  `g++`, `cmake`, `ninja`, `make`, `python3`, `git` and `apt` all present, the
+  GB10 visible to `nvidia-smi`, and working DNS. **Only `nvcc` is absent**, and
+  apt's `nvidia-cuda-toolkit` 12.0.140 is too old for sm_121a, so CUDA 13.x is
+  installed from `developer.download.nvidia.com/…/ubuntu2404/arm64` — a step, not
+  a wall. No `docker` and no `sudo` are involved. The host toolchain finding
+  ([#1019](https://github.com/mudler/vllm.cpp/issues/1019)) is real but does not
+  gate anything, because the host is not where work runs.
+
+  **What is actually outstanding** is narrower: `nvcc` must be installed into the
+  build container, and whether that container can see
+  `$CHECKPOINT_ROOT` is an OPEN question no probe has yet answered.
 - **`examples/nemotron_h_gen`** (§3.6) and the `docs/USAGE.md` weights block that
   rides with it — **both LANDED 2026-08-17** by `MODEL-NEMOTRON-H-ABI-A3-E2E`.
   The reason recorded here for deferring them — that shipping a client for a
