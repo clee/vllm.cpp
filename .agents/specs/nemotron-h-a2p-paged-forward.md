@@ -863,9 +863,15 @@ nobody routes this architecture through a block that ropes.
 
 ## 11. Owed
 
-- **The §5.4 A3 end-to-end token gate**, and the §5.7 sm_121a leg with it. Owned
-  by this row, tracked on [#810](https://github.com/mudler/vllm.cpp/issues/810).
-  Nothing about the released checkpoint is claimed until it runs. **The recorded
+- **The §5.4 A3 end-to-end token gate HAS RUN and FAILED: 6/96 tokens,
+  `GATE_RC=1`** (2026-08-17, sm_121a leg included,
+  [#1157](https://github.com/mudler/vllm.cpp/issues/1157)). Token 0 is correct
+  on all three prompts and decode then collapses onto a repeated id, which is
+  this unit's state carry rather than drift. **§10's "one measured surprise" is
+  the direct cause of it going undetected**: the synthetic fixture could not see
+  the recurrent carry, and the two numeric cases added to compensate were not
+  sufficient, because the CPU gate is 12/12 green at the commit that produces
+  this. A2-P is NOT done. Repair is owed to a fresh implementer. **The recorded
   PENDING CAUSE IS NO LONGER TRUE and was re-measured rather than inherited**
   (2026-08-17): §10 records contention — `dgx.casa` at loadavg 211 with 3 of
   119 GB — and the box now answers at **loadavg 0.36 with 115 of 119 GB

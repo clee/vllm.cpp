@@ -19,6 +19,81 @@ from relative link targets repointed for this file's location.
 
 # Benchmarks
 
+## MODEL-NEMOTRON-H-ABI-A3-E2E — the A3 token gate RAN on real weights, and FAILED 6/96 (2026-08-17, `row/MODEL-NEMOTRON-H-ABI-A3-E2E`, dgx.casa GB10 sm_121a, #810, #1157)
+
+**This supersedes the entry below it, which was written while the gate could not
+run. The gate has now run. It is a FAIL, recorded as a result.**
+
+`GATE_RC=1`. **6 of 96 tokens match.** Driven entirely through `include/vllm.h`
+(`vllm_engine_load` + `vllm_complete_tokens`) by `examples/nemotron_h_gen`
+against the committed oracle golden.
+
+```
+prompt 0  compared=32 matched=2   got 6993,1046,1317,1048,1032,1050,1050,1050,...
+                                  exp 6993,1046,1256,1010,1784,8961,1307,10787,...
+prompt 1  compared=32 matched=3   got 1032,1058,1048,1050,1010,1050,1050,1050,...
+                                  exp 1032,1048,1044,1032,1049,1044,1032,1049,...
+prompt 2  compared=32 matched=1   got 1349,1010,1032,1032,1032,1032,1050,1050,...
+                                  exp 1349,3468,5702,3244,1395,1261,30622,13406,...
+```
+
+**Token 0 is correct on ALL THREE prompts; everything after decays and collapses
+onto the repeated id `1050` by about step 5.** Token 0 comes from prefill. Every
+later token comes from a decode step that must read what the previous step
+wrote. A correct first token followed by convergence onto a fixed point is the
+signature of a broken recurrent carry, not of numeric drift: drift wanders, it
+does not settle on one id and stay.
+
+**The prediction this confirms, written in this row's own documents before the
+run:** the parent spec §6d matched 3/3 FIRST tokens against a forward carrying
+no state at all and warned that is "exactly how little a first token proves".
+This run reproduces 3/3 first tokens and then fails. And
+`nemotron-h-a2p-paged-forward.md` §10 records that on the synthetic fixture the
+token arms could NOT see the recurrent carry — conv and SSM zeroed on every step
+still produced byte-identical output, and P-M1/P-M2/P-M4/P-M9 all survived.
+**The two numeric cases added to compensate were not sufficient: the CPU gate is
+12/12 green at the very commit that produces this.** Green unit gate, wrong
+model — the class works, the capability does not.
+
+**Conditions, none of them degraded.** CUDA 13.3.73 from the `ubuntu2404/sbsa`
+lane; `CFG_RC=0`; `VOID_FLAG=0` with all four cells `ENABLED for [121a]`
+(`cutlass-nvfp4`, `cutlass-fp8`, `marlin-nvfp4`, `fa2` — not `[121]`, not
+DISABLED); `BUILD_RC=0`, `compile_errors=0`, `enospc=0`; binary sha256
+`b2a8f6a986938037d9f17edb5b93550512127e1913d34cfb1c19bcd7e47253ec`.
+
+**The instrument was not mute:** `compared=96` over 3 prompts of width 32,
+`full rows=3, short rows=0` — the expected geometry exactly. A run that compared
+fewer would have exited 4 instead of 1.
+
+**Ungated numbers from the same run, recorded because they were measured, not
+because anything claims them:** engine load **397.0 s**; peak host RAM **43 405
+MB** over 676 samples (well inside 119 GB, so `gpu_memory_utilization`'s
+host-RAM blindness did not bite here); decode ≈**10.3 s/token**, with `lm_head`
+and the FP8 Mamba2 projections still computing on the host.
+
+**Two environment facts this run established, both costly to rediscover:**
+
+- **The `rc` worker container is Ubuntu 24.04 as uid 0 with a full toolchain and
+  network, but NO `nvcc`.** apt's own `nvidia-cuda-toolkit` is 12.0.140, too old
+  for sm_121a. The NVIDIA repo lane is **`ubuntu2404/sbsa`**, NOT
+  `ubuntu2404/arm64`: the arm64 path answers `HTTP/2 200` but is the
+  Jetson/Tegra lane and carries no `cuda-toolkit-13-*` at all. Select
+  `cuda-toolkit-13-<N>` by an anchored pattern — an unanchored "newest
+  `cuda-toolkit-13*`" selects `cuda-toolkit-13-config-common`, which installs
+  cleanly, ships no compiler, and returns 0.
+- **`/workspace` is CIFS and refuses symlinks, so a CMake build directory cannot
+  live there.** A build that compiled the entire tree cleanly
+  (`compile_errors=0`) died on its last step at
+  `cmake_symlink_library libvllm.so.0.0.3 -> Operation not supported`, costing
+  1h33m. Build on the container-local overlay; keep only source and staged CUDA
+  on `/workspace`, which does persist between `rc run` invocations
+  (`WORKSPACE PERSISTED` marker confirmed).
+
+**Repair is owed and is NOT this row's author's**, per the fresh-implementer
+rule: the defect is in `NemotronHPagedForward`'s state carry, and this row wrote
+the driver that found it. Tracked on
+[#1157](https://github.com/mudler/vllm.cpp/issues/1157).
+
 ## MODEL-NEMOTRON-H-ABI-A3-E2E — the A3 token gate did NOT run, and the cause on record was NOT the cause (2026-08-17, `row/MODEL-NEMOTRON-H-ABI-A3-E2E`, base `origin/main` `a6df72777`, #810)
 
 **No number is recorded, on any axis. This entry exists so the pending cause is

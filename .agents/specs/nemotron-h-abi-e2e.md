@@ -1121,34 +1121,35 @@ five malformed-golden shapes each exit 2. That last one is the guard this
 section's own §5.2 is really about — a comparison over too few elements reports
 a perfect score, and here it cannot.
 
-**§5.2's A3 token gate has NOT RUN. Its recorded cause was wrong twice, and both
-corrections are kept here because the second one is a trap this section can save
-the next reader from.**
+**★ §5.2's A3 token gate HAS NOW RUN, ON REAL WEIGHTS, AND IT FAILED: 6/96
+tokens, `GATE_RC=1`** (2026-08-17, dgx.casa GB10 sm_121a,
+[#1157](https://github.com/mudler/vllm.cpp/issues/1157)). Driven entirely
+through `include/vllm.h` by `examples/nemotron_h_gen`.
 
-*First cause, dead:* contention. Re-measured, `dgx.casa` is idle (loadavg 0.36,
-115 of 119 GB available, GPU 0%), the checkpoint is present, and its first shard
-hashes to revision `29f2d174`'s own LFS record.
+**Token 0 is correct on all three prompts; decode then decays and collapses onto
+one repeated id by about step 5.** That is the recurrent carry, not numeric
+drift — drift wanders, it does not settle on a fixed point. Full token streams,
+conditions and ungated numbers are in
+[`benchmark-record.md`](../benchmark-record.md).
 
-*Second cause, also dead:* "nothing can build a gate binary". **That was a HOST
-measurement reported as a CONTAINER measurement, and the two are different
-machines for this purpose.** The host genuinely has no `nvcc`/`cmake` since the
-14 Aug reimage ([#1019](https://github.com/mudler/vllm.cpp/issues/1019)) — but
-the host is not where work runs. Inside `rc run` the worker container is Ubuntu
-24.04 as **uid 0**, carrying `gcc`, `g++`, `cmake`, `ninja`, `make`, `python3`,
-`git`, `apt`, with the GB10 visible and DNS working. **Only `nvcc` is missing**,
-and apt's `nvidia-cuda-toolkit` 12.0.140 is too old for sm_121a, so CUDA 13.x
-comes from `developer.download.nvidia.com/…/ubuntu2404/arm64`. Neither `docker`
-nor `sudo` is involved.
+**This section predicted its own failure and should be read as evidence that the
+prediction was right.** §5.2 says a single-step gate "is structurally blind to
+the entire class of defect A2 introduces", and the parent spec §6d had already
+matched 3/3 FIRST tokens against a forward carrying no state at all. This run
+matched 3/3 first tokens and then failed. The A2-P unit gate is **12/12 green at
+the same commit**, so the CPU arms cannot see this: a green class and a wrong
+capability.
 
-> **Rule this cost two cycles to learn: re-derive every environment fact INSIDE
-> `rc run`.** A probe that runs somewhere other than where the work will run
-> answers a question nobody asked, and it fails toward a confident verdict about
-> the code's environment rather than toward an obvious error.
+The build was not degraded and cannot explain it: CUDA 13.3.73, `CFG_RC=0`,
+`VOID_FLAG=0` with all four cells `ENABLED for [121a]`, `BUILD_RC=0`,
+`compile_errors=0`. The instrument was not mute: `compared=96`, `full rows=3`,
+`short rows=0`.
 
-*What is genuinely outstanding:* install `nvcc` in the build container, and
-whether that container can see `$CHECKPOINT_ROOT`, which is **OPEN** — no probe
-has answered it, and none is claimed. `docs/BENCHMARKS.md` records the gate as
-**pending a named resource**, never as a pass.
+*Two environment facts, both established the hard way and both worth reusing:*
+the `rc` container needs CUDA from the **`ubuntu2404/sbsa`** lane (the `arm64`
+lane answers 200 but carries no `cuda-toolkit-13-*`), and **a CMake build
+directory cannot live on `/workspace`**, which is CIFS and refuses the
+`libvllm.so.0` symlink after a fully successful compile.
 
 **§5.2 arm 2 (multi-request) is additionally blocked by design, not by a host.**
 G-SAFE refuses `input.num_reqs > 1` and A2-B owns that clause, so the three
