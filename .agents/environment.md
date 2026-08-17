@@ -94,6 +94,62 @@ already has one. This row measured `dgx`'s worker and adds the part that turns
 an open gap into a blocker for the parity gates, which is that the ORACLE VENV
 is also unreachable from a lease.
 
+### The lease carries bytes, and the exec bit is a mount option, measured 2026-08-17
+
+Probed with two `rc run -d dgx:gpu0 --max-runtime 3m` jobs,
+`1cb56f84-62bf-4c90-b138-9bd4c3b0617a` and
+`c692d5a0-ec3d-4498-86e4-e86a2864e91a`. Verify this again before you plan work
+around it, because the worker image and the mount options can change under you.
+
+`/workspace` in the worker and `/mnt/nas_share/rc/` on a local host are the same
+folder. A file written from the worker appeared locally under that path, and a
+file staged locally was read by the worker. The worker's `df` reported
+`//192.168.68.102/Data`, 7.3T total, 4.0T available, 46% used.
+
+**Direct execution off `/workspace` is refused, and the mount causes it rather
+than a `noexec` flag.** The worker mounts the share with `file_mode=0664`,
+`dir_mode=0775`, `nounix`, `forceuid` and `forcegid`, and the option list holds
+no `noexec`. The same bytes read `-rwxr-xr-x` on the local host, which mounts
+the share with `file_mode=0755`, and `-rw-rw-r--` in the worker, so the exec bit
+is a presentation of each mount and not stored state. In the worker, `chmod +x`
+failed with `Operation not permitted`, and a staged shell script and a copied
+ELF binary each failed to start with `Permission denied` and exit code 126.
+
+**Three routes ran staged content anyway, and each measured green.** Record the
+distinction, because a missing exec bit reads like a wall and is not one.
+
+| Route | Measured |
+|---|---|
+| `sh /workspace/staged.sh` | printed the script's output, exit 0 |
+| `/lib/ld-linux-aarch64.so.1 /workspace/echo_copy` | ran the ELF, exit 0 |
+| `cp` to `/tmp`, then `chmod +x`, then run | ran the script and the ELF, exit 0 |
+
+`/tmp`, `/var/tmp` and `$HOME`, which is `/home/rc`, are writable, take a real
+exec bit, and sit on a 3.6T overlay with 2.5T available. `/dev/shm` is 64M. The
+job's working directory `/` is not writable.
+
+**So the lease carries bytes, and bytes are enough to run.** A runtime staged on
+`/workspace` can start under the dynamic loader, or after a copy to `/tmp`. What
+the worker cannot do is produce or fetch that runtime, because it has no `curl`,
+`wget`, `git`, `gcc`, `nvcc`, `cmake` or `python3`. Present and useful for
+staging: `cp`, `cat`, `tar`, `chmod`, `perl`, `flock` and `nvidia-smi`.
+
+**This narrows [#1129](https://github.com/mudler/vllm.cpp/issues/1129) and does
+not close it.** The pinned oracle stays unreachable because its virtual
+environment lives at `~/venvs/vllm-oracle-pin-555967922` on the dgx host, which
+no lease can see, and only a host-side actor reached over `ssh` can place a copy
+on the NAS. Whether that copy then starts is UNMEASURED. A CUDA virtual
+environment holds absolute paths in its shebangs and its `RECORD` files, so
+treat the relocation as an open question rather than a solved step.
+
+**Three fleet-side changes would each remove the staging problem, and none of
+them is ours to make.** Whoever owns the fleet picks one.
+
+1. The worker image gains a toolchain and a Python interpreter.
+2. `rc run` gains an `--image` flag, so a job selects an image that has them.
+3. `/workspace` is mounted so that a file there can carry an exec bit. This one
+   removes the copy step only, because the two routes above already execute.
+
 ### The `flock` orphan hazard that motivated the replacement
 
 The harness family in this repository puts the `flock` handle on a **subshell**,
