@@ -479,10 +479,112 @@ Known-red and not this row's: `windows-msvc-*` (#584). Load-dependent:
 
 ## 8. What the mutation pass found
 
-Filled in by the implementation. Each row records `git diff --stat`, whether the
-mutation **BUILT** with its compile-error count, and the exit code captured
-directly — because a mutation that fails to build and one that never applied both
-read exactly like a passing test.
+Twenty mutations over five rounds. Each row carries `git diff --stat`, whether it
+**BUILT** with its compile-error count, and the exit code captured directly into
+a variable — because a mutation that fails to build and one that never applied
+both read exactly like a passing test. This row adds a fourth column, the doctest
+CASE and ASSERTION counts, and it earned its place in round 2 (see M6b).
+
+Restores are `git checkout --` against a fully staged index, verified by sha256
+and re-stamped with `os.utime`, because a restored file older than its object
+makes ninja skip the rebuild and carry the previous mutation's binary forward.
+The harness is `mutate.py`, recorded beside the golden generator.
+
+| # | Mutation | BUILT | cc-err | EXIT | cases | asserts | Verdict |
+|---|---|---|---|---|---|---|---|
+| M1 | delete the `kRes2s` dispatch in the phase loop | YES | 0 | **1** | 1/1F | 22/6F | **DETECTED** — the reachability proof |
+| M2 | widen `phi`'s guard to 1e-4, i.e. the series-expansion port | YES | 0 | **1** | 1/1F | 34/9F | DETECTED |
+| M3 | drop the SECOND evaluation and reuse the first | YES | 0 | **1** | 1/1F | 7/2F | DETECTED |
+| M4 | delete the bong refinement | YES | 0 | **1** | 1/1F | 28/4F | DETECTED |
+| M5 | relax the bong `sigma > 0.03` to `>=` | YES | 0 | 0 | 1/0F | 28/0F | **SURVIVED — unobservable, see below** |
+| M6a-d | remove one of the two `normalize(noise)` calls | YES | 0 | 0 | 1/0F | 9/0F | **NO-OP mutation, see below** |
+| M6e | neuter `normalize`'s shared body | YES | 0 | **1** | 1/1F | 9/4F | DETECTED |
+| M7a | collapse the step-level SDE width onto f64, at `kRoundOff` | YES | 0 | 0 | 1/0F | 34/0F | SURVIVED — **fixed**, see below |
+| M7b | the same, under a one-ulp bound | YES | 0 | **1** | 1/1F | 42/3F | DETECTED |
+| M8a | read the loop's eta at the substep, no eta≠0.5 fixture | YES | 0 | 0 | 1/0F | 34/0F | SURVIVED — **fixed**, see below |
+| M8b | the same, with the `Eta1` fixture | YES | 0 | **1** | 1/1F | 42/2F | DETECTED |
+| M9 | give the HQ recipe's stage 1 the Euler stepper | YES | 0 | **1** | 1/1F | 22/6F | DETECTED — the defect #921 names |
+| M10a | engine hands the loop its RAW draw | YES | 0 | 0 | 1/0F | 22/0F | SURVIVED — **fixed**, see below |
+| M10b | the same, with `res2s_noise_moment_error` | YES | 0 | **1** | 1/1F | 25/2F | DETECTED |
+| M11 | drop the final evaluation at the injected 0.0011 | YES | 0 | **1** | 1/1F | 72/3F | DETECTED |
+| M12 | skip the 0.0011 substitution | YES | 0 | **1** | 1/1F | 95/3F | DETECTED |
+| M13 | decode stage 2's audio, which the pipeline discards | YES | 0 | **1** | 1/1F | 43/1F | DETECTED |
+| M14 | drop `legacy_mode`'s post-injection blend | YES | 0 | **1** | 1/1F | 42/24F | DETECTED |
+| M15a | swap the video/audio draw order, stateless fixture noise | YES | 0 | 0 | 1/0F | 42/0F | SURVIVED — **fixed**, see below |
+| M15b | the same, with a stateful fixture generator | YES | 0 | **1** | 1/1F | 42/10F | DETECTED |
+| M16 | reassociate `h * a21 * eps` | YES | 0 | 0 | 1/0F | 42/0F | **SURVIVED — below one ulp, see below** |
+| M17 | refine the anchor but not `eps_1` | YES | 0 | **1** | 1/1F | 42/3F | DETECTED |
+| M18a | `bongmath_max_iter` 100 -> 1, wrong FILE | — | — | — | — | — | **ANCHOR NOT FOUND** — printed, not silent |
+| M18b | the same, in the header | YES | 0 | **1** | 1/1F | 42/6F | DETECTED |
+| M19 | stop incrementing `dit_evaluations` | YES | 0 | **1** | 1/1F | 25/7F | DETECTED |
+| M20 | give the HQ recipe's stage 2 the Euler stepper | YES | 0 | **1** | 1/1F | 43/1F | DETECTED |
+
+### The four survivors that were fixed
+
+**M7a, M8a, M10a and M15a each found a real hole, and each is now closed.**
+
+* **M7a** — the loop golden ran at this file's `kRoundOff` of 5e-6, and the
+  float32/float64 SDE-coefficient split (§1.5) moves the result by about 1e-7.
+  The tolerance was a claim this port could not defend. Measured: 3 of 5 fixtures
+  are BIT-EXACT against upstream and 2 differ by 2.98e-08, one ulp at 0.5. The
+  bound is now **1e-7**, and a direct case pins the two coefficient arms apart.
+* **M8a** — the substep injection is pinned at eta 0.5 whatever the loop's eta is
+  (samplers.py:273-274), and every fixture ran at the loop's own default of 0.5,
+  where the two are the same number. An **`Eta1` fixture** (eta = 1.0, generated
+  from upstream) is the only thing that separates them.
+* **M10a** — `Ltx2Res2sNormalizeNoise` was gated as a FUNCTION while whether the
+  ENGINE calls it was gated by nothing: the end-to-end case checks counts, and
+  normalization changes no count. `Ltx2ConditioningTrace::res2s_noise_moment_error`
+  now observes it, asserted below 1e-9, which a raw Gaussian draw cannot reach.
+* **M15a** — the fixture's noise hook was STATELESS and returned the same values
+  for video and audio, so swapping the two injections changed nothing. Upstream's
+  generator ADVANCES, so within one step the two modalities get different
+  tensors and the order decides which. The fixture's generator is now stateful on
+  both sides of the comparison.
+
+### The two survivors that stand, and why they are not holes
+
+* **M5 — `sigma > 0.03` against `sigma >= 0.03` is unobservable.** The schedule
+  is float32, so `0.03f` widens to 0.029999999329447746, which is below the
+  double `0.03` the guard compares against. No float32 schedule can hold the
+  boundary value, so no fixture can reach it. Upstream compares the same widened
+  float32 against the same Python float (samplers.py:357), so the strictness is
+  unobservable THERE too. The test comment previously claimed this case pinned
+  it; that claim is now removed and replaced by this derivation.
+* **M16 — reassociating `h * a21 * eps`.** Upstream forms the scalar product
+  first (`h * a21 * eps_1_video`, samplers.py:322) and this port mirrors that.
+  The reassociated form differs by less than one ulp at this fixture's scale, so
+  the association is mirrored but is **not separately observable**. Recorded
+  rather than asserted, because a case claiming to gate it would be a tautology.
+
+### The two mutations that could not fail, and what that cost
+
+**M6a through M6d each removed ONE of the two `normalize(noise)` calls, and each
+read as a survivor for four rounds.** They were not survivors. The two calls are
+idempotent on a rank-2 latent — the header says so in as many words — so removing
+either leaves the other doing the whole job. Only M6e, which neuters the shared
+body, is a mutation at all.
+
+**M6b's `-tc` filter matched NOTHING**: the case name was truncated to `ltx2 res2s
+the loop NORMALIZES its noise` and the case is `...its noise, unlike the ancestral
+loop`. doctest printed `SUCCESS!` with exit 0 over **zero cases**. `git diff
+--stat` was correct, the build was clean, and the exit code was 0 — all three
+standard facts said "passing test". The CASE COUNT column is the only thing that
+caught it, which is the argument for printing it.
+
+**M18a's anchor was in the header and the mutation targeted the `.cpp`.** The
+harness printed `ANCHOR NOT FOUND` rather than running a clean tree and reporting
+a pass, which is the fourth shape this campaign has paid for.
+
+### Reachability
+
+The chain is `vllm_video_generate` -> `VideoEngine::Generate` ->
+`Ltx2VideoEngine::Generate` -> the phase loop's `kRes2s` dispatch. M1 deletes the
+last hop and the end-to-end case goes RED (exit 1, 6 failed assertions). The
+`pipeline_kind` load extra reaches all three surfaces: `ltx2-gen`'s
+`--pipeline-kind` passes the string straight through with no allowlist
+(`examples/ltx2_gen/main.cpp:239`), the C ABI takes it as a video load extra, and
+the server takes `--video-extra pipeline_kind=res2s_two_stage`.
 
 ---
 
@@ -497,6 +599,17 @@ read exactly like a passing test.
 * Bit-exact SDE noise against upstream's `torch.randn` stream (§4.3), which the
   already-shipped ancestral arm owes on the same grounds.
 
+## Owed, added by the implementation
+
+* **The `sigma > 0.03` strictness is ungated and cannot be gated** through a
+  float32 schedule (§8, M5). Not filed as an issue: there is no defect and no
+  fixture that would close it.
+* **The `h * a21` association is mirrored but unobservable** at this fixture's
+  scale (§8, M16).
+* **`Ltx2Res2sNormalizeNoise`'s idempotent second call** is unreachable as a
+  distinct behaviour on a rank-2 latent; it exists because a batched latent would
+  make it real, and nothing here can tell.
+
 ## Now
 
-`ACTIVE` — implementation in flight on `row/LTX25-RES2S-LOOP`.
+`ACTIVE` — implemented on `row/LTX25-RES2S-LOOP`, awaiting fresh review.

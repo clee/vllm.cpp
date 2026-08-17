@@ -35,6 +35,7 @@
 #include "vllm/model_executor/models/ltx2_image_preprocess.h"
 #include "vllm/model_executor/models/ltx2_loader.h"
 #include "vllm/model_executor/models/ltx2_pipeline.h"
+#include "vllm/model_executor/models/ltx2_samplers.h"
 #include "vllm/model_executor/models/ltx2_retake.h"
 #include "vllm/model_executor/models/ltx2_t2a.h"
 #include "vllm/model_executor/models/ltx2_text_encoder.h"
@@ -231,13 +232,22 @@ void FromLatentState(const Ltx2LatentState& in, StreamState* s) {
 //   denoised * mask + clean * (1 - mask)
 // The mask is PER TOKEN and the latent is per token x channel, so the mask
 // broadcasts along the channel axis exactly as torch's trailing-axis rule does.
-std::vector<float> PostProcessLatent(const std::vector<float>& denoised, const StreamState& state) {
-  std::vector<float> out(denoised.size());
+// TEMPLATED ON THE VALUE TYPE because upstream calls this at two widths and the
+// res_2s loop reaches both: at the model dtype on a denoiser result
+// (samplers.py:305, :390, :441) and at `hp` on a sample inside
+// `_inject_sde_noise` (samplers.py:203). One implementation, two
+// instantiations; a second copy of the blend is the shape this campaign has
+// recorded going wrong. The mask is 0 or 1 on every LTX-2.5 path, so the result
+// is exactly one operand or the other and the two widths agree.
+template <typename Value>
+std::vector<Value> PostProcessLatent(const std::vector<Value>& denoised,
+                                     const StreamState& state) {
+  std::vector<Value> out(denoised.size());
   for (int64_t t = 0; t < state.tokens; ++t) {
-    const float m = state.mask[static_cast<size_t>(t)];
+    const Value m = static_cast<Value>(state.mask[static_cast<size_t>(t)]);
     for (int64_t c = 0; c < state.width; ++c) {
       const size_t i = static_cast<size_t>(t * state.width + c);
-      out[i] = denoised[i] * m + state.clean[i] * (1.0F - m);
+      out[i] = denoised[i] * m + static_cast<Value>(state.clean[i]) * (static_cast<Value>(1) - m);
     }
   }
   return out;
@@ -373,7 +383,7 @@ constexpr char kLtx2DurationHeadPathExtra[] = "duration_head_path";
 // they are no longer trusted: the list below is derived from this file on every
 // run and compared, and the failure prints the replacement to paste in.
 // READER ANCHORS (derived and gated by test_ltx2_video):
-// 791 801 802 864 960 976 978 1069 1094 1199 1240
+// 801 811 812 874 970 986 988 1079 1104 1209 1250
 const char* const kKnownLoadExtras[] = {
     kLtx2AudioPromptEmbedsExtra, kLtx2PipelineKindExtra,   kLtx2ModelVersionExtra,
     kLtx2AllowUnportedExtra,     kLtx2MaxPhaseExtra,       kLtx2DitConfigPathExtra,
@@ -2927,14 +2937,34 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
            phase.name + "'), so a `steps` override is refused rather than applied");
     }
 
-    // ── the denoise loop (samplers.py:39-79 / :488-558) ─────────────────────
-    // The ancestral arm's loop generator is seeded from the pipeline seed plus
-    // the recipe's own offset (distilled.py:69-73, :177-183) — a separate stream
-    // from the state noise, so its first draw is not the initial latent's.
-    SplitMixGaussian loop_noise(seed + static_cast<uint64_t>(phase.noise_seed_offset));
-    const int64_t sigma_count = static_cast<int64_t>(sigmas.size());
-    for (int64_t step = 0; step + 1 < sigma_count; ++step) {
-      const float sigma = sigmas[static_cast<size_t>(step)];
+    // ── ONE EVALUATION, SHARED BY EVERY SAMPLER ─────────────────────────────
+    //
+    // Upstream's samplers all take a `Denoiser` callable and never reach for a
+    // model (samplers.py:213-214, :45), which is why the loops differ only in
+    // how many times and at which sigmas they call it. This lambda is that
+    // callable, and BOTH arms below go through it: the first-order loop calls it
+    // once per step, `Ltx2Res2sDenoisingLoop` calls it twice per step plus once
+    // at the end.
+    //
+    // Hoisted rather than duplicated because a second forward path written by
+    // hand would be a second place to forget the keyframe marker, the frozen
+    // scalar sigma or the device/host split — and every one of those omissions
+    // renders a finished clip. It also makes `dit_evaluations` a single
+    // increment that no arm can bypass.
+    //
+    // It takes the latent as an ARGUMENT rather than reading `video.latent`,
+    // because the res_2s loop's second evaluation runs over a MIDPOINT state
+    // that never becomes the stream's own latent (samplers.py:369-378).
+    //
+    // `sigma` is a `double` on the way in and narrows here. That narrowing is
+    // upstream's own boundary rather than a shortcut: `Modality.sigma` reaches
+    // the DiT as a tensor of the model's dtype, and this port's
+    // `Ltx2ModalityInput::sigma` is a `const float*`. The res_2s substep sigma
+    // is float64 up to this line (samplers.py:315, :384) and float32 after it.
+    const auto Evaluate = [&](const std::vector<float>& v_latent,
+                              const std::vector<float>& a_latent, double sigma_hp,
+                              std::vector<float>& v_denoised, std::vector<float>& a_denoised) {
+      const float sigma = static_cast<float>(sigma_hp);
       const std::vector<float> v_timesteps = TimestepsFromMask(video, sigma);
       const std::vector<float> a_timesteps = TimestepsFromMask(audio, sigma);
       // The SECOND half of upstream's `frozen` on the VIDEO side
@@ -2952,7 +2982,7 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
       vin.batch = 1;
       vin.tokens = video.tokens;
       vin.context_tokens = context_tokens;
-      vin.latent = video.latent.data();
+      vin.latent = v_latent.data();
       vin.timesteps = v_timesteps.data();
       vin.sigma = &sigma_row;
       vin.positions = video.positions.data();
@@ -3010,7 +3040,7 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
       ain.batch = 1;
       ain.tokens = audio.tokens;
       ain.context_tokens = context_tokens;
-      ain.latent = audio.latent.data();
+      ain.latent = a_latent.data();
       ain.timesteps = a_timesteps.data();
       // The SECOND half of upstream's `frozen` (utils/types.py:104-106): the
       // per-modality scalar sigma is forced to 0, "not only per-token
@@ -3039,41 +3069,147 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
                        : Ltx2DitForward(im.device, im.dit.params, im.dit.weights, &vin, &ain,
                                         im.compute_dtype);
 
-      const std::vector<float> v_denoised = PostProcessLatent(
-          ToDenoised(video.latent, velocity.video, v_timesteps, video.tokens, video.width), video);
-      const std::vector<float> a_denoised = PostProcessLatent(
-          ToDenoised(audio.latent, velocity.audio, a_timesteps, audio.tokens, audio.width), audio);
+      // THE ONE PLACE A DiT FORWARD IS COUNTED. Every sampler reaches it, so a
+      // build that ran the wrong number of them cannot report the right count.
+      // This is the only observable that separates the res_2s sampler from the
+      // first-order one — the clip, its shape, its frame count, its sample rate
+      // and its file size are identical between them — which is why it is a
+      // counter rather than a comment.
+      im.trace.dit_evaluations += 1;
 
-      const bool terminal = sigmas[static_cast<size_t>(step + 1)] == 0.0F;
-      if (phase.stepper == Ltx2StepperKind::kEulerAncestral) {
-        if (terminal) {
-          // samplers.py:545-547 — the terminal step IS the denoised prediction;
-          // taking an ancestral step there would re-noise the finished latent.
-          video.latent = v_denoised;
-          audio.latent = a_denoised;
-          continue;
+      // RAW, not post-processed. `post_process_latent` belongs to the SAMPLER
+      // upstream, not to the denoiser: the first-order loop applies it inside
+      // `_step_state` (samplers.py:35) and the res_2s loop applies it at four
+      // separate points (:305, :390, :203, :441), one of which is after an SDE
+      // injection rather than after an evaluation. Folding it in here would put
+      // it in three of those four places and silently drop the fourth.
+      v_denoised = ToDenoised(v_latent, velocity.video, v_timesteps, video.tokens, video.width);
+      a_denoised = ToDenoised(a_latent, velocity.audio, a_timesteps, audio.tokens, audio.width);
+    };
+
+    // ── the denoise loop ────────────────────────────────────────────────────
+    // The ancestral arm's loop generator is seeded from the pipeline seed plus
+    // the recipe's own offset (distilled.py:69-73, :177-183) — a separate stream
+    // from the state noise, so its first draw is not the initial latent's.
+    SplitMixGaussian loop_noise(seed + static_cast<uint64_t>(phase.noise_seed_offset));
+    const int64_t sigma_count = static_cast<int64_t>(sigmas.size());
+
+    if (phase.stepper == Ltx2StepperKind::kRes2s) {
+      // ── the res_2s second-order sampler (samplers.py:208-447) ─────────────
+      //
+      // Row LTX25-RES2S-LOOP, issue #921. `TI2VidTwoStagesHQPipeline` passes
+      // `loop=res2s_audio_video_denoising_loop` to BOTH of its stages
+      // (ti2vid_two_stages_hq.py:292, :335), and this is that loop.
+      //
+      // THE PARAMETERS ARE THE LOOP'S OWN DEFAULTS, DELIBERATELY.
+      // `DiffusionStage.__call__` hands the loop six keyword arguments and no
+      // others (utils/blocks.py:566-573), so nothing on the HQ path overrides
+      // eta, bongmath, the iteration cap, the noise function or the seeds.
+      // Passing anything else here would be this port inventing a knob.
+      //
+      // THE SEEDS ARE CONSTANTS AND NOT `seed`. `noise_seed` defaults to -1
+      // (samplers.py:215) and the substep stream to -1 + 10000
+      // (samplers.py:265-266), so the res_2s SDE injections do not depend on the
+      // request's seed at all — the initial latent still does, through the
+      // noiser. The ancestral arm one branch up does the opposite. Mirrored
+      // rather than made consistent, because consistency here would be a
+      // divergence.
+      SplitMixGaussian res2s_step_noise(static_cast<uint64_t>(kLtx2Res2sNoiseSeed));
+      SplitMixGaussian res2s_substep_noise(
+          static_cast<uint64_t>(kLtx2Res2sNoiseSeed + kLtx2Res2sNoiseSeedSubstepOffset));
+
+      Ltx2Res2sHooks hooks;
+      hooks.denoise = Evaluate;
+      hooks.post_process = [&](std::vector<double> x, bool is_video) {
+        return PostProcessLatent<double>(x, is_video ? video : audio);
+      };
+      // `_get_new_noise` (samplers.py:164-170): draw, then normalize. The DRAW
+      // is this port's `SplitMixGaussian` rather than upstream's seeded
+      // `torch.randn`, so the stream differs — as it already does on the
+      // shipped ancestral arm — and only the normalization is mirrored. Which
+      // NOISE FUNCTION each loop uses is mirrored too, and the two loops do not
+      // agree: the ancestral one defaults to the un-normalized
+      // `_get_plain_noise` (samplers.py:574).
+      hooks.new_noise = [&](int64_t count, bool /*is_video*/, bool substep) {
+        SplitMixGaussian& stream = substep ? res2s_substep_noise : res2s_step_noise;
+        const std::vector<float> raw = stream.Draw(count);
+        std::vector<double> noise =
+            Ltx2Res2sNormalizeNoise(std::vector<double>(raw.begin(), raw.end()));
+        // OBSERVED, not asserted in prose. Whether this hook normalizes is
+        // invisible in the rendered clip, the token count and the evaluation
+        // count alike, and a build that returned `raw` here left the whole
+        // end-to-end suite green. See `res2s_noise_moment_error`.
+        double mean = 0.0;
+        for (const double v : noise) mean += v;
+        mean /= static_cast<double>(noise.size());
+        double sq = 0.0;
+        for (const double v : noise) sq += (v - mean) * (v - mean);
+        const double sd = std::sqrt(sq / static_cast<double>(noise.size() - 1));
+        im.trace.res2s_noise_moment_error = std::max(
+            im.trace.res2s_noise_moment_error, std::max(std::fabs(mean), std::fabs(sd - 1.0)));
+        return noise;
+      };
+
+      Ltx2Res2sModality res2s_video{video.latent, true};
+      Ltx2Res2sModality res2s_audio{audio.latent, true};
+      const Ltx2Res2sLoopStats stats =
+          Ltx2Res2sDenoisingLoop(sigmas, res2s_video, res2s_audio, hooks);
+      video.latent = std::move(res2s_video.latent);
+      audio.latent = std::move(res2s_audio.latent);
+      // Reported so a caller can assert what ran. `evaluations` is already
+      // counted inside `Evaluate`; this checks the two counters agree, which is
+      // what stops the loop and the engine drifting into disagreeing about how
+      // many forwards happened.
+      VT_CHECK(stats.evaluations > stats.full_steps,
+               "ltx2 video: the res_2s sampler evaluates the DiT TWICE per step plus once at a "
+               "terminal zero sigma (samplers.py:301, :380-386, :437), so it cannot report as "
+               "many evaluations as it has steps. A count at or below the step count means the "
+               "second evaluation was skipped, which renders a finished, correctly sized, "
+               "plausible clip at half the model evaluations the HQ preset was tuned for.");
+      im.trace.res2s_bong_steps += stats.bong_steps;
+    } else {
+      for (int64_t step = 0; step + 1 < sigma_count; ++step) {
+        const float sigma = sigmas[static_cast<size_t>(step)];
+        std::vector<float> v_raw, a_raw;
+        Evaluate(video.latent, audio.latent, static_cast<double>(sigma), v_raw, a_raw);
+        // `_step_state` (samplers.py:35) blends before it steps.
+        const std::vector<float> v_denoised = PostProcessLatent<float>(v_raw, video);
+        const std::vector<float> a_denoised = PostProcessLatent<float>(a_raw, audio);
+
+        const bool terminal = sigmas[static_cast<size_t>(step + 1)] == 0.0F;
+        if (phase.stepper == Ltx2StepperKind::kEulerAncestral) {
+          if (terminal) {
+            // samplers.py:545-547 — the terminal step IS the denoised
+            // prediction; taking an ancestral step there would re-noise the
+            // finished latent.
+            video.latent = v_denoised;
+            audio.latent = a_denoised;
+            continue;
+          }
+          const std::vector<float> v_noise =
+              loop_noise.Draw(static_cast<int64_t>(video.latent.size()));
+          const std::vector<float> a_noise =
+              loop_noise.Draw(static_cast<int64_t>(audio.latent.size()));
+          video.latent = PostProcessLatent<float>(
+              Ltx2EulerAncestralStep(video.latent.data(), v_denoised.data(), sigmas.data(),
+                                     sigma_count, step,
+                                     static_cast<int64_t>(video.latent.size()),
+                                     phase.stepper_eta, phase.stepper_s_noise, v_noise.data()),
+              video);
+          audio.latent = PostProcessLatent<float>(
+              Ltx2EulerAncestralStep(audio.latent.data(), a_denoised.data(), sigmas.data(),
+                                     sigma_count, step,
+                                     static_cast<int64_t>(audio.latent.size()),
+                                     phase.stepper_eta, phase.stepper_s_noise, a_noise.data()),
+              audio);
+        } else {
+          video.latent = Ltx2EulerStep(video.latent.data(), v_denoised.data(), sigmas.data(),
+                                       sigma_count, step,
+                                       static_cast<int64_t>(video.latent.size()));
+          audio.latent = Ltx2EulerStep(audio.latent.data(), a_denoised.data(), sigmas.data(),
+                                       sigma_count, step,
+                                       static_cast<int64_t>(audio.latent.size()));
         }
-        const std::vector<float> v_noise =
-            loop_noise.Draw(static_cast<int64_t>(video.latent.size()));
-        const std::vector<float> a_noise =
-            loop_noise.Draw(static_cast<int64_t>(audio.latent.size()));
-        video.latent = PostProcessLatent(
-            Ltx2EulerAncestralStep(video.latent.data(), v_denoised.data(), sigmas.data(),
-                                   sigma_count, step, static_cast<int64_t>(video.latent.size()),
-                                   phase.stepper_eta, phase.stepper_s_noise, v_noise.data()),
-            video);
-        audio.latent = PostProcessLatent(
-            Ltx2EulerAncestralStep(audio.latent.data(), a_denoised.data(), sigmas.data(),
-                                   sigma_count, step, static_cast<int64_t>(audio.latent.size()),
-                                   phase.stepper_eta, phase.stepper_s_noise, a_noise.data()),
-            audio);
-      } else {
-        video.latent = Ltx2EulerStep(video.latent.data(), v_denoised.data(), sigmas.data(),
-                                     sigma_count, step,
-                                     static_cast<int64_t>(video.latent.size()));
-        audio.latent = Ltx2EulerStep(audio.latent.data(), a_denoised.data(), sigmas.data(),
-                                     sigma_count, step,
-                                     static_cast<int64_t>(audio.latent.size()));
       }
     }
 

@@ -5596,3 +5596,106 @@ TEST_CASE("ltx2 t2a: rescale_scale 0 is the control because both spaces agree th
   CHECK(at_default > 1e-2);
   CHECK(at_default > 100.0 * at_zero);
 }
+
+// ─── the HQ arm reaches the res_2s sampler (row LTX25-RES2S-LOOP, #921) ─────
+//
+// THIS IS THE REACHABILITY CASE, and it is deliberately not a unit test of the
+// loop — `test_ltx2_pipeline` already gates the arithmetic against upstream's
+// own output. This one enters through the production path a user arrives on:
+// `LoadVideoEngine` with the `pipeline_kind` LOAD extra, then
+// `VideoEngine::Generate`, which is what `vllm_video_generate`, `ltx2-gen` and
+// the server all call. Deleting the `kRes2s` dispatch in `ltx2_video.cpp`'s
+// phase loop must red this case; a unit test of `Ltx2Res2sDenoisingLoop` would
+// stay green, because it proves the class works and never that anything
+// reaches it.
+//
+// WHAT IT ASSERTS IS A COUNT, because a count is the only thing that separates
+// the two samplers. The rendered clip, its shape, its frame count and its
+// sample rate are identical whichever one ran.
+TEST_CASE("ltx2 video: the HQ pipeline evaluates the DiT twice per step") {
+  Workspace ws;
+
+  // `steps` -> forwards, for each arm. The res_2s loop runs two evaluations per
+  // step plus one at the terminal sigma the schedule injects (samplers.py:281,
+  // :437), and the first-order loop runs one per step. TWO step counts, so an
+  // off-by-one cannot satisfy both, and the ratio is close to two rather than a
+  // difference of one.
+  const auto forwards = [&ws](const std::string& kind, int64_t steps, const std::string& tag) {
+    vllm::multimodal::VideoModelParams mp = FixtureParams(ws.paths);
+    mp.extras[vllm::multimodal::kLtx2PipelineKindExtra] = kind;
+    // Stage 1 only. Both recipes' second phase needs the latent spatial
+    // upsampler, which the fixture does not carry and which is refused BY NAME
+    // in its own case above — that refusal is not what this case is about.
+    mp.extras[vllm::multimodal::kLtx2MaxPhaseExtra] = "0";
+    const std::unique_ptr<vllm::multimodal::VideoEngine> engine =
+        vllm::multimodal::LoadVideoEngine(mp);
+    REQUIRE(engine != nullptr);
+    auto* ltx2 = dynamic_cast<vllm::multimodal::Ltx2VideoEngine*>(engine.get());
+    REQUIRE(ltx2 != nullptr);
+    vllm::multimodal::VideoGenParams gen = FixtureGen(ws.root + "/" + tag);
+    gen.steps = steps;
+    (void)engine->Generate(gen);
+    return ltx2->last_conditioning();
+  };
+
+  const vllm::multimodal::Ltx2ConditioningTrace hq3 = forwards("res2s_two_stage", 3, "hq3");
+  const vllm::multimodal::Ltx2ConditioningTrace hq5 = forwards("res2s_two_stage", 5, "hq5");
+  const vllm::multimodal::Ltx2ConditioningTrace euler3 = forwards("one_stage", 3, "e3");
+  const vllm::multimodal::Ltx2ConditioningTrace euler5 = forwards("one_stage", 5, "e5");
+
+  INFO("res2s: 3 steps -> " << hq3.dit_evaluations << " forwards, 5 steps -> "
+                            << hq5.dit_evaluations << "; euler: 3 -> "
+                            << euler3.dit_evaluations << ", 5 -> " << euler5.dit_evaluations);
+  // 2 * steps + 1. The schedule `Ltx2SigmaSchedule` builds terminates at exactly
+  // 0 (gated in test_ltx2_pipeline), so the terminal evaluation always happens.
+  CHECK(hq3.dit_evaluations == 7);
+  CHECK(hq5.dit_evaluations == 11);
+  // ...against the first-order arm on the SAME request. Both numbers are read
+  // off a real render rather than one being computed from the other, so the
+  // comparison cannot be satisfied by both arms sharing a defect.
+  CHECK(euler3.dit_evaluations == 3);
+  CHECK(euler5.dit_evaluations == 5);
+  CHECK(hq3.dit_evaluations > 2 * euler3.dit_evaluations);
+  CHECK(hq5.dit_evaluations > 2 * euler5.dit_evaluations);
+  // A ZERO WOULD ALSO BE "not equal to the Euler count", and zero is what a
+  // build that never ran the loop reports. Ruled out explicitly.
+  CHECK(euler3.dit_evaluations > 0);
+
+  // THE BONG REFINEMENT IS REACHED ON THE PRODUCTION SCHEDULE, not only on the
+  // hand-built fixtures in test_ltx2_pipeline. It changes the latent without
+  // changing how many forwards ran, so the counter above is blind to it and this
+  // is the only place a real render says it happened.
+  CHECK(hq3.res2s_bong_steps > 0);
+  CHECK(hq5.res2s_bong_steps > 0);
+  // ...and never on a first-order arm, which has no anchor to refine.
+  CHECK(euler3.res2s_bong_steps == 0);
+  CHECK(euler5.res2s_bong_steps == 0);
+
+  // THE NOISE THE ENGINE HANDED THE LOOP WAS NORMALIZED. `_get_new_noise`
+  // (samplers.py:164-170) is what the res_2s loop takes, against the ancestral
+  // loop's un-normalized `_get_plain_noise` (:155-157) ten lines away. That the
+  // FUNCTION normalizes is gated in test_ltx2_pipeline; that this engine calls
+  // it is a different claim, and MEASURED: with the hook handing over its raw
+  // draw instead, every assertion above stayed green.
+  //
+  // 1e-9 is unreachable for a raw Gaussian draw, whose sample moments miss by
+  // O(1/sqrt(n)) on any latent this fixture builds, and trivial for a
+  // normalized one, which is exact to rounding.
+  INFO("res2s noise moment error = " << hq3.res2s_noise_moment_error);
+  CHECK(hq3.res2s_noise_moment_error < 1e-9);
+  CHECK(hq5.res2s_noise_moment_error < 1e-9);
+  // Zero — not "small" — on an arm that runs no res_2s draw at all, so the
+  // field cannot read as satisfied by never having been written.
+  CHECK(euler3.res2s_noise_moment_error == 0.0);
+
+  // BOTH ARMS BUILT THEIR SCHEDULE THE SAME WAY, which is what lets the two
+  // counts be compared at all: each recipe leaves stage 1's sigmas empty and
+  // therefore derives them from `steps` through `Ltx2SigmaSchedule`, so the
+  // difference between 7 and 3 is the SAMPLER and not a different schedule.
+  // Their token counts differ — the HQ stage 1 halves the request
+  // (ti2vid_two_stages_hq.py:238-243) and `one_stage` does not — which is why
+  // the counts above are asserted absolutely rather than only as a ratio.
+  CHECK(hq3.schedule_tokens > 0);
+  CHECK(euler3.schedule_tokens > 0);
+  CHECK(hq3.video_tokens < euler3.video_tokens);
+}

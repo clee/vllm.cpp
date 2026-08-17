@@ -2496,8 +2496,8 @@ or without the ComfyUI `model.diffusion_model.` prefix. Each family reads its ow
 knobs from `extras`. H3 takes `partition`. LTX-2.5 takes
 `audio_prompt_embeds_path` (the audio stream's conditioning, the twin of the
 seam's `prompt_embeds_path`, which carries the video stream), `pipeline_kind`
-(default `distilled_two_stage`; also `one_stage`, `dmd2`, `dfr`, `retake` and
-`t2a_one_stage`), `model_version` (only for a checkpoint that
+(default `distilled_two_stage`; also `one_stage`, `res2s_two_stage`, `dmd2`,
+`dfr`, `retake` and `t2a_one_stage`), `model_version` (only for a checkpoint that
 declares none), `dit_config_path`, `encoder_config_path`,
 `allow_unported_modules`, `max_phase`, `prompt_embeds_valid_rows`,
 `upsampler_path` and `duration_head_path`. An extra a family does not define is
@@ -2978,7 +2978,45 @@ Recipes resolve on an EXACT `(pipeline_kind, model_version)` pair and refuse
 anything else by name rather than defaulting, because a plausible but wrong sigma
 schedule or guidance scale renders a video instead of failing. The pairs that
 resolve are `one_stage` at 2, 2.3, 2.4 and 2.5, `distilled_two_stage` at 2 and
-2.5, `dmd2` at 2 and 2.3, and `retake` at 2 and 2.5.
+2.5, `res2s_two_stage` at 2.5, `dmd2` at 2 and 2.3, and `retake` at 2 and 2.5.
+
+### `res2s_two_stage`: the high-quality preset, and why it is a sampler
+
+`res2s_two_stage` is `TI2VidTwoStagesHQPipeline`. It differs from the two-stage
+pipeline in three things and two of them are the SAMPLER: it runs the `res_2s`
+second-order method on both stages instead of Euler, and it takes
+`LTX_2_3_HQ_PARAMS` — 15 steps, STG off, video rescale 0.45. It resolves at 2.5
+only, because that preset is a plain constant upstream with no per-generation
+lineage to spread it over.
+
+Fifteen steps is not fewer forwards. The `res_2s` loop evaluates the transformer
+TWICE per step, once at the step's sigma and once at the geometric mean of that
+sigma and the next, and once more at a terminal sigma the schedule injects — so
+15 steps is 31 transformer evaluations against `one_stage`'s 30 at its own
+default. Expect it to cost about the same as the 30-step arm and to look better,
+not to be faster.
+
+That is also why the preset cannot be reached by passing its numbers to another
+kind. `--steps 15` on `one_stage` renders a finished, correctly sized, plausible
+clip at half the model evaluations the preset was tuned for, and no property of
+the output says so. Ask for the pipeline, not for its step count.
+
+```sh
+ltx2-gen --pipeline-kind res2s_two_stage \
+         --prompt "a cinematic shot of ..." \
+         --height 1088 --width 1920 --frames 121
+```
+
+`pipeline_kind` is a LOAD knob, so this reaches the C API and the server too: a
+server started with `--video-extra pipeline_kind=res2s_two_stage` renders every
+request on the HQ preset.
+
+Two limits, stated rather than left to be found. The stage-2 spatial upsample is
+the same one `distilled_two_stage` uses and carries the same refusal when the
+checkpoint has no latent upsampler. And the loop's SDE noise is drawn from this
+port's own generator rather than upstream's seeded `torch.randn`, so a render is
+not bit-comparable with Lightricks' — the same limit the ancestral arm already
+ships with, recorded in `.agents/specs/ltx25-res2s-loop.md`.
 
 ### Retake: regenerating a time window of an existing clip
 

@@ -699,6 +699,56 @@ struct Ltx2ConditioningTrace {
   uint64_t retake_latent_digest = 0;
   double retake_latent_absmax = 0.0;
 
+  // ── THE SAMPLER (row LTX25-RES2S-LOOP, #921) ──────────────────────────────
+  //
+  // `dit_evaluations` is every DiT forward this render ran, across every phase
+  // and every step, and it is the ONLY thing that separates the res_2s sampler
+  // from the first-order one. That is not a comment about instrumentation being
+  // nice to have; it is the whole reason this field exists. The two samplers
+  // return a clip of the same shape, the same frame count, the same sample rate
+  // and the same file size, and the difference between them is that one calls
+  // the transformer TWICE per step (samplers.py:301 and :380-386) plus once at
+  // the terminal sigma (:437). Serving the HQ preset's 15 steps on the Euler
+  // loop would run 15 forwards where upstream runs 31, and no output check in
+  // this tree could tell.
+  //
+  // The count is `2 * steps + 1` per res_2s phase when that phase's schedule
+  // ends at 0 and `2 * steps` when it does not, against `steps` for the Euler
+  // and ancestral arms — so a build that selected the wrong sampler reports a
+  // number that is close to half, not a number that is wrong by one.
+  //
+  // Incremented at ONE site, inside the shared `Evaluate` lambda that every
+  // sampler goes through, so no arm can run a forward this misses. A second
+  // increment beside the res_2s loop's own returned `evaluations` would let the
+  // two drift; the engine asserts they agree instead.
+  int64_t dit_evaluations = 0;
+  // Steps on which the bong anchor refinement ran, i.e. on which
+  // `bongmath and h < 0.5 and sigma > 0.03` held (samplers.py:357). Zero on
+  // every non-res_2s pipeline. It is reported separately from the evaluation
+  // count because the refinement changes the latent WITHOUT changing how many
+  // forwards ran, so the counter above is blind to it.
+  int64_t res2s_bong_steps = 0;
+  // The largest deviation from a standardized draw across every noise tensor the
+  // res_2s loop was handed: `max(|mean|, |sd - 1|)` over each draw, maximum over
+  // all of them. Zero on every non-res_2s pipeline.
+  //
+  // IT EXISTS BECAUSE THE WIRING IS INVISIBLE OTHERWISE. `_get_new_noise`
+  // normalizes (samplers.py:164-170) and `_get_plain_noise` does not
+  // (:155-157); the res_2s loop takes the first and the ancestral loop takes
+  // the second, ten lines apart in one file. `Ltx2Res2sNormalizeNoise` is gated
+  // as a FUNCTION by `test_ltx2_pipeline`, but whether the engine's hook calls
+  // it is a different claim, and nothing about a rendered clip, a token count or
+  // an evaluation count can answer it. MEASURED: with the engine handing the
+  // loop its raw draw, the end-to-end suite stayed GREEN — mutation M10 in
+  // .agents/specs/ltx25-res2s-loop.md section 8 — which is why this field was
+  // added rather than the wiring being left as a claim.
+  //
+  // A NORMALIZED draw drives this to ~1e-15 by construction. A raw Gaussian
+  // draw cannot: its sample mean is O(1/sqrt(n)) and its sample deviation is
+  // O(1/sqrt(n)) away from 1, so on any latent this engine builds the two are
+  // orders of magnitude apart rather than close.
+  double res2s_noise_moment_error = 0.0;
+
   // ── TEXT-TO-AUDIO: what the audio-only render actually ran (#1005) ────────
   //
   // Zero and false everywhere on a pipeline that is not `t2a_one_stage`.
