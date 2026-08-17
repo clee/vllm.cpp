@@ -281,11 +281,18 @@ a zeroed velocity collapses the equation to `x0 == latent` for that arm alone.
 ### 4. Reachability (`test_ltx2_video.cpp`)
 
 `LoadVideoEngine` with `pipeline_kind = ti2vid_two_stage` -> `Generate` ->
-pixels, which is `include/vllm.h` plus the documented load extra and is what
+pixels, which is `include/vllm.h` plus the documented load extras and is what
 `ltx2-gen --pipeline-kind ti2vid_two_stage --lora-path ... --upsampler-path ...`
-does through the ABI. The `/v1/videos` route cannot drive it, because
-`VideoGenParamsFromRequest` never writes `gen.extras` (#928) — stated so the
-claim excludes it rather than overstating it.
+does through the ABI.
+
+**#928 does NOT exclude the HTTP route here, and the a2vid wording would have
+said it did.** That recipe needs `audio_path`, a PER-GENERATION extra, and
+`VideoGenParamsFromRequest` writes none. All three knobs this recipe needs are
+LOAD extras, which a server supplies through `--video-extra KEY=VALUE`
+(`server_main.cpp` applies `args.video_extras` onto `vmp.extras`), and
+`requires_audio_input` is false. That is a claim about the request SURFACE.
+Nothing here drives the HTTP route end to end, so it is not measured and the
+reach claim rests on the ABI path alone.
 
 `dit_forwards`, not an evaluation count, distinguishes the guided stage: a
 denoiser call is ONE evaluation whether or not guidance ran, and only

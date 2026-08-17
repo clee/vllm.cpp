@@ -7522,9 +7522,18 @@ TEST_CASE("ltx2 ti2vid: the pipeline renders through vllm.h, guided on the UNADA
   //
   // `ltx2-gen --pipeline-kind ti2vid_two_stage --lora-path ... --upsampler-path
   // ...` is the same two calls through the ABI, as a thin client that includes
-  // no internal header. The `/v1/videos` route CANNOT drive it:
-  // `VideoGenParamsFromRequest` never writes `gen.extras` (#928). Stated here so
-  // the reach claim excludes it rather than overstating it.
+  // no internal header.
+  //
+  // AND #928 DOES NOT EXCLUDE THE HTTP ROUTE HERE, unlike on `a2vid_two_stage`.
+  // That recipe needs `audio_path`, a PER-GENERATION extra, and
+  // `VideoGenParamsFromRequest` writes none. All three knobs THIS recipe needs —
+  // `pipeline_kind`, `lora_path`, `upsampler_path` — are LOAD extras, which a
+  // server supplies through `--video-extra KEY=VALUE`, and `requires_audio_input`
+  // is false, which the recipe case gates.
+  //
+  // That is a statement about the REQUEST SURFACE and not a second reach claim:
+  // no case here drives the HTTP route end to end, so it is not measured and is
+  // not asserted.
   Workspace ws;
   const std::string lora =
       WriteFixtureLora(ws.root + "/distilled.safetensors", kFixtureLoraTarget, 1.0F);

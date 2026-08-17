@@ -3480,10 +3480,13 @@ trajectory they were never trained for and renders a plausible clip with nothing
 in its size, frame count, sample rate or errors to show it
 ([#1137](https://github.com/mudler/vllm.cpp/issues/1137)).
 
-`pipeline_kind` is a LOAD knob, so a server reaches this arm with
-`--video-extra pipeline_kind=ti2vid_two_stage`. Unlike `a2vid_two_stage` it
-needs no per-generation extra, so `/v1/videos` can drive it once the load
-carries the adapter.
+All three knobs this arm needs are LOAD extras, so a server supplies them with
+`--video-extra pipeline_kind=ti2vid_two_stage` and the same for `lora_path` and
+`upsampler_path`. Unlike `a2vid_two_stage` it needs no per-generation extra, so
+[#928](https://github.com/mudler/vllm.cpp/issues/928) does not stand in the way
+of `/v1/videos`. That is a statement about the request surface: the gated path
+is `vllm_video_engine_load` plus `vllm_video_generate`, which is what `ltx2-gen`
+drives, and no test here exercises the HTTP route end to end.
 
 ### Retake: regenerating a time window of an existing clip
 
