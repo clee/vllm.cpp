@@ -218,7 +218,7 @@ int main(int argc, char** argv) {
   std::string audio_skip_step, audio_stg_blocks;
 
   // THE VIDEO GUIDER (row LTX25-GUIDED-VIDEO, #1092): the other half of the same
-  // parser, `default_1_stage_arg_parser` (utils/args.py:947-1010). `--negative-
+  // parser, `default_1_stage_arg_parser` (utils/args.py:947-1066). `--negative-
   // prompt` above is shared by both, which is why it is not repeated here.
   std::string video_cfg_scale, video_stg_scale, video_rescale, video_skip_step;
   std::string video_stg_blocks, a2v_scale, v2a_scale;

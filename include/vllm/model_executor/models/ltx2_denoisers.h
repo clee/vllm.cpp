@@ -9,7 +9,7 @@
 //
 // Upstream has three denoisers (`SimpleDenoiser`, `GuidedDenoiser`,
 // `FactoryGuidedDenoiser`) and they share ONE function: `_guided_denoise`
-// (denoisers.py:62-207). That function is what this file ports. It is the piece
+// (denoisers.py:61-211). That function is what this file ports. It is the piece
 // four unported pipelines are each blocked on — `a2vid_two_stage.py:230`,
 // `ti2vid_two_stages.py:248`, `ti2vid_two_stages_hq.py:271`,
 // `keyframe_interpolation.py:232` — and it is what a `pipeline_kind = one_stage`
@@ -24,9 +24,19 @@
 //    denoised tensors. Combining velocities and converting once afterwards is a
 //    DIFFERENT function whenever `rescale_scale != 0` (guiders.py:268-271), and
 //    it is 0.7 on every video row of the params table. That defect shipped on
-//    the audio arm of this tree and is #1039. This seam cannot commit it,
-//    because it never sees a velocity: the conversion lives in the caller's
-//    `Ltx2X0Model`, which is where upstream puts it.
+//    the audio arm of this tree and is #1039. The conversion therefore lives in
+//    the caller's `Ltx2X0Model`, which is where upstream puts it, and the seam
+//    combines `Ltx2X0Outputs::video` / `::audio`.
+//
+//    THAT IS CALLER DISCIPLINE AND NOT A TYPE GUARANTEE, and this comment
+//    claimed the stronger thing until 2026-08-17. `Ltx2X0Outputs` carries the
+//    raw velocity beside the denoised prediction (below), so a lambda that fills
+//    `video` with what belongs in `video_velocity` type-checks and renders.
+//    Nothing in the signature can stop it; the four per-arm invariants in
+//    `test_ltx2_video` do, and mutations M1-M4 — one per arm, each handing the
+//    seam a velocity — are red against them. A structural claim a type does not
+//    enforce is worth less than a gate that catches the substitution, so the
+//    gate is where this is argued.
 //
 // 2. ONE PASS LIST, TWO GUIDERS. `_guided_denoise` takes the UNION of what the
 //    two guiders want — one `uncond` pass if either asks (`:102-109`), one `ptb`
@@ -172,7 +182,7 @@ struct Ltx2GuidedDenoiseResult {
   bool modality_pass_skipped_v2a = false;
 };
 
-// `_guided_denoise` (denoisers.py:62-207).
+// `_guided_denoise` (denoisers.py:61-211).
 Ltx2GuidedDenoiseResult Ltx2GuidedDenoise(const Ltx2X0Model& transformer,
                                           const Ltx2GuidedDenoiseInputs& in);
 

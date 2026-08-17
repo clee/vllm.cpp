@@ -1,4 +1,4 @@
-// `_guided_denoise` (ltx-pipelines utils/denoisers.py:62-207) at
+// `_guided_denoise` (ltx-pipelines utils/denoisers.py:61-211) at
 // Lightricks/LTX-2 @ fd4ded7f. See ltx2_denoisers.h for the four things that
 // fail silently if guessed.
 //
@@ -162,9 +162,20 @@ Ltx2GuidedDenoiseResult Ltx2GuidedDenoise(const Ltx2X0Model& transformer,
     // Upstream never meets this because it only ever runs 48-block checkpoints;
     // this port runs reduced ones, and a smaller checkpoint is a legal thing to
     // hand it.
+    //
+    // AN EMPTY LIST IS EXEMPT, and it was not until 2026-08-17. `blocks=[]` is
+    // upstream's documented spelling for "perturb no block", distinct from
+    // `blocks=None`'s "perturb every block" (perturbations.py:26-33), named as
+    // the way to disable STG at `ltx-pipelines/docs/multimodal-guidance.md:13`,
+    // shipped in `LTX_2_3_HQ_PARAMS` (constants.py:105, :113), and reachable
+    // through `nargs="*"` (args.py:979-985). Upstream runs the pass and takes
+    // the zero term; so does this. What is refused is a list that NAMES blocks
+    // and reaches none of them, which is a request that disagrees with the
+    // CHECKPOINT rather than a caller who asked for nothing.
     const auto check_reaches_a_block = [&](const Ltx2MultiModalGuiderParams& guider,
                                            const char* which) {
       if (!guider.DoPerturbedGeneration()) return;
+      if (guider.stg_blocks.empty()) return;
       for (const int64_t block : guider.stg_blocks) {
         if (block >= 0 && block < in.num_blocks) return;
       }
@@ -184,7 +195,7 @@ Ltx2GuidedDenoiseResult Ltx2GuidedDenoise(const Ltx2X0Model& transformer,
 
   // `:121-137`. The isolated-modality pass: BOTH cross directions, ALL blocks
   // (`blocks=None`), when EITHER guider isolates. `modality_scale` is 3.0 on
-  // every video row of the params table (utils/constants.py:40-80), so this is
+  // every video row of the params table (utils/constants.py:54, :64), so this is
   // the default arm rather than a corner.
   if (video_guider.DoIsolatedModalityGeneration() ||
       audio_guider.DoIsolatedModalityGeneration()) {
@@ -200,7 +211,7 @@ Ltx2GuidedDenoiseResult Ltx2GuidedDenoise(const Ltx2X0Model& transformer,
     passes.push_back({Ltx2DenoisePass::kModality, v_context, a_context, std::move(mod)});
   }
 
-  // ── the perturbation config (denoisers.py:172-186) ───────────────────────
+  // ── the perturbation config (denoisers.py:182-187) ───────────────────────
   //
   // ONE batched config over the whole pass list, then one sample slice per pass,
   // which is upstream's `batched_ptb_configs` followed by the per-sample mask the
@@ -235,7 +246,7 @@ Ltx2GuidedDenoiseResult Ltx2GuidedDenoise(const Ltx2X0Model& transformer,
     }
     // The cross flags are not per block, because `Ltx2DitPerturbation` has no
     // per-block cross vector and upstream's reader is the per-block scalar
-    // `cross_attn_skip_all` (transformer.py:335,366) rather than a mask
+    // `cross_attn_skip_all` (transformer.py:335,367) rather than a mask
     // multiply. That flattening is only sound while the config says the same
     // thing on every block, which is what `blocks=None` produces
     // (denoisers.py:132-135) — so it is CHECKED here rather than assumed. A
@@ -274,7 +285,7 @@ Ltx2GuidedDenoiseResult Ltx2GuidedDenoise(const Ltx2X0Model& transformer,
     if (in.video != nullptr) {
       video_in = *in.video;
       video_in.context = pass.video_context;
-      // `enabled=not v_skip` (`:151`). A skipped modality stays PRESENT, so the
+      // `enabled=not v_skip` (`:158`). A skipped modality stays PRESENT, so the
       // other stream's cross attention still reads its latent
       // (transformer.py:269 tests presence, not `enabled`).
       video_in.enabled = !v_skip;

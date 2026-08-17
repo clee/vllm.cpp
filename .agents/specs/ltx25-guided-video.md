@@ -34,7 +34,7 @@ does not have.
 
 **In:**
 
-- `Ltx2GuidedDenoise` — `_guided_denoise` (`utils/denoisers.py:62-207`) in its
+- `Ltx2GuidedDenoise` — `_guided_denoise` (`utils/denoisers.py:61-211`) in its
   own translation unit mirroring upstream's own file.
 - The four passes it assembles: `cond`, `uncond`, `ptb`, `mod`.
 - The `SKIP_A2V_CROSS_ATTN` / `SKIP_V2A_CROSS_ATTN` halves of
@@ -43,20 +43,27 @@ does not have.
 - The negative conditioning for the video path — the second half of the encode
   `GenerateAudioOnly` already performs and discards.
 - The video guidance request extras that `default_1_stage_arg_parser`
-  (`utils/args.py:930-1010`) exposes, gated by `allow_guidance_override`.
+  (`utils/args.py:930-1067`) exposes, gated by `allow_guidance_override`.
 - The `one_stage` pipeline as the reachable consumer.
 
 **Out, and owed rather than silently absent:**
 
-- The other three video pipelines that need this seam
-  (`a2vid_two_stage`, `ti2vid_two_stages`, `ti2vid_two_stages_hq`,
-  `keyframe_interpolation`). Each is its own row; this row exists so that they
-  are ordinary porting work rather than blocked.
+- The other video pipelines that need this seam — `a2vid_two_stage`,
+  `ti2vid_two_stages` ([#1093](https://github.com/mudler/vllm.cpp/issues/1093)),
+  `ti2vid_two_stages_hq` (owned by #921),
+  `keyframe_interpolation` ([#1096](https://github.com/mudler/vllm.cpp/issues/1096)),
+  and beside them `hdr_ic_lora` ([#1094](https://github.com/mudler/vllm.cpp/issues/1094))
+  and `dubit` ([#1095](https://github.com/mudler/vllm.cpp/issues/1095)), which are
+  blocked on other things. This list named four pipelines and no issue numbers
+  when the spec was written; `281e6a120` (#1099) filed them while this branch was
+  open, and #1093 names this row's seam as one of the two things it waits on.
+  Each is its own row; this row exists so that they are ordinary porting work
+  rather than blocked.
 - The **device-resident** arm of the `ptb` and `mod` passes.
   `Ltx2DitForwardDevice` (`ltx2_device.h:136`) takes no `perturbations`
   argument. Refused by name on that arm rather than run unperturbed, which would
   produce a legal-looking render whose STG term is identically zero. See §4.3.
-- `BatchedPerturbationConfig`'s partial blend (`attention.py:571-572`) and
+- `BatchedPerturbationConfig`'s partial blend (`attention.py:572-573`) and
   batch > 1, which stay degenerate at the one batch size this port runs — the
   statement `ltx2.h` already carries, unchanged.
 
@@ -92,7 +99,7 @@ The perturbation types are per direction, not per modality
 | `cond` | none | — |
 | `uncond` | none | negative context on both streams |
 | `ptb` | `SKIP_VIDEO_SELF_ATTN` on `video_guider.stg_blocks`, `SKIP_AUDIO_SELF_ATTN` on `audio_guider.stg_blocks` | `attention.py:557` `use_attention = not all_perturbed` |
-| `mod` | `SKIP_A2V_CROSS_ATTN` and `SKIP_V2A_CROSS_ATTN`, **all blocks** | `transformer.py:335,366` `cross_attn_skip_all` |
+| `mod` | `SKIP_A2V_CROSS_ATTN` and `SKIP_V2A_CROSS_ATTN`, **all blocks** | `transformer.py:335,367` `cross_attn_skip_all` |
 
 ## 3. Our baseline, derived at `b5756ea8c`
 
@@ -161,10 +168,20 @@ using Ltx2X0Model = std::function<Ltx2X0Outputs(const Ltx2ModalityInput* video,
 That is the structural claim this row is graded on. The x0 conversion happens
 **inside the caller's lambda**, which is upstream's `X0Model` wrapper
 (`blocks.py:480-482` builds it; `model.py:590-604` is its forward), so the seam
-combines already-denoised tensors and cannot be handed a velocity. Converting
-once after the guider instead is a **different function on the default arm** —
-`rescale_scale` is 0.7 on every video row — and that is #1039, on the audio arm,
-in this tree, six days ago.
+combines already-denoised tensors. Converting once after the guider instead is a
+**different function on the default arm** — `rescale_scale` is 0.7 on every
+video row — and that is #1039, on the audio arm, in this tree, six days ago.
+
+**That is caller discipline, not a type guarantee**, and this section claimed the
+stronger thing ("cannot be handed a velocity") until 2026-08-17.
+`Ltx2X0Outputs` carries `video_velocity` and `audio_velocity` beside `video` and
+`audio` (`ltx2_denoisers.h`), because the per-arm invariant is an equation
+between three tensors and cannot be checked from the denoised one alone. A lambda
+that fills `video` with the velocity therefore compiles and renders. What stops
+it is the gate, not the signature: mutations M1 to M4 hand the seam a velocity on
+one arm each and all four are red. The claim is restated rather than the code
+changed, because dropping the velocity from the struct would delete the evidence
+the invariant is checked against.
 
 It also means the host forward and the device forward are the same seam with two
 lambdas, and that the four later pipelines supply their own conditioning without
@@ -185,12 +202,12 @@ schedules.
   (`:111-119`).
 - `mod` when either guider isolates, all blocks, both cross directions
   (`:121-137`).
-- `enabled = not skip` per modality (`:151,161`), which is
+- `enabled = not skip` per modality (`:158,168`), which is
   `Ltx2ModalityInput::enabled` here.
 - the combination per modality with that modality's own guider (`:203-204`).
 
 Perturbations route through `Ltx2BatchedPerturbationConfig`: one config built
-over all N passes (`denoisers.py:172-176`), then `BatchSlice(i, i+1)` per pass,
+over all N passes (`denoisers.py:182-187`), then `BatchSlice(i, i+1)` per pass,
 then flattened into the `Ltx2DitPerturbation` the forward takes. At batch 1 the
 slice is the pass's own mask, which is exactly the degeneracy `ltx2.h` already
 records.
@@ -199,9 +216,9 @@ records.
 
 `Ltx2DitPerturbation` grows two booleans, `video_cross_attn_skip_all` and
 `audio_cross_attn_skip_all`, mirroring `TransformerArgs.cross_attn_skip_all`
-(`transformer_args.py:118`). They gate the A2V and V2A branches at
+(`transformer_args.py:70`). They gate the A2V and V2A branches at
 `ltx2_dit.cpp`'s `if (run_a2v)` / `if (run_v2a)`, mirroring
-`transformer.py:335` and `:366`. Note the polarity: `video.cross_attn_skip_all`
+`transformer.py:335` and `:367`. Note the polarity: `video.cross_attn_skip_all`
 gates **A2V** (audio into video) and `audio.cross_attn_skip_all` gates **V2A**,
 because the flag rides on the stream being *written*.
 
@@ -211,7 +228,7 @@ still reads the pre-cross state for the other.
 
 `ltx2.h:41-49`'s NOT-PORTED entry is corrected in the same change. Its stated
 reason — "nothing upstream that this port serves constructs them" — was true for
-text-to-audio, which pins `modality_scale = 1.0` (`t2a_one_stage.py:200-202`),
+text-to-audio, which pins `modality_scale = 1.0` (`t2a_one_stage.py:202`),
 and is false for every video pipeline, all of which default it to 3.0.
 
 **The device arm is refused, not degraded.** `Ltx2DitForwardDevice` has no
@@ -236,7 +253,7 @@ already exist for the positive stream (`prompt_embeds_path`,
 `audio_prompt_embeds_path`): `negative_prompt_embeds_path` and
 `negative_audio_prompt_embeds_path`. This is a **local adaptation**, recorded as
 one: upstream encodes `[prompt, negative_prompt]` in one `PromptEncoder` call
-(`ti2vid_one_stage.py:170-178`) and has no embeds surface at all. The adaptation
+(`ti2vid_one_stage.py:166-174`) and has no embeds surface at all. The adaptation
 is the existing one applied to the second of upstream's two encodings, not a new
 concept. Without a tower and without those files, a guider that asks for the
 unconditional pass is refused by name, exactly as T2A is at
@@ -244,7 +261,7 @@ unconditional pass is refused by name, exactly as T2A is at
 
 ### 4.5 The request extras
 
-Mirroring `default_1_stage_arg_parser` (`utils/args.py:947-1010`), one extra per
+Mirroring `default_1_stage_arg_parser` (`utils/args.py:947-1066`), one extra per
 flag, each overriding one field:
 
 | Extra | Upstream flag | Field |
@@ -270,14 +287,14 @@ and is made the same way here.
 
 | Upstream | Here |
 |---|---|
-| `utils/denoisers.py:62-207` `_guided_denoise` | `Ltx2GuidedDenoise`, `src/vllm/model_executor/models/ltx2_denoisers.cpp` |
+| `utils/denoisers.py:61-211` `_guided_denoise` | `Ltx2GuidedDenoise`, `src/vllm/model_executor/models/ltx2_denoisers.cpp` |
 | `utils/denoisers.py:25-28` `_POSITIVE_ONLY_GUIDER` | the default-constructed `Ltx2MultiModalGuiderParams`, whose defaults are already `cfg 1.0 / stg 0.0 / modality 1.0` |
 | `model/transformer/model.py:590-604` `X0Model.forward` | the caller's `Ltx2X0Model` lambda, `ltx2_video.cpp` |
 | `guidance/perturbations.py:8-16` cross types | `Ltx2DitPerturbation::{video,audio}_cross_attn_skip_all` |
-| `model/transformer/transformer.py:335,366` `cross_attn_skip_all` | `ltx2_dit.cpp` A2V / V2A guards |
+| `model/transformer/transformer.py:335,367` `cross_attn_skip_all` | `ltx2_dit.cpp` A2V / V2A guards |
 | `components/guiders.py:244-273` | `Ltx2MultiModalGuidance` (unchanged) |
-| `utils/args.py:947-1010` | the six extras in §4.5 |
-| `ti2vid_one_stage.py:210-226` | the `one_stage` consumer in `ltx2_video.cpp` |
+| `utils/args.py:947-1066` | the six extras in §4.5 |
+| `ti2vid_one_stage.py:211-226` | the `one_stage` consumer in `ltx2_video.cpp` |
 
 ## 6. Gates
 
@@ -323,7 +340,7 @@ to make the symbol live would add a switch statement between the caller and the
 function upstream actually calls, and would still leave `Ltx2CfgDelta` and
 `Ltx2StgDelta` — the two arms nothing can select — dead. #1049 stays open, its
 scope narrows to those three symbols, and the honest disposition is that they
-are ported-but-unreachable arms of `guiders.py:23-27,70-74`, not a wiring gap
+are ported-but-unreachable arms of `guiders.py:11-27,56-74`, not a wiring gap
 this row can close.
 
 ## 7. Tests to port
@@ -353,9 +370,21 @@ the two double-application positions.
 `Ltx2MultiModalGuidance`, measuring the disagreement between combining in x0
 space and combining in velocity space. At 0.0 the linear terms are invariant and
 the two are the same function; at 0.7 they are not. A gate that fires at 0.0 is
-not about this defect. The existing T2A case measured 1.50e-07 against 0.352;
-the video case adds the **modality** term, which the T2A control could not carry
-because T2A pins `modality_scale = 1.0`.
+not about this defect. The existing T2A case measured 1.50e-07 against 0.352.
+
+**The modality term is in this control and is inert in it**, which is a weaker
+statement than this section made until 2026-08-17. It said the video case "adds
+the modality term, which the T2A control could not carry" and left a reader to
+infer that the control therefore covers the modality arm. It does not: pinning
+`modality_scale` to 1.0 moves the shipped-rescale disagreement from
+`4.054e-01` to `4.118e-01`, a 1.6% change, so the fourth linear term changes
+what the rescale is computed over and does not change whether the rescale is
+what breaks the equivalence. Presence is coverage; it is not discriminating
+power. **The modality arm's gate is the per-arm invariant in §7.1**, whose
+`modality` row is what mutation M4 turns red. The two numbers are now asserted
+inside the case rather than argued here, so a later reader who leans on this
+control for modality coverage is contradicted by an assertion instead of by a
+paragraph.
 
 ### 7.3 The pass count
 
@@ -380,10 +409,41 @@ asserted in prose: an arm silently skipped changes a counter no output does.
 | M9 | `ptb` pass given no self-attn perturbation | a ptb≠cond check |
 | M10 | `PostProcessLatent` applied per arm instead of after the guider | the replay check |
 | M11 | the production call site deleted (reachability) | the whole case |
+| M12 | the DiT ignores `video_cross_attn_skip_all` | §7.5 A2V row |
+| M13 | the DiT ignores `audio_cross_attn_skip_all` | §7.5 V2A row |
+| M14 | the DiT ignores BOTH cross flags | §7.5, and the shipped-path `mod != cond` check |
+| M15 | the DiT SWAPS which flag gates which direction | §7.5 both rows |
 
 Each mutation reports three facts: `git diff --stat`, whether it **BUILT** with
 the compile-error count, and the exit code captured directly. A non-building
 mutation reads exactly like a passing test.
+
+### 7.5 The two cross directions, gated per direction
+
+M12, M13 and M15 were all **GREEN** against the first draft of this row's gate,
+which had no direct DiT-level cross case: only M14 was caught. A build that
+plumbs both flags and applies exactly one, or applies both to the wrong
+directions, renders — on the DEFAULT video arm, whose `modality_scale` is 3.0 —
+with the isolated-modality term half wrong.
+
+Two things made the shipped-path case blind to it. The end-to-end
+`MaxAbsDiffOf(video_first_modality, video_first_cond)` still fires with one
+direction applied, because the modality pass still differs from `cond`. And
+`Ltx2ConditioningTrace::video_modality_skipped_{a2v,v2a}` is assigned from the
+perturbation struct **the seam built** (`ltx2_denoisers.cpp:315-316`), so it
+records what was handed over and nothing about what the DiT did with it — while
+its message claimed the latter.
+
+The instrument is a **direct `Ltx2DitForward` case per direction**, mirroring the
+self-attention one this file already had. Separation comes from upstream's own
+predicates (`transformer.py:265-269`): `run_a2v` needs the VIDEO stream enabled
+and the audio stream merely PRESENT, and `run_v2a` the reverse. So a forward with
+`audio->enabled = false` runs A2V alone, and one with `video->enabled = false`
+runs V2A alone. Each row asserts both halves — the flag for that direction MOVES
+the written stream, and the flag for the other direction leaves it BIT-IDENTICAL
+— which is what makes the swap detectable rather than only the omission. The
+per-block-pair coupling that defeats a both-enabled forward (block 1's V2A reads
+what block 0's A2V wrote) never arises, because only one direction runs at all.
 
 ## 8. Risks and decisions
 
@@ -427,10 +487,18 @@ Stop and report `NEEDS_DECISION` rather than narrowing silently if:
 - **The device-resident `ptb` and `mod` passes.** `Ltx2DitForwardDevice` takes
   no `perturbations`. Owned by this row's follow-up issue; refused by name until
   then.
-- **The other four pipelines** — `a2vid_two_stage`, `ti2vid_two_stages`,
-  `ti2vid_two_stages_hq`, `keyframe_interpolation`. Each needs its own row; none
-  is blocked on this seam any more.
+- **The other four pipelines** — `a2vid_two_stage`, `ti2vid_two_stages`
+  ([#1093](https://github.com/mudler/vllm.cpp/issues/1093)),
+  `ti2vid_two_stages_hq` (#921),
+  `keyframe_interpolation` ([#1096](https://github.com/mudler/vllm.cpp/issues/1096)).
+  Each needs its own row; none is blocked on this seam any more.
 - **#1049's remaining three symbols** — see §6c.
+- **[#1111](https://github.com/mudler/vllm.cpp/issues/1111) — the T2A arm still
+  refuses an EMPTY `audio_stg_blocks`.** The same divergence this row's review
+  found on the video path, in `ltx2_t2a.cpp:203-214`, which landed with #1032 and
+  is not this row's code. Fixing it moves a landed row's gated behaviour and one
+  of its cases, so it takes the normal row-spec-review path. Until then the two
+  arms disagree about the same request.
 - **An oracle-run comparison.** vLLM-Omni is UNPINNED (#633) and carries no
   LTX-2.5 recipe; no LTX-2.5 checkpoint here has a recorded sha256 (#1048). The
   guidance arithmetic is gated against upstream **source**, not against upstream
@@ -453,15 +521,47 @@ one. **Measured, not argued:** every existing golden in `test_ltx2_video` held
 unchanged across the change, including the `distilled_two_stage` renders and the
 DFR and retake ones.
 
-**Two refusals that upstream does not have.** Both are cases where upstream's
+**One refusal that upstream does not have.** It is a case where upstream's
 behaviour is a silent zero rather than an error, and where the render finishes:
 
 - an `stg_blocks` list naming no block this checkpoint has. Upstream's
   `Perturbation.is_perturbed` is a membership test (`perturbations.py:26-33`), so
   `[28]` on a two-block DiT perturbs nothing and leaves
   `stg_scale * (cond - perturbed)` at exactly zero. Upstream never meets it
-  because it only runs 48-block checkpoints; this port runs reduced ones.
-- an EMPTY `stg_blocks` beside a non-zero STG scale, for the same reason.
+  because it only runs 48-block checkpoints; this port runs reduced ones. The
+  refusal is about a request that disagrees with the **checkpoint**, which is a
+  local condition rather than an upstream one.
+
+**A second refusal was landed on this branch and is retired in the review
+repair.** An EMPTY `stg_blocks` beside a non-zero STG scale was refused for the
+same "the term would be exactly zero" reason. Every clause of that reason is
+true, and none of it makes the configuration illegal upstream — which is the only
+question a mirror gets to ask. Measured at `fd4ded7f`:
+
+| Evidence | Where |
+|---|---|
+| "Set to `[]` to disable STG", in the same table and idiom as `stg_scale` → 0.0 | `ltx-pipelines/docs/multimodal-guidance.md:13` |
+| `MultiModalGuiderParams.stg_blocks` DEFAULTS to `[]` | `guiders.py:204` |
+| `--video-stg-blocks` / `--audio-stg-blocks` are `nargs="*"`, so `[]` has a CLI spelling; `nargs="+"` was the one-character way to forbid it | `args.py:979-985`, `:1039-1045`, `:1107-1113` |
+| `LTX_2_3_HQ_PARAMS` SHIPS `stg_blocks=[]` on both modalities | `constants.py:105`, `:113` |
+| no validation of `stg_blocks` anywhere in that tree — no emptiness, length or range check | measured by a whole-tree search with the null results recorded |
+
+`blocks=None` means EVERY block and `blocks=[]` means NO block
+(`perturbations.py:26-33`), so the empty list is how a caller says the second
+thing — and `ApplyStgBlocksExtra` exists precisely to keep PRESENT-and-empty
+distinct from ABSENT. Refusing it made that distinction unreachable, which is
+the shape of the defect rather than a matter of taste. Upstream does not skip
+the pass either: `do_perturbed_generation` reads `stg_scale` alone
+(`guiders.py:279-281`), so the `ptb` entry is appended and its result equals
+`cond`. This port now does the same, and the case asserts the exact equality
+rather than a tolerance.
+
+**The same refusal exists on the T2A arm and is NOT changed here.**
+`ltx2_t2a.cpp:203-214` computes the block mask and refuses when no bit is set,
+which catches the empty list as well as the out-of-range one. It landed with
+[#1032](https://github.com/mudler/vllm.cpp/issues/1032) and is not this row's
+code; changing it would alter a landed row's gated behaviour and one of its
+cases. Filed and listed under `## Owed`.
 
 **A cross perturbation that differs between blocks is refused rather than
 widened.** `Ltx2DitPerturbation` carries one boolean per direction, which is
@@ -504,6 +604,61 @@ and the case now says why in an assertion instead of leaving it unexplained.
 
 **A residual, stated.** Nothing here compares against a running oracle; see §0.
 
+### 11.1 The fresh review, and what it moved
+
+One BLOCKING finding and ten non-blocking ones. The core was reproduced and is
+not revisited: the seam, the x0 space, all four arms, the reachability, and the
+gate. The reviewer also confirmed the live defect independently — `video_guidance`
+had exactly two hits at the merge base, a declaration and a write with no reader,
+against a positive control where `audio_guidance` finds its T2A consumer.
+
+| Finding | Disposition |
+|---|---|
+| B1 (blocking) — the two cross booleans were not gated per direction: M12, M13 and M15 were GREEN | REPAIRED. §7.5, a direct DiT-level case per direction. All four mutations now RED |
+| B2 — `docs/FEATURES.md` said T2A was "the only GUIDED arm", which this row's own new row made false | REPAIRED in the existing cell, 202 of 220 chars, prose paragraphs unchanged at 21 of 21 |
+| B3 — the EMPTY `stg_blocks` refusal diverges from upstream | REPAIRED on this row's paths; the T2A one is #1111. See §10 |
+| B4 — `INFO("arm = " << arm.name)` printed `arm = 1` | REPAIRED at all three sites in the file |
+| B5 — the rescale control's modality claim was numerically inert | RESTATED, and now asserted rather than argued. See §7.2 |
+| B6 — upstream anchor drift | REPAIRED, 41 scripted replacements with the hit count asserted per edit. See §11.2 |
+| B7 — "the seam cannot be handed a velocity" is caller discipline, not a type guarantee | RESTATED in §4.1 and in `ltx2_denoisers.h`; the code is unchanged, which is the right outcome |
+| B8 — the branch was behind `origin/main` | MERGED and re-gated; §1 now carries #1093 to #1096 from `281e6a120` |
+| B9, B11 | recorded by the reviewer as not this repair's |
+| B10 — the new `docs/USAGE.md` section documented flags and not extra keys | REPAIRED: the `/v1/videos` caveat, a flag-to-extra table, and the empty-list behaviour |
+
+**One sub-claim was REJECTED on evidence.** B3 argued an asymmetry: that
+`audio_stg_blocks=""` is still accepted on `t2a_one_stage`, because that path
+returns before `ApplyGuidanceOverrides`. It does return there, and the request is
+still refused — by `ltx2_t2a.cpp:203-214`, which builds the block mask and fails
+when no bit is set, and which `git log -S` puts on `main` at `0b0b8900f` with
+#1032 rather than on this branch. So there is no asymmetry today; the two arms
+agree, and both diverge from upstream. Fixing the video half creates the
+asymmetry, which is why #1111 exists and is listed under `## Owed` rather than
+left implied.
+
+### 11.2 The anchors
+
+Re-derived against `fd4ded7f` from the sentence making each claim, never by
+reading text out of the cited span. Corrected: `_guided_denoise` **61-211** (was
+62-207); `enabled = not skip` at **158, 168** (was 151, 161 — the `= None`
+initializers); the V2A `cross_attn_skip_all` guard at **367** (366 is blank); the
+batched config built at **182-187** (172-176 is the comment plus the per-sample
+replication at :175); the partial blend at **572-573**; the one `PromptEncoder`
+call at **166-174**; `default_1_stage_arg_parser` **930-1067** and its guider
+flags **947-1066**; the two `--*-stg-blocks` flags at **979-985** and
+**1039-1045**; `cross_attn_skip_all` DECLARED at `transformer_args.py:70` (118 is
+a call site); `modality_scale = 3.0` at `constants.py:54, :64` with
+`_PARAMS_SINCE_VERSION` at **130-133** (the cited 40-80 covers neither);
+`CFGGuider` / `STGGuider` at **11-27** and **56-74**; the `perturbations`
+ARGUMENT at `model.py:493` (492 is the `def`); `t2a_one_stage.py:202` (200-201
+are its comment); `ti2vid_one_stage.py:211-226` (210 is blank).
+
+No gate protects a spec anchor ([#632](https://github.com/mudler/vllm.cpp/issues/632)),
+so the edits were applied by a script that asserts the expected hit count per
+replacement and refuses the whole run on a mismatch — two of the 43 planned edits
+were caught that way and re-derived.
+
 ## Now
 
-Implementation and gate landed on the branch; the row awaits a fresh review.
+The fresh review returned CHANGES REQUESTED; the blocking finding and the nine
+non-blocking ones this repair owns are answered on the branch (§11.1), the branch
+is merged up to `origin/main`, and the row awaits a second fresh review.

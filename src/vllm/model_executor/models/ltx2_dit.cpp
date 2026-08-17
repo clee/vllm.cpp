@@ -384,7 +384,7 @@ void Ltx2TransformerBlockForward(vt::Device device, const Ltx2DitParams& params,
       AddGatedBroadcast(video_x, out, gate, batch, tv, dim);
     }
 
-    // `if run_v2a and not audio.cross_attn_skip_all` (transformer.py:366).
+    // `if run_v2a and not audio.cross_attn_skip_all` (transformer.py:367).
     if (run_v2a && !args.audio_cross_attn_skip_all) {
       std::vector<float> scale_a, shift_a, scale_v, shift_v;
       av_scale_shift(w.scale_shift_table_a2v_ca_audio, args.audio_cross_scale_shift, ta, adim, 2,
@@ -830,7 +830,7 @@ Ltx2DitOutputs Ltx2DitForward(vt::Device device, const Ltx2DitParams& params,
                        params.audio_num_attention_heads, have_both ? video : nullptr);
   }
 
-  // `perturbations` (model.py:492). A vector that is not exactly `num_layers`
+  // `perturbations` (model.py:493). A vector that is not exactly `num_layers`
   // long is REFUSED rather than indexed defensively: a config built for another
   // layer count would otherwise perturb a prefix of the blocks and leave the rest
   // alone, which is a legal-looking STG pass over the wrong blocks and renders.
@@ -878,7 +878,7 @@ Ltx2DitOutputs Ltx2DitForward(vt::Device device, const Ltx2DitParams& params,
                                     perturbations->audio_self_attn[static_cast<size_t>(i)] != 0;
       // Not indexed by block: the only thing that builds these asks for ALL
       // blocks (`blocks=None`, denoisers.py:132-135), and upstream's reader is a
-      // per-block scalar rather than a mask multiply (transformer.py:335,366).
+      // per-block scalar rather than a mask multiply (transformer.py:335,367).
       a.video_cross_attn_skip_all = perturbations->video_cross_attn_skip_all;
       a.audio_cross_attn_skip_all = perturbations->audio_cross_attn_skip_all;
     }

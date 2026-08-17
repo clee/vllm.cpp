@@ -1496,7 +1496,7 @@ void AssertGeneratedKeyframesSupported(bool has_embedding, const std::string& di
 
 // ── the guiders (row LTX25-GUIDED-VIDEO, #1092) ────────────────────────────
 
-// `--*-stg-blocks`, `nargs="*"` (utils/args.py:980-985, :1040-1045). An extra
+// `--*-stg-blocks`, `nargs="*"` (utils/args.py:979-985, :1039-1045). An extra
 // that is PRESENT and empty is upstream's empty list — "perturb nothing" — and
 // stays distinct from an ABSENT extra, which takes the params table's own value.
 // Collapsing the two would make `video_stg_blocks=` silently mean block 28.
@@ -1522,8 +1522,8 @@ void ApplyStgBlocksExtra(const std::map<std::string, std::string>& extras, const
   }
 }
 
-// One CLI flag each, from `default_1_stage_arg_parser` (utils/args.py:947-1010
-// for the video row, :1011-1075 for the audio one). Each extra overrides ONE
+// One CLI flag each, from `default_1_stage_arg_parser` (utils/args.py:947-1066:
+// the video row's six flags open at :948 and the audio row's at :1008). Each extra overrides ONE
 // field of the phase's own resolved guider, which is what one flag does.
 //
 // REFUSED WHOLESALE on a phase that fixes its guidance. `allow_guidance_override
@@ -1574,25 +1574,40 @@ void ApplyGuidanceOverrides(const std::map<std::string, std::string>& extras,
   };
   check_skip(kLtx2VideoSkipStepExtra, video->skip_step);
   check_skip(kLtx2AudioSkipStepExtra, audio->skip_step);
-  // `stg_blocks` is only read when the perturbed pass runs, so an out-of-range
-  // block is refused HERE rather than inside the DiT, where the message would be
-  // about a mask length. `blocks is None` — upstream's "every block" — has no CLI
-  // spelling and none is invented, so an EMPTY list beside a non-zero STG scale
-  // is a perturbed pass identical to the conditional one, which is a wasted
-  // forward and a guidance term of exactly zero.
-  const auto check_blocks = [&](const Ltx2MultiModalGuiderParams& g, const char* which,
-                                const char* key) {
-    if (!g.DoPerturbedGeneration()) return;
-    if (g.stg_blocks.empty()) {
-      Fail(std::string("the ") + which + " STG scale is " + std::to_string(g.stg_scale) +
-           " and its block list is EMPTY, so the perturbed forward would be identical to the "
-           "conditional one and `stg_scale * (cond - perturbed)` would be exactly zero "
-           "(guiders.py:264). Set '" + std::string(key) +
-           "' to the blocks to perturb, or set the STG scale to 0.0");
-    }
-  };
-  check_blocks(*video, "video", kLtx2VideoStgBlocksExtra);
-  check_blocks(*audio, "audio", kLtx2AudioStgBlocksExtra);
+  // AN EMPTY LIST IS NOT REFUSED, and this function refused it until 2026-08-17.
+  //
+  // The refusal read: an empty `stg_blocks` beside a non-zero STG scale is a
+  // perturbed pass identical to the conditional one, so it is a wasted forward
+  // and a guidance term of exactly zero. Every clause of that is true and none
+  // of it makes the configuration illegal upstream, which is the only question
+  // a mirror gets to ask. Measured at Lightricks/LTX-2 `fd4ded7f`:
+  //
+  //   - `packages/ltx-pipelines/docs/multimodal-guidance.md:13` documents it as
+  //     THE way to turn STG off: "Set to `[]` to disable STG", in the same table
+  //     and the same idiom as `stg_scale` -> 0.0 and `cfg_scale` -> 1.0.
+  //   - `MultiModalGuiderParams.stg_blocks` DEFAULTS to `[]`
+  //     (guiders.py:204, `field(default_factory=list)`).
+  //   - `--video-stg-blocks` / `--audio-stg-blocks` are `nargs="*"`
+  //     (args.py:979-985, :1039-1045, :1107-1113), so the flag with zero values
+  //     parses to `[]`. `nargs="+"` was the one-character way to forbid it.
+  //   - `LTX_2_3_HQ_PARAMS` SHIPS `stg_blocks=[]` on both modalities
+  //     (constants.py:105, :113).
+  //   - There is no validation of `stg_blocks` anywhere in that tree: no
+  //     emptiness check, no length check, no range check against the block
+  //     count.
+  //
+  // Upstream's semantics are unambiguous and are the reason `[]` is meaningful:
+  // `blocks=None` means EVERY block and `blocks=[]` means NO block
+  // (perturbations.py:26-33). The empty list is how a caller says the second
+  // thing, and `ApplyStgBlocksExtra` above exists to keep PRESENT-and-empty
+  // distinct from ABSENT for exactly that reason. Refusing it here made that
+  // distinction unreachable.
+  //
+  // WHAT IS STILL REFUSED, one layer down in `Ltx2GuidedDenoise`: a list that
+  // NAMES blocks and reaches none of them, e.g. `[28]` on a two-block DiT. That
+  // is a local condition rather than an upstream one — upstream only ever runs
+  // 48-block checkpoints and this port runs reduced ones — and it is a mismatch
+  // between a request and a checkpoint rather than an expressed intent.
 }
 
 // Everything step 0 of phase 0 produced, for the gate that decides WHICH SPACE
@@ -1667,7 +1682,7 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
                        kv.first == kLtx2AudioStgBlocksExtra ||
                        // The VIDEO guider's row (row LTX25-GUIDED-VIDEO, #1092),
                        // from the same parser as the audio row above
-                       // (utils/args.py:947-1010).
+                       // (utils/args.py:947-1066).
                        kv.first == kLtx2VideoCfgScaleExtra ||
                        kv.first == kLtx2VideoStgScaleExtra ||
                        kv.first == kLtx2VideoRescaleScaleExtra ||
@@ -2603,7 +2618,7 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
   }
 
   // The second half of upstream's ONE `PromptEncoder` call over
-  // `[prompt, negative_prompt]` (ti2vid_one_stage.py:170-178). Encoded ONLY when
+  // `[prompt, negative_prompt]` (ti2vid_one_stage.py:166-174). Encoded ONLY when
   // a guider asks: `do_unconditional_generation` is `not isclose(cfg_scale, 1.0)`
   // (guiders.py:275-277), and at 1.0 there is no unconditional forward, so
   // encoding it would be a wasted host-side 12B pass per request.

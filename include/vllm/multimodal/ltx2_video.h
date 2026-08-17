@@ -461,7 +461,7 @@ inline constexpr char kLtx2AudioStgBlocksExtra[] = "audio_stg_blocks";
 
 // THE VIDEO GUIDER, row LTX25-GUIDED-VIDEO (#1092). The same row of flags on the
 // other stream, from the same parser (`default_1_stage_arg_parser`,
-// utils/args.py:947-1010). ABSENT MEANS the params table's own value: 3.0 / 1.0 /
+// utils/args.py:947-1066). ABSENT MEANS the params table's own value: 3.0 / 1.0 /
 // 0.7 / 3.0 and block 28 on the 2.3-and-later lineage
 // (utils/constants.py:40-88).
 //
@@ -491,7 +491,7 @@ inline constexpr char kLtx2V2aGuidanceScaleExtra[] = "v2a_guidance_scale";
 //
 // Upstream has no embeds surface at all: every pipeline encodes
 // `[prompt, negative_prompt]` in ONE `PromptEncoder` call
-// (ti2vid_one_stage.py:170-178) and takes `.video_encoding` / `.audio_encoding`
+// (ti2vid_one_stage.py:166-174) and takes `.video_encoding` / `.audio_encoding`
 // from each half. `prompt_embeds_path` and the `audio_prompt_embeds_path` extra
 // are this port's own affordance for running the DiT without a 12B tower; these
 // two are the SAME affordance applied to the second of upstream's two

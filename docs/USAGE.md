@@ -1000,27 +1000,65 @@ them per modality:
 | isolated modality | the audio<->video cross attention off in every block | `modality_scale != 1.0` |
 
 Seven per-generation knobs mirror upstream's `default_1_stage_arg_parser` and
-each takes the checkpoint generation's value when absent:
-`--video-cfg-guidance-scale`, `--video-stg-guidance-scale`,
-`--video-rescale-scale`, `--video-skip-step`, `--video-stg-blocks` (comma
-separated), `--a2v-guidance-scale` and `--v2a-guidance-scale`. The audio row and
+each takes the checkpoint generation's value when absent. The audio row and
 `--negative-prompt` are shared with text-to-audio and are no longer refused on a
 video pipeline; upstream's parser carries both rows side by side, and the old
 refusal rested on a reading of upstream that was wrong and harmless only while
 nothing here read them.
 
+| `ltx2-gen` flag | per-generation extra | meaning |
+|---|---|---|
+| `--video-cfg-guidance-scale` | `video_cfg_guidance_scale` | video `cfg_scale`; `1.0` turns the unconditional forward off |
+| `--video-stg-guidance-scale` | `video_stg_guidance_scale` | video `stg_scale`; `0.0` turns the perturbed forward off |
+| `--video-rescale-scale` | `video_rescale_scale` | video `rescale_scale`, applied to the DENOISED prediction |
+| `--video-skip-step` | `video_skip_step` | `0` never skips; `n` runs every `n+1`-th step |
+| `--video-stg-blocks` | `video_stg_blocks` | comma separated block indices; EMPTY disables STG, see below |
+| `--a2v-guidance-scale` | `a2v_guidance_scale` | video `modality_scale`; `1.0` turns the isolated-modality forward off |
+| `--v2a-guidance-scale` | `v2a_guidance_scale` | audio `modality_scale` |
+| `--negative-prompt` | `negative_prompt` | the unconditional forward's conditioning |
+
+The audio row is the same six spellings with `audio_` in place of `video_`:
+`audio_cfg_guidance_scale`, `audio_stg_guidance_scale`, `audio_rescale_scale`,
+`audio_skip_step`, `audio_stg_blocks`, and `v2a_guidance_scale` for its
+`modality_scale`.
+
+Those extras ride the per-generation `extra_keys` / `extra_values` array on
+`vllm_video_params`, so the C ABI reaches the same path with no new field. They
+are per-GENERATION and therefore reach the CLI and the C ABI and **not**
+`/v1/videos`, which forwards no per-generation extra to any engine
+([#928](https://github.com/mudler/vllm.cpp/issues/928)). `pipeline_kind` is a
+LOAD knob and does reach the server, so a server started with
+`--video-extra pipeline_kind=one_stage` renders every request through the guided
+denoiser at the recipe's own guider values and no request can change them.
+
+**An EMPTY `--video-stg-blocks` is accepted and means "perturb no block".** That
+is upstream's own idiom — `docs/multimodal-guidance.md:13` says "Set to `[]` to
+disable STG", the field defaults to `[]`, the flags are `nargs="*"`, and the
+shipped HQ params row uses it — and it stays distinct from OMITTING the flag,
+which takes the params table's value. It disables the STG signal and not the STG
+cost: upstream selects the perturbed pass from `stg_scale` alone, so the forward
+still runs and contributes exactly zero. Set the scale to `0.0` to skip the
+forward as well. This page and this port refused the empty list until
+2026-08-17.
+
 **The unconditional forward needs a negative conditioning, and there are two
 ways to supply one.** With a text tower, `--negative-prompt` (or the recipe's
 own default) is encoded through the same chain as the positive prompt. Without
-one, `--negative-prompt-embeds` and `--negative-audio-prompt-embeds` are the
-negative half of the `prompt_embeds_path` fallback: two files at the DiT's two
-cross-attention widths, the same row count as the positive pair. With neither, a
+one, `--negative-prompt-embeds` and `--negative-audio-prompt-embeds` — the LOAD
+extras `negative_prompt_embeds_path` and `negative_audio_prompt_embeds_path` —
+are the negative half of the `prompt_embeds_path` fallback: two files at the
+DiT's two cross-attention widths, the same row count as the positive pair. Being
+LOAD extras they DO reach the server, through `--video-extra`. With neither, a
 `cfg_scale` other than 1.0 is **refused by name** rather than served the positive
 context twice, which would leave the whole classifier-free term at exactly zero.
 
-**A block index the checkpoint does not have is refused.** `stg_blocks` is a
-membership test upstream, so naming block 28 on a model with fewer blocks
-perturbs nothing and leaves `stg_scale * (cond - perturbed)` at exactly zero.
+**A block index the checkpoint does not have is refused**, which is the case the
+empty list above is NOT. `stg_blocks` is a membership test upstream, so naming
+block 28 on a model with fewer blocks perturbs nothing and leaves
+`stg_scale * (cond - perturbed)` at exactly zero — the same zero, reached by a
+request that disagrees with the checkpoint rather than by a caller who asked for
+no perturbation. Upstream never meets it because it only ships 48-block
+checkpoints, so this refusal is local to this port and is named as such.
 
 **The distilled and retake recipes refuse every one of these flags.** Their
 guidance is distilled into the weights, so honouring an override would sample a
