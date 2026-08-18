@@ -22,12 +22,15 @@
 #include <mutex>
 #include <cstdint>
 #include <cstdio>
+#include <exception>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <memory>
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #if defined(_WIN32)
@@ -55,7 +58,9 @@
 
 #include "vllm/config/device.h"
 #include "vllm/config/scheduler.h"
+#include "vllm/config/multimodal.h"
 #include "vllm/entrypoints/model_loader.h"
+#include "vllm/entrypoints/openai/chat_mm.h"
 #include "vllm/entrypoints/openai/serving_chat.h"
 #include "vllm/entrypoints/openai/serving_completion.h"
 #include "vllm/entrypoints/openai/serving_models.h"
@@ -112,6 +117,120 @@ using vllm::v1::sha256_cbor;
 using vt::DType;
 
 namespace {
+
+// ─── Threads that can still report a failure (#584) ──────────────────────────
+//
+// Every socket case below runs the server on a background thread and asserts
+// against it. A bare `std::thread` held across those assertions makes the file
+// unable to report anything at all, through two separate std::terminate paths:
+//
+//   1. `~thread` on a JOINABLE thread calls std::terminate ([thread.thread.destr]).
+//      A failing REQUIRE, or a `json::parse` on an unexpected body, unwinds past
+//      the thread object and ends the process.
+//   2. An exception escaping a thread's initial function is std::terminate too
+//      ([except.handle]/9), so a throw inside `serve()` does the same.
+//
+// On MSVC std::terminate reaches `abort()`, which is `__fastfail`, which raises
+// status 0xC0000409 and bypasses SEH by design. doctest's Windows handler never
+// runs and its buffered stdout is discarded, so a NAMED assertion failure
+// arrives in CI as an opaque exit code with no `Status:` and no `assertions:`
+// line — which is exactly what #584 has printed on both Windows lanes.
+//
+// These two types close both paths. They do not claim to fix whatever #584's
+// fast-fail actually is; they make the run able to say so.
+
+// One thread, joined by the destructor on every path. The body runs inside a
+// catch-all and the escaped exception is rethrown by `join()`, which is a
+// synchronisation point, so the store and the load do not race. The DESTRUCTOR
+// never rethrows: throwing while unwinding is the failure this type exists to
+// prevent. `stop_request` runs before the join, for a body that waits on
+// something and would otherwise never return.
+class ScopedThread {
+ public:
+  template <typename Body>
+  explicit ScopedThread(Body&& body, std::function<void()> stop_request = {})
+      : stop_request_(std::move(stop_request)),
+        escaped_(std::make_shared<std::exception_ptr>()),
+        thread_([slot = escaped_, fn = std::forward<Body>(body)]() mutable {
+          try {
+            fn();
+          } catch (...) {
+            *slot = std::current_exception();
+          }
+        }) {}
+
+  ScopedThread(const ScopedThread&) = delete;
+  ScopedThread& operator=(const ScopedThread&) = delete;
+  // Movable so a vector of them can exist; the body captured the exception slot
+  // BY VALUE rather than capturing `this`, so a move leaves no dangling handle.
+  ScopedThread(ScopedThread&&) = default;
+  // Move ASSIGNMENT stays deleted: assigning onto a joinable thread is itself
+  // std::terminate, and nothing here needs it.
+  ScopedThread& operator=(ScopedThread&&) = delete;
+
+  ~ScopedThread() { stop_and_join(); }
+
+  // Join and surface an exception the body swallowed, at a point where doctest
+  // can translate and name it.
+  void join() {
+    stop_and_join();
+    if (escaped_ && *escaped_) {
+      std::exception_ptr e = *escaped_;
+      *escaped_ = nullptr;
+      std::rethrow_exception(e);
+    }
+  }
+
+ private:
+  void stop_and_join() noexcept {
+    if (!thread_.joinable()) return;
+    if (stop_request_) {
+      // A throwing stop action would defeat the whole point on the unwind path.
+      try {
+        stop_request_();
+      } catch (...) {
+      }
+    }
+    thread_.join();
+  }
+
+  std::function<void()> stop_request_;
+  std::shared_ptr<std::exception_ptr> escaped_;
+  std::thread thread_;  // declared last: constructed after the slot it reads
+};
+
+// `ScopedThread` for the shape that dominates this file — an ApiServer served on
+// a background thread. It owns the `stop()` as well as the join, so a case that
+// throws before its stop line is reached still ends.
+//
+// The stop action waits for the accept loop first. `httplib::Server::stop()` is
+// a no-op while `is_running_` is false (`third_party/httplib/httplib.h:11460`),
+// and `listen_internal` raises that flag only once it is in the loop (`:12027`),
+// so stopping too early would leave the destructor blocked in `join()` forever —
+// turning a fast-fail into a CI timeout, which is a worse instrument, not a
+// better one. The bound is the same 500 x 2 ms the call sites already used.
+//
+// It owns the stop EXCLUSIVELY, and the call sites no longer call
+// `h.server.stop()` themselves. A second `stop()` is not a no-op: it sees
+// `is_running_` still true while the accept loop unwinds and `svr_sock_` already
+// exchanged to INVALID_SOCKET, which trips `assert(svr_sock_ != INVALID_SOCKET)`
+// at `httplib.h:11462` on every build that is not NDEBUG — which is this suite's
+// own Linux build.
+class ScopedServerThread {
+ public:
+  explicit ScopedServerThread(ApiServer& server)
+      : thread_([&server] { server.serve(); },
+                [&server] {
+                  for (int i = 0; i < 500 && !server.is_running(); ++i)
+                    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                  server.stop();
+                }) {}
+
+  void join() { thread_.join(); }
+
+ private:
+  ScopedThread thread_;
+};
 
 // ─── Synthetic weights (mirrors test_serving.cpp) ────────────────────────────
 uint64_t Mix(uint64_t x) {
@@ -1238,7 +1357,7 @@ TEST_CASE("api_server: socket smoke — real HTTP requests over an ephemeral por
 
   const int port = h.server.bind_to_any_port("127.0.0.1");
   REQUIRE(port > 0);
-  std::thread server_thread([&h]() { h.server.serve(); });
+  ScopedServerThread server_thread(h.server);
   // Wait until the accept loop is up.
   for (int i = 0; i < 500 && !h.server.is_running(); ++i)
     std::this_thread::sleep_for(std::chrono::milliseconds(2));
@@ -1297,8 +1416,7 @@ TEST_CASE("api_server: socket smoke — real HTTP requests over an ephemeral por
     CHECK(j.at("choices").at(0).at("message").at("role") == "assistant");
   }
 
-  h.server.stop();
-  server_thread.join();
+  server_thread.join();  // stops the server, then joins
 }
 
 // Route-registration gate over a real socket: /tokenizer_info is ABSENT (404)
@@ -1317,7 +1435,7 @@ TEST_CASE("api_server: /tokenizer_info + /abort_requests are opt-in routes") {
     h.server.set_tokenizer(&Fixture(), kMaxModelLen);
     const int port = h.server.bind_to_any_port("127.0.0.1");
     REQUIRE(port > 0);
-    std::thread server_thread([&h]() { h.server.serve(); });
+    ScopedServerThread server_thread(h.server);
     for (int i = 0; i < 500 && !h.server.is_running(); ++i)
       std::this_thread::sleep_for(std::chrono::milliseconds(2));
     REQUIRE(h.server.is_running());
@@ -1332,8 +1450,7 @@ TEST_CASE("api_server: /tokenizer_info + /abort_requests are opt-in routes") {
     REQUIRE(abort);
     CHECK(abort->status == 404);  // no callback → route not registered
 
-    h.server.stop();
-    server_thread.join();
+    server_thread.join();  // stops the server, then joins
   }
 
   SUBCASE("backings attached → routes serve (200)") {
@@ -1348,7 +1465,7 @@ TEST_CASE("api_server: /tokenizer_info + /abort_requests are opt-in routes") {
         });
     const int port = h.server.bind_to_any_port("127.0.0.1");
     REQUIRE(port > 0);
-    std::thread server_thread([&h]() { h.server.serve(); });
+    ScopedServerThread server_thread(h.server);
     for (int i = 0; i < 500 && !h.server.is_running(); ++i)
       std::this_thread::sleep_for(std::chrono::milliseconds(2));
     REQUIRE(h.server.is_running());
@@ -1367,8 +1484,7 @@ TEST_CASE("api_server: /tokenizer_info + /abort_requests are opt-in routes") {
     CHECK(json::parse(abort->body).at("aborted") == 2);
     CHECK(aborted_calls == 1);
 
-    h.server.stop();
-    server_thread.join();
+    server_thread.join();  // stops the server, then joins
   }
 }
 
@@ -1387,15 +1503,14 @@ TEST_CASE("api_server: ConfigureUtilityEndpoints wires the production C8 surface
   auto with_server = [](ServerHarness& h, auto&& body) {
     const int port = h.server.bind_to_any_port("127.0.0.1");
     REQUIRE(port > 0);
-    std::thread server_thread([&h]() { h.server.serve(); });
+    ScopedServerThread server_thread(h.server);
     for (int i = 0; i < 500 && !h.server.is_running(); ++i)
       std::this_thread::sleep_for(std::chrono::milliseconds(2));
     REQUIRE(h.server.is_running());
     httplib::Client client("127.0.0.1", port);
     client.set_read_timeout(5, 0);
     body(client);
-    h.server.stop();
-    server_thread.join();
+    server_thread.join();  // stops the server, then joins
   };
 
   // RED: a default production server WITHOUT the wiring seam 404s every C8 route,
@@ -1529,15 +1644,19 @@ TEST_CASE("api_server: concurrent requests share AsyncLLM without state races") 
 
   const int port = h.server.bind_to_any_port("127.0.0.1");
   REQUIRE(port > 0);
-  std::thread server_thread([&h]() { h.server.serve(); });
+  ScopedServerThread server_thread(h.server);
   for (int i = 0; i < 500 && !h.server.is_running(); ++i)
     std::this_thread::sleep_for(std::chrono::milliseconds(2));
   REQUIRE(h.server.is_running());
 
   constexpr int kClients = 6;
-  std::vector<std::thread> clients;
   std::vector<int> statuses(kClients, -1);
   std::vector<std::string> texts(kClients);
+  // Declared AFTER the vectors its bodies write into, so the joining destructor
+  // runs BEFORE those vectors are destroyed. The previous order was safe only
+  // because a joinable `std::thread` ended the process instead of unwinding.
+  std::vector<ScopedThread> clients;
+  clients.reserve(kClients);
   for (int i = 0; i < kClients; ++i) {
     clients.emplace_back([&, i]() {
       httplib::Client client("127.0.0.1", port);
@@ -1569,8 +1688,7 @@ TEST_CASE("api_server: concurrent requests share AsyncLLM without state races") 
   for (int i = 1; i < kClients; ++i)
     CHECK(texts[static_cast<size_t>(i)] == texts[0]);
 
-  h.server.stop();
-  server_thread.join();
+  server_thread.join();  // stops the server, then joins
 }
 
 TEST_CASE("api_server: configured persistent-stream capacity remains readable") {
@@ -1584,7 +1702,7 @@ TEST_CASE("api_server: configured persistent-stream capacity remains readable") 
         kStreamCapacity + ApiServer::kControlWorkerHeadroom);
   const int port = h.server.bind_to_any_port("127.0.0.1");
   REQUIRE(port > 0);
-  std::thread server_thread([&h]() { h.server.serve(); });
+  ScopedServerThread server_thread(h.server);
   for (int i = 0; i < 500 && !h.server.is_running(); ++i)
     std::this_thread::sleep_for(std::chrono::milliseconds(2));
   REQUIRE(h.server.is_running());
@@ -1616,8 +1734,7 @@ TEST_CASE("api_server: configured persistent-stream capacity remains readable") 
   CHECK(response->status == 200);
 
   parked.clear();
-  h.server.stop();
-  server_thread.join();
+  server_thread.join();  // stops the server, then joins
 }
 
 TEST_CASE("api_server: stream capacity must be positive") {
@@ -1657,7 +1774,7 @@ TEST_CASE(
 
   const int port = h.server.bind_to_any_port("127.0.0.1");
   REQUIRE(port > 0);
-  std::thread server_thread([&h]() { h.server.serve(); });
+  ScopedServerThread server_thread(h.server);
   for (int i = 0; i < 500 && !h.server.is_running(); ++i)
     std::this_thread::sleep_for(std::chrono::milliseconds(2));
   REQUIRE(h.server.is_running());
@@ -1695,8 +1812,7 @@ TEST_CASE(
   CHECK(nodelay == 1);    // RED until ApiServer calls set_tcp_nodelay(true)
 
   ::close(client_fd);
-  h.server.stop();
-  server_thread.join();
+  server_thread.join();  // stops the server, then joins
 #endif  // defined(__linux__)
 }
 
@@ -2096,15 +2212,14 @@ TEST_CASE("api_server: the /v1/videos routes do not exist without a runner") {
   auto with_server = [](ServerHarness& h, auto&& body) {
     const int port = h.server.bind_to_any_port("127.0.0.1");
     REQUIRE(port > 0);
-    std::thread server_thread([&h]() { h.server.serve(); });
+    ScopedServerThread server_thread(h.server);
     for (int i = 0; i < 500 && !h.server.is_running(); ++i)
       std::this_thread::sleep_for(std::chrono::milliseconds(2));
     REQUIRE(h.server.is_running());
     httplib::Client client("127.0.0.1", port);
     client.set_read_timeout(5, 0);
     body(client);
-    h.server.stop();
-    server_thread.join();
+    server_thread.join();  // stops the server, then joins
   };
 
   SUBCASE("no runner: every video route 404s, and the core routes are unaffected") {
@@ -2262,7 +2377,7 @@ TEST_CASE("api_server: transcriptions socket smoke (multipart), generate routes 
   AsrHarness h;
   const int port = h.server.bind_to_any_port("127.0.0.1");
   REQUIRE(port > 0);
-  std::thread server_thread([&h]() { h.server.serve(); });
+  ScopedServerThread server_thread(h.server);
   for (int i = 0; i < 500 && !h.server.is_running(); ++i)
     std::this_thread::sleep_for(std::chrono::milliseconds(2));
   REQUIRE(h.server.is_running());
@@ -2309,8 +2424,7 @@ TEST_CASE("api_server: transcriptions socket smoke (multipart), generate routes 
           "parakeet-fixture");
   }
 
-  h.server.stop();
-  server_thread.join();
+  server_thread.join();  // stops the server, then joins
 }
 
 TEST_CASE("api_server: the audio routes do not exist on a TEXT server") {
@@ -2328,7 +2442,7 @@ TEST_CASE("api_server: the audio routes do not exist on a TEXT server") {
 
   const int port = h.server.bind_to_any_port("127.0.0.1");
   REQUIRE(port > 0);
-  std::thread server_thread([&h]() { h.server.serve(); });
+  ScopedServerThread server_thread(h.server);
   for (int i = 0; i < 500 && !h.server.is_running(); ++i)
     std::this_thread::sleep_for(std::chrono::milliseconds(2));
   REQUIRE(h.server.is_running());
@@ -2361,8 +2475,7 @@ TEST_CASE("api_server: the audio routes do not exist on a TEXT server") {
     CHECK(health->status == 200);
   }
 
-  h.server.stop();
-  server_thread.join();
+  server_thread.join();  // stops the server, then joins
 }
 
 // ─── ARCH-ONE-SURFACE ROW 8: the server's --device seam ──────────────────────
@@ -2516,7 +2629,7 @@ TEST_CASE("api_server: embeddings socket smoke; generate routes 404 on the "
   EmbedHarness h;
   const int port = h.server.bind_to_any_port("127.0.0.1");
   REQUIRE(port > 0);
-  std::thread server_thread([&h]() { h.server.serve(); });
+  ScopedServerThread server_thread(h.server);
   for (int i = 0; i < 500 && !h.server.is_running(); ++i)
     std::this_thread::sleep_for(std::chrono::milliseconds(2));
   REQUIRE(h.server.is_running());
@@ -2552,8 +2665,7 @@ TEST_CASE("api_server: embeddings socket smoke; generate routes 404 on the "
           "llama-embed-fixture");
   }
 
-  h.server.stop();
-  server_thread.join();
+  server_thread.join();  // stops the server, then joins
 }
 
 TEST_CASE("api_server: /v1/embeddings does not exist on a TEXT server") {
@@ -2569,7 +2681,7 @@ TEST_CASE("api_server: /v1/embeddings does not exist on a TEXT server") {
 
   const int port = h.server.bind_to_any_port("127.0.0.1");
   REQUIRE(port > 0);
-  std::thread server_thread([&h]() { h.server.serve(); });
+  ScopedServerThread server_thread(h.server);
   for (int i = 0; i < 500 && !h.server.is_running(); ++i)
     std::this_thread::sleep_for(std::chrono::milliseconds(2));
   REQUIRE(h.server.is_running());
@@ -2584,8 +2696,7 @@ TEST_CASE("api_server: /v1/embeddings does not exist on a TEXT server") {
     CHECK(res->status == 404);
   }
 
-  h.server.stop();
-  server_thread.join();
+  server_thread.join();  // stops the server, then joins
 }
 
 TEST_CASE("platform process: Windows command line preserves every argv byte") {
@@ -2624,10 +2735,16 @@ TEST_CASE("platform shutdown: teardown drains an acquired console handler") {
   auto shutdown = std::make_unique<vllm::platform::ConsoleShutdown>(
       [&]() { ++stops; });
   shutdown->SetBeforeDrainEventForTest(before_drain);
-  std::thread handler([&] {
-    CHECK(vllm::platform::ConsoleShutdown::DispatchControlEventForTest(
-        CTRL_BREAK_EVENT, acquired, resume));
-  });
+  // Both threads below block until `resume` is set, so their stop action is
+  // that SetEvent: an unwind must not park the joining destructor forever.
+  // `resume` is manual-reset, so setting an already-set event is a no-op and
+  // the explicit SetEvent calls further down stay exactly as they were.
+  ScopedThread handler(
+      [&] {
+        CHECK(vllm::platform::ConsoleShutdown::DispatchControlEventForTest(
+            CTRL_BREAK_EVENT, acquired, resume));
+      },
+      [&] { SetEvent(resume); });
   const DWORD acquired_result = WaitForSingleObject(acquired, kWaitMs);
   if (acquired_result != WAIT_OBJECT_0) {
     SetEvent(resume);
@@ -2638,10 +2755,12 @@ TEST_CASE("platform shutdown: teardown drains an acquired console handler") {
     CloseHandle(acquired);
     FAIL("console handler did not acquire state within timeout");
   }
-  std::thread destroyer([&] {
-    shutdown.reset();
-    destroyed.store(true, std::memory_order_release);
-  });
+  ScopedThread destroyer(
+      [&] {
+        shutdown.reset();
+        destroyed.store(true, std::memory_order_release);
+      },
+      [&] { SetEvent(resume); });
   const DWORD drain_result = WaitForSingleObject(before_drain, kWaitMs);
   if (drain_result != WAIT_OBJECT_0) {
     SetEvent(resume);
@@ -2663,3 +2782,557 @@ TEST_CASE("platform shutdown: teardown drains an acquired console handler") {
   CloseHandle(acquired);
 }
 #endif
+
+// ── MULTIMODAL INPUT LIMITS, END TO END (#607 wave L2, #686) ────────────────
+//
+// The gate PR #685's reviewer owed to this wave: L1 ported the refusal and
+// proved it throws, but nothing called it on a live request, so the claim "and
+// it becomes HTTP 400" was unproven end to end. This is that proof, and it is
+// deliberately written to distinguish 400 from BOTH of the wrong answers:
+//
+//   * NOT 500. `InputValidationError` is caught at api_server.cpp:252, AHEAD of
+//     the generic `std::exception -> InternalServerError` arm. A refusal thrown
+//     as any other type would land as a 500 — a client mistake reported as a
+//     server fault — which is exactly why L1 reused the ONE validation type
+//     instead of adding a multimodal-only one. Leg 3 below pins that by
+//     throwing a bespoke type through the same seam and observing the 500.
+//   * NOT a truncated 200. Before this wave the seam took the first image_url
+//     part and `break`ed, so THREE images produced a perfectly ordinary 200
+//     about one of them (#686). Leg 2 shows a within-limit request still
+//     answering 200, so the 400 is a LIMIT decision, not "multimodal is off".
+//
+// RECORDED, because the RED run says something #686 does not: against the code
+// before this wave, leg 2 (the validate-then-build shape) returned the truncated
+// 200 exactly as #686 describes, but leg 1 — the REAL MakeQwen3VLImageChatFn —
+// returned a FIVE HUNDRED. It injects one placeholder marker per image part but
+// routes only the first image, so ExpandImagePlaceholders raised "more image
+// placeholders than grids" and the client saw a server fault carrying an
+// internal message. Both are wrong in the same way (neither is upstream's
+// refusal) and both become the 400 below, but the issue's "served with one,
+// silently" understates the production seam's case rather than overstating it.
+//
+// Upstream chain: chat_utils.py:662 (the per-item check) ->
+// multimodal/processing/context.py:409-428 (VLLMValidationError) ->
+// serve/utils/error_response.py:62-65 (BadRequestError / 400), all at
+// 5559679229bc.
+TEST_CASE("api_server: an over-limit multimodal chat request is HTTP 400") {
+  namespace oai = vllm::entrypoints::openai;
+  const HfConfig c = MakeConfig();
+  const Qwen3_5MoeWeights w = MakeWeights(c);
+  ServerHarness h(c, w, Fixture());
+
+  // A chat body carrying `n` image parts, in the OpenAI array-content form.
+  auto ImageBody = [](int n) {
+    json parts = json::array();
+    for (int i = 0; i < n; ++i) {
+      parts.push_back({{"type", "image_url"},
+                       {"image_url",
+                        {{"url", "data:image/x-raw-rgb;base64,AAAA"}}}});
+    }
+    parts.push_back({{"type", "text"}, {"text", "hello"}});
+    const json body = {
+        {"messages", json::array({{{"role", "user"}, {"content", parts}}})},
+        {"max_completion_tokens", 4},
+        {"temperature", 0.0}};
+    return body.dump();
+  };
+
+  // The seam's own limits, folded with a DEFAULT MultiModalConfig (no
+  // --limit-mm-per-prompt, no --language-model-only): image=1.
+  const vllm::MultiModalConfig default_cfg;
+  const vllm::multimodal::BaseProcessingInfo info(
+      default_cfg, oai::Qwen3VLChatSupportedMmLimits());
+
+  // ── LEG 1: the REAL production seam. MakeQwen3VLImageChatFn validates before
+  // it decodes anything, so the processor and codec below are never reached on
+  // this path — which is why a synthetic processor config is honest here: the
+  // refusal is the whole code path under test.
+  vllm::multimodal::Qwen3VLProcessorConfig pcfg;
+  pcfg.image_token_id = 3;  // inside the fixture vocab (ids 0..21)
+  const vllm::multimodal::Qwen3VLImageProcessor proc(pcfg);
+  oai::ImageCodecFn never_reached =
+      [](const oai::DecodedMedia&) -> oai::DecodedImageRgb {
+    FAIL("the codec must not run: the limit check refuses first");
+    return {};
+  };
+  h.chat.set_multimodal_chat_fn(oai::MakeQwen3VLImageChatFn(
+      proc, Fixture(), InVocabChatPrompt, never_reached, info));
+
+  ApiServer::DispatchResult refused =
+      h.server.handle_chat_completions(ImageBody(3));
+  CHECK(refused.status == 400);
+  // Explicitly NOT the 500 arm, and explicitly not a 200 body.
+  CHECK(refused.status != 500);
+  CHECK(refused.status != 200);
+  {
+    const json j = json::parse(refused.body);
+    CHECK(j.at("error").at("type") == "BadRequestError");
+    // Upstream's message text VERBATIM (context.py:421-423), reaching the wire.
+    CHECK(j.at("error").at("message") ==
+          "At most 1 image(s) may be provided in one prompt.");
+    // A truncated 200 would have carried a completion instead.
+    CHECK_FALSE(j.contains("choices"));
+  }
+
+  // ── LEG 2: the SAME server, a WITHIN-limit request, still 200. This is what
+  // separates "the limit refused you" from "multimodal requests are off": the
+  // seam here is the production SHAPE (validate, then build the engine input),
+  // with the synthetic engine's in-vocab ids standing in for the real
+  // processor's expansion, because the fixture vocab is 22 tokens wide and a
+  // real Qwen image id (151655) would run off the end of it.
+  h.chat.set_multimodal_chat_fn(
+      [&info](const std::vector<ChatMessage>& messages)
+          -> std::optional<vllm::multimodal::MultiModalInputs> {
+        oai::ValidateChatMmLimits(info, messages);
+        vllm::multimodal::MultiModalInputs mm;
+        mm.prompt_token_ids = {13, 17};  // "hello", " world"
+        vllm::multimodal::MultiModalFeatureSpec spec;
+        spec.modality = "image";
+        spec.offset = 0;
+        spec.length = 1;
+        mm.mm_features.push_back(std::move(spec));
+        return mm;
+      });
+  ApiServer::DispatchResult served =
+      h.server.handle_chat_completions(ImageBody(1));
+  CHECK(served.status == 200);
+  {
+    const json j = json::parse(served.body);
+    CHECK(j.at("object") == "chat.completion");
+    CHECK(j.at("choices").at(0).at("message").at("role") == "assistant");
+  }
+  // ...and the same seam refuses three, so leg 1's 400 was not an artifact of
+  // the production seam's own decode path.
+  CHECK(h.server.handle_chat_completions(ImageBody(3)).status == 400);
+
+  // ── LEG 3: the DISCRIMINATOR. A seam that throws anything OTHER than
+  // InputValidationError lands as a 500. Without this leg, "status == 400"
+  // could be satisfied by a handler that answered 400 to every seam failure,
+  // and the type L1 chose would be doing no work.
+  h.chat.set_multimodal_chat_fn(
+      [](const std::vector<ChatMessage>&)
+          -> std::optional<vllm::multimodal::MultiModalInputs> {
+        throw std::runtime_error("a seam failure that is NOT a validation error");
+      });
+  ApiServer::DispatchResult faulted =
+      h.server.handle_chat_completions(ImageBody(1));
+  CHECK(faulted.status == 500);
+  CHECK(json::parse(faulted.body).at("error").at("type") ==
+        "InternalServerError");
+}
+
+TEST_CASE("api_server: --language-model-only answers an image request with 400") {
+  // The flag's main observable effect, at the HTTP boundary. Upstream's
+  // --language-model-only is not "the same server, minus some VRAM" — it is a
+  // server that answers an image request with "At most 0 image(s) may be
+  // provided in one prompt." (multimodal.py:78-80 -> :326-327 ->
+  // context.py:409-428). The VRAM half is wave L3 and is NOT claimed here.
+  namespace oai = vllm::entrypoints::openai;
+  const HfConfig c = MakeConfig();
+  const Qwen3_5MoeWeights w = MakeWeights(c);
+  ServerHarness h(c, w, Fixture());
+
+  vllm::MultiModalConfig lm_only;
+  lm_only.language_model_only = true;
+  const vllm::multimodal::BaseProcessingInfo info(
+      lm_only, oai::Qwen3VLChatSupportedMmLimits());
+
+  vllm::multimodal::Qwen3VLProcessorConfig pcfg;
+  pcfg.image_token_id = 3;
+  const vllm::multimodal::Qwen3VLImageProcessor proc(pcfg);
+  oai::ImageCodecFn never_reached =
+      [](const oai::DecodedMedia&) -> oai::DecodedImageRgb {
+    FAIL("the codec must not run under --language-model-only");
+    return {};
+  };
+  h.chat.set_multimodal_chat_fn(oai::MakeQwen3VLImageChatFn(
+      proc, Fixture(), InVocabChatPrompt, never_reached, info));
+
+  const json body = {
+      {"messages",
+       json::array({{{"role", "user"},
+                     {"content",
+                      json::array({{{"type", "image_url"},
+                                    {"image_url",
+                                     {{"url",
+                                       "data:image/x-raw-rgb;base64,AAAA"}}}},
+                                   {{"type", "text"}, {"text", "hello"}}})}}})},
+      {"max_completion_tokens", 4},
+      {"temperature", 0.0}};
+  const ApiServer::DispatchResult r =
+      h.server.handle_chat_completions(body.dump());
+  CHECK(r.status == 400);
+  const json j = json::parse(r.body);
+  CHECK(j.at("error").at("type") == "BadRequestError");
+  CHECK(j.at("error").at("message") ==
+        "At most 0 image(s) may be provided in one prompt. "
+        "Set `--limit-mm-per-prompt` to increase this limit.");
+
+  // A TEXT-only request on the same server is unaffected — the flag limits
+  // multimodal INPUT, it does not turn the server off.
+  const ApiServer::DispatchResult text = h.server.handle_chat_completions(
+      R"({"messages":[{"role":"user","content":"hello"}],)"
+      R"("max_completion_tokens":4,"temperature":0.0})");
+  CHECK(text.status == 200);
+}
+
+// ---------------------------------------------------------------------------
+// POST /v1/audio/speech (W6 of #672). ADDITIVE and OPT-IN, exactly like the
+// video runner and the transcriber above: without a synthesizer attached the
+// handler refuses and the route is never registered at all.
+// ---------------------------------------------------------------------------
+
+namespace {
+std::string MusicBody() {
+  return R"({"model":"minimax-music3","lyrics":"[Verse]\nMorning light\n",
+             "description":"Genre: acoustic pop. BPM: 96.",
+             "audio_duration":12.5,"num_inference_steps":4,"seed":7})";
+}
+
+// A 44100 Hz STEREO RIFF/WAVE, so the route's output can be checked for the
+// rate and channel count Music3 declares rather than for "some bytes".
+vllm::openai::SpeechResponse StereoWav(int64_t frames) {
+  std::string wav;
+  const uint32_t payload = static_cast<uint32_t>(frames * 2 * 2);
+  const auto put32 = [&wav](uint32_t v) {
+    for (int i = 0; i < 4; ++i) wav += static_cast<char>((v >> (8 * i)) & 0xFF);
+  };
+  const auto put16 = [&wav](uint16_t v) {
+    for (int i = 0; i < 2; ++i) wav += static_cast<char>((v >> (8 * i)) & 0xFF);
+  };
+  wav += "RIFF";
+  put32(36u + payload);
+  wav += "WAVE";
+  wav += "fmt ";
+  put32(16u);
+  put16(1u);
+  put16(2u);       // stereo
+  put32(44100u);   // the family's NATIVE rate
+  put32(44100u * 4u);
+  put16(4u);
+  put16(16u);
+  wav += "data";
+  put32(payload);
+  for (int64_t i = 0; i < frames * 2; ++i) put16(static_cast<uint16_t>(i & 0xFFFF));
+  vllm::openai::SpeechResponse out;
+  out.wav = wav;
+  out.sample_rate = 44100;
+  out.channels = 2;
+  out.samples_per_channel = frames;
+  return out;
+}
+
+uint32_t WavU32(const std::string& wav, size_t offset) {
+  return static_cast<uint32_t>(static_cast<unsigned char>(wav[offset])) |
+         (static_cast<uint32_t>(static_cast<unsigned char>(wav[offset + 1])) << 8) |
+         (static_cast<uint32_t>(static_cast<unsigned char>(wav[offset + 2])) << 16) |
+         (static_cast<uint32_t>(static_cast<unsigned char>(wav[offset + 3])) << 24);
+}
+uint16_t WavU16(const std::string& wav, size_t offset) {
+  return static_cast<uint16_t>(static_cast<unsigned char>(wav[offset]) |
+                               (static_cast<unsigned char>(wav[offset + 1]) << 8));
+}
+}  // namespace
+
+TEST_CASE("api_server: /v1/audio/speech without a synthesizer is a 500, not a crash") {
+  const HfConfig c = MakeConfig();
+  const Qwen3_5MoeWeights w = MakeWeights(c);
+  ServerHarness h(c, w, Fixture());
+  // ADDITIVITY: with nothing attached the handler refuses and NO speech
+  // envelope leaks — the body is the ordinary OpenAI error object, and the
+  // route itself is never registered, so the socket answers 404 as before.
+  ApiServer::DispatchResult r = h.server.handle_audio_speech(MusicBody());
+  CHECK(r.status == 500);
+  CHECK(r.content_type == "application/json");
+  CHECK(r.body.find("No speech synthesizer configured") != std::string::npos);
+  CHECK(r.body.find("RIFF") == std::string::npos);
+  CHECK(r.body.find("minimax-music3") == std::string::npos);
+}
+
+TEST_CASE("api_server: /v1/audio/speech serves the family's 44100 Hz stereo WAV") {
+  const HfConfig c = MakeConfig();
+  const Qwen3_5MoeWeights w = MakeWeights(c);
+  ServerHarness h(c, w, Fixture());
+
+  vllm::openai::SpeechRequest seen;
+  int64_t calls = 0;
+  vllm::openai::SpeechCapabilities caps;
+  caps.family = "minimax-music3";
+  caps.sample_rate = 44100;
+  caps.channels = 2;
+  caps.requires_reference_audio = false;  // Music3 conditions on text alone
+  h.server.set_synthesizer(
+      [&](const vllm::openai::SpeechRequest& req) {
+        seen = req;
+        ++calls;
+        return StereoWav(1024);
+      },
+      caps);
+
+  ApiServer::DispatchResult r = h.server.handle_audio_speech(MusicBody());
+  CHECK(r.status == 200);
+  // AUDIO BYTES, not a JSON envelope around them.
+  CHECK(r.content_type == "audio/wav");
+  REQUIRE(r.body.size() > 44);
+  CHECK(r.body.compare(0, 4, "RIFF") == 0);
+  CHECK(WavU16(r.body, 22) == 2);      // stereo
+  CHECK(WavU32(r.body, 24) == 44100u); // the native rate, unresampled
+  CHECK(WavU16(r.body, 34) == 16);     // 16-bit PCM
+  CHECK(r.body.size() == 44u + 1024u * 2u * 2u);
+
+  // Every field reached the seam, and each value DIFFERS from its default.
+  CHECK(calls == 1);
+  CHECK(seen.lyrics == "[Verse]\nMorning light\n");
+  CHECK(seen.description == "Genre: acoustic pop. BPM: 96.");
+  CHECK(seen.text.empty());
+  CHECK(seen.audio_duration_s == doctest::Approx(12.5));
+  CHECK(seen.num_inference_steps == 4);
+  CHECK(seen.seed == 7);
+  CHECK(seen.model == "minimax-music3");
+}
+
+TEST_CASE("api_server: requires_reference_audio REFUSES before the runner is called") {
+  const HfConfig c = MakeConfig();
+  const Qwen3_5MoeWeights w = MakeWeights(c);
+  ServerHarness h(c, w, Fixture());
+
+  int64_t calls = 0;
+  vllm::openai::SpeechCapabilities caps;
+  caps.family = "indextts2";
+  caps.sample_rate = 22050;
+  caps.channels = 1;
+  // TRUE — IndexTTS-2 has NO text-only synthesis, so an absent clip is a
+  // refusal rather than a default voice. This is the value that DIFFERS from
+  // Music3's, so a pass proves the flag was consulted.
+  caps.requires_reference_audio = true;
+  h.server.set_synthesizer(
+      [&](const vllm::openai::SpeechRequest&) {
+        ++calls;
+        return StereoWav(8);
+      },
+      caps);
+
+  ApiServer::DispatchResult r = h.server.handle_audio_speech(R"({"input":"hello"})");
+  CHECK(r.status == 400);
+  CHECK(r.body.find("indextts2") != std::string::npos);
+  CHECK(r.body.find("reference_audio") != std::string::npos);
+  // THE POINT: nothing staged and nothing synthesized.
+  CHECK(calls == 0);
+
+  // And the SAME request against a family that needs no clip is served.
+  ServerHarness other(c, w, Fixture());
+  int64_t other_calls = 0;
+  vllm::openai::SpeechCapabilities music;
+  music.family = "minimax-music3";
+  music.sample_rate = 44100;
+  music.channels = 2;
+  music.requires_reference_audio = false;
+  other.server.set_synthesizer(
+      [&](const vllm::openai::SpeechRequest&) {
+        ++other_calls;
+        return StereoWav(8);
+      },
+      music);
+  ApiServer::DispatchResult served =
+      other.server.handle_audio_speech(R"({"lyrics":"[Verse]\nx\n"})");
+  CHECK(served.status == 200);
+  CHECK(other_calls == 1);
+}
+
+TEST_CASE("api_server: /v1/audio/speech surfaces the family's own refusal verbatim") {
+  const HfConfig c = MakeConfig();
+  const Qwen3_5MoeWeights w = MakeWeights(c);
+  ServerHarness h(c, w, Fixture());
+  vllm::openai::SpeechCapabilities caps;
+  caps.family = "minimax-music3";
+  caps.sample_rate = 44100;
+  caps.channels = 2;
+  h.server.set_synthesizer(
+      [](const vllm::openai::SpeechRequest&) -> vllm::openai::SpeechResponse {
+        throw std::runtime_error(
+            "MiniMax-Music3: the AUTOREGRESSIVE HEAD is not implemented (W2, issue #672)");
+      },
+      caps);
+  ApiServer::DispatchResult r = h.server.handle_audio_speech(MusicBody());
+  CHECK(r.status == 500);
+  // The message NAMES the missing stage; a generic body would throw that away
+  // and send the caller to read loader source.
+  CHECK(r.body.find("AUTOREGRESSIVE HEAD") != std::string::npos);
+  CHECK(r.body.find("#672") != std::string::npos);
+
+  // A malformed body is a 400 BEFORE the runner, and an unsupported field is
+  // refused rather than dropped.
+  CHECK(h.server.handle_audio_speech("{not json").status == 400);
+  CHECK(h.server.handle_audio_speech("{}").status == 400);
+  CHECK(h.server.handle_audio_speech(R"({"input":"hi","voice":"alloy"})").status == 400);
+  CHECK(h.server.handle_audio_speech(R"({"input":"hi","stream":true})").status == 400);
+}
+
+TEST_CASE("api_server: /v1/audio/speech route registration is ADDITIVE over a real socket") {
+  // The handler-dispatch cases above prove the LOGIC; this one proves the ROUTE
+  // TABLE, which is where additivity actually lives: without a synthesizer the
+  // endpoint must not exist at all, so a server built before W6 and one built
+  // after are indistinguishable to a client that never asks for speech.
+  const HfConfig c = MakeConfig();
+  const Qwen3_5MoeWeights w = MakeWeights(c);
+
+  auto with_socket = [](ServerHarness& h, auto&& body) {
+    const int port = h.server.bind_to_any_port("127.0.0.1");
+    REQUIRE(port > 0);
+    ScopedServerThread server_thread(h.server);
+    for (int i = 0; i < 500 && !h.server.is_running(); ++i)
+      std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    REQUIRE(h.server.is_running());
+    httplib::Client client("127.0.0.1", port);
+    client.set_connection_timeout(5, 0);
+    client.set_read_timeout(15, 0);
+    body(client);
+    server_thread.join();  // stops the server, then joins
+  };
+
+  SUBCASE("with NO speech family attached the route is 404 and nothing leaks") {
+    ServerHarness h(c, w, Fixture());
+    with_socket(h, [](httplib::Client& client) {
+      auto res = client.Post("/v1/audio/speech", MusicBody(), "application/json");
+      REQUIRE(res);
+      // 404 from the route table, NOT a 500 from a handler — the endpoint does
+      // not exist, exactly as before W6 existed.
+      CHECK(res->status == 404);
+      // No speech envelope of any kind reaches the wire.
+      CHECK(res->body.find("minimax-music3") == std::string::npos);
+      CHECK(res->body.find("synthesizer") == std::string::npos);
+      CHECK(res->body.find("RIFF") == std::string::npos);
+      // And the routes that were always there are untouched.
+      auto health = client.Get("/health");
+      REQUIRE(health);
+      CHECK(health->status == 200);
+      auto models = client.Get("/v1/models");
+      REQUIRE(models);
+      CHECK(models->status == 200);
+    });
+  }
+
+  SUBCASE("with a speech family attached the route serves audio/wav bytes") {
+    ServerHarness h(c, w, Fixture());
+    vllm::openai::SpeechCapabilities caps;
+    caps.family = "minimax-music3";
+    caps.sample_rate = 44100;
+    caps.channels = 2;
+    caps.requires_reference_audio = false;
+    h.server.set_synthesizer(
+        [](const vllm::openai::SpeechRequest&) { return StereoWav(2048); }, caps);
+    with_socket(h, [](httplib::Client& client) {
+      auto res = client.Post("/v1/audio/speech", MusicBody(), "application/json");
+      REQUIRE(res);
+      CHECK(res->status == 200);
+      CHECK(res->get_header_value("Content-Type") == "audio/wav");
+      REQUIRE(res->body.size() == 44u + 2048u * 2u * 2u);
+      CHECK(res->body.compare(0, 4, "RIFF") == 0);
+      CHECK(WavU16(res->body, 22) == 2);       // stereo
+      CHECK(WavU32(res->body, 24) == 44100u);  // the family's native rate
+      // Every OTHER route is exactly where it was: attaching a synthesizer adds
+      // one endpoint and moves none.
+      auto health = client.Get("/health");
+      REQUIRE(health);
+      CHECK(health->status == 200);
+      auto videos = client.Post("/v1/videos", R"({"prompt":"x"})", "application/json");
+      REQUIRE(videos);
+      CHECK(videos->status == 404);  // still unregistered, no video runner attached
+    });
+  }
+}
+
+// ─── The SPEECH-ONLY server (#672) ──────────────────────────────────────────
+//
+// `vllm-server --speech-model <dir>` with NO `--model` is now a valid
+// invocation, because upstream's own recipe is `sgl-omni serve --model
+// MiniMaxAI/MiniMax-Music3` and nothing else — a music model is not an
+// accessory to a text model. Requiring a text checkpoint beside a 28.5 GB music
+// one made the documented recipe unrunnable on any box whose smallest text
+// model is tens of gigabytes.
+//
+// This case pins the ROUTE TABLE that invocation produces, which is the half a
+// handler-dispatch test cannot see. It is the exact twin of the ASR pair above
+// ("transcriptions socket smoke … generate routes 404" / "the audio routes do
+// not exist on a TEXT server"), and it uses the SAME construction the server's
+// speech-only branch does: an `ApiServer` built from serving-models alone, with
+// no completion and no chat handler, plus a synthesizer.
+//
+// It needs no checkpoint and no engine, so it runs in CI unconditionally.
+TEST_CASE("api_server: a SPEECH-ONLY server serves speech and 404s the generate routes") {
+  OpenAIServingModels models{"minimax-music3"};
+  ApiServer server{models, "speech-only"};
+  vllm::openai::SpeechCapabilities caps;
+  caps.family = "minimax-music3";
+  caps.sample_rate = 44100;
+  caps.channels = 2;
+  caps.requires_reference_audio = false;
+  server.set_synthesizer([](const vllm::openai::SpeechRequest&) { return StereoWav(1024); },
+                         caps);
+
+  const int port = server.bind_to_any_port("127.0.0.1");
+  REQUIRE(port > 0);
+  ScopedServerThread server_thread(server);
+  for (int i = 0; i < 500 && !server.is_running(); ++i)
+    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+  REQUIRE(server.is_running());
+
+  {
+    httplib::Client client("127.0.0.1", port);
+    client.set_connection_timeout(5, 0);
+    client.set_read_timeout(15, 0);
+
+    // The route this server exists to serve.
+    auto speech = client.Post("/v1/audio/speech", MusicBody(), "application/json");
+    REQUIRE(speech);
+    CHECK(speech->status == 200);
+    CHECK(speech->get_header_value("Content-Type") == "audio/wav");
+    REQUIRE(speech->body.size() == 44u + 1024u * 2u * 2u);
+    CHECK(speech->body.compare(0, 4, "RIFF") == 0);
+    CHECK(WavU16(speech->body, 22) == 2);       // STEREO
+    CHECK(WavU32(speech->body, 24) == 44100u);  // the family's NATIVE rate
+
+    // The TEXT routes are ABSENT, not present-and-broken. A well-formed body —
+    // exactly what the route would accept if it existed — must fall through to
+    // httplib's own 404, which is what proves the route was never registered
+    // rather than that a handler rejected the payload.
+    auto completions = client.Post("/v1/completions",
+                                   R"({"model":"minimax-music3","prompt":"hi"})",
+                                   "application/json");
+    REQUIRE(completions);
+    CHECK(completions->status == 404);
+    auto chat = client.Post(
+        "/v1/chat/completions",
+        R"({"model":"minimax-music3","messages":[{"role":"user","content":"hi"}]})",
+        "application/json");
+    REQUIRE(chat);
+    CHECK(chat->status == 404);
+    // Not OUR 404 either: no error envelope is emitted, so nothing tells a
+    // client the route half-exists.
+    CHECK(completions->body.find("\"object\"") == std::string::npos);
+    CHECK(chat->body.find("\"object\"") == std::string::npos);
+
+    // The OTHER opt-in surfaces stay unregistered too — attaching a synthesizer
+    // adds ONE endpoint, not a family of them.
+    auto videos = client.Post("/v1/videos", R"({"prompt":"x"})", "application/json");
+    REQUIRE(videos);
+    CHECK(videos->status == 404);
+    auto embeddings =
+        client.Post("/v1/embeddings", R"({"input":"x"})", "application/json");
+    REQUIRE(embeddings);
+    CHECK(embeddings->status == 404);
+
+    // Liveness and discovery still serve, so the 404s above are about the
+    // routes and not about a dead server — and `/v1/models` reports the FAMILY,
+    // which is what the speech-only branch defaults the served name to.
+    auto health = client.Get("/health");
+    REQUIRE(health);
+    CHECK(health->status == 200);
+    auto models_res = client.Get("/v1/models");
+    REQUIRE(models_res);
+    CHECK(models_res->status == 200);
+    CHECK(json::parse(models_res->body).at("data").at(0).at("id") == "minimax-music3");
+  }
+
+  server_thread.join();  // stops the server, then joins
+}

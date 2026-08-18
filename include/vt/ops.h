@@ -4,6 +4,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <optional>
 #include <type_traits>
 
@@ -106,6 +107,7 @@ enum class OpId : uint8_t {
   kMoeRouterTopK,
   kMoeCombine,
   kAttention,
+  kAttentionCross,
   kAttentionDenseFast,
   kAttentionDenseFlash,
   kAttentionDenseFa2,
@@ -371,6 +373,74 @@ enum class OpId : uint8_t {
   // participates in plan/algo selection. Appended before kCount so no existing
   // op's id shifts.
   kMatmulFp8CublasLtAlphaVec,
+  // --- Mamba2 / SSD selective-scan core (.agents/specs/mamba2-ssd.md W1,
+  // #496). The three numerical objects the GDN arm of KERNEL-SSM-MAMBA never
+  // built. SSD is NOT the gated delta rule: there is no `(I - beta*k*k^T)`
+  // removal term, the decay is a diagonal `exp(A*dt)` driven by `A_log`/`dt`,
+  // and `B`/`C` are shared across `n_groups` head groups. See
+  // vt::Mamba2ChunkScan / vt::Mamba2StateUpdate / vt::RmsNormGatedGroup below
+  // for the exact contracts and their upstream anchors. Additive: nothing
+  // outside the Mamba2 path dispatches them. Appended before kCount so no
+  // existing op's id shifts.
+  kMamba2ChunkScan,
+  kMamba2StateUpdate,
+  kRmsNormGatedGroup,
+  // LTX-2.5 DiT device-resident-forward glue table (phase L8). Only the seven
+  // small ops the shared vt:: surface does NOT already cover: the AdaLN table
+  // lookup, the AdaZero affine, the gated residual accumulate, the per-head
+  // attention gate, LTX's split/interleaved RoPE, the output head's
+  // table+embedded affine, and plain ungated SiLU. Everything else in the DiT
+  // forward reuses tuned shared ops (kMatmulBT, kRmsNorm, kLayerNorm, kGeluTanh,
+  // kAdd, kAttention, kAttentionCross), so this table stays deliberately small.
+  // Registered on BOTH kCPU and kCUDA (cpu_ltx2.cpp / cuda_ltx2.cu) so the
+  // device forward is exercised in CPU CI too; resolved via ltx2::Ltx2Device().
+  // Additive: only Ltx2DitForwardDevice dispatches it. Appended before kCount
+  // so no existing op's id shifts.
+  kLtx2,
+  // The NON-GATED MoE activation: out = relu(x)^2, the whole epilogue of a
+  // NemotronH expert (models/nemotron_h.py:227 activation_without_mul("relu2")
+  // -> MoEActivation.RELU2_NO_MUL). Sibling of kMoeSiluMul with ONE input
+  // instead of two, because a non-gated expert has no gate half to multiply by
+  // (nemotron_h.py:220 ckpt_names=("up_proj","down_proj","")). See vt::MoeRelu2.
+  // Appended before kCount so no existing op's id shifts.
+  kMoeRelu2,
+  // --- BigVGAN / DAC vocoder 1-D convolutions (#672,
+  // .agents/specs/minimax-music3.md §11.4). The GENERAL grouped `nn.Conv1d` and
+  // the transposed `nn.ConvTranspose1d` that the three `vocoder1d` consumers
+  // (MiniMax-Music3, MiniMax-H3's audio VAE, IndexTTS-2.5, plus LTX-2.5's audio
+  // VAE) are built from. Two reasons these are new ids rather than parameters of
+  // kDepthwiseConv1d:
+  //   * `vt` had NO transposed 1-D convolution of any kind. kCausalConv1dFwd is
+  //     causal/stateful/SiLU-folded and kDepthwiseConv1d is centre-padded and
+  //     depthwise; neither can express a scatter that GROWS the time axis.
+  //   * the ACCUMULATOR WIDTH differs and is part of the contract, not an
+  //     implementation detail. kDepthwiseConv1d accumulates in f32 and its
+  //     byte-exactness gate pins that; these two accumulate in f64, because f64
+  //     is what every committed `vocoder1d` golden was taken with. Widening or
+  //     narrowing either one moves a shipped model's numerics, so these are
+  //     SIBLINGS and kDepthwiseConv1d is untouched.
+  // See vt::Conv1d / vt::ConvTranspose1d below for the exact contracts.
+  // Appended before kCount so no existing op's id shifts.
+  kConv1d,
+  kConvTranspose1d,
+  // --- Block-wise FP8 (VT-QUANT-FP8-GROUP, #1189 milestone M1). The DYNAMIC
+  // per-token, per-group fp8 activation quant that a 128x128 block-scaled FP8
+  // GEMM consumes. It is not a parameter of kQuantFp8Static: that op takes ONE
+  // static per-tensor scale from the checkpoint and emits no scale tensor at
+  // all, while this one derives a scale per (row, group) at run time and emits
+  // an f32 [M, K/group_size] second output. The nearest existing shape is
+  // kScaledFp4Quant, which is dynamic per-token with a 2-D scale as well.
+  // See vt::QuantFp8Group below for the contract.
+  // Appended before kCount so no existing op's id shifts.
+  kQuantFp8Group,
+  // --- Block-wise FP8 (VT-MATMUL-FP8-BLOCK-REF, #1189 milestone M2). The
+  // 128x128 block-scaled fp8 GEMM that consumes kQuantFp8Group's output. It is
+  // NOT a parameter of kMatmulFp8Cutlass and cannot be: that op folds ONE
+  // scalar alpha into the epilogue, which has exactly one degree of freedom per
+  // output element, while this scheme has cdiv(K, block_k) of them and applies
+  // them in the MAINLOOP. See vt::MatmulFp8BlockScaled below for the contract.
+  // Appended before kCount so no existing op's id shifts.
+  kMatmulFp8BlockScaled,
   kCount
 };
 
@@ -479,6 +549,41 @@ struct RmsNormGatedArgs {
   bool sigmoid_gate = false;
 };
 
+// Silu-gated GROUP RMS norm args (Mixer2RMSNormGated, mamba_mixer2.py:69-149).
+// SIBLING of RmsNormGatedArgs, not a mode of it: the GDN/KDA gated norm reduces
+// over the WHOLE row with an optional sigmoid gate, this one always uses SILU and
+// reduces over `group_size = hidden / n_groups` slices (:136-141).
+struct RmsNormGatedGroupArgs {
+  float eps = 1e-6f;  // Mixer2RMSNormGated default (mamba_mixer2.py:76)
+  // full_n_groups. group_size = hidden / n_groups must divide the last dim
+  // (mamba_mixer2.py:80). n_groups == 1 degenerates to a whole-row RMS norm,
+  // which is exactly upstream's `self.n_groups == 1` branch (:120-131).
+  int64_t n_groups = 1;
+  // W1 lands tp_world_size == 1 only. Any other value is REFUSED with a message
+  // naming `extra_groups_for_head_shards` (mamba_utils.py:187) rather than
+  // silently computing a wrong split (mamba2-ssd.md §7).
+  int64_t tp_world_size = 1;
+};
+
+// Mamba2 SSD args, shared by the chunked prefill scan and the decode state
+// update (ssd_combined.py:27-235, mamba_ssm.py:497+).
+struct Mamba2Args {
+  // Physical chunk length. MUST be an integer power of two — upstream asserts it
+  // (`is_int_pow_2`, ssd_combined.py:48). Ignored by Mamba2StateUpdate.
+  int64_t chunk_size = 0;
+  // Whether dt goes through softplus before the decay (`dt_softplus`). Upstream
+  // guards it as `dt <= 20 ? softplus(dt) : dt` (ssd_chunk_state.py:94,
+  // mamba_kernels.hpp:177). mamba_mixer2.py:1097 passes True.
+  bool dt_softplus = false;
+  // dt_limit, applied AFTER softplus (`tl.clamp(dt, dt_min, dt_max)`,
+  // ssd_chunk_state.py:96). Upstream default is (0.0, +inf).
+  // Ignored by Mamba2StateUpdate: selective_state_update has no dt_limit.
+  float dt_min = 0.0f;
+  float dt_max = std::numeric_limits<float>::infinity();
+  // W1 lands tp_world_size == 1 only; see RmsNormGatedGroupArgs::tp_world_size.
+  int64_t tp_world_size = 1;
+};
+
 struct GdnArgs {
   // q scale, applied to q only after l2norm; upstream default Dk^-0.5
   // (gdn-semantics.md §1). Must be set explicitly (> 0).
@@ -502,6 +607,26 @@ struct AttentionArgs {
   // Causal masking: key position j attends only when j <= query position i.
   // Always true for the M0.9 decoder path (bidirectional is a M1.6+ concern).
   bool causal = true;
+};
+
+// Dense NON-CAUSAL CROSS attention args. vt::Attention requires key/value to
+// carry the SAME token count as query (ops.cpp: "query/key/value token count must
+// match"), which no cross-attention can satisfy: LTX-2.5's text cross-attention
+// (transformer.py:113 `attn2`) and its audio<->video cross-attention
+// (transformer.py:154 `audio_to_video_attn`, :166 `video_to_audio_attn`) each
+// project queries from one stream and keys/values from another, so Tq != S by
+// construction. This is that seam, kept SEPARATE from vt::Attention so every
+// existing self-attention call stays byte-identical.
+//
+// query [Tq,Hq,D], key/value [S,Hkv,D], out [Tq,Hq,D]; Hq a multiple of Hkv
+// (GQA broadcast, exactly as vt::Attention). Query i attends to EVERY key j in
+// [0,S) — bidirectional, no causal mask; the only masking is the optional
+// additive `bias` (see vt::AttentionCross). f32 softmax with max subtraction.
+struct AttentionCrossArgs {
+  // Softmax scale applied to the qk dot product. torch SDPA's default is
+  // E**-0.5 with E = query.size(-1) = head_dim, which is what every LTX
+  // attention gets (attention.py:98). Must be set explicitly (> 0).
+  float scale = 0.0f;
 };
 
 // --- Conformer / FastConformer audio-encoder op args (spike
@@ -532,6 +657,34 @@ struct DepthwiseConv1dArgs {
   int64_t stride = 1;
   int64_t padding = 0;
   int64_t dilation = 1;
+};
+
+// --- BigVGAN / DAC vocoder 1-D convolution args (#672). --------------------
+
+// torch `nn.Conv1d` arguments, the GENERAL grouped form. Field names mirror the
+// constructor keywords 1:1. `groups == 1` is the dense conv the vocoder's
+// conv_pre/conv_post/1x1 projections use; `groups == C_in == C_out` is the
+// depthwise form the alias-free low-pass filter uses.
+//
+// NOT to be confused with DepthwiseConv1dArgs, which drives the conformer's
+// f32-accumulate depthwise op — see OpId::kConv1d for why the two are siblings.
+struct Conv1dArgs {
+  int64_t stride = 1;
+  int64_t padding = 0;  // ZERO padding on BOTH sides; out-of-range taps skipped
+  int64_t dilation = 1;
+  int64_t groups = 1;
+};
+
+// torch `nn.ConvTranspose1d` arguments. Mirrors the constructor keywords 1:1.
+// `padding` here CROPS (torch's "dilation * (kernel_size - 1) - padding"
+// implicit zero-padding on both sides), and `output_padding` appends to the
+// right only.
+struct ConvTranspose1dArgs {
+  int64_t stride = 1;
+  int64_t padding = 0;
+  int64_t output_padding = 0;
+  int64_t dilation = 1;
+  int64_t groups = 1;
 };
 
 // Transformer-XL relative-position self-attention args — the conformer
@@ -787,6 +940,17 @@ using MatmulFp8CublasLtFn =
 using MatmulFp8CublasLtAlphaVecFn =
     void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, const Tensor& /*alpha_vec*/, bool);
 using QuantFp8StaticFn = void (*)(Queue&, Tensor&, const Tensor&, float);
+// Two outputs, because the scale is computed rather than supplied: the fp8 bytes
+// and the f32 [M, K/group_size] per-group scale.
+using QuantFp8GroupFn = void (*)(Queue&, Tensor& /*out_fp8*/, Tensor& /*out_scale*/,
+                                 const Tensor& /*x*/, int /*group_size*/);
+// Two scale streams and the block geometry, where the per-tensor fp8 GEMMs above
+// carry one scalar alpha. The geometry is not a convenience: it is what selects
+// which scale pair each K-block multiplies by.
+using MatmulFp8BlockScaledFn = void (*)(Queue&, Tensor& /*out*/, const Tensor& /*a_fp8*/,
+                                        const Tensor& /*a_scale*/, const Tensor& /*b_fp8*/,
+                                        const Tensor& /*b_scale*/, int /*block_n*/,
+                                        int /*block_k*/);
 using RmsNormQuantFp8Fn = void (*)(Queue&, Tensor& /*out_fp8*/, Tensor* /*out_bf16*/,
                                    const Tensor& /*x*/, const Tensor& /*weight*/,
                                    const RmsNormArgs&, Tensor* /*residual*/, float /*input_scale*/);
@@ -860,6 +1024,8 @@ using MarlinDenseGemmFn =
              const Tensor& /*b_scales*/, const Tensor& /*global_scale*/, Tensor& /*workspace*/,
              const MarlinDenseArgs&);
 using MoeSiluMulFn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor&);
+// kMoeRelu2: out[i] = relu(x[i])^2 — the NON-GATED MoE activation (one input).
+using MoeRelu2Fn = void (*)(Queue&, Tensor&, const Tensor&);
 // --- Qwen3.6 elementwise "glue" ops (M0.9 forward). These replace host-side
 // loops so the decode step can run entirely on-device (CUDA-graph capture).
 // All math in f32; dims are inferred from the tensor shapes (no args structs).
@@ -950,6 +1116,31 @@ using KdaGatedDeltaRuleFn = void (*)(Queue&, Tensor&, const Tensor&, const Tenso
 using KdaChunkPrefillFn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, const Tensor&,
                                    const Tensor&, const Tensor&, const Tensor&, const Tensor&,
                                    Tensor&, const Tensor&, const GdnArgs&);
+// Mamba2 SSD varlen chunked prefill scan (vt::Mamba2ChunkScan). NOT a shape of
+// GdnPrefillFn: the SSD recurrence has no delta-removal term and carries the
+// per-chunk decay/state-passing metadata upstream builds in mamba2_attn.py.
+using Mamba2ChunkScanFn = void (*)(Queue&, Tensor& /*out*/, Tensor& /*final_states*/,
+                                   const Tensor& /*x*/, const Tensor& /*dt*/,
+                                   const Tensor& /*A*/, const Tensor& /*B*/,
+                                   const Tensor& /*C*/, const Tensor* /*D*/,
+                                   const Tensor* /*z*/, const Tensor* /*dt_bias*/,
+                                   const Tensor* /*initial_states*/,
+                                   const Tensor& /*cu_seqlens*/,
+                                   const Tensor& /*cu_chunk_seqlens*/,
+                                   const Tensor& /*last_chunk_indices*/,
+                                   const Tensor& /*seq_idx*/, const Mamba2Args&);
+// Mamba2 single-token selective state update (vt::Mamba2StateUpdate).
+using Mamba2StateUpdateFn = void (*)(Queue&, Tensor& /*out*/, Tensor& /*state*/,
+                                     const Tensor& /*x*/, const Tensor& /*dt*/,
+                                     const Tensor& /*A*/, const Tensor& /*B*/,
+                                     const Tensor& /*C*/, const Tensor* /*D*/,
+                                     const Tensor* /*z*/, const Tensor* /*dt_bias*/,
+                                     const Tensor* /*state_indices*/, const Mamba2Args&);
+// Silu-gated group RMS norm (vt::RmsNormGatedGroup). `weight` is nullable:
+// upstream skips the parameter entirely when use_rms_norm is False.
+using RmsNormGatedGroupFn = void (*)(Queue&, Tensor& /*out*/, const Tensor& /*x*/,
+                                     const Tensor& /*gate*/, const Tensor* /*weight*/,
+                                     const RmsNormGatedGroupArgs&);
 using GdnStateGatherFn =
     void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, const Tensor*);
 using GdnStateScatterFn =
@@ -958,18 +1149,28 @@ using IndexSelectFn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor&);
 using IndexCopyFn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor&);
 using MoeRouterTopKFn = void (*)(Queue&, Tensor&, Tensor&, const Tensor&,
                                  const MoeRouterTopKArgs&, const Tensor*);
+// The trailing float is `routed_scale` — the routed_scaling_factor applied to
+// the ROUTED sum before the shared term is added (see vt::MoeCombine).
 using MoeCombineFn =
-    void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, const Tensor*);
+    void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, const Tensor*, float);
 using MoeCombineGateFn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, const Tensor&,
                                   const Tensor&);
 using AttentionFn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, const Tensor&,
                              const AttentionArgs&);
+using AttentionCrossFn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, const Tensor&,
+                                  const Tensor* /*bias*/, const AttentionCrossArgs&);
 // Conformer / FastConformer audio-encoder kernels (spike P1/P2/P3).
 using Conv2dFn = void (*)(Queue&, Tensor& /*out*/, const Tensor& /*x*/, const Tensor& /*weight*/,
                           const Tensor* /*bias*/, const Conv2dArgs&);
 using DepthwiseConv1dFn = void (*)(Queue&, Tensor& /*out*/, const Tensor& /*x*/,
                                    const Tensor& /*weight*/, const Tensor* /*bias*/,
                                    const DepthwiseConv1dArgs&);
+// BigVGAN / DAC vocoder 1-D convolutions (#672).
+using Conv1dFn = void (*)(Queue&, Tensor& /*out*/, const Tensor& /*x*/, const Tensor& /*weight*/,
+                          const Tensor* /*bias*/, const Conv1dArgs&);
+using ConvTranspose1dFn = void (*)(Queue&, Tensor& /*out*/, const Tensor& /*x*/,
+                                   const Tensor& /*weight*/, const Tensor* /*bias*/,
+                                   const ConvTranspose1dArgs&);
 using AttentionRelPosFn = void (*)(Queue&, Tensor& /*out*/, const Tensor& /*query*/,
                                    const Tensor& /*key*/, const Tensor& /*value*/,
                                    const Tensor& /*rel_key*/, const Tensor* /*bias_u*/,
@@ -1334,11 +1535,130 @@ void MatmulNvfp4Cutlass(Queue& q, Tensor& out, const Tensor& a_packed, const Ten
 // per-tensor weight_scale + a f32 per-tensor input_scale (both applied directly:
 // dequant(w)=f8(w)*weight_scale, dequant(a)=f8(a)*input_scale).
 
-// QuantFp8Static (mirror vLLM static_scaled_fp8_quant, is_scale_inverted=False):
-//   out_fp8[i] = fp8_e4m3( clamp(x[i] / input_scale, -448, 448) )   // RNE hw cvt
+// QuantFp8Static (mirror vLLM static_scaled_fp8_quant):
+//   inv = 1/input_scale;  out_fp8[i] = fp8_e4m3( clamp(x[i] * inv, -448, 448) )
+// RNE convert. The scale is applied as a RECIPROCAL MULTIPLY, not a divide, and
+// the reciprocal is formed ONCE outside the elementwise loop — that is what
+// upstream ships: `x = val * scale` under is_scale_inverted=true
+// (csrc/quantization/w8a8/fp8/common.cuh:62, clamp at :68) with the inverse formed
+// by the caller (csrc/libtorch_stable/quantization/w8a8/fp8/common.cu:31,
+// `1.0f / scale[...]`). DO NOT "correct" the kernels to a divide to match a
+// prose formula: `x/s` and `x*(1/s)` differ by up to one f32 ulp, and near an
+// e4m3 tie that ulp changes the emitted byte on a default-ON 35B path.
 // Static per-tensor scale (NOT dynamic/per-token). x [M,K] f32/bf16, out [M,K]
-// i8 (raw fp8-e4m3fn bytes). CUDA only (the 35B W8A8 path is CUDA-resident).
+// i8 (raw fp8-e4m3fn bytes). CUDA + CPU (the CPU arm is the portable reference
+// that makes the fp8 seam testable without a GPU, #468).
 void QuantFp8Static(Queue& q, Tensor& out_fp8, const Tensor& x, float input_scale);
+
+// --- Block-wise FP8 (VT-QUANT-FP8-GROUP, #1189 M1,
+// .agents/specs/vt-quant-fp8-group.md). QuantFp8Group is the DYNAMIC per-token,
+// per-group sibling of QuantFp8Static: the scale is derived from the data, once
+// per contiguous run of `group_size` elements inside a row, and written out.
+//
+//   amax = max(1e-10, max |x_f32| over the group)
+//   y_s  = amax / 448.0f
+//   out_fp8[i] = fp8_e4m3( min(max(x_f32[i] / y_s, -448.0f), 448.0f) )
+//   out_scale[row, group] = y_s
+//
+// x [M,K] f32/bf16, out_fp8 [M,K] i8 (raw fp8-e4m3fn bytes), out_scale
+// [M, K/group_size] F32 — f32 because upstream allocates it f32 and the GEMM
+// that consumes it multiplies in f32 (fp8_utils.py:629-631). K must be a
+// multiple of group_size; the op refuses any other K by name, as upstream
+// asserts at fp8_utils.py:596-599. CPU + CUDA.
+//
+// WHICH UPSTREAM ARM THIS MIRRORS, because there are two and they DISAGREE.
+// `per_token_group_quant_fp8` reads like a Triton kernel with a C++ fast path
+// and it is the other way round: on a CUDA-alike platform with a contiguous
+// input it calls the C++ custom op and RETURNS (fp8_utils.py:635-650), so the
+// Triton kernel never executes there. The executing kernel is
+// csrc/libtorch_stable/quantization/w8a8/fp8/per_token_group_quant.cu:
+//   :47  float local_absmax = eps           — eps SEEDS the reduction, so an
+//                                             all-zero group cannot divide by 0
+//   :53  fmaxf(local_absmax, fabsf((float)src))
+//   :68  float y_s = local_absmax / max_8bit                    — a DIVIDE
+//   :85  fminf(fmaxf((float)src / y_s, min_8bit), max_8bit)     — a DIVIDE
+//   :86  DST_DTYPE(q)                       — hardware e4m3 RNE, saturating
+// DO NOT "correct" either divide into a hoisted reciprocal multiply to match
+// QuantFp8Static's form. That form is right for QuantFp8Static because upstream
+// ships it there (common.cuh:62 with the reciprocal formed by the caller); here
+// upstream ships a divide, the scale changes per group so nothing is
+// loop-invariant, and the Triton fallback's `_absmax * (1.0 / fp8_max)`
+// (fp8_utils.py:145) carries an upstream comment naming the 1-ULP gap it opens.
+// One f32 ulp before an e4m3 round changes the emitted byte near a tie, and
+// upstream's own test cannot see it: it compares values at rtol=0.15 and the
+// scale at rtol=1e-5 (test_block_fp8.py:112-115). Only a byte comparison can,
+// which is what tests/vt/test_ops_quant_fp8_group_cpu.cpp G1 is.
+//
+// The column-major and TMA-aligned scale layouts (fp8_utils.py:610-628) and the
+// `use_ue8m0` DeepGEMM scale rounding (per_token_group_quant.cu:69-71) are NOT
+// implemented. Both are recorded under `## Owed` in the row's spec; no consumer
+// in this tree can read either yet, and upstream excludes the target model from
+// DeepGEMM on family 120 (vllm/utils/deep_gemm.py:27-46).
+void QuantFp8Group(Queue& q, Tensor& out_fp8, Tensor& out_scale, const Tensor& x,
+                   int group_size);
+
+// MatmulFp8BlockScaled (VT-MATMUL-FP8-BLOCK-REF, #1189 M2,
+// .agents/specs/vt-matmul-fp8-block-ref.md) — the 128x128 block-scaled fp8 GEMM,
+// mirroring native_w8a8_block_matmul (tests/kernels/quant_utils.py:91-154):
+//
+//   for each (m, n):
+//     acc = 0                                              f32
+//     for kt in [0, cdiv(K, block_k)):
+//       part = 0                                           f32, a SEPARATE register
+//       for k in the k-tile:  part += f8(a[m,k]) * f8(b[n,k])
+//       acc += part * ( a_scale[m, kt] * b_scale[n / block_n, kt] )
+//     out[m, n] = acc                                      stored to out's dtype
+//
+// THE SCALES APPLY IN THE MAINLOOP, ONCE PER K-BLOCK, INTO AN F32 ACCUMULATOR —
+// NOT IN THE EPILOGUE, and that is a correctness constraint rather than an
+// optimisation choice. MatmulFp8Cutlass above folds one scalar alpha after the
+// whole K reduction. An epilogue has exactly ONE degree of freedom per output
+// element; this scheme has cdiv(K, block_k) of them. An epilogue-only
+// application therefore cannot express a per-K-block scale AT ALL, which is why
+// this is a separate op. DO NOT "simplify" `part` away into `acc`: that IS the
+// epilogue form, and tests/vt/test_ops_matmul_fp8_block_cpu.cpp G4 is built so
+// that no single-alpha implementation can pass it.
+//
+// WHICH UPSTREAM ARM THIS MIRRORS. The Triton kernel at fp8_utils.py:826-836 is
+// not what executes on the target architecture; CUTLASS is
+// (vllm/model_executor/kernels/linear/__init__.py:355-377 ranks it third,
+// DeepGEMM is auto-disabled for qwen3_5_text on family 120 at
+// vllm/utils/deep_gemm.py:27-46, and Marlin is excluded at cc >= 89). Unlike the
+// QuantFp8Group case above, the two AGREE: csrc/.../c3x/
+// scaled_mm_blockwise_sm120_fp8_dispatch.cuh:56-58,218-235 hands both scale
+// pointers to the MAINLOOP arguments over an `ElementAccumulator = float`, and
+// cutlass 4.5.0's sm120_mma_tma_blockwise_scaling.hpp:714-717 is literally
+// `accum(i) += tmp_accum(i) * tCrScaleAViewAsC(i) * tCrScaleBViewAsC(i)`.
+// CUTLASS associates the two scale multiplies left to right where the reference
+// forms their product first (quant_utils.py:150-151); the difference is at most
+// one f32 ULP per K-block and upstream's own gate admits it, comparing the two
+// at rel_diff < 0.001 (test_block_fp8.py:194-200). We mirror the reference's
+// association, because this op IS the reference port and the CUDA kernel that
+// #1189 milestone M5 lands will be measured against it.
+//
+// SHAPES, with CEIL on every tiling, so a ragged final block is legal and must
+// work (upstream asserts exactly this at fp8_utils.py:935-936):
+//   a_fp8   [M,K]                              i8, raw fp8-e4m3fn bytes
+//   a_scale [M, cdiv(K, block_k)]              F32
+//   b_fp8   [N,K]                              i8, raw fp8-e4m3fn bytes
+//   b_scale [cdiv(N, block_n), cdiv(K, block_k)] F32
+//   out     [M,N]                              f32 or bf16
+// The scales are f32 because upstream refuses any other dtype on this path
+// (csrc/.../c3x/scaled_mm_helper.hpp:15-18) and the accumulator is f32.
+// a_scale's K axis is a CEIL too, so this op accepts a K that vt::QuantFp8Group
+// would refuse; that asymmetry is upstream's own (fp8_utils.py:930 uses cdiv
+// where fp8_utils.py:596-599 demands divisibility).
+//
+// No bias: upstream refuses one outright on the blockwise path
+// (scaled_mm_helper.hpp:54), so this mirrors a refusal rather than deferring a
+// feature.
+//
+// CPU only. A CORRECTNESS REFERENCE, NOT A PERFORMANCE PATH — it is the
+// numerical oracle #1189 milestone M5's CUTLASS kernel is measured against, and
+// it makes no speed claim. M5 owns the CUDA arm.
+void MatmulFp8BlockScaled(Queue& q, Tensor& out, const Tensor& a_fp8, const Tensor& a_scale,
+                          const Tensor& b_fp8, const Tensor& b_scale, int block_n,
+                          int block_k);
 
 // RmsNormQuantFp8 (fused fp8 RMSNorm -> static per-tensor activation quant). One
 // HBM pass mirrors vLLM's Inductor `fused_add_rms_norm_static_fp8_quant`
@@ -1388,7 +1708,16 @@ void RmsNormGatedQuantFp8(Queue& q, Tensor& out_fp8, const Tensor& x, const Tens
 // sequential scale_a·(scale_b·acc) — within fp8 tolerance, ported deviation).
 // a_fp8 [M,K] (= QuantFp8Static output), b_fp8 [N,K] the on-disk raw fp8-e4m3fn
 // weight (K contiguous). out [M,N] bf16 (cutlass epilogue) or f32 (via cast).
-// K,N multiples of 16 (128-bit fp8 alignment). CUDA-only (sm120a).
+// K,N multiples of 16 (128-bit fp8 alignment). CUDA (sm120a) + a CPU CORRECTNESS
+// REFERENCE (f32 accumulate, naive triple loop — no speed claim, and no
+// production model routes through it; it exists so the fp8 seam resolves on a
+// CPU queue and can be gated without a GPU, #468). The CPU arm is EXPECTED to
+// agree with the CUDA kernel to fp8/bf16 tolerance and NOT byte-for-byte, because
+// the CUDA arm reduces K in tensor-core order and rounds its epilogue through
+// bf16 — but that agreement is DECLARED AND OWED, not measured. No committed run
+// has compared the two arms: gate G2 of .agents/specs/vt-fp8-w8a8-cpu-arm.md is
+// PENDING for want of a GPU. Treat the tolerance above as the claim to be tested,
+// not as a result.
 void MatmulFp8Cutlass(Queue& q, Tensor& out, const Tensor& a_fp8, const Tensor& b_fp8,
                       float alpha);
 
@@ -1575,6 +1904,30 @@ void MarlinDenseGemm(Queue& q, Tensor& c, const Tensor& a, const Tensor& b_q_wei
 // vt::SiluAndMul (single [T,2D] input), this takes the two separately-produced
 // projections so no concat/copy is needed. CPU + CUDA.
 void MoeSiluMul(Queue& q, Tensor& out, const Tensor& gate, const Tensor& up);
+
+// out[R,I] = relu(x[R,I])^2 — the NON-GATED MoE activation, and the whole
+// epilogue of a NemotronH expert. Mirror of vLLM's `ReLUSquaredActivation`
+// (layers/activation.py:609-628, forward_native = torch.square(F.relu(x))) as
+// reached through the fused-MoE path: `activation_without_mul("relu2")` ->
+// `MoEActivation.RELU2_NO_MUL` -> `apply_moe_activation`'s
+// `F.relu(input, inplace=True); torch.square(input, out=output)`
+// (layers/fused_moe/activation.py:34 `RELU2_NO_MUL`, :98
+// `activation_without_mul`, and the :184 RELU2_NO_MUL branch; `:33` is
+// GELU_TANH_NO_MUL, the neighbouring enumerator).
+//
+// Why this is NOT a MergedGemmGroup epilogue: a NON-gated expert has no gate
+// half to merge with (nemotron_h.py:220 `ckpt_names=("up_proj","down_proj","")`
+// — the empty third entry IS the absent gate). There is exactly ONE projection,
+// so the expert is the EXISTING grouped GEMM plus this activation, exactly as
+// the gated bf16 archs are kMoeGroupedGemmBf16 + kMoeSiluMul. See
+// merged_gemm.h's note on the non-gated family.
+//
+// DTYPE/ROUNDING ORDER is the mirrored part, not an implementation detail:
+// upstream's kernel (csrc/libtorch_stable/activation_kernels.cu:673-678)
+// widens to f32, clamps at zero in f32, squares in f32 and rounds ONCE on the
+// store — so a bf16 input with an f32 output keeps the FULL f32 square. x f32
+// or bf16, out f32/bf16. CPU + CUDA.
+void MoeRelu2(Queue& q, Tensor& out, const Tensor& x);
 
 // out[T,H] = x[T,H] / sqrt(mean(x^2) + eps) * w  (or *(1+w) when gemma);
 // out f32 or bf16 (computed in f32, rounded on store).
@@ -2009,6 +2362,112 @@ void KdaChunkPrefill(Queue& q, Tensor& out, const Tensor& q_in, const Tensor& k,
                      const Tensor& a_log, const Tensor& dt_bias, Tensor& state,
                      const Tensor& query_start_loc, const GdnArgs& args);
 
+// ─── Mamba2 / SSD (.agents/specs/mamba2-ssd.md, issue #496) ──────────────────
+//
+// SSD IS NOT THE GATED DELTA RULE. GdnPrefill/KdaGatedDeltaRule above carry a
+// delta REMOVAL term `(I - beta*k*k^T)` and a decay that is a per-head (GDN) or
+// per-K-channel (KDA) scalar. Mamba2's SSD is a diagonally-decayed gated linear
+// recurrence with NO removal term, whose decay `exp(A[h]*dt[t,h])` is driven by
+// `A_log`/`dt`, with a `D` skip and `B`/`C` SHARED across `n_groups` head groups
+// (head h reads group `h / (nheads/ngroups)`). These are sibling ops, never a
+// parameterisation of the GDN kernels (mamba2-ssd.md §0, §7).
+
+// MAMBA2 CHUNKED SSD PREFILL — the varlen entry
+// `mamba_chunk_scan_combined_varlen` (ssd_combined.py:157-235) over the 5-stage
+// pipeline `_mamba_chunk_scan_combined_fwd` (:27-156), in upstream order:
+//   1. `_chunk_cumsum_fwd`  (ssd_chunk_state.py:300-346) — dt bias/softplus/clamp
+//      then per-chunk `dA_cumsum[h,c,i] = sum_{j<=i} dt[h,c,j]*A[h]`. Positions
+//      past a partial chunk's length hold dt = 0, so `dA_cumsum[h,c,cs-1]` is the
+//      chunk's TOTAL decay whatever its length (:96-110).
+//   2. `_chunk_state_fwd`   (ssd_chunk_state.py:349-407) — the chunk-local state
+//      `sum_i x*B * exp(min(dA_last - dA_i, 0)) * dt`, accumulated in f32
+//      (`states_in_fp32=True`, ssd_combined.py:100-102).
+//   3. `_state_passing_fwd` (ssd_state_passing.py:99-146) — the inter-chunk
+//      recurrence `S_c = exp(dA_last[c]) * S_{c-1} + states[c]`, run per SEQUENCE
+//      over the chunk range `last_chunk_indices` derives, seeded from
+//      `initial_states`. Note out[c] is the state AFTER chunk c (:90-97).
+//   4. `_bmm_chunk_fwd`     (ssd_bmm.py:148-209) — `CB[c,g,i,j] = C_i . B_j`,
+//      accumulated and RETURNED in f32 regardless of activation dtype
+//      (`output_dtype=torch.float32`, ssd_combined.py:124).
+//   5. `_chunk_scan_fwd`    (ssd_chunk_scan.py:216-525) — per token i of chunk c:
+//        out = exp(dA_i) * (C_i . S_{c-1})                       // inter-chunk
+//            + sum_{j<=i} CB[i,j] * exp(min(dA_i - dA_j,0)) * dt_j * x_j // intra
+//            + D * x_i                                           // skip
+//        and `out *= z*sigmoid(z)` when z is given. `S_{c-1}` is
+//        `initial_states[seq_idx[c]]` when `seq_idx[c] != seq_idx[c-1]` and
+//        initial states were supplied, ZEROS when they were not (:236-250,
+//        :271-289) — that is what makes a sequence boundary inside a physical
+//        chunk correct.
+//
+// Shapes (varlen, implicit batch 1 — ssd_combined.py:158-215):
+//   x            [T,H,P] float          dt      [T,H] float
+//   A            [H] f32 (negative)     B,C     [T,G,N] float, H % G == 0
+//   D            optional [H] or [H,P] f32       z  optional [T,H,P] float
+//   dt_bias      optional [H] f32
+//   initial_states optional [S,H,P,N] f32/bf16 (:79, :194)
+//   cu_seqlens   [S+1] i32              seq_idx [nchunks] i32 — PER CHUNK, not
+//                                       per token (:60-61, :189)
+//   cu_chunk_seqlens [nchunks+1] i32    last_chunk_indices [S] i32
+//   out          [T,H,P] f32/bf16 (pre-allocated, written in place)
+//   final_states [S,H,P,N] f32/bf16 — `varlen_states`, the state after each
+//                sequence's LAST chunk (:154). Its dtype is the SEPARATE
+//                `state_dtype` knob (:46,119,176), NOT the activation dtype.
+// `args.chunk_size` must be a power of two (:48). All arithmetic is f32; the
+// device tile-precision downcasts inside the Triton dots are a W2 concern.
+void Mamba2ChunkScan(Queue& q, Tensor& out, Tensor& final_states, const Tensor& x,
+                     const Tensor& dt, const Tensor& A, const Tensor& B, const Tensor& C,
+                     const Tensor* D, const Tensor* z, const Tensor* dt_bias,
+                     const Tensor* initial_states, const Tensor& cu_seqlens,
+                     const Tensor& cu_chunk_seqlens, const Tensor& last_chunk_indices,
+                     const Tensor& seq_idx, const Mamba2Args& args);
+
+// MAMBA2 SINGLE-TOKEN SELECTIVE STATE UPDATE — the decode path,
+// `selective_state_update` (mamba_ssm.py:497+) as mamba_mixer2.py:1087 calls it.
+// Per row b and head h (group g = h / (H/G)), with dt SCALAR PER HEAD — the
+// `tie_hdim` shape Mamba2 always uses, and the only one upstream's own CPU
+// kernel implements (csrc/cpu/mamba_kernels.hpp:104-250, and the
+// `current_platform.is_cpu()` skips in tests/kernels/mamba/test_mamba_ssm.py):
+//   dt = softplus(dt[b,h] + dt_bias[h])            // guarded dt<=20, :177
+//   s  = s * exp(A[h]*dt) + B[b,g,:] * x[b,h,p] * dt
+//   out[b,h,p] = sum_n s[n]*C[b,g,n] + D[h]*x[b,h,p]   (then *= silu(z))
+//
+//   state   [S,H,P,N] f32/bf16 — the FULL cache when state_indices is given
+//           (mamba2_state_dtype's ssm_dtype is its own knob, mamba_utils.py:73-81),
+//           else compact [Nb,H,P,N] with row b == b. Updated IN PLACE.
+//   x [Nb,H,P] float, dt [Nb,H] float, A [H] f32, B/C [Nb,G,N] float,
+//   D optional [H] f32, z optional [Nb,H,P] float, dt_bias optional [H] f32,
+//   out [Nb,H,P] f32/bf16.
+//   state_indices optional [Nb] i32 (upstream `state_batch_indices`). LOCAL ABI:
+//           index < 0 is the NULL row — its cache slot is left untouched and its
+//           output row is zeroed, exactly as GdnDecode/CausalConv1dSpecUpdate
+//           already model it (ops.h GdnDecode, cpu_ops.cpp GdnDecodeKernel).
+//           Upstream's sentinel is `NULL_BLOCK_ID = 0`
+//           (v1/attention/backends/utils.py:46) and it leaves the padded output
+//           rows UNDEFINED (`continue`, mamba_kernels.hpp:147); the caller maps
+//           its padding onto the local negative sentinel, and zeroing is strictly
+//           more defined than what upstream promises.
+void Mamba2StateUpdate(Queue& q, Tensor& out, Tensor& state, const Tensor& x,
+                       const Tensor& dt, const Tensor& A, const Tensor& B, const Tensor& C,
+                       const Tensor* D, const Tensor* z, const Tensor* dt_bias,
+                       const Tensor* state_indices, const Mamba2Args& args);
+
+// SILU-GATED GROUP RMS NORM — `Mixer2RMSNormGated.forward_native`
+// (mamba_mixer2.py:100-149). A SIBLING of RmsNormGated, not a mode of it: that
+// one is the GDN/KDA gate (sigmoid or silu) over the WHOLE row; this one always
+// SILU-gates and reduces the variance over `group_size = hidden / n_groups`
+// slices. Both the activation and the reduction extent differ (mamba2-ssd.md §0).
+//   v      = x * silu(f32(gate))                                     (:114)
+//   out    = weight * dtype(x)( v * rsqrt(mean(v^2 over its group) + eps) )
+//            (:136-141 grouped, :127-131 the n_groups == 1 whole-row branch,
+//             :149 the `self.weight * x.to(input_dtype)` cast point)
+// x/gate/out are rank 2 [rows,Hd] or rank 3 [T,H,D]; the LAST dim is the hidden
+// dim and every leading dim is a row (`*prefix_dims, hidden_dim`, :136).
+// `weight` is [Hd] float, or NULLPTR for `use_rms_norm=False`, where upstream
+// registers no parameter at all and returns just the gated value (:94-96,
+// :115-116). args.n_groups must divide the last dim.
+void RmsNormGatedGroup(Queue& q, Tensor& out, const Tensor& x, const Tensor& gate,
+                       const Tensor* weight, const RmsNormGatedGroupArgs& args);
+
 // Single-token gated-delta-rule step, one token per sequence
 // (gdn-semantics.md §7 decode path). Same math as GdnPrefill with T == B and
 // state[B,Hv,Dv,Dk] row b for token b. q_in/k must be l2-normalized by the
@@ -2158,7 +2617,7 @@ void MoeRouterTopK(Queue& q, Tensor& weights, Tensor& indices, const Tensor& log
                    const Tensor* e_score_correction_bias = nullptr);
 
 // Weighted scatter-combine of the per-expert outputs (moe-semantics.md §4/§6).
-//   out[t,:] = sum_j weights[t,j] * expert_out[t,j,:]   (f32 accumulation)
+//   out[t,:] = routed_scale * sum_j weights[t,j] * expert_out[t,j,:]  (f32 accum)
 //              + shared[t,:]                            (when shared != nullptr)
 // expert_out [T,K,H] any float dtype (the K per-slot expert MLP outputs for
 // token t), weights [T,K] f32 (router weights, §3), optional shared [T,H] any
@@ -2167,8 +2626,18 @@ void MoeRouterTopK(Queue& q, Tensor& weights, Tensor& indices, const Tensor& log
 // (§6 combine order: shared_output + routed_output). The activation-dtype
 // rounding of the routed sum before the shared add is carried by the caller
 // materializing expert_out/shared in the activation dtype.
+//
+// `routed_scale` is upstream's `apply_routed_scale_to_output=True` arm
+// (layers/fused_moe/runner/moe_runner.py:390-407, :402-406 `fused_output *=
+// routed_scaling_factor`, then :722-725 `result = shared_output + fused_output`).
+// It multiplies the ROUTED sum ONLY — the shared-expert term is added unscaled,
+// which is the whole point of the flag and the error a token gate catches late.
+// The DEFAULT 1.0f is the `apply_routed_scale_to_output=False` polarity every
+// landed caller uses, where the factor is instead folded into the router weights
+// by MoeRouterTopKArgs::routed_scaling_factor (layer.py:291-300 forces the
+// router's factor to 1.0 exactly when this one is not).
 void MoeCombine(Queue& q, Tensor& out, const Tensor& expert_out, const Tensor& weights,
-                const Tensor* shared = nullptr);
+                const Tensor* shared = nullptr, float routed_scale = 1.0f);
 
 // --- Fused MoE combine + shared-expert gate (MoE glue fusion). Equivalent to
 // SharedExpertGate(shared=bf16(sigmoid(gl)*sd)) followed by MoeCombine(...,shared),
@@ -2195,6 +2664,45 @@ void MoeCombineGate(Queue& q, Tensor& out, const Tensor& expert_out, const Tenso
 // f32 or bf16 in, f32/bf16 out; all softmax/accumulation math in f32.
 void Attention(Queue& q, Tensor& out, const Tensor& query, const Tensor& key,
                const Tensor& value, const AttentionArgs& args);
+
+// --- Dense non-causal CROSS attention (LTX-2.5 L2). See AttentionCrossArgs for
+// why vt::Attention cannot serve it. Per q-head h (kv-head g = h/(Hq/Hkv)),
+// query i in [0,Tq), keys j in [0,S):
+//   s[j] = scale * (query[i,h] · key[j,g]) + bias[i or 0, j]
+//   p    = softmax_j(s)                       (f32, max-subtracted)
+//   out[i,h] = Σ_j p[j] * value[j,g]
+// `bias` is an OPTIONAL rank-2 additive score bias [Tq, S] or [1, S] (the
+// broadcast key-only form a padding mask produces), f32, on the same device;
+// nullptr means no bias. It is additive in torch SDPA's sense — upstream builds
+// it as `(mask - 1) * finfo.max` for the prompt mask (transformer_args.py:204)
+// and as log-space attenuation for the self-attention strength mask (:232-237),
+// so a fully masked key reaches the softmax as a large negative number, NOT as
+// -inf, and an all-masked row degenerates to a uniform average exactly as torch's
+// does. All softmax/accumulation math is f32.
+//
+// BACKENDS, recorded so it cannot be discovered later: this op ships with a CPU
+// kernel (`AttentionCrossKernel`, src/vt/cpu/cpu_ops.cpp) AND — since phase L8,
+// 2026-08-12 — a NATIVE CUDA kernel (src/vt/cuda/cuda_attention_cross.cu). An
+// earlier revision of this paragraph recorded the CUDA one as OWED "alongside the
+// LTX-2.5 device-resident forward, which is the first caller that would need it";
+// that caller arrived and so did the kernel, in the same change, and a CUDA
+// device now has a real provider rather than a refusal or a unified-memory
+// fallback to the host.
+//
+// The CUDA kernel is a structural port of `AttentionDenseFlashKernel`
+// (src/vt/cuda/cuda_ops.cu), generalized on the three axes AttentionCrossArgs
+// exists for. It uses the online-softmax recurrence where the CPU kernel uses the
+// explicit three-pass max/exp/normalize, so the two agree to f32 summation-order
+// slack and are NOT bit-identical — the same relationship `AttentionDenseFast`
+// already has with `AttentionKernel`.
+//
+// A device with NO provider — kXPU, say — still refuses through `GetOp`, naming
+// this op via `vt::OpName` rather than falling back. Callers route on what a call
+// MEANS, not on whether its numbers happen to be square, so that refusal is
+// deterministic per call site instead of per prompt length — see Ltx2Attention
+// (src/vllm/model_executor/models/ltx2.cpp).
+void AttentionCross(Queue& q, Tensor& out, const Tensor& query, const Tensor& key,
+                    const Tensor& value, const Tensor* bias, const AttentionCrossArgs& args);
 
 // --- Conformer / FastConformer audio-encoder kernels -------------------------
 // Spike: .agents/specs/parakeet-conformer-encoder.md (rows P1/P2/P3). Upstream
@@ -2250,6 +2758,97 @@ void Conv2d(Queue& q, Tensor& out, const Tensor& x, const Tensor& weight, const 
 // x/weight/bias f32/f16/bf16; out f32/f16/bf16; all math in f32.
 void DepthwiseConv1d(Queue& q, Tensor& out, const Tensor& x, const Tensor& weight,
                      const Tensor* bias, const DepthwiseConv1dArgs& args);
+
+// --- BigVGAN / DAC vocoder 1-D convolutions (#672, spec
+// .agents/specs/minimax-music3.md §11.4). ------------------------------------
+//
+// These two are the whole convolution vocabulary of `vllm::vocoder1d`, the
+// shared 1-D BigVGAN core that MiniMax-Music3's vocoder, MiniMax-H3's audio VAE,
+// LTX-2.5's audio VAE and IndexTTS-2.5 all decode through
+// (include/vllm/model_executor/models/vocoder1d.h). The transposed one is 88.5 %
+// of MiniMax-Music3's acoustic-half profile and `vt` had no op of any kind that
+// could express it, which is why the whole stage had no device kernel to route
+// to.
+//
+// Upstream mirror: `torch.nn.functional.conv1d` / `conv_transpose1d` as the
+// checkpoints instantiate them —
+//   * MiniMax-Music3 `minimax_music3_vocoder.py:42,44,55,89,98`
+//     (`nn.Conv1d` at :42/:44/:89/:98, `nn.ConvTranspose1d` at :55),
+//   * LTX-2.5 `audio_vae/vocoder.py:104-184` (the alias-free resample pair) and
+//     its BigVGAN conv_pre/conv_post,
+//   * MiniMax-H3's DAC audio VAE (`dac_alias_free_resample.py`).
+//
+//   Conv1d              out    [N, Cout, Lout]
+//                       x      [N, Cin,  Lin ]
+//                       weight [Cout, Cin/groups, K]        (torch's layout)
+//                       bias   optional rank-1 [Cout]
+//     Lout = (Lin + 2*padding - dilation*(K-1) - 1)/stride + 1
+//
+//   ConvTranspose1d     out    [N, Cout, Lout]
+//                       x      [N, Cin,  Lin ]
+//                       weight [Cin, Cout/groups, K]        (torch's layout —
+//                              note dim 0 is the INPUT channel here)
+//                       bias   optional rank-1 [Cout]
+//     Lout = (Lin-1)*stride - 2*padding + dilation*(K-1) + 1 + output_padding
+//
+// `groups` must divide both Cin and Cout. Zero padding is realised by SKIPPING
+// out-of-range taps.
+//
+// THE NUMERIC CONTRACT, which is the load-bearing part.
+//
+// (1) Every output element owns ONE f64 accumulator. Not f32. The host
+//     reference these replace accumulated in double
+//     (`src/vllm/model_executor/models/vocoder1d.cpp` @ 8fa405bb7), every
+//     committed golden under `tests/parity/goldens/` for all four consumers was
+//     taken through it, and a narrower accumulator would move four shipped
+//     models at once. This is a DELIBERATE divergence from torch, which
+//     accumulates an f32 conv in f32; it is recorded rather than silently
+//     inherited because `.agents/porting.md` "Mirror the memory format" cuts
+//     both ways and a WIDER accumulator is exactly the class of divergence a
+//     token gate cannot see. Cost: the activations and weights stay f32 in
+//     memory, so nothing moves more bytes; only the register width differs.
+//
+// (2) THE VISIT ORDER IS PINNED, not merely the value.
+//     Conv1d accumulates over (ic ascending, k ascending) with the bias seeded
+//     FIRST — `acc = bias; for ic: for k: acc += x*w`.
+//     ConvTranspose1d accumulates over (ic ascending, then input position t
+//     ascending, taking the single tap k with `t*stride + k*dilation == p`) with
+//     the bias added LAST. That is the exact sequence of additions the host
+//     scatter performed into each destination cell, which is what lets the
+//     gather-form kernels here be BIT-IDENTICAL to it rather than merely close.
+//
+// (3) ConvTranspose1d SKIPS an input whose value compares equal to 0.0, exactly
+//     as the host loop did. That is not an optimisation that may be dropped: it
+//     decides the sign of a zero output cell, because (-0.0) + (+0.0) == +0.0
+//     while (-0.0) alone is -0.0.
+//
+// Parallelism partitions OUTPUT elements only, so results do not depend on the
+// thread count or the launch geometry. Gated in
+// tests/vt/test_ops_conv1d_general.cpp against a verbatim copy of the pre-op
+// host loop, and in tests/vllm/models/test_host_parallel.cpp end to end.
+//
+// (4) THE CUDA PROVIDER IS BYTE-IDENTICAL TO THE CPU ONE, not merely close.
+//     Both are one f64 accumulator per output element walked in the order
+//     above; the host is compiled `-ffp-contract=off` (CMakeLists.txt:40-56)
+//     and the device kernel uses `__dmul_rn`/`__dadd_rn`, so every operation on
+//     both arms is an IEEE double multiply or add with round-to-nearest-even on
+//     the same values in the same sequence. The gate asserts `memcmp` equality,
+//     not a tolerance.
+//
+// x/weight/bias/out are f32 only. f16/bf16 are REFUSED with a message naming
+// the gap rather than silently widened — no consumer has them and no golden
+// covers them (owed: .agents/specs/minimax-music3.md §11.4).
+void Conv1d(Queue& q, Tensor& out, const Tensor& x, const Tensor& weight, const Tensor* bias,
+            const Conv1dArgs& args);
+
+void ConvTranspose1d(Queue& q, Tensor& out, const Tensor& x, const Tensor& weight,
+                     const Tensor* bias, const ConvTranspose1dArgs& args);
+
+// Output length for the given input length and args — the single definition of
+// torch's shape arithmetic, so a caller sizing an output buffer and the op
+// validating it can never disagree. Returns <= 0 when the geometry is empty.
+int64_t Conv1dOutLength(int64_t in_len, int64_t kernel, const Conv1dArgs& args);
+int64_t ConvTranspose1dOutLength(int64_t in_len, int64_t kernel, const ConvTranspose1dArgs& args);
 
 // P3 — Transformer-XL relative-position ENCODER self-attention. No KV cache, no
 // paging, no RoPE, non-causal: every existing vt attention path is a decoder
