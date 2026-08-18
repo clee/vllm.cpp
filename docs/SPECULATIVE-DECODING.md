@@ -189,7 +189,10 @@ which is AHEAD of the pinned oracle; it is mirrored here because the pinned
 behavior is wrong for a checkpoint that is already published
 (`RadixArk/Qwen3.8-27B-DSpark` declares exactly that pair).
 
-Anything else is the DeepSeek-V4 DSpark draft, whose weights ship inside the
+A draft config that carries no `architectures` key at all is not classified. It
+loads exactly as it did before, because an absent key is not evidence of a lane.
+
+Anything else that names an architecture is the DeepSeek-V4 DSpark draft, whose weights ship inside the
 DeepSeek-V4 target rather than in a separate checkpoint. vLLM rewrites such a
 config onto `model_type: "deepseek_v4"` and loads it; **this engine refuses it by
 name** instead, because it carries only a stub for that model and the lane needs

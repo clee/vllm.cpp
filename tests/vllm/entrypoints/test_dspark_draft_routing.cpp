@@ -296,6 +296,15 @@ constexpr const char* kDeepseekV4DraftConfig =
     R"({"architectures":["DSparkDraftModel"],"model_type":"deepseek_v4",)"
     R"("num_hidden_layers":5})";
 
+// A draft that DECLARES no architecture at all. Upstream reads the key off a
+// HuggingFace ModelConfig, where an absent key is `[]`, and its catch-all would
+// send that to DeepSeek-V4. This engine does not classify on the ABSENCE of
+// evidence, because the native `deepseek-ai/dspark_qwen3_*_block7` layouts have
+// not been read here to confirm they declare it, and refusing them would break a
+// lane that loads today.
+constexpr const char* kNoArchitecturesDraftConfig =
+    R"({"model_type":"qwen3","block_size":7,"num_hidden_layers":5})";
+
 // The native name, routed since SPEC-DSPARK W5. The regression guard: the
 // classification must not refuse the lane that already loads.
 constexpr const char* kNativeQwen3DSparkConfig =
@@ -369,5 +378,16 @@ TEST_CASE("loader admits a DSparkDraftModel + qwen3 draft") {
 
 TEST_CASE("loader still admits the native Qwen3DSparkModel draft") {
   const DraftDir draft("draft-native", kNativeQwen3DSparkConfig);
+  CHECK(RefusalForDraft(draft.path()).empty());
+}
+
+TEST_CASE("loader does not classify a draft that declares no architecture") {
+  // The narrowing recorded beside `ReadDsparkDraftIdentity`. The directory name
+  // carries "dspark", exactly as the published native drafts' repo ids do, so
+  // `IsDsparkDraft` answers true and the ONLY thing standing between this draft
+  // and the DeepSeek-V4 refusal is the empty-list guard.
+  const DraftDir draft("dspark-noarch", kNoArchitecturesDraftConfig);
+  REQUIRE(CarriesDsparkSubstring(draft.path()));
+
   CHECK(RefusalForDraft(draft.path()).empty());
 }

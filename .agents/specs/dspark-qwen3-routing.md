@@ -304,6 +304,25 @@ in §2 do.
 - R4's `block_size` gap needs its own issue and row. It is a correctness hole in
   the landed `SPEC-DSPARK` lane, not in this routing change, and folding it in
   here would bundle unrelated work into one branch.
+- **The empty `architectures` list is NOT classified.** Upstream reads the key
+  off a HuggingFace `ModelConfig`, where an absent key is `[]`, so its catch-all
+  sends that list to DeepSeek-V4. The loader here skips classification instead,
+  because refusing on the ABSENCE of evidence would refuse the native
+  `deepseek-ai/dspark_qwen3_*_block7` drafts if they declare no architecture, and
+  no copy of one has been read on this host to settle it. Owed: read a published
+  native draft's `config.json`, and tighten the guard to upstream's catch-all if
+  it declares the key. Gated today by
+  `test_dspark_draft_routing.cpp`'s no-architecture case, which pins the
+  narrowing so it cannot change silently.
+- **The refusal is not FIRST on the `FromModelDir` path.**
+  `maybe_load_dflash()` runs `LoadDsparkDraft` BEFORE the `LoadedEngine`
+  constructor resolves the speculative config, so a DeepSeek-V4 draft reaching
+  that path fails on `LoadDsparkDraft`'s own "must carry target_layer_ids and
+  mask_token_id" first, and the named refusal only leads on the in-memory
+  constructor path. Owed: a second classification call site inside
+  `LoadDsparkDraft`, plus the test that proves it, which needs a real draft
+  checkpoint and therefore the same authority G5 waits on.
+
 - A pin advance past `555967922` inherits from this row: remove the
   `BEYOND-PIN` marks, re-point the `speculative.py` anchors at the new line
   numbers, and re-check whether the `K3DSparkModel` arm visible in #52197's

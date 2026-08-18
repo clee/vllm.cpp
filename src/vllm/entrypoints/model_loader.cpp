@@ -487,6 +487,14 @@ std::optional<DsparkDraftIdentity> ReadDsparkDraftIdentity(const std::string& pa
       if (a.is_string()) id.architectures.push_back(a.get<std::string>());
     }
   }
+  // A config that DECLARES no architecture is not classified at all. Upstream
+  // reads the key off a HuggingFace `ModelConfig`, where an absent key is `[]`,
+  // and its catch-all would send that empty list to DeepSeek-V4. Refusing on it
+  // here would refuse a draft on the ABSENCE of evidence, and the native
+  // `deepseek-ai/dspark_qwen3_*_block7` layouts have not been read on this host
+  // to confirm they declare it. The narrowing is deliberate and is recorded
+  // under `## Owed` in .agents/specs/dspark-qwen3-routing.md.
+  if (id.architectures.empty()) return std::nullopt;
   if (doc.contains("model_type") && doc.at("model_type").is_string()) {
     id.model_type = doc.at("model_type").get<std::string>();
   }
