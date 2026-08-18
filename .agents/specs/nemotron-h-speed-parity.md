@@ -195,14 +195,35 @@ would void it, so the leg sampler records the compute-apps list instead.
 
 ## Now
 
-**Result: PENDING a named resource.** No speed number is recorded on any axis.
-`dgx:gpu0` reads `unhealthy`, `out of the pool lease_expired`, with a live
-heartbeat and refreshing labels, and `AGENTS.md` sends clearing a quarantined
-device to a human. The job is queued at position 1 and runs when the device
-returns to the pool. It is pinned to
-`8ac26d6fc0c086efffd1d093d48d0500357dda9c`, which contains `0ea5d249f`.
+**Result: the numerator is MEASURED and gated; the ratio is PENDING the oracle.**
 
-The one lease that started took no number and corrected two instruments; the
-evidence, the contention state, the clock window and the operand hashes are in
-[`benchmark-record.md`](../benchmark-record.md). Nothing about our throughput,
-latency or memory against the oracle is claimed or implied here.
+Measured on `dgx:gpu0` through `rc run` (job
+`d5858b36-a03a-4261-94df-5269024e4160`) at tree
+`5325b7b970b67f97a77834e907fc34fb2990b71e`, on an idle box, with all five CUDA
+feature lines `ENABLED for [121a]`:
+
+- engine load **280.9 s**
+- warm per-output-token **10.3194 s**, output throughput **0.09691 tok/s**,
+  batch 1, over 5 warm prompts with a 0.245% spread
+- peak host memory **44,616 MB** of 122,502
+- `TOKEN MATCH: 96/96 ... mode=decode` on BOTH timing legs, `STRICT PASS`,
+  192/192 tokens; same-binary A/B over one load 1.0016 warm
+
+**No ratio is claimed.** The pinned oracle initialized, loaded (17.86 GiB,
+230.4 s) and completed `torch.compile` inside the lease, then consumed
+104,992 MB of host in the next step and was killed by this row's watchdog at
+`MemAvailable` 17,510 MB. The box did not reboot. The lever is named by
+arithmetic rather than left open: `gpu_memory_utilization` 0.9 of ~119 GiB of
+unified memory is ~107 GB, which is the observed peak.
+
+**The bottleneck is named by an instrument, not by a reading.** `nvidia-smi`
+reported GPU utilization 0% in 2,019 of 2,155 samples over the measured window,
+so the GPU was busy in 6.31% of it, and the clock helper's own comparison gate
+would refuse that window for failing its majority-busy floor. That refusal is
+the finding. It is the 23 of 52 layers that bounce to the host per token plus
+the host NVFP4 `lm_head`, and the next traceable hypothesis is A2-Q1
+([#940](https://github.com/mudler/vllm.cpp/issues/940)) then A2-Q2b, each of
+which has to raise the busy fraction to be believed.
+
+Full recipe, hashes, contention and clock state:
+[`benchmark-record.md`](../benchmark-record.md).

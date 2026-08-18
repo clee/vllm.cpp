@@ -19,97 +19,139 @@ from relative link targets repointed for this file's location.
 
 # Benchmarks
 
-## MODEL-NEMOTRON-H-ABI-A2P — the first Nemotron speed run took NO number, and corrected the two instruments the number depends on (2026-08-18, `row/MODEL-NEMOTRON-H-ABI-A2P-speed`, #1250, #1253, #1185)
+## MODEL-NEMOTRON-H-ABI-A2P — the FIRST Nemotron speed numbers, gated, numerator-only, and the GPU is idle 93.7% of the decode (2026-08-18, `row/MODEL-NEMOTRON-H-ABI-A2P-speed`, #1250, #1253)
 
-**No speed number is recorded, on any axis.** The result is PENDING a named
-resource: `dgx:gpu0` reads `unhealthy`, `out of the pool lease_expired`, and
-`AGENTS.md` sends clearing a quarantined device to a human. The job is still
-queued at position 1 and runs when the device returns to the pool. Read this
-entry as what one lease measured about the MEASUREMENT, not about the model.
+**These are the first speed numbers for `NemotronHForCausalLM` on any axis.
+They are NUMERATOR-ONLY and NO ratio is claimed**, because the pinned oracle
+could not be run to completion on this workload. The denominator's identity is
+pinned and its blocker is measured; both are below.
 
-**Contention, recorded because it is the reason a number would be void.**
-`rc devices` read `dgx:gpu0 busy` for every window of this session, held first by
-`fullmodel-onestage-r4` and then by `fullmodel-1252-r5`, so nothing ran beside
-another job. At the one lease that did start (`81a0cfb1-eaa3-46fc-b64f-d9fa0cab5ecf`,
-18:11:01Z) phase 0 read load average 1.39, host memory 69,399 of 122,502 MB used,
-SM clock 2411 MHz against a 3003 MHz maximum, persistence `Disabled`, boot id
-`3fd9745a-d25a-426c-ba3c-97c958a85515`, and **`nvidia-smi --query-compute-apps`
-reporting PID 10495 still holding 36,396 MiB from the PREVIOUS lease**. The
-controller reaped it afterwards (`killed: stragglers reaped after exit`).
-`nvidia-smi -lgc 2100` returned 4, `The current user does not have permission to
-change clocks`, so the clock cannot be pinned from inside the worker and has to
-be recorded rather than controlled.
+### Provenance
 
-**`nvidia-smi --query-gpu=memory.used` reads `[N/A]` on GB10.** A leg that
-samples it is blind to exactly the state that would void it, so the compute-apps
-list is the only device-side contention instrument on this box and the sampler
-now records that instead.
+Measured tree `5325b7b970b67f97a77834e907fc34fb2990b71e`, which contains
+`0ea5d249f` (#1221). `dgx:gpu0` through `rc run`, job
+`d5858b36-a03a-4261-94df-5269024e4160`, no `ssh`. Operand
+`/workspace/a3/ckpt-stage`, 21,583,809,748 bytes, 52 shards,
+`architectures ['NemotronHForCausalLM']`, `num_hidden_layers 52`, first shard
+`model-00001-of-00052.safetensors` sha256 of its first MiB
+`aaa10f1a263d622e838b1604de278504c8d07a5894c49cff3264383129906f2a`; the golden
+names the same checkpoint at revision `29f2d1746d8f41e316523194b19018707749b1b1`.
+Binary sha256 `10de36a0fa8fcf6d02e4aab00597c8e0e7ace62e9d4c191d33d8f4fd566ce75c`,
+`cuobjdump -lelf` reporting `libvllm.so.0.0.3.sm_121a.cubin`.
 
-**`nvcc --version` is not the toolkit postcondition.** The worker ships a PARTIAL
-CUDA 13.0: the compiler answers `release 13.0, V13.0.88` and the cuBLAS
-development component is absent. A harness that installs only when `nvcc` is
-missing therefore installed nothing, CMake configured through every feature probe
-and printed all five of `fp4-mma`, `cutlass-nvfp4`, `cutlass-fp8`,
-`marlin-nvfp4` and `fa2` as `ENABLED for [121a]`, and then failed at generate:
+**The build is not degraded.** CUDA 13.3.73 from the `ubuntu2404/sbsa` lane,
+`CFG_RC=0`, `BUILD_RC=0`, zero compile errors, and `fp4-mma`, `cutlass-nvfp4`,
+`cutlass-fp8`, `marlin-nvfp4` and `fa2` each `ENABLED for [121a]` —
+`FEATURE_LINES_SEEN=5 DEGRADED_FEATURE_LINES=0`, counted rather than eyeballed.
 
-```
-CMake Error at CMakeLists.txt:1654 (target_link_libraries):
-  Target "vllm" links to:
-    CUDA::cublasLt
-  but the target was not found.
-```
+**Contention: the box was idle.** At the measured lease `nvidia-smi
+--query-compute-apps` was EMPTY, host memory read 4,892 of 122,502 MB used, load
+average 1.86. `nvidia-smi --query-gpu=memory.used` reads `[N/A]` on GB10, so the
+compute-apps list is the only device-side instrument here; an earlier lease this
+session started with 36,396 MiB still held by the previous holder's straggler,
+which is why this is recorded rather than assumed.
 
-This is #1185's own "an environment repair must be unconditional and assert its
-postcondition" applied to a postcondition chosen wrong, which is a different
-defect from skipping the repair. The postcondition is `libcublasLt.so`,
-`cublasLt.h` and `Python.h`.
+**Clock.** Median 2411 MHz over 136 retained busy samples, spread 0.00%,
+`clocks.max.sm` 3003, applications 2418, persistence `Disabled`, boot id
+`3fd9745a-d25a-426c-ba3c-97c958a85515`, throttle reasons `{0x0, 0x4}`.
+`nvidia-smi -lgc` returns 4, `The current user does not have permission to change
+clocks`, so the clock is RECORDED and not pinned from inside the worker.
 
-**The oracle's recorded hazard is NOT what stopped it, and that is the load-bearing
-correction.** #1185 records a model run as untested with a reboot of the box as
-the known failure mode, at `gpu_memory_utilization` 0.75 and again at 0.30. The
-run reached engine start and **did not reboot the box**: peak host use over the
-window was 28,534 MB of 122,502 MB across 233 samples and the `MemAvailable`
-watchdog never fired. It died on:
+### The workload, and what the correctness evidence covers
 
-```
-/tmp/tmpd89bw8jj/cuda_utils.c:9:10: fatal error: Python.h: No such file or directory
-torch._inductor.exc.InductorError: CalledProcessError: Command '['/usr/bin/gcc', ...
-RuntimeError: Engine core initialization failed. See root cause above. Failed core proc(s): {}
-```
+The three golden prompts (5, 8, 13 prompt tokens), 32 tokens each, greedy with
+`ignore_eos`, batch 1 sequential, `max_model_len 512`, `max_num_seqs 8`, KV pool
+stated explicitly as `--num-blocks 256` at the 32-token default block size, so
+8192 KV tokens. `--repeat 2` ran the battery twice over ONE engine load.
 
-Triton compiles `cuda_utils.c` at RUNTIME and the worker has `python3` and no
-`python3-dev`. The failure surfaces four frames up as an engine-core failure
-whose proc set is EMPTY, so it names nothing and reads as an oracle or model
-limitation. `lease-runtime-staging.md` already carries
-`apt-get install -y -qq python3-dev` as step one of the `thor:gpu0` recipe, so
-the fix was written down and had not been applied on the `dgx` side.
+**Every timing leg is a gated leg.** `TOKEN MATCH: 96/96 over 3 prompt(s) (full
+rows=3, short rows=0, mode=decode)` on leg 1 and again on leg 2, `STRICT PASS`,
+192 of 192 tokens, zero short rows. No number below comes from a configuration
+whose tokens were not compared in the same process.
 
-**What the lease DID establish about the oracle.** The wheel
+### The numbers
+
+| axis | value |
+|---|---|
+| engine load | **280.9 s** |
+| leg 1, per prompt | 347.22 / 330.44 / 330.64 s |
+| leg 2, per prompt | 329.92 / 330.27 / 329.83 s |
+| warm per-prompt mean (n=5) | **330.220 s** for 32 tokens |
+| warm per-output-token | **10.3194 s** |
+| warm output throughput | **0.09691 tok/s** |
+| first prompt after load | 347.220 s, 10.8506 s/token |
+| peak host memory | **44,616 MB** of 122,502 (min `MemAvailable` 77,886, 1106 samples) |
+
+**Same-binary A/B, order preserved, over one load.** Leg 1 against leg 2 is
+1.0185 including the cold first prompt and **1.0016 excluding it** — 0.16%
+apart. Across the five warm prompts the spread is 0.245% (min 329.83, max
+330.64). The first prompt after the load is 5.2% slower than the warm mean and
+is reported separately rather than averaged in, because it is cold for a named
+reason and not discarded for an unnamed one.
+
+### The finding that names the bottleneck, from an instrument rather than a reading
+
+**`nvidia-smi` reported GPU utilization 0% in 2,019 of 2,155 samples across the
+whole measured window. The GPU was busy in 6.31% of it.**
+`tools/bench/gpu_clock_state.py` counts a sample idle at
+`utilization_gpu_pct <= 0.0`, so this is the driver's own answer and not an
+inference from source. Read the consequence carefully: the helper's own
+comparison gate would REFUSE this window as a clock attribution, because it
+requires a MAJORITY of the window busy and this is 6.31%. That refusal is the
+result here rather than a defect — it says the decode is not GPU work.
+
+That matches the mechanism exactly. Of 52 layers, 6 are attention and stay on
+the device end to end, 23 MoE layers run on the device through the NVFP4 Marlin
+arm, and **23 Mamba2 layers bounce**: `nemotron_h_device.cpp` downloads the
+normed hidden, runs the mixer on the CPU queue and uploads the result, once per
+layer per token. Then `NemotronHHostLmHead` projects the last hidden on the
+host, because `nemotron_h.cpp:1031-1034` refuses the NVFP4 `lm_head` on a
+non-CPU queue.
+
+**This is not a ceiling and nothing here is architecture-limited.** The next
+traceable hypothesis is A2-Q1 ([#940](https://github.com/mudler/vllm.cpp/issues/940)),
+the 46 FP8 W8A8 mamba `in_proj`/`out_proj` projections that are 36.6% of decode
+bytes and 27.6% of GEMM FLOPs, which removes the 23 bounces; then A2-Q2b for the
+`lm_head`. The prediction each one has to answer is the busy fraction: if the
+23 bounces are the cost, moving them on-device must raise 6.31% toward the
+majority the clock gate wants, and the same battery on the same binary makes the
+delta attributable.
+
+### The denominator: identity pinned, runtime blocked, blocker MEASURED
+
 `vllm-0.1.dev1+g555967922-cp312-cp312-linux_aarch64.whl`, sha256
-`89805161e5ac9905beae21b585b529a0343dccce290ccfeefa680effd2cf7523`, installs into
-a fresh venv beside `torch==2.13.0` and asserts its identity from `cd /`:
-`vllm 0.1.dev1+g555967922 /tmp/nhspeed-oracle/lib/python3.12/site-packages/vllm/__init__.py`.
-So the denominator's identity is pinned and only its runtime is blocked.
+`89805161e5ac9905beae21b585b529a0343dccce290ccfeefa680effd2cf7523`, installed
+beside `torch==2.13.0` and asserted from `cd /` as `vllm 0.1.dev1+g555967922`.
 
-**Provenance of the operand.** `/workspace/a3/ckpt-stage`, 21,583,809,748 bytes,
-52 shards, `architectures ['NemotronHForCausalLM']`, `num_hidden_layers 52`,
-first shard `model-00001-of-00052.safetensors` with sha256 of its first MiB
-`aaa10f1a263d622e838b1604de278504c8d07a5894c49cff3264383129906f2a`. Measured tree
-`8ac26d6fc0c086efffd1d093d48d0500357dda9c`, which contains `0ea5d249f` (#1221).
+With `python3-dev` installed ([#1253](https://github.com/mudler/vllm.cpp/issues/1253))
+**the pinned oracle got further than it ever has inside a lease**: it initialized
+a V1 engine, loaded the checkpoint (`Model loading took 17.86 GiB memory and
+230.443145 seconds`) and **completed `torch.compile` in 17.28 s** — the step
+whose aftermath is the recorded reboot hazard. It was then killed by this row's
+watchdog in the step AFTER compile, at `MemAvailable` 17,510 MB against a
+20,000 MB floor, with **104,992 MB of host memory in use**. `ORACLE_RC=137`.
+**The box did not reboot; the watchdog is why.**
 
-**The gap, when it is measured, already has its causes named and is NOT a
-ceiling.** The A3 gate's own legs read 264.4 s engine load and 342.61 / 328.19 /
-327.51 s for 32 tokens each, about 10.3 s per output token at batch 1. The
-per-layer trace gives the mechanism rather than a guess: of 52 layers, 6 are
-attention and stay on the device end to end, 23 MoE layers run on the device
-through the NVFP4 Marlin arm, and **23 Mamba2 layers bounce** — the normed hidden
-is downloaded, the mixer runs on the CPU queue, the result is uploaded — once per
-layer per token, after which `NemotronHHostLmHead` projects the last hidden on the
-host because `nemotron_h.cpp:1031-1034` refuses the NVFP4 `lm_head` on a non-CPU
-queue. The next traceable hypothesis is therefore A2-Q1 (#940), the 46 FP8 W8A8
-mamba projections that are 36.6% of decode bytes, followed by A2-Q2b for the
-`lm_head`; and the measurement to take after each is the same battery on the same
-binary, so the deltas are attributable.
+The arithmetic names the lever rather than leaving it open: `gpu_memory_utilization`
+defaults to 0.9, and 0.9 of ~119 GiB of UNIFIED memory is ~107 GB, which is the
+104,992 MB observed. #1185 records the fraction as "not the lever" from an
+earlier attempt; on this model and this configuration the peak matches the
+fraction almost exactly, so it is the first thing to vary, one at a time.
+
+The resolved production configuration is recorded so the retry changes one thing
+against it: `enforce_eager=False`, `cudagraph_mode=FULL_AND_PIECEWISE`,
+`cudagraph_capture_sizes=[1,2,4,8,16]`, `max_cudagraph_capture_size=16`,
+`dtype=torch.bfloat16`, `quantization=modelopt_mixed`, `kv_cache_dtype=fp8_e4m3`,
+`enable_chunked_prefill=True`, `enable_prefix_caching=False`, `max_seq_len=512`.
+
+**A KV fact that no fraction fixes, and it bounds what "like-for-like" can
+mean here.** vLLM's hybrid allocator logged `Setting attention block size to
+4192 tokens to ensure that attention page size is >= mamba page size` and
+`Padding mamba page size by 0.58%`. Our block size is 32. So the two sides
+cannot be matched on block count at all, and a token-capacity match is the most
+that is available: ours is 256 x 32 = 8192 KV tokens, and the oracle's smallest
+comparable pool is 2 x 4192 = 8384. Any future ratio states which of the two it
+matched and does not imply the other.
 
 ## MODEL-NEMOTRON-H-ABI-A2P — the A3 gate PASSES on the host, and the device divergence was the STALE input ids (2026-08-18, `row/MODEL-NEMOTRON-H-ABI-A2P-1157`, #1157, #1217, #810)
 
