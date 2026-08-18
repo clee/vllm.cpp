@@ -128,11 +128,14 @@ Two consequences, both binding:
 
 ## Our baseline
 
-What exists in this tree today, measured against `origin/main` `4ee5f4a69` and
+What exists in this tree today, measured against `origin/main` `836c13c35` and
 against the artifacts' own headers rather than against any record of them. The
-first reading was taken at `1dac4f9a7`; `4ee5f4a69` landed #1258 (via #1267) and
-#1259, which edited two of the files this section anchors, so every citation
-below was re-derived against the merged tree rather than carried forward.
+first reading was taken at `1dac4f9a7`. `4ee5f4a69` landed #1258 (via #1267) and
+#1259, and `836c13c35` then landed #1277, which between them edited four of the
+files this section anchors, so every citation below was re-derived against the
+merged tree rather than carried forward. `origin/main` moved twice during this
+one repair, which is why the re-anchor obligation under `## Owed` is stated as a
+standing pre-landing step rather than a thing this change finished.
 
 ### The GGUF arm
 
@@ -339,7 +342,7 @@ unquantized.
    `src/vllm/model_executor/models/qwen3_5_dense_weights.cpp:828`. This is the
    **only** FP8 arm with no `has()` guard: the block-wise arm refuses an
    `input_scale` (`:467-473`), the ModelOpt NVFP4 arm presence-guards it
-   (`:388-395`). Verified still present at `origin/main` `4ee5f4a69`.
+   (`:388-395`). Verified still present at `origin/main` `836c13c35`.
 
 2. **The per-channel BF16 `weight_scale` is refused independently.**
    `include/vllm/model_executor/models/dense_weight_loaders.h:168` asserts
@@ -352,9 +355,9 @@ unquantized.
    read fix.
 
 3. **A dynamic per-token activation scheme has no representation.**
-   `src/vllm/model_executor/models/qwen3_5.cpp:3593` quantizes the activation with
+   `src/vllm/model_executor/models/qwen3_5.cpp:3629` quantizes the activation with
    one static scalar (`vt::QuantFp8Static(..., w.in_proj_qkv_fp8.input_scale)`),
-   and `:3512-3513` asserts the two GDN shards share it. There is no dynamic-scale
+   and `:3548-3549` asserts the two GDN shards share it. There is no dynamic-scale
    path on this arm at all.
 
 4. **The scheme is never read from the config.** The only `quantization_config`
@@ -538,7 +541,7 @@ qwen3_5's assert (`qwen3_5_gguf_weights.cpp:874-875`).
    `AGENTS.md` §"Nothing lands dead" requires. If it does not fit, extend it.
    Either way the tree ends with ONE mixed-precision resolver.
 4. Widen the FP8 weight scale from a host float to a resident per-channel vector.
-   `qwen3_5.cpp:3521,3532-3540,3553-3554` already carries a per-column
+   `qwen3_5.cpp:3557,3568-3576,3589-3590` already carries a per-column
    folded-alpha vector for the merged GDN GEMM, so the *consumer* shape exists;
    what is missing is loading one from disk.
 5. Dynamic per-token activation FP8: mirror vLLM's own path for
@@ -766,7 +769,7 @@ them:
   change publishes them on — this spec, the two `quantization-matrix.md` rows
   (which publish clickable `#L` permalinks), and the justifying comment in
   `scripts/check-agent-record.py` — before any implementation lands. They were
-  re-derived at `origin/main` `4ee5f4a69` and a line number is stale the moment
+  re-derived at `origin/main` `836c13c35` and a line number is stale the moment
   the file above it moves, including inside the same pull request. This bullet
   previously promised only the spec's citations, which is the narrower promise
   that let the matrix permalinks go stale while the spec was being repaired.
@@ -776,7 +779,7 @@ them:
 ## Now
 
 All three rows are `READY`: the gap is verified against `origin/main`
-`4ee5f4a69` and
+`836c13c35` and
 against the artifacts' own headers, and this spec is committed before any
 implementation. No `src/`, `include/` or `tests/` file changes in this change —
 `git diff origin/main..HEAD` over those three paths is empty, and that emptiness
