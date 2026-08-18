@@ -23254,4 +23254,46 @@ frame where the old one made 14 larger ones, so it pays proportionally more
 `Threadpool::Barrier`, and its per-step attention is a scalar loop over one query
 row that no longer rides the output-row partition. Both show up as the after
 arm's wider relative spread (1.68-3.73 against 5.87-8.67).
+## MUSIC3-DEPTH-THOR-PAIR-1 — VOID: the two arms were the same binary (2026-08-18, `thor:gpu0`, job `56848b2e`, #672)
 
+**Status: VOID. This pair measured nothing about the depth schedule, and its
+numbers must not be quoted.** It is recorded because a voided measurement with
+its cause named is evidence, and a silently dropped one is not.
+
+**The cause, from the job's own log:**
+
+```text
+gen_before: 72744 bytes sha=b98a5dbba37a67f1
+gen_after:  72744 bytes sha=b98a5dbba37a67f1
+```
+
+The job used ONE source tree and ONE build dir for both arms. After the first
+build, the second configure-and-build found the tree up to date and emitted no
+distinct binary, so `gen_before` and `gen_after` are the same program under two
+names. Both arms hashed `b98a5dbba37a67f1`.
+
+**What it reported, marked as not a result:** `ar.depth_forward` 77.930 s on the
+nominal BEFORE arm against 77.726 s on the nominal AFTER arm, at **808 calls on
+both**. That is a 0.26 % spread between two runs of one binary. The identical
+call count is the internal control that catches it: the whole claim of
+`MUSIC3-DEPTH-INCREMENTAL` is that the schedule goes from 14 depth calls per
+frame to 8, so **a pair whose call count does not move cannot contain the
+change**. Taken at face value this pair reads as a refutation of the 3.50x in
+`MUSIC3-DEPTH-INCREMENTAL`, and it is not one.
+
+**Generalisation, because this is the third shape of the same defect in this
+tree.** A mutation that fails to rebuild reads as a passing test; a restore
+without a rebuild leaves the previous mutation's object in `libvllm.a`; an A/B
+that fails to rebuild reads as a levelled speedup. In every case the instrument
+measures the previous artifact and returns a confident verdict about the code.
+**Whenever two artifacts are required to differ, assert that they differ — by
+hash — before reading anything downstream of them.**
+
+**Replacement in flight:** job `7b22b5b0`, `thor:gpu0`, `--max-runtime 150m`.
+Separate clones and separate build dirs per arm; a hard `FATAL_ARMS_IDENTICAL`
+guard on the two binaries' `sha256` so this failure aborts rather than tabulates;
+the checkpoint staged to local disk first (spec §15.6); three alternating pairs;
+and a cross-arm comparison of the output WAV `sha256`, which puts the
+bit-identity claim at Thor geometry alongside the speed. Arms `c802dba8d` (the
+`row/MUSIC3-DEPTH-SPEED` merge-base, so the delta is exactly the 10 files the row
+touches) and `4568c6e71`. Spec §16.6a.

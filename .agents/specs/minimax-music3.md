@@ -2925,6 +2925,14 @@ so no crossover point is claimed.
 
 ## 16. The depth decoder stops recomputing itself (#672) — §11.4's last owed row, and it did not need the dtype
 
+> **This section was §15 until #1237 landed `## 15. Where the time ACTUALLY goes`
+> on `main` at the same end-of-file position.** It is §16 from that merge onward.
+> The bodies of issues #1246 and #1247 were written before the merge and cite
+> `§15.2`, `§15.3`, `§15.5` and `§15.6` meaning the subsections that are now
+> §16.2, §16.3, §16.5 and §16.6. Those two rows are corrected here rather than in
+> `.agents/issue-index.md`, because that index is append-only and an edited row
+> is duplicated rather than merged.
+
 §14.5 left the depth decoder as the one owed device row and corrected §11.4's
 reason for it: routing it through an f32 `vt::MatmulBT` would drop the bf16
 `Store` that every gated number was taken with, so a device arm needs **bf16
@@ -3147,9 +3155,9 @@ reason and it recurred: this 20-core x86-64 box was carrying three other
 sessions' `test_ltx2_video` runs and two full `ctest` builds throughout, at a
 1-minute load average between **39 and 52** (5-minute 71-92). A wall-clock e2e
 pair taken there measures somebody else's scheduler. The Thor per-stage pair —
-the one that would price this against §16.1's own profile — is **QUEUED** on
-`thor:gpu0` behind two other jobs and is recorded as PENDING rather than
-estimated.
+the one that would price this against §16.1's own profile — has now been taken,
+and its first result is **VOID** rather than pending. §16.6a records what it
+reported, why the number cannot be read, and what is in flight to replace it.
 
 **What replaces it.** The depth stage's inner loop is short enough to repeat, so
 the MINIMUM over rounds is available, and a minimum is the least-disturbed sample
@@ -3223,6 +3231,52 @@ visible in the after arm's higher round-to-round spread (1.68-3.73 against
 5.87-8.67, a wider RELATIVE band). Neither is worth a lever until the Thor number
 says which side of the bound this stage is on.
 
+### 16.6a The Thor pair was taken, and the first one is VOID — both arms were the same binary
+
+**The first Thor per-stage pair (job `56848b2e`, `thor:gpu0`) is VOID. It did not
+measure this change, because the two arms were byte-identical binaries.** Its own
+log is what says so:
+
+```text
+gen_before: 72744 bytes sha=b98a5dbba37a67f1
+gen_after:  72744 bytes sha=b98a5dbba37a67f1
+```
+
+One `sha256` for both arms. The job reused a single source tree and a single
+build dir across the two arms, so the second configure-and-build found the tree
+already up to date and produced no distinct binary. `gen_before` and `gen_after`
+are the same program, run twice.
+
+**What it reported is therefore not a result and is not recorded as one.** It
+showed `ar.depth_forward` at 77.930 s on the "before" arm against 77.726 s on the
+"after" arm, with an identical **808 calls on both**. Those two numbers are a
+0.26 % difference between two runs of one binary, which is run-to-run noise on a
+shared box; the identical call count is the same fact stated a second way, since
+§16.2's whole claim is that this change takes the depth stage from 14 calls a
+frame to 8. **A pair that cannot move the call count cannot have contained the
+change.** Read at face value the pair would have refuted §16.6's 3.50x, and it is
+recorded here precisely so that it cannot be quoted later as a refutation.
+
+**This is the class of defect §16.5's own gate work is about, arriving from the
+other side.** A mutation that fails to rebuild reads as a passing test; an A/B
+that fails to rebuild reads as a levelled speedup. In both the instrument
+silently measures the previous artifact and returns a verdict about the code.
+The rule both cases want is the same one: **whenever two artifacts are required
+to differ, assert that they differ before believing anything downstream of them.**
+
+**The corrected pair is in flight** as job `7b22b5b0` on `thor:gpu0`
+(`--max-runtime 150m`), and it is not this session's job to submit or lease. It
+takes the two arms from **separate clones with separate build dirs**, and it
+carries a hard `FATAL_ARMS_IDENTICAL` guard on the two binaries' `sha256` so this
+failure aborts the job instead of producing a plausible table. It stages the
+checkpoint to local disk first (§15.6's finding, applied), runs three alternating
+pairs, and compares the two arms' output WAV `sha256` across arms so the
+bit-identity claim is checked at Thor geometry as well as the speed. Its arms are
+**`c802dba8d`** — this row's merge-base, so the delta is exactly the 10 files
+this row touches — and **`4568c6e71`**. Until that job lands, §16.6's 3.50x
+stands as an x86-64 stage number and Thor has no number at all, which is a
+different state from the one the void appeared to report.
+
 ### 16.7 What is still OWED after this row
 
 **The dtype decision is untouched and still owed.** §14.5 stands: the depth
@@ -3259,6 +3313,14 @@ needs a quiet box and ~50 GB of free disk to redo. Owed.
 committed goldens and exercised by `test_minimax_music3_quant_real`, but no
 production path calls it any more. That is recorded here rather than deleted,
 because it is what the incremental schedule is checked to agree with.
+
+**The Thor per-stage number is OWED, and the first attempt is VOID rather than
+missing.** §16.6a names the job (`56848b2e`), the cause (one build dir across
+both arms, so both binaries hashed `b98a5dbba37a67f1`) and the corrected job
+(`7b22b5b0`). The owed item is the number, not the attempt: until `7b22b5b0`
+lands, this row has an x86-64 stage ratio and no Thor ratio, and §16.6's
+closing question — which side of the weight-streaming bound this stage sits on
+for a 14-core Jetson with unified LPDDR5X — stays open.
 
 **No parity claim, again.** SGLang-Omni is still `gateable = no`, and every
 reference axis in `docs/BENCHMARKS.md` stays `PENDING`. Everything above is an
