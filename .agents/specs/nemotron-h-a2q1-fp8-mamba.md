@@ -520,7 +520,7 @@ for (`ssm_dtype == f32`), so the cheap arm was gating a path production does not
 take. And the whole file was a skip on a GPU-less box, so a CPU-runnable case now
 pins the op contract the split depends on.
 
-### 10.3 The A/B: the arm is token-exact where the HOST arm is not, and the busy fraction is VOID
+### 10.3 The A/B: the arm is token-exact on Thor, and the busy fraction is VOID
 
 Same lease, same binary, same checkpoint, same golden, differing only by
 `VT_NEMOTRON_H_DEVICE_MAMBA`:
@@ -530,17 +530,39 @@ Same lease, same binary, same checkpoint, same golden, differing only by
 | `1` (default) | device FP8 W8A8 | `96/96 mode=decode STRICT PASS` | 0 | 2336 util samples |
 | `0` | host, dequant to bf16 | `93/96 mode=decode DIVERGENCE` | 1 | 5702 util samples |
 
-**The host arm is the one that diverges**, and the mechanism is named rather than
-guessed: the golden comes from an oracle that computes these projections W8A8,
-while `DenseBf16` states at `nemotron_h.cpp:419-422` that `input_scale` is
-carried and NOT applied. The host arm is a deliberate W8A16 approximation of the
-scheme the golden was generated with. That is
-[#1290](https://github.com/mudler/vllm.cpp/issues/1290), filed while landing this
-row and fixed by it. NOT established: n=1 per arm, which three tokens move, and
-whether GB10 shows the same.
+**THIS IS AN sm_110 RESULT AND IT DOES NOT GENERALISE.** On GB10 (`sm_121a`) the
+SAME host arm reads `96/96 STRICT PASS` — the A3 run that closed
+[#1157](https://github.com/mudler/vllm.cpp/issues/1157),
+`/usr/local/nas_share/rc/nh1157/gate_fixed.out`. So "the host arm is token-wrong
+on a GPU" is false as a general statement, and writing it that way would get the
+finding dismissed the moment somebody checked on GB10. n=1 per arm.
+
+What IS established: on ONE box, holding the whole rest of the tower constant,
+flipping only the mamba arm moves 93/96 to 96/96.
+
+The leading mechanism stays the memory format. The golden's oracle computes these
+projections W8A8; the host arm is W8A16 by construction, because `DenseBf16`
+carries `input_scale` and does not apply it (`nemotron_h.cpp:419-422`). What that
+does not yet explain is why GB10 is clean, and the honest reading is that the
+approximation is MARGINAL — it perturbs the residual stream, and whether the
+perturbation crosses a decision boundary depends on the rest of the tower.
+
+**One candidate is already excluded.** "The two arms resolve different fp8 GEMMs"
+cannot be the differentiator, because the `0` configuration runs NO fp8 GEMM on
+either box: `DenseFor` dequantizes and hands the result to `vt::MatmulBT` on the
+CPU queue (`nemotron_h_device.cpp:2027`). The device-side difference that IS
+checkable is attention — `CudaArchFeatures.cmake:349` provides `fa2` for
+`12.1a` and not for `11.0`, so GB10 runs vendored FlashAttention-2 over the 6 GQA
+layers where Thor runs the portable fallback.
+
+Tracked as [#1290](https://github.com/mudler/vllm.cpp/issues/1290), which owns the
+open question. Next, in order: the oracle's top-2 margin at the three moved tokens
+(this family has already produced a "divergence" that was a bit-exact near-tie),
+then a `NemotronHTrace` layer bisect, then a repeat to lift n=1.
 
 From the sample counts, at one sampler and one nominal interval, **the run was
-2.44x shorter with the arm on**.
+2.44x shorter with the arm on**. That is a WALL-CLOCK ratio on Thor and it is not
+an occupancy or per-token claim.
 
 **★ THE BUSY FRACTION IS VOID, AND THAT IS THIS UNIT'S ACCEPTANCE TEST.** It read
 15.33% on and 14.73% off — a 0.59-point difference that answers the wrong
