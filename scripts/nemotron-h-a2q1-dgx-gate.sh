@@ -136,31 +136,64 @@ step "7. the A3 gate + the GPU busy fraction, device mamba ON"
 # not a measurement.
 run_gate() {   # $1 = label, $2 = VT_NEMOTRON_H_DEVICE_MAMBA value
   local label=$1 flag=$2
-  ( while true; do nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader,nounits; sleep 0.1; done ) \
-    > "$RUN/util_$label.txt" 2>/dev/null &
-  local sampler=$!
-  t0=$(date +%s.%N)
+  local log="$RUN/a3_$label.log"
+  : > "$log"
+
+  # ★ THE SAMPLING WINDOW IS THE DECODE, NOT THE WHOLE PROCESS.
+  #
+  # The first Thor run sampled from process start, so the window contained the
+  # multi-minute 20.1 GiB engine load, which is GPU-IDLE. That dilutes both arms
+  # toward each other and toward zero: it read 15.33% with the arm on and 14.73%
+  # with it off, a 0.59-point difference that says almost nothing about what the
+  # DECODE does, and it is not comparable to the 6.31% figure either. Mixing a
+  # load phase into a decode measurement is the same defect as summing prefill
+  # and decode in one profile.
+  #
+  # So the driver starts FIRST, and the sampler starts only once the driver has
+  # printed `engine loaded in Ns`. Everything after that line is decode.
   VT_NEMOTRON_H_DEVICE_MAMBA=$flag "$BUILD/examples/nemotron-h-gen" \
       --model "$CKPT" \
       --golden "$SRC/tests/parity/goldens/nemotron_35_lightning_greedy/oracle.json" \
-      > "$RUN/a3_$label.log" 2>&1
+      > "$log" 2>&1 &
+  local pid=$!
+  local waited=0
+  local loaded=0
+  while kill -0 "$pid" 2>/dev/null; do
+    if grep -q "engine loaded in" "$log" 2>/dev/null; then loaded=1; break; fi
+    sleep 1
+    waited=$((waited + 1))
+    if [ "$waited" -ge 5400 ]; then break; fi
+  done
+  if [ "$loaded" -ne 1 ]; then
+    # Say so rather than sampling a window whose meaning is unknown. A fraction
+    # over the wrong window is worse than no fraction, because it still formats
+    # like a measurement.
+    echo "$label: the engine never reported a load in ${waited}s -- the decode window is UNKNOWN, so NO busy fraction is sampled"
+  fi
+  local t0=$(date +%s.%N)
+  ( while true; do nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader,nounits; sleep 0.1; done ) \
+    > "$RUN/util_$label.txt" 2>/dev/null &
+  local sampler=$!
+  wait "$pid"
   local r=$?
-  t1=$(date +%s.%N)
+  local t1=$(date +%s.%N)
   kill "$sampler" 2>/dev/null
   wait "$sampler" 2>/dev/null
+
   echo "RC[a3 $label]=$r"
-  grep -E "STRICT|PASS|FAIL|mode=|tok/s|per output token" "$RUN/a3_$label.log" | tail -20
-  # The busy fraction WITH its denominator. The 6.31% baseline this row is
-  # measured against was taken on GB10, so it is quoted ONLY on GB10: printing
-  # it beside a Thor number invites a cross-silicon comparison that answers a
+  grep -E "STRICT|PASS|FAIL|DIVERGENCE|REFUSING|SHORT|mode=|engine loaded in" "$log" | tail -20
+  # The busy fraction WITH its denominator, over the DECODE window alone. The
+  # 6.31% baseline is a GB10 number, so it is quoted ONLY on GB10: printing it
+  # beside a Thor figure invites a cross-silicon comparison that answers a
   # different question, and a number quoted often enough becomes treated as
-  # measured. On any other arch the same-binary ON/OFF A/B below is the
-  # comparison that is valid.
-  python3 - "$RUN/util_$label.txt" "$label" "$ARCH" <<'PY'
+  # measured.
+  python3 - "$RUN/util_$label.txt" "$label" "$ARCH" "$loaded" <<'PY'
 import sys
 vals = [int(x) for x in open(sys.argv[1]).read().split() if x.strip().isdigit()]
-label, arch = sys.argv[2], sys.argv[3]
-if not vals:
+label, arch, loaded = sys.argv[2], sys.argv[3], sys.argv[4]
+if loaded != "1":
+    print(f"{label}: busy fraction NOT REPORTED -- the decode window was never identified")
+elif not vals:
     print(f"{label}: NO SAMPLES -- the busy fraction is unmeasured, not 0")
 else:
     busy = sum(1 for v in vals if v > 0)
@@ -168,16 +201,13 @@ else:
     note = ("baseline 6.31% on this same GB10 workload" if arch == "121a"
             else f"NO baseline for arch {arch}: the 6.31% figure is GB10's, so it "
                  f"is not comparable here; use the ON/OFF A/B on this box")
-    print(f"{label}: GPU busy in {busy} of {len(vals)} samples = {pct:.2f}% busy ({note})")
+    print(f"{label}: GPU busy in {busy} of {len(vals)} DECODE samples = {pct:.2f}% busy ({note})")
 PY
-  # The per-output-token time, DERIVED and shown with its terms, because the
-  # driver reports neither a rate nor a duration. Wall minus the engine load,
-  # over the tokens the run actually COMPARED -- printing a rate without the
-  # token count is the mute-instrument shape this row has already been bitten by.
-  python3 "$SRC/scripts/nemotron-h-a2q1-per-token.py" "$RUN/a3_$label.log" "$label" "$t0" "$t1"
+  # The per-output-token time over the SAME decode window, with the terms shown.
+  python3 "$SRC/scripts/nemotron-h-a2q1-per-token.py" "$log" "$label" "$t0" "$t1"
   # The reference tier is numerically CORRECT, so a pass obtained on it is
   # invisible in the numbers and only this line separates them (spec R2).
-  echo "reference-tier lines in $label: $(grep -c 'reference-tier' "$RUN/a3_$label.log")"
+  echo "reference-tier lines in $label: $(grep -c 'reference-tier' "$log")"
 }
 
 if [ ! -d "$CKPT" ]; then

@@ -7,9 +7,17 @@ number this row is measured on has to be derived, and a derived number that hide
 its terms is how a rate over an unknown denominator comes to be quoted as if it
 were measured.
 
-This prints the wall time, the load it subtracts, and the token count it divides
-by, on separate lines, and it REFUSES rather than printing 0 when either term is
-missing from the log.
+THE WINDOW IS THE DECODE, AND THE CALLER BRACKETS IT. `t0`/`t1` are taken AFTER
+the driver prints `engine loaded in Ns`, so the 20.1 GiB load is already outside
+them and nothing is subtracted here. An earlier version bracketed the whole
+process and subtracted the load, which put a multi-minute GPU-idle phase inside
+the same window as the decode -- the same defect as summing prefill and decode
+into one profile. The load is still read out of the log and printed, because it
+is context for the number, not a term in it.
+
+This prints the window, the load it excludes and the token count it divides by on
+separate lines, and it REFUSES rather than printing 0 when a term is missing or
+the window is not positive.
 
     nemotron-h-a2q1-per-token.py <a3.log> <label> <t0_epoch> <t1_epoch>
 """
@@ -32,34 +40,28 @@ def main(argv: list[str]) -> int:
     log, label, t0, t1 = argv[1], argv[2], float(argv[3]), float(argv[4])
     with open(log, errors="replace") as fh:
         text = fh.read()
-    wall = t1 - t0
-    print(f"{label}: wall {wall:.3f} s")
+    decode_s = t1 - t0
+    print(f"{label}: decode window {decode_s:.3f} s (the engine load is OUTSIDE it)")
 
     load = re.search(r"engine loaded in ([0-9.]+)s", text)
     match = re.search(r"TOKEN MATCH: (\d+)/(\d+) over (\d+) prompt", text)
-    if load is None:
-        print(f"{label}: NO LOAD LINE -- per-token time NOT derivable, not 0")
-        return 0
+    if load is not None:
+        print(f"{label}: engine load {float(load.group(1)):.1f} s, excluded")
     if match is None:
         print(f"{label}: NO TOKEN MATCH LINE -- per-token time NOT derivable, not 0")
         return 0
-
-    load_s = float(load.group(1))
     matched, compared = int(match.group(1)), int(match.group(2))
-    print(f"{label}: engine load {load_s:.1f} s ; tokens compared {compared} ; "
-          f"matched {matched}")
+    print(f"{label}: tokens compared {compared} ; matched {matched}")
     if compared <= 0:
         print(f"{label}: ZERO tokens compared -- a rate here would divide by nothing")
         return 0
-    decode_s = wall - load_s
     if decode_s <= 0.0:
-        # The wall clock cannot be shorter than the load it contains. When it
-        # reads that way the two terms came from different runs, or the sampler
-        # wrapper mismeasured, and the quotient is a NEGATIVE rate -- a number
-        # that looks like a measurement and would be quoted as one. Refuse.
-        print(f"{label}: wall {wall:.3f} s is not greater than the load "
-              f"{load_s:.1f} s -- the terms disagree, so NO per-token time is "
-              f"reported rather than a negative rate")
+        # A non-positive window means the caller's brackets did not span the
+        # decode -- the driver exited before the sampler started, or the two
+        # timestamps came from different runs. The quotient would be a negative
+        # or infinite rate that still formats like a measurement.
+        print(f"{label}: decode window {decode_s:.3f} s is not positive -- the "
+              f"brackets did not span a decode, so NO per-token time is reported")
         return 0
     per_token = decode_s / compared
     print(f"{label}: per output token {per_token:.6f} s "

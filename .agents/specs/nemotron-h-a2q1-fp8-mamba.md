@@ -520,6 +520,42 @@ for (`ssm_dtype == f32`), so the cheap arm was gating a path production does not
 take. And the whole file was a skip on a GPU-less box, so a CPU-runnable case now
 pins the op contract the split depends on.
 
+### 10.3 The A/B: the arm is token-exact where the HOST arm is not, and the busy fraction is VOID
+
+Same lease, same binary, same checkpoint, same golden, differing only by
+`VT_NEMOTRON_H_DEVICE_MAMBA`:
+
+| flag | mamba arm | A3 | exit | decode |
+|---|---|---|---|---|
+| `1` (default) | device FP8 W8A8 | `96/96 mode=decode STRICT PASS` | 0 | 2336 util samples |
+| `0` | host, dequant to bf16 | `93/96 mode=decode DIVERGENCE` | 1 | 5702 util samples |
+
+**The host arm is the one that diverges**, and the mechanism is named rather than
+guessed: the golden comes from an oracle that computes these projections W8A8,
+while `DenseBf16` states at `nemotron_h.cpp:419-422` that `input_scale` is
+carried and NOT applied. The host arm is a deliberate W8A16 approximation of the
+scheme the golden was generated with. That is
+[#1290](https://github.com/mudler/vllm.cpp/issues/1290), filed while landing this
+row and fixed by it. NOT established: n=1 per arm, which three tokens move, and
+whether GB10 shows the same.
+
+From the sample counts, at one sampler and one nominal interval, **the run was
+2.44x shorter with the arm on**.
+
+**★ THE BUSY FRACTION IS VOID, AND THAT IS THIS UNIT'S ACCEPTANCE TEST.** It read
+15.33% on and 14.73% off — a 0.59-point difference that answers the wrong
+question, because the sampler ran from process start and therefore put the
+multi-minute, GPU-IDLE 20.1 GiB engine load inside the same window as the decode.
+That dilutes both arms toward each other and toward zero. It is the same defect
+as summing prefill and decode into one profile, and a fraction over the wrong
+window is worse than no fraction because it still formats like a measurement.
+
+`run_gate` now starts the driver first, waits for `engine loaded in Ns`, and only
+then starts sampling; it refuses to report a fraction at all when that line never
+appears. **No busy-fraction claim is made from the Thor run, in either
+direction.** The hypothesis that this arm raises GPU occupancy is neither
+supported nor refuted by it.
+
 **What is still owed, and it is the acceptance test rather than a formality:**
 the §5.1 per-block numeric gate on the real checkpoint, the A3
 `96/96 mode=decode STRICT PASS` re-run, the §5.3 mutations, and the GPU busy
