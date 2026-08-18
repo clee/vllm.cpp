@@ -36,13 +36,13 @@
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
-#include <random>
 #include <stdexcept>
 #include <string>
 #include <vector>
 
 #include <nlohmann/json.hpp>
 
+#include "support/process_id.h"
 #include "vllm/config/speculative.h"
 #include "vllm/model_executor/models/qwen3_5_dense.h"
 #include "vllm/tokenizer/bpe.h"
@@ -248,9 +248,11 @@ Tokenizer FreshFixture() { return BuildFixture(); }
 class DraftDir {
  public:
   DraftDir(const std::string& leaf, const std::string& config_json) {
-    std::random_device rd;
+    // The shared portable process id, so two concurrent runs cannot collide and
+    // the file does not reintroduce the ::getpid() include class this tree just
+    // fixed (tests/support/process_id.h).
     dir_ = fs::temp_directory_path() /
-           ("vllm-cpp-" + leaf + "-" + std::to_string(rd()));
+           ("vllm-cpp-" + leaf + "-" + std::to_string(vllm_test::ProcessId()));
     fs::remove_all(dir_);
     fs::create_directories(dir_);
     std::ofstream(dir_ / "config.json") << config_json;
