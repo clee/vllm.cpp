@@ -79,7 +79,7 @@ are our reading of their documented behavior, not measurements.
 | GPTQ | ◐ CPU dequant | ✅ | ✅ | ☐ |
 | MXFP4 compressed-tensors | ◐ W4A16 Marlin, mem 2.63x less. gate_up FUSION + decode-graph default-ON; #44 3/3, 32B 6/6. **`VT_MARLIN_DENSE` DEFAULT-ON** (`KERNEL-MARLIN-DENSE-EXEC`): dense marlin 48-CTA, byte-faithful, beats MoE (c8 0.969) | ✅ | ✅ | ☐ |
 | fp8 weights, per-tensor scale | ✅ | ✅ | ✅ | ☐ |
-| Block-wise (fine-grained 128x128) FP8, the `weight_scale_inv` layout | ☐ REFUSED BY NAME at load (#1166): `Qwen/Qwen3.8-27B-FP8` declares `weight_block_size` [128, 128] and this build is per-tensor FP8 only ([spec](../.agents/specs/fp8-blockwise-refusal.md)) | ✅ | ✅ | ☐ |
+| Block-wise (fine-grained 128x128) FP8, the `weight_scale_inv` layout | ◐ LOADS, cannot run (#1189 M3): weight + `cdiv` scale rung + config/tensor cross-check; BF16 scale widened to f32. Linear method is M4, so `Prepare` refuses by name ([spec](../.agents/specs/model-fp8-block-weight.md)) | ✅ | ✅ | ☐ |
 | Per-tensor FP8 W8A8 linear is a shared seam any model can bind | ✅ `models/dense_fp8_gemm.h` + `layers::Fp8W8A8LinearMethod` (#940), bound via `layers::MakeLinearMethod`. One definition, CUDA only ([spec](../.agents/specs/vt-fp8-shared-seam.md)) | ✅ `Fp8LinearMethod` | ✅ | ☐ |
 | FP8 W8A8 works on a CUDA arch without `cutlass-fp8` | ✅ `vt::QuantFp8Static` registers from an unconditional TU (#960); sm_110 measured ([spec](../.agents/specs/vt-fp8-quant-arch-gate.md)) | ✅ | ✅ | ☐ |
 | fp8-tower GDN `in_proj` emits bf16, unlocking packed GDN decode | ◐ `VT_GDN_FP8_IN_BF16` + `VT_GDN_PACKED_DECODE_FP8_TOWER` (inert alone), both default **OFF**, ungated (#339) ([spec](../.agents/specs/perf-fp8-alpha-fold.md)) | ✅ bf16 `out_dtype` | ☐ | ☐ |
@@ -240,6 +240,7 @@ both refuse, naming what is missing.
 | DFlash block diffusion | ✅ 2.9x over spec-off, at/above vLLM DFlash-on | ✅ | ☐ |
 | n-gram / prompt lookup | ✅ 27B 5/5 strict vs vLLM | ✅ | ✅ |
 | DSpark (semi-autoregressive block drafter) | ◐ **both gate models** ([spec](../.agents/specs/dspark-spec-decode.md)): token-identical to spec-off; T=1+k verify CAPTURED. Cross-engine ratio UNSETTLED (**0.834x** matched-and-warm); Marlin MoE CLEARED as the residual | ✅ | ◐ |
+| DSpark draft routing (which draft the loader takes) | ◐ `Qwen3DSparkModel`, `Gemma4DSparkModel` and (BEYOND-PIN, vllm#52197) `DSparkDraftModel` + `qwen3` take the Qwen3 lane; DeepSeek-V4 DSpark is REFUSED by name ([spec](../.agents/specs/dspark-qwen3-routing.md)) | ◐ at the pinned `555967922` that pair routes to DeepSeek-V4; ✅ only since vllm#52197, merged 2026-08-17 | not assessed |
 | Other methods (ngram-gpu, suffix, custom-class, dynamic-k, mlp-speculator) | ☐ inventoried | ✅ | ◐ |
 
 ## Structured output and tool calling
