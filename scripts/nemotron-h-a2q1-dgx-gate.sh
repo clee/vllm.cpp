@@ -150,15 +150,25 @@ run_gate() {   # $1 = label, $2 = VT_NEMOTRON_H_DEVICE_MAMBA value
   wait "$sampler" 2>/dev/null
   echo "RC[a3 $label]=$r"
   grep -E "STRICT|PASS|FAIL|mode=|tok/s|per output token" "$RUN/a3_$label.log" | tail -20
-  python3 - "$RUN/util_$label.txt" "$label" <<'PY'
+  # The busy fraction WITH its denominator. The 6.31% baseline this row is
+  # measured against was taken on GB10, so it is quoted ONLY on GB10: printing
+  # it beside a Thor number invites a cross-silicon comparison that answers a
+  # different question, and a number quoted often enough becomes treated as
+  # measured. On any other arch the same-binary ON/OFF A/B below is the
+  # comparison that is valid.
+  python3 - "$RUN/util_$label.txt" "$label" "$ARCH" <<'PY'
 import sys
 vals = [int(x) for x in open(sys.argv[1]).read().split() if x.strip().isdigit()]
+label, arch = sys.argv[2], sys.argv[3]
 if not vals:
-    print(f"{sys.argv[2]}: NO SAMPLES -- the busy fraction is unmeasured, not 0")
+    print(f"{label}: NO SAMPLES -- the busy fraction is unmeasured, not 0")
 else:
     busy = sum(1 for v in vals if v > 0)
-    print(f"{sys.argv[2]}: GPU busy in {busy} of {len(vals)} samples = "
-          f"{100.0*busy/len(vals):.2f}% busy (baseline 6.31%)")
+    pct = 100.0 * busy / len(vals)
+    note = ("baseline 6.31% on this same GB10 workload" if arch == "121a"
+            else f"NO baseline for arch {arch}: the 6.31% figure is GB10's, so it "
+                 f"is not comparable here; use the ON/OFF A/B on this box")
+    print(f"{label}: GPU busy in {busy} of {len(vals)} samples = {pct:.2f}% busy ({note})")
 PY
   # The per-output-token time, DERIVED and shown with its terms, because the
   # driver reports neither a rate nor a duration. Wall minus the engine load,
