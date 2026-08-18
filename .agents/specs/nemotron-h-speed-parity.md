@@ -195,5 +195,14 @@ would void it, so the leg sampler records the compute-apps list instead.
 
 ## Now
 
-Written before the measurement. The result and its evidence land in
-[`benchmark-record.md`](../benchmark-record.md) and `docs/BENCHMARKS.md`.
+**Result: PENDING a named resource.** No speed number is recorded on any axis.
+`dgx:gpu0` reads `unhealthy`, `out of the pool lease_expired`, with a live
+heartbeat and refreshing labels, and `AGENTS.md` sends clearing a quarantined
+device to a human. The job is queued at position 1 and runs when the device
+returns to the pool. It is pinned to
+`8ac26d6fc0c086efffd1d093d48d0500357dda9c`, which contains `0ea5d249f`.
+
+The one lease that started took no number and corrected two instruments; the
+evidence, the contention state, the clock window and the operand hashes are in
+[`benchmark-record.md`](../benchmark-record.md). Nothing about our throughput,
+latency or memory against the oracle is claimed or implied here.

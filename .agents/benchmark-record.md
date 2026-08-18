@@ -19,6 +19,98 @@ from relative link targets repointed for this file's location.
 
 # Benchmarks
 
+## MODEL-NEMOTRON-H-ABI-A2P — the first Nemotron speed run took NO number, and corrected the two instruments the number depends on (2026-08-18, `row/MODEL-NEMOTRON-H-ABI-A2P-speed`, #1250, #1253, #1185)
+
+**No speed number is recorded, on any axis.** The result is PENDING a named
+resource: `dgx:gpu0` reads `unhealthy`, `out of the pool lease_expired`, and
+`AGENTS.md` sends clearing a quarantined device to a human. The job is still
+queued at position 1 and runs when the device returns to the pool. Read this
+entry as what one lease measured about the MEASUREMENT, not about the model.
+
+**Contention, recorded because it is the reason a number would be void.**
+`rc devices` read `dgx:gpu0 busy` for every window of this session, held first by
+`fullmodel-onestage-r4` and then by `fullmodel-1252-r5`, so nothing ran beside
+another job. At the one lease that did start (`81a0cfb1-eaa3-46fc-b64f-d9fa0cab5ecf`,
+18:11:01Z) phase 0 read load average 1.39, host memory 69,399 of 122,502 MB used,
+SM clock 2411 MHz against a 3003 MHz maximum, persistence `Disabled`, boot id
+`3fd9745a-d25a-426c-ba3c-97c958a85515`, and **`nvidia-smi --query-compute-apps`
+reporting PID 10495 still holding 36,396 MiB from the PREVIOUS lease**. The
+controller reaped it afterwards (`killed: stragglers reaped after exit`).
+`nvidia-smi -lgc 2100` returned 4, `The current user does not have permission to
+change clocks`, so the clock cannot be pinned from inside the worker and has to
+be recorded rather than controlled.
+
+**`nvidia-smi --query-gpu=memory.used` reads `[N/A]` on GB10.** A leg that
+samples it is blind to exactly the state that would void it, so the compute-apps
+list is the only device-side contention instrument on this box and the sampler
+now records that instead.
+
+**`nvcc --version` is not the toolkit postcondition.** The worker ships a PARTIAL
+CUDA 13.0: the compiler answers `release 13.0, V13.0.88` and the cuBLAS
+development component is absent. A harness that installs only when `nvcc` is
+missing therefore installed nothing, CMake configured through every feature probe
+and printed all five of `fp4-mma`, `cutlass-nvfp4`, `cutlass-fp8`,
+`marlin-nvfp4` and `fa2` as `ENABLED for [121a]`, and then failed at generate:
+
+```
+CMake Error at CMakeLists.txt:1654 (target_link_libraries):
+  Target "vllm" links to:
+    CUDA::cublasLt
+  but the target was not found.
+```
+
+This is #1185's own "an environment repair must be unconditional and assert its
+postcondition" applied to a postcondition chosen wrong, which is a different
+defect from skipping the repair. The postcondition is `libcublasLt.so`,
+`cublasLt.h` and `Python.h`.
+
+**The oracle's recorded hazard is NOT what stopped it, and that is the load-bearing
+correction.** #1185 records a model run as untested with a reboot of the box as
+the known failure mode, at `gpu_memory_utilization` 0.75 and again at 0.30. The
+run reached engine start and **did not reboot the box**: peak host use over the
+window was 28,534 MB of 122,502 MB across 233 samples and the `MemAvailable`
+watchdog never fired. It died on:
+
+```
+/tmp/tmpd89bw8jj/cuda_utils.c:9:10: fatal error: Python.h: No such file or directory
+torch._inductor.exc.InductorError: CalledProcessError: Command '['/usr/bin/gcc', ...
+RuntimeError: Engine core initialization failed. See root cause above. Failed core proc(s): {}
+```
+
+Triton compiles `cuda_utils.c` at RUNTIME and the worker has `python3` and no
+`python3-dev`. The failure surfaces four frames up as an engine-core failure
+whose proc set is EMPTY, so it names nothing and reads as an oracle or model
+limitation. `lease-runtime-staging.md` already carries
+`apt-get install -y -qq python3-dev` as step one of the `thor:gpu0` recipe, so
+the fix was written down and had not been applied on the `dgx` side.
+
+**What the lease DID establish about the oracle.** The wheel
+`vllm-0.1.dev1+g555967922-cp312-cp312-linux_aarch64.whl`, sha256
+`89805161e5ac9905beae21b585b529a0343dccce290ccfeefa680effd2cf7523`, installs into
+a fresh venv beside `torch==2.13.0` and asserts its identity from `cd /`:
+`vllm 0.1.dev1+g555967922 /tmp/nhspeed-oracle/lib/python3.12/site-packages/vllm/__init__.py`.
+So the denominator's identity is pinned and only its runtime is blocked.
+
+**Provenance of the operand.** `/workspace/a3/ckpt-stage`, 21,583,809,748 bytes,
+52 shards, `architectures ['NemotronHForCausalLM']`, `num_hidden_layers 52`,
+first shard `model-00001-of-00052.safetensors` with sha256 of its first MiB
+`aaa10f1a263d622e838b1604de278504c8d07a5894c49cff3264383129906f2a`. Measured tree
+`8ac26d6fc0c086efffd1d093d48d0500357dda9c`, which contains `0ea5d249f` (#1221).
+
+**The gap, when it is measured, already has its causes named and is NOT a
+ceiling.** The A3 gate's own legs read 264.4 s engine load and 342.61 / 328.19 /
+327.51 s for 32 tokens each, about 10.3 s per output token at batch 1. The
+per-layer trace gives the mechanism rather than a guess: of 52 layers, 6 are
+attention and stay on the device end to end, 23 MoE layers run on the device
+through the NVFP4 Marlin arm, and **23 Mamba2 layers bounce** — the normed hidden
+is downloaded, the mixer runs on the CPU queue, the result is uploaded — once per
+layer per token, after which `NemotronHHostLmHead` projects the last hidden on the
+host because `nemotron_h.cpp:1031-1034` refuses the NVFP4 `lm_head` on a non-CPU
+queue. The next traceable hypothesis is therefore A2-Q1 (#940), the 46 FP8 W8A8
+mamba projections that are 36.6% of decode bytes, followed by A2-Q2b for the
+`lm_head`; and the measurement to take after each is the same battery on the same
+binary, so the deltas are attributable.
+
 ## MODEL-NEMOTRON-H-ABI-A2P — the A3 gate PASSES on the host, and the device divergence was the STALE input ids (2026-08-18, `row/MODEL-NEMOTRON-H-ABI-A2P-1157`, #1157, #1217, #810)
 
 **This supersedes the entry that recorded the A3 gate as a 6/96 device failure
