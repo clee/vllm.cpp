@@ -262,7 +262,13 @@ MATRICES = {
     # proves the portable dot is reached at 20.10% of Qwen3.5-2B user cycles;
     # the row owns exact-order C++ SDOT vs scheduled AAPCS64, independent of
     # the broad CPU-backend row.
-    "KERNEL": (AGENTS / "kernel-matrix.md", 51),
+    # 52 since 2026-08-18 (#1171): +`KERNEL-GDN-REPLAYSSM`, the ReplaySSM buffered
+    # output-only GDN decode. A genuinely new family, not a variant of the packed
+    # decode row: it changes WHEN the state is written (every L steps, from a ring
+    # of rank-1 factors) rather than how one step is tiled, and it adds three cache
+    # tensors to the MambaSpec. vLLM ships the algorithm for Mamba2 only and cannot
+    # reach GDN (four walls, spec §Upstream chain); SGLang ships the GDN arm.
+    "KERNEL": (AGENTS / "kernel-matrix.md", 52),
     # 56 since 2026-07-22: +`BACKEND-ACCEL-PROVIDER` (the acceleration-provider seam
     # itself, which is a cross-backend platform concern rather than a platform).
     # 57 since 2026-07-22: +`BACKEND-SEAM-AUDIT` (the accelerator-seam AUDIT — does
@@ -517,8 +523,28 @@ ENGINE_PREFIXES = (
 # humans caught by reading during the 2026-08-13/14 campaign, all of them IN RANGE.
 # Issue #632; `SPIKE` on its committed spec. The row claims no implementation: no
 # parser, no baseline and no test exists yet.
+# 157 since 2026-08-17: +`ENG-RESIDENCY-CONFIG` (the host-RAM->DISK weight-residency
+# tier as a CONFIG surface -- a `vllm_cpp` extension key inside the existing
+# `--offload-config` document, reaching the loader through
+# `EngineParams::weight_residency`). Genuinely new, and not expressible by either
+# offload row it sits beside: `ENG-WEIGHT-OFFLOAD` owns the MIRRORED device->host
+# tier and may not grow a disk arm without breaking a 1:1 transcription of
+# `vllm/config/offload.py`, and `ENG-EXPERT-STREAM` owns the streaming MECHANISM
+# rather than its configuration -- this row changes where a value comes from and
+# nothing about what it does. `ACTIVE`, spec `specs/weight-residency-config.md`,
+# issue #1110 (also fixes #1109 in flow).
+# 158 since 2026-08-18: +`SPEC-DSPARK-QWEN3-ROUTING` (the DSpark draft-ARCHITECTURE
+# route: `architectures=["DSparkDraftModel"]` + `model_type` `qwen3` must resolve to
+# the landed Qwen3 DSpark lane, and `IsDsparkDraft` must be reached from the loader).
+# Genuinely new and not expressible by `SPEC-DSPARK` beside it: that row owns the
+# DSpark MECHANISM -- the Markov head, the block draft, the sequential sample -- and
+# its W1-W8 all landed, while this row changes only which lane a draft config is
+# classified into before any of that runs. BEYOND-PIN on vLLM PR 52197 (merged
+# 2026-08-17 at `7075ddac`); the pinned behavior at `speculative.py:934-944` was never
+# ported here, so this row records a divergence that already exists rather than
+# introducing one. `READY`, spec `specs/dspark-qwen3-routing.md`, issue #1193.
 # Bumped for a real new row, never to make a failing state transition pass.
-ENGINE_ROWS = 157
+ENGINE_ROWS = 163
 
 ENGINE_SUMMARY_SECTIONS = (
     ("Engine and scheduling", "Engine core and scheduling"),
