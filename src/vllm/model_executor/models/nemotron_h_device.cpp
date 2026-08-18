@@ -1127,6 +1127,19 @@ bool NemotronHDiagEnabled() {
   return on;
 }
 
+// #1157 BISECT SWITCH. The device MoE arm is 23 of this model's 52 layers and
+// has never run at T=1 anywhere: its own gate (test_nemotron_h_moe_device.cpp)
+// exercises T=4 and T=2. Setting `VT_NEMOTRON_H_DEVICE_MOE=0` routes those
+// layers back through the host reference the CPU arm already proves token-exact
+// on this checkpoint, so one run says whether the device MoE is the difference.
+bool NemotronHDeviceMoeEnabled() {
+  static const bool on = [] {
+    const char* e = std::getenv("VT_NEMOTRON_H_DEVICE_MOE");
+    return e == nullptr || e[0] != '0';
+  }();
+  return on;
+}
+
 double DiagL2(const std::vector<float>& v, int64_t off, int64_t n) {
   double acc = 0.0;
   for (int64_t i = 0; i < n; ++i) {
@@ -1555,6 +1568,7 @@ ForwardLogits NemotronHPagedForward(const NemotronHHostWeights& host,
 
     const bool moe_on_device =
         lw.block == NemotronHBlock::kMoe && adt == DType::kBF16 && MoeIsNvfp4(lw.moe) &&
+        NemotronHDeviceMoeEnabled() &&
         vt::OpRegistered(vt::OpId::kMoeGroupedGemmNvfp4Marlin, d.q.device.type);
     const bool needs_host = lw.block != NemotronHBlock::kAttention && !moe_on_device;
     std::vector<float> nvec;

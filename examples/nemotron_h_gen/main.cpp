@@ -202,6 +202,10 @@ int main(int argc, char** argv) {
   // and wrong the normal way localises the defect to the CARRY and rules out
   // the tower; a stream that is wrong BOTH ways rules the carry out instead.
   bool fresh_prefill = false;
+  // Run BOTH modes over one engine load, which is the only affordable shape
+  // when a load is minutes long: the two streams then differ in nothing except
+  // whether a token came from a decode step or from a re-prefill.
+  bool both_modes = false;
   for (int i = 1; i < argc; ++i) {
     const std::string a = argv[i];
     auto next = [&]() -> const char* { return (i + 1 < argc) ? argv[++i] : ""; };
@@ -213,6 +217,7 @@ int main(int argc, char** argv) {
     else if (a == "--load-only") load_only = true;
     else if (a == "--golden-info") golden_info = true;
     else if (a == "--fresh-prefill") fresh_prefill = true;
+    else if (a == "--both-modes") both_modes = true;
     else { std::fprintf(stderr, "unknown arg %s\n", a.c_str()); return 2; }
   }
   if (model.empty() && !golden_info) {
@@ -304,6 +309,14 @@ int main(int argc, char** argv) {
                     : static_cast<int>(gold.entries.size());
 
   int total_compared = 0, total_matched = 0, rows_full = 0, rows_short = 0;
+  const int n_modes = both_modes ? 2 : 1;
+  for (int mi = 0; mi < n_modes; ++mi) {
+  if (both_modes) {
+    fresh_prefill = (mi == 1);
+    total_compared = 0; total_matched = 0; rows_full = 0; rows_short = 0;
+    std::fprintf(stderr, "\n[nemotron-h] ===== MODE %s =====\n",
+                 fresh_prefill ? "fresh-prefill" : "decode");
+  }
   for (int pi = 0; pi < n_prompts; ++pi) {
     const GoldenEntry& e = gold.entries[static_cast<size_t>(pi)];
     std::vector<int32_t> gen(static_cast<size_t>(steps), 0);
@@ -379,6 +392,7 @@ int main(int argc, char** argv) {
                "(full rows=%d, short rows=%d, mode=%s)\n",
                total_matched, total_compared, n_prompts, rows_full, rows_short,
                fresh_prefill ? "fresh-prefill" : "decode");
+  }
   vllm_engine_free(eng);
 
   // A pass needs three things to be true at once, and each is checked here
