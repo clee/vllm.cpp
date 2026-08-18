@@ -203,6 +203,22 @@ bool PackedGdnDecodeFp8TowerFlagIsOn(const char* env_value);
 // 5559679).
 bool GdnOutBf16FlagIsOn(const char* env_value);
 
+// GDN-MOE-BF16-OUT (#1168), fresh-review repair. The RESOLVER the model actually
+// calls, declared here so a gate can observe what it answers and not only what
+// its parser answers. The two are separable, and severing them is silent: a
+// `GdnOutDType()` hardwired to BF16 keeps every default-environment gate green
+// while `VT_GDN_OUT_BF16=0` stops rolling anything back — and that variable is
+// the denominator of this row's whole same-binary A/B, so a disconnected lever
+// would invalidate the measurement that decides the row rather than merely lose
+// coverage.
+//
+// It caches its getenv in a function-local static, so ONE process observes ONE
+// value. The gate is therefore the shape tests/CMakeLists.txt already uses for a
+// read-once lever (`_glue_fuse_off`, `test_dense_gateup_fused_marlin_off_*`): the
+// SAME binary is registered a second time with `VT_GDN_OUT_BF16=0`, and the case
+// asserts against the environment as it reads it directly.
+vt::DType GdnOutDType();
+
 // W2 merged-qkvz dispatch. vLLM always issues one in_proj_qkvz GEMM
 // (qwen_gdn_linear_attn.py:923-936 @ 702f4814); locally the single GEMM is
 // selected only on CUDA with the packed 27B owner resident, the runtime
@@ -291,7 +307,8 @@ GdnFp8InProjDebugStats GetGdnFp8InProjDebugStats();
 void DisableGdnFp8InProjDebugStats();
 
 // GDN-MOE-BF16-OUT (#1168) — the dtypes the GDN block's two OUTPUT-side
-// activations ACTUALLY carried on the last paged GDN layer this process ran.
+// activations ACTUALLY carried on the last NON-MIXED-SPEC paged GDN layer this
+// process ran.
 //
 // `GdnOutDType()` is a predicate, and a test that calls it proves only that the
 // predicate answers. This records what `GdnBlockPaged` allocated and projected:
@@ -301,9 +318,34 @@ void DisableGdnFp8InProjDebugStats();
 // real MoE config and ask what the model ran, which is the question
 // .agents/reachability.md says a unit test over the predicate cannot answer.
 //
-// `observed` is false until a paged GDN layer has run since the last reset. It
-// is the term that separates "the forward produced f32" from "the forward never
-// reached the GDN block", which are the same silence to a dtype comparison.
+// `observed` is false until such a layer has run since the last reset. It is the
+// term that separates "the forward produced f32" from "the forward never reached
+// that path", which are the same silence to a dtype comparison.
+//
+// THREE LIMITS, stated because the sentence above is narrower than it first
+// reads and a reader who takes `observed` for a complete answer gets a wrong one
+// (fresh-review finding).
+//
+//  1. It does NOT cover `GdnBlockPagedMixedSpec`. That is also a paged GDN
+//     layer, at the same `outdt`, and it records nothing: `GdnBlockPaged`
+//     returns into it before reaching the one recording site. On a step whose
+//     batch mixes speculative and non-speculative requests `observed` therefore
+//     stays false, or worse stays TRUE from an earlier step — which is the
+//     ambiguity `observed` exists to remove, reappearing one level up. Read it
+//     only from a gate that controls its own batch shape, as
+//     test_qwen35_paged_forward does. The recording is not extended to the mixed
+//     path because nothing gates that path's dtypes today, and a second call
+//     site no test enters is the shape .agents/reachability.md warns about.
+//  2. It is UNCONDITIONAL, unlike `GdnFp8InProjDebugStats` above, whose shape it
+//     otherwise borrows. That sibling is default-off behind an enable flag and
+//     counts only after `ResetGdnFp8InProjDebugStats`. This one stores three
+//     atomics on every non-mixed-spec paged GDN layer of every forward of every
+//     model, whether or not anybody reads it. Relaxed stores off the critical
+//     path, so nothing observable changes — but do not read the resemblance as
+//     "off by default", because it is not.
+//  3. It records at CUDA-graph CAPTURE, not at replay. Replay does no host
+//     dispatch, so under graphed decode the values are whatever the capturing
+//     step wrote. Same caveat as the fp8 sibling's "read on an eager step".
 struct GdnOutActivationDTypes {
   bool observed = false;
   vt::DType core_out = vt::DType::kF32;  // dcore [T,Hv,Dv]

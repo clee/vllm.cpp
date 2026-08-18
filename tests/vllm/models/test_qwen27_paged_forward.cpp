@@ -530,9 +530,17 @@ TEST_CASE("qwen27 packed GDN predicts the mixed_qkv dtype ProjectGdnQkvz emits")
 //
 // The three terms are PERF-FP8-ALPHA-FOLD's own, kept verbatim: the opt-in
 // toggle, `indt == BF16` (honouring VT_GDN_IN_BF16's documented rollback, since
-// that lever is the one being unblocked), and `outdt == BF16` (which is what
-// confines this to the dense 27B — the 35B is MoE, so GdnOutDType is f32 there
-// and the whole arm stays inert).
+// that lever is the one being unblocked), and `outdt == BF16`, which keeps the
+// chain dtype-uniform.
+//
+// GDN-MOE-BF16-OUT (#1168), and #521 asked for exactly this correction. That
+// third term USED to be described here as what "confines this to the dense 27B —
+// the 35B is MoE, so GdnOutDType is f32 there and the whole arm stays inert".
+// `GdnOutDType()` no longer branches on model shape, so `outdt == BF16` is now
+// unconditional at the default and the term excludes NO checkpoint. What keeps
+// this arm inert on the 35B is the DEFAULT-OFF `VT_GDN_FP8_IN_BF16` toggle, and
+// that is the only remaining bound — which is why the toggle case below is the
+// one a reader must not mistake for a shape guard.
 TEST_CASE("qwen27 fp8 merged in_proj dtype is one decision, all three terms") {
   using vllm::detail::GdnFp8MergedMixedQkvDType;
   using vt::DType;
@@ -549,7 +557,7 @@ TEST_CASE("qwen27 fp8 merged in_proj dtype is one decision, all three terms") {
   CHECK(GdnFp8MergedMixedQkvDType(true, DType::kF32, DType::kBF16) ==
         DType::kF32);  // VT_GDN_IN_BF16=0 rollback.
   CHECK(GdnFp8MergedMixedQkvDType(true, DType::kBF16, DType::kF32) ==
-        DType::kF32);  // VT_GDN_OUT_BF16=0 / the 35B MoE default.
+        DType::kF32);  // the VT_GDN_OUT_BF16=0 rollback, on EITHER arm (#1168).
   CHECK(GdnFp8MergedMixedQkvDType(true, DType::kF32, DType::kF32) ==
         DType::kF32);
   CHECK(GdnFp8MergedMixedQkvDType(false, DType::kF32, DType::kF32) ==

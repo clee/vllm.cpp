@@ -1972,8 +1972,11 @@ inline void LaunchGatedFast(cudaStream_t s, Tensor& out, const Tensor& x, const 
 // Runtime predicate + launch for the gated fast path. Returns true iff it ran.
 // Guard: d==128 (the GDN Dv used by both gate models); core/gate/weight share one dtype
 // (the caller VT_CHECKs gate.dtype==x.dtype==w.dtype) in {f32,bf16}; out in {f32,bf16}.
-// This covers the 27B (bf16 core/z, bf16 out) AND the 35B (f32 core/z; bf16 out under
-// GlueFuse, else f32 out). Out-of-scope shapes keep RmsNormGatedRowKernel. The launch
+// This covers BOTH the bf16 core/z/weight both gate models carry by default since
+// #1168 (GdnOutDType stopped branching on model shape, so the 35B is no longer the
+// f32 arm) AND the f32 core/z/weight the VT_GDN_OUT_BF16=0 rollback restores on
+// either of them; `out` is bf16 under GlueFuse and otherwise follows the input.
+// Out-of-scope shapes keep RmsNormGatedRowKernel. The launch
 // uses kGatedFastBlock (=128) threads and reproduces shipped's reduction ORDER, so the
 // output is bit-identical for every dispatched (Tin,Tout).
 inline bool TryLaunchRmsNormGatedFast(cudaStream_t s, Tensor& out, const Tensor& x,

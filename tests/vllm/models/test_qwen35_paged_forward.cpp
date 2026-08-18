@@ -19,6 +19,7 @@
 
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <vector>
 
@@ -48,6 +49,18 @@ using vllm::v1::GDNAttentionMetadata;
 using vt::DType;
 
 namespace {
+
+// GDN-MOE-BF16-OUT (#1168), fresh-review repair. Read VT_GDN_OUT_BF16 DIRECTLY
+// from the process environment, deliberately NOT through
+// `detail::GdnOutBf16FlagIsOn`: these cases exist to catch a resolver that was
+// hardwired or severed from its parser, and re-using either of them to compute
+// the expectation would make exactly that mutation self-consistent. Same reason
+// `LeverOn` exists in test_dense_gateup_fused_marlin.cpp. Default ON; only a
+// leading '0' turns it off.
+bool GdnOutBf16LeverOn() {
+  const char* e = std::getenv("VT_GDN_OUT_BF16");
+  return !(e != nullptr && e[0] == '0');
+}
 
 // splitmix64-based small deterministic weight values in [-0.08, 0.08).
 uint64_t Mix(uint64_t x) {
@@ -488,7 +501,7 @@ TEST_CASE("qwen35 paged: GDN state zeroing protects a fresh req in a mixed batch
 //
 // No token gate can see this axis: f32 is the MORE precise deviation, so the
 // goldens pass either way while the path moves twice the bytes.
-TEST_CASE("qwen35 paged MoE: the GDN recurrence output and z gate are bf16") {
+TEST_CASE("qwen35 paged MoE: the GDN recurrence output and z gate follow VT_GDN_OUT_BF16") {
   const HfConfig c = MakeConfig();
   REQUIRE(c.num_experts > 0);  // the arm that used to resolve f32.
   const Qwen3_5MoeWeights w = MakeWeights(c);
@@ -517,6 +530,54 @@ TEST_CASE("qwen35 paged MoE: the GDN recurrence output and z gate are bf16") {
   const vllm::detail::GdnOutActivationDTypes dt =
       vllm::detail::LastGdnOutActivationDTypes();
   REQUIRE(dt.observed);
-  CHECK(dt.core_out == DType::kBF16);
-  CHECK(dt.z_gate == DType::kBF16);
+
+  // Fresh-review repair, both halves. The case used to assert BF16
+  // UNCONDITIONALLY, which made it two things it should not be:
+  //
+  //  - a FALSE RED under the documented rollback. `VT_GDN_OUT_BF16=0` is what
+  //    the row's own `## Gates` A/B sets, and an operator who exported it and
+  //    re-ran this suite got 4/5 cases, 11/13 assertions and a FAILURE that was
+  //    not a regression. The resolver caches its getenv, so the case could not
+  //    neutralise the variable in-process either.
+  //  - blind to a SEVERED resolver. `GdnOutDType()` hardwired to BF16 — cut from
+  //    its parser and from the variable entirely — left this suite 5/5 13/13 and
+  //    test_qwen27_paged_forward 31/31 770/770.
+  //
+  // Asserting against the environment as this file reads it directly fixes both:
+  // the rollback arm now INVERTS rather than fails, and it is the arm in which a
+  // hardwired BF16 reads BF16 where F32 was ordered. tests/CMakeLists.txt
+  // registers this same binary a second time with VT_GDN_OUT_BF16=0 so both arms
+  // actually run, the shape `_glue_fuse_off` and
+  // `test_dense_gateup_fused_marlin_off_*` already use for a read-once lever.
+  const bool lever = GdnOutBf16LeverOn();
+  CAPTURE(lever);
+  const DType expect = lever ? DType::kBF16 : DType::kF32;
+  CHECK(dt.core_out == expect);
+  CHECK(dt.z_gate == expect);
+}
+
+// GDN-MOE-BF16-OUT (#1168), fresh-review repair. The RESOLVER, not the parser.
+//
+// The CPU tier already pins `detail::GdnOutBf16FlagIsOn`'s truth table
+// (test_qwen27_paged_forward), and the case above pins what the model RAN. Both
+// stayed green when `GdnOutDType()` was replaced with `return DType::kBF16;`,
+// because on the default environment BF16 is also the right answer. Nothing
+// asserted that the production resolver consumes the parser at all, and this
+// row's `## Gates` rest on a `VT_GDN_OUT_BF16=0|1` same-binary A/B: a lever
+// wired to nothing does not lose coverage, it invalidates the measurement.
+//
+// One process observes one value of the cached getenv, so the two env values are
+// two ctest registrations of this binary rather than two assertions here.
+TEST_CASE("qwen35: GdnOutDType resolves from VT_GDN_OUT_BF16, not from a constant") {
+  const bool lever = GdnOutBf16LeverOn();
+  CAPTURE(lever);
+  CHECK(vllm::detail::GdnOutDType() ==
+        (lever ? DType::kBF16 : DType::kF32));
+
+  // And the parser it is supposed to read agrees with the environment on this
+  // process's own value. Two separate statements: the one above says the
+  // resolver answers what the environment says, this one says the parser does
+  // too, so a divergence names WHICH of the two moved.
+  CHECK(vllm::detail::GdnOutBf16FlagIsOn(std::getenv("VT_GDN_OUT_BF16")) ==
+        lever);
 }

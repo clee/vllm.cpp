@@ -83,12 +83,18 @@ void ResetQwen3_5MixedSpecInvocations() {
 // GdnOutDType stopped branching on model shape: `core_out` is `outdt`, and
 // GdnPackedDecodeDTypesCompatible below already pins it to BF16, so an f32
 // recurrence output is what deselects packed decode on either arm. Removing it
-// BEFORE the dtype change would have been inert, and therefore unobservable
-// through any production entry point — which is why the two edits are one change.
+// BEFORE the dtype change would have removed a term that the dtype rule did not
+// yet subsume, which is why the two edits are one change and in this order.
 //
-// Removing it does NOT by itself reach packed decode on a MoE checkpoint:
-// `has_packed_ba` needs `in_proj_ba`, written only by the dense loader
-// (qwen3_5_dense_weights.cpp:436). That is #1169, and it is owed.
+// Do not read that as "and now the removal is observable in production", because
+// it is not, in either order (fresh-review finding). `has_packed_ba` needs
+// `in_proj_ba`, written at exactly one site in the tree — the dense loader,
+// qwen3_5_dense_weights.cpp:431 — so on a MoE checkpoint the eligibility is
+// false before the shape term is ever read. Removing it therefore reaches packed
+// decode on NO checkpoint; it removes a contradiction with both references and a
+// second answer to a question the dtype rule already answers. Reaching packed
+// decode on a MoE arm needs the merged `in_proj_ba` owner in the MoE loader,
+// which is #1169, and it is owed.
 bool detail::ShouldUsePackedGdnDecode(
     const GdnPackedDecodeEligibility& e) {
   return e.runtime_enabled && e.cuda && e.has_packed_ba &&
@@ -150,6 +156,20 @@ bool detail::GdnOutBf16FlagIsOn(const char* env_value) {
   return env_value == nullptr || env_value[0] != '0';
 }
 
+// ...and the RESOLVER that consumes it, here rather than in the anonymous
+// namespace below so the CPU tier can call the thing the model calls. Pinning
+// the parser alone does not pin that anything reads it: a `GdnOutDType()`
+// hardwired to BF16 keeps every default-environment gate green, and the
+// documented `VT_GDN_OUT_BF16=0` rollback then silently stops rolling back. See
+// the header for why that matters more here than coverage — the variable is the
+// denominator of this row's same-binary A/B. The full derivation of WHAT this
+// dtype is stays at the `using` declaration below, next to the call sites.
+vt::DType detail::GdnOutDType() {
+  static const bool bf16 =
+      detail::GdnOutBf16FlagIsOn(std::getenv("VT_GDN_OUT_BF16"));
+  return bf16 ? vt::DType::kBF16 : vt::DType::kF32;
+}
+
 bool detail::ShouldUseMergedGdnQkvz(const GdnMergedQkvzEligibility& e) {
   return e.runtime_enabled && e.cuda && e.has_packed_qkvz && e.uniform_dtype;
 }
@@ -206,8 +226,12 @@ void detail::DisableGdnFp8InProjDebugStats() {
 }
 
 namespace {
-// GDN-MOE-BF16-OUT (#1168). What the last paged GDN layer actually allocated and
-// projected, recorded off the tensors themselves rather than off the predicate.
+// GDN-MOE-BF16-OUT (#1168). What the last NON-MIXED-SPEC paged GDN layer actually
+// allocated and projected, recorded off the tensors themselves rather than off
+// the predicate. `GdnBlockPagedMixedSpec` is a paged GDN layer too and records
+// nothing, the stores are unconditional (the fp8 sibling above is default-off),
+// and they happen at graph CAPTURE and not at replay. The header states all
+// three; none of them is what the shape of this code suggests.
 std::atomic<bool> g_gdn_out_dtypes_observed{false};
 std::atomic<int> g_gdn_out_core_dtype{static_cast<int>(vt::DType::kF32)};
 std::atomic<int> g_gdn_out_z_dtype{static_cast<int>(vt::DType::kF32)};
@@ -3252,11 +3276,12 @@ bool GdnFp8InBf16Enabled() {
 // that accepts a model shape makes the default unreadable at the definition and
 // lets a new call site reintroduce the split silently. VT_GDN_OUT_BF16=0 is now
 // the f32 rollback for BOTH arms rather than for the dense one alone.
-DType GdnOutDType() {
-  static const bool bf16 =
-      detail::GdnOutBf16FlagIsOn(std::getenv("VT_GDN_OUT_BF16"));
-  return bf16 ? DType::kBF16 : DType::kF32;
-}
+//
+// Fresh-review repair: the definition moved up beside `GdnOutBf16FlagIsOn` and
+// into `detail::`, so that a gate can observe the RESOLVER and not only its
+// parser. Nothing about the resolution changed. The call sites below are
+// unqualified and keep reading it through this declaration.
+using detail::GdnOutDType;
 
 // bf16 residual stream (default ON). vLLM runs the 35B in bf16
 // (model_config.dtype=bfloat16): qwen3_next.py keeps `residual` as the bf16 hidden
@@ -4656,6 +4681,9 @@ DBuf GdnBlockPaged(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
   DBuf dcore(d, outdt, {T, Hv, Dv});
   // GDN-MOE-BF16-OUT (#1168): read off the tensors, not off GdnOutDType, so a
   // gate entering through ModelRegistry::Forward observes what this layer RAN.
+  // This is the ONLY recording site. The mixed spec+non-spec batch returns into
+  // GdnBlockPagedMixedSpec above and never reaches it, so a mixed step leaves
+  // the record untouched rather than stale-free — see the header's limits.
   RecordGdnOutActivationDTypes(dcore.t().dtype, z.dtype);
   const float scale = 1.0F / std::sqrt(SizeF(Dk));
   if (packed_decode) {
