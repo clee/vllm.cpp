@@ -1984,17 +1984,48 @@ that a claim source carries. No file under `.agents/claims/` claims
 session's in-flight work would be a fabricated record. `PARTIAL` is the state
 whose contract is exact code and test anchors, which this row now has.
 
-**Nothing here claims an end-to-end token gate, because none has passed.** The
-A3 gate is PENDING on `main`; `docs/BENCHMARKS.md` and `.agents/benchmark-record.md`
-are the authority on why, and [#1157](https://github.com/mudler/vllm.cpp/issues/1157)
-is the open decode divergence on real weights. No throughput, latency or memory
-number exists for this architecture and none is claimed.
+**The end-to-end token gate PASSES, and it passes on a branch that is not
+`main`.** On GB10 the A3 96-token gate reads `TOKEN MATCH: 96/96 over 3
+prompt(s) (full rows=3, short rows=0, mode=decode)` and `STRICT PASS`, against
+the pinned oracle `vllm=0.23.1rc1.dev1511+g555967922` on
+`nemotron-3.5-lightning-30b-nvfp4` at revision
+`29f2d1746d8f41e316523194b19018707749b1b1`.
+
+It is the DEVICE leg. Three things say so, and the third is the one that
+matters. The binary is `libvllm 0.0.3+cuda`, and `cfg.log` records `fp4-mma`,
+`cutlass-nvfp4` and `cutlass-fp8` as `ENABLED for [121a]`. The run logs
+`Asynchronous scheduling is enabled (max_concurrent_batches=2)`, which is
+precisely the path where `ModelForwardInput::device_token_ids` is non-null; on
+the host queue it is always null and the [#1157](https://github.com/mudler/vllm.cpp/issues/1157)
+defect cannot occur at all. And the same binary on the same checkpoint, with
+ONLY `nemotron_h_device.cpp` reverted to the fix's parent, scores `4/24 (full
+rows=0, short rows=3)` and bails at 8 generated tokens. A host-leg run would
+have been unmoved by that revert. **The delta is the proof; the pass on its own
+is not.** Evidence: `/usr/local/nas_share/rc/nh1157/` — `gate_fixed.out`,
+`gate_red.out`, `cfg.log`, `build.log`.
+
+**The pass is a property of [#1221](https://github.com/mudler/vllm.cpp/pull/1221),
+not of `main`.** That branch is `row/MODEL-NEMOTRON-H-ABI-A2P-1157-fix` at
+`6e9e8955`, OPEN and `CONFLICTING`. `main`'s last touch of
+`nemotron_h_device.cpp` is `a6df72777` (A2-P), so the tree this row describes
+does not carry the fix and the gate does not pass on it. This spec records a
+gate that passed, pending a merge. It does not record `main` as gated. One
+config caveat travels with the run: `--gpu-memory-utilization 0.92` did not size
+the KV pool, which fell back to 256 blocks ([#83](https://github.com/mudler/vllm.cpp/issues/83)).
+
+**No throughput, latency or memory number exists for this architecture and none
+is claimed.** The wall times in `gate_fixed.out` — 264.4s to load, 327-343s per
+32-token prompt — are a correctness run on a path whose `lm_head` and 46 FP8
+mamba projections still execute host-side. They are not benchmarks, they are not
+a denominator, and nothing may carry them into `docs/BENCHMARKS.md` as a
+performance figure.
 
 **Next action:** land [#1221](https://github.com/mudler/vllm.cpp/pull/1221) (the
-`device_token_ids` repair for #1157), then run the A3 96-token gate on GB10 under
-that fix and record the result. Then W5 (the MTP head, whose 270 tensors the
-loader already names as owed), W6/A3 the e2e token gate against the committed
-goldens, and W7 (GGUF k-quants). A2-Q2b (the device `lm_head`) is what removes
+`device_token_ids` repair for #1157). Its A3 gate has already been run and has
+already passed — 96/96, `STRICT PASS`, on GB10 — so what remains is the merge,
+which is blocked on that pull request being `CONFLICTING`, not on any
+measurement. Then W5 (the MTP head, whose 270 tensors the loader already names
+as owed) and W7 (GGUF k-quants). A2-Q2b (the device `lm_head`) is what removes
 `nemotron_h` from `scripts/runner-routing-allowlist.txt`; A2-B is what removes
 the `input.num_reqs <= 1` refusal.
 
