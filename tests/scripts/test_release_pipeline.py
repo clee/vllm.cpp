@@ -6,6 +6,7 @@ from __future__ import annotations
 import copy
 import importlib.util
 import json
+import re
 import subprocess
 import sys
 import tempfile
@@ -28,6 +29,22 @@ BUILD_DRIVERS = (
 WINDOWS_BUILD_DRIVER = ROOT / "scripts/build-windows-release.ps1"
 MATRIX = ROOT / "release/release-matrix.json"
 SHA = "0123456789abcdef0123456789abcdef01234567"
+
+# The `if:` line of BOTH `windows-msvc-*` jobs, as it appears in ci.yml.
+# `check-release-workflow.py::validate_pr_ci` pins the whole job mapping for
+# equality, so this string is load-bearing in three ways at once and is named
+# here rather than repeated at five call sites: it is what the checker compares
+# against, it is the anchor the mutations below splice on, and it is the reason
+# the two jobs can carry no `needs:` and no closed-action clause (#874).
+#
+# It gained `schedule` and `workflow_dispatch` on 2026-08-17 (#503) so the
+# `main` baseline lane runs them at all. `push` is ABSENT on purpose; see the
+# job's own comment in ci.yml.
+WINDOWS_PROOF_IF = (
+    "    if: github.event_name == 'pull_request'"
+    " || github.event_name == 'schedule'"
+    " || github.event_name == 'workflow_dispatch'\n"
+)
 
 
 def load(path: Path, name: str):
@@ -119,6 +136,16 @@ class ReleasePipelineContract(unittest.TestCase):
         cmake = (ROOT / "CMakeLists.txt").read_text(encoding="utf-8")
         self.assertIn("project(vllm_cpp VERSION 0.0.3 LANGUAGES CXX)", cmake)
 
+    def test_default_build_version_is_project_version(self) -> None:
+        cmake = (ROOT / "CMakeLists.txt").read_text(encoding="utf-8")
+        declaration = re.search(
+            r'^set\(VLLM_CPP_BUILD_VERSION\s+"([^"]*)"\s+CACHE\s+STRING\b',
+            cmake,
+            re.MULTILINE,
+        )
+        self.assertIsNotNone(declaration, "missing build-version cache declaration")
+        self.assertEqual(declaration.group(1), "${PROJECT_VERSION}")
+
     def test_release_version_declaration_rejects_every_identity_mismatch(self) -> None:
         original = json.loads(RELEASE_VERSION.read_text(encoding="utf-8"))
         mutations = {
@@ -134,6 +161,39 @@ class ReleasePipelineContract(unittest.TestCase):
                 mutant[field] = value
                 with self.assertRaises(ValueError):
                     self.pipeline.validate_release_version(mutant)
+
+    def test_every_release_builder_forwards_exact_build_version_to_cmake(self) -> None:
+        shell_argument = '-DVLLM_CPP_BUILD_VERSION="$VERSION"'
+        for driver in BUILD_DRIVERS:
+            with self.subTest(driver=driver.name):
+                text = driver.read_text(encoding="utf-8")
+                self.assertEqual(text.count(shell_argument), 1)
+                for replacement in (
+                    "",
+                    '-DVLLM_CPP_BUILD_VERSION="0.0.3-pre.1"',
+                    '-DVLLM_CPP_BUILD_VERSION="$PROJECT_VERSION"',
+                ):
+                    self.assertNotEqual(
+                        text.replace(shell_argument, replacement, 1).count(
+                            shell_argument
+                        ),
+                        1,
+                    )
+
+        powershell_argument = '"-DVLLM_CPP_BUILD_VERSION=$env:VERSION"'
+        text = WINDOWS_BUILD_DRIVER.read_text(encoding="utf-8")
+        self.assertEqual(text.count(powershell_argument), 1)
+        for replacement in (
+            "",
+            '"-DVLLM_CPP_BUILD_VERSION=0.0.3-pre.1"',
+            '"-DVLLM_CPP_BUILD_VERSION=$env:PROJECT_VERSION"',
+        ):
+            self.assertNotEqual(
+                text.replace(powershell_argument, replacement, 1).count(
+                    powershell_argument
+                ),
+                1,
+            )
 
     def test_workflow_has_two_exact_native_windows_preview_lanes(self) -> None:
         workflow = WORKFLOW.read_text(encoding="utf-8")
@@ -231,7 +291,9 @@ class ReleasePipelineContract(unittest.TestCase):
         ):
             with self.subTest(job=job):
                 block = self.checker.job_block(workflow, job)
-                self.assertIn("    if: github.event_name == 'pull_request'", block)
+                # The WHOLE line, not a prefix: a prefix assertion stays green
+                # while the condition grows a `|| always()` on the end.
+                self.assertIn(WINDOWS_PROOF_IF, block)
                 self.assertIn("    permissions:\n      contents: read", block)
                 self.assertIn("    runs-on: windows-2022", block)
                 self.assertIn(
@@ -255,6 +317,19 @@ class ReleasePipelineContract(unittest.TestCase):
 
     def test_pr_windows_gate_mutations_are_rejected(self) -> None:
         original = CI_WORKFLOW.read_text(encoding="utf-8")
+        # Each anchor below is spliced with `.replace(before, after, 1)`, and
+        # `WINDOWS_PROOF_IF` occurs twice in ci.yml -- once per Windows job --
+        # so the FIRST occurrence is `windows-msvc-cpu`, which is the job every
+        # mutation here is aimed at. The anchors used to carry the job header
+        # and its three comment lines to get that targeting; they no longer do,
+        # because that coupled a mutation suite to prose and reddened it for an
+        # edited comment. Asserted, not assumed, by the count check below.
+        self.assertEqual(original.count(WINDOWS_PROOF_IF), 2)
+        self.assertLess(
+            original.index("  windows-msvc-cpu:\n"),
+            original.index("  windows-msvc-vulkan:\n"),
+            "the CPU job must come first, or every mutation below targets Vulkan",
+        )
         mutations = {
             "missing CPU job": (
                 "  windows-msvc-cpu:\n",
@@ -264,35 +339,29 @@ class ReleasePipelineContract(unittest.TestCase):
                 "  windows-msvc-vulkan:\n",
                 "  windows-msvc-vulkan-removed:\n",
             ),
-            "non-PR execution": (
-                "  windows-msvc-cpu:\n"
-                "    # Native Windows release portability must be proven before merge. This PR\n"
-                "    # lane calls the authoritative driver but retains no artifact and has no\n"
-                "    # release, upload, write-token, or OIDC authority (#117).\n"
+            "unconditional execution": (WINDOWS_PROOF_IF, "    if: always()\n"),
+            # The #503 broadening added two events. These prove it added exactly
+            # those two and did not become a predicate that admits anything: a
+            # `push` arm, and the shape that would look equivalent to a reader.
+            "push lane added": (
+                WINDOWS_PROOF_IF,
+                WINDOWS_PROOF_IF.rstrip("\n") + " || github.event_name == 'push'\n",
+            ),
+            "condition inverted to exclude only push": (
+                WINDOWS_PROOF_IF,
+                "    if: github.event_name != 'push'\n",
+            ),
+            "baseline lane dropped again": (
+                WINDOWS_PROOF_IF,
                 "    if: github.event_name == 'pull_request'\n",
-                "  windows-msvc-cpu:\n"
-                "    # Native Windows release portability must be proven before merge. This PR\n"
-                "    # lane calls the authoritative driver but retains no artifact and has no\n"
-                "    # release, upload, write-token, or OIDC authority (#117).\n"
-                "    if: always()\n",
             ),
             "moving runner": (
                 "    runs-on: windows-2022\n",
                 "    runs-on: windows-latest\n",
             ),
             "write authority": (
-                "  windows-msvc-cpu:\n"
-                "    # Native Windows release portability must be proven before merge. This PR\n"
-                "    # lane calls the authoritative driver but retains no artifact and has no\n"
-                "    # release, upload, write-token, or OIDC authority (#117).\n"
-                "    if: github.event_name == 'pull_request'\n"
-                "    permissions:\n      contents: read\n",
-                "  windows-msvc-cpu:\n"
-                "    # Native Windows release portability must be proven before merge. This PR\n"
-                "    # lane calls the authoritative driver but retains no artifact and has no\n"
-                "    # release, upload, write-token, or OIDC authority (#117).\n"
-                "    if: github.event_name == 'pull_request'\n"
-                "    permissions:\n      contents: write\n",
+                WINDOWS_PROOF_IF + "    permissions:\n      contents: read\n",
+                WINDOWS_PROOF_IF + "    permissions:\n      contents: write\n",
             ),
             "CPU build omitted": (
                 "            -Backend cpu `",
@@ -590,8 +659,8 @@ class ReleasePipelineContract(unittest.TestCase):
     def test_pr_windows_gate_yaml_validation_ignores_comments_and_order(self) -> None:
         original = CI_WORKFLOW.read_text(encoding="utf-8")
         before = (
-            "    if: github.event_name == 'pull_request'\n"
-            "    permissions:\n"
+            WINDOWS_PROOF_IF
+            + "    permissions:\n"
             "      contents: read\n"
             "    runs-on: windows-2022\n"
             "    timeout-minutes: 180\n"
@@ -603,8 +672,7 @@ class ReleasePipelineContract(unittest.TestCase):
             "\n"
             "    permissions:\n"
             "      # The sole job permission remains read-only.\n"
-            "      contents: read\n"
-            "    if: github.event_name == 'pull_request'\n"
+            "      contents: read\n" + WINDOWS_PROOF_IF
         )
         self.assertEqual(original.count(before), 2)
         commented = original.replace(before, after)

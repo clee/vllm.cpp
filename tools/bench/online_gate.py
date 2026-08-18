@@ -8,8 +8,9 @@ This wrapper mirrors its CLI and result schema from:
 * ``vllm/benchmarks/datasets/datasets.py:2482-2610``
 * ``tests/benchmarks/test_serve_cli.py:58-132``
 
-at executable-oracle commit ``702f4814fe54fabff350d43cb753ae3e47c0c276``. It
-does not reimplement request timing.  It constructs the exact upstream client
+at the parity pin recorded in ``.agents/upstream-sync.md``, which
+``serve_low_common`` reads (#520) so this file cannot carry a second, drifting
+copy of it. It does not reimplement request timing.  It constructs the exact upstream client
 command, validates every detailed artifact, and makes partial request sets
 fatal instead of allowing their aggregate metrics to look successful.
 """
@@ -38,10 +39,15 @@ from collections.abc import Mapping, Sequence
 from typing import Any
 
 from tools.bench.serve_low_common import (
+    FLASHINFER_VERSION,
     HarnessError,
     VLLM_COMMIT,
+    VLLM_DISTRIBUTION_VERSION,
+    VLLM_ORACLE_VERSION,
+    assert_oracle_commit,
     canonical_json,
     read_jsonl,
+    require_complete_request_set,
     require_number,
     sha256_file,
     write_json_atomic,
@@ -50,8 +56,17 @@ from tools.bench.serve_low_common import (
 
 INPUT_LEN = 1024
 OUTPUT_LEN = 128
-VLLM_ORACLE_VERSION = "0.25.0"
-FLASHINFER_VERSION = "0.6.13"
+# VLLM_ORACLE_VERSION / VLLM_DISTRIBUTION_VERSION / FLASHINFER_VERSION / VLLM_COMMIT
+# are the parity pin, read from .agents/upstream-sync.md by serve_low_common
+# (#520). They are re-exported through this module's namespace by the import
+# above, so every existing consumer keeps importing them from here.
+#
+# PANDAS_VERSION stays a local constant because it pins a BENCH-CLIENT
+# dependency, not the oracle's identity. It is knowingly UNSATISFIED at the pin:
+# ~/venvs/vllm-oracle-next has no pandas at all (#522), so this assertion now
+# fails closed there. That refusal is the true state of the world -- `vllm bench
+# serve` cannot run in that venv -- and installing into a shared oracle needs
+# recorded authority, so it is filed rather than papered over.
 PANDAS_VERSION = "2.2.3"
 TRACE_CONCURRENCY = 16
 TRACE_PROMPTS = 48
@@ -263,10 +278,13 @@ MODEL_GATE_CONTRACTS = {
         "proof": "qwen27_paged_engine: full production stream 16/16 token-exact vs vLLM",
     },
     "test_qwen36_paged_engine": {
-        # Find35BSnapshot() takes the first cached snapshot of the 35B repo and
-        # pins no revision, so this records an honest "unknown" rather than
-        # asserting a match nothing checks.
-        "golden_revision": None,
+        # GATE-PIN-UNPINNED-SNAPSHOTS (#471): Find35BSnapshot() now resolves
+        # through tests/parity/hf_snapshot.h `kQwen36A3bNvfP4Revision`, the
+        # revision the 35B goldens record in `oracle.model`. This was an honest
+        # "unknown" while the gate took the first cached snapshot; it is no
+        # longer unknown, and leaving it None would understate the coverage the
+        # gate now actually has.
+        "golden_revision": "491c2f1ea524c639598bf8fa787a93fed5a6fbce",
         "proof": "qwen36_paged_engine M0-EXIT: produced ",
     },
     "mxfp4_smoke_battery": {
@@ -736,12 +754,11 @@ def validate_raw_result(
         raise HarnessError(
             f"num_prompts={record.get('num_prompts')!r}; expected {expected}"
         )
-    if record.get("completed") != expected or record.get("failed") != 0:
-        raise HarnessError(
-            "request set is partial: "
-            f"completed={record.get('completed')!r}, failed={record.get('failed')!r}, "
-            f"expected={expected}"
-        )
+    # Completion counters are checked by the shared precondition so this
+    # validator and every rate-deriving site refuse the same records (#931).
+    require_complete_request_set(
+        record, expected_requests=expected, source="online-gate raw result"
+    )
     if record.get("max_concurrency") != concurrency:
         raise HarnessError(
             f"configured max_concurrency={record.get('max_concurrency')!r}; "
@@ -3484,10 +3501,11 @@ def record_oracle_manifest(
 ) -> dict[str, Any]:
     """Record the exact immutable files behind the pip-vLLM oracle command.
 
-    This command is intentionally run with the oracle venv's Python.  The
-    audited v0.25.0 target defines the client contract while the older porting
-    parity pin remains explicit in the upstream-sync record until target
-    goldens and behavior gates close.
+    This command is intentionally run with the oracle venv's Python, and it is
+    where the oracle's IDENTITY is asserted (#375, #520): the client contract
+    and the porting parity pin are now the same commit, read from
+    ``.agents/upstream-sync.md``, and an oracle that is not that commit is
+    refused here rather than measured and labelled wrong.
     """
 
     if output.exists():
@@ -3502,15 +3520,22 @@ def record_oracle_manifest(
         raise HarnessError("vLLM distribution metadata is unavailable") from error
     metadata_version = distribution.version
     runtime_version = getattr(vllm, "__version__", None)
+    # Metadata and runtime are checked against their OWN recorded strings. They
+    # differ on the pin (metadata appends ".precompiled"), so the previous
+    # `metadata == runtime == CONST` shape was unsatisfiable there at any value,
+    # and a `startswith` would have accepted an arbitrary suffix instead.
     if (
-        metadata_version != VLLM_ORACLE_VERSION
+        metadata_version != VLLM_DISTRIBUTION_VERSION
         or runtime_version != VLLM_ORACLE_VERSION
     ):
         raise HarnessError(
             "vLLM oracle version drift: "
             f"metadata={metadata_version!r}, runtime={runtime_version!r}, "
-            f"expected={VLLM_ORACLE_VERSION!r}"
+            f"expected metadata={VLLM_DISTRIBUTION_VERSION!r}, "
+            f"runtime={VLLM_ORACLE_VERSION!r}"
         )
+    # And then the commit, which is the term the version numbers cannot supply.
+    assert_oracle_commit(runtime_version)
     try:
         import flashinfer  # Delayed so CPU contract tests can provide a stub.
         flashinfer_distribution = importlib.metadata.distribution("flashinfer-python")
@@ -3674,10 +3699,13 @@ def record_execution_manifest(
         "tokenizer": snapshot / "tokenizer.json",
     }
     oracle = _load_json_object(oracle_manifest)
-    if oracle.get("oracle_version") != VLLM_ORACLE_VERSION:
+    if oracle.get("oracle_version") != VLLM_DISTRIBUTION_VERSION:
         raise HarnessError("oracle manifest version differs from the pinned pip oracle")
     if oracle.get("runtime_version") != VLLM_ORACLE_VERSION:
         raise HarnessError("oracle runtime version differs from the pinned pip oracle")
+    # Re-asserted here, not merely inherited from record-oracle: the manifest is
+    # a file on disk and can be from another venv, another day, or hand-edited.
+    assert_oracle_commit(oracle.get("runtime_version"))
     if oracle.get("client_contract_source_commit") != VLLM_COMMIT:
         raise HarnessError("oracle client contract source differs from the parity pin")
     expected_bench_dependencies = {
