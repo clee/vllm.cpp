@@ -2512,3 +2512,284 @@ not once per step, so it is outside the 660-forward loop entirely.
 
 The vocoder row is unchanged: `vt` still has no `ConvTranspose1d` with any
 provider, that op has three consumers, and it is its own row.
+
+---
+
+## 15. The depth decoder stops recomputing itself (#672) — §11.4's last owed row, and it did not need the dtype
+
+§14.5 left the depth decoder as the one owed device row and corrected §11.4's
+reason for it: routing it through an f32 `vt::MatmulBT` would drop the bf16
+`Store` that every gated number was taken with, so a device arm needs **bf16
+storage** and its own numeric evidence.
+
+**That is still true, and this row did not need it.** The measured bottleneck
+turned out not to be how fast the depth decoder's arithmetic runs but **how much
+of it was arithmetic nobody read**.
+
+### 15.1 The measurement that defined the job
+
+`row/MUSIC3-PERF-VS-ORACLE`'s per-stage profiler (#1231), `thor:gpu0`, `--device 1`,
+4 s of audio / 4 steps / 100 frames / 1 window, 1481.5 s total:
+
+| stage | seconds | share | calls |
+|---|---|---|---|
+| `load.ar_weights` | 780.0 | 52.7 % | — (cold CIFS) |
+| **`ar.depth_forward`** | **347.3** | **23.4 %** | **1414** |
+| `load.acoustic_weights` | 249.0 | 16.8 % | — (cold CIFS) |
+| `vocoder.decode_window` | 53.6 | 3.6 % | — |
+| `ar.lm_decode_step` | 14.8 | 1.0 % | 100 |
+| `ar.depth_projection` | 10.1 | 0.7 % | 1414 |
+| `denoise.dit_device` | 5.06 | 0.34 % | 8 forwards |
+
+**The 0.646B host depth decoder cost 23.5x the 8.6B language model on the GPU**,
+and once the cold load is set aside it was ~88.5 % of the autoregressive loop.
+§14 having put the DiT on the device is why: at 0.34 % there is nothing left to
+win there, and the stage that was second is now first.
+
+### 15.2 What it was spending it on: rows it already had
+
+`_generate_depth_codes` (encoders.py:117-142) walks seven codebook steps over a
+sequence that grows by one row per step, and reads `hidden[:, -1]` each time. Our
+`Music3DepthStage` implemented that literally — `DepthSequenceEmbeds` then
+`DepthDecoderForward` over the WHOLE sequence, once per CFG branch:
+
+    rows through the decoder, per frame:  2 x (2+3+4+5+6+7+8) = 70,  of which 14 are read
+    rows through the 4096x4096 projection: the same 70,             of which 16 are new
+
+**Upstream re-runs the sequence too** — its profile shows `depth.forward` at
+7 calls per frame with shapes `(2, 2..8, 4096)` — so nothing was mis-ported.
+It is an algebraic identity that neither side had taken, and upstream's own
+`projection` line (56 calls, 8 of them batch-2, per frame) shows it HAS taken the
+smaller half of it: `sequence` keeps its projected rows and only the newly
+appended element is projected (encoders.py:125,127,141).
+
+### 15.3 The identity, and why it is exact rather than close
+
+The decoder is causal and carries position in a **learned table**, not in RoPE
+(`minimax_music3_rvq_depth_decoder.py:138-139`). So the input to position `t` is
+fixed the moment it is appended, and by induction over the layers every
+intermediate of positions `0..t-1` is bit-for-bit what a whole-sequence forward
+recomputes. `DepthDecoderAppend` computes each position ONCE against a K/V cache
+and returns the row the schedule actually reads.
+
+    rows through the decoder, per frame:  16   (2 branches x 8 positions)
+    rows through the projection:           9   (3 prefix + 6 appended)
+
+Two further things fall out, and both are upstream's own shape rather than
+inventions of ours. The two CFG rows differ ONLY at position 0, so they go
+through as **one batch-2 call** — `(2, 2..8, 4096)` is exactly what upstream's
+profile shows. And the projection is applied once per row: three rows in one
+sweep for the prefix, one per appended code.
+
+**`DepthDecoderForward` is untouched.** It is the mirrored reference, it is still
+what the committed upstream goldens gate, and it is what `DepthDecoderAppend` is
+asserted equal to. A fast path that replaced its reference would have nothing to
+be checked against.
+
+### 15.4 The other half: the kernel was weight-streaming bound, not FLOP bound
+
+`LinearNoBias` partitioned its output as a flat `(row, out)` index, so for each
+input row it swept the WHOLE weight matrix. At the depth decoder's geometry one
+row-forward reads
+
+    4 layers x (4 x 4096x4096 + 2 x 4096x6144 + 6144x4096) x 4 bytes = 2.28 GB
+
+of f32 weights for 570 MMAC, which is ~4 bytes per multiply-accumulate: the loop
+is bound by streaming weights, not by arithmetic. 347.3 s over 70 row-forwards
+per frame x 100 frames is ~46 GB/s of weight traffic, which is the right order
+for this box's memory rather than for its cores.
+
+So the row loop moved INSIDE one output column. Each output element still owns
+one sequential `double` accumulator walked in ascending `i` — the order W2/W3
+pinned against torch, under the project-wide `-ffp-contract=off` — but the weight
+row is now read once for every row in the call instead of once per row.
+
+| per frame | before | after |
+|---|---|---|
+| decoder row-forwards | 70 | **16** |
+| decoder weight sweeps | 70 | **8** |
+| projection rows | 70 | **9** |
+| projection weight sweeps | 70 | **7** |
+
+### 15.5 Correctness — BITWISE, and the gate had to earn it
+
+`tests/vllm/models/test_minimax_music3_ar.cpp` gains four cases that compare
+`DepthDecoderAppend` against `DepthDecoderForward` by `memcmp`, not by tolerance:
+
+* every prefix length 1..`max_position_embeddings`, at BOTH `ArCompute` widths
+  (96 values at the goldens' geometry);
+* a **wider** geometry — 8 heads of 8, three layers, the real 8-position
+  schedule, pseudo-random weights — because the committed goldens are 8-wide with
+  ONE head, where `heads * head_dim` and `head_dim` are the same number and a head
+  stride defect is invisible (1024 values);
+* the CFG pair as a batch of 2, each row against its OWN whole-sequence forward,
+  plus a check that the two rows have not collapsed into each other;
+* the cache's refusals: a null cache, batch 0, a mis-sized row, a batch change
+  mid-cache, and the position ceiling.
+
+**An f64 accumulator stored through an f32 cannot see a reassociation.** That is
+measured here rather than supposed — reversing the attention's value sweep leaves
+every ordinary-data assertion in the file GREEN. So the fourth case engineers the
+cancellation: `to_q` and `to_k` zero make every softmax weight exactly `1/seq`,
+and an `input_layernorm` whose first component is `2^60` makes positions 0 and 1
+carry `+2^60` and `-2^60` into `v` while every later position carries 0 there and
+O(1) elsewhere. Ascending `j` cancels the pair immediately and keeps the
+remainder exactly; any order that carries `2^60` through the remainder
+annihilates it across a 57-bit gap. The case also asserts its OWN teeth — that
+the remainder is finite and non-zero — because a zero remainder would make the
+whole apparatus vacuous and still print green.
+
+**Mutations: 7 applied, 7 RED.** Sources restored and `sha256`-verified after
+each.
+
+| # | mutation | result |
+|---|---|---|
+| M1 | attention value sweep walks `j` DESCENDING | **RED** 1 case / 4 — the cancellation case ALONE; every other case green |
+| M2 | `pos_embedding` read at row 0 instead of `position` | **RED** 3 cases / 30 |
+| M3 | the appended position excluded from its own attention | **RED** 4 cases / 35 |
+| M4 | every batch row served row 0's history | **RED** 2 cases, THROWN — 0 failed assertions, which is why cases are reported beside them |
+| M5 | `LinearNoBias` drops the last input row | **RED** in both suites |
+| M6 | `Store` dropped from the incremental position add | **RED** 3 cases / 30 |
+| M7 | `LinearNoBias` dot split into two interleaved accumulators | **RED** `test_host_parallel` 1 case / 5 |
+
+M7 is the one that gates the kernel restructure, and it reds through
+`test_host_parallel`'s own cancellation case (§12.2) rather than through anything
+added here — which is the check that the row-loop pivot did not quietly become a
+reassociation.
+
+M1 and M4 are each recorded with their shape rather than only their count: M1
+because it is the whole justification for the engineered case, and M4 because it
+fails by THROWING, so a reader grepping `assertions:` would see a suite that
+"passed" 408 of 408.
+
+**The COMPOSITION leg, and exactly how far it goes.** Nothing in the tree gates
+`Music3DepthStage` itself: `test_minimax_music3_ar_real` exercises
+`DepthDecoderForward`, and `test_minimax_music3_llm_real` checks
+`frame_hiddens[:, :4096]`, which is the language model's half of the row. What
+covers the composed schedule is §15.6's fingerprint: the A/B driver reproduces
+`Music3DepthStage`'s seven steps and two CFG rows at the REAL 4096-wide geometry
+and hashes the [7, 4096] block that function returns, and **all 20 runs on both
+arms printed `f0cfeed6eee4f55d`**. Everything downstream — `AudioHeadLogits`, the
+CFG mix, the top-k draw, the feedback embedding, the acoustic half — is
+unchanged code over that block, and `LinearNoBias`, the one kernel they share
+with this row, is gated bitwise by `test_host_parallel`.
+
+**What is NOT claimed is the WAV pair, and it was attempted.** §12.3's strong
+form — two binaries writing byte-identical audio through five stages and a
+28.5 GB checkpoint — is the leg this row does not have. The run was launched and
+died at `rc=127` on a missing `libvllm.so.0`: the BEFORE arm's binary was
+dynamically linked into a measurement worktree that had already been removed. It
+is recorded as attempted and not taken rather than quietly omitted, and rebuilding
+the pair is owed work whenever a quiet box is available; §15.7 carries it.
+
+### 15.6 Speed — a STAGE A/B, on one named box, and why not the e2e pair
+
+**One frame of the depth stage, at the REAL geometry, runs 3.5x faster and emits
+the same bytes.** That is a STAGE measurement, said so plainly, and it is not
+offered as an end-to-end speedup.
+
+**Why not the e2e pair, again.** §12.5 recorded the same refusal for the same
+reason and it recurred: this 20-core x86-64 box was carrying three other
+sessions' `test_ltx2_video` runs and two full `ctest` builds throughout, at a
+1-minute load average between **39 and 52** (5-minute 71-92). A wall-clock e2e
+pair taken there measures somebody else's scheduler. The Thor per-stage pair —
+the one that would price this against §15.1's own profile — is **QUEUED** on
+`thor:gpu0` behind two other jobs and is recorded as PENDING rather than
+estimated.
+
+**What replaces it.** The depth stage's inner loop is short enough to repeat, so
+the MINIMUM over rounds is available, and a minimum is the least-disturbed sample
+rather than an average of someone else's contention (§12.4's argument, reused
+because the situation is the same). ONE driver source
+(`depthbench.cpp`, in the row's evidence) is compiled twice and linked against
+the two `libvllm.a` builds — `fc163f62b` and that commit plus this change, which
+differ in exactly the four files this row touches. It drives ONE frame of the
+depth stage as `Music3DepthStage` drives it: seven codebook steps, two CFG rows,
+the projection and the decoder, with a fixed code per step so the two arms
+traverse identical rows. `DepthDecoderConfig`'s defaults are the real 4096 / 4 /
+16 / 6144 / 8 geometry, and the weights are 2.5 GB of seeded pseudo-random floats
+drawn identically on both arms.
+
+Eight alternating pairs across two series (base, new, base, new, ...), 12 timed
+rounds per arm:
+
+| series | BEFORE rounds (s) | AFTER rounds (s) | pair ratio |
+|---|---|---|---|
+| A, 1 round/process | 6.7769 / 6.6714 / 6.9562 / 7.5485 / 6.4413 | 1.7795 / 2.0487 / 2.5047 / 2.4196 / 2.1171 | 3.81, 3.26, 2.78, 3.12, 3.04 |
+| B, 4 rounds/process | 6.5467 5.8667 6.2444 6.0943 / 6.3505 5.9991 5.8783 6.5534 / 6.3186 6.3508 8.6671 7.6575 | 1.9943 2.0208 1.8607 1.6766 / 2.0193 2.1022 1.6981 1.8891 / 3.3631 3.0259 3.4770 3.7275 | 3.50, 3.46, 2.09 |
+
+    minimum over all rounds:  BEFORE 5.8667 s   AFTER 1.6766 s   3.50x
+    median of the 8 pair ratios:                                 3.19x
+
+`uptime` 39.30 before the series and 51.98 after, 20 cores; the noisy rounds are
+visibly higher on BOTH arms, which is what the minimum exists to discard. Series
+B's third pair is the loudest on both arms and is kept rather than dropped.
+
+**And the bit-identity holds AT THIS GEOMETRY, which is a leg the unit gate does
+not have.** Each arm printed an FNV-1a fingerprint of the frame's 28 672 depth
+hidden values, and **all 20 runs on both arms printed
+`f0cfeed6eee4f55d`**. §15.5 gates reduced dimensions against the reference
+forward; this gates 4096-wide production geometry across two separately compiled
+libraries.
+
+#### 3.5x, not 8.75x — recorded because the gap is the finding
+
+§15.4's byte accounting says the weight traffic falls 8.75x and the arithmetic
+4.375x. The measured 3.5x sits just BELOW the arithmetic ratio, not near the byte
+one, which says this stage is closer to compute-bound on THIS box than the
+byte-per-MAC arithmetic suggested — a 20-core x86-64 with a large L3 is not the
+regime the ~46 GB/s figure in §15.4 was inferred from, and that figure came from
+a 14-core Jetson Thor with unified LPDDR5X. The two boxes may well land on
+different sides of it, which is precisely why the Thor pair is worth waiting for
+rather than predicting.
+
+Two costs are also real and are named rather than absorbed: the incremental arm
+makes **8 pooled calls per frame where the old one made 14 larger ones**, so it
+pays proportionally more `Threadpool::Barrier` — the row's AR half already spends
+~25 % of its wall clock there (§11.4) — and its per-step attention is a scalar
+loop over one query row that no longer rides the output-row partition. Both are
+visible in the after arm's higher round-to-round spread (1.68-3.73 against
+5.87-8.67, a wider RELATIVE band). Neither is worth a lever until the Thor number
+says which side of the bound this stage is on.
+
+### 15.7 What is still OWED after this row
+
+**The dtype decision is untouched and still owed.** §14.5 stands: the depth
+decoder runs `ArCompute::kBFloat16`, an f32 `vt::MatmulBT` would drop that
+rounding, and a device arm for this stage needs **bf16 storage** with its own
+numeric evidence. This row deliberately did not take that on — it removed
+arithmetic nobody read and made the arithmetic that remains stream half the
+bytes, both bit-identically, and neither claim needs a dtype argument. **A device
+arm for the depth decoder is worth strictly less after this row than before it**,
+because it is now 4.4x less arithmetic to move.
+
+**The next traceable hypothesis, named rather than left as a ceiling.** The
+kernel is weight-streaming bound at ~4 bytes per multiply-accumulate. Three
+levers are visible and none is taken here:
+
+1. **bf16 weight STORAGE for the host arm.** The checkpoint is bf16 and the
+   loader widens it to f32, so every weight value is already exactly
+   representable in bf16 — expanding on the fly would halve the bytes streamed
+   BIT-IDENTICALLY on this path. It is not free to claim: the GGUF Q4_K arm
+   dequantises to values that are NOT bf16-representable, so the identity holds
+   for the safetensors lineage only and the two would have to be distinguished.
+2. **A larger batch.** The two CFG rows are the only rows this schedule has, so
+   the weight sweep is already amortised twice. Nothing above 2 exists to batch.
+3. **The device arm**, which is lever 1 plus `vt::MatmulBT`, and is the row §14.5
+   describes.
+
+**The e2e WAV pair (§15.5).** `minimax-music3-gen` on both arms with the same
+seed must write byte-identical audio. It is the one leg §12.3 had that this row
+does not, the attempt died on a linkage artefact rather than on a number, and it
+needs a quiet box and ~50 GB of free disk to redo. Owed.
+
+**`DepthSequenceEmbeds` is now gate-only.** It is still the documented mirror of
+`_generate_depth_codes`'s sequence assembly and is still gated against the
+committed goldens and exercised by `test_minimax_music3_quant_real`, but no
+production path calls it any more. That is recorded here rather than deleted,
+because it is what the incremental schedule is checked to agree with.
+
+**No parity claim, again.** SGLang-Omni is still `gateable = no`, and every
+reference axis in `docs/BENCHMARKS.md` stays `PENDING`. Everything above is an
+internal two-arm number on named hardware.
+

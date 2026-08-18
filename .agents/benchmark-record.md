@@ -22960,3 +22960,89 @@ for CUDA runtime version`. The Jetson 540.4.0 driver cannot run a CUDA 13 runtim
 untried route is a CUDA 12.x toolkit for that driver; it was not pursued, because the
 dgx gate had already answered the question orin was there to support. No lease held;
 `orin:gpu0` returned to ready.
+
+## MUSIC3-DEPTH-INCREMENTAL — the depth stage, whole-sequence vs incremental, x86-64 20-core (2026-08-18, `row/MUSIC3-DEPTH-SPEED`, base `origin/main` `727163997`, #672)
+
+**Not a parity ratio and not an end-to-end number.** A STAGE A/B between two
+builds of this project: `fc163f62b` (the `row/MUSIC3-PERF-VS-ORACLE` head this
+change was measured against) and that commit plus `row/MUSIC3-DEPTH-SPEED`,
+which differ in exactly four files. No reference leg; SGLang-Omni is still
+`gateable = no` and every axis in `docs/BENCHMARKS.md` against it stays
+`PENDING`.
+
+### What is timed
+
+ONE frame of the depth stage as `Music3DepthStage` drives it: seven codebook
+steps, two CFG rows, the projection and the decoder, with a fixed code per step
+so the two arms traverse identical rows. `DepthDecoderConfig`'s defaults are the
+REAL geometry — hidden 4096, 4 layers, 16 heads, ffn 6144, 8 codebooks — and the
+2.5 GB of weights are seeded pseudo-random floats drawn identically on both arms.
+
+* BEFORE arm: `DepthSequenceEmbeds` + `DepthDecoderForward` over the whole
+  growing sequence, twice per step. 70 row-forwards, 70 weight sweeps.
+* AFTER arm: one 3-row prefix projection, then eight `DepthDecoderAppend` calls
+  at batch 2. 16 row-forwards, 8 weight sweeps.
+
+### Recipe
+
+x86-64, 20 cores, 84 GB. ONE driver source compiled twice and linked against the
+two `libvllm.a` builds, the shape §12.4 used:
+
+    g++ -O3 -std=c++20 -ffp-contract=off -I<wt>/include -I<wt>/src \
+        -I<wt>/build/include -isystem <wt>/third_party [-DMUSIC3_AFTER] \
+        depthbench.cpp -o depthbench-<arm> <wt>/build/libvllm.a \
+        <wt>/build/libblake3_vendored.a -lpthread
+
+### Why the minimum, and what was NOT run
+
+The box was carrying three other sessions' `test_ltx2_video` runs and two full
+`ctest` builds throughout, at a 1-minute load average of **39.30 before the
+series and 51.98 after** (5-minute 71-92) on 20 cores. A wall-clock e2e pair
+taken there measures somebody else's scheduler — the same confound that voided
+§12.5's pair — so the e2e pair was NOT attempted. A short stage loop can be
+repeated, so the MINIMUM over rounds is available and is the least-disturbed
+sample.
+
+The Thor per-stage pair, which is the one that prices this against #1231's own
+`ar.depth_forward` = 347.3 s / 1414 calls, is **QUEUED on `thor:gpu0`** behind
+two other jobs and is PENDING, not estimated.
+
+### Result — 8 alternating pairs, 12 timed rounds per arm
+
+| series | BEFORE (s) | AFTER (s) | pair ratio |
+|---|---|---|---|
+| A pair 1 | 6.7769 | 1.7795 | 3.81 |
+| A pair 2 | 6.6714 | 2.0487 | 3.26 |
+| A pair 3 | 6.9562 | 2.5047 | 2.78 |
+| A pair 4 | 7.5485 | 2.4196 | 3.12 |
+| A pair 5 | 6.4413 | 2.1171 | 3.04 |
+| B pair 1 | 6.5467 5.8667 6.2444 6.0943 | 1.9943 2.0208 1.8607 1.6766 | 3.50 |
+| B pair 2 | 6.3505 5.9991 5.8783 6.5534 | 2.0193 2.1022 1.6981 1.8891 | 3.46 |
+| B pair 3 | 6.3186 6.3508 8.6671 7.6575 | 3.3631 3.0259 3.4770 3.7275 | 2.09 |
+| **minimum over all rounds** | **5.8667** | **1.6766** | **3.50x** |
+| median of the 8 pair ratios | | | **3.19x** |
+
+B pair 3 is the loudest on BOTH arms and is kept rather than dropped.
+
+### Bit-identity at production geometry
+
+Each run printed an FNV-1a fingerprint of the frame's 28 672 depth hidden values.
+**All 20 runs on both arms printed `f0cfeed6eee4f55d`.** The unit gate
+(`test_minimax_music3_ar`, 31 cases / 461 assertions) proves the identity against
+the reference forward at reduced dimensions; this proves it 4096-wide, across two
+separately compiled libraries.
+
+### 3.5x, not the 8.75x the byte accounting predicts
+
+Weight traffic falls 8.75x per frame (70 sweeps to 8) and arithmetic 4.375x (70
+row-forwards to 16). The measured 3.5x sits just below the ARITHMETIC ratio, so
+on this box the stage is closer to compute-bound than the ~4 bytes per
+multiply-accumulate suggested. That inference came from a 14-core Jetson Thor
+with unified LPDDR5X; a 20-core x86-64 with a large L3 is a different regime, and
+which side of the bound each box sits on is exactly what the queued Thor pair
+would say. Two costs are also real: the incremental arm makes 8 pooled calls per
+frame where the old one made 14 larger ones, so it pays proportionally more
+`Threadpool::Barrier`, and its per-step attention is a scalar loop over one query
+row that no longer rides the output-row partition. Both show up as the after
+arm's wider relative spread (1.68-3.73 against 5.87-8.67).
+
