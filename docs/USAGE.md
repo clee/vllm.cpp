@@ -618,6 +618,22 @@ then run a block-scaled GEMM whose scales apply in the mainloop, once per
 K-block, into an F32 accumulator. Each of the ten emits BF16, which is the
 model dtype and what vLLM emits at the same sites.
 
+Those ten projections are seven GEMMs, because `gate_proj` and `up_proj` run as
+one and `q_proj`, `k_proj` and `v_proj` run as one — the same two merged linears
+vLLM builds. A block scale belongs to a 128-row band, so the shards' scale grids
+concatenate exactly and the merged GEMM is byte-identical to the separate ones.
+
+That merge needs each projection in a group except the last to be a multiple of
+128 rows wide, which is what vLLM requires of the same checkpoints. A checkpoint
+that breaks the rule is refused by name, and the message says which projection
+and how wide it is, rather than quietly running a different arithmetic:
+
+```text
+block-wise FP8 merged 'qkv_proj': shard 'k_proj' has out_features 64, which is
+not a multiple of the quantization block's n 128. Only the LAST shard of a
+merged block-quant linear may be ragged
+```
+
 On a device with no block-scaled GEMM the model refuses while it is being
 prepared, before the first forward and before any CUDA graph is captured:
 
@@ -674,6 +690,29 @@ per-output-channel arm itself is not implemented yet.
 
 `lm_head` is not affected. It has always read a per-output-channel scale
 correctly, as the table above records.
+
+### One load refusal that is about this code, not your checkpoint
+
+Almost every load refusal in this document names something your `config.json`
+or your tensors actually declare. Exactly one does not:
+
+```text
+dense loader: LoadQwen3_5DenseLayer was given a tensor-presence probe that
+answered YES for '__vllm_cpp__a_tensor_no_checkpoint_carries__', a name no
+checkpoint carries.
+```
+
+That name is not in your checkpoint and is not supposed to be. The loader asks
+about it to find out whether its own "is this tensor present?" predicate is
+capable of answering `no`, and this message means it is not. Your checkpoint is
+fine; please report it with the model you were loading
+([#1258](https://github.com/mudler/vllm.cpp/issues/1258)).
+
+The check exists because a predicate that only ever said yes shipped twice in one
+file, and what a reader saw was the *opposite* of the truth: a refusal naming a
+block-wise FP8 scale tensor the checkpoint had never contained
+([#1256](https://github.com/mudler/vllm.cpp/issues/1256)). A message that blames
+the wrong side costs more than the failure does.
 
 ### Architectures that resolve but refuse to run
 
