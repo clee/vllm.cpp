@@ -3,8 +3,13 @@ on:
   push:
     branches: [main]
   # `closed` so a merged or abandoned pull request ENTERS the concurrency
-  # group and supersedes its own in-flight run. Every job below excludes it, so
-  # the run finishes immediately without executing a gate (#822).
+  # group and supersedes its own in-flight run (#822). Every job below is
+  # skipped on it -- directly through its own `if:`, or transitively by
+  # `needs:`-ing a job that is -- except the two `windows-msvc-*` PR proofs,
+  # whose whole job mapping is pinned byte-for-byte by
+  # `scripts/check-release-workflow.py` and can carry neither key. Those two
+  # therefore still start on a close; recorded as owed in
+  # .agents/specs/ci-concurrency.md and tracked by #874.
   pull_request:
     types: [opened, synchronize, reopened, closed]
   # THE BASELINE LANE (issue #274, spec .agents/specs/main-verifiability.md).
@@ -84,11 +89,27 @@ jobs:
     concurrency:
       group: ci-agent-record-${{ github.event_name }}-${{ github.ref }}-${{ github.repository }}
       cancel-in-progress: ${{ github.event_name != 'schedule' && github.event_name != 'workflow_dispatch' }}
-    # Skip when the pull request was CLOSED: the run exists only to enter
-    # the concurrency group and supersede the in-flight one (#822).
-    # always(): `last-gated-commit` is skipped on the PR lane, and a
-    # skipped dependency would otherwise skip this gate too.
-    if: always() && github.event.action != 'closed'
+    # NO job-level `if:`, deliberately, and no `always()`.
+    #
+    # `check-release-binary-contract.py` and `check-test-registration.py` count
+    # a checker as wired into CI only when the job owning its step carries no
+    # `if:` at all: a registration behind a condition is not a registration.
+    # #865 gave this job one, and both checkers plus three of their suites went
+    # RED on `main` (#873).
+    #
+    # The closed-pull-request skip #822 needs is carried by `needs:` instead.
+    # `last-gated-commit` excludes the closed action and runs on every other
+    # lane, so a closed pull request skips it and skips this job with it, while
+    # push, pull_request and the baseline lane all still run it. That is also
+    # why `always()` must NOT come back here: it would defeat the skip.
+    #
+    # The asymmetry that buys is deliberate but real: without `always()` the
+    # implicit `success()` couples this job to `last-gated-commit` SUCCEEDING,
+    # not merely running, while `documentation-checkpoint` and
+    # `commit-protocol-tag` on the same `needs:` keep `always()` and run
+    # regardless. A failure in the sha resolver therefore silences this job's
+    # checkers rather than reding them -- which is why that job does nothing but
+    # resolve a string and falls back instead of failing.
     needs: [last-gated-commit]
     runs-on: ubuntu-latest
     steps:
@@ -150,6 +171,9 @@ jobs:
         run: |
           python3 scripts/check-env-doc.py
           python3 tests/scripts/test_check_env_doc.py
+      - name: The gate bring-up script resolves its values or refuses
+        run: |
+          python3 tests/scripts/test_gate_bringup.py
       - name: The docs site's content invariants hold
         run: |
           python3 scripts/check-site.py
@@ -165,6 +189,10 @@ jobs:
         run: |
           python3 scripts/check-fp4-resident-consistency.py
           python3 tests/scripts/test_check_fp4_resident_consistency.py
+      - name: An arch-independent CUDA op is registered from an unconditional TU
+        run: |
+          python3 scripts/check-cuda-op-arch-gate.py --report
+          python3 tests/scripts/test_check_cuda_op_arch_gate.py
       - name: Model decode is born on the runner (device-resident logits)
         run: |
           python3 scripts/check-runner-routing-consistency.py
@@ -230,6 +258,14 @@ jobs:
         # whether a checker should catch the class; this closes the instance.
         run: |
           python3 tests/scripts/test_main_baseline.py
+      - name: Preflight never reports green over a block that did not run
+        # Registered in TWO places, like the baseline suite above: here and in
+        # the `SUITES` array of `scripts/agent-preflight.sh`. This lane is the
+        # one that matters more of the two, because the defect it pins (#998)
+        # is preflight lying about ITSELF, and a suite that only ever runs from
+        # the script it audits is checked by exactly the run it cannot trust.
+        run: |
+          python3 tests/scripts/test_agent_preflight_skip_report.py
       - name: Protocol prose matches the checkers that enforce it
         # PART tree-scoped, PART diff-scoped, and the two must be told apart on
         # the baseline lane (#274). `documentation-checkpoint` and
@@ -254,6 +290,22 @@ jobs:
             tests.scripts.test_check_commit_trailers
           python3 tests/scripts/test_check_prompt_contract.py
           python3 tests/scripts/test_agent_gates.py
+      - name: A citation that names a symbol still finds it (#1143, #1139)
+        # The tree already carried 539 `path::Symbol` citations and had never
+        # checked one. Line anchors are what rot: one 45-line insertion near the
+        # top of `model_loader.cpp` moved 203 references at once, in files that
+        # change never opened (#1143), and a pin advance left three upstream
+        # line anchors on one row pointing at unrelated code (#1139).
+        #
+        # NOT the #911 shape. The expectation is the symbol name written by the
+        # citing author and read from the CITING file; only the evidence comes
+        # from the cited one. `--self-test` sweeps the fixture corpus in both
+        # directions. The upstream half needs an oracle checkout this runner
+        # does not have, so it stays opt-in behind `--upstream-root`.
+        run: |
+          python3 scripts/check-symbol-anchors.py
+          python3 scripts/check-symbol-anchors.py --self-test
+          python3 tests/scripts/test_check_symbol_anchors.py
       - name: NOW.md stays a short one-Read resume surface
         run: |
           python3 scripts/check-now-current.py
@@ -434,7 +486,15 @@ jobs:
     # protocol's ban on network calls is about a CHECKER failing on
     # connectivity; this falls back to `before` when the query returns nothing,
     # so a failed query is the status quo rather than a skipped gate.
-    if: github.event.action != 'closed' && (github.event_name == 'push')
+    #
+    # It runs on EVERY lane except a closed pull request, and resolves a sha
+    # only on the push lane -- there is no gated `main` run to find for a pull
+    # request or a schedule. The wider condition is deliberate: `agent-record`
+    # may not carry an `if:` of its own without un-registering three checkers
+    # (#873), so this job's condition is the closed-PR guard it inherits through
+    # `needs:`. A skipped dependency skips its dependents, which is the same
+    # skip #822 asked for, expressed where a checker can still see the gate.
+    if: github.event.action != 'closed'
     runs-on: ubuntu-latest
     permissions:
       actions: read
@@ -447,11 +507,18 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           BRANCH: ${{ github.ref_name }}
+          EVENT_NAME: ${{ github.event_name }}
         run: |
           set -eu
-          sha="$(gh api \
-            "repos/$REPO/actions/workflows/ci.yml/runs?branch=$BRANCH&event=push&status=success&per_page=1" \
-            --jq '.workflow_runs[0].head_sha' 2>/dev/null || true)"
+          # Only the push lane has a gated `main` history to resolve against.
+          # Every other lane leaves this EMPTY and its consumers fall back,
+          # which is what they already do when the query finds nothing.
+          sha=""
+          if [ "$EVENT_NAME" = "push" ]; then
+            sha="$(gh api \
+              "repos/$REPO/actions/workflows/ci.yml/runs?branch=$BRANCH&event=push&status=success&per_page=1" \
+              --jq '.workflow_runs[0].head_sha' 2>/dev/null || true)"
+          fi
           # NOT `[ ... ] && sha=""`: that returns non-zero when the test is
           # false, which aborts the step under `set -e`.
           if [ "$sha" = "null" ]; then sha=""; fi
@@ -798,7 +865,23 @@ jobs:
     # Native Windows release portability must be proven before merge. This PR
     # lane calls the authoritative driver but retains no artifact and has no
     # release, upload, write-token, or OIDC authority (#117).
-    if: github.event.action != 'closed' && (github.event_name == 'pull_request')
+    #
+    # IT RUNS ON THE BASELINE LANE TOO (#503). The condition was
+    # `github.event_name == 'pull_request'` alone until 2026-08-17, so `main`
+    # could establish neither green nor red under MSVC. `scripts/main-baseline.py`
+    # then printed GREEN *because* the lane it grades never started this job --
+    # absence wearing success's face, which is the exact defect #274 was filed
+    # about, reached by a different route. Measured on the deliberate
+    # workflow_dispatch baseline 32044993401 (`conclusion=success`): both
+    # windows-msvc-* jobs `skipped`. The cost of that was not theoretical --
+    # #503, #603, #729, #965, #968 and #1068 each landed on `main` unseen and
+    # then surfaced as a red on an unrelated contributor's pull request.
+    #
+    # `push` stays EXCLUDED. That lane is cancellable by construction and cannot
+    # answer "is main green" (see the `schedule` comment above), and at the 55
+    # pushes/day measured there, two `windows-2022` runners per push is a bill
+    # rather than a baseline.
+    if: github.event_name == 'pull_request' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     permissions:
       contents: read
     runs-on: windows-2022
@@ -820,8 +903,10 @@ jobs:
             -BuildDir $env:GITHUB_WORKSPACE/build-pr-windows-cpu
   windows-msvc-vulkan:
     # Independent Vulkan build/loader/backend proof on the native MSVC ABI.
-    # Like the CPU lane it is PR-only, read-only, and retains no release asset.
-    if: github.event.action != 'closed' && (github.event_name == 'pull_request')
+    # Like the CPU lane it is read-only and retains no release asset, and it
+    # answers for the same three events for the same reason (#503): a baseline
+    # that silently excludes a compiling gate certifies less than it claims.
+    if: github.event_name == 'pull_request' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     permissions:
       contents: read
     runs-on: windows-2022
@@ -892,6 +977,46 @@ jobs:
             echo "Running test_ops_matmul_elem with VT_CPU_MATMUL_TIER=${tier}"
             VT_CPU_MATMUL_TIER="${tier}" build/tests/test_ops_matmul_elem
           done
+  build-newest-gcc:
+    # COMPILE-ONLY coverage on a compiler NEWER than any other lane's. Every
+    # other Linux lane installs the distro `g++`, which on ubuntu-latest is
+    # gcc 13, so a header that only compiles because of a TRANSITIVE include
+    # goes green here and red on a current distro. That is not hypothetical:
+    # ::getpid without <unistd.h> was fixed once and came back in five more
+    # files, one of them src/vllm/entrypoints/openai/server_main.cpp — a
+    # SHIPPED binary that does not build on gcc 16 (reported on issue #41).
+    #
+    # Deliberately does NOT run ctest: this lane exists to catch compile-time
+    # portability, and build-test-cpu already owns execution. Keeping it to a
+    # build is roughly one extra compile per PR.
+    concurrency:
+      group: ci-build-newest-gcc-${{ github.event_name }}-${{ github.ref }}-${{ github.repository }}
+      cancel-in-progress: ${{ github.event_name != 'schedule' && github.event_name != 'workflow_dispatch' }}
+    if: github.event.action != 'closed'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    container: gcc:16
+    steps:
+      - name: Install build tools
+        # The gcc image ships the toolchain only; git is needed BEFORE checkout
+        # so actions/checkout uses git rather than the slower tarball path.
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            ca-certificates cmake git ninja-build python3
+          rm -rf /var/lib/apt/lists/*
+      - uses: actions/checkout@v4
+      - name: Report the compiler this lane is actually pinning
+        run: g++ --version
+      - name: Configure
+        run: |
+          cmake -S . -B build-newest-gcc -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DVLLM_CPP_BUILD_TESTS=ON
+      - name: Build
+        # Same bounded parallelism as build-test-cpu: a bare -j OOM-kills the
+        # runner during the parallel link of the test executables.
+        run: cmake --build build-newest-gcc -j 2
   build-test-cpu-arm64:
     # Independent Arm execution evidence: the x86 lane cannot prove HWCAP
     # dispatch, Arm instructions, or the host ABI. The native runner exercises
@@ -1033,6 +1158,11 @@ jobs:
     # On the day this lands the first run is EXPECTED RED, on the six sanitizer
     # failures of #274 finding #1 / #301. That is the correct first verdict. A
     # baseline that hid them would certify nothing.
+    #
+    # The same applies to `windows-msvc-cpu`, joined here on 2026-08-17 (#503).
+    # It is red on #584 -- `test_openai_api_server.exe` fast-fails with
+    # 0xC0000409 -- so the baseline reports RED from the moment it can see that
+    # lane at all. It reported GREEN before only because it never ran it.
     if: always() && github.event.action != 'closed' && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
     needs:
       - agent-record
@@ -1041,6 +1171,8 @@ jobs:
       - vulkan-spirv-freshness
       - build-test-vulkan
       - device-leakage
+      - windows-msvc-cpu
+      - windows-msvc-vulkan
       - build-test-cpu
       - build-test-cpu-arm64
       - sanitize-cpu
