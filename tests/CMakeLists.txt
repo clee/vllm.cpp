@@ -404,6 +404,9 @@ vllm_cpp_add_test(test_linear_method vllm/model_executor/layers/test_linear_meth
 target_include_directories(test_linear_method PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_decode_graph_sizes vllm/models/test_decode_graph_sizes.cpp)
 vllm_cpp_add_test(test_qwen35_paged_forward vllm/models/test_qwen35_paged_forward.cpp)
+# GDN-MOE-BF16-OUT (#1168): the MoE forward's GDN output-activation dtype probe
+# lives in the not-installed qwen3_5_internal.h, beside the other detail:: seams.
+target_include_directories(test_qwen35_paged_forward PRIVATE ${CMAKE_SOURCE_DIR}/src)
 # MoE vision tower (#891): the tower is loaded (and its ABSENCE refused by name)
 # and the forked VL forward actually CONSUMES the merger rows.
 vllm_cpp_add_test(test_qwen3_5_moe_vision vllm/models/test_qwen3_5_moe_vision.cpp)

@@ -22,8 +22,12 @@
 #include <cstring>
 #include <vector>
 
+#include <memory>
+
+#include "vllm/model_executor/models/model_registry.h"
 #include "vllm/model_executor/models/qwen3_5.h"
 #include "vllm/model_executor/models/qwen3_5_weights.h"
+#include "vllm/model_executor/models/qwen3_5_internal.h"
 #include "vllm/transformers_utils/hf_config.h"
 #include "vllm/v1/attention/backend.h"
 #include "vllm/v1/attention/backends/gdn_attn.h"
@@ -37,6 +41,8 @@ using vllm::OwnedTensor;
 using vllm::PagedKvCache;
 using vllm::Qwen3_5Model;
 using vllm::Qwen3_5MoeWeights;
+using vllm::ModelForwardInput;
+using vllm::ModelRegistry;
 using vllm::v1::CommonAttentionMetadata;
 using vllm::v1::GDNAttentionMetadata;
 using vt::DType;
@@ -461,4 +467,56 @@ TEST_CASE("qwen35 paged: GDN state zeroing protects a fresh req in a mixed batch
   MESSAGE("mixed-batch fresh-A vs standalone-A max|diff| = " << d
           << " (garbage-seeded mamba block, zeroing must scrub)");
   CHECK(d < 1e-2);
+}
+
+// GDN-MOE-BF16-OUT (#1168). The GDN recurrence output `dcore` and the `z` gate
+// are the two largest OUTPUT-side activations of a GDN layer, and on a MoE
+// checkpoint both were f32 while vLLM keeps them at the bf16 model dtype:
+// `core_attn_out = torch.zeros(..., dtype=hidden_states.dtype)`
+// (vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py:870-873 @
+// 5559679) and `z` is a split of the bf16 in_proj_qkvz output (:843, :859-860).
+// Nothing upstream branches on dense vs MoE; vLLM resolves one model dtype and
+// every layer inherits it.
+//
+// This case enters through ModelRegistry::Forward on a MoE config — the
+// production entry point, over the registered MoE factory's own forward — and
+// asks what the GDN block RAN, read off `dcore`'s tensor and the projected gate
+// rather than off the GdnOutDType predicate. A test that called the predicate
+// would prove the predicate answers; AGENTS.md's "Nothing lands dead" wants the
+// capability, and the reviewer's mutation is to restore the `dense_model` form
+// of GdnOutDType, which must turn this red.
+//
+// No token gate can see this axis: f32 is the MORE precise deviation, so the
+// goldens pass either way while the path moves twice the bytes.
+TEST_CASE("qwen35 paged MoE: the GDN recurrence output and z gate are bf16") {
+  const HfConfig c = MakeConfig();
+  REQUIRE(c.num_experts > 0);  // the arm that used to resolve f32.
+  const Qwen3_5MoeWeights w = MakeWeights(c);
+  vt::Queue q = Q();
+  const int64_t T = 6;
+  const std::vector<int32_t> ids = {5, 9, 2, 31, 17, 3};
+  const std::vector<int32_t> pos = {0, 1, 2, 3, 4, 5};
+  const std::vector<int32_t> logits_indices;
+
+  CachePool pool(c, /*num_blocks=*/8, /*block_size=*/8);
+  const CommonAttentionMetadata am = PrefillAttnMeta(T, {0, 1}, 8, 0);
+  const GDNAttentionMetadata gm = PrefillGdnMeta(T, 0);
+
+  vllm::detail::ResetGdnOutActivationDTypes();
+  std::unique_ptr<vllm::LoadedModel> model =
+      vllm::BorrowQwen3_5MoeLoadedModel(w);
+  ModelForwardInput in{ids, pos, am, gm, pool.attn_kv, pool.gdn_state,
+                       c,   q,   logits_indices};
+  in.num_reqs = 1;
+  const vllm::ForwardLogits logits = ModelRegistry::Forward(*model, in);
+  CHECK((logits.host.size() == static_cast<size_t>(T * c.vocab_size) ||
+         logits.on_device()));
+
+  // `observed` separates "the forward produced f32" from "the forward never
+  // reached a paged GDN layer", which look identical to a dtype comparison.
+  const vllm::detail::GdnOutActivationDTypes dt =
+      vllm::detail::LastGdnOutActivationDTypes();
+  REQUIRE(dt.observed);
+  CHECK(dt.core_out == DType::kBF16);
+  CHECK(dt.z_gate == DType::kBF16);
 }

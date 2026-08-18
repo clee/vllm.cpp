@@ -34,8 +34,8 @@ struct GDNAttentionMetadata;
 // the real forward's embed target) through EITHER the merged single-GEMM arm
 // (`merged=true`) or the exact two legacy fp8 GEMMs, and return the
 // concatenation [mixed_qkv | z] as [T*(conv_dim+value_dim)] f32. `z` is
-// produced at BF16 when `z_bf16` (the 27B dense default `GdnOutDType`) and
-// upcast on the way out, so the two arms are directly byte-comparable. The
+// produced at BF16 when `z_bf16` (the `GdnOutDType` default, on every arm since
+// #1168) and upcast on the way out, so the two arms are directly byte-comparable. The
 // merged arm is byte-identical to the split arm by construction; this proves it
 // on the real fp8 GEMM. CUDA-only (the fp8 W8A8 path is). Defined in
 // qwen3_5.cpp.
@@ -62,7 +62,6 @@ namespace vllm::detail {
 struct GdnPackedDecodeEligibility {
   bool runtime_enabled = false;
   bool cuda = false;
-  bool dense_model = false;
   bool has_packed_ba = false;
   bool merged_ba_enabled = false;
   bool dtype_compatible = false;
@@ -84,8 +83,8 @@ bool ShouldUsePackedGdnDecode(const GdnPackedDecodeEligibility& eligibility);
 // wires into GdnPackedDecodeEligibility (qwen3_5.cpp GdnBlockPaged):
 // PackedGdnDecodeRuntimeEnabled (VT_GDN_PACKED_DECODE), MergedGdnBaEnabled
 // (master VT_GDN_MERGED_PROJ + leaf VT_GDN_MERGED_BA), and dtype_compatible —
-// GdnInDType (VT_GDN_IN_BF16) == BF16, GdnOutDType dense default
-// (VT_GDN_OUT_BF16) == BF16, MergedGdnBaOutputDType(packed)
+// GdnInDType (VT_GDN_IN_BF16) == BF16, GdnOutDType (VT_GDN_OUT_BF16) == BF16 —
+// its default on every arm since #1168 — MergedGdnBaOutputDType(packed)
 // (VT_GDN_BA_OUT_BF16) == BF16. Splitting BA (master OR leaf) or reverting any
 // coupled dtype therefore deselects packed and runs the decomposed recurrence:
 // the gate's dispatch-count contract must expect ZERO packed launches on those
@@ -140,8 +139,10 @@ vt::DType GdnProjectedMixedQkvDType(const GdnMixedQkvDTypeInputs& in);
 // Terms are PERF-FP8-ALPHA-FOLD's own, verbatim: the opt-in toggle
 // (`VT_GDN_FP8_IN_BF16`, default OFF), `indt == BF16` so `VT_GDN_IN_BF16`'s
 // documented rollback still restores f32 on this arm too, and `outdt == BF16`,
-// which confines the narrowing to the dense 27B (the 35B is MoE, so
-// `GdnOutDType` is f32 there and this stays inert).
+// which keeps the chain dtype-uniform. That third term used to be described as
+// what "confines the narrowing to the dense 27B, since the 35B is MoE and
+// `GdnOutDType` is f32 there"; #1168 made `outdt` BF16 on both arms, so the
+// DEFAULT-OFF toggle is now the only thing keeping this inert on the 35B.
 vt::DType GdnFp8MergedMixedQkvDType(bool fp8_in_bf16_enabled, vt::DType in_dtype,
                                     vt::DType out_dtype);
 
@@ -164,7 +165,7 @@ vt::DType GdnFp8MergedMixedQkvDType(bool fp8_in_bf16_enabled, vt::DType in_dtype
 struct GdnPackedDecodeDTypes {
   vt::DType mixed_qkv = vt::DType::kF32;  // post-conv activation (== mixed.dtype)
   vt::DType ba_out = vt::DType::kF32;     // MergedGdnBaOutputDType(packed)
-  vt::DType core_out = vt::DType::kF32;   // dcore, GdnOutDType(dense)
+  vt::DType core_out = vt::DType::kF32;   // dcore, GdnOutDType()
   vt::DType ssm_state = vt::DType::kF32;  // the recurrent cache, independent
 };
 
@@ -185,12 +186,31 @@ bool GdnPackedDecodeDTypesCompatible(const GdnPackedDecodeDTypes& dtypes);
 // unaffected.
 bool PackedGdnDecodeFp8TowerFlagIsOn(const char* env_value);
 
+// GDN-MOE-BF16-OUT (#1168). VT_GDN_OUT_BF16, DEFAULT ON — the whole decision
+// behind `GdnOutDType()`, which resolves the dtype of the GDN recurrence output
+// `dcore` [T,Hv,Dv], the `z` output gate, and the gated-RMSNorm weight that has
+// to match them. Parsed here rather than at the getenv so the CPU tier can pin
+// the truth table, the same way PackedGdnDecodeFp8TowerFlagIsOn is; the resolver
+// caches its getenv in a function-local static, so a process observes exactly
+// one value of it and the table cannot be asked of the resolver itself.
+//
+// Note the POLARITY differs from the flag above: this one is default ON and only
+// a leading '0' turns it off, matching VT_GDN_IN_BF16 and the `out_bf16` term
+// PackedGdnDecodeEnvSelected already mirrors. There is no model-shape argument.
+// `GdnOutDType` used to take a `bool dense_model` and default to it, which made
+// every MoE checkpoint f32 while vLLM keeps both tensors at the one model dtype
+// it resolves for every layer (qwen_gdn_linear_attn.py:870-873, :843, :459-465 @
+// 5559679).
+bool GdnOutBf16FlagIsOn(const char* env_value);
+
 // W2 merged-qkvz dispatch. vLLM always issues one in_proj_qkvz GEMM
 // (qwen_gdn_linear_attn.py:923-936 @ 702f4814); locally the single GEMM is
 // selected only on CUDA with the packed 27B owner resident, the runtime
 // toggles on (VT_GDN_MERGED_PROJ master, VT_GDN_MERGED_QKVZ leaf) and one
 // uniform output dtype (mixed_qkv and z leave one GEMM, so GdnInDType must
-// equal GdnOutDType — the 27B default is BF16/BF16). Every other combination
+// equal GdnOutDType — BF16/BF16 by default on every arm since #1168, so this
+// term no longer excludes a MoE checkpoint; `has_packed_qkvz` still does).
+// Every other combination
 // issues the exact two split GEMMs sliced from the same resident owner.
 struct GdnMergedQkvzEligibility {
   bool runtime_enabled = false;
@@ -269,6 +289,29 @@ struct GdnFp8InProjDebugStats {
 void ResetGdnFp8InProjDebugStats();
 GdnFp8InProjDebugStats GetGdnFp8InProjDebugStats();
 void DisableGdnFp8InProjDebugStats();
+
+// GDN-MOE-BF16-OUT (#1168) — the dtypes the GDN block's two OUTPUT-side
+// activations ACTUALLY carried on the last paged GDN layer this process ran.
+//
+// `GdnOutDType()` is a predicate, and a test that calls it proves only that the
+// predicate answers. This records what `GdnBlockPaged` allocated and projected:
+// `core_out` is `dcore`'s own `[T,Hv,Dv]` tensor dtype and `z_gate` is the dtype
+// `ProjectGdnQkvz` actually emitted for the gate, both read off the tensors
+// after they exist. So a gate can enter through `ModelRegistry::Forward` on a
+// real MoE config and ask what the model ran, which is the question
+// .agents/reachability.md says a unit test over the predicate cannot answer.
+//
+// `observed` is false until a paged GDN layer has run since the last reset. It
+// is the term that separates "the forward produced f32" from "the forward never
+// reached the GDN block", which are the same silence to a dtype comparison.
+struct GdnOutActivationDTypes {
+  bool observed = false;
+  vt::DType core_out = vt::DType::kF32;  // dcore [T,Hv,Dv]
+  vt::DType z_gate = vt::DType::kF32;    // the output gate handed to the norm
+};
+
+void ResetGdnOutActivationDTypes();
+GdnOutActivationDTypes LastGdnOutActivationDTypes();
 
 // Validate the exact prefix that will be uploaded. Negative rows are inert
 // padding; every live slot must be unique and in range. This runs on host
