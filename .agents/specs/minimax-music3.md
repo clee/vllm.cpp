@@ -2553,8 +2553,10 @@ sequence that grows by one row per step, and reads `hidden[:, -1]` each time. Ou
 `Music3DepthStage` implemented that literally — `DepthSequenceEmbeds` then
 `DepthDecoderForward` over the WHOLE sequence, once per CFG branch:
 
-    rows through the decoder, per frame:  2 x (2+3+4+5+6+7+8) = 70,  of which 14 are read
-    rows through the 4096x4096 projection: the same 70,             of which 16 are new
+    rows through the decoder, per frame:   2 x (2+3+4+5+6+7+8) = 70 FORWARDED
+                                           14 READ (2 CFG branches x 7 steps)
+    rows through the 4096x4096 projection: the same 70 PROJECTED
+                                           16 DISTINCT (branch, position) pairs
 
 **Upstream re-runs the sequence too** — its profile shows `depth.forward` at
 7 calls per frame with shapes `(2, 2..8, 4096)` — so nothing was mis-ported.
@@ -2574,6 +2576,14 @@ and returns the row the schedule actually reads.
 
     rows through the decoder, per frame:  16   (2 branches x 8 positions)
     rows through the projection:           9   (3 prefix + 6 appended)
+
+**16 and 9 count different things, and §15.2's "16" is the first of them.** 16 is
+the number of distinct **(branch, position) pairs** a frame has: 2 x 8. 9 is the
+number of distinct **row values** that have to be projected, because the two CFG
+branches share every row except position 0 — 2 last-hidden rows, the shared
+semantic row, and 6 fed-back codes. The decoder must see all 16, one per branch
+per position; the projection sees each value once. Neither number is 14, which is
+what the OLD arm READ (2 branches x 7 steps) out of the 70 rows it forwarded.
 
 Two further things fall out, and both are upstream's own shape rather than
 inventions of ours. The two CFG rows differ ONLY at position 0, so they go
@@ -2619,9 +2629,15 @@ row is now read once for every row in the call instead of once per row.
 * every prefix length 1..`max_position_embeddings`, at BOTH `ArCompute` widths
   (96 values at the goldens' geometry);
 * a **wider** geometry — 8 heads of 8, three layers, the real 8-position
-  schedule, pseudo-random weights — because the committed goldens are 8-wide with
-  ONE head, where `heads * head_dim` and `head_dim` are the same number and a head
-  stride defect is invisible (1024 values);
+  schedule, pseudo-random weights — for coverage BREADTH: 1024 values compared
+  against the goldens' 96, at a head count and a head_dim that differ from each
+  other and from the goldens'. **Not because a head stride is invisible at the
+  goldens' geometry.** That reason was recorded and it was false (#1247):
+  `minimax_music3_ar_goldens.inc` sets `kMusic3DepthHeads` = 2 over
+  `kMusic3DepthHidden` = 8, so the goldens are 2 heads of 4 and
+  `heads * head_dim` (8) is NOT `head_dim` (4). Dropping the head stride from the
+  cached KEY index reds 4 cases / 32 assertions, two of them at the goldens' own
+  geometry;
 * the CFG pair as a batch of 2, each row against its OWN whole-sequence forward,
   plus a check that the two rows have not collapsed into each other;
 * the cache's refusals: a null cache, batch 0, a mis-sized row, a batch change
@@ -2662,17 +2678,47 @@ because it is the whole justification for the engineered case, and M4 because it
 fails by THROWING, so a reader grepping `assertions:` would see a suite that
 "passed" 408 of 408.
 
-**The COMPOSITION leg, and exactly how far it goes.** Nothing in the tree gates
-`Music3DepthStage` itself: `test_minimax_music3_ar_real` exercises
-`DepthDecoderForward`, and `test_minimax_music3_llm_real` checks
-`frame_hiddens[:, :4096]`, which is the language model's half of the row. What
-covers the composed schedule is §15.6's fingerprint: the A/B driver reproduces
-`Music3DepthStage`'s seven steps and two CFG rows at the REAL 4096-wide geometry
-and hashes the [7, 4096] block that function returns, and **all 20 runs on both
-arms printed `f0cfeed6eee4f55d`**. Everything downstream — `AudioHeadLogits`, the
-CFG mix, the top-k draw, the feedback embedding, the acoustic half — is
-unchanged code over that block, and `LinearNoBias`, the one kernel they share
-with this row, is gated bitwise by `test_host_parallel`.
+**The COMPOSITION leg — a fifth case, because the fingerprint was not one
+(#1246).** As first landed, nothing in the tree entered `Music3DepthStage`:
+`test_minimax_music3_ar_real` exercises `DepthDecoderForward`,
+`test_minimax_music3_llm_real` checks `frame_hiddens[:, :4096]`, and the four
+cases above gate `DepthDecoderAppend` one row at a time. The schedule composed on
+top of it — the 3-row prefix projection, position 0 fed for its K/V alone, the
+batch-2 sequencing, the fed-back `(index-1) * audio_vocab_size + drawn`
+projection row — had no gate at all. Deleting the prefix append left all five
+music3 suites GREEN, and so did silently dropping the feedback row, which changes
+the generated song.
+
+**§15.6's fingerprint could not close that**, and that is the correction which
+matters most here: `tools/bench/music3_depth_stage_ab.cpp` is a hand
+TRANSCRIPTION of the schedule, not a call to `Music3DepthStage`. A transcription
+cannot detect divergence between itself and the function it transcribes, and
+nothing compiled it either. Both halves are repaired. The driver is now compiled
+by CI as `vllm_music3_depth_stage_ab_{before,after}` (§15.6), and
+`test_minimax_music3_ar` gains a fifth case that drives the PRODUCTION
+`Music3DepthStage` against a transcription of the whole-sequence schedule it
+replaced — same sampler, same weights, same order of draws — at 8 heads of 8,
+2 layers, 8 codebooks and a 32-entry audio vocabulary, wider than any committed
+geometry and needing no checkpoint. It compares 448 values bitwise, asserts that
+the drawn codes and the draw count agree, and asserts its own teeth (448 of 448
+reference values non-zero).
+
+| # | mutation | result |
+|---|---|---|
+| N8 | delete the 3-row prefix's position-0 K/V append | **RED** 1 case / 2 assertions, the new case ALONE |
+| N9 | silently drop the fed-back projection row | **RED** 1 case / 2 assertions, the new case ALONE |
+
+**What the new case still does NOT reach**, said rather than implied: it enters
+at `Music3DepthStage`, one hop below the top. The remaining hop is the single
+unconditional call in `Music3GenerateFrameHiddens`, which needs the 8.6B language
+model and so has no checkpoint-free driver; the registered speech family reaches
+it through `MiniMaxMusic3SpeechEngine`. Everything downstream of the returned
+block — `AudioHeadLogits`, the CFG mix, the top-k draw, the feedback embedding,
+the acoustic half — is unchanged code, and `LinearNoBias`, the one kernel they
+share with this row, is gated bitwise by `test_host_parallel`. §15.6's
+fingerprint remains what proves the identity at 4096-wide PRODUCTION geometry
+across two separately compiled libraries, which is a leg the unit gate does not
+have; it is no longer asked to be the composition gate as well.
 
 **What is NOT claimed is the WAV pair, and it was attempted.** §12.3's strong
 form — two binaries writing byte-identical audio through five stages and a
@@ -2700,18 +2746,33 @@ estimated.
 **What replaces it.** The depth stage's inner loop is short enough to repeat, so
 the MINIMUM over rounds is available, and a minimum is the least-disturbed sample
 rather than an average of someone else's contention (§12.4's argument, reused
-because the situation is the same). ONE driver source
-(`depthbench.cpp`, in the row's evidence) is compiled twice and linked against
-the two `libvllm.a` builds — `fc163f62b` and that commit plus this change, which
-differ in exactly the four files this row touches. It drives ONE frame of the
+because the situation is the same). ONE driver source —
+`tools/bench/music3_depth_stage_ab.cpp`, in the tree, and NOT the
+`depthbench.cpp` an earlier revision of this paragraph named — is compiled twice
+and linked against the two `libvllm.a` builds. The BEFORE arm is **`fc163f62b`**,
+the `row/MUSIC3-PERF-VS-ORACLE` head; the AFTER arm is that commit plus this
+change, and they differ in exactly the four files this row touches. The benchmark
+record carried `origin/main` `727163997` in its heading beside `fc163f62b` in its
+body; `727163997` is only the `origin/main` commit `fc163f62b` had merged, the
+delta between them is #1231's profiler alone, and the driver never enters it
+(#1247).
+
+**CI now COMPILES that driver, both arms, and runs neither.** It reaches internal
+headers and `LinearNoBias`, it is the only artifact a reader can reproduce this
+section from, and nothing built it — so the next signature change would have
+rotted it silently. `CMakeLists.txt` builds it as the OBJECT libraries
+`vllm_music3_depth_stage_ab_{before,after}`, linked nowhere, so no weight is ever
+allocated and CI's runtime is unchanged. The guard paid for itself on its first
+run: the file did not compile under the project's own `-Werror=comment`. It drives ONE frame of the
 depth stage as `Music3DepthStage` drives it: seven codebook steps, two CFG rows,
 the projection and the decoder, with a fixed code per step so the two arms
 traverse identical rows. `DepthDecoderConfig`'s defaults are the real 4096 / 4 /
 16 / 6144 / 8 geometry, and the weights are 2.5 GB of seeded pseudo-random floats
 drawn identically on both arms.
 
-Eight alternating pairs across two series (base, new, base, new, ...), 12 timed
-rounds per arm:
+Eight alternating pairs across two series (base, new, base, new, ...). Series A
+is 5 pairs x 1 round and series B is 3 pairs x 4 rounds, so **17 timed rounds per
+arm** across **16 processes**:
 
 | series | BEFORE rounds (s) | AFTER rounds (s) | pair ratio |
 |---|---|---|---|
@@ -2726,11 +2787,13 @@ visibly higher on BOTH arms, which is what the minimum exists to discard. Series
 B's third pair is the loudest on both arms and is kept rather than dropped.
 
 **And the bit-identity holds AT THIS GEOMETRY, which is a leg the unit gate does
-not have.** Each arm printed an FNV-1a fingerprint of the frame's 28 672 depth
-hidden values, and **all 20 runs on both arms printed
-`f0cfeed6eee4f55d`**. §15.5 gates reduced dimensions against the reference
-forward; this gates 4096-wide production geometry across two separately compiled
-libraries.
+not have.** The driver computes an FNV-1a fingerprint of the frame's 28 672 depth
+hidden values every round and prints ONE line per process, after the round loop.
+The table is 8 alternating pairs x 2 arms, so **16 processes printed one
+fingerprint each and all 16 read `f0cfeed6eee4f55d`**. An earlier revision said
+"all 20 runs", which is neither the 17 rounds per arm nor the 16 processes
+(#1247). §15.5 gates reduced dimensions against the reference forward; this gates
+4096-wide production geometry across two separately compiled libraries.
 
 #### 3.5x, not 8.75x — recorded because the gap is the finding
 

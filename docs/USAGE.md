@@ -2248,11 +2248,14 @@ clock window, so its rows are a within-run **split** and must not be quoted as
 per-kernel or cross-box figures.
 
 If you want to price the depth stage on your own box without generating a song,
-`tools/bench/music3_depth_stage_ab.cpp` drives one frame of it directly. It is
-deliberately not a build target — it allocates 2.5 GB and is a two-build A/B —
-and its header carries the exact `g++` and run lines. Alternate the arms and take
-the minimum; it prints a fingerprint of its output so a "speedup" that changed
-the answer cannot be mistaken for one that did not.
+`tools/bench/music3_depth_stage_ab.cpp` drives one frame of it directly. Nothing
+RUNS it — it allocates 2.5 GB and is a two-build A/B, which one target could not
+express — but both arms are COMPILED, as the never-linked OBJECT libraries
+`vllm_music3_depth_stage_ab_{before,after}`, so it cannot rot behind a signature
+change while still being the artifact the §15.6 measurement is reproducible from
+(#1246). Its header carries the exact `g++` and run lines. Alternate the arms and
+take the minimum; it prints one fingerprint per process, after its round loop, so
+a "speedup" that changed the answer cannot be mistaken for one that did not.
 
 **Measured, so expectations are calibrated rather than hoped for.** On a Jetson
 Thor (sm_110, 14 cores) the device arm was *slower* on a two-frame request

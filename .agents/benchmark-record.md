@@ -22961,7 +22961,7 @@ untried route is a CUDA 12.x toolkit for that driver; it was not pursued, becaus
 dgx gate had already answered the question orin was there to support. No lease held;
 `orin:gpu0` returned to ready.
 
-## MUSIC3-DEPTH-INCREMENTAL — the depth stage, whole-sequence vs incremental, x86-64 20-core (2026-08-18, `row/MUSIC3-DEPTH-SPEED`, base `origin/main` `727163997`, #672)
+## MUSIC3-DEPTH-INCREMENTAL — the depth stage, whole-sequence vs incremental, x86-64 20-core (2026-08-18, `row/MUSIC3-DEPTH-SPEED`, BEFORE arm `fc163f62b`, #672)
 
 **Not a parity ratio and not an end-to-end number.** A STAGE A/B between two
 builds of this project: `fc163f62b` (the `row/MUSIC3-PERF-VS-ORACLE` head this
@@ -22969,6 +22969,20 @@ change was measured against) and that commit plus `row/MUSIC3-DEPTH-SPEED`,
 which differ in exactly four files. No reference leg; SGLang-Omni is still
 `gateable = no` and every axis in `docs/BENCHMARKS.md` against it stays
 `PENDING`.
+
+**ONE base, and which one (#1247).** An earlier revision of this heading named
+`origin/main` `727163997` while the paragraph above named `fc163f62b`, and the
+two are not the same commit. The BEFORE arm that was BUILT AND TIMED is
+**`fc163f62b`**; `727163997` is only the `origin/main` commit it had merged, so
+it belongs in this sentence rather than in the heading. The delta between them is
+`7a2dabd65`, #1231's per-stage profiler and nothing else, and the driver never
+enters it: every function the driver calls lives in
+`src/vllm/model_executor/models/minimax_music3_ar.cpp`, which contains zero
+`profile::` uses, while `music3_profile.h` is included only by
+`minimax_music3_llm.cpp` and `minimax_music3_speech.cpp`. So the measurement
+stands as taken; what was wrong was the record. `fc163f62b` is reachable from
+`origin/row/MUSIC3-PERF-VS-ORACLE` and is NOT an ancestor of this row's head —
+that profiler reached `main` as the squashed `aba8d5ffb`, which is.
 
 ### What is timed
 
@@ -22990,8 +23004,8 @@ two `libvllm.a` builds, the shape §12.4 used:
 
     g++ -O3 -std=c++20 -ffp-contract=off -I<wt>/include -I<wt>/src \
         -I<wt>/build/include -isystem <wt>/third_party [-DMUSIC3_AFTER] \
-        depthbench.cpp -o depthbench-<arm> <wt>/build/libvllm.a \
-        <wt>/build/libblake3_vendored.a -lpthread
+        tools/bench/music3_depth_stage_ab.cpp -o depthbench-<arm> \
+        <wt>/build/libvllm.a <wt>/build/libblake3_vendored.a -lpthread
 
 ### Why the minimum, and what was NOT run
 
@@ -23007,7 +23021,7 @@ The Thor per-stage pair, which is the one that prices this against #1231's own
 `ar.depth_forward` = 347.3 s / 1414 calls, is **QUEUED on `thor:gpu0`** behind
 two other jobs and is PENDING, not estimated.
 
-### Result — 8 alternating pairs, 12 timed rounds per arm
+### Result — 8 alternating pairs, 17 timed rounds per arm
 
 | series | BEFORE (s) | AFTER (s) | pair ratio |
 |---|---|---|---|
@@ -23026,11 +23040,18 @@ B pair 3 is the loudest on BOTH arms and is kept rather than dropped.
 
 ### Bit-identity at production geometry
 
-Each run printed an FNV-1a fingerprint of the frame's 28 672 depth hidden values.
-**All 20 runs on both arms printed `f0cfeed6eee4f55d`.** The unit gate
-(`test_minimax_music3_ar`, 31 cases / 461 assertions) proves the identity against
-the reference forward at reduced dimensions; this proves it 4096-wide, across two
-separately compiled libraries.
+**16 processes, one printed fingerprint each, all `f0cfeed6eee4f55d`.** The
+denominator is stated exactly because it is the evidence (#1247). The table above
+is 8 alternating pairs x 2 arms = **16 processes**, carrying 5 + 12 = **17 timed
+rounds per arm**; `music3_depth_stage_ab.cpp` computes the FNV-1a fingerprint of
+the frame's 28 672 depth hidden values every round but prints ONE line per
+process, after the round loop, so 16 fingerprints were printed and every one of
+them read `f0cfeed6eee4f55d`. An earlier revision said "all 20 runs", which is
+neither the round count nor the process count.
+
+The unit gate (`test_minimax_music3_ar`, 32 cases / 470 assertions) proves the
+identity against the reference forward at reduced dimensions; this proves it
+4096-wide, across two separately compiled libraries.
 
 ### 3.5x, not the 8.75x the byte accounting predicts
 

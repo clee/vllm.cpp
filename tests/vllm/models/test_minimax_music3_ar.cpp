@@ -33,6 +33,8 @@
 
 #include "minimax_music3_ar_goldens.inc"
 #include "vllm/model_executor/models/minimax_music3_ar.h"
+#include "vllm/model_executor/models/minimax_music3_llm.h"
+#include "vt/dtype.h"
 
 namespace {
 
@@ -714,12 +716,22 @@ TEST_CASE("music3 ar: the incremental depth decode is BIT-IDENTICAL to the whole
 }
 
 TEST_CASE("music3 ar: the incremental depth decode holds at a WIDER geometry") {
-  // The committed goldens are 8-wide with ONE head, so the case above cannot see
-  // a head-indexing defect in the cached attention at all — `heads * head_dim`
-  // and `head_dim` are the same number there. This one is 8 heads of 8, three
-  // layers and the real 8-position depth schedule, on pseudo-random weights, so
-  // the head stride is exercised and the comparison covers 1024 values instead
-  // of 96.
+  // COVERAGE BREADTH, not a blind spot in the case above. An earlier revision of
+  // this comment said the goldens are "8-wide with ONE head", so that a head
+  // stride is invisible there. That is FALSE (#1247) and the correction is
+  // measured:
+  // `minimax_music3_ar_goldens.inc` sets `kMusic3DepthHeads` = 2 over
+  // `kMusic3DepthHidden` = 8, so the goldens are 2 heads of 4 and
+  // `heads * head_dim` (8) is NOT `head_dim` (4). Dropping the head stride from
+  // the cached KEY index — every head reading head 0's keys — reds 4 cases / 32
+  // assertions here, and TWO of them are golden-geometry cases: the bit-identity
+  // case above and the batched one below.
+  //
+  // What this case adds is reach, which is worth having on its own. 8 heads of
+  // 8, three layers, the real 8-position schedule and pseudo-random weights:
+  // 1024 values compared where the goldens compare 96, at a head count and a
+  // head_dim that differ from each other AND from the goldens'. It is also one
+  // of the two cases that catch a batch-history defect.
   m3::DepthDecoderConfig config;
   config.hidden_size = 64;
   config.num_layers = 3;
@@ -988,6 +1000,177 @@ TEST_CASE("music3 ar: the incremental depth cache refuses what it cannot hold, b
   CHECK(cache.positions == config.max_position_embeddings);
   CHECK_THROWS_AS(m3::DepthDecoderAppend(row, 1, config, weights, m3::ArCompute::kFloat32, &cache),
                   std::runtime_error);
+}
+
+TEST_CASE("music3 ar: the COMPOSED depth stage is BIT-IDENTICAL to the schedule it replaced") {
+  // WHY THIS CASE EXISTS, and why the four above do not cover it. Those gate
+  // `DepthDecoderAppend` — ONE row against ONE whole-sequence forward. They say
+  // nothing about the SCHEDULE `Music3DepthStage` composes out of it: the 3-row
+  // prefix projection, position 0 fed for its K/V alone, the batch-2 call
+  // sequencing, and the fed-back `(index-1) * audio_vocab_size + drawn`
+  // projection row. Silently dropping the feedback row changes the generated
+  // song and leaves every other case in this file GREEN, and so does deleting
+  // the prefix append; both were measured, not supposed (#1246).
+  //
+  // So this drives the PRODUCTION function — `Music3DepthStage`, the one
+  // `Music3GenerateFrameHiddens` calls, which is how the registered speech
+  // family reaches this row's change — against a TRANSCRIPTION of the
+  // whole-sequence schedule it replaced (`DepthSequenceEmbeds` +
+  // `DepthDecoderForward` per CFG branch, encoders.py:117-142), with the same
+  // sampler, the same weights and the same order of draws. No checkpoint: this
+  // path reads `lm_config.hidden_size` and the embedding rows `EmbedRow`
+  // serves, and nothing else.
+  //
+  // The geometry is WIDER than any committed golden — 8 heads of 8, the full
+  // 8-codebook schedule, a 32-entry audio vocabulary — so the head stride, all
+  // seven steps and the feedback row index are exercised together.
+  m3::DepthDecoderConfig config;
+  config.hidden_size = 64;
+  config.num_layers = 2;
+  config.num_attention_heads = 8;
+  config.intermediate_size = 96;
+  config.audio_vocab_size = 32;
+  config.num_codebooks = 8;
+  config.max_position_embeddings = 16;
+  const int64_t H = config.hidden_size;
+  const size_t hidden = static_cast<size_t>(H);
+  const size_t inter = static_cast<size_t>(config.intermediate_size);
+
+  uint32_t state = 0x9E3779B9u;
+  const auto draw = [&state]() {
+    state = state * 1664525u + 1013904223u;
+    return static_cast<float>(static_cast<double>(state >> 8) / 8388608.0 - 1.0) * 0.5f;
+  };
+  const auto fill = [&draw](size_t n) {
+    std::vector<float> v(n);
+    for (size_t i = 0; i < n; ++i) v[i] = draw();
+    return v;
+  };
+
+  m3::DepthDecoderWeights depth;
+  depth.audio_embeddings =
+      fill(static_cast<size_t>(config.audio_vocab_size * config.residual_codebooks()) * hidden);
+  depth.projection = fill(hidden * hidden);
+  depth.pos_embedding = fill(static_cast<size_t>(config.max_position_embeddings) * hidden);
+  depth.norm = fill(hidden);
+  for (int64_t l = 0; l < config.num_layers; ++l) {
+    m3::DepthDecoderLayerWeights layer;
+    layer.input_layernorm = fill(hidden);
+    layer.post_attention_layernorm = fill(hidden);
+    layer.to_q = fill(hidden * hidden);
+    layer.to_k = fill(hidden * hidden);
+    layer.to_v = fill(hidden * hidden);
+    layer.to_out = fill(hidden * hidden);
+    layer.gate_proj = fill(inter * hidden);
+    layer.up_proj = fill(inter * hidden);
+    layer.down_proj = fill(hidden * inter);
+    depth.layers.push_back(std::move(layer));
+  }
+  for (int64_t h = 0; h < config.residual_codebooks(); ++h) {
+    depth.audio_heads.push_back(fill(static_cast<size_t>(config.audio_vocab_size) * hidden));
+  }
+
+  m3::Music3ArWeights weights;
+  weights.depth_config = config;
+  weights.depth = depth;
+  weights.lm_config.hidden_size = H;
+  const int64_t vocab = m3::kAudioCodeOffset + 64;
+  weights.lm_config.vocab_size = vocab;
+  {
+    // bf16 rows, because `EmbedRow` reads the table as the loader stores it. Only
+    // the audio-code window can be reached from here, so only it is filled.
+    std::vector<uint8_t> bytes(static_cast<size_t>(vocab) * hidden * sizeof(uint16_t), 0);
+    uint16_t* const rows = reinterpret_cast<uint16_t*>(bytes.data());
+    for (int64_t t = m3::kAudioCodeOffset; t < vocab; ++t) {
+      for (int64_t j = 0; j < H; ++j) rows[t * H + j] = vt::F32ToBF16(draw());
+    }
+    weights.lm.embed_tokens.bytes = vllm::OwnedBytes(std::move(bytes));
+    weights.lm.embed_tokens.dtype = vt::DType::kBF16;
+    weights.lm.embed_tokens.rank = 2;
+    weights.lm.embed_tokens.shape[0] = vocab;
+    weights.lm.embed_tokens.shape[1] = H;
+  }
+
+  const int32_t semantic_code = 7;
+  const int64_t frame_index = 3;
+  // DISTINCT per branch, which is the whole of what the unconditional row
+  // contributes: two equal rows would hide a schedule that served one to both.
+  const std::vector<float> last_conditional = fill(hidden);
+  const std::vector<float> last_unconditional = fill(hidden);
+
+  // A sampler keyed on the LOGITS rather than on the call order: argmax, ties to
+  // the lowest index. The two schedules agree on a drawn code only if they ask
+  // the same question, in the same order, from the same hidden state.
+  int64_t calls_new = 0;
+  int64_t calls_old = 0;
+  const auto make_sampler = [](int64_t* counter) {
+    return m3::Music3CodeSampler(
+        [counter](const std::vector<float>& probs, const m3::Music3Draw&) -> int64_t {
+          ++*counter;
+          size_t best = 0;
+          for (size_t i = 1; i < probs.size(); ++i) {
+            if (probs[i] > probs[best]) best = i;
+          }
+          return static_cast<int64_t>(best);
+        });
+  };
+
+  std::vector<int32_t> codes_new{semantic_code};
+  const std::vector<float> got =
+      m3::Music3DepthStage(last_conditional, last_unconditional, frame_index, weights,
+                           make_sampler(&calls_new), &codes_new);
+
+  const std::vector<float> semantic_embed =
+      weights.EmbedRow(static_cast<int64_t>(semantic_code) + m3::kAudioCodeOffset);
+  std::vector<float> want;
+  std::vector<int32_t> codes_old{semantic_code};
+  std::vector<int32_t> fed_back;
+  const m3::Music3CodeSampler sampler_old = make_sampler(&calls_old);
+  for (int64_t index = 1; index < config.num_codebooks; ++index) {
+    std::vector<float> hidden_rows[2];
+    for (int row = 0; row < 2; ++row) {
+      const std::vector<float>& last = row == 0 ? last_conditional : last_unconditional;
+      const std::vector<float> embeds = m3::DepthSequenceEmbeds(
+          last, semantic_embed, fed_back, config, depth, m3::ArCompute::kBFloat16);
+      const std::vector<float> states = m3::DepthDecoderForward(
+          embeds, /*seq_len=*/index + 1, config, depth, m3::ArCompute::kBFloat16);
+      hidden_rows[row].assign(states.end() - H, states.end());
+    }
+    // `hidden_parts.append(hidden[:1])` — the CONDITIONAL row alone.
+    want.insert(want.end(), hidden_rows[0].begin(), hidden_rows[0].end());
+    const std::vector<float> conditional =
+        m3::AudioHeadLogits(hidden_rows[0], index - 1, config, depth, m3::ArCompute::kBFloat16);
+    const std::vector<float> unconditional =
+        m3::AudioHeadLogits(hidden_rows[1], index - 1, config, depth, m3::ArCompute::kBFloat16);
+    const std::vector<float> guided =
+        m3::GuidedDepthLogits(conditional, unconditional, m3::kArCfgScale);
+    const std::vector<float> probs = m3::TopKProbabilities(guided, m3::kArSamplingTopK);
+    const int64_t drawn = sampler_old(probs, m3::Music3Draw{frame_index, index});
+    codes_old.push_back(static_cast<int32_t>(drawn));
+    // c7 is only ever PREDICTED (encoders.py:139).
+    if (index < config.num_codebooks - 1) fed_back.push_back(static_cast<int32_t>(drawn));
+  }
+
+  const size_t compared =
+      ExpectBitIdentical(got, want, "composed depth stage, conditional hidden rows");
+  CHECK_MESSAGE(codes_new == codes_old, "the two schedules drew different residual codes");
+  CHECK(calls_new == calls_old);
+  CHECK(calls_new == config.residual_codebooks());
+  CHECK(static_cast<int64_t>(codes_new.size()) == config.num_codebooks);
+  CHECK(codes_new[0] == semantic_code);
+  // The teeth, twice over. An all-zero reference block would satisfy the
+  // comparison while proving nothing, and a stage that drew nothing would
+  // satisfy the code check the same way.
+  size_t nonzero = 0;
+  for (const float value : want) {
+    if (value != 0.0f) ++nonzero;
+  }
+  CHECK_MESSAGE(nonzero > 0, "the reference block is all zeros, so nothing here is comparable");
+  CHECK_MESSAGE(calls_new > 0, "no code was drawn, so the draw order is untested");
+  MESSAGE("composed depth stage: " << compared << " values compared BITWISE over "
+                                   << config.residual_codebooks() << " codebook steps x 2 CFG rows, "
+                                   << nonzero << " of " << want.size()
+                                   << " reference values non-zero, " << calls_new << " draws");
 }
 
 TEST_CASE("music3 ar: the audio heads match upstream, one per residual codebook") {

@@ -2,21 +2,29 @@
 // `.agents/specs/minimax-music3.md` §15.6 and benchmark-record's
 // MUSIC3-DEPTH-INCREMENTAL section.
 //
-// DELIBERATELY NOT A REGISTERED TEST TARGET. It allocates 2.5 GB of weights and
-// spends seconds per round, so CI must never build or run it; and it is a
-// TWO-BUILD A/B, so one target could not express it anyway. Compile it TWICE and
-// link it against the two `libvllm.a` builds you want to compare:
+// DELIBERATELY NOT A REGISTERED TEST. It allocates 2.5 GB of weights and spends
+// seconds per round, so CI must never RUN it; and it is a TWO-BUILD A/B, so one
+// target could not express it anyway. CI does COMPILE it, both arms, as the
+// OBJECT libraries `vllm_music3_depth_stage_ab_{before,after}` in CMakeLists.txt
+// — nothing is linked and no weight is ever allocated, and the file cannot rot
+// behind a `LinearNoBias` signature change while still being the only artifact a
+// reader can reproduce §15.6's 3.50x from (#1246).
 //
-//   # the arm WITHOUT the incremental schedule (any commit before it)
-//   g++ -O3 -std=c++20 -ffp-contract=off -I<wt>/include -I<wt>/src \
-//       -I<wt>/build/include -isystem <wt>/third_party \
-//       tools/bench/music3_depth_stage_ab.cpp -o depthbench_before \
-//       <wt>/build/libvllm.a <wt>/build/libblake3_vendored.a -lpthread
-//
-//   # the arm WITH it — the same source, plus -DMUSIC3_AFTER
-//   g++ ... -DMUSIC3_AFTER ... -o depthbench_after ...
-//
-//   ./depthbench_before 4 ; ./depthbench_after 4      # alternate, take the MIN
+// To RUN it, compile it twice and link each against the `libvllm.a` you want to
+// compare. The recipe is in a block comment because a `//` line may not end in a
+// backslash under `-Werror=comment`, which is a rule this file is now inside.
+/*
+    # the arm WITHOUT the incremental schedule (any commit before it)
+    g++ -O3 -std=c++20 -ffp-contract=off -I<wt>/include -I<wt>/src \
+        -I<wt>/build/include -isystem <wt>/third_party \
+        tools/bench/music3_depth_stage_ab.cpp -o depthbench_before \
+        <wt>/build/libvllm.a <wt>/build/libblake3_vendored.a -lpthread
+
+    # the arm WITH it — the same source, plus -DMUSIC3_AFTER
+    g++ ... -DMUSIC3_AFTER ... -o depthbench_after ...
+
+    ./depthbench_before 4 ; ./depthbench_after 4      # alternate, take the MIN
+*/
 //
 // The argument is the number of rounds per process. Take the MINIMUM over rounds
 // and alternate the arms: a shared box makes an average a statement about
