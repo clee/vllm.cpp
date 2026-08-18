@@ -262,7 +262,7 @@ MATRICES = {
     # proves the portable dot is reached at 20.10% of Qwen3.5-2B user cycles;
     # the row owns exact-order C++ SDOT vs scheduled AAPCS64, independent of
     # the broad CPU-backend row.
-    # 52 since 2026-08-06 (#1171): +`KERNEL-GDN-REPLAYSSM`, the ReplaySSM buffered
+    # 52 since 2026-08-18 (#1171): +`KERNEL-GDN-REPLAYSSM`, the ReplaySSM buffered
     # output-only GDN decode. A genuinely new family, not a variant of the packed
     # decode row: it changes WHEN the state is written (every L steps, from a ring
     # of rank-1 factors) rather than how one step is tiled, and it adds three cache
