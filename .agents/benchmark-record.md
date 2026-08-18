@@ -19,12 +19,13 @@ from relative link targets repointed for this file's location.
 
 # Benchmarks
 
-## MODEL-NEMOTRON-H-ABI-A2P — the FIRST Nemotron speed numbers, gated, numerator-only, and the GPU is idle 93.7% of the decode (2026-08-18, `row/MODEL-NEMOTRON-H-ABI-A2P-speed`, #1250, #1253)
+## MODEL-NEMOTRON-H-ABI-A2P — the FIRST Nemotron speed numbers AND the first pinned-oracle model run inside a lease: 0.00139x decode, 2.12x faster load, GPU idle 93.7% of our decode (2026-08-18, `row/MODEL-NEMOTRON-H-ABI-A2P-speed`, #1250, #1253) (2026-08-18, `row/MODEL-NEMOTRON-H-ABI-A2P-speed`, #1250, #1253)
 
-**These are the first speed numbers for `NemotronHForCausalLM` on any axis.
-They are NUMERATOR-ONLY and NO ratio is claimed**, because the pinned oracle
-could not be run to completion on this workload. The denominator's identity is
-pinned and its blocker is measured; both are below.
+**These are the first speed numbers for `NemotronHForCausalLM` on any axis, and
+the denominator is the first pinned-oracle MODEL RUN ever completed inside an
+`rc` lease.** Read the ratios with the two refusals recorded beside them: the
+project's own clock gate REFUSES this pair, and the two sides could not be given
+the same KV pool. Both are stated in full below rather than netted out.
 
 ### Provenance
 
@@ -152,6 +153,67 @@ cannot be matched on block count at all, and a token-capacity match is the most
 that is available: ours is 256 x 32 = 8192 KV tokens, and the oracle's smallest
 comparable pool is 2 x 4192 = 8384. Any future ratio states which of the two it
 matched and does not imply the other.
+### The oracle leg: it ran, in its production shape
+
+Job `7606d1c4-fcc3-4d90-958b-83bcb72786b3`, same box, same boot id, same
+checkpoint directory, same three pre-tokenized prompts, same 32 tokens, greedy,
+`ignore_eos`, batch 1 sequential, `--repeat 2` over one load.
+`vllm 0.1.dev1+g555967922` asserted from `cd /`.
+
+**`enforce_eager=False` throughout: CUDA graphs are ON and were never disabled.**
+Two knobs deviate from vLLM's defaults and both are forced by the box, not
+chosen for flattery: `gpu_memory_utilization=0.30` (default 0.9) and
+`max_num_batched_tokens=512` (matching `max_model_len`). At 0.9 the previous
+attempt took 104,992 MB of a 122,502 MB unified pool and was killed. The
+deviation makes the denominator SMALLER in memory, not faster, and it is named
+here so a reader can price it.
+
+| axis | ours | pinned vLLM | ratio |
+|---|---|---|---|
+| per output token, warm (n=5) | **10.3194 s** | **0.014369 s** | **718.2x slower** |
+| output throughput, batch 1 | **0.09691 tok/s** | **69.595 tok/s** | **0.001392x** |
+| engine load | **280.9 s** | **596.3 s** | **0.4711x — we are 2.12x FASTER** |
+| peak host memory | 44,616 MB | 70,974 MB | 0.629x raw, see caveat |
+| KV pool | 256 x 32 = 8192 tokens | 1258 x 512 = 644,096 tokens | 78.6x, NOT matched |
+
+Oracle warm per-prompt walls 0.427 / 0.470 / 0.465 / 0.472 / 0.465 s, spread
+9.79%; the first prompt after its load was 1.120 s and is excluded on the same
+rule ours is. Oracle load 596.3 s ran with a WARM `torch.compile` cache from the
+previous attempt, so it is not a cold-start figure and our 2.12x load win is
+measured against the friendlier of the two.
+
+**The memory ratio is raw and its caveat is not optional.** The oracle window
+carried a straggler — PID 40514, 22,986 MiB, the EngineCore this row's own
+watchdog killed in the previous job — still resident at that leg's start.
+Subtracting it would give 47,988 MB and 0.930x, and that subtraction is an
+imputation over an aggregate, so it is written here and NOT promoted into the
+table. The KV pools differ by 78.6x anyway, so the memory axis is not
+like-for-like and no memory claim is made from it.
+
+### Two refusals that travel with the ratio
+
+**1. The clock gate refuses this pair, and the refusal is recorded rather than
+waived.** `tools/bench/gpu_clock_state.py compare` exits 1 with six reasons:
+ours 6.31% busy and vLLM 31.05% busy, both below the 50% floor; vLLM's spread
+5.14% above the 5.0% ceiling; ours throttled `SwPowerCap`; persistence
+`Disabled` on both. Same boot id, and both medians 2411 MHz with a
+`median_offset_pct` of 0.0. So the two arms ran at the same clock and the
+WINDOWS do not qualify. What the refusal cannot do is explain the result: the
+tool's own recorded basis is 0.7548 points of kernel time per point of clock,
+and the decode gap is 718x. Three orders of magnitude is not a clock artifact.
+
+**2. The oracle does not reproduce its own committed golden under this
+configuration.** `ORACLE TOKEN MATCH: 180/192` — prompt 2 matched 26/32, in BOTH
+legs identically, so it is deterministic within the configuration and not noise.
+Our side matched 96/96 on the same golden with the same binary. The golden was
+captured at the oracle's own default memory configuration; changing
+`gpu_memory_utilization` and `max_num_batched_tokens` moved its resolved
+`block_size` to 512 and with it the batching and reduction order. The throughput
+comparison survives this — `max_tokens` is fixed at 32 with `ignore_eos`, so both
+sides took the same number of decode steps — but a token-exact gate against this
+golden does NOT survive a change to the oracle's memory configuration, and that
+is a live constraint on how the gate may be re-run.
+
 
 ## MODEL-NEMOTRON-H-ABI-A2P — the A3 gate PASSES on the host, and the device divergence was the STALE input ids (2026-08-18, `row/MODEL-NEMOTRON-H-ABI-A2P-1157`, #1157, #1217, #810)
 

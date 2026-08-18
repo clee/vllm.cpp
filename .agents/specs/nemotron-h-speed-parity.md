@@ -189,41 +189,52 @@ would void it, so the leg sampler records the compute-apps list instead.
 
 ## Owed
 
-- The oracle-side legs, if the oracle leg does not complete.
-- The re-measurement after A2-Q1 and A2-Q2b land, which is the next traceable
-  hypothesis rather than a ceiling.
+- A clock window that satisfies `gpu_clock_state compare`. Both arms failed its
+  majority-busy floor and vLLM failed its spread ceiling, so the ratios are
+  recorded WITH that refusal and are not clock-attributed.
+- The oracle at its DEFAULT `gpu_memory_utilization`, which the box could not
+  hold; and with it, whether the oracle reproduces its own golden 96/96 when its
+  resolved `block_size` is the one the golden was captured at.
+- The re-measurement after A2-Q1 ([#940](https://github.com/mudler/vllm.cpp/issues/940))
+  and A2-Q2b land, which is the next traceable hypothesis rather than a ceiling.
 
 ## Now
 
-**Result: the numerator is MEASURED and gated; the ratio is PENDING the oracle.**
+**Result: MEASURED on every declared axis, with two refusals recorded beside the
+ratios.** Both legs ran on `dgx:gpu0` through `rc run`, same box, same boot id,
+same checkpoint, same prompts, same 32 greedy tokens with `ignore_eos`, batch 1
+sequential, `--repeat 2` over one load each. Tree
+`5325b7b970b67f97a77834e907fc34fb2990b71e`. **`enforce_eager=False`: CUDA graphs
+were on and were never disabled.**
 
-Measured on `dgx:gpu0` through `rc run` (job
-`d5858b36-a03a-4261-94df-5269024e4160`) at tree
-`5325b7b970b67f97a77834e907fc34fb2990b71e`, on an idle box, with all five CUDA
-feature lines `ENABLED for [121a]`:
+| axis | ours | pinned vLLM | ratio |
+|---|---|---|---|
+| per output token, warm (n=5) | 10.3194 s | 0.014369 s | **718.2x slower** |
+| output throughput, batch 1 | 0.09691 tok/s | 69.595 tok/s | **0.001392x** |
+| engine load | 280.9 s | 596.3 s | **0.4711x, we are 2.12x FASTER** |
+| peak host memory | 44,616 MB | 70,974 MB | 0.629x raw, not like-for-like |
+| KV pool | 8192 tokens | 644,096 tokens | 78.6x, could NOT be matched |
 
-- engine load **280.9 s**
-- warm per-output-token **10.3194 s**, output throughput **0.09691 tok/s**,
-  batch 1, over 5 warm prompts with a 0.245% spread
-- peak host memory **44,616 MB** of 122,502
-- `TOKEN MATCH: 96/96 ... mode=decode` on BOTH timing legs, `STRICT PASS`,
-  192/192 tokens; same-binary A/B over one load 1.0016 warm
+**Correctness.** Ours `TOKEN MATCH: 96/96 ... mode=decode`, `STRICT PASS`, on
+BOTH timing legs, 192/192 tokens. The oracle read 180/192 against its OWN
+committed golden, deterministically, because its resolved `block_size` moved to
+512 under the memory configuration the box forced.
 
-**No ratio is claimed.** The pinned oracle initialized, loaded (17.86 GiB,
-230.4 s) and completed `torch.compile` inside the lease, then consumed
-104,992 MB of host in the next step and was killed by this row's watchdog at
-`MemAvailable` 17,510 MB. The box did not reboot. The lever is named by
-arithmetic rather than left open: `gpu_memory_utilization` 0.9 of ~119 GiB of
-unified memory is ~107 GB, which is the observed peak.
+**Refusal 1, the clock gate.** `gpu_clock_state compare` exits 1: ours 6.31%
+busy and vLLM 31.05% busy against a 50% floor, vLLM spread 5.14% against a 5.0%
+ceiling, ours throttled `SwPowerCap`, persistence `Disabled` on both. Same boot,
+both medians 2411 MHz, `median_offset_pct` 0.0. The tool's own basis is 0.7548
+points of kernel time per point of clock, so it cannot reach a 718x gap.
 
-**The bottleneck is named by an instrument, not by a reading.** `nvidia-smi`
-reported GPU utilization 0% in 2,019 of 2,155 samples over the measured window,
-so the GPU was busy in 6.31% of it, and the clock helper's own comparison gate
-would refuse that window for failing its majority-busy floor. That refusal is
-the finding. It is the 23 of 52 layers that bounce to the host per token plus
-the host NVFP4 `lm_head`, and the next traceable hypothesis is A2-Q1
-([#940](https://github.com/mudler/vllm.cpp/issues/940)) then A2-Q2b, each of
-which has to raise the busy fraction to be believed.
+**Refusal 2, the KV pool.** vLLM's hybrid allocator resolves its own block size
+(512 here, 4192 at other settings) against our 32, so the pools cannot be
+matched and the memory axis is not like-for-like.
+
+**The bottleneck is named by an instrument.** `nvidia-smi` reported GPU
+utilization 0% in 2,019 of 2,155 samples of our window. It is the 23 of 52
+layers that bounce to the host per token plus the host NVFP4 `lm_head`. Next
+traceable hypothesis: A2-Q1 ([#940](https://github.com/mudler/vllm.cpp/issues/940)),
+then A2-Q2b, each of which must RAISE that busy fraction to be believed.
 
 Full recipe, hashes, contention and clock state:
 [`benchmark-record.md`](../benchmark-record.md).
