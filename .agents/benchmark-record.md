@@ -19,6 +19,70 @@ from relative link targets repointed for this file's location.
 
 # Benchmarks
 
+## MODEL-NEMOTRON-H-ABI-A2P — the A3 gate PASSES on the host, and the device divergence was the STALE input ids (2026-08-18, `row/MODEL-NEMOTRON-H-ABI-A2P-1157`, #1157, #1217, #810)
+
+**This supersedes the entry that recorded the A3 gate as a 6/96 device failure
+with an unknown cause. The cause is known, it is not the recurrent carry, and
+the host leg of the gate is a PASS.**
+
+**Host leg, `STRICT PASS`.** `TOKEN MATCH: 96/96 over 3 prompts (full rows=3,
+short rows=0)`, driven through `include/vllm.h` alone by
+`examples/nemotron_h_gen` against the committed oracle golden, on the released
+`nemotron-3.5-lightning-30b-nvfp4` at revision `29f2d174`. Engine load 209.0 s;
+peak RSS 20 142 392 KB; per-prompt wall 928.93 / 839.42 / 1081.16 s.
+`--max-model-len 512`, greedy, `ignore_eos`. **No number on any speed axis is
+claimed or implied** — this is a correctness result on a host that is not the
+performance target.
+
+**Device leg, GB10 sm_121a, and the three measurements that name the mechanism.**
+The build was not degraded: CUDA 13.x from the `ubuntu2404/sbsa` lane,
+`CFG_RC=0`, `cutlass-nvfp4` / `cutlass-fp8` / `marlin-nvfp4` / `fa2` all
+`ENABLED for [121a]`, `BUILD_RC=0`, `compile_errors=0`, binary sha256
+`b4677cdb7cf521250c5325fa10e5eadc80134763621d187af1f9b380c7d70140`.
+
+| arm | same binary, same weights, same golden | result |
+|---|---|---|
+| decode | the shipped path | **4/24** over the first 8 tokens of 3 prompts |
+| fresh-prefill | one token per completion, so no decode step is ever taken | **24/24** |
+| host | the same driver on a CPU queue, where `device_token_ids` is always null | **96/96** |
+
+The `got` streams in the decode arm are byte-identical to the earlier recorded
+run, so the failure reproduced on a fresh build rather than drifting.
+
+**The per-layer trace (`VT_NEMOTRON_H_DIAG`) localises it to the first
+operation of the decode step.** At the prefill step CPU and GB10 agree to six
+digits on every one of the 52 layers, including bit-identical layer-0 numbers.
+At the first decode step the gathered conv/SSM state is IDENTICAL on the two
+(`|conv|=310.374`, `|ssm|=3985.8` on both), so the recurrent carry is exact —
+and layer 0's embedding row differs. It reads `0.228135` on GB10 at BOTH decode
+steps, which consumed different tokens. A constant embedding is a constant
+input id.
+
+**Cause:** `NemotronHPagedForward` embedded the host `input.token_ids` while
+`ModelForwardInput::device_token_ids` was non-null. That field's contract is
+that the host vector is STALE for decode rows (`model_registry.h:314-324`),
+because not materialising it on the host is the synchronize ENG-ASYNC-SCHED W4
+exists to remove. Kimi-Linear was cut from the same divergence
+(`kimi_linear_device.cpp:2270-2280`); the seam that allows a third is
+[#1217](https://github.com/mudler/vllm.cpp/issues/1217).
+
+**What this REFUTES, recorded because the wrong cause was on the record for a
+day.** [#1157](https://github.com/mudler/vllm.cpp/issues/1157) reasoned that
+`gm.num_decodes` might classify a decode as a prefill so the gather would hand
+the mixer zeros. On real weights the trace reports `nd=1 np=0 init=[1]` on every
+decode step, and mutating that mask to 0 turns the A2-P CPU gate RED (1 case,
+6 assertions) — so that gate was never blind to that defect. It was blind to the
+real one for a structural reason: the runner sets `device_token_ids` only under
+`VLLM_CPP_CUDA` with a live device mirror, so no CPU gate reaches the branch.
+
+**Two things this run established about the environment, both cheap to lose.**
+The released checkpoint LOADS AND DECODES ON A CPU-ONLY BOX — 20.1 GB peak RSS,
+209-304 s from a CIFS mount — which is what made a same-binary host/device A/B
+affordable at all and should be the first instrument reached for the next
+device-only divergence on this model. And `/workspace` on the `rc` worker
+persists between runs, so a cloned source tree and a CMake build directory under
+`/root` survive long enough for an incremental rebuild between arms.
+
 ## MODEL-NEMOTRON-H-ABI-A3-E2E — the A3 token gate did NOT run, and the cause on record was NOT the cause (2026-08-17, `row/MODEL-NEMOTRON-H-ABI-A3-E2E`, base `origin/main` `a6df72777`, #810)
 
 **No number is recorded, on any axis. This entry exists so the pending cause is
@@ -22961,6 +23025,130 @@ untried route is a CUDA 12.x toolkit for that driver; it was not pursued, becaus
 dgx gate had already answered the question orin was there to support. No lease held;
 `orin:gpu0` returned to ready.
 
+## LTX25-TEXT-LINEAR-SEAM — the LTX-2.5 caption projection, attributed and then measured (2026-08-18, `row/LTX25-TEXT-LINEAR-SEAM`, base `origin/main` `b626be75a`, #1208)
+
+**This entry exists because #1208's own second comment withdrew the attribution
+its first comment implied, and the row was dispatched to settle that by
+measurement before fixing anything.** It is PARTLY settled. The projection is a
+fixed, serial, twice-paid 1.1838e12-MAC cost and it accounts for **39% to 100%**
+of each single-core stretch; the range is what one unmeasured per-core ratio
+buys, and the residual is named rather than absorbed.
+
+### Recipe
+
+x86 development box, **not GB10 and not a fleet device** — 20-core AMD Ryzen 9
+9950X3D under KVM, AVX-512 present, 84 GiB RAM, Ubuntu 24.04, GCC 13.3.0.
+Release CPU tier (`-DVLLM_CPP_CUDA=OFF -DVLLM_CPP_HIP=OFF -DVLLM_CPP_METAL=OFF
+-DVLLM_CPP_TENSTORRENT=OFF`), `-O3 -DNDEBUG -ffp-contract=off`. **Box NOT idle:**
+other agents built concurrently and `uptime` read load average 4.1 to 10.1 across
+the runs. A scratch `main` calls the production
+`vllm::Ltx2TextFeatureExtractorForward` once at the shipped geometry — gemma
+hidden 3840, 49 states, `flat = 188160`, video 4096, audio 2048, V2 variant,
+every position valid — and times that call. Same harness source and flags on both
+arms; only `libvllm.a` differs.
+
+### The A/B
+
+| arm | rows | wall | rate | CPU | peak RSS |
+|---|---:|---:|---:|---:|---:|
+| before, scalar `double` | 8 / 16 / 32 | 4.964 / 10.152 / 20.113 s | 1.86 / 1.82 / 1.84 GMAC/s | one core | 4.54 GB @ 8 |
+| before, scalar `double` | **1024** | **671.777 s** | **1.7622 GMAC/s** | **99%** | 7.56 GB |
+| after, `vt::MatmulBT` | 32 | 2.320 s | 15.945 GMAC/s | many | |
+| after, `vt::MatmulBT` | 256 | 20.342 s | 14.549 GMAC/s | 1431% of 2000% | 5.52 GB |
+| after, `vt::MatmulBT` | **1024** | **78.421 s** | **15.095 GMAC/s** | many | 7.79 GB |
+
+`rows = 1024` is not a chosen size. `Ltx2EncodePromptToConditioning` sets
+`out.seq = max_length` and `kLtx2GemmaTokenizerMaxLength = 1024`, so the
+projection costs `1024 x 1,156,055,040 = 1.1838e12` MACs on **every** render
+regardless of prompt length or resolution. **671.777 s -> 78.421 s, 8.57x.**
+
+### How much of the GB10 stretch this is — BOUNDED, not a point claim
+
+1738 s for 1.1838e12 MACs is **0.681 GMAC/s**, against 1.7622 measured here. The
+conversion needs `R`, the per-core ratio between this box and GB10 on this loop,
+and **`R` was not measured**. It is bounded instead: `R >= 1` because a GB10 Arm
+core does not out-run a 5.7 GHz-class Zen 5 on a scalar `double`-widening loop,
+and `R <= 2.587` because the projection runs INSIDE the stretch and cannot exceed
+it.
+
+| `R` | share of one 1738 s stretch | residual |
+|---:|---:|---:|
+| 1.0 | 671.8 s (39%) | 1066 s |
+| 2.0 | 1343.6 s (77%) | 394 s |
+| 2.587 | 1738 s (100%) | 0 |
+
+**So 0-1066 s per stretch is still unattributed, and this entry says so rather
+than rounding it into the projection.**
+
+**One residual hypothesis was offered and is REFUTED here.** The candidate was
+the surrounding single-threaded buffer work. Timed directly at the shipped
+geometry through the same exported entry points, two runs: `Ltx2StackHiddenStates`
+0.839 / 0.910 s, `Ltx2NormAndConcatPerTokenRms` 0.632 / 0.688 s, the `scaled`
+copy x2 (once per `project()`) 0.390 / 0.468 s — **total 1.861 / 2.066 s, i.e.
+0.28% of the 671.777 s pass, with the two GEMMs at 99.7%.** A core ten times
+slower would still put it at ~20 s. It is also *inside* the 671.777 s rather than
+beside it.
+
+**A double-count that changes the conclusion, recorded so it is not repeated.**
+671.777 s is ONE WHOLE conditioning pass: one
+`Ltx2TextFeatureExtractorForward` call with `video_out_features = 4096` AND
+`audio_out_features = 2048`, so both `project()` calls are already in it
+(`per_row = (4096 + 2048) * 188160`). Doubling it "for the two projections"
+counts the pass twice and inflates the projection's share from 39% to 77% on a
+box-equality assumption.
+
+Remaining candidates if `R` is near 1, claimed for none: the U8/NVFP4 caption
+weights being unpacked to the f32 4.6 GB — the only candidate of the right
+magnitude, and this row did not establish when that happens; the caller's padded
+hidden-state buffers (~1.5 GB of `assign` + `memcpy`, so seconds); and the
+tower's serial host glue between its threaded GEMMs, which a 1 Hz max-sampler
+would still read near 101%.
+
+**Settled regardless of `R`:** the equal-cost pair is the guided render's two
+text-conditioning passes — `ltx2_video.cpp:2085` and `:2799` build a CPU queue and
+call `Ltx2EncodePromptToConditioning` — so the two projections' 2:1 size ratio
+sits INSIDE one stretch and cannot split it; the Gemma-4 tower cannot be a 101%
+stretch, because its vt ops run on `hardware_concurrency()` threads; and the
+projection is a fixed 1.1838e12-MAC serial cost paid twice per render whatever
+shares the stretch with it.
+
+Two soft corroborations of the high end, neither a ratio measurement: #1202
+DERIVED ~0.53 GFLOP/s for a *different* scalar host loop on GB10 (from RSS growth,
+not timed, and that loop converts bf16 per multiply and strides its inner
+operand), and the trace's own RSS discriminator (paired stretches climb ~8.5 GiB,
+the third does not) matches this function's measured 7.79 GB peak — a magnitude,
+not a cause.
+
+**Owed: one `rc` lease on `dgx:gpu0` running this harness measures `R` and
+collapses the table to one row.**
+
+### Refuted and left open
+
+- **`R` itself.** The single quantity that would close the attribution, and the
+  one this row could not get: no GB10 access was taken.
+- **NOT refuted, not established: the third single-core stretch** (2589 s+, RSS
+  flat at 31 GiB). Different signature; unattributed, and a separate question
+  from the residual above.
+- **The after arm is memory-bound and NO ceiling is declared.** Per busy core it
+  reads ~1.0 GMAC/s against the before arm's 1.84 on one core, so the seam wins
+  on parallelism and loses on per-core throughput. `MatmulOneChunk` reduces over
+  the whole `K = 188160` inside one micro-kernel call, so a 752 KB weight row and
+  a 752 KB activation row each exceed the 1 MB L2 — about 1.25 bytes per MAC at
+  `mr = 4`, i.e. ~18 GB/s at the measured rate. **Next hypothesis: K-blocking**,
+  L2-resident K panels so a weight panel serves more output columns before
+  eviction. Belongs to the CPU GEMM row.
+- **No GB10 number.** The LTX-2.5 speed axis stays `PENDING` and the GB10
+  re-measure is owed.
+
+### Accumulator cost, measured at K = 188160
+
+Against a `long double` reference on this path's magnitudes (unit-RMS
+activations, `U(-1/sqrt(fan_in))` weights, 256 sampled outputs): f32 sequential
+reads max abs 2.12e-05 / mean rel 2.88e-05, f64-then-store reads 5.88e-08 /
+2.26e-08. f64 is ~360x nearer exact; the f32 arm's worst absolute error is ~330x
+below one bf16 ulp of the value it produces. Ten of twelve goldens are unchanged;
+the two that moved are the V1 arm at 1.19e-07 and 7.45e-08 against a 1e-5 bound.
+No tolerance was widened.
 ## MUSIC3-DEPTH-INCREMENTAL — the depth stage, whole-sequence vs incremental, x86-64 20-core (2026-08-18, `row/MUSIC3-DEPTH-SPEED`, BEFORE arm `fc163f62b`, #672)
 
 **Not a parity ratio and not an end-to-end number.** A STAGE A/B between two

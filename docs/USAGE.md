@@ -596,7 +596,7 @@ quantizes the activation once; a checkpoint whose scales differ keeps the two
 separate GEMMs automatically. `VT_GDN_MERGED_QKVZ_FP8=0` restores the two GEMMs
 in the same binary.
 
-### Block-wise FP8 loads and does not run yet
+### Block-wise FP8 runs on CPU and refuses on CUDA
 
 Block-wise FP8, also called fine-grained FP8, keeps one scale for each 128x128
 block of a weight rather than one scale for the whole weight. A block-wise
@@ -610,27 +610,45 @@ checkpoint declares `quantization_config.weight_block_size` in its
 `self_attn.q_proj.weight` as `F8_E4M3` `[12288, 5120]` beside
 `self_attn.q_proj.weight_scale_inv` as `BF16` `[96, 40]`.
 
-That checkpoint now LOADS. The weights are read into a block-wise FP8 weight,
-the `BF16` scale is widened to `F32` by value the way vLLM widens it, and the
-config is cross-checked against the tensors so a disagreement is named rather
-than guessed at. Nothing can execute the weight yet, so the model refuses to
-finish preparing:
+That checkpoint now RUNS on a CPU queue. Ten projections of the Qwen3.5 dense
+model — `q_proj`, `k_proj`, `v_proj`, `o_proj`, the Gated-DeltaNet
+`in_proj_qkv`, `in_proj_z` and `out_proj`, and the MLP's `gate_proj`, `up_proj`
+and `down_proj` — quantize their activation per token per 128-wide group and
+then run a block-scaled GEMM whose scales apply in the mainloop, once per
+K-block, into an F32 accumulator. Each of the ten emits BF16, which is the
+model dtype and what vLLM emits at the same sites.
+
+On a device with no block-scaled GEMM the model refuses while it is being
+prepared, before the first forward and before any CUDA graph is captured:
 
 ```text
 block-wise (fine-grained) 128x128 FP8 weights LOADED for
-model.layers.0.self_attn.q_proj and nothing in this build can execute them
+model.layers.0.self_attn.q_proj and there is no block-wise FP8 GEMM on device
+'cuda'. The linear method and the dense forward wiring are implemented and the
+CPU reference GEMM executes them, so this checkpoint runs on CPU today
 ```
+
+What exists on CPU is a correctness reference. It makes no speed claim, and no
+token-exact comparison against vLLM on this checkpoint has been recorded,
+because the GPU arm that would run one does not exist yet. Milestone M5 of
+[#1189](https://github.com/mudler/vllm.cpp/issues/1189) owns the
+mainloop-scaled CUTLASS kernel; [#1166](https://github.com/mudler/vllm.cpp/issues/1166)
+is the original report.
+
+One lever is incompatible with this arm. `VT_KV_CACHE_F32=1` selects an F32
+paged KV cache while `v_proj` keeps emitting BF16, and the KV write requires
+both to share one dtype, so it refuses. That affects every BF16 arm rather than
+this one; it is tracked as
+[#1249](https://github.com/mudler/vllm.cpp/issues/1249). Leave the lever unset,
+which is the default.
 
 Two block-wise configurations are refused earlier, at load, because no build
 here implements them: an `activation_scheme` other than `dynamic`, and a
 `weight_block_size` other than `[128, 128]`. Both messages name the key and the
 value your `config.json` declares.
 
-Nothing is wrong with those checkpoints; the missing arm is in this project. To
-run the same model today, use a per-tensor FP8, BF16, NVFP4, or GGUF checkpoint
-of it. Issue [#1189](https://github.com/mudler/vllm.cpp/issues/1189) tracks the
-remaining milestones, and
-[#1166](https://github.com/mudler/vllm.cpp/issues/1166) is the original report.
+To run this model on a GPU today, use a per-tensor FP8, BF16, NVFP4, or GGUF
+checkpoint of it.
 
 ### A per-tensor scale has to be one F32 number
 
@@ -3557,7 +3575,7 @@ CHECKPOINT_ROOT=... VLLM_CPP_LTX2_TOWER_E2E=1 \
 
 Recipes resolve on an EXACT `(pipeline_kind, model_version)` pair and refuse
 anything else by name rather than defaulting, because a plausible but wrong sigma
-schedule or guidance scale renders a video instead of failing. **Twenty-four**
+schedule or guidance scale renders a video instead of failing. **Twenty-eight**
 pairs resolve, derived from `ResolveLtx2PipelineRecipe`:
 
 | `pipeline_kind` | resolving `model_version` | what it also needs |
@@ -3571,6 +3589,7 @@ pairs resolve, derived from `ResolveLtx2PipelineRecipe`:
 | `t2a_one_stage` | 2, 2.3, 2.4, 2.5 | a text tower; no video VAE is asked for |
 | `a2vid_two_stage` | 2, 2.3, 2.4, 2.5 | `upsampler_path`, `lora_path`, and an `audio_path` on every request |
 | `ti2vid_two_stage` | 2, 2.3, 2.4, 2.5 | `upsampler_path` and `lora_path` |
+| `keyframe_interpolation` | 2, 2.3, 2.4, 2.5 | `upsampler_path` and `lora_path` |
 
 This list ran to ten until 2026-08-17, omitting `dfr` entirely and all four
 `t2a_one_stage` rows. **`dfr` at 2 is refused deliberately, not by oversight**:
@@ -3777,6 +3796,82 @@ All three knobs this arm needs are LOAD extras, so a server supplies them with
 of `/v1/videos`. That is a statement about the request surface: the gated path
 is `vllm_video_engine_load` plus `vllm_video_generate`, which is what `ltx2-gen`
 drives, and no test here exercises the HTTP route end to end.
+
+### `keyframe_interpolation`: generating the motion between pinned frames
+
+`KeyframeInterpolationPipeline` — you supply the keyframes, the model generates
+what happens between them. Its two stages are `ti2vid_two_stage`'s: a guided
+half-resolution stage 1 on the **unadapted** model, then a 2x latent upsample and
+a distilled three-sigma refinement. It needs the same `--lora-path` and
+`--upsampler-path`, for the same reasons.
+
+```sh
+ltx2-gen \
+  --pipeline-kind keyframe_interpolation \
+  --checkpoint "$CHECKPOINT_ROOT/ltx-2.5/..." \
+  --upsampler-path "$CHECKPOINT_ROOT/ltx-2.5/.../spatial-upsampler.safetensors" \
+  --lora-path "$CHECKPOINT_ROOT/ltx-2.5/.../ltx-2.5-22b-distilled-lora-450-bf16.safetensors" \
+  --prompt 'the balloon drifts from the left ridge to the right one' \
+  --first-frame open.ppm --last-frame close.ppm --image-crf 0 \
+  --height 704 --width 1216 --num-frames 121 --steps 30 \
+  --output-dir out/
+```
+
+**Two fields separate it from `ti2vid_two_stage`, and both render either way.**
+
+**The first frame is a KEYFRAME, not a replacement.** Every other pipeline maps a
+conditioning image at frame 0 onto a latent-index item, which overwrites the
+tokens of latent frame 0 in place. This one drops that special case: the image is
+appended as keyframe guidance the model interpolates *from*, and the sequence the
+transformer runs over grows by one latent frame. Nothing about a rendered clip
+shows which mapping was used — both return the right size, the right frame count
+and the right sample rate with the image visibly present — so the difference is
+gated on the token count the transformer actually ran over.
+
+**The soundtrack that leaves is stage 2's**, where `ti2vid_two_stage` keeps stage
+1's and discards its refinement stage's audio. Upstream says so by what it binds
+rather than in a comment, and the two pipelines bind opposite ways.
+
+Everything else is shared. `--lora-path` is **required** and the load is refused
+without it: upstream makes the distilled adapter a positional, non-defaulted
+constructor argument as well as a required flag, and the adapter rides **stage 2
+alone** while stage 1 runs the base weights. There is no `--audio-path`; the
+soundtrack is generated. Height and width describe the FINAL output and must
+divide 64, because stage 1 halves them. Its stage-1 sigma shift is fitted on the
+scheduler's fixed 4096-token anchor rather than on the target latent grid, which
+is what upstream's `execute(steps=...)` with no latent resolves to.
+
+**`--last-frame` is new with this kind** and works on every pipeline that takes
+images: the ABI and the engine have served a closing keyframe since
+[#930](https://github.com/mudler/vllm.cpp/issues/930), and `ltx2-gen` had never
+read the field ([#1191](https://github.com/mudler/vllm.cpp/issues/1191)). Both
+image slots share one `--image-crf` and one strength, and a keyframe at an
+**interior** frame is not requestable — upstream's `--image PATH FRAME_IDX
+STRENGTH [CRF]` is repeatable and this request surface carries two fixed slots
+([#1187](https://github.com/mudler/vllm.cpp/issues/1187)).
+
+**Which weights this was gated against: reduced CPU fixtures, and nothing else.**
+Upstream runs this pipeline on the FULL model
+(`ltx-2.5-22b-dev-transformer-bf16.safetensors`, 42,018,190,584 bytes, 4349
+tensors, 21.004 B parameters, pure BF16, `model_version` `2.5.0`), which is on
+the NAS and header-verified, and which `LTX25-BF16-DIT`
+([#1148](https://github.com/mudler/vllm.cpp/issues/1148)) made loadable. **What
+is owed is the run**: a comparison against upstream's own render on the same
+checkpoint, prompt and seed. Do **not** substitute a distilled transformer to try
+the arm out — the distilled scales are trained into those weights, so a
+CFG-guided stage 1 on top samples a trajectory they were never trained for and
+renders a plausible clip with nothing in its size, frame count, sample rate or
+errors to show it ([#1137](https://github.com/mudler/vllm.cpp/issues/1137)).
+
+All three knobs this arm needs are LOAD extras, so a server supplies them with
+`--video-extra pipeline_kind=keyframe_interpolation` and the same for
+`lora_path` and `upsampler_path`. Like `ti2vid_two_stage` and unlike
+`a2vid_two_stage` it needs no per-generation extra, so
+[#928](https://github.com/mudler/vllm.cpp/issues/928) does not stand in the way
+of `/v1/videos` — though `/v1/videos` forwards no image either, so a server
+render is unconditioned. That is a statement about the request surface: the gated
+path is `vllm_video_engine_load` plus `vllm_video_generate`, which is what
+`ltx2-gen` drives, and no test here exercises the HTTP route end to end.
 
 ### Retake: regenerating a time window of an existing clip
 
@@ -4352,9 +4447,27 @@ ENVIRONMENT.md (`VT_GEMMA4_RESIDENT_*`, `VT_ATTN_*`). Defaults stay safe off RDN
 GetBlas keeps two per-thread hipBLAS handles (`tls_slots[2]`, device 1 → slot 1)
 so a 0→1 hop does not destroy GPU0's handle. `ProductGetBlasHandle` is the
 test accessor for that file-local `GetBlas`. HIP live probe is a separate CTest
-target (exit 77 if `HIP_VISIBLE_DEVICES` empty); it enters capture so production `StreamIsCapturing` is load-bearing. No new env. This PR does **not**
-restructure the Gemma-4 layer loop or enable decode hipGraph (those stay lab-only
-until a CUDA token-exact gate can land them).
+target (exit 77 if `HIP_VISIBLE_DEVICES` empty); it enters capture so production `StreamIsCapturing` is load-bearing. No new env.
+This path does **not** restructure the Gemma-4 layer loop or enable decode hipGraph
+(those stay lab-only until a CUDA token-exact gate can land them).
+
+Contributor KEEP recipe (2x R9700 gfx1201, ROCm 7.2.4, `PREFIX_CACHE=0`, unique
+pads, 2026-08-13): SharedK-WMMA on, FLASH/FMHA off, `VT_GEMMA4_PREFILL_GEMM_M=2048`
+(the default), `VT_GEMMA4_PREFILL_PEER_ACT=1` (the default), batch MoE `T>=64`.
+Fair median prefill **2014 t/s @~11k** and **1099 t/s @~42k**; stream decode
+**55 t/s** temp=0. Paris / arith `63` / `gemma4` tool_calls held. Speculative,
+ngram, FMHA, and layer-split are **out of this recipe**. Details:
+[spec](../.agents/specs/gemma4-rocm-fp8-moe.md).
+
+These are contributor-lab numbers against **no denominator**: no pinned vLLM-ROCm
+run on the same box, same model, same quantization and same request shape exists
+for them, so `docs/BENCHMARKS.md` still records this backend as `PENDING: no
+binding throughput number` and this recipe does not change that. The decode
+figure is also not reproducible from the knobs above: the as-run recipe set four
+further decode splits that no product code in this tree reads
+([#845](https://github.com/mudler/vllm.cpp/issues/845)), and they are recorded in
+the spec rather than here, because a recipe on this page has to be one a reader
+can follow.
 
 ## LTX-2.5 text conditioning
 
