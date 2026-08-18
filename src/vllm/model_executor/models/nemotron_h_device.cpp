@@ -1523,14 +1523,47 @@ ForwardLogits NemotronHPagedForward(const NemotronHHostWeights& host,
   RequireDeviceWeight(host.norm_f, "backbone.norm_f.weight", adt, {H});
   DBuf residual(d, adt, {T, H});
   {
-    std::vector<int32_t> ids = input.token_ids;
-    for (int32_t id : ids) {
-      VT_CHECK(id >= 0 && id < V, "NemotronH paged forward: token id out of range");
-    }
-    DBuf it(d, DType::kI32, {T}, ids.data());
-    d.b.Synchronize(d.q);  // `ids` is a local; see UploadAs.
     Tensor tab = ResidentWeight(d, host.embeddings);
-    vt::Embedding(d.q, residual.t(), tab, it.t());
+    Tensor rt = residual.t();
+    if (input.device_token_ids != nullptr) {
+      // ★ ENG-ASYNC-SCHED W4 (#1157). `ModelForwardInput::device_token_ids` is
+      // non-null exactly when the async runner's device combine has already
+      // spliced each DECODE row's sampled token into ITS device buffer and left
+      // the host `token_ids` STALE on purpose — materializing it on the host is
+      // the synchronize W4 exists to remove (model_registry.h:314-324,
+      // runner.cpp:1175-1194). A forward that embeds the host vector therefore
+      // embeds the same placeholder id on every decode step.
+      //
+      // That is not a hypothesis. With the host vector, this model's A3 token
+      // gate read 4/24 on GB10 while the SAME binary read 24/24 in
+      // fresh-prefill mode (no decode step is ever taken) and 96/96 on CPU
+      // (where this pointer is always null), and the per-layer trace showed the
+      // layer-0 embedding row identical across two consecutive decode steps
+      // that consumed different tokens.
+      //
+      // Kimi-Linear was cut from this same divergence
+      // (kimi_linear_device.cpp:2270-2280) and every other registered forward
+      // already honours the field. This one did not, and nothing could see it:
+      // the runner sets the pointer only under VLLM_CPP_CUDA with a live device
+      // mirror, so no CPU gate can reach the branch at all.
+      //
+      // The host-side range check below is deliberately NOT repeated here. The
+      // ids live on the device and validating them would need the D2H
+      // synchronize this path exists to delete; `LaunchCombineSampledAndDraft
+      // Tokens` produces them from the sampler's own output, and vt::Embedding
+      // bounds-checks the gather.
+      Tensor ids = MakeTensor(const_cast<int32_t*>(input.device_token_ids),
+                              DType::kI32, d.q.device, {T});
+      vt::Embedding(d.q, rt, tab, ids);
+    } else {
+      std::vector<int32_t> ids = input.token_ids;
+      for (int32_t id : ids) {
+        VT_CHECK(id >= 0 && id < V, "NemotronH paged forward: token id out of range");
+      }
+      DBuf it(d, DType::kI32, {T}, ids.data());
+      d.b.Synchronize(d.q);  // `ids` is a local; see UploadAs.
+      vt::Embedding(d.q, rt, tab, it.t());
+    }
   }
 
   vt::RmsNormArgs nargs;
