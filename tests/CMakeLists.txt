@@ -1641,6 +1641,10 @@ target_link_libraries(test_parallel_layout PRIVATE Threads::Threads)
 vllm_cpp_add_test(test_backend_multidevice vt/test_backend_multidevice.cpp)
 vllm_cpp_add_test(test_arena vt/test_arena.cpp)
 vllm_cpp_add_test(test_ops_matmul vt/test_ops_matmul.cpp)
+# #839 host lifetime + source invariants (no GPU).
+vllm_cpp_add_test(test_ops_gemma4_prefill_peer vt/test_ops_gemma4_prefill_peer.cpp)
+target_compile_definitions(test_ops_gemma4_prefill_peer PRIVATE
+  VLLM_CPP_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 # D1 (fold plan Tier D1): the merged-QKV == separate-q/k/v A/B — one MatmulBT over
 # the merged [Nq+Nk+Nv,H] owner + a contiguous QkvSplit is BYTE-IDENTICAL to three
 # separate MatmulBT (bit-exact GEMM math, wider N; RED-first). CPU-only.
@@ -2009,6 +2013,21 @@ target_compile_definitions(test_qwen3_paged_engine PRIVATE
   PARITY_GOLDENS_DIR="${CMAKE_SOURCE_DIR}/tests/parity/goldens")
 target_include_directories(test_qwen3_paged_engine PRIVATE
   ${CMAKE_SOURCE_DIR}/tests/parity ${CMAKE_SOURCE_DIR}/src)
+
+# ROCm M4 — the GDN sibling of the Qwen3-dense gate: Qwen3.5-0.8B greedy decode
+# vs the pinned vLLM-ROCm oracle (the ONLY capture of this model — no dgx
+# capture exists; the base golden pair is ROCm-captured on gfx1100).
+# Checkpoint-gated: skips loudly when the HF snapshot is absent.
+vllm_cpp_add_test(test_qwen35_paged_engine parity/test_qwen35_paged_engine.cpp)
+target_compile_definitions(test_qwen35_paged_engine PRIVATE
+  PARITY_GOLDENS_DIR="${CMAKE_SOURCE_DIR}/tests/parity/goldens")
+target_include_directories(test_qwen35_paged_engine PRIVATE
+  ${CMAKE_SOURCE_DIR}/tests/parity ${CMAKE_SOURCE_DIR}/src)
+add_test(NAME test_qwen35_paged_engine_prerequisites
+  COMMAND ${CMAKE_COMMAND}
+    "-DTEST_EXE=$<TARGET_FILE:test_qwen35_paged_engine>"
+    "-DPROBE_ROOT=${CMAKE_CURRENT_BINARY_DIR}/qwen35_paged_engine_prerequisites"
+    -P "${CMAKE_CURRENT_SOURCE_DIR}/parity/test_qwen35_paged_engine_prerequisites.cmake")
 
 # ROW-SERVE-ASYNC-DENSE-MIRROR — the classic-dense async-serving greedy gate:
 # Qwen3-0.6B/4B async batch-1 + concurrency reproduce the race-free SYNC engine
