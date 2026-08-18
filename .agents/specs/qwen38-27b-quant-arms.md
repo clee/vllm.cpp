@@ -103,8 +103,9 @@ other statement below rests on a header I parsed.
 revision #821 pins, **does not resolve**. The tree API answers
 `{"error":"Invalid rev id"}` and
 `GET /unsloth/Qwen3.8-27B-NVFP4/resolve/a767244d.../config.json` answers **HTTP
-404**. `git ls-remote https://huggingface.co/unsloth/Qwen3.8-27B-NVFP4` reports
-exactly one ref, `refs/heads/main` = `7d6f8d4d72f56b92b3cdbf22f156b90e1bab0108`.
+404**. `git ls-remote https://huggingface.co/unsloth/Qwen3.8-27B-NVFP4` reports exactly
+one branch, `refs/heads/main` = `7d6f8d4d72f56b92b3cdbf22f156b90e1bab0108`; it
+prints two lines, because `HEAD` resolves to the same commit.
 
 This is the failure mode this tree has already recorded once, for the sibling
 repo: [`porting-a-model.md`](../porting-a-model.md) §2.1 says
@@ -127,8 +128,11 @@ Two consequences, both binding:
 
 ## Our baseline
 
-What exists in this tree today, measured against `main` `1dac4f9a7` and
-against the artifacts' own headers rather than against any record of them.
+What exists in this tree today, measured against `origin/main` `4ee5f4a69` and
+against the artifacts' own headers rather than against any record of them. The
+first reading was taken at `1dac4f9a7`; `4ee5f4a69` landed #1258 (via #1267) and
+#1259, which edited two of the files this section anchors, so every citation
+below was re-derived against the merged tree rather than carried forward.
 
 ### The GGUF arm
 
@@ -172,8 +176,9 @@ The load-bearing detail is the patch embedding. It ships as **two** tensors,
 precisely the thing whose absence made MuseGlimmer's mmproj unloadable:
 `muse_glimmer_gguf_weights.h:198-214` records that its `v.patch_embd.weight` is
 ggml `ne [14,14,3,1536]`, i.e. only 588 of the 1176 input features the temporal
-patch needs, and `muse_glimmer_gguf_weights.cpp:695-706` refuses it by name
-because "loading it would mean inventing the temporal half of a weight". **Both
+patch needs, and `muse_glimmer_gguf_weights.cpp:695-706` refuses it by name. The
+reason — "loading it would mean inventing the temporal half of a weight" — is in
+the header at `muse_glimmer_gguf_weights.h:212`, not beside the throw. **Both
 halves are present here.** So this projector is loadable, and the MuseGlimmer
 refusal is not precedent for refusing it — it is precedent for exactly the check
 that distinguishes the two.
@@ -195,7 +200,7 @@ The single-file assumption is structural, not incidental:
 
 - `include/vllm/model_executor/models/model_registry.h:98` carries `const GgufFile* gguf = nullptr;` — **one pointer**. Safetensors gets a *vector* at `:95`. GGUF does not.
 - `include/vllm/entrypoints/model_loader.h:78` `EngineParams` has no projector or mmproj field; `:300` `FromModelDir` takes one path string.
-- `include/vllm/model_executor/model_loader/gguf_reader.h:122` `GgufFile::Open(const std::string&)` opens one logical file. It *does* handle sharding — `src/vllm/model_executor/model_loader/gguf_reader.cpp:519-547` `DetectSplit` parses `-NNNNN-of-MMMMM.gguf` and merges shard tensor tables — but shards of one split are not a second, differently-architected file.
+- `include/vllm/model_executor/model_loader/gguf_reader.h:122` `GgufFile::Open(const std::string&)` opens one logical file. It *does* handle sharding — `src/vllm/model_executor/model_loader/gguf_reader.cpp:519-546` `DetectSplit` parses `-NNNNN-of-MMMMM.gguf` and merges shard tensor tables — but shards of one split are not a second, differently-architected file.
 - Every qwen3_5 GGUF entry point in `include/vllm/model_executor/models/qwen3_5_gguf_weights.h` takes `const GgufFile&` singular.
 
 So a second file attaches at, minimally: `EngineParams` and `FromModelDir`
@@ -227,16 +232,30 @@ unrelated prose at `:1336`.
 
 #### What already works, and therefore is not in scope
 
-Every tensor dtype a Q4_K_M carries is already computed natively, on both tiers,
-with no prefill/decode split:
+Every tensor dtype a Q4_K_M carries is already computed natively, on both tiers.
+The two tiers differ in whether they branch on `M`, and only one of them does:
 
 - CUDA: `src/vt/cuda/cuda_quant_dot.cu:700-713` enumerates
   IQ2_XXS/IQ3_XXS/Q2_K/Q3_K/Q4_K/Q5_K/Q6_K/IQ2_S/IQ1_S/IQ1_XXXS, gated by
   `IsCudaKeepQuantSupported` at `:1588-1607`; Q8_0 has its own dedicated path at
-  `:1659`. The same kernel serves `M=1` and `M>1`
-  (`src/vt/cuda/cuda_quant_dot.cu:1814,1855`).
-- CPU: `src/vt/cpu/cpu_quant_dot.cpp:787-810` carries the same set plus Q4_0 and
-  MXFP4.
+  `:1659`. Here there really is **no prefill/decode split**: `LaunchGemm`
+  (`:1609-1626`) sizes its grid as `m * n` warps and reads `M` nowhere else, and
+  the dispatch switch that selects the encoding (`:1864-1874`) does not see `M`
+  at all, so `M=1` and `M>1` enter the identical kernel.
+- CPU: `src/vt/cpu/cpu_quant_dot.cpp:787-809` carries the same set plus Q4_0 and
+  MXFP4. This tier **does** branch on `M`:
+  `src/vt/cpu/cpu_quant_gemm.cpp:190` takes the Arm i8mm `mmla` 2x2 register tile
+  only when `mmla != nullptr && m % 2 == 0 && n % 2 == 0`, and its comment
+  (`:183-187`) names decode (`M=1`) as the case that falls to the portable
+  `nrc == 1` path, mirroring ggml's own `num_rows_per_vec_dot` guard.
+
+**That CPU branch is a kernel-TIER split, not a coverage split, and the
+conclusion is unchanged.** No dtype gains or loses support at any `M`: both arms
+end in the same `BlockVecDot` table, and the odd-`M` arm is the general one, so
+every encoding this file carries is computed at every shape. So the Q4_K_M arm is
+**not** blocked on kernels. What the branch does change is the speed a Q4_K_M
+decode step runs at on Arm, which is a benchmarking fact for W3 rather than a
+gap for W2.
 
 So the Q4_K_M arm is **not** blocked on kernels. Q4_0 and MXFP4 would cost a
 per-GEMM `cudaStreamSynchronize` (`src/vt/cuda/cuda_quant_dot.cu:1830-1836`);
@@ -255,8 +274,27 @@ At `7d6f8d4d...`, `config.json` declares `quantization_config.format =
 | `group_0` | `float-quantized` (FP8 W8A8) | `self_attn.(q\|k\|v\|o)_proj`, `linear_attn.(in_proj_qkv\|in_proj_z\|out_proj)`, `lm_head`, `layers.(56..63).mlp.(gate\|up\|down)_proj` | 8-bit, **`strategy: channel`**, static | 8-bit, **`dynamic: true`**, `strategy: token` |
 | `group_1` | `nvfp4-pack-quantized` (W4A4) | `mlp.(gate\|up\|down)_proj` | 4-bit, `group_size: 16`, `strategy: tensor_group`, `actorder: static` | 4-bit, `dynamic: "local"`, `group_size: 16` |
 
-plus `kv_cache_scheme` (8-bit, static, per-tensor) and an `ignore` list covering
-the whole vision tower.
+plus `kv_cache_scheme` (8-bit, static, per-tensor) and an `ignore` list of
+**303 entries**, which is not merely "the vision tower" and must be honoured
+entry for entry when a W4 implementer resolves group membership. Counted from
+the same `config.json`, the 303 are:
+
+| Count | Entry shape |
+|---:|---|
+| 48 | `model.language_model.layers.<i>.linear_attn` |
+| 48 | `model.language_model.layers.<i>.linear_attn.norm` |
+| 48 | `model.language_model.layers.<i>.linear_attn.in_proj_b` |
+| 48 | `model.language_model.layers.<i>.linear_attn.in_proj_a` |
+| 27 x 4 | `model.visual.blocks.<i>.attn.{qkv,proj}`, `model.visual.blocks.<i>.mlp.{linear_fc1,linear_fc2}` |
+| 2 | `model.visual.merger.{linear_fc1,linear_fc2}` |
+| 1 | `re:^mtp.*` |
+
+The 48 is the GDN layer count (the other 16 of 64 are full-attention), and the
+`ignore` list is **why the `IsQwen27QuantizedLinear` claim below holds**:
+`in_proj_a` and `in_proj_b` are ignored while `in_proj_qkv`, `in_proj_z` and
+`out_proj` are not — they are `group_0` targets. A resolver that reads the
+groups but not the `ignore` list, or that treats `linear_attn.*` as one unit,
+gets the GDN block exactly wrong in both directions.
 
 The header confirms every one of those claims at the byte level:
 
@@ -296,17 +334,17 @@ unquantized.
    ```
 
    `ReadF32Scalar` calls the resolver immediately
-   (`include/vllm/model_executor/models/dense_weight_loaders.h:101-102`), and the
+   (`include/vllm/model_executor/models/dense_weight_loaders.h:164-165`), and the
    resolver throws at
-   `src/vllm/model_executor/models/qwen3_5_dense_weights.cpp:817`. This is the
+   `src/vllm/model_executor/models/qwen3_5_dense_weights.cpp:828`. This is the
    **only** FP8 arm with no `has()` guard: the block-wise arm refuses an
-   `input_scale` (`:467-470`), the ModelOpt NVFP4 arm presence-guards it
-   (`:388-395`). Verified still present at `main` `1dac4f9a7`.
+   `input_scale` (`:467-473`), the ModelOpt NVFP4 arm presence-guards it
+   (`:388-395`). Verified still present at `origin/main` `4ee5f4a69`.
 
 2. **The per-channel BF16 `weight_scale` is refused independently.**
-   `include/vllm/model_executor/models/dense_weight_loaders.h:101-102` asserts
-   `numel == 1` *and* `dtype == "F32"`, and the comment above it names this exact
-   case: "A per-output-channel `[out] BF16` scale passed at two bytes an element
+   `include/vllm/model_executor/models/dense_weight_loaders.h:168` asserts
+   `numel == 1` and `:172` asserts `dtype == "F32"`, and the comment above them
+   (`:147-163`) names this exact case: "A per-output-channel `[out] BF16` scale passed at two bytes an element
    and was read as one float built from the first two entries." So even after (1)
    is fixed, `weight_scale` BF16 `[10240,1]` fails the count check first. `Fp8Weight`
    (`include/vllm/model_executor/models/qwen3_5_weights.h:318-330`) is three host
@@ -316,12 +354,12 @@ unquantized.
 3. **A dynamic per-token activation scheme has no representation.**
    `src/vllm/model_executor/models/qwen3_5.cpp:3593` quantizes the activation with
    one static scalar (`vt::QuantFp8Static(..., w.in_proj_qkv_fp8.input_scale)`),
-   and `:3513-3514` asserts the two GDN shards share it. There is no dynamic-scale
+   and `:3512-3513` asserts the two GDN shards share it. There is no dynamic-scale
    path on this arm at all.
 
 4. **The scheme is never read from the config.** The only `quantization_config`
    keys this arm consults are the block-wise FP8 ones —
-   `src/vllm/model_executor/layers/quantization/fp8_block_quant.cpp:17-27,46-60,78-89,102-113,128-141`
+   `src/vllm/model_executor/layers/quantization/fp8_block_quant.cpp:19-28,49-61,77-91,106-116,131-142`
    (`weight_block_size`, `quant_method`, `activation_scheme`, `ignored_layers`).
    Nothing reads `format`, `config_groups`, `targets`, `strategy`, or the
    compressed-tensors `ignore`. Detection is by tensor presence and dtype, per
@@ -329,22 +367,52 @@ unquantized.
    over layer indices* (layers 56-63 FP8, 0-55 NVFP4, same module name) cannot be
    resolved that way without at least reading the groups. A generic resolver
    exists — `src/vllm/model_executor/layers/quantization/modelopt_mixed_precision.h`
-   — but it is included only by Nemotron-H.
+   — **and no production file includes it.** `grep -rn modelopt_mixed_precision
+   src/ include/ tests/` returns exactly two includes, both tests
+   (`tests/vllm/model_executor/layers/quantization/test_modelopt_mixed_precision.cpp:32`
+   and `test_modelopt_mixed_precision_checkpoint.cpp:25`); the only other mention
+   under `src/` is a comment at
+   `src/vllm/model_executor/models/voxtral_loader_internal.h:15`. Nemotron-H is
+   not a counterexample and was the one this spec previously named:
+   `src/vllm/model_executor/models/nemotron_h_weights.cpp` includes
+   `nemotron_h.h`, `nemotron_h_loader.h`, `nvfp4_dequant.h` and `vt/unaligned.h`,
+   and reads its quantization config inline.
+
+   **This is an `AGENTS.md` §"Nothing lands dead" fact, and it has to be stated
+   as one:** a 33,575-byte header whose only reachable entry points are two unit
+   tests. It is a resolver that has been proven to work and never proven to be
+   reached. That is exactly the failure that section names — the tests measure a
+   class, not a capability — and it changes what a W4 implementer may assume,
+   because "reuse the existing resolver" and "be the first production caller of
+   an untried one" are different jobs with different evidence burdens.
 
 Two adjacent facts that will bite an implementer:
 
-- `src/vllm/model_executor/models/qwen3_5_dense_weights.cpp:704`
+- `src/vllm/model_executor/models/qwen3_5_dense_weights.cpp:698,702`
   (`IsQwen27QuantizedLinear`) returns **false** for any name containing
   `.linear_attn.in_proj_`, i.e. it declares the GDN input projections never
   quantized. That is correct for the *3.6* unsloth artifact —
   `tests/parity/hf_snapshot.h:287-299` records that one lists
   `linear_attn.in_proj_{qkv,z,a,b}` in `ignore` and ships zero `*.input_scale` —
-  and **false for this one**. The two unsloth 27B artifacts differ, and reasoning
-  from the 3.6 shape is what produced this line.
+  and **false for this one**, whose `ignore` list stops at `in_proj_a` and
+  `in_proj_b` while `group_0` claims `in_proj_qkv`, `in_proj_z` and `out_proj`.
+  The two unsloth 27B artifacts differ, and reasoning from the 3.6 shape is what
+  produced this line.
 - The GDN path never probes NVFP4 at all: `IsNvfp4Projection` is applied only to
   `out_proj` (`src/vllm/model_executor/models/qwen3_5_dense_weights.cpp:514`),
   while `self_attn` and `mlp` do probe it (`:561`, `:594`). Correct for
   this artifact, worth stating so nobody "fixes" it.
+- **A doc comment on the NVFP4 loader is stale in the direction that matters
+  here, and it is NOT this row's to repair.**
+  `src/vllm/model_executor/models/qwen3_5_dense_weights.cpp:162-163` says the
+  on-disk `input_global_scale` "is not read", and `LoadCtNvfp4Raw` reads it
+  unconditionally sixteen lines later at `:190`, refusing a zero at `:191-192`.
+  It matters to W4 because this checkpoint's `group_1` ships
+  `input_global_scale` on every NVFP4 projection (see the byte table above), so
+  an implementer who trusts the comment will mis-plan the one half of this
+  artifact that already works. The defect predates this branch and belongs to
+  whoever owns that loader; naming it here keeps it from being rediscovered as
+  a surprise, and this spec deliberately does not edit that file.
 
 The NVFP4 MLP group, by contrast, is the compressed-tensors spelling the loader
 already handles (`weight_packed` + `weight_scale` F8 + `weight_global_scale` +
@@ -397,8 +465,8 @@ oracle. W3 and W5 are the only units that do.
   `tokenizer.json` of 19,989,325 B and a `tokenizer_config.json` of 1,047 B
   against the official repo's 12,809,320 B and 17,928 B, with no `merges.txt`. A
   shared "surface" row would have to load both artifacts to say anything, and
-  would be a shared file two branches must both write — the lock shape
-  `AGENTS.md` §Records forbids. Each arm gates its own surface.
+  would have nothing left to assert once it did, because the two artifacts
+  disagree on the answer. Each arm gates its own surface.
 
 ## Port map
 
@@ -418,7 +486,7 @@ an error.
 
 The vision loader reads `clip.*` KV and `v.*` / `mm.*` tensors and builds the same
 `multimodal::Qwen3VLVisionConfig` that
-`src/vllm/model_executor/models/minimax_h3_vision_gguf.cpp:32-57` builds from
+`src/vllm/model_executor/models/minimax_h3_vision_gguf.cpp:32-56` builds from
 `visual.*`; that mapping is the port target, not a new design. The two-tensor
 patch embedding (`v.patch_embd.weight` + `v.patch_embd.weight.1`) is joined into
 the `[out, temporal*3*p*p]` operand our `conv1_linear` needs, and a checkpoint
@@ -461,13 +529,18 @@ qwen3_5's assert (`qwen3_5_gguf_weights.cpp:874-875`).
    were obtained.
 3. Read the compressed-tensors `config_groups` / `targets` / `format` rather than
    inferring the scheme from tensor dtypes, because a regex over layer indices is
-   not inferable from a per-projection probe. Reuse
-   `modelopt_mixed_precision.h` if it fits; extend it if it does not; do not add a
-   second mixed-precision resolver.
+   not inferable from a per-projection probe. `modelopt_mixed_precision.h` is the
+   candidate to build on, and it is **test-only code today** (see the fourth
+   blocker above), so treat it as a design to evaluate rather than as a
+   production-proven component: read it against this checkpoint's
+   `config_groups`, and if it fits, the change that adopts it is also the change
+   that gives it its first production call site and the reachability evidence
+   `AGENTS.md` §"Nothing lands dead" requires. If it does not fit, extend it.
+   Either way the tree ends with ONE mixed-precision resolver.
 4. Widen the FP8 weight scale from a host float to a resident per-channel vector.
-   `qwen3_5.cpp:3522,3532-3543,3553` already carries a per-column folded-alpha
-   vector for the merged GDN GEMM, so the *consumer* shape exists; what is missing
-   is loading one from disk.
+   `qwen3_5.cpp:3521,3532-3540,3553-3554` already carries a per-column
+   folded-alpha vector for the merged GDN GEMM, so the *consumer* shape exists;
+   what is missing is loading one from disk.
 5. Dynamic per-token activation FP8: mirror vLLM's own path for
    `activation_scheme: dynamic`, do not invent a static substitute.
 6. `k_scale` / `v_scale`: consume, or refuse by name with a message naming the
@@ -507,8 +580,10 @@ you ported"), at the pinned revisions:
   records `gateable = no` for pin `b10451`, with #857 owing the measurement. This
   is not a reason to weaken the gate; it is a dependency, recorded under `## Owed`.
 - **A per-channel scale read as a scalar produces plausible wrong numbers.**
-  `dense_weight_loaders.h:85-100` records this having happened. Any widening of
-  `Fp8Weight` must keep that refusal for the arms that really are per-tensor.
+  `dense_weight_loaders.h:147-163` records this having happened, and names the
+  `[out] BF16` scale read as one float built from its first two entries at
+  `:151-152`. Any widening of `Fp8Weight` must keep that refusal for the arms
+  that really are per-tensor.
 - **Merging the FP8 tower and NVFP4 MLP work.** Layers 56-63 are FP8 and 0-55 are
   NVFP4 under the same module names. A per-projection probe that gets the boundary
   wrong is silent.
@@ -608,11 +683,49 @@ authority — not waived, and not silent.
 - Stop and escalate if closing an arm would need a divergence from vLLM's
   compressed-tensors semantics. vLLM is the mirror on the NVFP4 arm; llama.cpp
   never becomes one.
-- Stop before writing a second mixed-precision resolver. Extend
-  `modelopt_mixed_precision.h` or record one exact tracked exception.
+- Stop before writing a second mixed-precision resolver. Adopt or extend
+  `modelopt_mixed_precision.h`, or record one exact tracked exception. The
+  intent is unchanged — the tree must not carry two resolvers for one format —
+  but do not read this as "the existing one is proven": it is reached only from
+  two tests, so adopting it is a first production wiring and owes reachability
+  evidence, and finding it unfit is a legitimate outcome that the spec of the
+  adopting row records rather than a reason to fork it.
 - Stop before auto-discovering an mmproj beside a language file. That is a
   wrong-shaped model with no error, and it is out of scope by design.
 - Do not report a token gate as passing on an oracle recorded `gateable = no`.
+
+## The #1168 rider this branch carries, and why that is an exception
+
+`9a1f57348` is on this branch and is **not this row's work**. It moves
+`VT_GDN_OUT_BF16` from `scripts/env-doc-allowlist.txt` into
+`docs/ENVIRONMENT.md`, a `GDN-MOE-BF16-OUT` ([#1168](https://github.com/mudler/vllm.cpp/issues/1168))
+record repair. `AGENTS.md` §"Work happens in a worktree" narrows what counts as
+a unit of work and then says the narrowing "never licenses bundling unrelated
+work into one branch", so carrying it here needs an argument rather than a
+silence, and the commit's own body argues the *reclassification* — why the
+variable stopped being kernel-internal — and never the *bundling*.
+
+The argument for the bundling is this. It is a separate issue, carried on this
+branch by **explicit developer direction** rather than by an inference this
+session made. It is a two-line record move, `+1` in `docs/ENVIRONMENT.md` and
+`-1` in `scripts/env-doc-allowlist.txt`, and it touches **no surface this row
+touches** — this row writes the spec, the two `quantization-matrix.md` rows, the
+`engine-matrix.md` row, `.agents/issue-index.md`,
+`scripts/check-agent-record.py`, `docs/FEATURES.md`, `docs/STATUS.md` and
+`docs/BENCHMARKS.md`, and the intersection with those two files is empty. So the
+usual cost of bundling — a reviewer who cannot tell which change a finding
+belongs to, and a revert that takes the innocent half with it — is not paid
+here. It was kept as **its own commit** for exactly that reason: the two remain
+separately revertible by `git revert 9a1f57348`, which is the property bundling
+normally destroys.
+
+Recorded here rather than in that commit's message because the commit is now an
+ancestor of three merge commits on this branch, so amending it would rewrite
+published history, which this repair is not permitted to do. The commit that
+adds this section carries the same argument in its own message, so the reason is
+in Git history with a diff, an author and a date, as
+`AGENTS.md` §"Changing the rules or a checker" requires of an exception. This is
+visible debt, not a precedent: the next unrelated rider gets its own branch.
 
 ## Dependencies and blockers
 
@@ -649,14 +762,21 @@ them:
 - The `docs/USAGE.md` rows for all four artifacts, per
   [`porting-a-model.md`](../porting-a-model.md) §2.1. Owed by whichever row first
   makes an arm reachable, not by this spec.
-- A re-anchor pass over this spec's own `file:line` citations before any
-  implementation lands. They were read at `main` `1dac4f9a7` and a line number is
-  stale the moment the file above it moves, including inside the same pull
-  request.
+- A re-anchor pass over the `file:line` citations on **all three** surfaces this
+  change publishes them on — this spec, the two `quantization-matrix.md` rows
+  (which publish clickable `#L` permalinks), and the justifying comment in
+  `scripts/check-agent-record.py` — before any implementation lands. They were
+  re-derived at `origin/main` `4ee5f4a69` and a line number is stale the moment
+  the file above it moves, including inside the same pull request. This bullet
+  previously promised only the spec's citations, which is the narrower promise
+  that let the matrix permalinks go stale while the spec was being repaired.
+  `scripts/check-symbol-anchors.py` validates only `path::Symbol` citations, so
+  a bare line number is checked by a reader or not at all.
 
 ## Now
 
-All three rows are `READY`: the gap is verified against `main` `1dac4f9a7` and
+All three rows are `READY`: the gap is verified against `origin/main`
+`4ee5f4a69` and
 against the artifacts' own headers, and this spec is committed before any
 implementation. No `src/`, `include/` or `tests/` file changes in this change —
 `git diff origin/main..HEAD` over those three paths is empty, and that emptiness
