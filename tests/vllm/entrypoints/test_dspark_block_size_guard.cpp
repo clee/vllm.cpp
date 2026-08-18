@@ -152,7 +152,11 @@ TEST_CASE("the loader refuses k below the draft's block_size") {
 
 TEST_CASE("the refusal names the block and the k that was asked for") {
   // Upstream's message names both values, and so must ours: the user has to
-  // learn which number to raise k to.
+  // learn which number to raise k to. It also names the KEY the block came
+  // from, which upstream can hard-code because it reads one key and we cannot
+  // because we read two. On a published Qwen3 draft the 7 comes from
+  // `block_size`, so a message saying `dspark_block_size` would send the reader
+  // looking through their config for a key that is not in it.
   const ScratchDraft draft(kQwen3Block7);
   const EngineParams params = DsparkParams(draft.path(), 6);
   try {
@@ -160,8 +164,29 @@ TEST_CASE("the refusal names the block and the k that was asked for") {
     FAIL("expected a refusal for k=6 against a block-7 DSpark draft");
   } catch (const std::invalid_argument& e) {
     const std::string what = e.what();
+    INFO("what: ", what);
     CHECK(what.find('7') != std::string::npos);
     CHECK(what.find('6') != std::string::npos);
+    CHECK(what.find(">= block_size (7)") != std::string::npos);
+    CHECK(what.find("dspark_block_size") == std::string::npos);
+    // speculative.py:1024-1026 — the sentence that says what to type.
+    CHECK(what.find("Use num_speculative_tokens=7 or larger") !=
+          std::string::npos);
+  }
+}
+
+TEST_CASE("the refusal names dspark_block_size when that is the key") {
+  // The upstream-keyed shape gets upstream's wording, unchanged. The key name
+  // is threaded rather than assumed, so this pins both ends of the choice.
+  const ScratchDraft draft(kDsv4Block7);
+  const EngineParams params = DsparkParams(draft.path(), 6);
+  try {
+    LoadedEngine::ResolveSpecConfig(params, vllm::HfConfig{});
+    FAIL("expected a refusal for k=6 against a block-7 DSpark draft");
+  } catch (const std::invalid_argument& e) {
+    const std::string what = e.what();
+    INFO("what: ", what);
+    CHECK(what.find(">= dspark_block_size (7)") != std::string::npos);
   }
 }
 
@@ -220,6 +245,130 @@ TEST_CASE("a draft path with no config.json resolves as it did before") {
   // LoadDsparkDraft owns that message and names the path it looked in.
   const EngineParams params =
       DsparkParams("/nonexistent/dspark/draft/for/this/test", 7);
+  const std::optional<SpeculativeConfig> cfg =
+      LoadedEngine::ResolveSpecConfig(params, vllm::HfConfig{});
+  REQUIRE(cfg.has_value());
+  REQUIRE(cfg->num_speculative_tokens.has_value());
+  CHECK(*cfg->num_speculative_tokens == 7);
+}
+
+// ─── The SECOND call site: the draft load inside FromModelDir ────────────────
+//
+// Everything above enters at LoadedEngine::ResolveSpecConfig, which the
+// LoadedEngine constructor calls. It is not the first resolution a DSpark run
+// meets. `FromModelDir` resolves the draft config itself, before it constructs
+// the engine (src/vllm/entrypoints/model_loader.cpp, `maybe_load_dflash`), so
+// that site decides what the user sees and this suite did not touch it.
+//
+// It also could not, until the resolution moved ahead of the model load: the
+// site sat behind `LoadShards`, so reaching it needed a real target checkpoint
+// and no CPU test could arrive. That is why reverting the site alone left this
+// file 8/8 green while half the change was unmeasured. The cases below enter at
+// `FromModelDir` with a model directory that does not exist, which is the shape
+// `test_loaded_engine_dense.cpp` already uses to pin the device resolution
+// "BEFORE any path I/O": the speculative config is refused, or is resolved
+// without complaint, before the loader has an opinion about the target at all.
+//
+// The k the site used to pass was `ResolvedNumSpeculativeTokens()`
+// (include/vllm/config/speculative.h, `SpeculativeConfig::ResolvedNumSpeculativeTokens`),
+// which is `num_speculative_tokens.value_or(n_predict)` and therefore ZERO for a
+// user who named no k — the CLI never fills `n_predict`. With the floor made
+// reachable that refused a k of 0 against a key the checkpoint does not carry,
+// on a lane that works today.
+
+TEST_CASE("the loader refuses a short k before it touches the model directory") {
+  // RED before the repair: FromModelDir never resolved the draft config until
+  // after LoadShards, so this reported "model path is not a directory" and the
+  // block floor was not consulted on the path a user actually takes.
+  const ScratchDraft draft(kQwen3Block7);
+  EngineParams params = DsparkParams(draft.path(), 6);
+  try {
+    (void)LoadedEngine::FromModelDir("/nonexistent/vllm-cpp/dspark/target",
+                                     params);
+    FAIL("expected a refusal for k=6 against a block-7 DSpark draft");
+  } catch (const std::exception& e) {
+    const std::string what = e.what();
+    INFO("what: ", what);
+    CHECK(what.find("block_size (7)") != std::string::npos);
+    CHECK(what.find("got 6") != std::string::npos);
+    CHECK(what.find("model path is not a directory") == std::string::npos);
+  }
+}
+
+TEST_CASE("the loader does not refuse an absent k against a k of zero") {
+  // The Gemma4 default (speculative.py:945-961 then :973-979) has to reach the
+  // loader's own draft-load site, not only ResolveSpecConfig. Passing
+  // ResolvedNumSpeculativeTokens() here collapses "the user named no k" to k=0
+  // and refuses it against the draft's block, quoting a number nobody typed.
+  const ScratchDraft draft(kGemma4Block7);
+  EngineParams params = DsparkParams(draft.path(), std::nullopt);
+  try {
+    (void)LoadedEngine::FromModelDir("/nonexistent/vllm-cpp/dspark/target",
+                                     params);
+    FAIL("expected the missing target directory to be the failure");
+  } catch (const std::exception& e) {
+    const std::string what = e.what();
+    INFO("what: ", what);
+    CHECK(what.find("model path is not a directory") != std::string::npos);
+    CHECK(what.find("num_speculative_tokens") == std::string::npos);
+    CHECK(what.find("got 0") == std::string::npos);
+  }
+}
+
+TEST_CASE("the loader keeps the native Qwen3 no-k message at the draft load") {
+  // The shipped lane: a native Qwen3 draft carries no n_predict, so k stays
+  // required and the message that names WHY must survive. Before the repair the
+  // first resolution a user met was the draft-load site, which said
+  // "num_speculative_tokens >= dspark_block_size (7); got 0" instead — a key the
+  // checkpoint does not carry and a k the user never supplied.
+  const ScratchDraft draft(kQwen3Block7);
+  EngineParams params = DsparkParams(draft.path(), std::nullopt);
+  try {
+    (void)LoadedEngine::FromModelDir("/nonexistent/vllm-cpp/dspark/target",
+                                     params);
+    FAIL("expected a DSpark draft with no k to be refused");
+  } catch (const std::exception& e) {
+    const std::string what = e.what();
+    INFO("what: ", what);
+    CHECK(what.find("requires num_speculative_tokens") != std::string::npos);
+    CHECK(what.find("a DSpark draft config carries no n_predict") !=
+          std::string::npos);
+    CHECK(what.find("got 0") == std::string::npos);
+  }
+}
+
+// ─── The speculators layout ─────────────────────────────────────────────────
+//
+// Both shipped config layouts must resolve the floor identically. The
+// speculators checkpoint spells the draft under `transformer_layer_config` and
+// carries `block_size` as one of the copied keys
+// (src/vllm/model_executor/models/qwen3_dspark.cpp,
+// `Qwen3DSparkModel::TranslateSpeculatorsDsparkConfig`), so the read has to
+// translate before it looks — reading the raw document would find no block at
+// all and silently accept every k.
+const char* kSpeculatorsBlock7 = R"({
+  "speculators_model_type": "dspark",
+  "block_size": 7,
+  "markov_rank": 256,
+  "mask_token_id": 151669,
+  "aux_hidden_state_layer_ids": [2, 10, 18, 26, 34],
+  "transformer_layer_config": {
+    "model_type": "qwen3",
+    "hidden_size": 2048,
+    "num_hidden_layers": 1
+  }
+})";
+
+TEST_CASE("the speculators layout supplies the same block floor") {
+  const ScratchDraft draft(kSpeculatorsBlock7);
+  const EngineParams params = DsparkParams(draft.path(), 6);
+  CHECK_THROWS_AS(LoadedEngine::ResolveSpecConfig(params, vllm::HfConfig{}),
+                  std::invalid_argument);
+}
+
+TEST_CASE("the speculators layout accepts k at its block") {
+  const ScratchDraft draft(kSpeculatorsBlock7);
+  const EngineParams params = DsparkParams(draft.path(), 7);
   const std::optional<SpeculativeConfig> cfg =
       LoadedEngine::ResolveSpecConfig(params, vllm::HfConfig{});
   REQUIRE(cfg.has_value());

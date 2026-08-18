@@ -130,7 +130,8 @@ the output.
 | `speculative.py:945-961`, the Gemma4 normalization | the same helper | When `n_predict` is absent and `architectures` contains `Gemma4DSparkModel`, take `block_size` as `n_predict`. Guarded by the architecture name exactly as upstream guards it. |
 | `speculative.py:1011-1015`, the floor read | the same helper | Read `dspark_block_size` when present. **Divergence (§2):** fall back to `block_size` when it is not. |
 | `speculative.py:1003-1027`, the hard error | `include/vllm/config/speculative.h:179-185` | Already landed and already worded from upstream. Not re-implemented; only reached. |
-| `speculative.py:990-994`, k required | `model_loader.cpp:877-880` | The existing early throw fires before `ResolveDspark` sees `n_predict`, which would make the threaded `n_predict` default unreachable. Narrow it to fire only when the draft carries no `n_predict` either, and let `ResolveDspark` raise otherwise. |
+| `speculative.py:990-994`, k required | `model_loader.cpp`, `LoadedEngine::ResolveSpecConfig` | The existing early throw fires before `ResolveDspark` sees `n_predict`, which would make the threaded `n_predict` default unreachable. Narrow it to fire only when the draft carries no `n_predict` either, and let `ResolveDspark` raise otherwise. §7 R4 records what this claim was worth before §6b. |
+| `speculative.py:1018-1027`, the refusal's wording | `include/vllm/config/speculative.h`, `SpeculativeConfig::ResolveDspark` | Upstream names one key literally, because it reads one. We read two (§2), so the key is carried on `DsparkDraftKeys` and passed in; the parameter defaults to upstream's key. Upstream's third sentence, `Use num_speculative_tokens={n} or larger (e.g. 7).`, was dropped when the check was first ported and is restored (§6b, finding 2). |
 
 `ReadDsparkDraftKeys` resolves the draft directory with the existing
 `ResolveDflashDraftDir` (`model_loader.cpp:279`) and returns both values empty
@@ -139,11 +140,12 @@ that `LoadDsparkDraft` will later reject with its own message. It applies
 `TranslateSpeculatorsDsparkConfig` first, exactly as `LoadDsparkDraft` does, so
 both config layouts are read through the same normalized shape.
 
-This is the second read of the draft config, alongside the one at `:471-474`.
-`dspark-qwen3-routing.md` §3 already weighs a second read of a five-layer draft
-config and records it as not a measured cost. Hoisting the read would mean
-restructuring `FromModelDir`, which collides with the in-flight row for no
-correctness gain.
+This is the second read of the draft config, alongside the one in
+`LoadDsparkDraft`. `dspark-qwen3-routing.md` §3 already weighs a second read of a
+five-layer draft config and records it as not a measured cost. Hoisting the read
+would mean restructuring `FromModelDir`, which collides with the in-flight row
+for no correctness gain. §8 records the total, and the number the two rows reach
+together, as owed.
 
 ## 4. Work breakdown
 
@@ -178,12 +180,29 @@ New file `tests/vllm/entrypoints/test_dspark_block_size_guard.cpp`, entering at
 
 The last row is the regression guard for §3's filesystem-independence note.
 
+§6b adds five cases to the same file. Three enter at `LoadedEngine::FromModelDir`
+with a model directory that does not exist, which is where the second call site
+now resolves:
+
+| Case | Before §6b | After |
+|---|---|---|
+| Qwen3 draft, `block_size: 7`, `k = 6` | `model path is not a directory` — the floor was never consulted on the path a user takes | refused, naming the block and the `k` |
+| Gemma4 draft, no `k` | refused with `got 0` against a `k` nobody supplied | resolves; the missing target directory is the failure |
+| Qwen3 draft, no `k` | refused with `got 0` | refused with the shipped `requires num_speculative_tokens` message |
+
+Two more cover the speculators config layout at `ResolveSpecConfig`, where
+`block_size` arrives through `Qwen3DSparkModel::TranslateSpeculatorsDsparkConfig`'s
+copied-key list rather than at the top level. Nothing committed covered that
+layout, although it is one of the two this engine ships, and a read that did not
+translate first would find no block in it and accept every `k`.
+
 ## 6. Gates
 
 | Gate | Content | State |
 |---|---|---|
 | G1, focused | `test_dspark_block_size_guard` and `test_speculative_dspark` green, both reds captured first. | required, CPU |
-| G2, reachability | Restore `std::nullopt, std::nullopt` at `:881-883` in a scratch copy. `test_dspark_block_size_guard` must go red. A green here is the finding, not a pass. | required, CPU |
+| G2a, reachability of the `ResolveSpecConfig` site | Restore `std::nullopt, std::nullopt` at the `ResolveSpecConfig` call (`src/vllm/entrypoints/model_loader.cpp::ResolveSpecConfig`) in a scratch copy. `test_dspark_block_size_guard` must go red. A green here is the finding, not a pass. **This mutates ONE of the two sites**, which the row did not say until the fresh review found the other one unmeasured. | required, CPU |
+| G2b, reachability of the `FromModelDir` site | Restore the pre-repair resolution inside `maybe_load_dflash` (`src/vllm/entrypoints/model_loader.cpp::FromModelDir`) in a scratch copy, and separately restore only its `ResolvedNumSpeculativeTokens()` argument. Each must red `test_dspark_block_size_guard`. Before §6b neither did: the site sat behind `LoadShards`, so no CPU test could reach it and reverting it left the suite 8/8 GREEN. | required, CPU |
 | G3, run | On `Qwen3.8-27B` + `RadixArk/Qwen3.8-27B-DSpark` @ `85ef153b`, decode at `k = 6` against the pinned oracle at the same `k`, greedy, same prompts. This is the gate that shows whether a short `k` garbles, and therefore whether §2's stricter-than-upstream refusal is right. | **owed**, needs a GPU lease |
 | G4, spec-off | Decode with speculation off byte-identical before and after. The change touches only the dspark branch, so a difference is a defect in the change. | owed |
 
@@ -241,6 +260,79 @@ class. The file was restored and its sha256 checked equal to the pre-mutation
 value (`181250a7c130db41...`), and the suite returned to 8/8.
 
 
+## 6b. The fresh review's findings, and the repair (2026-08-18)
+
+The fresh review confirmed the fix, the divergence and the mutations of §6a, and
+returned two findings. Both are repaired here, on the same CPU-only build
+(`-DVLLM_CPP_CUDA=OFF -DCMAKE_BUILD_TYPE=RelWithDebInfo`), on top of a merge of
+`origin/main` at `c20018f8d`.
+
+**Finding 1, the second call site landed unreached and the record claimed the
+opposite.** Diagnosis and consequences: §7 R4. The repair does not patch the
+site's argument list. It DELETES the second resolution:
+`LoadedEngine::FromModelDir` now resolves the DSpark config once, at the top of
+the function, through `LoadedEngine::ResolveSpecConfig` — the same function the
+constructor calls — and `maybe_load_dflash` consumes that result. One resolution,
+one set of messages, one place the floor is applied. Patching the argument would
+have left two implementations of one rule, which is the shape that produced the
+finding.
+
+The resolution is placed after the `.gguf` branch, which keeps its own named
+refusal, and before every path, config, tokenizer and weight operation. Two
+things follow. A `k` the draft cannot serve is refused before the loader maps the
+target rather than after, which is the ordering the device resolution above it
+already has. And the site becomes reachable from a CPU test: `FromModelDir` with
+a model directory that does not exist now reaches the speculative resolution,
+which is the shape `tests/vllm/entrypoints/test_loaded_engine_dense.cpp` uses to
+pin that device resolution.
+
+**Finding 2, the refusal named a key the checkpoint does not carry.** The floor
+falls back to `block_size` (§2), and on BOTH published Qwen3 drafts that fallback
+is what supplies it, yet the message always said `dspark_block_size`. The key the
+value was read from is now carried on `DsparkDraftKeys` and passed to
+`SpeculativeConfig::ResolveDspark`, whose new `block_size_key` parameter defaults
+to upstream's key — so a caller supplying the upstream field gets upstream's
+wording unchanged. Upstream's third sentence, `Use num_speculative_tokens={n} or
+larger (e.g. 7).` (`speculative.py:1018-1027`), was dropped when the check was
+first ported and is restored in the same edit: the first two sentences say the
+`k` is wrong, and only the third says what to type.
+
+### Evidence
+
+**RED first, before the repair**, with the new cases compiled against the
+unrepaired tree (`compile_rc=0`, so this is a result and not a build failure):
+13 cases, 11 passed, 2 failed; 35 assertions, 30 passed, 5 failed;
+`Status: FAILURE!`. Both failures name the same thing — `FromModelDir` reached
+the missing directory before it had any opinion about the speculative config:
+
+```
+TEST CASE:  the loader refuses a short k before it touches the model directory
+  ERROR: CHECK( what.find("block_size (7)") != std::string::npos ) is NOT correct!
+  logged: what: model path is not a directory: /nonexistent/vllm-cpp/dspark/target
+TEST CASE:  the loader keeps the native Qwen3 no-k message at the draft load
+  ERROR: CHECK( what.find("requires num_speculative_tokens") != std::string::npos ) is NOT correct!
+  logged: what: model path is not a directory: /nonexistent/vllm-cpp/dspark/target
+```
+
+**GREEN after**, `test_dspark_block_size_guard`: 14 cases, 14 passed; 39
+assertions, 39 passed; `Status: SUCCESS!`. Neighbours, rebuilt and rerun at the
+same base: `test_speculative_dspark` 9/9 (30 assertions),
+`test_loaded_engine_dense` 19/19 (87), `test_speculative_unknown_keys` 9/9 (63),
+`test_qwen3_dspark_config` 8/8 (25).
+
+**The mutations.** Each compiled (`compile_rc=0`), each was confirmed applied
+with `git diff --stat`, and the file was restored from a byte copy and its
+sha256 rechecked equal afterwards.
+
+| Mutation | What it does | Result |
+|---|---|---|
+| G2b, the review's M4b | Restore the pre-repair resolution inside `maybe_load_dflash` and ignore the hoisted one | 14 cases, **2 failed**; 39 assertions, 5 failed. It was 8/8 GREEN before this repair. |
+| G2b', the `k`-of-zero in isolation | Keep the hoist, resolve with the pre-repair argument list (`ResolvedNumSpeculativeTokens()`) | 14 cases, **2 failed**. Message observed: `DSpark requires num_speculative_tokens >= block_size (7); got 0` — the reviewer's defect, reproduced and caught. |
+| G2a, the review's M1, which is also the §7 R5 landing hazard | Restore `std::nullopt, std::nullopt` at the `ResolveSpecConfig` site, which is what `row/DSPARK-QWEN3-ROUTING-IMPL` still carries there | 14 cases, **8 failed**; 39 assertions, 10 failed. A conflict resolution that takes the routing branch's copy of that call cannot land silently. |
+| The key-naming half | Drop `keys.block_floor_key` from the call | 14 cases, **1 failed**: the refusal says `dspark_block_size` where the 7 came from `block_size`. |
+
+G3 and G4 remain owed. No GPU on this host, and no run gate is claimed.
+
 ## 7. Risks and decisions
 
 **R1. The floor could be wrong about our implementation.** Upstream says a short
@@ -263,7 +355,31 @@ function that had none.** Mitigated by returning empty on a missing
 with `block_size` and no `k` is refused; upstream defaults `k`. After the change
 `ResolveDspark` raises the equivalent error when there is genuinely no
 `n_predict`, so the native Qwen3 case keeps today's message. This is a mirror
-repair, and it is required for the threaded `n_predict` to be reachable at all.
+repair.
+
+**It was justified in `c9282725` with a claim that was FALSE when it was
+written**, and the correction is kept here rather than quietly dropped. That
+commit said the narrowing was "required for the threaded `n_predict` to be
+reachable at all". It was not, because the threaded `n_predict` was unreachable
+end to end for an unrelated reason: the SECOND call site, inside `FromModelDir`,
+runs before the `LoadedEngine` constructor reaches `ResolveSpecConfig`, and it
+passed `ResolvedNumSpeculativeTokens()` — `num_speculative_tokens.value_or(n_predict)`,
+and therefore `0` for a user who named no `k`, because nothing fills `n_predict`
+on the CLI-side config. A no-`k` run was refused THERE, with
+`>= dspark_block_size (7); got 0`, before any default could apply. The fresh
+review measured it with a linked probe: `ResolvedNumSpeculativeTokens() with no
+user k = 0`, and both the Gemma4 and the native Qwen3 configs refused at site 2.
+
+Two consequences followed and both are repaired in §6b. The `## Tests` row
+"a Gemma4 draft's block_size defaults k" asserted a default production never
+reached. And the shipped native-Qwen3 no-`k` lane silently changed message, from
+`method "dspark" requires num_speculative_tokens (a DSpark draft config carries
+no n_predict)` to a block-floor refusal quoting a `k` the user never supplied
+against a key their checkpoint does not carry.
+
+With site 2 delegating to `ResolveSpecConfig`, the sentence above is true rather
+than aspirational: one resolution runs, it runs first, it applies the default,
+and the narrowing is what lets it.
 
 **R5. Collision with `SPEC-DSPARK-QWEN3-ROUTING`.** That row edits the same
 `ResolveSpecConfig` dspark branch to add classification. The two changes are
@@ -273,7 +389,18 @@ conflict textually. The mitigation is shape: this row's footprint in that branch
 is one helper call and the two argument lists, with the helper defined elsewhere
 in the file. Whichever lands second resolves by taking the other's classification
 lines whole and re-applying its own argument lines. Both rows read the same
-`config.json`, so a later cleanup can hoist one read; neither row should do it.
+`config.json`, so a later cleanup can hoist one read; neither row should do it
+(§8 carries the count as owed).
+
+**The hazard is specific, and it is now measured.** `row/DSPARK-QWEN3-ROUTING-IMPL`
+still carries `ResolveDspark(std::nullopt, std::nullopt, cli.num_speculative_tokens)`
+at that call, because it branched before this row. A resolution that takes its
+side of the conflict whole therefore DELETES this guard while resolving cleanly.
+§6b's G2a mutation is exactly that outcome, and it reds 8 of 14 cases in
+`test_dspark_block_size_guard`, so the deletion cannot land silently. This row's
+footprint in that branch stays one helper call and one argument list, and §6b
+adds nothing to it: the second call site is in `FromModelDir`, which the routing
+row does not touch.
 
 ## 8. Owed
 
@@ -291,6 +418,16 @@ lines whole and re-applying its own argument lines. Both rows read the same
   practice, and only the `block_size` fallback carries. That does not make the
   read wrong, and it is the reason §2 argues the fallback rather than relying on
   the upstream key.
+- **The draft `config.json` is opened and parsed more than once per load, and no
+  row owns hoisting it.** Today: `ReadDsparkDraftKeys` on each of the two
+  `ResolveSpecConfig` calls a load makes — `FromModelDir`'s and the
+  `LoadedEngine` constructor's — plus `LoadDsparkDraft`, so three. Once
+  `SPEC-DSPARK-QWEN3-ROUTING` ([#1193](https://github.com/mudler/vllm.cpp/issues/1193))
+  lands, `ReadDsparkDraftIdentity` rides the same two resolutions and the count
+  is five. It is a five-layer config and nobody has measured a cost, which is
+  why neither row hoists it: the hoist means restructuring `FromModelDir` while
+  a second row edits the same branch. Recorded here so whoever lands second does
+  not discover it, and so it is not fixed twice. §7 R5 owns the seam.
 
 ## 9. Stop conditions
 
@@ -308,6 +445,13 @@ lines whole and re-applying its own argument lines. Both rows read the same
 landed: the floor is threaded at both call sites, the red was captured before the
 fix, and the reachability mutation is recorded in §6a. W4 is owed and needs a GPU
 lease, so the row cannot reach `DONE` here.
+
+A fresh review then found the second call site landed unreached while §7 R4
+claimed otherwise, and found the refusal naming a key the published checkpoints
+do not carry. Both are repaired in §6b: the second resolution is deleted rather
+than patched, `FromModelDir` resolves once through `ResolveSpecConfig` ahead of
+the model load, and the message names the key the block was read from. Nothing
+in this row is unreached, so nothing here takes the staged-slice exception.
 
 The divergence of §2 is decided and recorded rather than deferred, and G3 is the
 measurement that can overturn it. Until G3 runs, the claim this row makes is that

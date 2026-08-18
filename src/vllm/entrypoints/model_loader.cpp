@@ -455,6 +455,10 @@ vllm::HfConfig MakeDsparkDraftConfig(const nlohmann::json& c) {
 struct DsparkDraftKeys {
   std::optional<int> n_predict = std::nullopt;
   std::optional<int> block_floor = std::nullopt;
+  // The key `block_floor` was actually read from, so the refusal can name it.
+  // Upstream's `dspark_block_size` unless the fallback below supplied it, which
+  // on both published Qwen3 drafts is always.
+  const char* block_floor_key = "dspark_block_size";
 };
 
 // Mirror of the getattr() reads upstream performs on the draft's hf_config
@@ -527,6 +531,7 @@ DsparkDraftKeys ReadDsparkDraftKeys(const std::optional<std::string>& draft_mode
   keys.block_floor = read_int("dspark_block_size");
   if (!keys.block_floor.has_value()) {
     keys.block_floor = read_int("block_size");  // the divergence, above
+    keys.block_floor_key = "block_size";
   }
   return keys;
 }
@@ -970,7 +975,8 @@ std::optional<vllm::SpeculativeConfig> LoadedEngine::ResolveSpecConfig(
           "(a DSpark draft config carries no n_predict)");
     }
     vllm::SpeculativeConfig resolved = vllm::SpeculativeConfig::ResolveDspark(
-        keys.n_predict, keys.block_floor, cli.num_speculative_tokens);
+        keys.n_predict, keys.block_floor, cli.num_speculative_tokens,
+        keys.block_floor_key);
     resolved.draft_model_path = cli.draft_model_path;
     return resolved;
   }
@@ -1673,6 +1679,40 @@ std::unique_ptr<LoadedEngine> LoadedEngine::FromModelDir(
         /*preselected_queue=*/nullptr, std::move(dflash)));
   }
 
+  // SPEC-DSPARK-BLOCK-SIZE-GUARD (#1225): resolve the DSpark speculative config
+  // ONCE, here, and hand the result to the draft load further down.
+  //
+  // The draft load used to resolve it a second time, with its own argument list,
+  // and it runs BEFORE the LoadedEngine constructor reaches ResolveSpecConfig —
+  // so that second copy, not this function, was the first resolution a DSpark run
+  // ever met. It passed `ResolvedNumSpeculativeTokens()`
+  // (`include/vllm/config/speculative.h::ResolvedNumSpeculativeTokens`), which is
+  // `num_speculative_tokens.value_or(n_predict)` and therefore ZERO when the user
+  // named no k, because nothing fills `n_predict` on the CLI-side config. Once the
+  // block floor became reachable that refused an absent k against a k of 0, naming
+  // a key the checkpoint does not carry and a number nobody typed, on the native
+  // Qwen3 lane that works today. The `n_predict` default and the "requires
+  // num_speculative_tokens" message were both unreachable in production for the
+  // same reason, while this file's tests asserted them through ResolveSpecConfig.
+  //
+  // Delegating deletes the second implementation instead of repairing it: one
+  // resolution, one set of messages, one place the floor is applied. The dspark
+  // branch of `ResolveSpecConfig` reads nothing off the target `HfConfig` — it
+  // resolves from the CLI config and the draft's own config.json — so the empty
+  // config here yields exactly what the constructor's re-resolution against the
+  // real one will yield.
+  //
+  // Placed AFTER the `.gguf` branch above, which keeps its own named refusal for
+  // a GGUF target, and BEFORE every path, config, tokenizer and weight operation
+  // below. A speculative length the draft cannot serve is then refused before the
+  // loader spends twenty minutes mapping a target it will not get to use, which is
+  // the same ordering the device resolution above exists to give.
+  std::optional<vllm::SpeculativeConfig> dspark_spec;
+  if (params.speculative_config.has_value() &&
+      params.speculative_config->method == "dspark") {
+    dspark_spec = LoadedEngine::ResolveSpecConfig(params, vllm::HfConfig{});
+  }
+
   if (!fs::exists(dir) || !fs::is_directory(dir)) {
     throw std::runtime_error("model path is not a directory: " + model_dir);
   }
@@ -1763,17 +1803,13 @@ std::unique_ptr<LoadedEngine> LoadedEngine::FromModelDir(
     if (!params.speculative_config.has_value()) return nullptr;
     // SPEC-DSPARK W5: the DSpark draft rides the same seam and the same bundle.
     if (params.speculative_config->method == "dspark") {
-      // SPEC-DSPARK-BLOCK-SIZE-GUARD (#1225): the same threaded read as the
-      // ResolveSpecConfig branch. This site resolves against the draft path
-      // directly, so it needs the floor too -- LoadDsparkDraft below sizes the
-      // block from this k alone.
-      const DsparkDraftKeys keys =
-          ReadDsparkDraftKeys(params.speculative_config->draft_model_path);
-      vllm::SpeculativeConfig resolved = vllm::SpeculativeConfig::ResolveDspark(
-          keys.n_predict, keys.block_floor,
-          params.speculative_config->ResolvedNumSpeculativeTokens());
-      resolved.draft_model_path = params.speculative_config->draft_model_path;
-      return LoadDsparkDraft(resolved, SharedHeadSource(shards.get()));
+      // SPEC-DSPARK-BLOCK-SIZE-GUARD (#1225): use the config resolved at the top
+      // of this function, which is where the block floor is applied. Resolving
+      // again here is what put a SECOND, differently-argued copy of the
+      // resolution ahead of the constructor's; `LoadDsparkDraft` sizes the draft
+      // block from this k alone, so the k it gets must be the refused-or-accepted
+      // one and not a second opinion.
+      return LoadDsparkDraft(*dspark_spec, SharedHeadSource(shards.get()));
     }
     if (params.speculative_config->method != "dflash") {
       return nullptr;
