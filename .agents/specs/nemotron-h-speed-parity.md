@@ -44,10 +44,10 @@ SAME run**: `--repeat` reruns the battery over one engine load and every leg is
 compared against the golden, so no timing leg is an ungated one. A binary whose
 tokens were not checked produces no accepted number here.
 
-**The measured tree carries the #1157 fix.** Until PR #1221 lands, the measured
-SHA is a merge of `origin/main` and `row/MODEL-NEMOTRON-H-ABI-A2P-1157-fix`, and
-every result states that. Without it every decode step on the CUDA path embeds
-the same placeholder id.
+**The measured tree carries the #1157 fix.** PR #1221 landed as `0ea5d249f`,
+verified by CONTENT on `main` rather than by the API, so the measured base is a
+SHA at or after it and every result records that SHA. Without the fix every
+decode step on the CUDA path embeds the same placeholder id.
 
 **The build is not degraded.** `fp4-mma`, `cutlass-nvfp4`, `cutlass-fp8`,
 `marlin-nvfp4` and `fa2` must each read `ENABLED for [121a]` in the configure
@@ -146,6 +146,15 @@ The `rc` job and its persisted logs are the evidence.
   say precisely why. Never substitute a different vLLM for the pin.
 - Return `NEEDS_DECISION` rather than benchmarking a configuration that avoids
   the host-side arms, because that would measure a model nobody can run.
+
+## What the correctness evidence covers, and what it does not
+
+The 96/96 belongs to ONE configuration: the three golden prompts, 32 tokens
+each, greedy with `ignore_eos`, batch 1 sequential, `max_model_len 512`, the
+256-block pool. The timing legs run that configuration and no other. A
+deviation in KV sizing, batching or sampling does not inherit the correctness
+evidence, and any such leg is reported as ungated rather than allowed to borrow
+coverage the gate does not give it.
 
 ## Owed
 
