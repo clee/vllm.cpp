@@ -1112,13 +1112,19 @@ std::vector<float> OwnedToF32(const NemotronHOwned& w) {
   return out;
 }
 
-// ─── #1157 DIAGNOSTIC SCAFFOLD (VT_NEMOTRON_H_DIAG) ─────────────────────────
+// ─── #1157 DIAGNOSTIC (VT_NEMOTRON_H_DIAG, documented in ENVIRONMENT.md) ────
 //
-// TEMPORARY. Off unless `VT_NEMOTRON_H_DIAG` is set to something other than
-// "0", and every download it does is inside that guard, so a production step
-// pays nothing. It exists to answer ONE question the CPU gate cannot: on the
-// real checkpoint, is the recurrent state the decode step READS the state the
-// previous step WROTE.
+// Off unless `VT_NEMOTRON_H_DIAG` is set to something other than "0", and every
+// download it does is inside that guard, so a production step pays nothing.
+//
+// It exists to answer the question no CPU gate on this model can: the runner
+// hands a decode step a device-resident input id and a recurrent page, and when
+// the tokens come out wrong, only the per-layer numbers say WHICH of the two the
+// step actually read. On #1157 they said the carry was exact — the state
+// gathered at step k+1 equalled the state written at step k, on host and on
+// GB10 alike — and that layer 0's embedding row was constant across two decode
+// steps that consumed different tokens. It stays for the next reader of this
+// model, because the next divergence here will be diagnosed the same way.
 bool NemotronHDiagEnabled() {
   static const bool on = [] {
     const char* e = std::getenv("VT_NEMOTRON_H_DIAG");
