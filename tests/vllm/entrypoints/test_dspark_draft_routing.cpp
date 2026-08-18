@@ -311,6 +311,20 @@ constexpr const char* kNativeQwen3DSparkConfig =
     R"({"architectures":["Qwen3DSparkModel"],"model_type":"qwen3",)"
     R"("block_size":7,"num_hidden_layers":5})";
 
+// The GEMMA4 name, with its own model_type. This is BRANCH 3 of
+// `SpeculativeConfig::ResolveDsparkArchitecture`: upstream leaves
+// `Gemma4DSparkModel` in place and normalizes only its keys, because upstream has
+// a Gemma4 DSpark class to dispatch to; this engine has one DSpark draft lane, so
+// the branch COLLAPSES onto "Qwen3DSparkModel". That collapse is the SECOND
+// tracked divergence recorded in .agents/specs/dspark-qwen3-routing.md
+// `## Outcome`, and until this case it was exercised only by the hand-called unit
+// case in tests/vllm/config/test_speculative_dspark.cpp — the shape AGENTS.md
+// `## Nothing lands dead` excludes, because it proves the function works rather
+// than that anything reaches it.
+constexpr const char* kGemma4DSparkConfig =
+    R"({"architectures":["Gemma4DSparkModel"],"model_type":"gemma4",)"
+    R"("block_size":7,"num_hidden_layers":5})";
+
 // The SPECULATORS layout, the second published shape `LoadDsparkDraft` accepts.
 // It declares NO top-level `architectures` at all — `speculators_model_type`
 // identifies it, and `Qwen3DSparkModel::TranslateSpeculatorsDsparkConfig` writes
@@ -401,6 +415,21 @@ TEST_CASE("loader admits a DSparkDraftModel + qwen3 draft") {
 
 TEST_CASE("loader still admits the native Qwen3DSparkModel draft") {
   const DraftDir draft("draft-native", kNativeQwen3DSparkConfig);
+  CHECK(RefusalForDraft(draft.path()).empty());
+}
+
+TEST_CASE("loader admits a Gemma4DSparkModel draft through the collapsed lane") {
+  // Branch 3 of `ResolveDsparkArchitecture`, reached from the production entry
+  // point rather than by hand. Two things are asserted at once: the Gemma4 name
+  // is ADMITTED (it must not fall into the DeepSeek-V4 refusal, which is what a
+  // `!has_qwen3 && !has_gemma4` guard reverted to `!has_qwen3` would do), and it
+  // is admitted onto the ONE lane this engine implements. The directory name
+  // carries no "dspark", so `IsDsparkDraft`'s model-id arm cannot answer for it
+  // and only the architecture arm can — the mute switch this file's
+  // `CarriesDsparkSubstring` precondition exists to keep shut.
+  const DraftDir draft("draft-gemma4", kGemma4DSparkConfig);
+  REQUIRE_FALSE(CarriesDsparkSubstring(draft.path()));
+
   CHECK(RefusalForDraft(draft.path()).empty());
 }
 
