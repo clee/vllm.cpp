@@ -13,7 +13,7 @@
 | Dependencies | Landed: `SPEC-DSPARK` W1-W8 ([dspark-spec-decode.md](dspark-spec-decode.md), `ACTIVE`). In flight and adjacent: `SPEC-DSPARK-QWEN3-ROUTING` ([dspark-qwen3-routing.md](dspark-qwen3-routing.md)), which edits the same `ResolveSpecConfig` branch for classification. §7 R5 records the seam between them. |
 | Work breakdown | §4. |
 | Risks/decisions | §7. |
-| Pin policy | Mirror the pin, plus one recorded divergence argued in §2 and repeated in the commit body. |
+| Pin policy | Mirror the pin, plus two recorded divergences: the block-key fallback argued in §2, and the error ORDER argued in §2a. Both are repeated in the commit body. |
 | Role / claim | fresh implementer, branch `row/DSPARK-BLOCK-SIZE-GUARD` |
 | Base | `65d6cdaed3e20e9bc70b4f9374fccafefefa7bd0` (origin/main, 2026-08-18) |
 | Parity pin | vLLM `555967922` (0.26.0.dev0) at `$VLLM_SOURCE` |
@@ -122,6 +122,54 @@ That is a deliberate stricter-than-upstream refusal on a path upstream leaves
 unguarded, and §6 G3 owes the oracle run that shows which side is right about
 the output.
 
+## 2a. The second divergence: where the refusal falls in the error order
+
+§6b moved the DSpark resolution to the top of `LoadedEngine::FromModelDir`,
+above the `fs::is_directory` refusal. That changes an ORDER upstream fixes, so it
+is a second divergence and it is recorded with the same rigour as §2 rather than
+left inside a design paragraph.
+
+**What upstream does.** `EngineArgs.create_engine_config` builds `ModelConfig` at
+`vllm/engine/arg_utils.py:1899` and `SpeculativeConfig` at `:2218`, in that
+order. A run that names both a target the loader cannot open and a `k` below the
+draft's block therefore meets the MODEL error first. The speculative refusal
+never runs.
+
+**What we do.** The same run meets the `k` error. `FromModelDir` resolves the
+DSpark config before it touches the model directory, so
+`DSpark requires num_speculative_tokens >= block_size (7); got 6` is what the
+user reads, and `model path is not a directory` is what they read after they fix
+the `k`.
+
+**Why the internal precedent does not carry it.** §6b argued the placement from
+the explicit device resolution that already runs before `const fs::path
+dir(model_dir)`. That precedent is real but it points the other way: vLLM builds
+`DeviceConfig` at `:1878`, BEFORE `ModelConfig` at `:1899`, so our device
+ordering mirrors upstream and says nothing about where a speculative config
+belongs. Upstream's own answer for the speculative config is `:2218`, after.
+
+**Why ours is better here, and why the mirror is not available.** Upstream splits
+the work: `create_engine_config` builds config objects only, and the target
+weights are loaded much later by the executor, so upstream never pays for the
+target when it refuses a `k`. Our `FromModelDir` is one function that validates
+the path, parses the config, builds the tokenizer AND loads the weights. Placing
+the resolution after the model-directory work would spend the whole target load
+before refusing a `k` the draft can never serve, which on a 27B target is minutes
+of mapping for a run that cannot start. There is no placement here that both
+mirrors upstream's order and keeps upstream's property that the refusal is cheap.
+We keep the property and diverge on the order.
+
+**The user-visible consequence, exactly.** It shows only when BOTH inputs are
+wrong, and then it is which message comes first — the `k` here, the model path
+upstream. Either way the user has to fix both. When only the `k` is wrong, which
+is the case the guard exists for, upstream and this loader agree on the message
+and differ only in how much work preceded it.
+
+**What would reverse it.** A `FromModelDir` split into a config phase and a load
+phase would let the model error keep its upstream position and still refuse the
+`k` before any weight is read. That is a restructuring this row does not own; §8
+carries it.
+
 ## 3. Port map
 
 | Upstream, at the pin | Lands in | Shape |
@@ -131,14 +179,16 @@ the output.
 | `speculative.py:1011-1015`, the floor read | the same helper | Read `dspark_block_size` when present. **Divergence (§2):** fall back to `block_size` when it is not. |
 | `speculative.py:1003-1027`, the hard error | `include/vllm/config/speculative.h:179-185` | Already landed and already worded from upstream. Not re-implemented; only reached. |
 | `speculative.py:990-994`, k required | `model_loader.cpp`, `LoadedEngine::ResolveSpecConfig` | The existing early throw fires before `ResolveDspark` sees `n_predict`, which would make the threaded `n_predict` default unreachable. Narrow it to fire only when the draft carries no `n_predict` either, and let `ResolveDspark` raise otherwise. §7 R4 records what this claim was worth before §6b. |
-| `speculative.py:1018-1027`, the refusal's wording | `include/vllm/config/speculative.h`, `SpeculativeConfig::ResolveDspark` | Upstream names one key literally, because it reads one. We read two (§2), so the key is carried on `DsparkDraftKeys` and passed in; the parameter defaults to upstream's key. Upstream's third sentence, `Use num_speculative_tokens={n} or larger (e.g. 7).`, was dropped when the check was first ported and is restored (§6b, finding 2). |
+| `speculative.py:1021-1026`, the refusal's wording | `include/vllm/config/speculative.h`, `SpeculativeConfig::ResolveDspark` | Upstream names one key literally, because it reads one. We read two (§2), so the key is carried on `DsparkDraftKeys` and passed in; the parameter defaults to upstream's key. Upstream's third sentence, `Use num_speculative_tokens={n} or larger (e.g. 7).`, was dropped when the check was first ported and is restored (§6b, finding 2). |
 
 `ReadDsparkDraftKeys` resolves the draft directory with the existing
 `ResolveDflashDraftDir` (`model_loader.cpp:279`) and returns both values empty
 when no `config.json` is there, so `ResolveSpecConfig` keeps working on a path
 that `LoadDsparkDraft` will later reject with its own message. It applies
 `TranslateSpeculatorsDsparkConfig` first, exactly as `LoadDsparkDraft` does, so
-both config layouts are read through the same normalized shape.
+both config layouts are read through the same normalized shape. On the two
+shipped layouts that translation moves neither key the guard reads, so the call
+is consistency insurance and not a measured requirement (§6c).
 
 This is the second read of the draft config, alongside the one in
 `LoadDsparkDraft`. `dspark-qwen3-routing.md` §3 already weighs a second read of a
@@ -190,11 +240,13 @@ now resolves:
 | Gemma4 draft, no `k` | refused with `got 0` against a `k` nobody supplied | resolves; the missing target directory is the failure |
 | Qwen3 draft, no `k` | refused with `got 0` | refused with the shipped `requires num_speculative_tokens` message |
 
-Two more cover the speculators config layout at `ResolveSpecConfig`, where
-`block_size` arrives through `Qwen3DSparkModel::TranslateSpeculatorsDsparkConfig`'s
-copied-key list rather than at the top level. Nothing committed covered that
-layout, although it is one of the two this engine ships, and a read that did not
-translate first would find no block in it and accept every `k`.
+Two more cover the speculators config layout at `ResolveSpecConfig`. Nothing
+committed covered that layout, although it is one of the two this engine ships,
+and that is what those two cases pin. They do NOT drive the
+`TranslateSpeculatorsDsparkConfig` call in `ReadDsparkDraftKeys`: `block_size`
+sits at the TOP LEVEL of the raw speculators document, which is where the
+translation's copied-key list reads it FROM, so a read of the untranslated
+document finds the same 7. §6c measures it.
 
 ## 6. Gates
 
@@ -293,7 +345,7 @@ value was read from is now carried on `DsparkDraftKeys` and passed to
 `SpeculativeConfig::ResolveDspark`, whose new `block_size_key` parameter defaults
 to upstream's key — so a caller supplying the upstream field gets upstream's
 wording unchanged. Upstream's third sentence, `Use num_speculative_tokens={n} or
-larger (e.g. 7).` (`speculative.py:1018-1027`), was dropped when the check was
+larger (e.g. 7).` (`speculative.py:1021-1026`), was dropped when the check was
 first ported and is restored in the same edit: the first two sentences say the
 `k` is wrong, and only the third says what to type.
 
@@ -328,10 +380,73 @@ sha256 rechecked equal afterwards.
 |---|---|---|
 | G2b, the review's M4b | Restore the pre-repair resolution inside `maybe_load_dflash` and ignore the hoisted one | 14 cases, **2 failed**; 39 assertions, 5 failed. It was 8/8 GREEN before this repair. |
 | G2b', the `k`-of-zero in isolation | Keep the hoist, resolve with the pre-repair argument list (`ResolvedNumSpeculativeTokens()`) | 14 cases, **2 failed**. Message observed: `DSpark requires num_speculative_tokens >= block_size (7); got 0` — the reviewer's defect, reproduced and caught. |
-| G2a, the review's M1, which is also the §7 R5 landing hazard | Restore `std::nullopt, std::nullopt` at the `ResolveSpecConfig` site, which is what `row/DSPARK-QWEN3-ROUTING-IMPL` still carries there | 14 cases, **8 failed**; 39 assertions, 10 failed. A conflict resolution that takes the routing branch's copy of that call cannot land silently. |
+| G2a, the review's M1, which is also the §7 R5 landing hazard | Restore `std::nullopt, std::nullopt` at the `ResolveSpecConfig` site, which is what `row/DSPARK-QWEN3-ROUTING-IMPL` still carries there | 14 cases, **8 failed**; 31 assertions, 10 failed. The total is BELOW the green run's 39 because a `REQUIRE` abort ends three cases early, so a reader who expects 39 here is reading a shortened run and not a muted one. A conflict resolution that takes the routing branch's copy of that call cannot land silently. |
 | The key-naming half | Drop `keys.block_floor_key` from the call | 14 cases, **1 failed**: the refusal says `dspark_block_size` where the 7 came from `block_size`. |
 
 G3 and G4 remain owed. No GPU on this host, and no run gate is claimed.
+
+## 6c. The second review's record findings, and what they measured (2026-08-18)
+
+The second fresh review returned `PASS` on the code: both §6b findings closed,
+the `FromModelDir` reordering verified safe, and every mutation of §6b's table
+reproduced. Its remaining findings were about this record, and they are repaired
+here. No behaviour changed.
+
+**The speculators cases were credited with a guarantee they do not carry.** §5
+and the test file both said that a read which did not translate first would find
+no block in the speculators document and accept every `k`. That is false.
+`block_size` sits at the TOP LEVEL of the raw speculators document — it is a
+copied key, so `Qwen3DSparkModel::TranslateSpeculatorsDsparkConfig` reads it
+from the top level and writes it to the top level — and the verbatim
+`RedHatAI/Qwen3.6-35B-A3B-speculator.dspark` fixture in
+`tests/vllm/models/test_qwen3_dspark_config.cpp` carries it there.
+
+Measured, on the same CPU-only build as §6a and §6b: with the
+`IsSpeculatorsDsparkConfig` / `TranslateSpeculatorsDsparkConfig` call DELETED
+from `ReadDsparkDraftKeys` (`compile_rc=0`, `git diff --stat` confirming one file
+and four deleted lines, so neither false-pass mode is in play), all five focused
+suites stay GREEN: `test_dspark_block_size_guard` 14/14 (39 assertions),
+`test_speculative_dspark` 9/9 (30), `test_loaded_engine_dense` 19/19 (87),
+`test_speculative_unknown_keys` 9/9 (63), `test_qwen3_dspark_config` 8/8 (25).
+The file was restored from a byte copy and its sha256 rechecked equal
+(`c9f16c45e34cf0cc...`).
+
+So the translate call is NOT load-bearing for the block floor on either shipped
+layout, and no other reason was found that makes it so. It stays for the reason
+§3 gives — the guard reads the same normalized shape `LoadDsparkDraft` builds,
+so the two cannot disagree about a future layout — and that reason is now
+recorded as unmeasured rather than asserted as tested. The two speculators cases
+keep their value: they pin the floor on the second shipped layout, which nothing
+committed covered.
+
+**The G2a assertion total did not reproduce.** §6b recorded `39 assertions, 10
+failed`; the run gives `31 assertions, 10 failed` over the same 14 cases with 8
+failed. A `REQUIRE` abort ends three cases before their later assertions run, so
+the total FALLS below the green run's 39. The failure counts were correct and are
+load-bearing; the total is corrected in place. §6b's M4b row was re-derived at
+the same time and reproduces exactly (14 cases, 2 failed; 39 assertions, 5
+failed).
+
+**Two records described the pre-repair shape.** The `SPEC-DSPARK-BLOCK-SIZE-GUARD`
+row in `.agents/engine-matrix.md` and
+`.agents/claims/CLAIM-SPEC-DSPARK-BLOCK-SIZE-GUARD.md` still said BOTH call sites
+pass `std::nullopt`, scoped the claim to the `ResolveDspark` ARGUMENTS at two
+line anchors that the repair deleted, and reported the pre-§6b `8/8, 22
+assertions`. Both are rewritten to the landed shape, without line anchors, which
+is what let them go stale inside one pull request.
+`.agents/issue-index.md` carries the same stale anchors and is deliberately NOT
+edited: it is append-only and carries `merge=union`, so an edited row duplicates
+rather than merges. `docs/STATUS.md` describes the historical defect and is left
+alone, because as history it is still true. `docs/USAGE.md` said "one recorded
+divergence" beside the `--speculative-config` row and now names both, because
+§2a's ordering is user-visible on that flag.
+
+**The upstream citation for the refusal's wording was off by three lines.** The
+message is at `speculative.py:1021-1026`; `:1018` is the comparison in the `if`.
+Corrected in §3, in §6b and in the comment above the throw in
+`include/vllm/config/speculative.h`. The `(e.g. 7)` that reads like a duplicate
+of the `num_speculative_tokens={n}` before it is upstream's own, at `:1025-1026`,
+and is mirrored deliberately.
 
 ## 7. Risks and decisions
 
@@ -418,6 +533,21 @@ row does not touch.
   practice, and only the `block_size` fallback carries. That does not make the
   read wrong, and it is the reason §2 argues the fallback rather than relying on
   the upstream key.
+- **No `VT_CHECK` guards the `*dspark_spec` dereference in `maybe_load_dflash`,
+  and that is deliberate.** The optional is filled by exactly the condition the
+  dereference sits behind — `params.speculative_config->method == "dspark"` — so
+  the dspark branch of `ResolveSpecConfig` cannot return `nullopt` and no input
+  reaches an empty one. A check there would make the coupling local, but nothing
+  can drive it, and an unreachable check is dead code under `AGENTS.md`
+  `## Nothing lands dead`. The second review raised it and accepted this answer.
+  If a later row lets that branch return `nullopt` — a classification that
+  declines the method, say — the check becomes testable and is owed with the
+  test that reds without it.
+- **Splitting `FromModelDir` into a config phase and a load phase** would let the
+  model-directory error keep its upstream position (§2a) while the `k` refusal
+  still runs before any weight is read, which is the one shape that needs no
+  divergence. It restructures a function two rows are editing, so it is not this
+  row's work. Unowned; it needs an issue before anyone starts it.
 - **The draft `config.json` is opened and parsed more than once per load, and no
   row owns hoisting it.** Today: `ReadDsparkDraftKeys` on each of the two
   `ResolveSpecConfig` calls a load makes — `FromModelDir`'s and the
@@ -442,9 +572,9 @@ row does not touch.
 
 `ACTIVE`, not `DONE`. The spec is committed,
 [#1225](https://github.com/mudler/vllm.cpp/issues/1225) is open, and W1-W3 have
-landed: the floor is threaded at both call sites, the red was captured before the
-fix, and the reachability mutation is recorded in §6a. W4 is owed and needs a GPU
-lease, so the row cannot reach `DONE` here.
+landed: the floor is threaded into the resolution the loader runs, the red was
+captured before the fix, and the reachability mutations are recorded in §6a and
+§6b. W4 is owed and needs a GPU lease, so the row cannot reach `DONE` here.
 
 A fresh review then found the second call site landed unreached while §7 R4
 claimed otherwise, and found the refusal naming a key the published checkpoints
@@ -453,8 +583,13 @@ than patched, `FromModelDir` resolves once through `ResolveSpecConfig` ahead of
 the model load, and the message names the key the block was read from. Nothing
 in this row is unreached, so nothing here takes the staged-slice exception.
 
-The divergence of §2 is decided and recorded rather than deferred, and G3 is the
-measurement that can overturn it. Until G3 runs, the claim this row makes is that
+A second fresh review returned `PASS` on the code and left three record
+findings, repaired in §6c: a guarantee the speculators cases were credited with
+and do not carry, the error-order divergence now argued in §2a instead of left in
+a design paragraph, and one mutation total that did not reproduce.
+
+The divergences of §2 and §2a are decided and recorded rather than deferred, and
+G3 is the measurement that can overturn §2's. Until G3 runs, the claim this row makes is that
 a `k` below the draft's block is REFUSED, not that a `k` below the block would
 have garbled: the second is upstream's statement and our structural reading of
 the draft path, not our measurement.

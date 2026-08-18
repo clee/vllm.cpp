@@ -339,13 +339,21 @@ TEST_CASE("the loader keeps the native Qwen3 no-k message at the draft load") {
 
 // ─── The speculators layout ─────────────────────────────────────────────────
 //
-// Both shipped config layouts must resolve the floor identically. The
-// speculators checkpoint spells the draft under `transformer_layer_config` and
-// carries `block_size` as one of the copied keys
-// (src/vllm/model_executor/models/qwen3_dspark.cpp,
-// `Qwen3DSparkModel::TranslateSpeculatorsDsparkConfig`), so the read has to
-// translate before it looks — reading the raw document would find no block at
-// all and silently accept every k.
+// Both shipped config layouts must resolve the floor identically. Nothing
+// committed covered the speculators one, although it is one of the two this
+// engine ships, so these two cases pin the floor on it.
+//
+// They do NOT prove the `TranslateSpeculatorsDsparkConfig` call in
+// `ReadDsparkDraftKeys`. The speculators layout spells the draft BODY under
+// `transformer_layer_config`, but `block_size` sits at the TOP LEVEL of the raw
+// document — that is where the translation copies it FROM
+// (src/vllm/model_executor/models/qwen3_dspark.cpp, the copied-key list), and
+// the verbatim RedHatAI/Qwen3.6-35B-A3B-speculator.dspark fixture in
+// tests/vllm/models/test_qwen3_dspark_config.cpp carries it there. Deleting the
+// translate call leaves all five focused suites green, measured on 2026-08-18
+// (.agents/specs/dspark-block-size-guard.md §6c). The call stays because the
+// guard must read the same normalized shape `LoadDsparkDraft` builds, and that
+// reason is recorded as UNMEASURED rather than as tested here.
 const char* kSpeculatorsBlock7 = R"({
   "speculators_model_type": "dspark",
   "block_size": 7,

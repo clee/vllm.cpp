@@ -189,7 +189,7 @@ struct SpeculativeConfig {
           "\"num_speculative_tokens\" was not provided");
     }
     if (dspark_block_size.has_value() && *k < *dspark_block_size) {
-      // speculative.py:1018-1027 verbatim, including the third sentence that
+      // speculative.py:1021-1026 verbatim, including the third sentence that
       // says which value to use. It was dropped when the check was first ported
       // and is restored here: the first two sentences tell the user the k is
       // wrong, and only the third tells them what to type.
