@@ -55,6 +55,15 @@ TEST_CASE("CPU platform is self-registered and advertises CPU capabilities") {
   CHECK_FALSE(cpu.opaque_attention_op());
   CHECK_FALSE(cpu.is_integrated_gpu());
   CHECK_FALSE(cpu.support_static_graph_mode());
+  // ENG-EXPERT-STREAM-DEVICE W0b (#1124): the CPU leg does NOT override this.
+  //
+  // That reads backwards at first glance — a CPU kernel obviously reads host
+  // memory — and it is the right answer, because the predicate exists to name
+  // the platforms that are NOT the CPU and can still do it. Every consumer asks
+  // `is_cpu() || host_memory_is_device_addressable()`, so answering true here
+  // would make the second term untestable on this tier: it would be satisfied
+  // by the first for the one platform this build has.
+  CHECK_FALSE(cpu.host_memory_is_device_addressable());
   // S7 residency / FA2 POLICY — base false on CPU: it reads host weights/state
   // in place (no staging) and has no FA2 kernel, exactly what the converted
   // `device==kCUDA` gates answered on a CPU device (byte-identical).
@@ -253,6 +262,71 @@ TEST_CASE("is_device_capability_family matches any <major>.x (interface.py:441-4
   // S7 additions default false on the base too (the CUDA ANSWER lives in the leg).
   CHECK_FALSE(sm121.needs_weight_staging());
   CHECK_FALSE(sm121.supports_fa2_attention());
+  // W0b default. Being wrong here hands a HOST pointer to a DEVICE kernel, so
+  // the base must be the refusing answer and a platform must opt in from a
+  // probe. This stub does not override it and its device_type() is kCUDA, which
+  // is exactly the shape that would be wrong if the answer lived at the call
+  // site as a `device == kCUDA` test.
+  CHECK_FALSE(sm121.host_memory_is_device_addressable());
+}
+
+namespace {
+// ENG-EXPERT-STREAM-DEVICE W0b (#1124). A platform that STAGES its weights and
+// can ALSO read host memory from a kernel — the GB10 shape, which has no other
+// representative on a CPU tier. It exists to prove the two predicates are
+// independent, which is the whole claim W0b rests on: if
+// `host_memory_is_device_addressable()` were derivable from any predicate the
+// seam already had, W0b would be a call-site test rather than a new one.
+class FakeUnifiedAddressablePlatform final : public Platform {
+ public:
+  DeviceType device_type() const override { return DeviceType::kCUDA; }
+  vt::Backend& backend() const override { return vt::GetBackend(DeviceType::kCPU); }
+  DeviceCapability get_device_capability() const override { return {12, 1}; }
+  std::vector<DType> supported_dtypes() const override { return {DType::kBF16}; }
+  ResidencyPolicy residency_policy() const override { return {}; }
+  bool needs_weight_staging() const override { return true; }
+  bool is_integrated_gpu() const override { return true; }
+  bool host_memory_is_device_addressable() const override { return true; }
+};
+}  // namespace
+
+TEST_CASE("host_memory_is_device_addressable is independent of every neighbour") {
+  FakeUnifiedAddressablePlatform gb10;
+  Platform& cpu = GetPlatform(DeviceType::kCPU);
+
+  // The value threads through the virtual at all: a platform that overrides it
+  // answers its own value, not the base's.
+  CHECK(gb10.host_memory_is_device_addressable());
+
+  // AGAINST needs_weight_staging. Both TRUE here, and that combination is the
+  // one the row exists for: the CUDA programming model still binds distinct
+  // device pointers for every staged weight, AND a kernel can follow a host
+  // pointer. A lane keyed on `!needs_weight_staging()` would never fire on this
+  // platform; a lane keyed on this predicate does.
+  CHECK(gb10.needs_weight_staging());
+  CHECK(gb10.needs_weight_staging() == gb10.host_memory_is_device_addressable());
+
+  // AGAINST is_cpu(). This is NOT a CPU, which is the entire point: the guard
+  // being lifted in qwen3_5.cpp is `is_cpu()`, and it answers false here.
+  CHECK_FALSE(gb10.is_cpu());
+  CHECK(gb10.is_cpu() != gb10.host_memory_is_device_addressable());
+
+  // AGAINST the CPU leg, in the other direction: the CPU IS host memory and
+  // still answers false (see the CPU case for why), so the two predicates
+  // DIVERGE on both platforms this build can construct. Neither is a rename of
+  // the other, in either direction.
+  CHECK(cpu.is_cpu());
+  CHECK_FALSE(cpu.host_memory_is_device_addressable());
+  CHECK(cpu.is_cpu() != cpu.host_memory_is_device_addressable());
+
+  // AGAINST the backend seam it is often confused with.
+  // `Backend::DeviceMemoryIsHostAddressable()` asks whether the HOST may
+  // dereference a DEVICE allocation; this asks the reverse. The CPU backend
+  // this stub borrows answers false to that one while the platform answers true
+  // to this one, so they are not the same bit read twice.
+  CHECK_FALSE(gb10.backend().DeviceMemoryIsHostAddressable());
+  CHECK(gb10.host_memory_is_device_addressable() !=
+        gb10.backend().DeviceMemoryIsHostAddressable());
 }
 
 // The CUDA leg's capability ANSWERS, exercised only where a real CUDA platform is
@@ -288,6 +362,25 @@ TEST_CASE("CUDA leg capability values (GPU build only)") {
   // device-combine/scatter gates (async sampling into device-addressable host mem).
   CHECK(cu.is_integrated_gpu() == cu.is_unified_memory());
   CHECK(cu.is_integrated_gpu());  // true on GB10
+
+  // W0b host_memory_is_device_addressable (#1124), probed at registration from
+  // `cudaDevAttrPageableMemoryAccess AND cudaDevAttrIntegrated`.
+  //
+  // THE CONJUNCTION IS ASSERTED, not the value: a discrete CUDA card with HMM
+  // reports pageable access and is NOT integrated, and this predicate must be
+  // false there or the expert-stream lane would serve 6.95 GB per token over
+  // PCIe with page migration. So the implication holds on EVERY CUDA device,
+  // and it is what a discrete box would catch. The board-specific `true` below
+  // is asserted only where the device also says it is integrated.
+  CHECK((!cu.host_memory_is_device_addressable() || cu.is_integrated_gpu()));
+  if (cu.is_integrated_gpu()) CHECK(cu.host_memory_is_device_addressable());
+
+  // ...and it is NOT `needs_weight_staging()` inverted. On GB10 BOTH are true,
+  // which is the combination that made this a new predicate rather than a
+  // reuse: the CUDA path still stages every ordinary weight, and a kernel can
+  // still follow a host pointer.
+  CHECK(cu.needs_weight_staging());
+  CHECK(cu.needs_weight_staging() == cu.host_memory_is_device_addressable());
 
   // S7 needs_weight_staging: unconditional true on CUDA — the CUDA path stages
   // host tensors into device-resident buffers even though GB10 is physically

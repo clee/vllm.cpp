@@ -3898,6 +3898,36 @@ VT_MOE_EXPERT_STREAM_SLOTS=8000 \
                    --prompt "The capital of France is" --max-tokens 16
 ```
 
+### Which device can serve it
+
+`--device cpu` serves this today, and that is the arm every published number for
+this checkpoint was measured on.
+
+`--device cuda` refuses at load, by design, when the weights cannot be staged
+into device memory (issue
+[#1123](https://github.com/mudler/vllm.cpp/issues/1123)). The message names the
+byte counts on both sides. That refusal is now **conditional on the lane**
+(`ENG-EXPERT-STREAM-DEVICE` W0d, issue
+[#1124](https://github.com/mudler/vllm.cpp/issues/1124)): with expert streaming
+on, and on a device whose kernels can dereference host memory, the routed-expert
+towers are not staged at all — their slices are read from the host slot store in
+place — so what has to fit is the NON-expert remainder plus the slot arena
+rather than the whole file.
+
+Two limits, stated plainly rather than left to be discovered.
+
+* **The device has to be probed capable, and most are not.** The condition is
+  `cudaDevAttrPageableMemoryAccess AND cudaDevAttrIntegrated` — an integrated,
+  unified part. A DISCRETE card answers false, keeps staging every tower and
+  keeps the refusal. That is deliberate: a slot store the card cannot read is
+  not a lane, and giving it one is later work on the same row.
+* **No speed claim is attached.** The measurement on the one machine that
+  answers true has not run at the time of writing; `docs/BENCHMARKS.md` carries
+  it as `PENDING`. Device access to host-resident weights on that part has a
+  recorded penalty, and this lane reads ~6.95 GB of expert bytes per token that
+  way, so a CUDA arm slower than the CPU arm is a real possible outcome. Read
+  the benchmarks file before assuming the GPU is the faster arm here.
+
 ### The same thing as config, and which one wins
 
 The residency knobs are also config keys, under the `vllm_cpp` key of

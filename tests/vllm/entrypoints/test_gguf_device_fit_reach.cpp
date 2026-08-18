@@ -100,11 +100,20 @@ class StagingPlatform final : public vllm::platforms::Platform {
     return {vt::DType::kBF16};
   }
   bool needs_weight_staging() const override { return true; }
+  // ENG-EXPERT-STREAM-DEVICE W0d (#1124). The second half of the loader's lane
+  // condition. A settable field for the same reason `create_queue_throws` is
+  // one: the platform registry is process-global, so a second registration would
+  // fight this one, and a flag lets a case move exactly the bit under test.
+  bool host_memory_is_device_addressable() const override {
+    return host_addressable;
+  }
   vllm::platforms::ResidencyPolicy residency_policy() const override {
     vllm::platforms::ResidencyPolicy p;
     p.device_memory_total_bytes = budget_;
     return p;
   }
+
+  bool host_addressable = false;
 
  private:
   HostBackend& backend_;
@@ -175,6 +184,70 @@ std::string BuildSyntheticMoeGguf() {
 }
 
 constexpr size_t kStagedLowerBound = 8192;
+
+// ENG-EXPERT-STREAM-DEVICE W0d (#1124). The same synthetic model plus ONE stacked
+// expert tower, so the streaming lane has something to serve.
+//
+//   blk.0.ffn_gate_exps.weight  Q8_0, ne [32, 2, 4] -> 256 elems, 8 blocks, 272 B
+//
+// So the lane-OFF bound is 8192 + 272 = 8464, and the lane-ON bound is 8192 plus
+// the slot arena. `VT_MOE_EXPERT_STREAM_SLOTS` is pinned to 2 below and the slot
+// size resolves to the largest per-expert slice, 272/4 = 68, so the arena is 136
+// and the lane-ON bound is 8328. The two bounds STRADDLE the budget the cases
+// use, which is what makes them a real comparison rather than two runs of the
+// same arithmetic.
+constexpr size_t kExpertTowerStaged = 272;
+constexpr size_t kLaneOffBound = kStagedLowerBound + kExpertTowerStaged;  // 8464
+constexpr size_t kArenaBytes = 136;                                      // 2 x 68
+constexpr size_t kLaneOnBound = kStagedLowerBound + kArenaBytes;          // 8328
+
+std::string Q8BlockBytes() {
+  std::string b(2, '\0');
+  b[1] = '\x3c';  // f16 1.0, little-endian
+  for (int i = 0; i < 32; ++i) b.push_back(static_cast<char>(i));
+  return b;
+}
+
+std::string BuildSyntheticMoeGgufWithExpertTower() {
+  GgufModelBuilder b;
+  b.AddKv(StrKv("general.architecture", "qwen35moe"));
+  b.AddKv(U32Kv("qwen35moe.embedding_length", 64));
+  b.AddKv(U32Kv("qwen35moe.block_count", 2));
+  b.AddKv(U32Kv("qwen35moe.attention.head_count", 4));
+  b.AddKv(U32Kv("qwen35moe.attention.head_count_kv", 2));
+  b.AddKv(U32Kv("qwen35moe.attention.key_length", 16));
+  b.AddKv(U32Kv("qwen35moe.expert_count", 4));
+  b.AddKv(U32Kv("qwen35moe.expert_used_count", 2));
+  b.AddKv(U32Kv("qwen35moe.expert_feed_forward_length", 32));
+  b.AddKv(U32Kv("qwen35moe.expert_shared_feed_forward_length", 32));
+  b.AddKv(U32Kv("qwen35moe.ssm.group_count", 2));
+  b.AddKv(U32Kv("qwen35moe.ssm.time_step_rank", 4));
+  b.AddKv(U32Kv("qwen35moe.ssm.state_size", 8));
+  b.AddKv(U32Kv("qwen35moe.ssm.conv_kernel", 4));
+  b.AddKv(U32Kv("qwen35moe.full_attention_interval", 4));
+  b.AddKv(U32Kv("qwen35moe.context_length", 256));
+  b.AddKv(gguf_test::F32Kv("qwen35moe.rope.freq_base", 1000000.0F));
+  b.AddKv(gguf_test::F32Kv("qwen35moe.attention.layer_norm_rms_epsilon", 1e-6F));
+  b.AddTensor("token_embd.weight", {64, 64}, /*ggml_type=*/0,
+              std::string(4096 * 4, '\0'));
+  std::string tower;
+  for (int i = 0; i < 8; ++i) tower += Q8BlockBytes();
+  b.AddTensor("blk.0.ffn_gate_exps.weight", {32, 2, 4}, /*ggml_type=*/8, tower);
+  return b.Build();
+}
+
+// The lane's environment, set before any case runs. `VT_MOE_EXPERT_STREAM`
+// LATCHES on first read, so a case that set it in its own body would work today
+// and break the moment a case ordering changed — the same hazard, and the same
+// remedy, as the expert-stream suites. It is inert for every case that leaves
+// `host_addressable` false, because the loader short-circuits before asking.
+struct EnableExpertStreaming {
+  EnableExpertStreaming() {
+    vllm_test::SetEnv("VT_MOE_EXPERT_STREAM", "1");
+    vllm_test::SetEnv("VT_MOE_EXPERT_STREAM_SLOTS", "2");
+  }
+};
+const EnableExpertStreaming kEnableExpertStreaming;
 
 std::string ThrownMessage(const std::string& gguf_path, vllm::Device device) {
   vllm::entrypoints::EngineParams params;
@@ -315,4 +388,81 @@ TEST_CASE("device fit: an explicit CPU load is never refused, at any budget") {
   CAPTURE(message);
   CHECK(message.find("cannot serve this GGUF") == std::string::npos);
   CHECK(message.find("tokenizer: GGUF missing kv") != std::string::npos);
+}
+
+// --- ENG-EXPERT-STREAM-DEVICE W0d (#1124): does the LOADER pass the lane? ------
+//
+// The arithmetic is gated in test_gguf_device_fit. This is the different
+// question, and it is the one that decides whether a 369.96 GiB checkpoint loads
+// at all: the refusal fires before the tokenizer and before any weight I/O, so
+// unless the loader itself computes the lane and hands it to the predicate, the
+// device arm never starts. Deleting the `StreamedExpertLane` block in
+// `model_loader.cpp` makes the permitting case below refuse, which is red.
+//
+// All three cases use ONE file, ONE platform and ONE budget, and differ only in
+// `host_addressable` — the probed bit W0b added. That is the comparison: same
+// checkpoint, same device memory, refused without the predicate and served with
+// it.
+
+TEST_CASE("device fit W0d: a device that cannot read host slots is still refused") {
+  RegisterFakeStagingPlatform();
+  Platform().host_addressable = false;
+  TempFile f(BuildSyntheticMoeGgufWithExpertTower());
+
+  // Between the two bounds: above the lane-ON figure, below the lane-OFF one.
+  vllm_test::SetEnv("VT_DEVICE_WEIGHT_BUDGET_BYTES", std::to_string(kLaneOnBound + 1));
+  const std::string message = ThrownMessage(f.path(), vllm::Device::kNamedPlatform);
+  vllm_test::UnsetEnv("VT_DEVICE_WEIGHT_BUDGET_BYTES");
+
+  REQUIRE_FALSE(message.empty());
+  CAPTURE(message);
+  CHECK(message.find("cannot serve this GGUF") != std::string::npos);
+  // The WHOLE table, expert tower included — this is the pre-W0d number, and it
+  // is what a discrete GPU still gets.
+  CHECK(message.find(std::to_string(kLaneOffBound)) != std::string::npos);
+  // ...and no lane note, because no lane was computed.
+  CHECK(message.find("the expert-stream lane IS active") == std::string::npos);
+}
+
+TEST_CASE("device fit W0d: a host-addressable device is LET THROUGH on the same budget") {
+  RegisterFakeStagingPlatform();
+  Platform().host_addressable = true;
+  TempFile f(BuildSyntheticMoeGgufWithExpertTower());
+
+  vllm_test::SetEnv("VT_DEVICE_WEIGHT_BUDGET_BYTES", std::to_string(kLaneOnBound + 1));
+  const std::string message = ThrownMessage(f.path(), vllm::Device::kNamedPlatform);
+  vllm_test::UnsetEnv("VT_DEVICE_WEIGHT_BUDGET_BYTES");
+  Platform().host_addressable = false;
+
+  // Same file, same budget, same platform: the ONE bit that moved is the probed
+  // predicate, and the load now gets past the check to die at the tokenizer —
+  // the step immediately after it. The later error is asserted POSITIVELY, so a
+  // loader that died earlier for an unrelated reason cannot pass this case.
+  REQUIRE_FALSE(message.empty());
+  CAPTURE(message);
+  CHECK(message.find("cannot serve this GGUF") == std::string::npos);
+  CHECK(message.find("tokenizer: GGUF missing kv") != std::string::npos);
+}
+
+TEST_CASE("device fit W0d: when the lane is on and it STILL does not fit, the message says so") {
+  RegisterFakeStagingPlatform();
+  Platform().host_addressable = true;
+  TempFile f(BuildSyntheticMoeGgufWithExpertTower());
+
+  // One byte under the lane-ON bound. This case is the positive proof that the
+  // loader computed and passed the lane rather than merely happening to permit
+  // the load: only a footprint built WITH the lane can produce this note and
+  // this number, and the number is the arena the two resolvers actually resolve.
+  vllm_test::SetEnv("VT_DEVICE_WEIGHT_BUDGET_BYTES", std::to_string(kLaneOnBound - 1));
+  const std::string message = ThrownMessage(f.path(), vllm::Device::kNamedPlatform);
+  vllm_test::UnsetEnv("VT_DEVICE_WEIGHT_BUDGET_BYTES");
+  Platform().host_addressable = false;
+
+  REQUIRE_FALSE(message.empty());
+  CAPTURE(message);
+  CHECK(message.find("cannot serve this GGUF") != std::string::npos);
+  CHECK(message.find(std::to_string(kLaneOnBound)) != std::string::npos);
+  CHECK(message.find("the expert-stream lane IS active") != std::string::npos);
+  CHECK(message.find(std::to_string(kExpertTowerStaged)) != std::string::npos);
+  CHECK(message.find(std::to_string(kArenaBytes)) != std::string::npos);
 }

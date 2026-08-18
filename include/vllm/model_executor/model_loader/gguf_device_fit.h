@@ -75,6 +75,37 @@ namespace vllm {
 // not invented here. The under-count is owed to the startup memory profile
 // (`KV-WARMUP-PROFILE`) for the same reason: an invented headroom fraction here
 // would be the guess this bound exists to avoid.
+// ENG-EXPERT-STREAM-DEVICE W0d (issue #1124). The one input that tells the bound
+// above "these tensors are NOT staged, and this arena is what the device pays
+// instead".
+//
+// WHY THIS AND NOT A GENERAL PER-TENSOR STAGING POLICY. The header above records
+// that closing its over-count "means teaching the bound which tensors THIS load
+// will stage, which is load policy and not a property of the file, so it is owed
+// and not invented here" (issue #1136). That judgement stands, and this is not
+// that: it is not a predicate, not a callback and not a policy object. It is one
+// literal name suffix and one byte count, both known at load, describing a lane
+// that is either on or off for the whole file. A caller cannot express "stage
+// this tensor and not that one" through it.
+//
+// EMPTY MEANS OFF, and off must be BYTE-IDENTICAL to the pre-W0d bound — same
+// sum, same tensor count, same largest tensor, same message. That is a gate
+// (`test_gguf_device_fit`), because a load-time refusal that quietly moved for
+// every CPU user would be a far worse defect than the one this input removes.
+struct StreamedExpertLane {
+  // The tensor-name SUFFIX the slot lane serves. On a llama.cpp MoE export the
+  // stacked expert towers are `blk.<n>.ffn_{gate,up,down}_exps.weight`, so
+  // `_exps.weight` names exactly the set `KqExpertSlice` streams and nothing
+  // else. Empty == the lane is off and this whole struct is inert.
+  std::string_view tensor_name_suffix{};
+  // The slot arena's resident bytes — `slots * slot_bytes`, which is what
+  // `HostExpertSlotStore` allocates up front and holds for the process. Added to
+  // the bound ONLY when at least one tensor actually matched the suffix, because
+  // a file with no expert towers builds no store and would otherwise be charged
+  // for an arena that never exists.
+  size_t arena_bytes = 0;
+};
+
 struct GgufStagedFootprint {
   // The bound, in bytes. The name is accurate for what it measures — the sum of
   // per-tensor lower bounds over the file's whole tensor table — and it is NOT a
@@ -88,13 +119,54 @@ struct GgufStagedFootprint {
   // is not the same as a contiguous block that fits.
   size_t largest_tensor_bytes = 0;
   std::string largest_tensor_name;
+  // W0d. How many tensors the lane took out of the sum, and how many bytes they
+  // would otherwise have contributed. Both are 0 with the lane off. They are
+  // reported rather than merely subtracted because a caller that says "44.56 GiB"
+  // without saying "and 335.62 GiB across 279 towers is served elsewhere" has not
+  // said how many things it examined.
+  size_t streamed_tensor_count = 0;
+  size_t streamed_bytes = 0;
+  // The arena term actually added (0 when the lane is off, and 0 when it is on
+  // but nothing matched).
+  size_t arena_bytes = 0;
 };
+
+// The per-expert SLICE size of a stacked expert tower, which is the slot size
+// the lane needs for it: `nbytes / n_expert`.
+//
+// A llama.cpp MoE export stores a tower as a 3-D tensor whose last `ne`
+// dimension is the expert count — `[n_embd, n_ff_exp, n_expert]` — so the
+// divisor is read off the tensor itself and no metadata key, architecture prefix
+// or config lookup is involved. `GgufTensorInfo::shape` is the REVERSE of `ne`
+// order (`gguf_reader.cpp:443`), so in this tree the expert count is `shape[0]`;
+// the implementation says so at the line that divides, because reading the other
+// end silently yields `n_embd` and a slot 16x too small. Measured on
+// `Qwen3.8-2.4T-A95B UD-Q1_0`: 1,275,068,416 / 512 = 2,490,368 bytes, which is
+// exactly the slice `KqExpertSlice` takes.
+//
+// Returns the largest such slice over every tensor whose name ends in `suffix`,
+// or 0 when none matches. A matching tensor that is not 3-D contributes its whole
+// size, which over-states rather than under-states the slot it would need.
+//
+// IT SCANS THE FILE, AND A DEFAULT LOAD STREAMS A SUBSET OF IT, so the answer
+// can be larger than the slot the store actually builds. That is the same
+// over-count direction the footprint above documents, on the same tensors: on
+// `Qwen3.8-2.4T-A95B UD-Q1_0` the largest `*_exps` slice in the FILE is an MTP
+// `nextn`-block Q2_K tower at 2,818,572,288 / 512 = 5,505,024 bytes, while the
+// IQ1_XXXS towers a default load streams need 2,490,368. The arena term is then
+// 2.21x the one `Qwen35ExpertStream::Reserve` will settle on. Narrowing it means
+// teaching this function which tensors THIS load will reach, which is load
+// policy and not a property of the file — the shape issue #1136 declines to
+// invent — so the error is named here and left in the safe direction.
+size_t GgufLargestExpertSliceBytes(const GgufFile& gguf,
+                                   std::string_view tensor_name_suffix);
 
 // `model_dtype_bytes` is the resolved model dtype's size (2 for bf16, which is
 // what every GGUF path here loads at). vLLM resolves ONE model dtype and every
 // layer inherits it, so one value is the faithful shape.
 GgufStagedFootprint GgufStagedWeightFootprint(const GgufFile& gguf,
-                                              size_t model_dtype_bytes = 2);
+                                              size_t model_dtype_bytes = 2,
+                                              const StreamedExpertLane& lane = {});
 
 // The budget to compare a footprint against, in bytes, or 0 for UNKNOWN.
 //
@@ -127,6 +199,15 @@ struct DeviceWeightFit {
 //
 //   refuse  <=>  needs_weight_staging  AND  budget != 0  AND  needed > budget
 //
+// `lane` (W0d) changes only what `needed` COUNTS, never the shape of the test:
+// with the lane on, the towers it serves are not staged and its arena is, so
+// `needed` is the remainder plus the arena. On `Qwen3.8-2.4T-A95B UD-Q1_0` that
+// turns 369.96 GiB into 34.34 GiB of non-expert weights plus the arena — 18.55
+// GiB at the 8000 slots the row measures with — against a 119.631 GiB pool. The
+// documented over-count direction is unchanged and still includes the MTP block
+// (issue #1136), which is the difference between that 34.34 GiB and the 26.01
+// GiB a default load actually stages.
+//
 // Keyed on the MEASURED condition, never on "CUDA + GGUF" and never on an
 // architecture name, so a GGUF that genuinely fits the pool still loads.
 // Strictly greater than: a checkpoint whose footprint exactly equals the budget is
@@ -136,6 +217,7 @@ DeviceWeightFit CheckDeviceWeightFit(const GgufFile& gguf,
                                      std::string_view device_name,
                                      bool needs_weight_staging,
                                      size_t budget_bytes,
-                                     size_t model_dtype_bytes = 2);
+                                     size_t model_dtype_bytes = 2,
+                                     const StreamedExpertLane& lane = {});
 
 }  // namespace vllm

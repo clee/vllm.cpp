@@ -10,11 +10,48 @@ platform may read it.
 
 ## Now
 
-`READY`, spec committed, no implementation. W0 is the critical path: today
-`--device cuda` on `Qwen3.8-2.4T-A95B UD-Q1_0` refuses at load by design
-(`76f2a6d84`, issue #1123), so **there is no GPU number for this checkpoint to
-take at all**, and nothing downstream of W0 produces one on the hardware this
-project owns. The developer's target is that GPU figure.
+`ACTIVE`. **W0b, W0c and W0d are implemented and unit-gated on the CPU tier.
+W0a and W0e are QUEUED behind a four-hour lease on `dgx:gpu0` and neither has
+run, so no GPU number exists yet and none is claimed.**
+
+What that means precisely, because "W0 landed" would overstate it:
+
+* **W0b — the predicate.** `Platform::host_memory_is_device_addressable()`,
+  base false, CUDA from `cudaDevAttrPageableMemoryAccess AND
+  cudaDevAttrIntegrated` probed at registration, ROCm from the pair its backend
+  already probes. Gated in `test_platform` (13 cases / 107 assertions), which
+  pins the DEFAULT and the INDEPENDENCE from all four neighbouring predicates.
+  The CUDA leg's own assembly compiles only in a CUDA build, so its mutation is
+  owed to the same lease as W0e and is listed under `## Owed`.
+* **W0c — the slot arm without the tower.** The seam takes the slot arm on
+  `is_cpu() || host_memory_is_device_addressable()`, builds the slice tensor
+  through a new `KqHostSliceView` instead of `ResidentWeight` (whose staging
+  branch is the 1.1875 GiB allocation #1123 died on), reads the tower in place
+  when the cache cannot serve a slice on a non-CPU platform, and refuses by
+  name if a claimed tower ever reaches device staging. Gated in the new
+  `test_expert_stream_device_slot` (5 cases / 38 assertions) over a fake
+  staging, host-addressable platform, because no CPU tier can register a real
+  one.
+* **W0d — the conditional refusal.** The fit bound gained a
+  `StreamedExpertLane` input; the loader fills it when the platform stages,
+  can read host slots, and the config says streaming is on. Gated in
+  `test_gguf_device_fit` (13 cases / 108) for the arithmetic and
+  `test_gguf_device_fit_reach` (8 cases / 36) for the production reach. **The
+  lane-off bound is byte-identical**, asserted three ways against literal
+  values.
+* **W0a — the probe.** Submitted to `rc` FIRST, before any tree change, and
+  still queued. It is the experiment that decides whether the W0b design is
+  sound at all: if `cudaDevAttrPageableMemoryAccess` is 0 on GB10, the CUDA leg
+  answers false, the lane never engages, and the row returns `NEEDS_DECISION`
+  rather than substituting a `cudaHostAlloc` arena. **W0b-W0d were written
+  against that risk knowingly**, and none of them claims a GB10 answer.
+* **W0e — the measurement.** Not run. G0-CORRECT, G0-LIVE and G0-SPEED are all
+  `PENDING` on the lease.
+
+Today `--device cuda` on `Qwen3.8-2.4T-A95B UD-Q1_0` still refuses at load on
+any build that has not measured `PageableMemoryAccess == 1`, because the
+predicate is probed and not assumed. The developer's target remains that GPU
+figure.
 
 ## Scope
 

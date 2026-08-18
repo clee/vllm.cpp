@@ -1503,11 +1503,47 @@ std::unique_ptr<LoadedEngine> LoadedEngine::FromModelDir(
     {
       const platforms::Platform& target = platforms::GetPlatform(
           ResolveModelDeviceType(gguf_arch.architecture, params.device));
+      // ENG-EXPERT-STREAM-DEVICE W0d (issue #1124). The bound above sums the
+      // WHOLE tensor table, so on `Qwen3.8-2.4T-A95B UD-Q1_0` it counts all
+      // 335.62 GiB of `*_exps` and refuses before any forward exists to take the
+      // slot arm. That is right whenever those towers really are staged, and
+      // wrong when the streaming lane serves them: then they are not staged at
+      // all, and what the device pays instead is the slot arena.
+      //
+      // THE THREE CONDITIONS, in this order because the last one LATCHES.
+      // `ResolveExpertStreamRequested()` fixes the process's answer for good, so
+      // it is asked only once the platform has already said it both stages and
+      // can read host slots — which is false on every CPU load and on every
+      // discrete device, i.e. everywhere the latch would be a side effect rather
+      // than the question. The offload config is installed at the top of this
+      // function, well before here, so the latched answer is the configured one.
+      StreamedExpertLane lane;
+      if (target.needs_weight_staging() &&
+          target.host_memory_is_device_addressable() &&
+          ResolveExpertStreamRequested()) {
+        // `_exps.weight` is exactly the set `KqExpertSlice` streams: the stacked
+        // `blk.<n>.ffn_{gate,up,down}_exps.weight` towers a llama.cpp MoE export
+        // writes. The arena is the store's own arithmetic — `slots *
+        // slot_bytes` through the same two resolvers `Qwen35ExpertStream`'s
+        // constructor uses, with the largest per-expert slice in this file as
+        // the computed default, so the number here is the number that gets
+        // allocated and not an estimate of it.
+        lane.tensor_name_suffix = "_exps.weight";
+        const size_t slice =
+            GgufLargestExpertSliceBytes(gguf, lane.tensor_name_suffix);
+        if (slice > 0) {
+          lane.arena_bytes =
+              static_cast<size_t>(ResolveExpertStreamSlots()) *
+              static_cast<size_t>(
+                  ResolveExpertStreamSlotBytes(static_cast<int64_t>(slice)));
+        }
+      }
       const DeviceWeightFit fit = CheckDeviceWeightFit(
           gguf, vt::DeviceTypeName(target.device_type()),
           target.needs_weight_staging(),
           DeviceWeightBudgetBytes(
-              target.residency_policy().device_memory_total_bytes));
+              target.residency_policy().device_memory_total_bytes),
+          /*model_dtype_bytes=*/2, lane);
       if (fit.refuse) throw std::runtime_error(fit.message);
     }
     tok::Tokenizer tokenizer = tok::Tokenizer::FromGguf(gguf);

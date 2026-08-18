@@ -224,6 +224,46 @@ class Platform {
   // false. Surface parity for the ROCm/memory-reporting port; unwired today.
   virtual bool is_integrated_gpu() const { return false; }
 
+  // ENG-EXPERT-STREAM-DEVICE W0b (issue #1124). May a KERNEL on this platform
+  // DEREFERENCE ordinary host storage — a `std::vector<uint8_t>`, an mmap'd
+  // file page — with no staging copy, no registration and no map/unmap call?
+  //
+  // This is a PROBED PHYSICAL PROPERTY, never a device name, an architecture
+  // string or a compute capability. CUDA answers from
+  // `cudaDevAttrPageableMemoryAccess AND cudaDevAttrIntegrated`, probed once at
+  // registration; ROCm from the `pageable_memory_access` + `integrated` pair it
+  // already probes. The conjunction is the point: a DISCRETE card with HMM
+  // reports pageable access alone and would then serve every expert slice over
+  // PCIe with page migration, which is the opposite of what the caller wants.
+  //
+  // WHY NOT AN EXISTING PREDICATE. `is_cpu()` is what this lifts. Every one of
+  // the other four answers a different question:
+  //
+  //   needs_weight_staging()  is TRUE on CUDA everywhere, GB10 included, and is
+  //                           a PROGRAMMING-MODEL policy — the model's forward
+  //                           binds distinct device pointers. It would gate
+  //                           nothing here, and the two deliberately DISAGREE on
+  //                           GB10 (stages: yes; can read host memory: yes).
+  //   is_unified_memory()     answers the OPPOSITE question: CUDA on GB10
+  //                           reports unified because host and device address one
+  //                           physical pool, while a `cudaMalloc` pointer is
+  //                           still not host-dereferenceable — see
+  //                           `include/vt/backend.h::DeviceMemoryIsHostAddressable`.
+  //   is_integrated_gpu()     alone is insufficient:
+  //                           `src/vllm/platforms/rocm.cpp::is_integrated_gpu`
+  //                           records integrated-WITHOUT-pageable-access as a
+  //                           real device class, and on it a host pointer faults.
+  //   Backend::DeviceMemoryIsHostAddressable()
+  //                           is the MIRROR of this one and not a substitute. It
+  //                           asks whether a pointer from `Alloc()` may be
+  //                           dereferenced by the HOST; this asks whether a host
+  //                           pointer may be dereferenced by the DEVICE. GB10
+  //                           answers false to that one and true to this one.
+  //
+  // Base false, because being wrong here hands a host pointer to a device kernel.
+  // A platform must OPT IN from a probe, exactly like the backend seam above.
+  virtual bool host_memory_is_device_addressable() const { return false; }
+
   // interface.py:1058 + cuda.py:662 support_static_graph_mode — does this platform
   // support static (CUDA-graph) capture mode? CUDA: true; else false. Distinct
   // from supports_graph_capture() (the backend-level capability); this is the
