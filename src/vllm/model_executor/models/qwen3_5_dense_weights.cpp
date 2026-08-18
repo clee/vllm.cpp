@@ -676,7 +676,24 @@ GdnLayerWeights LoadQwen3_5DenseGdn(const TensorResolver& get,
   // Public focused-loader seam historically describes the 27B checkpoint, which
   // is NVFP4 and declares no `weight_block_size`, so the default-constructed
   // block config here is the truthful one and the routing is unchanged.
-  const TensorExists has = [](const std::string&) { return true; };
+  //
+  // `has` ASKS THE RESOLVER (#1256). It used to answer `true` for every name,
+  // which was harmless while the only caller of `has` was a dtype probe that
+  // went on to `get` the tensor anyway and would throw on a name that was not
+  // there. M3's config/tensor cross-check made it harmful: it asks
+  // `has(proj + ".weight_scale_inv")` WITHOUT then fetching it, so a stub that
+  // says yes to everything reports a block-wise scale on a checkpoint that has
+  // none, and `IsFp8BlockProjection` refuses the disagreement it just invented.
+  // `TensorResolver` throws on a missing tensor, so probing it is the honest
+  // answer and the only one available at this seam.
+  const TensorExists has = [&get](const std::string& name) {
+    try {
+      (void)get(name);
+      return true;
+    } catch (const std::exception&) {
+      return false;
+    }
+  };
   return LoadGdnDense(get, has, layer_base, Fp8BlockQuantConfig{});
 }
 
