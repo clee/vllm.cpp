@@ -262,7 +262,13 @@ MATRICES = {
     # proves the portable dot is reached at 20.10% of Qwen3.5-2B user cycles;
     # the row owns exact-order C++ SDOT vs scheduled AAPCS64, independent of
     # the broad CPU-backend row.
-    "KERNEL": (AGENTS / "kernel-matrix.md", 51),
+    # 52 since 2026-08-18 (#1171): +`KERNEL-GDN-REPLAYSSM`, the ReplaySSM buffered
+    # output-only GDN decode. A genuinely new family, not a variant of the packed
+    # decode row: it changes WHEN the state is written (every L steps, from a ring
+    # of rank-1 factors) rather than how one step is tiled, and it adds three cache
+    # tensors to the MambaSpec. vLLM ships the algorithm for Mamba2 only and cannot
+    # reach GDN (four walls, spec §Upstream chain); SGLang ships the GDN arm.
+    "KERNEL": (AGENTS / "kernel-matrix.md", 52),
     # 56 since 2026-07-22: +`BACKEND-ACCEL-PROVIDER` (the acceleration-provider seam
     # itself, which is a cross-backend platform concern rather than a platform).
     # 57 since 2026-07-22: +`BACKEND-SEAM-AUDIT` (the accelerator-seam AUDIT — does
@@ -299,14 +305,22 @@ MATRICES = {
     # MistralForCausalLM on TT + device-aware SACRED gate. Reuses Qwen3-dense
     # forward; no new kernel. Pending 7B checkpoint + vLLM oracle for the e2e
     # gate.
-    # 83 since 2026-08-16: +`BACKEND-GATE-CUDA-LLAMACPP` (#979), the llama.cpp
-    # floor on a CURRENT CUDA card. Neither existing llama.cpp row covers it:
-    # `BACKEND-GATE-CPU-LLAMACPP` is the CPU floor and
-    # `BACKEND-GATE-CUDA-LLAMACPP-LEGACY` is scoped to Pascal/Volta/Turing,
-    # where vLLM has no entry at all. The four-way Qwen3.8-27B campaign needs
-    # it because llama.cpp is the ONLY comparator that runs the Q4_K_M arm:
-    # vLLM removed GGUF from its tree at our pin. INVENTORIED, no run.
-    "BACKEND": (AGENTS / "backend-matrix.md", 83),
+     # 83 since 2026-08-16: +`BACKEND-GATE-CUDA-LLAMACPP` (#979), the llama.cpp
+     # floor on a CURRENT CUDA card. Neither existing llama.cpp row covers it:
+     # `BACKEND-GATE-CPU-LLAMACPP` is the CPU floor and
+     # `BACKEND-GATE-CUDA-LLAMACPP-LEGACY` is scoped to Pascal/Volta/Turing,
+     # where vLLM has no entry at all. The four-way Qwen3.8-27B campaign needs
+     # it because llama.cpp is the ONLY comparator that runs the Q4_K_M arm:
+     # vLLM removed GGUF from its tree at our pin. INVENTORIED, no run.
+     # 84 since 2026-08-12: +`BACKEND-TENSTORRENT-TRACE-RUNNER`, feasibility
+     # spike for wiring the landed #354 graph-capture foundation into a
+     # capturable forward region (decode host-free region? capture tok/s cost?
+     # ttnn program-cache warm-up?). No code; decision record only.
+     # 85 since 2026-08-13: +`BACKEND-TENSTORRENT-HOST-FREE-FORWARD`, the plan
+     # row decomposing the host-free decode forward (R1 RmsNorm+RoPE, R2
+     # QkvSplit+RAC, R3 PA decode, R4 capture wire) that the trace-runner
+     # spike revealed as the real prerequisite for decode capture.
+    "BACKEND": (AGENTS / "backend-matrix.md", 85),
 }
 
 ENGINE_MATRIX = AGENTS / "engine-matrix.md"
@@ -509,8 +523,28 @@ ENGINE_PREFIXES = (
 # humans caught by reading during the 2026-08-13/14 campaign, all of them IN RANGE.
 # Issue #632; `SPIKE` on its committed spec. The row claims no implementation: no
 # parser, no baseline and no test exists yet.
+# 157 since 2026-08-17: +`ENG-RESIDENCY-CONFIG` (the host-RAM->DISK weight-residency
+# tier as a CONFIG surface -- a `vllm_cpp` extension key inside the existing
+# `--offload-config` document, reaching the loader through
+# `EngineParams::weight_residency`). Genuinely new, and not expressible by either
+# offload row it sits beside: `ENG-WEIGHT-OFFLOAD` owns the MIRRORED device->host
+# tier and may not grow a disk arm without breaking a 1:1 transcription of
+# `vllm/config/offload.py`, and `ENG-EXPERT-STREAM` owns the streaming MECHANISM
+# rather than its configuration -- this row changes where a value comes from and
+# nothing about what it does. `ACTIVE`, spec `specs/weight-residency-config.md`,
+# issue #1110 (also fixes #1109 in flow).
+# 158 since 2026-08-18: +`SPEC-DSPARK-QWEN3-ROUTING` (the DSpark draft-ARCHITECTURE
+# route: `architectures=["DSparkDraftModel"]` + `model_type` `qwen3` must resolve to
+# the landed Qwen3 DSpark lane, and `IsDsparkDraft` must be reached from the loader).
+# Genuinely new and not expressible by `SPEC-DSPARK` beside it: that row owns the
+# DSpark MECHANISM -- the Markov head, the block draft, the sequential sample -- and
+# its W1-W8 all landed, while this row changes only which lane a draft config is
+# classified into before any of that runs. BEYOND-PIN on vLLM PR 52197 (merged
+# 2026-08-17 at `7075ddac`); the pinned behavior at `speculative.py:934-944` was never
+# ported here, so this row records a divergence that already exists rather than
+# introducing one. `READY`, spec `specs/dspark-qwen3-routing.md`, issue #1193.
 # Bumped for a real new row, never to make a failing state transition pass.
-ENGINE_ROWS = 157
+ENGINE_ROWS = 163
 
 ENGINE_SUMMARY_SECTIONS = (
     ("Engine and scheduling", "Engine core and scheduling"),
@@ -1524,8 +1558,21 @@ def main() -> int:
         check_row_contracts(rows, by_id, errors)
         check_model_invariants(errors)
         spec_paths = [path for row in rows if row.state in READY_STATES for path in local_spec_paths(row)]
+        # ISSUE_INDEX is here for the same reason every other record table is:
+        # nothing else counts its cells. It was the ONE record surface every
+        # change must write and the only markdown table in the set with no shape
+        # gate, so a row that lost its trailing pipe, or carried an unescaped one
+        # inside a code span, mis-rendered on GitHub while every gate stayed
+        # green (#1033). The constant is reused rather than respelled so this
+        # gate and check_issue_index cannot drift onto different files.
         check_table_shapes(
-            [AGENTS / "roadmap_v1.md", AGENTS / "coordination.md", *MATRIX_PATHS, *spec_paths],
+            [
+                AGENTS / "roadmap_v1.md",
+                AGENTS / "coordination.md",
+                ISSUE_INDEX,
+                *MATRIX_PATHS,
+                *spec_paths,
+            ],
             errors,
         )
         check_spec_location(errors)

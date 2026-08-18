@@ -118,6 +118,11 @@ vllm_cpp_add_test(test_vocoder1d vllm/models/test_vocoder1d.cpp)
 # CPU-only.
 vllm_cpp_add_test(test_host_parallel vllm/models/test_host_parallel.cpp)
 target_include_directories(test_host_parallel PRIVATE ${CMAKE_SOURCE_DIR}/src)
+# The accounting gate for the MiniMax-Music3 stage profiler (#672). It reaches
+# src/ for `music3_profile.h`, which is an INTERNAL instrument and deliberately
+# not on the public surface. CPU-only, no checkpoint.
+vllm_cpp_add_test(test_music3_profile vllm/models/test_music3_profile.cpp)
+target_include_directories(test_music3_profile PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_speech_engine vllm/multimodal/test_speech_engine.cpp)
 vllm_cpp_add_test(test_indextts2_family vllm/models/test_indextts2_family.cpp)
 vllm_cpp_add_test(test_campplus vllm/models/test_campplus.cpp)
@@ -384,10 +389,49 @@ target_include_directories(test_model_registry PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_platform vllm/platforms/test_platform.cpp)
 vllm_cpp_add_test(test_device_selection
   vllm/entrypoints/test_device_selection.cpp)
+# ENG-EXPERT-STREAM #1123: the load-time GGUF device-fit refusal, in two targets
+# for two different questions. The arithmetic runs everywhere; the REACHABILITY
+# gate needs a fake WEIGHT-STAGING platform in the CUDA lookup slot, because
+# `needs_weight_staging()` is true on exactly one platform in this tree and the
+# branch is otherwise unreachable on a host with no CUDA device. Its own
+# executable for the same reason test_device_selection is one.
+vllm_cpp_add_test(test_gguf_device_fit
+  vllm/model_executor/test_gguf_device_fit.cpp)
+vllm_cpp_add_test(test_gguf_device_fit_reach
+  vllm/entrypoints/test_gguf_device_fit_reach.cpp)
+# FIX-FP8-BLOCKWISE-REFUSAL #1166: block-wise (128x128) FP8 is refused BY NAME
+# at load. Every case enters through `ModelRegistry::Load` rather than through
+# the predicate, so deleting that call site reds this target. That is the
+# reachability proof and not a class test.
+vllm_cpp_add_test(test_fp8_block_quant
+  vllm/model_executor/layers/test_fp8_block_quant.cpp)
+# MODEL-FP8-BLOCK-WEIGHT #1189 M3: `Fp8BlockWeight`, the `weight_scale_inv`
+# loader rung, and the config reader. Every case enters through
+# `ModelRegistry::Load` or `LoadQwen3_5Dense` -- the loader that call reaches --
+# and never through `LoadFp8BlockRaw`, so deleting the rung reds this target.
+vllm_cpp_add_test(test_fp8_block_weight_load
+  vllm/model_executor/models/test_fp8_block_weight_load.cpp)
 vllm_cpp_add_test(test_linear_method vllm/model_executor/layers/test_linear_method.cpp)
 target_include_directories(test_linear_method PRIVATE ${CMAKE_SOURCE_DIR}/src)
+vllm_cpp_add_test(test_qwen3_break_point vllm/models/test_qwen3_break_point.cpp)
 vllm_cpp_add_test(test_decode_graph_sizes vllm/models/test_decode_graph_sizes.cpp)
 vllm_cpp_add_test(test_qwen35_paged_forward vllm/models/test_qwen35_paged_forward.cpp)
+# GDN-MOE-BF16-OUT (#1168): the MoE forward's GDN output-activation dtype probe
+# lives in the not-installed qwen3_5_internal.h, beside the other detail:: seams.
+target_include_directories(test_qwen35_paged_forward PRIVATE ${CMAKE_SOURCE_DIR}/src)
+# GDN-MOE-BF16-OUT (#1168), fresh-review repair. `GdnOutDType()` caches its
+# getenv in a function-local static, so one process observes exactly ONE value of
+# VT_GDN_OUT_BF16 and a single run cannot tell a resolver that READS the lever
+# from one that was hardwired to its default answer — the mutation
+# `return DType::kBF16;` left this binary 5/5 13/13. Re-run the SAME binary with
+# the lever forced to 0, the shape `_glue_fuse_off` and
+# `test_dense_gateup_fused_marlin_off_*` above already use. This is also the
+# documented f32 rollback and the denominator of the row's same-binary A/B, so
+# without this entry the arm an operator is told to run is ungated.
+add_test(NAME test_qwen35_paged_forward_gdn_out_f32
+  COMMAND test_qwen35_paged_forward)
+set_tests_properties(test_qwen35_paged_forward_gdn_out_f32 PROPERTIES
+  ENVIRONMENT "VT_GDN_OUT_BF16=0")
 # MoE vision tower (#891): the tower is loaded (and its ABSENCE refused by name)
 # and the forked VL forward actually CONSUMES the merger rows.
 vllm_cpp_add_test(test_qwen3_5_moe_vision vllm/models/test_qwen3_5_moe_vision.cpp)
@@ -521,6 +565,13 @@ vllm_cpp_add_test(test_gemma_load vllm/models/test_gemma_load.cpp)
 vllm_cpp_add_test(test_gemma_forward vllm/models/test_gemma_forward.cpp)
 target_include_directories(test_gemma_forward PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_gemma4_honesty vllm/models/test_gemma4_honesty.cpp)
+# #1205: the Gemma-4 device-expert upload must refuse where `vt::MatmulBTAlphaBeta`
+# has no arm, entered through `vllm::RunGemma4Moe`. Its own binary: the layer's
+# env knobs are frozen into function-local statics on the first call, so the arm
+# it measures has to be decided before main() and cannot share a process with a
+# case that wants a different one.
+vllm_cpp_add_test(test_gemma4_moe_device_arm_guard
+                  vllm/models/test_gemma4_moe_device_arm_guard.cpp)
 vllm_cpp_add_test(test_qwen3_moe_load vllm/models/test_qwen3_moe_load.cpp)
 vllm_cpp_add_test(test_qwen3_moe_forward vllm/models/test_qwen3_moe_forward.cpp)
 target_include_directories(test_qwen3_moe_forward PRIVATE ${CMAKE_SOURCE_DIR}/src)
@@ -782,6 +833,27 @@ target_include_directories(test_nemotron_h_quantized_forms PRIVATE
 vllm_cpp_add_test(test_nemotron_h_moe_device
   vllm/models/test_nemotron_h_moe_device.cpp)
 target_include_directories(test_nemotron_h_moe_device PRIVATE
+  ${CMAKE_SOURCE_DIR}/src)
+
+# A2-P (#810, .agents/specs/nemotron-h-a2p-paged-forward.md): the PAGED forward,
+# gated through the PRODUCTION entry point. Every case builds a real
+# NemotronHLoadedModel from a synthetic checkpoint, hands it to a real
+# GPUModelRunner, and drives execute_model / sample_tokens — so the paged
+# forward is reached at runner.cpp:1465 through ModelRegistry::Forward, never
+# through a fabricated ModelForwardInput. That is the difference AGENTS.md
+# §"Nothing lands dead" is about: before this change NemotronHDeviceForward had
+# ONE non-declaration call site in the whole tree and it was a test.
+#
+# The multi-step arm is the only one that can see a DROPPED CARRY (with one leg
+# and fresh state the recurrent half is unobservable — nemotron_h_forward.h
+# says so outright), the per-block numeric arm is the only one that can see a
+# dropped mechanism whose argmax is unchanged, and the page dtypes are asserted
+# directly because a too-WIDE page is numerically correct and invisible to both.
+# CPU-only, no checkpoint, no speed claim: the A3 end-to-end token gate against
+# the released checkpoint is the on-box binding gate.
+vllm_cpp_add_test(test_nemotron_h_paged_forward
+  vllm/models/test_nemotron_h_paged_forward.cpp)
+target_include_directories(test_nemotron_h_paged_forward PRIVATE
   ${CMAKE_SOURCE_DIR}/src)
 
 # Kimi-Linear CPU REFERENCE FORWARD gates (W2-W6): the per-op reference forwards
@@ -1067,6 +1139,11 @@ vllm_cpp_add_test(test_speculative_draft_max_position_embeddings
 # SPEC-DSPARK W1: the DSpark config slice (method acceptance, block-size floor,
 # lookahead slots, draft identity).
 vllm_cpp_add_test(test_speculative_dspark vllm/config/test_speculative_dspark.cpp)
+# #1160: `--speculative-config` key ADMISSION — an unknown or misspelled key is
+# refused by name, and an upstream key this engine does not implement is refused
+# with the missing part named, instead of being silently dropped.
+vllm_cpp_add_test(test_speculative_unknown_keys
+  vllm/config/test_speculative_unknown_keys.cpp)
 # SPEC-MTP-K-GT-1 (#81): the MTP speculation-DEPTH config contract — the k=1
 # default, the upstream divisibility rule, and that a configured k above 1 is
 # carried rather than silently degraded.
@@ -1075,6 +1152,22 @@ vllm_cpp_add_test(test_speculative_mtp_depth vllm/config/test_speculative_mtp_de
 # language_model_only ⇒ 0 BEFORE the map, else the map, else the 999 default.
 vllm_cpp_add_test(test_multimodal_config vllm/config/test_multimodal_config.cpp)
 vllm_cpp_add_test(test_offload_config vllm/config/test_offload_config.cpp)
+# ENG-RESIDENCY-CONFIG (#1110): the `vllm_cpp` extension of --offload-config.
+vllm_cpp_add_test(test_weight_residency_config
+  vllm/config/test_weight_residency_config.cpp)
+# ...and the expert-stream knob's own binary (#1122). `ResolveExpertStreamRequested`
+# caches its answer in a function-local static, so a process can observe what it
+# resolved exactly ONCE. That one observation is spent here, on the field the
+# resolver reads — rewiring it to the adjacent `.mmap` left every other suite green.
+vllm_cpp_add_test(test_expert_stream_latch
+  vllm/config/test_expert_stream_latch.cpp)
+# ...and its REACHABILITY: the loader and the C ABI install it. `vllm.h` is the
+# public surface, so this suite needs src/ on the include path exactly as
+# test_capi does (it reaches the internal MakeEngineHandle hook there; here it is
+# the internal weight_residency header beside the public one).
+vllm_cpp_add_test(test_weight_residency_reach
+  vllm/entrypoints/test_weight_residency_reach.cpp)
+target_include_directories(test_weight_residency_reach PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_weight_offloader vllm/model_executor/test_weight_offloader.cpp)
 vllm_cpp_add_test(test_weight_offload_policy vllm/model_executor/test_weight_offload_policy.cpp)
 vllm_cpp_add_test(test_expert_slot_cache vllm/model_executor/test_expert_slot_cache.cpp)
@@ -1093,6 +1186,12 @@ target_include_directories(test_expert_stream_wiring PRIVATE ${CMAKE_SOURCE_DIR}
 # defect, and the store is built from the FIRST model a process runs.
 vllm_cpp_add_test(test_expert_stream_mixed_slot vllm/model_executor/test_expert_stream_mixed_slot.cpp)
 target_include_directories(test_expert_stream_mixed_slot PRIVATE ${CMAKE_SOURCE_DIR}/src)
+# ENG-EXPERT-STREAM (#1091): the step clock at the MoE entry points ForwardLayers
+# does NOT cover, and the final statistics line. Its own binary because it is the
+# only one that can observe `steps == 0` -- the store is a process-lifetime
+# singleton, so a case asking that question must run before anything ends a step.
+vllm_cpp_add_test(test_expert_stream_steps vllm/model_executor/test_expert_stream_steps.cpp)
+target_include_directories(test_expert_stream_steps PRIVATE ${CMAKE_SOURCE_DIR}/src)
 # ENG-MM-INPUT-PIPELINE L1 (#607): the refusal those limits carry — the min()
 # fold against the model's own ceiling, upstream's exact message, and both call
 # sites with the enable_mm_embeds escape.
@@ -1169,6 +1268,7 @@ vllm_cpp_add_test(test_output_processor vllm/v1/test_output_processor.cpp)
 vllm_cpp_add_test(test_async_llm vllm/v1/test_async_llm.cpp)
 vllm_cpp_add_test(test_llm_engine vllm/v1/test_llm_engine.cpp)
 vllm_cpp_add_test(test_loaded_engine_dense vllm/entrypoints/test_loaded_engine_dense.cpp)
+vllm_cpp_add_test(test_dspark_block_size_guard vllm/entrypoints/test_dspark_block_size_guard.cpp)
 vllm_cpp_add_test(test_beam_search vllm/entrypoints/test_beam_search.cpp)
 # ROAD-V1-MM serving W1: OpenAI multimodal content-part parse + decode + route
 # to the existing single-sequence mm processors (CPU, no model weights). Reuses
@@ -1340,6 +1440,11 @@ if(VLLM_CPP_SERVER)
   vllm_cpp_add_test(test_serve_mm_limits
     vllm/entrypoints/openai/test_serve_mm_limits.cpp)
   target_include_directories(test_serve_mm_limits PRIVATE ${CMAKE_SOURCE_DIR}/src)
+  # ENG-RESIDENCY-CONFIG (#1110): --offload-config's vllm_cpp key reaching the
+  # loader through the REAL VllmServerMain. Same include path for server_main.h.
+  vllm_cpp_add_test(test_serve_residency_config
+    vllm/entrypoints/openai/test_serve_residency_config.cpp)
+  target_include_directories(test_serve_residency_config PRIVATE ${CMAKE_SOURCE_DIR}/src)
 endif()
 vllm_cpp_add_test(test_outputs vllm/test_outputs.cpp)
 
@@ -1410,6 +1515,16 @@ add_test(NAME test_vulkan_loader COMMAND test_vulkan_loader)
 # so it is meaningful on a CUDA box, on the Metal M4, and inert (CPU-only bit-
 # exactness checks) on a plain CPU build.
 vllm_cpp_add_test(test_backend_cross_device vt/test_backend_cross_device.cpp)
+# The head_dim-128 decode arm (#382) ships default OFF, and its flag is read into
+# a `static const bool` -- once per process. The default registration above
+# therefore only ever gates the PagedAttnOnline fallback; the arm that runs the new
+# kernel needs its own INVOCATION with the flag set. Same shape as the
+# test_dense_gateup_fused_marlin_off_* lever pair above. The filter avoids commas:
+# doctest reads them as filter separators and the case name contains three.
+add_test(NAME test_backend_cross_device_vt_attn_decode_d128
+  COMMAND test_backend_cross_device "--test-case=*head_dim 128*")
+set_tests_properties(test_backend_cross_device_vt_attn_decode_d128 PROPERTIES
+  ENVIRONMENT "VT_ATTN_DECODE_D128=1" SKIP_RETURN_CODE 77)
 # The ROCm GCN-arch capability parse (BACKEND-ROCM W0). UNCONDITIONAL by design:
 # include/vt/rocm/rocm_arch.h is deliberately free of HIP headers so the one part
 # of that skeleton carrying a DECISION is gated on a CPU-only CI runner with no
@@ -1591,8 +1706,17 @@ target_include_directories(test_gdn_prefill_conv PRIVATE ${CMAKE_SOURCE_DIR}/src
 # resident), never freed, so a device pointer baked into a captured pure-decode CUDA
 # graph stays valid — the fix for the 35B c2+ online-serving illegal-memory-access.
 # The device proof is the DGX serving harness; this pins the never-free guarantee.
+vllm_cpp_add_test(test_breakable_graph vt/test_breakable_graph.cpp)
 vllm_cpp_add_test(test_graph_safe_scratch vt/test_graph_safe_scratch.cpp)
 target_include_directories(test_graph_safe_scratch PRIVATE ${CMAKE_SOURCE_DIR}/src)
+vllm_cpp_add_test(test_graph_dedup vt/test_graph_dedup.cpp)
+target_include_directories(test_graph_dedup PRIVATE ${CMAKE_SOURCE_DIR}/src)
+# ENG-CUDAGRAPH-DEDUP / #1184: the two device-free halves of the CUDA/HIP binding --
+# the error-latch guard every entry point installs, and the structural-signature walk.
+# Both lived inside a header that includes <cuda_runtime.h> and were therefore reached
+# by NO test on any tier; the latch defect hid in exactly that gap.
+vllm_cpp_add_test(test_graph_dedup_runtime vt/test_graph_dedup_runtime.cpp)
+target_include_directories(test_graph_dedup_runtime PRIVATE ${CMAKE_SOURCE_DIR}/src)
 # CPU threadpool (QUANT-GGUF-CPU-THREADPOOL): barrier/park-wake/chunk-steal
 # stress + the n_threads 1/3/20 determinism battery. Reaches the internal
 # header under src/ (the pool is not public API).
@@ -1634,6 +1758,15 @@ vllm_cpp_add_test(test_ops_fp8_cutlass vt/test_ops_fp8_cutlass.cpp)
 # box with NO GPU by construction — that is the point of the row — and carries a
 # CUDA-gated arm (G2) for CPU-vs-CUDA byte agreement wherever a device exists.
 vllm_cpp_add_test(test_ops_fp8_cpu vt/test_ops_fp8_cpu.cpp)
+# VT-QUANT-FP8-GROUP (#1189 M1): the dynamic per-token per-group fp8 activation
+# quant. CPU-gateable by construction; its CPU-vs-CUDA byte-identity arm (G6) is
+# CUDA-gated and reports PENDING rather than skipping where no device exists.
+vllm_cpp_add_test(test_ops_quant_fp8_group_cpu vt/test_ops_quant_fp8_group_cpu.cpp)
+# VT-MATMUL-FP8-BLOCK-REF (#1189 M2): the 128x128 block-scaled fp8 GEMM, CPU
+# reference arm — the numerical oracle every later block-fp8 kernel is measured
+# against. Its G4 holds the constraint the row exists for: the scales apply in
+# the MAINLOOP, once per K-block, which an epilogue-folded alpha cannot express.
+vllm_cpp_add_test(test_ops_matmul_fp8_block_cpu vt/test_ops_matmul_fp8_block_cpu.cpp)
 # Opt-in arm: run the fp8 plan-cache byte-exact case with the cache ENABLED
 # (VT_FP8_PLAN_CACHE=1 -> first MatmulFp8CublasLt call builds the plan fresh,
 # later calls hit the cache). Proves the cached-plan GEMM is BYTE-identical to the
@@ -1740,6 +1873,12 @@ vllm_cpp_add_test(test_ops_conv2d vt/test_ops_conv2d.cpp)
 target_include_directories(test_ops_conv2d PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_ops_conv1d_depthwise vt/test_ops_conv1d_depthwise.cpp)
 target_include_directories(test_ops_conv1d_depthwise PRIVATE ${CMAKE_SOURCE_DIR}/src)
+# BigVGAN / DAC vocoder 1-D convolutions (#672): vt::Conv1d + vt::ConvTranspose1d
+# against a verbatim copy of the pre-op vocoder1d host loop, plus a CPU-vs-CUDA
+# BYTE-equality arm that skips loudly on a CPU box. The four consumers' own
+# end-to-end bit-identity gate is tests/vllm/models/test_host_parallel.cpp.
+vllm_cpp_add_test(test_ops_conv1d_general vt/test_ops_conv1d_general.cpp)
+target_include_directories(test_ops_conv1d_general PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_ops_attn_relpos vt/test_ops_attn_relpos.cpp)
 target_include_directories(test_ops_attn_relpos PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_ops_paged_attn vt/test_ops_paged_attn.cpp)
@@ -1748,6 +1887,15 @@ vllm_cpp_add_test(test_ops_paged_attn vt/test_ops_paged_attn.cpp)
 vllm_cpp_add_test(test_ops_paged_attn_dtype vt/test_ops_paged_attn_dtype.cpp)
 vllm_cpp_add_test(test_ops_sample vt/test_ops_sample.cpp)
 vllm_cpp_add_test(test_gemma4_rocm_fp8_seams vt/test_gemma4_rocm_fp8_seams.cpp)
+vllm_cpp_add_test(test_ops_getblas_dualslot vt/test_ops_getblas_dualslot.cpp)
+target_compile_definitions(test_ops_getblas_dualslot PRIVATE
+  VLLM_CPP_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+if(VLLM_CPP_HIP)
+  # Separate HIP target: calls production GetBlas. Missing devices → exit 77.
+  # .cpp would compile as host CXX and miss __HIP_PLATFORM_AMD__.
+  set_source_files_properties(vt/test_ops_getblas_product.cpp PROPERTIES LANGUAGE HIP)
+  vllm_cpp_add_test(test_ops_getblas_product vt/test_ops_getblas_product.cpp)
+endif()
 vllm_cpp_add_test(test_ops_penalties vt/test_ops_penalties.cpp)
 
 vllm_cpp_add_test(test_npy parity/test_npy.cpp)
@@ -2135,3 +2283,18 @@ target_include_directories(test_qwen3_32b_nvfp4a16_paged_engine PRIVATE
 # CPU-only and needs no checkpoint.
 vllm_cpp_add_test(test_registry_downcast_refusal
   vllm/models/test_registry_downcast_refusal.cpp)
+
+# The five suites that reach src/vllm/support/platform_compat.h, granted per
+# target rather than globally: the file already carries 123 explicit
+# ${CMAKE_SOURCE_DIR}/src grants, and a blanket one in vllm_cpp_add_test would
+# convert that deliberate opt-in into a repo-wide default (#503).
+foreach(_pc_target
+        test_safetensors
+        test_minimax_h3
+        test_minimax_h3_video_fold
+        test_kv_offload_connector
+        test_kv_offload_tiering)
+  if(TARGET ${_pc_target})
+    target_include_directories(${_pc_target} PRIVATE ${CMAKE_SOURCE_DIR}/src)
+  endif()
+endforeach()

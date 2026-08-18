@@ -210,6 +210,46 @@ std::vector<float> Ltx2Res2sStep(const float* sample, const float* denoised,
                                  const float* sigmas, int64_t sigma_count, int64_t step_index,
                                  int64_t count, const float* noise, double eta = 0.5);
 
+// ─── THE SAME STEP, AT THE PRECISION EACH CALL SITE ACTUALLY HANDS IT ────────
+//
+// `Res2sDiffusionStep.step` has no dtype of its own: it takes whatever its
+// tensors carry, and the res_2s loop hands it two DIFFERENT combinations. Both
+// are mirrored rather than unified onto one, because the difference is real
+// arithmetic and putting the conversion where upstream puts it is the rule.
+//
+//   SUBSTEP (samplers.py:337-352). `sigmas = torch.stack([sigma, sub_sigma])`,
+//   and both are `hp` (:291-292, :315). So `get_sde_coeff` runs in FLOAT64.
+//
+//   STEP (samplers.py:412-427). `sigmas` is the loop's own schedule, which
+//   `DiffusionStage` created as FLOAT32 (ti2vid_two_stages_hq.py:268). So
+//   `get_sde_coeff` runs in FLOAT32 — the residual `sqrt(sigma_next^2 -
+//   sigma_up^2)`, `alpha_ratio` and `sigma_down` are all f32 quantities — while
+//   the SAMPLE and the noise are still f64 and the result is f64.
+//
+// The values in both cases are f64, because `sample` is `x_anchor` (`hp`) and
+// `output_dtype = denoised_sample.dtype` is `hp` too (diffusion_steps.py:180).
+//
+// One implementation, instantiated at the two scalar types; there is no second
+// copy of the formula. The selection is an enum naming the two upstream call
+// sites rather than a bare bool, so a reader can check the claim.
+enum class Ltx2Res2sScheduleWidth {
+  // samplers.py:415, :425 — the loop's float32 schedule.
+  kF32Schedule,
+  // samplers.py:342, :350 — the [sigma, sub_sigma] pair, both float64.
+  kF64Schedule,
+};
+
+// `Res2sDiffusionStep.get_sde_coeff` computed in float64 rather than float32.
+// The f32 arm stays `Ltx2Res2sSdeCoeff` above and keeps its goldens.
+Ltx2SdeCoeff Ltx2Res2sSdeCoeffHp(double sigma_next, double sigma_up);
+
+// `Res2sDiffusionStep.step` over float64 samples. `width` decides only the
+// precision the SIGMAS and therefore the coefficients are computed at.
+std::vector<double> Ltx2Res2sStepHp(const double* sample, const double* denoised,
+                                    const double* sigmas, int64_t sigma_count,
+                                    int64_t step_index, int64_t count, const double* noise,
+                                    double eta, Ltx2Res2sScheduleWidth width);
+
 // _get_ancestral_step (diffusion_steps.py:7-22): the DDIM / variance-exploding
 // ancestral coefficients, in the rescaled `sigma / alpha` space. Used only by
 // CFG++.
@@ -518,9 +558,153 @@ bool Ltx2ShouldUseAncestralSampler(const std::string& version);
 // ltx2_recipes.py:38 — how a phase builds its input.
 enum class Ltx2PhaseInputTransform { kInitial, kSpatialUpsample };
 // Which stepper a phase samples with (distilled.py:170-185).
-enum class Ltx2StepperKind { kEuler, kEulerAncestral };
+//
+// `kRes2s` is not only a stepper: it selects a whole SAMPLER. Upstream keeps the
+// two choices separate — `DiffusionStage.__call__` takes `stepper` and `loop`
+// independently (utils/blocks.py:512-513) — but they are not independently
+// selectable in practice, because `res2s_audio_video_denoising_loop` REFUSES any
+// stepper that is not a `Res2sDiffusionStep` (samplers.py:276-277) and no other
+// loop constructs one. `TI2VidTwoStagesHQPipeline` passes both together, to both
+// stages (ti2vid_two_stages_hq.py:285/:292 and :319/:335). One enumerator
+// therefore carries both, and the alternative — a separate loop field whose only
+// legal combination is this one — would publish a selection surface upstream
+// does not have and three combinations that must then be refused.
+//
+// Row LTX25-RES2S-LOOP, issue #921. Spec .agents/specs/ltx25-res2s-loop.md.
+enum class Ltx2StepperKind { kEuler, kEulerAncestral, kRes2s };
+
+// Which denoiser upstream CONSTRUCTS for this phase — the two classes in
+// ltx-pipelines `utils/denoisers.py`. `kGuided` is `GuidedDenoiser`, built from
+// a `MultiModalGuider` per stream; `kSimple` is `SimpleDenoiser`, "single
+// transformer call, no guidance" (`utils/denoisers.py:3`).
+//
+// THIS DOES NOT GATE THE SEAM, and reading it as if it did is the mistake worth
+// naming here. `Ltx2GuidedDenoise` runs on EVERY phase, because a phase whose
+// recipe sets no guidance keeps `Ltx2MultiModalGuiderParams`'s own defaults and
+// those ARE `_POSITIVE_ONLY_GUIDER` (denoisers.py:25-28) — one pass, and a
+// `calculate` whose every term is zero, which is `SimpleDenoiser`'s output.
+// That equivalence is measured rather than argued; see
+// .agents/specs/ltx25-guided-video.md section 10.
+//
+// What it DOES decide is where a request's guider override lands, and it exists
+// because `allow_guidance_override` alone cannot express the a2vid case. That
+// field answers "does this pipeline's CLI carry the guider flags at all":
+// `distilled.py` selects `default_2_stage_distilled_arg_parser`
+// (utils/args.py:1188), which never adds them, so an override there names a knob
+// the pipeline has no surface for and is REFUSED. `a2vid_two_stage.py:311`
+// selects `default_2_stage_arg_parser` (utils/args.py:1123), which DOES carry
+// them (utils/args.py:947-1006, the six video-guider flags) — and they reach
+// stage 1's guider alone (`:233-236`),
+// because stage 2 constructs `SimpleDenoiser(v_context_p, a_context_p)`
+// (`:278`) and takes no params at all. So on that phase the flag is legal and
+// simply does not arrive. Neither value of a boolean says that: refusing would
+// reject a request upstream accepts, and applying would switch on guidance
+// upstream's stage 2 does not have.
+enum class Ltx2PhaseDenoiser { kGuided, kSimple };
 
 // LTXPhaseRecipe (ltx2_recipes.py:29-50).
+// WHICH of the load's adapters a PHASE runs.
+//
+// Upstream states this by building a second `DiffusionStage` from the same
+// checkpoint with a different `loras=` argument, read at Lightricks/LTX-2
+// fd4ded7f: `a2vid_two_stage.py:107` against `:114`, `ti2vid_two_stages.py:140`
+// against `:151`, `ti2vid_two_stages_hq.py:154` against `:165`, and — the mirror
+// image — `ic_lora.py:108` against `:119`, where the adapter rides stage 1 and
+// stage 2 runs bare.
+//
+// UPSTREAM NEEDS TWO PLACEMENTS, not one, which is why this is a SET and not a
+// "does this phase get the distilled adapter" boolean.
+// `ltx-pipelines/CLAUDE.md:48` scopes the adapter to "stage 2 only in
+// TI2Vid/A2Vid/Keyframe", while `:49` has HQ apply it to BOTH stages and
+// `:50-51` says the same of DFR. Stage 1 `kNoAdapters` with stage 2 defaulted is
+// the first; both phases defaulted is the second.
+//
+// TWO ENUMERATORS, and two is the COMPLETE space rather than a boolean wearing
+// an enum's clothes: `Ltx2ResolveLoraReferenceFactors` refuses more than one
+// adapter by name (`ltx2_lora.h:167-172`, mirroring `dubit.py:364-365` and
+// `hdr_ic_lora.py:271-272`), so the powerset of the load's adapters has exactly
+// two members. "Some of them" has no spelling here because it has no spelling
+// anywhere in this engine yet; the day that arity cap lifts, the third value
+// goes here.
+//
+// AND UPSTREAM HOLDS ONE TRANSFORMER, not two. Both `from_checkpoint` calls name
+// the same `model_paths.transformer()` (`a2vid_two_stage.py:104` and `:116`,
+// `ti2vid_two_stages.py:137` and `:148`) and differ only in the adapter tuple.
+// So a phase-scoped adapter over one resident DiT is what upstream does, and a
+// second resident weight set would be a heavier architecture than the reference
+// rather than a faithful port of it.
+//
+// NO PER-PHASE STRENGTH, deliberately. `ti2vid_two_stages_hq.py` needs one —
+// 0.25 at `:92-96` and 0.5 at `:97-101` — and no recipe this tree ships would
+// set it, so adding the field now lands a branch nothing can select. That is the
+// argument `ltx2_lora.h:41-44` already makes for the second product form. Owed
+// by https://github.com/mudler/vllm.cpp/issues/1144 — NOT #921, which was closed
+// as completed the same day this landed and would have left the debt looking
+// owned while owning nothing. The trap that makes it more than a new field is
+// written beside `Ltx2RebindDitLoras` in `ltx2_loader.h`: that function's no-op
+// test is a BOOLEAN, and HQ needs both stages fused at different strengths.
+enum class Ltx2PhaseLoraScope {
+  // Every adapter the load supplied. The DEFAULT, because `distilled.py:131`
+  // builds ONE stage set and so every recipe that predates this field —
+  // `distilled_two_stage`, `dfr`, `retake`, `one_stage`, `res2s`, `t2a_one_stage`
+  // — is upstream-correct running the adapters on all of its phases. A different
+  // default would silently move six gated arms.
+  kAllAdapters,
+  // The base weights. `ic_lora.py:119`'s `loras=()`, and
+  // `a2vid_two_stage.py:107`'s stage 1 relative to the distilled adapter that
+  // `requires_distilled_lora` identifies.
+  kNoAdapters,
+};
+
+// WHICH token count the sigma SHIFT is fitted on, for a phase whose schedule is
+// derived rather than frozen.
+//
+// `LTX2Scheduler.execute` takes an OPTIONAL latent and `schedulers.py:31` is
+// `tokens = math.prod(latent.shape[2:]) if latent is not None else
+// default_number_of_tokens`. So upstream selects between two anchors by passing
+// a latent or not, and `default_number_of_tokens` is `MAX_SHIFT_ANCHOR` = 4096
+// (`schedulers.py:11`, `:29`).
+//
+// SEVEN CALL SITES AT `fd4ded7f`, AND SIX OF THEM PASS NO LATENT. The
+// population is `grep -rn '\.execute(' packages/ltx-pipelines/src/ltx_pipelines/`
+// and it is small enough to list in full:
+//
+//   ti2vid_one_stage.py:207      no latent      our `one_stage` x4
+//   t2a_one_stage.py:141         no latent      our `t2a_one_stage`
+//   retake.py:287                no latent      our `retake`, non-distilled arm
+//   a2vid_two_stage.py:226       no latent      our `a2vid_two_stage` stage 1
+//   ti2vid_two_stages.py:244     no latent      our `ti2vid_two_stage` stage 1
+//   keyframe_interpolation.py:200 no latent     unported (#1096)
+//   ti2vid_two_stages_hq.py:267  latent=empty_latent   our `res2s_two_stage`
+//
+// So the LATENT-DERIVED anchor is upstream's exception, not its rule — which is
+// the opposite of how this engine has always behaved, since `ltx2_video.cpp`
+// passes `target_tokens` on every phase. That divergence is
+// https://github.com/mudler/vllm.cpp/issues/1150 and it is REAL rather than a
+// rounding: at the recipe default geometry the target latent is 6144 tokens,
+// giving a shift of 2.78 against upstream's 2.05, so every sigma in the
+// schedule moves while the frame count, the shapes and the sample rate do not.
+//
+// THE DEFAULT IS TODAY'S BEHAVIOUR AND NOT UPSTREAM'S MAJORITY, deliberately.
+// Flipping it would re-sample `one_stage` at four version keys,
+// `a2vid_two_stage` stage 1 and `retake`, all shipped and gated, and rewrite
+// their goldens — on a finding made inside a row scoped to add one recipe. #1150
+// owns that flip and this enum is the seam it uses. The preserving default also
+// cannot fail SILENTLY: an arm moves only where a line says so, whereas under
+// the flip an arm nobody remembered to pin would move with nothing naming it.
+//
+// Read in exactly one place, the phase loop's schedule block, and only on the
+// branch that derives a schedule at all. A phase carrying explicit `sigmas`
+// never reaches it.
+enum class Ltx2PhaseScheduleTokens {
+  // `math.prod(latent.shape[2:])` of THIS phase's target grid, which is
+  // `ti2vid_two_stages_hq.py:267`'s `latent=empty_latent`. The default.
+  kTargetLatent,
+  // `default_number_of_tokens`, i.e. 4096 — what the six call sites above get
+  // by passing no latent at all.
+  kSchedulerDefault,
+};
+
 struct Ltx2PhaseRecipe {
   std::string name;
   Ltx2MultiModalGuiderParams video_guidance;
@@ -532,7 +716,18 @@ struct Ltx2PhaseRecipe {
   double noise_scale = 0.0;
   Ltx2PhaseInputTransform input_transform = Ltx2PhaseInputTransform::kInitial;
   bool allow_guidance_override = true;
+  // See `Ltx2PhaseDenoiser`. Read in exactly one place — where a request's
+  // guider overrides are applied — and only AFTER the refusal above, so no
+  // recipe that refuses an override can reach it.
+  Ltx2PhaseDenoiser denoiser = Ltx2PhaseDenoiser::kGuided;
   bool use_official_sigma_schedule = true;
+  // See `Ltx2PhaseScheduleTokens`. Only consulted when `sigmas` is empty.
+  Ltx2PhaseScheduleTokens schedule_tokens = Ltx2PhaseScheduleTokens::kTargetLatent;
+  // The adapter set this phase runs. Read in exactly one place — the phase
+  // loop's rebind, immediately before the phase's first DiT forward — and
+  // honoured by `Ltx2RebindDitLoras`, which re-materializes only the tensors an
+  // adapter targets so that no second weight set ever exists.
+  Ltx2PhaseLoraScope loras = Ltx2PhaseLoraScope::kAllAdapters;
   Ltx2StepperKind stepper = Ltx2StepperKind::kEuler;
   double stepper_eta = 0.0;
   double stepper_s_noise = 1.0;
@@ -572,6 +767,42 @@ struct Ltx2PipelineRecipe {
   // "t2a_one_stage"` tests are four chances for one of them to be missed on the
   // next audio-only recipe. The recipe table is the one place that knows.
   bool audio_only = false;
+
+  // `A2VidPipelineTwoStage` (a2vid_two_stage.py:53). TRUE means a driving
+  // waveform is not optional: `--audio-path` is `required=True` (`:312-317`) and
+  // the whole pipeline is "denoise video AROUND this take", with the audio
+  // stream frozen at both stages (`:251-256`, `:291-296`).
+  //
+  // FLAGS ON THE RECIPE, not `pipeline_kind` string compares at the two call
+  // sites, for the reason `audio_only` gives above. The second one already has a
+  // second user waiting: `ti2vid_two_stages` (#1093) and
+  // `keyframe_interpolation` (#1096) both select a parser where
+  // `--distilled-lora` is `required=True` (utils/args.py:1140-1155).
+  //
+  // WITHOUT THE TAKE the render still finishes. It returns a clip of the right
+  // size, the right frame count and the right sample rate, with the soundtrack
+  // generated rather than supplied — which is the ordinary joint-generation
+  // behaviour and is indistinguishable from audio-to-video that ignored its
+  // input.
+  bool requires_audio_input = false;
+  // `--distilled-lora` is `required=True` on the two-stage parser this pipeline
+  // selects (utils/args.py:1140-1155, `default_2_stage_arg_parser` at `:1123`),
+  // and stage 2's three-sigma refinement (`:164`) is what that adapter was
+  // trained for. A recipe that fixes this flag cannot render on a checkpoint
+  // carrying no adapter without running a distilled schedule on undistilled
+  // weights.
+  //
+  // THE PLACEMENT IS NOT THIS FLAG'S JOB, and it is no longer missing. This
+  // comment used to end "this engine fuses at load into one weight set", owed by
+  // #1118. Row LTX25-PHASE-LORA closed that: `Ltx2PhaseRecipe::loras` carries
+  // upstream's per-stage adapter set, and `A2VidTwoStageRecipe` gives stage 1
+  // `kNoAdapters` (`a2vid_two_stage.py:107`) against stage 2's default
+  // (`:114`, `stage_2_loras = (*loras, *distilled_lora)`).
+  //
+  // What this flag says is only that the load must CARRY an adapter, mirroring
+  // `--distilled-lora required=True`. What the phase field says is which stage
+  // runs it. The two were conflated while only one placement existed.
+  bool requires_distilled_lora = false;
 
   int64_t max_spatial_downscale() const;
 };
@@ -624,6 +855,19 @@ void Ltx2AssertResolution(int64_t height, int64_t width, int64_t divisor);
 //   ("one_stage",          "2.5")  Lightricks, via _PARAMS_SINCE_VERSION (:130-133)
 //   ("distilled_two_stage","2")    vLLM-Omni LTX2_DISTILLED_TWO_STAGE_RECIPE (:125-158)
 //   ("distilled_two_stage","2.5")  Lightricks distilled.py + constants.py:17-23
+//   ("res2s_two_stage",    "2.5")  Lightricks ti2vid_two_stages_hq.py:59-340 plus
+//                                  LTX_2_3_HQ_PARAMS (constants.py:95-115). Row
+//                                  LTX25-RES2S-LOOP, #921. The res_2s sampler on
+//                                  BOTH stages, 15 steps, STG off. 2.5 only, and
+//                                  not by analogy with the one_stage rows:
+//                                  `LTX_2_3_HQ_PARAMS` is a plain constant that
+//                                  overrides every generation-varying knob
+//                                  (constants.py:91-94 says so), so there is no
+//                                  `detect_params` lineage to spread it across
+//                                  versions. THE SAMPLER IS THE PRESET: this
+//                                  recipe on `kEuler` would render a finished,
+//                                  correctly sized, plausible clip at half the
+//                                  model evaluations 15 steps was tuned for
 //   ("dmd2",               "2")    vLLM-Omni LTX_POSITIVE_ONLY_RECIPE (:116-124)
 //   ("dmd2",               "2.3")  same
 //   ("dfr",                "2.5")  Lightricks dfr_pipeline.py:155-561 (row
@@ -638,6 +882,44 @@ void Ltx2AssertResolution(int64_t height, int64_t width, int64_t divisor);
 //                                  `use_keyframes_abs_pos_embedding`
 //   ("retake",             "2")    Lightricks retake.py:85,287,290-294,313-324
 //   ("retake",             "2.5")  same
+//   ("a2vid_two_stage",    "2")    Lightricks a2vid_two_stage.py:53,143 (row
+//   ("a2vid_two_stage",    "2.3")  LTX25-A2VID-RECIPE, #1117). Stage 1 denoises
+//   ("a2vid_two_stage",    "2.4")  VIDEO at half resolution, guided by the
+//   ("a2vid_two_stage",    "2.5")  params table's video row and a scheduler-
+//                                  DERIVED schedule (:225-227), with the audio
+//                                  stream frozen on the caller's own take
+//                                  (:251-256); stage 2 upsamples 2x and refines
+//                                  with STAGE_2_DISTILLED_SIGMAS and no guider
+//                                  at all (:277-297). It is NOT
+//                                  `distilled_two_stage` with a take attached:
+//                                  that recipe fixes both stages' sigmas, fixes
+//                                  its guidance, and samples stage 1 with the
+//                                  ANCESTRAL stepper on 2.5, where A2Vid passes
+//                                  no `stepper` and gets `EulerDiffusionStep()`
+//                                  (utils/blocks.py:526-527)
+//   ("ti2vid_two_stage",   "2")    Lightricks ti2vid_two_stages.py:61,159 (row
+//   ("ti2vid_two_stage",   "2.3")  LTX25-TI2VID-RECIPE, #1093). Upstream's PLAIN
+//   ("ti2vid_two_stage",   "2.4")  two-stage pipeline: stage 1 is the FULL model
+//   ("ti2vid_two_stage",   "2.5")  under CFG at half resolution on a scheduler-
+//                                  DERIVED schedule (:243-245) with the
+//                                  distilled adapter withheld (:140), stage 2
+//                                  spatially upsamples (:272) and refines on the
+//                                  frozen STAGE_2_DISTILLED_SIGMAS (:178) with
+//                                  the adapter (:151) and no guider (:290). It
+//                                  is NOT `distilled_two_stage`, which builds
+//                                  ONE stage set (distilled.py:131), freezes
+//                                  stage 1's sigmas and samples 2.5 with the
+//                                  ANCESTRAL stepper; nor `res2s_two_stage`,
+//                                  which puts the adapter on BOTH stages at
+//                                  0.25/0.5 and runs the second-order sampler.
+//                                  Four keys for the a2vid reason: `main()`
+//                                  takes whatever `resolve_cli_params()` read
+//                                  off the checkpoint (:318-319). ALONE among
+//                                  the derived arms it fits its sigma shift on
+//                                  the 4096 anchor rather than the target grid,
+//                                  because `execute(steps=...)` passes no latent
+//                                  (schedulers.py:31) — see
+//                                  `Ltx2PhaseScheduleTokens`
 //   ("t2a_one_stage",      "2")    Lightricks t2a_one_stage.py:43,109 (row
 //   ("t2a_one_stage",      "2.3")  LTX25-T2A-ONE-STAGE, #1005). The one_stage
 //   ("t2a_one_stage",      "2.4")  rows' own schedule with `audio_only` set:

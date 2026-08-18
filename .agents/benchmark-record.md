@@ -19,6 +19,109 @@ from relative link targets repointed for this file's location.
 
 # Benchmarks
 
+## MODEL-NEMOTRON-H-ABI-A3-E2E — the A3 token gate did NOT run, and the cause on record was NOT the cause (2026-08-17, `row/MODEL-NEMOTRON-H-ABI-A3-E2E`, base `origin/main` `a6df72777`, #810)
+
+**No number is recorded, on any axis. This entry exists so the pending cause is
+the measured one rather than the inherited one.**
+
+`.agents/specs/nemotron-h-a2p-paged-forward.md` §10 recorded the A3 gate as
+pending on **contention**: `dgx.casa` observed at loadavg 211 with 3 of 119 GB
+available, which is a real reason a 20.1 GiB checkpoint cannot load. Re-measured
+on 2026-08-17 under an `rc` lease, that box answers at **loadavg 0.36, 115 of
+119 GB available, GPU utilisation 0%**, with nothing of ours running on it. The
+recorded cause is no longer true, and this is the #775 shape the governing spec
+§5.5 warns about: a pending reason that outlives its own truth and gets
+subtracted by everyone who reads it afterwards.
+
+**★ THIS ENTRY WAS FIRST WRITTEN WITH A FALSE BLOCKER AND IS CORRECTED IN PLACE.**
+It claimed "no CUDA binary can be built for that host" over three closed paths.
+**Two of those three were wrong**, and the error has one root: *the dgx HOST and
+the `rc` worker CONTAINER are different machines, and host findings were reported
+as container findings.* The correction is kept beside the claim rather than
+substituted for it, because the failure mode is the interesting part.
+
+1. **The host toolchain — this part was RIGHT and stands.** Measured on
+   `ssh dgx.casa`: `nvcc ABSENT   cmake ABSENT   g++ ABSENT   ninja ABSENT`.
+   Already filed as [#1019](https://github.com/mudler/vllm.cpp/issues/1019),
+   whose title says the dgx profile "mandates a CUDA toolkit and a CUTLASS path
+   that do not exist". **But the host is not where work runs**, so this never
+   blocked the gate the way this entry first said.
+2. **The `rc` worker container — the original claim here was FALSE.** It said
+   `gcc`, `g++`, `cc`, `cmake`, `ninja`, `make`, `python3`, `git` were all
+   absent, that `/usr/include/stdio.h` did not exist, and that DNS failed.
+   Measured inside `rc run`, the container is Ubuntu 24.04, runs as **uid 0**,
+   and carries `gcc`, `g++`, `cmake`, `ninja`, `make`, `python3`, `pip3`, `git`
+   and `apt`; `nvidia-smi` reports the GB10; DNS resolves and
+   `developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/arm64/` answers
+   `HTTP/2 200`. **Only `nvcc` is genuinely absent**, and apt's own
+   `nvidia-cuda-toolkit` is 12.0.140, too old for sm_121a (GB10 needs 12.8+/13.x)
+   — so the toolkit is installed from the NVIDIA repo, which is a step, not a
+   wall.
+3. **`docker` and `sudo` are NOT NEEDED AT ALL, and asking for them was the
+   error compounding.** You are root in the container; the recorded
+   `sudo -n docker run …` recipe in `$HOME/a2r/gb10_build.sh` belongs to the
+   pre-`rc` era.
+
+**The lesson, stated plainly for the next reader:** a probe that runs somewhere
+other than where the work will run answers a question nobody asked. Re-derive
+inside `rc run`, and do not let a host `ssh` result stand in for it.
+
+**What WAS verified on the gate host**, all of it cheap and under short leases:
+
+- **The checkpoint is present under BOTH paths, and `.env` is CORRECT.** An
+  earlier revision of this entry claimed the opposite — that only
+  `/home/mudler/ckpt/...` held it and that "there are no cifs/nfs mounts at
+  all". `findmnt` on the host says otherwise:
+
+  ```
+  /usr/local/nas_share //192.168.68.102/Data cifs rw,relatime,vers=3.1.1,
+    cache=strict,username=anonymous,uid=0,forceuid,gid=10001,forcegid,
+    addr=192.168.68.102,file_mode=0664,dir_mode=0775,iocharset=utf8,soft,nounix
+  ```
+
+  and the checkpoint resolves at
+  `/usr/local/nas_share/checkpoints/nemotron-3.5-lightning-30b-nvfp4`,
+  `/usr/local/nas_share/checkpoints/nemotron-3.5-lightning-30b-gguf` and
+  `/home/mudler/ckpt/nemotron-3.5-lightning-30b-nvfp4`. So
+  `CHECKPOINT_ROOT=/usr/local/nas_share/checkpoints` in `.env` is right and must
+  not be "fixed".
+- **Whether the container can SEE that path is still OPEN.** No probe has
+  answered it: the one queued to do so was killed to free the queue. Nothing is
+  claimed here either way, and step 6 of the A3 job is what will answer it.
+- **21 583 809 748 bytes**, 52 safetensors shards.
+- The revision is **verified, not copied**:
+  `model-00001-of-00052.safetensors` hashes to
+  `672c8bda10fdec0256e0819e112d2aa3a936cc3e5d311a05fd3ff773ca9a44b9`, which is
+  what that file's own HF sidecar records for commit
+  `29f2d1746d8f41e316523194b19018707749b1b1`, the golden's revision.
+
+**The driver was built and its instrument proven armed, off the gate host.**
+`examples/nemotron_h_gen` compiles and links against the real `vllm::shared` in
+a CPU build (`BUILD_RC=0`, 0 compile errors). Its guards were then exercised
+against a **real engine** on `opt-125m-bf16-st` rather than argued for, because
+the driver is model-agnostic and the assertions are what a NemotronH run will
+depend on:
+
+| arm | result |
+|---|---|
+| golden width 8, all 8 match | `STRICT PASS`, exit **0** |
+| golden width 8, 0 of 8 match | `DIVERGENCE`, exit **1** |
+| `--steps 4` against golden width 8, **4/4 matched** | `SHORT`, exit **4** |
+| 5 malformed goldens (empty array, empty prompt, empty tokens, no array, truncated) | parse refusal, exit **2** each |
+
+The third row is the one worth keeping: it matched **every token it looked at**
+and still refused, because it had looked at half the golden. A driver without
+that check would have reported `4/4` as a pass.
+
+The committed golden's geometry, read by the driver itself (`--golden-info`):
+**3 entries, prompt widths 5 / 8 / 13, golden width 32 each**, so a full A3 run
+compares **96 tokens**. Any "compared" number below 96 is a short run and exits 4.
+
+**Also blocked, and by design rather than by a host:** the governing spec §5.2
+arm 2 (the three prompts submitted concurrently and interleaved). G-SAFE refuses
+`input.num_reqs > 1` and A2-B owns that clause, so only arm 1 (multi-step,
+single request) is reachable even once a build host exists.
+
 ## KIMI-BF16-STREAM — bf16 residual stream end-to-end REFUTED (122→4/128, KDA repeat-loop destabilization, no speed win); STRICT is NOT reachable by residual-precision (§14-§20 all closed); 122/128 @ 18.9 tok/s (0.90× vLLM) is the coherent best; SERVER runner fold scoped (runner aborts on Kimi's KV today) (2026-08-07, `row/KIMI-BF16-STREAM-CLOSE`, base `origin/main` `2f029a10`, GB10 sm_121a, PR #118)
 
 The #113 follow-on tested the §19-named residual #1 — the bf16 residual stream END-TO-END, framed as
@@ -22255,3 +22358,605 @@ and cannot hold a 370 GiB checkpoint, and three earlier attempts on that box wer
 OOM-killed at 48.6 GiB anon beside another session's 32.6 GiB job. Tracked under
 `## Owed` in [`expert-streaming.md`](specs/expert-streaming.md). No new
 performance number is claimed by the repair that produced this retraction.
+
+## SPEC-MTP-K-GT-1 — the k>1 depth arms re-measured in ONE uncontended window (throughput VOID lifted); the vLLM leg failed on a HOST TOOLCHAIN gap, not on the model (2026-08-17, `row/SPEC-MTP-K-GT-1-DGX`, GB10 sm_121, #81 M1)
+
+Third DGX pass. `dgx.casa` was clean for the first time in three passes: no
+compute apps, no containers, mutex free, 115 GiB of 119 available, loadavg 0.16.
+
+**Window 1 (`WINDOW_RC=0`, 07:15:27Z to 07:47:55Z, boot_id `5bbdc432`).** All
+three device preconditions passed on the acquire, clocks pinned at 2100, trap
+reset them. Seven arms, every one exit 0:
+
+| Leg | Exit | loadavg at start |
+|---|---|---|
+| `ours_off` | 0 | 0.16 |
+| `ours_on_k2` | 0 | 1.86 |
+| `ours_on_k3` | 0 | 1.77 |
+| `ours_on_k4` | 0 | 1.53 |
+| `padded_k2` | 0 | 1.19 |
+| `padded_k3` | 0 | 1.61 |
+| `padded_k4` | 0 | 1.86 |
+
+`ours_on_k2` per-depth: `SPEC_DEPTH 0 proposed=197 accepted=173 rate=0.878173`,
+`SPEC_DEPTH 1 proposed=197 accepted=144 rate=0.730964`.
+
+**This LIFTS the VOID the first pass carried on `padded_k3`/`padded_k4`
+throughput.** That void existed because those arms started at loadavg 10.77 and
+20.41 while the real arms ran at 1.5 to 2.9, so the two sides were not
+comparable. Here all seven ran inside one window in a band of 0.16 to 1.86.
+
+**The ON/OFF divergence reproduced EXACTLY on independently generated streams**:
+1718 divergent positions, 18 adjudicable (first per arm and prompt), 3 distinct
+probe points; prompt 0 position 12 `79733`→`279`, prompt 1 position 1 `25`→`7318`
+at k=2, prompt 2 position 69 `15336`→`1727`, prompt 3 identical throughout. It is
+deterministic across sessions and boots, not a flake.
+
+**The adjudication and all four oracle legs FAILED, and neither failure is a
+verdict about the model.** The reimaged host carries NO C compiler: no `gcc`,
+`cc`, `clang`, `ninja` or `nvcc` anywhere, `/usr/include` without `stdio.h` or
+`python3.12/Python.h`, no crt objects, and a Triton 3.7.1 shipping only `ptxas`,
+`cuobjdump` and `nvdisasm`. Triton's JIT therefore died AFTER the weights loaded
+and vLLM reported `Engine core initialization failed. See root cause above.
+Failed core proc(s): {}`. A reader who did not open the traceback would have
+scored four `ORACLE_EXIT=1` legs as "the oracle cannot run this configuration".
+`enforce_eager` would have walked past it and was NOT used: it is forbidden as a
+denominator and this is the denominator. A second, independent caller defect hit
+the OFF leg only, which passed an empty `k` and died on `int('')`.
+
+**Window 2 proved the repair and then lost the box.** Queued at 07:35:04Z with
+`flock -w 21600`, BLOCKED on the mutex rather than jumping it, acquired 07:47:55Z
+in the same second window 1 released. Running the pinned venv inside a container
+carrying the toolchain gave `TOOLCHAIN gcc=13 ninja=1.11.1 CC=/usr/bin/gcc
+python=Python 3.12.3`, oracle identity `0.23.1rc1.dev1511+g555967922`, 6/6 arms
+loaded, and the engine passed the point that killed every window 1 leg into
+`torch.compile` (`Dynamo bytecode transform time: 20.80 s`). At approximately
+07:56Z the host stopped completing an SSH banner exchange while still answering
+ICMP, and had not returned when this entry was written.
+
+**The cause was then MEASURED.** The box returned at 08:38Z after about 42
+minutes and had NOT rebooted: `uptime` read `up 11:28` and `boot_id` was still
+`5bbdc432`, so this is the thrash case, not the documented OOM-reboot. It came
+back at `load average: 260.22` with 118 of 119 GiB used and 0 available, our
+container still up and still holding the mutex, 26147 MiB on the device, clocks
+still pinned. It was not progressing: `torch.compile` finished at 07:53:41 in
+122.46 s and the log did not advance for the 45 minutes after, stuck in the
+memory-profiling and KV-sizing step that follows. Its own timeout had fired,
+`ADJUDICATE_EXIT=124`, and `timeout` had signalled `docker run` while the
+CONTAINER outlived it.
+
+Killing our own container took the host from 118 of 119 GiB used to 4 of 119 in
+under ten seconds. **The engine was holding roughly 110 GiB of HOST RAM while
+`nvidia-smi` showed 26 GiB on the device.** That much is measured and stands.
+
+**The attribution to `gpu_memory_utilization=0.75` was then TESTED AND REFUTED.**
+`adjudicate.py` exposes `--gpu-mem-util` as an argument, so a third window ran the
+byte-identical instrument at **0.30**, with a 5-second host-memory sampler that
+window 2 had lacked. It collapsed the same way: `avail_mb` 87683 at 09:00:47 and
+**0** at 09:02:25, loadavg 1.19 to 39.90. Weight loading finished with 66 GiB
+free (`Loading weights took 170.12 seconds`) and `torch.compile` finished with
+88 GiB free (`took 118.96 s in total`), so the collapse is in NEITHER. Lowering
+the fraction bought a later start and changed nothing.
+
+What the A/B did buy is a tighter localisation: the step immediately AFTER
+compilation, insensitive to the KV-pool fraction, which points at the profiling
+forward and graph capture (`max_num_batched_tokens=8192`,
+`cudagraph_capture_sizes: [1, 2, 4, 8]`, all host-backed on GB10). **That is a
+hypothesis with a located step, not a result.** Vary those one at a time with the
+sampler running. No oracle leg in any pass has reached KV-cache allocation here,
+so nothing about this step had been exercised on this box before.
+
+**And the 0.30 run REBOOTED the box, which the 0.75 run did not.** Evidenced
+rather than inferred: `boot_id` moved `5bbdc432...` to `bd5c6e7a...` and
+`journalctl --list-boots` shows boot `-1` ending 09:10:15Z against boot `0`
+beginning 09:13:55Z. The lower fraction therefore did not merely fail to help,
+it did not prevent the worst outcome either: 0.75 thrashed 42 minutes and
+survived, 0.30 took the machine down. Treat every attempt here as at risk.
+
+State after the reboot, verified: mutex FREE, no containers, no compute apps,
+115 GiB available, loadavg 0.71, clocks at the boot default 208 MHz, 0 of our
+processes, and everything under `~/mtpgate/final/` intact.
+
+**A trap defect, found by watching it fail.** `SIGTERM` to the driver reset the
+clocks and the driver then started its NEXT leg on a box with no memory left,
+because `trap cleanup EXIT INT TERM` runs `cleanup` and returns without exiting.
+The chain needed `SIGKILL` and the container needed stopping separately. Both DGX
+drivers share this shape.
+
+Only our own processes were signalled. Final state verified: no matching
+processes, no containers, `fuser $HOME/gpu.lock` with no holders so the mutex is
+FREE, no compute apps, clocks reset (`nvidia-smi -rgc` reporting `All done.`),
+115 GiB available, loadavg falling 260 to 42.
+
+**Padded control, PAID at every depth in that one window.** Margin fixed at 0.10
+absolute before the run. Real depth-1 acceptance 0.730964 (k=2), 0.682635 (k=3),
+0.750000 (k=4); depth-2 0.538922 (k=3), 0.617647 (k=4); depth-3 0.507353 (k=4).
+Control 0.000000 at every depth >= 1 while its depth-0 rate MATCHES the real arm
+(0.892 to 0.925 against 0.868 to 0.878), which is what a control isolating
+columns >= 1 must look like. All six margins clear by +0.5074 to +0.7500.
+`compare.py`: **`CHECKS_RUN=21 CHECKS_FAILED=11 VERDICT=FAIL`** — 10 pass (three
+per-depth counter checks, six control margins, one token-production check), 3
+fail on the unadjudicated ON/OFF divergence and 8 on `arm missing` from the
+oracle that never produced a file.
+
+**No parity number is claimed and the token gate is still unclaimed.**
+`our-ON == our-OFF` remains FALSE and unattributed. Owed detail lives under
+`## Owed` in [`mtp-k-gt-1.md`](specs/mtp-k-gt-1.md).
+## MUSIC3-DIT-DEVICE — the 2.4B fp32 DiT on `thor:gpu0`, per-forward A/B against the host reference (2026-08-17, `row/MUSIC3-DIT-DEVICE`, #672)
+
+**Not a parity ratio.** There is no reference leg: SGLang-Omni is `gateable = no`
+and serves the native layout, so this is an INTERNAL two-arm number about our own
+host reference vs our own device arm. Every axis in `docs/BENCHMARKS.md` against
+the reference stays `PENDING`.
+
+### Device, named because a number without one is meaningless here
+
+**`thor:gpu0` — NVIDIA Thor, sm_110, aarch64, 14 cores, ~122 GB UNIFIED, driver
+595.78.** Nothing below is compared to a `dgx:gpu0` (GB10) or `orin:gpu0` number;
+the three boxes are different machines. Image `vllmcpp-thor:cuda13.0.1`, nvcc
+13.0.88, `-DVLLM_CPP_CUDA=ON -DVLLM_CPP_CUDA_ARCHITECTURES=110
+-DVLLM_CPP_TRITON=OFF -DVLLM_CPP_SERVER=ON`, no cutlass. Checkpoint mounted
+read-only from the NAS. Same binary, same weights, same committed inputs on both
+arms; the arms never overlapped.
+
+**Lease discipline, recorded because it was imperfect.** The CUDA build, the
+two-arm correctness series and the first timing runs were driven over `ssh` under
+`flock $HOME/gpu.lock`, which is what this row's brief specified and which the
+`rc` lease system has since superseded — during that window the fleet reported
+`thor:gpu0` as FREE while it was in use. The device-arm timing series that the
+speed claim rests on was run under a real `rc hold` on `thor:gpu0`
+(`a91d21dc`, taken 10:32Z, released 10:54Z on completion). The hold carried no
+`--reason` string and a 75 m TTL for ~22 m of work; both are recorded as errors,
+and single commands should go through `rc run --max-runtime` instead.
+
+### What is timed
+
+`VLLM_CPP_MUSIC3_DIT_REPEAT=R` runs the guided velocity R times per timestep in
+`tests/parity/test_minimax_music3_acoustic_real.cpp`. The timer brackets ONLY
+that loop: the 9.7 GB checkpoint load and the weight staging are outside it, and
+staging is timed separately. NOTE, corrected in fresh review: the golden reads
+(4x `LoadF32Npy`, 2x `Compare`, 2x `ReportInto`) are INSIDE the bracket
+(`test_minimax_music3_acoustic_real.cpp:592-606`), which inflates the intercept
+and makes the reported per-forward number conservative, not inflated. One guided velocity is TWO
+DiT forwards (the conditional and the unconditional CFG branch).
+
+| arm | repeats | forwards | loop | per forward | staging | box load |
+|---|---|---|---|---|---|---|
+| CPU (`VLLM_CPP_MUSIC3_DEVICE=0`) | 1 | 4 | 819.818584 s | **204.954646 s** | 0 (no-op) | 3.42 |
+| CPU (`=0`) | 1 | 4 | 819.992 s | **204.998 s** | 0 (no-op) | 10.37 |
+| CUDA (`=1`) | 1 | 4 | 0.749077 s | **0.187269 s** | 0.603561 s | 4.79 |
+| CUDA (`=1`) | 3 | 12 | 2.110301 s | **0.175858 s** | 0.660600 s | 5.32 |
+| CUDA (`=1`) | 1 | 4 | 0.743367 s | **0.185842 s** | 0.609463 s | 5.1 |
+| CUDA (`=1`) | 1 | 4 | 0.743881 s | **0.185970 s** | 0.612787 s | 4.44 |
+
+Two-point fit over the device arm's 4- and 12-forward runs:
+
+    slope = 0.170607 s per forward        intercept = 0.063012 s
+
+**Per DiT forward at the capture's geometry (latent length 86, sequence 87):
+204.955 s host vs 0.1706-0.1873 s device — 1102x on the matched R=1 pair, 1201x
+on the fitted slope.** The device R=1 point was taken THREE times across two
+sessions, bracketing R=3, at 0.749077 / 0.743367 / 0.743881 s: a 0.77 % spread.
+
+**The contention asymmetry was measured away, not argued away.** The first CPU
+point sat at box load 10.37 against the device arm's 4.4-5.3, which would have
+inflated the ratio if it mattered. Re-taken on an idle box (load 3.42) with the
+fixed instrument it reads **204.954646 s against 204.998 s — 0.021 %**. The host
+DiT forward is single-threaded on a 14-core box, so a load of 10 still leaves it
+a core. Both points are in the table rather than the convenient one.
+
+### The weights are staged ONCE, as a measurement
+
+One staging costs 0.60-0.66 s. The entire FOUR-forward loop costs 0.745 s and the
+TWELVE-forward loop 2.110 s; twelve stagings would be 7.35 s by themselves. The
+loop's fitted intercept is 0.063 s, a tenth of a single staging. A per-forward
+or per-window upload is excluded arithmetically, not by reading the code.
+
+### The whole-process ratios — lower, and the honest ceiling on what a user sees
+
+Same gate binary end to end, including the identical 9.7 GB NAS load on both
+arms: 1054-1071 s (CPU) vs 238-298 s (CUDA), **3.5-4.5x** — the spread is NAS
+cache state, not compute. The earlier full two-arm
+correctness series, identical scripts throughout: 49 min 17 s vs 15 min 49 s,
+**3.12x**. Load averages across the series 4.0-5.1, box otherwise idle apart from
+`k3s`; `uptime` recorded on both sides of every run and the host never rebooted.
+
+The distance between 1100x on the DiT and 4x on the process IS the owed list: the
+checkpoint load, the DAC vocoder and the RVQ depth decoder are unchanged and now
+dominate.
+
+### Extrapolation, labelled as one
+
+The only geometry measured is the capture's single 86-frame window. Applying the
+fit to the 660 forwards a 45 s clip runs at the shipped defaults (30 steps x 2 CFG
+x 11 windows) gives **~37.6 h of DiT on the host against ~113 s on the device**,
+with the one-time staging 0.53 % of the device total. That is an extrapolation
+from one window geometry and is not a measured clip-level result.
+
+**No end-to-end song pair is offered, and that is a limit rather than an
+omission.** At 30 steps the host arm's DiT alone is ~37.6 h, so an e2e pair is
+not runnable on the CPU arm at a realistic setting; at a setting short enough to
+run, the DiT is a small enough share that the pair would be measuring the
+vocoder.
+
+### Correctness taken in the same series, at bounds that did not move
+
+Full scale, the real 2.4B fp32 checkpoint against the committed oracle capture,
+11 008 values per step, `kDitRelTol` 1e-4 / `kDitAbsFloor` 5e-5 /
+`kDitMeanAbsTol` 5e-6 — all unchanged:
+
+| arm | step | bit-identical | mean\|d\| | max\|d\| | outside |
+|---|---|---|---|---|---|
+| Thor CPU | first | 423 (3.843 %) | 1.71434e-06 | 2.38419e-05 | 0 |
+| Thor CPU | last | 235 (2.135 %) | 2.22396e-06 | 2.83718e-05 | 0 |
+| Thor CUDA | first | 473 (4.297 %) | 1.64344e-06 | 2.47955e-05 | 0 |
+| Thor CUDA | last | 222 (2.017 %) | 2.44677e-06 | 2.59876e-05 | 0 |
+| CONTROL torch-vs-torch | first | 15.416 % | 7.526e-07 | 7.153e-06 | — |
+| CONTROL torch-vs-torch | last | 5.596 % | 1.424e-06 | 1.335e-05 | — |
+
+The Thor CPU arm reproduces the x86-64 numbers already recorded for this gate
+VALUE FOR VALUE, so the CPU path is unchanged across two architectures.
+
+### Instrument defect found and fixed inside this series
+
+The first timing line printed `DIT_TIMING arm=1` on the CPU run: a `const char*`
+in a doctest `MESSAGE` chain takes the bool conversion. It is the SAME defect
+§11.5 recorded for this row's arm banner, reintroduced by a fresh `<<` chain.
+Both lines are now assembled as one `std::string`. EVERY number in the table was
+then re-taken with the fixed instrument, and the CPU arm's pre-fix point is kept
+beside its post-fix twin rather than replaced by it, because the pair is what
+proves the label defect never touched the values: 819.992 s against
+819.818584 s.
+
+---
+
+## BACKEND-ROCM — the `d=128` decode arm against the pinned oracle: 6.35x -> 1.75x slower on per-token decode, both sides in ONE container; the "container/glibc" blocker was RETRACTED (2026-08-14, `row/ROCM-DECODE-ATTN-D128-IMPL`, gfx1200 / RX 9060 XT / ROCm 7.2.3, PR #767, issues #382 / #488)
+
+Recorded here from [the #767 comment of
+2026-08-14](https://github.com/mudler/vllm.cpp/pull/767#issuecomment-5295395139)
+because it was the strongest evidence in that pull request and lived only in a
+GitHub thread, which a squash merge does not carry into the tree. Spec:
+[`specs/rocm-decode-attn-d128.md`](specs/rocm-decode-attn-d128.md) §5.
+
+**The blocker this row previously recorded does not exist.** PR #767's body and
+the spec's §6 said the post-change oracle re-measure was blocked on a
+Nix-glibc-vs-container ABI mismatch. Its author retracted that diagnosis in the
+comment above: our binary runs inside the pinned oracle container, and the
+earlier failures were self-inflicted — `LD_LIBRARY_PATH` exported
+container-wide, which breaks the container's own tools, plus a bind mount that
+silently yielded nothing and presented as a missing ELF interpreter. A false
+blocker in the record is worse than no record, because it stops the next person
+from trying. §6 of the spec now says "not run — NOT blocked".
+
+### The substitution was proved inert before it was used
+
+Running our binary against the CONTAINER's ROCm rather than the host's is a
+substitution, so it gets a control. Qwen3-0.6B, 1024 in / 128 out, concurrency 1:
+
+| TPOT | native | in container |
+|---|---|---|
+| flag unset | 42.53 ms | 42.79 ms |
+| `VT_ATTN_DECODE_D128=1` | 11.78 ms | 12.03 ms |
+
+### Both sides in that container, matched workload
+
+Qwen3-0.6B, 1024 in / 128 out, concurrency 1, **8 prompts**, warmup discarded,
+**3 reps**. Oracle = vLLM `555967922` — the parity pin — in its PRODUCTION
+configuration, driven by `vllm bench serve`.
+
+| | TPOT reps | mean | vs oracle |
+|---|---|---|---|
+| ours, flag unset (`PagedAttnOnline`) | 42.54 / 42.46 / 42.19 | 42.40 ms | 6.35x slower |
+| ours, `VT_ATTN_DECODE_D128=1` | 11.97 / 11.38 / 11.66 | **11.67 ms** | **1.75x slower** |
+| vLLM `555967922` | 6.57 / 6.90 / 6.58 | 6.68 ms | — |
+
+The `d=128` decode arm closes the ROCm decode gap on this shape from **6.35x to
+1.75x**. It is the first oracle-relative ROCm decode figure this row has, and
+the arm ships **default OFF**, so it is not a shipped-behaviour number.
+
+### What this is NOT, carried forward verbatim from the author's own caveats
+
+- **Not the same-tool per-call kernel trace.** This is LATENCY, taken with each
+  side's own harness. AGENTS.md wants matching traces before a throughput
+  comparison. `rocprofv3` is present in the container and our binary traces
+  under it, but the oracle side still needs decode-phase windowing — bucket
+  dispatches over time, take the final burst — or it compares our decode
+  against vLLM's model load and graph capture. Reachable, and still owed.
+- **Harness asymmetry.** The oracle runs over HTTP via `vllm bench serve`; ours
+  is in-process. TPOT is the comparable axis. TTFT, E2EL and end-to-end
+  throughput carry the oracle's HTTP and tokenizer overhead and are
+  DIRECTIONAL ONLY.
+- **Not a #488 closure.** [#488](https://github.com/mudler/vllm.cpp/issues/488)
+  asks for a PER-CALL kernel comparison; this is PER-TOKEN latency. The ROCm
+  throughput axis in `docs/BENCHMARKS.md` stays **PENDING/OPEN**.
+- Single board, single model shape, one host.
+
+### The prompt count is load-bearing, and this is why
+
+At `--num-prompts 2` the oracle returned TPOT **6.96 ms and 13.45 ms on
+consecutive reps** — a ~2x spread that averages to a plausible-looking and
+entirely fictional number. The figures above use 8 prompts with a discarded
+warmup, where both sides hold to ~±0.3 ms. A two-request rate harness is not a
+measurement of this axis; it is a coin flip with a mean.
+
+## ENG-CUDAGRAPH-BREAK W1 — the measurement that was NOT taken, and the one that was (2026-08-18, #1192)
+
+**No throughput number was taken, and none is owed.** This is a coverage and
+correctness row. A speed claim from the break-point seam is admissible only after
+naming a path that is BOTH currently eager AND currently host-bound, and stating
+how the host-bound part is measured. Our prefill is neither: GB10 measured idle
+between launches at 3.8% with GPU-busy above 96%, and the 27B prefill gap at
+92.5% non-GEMM glue GPU work. Decode is already captured and already banked its
+launch-overhead win. The refutation is dated and hardware-specific rather than
+permanent; the burden is on a later claimant to name the path.
+
+**What W1 did measure is a CAPABILITY, not a rate.** W0 deliberately left open
+whether CUDA permits `cudaStreamEndCapture` followed by `cudaStreamBeginCapture`
+on the same stream mid-forward with eager work between them, on our stream
+configuration. SGLang does exactly this on a production path at the pinned
+revision, which is strong evidence and was not our measurement.
+
+Measured on `orin:gpu0` through an `rc` lease, driver `12060`, under
+`cudaStreamCaptureModeThreadLocal` — the mode `src/vt/cuda/cuda_backend.cu:204`
+uses. The probe runs the seam's own shape rather than a toy: segment,
+host-dependent eager break on the same stream, RE-BEGIN, segment, bare zero-work
+re-begin, segment. Then three replays with fresh inputs. Result: every re-begin
+legal, 0 mismatches on all three replays. The bare re-begin
+(`breakable_cuda_graph.py:370-374`) is legal too.
+
+**The first two probe runs REFUSED, and both refusals were the probe's.** This is
+the entry worth reading before anyone re-runs this lever. Binding the CUDA driver
+API through `dlsym` on the BARE symbol name gets `libcuda`'s LEGACY v1 entry
+points, which are not capture-aware: `cuMemcpyDtoDAsync` (v1) returned
+`CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED` inside a capture that is in fact legal,
+and `cuStreamBeginCapture` (v1) takes NO capture-mode argument, so the probe
+believed it was exercising the thread-local mode while exercising the global one.
+Preferring `_v3` blindly then bound `cuCtxCreate_v3`, which takes two extra
+parameters, and context creation failed `CUDA_ERROR_INVALID_DEVICE`. Both
+readings presented as a verdict about the DESIGN. Bound by exact versioned name,
+the criterion holds. An instrument that can fail toward a code verdict has to
+assert its own precondition first.
+
+**A second run on GB10 (`dgx:gpu0`) compiled and did not execute**, for a reason
+that is also not CUDA's: `nvcc` produced the binary under `/workspace`, which on
+that host is a CIFS mount storing `file_mode=0664`, so the run exited 126
+`Permission denied`. `BUILD_STATUS=0` on `NVIDIA GB10` is recorded; the execution
+belongs on container-local disk.
+
+**The correctness number that IS recorded** is not a rate either: the Qwen3 dense
+forward run with a capture scope open produces logits BIT-IDENTICAL to the same
+forward with no scope — 500 values compared, 0 differing
+(`tests/vllm/models/test_qwen3_break_point.cpp`). That is what makes the stage
+reversible, and it is the polarity AGENTS.md requires when a greedy path exists.
+
+**THE PROBE IS IN THE TREE, and here is how to run it.** A measurement that
+produced two false refusals, each presenting as a verdict about the design, is
+the last one anybody should have to reconstruct from prose. The first record of
+it named neither an artifact nor a recipe; this one does.
+
+| Artifact | Path | sha256 | Lines |
+|---|---|---|---|
+| driver-API probe (`dlsym`, no toolkit, no headers) | `scripts/probe_cudagraph_rebegin.c` | `dbf95d69d396e7f3a41c754ccedda59ef076a1dd30960d2c738a1c26fe238297` | 246 |
+| runtime-API probe (needs `nvcc`) | `scripts/probe_cudagraph_rebegin.cu` | `ce73250331af5bc3eb8b560176e60a07f77476dcff60b81a0b0d7caea6f20bed` | 167 |
+
+Both exercise the SEAM's shape rather than a toy — segment, host-dependent eager
+break on the same stream, RE-BEGIN, segment, bare zero-work re-begin, segment,
+then three replays with fresh inputs — and both print a single
+`VERDICT: REBEGIN_HOLDS` or a named refusal. Recipe, on a leased device:
+
+```sh
+# driver-API build: no CUDA toolkit needed, links libdl and binds libcuda at run time
+cc -O1 -o probe scripts/probe_cudagraph_rebegin.c -ldl && ./probe; echo "PROBE_EXIT=$?"
+
+# runtime-API build
+nvcc -O1 -arch=native -o probe scripts/probe_cudagraph_rebegin.cu || \
+  nvcc -O1 -o probe scripts/probe_cudagraph_rebegin.cu
+echo "BUILD_STATUS=$?"; ./probe; echo "PROBE_EXIT=$?"
+```
+
+Build it on CONTAINER-LOCAL disk. The `dgx:gpu0` run compiled under `/workspace`,
+which on that host is a CIFS mount storing `file_mode=0664`, and exited 126
+`Permission denied` — `BUILD_STATUS=0` with nothing executed, which is a build
+result wearing a measurement's clothes.
+
+**What is NOT recoverable, stated plainly rather than reconstructed.** The
+`orin:gpu0` run's own driver script and its raw stdout were not retained. The
+verdict above therefore rests on the recorded reading, and the only way to
+re-derive it is to re-run the committed source under the recipe above on a leased
+GPU. Nothing here was re-run for this record: the repair pass that added it had
+no GPU lease.
+
+## ENG-CUDAGRAPH-DEDUP W4 — the device A/B: correctness PASSES, and the fold NEVER HAPPENS (2026-08-18, `row/ENG-CUDAGRAPH-DEDUP-RESULT`, gated commit `72de552c8`, GB10 sm_121a, #1162 / #1184 / #1226)
+
+**No throughput or memory number is recorded, on any axis, and none is owed.** Two
+independent reasons and either alone is sufficient: the clocks were not pinned, and the
+`VT_CUDA_GRAPH_DEDUP=1` arm allocated exactly as many graph executables as the OFF arm,
+so there is no memory delta to claim. The `replay branch avg` figures in the cell logs
+(0.033-0.120 ms/step) are diagnostics, not a measurement. This row was never a
+throughput row; its load-bearing gate is byte-identity, and its headline number is an
+executable count.
+
+### The commit that was gated is NOT the commit that landed
+
+`72de552c8` was built and run. The merge is `2a976eb9f`, and the row squashed, so the
+gated tree is not an ancestor of it. What carries the claim across that gap is a content
+equality that was checked rather than assumed: all four dedup sources — `src/vt/graph_dedup.h`,
+`src/vt/graph_dedup_runtime.h`, `src/vt/graph_dedup_latch.h` and
+`src/vt/graph_dedup_signature.h` — are **byte-identical** at the two commits. The merge
+commit itself was not executed, and this record does not claim it was.
+
+### Environment
+
+Device `dgx:gpu0`, leased through `rc`, job `f88d484b`, never ssh. Worker pod
+`rc-worker-4b8lj`, aarch64, root, 20 cores. boot_id
+`1cf6179f-0150-4052-b507-506fd6751953` for the build and every cell. GPU NVIDIA GB10,
+driver `580.173.02`, `clocks.sm` 208 MHz idle / 3003 MHz max, `applications.graphics`
+2418 MHz, persistence Disabled. **Clocks NOT pinned.** loadavg `1.82 3.22 4.07` at
+series start and `2.88 3.98 3.98` at series end, per-cell range 2.94-3.45; the box was
+quiet at both ends.
+
+**The in-pod toolkit CHANGED under us between the two attempts.**
+`/usr/local/cuda/bin/nvcc` measured **CUDA 13.0.88** here and **13.3.73** on the same
+pod and the same boot at the first attempt, because a neighbouring session held the box
+for about two hours immediately before with a job named `oracle-build130`. The toolkit
+is a property of the shared pod, not of the job. 13.0.88 is the version the recorded dgx
+gate stack names. The lesson generalizes past this row: a job that needs a known toolkit
+must ASSERT it, not assume it. This one recorded it.
+
+Runtime cuBLASLt was the staged cu130 `/tmp/tsite/nvidia/cu13/lib/libcublasLt.so.13`
+(629,945,952 bytes), selected by a smoke probe (rc=0, 0 cuBLAS errors, a graph
+captured). **Honest gap:** the probe tried that prefix FIRST and it worked, so the
+container's own cuBLASLt was never re-tested at 13.0. The reason the shim existed — a
+13.6.0.2 cuBLASLt that could not capture — may no longer apply.
+
+### Build recipe
+
+```sh
+cmake -S /tmp/dedup72/src -B /tmp/dedup72/build -G Ninja \
+  -DCMAKE_BUILD_TYPE=Release -DVLLM_CPP_CUDA=ON -DVLLM_CPP_CUDA_ARCHITECTURES=121a \
+  -DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc \
+  -DVLLM_CPP_CUTLASS_DIR=/tmp/dedup72/cutlass -DVLLM_CPP_TRITON=ON \
+  -DVLLM_CPP_BUILD_TESTS=OFF -DVLLM_CPP_BUILD_EXAMPLES=ON
+ninja -C /tmp/dedup72/build -j 4 vllm-bench
+```
+
+`rc=0`. All four mandatory production-stack assertions present in the configure log:
+`CUTLASS found … enabling sm120a NVFP4 cutlass GEMM`; `FlashAttention-2
+prefill/decode: ENABLED for arch(es) [121a]`; `Triton AOT: gdn_deltah_h48 <- sm_121a`;
+`VLLM_CPP_CUDA_ARCHITECTURES:STRING=121a`. Built on local disk, never the NAS.
+
+| Artifact | sha256 |
+|---|---|
+| `vllm-bench` binary, copied out of the build tree | `e166ed8d7b39ff131bf832bdef0c3ddb26b0e38ea7cddf3eedb54e7d417666fb` |
+| model `model.safetensors`, Qwen3ForCausalLM 0.6B bf16 | `11293257a8df593c154a8ecd5fc039f3076de35411e35f06d41b471e136f6641` |
+| source tar `src-72de552c8.tar` | `5e940df5bd94edd94da19048b8c864e697b100971f3fe91c9c35edda337ce62f` |
+
+Evidence directory `/mnt/nas_share/rc/dedup-gate2/` — `EVIDENCE.md`, `logs-ab/`,
+`out-ab/`, `build72.sh`, `run72.sh`, `probe_orin.sh`.
+
+### Method, and the knob the FIRST attempt got wrong
+
+One binary in every cell. The only variable is `VT_CUDA_GRAPH_DEDUP`.
+`VT_ASYNC_RUNNER=0` in every cell, and that is THE knob: `qwen3.cpp`
+`DenseDecodeGraphForward` declines the graph while `input.device_token_ids != nullptr`
+(the #323 mitigation), and that pointer is owned by the async RUNNER, not by
+`VT_ASYNC_SCHED`. The first attempt's runs 1-2 were VOID because they used the wrong
+knob and captured no graph at all. `VT_DECODE_GRAPH_STATS=1` throughout. The compared
+artifact is `--output-token-ids`, the generated identifiers per request index — a real
+byte artifact, not a summary statistic and not an exit code.
+
+**Multi-bucket design, which the first attempt lacked.** Buckets come from
+`vllm::DecodeGraphSizes(max_num_seqs)`; `examples/bench` sets `max_num_seqs =
+--concurrency` and refills to `concurrency` each poll, so the shapes seen are `pad(C)`
+and `pad(N mod C)`. Workload A "drain" C=24 N=24 in=64 out=40 seed=4242 captured
+24/16/8; B "tail" C=16 N=21 out=32 seed=777 captured 16/8; C "tail2" C=32 N=49 out=24
+seed=31337 captured 32/24. The first attempt captured ONE size in every cell, so its 1:1
+ratio measured nothing.
+
+### The 12 cells
+
+| cell | DEDUP | exit | dedup final line | sizes | replays | ids sha256 |
+|---|---|---|---|---|---|---|
+| a_off_a | unset | 0 | (none) | 24 16 8 | 33 | `d3b7028b…` |
+| a_off_b | unset | 0 | (none) | 24 16 8 | 33 | `d3b7028b…` |
+| a_on_a | 1 | 0 | captured 3 graphs, deduped to 3 execs | 24 16 8 | 33 | `d3b7028b…` |
+| a_on_b | 1 | 0 | captured 3 graphs, deduped to 3 execs | 24 16 8 | 33 | `d3b7028b…` |
+| a_zero | 0 | 0 | (none) | 24 16 8 | 33 | `d3b7028b…` |
+| b_off_a | unset | 0 | (none) | 16 8 | 60 | `02a1add6…` |
+| b_off_b | unset | 0 | (none) | 16 8 | 60 | `02a1add6…` |
+| b_on_a | 1 | 0 | captured 2 graphs, deduped to 2 execs | 16 8 | 60 | `02a1add6…` |
+| b_on_b | 1 | 0 | captured 2 graphs, deduped to 2 execs | 16 8 | 60 | `02a1add6…` |
+| c_off_a | unset | 0 | (none) | 32 24 | 43 | `4f8714db…` |
+| c_on_a | 1 | 0 | captured 2 graphs, deduped to 2 execs | 32 24 | 43 | `4f8714db…` |
+| c_off_b | unset | 0 | (none) | 32 24 | 43 | `4f8714db…` |
+
+Every cell: successful requests = N, `empty_rows` 0, token counts 960 / 672 / 1176.
+
+### Result 1 — #1184 is FIXED, on the device
+
+All 12 cells exit 0. `grep -c "invalid device function"` and `grep -c "engine-fatal"`
+return **zero** in every cell log. On the pre-fix head `e4ce5571a` every `dedup=1` cell
+died after exactly one replay. The ON arms now replay as often as the OFF arms: **60 =
+60** on B, **33 = 33** on A, **43 = 43** on C. A CPU suite drives a fake runtime and
+cannot observe the real latched error, so this run is what closes the issue, not the
+suite that proved the guard's structure.
+
+### Result 2 — byte-identity, 10/10, controls first
+
+```text
+-- OFF/OFF controls, which must pass before any OFF-vs-ON comparison means anything
+IDENTICAL  a_off_a == a_off_b        IDENTICAL  b_off_a == b_off_b
+IDENTICAL  c_off_a == c_off_b
+-- OFF vs ON
+IDENTICAL  a_off_a == a_on_a         IDENTICAL  a_off_a == a_on_b
+IDENTICAL  a_on_a  == a_on_b         IDENTICAL  a_off_a == a_zero
+IDENTICAL  b_off_a == b_on_a         IDENTICAL  b_off_a == b_on_b
+IDENTICAL  c_off_a == c_on_a
+```
+
+The three workloads hash to three DIFFERENT values, so the identity is not the vacuous
+kind a constant artifact would produce.
+
+### Result 3 — THE NEGATIVE: the fold never happens, and the cause is structural
+
+`N == M` in every ON cell, now with 2 and 3 *distinct* padded buckets per process:
+
+```text
+a_on_a / a_on_b: captured 3 graphs, deduped to 3 execs   sizes=[24 16 8]
+b_on_a / b_on_b: captured 2 graphs, deduped to 2 execs   sizes=[16 8]
+c_on_a:          captured 2 graphs, deduped to 2 execs   sizes=[32 24]
+```
+
+The registry logs one line per registration and the count CLIMBS — `1 -> 1`, `2 -> 2`,
+`3 -> 3` — which is the proof that more than one capture reached it. This was
+pre-registered in `EVIDENCE.md` BEFORE the run rather than reasoned backwards from it:
+`AppendKernelPayload` hashes `(func, gridDim.{x,y,z}, blockDim.{x,y,z}, sharedMemBytes)`
+(`src/vt/graph_dedup_runtime.h:121-128`) and the memcpy payload hashes the copy extent.
+The padded batch dimension is in BOTH, so two decode buckets never share a key, no
+candidate group forms, and `cudaGraphExecUpdate` is **never attempted**.
+
+**This refutes the row's own premise.** `graph_dedup.h`'s header comment says the fold
+exists because "the decode graphs of two padded batch sizes are usually the same node
+topology with different parameters", and the signature as written cannot group exactly
+those. SGLang hashes the same fields (`cuda_graph_dedup_mixin.py:105-114`), so whatever
+folds upstream is not decode buckets either. The machinery is correct and does nothing
+on the workload it was built for. `VT_CUDA_GRAPH_DEDUP` therefore stays OFF: a default
+is a measurement, and this measurement does not support one.
+
+**The next traceable hypothesis, filed rather than decided** ([#1226](https://github.com/mudler/vllm.cpp/issues/1226)):
+a coarser key that keeps the function addresses and the topology but drops the launch
+dimensions and the memcpy extents would let two padded buckets form a candidate group at
+all. The probe-before-fold design means such a key costs one wasted `cudaGraphExecUpdate`
+probe and a private executable when the driver refuses, rather than a wrong replay, so it
+is a cost question and not an obviously unsafe one. "Unreachable with THIS key" is not
+"unreachable", and nothing here declares a ceiling.
+
+### Honest gaps a reviewer must weigh
+
+- **Per-shape replay counts are unavailable.** The driver prints a TOTAL only. Workload
+  B's ~30 replays per shape is arithmetic over that total (60 replays, 2 captured
+  shapes, a 16-request wave then a 5-request wave each decoding 31 steps). Stated as
+  arithmetic, not as a measurement. The ON and OFF arms report the SAME totals.
+- **The driver's "N captured size(s)" figure counts SLOTS, not captures.** Workload A
+  reports 6 sizes and emits only 3 `captured dense decode graph for padded size S=`
+  lines, because the smallest buckets appeared for too few steps to pass warm-up.
+- **The container's own cuBLASLt was never re-tested at CUDA 13.0**, as recorded above.
+- **Only the Qwen3 dense decode driver was exercised.** Whether any other capture site,
+  or two models sharing the process-singleton registry, can produce a fold is untested.
+- **The model is a Qwen3ForCausalLM 0.6B derivative from the NAS**, not a SACRED gate
+  checkpoint.
+- **The merge commit `2a976eb9f` was not run**; `72de552c8` was, with the four dedup
+  sources verified byte-identical between them.
+
+### The supporting `orin:gpu0` lane — BLOCKED, cleanly
+
+Two `rc run` jobs on `orin:gpu0`. Job 1 exited `FATAL_NO_CUDA_PKG` because the script
+hardcoded the ubuntu2404 suite without checking. Job 2 measured the worker properly:
+Ubuntu 24.04.4, root, 12 cores, 29 GiB, `gcc`/`g++`/`cmake`/`ninja`/`git`/`python3`/`curl`
+present, `/workspace` a LOCAL 1.8T disk and not the NAS, driver "NVIDIA UNIX Open Kernel
+Module for aarch64 540.4.0", `/dev/nvidia0` present, `nvcc` 13.0 V13.0.88 present. The
+CUDA smoke then failed: `cudaGetDeviceCount err=35 CUDA driver version is insufficient
+for CUDA runtime version`. The Jetson 540.4.0 driver cannot run a CUDA 13 runtime. The
+untried route is a CUDA 12.x toolkit for that driver; it was not pursued, because the
+dgx gate had already answered the question orin was there to support. No lease held;
+`orin:gpu0` returned to ready.

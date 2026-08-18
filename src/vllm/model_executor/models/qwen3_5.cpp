@@ -1,5 +1,6 @@
 #if defined(__unix__)
 #include <sys/mman.h>
+#include <unistd.h>  // ::sysconf(_SC_PAGESIZE) in the readahead hint below
 #endif
 // vllm.cpp original; see qwen3_5.h. Forward math mirrored 1:1 from the pinned
 // upstream (qwen3_next.py::Qwen3NextDecoderLayer / Qwen3NextModel.forward,
@@ -8,6 +9,7 @@
 // .agents/specs/qwen36-forward-notes.md (assembly, §2 mRoPE->NeoX, §5 attention),
 // .agents/specs/gdn-semantics.md (§1 layout, §6 g/beta prep, §7 recurrence),
 // .agents/specs/moe-semantics.md (§1-§6 MoE block + activated-expert gather).
+#include "vllm/config/weight_residency.h"
 #include "vllm/model_executor/host_expert_slot_store.h"
 #include "vllm/model_executor/expert_streamer.h"
 #include "vllm/model_executor/expert_slot_cache.h"
@@ -73,9 +75,30 @@ void ResetQwen3_5MixedSpecInvocations() {
   g_mixed_spec_invocations.store(0, std::memory_order_relaxed);
 }
 
+// GDN-MOE-BF16-OUT (#1168) Edit 2 dropped the `e.dense_model` term. It entered at
+// f344decf4 ("dispatch exact packed decode") as one of that change's "real-model
+// safety gates", was never revisited, and neither reference has an equivalent:
+// VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE defaults True with no shape term
+// (vllm/envs.py:124 @ 5559679) and SGLang keys supports_packed_decode on the
+// platform alone (gdn_triton.py:43 @ f63458b5be). It became REDUNDANT once
+// GdnOutDType stopped branching on model shape: `core_out` is `outdt`, and
+// GdnPackedDecodeDTypesCompatible below already pins it to BF16, so an f32
+// recurrence output is what deselects packed decode on either arm. Removing it
+// BEFORE the dtype change would have removed a term that the dtype rule did not
+// yet subsume, which is why the two edits are one change and in this order.
+//
+// Do not read that as "and now the removal is observable in production", because
+// it is not, in either order (fresh-review finding). `has_packed_ba` needs
+// `in_proj_ba`, written at exactly one site in the tree — the dense loader,
+// qwen3_5_dense_weights.cpp:431 — so on a MoE checkpoint the eligibility is
+// false before the shape term is ever read. Removing it therefore reaches packed
+// decode on NO checkpoint; it removes a contradiction with both references and a
+// second answer to a question the dtype rule already answers. Reaching packed
+// decode on a MoE arm needs the merged `in_proj_ba` owner in the MoE loader,
+// which is #1169, and it is owed.
 bool detail::ShouldUsePackedGdnDecode(
     const GdnPackedDecodeEligibility& e) {
-  return e.runtime_enabled && e.cuda && e.dense_model && e.has_packed_ba &&
+  return e.runtime_enabled && e.cuda && e.has_packed_ba &&
          e.merged_ba_enabled && e.dtype_compatible && e.has_state_indices &&
          e.num_prefills == 0 && e.num_prefill_tokens == 0 &&
          e.num_spec_decodes == 0 && e.num_spec_decode_tokens == 0 &&
@@ -100,7 +123,12 @@ vt::DType detail::GdnProjectedMixedQkvDType(const GdnMixedQkvDTypeInputs& in) {
 // in the ONE place both the producer and the predictor read. See the header for
 // why each term is required; the short version is that the toggle is the opt-in,
 // `indt` keeps VT_GDN_IN_BF16's rollback honest on this arm too, and `outdt`
-// confines the narrowing to the dense 27B.
+// keeps the chain dtype-uniform. `outdt` used to be described as what "confines
+// the narrowing to the dense 27B"; GDN-MOE-BF16-OUT (#1168) removed the
+// model-shape argument from `GdnOutDType`, so `outdt` is BF16 on BOTH arms at
+// the default and confines nothing. The DEFAULT-OFF `VT_GDN_FP8_IN_BF16` toggle
+// (`GdnFp8InBf16Enabled`, which requires a leading '1') is now the only term
+// keeping this inert on the 35B.
 vt::DType detail::GdnFp8MergedMixedQkvDType(bool fp8_in_bf16_enabled,
                                            vt::DType in_dtype,
                                            vt::DType out_dtype) {
@@ -124,6 +152,28 @@ bool detail::GdnPackedDecodeDTypesCompatible(const GdnPackedDecodeDTypes& d) {
 // Default OFF: ON only for a '1'-leading value (vt::cuda::GdnPackedRegTileFlagIsOn).
 bool detail::PackedGdnDecodeFp8TowerFlagIsOn(const char* env_value) {
   return env_value != nullptr && env_value[0] == '1';
+}
+
+// GDN-MOE-BF16-OUT (#1168) — VT_GDN_OUT_BF16, default ON, parsed here so the CPU
+// tier can pin the truth table that GdnOutDType() caches. There is no model-shape
+// term: the environment is the whole decision, on the dense and the MoE arms
+// alike, exactly as upstream resolves one model dtype for every layer.
+bool detail::GdnOutBf16FlagIsOn(const char* env_value) {
+  return env_value == nullptr || env_value[0] != '0';
+}
+
+// ...and the RESOLVER that consumes it, here rather than in the anonymous
+// namespace below so the CPU tier can call the thing the model calls. Pinning
+// the parser alone does not pin that anything reads it: a `GdnOutDType()`
+// hardwired to BF16 keeps every default-environment gate green, and the
+// documented `VT_GDN_OUT_BF16=0` rollback then silently stops rolling back. See
+// the header for why that matters more here than coverage — the variable is the
+// denominator of this row's same-binary A/B. The full derivation of WHAT this
+// dtype is stays at the `using` declaration below, next to the call sites.
+vt::DType detail::GdnOutDType() {
+  static const bool bf16 =
+      detail::GdnOutBf16FlagIsOn(std::getenv("VT_GDN_OUT_BF16"));
+  return bf16 ? vt::DType::kBF16 : vt::DType::kF32;
 }
 
 bool detail::ShouldUseMergedGdnQkvz(const GdnMergedQkvzEligibility& e) {
@@ -181,6 +231,40 @@ void detail::DisableGdnFp8InProjDebugStats() {
   g_gdn_fp8_inproj_debug_enabled.store(false, std::memory_order_release);
 }
 
+namespace {
+// GDN-MOE-BF16-OUT (#1168). What the last NON-MIXED-SPEC paged GDN layer actually
+// allocated and projected, recorded off the tensors themselves rather than off
+// the predicate. `GdnBlockPagedMixedSpec` is a paged GDN layer too and records
+// nothing, the stores are unconditional (the fp8 sibling above is default-off),
+// and they happen at graph CAPTURE and not at replay. The header states all
+// three; none of them is what the shape of this code suggests.
+std::atomic<bool> g_gdn_out_dtypes_observed{false};
+std::atomic<int> g_gdn_out_core_dtype{static_cast<int>(vt::DType::kF32)};
+std::atomic<int> g_gdn_out_z_dtype{static_cast<int>(vt::DType::kF32)};
+
+void RecordGdnOutActivationDTypes(vt::DType core_out, vt::DType z_gate) {
+  g_gdn_out_core_dtype.store(static_cast<int>(core_out), std::memory_order_relaxed);
+  g_gdn_out_z_dtype.store(static_cast<int>(z_gate), std::memory_order_relaxed);
+  g_gdn_out_dtypes_observed.store(true, std::memory_order_release);
+}
+}  // namespace
+
+void detail::ResetGdnOutActivationDTypes() {
+  g_gdn_out_dtypes_observed.store(false, std::memory_order_release);
+  g_gdn_out_core_dtype.store(static_cast<int>(vt::DType::kF32), std::memory_order_relaxed);
+  g_gdn_out_z_dtype.store(static_cast<int>(vt::DType::kF32), std::memory_order_relaxed);
+}
+
+detail::GdnOutActivationDTypes detail::LastGdnOutActivationDTypes() {
+  GdnOutActivationDTypes out;
+  out.observed = g_gdn_out_dtypes_observed.load(std::memory_order_acquire);
+  out.core_out =
+      static_cast<vt::DType>(g_gdn_out_core_dtype.load(std::memory_order_relaxed));
+  out.z_gate =
+      static_cast<vt::DType>(g_gdn_out_z_dtype.load(std::memory_order_relaxed));
+  return out;
+}
+
 bool detail::PackedGdnDecodeEnvSelected(const GdnPackedDecodeEnvConfig& env) {
   // Mirror PackedGdnDecodeRuntimeEnabled: enabled unless first char is '0'.
   const bool runtime_enabled =
@@ -190,8 +274,8 @@ bool detail::PackedGdnDecodeEnvSelected(const GdnPackedDecodeEnvConfig& env) {
       !(env.merged_proj != nullptr && env.merged_proj[0] == '0') &&
       (env.merged_ba == nullptr || env.merged_ba[0] != '0');
   // Mirror the dtype_compatible expression on the real 27B dense gate:
-  // GdnInDType (default BF16), GdnOutDType dense default (BF16; override
-  // '0' -> F32), MergedGdnBaOutputDType(packed) (default BF16 under packed;
+  // GdnInDType (default BF16), GdnOutDType (default BF16 on every arm since
+  // #1168; override '0' -> F32), MergedGdnBaOutputDType(packed) (default BF16 under packed;
   // override '0' -> F32). The SSM cache dtype term is always a float dtype.
   const bool in_bf16 = env.in_bf16 == nullptr || env.in_bf16[0] != '0';
   const bool out_bf16 = env.out_bf16 == nullptr || env.out_bf16[0] != '0';
@@ -3168,8 +3252,8 @@ bool GdnFp8InBf16Enabled() {
   return on;
 }
 
-// GDN recurrence-OUTPUT + z-gate in bf16 (27B default ON; 35B keeps its former
-// f32 default; VT_GDN_OUT_BF16=0/1 overrides both for diagnostics).
+// GDN recurrence-OUTPUT + z-gate in bf16, on EVERY arm (default ON;
+// VT_GDN_OUT_BF16=0 is the same-binary f32 rollback).
 // vLLM keeps core_attn_out and the z gate bf16 (the gated-RMSNorm consumes them):
 // FLA chunk_o.py stores o bf16, and Qwen3NextGatedRMSNorm reads bf16 core/gate,
 // upcasting to f32 only for the variance reduction (layernorm_guard.py). Our
@@ -3184,18 +3268,26 @@ bool GdnFp8InBf16Enabled() {
 // this lever is the f32 `dcore` recurrence output that attempt left untouched.
 // This is correctness-significant for the 27B: with the repaired full NVFP4
 // tactic stack, f32 core/z takes the alternate whitespace near-tie branch while
-// bf16 reproduces native vLLM 16/16. Keep every unmeasured 35B arm, including
-// GGUF, on its prior f32 default; the explicit env override remains available
-// for its later independently gated campaign.
-DType GdnOutDType(bool dense_model) {
-  static const int override = [] {
-    const char* e = std::getenv("VT_GDN_OUT_BF16");
-    if (e == nullptr) return -1;
-    return e[0] == '0' ? 0 : 1;
-  }();
-  const bool bf16 = override >= 0 ? override != 0 : dense_model;
-  return bf16 ? DType::kBF16 : DType::kF32;
-}
+// bf16 reproduces native vLLM 16/16.
+//
+// GDN-MOE-BF16-OUT (#1168) removed the `bool dense_model` parameter this used to
+// default to. It resolved bf16 for a dense checkpoint and f32 for a MoE one, and
+// all three call sites passed `cfg.num_experts == 0`, so every MoE checkpoint
+// carried `dcore`, `z` and the gated-norm weight at double width. Upstream does
+// not branch on model shape anywhere on this path — `Qwen3_5ForCausalLMBase`
+// (vllm/model_executor/models/qwen3_5.py:280-297 @ 5559679) is the shared base of
+// the dense and MoE causal-LM arms — and the deferral quoted above ("keep every
+// unmeasured 35B arm on its prior f32 default") named its own successor campaign,
+// which this is. The parameter is gone rather than defaulted because a signature
+// that accepts a model shape makes the default unreadable at the definition and
+// lets a new call site reintroduce the split silently. VT_GDN_OUT_BF16=0 is now
+// the f32 rollback for BOTH arms rather than for the dense one alone.
+//
+// Fresh-review repair: the definition moved up beside `GdnOutBf16FlagIsOn` and
+// into `detail::`, so that a gate can observe the RESOLVER and not only its
+// parser. Nothing about the resolution changed. The call sites below are
+// unqualified and keep reading it through this declaration.
+using detail::GdnOutDType;
 
 // bf16 residual stream (default ON). vLLM runs the 35B in bf16
 // (model_config.dtype=bfloat16): qwen3_next.py keeps `residual` as the bf16 hidden
@@ -3529,8 +3621,11 @@ DBuf MergedFp8QkvzD(Dev d, const Tensor& x, const Tensor* h_fp8,
 // resident owner is shared by both arms: the fallback slices its output ROWS
 // (dim-0 raw-NK slices stay contiguous) and issues the two legacy GEMMs at
 // their independent dtypes, never retaining duplicate split weights. The
-// merged arm requires one uniform output dtype (GdnInDType == GdnOutDType; the
-// 27B default is BF16/BF16, matching vLLM's model-dtype projection).
+// merged arm requires one uniform output dtype (GdnInDType == GdnOutDType, and
+// since GDN-MOE-BF16-OUT (#1168) that is BF16/BF16 on every arm, matching vLLM's
+// model-dtype projection). The uniformity term therefore no longer excludes a
+// MoE checkpoint; `has_packed_qkvz` still does, because no MoE or GGUF loader
+// builds the merged `in_proj_qkvz` owner either — the same gap as #1169's.
 // VT_GDN_MERGED_QKVZ=0 (or master VT_GDN_MERGED_PROJ=0) restores the split
 // GEMMs from the same binary and the same resident owner.
 bool MergedGdnQkvzEnabled(Dev d) {
@@ -3595,11 +3690,17 @@ GdnQkvzOutput ProjectGdnQkvz(Dev d, const GdnLayerWeights& w, const Tensor& h,
   //      narrowing is not value-neutral),
   //   2. indt == BF16, i.e. VT_GDN_IN_BF16 is on (its default) — this IS the
   //      lever being unblocked, so honouring its rollback is mandatory,
-  //   3. outdt == BF16. This is what confines the change to the 27B: the 35B is
-  //      MoE, so GdnOutDType(dense_model=false) is f32 by default and this stays
-  //      inert there. It also keeps the whole chain dtype-uniform, which the
-  //      downstream contracts need — vt::RmsNormGatedQuantFp8 requires
+  //   3. outdt == BF16, which keeps the whole chain dtype-uniform — the
+  //      downstream contracts need that: vt::RmsNormGatedQuantFp8 requires
   //      gate.dtype == x.dtype (ops.cpp), and `z` below is exactly that gate.
+  //      This term USED to read "confines the change to the 27B, because the
+  //      35B is MoE and GdnOutDType(dense_model=false) is f32 there". #521
+  //      asked for that correction and GDN-MOE-BF16-OUT (#1168) is what makes
+  //      it wrong: outdt is BF16 on every arm now. What still keeps this leaf
+  //      inert on the 35B is condition 1, the DEFAULT-OFF VT_GDN_FP8_IN_BF16
+  //      toggle — a toggle term, not a model-shape one. Nothing moves by
+  //      default in either merge order, but whoever turns that toggle on owns
+  //      measuring the 35B too (#417).
   // PERF-GDN-PACKED-BRIDGE (#365): PERF-FP8-ALPHA-FOLD's three-term decision,
   // moved into the shared `GdnFp8MergedInProjDType` so the PRODUCER (this line,
   // which reaches MergedFp8QkvzD and allocates the buffer) and the PREDICTOR
@@ -3746,7 +3847,7 @@ DBuf GdnBlock(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
   // and on the merged fp8 branch too under VT_GDN_FP8_IN_BF16 (default OFF, see
   // GdnFp8InBf16Enabled). See GdnInDType().
   const DType indt = GdnInDType();
-  const DType outdt = GdnOutDType(cfg.num_experts == 0);
+  const DType outdt = GdnOutDType();
   GdnQkvzOutput qkvz =
       ProjectGdnQkvz(d, w, h, conv_dim, value_dim, indt, outdt, h_fp8);
   Tensor mixed = qkvz.mixed;  // [T,conv_dim], contiguous or row-strided view
@@ -4152,7 +4253,7 @@ DBuf GdnBlockPagedMixedSpec(Dev d, const GdnLayerWeights& w, const HfConfig& cfg
   const int64_t conv_dim = 2 * key_dim + value_dim;
   const float eps = static_cast<float>(cfg.rms_norm_eps);
   const DType convdt = mixed.dtype;
-  const DType outdt = GdnOutDType(cfg.num_experts == 0);
+  const DType outdt = GdnOutDType();
   const DType actdt = GdnActDType();
   const float scale = 1.0F / std::sqrt(SizeF(Dk));
   g_mixed_spec_invocations.fetch_add(1, std::memory_order_relaxed);
@@ -4383,7 +4484,7 @@ DBuf GdnBlockPaged(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
   const bool mixed_spec = spec && np > 0;
 
   const DType indt = GdnInDType();
-  const DType outdt = GdnOutDType(cfg.num_experts == 0);
+  const DType outdt = GdnOutDType();
   // PERF-27B-GDN-PACKED-REACHABLE (#365). `dtype_compatible` is decided by the
   // ACTIVATION dtypes vt::GdnPackedDecode requires, not by how the GDN weights
   // are stored. `mixed_qkv` has to be PREDICTED because this decision runs
@@ -4406,7 +4507,6 @@ DBuf GdnBlockPaged(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
       detail::GdnPackedDecodeEligibility{
           PackedGdnDecodeRuntimeEnabled(),
           vllm::platforms::GetPlatform(d.q.device.type).needs_weight_staging(),
-          cfg.num_experts == 0,
           !w.in_proj_ba.Empty(),
           MergedGdnBaEnabled(d),
           detail::GdnPackedDecodeDTypesCompatible(
@@ -4585,6 +4685,12 @@ DBuf GdnBlockPaged(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
   // intermediates are allocated. This mirrors vLLM v0.25.0
   // _forward_core_decode_non_spec:1644-1695.
   DBuf dcore(d, outdt, {T, Hv, Dv});
+  // GDN-MOE-BF16-OUT (#1168): read off the tensors, not off GdnOutDType, so a
+  // gate entering through ModelRegistry::Forward observes what this layer RAN.
+  // This is the ONLY recording site. The mixed spec+non-spec batch returns into
+  // GdnBlockPagedMixedSpec above and never reaches it, so a mixed step leaves
+  // the record untouched rather than stale-free — see the header's limits.
+  RecordGdnOutActivationDTypes(dcore.t().dtype, z.dtype);
   const float scale = 1.0F / std::sqrt(SizeF(Dk));
   if (packed_decode) {
     Tensor gidx = SubView(sdi.gdn_state_idx.t(), 0, nd);
@@ -5138,17 +5244,36 @@ Tensor KqResidentSlice(Dev d, const OwnedTensor& w, int64_t N, int64_t K,
 // A slot is filled by ONE contiguous copy of a whole slice, so the read is
 // sequential, and a slice already resident costs nothing at all.
 //
-// The cache is keyed by (tower, expert). A tower's identity is its base
-// pointer, which is stable for the model's life because the tower is a borrowed
-// view into the mapping; the id map is built once per pointer.
+// The cache is keyed by (tower, expert). A tower's identity is `TowerUid()`, a
+// process-unique counter, NOT the buffer's address: the store outlives any one
+// model, and the allocator hands a freed tower's address to the next one (#1066,
+// and the note on TowerId below).
+
 // Whether the operator ASKED for streaming, independent of whether a store has
 // been built yet. The grouped-MoE gate needs this before any expert is touched.
 inline bool Qwen35ExpertStreamRequested() {
-  static const bool on = [] {
-    const char* v = std::getenv("VT_MOE_EXPERT_STREAM");
-    return v != nullptr && v[0] != '0' && v[0] != '\0';
-  }();
-  return on;
+  // ENG-RESIDENCY-CONFIG (#1110): the answer now comes from
+  // `ResolveExpertStreamRequested()`, which holds `VT_MOE_EXPERT_STREAM` >
+  // `--offload-config`'s `vllm_cpp.expert_stream.enabled` > OFF, and which keeps
+  // this knob's ODD environment rule verbatim: only the FIRST CHARACTER is
+  // examined, so `VT_MOE_EXPERT_STREAM=false` is ON. That is what
+  // docs/ENVIRONMENT.md documents, so it is transcribed rather than normalised
+  // onto the tree's whole-value polarity.
+  //
+  // The answer is still cached on first call, and that is deliberate — it decides
+  // whether an ~18 GiB slot store is built and whether the default-on grouped-MoE
+  // path is disabled, and those two must not be able to disagree later in the same
+  // process. The function-local static lives in `ResolveExpertStreamRequested`, not
+  // here; this is a pure delegation.
+  //
+  // That cached answer is why `SetWeightResidencyConfig` refuses a config that would
+  // CHANGE it — not one that arrives late. A document that omits `expert_stream`, or
+  // asks for exactly what was decided, or that the environment overrides anyway, is
+  // accepted; only one that would make this function's answer differ from the value
+  // already returned is refused, because recording that would publish a
+  // configuration the engine is not running. The loader installs in `FromModelDir`'s
+  // first block, ahead of all weight I/O, so the ordering holds by construction.
+  return ResolveExpertStreamRequested();
 }
 
 class Qwen35ExpertStream {
@@ -5234,7 +5359,14 @@ class Qwen35ExpertStream {
   uint8_t* Slice(const uint8_t* base, uint64_t tower_uid, int64_t expert,
                  size_t offset, size_t bytes, int fd, size_t file_offset) {
     if (ForceFallback()) {
-      ++exhausted_;
+      // COUNTED SEPARATELY FROM `exhausted_`, on purpose (#1091 finding 6).
+      // `exhausted` is the operator-facing number and both docs define it as
+      // "the budget is smaller than one step's working set; raise
+      // VT_MOE_EXPERT_STREAM_SLOTS". This switch has no production caller at
+      // all, so charging it to that counter told an operator to raise a budget
+      // that was never the reason. It stays out of the stderr line for the same
+      // reason: in a production process it is always zero.
+      ++forced_;
       return nullptr;
     }
     const int32_t tower = TowerId(tower_uid);
@@ -5270,6 +5402,16 @@ class Qwen35ExpertStream {
     // way. `advised_` counts the calls that were actually accepted, so a run
     // can tell a working hint from a silently rejected one.
     //
+    // ROUNDING THE END UP CAN LEAVE THE ALLOCATION, and that is the one way
+    // this call still fails: madvise(2) returns ENOMEM when any page in the
+    // range is unmapped, so a tower whose last byte sits near the end of its
+    // final mapped page would not be counted. In production the tower is a
+    // borrowed view into a file mapping many pages larger than one slice, so
+    // the trailing page is mapped. On the heap-backed towers the gates build it
+    // holds because the allocator's arena page is mapped, not because the
+    // allocation reaches it — which is why `advised == fills` is asserted
+    // against a measured run rather than assumed from the arithmetic.
+    //
     // NO SPEEDUP IS CLAIMED HERE. This makes the call well-formed; whether
     // readahead moves decode is a measurement the spec records as owed.
 #if defined(__unix__)
@@ -5302,6 +5444,7 @@ class Qwen35ExpertStream {
   const ExpertStreamer& streamer() const { return *streamer_; }
   const ExpertSlotCache& cache() const { return *cache_; }
   int64_t exhausted() const { return exhausted_; }
+  int64_t forced() const { return forced_; }
   int64_t advised() const { return advised_; }
 
   // ONE line a benchmark can read to prove the lane stayed live.
@@ -5314,24 +5457,61 @@ class Qwen35ExpertStream {
   // immediately are `steps` and `exhausted`: steps==0 means the step clock never
   // advanced, and exhausted>0 means slices were refused and silently served from
   // the mapping instead. Both are on this line, and either is wrong at a glance.
+  //
+  // `final` IS THE WHOLE POINT AND IT USED TO HAVE NO CALLER (#1091 finding 1).
+  // The periodic report is skipped on `steps == 0` — so the one run that most
+  // needs the line, the one where the step boundary is never reached, printed
+  // nothing at all, and both docs told an operator to read a zero off a line
+  // that could not exist. It is skipped again whenever `stats_every_` does not
+  // divide the step count, and the default is 16, so a healthy five-token run
+  // printed nothing either and a benchmark reading absence as failure reported
+  // VOID on a working lane. The final report crosses both early returns.
   void ReportStats(bool final) const {
     const int64_t steps = cache_->steps();
     if (!final) {
       if (stats_every_ <= 0) return;
       if (steps == 0 || steps % stats_every_ != 0) return;
     }
-    std::fprintf(stderr,
-                 "[expert-stream] steps=%lld hits=%lld misses=%lld "
-                 "evictions=%lld fills=%lld bytes=%lld exhausted=%lld "
-                 "advised=%lld\n",
-                 static_cast<long long>(steps),
-                 static_cast<long long>(cache_->hits()),
-                 static_cast<long long>(cache_->misses()),
-                 static_cast<long long>(cache_->evictions()),
-                 static_cast<long long>(streamer_->fills()),
-                 static_cast<long long>(streamer_->bytes_filled()),
-                 static_cast<long long>(exhausted_),
-                 static_cast<long long>(advised_));
+    PrintStatsLine(steps, cache_->hits(), cache_->misses(), cache_->evictions(),
+                   streamer_->fills(), streamer_->bytes_filled(), exhausted_,
+                   advised_);
+  }
+
+  // The final line, printed exactly ONCE per process.
+  //
+  // NOTHING IN PRODUCTION CALLS THIS, and read the destructor below before you
+  // conclude otherwise. Teardown produces the LINE but does not route through
+  // here: the store is a function-local static, so `~Qwen35ExpertStream` runs on
+  // the normal exit path and calls `ReportStats` itself, for the reason stated
+  // there. The two share the once-flag, not a call, so exactly one of them
+  // prints. This entry exists so a GATE can observe the same guarantee from
+  // inside a running process, because a static destructor fires after main
+  // returns and nothing in the process can assert on it.
+  //
+  // A once-flag rather than two independent prints, so "one line" is a property
+  // of the process and not of which caller happened to win. The flag is a plain
+  // bool with constant initialisation and no destructor of its own, so it cannot
+  // itself be lost to static-destruction ordering.
+  //
+  // No store means no line, and that is not a gap: a store that exists always
+  // announced itself with `[expert-stream] ON ...` first, so banner-without-line
+  // is a process that died, and no-banner is a lane nothing ever reached.
+  static void FlushFinalStats() {
+    if (FinalReported()) return;
+    Qwen35ExpertStream* s = Existing();
+    if (s == nullptr) return;
+    FinalReported() = true;
+    s->ReportStats(/*final=*/true);
+  }
+
+  ~Qwen35ExpertStream() {
+    // The store holds the numbers, so it prints them before it goes away. Not
+    // routed through FlushFinalStats: that reads `Existing()`, and the unique_ptr
+    // this object lives in does not clear itself before running this destructor.
+    if (!FinalReported()) {
+      FinalReported() = true;
+      ReportStats(/*final=*/true);
+    }
   }
 
  private:
@@ -5354,24 +5534,61 @@ class Qwen35ExpertStream {
     static bool on = false;
     return on;
   }
+  // Constant-initialised and destructor-free, so the "has the final line been
+  // printed" answer survives every other static's destruction.
+  static bool& FinalReported() {
+    static bool done = false;
+    return done;
+  }
+
+  // The one place the statistics line's format lives, so the final report and
+  // the periodic report cannot drift apart into two shapes a parser has to
+  // know about.
+  static void PrintStatsLine(int64_t steps, int64_t hits, int64_t misses,
+                             int64_t evictions, int64_t fills, int64_t bytes,
+                             int64_t exhausted, int64_t advised) {
+    std::fprintf(stderr,
+                 "[expert-stream] steps=%lld hits=%lld misses=%lld "
+                 "evictions=%lld fills=%lld bytes=%lld exhausted=%lld "
+                 "advised=%lld\n",
+                 static_cast<long long>(steps), static_cast<long long>(hits),
+                 static_cast<long long>(misses),
+                 static_cast<long long>(evictions),
+                 static_cast<long long>(fills), static_cast<long long>(bytes),
+                 static_cast<long long>(exhausted),
+                 static_cast<long long>(advised));
+  }
 
   explicit Qwen35ExpertStream(size_t slot_bytes) {
-    const char* sb = std::getenv("VT_MOE_EXPERT_STREAM_SLOT_BYTES");
-    if (sb != nullptr && *sb != '\0') {
-      const long long v = std::atoll(sb);
-      if (v > 0) slot_bytes = static_cast<size_t>(v);
-    }
-    int32_t slots = 64;
-    const char* sv = std::getenv("VT_MOE_EXPERT_STREAM_SLOTS");
-    if (sv != nullptr && *sv != '\0') {
-      const long v = std::atol(sv);
-      if (v > 0) slots = static_cast<int32_t>(v);
-    }
+    // ENG-RESIDENCY-CONFIG (#1110): both sizes resolve through the shared
+    // resolvers, which hold env var > `--offload-config`'s
+    // `vllm_cpp.expert_stream.{slots,slot_bytes}` > the default, and which keep
+    // the tolerant integer parsing this constructor already had (atoll, then
+    // ignore anything non-positive) so an environment-only run is unchanged. The
+    // CONFIG side is stricter: a zero or negative value is refused at startup,
+    // where the operator can still read the message, rather than silently becoming
+    // the default.
+    //
+    // `slot_bytes`' default is the caller's computed maximum, not a constant, so it
+    // is passed in rather than duplicated here.
+    slot_bytes = static_cast<size_t>(
+        ResolveExpertStreamSlotBytes(static_cast<int64_t>(slot_bytes)));
+    const int32_t slots = static_cast<int32_t>(ResolveExpertStreamSlots());
+    // STATS_EVERY stays environment-only, and that is a decision rather than an
+    // oversight: it changes only how often the line below is printed, so it is the
+    // instrument and not the configuration. `--offload-config` refuses it as an
+    // unknown key rather than accepting and dropping it.
     const char* se = std::getenv("VT_MOE_EXPERT_STREAM_STATS_EVERY");
     if (se != nullptr && *se != '\0') {
       const long v = std::atol(se);
       if (v >= 0) stats_every_ = static_cast<int64_t>(v);
     }
+    // Record the geometry this store was actually built with. It is the only way
+    // a test can tell that the two resolvers above were consulted: the values are
+    // otherwise visible only on a stderr line, and a site that hardcoded the
+    // default would leave every existing suite green.
+    NoteExpertStreamGeometry(static_cast<int64_t>(slots),
+                             static_cast<int64_t>(slot_bytes));
     store_ = std::make_unique<HostExpertSlotStore>(slots, slot_bytes);
     cache_ = std::make_unique<ExpertSlotCache>(slots);
     streamer_ = std::make_unique<ExpertStreamer>(*cache_, *store_);
@@ -5407,6 +5624,11 @@ class Qwen35ExpertStream {
   std::unordered_map<uint64_t, int32_t> tower_ids_;
   int32_t next_tower_id_ = 0;
   int64_t exhausted_ = 0;
+  // Slices the FORCED-fallback switch refused. Separate from `exhausted_`
+  // because that one is an operator-facing budget diagnosis and this one is a
+  // gate asking for the unstreamed arm; see the note at the ForceFallback
+  // branch in Slice.
+  int64_t forced_ = 0;
   int64_t advised_ = 0;
   int64_t stats_every_ = 16;
 };
@@ -5427,11 +5649,56 @@ class Qwen35ExpertStream {
 //
 // A guard rather than a call at the end of the body: ForwardLayers has two
 // returns and can throw, and a step that ended by throwing still ended.
+//
+// ONE FORWARD IS ONE STEP, AND THE GUARD REFUSES TO NEST (#1091 finding 3).
+// Five forwards in this file take expert slices — `ForwardLayers`,
+// `Qwen3_5Model::ForwardDense`, both MTP forwards and `Qwen3_5ReplayLayer` —
+// and each is a complete forward that no other one contains. A nested guard
+// would end the step twice, which advances the hotness clock for a step that
+// never happened and decays every resident entry an extra tick; that is a
+// quieter defect than the missing boundary and it is the one adding guards
+// invites. So the precondition is stated rather than handled, the same way
+// `MatmulF32Slice` states `expert >= 0`: the flag is per-thread because a
+// decode step runs on one host thread, which is the assumption the store's own
+// locking already makes.
+//
+// THE REFUSAL IS NOT GATED ON `Qwen35ExpertStreamRequested()`, deliberately.
+// "One forward is one step" is a property of the CALL GRAPH, not of the
+// streaming lane: a nest is a defect whether or not a store exists, and the
+// streamed run is the rare configuration. Arming it only there would let the
+// default-on path establish a nest that nobody sees until someone turns
+// streaming on, which is the shape this row keeps finding. The cost is that a
+// nest reds every Qwen3.5 forward rather than only the streamed ones, and that
+// is the intended polarity: loud on the default path is what makes it a gate.
+//
+// `Begin`/`End` are named rather than living only in the constructor and
+// destructor bodies so that `detail::ExpertStreamStepScope` can hold THE SAME
+// boundary. A gate that re-implemented the refusal would prove its own copy;
+// this way deleting the `VT_CHECK` below is one edit that both changes
+// production and takes the gate red.
 struct Qwen35ExpertStreamStep {
-  Qwen35ExpertStreamStep() = default;
-  ~Qwen35ExpertStreamStep() { Qwen35ExpertStream::EndStepIfActive(); }
+  Qwen35ExpertStreamStep() { Begin(); }
+  ~Qwen35ExpertStreamStep() { End(); }
   Qwen35ExpertStreamStep(const Qwen35ExpertStreamStep&) = delete;
   Qwen35ExpertStreamStep& operator=(const Qwen35ExpertStreamStep&) = delete;
+
+  // Open the step. Throws when one is already open on this thread; the flag is
+  // then left as it was, so the outer guard's `End` still closes exactly one.
+  static void Begin() {
+    VT_CHECK(!Open(), "qwen3_5: a decode step is already open; the expert-stream "
+                      "step guard marks ONE forward and must not nest");
+    Open() = true;
+  }
+  static void End() {
+    Open() = false;
+    Qwen35ExpertStream::EndStepIfActive();
+  }
+
+ private:
+  static bool& Open() {
+    static thread_local bool open = false;
+    return open;
+  }
 };
 
 // The expert-slice seam. Identical to KqResidentSlice except that, when
@@ -7221,6 +7488,7 @@ detail::ExpertStreamStats detail::ExpertStreamSnapshot() {
   s.fills = st->streamer().fills();
   s.bytes_filled = st->streamer().bytes_filled();
   s.exhausted = st->exhausted();
+  s.forced = st->forced();
   s.advised = st->advised();
   return s;
 }
@@ -7230,6 +7498,19 @@ void detail::ExpertStreamSetForceFallback(bool on) {
 }
 
 void detail::EndExpertStreamStep() { Qwen35ExpertStream::EndStepIfActive(); }
+
+void detail::ExpertStreamFlushStats() { Qwen35ExpertStream::FlushFinalStats(); }
+
+// The step guard as a scope a gate can hold. These forward to the SAME
+// `Begin`/`End` the production guard's constructor and destructor call, so the
+// nesting refusal a gate observes here is the one every forward in this file is
+// protected by, not a re-statement of it.
+detail::ExpertStreamStepScope::ExpertStreamStepScope() {
+  Qwen35ExpertStreamStep::Begin();
+}
+detail::ExpertStreamStepScope::~ExpertStreamStepScope() {
+  Qwen35ExpertStreamStep::End();
+}
 
 // ENG-ASYNC-SCHED W4: overwrite the REAL prefix of a freshly uploaded input-id
 // buffer with the device-resident ids the async runner's combine produced.
@@ -7358,11 +7639,37 @@ static DBuf ForwardLayers(Dev d, const Tensor& hidden_in,
                           const std::vector<int32_t>* aux_layer_ids = nullptr,
                           const Tensor* aux_out = nullptr,
                           StepDevInputs* persistent_sdi = nullptr) {
-  // ONE decode step. Every MoE entry point funnels through here exactly once
-  // per forward — ForwardBody, the VL path, and the graph driver's eager
-  // fallback — so this is the step boundary the expert slot cache is defined
-  // against, and it is neither once per layer nor once per expert. Inert unless
-  // a store exists, which needs both VT_MOE_EXPERT_STREAM and a slice taken.
+  // ONE decode step, for the PAGED forwards: ForwardBody, the VL path and the
+  // graph driver's eager fallback all funnel through here exactly once per
+  // forward. This is the step boundary the expert slot cache is defined against,
+  // and it is neither once per layer nor once per expert.
+  //
+  // IT IS NOT THE ONLY ENTRY POINT, and the comment this replaces said it was
+  // (#1091 finding 3). Four more forwards reach `ExpertMlpKq -> KqExpertSlice`
+  // without passing through here — `Qwen3_5Model::ForwardDense`,
+  // `Qwen3_5MTPModel::Forward`, `Qwen3_5MTPModel::ForwardPaged` and
+  // `Qwen3_5ReplayLayer` — and each now carries its own guard.
+  //
+  // ONE OF THOSE FOUR HAS A PRODUCTION CALLER, not all of them, and an earlier
+  // revision of this comment said "the MTP pair" (#1106 finding 2, #1108). It is
+  // `Qwen3_5MTPModel::ForwardPaged`, the spec-decode DRAFT forward, reached from
+  // `runner.cpp:2183` through `spec_decode/mtp/speculator.cpp:107,262` — so the
+  // shape that was actually running is draft forwards that pin every slot they
+  // touch across the following target forward. That caller is itself
+  // "UNREACHABLE unless a speculator is configured" (`runner.cpp:2120`), so a
+  // DEFAULT-configuration run reaches none of these four guards; one of them has
+  // a production caller, which is not the same claim. `Qwen3_5MTPModel::Forward`,
+  // `Qwen3_5Model::ForwardDense` and `Qwen3_5ReplayLayer` are parity entry
+  // points whose every caller is under `tests/`, and per `.agents/reachability.md`
+  // a call site inside a test is not reach: their guards land UNREACHED, which
+  // the spec's `## Owed` records as a staged slice rather than claiming.
+  //
+  // `RunMoeBlock` is the deliberate exception: it is one block, not a forward,
+  // and qwen3_moe.cpp owns the boundary for the model that composes it
+  // (qwen3_moe.cpp:150).
+  //
+  // Inert unless a store exists, which needs both VT_MOE_EXPERT_STREAM and a
+  // slice taken.
   const Qwen35ExpertStreamStep expert_stream_step;
   const int64_t T = hidden_in.shape[0];
   const int64_t H = config.hidden_size;
@@ -7869,6 +8176,10 @@ std::vector<float> Qwen3_5Model::ForwardDense(const std::vector<int32_t>& token_
            "qwen3_5 forward: positions length must equal token count");
   VT_CHECK(static_cast<int64_t>(weights.layers.size()) == config.num_hidden_layers,
            "qwen3_5 forward: weights.layers size must equal num_hidden_layers");
+  // ONE decode step. This forward does NOT go through ForwardLayers — it runs
+  // its own unpaged layer loop — so it needs its own boundary, and every MoE
+  // layer it runs takes expert slices (#1091 finding 3).
+  const Qwen35ExpertStreamStep expert_stream_step;
   Dev d{vt::GetBackend(queue.device.type), queue};
   const float eps = static_cast<float>(config.rms_norm_eps);
 
@@ -7998,6 +8309,21 @@ Qwen3_5MTPHiddenStates Qwen3_5MTPModel::Forward(
            "qwen3_5 MTP forward: fc must be raw bf16 [H,2H]");
 
   (void)vocab_size;
+  // ONE decode step. A DRAFT forward is a complete forward with its own working
+  // set: its slices are finished with when it returns, and leaving them pinned
+  // across the target's forward would shrink the evictable set for the whole run
+  // — F1 at draft scale (#1091 finding 3). A spec-decode iteration therefore
+  // advances the clock once per draft plus once for the target, which is what
+  // "one step is one forward" means for a draft+target pair.
+  //
+  // THAT PAIR IS RUN BY `ForwardPaged`, NOT BY THIS OVERLOAD. This one is
+  // reached only through `ForwardLogitsHost`, a standalone parity convenience
+  // (qwen3_5_mtp.h:135) whose every caller is under `tests/`, so the guard here
+  // lands unreached and is recorded as a staged slice (#1108). It is kept
+  // because the reasoning above is what makes it correct the moment this
+  // overload gains a caller, and adding the guard later with the caller is how
+  // this row lost its step boundary the first time.
+  const Qwen35ExpertStreamStep expert_stream_step;
   Dev device{vt::GetBackend(queue.device.type), queue};
 
   // Qwen3_5MultiTokenPredictor.forward head: shared embedding + independent Gemma
@@ -8050,6 +8376,8 @@ Qwen3_5MTPHiddenStates Qwen3_5MTPModel::ForwardPaged(
                draft_kv.head_size == config_->head_dim,
            "qwen3_5 MTP paged forward: draft KV cache dims mismatch config");
 
+  // ONE decode step, for the same reason as the unpaged draft forward above.
+  const Qwen35ExpertStreamStep expert_stream_step;
   Dev device{vt::GetBackend(queue.device.type), queue};
 
   // Same head math as Forward; the difference is the DECODER LAYER, which runs
@@ -8975,6 +9303,10 @@ std::vector<float> Qwen3_5ReplayLayer(const Qwen3_5MoeLayerWeights& layer,
   const int64_t H = config.hidden_size;
   VT_CHECK(static_cast<int64_t>(hidden_in.size()) == T * H,
            "qwen3_5 replay: hidden_in must be [T*H]");
+  // ONE decode step. This replays a single layer as a self-contained unit of
+  // work, so the slices it takes are finished with when it returns; without a
+  // boundary they stay pinned for the life of the process (#1091 finding 3).
+  const Qwen35ExpertStreamStep expert_stream_step;
   Dev d{vt::GetBackend(queue.device.type), queue};
 
   // Seed the fused stream with the combined residual input: res = hidden_in,
@@ -10126,8 +10458,11 @@ ForwardLogits Qwen3_5DenseDecodeGraph::Step(
     // Drain the capture if the forward throws — see the 35B driver above for why
     // a skipped EndCaptureGraph poisons the stream permanently (#339, F-B). This
     // is the 27B DENSE driver, and it is the one that matters most here: the
-    // bf16-D fp8 lever this row guards (VT_GDN_FP8_IN_BF16) is confined to the
-    // 27B by construction, since the 35B is MoE and its GdnOutDType is f32.
+    // bf16-D fp8 lever this row guards (VT_GDN_FP8_IN_BF16) is off by DEFAULT
+    // (GdnFp8InBf16Enabled), which is the only thing keeping it inert on the
+    // 35B. It used to read "confined to the 27B by construction, since the 35B
+    // is MoE and its GdnOutDType is f32"; GDN-MOE-BF16-OUT (#1168) made outdt
+    // BF16 on both arms, so the bound is a toggle now, not a model shape.
     DBuf lg = [&] {
       try {
         return DenseForwardLayers(d, s.hidden->t(), s.positions, s.attn_meta,

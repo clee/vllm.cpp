@@ -14,6 +14,7 @@
 #include <fstream>
 #include <iostream>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -22,6 +23,7 @@
 #include <nlohmann/json.hpp>
 
 #include "vllm/model_executor/weight_offloader.h"
+#include "vllm/model_executor/model_loader/gguf_device_fit.h"
 #include "vllm/model_executor/model_loader/gguf_reader.h"
 #include "vllm/model_executor/model_loader/safetensors_reader.h"
 #include "vllm/model_executor/models/deepseek_v4.h"  // deepseek4 GGUF dispatch arm
@@ -57,15 +59,97 @@ namespace fs = std::filesystem;
 // a failure to serve the named device PROPAGATES instead of falling back to
 // CPU (mirror of vLLM never substituting an explicitly named device,
 // vllm/config/device.py:61-66).
-vt::Queue SelectQueueForModel(std::string_view architecture,
-                              vllm::Device device) {
+namespace {
+
+// The auto arm of the resolution below, WITHOUT creating a queue. Extracted so
+// the queue selector and the load-time device-fit refusal (issue #1123) read one
+// description of "which device will this model run on" rather than two that can
+// drift. May throw, exactly as `CurrentPlatform()` can, and every caller keeps
+// the try/catch the original code had around it.
+vt::DeviceType AutoAcceleratorDeviceType(std::string_view architecture) {
+  const vllm::platforms::Platform& plat = vllm::platforms::CurrentPlatform();
+  const vt::DeviceType dev = plat.device_type();
+  // A PARTIAL backend (Metal today: 15 of 75 ops) must be able to decline a
+  // model whose kernels it has not registered. The default answer is `true`,
+  // so CUDA and CPU selection is byte-unchanged.
+  if (dev != vt::DeviceType::kCPU &&
+      (architecture.empty() || plat.supports_model_architecture(architecture))) {
+    return dev;
+  }
+  return vt::DeviceType::kCPU;
+}
+
+// The AUTO arm, resolved by ATTEMPTING the queue. One implementation, so
+// `ResolveModelDeviceType` and `SelectQueueForModel` cannot answer differently.
+//
+// Asking `CurrentPlatform()` alone is not enough, and #1136 measured why. This
+// arm has always fallen back to CPU when `CreateQueue()` throws — "a platform can
+// be registered while CreateQueue still fails, and CPU must remain reachable" —
+// so on such a box a platform query answers `kCUDA` while the load runs on the
+// CPU queue. The load-time device-fit refusal reads the query, and it therefore
+// refused a checkpoint by naming a device nothing was going to run on, removing a
+// load that previously served on CPU. Whether `CreateQueue()` fails is knowable
+// only by calling it, so it is called here, once, and the queue goes to whichever
+// caller wants one.
+struct AutoDeviceResolution {
+  vt::DeviceType device = vt::DeviceType::kCPU;
+  // Set exactly when `device != kCPU`: the queue whose creation PROVED it.
+  std::optional<vt::Queue> queue;
+};
+
+AutoDeviceResolution ResolveAutoDevice(std::string_view architecture) {
+  AutoDeviceResolution out;
+  try {
+    const vt::DeviceType dev = AutoAcceleratorDeviceType(architecture);
+    if (dev != vt::DeviceType::kCPU) {
+      // Order matters: `device` is set only AFTER the queue exists, so a throw
+      // leaves the CPU answer rather than a device nothing can serve.
+      vt::Queue q = vt::GetBackend(dev).CreateQueue();
+      out.queue = q;
+      out.device = dev;
+    }
+  } catch (const std::exception&) {
+    // No usable accelerator; CPU, which is what this arm has always returned.
+  }
+  return out;
+}
+
+}  // namespace
+
+vt::DeviceType ResolveModelDeviceType(std::string_view architecture,
+                                      vllm::Device device) {
   if (device != vllm::Device::kAuto) {
     const vllm::platforms::Platform* named_platform =
         vllm::platforms::FindPlatformByName(vllm::DeviceName(device));
-    const vt::DeviceType resolved = LoadedEngine::ResolveExplicitDeviceType(
+    // Propagates for an explicitly named absent device, which is the refusal
+    // vllm/config/device.py:61-66 mirrors and must not be swallowed here.
+    return LoadedEngine::ResolveExplicitDeviceType(
         device, named_platform == nullptr
                     ? std::nullopt
                     : std::optional{named_platform->device_type()});
+  }
+  AutoDeviceResolution resolved = ResolveAutoDevice(architecture);
+  // The queue was created only to learn whether it CAN be created. `vt::Queue` is
+  // a NON-OWNING handle (a raw `cudaStream_t`) with no destructor, so dropping the
+  // value would leak the stream.
+  //
+  // Through the FREE `vt::DestroyQueue`, not `Backend::DestroyQueue`: that is what
+  // this file's only other queue teardown does (`load_queue`, below), it is what
+  // `vt/backend.h` asks of new code so device index and queue cleanup are never
+  // ambient, and it adds the `Synchronize` and the handle/id clearing the method
+  // does not. The CREATE side deliberately stays `GetBackend(...).CreateQueue()`,
+  // because that is the call this arm has always made and switching it would move
+  // the production queue-selection path onto the drop-in resource ABI — a
+  // behaviour change, which this repair is not.
+  if (resolved.queue.has_value()) vt::DestroyQueue(*resolved.queue);
+  return resolved.device;
+}
+
+vt::Queue SelectQueueForModel(std::string_view architecture,
+                              vllm::Device device) {
+  if (device != vllm::Device::kAuto) {
+    const vt::DeviceType resolved =
+        ResolveModelDeviceType(architecture, device);
     if (resolved == vt::DeviceType::kCPU) {
       return vt::Queue{vt::Device{vt::DeviceType::kCPU, 0}, nullptr};
     }
@@ -83,24 +167,14 @@ vt::Queue SelectQueueForModel(std::string_view architecture,
   // the single line that stood between the Metal backend and running a model.
   // It now asks the PLATFORM seam, which is the tree's own answer to "which
   // device is this process running on": CurrentPlatform() walks
-  // {kCUDA, kXPU, kVULKAN, kMETAL, kCPU} and returns the first whose backend
-  // actually probed a device (src/vllm/platforms/platform.cpp:38-40), so on a
-  // CUDA box this selects EXACTLY the queue the old code did, byte for byte,
-  // and on the M4 it selects Metal. The try/catch stays: a platform can be
+  // {kCUDA, kROCM, kXPU, kVULKAN, kMETAL, kTENSTORRENT, kCPU} and returns the
+  // first whose backend actually probed a device
+  // (src/vllm/platforms/platform.cpp:91-98), so on a CUDA box this selects
+  // EXACTLY the queue the old code did, byte for byte, and on the M4 it selects
+  // Metal. The try/catch stays, now inside `ResolveAutoDevice`: a platform can be
   // registered while CreateQueue still fails, and CPU must remain reachable.
-  try {
-    const vllm::platforms::Platform& plat = vllm::platforms::CurrentPlatform();
-    const vt::DeviceType dev = plat.device_type();
-    // A PARTIAL backend (Metal today: 15 of 75 ops) must be able to decline a
-    // model whose kernels it has not registered. The default answer is `true`,
-    // so CUDA and CPU selection is byte-unchanged.
-    if (dev != vt::DeviceType::kCPU &&
-        (architecture.empty() || plat.supports_model_architecture(architecture))) {
-      return vt::GetBackend(dev).CreateQueue();
-    }
-  } catch (const std::exception&) {
-    // No usable accelerator; fall through to CPU.
-  }
+  AutoDeviceResolution resolved = ResolveAutoDevice(architecture);
+  if (resolved.queue.has_value()) return *resolved.queue;
   return vt::Queue{vt::Device{vt::DeviceType::kCPU, 0}, nullptr};
 }
 
@@ -374,6 +448,92 @@ vllm::HfConfig MakeDsparkDraftConfig(const nlohmann::json& c) {
   }
   cfg.raw["dflash_config"] = dflash_config;
   return cfg;
+}
+
+// The two DSpark resolution keys, read off the draft checkpoint's own
+// config.json (SPEC-DSPARK-BLOCK-SIZE-GUARD, #1225).
+struct DsparkDraftKeys {
+  std::optional<int> n_predict = std::nullopt;
+  std::optional<int> block_floor = std::nullopt;
+  // The key `block_floor` was actually read from, so the refusal can name it.
+  // Upstream's `dspark_block_size` unless the fallback below supplied it, which
+  // on both published Qwen3 drafts is always.
+  const char* block_floor_key = "dspark_block_size";
+};
+
+// Mirror of the getattr() reads upstream performs on the draft's hf_config
+// before it resolves k, all @ 555967922:
+//
+//   * n_predict                                                :973-975
+//   * the Gemma4 normalization n_predict = block_size          :957-961
+//     (guarded by "Gemma4DSparkModel" in architectures, exactly as upstream
+//     guards it -- it does NOT apply to a Qwen3 DSpark draft)
+//   * dspark_block_size, the block floor                       :1011-1015
+//
+// ONE DIVERGENCE, argued in .agents/specs/dspark-block-size-guard.md section 2:
+// when `dspark_block_size` is absent the floor falls back to `block_size`.
+// Upstream reads only `dspark_block_size`, and that identifier occurs in no file
+// of the pinned checkout except speculative.py, so it can only arrive from a
+// draft config.json -- and NEITHER published Qwen3 draft carries it.
+// deepseek-ai/dspark_qwen3_4b_block7 and RadixArk/Qwen3.8-27B-DSpark @ 85ef153b
+// both ship `block_size: 7` with no n_predict, and the :957-961 normalization is
+// Gemma4-only, so upstream accepts k=6 against a block-7 Qwen3 draft. A literal
+// port would key the floor on a field no checkpoint we support sets. Our draft
+// block is sized by k alone (spec_decode/dspark/speculator.h:56) and no weight
+// is block-shaped, so a short k raises no shape error: it drafts a structurally
+// wrong block in silence. The explicit key still wins when a checkpoint does
+// carry it, so a later pin that adds it changes nothing here.
+//
+// Both values stay std::nullopt when the draft checkpoint is not on disk. That
+// keeps ResolveSpecConfig resolving a path it cannot read exactly as it did
+// before this change; LoadDsparkDraft owns the "not found" message and names the
+// directory it looked in.
+DsparkDraftKeys ReadDsparkDraftKeys(const std::optional<std::string>& draft_model_path) {
+  DsparkDraftKeys keys;
+  if (!draft_model_path.has_value()) return keys;
+  const std::string draft_dir = ResolveDflashDraftDir(*draft_model_path);
+  std::error_code ec;
+  const fs::path config_path = fs::path(draft_dir) / "config.json";
+  if (!fs::exists(config_path, ec)) return keys;
+
+  nlohmann::json cj;
+  try {
+    std::ifstream cf(config_path.string());
+    cf >> cj;
+  } catch (const std::exception&) {
+    return keys;  // LoadDsparkDraft re-reads it and reports the parse failure.
+  }
+  if (!cj.is_object()) return keys;
+  // Read through the SAME normalized shape LoadDsparkDraft loads from, so both
+  // published config layouts resolve identically.
+  if (vllm::Qwen3DSparkModel::IsSpeculatorsDsparkConfig(cj)) {
+    cj = vllm::Qwen3DSparkModel::TranslateSpeculatorsDsparkConfig(cj);
+  }
+
+  const auto read_int = [&cj](const char* key) -> std::optional<int> {
+    if (cj.contains(key) && cj.at(key).is_number_integer()) {
+      return cj.at(key).get<int>();
+    }
+    return std::nullopt;
+  };
+
+  keys.n_predict = read_int("n_predict");
+  if (!keys.n_predict.has_value() && cj.contains("architectures") &&
+      cj.at("architectures").is_array()) {
+    for (const auto& arch : cj.at("architectures")) {
+      if (arch.is_string() && arch.get<std::string>() == "Gemma4DSparkModel") {
+        keys.n_predict = read_int("block_size");  // speculative.py:957-961
+        break;
+      }
+    }
+  }
+
+  keys.block_floor = read_int("dspark_block_size");
+  if (!keys.block_floor.has_value()) {
+    keys.block_floor = read_int("block_size");  // the divergence, above
+    keys.block_floor_key = "block_size";
+  }
+  return keys;
 }
 
 // Load a DSpark draft: the DFlash backbone plus the Markov head plus, for a
@@ -796,16 +956,27 @@ std::optional<vllm::SpeculativeConfig> LoadedEngine::ResolveSpecConfig(
   }
   // SPEC-DSPARK W5: the semi-autoregressive block drafter. Like DFlash it names a
   // SEPARATE draft checkpoint and takes k from the CLI (a native Qwen3 DSpark
-  // config carries no n_predict, speculative.py:973-994); the draft's own
-  // block_size floor is applied by ResolveDspark once the config is read.
+  // config carries no n_predict, speculative.py:973-994).
+  //
+  // SPEC-DSPARK-BLOCK-SIZE-GUARD (#1225): read the draft's own n_predict and
+  // block floor and PASS them. Both arguments were std::nullopt here, so
+  // ResolveDspark's k >= block floor (speculative.h:179-185, from
+  // speculative.py:1003-1027) reached no user and a k below the checkpoint's
+  // block was accepted in silence.
   if (cli.method == "dspark") {
-    if (!cli.num_speculative_tokens.has_value()) {
+    const DsparkDraftKeys keys = ReadDsparkDraftKeys(cli.draft_model_path);
+    // speculative.py:990-994. Kept ahead of ResolveDspark only for the case it
+    // was written for -- a native Qwen3 draft, which carries no n_predict to
+    // default from. With one present, :973-979 defaults k and this must not
+    // pre-empt it, or the n_predict threaded above would be unreachable.
+    if (!cli.num_speculative_tokens.has_value() && !keys.n_predict.has_value()) {
       throw std::invalid_argument(
           "speculative-config: method \"dspark\" requires num_speculative_tokens "
           "(a DSpark draft config carries no n_predict)");
     }
     vllm::SpeculativeConfig resolved = vllm::SpeculativeConfig::ResolveDspark(
-        std::nullopt, std::nullopt, cli.num_speculative_tokens);
+        keys.n_predict, keys.block_floor, cli.num_speculative_tokens,
+        keys.block_floor_key);
     resolved.draft_model_path = cli.draft_model_path;
     return resolved;
   }
@@ -882,7 +1053,38 @@ int LoadedEngine::ResolveNumBlocks(const EngineParams& params,
   //    fraction can be turned into a block count. Until that lands, fall back to
   //    the historical default so the default path is byte-identical.
   // TODO(ROAD-V1-MEM M3): profile run -> available_kv = free*util - non_kv.
-  return 256;
+  constexpr int kFallbackNumBlocks = 256;
+  // FIX-GPU-MEM-UTIL-INERT (#1165): this line is where an explicitly chosen
+  // fraction gets discarded, so this is where the engine has to say so. The
+  // flag is NOT refused: roadmap_v1.md:71 records the intent that it keeps
+  // vLLM's exact name and fraction semantics so a published vLLM launch line
+  // ports unchanged. What was wrong was accepting the value in silence, which
+  // left a user believing they had sized the KV pool when they had sized
+  // nothing.
+  //
+  // Only an EXPLICIT value warns. A default nobody set has nothing to report,
+  // and a line on every start is noise rather than a warning.
+  if (params.gpu_memory_utilization.has_value()) {
+    std::cerr
+        << "vllm.cpp: WARNING --gpu-memory-utilization "
+        << *params.gpu_memory_utilization
+        << " was accepted but did NOT size the KV cache.\n"
+           "vllm.cpp:   The profile run that turns a free-memory fraction into "
+           "a block count is not\n"
+           "vllm.cpp:   implemented yet (ROAD-V1-MEM M3, "
+           "https://github.com/mudler/vllm.cpp/issues/83).\n"
+           "vllm.cpp:   The pool fell back to "
+        << kFallbackNumBlocks
+        << " blocks. To size it today, pass\n"
+           "vllm.cpp:   --kv-cache-memory <bytes> for an absolute KV budget, or "
+           "--num-blocks <n> for an\n"
+           "vllm.cpp:   exact block count.\n";
+    // Unbuffered by the time the loader's next line lands, so the notice cannot
+    // be separated from the load it belongs to (same reason as the auto-fit
+    // INFO line in ResolveMaxModelLen).
+    std::cerr.flush();
+  }
+  return kFallbackNumBlocks;
 }
 
 vllm::v1::KVCacheConfig LoadedEngine::MakeKVCacheResolved(
@@ -1254,6 +1456,68 @@ vllm::v1::AsyncLLM& LoadedEngine::async_engine() {
 
 std::unique_ptr<LoadedEngine> LoadedEngine::FromModelDir(
     const std::string& model_dir, const EngineParams& params) {
+  // ENG-RESIDENCY-CONFIG (#1110): install the host-RAM -> DISK residency config
+  // FIRST — before the offloader below, before the device resolution, before any
+  // path or weight operation.
+  //
+  // The ordering is the whole requirement, not tidiness. Each knob this config
+  // feeds (`VT_GGUF_MMAP`, `VT_GGUF_PREFAULT`, `VT_MOE_EXPERT_STREAM` and its two
+  // sizes) is read during weight load, and two of them cannot be taken back: the
+  // expert-stream decision is cached in a function-local static, and the slot
+  // store's geometry is fixed when the store is built. A config that arrived after
+  // either would be silently ignored, which is why `SetWeightResidencyConfig`
+  // throws when a document would CHANGE one of those two decisions rather than
+  // accepting it. It throws on nothing else: a second engine in one process is legal,
+  // so a late `mmap` or `prefault` (both resolved per load), a document that omits a
+  // decided field, and a document that asks for what was decided are all installed,
+  // and the install MERGES field by field so a partial document does not drop the
+  // first engine's. It is placed ahead of `CreateWeightOffloader`
+  // deliberately:
+  // that call can THROW for a configured-but-unwired backend, and a document
+  // carrying both tiers must still have installed its residency half first.
+  //
+  // Absent (the default, and every caller that predates this row) installs
+  // nothing, so every knob resolves exactly as it did before.
+  if (params.weight_residency.has_value() &&
+      !params.weight_residency->empty()) {
+    vllm::SetWeightResidencyConfig(*params.weight_residency);
+    // ONE line, naming THE DOCUMENT THAT WAS INSTALLED — the fields the operator
+    // set, not the values the engine will resolve. The two differ exactly when a
+    // variable overrides the document, which is why the second line exists: it
+    // names every variable that would WIN over a field of it, by variable and by
+    // field. The environment deliberately wins (those variables exist so a
+    // benchmark arm is switchable without a restart), and a document silently
+    // overridden by something exported weeks ago is the one way that precedence
+    // hurts.
+    //
+    // It does not print RESOLVED values, and ONE of the five is the reason:
+    // `expert_stream` is cached on first read, so resolving it here would move that
+    // decision ahead of the load — the exact ordering this block exists to hold. The
+    // other four could be resolved at this point (`prefault` and `slots` outright;
+    // `mmap` and `slot_bytes` need a built-in default only their caller has), so
+    // printing the document rather than a mixture of asked-for and resolved values is
+    // a consistency decision on top of that one constraint. An operator reading
+    // `expert_stream=on` beside `VT_MOE_EXPERT_STREAM (...) OVERRIDES` is being told
+    // the document said on and the variable decides.
+    //
+    // IT READS BACK THE INSTALLED GLOBAL, not `params`, and that is what makes the
+    // line evidence that the install RAN. Measured: with the line printing from
+    // `params`, the reachability mutation — deleting the `SetWeightResidencyConfig`
+    // call above — left the server-level suite GREEN, because the log and the
+    // install were independent statements.
+    const vllm::WeightResidencyConfig installed =
+        vllm::ActiveWeightResidencyConfig();
+    if (!installed.empty()) {
+      std::cerr << "engine: weight residency (offload_config vllm_cpp): "
+                << installed.Describe() << std::endl;
+      const std::string shadowed = installed.DescribeEnvOverrides();
+      if (!shadowed.empty()) {
+        std::cerr << "engine: weight residency: the environment OVERRIDES the "
+                     "config for "
+                  << shadowed << std::endl;
+      }
+    }
+  }
   // ENG-WEIGHT-OFFLOAD W1: install the weight offloader BEFORE any weight I/O,
   // mirroring vLLM setting the process-global at
   // v1/worker/gpu_model_runner.py:939. `ModelRegistry::Prepare` reads it back
@@ -1313,7 +1577,36 @@ std::unique_ptr<LoadedEngine> LoadedEngine::FromModelDir(
     // Resolve before tokenizer/weight work so unsupported architecture errors
     // are deterministic and match registry.py rather than being masked by a
     // later source-specific missing-tensor/tokenizer error.
-    (void)ModelRegistry::Resolve(config);
+    const ModelRegistration& gguf_arch = ModelRegistry::Resolve(config);
+    // Issue #1123: refuse a GGUF whose weights cannot be STAGED onto the target
+    // device, here, before any weight I/O and before the tokenizer.
+    //
+    // `Qwen3.8-2.4T-A95B UD-Q1_0` (369.96 GiB) reached a serving state on
+    // `--device cuda` on a 119.631 GiB GB10 after 26 minutes and then died on
+    // the FIRST forward with `vt cuda: cudaMalloc: out of memory`. The load
+    // succeeds because a keep-quant expert tower is BORROWED from this mapping
+    // and costs zero anonymous bytes; the forward dies because a
+    // weight-staging device copies each tower into device memory
+    // (`ResidentWeight`, qwen3_5.cpp:1011 -- 276 towers of 1,275,068,416
+    // bytes plus 3 of 2,818,572,288, so 335.62 GiB). Loading for 26 minutes and dying
+    // mid-stream is the worst of the available behaviours.
+    //
+    // Placed AFTER Resolve so an unsupported-architecture error keeps its
+    // priority and the error ordering this branch documents is unchanged, and
+    // BEFORE the tokenizer and the weights because everything after this point
+    // is the cost the refusal exists to avoid paying. The predicate lives in
+    // `gguf_device_fit.h`; it decides nothing on a platform that does not stage
+    // weights (every CPU load) and nothing when no budget is known.
+    {
+      const platforms::Platform& target = platforms::GetPlatform(
+          ResolveModelDeviceType(gguf_arch.architecture, params.device));
+      const DeviceWeightFit fit = CheckDeviceWeightFit(
+          gguf, vt::DeviceTypeName(target.device_type()),
+          target.needs_weight_staging(),
+          DeviceWeightBudgetBytes(
+              target.residency_policy().device_memory_total_bytes));
+      if (fit.refuse) throw std::runtime_error(fit.message);
+    }
     tok::Tokenizer tokenizer = tok::Tokenizer::FromGguf(gguf);
     // Dense-vs-MoE GGUF dispatch now happens through the registry: the bench
     // branch's inline `IsDenseArch` split is superseded by
@@ -1384,6 +1677,40 @@ std::unique_ptr<LoadedEngine> LoadedEngine::FromModelDir(
     return std::unique_ptr<LoadedEngine>(new LoadedEngine(
         std::move(config), std::move(model), std::move(tokenizer), params,
         /*preselected_queue=*/nullptr, std::move(dflash)));
+  }
+
+  // SPEC-DSPARK-BLOCK-SIZE-GUARD (#1225): resolve the DSpark speculative config
+  // ONCE, here, and hand the result to the draft load further down.
+  //
+  // The draft load used to resolve it a second time, with its own argument list,
+  // and it runs BEFORE the LoadedEngine constructor reaches ResolveSpecConfig —
+  // so that second copy, not this function, was the first resolution a DSpark run
+  // ever met. It passed `ResolvedNumSpeculativeTokens()`
+  // (`include/vllm/config/speculative.h::ResolvedNumSpeculativeTokens`), which is
+  // `num_speculative_tokens.value_or(n_predict)` and therefore ZERO when the user
+  // named no k, because nothing fills `n_predict` on the CLI-side config. Once the
+  // block floor became reachable that refused an absent k against a k of 0, naming
+  // a key the checkpoint does not carry and a number nobody typed, on the native
+  // Qwen3 lane that works today. The `n_predict` default and the "requires
+  // num_speculative_tokens" message were both unreachable in production for the
+  // same reason, while this file's tests asserted them through ResolveSpecConfig.
+  //
+  // Delegating deletes the second implementation instead of repairing it: one
+  // resolution, one set of messages, one place the floor is applied. The dspark
+  // branch of `ResolveSpecConfig` reads nothing off the target `HfConfig` — it
+  // resolves from the CLI config and the draft's own config.json — so the empty
+  // config here yields exactly what the constructor's re-resolution against the
+  // real one will yield.
+  //
+  // Placed AFTER the `.gguf` branch above, which keeps its own named refusal for
+  // a GGUF target, and BEFORE every path, config, tokenizer and weight operation
+  // below. A speculative length the draft cannot serve is then refused before the
+  // loader spends twenty minutes mapping a target it will not get to use, which is
+  // the same ordering the device resolution above exists to give.
+  std::optional<vllm::SpeculativeConfig> dspark_spec;
+  if (params.speculative_config.has_value() &&
+      params.speculative_config->method == "dspark") {
+    dspark_spec = LoadedEngine::ResolveSpecConfig(params, vllm::HfConfig{});
   }
 
   if (!fs::exists(dir) || !fs::is_directory(dir)) {
@@ -1476,11 +1803,13 @@ std::unique_ptr<LoadedEngine> LoadedEngine::FromModelDir(
     if (!params.speculative_config.has_value()) return nullptr;
     // SPEC-DSPARK W5: the DSpark draft rides the same seam and the same bundle.
     if (params.speculative_config->method == "dspark") {
-      vllm::SpeculativeConfig resolved = vllm::SpeculativeConfig::ResolveDspark(
-          std::nullopt, std::nullopt,
-          params.speculative_config->ResolvedNumSpeculativeTokens());
-      resolved.draft_model_path = params.speculative_config->draft_model_path;
-      return LoadDsparkDraft(resolved, SharedHeadSource(shards.get()));
+      // SPEC-DSPARK-BLOCK-SIZE-GUARD (#1225): use the config resolved at the top
+      // of this function, which is where the block floor is applied. Resolving
+      // again here is what put a SECOND, differently-argued copy of the
+      // resolution ahead of the constructor's; `LoadDsparkDraft` sizes the draft
+      // block from this k alone, so the k it gets must be the refused-or-accepted
+      // one and not a second opinion.
+      return LoadDsparkDraft(*dspark_spec, SharedHeadSource(shards.get()));
     }
     if (params.speculative_config->method != "dflash") {
       return nullptr;

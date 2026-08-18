@@ -22,6 +22,22 @@ example targets are named after the directories they are built from, so an
 in-source build makes the linker write each executable over its own source
 directory (issue #85).
 
+### Host compilers
+
+gcc 13 and 14 and clang are exercised by CI, and **gcc 16 builds the tree,
+including the OpenAI server**. Before this it did not: several files, one of
+them the server's own `main`, called `getpid()` without including `<unistd.h>`
+and compiled only because an older libstdc++ happened to pull that header in
+for them. A compile-only CI lane on the newest released gcc now guards this,
+because every other Linux lane uses the distro compiler and cannot see it.
+
+On gcc 16 the `array-bounds` warning is reported but is **not** treated as an
+error, unlike on every earlier gcc. That release emits it inside libstdc++ and
+the vendored JSON library for code that is correct, and no change to the
+calling code avoids it (`cmake/CompilerWarnings.cmake` explains the mechanism
+and cites the upstream gcc bug). A genuine out-of-bounds still fails the build
+on gcc 15 and earlier, which is what the rest of CI enforces.
+
 ### Setting the compiled build identity
 
 `vllm-server --version` reports the CMake project version by default. Release
@@ -54,6 +70,15 @@ never use, and its teardown can deadlock at process exit — every test passes,
 or putting your own `-O` in `CMAKE_HIP_FLAGS`, overrides it.
 
 ### ROCm op coverage is incremental (and throws are by design)
+
+ROCm now also carries an **engine-level attention backend name**. Until #1056 the
+kernels were registered (`kPagedAttention`, `kReshapeAndCache`) but
+`RocmPlatform::get_attn_backend_priority` returned an empty list, so
+`SelectAttentionBackendName` had nothing to resolve for `kROCM` — ROCm was the
+only platform in that state. It now returns upstream's dense order verbatim, and
+`ROCM_ATTN` is registered against the NHD layout this tree uses. Nothing routes
+to that name until the runner asks for it (#1065), and no user-facing flag
+changes: this is what the engine picks, not something you select.
 
 The ROCm backend registers native ops family by family
 ([#41](https://github.com/mudler/vllm.cpp/issues/41)); landed GDN slices so far:
@@ -188,12 +213,58 @@ welcome that the agent should relay. An explicit request can use
 claim action, rerun it after declaration, then run `scripts/agent-preflight.sh`.
 The entrypoint is non-interactive and does not mutate the checkout.
 
+`scripts/agent-preflight.sh` now also runs `scripts/check-symbol-anchors.py`,
+which reads every citation written as `` `path/to/file.cpp::SymbolName` `` and
+requires that the file it names still contains that symbol. Write citations in
+that form rather than as `file.cpp:412`: a line number is a coordinate into a
+moving file, so an edit anywhere above it retargets the citation in files the
+edit never opened. Add `--upstream-root <vllm-checkout>` to ask the same
+question of the pinned oracle; that run is opt-in, because CI has no checkout to
+resolve upstream paths against. Both runs print every bucket they left out --
+frozen files, untracked files, upstream paths -- and refuse a checked count
+below the recorded floor, so a run that quietly stopped examining anything
+cannot report as a pass.
+
 The operator role is a coordinator, and **several may run at once**:
 `scripts/agent-role.py claim operator` records this worktree and is never
 refused, `scripts/agent-role.py show` lists the other live coordinators, and
 `scripts/agent-role.py release` removes only this worktree's record. What keeps
 concurrent coordinators safe is that `main` is never force-pushed, so a plain
 `git push` refuses any non-fast-forward.
+
+### `.env`: your values, and what happens when it is missing
+
+`.env` is untracked, so a fresh clone and every linked worktree start without
+one. `scripts/agent-start.py` reports that as `environment: missing`,
+`incomplete`, or `unreadable`, and prints what to do about it. The route is ask
+and then record. It never guesses a value, and it never falls back to a host
+name or a path written in a repository document, because that is another
+developer's resolved value.
+
+Record one answered value with the writer that owns the file:
+
+```sh
+scripts/agent-onboard.py --env-set GATE_HOST=my-gate-box
+```
+
+It seeds `.env` from `.env.example` on first use, so every other key survives
+commented and empty, and it refuses any key `.env.example` does not declare.
+Leave a key empty when your setup does not have the thing. Empty means
+unavailable, and the gates that need it stay `PENDING` for you.
+
+Three keys name where the hardware gate runs, and a gate script refuses by name
+rather than guessing when one it needs is unset:
+
+| Key | Value |
+|---|---|
+| `GATE_HOST` | The box the hardware gates run on |
+| `GATE_DEVICE` | Its resource-controller device, as `<box>:<device>`, for example `dgx:gpu0`. `rc devices` lists the fleet |
+| `GATE_CHECKOUT` | The repository checkout on that box, which remote gate commands enter before they build |
+
+`SHARED_STORAGE_ROOT` names the mount point of shared storage when it is a
+network share, and `CHECKPOINT_ROOT` names the checkpoint directory inside it.
+The two are separate because a leased worker or a container can see the same
+folder under a different path.
 
 ### `GPU_LOCK`: one file mutex, and only one
 
@@ -248,7 +319,7 @@ build/examples/vllm-cli \
 | `--top-k K` | `0` | Top-k (`0` means all) |
 | `--seed S` | (unset) | RNG seed (enables seeded sampling) |
 | `--stream` | off | Stream token deltas to stdout |
-| `--speculative-config '<json>'` | (unset) | Speculative decoding, same JSON as vLLM's flag. See [docs/SPECULATIVE-DECODING.md](SPECULATIVE-DECODING.md) |
+| `--speculative-config '<json>'` | (unset) | Speculative decoding, same JSON as vLLM's flag. Every key is checked and none is dropped: an unknown or misspelled name is refused at startup by name, and a real vLLM key this engine does not implement is refused as such ([#1160](https://github.com/mudler/vllm.cpp/issues/1160)). See [docs/SPECULATIVE-DECODING.md](SPECULATIVE-DECODING.md) |
 | `--max-num-seqs N` | engine default (32) | Max concurrent sequences. Under speculative decoding on a GDN model the recurrent state is `max-num-seqs x (k+1)` per slot, so this is the knob to lower when a run is refused for state budget |
 | `--repeat N` | `1` | Load once, then run N blocking completions. Use it to read a warm decode tok/s without paying model load each time. Not supported with `--stream`, which falls back to 1 |
 | `-h`, `--help` | | Print usage and exit |
@@ -416,6 +487,48 @@ a silent fallback cannot post a plausible number:
   on the gate clip, so turn it on only where encoder latency matters more than exact
   reproduction of the default output.
 
+Every build — not only a Vulkan one — additionally gets `vocoder-conv-ab`, the
+same-binary A/B for the shared 1-D BigVGAN vocoder convolution chain that
+MiniMax-Music3, MiniMax-H3's audio VAE, LTX-2.5's audio VAE and IndexTTS-2.5 all
+decode through. `VLLM_CPP_VOCODER_DEVICE` is the only variable, and the binary
+prints the arm it RESOLVED rather than the one that was asked for, so a silent
+fallback to the host cannot post a plausible pair of timings:
+
+```sh
+VLLM_CPP_VOCODER_DEVICE=cpu  ./build/vocoder-conv-ab --frames 96 --reps 3
+VLLM_CPP_VOCODER_DEVICE=cuda ./build/vocoder-conv-ab --frames 96 --reps 3
+```
+
+It runs the four upsample stages at the shipped decoder's real channel counts and
+strides, and prints a per-stage checksum so two arms that report the same time can
+still be told apart if one of them computed something else. The transposed
+convolution it times is 88.5 % of MiniMax-Music3's acoustic-half profile.
+
+### Running the vocoder convolutions on the GPU
+
+`VLLM_CPP_VOCODER_DEVICE=cuda` routes `vt::Conv1d` and `vt::ConvTranspose1d` to
+their CUDA providers for every model that decodes through the shared vocoder
+core. It needs a CUDA build; asking for it without one throws by name rather than
+falling back silently, because a silent fallback means an operator who asked for
+a device never learns they did not get one.
+
+The knob is not CUDA-specific. It accepts any device name `vt` knows (`cpu`,
+`cuda`, `metal`, `vulkan`, `xpu`, `rocm`, `tenstorrent`) and refuses one whose
+device carries no registered provider in the build in front of it, so a Metal or
+Vulkan provider becomes reachable here by being registered and nothing else.
+
+The default is `cpu`, and deliberately so — not because the device arm is
+approximate. The two providers are **byte-identical**: one f64 accumulator per
+output element walked in the same order on both, with the host pinned
+`-ffp-contract=off` and the device kernel pinned with `__dmul_rn`/`__dadd_rn`, so
+`tests/vt/test_ops_conv1d_general.cpp` gates them with `memcmp` rather than a
+tolerance (8 cases / 385 assertions on Jetson Thor sm_110, against 8 / 347 on a
+CPU-only box — the 38-assertion difference IS the device arm). It stays opt-in
+because flipping four shipped audio models onto a device arm needs its own
+re-gate against each one's committed goldens, which is owed to the row that
+wires it ([#672](https://github.com/mudler/vllm.cpp/issues/672),
+[.agents/specs/minimax-music3.md](../.agents/specs/minimax-music3.md) §13).
+
 ### Quantized checkpoints: which weight forms load
 ### How long a load takes, and how to see where it goes
 
@@ -482,6 +595,67 @@ quantizes the activation once; a checkpoint whose scales differ keeps the two
 separate GEMMs automatically. `VT_GDN_MERGED_QKVZ_FP8=0` restores the two GEMMs
 in the same binary.
 
+### Block-wise FP8 loads and does not run yet
+
+Block-wise FP8, also called fine-grained FP8, keeps one scale for each 128x128
+block of a weight rather than one scale for the whole weight. A block-wise
+checkpoint declares `quantization_config.weight_block_size` in its
+`config.json` and stores its scales under `weight_scale_inv` rather than under
+`weight_scale`.
+
+`Qwen/Qwen3.8-27B-FP8` is such a checkpoint. At revision
+`017b9c7af6b5689d5dd426a76e0bc077eb5ca20a` it declares `weight_block_size`
+`[128, 128]` with `activation_scheme` `dynamic`, and it stores
+`self_attn.q_proj.weight` as `F8_E4M3` `[12288, 5120]` beside
+`self_attn.q_proj.weight_scale_inv` as `BF16` `[96, 40]`.
+
+That checkpoint now LOADS. The weights are read into a block-wise FP8 weight,
+the `BF16` scale is widened to `F32` by value the way vLLM widens it, and the
+config is cross-checked against the tensors so a disagreement is named rather
+than guessed at. Nothing can execute the weight yet, so the model refuses to
+finish preparing:
+
+```text
+block-wise (fine-grained) 128x128 FP8 weights LOADED for
+model.layers.0.self_attn.q_proj and nothing in this build can execute them
+```
+
+Two block-wise configurations are refused earlier, at load, because no build
+here implements them: an `activation_scheme` other than `dynamic`, and a
+`weight_block_size` other than `[128, 128]`. Both messages name the key and the
+value your `config.json` declares.
+
+Nothing is wrong with those checkpoints; the missing arm is in this project. To
+run the same model today, use a per-tensor FP8, BF16, NVFP4, or GGUF checkpoint
+of it. Issue [#1189](https://github.com/mudler/vllm.cpp/issues/1189) tracks the
+remaining milestones, and
+[#1166](https://github.com/mudler/vllm.cpp/issues/1166) is the original report.
+
+### A per-tensor scale has to be one F32 number
+
+Every scale this build reads as a single number is required to be exactly one
+element and exactly `F32`. That covers `weight_scale`, `input_scale`,
+`weight_scale_2`, `weight_global_scale`, `input_global_scale`, `k_scale` and
+`v_scale`. A checkpoint that stores one of them as an array, or in a narrower
+dtype, is refused at load with a message naming the tensor, the shape it
+shipped, and the dtype it shipped:
+
+```text
+dense loader: 'model.layers.0.self_attn.q_proj.weight_scale' ships shape
+[12288, 1] (12288 elements), not the ONE element a per-tensor scale is
+```
+
+The two layouts this refuses in practice are per-output-channel FP8, which
+stores one scale per output row, and block-wise FP8, which stores a grid. Both
+used to load. The reader took the first four bytes and used them as the scale
+of the whole matrix, which is a finite plausible number and therefore fluent
+plausible wrong output rather than a failure. Issue
+[#1181](https://github.com/mudler/vllm.cpp/issues/1181) has the detail, and the
+per-output-channel arm itself is not implemented yet.
+
+`lm_head` is not affected. It has always read a per-output-channel scale
+correctly, as the table above records.
+
 ### Architectures that resolve but refuse to run
 
 A few architectures are registered so their config and weight layout are
@@ -493,7 +667,7 @@ tokens quietly.
 | Architecture | Why it refuses |
 |---|---|
 | `KimiK3ForConditionalGeneration` | Needs ~1.56 TB (MXFP4); no host here can run it |
-| `NemotronHForCausalLM` | The hybrid forward is ported (#517 W4) and the weight loader materializes the real checkpoint, but that forward is a HOST reference: it recomputes K/V over the whole sequence every step, carries no recurrent state between steps and treats a batch as one causal sequence. Engine construction now SUCCEEDS — the KV allocation reads the model's own recurrent spec (#810) — and the first step then refuses by name, naming the paged/batched decode path as the missing piece rather than returning plausible wrong tokens. **That refusal is UNCHANGED by A2-R (#810)**: A2-R adds a partial device arm (embedding lookup, the 52 layer norms + `norm_f`, and the 6 GQA attention blocks; Mamba2, MoE and `lm_head` stay on the host), but it is non-paged and single-request, so it creates none of the capability the refusal guards and is not reachable through `include/vllm.h`. It is exercised only by `test_nemotron_h_forward`, and it records no throughput number. Safetensors resolve and parse; a GGUF file is refused by name, since no GGUF arm exists for it |
+| `NemotronHForCausalLM` | **Only BATCHED decode still refuses.** A2-P (#810) narrowed this: `ForwardNemotronHForCausalLM` now selects the paged forward whenever the runner supplies paged KV and recurrent state, so K/V go into the runner's pages and the conv/SSM rows are carried across steps, and `examples/nemotron_h_gen` reaches all of it through `include/vllm.h` alone. What is left is `num_reqs > 1`, refused by name because one request's pages and one request's recurrent state are carried per step and a multi-request step would be decoded as ONE concatenated causal sequence — plausible wrong tokens rather than a failure. Owed to A2-B. **The end-to-end token gate against the pinned oracle has NOT run**, so no claim is made here about what this checkpoint emits; `docs/BENCHMARKS.md` records that as pending rather than as silence. `lm_head` and the FP8 Mamba2 projections still compute on the host, and a GGUF file is refused by name since no GGUF arm exists for it. See *Nemotron-3.5-Lightning-30B: the exact weights, and which arms run* below |
 
 This is a deliberate state, not a bug: registering the architecture is what lets
 the config parse and weight-name mapping be tested before the forward exists.
@@ -820,8 +994,10 @@ existing key in place, so `--lora a --lora b` leaves one `lora_path` extra
 holding `b`, silently fuses `b`, and exits 0. Pass one adapter.
 
 The C ABI cannot reach it either, and that is the wider half of the finding:
-`ltx2_video.cpp:813` is the ONLY `dit_options.loras.push_back` in the tree and it
-runs at most once, under `if (!lora_path.empty())`. So `loras.size()` is 0 or 1
+`Ltx2VideoEngine::Load` carries the ONLY `dit_options.loras.push_back` in the
+tree and it runs at most once, under `if (!lora_path.empty())` — named by symbol
+rather than by line, because the line moved with #1118 and a stale anchor is what
+this paragraph already had to correct once. So `loras.size()` is 0 or 1
 on every production path — CLI, `vllm_video_engine_load` and the server alike —
 and the more-than-one refusal is reached only by `test_ltx2_lora`. It is correct
 code guarding a state nothing can currently construct, which is the shape
@@ -941,13 +1117,17 @@ ignored — upstream passes a 512x512 placeholder whose height and width it
 documents as unused, and only the frame count and the recipe's frame rate are
 read, to derive the duration.
 
-**It is the only GUIDED arm, and that changes what it costs and what it needs.**
-The distilled video recipes run one DiT forward per step. This one runs
-**three** by default — conditional, unconditional, and one with the audio
+**It is a GUIDED arm, and that changes what it costs and what it needs.** The
+distilled video recipes run one DiT forward per step. This one runs **three** by
+default — conditional, unconditional, and one with the audio
 self-attention perturbed (STG) — so it is roughly 3x the work per step, and it
 **requires a text tower**, because the unconditional pass conditions on the
 negative prompt. Loading with `prompt_embeds_path` alone gets a refusal naming
 `--audio-cfg-guidance-scale 1.0` as the way to turn the unconditional pass off.
+
+It was the only guided arm here until row LTX25-GUIDED-VIDEO
+([#1092](https://github.com/mudler/vllm.cpp/issues/1092)) gave the joint video
+path its own denoiser; see *LTX-2.5 video guidance* below.
 
 Six per-generation knobs mirror upstream's own CLI, and each takes the
 checkpoint generation's value when absent: `--negative-prompt`,
@@ -974,6 +1154,99 @@ at the recipe's own guider values.
 **The accelerator is refused by name.** `device = 1` gets a refusal on this
 pipeline: the device forward takes both streams by reference and this pipeline
 has no video stream to give it. Use `--device cpu`.
+
+### LTX-2.5 video guidance: `--pipeline-kind one_stage`
+
+`one_stage` mirrors upstream's `TI2VidOneStagePipeline`, which builds a
+`FactoryGuidedDenoiser` from the params table's own video and audio guiders. On
+the 2.4/2.5 lineage those resolve to `cfg_scale = 3.0`, `stg_scale = 1.0`,
+`rescale_scale = 0.7` and `modality_scale = 3.0`.
+
+Until [#1092](https://github.com/mudler/vllm.cpp/issues/1092) this port read none
+of it: the joint denoise loop ran one unguided forward per step. A `one_stage`
+render therefore finished, at the right size and frame count, along a different
+trajectory than upstream's. It now runs **four** forwards per step and combines
+them per modality:
+
+| Pass | What differs | Selected by |
+|---|---|---|
+| conditional | nothing | always |
+| unconditional | the negative conditioning | `cfg_scale != 1.0` |
+| perturbed | video/audio self-attention skipped on `stg_blocks` | `stg_scale != 0.0` |
+| isolated modality | the audio<->video cross attention off in every block | `modality_scale != 1.0` |
+
+Seven per-generation knobs mirror upstream's `default_1_stage_arg_parser` and
+each takes the checkpoint generation's value when absent. The audio row and
+`--negative-prompt` are shared with text-to-audio and are no longer refused on a
+video pipeline; upstream's parser carries both rows side by side, and the old
+refusal rested on a reading of upstream that was wrong and harmless only while
+nothing here read them.
+
+| `ltx2-gen` flag | per-generation extra | meaning |
+|---|---|---|
+| `--video-cfg-guidance-scale` | `video_cfg_guidance_scale` | video `cfg_scale`; `1.0` turns the unconditional forward off |
+| `--video-stg-guidance-scale` | `video_stg_guidance_scale` | video `stg_scale`; `0.0` turns the perturbed forward off |
+| `--video-rescale-scale` | `video_rescale_scale` | video `rescale_scale`, applied to the DENOISED prediction |
+| `--video-skip-step` | `video_skip_step` | `0` never skips; `n` runs every `n+1`-th step |
+| `--video-stg-blocks` | `video_stg_blocks` | comma separated block indices; EMPTY disables STG, see below |
+| `--a2v-guidance-scale` | `a2v_guidance_scale` | video `modality_scale`; `1.0` turns the isolated-modality forward off |
+| `--v2a-guidance-scale` | `v2a_guidance_scale` | audio `modality_scale` |
+| `--negative-prompt` | `negative_prompt` | the unconditional forward's conditioning |
+
+The audio row is the same six spellings with `audio_` in place of `video_`:
+`audio_cfg_guidance_scale`, `audio_stg_guidance_scale`, `audio_rescale_scale`,
+`audio_skip_step`, `audio_stg_blocks`, and `v2a_guidance_scale` for its
+`modality_scale`.
+
+Those extras ride the per-generation `extra_keys` / `extra_values` array on
+`vllm_video_params`, so the C ABI reaches the same path with no new field. They
+are per-GENERATION and therefore reach the CLI and the C ABI and **not**
+`/v1/videos`, which forwards no per-generation extra to any engine
+([#928](https://github.com/mudler/vllm.cpp/issues/928)). `pipeline_kind` is a
+LOAD knob and does reach the server, so a server started with
+`--video-extra pipeline_kind=one_stage` renders every request through the guided
+denoiser at the recipe's own guider values and no request can change them.
+
+**An EMPTY `--video-stg-blocks` is accepted and means "perturb no block".** That
+is upstream's own idiom — `docs/multimodal-guidance.md:13` says "Set to `[]` to
+disable STG", the field defaults to `[]`, the flags are `nargs="*"`, and the
+shipped HQ params row uses it — and it stays distinct from OMITTING the flag,
+which takes the params table's value. It disables the STG signal and not the STG
+cost: upstream selects the perturbed pass from `stg_scale` alone, so the forward
+still runs and contributes exactly zero. Set the scale to `0.0` to skip the
+forward as well. This page and this port refused the empty list until
+2026-08-17.
+
+**The unconditional forward needs a negative conditioning, and there are two
+ways to supply one.** With a text tower, `--negative-prompt` (or the recipe's
+own default) is encoded through the same chain as the positive prompt. Without
+one, `--negative-prompt-embeds` and `--negative-audio-prompt-embeds` — the LOAD
+extras `negative_prompt_embeds_path` and `negative_audio_prompt_embeds_path` —
+are the negative half of the `prompt_embeds_path` fallback: two files at the
+DiT's two cross-attention widths, the same row count as the positive pair. Being
+LOAD extras they DO reach the server, through `--video-extra`. With neither, a
+`cfg_scale` other than 1.0 is **refused by name** rather than served the positive
+context twice, which would leave the whole classifier-free term at exactly zero.
+
+**A block index the checkpoint does not have is refused**, which is the case the
+empty list above is NOT. `stg_blocks` is a membership test upstream, so naming
+block 28 on a model with fewer blocks perturbs nothing and leaves
+`stg_scale * (cond - perturbed)` at exactly zero — the same zero, reached by a
+request that disagrees with the checkpoint rather than by a caller who asked for
+no perturbation. Upstream never meets it because it only ships 48-block
+checkpoints, so this refusal is local to this port and is named as such.
+
+**The distilled and retake recipes refuse every one of these flags.** Their
+guidance is distilled into the weights, so honouring an override would sample a
+trajectory the weights were never trained for. Their guiders are upstream's
+positive-only one, so they still issue one forward per step and their output is
+unchanged by this row.
+
+**The accelerator is refused for the perturbed and isolated-modality passes.**
+`Ltx2DitForwardDevice` takes no perturbation argument, so those two passes on
+`device = 1` would run an unperturbed forward and leave both terms at zero.
+Classifier-free guidance alone is a different context and no perturbation, and
+runs on both arms.
 
 **What is not served.** `temporal_upsample_rounds` is defined and refused above
 `0`: the rounds loop that temporally doubles the latent, re-tiles the canvas and
@@ -1849,11 +2122,16 @@ claimed. Ask for a short duration and few `num_inference_steps` while you are
 checking that it works.
 
 The part that dominates is *not* the one you would guess. The 8.6B language
-model goes through `vt` and uses the CPU threadpool; the RVQ depth decoder and
-the DiT do not — they are scalar host loops with a double accumulator, written
-that way in W2-W5 so their reduction order is reproducible against torch, and
-they run single-threaded. In one 0.1 s request the depth decoder alone is the
-majority of the wall clock.
+model goes through `vt` and uses the CPU threadpool; the RVQ depth decoder does
+not — it is a scalar host loop with a double accumulator, written that way in
+W2/W3 so its reduction order is reproducible against torch. In one 0.1 s request
+the depth decoder alone is the majority of the wall clock.
+
+At a *real* duration the DiT is the whole story instead, which is why it is the
+stage that moved first: a 45 s clip at the default 30 inference steps runs the
+DiT 660 times (30 steps x 2 CFG branches x 11 windows) for roughly 634 TFLOP
+against about 29 TFLOP for the entire autoregressive half. On the host loops
+that is measured in hours. `--speech-device 1` puts it on the accelerator.
 
 #### What runs on the device, and what does not
 
@@ -1866,20 +2144,34 @@ direction that matters.
 |---|---|
 | 8.6B `Qwen3ForCausalLM` (prefill + every decode step, its paged KV) | **device** |
 | guided-logit pipeline, top-k draw, frame feedback embedding | host (two 200 000-wide rows per step; not the cost) |
+| **2.4B fp32 flow-matching DiT** (every denoise step, both CFG branches) | **device**, weights staged ONCE |
 | 0.646B RVQ depth decoder (7 steps per frame) | **host**, scalar loops |
-| condition mix, 2.4B fp32 flow-matching DiT, scheduler | **host**, scalar loops |
+| condition mix (once per window), scheduler, CFG mix, Euler step | **host** |
 | DAC Flow-VAE vocoder (`Conv1d` / `ConvTranspose1d`) | **host**, scalar loops |
 
 The language model reaches the device because it is already routed through the
 shared `Qwen3DenseModel` forward that five text registrations ride — nothing was
 forked for it, and the only thing this option changes is which queue that
-forward is handed and where its KV cache is allocated. The other stages do not,
-for two different reasons, and both are owed rather than hidden:
+forward is handed and where its KV cache is allocated.
 
-* the depth decoder and the DiT are host `std::vector<float>` reference loops
-  under `-ffp-contract=off`, kept that way so their reduction order stays
-  reproducible against torch. Moving them means routing them through the shared
-  `vt` GEMM seam with device-resident weights, not adding a flag;
+The DiT reaches it the same way: through shared `vt` ops only
+(`MatmulBT`, `LayerNorm`, `AttentionCross`, `RopeFromCache`, `SiluAndMul`,
+`Add`), with **no new kernel**. Its 9.7 GB of fp32 weights are uploaded once per
+request, before the window loop, and the host copy is released as each tensor
+lands — a 45 s clip runs that forward 660 times, so a per-step or even
+per-window upload would cost more than the compute it enables. `fp32 stays
+fp32`: the acoustic half is float32 because upstream chose float32 for it, and
+this arm mirrors that rather than buying speed with a narrower dtype.
+
+The remaining stages do not move, for two different reasons, and both are owed
+rather than hidden:
+
+* the depth decoder and the condition mix are host `std::vector<float>`
+  reference loops under `-ffp-contract=off`, and they run at
+  `ArCompute::kBFloat16` — every op's *result* is rounded to bf16, which is what
+  upstream stores. Routing them through an f32 GEMM would silently drop that
+  rounding, so mirroring them needs bf16 storage, which is a dtype decision with
+  its own numeric evidence rather than a transcription;
 * the vocoder needs `ConvTranspose1d`, and **`vt` has no such op at all** — the
   1-D convolutions it does have (`vt::DepthwiseConv1d`, `vt::CausalConv1dFwd`)
   are depthwise or causal-with-state, and `vt::Conv2d` and `vt::DepthwiseConv1d`
@@ -1887,10 +2179,16 @@ for two different reasons, and both are owed rather than hidden:
   this stage would need, so it is named here rather than hand-rolled outside the
   seam.
 
-Because the host stages are unchanged, the CPU arm is **bit-identical** to the
-one every Music3 correctness gate was taken on, and the device arm's output
-differs from it exactly where the language model's own arithmetic differs — one
-stage, not five.
+Because the host stages are unchanged — and because `--speech-device 0` takes
+the same `DitForward` it always did, source byte for source byte — the CPU arm
+is **bit-identical** to the one every Music3 correctness gate was taken on. The
+device arm's output differs from it exactly where the language model's and the
+DiT's own arithmetic differ: two stages, not six, and neither difference is a
+shape or an ordering defect. The DiT's device forward is gated against the same
+upstream goldens at the same tolerance as the host one; nothing was widened for
+it, and `VLLM_CPP_MUSIC3_DEVICE=1` runs that comparison on either arm
+(`tests/parity/test_minimax_music3_acoustic_real.cpp`, with
+`VLLM_CPP_MUSIC3_DIT=1`).
 
 **The two arms do not produce the same song, and that is structural.** The
 autoregressive stage has no greedy path upstream: it ends every draw in a seeded
@@ -1901,6 +2199,44 @@ language model's own hidden state against the oracle capture, and
 arm — `VLLM_CPP_MUSIC3_DEVICE=1` selects the device one, unset is the CPU one —
 at the same bounds, with the same negative control. Numbers for both are in
 [BENCHMARKS](BENCHMARKS.md).
+
+#### Where the time actually goes: `VLLM_CPP_MUSIC3_PROFILE`
+
+The table above says which stage runs where. It does not say what each one
+*costs*, and at a real duration that is the only question anyone asks. Set
+
+```sh
+VLLM_CPP_MUSIC3_PROFILE=1 minimax-music3-gen --model ... --duration 20 --steps 30 --device 1
+```
+
+and the engine prints a `MUSIC3_PROFILE` table to **stderr** when the request
+finishes: one row per stage with seconds, a call count, and its share of the
+request, then the resident-set size at each stage boundary.
+
+Read it as follows.
+
+* `leaf` rows partition the request and are the ones that add up. `span` rows
+  enclose leaves — `ar.TOTAL_loop`, `denoise.TOTAL` — and are printed for
+  context but never summed, so the table cannot claim more work than the run
+  contained.
+* `cnt` rows carry no time at all. They are the counts a split has to state to
+  be readable: frames, windows, requested steps.
+* `unattributed` is the glue between the leaves — chunk slicing, the overlap
+  blend, the Euler step, the WAV assembly. It is printed rather than spread
+  silently over the measured stages, so a bracket in the wrong place shows up as
+  a number instead of as a plausible share somewhere else.
+* the `calls` column on `denoise.dit_device` counts *steps*, not forwards: one
+  bracket covers both classifier-free-guidance branches, so the forward count is
+  twice it.
+
+It is **off unless the variable is set to `1`, `true`, `on` or `yes`**. Any
+other value, including a near miss like `y`, leaves it off — an operator who
+mistypes gets a run with no table rather than a run whose meaning quietly
+changed. With it off, no clock is read and no `/proc` file is opened.
+
+This is an attribution instrument, not a benchmark harness: it takes no GPU
+clock window, so its rows are a within-run **split** and must not be quoted as
+per-kernel or cross-box figures.
 
 **Measured, so expectations are calibrated rather than hoped for.** On a Jetson
 Thor (sm_110, 14 cores) the device arm was *slower* on a two-frame request
@@ -1990,8 +2326,10 @@ a stop token early.
 | `--port P` | `8000` | Bind port |
 | `--served-model-name N` | model dir basename | Model id in `/v1/models` and responses |
 | `--tokenizer-config F` | `<dir>/tokenizer_config.json` | Chat template / tokenizer config |
-| `--block-size N` | `32` | KV block size |
-| `--num-blocks N` | `256` | KV blocks |
+| `--block-size N` | `32` | KV block size. **Must be a multiple of 16** — the attention backends' `get_kv_cache_shape` refuses anything else, and the server now rejects it at startup rather than throwing during engine init |
+| `--num-blocks N` | `0` (auto, resolves to `256`) | KV block count, and vLLM's `num_gpu_blocks_override`. It wins over every other sizing knob. `0` means auto, which uses `--kv-cache-memory` when that is set and otherwise falls back to `256` blocks |
+| `--kv-cache-memory BYTES` | `0` (unset) | Absolute KV-pool size in bytes, vLLM's `kv_cache_memory_bytes`. The block count is this budget divided by the model's own bytes per block, summed across its KV groups, so it is correct on MLA and heterogeneous-KV architectures too. It ignores `--gpu-memory-utilization`, as vLLM does. A budget smaller than one KV block is refused at startup |
+| `--gpu-memory-utilization F` | `0.92` | **Accepted, and it does not size anything yet.** See [What `--gpu-memory-utilization` does not do yet](#what---gpu-memory-utilization-does-not-do-yet) |
 | `--max-model-len N` | `0` (config default) | Max sequence length |
 | `--max-num-seqs N` | `32` | Max concurrent sequences (also sizes the HTTP worker pool). Was `8`, which put a c8 client exactly on the batch ceiling; vLLM's own default is 1024, which we do not mirror because this also caps the padded decode-graph set. On a GDN/Mamba model under speculative decoding this also multiplies the recurrent state, which is sized `max-num-seqs x (k+1)`; an unservable budget is refused at load with the arithmetic |
 | `--max-num-batched-tokens N` | `0` (per-arch default) | Per-step token budget |
@@ -2003,8 +2341,8 @@ a stop token early.
 | `--tool-call-parser <name>` | `hermes` | Tool-call dialect (42 names over 38 families). `auto` detects from the chat template, `none` disables. For `gemma4`, OpenAI chat uses the text-seam parser (wrapped `<\|tool_call>` **or** bare `call:NAME{ARGS}`) so free-form / detokenized tool bodies still become `tool_calls`. **`inkling` needs `"skip_special_tokens": false` on the request today** — its whole grammar is special tokens and we have no `adjust_request` seam to force the flag off for you, so at the `true` default the detokenizer strips the markers before the parser runs ([#695](https://github.com/mudler/vllm.cpp/issues/695)). `--reasoning-parser inkling` is not registered at all ([#703](https://github.com/mudler/vllm.cpp/issues/703)) |
 | `--reasoning-parser <name>` | `none` | Reasoning parser (`think_auto`, `deepseek_r1`, `deepseek_v3`, `holo2`, `mistral`, `minimax_m2`, `minimax_m2_append_think`, `step3`, `olmo3`, `muse_glimmer`, `qwen3`, `mimo`). `auto` detects, `none` disables. `qwen3` and its `mimo` alias are the engine-backed adapter (one upstream class, two registry names): thinking is ON, so a marker-less stream is reasoning and a `<tool_call>` ends reasoning with no `</think>`. `auto` never selects it — a generic `<think>` template resolves to `think_auto`, which is the right default for hybrid-thinking models that may answer with no think block at all |
 | `--kv-transfer-config '<json>'` | (unset) | External KV connector, same JSON as vLLM's flag. See [docs/KV-OFFLOAD.md](KV-OFFLOAD.md) |
-| `--offload-config '<json>'` | (unset) | Weight offload, the same JSON vLLM's `OffloadConfig` takes (distinct from `--kv-transfer-config`, which offloads KV blocks). Parsed and validated at startup, so a malformed document, an unknown backend or a validator violation is refused before any model I/O; a backend/field mismatch is a warning, as upstream. **Enabling it fails startup on every model today**: no loader consults the offloader, so the engine refuses the configuration by architecture name rather than accept a budget that frees nothing. A config that leaves offloading disabled still parses and reports normally. On unified memory such as GB10 offload cannot help at all, because host and device share one pool. See [docs/WEIGHT-OFFLOAD.md](WEIGHT-OFFLOAD.md) |
-| `--speculative-config '<json>'` | (unset) | Speculative decoding (`mtp`, `dflash`, `ngram`), same JSON as vLLM's flag. For `mtp`, `num_speculative_tokens` sets the draft DEPTH and defaults to the checkpoint's `mtp_num_hidden_layers`, which is 1 on both gate checkpoints, so the default is unchanged. A value above it must be a multiple of it, mirroring vLLM. Depth cannot move the emitted tokens under greedy decoding, and no speed number is claimed above k=1 yet ([#81](https://github.com/mudler/vllm.cpp/issues/81)). What is gated on CPU at k=1..4 is that the propose runs `k-1` draft decode forwards per propose call, that k drafts reach the verify path, and that the drafts DELIVERED to the verify path vary with depth rather than repeating the first one. That last one is counted over a RUN and never per call, because a correct drafter may resample the same token and this fixture does. Two things are NOT gated there. A draft is never accepted at depth, because acceptance is zero at every depth on the synthetic gate model. And nothing here proves the draft at depth j came from the j-th forward. Both are owed to the GPU gate, which must close the second by comparing the per-depth acceptance RATE against a PADDED control rather than by asserting a non-zero acceptance count, because a padded drafter earns acceptance at depth whenever the target's own greedy continuation repeats a token. `dspark` speculates on the Qwen3.6 gate models (native + Speculators drafts), token-identically to speculative-off, but is not gated on speed: the cross-engine ratio is UNSETTLED, with a matched-and-warm paired measurement of 0.834x against the pinned oracle and the earlier 0.957x-0.989x figures taken against a single COLD oracle invocation on a machine that has since been reimaged. A GGUF target, or a target with no aux multi-tap, is refused by name (`SPEC-DSPARK`). Its sequential Markov sampling runs on device by default; `VT_DSPARK_DEVICE_SAMPLE=0` restores the host loop (token-identical, cost only). The speculative verify runs from a captured CUDA graph, worth +12.2%/+3.5% on the 35B cells; `VT_SPEC_DECODE_GRAPH=0` restores the eager verify (also token-identical). See [docs/SPECULATIVE-DECODING.md](SPECULATIVE-DECODING.md) |
+| `--offload-config '<json>'` | (unset) | Weight offload, the same JSON vLLM's `OffloadConfig` takes (distinct from `--kv-transfer-config`, which offloads KV blocks). Parsed and validated at startup, so a malformed document, an unknown backend, an unknown TOP-LEVEL key (the four legal ones are `offload_backend`, `uva`, `prefetch` and `vllm_cpp`) or a validator violation is refused before any model I/O; a backend/field mismatch is a warning, as upstream. **Enabling it fails startup on every model today**: no loader consults the offloader, so the engine refuses the configuration by architecture name rather than accept a budget that frees nothing. A config that leaves offloading disabled still parses and reports normally. On unified memory such as GB10 offload cannot help at all, because host and device share one pool. See [docs/WEIGHT-OFFLOAD.md](WEIGHT-OFFLOAD.md). The same document also carries the **`vllm_cpp` key**, which governs the tier BELOW this one — weights borrowed out of the file mapping rather than moved to host RAM — and which is live rather than refused: see [Streaming routed experts from disk](#streaming-routed-experts-from-disk-capacity-mode). A `vllm_cpp`-only document does not enable vLLM's offload backends and is not subject to the refusal above |
+| `--speculative-config '<json>'` | (unset) | Speculative decoding (`mtp`, `dflash`, `ngram`), same JSON as vLLM's flag. For `mtp`, `num_speculative_tokens` sets the draft DEPTH and defaults to the checkpoint's `mtp_num_hidden_layers`, which is 1 on both gate checkpoints, so the default is unchanged. A value above it must be a multiple of it, mirroring vLLM. Depth cannot move the emitted tokens under greedy decoding, and no speed number is claimed above k=1 yet ([#81](https://github.com/mudler/vllm.cpp/issues/81)). What is gated on CPU at k=1..4 is that the propose runs `k-1` draft decode forwards per propose call, that k drafts reach the verify path, and that the drafts DELIVERED to the verify path vary with depth rather than repeating the first one. That last one is counted over a RUN and never per call, because a correct drafter may resample the same token and this fixture does. Two things are NOT gated there. A draft is never accepted at depth, because acceptance is zero at every depth on the synthetic gate model. And nothing here proves the draft at depth j came from the j-th forward. Both are owed to the GPU gate, which must close the second by comparing the per-depth acceptance RATE against a PADDED control rather than by asserting a non-zero acceptance count, because a padded drafter earns acceptance at depth whenever the target's own greedy continuation repeats a token. `dspark` speculates on the Qwen3.6 gate models (native + Speculators drafts), token-identically to speculative-off, but is not gated on speed: the cross-engine ratio is UNSETTLED, with a matched-and-warm paired measurement of 0.834x against the pinned oracle and the earlier 0.957x-0.989x figures taken against a single COLD oracle invocation on a machine that has since been reimaged. A GGUF target, or a target with no aux multi-tap, is refused by name (`SPEC-DSPARK`). Its sequential Markov sampling runs on device by default; `VT_DSPARK_DEVICE_SAMPLE=0` restores the host loop (token-identical, cost only). The speculative verify runs from a captured CUDA graph, worth +12.2%/+3.5% on the 35B cells; `VT_SPEC_DECODE_GRAPH=0` restores the eager verify (also token-identical). The object is admitted key by key and NOTHING is dropped ([#1160](https://github.com/mudler/vllm.cpp/issues/1160)): the honoured keys are `method`, `num_speculative_tokens`, `model`, `prompt_lookup_min` and `prompt_lookup_max`, plus `draft_sample_method` and `rejection_sample_method` at their upstream defaults `greedy` and `standard`, which are what this engine implements. Any other value of those two names row `SPEC-ACCEPT-VARIANTS` and is refused. A name vLLM's `SpeculativeConfig` declares but this engine does not implement, such as `quantization`, is refused as exactly that, and any other name is refused as unknown with the accepted list. Before this the extra key was discarded, so `draft_sample_method=probabilistic` ran GREEDY and a misspelled `num_speculatve_tokens` took the default, both silently and both at exit 0. For `dspark`, `num_speculative_tokens` may no longer sit BELOW the draft checkpoint's block: DSpark drafts a block, our block is sized from this value alone, and a shorter one drafted a structurally wrong block in silence. It is refused now, before any weight is loaded, naming the block, the config key the block was read from, and the value given ([#1225](https://github.com/mudler/vllm.cpp/issues/1225)). The block is read from the draft config's `dspark_block_size`, or from `block_size` when that key is absent, which is the case on every published Qwen3 draft (`deepseek-ai/dspark_qwen3_4b_block7` and `RadixArk/Qwen3.8-27B-DSpark` both carry `block_size: 7`, so k must be at least 7). vLLM reads only the first key and accepts the shorter value. vLLM also builds its model config BEFORE its speculative config, so a command that names both a target directory it cannot open and a short `k` hears about the target there and about the `k` here. Those are the two recorded divergences, both argued in `.agents/specs/dspark-block-size-guard.md`. A k at or above the block behaves exactly as before. See [docs/SPECULATIVE-DECODING.md](SPECULATIVE-DECODING.md) |
 | `--language-model-only` / `--no-language-model-only` | off | Disable all multimodal input by setting **every** modality limit to 0, mirroring vLLM's flag of the same name. It is not a "skip the encoder" switch: the server then **refuses** a multimodal request with ``400 At most 0 image(s) may be provided in one prompt. Set `--limit-mm-per-prompt` to increase this limit.`` It does **not** free VRAM yet — nothing gates tower construction on it ([#607](https://github.com/mudler/vllm.cpp/issues/607) wave L3) |
 | `--limit-mm-per-prompt '<json>'` | (unset ⇒ 999 per modality) | Maximum multimodal input items per prompt, per modality, as the same JSON object vLLM's flag takes: `'{"image": 2, "video": 0}'`, or with profiling options `'{"video": {"count": 1, "num_frames": 32}}'` (the options are validated and ignored — they size dummy inputs for memory profiling, which this engine does not do). A limit can only **lower** what the model/seam supports, never raise it. Malformed JSON, a negative count, or an unknown option on `image` / `video` / `audio` is refused at startup rather than defaulted. An unknown option on any other modality name is dropped rather than refused, mirroring upstream, whose fallback `BaseDummyOptions` is the one such dataclass without `extra="forbid"`. Upstream's dotted spelling (`--limit-mm-per-prompt.image 2`) is not accepted here, as for `--kv-transfer-config` and `--speculative-config` |
 | `--enable-log-requests` / `--disable-log-requests` | on | Log each incoming request. Mirrors vLLM's flag of the same name |
@@ -2051,6 +2389,43 @@ aborts with `server: unknown argument '<flag>'`, including flags that are inert
 only because the capability is missing (`--tensor-parallel-size` and the other
 parallelism flags) — silently accepting those would let you believe you got
 tensor parallelism when you did not.
+
+#### What `--gpu-memory-utilization` does not do yet
+
+The flag is accepted, keeps vLLM's exact name and fraction semantics, and is
+then discarded. It does not size the KV pool. Passing
+`--gpu-memory-utilization 0.85` gives the same 256-block pool as passing
+nothing.
+
+Turning a free-memory fraction into a block count needs a profile run that
+measures what the weights and activations cost on the device first. That run is
+not implemented. It is `ROAD-V1-MEM` M3, tracked by
+[issue #83](https://github.com/mudler/vllm.cpp/issues/83), and it needs a GPU to
+gate.
+
+The flag is accepted rather than refused so that a published `vllm serve`
+command line runs here unchanged. Setting it prints this warning at startup, so
+a log never implies it took effect:
+
+```text
+vllm.cpp: WARNING --gpu-memory-utilization 0.85 was accepted but did NOT size the KV cache.
+vllm.cpp:   The profile run that turns a free-memory fraction into a block count is not
+vllm.cpp:   implemented yet (ROAD-V1-MEM M3, https://github.com/mudler/vllm.cpp/issues/83).
+vllm.cpp:   The pool fell back to 256 blocks. To size it today, pass
+vllm.cpp:   --kv-cache-memory <bytes> for an absolute KV budget, or --num-blocks <n> for an
+vllm.cpp:   exact block count.
+```
+
+To size the pool today, use `--kv-cache-memory` for an absolute byte budget or
+`--num-blocks` for an exact count. A run that never sets the flag prints
+nothing.
+
+**Warning.** On a unified-memory board such as NVIDIA GB10, a fraction of
+"device" memory is a fraction of the one pool the host shares, so it reserves
+host RAM as well. A value of 0.85 has hard-rebooted a GB10 box. When M3 lands
+and this flag starts to bind, choose the fraction on such a board against the
+whole 119 GiB pool and leave the host its headroom. Until then the flag reserves
+nothing, on any board.
 
 #### Context length vs the KV pool
 
@@ -2129,6 +2504,80 @@ Four caveats:
 Set `VLLM_MUSE_GGUF=<file>` (or `VLLM_MUSE_GGUF_LOAD=<file>` for the full
 materialization) to run `test_muse_glimmer_gguf` against a real checkpoint;
 without them the gate runs off committed header-only manifests.
+
+## Nemotron-3.5-Lightning-30B: the exact weights, and which arms run
+
+`NemotronHForCausalLM` is a hybrid: 6 GQA attention layers over a paged KV cache
+and 23 Mamba2 layers over a recurrent conv/SSM state, with MoE blocks between
+them. `examples/nemotron_h_gen` (`nemotron-h-gen`) drives it through the public
+C ABI and nothing else — `vllm_engine_load` + `vllm_complete_tokens` — against
+the committed oracle golden:
+
+```sh
+nemotron-h-gen --model "$CHECKPOINT_ROOT/nemotron-3.5-lightning-30b-nvfp4" \
+               --golden tests/parity/goldens/nemotron_35_lightning_greedy/oracle.json
+```
+
+`--golden-info` parses the golden and prints its geometry without loading a
+model, which is how you check the battery's shape before spending a 20.1 GiB
+load. `--load-only` stops after `vllm_engine_load`.
+
+### The checkpoint
+
+| field | value |
+|---|---|
+| repo | [nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4](https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4) — first party |
+| revision | `29f2d1746d8f41e316523194b19018707749b1b1` |
+| staged as | `$CHECKPOINT_ROOT/nemotron-3.5-lightning-30b-nvfp4` (a `hf download --local-dir` tree) |
+| on-disk total | 21 583 809 748 bytes (20.1 GiB) |
+| weights | `model-000{01..52}-of-00052.safetensors` + `model.safetensors.index.json` |
+| quantization | `config.json` (1 337 760 B) + `hf_quant_config.json` (928 085 B), the `modelopt_mixed` layout |
+| tokenizer | `tokenizer.json`, `tokenizer_config.json`, `special_tokens_map.json`, `chat_template.jinja` |
+| sha256 (first shard) | `672c8bda10fdec0256e0819e112d2aa3a936cc3e5d311a05fd3ff773ca9a44b9` for `model-00001-of-00052.safetensors` (743 427 168 B) |
+
+**A repo id alone is not a pin** — checkpoints get re-quantized in place under an
+unchanged name — so the revision is recorded, and it was verified rather than
+copied: the first shard on the gate host hashes to the value above, which is
+that revision's own LFS record for the file
+(`.cache/huggingface/download/model-00001-of-00052.safetensors.metadata`, whose
+sidecar names commit `29f2d174`). `tests/parity/hf_snapshot.h` resolves the
+directory and refuses a tree staged at any other revision, so
+`VT_NEMOTRON35_SNAPSHOT` is left UNSET for a gate run: setting it takes the
+explicit-directory escape, which is deliberately not revision-checked.
+
+    hf download nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4 \
+      --revision 29f2d1746d8f41e316523194b19018707749b1b1 \
+      --local-dir "$CHECKPOINT_ROOT/nemotron-3.5-lightning-30b-nvfp4"
+
+### The arms, and what each one costs you today
+
+The loader materializes all 18 487 tensors in the memory format the checkpoint
+ships them in, so nothing is silently widened at load. What differs between arms
+is **where the arithmetic happens**, and that is not something a token
+comparison can see, so it is written down here instead.
+
+| arm | state |
+|---|---|
+| bf16 layers, norms, the 6 GQA attention blocks | **device** |
+| MoE experts, NVFP4 W4A16 g16 | **device** (Marlin arena) |
+| FP8 W8A8 static Mamba2 input projections | **host** — the device arm is owed, [#940](https://github.com/mudler/vllm.cpp/issues/940) |
+| `lm_head`, NVFP4 W4A16 g16 | **host** — it refuses a non-CPU queue by name, so the forward's last step is a host projection and the model still returns host logits. Owed to A2-Q2b, [#810](https://github.com/mudler/vllm.cpp/issues/810) |
+
+And the arms that are **refused by name** rather than substituted:
+
+| arm | the refusal |
+|---|---|
+| GGUF k-quants / i-quants | not ported. A GGUF path is refused at load naming `.agents/specs/nemotron-h-model.md` §5b W7, because silently dequantizing to a supported path is exactly what a token gate cannot see |
+| the MTP draft head | deferred by name at load (W5) |
+| batched decode (`num_reqs > 1`) | refused at the forward. One request's KV pages and one request's recurrent state are carried per step; a multi-request step would be decoded as ONE concatenated causal sequence and would return plausible wrong tokens instead of failing. Owed to A2-B, [#810](https://github.com/mudler/vllm.cpp/issues/810) |
+
+### What has NOT been measured
+
+**No token gate result exists for this checkpoint yet.** The example above is the
+vehicle for it and the golden is committed, but the run itself is pending; the
+current state is recorded in `docs/BENCHMARKS.md` rather than left as silence,
+and nothing about the released checkpoint's output is claimed here until it is
+green.
 
 ## MiniMax-H3: video + audio generation
 
@@ -2451,6 +2900,13 @@ declarations in that header) suitable for `dlopen` / FFI / LocalAI integration.
 This line read `19` and `36` until 2026-08-17; both numbers were last true
 several ABI additions ago, and neither is derived by any gate.
 
+On native Windows/MSVC, the shared-library packaging lane keeps the runtime DLL
+name at `vllm` and gives the import/static archive the distinct name
+`vllm_shared`, so one build tree can hold the shared C ABI package and the
+static `vllm` archive without a filename collision. The same ABI smoke test
+therefore resolves the exported symbols through `LoadLibraryA` /
+`GetProcAddress` on Windows and `dlopen` / `dlsym` on POSIX.
+
 ```c
 #include "vllm.h"
 
@@ -2537,9 +2993,11 @@ or without the ComfyUI `model.diffusion_model.` prefix. Each family reads its ow
 knobs from `extras`. H3 takes `partition`. LTX-2.5 takes
 `audio_prompt_embeds_path` (the audio stream's conditioning, the twin of the
 seam's `prompt_embeds_path`, which carries the video stream), `pipeline_kind`
-(default `distilled_two_stage`; also `one_stage`, `dmd2`, `dfr`, `retake` and
-`t2a_one_stage`), `model_version` (only for a checkpoint that
+(default `distilled_two_stage`; also `one_stage`, `res2s_two_stage`, `dmd2`,
+`dfr`, `retake` and `t2a_one_stage`), `model_version` (only for a checkpoint that
 declares none), `dit_config_path`, `encoder_config_path`,
+`negative_prompt_embeds_path` and `negative_audio_prompt_embeds_path` (the
+negative half of the same fallback, for the unconditional forward),
 `allow_unported_modules`, `max_phase`, `prompt_embeds_valid_rows`,
 `upsampler_path`, `duration_head_path`, `lora_path` and `lora_strength` — twelve
 keys, which is `kKnownLoadExtras` (`ltx2_video.cpp:377-383`) in order. The two
@@ -3027,17 +3485,20 @@ CHECKPOINT_ROOT=... VLLM_CPP_LTX2_TOWER_E2E=1 \
 
 Recipes resolve on an EXACT `(pipeline_kind, model_version)` pair and refuse
 anything else by name rather than defaulting, because a plausible but wrong sigma
-schedule or guidance scale renders a video instead of failing. **Fifteen** pairs
-resolve, derived from `ResolveLtx2PipelineRecipe` (`ltx2_pipeline.cpp:1288-1333`):
+schedule or guidance scale renders a video instead of failing. **Twenty-four**
+pairs resolve, derived from `ResolveLtx2PipelineRecipe`:
 
-| `pipeline_kind` | resolving `model_version` |
-|---|---|
-| `one_stage` | 2, 2.3, 2.4, 2.5 |
-| `distilled_two_stage` | 2, 2.5 |
-| `dfr` | **2.5 only** |
-| `dmd2` | 2, 2.3 |
-| `retake` | 2, 2.5 |
-| `t2a_one_stage` | 2, 2.3, 2.4, 2.5 |
+| `pipeline_kind` | resolving `model_version` | what it also needs |
+|---|---|---|
+| `one_stage` | 2, 2.3, 2.4, 2.5 | — |
+| `distilled_two_stage` | 2, 2.5 | `upsampler_path` for its second phase |
+| `res2s_two_stage` | **2.5 only** | `upsampler_path` for its second phase |
+| `dfr` | **2.5 only** | `upsampler_path` |
+| `dmd2` | 2, 2.3 | — |
+| `retake` | 2, 2.5 | a source clip as a `frame_%06d.ppm` directory |
+| `t2a_one_stage` | 2, 2.3, 2.4, 2.5 | a text tower; no video VAE is asked for |
+| `a2vid_two_stage` | 2, 2.3, 2.4, 2.5 | `upsampler_path`, `lora_path`, and an `audio_path` on every request |
+| `ti2vid_two_stage` | 2, 2.3, 2.4, 2.5 | `upsampler_path` and `lora_path` |
 
 This list ran to ten until 2026-08-17, omitting `dfr` entirely and all four
 `t2a_one_stage` rows. **`dfr` at 2 is refused deliberately, not by oversight**:
@@ -3045,7 +3506,205 @@ DFR's base stage rests on generated keyframe slots, which need a checkpoint
 declaring `use_keyframes_abs_pos_embedding`, and the 2.0 distilled row predates
 that parameter — so resolving DFR onto it would build a recipe the engine must
 then refuse at load. Refusing at the recipe table names the version instead
-(`ltx2_pipeline.cpp:1306-1313`).
+(the `dfr` arm of `ResolveLtx2PipelineRecipe`, named rather than given as a line
+range because this row's own insertions above it staled the range once already).
+
+### `res2s_two_stage`: the high-quality preset, and why it is a sampler
+
+`res2s_two_stage` is `TI2VidTwoStagesHQPipeline`. Against the plain two-stage
+pipeline it changes the SAMPLER on both stages — the `res_2s` second-order
+method instead of Euler — and takes `LTX_2_3_HQ_PARAMS`: 15 steps, STG off,
+video rescale 0.45, cfg 3.0 video / 7.0 audio, modality 3.0. Those are not the
+only differences (stage 1 also loads the distilled LoRA, derives its schedule
+from the stage-1 latent shape, and runs a `GuidedDenoiser` where the plain
+pipeline runs a `FactoryGuidedDenoiser`), so do not read the sampler swap as an
+exhaustive list. It resolves at 2.5 only, because that preset is a plain
+constant upstream with no per-generation lineage to spread it over.
+
+Fifteen steps is not fewer forwards, and it is not even 15 model calls. The
+`res_2s` loop evaluates the denoiser TWICE per step — once at the step's sigma
+and once at the geometric mean of that sigma and the next — and once more at a
+terminal sigma the schedule injects. Stage 1's 15 steps is therefore 31 denoiser
+calls, and stage 2's frozen 3-step schedule adds 7, for **38 calls per render**.
+Stage 1 is also GUIDED, so each of its calls is three transformer forwards
+(conditional, unconditional, isolated-modality) against stage 2's one: **100
+transformer forwards** for a full render, where `one_stage` at its own 30-step
+default runs 30 calls. Expect the HQ preset to cost several times the 30-step
+arm and to look better, not to be faster.
+
+That is also why the preset cannot be reached by passing its numbers to another
+kind. `--steps 15` on `one_stage` renders a finished, correctly sized, plausible
+clip at a fraction of the model evaluations the preset was tuned for, and no
+property of the output says so. Ask for the pipeline, not for its step count.
+
+```sh
+ltx2-gen --pipeline-kind res2s_two_stage \
+         --prompt "a cinematic shot of ..." \
+         --height 1088 --width 1920 --frames 121
+```
+
+`pipeline_kind` is a LOAD knob, so this reaches the C API and the server too: a
+server started with `--video-extra pipeline_kind=res2s_two_stage` renders every
+request on the HQ preset.
+
+Three limits, stated rather than left to be found. The stage-2 spatial upsample
+is the same one `distilled_two_stage` uses and carries the same refusal when the
+checkpoint has no latent upsampler. The loop's SDE noise is drawn from this
+port's own generator rather than upstream's seeded `torch.randn`, so a render is
+not bit-comparable with Lightricks' — the same limit the ancestral arm already
+ships with. And stage 1's guidance asks for an isolated-modality pass, which the
+device-resident forward cannot perturb, so this preset is host-only until that
+is closed; both are recorded in `.agents/specs/ltx25-res2s-loop.md`.
+
+### Audio-to-video: rendering a clip around a soundtrack you supply
+
+`a2vid_two_stage` is `A2VidPipelineTwoStage`. Stage 1 denoises video at half
+resolution, guided, on a schedule derived from the recipe's own step count;
+stage 2 upsamples 2x and refines with the distilled three-sigma schedule. The
+soundtrack is your file throughout: it is encoded once, frozen at both stages,
+and handed back unchanged rather than round-tripped through the VAE.
+
+```sh
+ltx2-gen --dit ltx-2.5-22b-distilled-fp8.safetensors \
+         --dit-config ltx-2.5-transformer-config.json \
+         --video-vae ltx-2.5-video-vae-conv-bf16.safetensors \
+         --audio-vae ltx-2.5-audio-vae-bf16.safetensors \
+         --upsampler ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors \
+         --lora ltx-2.5-22b-distilled-lora-450-bf16.safetensors \
+         --pipeline-kind a2vid_two_stage --audio-path take.wav \
+         --prompt "a drummer in a small club" \
+         --width 128 --height 128 --frames 25 --out out/a2v
+```
+
+**No render on real weights is claimed for this recipe.** It is gated on reduced
+fixtures. Upstream's stage 1 runs the base `-dev-` transformer and puts the
+distilled adapter on stage 2 only; the command above names the distilled
+checkpoint this tree has measured elsewhere, so it is a shape to copy rather than
+a reproduced result.
+
+Three things this kind demands, each refused by name rather than defaulted:
+
+| What | Why | Where upstream says so |
+|---|---|---|
+| `--audio-path` on **every** request | the pipeline is "denoise video around this take"; without one the soundtrack is generated and the clip looks finished | `--audio-path` is `required=True`, `a2vid_two_stage.py:312-317` |
+| `--lora` naming the distilled adapter | stage 2 is a three-sigma refinement the base weights were never distilled for | `--distilled-lora` is `required=True`, `utils/args.py:1140-1155` |
+| `--upsampler` | stage 2's input is the upsampled stage-1 latent | `a2vid_two_stage.py:261` |
+
+`--audio-start-time` and `--audio-max-duration` window the take; the window
+defaults to the clip's own duration. A take shorter than the clip is refused
+rather than padded, and a longer one keeps its leading frames.
+
+**The distilled adapter rides stage 2 alone**, as upstream's does: stage 1 is
+built with `loras=tuple(loras)` (`a2vid_two_stage.py:107`) and stage 2 with
+`(*tuple(loras), *tuple(distilled_lora))` (`:114`), and
+`ltx-pipelines/CLAUDE.md:48` states the convention for TI2Vid, A2Vid and
+Keyframe alike. Until 2026-08-17 this page recorded the opposite as an
+unrepairable divergence, because adapters fused once at load and every phase saw
+them; [#1118](https://github.com/mudler/vllm.cpp/issues/1118) closed that. The
+engine still holds ONE DiT — upstream does too, since both of its
+`from_checkpoint` calls name the same `model_paths.transformer()` — and
+re-materializes the adapter's target tensors at the phase boundary instead of
+keeping a second weight set.
+
+**What that costs you, per render.** Moving one DiT between the two states is
+paid in wall-clock rather than in memory: a two-stage render does **two**
+rebinds, one at each phase boundary, and each re-opens `--lora` and reads every
+`lora_A`/`lora_B` factor pair before re-materializing the tensors they target.
+The adapter above is 8,899,889,568 bytes, so this is not free, and the DiT is
+left in stage 2's state so the next render pays the same two. **No number is
+published for it** — this recipe is gated on reduced fixtures and nothing has
+timed the boundary on real weights. Upstream spends memory here instead, holding
+two `DiffusionStage`s over one checkpoint, which does not fit one GB10.
+
+**The adapter `--lora` wants**, pinned by content rather than by name, because a
+LoRA repository can be re-quantized in place under an unchanged filename:
+`ltx-2.5-22b-distilled-lora-450-bf16.safetensors`, 8,899,889,568 bytes, 3320
+BF16 tensors forming 1660 `lora_A`/`lora_B` pairs,
+`__metadata__` `lora_rank` and `lora_alpha` both `450` and `model_version`
+`2.5.0`. This is upstream's `distilled_lora`, the one `--distilled-lora`
+(`required=True`) names. It is **not** the IC-LoRA
+(`ltx-2.5-22b-ic-lora-pixel-spatial-upscaler-x2-1.0.safetensors`, 327,322,640
+bytes), which is a different adapter for a different arm. Nothing here checks
+which one you passed: `requires_distilled_lora` refuses a load carrying **no**
+`--lora`, and that is the whole of it, so the two are told apart by the header
+facts above and not by the engine.
+
+The guider flags (`--video-cfg-guidance-scale` and the rest, spelled as the
+`video_cfg_guidance_scale` extras over the C API) reach stage 1 and are ignored
+by stage 2, which runs no guider at all — unlike `distilled_two_stage` and
+`retake`, which refuse them outright. `pipeline_kind` is a LOAD knob and reaches
+a server through `--video-extra pipeline_kind=a2vid_two_stage`, but `audio_path`
+is a per-generation extra and `/v1/videos` forwards none
+([#928](https://github.com/mudler/vllm.cpp/issues/928)), so every request to such
+a server is refused for the missing take. This kind is reachable from the C API
+and from `ltx2-gen`, and not over HTTP.
+
+### `ti2vid_two_stage`: the plain two-stage pipeline
+
+`TI2VidTwoStagesPipeline` — upstream's ordinary text/image-to-video two-stage
+arm. Stage 1 generates at HALF the requested resolution under classifier-free
+guidance on the **unadapted** model; stage 2 upsamples the latent 2x and refines
+it with the distilled adapter on a frozen three-sigma schedule and no guider.
+
+```sh
+ltx2-gen \
+  --pipeline-kind ti2vid_two_stage \
+  --checkpoint "$CHECKPOINT_ROOT/ltx-2.5/..." \
+  --upsampler-path "$CHECKPOINT_ROOT/ltx-2.5/.../spatial-upsampler.safetensors" \
+  --lora-path "$CHECKPOINT_ROOT/ltx-2.5/.../ltx-2.5-22b-distilled-lora-450-bf16.safetensors" \
+  --prompt 'a hot-air balloon over a wheat field at dawn' \
+  --height 704 --width 1216 --num-frames 121 --steps 30 \
+  --output-dir out/
+```
+
+`--lora-path` is **required** and the load is refused without it, mirroring
+`--distilled-lora required=True`. The adapter is the same
+`ltx-2.5-22b-distilled-lora-450-bf16.safetensors` the audio-to-video section
+pins by content above. There is **no** `--audio-path`: this pipeline generates
+its soundtrack, and the take that leaves is **stage 1's** — stage 2 refines the
+picture only and its audio is discarded, which is upstream's own behaviour.
+
+Height and width describe the FINAL output and must divide 64, because stage 1
+halves them and the result still has to land on the VAE's 32-pixel grid. A size
+that does not divide is refused rather than rounded.
+
+**Against the neighbouring kinds.** It is not `distilled_two_stage`, which
+builds one stage set, freezes stage 1's sigmas and gives 2.5 the ancestral
+stepper. It is not `res2s_two_stage`, which puts the adapter on **both** stages
+and runs the second-order sampler at 15 steps. And it differs from
+`a2vid_two_stage` in three fields: no take is required, the audio guider is the
+parameter table's row rather than the positive-only default, and the soundtrack
+comes from stage 1.
+
+**One behaviour is unique to this kind.** Its stage-1 sigma shift is fitted on
+the scheduler's fixed 4096-token anchor rather than on the target latent grid,
+because upstream calls `execute(steps=...)` with no latent. Every other derived
+arm in this engine still fits on the target grid, which for six of upstream's
+seven scheduler calls is a divergence
+([#1150](https://github.com/mudler/vllm.cpp/issues/1150)); `res2s_two_stage` is
+the one arm where the target grid is correct.
+
+**Which weights this was gated against: reduced CPU fixtures, and nothing else.**
+Upstream runs this pipeline on the FULL model
+(`ltx-2.5-22b-dev-transformer-bf16.safetensors`, 42,018,190,584 bytes, 4349
+tensors, 21.004 B parameters, pure BF16, `model_version` `2.5.0`), which is on
+the NAS and header-verified, and which `LTX25-BF16-DIT`
+([#1148](https://github.com/mudler/vllm.cpp/issues/1148)) made loadable. **What
+is owed is the run**: a comparison against upstream's own render on the same
+checkpoint, prompt and seed. Nothing here has been measured against it. Do
+**not** substitute a distilled transformer to try the arm out — the distilled
+scales are trained into those weights, so a CFG-guided stage 1 on top samples a
+trajectory they were never trained for and renders a plausible clip with nothing
+in its size, frame count, sample rate or errors to show it
+([#1137](https://github.com/mudler/vllm.cpp/issues/1137)).
+
+All three knobs this arm needs are LOAD extras, so a server supplies them with
+`--video-extra pipeline_kind=ti2vid_two_stage` and the same for `lora_path` and
+`upsampler_path`. Unlike `a2vid_two_stage` it needs no per-generation extra, so
+[#928](https://github.com/mudler/vllm.cpp/issues/928) does not stand in the way
+of `/v1/videos`. That is a statement about the request surface: the gated path
+is `vllm_video_engine_load` plus `vllm_video_generate`, which is what `ltx2-gen`
+drives, and no test here exercises the HTTP route end to end.
 
 ### Retake: regenerating a time window of an existing clip
 
@@ -3174,6 +3833,93 @@ and exists only for the f32 parity forward.
 a time so peak residency is the device copy plus one tensor, and it stages at
 load because host-resident weights measure 20 to 30 percent slower there.
 
+### The DiT is not always quantized, and the FULL model never is
+
+**`--dit` accepts an UNQUANTIZED bf16 transformer as of 2026-08-17**
+([#1148](https://github.com/mudler/vllm.cpp/issues/1148)). Until then `PlanDit`
+refused any DiT carrying neither `U8` nor `F8_E4M3`, and the file it refused is
+the one most of these pipelines need: upstream's table
+(`packages/ltx-pipelines/CLAUDE.md:17-30` @ `fd4ded7f`) marks `Full` or
+`Full + distilled LoRA` for `TI2VidOneStagePipeline`, `T2AOneStagePipeline`,
+`TI2VidTwoStagesPipeline`, `TI2VidTwoStagesHQPipeline`, `A2VidPipelineTwoStage`
+and `KeyframeInterpolationPipeline`. `one_stage`, `t2a_one_stage`,
+`res2s_two_stage` and `a2vid_two_stage` are all reachable here, so all four
+could previously only run against a *distilled* checkpoint — a different
+sampling regime that renders plausibly and says nothing.
+
+Nothing about the arm is a new decoder. Unquantized is upstream's ordinary case:
+`_DTYPE_CASTABLE` (`single_gpu_model_builder.py:51-57` @ `fd4ded7f`) is
+float32/float64/float16/bfloat16, and uint8-NVFP4 and float8 are what that file
+calls "quantized payloads". `Ltx2DitCheckpoint::quant` reports which of the
+three the file was, and a BF16 weight is stored as it is, so the memory format
+is what the checkpoint chose.
+
+**A dtype this loader cannot read is still refused, by name.** The refusal now
+lists the dtypes the file holds and the four encodings the loader materializes
+(BF16, F32, F8_E4M3 with an F32 `<name>_scale`, and U8 with an F8_E4M3
+`<name>_weight_scale` plus an F32 `<name>_weight_scale_2`). An `F16` DiT is the
+live case: upstream's castable set lists `torch.float16` and this port has no
+F16 materialization. The message it replaced said "use the L2 path", which was
+advice a reader could not follow — `Ltx2LoadDitFromSafetensors` *is* the L2 path
+and calls the refusing function on its first line.
+
+**The full model costs ~42 GB resident.** It is 21.004 B parameters at two
+bytes, not a widening: no path in this loader turns a bf16 weight into anything
+else, and `widen_to_f32` stays opt-in. That does not fit one GB10 beside a
+24 GB text tower, so the arm has been gated on reduced fixtures and on the real
+file's *header*; a full materialization and a render on real weights are still
+owed ([#1048](https://github.com/mudler/vllm.cpp/issues/1048)).
+
+### LTX-2.5 DiT weights: which file, and how to tell them apart
+
+Repo [`Lightricks/LTX-2.5`](https://huggingface.co/Lightricks/LTX-2.5) at
+revision `6c7e5e573ac1667efc83407806fe9b0b93730e60`, read from
+`/api/models/Lightricks/LTX-2.5` on 2026-08-17. Sizes below come from the same
+API's tree listing.
+
+| Arm | File under `diffusion_models/` | Bytes | sha256 |
+|---|---|---:|---|
+| unquantized bf16, FULL (dev) | `ltx-2.5-22b-dev-transformer-bf16.safetensors` | 42,018,190,584 | `792a2bad501ca03262c0bc2ce7a2949e85b142ce18e30894aad5bc849c8e7584` (the local copy; see below) |
+| unquantized bf16, distilled | `ltx-2.5-22b-distilled-transformer-bf16.safetensors` | 42,018,190,584 | not obtainable here |
+| NVFP4 (`nvfp4-prequant`), distilled | `ltx-2.5-22b-distilled-transformer-nvfp4.safetensors` | 18,721,548,408 | not obtainable here |
+| `int8-convrot`, REFUSED (ComfyUI-only) | `ltx-2.5-22b-dev-transformer-comfy-int8-convrot.safetensors` | 21,504,034,224 | not obtainable here |
+| `int8-convrot`, REFUSED (ComfyUI-only) | `ltx-2.5-22b-distilled-transformer-comfy-int8-convrot.safetensors` | 21,504,034,224 | not obtainable here |
+
+**The hub will not give you a content hash for this repo, and it does not say
+so.** `Lightricks/LTX-2.5` is gated — an unauthenticated `resolve` returns
+`Access to model Lightricks/LTX-2.5 is restricted` — and the tree API answers an
+unauthenticated caller with an `lfs.oid` that is **one character repeated 64
+times**, for every LFS file in the repo. It is the right length, it is
+lowercase hex, and `len(oid) == 64` passes. All 14 LFS files share it, which is
+the only cheap tell. So a pinning script that reads that field records five
+different checkpoints under one fabricated digest and reports success. Pinning
+the other four by content needs an authenticated fetch and is owed
+([#1048](https://github.com/mudler/vllm.cpp/issues/1048)); the dev row above is
+the sha256 of the copy on this project's NAS, computed locally, and it has not
+been compared against the published artifact because there is nothing here to
+compare it to.
+
+**The two bf16 transformers are exactly the same SIZE**, and the file name is
+the only cheap thing that separates them. Both are 4349 tensors, both carry the
+same four `__metadata__` keys with `model_version` `2.5.0`. So a mislabelled or
+re-downloaded copy cannot be caught by `ls -l`, and nothing here validates the
+checkpoint *class* at load
+([#1137](https://github.com/mudler/vllm.cpp/issues/1137)): pointing
+`--pipeline-kind res2s_two_stage` at the distilled file renders in the wrong
+sampling regime with no diagnostic.
+
+Read from the FULL model's own header on 2026-08-17, by parsing its
+677,616-byte JSON prologue and no payload: 4349 tensors, every one
+`model.diffusion_model.`-prefixed, **4059 BF16 and 290 F32**, zero names ending
+in `_scale`, `_scale_2` or `torchao_nvfp4`, 48 blocks,
+`keyframes_abs_pos_embedding` present and TRAINED as `BF16 [1, 4096]`, the 290
+F32 tensors being exactly the six `*scale_shift_table*` families, and the data
+end plus the 8-byte length plus the header equal to the file size.
+
+The `vonkaiser/LTX-2.5-FP8-NVFP4` FP8 DiT is a separate repo and is pinned where
+the FP8 recipes name it; it carries no `__metadata__` at all, which is why those
+recipes need `--dit-config`.
+
 The gate needs the three checkpoint headers, a vLLM checkout and an LTX-2
 checkout (the two nibble-order authorities); it reads a few hundred bytes at
 their own offsets and never a payload:
@@ -3199,6 +3945,104 @@ VT_MOE_EXPERT_STREAM_SLOTS=8000 \
                    --prompt "The capital of France is" --max-tokens 16
 ```
 
+### The same thing as config, and which one wins
+
+The residency knobs are also config keys, under the `vllm_cpp` key of
+`--offload-config` — the flag that already carries vLLM's weight-offload
+document. One flag covers both tiers: vLLM's own `uva`/`prefetch` keys move
+weights from the device to host RAM, and the `vllm_cpp` key governs the tier
+below that, where weights stay borrowed out of the file mapping.
+
+```sh
+./build/vllm-server --model /models/Qwen3.8-2.4T-A95B-UD-Q1_0-00001-of-00008.gguf \
+  --offload-config '{"vllm_cpp":{"mmap":{"enabled":true,"prefault":false},
+                                 "expert_stream":{"enabled":true,"slots":8000}}}'
+```
+
+| Key | Environment equivalent | Default |
+|---|---|---|
+| `vllm_cpp.mmap.enabled` | `VT_GGUF_MMAP` | on when weights stay quantized |
+| `vllm_cpp.mmap.prefault` | `VT_GGUF_PREFAULT` | on with mmap residency — **set it `false` for a model larger than memory** |
+| `vllm_cpp.expert_stream.enabled` | `VT_MOE_EXPERT_STREAM` | off |
+| `vllm_cpp.expert_stream.slots` | `VT_MOE_EXPERT_STREAM_SLOTS` | `64`; a real model wants thousands |
+| `vllm_cpp.expert_stream.slot_bytes` | `VT_MOE_EXPERT_STREAM_SLOT_BYTES` | the largest gate/up/down slice of the first MoE layer reached |
+
+Every field is optional, and an absent field means unchanged, so an
+`--offload-config` without a `vllm_cpp` key behaves exactly as it did before this
+surface existed — with one difference, described below: a misspelled key is now an
+error rather than being ignored. The same C ABI field carries it:
+`vllm_model_params.offload_config` is one string holding both halves, so a library
+client needs no new field.
+
+**A second engine in one process is legal.** "Absent means unchanged" applies to the
+install as well as to the parse: a later document is merged field by field over the
+installed one, so `{"vllm_cpp":{"mmap":{"enabled":true}}}` on a second engine changes
+`mmap` and leaves the first engine's `expert_stream` and slot count alone. Only two
+things cannot be changed once a model has used them — whether expert streaming is on,
+which is cached the first time it is asked, and the slot store's `slots x slot_bytes`
+reservation, which is fixed when the store is built. A document that would change
+either is refused at startup, naming the field and the value in force; a document that
+omits it, or asks for exactly what is in force, is accepted.
+
+**Precedence is `environment variable > config > built-in default`**, and it is
+deliberate: the `VT_*` variables exist so a benchmark arm is switchable without
+restarting the server with a new document, so `VT_MOE_EXPERT_STREAM=0` beats a
+config `"enabled": true`. The engine prints one line at startup naming the fields
+of the document it installed, and a second naming every variable that would win
+over one of them, because a configuration silently overridden by something
+exported weeks ago is the one way this precedence hurts. The first line reports
+what was ASKED FOR, not what the engine resolves: the streaming answer is cached the
+first time it is asked, so resolving it at startup would move that decision ahead of
+the weight load. That constraint binds `expert_stream` alone — `prefault` and `slots`
+could be resolved at startup, and `mmap` and `slot_bytes` need a built-in default only
+their caller knows — and the line reports the document for all five so it reports one
+kind of thing rather than a mixture. Read the two lines together: `expert_stream=on`
+beside `VT_MOE_EXPERT_STREAM (expert_stream) OVERRIDES` means the document said on and
+the variable decides.
+
+**Where the config form reaches, and where it does not.** It reaches the
+generate/chat server path (`vllm-server`) and the C ABI's
+`vllm_model_params.offload_config`, which is the whole of the library surface. It
+does NOT reach `vllm-cli`, nor the server's pooling/embedding and
+transcription-only paths, which build their engine parameters without the offload
+document at all — the mirrored `uva`/`prefetch` half is dropped there too, and has
+been since before this key existed. On those three, use the environment form
+above. Recorded under `## Owed` in
+[`.agents/specs/weight-residency-config.md`](../.agents/specs/weight-residency-config.md)
+with [#1135](https://github.com/mudler/vllm.cpp/issues/1135).
+
+**A misspelled key is refused at startup, not ignored — at every level of the
+document.** vLLM's own parser ignores a key it does not recognise, which is what
+lets this extension share the flag, and it is also what would make
+`{"vllm_cpp":{"mmapp":…}}` or `{"vllm-cpp":{…}}` start a server that quietly does
+not borrow its weights, discovered later as an out-of-memory kill. The hyphenated
+spelling is the likeliest typo of all, because every flag around it is hyphenated.
+So the whole document is enumerated and the offender is named:
+
+```text
+offload config: unknown key "vllm_cpp.mmapp" (expected one of: mmap expert_stream)
+offload config: unknown key "vllm-cpp" (expected one of: offload_backend uva prefetch vllm_cpp)
+offload config: unknown key "uva.cpu_offload_GB" (expected one of: cpu_offload_gb cpu_offload_params)
+```
+
+Every level means every level, the mirrored sub-objects included. The enumeration once
+stopped at the top level and inside `vllm_cpp`, which left the same hole one step down:
+`{"uva":{"cpu_offload_GB":10}}` started a server with a 0 GiB offload budget the
+operator believed was set.
+
+The four legal top-level keys are `offload_backend`, `uva`, `prefetch` and
+`vllm_cpp` — vLLM's three plus this extension — so a typo in the mirrored half
+(`uvaa`, or `cpu_offload_gbb` inside it) is refused on the same terms. Refusing is what upstream does with its own
+JSON config flags: vLLM builds its config dataclasses with a decorator that sets
+`ConfigDict(extra="forbid")` (`vllm/config/utils.py:68-69`), which is why
+`--kv-transfer-config` refuses an unknown key — and upstream has no
+`--offload-config` at all, so no upstream-legal document is refused by this.
+
+`VT_MOE_EXPERT_STREAM_STATS_EVERY` is **not** a config key, by decision: it
+changes only how often the statistics line below is printed, so it is the
+instrument rather than the configuration, and the config surface refuses it as an
+unknown key rather than accepting and dropping it.
+
 It applies to CPU keep-quant expert towers. On a device platform the expert
 slice is already device-resident and is served unchanged, and turning streaming
 on also disables the default-on grouped-MoE path, which stages the whole tower
@@ -3206,25 +4050,152 @@ and therefore cannot stream. The engine says that once on stderr rather than
 silently doing no streaming.
 
 **Read the statistics line before you believe any number you measure with it.**
-Every `VT_MOE_EXPERT_STREAM_STATS_EVERY` steps (default 16, `0` silences it) the
-engine prints:
+The engine prints one every `VT_MOE_EXPERT_STREAM_STATS_EVERY` steps (default
+16, `0` silences the periodic line), and **exactly one more when the process
+ends**, whatever the run did:
 
 ```text
 [expert-stream] steps=64 hits=141230 misses=37312 evictions=29312 fills=37312 bytes=92876505088 exhausted=0 advised=37312
 ```
 
-Two of those fields decide whether the run is measuring anything at all:
+**The final line is the one to read**, because it is the only one you are
+guaranteed to get. The periodic line is skipped whenever the step count is not a
+multiple of the interval, so a healthy five-token run prints none of them at the
+default 16; and it used to be skipped on `steps == 0` as well, which meant the
+one run that most needed reporting — the one where the step boundary is never
+reached — printed nothing at all. Treating absence as failure therefore reported
+VOID on a working lane. The final line crosses both of those skips, so it is
+printed even on a run of zero steps.
 
-- `steps` must advance. If it stays at 0 the decode step boundary is not being
-  reached and the cache will stop serving as soon as it fills.
+Two of the fields decide whether the run is measuring anything at all:
+
+- `steps` must advance. If the final line says `steps=0` the decode step
+  boundary is not being reached, and the cache stops serving as soon as it
+  fills — it will fall back to the memory mapping for the rest of the run.
 - `exhausted` must stay 0. Anything above 0 means slices were refused and read
   from the memory mapping instead, which is the slow path streaming exists to
   replace. The usual cause is a budget smaller than one step's working set:
   raise `VT_MOE_EXPERT_STREAM_SLOTS`.
 
-A run whose `steps` is 0 or whose `exhausted` is large is not a measurement of
+Read it together with the `[expert-stream] ON slots=...` banner, which is printed
+once when the lane builds its store. The four shapes are:
+
+| Banner | Final line | What happened |
+|---|---|---|
+| absent | absent | Nothing reached the streamed seam. A CUDA run (a device-resident expert is served unchanged), a checkpoint whose experts are not keep-quant towers, or a prompt that never reached an MoE layer |
+| present | present | The lane ran. Read `steps` and `exhausted` |
+| present | absent, and nothing called `ExpertStreamFlushStats` | The process did not reach its static destructors: a crash, a signal, or `_exit` |
+| present | absent, because `ExpertStreamFlushStats` was called | The internal gate seam took the process's single print, so teardown had none left to make. No shipped command or server path calls it, so an operator never reaches this shape |
+
+The last two shapes are keyed on the CALL and not on what stderr looks like,
+because stderr cannot separate them. `ExpertStreamFlushStats` prints the same
+line in the same shape as the periodic report, so "a statistics line already
+appeared mid-run" is also what a healthy run of 16 steps that then crashes
+produces. What distinguishes the two is whether the seam was called, and only a
+gate calls it.
+
+A run whose `steps` is 0, or whose `exhausted` is large, is not a measurement of
 streaming, whatever the startup line said. See
 [`docs/ENVIRONMENT.md`](ENVIRONMENT.md) for every knob and its parsing rules.
+
+### `--device cuda` refuses a checkpoint it cannot hold
+
+Streaming is a **host** capability. The GGUF mapping is borrowed in place on the
+CPU path, so a routed-expert tower costs no resident bytes, which is the whole
+reason a 369.96 GiB checkpoint serves on a 119.631 GiB box. A weight-staging
+device has no such lane: it copies every tower into device memory, one
+`cudaMalloc` per stacked `[E*N,K]` tower.
+
+For `Qwen3.8-2.4T-A95B UD-Q1_0` that is 276 towers of 1,275,068,416 bytes plus
+three of 2,818,572,288, so 335.62 GiB in total, against a pool `cudaMemGetInfo`
+reports as
+128,452,956,160 bytes (119.631 GiB). Until that lane exists
+([#1124](https://github.com/mudler/vllm.cpp/issues/1124)), the engine **refuses
+at load** and names what is missing:
+
+```text
+device 'cuda' cannot serve this GGUF: staging its weights needs at least N bytes
+(X GiB) of device memory across T tensors, the largest single allocation being M
+bytes (Y GiB, '<tensor>'), and this device's memory pool is B bytes (Z GiB).
+THE MISSING PART: ... there is no device-side expert slot store and no device
+streaming lane ... Use device=cpu, which serves this checkpoint today, or a
+checkpoint that fits the pool.
+```
+
+It used to load for 26 minutes, report ready, and then die on the first request
+with `vt cuda: cudaMalloc: out of memory` from inside the engine's busy loop
+([#1123](https://github.com/mudler/vllm.cpp/issues/1123)).
+
+The refusal is keyed on the measured condition and not on the device or the file
+format, so **a GGUF that fits the pool still loads on `--device cuda`**. Three
+things it deliberately does not do:
+
+- it never fires on a platform that does not stage weights, so every
+  `--device cpu` load is unchanged;
+- it never fires when no budget is known. Today exactly one platform stages
+  weights (CUDA) and exactly one probes a budget (CUDA, with `cudaMemGetInfo`),
+  so **every NVIDIA GPU this build runs on — discrete or GB10 — gets both the
+  probe and the refusal**, while ROCm, Vulkan and Metal answer
+  `needs_weight_staging() == false`: they read the GGUF mapping where it already
+  lies, so there is no staging allocation to fail and nothing for this check to
+  decide. What is owed there is the `Backend::DeviceMemoryInfo` probe CUDA does
+  not implement ([#1126](https://github.com/mudler/vllm.cpp/issues/1126)), which
+  is a different capability;
+- it counts **weights only**. The KV cache, activations, scratch pools and the
+  driver context are not in the bound, so a checkpoint just under the pool
+  passes this check and can still fail later;
+- it can also count a little **too much**: a tensor present in the file that this
+  load will not stage — the MTP / `nextn` block on a load with no speculator, 8.33
+  GiB of the measured 369.96 GiB checkpoint — is still in the sum, so a budget in
+  that narrow window refuses a weight set that would have fitted. Raise
+  `VT_DEVICE_WEIGHT_BUDGET_BYTES` if you land in it
+  ([#1136](https://github.com/mudler/vllm.cpp/issues/1136)).
+
+`VT_DEVICE_WEIGHT_BUDGET_BYTES` moves the budget: lower it when something else
+lives in the pool, or raise it (or set `0`) to suppress the refusal and get the
+late failure back. It does not make the model fit.
+
+**The instrument matters here.** `nvidia-smi
+--query-gpu=memory.total,memory.free,memory.used` answers `[N/A], [N/A], [N/A]`
+on a GB10, because host and device share one pool. `cudaMemGetInfo` answers
+honestly, and its `total` is EXACTLY `/proc/meminfo MemTotal`
+(125442340 kB) times 1024. Do not size this from `nvidia-smi`.
+
+## Turning CUDA graph capture off, including the break seam
+
+`VLLM_CPP_CUDAGRAPH=0` disables CUDA graph capture. It always did for the six
+batched decode drivers that each read it, and as of `ENG-CUDAGRAPH-BREAK` W1
+(#1192) it is also the switch the shared break-point seam reads, once per
+process, into a function-local static — so a process is in exactly one lane for
+its whole life and nothing can toggle it mid-run.
+
+With capture off, or on a backend that reports no capture support (Vulkan,
+Metal, and the CPU backend), a `vt::GraphCaptureScope` is INERT: it captures
+nothing, every `vt::GraphBreak` inside it calls its function and returns, and
+the forward runs eager exactly as before. That path is byte-identical to the
+non-capturing forward and makes zero backend calls, which is what makes each
+migration stage reversible.
+
+Nothing about this is new configuration to learn: there is no new flag, no new
+config key and no new command. The seam is a library surface
+(`include/vt/breakable_graph.h`), and W1 registers one break point at the dense
+attention entry of `Qwen3ForCausalLM`. No production step opens a capture scope
+yet — that arrives when the decode drivers migrate onto the seam — so today the
+switch changes nothing about the break point beyond what it already changed
+about the decode graphs.
+
+Building it needs no option. `src/vt/breakable_graph.cpp` is part of the core
+`vllm` library on every platform, because the seam is backend-agnostic and asks
+nothing new of any backend.
+
+The switch is GATED, and it is gated in a child process, because it is read once
+per process into a function-local static and no test in a running process can
+toggle it. `tests/vt/test_breakable_graph.cpp` re-executes itself with
+`VLLM_CPP_CUDAGRAPH=0` and requires the inert behaviour on a backend that CAN
+capture — the arm that proves the switch itself is what turns capture off, rather
+than the backend's own lack of support. Asserting the backend arm instead
+substitutes a different condition, and dropping the switch from the seam left the
+whole suite green.
 
 ## SSE keepalives on long prefill
 
@@ -3275,8 +4246,12 @@ interval does.
 
 Dual-GPU resident FP8 MoE and SharedK-WMMA prefill are controlled via
 ENVIRONMENT.md (`VT_GEMMA4_RESIDENT_*`, `VT_ATTN_*`). Defaults stay safe off RDNA4.
-This PR does **not** restructure the Gemma-4 layer loop or enable decode hipGraph
-(those stay lab-only until a CUDA token-exact gate can land them).
+GetBlas keeps two per-thread hipBLAS handles (`tls_slots[2]`, device 1 → slot 1)
+so a 0→1 hop does not destroy GPU0's handle. `ProductGetBlasHandle` is the
+test accessor for that file-local `GetBlas`. HIP live probe is a separate CTest
+target (exit 77 if `HIP_VISIBLE_DEVICES` empty); it enters capture so production `StreamIsCapturing` is load-bearing. No new env. This PR does **not**
+restructure the Gemma-4 layer loop or enable decode hipGraph (those stay lab-only
+until a CUDA token-exact gate can land them).
 
 ## LTX-2.5 text conditioning
 

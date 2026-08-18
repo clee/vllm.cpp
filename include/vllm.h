@@ -319,7 +319,9 @@ typedef struct vllm_model_params {
    * --tokenizer-config. Ignored for a .gguf model_path, whose template comes
    * from the GGUF `tokenizer.chat_template` metadata. */
   const char* tokenizer_config_path;
-  /* KV-cache block size (tokens per block). <= 0 => 32. */
+  /* KV-cache block size (tokens per block). <= 0 => 32.
+     MUST be a multiple of 16: the attention backends' get_kv_cache_shape
+     refuses any other value, so a non-multiple throws from vllm_engine_load. */
   int32_t block_size;
   /* KV-cache block count OVERRIDE (vLLM num_gpu_blocks_override). > 0 pins the
    * pool to exactly this many blocks. <= 0 => AUTO: the pool is sized by the
@@ -426,12 +428,47 @@ typedef struct vllm_model_params {
    * when prefetch is enabled) fails vllm_engine_load with
    * VLLM_ERR_INVALID_ARGUMENT.
    *
-   * ACCEPTED BUT NOT YET ACTED ON: `ENG-WEIGHT-OFFLOAD` W0b wires the config
-   * surface end to end (CLI -> ABI -> EngineParams) and validates it; the
-   * offloader that would MOVE a weight is W2/W5. So a valid config parses,
-   * validates and is recorded, and no weight moves yet. It is spelled out here
-   * rather than left silent because a user who sets cpu_offload_gb and sees no
-   * memory change deserves to know it was accepted and is inert, not ignored.
+   * THE MIRRORED KEYS ARE ACCEPTED BUT NOT YET ACTED ON: `ENG-WEIGHT-OFFLOAD`
+   * W0b wires the `offload_backend`/`uva`/`prefetch` half end to end (CLI -> ABI
+   * -> EngineParams) and validates it; the offloader that would MOVE a weight to
+   * host RAM is W2/W5. So that half parses, validates and is recorded, and no
+   * weight moves yet. It is spelled out here rather than left silent because a
+   * user who sets cpu_offload_gb and sees no memory change deserves to know it
+   * was accepted and is inert, not ignored. This sentence covers ONLY those three
+   * keys.
+   *
+   * THE `vllm_cpp` KEY IS LIVE, and it moves weights (ABI v21, row
+   * `ENG-RESIDENCY-CONFIG`). The same string carries a vllm.cpp-ORIGINAL object
+   * for the tier BELOW upstream's: weights borrowed out of the GGUF file mapping
+   * rather than copied to host RAM, plus a bounded host slot cache for routed
+   * expert slices. Upstream has no disk tier, so there is nothing to mirror and
+   * the key names itself. Schema, every field optional and an absent field
+   * meaning unchanged:
+   *   {"vllm_cpp":{"mmap":{"enabled":bool,"prefault":bool},
+   *                "expert_stream":{"enabled":bool,"slots":int,
+   *                                 "slot_bytes":int}}}
+   * Precedence per field is environment variable > this document > built-in
+   * default, so an exported VT_GGUF_MMAP / VT_GGUF_PREFAULT / VT_MOE_EXPERT_STREAM
+   * / VT_MOE_EXPERT_STREAM_SLOTS / VT_MOE_EXPERT_STREAM_SLOT_BYTES still wins; the
+   * engine prints one line on stderr naming what it installed, plus a second line
+   * naming the variables that override it when there are any. The engine acts on it
+   * during weight load, so it must be installed before then, which vllm_engine_load
+   * does. Loading a SECOND engine in one process is legal: an absent field means
+   * unchanged, so a partial document is merged over what is installed rather than
+   * replacing it, and only a document that would CHANGE a decision the process has
+   * already taken — the streaming answer, or the slot store's geometry — is refused.
+   *
+   * REFUSALS ADDED WITH THAT KEY, all VLLM_ERR_INVALID_ARGUMENT before any model
+   * I/O: an UNKNOWN key anywhere in the document — a misspelled top-level key
+   * (`{"vllm-cpp":...}` with a hyphen, `{"uvaa":...}`), a misspelled key inside
+   * `vllm_cpp` (`{"vllm_cpp":{"mmapp":...}}`), and a misspelled key inside the
+   * mirrored `uva` or `prefetch` object (`{"uva":{"cpu_offload_GB":10}}`); a
+   * wrong-typed field; and a non-positive `slots` or `slot_bytes`. A typo is refused
+   * rather than defaulted because a silently disabled residency tier, or a budget
+   * the operator believes is set, is met as an out-of-memory kill rather than as an
+   * error. Upstream refuses one too: every vLLM config dataclass carries
+   * `extra="forbid"`. The four legal top-level keys are `offload_backend`, `uva`,
+   * `prefetch` and `vllm_cpp`. See docs/USAGE.md.
    * Borrowed for the call only. */
   const char* offload_config;
   /* ── Jump-forward decoding (ABI v10) ───────────────────────────────────────
@@ -482,7 +519,20 @@ typedef struct vllm_model_params {
    * the non-KV footprint; that profile run is not implemented yet
    * (ROAD-V1-MEM M3), so until it lands a struct with both other knobs unset
    * still falls back to the historical 256-block default — the zero-initialized
-   * struct's behaviour is unchanged from pre-v16. */
+   * struct's behaviour is unchanged from pre-v16.
+   *
+   * Since #1165 that fallback is no longer SILENT: a value > 0.0 here, with
+   * num_blocks and kv_cache_memory_bytes both unset, prints one warning per
+   * vllm_engine_load naming the block count that resolved instead and the two
+   * knobs that do bind today. Accepting a fraction and sizing nothing without
+   * saying so left callers believing they had sized the pool.
+   *
+   * Note that vllm_model_params_default() pre-fills this field with 0.92, so a
+   * caller who never touched it is indistinguishable from one who chose 0.92
+   * and does get the warning. That is deliberate: on this ABI there is no
+   * "flag not typed" state, and a struct carrying 0.92 into an engine that
+   * ignores it is exactly the case the warning is for. To opt out, spell the
+   * unset sentinel: set the field to 0.0. */
   double gpu_memory_utilization;
   /* kv_cache_memory_bytes: an ABSOLUTE KV-pool size in bytes. When > 0 it sizes
    * the block count directly (num_blocks = kv_cache_memory_bytes / bytes-per-

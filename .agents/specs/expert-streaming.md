@@ -1184,6 +1184,408 @@ funnels through exactly once per forward, as an RAII guard so a step that ends b
 throwing still ends. `qwen3_moe.cpp` composes the same MoE block from another
 translation unit and marks its own step for the same reason.
 
+## The observability review (#1091): the instrument could not report its own defect
+
+17 August 2026. A fresh review of the F1-F11 repair above returned FAIL on six
+findings. None of them was a red test. Every one was a gap in what the gate could
+see, which is the same class as the defect the repair had just fixed.
+
+**The statistics line could not print the number the docs told an operator to
+read.** `ReportStats` had exactly one caller, `EndStep`, and it returned early on
+`steps == 0`. So a run whose step boundary is never reached — F1, the reason the
+line exists — printed nothing at all. Measured on one binary with
+`VT_MOE_EXPERT_STREAM_STATS_EVERY=1`: healthy, 8 lines; F1 reinjected, 0 lines
+and only the startup banner. `docs/ENVIRONMENT.md` and `docs/USAGE.md` both told
+the operator to read `steps == 0` off a line that could not exist, and the
+**absence** was the signature.
+
+A second consequence found while acting on it: `stats_every_` defaults to 16, so
+a short healthy run prints nothing either. A benchmark that reads absence as
+failure therefore reports VOID on a working lane, which is what happened to the
+streaming benchmark and is why it had to be restarted.
+
+The repair is one final line, printed from the store's own destructor, once per
+process, crossing both early returns. Not a second teardown hook registered when
+streaming is REQUESTED, which was the first shape tried: on a CPU-only host that
+hook's only unique job — a run that asks for streaming and never builds a store —
+is not reachable by any test, because `Reserve` and `Get` are called from the same
+call chain. It would have been an untestable branch added to fix an
+untestable-branch problem. What replaces it is a protocol the docs now state:
+the `[expert-stream] ON ...` banner says a store was built, the final line says
+what it did, and each combination of present/absent means one thing. The docs
+carry four rather than three: an in-process flush through the exposed seam takes
+the once-flag, so a gate that calls it leaves the teardown line absent, and only
+a gate can produce that shape (#1106).
+
+**`CHECK(s.advised > 0)` could not fail for the defect it named.** Reinjecting the
+pre-fix unaligned `madvise` address exits 0 in 40 of 40 runs. The measured reason
+is that `> 0` over 48 calls is satisfied whenever heap layout happens to
+page-align a single slice, and one did: `advised=1` against `fills=48`. The
+assertion is now `advised == fills`, which is the true healthy invariant on this
+arm — madvise is issued on the mapping-copy path only, and only when the key is
+not already resident, which is exactly the condition under which `EnsureSpan`
+goes on to fill, with `exhausted == 0` asserted beside it as the premise. Verified
+stable over 50 consecutive runs before being asserted, rather than after.
+
+**"Every MoE entry point funnels through here exactly once per forward" was
+false.** Four more forwards reach `ExpertMlpKq -> KqExpertSlice`:
+`Qwen3_5Model::ForwardDense`, `Qwen3_5MTPModel::Forward`,
+`Qwen3_5MTPModel::ForwardPaged` and `Qwen3_5ReplayLayer`. One of them,
+`Qwen3_5MTPModel::ForwardPaged`, is the production spec-decode DRAFT forward, so
+a draft's acquisitions stayed `protected_this_step` across the following target
+forward — F1 at draft scale. This paragraph said "the MTP pair" until #1106
+finding 2 measured it; the other three are parity-only entry points, and that is
+recorded below and under `## Owed` as #1108.
+
+ONE FORWARD IS ONE STEP, and that is the call the draft forced. Folding a draft
+into the target's step would pin the draft's slots across a second forward for no
+benefit, so each draft gets its own step and a spec-decode iteration advances the
+clock once per draft plus once for the target. The opposite mistake is the one
+adding guards invites — a guard nested inside another ends the step twice, which
+decays every resident entry an extra tick for a step that never happened — so the
+guard now REFUSES to nest, stated as a precondition in the same idiom
+`MatmulF32Slice` uses for `expert >= 0` rather than handled. That refusal was
+STATED here and pinned by nothing, which the next review measured; see #1106
+below. `RunMoeBlock` stays
+deliberately unguarded: it is one block, not a forward, and qwen3_moe.cpp owns
+the boundary for the model that composes it. That exemption is what makes the
+`steps == 0` case above constructible without breaking anything.
+
+**Three more, smaller.** `EnsureFile` — the arm every real GGUF-mmap checkpoint
+takes — was reached by no test, so the `file_offset + offset` composition was
+unverified; it is now driven from a temp file at a deliberately awkward offset
+(4109 bytes: past a page, not on a page, not on a 34-byte Q8_0 block), and the
+arm is PROVEN rather than assumed by `advised` staying flat while `fills` grows,
+which is the one number that separates a pread from an `EnsureSpan`.
+`OwnedTensor::TowerUid`'s comment promised an identity for "this tensor's CURRENT
+bytes" while the code keys on `bytes.data()`; the comment now states where the
+guarantee stops, and a borrowed-buffer case pins both halves, because #1066 was
+that same overclaim on that same field. `SetForceFallback` has no production
+caller and was incrementing the operator-facing `exhausted_`, so a gate asking for
+the unstreamed arm told an operator to raise a budget that was never the reason
+(measured: `exhausted=42` from the switch alone); it has its own counter now, kept
+off the stderr line because in a production process it is always zero.
+
+Thirteen mutations, thirteen caught, each recorded with a non-empty
+`git diff --stat`, a zero compile status and a non-zero doctest case count. The
+first attempt at two of them was INVALID rather than passing — one did not build
+(`-Werror` on an unused variable), and two reported the CHILD process's doctest
+summary because a failing case dumps the child's output into the parent's log,
+so the first `test cases:` match in the file belonged to the child.
+
+## The review of that repair (#1106): three claims outran the code
+
+17 August 2026. A fresh review of the pull request above returned FAIL. The six
+functional repairs are correct and all thirteen mutation claims reproduce
+independently. What failed is what was said about them, and three of the four
+findings are the class that pull request was fixing.
+
+**The comment asserted a mechanism that does not exist.**
+`qwen3_5_internal.h` said the final line is reached "at process teardown: a
+static registered the first time streaming is requested, plus the store's own
+destructor, whichever runs first". There is no such static — the same pull
+request says in its own body that the hook was deliberately not built, and the
+grep for `atexit` returns nothing. It also claimed "exactly one line per
+process, even on a run with zero steps" without the two qualifiers `docs/USAGE.md`
+carries: a store must have been BUILT, and the process must RUN its static
+destructors. This is #1091 finding 5 — a comment promising more than the code —
+reintroduced one file away in the change that fixes it, which is the strongest
+argument on record that the class is a habit rather than an accident.
+`~Qwen35ExpertStream` is now named as the only production path to the LINE, with
+both qualifiers, and the note says what calling the exposed seam costs: it takes
+the once-flag, so it suppresses the teardown line for the rest of the process.
+The header says that `ExpertStreamFlushStats` itself has ZERO production callers
+and that the destructor does not route through it, because the first repair of
+this finding headed that comment "`~Qwen35ExpertStream` IS THE ONLY PRODUCTION
+CALLER" — true of the line, and read as a call that the destructor deliberately
+does not make.
+
+**"Nothing lands dead" was claimed for four step guards and holds for one.**
+Only `Qwen3_5MTPModel::ForwardPaged` has a production caller
+(`runner.cpp:2183` -> `spec_decode/mtp/speculator.cpp:107,262`). The other three
+sit in parity-only entry points: `Qwen3_5MTPModel::Forward` is reached only
+through `ForwardLogitsHost`, itself a "standalone parity convenience" with no
+caller outside `tests/`; `Qwen3_5Model::ForwardDense` is the parity reference by
+its own header; `Qwen3_5ReplayLayer` is per-layer parity replay. A call site
+inside a test is not reach. Nothing is deleted — the guards are correct where
+they sit and become live the moment any of those entry points gains a production
+caller, and adding the guard later WITH the caller is exactly how this row lost
+its step boundary the first time. What changes is the record: they are named as a
+staged slice that lands unreached, in the commit body, in the pull request body
+and under `## Owed` below, tracked as #1108.
+
+**The nesting refusal was asserted everywhere and pinned nowhere.** The source,
+the spec and the pull request body all stated that the guard refuses to nest.
+Deleting its `VT_CHECK` left both focused binaries fully green — 6/6 and 4/4 —
+and it appeared in none of the thirteen mutations. It is unreachable through
+production code by construction: every forward that takes expert slices is a
+complete forward that no other one contains, so no legitimate call graph nests
+one. `detail::ExpertStreamStepScope` exists for that and nothing else, and it
+forwards to the guard's own `Begin`/`End` rather than restating the flag, so a
+gate holding it measures the production boundary. The case asserts the refusal
+twice: a second scope throws, AND a real `ForwardDense` entered while the scope
+is held throws too — the second is what proves the two share a boundary rather
+than agreeing by coincidence, and a mutation that gives the scope a parallel flag
+kills only that pair.
+
+The refusal is deliberately NOT gated on `Qwen35ExpertStreamRequested()`. "One
+forward is one step" is a property of the call graph, not of the streaming lane,
+so a nest is a defect whether or not a store exists. Arming it only under
+streaming — the rare configuration — would let the default path establish a nest
+that nobody sees until someone turns streaming on, which is this row's recurring
+shape. The cost is that a nest reds every Qwen3.5 forward and not merely the
+streamed ones, and that is the intended polarity.
+
+**The MSVC repair was incomplete.** `::setenv` sat at namespace scope in both new
+gates with no `_WIN32` guard. It is POSIX; MSVC's CRT has only `_putenv_s`, the
+targets are added unconditionally, and `build-windows-release.ps1` configures
+`VLLM_CPP_BUILD_TESTS=ON` — so the translation units did not compile there at
+all, and the claim that the step-clock cases are "built everywhere" was false.
+Both now use `vllm_test::SetEnv` from `support/test_env.h`, which has been the
+one place that branch lives since #603. CI could not report it because the
+Windows lanes fail earlier, inside the product library, on #1068; a lane that
+never reaches a test translation unit cannot fail in one. The static checker that
+could have is blind to it twice over — it scans only the shipped-server sources
+and knows neither `setenv` nor `unsetenv` — filed as #1107 against
+`ENG-RELEASE-WINDOWS` and not fixed here, because changing a checker's semantics
+needs its own spec and red-before evidence.
+
+Three mutations on the added guarantee, three caught, each with a changed sha256,
+a zero compile status and a non-zero doctest case count: deleting the `VT_CHECK`
+(7 cases, 1 failed, all six assertions of the new case red, and `Steps()` reading
+3 where 1 is correct — the double-count the guard exists to stop); dropping
+`Open() = false` from `End` (7 cases, 4 failed); and giving the scope its own
+parallel flag (7 cases, 1 failed, exactly the two assertions that pin the shared
+boundary). The Windows repair is NOT mutation-proven: no MSVC is reachable from
+this host, and the checker that would have caught it statically is the subject of
+#1107.
+
+## `--device cuda` loads for 26 minutes and then dies: the allocation, named (#1123)
+
+17 August 2026. The same checkpoint that serves on `--device cpu` reaches a
+serving state on `--device cuda` on the same box and the same binary, and then
+dies on the first request with `vt cuda: cudaMalloc: out of memory` inside the
+EngineCore busy loop. The load succeeded, so the failure is the forward.
+
+The log line cannot say which allocation failed or how big it was:
+`CudaBackend::Alloc` is `Check(cudaMalloc(&p, bytes), "cudaMalloc")`
+(`src/vt/cuda/cuda_backend.cu:77-81`) and `Check` composes
+`"vt cuda: " + what + ": " + cudaGetErrorString(err)`
+(`cuda_backend.cu:48-52`), where `what` is the literal `"cudaMalloc"`. `bytes`
+is in scope and discarded. So the size was established from the code and the
+checkpoint rather than from the message.
+
+### The allocation
+
+`ResidentWeight` (`src/vllm/model_executor/models/qwen3_5.cpp:963-1025`) aliases
+the host bytes when `GetPlatform(...).is_cpu()` and otherwise **uploads the whole
+tensor**: `const size_t nb = w.bytes.size(); void* p = d.b.Alloc(nb);`
+(`qwen3_5.cpp:1010-1011`). For a routed-expert weight, `w` is the STACKED
+`[E*N,K]` keep-quant tower, so `nb` is one tower — every expert of one matrix of
+one layer, in one contiguous `cudaMalloc`.
+
+**Both switch positions of the keep-quant MoE path reach that same line**, which
+is why no knob avoids it. Every `f:N` below is a CALL SITE — the line inside `f`
+that invokes the next hop — never a definition line, so the chain can be walked
+one `sed` at a time:
+
+| Configuration | Path | Reaches |
+|---|---|---|
+| default (`VT_QWEN35_GROUPED_MOE` unset ⇒ on) | `MoeBlock:6615,6616,6620` → `KqGrouped:5694` | `ResidentWeight(d, w_kq)` |
+| `VT_MOE_EXPERT_STREAM=1` (which DISABLES grouping, `:5670-5676`) | `ExpertMlpKq:5651,5652` → `MatmulF32Slice:5611` → `KqExpertSlice:5595` | `KqResidentSlice:5114` → `ResidentWeight` |
+
+`KqExpertSlice`'s slot arm is guarded by `is_cpu()` (`qwen3_5.cpp:5578`), so on a
+device platform it falls through before the store is even constructed. That is
+the `## Owed` line "Streaming serves the CPU-resident borrowed tower only"
+observed from the other end: the lane that makes the model fit has no device arm,
+and the device path therefore asks `cudaMalloc` for every expert byte.
+
+Ruled out by reading, not by assumption. `src/vt/cuda/cuda_moe.cu` and
+`cuda_glue.cu` contain no allocation at all. `BuildMoeMarlinResident`
+(`qwen3_5.cpp:6010-6215`; its `E ×` per-expert allocations are `:6049-6064`, plus
+two repack temporaries at `:6094-6095`) does allocate unpooled, and it
+is NOT on this path: `MoeBlock` takes the fp4/Marlin arm at `:6555`, guarded by
+`const bool fp4 = !w.expert_gate_fp4.empty()` at `:6548`, and a GGUF keep-quant
+load populates `expert_*_kq`, not `expert_*_fp4`.
+
+### The size, measured from the checkpoint
+
+Both GGUF tensor tables of `unsloth/Qwen3.8-2.4T-A95B-GGUF` at revision
+`567d3e6ac26c5474b18311e619c04350fb9a5556` were re-censused independently of the
+earlier census in this spec, by HTTP range request over all ten shards, with no
+tensor data downloaded: **1702 tensor records parsed against the 1702 declared in
+`split.tensors.count`**, and the two numbers agreeing is the coverage claim.
+Shard 1 carries the 58 metadata keys and ZERO tensors; shards 2-10 carry the
+table.
+
+| Encoding | ggml | Tensors | Bytes | % bytes |
+|---|---|---|---|---|
+| IQ1_XXXS (routed experts) | 66 | 276 | 351,918,882,816 | 88.59 |
+| Q5_K | 13 | 420 | 23,391,633,408 | 5.89 |
+| Q6_K | 14 | 162 | 8,876,851,200 | 2.23 |
+| Q2_K (the `nextn` MTP block's 3 towers) | 10 | 3 | 8,455,716,864 | 2.13 |
+| Q4_K | 12 | 2 | 2,288,517,120 | 0.58 |
+| F32 | 0 | 838 | 2,171,133,440 | 0.55 |
+| Q8_0 | 8 | 1 | 142,606,336 | 0.04 |
+| total | | 1702 | 397,245,341,184 | 369.96 GiB |
+
+`expert_count = 512`, `embedding_length = 8192`,
+`expert_feed_forward_length = 2048`, `expert_used_count = 10`,
+`block_count = 93`. So one tower is:
+
+| Tower | Bytes | | Count |
+|---|---|---|---|
+| IQ1_XXXS `ffn_{gate,up,down}_exps`, dims `[8192,2048,512]` / `[2048,8192,512]` | **1,275,068,416** | 1.1875 GiB | 276 |
+| Q2_K `ffn_{gate,up,down}_exps` (block 92, the MTP layer) | **2,818,572,288** | 2.6250 GiB | 3 |
+| all `*_exps` | **360,374,599,680** | **335.62 GiB** | 279 |
+
+`1,275,068,416 / 512 = 2,490,368` bytes per expert slice, which is exactly the
+`slot_bytes=2490368` the W4 banner printed, so the arithmetic here and the
+running lane agree on the same weight.
+
+**So the answer to "which allocation and how big" is: `qwen3_5.cpp:1011`,
+1,275,068,416 bytes at a time (2,818,572,288 for three of them), 279 times,
+335.62 GiB in total.**
+
+### Why it fails, and why the loader does not
+
+The budget is measurable, and `nvidia-smi` is the wrong instrument for it: on
+this box it answers `[N/A], [N/A], [N/A]` for `memory.total,memory.free,
+memory.used`, and the `rc` fleet label likewise records `vram=[N/A]M`.
+`cudaMemGetInfo` answers honestly. Measured on `dgx:gpu0` under an `rc` hold,
+through `libcudart.so.13` in the `vllmcpp-build:gb10` image:
+
+```
+cudaGetDeviceCount rc = 0 count = 1
+cudaMemGetInfo     rc = 0
+free  = 122059919360 (113.677 GiB)
+total = 128452956160 (119.631 GiB)
+attr Integrated           rc=0 value=1
+attr UnifiedAddressing    rc=0 value=1
+```
+
+`total` is EXACTLY `/proc/meminfo MemTotal` (125442340 kB) times 1024, and equals
+the fleet's own `mem_total_bytes=128452956160`. **One unified pool, correctly
+reported by the CUDA runtime and not by `nvidia-smi`.**
+
+Against that pool, 335.62 GiB of tower staging is 2.8x the whole machine, and
+the total device-resident weight demand (towers plus the dense remainder, which
+this spec measured at 62 GiB resident on the CPU arm) is over 3x. The load
+survives because a borrowed tower costs ZERO anonymous bytes — that is the
+finding in "Why a 370 GiB model fits in 119 GiB" above. Staging converts each
+borrow into a real allocation, so the pool is exhausted after roughly
+`(119.6 - 62) / 1.1875 ≈ 48` towers, i.e. partway through layer 16 of 93, on the
+first forward. Hence: 26 minutes to READY, then death mid-stream.
+
+### The refusal: what it keys on, and what it deliberately does not
+
+Loading for 26 minutes and dying mid-stream is the worst of the three available
+behaviours, and AGENTS.md already says which one is right: refuse an
+unimplemented arm at load with a message that names the missing part. This
+change lands that refusal and nothing else. It does NOT build the device-slot
+arm; that stays owed below.
+
+The predicate is keyed on the MEASURED condition, never on "CUDA + GGUF" and
+never on an architecture name, because a GGUF that genuinely fits the pool must
+still load:
+
+```
+refuse  ⇔  needs_weight_staging()  ∧  budget_known  ∧  staged_lower_bound > budget
+```
+
+Three properties are deliberate.
+
+**A PER-TENSOR lower bound, and it is wrong in both directions.** Per tensor the
+bound is `min(gguf_bytes, elems × model_dtype_bytes)`. A weight the loader keeps
+quantized is staged verbatim, which is `gguf_bytes`; a weight it expands is staged
+at the model dtype, which is `elems × 2` for bf16. Taking the minimum makes each
+term a true lower bound on THAT tensor's staged size.
+
+It does not follow that the sum is a lower bound on the load, and the first
+version of this section claimed it did — "so the refusal can never over-refuse".
+The review that caught it supplied the counter-example, which is present on every
+default load:
+
+- **Over-count.** A tensor counted and never staged is a positive error. The MTP /
+  `nextn` block is attached only when a speculator is configured, so on a default
+  load block 92 of the target checkpoint — 20 tensors, 8,940,488,704 bytes, 8.33
+  GiB, **2.2506 %** — is counted and not staged. A budget in
+  `[what a default load stages, what this counts)` refuses a weight set that fits.
+- **Under-count.** The bound omits KV cache, activations, scratch pools and the
+  CUDA context, so a checkpoint at 0.95x of the pool still passes here and still
+  dies later.
+
+The two errors are on DIFFERENT quantities and do not cancel, so "the under-count
+dominates" is not an argument that the refusal is safe — it is an argument about a
+number the refusal never compares. `gguf_device_fit.h` said this correctly from the
+day it landed; the spec and the commit body did not, which is why the wording here
+is now the header's. `test_gguf_device_fit` carries a counted-but-unstaged fixture
+so the over-count direction is executable rather than described, and both remainders
+are owed: the over-count to [#1136](https://github.com/mudler/vllm.cpp/issues/1136),
+because closing it means teaching the bound which tensors THIS load will stage,
+which is load policy and not a property of the file; the under-count to the startup
+memory profile `KV-WARMUP-PROFILE` owns. A headroom fraction invented here would be
+the guess this bound exists to avoid, in either direction.
+
+**`total`, not `free`.** `free` at load time carries the page cache and whatever
+else the box is doing, so it makes the refusal a function of contention. `total`
+is a device property.
+
+**Unknown is not a verdict.** `ResidencyPolicy::device_memory_total_bytes` is 0
+on every platform that does not probe one, and 0 means UNKNOWN. A caller that
+cannot learn the budget declines to decide, so no non-CUDA device and no CUDA
+build without the probe changes behaviour. This is the polarity
+`gemma4_moe.cpp:506` chose for the opposite reason (it refuses the device
+allocation on unknown, because a hung `hipMalloc` is worse than a host
+fallback); here the risk runs the other way, since refusing a load on an unknown
+budget would break every device whose budget nothing reports.
+
+**Which platforms this actually covers**, because the first version of this
+section and `docs/USAGE.md` both got it wrong in the same way. The two predicates
+coincide on exactly one platform: `needs_weight_staging()` is true only on
+`CudaPlatform` (`src/vllm/platforms/cuda.cpp:71`) and a budget is probed only
+there. So **every** NVIDIA GPU this build runs on gets both the probe and the
+refusal — a discrete card is `CudaPlatform` too, not a separate case. ROCm,
+Vulkan and Metal answer `needs_weight_staging() == false` (ROCm says so
+explicitly, `src/vllm/platforms/rocm.cpp:74`), which means they read the mapping
+where it lies and have no staging allocation to fail: the refusal is not "owed"
+to them, it is inapplicable. What IS owed on ROCm is the separate
+`Backend::DeviceMemoryInfo` capability (#1126).
+
+The probe is added to `CudaPlatform`, which already includes `<cuda_runtime.h>`
+and already probes device attributes at registration, and NOT to
+`Backend::DeviceMemoryInfo`. That seam's comment claimed "ROCm/CUDA override with
+hipMemGetInfo/cudaMemGetInfo" and only ROCm does
+(`src/vt/rocm/rocm_backend.hip:358-365`). The comment is **corrected in this
+change**, in the two places that carried it: `include/vt/backend.h:78-93` on the
+seam, and `gemma4_moe.cpp:440-448` on the only call site — the second copy was
+found by this round's audit and is why the first correction alone would have left
+the claim in the tree. Overriding the seam would also silently wake `Gemma4MoE`'s
+device-expert LRU, whose `MakeRoom` refuses on CUDA today precisely because the
+query is absent (`gemma4_moe.cpp:506`). Waking another model's residency policy is
+a behaviour change with its own measurement, so it is filed rather than done.
+
+### Tests, and how the device branch is reached on a CPU-only host
+
+`needs_weight_staging()` is true on exactly one platform in this tree
+(`src/vllm/platforms/cuda.cpp:71`), so the branch is unreachable from the real
+loader on a host with no CUDA device — the untestable-device-branch shape this
+row has hit repeatedly. It is reached here by registering a FAKE staging
+platform in the CUDA lookup slot, which is the instrument
+`tests/vllm/entrypoints/test_device_selection.cpp` already established for
+exactly this reason, in its own executable so the global registry cannot leak
+into other suites.
+
+| Case | Instrument |
+|---|---|
+| the arithmetic, both directions and the boundary | `GgufStagedWeightFootprint` / `CheckDeviceWeightFit` over a table: `>` refuses, `==` and `<` do not, unknown budget does not, a non-staging platform does not, an F32 tensor is counted at bf16 and a quantized one at its GGUF size |
+| the bound's OVER-count direction | a fixture carrying a `blk.N.nextn.*` tensor a default load never stages: the footprint counts it, and both ends of the resulting over-refusal window are asserted, so the direction cannot be claimed away again |
+| the AUTO arm names the device the load will RUN on | a fake staging platform whose backend's `CreateQueue()` can be made to throw, driven through `FromModelDir` twice at the same budget: it refuses when the queue can be created, and refuses NOTHING when it cannot, because that load runs on CPU |
+| the CUDA residency policy assembles the probed budget | `CudaResidencyPolicy` in `platforms/interface.h`, unit-tested on every host, so the assignment is no longer reachable only in a CUDA build |
+| the refusal is REACHED from the loader | `LoadedEngine::FromModelDir` on a synthetic `qwen35moe` GGUF with the fake staging platform registered and a small `VT_DEVICE_WEIGHT_BUDGET_BYTES`: the thrown message is the fit refusal |
+| a fitting GGUF still loads | the SAME call with a generous budget: the throw is a LATER, different one (the synthetic file has no tokenizer), which is what proves the check let it through rather than that it never ran |
+| the CPU arm is untouched | the same file with `device=cpu` never refuses, whatever the budget |
+
 ## Owed
 
 Carried debt for this row. Each item names why it is not closed here.
@@ -1191,12 +1593,27 @@ Carried debt for this row. Each item names why it is not closed here.
 | Owed | Why it is open |
 |---|---|
 | **Re-measure decode on a LIVE cache.** The `docs/BENCHMARKS.md` decode figure for this row was taken with the step clock dead from token 3 onward and is void. | Needs `dgx.casa` and the 370 GiB checkpoint. The box was unreachable for this repair (`No route to host`), and this host has no CUDA device and cannot hold the model. |
-| **The `pread` path has never run on the model.** `EnsureFile` is gated by unit tests only. | Same host. Three earlier attempts were OOM-killed at 48.6 GiB anon beside another session's 32.6 GiB job. |
+| **The `pread` path has never run on the model.** `EnsureFile` now has a CPU-local gate that drives it through the production seam from a temp file and proves the `file_offset + offset` composition (#1091 finding 4), so it is no longer UNREACHED. It is still unmeasured on a real checkpoint. | Same host. Three earlier attempts were OOM-killed at 48.6 GiB anon beside another session's 32.6 GiB job. |
+| **A run that REQUESTS streaming and never builds a store prints no statistics line.** The `[expert-stream] ON ...` banner is absent in that case too, so no-banner means "nothing reached the lane" and banner-without-line means "the process died"; the docs state all four shapes. | A teardown hook that could report it is not reachable from any test on a CPU-only host, because `Reserve` and `Get` sit in one call chain and a device platform is what separates them. Landing it would have been an untestable branch added to fix an untestable-branch problem. Needs `dgx.casa` (see #1091). There is NO such hook in the tree: `~Qwen35ExpertStream` is the only production path to the final line, and it prints it directly rather than through `ExpertStreamFlushStats`, which has no production caller at all. The header now says both, rather than describing the hook that was rejected (#1106). |
+| **Three of the four step guards land UNREACHED.** `Qwen3_5MTPModel::Forward`, `Qwen3_5Model::ForwardDense` and `Qwen3_5ReplayLayer` are parity-only entry points with no caller outside `tests/`, so their `Qwen35ExpertStreamStep` guard is reached by no production path. Only `Qwen3_5MTPModel::ForwardPaged` is (`runner.cpp:2183` -> `spec_decode/mtp/speculator.cpp:107,262`), and even that caller is "UNREACHABLE unless a speculator is configured" (`runner.cpp:2120`) — so a DEFAULT-configuration run reaches none of the four, which is a weaker statement than "one of four is reached" and is recorded here rather than rounded up. Owning row `ENG-EXPERT-STREAM`; tracked as [#1108](https://github.com/mudler/vllm.cpp/issues/1108). | Nothing is deleted, because the guards are correct where they sit and cost nothing, and the alternative — add the guard later, together with the caller — is precisely how this row lost its step boundary in the first place. It closes when one of those entry points gains a production caller, or when they are retired as parity references. Neither is scheduled and neither should be forced by the record. |
+| **`check-windows-portability.py` cannot see this class.** It scans only the sources reachable from the shipped server target, so no test translation unit at all, and `setenv`/`unsetenv` are in none of its patterns. Tracked as [#1107](https://github.com/mudler/vllm.cpp/issues/1107) against `ENG-RELEASE-WINDOWS`. | Changing a checker's semantics needs its own spec, a red-before test and green-after evidence, which is a different unit of work from repairing two test files. Widening the scan to `tests/` also has to separate a guarded POSIX call from an unguarded one across a large surface, and that wants measurement rather than a guess. |
+| **The Windows repair is not mutation-proven.** Both gates now use `vllm_test::SetEnv`, and nothing here executed an MSVC compile of them. | No MSVC is reachable from this host, and the Windows CI lanes fail earlier in the product library on #1068, so they cannot report a test translation unit either way. The static checker that could have is #1107. |
 | **The `MADV_WILLNEED` readahead is unmeasured.** It is now well formed and counted; whether it moves decode is unknown. | Same host and the same OOM contention. No speedup is claimed anywhere for it. |
 | **Windows has no streaming.** `EnsureFile` throws `"EnsureFile needs pread"` on `_WIN32`, and `SourceOfSpan` returns `fd = -1` there, so the lane falls back to the mapping copy. | No `pread(2)`; needs an `OVERLAPPED`/`ReadFile` arm. Refused by name rather than silently degraded. |
 | **The CUDA arms of [#1029](https://github.com/mudler/vllm.cpp/issues/1029)'s grouped gate have not run on a device.** | Recorded in that issue, which stays open for it. Unchanged by this repair. |
 | **Streaming serves the CPU-resident borrowed tower only.** A staged device weight takes `KqResidentSlice`, so there is no device-slot arm. | Deliberate for phase 1 (copying a device-resident weight through host slots moves MORE bytes); W7 owns the pluggable backing store. |
 | **The grouped keep-quant MoE path and streaming are mutually exclusive.** `VT_MOE_EXPERT_STREAM=1` disables grouping and says so once on stderr. | Grouping stages the whole tower, which is what streaming exists to avoid. Making them compose needs a slot-aware grouped GEMM, which is its own row. |
+| **`--device cuda` still cannot SERVE a larger-than-pool GGUF; it only refuses by name now.** The device-slot arm is the missing capability: a `DeviceExpertSlotStore` behind `ExpertSlotStore`, a read accessor on that interface (`KqExpertSlice` reads `HostExpertSlotStore::Slot()`, the CONCRETE class, so the seam cannot be swapped today), a device filler that is not `pread`-into-host (`ExpertSlotStore::SlotForWrite` is handed straight to `::pread`, `expert_streamer.cpp:76-94`), and lifting the `is_cpu()` guard at `qwen3_5.cpp:5578`. Sized by the measurement above: 2790 slices per token at 2,490,368 bytes is 6.95 GB per token against a 119.631 GiB pool that already holds the dense remainder. Tracked as [#1124](https://github.com/mudler/vllm.cpp/issues/1124). | It is a campaign, not a fix: W7 (the pluggable backing store) is its declared owner in the work breakdown, and the CPU arm's own I/O rate is still unmeasured on a live cache two rows above. Building a device lane on top of a host lane whose bandwidth number is void would be optimising against a number nobody has. |
+| **The fit bound omits everything that is not a weight.** KV cache, activations, the scratch pools and the CUDA context are not counted, so a checkpoint at 0.95x of the pool passes the refusal and still dies on the first forward. | A headroom fraction invented here would be exactly the guess the per-tensor bound exists to avoid. The number wants the startup memory profile that `KV-WARMUP-PROFILE` owns (`INVENTORIED`; upstream's is `GPUWorker.determine_available_memory`, `vllm/v1/worker/gpu_worker.py:451-495`, around `profile_run`, `vllm/v1/worker/gpu/model_runner.py:682`), which is a different row. Those two anchors are stated here from the pinned tree because that row's own three anchors are stale at the current pin, and `gguf_device_fit.h` had copied two of them — filed as [#1139](https://github.com/mudler/vllm.cpp/issues/1139), owned by `KV-WARMUP-PROFILE`, blocked here only by the `engine-matrix.md` record lock #1119 holds. |
+| **The fit bound also counts too MUCH, and that direction can refuse a load that fits.** A tensor present in the file and not staged by THIS load is a positive over-count. On a default load that is the MTP / `nextn` block: 8,940,488,704 bytes, 8.33 GiB, 2.2506 % of the target checkpoint. A budget in that window refuses a weight set that would have fitted. | Not closed here. Closing it means the bound taking a per-tensor staging POLICY as input, which is the caller's knowledge and not the file's, and the exclusion's own failure mode is an under-count to nothing — which restores the 26-minute-then-OOM this row exists to remove, on a device nobody here has to measure it on. So the direction is stated in `gguf_device_fit.h`, pinned executably by `test_gguf_device_fit`, exposed to operators in `docs/USAGE.md`, and tracked as [#1136](https://github.com/mudler/vllm.cpp/issues/1136). `VT_DEVICE_WEIGHT_BUDGET_BYTES` is the way out of the window in the meantime. |
+| **`Backend::DeviceMemoryInfo` has no CUDA override, and waking it is not the one-line port of the ROCm one that #1126 describes: on CUDA it would wake a THROW.** Only ROCm implements it (`src/vt/rocm/rocm_backend.hip:358-365`), so `Gemma4MoE`'s device-expert LRU refuses on every CUDA device (`gemma4_moe.cpp:506`). Where a per-expert FP8 checkpoint is present, the expert's BF16 bytes are re-copied HOST->DEVICE on every use instead (`ExpertGeGLUHost`, `gemma4_moe.cpp:49-74`, reached at `:1515-1521`; the H2D is `:59-60` and it drains the queue per expert at `:73`), silently and for the life of the process. That H2D cost is CONDITIONAL, not present-tense: the whole device LRU is `ex.is_fp8`-gated (`:991`, `:1506`), and by point (1) below no such Gemma-4 checkpoint is pinned anywhere, so on CUDA today the LRU-MISS fallback is never even asked for. (A BF16 Gemma-4 checkpoint reaches `ExpertGeGLUHost` at `:1525` too, but through the host-weight branch the LRU never governs, so it is not a cost of the missing probe.) The name misleads: it computes on the DEVICE from host-resident weights, so what the dead LRU would cost is bandwidth and a per-expert `Synchronize`, not a wrong answer. | The CAPABILITY is [#1126](https://github.com/mudler/vllm.cpp/issues/1126) and is still not built. Note that the MERGED `#1126` index row cites `rocm_backend.hip:338-345`, which a later commit moved to `:358-365`. That row is append-only and is deliberately left alone: editing a merged row makes a union merge DUPLICATE it rather than merge it, which is a worse outcome than one stale number. This spec row carries the current anchor and is authoritative for it. The false COMMENT was corrected by this row in both places that carried it, `include/vt/backend.h:78-93` and `gemma4_moe.cpp:440-448`; both anchors were re-verified exact against `fd64c76ee`, as were `rocm_backend.hip:358-365`, `gemma4_moe.cpp:506`, `platforms/cuda.cpp:71` and `platforms/rocm.cpp:74`. SCOPE, because the previous headline read as coverage it did not have. The first review repair re-audited every anchor cited by the FOUR `## Owed` rows in this cluster — this one, the #1126 step-3 row, the #1197 row and the #1205 row — against the repaired tree: 53 examined, 53 exact, 0 stale. It audited those four rows and nothing else. The GitHub ISSUE BODIES were never in the audited set, and #1205's body was in fact 11 lines stale at `7beada17c` for exactly that reason. The second review repair widened the set: it re-derived every anchor in those four rows AND in the #1197 and #1205 issue bodies AND in the #1205 index row against the final tree — 71 examined, 71 exact, 0 stale after repair. Anchors from `gemma4_moe.cpp:549` onward moved by 22 lines in that repair, because the arm-existence guard it added sits at `:571`. **Four things were established while re-reading it for #1126, and each one raises the price of the override.** (1) *There is nothing to run it on.* The LRU needs `ex.is_fp8`, which only `LoadMoeFp8PerExpert` sets (`gemma4_weights.cpp:210-215`) from a per-expert `F8_E4M3` export; no such Gemma-4 checkpoint is pinned anywhere in `docs/USAGE.md` — all 32 lines there matching `gemma` case-insensitively were swept, and every checkpoint among them is the LTX-2.5 text tower (`gemma4-12b-with-proj*.safetensors`), not a per-expert FP8 MoE decoder, so the woken path cannot be exercised, here or elsewhere, until one is. (2) *The device-resident arm has no CUDA implementation to route into. It has a throw.* `ExpertGeGLUDeviceAccum` (`gemma4_moe.cpp:76-93`) READS as generic — `vt::MatmulBT`, `GeluAndMul`, `vt::MatmulBTAlphaBeta` — and an earlier draft of this row concluded from that reading that it "would run". It does not. `vt::MatmulBTAlphaBeta` (`src/vt/fused_ops.cpp:111-157`, dispatching at `:117`) is guarded on `#if defined(VLLM_CPP_HIP)` AND `q.device.type == kROCM`; its only implementation in the tree is `rocm::MatmulBTAlphaBetaRocm` (`src/vt/rocm/rocm_matmul_hipblaslt.hip:516`, declared `include/vt/rocm/rocm_matmul_batch.h:28`), and every other device falls through to a refusal. So the chain the override WOULD wake is: `EnsureGemma4Fp8ExpertOnDevice` (`gemma4_moe.cpp:548-608`) -> `lru.MakeRoom` (`:587`) succeeding as soon as `FreeBytes` can answer -> `true` at `:597` -> the call site at `:1508` -> `ExpertGeGLUDeviceAccum` at `:1509` -> `vt::MatmulBTAlphaBeta` at `:90` -> THROW, mid-decode. The `try`/`catch (...)` at `:585-607` wraps only the UPLOAD; the compute at `:1509` sits outside it, so the exception would propagate out of the decode step rather than degrading to the host fallback. **That chain is now cut at its first link.** `EnsureGemma4Fp8ExpertOnDevice` refuses at `:571` when `vt::HasMatmulBTAlphaBeta(d.q)` is false, BEFORE the upload, so the caller takes the `else` at `:1515-1521` — `EnsureGemma4Fp8ExpertCached` plus `ExpertGeGLUHost` — and the step answers instead of throwing. The refusal at `:90` stays as the backstop. It is latent today only because the other route into that function, `same_dev` (`:752-753`), needs `ex.gate_up_dev`, which is assigned nowhere but `src/vt/rocm/rocm_gemma4_experts.hip:207,226` — so the resident arm is UNREACHABLE off ROCm rather than safe. This is the actual blocker under #1126, it was recorded nowhere, and it is a stronger argument than the other three: filed as [#1205](https://github.com/mudler/vllm.cpp/issues/1205), and the refusal itself is now gated by `tests/vt/test_gemma4_rocm_fp8_seams.cpp`, which is what a CUDA implementation will have to satisfy. **Two corrections to the earlier draft's supporting claims, both of which overstated the case.** *The HIP-only list was one symbol too long.* Three of the four are genuinely HIP-only stubs inside `gemma4_moe.cpp`'s ONLY `#ifndef VLLM_CPP_HIP` block (`gemma4_moe.cpp:1596-1650`): `RunGemma4FusedTopkExpertGeGLU` (`:1621`), `PeerCopyGemma4Fp8ExpertSlice` (`:1629`) and `RunGemma4Fp8TopKOnExpertDevice` (`:1633`). `ExpertGeGLUDeviceBatched` (`:240`) is NOT: it sits OUTSIDE that block, in an anonymous namespace, with no HIP implementation and no header declaration, and is unconditionally `return false` under its own lab note (`:237-239` — gather+strided produced wrong tokens at ~23 t/s, pointer-batch ~0.8 t/s, serial/fused-gelu kept at ~34 t/s). It is disabled EVERYWHERE, ROCm included, so naming it beside the three inflated the ROCm/CUDA asymmetry. *The token-neutrality argument had the wrong mechanism.* The conclusion stands — the swap would not be token-neutral — but not because "the two arms sum the top-k experts in a different order". They do not: both run inside the SAME `for (int i = 0; i < top_k; ++i)` at `:1453`, so the summation order is identical. The real difference is ROUNDING and where the routing weight is applied. The resident arm folds `ww` into the GEMM `alpha` and accumulates in the epilogue with `beta` (`:1456`, `:1464`, `:90`), so the weight multiplies in the GEMM's own accumulator. The fallback writes the UNWEIGHTED product to a BF16 buffer (`:67`, `:70`) and applies `ww` afterwards with separate BF16 kernels — `vt::MulScalar` at `:1546` on the first expert, `MulScalar` plus `vt::Add` at `:1548-1549` on the rest. Two extra BF16 roundings per expert, with the weight applied post-rounding. (3) *The headroom test does not mean the same thing on the CUDA device this project gates on.* `MakeRoom` admits iff `free_b >= need + 1.5 GiB` (`:514`), a constant tuned on discrete dual R9700s where free VRAM is a quantity distinct from host RAM. On a GB10 it is not. This row already measured that `cudaMemGetInfo`'s `total` there is EXACTLY `/proc/meminfo MemTotal` times 1024, which is why it reached for that instrument where `nvidia-smi` answers `[N/A]`; its `free` is therefore reported over the same unified pool, and the host BF16 expert cache the device upload exists to relieve (`ex.cached_gu`/`cached_dn` via `EnsureGemma4Fp8ExpertCached`, bounded by the host LRU at `gemma4_moe.cpp:352`) is drawn from that pool too. So the admission test would double-count, on a box whose unified-memory OOM takes the host down with it. The `free` half is an inference from the measured `total`, not a second measurement, and it wants confirming on the device before any override lands. (4) *The gap is isolated, not a pattern.* Comparing overrides one by one across `src/vt/cuda/cuda_backend.cu` and `src/vt/rocm/rocm_backend.hip` at `fd64c76ee`, `DeviceMemoryInfo` is the ONLY optional `vt::Backend` seam ROCm answers and CUDA does not. |
+| **#1126's own closing plan, step 3, must be NARROWED before it is done: the load-time fit check may read the seam's `total`, and never its `free`.** The issue proposes that "the #1123 fit check can then read the budget from the backend seam on every platform that reports one". As written that invites the live half, which would be a defect — but the seam returns BOTH halves (`bool DeviceMemoryInfo(size_t* free_bytes, size_t* total_bytes)`, `include/vt/backend.h:94`), and only one of them is illegitimate here. | The tree holds two answers to "how much device memory", and they answer different questions. `vt::Backend::DeviceMemoryInfo(free, total)` is a LIVE probe that moves with contention; it is authoritative for a RUNTIME admission decision — can this allocation succeed right now — and for nothing else. `vllm::platforms::ResidencyPolicy::device_memory_total_bytes` is a TOTAL probed once at platform registration with `0 == UNKNOWN`; it is authoritative for a LOAD-TIME budget verdict, which has to be reproducible and independent of whatever else the box is doing. Sourcing the load-time verdict from `free` would make the same checkpoint load or be refused depending on the page cache, which is precisely the property **`total`, not `free`** above was chosen to avoid. Reading `total` through the seam is not that. It is contention-independent, it is the same quantity `ResidencyPolicy` already carries, and a seam that answers it on every platform is a defensible place to source it from. What step 3 must additionally preserve is the PROBE-ONCE semantics: `device_memory_total_bytes` is probed at platform registration (`include/vllm/platforms/interface.h:70-72`), and a per-load live call would reintroduce the contention dependence by the back door even reading only `total`, because a load-time verdict has to be reproducible from the record rather than from the moment. So the defensible statement, and the one this row asserts: **step 3 may read only `total`, never `free`, and must keep the value probed once at platform registration.** An earlier draft of this row said "never step 3" outright; that overstated it and would have blocked a legitimate simplification, so it is corrected here rather than quietly narrowed. Both seams already carry the division in prose (`include/vt/backend.h:90-93` and `include/vllm/platforms/interface.h:61-69`); it is restated here because #1126 is the record a reader of that issue will act on, and as filed it points the other way. What #1126 owes is its steps 1 and 2 together — the override AND the Gemma4 measurement, with [#1205](https://github.com/mudler/vllm.cpp/issues/1205) ahead of both — never step 1 alone, and step 3 only in the narrowed form above. |
+| **The device-expert LRU's slot cap makes its own eviction opt-in inert.** `MakeRoom` tests `slots.size() >= kMaxSlots` (`gemma4_moe.cpp:498`) BEFORE the eviction loop (`:499-500`), and `EvictOne` (`:457`, the device LRU's — a host-cache namesake sits at `:275`) is the only thing that SHRINKS `slots`. The one other statement that touches its size, `slots.clear()` in `DevExpertLru::Note` (`:522`), is a device-index RESET rather than an eviction: it drops bookkeeping when `dev != d.q.device.index` and frees nothing, and it is unreachable in a single-device process. It is named here so the next reader does not conclude the #1197 sweep missed it. So once 24 slots are resident `VT_GEMMA4_EXPERT_EVICT=1` never runs again and the cache degrades permanently to fill-only. It binds only when `24 * expert_bytes < BudgetBytes()`, so it is condition-dependent and silent either way. Tracked as [#1197](https://github.com/mudler/vllm.cpp/issues/1197). | Filed, not fixed, and for the same reason as the row above rather than for effort: the one-line repair wakes more `hipFree` under load, which the surrounding comments say has been observed as a permanent `kfd_wait` hang with the GPU idle and no decode tokens. The current ordering may well be deliberate belt-and-braces. Deciding that needs the dual-RDNA4 box `.agents/specs/gemma4-rocm-fp8-moe.md` describes; this host has neither a ROCm nor a CUDA device. It closes when the cap moves after the eviction loop and a run stays hang-free, or when the comment says the cap is by design — one of the two, not silence. |
+| **`vt::MatmulBTAlphaBeta` is ROCm-only and has no CUDA implementation at all, which is what #1126 step 1 is actually blocked on.** `src/vt/fused_ops.cpp:117` dispatches to `rocm::MatmulBTAlphaBetaRocm` (`src/vt/rocm/rocm_matmul_hipblaslt.hip:516`) under `#if defined(VLLM_CPP_HIP)` and `q.device.type == kROCM` — `src/vt/fused_ops.cpp:111-112` is the signature, not the dispatch — and every other device falls through to the refusal at `src/vt/fused_ops.cpp:152`. There is no CUDA, Vulkan, Metal or CPU arm. The full chain from the missing `DeviceMemoryInfo` override to that refusal is traced in the first row above. Tracked as [#1205](https://github.com/mudler/vllm.cpp/issues/1205). | The REFUSAL is fixed in flow, because a bare `std::runtime_error` reading "ROCm-only in this build" does not satisfy the standing rule that an unimplemented arm refuses with a message NAMING the missing part: a caller who hits it on CUDA cannot tell a missing kernel from a missing build flag. It now names the device that asked, names the one arm that exists, and names the issue (`:152`), and a kROCM queue — which reaches the same line in a build configured without `-DVLLM_CPP_HIP` — gets a DIFFERENT message naming the absent build flag (`:138`), because for that caller the kernel exists and telling them to write one would send them to fix the wrong thing. `tests/vt/test_gemma4_rocm_fp8_seams.cpp` gates both messages on a posed CUDA queue, on `kCPU`/`kVULKAN`/`kMETAL`, and on kROCM — mutation-proven by restoring the old message (RED), by deleting the refusal outright (RED), and by deleting the kROCM branch so that case falls to the generic message (RED). **Say plainly what that message change does and does not pin: a contract in a unit test, not observable behaviour.** The throw is unreachable off ROCm in any shipped configuration, so no production run can print either string today; what the test fixes is what a CUDA implementation has to satisfy when someone writes one. **The reachable half of this row is the GUARD.** `EnsureGemma4Fp8ExpertOnDevice` refuses at `gemma4_moe.cpp:571` when `vt::HasMatmulBTAlphaBeta(d.q)` is false, BEFORE the upload rather than after it, which converts the mid-decode exception traced above into the host fallback that was already sitting in the `else` at `:1515-1521`: slower, two extra BF16 roundings per expert, and correct. The predicate (`include/vt/fused_ops.h`, defined `src/vt/fused_ops.cpp:102-109`) is the same condition the dispatch at `:117` uses rather than a second copy of it, so the two cannot drift and writing the CUDA kernel wakes the device arm with no edit at the call site. It is gated by `tests/vllm/models/test_gemma4_moe_device_arm_guard.cpp`, which enters through `vllm::RunGemma4Moe` — the production layer entry `src/vllm/model_executor/models/gemma4.cpp:634` calls — and decorates the registered CPU backend so `DeviceMemoryInfo` ANSWERS, which is the post-#1126 state and the only state in which the guard binds at all. Deleting the guard makes that test RED with the exact `no implementation for device 'cpu'` throw; forcing `HasMatmulBTAlphaBeta` to `true` makes it RED too. A test that constructed the `Dev` or the LRU by hand would have stayed green under both. The IMPLEMENTATION stays owed and is what [#1205](https://github.com/mudler/vllm.cpp/issues/1205) tracks. It is not written here: a `beta`-accumulating BT GEMM on cuBLASLt is a kernel with its own correctness gate, the `DeviceMemoryInfo` row's point (1) above says there is no checkpoint to exercise it on, and this host has neither a ROCm nor a CUDA device to measure either arm. |
+| **`model_loader.cpp` is cited by absolute line number from 109 sites in 45 files, and this row's change moved them.** Measured between `e7d0a1f7c` and the repaired head: 203 moved line references over 109 citing sites, 10 unmoved. The file is ~1640 lines and almost every engine and model row edits it, so any edit near its top invalidates citations in files the editing change never opens. | Not swept here, deliberately, and the reason is not effort: several of the 109 were ALREADY stale (`model-matrix.md:197` cites `:184-223` as the "live loader"; line 184 at `e7d0a1f7c` is `static const bool once = [] {`), and rewriting all of them from the current tree would launder pre-existing debt into a clean-looking record. What IS fixed here is the two anchors this change authored itself, checked against the final tree. Tracked as [#1143](https://github.com/mudler/vllm.cpp/issues/1143), which lists the three candidate fixes; it needs a row of its own and is parked here because this row is what measured it. |
+| **The budget knob is an environment variable, not a config key.** `VT_DEVICE_WEIGHT_BUDGET_BYTES`. | `ENG-RESIDENCY-CONFIG` ([#1110](https://github.com/mudler/vllm.cpp/issues/1110), PR #1119) is in flight and adds exactly the `vllm_cpp` namespace inside `--offload-config` this key belongs in. Landing a second, competing config surface while that one is unmerged would create the conflict both changes then have to resolve. Migrate once #1119 lands; tracked as [#1127](https://github.com/mudler/vllm.cpp/issues/1127). |
+| **`EnsureGemma4Fp8NativeOnDevice` has the same missing-arm shape and no guard, and it is the DEFAULT arm.** The guard this row added covers the BF16 device-expert arm (`gemma4_moe.cpp:571`). Its FP8-native twin at `:611` does not have one, and `VT_GEMMA4_FP8_NATIVE` defaults to TRUE (`:969-974`), so on a per-expert FP8 checkpoint the expert loop reaches the twin at `:1359` and `:1484` FIRST. A `true` from it routes into `ExpertGeGLUFp8Native` (`:95-130`), which needs `vt::DequantFp8ChannelBf16` (`:117`, `:119`; refuses at `src/vt/fused_ops.cpp:194`) and `vt::MatmulBTAlphaBeta` (`gemma4_moe.cpp:128`; refuses at `src/vt/fused_ops.cpp:152`). Latent for the same reason and for exactly as long: its `MakeRoom` also needs `Backend::DeviceMemoryInfo`, so #1126 step 1 wakes this arm BEFORE it wakes the guarded one. Tracked as [#1218](https://github.com/mudler/vllm.cpp/issues/1218). | Not fixed in flow, and not for effort. The BF16 guard keys on ONE predicate that is the same condition its dispatch uses, which is what makes it honest. The twin depends on three different ops, so an honest guard for it needs a predicate per op; reusing `HasMatmulBTAlphaBeta` there would be a guard naming the wrong arm, which is the defect this row's own review just corrected in a refusal message. That is a distinct change with its own gate. Recording it is what stops the default arm being discovered by whoever lands #1126. |
+| **A production-entered gate for the guard exists; a production-entered gate for the REFUSAL MESSAGE does not, and cannot be built here.** `test_gemma4_moe_device_arm_guard.cpp` drives `vllm::RunGemma4Moe`, so the guard is measured as a capability. The message itself is only reachable when the guard is absent, which is precisely what that test forbids, so the message's own gate is a unit contract on a posed `vt::Queue`. | This is a property of the fix, not a gap in the test. A refusal that a correct program never reaches has no production path by construction; the alternative would be to leave the hazard unguarded so the string could be observed. Naming it here so no later reader reads the seams suite as a reachability proof. Closed when a CUDA `MatmulBTAlphaBeta` lands under [#1205](https://github.com/mudler/vllm.cpp/issues/1205) and the message stops being the answer at all. |
 
 ## Risks/decisions
 

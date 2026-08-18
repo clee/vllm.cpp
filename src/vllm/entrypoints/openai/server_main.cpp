@@ -57,6 +57,7 @@
 #include <chrono>
 #include <fcntl.h>
 #include <sys/stat.h>
+#include <unistd.h>  // ::getpid below; guarded because MSVC has no such header
 #include <thread>
 #endif
 
@@ -181,7 +182,13 @@ struct Args {
   // engine (needs the M3 profile run; inert until then). --kv-cache-memory: an
   // absolute KV-pool size in bytes that sizes the block count directly (0 =>
   // unset).
-  double gpu_memory_utilization = 0.92;
+  //
+  // TRI-STATE (FIX-GPU-MEM-UTIL-INERT, #1165), like enable_prefix_caching
+  // below: nullopt means the flag was NOT passed. It carries a value only when
+  // the user typed one, which is what lets the engine warn that a chosen
+  // fraction sized nothing without warning on a default nobody chose. A plain
+  // double pre-filled with 0.92 could not express the difference.
+  std::optional<double> gpu_memory_utilization = std::nullopt;
   long long kv_cache_memory_bytes = 0;
   int max_model_len = 0;  // 0 => config.max_position_embeddings
   int max_num_seqs = 32;  // see model_loader.h: 8 clamped c8 batching.
@@ -435,6 +442,14 @@ Args ParseArgs(int argc, char** argv) {
       a.served_model_name = NextArg(argc, argv, i, argv[0]);
     } else if (flag == "--block-size") {
       a.block_size = std::stoi(NextArg(argc, argv, i, argv[0]));
+      // The attention backends (FLASH_ATTN / ROCM_ATTN get_kv_cache_shape)
+      // enforce block_size % 16 == 0 and the runner validates at init — fail
+      // here with a clear message rather than at engine init.
+      if (a.block_size <= 0 || a.block_size % 16 != 0) {
+        std::cerr << argv[0] << ": --block-size must be a positive multiple of 16"
+                  << " (got " << a.block_size << ")\n";
+        Usage(argv[0], 2);
+      }
     } else if (flag == "--num-blocks") {
       a.num_blocks = std::stoi(NextArg(argc, argv, i, argv[0]));
     } else if (flag == "--gpu-memory-utilization") {
@@ -1106,6 +1121,23 @@ int VllmServerMain(int argc, char** argv) {
         std::fprintf(stderr, "[vllm.cpp] offload_config: %s\n", w.c_str());
       }
       engine_params.offload_config = std::move(off_cfg);
+      // ENG-RESIDENCY-CONFIG (#1110): the SAME document also carries the
+      // vllm.cpp-original `vllm_cpp` key, which governs the tier BELOW vLLM's —
+      // weights borrowed out of the file mapping rather than moved to host RAM.
+      // Two parsers over one string, each reading only its own half, is what keeps
+      // `include/vllm/config/offload.h` a byte-faithful transcription of
+      // `vllm/config/offload.py` (which has no disk tier) while still giving the
+      // operator one flag for one concept.
+      //
+      // Parsed HERE, beside the mirrored half, for the same reason: a mistyped key
+      // costs a second rather than a full load. The extension REFUSES a key it
+      // does not know, which the mirrored parser does not do — and that refusal is
+      // load-bearing, because a silently ignored `{"vllm_cpp":{"mmapp":...}}`
+      // starts a server running this tier at its defaults and is discovered as an
+      // out-of-memory kill instead of an error.
+      vllm::WeightResidencyConfig res_cfg =
+          vllm::parse_weight_residency_extension_json(args.offload_config);
+      if (!res_cfg.empty()) engine_params.weight_residency = std::move(res_cfg);
     }
     // --speculative-config: speculative decoding (SPEC-MTP I5d). Absent (default)
     // leaves the optional unset — the byte-identical no-speculation path. The
