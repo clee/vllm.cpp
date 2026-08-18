@@ -191,6 +191,56 @@ G3 is the one that settles §2. Until it runs, the divergence rests on upstream'
 own comment and on the absence of any block-shaped weight in our draft path, not
 on a measurement of our output. The row does not claim it.
 
+## 6a. G1 and G2 RESULTS (2026-08-18)
+
+CPU-only build, `-DVLLM_CPP_CUDA=OFF -DCMAKE_BUILD_TYPE=RelWithDebInfo`, at base
+`65d6cdaed`. No GPU on this host, so G3 and G4 stay owed.
+
+**G1 red, before the fix.** `test_dspark_block_size_guard` compiled cleanly
+(`compile_rc=0`, so this is a real result and not a build failure reading as a
+pass) and reported 8 cases with 4 passed and 4 failed, 17 assertions with 14 passed and 3
+failed, `Status: FAILURE!`. The four failures were the intended ones:
+
+```
+TEST CASE:  the loader refuses k below the draft's dspark_block_size
+  ERROR: CHECK_THROWS_AS( LoadedEngine::ResolveSpecConfig(params, vllm::HfConfig{}),
+         std::invalid_argument ) did NOT throw at all!
+TEST CASE:  the loader refuses k below the draft's block_size
+  ERROR: CHECK_THROWS_AS( ... ) did NOT throw at all!
+TEST CASE:  the refusal names the block and the k that was asked for
+  FATAL ERROR: expected a refusal for k=6 against a block-7 DSpark draft
+TEST CASE:  a Gemma4 draft's block_size defaults k
+  ERROR: test case THREW exception: speculative-config: method "dspark" requires
+         num_speculative_tokens (a DSpark draft config carries no n_predict)
+```
+
+The first two are the hole itself: a `k` below the block resolved without
+complaint on both the upstream-keyed and the published-checkpoint config shape.
+
+**G1 green, after the fix.** 8 cases with 8 passed and 0 failed, 22 assertions
+with 22 passed and 0 failed, `Status: SUCCESS!`. The assertion count rises from 17 to 22
+because the three previously-throwing cases now reach the checks past the
+refusal, which is the shape a real green has here rather than a muted one.
+
+No regression in the neighbours, each rebuilt and rerun at the same base:
+
+| Suite | Result |
+|---|---|
+| `test_speculative_dspark` | 9 cases, 9 passed; 30 assertions, 30 passed |
+| `test_loaded_engine_dense` | 19 cases, 19 passed; 87 assertions, 87 passed |
+| `test_speculative_unknown_keys` | 9 cases, 9 passed; 63 assertions, 63 passed |
+| `test_qwen3_dspark_config` | 8 cases, 8 passed; 25 assertions, 25 passed |
+
+**G2, the reachability mutation.** `keys.n_predict, keys.block_floor` restored to
+`std::nullopt, std::nullopt` at the `ResolveSpecConfig` call site only. The
+mutation compiled (`compile_rc=0`) and `git diff --stat` confirmed it applied, so
+neither of the two ways a mutation reads as a false pass is in play. The focused
+gate went back to 8 cases with 4 passed and 4 failed, `Status: FAILURE!`. The test
+therefore enters through the production call site rather than measuring the
+class. The file was restored and its sha256 checked equal to the pre-mutation
+value (`181250a7c130db41...`), and the suite returned to 8/8.
+
+
 ## 7. Risks and decisions
 
 **R1. The floor could be wrong about our implementation.** Upstream says a short
@@ -254,8 +304,13 @@ lines whole and re-applying its own argument lines. Both rows read the same
 ## Now
 
 `ACTIVE`, not `DONE`. The spec is committed,
-[#1225](https://github.com/mudler/vllm.cpp/issues/1225) is open, and W1-W3 land
-with it. W4 is owed and needs a GPU lease, so the row cannot reach `DONE` here.
+[#1225](https://github.com/mudler/vllm.cpp/issues/1225) is open, and W1-W3 have
+landed: the floor is threaded at both call sites, the red was captured before the
+fix, and the reachability mutation is recorded in §6a. W4 is owed and needs a GPU
+lease, so the row cannot reach `DONE` here.
 
 The divergence of §2 is decided and recorded rather than deferred, and G3 is the
-measurement that can overturn it.
+measurement that can overturn it. Until G3 runs, the claim this row makes is that
+a `k` below the draft's block is REFUSED, not that a `k` below the block would
+have garbled: the second is upstream's statement and our structural reading of
+the draft path, not our measurement.
