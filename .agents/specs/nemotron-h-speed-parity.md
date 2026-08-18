@@ -156,6 +156,37 @@ deviation in KV sizing, batching or sampling does not inherit the correctness
 evidence, and any such leg is reported as ungated rather than allowed to borrow
 coverage the gate does not give it.
 
+## What the first lease measured, and the two instruments it corrected
+
+Job `81a0cfb1-eaa3-46fc-b64f-d9fa0cab5ecf` on `dgx:gpu0`, 2026-08-18, produced no
+speed number and two corrections that the number depends on. Both are
+[#1253](https://github.com/mudler/vllm.cpp/issues/1253).
+
+**`nvcc --version` is not the toolkit postcondition.** The worker ships a PARTIAL
+CUDA 13.0: the compiler answers and the cuBLAS development component is absent.
+The harness installed nothing because `nvcc` answered, CMake then printed all
+five feature lines `ENABLED for [121a]` and failed at generate with
+`Target "vllm" links to CUDA::cublasLt but the target was not found`. The
+postcondition is `libcublasLt.so`, `cublasLt.h` and `Python.h`. This is #1185's
+"an environment repair must be unconditional and assert its postcondition"
+applied to a postcondition chosen wrong, which is a different defect from
+skipping the repair.
+
+**The oracle's recorded hazard is not what stopped it.** The model run did NOT
+reboot the box: peak host use was 28,534 MB of 122,502 MB and the watchdog never
+fired. It died on `Python.h: No such file or directory` inside `torch._inductor`,
+because Triton compiles `cuda_utils.c` at runtime and the worker has no
+`python3-dev`. That surfaces as `Engine core initialization failed ... Failed
+core proc(s): {}`, an empty proc set naming nothing, which reads as an oracle
+limitation and is a missing `-dev` package.
+
+**Contention has one usable instrument here.** `nvidia-smi
+--query-gpu=memory.used` reads `[N/A]` on GB10, so the compute-apps list is the
+only device-side one. At this lease's start it reported PID 10495 holding
+36,396 MiB from the PREVIOUS lease, later reaped by the controller. A benchmark
+that samples only `memory.used` on this box is blind to exactly the state that
+would void it, so the leg sampler records the compute-apps list instead.
+
 ## Owed
 
 - The oracle-side legs, if the oracle leg does not complete.
