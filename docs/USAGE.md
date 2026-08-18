@@ -596,7 +596,7 @@ quantizes the activation once; a checkpoint whose scales differ keeps the two
 separate GEMMs automatically. `VT_GDN_MERGED_QKVZ_FP8=0` restores the two GEMMs
 in the same binary.
 
-### Block-wise FP8 loads and does not run yet
+### Block-wise FP8 runs on CPU and refuses on CUDA
 
 Block-wise FP8, also called fine-grained FP8, keeps one scale for each 128x128
 block of a weight rather than one scale for the whole weight. A block-wise
@@ -610,27 +610,61 @@ checkpoint declares `quantization_config.weight_block_size` in its
 `self_attn.q_proj.weight` as `F8_E4M3` `[12288, 5120]` beside
 `self_attn.q_proj.weight_scale_inv` as `BF16` `[96, 40]`.
 
-That checkpoint now LOADS. The weights are read into a block-wise FP8 weight,
-the `BF16` scale is widened to `F32` by value the way vLLM widens it, and the
-config is cross-checked against the tensors so a disagreement is named rather
-than guessed at. Nothing can execute the weight yet, so the model refuses to
-finish preparing:
+That checkpoint now RUNS on a CPU queue. Ten projections of the Qwen3.5 dense
+model — `q_proj`, `k_proj`, `v_proj`, `o_proj`, the Gated-DeltaNet
+`in_proj_qkv`, `in_proj_z` and `out_proj`, and the MLP's `gate_proj`, `up_proj`
+and `down_proj` — quantize their activation per token per 128-wide group and
+then run a block-scaled GEMM whose scales apply in the mainloop, once per
+K-block, into an F32 accumulator. Each of the ten emits BF16, which is the
+model dtype and what vLLM emits at the same sites.
+
+Those ten projections are seven GEMMs, because `gate_proj` and `up_proj` run as
+one and `q_proj`, `k_proj` and `v_proj` run as one — the same two merged linears
+vLLM builds. A block scale belongs to a 128-row band, so the shards' scale grids
+concatenate exactly and the merged GEMM is byte-identical to the separate ones.
+
+That merge needs each projection in a group except the last to be a multiple of
+128 rows wide, which is what vLLM requires of the same checkpoints. A checkpoint
+that breaks the rule is refused by name, and the message says which projection
+and how wide it is, rather than quietly running a different arithmetic:
+
+```text
+block-wise FP8 merged 'qkv_proj': shard 'k_proj' has out_features 64, which is
+not a multiple of the quantization block's n 128. Only the LAST shard of a
+merged block-quant linear may be ragged
+```
+
+On a device with no block-scaled GEMM the model refuses while it is being
+prepared, before the first forward and before any CUDA graph is captured:
 
 ```text
 block-wise (fine-grained) 128x128 FP8 weights LOADED for
-model.layers.0.self_attn.q_proj and nothing in this build can execute them
+model.layers.0.self_attn.q_proj and there is no block-wise FP8 GEMM on device
+'cuda'. The linear method and the dense forward wiring are implemented and the
+CPU reference GEMM executes them, so this checkpoint runs on CPU today
 ```
+
+What exists on CPU is a correctness reference. It makes no speed claim, and no
+token-exact comparison against vLLM on this checkpoint has been recorded,
+because the GPU arm that would run one does not exist yet. Milestone M5 of
+[#1189](https://github.com/mudler/vllm.cpp/issues/1189) owns the
+mainloop-scaled CUTLASS kernel; [#1166](https://github.com/mudler/vllm.cpp/issues/1166)
+is the original report.
+
+One lever is incompatible with this arm. `VT_KV_CACHE_F32=1` selects an F32
+paged KV cache while `v_proj` keeps emitting BF16, and the KV write requires
+both to share one dtype, so it refuses. That affects every BF16 arm rather than
+this one; it is tracked as
+[#1249](https://github.com/mudler/vllm.cpp/issues/1249). Leave the lever unset,
+which is the default.
 
 Two block-wise configurations are refused earlier, at load, because no build
 here implements them: an `activation_scheme` other than `dynamic`, and a
 `weight_block_size` other than `[128, 128]`. Both messages name the key and the
 value your `config.json` declares.
 
-Nothing is wrong with those checkpoints; the missing arm is in this project. To
-run the same model today, use a per-tensor FP8, BF16, NVFP4, or GGUF checkpoint
-of it. Issue [#1189](https://github.com/mudler/vllm.cpp/issues/1189) tracks the
-remaining milestones, and
-[#1166](https://github.com/mudler/vllm.cpp/issues/1166) is the original report.
+To run this model on a GPU today, use a per-tensor FP8, BF16, NVFP4, or GGUF
+checkpoint of it.
 
 ### A per-tensor scale has to be one F32 number
 
@@ -656,6 +690,29 @@ per-output-channel arm itself is not implemented yet.
 
 `lm_head` is not affected. It has always read a per-output-channel scale
 correctly, as the table above records.
+
+### One load refusal that is about this code, not your checkpoint
+
+Almost every load refusal in this document names something your `config.json`
+or your tensors actually declare. Exactly one does not:
+
+```text
+dense loader: LoadQwen3_5DenseLayer was given a tensor-presence probe that
+answered YES for '__vllm_cpp__a_tensor_no_checkpoint_carries__', a name no
+checkpoint carries.
+```
+
+That name is not in your checkpoint and is not supposed to be. The loader asks
+about it to find out whether its own "is this tensor present?" predicate is
+capable of answering `no`, and this message means it is not. Your checkpoint is
+fine; please report it with the model you were loading
+([#1258](https://github.com/mudler/vllm.cpp/issues/1258)).
+
+The check exists because a predicate that only ever said yes shipped twice in one
+file, and what a reader saw was the *opposite* of the truth: a refusal naming a
+block-wise FP8 scale tensor the checkpoint had never contained
+([#1256](https://github.com/mudler/vllm.cpp/issues/1256)). A message that blames
+the wrong side costs more than the failure does.
 
 ### Architectures that resolve but refuse to run
 
@@ -4410,9 +4467,28 @@ ENVIRONMENT.md (`VT_GEMMA4_RESIDENT_*`, `VT_ATTN_*`). Defaults stay safe off RDN
 GetBlas keeps two per-thread hipBLAS handles (`tls_slots[2]`, device 1 → slot 1)
 so a 0→1 hop does not destroy GPU0's handle. `ProductGetBlasHandle` is the
 test accessor for that file-local `GetBlas`. HIP live probe is a separate CTest
-target (exit 77 if `HIP_VISIBLE_DEVICES` empty); it enters capture so production `StreamIsCapturing` is load-bearing. No new env. This PR does **not**
-restructure the Gemma-4 layer loop or enable decode hipGraph (those stay lab-only
-until a CUDA token-exact gate can land them).
+target (exit 77 if `HIP_VISIBLE_DEVICES` empty); it enters capture so production `StreamIsCapturing` is load-bearing. No new env.
+Prefill peer (#839) unpins dequant cache only after observed retirement; a failed fill/ready lease is retired with RetireFillLocked after the producer stream sync (never under cache.mu); restore-fail after publish retires before rethrow; failed retire quarantines the pin.
+This path does **not** restructure the Gemma-4 layer loop or enable decode hipGraph
+(those stay lab-only until a CUDA token-exact gate can land them).
+
+Contributor KEEP recipe (2x R9700 gfx1201, ROCm 7.2.4, `PREFIX_CACHE=0`, unique
+pads, 2026-08-13): SharedK-WMMA on, FLASH/FMHA off, `VT_GEMMA4_PREFILL_GEMM_M=2048`
+(the default), `VT_GEMMA4_PREFILL_PEER_ACT=1` (the default), batch MoE `T>=64`.
+Fair median prefill **2014 t/s @~11k** and **1099 t/s @~42k**; stream decode
+**55 t/s** temp=0. Paris / arith `63` / `gemma4` tool_calls held. Speculative,
+ngram, FMHA, and layer-split are **out of this recipe**. Details:
+[spec](../.agents/specs/gemma4-rocm-fp8-moe.md).
+
+These are contributor-lab numbers against **no denominator**: no pinned vLLM-ROCm
+run on the same box, same model, same quantization and same request shape exists
+for them, so `docs/BENCHMARKS.md` still records this backend as `PENDING: no
+binding throughput number` and this recipe does not change that. The decode
+figure is also not reproducible from the knobs above: the as-run recipe set four
+further decode splits that no product code in this tree reads
+([#845](https://github.com/mudler/vllm.cpp/issues/845)), and they are recorded in
+the spec rather than here, because a recipe on this page has to be one a reader
+can follow.
 
 ## LTX-2.5 text conditioning
 
@@ -5093,3 +5169,7 @@ length is the one the request's duration implies, and that it is **real audio** 
 non-zero, unclipped, non-constant, and with two channels that differ (the stereo
 fold is a contiguous split of the 128 latent channels, and an interleave produces
 a correctly shaped, correctly ranged, wrong song).
+
+Gemma-4 FP8 xdev prefill (`RunGemma4Fp8ExpertGeGLUPrefillOnExpertDevice`) is a
+Launch/Finish wrapper: cache pins stay live until host-observed `ev_e` retirement.
+Peer-pipe overlap stays off (slot 0 only).
