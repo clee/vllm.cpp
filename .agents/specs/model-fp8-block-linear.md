@@ -242,6 +242,17 @@ number appears anywhere in this row.
 
 ## Owed
 
+- **An f32 KV cache refuses this arm, and every other bf16 arm**
+  ([#1249](https://github.com/mudler/vllm.cpp/issues/1249)). This method emits a
+  bf16 `V` at `v_proj`, which is upstream's `out_dtype` and the model dtype, and
+  `vt::ReshapeAndCache`'s auto path requires `k`/`v` and the cache to share ONE
+  dtype — mirroring upstream's own `reshape_and_cache_flash`, which torch types
+  identically. So `VT_KV_CACHE_F32=1` refuses this arm. It refuses every bf16
+  arm in the tree the same way, so the defect is older and wider than this row
+  and closing it is a `vt` semantic change with its own spec and red-first test,
+  not a widening of M4. G3 therefore drives the PRODUCTION bf16 cache and says
+  in the source that it cannot drive the f32 one, rather than passing quietly on
+  a configuration nothing gates.
 - **There is no GPU kernel and there is no token gate.** What this row
   establishes is that the composition is correct against upstream's own
   reference and that a production entry point reaches it on a CPU queue. It does
