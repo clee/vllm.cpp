@@ -464,11 +464,71 @@ The difference between them is the e4m3 activation quantization, and every band
 in `tests/vllm/models/test_nemotron_h_mamba_device.cpp` is measured in the run
 against a defect the fixture separates.
 
+### 10.1 Thor (sm_110) RAN the arm, and it answers §3's question
+
+Measured 2026-08-18 under an `rc` lease on `thor:gpu0`, product tree behaviourally
+identical to this row's head (the later commits touch tests, scripts and one
+comment only). `cmake --build -j 4` returned 0. The feature table read
+**`ENABLED for [110]: 1 ; DISABLED cells: 7`** — only `marlin-nvfp4`, with
+`cutlass-fp8` and both `scaledmm-c3x` cells DISABLED.
+
+**That configuration is the whole point.** §3.1 measured Thor as having half an
+fp8 arm: the GEMM present through `kMatmulFp8CublasLt`, the activation quant
+trapped in a CUTLASS-gated TU. #991 moved the registration out. The arm running
+here, on a build with no CUTLASS fp8 at all, is what closes that question.
+
+`test_nemotron_h_mamba_device` reported **49 assertions** where a GPU-less box
+reports 4, so the device path executed rather than skipping:
+
+| case | result |
+|---|---|
+| fresh block vs host reference, T=1 / 8 / 12 | agreed 0.164 / 0.282 / 0.309 against a measured band of 0.5; 128 / 1024 / 1536 elements examined; 3 widths covered |
+| the fp8 tower uploads ONCE | first call 61760 B == expected 61760 B, second call 0 B |
+| refuses a dense projection, refuses a missing `input_scale` | both threw |
+| the carry across two legs | **FAILED, and the instrument was the defect** — see below |
+
+Neighbouring suites, same run, all `Status: SUCCESS!`: `test_nemotron_h_forward`
+16/16 (5716 assertions), `test_nemotron_h_paged_forward` 12/12 (3256),
+`test_nemotron_h_loader` 2/2, `test_nemotron_h_moe_device` 2/2 (29),
+`test_ops_mamba2_ssd` 12/12 (2095), `test_ops_fp8_cpu` 5/5 (62).
+
+### 10.2 The carry gate banded a defect smaller than the noise it had to accept
+
+The case banded the SECOND LEG'S OUTPUT against the separation of a dropped
+carry. Thor measured the second leg agreeing to 0.705 while a dropped carry
+separated by only 0.205, so the derived band (0.102) sat BELOW the deviation a
+FRESH leg already shows (0.164 at T=1, from the case above).
+
+That is §5.2's lesson arriving from the other direction. The two arms are W8A8
+against W8A16, so a fresh leg already disagrees by the e4m3 activation
+quantization and a second leg compounds that with the same disagreement
+propagated through the carried state. **A defect whose separation is smaller than
+the noise the comparison must accept is not resolvable from that comparison**, and
+widening the band until it passes is what §8.1 says to stop for.
+
+The repair gates what the carry IS: the STATE. A dropped carry hands the next leg
+zeros, so the separation between the advanced state and a zeroed one is 1.0 by
+construction — about six times the noise floor. The conv window and the SSM state
+are banded separately, each against its own zeroed twin. The noise floor is
+measured in the run at the same width and printed beside the separation, and the
+second leg's output carries an assertion only when the separation exceeds twice
+that floor, with the condition printed either way.
+
+The failure also exposed two fixture defects. `mamba_ssm_cache_dtype` was unset
+and resolved bf16 — NOT the configuration the paged forward selects the device arm
+for (`ssm_dtype == f32`), so the cheap arm was gating a path production does not
+take. And the whole file was a skip on a GPU-less box, so a CPU-runnable case now
+pins the op contract the split depends on.
+
 **What is still owed, and it is the acceptance test rather than a formality:**
-the §5.1 per-block numeric gate on the real checkpoint on both hosts, the A3
+the §5.1 per-block numeric gate on the real checkpoint, the A3
 `96/96 mode=decode STRICT PASS` re-run, the §5.3 mutations, and the GPU busy
 fraction — which must RISE from the measured 6.31% baseline, sampled with its
-denominator reported. `scripts/nemotron-h-a2q1-dgx-gate.sh` is the recipe.
+denominator reported. **The 6.31% baseline is a GB10 number, so only a GB10 run
+can be compared against it**; a Thor busy fraction measures different silicon and
+would answer a different question. The same-binary
+`VT_NEMOTRON_H_DEVICE_MAMBA=0` A/B is valid on either host.
+`scripts/nemotron-h-a2q1-dgx-gate.sh` is the recipe.
 
 ## 11. Owed
 
