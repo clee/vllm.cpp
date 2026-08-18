@@ -139,17 +139,16 @@ run_gate() {   # $1 = label, $2 = VT_NEMOTRON_H_DEVICE_MAMBA value
   ( while true; do nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader,nounits; sleep 0.1; done ) \
     > "$RUN/util_$label.txt" 2>/dev/null &
   local sampler=$!
-  local t0=$(date +%s.%N)
+  t0=$(date +%s.%N)
   VT_NEMOTRON_H_DEVICE_MAMBA=$flag "$BUILD/examples/nemotron-h-gen" \
       --model "$CKPT" \
       --golden "$SRC/tests/parity/goldens/nemotron_35_lightning_greedy/oracle.json" \
       > "$RUN/a3_$label.log" 2>&1
   local r=$?
-  local t1=$(date +%s.%N)
+  t1=$(date +%s.%N)
   kill "$sampler" 2>/dev/null
   wait "$sampler" 2>/dev/null
   echo "RC[a3 $label]=$r"
-  echo "wall seconds ($label): $(echo "$t1 - $t0" | bc)"
   grep -E "STRICT|PASS|FAIL|mode=|tok/s|per output token" "$RUN/a3_$label.log" | tail -20
   python3 - "$RUN/util_$label.txt" "$label" <<'PY'
 import sys
@@ -161,7 +160,13 @@ else:
     print(f"{sys.argv[2]}: GPU busy in {busy} of {len(vals)} samples = "
           f"{100.0*busy/len(vals):.2f}% busy (baseline 6.31%)")
 PY
-  grep -c "reference-tier" "$RUN/a3_$label.log" > /dev/null 2>&1
+  # The per-output-token time, DERIVED and shown with its terms, because the
+  # driver reports neither a rate nor a duration. Wall minus the engine load,
+  # over the tokens the run actually COMPARED -- printing a rate without the
+  # token count is the mute-instrument shape this row has already been bitten by.
+  python3 "$SRC/scripts/nemotron-h-a2q1-per-token.py" "$RUN/a3_$label.log" "$label" "$t0" "$t1"
+  # The reference tier is numerically CORRECT, so a pass obtained on it is
+  # invisible in the numbers and only this line separates them (spec R2).
   echo "reference-tier lines in $label: $(grep -c 'reference-tier' "$RUN/a3_$label.log")"
 }
 
