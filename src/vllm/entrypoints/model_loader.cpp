@@ -450,6 +450,49 @@ vllm::HfConfig MakeDsparkDraftConfig(const nlohmann::json& c) {
   return cfg;
 }
 
+// SPEC-DSPARK-QWEN3-ROUTING (#1193): the two keys upstream classifies a DSpark
+// draft by — `architectures` and `model_type` (speculative.py:882-887 and
+// :934-944 @ 555967922, plus vllm-project/vllm#52197). Nothing else is read.
+struct DsparkDraftIdentity {
+  std::vector<std::string> architectures;
+  std::string model_type;
+};
+
+// Read them off the draft's config.json, or nullopt when there is no config.json
+// to read. A GGUF draft (ResolveDflashDraftDir hands back the .gguf file itself)
+// and an HF repo id that is not in the local cache both land there, and both
+// already have their own precise error further down the load; refusing them HERE
+// would replace "draft checkpoint not found" with a classification failure.
+std::optional<DsparkDraftIdentity> ReadDsparkDraftIdentity(const std::string& path) {
+  std::error_code ec;
+  const fs::path cfg = fs::path(ResolveDflashDraftDir(path)) / "config.json";
+  if (!fs::exists(cfg, ec)) return std::nullopt;
+  std::ifstream f(cfg.string());
+  nlohmann::json doc;
+  try {
+    f >> doc;
+  } catch (const nlohmann::json::exception&) {
+    return std::nullopt;  // LoadDsparkDraft parses it again and reports this
+  }
+  if (!doc.is_object()) return std::nullopt;
+  // Classify the SAME document LoadDsparkDraft will load: the speculators layout
+  // carries no top-level `architectures`, and its translation writes
+  // ["Qwen3DSparkModel"] (qwen3_dspark.cpp, update_dspark).
+  if (vllm::Qwen3DSparkModel::IsSpeculatorsDsparkConfig(doc)) {
+    doc = vllm::Qwen3DSparkModel::TranslateSpeculatorsDsparkConfig(doc);
+  }
+  DsparkDraftIdentity id;
+  if (doc.contains("architectures") && doc.at("architectures").is_array()) {
+    for (const nlohmann::json& a : doc.at("architectures")) {
+      if (a.is_string()) id.architectures.push_back(a.get<std::string>());
+    }
+  }
+  if (doc.contains("model_type") && doc.at("model_type").is_string()) {
+    id.model_type = doc.at("model_type").get<std::string>();
+  }
+  return id;
+}
+
 // Load a DSpark draft: the DFlash backbone plus the Markov head plus, for a
 // reduced draft vocab, the d2t map (SPEC-DSPARK W5). Both published config
 // layouts are accepted; the tensor layout is identical between them.
@@ -877,6 +920,61 @@ std::optional<vllm::SpeculativeConfig> LoadedEngine::ResolveSpecConfig(
       throw std::invalid_argument(
           "speculative-config: method \"dspark\" requires num_speculative_tokens "
           "(a DSpark draft config carries no n_predict)");
+    }
+    // SPEC-DSPARK-QWEN3-ROUTING (#1193): classify the draft by its OWN config
+    // before resolving anything else. Upstream picks the DSpark lane from the
+    // draft's architectures and model_type (speculative.py:882-887 and :934-944
+    // @ 555967922, plus vllm#52197); this engine picked it from the CLI method
+    // string alone, so a `DSparkDraftModel` checkpoint loaded as a Qwen3 draft by
+    // OMISSION rather than by decision, and a DeepSeek-V4 one loaded far enough
+    // to fail on a missing key. This is the production caller
+    // `SpeculativeConfig::IsDsparkDraft` lacked.
+    if (cli.draft_model_path.has_value()) {
+      const std::optional<DsparkDraftIdentity> ident =
+          ReadDsparkDraftIdentity(*cli.draft_model_path);
+      if (ident.has_value()) {
+        std::string listed;
+        for (const std::string& arch : ident->architectures) {
+          if (!listed.empty()) listed += ", ";
+          listed += "\"" + arch + "\"";
+        }
+        // Upstream's detection (speculative.py:882-887 + #52197 hunk 1). A draft
+        // that fails it is precisely the set upstream's fallback rewrites into
+        // the DeepSeek-V4 lane, so it is refused with that lane named.
+        if (!vllm::SpeculativeConfig::IsDsparkDraft(
+                *cli.draft_model_path, ident->architectures, ident->model_type)) {
+          throw std::invalid_argument(
+              "speculative-config: the draft checkpoint at \"" +
+              *cli.draft_model_path +
+              "\" does not identify as a Qwen3 or Gemma4 DSpark draft: its "
+              "model id carries no \"dspark\", and its architectures [" +
+              listed + "] with model_type \"" + ident->model_type +
+              "\" name none of \"Qwen3DSparkModel\", \"Gemma4DSparkModel\" or "
+              "the \"DSparkDraftModel\" + \"qwen3\" pair "
+              "(vllm/config/speculative.py:882-887 @ 555967922 + "
+              "vllm-project/vllm#52197). Upstream routes exactly this set into "
+              "the DeepSeek-V4 DSpark lane (:934-944), and that lane is not "
+              "implemented here: DeepseekV4Model is a stub and it needs two "
+              "Sparks. Owed by row SPEC-DSPARK-QWEN3-ROUTING "
+              "(.agents/specs/dspark-qwen3-routing.md).");
+        }
+        // Upstream's normalization (#52197 hunk 2). Refuses the DeepSeek-V4
+        // fallback by name; see the tracked divergence on the function itself.
+        const std::string lane = vllm::SpeculativeConfig::ResolveDsparkArchitecture(
+            ident->architectures, ident->model_type);
+        if (lane != "Qwen3DSparkModel") {
+          // Not reachable from the three branches above, which all answer
+          // "Qwen3DSparkModel" or throw. It is the seam a further upstream lane
+          // (#52197's own context already carries a K3DSparkModel arm this pin
+          // does not have) arrives through, and LoadDsparkDraft implements one
+          // lane, so the arrival must be named rather than silently loaded.
+          throw std::invalid_argument(
+              "speculative-config: the DSpark draft at \"" + *cli.draft_model_path +
+              "\" normalizes to architecture \"" + lane +
+              "\", and the only DSpark draft lane implemented here is "
+              "\"Qwen3DSparkModel\" (LoadDsparkDraft)");
+        }
+      }
     }
     vllm::SpeculativeConfig resolved = vllm::SpeculativeConfig::ResolveDspark(
         std::nullopt, std::nullopt, cli.num_speculative_tokens);
