@@ -3155,9 +3155,10 @@ reason and it recurred: this 20-core x86-64 box was carrying three other
 sessions' `test_ltx2_video` runs and two full `ctest` builds throughout, at a
 1-minute load average between **39 and 52** (5-minute 71-92). A wall-clock e2e
 pair taken there measures somebody else's scheduler. The Thor per-stage pair —
-the one that would price this against §16.1's own profile — has now been taken,
-and its first result is **VOID** rather than pending. §16.6a records what it
-reported, why the number cannot be read, and what is in flight to replace it.
+the one that would price this against §16.1's own profile — has since been
+taken twice. The first result is **VOID** and §16.6a records why the number
+cannot be read; §16.6b is the corrected pair, and it measures **4.45x on the
+depth forward and 2.74x on wall** against the real checkpoint.
 
 **What replaces it.** The depth stage's inner loop is short enough to repeat, so
 the MINIMUM over rounds is available, and a minimum is the least-disturbed sample
@@ -3218,9 +3219,11 @@ fingerprint each and all 16 read `f0cfeed6eee4f55d`**. An earlier revision said
 one, which says this stage is closer to compute-bound on THIS box than the
 byte-per-MAC arithmetic suggested — a 20-core x86-64 with a large L3 is not the
 regime the ~46 GB/s figure in §16.4 was inferred from, and that figure came from
-a 14-core Jetson Thor with unified LPDDR5X. The two boxes may well land on
-different sides of it, which is precisely why the Thor pair is worth waiting for
-rather than predicting.
+a 14-core Jetson Thor with unified LPDDR5X. The two boxes do land on
+different sides of it: §16.6b measures **4.45x on Thor, just above the 4.375x
+arithmetic ratio**, against this 3.50x just below it. That is the direction the
+paragraph above predicted, which is why §16.6b labels the explanation a
+hypothesis rather than treating the agreement as evidence.
 
 Two costs are also real and are named rather than absorbed: the incremental arm
 makes **8 pooled calls per frame where the old one made 14 larger ones**, so it
@@ -3228,8 +3231,9 @@ pays proportionally more `Threadpool::Barrier` — the row's AR half already spe
 ~25 % of its wall clock there (§11.4) — and its per-step attention is a scalar
 loop over one query row that no longer rides the output-row partition. Both are
 visible in the after arm's higher round-to-round spread (1.68-3.73 against
-5.87-8.67, a wider RELATIVE band). Neither is worth a lever until the Thor number
-says which side of the bound this stage is on.
+5.87-8.67, a wider RELATIVE band). The Thor number in §16.6b now says this stage
+sits nearer the arithmetic bound than the byte one on that box too, so neither
+is worth a lever ahead of the vocoder, which §16.7 names as the larger term.
 
 ### 16.6a The Thor pair was taken, and the first one is VOID — both arms were the same binary
 
@@ -3264,18 +3268,115 @@ silently measures the previous artifact and returns a verdict about the code.
 The rule both cases want is the same one: **whenever two artifacts are required
 to differ, assert that they differ before believing anything downstream of them.**
 
-**The corrected pair is in flight** as job `7b22b5b0` on `thor:gpu0`
-(`--max-runtime 150m`), and it is not this session's job to submit or lease. It
-takes the two arms from **separate clones with separate build dirs**, and it
-carries a hard `FATAL_ARMS_IDENTICAL` guard on the two binaries' `sha256` so this
-failure aborts the job instead of producing a plausible table. It stages the
-checkpoint to local disk first (§15.6's finding, applied), runs three alternating
-pairs, and compares the two arms' output WAV `sha256` across arms so the
-bit-identity claim is checked at Thor geometry as well as the speed. Its arms are
-**`c802dba8d`** — this row's merge-base, so the delta is exactly the 10 files
-this row touches — and **`4568c6e71`**. Until that job lands, §16.6's 3.50x
-stands as an x86-64 stage number and Thor has no number at all, which is a
-different state from the one the void appeared to report.
+**The corrected pair (job `7b22b5b0`) has since run, and §16.6b is its result.**
+It took the two arms from **separate clones with separate build dirs**, behind a
+hard `FATAL_ARMS_IDENTICAL` guard on the two binaries' `sha256`, so this failure
+would abort the job rather than produce a plausible table. **The guard reported
+`ARMS_DIFFER=yes` on two distinct hashes**, which is the precondition this
+section exists to insist on.
+
+### 16.6b The corrected Thor pair — the real-checkpoint number, and the WAV identity leg it closes
+
+**On Thor, against the real 28.5 GB checkpoint, the depth forward runs 4.45x
+faster and the whole run finishes 2.74x sooner, writing byte-identical audio.**
+Job `7b22b5b0`, `thor:gpu0` sm_110, `--device 1 --duration 4 --steps 4 --seed 7`,
+100 frames. Arms **`c802dba8d`** — this row's merge-base, so the delta is exactly
+the 10 files this row touches — and **`4568c6e71`**. Three alternating pairs.
+
+**The instrument's own preconditions were asserted before any timing was read**,
+which is the whole reason this pair exists:
+
+    gen_before sha=33f5c5fb18a7e91a5fe7b2fe26f7f5c1   ARMS_DIFFER=yes
+    gen_after  sha=d2fdac95a34ce177bbdd9e766e87078a
+    STAGE_SECONDS=815   SRC_BYTES=DST_BYTES=28517617303
+
+The checkpoint was staged to local disk first, with source and destination byte
+counts asserted equal, so §15.6's cold-CIFS load is not inside these figures.
+
+| bucket | BEFORE, mean of 3 | AFTER, mean of 3 | ratio | calls |
+|---|---|---|---|---|
+| `ar.depth_forward` | 348.273 s | 78.316 s | **4.45x** | 1414 -> 808 |
+| `ar.depth_projection` | 10.102 s | 1.307 s | **7.73x** | 1414 -> 707 |
+| `ar.depth_stage` | 359.090 s | 80.221 s | **4.48x** | 101 -> 101 |
+| `ar.TOTAL_loop` | 375.687 s | 94.084 s | **3.99x** | 1 -> 1 |
+| **wall clock** | **446.33 s** | **163.00 s** | **2.74x** | — |
+| `vocoder.decode_window` | 53.648 s | 53.605 s | 1.00x | 1 -> 1 |
+| `ar.lm_decode_step` | 14.989 s | 12.339 s | 1.21x | 100 -> 100 |
+
+The spread is tight enough that the means are not hiding anything.
+`depth_forward` reads 348.076 / 349.588 / 347.154 before and 78.190 / 78.627 /
+78.131 after — the two bands are three orders of magnitude apart in separation
+relative to their own width. Wall is 450 / 446 / 443 s before and 164 / 163 /
+162 s after.
+
+**The call count is the control that the void pair failed.** 1414 depth forwards
+before against 808 after is 101 frames x 14 and 101 frames x 8, exactly the
+schedule change §16.2 describes, and `depth_projection` at 1414 -> 707 is
+101 x 14 and 101 x 7. The void pair's 808-on-both-arms is now positively
+explained: it ran the AFTER binary twice.
+
+**Where the 4.45x comes from, decomposed.** Per call, `depth_forward` costs
+246.30 ms before and 96.93 ms after. So the stage is **1.75x fewer calls times
+2.54x cheaper per call**, and the two factors multiply to the measured 4.45x.
+The per-call figures are not like-for-like by design — a BEFORE call re-forwards
+the whole growing depth sequence while an AFTER call appends one position against
+a cache — and that is the change, not a confound.
+
+#### 2.74x is the number a user feels, and it is smaller for a reason worth naming
+
+**Lead with 2.74x, not 4.45x.** The depth stage is no longer the whole run. It
+was **80.5 % of wall before and is 49.2 % after**, and the run is now dominated
+by a term this change does not touch: `vocoder.decode_window` costs **53.6 s on
+both arms**, going from 12.0 % of wall to **32.9 %**. A fixed serial phase does
+not shrink when you speed up the parallel one, so the stage ratio and the wall
+ratio are different claims and each is quoted where it applies. The depth stage
+saved 278.9 s and the wall fell 283.3 s, so essentially all of the wall saving is
+this change and there is no unexplained gain hiding in the total.
+
+**One delta is NOT explained and is recorded rather than smoothed.**
+`ar.lm_decode_step` fell 14.989 s -> 12.339 s (1.21x) across an unchanged 100
+calls, and this row does not touch the LM decode. The plausible reading is that
+the AR loop's working set is smaller once the growing depth sequence is gone, so
+the LM's own memory traffic gets cheaper — but that is a **hypothesis**, it was
+not measured, and 2.65 s of the 283.3 s wall saving therefore has no established
+cause. It is named here so that a later reader does not attribute it to the depth
+schedule by default.
+
+#### The e2e WAV identity leg is TAKEN — not owed, and not at unit scale
+
+**All three pairs wrote `sha 5e81fc133d653560` on BOTH arms.** Six runs, one
+hash. The two arms also report identical `RMS 0.01350` and `peak 0.25180` on
+every run, and identical geometry (3.994 s, 44100 Hz, 2 channels, 176 128
+samples per channel).
+
+This is the leg §12.3 had and §16.5 could not reach, and it is a strictly
+stronger statement than the unit gate or than §16.6's fingerprint. It runs the
+real checkpoint through **every** stage — AR loop, depth decoder, DiT denoise,
+and the vocoder — and compares the finished audio file, so it proves the change
+is inaudible in the product rather than bit-exact at a layer boundary. §16.7 no
+longer carries it as owed.
+
+#### 4.45x on Thor against 3.50x on x86 — two measurements, not one confirming the other
+
+These are **different machines, different weight sources and different arms**,
+and neither validates the other. §16.6 is a synthetic in-process bench on a
+20-core x86-64 under load 39-52, driving `DepthDecoderConfig` defaults against
+2.5 GB of seeded pseudo-random weights, with arms `fc163f62b` and that commit
+plus this change. §16.6b is the shipped binary on a 14-core Jetson Thor against
+the real checkpoint, with arms `c802dba8d` and `4568c6e71`. Each is quoted with
+its box and its weight source at the point of use, and the row claims neither as
+a reproduction of the other.
+
+**Why Thor is higher is a HYPOTHESIS, and it is labelled one because it was
+predicted rather than measured.** §16.4's accounting gives a weight-traffic ratio
+of 8.75x and an arithmetic ratio of 4.375x, and a stage that is bandwidth-bound
+should land nearer the first. Thor's **4.45x sits just above the arithmetic
+ratio; x86's 3.50x sits just below it**, which is the direction a unified-LPDDR5X
+box versus a large-L3 x86 box would predict. That the prediction matches is
+suggestive and nothing more — the ~46 GB/s figure §16.4 reasons from was itself
+inferred from Thor, so this is the same argument returning, not independent
+evidence for it. Settling it needs a bandwidth measurement on both boxes, which
+no axis here has.
 
 ### 16.7 What is still OWED after this row
 
@@ -3303,10 +3404,12 @@ levers are visible and none is taken here:
 3. **The device arm**, which is lever 1 plus `vt::MatmulBT`, and is the row §14.5
    describes.
 
-**The e2e WAV pair (§16.5).** `minimax-music3-gen` on both arms with the same
-seed must write byte-identical audio. It is the one leg §12.3 had that this row
-does not, the attempt died on a linkage artefact rather than on a number, and it
-needs a quiet box and ~50 GB of free disk to redo. Owed.
+**The e2e WAV pair is NO LONGER OWED — it was taken and it passed (§16.6b).**
+`minimax-music3-gen` on both arms with the same seed wrote `sha
+5e81fc133d653560` on all three pairs, six runs and one hash, with identical RMS
+and peak. The first attempt died on a linkage artefact; the corrected job ran it
+on Thor against the real checkpoint. This closes the one leg §12.3 had that this
+row lacked, and it closes it at full scale rather than at unit scale.
 
 **`DepthSequenceEmbeds` is now gate-only.** It is still the documented mirror of
 `_generate_depth_codes`'s sequence assembly and is still gated against the
@@ -3314,13 +3417,21 @@ committed goldens and exercised by `test_minimax_music3_quant_real`, but no
 production path calls it any more. That is recorded here rather than deleted,
 because it is what the incremental schedule is checked to agree with.
 
-**The Thor per-stage number is OWED, and the first attempt is VOID rather than
-missing.** §16.6a names the job (`56848b2e`), the cause (one build dir across
-both arms, so both binaries hashed `b98a5dbba37a67f1`) and the corrected job
-(`7b22b5b0`). The owed item is the number, not the attempt: until `7b22b5b0`
-lands, this row has an x86-64 stage ratio and no Thor ratio, and §16.6's
-closing question — which side of the weight-streaming bound this stage sits on
-for a 14-core Jetson with unified LPDDR5X — stays open.
+**The Thor number is TAKEN (§16.6b): 4.45x on the depth forward and 2.74x on
+wall, against the real checkpoint.** §16.6a keeps the voided first attempt and
+its cause on the record, because a void with a named cause is evidence and the
+number that replaced it does not erase it. What remains open is narrower than
+before and is stated as such: **why Thor's 4.45x exceeds x86's 3.50x is a
+hypothesis, not a result.** Settling it needs a measured memory bandwidth on
+both boxes, and no axis in this row has one. A second open item is smaller and
+concrete: 2.65 s of the wall saving sits in `ar.lm_decode_step`, a bucket this
+change does not touch, and its cause is unestablished.
+
+**The vocoder is now the largest single term in a run, and no row owns it.** At
+53.6 s it is 32.9 % of wall after this change, against 12.0 % before, and it did
+not move because nothing here touches it. That is the next thing worth
+attacking on this model, and it is named here rather than left for the next
+reader to rediscover from a profile.
 
 **No parity claim, again.** SGLang-Omni is still `gateable = no`, and every
 reference axis in `docs/BENCHMARKS.md` stays `PENDING`. Everything above is an

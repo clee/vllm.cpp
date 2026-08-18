@@ -23297,3 +23297,90 @@ and a cross-arm comparison of the output WAV `sha256`, which puts the
 bit-identity claim at Thor geometry alongside the speed. Arms `c802dba8d` (the
 `row/MUSIC3-DEPTH-SPEED` merge-base, so the delta is exactly the 10 files the row
 touches) and `4568c6e71`. Spec §16.6a.
+
+## MUSIC3-DEPTH-THOR-PAIR-2 — the real-checkpoint Thor pair: 4.45x depth, 2.74x wall, byte-identical audio (2026-08-18, `thor:gpu0` sm_110, job `7b22b5b0`, arms `c802dba8d` / `4568c6e71`, #672)
+
+**Status: TAKEN. This replaces the PENDING left by `MUSIC3-DEPTH-THOR-PAIR-1`,
+which is VOID and stays on the record above.**
+
+Thor sm_110, `--device 1 --duration 4 --steps 4 --seed 7`, 100 frames, three
+alternating pairs. Arms are `c802dba8d` (the `row/MUSIC3-DEPTH-SPEED`
+merge-base, so the delta is exactly the 10 files the row touches) and
+`4568c6e71`.
+
+**Preconditions asserted before any timing was read**, which is the entire point
+of this second pair:
+
+```text
+gen_before sha=33f5c5fb18a7e91a5fe7b2fe26f7f5c1 size=72744
+gen_after  sha=d2fdac95a34ce177bbdd9e766e87078a size=72744
+ARMS_DIFFER=yes
+STAGE_SECONDS=815 SRC_BYTES=28517617303 DST_BYTES=28517617303
+```
+
+The checkpoint was staged to local disk with source and destination byte counts
+asserted equal, so the cold-CIFS load is outside these figures.
+
+| bucket | BEFORE mean of 3 | AFTER mean of 3 | ratio | calls |
+|---|---|---|---|---|
+| `ar.depth_forward` | 348.273 s | 78.316 s | **4.45x** | 1414 -> 808 |
+| `ar.depth_projection` | 10.102 s | 1.307 s | **7.73x** | 1414 -> 707 |
+| `ar.depth_stage` | 359.090 s | 80.221 s | **4.48x** | 101 -> 101 |
+| `ar.TOTAL_loop` | 375.687 s | 94.084 s | **3.99x** | 1 -> 1 |
+| **wall clock** | **446.33 s** | **163.00 s** | **2.74x** | — |
+| `vocoder.decode_window` | 53.648 s | 53.605 s | 1.00x | 1 -> 1 |
+| `ar.lm_decode_step` | 14.989 s | 12.339 s | 1.21x | 100 -> 100 |
+
+Per-run, so the spread is visible rather than implied. `depth_forward` before
+348.076 / 349.588 / 347.154, after 78.190 / 78.627 / 78.131. Wall before
+450 / 446 / 443 s, after 164 / 163 / 162 s. The bands do not approach each other.
+
+**The call count is the control the void pair failed.** `depth_forward` goes
+1414 -> 808, which is 101 frames x 14 against 101 frames x 8; `depth_projection`
+goes 1414 -> 707, which is 101 x 14 against 101 x 7. That is the schedule change
+exactly. `MUSIC3-DEPTH-THOR-PAIR-1`'s 808-calls-on-both-arms is
+now positively explained as the AFTER binary run twice.
+
+**Decomposition.** `depth_forward` costs 246.30 ms per call before and 96.93 ms
+after, so 4.45x is **1.75x fewer calls times 2.54x cheaper per call**. The
+per-call figures are not like-for-like by design: a BEFORE call re-forwards the
+whole growing depth sequence, an AFTER call appends one position against a cache.
+
+### Quote 2.74x to a user, not 4.45x
+
+The depth stage was **80.5 % of wall before and is 49.2 % after**. What now
+dominates is a term this change does not touch: `vocoder.decode_window` is
+**53.6 s on both arms**, moving from 12.0 % of wall to **32.9 %**. A fixed serial
+phase does not shrink when the parallel one does. The stage saved 278.9 s and
+wall fell 283.3 s, so the wall saving is accounted for and nothing unexplained is
+hiding in the total.
+
+**One delta is unexplained and is recorded, not smoothed.** `ar.lm_decode_step`
+fell 14.989 -> 12.339 s over an unchanged 100 calls, and this change does not
+touch the LM decode. A smaller AR working set is the plausible reading and it is
+a **hypothesis**: 2.65 s of the 283.3 s saving has no established cause.
+
+### E2E byte-identity, at full scale
+
+**All three pairs wrote `sha 5e81fc133d653560` on BOTH arms — six runs, one
+hash**, with identical `RMS 0.01350`, `peak 0.25180` and geometry (3.994 s,
+44100 Hz, 2 channels, 176 128 samples/channel). This runs the real checkpoint
+through every stage including the vocoder and compares the finished file, so it
+is strictly stronger than the unit gate or than `MUSIC3-DEPTH-INCREMENTAL`'s
+in-process fingerprint. The leg the spec carried as owed is closed.
+
+### 4.45x here against 3.50x in `MUSIC3-DEPTH-INCREMENTAL` — two measurements
+
+Different boxes, different weight sources, different arms, and neither confirms
+the other. `MUSIC3-DEPTH-INCREMENTAL` is a synthetic in-process bench on a
+20-core x86-64 under load 39-52 driving seeded pseudo-random weights, arms
+`fc163f62b` and that commit plus the change. This is the shipped binary on a
+14-core Jetson Thor against the real 28.5 GB checkpoint.
+
+**Why Thor is higher is a labelled HYPOTHESIS.** The byte accounting predicts
+8.75x and the arithmetic 4.375x; Thor's 4.45x sits just above the arithmetic
+ratio and x86's 3.50x just below it, the direction a unified-LPDDR5X box against
+a large-L3 x86 box would give. The prediction matching is not a measurement, and
+the ~46 GB/s figure it reasons from was itself inferred from Thor, so this is the
+same argument returning rather than independent support. Settling it needs a
+measured bandwidth on both boxes.
