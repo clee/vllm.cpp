@@ -643,11 +643,24 @@ the default path has already failed.
 
 ## Evidence
 
-**Evidence that exists today: source only.** Every anchor in *Upstream chain (vLLM)*, *Upstream chain (SGLang)* and *Our baseline* was
-read at the two pinned revisions named in the header, and each was re-verified
-with `sed -n` against the file before this spec was committed. That is the whole
-evidence base. It establishes what upstream does and what this tree lacks. It
+**Evidence that exists today: source, plus one compile-only probe.** Every
+anchor in *Upstream chain (vLLM)*, *Upstream chain (SGLang)* and *Our baseline*
+was read at the two pinned revisions named in the header, and each was
+re-verified with `sed -n` against the file before this spec was committed. That
+reading establishes what upstream does and what this tree lacks, and it
 establishes nothing about speed.
+
+On 2026-08-18 exactly one measurement joined it, and it remains the only one.
+Six kernels were compiled in a single translation unit by `nvcc`/`ptxas` 13.0.88
+for `sm_121a`, read with `cuobjdump -res-usage`, `cuobjdump -sass` and
+`nvdisasm -g`. It yields per-kernel register, stack, spill-byte, shared-memory
+and SASS instruction counts, and a `probe.cu` line for every `LDL`/`STL`.
+`## Outcome` carries the numbers and
+[`docs/bench-evidence/gdn-replayssm-w0-20260818/`](../../docs/bench-evidence/gdn-replayssm-w0-20260818/)
+carries the probe source, the scripts and the raw logs. **That is a static
+property of compiled code and nothing else.** The probe was never launched, on
+any device, so it is not evidence of correctness either: its algebra was checked
+against *Design* by reading it, which T1 still owes a real gate for.
 
 Two structural claims carry their own commands, so a reader can re-run them
 rather than trust this document:
@@ -657,9 +670,13 @@ rather than trust this document:
 | This tree has no ReplaySSM | `grep -rniE 'replayssm' src include tests` (empty) |
 | vLLM has no GDN ReplaySSM, at the pin or 877 commits past it | `git -C /home/mudler/_git/vllm ls-tree -r --name-only origin/main \| grep -i replayssm` (Mamba2 files only) |
 
-**Evidence that does not exist and must not be implied:** any timing, any
-kernel-level attribution, any register count for a kernel that has not been
-written, and any statement about the GDN share of a 27B decode step. The numbers
+**Evidence that does not exist and must not be implied:** any timing; any
+throughput, latency, TPOT, occupancy or memory measurement; any statement about
+the GDN share of a 27B decode step; and any numeric or token output, because
+nothing has been executed. *The A/B* is still **UNMEASURED** and a static count
+is not a substitute for it in either direction. The counts above are facts about
+`probe.cu`, not about anything this tree ships: no ReplaySSM product code exists,
+and `grep -rniE 'replayssm' src include tests` is still empty. The numbers
 in *Traffic model* are *derivations from shapes*, explicitly labelled as such; they are
 arithmetic over `HV=32, V=128, K=128, H_k=16`, not observations. A derivation is
 a prediction to be tested, and *The A/B* is the test.
@@ -714,6 +731,18 @@ A negative result here is a result. Record it; do not retry it silently.
   not take a lock on a second shared record surface.
 - **The GDN share of the 27B decode step is unmeasured** (*Three reasons the end-to-end win is smaller again*). Until it is, the
   0.627x state-traffic ratio bounds nothing end to end. Owned by #1171.
+- **The bare line anchors in this row's `.agents/kernel-matrix.md` cell are not
+  gate-checkable.** Eight `cuda_gdn.cu` anchors, ten line numbers between them,
+  had all drifted by a uniform **+12** under one unrelated edit to that file
+  (`5ae2c100f`, three hunks between lines 1879 and 1985), and two anchors in
+  other files had drifted by +84 (`qwen3_5.cpp`) and +139 (`ops.h`). Every one
+  is re-derived and correct as of this change, and the three that name a symbol
+  now use the `path::Symbol` form that `scripts/check-symbol-anchors.py`
+  verifies. The rest are still line numbers, which that gate deliberately does
+  not check, because a bare number carries no claim to check against.
+  Converting them is a per-citation judgement about intent, so it rides with the
+  implementation change that next touches the cell rather than with this repair.
+  Owned by #1171.
 - **Whether a pin advance changes the mirror source.** SGLang cites a vLLM
   `layers/fla/ops/fused_recurrent_replayssm.py` at commit `3c85112` that resolves
   nowhere in the pinned clone (*Upstream chain (SGLang)*). Re-check at the next pin advance; if vLLM
@@ -736,7 +765,12 @@ Six kernels in one translation unit, compiled once, so every number comes from
 one `ptxas` invocation. Source, submission script and raw logs:
 [`docs/bench-evidence/gdn-replayssm-w0-20260818/`](../../docs/bench-evidence/gdn-replayssm-w0-20260818/)
 (`probe.cu`, `build_w0.sh`, `run_on_lease.sh`, `job1.log`, `job2.log`,
-`RESULT.txt`).
+`RESULT.txt`, and for the instruction counts below `count_sass.sh`,
+`run_sass_on_lease.sh`, `job3_sass.log`, `sass.txt.gz`). `count_sass.sh` is a
+separate script rather than two more lines in `build_w0.sh` because
+`build_w0.sh`'s recorded sha256 is the provenance of `job1.log` and `job2.log`,
+and editing it would retroactively invalidate that for runs it did not
+produce.
 
 | Kernel | What it is |
 |---|---|
@@ -766,7 +800,9 @@ an earlier tile's store cannot alias a later tile's load.
 | `CUOBJDUMP_RC` / `LINEINFO_COMPILE_RC` | **0** / **0** |
 | `probe.cu` sha256 | `f7d323651cf1a5720f0ce712b802a10248278566e1abb9ecdbae8e62fcf0f4b3` |
 | `build_w0.sh` sha256 | `c5218d087949e94647e28d6799b2f870e34643bc754dfaec084b562fd979ef55` |
-| Reproduced | two independent `rc run` jobs, `629f4fd6` (`job1.log`) and `1ef2dbe4` (`job2.log`), byte-identical register, stack and LDL/STL numbers |
+| `count_sass.sh` sha256 | `377bb25bf8900ffa70728a0a44bb52861926d07642bea9eade9b226463208172` (the committed file is byte-identical to the one that ran; `job3_sass.log` prints it) |
+| `sass.txt` sha256 | `b452d21124d2f1cd12a64850d6d14acf7c8ddb2bf7fac005b519539ab37c81a9`, 3,018,425 bytes, committed gzipped as `sass.txt.gz` |
+| Reproduced | three separate `rc run` jobs — `629f4fd6` (`job1.log`), `1ef2dbe4` (`job2.log`) and `cbfa6469` (`job3_sass.log`) — with byte-identical register, stack and LDL/STL numbers. All three landed on the same worker `rc-worker-lnvw6`, the same box and the same toolkit, so what this reproduces is **compiler determinism on one host**, not independence of host, toolkit or `nvcc` version. A second toolkit or a second box would be a different claim, and it is not made |
 
 The lease was taken on `orin` rather than a Blackwell box because **this is
 compile-only**: `cuobjdump` and `nvdisasm` read a compiled object and never
@@ -806,8 +842,49 @@ figure from another month.
 the same toolkit and the same translation unit go from `REG:255 + STACK:96` to
 `REG:95 + STACK:0` when the state slice is streamed over `32`/`64`-wide dstate
 tiles instead of held whole — which is what the mirror source does, and why it
-does it. The fused kernel sits below even the Triton arm's `REG:205` on this
-tile. The register file is not the wall for ReplaySSM.
+does it. The register file is not the wall for ReplaySSM.
+
+The Triton row sits in the table above for reference and nothing is concluded
+from it. `gdn_packed_decode_triton.h:9-14` records `REG:205` for a **resident**
+`[BV=32,BK=128]` fp32 tile, while the fused probe streams `32`/`64`-wide slices;
+the two counts describe different structures, which is the finding of this
+section, so reading `95 < 205` as a win would be the same category error in the
+other direction.
+
+### The `REG:42` kernel is not a stub
+
+A low register count has an uninteresting explanation available: `ptxas` deleted
+the work. The W0 review closed that question by inference, from three
+independent arguments over the source and the other kernels' numbers. That
+reasoning stands and is not restated here, because a count answers the question
+outright, and a count costs one line. So it was taken:
+`cuobjdump -sass` on the same object, and one line of `awk` counting the
+`/*ffff*/` address comments that mark each SASS instruction, per `Function :`
+header (`count_sass.sh`, `job3_sass.log`).
+
+| Kernel | REG | SASS instructions |
+|---|---|---|
+| `ProbeReplaySsmNonFlushKernel` | 42 | **1,688** |
+| `ProbeReplaySsmFlushKernel` | 94 | 1,872 |
+| `ProbeReplaySsmFlushSeqKernel` | 94 | 1,872 |
+| `ProbeReplaySsmFusedKernel` | 95 | 2,320 |
+| `ProbeControlRegTileKernel` | 255 | 2,000 |
+| `ProbeReplaySsmRegTileKernel` | 255 | 2,816 |
+
+`REG:42` buys 1,688 instructions, within a factor of 1.2 of the 2,000-instruction
+control, so nothing was folded away. The ordering is the one the structure
+predicts: the non-flush route alone is the smallest, adding the flush route costs
+about 630 instructions, and the first attempt's resident `sh[128]` is the largest
+of all — it pays for the spill traffic the previous subsection attributes. That
+run also re-emitted every register, stack and spill figure identically, so it is
+a third reproduction as well as a new count. It is still a static property of the
+object: an instruction count is not a cycle count and says nothing about speed.
+
+The compile produced 435,296 bytes against the 435,184 recorded above, from the
+same `probe.cu` (sha256 `f7d3236…`) and the same command. The difference is the
+output path baked into the object — `/tmp/replayssm-w0b-sass/` against
+`/tmp/replayssm-w0b/` — and not a codegen difference, which is why every
+per-kernel number is byte-identical.
 
 ### Where the spill actually was — a static count is not a per-step cost
 
@@ -866,6 +943,18 @@ is only as strong as the transcription under it. A spill number is a fact about
   owes one.
 - **No occupancy or launch-config work.** `REG:95` implies a theoretical
   occupancy, not an achieved one.
+- **No claim that a 32-wide resident NF tile is separately affordable.**
+  `ProbeReplaySsmNonFlushKernel` is *lighter* than the pin, not equal to it: it
+  reduces the checkpoint into two scalars and declares no NF tile array at all,
+  so its `REG:42` bounds that route's arithmetic and its memory pattern, not the
+  pin's storage. The pin-shaped tiling — `NF_DSTATE_TILE = 32` and
+  `FL_DSTATE_TILE = 64` as disjoint per-branch locals — is measured only in
+  `ProbeReplaySsmFusedKernel`, at `REG:95`, and `ptxas` has very likely
+  scalarized that kernel's `st[32]` too, since a fully unrolled loop over a
+  compile-time-sized local array is exactly what it promotes. What the six
+  kernels jointly establish is that **no shape tried here spills**, which is
+  what R1 asked. They do not establish the register cost of a 32-wide array the
+  compiler is forced to keep resident, and no such kernel was written.
 
 ### The question W0 replaces R1 with
 
@@ -901,7 +990,8 @@ and the raw numbers.
 
 Next action, for a fresh implementer: **W1**, and read `## Outcome` first — in
 particular *The question W0 replaces R1 with*. Do not re-run the register probe;
-it is done, reproduced across two jobs, and its artifacts are committed. The
+it is done, its numbers re-emitted identically across three jobs on the same
+worker and toolkit, and its artifacts are committed. The
 open wall is R2 and *Traffic model*: whether a streamed kernel's exposed load
 latency costs more than the traffic it saves, measured against the vendored FLA
 cubin denominator in *The A/B*. Nothing in W0 licenses a speed claim in either
