@@ -3,6 +3,7 @@
 // (.agents/specs/qwen36-forward-notes.md §6).
 #include "vllm/model_executor/models/qwen3_5_weights.h"
 
+#include <atomic>
 #include <cctype>
 #include <cstdint>
 #include <cstdlib>
@@ -20,6 +21,7 @@
 #endif
 
 #include "vllm/model_executor/model_loader/nvfp4_dequant.h"
+#include "vllm/model_executor/models/dense_weight_loaders.h"  // ReadF32Scalar (#1181)
 #include "vllm/model_executor/models/qwen3_vl.h"  // LoadQwen3VLVisionWeights (#891)
 #include "vt/backend.h"
 #include "vt/dtype.h"
@@ -32,6 +34,19 @@ int64_t OwnedTensor::Numel() const {
   int64_t n = 1;
   for (int i = 0; i < rank; ++i) n *= shape[i];
   return n;
+}
+
+uint64_t OwnedTensor::TowerUid() const {
+  // See the field comment: an ADDRESS is not an identity for a cache that
+  // outlives the model, because the allocator reuses addresses. A counter is,
+  // because it never goes backwards.
+  static std::atomic<uint64_t> next{1};
+  const uint8_t* p = bytes.data();
+  if (tower_uid == 0 || tower_uid_for != p) {
+    tower_uid = next.fetch_add(1, std::memory_order_relaxed);
+    tower_uid_for = p;
+  }
+  return tower_uid;
 }
 
 void OwnedTensor::ReleaseHost() const {
@@ -49,6 +64,13 @@ void OwnedTensor::ReleaseHost() const {
     self.bytes.Reset();
     self.mmap_src = nullptr;  // nothing borrows the mapping through this tensor now
     self.mmap_src_bytes = 0;
+    // The FILE descriptor goes with the mapping. It describes where these host
+    // bytes came from, and there are no host bytes now. Left set, it outlives
+    // its own subject: `bytes.data()` is null, so an expert-stream slice would
+    // pread the recorded offset (which belongs to a tensor nothing is reading
+    // any more) and would key every released tower on TowerId(nullptr) == 0.
+    self.mmap_fd = -1;
+    self.mmap_file_offset = 0;
     self.host_released = true;
     return;
   }
@@ -148,6 +170,11 @@ void AdoptDeviceBytesAsHost(vt::Backend& backend, const OwnedTensor& w) {
                                     nb, std::move(keep));
     self.mmap_src = nullptr;
     self.mmap_src_bytes = 0;
+    // `bytes` now points at DEVICE memory, so the file offset no longer
+    // describes it. See the note in ReleaseHost: a descriptor that outlives its
+    // mapping reads as a valid source and is not one.
+    self.mmap_fd = -1;
+    self.mmap_file_offset = 0;
     return;
   }
   if (!backend.DeviceMemoryIsHostAddressable()) return;
@@ -283,13 +310,10 @@ OwnedTensor MakeOwned(vt::DType dt, const std::vector<int64_t>& shape) {
   return o;
 }
 
-float ReadF32Scalar(const StTensor& t) {
-  VT_CHECK(t.data != nullptr && t.nbytes >= sizeof(float),
-           "qwen3_5 weights: scalar tensor too small for f32");
-  float v = 0.0F;
-  std::memcpy(&v, t.data, sizeof(float));
-  return v;
-}
+// The per-tensor scale read, from the shared seam. It used to be a local copy
+// bounded by `nbytes >= sizeof(float)`, a FLOOR, so an array was read as
+// element 0 and any dtype was reinterpreted (#1181).
+using dense_loaders::ReadF32Scalar;
 
 // src bf16 [rows, cols] -> dst bf16 [cols, rows].
 //
@@ -298,8 +322,8 @@ float ReadF32Scalar(const StTensor& t) {
 // the running byte total of everything ahead of it, so a bf16 tensor that
 // follows an odd-length one starts on an odd byte and the typed pointer is
 // undefined to form or load through (issue #627). `vt::LoadUnaligned` is the
-// project's seam for that — the same one `ReadF32Scalar` above open-codes with
-// memcpy and `dense_loaders::TransposeBf16` already uses for this exact loop.
+// project's seam for that — the same one `dense_loaders::ReadF32Scalar` uses
+// and `dense_loaders::TransposeBf16` already uses for this exact loop.
 // The strided form. `src_pitch` is the distance in ELEMENTS between successive
 // source rows, which is `cols` for a dense 2-D tensor and something larger when
 // the block is a column-slice of a wider one (the stacked gate/up halves below).
@@ -429,8 +453,8 @@ Fp8Weight LoadFp8Raw(const TensorResolver& get, const std::string& proj) {
   Fp8Weight r;
   r.n = w.shape[0];
   r.k = w.shape[1];
-  r.weight_scale = ReadF32Scalar(get(proj + ".weight_scale"));
-  r.input_scale = ReadF32Scalar(get(proj + ".input_scale"));
+  r.weight_scale = ReadF32Scalar(get, proj + ".weight_scale");
+  r.input_scale = ReadF32Scalar(get, proj + ".input_scale");
   r.alpha = r.input_scale * r.weight_scale;
   r.packed = MakeOwned(vt::DType::kI8, {r.n, r.k});
   VT_CHECK(w.nbytes == r.packed.bytes.size(),
@@ -451,7 +475,7 @@ OwnedTensor LoadFp8Transposed(const TensorResolver& get,
            "qwen3_5 weights: expected 2-D weight for " + proj);
   const int64_t out_dim = w.shape[0];
   const int64_t in_dim = w.shape[1];
-  const float scale = ReadF32Scalar(get(proj + ".weight_scale"));
+  const float scale = ReadF32Scalar(get, proj + ".weight_scale");
 
   std::vector<uint16_t> dq(static_cast<size_t>(out_dim) * in_dim);
   DequantFp8ToBf16(w.data, scale, out_dim * in_dim, dq.data());
@@ -481,7 +505,7 @@ Nvfp4Weight LoadNvfp4Raw(const TensorResolver& get, const std::string& proj) {
   const StTensor& ws = get(proj + ".weight_scale");
   VT_CHECK(ws.dtype == "F8_E4M3",
            "qwen3_5 weights: expected F8_E4M3 for " + proj + ".weight_scale");
-  const float ws2 = ReadF32Scalar(get(proj + ".weight_scale_2"));
+  const float ws2 = ReadF32Scalar(get, proj + ".weight_scale_2");
 
   Nvfp4Weight r;
   r.n = out_dim;
@@ -950,13 +974,16 @@ void CheckMoeQuantLayoutSupported(const std::vector<std::string>& names,
   // ...and the three NON-routed components, refused by the dtype the probe
   // RESOLVED rather than discovered as a complaint from inside a reader (#490).
   // Each of these already failed before #864; naming it is the whole change.
-  const auto refuse = [&kRequired](const char* what, MoeProjDtype got,
-                                   const char* supported) {
+  // Names the namespace-scope constant, not the function-local `kRequired`
+  // reference bound to it: a local reference is odr-used here and would need a
+  // capture, which MSVC enforces (#1068).
+  const auto refuse = [](const char* what, MoeProjDtype got,
+                         const char* supported) {
     VT_CHECK(false, std::string("qwen3_5 weights: a ") +
                         MoeProjDtypeName(got) + " " + what +
                         " is not implemented for the safetensors MoE arm -- it "
                         "reads " +
-                        supported + " there." + kRequired);
+                        supported + " there." + kMoeExpertLayoutHelp);
   };
   if (tower.gdn == MoeProjDtype::kNvfp4) {
     refuse("GDN tower (<layer>.linear_attn.{in_proj_qkv,in_proj_z,out_proj})",

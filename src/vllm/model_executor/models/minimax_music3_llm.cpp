@@ -13,7 +13,10 @@
 #include <vector>
 
 #include "vllm/model_executor/model_loader/safetensors_reader.h"
+#include "vt/backend.h"
 #include "vt/dtype.h"
+
+#include "vllm/model_executor/models/music3_profile.h"
 
 namespace vllm {
 namespace models {
@@ -134,13 +137,25 @@ Music3ArWeights Music3LoadArWeights(const MiniMaxMusic3Paths& paths,
          std::to_string(out.lm_config.num_hidden_layers) + " vs " +
          std::to_string(config.language_model.num_hidden_layers) + ")");
   }
+  // BREAKDOWN ROWS. These are SPANS, not leaves: they sit INSIDE the
+  // `load.ar_weights` leaf that `minimax_music3_speech.cpp` brackets, so summing
+  // them would double-count the load. They exist to answer one question that no
+  // wall clock can — `SafetensorsFile` is an mmap and every tensor is COPIED out
+  // of it, so page-fault I/O and the copy are interleaved inside one call and
+  // "is the load I/O or CPU?" cannot be inferred from the total.
   std::vector<SafetensorsFile> shards;
-  shards.reserve(paths.language_model_shards.size());
-  for (const std::string& shard : paths.language_model_shards) {
-    shards.push_back(SafetensorsFile::Open(shard));
+  {
+    profile::Timer open_timer("load.ar.open_shards", /*span=*/true);
+    shards.reserve(paths.language_model_shards.size());
+    for (const std::string& shard : paths.language_model_shards) {
+      shards.push_back(SafetensorsFile::Open(shard));
+    }
   }
   if (shards.empty()) Fail("MiniMax-Music3: language_model has no safetensors shards");
-  out.lm = LoadQwen3ForCausalLMWeights(shards, out.lm_config);
+  {
+    profile::Timer lm_timer("load.ar.lm_weights", /*span=*/true);
+    out.lm = LoadQwen3ForCausalLMWeights(shards, out.lm_config);
+  }
   if (out.lm.embed_tokens.bytes.size() !=
       static_cast<size_t>(out.lm_config.vocab_size) *
           static_cast<size_t>(out.lm_config.hidden_size) * sizeof(uint16_t)) {
@@ -168,6 +183,7 @@ Music3ArWeights Music3LoadArWeights(const MiniMaxMusic3Paths& paths,
 
   const SafetensorsFile depth_file = SafetensorsFile::Open(
       (fs::path(paths.rvq_depth_decoder_dir) / "diffusion_pytorch_model.safetensors").string());
+  const auto depth_t0 = profile::Now();
   const auto depth_get = [&depth_file](const std::string& name) {
     return AtRuntimeDtype(depth_file.Get(name), name);
   };
@@ -194,9 +210,13 @@ Music3ArWeights Music3LoadArWeights(const MiniMaxMusic3Paths& paths,
         depth_get("audio_heads." + std::to_string(head) + ".weight"));
   }
 
+  profile::AddSince("load.ar.depth_weights", depth_t0, /*span=*/true);
+
   // ── the tokenizer ────────────────────────────────────────────────────────
+  const auto tok_t0 = profile::Now();
   out.tokenizer =
       tok::Tokenizer::FromHfJson((fs::path(paths.tokenizer_dir) / "tokenizer.json").string());
+  profile::AddSince("load.ar.tokenizer", tok_t0, /*span=*/true);
   return out;
 }
 
@@ -223,22 +243,57 @@ Music3LmSession::Music3LmSession(const Music3ArWeights& weights, vt::Queue& queu
   const HfConfig& c = weights_.lm_config;
   const int64_t per_block =
       2 * block_size_ * c.num_key_value_heads * c.head_dim;  // k and v
-  kv_storage_.resize(static_cast<size_t>(c.num_hidden_layers));
+  const size_t elems = static_cast<size_t>(kRows * blocks_per_row_ * per_block);
+  // WHERE the cache lands is the queue's decision and nothing else's.
+  // `dense_attn::KvSlice` labels this pointer with `d.q.device`
+  // (dense_attn_block.h:233), so a host `std::vector` handed to a CUDA forward
+  // is a host pointer wearing a device tensor's label: finite, correctly shaped,
+  // and read by a kernel that cannot dereference it.
+  const bool on_device = queue_.device.type != vt::DeviceType::kCPU;
+  if (on_device) {
+    device_kv_.assign(static_cast<size_t>(c.num_hidden_layers), nullptr);
+  } else {
+    kv_storage_.resize(static_cast<size_t>(c.num_hidden_layers));
+  }
   attn_kv_.reserve(static_cast<size_t>(c.num_hidden_layers));
   for (int64_t layer = 0; layer < c.num_hidden_layers; ++layer) {
     // BF16, which is what the dense forward WRITES (qwen3_5.h: the paged store
     // down-casts K/V to bf16). An f32 cache here would be a wider memory format
     // than the path that fills it.
-    kv_storage_[static_cast<size_t>(layer)].assign(
-        static_cast<size_t>(kRows * blocks_per_row_ * per_block), 0);
     PagedKvCache kv;
-    kv.data = kv_storage_[static_cast<size_t>(layer)].data();
+    if (on_device) {
+      // ZEROED, and the zero matters as much as the allocation: `KvSlice` hands
+      // the whole [num_blocks, block_size, Hkv, Dh] view to the kernel, so the
+      // unwritten tail of the last block is real memory. Uninitialised device
+      // bytes there are the classic NaN nobody can localize; the CPU arm's
+      // `assign(elems, 0)` has always zeroed for the same reason.
+      vt::Backend& backend = vt::GetBackend(queue_.device.type);
+      void* p = backend.Alloc(elems * sizeof(uint16_t));
+      device_kv_[static_cast<size_t>(layer)] = p;
+      backend.Memset(queue_, p, 0, elems * sizeof(uint16_t));
+      kv.data = p;
+    } else {
+      kv_storage_[static_cast<size_t>(layer)].assign(elems, 0);
+      kv.data = kv_storage_[static_cast<size_t>(layer)].data();
+    }
     kv.dtype = vt::DType::kBF16;
     kv.num_blocks = kRows * blocks_per_row_;
     kv.block_size = block_size_;
     kv.num_kv_heads = c.num_key_value_heads;
     kv.head_size = c.head_dim;
     attn_kv_.push_back(kv);
+  }
+}
+
+Music3LmSession::~Music3LmSession() {
+  if (device_kv_.empty()) return;  // the CPU arm owns nothing to free
+  vt::Backend& backend = vt::GetBackend(queue_.device.type);
+  // Synchronize before freeing: the last step's kernels can still be reading the
+  // cache when the request returns, and a free racing a live kernel surfaces as
+  // a fault attributed to whatever allocates next.
+  backend.Synchronize(queue_);
+  for (void* p : device_kv_) {
+    if (p != nullptr) backend.Free(p);
   }
 }
 
@@ -376,6 +431,7 @@ std::vector<float> Music3DepthStage(const std::vector<float>& last_hidden_condit
   if (out_frame_codes->size() != 1) {
     Fail("MiniMax-Music3: the depth stage starts from the frame's semantic code alone");
   }
+  profile::Timer depth_timer("ar.depth_stage", /*span=*/true);
   const int32_t semantic = (*out_frame_codes)[0];
   const std::vector<float> semantic_embed =
       weights.EmbedRow(static_cast<int64_t>(semantic) + kAudioCodeOffset);
@@ -390,24 +446,36 @@ std::vector<float> Music3DepthStage(const std::vector<float>& last_hidden_condit
     for (int row = 0; row < 2; ++row) {
       const std::vector<float>& last =
           row == 0 ? last_hidden_conditional : last_hidden_unconditional;
-      const std::vector<float> embeds = DepthSequenceEmbeds(
-          last, semantic_embed, fed_back, config, weights.depth, ArCompute::kBFloat16);
-      const std::vector<float> states = DepthDecoderForward(
-          embeds, seq_len, config, weights.depth, ArCompute::kBFloat16);
+      std::vector<float> embeds;
+      {
+        profile::Timer embed_timer("ar.depth_projection");
+        embeds = DepthSequenceEmbeds(last, semantic_embed, fed_back, config, weights.depth,
+                                     ArCompute::kBFloat16);
+      }
+      std::vector<float> states;
+      {
+        profile::Timer forward_timer("ar.depth_forward");
+        states =
+            DepthDecoderForward(embeds, seq_len, config, weights.depth, ArCompute::kBFloat16);
+      }
       hidden_rows[row].assign(states.end() - H, states.end());
     }
     // `hidden_parts.append(hidden[:1])` — the CONDITIONAL row only, which is why
     // `frame_hiddens` can be reproduced from a golden that stores no other.
     depth_hidden.insert(depth_hidden.end(), hidden_rows[0].begin(), hidden_rows[0].end());
 
-    const std::vector<float> conditional = AudioHeadLogits(
-        hidden_rows[0], index - 1, config, weights.depth, ArCompute::kBFloat16);
-    const std::vector<float> unconditional = AudioHeadLogits(
-        hidden_rows[1], index - 1, config, weights.depth, ArCompute::kBFloat16);
-    const std::vector<float> guided =
-        GuidedDepthLogits(conditional, unconditional, kArCfgScale);
-    const std::vector<float> probs = TopKProbabilities(guided, kArSamplingTopK);
-    const int64_t drawn = sampler(probs, Music3Draw{frame_index, index});
+    int64_t drawn = 0;
+    {
+      profile::Timer head_timer("ar.depth_head_and_draw");
+      const std::vector<float> conditional = AudioHeadLogits(
+          hidden_rows[0], index - 1, config, weights.depth, ArCompute::kBFloat16);
+      const std::vector<float> unconditional = AudioHeadLogits(
+          hidden_rows[1], index - 1, config, weights.depth, ArCompute::kBFloat16);
+      const std::vector<float> guided =
+          GuidedDepthLogits(conditional, unconditional, kArCfgScale);
+      const std::vector<float> probs = TopKProbabilities(guided, kArSamplingTopK);
+      drawn = sampler(probs, Music3Draw{frame_index, index});
+    }
     if (drawn < 0 || drawn >= config.audio_vocab_size) {
       Fail("MiniMax-Music3: the sampler returned residual code " + std::to_string(drawn) +
            " for codebook " + std::to_string(index) + ", outside the " +
@@ -456,7 +524,11 @@ Music3ArResult Music3GenerateFrameHiddens(const std::vector<int32_t>& prompt_ids
 
   std::vector<float> hidden;  // [2, H]
   std::vector<float> logits;  // [2, vocab]
-  session.Prefill(prompt_ids, unconditional_ids, &hidden, &logits);
+  {
+    profile::Timer prefill_timer("ar.lm_prefill");
+    session.Prefill(prompt_ids, unconditional_ids, &hidden, &logits);
+  }
+  profile::Count("ar.prompt_tokens", static_cast<int64_t>(prompt_ids.size()));
 
   Music3ArResult result;
   result.frame_hiddens.reserve(
@@ -469,15 +541,22 @@ Music3ArResult Music3GenerateFrameHiddens(const std::vector<int32_t>& prompt_ids
            " logits, 2 rows x " + std::to_string(vocab) + " expected");
     }
     // encoders.py:312 — the head's output is bf16 before `.float()`.
-    RoundToBf16(logits);
-    const std::vector<float> conditional(logits.begin(),
-                                         logits.begin() + static_cast<ptrdiff_t>(vocab));
-    const std::vector<float> unconditional(logits.begin() + static_cast<ptrdiff_t>(vocab),
-                                           logits.end());
-    const std::vector<float> guided =
-        GuidedSemanticLogits(conditional, unconditional, blocked, kArCfgTopK, kArCfgScale);
-    const std::vector<float> probs = TopKProbabilities(guided, kArSamplingTopK);
-    const int64_t sampled = sampler(probs, Music3Draw{frame_index, 0});
+    int64_t sampled = 0;
+    {
+      // The guided-logits half of the frame: two 200 000-wide rows, a top-k over
+      // each, and the draw. §11.1's table calls this "not the cost"; that was an
+      // argument, and this bracket is what turns it into a number.
+      profile::Timer semantic_timer("ar.semantic_guide_and_draw");
+      RoundToBf16(logits);
+      const std::vector<float> conditional(logits.begin(),
+                                           logits.begin() + static_cast<ptrdiff_t>(vocab));
+      const std::vector<float> unconditional(logits.begin() + static_cast<ptrdiff_t>(vocab),
+                                             logits.end());
+      const std::vector<float> guided =
+          GuidedSemanticLogits(conditional, unconditional, blocked, kArCfgTopK, kArCfgScale);
+      const std::vector<float> probs = TopKProbabilities(guided, kArSamplingTopK);
+      sampled = sampler(probs, Music3Draw{frame_index, 0});
+    }
     if (sampled < 0 || sampled >= vocab) {
       Fail("MiniMax-Music3: the sampler returned token " + std::to_string(sampled) +
            ", outside the language model's " + std::to_string(vocab) + "-entry vocabulary");
@@ -538,7 +617,10 @@ Music3ArResult Music3GenerateFrameHiddens(const std::vector<int32_t>& prompt_ids
         weights.EmbedRow(sampled), residual, depth, weights.depth, ArCompute::kBFloat16);
     std::vector<float> both(feedback);
     both.insert(both.end(), feedback.begin(), feedback.end());
-    session.Step(both, &hidden, &logits);
+    {
+      profile::Timer step_timer("ar.lm_decode_step");
+      session.Step(both, &hidden, &logits);
+    }
   }
 
   if (result.frames == 0) {
