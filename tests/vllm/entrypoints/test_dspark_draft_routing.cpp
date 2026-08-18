@@ -311,6 +311,19 @@ constexpr const char* kNativeQwen3DSparkConfig =
     R"({"architectures":["Qwen3DSparkModel"],"model_type":"qwen3",)"
     R"("block_size":7,"num_hidden_layers":5})";
 
+// The SPECULATORS layout, the second published shape `LoadDsparkDraft` accepts.
+// It declares NO top-level `architectures` at all — `speculators_model_type`
+// identifies it, and `Qwen3DSparkModel::TranslateSpeculatorsDsparkConfig` writes
+// `["Qwen3DSparkModel"]` while translating (algos.py update_dspark). So it is the
+// one layout for which the no-architecture narrowing above and the classification
+// disagree, and which of the two answers it gets depends on the translation
+// running FIRST. Keys reduced to what the translation asserts on.
+constexpr const char* kSpeculatorsDsparkConfig =
+    R"({"speculators_model_type":"dspark","aux_hidden_state_layer_ids":[5,17,29],)"
+    R"("speculators_config":{"proposal_methods":[{"speculative_tokens":7}]},)"
+    R"("block_size":7,"mask_token_id":151665,)"
+    R"("transformer_layer_config":{"model_type":"qwen3","num_hidden_layers":5}})";
+
 EngineParams DsparkParams(const std::string& draft_dir, int k) {
   EngineParams params;
   vllm::SpeculativeConfig cli;
@@ -348,6 +361,12 @@ TEST_CASE("loader refuses a DeepSeek-V4 DSpark draft by name") {
   // part. "DeepSeek-V4" is that name; without it the user is sent hunting.
   CHECK(message.find("DeepSeek-V4") != std::string::npos);
   CHECK(message.find("not implemented") != std::string::npos);
+  // The ARM, not just the lane. Both refusals on this path name DeepSeek-V4 and
+  // say "not implemented", so those two substrings alone cannot tell them apart —
+  // and a test that cannot tell them apart cannot see the identity check
+  // disappear. This case must reach `SpeculativeConfig::IsDsparkDraft`'s refusal,
+  // whose wording is its own.
+  CHECK(message.find("does not identify as") != std::string::npos);
 }
 
 TEST_CASE("loader refuses a DeepSeek-V4 draft whose id DOES carry \"dspark\"") {
@@ -363,6 +382,10 @@ TEST_CASE("loader refuses a DeepSeek-V4 draft whose id DOES carry \"dspark\"") {
   REQUIRE_FALSE(message.empty());  // RED before this row: nothing refuses.
   CHECK(message.find("DeepSeek-V4") != std::string::npos);
   CHECK(message.find("not implemented") != std::string::npos);
+  // The other arm's own wording, for the reason given in the case above: this
+  // draft must be refused by `SpeculativeConfig::ResolveDsparkArchitecture`,
+  // having PASSED the identity check on its model id.
+  CHECK(message.find("routes to the DeepSeek-V4 DSpark lane") != std::string::npos);
 }
 
 TEST_CASE("loader admits a DSparkDraftModel + qwen3 draft") {
@@ -388,6 +411,21 @@ TEST_CASE("loader does not classify a draft that declares no architecture") {
   // and the DeepSeek-V4 refusal is the empty-list guard.
   const DraftDir draft("dspark-noarch", kNoArchitecturesDraftConfig);
   REQUIRE(CarriesDsparkSubstring(draft.path()));
+
+  CHECK(RefusalForDraft(draft.path()).empty());
+}
+
+TEST_CASE("loader classifies a Speculators-layout DSpark draft as the Qwen3 lane") {
+  // The gap this case closes: nothing drove the second published layout through
+  // the new classification. It matters because that layout reaches
+  // `ReadDsparkDraftIdentity` with no `architectures` key of its own, so the
+  // empty-list narrowing would skip it — unless the speculators translation runs
+  // before the key is read, which is what
+  // `src/vllm/entrypoints/model_loader.cpp::ReadDsparkDraftIdentity` does. The
+  // directory name deliberately carries no "dspark", so the ONLY thing that can
+  // admit this draft is the translated architecture.
+  const DraftDir draft("draft-spec-layout", kSpeculatorsDsparkConfig);
+  REQUIRE_FALSE(CarriesDsparkSubstring(draft.path()));
 
   CHECK(RefusalForDraft(draft.path()).empty());
 }

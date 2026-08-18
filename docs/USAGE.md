@@ -2431,6 +2431,17 @@ The two layouts that already run are the native
 `RedHatAI/*.dspark` drafts; the DeepSeek-V4 DSpark draft, whose weights ship
 inside the DeepSeek-V4 target, is refused by name.
 
+**Which refusal you actually get today.** Point the server or the C API at a
+DeepSeek-V4 DSpark draft and the message is the draft loader's — "the draft
+config must carry target_layer_ids and mask_token_id" — not the named
+DeepSeek-V4 refusal. `--model` loading runs the draft checkpoint's own loader
+before the engine resolves its speculative config, so the earlier error wins. The
+named refusal is what the classification produces once it is reached, and moving
+it in front of the draft load needs a second call site inside the draft loader,
+which is owed with the run gate (`SPEC-DSPARK-QWEN3-ROUTING`,
+[#1193](https://github.com/mudler/vllm.cpp/issues/1193)). Either way the draft is
+refused and nothing loads it as a Qwen3 draft; only the wording differs.
+
 ## Muse Glimmer 30B from a GGUF k-quant
 
 The text tower loads from a `muse-glimmer`-architecture GGUF, so the 30B model

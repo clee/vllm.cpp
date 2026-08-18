@@ -14,7 +14,7 @@
 | Work breakdown | §4. |
 | Risks/decisions | §7. |
 | Pin policy | Mirror ahead of the pin, marked `BEYOND-PIN`. §2 gives the reasoning and the precedents. |
-| Role / claim | helper, branch `row/SPEC-DSPARK-QWEN3-ROUTING` |
+| Role / claim | helper. The implementation branch is `row/DSPARK-QWEN3-ROUTING-IMPL`, which does NOT match the `row/<ID>` form this row's ID (`SPEC-DSPARK-QWEN3-ROUTING`) requires. Recorded rather than renamed: renaming mid-flight strands the review that is already anchored to the branch, and the deviation costs a reader one lookup, not a wrong answer. The next branch for this row uses `row/SPEC-DSPARK-QWEN3-ROUTING` |
 | Base | `fd64c76ee45ba49b070ea83024f6678ddd7f64a6` (origin/main, 2026-08-18) |
 | Parity pin | vLLM `555967922` (0.26.0.dev0) at `$VLLM_SOURCE` |
 
@@ -204,14 +204,27 @@ the predicate. `AGENTS.md` "Nothing lands dead" requires the smallest failing
 test to enter the new code through a production entry point, and a unit test on
 `IsDsparkDraft` is exactly the unit test that rule excludes.
 
+**Each refusal is asserted by its OWN wording.** Both refusals on this path name
+DeepSeek-V4 and say "not implemented", so a case that asserts only those two
+substrings cannot tell the identity check from the architecture normalization —
+and a test that cannot tell them apart cannot see either one deleted. The
+identity case asserts "does not identify as"; the normalization case asserts
+"routes to the DeepSeek-V4 DSpark lane". Both mutations in §6 G2 depend on this.
+
+**Both published draft layouts, not one.** The Speculators layout declares no
+top-level `architectures` and is translated to `["Qwen3DSparkModel"]` before the
+classification reads it, so it is the one shape where the no-architecture
+narrowing and the classification disagree and the ORDER decides. It gets its own
+loader case.
+
 ## 6. Gates
 
 | Gate | Content | State |
 |---|---|---|
-| G1, focused | The §5 cases green, the pinned `:132-140` cases unchanged. | owed |
-| G2, mutation | Delete the `ResolveSpecConfig` call site in a scratch copy and rerun G1. A green G1 without the call site measures a class, not a capability, and fails this row. | owed |
-| G3, mutation | Revert the `:131` architecture list to the two pinned names and rerun G1. The first §5 case must go red. | owed |
-| G4, full | `scripts/agent-preflight.sh` and the repository gate on the branch. | owed |
+| G1, focused | The §5 cases green, the pinned `IsDsparkDraft` cases unchanged. | GREEN 2026-08-18: `test_speculative_dspark` 12 cases / 40 assertions, `test_dspark_draft_routing` 6 cases / 17 assertions, both `Status: SUCCESS!`, rc=0 |
+| G2, mutation | Delete the `ResolveSpecConfig` call site in a scratch copy and rerun G1. A green G1 without the call site measures a class, not a capability, and fails this row. Three mutations, because the call site has three separable parts and a refusal that names only the LANE cannot tell them apart. | RED as required 2026-08-18, in a scratch copy at `$SCRATCH/mut`, each with `compile_rc=0`: (a) delete the whole `IsDsparkDraft` call → routing rc=1; (b) make `IsDsparkDraft` return constant `true` → routing rc=1 and the predicate suite rc=1; (c) delete the `ResolveDsparkArchitecture` call → routing rc=1. The scratch tree was restored byte-for-byte and re-verified green after each |
+| G3, mutation | Revert the architecture list in `IsDsparkDraft` to the two pinned names and rerun G1. The first §5 case must go red. | proven by G2(b), which is the stronger form: a predicate that admits EVERYTHING already fails the case that only the `DSparkDraftModel` + `qwen3` arm can pass |
+| G4, full | `scripts/agent-preflight.sh` and the repository gate on the branch. | owed until the branch is merged up to `origin/main` and the run is recorded here |
 | G5, run | Token-exact decode against the pinned oracle with #52197 applied, same target, same draft, same k, greedy. `Qwen/Qwen3.8-27B` + `RadixArk/Qwen3.8-27B-DSpark` at revision `85ef153be924f17ce4bf62726954eeaa4a73e854`. | owed, GPU-blocked, NOT hardware-blocked |
 | G6, spec-off | Decode with speculation off byte-identical before and after. The change touches classification only, so a difference here is a defect in the change. | owed |
 
@@ -314,14 +327,35 @@ in §2 do.
   it declares the key. Gated today by
   `test_dspark_draft_routing.cpp`'s no-architecture case, which pins the
   narrowing so it cannot change silently.
-- **The refusal is not FIRST on the `FromModelDir` path.**
-  `maybe_load_dflash()` runs `LoadDsparkDraft` BEFORE the `LoadedEngine`
-  constructor resolves the speculative config, so a DeepSeek-V4 draft reaching
-  that path fails on `LoadDsparkDraft`'s own "must carry target_layer_ids and
-  mask_token_id" first, and the named refusal only leads on the in-memory
-  constructor path. Owed: a second classification call site inside
-  `LoadDsparkDraft`, plus the test that proves it, which needs a real draft
-  checkpoint and therefore the same authority G5 waits on.
+- **The refusal leads on NO production path yet.** This is stronger than the
+  first writing of this entry, which said it "only leads on the in-memory
+  constructor path" and thereby implied that path was one of two production
+  routes. It is not a production route at all. Measured on this branch:
+
+  - The in-memory constructors
+    `LoadedEngine(HfConfig, Qwen3_5DenseWeights, Tokenizer, EngineParams)` and
+    its `Qwen3_5MoeWeights` sibling — the ones whose member-init runs
+    `ResolveSpecConfig`, and the entry point the reachability suite uses — have
+    NO caller anywhere in `src/`, `include/` or `examples/`. A grep for
+    `LoadedEngine` outside `model_loader.{h,cpp}` finds `src/capi/vllm_c.cpp`
+    and `src/vllm/entrypoints/openai/server_main.cpp`, and both construct
+    through `LoadedEngine::FromModelDir`.
+  - `FromModelDir` is the one production engine constructor, reached from
+    `include/vllm.h` through `src/capi/vllm_c.cpp`. It calls its
+    `maybe_load_dflash` lambda — which calls
+    `src/vllm/entrypoints/model_loader.cpp::LoadDsparkDraft` — BEFORE it
+    constructs the engine, so `ResolveSpecConfig` has not run yet. For exactly
+    the DeepSeek-V4 shape, `LoadDsparkDraft` throws first on the missing
+    `dflash_config` / `target_layer_ids` / `mask_token_id`.
+
+  So a user arriving through the C ABI or the server today still gets
+  `LoadDsparkDraft`'s message, not the named refusal. The classification is
+  correct, gated and reached by its test; what it is not is FIRST. Owed: a
+  second classification call site inside `LoadDsparkDraft`, plus the test that
+  proves it, which needs a real draft checkpoint and therefore the same
+  authority G5 waits on. Scoping this row to `ResolveSpecConfig` is what §3's
+  port map says, so the second call site is a follow-on rather than a defect in
+  the port.
 
 - A pin advance past `555967922` inherits from this row: remove the
   `BEYOND-PIN` marks, re-point the `speculative.py` anchors at the new line
@@ -347,20 +381,87 @@ Stop and report `NEEDS_DECISION` when any of these holds.
 Stop and report `NEEDS_CONTEXT` when the draft download authority or the GPU
 authority is unrecorded. Do not assume either.
 
+## Outcome
+
+Recorded at the W1-W4 landing, ahead of `DONE`, because §3 and §7 R3 name a
+decision this row had to make and neither the code nor the Git history states
+the reason on its own.
+
+**R3, two draft-config reads, not one.** The dspark path now reads the draft's
+`config.json` twice: once in
+`src/vllm/entrypoints/model_loader.cpp::ReadDsparkDraftIdentity` for the two
+classification keys, and once in
+`src/vllm/entrypoints/model_loader.cpp::LoadDsparkDraft` for the weights. Both
+bodies also run the Speculators translation. **Decision: read twice.** The
+hoist was rejected for three reasons. The two reads happen on DIFFERENT sides of
+the engine constructor — `LoadDsparkDraft` runs inside `FromModelDir`'s
+`maybe_load_dflash`, before the constructor whose member-init calls
+`ResolveSpecConfig` — so a shared read has nowhere to live that both reach
+without a new member or a new parameter on a public seam, and widening that seam
+is the growth §9 lists as a stop condition. The cost is a five-layer draft's
+`config.json`, parsed twice at load time, on a path that then reads a 2.53 GiB
+shard; it is not measurable, and this row measured nothing that would justify
+changing it. And the duplication is legible: each read names the keys it wants,
+and neither can silently change what the other sees. When
+[#1225](https://github.com/mudler/vllm.cpp/issues/1225) lands, its
+`ReadDsparkDraftKeys` makes it three reads with near-identical bodies, at which
+point ONE hoist serving all three callers is worth its own row. Hoisting one of
+the three here would leave the same duplication in a shape harder to reason
+about.
+
+**The DeepSeek-V4 refusal, and what it does not yet reach.** §7 R2's decision
+stands and is argued in three places (the predicate's header, the loader, and
+this row). What the review corrected is the claim about its REACH: the refusal
+leads on no production path today, because `FromModelDir` runs
+`LoadDsparkDraft` before `ResolveSpecConfig`. The corrected statement and the
+owed second call site are under `## Owed`.
+
+**TWO divergences from upstream, not one.** The first writing named only the
+DeepSeek-V4 refusal. The second is at branch 3: upstream leaves a Gemma4 draft's
+`Gemma4DSparkModel` architecture in place and normalizes only its keys, because
+upstream has a Gemma4 DSpark class to dispatch to. This engine has one DSpark
+draft lane, so branch 3 COLLAPSES onto `Qwen3DSparkModel`, and that collapse is
+what makes `ResolveDsparkArchitecture` total over a single lane.
+
+**Why the loader dispatches on nothing.** The first shape of the call site
+guarded on `lane != "Qwen3DSparkModel"` and threw. Because of the collapse
+above, no input can enter that branch: the function answers `Qwen3DSparkModel`
+or throws. A reviewer's mutation deleted the branch and both suites stayed
+green, which is the definition of dead code under `AGENTS.md` `## Nothing lands
+dead`. It was deleted rather than disclosed, because the staged-slice exception
+is for work a named row will wire, and no row will wire this one: the branch
+becomes live only when a SECOND lane exists, and the change that adds that lane
+is the change that should add its dispatch. `ResolveDsparkArchitecture` is still
+called, for its refusal — a mutation deleting the call turns the routing suite
+red.
+
+**Why an empty `architectures` list is not classified.** Under `## Owed`.
+Upstream can send an absent key to its DeepSeek-V4 path; refusing here would
+refuse a checkpoint whose contents nobody on this host has read, and the native
+`deepseek-ai/dspark_qwen3_*_block7` drafts load today.
+
 ## Now
 
-`READY`. The spec is committed, [#1193](https://github.com/mudler/vllm.cpp/issues/1193)
-is open, and no implementation has landed.
+`ACTIVE`. W1-W4 have landed on the row's branch, been reviewed once and repaired
+once. [#1193](https://github.com/mudler/vllm.cpp/issues/1193) is open and stays
+open until G5 runs.
 
-The pin decision is made and recorded: **mirror #52197 ahead of the pin, marked
-`BEYOND-PIN`**, on the precedent of `.agents/model-matrix.md:318-319`,
-`:100` and `:211`. §2 carries the reasoning. A pin advance is not scoped by this
-row and is not blocked by it.
+Landed: `IsDsparkDraft` carries the `DSparkDraftModel` + `qwen3` pair;
+`ResolveDsparkArchitecture` normalizes the three accepted shapes and refuses the
+DeepSeek-V4 lane by name; and the dspark branch of `ResolveSpecConfig` reaches
+both from the draft's own `config.json`. G1 green (`test_speculative_dspark`
+12 cases / 40 assertions, `test_dspark_draft_routing` 6 cases / 17 assertions),
+G2 and G3 proven by mutation, G4 by the branch gate.
 
-The reality check is answered: `RadixArk/Qwen3.8-27B-DSpark` exists at revision
-`85ef153be924f17ce4bf62726954eeaa4a73e854` with the exact config shape, so this
-row is gateable on this host. The 2.4T lane named by the upstream PR stays
-memory-infeasible here and is not claimed.
+The pin decision stands as recorded in §2: **mirror #52197 ahead of the pin,
+marked `BEYOND-PIN`**, on the precedent of the three existing `BEYOND-PIN` rows
+in `.agents/model-matrix.md`. A pin advance is not scoped by this row and is not
+blocked by it.
 
-Next: dispatch a fresh implementer for W1-W3 against this spec. W1 captures the
-two reds of §5 before any production edit.
+Next, in order: G5, the token-exact run gate against
+`Qwen/Qwen3.8-27B` + `RadixArk/Qwen3.8-27B-DSpark` @
+`85ef153be924f17ce4bf62726954eeaa4a73e854`, which needs the 2.53 GiB draft
+download and a GPU lease and has neither; then G6, the spec-off byte-identity
+check. Both are `PENDING` against a named external authority, not failing, and
+the row does not reach `DONE` until they run. The second classification call
+site under `## Owed` waits on the same authority.

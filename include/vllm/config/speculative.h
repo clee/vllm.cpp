@@ -172,8 +172,10 @@ struct SpeculativeConfig {
   // catch-all, so the specific case is claimed before the general one rewrites
   // it.
   //
-  // ONE TRACKED DIVERGENCE, at branch 2. Upstream rewrites the config and lets
-  // the DeepSeek-V4 model path take it. That path does not exist here:
+  // TWO TRACKED DIVERGENCES, and both are deliberate.
+  //
+  // DIVERGENCE 1, at branch 2. Upstream rewrites the config and lets the
+  // DeepSeek-V4 model path take it. That path does not exist here:
   // DeepseekV4Model is a stub that fails a VT_CHECK
   // (src/vllm/model_executor/models/deepseek_v4_registry.cpp) and the lane needs
   // two Sparks. Mirroring the rewrite would send the draft into the stub and
@@ -181,9 +183,17 @@ struct SpeculativeConfig {
   // REFUSES by name — which is what AGENTS.md requires of an unimplemented arm.
   // .agents/specs/dspark-qwen3-routing.md §7 R2 records the decision.
   //
-  // Branches 1 and 3 both answer "Qwen3DSparkModel" because the one DSpark draft
-  // lane this engine implements is LoadQwen3DSpark, which both published layouts
-  // load through (src/vllm/entrypoints/model_loader.cpp).
+  // DIVERGENCE 2, at branch 3. Upstream leaves a Gemma4 draft's architecture
+  // ALONE — "Gemma4DSparkModel" stands and only its keys are normalized
+  // (speculative.py:945-961) — because upstream has a Gemma4 DSpark model class
+  // to dispatch to. This engine does not: LoadQwen3DSpark is the one DSpark
+  // draft lane, and both published layouts load through it
+  // (src/vllm/entrypoints/model_loader.cpp::LoadDsparkDraft). So branch 3
+  // COLLAPSES onto "Qwen3DSparkModel" together with branch 1, and this function
+  // answers exactly one lane or throws. The collapse is what makes a
+  // lane-dispatch guard at the call site dead code today; it is undone by the
+  // change that lands a second lane, not before.
+  // .agents/specs/dspark-qwen3-routing.md §3 designs it this way.
   static std::string ResolveDsparkArchitecture(
       const std::vector<std::string>& architectures,
       const std::string& model_type) {

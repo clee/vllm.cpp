@@ -966,22 +966,20 @@ std::optional<vllm::SpeculativeConfig> LoadedEngine::ResolveSpecConfig(
               "Sparks. Owed by row SPEC-DSPARK-QWEN3-ROUTING "
               "(.agents/specs/dspark-qwen3-routing.md).");
         }
-        // Upstream's normalization (#52197 hunk 2). Refuses the DeepSeek-V4
-        // fallback by name; see the tracked divergence on the function itself.
-        const std::string lane = vllm::SpeculativeConfig::ResolveDsparkArchitecture(
-            ident->architectures, ident->model_type);
-        if (lane != "Qwen3DSparkModel") {
-          // Not reachable from the three branches above, which all answer
-          // "Qwen3DSparkModel" or throw. It is the seam a further upstream lane
-          // (#52197's own context already carries a K3DSparkModel arm this pin
-          // does not have) arrives through, and LoadDsparkDraft implements one
-          // lane, so the arrival must be named rather than silently loaded.
-          throw std::invalid_argument(
-              "speculative-config: the DSpark draft at \"" + *cli.draft_model_path +
-              "\" normalizes to architecture \"" + lane +
-              "\", and the only DSpark draft lane implemented here is "
-              "\"Qwen3DSparkModel\" (LoadDsparkDraft)");
-        }
+        // Upstream's normalization (#52197 hunk 2), called for its REFUSAL. At
+        // this pin `SpeculativeConfig::ResolveDsparkArchitecture` is TOTAL over
+        // its two outcomes: it answers "Qwen3DSparkModel" or it throws the
+        // DeepSeek-V4 refusal by name. So the returned lane is always the one
+        // `LoadDsparkDraft` implements, and a `lane != "Qwen3DSparkModel"` guard
+        // here would be a branch nothing can enter — dead code, which the earlier
+        // shape of this call site carried and a mutation caught. When a further
+        // upstream lane arrives (#52197's own context already carries a
+        // `K3DSparkModel` arm absent from this pin), the returned value becomes a
+        // decision and the dispatch lands WITH the lane that needs it; the
+        // pin-advance item under `## Owed` in
+        // .agents/specs/dspark-qwen3-routing.md carries that.
+        vllm::SpeculativeConfig::ResolveDsparkArchitecture(ident->architectures,
+                                                           ident->model_type);
       }
     }
     vllm::SpeculativeConfig resolved = vllm::SpeculativeConfig::ResolveDspark(

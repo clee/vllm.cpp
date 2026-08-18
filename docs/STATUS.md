@@ -276,6 +276,8 @@ a spike while its user-facing serving surface is finalized.
 
 **Method surface (enumerated from vLLM source 2026-08-06, `.agents/specs/spec-decode-inventory.md`).** Of the 13 vLLM `SpeculativeMethod` strings we ship MTP (any k), DFlash, DSpark and n-gram; draft_model is a CPU brick and Medusa a spike; EAGLE1/EAGLE3, ngram-gpu, suffix, custom_class, extract_hidden_states, dynamic-k and the synthetic/block acceptance variants are INVENTORIED; mlp_speculator is upstream-deprecated (no V1 proposer). Draft DEPTH: MTP k>1 is BUILT and CPU-gated (`SPEC-MTP-K-GT-1`, no speed number yet). Dynamic (batch-size-keyed) and adaptive (acceptance-driven) depth stay unbuilt (`ROAD-V1-D3-SPEC-K`, #81).
 
+**DSpark draft routing** (`SPEC-DSPARK-QWEN3-ROUTING`, ACTIVE) makes the loader classify a DSpark draft from the draft's own `config.json` before it resolves anything else. `Qwen3DSparkModel`, `Gemma4DSparkModel` and — ahead of the pin, mirroring vllm#52197 — `DSparkDraftModel` with `model_type` `qwen3` take the landed Qwen3 lane; a draft that resolves to the DeepSeek-V4 DSpark lane is refused BY NAME instead of being rewritten into a stub. CPU-gated only: the token-exact run gate against the pinned oracle waits on a draft download and GPU time that are not authorized, so it stays owed (#1193).
+
 **DeepSeek-V4 native MTP** (`DeepSeekV4MTPModel`, ACTIVE — W1 self-spec wiring,
 2026-07-30) has its nextn draft head wired to the same lossless spec-decode path.
 Unlike V3's fused `eh_proj`, the V4 nextn layer keeps separate `e_proj`/`h_proj`,
