@@ -322,7 +322,7 @@ void DisableGdnFp8InProjDebugStats();
 // term that separates "the forward produced f32" from "the forward never reached
 // that path", which are the same silence to a dtype comparison.
 //
-// THREE LIMITS, stated because the sentence above is narrower than it first
+// FOUR LIMITS, stated because the sentence above is narrower than it first
 // reads and a reader who takes `observed` for a complete answer gets a wrong one
 // (fresh-review finding).
 //
@@ -346,6 +346,12 @@ void DisableGdnFp8InProjDebugStats();
 //  3. It records at CUDA-graph CAPTURE, not at replay. Replay does no host
 //     dispatch, so under graphed decode the values are whatever the capturing
 //     step wrote. Same caveat as the fp8 sibling's "read on an eager step".
+//  4. It does not cover the NON-PAGED `GdnBlock` either (qwen3_5.cpp), which
+//     allocates at the same `outdt` and records nothing. The word "paged" above
+//     already excludes it, but a list a reader takes for complete has to say so:
+//     a forward that runs the non-paged block leaves `observed` exactly as
+//     limit 1 does, and this list is complete only with both uncovered sites on
+//     it.
 struct GdnOutActivationDTypes {
   bool observed = false;
   vt::DType core_out = vt::DType::kF32;  // dcore [T,Hv,Dv]

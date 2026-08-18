@@ -1975,7 +1975,14 @@ inline void LaunchGatedFast(cudaStream_t s, Tensor& out, const Tensor& x, const 
 // This covers BOTH the bf16 core/z/weight both gate models carry by default since
 // #1168 (GdnOutDType stopped branching on model shape, so the 35B is no longer the
 // f32 arm) AND the f32 core/z/weight the VT_GDN_OUT_BF16=0 rollback restores on
-// either of them; `out` is bf16 under GlueFuse and otherwise follows the input.
+// either of them; `out` is bf16 exactly when GlueFuseEnabled() and f32
+// UNCONDITIONALLY otherwise -- it does NOT follow the input. All three
+// non-GlueFuse gated-norm call sites allocate `DBuf dgated(d, DType::kF32, ...)`
+// whatever the input dtype (qwen3_5.cpp:3965, :4435, :4886), so this row's own
+// VT_GDN_OUT_BF16=1 default plus the documented VT_GLUE_FUSE=0 rollback makes
+// bf16-in/f32-out a REACHABLE pair. That is why all four (Tin,Tout)
+// instantiations below are live: the dispatch reads out.dtype independently of
+// x.dtype, and narrowing it to the diagonal would drop a shipped combination.
 // Out-of-scope shapes keep RmsNormGatedRowKernel. The launch
 // uses kGatedFastBlock (=128) threads and reproduces shipped's reduction ORDER, so the
 // output is bit-identical for every dispatched (Tin,Tout).

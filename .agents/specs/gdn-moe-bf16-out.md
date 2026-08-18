@@ -407,11 +407,12 @@ than as an omission.
   the merged arm slower while the split arm gets faster. It is a measurement, not
   a blocker, and it is why the A/B reports the two leaves separately.
 - **First bf16 exposure of the fp8-fused gated norm.** The 35B's `out_proj` is
-  W8A8 fp8, so it takes `vt::RmsNormGatedQuantFp8` (`:4768`); the 27B's is fp4 and
-  never did (`:4747-4748`). The op accepts bf16 and the CUDA kernel dispatches it,
+  W8A8 fp8, so it takes `vt::RmsNormGatedQuantFp8` (`:4873`); the 27B's is fp4 and
+  never did (`:4896-4897`). The op accepts bf16 and the CUDA kernel dispatches it,
   but no gate has run that combination on a real checkpoint. Test 3 was assigned
-  to reach it and **cannot**: the call is guarded by
-  `!w.out_proj_fp8.Empty() && supports_fp8()`, the synthetic CPU model carries no
+  to reach it and **cannot**: the call is guarded by FOUR terms,
+  `!w.out_proj_fp8.Empty() && GdnOutFp8FuseEnabled() && GlueFuseEnabled() &&
+  supports_fp8()` (`:4854-4855`), the synthetic CPU model carries no
   fp8 `out_proj`, and the CPU platform does not report fp8. So Test 3 exercises
   the plain `vt::RmsNormGated` arm and this risk is UNMET on the CPU tier by
   construction, not by omission. It is owed to the 35B GPU gate and recorded
@@ -524,8 +525,10 @@ mistake the silence for absence, and contradicts none of it.
   AOT arms are pinned to 48 or 32 linear V-heads, so `Qwen3.8-2.4T-A95B` (128)
   runs the hand CUDA kernels the vendoring exists to replace. Not measurable on
   this hardware.
-- **The first bf16 pass through `vt::RmsNormGatedQuantFp8`** (`qwen3_5.cpp:4840`,
-  reached only when `!w.out_proj_fp8.Empty() && supports_fp8()`). `## Risks` names
+- **The first bf16 pass through `vt::RmsNormGatedQuantFp8`** (guard
+  `qwen3_5.cpp:4854-4855`, call `:4873`; reached only when
+  `!w.out_proj_fp8.Empty() && GdnOutFp8FuseEnabled() && GlueFuseEnabled() &&
+  supports_fp8()`). `## Risks` names
   it and `## Tests` assigned it to Test 3, which cannot reach it on the CPU tier
   for the two structural reasons recorded there. The op accepts bf16 and the CUDA
   kernel dispatches it, so this is an unexercised combination rather than a known

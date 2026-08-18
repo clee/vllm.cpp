@@ -122,7 +122,12 @@ vt::DType detail::GdnProjectedMixedQkvDType(const GdnMixedQkvDTypeInputs& in) {
 // in the ONE place both the producer and the predictor read. See the header for
 // why each term is required; the short version is that the toggle is the opt-in,
 // `indt` keeps VT_GDN_IN_BF16's rollback honest on this arm too, and `outdt`
-// confines the narrowing to the dense 27B.
+// keeps the chain dtype-uniform. `outdt` used to be described as what "confines
+// the narrowing to the dense 27B"; GDN-MOE-BF16-OUT (#1168) removed the
+// model-shape argument from `GdnOutDType`, so `outdt` is BF16 on BOTH arms at
+// the default and confines nothing. The DEFAULT-OFF `VT_GDN_FP8_IN_BF16` toggle
+// (`GdnFp8InBf16Enabled`, which requires a leading '1') is now the only term
+// keeping this inert on the 35B.
 vt::DType detail::GdnFp8MergedMixedQkvDType(bool fp8_in_bf16_enabled,
                                            vt::DType in_dtype,
                                            vt::DType out_dtype) {
