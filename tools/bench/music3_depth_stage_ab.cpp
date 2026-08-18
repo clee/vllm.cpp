@@ -1,5 +1,5 @@
 // MiniMax-Music3 depth-stage A/B driver (#672) — the source behind
-// `.agents/specs/minimax-music3.md` §15.6 and benchmark-record's
+// `.agents/specs/minimax-music3.md` §16.6 and benchmark-record's
 // MUSIC3-DEPTH-INCREMENTAL section.
 //
 // DELIBERATELY NOT A REGISTERED TEST. It allocates 2.5 GB of weights and spends
@@ -8,7 +8,7 @@
 // OBJECT libraries `vllm_music3_depth_stage_ab_{before,after}` in CMakeLists.txt
 // — nothing is linked and no weight is ever allocated, and the file cannot rot
 // behind a `LinearNoBias` signature change while still being the only artifact a
-// reader can reproduce §15.6's 3.50x from (#1246).
+// reader can reproduce §16.6's 3.50x from (#1246).
 //
 // To RUN it, compile it twice and link each against the `libvllm.a` you want to
 // compare. The recipe is in a block comment because a `//` line may not end in a

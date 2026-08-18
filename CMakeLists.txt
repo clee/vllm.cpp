@@ -2298,7 +2298,7 @@ if(VLLM_CPP_SERVER)
 endif()
 
 # ── BIT-ROT GUARD: the MiniMax-Music3 depth-stage A/B driver (#672, #1246) ────
-# `tools/bench/music3_depth_stage_ab.cpp` is the sole artifact behind spec §15.6's
+# `tools/bench/music3_depth_stage_ab.cpp` is the sole artifact behind spec §16.6's
 # 3.50x and its `f0cfeed6eee4f55d` fingerprint. Its own header argues, correctly,
 # that CI must never RUN it: it allocates 2.5 GB of weights, spends seconds per
 # round, and is a TWO-BUILD A/B that one target could not express anyway. None of
@@ -2408,4 +2408,18 @@ endif()
 
 if(VLLM_CPP_BUILD_EXAMPLES)
   add_subdirectory(examples)
+endif()
+
+# `vllm-cli`'s own reachability gate (#1135) runs the BINARY, so it needs the
+# binary built first. The dependency is declared HERE rather than in
+# tests/CMakeLists.txt because `add_subdirectory(tests)` runs before
+# `add_subdirectory(examples)`, so the `vllm-cli` target does not exist yet at
+# that point. The `$<TARGET_FILE:vllm-cli>` compile definition in tests/ is fine
+# there, because a generator expression is evaluated after every directory has
+# been processed. With examples off there is no `vllm-cli` target, no
+# `VLLM_CLI_BINARY` define, and the test EXITS 77 so CTest reports it Skipped
+# (see tests/vllm/entrypoints/test_cli_offload_config.cpp); this guard is the only
+# thing that has to know about the ordering.
+if(TARGET test_cli_offload_config AND TARGET vllm-cli)
+  add_dependencies(test_cli_offload_config vllm-cli)
 endif()
