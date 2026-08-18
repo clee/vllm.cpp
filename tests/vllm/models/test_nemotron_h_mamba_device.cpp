@@ -455,9 +455,20 @@ TEST_CASE("NemotronH A2-Q1: the device Mamba2 arm carries conv and SSM state acr
                                 << " ; noise floor " << noise_floor << " over " << examined
                                 << " elements");
   const bool resolvable = separation > 2.0 * noise_floor;
+  // ★ std::string, NOT a char* ternary. doctest stringifies a `const char*` as a
+  // BOOL, so `<< (cond ? "yes" : "no ...")` prints `1` whichever branch is live
+  // -- the Thor run printed exactly that, and this line's entire job is to make
+  // "no assertion was made here" a STATED result rather than a silent hole. A
+  // diagnostic that cannot say what it means is the same class of defect as the
+  // band it is reporting on. Reproduced and fixed against doctest 2.5.2:
+  // `MESSAGE("x " << (false ? "yes" : "prose"))` prints `x 1`, and the
+  // std::string form prints `x prose`.
+  const std::string resolvable_verdict =
+      resolvable ? std::string("yes")
+                 : std::string("no -- the separation is inside the noise, so the "
+                               "assertion is on the STATE above");
   MESSAGE("is a dropped carry RESOLVABLE from the second leg's output here? "
-          << (resolvable ? "yes" : "no -- the separation is inside the noise, so the "
-                                   "assertion is on the STATE above"));
+          << resolvable_verdict);
   if (resolvable) {
     const double band = separation / 2.0;
     MESSAGE("accepting the second leg at band " << band);

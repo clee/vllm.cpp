@@ -520,6 +520,36 @@ for (`ssm_dtype == f32`), so the cheap arm was gating a path production does not
 take. And the whole file was a skip on a GPU-less box, so a CPU-runnable case now
 pins the op contract the split depends on.
 
+### 10.2b The repaired carry gate, re-run on hardware, and what it measured
+
+Thor re-run at the branch head: `test_nemotron_h_mamba_device` **5 cases, 63
+assertions, 0 failed**, and every neighbouring suite green again. The repair of
+§10.2 therefore holds on the silicon that exposed the defect, and the numbers it
+prints now justify the repair rather than merely passing:
+
+| quantity | measured | separation | band | margin |
+|---|---|---|---|---|
+| W8A8-vs-W8A16 noise floor, T=1 | **0.2465** | — | — | the reference for everything below |
+| carried conv window | **0.1746** over 576 elements | 1.0 (zeroed) | 0.5 | 2.9x |
+| carried SSM state | **0.0614** over 2048 elements | 1.0 (zeroed) | 0.5 | 8.1x |
+| second leg's output | 0.7055 | 0.2045 | — | NO assertion, see below |
+
+**The data now proves the diagnosis that drove the repair.** A dropped carry
+separates the second leg's output by 0.2045, while the noise the comparison must
+accept is 0.2465 — the defect is genuinely SMALLER than the noise, so
+`separation > 2 * noise_floor` is false and the case makes no assertion there, by
+design. The state comparison carries the case instead, at 2.9x and 8.1x margins.
+Had the original band survived, it would have been asserting on a quantity it
+cannot resolve.
+
+**One diagnostic was defective and is fixed.** The line that reports whether the
+second leg is resolvable printed `1` rather than its prose, because doctest
+stringifies a `const char*` as a BOOL and the message streamed a `char*` ternary.
+That line's whole job is to make "no assertion was made here" a STATED result
+rather than a silent hole, so a version of it that cannot say what it means is
+the same class of defect as the band it reports on. It now builds a
+`std::string`; reproduced against doctest 2.5.2 both ways before the fix.
+
 ### 10.3 The A/B: the arm is token-exact on Thor, and the busy fraction is VOID
 
 Same lease, same binary, same checkpoint, same golden, differing only by
