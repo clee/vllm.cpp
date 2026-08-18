@@ -2351,7 +2351,7 @@ straight at the file; the config comes from the GGUF's own metadata, so no
 `config.json` is needed:
 
 ```sh
-./build/vllm-server --model /path/to/muse-glimmer-30B-kquant-17gb.gguf
+build/examples/vllm-server --model /path/to/muse-glimmer-30B-kquant-17gb.gguf
 ```
 
 Both published k-quants load (`muse-glimmer-30B-kquant-17gb.gguf` and the mixed
@@ -3832,7 +3832,7 @@ save.
 ```sh
 VT_MOE_EXPERT_STREAM=1 \
 VT_MOE_EXPERT_STREAM_SLOTS=8000 \
-  ./build/vllm-cli --model /models/Qwen3.8-2.4T-A95B-UD-Q1_0-00001-of-00008.gguf \
+  ./build/vllm-cli --model /models/Qwen3.8-2.4T-A95B-UD-Q1_0-00001-of-00010.gguf \
                    --prompt "The capital of France is" --max-tokens 16
 ```
 
@@ -3845,7 +3845,7 @@ weights from the device to host RAM, and the `vllm_cpp` key governs the tier
 below that, where weights stay borrowed out of the file mapping.
 
 ```sh
-./build/vllm-server --model /models/Qwen3.8-2.4T-A95B-UD-Q1_0-00001-of-00008.gguf \
+build/examples/vllm-server --model /models/Qwen3.8-2.4T-A95B-UD-Q1_0-00001-of-00010.gguf \
   --offload-config '{"vllm_cpp":{"mmap":{"enabled":true,"prefault":false},
                                  "expert_stream":{"enabled":true,"slots":8000}}}'
 ```
@@ -4051,6 +4051,215 @@ late failure back. It does not make the model fit.
 on a GB10, because host and device share one pool. `cudaMemGetInfo` answers
 honestly, and its `total` is EXACTLY `/proc/meminfo MemTotal`
 (125442340 kB) times 1024. Do not size this from `nvidia-smi`.
+
+## Qwen3.8-2.4T-A95B `UD-Q1_0`: 370 GiB served from a 119 GiB box
+
+A 2.4-trillion-parameter mixture-of-experts checkpoint, three times the size of
+the machine's memory, loads and answers on one DGX Spark with no GPU offload and
+no swapping. This section is the recipe. The mechanism it drives is the previous
+section, [Streaming routed experts from disk](#streaming-routed-experts-from-disk-capacity-mode),
+which owns the config schema, the precedence rule, the statistics line and the
+`--device cuda` refusal; nothing here repeats them.
+
+**Read the speed before you spend the download.** Steady decode is tens of
+seconds per token, and the ceiling is set by storage rather than by this
+implementation — see [What decode costs](#what-decode-costs-and-why-the-ceiling-is-where-it-is)
+below. This is a capacity result, not an interactive one.
+
+### The exact weights (so the run is reproducible)
+
+| field | value |
+|---|---|
+| repo | [unsloth/Qwen3.8-2.4T-A95B-GGUF](https://huggingface.co/unsloth/Qwen3.8-2.4T-A95B-GGUF) — third party (Unsloth), see the note below |
+| revision | `567d3e6ac26c5474b18311e619c04350fb9a5556` |
+| arm | `UD-Q1_0`, roughly one bit per weight; the repo carries other arms in sibling directories |
+| weights | `UD-Q1_0/Qwen3.8-2.4T-A95B-UD-Q1_0-000{01..10}-of-00010.gguf`, **ten** shards |
+| on-disk total | 397 256 393 248 bytes (369.97 GiB) |
+| tensor records | 1702, matching the `split.tensors.count` both tensor tables declare |
+| sha256 (shard 1) | `b7770552b2ac24e7334c917bc92e90e218e87cfe29484db65e62e8ef2a60334d` for `-00001-of-00010.gguf` (10 943 264 B) |
+| sha256 (shard 2) | `2765517f833c736338d3ab34354e1c10eb8d79e62325f998285b435e5cf03dcd` for `-00002-of-00010.gguf` (48 759 636 544 B) |
+
+**A repo id alone is not a pin**, because a quantized checkpoint gets
+re-quantized in place under an unchanged name. Both digests are that revision's
+own LFS records, read from the `X-Linked-ETag` the resolve endpoint returns.
+Shard 1 is pinned as well as shard 2 because shard 1 carries no weights — it is
+the metadata and the split declaration, so it is the file that decides what the
+other nine are.
+
+```sh
+hf download unsloth/Qwen3.8-2.4T-A95B-GGUF \
+  --revision 567d3e6ac26c5474b18311e619c04350fb9a5556 \
+  --include "UD-Q1_0/*" \
+  --local-dir ./qwen3.8-2.4t-a95b-gguf
+```
+
+The files land under a `UD-Q1_0/` subdirectory of `--local-dir`, because that is
+where they live in the repo. Point `--model` at the copy on **local NVMe**: a
+network filesystem puts an uncontrolled variable in front of every one of the
+6.95 GB of expert reads each token makes.
+
+**The encoding has no upstream reference.** `UD-Q1_0` stores its expert towers as
+`IQ1_XXXS`, which upstream llama.cpp does not define; it exists only in the
+`unslothai/llama.cpp` fork, pinned as a secondary oracle in
+[`.agents/oracles/llama-cpp-unsloth.md`](../.agents/oracles/llama-cpp-unsloth.md).
+The decode is sealed against golden vectors produced by that fork. The fork itself is
+recorded `gateable = no` — it has not been shown to build and run this model, and
+[#933](https://github.com/mudler/vllm.cpp/issues/933) owes that measurement — so
+there is no token-exact denominator for anything below.
+
+### Build and serve
+
+A plain CPU build is enough; no CUDA is involved on this path.
+
+```sh
+cmake -S . -B build
+cmake --build build -j
+```
+
+```sh
+build/examples/vllm-server \
+  --model ./qwen3.8-2.4t-a95b-gguf/UD-Q1_0/Qwen3.8-2.4T-A95B-UD-Q1_0-00001-of-00010.gguf \
+  --offload-config '{"vllm_cpp":{"mmap":{"enabled":true,"prefault":false}}}' \
+  --device cpu \
+  --max-num-seqs 1 \
+  --max-model-len 512 \
+  --port 8899
+```
+
+Four things in that line are load-bearing.
+
+- **`--model` takes shard 1, not the directory.** A directory sends the loader
+  down the HuggingFace branch, which fatals on a missing `config.json` before it
+  looks for a GGUF. Given shard 1 the reader finds its nine siblings from the
+  `-NNNNN-of-MMMMM.gguf` naming and cross-checks `split.count`.
+- **`prefault: false` is the setting that decides whether this works.**
+  Pre-faulting is **on** by default (`VT_GGUF_PREFAULT`), and it is the right
+  default for a model that fits: it walks every borrowed span at load so the
+  first-touch faults do not land inside the timed prefill. For 335.62 GiB of
+  expert towers that cannot fit, it reads the whole checkpoint to populate a page
+  cache that cannot hold it.
+- **`mmap: true` confirms the default rather than enabling it** — it is already
+  on wherever weights stay quantized. It is what makes the checkpoint fit at all:
+  an expert tower is borrowed from the file mapping and costs zero anonymous
+  bytes, so only the dense remainder becomes resident.
+- **`--device cpu`.** `--device cuda` is refused at load, by name and with the
+  arithmetic, because the larger-than-memory lane is host-only. That refusal is
+  documented in the previous section.
+
+`--max-num-seqs 1` and a small `--max-model-len` keep the KV cache out of the
+way. At this speed nothing is being batched, and the capacity argument itself
+only holds at low concurrency: at high concurrency every step touches most of the
+experts and the working set stops being one.
+
+`--offload-config` does **not** reach `vllm-cli`, nor the server's
+pooling/embedding and transcription-only paths
+([#1135](https://github.com/mudler/vllm.cpp/issues/1135)). Use `VT_GGUF_PREFAULT=0`
+on those.
+
+### What the load costs
+
+Expect to wait. Two runs are recorded, and the spread is the page cache rather
+than noise: **13 minutes** to a serving state on the first `--device cpu` run
+(16 August 2026), and **26 minutes** on the run that produced the CUDA refusal
+([#1123](https://github.com/mudler/vllm.cpp/issues/1123)).
+
+Resident anonymous memory settles at **62 GiB** of 119 GiB and stays there. That
+is the dense remainder plus the KV cache and runtime, and it matches what the
+checkpoint's own tensor table predicts (21.56 GiB of `attn_qkv` and 17.25 GiB of
+`ssm_out` expanded to bf16, plus 5.81 GiB of embeddings and F32 norms, so 44.6
+GiB before KV and runtime). The other 335.62 GiB is mapped, not copied. **The
+model does not fit because of streaming; it fits because of borrowing.**
+
+Check readiness against the model list rather than the process:
+
+```sh
+curl -sf http://127.0.0.1:8899/v1/models
+```
+
+```sh
+curl -s http://127.0.0.1:8899/v1/completions -H 'Content-Type: application/json' \
+  -d '{"model":"Qwen3.8-2.4T-A95B-UD-Q1_0-00001-of-00010.gguf",
+       "prompt":"Q: What is the capital of France? A:","max_tokens":4}'
+```
+
+It answers ` Paris. Q: What`, which is the whole point: the output is coherent,
+so the one-bit encoding and the borrowed-tower path are both faithful enough to
+serve.
+
+### What decode costs, and why the ceiling is where it is
+
+| | measured |
+|---|---|
+| TTFT, warm page cache | 667.0 s ([#1123](https://github.com/mudler/vllm.cpp/issues/1123)) |
+| TTFT, cold | 3318 s |
+| steady decode, warm | **44.2 s/token** ([#1123](https://github.com/mudler/vllm.cpp/issues/1123)) |
+| steady decode, cold | 66.7 s/token (66.5, 66.9, 66.8) |
+
+Do not quote a TTFT as a decode number: token 1 carries prefill and the cold
+expert set. From token 2 onward you are watching steady state. The full
+measurement record is [docs/BENCHMARKS.md](BENCHMARKS.md).
+
+The arithmetic behind those seconds is short and it decides everything. Every
+output token routes 93 blocks through the top 10 of 512 experts, and each expert
+contributes three projections:
+
+| | |
+|---|---|
+| expert slices per token | 93 x 10 x 3 = 2790 |
+| bytes per slice | 2 490 368 (2.375 MiB) |
+| read per token | **6.95 GB** (6.47 GiB) |
+| implied rate at 44.2 s/token | 157 MB/s |
+| NVMe sequential, for reference | ~5 GB/s |
+
+Two things follow, and the second one is the important one.
+
+**There is real headroom.** 157 MB/s is what single-queue synchronous reads
+give; issuing those 2790 reads concurrently should approach storage speed, which
+is roughly a 32x decode improvement still on the table.
+
+**And that improvement lands near 0.72 tok/s, not higher.** 6.95 GB at 5 GB/s is
+1.39 s/token whatever the software does. Reaching 3 tok/s would demand about 21
+GB/s of expert bandwidth, which means serving most of those reads from RAM — and
+with 335.62 GiB of experts against at most tens of GB spendable on cache, top-10-of-512
+routing does not give consecutive tokens enough reuse to close that gap. **If you
+need conversational speed from this model you need more memory or fewer active
+parameters, not better software.**
+
+### The expert slot cache is off, and it has not yet earned being on
+
+`vllm_cpp.expert_stream` copies routed slices into a fixed slot arena instead of
+re-faulting them through the mapping. It is off by default and this checkpoint is
+the reason the default has not moved.
+
+In the recorded run (8000 slots, `resident=18.55 GiB` of arena) it was
+**token-identical** to the mapped path and cut TTFT 4.5x, from 3318.1 s to
+733.4 s — prefill touches a wide expert set once, where sequential order and slot
+reuse both help. Both of those are COLD-cache figures against the cold baseline
+in the table above; do not read 733.4 s against the warm 667.0 s, which is a
+different regime. **Its steady-decode figure is recorded VOID**, not as a win or a
+loss: the step clock had no caller, so the cache stopped serving in token 3 and
+the run measured the mapped path wearing the cache's name
+([#912](https://github.com/mudler/vllm.cpp/issues/912) F1). The re-measure is
+owed.
+
+Two bounds are already known and neither needs that re-measure. The fill copies
+from a pointer into the mmap, so it still takes the page fault it exists to
+avoid; and 6.95 GB per token against a ~20 GiB arena is under three tokens of
+working set. Before believing any number you take here, read the
+`[expert-stream]` final statistics line: `steps` must advance and `exhausted`
+must stay 0, or the run measured something else.
+
+### What this does not establish
+
+- **The quantization is extreme.** Roughly one bit per weight. The output is
+  coherent; this is not the configuration to judge the model's quality by.
+- **There is no oracle.** No entry in the oracle table runs this checkpoint on
+  this hardware, so there is no token-exact or throughput denominator — every
+  figure above is an absolute measurement of this implementation, compared to
+  nothing.
+- **One request at a time.** Nothing here says anything about concurrency, and
+  the capacity argument stops holding as concurrency rises.
+- **Timings are warm unless labelled cold**, and the two differ by 5x on TTFT.
 
 ## SSE keepalives on long prefill
 
