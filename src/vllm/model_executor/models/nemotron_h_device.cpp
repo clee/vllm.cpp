@@ -1087,6 +1087,15 @@ DBuf NemotronHMamba2MixerDevice(Dev d, const NemotronHMambaWeights& w,
            "NemotronH device mamba: the decode arm updates the cache pages IN "
            "PLACE at their slots and takes no gathered carry — pass the decode "
            "slots or the gathered rows, never both");
+  // `has_initial` has no meaning on the decode arm — a decode continues a
+  // sequence by definition, which is why upstream leaves `has_initial_state`
+  // None on a decode-only step (gdn_attn.py:405). Refuse `false` rather than
+  // ignore it: silently dropping a flag a caller set is how the two cases the
+  // parameter exists to distinguish become indistinguishable again.
+  VT_CHECK(decode == nullptr || has_initial,
+           "NemotronH device mamba: the decode arm carries state by definition "
+           "and cannot express has_initial=false; a fresh request is a PREFILL "
+           "and keeps the chunk scan");
   VT_CHECK(vt::OpRegistered(vt::OpId::kQuantFp8Static, d.q.device.type),
            "NemotronH device mamba: this device has no static per-tensor fp8 "
            "activation quant, so the FP8 W8A8 arm cannot run (issue #960)");
