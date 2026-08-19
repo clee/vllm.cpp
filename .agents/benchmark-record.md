@@ -24869,9 +24869,61 @@ on: per output token 0.776159 s
 and a ratio against it would compare two pieces of silicon. The only admissible
 comparison is the ON/OFF A/B of this same binary on this same box.
 
+### The same-binary A/B — the SPEED HYPOTHESIS IS REFUTED ON THIS BOX
+
+One binary, one box, device mamba arm ON in both legs, only
+`VT_NEMOTRON_H_MAMBA_DECODE_STEP` differing. Both legs pass the token gate, so
+this is a speed comparison between two CORRECT arms:
+
+| | ON (single-step, default) | OFF (chunk scan at decode) |
+|---|---|---|
+| A3 verdict | `96/96 mode=decode STRICT PASS` | `96/96 mode=decode STRICT PASS` |
+| `state_update_rows` per decode step | 23 | 0 |
+| `chunk_scan_calls` per decode step | 0 | 23 |
+| `conv_update_rows` / `conv_fwd_calls` | 23 / 0 | 0 / 23 |
+| `gathers` / `scatters` per decode step | 0 / 0 | 46 / 46 |
+| decode window | 74.511 s | 74.223 s |
+| per output token | 0.776159 s | 0.773156 s |
+| GPU busy (decode samples) | 244 of 555 = 43.96% | 230 of 562 = 40.93% |
+| engine load, EXCLUDED | 654.7 s | 778.2 s |
+| `reference-tier` lines | 0 | 0 |
+
+**Per output token moved +0.388%, and in the SLOWER direction.** Issue #1311's
+own stop condition is "Refuted if per-token time moves less than 3%". At 0.388%
+the speed hypothesis is **REFUTED on `thor:gpu0` (sm_110) at concurrency 1**,
+and this record says so rather than reporting the two counter columns as though
+they were a result.
+
+**What is NOT refuted, and the distinction matters.** The counters are not a
+prediction; they are what the run launched. The single-step arm demonstrably
+removed 92 of 115 SSD kernel launches, all 230 driver alloc/frees, all 46
+memsets, 104.9 MiB of per-token scratch and all 92 gather/scatter launches per
+token — and per-token time did not move. **So at c1 on this box the decode step
+is not bound by any of them.** That is a finding, not a null.
+
+**Limits of this measurement, stated rather than discovered later:**
+
+- **n = 1 per leg.** No repetitions, so 0.388% is not separable from run-to-run
+  noise; it is reported as "did not move", not as a regression.
+- **The two legs did not see the same box.** Engine load was 654.7 s and 778.2 s
+  — an 18.8% spread on a phase that is excluded from the window but is evidence
+  that the host was not in the same state for both.
+- **Thor is not GB10.** The 6.31% busy-fraction and 0.014369 s/token references
+  are GB10's, so NO ratio against them is quoted here. The sm_121a leg is owed
+  and is the only thing that can answer the GB10 question
+  ([[negative-results-are-regime-dependent]]).
+- **c1 only.** The gather/scatter tax the `qwen3_5.cpp:4730-4746` comment
+  describes is stated to scale with CONCURRENCY, and G-SAFE pins `num_reqs <= 1`
+  here, so the regime where it would show has not been measured at all.
+
+**The next traceable hypothesis, because no ceiling is declared:** an `nsys`
+trace of the DECODE WINDOW ONLY on both legs, attributing the 0.776 s/token.
+The counters say what the step stopped launching; the trace would say what the
+0.776 s is actually spent on. Peak host during the run was 44402 MiB.
+
 ### Evidence
 
 `tests/vt/test_ops_mamba2_state_update.cpp` (the two driver-group cases),
 `tests/vllm/models/test_nemotron_h_paged_forward.cpp` (the arm recorder, driven
 through `ModelRegistry::Forward`), `scripts/nemotron-h-a2d1-gpu-gate.sh` (the
-recipe), and the Thor run logs under `/workspace/a2d1-thor/`.
+recipe), and the Thor run logs under `/workspace/a2d1-thor/20260819T125936Z`.

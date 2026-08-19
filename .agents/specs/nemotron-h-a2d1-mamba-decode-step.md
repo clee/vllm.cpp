@@ -229,23 +229,75 @@ already produced one void number on this row.
 - The counters read zero on both arms → the instrument is broken; T3 is the
   triage, not the GPU log.
 
+### 6.1 The speed stop condition FIRED, and what it does and does not close
+
+#1311 pre-registered its own refutation criterion: *"Refuted if per-token time
+moves less than 3%."* On `thor:gpu0` at c1 the move is **0.388%**, so the speed
+hypothesis is **REFUTED on that box**. Recording it is the point of
+pre-registering it; a criterion that only ever confirms is not one.
+
+**What the refutation does NOT close, and this is not consolation.** The
+counters are not a prediction, they are what the run launched: the arm
+demonstrably removed 92 of 115 SSD kernel launches, all 230 driver alloc/frees,
+all 46 memsets, 104.9 MiB of per-token scratch and all 92 gather/scatter
+launches, **and per-token time did not move**. The correct reading is therefore
+*the c1 decode step on sm_110 is not bound by launch count, driver allocation or
+state-copy traffic*, which is a positive finding about where the time is NOT.
+
+**Three regimes this measurement never entered**, so none of them is refuted:
+
+1. **GB10 / sm_121a.** The 6.31% busy-fraction and 0.014369 s/token references
+   are GB10's and no ratio against them is quoted here
+   ([[negative-results-are-regime-dependent]]).
+2. **Concurrency above 1.** `qwen3_5.cpp:4730-4746` says the gather/scatter tax
+   scales with concurrency; G-SAFE pins `num_reqs <= 1`, so the regime where it
+   would show was not measured. A2-B owns lifting that.
+3. **n > 1.** One run per leg, and the two legs saw engine loads of 654.7 s and
+   778.2 s — an 18.8% spread on an excluded phase, which is evidence the host
+   was not in one state. 0.388% is not separable from that.
+
+**No ceiling is declared. The next traceable step** is an `nsys` trace of the
+DECODE WINDOW ONLY on both legs. The counters say what the step stopped
+launching; only a trace says what the 0.776 s/token is spent on.
+
+**The row still lands.** Correctness is the acceptance condition and it is met;
+the "Nothing lands dead" violation is closed by measurement; and the arm is what
+vLLM runs, which is repository policy independent of a local speed delta.
+
 ---
 
 ## Now
 
-T1, T2 and T3 committed and green. **T4 MET on `thor:gpu0` (sm_110): the A3 gate
-reads `96/96 mode=decode STRICT PASS` on the single-step arm**, with every
-decode step launching 23 state-update rows and 0 chunk scans, 0 gathers and 0
-scatters. The `dgx:gpu0` sm_121a leg and the same-binary A/B delta are still
-owed.
+T1, T2 and T3 committed and green. T4 MEASURED on `thor:gpu0` (sm_110), both
+legs of one binary:
+
+- **Correctness ACCEPTED.** The A3 gate reads `96/96 mode=decode STRICT PASS`
+  on the single-step arm, with `reference-tier lines: 0`. The chunk-scan leg
+  passes identically, so the swap changes no token.
+- **Reachability ESTABLISHED.** Every decode step launches 23 state-update rows
+  and 0 chunk scans, 0 gathers and 0 scatters, against 23 chunk scans and 46
+  gathers + 46 scatters with the arm off. `vt::Mamba2StateUpdate` went from zero
+  callers under `src/vllm/` to 23 launches per decoded token through a
+  production entry point.
+- **★ SPEED REFUTED on this box.** Per output token 0.776159 s (on) against
+  0.773156 s (off) = **+0.388%**, in the slower direction. §6's stop condition
+  quotes #1311's own bar — "Refuted if per-token time moves less than 3%" — and
+  0.388% is under it. See §6.1.
+
+The `dgx:gpu0` sm_121a leg is still owed and is the only thing that can answer
+the GB10 question.
 
 ## Owed
 
-- The `dgx:gpu0` sm_121a leg of T4, and the ON/OFF A/B delta on one binary. The
-  sm_110 leg is MET (see `## Now`); dgx was queued behind a two-hour job.
+- **The `dgx:gpu0` sm_121a leg of T4.** The sm_110 leg is MET and its speed
+  result is a REFUTATION (§6.1); dgx was held by another session all session.
   Owned by this row, tracked by
   [#1311](https://github.com/mudler/vllm.cpp/issues/1311). NO vLLM ratio may be
   quoted for arch 110: the 0.014369 s reference is GB10's.
+- **A repeated A/B (n >= 3 per leg) on an idle box**, because the sm_110 legs
+  saw an 18.8% spread in engine-load time and 0.388% is not separable from that.
+- **An `nsys` decode-window trace of both legs**, the next traceable step §6.1
+  names.
 - The batched decode arm (`nd > 1`) is written and unreachable while G-SAFE pins
   `num_reqs <= 1`; A2-B owns lifting that, and the code is indexed rather than
   hardcoded so the lift is a count change.
