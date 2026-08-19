@@ -767,6 +767,37 @@ environment:
     this box: Qwen3-4B bf16 spec-off warm ~24.6 tok/s; Qwen3.6-27B bf16 spec-off
     warm 4.42 tok/s (portable kernels, no fast paths — absolute numbers are NOT
     comparable to GB10).
+  - **★ A BUILD CAN DO IT TOO, and the load list above is not the whole
+    envelope. Measured 2026-08-19** ([#1380](https://github.com/mudler/vllm.cpp/issues/1380)).
+    An `rc run` job on `thor:gpu0` ran `cmake --build <dir> -j 8` over the whole
+    tree — **1098 targets**, which is a compile phase followed by a link phase
+    that runs several `ld` processes at once, each mapping a multi-hundred-MB
+    static image. Roughly five minutes in, `rc devices` went from `busy` to
+    `unknown (no contact)` and then to `unhealthy`, the job vanished from
+    `rc ps`, and its `/workspace` log stopped mid-phase with no error written.
+    The box recovered on its own about twenty minutes later and now reads
+    `ready`. **It was NOT re-leased while unhealthy** — AGENTS.md forbids
+    clearing a quarantined device, and nothing was cleared.
+    **"Most likely" is the honest register here.** The signature matches the
+    reboot-instead-of-OOM shape this file already documents, and a parallel link
+    of that tree is the largest concurrent host-memory demand in the build. What
+    was NOT measured is the kernel's own account: nobody read `uptime`, `dmesg`
+    or `journalctl --list-boots` on the host afterwards, so "the parallel link
+    exhausted memory and the box rebooted" is inference from the fleet's view
+    alone. **What would settle it:** re-run the same full build at `-j 8` while
+    sampling `free -m` from inside the job, and read `journalctl --list-boots` on
+    the host afterwards — a GAP in the boot list is the evidence
+    ([[kairos-oem-rw-paths-change-cost-a-boot]]), and a host that did not reboot
+    would falsify it and point at the worker pod instead.
+    **The instruction that already existed is the one to follow.** The build
+    recipe above says `-j4` is deliberate, and every NAMED-TARGET build in that
+    campaign — five jobs, `-j 8`, one to four targets each — completed without
+    incident. It is the whole-tree build that correlates. Use `-j 4` for a full
+    build, and prefer named targets.
+    **This is the SECOND recorded `unknown (no contact)` for this device.** The
+    first was 2026-08-17, cited in AGENTS.md as the reason a lost controller
+    contact is a live state rather than a hypothetical. Two independent
+    occurrences in three days is a property of the box, not a coincidence.
   - `k3s` runs here and is `enabled`; `sudo systemctl stop k3s` frees its pods
     (5 containerd shims survive the stop). It was not the crash cause.
   - Transfer code with `git archive` (NOT rsync — see

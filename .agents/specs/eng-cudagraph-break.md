@@ -1588,21 +1588,65 @@ Each item names the stage that owns it. Nothing here is claimed by W1.
   read `btab[r * bt_row + (j / block_size) * bt_col]` for every
   `j < seq_lens[r]` without checking the table had that many columns.
   `test_qwen3_5_decode_graph_seam.cpp`'s `SpecAttnMeta` supplied one column
-  against shape C's `seq_lens = 24` at `block_size = 16`. At `origin/main` that
-  read lands on bytes that decode to an in-range block index, which is the
-  failure mode worth naming: not a latent crash, but attention over the WRONG
-  page that no gate here can see. The kernel now refuses, one compare per request
-  outside the token loop, and the helper sizes its table for the sequence length
-  it declares.
+  against shape C's `seq_lens = 24` at `block_size = 16`.
 
-  **One bounded assumption is worth naming rather than leaving to be found.** The
-  profile a driver pre-grows from is the one its COLD step recorded at that shape
-  and slot, so the guarantee is "the captured forward demands no more of any class
-  than the eager forward at the same shape did". That holds by construction today
-  -- both run `DenseForwardLayers`, and the capture arm draws its persistent step
-  inputs from a DEDICATED pool, so its main-pool demand is a subset -- and it is
-  an argument rather than a gate. A future capture-only allocation with no eager
-  counterpart would reopen this. Owner: row **`ENG-CUDAGRAPH-BREAK`**.
+  **THE SEVERITY WAS RECORDED TOO LOW FIRST, AND THE CORRECTION RAISES IT.** This
+  entry, the commit body and [#1394](https://github.com/mudler/vllm.cpp/issues/1394)
+  all first read that the case "passes at `origin/main`", on the strength of one
+  reading: `test_qwen3_5_decode_graph_seam` at `5f68e60df` on `thor:gpu0`, 8 cases
+  / 138 assertions / exit 0, in a CUDA-ON build. **The operator then measured the
+  same file at the same SHA and got a deterministic SIGSEGV, exit 139, three runs
+  of three.** Both readings are real. What they say together is that the
+  out-of-bounds read is present at `main` unconditionally and that WHETHER IT
+  FAULTS depends on what the allocator put after the table -- so it crashes
+  deterministically in natural case order on at least one build, and is silent
+  wrong-page attention on another. "Passes at main" was a statement about one
+  build presented as a statement about the tree, and it is withdrawn.
+
+  **What settles the presence of the defect independently of any heap layout**:
+  `origin/main` built with ONLY the kernel refusal added and WITHOUT the
+  test-data fix -- the refusal FIRED (`## Gates` G1). A predicate over
+  `seq_lens[r]`, `block_size` and `block_table.shape[1]` cannot depend on what
+  follows an allocation.
+
+  **And the assertion counts never disagreed.** 135 is a run of the same 8 cases
+  that CRASHED inside the last one, so doctest never counts the three assertions
+  after the crash point; 138 is the complete run. `git diff` shows this pull
+  request adds no assertion to that file, and the file is byte-identical between
+  `5f68e60df` and `96ed8346f`.
+
+  The kernel now refuses, one compare per visited request outside the token loop,
+  and the helper sizes its table for the sequence length it declares. **The
+  `.agents/issue-index.md` row for #1394 still carries the withdrawn wording:
+  that file is append-only and one row per issue, so the correction lives here
+  rather than as an edit or a second row.**
+
+  **ONE ASSUMPTION IS CARRIED BY AN ARGUMENT AND BY NO GATE, and this entry
+  exists so nobody reads the green as covering it.** The profile a driver
+  pre-grows from is the one its COLD step recorded at that shape and slot, so the
+  fix rests on: *the captured forward demands no more blocks of any size class
+  than the eager forward at the same shape did*.
+
+  **What supports it is a reading of the code, not a measurement.** Both arms run
+  the same `DenseForwardLayers`, and the capture arm draws its persistent step
+  inputs from a DEDICATED pool, so its main-pool demand is a subset of the cold
+  step's. **No test asserts that.** The device gate would go red if the
+  assumption broke *at the gate's shape*, which is one shape on one synthetic
+  model, and the CPU gate asserts the pool primitive rather than the drivers'
+  use of it. So a capture-only allocation with no eager counterpart -- a new
+  buffer allocated inside `GraphCaptureScope` that the eager path never builds --
+  reopens #1380 exactly, and nothing here would say so until a capture threw on a
+  device.
+
+  **What would settle it**, in increasing cost: (1) assert the containment
+  directly -- have `PreGrowForCapture` record the profile it was given, have the
+  pool record the peak the CAPTURED region actually reached, and refuse (or
+  count) when the second exceeds the first, which turns the argument into a
+  runtime invariant a gate can mutate; (2) failing that, a second G1 shape whose
+  class arithmetic differs from the first, so the gate is not one coincidence
+  wide. Option (1) is the one worth building, because it holds for every driver
+  and every shape rather than for the shapes somebody remembered to gate.
+  Owner: row **`ENG-CUDAGRAPH-BREAK`**.
 
 - ~~**The seam is not yet ENTERED from a production step.**~~ RETIRED by **W2**
   ([#1261](https://github.com/mudler/vllm.cpp/issues/1261)).

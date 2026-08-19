@@ -133,12 +133,15 @@ void PagedAttentionKernel(Queue&, Tensor& out, const Tensor& query, const Tensor
   // `btab[r * bt_row + (j / block_size) * bt_col]` for every j < seq_lens[r], so
   // a table with fewer columns than `ceil(seq_lens[r] / block_size)` is read past
   // its own last element. That read is SILENT: it lands inside whatever the
-  // scratch pool put next to the table, produces a plausible block index, and
-  // attends to the wrong page. `tests/vllm/models/test_qwen3_5_decode_graph_seam.cpp`
-  // supplied exactly that and read GREEN, until a `DevicePool` change moved the
-  // neighbouring bytes and the same read became a SIGSEGV. One compare per
+  // scratch pool put next to the table, and then either attends to the WRONG page
+  // or dies, depending on what those bytes decode to.
+  // `tests/vllm/models/test_qwen3_5_decode_graph_seam.cpp` supplied exactly that.
+  // At `origin/main` it SIGSEGVs deterministically in one measured build (exit
+  // 139, three runs of three) and reads green in another, which is the shape of
+  // the hazard: the read is out of bounds unconditionally, and whether it faults
+  // is the allocator's business rather than the caller's. One compare per
   // request, outside the token loop, turns it into a refusal that names the
-  // caller's mistake.
+  // caller's mistake instead.
   const int64_t bt_cols = block_table.rank >= 2 ? block_table.shape[1] : 0;
   for (int64_t r = 0; r < num_reqs; ++r) {
     // Only the requests the token loop actually visits. A padded or inert row
