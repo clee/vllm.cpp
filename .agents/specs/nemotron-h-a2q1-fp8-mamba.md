@@ -580,73 +580,65 @@ comparison is withheld by name. Both arms are pinned in
 `tests/scripts/test_nemotron_h_a2q1_per_token.py`, and quoting the ratio
 unconditionally reds the suite.
 
-### 10.3 The A/B: the arm is token-exact on Thor, and the busy fraction is VOID
+### 10.3 The A/B, on the corrected instrument: the busy fraction ROSE
 
-Same lease, same binary, same checkpoint, same golden, differing only by
+Second Thor lease, fresh build and clone, sampler measuring the DECODE window
+alone. Same binary, same checkpoint, same golden, differing only by
 `VT_NEMOTRON_H_DEVICE_MAMBA`:
 
-| flag | mamba arm | A3 | exit | decode |
-|---|---|---|---|---|
-| `1` (default) | device FP8 W8A8 | `96/96 mode=decode STRICT PASS` | 0 | 2336 util samples |
-| `0` | host, dequant to bf16 | `93/96 mode=decode DIVERGENCE` | 1 | 5702 util samples |
+| flag | mamba arm | A3 | exit | decode GPU busy | per output token | decode wall |
+|---|---|---|---|---|---|---|
+| `1` (default) | device FP8 W8A8 | `96/96 STRICT PASS` | 0 | **240/564 = 42.55%** | **0.785606 s** | 75.4 s |
+| `0` | host, dequant to bf16 | `93/96 DIVERGENCE` | 1 | **700/3808 = 18.38%** | **5.633442 s** | 540.8 s |
 
-**THIS IS AN sm_110 RESULT AND IT DOES NOT GENERALISE.** On GB10 (`sm_121a`) the
-SAME host arm reads `96/96 STRICT PASS` — the A3 run that closed
-[#1157](https://github.com/mudler/vllm.cpp/issues/1157),
-`/usr/local/nas_share/rc/nh1157/gate_fixed.out`. So "the host arm is token-wrong
-on a GPU" is false as a general statement, and writing it that way would get the
-finding dismissed the moment somebody checked on GB10. n=1 per arm.
+**THE BUSY FRACTION ROSE, WHICH IS THIS UNIT'S ACCEPTANCE TEST: 18.38% to
+42.55%, +24.17 points, a 2.31x rise.** A decode token costs 7.17x less. Peak host
+44070 MiB. `reference-tier lines: 0` on both arms, so neither took the portable
+tier.
 
-What IS established: on ONE box, holding the whole rest of the tower constant,
-flipping only the mamba arm moves 93/96 to 96/96.
+**Read on the box it was taken on, and nowhere else.** These are sm_110 figures.
+The 6.31% baseline and the 0.014369 s per-token reference are BOTH GB10's, so
+neither supports a ratio against these numbers, and the instrument now withholds
+both comparisons by name on any other arch. What is established is the ON/OFF
+difference on one box, and that is exactly the comparison the hypothesis needed.
 
-The leading mechanism stays the memory format. The golden's oracle computes these
-projections W8A8; the host arm is W8A16 by construction, because `DenseBf16`
-carries `input_scale` and does not apply it (`nemotron_h.cpp:419-422`). What that
-does not yet explain is why GB10 is clean, and the honest reading is that the
-approximation is MARGINAL — it perturbs the residual stream, and whether the
-perturbation crosses a decision boundary depends on the rest of the tower.
+**The `ratio 54.7x` and `ratio 392.1x` strings in that run's log are stale and
+must not be quoted.** That job cloned before the per-token arch gate landed, so it
+still printed the GB10 comparison unconditionally; the per-token VALUES are sound
+measurements of that box, the ratios beside them are not.
 
-**One candidate is already excluded.** "The two arms resolve different fp8 GEMMs"
-cannot be the differentiator, because the `0` configuration runs NO fp8 GEMM on
-either box: `DenseFor` dequantizes and hands the result to `vt::MatmulBT` on the
-CPU queue (`nemotron_h_device.cpp:2027`). The device-side difference that IS
-checkable is attention — `CudaArchFeatures.cmake:349` provides `fa2` for
-`12.1a` and not for `11.0`, so GB10 runs vendored FlashAttention-2 over the 6 GQA
-layers where Thor runs the portable fallback.
+### 10.4 The divergence reproduces, so it is not n=1 on Thor
 
-Tracked as [#1290](https://github.com/mudler/vllm.cpp/issues/1290), which owns the
-open question. Next, in order: the oracle's top-2 margin at the three moved tokens
-(this family has already produced a "divergence" that was a bit-exact near-tie),
-then a `NemotronHTrace` layer bisect, then a repeat to lift n=1.
+Two independent Thor leases, separate builds and separate clones, agree exactly
+on both arms:
 
-From the sample counts, at one sampler and one nominal interval, **the run was
-2.44x shorter with the arm on**. That is a WALL-CLOCK ratio on Thor and it is not
-an occupancy or per-token claim.
+| run | arm ON | arm OFF |
+|---|---|---|
+| `20260818T222352Z` | 96/96 | 93/96 |
+| `20260818T232910Z` | 96/96 | 93/96 |
 
-**★ THE BUSY FRACTION IS VOID, AND THAT IS THIS UNIT'S ACCEPTANCE TEST.** It read
-15.33% on and 14.73% off — a 0.59-point difference that answers the wrong
-question, because the sampler ran from process start and therefore put the
-multi-minute, GPU-IDLE 20.1 GiB engine load inside the same window as the decode.
-That dilutes both arms toward each other and toward zero. It is the same defect
-as summing prefill and decode into one profile, and a fraction over the wrong
-window is worse than no fraction because it still formats like a measurement.
+So the `n=1` caveat is lifted FOR THOR: the host arm's 93/96 is reproducible
+there, and the device arm's 96/96 is too. GB10 remains n=1 in the other
+direction (the #1157 run, host arm, 96/96), and no GB10 run of the DEVICE arm
+exists yet. [#1290](https://github.com/mudler/vllm.cpp/issues/1290) carries this.
 
-`run_gate` now starts the driver first, waits for `engine loaded in Ns`, and only
-then starts sampling; it refuses to report a fraction at all when that line never
-appears. **No busy-fraction claim is made from the Thor run, in either
-direction.** The hypothesis that this arm raises GPU occupancy is neither
-supported nor refuted by it.
+**What is still owed.** The occupancy hypothesis is now SUPPORTED on sm_110 and
+UNMEASURED on sm_121a, and the two are not interchangeable. Specifically owed:
 
-**What is still owed, and it is the acceptance test rather than a formality:**
-the §5.1 per-block numeric gate on the real checkpoint, the A3
-`96/96 mode=decode STRICT PASS` re-run, the §5.3 mutations, and the GPU busy
-fraction — which must RISE from the measured 6.31% baseline, sampled with its
-denominator reported. **The 6.31% baseline is a GB10 number, so only a GB10 run
-can be compared against it**; a Thor busy fraction measures different silicon and
-would answer a different question. The same-binary
-`VT_NEMOTRON_H_DEVICE_MAMBA=0` A/B is valid on either host.
-`scripts/nemotron-h-a2q1-dgx-gate.sh` is the recipe.
+- the GB10 run, which is the only one that can be read against the 6.31%
+  baseline and the 0.014369 s per-token reference, and the only place a DEVICE-arm
+  A3 result does not yet exist at all;
+- the §5.1 per-block numeric gate against `trace.mixer[l]` on the real checkpoint
+  — the A3 gate is token-level and cannot see a per-layer defect whose argmax is
+  unchanged;
+- the §5.3 mutations, which belong to the fresh reviewer;
+- the three moved tokens on the OFF arm, whose oracle top-2 margin decides
+  whether [#1290](https://github.com/mudler/vllm.cpp/issues/1290) is a near-tie
+  sensitivity or a wrong answer.
+
+`scripts/nemotron-h-a2q1-dgx-gate.sh` is the recipe, and it now measures the
+decode window, withholds both GB10 references off `121a`, and refuses a fraction
+outright when the load boundary never appears.
 
 ## 11. Owed
 
