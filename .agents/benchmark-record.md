@@ -110,13 +110,62 @@ host, because `nemotron_h.cpp:1031-1034` refuses the NVFP4 `lm_head` on a
 non-CPU queue.
 
 **This is not a ceiling and nothing here is architecture-limited.** The next
-traceable hypothesis is A2-Q1 ([#940](https://github.com/mudler/vllm.cpp/issues/940)),
-the 46 FP8 W8A8 mamba `in_proj`/`out_proj` projections that are 36.6% of decode
-bytes and 27.6% of GEMM FLOPs, which removes the 23 bounces; then A2-Q2b for the
-`lm_head`. The prediction each one has to answer is the busy fraction: if the
+traceable hypothesis is A2-Q1 (PR [#1289](https://github.com/mudler/vllm.cpp/pull/1289) — [#940](https://github.com/mudler/vllm.cpp/issues/940) is CLOSED
+since 2026-08-16 and is NOT the live pointer), the 46 FP8 W8A8 mamba
+`in_proj`/`out_proj` projections that are 36.6% of decode bytes and 27.6% of
+GEMM FLOPs, which removes the 23 bounces; then A2-Q2b for the `lm_head`. The prediction each one has to answer is the busy fraction: if the
 23 bounces are the cost, moving them on-device must raise 6.31% toward the
 majority the clock gate wants, and the same battery on the same binary makes the
 delta attributable.
+
+### The lever is CONFIRMED and still UNGATED (added 2026-08-19)
+
+A three-leg discriminator ran on `dgx:gpu0`
+(`/workspace/a2d1-discriminate/20260819T200231Z`), one binary, one box, the
+mamba arm the only variable, five feature cells `ENABLED for [121a]`. It tests
+the prediction this entry made — that moving the 23 Mamba2 layers on-device must
+RAISE the GPU-busy fraction, not merely go faster — and it reports both halves.
+
+| leg | arm | token gate | warm s/output token | GPU busy |
+|---|---|---|---|---|
+| `a3_hostmamba` | host bounce, the SHIPPED default | **96/96 `STRICT PASS`** | 10.1502 | 559/7115 = **7.86%** |
+| `a3_off` | device, `vt::Mamba2ChunkScan` | **95/96 `DIVERGENCE`** | 1.3898 | 108/1061 = **10.18%** |
+| `a3_on` | device, `vt::Mamba2StateUpdate` | **95/96 `DIVERGENCE`** | 1.3947 | 108/1052 = **10.27%** |
+
+Warm-basis, on the same cold-prompt exclusion this entry uses throughout, the
+device arm is **7.28x** faster per output token, and the busy fraction moves
+7.86% -> 10.2%. **The prediction holds on both axes.**
+
+**It is NOT a parity number, and this is the rule rather than a preference.**
+Both device legs read `95/96 DIVERGENCE`. AGENTS.md puts correctness first and
+requires the declared token-exact gate BEFORE a performance result is accepted,
+so the 718.2x in the table above remains this row's gated figure and the device
+arm's ~97x-vs-oracle is a measured PROJECTION carried as ungated until
+[#1388](https://github.com/mudler/vllm.cpp/issues/1388) closes. PR [#1289](https://github.com/mudler/vllm.cpp/pull/1289) is held DRAFT for exactly this.
+
+**Two things this contributes to [#1388](https://github.com/mudler/vllm.cpp/issues/1388), which does not have them.**
+
+First, #1388 concludes the divergence is "arch- or host-specific, not
+arm-specific" from two DEVICE arms plus a passing Thor. It had no host-arm leg
+on GB10. This discriminator has one and it **PASSES 96/96 on the same binary,
+box and checkpoint**, and so do this row's own two timing legs and #1221's. So
+on GB10 the host arm passes and both device arms lose one token: the divergence
+does track the arm, and #1388's conclusion is narrower than its wording.
+
+Second, the diverging row is **prompt 2** in both device legs (31/32). Prompt 2
+is also the row where the ORACLE ITSELF failed to reproduce its own committed
+golden in this row's oracle leg (26/32) once its resolved `block_size` moved to
+512. Two independent perturbations landing on the same prompt is evidence FOR
+#1388's benign-near-tie hypothesis and against a wrong recurrent carry, and it
+names the discriminator #1388 already asks for: the oracle's top-2 margin at
+that position. It is a lead, not a finding — the `got:`/`exp:` ids are needed to
+confirm it is the same position.
+
+**What it does NOT change: the ceiling is still not in sight.** At ~10.2% busy
+the device arm leaves the decode roughly 90% GPU-idle, so A2-Q1 banks 7.28x and
+does not close the gap. The next lever after it is still host-side work — the
+NVFP4 `lm_head` that `nemotron_h.cpp:1031-1034` refuses on a non-CPU queue
+(A2-Q2b) — and the same busy-fraction test applies to it.
 
 ### The denominator: identity pinned, runtime blocked, blocker MEASURED
 

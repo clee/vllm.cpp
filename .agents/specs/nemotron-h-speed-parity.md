@@ -26,8 +26,9 @@ In scope:
 Out of scope:
 
 - Any repair of the two arms that make the number what it is. A2-Q2b owns the
-  device `lm_head`, and A2-Q1 ([#940](https://github.com/mudler/vllm.cpp/issues/940))
-  owns the 46 FP8 W8A8 mamba projections. Measuring a gap is not closing it.
+  device `lm_head`, and A2-Q1 (PR [#1289](https://github.com/mudler/vllm.cpp/pull/1289)) owns the 46 FP8 W8A8 mamba
+  projections. [#940](https://github.com/mudler/vllm.cpp/issues/940) is CLOSED (2026-08-16) and is not the live
+  pointer. Measuring a gap is not closing it.
 - Any lifecycle change. The row does not move state here; it gains a number.
 - Any advance of the parity pin.
 
@@ -99,7 +100,7 @@ it, and neither has landed:
   projection and the forward returns `HostLogits`. Owned by A2-Q2b.
 - **The 46 FP8 W8A8 mamba `in_proj`/`out_proj` projections still execute
   HOST-side.** They are 36.6% of decode bytes and 27.6% of GEMM FLOPs. Owned by
-  A2-Q1, [#940](https://github.com/mudler/vllm.cpp/issues/940).
+  A2-Q1, PR [#1289](https://github.com/mudler/vllm.cpp/pull/1289).
 
 So the expected result is a poor ratio with a known cause. **It is recorded as
 the current state with those two arms named, and never as a ceiling.** An
@@ -195,8 +196,8 @@ would void it, so the leg sampler records the compute-apps list instead.
 - The oracle at its DEFAULT `gpu_memory_utilization`, which the box could not
   hold; and with it, whether the oracle reproduces its own golden 96/96 when its
   resolved `block_size` is the one the golden was captured at.
-- The re-measurement after A2-Q1 ([#940](https://github.com/mudler/vllm.cpp/issues/940))
-  and A2-Q2b land, which is the next traceable hypothesis rather than a ceiling.
+- The re-measurement after A2-Q1 (PR [#1289](https://github.com/mudler/vllm.cpp/pull/1289), blocked by
+  [#1388](https://github.com/mudler/vllm.cpp/issues/1388)) and A2-Q2b land, which is the next traceable hypothesis rather than a ceiling.
 
 ## Now
 
@@ -233,8 +234,19 @@ matched and the memory axis is not like-for-like.
 **The bottleneck is named by an instrument.** `nvidia-smi` reported GPU
 utilization 0% in 2,019 of 2,155 samples of our window. It is the 23 of 52
 layers that bounce to the host per token plus the host NVFP4 `lm_head`. Next
-traceable hypothesis: A2-Q1 ([#940](https://github.com/mudler/vllm.cpp/issues/940)),
-then A2-Q2b, each of which must RAISE that busy fraction to be believed.
+traceable hypothesis: A2-Q1 (PR [#1289](https://github.com/mudler/vllm.cpp/pull/1289)), then A2-Q2b, each of which
+must RAISE that busy fraction to be believed. **A2-Q1's arm has since been
+measured and it does both, and it is still UNGATED** — see the confirmation
+section in [`benchmark-record.md`](../benchmark-record.md).
+
+**The lever is confirmed and still ungated.** A three-leg discriminator
+(2026-08-19) moved the 23 Mamba2 layers on-device: warm 10.1502 -> 1.3947
+s/token, **7.28x**, with the busy fraction rising 7.86% -> 10.2% as this spec
+predicted. Both device legs read **95/96 `DIVERGENCE`** while the host arm reads
+96/96 on the same binary, so no parity number is accepted from them: correctness
+precedes performance. PR [#1289](https://github.com/mudler/vllm.cpp/pull/1289) is DRAFT pending [#1388](https://github.com/mudler/vllm.cpp/issues/1388).
+At ~10.2% busy the decode is still ~90% GPU-idle, so A2-Q1 banks 7.28x and does
+not close the gap; A2-Q2b's `lm_head` is next and owes the same test.
 
 Full recipe, hashes, contention and clock state:
 [`benchmark-record.md`](../benchmark-record.md).
