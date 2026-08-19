@@ -289,15 +289,75 @@ std::string BuildSyntheticDeepseekV4GgufWithExpertTower() {
   return b.Build();
 }
 
+// ENG-EXPERT-STREAM-DEVICE W0d repair (#1378). The same synthetic `qwen35moe`
+// model, with the expert tower stored in NVFP4 (ggml type 40) instead of Q8_0.
+//
+//   blk.0.ffn_gate_exps.weight  NVFP4, ne [64, 2, 4] -> 512 elems, 8 blocks of
+//   64 elements in 36 bytes = 288 B
+//
+// NVFP4 has no `vt::DType` block encoding by design, so it can never be
+// `kKeepQuant`: `RouteGgufTensor` sends it to `kNvfp4Fp4` when the fp4 residency
+// is on and to `kExpandBf16` when it is off, and BOTH of those arms reach
+// `ResidentWeight` and stage the whole tower. So the lane must stay off and the
+// bound must stay whole, on a file whose architecture, tensor names, platform and
+// streaming configuration are otherwise identical to the permitted case.
+constexpr size_t kNvfp4TowerStaged = 288;                                  // 8 x 36
+constexpr size_t kNvfp4LaneOffBound = kStagedLowerBound + kNvfp4TowerStaged;  // 8480
+constexpr size_t kNvfp4ArenaBytes = 144;                                   // 2 x 72
+constexpr size_t kNvfp4LaneOnBound = kStagedLowerBound + kNvfp4ArenaBytes;  // 8336
+
+std::string BuildSyntheticMoeGgufWithNvfp4ExpertTower() {
+  GgufModelBuilder b;
+  b.AddKv(StrKv("general.architecture", "qwen35moe"));
+  b.AddKv(U32Kv("qwen35moe.embedding_length", 64));
+  b.AddKv(U32Kv("qwen35moe.block_count", 2));
+  b.AddKv(U32Kv("qwen35moe.attention.head_count", 4));
+  b.AddKv(U32Kv("qwen35moe.attention.head_count_kv", 2));
+  b.AddKv(U32Kv("qwen35moe.attention.key_length", 16));
+  b.AddKv(U32Kv("qwen35moe.expert_count", 4));
+  b.AddKv(U32Kv("qwen35moe.expert_used_count", 2));
+  b.AddKv(U32Kv("qwen35moe.expert_feed_forward_length", 32));
+  b.AddKv(U32Kv("qwen35moe.expert_shared_feed_forward_length", 32));
+  b.AddKv(U32Kv("qwen35moe.ssm.group_count", 2));
+  b.AddKv(U32Kv("qwen35moe.ssm.time_step_rank", 4));
+  b.AddKv(U32Kv("qwen35moe.ssm.state_size", 8));
+  b.AddKv(U32Kv("qwen35moe.ssm.conv_kernel", 4));
+  b.AddKv(U32Kv("qwen35moe.full_attention_interval", 4));
+  b.AddKv(U32Kv("qwen35moe.context_length", 256));
+  b.AddKv(gguf_test::F32Kv("qwen35moe.rope.freq_base", 1000000.0F));
+  b.AddKv(gguf_test::F32Kv("qwen35moe.attention.layer_norm_rms_epsilon", 1e-6F));
+  b.AddTensor("token_embd.weight", {64, 64}, /*ggml_type=*/0,
+              std::string(4096 * 4, '\0'));
+  // 8 NVFP4 blocks: 4 UE4M3 sub-block scales + 32 packed e2m1 bytes each. The
+  // BYTES are never decoded by anything this suite runs — the fit check reads the
+  // tensor table, and the load dies at the tokenizer long before a GEMM — so a
+  // fixed filler is honest here in a way it would not be in a numerics test.
+  b.AddTensor("blk.0.ffn_gate_exps.weight", {64, 2, 4}, /*ggml_type=*/40,
+              std::string(8 * 36, '\x11'));
+  return b.Build();
+}
+
 // The lane's environment, set before any case runs. `VT_MOE_EXPERT_STREAM`
 // LATCHES on first read, so a case that set it in its own body would work today
 // and break the moment a case ordering changed — the same hazard, and the same
 // remedy, as the expert-stream suites. It is inert for every case that leaves
 // `host_addressable` false, because the loader short-circuits before asking.
+//
+// `VT_GGUF_KEEP_QUANT` is pinned here for a different reason, and it is a
+// deliberate pin rather than a convenience (#1378). The lane now also requires the
+// expert towers to take a KEEP residency, and the production default for that is
+// `GgufQuantComputeAvailable()`, which asks whether the CURRENT platform has
+// `OpId::kMatmulBTQuant` registered. On a real GB10 that is true — `cuda_quant_dot.cu`
+// registers it for CUDA — but this suite registers a FAKE platform in the CUDA
+// slot of a CPU-only build, where nothing registers that op, so the availability
+// default would answer false and every lane-on case would be measuring the
+// absence of a CUDA kernel rather than the lane. Pinning the variable states the
+// residency the cases are about; the case below moves it to `0` on purpose.
 struct EnableExpertStreaming {
   EnableExpertStreaming() {
     vllm_test::SetEnv("VT_MOE_EXPERT_STREAM", "1");
     vllm_test::SetEnv("VT_MOE_EXPERT_STREAM_SLOTS", "2");
+    vllm_test::SetEnv("VT_GGUF_KEEP_QUANT", "1");
   }
 };
 const EnableExpertStreaming kEnableExpertStreaming;
@@ -559,6 +619,85 @@ TEST_CASE(
   // Not the tokenizer: the refusal fired first, which is the point of refusing at
   // load. Asserting this rules out the reading in which the case passes because
   // the deepseek4 config parse died before the check was reached at all.
+  CHECK(message.find("tokenizer") == std::string::npos);
+}
+
+// --- ENG-EXPERT-STREAM-DEVICE W0d repair (#1378): does the loader ask which -----
+// --- RESIDENCY ROUTE the towers will take? --------------------------------------
+//
+// The two cases below are the architecture case one level down. There the file
+// and the platform were identical and the ARCHITECTURE decided; here the file's
+// architecture, tensor names, platform, budget and streaming configuration are
+// all the permitted case's, and what decides is whether THIS file under THIS
+// policy routes its towers to the `expert_*_kq` arm that `KqExpertSlice` serves.
+//
+// Both are the UNSAFE direction, like the architecture case and unlike the two
+// over-counts the bound documents: with the towers dropped from the bound and an
+// arena charged that nothing allocates, a load that stages all 335.62 GiB of them
+// is permitted, and what replaces the refusal is the 26-minute load and the
+// `cudaMalloc: out of memory` first forward #1123 exists to prevent.
+
+TEST_CASE(
+    "device fit W0d: the keep-quant OPT-OUT keeps the WHOLE bound, on the same "
+    "file the lane serves") {
+  RegisterFakeStagingPlatform();
+  Platform().host_addressable = true;
+  TempFile f(BuildSyntheticMoeGgufWithExpertTower());
+
+  // `VT_GGUF_KEEP_QUANT=0` is a DOCUMENTED, supported opt-out, not a corner: it
+  // is the two-way override `FromEnv` promises so the historical all-expand load
+  // stays reachable in the same binary. With it set, `LoadExpertsOrNvfp4` peeks
+  // `kExpandBf16` and fills `expert_gate` rather than `expert_gate_kq`, the
+  // forward takes `MoeBlockBf16Cuda`, and every tower is staged through
+  // `ResidentWeight`. Byte-for-byte the same file that IS served with the opt-out
+  // absent — the case above this one — so this pair isolates the residency route
+  // and nothing else.
+  vllm_test::SetEnv("VT_GGUF_KEEP_QUANT", "0");
+  vllm_test::SetEnv("VT_DEVICE_WEIGHT_BUDGET_BYTES", std::to_string(kLaneOnBound + 1));
+  const std::string message = ThrownMessage(f.path(), vllm::Device::kNamedPlatform);
+  vllm_test::UnsetEnv("VT_DEVICE_WEIGHT_BUDGET_BYTES");
+  vllm_test::SetEnv("VT_GGUF_KEEP_QUANT", "1");
+  Platform().host_addressable = false;
+
+  REQUIRE_FALSE(message.empty());
+  CAPTURE(message);
+  CHECK(message.find("cannot serve this GGUF") != std::string::npos);
+  // The WHOLE table, expert tower included: the pre-W0d number, which is what a
+  // load that stages its towers must still get.
+  CHECK(message.find(std::to_string(kLaneOffBound)) != std::string::npos);
+  CHECK(message.find("the expert-stream lane IS active") == std::string::npos);
+  // Not the tokenizer: the refusal fired first, which is the point of refusing at
+  // load. This also rules out the reading in which the case passes because the
+  // load died earlier for an unrelated reason.
+  CHECK(message.find("tokenizer") == std::string::npos);
+}
+
+TEST_CASE(
+    "device fit W0d: an NVFP4 expert tower keeps the WHOLE bound, because fp4 "
+    "residency stages it") {
+  RegisterFakeStagingPlatform();
+  Platform().host_addressable = true;
+  TempFile f(BuildSyntheticMoeGgufWithNvfp4ExpertTower());
+
+  // `VT_GGUF_NVFP4_FP4=1` forces the fp4 residency ON, which is the SHIPPED CUDA
+  // default (`FromEnv` reads `GgufNvfp4ComputeAvailable()`, true wherever the
+  // NVFP4 GEMM is registered) and is not reachable from the availability default
+  // in a CPU-only build. It is forced rather than inherited so the route under
+  // test is `kNvfp4Fp4` and not the `kExpandBf16` an unregistered kernel would
+  // give — both keep the lane off, but only one of them is the arm a GB10 takes.
+  vllm_test::SetEnv("VT_GGUF_NVFP4_FP4", "1");
+  vllm_test::SetEnv("VT_DEVICE_WEIGHT_BUDGET_BYTES",
+                    std::to_string(kNvfp4LaneOnBound + 1));
+  const std::string message = ThrownMessage(f.path(), vllm::Device::kNamedPlatform);
+  vllm_test::UnsetEnv("VT_DEVICE_WEIGHT_BUDGET_BYTES");
+  vllm_test::UnsetEnv("VT_GGUF_NVFP4_FP4");
+  Platform().host_addressable = false;
+
+  REQUIRE_FALSE(message.empty());
+  CAPTURE(message);
+  CHECK(message.find("cannot serve this GGUF") != std::string::npos);
+  CHECK(message.find(std::to_string(kNvfp4LaneOffBound)) != std::string::npos);
+  CHECK(message.find("the expert-stream lane IS active") == std::string::npos);
   CHECK(message.find("tokenizer") == std::string::npos);
 }
 

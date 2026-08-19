@@ -33,6 +33,7 @@
 #include <string>
 #include <string_view>
 
+#include "vllm/model_executor/model_loader/gguf_keep_quant.h"
 #include "vllm/model_executor/model_loader/gguf_reader.h"
 
 namespace vllm {
@@ -160,6 +161,56 @@ struct GgufStagedFootprint {
 // invent — so the error is named here and left in the safe direction.
 size_t GgufLargestExpertSliceBytes(const GgufFile& gguf,
                                    std::string_view tensor_name_suffix);
+
+// ENG-EXPERT-STREAM-DEVICE W0d repair, issue #1378. The RESIDENCY ROUTE term of
+// the lane condition: will the towers the lane proposes to serve actually reach
+// the slot seam, or will they be staged like any other weight?
+//
+// The four terms the loader asked before this one -- the platform stages, the
+// platform can read host slots, the factory declares `streams_routed_experts`,
+// streaming is requested -- are properties of the DEVICE and of the
+// ARCHITECTURE. None of them is a property of THIS FILE under THIS POLICY.
+// `KqExpertSlice`, the seam that serves a slice out of the host slot store, is
+// reached only from the `expert_*_kq` arm, and `LoadExpertsOrNvfp4`
+// (`qwen3_5_gguf_weights.cpp`) routes the same
+// `blk.<n>.ffn_{gate,up,down}_exps.weight` tensors to two OTHER arms as well:
+// `kNvfp4Fp4` fills `expert_*_fp4` and `kExpandBf16` fills `expert_*`, and both
+// of those reach `MoeBlockFusedMarlinCuda` / `MoeBlockFusedCuda` /
+// `MoeBlockBf16Cuda`, which stage every tower through `ResidentWeight`.
+//
+// So with `VT_GGUF_KEEP_QUANT=0` -- a documented, supported opt-out
+// (`gguf_keep_quant.cpp`, `FromEnv`) -- or with an NVFP4 GGUF, all four terms held,
+// the lane turned on, every tower left the bound, and the #1123 refusal was
+// DELETED on a load that stages every one of them. The `expert_streamed`
+// tripwire in `ResidentWeight` does not catch it either, because a tower on
+// those arms is never claimed. What is left is the 26-minute load and the
+// `cudaMalloc: out of memory` first forward that refusal exists to prevent.
+//
+// Keyed on the DECLARED property, exactly as the architecture term is: the
+// residency `RouteGgufTensor` gives each tower under the policy this process
+// resolved, never a list of encodings or of file names.
+//
+// THE ACCEPTED SET IS `kKeepQuant` OR `kKeepF16`, and that is read off the code
+// rather than chosen: `LoadExpertsOrNvfp4` dispatches everything that is neither
+// fp4 nor expand into `LoadExpertsStackedKq`, whose own `VT_CHECK` names exactly
+// those two, and `KqExpertSlice` is dtype-agnostic (it sizes a slice with
+// `vt::RowSizeBytes`, which serves a block dtype and an f16 alike). So both keep
+// residencies fill `expert_*_kq` and both reach the lane.
+//
+// ALL OR NOTHING, in the safe direction. `StreamedExpertLane` is deliberately one
+// suffix and one byte count for the whole file -- its own comment says a caller
+// cannot express "stage this tensor and not that one" through it -- so this
+// returns true only when EVERY matching tensor reaches the lane, and false the
+// moment one of them would be staged. A file that mixes the two therefore keeps
+// the WHOLE bound: it can over-refuse, which `VT_DEVICE_WEIGHT_BUDGET_BYTES`
+// releases, and it can never under-refuse, which nothing releases.
+//
+// False when NOTHING matches the suffix, because "every element of the empty set
+// reaches the lane" is true and useless: a file with no expert towers has no lane
+// to turn on.
+bool GgufExpertTowersReachSlotLane(const GgufFile& gguf,
+                                   std::string_view tensor_name_suffix,
+                                   const GgufLoadPolicy& policy);
 
 // `model_dtype_bytes` is the resolved model dtype's size (2 for bf16, which is
 // what every GGUF path here loads at). vLLM resolves ONE model dtype and every

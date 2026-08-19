@@ -1786,12 +1786,32 @@ std::unique_ptr<LoadedEngine> LoadedEngine::FromModelDir(
       // #1123 exists to prevent. The capability is declared on the factory beside
       // the forward that implements it, and a model that does not declare it gets
       // the whole bound.
+      //
+      // THE RESIDENCY TERM IS THE SAME FINDING ONE LEVEL DEEPER (#1378). The four
+      // conditions above are all properties of the DEVICE and the ARCHITECTURE,
+      // and a `qwen35moe` GGUF satisfies every one of them while still staging
+      // every tower: `LoadExpertsOrNvfp4` routes the SAME `_exps.weight` tensors
+      // to `expert_*_fp4` or to `expert_*` whenever the residency is not a keep
+      // residency, and only the `expert_*_kq` arm reaches `KqExpertSlice`. With
+      // `VT_GGUF_KEEP_QUANT=0`, or on an NVFP4 GGUF, this block therefore dropped
+      // 335.62 GiB of towers from the bound on a load that stages all of them and
+      // deleted the #1123 refusal outright. `GgufExpertTowersReachSlotLane` asks
+      // the model loader's own routing function about this file under this
+      // process's policy, so the bound and the forward cannot disagree.
+      //
+      // It is asked LAST, after `ResolveExpertStreamRequested()`, only because
+      // that call LATCHES: moving a non-latching file scan in front of it would
+      // change which loads fix the process's streaming answer, and this repair
+      // has no business moving that.
+      static constexpr std::string_view kStreamedExpertSuffix = "_exps.weight";
       StreamedExpertLane lane;
       if (target.needs_weight_staging() &&
           target.host_memory_is_device_addressable() &&
           gguf_arch.factory != nullptr &&
           gguf_arch.factory->streams_routed_experts &&
-          ResolveExpertStreamRequested()) {
+          ResolveExpertStreamRequested() &&
+          GgufExpertTowersReachSlotLane(gguf, kStreamedExpertSuffix,
+                                        GgufLoadPolicy::FromEnv())) {
         // `_exps.weight` is exactly the set `KqExpertSlice` streams: the stacked
         // `blk.<n>.ffn_{gate,up,down}_exps.weight` towers a llama.cpp MoE export
         // writes. The arena is the store's own arithmetic — `slots *
@@ -1799,7 +1819,7 @@ std::unique_ptr<LoadedEngine> LoadedEngine::FromModelDir(
         // constructor uses, with the largest per-expert slice in this file as
         // the computed default, so the number here is the number that gets
         // allocated and not an estimate of it.
-        lane.tensor_name_suffix = "_exps.weight";
+        lane.tensor_name_suffix = kStreamedExpertSuffix;
         const size_t slice =
             GgufLargestExpertSliceBytes(gguf, lane.tensor_name_suffix);
         if (slice > 0) {

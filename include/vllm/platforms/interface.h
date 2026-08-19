@@ -457,4 +457,33 @@ Platform& CurrentPlatform();
 // static array of `count` entries.
 const DeviceType* CurrentPlatformPriority(size_t& count);
 
+// ENG-EXPERT-STREAM-DEVICE W0b, issue #1378. The DECISION behind
+// `CudaPlatform::host_memory_is_device_addressable()`, as a pure function of the
+// two probed attribute values, so it can be checked without the hardware.
+//
+// It exists because the conjunction was gated by nothing. The rule is declared
+// load-bearing in three places -- the base predicate's own comment above,
+// `src/vllm/platforms/cuda.cpp`'s probe, and this row's spec -- and the only CUDA
+// box this project can reach reports BOTH attributes as 1, so `test_platform`
+// could assert the implication (`!hmda || integrated`) and the board value and
+// still pass with either term deleted. Both mutations were run in the fresh
+// review of #1377 and both came back GREEN. A rule that no reachable input can
+// falsify is a comment, not a guard.
+//
+// The device class the conjunction is FOR is the one nobody here owns: a discrete
+// card with HMM answers `pageable = 1, integrated = 0`, and on it the lane would
+// serve ~6.95 GB of expert slices per token over PCIe with page migration. Taking
+// the arguments as the raw `int`s `cudaDeviceGetAttribute` writes, rather than as
+// `bool`s, keeps this callable with exactly the values the probe produced --
+// including the 0 a FAILED probe leaves behind, which is the conservative answer
+// and is part of what the cases pin.
+//
+// The ROCm leg answers the identical conjunction inside
+// `vt::rocm::HostMemoryIsDeviceAddressable` (`src/vt/rocm/rocm_backend.hip`). It
+// does NOT call this function and cannot: `vt` does not depend on `vllm`, and
+// inverting that layering to share four bytes of boolean algebra would be the
+// worse trade. The duplication is recorded here rather than left to be found.
+bool HostMemoryIsDeviceAddressableFromAttrs(int pageable_memory_access,
+                                            int integrated);
+
 }  // namespace vllm::platforms

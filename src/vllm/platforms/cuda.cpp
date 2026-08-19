@@ -230,9 +230,16 @@ struct Registrar {
     // static outlives the registrar as RegisterPlatform requires.
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wdangling-pointer"
-    static CudaPlatform platform(major, minor, integrated != 0,
-                                 pageable != 0 && integrated != 0,
-                                 total_bytes);  // device 0 only
+    static CudaPlatform platform(
+        major, minor, integrated != 0,
+        // #1378: the conjunction is a named, CPU-testable decision now
+        // (`HostMemoryIsDeviceAddressableFromAttrs`, declared in
+        // `platforms/interface.h`), not two `!= 0` tests written here where no
+        // reachable box can falsify either of them. The probe still owns the two
+        // VALUES, including the 0 a failed query leaves; the rule that combines
+        // them is gated on the CPU tier.
+        HostMemoryIsDeviceAddressableFromAttrs(pageable, integrated),
+        total_bytes);  // device 0 only
 #pragma GCC diagnostic pop
     RegisterPlatform(DeviceType::kCUDA, &platform);
   }

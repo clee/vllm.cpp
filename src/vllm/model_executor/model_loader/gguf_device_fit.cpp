@@ -72,6 +72,26 @@ size_t GgufLargestExpertSliceBytes(const GgufFile& gguf,
   return largest;
 }
 
+bool GgufExpertTowersReachSlotLane(const GgufFile& gguf,
+                                   std::string_view tensor_name_suffix,
+                                   const GgufLoadPolicy& policy) {
+  bool matched = false;
+  for (const GgufTensorInfo& t : gguf.Tensors()) {
+    if (!NameHasSuffix(t.name, tensor_name_suffix)) continue;
+    matched = true;
+    // The SAME call the model's own loader makes, on the SAME tensor, with the
+    // SAME role, through the SAME function: `LoadExpertsOrNvfp4` peeks
+    // `kStackedExpertWeight` and dispatches on the answer. Asking it the same way
+    // is what stops the bound and the forward from disagreeing about a file.
+    const GgufResidency r =
+        PeekRoute(policy, t, GgufTensorRole::kStackedExpertWeight);
+    if (r != GgufResidency::kKeepQuant && r != GgufResidency::kKeepF16) {
+      return false;
+    }
+  }
+  return matched;
+}
+
 GgufStagedFootprint GgufStagedWeightFootprint(const GgufFile& gguf,
                                               size_t model_dtype_bytes,
                                               const StreamedExpertLane& lane) {

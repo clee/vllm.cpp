@@ -4399,7 +4399,7 @@ staged at all — their slices are read from the host slot store in place — so
 what has to fit is the NON-expert remainder plus the slot arena rather than the
 whole file.
 
-Three limits, stated plainly rather than left to be discovered.
+Four limits, stated plainly rather than left to be discovered.
 
 * **The device has to be probed capable, and most are not.** The condition is
   `cudaDevAttrPageableMemoryAccess AND cudaDevAttrIntegrated` — an integrated,
@@ -4407,15 +4407,29 @@ Three limits, stated plainly rather than left to be discovered.
   keeps the refusal. That is deliberate: a slot store the card cannot read is
   not a lane, and giving it one is later work on the same row.
 * **The model has to be one of the families whose forward reads experts through
-  the slot seam.** Today those are the Qwen MoE architectures —
-  `Qwen3_5MoeForConditionalGeneration`, `Qwen3_5MoeForCausalLM` and
-  `Qwen3MoeForCausalLM`, which share one MoE block. Every other architecture,
-  `DeepseekV4ForCausalLM` and `LagunaForCausalLM` included, keeps the whole
-  bound and keeps the refusal even with `VT_MOE_EXPERT_STREAM=1` set — their
-  GGUF exports carry the same `_exps.weight` tensor names, but their forwards
-  stage those towers, so charging the device for a slot arena instead would
-  under-count what the load really needs and turn a correct refusal into an
-  out-of-memory first forward.
+  the slot seam.** Today that is the Qwen3.5 MoE family:
+  `Qwen3_5MoeForConditionalGeneration` and `Qwen3_5MoeForCausalLM`, which share
+  one factory and one MoE block, and which a `qwen35moe` GGUF resolves to.
+  `Qwen3MoeForCausalLM` (Qwen3-Coder) declares the same capability truthfully
+  and NO GGUF load can reach it, because no `general.architecture` maps onto it
+  — that gap is listed under `## Owed` in the row's spec. Every other
+  architecture keeps the whole bound and keeps the refusal even with
+  `VT_MOE_EXPERT_STREAM=1` set. `DeepseekV4ForCausalLM` is the case to have in
+  mind: a `deepseek4` GGUF loads, its export carries the same `_exps.weight`
+  tensor names, and its forward stages every one of those towers, so charging
+  the device for a slot arena instead would under-count what the load really
+  needs and turn a correct refusal into an out-of-memory first forward.
+  `LagunaForCausalLM` is NOT that case and is not evidence for anything here: no
+  `laguna` GGUF architecture arm exists, so a Laguna GGUF is refused as an
+  unsupported architecture well before this check runs.
+* **The checkpoint's expert towers have to stay QUANTIZED.** Only the keep-quant
+  arm reads experts a slice at a time; the fp4-resident and the expand-to-bf16
+  arms of the same loader stage every tower like any other weight. So
+  `VT_GGUF_KEEP_QUANT=0`, and an NVFP4 GGUF, both keep the whole bound and keep
+  the refusal on a device and a model that otherwise qualify. This is checked
+  per file, against the residency this process resolved, and a file that mixes
+  the two keeps the whole bound as well (issue
+  [#1378](https://github.com/mudler/vllm.cpp/issues/1378)).
 * **No speed claim is attached.** The decode measurement on the one machine that
   answers capable has not run at the time of writing; `docs/BENCHMARKS.md`
   carries it as `PENDING` and records what HAS been measured there, which is the

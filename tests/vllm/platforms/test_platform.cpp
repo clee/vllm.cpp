@@ -375,6 +375,13 @@ TEST_CASE("CUDA leg capability values (GPU build only)") {
   // is asserted only where the device also says it is integrated.
   CHECK((!cu.host_memory_is_device_addressable() || cu.is_integrated_gpu()));
   if (cu.is_integrated_gpu()) CHECK(cu.host_memory_is_device_addressable());
+  // ...and the two assertions above are exactly what #1378 found insufficient.
+  // Both attributes read 1 on the only CUDA box this project can reach, so either
+  // term of the conjunction could be deleted and both assertions would still
+  // pass -- measured, by the fresh review of #1377, which ran both mutations and
+  // got GREEN twice. They now say only what THIS device reports. The RULE is
+  // gated in the last case of this file, over all four attribute pairs, on a tier
+  // with no CUDA device at all.
 
   // ...and it is NOT `needs_weight_staging()` inverted. On GB10 BOTH are true,
   // which is the combination that made this a new predicate rather than a
@@ -527,4 +534,48 @@ TEST_CASE("CudaResidencyPolicy assembles the CUDA policy, budget included") {
   CHECK(unknown.release_host_weights_after_upload);
   CHECK(ShouldReleaseHostWeights(unknown, /*marlin=*/true, /*env=*/true));
   CHECK(ShouldInterleaveLoadStream(unknown, /*marlin=*/true));
+}
+
+// --- ENG-EXPERT-STREAM-DEVICE W0b, issue #1378 --------------------------------
+//
+// The `PageableMemoryAccess AND Integrated` conjunction, gated over all four
+// inputs on a tier with no CUDA device. Before this case the rule was asserted
+// only through `CudaPlatform`, on the one box this project can reach, where BOTH
+// attributes read 1 -- so the fresh review of #1377 deleted each term in turn
+// (mutations M-B1 and M-B2) and the suite stayed GREEN both times. A conjunction
+// that no reachable input can falsify is a comment.
+//
+// The DISCRETE-with-HMM row is the one that matters and the one no CUDA box here
+// can produce: `pageable = 1, integrated = 0` is a card that reports pageable
+// access and would serve every expert slice over PCIe with page migration. It
+// must answer false, and deleting the `integrated` term is exactly what makes it
+// answer true.
+TEST_CASE("host_memory_is_device_addressable: the conjunction over all four attribute pairs") {
+  using vllm::platforms::HostMemoryIsDeviceAddressableFromAttrs;
+
+  // GB10 / any integrated, pageable-capable part: the ONE true row, and the one
+  // the measured `dgx:gpu0` probe produced (both attributes 1).
+  CHECK(HostMemoryIsDeviceAddressableFromAttrs(1, 1));
+
+  // Discrete card with HMM. Deleting the `integrated` term flips this to true.
+  CHECK_FALSE(HostMemoryIsDeviceAddressableFromAttrs(1, 0));
+
+  // Integrated WITHOUT pageable access. `src/vllm/platforms/rocm.cpp` records
+  // this as a real device class, and on it a host pointer faults. Deleting the
+  // `pageable` term flips this to true.
+  CHECK_FALSE(HostMemoryIsDeviceAddressableFromAttrs(0, 1));
+
+  // Neither.
+  CHECK_FALSE(HostMemoryIsDeviceAddressableFromAttrs(0, 0));
+
+  // A FAILED `cudaDeviceGetAttribute` leaves its output at 0, which the probe
+  // relies on being the conservative answer. Same two rows as above, said as the
+  // failure it actually is rather than as a hypothetical device.
+  CHECK_FALSE(HostMemoryIsDeviceAddressableFromAttrs(/*probe failed=*/0, 1));
+  CHECK_FALSE(HostMemoryIsDeviceAddressableFromAttrs(1, /*probe failed=*/0));
+
+  // The arguments are the raw `int`s the CUDA probe writes, not `bool`s, so any
+  // non-zero value is the attribute being SET. A rule written with `== 1` would
+  // pass every case above and fail here.
+  CHECK(HostMemoryIsDeviceAddressableFromAttrs(2, 7));
 }

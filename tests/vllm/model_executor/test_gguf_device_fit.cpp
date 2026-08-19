@@ -104,6 +104,51 @@ std::string BuildGgufWithExpertTowers() {
   return b.Build();
 }
 
+// ENG-EXPERT-STREAM-DEVICE W0d repair (#1378). Two more files for the RESIDENCY
+// ROUTE term.
+//
+// `BuildGgufWithMixedExpertTowers` carries one Q8_0 tower (keep-quant eligible)
+// beside one F32 tower of the same shape (never keep-quant: no block encoding).
+// It is the case the all-or-nothing rule exists for — the lane is one suffix and
+// one byte count for the WHOLE file, so a file that would stage even one tower
+// must keep the whole bound.
+//
+// `BuildGgufWithNvfp4ExpertTower` carries a single NVFP4 (ggml type 40) tower,
+// 8 blocks of 64 elements in 36 bytes. NVFP4 has no `vt::DType` block encoding by
+// design, so it routes to `kNvfp4Fp4` or to `kExpandBf16` and never to a keep
+// residency; both of those arms stage the tower.
+std::string BuildGgufWithMixedExpertTowers() {
+  GgufModelBuilder b;
+  b.AddKv(StrKv("general.architecture", "qwen35moe"));
+  std::string gate;
+  for (int i = 0; i < 8; ++i) gate += Q8Block();
+  b.AddTensor("blk.0.ffn_gate_exps.weight", {32, 2, 4}, /*ggml_type=*/8, gate);
+  b.AddTensor("blk.1.ffn_up_exps.weight", {32, 2, 4}, /*ggml_type=*/0,
+              std::string(256 * 4, '\2'));
+  return b.Build();
+}
+
+std::string BuildGgufWithNvfp4ExpertTower() {
+  GgufModelBuilder b;
+  b.AddKv(StrKv("general.architecture", "qwen35moe"));
+  b.AddTensor("blk.0.ffn_gate_exps.weight", {64, 2, 4}, /*ggml_type=*/40,
+              std::string(8 * 36, '\x11'));
+  return b.Build();
+}
+
+// A policy stated field by field rather than read from the environment: this is
+// the PURE decision, and a case that called `FromEnv()` would be measuring the
+// box's registered ops as well as the rule.
+vllm::GgufLoadPolicy PolicyWith(bool keep_quant, bool keep_f16, bool nvfp4_fp4,
+                                bool cpu_ref) {
+  vllm::GgufLoadPolicy p;
+  p.keep_quant = keep_quant;
+  p.keep_f16 = keep_f16;
+  p.nvfp4_fp4 = nvfp4_fp4;
+  p.cpu_ref = cpu_ref;
+  return p;
+}
+
 // The lane, as the loader assembles it.
 vllm::StreamedExpertLane Lane(size_t arena_bytes) {
   vllm::StreamedExpertLane lane;
@@ -428,4 +473,74 @@ TEST_CASE("gguf_device_fit W0d: the lane FLIPS a refusal into a load, and the me
   CHECK(on_tight.message.find("VT_MOE_EXPERT_STREAM_SLOTS") != std::string::npos);
   CHECK(on_tight.message.find(std::to_string(kStreamedStaged)) !=
         std::string::npos);
+}
+
+// --- ENG-EXPERT-STREAM-DEVICE W0d repair (#1378): the RESIDENCY ROUTE term -----
+
+TEST_CASE(
+    "gguf_device_fit W0d: the lane term asks which residency the towers take") {
+  TempFile f(BuildGgufWithExpertTowers());
+  const vllm::GgufFile gguf = vllm::GgufFile::Open(f.path());
+
+  // Both towers are Q8_0 with K = 32, a whole number of 32-element blocks, in a
+  // role whose bytes are taken verbatim. With keep-quant on they reach
+  // `expert_*_kq` and therefore `KqExpertSlice`, which is the ONLY arm the lane
+  // serves.
+  CHECK(vllm::GgufExpertTowersReachSlotLane(
+      gguf, "_exps.weight", PolicyWith(true, false, false, false)));
+
+  // The documented opt-out. Same file, same tensors: the towers now expand to
+  // bf16 at load and every one of them is staged, so the lane must not claim
+  // them. This is the defect #1378 filed — four terms held and this fifth one
+  // did not exist.
+  CHECK_FALSE(vllm::GgufExpertTowersReachSlotLane(
+      gguf, "_exps.weight", PolicyWith(false, false, false, false)));
+
+  // `VT_CPU_REF=1` forces the full expand path regardless of `keep_quant`, so it
+  // must turn the lane off through the same door rather than through a second
+  // rule written here.
+  CHECK_FALSE(vllm::GgufExpertTowersReachSlotLane(
+      gguf, "_exps.weight", PolicyWith(true, false, false, true)));
+
+  // An empty suffix matches NOTHING, and a file with no matching tower has no
+  // lane to turn on. "Every element of the empty set reaches the lane" is true
+  // and useless, so the answer is false in both shapes.
+  CHECK_FALSE(vllm::GgufExpertTowersReachSlotLane(
+      gguf, "", PolicyWith(true, false, false, false)));
+  CHECK_FALSE(vllm::GgufExpertTowersReachSlotLane(
+      gguf, "_nothing_matches", PolicyWith(true, false, false, false)));
+}
+
+TEST_CASE(
+    "gguf_device_fit W0d: ONE staged tower turns the whole lane off") {
+  TempFile f(BuildGgufWithMixedExpertTowers());
+  const vllm::GgufFile gguf = vllm::GgufFile::Open(f.path());
+
+  // The Q8_0 tower alone would reach the lane; the F32 tower beside it never
+  // can. The lane is all-or-nothing by construction — one suffix, one arena,
+  // on or off for the file — so the mixed file keeps the WHOLE bound. That
+  // over-refuses, which `VT_DEVICE_WEIGHT_BUDGET_BYTES` releases; the other
+  // direction under-refuses, and nothing releases that.
+  CHECK_FALSE(vllm::GgufExpertTowersReachSlotLane(
+      gguf, "_exps.weight", PolicyWith(true, false, false, false)));
+  // ...and the positive control, so the case cannot pass because the file was
+  // built wrong: the Q8_0 tower on its own does reach it.
+  CHECK(vllm::GgufExpertTowersReachSlotLane(
+      gguf, "gate_exps.weight", PolicyWith(true, false, false, false)));
+}
+
+TEST_CASE(
+    "gguf_device_fit W0d: an NVFP4 tower never reaches the lane, on either fp4 "
+    "setting") {
+  TempFile f(BuildGgufWithNvfp4ExpertTower());
+  const vllm::GgufFile gguf = vllm::GgufFile::Open(f.path());
+
+  // fp4 residency ON is the shipped CUDA default and routes `kNvfp4Fp4`, which
+  // fills `expert_*_fp4` and reaches `MoeBlockFusedCuda` / `MoeBlockFusedMarlinCuda`.
+  CHECK_FALSE(vllm::GgufExpertTowersReachSlotLane(
+      gguf, "_exps.weight", PolicyWith(true, false, true, false)));
+  // fp4 residency OFF routes `kExpandBf16`, which fills `expert_*` and reaches
+  // `MoeBlockBf16Cuda`. Different arm, same verdict: the tower is staged.
+  CHECK_FALSE(vllm::GgufExpertTowersReachSlotLane(
+      gguf, "_exps.weight", PolicyWith(true, false, false, false)));
 }
