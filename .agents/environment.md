@@ -784,7 +784,15 @@ environment:
     was NOT measured is the kernel's own account: nobody read `uptime`, `dmesg`
     or `journalctl --list-boots` on the host afterwards, so "the parallel link
     exhausted memory and the box rebooted" is inference from the fleet's view
-    alone. **What would settle it:** re-run the same full build at `-j 8` while
+    alone.
+    **One piece of corroboration WAS measured, on the next job.** The worker that
+    picked up the following lease reported a DIFFERENT pod name (`rc-worker-m4d7t`
+    against `rc-worker-hqfj4` before), and its `/tmp` had lost the source tree and
+    the build directory the earlier jobs had left there, and `/usr/local/cuda-13.0`
+    was gone so the job had to `apt-get` the toolkit again. So the worker
+    container was certainly recreated. That still does not distinguish a host
+    reboot from a pod restart, which is exactly the gap the boot list closes.
+    **What would settle it:** re-run the same full build at `-j 8` while
     sampling `free -m` from inside the job, and read `journalctl --list-boots` on
     the host afterwards — a GAP in the boot list is the evidence
     ([[kairos-oem-rw-paths-change-cost-a-boot]]), and a host that did not reboot
