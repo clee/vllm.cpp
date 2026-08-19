@@ -768,7 +768,18 @@ GDNAttentionMetadata SpecGdnMeta(int32_t reqs, int32_t q) {
   return gm;
 }
 
-CommonAttentionMetadata SpecAttnMeta(int32_t reqs, int32_t q, int32_t pos) {
+// `bs` is the pool's block size, and it is a PARAMETER because the block table
+// this builds has to be wide enough to ADDRESS `pos + q`. A single hard-coded
+// column made the q=4-at-pos-20 shape below declare seq_len 24 against a table
+// that reaches position 15, and every paged-attention kernel reads
+// `block_table[r, j / block_size]` for j up to seq_len-1 with no bound of its
+// own -- so that shape read one int32 past a 1-element row, found 0 when this
+// case ran alone and 1021459670 when another case in the file had run first,
+// and SIGSEGV'd on the second (#1390). `vt::PagedAttention` now refuses the
+// narrow table outright; this builds one that fits. Logical block j maps to
+// PHYSICAL block j, which is exactly the identity `slot_mapping = pos + i`
+// already assumes.
+CommonAttentionMetadata SpecAttnMeta(int32_t reqs, int32_t q, int32_t pos, int32_t bs = 16) {
   CommonAttentionMetadata am;
   am.num_reqs = reqs;
   am.num_actual_tokens = reqs * q;
@@ -780,8 +791,12 @@ CommonAttentionMetadata SpecAttnMeta(int32_t reqs, int32_t q, int32_t pos) {
   am.seq_lens_cpu = am.seq_lens;
   am.max_query_len = q;
   am.max_seq_len = pos + q;
-  am.block_table_num_cols = 1;
-  am.block_table_tensor.assign(static_cast<size_t>(reqs), 0);
+  const int32_t cols = (pos + q + bs - 1) / bs;
+  am.block_table_num_cols = cols;
+  am.block_table_tensor.resize(static_cast<size_t>(reqs) * static_cast<size_t>(cols));
+  for (int32_t r = 0; r < reqs; ++r)
+    for (int32_t c = 0; c < cols; ++c)
+      am.block_table_tensor[static_cast<size_t>(r * cols + c)] = c;
   am.slot_mapping.resize(static_cast<size_t>(reqs) * static_cast<size_t>(q));
   for (size_t i = 0; i < am.slot_mapping.size(); ++i)
     am.slot_mapping[i] = pos + static_cast<int32_t>(i);

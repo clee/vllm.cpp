@@ -629,6 +629,35 @@ TEST_CASE("paged_attention validates shapes/args") {
         vt::PagedAttention(qq, tp, tq, tkc, tvc, tbt, tsl, tqsl, bad),
         std::runtime_error);
   }
+  // #1390: A BLOCK TABLE THAT CANNOT ADDRESS seq_lens IS AN OUT-OF-BOUNDS READ,
+  // not a wrong number. `tbt` is one column at block_size 2, so it addresses
+  // positions 0..1; seq_len 3 makes the kernel read `block_table[0, 1]`, one
+  // int32 past the row, and multiply that byte pattern by the cache's block
+  // stride. On `main` that read returned 0 when the case ran alone and
+  // 1021459670 when another case had run first -- a SIGSEGV whose only
+  // difference was the heap. Both arms of the bound are asserted, because the
+  // device arm is the only one a CUDA caller gets.
+  {
+    Tensor tq = F32(q, {1, 2, D}), tp = F32(out, {1, 2, D});
+    std::vector<int32_t> sl_over = {3};  // needs 2 columns, the table has 1
+    Tensor tsl_over = I32(sl_over, {1});
+    CHECK_THROWS_AS(vt::PagedAttention(qq, tp, tq, tkc, tvc, tbt, tsl_over, tqsl,
+                                       PagedAttentionArgs{1.0f, true}),
+                    std::runtime_error);
+    // The host-known upper bound is refused on its own, which is what a caller
+    // whose seq_lens live on a device gets.
+    PagedAttentionArgs over{1.0f, true};
+    over.max_seq_len = 3;
+    CHECK_THROWS_AS(vt::PagedAttention(qq, tp, tq, tkc, tvc, tbt, tsl, tqsl, over),
+                    std::runtime_error);
+    // And a batch that FITS still runs: seq_len 2 == 1 column x block_size 2.
+    std::vector<int32_t> sl_fit = {2};
+    Tensor tsl_fit = I32(sl_fit, {1});
+    PagedAttentionArgs fits{1.0f, true};
+    fits.max_seq_len = 2;
+    CHECK_NOTHROW(
+        vt::PagedAttention(qq, tp, tq, tkc, tvc, tbt, tsl_fit, tqsl, fits));
+  }
 }
 
 // ===========================================================================

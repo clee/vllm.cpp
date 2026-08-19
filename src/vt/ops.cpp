@@ -3595,6 +3595,40 @@ void PagedAttention(Queue& q, Tensor& out, const Tensor& query, const Tensor& k_
                seq_lens.device == q.device && query_start_loc.device == q.device,
            "paged_attention: device mismatch (query/out/cache/block_table/seq_lens/"
            "query_start_loc/queue)");
+  // THE BLOCK TABLE MUST ADDRESS EVERY POSITION THE BATCH ATTENDS TO (#1390).
+  // Every kernel reads `block_table[r, j / block_size]` for j up to
+  // `seq_lens[r] - 1` (cpu_paged_attn.cpp:227,247) and none of them bounds that
+  // column, so a row one column short does not return a wrong answer -- it
+  // reads one int32 PAST the row and multiplies whatever byte pattern it finds
+  // by the cache's block stride. A window narrows only the LOW end (jmin), so
+  // the highest column read is `(seq_len-1)/block_size` for causal, non-causal
+  // and windowed callers alike, and this one bound holds for all three.
+  const int64_t addressable_positions = block_table.shape[1] * k_cache.shape[1];
+  // `max_seq_len` is the caller's host-known upper bound over `seq_lens`
+  // (0 == unset, which passes trivially). It is the only arm available when the
+  // metadata lives on a device this thread must not dereference.
+  VT_CHECK(args.max_seq_len <= addressable_positions,
+           "paged_attention: block_table addresses " +
+               std::to_string(addressable_positions) + " positions (" +
+               std::to_string(block_table.shape[1]) + " columns x block_size " +
+               std::to_string(k_cache.shape[1]) + "), below max_seq_len " +
+               std::to_string(args.max_seq_len));
+  if (q.device.type == DeviceType::kCPU) {
+    // On CPU the metadata IS host memory (asserted contiguous and device-equal
+    // above), so the exact per-request bound is one pass over num_reqs int32s --
+    // unmeasurable beside the layer's GEMMs, and the arm that actually caught
+    // #1390, whose batch left max_seq_len unset.
+    const int32_t* seq_lens_host = seq_lens.Ptr<int32_t>();
+    for (int64_t r = 0; r < num_reqs; ++r) {
+      VT_CHECK(seq_lens_host[r] >= 0 && seq_lens_host[r] <= addressable_positions,
+               "paged_attention: seq_lens[" + std::to_string(r) + "] == " +
+                   std::to_string(seq_lens_host[r]) + " exceeds the " +
+                   std::to_string(addressable_positions) +
+                   " positions block_table can address (" +
+                   std::to_string(block_table.shape[1]) + " columns x block_size " +
+                   std::to_string(k_cache.shape[1]) + ")");
+    }
+  }
   reinterpret_cast<PagedAttentionFn>(GetOp(OpId::kPagedAttention, q.device.type))(
       q, out, query, k_cache, v_cache, block_table, seq_lens, query_start_loc, args);
 }
