@@ -128,6 +128,25 @@ void PagedAttentionKernel(Queue&, Tensor& out, const Tensor& query, const Tensor
   const int32_t* slens = seq_lens.Ptr<int32_t>();
   const int32_t* btab = block_table.Ptr<int32_t>();
   const int64_t bt_row = block_table.stride[0], bt_col = block_table.stride[1];
+  // THE BLOCK TABLE HAS TO REACH THE LAST POSITION `seq_lens` DECLARES, and
+  // nothing checked that it did (#1394). The j loop below reads
+  // `btab[r * bt_row + (j / block_size) * bt_col]` for every j < seq_lens[r], so
+  // a table with fewer columns than `ceil(seq_lens[r] / block_size)` is read past
+  // its own last element. That read is SILENT: it lands inside whatever the
+  // scratch pool put next to the table, produces a plausible block index, and
+  // attends to the wrong page. `tests/vllm/models/test_qwen3_5_decode_graph_seam.cpp`
+  // supplied exactly that for two years' worth of nothing, until a `DevicePool`
+  // change moved the neighbouring bytes and it became a SIGSEGV. One compare per
+  // request, outside the token loop, turns it into a refusal that names the
+  // caller's mistake.
+  const int64_t bt_cols = block_table.rank >= 2 ? block_table.shape[1] : 0;
+  for (int64_t r = 0; r < num_reqs; ++r) {
+    const int64_t need = (slens[r] + block_size - 1) / block_size;
+    VT_CHECK(need <= bt_cols,
+             "paged_attention: the block table is shorter than the sequence it "
+             "must address (a request needs more logical blocks than the table "
+             "has columns)");
+  }
   // Cache strides (unbind-slice aware): block / page(offset) / head / elem.
   const int64_t kc_blk = k_cache.stride[0], kc_pg = k_cache.stride[1], kc_hd = k_cache.stride[2];
   const int64_t vc_blk = v_cache.stride[0], vc_pg = v_cache.stride[1], vc_hd = v_cache.stride[2];
