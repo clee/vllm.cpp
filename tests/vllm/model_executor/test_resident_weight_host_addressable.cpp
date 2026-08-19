@@ -419,6 +419,47 @@ TEST_CASE("a MISALIGNED BORROW is not re-homed, and stages instead") {
   CHECK(std::memcmp(t.data, off, nb) == 0);
 }
 
+TEST_CASE("an ALIASED weight's host mirror is NOT redundant, so nothing may free it") {
+  // THE USE-AFTER-FREE A FRESH REVIEW CAUGHT (#1299). `MoeBlockBf16Cuda`
+  // captures `ResidentWeight(...).data` for every expert into a DEVICE-resident
+  // pointer table, uploads the table once, and then releases the host mirrors.
+  // Its own comment justified that with "once the device copy exists it is
+  // authoritative and nothing reads the host bytes again", which held while
+  // `ResidentWeight` had two behaviours. It has three: this branch ALIASES, so
+  // the captured pointers ARE `w.bytes.data()`, and the release frees memory the
+  // resident table still points at for the model's lifetime, from inside
+  // captured graphs. The reviewer demonstrated it with a scratch case that takes
+  // SIGSEGV.
+  //
+  // THIS CASE DOES NOT DEREFERENCE FREED MEMORY, deliberately: a segfault is a
+  // red that also destroys the rest of the binary's report, and a gate should
+  // fail by assertion. It asserts the DECISION instead, on both arms, which is
+  // the thing the production site now asks.
+  const PlatformArm arm(true);
+  const OwnedTensor aliased = MakeWeight(/*tag=*/11);
+  Queue q = XpuQueue();
+  const Tensor t = vllm::detail::StageWeightForTest(q, aliased);
+
+  REQUIRE(aliased.d_dev == nullptr);
+  REQUIRE(t.data == static_cast<const void*>(aliased.bytes.data()));
+  // There is no device copy, so the host bytes are the ONLY copy and releasing
+  // them would free what the kernel reads.
+  CHECK_FALSE(vllm::HostMirrorIsRedundant(aliased));
+
+  // The discrete arm is the other half: a staged weight DOES have an
+  // authoritative device copy, and the release that predates W0f stays correct
+  // for it. Without this half the invariant could be satisfied by refusing every
+  // release, which would silently undo a measured host-memory lever.
+  {
+    const PlatformArm discrete(false);
+    const OwnedTensor staged = MakeWeight(/*tag=*/12);
+    const Tensor dt = vllm::detail::StageWeightForTest(q, staged);
+    REQUIRE(staged.d_dev != nullptr);
+    CHECK(dt.data == staged.d_dev.get());
+    CHECK(vllm::HostMirrorIsRedundant(staged));
+  }
+}
+
 TEST_CASE("a weight whose host bytes are GONE is refused by name, not aliased to null") {
   // THE LIFETIME PRECONDITION, stated in code. The aliasing branch hands out
   // `w.bytes.data()` and keeps no reference of its own, so it is correct only
