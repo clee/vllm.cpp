@@ -24758,10 +24758,16 @@ run would now do — only that #1252 is not what stopped the last one.
 
 ## A2-D1 — NemotronH decodes on the single-step recurrent kernels (#1311)
 
-**No throughput, latency or occupancy number is claimed by the landing change.**
-The A3 e2e token gate on both legs of one binary is the acceptance condition and
-is OWED; the recipe is `scripts/nemotron-h-a2d1-gpu-gate.sh` and the row's spec
-lists it under `## Owed`.
+**Verdict: correctness ACCEPTED, speed REFUTED on the box that was measured.**
+The A3 e2e token gate reads `96/96 mode=decode STRICT PASS` on both legs of one
+binary on `thor:gpu0` (sm_110), and per-output-token moved +0.388% -- under
+#1311's own 3% refutation bar. The recipe is
+`scripts/nemotron-h-a2d1-gpu-gate.sh`. The `dgx:gpu0` sm_121a leg, a repeated
+A/B and an `nsys` decode-window trace stay OWED in the row's spec.
+
+This entry was first written before any GPU lease was obtained and said no
+number was claimed. It is superseded by the sections below rather than deleted,
+because the order in which the evidence arrived is part of the record.
 
 ### What IS established, and on what
 
