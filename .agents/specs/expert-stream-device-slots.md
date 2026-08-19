@@ -368,7 +368,15 @@ first (`echo 3 > /proc/sys/vm/drop_caches`, ~90.9 GB available after each drop).
 
 `benchmarks/expert_stream_device_w0e.cpp`, a thin client of `include/vllm.h`
 linked against the packaged shared library, which exports the C ABI and nothing
-else. It needed to exist because the gate wants three things from ONE
+else. **The project builds it**, as the `expert-stream-device-w0e` target. It
+was first written unwired, beside `marlin_moe_standalone.cpp`, on the reading
+that a gate instrument is not a shipped capability. Wiring it found that the
+file did not compile under the project's own flags at all — three backslash
+continuations inside `//` comments, which `-Werror=comment` rejects — so the
+recorded recipe was the only thing that had ever built it. An instrument
+nothing compiles rots against the very ABI it measures, and a measurement whose
+harness no longer builds cannot be reproduced, so the target is the correct
+shape even though the file is not a capability. It needed to exist because the gate wants three things from ONE
 generation, and no shipped command produces all three: the generated TOKEN IDS
 (`vllm_complete_tokens`, ABI v13, which writes them into a caller buffer), a
 PER-STEP arrival timestamp (a custom logits processor, invoked once per decode

@@ -16,26 +16,29 @@
 // to take that path; without it the harness falls back to vllm_complete, whose
 // only id evidence is the processor's lagging view.
 //
-// NOT WIRED INTO CMAKE, like marlin_moe_standalone.cpp beside it: it is a
-// measurement instrument for one row's gate and not a shipped capability.
-// Build it against the packaged shared library, which exports the C ABI and
-// nothing else, so this file cannot reach an internal header even by accident:
+// It builds as the `expert-stream-device-w0e` target, and links `vllm::shared`
+// rather than `vllm::vllm`, so it exercises the packaged C ABI and nothing else
+// and cannot reach an internal header even by accident. It was originally left
+// out of CMake beside marlin_moe_standalone.cpp, on the reading that a
+// gate instrument is not a shipped capability. That is the wrong trade for THIS
+// file: an instrument nothing compiles rots silently against the very ABI it
+// measures, and the numbers in `.agents/benchmark-record.md` cannot be
+// reproduced from a file that no longer builds. So the project builds it.
 //
-//   cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
-//     -DVLLM_CPP_CUDA=ON -DVLLM_CPP_CUDA_ARCHITECTURES=121a \
+//   cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+//     -DVLLM_CPP_CUDA=ON -DVLLM_CPP_CUDA_ARCHITECTURES=121a
 //     -DVLLM_CPP_CUTLASS_DIR=$HOME/cutlass -DVLLM_CPP_TRITON=ON
-//   cmake --build build --target vllm-cli -j 6
-//   g++ -O2 -std=c++17 -Iinclude -o build/w0e_gen \
-//       benchmarks/expert_stream_device_w0e.cpp build/libvllm.so \
-//       -Wl,-rpath,$PWD/build
+//   cmake --build build --target expert-stream-device-w0e -j 6
 //
 // One arm, with the lane on and its statistics line at every step so that the
-// after-prefill snapshot and the final one are both in the log:
+// after-prefill snapshot and the final one are both in the log. (Written on one
+// line: a backslash continuation inside a `//` comment is what -Werror=comment
+// rejects, and this file is compiled with the project's flags now.)
 //
-//   VT_GGUF_PREFAULT=0 VT_MOE_EXPERT_STREAM=1 \
-//   VT_MOE_EXPERT_STREAM_SLOTS=8000 VT_MOE_EXPERT_STREAM_STATS_EVERY=1 \
-//     ./build/w0e_gen --model <shard-1>.gguf --device cuda --max-tokens 32 \
-//                     --max-num-seqs 1 --prompt-ids 760,6511,314,9338,369
+//   VT_GGUF_PREFAULT=0 VT_MOE_EXPERT_STREAM=1 VT_MOE_EXPERT_STREAM_SLOTS=8000
+//   VT_MOE_EXPERT_STREAM_STATS_EVERY=1 ./build/examples/expert-stream-device-w0e
+//   --model <shard-1>.gguf --device cuda --max-tokens 32 --max-num-seqs 1
+//   --prompt-ids 760,6511,314,9338,369
 //
 // `VT_GGUF_PREFAULT=0` is load-bearing for a model larger than memory, and
 // STATS_EVERY=1 is load-bearing for a short run: at the default 16 a healthy
