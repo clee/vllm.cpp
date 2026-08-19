@@ -853,6 +853,22 @@ bool NemotronHDeviceMambaEnabled() {
 // vLLM runs and "parity enablers ship as defaults" is repository policy. The
 // opt-out exists so the two arms can be A/B'd IN ONE BINARY: a decode-window
 // measurement taken against a differently-built binary measures the build.
+// The ARM counter line is gated SEPARATELY from `VT_NEMOTRON_H_DIAG`, and that
+// separation is the whole point. `VT_NEMOTRON_H_DIAG` does a `DownloadF32` of
+// the carry and the residual PER LAYER PER STEP; a timed A/B run under it is
+// measuring the diagnostic, not the arm
+// ([[instrument-injects-the-defect-it-reveals]]). This one is a single
+// `fprintf` of six already-resident counters per step, so it can stay on for
+// the timed legs and the reachability evidence and the numbers come from ONE
+// run instead of two that might differ.
+bool NemotronHArmTraceEnabled() {
+  static const bool on = [] {
+    const char* e = std::getenv("VT_NEMOTRON_H_ARM_TRACE");
+    return e != nullptr && e[0] != '0';
+  }();
+  return on;
+}
+
 bool NemotronHDecodeStepEnabled() {
   static const bool on = [] {
     const char* e = std::getenv("VT_NEMOTRON_H_MAMBA_DECODE_STEP");
@@ -2541,7 +2557,7 @@ ForwardLogits NemotronHPagedForward(const NemotronHHostWeights& host,
   // VT_LOGITS_GATHER=0 path and means "every row", which is also what the two
   // non-paged seams mean by it — so this branch serves both gather settings and
   // no runner step can escape the paged path on that flag.
-  if (NemotronHDiagEnabled()) {
+  if (NemotronHArmTraceEnabled() || NemotronHDiagEnabled()) {
     // ★ WHICH RECURRENT KERNELS THIS STEP LAUNCHED. The two arms compute the
     // same recurrence, so the tokens cannot tell them apart and only this line
     // separates "the decode step stopped launching the chunk scan" from a claim

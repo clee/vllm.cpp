@@ -144,8 +144,13 @@ run_leg() {   # $1 = label, $2 = VT_NEMOTRON_H_MAMBA_DECODE_STEP value
   # which is GPU-IDLE, and dilutes both arms toward each other. That already
   # produced one void number on this row. The driver starts FIRST and the
   # sampler starts only once it has printed `engine loaded in Ns`.
+  # ★ VT_NEMOTRON_H_ARM_TRACE, *NOT* VT_NEMOTRON_H_DIAG. The latter downloads
+  # the carry and the residual per layer per step, so a timed leg under it
+  # measures the diagnostic. The arm trace is one fprintf of six resident
+  # counters per step, so the reachability evidence and the timing come from
+  # the SAME run rather than from two runs that might differ.
   VT_NEMOTRON_H_DEVICE_MAMBA=1 VT_NEMOTRON_H_MAMBA_DECODE_STEP=$flag \
-  VT_NEMOTRON_H_DIAG=1 "$BUILD/examples/nemotron-h-gen" \
+  VT_NEMOTRON_H_ARM_TRACE=1 "$BUILD/examples/nemotron-h-gen" \
       --model "$CKPT" \
       --golden "$SRC/tests/parity/goldens/nemotron_35_lightning_greedy/oracle.json" \
       > "$log" 2>&1 &
@@ -176,10 +181,20 @@ run_leg() {   # $1 = label, $2 = VT_NEMOTRON_H_MAMBA_DECODE_STEP value
   # only line that can. A counter that reads 0 on BOTH legs means the recorder
   # is broken, not that no kernel ran -- test_nemotron_h_paged_forward's
   # "recurrent arm recorder" case is the triage for that.
-  echo "--- decode-step arm counters ($label), first 3 and last 1 decode steps ---"
-  grep "ARM step" "$log" | awk '$4=="nd=1"' | head -3
-  grep "ARM step" "$log" | awk '$4=="nd=1"' | tail -1
-  echo "decode steps recorded: $(grep -c 'ARM step' "$log")"
+  echo "--- decode-step arm counters ($label) ---"
+  # Match on the FIELD TEXT, not on a field INDEX. The line is
+  # `[NH-DIAG] ARM step T=1 nd=1 np=0  state_update_rows=...`, so nd is field 5
+  # and an `$4` test silently selects NOTHING -- which prints as a clean empty
+  # result and reads exactly like "no decode steps ran".
+  grep -E 'ARM step .* nd=[1-9]' "$log" | head -3
+  grep -E 'ARM step .* nd=[1-9]' "$log" | tail -1
+  echo "ARM lines total: $(grep -c 'ARM step' "$log")"
+  echo "ARM lines with a DECODE row: $(grep -cE 'ARM step .* nd=[1-9]' "$log")"
+  echo "ARM lines with a PREFILL row: $(grep -cE 'ARM step .* np=[1-9]' "$log")"
+  # A count of ZERO decode lines is an instrument failure, not a result.
+  if [ "$(grep -cE 'ARM step .* nd=[1-9]' "$log")" -eq 0 ]; then
+    echo "$label: NO decode-step ARM lines were recorded -- the counters say NOTHING about this run, and that is not a pass"
+  fi
 
   python3 - "$RUN/util_$label.txt" "$label" "$ARCH" "$loaded" <<'PY'
 import sys
