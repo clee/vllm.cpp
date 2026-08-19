@@ -966,8 +966,16 @@ TEST_CASE("G1 CUDA W6: a SPEC shape captures and replays bit-exactly against eag
                                /*spec_mql=*/3);
   CudaGdnCachePool graph_cache(b, q, c, /*num_blocks=*/4, /*block_size=*/16,
                                /*spec_mql=*/3);
-  vllm::Qwen3_5DenseDecodeGraph eager(w, c, q, /*max_num_reqs=*/0);  // EAGER arm
   vllm::Qwen3_5DenseDecodeGraph graphed(w, c, q, /*max_num_reqs=*/4);
+  // THE EAGER ARM IS THE MODEL'S OWN `ForwardDevice`, NOT A SECOND DRIVER, and
+  // the difference is not stylistic. The five cases above select eager with
+  // `max_num_reqs == 0`, which works because `PadToCaptureSize` then returns -1.
+  // A SPEC step never pads -- `S = spec_step ? B : PadToCaptureSize(B)` -- so a
+  // driver built with `max_num_reqs == 0` captures the spec shape just like the
+  // graphed one, and the "eager" arm silently becomes a second capturing driver
+  // competing for the same pool. `Qwen3_5DenseModel::ForwardDevice` is the exact
+  // body the driver's own disabled path runs (`DenseForwardBody` +
+  // `WrapDeviceLogits`), so the two arms stay one binary on one device.
 
   // Five steps, each recorded rather than aggregated, because WHICH step is
   // refused is how #1380 was located. A spec step always takes the two-slot
@@ -982,9 +990,10 @@ TEST_CASE("G1 CUDA W6: a SPEC shape captures and replays bit-exactly against eag
     std::vector<float> e, g;
     try {
       e = Read(b, q,
-               eager.Step(SpecIota(6, 10), SpecIota(6, 0), SpecAttnMeta(2, 3, 0),
-                          SpecGdnMeta(2, 3), eager_cache.attn_kv,
-                          eager_cache.gdn_state),
+               vllm::Qwen3_5DenseModel::ForwardDevice(
+                   SpecIota(6, 10), SpecIota(6, 0), SpecAttnMeta(2, 3, 0),
+                   SpecGdnMeta(2, 3), eager_cache.attn_kv,
+                   eager_cache.gdn_state, w, c, q),
                c.vocab_size * rows);
       g = Read(b, q,
                graphed.Step(SpecIota(6, 10), SpecIota(6, 0), SpecAttnMeta(2, 3, 0),
@@ -1011,7 +1020,6 @@ TEST_CASE("G1 CUDA W6: a SPEC shape captures and replays bit-exactly against eag
   CHECK(captured_after[2] == 1);
   CHECK(captured_after[3] == 1);
   CHECK(captured_after[4] == 1);
-  CHECK_FALSE(eager.captured());
   CHECK(graphed.replay_count() >= 1);
   MESSAGE("G1 W6 spec shape on CUDA: 5 steps x " << c.vocab_size * rows
           << " logits, " << total << " differing, " << graphed.replay_count()
