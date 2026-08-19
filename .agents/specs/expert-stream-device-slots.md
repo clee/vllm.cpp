@@ -23,7 +23,7 @@ The three gates, reported one result each:
 |---|---|
 | **G0-CORRECT** | **NO CUDA SIDE.** The CUDA arm emits zero tokens, so there is nothing to compare. The CPU side is byte-identical across four runs and two slot counts (32 ids, listed in `## Evidence`), which is the strongest half of the comparison that this hardware allows today. |
 | **G0-LIVE** | **PASS on CPU, NOT REACHED on CUDA.** CPU: `steps=32`, `forced=0`, decode-phase `exhausted` delta **0** at both 4000 and 8000 slots. CUDA: the store BUILDS and prints its banner, and no step boundary is ever reached, so there is no snapshot pair to difference. |
-| **G0-SPEED** | **CPU only, no ratio.** Steady decode **11.05 s/token** median (min 9.43, max 13.25, 29 samples, 2 reps) at 4000 slots. No CUDA number exists, so no ratio is reported and none may be inferred. |
+| **G0-SPEED** | **CPU only, no ratio.** Steady decode **11.05 s/token**, which is rep 2's median over 29 samples (min 9.43, max 13.25) at 4000 slots; rep 1's median is 11.22, so the two reps agree within 1.5%. No CUDA number exists, so no ratio is reported and none may be inferred. |
 
 What that means precisely, because both "W0 landed" and "W0 failed" would
 misstate it:
@@ -461,14 +461,34 @@ greedy, 32 tokens. Four runs, two slot counts, two reps each:
 | 8000 | 18.55 GiB | 266.5 s | 132.74 s | median 39.98, min 16.06, max 94.30 | 1581.6 s | 86.6 GiB | 6,941 MiB | **30,625 MiB (all of it)** |
 
 **Read the 8000-slot rows as a memory result, not a cache result.** A bigger
-cache came out 3.6x SLOWER and 4x more variable, which is the wrong direction,
-and the last column says why: an 18.55 GiB arena does not fit beside this
-model's 62 GiB of dense weights on a 119.63 GiB box, so those runs swapped, one
-of them exhausting swap entirely. Both 8000-slot runs reproduce each other, so
-this is the box's behaviour and not a fluke. **The publishable CPU figure is the
-4000-slot one, 11.05 s/token**, and it is the first live-cache streaming-ON
-decode number this project has; `docs/BENCHMARKS.md:8` recorded streaming-ON as
-VOID (#912 F1, the step clock dead from token 3) with a re-measure owed.
+cache came out slower, and the four available median pairings span 3.56x to
+4.11x: 3.62x same-rep on the pair that produced the publishable figure (39.98
+against 11.05) and 4.05x pairing rep 1 with rep 1 (45.40 against 11.22). It also
+came out far less steady: the steady window's max/min ratio is 3.99x in rep 1
+(20.73 to 82.68 s) and 5.87x in rep 2 (16.06 to 94.30 s), against 1.30x and
+1.40x at 4000 slots. Whichever pairing is quoted, the direction is wrong.
+
+**The cause is NOT that the arena does not fit, and the arithmetic says so.**
+18.55 GiB of arena beside this model's 62 GiB of dense weights is 80.55 GiB on a
+119.63 GiB box, which fits with room to spare, and the columns agree: peak RSS
+moves 86.5 -> 86.6 GiB for a 9.27 GiB arena delta. The two columns that DO move
+are `min avail`, 16,347 -> 6,941 MiB, a 9,406 MiB fall that is about the arena
+delta, and peak swap, 6,883 -> 30,625 MiB, which is all of it. The
+best-supported reading of that pattern is **page-cache displacement**: the
+borrowed 370 GiB expert mapping is served out of whatever memory is free, the
+arena takes that memory, and the reclaim pressure it creates pushes anonymous
+pages to swap. That is a reading of the columns and not a proven mechanism, and
+this run cannot separate it from plain reclaim pressure, because it sampled no
+page-cache size and no major-fault counter. The operational conclusion does not
+depend on which of the two it is, and it is unchanged: **more slots is not a
+free knob.**
+
+Both 8000-slot runs reproduce each other, so this is the box's behaviour and not
+a fluke. **The publishable CPU figure is the 4000-slot one, 11.05 s/token**,
+which is rep 2's median; rep 1's is 11.22, so the two reproduce within 1.5%. It
+is the first live-cache streaming-ON decode number this project has;
+`docs/BENCHMARKS.md:8` recorded streaming-ON as VOID (#912 F1, the step clock
+dead from token 3) with a re-measure owed.
 
 Steps 1-3 are excluded from the steady figure and reported separately because
 they are not steady state: step 1 is prefill, and steps 2-3 are still filling a
@@ -484,8 +504,9 @@ produce byte-identical counters, so the lane is deterministic. `steps=32 > 0`.
 `forced` is 0 by construction and is deliberately absent from the stderr line:
 its only setter is `detail::ExpertStreamSetForceFallback`, which
 `src/vllm/model_executor/models/qwen3_5_internal.h:488` records as having no
-production caller, and `qwen3_5.cpp:5389` counts it separately from `exhausted`
-for exactly that reason.
+production caller, and `qwen3_5.cpp:5521` (`++forced_` in
+`Qwen35ExpertStream::Slice`) counts it separately from `exhausted` for exactly
+that reason, in a comment that says so.
 
 **The tokens.** All four CPU runs, across both slot counts, produced the same 32
 ids:
@@ -730,6 +751,6 @@ re-derived here.
 | **A mutation of W0b's CUDA leg.** `CudaPlatform::host_memory_is_device_addressable` compiles only in a CUDA build, so no CPU-tier gate can invert it. The bullet in `## Now` promised this line and the table did not carry it, which is fixed here. | **Half discharged by W0e and stated as half.** The lane engaged on a real `--device cuda` run — the `[expert-stream] ON` banner printed and the #1123 refusal did not fire — and neither happens unless the probed predicate returned true on the actual CUDA platform, so the leg is now proven REACHED and proven to answer true on a GB10. What is still owed is the negative: a mutation that makes it answer false and shows a gate go red. That needs a CUDA build with a test target, and W0e built with `-DVLLM_CPP_BUILD_TESTS=OFF` because the lease was for the measurement. |
 | **A zero-copy device filler (GPUDirect Storage / `cuFile`).** | W1 ships the staging bounce by choice, for the reasons in its design note. The measurement that would justify replacing it — a device-arm decode where the H2D leg is a measurable fraction of fill time — does not exist until W1 has run somewhere. |
 | **The CUDA arm loads and then exhausts the box in its first forward, so this row still has no GPU number.** [#1299](https://github.com/mudler/vllm.cpp/issues/1299). The non-expert weights are resident twice on a unified part, once as the host-side `OwnedTensor` and once as the `ResidentWeight` device staging copy, and about 50 GiB of that is the bf16 expansion the GDN V-head reorder forces on `attn_qkv` and `ssm_out`. | Not fixable inside this row's scope, and measured rather than inferred: a 0.15 GiB arena fails where an 18.55 GiB one does, and the growth is `RssAnon` while `RssFile` stays flat. The fix is a transformed-weight path that does not expand, or a staging path that releases the host copy — either is its own row with its own spec. W1 and W2 are unaffected: they are about WHERE a slice lives, and this is about the dense remainder beside it. |
-| ~~**The CPU arm's streaming decode figure is still VOID.**~~ **CLOSED by W0e**, 2026-08-18: streaming-ON decode on a live cache is **11.05 s/token** steady, two reps, decode-phase `exhausted` delta 0 in the same run. See `## Evidence`. | Kept as a line rather than deleted because `docs/BENCHMARKS.md:8` still carries the parent row's VOID (#912 F1) text for `ENG-EXPERT-STREAM`, which owns that row's own re-measure. This row measured its own denominator and is no longer waiting on one. |
+| ~~**The CPU arm's streaming decode figure is still VOID.**~~ **CLOSED by W0e**, 2026-08-18: streaming-ON decode on a live cache is **11.05 s/token** steady at 4000 slots, rep 2's median with rep 1 at 11.22, and the decode-phase `exhausted` delta is 0 in the same run. See `## Evidence`. | Kept as a line rather than deleted because `docs/BENCHMARKS.md:8` still carries the parent row's VOID (#912 F1) text for `ENG-EXPERT-STREAM`, which owns that row's own re-measure. This row measured its own denominator and is no longer waiting on one. |
 | **`.agents/specs/expert-streaming.md`'s `## Owed` entry for #1124 still names no owning row ID.** | Not edited here on purpose; PRs #1200 and #1216 both edit that file. One-line follow-up once both land. |
 | **W1 may land UNREACHED if it is split from W2.** | The recommendation is one pull request. If a split is chosen, the commit body and the PR body must name what is unreached and name W2 as the owning wiring, per `## Nothing lands dead`. |

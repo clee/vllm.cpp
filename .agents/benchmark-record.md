@@ -25133,11 +25133,29 @@ the argmax is unchanged), and the expert-stream counters at both ends of the run
 | 8000 | 18.55 GiB | 266.5 s | 132.74 s | median 39.98, min 16.06, max 94.30 | 1581.6 s | 86.6 GiB | 6,941 MiB | 30,625 MiB (all) |
 
 The 8000-slot rows are a MEMORY result, not a cache result. A bigger cache came
-out 3.6x slower and 4x more variable, which is the wrong direction, and the last
-column says why: an 18.55 GiB arena does not fit beside 62 GiB of dense weights
-on a 119.63 GiB box, so those runs swapped and one exhausted swap entirely. Both
-reps of each slot count reproduce each other, so this is the box and not a
-fluke. The publishable figure is the 4000-slot one.
+out slower on every pairing of the medians: 3.62x same-rep on the pair carrying
+the publishable figure (39.98 against 11.05), 4.05x pairing rep 1 with rep 1
+(45.40 against 11.22), and 3.56x to 4.11x over all four pairings. It also came
+out much less steady, stated as the max/min ratio of the steady window: 3.99x in
+rep 1 (20.73 to 82.68 s) and 5.87x in rep 2 (16.06 to 94.30 s), against 1.30x
+and 1.40x at 4000 slots.
+
+The cause is NOT that the arena does not fit. 18.55 GiB of arena beside 62 GiB
+of dense weights is 80.55 GiB on a 119.63 GiB box, and the columns agree that
+nothing overflowed: peak RSS moves 86.5 -> 86.6 GiB for a 9.27 GiB arena delta.
+The columns that DO move are `min avail`, 16,347 -> 6,941 MiB, a 9,406 MiB fall
+that is about the arena delta, and peak swap, 6,883 -> 30,625 MiB, all of it.
+The best-supported reading of that pattern is page-cache displacement: the
+borrowed 370 GiB expert mapping is served out of whatever memory is free, the
+arena takes that memory, and the reclaim pressure it creates pushes anonymous
+pages to swap. That is a reading of these columns and not a proven mechanism.
+This run sampled no page-cache size and no major-fault counter, so it cannot
+separate displacement from plain reclaim pressure, and a run that wants to
+settle it has to sample both.
+
+The operational conclusion does not depend on which of the two it is. Both reps
+of each slot count reproduce each other, so this is the box and not a fluke,
+more slots is not a free knob, and the publishable figure is the 4000-slot one.
 
 Per-token deltas, 4000-slot rep 2, seconds: 79.09, 51.14, 12.52, then 11.69,
 11.51, 11.35, 11.59, 13.25, 11.58, 9.48, 12.16, 11.22, 11.42, 11.51, 11.05,
