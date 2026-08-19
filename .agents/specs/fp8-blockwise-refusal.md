@@ -181,13 +181,19 @@ pull request with the spec committed first.
 
 ## Owed
 
-- Block-wise FP8 execution itself. Reading `weight_scale_inv`, dequantizing or
-  applying a 128x128 block scale, and the dynamic per-token activation quant
-  upstream pairs with it (`fp8.py:301-310`). This is the arm the refusal names,
-  it needs a GPU gate and a checkpoint, and it has no row yet. Tracked by
-  [#1166](https://github.com/mudler/vllm.cpp/issues/1166), which stays open
-  after this change lands, because this change makes the gap legible and does
-  not close it.
+- ~~Block-wise FP8 execution itself.~~ **DELIVERED** by the #1189 milestones,
+  which this row's refusal made legible: `ad5f175e7` (M1, the dynamic per-token
+  group quant upstream pairs with it, `fp8.py:301-310`), `770e49486` (M2, the CPU
+  reference GEMM), `09597106e` (M3, the `weight_scale_inv` load),
+  `281b4bc76` (M4, the linear method and the dense forward that reads it),
+  `489a9a4c0` (M5, the mainloop-scaled CUTLASS kernel) and `836c13c35` (M6, the
+  merged `gate_up` and QKV). What this row refused by name is now executed.
+  [#1166](https://github.com/mudler/vllm.cpp/issues/1166) and
+  [#1189](https://github.com/mudler/vllm.cpp/issues/1189) both stay OPEN, because
+  the remaining debt is not the code:
+  **the CUDA kernel has never executed on hardware and there is no token gate
+  against `Qwen/Qwen3.8-27B-FP8`.** That is recorded in
+  `.agents/specs/vt-matmul-fp8-block-cuda.md` `## Owed` and is not narrowed here.
 - `ReadF32Scalar` (`src/vllm/model_executor/models/qwen3_5_weights.cpp:312`)
   bounds its input with `t.nbytes >= sizeof(float)`, a lower bound, and returns
   the first 4 bytes. A multi-element scale passes that check and reads as block

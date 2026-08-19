@@ -881,13 +881,15 @@ Qwen3_5DenseWeights LoadQwen3_5Dense(const std::vector<SafetensorsFile>& shards,
 // fp4, per-tensor fp8 and bf16 and an unwired block-wise checkpoint would fall
 // through to an EMPTY bf16 tensor. The forward reads them now
 // (`dense_fp8_block::MatmulFp8BlockScaledD` at each of the ten projections), so
-// what is left to refuse is a DEVICE with no kernel: `vt::MatmulFp8BlockScaled`
-// is a CPU correctness reference and the mainloop-scaled CUTLASS kernel is
-// milestone M5. This runs from `PrepareQwen3_5Dense`, i.e.
+// what is left to refuse is a DEVICE with no kernel. M5 (`489a9a4c0`) added the
+// mainloop-scaled CUTLASS kernel for `VT_CUTLASS_FP8_ARCHS` (12.0a, 12.1a), so
+// this now fires for a CUDA arch outside that cell and for the CPU arm, which is
+// a correctness reference. This runs from `PrepareQwen3_5Dense`, i.e.
 // `ModelRegistry::Prepare`, which every runner calls unconditionally before the
 // first forward and before any graph capture
 // (`src/vllm/v1/worker/gpu/runner.cpp:414,455`), so the user is told before a
-// capture rather than inside the first GEMM. Deleted by M5.
+// capture rather than inside the first GEMM. M5 NARROWED this rather than
+// deleting it: an arch outside the CUTLASS cell must still be refused by name.
 void RefuseUnrunnableQwen3_5DenseFp8Block(const Qwen3_5DenseWeights& weights,
                                           vt::DeviceType device) {
   if (dense_fp8_block::BlockFp8Runnable(device)) return;
