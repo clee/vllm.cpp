@@ -713,21 +713,46 @@ DIRECTLY, so it bypasses the predicate entirely, and the `(S, q, spec)` key only
 changes which map entry a step uses. The five migrated drivers read 0 differing
 on the same binary.
 
-`tests/vllm/models/test_decode_graph_seam_g1_cuda.cpp` therefore pins steps 0
-through 2 -- the two cold slots and the FIRST capture -- and prints all five
-outcomes, so the reading above is re-derivable with one command on a leased
-device. It asserts what it measured rather than what W6 wanted, and the
+`tests/vllm/models/test_decode_graph_seam_g1_cuda.cpp` therefore pinned steps 0
+through 2 -- the two cold slots and the FIRST capture -- and printed all five
+outcomes, so the reading above stayed re-derivable with one command on a leased
+device. It asserted what it measured rather than what W6 wanted, and the
 difference between "the spec path is broken" and "the second ring slot's capture
-is refused" is the whole value of the case.
+is refused" is what made the cause findable.
 
-There is also no eager arm to compare a spec step against, and that is worth
-recording for whoever picks it up: every other case in this file selects one with
-`max_num_reqs == 0`, because `PadToCaptureSize` then returns -1, and a spec step
-takes `S = B` and never consults `max_num_reqs`. The A/B has to be between two
-GRAPHED drivers that differ only in HISTORY. They must also run SEQUENTIALLY
-rather than step-interleaved: the capture pre-grows the pool for its retained
-`[S, vocab]` logits immediately before `BeginCapture`, and a second driver's step
-in between takes the block that was just freed.
+**#1380 IS FIXED, and the cause is not the one the pre-grow comment assumed
+(2026-08-19, `thor:gpu0`, sm_110).** A backtrace taken AT the failing
+`cudaMalloc` -- not inferred from the message, which names the API and no call
+site -- resolves to `DBuf` construction inside `GdnBlockPaged`
+(`src/vllm/model_executor/models/qwen3_5.cpp`, the `dconv` causal-conv output),
+reached through `RunDenseLayerPaged` and `DenseForwardLayers` from the
+`GraphCaptureScope` in `Qwen3_5DenseDecodeGraph::Step`. The request was 960
+bytes, which at the gate's synthetic shape is BOTH `[T=6, conv_dim=80]` bf16 and
+`[S=6, vocab=40]` f32.
+
+That coincidence IS the defect. `DevicePool` hands out blocks by SIZE CLASS and
+knows nothing about tensors, so a pre-grow that allocates and frees one
+`[S, vocab]` block supplies one block of a class the captured forward may need
+several of. A `VT_POOL_TRACE_CLASS` trace on the device measured the forward
+holding TWO blocks of that class live at once, against a pre-grow of one, with
+the other ring slot's retained logits holding the third. `DevicePool` now
+measures the per-class PEAK a step holds live above its own baseline, and
+`PreGrowForCapture` makes the free list able to serve that profile before
+`BeginCapture`. Both Qwen3.5 drivers record the profile at the end of their COLD
+step, per SLOT, because two shapes interleave through one pool.
+
+**The eager arm question is answered, and the answer is the opposite of what this
+paragraph used to say.** It read that the A/B "has to be between two GRAPHED
+drivers that differ only in HISTORY", because `max_num_reqs == 0` does not select
+eager on a spec shape (`S = B` never consults it). Two graphed drivers is wrong:
+measured, they both capture and compete for one pool, and the refusal moves from
+the second ring slot to the first. The eager arm is
+`Qwen3_5DenseModel::ForwardDevice`, which is the body the driver's own disabled
+path runs. And the SEQUENCING rule the paragraph got right has the opposite
+reason: the two arms must not interleave because an eager forward between the
+graph arm's steps DEEPENS the shared free list on the graph arm's behalf and
+hides the defect outright -- the interleaved shape of this case passed 1240
+assertions at the un-fixed head while the driver stepped alone threw.
 
 For each migrated model, run the same inputs through the segmented capture path and
 through the eager forward with capture disabled, and require the logits to be
@@ -1544,6 +1569,27 @@ CONFIRMED on a leased GPU and is no longer an open question for any later stage.
 ## Owed
 
 Each item names the stage that owns it. Nothing here is claimed by W1.
+
+- ~~**A speculative capture does a `cudaMalloc` INSIDE the captured region and
+  throws** ([#1380](https://github.com/mudler/vllm.cpp/issues/1380), found by
+  W6).~~ RETIRED 2026-08-19 on `thor:gpu0` (sm_110). The call site was named with
+  a backtrace taken AT the failing allocation rather than inferred from the
+  message: `dconv`, the GDN causal-conv output in `GdnBlockPaged`, reached from
+  the `GraphCaptureScope` in `Qwen3_5DenseDecodeGraph::Step`. `DevicePool` is
+  keyed by SIZE CLASS, that block shares a class with the retained
+  `[S, vocab]` logits at the gate's shape, and the driver's pre-grow supplied ONE
+  block against a measured demand of two. `DevicePool::PreGrowForCapture` now
+  serves the whole step's per-class transient demand; `## Gates` G1 carries the
+  measurement and the two detecting mutations.
+
+  **One bounded assumption is worth naming rather than leaving to be found.** The
+  profile a driver pre-grows from is the one its COLD step recorded at that shape
+  and slot, so the guarantee is "the captured forward demands no more of any class
+  than the eager forward at the same shape did". That holds by construction today
+  -- both run `DenseForwardLayers`, and the capture arm draws its persistent step
+  inputs from a DEDICATED pool, so its main-pool demand is a subset -- and it is
+  an argument rather than a gate. A future capture-only allocation with no eager
+  counterpart would reopen this. Owner: row **`ENG-CUDAGRAPH-BREAK`**.
 
 - ~~**The seam is not yet ENTERED from a production step.**~~ RETIRED by **W2**
   ([#1261](https://github.com/mudler/vllm.cpp/issues/1261)).

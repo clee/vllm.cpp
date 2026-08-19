@@ -515,26 +515,14 @@ TEST_CASE("device pool: a capture pre-grow serves the STEP's demand, not one blo
   CHECK(peak == 2);  // the PROFILE, and it is the number the pre-grow needs
 
   // The previous capture retained its logits: one block leaves circulation for
-  // good, exactly as `SizeSlot::logits` does.
+  // good, exactly as `SizeSlot::logits` does. The free list is now ONE deep
+  // against a demand of two, which is the whole defect.
   auto retained = std::make_unique<DBuf>(Dev{a, qa}, DType::kF32, shape);
-
-  // A profile is a property of the FORWARD, not of what is resident when it
-  // runs. Re-measure with the retained block live and the peak must still read
-  // two, because the baseline moved with it.
-  pool.MarkStepBoundary();
-  {
-    DBuf scratch(Dev{a, qa}, DType::kF32, shape);
-    DBuf out(Dev{a, qa}, DType::kF32, shape);
-  }
-  int64_t peak_with_retention = 0;
-  for (const auto& e : pool.StepDemandProfile())
-    if (e.first == key) peak_with_retention = e.second;
-  CHECK(peak_with_retention == 2);
 
   const int allocs_before = a.allocs();
   pool.PreGrowForCapture(a, demand);
   const int allocs_after_pregrow = a.allocs();
-  CHECK(allocs_after_pregrow > allocs_before);  // it really was short
+  CHECK(allocs_after_pregrow == allocs_before + 1);  // it really was one short
 
   // THE GATE. This is the captured region: two blocks of the class, live at once,
   // and NOT ONE of them may reach the driver.
@@ -550,5 +538,20 @@ TEST_CASE("device pool: a capture pre-grow serves the STEP's demand, not one blo
   const int allocs_before_second = a.allocs();
   pool.PreGrowForCapture(a, demand);
   CHECK(a.allocs() == allocs_before_second);
+
+  // A profile is a property of the FORWARD, not of what is resident when it
+  // runs. Re-measure with the retained block still live and the peak must read
+  // two again, because the baseline moved with it. Without that subtraction the
+  // profile would read three here and the pre-grow would over-allocate on every
+  // capture for the rest of the process.
+  pool.MarkStepBoundary();
+  {
+    DBuf scratch(Dev{a, qa}, DType::kF32, shape);
+    DBuf out(Dev{a, qa}, DType::kF32, shape);
+  }
+  int64_t peak_with_retention = 0;
+  for (const auto& e : pool.StepDemandProfile())
+    if (e.first == key) peak_with_retention = e.second;
+  CHECK(peak_with_retention == 2);
   retained.reset();
 }
