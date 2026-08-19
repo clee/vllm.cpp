@@ -1124,8 +1124,6 @@ DBuf NemotronHMamba2MixerDevice(Dev d, const NemotronHMambaWeights& w,
   //    (nemotron_h.cpp:493-498) — A2-Q1 is non-paged in its own right and reads
   //    no persistent page it did not receive.
   const bool carry_in = conv_state != nullptr && has_initial;
-  DBuf conv_fresh(d, DType::kF32, {1, Cd, Kw - 1});
-  if (conv_state == nullptr && decode == nullptr) conv_fresh.Zero(d);
   DBuf xbc_out(d, adt, {T, Cd});
   {
     Tensor cw = MakeTensor(mr.conv_w.get(), adt, d.q.device, {Cd, Kw});
@@ -1145,6 +1143,12 @@ DBuf NemotronHMamba2MixerDevice(Dev d, const NemotronHMambaWeights& w,
                              mr.has_conv_bias ? &cb : nullptr, conv_page, cargs, &sidx);
       MambaArmCountsSlot().conv_update_rows += T;
     } else {
+      // The transient per-call window the non-paged arm uses, allocated ONLY on
+      // this branch: the decode arm reads and rolls the page in place and has no
+      // use for one, and a pool block taken per layer per token is exactly the
+      // cost A2-D1 exists to remove.
+      DBuf conv_fresh(d, DType::kF32, {1, Cd, Kw - 1});
+      if (conv_state == nullptr) conv_fresh.Zero(d);
       Tensor cst = conv_state != nullptr ? *conv_state : conv_fresh.t();
       const int32_t qsl[2] = {0, static_cast<int32_t>(T)};
       const int32_t hinit[1] = {carry_in ? 1 : 0};
