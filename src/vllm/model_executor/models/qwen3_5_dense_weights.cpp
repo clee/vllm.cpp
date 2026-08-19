@@ -883,8 +883,9 @@ Qwen3_5DenseWeights LoadQwen3_5Dense(const std::vector<SafetensorsFile>& shards,
 // (`dense_fp8_block::MatmulFp8BlockScaledD` at each of the ten projections), so
 // what is left to refuse is a DEVICE with no kernel. M5 (`489a9a4c0`) added the
 // mainloop-scaled CUTLASS kernel for `VT_CUTLASS_FP8_ARCHS` (12.0a, 12.1a), so
-// this now fires for a CUDA arch outside that cell and for the CPU arm, which is
-// a correctness reference. This runs from `PrepareQwen3_5Dense`, i.e.
+// this now fires for a CUDA arch outside that cell. It stays inert on CPU,
+// where `vt::MatmulFp8BlockScaled` is registered as a correctness reference.
+// This runs from `PrepareQwen3_5Dense`, i.e.
 // `ModelRegistry::Prepare`, which every runner calls unconditionally before the
 // first forward and before any graph capture
 // (`src/vllm/v1/worker/gpu/runner.cpp:414,455`), so the user is told before a

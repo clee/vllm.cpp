@@ -363,12 +363,16 @@ struct Fp8Weight {
 // its own geometry cannot be paired with the wrong one.
 //
 // CONSUMED BY THE DENSE FORWARD since #1189 milestone M4 (`281b4bc76`), which
-// landed `Fp8BlockLinearMethod` and the wiring it names:
-// `dense_fp8_block::MatmulFp8BlockScaledD` reads these at each of the ten
-// projections in `qwen3_5.cpp`, and M6 (`836c13c35`) added the merged `gate_up`
-// and QKV arm. `PrepareQwen3_5Dense` no longer refuses a populated weight -- it
-// refuses a DEVICE with no block-scaled GEMM, which after M5 (`489a9a4c0`)
-// means a CUDA arch outside `VT_CUTLASS_FP8_ARCHS` (12.0a, 12.1a).
+// landed `Fp8BlockLinearMethod` and the wiring it names. All ten projections
+// in `qwen3_5.cpp` are read, through THREE entry points rather than one.
+// `dense_fp8_block::MatmulFp8BlockScaledD` reads eight of them: `o_proj`,
+// `down_proj`, the three GDN projections, and q/k/v whenever the split path
+// runs. M6 (`836c13c35`) added the other two: `MatmulFp8BlockMergedD` reads
+// q/k/v as one operand when the consumer accepts row-strided views, and
+// `Fp8BlockGateUpSwiGLUD` is the ONLY reader of `gate_proj_fp8_block` and
+// `up_proj_fp8_block`. `PrepareQwen3_5Dense` no longer refuses a populated
+// weight -- it refuses a DEVICE with no block-scaled GEMM, which after M5
+// (`489a9a4c0`) means a CUDA arch outside `VT_CUTLASS_FP8_ARCHS` (12.0a, 12.1a).
 //
 // The CUDA kernel has still NEVER EXECUTED on hardware and there is no token
 // gate. That debt is real and is recorded in
