@@ -391,3 +391,107 @@ TEST_CASE("speech api: the SPEECH parameters upstream refuses by name are refuse
   CHECK(ok.language == "en");
   CHECK(ok.audio_duration_s == doctest::Approx(12.5));
 }
+
+// The CONTENT keys were the half `#1315` did not route, and leaving them on the
+// bare `json` handle left the SAME hole open (#1336). The comment above them
+// claimed every read resolved through `Owner`; eight of them did not, and three
+// refusals downstream were defeatable by moving the key one level down.
+//
+// Each case below is a body that returned 200 with the key silently dropped
+// before this repair, and the three marked REFUSAL-DEFEAT are the ones that
+// bypassed a guard rather than only losing a value.
+TEST_CASE("speech api: the CONTENT keys resolve through BOTH placements, not the top level only") {
+  // REFUSAL-DEFEAT 1. `text` at the top level reaches Music3's refusal at
+  // `minimax_music3_speech.cpp:440-446`, whose last words are "rather than
+  // having it silently dropped". Nested, it produced exactly that drop.
+  CHECK(ParseSpeechRequest(R"({"lyrics":"x","extra_params":{"text":"hello"}})").text == "hello");
+  // REFUSAL-DEFEAT 2. `language` nested skipped `:456-460`.
+  CHECK(ParseSpeechRequest(R"({"lyrics":"x","extra_params":{"language":"en"}})").language == "en");
+  // REFUSAL-DEFEAT 3. A nested reference clip was dropped, so a family whose
+  // `requires_reference_audio()` is true answered "`reference_audio` is
+  // required" to a caller who had supplied one. The decoded samples are
+  // asserted, not just the size, so a clip read at the wrong offset still reds.
+  const std::string uri = ReferenceWavDataUri({16384, -16384}, 22050);
+  const SpeechRequest nested_clip =
+      ParseSpeechRequest(R"({"input":"hi","extra_params":{"reference_audio":")" + uri + R"("}})");
+  REQUIRE(nested_clip.reference_audio.size() == 2);
+  CHECK(nested_clip.reference_sample_rate == 22050);
+  CHECK(nested_clip.reference_audio[0] == doctest::Approx(0.5));
+  CHECK(nested_clip.reference_audio[1] == doctest::Approx(-0.5));
+
+  // The remaining content keys, each in the nested placement, each asserted
+  // against a value that differs from the field's default.
+  CHECK(ParseSpeechRequest(R"({"extra_params":{"input":"hi"}})").text == "hi");
+  CHECK(ParseSpeechRequest(R"({"extra_params":{"lyrics":"[Verse]\nx\n"}})").lyrics ==
+        "[Verse]\nx\n");
+  CHECK(ParseSpeechRequest(R"({"lyrics":"x","extra_params":{"description":"pop"}})").description ==
+        "pop");
+  CHECK(ParseSpeechRequest(R"({"lyrics":"x","extra_params":{"prompt":"lo-fi"}})").description ==
+        "lo-fi");
+  CHECK(ParseSpeechRequest(R"({"lyrics":"x","extra_params":{"model":"minimax-music3"}})").model ==
+        "minimax-music3");
+
+  // PRECEDENCE, for a content key as for a knob: `extra_params` wins, the same
+  // way `video_api.cpp:216-225` resolves it.
+  CHECK(ParseSpeechRequest(R"({"lyrics":"top","extra_params":{"lyrics":"nested"}})").lyrics ==
+        "nested");
+  CHECK(ParseSpeechRequest(R"({"input":"top","extra_params":{"input":"nested"}})").text ==
+        "nested");
+
+  // The two "same field, two spellings" guards see ACROSS the placements too,
+  // which is the property that made routing them through `Owner` the repair
+  // rather than eight separate lookups.
+  CHECK_THROWS_WITH(ParseSpeechRequest(R"({"input":"a","extra_params":{"text":"b"}})"),
+                    doctest::Contains("`input` and `text` are the same field and disagree"));
+  CHECK_THROWS_WITH(ParseSpeechRequest(R"({"description":"a","extra_params":{"prompt":"b"}})"),
+                    doctest::Contains("`prompt` and `description` are the same field and "
+                                      "disagree"));
+  // ... and they still ACCEPT the agreeing body, so the guard is not "refuse
+  // whenever both placements carry the key".
+  CHECK(ParseSpeechRequest(R"({"input":"a","extra_params":{"text":"a"}})").text == "a");
+
+  // `model` keeps its emptiness check in the nested placement as well.
+  CHECK_THROWS_WITH(ParseSpeechRequest(R"({"input":"hi","extra_params":{"model":""}})"),
+                    doctest::Contains("`model` must not be empty"));
+
+  // THE #925 BOUNDARY, restated for the content sweep: an unknown key in EITHER
+  // placement still parses. Routing the content keys through `Owner` is a
+  // change of WHERE a known key is read, never a change of which keys are
+  // known, and a strict whitelist would red this line.
+  CHECK_NOTHROW(ParseSpeechRequest(R"({"lyrics":"x","some_future_knob":1})"));
+  CHECK_NOTHROW(ParseSpeechRequest(R"({"lyrics":"x","extra_params":{"some_future_knob":1}})"));
+}
+
+// `instructions` is refused, and the refusal has to name BOTH readings of the
+// key. It is OpenAI's own createSpeech field for VOICE STYLE, and this route
+// declares itself "OpenAI's createSpeech, extended with the two MUSIC inputs"
+// (`api_server.cpp:496-497`), so a caller who sends it may well mean the style
+// and not SGLang-Omni's caption. Redirecting that caller to `description` would
+// move a voice-style string into the music caption, which is the exact
+// conflation the refusal exists to prevent.
+TEST_CASE("speech api: the `instructions` refusal names the OpenAI reading as well as upstream's") {
+  CHECK_THROWS_WITH(ParseSpeechRequest(R"({"lyrics":"x","instructions":"speak warmly"})"),
+                    doctest::Contains("VOICE STYLE"));
+  CHECK_THROWS_WITH(ParseSpeechRequest(R"({"lyrics":"x","instructions":"speak warmly"})"),
+                    doctest::Contains("no registered speech family exposes a style control"));
+  // The upstream reading and its redirect are still there.
+  CHECK_THROWS_WITH(ParseSpeechRequest(R"({"lyrics":"x","instructions":"Genre: lo-fi"})"),
+                    doctest::Contains("`instructions` is SGLang-Omni's spelling of the music"));
+  CHECK_THROWS_WITH(ParseSpeechRequest(R"({"lyrics":"x","instructions":"Genre: lo-fi"})"),
+                    doctest::Contains("`description`"));
+}
+
+// `audio_duration` (#1338). The predicate has always been `>= 0.0`, so an
+// explicit 0 parses and resolves to the family's default; the message promised
+// "> 0", a rule this route does not have, and was printed by nothing.
+TEST_CASE("speech api: the `audio_duration` refusal states the guard the code implements") {
+  // ZERO is accepted and means "take the family's default", the same split
+  // `minimax_music3_speech.cpp:465-474` argues at the family layer.
+  CHECK(ParseSpeechRequest(R"({"lyrics":"x","audio_duration":0})").audio_duration_s ==
+        doctest::Approx(0.0));
+  // NEGATIVE is refused, and the message says NEGATIVE rather than "> 0".
+  CHECK_THROWS_WITH(ParseSpeechRequest(R"({"lyrics":"x","audio_duration":-1.0})"),
+                    doctest::Contains("must not be NEGATIVE"));
+  CHECK_THROWS_WITH(ParseSpeechRequest(R"({"lyrics":"x","extra_params":{"audio_duration":-1.0}})"),
+                    doctest::Contains("must not be NEGATIVE"));
+}

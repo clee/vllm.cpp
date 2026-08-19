@@ -108,10 +108,27 @@ SpeechRequest ParseSpeechRequest(const std::string& body) {
   // video route already documents (video_api.cpp:216-225), so the two routes
   // resolve a knob the same way rather than two ways.
   //
-  // Every read and every refusal below resolves through `Owner`, and that is
-  // the repair rather than tidiness: a guard that looks at one placement only
-  // can no longer be written, because there is no longer a handle on one
-  // placement only.
+  // EVERY request key below resolves through `Owner` -- the CONTENT fields as
+  // much as the knobs and the refusals -- and that is the repair rather than
+  // tidiness.
+  //
+  // The first version of this change routed only the knobs and the refusals
+  // through `Owner` and left `model`, `input`, `text`, `language`, `lyrics`,
+  // `description`, `prompt` and `reference_audio` reading `json` directly. That
+  // left the SAME hole open for the content keys, and it defeated three
+  // refusals by nesting (#1336): a nested `text` was dropped instead of
+  // reaching `minimax_music3_speech.cpp:440-446`, whose own last words are
+  // "rather than having it silently dropped"; a nested `language` instead of
+  // `:456-460`; and a nested `reference_audio` instead of being decoded, which
+  // made a family whose `requires_reference_audio()` is true answer
+  // "`reference_audio` ... is required" (api_server.cpp:511-516) to a caller
+  // who had supplied one.
+  //
+  // `json` STAYS in scope, because `Owner` needs it as the fallback. So this is
+  // a convention that this comment states and that the tests pin, NOT a
+  // structural impossibility. An earlier draft claimed the single-placement
+  // handle was gone; it was not, and that claim is what let eight direct reads
+  // sit under it.
   const nlohmann::json& extra =
       (json.contains("extra_params") && json.at("extra_params").is_object())
           ? json.at("extra_params")
@@ -123,26 +140,32 @@ SpeechRequest ParseSpeechRequest(const std::string& body) {
   };
 
   SpeechRequest out;
-  if (Has(json, "model")) {
-    out.model = ReadString(json, "model");
+  if (const nlohmann::json* o = Owner("model")) {
+    out.model = ReadString(*o, "model");
     VT_CHECK(!out.model.empty(), "speech request: `model` must not be empty");
   }
   // OpenAI's field is `input`; `text` is accepted as the native spelling so a
   // caller does not have to know which surface it is talking to.
-  if (Has(json, "input")) out.text = ReadString(json, "input");
-  if (Has(json, "text")) {
-    VT_CHECK(out.text.empty() || out.text == ReadString(json, "text"),
+  if (const nlohmann::json* o = Owner("input")) out.text = ReadString(*o, "input");
+  if (const nlohmann::json* o = Owner("text")) {
+    const std::string text = ReadString(*o, "text");
+    VT_CHECK(out.text.empty() || out.text == text,
              "speech request: `input` and `text` are the same field and disagree; supply one");
-    out.text = ReadString(json, "text");
+    out.text = text;
   }
-  if (Has(json, "language")) out.language = ReadString(json, "language");
-  if (Has(json, "lyrics")) out.lyrics = ReadString(json, "lyrics");
-  if (Has(json, "description")) out.description = ReadString(json, "description");
+  if (const nlohmann::json* o = Owner("language")) out.language = ReadString(*o, "language");
+  if (const nlohmann::json* o = Owner("lyrics")) out.lyrics = ReadString(*o, "lyrics");
+  if (const nlohmann::json* o = Owner("description")) {
+    out.description = ReadString(*o, "description");
+  }
   // vLLM-Omni and the video route both carry the music description under
   // `prompt`; accept it as the documented alias rather than making a caller
-  // learn a second name for the same string.
-  if (Has(json, "prompt")) {
-    const std::string prompt = ReadString(json, "prompt");
+  // learn a second name for the same string. This is the one ALIAS this route
+  // accepts, and the rule it follows is stated at the `instructions` refusal
+  // below: both spellings carry the same value in the same units for every
+  // family this route can load.
+  if (const nlohmann::json* o = Owner("prompt")) {
+    const std::string prompt = ReadString(*o, "prompt");
     VT_CHECK(out.description.empty() || out.description == prompt,
              "speech request: `prompt` and `description` are the same field and disagree; "
              "supply one");
@@ -173,8 +196,8 @@ SpeechRequest ParseSpeechRequest(const std::string& body) {
                  "is vendored and relabelling RIFF bytes would be worse than refusing");
   }
 
-  if (Has(json, "reference_audio")) {
-    const std::string value = ReadString(json, "reference_audio");
+  if (const nlohmann::json* o = Owner("reference_audio")) {
+    const std::string value = ReadString(*o, "reference_audio");
     VT_CHECK(value.compare(0, 5, "data:") == 0,
              "speech request: `reference_audio` must be a `data:` URL carrying a 16-bit PCM "
              "mono WAV; a filesystem path is not read, because the server and the client "
@@ -212,8 +235,15 @@ SpeechRequest ParseSpeechRequest(const std::string& body) {
   if (duration_owner != nullptr) {
     out.audio_duration_s = ReadNumber(*duration_owner, duration_key);
   }
+  // The predicate is `>= 0.0` and the message says so. It used to promise
+  // "must be > 0" while accepting an explicit `0`, which then resolved to the
+  // family's 60 s default and never printed the sentence that would have
+  // explained it (#1338). ZERO means "omitted, take the family's default" --
+  // the same split `minimax_music3_speech.cpp:465-474` argues at the family
+  // layer -- and only a NEGATIVE duration is impossible.
   VT_CHECK(out.audio_duration_s >= 0.0,
-           "speech request: `audio_duration` must be > 0 (omit it for the family's default)");
+           "speech request: `audio_duration` must not be NEGATIVE; omit it, or send 0, to take "
+           "the family's default duration");
   if (const nlohmann::json* o = Owner("num_inference_steps")) {
     out.num_inference_steps = static_cast<int64_t>(ReadNumber(*o, "num_inference_steps"));
     VT_CHECK(out.num_inference_steps > 0,
@@ -294,18 +324,36 @@ SpeechRequest ParseSpeechRequest(const std::string& body) {
            "a 200 for half of one field. A family that clones a voice takes `reference_audio` "
            "instead");
   // `instructions` is REFUSED rather than accepted as an alias, although
-  // upstream honours it. Three reasons, and they are the same three the
-  // `max_new_tokens` refusal above rests on: a secondary oracle never becomes
-  // the mirror source, one meaning keeps one name on this route, and
-  // `instructions` means style-and-emotion for a TTS family
-  // (protocol.py:348) and the music CAPTION for this one — so aliasing it
-  // globally would bake one family's meaning into a shared route.
+  // upstream honours it. TWO reasons hold. A secondary oracle never becomes the
+  // mirror source (AGENTS.md), and SGLang-Omni is only the secondary here
+  // because vLLM registers no `/v1/audio/speech` at all. And `instructions`
+  // means style-and-emotion on OpenAI's own createSpeech and for a TTS family
+  // (protocol.py:348), and the music CAPTION for this one, so a global alias on
+  // a SHARED route would bake one family's meaning in.
+  //
+  // A third reason an earlier draft gave, "one meaning keeps one name on this
+  // route", does NOT hold. `prompt` four refusals above is the counter-example:
+  // it is accepted as a second spelling of `description`, with a comment saying
+  // so. The rule the two cases actually follow is narrower. An ALIAS is
+  // accepted when both spellings carry the same value in the same UNITS and
+  // mean the same thing for EVERY family this route can load.
+  // `prompt`/`description` qualify. `instructions` fails on MEANING, and
+  // `max_new_tokens` fails on UNITS, 25 Hz frames against seconds, so aliasing
+  // it would need a silent conversion.
+  //
+  // The refusal therefore names BOTH readings. Redirecting every caller to
+  // `description` is right only for one who learned the key from SGLang-Omni.
+  // For one who learned it from OpenAI it would move a VOICE-STYLE string into
+  // the music caption, which is the conflation this refusal exists to prevent.
   VT_CHECK(Owner("instructions") == nullptr,
-           "speech request: `instructions` is SGLang-Omni's spelling of the music CAPTION — "
-           "the string MiniMax-Music3 assembles into `<|caption_start|>`, and which upstream "
-           "requires non-empty (request_builders.py:104-106). This route calls it "
-           "`description`; send that instead, so one meaning keeps one name. Dropping it "
-           "silently would lose the whole music description of a request that named it");
+           "speech request: `instructions` names two different things and this route honours "
+           "neither. OpenAI's createSpeech uses it for VOICE STYLE and emotion, and no "
+           "registered speech family exposes a style control, so there is nothing to send if "
+           "that is what you meant. `instructions` is SGLang-Omni's spelling of the music "
+           "CAPTION, the string MiniMax-Music3 assembles into `<|caption_start|>` and which "
+           "upstream requires non-empty (request_builders.py:104-106), and this route calls "
+           "THAT `description`; send `description` if the caption is what you meant. Dropping "
+           "it silently would lose the whole music description of a request that named it");
   VT_CHECK(Owner("ref_audio") == nullptr,
            "speech request: `ref_audio` is SGLang-Omni's spelling of the reference clip "
            "(protocol.py:351), where it is a path or a URL. This route takes "
