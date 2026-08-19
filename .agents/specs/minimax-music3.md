@@ -3437,3 +3437,132 @@ reader to rediscover from a profile.
 reference axis in `docs/BENCHMARKS.md` stays `PENDING`. Everything above is an
 internal two-arm number on named hardware.
 
+
+## 17. The request-key contract, finished (#1315) — a guard that stopped looking
+
+[#925](https://github.com/mudler/vllm.cpp/issues/925) refused `audio_duration_s`
+and [#953](https://github.com/mudler/vllm.cpp/issues/953) refused the five keys
+SGLang-Omni names. Both landed and both are correct. This section is what they
+did not cover, and the first half of it is the same defect they fixed, still
+live at `678fc672c` and reachable by an ordinary body.
+
+### 17.1 Scope
+
+[#1315](https://github.com/mudler/vllm.cpp/issues/1315). One function,
+`ParseSpeechRequest`
+([`src/vllm/entrypoints/openai/speech_api.cpp`](../../src/vllm/entrypoints/openai/speech_api.cpp)),
+plus the tests that enter it through the registered route. No engine, no
+kernel, no model code, no lifecycle change: the row stays `ACTIVE`, so this
+change owes `docs/USAGE.md` (a request-key surface) and nothing in
+`docs/STATUS.md`, `docs/BENCHMARKS.md` or `## Now`.
+
+### 17.2 The oracle, and what it says
+
+vLLM registers no `/v1/audio/speech` and no MiniMax-Music3, so the primary is
+silent here and the secondary applies: SGLang-Omni, pinned at
+`748a0b437e4a8faad44d7bbfd5a0ae55d1fef830`
+([`.agents/oracles/sglang-omni.md`](../oracles/sglang-omni.md)). The pin was
+asserted against the local checkout's `HEAD` before a line of it was read,
+because an oracle whose identity is assumed measures whatever happens to be
+checked out.
+
+`_build_tts_params` (`sglang_omni/serve/speech_service.py:737-779`) forwards a
+named set of wire keys into the model builder.
+`_UNSUPPORTED_TTS_PARAMS` (`sglang_omni/models/minimax_music3/request_builders.py:20-30`)
+lists what MiniMax-Music3 cannot honour, and `_validate_tts_contract` (`:71-81`)
+raises `"MiniMax Music 3 does not support speech parameters: <names>"` for each.
+Two further keys come from the schema itself: `voice` carries
+`AliasChoices("voice", "speaker")` (`sglang_omni/serve/protocol.py:337-339`),
+and `instructions` is the music CAPTION, which the builder requires non-empty
+(`request_builders.py:104-106`).
+
+The oracle is `gateable = no` — cloned and read, never executed here — so this
+is a SOURCE reading and it is recorded as one. Nothing in this section claims a
+measured comparison against a running SGLang-Omni.
+
+### 17.3 The defect, in two parts
+
+**Part 1 — `extra_params` was a REPLACEMENT, not a second place to look.** The
+binding at `speech_api.cpp:160-163` selects one of the two objects:
+
+```cpp
+const nlohmann::json& extra =
+    (json.contains("extra_params") && json.at("extra_params").is_object())
+        ? json.at("extra_params") : json;
+```
+
+So a body carrying an `extra_params` object AT ALL — an empty `{}` suffices —
+stops the top level being read for every knob and every refusal that resolves
+through `extra`. `{"lyrics": …, "extra_params": {"seed": 7}, "audio_duration":
+0.1}` drops the duration, leaves `audio_duration_s` at its `0.0` sentinel, and
+§4.1's resolver substitutes the family's 60 s
+(`minimax_music3_speech.cpp:478-479`). That is #852's ~750x job, behind a 200,
+with #925's guard in the tree and unable to fire. The five #953 refusals go
+quiet on the same body. The mirror hole is the other side of it: `voice`,
+`speed`, `stream`, `stream_format` and `response_format` were read from the top
+level only, so nesting any of them dropped it.
+
+**Part 2 — nine keys the oracle names, dropped silently.** The seven of
+`_UNSUPPORTED_TTS_PARAMS` that this route can see (`task_type`, `ref_audio`,
+`ref_text`, `x_vector_only_mode`, `initial_codec_chunk_frames`, `token_count`,
+`duration_tokens`), plus `speaker` and `instructions`. `token_count` and
+`duration_tokens` are LENGTH keys, so they repeat #925's cost exactly.
+
+### 17.4 Design
+
+`extra_params` becomes a second place to look, with `extra_params` winning —
+the precedence the video route already documents
+(`src/vllm/entrypoints/openai/video_api.cpp:216-225`), so the two routes resolve
+a knob the same way instead of two ways. Every read and every refusal goes
+through one `owner(key)` resolver, which is what stops the two placements
+drifting apart again: a guard cannot be written that looks at one of them,
+because there is no longer a handle on one of them.
+
+The nine keys are REFUSED by name, each naming what to send instead. `speaker`
+points at `voice`'s refusal, `instructions` at `description`, `ref_audio` at
+`reference_audio`, and both length keys at `audio_duration` in seconds.
+
+**`instructions` is refused rather than aliased, and that is a decision.**
+Upstream HONOURS it as the caption, so an alias would be the closer mirror of
+behaviour. It is refused because AGENTS.md holds that a secondary oracle
+"never becomes the mirror source", because this route already made the opposite
+call for `max_new_tokens` in #953 — one meaning keeps one name, and the second
+spelling is refused with a pointer — and because `instructions` means
+style-and-emotion for a TTS family (`protocol.py:348`) and caption for this
+music one, so a global alias would bake one family's meaning into a shared
+route. A refusal that names `description` costs the caller one edit and can
+never mean the wrong thing.
+
+**`language` is deliberately absent from the refused set.** Upstream lists it,
+but it is already refused BY NAME one layer down
+(`minimax_music3_speech.cpp:456-460`), which is the layer this tree puts
+family-specific refusals at and where a family that HAS a language can still
+take it. Moving it up would break IndexTTS-2.5.
+
+**The boundary from #925 is unchanged.** An unknown key is still accepted, so
+`extra_params` stays forward-compatible. Only keys the pinned oracle names are
+refused, and the negative control in the test file pins that boundary so a later
+sweep cannot quietly turn it into "refuse everything".
+
+### 17.5 Gate
+
+Red first, and the red is the point: the parser suite fails 24 assertions and
+the server suite 54 before the change, on assertions that name the dropped key.
+The failing tests enter through the production entry point —
+`ApiServer::handle_audio_speech`, which is what
+`server.Post("/v1/audio/speech", …)` calls (`api_server.cpp:1116-1120`) — and one
+of them over a real socket, because #925 was a claim about an HTTP request and a
+parser test cannot make one. The parser-level cases stay as well; they localize
+a failure, which is worth having, and they are not the proof.
+
+Reachability is proven by deleting the parse call site
+(`api_server.cpp:504`) in a scratch copy and confirming the focused gate reds.
+
+### 17.6 Risks
+
+A guard that fires on an ordinary request is worse than the drop it replaces, so
+every refusal carries a negative control: a body without the key parses, an
+unknown key parses, and the honoured knobs keep their values across both
+placements. The precedence choice is the one behaviour change a body could
+notice, and it only becomes observable when a caller sends the SAME key twice in
+two places, which today resolves to whichever object `extra` happened to bind.
