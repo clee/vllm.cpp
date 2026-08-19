@@ -297,8 +297,19 @@ confirming they ran different kernels (`state_update_rows=23 chunk_scan_calls=0
 gathers=0 scatters=0` against `0 / 23 / 46 / 46`). The arm that predates A2-D1
 diverges identically to the arm that replaces it, so **A2-D1 does not cause it**.
 Filed as [#1388](https://github.com/mudler/vllm.cpp/issues/1388) — the sm_121a
-re-run `STATUS` has carried as pending, failing on both arms, arch- or
-host-specific since sm_110 passes 96/96 on the same code.
+re-run `STATUS` has carried as pending, failing on both arms.
+
+**★ What #1388's CAUSE is remains UNDECIDED, and the same counters show why.**
+The four kernel counters are non-zero in both legs and are reachable only from
+`mamba_on_device`, so **both legs carried A2-Q1's FP8 W8A8 projections**; the
+script pinned `VT_NEMOTRON_H_DEVICE_MAMBA=1` in both. `main` has no device mamba
+arm at all. So `95/96` on both legs fits either "the host diverges" or
+"A2-Q1's FP8 projections diverge", and this A/B separates neither. #1312's
+`96/96` on a `main`-based GB10 tree corroborates the second without settling it,
+being a different binary. **Leg 3** (`VT_NEMOTRON_H_DEVICE_MAMBA=0`, same
+binary) is the discriminator and is queued; if it reads `96/96` the finding
+belongs to A2-Q1 (#1289), which carries the only real speed win measured this
+session.
 
 **The per-host verdict, which is the acceptance statement:**
 
@@ -319,9 +330,11 @@ defect, found by needing it, and it is fixed so the next run captures them.
 ## Owed
 
 - **[#1388](https://github.com/mudler/vllm.cpp/issues/1388)** — GB10 sm_121a
-  loses one token in 96 on BOTH recurrent arms. Not this row's, and it owns the
-  next `dgx` lease: re-run the repaired gate and read the `got:`/`exp:` ids, so
-  a wrong carry and a benign bf16 near-tie are finally separated.
+  loses one token in 96 on BOTH recurrent arms. Not this row's, and its CAUSE is
+  undecided between the host and A2-Q1's FP8 projections. The queued three-leg
+  run settles it and also reads the `got:`/`exp:` ids the old script discarded,
+  so a wrong carry and a benign bf16 near-tie are finally separated. If leg 3
+  reads `96/96`, #1289 needs flagging.
 - **A repeated A/B (n >= 3 per leg) on an idle box.** The sm_110 legs saw an
   18.8% spread in engine-load time and the two hosts' deltas have opposite
   signs; neither 0.388% nor 1.991% is separable from that at n=1.

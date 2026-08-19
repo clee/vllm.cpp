@@ -25259,9 +25259,38 @@ binary:
 
 The counters prove the two legs ran DIFFERENT kernels and both lost exactly one
 token in 96. **The pre-change arm diverges identically to the post-change arm,
-so A2-D1 does not cause it.** Filed as #1388, which is the sm_121a re-run
-`STATUS` has carried as pending; it fails on both arms and is arch- or
-host-specific, since sm_110 passes 96/96 on the same code and checkpoint.
+so A2-D1 does not cause it.** Filed as #1388.
+
+**★ BUT "arch-specific" is UNDER-DETERMINED, and the same counters are what show
+it.** The four kernel counters are non-zero in BOTH legs, and they are only
+reachable from the `mamba_on_device` branch — so **both legs ran A2-Q1's FP8
+W8A8 projections**, because this script hardcoded `VT_NEMOTRON_H_DEVICE_MAMBA=1`
+in both. `main` carries NO device mamba arm at all: `NemotronHMamba2MixerDevice`,
+`MambaIsFp8` and even the `VT_NEMOTRON_H_DEVICE_MAMBA` knob are ABSENT there
+(`git show origin/main:...nemotron_h_device.cpp | grep -c` returns 0 for each).
+
+So `95/96` on both legs is equally consistent with two hypotheses this A/B
+CANNOT separate:
+
+- **(a)** the divergence is the HOST's, i.e. arch-specific; or
+- **(b)** the divergence is **A2-Q1's FP8 projections**, which neither leg
+  turns off.
+
+A third data point favours (b) without settling it: **#1312's GB10 run on a
+`main`-based tree — no device mamba arm at all — read `96/96 STRICT PASS`.**
+That is a different branch and a different binary, so it is corroboration and
+not the discriminator.
+
+**The discriminator is leg 3**, `VT_NEMOTRON_H_DEVICE_MAMBA=0` on the SAME
+binary and box, which routes the whole mamba block back to the host reference.
+Its own counters check that it took that path: four kernel counters at 0 with
+gathers/scatters non-zero. `96/96` there means the divergence is A2-Q1's FP8 arm
+and NOT the architecture, which re-scopes #1388 and matters for #1289 — the PR
+carrying the only real speed win measured this session. It is queued.
+
+Until it reports, the arch-specific reading is a HYPOTHESIS in this record, not
+a result. Recording it as settled would be the same error as reading the Thor
+pass across to GB10.
 
 **What is NOT established: whether both legs lose the SAME token.** The counts
 and row shape are identical, which is what supports "neutral", but the driver's
