@@ -119,12 +119,17 @@ reimage, so host-side oracle work needs `sudo -n docker run` against
 `vllmcpp-build:gb10` or `nvidia/cuda:13.0.1-devel-ubuntu24.04`, reached over
 `ssh`, which is the bypass. **The sentence this paragraph used to carry, "no
 vLLM leg of any row can currently run on `dgx.casa` by a lease-compliant path",
-is FALSIFIED for the BUILD step and still holds for a MODEL RUN.** On 2026-08-18
+is FALSIFIED, for the BUILD step and for a MODEL RUN alike.** On 2026-08-18
 two `rc run` jobs built the pin from source inside a lease, installed the wheel,
 imported it, and reported `cuda True NVIDIA GB10`
 ([#1185](https://github.com/mudler/vllm.cpp/issues/1185), and "The pinned oracle
-builds inside a lease on `dgx:gpu0`" further down). Nobody has run a model that
-way, so no oracle-side MEASUREMENT is unblocked yet. Read the old reason
+builds inside a lease on `dgx:gpu0`" further down). On 2026-08-19 the same pin
+then SERVED: `vllm serve` on a 52 GiB bf16 checkpoint, from a lease, no `ssh` and
+no container image, three clean benchmark legs (`.agents/benchmark-record.md`,
+`BENCH-QWEN38-27B-BF16` c1, and "A model DOES run inside a lease" below). So
+oracle-side MEASUREMENT from a lease is no longer blocked; what is still
+unreachable is the image-based path SGLang needs
+([#1265](https://github.com/mudler/vllm.cpp/issues/1265)). Read the old reason
 carefully before you quote it, because it was never the worker's missing
 toolchain. "The lease carries bytes, and the exec bit is a mount option" below
 measures staged content starting under the dynamic loader and after a copy to

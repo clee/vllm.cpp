@@ -982,6 +982,14 @@ now defaults to `0`. With it off, our arm completed **162 of 162** requests,
 three reps at each concurrency, `failed=0` on every leg: c1 output throughput
 **4.4040 tok/s** (CV 0.039%), c8 **22.6402 tok/s** (CV 0.205%).
 
+**Read both of those absolutes with one caveat.** Our server reported 5,942
+prompt tokens at c1 where vLLM reported 6,144 on the identical prompts, and 19 of
+48 were short at c8 ([#1355](https://github.com/mudler/vllm.cpp/issues/1355)).
+`output_lens` is `[128]xN` on both arms, so TPOT and ITL stand and total-token
+throughput does not. Output throughput is biased UP if the prompts were truly
+truncated, by roughly 0.13% at c1 and 0.4-0.6% at c8 — larger than the 0.039% and
+0.205% CVs published beside them, so the bias is not inside the stated precision.
+
 **Our half of the debt is discharged. Neither cell is a ratio, and each is
 blocked for its own reason.** At c1 vLLM also completed every request
 (**4.2835 tok/s**, CV 0.033%) and both absolutes stand, but
@@ -999,7 +1007,7 @@ that ceiling, and stable medians do not launder it.
 **At c8 the vLLM denominator is NOT MEASURABLE on this box at the recorded
 configuration, and that is the answer rather than a gap in it.** The server
 reached `/health` at 373 s and the worker was then lost during warmup. The KV
-reservation took **48,715 MB in a single 4-second window** (38,708 -> 9,738 MB),
+reservation took **48,715 MB in a single 4-second window** (58,453 -> 9,738 MB),
 the last observed value was 6,261 MB, and the death fell inside one 2-second
 sampling interval.
 

@@ -112,8 +112,22 @@ concurrency on an idle leased box completed **162 of 162** requests with
 `failed=0` and zero non-empty `errors` entries on every leg. c1 output
 throughput **4.4040 tok/s** (CV 0.039%), median TPOT 218.11 ms, median ITL
 216.56 ms, median TTFT 883.78 ms. c8 output throughput **22.6402 tok/s**
-(CV 0.205%), total token throughput 196.10 tok/s, median TPOT 250.57 ms, median
-ITL 232.83 ms, median TTFT 3623.5 ms. Both teardowns `TEARDOWN_VERDICT=CLEAN`.
+(CV 0.205%), total token throughput **196.10 tok/s, CORRUPTED — do not quote it**
+([#1355](https://github.com/mudler/vllm.cpp/issues/1355), `## Owed`), median TPOT
+250.57 ms, median ITL 232.83 ms, median TTFT 3623.5 ms. Both teardowns
+`TEARDOWN_VERDICT=CLEAN`.
+
+**And read the two output-throughput figures with the same caveat, bounded rather
+than dismissed.** `output_lens` is `[128]xN` on both arms, so TPOT and ITL stand.
+`output_throughput` divides output tokens by a WALL, and a genuinely truncated
+prompt shortens that wall, so it is biased UP: at the c1 marginal prefill cost the
+missing 202 tokens are ~0.22 s of a 174.39 s wall (~0.13%), and the missing 2,080
+at c8 are ~1.1-1.6 s of 271.0 s (~0.4-0.6%). Both exceed the 0.039% and 0.205% CVs
+published beside them, so "unaffected" is wrong and the bias sits outside our own
+stated precision. Shorter context also cheapens decode, so these are lower bounds.
+The median TTFTs (883.78 ms ours, 876.4 ms vLLM) ARE comparable: our two short
+prompts are the two LOWEST TTFTs in every rep, so on both arms the median falls on
+a 1024-token request.
 
 **Neither cell became a ratio, and the two halves are blocked differently.** At
 c1 the pinned oracle `0.1.dev1+g555967922` also completed every request on its
@@ -262,7 +276,25 @@ c8 until #931 closes. Concurrencies above 8 were not run.
   5,942 prompt tokens where vLLM reported 6,144 for the identical
   client-generated prompts, 19 of 48 short at c8. Whether we under-report
   `usage.prompt_tokens` or actually truncate the prompt is not decidable from
-  these artifacts.
+  these artifacts. **It corrupts `total_token_throughput` on both legs** — c1
+  38.4776 tok/s and c8 196.10 tok/s are computed over 5,942 and 47,072 input
+  tokens where the workload intends 6,144 and 49,152 — and it biases
+  `output_throughput` up by more than that figure's own CV; `## Now` carries the
+  bound. Quoting either total-token figure, or setting our 38.4776 beside vLLM's
+  38.5516, compares two different workloads.
+- [#1365](https://github.com/mudler/vllm.cpp/issues/1365), a reproducible ~4 s
+  TTFT outlier on request 3 of every c1 leg of ours, which the oracle does not
+  have: index 2 reads 3.981 / 3.924 / 4.006 / 3.955 s across the warmup leg and
+  all three reps against 0.73-0.93 s for every other request, four legs of four,
+  on a 1024-token prompt like requests 4, 5 and 6. Nothing published is wrong,
+  because the median of six averages ranks three and four and the outlier never
+  occupies either; it moves the MEAN (ours 1347.6-1372.6 ms against the oracle's
+  873.3-900.2 ms) and costs ~3.1 s of the 174.39 s c1 wall. The cause is not
+  chased here.
 - The checkpoint size disagrees between records: this spec's `## Outcome` says
-  55,586,114,863 bytes and the campaign's `NOTES.txt` says 55,586,040,114.
-  Neither was re-derived on 2026-08-19.
+  55,586,114,863 bytes and the campaign's `NOTES.txt` says 55,586,040,114, a
+  difference of 74,749 bytes. The 2026-08-19 run DID re-derive it, and it agrees
+  with `NOTES.txt`: `out/bench-20260819T035148Z/job.log:47,49` print
+  `CKPT_SRC_BYTES=55586040114` and `CKPT_DST_BYTES=55586040114` over the staged
+  tree that then served every leg. What is unresolved is WHY the `## Outcome`
+  figure differs, which the artifacts cannot settle.

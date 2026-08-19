@@ -24171,7 +24171,7 @@ coefficient of variation over the same three values.
 | non-empty `errors` entries | 0 | 0 |
 | output token throughput, median | **4.4040 tok/s** | **22.6402 tok/s** |
 | output token throughput, CV over 3 reps | 0.039% | 0.205% |
-| total token throughput, median | 38.4776 tok/s | 196.0967 tok/s |
+| total token throughput, median — **CORRUPTED, [#1355](https://github.com/mudler/vllm.cpp/issues/1355); NOT comparable to vLLM's** | 38.4776 tok/s, over 5,942 input tokens where the workload intends 6,144 | 196.0967 tok/s, over 47,072 where it intends 49,152 |
 | median TPOT | 218.11 ms | 250.57 ms |
 | median ITL | 216.56 ms | 232.83 ms |
 | median TTFT | 883.78 ms | 3623.5 ms |
@@ -24198,7 +24198,7 @@ shape and not `--enforce-eager`.
 | `failed`, per rep | 0, 0, 0 |
 | output token throughput, median | **4.2835 tok/s** |
 | output token throughput, CV over 3 reps | 0.033% |
-| total token throughput, median | 38.5516 tok/s |
+| total token throughput, median — **do not set this beside ours**; ours is deflated by 202 missing prompt tokens ([#1355](https://github.com/mudler/vllm.cpp/issues/1355)), so the axis is not comparable | 38.5516 tok/s, over the full 6,144 input tokens |
 | median TPOT | 228.36 ms |
 | median ITL | 226.86 ms |
 | median TTFT | 876.4 ms |
@@ -24253,7 +24253,10 @@ The c8 vLLM server loaded, reached `/health` after 373 s (launched 10:18:54 UTC,
 first `GET /health 200 OK` logged at 10:25:07 UTC), and the worker was then lost
 during the untimed warmup, before any timed leg ran. The memory trajectory is
 the finding, from the series' own 2-second `MemAvailable` sampler
-(`out/vllm-20260819T095758Z/mem.samples`, epoch seconds and MB):
+(`out/vllm-20260819T095758Z/mem.samples`, epoch seconds and MB). One row is NOT
+from the sampler: the `before launch` value is `MemAvailable_MB_before_server`
+from `job.log:214`, read once at launch, and `116869` appears nowhere in
+`mem.samples`.
 
 | Sample time (UTC) | MemAvailable | What it is |
 |---|---:|---|
@@ -24380,7 +24383,11 @@ Against the previously recorded cells (2026-08-15, a DIFFERENT boot
 
 **The SHAPE of that difference is the diagnosis, and the MAGNITUDE is not
 established by these two rows.** The throughput axis moves a great deal while
-the per-token axis moves 1-4%. That is exactly what
+the per-token axis barely moves at all — and that comparison is qualitative on
+purpose, because the two rows straddle the 2184 MHz-pinned / 2489 MHz-sampled
+boundary this paragraph goes on to declare non-dividable, so quoting a percentage
+here (220.6 -> 218.11 and 261.1 -> 250.57) would break the rule stated three
+sentences later. That is exactly what
 [#931](https://github.com/mudler/vllm.cpp/issues/931) predicts: the per-token
 axis was always measuring the engine, because it is computed over completed
 requests, while `output_throughput` was dividing live tokens by a wall duration
@@ -24419,17 +24426,72 @@ three c8 reps. `vllm bench serve` re-aligns prompts against the server's own
 warning on either arm, so our `/tokenize` agreed on 1024 while our
 `usage.prompt_tokens` reported 915 for the same request.
 
-**What this does and does not touch.** `output_throughput` is
-`total_output_tokens / duration`, and `output_lens` is `[128] x N` on BOTH arms
-in every leg, so the output-throughput, TPOT and ITL figures above are
-unaffected. `total_token_throughput` has input tokens in its numerator and IS
-affected: our c8 figure of 196.10 tok/s is computed over 47,072 input tokens
-where the intended workload is 49,152.
+**What this does and does not touch, BOUNDED rather than asserted.**
+`total_token_throughput` has input tokens in its numerator and is corrupted
+outright: our c1 figure of 38.4776 tok/s is computed over 5,942 input tokens and
+our c8 figure of 196.10 tok/s over 47,072, where the intended workload is 6,144
+and 49,152. `output_lens` is `[128] x N` on BOTH arms in every leg, so TPOT and
+ITL — both computed per completed request — stand.
+
+**`output_throughput` does NOT stand unconditionally, and the earlier wording
+"affects total-token throughput only" was too strong.** It is
+`total_output_tokens / duration`, and under GENUINE truncation the missing
+prompt tokens mean less prefill and therefore a shorter wall, which biases it
+UP. The size is derivable from these files. At c1 the wall equals the sum of the
+per-request E2ELs to within 1 ms (174.4387 s against a 174.4397 s `duration`),
+so the whole effect is in TTFT: over the 15 non-outlier c1 points the marginal
+prefill cost is 1.10 ms/token, so the missing 202 tokens are 0.22 s, and the two
+short prompts' TTFTs sit 0.20, 0.23 and 0.20 s below the 1024-token mean of
+884.6 ms across the three reps — **~0.22 s of 174.39 s, about 0.13%, against a
+published CV of 0.039%**. At c8 the first wave prefills at 1,300-1,800
+tok/s (six of eight first tokens by 4.579 s in rep 3), so 2,080 missing tokens
+are **~1.1-1.6 s of 271.0 s, about 0.4-0.6%, against a published CV of 0.205%**.
+Both are LOWER bounds, because a shorter context also cheapens every decode step.
+So the systematic bias on our headline throughput figures is larger than the
+precision printed beside them, and a reader must see that.
+
+**The two median TTFTs ARE comparable, and by evidence rather than by luck.**
+883.78 ms ours against 876.4 ms vLLM: every vLLM prompt is 1024 tokens, and on
+our side the two short prompts (915 and 931) produce the two LOWEST TTFTs in all
+three reps — sorted rep 1 `0.7381, 0.8264, 0.8436, 0.8484, 0.9047, 3.9243`, rep 2
+`0.7295, 0.8078, 0.8523, 0.9152, 0.9248, 4.0061`, rep 3 `0.7294, 0.8363, 0.8899,
+0.8900, 0.8921, 3.9548`. The median of six averages the third and fourth, both of
+which are 1024-token requests in every rep, so both arms' medians fall on the same
+prompt length. Had a short prompt landed at rank three or four, this comparison
+would have been wrong and nothing in the record would have said so.
 
 **Two causes remain open and the artifacts cannot separate them**: our server
 under-reports `usage.prompt_tokens`, or our server actually processed a
 truncated prompt. Filed, not fixed in flow — this row writes no product code
 and holds no GPU.
+
+### A SECOND THING THE CAMPAIGN DID NOT SET OUT TO FIND — A REPRODUCIBLE TTFT OUTLIER AT A FIXED REQUEST INDEX
+
+[#1365](https://github.com/mudler/vllm.cpp/issues/1365). At c1 the six requests
+are strictly serialized, and OUR arm puts a ~4 s TTFT on request 3 of every leg:
+
+| leg | `ttfts`, seconds |
+|---|---|
+| `warmup-c1.json` | 77.005, 0.727, **3.981**, 0.850, 0.845, 0.839 |
+| `c1-r1.json` | 0.738, 0.826, **3.924**, 0.844, 0.905, 0.848 |
+| `c1-r2.json` | 0.729, 0.808, **4.006**, 0.915, 0.925, 0.852 |
+| `c1-r3.json` | 0.729, 0.836, **3.955**, 0.890, 0.892, 0.890 |
+
+Four legs of four, always index 2, and request 3 carries a 1024-token prompt
+exactly as requests 4, 5 and 6 do, so prompt length does not separate it. The
+77.005 s first value is the separate, already-recorded first-inference cost
+behind a liveness-only `/health`. The oracle has no such point: 18 requests
+across its three c1 legs, every TTFT between 0.834 and 1.015 s.
+
+**Nothing recorded above is wrong, and that is exactly why this is filed.** The
+figure this repository quotes is the MEDIAN, labelled as such, and the median of
+six averages ranks three and four, which the outlier never occupies. What it does
+move is the MEAN — ours 1347.6 / 1372.6 / 1365.4 ms against the oracle's 873.3 /
+883.4 / 900.2 ms, while the medians read 883.78 ms and 876.4 ms — and the wall:
+request 4 starts 31.63 s after request 3 where every other gap is ~28.4 s, so
+roughly 3.1 s of the 174.39 s c1 wall. A reproducible outlier at a FIXED request
+index is a behaviour rather than noise. The cause is deliberately NOT chased
+here; this row writes no product code and holds no GPU.
 
 ### EVIDENCE
 
@@ -24445,10 +24507,17 @@ result JSONs, six `clock-*.json` windows with their raw samples, `CLOCKS.txt`,
 and `vllm-20260819T095758Z/` (attempt 2: three c1 JSONs and clock windows, both
 server logs, `mem.samples`, the empty `watchdog.log`).
 
-**Two inconsistencies inside the evidence directory, resolved in favour of the
+**Three inconsistencies inside the evidence directory, resolved in favour of the
 executing artifact.** `NOTES.txt` states a binary sha256 of `ab0b9a1e...`; the
 job log asserted and printed `7d0c3caf...` as both `WANT` and `GOT` at launch,
 and `out/RESULT.txt` agrees, so `7d0c3caf...` is the binary that ran and
 `NOTES.txt` carries a stale value. `NOTES.txt` gives the checkpoint as
 55,586,040,114 bytes where `.agents/specs/qwen38-27b-bf16-gate.md` records
-55,586,114,863; neither was re-derived here and the difference is not adjudicated.
+55,586,114,863, a difference of 74,749 bytes; the run DID re-derive it and it
+agrees with `NOTES.txt` — `out/bench-20260819T035148Z/job.log:47,49` print
+`CKPT_SRC_BYTES=55586040114` and `CKPT_DST_BYTES=55586040114` over the staged tree
+that served every leg — so what is unadjudicated is why the spec's figure differs,
+not whether anybody measured. And `NOTES.txt:208` gives the c8 cold start as 374 s
+where this entry derives 373 s from the log's own timestamps (10:18:54 launch,
+10:25:07 first `GET /health 200 OK`); the derived value is the better one and the
+disagreement is recorded here rather than left silent, since the other two were.
