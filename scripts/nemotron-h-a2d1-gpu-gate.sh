@@ -195,6 +195,19 @@ run_leg() {   # $1 = label, $2 = VT_NEMOTRON_H_MAMBA_DECODE_STEP value
   echo "RC[a3 $label]=$r"
   grep -E "STRICT|PASS|FAIL|DIVERGENCE|REFUSING|SHORT|mode=|engine loaded in" "$log" | tail -20
 
+  # ★ ON A DIVERGENCE, PRINT THE TOKENS. The driver already emits `got:` and
+  # `exp:` for any row that mismatches (nemotron_h_gen/main.cpp:385), and the
+  # verdict grep above throws them away -- so a `95/96 DIVERGENCE` arrived with
+  # no way to tell a wrong recurrent carry from a benign bf16 near-tie without
+  # spending a second lease. A gate that reports a failure it cannot triage has
+  # not finished reporting. Also print the per-prompt row lines, which carry
+  # which prompt was short and by how much.
+  if grep -q "DIVERGENCE" "$log"; then
+    echo "--- DIVERGENCE detail ($label): per-prompt rows, then got/exp ---"
+    grep -E "^\s*prompt |matched=|wall=" "$log" | tail -10
+    grep -E "^\s+(got|exp):" "$log" | tail -20
+  fi
+
   # ★ WHICH KERNELS THE DECODE STEPS ACTUALLY LAUNCHED. The two arms compute the
   # same recurrence, so the tokens agree and cannot separate them; this is the
   # only line that can. A counter that reads 0 on BOTH legs means the recorder
