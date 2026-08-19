@@ -161,5 +161,75 @@ or headline changes.
 
 ## 10. Now
 
-Implementation and gates in one pull request, per the AGENTS.md default (no
+**State at this commit: LANDED and GATED.** Implementation and gates in one pull
+request, per the AGENTS.md default (no
 recorded preference for this row and no split case applies).
+
+---
+
+## 11. Outcome
+
+**Measured 2026-08-19 on `dgx:gpu0` (GB10, sm_121a), one `rc run` lease, job
+`75f0121b-ed8a-42cc-a639-e00bfefafb9c`, one build tree for both arms.** Full
+evidence in [PR #1348](https://github.com/mudler/vllm.cpp/pull/1348).
+
+**The question this row had to answer first.** `Synchronize` is a REAL drain:
+`src/vt/cuda/cuda_backend.cu:110-112` is `cudaStreamSynchronize(AsStream(q))`.
+The issue's refutation clause fails, so #1312 was serialisation as well as
+bandwidth and the resident fix is the right size.
+
+**What was measured.** Per MoE block per forward, steady state: gate uploads
+1 -> 0, bias uploads 1 -> 0, host drains charged to the router 2 -> 0. The two
+that remain (2 -> 2) are the test seam's own `UploadAs` and `DownloadF32`, which
+`NemotronHPagedForward` does not have. At 23 MoE layers that is 46 copies and 46
+drains per decode token, to zero. The answer did not move: worst relative
+deviation 0 over 128 elements, twice, with the element count asserted against
+the geometry.
+
+RED `9d55ef92f`: 3 cases / 2 passed / 1 failed, 47 assertions / 42 passed / 5
+failed, exit 1. GREEN `e551bfa17`: 3 / 3 passed, 47 / 47, exit 0. The mutation
+that defeats the residency test builds clean (`BUILD_MUT_RC=0`, zero `error`
+lines) and turns the case red again at the same five assertions, so the case
+detects the defect rather than passing beside it.
+
+**A3, at GREEN, on the released checkpoint at revision `29f2d174`:**
+`TOKEN MATCH: 96/96 over 3 prompt(s) (full rows=3, short rows=0, mode=decode)`,
+`STRICT PASS`, exit 0, through `include/vllm.h` alone. Engine load 254.5 s;
+per-prompt wall 335.87 / 323.42 / 322.71 s. **This is the first green sm_121a
+A3 leg** -- [`nemotron-h-a2p-paged-forward.md`](nemotron-h-a2p-paged-forward.md)
+section 10 records the host leg green and the sm_121a leg as the one that
+remained. Reconciling that record is A2-P's, not this row's, so it is reported
+rather than edited here.
+
+**REJECTED: a speed claim.** No A/B was run and none is offered. The numbers
+settle the opposite point, and it is the useful one: 32 tokens in 335.87 s is
+10.50 s per token, and 46 drains at the tree's own ~66 us figure
+(`deepseek_v4.cpp:203`, a DeepSeek-V4 comment rather than a measurement on this
+arm) is of order 3 ms, about 0.03% of the step. #1312 is worth fixing because it
+is free and because an unsynchronised pageable upload is a correctness hazard,
+NOT because it was the decode gap. It never could have been.
+
+**This is not a ceiling.** The next traceable step is the one the A3 walls point
+at: the 23 Mamba2 blocks still compute their FP8 projections on the HOST every
+decode token (#940, #1289, #1311). A 10.50 s token has to be attributed there
+before anything else on this model is worth measuring.
+
+**Why each default has its value.**
+
+- *The first-use copy keeps its `Synchronize`.* One drain per layer per process
+  is not what this row is about, and `w.bytes` outliving the copy makes removing
+  it a separate argument with its own evidence.
+- *`RequireOwned` runs before the residency test, not inside it.* Folding the
+  refusal into the copy would refuse a wrong weight once and then accept it
+  silently for the rest of the process.
+- *The slots are raw `void*` on the resident struct, not `shared_ptr` with a
+  deleter.* That matches the eleven fields already on
+  `NemotronHMoeMarlinResident` and the identical `MoeMarlinResident` in
+  `qwen3_5.cpp:861`. Neither frees, so both leak their arena at teardown; that is
+  the tree-wide shape for a process-lifetime Marlin arena and changing it here
+  would be a one-field deviation inside a struct that does the opposite. Noted,
+  not filed, because no measurement establishes it as a defect rather than a
+  deliberate lifetime.
+- *`topk_weights` is allocated and left unwritten rather than zeroed.* A device
+  `Memset` would be 46 more launches per token to initialise a buffer the kernel
+  provably does not read, which is the cost this row exists to remove.
