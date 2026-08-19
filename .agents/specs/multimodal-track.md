@@ -458,6 +458,227 @@ comparing the two arms must set the flag on both sides or state that it did not.
 - **L3** — the tower skip: construct-without-initialising when every limit is 0,
   gated on **measured** RSS reduction against a multimodal checkpoint, plus
   token-exactness of the text path with and without the flag.
+
+  **SPEC 2026-08-19 (#607, `row/ENG-MM-INPUT-PIPELINE-l3`). Read L2's "What L2
+  does NOT do" above first: it is the input to this section.**
+
+  **The mechanism, re-verified at the pin `555967922` rather than taken from the
+  issue.** #607's body cites `interfaces.py:293`. That line is the CONDITION;
+  the construct is `interfaces.py:288-293`, inside
+  `SupportsMultiModal._mark_tower_model` (`:257-298`):
+
+  ```python
+  with collect_children(self, targets=targets) as children_names:      # :286
+      with (
+          no_init_weights(                                             # :288
+              self,
+              lambda mod: StageMissingLayer(stage_name, mod),          # :290
+              targets=targets,
+          )
+          if all(mm_config.get_limit_per_prompt(m) == 0 for m in modalities)  # :293
+          else nullcontext()
+      ):
+          yield
+  self._tower_model_names = children_names                             # :298
+  ```
+
+  Four facts follow, and the dispatch's framing was right on all four:
+
+  1. **The skip is a consequence of ZERO LIMITS, not of the flag.** The
+     condition reads `mm_config.get_limit_per_prompt(m)`, and
+     `--language-model-only` is only one of the routes that makes it 0
+     (`multimodal.py:78-80,321-327`; `--limit-mm-per-prompt '{"image":0,
+     "video":0}'` is the other). Nothing in `_mark_tower_model` mentions the
+     flag. Gating our skip on `language_model_only` would be the bespoke path
+     the mirror rule forbids, and it would silently diverge for the second
+     route.
+  2. **ALL, not ANY.** `all(...)` over the tower's OWN modality set. The
+     Qwen3.6 / Qwen3-VL tower is marked `{"image", "video"}`
+     (`qwen3_5.py:422`, `qwen3_5.py:634`, `qwen3_vl.py:1747`), so `image: 0`
+     alone does NOT skip it. `stage_name` is `"vision_tower"` for exactly that
+     pair (`interfaces.py:280-283`).
+  3. **CONSTRUCT-without-initialise, not "do not construct".** `no_init_weights`
+     enters `torch.device("meta")` (`utils.py:762`) — every submodule's
+     `__init__` still runs and every shape is still resolved, and no storage is
+     allocated. Our analogue is not "skip the constructor", it is "leave the
+     weights struct default-constructed and never read the checkpoint tensors":
+     the tower's geometry is still parsed from `vision_config`, which is what
+     keeps a later refusal able to name what is missing.
+  4. **The placeholder is LOUD and INVISIBLE to the loader.**
+     `StageMissingLayer` (`utils.py:687-704`) keeps the real module out of the
+     child registry (`self.__dict__["module"] = module`, `:693-695`) so the
+     weight loader reports no missing keys for it, and raises
+     `RuntimeError(f"{self} should not be called")` from `__call__` (`:700-701`)
+     if anything reaches it. Both halves are obligations on us: the skipped
+     tower must not make the loader complain, and calling it must throw by name
+     rather than read empty buffers.
+
+  **One correction to #607's own framing, found by reading our tree rather than
+  upstream's.** The issue says "builds the tower uninitialised" as though it
+  were one site. In THIS tree there are exactly **two** production tower-load
+  call sites, and a third that a name-only search would wrongly count:
+
+  - `src/vllm/model_executor/models/qwen3_vl.cpp:418` —
+    `w.vision = LoadQwen3VLVisionWeights(shards, w.vision_cfg)` inside
+    `LoadQwen3VLWeights`, reached from `qwen3_vl_registry.cpp:97-98`
+    (`Qwen3VLForConditionalGeneration`);
+  - `src/vllm/model_executor/models/muse_glimmer_weights.cpp:791` —
+    `if (w.params.vision.present) w.vision = LoadVisionTower(get, w.params)`
+    inside `LoadMuseGlimmerForConditionalGenerationWeights`, reached from
+    `muse_glimmer_registry.cpp:77-78` (both `MuseGlimmerForCausalLM` and
+    `MuseGlimmerForConditionalGeneration`);
+  - **NOT** `LoadQwen3_5MoeVision` (`qwen3_5_weights.h:991`). It has no
+    production caller at all — the only references outside its own definition
+    are `tests/vllm/models/test_qwen3_5_moe_vision.cpp` and
+    `tests/vllm/multimodal/test_qwen3_5_moe_vl_hw.cpp`. `LoadQwen3_5Moe` reads
+    the TEXT backbone only, so on the production path the Qwen3.6 MoE tower is
+    already never loaded and there is no RSS for L3 to save there. That is #891,
+    not this row, and it is recorded here so the next reader does not measure a
+    saving that does not exist.
+
+  `Gemma4ForConditionalGeneration` (`gemma4_registry.cpp:13`) and
+  `KimiK3ForConditionalGeneration` declare `supports_multimodal` but their
+  loaders are text-only today, so they have no tower-load site to gate. They
+  inherit the seam and cost nothing.
+
+  **Design.**
+
+  *The seam.* Upstream's model `__init__` reads
+  `vllm_config.model_config.multimodal_config`. Our loader seam is
+  `ModelWeightLoader(registration, config, source)` (`model_registry.h:328-330`)
+  and carries no such handle. `ModelSource` is already the per-load CONTEXT
+  rather than only the checkpoint — it carries `vt::Queue* load_queue`, which is
+  an engine-selected execution resource and not a property of the file — so the
+  multimodal config rides there:
+
+  ```cpp
+  // model_registry.h, struct ModelSource
+  const MultiModalConfig* multimodal = nullptr;
+  ```
+
+  Null means "no limits configured", which loads everything and is
+  byte-identical to pre-L3. The loaders that have no tower never read it and are
+  not edited. This is a seam EXTENSION with a recorded reason, not a parallel
+  path: the alternative — a third parameter on `ModelWeightLoader` — rewrites
+  every registered architecture's signature to thread a value all but two of
+  them ignore, and the alternative after that — a process-global like
+  `WeightOffloader` — has no upstream analogue here, because upstream threads
+  the value through `vllm_config` and keeps a global only where it already had
+  one (`offloader/base.py:106-125`).
+
+  *The decision.* One function, mirroring `interfaces.py:288-293`, in a new
+  `include/vllm/model_executor/models/interfaces.h` that mirrors upstream's own
+  file:
+
+  ```cpp
+  bool SkipTowerForModalities(const MultiModalConfig* mm_config,
+                              std::initializer_list<std::string_view> modalities);
+  ```
+
+  `false` when `mm_config == nullptr` or when the modality list is empty (an
+  empty `all(...)` is vacuously true in Python and would skip every tower, which
+  is the one place a literal transcription is wrong for us: upstream can never
+  reach it because `_mark_tower_model` is always called with a non-empty set).
+  Both call sites pass `{"image", "video"}`, which is the marked set at
+  `qwen3_5.py:422` / `qwen3_vl.py:1747` for Qwen3-VL and, for Muse Glimmer, the
+  perception encoder's own image+video coverage recorded at
+  `muse_glimmer_registry.cpp:36-37`.
+
+  *The placeholder.* Muse Glimmer already has the `StageMissingLayer.__call__`
+  analogue: `MuseGlimmerEncodePixelGroups` refuses on `weights.vision.loaded`
+  with a message naming the missing tower (`muse_glimmer_mm.cpp:194`, message at
+  `:66-70`). The skip therefore extends that message so a reader can tell "this
+  checkpoint has no encoder" from "you asked for zero limits", because the two
+  have different fixes. `Qwen3VLWeights` gains `vision_loaded` for symmetry; it
+  has **no production consumer today** (`Qwen3VLWeights` appears in three
+  hardware e2e tests and nowhere else outside its own loader), which is a
+  pre-existing reachability gap this row records and files rather than repairs.
+
+  *The observable.* Upstream's skip is observable on the module tree
+  (`isinstance(model.visual, StageMissingLayer)`). Ours is a type-erased
+  `LoadedModel`, so it gains the mirror of `_tower_model_names`
+  (`interfaces.py:141,298`):
+
+  ```cpp
+  virtual std::vector<std::string> skipped_towers() const { return {}; }
+  ```
+
+  empty on every text model and on every multimodal model loaded with a non-zero
+  limit, `{"vision_tower"}` on a skipped one — `stage_name` for `{"image",
+  "video"}` at `interfaces.py:280-283`. `LoadedEngine::skipped_towers()`
+  forwards it, which is what lets the gate below enter through a production
+  entry point instead of asserting on a class.
+
+  **Risks.**
+
+  - *A skip that fires when it should not* silently produces an engine that
+    cannot serve images. Contained by the L1 refusal, which is already in and
+    already keyed on the SAME predicate: a request that could reach the skipped
+    tower is refused at the entrypoint with limit 0 before it gets there. The
+    two cannot disagree because both read `GetLimitPerPrompt`.
+  - *`all` vs `any`* is the one-character defect that would skip the tower on
+    `--limit-mm-per-prompt '{"image":0}'`. Gated directly.
+  - *The empty-modality vacuous truth* is called out above and gated directly.
+  - *An RSS measurement that measures the box, not the change.* Contained by the
+    A/B discipline below.
+
+  **Tests, red-first, all CPU except the RSS axis.**
+  `tests/vllm/models/test_tower_skip.cpp`:
+
+  1. the predicate: both zero ⇒ skip; one non-zero ⇒ no skip (the `all` gate);
+     null config ⇒ no skip; empty modality list ⇒ no skip; and
+     `language_model_only` reaching it only through `GetLimitPerPrompt`;
+  2. through `ModelRegistry::Load` on a synthetic Muse Glimmer conditional-
+     generation checkpoint written in the real on-disk names: tower loaded with
+     no mm config, tower NOT loaded with zero limits, text tower fully loaded in
+     both, and the loader complaining about neither;
+  3. **token-exactness of the text path with and without the flag** — the same
+     text prompt through `ModelRegistry::Forward` on both models, requiring
+     BIT-IDENTICAL logits and identical greedy ids;
+  4. the loud refusal: the mm forward on the skipped model throws by name, and
+     the message distinguishes the skip from an absent encoder;
+  5. **reachability** — `LoadedEngine::FromModelDir` on a synthetic model
+     directory, `skipped_towers()` empty by default and `{"vision_tower"}` with
+     `params.multimodal.language_model_only`. The mutation this case exists for
+     is deleting `source.multimodal = &params.multimodal;` in
+     `src/vllm/entrypoints/model_loader.cpp`; a gate that stays green without it
+     measures a class.
+
+  **The RSS gate, and its threshold declared BEFORE the measurement.**
+
+  Peak RSS, not steady-state: the load phase is where the tower's bytes are
+  paid, and a steady-state figure taken after the allocator has returned pages
+  would report a saving the box never saw. `/usr/bin/time -v` (`Maximum resident
+  set size`) around one process that loads the checkpoint and generates a fixed
+  16 greedy tokens from a fixed text prompt, run A-B-A-B, from **two separate
+  build directories of the same commit** (an A/B that reuses one build directory
+  measures one binary twice, and identical call counts are the tell), on an
+  otherwise idle box, with the page cache warmed by a discarded first run so the
+  two arms see the same I/O state.
+
+  Vehicle: `MuseGlimmerForConditionalGeneration`, the only architecture in this
+  tree that both loads a tower on its production path and has a checkpoint on
+  the NAS.
+
+  **Declared threshold: the language-model-only arm's peak RSS must be at least
+  90% of the perception encoder's on-disk byte total below the default arm, and
+  the default arm must be within 2% of the pre-L3 binary's.** The tower's own
+  size is computable from the checkpoint index before the run, so this is a
+  threshold on the physics rather than a round number: 90% leaves room for
+  allocator granularity and for the tower geometry that is still parsed, and the
+  second half is what stops "we saved memory" from meaning "we broke the default
+  path". An outcome below it is a FAILING axis and stays open; it is not
+  renegotiated afterwards.
+
+  **Stop conditions.** Stop and report, do not work around: the mechanism
+  differs at the pin from the four facts above; the skip cannot be expressed at
+  `ModelSource`/`ModelRegistry::Load` without a bespoke path; neither NAS
+  checkpoint loads in this tree; or only the GPU measurement remains.
+
+  **Owed by this section, not done in it.** The RSS number itself, which needs a
+  device under an `rc` lease. `process_inputs_mm` stays owed to the per-model
+  `get_supported_mm_limits()` hook, unchanged from L2. L4 (#414) is untouched.
+  `Qwen3VLWeights::vision` having no production consumer is filed, not fixed.
 - **L4** — mirror the kernel gate, or record an explicit tracked exception with
   the #414 cross-reference.
 
