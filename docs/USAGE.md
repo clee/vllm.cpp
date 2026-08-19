@@ -812,7 +812,7 @@ tokens quietly.
 | Architecture | Why it refuses |
 |---|---|
 | `KimiK3ForConditionalGeneration` | Needs ~1.56 TB (MXFP4); no host here can run it |
-| `NemotronHForCausalLM` | **Only BATCHED decode still refuses.** A2-P (#810) narrowed this: `ForwardNemotronHForCausalLM` now selects the paged forward whenever the runner supplies paged KV and recurrent state, so K/V go into the runner's pages and the conv/SSM rows are carried across steps, and `examples/nemotron_h_gen` reaches all of it through `include/vllm.h` alone. What is left is `num_reqs > 1`, refused by name because one request's pages and one request's recurrent state are carried per step and a multi-request step would be decoded as ONE concatenated causal sequence — plausible wrong tokens rather than a failure. Owed to A2-B. **The end-to-end token gate against the pinned oracle has NOT run**, so no claim is made here about what this checkpoint emits; `docs/BENCHMARKS.md` records that as pending rather than as silence. `lm_head` and the FP8 Mamba2 projections still compute on the host, and a GGUF file is refused by name since no GGUF arm exists for it. See *Nemotron-3.5-Lightning-30B: the exact weights, and which arms run* below |
+| `NemotronHForCausalLM` | **Only BATCHED decode still refuses.** A2-P (#810) narrowed this: `ForwardNemotronHForCausalLM` now selects the paged forward whenever the runner supplies paged KV and recurrent state, so K/V go into the runner's pages and the conv/SSM rows are carried across steps, and `examples/nemotron_h_gen` reaches all of it through `include/vllm.h` alone. What is left is `num_reqs > 1`, refused by name because one request's pages and one request's recurrent state are carried per step and a multi-request step would be decoded as ONE concatenated causal sequence — plausible wrong tokens rather than a failure. Owed to A2-B. **The end-to-end token gate against the pinned oracle has NOT run**, so no claim is made here about what this checkpoint emits; `docs/BENCHMARKS.md` records that as pending rather than as silence. `lm_head` now computes on the device through the shared NVFP4 W4A16 route (A2-Q2b), though its numeric gate has not run yet; the FP8 Mamba2 projections still compute on the host, and a GGUF file is refused by name since no GGUF arm exists for it. See *Nemotron-3.5-Lightning-30B: the exact weights, and which arms run* below |
 
 This is a deliberate state, not a bug: registering the architecture is what lets
 the config parse and weight-name mapping be tested before the forward exists.
@@ -2952,7 +2952,7 @@ comparison can see, so it is written down here instead.
 | bf16 layers, norms, the 6 GQA attention blocks | **device** |
 | MoE experts, NVFP4 W4A16 g16 | **device** (Marlin arena) |
 | FP8 W8A8 static Mamba2 input projections | **host** — the device arm is owed, [#940](https://github.com/mudler/vllm.cpp/issues/940) |
-| `lm_head`, NVFP4 W4A16 g16 | **host** — it refuses a non-CPU queue by name, so the forward's last step is a host projection and the model still returns host logits. Owed to A2-Q2b, [#810](https://github.com/mudler/vllm.cpp/issues/810) |
+| `lm_head`, NVFP4 W4A16 g16 | **device** on the paged forward (A2-Q2b, [#810](https://github.com/mudler/vllm.cpp/issues/810)) — it runs through the shared NVFP4 W4A16 route `dense_nvfp4::MatmulNvfp4W4A16D`, so `NemotronHPagedForward` returns device-resident logits to the on-GPU sampler instead of a host projection. **The device arm's own numeric gate has NOT run yet** (it needs a `dgx:gpu0` window); until it does, treat this row as "implemented and unmeasured", which is what the spec's `## Now` records. The host projection is retained and is what serves a build without the Marlin NVFP4 GEMM, a non-NVFP4 `lm_head`, and the numeric gate's reference side |
 
 And the arms that are **refused by name** rather than substituted:
 
@@ -2961,6 +2961,27 @@ And the arms that are **refused by name** rather than substituted:
 | GGUF k-quants / i-quants | not ported. A GGUF path is refused at load naming `.agents/specs/nemotron-h-model.md` §5b W7, because silently dequantizing to a supported path is exactly what a token gate cannot see |
 | the MTP draft head | deferred by name at load (W5) |
 | batched decode (`num_reqs > 1`) | refused at the forward. One request's KV pages and one request's recurrent state are carried per step; a multi-request step would be decoded as ONE concatenated causal sequence and would return plausible wrong tokens instead of failing. Owed to A2-B, [#810](https://github.com/mudler/vllm.cpp/issues/810) |
+
+#### What the host arms cost, per decode token
+
+Counted on the real checkpoint at the single dequant seam, one decode step
+(T=1, `top_k` 6, 23 MoE layers), because "where the arithmetic happens" is only
+half the answer — the other half is how much of it there is:
+
+| group | elements re-expanded per token | share |
+|---|---|---|
+| routed experts (6 of 128, x 23 layers) | 1 376 944 128 | 44.7% |
+| shared experts (x 23) | 458 981 376 | 14.9% |
+| Mamba2 FP8 `in_proj` + `out_proj` (x 23) | 890 265 600 | 28.9% |
+| `lm_head` | 352 321 536 | 11.4% |
+| **total** | **3 078 512 640 (6.157 GB at bf16)** | |
+
+Only the groups marked **host** above are actually paid at run time. With the
+MoE arm on the device that is 1 242 587 136 elements (2.485 GB) per token, and
+with `lm_head` on the device too it is the Mamba2 FP8 pair alone. `lm_head` is
+the largest SINGLE re-expansion in the model by 12.7x — one call, a 704.6 MB
+transient bf16 buffer — which is why it matters more than its 11.4% share
+suggests on a unified-memory box that reboots rather than OOM-kills.
 
 ### What has NOT been measured
 
