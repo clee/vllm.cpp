@@ -152,6 +152,11 @@ Music3AcousticWeights Music3LoadAcousticWeights(const MiniMaxMusic3Paths& paths,
                                                 const MiniMaxMusic3Config& config) {
   Music3AcousticWeights out;
 
+  // BREAKDOWN ROWS, all SPANS: they sit inside the `load.acoustic_weights` leaf
+  // and summing them would double-count it. `SafetensorsFile` is an mmap whose
+  // tensors are COPIED out, so the read and the copy are interleaved and the
+  // total cannot say which one it is.
+  const auto cond_t0 = profile::Now();
   const SafetensorsFile condition_file = SafetensorsFile::Open(
       (fs::path(paths.condition_encoder_dir) / "diffusion_pytorch_model.safetensors").string());
   const auto condition_get = [&condition_file](const std::string& name) {
@@ -161,21 +166,36 @@ Music3AcousticWeights Music3LoadAcousticWeights(const MiniMaxMusic3Paths& paths,
   out.condition.layer_scale = condition_get("layer_scale");
   out.condition.proj_weight = condition_get("proj.weight");
   out.condition.proj_bias = condition_get("proj.bias");
+  profile::AddSince("load.ac.condition", cond_t0, /*span=*/true);
 
+  const auto voc_t0 = profile::Now();
   const SafetensorsFile vocoder_file = SafetensorsFile::Open(
       (fs::path(paths.vocoder_dir) / "diffusion_pytorch_model.safetensors").string());
   out.vocoder = VocoderWeightsFromLoader(
       config.vocoder, MiniMaxMusic3LoadVocoderWeights(config.vocoder, vocoder_file));
+  profile::AddSince("load.ac.vocoder", voc_t0, /*span=*/true);
 
   if (paths.transformer_shards.empty()) {
     Fail("MiniMax-Music3: the transformer has no safetensors shards");
   }
+  // The two halves of the fp32 DiT's 9.7 GB: reading each tensor out of the
+  // mmap into a `std::map` of `std::vector<float>`, and then rebuilding the
+  // weight struct from that map. They are separated because they are different
+  // costs — the first touches every source page, the second is a pure host copy
+  // that touches no file at all — and only the second can be blamed on the
+  // loader rather than on the storage.
   std::map<std::string, std::vector<float>> dit;
-  for (const std::string& shard : paths.transformer_shards) {
-    const SafetensorsFile file = SafetensorsFile::Open(shard);
-    for (const std::string& name : file.Names()) dit[name] = AcousticF32(file.Get(name), name);
+  {
+    profile::Timer read_timer("load.ac.dit_read", /*span=*/true);
+    for (const std::string& shard : paths.transformer_shards) {
+      const SafetensorsFile file = SafetensorsFile::Open(shard);
+      for (const std::string& name : file.Names()) dit[name] = AcousticF32(file.Get(name), name);
+    }
   }
-  out.dit = DitWeightsFromTensors(config.transformer, dit);
+  {
+    profile::Timer build_timer("load.ac.dit_build", /*span=*/true);
+    out.dit = DitWeightsFromTensors(config.transformer, dit);
+  }
   return out;
 }
 
@@ -558,20 +578,46 @@ class Music3SpeechEngine final : public multimodal::SpeechEngine {
       // `queue_` and the ONLY thing the device selector changes.
       //
       // WHAT MOVES: the 8.6B `Qwen3ForCausalLM` half, through the shared
-      // `Qwen3DenseModel::ForwardEmbeds` five registrations already ride. WHAT
-      // DOES NOT: the 0.65B RVQ depth decoder and the whole acoustic half,
-      // which are host reference loops — see minimax_music3_ar.h and
-      // vocoder1d.h for exactly which pieces are owed and why.
+      // `Qwen3DenseModel::ForwardEmbeds` five registrations already ride, AND —
+      // since #1309 — the 0.65B RVQ depth decoder, which was 48.4 % of a run
+      // (spec §19.1). WHAT DOES NOT: the depth decoder's projection, audio
+      // heads and feedback embedding, ~1.6 % of that stage and owed by §19.7;
+      // and the whole acoustic half's host reference loops — see
+      // minimax_music3_ar.h and vocoder1d.h for which pieces are owed and why.
+      //
+      // NON-const, because the depth arm below STAGES OUT OF IT.
       const auto load_t0 = profile::Now();
-      const Music3ArWeights ar = Music3LoadArWeights(paths_, config_);
+      Music3ArWeights ar = Music3LoadArWeights(paths_, config_);
       profile::AddSince("load.ar_weights", load_t0);
       profile::Mark("ar.weights_loaded");
       const std::vector<int32_t> prompt_ids = ar.Encode(request.prompt);
+
+      // THE PRODUCTION SELECTION for the depth decoder, on the SAME switch the
+      // DiT arm rides: `--speech-device 1` resolves `queue_` to the platform's
+      // device, and a non-CPU queue takes the device arm. There is no separate
+      // flag and no environment variable, because a capability behind an option
+      // nothing turns on is the shape `.agents/reachability.md` calls dead.
+      //
+      // The rule itself lives in `Music3SelectDepthArm` rather than in an `if`
+      // here, and that placement is the #1131 repair: the condition `queue_` has
+      // to satisfy is false on every runner CI owns, so a branch written at this
+      // line is unreachable from any gate, while the function is driven by
+      // `test_minimax_music3_ar` on both sides of it. The DiT block below still
+      // carries the untestable shape and #1131 still owns it.
+      //
+      // `release_host` is TRUE: the staged tensors are the ONLY thing the host
+      // append loop reads, and it is not called when the arm is engaged. The
+      // projection, the audio embeddings and the audio heads — which this stage
+      // still reads on the host — are not staged and are not released.
+      Music3DepthDeviceWeights staged_depth;
+      const Music3DepthDeviceArm depth_arm = Music3SelectDepthArm(
+          queue_, ar.depth_config, ar.depth, /*release_host=*/true, &staged_depth);
       Music3ArResult generated;
       {
         profile::Timer ar_timer("ar.TOTAL_loop", /*span=*/true);
-        generated = Music3GenerateFrameHiddens(
-            prompt_ids, request.max_frames, ar, Music3SeededSampler(request.seed), queue_);
+        generated = Music3GenerateFrameHiddens(prompt_ids, request.max_frames, ar,
+                                               Music3SeededSampler(request.seed), queue_,
+                                               depth_arm);
       }
       profile::Mark("ar.loop_done");
       frame_hiddens = std::move(generated.frame_hiddens);

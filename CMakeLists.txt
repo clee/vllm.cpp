@@ -694,6 +694,20 @@ include(cmake/TritonAOT.cmake)
 
 configure_file(include/vllm/version.h.in include/vllm/version.h @ONLY)
 
+# THE COMPILED-ARCH MANIFEST (issue #1357, umbrella #1332 M2) starts EMPTY, and
+# empty means "FlashAttention-2 was not compiled". It is filled in exactly one
+# place: beside the vt_cuda_set_source_gencode call that emits FA2's -gencode
+# options, so the manifest cannot claim an architecture nvcc was not asked to
+# emit SASS for. Nothing fills it in a non-CUDA build, in a build with
+# -DVLLM_CPP_FLASH_ATTN=OFF, in a build without CUTLASS headers, or in a build
+# whose requested architectures do not intersect the feature table's fa2 row --
+# and "not compiled" is the correct answer in every one of those cases.
+#
+# The header is rendered at the END of this file, after that assignment has had
+# its chance to run. Derived, never hand-written: a parallel architecture list is
+# CUDA_SUPPORTED_ARCHS, and a list that goes stale is precisely the defect.
+set(VLLM_CPP_CUDA_FA2_COMPILED_ARCHS "")
+
 add_library(vllm STATIC
   src/vllm/version.cpp
   src/vllm/sampling_params.cpp
@@ -781,6 +795,7 @@ add_library(vllm STATIC
   src/vllm/model_executor/models/minimax_music3_ar.cpp
   src/vllm/model_executor/models/minimax_music3_acoustic.cpp
   src/vllm/model_executor/models/minimax_music3_device.cpp
+  src/vllm/model_executor/models/minimax_music3_depth_device.cpp
   src/vllm/model_executor/models/minimax_music3_llm.cpp
   src/vllm/model_executor/models/minimax_music3_speech.cpp
   src/vllm/model_executor/models/gpt2.cpp
@@ -1090,6 +1105,7 @@ add_library(vllm STATIC
   src/vllm/platform/process.cpp
   src/vllm/platform/console_shutdown.cpp
   src/vllm/platforms/platform.cpp
+  src/vllm/platforms/cuda_arch_manifest.cpp
   src/vllm/platforms/cpu.cpp
   src/vllm/v1/attention/backend.cpp
   src/vllm/v1/attention/registry.cpp
@@ -1216,6 +1232,7 @@ add_library(vllm STATIC
   src/vt/dtype.cpp
   src/vt/backend.cpp
   src/vt/breakable_graph.cpp
+  src/vt/persistent_step_input.cpp
   src/vt/tensor.cpp
   src/vt/arena.cpp
   src/vt/op_provider.cpp
@@ -1712,9 +1729,18 @@ if(VLLM_CPP_CUDA)
     # different upstream arch set from the NVFP4 block-scaled collective (vLLM
     # keeps them as separate SCALED_MM_ARCHS / FP4_SM120_ARCHS intersections), so
     # it is resolved separately here rather than riding on the NVFP4 gate.
+    # cuda_matmul_fp8_block_cutlass.cu (#1189 M5) rides the SAME cell: it is the
+    # BLOCK-scaled (fine-grained 128x128) sibling of the per-tensor GEMM above,
+    # built from the same ArchTag=Sm120 family -- upstream keeps both in
+    # csrc/.../w8a8/cutlass/c3x behind one SCALED_MM_ARCHS intersection. It is a
+    # separate TU rather than a second kernel in the same file because the two
+    # share no template (dense layout tags vs cute::tuple<Layout, LayoutSF>), so
+    # one file would only serialise two heavy cutlass compiles.
     set(_FP8_CUTLASS_SOURCES)
     if(VT_CUTLASS_FP8_ARCHS)
-      set(_FP8_CUTLASS_SOURCES src/vt/cuda/cuda_matmul_fp8_cutlass.cu)
+      set(_FP8_CUTLASS_SOURCES
+        src/vt/cuda/cuda_matmul_fp8_cutlass.cu
+        src/vt/cuda/cuda_matmul_fp8_block_cutlass.cu)
     endif()
     target_sources(vllm PRIVATE
       ${_NVFP4_CUTLASS_SOURCES}
@@ -2267,6 +2293,11 @@ if(VLLM_CPP_CUDA)
       src/vt/cuda/cuda_flash_attn_fa2.cu
       ${_FA2_KERNEL_SRCS})
     vt_cuda_set_source_gencode("${VT_FA2_ARCHS}" ${_VT_FA2_SOURCES})
+    # THE MANIFEST, taken from the SAME argument that just became nvcc's
+    # -gencode options for these exact sources (issue #1357). Reaching this line
+    # is what "FA2 is compiled" means, and the architectures are the ones the
+    # compiler was handed -- not a second list that has to be kept honest.
+    string(REPLACE ";" "," VLLM_CPP_CUDA_FA2_COMPILED_ARCHS "${VT_FA2_ARCHS}")
     list(APPEND _VT_CUDA_FEATURE_SOURCES ${_VT_FA2_SOURCES})
   endif()
 
@@ -2296,6 +2327,32 @@ if(VLLM_CPP_SERVER)
   # third_party/httplib/httplib.h is reached as <httplib/httplib.h> (third_party
   # is already a SYSTEM include on the vllm target).
 endif()
+
+# ── BIT-ROT GUARD: the MiniMax-Music3 depth-stage A/B driver (#672, #1246) ────
+# `tools/bench/music3_depth_stage_ab.cpp` is the sole artifact behind spec §16.6's
+# 3.50x and its `f0cfeed6eee4f55d` fingerprint. Its own header argues, correctly,
+# that CI must never RUN it: it allocates 2.5 GB of weights, spends seconds per
+# round, and is a TWO-BUILD A/B that one target could not express anyway. None of
+# that is a reason for it to be UNCOMPILABLE — it reaches internal headers and
+# `LinearNoBias`, so the next signature change would rot the one file a reader
+# has to compile to reproduce the measurement, silently.
+#
+# So both arms are compiled and NOTHING is linked or registered as a test. An
+# OBJECT library builds the TU and discards it; `main` is never linked, so no
+# weight is ever allocated and the build stays byte-identical to what it was.
+# Two targets rather than one because the arms are `#if defined(MUSIC3_AFTER)`
+# alternatives and a single configuration would leave the other half unchecked.
+foreach(_music3_ab_arm before after)
+  add_library(vllm_music3_depth_stage_ab_${_music3_ab_arm} OBJECT
+    tools/bench/music3_depth_stage_ab.cpp)
+  target_include_directories(vllm_music3_depth_stage_ab_${_music3_ab_arm} PRIVATE
+    ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/src ${CMAKE_BINARY_DIR}/include)
+  target_include_directories(vllm_music3_depth_stage_ab_${_music3_ab_arm} SYSTEM PRIVATE
+    ${CMAKE_SOURCE_DIR}/third_party)
+  target_compile_features(vllm_music3_depth_stage_ab_${_music3_ab_arm} PRIVATE cxx_std_20)
+  vllm_cpp_set_warnings(vllm_music3_depth_stage_ab_${_music3_ab_arm})
+endforeach()
+target_compile_definitions(vllm_music3_depth_stage_ab_after PRIVATE MUSIC3_AFTER)
 
 # ── Packaged shared/static libvllm (M3.5 Task 3, library-first packaging) ─────
 # The static `vllm` core lib above stays as-is (tests + examples link it and
@@ -2383,3 +2440,25 @@ endif()
 if(VLLM_CPP_BUILD_EXAMPLES)
   add_subdirectory(examples)
 endif()
+
+# `vllm-cli`'s own reachability gate (#1135) runs the BINARY, so it needs the
+# binary built first. The dependency is declared HERE rather than in
+# tests/CMakeLists.txt because `add_subdirectory(tests)` runs before
+# `add_subdirectory(examples)`, so the `vllm-cli` target does not exist yet at
+# that point. The `$<TARGET_FILE:vllm-cli>` compile definition in tests/ is fine
+# there, because a generator expression is evaluated after every directory has
+# been processed. With examples off there is no `vllm-cli` target, no
+# `VLLM_CLI_BINARY` define, and the test EXITS 77 so CTest reports it Skipped
+# (see tests/vllm/entrypoints/test_cli_offload_config.cpp); this guard is the only
+# thing that has to know about the ordering.
+if(TARGET test_cli_offload_config AND TARGET vllm-cli)
+  add_dependencies(test_cli_offload_config vllm-cli)
+endif()
+
+# Render the compiled-arch manifest (issue #1357). Last, so it observes whatever
+# the FA2 gencode site above did or did not set. Generated per build into the
+# build tree, so it is not a shared file any pull request has to edit.
+configure_file(include/vllm/platforms/cuda_compiled_archs.h.in
+  include/vllm/platforms/cuda_compiled_archs.h @ONLY)
+message(STATUS
+  "CUDA FA2 compiled-arch manifest: [${VLLM_CPP_CUDA_FA2_COMPILED_ARCHS}]")

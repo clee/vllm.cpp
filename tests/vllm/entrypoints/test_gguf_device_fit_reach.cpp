@@ -28,6 +28,7 @@
 
 #include "support/test_env.h"
 #include "vllm/config/device.h"
+#include "vllm/config/weight_residency.h"
 #include "vllm/entrypoints/model_loader.h"
 #include "vllm/gguf_builder.h"
 #include "vllm/platforms/interface.h"
@@ -228,6 +229,58 @@ std::string BuildSyntheticMoeGgufWithExpertTower() {
   b.AddKv(U32Kv("qwen35moe.context_length", 256));
   b.AddKv(gguf_test::F32Kv("qwen35moe.rope.freq_base", 1000000.0F));
   b.AddKv(gguf_test::F32Kv("qwen35moe.attention.layer_norm_rms_epsilon", 1e-6F));
+  b.AddTensor("token_embd.weight", {64, 64}, /*ggml_type=*/0,
+              std::string(4096 * 4, '\0'));
+  std::string tower;
+  for (int i = 0; i < 8; ++i) tower += Q8BlockBytes();
+  b.AddTensor("blk.0.ffn_gate_exps.weight", {32, 2, 4}, /*ggml_type=*/8, tower);
+  return b.Build();
+}
+
+// ENG-EXPERT-STREAM-DEVICE W0d repair (#1124). A `deepseek4` GGUF carrying the
+// SAME `_exps.weight` suffix, and the same expert tower byte-for-byte, on an
+// architecture whose forward never reaches `KqExpertSlice`.
+//
+// `deepseek_v4_weights.cpp` writes `blk.<n>.ffn_{gate,up,down}_exps.weight`
+// exactly as the llama.cpp Qwen MoE export does, and `deepseek_v2.cpp` records at
+// its head that this family deliberately does NOT compose `RunMoeBlock` — so no
+// slot lane serves it, no arena is ever allocated for it, and every one of its
+// towers IS staged. A lane keyed on the suffix alone cannot tell this file from
+// the one above, which is the defect this case exists for: with the towers
+// dropped from the bound and an arena added that nothing builds, the #1123
+// refusal is replaced by the 26-minute-then-`cudaMalloc` death it was created to
+// eliminate.
+//
+// The KV set is the one `tests/vllm/models/test_deepseek_v4_gguf_load.cpp` builds,
+// reduced to the keys `DeepseekV4ParamsFromGguf` REQUIRES plus the two its
+// self-consistency checks read (`hyper_connection.count`, and
+// `attention.compress_ratios` of length >= `block_count`). It carries no
+// tokenizer, so the permitted arm dies at the same later step every other case in
+// this file uses as its positive control.
+std::string BuildSyntheticDeepseekV4GgufWithExpertTower() {
+  GgufModelBuilder b;
+  b.AddKv(StrKv("general.architecture", "deepseek4"));
+  const std::string p = "deepseek4.";
+  b.AddKv(U32Kv(p + "embedding_length", 64));
+  b.AddKv(U32Kv(p + "block_count", 2));
+  b.AddKv(U32Kv(p + "attention.head_count", 4));
+  b.AddKv(U32Kv(p + "attention.head_count_kv", 1));
+  b.AddKv(U32Kv(p + "attention.key_length", 16));
+  b.AddKv(U32Kv(p + "attention.q_lora_rank", 8));
+  b.AddKv(U32Kv(p + "attention.output_lora_rank", 8));
+  b.AddKv(U32Kv(p + "attention.output_group_count", 1));
+  b.AddKv(gguf_test::F32Kv(p + "rope.freq_base", 10000.0F));
+  b.AddKv(gguf_test::F32Kv(p + "attention.layer_norm_rms_epsilon", 1e-6F));
+  b.AddKv(U32Kv(p + "expert_count", 4));
+  b.AddKv(U32Kv(p + "expert_used_count", 2));
+  b.AddKv(U32Kv(p + "expert_shared_count", 1));
+  b.AddKv(U32Kv(p + "expert_feed_forward_length", 32));
+  b.AddKv(gguf_test::F32Kv(p + "swiglu_clamp", 10.0F));
+  b.AddKv(U32Kv(p + "hyper_connection.count", 2));
+  b.AddKv(gguf_test::I32ArrayKv(p + "attention.compress_ratios",
+                                std::vector<int32_t>{1, 1}));
+  // Byte-identical to the qwen35moe file above, so the two cases differ in the
+  // ARCHITECTURE and in nothing else the bound can see.
   b.AddTensor("token_embd.weight", {64, 64}, /*ggml_type=*/0,
               std::string(4096 * 4, '\0'));
   std::string tower;
@@ -465,4 +518,175 @@ TEST_CASE("device fit W0d: when the lane is on and it STILL does not fit, the me
   CHECK(message.find("the expert-stream lane IS active") != std::string::npos);
   CHECK(message.find(std::to_string(kExpertTowerStaged)) != std::string::npos);
   CHECK(message.find(std::to_string(kArenaBytes)) != std::string::npos);
+}
+
+TEST_CASE(
+    "device fit W0d: an architecture the slot lane never serves keeps the WHOLE "
+    "bound") {
+  // The case the first draft of W0d did not have, and the reason the lane grew an
+  // architecture term. Everything the loader could see was already identical to
+  // the permitted case above — a weight-staging platform, `host_addressable`
+  // true, `VT_MOE_EXPERT_STREAM=1` latched on, and a tensor whose name ends in
+  // `_exps.weight` — and the ONE thing that differs is the resolved
+  // architecture, which decides whether any slot lane exists to serve those
+  // towers. `DeepseekV4ForCausalLM`'s forward does not compose `RunMoeBlock`, so
+  // it never reaches `KqExpertSlice`, so its towers are staged in full.
+  //
+  // The direction matters. The two over-counts this bound already documents are
+  // conservative: they refuse a checkpoint that would have fitted, and the
+  // operator has `VT_DEVICE_WEIGHT_BUDGET_BYTES` to get past them. This one is
+  // not. Dropping 335.62 GiB of towers from the bound on a model that stages
+  // every one of them REMOVES a refusal that was correct, and what replaces it is
+  // the failure #1123 exists to prevent: a 26-minute load and then
+  // `cudaMalloc: out of memory` on the first forward.
+  RegisterFakeStagingPlatform();
+  Platform().host_addressable = true;
+  TempFile f(BuildSyntheticDeepseekV4GgufWithExpertTower());
+
+  // The SAME budget the qwen35moe case is let through on.
+  vllm_test::SetEnv("VT_DEVICE_WEIGHT_BUDGET_BYTES", std::to_string(kLaneOnBound + 1));
+  const std::string message = ThrownMessage(f.path(), vllm::Device::kNamedPlatform);
+  vllm_test::UnsetEnv("VT_DEVICE_WEIGHT_BUDGET_BYTES");
+  Platform().host_addressable = false;
+
+  REQUIRE_FALSE(message.empty());
+  CAPTURE(message);
+  CHECK(message.find("cannot serve this GGUF") != std::string::npos);
+  // The WHOLE table, expert tower included, and no lane note — the pre-W0d
+  // number, which is what every architecture that does not stream must still get.
+  CHECK(message.find(std::to_string(kLaneOffBound)) != std::string::npos);
+  CHECK(message.find("the expert-stream lane IS active") == std::string::npos);
+  // Not the tokenizer: the refusal fired first, which is the point of refusing at
+  // load. Asserting this rules out the reading in which the case passes because
+  // the deepseek4 config parse died before the check was reached at all.
+  CHECK(message.find("tokenizer") == std::string::npos);
+}
+
+// --- The budget as a CONFIG KEY (#1127), through the same loader --------------
+//
+// The cases above move the budget with `VT_DEVICE_WEIGHT_BUDGET_BYTES`. The three
+// below move it with `--offload-config`'s `vllm_cpp.device_fit.weight_budget_bytes`,
+// arriving as `EngineParams::weight_residency`. The first two set NO variable at
+// all; the third sets one DELIBERATELY, because its subject is the precedence
+// between the two inputs rather than the config tier on its own.
+//
+// This is the reachability half of #1127 and not a second unit test of the
+// resolver: `test_weight_residency_config` already builds the config by hand and
+// calls `ResolveDeviceWeightBudgetBytes`, which proves the rule and says nothing
+// about whether a document reaches it. The chain these cases traverse is
+// `parse_weight_residency_extension_json` -> `EngineParams::weight_residency` ->
+// `SetWeightResidencyConfig` (the install block at the top of `FromModelDir`) ->
+// `DeviceWeightBudgetBytes` (the fit check, later in the SAME call). Measured:
+// deleting the install call site in `LoadedEngine::FromModelDir`, and separately
+// deleting the delegation inside `DeviceWeightBudgetBytes`, each turn this suite
+// RED.
+//
+// The install and the fit check being in one function is what makes this
+// observable without a checkpoint: the install runs before any path or weight
+// operation, and the check runs before the tokenizer.
+
+TEST_CASE("device fit: the budget arrives as a CONFIG KEY, with no variable set") {
+  RegisterFakeStagingPlatform();
+  TempFile f(BuildSyntheticMoeGguf());
+  vllm::ResetWeightResidencyConfigForTesting();
+  vllm_test::UnsetEnv("VT_DEVICE_WEIGHT_BUDGET_BYTES");
+
+  vllm::entrypoints::EngineParams params;
+  params.device = vllm::Device::kNamedPlatform;
+  // Parsed from the SAME string the `--offload-config` flag carries, rather than
+  // assembled field by field: a case that set the struct member directly would
+  // still pass if the parser never learned the key.
+  params.weight_residency = vllm::parse_weight_residency_extension_json(
+      R"({"vllm_cpp":{"device_fit":{"weight_budget_bytes":8191}}})");
+  REQUIRE(params.weight_residency->device_weight_budget_bytes.has_value());
+
+  std::string message;
+  try {
+    (void)vllm::entrypoints::LoadedEngine::FromModelDir(f.path(), params);
+  } catch (const std::exception& e) {
+    message = e.what();
+  }
+  vllm::ResetWeightResidencyConfigForTesting();
+
+  REQUIRE_FALSE(message.empty());
+  CAPTURE(message);
+  // One byte under the footprint, exactly as the environment case is, so a
+  // comparison against the wrong quantity cannot pass by accident.
+  CHECK(message.find("cannot serve this GGUF") != std::string::npos);
+  CHECK(message.find(std::to_string(kStagedLowerBound)) != std::string::npos);
+  CHECK(message.find(std::to_string(kStagedLowerBound - 1)) != std::string::npos);
+  // The refusal names the config form as a way out, not only the variable, so an
+  // operator who set the budget with a document is told how to raise it with one.
+  CHECK(message.find("weight_budget_bytes") != std::string::npos);
+  CHECK(message.find("tokenizer") == std::string::npos);
+}
+
+TEST_CASE("device fit: a config budget of ZERO suppresses the refusal") {
+  RegisterFakeStagingPlatform();
+  TempFile f(BuildSyntheticMoeGguf());
+  vllm::ResetWeightResidencyConfigForTesting();
+  vllm_test::UnsetEnv("VT_DEVICE_WEIGHT_BUDGET_BYTES");
+
+  vllm::entrypoints::EngineParams params;
+  params.device = vllm::Device::kNamedPlatform;
+  // The platform's own probe is 0 in this fixture, so a budget of 0 is NOT what
+  // distinguishes this case from the default one. What it proves is that a
+  // configured zero reaches the check AS a zero rather than being dropped as a
+  // falsy value on the way, which is the one direction the merge and the resolver
+  // could each have got wrong. The positive control is the case above: the same
+  // file and platform refuse when the configured budget is 8191.
+  params.weight_residency = vllm::parse_weight_residency_extension_json(
+      R"({"vllm_cpp":{"device_fit":{"weight_budget_bytes":0}}})");
+
+  std::string message;
+  try {
+    (void)vllm::entrypoints::LoadedEngine::FromModelDir(f.path(), params);
+  } catch (const std::exception& e) {
+    message = e.what();
+  }
+  // Read what the loader installed BEFORE clearing it: this is the assertion that
+  // the document reached the process-global rather than being carried past it.
+  const vllm::WeightResidencyConfig installed =
+      vllm::ActiveWeightResidencyConfig();
+  vllm::ResetWeightResidencyConfigForTesting();
+
+  REQUIRE(installed.device_weight_budget_bytes.has_value());
+  CHECK(*installed.device_weight_budget_bytes == 0);
+
+  REQUIRE_FALSE(message.empty());
+  CAPTURE(message);
+  CHECK(message.find("cannot serve this GGUF") == std::string::npos);
+  // The LATER error, asserted positively: without it, "no refusal" would also be
+  // true of a load that died earlier for an unrelated reason.
+  CHECK(message.find("tokenizer: GGUF missing kv") != std::string::npos);
+}
+
+TEST_CASE("device fit: the VARIABLE beats the config key, through the loader") {
+  RegisterFakeStagingPlatform();
+  TempFile f(BuildSyntheticMoeGguf());
+  vllm::ResetWeightResidencyConfigForTesting();
+
+  vllm::entrypoints::EngineParams params;
+  params.device = vllm::Device::kNamedPlatform;
+  // The document suppresses the refusal; the variable puts a refusing budget
+  // back. The precedence exists so a benchmark arm is switchable without a
+  // restart, and this is that direction: the variable can turn a configured
+  // suppression back ON.
+  params.weight_residency = vllm::parse_weight_residency_extension_json(
+      R"({"vllm_cpp":{"device_fit":{"weight_budget_bytes":0}}})");
+  vllm_test::SetEnv("VT_DEVICE_WEIGHT_BUDGET_BYTES",
+                    std::to_string(kStagedLowerBound - 1));
+  std::string message;
+  try {
+    (void)vllm::entrypoints::LoadedEngine::FromModelDir(f.path(), params);
+  } catch (const std::exception& e) {
+    message = e.what();
+  }
+  vllm_test::UnsetEnv("VT_DEVICE_WEIGHT_BUDGET_BYTES");
+  vllm::ResetWeightResidencyConfigForTesting();
+
+  REQUIRE_FALSE(message.empty());
+  CAPTURE(message);
+  CHECK(message.find("cannot serve this GGUF") != std::string::npos);
+  CHECK(message.find(std::to_string(kStagedLowerBound - 1)) != std::string::npos);
 }

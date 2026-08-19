@@ -184,10 +184,40 @@ const uint8_t* SliceStart(const OwnedTensor& w, int64_t expert) {
   return w.bytes.data() + static_cast<size_t>(expert) * kN * kRowBytes;
 }
 
+// Every case below moves a PROCESS-GLOBAL, and an earlier revision of this file
+// put each one back on the case's last line. That restores it only on the path
+// that REACHES the last line: a doctest `REQUIRE` throws, doctest catches the
+// throw and runs the next case, and that next case then runs against the
+// previous case's platform. The failure would be reported against the wrong
+// case, which is the shape that makes a suite unreadable exactly when it has
+// something to say. These two guards restore on every exit path, and they
+// restore the PREVIOUS value rather than a hard-coded one, so nesting or
+// reordering cases cannot make a guard lie either.
+class HostAddressable {
+ public:
+  explicit HostAddressable(bool on) : prev_(Platform_().host_addressable) {
+    Platform_().host_addressable = on;
+  }
+  ~HostAddressable() { Platform_().host_addressable = prev_; }
+  HostAddressable(const HostAddressable&) = delete;
+  HostAddressable& operator=(const HostAddressable&) = delete;
+
+ private:
+  bool prev_;
+};
+
+class ForcedFallback {
+ public:
+  ForcedFallback() { vllm::detail::ExpertStreamSetForceFallback(true); }
+  ~ForcedFallback() { vllm::detail::ExpertStreamSetForceFallback(false); }
+  ForcedFallback(const ForcedFallback&) = delete;
+  ForcedFallback& operator=(const ForcedFallback&) = delete;
+};
+
 }  // namespace
 
 TEST_CASE("a host-addressable staging device takes the SLOT arm and stages nothing") {
-  Platform_().host_addressable = true;
+  const HostAddressable host_addressable(true);
   const OwnedTensor tower = MakeTower(/*tag=*/1);
   Queue q = XpuQueue();
   const int allocs_before = Fake().allocs;
@@ -240,15 +270,15 @@ TEST_CASE("the exhausted fallback reads the tower IN PLACE and still stages noth
   // budget makes it fit. If the exhausted branch staged the tower, a real
   // prefill would take that branch thousands of times and die exactly as #1123
   // did, while every "streaming works" gate stayed green.
-  Platform_().host_addressable = true;
+  const HostAddressable host_addressable(true);
   const OwnedTensor tower = MakeTower(/*tag=*/2);
   Queue q = XpuQueue();
 
-  vllm::detail::ExpertStreamSetForceFallback(true);
-  const Tensor t = vllm::detail::ExpertSliceForTest(q, tower, kN, kK,
-                                                    /*row_off=*/1 * kN,
-                                                    /*expert=*/1);
-  vllm::detail::ExpertStreamSetForceFallback(false);
+  const Tensor t = [&] {
+    const ForcedFallback forced;
+    return vllm::detail::ExpertSliceForTest(q, tower, kN, kK,
+                                           /*row_off=*/1 * kN, /*expert=*/1);
+  }();
 
   CHECK(tower.d_dev == nullptr);
   // The tower's OWN bytes, at the slice offset — the direct host view, which is
@@ -265,7 +295,7 @@ TEST_CASE("a device that CANNOT read host memory keeps staging the whole tower")
   // deliberately the pre-W0c behaviour: no slot arm, a full tower upload, and
   // therefore the #1123 load-time refusal still standing in front of it. W1/W2
   // are what remove it, not this branch.
-  Platform_().host_addressable = false;
+  const HostAddressable host_addressable(false);
   const OwnedTensor tower = MakeTower(/*tag=*/3);
   Queue q = XpuQueue();
   const int allocs_before = Fake().allocs;
@@ -284,8 +314,6 @@ TEST_CASE("a device that CANNOT read host memory keeps staging the whole tower")
   CHECK(t.data == static_cast<void*>(static_cast<uint8_t*>(tower.d_dev.get()) +
                                      static_cast<size_t>(3) * kN * kRowBytes));
   CHECK(std::memcmp(t.data, SliceStart(tower, 3), kSliceBytes) == 0);
-
-  Platform_().host_addressable = true;
 }
 
 TEST_CASE("a STREAMED tower that reaches device staging is refused BY NAME") {
@@ -294,7 +322,7 @@ TEST_CASE("a STREAMED tower that reaches device staging is refused BY NAME") {
   // fallback reads host bytes in place — and that is the point: the failure it
   // guards is silent until the allocator runs out, 48 towers and 16 layers
   // later. A guard nothing can reach is not a guard, so this reaches it.
-  Platform_().host_addressable = true;
+  const HostAddressable host_addressable(true);
   const OwnedTensor tower = MakeTower(/*tag=*/4);
   Queue q = XpuQueue();
 
@@ -320,7 +348,7 @@ TEST_CASE("an unclaimed tower still stages normally, so the refusal is not a bla
   // The negative control for the case above. A refusal that fired for every
   // tower would pass that case and break every model, so the same helper must
   // succeed on a tower the lane never touched.
-  Platform_().host_addressable = true;
+  const HostAddressable host_addressable(true);
   const OwnedTensor plain = MakeTower(/*tag=*/5);
   Queue q = XpuQueue();
 

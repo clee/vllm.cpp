@@ -121,7 +121,7 @@ struct GgufStagedFootprint {
   std::string largest_tensor_name;
   // W0d. How many tensors the lane took out of the sum, and how many bytes they
   // would otherwise have contributed. Both are 0 with the lane off. They are
-  // reported rather than merely subtracted because a caller that says "44.56 GiB"
+  // reported rather than merely subtracted because a caller that says "75.35 GiB"
   // without saying "and 335.62 GiB across 279 towers is served elsewhere" has not
   // said how many things it examined.
   size_t streamed_tensor_count = 0;
@@ -172,12 +172,22 @@ GgufStagedFootprint GgufStagedWeightFootprint(const GgufFile& gguf,
 //
 // `device_memory_total_bytes` is the platform's own probe
 // (`ResidencyPolicy::device_memory_total_bytes`), which is 0 on every platform
-// that does not probe one. `VT_DEVICE_WEIGHT_BUDGET_BYTES` overrides it, for an
-// operator whose pool is smaller than the probe reports because something else
-// lives in it, and for an operator who wants to attempt the load anyway. A
-// value of 0 in the environment means "unknown", i.e. disables the check, and
-// an unparseable value is ignored rather than treated as 0, because silently
-// disabling a guard on a typo is the failure shape this tree refuses.
+// that does not probe one. Two things override it, for an operator whose pool is
+// smaller than the probe reports because something else lives in it, and for an
+// operator who wants to attempt the load anyway:
+// `--offload-config '{"vllm_cpp":{"device_fit":{"weight_budget_bytes":N}}}'`, and
+// `VT_DEVICE_WEIGHT_BUDGET_BYTES`, which beats the config. A value of 0 from
+// either means "unknown", i.e. disables the check, and an unparseable
+// ENVIRONMENT value is ignored rather than treated as 0, because silently
+// disabling a guard on a typo is the failure shape this tree refuses; a
+// malformed CONFIG value cannot get this far, because the parser refuses it at
+// startup.
+//
+// THE RULE ITSELF LIVES IN `vllm/config/weight_residency.h`
+// (`ResolveDeviceWeightBudgetBytes`), and this function is a delegation to it
+// (issue #1127). That keeps one reader for the variable, which is what stops the
+// install-time override announcement from drifting away from what the resolver
+// does with the value.
 //
 // TOTAL rather than FREE on purpose: `free` at load time carries the page cache
 // and whatever else the box is doing, which would make the verdict a function
@@ -201,15 +211,40 @@ struct DeviceWeightFit {
 //
 // `lane` (W0d) changes only what `needed` COUNTS, never the shape of the test:
 // with the lane on, the towers it serves are not staged and its arena is, so
-// `needed` is the remainder plus the arena. On `Qwen3.8-2.4T-A95B UD-Q1_0` that
-// turns 369.96 GiB into 34.34 GiB of non-expert weights plus the arena — 18.55
-// GiB at the 8000 slots the row measures with — against a 119.631 GiB pool. The
-// documented over-count direction is unchanged and still includes the MTP block
+// `needed` is the remainder plus the arena.
+//
+// THE NUMBER THIS CHARGES, on `Qwen3.8-2.4T-A95B UD-Q1_0` at the 8000 slots the
+// row measures with, stated as what the code computes rather than as what the
+// store will settle on, because the two differ and the charged one is what
+// decides the load:
+//
+//   34.34 GiB non-expert remainder
+//   + 8000 x 5,505,024 B = 44,040,192,000 B = 41.02 GiB arena
+//   = 80,910,933,504 B = 75.35 GiB, against a 119.631 GiB pool.
+//
+// The arena term is `slots * ResolveExpertStreamSlotBytes(GgufLargestExpertSliceBytes(...))`,
+// and that function's own doc above says what its answer is on this checkpoint:
+// the largest `*_exps` slice in the FILE, which is an MTP `nextn`-block Q2_K
+// tower at 2,818,572,288 / 512 = 5,505,024 B, not the 2,490,368 B IQ1_XXXS slice
+// a default load actually streams. So the charged arena is 2.2105x the 18.55 GiB
+// `Qwen35ExpertStream::Reserve` will allocate, and the charged total is 75.35 GiB
+// where the resident total will be 52.89 GiB. That is the SAME over-count, in the
+// same safe direction, as the file-versus-load scope error the footprint doc
+// above names (issue #1136) — it can over-refuse, never under-refuse — and it is
+// written here as the charged figure because a reader deciding whether a
+// checkpoint fits reads this line and not the resolver.
+//
+// The over-count on the remainder is unchanged and still includes the MTP block
 // (issue #1136), which is the difference between that 34.34 GiB and the 26.01
 // GiB a default load actually stages.
 //
-// Keyed on the MEASURED condition, never on "CUDA + GGUF" and never on an
-// architecture name, so a GGUF that genuinely fits the pool still loads.
+// Keyed on the MEASURED condition, never on "CUDA + GGUF", so a GGUF that
+// genuinely fits the pool still loads. `lane` is the ONE architecture-dependent
+// input, and it is not resolved here: the loader fills it only for a model whose
+// factory declares `streams_routed_experts`, because the `_exps.weight` suffix is
+// written by MoE families this tree does not stream and dropping THEIR towers
+// would delete a correct refusal. This function still decides nothing from a
+// name; it is told, by the one caller that knows.
 // Strictly greater than: a checkpoint whose footprint exactly equals the budget is
 // not refused here. The footprint is approximate in both directions, so equality is
 // not evidence of anything, and the tie goes to attempting the load.
