@@ -996,24 +996,30 @@ DBuf DeviceLmHeadD(Dev d, const NemotronHHostWeights& host,
       ResidentIn<dense_nvfp4::MarlinDenseResident>(host.lm_head_marlin);
   // ★ A FALLBACK HERE IS A DEFECT, NOT A SLOWER ANSWER, so it refuses by name.
   //
-  // `DeviceLmHeadEligible` asked `MarlinW4A16Selects` and was told yes; if the
-  // dispatcher nevertheless takes its naive arm, the two have disagreed. The
-  // consequence is invisible to every value-based gate — the naive arm computes
-  // the SAME logits — and it costs a fresh upload of the whole [vocab, hidden]
-  // operand per step, because `LmHeadNvfp4View` hands out a stack temporary and
-  // `ResidentNvfp4` is keyed on the weight. The counter is the seam's own
-  // (`dense_nvfp4::MutableW4A16Stats().fallback_gemms`, bumped at the single
-  // fallback line), and `tests/vllm/models/test_nemotron_h_moe_device.cpp`
-  // proves on the CPU arm that it actually moves — an absent hook reads exactly
-  // like an armed one.
-  const uint64_t fb_before = dense_nvfp4::GetW4A16Stats().fallback_gemms;
-  DBuf out = dense_nvfp4::MatmulNvfp4W4A16D(d, gathered, nw, DType::kF32, &mr);
-  VT_CHECK(dense_nvfp4::GetW4A16Stats().fallback_gemms == fb_before,
-           "NemotronH device lm_head: the shared NVFP4 W4A16 dispatcher took its "
-           "redundant-dequant fallback although DeviceLmHeadEligible selected the "
-           "device arm — the two gates have disagreed, and the fallback re-uploads "
-           "the whole lm_head every step");
-  return out;
+  // `DeviceLmHeadEligible` asked `MarlinW4A16Selects` and was told yes. Asking
+  // the SAME predicate again on the operand actually about to be handed over is
+  // what catches an eligibility answer taken against a different dtype or a
+  // different queue. If it were ever false here the dispatcher would take its
+  // naive redundant-dequant arm, and the consequence is invisible to every
+  // value-based gate: that arm computes the SAME logits, while re-uploading
+  // 198.18 MB — the whole [131072, 2688] packed operand plus its group scales —
+  // on EVERY call, because `LmHeadNvfp4View` hands out a stack temporary and
+  // `ResidentNvfp4` caches on `w.d_packed`, a member of the weight it was given.
+  //
+  // The predicate and not the seam's `fallback_gemms` counter, deliberately.
+  // `MutableW4A16Stats()` is a plain non-atomic static shared by every consumer
+  // in the process, so a counter window would refuse a correct run whenever
+  // anything else took a fallback GEMM concurrently — a false refusal is worse
+  // than the silence it replaces. The counter is the right instrument in a test,
+  // where single-threadedness is a property of the harness, and that is where
+  // `tests/vllm/models/test_nemotron_h_moe_device.cpp` asserts it.
+  VT_CHECK(dense_nvfp4::MarlinW4A16Selects(d, gathered.dtype),
+           "NemotronH device lm_head: the shared NVFP4 W4A16 dispatcher would take "
+           "its redundant-dequant fallback on this queue and dtype although the "
+           "device arm was selected — the fallback re-uploads the whole lm_head on "
+           "every call, so this refuses rather than computing the right answer the "
+           "wrong way");
+  return dense_nvfp4::MatmulNvfp4W4A16D(d, gathered, nw, DType::kF32, &mr);
 #else
   (void)d;
   (void)host;

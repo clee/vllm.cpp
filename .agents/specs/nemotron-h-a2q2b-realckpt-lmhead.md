@@ -286,9 +286,15 @@ out a stack temporary that `ResidentNvfp4`'s weight-keyed cache can never hit.
 The repair is structural rather than a patched clause: the three clauses now
 live once, in `dense_nvfp4::MarlinW4A16Selects`, and both the dispatcher and
 the model call it, so they cannot drift. `DeviceLmHeadD` additionally refuses
-BY NAME if the seam's `fallback_gemms` counter moves across its own call, and
-the synthetic gate asserts the same counter — the counter is demonstrably armed
-rather than assumed, because `tests/vllm/models/test_qwen3_forward.cpp:497`
-already asserts on CPU that it reaches exactly `5 * num_hidden_layers` when the
-dispatcher does fall back. The behavioural red for this class needs CUDA and is
-PENDING with the rest.
+BY NAME if that same predicate is false on the operand it is about to hand over,
+which catches an eligibility answer taken against a different queue or dtype.
+Deliberately the PREDICATE and not the seam's `fallback_gemms` counter:
+`MutableW4A16Stats()` is a plain non-atomic process-wide static, so a counter
+window in production would refuse a correct run whenever anything else took a
+fallback GEMM concurrently, and a false refusal is worse than the silence it
+replaces. The counter is the right instrument in a test, where
+single-threadedness is a property of the harness, and the synthetic gate asserts
+it there. It is demonstrably armed rather than assumed, because
+`tests/vllm/models/test_qwen3_forward.cpp:497` already asserts on CPU that it
+reaches exactly `5 * num_hidden_layers` when the dispatcher does fall back. The
+behavioural red for this class needs CUDA and is PENDING with the rest.
