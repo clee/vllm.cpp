@@ -135,8 +135,8 @@ void PagedAttentionKernel(Queue&, Tensor& out, const Tensor& query, const Tensor
   // its own last element. That read is SILENT: it lands inside whatever the
   // scratch pool put next to the table, produces a plausible block index, and
   // attends to the wrong page. `tests/vllm/models/test_qwen3_5_decode_graph_seam.cpp`
-  // supplied exactly that for two years' worth of nothing, until a `DevicePool`
-  // change moved the neighbouring bytes and it became a SIGSEGV. One compare per
+  // supplied exactly that and read GREEN, until a `DevicePool` change moved the
+  // neighbouring bytes and the same read became a SIGSEGV. One compare per
   // request, outside the token loop, turns it into a refusal that names the
   // caller's mistake.
   const int64_t bt_cols = block_table.rank >= 2 ? block_table.shape[1] : 0;
