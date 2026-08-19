@@ -25059,13 +25059,25 @@ stays `PENDING`. Everything above is an internal two-arm number on one named box
 
 ## A2-D1 — NemotronH decodes on the single-step recurrent kernels (#1311)
 
-**Verdict: correctness ACCEPTED on sm_110 and IN QUESTION on sm_121a; speed
-REFUTED on sm_110.** The A3 gate reads `96/96 mode=decode STRICT PASS` on both
-legs of one binary on `thor:gpu0` (sm_110), and per-output-token moved +0.388%,
-under #1311's own 3% refutation bar. **`dgx:gpu0` (GB10, sm_121a) then read
-`95/96 DIVERGENCE` `RC=1` on the single-step leg**, and whether this change
-CAUSES that token is NOT yet established -- see the sm_121a section below. The
-recipe is `scripts/nemotron-h-a2d1-gpu-gate.sh`.
+**Verdict: this change is TOKEN-NEUTRAL on both gated hosts, and its SPEED
+hypothesis is REFUTED on both.** Measured as a same-binary A/B on `thor:gpu0`
+(sm_110) and `dgx:gpu0` (GB10, sm_121a); recipe
+`scripts/nemotron-h-a2d1-gpu-gate.sh`.
+
+| host | ON (single-step) | OFF (chunk scan) | per-token move | verdict |
+|---|---|---|---|---|
+| sm_110 | `96/96 STRICT PASS` | `96/96 STRICT PASS` | +0.388% (slower) | speed REFUTED |
+| sm_121a | `95/96 DIVERGENCE` | `95/96 DIVERGENCE` | -1.991% (faster) | speed REFUTED |
+
+**Each host returns the SAME token verdict on both arms**, which is what makes
+this change token-neutral: the arm that predates it diverges identically to the
+arm that replaces it. The sm_121a divergence is therefore NOT this row's and is
+filed as #1388 -- it is the "sm_121a re-run pending" `STATUS` has carried, and
+it fails on both arms.
+
+Both moves are under #1311's own 3% refutation bar, so the speed hypothesis is
+refuted on both hosts -- and note they point in OPPOSITE directions, which is
+itself evidence that neither is signal.
 
 This entry was first written before any GPU lease was obtained and said no
 number was claimed. It is superseded by the sections below rather than deleted,
@@ -25229,46 +25241,40 @@ trace of the DECODE WINDOW ONLY on both legs, attributing the 0.776 s/token.
 The counters say what the step stopped launching; the trace would say what the
 0.776 s is actually spent on. Peak host during the run was 44402 MiB.
 
-### sm_121a (GB10) — `95/96 DIVERGENCE`, ATTRIBUTION PENDING
+### sm_121a (GB10) — both arms diverge identically, so the row is CLEARED
 
 `dgx:gpu0` in an `rc` lease, `ARCH=121a`, tree `e35c14d52`, same checkpoint,
-`cutlass-fp8: ENABLED for [121a]` so the run is not VOID:
+`cutlass-fp8: ENABLED for [121a]` so the run is not VOID. Both legs of ONE
+binary:
 
-```
-RC[a3 on]=1
-[nemotron-h] engine loaded in 347.6s
-[nemotron-h] TOKEN MATCH: 95/96 over 3 prompt(s) (full rows=3, short rows=0, mode=decode)
-[nemotron-h] DIVERGENCE
-on: tokens compared 96 ; matched 95        reference-tier lines in on: 0
-on: GPU busy in 112 of 1013 DECODE samples = 11.06%
-on: decode window 145.340 s, engine load 347.6 s EXCLUDED
-on: per output token 1.513958 s (vLLM 0.014369 s; ratio 105.4x)
-```
+| | ON (single-step) | OFF (chunk scan) |
+|---|---|---|
+| `RC[a3]` | 1 | 1 |
+| TOKEN MATCH | `95/96 full rows=3 short rows=0 mode=decode` | `95/96 full rows=3 short rows=0 mode=decode` |
+| decode-step counters | `state_update_rows=23 chunk_scan_calls=0 conv_update_rows=23 conv_fwd_calls=0 gathers=0 scatters=0` | `state_update_rows=0 chunk_scan_calls=23 conv_update_rows=0 conv_fwd_calls=23 gathers=46 scatters=46` |
+| per output token | 1.513958 s | 1.544706 s |
+| GPU busy | 112 of 1013 = 11.06% | 120 of 1051 = 11.42% |
+| engine load, EXCLUDED | 347.6 s | 399.3 s |
+| `reference-tier` lines | 0 | 0 |
 
-The arm ran as designed — `state_update_rows=23 chunk_scan_calls=0
-conv_update_rows=23 conv_fwd_calls=0 gathers=0 scatters=0` on every one of the
-93 decode steps — so this is not a routing failure. **One token in 96 differs,
-and whether A2-D1 CAUSES it is not established.**
+The counters prove the two legs ran DIFFERENT kernels and both lost exactly one
+token in 96. **The pre-change arm diverges identically to the post-change arm,
+so A2-D1 does not cause it.** Filed as #1388, which is the sm_121a re-run
+`STATUS` has carried as pending; it fails on both arms and is arch- or
+host-specific, since sm_110 passes 96/96 on the same code and checkpoint.
 
-**The attribution is the OFF leg**, the chunk-scan arm on the same binary, box
-and checkpoint:
+**What is NOT established: whether both legs lose the SAME token.** The counts
+and row shape are identical, which is what supports "neutral", but the driver's
+`got:`/`exp:` ids were discarded by this script's own verdict grep and are not
+in the log. That was a defect in the recipe, found by needing it, and it is
+fixed on the branch so the next run captures them. Until then the claim is "one
+token in 96 on both arms", not "the same token" -- and a wrong recurrent carry
+and a benign bf16 near-tie are not yet separated.
 
-- OFF `96/96` ⇒ this change causes it, and the row does not land as written.
-- OFF `95/96` or worse ⇒ pre-existing on sm_121a and this change is neutral to
-  it, and it owes its own issue against GB10 rather than this row.
-
-**Prior GB10 trouble on this row makes the second branch plausible and does NOT
-establish it.** `docs/STATUS.md` carries "GB10 read 4/24; cause and fix #1157,
-sm_121a re-run pending", and A2-Q1's entry records a `93/96 DIVERGENCE` arm
-under #1290. A single divergent token out of 96 is exactly what a wrong
-recurrent carry and a benign bf16 near-tie both look like; only the A/B
-separates them, and reading the Thor pass across to GB10 would be the
-cross-silicon inference this record refuses everywhere else.
-
-**The per-token figure is 1.513958 s against Thor's 0.776159 s on the same
-arm**, and the decode busy fraction 11.06% against Thor's 43.96%. GB10 is about
-2x slower here. That is unexplained, is not this row's claim, and is recorded so
-it is not read as an A2-D1 result.
+**GB10 runs this arm about 2x SLOWER than Thor** — 1.513958 s/token against
+0.776159, at 11.06% decode busy against 43.96%. That is unexplained, is not
+this row's claim, and is recorded so it is not read as an A2-D1 result. Peak
+host 45043 MiB.
 
 ### Evidence
 

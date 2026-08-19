@@ -230,9 +230,10 @@ already produced one void number on this row.
   triage, not the GPU log.
 - **The A3 gate does not read `96/96 STRICT PASS` on ANY gated host → the swap
   is not accepted there, and a pass on a DIFFERENT host does not substitute.**
-  This condition is LIVE: sm_110 passes and sm_121a reads `95/96`. Two hosts
-  disagreeing is not a pass with an asterisk; it is an open correctness question
-  until the same-binary A/B on the failing host says which arm owns the token.
+  This condition FIRED on sm_121a and was DISCHARGED by the same-binary A/B: the
+  chunk-scan arm diverges identically, so the host owns the token and this row
+  does not (#1388). The discharge is the A/B, never the argument that the other
+  host passed.
 
 ### 6.1 The speed stop condition FIRED, and what it does and does not close
 
@@ -289,36 +290,46 @@ legs of one binary:
   quotes #1311's own bar — "Refuted if per-token time moves less than 3%" — and
   0.388% is under it. See §6.1.
 
-**★ The `dgx:gpu0` sm_121a leg then READ `95/96 DIVERGENCE` (`RC=1`), and the
-row is BLOCKED on attributing it.** The arm ran as designed there — the same
-`state_update_rows=23 chunk_scan_calls=0 gathers=0 scatters=0` on all 93 decode
-steps, `reference-tier lines: 0`, `cutlass-fp8: ENABLED for [121a]` — so it is
-not a routing failure and not a VOID run. Whether A2-D1 CAUSES that one token is
-NOT established: the chunk-scan OFF leg on the same binary, box and checkpoint
-is the attribution, and it is running.
+**★ The `dgx:gpu0` sm_121a leg then READ `95/96 DIVERGENCE` (`RC=1`) — AND SO
+DID ITS CHUNK-SCAN LEG, so this row is CLEARED.** Both legs of one binary on
+that box return `95/96 full rows=3 short rows=0 mode=decode`, with the counters
+confirming they ran different kernels (`state_update_rows=23 chunk_scan_calls=0
+gathers=0 scatters=0` against `0 / 23 / 46 / 46`). The arm that predates A2-D1
+diverges identically to the arm that replaces it, so **A2-D1 does not cause it**.
+Filed as [#1388](https://github.com/mudler/vllm.cpp/issues/1388) — the sm_121a
+re-run `STATUS` has carried as pending, failing on both arms, arch- or
+host-specific since sm_110 passes 96/96 on the same code.
 
-- OFF `96/96` ⇒ **this change causes it; the row does NOT land as written.**
-- OFF `95/96` or worse ⇒ pre-existing on sm_121a, this change neutral, and it
-  owes its own issue against GB10 rather than this row.
+**The per-host verdict, which is the acceptance statement:**
 
-Prior GB10 trouble on this row (`STATUS`: "GB10 read 4/24; cause and fix #1157",
-and A2-Q1's `93/96 DIVERGENCE` arm under #1290) makes the second branch
-plausible and does NOT establish it. §6 forbids reading the Thor pass across.
+| host | ON | OFF | per-token move |
+|---|---|---|---|
+| sm_110 | `96/96 STRICT PASS` | `96/96 STRICT PASS` | +0.388% slower |
+| sm_121a | `95/96 DIVERGENCE` | `95/96 DIVERGENCE` | -1.991% faster |
+
+Each host returns the SAME verdict on both arms ⇒ **token-neutral**. Both moves
+are under #1311's 3% bar ⇒ **speed refuted on both**, and they point in
+OPPOSITE directions, which is itself evidence neither is signal.
+
+**NOT established: whether both legs lose the SAME token.** The counts and row
+shape match, which is what supports "neutral", but the driver's `got:`/`exp:`
+ids were discarded by the gate script's own verdict grep. That was a recipe
+defect, found by needing it, and it is fixed so the next run captures them.
 
 ## Owed
 
-- **The `dgx:gpu0` sm_121a leg of T4.** The sm_110 leg is MET and its speed
-  result is a REFUTATION (§6.1); dgx was held by another session all session.
-  Owned by this row, tracked by
-  [#1311](https://github.com/mudler/vllm.cpp/issues/1311). NO vLLM ratio may be
-  quoted for arch 110: the 0.014369 s reference is GB10's.
-- **A repeated A/B (n >= 3 per leg) on an idle box**, because the sm_110 legs
-  saw an 18.8% spread in engine-load time and 0.388% is not separable from that.
+- **[#1388](https://github.com/mudler/vllm.cpp/issues/1388)** — GB10 sm_121a
+  loses one token in 96 on BOTH recurrent arms. Not this row's, and it owns the
+  next `dgx` lease: re-run the repaired gate and read the `got:`/`exp:` ids, so
+  a wrong carry and a benign bf16 near-tie are finally separated.
+- **A repeated A/B (n >= 3 per leg) on an idle box.** The sm_110 legs saw an
+  18.8% spread in engine-load time and the two hosts' deltas have opposite
+  signs; neither 0.388% nor 1.991% is separable from that at n=1.
 - **An `nsys` decode-window trace of both legs**, the next traceable step §6.1
-  names.
-- The batched decode arm (`nd > 1`) is written and unreachable while G-SAFE pins
-  `num_reqs <= 1`; A2-B owns lifting that, and the code is indexed rather than
-  hardcoded so the lift is a count change.
+  names. GB10 runs this arm ~2x slower than Thor (1.514 vs 0.776 s/token) and
+  that is unexplained.
+- **Concurrency > 1** is where `qwen3_5.cpp:4730-4746` says the gather/scatter
+  tax shows; G-SAFE pins `num_reqs <= 1`, so A2-B owns that regime.
 
 ## Outcome
 
