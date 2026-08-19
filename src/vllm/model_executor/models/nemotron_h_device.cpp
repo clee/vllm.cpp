@@ -2116,6 +2116,12 @@ ForwardLogits NemotronHPagedForward(const NemotronHHostWeights& host,
            "NemotronH paged forward: tie_word_embeddings is false in the "
            "released checkpoint and the tied arm is not ported");
 
+  // A2-D1 (#1311): a PER-FORWARD snapshot of the recurrent arm counters, so the
+  // diagnostic line at the end of this function reports THIS step rather than a
+  // running total. Taken unconditionally and costing two loads, because taking
+  // it under the diag guard would make the guard change what is measured.
+  const NemotronHMambaArmCounts arm_before = MambaArmCountsSlot();
+
   const int64_t H = params.hidden_size;
   const int64_t V = params.vocab_size;
   const int64_t L = params.num_hidden_layers();
@@ -2522,6 +2528,26 @@ ForwardLogits NemotronHPagedForward(const NemotronHHostWeights& host,
   // VT_LOGITS_GATHER=0 path and means "every row", which is also what the two
   // non-paged seams mean by it — so this branch serves both gather settings and
   // no runner step can escape the paged path on that flag.
+  if (NemotronHDiagEnabled()) {
+    // ★ WHICH RECURRENT KERNELS THIS STEP LAUNCHED. The two arms compute the
+    // same recurrence, so the tokens cannot tell them apart and only this line
+    // separates "the decode step stopped launching the chunk scan" from a claim
+    // about the source. Read as a DELTA over this forward.
+    const NemotronHMambaArmCounts& a = MambaArmCountsSlot();
+    std::fprintf(stderr,
+                 "[NH-DIAG] ARM step T=%lld nd=%lld np=%lld  state_update_rows=%lld "
+                 "chunk_scan_calls=%lld conv_update_rows=%lld conv_fwd_calls=%lld "
+                 "gathers=%lld scatters=%lld\n",
+                 static_cast<long long>(T),
+                 static_cast<long long>(input.gdn_meta.num_decodes),
+                 static_cast<long long>(input.gdn_meta.num_prefills),
+                 static_cast<long long>(a.state_update_rows - arm_before.state_update_rows),
+                 static_cast<long long>(a.chunk_scan_calls - arm_before.chunk_scan_calls),
+                 static_cast<long long>(a.conv_update_rows - arm_before.conv_update_rows),
+                 static_cast<long long>(a.conv_fwd_calls - arm_before.conv_fwd_calls),
+                 static_cast<long long>(a.state_gathers - arm_before.state_gathers),
+                 static_cast<long long>(a.state_scatters - arm_before.state_scatters));
+  }
   std::vector<int64_t> want;
   if (input.logits_indices.empty()) {
     want.resize(static_cast<size_t>(T));
