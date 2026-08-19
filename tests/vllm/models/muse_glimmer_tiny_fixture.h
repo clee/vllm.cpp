@@ -34,7 +34,15 @@
 namespace muse_glimmer_tiny {
 
 constexpr int64_t kVocab = 32, kHidden = 8, kInter = 12, kTextLayers = 2;
-constexpr int64_t kHeads = 2, kKvHeads = 1, kHeadDim = 4;
+// `kHeadDim` is 8 rather than the 4 this fixture carried while it lived inside
+// the wiring test. A head size must be a multiple of 8 for FLASH_ATTN to accept
+// it (`FlashAttentionBackend::supports_head_size`, the port of
+// `flash_attn.py:170-178` that landed with #1344), and the tower-skip gate drives
+// a real `LoadedEngine::FromModelDir`, so it has to pick an attention backend
+// where the wiring gate never did. At 4 the engine refuses with "No valid
+// attention backend ... {FLASH_ATTN: [head_size not supported]}" — the rule is
+// upstream's and correct; the synthetic geometry was what had to move.
+constexpr int64_t kHeads = 2, kKvHeads = 1, kHeadDim = 8;
 constexpr int64_t kVHidden = 4, kVHeads = 1, kVLayers = 2, kVInter = 8;
 constexpr int64_t kPatch = 2, kPatchT = 2, kMerge = 2, kPosGrid = 4;
 constexpr int64_t kOutputDim = kVHidden * kMerge * kMerge;  // 16
