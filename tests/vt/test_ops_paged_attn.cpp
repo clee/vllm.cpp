@@ -629,14 +629,18 @@ TEST_CASE("paged_attention validates shapes/args") {
         vt::PagedAttention(qq, tp, tq, tkc, tvc, tbt, tsl, tqsl, bad),
         std::runtime_error);
   }
-  // #1390: A BLOCK TABLE THAT CANNOT ADDRESS seq_lens IS AN OUT-OF-BOUNDS READ,
-  // not a wrong number. `tbt` is one column at block_size 2, so it addresses
+  // #1390 / #1394: A BLOCK TABLE THAT CANNOT ADDRESS `seq_lens` IS AN
+  // OUT-OF-BOUNDS READ, not a wrong number, and the refusal that stops it had
+  // no test of its own. `tbt` is one column at block_size 2, so it addresses
   // positions 0..1; seq_len 3 makes the kernel read `block_table[0, 1]`, one
   // int32 past the row, and multiply that byte pattern by the cache's block
-  // stride. On `main` that read returned 0 when the case ran alone and
-  // 1021459670 when another case had run first -- a SIGSEGV whose only
-  // difference was the heap. Both arms of the bound are asserted, because the
-  // device arm is the only one a CUDA caller gets.
+  // stride. Measured at `5f68e60df`: that read returned 0 when the crashing
+  // case ran alone and 1021459670 when one earlier case in its file had run
+  // first, so the same source faulted at 0x533fbc625590 in the natural suite
+  // order and looked correct in isolation. The bound is asserted HERE, at
+  // `vt::PagedAttention`, rather than against any one kernel, because six
+  // backends register `OpId::kPagedAttention` and this call is what every
+  // caller writes.
   {
     Tensor tq = F32(q, {1, 2, D}), tp = F32(out, {1, 2, D});
     std::vector<int32_t> sl_over = {3};  // needs 2 columns, the table has 1
@@ -644,24 +648,19 @@ TEST_CASE("paged_attention validates shapes/args") {
     CHECK_THROWS_AS(vt::PagedAttention(qq, tp, tq, tkc, tvc, tbt, tsl_over, tqsl,
                                        PagedAttentionArgs{1.0f, true}),
                     std::runtime_error);
-    // The host-known upper bound is refused on its own, which is what a caller
-    // whose seq_lens live on a device gets.
-    PagedAttentionArgs over{1.0f, true};
-    over.max_seq_len = 3;
-    CHECK_THROWS_AS(vt::PagedAttention(qq, tp, tq, tkc, tvc, tbt, tsl, tqsl, over),
-                    std::runtime_error);
     // And a batch that FITS still runs: seq_len 2 == 1 column x block_size 2.
+    // Without this line the case above is satisfied by a refusal that refuses
+    // everything.
     std::vector<int32_t> sl_fit = {2};
     Tensor tsl_fit = I32(sl_fit, {1});
-    PagedAttentionArgs fits{1.0f, true};
-    fits.max_seq_len = 2;
-    CHECK_NOTHROW(
-        vt::PagedAttention(qq, tp, tq, tkc, tvc, tbt, tsl_fit, tqsl, fits));
+    CHECK_NOTHROW(vt::PagedAttention(qq, tp, tq, tkc, tvc, tbt, tsl_fit, tqsl,
+                                     PagedAttentionArgs{1.0f, true}));
   }
   // A PADDED ROW IS NOT A CALLER MISTAKE. Request 1 carries no query tokens, so
-  // no kernel reads its seq_lens entry and its over-long context addresses
-  // nothing. Refusing on it would reject a batch that runs correctly today
-  // (#1394 measured this).
+  // no kernel reads its `seq_lens` entry and its over-long context addresses
+  // nothing. A bound that read every row would reject a batch that runs
+  // correctly today, which is #1394's second measurement and the reason its
+  // refusal skips a row the token loop never visits.
   {
     Tensor tq = F32(q, {1, 2, D}), tp = F32(out, {1, 2, D});
     std::vector<int32_t> bt2 = {0, 0}, sl2 = {1, 99}, qsl2 = {0, 1, 1};
