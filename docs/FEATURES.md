@@ -79,7 +79,7 @@ are our reading of their documented behavior, not measurements.
 | GPTQ | ◐ CPU dequant | ✅ | ✅ | ☐ |
 | MXFP4 compressed-tensors | ◐ W4A16 Marlin, mem 2.63x less. gate_up FUSION + decode-graph default-ON; #44 3/3, 32B 6/6. **`VT_MARLIN_DENSE` DEFAULT-ON** (`KERNEL-MARLIN-DENSE-EXEC`): dense marlin 48-CTA, byte-faithful, beats MoE (c8 0.969) | ✅ | ✅ | ☐ |
 | fp8 weights, per-tensor scale | ✅ | ✅ | ✅ | ☐ |
-| Block-wise (fine-grained 128x128) FP8, the `weight_scale_inv` layout | ◐ RUNS on CPU, refuses on CUDA (#1189 M4/M6): 10 projections as 7 GEMMs, `gate_up` + QKV merged, mainloop scales. No CUDA kernel (M5), no token gate ([spec](../.agents/specs/model-fp8-block-merged.md)) | ✅ | ✅ | ☐ |
+| Block-wise (fine-grained 128x128) FP8, the `weight_scale_inv` layout | ◐ RUNS on CPU (#1189 M4/M6): 10 projections as 7 GEMMs, `gate_up`+QKV merged, mainloop scales. CUDA arm BUILD-VERIFIED ONLY, never executed, no token gate ([spec](../.agents/specs/vt-matmul-fp8-block-cuda.md)) | ✅ | ✅ | ☐ |
 | Per-tensor FP8 W8A8 linear is a shared seam any model can bind | ✅ `models/dense_fp8_gemm.h` + `layers::Fp8W8A8LinearMethod` (#940), bound via `layers::MakeLinearMethod`. One definition, CUDA only ([spec](../.agents/specs/vt-fp8-shared-seam.md)) | ✅ `Fp8LinearMethod` | ✅ | ☐ |
 | FP8 W8A8 works on a CUDA arch without `cutlass-fp8` | ✅ `vt::QuantFp8Static` registers from an unconditional TU (#960); sm_110 measured ([spec](../.agents/specs/vt-fp8-quant-arch-gate.md)) | ✅ | ✅ | ☐ |
 | fp8-tower GDN `in_proj` emits bf16, unlocking packed GDN decode | ◐ `VT_GDN_FP8_IN_BF16` + `VT_GDN_PACKED_DECODE_FP8_TOWER` (inert alone), both default **OFF**, ungated (#339) ([spec](../.agents/specs/perf-fp8-alpha-fold.md)) | ✅ bf16 `out_dtype` | ☐ | ☐ |
@@ -115,7 +115,7 @@ speed-pending, which [BENCHMARKS.md](BENCHMARKS.md) tracks.
 <!-- supported-arch-table:begin -->
 | Architecture | Tested checkpoint(s) | Correctness gate | Speed vs reference |
 |---|---|---|---|
-| `Qwen3_5ForConditionalGeneration` | Qwen3.6-27B NVFP4 (`unsloth` @`890bdef7`, `nvidia` @`0893e160`); Qwen3.5-4B BF16; **Qwen3.8-27B BF16** @`1d4bf0f2` | 27B strict 235/235 text + 32/32 image/video; 4B cached 3/3; Qwen3.8-27B 4/7 strict, 3 exact fp32 ties in band (#915) | `unsloth` 27B at/above vLLM, ModelOpt 0.85x; 4B 1.021x; 3.8-27B c4 **0.963x**, c1/c8 withheld (#931). Loads BF16/per-tensor FP8/NVFP4 (CT + ModelOpt); `modelopt_mixed` FP8 tower NATIVE (#164), GDN qkvz merged. CUDA/CPU |
+| `Qwen3_5ForConditionalGeneration` | Qwen3.6-27B NVFP4 (`unsloth` @`890bdef7`, `nvidia` @`0893e160`); Qwen3.5-4B BF16; **Qwen3.8-27B BF16** @`1d4bf0f2` | 27B strict 235/235 text + 32/32 image/video; 4B cached 3/3; Qwen3.8-27B 4/7 strict, 3 exact fp32 ties in band (#915) | `unsloth` 27B at/above vLLM, ModelOpt 0.85x; 4B 1.021x; 3.8-27B c4 **0.963x**, c1/c8 absolutes (#915). Loads BF16/per-tensor FP8/NVFP4 (CT+ModelOpt); `modelopt_mixed` FP8 tower NATIVE (#164), GDN qkvz merged. CUDA/CPU |
 | `Qwen3_5MoeForConditionalGeneration` | Qwen3.6-35B-A3B (NVFP4 text; published BF16 text + vision tower) | NVFP4 strict 315/315 vs vLLM 0.25.0; published BF16 6/7 prompts strict 16/16 vs the pin, 7th an exact tie (#910). Image/video IMPLEMENTED, NOT GATED (#891): the tower loads and runs, mm gate OWED | gate model: 0.93x to 1.03x grid; NO BF16 or mm speed claim |
 | `Qwen3_5ForCausalLM`, `Qwen3_5MoeForCausalLM` | none: no text-only Qwen3.5 checkpoint fits this hardware | **NO RUN GATE, OWED.** Gated on `test_qwen3_8_text_only.cpp`; NO token claim. Loader reads stacked BF16 experts (#740) plus BF16 towers, shared expert and `lm_head` (#864), so both published indices satisfy the load plan | not measured |
 | `Qwen3ForCausalLM` | Qwen3 dense 0.6B/1.7B/4B/32B, NVFP4A16 | near-tie strict 16/16 vs vLLM 0.25.0 | c1 every-axis parity, c8 decode residual |
@@ -306,7 +306,7 @@ Build with `-DVLLM_CPP_VULKAN=ON`; off by default.
 | LoRA adapters | ☐ CPU brick only | ✅ | ✅ | ✅ |
 | Embedding / pooling endpoints | ◐ `/v1/embeddings` live (task=embed; score/rerank/classify pending) | ✅ | ✅ | ✅ |
 | OpenAI video generation `/v1/videos` (Sora shape) | ✅ `model`/`size`/`seconds` aliases + `GET /{id}/content`; `input_reference` and `metadata` references condition the render; `--video-family` pins the family (default DETECT), `--video-extra K=V` carries family knobs | ◐ (vllm-omni, its own request shape) | ☐ | ☐ |
-| OpenAI speech generation `/v1/audio/speech` (createSpeech shape) | ◐ route + ABI live, opt-in behind `--speech-model`; `lyrics` + `description` are extra named fields for a music family; `voice`, `speed`, streaming and non-`wav` refused by name | ◐ (vllm-omni) | ☐ | ☐ |
+| OpenAI speech generation `/v1/audio/speech` (createSpeech shape) | ◐ route + ABI live, opt-in behind `--speech-model`; `lyrics` + `description` are extra named fields for a music family; 20 unsupported keys refused by name; every key read at the top level and under `extra_params` | ◐ (vllm-omni) | ☐ | ☐ |
 | Flat C ABI for embedding in other languages | ✅ versioned | ☐ | ☐ | ✅ |
 
 #### C-ABI capability coverage <!-- abi-capability-table:begin -->
@@ -358,6 +358,7 @@ CPU elementwise GEMM (f32/f16/bf16) runs AVX2 and AVX-512 tiers on x86 where the
 | LTX-2.5 arms a request CAN reach | Refused by name at the call site | The spatiotemporal latent upsampler (both flags set). Supplying that checkpoint names that arm, not the temporal one. The temporal-only x2 arm is ported, not refused |
 | LTX-2.5 resolution | Off-grid sizes refused, naming the offending axis and a size you can actually pass; frames still round | `--width`/`--height` must divide 64 (two-stage) or 32 (one-stage), from the VAE factor times the phase downscale ([#919](https://github.com/mudler/vllm.cpp/issues/919)). `--frames` rounds to `8k + 1`. No size cap |
 | LTX-2.5 arms nothing can request | Declared, not requestable | `int8-convrot` (ComfyUI-only), single-node multi-GPU, `BetaScheduler` (upstream selects no scheduler either). No flag or extra asks for these. `multishot` was RETIRED (absent upstream) and `kLoraFusion` too (now served) |
+| Qwen3.8-27B quantized arms (Q4_K_M GGUF, its `clip` mmproj, the `unsloth` "NVFP4") | Spec'd, not implemented | BF16 is gated (#915); these are not. Nothing here accepts a second `clip` GGUF file, and the "NVFP4" artifact is `mixed-precision` with zero `input_scale` tensors. [spec](../.agents/specs/qwen38-27b-quant-arms.md) |
 | Multi-GPU execution | Hardware-blocked | TP proven equal to tp=1 on CPU; no 2-GPU box to run it |
 | LoRA end to end | CPU brick landed | Unwired standalone; not usable through the server |
 | Multimodal over HTTP | Image request path wired; forward + codec pending | `ROAD-V1-MM` W1-W3 landed. Open: no mm-forward on `Request.mm_features`; no image codec. Video/audio/multi-image now **refuse** with HTTP 400 rather than drop ([#686](https://github.com/mudler/vllm.cpp/issues/686)) |

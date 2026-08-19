@@ -28,10 +28,12 @@
 #include "vllm/model_executor/model_loader/safetensors_reader.h"
 #include "vllm/model_executor/models/deepseek_v4.h"  // deepseek4 GGUF dispatch arm
 #include "vllm/model_executor/models/muse_glimmer_gguf_weights.h"  // muse-glimmer GGUF arm
+#include "vllm/model_executor/models/nemotron_h.h"  // the OWED nemotron_h* GGUF refusal (#809)
 #include "vllm/model_executor/models/qwen3_5_gguf_weights.h"
 #include "vllm/model_executor/models/qwen3_5_mtp.h"  // SPEC-MTP I5d-pre draft load
 #include "vllm/model_executor/models/qwen3_5_common.h"  // SPEC-MTP I5d KV widening
 #include "vllm/model_executor/models/qwen3_dflash.h"  // SPEC-DFLASH D5 draft load
+#include "vllm/transformers_utils/hf_cache.h"  // ENG-HF-MODEL-DOWNLOAD (#1280)
 #include "vllm/transformers_utils/hf_config.h"  // SPEC-DFLASH D5 draft config
 #include "vllm/platforms/interface.h"  // CurrentPlatform() — SelectQueue
 #include "vllm/v1/core/kv_cache_utils.h"  // check_enough_kv_cache_memory (M4)
@@ -277,29 +279,21 @@ bool IsDflashGgufDraft(const std::string& path) {
 }
 
 std::string ResolveDflashDraftDir(const std::string& path) {
-  std::error_code ec;
-  if (IsDflashGgufDraft(path)) return path;
-  if (fs::exists(fs::path(path) / "config.json", ec)) return path;
-  // HF repo id -> local cache snapshot.
-  std::string slug = "models--";
-  for (char c : path) slug.push_back(c == '/' ? '-' : c);
-  // "z-lab/Qwen3.6-27B-DFlash" -> "models--z-lab--Qwen3.6-27B-DFlash" (each '/'
-  // becomes '--'): the single replace above turned '/' into one '-', so redo it
-  // as the HF two-dash convention.
-  slug.clear();
-  slug = "models--";
-  for (size_t i = 0; i < path.size(); ++i) {
-    if (path[i] == '/') slug += "--";
-    else slug.push_back(path[i]);
-  }
+  // ENG-HF-MODEL-DOWNLOAD W2 (#1280): this used to carry its own copy of the
+  // HuggingFace cache walk. The walk now lives in
+  // vllm::transformers_utils::ResolveCachedSnapshotDir, so the tree holds ONE
+  // implementation of it.
+  //
+  // The cache root stays $HOME/.cache/huggingface/hub, which is what this path
+  // has always read, rather than HfHubCacheDir(). This move is a relocation and
+  // must not change what a DFlash run resolves; a container that sets HF_HOME
+  // would otherwise start resolving a different directory as a side effect. The
+  // migration onto HfHubCacheDir() is listed under `## Owed` in
+  // .agents/specs/hf-model-download.md.
   const char* home = std::getenv("HOME");
-  if (home == nullptr) return path;
-  fs::path snaps = fs::path(home) / ".cache/huggingface/hub" / slug / "snapshots";
-  if (!fs::is_directory(snaps, ec)) return path;
-  std::string best;
-  for (const auto& e : fs::directory_iterator(snaps, ec))
-    if (fs::exists(e.path() / "config.json", ec)) best = e.path().string();
-  return best.empty() ? path : best;
+  const fs::path hub_dir =
+      home == nullptr ? fs::path() : fs::path(home) / ".cache/huggingface/hub";
+  return vllm::transformers_utils::ResolveCachedSnapshotDir(path, hub_dir);
 }
 
 // Read a named BF16 tensor from safetensors shards into a host OwnedTensor
@@ -328,30 +322,6 @@ vllm::OwnedTensor LoadNamedBf16(const std::vector<vllm::SafetensorsFile>& shards
     }
   }
   return vllm::OwnedTensor{};
-}
-
-// Build the DFlash draft HfConfig from the draft config.json (the real nested
-// {block_size, dflash_config:{mask_token_id,target_layer_ids}, layer_types,...}).
-// Mirrors the D3 parity harness MakeConfig; kept manual (not LoadHfConfig) so the
-// DFlashDraftModel architecture / nested dflash_config parse deterministically.
-vllm::HfConfig MakeDflashDraftConfig(const nlohmann::json& c) {
-  vllm::HfConfig cfg;
-  cfg.hidden_size = c.at("hidden_size").get<int64_t>();
-  cfg.num_attention_heads = c.at("num_attention_heads").get<int64_t>();
-  cfg.num_key_value_heads = c.at("num_key_value_heads").get<int64_t>();
-  cfg.head_dim = c.at("head_dim").get<int64_t>();
-  cfg.rotary_dim = cfg.head_dim;
-  cfg.rope_theta = c.at("rope_theta").get<double>();
-  cfg.intermediate_size = c.at("intermediate_size").get<int64_t>();
-  cfg.vocab_size = c.at("vocab_size").get<int64_t>();
-  cfg.num_hidden_layers = c.at("num_hidden_layers").get<int64_t>();
-  cfg.rms_norm_eps = c.at("rms_norm_eps").get<double>();
-  cfg.sliding_window = c.at("sliding_window").get<int64_t>();
-  cfg.layer_types = c.at("layer_types").get<std::vector<std::string>>();
-  cfg.raw = nlohmann::json::object();
-  cfg.raw["dflash_config"] = c.at("dflash_config");
-  cfg.raw["block_size"] = c.at("block_size");
-  return cfg;
 }
 
 // SPEC-DFLASH-GGUF B1: WHERE the draft's SHARED bf16 embed_tokens + lm_head
@@ -448,6 +418,95 @@ vllm::HfConfig MakeDsparkDraftConfig(const nlohmann::json& c) {
   }
   cfg.raw["dflash_config"] = dflash_config;
   return cfg;
+}
+
+// SPEC-DFLASH2 W1 (#1314): the draft's declared architectures, read off its own
+// config.json, or an EMPTY list when there is nothing to read. A `.gguf` draft
+// (ResolveDflashDraftDir hands back the file itself) and an uncached HF repo id
+// both land there, and both already have their own precise error further down the
+// load; classifying them here would replace "draft checkpoint not found" with a
+// classification failure. An absent or malformed `architectures` key is the same
+// case: this engine does not classify on the ABSENCE of evidence.
+std::vector<std::string> ReadDflashDraftArchitectures(const std::string& path) {
+  std::vector<std::string> architectures;
+  std::error_code ec;
+  const fs::path cfg = fs::path(ResolveDflashDraftDir(path)) / "config.json";
+  if (!fs::exists(cfg, ec)) return architectures;
+  std::ifstream f(cfg.string());
+  nlohmann::json doc;
+  try {
+    f >> doc;
+  } catch (const nlohmann::json::exception&) {
+    return architectures;  // LoadDflashDraft parses it again and reports this
+  }
+  if (!doc.is_object()) return architectures;
+  if (doc.contains("architectures") && doc.at("architectures").is_array()) {
+    for (const nlohmann::json& a : doc.at("architectures")) {
+      if (a.is_string()) architectures.push_back(a.get<std::string>());
+    }
+  }
+  return architectures;
+}
+
+// Refuse a DFlash2 draft BY NAME, before any weight is read.
+//
+// Upstream selects a different model class and a different speculator on the
+// `DFlash2DraftModel` architecture (registry.py:628 and
+// v1/worker/gpu/spec_decode/__init__.py:12-17 @ vllm-project/vllm#52816 head
+// `19c9351904df4c63042671bc67a866ca48dc7d6f`). This engine selects the draft lane
+// from the CLI method string alone, and a DFlash2 checkpoint's tensor set is
+// DFlash1's PLUS the conv and selector tensors -- so it loads through the DFlash1
+// loader with nothing missing and nothing thrown, and drafts with both new
+// mechanisms simply absent. That draft proposes worse tokens, the verify is
+// lossless, so the emitted tokens are still the target's and only acceptance
+// falls. AGENTS.md requires an unimplemented arm to refuse with the missing part
+// named rather than to degrade in silence, and this refusal is what SPEC-DFLASH2
+// W1 ships.
+void RefuseDflash2Draft(const std::string& draft_model_path) {
+  // WHAT IDENTIFIED THE FILE, which differs by container and is quoted back to
+  // the user because the two arms are otherwise indistinguishable in a message.
+  std::string identity;
+  const std::string resolved = ResolveDflashDraftDir(draft_model_path);
+  if (IsDflashGgufDraft(resolved)) {
+    // The GGUF arm. A GGUF carries no `architectures` array, and the published
+    // DFlash2 drafter declares `general.architecture = "dflash"` -- the SAME
+    // string a DFlash1 drafter writes -- so the architecture cannot separate
+    // them and the file would load through the DFlash1 lane. The discriminator
+    // is the DFlash2-only metadata (`IsDflash2Gguf`). A file this cannot open or
+    // parse is not classified: `LoadDflashDraft` opens it again and owns that
+    // error.
+    std::string matched;
+    try {
+      const vllm::GgufFile g = vllm::GgufFile::Open(resolved);
+      if (!vllm::IsDflash2Gguf(g, &matched)) return;
+    } catch (const std::exception&) {
+      return;
+    }
+    identity = "carries the DFlash2-only metadata key \"" + matched + "\"";
+  } else {
+    const std::vector<std::string> architectures =
+        ReadDflashDraftArchitectures(draft_model_path);
+    if (!vllm::SpeculativeConfig::IsDflash2Draft(architectures)) return;
+    identity = "declares architecture \"DFlash2DraftModel\"";
+  }
+  throw std::invalid_argument(
+      "speculative-config: the draft checkpoint at \"" + draft_model_path +
+      "\" " + identity +
+      ", and the DFlash2 draft lane "
+      "is not implemented here. Two mechanisms are missing: the grouped dynamic "
+      "depthwise convolution wrapped around each attention and each MLP sublayer, "
+      "and the candidate selector that replaces the per-slot argmax with a scored "
+      "path walk over the target head's top-K "
+      "(vllm/model_executor/models/qwen3_dflash2.py and "
+      "vllm/v1/worker/gpu/spec_decode/dflash2/speculator.py @ "
+      "vllm-project/vllm#52816 head 19c9351904df4c63042671bc67a866ca48dc7d6f). "
+      "Loading it through the DFlash1 lane instead would succeed, because a "
+      "DFlash2 checkpoint carries DFlash1's whole tensor set, and it would draft "
+      "worse tokens with no visible symptom: the verify is lossless, so the "
+      "emitted tokens are still the target's and only acceptance falls. Owed by "
+      "row SPEC-DFLASH2 (.agents/specs/dflash2-spec-decode.md), issue #1314 "
+      "(https://github.com/mudler/vllm.cpp/issues/1314). Use a DFlashDraftModel "
+      "checkpoint until that row lands.");
 }
 
 // SPEC-DSPARK-QWEN3-ROUTING (#1193): the two keys upstream classifies a DSpark
@@ -694,7 +753,7 @@ std::unique_ptr<DflashDraft> LoadDflashDraft(
     std::ifstream cf((fs::path(draft_dir) / "config.json").string());
     nlohmann::json cj;
     cf >> cj;
-    draft->config = MakeDflashDraftConfig(cj);
+    draft->config = vllm::MakeQwen3DFlashDraftConfig(cj);
     num_taps = static_cast<int64_t>(
         cj.at("dflash_config").at("target_layer_ids").size());
     mask_id = cj.at("dflash_config").at("mask_token_id").get<int32_t>();
@@ -785,23 +844,79 @@ std::unique_ptr<vllm::v1::kv_offload::KVConnector> BuildKvConnector(
   return KVConnectorFactory::Create(ctx);
 }
 
-// Top-level GGUF architecture dispatch: `general.architecture` selects the
-// family's HfConfig builder. The qwen35/qwen35moe/qwen3next keys go to
-// HfConfigFromGguf; a `deepseek4` file goes to DeepseekV4HfConfigFromGguf (which
-// maps it onto the registered DeepseekV4ForCausalLM). Additive by construction —
-// a new GGUF-loadable arch adds ONE arm here and owns its config builder in its
-// own TU. Everything downstream (Resolve -> tokenizer -> Load) is arch-agnostic.
-HfConfig HfConfigFromGgufDispatch(const vllm::GgufFile& gguf) {
-  const vllm::GgufValue* arch = gguf.FindKv("general.architecture");
-  if (arch != nullptr && arch->TypeId() == vllm::kGgufString &&
-      std::get<std::string>(arch->v) == "deepseek4") {
-    return vllm::DeepseekV4HfConfigFromGguf(gguf);
+// The GGUF architectures this build dispatches, keyed by llama.cpp's
+// `general.architecture`, in the order they are tried. ONE table rather than a
+// ladder plus a hand-written list: the refusal below names the supported set by
+// READING this, so an added arm cannot drift from what a user is told it can
+// load. Additive by construction — a new GGUF-loadable arch adds ONE row here
+// and owns its config builder in its own TU. Everything downstream
+// (Resolve -> tokenizer -> Load) is arch-agnostic.
+//
+//  * `deepseek4` -> DeepseekV4HfConfigFromGguf, which maps it onto the
+//    registered DeepseekV4ForCausalLM.
+//  * `muse-glimmer` -> the k-quant arm whose config builder recovers the query
+//    pre-scale from the folded attn_q_norm and the iRoPE mask from
+//    sliding_window_pattern (muse_glimmer_gguf_weights.h).
+//  * the three qwen3_5 keys -> HfConfigFromGguf, which owns all three itself
+//    (qwen3_5_gguf_weights.cpp).
+struct GgufArchArm {
+  const char* arch;
+  HfConfig (*build)(const vllm::GgufFile&);
+};
+
+constexpr GgufArchArm kGgufArchArms[] = {
+    {"deepseek4", &vllm::DeepseekV4HfConfigFromGguf},
+    {vllm::kMuseGlimmerGgufArch, &vllm::MuseGlimmerHfConfigFromGguf},
+    {"qwen35", &vllm::HfConfigFromGguf},
+    {"qwen35moe", &vllm::HfConfigFromGguf},
+    {"qwen3next", &vllm::HfConfigFromGguf},
+};
+
+std::string SupportedGgufArchitectures() {
+  std::string list;
+  for (const GgufArchArm& arm : kGgufArchArms) {
+    if (!list.empty()) list += ", ";
+    list += arm.arch;
   }
-  // The Muse Glimmer k-quant arm; its config builder recovers the query
-  // pre-scale from the folded attn_q_norm and the iRoPE mask from
-  // sliding_window_pattern (muse_glimmer_gguf_weights.h).
-  if (vllm::IsMuseGlimmerGguf(gguf)) return vllm::MuseGlimmerHfConfigFromGguf(gguf);
-  return vllm::HfConfigFromGguf(gguf);
+  return list;
+}
+
+// Top-level GGUF architecture dispatch: `general.architecture` selects the
+// family's HfConfig builder.
+//
+// The default is EXPLICIT and refuses by name. It used to fall through to
+// `vllm::HfConfigFromGguf`, which is qwen3_5's builder and hard-asserts its own
+// three keys — so every unsupported architecture, `nemotron_h_moe` included,
+// died with "qwen3_5 gguf: unexpected architecture", naming a model that has
+// nothing to do with the file the user passed and sending the reader into an
+// unrelated translation unit (#809). A refusal that names the wrong model is
+// worse than none.
+HfConfig HfConfigFromGgufDispatch(const vllm::GgufFile& gguf) {
+  const vllm::GgufValue* arch_kv = gguf.FindKv("general.architecture");
+  if (arch_kv == nullptr || arch_kv->TypeId() != vllm::kGgufString) {
+    throw std::runtime_error(
+        "GGUF: this file carries no string `general.architecture` key, so no "
+        "architecture can be selected. GGUF architectures supported by this "
+        "build: " +
+        SupportedGgufArchitectures());
+  }
+  const std::string arch = std::get<std::string>(arch_kv->v);
+  for (const GgufArchArm& arm : kGgufArchArms) {
+    if (arch == arm.arch) return arm.build(gguf);
+  }
+  // KNOWN architectures whose GGUF arm is OWED, not absent. Each refuses with
+  // the message its OWN model writes, so the reader lands in the translation
+  // unit that owes the work and on the spec section that tracks it. Without
+  // this the arm below would refuse them as merely unrecognized, which
+  // understates them: the file IS one this project knows.
+  if (vllm::IsNemotronHGguf(gguf)) {
+    throw std::runtime_error(vllm::NemotronHGgufRefusal());
+  }
+  throw std::runtime_error(
+      "GGUF architecture '" + arch +
+      "' is not supported by this build. GGUF architectures supported by this "
+      "build: " +
+      SupportedGgufArchitectures());
 }
 
 }  // namespace
@@ -983,6 +1098,16 @@ std::optional<vllm::SpeculativeConfig> LoadedEngine::ResolveSpecConfig(
       throw std::invalid_argument(
           "speculative-config: method \"dflash\" requires num_speculative_tokens "
           "(the draft block_size, e.g. 16)");
+    }
+    // SPEC-DFLASH2 W1 (#1314): classify the draft by its OWN config.json before
+    // resolving anything else, exactly as SPEC-DSPARK-QWEN3-ROUTING does for
+    // DSpark below. Upstream reads the architecture off the draft config too
+    // (v1/worker/gpu/spec_decode/__init__.py:12 @ the PR head); this engine read
+    // nothing, so a DFlash2 checkpoint drafted through the DFlash1 lane by
+    // OMISSION rather than by decision. This is the production caller
+    // `SpeculativeConfig::IsDflash2Draft` would otherwise lack.
+    if (cli.draft_model_path.has_value()) {
+      RefuseDflash2Draft(*cli.draft_model_path);
     }
     vllm::SpeculativeConfig cfg =
         vllm::SpeculativeConfig::ResolveDflash(*cli.num_speculative_tokens);
@@ -1672,6 +1797,24 @@ std::unique_ptr<LoadedEngine> LoadedEngine::FromModelDir(
                            : std::optional{named_platform->device_type()});
   }
   const fs::path dir(model_dir);
+
+  // SPEC-DFLASH2 W1 (#1314): classify a DFlash draft here, BEFORE any path,
+  // config, tokenizer or weight I/O, for the same reason
+  // SPEC-DSPARK-BLOCK-SIZE-GUARD resolves the DSpark config up front further
+  // down: the dflash draft load below runs BEFORE the LoadedEngine constructor
+  // reaches ResolveSpecConfig and resolves from the CLI config directly, so
+  // without this the constructor's refusal would arrive after the draft
+  // checkpoint had already been read through the DFlash1 loader. Both target
+  // containers pass through this line, and the `.gguf` branch immediately below
+  // returns before the later one. This is a REFUSAL and not a second resolution:
+  // it calls the same `RefuseDflash2Draft` the constructor's `ResolveSpecConfig`
+  // calls and decides nothing else, so the classification keeps one owner and
+  // one message.
+  if (params.speculative_config.has_value() &&
+      params.speculative_config->method == "dflash" &&
+      params.speculative_config->draft_model_path.has_value()) {
+    RefuseDflash2Draft(*params.speculative_config->draft_model_path);
+  }
 
   // A single `.gguf` file: config + weights + tokenizer all come from the
   // GGUF (M0.10). The engine stack below is unchanged.

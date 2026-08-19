@@ -63,6 +63,9 @@ vllm_cpp_add_test(test_plugin_system
   vllm/plugins/test_plugin_system.cpp
   vllm/plugins/toy_model_plugin.cpp)
 vllm_cpp_add_test(test_hf_config vllm/test_hf_config.cpp)
+# ENG-HF-MODEL-DOWNLOAD W2 (#1280): the HuggingFace cache layout. No socket,
+# so it is not behind VLLM_CPP_SERVER; the fake-hub half is, below.
+vllm_cpp_add_test(test_hf_cache vllm/transformers_utils/test_hf_cache.cpp)
 vllm_cpp_add_test(test_safetensors vllm/test_safetensors.cpp)
 vllm_cpp_add_test(test_load_direct_upload vllm/test_load_direct_upload.cpp)
 vllm_cpp_add_test(test_gguf vllm/test_gguf.cpp)
@@ -387,6 +390,8 @@ vllm_cpp_add_test(test_video_api vllm/entrypoints/openai/test_video_api.cpp)
 vllm_cpp_add_test(test_speech_api vllm/entrypoints/openai/test_speech_api.cpp)
 target_include_directories(test_model_registry PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_platform vllm/platforms/test_platform.cpp)
+vllm_cpp_add_test(test_cuda_arch_manifest
+  vllm/platforms/test_cuda_arch_manifest.cpp)
 vllm_cpp_add_test(test_device_selection
   vllm/entrypoints/test_device_selection.cpp)
 # ENG-EXPERT-STREAM #1123: the load-time GGUF device-fit refusal, in two targets
@@ -426,6 +431,17 @@ vllm_cpp_add_test(test_linear_method vllm/model_executor/layers/test_linear_meth
 target_include_directories(test_linear_method PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_qwen3_break_point vllm/models/test_qwen3_break_point.cpp)
 vllm_cpp_add_test(test_qwen3_decode_graph_seam vllm/models/test_qwen3_decode_graph_seam.cpp)
+vllm_cpp_add_test(test_qwen3_moe_decode_graph_seam vllm/models/test_qwen3_moe_decode_graph_seam.cpp)
+vllm_cpp_add_test(test_voxtral_decode_graph_seam vllm/models/test_voxtral_decode_graph_seam.cpp)
+vllm_cpp_add_test(test_deepseek_v2_decode_graph_seam vllm/models/test_deepseek_v2_decode_graph_seam.cpp)
+vllm_cpp_add_test(test_qwen3_5_decode_graph_seam vllm/models/test_qwen3_5_decode_graph_seam.cpp)
+# W6 (#1374): the dispatch counters live under src/, beside the runner (:561).
+target_include_directories(test_qwen3_5_decode_graph_seam PRIVATE ${CMAKE_SOURCE_DIR}/src)
+vllm_cpp_add_test(test_qwen3_dflash_decode_graph_seam vllm/models/test_qwen3_dflash_decode_graph_seam.cpp)
+# G1 for the row: bit-exactness against eager over THREE replays, on a real
+# device. Inert without a CUDA backend (every case skips), because a CPU
+# "replay" recomputes nothing.
+vllm_cpp_add_test(test_decode_graph_seam_g1_cuda vllm/models/test_decode_graph_seam_g1_cuda.cpp)
 vllm_cpp_add_test(test_decode_graph_sizes vllm/models/test_decode_graph_sizes.cpp)
 vllm_cpp_add_test(test_qwen35_paged_forward vllm/models/test_qwen35_paged_forward.cpp)
 # GDN-MOE-BF16-OUT (#1168): the MoE forward's GDN output-activation dtype probe
@@ -1156,6 +1172,12 @@ vllm_cpp_add_test(test_speculative_dspark vllm/config/test_speculative_dspark.cp
 # DeepSeek-V4 DSpark lane by name, instead of trusting the CLI method string.
 vllm_cpp_add_test(test_dspark_draft_routing
   vllm/entrypoints/test_dspark_draft_routing.cpp)
+# SPEC-DFLASH2 W1 (#1314): REACHABILITY of the DFlash2 refusal — the loader
+# reads the draft's own config.json and refuses `DFlash2DraftModel` by name,
+# instead of drafting it through the DFlash1 lane with the grouped convolution
+# and the candidate selector silently absent.
+vllm_cpp_add_test(test_dflash2_draft_routing
+  vllm/entrypoints/test_dflash2_draft_routing.cpp)
 # #1160: `--speculative-config` key ADMISSION — an unknown or misspelled key is
 # refused by name, and an upstream key this engine does not implement is refused
 # with the missing part named, instead of being silently dropped.
@@ -1249,6 +1271,8 @@ vllm_cpp_add_test(test_runner vllm/v1/worker/test_runner.cpp)
 target_include_directories(test_runner PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_common_attn_metadata vllm/v1/attention/test_common_attn_metadata.cpp)
 vllm_cpp_add_test(test_attn_backend_registry vllm/v1/attention/test_attn_backend_registry.cpp)
+vllm_cpp_add_test(test_attn_validate_configuration
+  vllm/v1/attention/test_attn_validate_configuration.cpp)
 vllm_cpp_add_test(test_attention_window vllm/model_executor/layers/attention/test_attention.cpp)
 vllm_cpp_add_test(test_chunked_local_attention
   vllm/v1/attention/test_chunked_local_attention.cpp)
@@ -1265,6 +1289,10 @@ vllm_cpp_add_test(test_mtp_speculator vllm/v1/spec_decode/test_mtp_speculator.cp
 # SPEC-MTP-K-GT-1 (#81): MTP speculation DEPTH through the production loader —
 # the configured k reaches the propose path, or is refused by name.
 vllm_cpp_add_test(test_mtp_depth vllm/v1/spec_decode/test_mtp_depth.cpp)
+# ENG-CUDAGRAPH-BREAK W6 (#1374): the graph-eligibility predicate and its
+# counters live under src/, beside the runner that computes them, exactly as
+# test_cudagraph_dispatch reads them (:561).
+target_include_directories(test_mtp_depth PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_rejection_sampler vllm/v1/spec_decode/test_rejection_sampler.cpp)
 vllm_cpp_add_test(test_prepare_prefill_inputs vllm/v1/spec_decode/test_prepare_prefill_inputs.cpp)
 # SPEC-MTP-K-GT-1 (#81): the draft-DECODE half of the autoregressive propose —
@@ -1272,6 +1300,10 @@ vllm_cpp_add_test(test_prepare_prefill_inputs vllm/v1/spec_decode/test_prepare_p
 vllm_cpp_add_test(test_prepare_decode_inputs vllm/v1/spec_decode/test_prepare_decode_inputs.cpp)
 vllm_cpp_add_test(test_dflash_kvprep vllm/v1/spec_decode/test_dflash_kvprep.cpp)
 target_include_directories(test_dflash_kvprep PRIVATE ${CMAKE_SOURCE_DIR}/src)
+# SPEC-DFLASH2 W1 (#1314): the DFlash causality rule — the port of vLLM's
+# tests/v1/spec_decode/test_dflash_causality.py as edited by vllm#52816, plus the
+# assertion that a DFlash1 checkpoint's resolution is unchanged.
+vllm_cpp_add_test(test_dflash_causality vllm/v1/spec_decode/test_dflash_causality.cpp)
 vllm_cpp_add_test(test_dflash_propose vllm/v1/spec_decode/test_dflash_propose.cpp)
 target_include_directories(test_dflash_propose PRIVATE ${CMAKE_SOURCE_DIR}/src)
 # SPEC-NGRAM (ROAD-V1-D3) — the draft-free n-gram matcher unit gate (ports
@@ -1302,6 +1334,11 @@ vllm_cpp_add_test(test_async_llm vllm/v1/test_async_llm.cpp)
 vllm_cpp_add_test(test_llm_engine vllm/v1/test_llm_engine.cpp)
 vllm_cpp_add_test(test_loaded_engine_dense vllm/entrypoints/test_loaded_engine_dense.cpp)
 vllm_cpp_add_test(test_dspark_block_size_guard vllm/entrypoints/test_dspark_block_size_guard.cpp)
+# ENG-HF-MODEL-DOWNLOAD W2 (#1280): the HuggingFace cache walk entered through
+# the production loader, with a repository identifier rather than a path. The
+# transformers_utils suite calls the function directly and cannot see a deleted
+# call site; this one can. Named `dflash` so `ctest -R "dflash|dspark"` runs it.
+vllm_cpp_add_test(test_dflash_draft_hf_cache vllm/entrypoints/test_dflash_draft_hf_cache.cpp)
 vllm_cpp_add_test(test_beam_search vllm/entrypoints/test_beam_search.cpp)
 # ROAD-V1-MM serving W1: OpenAI multimodal content-part parse + decode + route
 # to the existing single-sequence mm processors (CPU, no model weights). Reuses
@@ -1434,6 +1471,10 @@ target_compile_definitions(test_chat_template PRIVATE
   VLLM_TEST_FIXTURES_DIR="${CMAKE_SOURCE_DIR}/tests/fixtures")
 # The HTTP api_server smoke test needs the vendored cpp-httplib (gated).
 if(VLLM_CPP_SERVER)
+  # ENG-HF-MODEL-DOWNLOAD W2 (#1280): the hub protocol against an in-process fake
+  # hub. It starts a REAL cpp-httplib server on an ephemeral port, so it shares
+  # api_server.cpp's gate and the RUN_SERIAL treatment two rows below.
+  vllm_cpp_add_test(test_hf_hub vllm/transformers_utils/test_hf_hub.cpp)
   vllm_cpp_add_test(test_openai_api_server vllm/entrypoints/openai/test_api_server.cpp)
   # /v1/audio/transcriptions dispatch + socket smoke run against the REAL
   # library transcription seam on the committed parakeet_e2e fixture
@@ -1457,7 +1498,7 @@ if(VLLM_CPP_SERVER)
   # parallel suite is deterministic. (A shared RESOURCE_LOCK would only serialize
   # these two against each other, not against the CPU-hog tests that actually
   # cause the starvation.)
-  set_tests_properties(test_openai_api_server test_openai_conformance
+  set_tests_properties(test_openai_api_server test_openai_conformance test_hf_hub
     PROPERTIES RUN_SERIAL ON)
   # SERVE-RECIPE-ARGS (#606): the accepted-and-inert serve-argument seam. It
   # drives the REAL VllmServerMain (owned by the library behind the same
@@ -1694,6 +1735,47 @@ target_include_directories(test_cuda_quant_dot PRIVATE ${CMAKE_SOURCE_DIR}/src)
 # domain. Reaches src/ for the tier header and the threadpool test hook.
 vllm_cpp_add_test(test_ops_matmul_elem vt/test_ops_matmul_elem.cpp)
 target_include_directories(test_ops_matmul_elem PRIVATE ${CMAKE_SOURCE_DIR}/src)
+# LTX25-TEXT-LINEAR-MEM (#1286): the seam's ALLOCATION bound, on both
+# `MatmulOneChunk` instantiations. Every other GEMM gate here asserts values or
+# byte equality, so a kernel that allocated a whole intermediate per worker
+# would pass all of them. It counts bytes REQUESTED through replaced global
+# `operator new` overloads, not peak RSS -- the peak-RSS draft read zero at
+# every geometry while passing every bound, because glibc retains the arena
+# (spec `## Outcome` W4).
+#
+# Registered only on Linux, and NOT because of /proc or the threadpool: the
+# counter reads nothing under /proc and the pool is portable. It is that the
+# replaced allocation functions serve the WHOLE PROGRAM, so the gate depends on
+# every `delete` in the binary reaching the matching replaced `delete`, and on
+# its fixed slack term being calibrated against the library doing the
+# allocating. Both hold for glibc/libstdc++ and are unestablished elsewhere; a
+# standard library linked as its own runtime keeps its own `operator new`, and
+# the mismatch is a heap corruption rather than a red assertion. Compiling it
+# elsewhere with a skip would print `Status: SUCCESS!` over `assertions: 0`,
+# which reads as a pass. Extending the lanes is owed, not a one-line change.
+# Reaches src/ for the threadpool test hook, which is what lets one process
+# sweep the worker count.
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  vllm_cpp_add_test(test_ops_matmul_mem vt/test_ops_matmul_mem.cpp)
+  target_include_directories(test_ops_matmul_mem PRIVATE ${CMAKE_SOURCE_DIR}/src)
+  # The C allocator is counted through the LINKER, not through a symbol
+  # definition. `--wrap` redirects the calls made by the objects in this link --
+  # which includes libvllm.a, and so cpu_ops.cpp -- while leaving `malloc` itself
+  # defined by whoever normally defines it. Defining `malloc` in the test would
+  # instead be a second strong definition beside AddressSanitizer's own
+  # interceptor, which is what would break the sanitize-cpu lane. Scoped to this
+  # one target, so nothing else in the suite is affected.
+  #
+  # These flags are LOAD-BEARING, not an optimization: the test references
+  # `__real_malloc` directly, so dropping one fails the LINK rather than quietly
+  # costing the gate its malloc coverage. Verified by mutation (M-W).
+  target_link_options(test_ops_matmul_mem PRIVATE
+    -Wl,--wrap=malloc
+    -Wl,--wrap=calloc
+    -Wl,--wrap=realloc
+    -Wl,--wrap=aligned_alloc
+    -Wl,--wrap=posix_memalign)
+endif()
 # CPU-tier contract for the env-gated cuBLASLt GEMM algo-selection diagnostic
 # helpers. Reaches the internal header under src/ (not public API); the cuBLASLt
 # emit it gates is CUDA-only and lives in src/vt/cuda/cuda_matmul.cu.
@@ -1771,6 +1853,7 @@ target_include_directories(test_gdn_prefill_conv PRIVATE ${CMAKE_SOURCE_DIR}/src
 # graph stays valid — the fix for the 35B c2+ online-serving illegal-memory-access.
 # The device proof is the DGX serving harness; this pins the never-free guarantee.
 vllm_cpp_add_test(test_breakable_graph vt/test_breakable_graph.cpp)
+vllm_cpp_add_test(test_persistent_step_input vt/test_persistent_step_input.cpp)
 vllm_cpp_add_test(test_graph_safe_scratch vt/test_graph_safe_scratch.cpp)
 target_include_directories(test_graph_safe_scratch PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_graph_dedup vt/test_graph_dedup.cpp)
@@ -1781,6 +1864,43 @@ target_include_directories(test_graph_dedup PRIVATE ${CMAKE_SOURCE_DIR}/src)
 # by NO test on any tier; the latch defect hid in exactly that gap.
 vllm_cpp_add_test(test_graph_dedup_runtime vt/test_graph_dedup_runtime.cpp)
 target_include_directories(test_graph_dedup_runtime PRIVATE ${CMAKE_SOURCE_DIR}/src)
+# ENG-CUDAGRAPH-DEDUP / #1226: the coarse-key knob itself. vt::GraphDedupCoarseKeyEnabled
+# caches its answer in a function-local static -- deliberately, because the drivers
+# capture lazily and a knob that moved between two captures would give one model a mixed
+# set of handles -- so ONE PROCESS CAN OBSERVE ONE VALUE. Proving that "1" enables the
+# coarse key and "10" does not therefore takes one process per value, which is what these
+# entries are. Without them the accessor's only coverage was a single unset-variable
+# CHECK_FALSE, which two mutations survived: accepting any non-null value, and reading a
+# completely different variable name.
+vllm_cpp_add_test(test_graph_dedup_coarse_env vt/test_graph_dedup_coarse_env.cpp)
+target_include_directories(test_graph_dedup_coarse_env PRIVATE ${CMAKE_SOURCE_DIR}/src)
+function(vllm_cpp_add_coarse_key_case suffix value expect)
+  add_test(NAME test_graph_dedup_coarse_env_${suffix}
+    COMMAND test_graph_dedup_coarse_env)
+  set_tests_properties(test_graph_dedup_coarse_env_${suffix} PROPERTIES
+    ENVIRONMENT "VT_CUDA_GRAPH_DEDUP_COARSE_KEY=${value};VT_COARSE_KEY_EXPECT=${expect}"
+    SKIP_RETURN_CODE 77)
+endfunction()
+# The one value that turns it on. This entry is what proves the accessor reads THIS
+# variable: a mutation that reads any other name leaves it unset and fails here.
+vllm_cpp_add_coarse_key_case(on "1" 1)
+# ...and the near misses, each of which enables the key under a `value != nullptr` test.
+# "10" is a hand-edited "1" plus a stray keystroke, and it turning a default-off
+# correctness-sensitive path on by accident is the failure the polarity exists to stop.
+vllm_cpp_add_coarse_key_case(off_zero "0" 0)
+vllm_cpp_add_coarse_key_case(off_ten "10" 0)
+vllm_cpp_add_coarse_key_case(off_oh_one "01" 0)
+vllm_cpp_add_coarse_key_case(off_one_x "1x" 0)
+vllm_cpp_add_coarse_key_case(off_true "true" 0)
+vllm_cpp_add_coarse_key_case(off_empty "" 0)
+# The knob is DEFINED but the OTHER knob is the one set. The two are separate variables
+# and the coarse key must not piggyback on VT_CUDA_GRAPH_DEDUP: a run that asked only for
+# dedup must get the exact key the 2026-08-18 device gate ran, or the A/B is not one.
+add_test(NAME test_graph_dedup_coarse_env_off_sibling_knob
+  COMMAND test_graph_dedup_coarse_env)
+set_tests_properties(test_graph_dedup_coarse_env_off_sibling_knob PROPERTIES
+  ENVIRONMENT "VT_CUDA_GRAPH_DEDUP=1;VT_COARSE_KEY_EXPECT=0"
+  SKIP_RETURN_CODE 77)
 # CPU threadpool (QUANT-GGUF-CPU-THREADPOOL): barrier/park-wake/chunk-steal
 # stress + the n_threads 1/3/20 determinism battery. Reaches the internal
 # header under src/ (the pool is not public API).
@@ -1831,6 +1951,23 @@ vllm_cpp_add_test(test_ops_quant_fp8_group_cpu vt/test_ops_quant_fp8_group_cpu.c
 # against. Its G4 holds the constraint the row exists for: the scales apply in
 # the MAINLOOP, once per K-block, which an epilogue-folded alpha cannot express.
 vllm_cpp_add_test(test_ops_matmul_fp8_block_cpu vt/test_ops_matmul_fp8_block_cpu.cpp)
+# VT-MATMUL-FP8-BLOCK-CUDA (#1189 M5): the HOST-SIDE contract of the same op's
+# CUDA arm — the tile-config heuristic, the refusal predicate, the two scale
+# layouts cutlass DEDUCES from the problem shape, and the dispatch counter. Runs
+# on every machine including one with no GPU and no CUDA toolkit, which is the
+# whole point: those four are the parts of an sm_12xa-only kernel that can be
+# wrong in a way a successful compile cannot see. Reaches the internal header
+# under src/ (not public API), exactly like its test_fp8_plan_cache neighbour.
+vllm_cpp_add_test(test_fp8_block_scaled_dispatch vt/test_fp8_block_scaled_dispatch.cpp)
+target_include_directories(test_fp8_block_scaled_dispatch PRIVATE ${CMAKE_SOURCE_DIR}/src)
+# VT-MATMUL-FP8-BLOCK-CUDA (#1189 M5), the DEVICE tier: the CUDA arm against the
+# CPU reference arm of the SAME op, carrying upstream's own
+# test_w8a8_block_fp8_cutlass_matmul whole (M=32, N=576, K=7168, rel_diff <
+# 0.001). IT HAS NEVER RUN: no GPU was leased for that row and it skips without a
+# device. The row's spec lists the on-hardware leg under `## Owed`; a skip here
+# is not a pass and must not be reported as one.
+vllm_cpp_add_test(test_ops_matmul_fp8_block_cuda vt/test_ops_matmul_fp8_block_cuda.cpp)
+target_include_directories(test_ops_matmul_fp8_block_cuda PRIVATE ${CMAKE_SOURCE_DIR}/src)
 # Opt-in arm: run the fp8 plan-cache byte-exact case with the cache ENABLED
 # (VT_FP8_PLAN_CACHE=1 -> first MatmulFp8CublasLt call builds the plan fresh,
 # later calls hit the cache). Proves the cached-plan GEMM is BYTE-identical to the

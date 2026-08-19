@@ -480,6 +480,40 @@ class RatchetTests(unittest.TestCase):
         )
         self.assertEqual(runnable, set(gates.RUNNABLE_BASELINE))
 
+    def test_dropping_the_anchor_ratchet_from_the_pin_breaks_it(self):
+        # MUTATION for the 2026-08-14 re-pin (#632). ENG-RECORD-ANCHOR-RATCHET
+        # entered the runnable population when the row left SPIKE for ACTIVE, so
+        # the entry added for it must be what keeps the exact pin agreeing with
+        # the audit. Remove it and the equality assertion has to go red, which is
+        # what proves the row was pinned because it entered the population and
+        # not to quiet a gate.
+        reduced = set(gates.RUNNABLE_BASELINE) - {"ENG-RECORD-ANCHOR-RATCHET"}
+        self.assertNotEqual(reduced, set(gates.RUNNABLE_BASELINE))
+        runnable = {r["id"] for r in gates.audit() if r["verdict"] == "runnable"}
+        self.assertNotEqual(runnable, reduced)
+        self.assertEqual(runnable - reduced, {"ENG-RECORD-ANCHOR-RATCHET"})
+
+    def test_the_anchor_ratchet_credit_is_its_own_gate(self):
+        # The credit has to be EARNED, not inherited: unlike the weak credits the
+        # RUNNABLE_BASELINE header admits to, this row's gate IS the checker its
+        # spec names, so the credited command is the thing under test. Pin both
+        # halves -- the row audits runnable, and the invocation its Gates section
+        # carries is the one that reds on either direction of the ratchet. A spec
+        # rewritten into prose gates goes red here rather than keeping a credit
+        # it no longer deserves.
+        row = "ENG-RECORD-ANCHOR-RATCHET"
+        self.assertIn(row, gates.RUNNABLE_BASELINE)
+        record = next(r for r in gates.audit() if r["id"] == row)
+        self.assertEqual(record["verdict"], "runnable", record)
+
+        section = gates.gates_section(
+            (ROOT / ".agents/specs/record-anchor-ratchet.md").read_text(encoding="utf-8")
+        )
+        self.assertIsNotNone(section)
+        commands = gates.runnable_commands(section)
+        self.assertIn("python3 scripts/check-agent-record.py --report", commands)
+        self.assertIn("python3 tests/scripts/test_agent_record.py", commands)
+
     def test_eng_docs_site_is_credited_for_real_commands(self):
         # ENG-DOCS-SITE joined the runnable population on arrival rather than
         # being parked as gates-no-command, so the credit has to be earned by
@@ -745,6 +779,40 @@ class RatchetTests(unittest.TestCase):
         runnable = {r["id"] for r in gates.audit() if r["verdict"] == "runnable"}
         self.assertNotEqual(runnable, reduced)
         self.assertEqual(runnable - reduced, {"ENG-CUDAGRAPH-DEDUP"})
+        self.assertEqual(runnable, set(gates.RUNNABLE_BASELINE))
+
+    def test_dropping_cudagraph_break_from_the_pin_breaks_it(self):
+        # MUTATION for the #1376 repair. ENG-CUDAGRAPH-BREAK entered the runnable
+        # population when W5 (#1361) filled its spec's Gates section with runnable
+        # evidence, and the re-pin that change owed was not made, so main itself
+        # failed this suite 8 times of 44. Remove the entry and set equality has
+        # to go red, which is what proves the row was pinned because it entered
+        # the population rather than to quiet a gate.
+        reduced = set(gates.RUNNABLE_BASELINE) - {"ENG-CUDAGRAPH-BREAK"}
+        self.assertNotEqual(reduced, set(gates.RUNNABLE_BASELINE))
+        runnable = {r["id"] for r in gates.audit() if r["verdict"] == "runnable"}
+        self.assertNotEqual(runnable, reduced)
+        self.assertEqual(runnable - reduced, {"ENG-CUDAGRAPH-BREAK"})
+        self.assertEqual(runnable, set(gates.RUNNABLE_BASELINE))
+
+    def test_hf_model_download_earns_its_runnable_baseline_entry(self):
+        # ENG-HF-MODEL-DOWNLOAD (#1280) arrives at READY, so it enters the gated
+        # population for the first time and the baseline grows by one. Same
+        # shape and same reason as the row above.
+        #
+        # The row is classified runnable because its spec's `## Gates` section
+        # names `scripts/validate-container-image.py`, a command that can fail.
+        # The exact pin proves the SET agrees, which holds for any membership
+        # and cannot say this row belongs. This says it: remove the entry and
+        # set equality has to go red, which is what separates a row pinned
+        # because it entered the population from a row pinned to quiet a gate.
+        verdicts = {r["id"]: r["verdict"] for r in gates.audit()}
+        self.assertEqual(verdicts.get("ENG-HF-MODEL-DOWNLOAD"), "runnable")
+        reduced = set(gates.RUNNABLE_BASELINE) - {"ENG-HF-MODEL-DOWNLOAD"}
+        self.assertNotEqual(reduced, set(gates.RUNNABLE_BASELINE))
+        runnable = {r["id"] for r in gates.audit() if r["verdict"] == "runnable"}
+        self.assertNotEqual(runnable, reduced)
+        self.assertEqual(runnable - reduced, {"ENG-HF-MODEL-DOWNLOAD"})
         self.assertEqual(runnable, set(gates.RUNNABLE_BASELINE))
 
 
