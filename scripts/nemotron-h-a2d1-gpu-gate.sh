@@ -153,8 +153,10 @@ fi
 # ─────────────────────────────────────────────────────────────────────────────
 # The A/B. ONE binary, device mamba ON in both legs, only the decode arm differs.
 # ─────────────────────────────────────────────────────────────────────────────
-run_leg() {   # $1 = label, $2 = VT_NEMOTRON_H_MAMBA_DECODE_STEP value
-  local label=$1 flag=$2
+# $1 = label, $2 = VT_NEMOTRON_H_MAMBA_DECODE_STEP, $3 = VT_NEMOTRON_H_DEVICE_MAMBA
+# (defaults to 1; leg 3 sets it to 0 -- see the CONFOUND note above step 7).
+run_leg() {
+  local label=$1 flag=$2 devmamba=${3:-1}
   local log="$RUN/a3_$label.log"
   : > "$log"
 
@@ -168,7 +170,7 @@ run_leg() {   # $1 = label, $2 = VT_NEMOTRON_H_MAMBA_DECODE_STEP value
   # measures the diagnostic. The arm trace is one fprintf of six resident
   # counters per step, so the reachability evidence and the timing come from
   # the SAME run rather than from two runs that might differ.
-  VT_NEMOTRON_H_DEVICE_MAMBA=1 VT_NEMOTRON_H_MAMBA_DECODE_STEP=$flag \
+  VT_NEMOTRON_H_DEVICE_MAMBA=$devmamba VT_NEMOTRON_H_MAMBA_DECODE_STEP=$flag \
   VT_NEMOTRON_H_ARM_TRACE=1 "$BUILD/examples/nemotron-h-gen" \
       --model "$CKPT" \
       --golden "$SRC/tests/parity/goldens/nemotron_35_lightning_greedy/oracle.json" \
@@ -248,12 +250,44 @@ PY
 step "7. A3 gate + decode window, SINGLE-STEP decode arm (the default, = vLLM)"
 ( while true; do free -m | awk '/^Mem:/{print $3}'; sleep 1; done ) > "$RUN/rss.txt" 2>/dev/null &
 MEMPID=$!
+# ★ THE CONFOUND THIS THIRD LEG EXISTS TO REMOVE.
+#
+# Legs 1 and 2 vary the mamba KERNEL (single-step vs chunk scan) and BOTH sit on
+# top of A2-Q1's FP8 W8A8 device projections, because both run inside the
+# `mamba_on_device` branch. `main` carries NO device mamba arm at all --
+# `NemotronHMamba2MixerDevice`, `MambaIsFp8` and even `VT_NEMOTRON_H_DEVICE_MAMBA`
+# are absent there -- so a `95/96` seen on BOTH of legs 1 and 2 is equally
+# consistent with:
+#
+#   (a) the divergence being the HOST's (arch-specific), or
+#   (b) the divergence being A2-Q1's FP8 PROJECTIONS, which neither leg turns off.
+#
+# Leg 3 discriminates by routing the whole mamba block back to the host
+# reference on the SAME binary and box. Its counters are the check that it
+# really took that path: the four kernel counters must read 0 while
+# gathers/scatters stay non-zero, because the host branch still gathers and
+# scatters but never enters the instrumented device mixer.
+#
+#   leg 3 `96/96` => the divergence is A2-Q1's FP8 arm, NOT the architecture.
+#   leg 3 `95/96` => the host owns it and the arch-specific framing stands.
 run_leg on 1
 
 step "8. the same binary with the decode arm OFF -- the chunk scan on decode rows"
 run_leg off 0
+
+step "8b. THE DISCRIMINATOR -- device mamba arm OFF, so A2-Q1's FP8 projections are OUT"
+run_leg hostmamba 1 0
+
 kill "$MEMPID" 2>/dev/null
 echo "peak host MiB used during the run: $(sort -n "$RUN/rss.txt" | tail -1)"
+
+step "8c. the three-way verdict"
+for L in on off hostmamba; do
+  printf '%-10s %s\n' "$L" "$(grep -E 'TOKEN MATCH' "$RUN/a3_$L.log" 2>/dev/null | tail -1)"
+done
+echo "leg 3 (hostmamba) MUST show the four kernel counters at 0 with gathers/scatters non-zero;"
+echo "anything else means it did NOT take the host path and the discrimination is VOID."
+grep -E 'ARM step .* nd=[1-9]' "$RUN/a3_hostmamba.log" 2>/dev/null | tail -1
 
 step "9. contention, after"
 nvidia-smi --query-compute-apps=pid,used_memory --format=csv
