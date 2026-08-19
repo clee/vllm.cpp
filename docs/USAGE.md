@@ -1994,13 +1994,16 @@ environment variables are set. It is NOT yet measured against the vLLM-Omni
 oracle, which is unpinned (#633), so nothing here is a quality claim. Inferring the emotion from a clip instead of stating it needs a
 Conformer and a Perceiver that are not ported.
 
-There is **no `/v1/audio/speech`**. Text to speech is not servable: the
-IndexTTS-2.5 stages are ported and gated at reduced dimensions, with further
-stages named as missing by the checkpoint's own manifest, and no route is
-registered, the public ABI carries no synthesis entry point, and loading the
-family refuses with a message naming the missing pieces (#634). Asking a running server for speech
-today is a 404 at the route table, not a runtime error, and that is the accurate
-signal: the capability does not reach any surface yet.
+`/v1/audio/speech` is served, but **only** by a server started with
+`--speech-model`, and what it can render depends on the family that flag loads
+(#1112). MiniMax-Music3 renders: a composed request returns a real 44100 Hz
+stereo WAV (#852). **IndexTTS-2.5 does not**: its stages are ported and gated at
+reduced dimensions, further stages are named as missing by the checkpoint's own
+manifest, and loading the family refuses with a message naming the missing
+pieces (#634). Without `--speech-model` the route is a 404 at the route table
+rather than a runtime error, which is the accurate signal: the endpoint is opt
+in, not absent. See
+[Speech and music generation](#speech-and-music-generation).
 
 `prompt_logprobs` is accepted on `/v1/completions` and `/v1/chat/completions`
 and the engine computes it — every prompt position is scored against the token
@@ -2162,6 +2165,24 @@ for that once (#925), which is why the list is long rather than convenient.
 | `response_format` other than `"wav"` | no mp3/opus/aac/flac encoder is vendored, and relabelling RIFF bytes is worse than refusing |
 | `temperature`, `top_p`, `top_k`, `repetition_penalty` | this model's autoregressive stage has ONE sampler — a fixed top-50 draw (`encoders.py:48,94-103`). There is no temperature to set and no nucleus branch to widen, so the knob can be neither honoured nor honestly ignored. Upstream refuses all four (`request_builders.py:14-19,109-114`). Use `seed` to control the draw |
 | `max_new_tokens` | SGLang-Omni's spelling of the length, counted in 25 Hz **frames** rather than seconds (`request_builders.py:56-68`). This route takes `audio_duration` in seconds — divide by 25. Two spellings of one meaning on one route is exactly what #925 was |
+| `token_count`, `duration_tokens` | SGLang-Omni's length in **duration tokens** (`protocol.py:355-356`). Same meaning as `audio_duration`, different unit; upstream refuses both by name for this model (`request_builders.py:20-30,71-81`). A length key nobody reads is how a short request becomes a 60 s song (#1315) |
+| `instructions` | SGLang-Omni's spelling of the music **caption** — the string it assembles into `<\|caption_start\|>`, and which it requires non-empty (`request_builders.py:104-106`). This route calls it `description`. Refused rather than aliased so one meaning keeps one name, and because `instructions` means style and emotion for a TTS family (`protocol.py:348`) and the caption for this music one (#1315) |
+| `speaker` | SGLang-Omni's declared **alias** for `voice` (`protocol.py:337-339`). Refusing `voice` and dropping `speaker` refused one spelling of one field and returned a 200 for the other (#1315) |
+| `ref_audio`, `ref_text` | upstream's reference-clip spellings, where `ref_audio` is a path or URL. This route takes `reference_audio` as a `data:` URL, because the server and the client need not share a filesystem; no family conditions on a reference **transcript** at all. Upstream refuses both by name (`request_builders.py:20-30,71-81`) |
+| `task_type`, `x_vector_only_mode`, `initial_codec_chunk_frames` | there is one synthesis mode per loaded family and no task selector, no speaker-embedding-only path, and the chunk schedule is the family's own (MiniMax-Music3 fixes it at 200 frames with a 100 hop). Upstream refuses all three by name (`request_builders.py:20-30,71-81`) |
+
+**Where you put a key does not change whether it is read.** The generation
+knobs — `audio_duration`, `duration`, `num_inference_steps`, `guidance_scale`,
+`seed` — are accepted at the **top level** and nested under **`extra_params`**,
+because vLLM-Omni nests them and OpenAI does not, and a client should not have to
+know which surface it is talking to. `extra_params` wins where both carry the
+same key, the same precedence the video route uses. Every refusal above sees both
+placements too.
+
+This used to be an either/or: an `extra_params` object as empty as `{}` stopped
+the top level being read at all, so a body that nested `seed` and put
+`audio_duration` where OpenAI puts it lost the duration and got the 60 s default
+— #925's cost, behind a 200, with #925's own guard unable to fire (#1315).
 
 A family with no text-only synthesis — IndexTTS-2.5 is one — is refused
 **before** anything stages: the route asks the loaded engine's
@@ -4871,8 +4892,9 @@ quantized arm (0.0324), so upper bounds alone cannot tell them apart.
 
 ### IndexTTS-2.5 goldens and checkpoint manifests
 
-The speech lane is not servable yet (see `/v1/audio/speech` above); these
-regenerate its gates. `read-torch-manifest.py` reads a torch `.pth`'s tensor
+IndexTTS-2.5 is not servable yet — `/v1/audio/speech` exists and serves
+MiniMax-Music3, but this family still refuses naming its missing pieces (#634,
+#1112). These regenerate its gates. `read-torch-manifest.py` reads a torch `.pth`'s tensor
 names and shapes from its pickle header over HTTP range requests, so it inspects
 a multi-GB checkpoint without downloading the weights:
 

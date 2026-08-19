@@ -23,6 +23,14 @@ bool Has(const nlohmann::json& body, const char* key) {
   return body.contains(key) && !body.at(key).is_null();
 }
 
+// What `extra_params` binds to when a body carries none. It must NOT be the top
+// level: binding it there is what made `extra_params` a replacement rather than
+// a second place to look. See the `Owner` resolver in ParseSpeechRequest.
+const nlohmann::json& EmptyObject() {
+  static const nlohmann::json kEmpty = nlohmann::json::object();
+  return kEmpty;
+}
+
 std::string ReadString(const nlohmann::json& body, const char* key) {
   VT_CHECK(body.at(key).is_string(),
            std::string("speech request: `") + key + "` must be a string");
@@ -87,6 +95,33 @@ SpeechRequest ParseSpeechRequest(const std::string& body) {
   }
   VT_CHECK(json.is_object(), "speech request: body must be a JSON object");
 
+  // `extra_params` is a SECOND place to look, NEVER a replacement for the top
+  // level. vLLM-Omni nests the generation knobs there and OpenAI puts its own
+  // at the top level, so a client may reasonably do either -- and one that did
+  // both used to lose every key in whichever object this did not bind. An
+  // `extra_params` object as empty as `{}` was enough to drop a top-level
+  // `audio_duration`, leave the field at its 0.0 sentinel, and have
+  // MiniMax-Music3 answer with its 60 s default behind a 200: #925's cost with
+  // #925's own guard in the tree and unable to fire (#1315).
+  //
+  // `extra_params` WINS where both carry a key, which is the precedence the
+  // video route already documents (video_api.cpp:216-225), so the two routes
+  // resolve a knob the same way rather than two ways.
+  //
+  // Every read and every refusal below resolves through `Owner`, and that is
+  // the repair rather than tidiness: a guard that looks at one placement only
+  // can no longer be written, because there is no longer a handle on one
+  // placement only.
+  const nlohmann::json& extra =
+      (json.contains("extra_params") && json.at("extra_params").is_object())
+          ? json.at("extra_params")
+          : EmptyObject();
+  const auto Owner = [&json, &extra](const char* key) -> const nlohmann::json* {
+    if (Has(extra, key)) return &extra;
+    if (Has(json, key)) return &json;
+    return nullptr;
+  };
+
   SpeechRequest out;
   if (Has(json, "model")) {
     out.model = ReadString(json, "model");
@@ -119,19 +154,19 @@ SpeechRequest ParseSpeechRequest(const std::string& body) {
            "is required; which of them applies is the loaded family's decision");
 
   // ── The named residuals. Each is refused rather than ignored. ─────────────
-  VT_CHECK(!Has(json, "voice"),
+  VT_CHECK(Owner("voice") == nullptr,
            "speech request: `voice` is not supported — no registered speech family exposes "
            "named voices, and there is no voice-enumeration endpoint to pick one from. A "
            "family that clones a voice takes `reference_audio` instead");
-  VT_CHECK(!Has(json, "speed"),
+  VT_CHECK(Owner("speed") == nullptr,
            "speech request: `speed` is not supported — no registered family implements a rate "
            "control, and honouring it silently would return audio at the wrong tempo");
-  VT_CHECK(!Has(json, "stream") && !Has(json, "stream_format"),
+  VT_CHECK(Owner("stream") == nullptr && Owner("stream_format") == nullptr,
            "speech request: streaming is not supported — MiniMax-Music3 generates the whole "
            "song before the first sample exists (.agents/specs/minimax-music3.md §7), and "
            "buffering it to emit chunks would be a stream in name only");
-  if (Has(json, "response_format")) {
-    const std::string format = ReadString(json, "response_format");
+  if (const nlohmann::json* format_owner = Owner("response_format")) {
+    const std::string format = ReadString(*format_owner, "response_format");
     VT_CHECK(format == "wav",
              "speech request: `response_format` '" + format +
                  "' is not supported; only \"wav\" is, because no mp3/opus/aac/flac encoder "
@@ -154,11 +189,6 @@ SpeechRequest ParseSpeechRequest(const std::string& body) {
     DecodeReferenceWav(bytes, &out.reference_audio, &out.reference_sample_rate);
   }
 
-  // vLLM-Omni nests the generation knobs under `extra_params`; accept them at
-  // the top level too, exactly as the video route does.
-  const nlohmann::json& extra =
-      (json.contains("extra_params") && json.at("extra_params").is_object()) ? json.at("extra_params")
-                                                                            : json;
   // `audio_duration_s` is the name of the C++/C-API FIELD this key fills, not a
   // wire key, and it is the one misspelling a caller reaches for by reading the
   // struct instead of the docs. Dropping it silently hands back the family's
@@ -167,32 +197,37 @@ SpeechRequest ParseSpeechRequest(const std::string& body) {
   // multi-hour runs generating a 60 s song it had asked 0.1 s for (#852): 2 AR
   // frames became 1500 and the run was misread as a hung weight load. REFUSED
   // and NAMED, like every other unsupported field above.
-  VT_CHECK(!Has(extra, "audio_duration_s"),
+  VT_CHECK(Owner("audio_duration_s") == nullptr,
            "speech request: `audio_duration_s` is not a request key — it is the name of the "
            "field it fills. Use `audio_duration` (seconds), or omit it for the family's "
            "default; accepting it here would silently return the default duration instead");
-  if (Has(extra, "audio_duration")) {
-    out.audio_duration_s = ReadNumber(extra, "audio_duration");
-  }
   // OpenAI spells a duration `seconds` on the video surface; keep one spelling
   // per meaning here and accept both, with the native one winning.
-  if (Has(extra, "duration") && !Has(extra, "audio_duration")) {
-    out.audio_duration_s = ReadNumber(extra, "duration");
+  const char* duration_key = "audio_duration";
+  const nlohmann::json* duration_owner = Owner(duration_key);
+  if (duration_owner == nullptr) {
+    duration_key = "duration";
+    duration_owner = Owner(duration_key);
+  }
+  if (duration_owner != nullptr) {
+    out.audio_duration_s = ReadNumber(*duration_owner, duration_key);
   }
   VT_CHECK(out.audio_duration_s >= 0.0,
            "speech request: `audio_duration` must be > 0 (omit it for the family's default)");
-  if (Has(extra, "num_inference_steps")) {
-    out.num_inference_steps = static_cast<int64_t>(ReadNumber(extra, "num_inference_steps"));
+  if (const nlohmann::json* o = Owner("num_inference_steps")) {
+    out.num_inference_steps = static_cast<int64_t>(ReadNumber(*o, "num_inference_steps"));
     VT_CHECK(out.num_inference_steps > 0,
              "speech request: `num_inference_steps` must be > 0 (omit it for the family's "
              "default)");
   }
-  if (Has(extra, "guidance_scale")) {
-    out.guidance_scale = ReadNumber(extra, "guidance_scale");
+  if (const nlohmann::json* o = Owner("guidance_scale")) {
+    out.guidance_scale = ReadNumber(*o, "guidance_scale");
     VT_CHECK(out.guidance_scale >= 0.0, "speech request: `guidance_scale` must be >= 0");
     out.has_guidance_scale = true;
   }
-  if (Has(extra, "seed")) out.seed = static_cast<int64_t>(ReadNumber(extra, "seed"));
+  if (const nlohmann::json* o = Owner("seed")) {
+    out.seed = static_cast<int64_t>(ReadNumber(*o, "seed"));
+  }
 
   // ── The keys UPSTREAM refuses, refused here too (#672) ────────────────────
   //
@@ -212,7 +247,7 @@ SpeechRequest ParseSpeechRequest(const std::string& body) {
   // WAV, and has no way to learn the knob was dropped. The cost of that
   // silence is already recorded in this file, one refusal above.
   for (const char* key : {"temperature", "top_p", "top_k", "repetition_penalty"}) {
-    VT_CHECK(!Has(extra, key),
+    VT_CHECK(Owner(key) == nullptr,
              std::string("speech request: `") + key +
                  "` is not supported — MiniMax-Music3's autoregressive stage has no "
                  "temperature and no nucleus sampling; its only sampler is a fixed top-50 "
@@ -226,12 +261,88 @@ SpeechRequest ParseSpeechRequest(const std::string& body) {
   // SECONDS, because diffusers is this row's primary oracle. Two duration
   // spellings on one route is what #925 was, so the second one is REFUSED and
   // converted for the caller rather than accepted as a near-synonym.
-  VT_CHECK(!Has(extra, "max_new_tokens"),
+  VT_CHECK(Owner("max_new_tokens") == nullptr,
            "speech request: `max_new_tokens` is SGLang-Omni's spelling of the length, counted "
            "in 25 Hz audio frames (request_builders.py:56-68). This route takes "
            "`audio_duration` in SECONDS instead — divide by 25 — because accepting both would "
            "be two names for one meaning, and a duration key that is read by nobody is how "
            "this project shipped a 750x job behind a 200 (#925)");
+
+  // ── The rest of upstream's named set (#1315) ──────────────────────────────
+  //
+  // `_build_tts_params` (sglang_omni/serve/speech_service.py:737-779) forwards
+  // these wire keys into the model's builder, and `_UNSUPPORTED_TTS_PARAMS`
+  // (models/minimax_music3/request_builders.py:20-30) makes
+  // `_validate_tts_contract` (:71-81) raise
+  //   "MiniMax Music 3 does not support speech parameters: <names>"
+  // for each one. We were SILENT on all of them, which is #925 again: a key the
+  // server will not honour must not come back behind a 200.
+  //
+  // `language` is in upstream's set and is deliberately NOT here. It is already
+  // refused BY NAME one layer down (minimax_music3_speech.cpp:456-460), which
+  // is the layer this tree puts family-specific refusals at and where a family
+  // that HAS a language can still take it. Moving it up would break
+  // IndexTTS-2.5.
+  //
+  // The boundary #925 drew is unchanged: only the keys upstream NAMES are
+  // refused, so an unknown key still parses and `extra_params` stays
+  // forward-compatible.
+  VT_CHECK(Owner("speaker") == nullptr,
+           "speech request: `speaker` is SGLang-Omni's alias for `voice` "
+           "(protocol.py:337-339), and neither is supported — no registered speech family "
+           "exposes named voices. Refusing one spelling and dropping the other would return "
+           "a 200 for half of one field. A family that clones a voice takes `reference_audio` "
+           "instead");
+  // `instructions` is REFUSED rather than accepted as an alias, although
+  // upstream honours it. Three reasons, and they are the same three the
+  // `max_new_tokens` refusal above rests on: a secondary oracle never becomes
+  // the mirror source, one meaning keeps one name on this route, and
+  // `instructions` means style-and-emotion for a TTS family
+  // (protocol.py:348) and the music CAPTION for this one — so aliasing it
+  // globally would bake one family's meaning into a shared route.
+  VT_CHECK(Owner("instructions") == nullptr,
+           "speech request: `instructions` is SGLang-Omni's spelling of the music CAPTION — "
+           "the string MiniMax-Music3 assembles into `<|caption_start|>`, and which upstream "
+           "requires non-empty (request_builders.py:104-106). This route calls it "
+           "`description`; send that instead, so one meaning keeps one name. Dropping it "
+           "silently would lose the whole music description of a request that named it");
+  VT_CHECK(Owner("ref_audio") == nullptr,
+           "speech request: `ref_audio` is SGLang-Omni's spelling of the reference clip "
+           "(protocol.py:351), where it is a path or a URL. This route takes "
+           "`reference_audio`, a `data:` URL carrying a 16-bit PCM mono WAV, because the "
+           "server and the client need not share a filesystem; send that instead");
+  VT_CHECK(Owner("ref_text") == nullptr,
+           "speech request: `ref_text` (the transcript of a reference clip) is not supported "
+           "— no registered family conditions on a reference TRANSCRIPT, and upstream refuses "
+           "it by name for this model too (request_builders.py:20-30,71-81). Supply the text "
+           "to synthesize in `input`, or the sung text in `lyrics`");
+  VT_CHECK(Owner("task_type") == nullptr,
+           "speech request: `task_type` (`Base`/`CustomVoice`/`VoiceDesign`) is not supported "
+           "— this route has one synthesis mode per loaded family and no task selector, so "
+           "the field can select nothing. Upstream refuses it by name too "
+           "(request_builders.py:20-30,71-81)");
+  VT_CHECK(Owner("x_vector_only_mode") == nullptr,
+           "speech request: `x_vector_only_mode` is not supported — no registered family "
+           "exposes a speaker-embedding-only path to switch into, and upstream refuses it by "
+           "name for this model too (request_builders.py:20-30,71-81)");
+  VT_CHECK(Owner("initial_codec_chunk_frames") == nullptr,
+           "speech request: `initial_codec_chunk_frames` is not supported — the chunk "
+           "schedule is the family's own (MiniMax-Music3 fixes it at 200 frames with a 100 "
+           "hop, constants.py:9-10), so the value can be neither honoured nor honestly "
+           "ignored. Upstream refuses it by name too (request_builders.py:20-30,71-81)");
+  // The two LENGTH spellings. These are the ones that repeat #925's cost
+  // exactly: a duration key nobody reads is how a short request becomes a 60 s
+  // song.
+  for (const char* key : {"token_count", "duration_tokens"}) {
+    VT_CHECK(Owner(key) == nullptr,
+             std::string("speech request: `") + key +
+                 "` is SGLang-Omni's LENGTH, counted in duration tokens "
+                 "(protocol.py:355-356). This route takes `audio_duration` in SECONDS "
+                 "instead, because two spellings of one meaning is what let a length key go "
+                 "unread and turn a short request into the family's 60 s default (#925). "
+                 "Upstream refuses it by name for this model too "
+                 "(request_builders.py:20-30,71-81)");
+  }
   return out;
 }
 
