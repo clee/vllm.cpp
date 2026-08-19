@@ -228,6 +228,11 @@ already produced one void number on this row.
   the premise of #1311 is refuted. `NEEDS_DECISION`, not a wider tolerance.
 - The counters read zero on both arms → the instrument is broken; T3 is the
   triage, not the GPU log.
+- **The A3 gate does not read `96/96 STRICT PASS` on ANY gated host → the swap
+  is not accepted there, and a pass on a DIFFERENT host does not substitute.**
+  This condition is LIVE: sm_110 passes and sm_121a reads `95/96`. Two hosts
+  disagreeing is not a pass with an asterisk; it is an open correctness question
+  until the same-binary A/B on the failing host says which arm owns the token.
 
 ### 6.1 The speed stop condition FIRED, and what it does and does not close
 
@@ -284,8 +289,21 @@ legs of one binary:
   quotes #1311's own bar — "Refuted if per-token time moves less than 3%" — and
   0.388% is under it. See §6.1.
 
-The `dgx:gpu0` sm_121a leg is still owed and is the only thing that can answer
-the GB10 question.
+**★ The `dgx:gpu0` sm_121a leg then READ `95/96 DIVERGENCE` (`RC=1`), and the
+row is BLOCKED on attributing it.** The arm ran as designed there — the same
+`state_update_rows=23 chunk_scan_calls=0 gathers=0 scatters=0` on all 93 decode
+steps, `reference-tier lines: 0`, `cutlass-fp8: ENABLED for [121a]` — so it is
+not a routing failure and not a VOID run. Whether A2-D1 CAUSES that one token is
+NOT established: the chunk-scan OFF leg on the same binary, box and checkpoint
+is the attribution, and it is running.
+
+- OFF `96/96` ⇒ **this change causes it; the row does NOT land as written.**
+- OFF `95/96` or worse ⇒ pre-existing on sm_121a, this change neutral, and it
+  owes its own issue against GB10 rather than this row.
+
+Prior GB10 trouble on this row (`STATUS`: "GB10 read 4/24; cause and fix #1157",
+and A2-Q1's `93/96 DIVERGENCE` arm under #1290) makes the second branch
+plausible and does NOT establish it. §6 forbids reading the Thor pass across.
 
 ## Owed
 
