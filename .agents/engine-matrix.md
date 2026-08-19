@@ -48,7 +48,7 @@ forensics: roadmap_v1.md and the parity ledger.
 | LoRA and adapters | 2 | 0 | 0 | 0 | 0 | 1 | 0 | 0 | 1 |
 | Long context and attention | 10 | 5 | 0 | 0 | 1 | 0 | 1 | 0 | 3 |
 | Loading, tokenizer, config | 12 | 3 | 3 | 0 | 2 | 1 | 1 | 1 | 1 |
-| **Total** | **167** | **35** | **17** | **4** | **14** | **39** | **8** | **11** | **38** |
+| **Total** | **167** | **35** | **17** | **4** | **13** | **40** | **8** | **11** | **38** |
 
 ## Engine core and scheduling
 
