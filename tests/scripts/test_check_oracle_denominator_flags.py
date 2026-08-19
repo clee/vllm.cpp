@@ -111,6 +111,33 @@ class OracleDenominatorFlagsTest(unittest.TestCase):
         self.assertEqual(got.returncode, 2, got.stdout)
         self.assertIn("broken detector", got.stdout)
 
+    def test_any_variable_spelling_of_the_client_is_still_a_launch(self) -> None:
+        # The evasion surface. The detector used to name the two variables this
+        # tree happens to use, `${client}` and `${VLLM_ORACLE}`, so a harness
+        # that called its binary anything else launched the oracle unscanned and
+        # the checker reported a clean tree. What identifies a launch is the
+        # `serve` subcommand sitting directly after the binary, not the name
+        # somebody gave the variable holding it.
+        for spelling in ('"$ORACLE"', '"${server_bin}"', "$oracle_cli", "${VENV}"):
+            with self.subTest(spelling=spelling):
+                body = f'cmd=(\n  {spelling} serve "${{snapshot}}" --port 8000\n)\n'
+                with tree(**{"scripts/h.sh": body}) as root:
+                    got = run("--root", root)
+                self.assertEqual(got.returncode, 1, got.stdout)
+                self.assertIn("scripts/h.sh:2", got.stdout)
+
+    def test_bench_serve_stays_a_client_under_any_variable_spelling(self) -> None:
+        # The guard on the line above. Widening to any `$`-expansion must not
+        # start matching `bench serve`, which is the timed CLIENT: the token
+        # before `serve` there is `bench`, which is no expansion at all.
+        for spelling in ('"$ORACLE"', '"${server_bin}"', '"${client}"'):
+            with self.subTest(spelling=spelling):
+                body = f'cmd=(\n  {spelling} bench serve --backend openai\n)\n'
+                with tree(**{"scripts/h.sh": body}) as root:
+                    got = run("--root", root)
+                self.assertEqual(got.returncode, 2, got.stdout)
+                self.assertIn("broken detector", got.stdout)
+
     def test_prose_naming_the_flag_free_oracle_is_not_a_launch(self) -> None:
         # Case matters: prose writes "vLLM", commands write "vllm". A comment
         # line is never a command either.

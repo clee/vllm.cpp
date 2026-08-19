@@ -91,9 +91,19 @@ SELF = "check-oracle-denominator-flags.py"
 REQUIRED_FLAG = "--language-model-only"
 EXEMPT_MARKER = "ORACLE-DENOMINATOR-EXEMPT:"
 
-# A token naming the pinned oracle CLI. Case-sensitive on purpose: prose writes
-# "vLLM", commands write "vllm".
-_ORACLE_CLIENT = re.compile(r"\A(.*/)?vllm\Z|\$\{?client\}?|\$\{?VLLM_ORACLE\}?")
+# A token naming the pinned oracle CLI: either the binary spelled out, or ANY
+# shell or Python variable holding it. Naming the two variables this tree
+# happens to use today would have made the detector a list of spellings, and a
+# harness calling its binary `${ORACLE}` or `${server_bin}` would have launched
+# the oracle unscanned while the checker reported a clean tree. What identifies
+# a launch is `serve` sitting directly after the binary, so the binary may be
+# anonymous. `bench serve` is unaffected and stays a client: the token before
+# `serve` there is `bench`, which is no expansion at all.
+#
+# Case-sensitive on purpose: prose writes "vLLM", commands write "vllm". The
+# optional closing brace is not cosmetic -- `_TOKEN_STRIP` eats `}` off the end
+# of a token, so `"${client}"` reaches this pattern as `${client`.
+_ORACLE_CLIENT = re.compile(r"\A(?:(?:.*/)?vllm|\$\{?[A-Za-z0-9_]+\}?)\Z")
 _TOKEN_STRIP = "\"'`,()[]{}\\"
 # A line that opens a command block, so a flag placed before `serve` still counts.
 _OPENER = re.compile(r"[(\[]\s*$")

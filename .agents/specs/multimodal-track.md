@@ -496,9 +496,9 @@ re-measured here); advancing the pin.
 | the flag | `vllm/engine/arg_utils.py:1275-1277` | `--language-model-only` over `MultiModalConfig.language_model_only` |
 | the default | `vllm/config/multimodal.py:78` | `language_model_only: bool = False` |
 | the predicate | `vllm/model_executor/models/qwen3_next.py:324-331` (`Qwen3NextAttention.__init__`) | `text_only = mm_config is None or mm_config.language_model_only`; `use_fused_qk_norm_rope_gate = attn_output_gate and is_neox_style and current_platform.is_cuda() and text_only` |
-| the reason for the conjunct | `qwen3_next.py:322` | `# TODO: support MRoPE`, immediately above the predicate |
+| the reason for the conjunct | `qwen3_next.py:323` | `# TODO: support MRoPE`, immediately above the predicate |
 | the same reason, restated at the call | `qwen3_next.py:344-352` (`Qwen3NextAttention._project_qkv_gate`) | *"mRoPE passes positions as (3, n_tokens) for T/H/W. Fusion is only enabled text-only, where the three rows are identical, so taking the T row is exact."* — then `pos = positions[0] if positions.ndim == 2 else positions` |
-| the kernel | `vllm/model_executor/layers/fused_qk_norm_rope.py:119-201` (`fused_qk_rmsnorm_rope_gate`) | takes `cos_sin_cache: (max_pos, rotary_dim)` **and** `positions: (n_tokens,)`, and indexes the cache by position inside the kernel |
+| the kernel | `vllm/model_executor/layers/fused_qk_norm_rope.py:117-201` (`fused_qk_rmsnorm_rope_gate`) | takes `cos_sin_cache: (max_pos, rotary_dim)` **and** `positions: (n_tokens,)`, and indexes the cache by position inside the kernel |
 | the eager arm | `qwen3_next.py:366-387` | split → `q_norm`/`k_norm` → `self.rotary_emb(positions, q, k)`, where `rotary_emb` **is** the MRoPE module for a multimodal Qwen3.5 |
 | how Qwen3.5 reaches it | `vllm/model_executor/models/qwen3_5.py:146-153` (`Qwen3_5DecoderLayer.__init__`) | `full_attention` layers construct `Qwen3NextAttention(config, model_config=model_config, …)` |
 | why our gate models land on `text_only == False` | `qwen3_5.py:399,614` (`Qwen3_5ForConditionalGeneration`, `Qwen3_5MoeForConditionalGeneration`) with `multimodal.py:78` | both read `vllm_config.model_config.multimodal_config`, which is non-`None`, so `text_only` is `False` unless the flag is passed |
@@ -602,6 +602,18 @@ gate checkpoint without the flag.
 4. *A harness that legitimately launches no oracle trips it.* The checker keys
    on the oracle `serve` invocation, not on the file, so such a harness is
    simply out of its scope.
+5. *The detector degrades into a list of spellings.* Raised by the fresh review
+   of this wave. `_ORACLE_CLIENT` first named the two variables this tree
+   happens to use, `${client}` and `${VLLM_ORACLE}`, so a future harness writing
+   `"$ORACLE" serve` or `"$server_bin" serve` would have gone unscanned — and an
+   unscanned launch reads as a clean tree, which is the failure the exit-2
+   "broken detector" arm exists to catch and could not have caught here, because
+   the other launches keep the count above zero. The pattern now matches the
+   binary spelled out OR any `$`-expansion, since what identifies a launch is
+   `serve` sitting directly after the binary, not the name of the variable
+   holding it. `bench serve` is unaffected: the token before `serve` there is
+   `bench`, which is no expansion. The real tree discovers the same three
+   launches, so the widening added no false positive.
 
 **Tests.**
 
@@ -611,7 +623,12 @@ gate checkpoint without the flag.
   a text-only-architecture harness is out of scope; and the two real in-tree
   harnesses are asserted clean. RED-first is behavioural — the checker run
   against `dgx-online-serving.sh` as it stood before this change exits non-zero
-  naming that file and that line.
+  naming that file and that line. A second RED-first pair covers risk 5:
+  `test_any_variable_spelling_of_the_client_is_still_a_launch` failed 4/4 of its
+  spellings before the pattern widened, each reporting exit 2 and "found NO
+  oracle server launch at all", and
+  `test_bench_serve_stays_a_client_under_any_variable_spelling` holds the
+  widening off the timed client.
 - No upstream test covers this. `fused_qk_norm_rope.py` has no test module at
   the pin, and upstream has no test asserting that a benchmark harness
   configures its own oracle, because the harness is ours. Searched at the pin:
