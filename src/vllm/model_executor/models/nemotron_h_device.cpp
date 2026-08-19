@@ -849,6 +849,18 @@ bool NemotronHDeviceMambaEnabled() {
   return on;
 }
 
+// A2-D1 (#1311). The single-step decode arm is the DEFAULT, because it is what
+// vLLM runs and "parity enablers ship as defaults" is repository policy. The
+// opt-out exists so the two arms can be A/B'd IN ONE BINARY: a decode-window
+// measurement taken against a differently-built binary measures the build.
+bool NemotronHDecodeStepEnabled() {
+  static const bool on = [] {
+    const char* e = std::getenv("VT_NEMOTRON_H_MAMBA_DECODE_STEP");
+    return !(e != nullptr && e[0] == '0');
+  }();
+  return on;
+}
+
 // A lifetime-resident device copy of `nbytes` host bytes. Accounted through
 // `load_stats::AddDeviceUpload` AT THE SITE THAT CAUSES THE UPLOAD, which is
 // what `ResidentWeight` (dense_attn_block.h:197) and `ResidentNvfp4`
@@ -993,6 +1005,40 @@ void BuildNemotronHMambaDeviceResident(Dev d, const NemotronHMambaWeights& w,
   mr.ready = true;
 }
 
+// ─── A2-D1: the single-step DECODE arm (#1311) ──────────────────────────────
+//
+// vLLM does NOT run the chunked scan at decode. `mamba_mixer2.py:981` branches
+// on `has_decode` and calls the two single-step recurrent kernels —
+// `causal_conv1d_update(..., conv_state_indices=state_indices_tensor_d)` at
+// :1012 and `selective_state_update(..., state_batch_indices=...)` at :1087.
+// Both READ AND WRITE THE CACHE IN PLACE AT THE SLOT, which is why upstream's
+// decode half has no gather and no scatter at all.
+//
+// This descriptor is how a caller says "these rows are decodes". Non-null
+// selects that pair of kernels for EVERY row of the call, and the two cache
+// handles are the FULL pages, not gathered rows.
+//
+// WHY IT IS A SEPARATE DESCRIPTOR AND NOT A TOKEN COUNT. `T == 1` is not the
+// decode condition and never was: a one-token PREFILL of a fresh request is
+// also T == 1, and it must keep the chunk scan because it carries no state in
+// and its `has_initial` mask can be 0. The condition is the metadata's own
+// decode/prefill split (`gdn_meta.num_decodes`), which the paged forward
+// already computes and which mirrors `mamba_attn.py:523-532`. Selecting on the
+// token count instead is the mistake that would run a fresh prefill through a
+// kernel that assumes a carried state.
+struct NemotronHMambaDecodeSlots {
+  Tensor conv_cache;  // [num_slots, conv_dim, K-1] the FULL page, in place
+  Tensor ssm_cache;   // [num_slots, heads, head_dim, state] the FULL page
+  Tensor state_idx;   // i32 [T] one cache slot per decode token
+};
+
+// The recording seam's storage. The struct and the reader are DECLARED in
+// nemotron_h_forward.h; see there for why a counter exists at all.
+NemotronHMambaArmCounts& MambaArmCountsSlot() {
+  static NemotronHMambaArmCounts counts;
+  return counts;
+}
+
 // ONE NemotronH Mamba2 block on the device.
 //
 // `normed` is the already-normed hidden [T,H] in `adt` on the device; the return
@@ -1010,10 +1056,16 @@ void BuildNemotronHMambaDeviceResident(Dev d, const NemotronHMambaWeights& w,
 // `has_initial = false`, and the conv window then reads zeros and the scan gets
 // NO `initial_states` — precisely what the host arm does. Deriving the flag from
 // pointer-ness would make those two cases indistinguishable.
+//
+// `decode` non-null replaces the two CHUNKED kernels with the two SINGLE-STEP
+// ones and takes the cache pages in place; `conv_state` / `ssm_state` must then
+// be null, because there is nothing gathered to carry. See
+// `NemotronHMambaDecodeSlots`.
 DBuf NemotronHMamba2MixerDevice(Dev d, const NemotronHMambaWeights& w,
                                 const NemotronHParams& params, const Tensor& normed,
                                 int64_t T, DType adt, Tensor* conv_state,
-                                Tensor* ssm_state, bool has_initial) {
+                                Tensor* ssm_state, bool has_initial,
+                                const NemotronHMambaDecodeSlots* decode = nullptr) {
   const int64_t H = params.hidden_size;
   const int64_t I = params.mamba_intermediate_size();
   const int64_t Cd = params.conv_dim();
@@ -1031,6 +1083,10 @@ DBuf NemotronHMamba2MixerDevice(Dev d, const NemotronHMambaWeights& w,
   VT_CHECK((conv_state == nullptr) == (ssm_state == nullptr),
            "NemotronH device mamba: the conv and SSM carries are one unit — pass "
            "both or neither");
+  VT_CHECK(decode == nullptr || (conv_state == nullptr && ssm_state == nullptr),
+           "NemotronH device mamba: the decode arm updates the cache pages IN "
+           "PLACE at their slots and takes no gathered carry — pass the decode "
+           "slots or the gathered rows, never both");
   VT_CHECK(vt::OpRegistered(vt::OpId::kQuantFp8Static, d.q.device.type),
            "NemotronH device mamba: this device has no static per-tensor fp8 "
            "activation quant, so the FP8 W8A8 arm cannot run (issue #960)");
@@ -1069,20 +1125,35 @@ DBuf NemotronHMamba2MixerDevice(Dev d, const NemotronHMambaWeights& w,
   //    no persistent page it did not receive.
   const bool carry_in = conv_state != nullptr && has_initial;
   DBuf conv_fresh(d, DType::kF32, {1, Cd, Kw - 1});
-  if (conv_state == nullptr) conv_fresh.Zero(d);
-  Tensor cst = conv_state != nullptr ? *conv_state : conv_fresh.t();
-  const int32_t qsl[2] = {0, static_cast<int32_t>(T)};
-  const int32_t hinit[1] = {carry_in ? 1 : 0};
-  DBuf dqsl(d, DType::kI32, {2}, qsl);
-  DBuf dhinit(d, DType::kI32, {1}, hinit);
+  if (conv_state == nullptr && decode == nullptr) conv_fresh.Zero(d);
   DBuf xbc_out(d, adt, {T, Cd});
   {
     Tensor cw = MakeTensor(mr.conv_w.get(), adt, d.q.device, {Cd, Kw});
     Tensor cb = MakeTensor(mr.conv_b.get(), adt, d.q.device, {Cd});
     vt::CausalConv1dArgs cargs;
     cargs.silu_activation = true;
-    vt::CausalConv1dFwd(d.q, xbc_out.t(), xbc.t(), cw, mr.has_conv_bias ? &cb : nullptr,
-                        cst, dqsl.t(), dhinit.t(), cargs);
+    if (decode != nullptr) {
+      // `causal_conv1d_update` with `conv_state_indices` (mamba_mixer2.py:1012,
+      // :1017). ONE launch for every decode row, reading and rolling the window
+      // in the page at its own slot. Upstream passes no `has_initial_state`
+      // here at all, and it does not need one: a decode by definition continues
+      // a sequence, which is the same reason A2-P sets the mask to 1 for every
+      // row below `num_decodes` (gdn_attn.py:405).
+      Tensor conv_page = decode->conv_cache;
+      Tensor sidx = decode->state_idx;
+      vt::CausalConv1dUpdate(d.q, xbc_out.t(), xbc.t(), cw,
+                             mr.has_conv_bias ? &cb : nullptr, conv_page, cargs, &sidx);
+      MambaArmCountsSlot().conv_update_rows += T;
+    } else {
+      Tensor cst = conv_state != nullptr ? *conv_state : conv_fresh.t();
+      const int32_t qsl[2] = {0, static_cast<int32_t>(T)};
+      const int32_t hinit[1] = {carry_in ? 1 : 0};
+      DBuf dqsl(d, DType::kI32, {2}, qsl);
+      DBuf dhinit(d, DType::kI32, {1}, hinit);
+      vt::CausalConv1dFwd(d.q, xbc_out.t(), xbc.t(), cw, mr.has_conv_bias ? &cb : nullptr,
+                          cst, dqsl.t(), dhinit.t(), cargs);
+      MambaArmCountsSlot().conv_fwd_calls += 1;
+    }
   }
 
   // 4. split the conv output into x | B | C (mamba_mixer2.py:535-543).
@@ -1107,53 +1178,82 @@ DBuf NemotronHMamba2MixerDevice(Dev d, const NemotronHMambaWeights& w,
              "NemotronH device mamba: the carried SSM state is not the cache "
              "dtype this model resolves");
   }
-  // One sequence, chunked on the GLOBAL token position — the single-sequence
-  // case of `compute_varlen_chunk_metadata` (v1/attention/backends/mamba2_attn.py
-  // :22-88), built exactly as the host arm builds it (nemotron_h.cpp:559-571).
-  const int64_t chunk = params.chunk_size;
-  const int32_t cu_seqlens[2] = {0, static_cast<int32_t>(T)};
-  std::vector<int32_t> cu_chunk = {0};
-  std::vector<int32_t> seq_idx;
-  for (int64_t pos = 0; pos < T; pos += chunk) {
-    cu_chunk.push_back(static_cast<int32_t>(std::min(pos + chunk, T)));
-    seq_idx.push_back(0);
-  }
-  const int32_t last_chunk[1] = {static_cast<int32_t>(seq_idx.size()) - 1};
-  // These five metadata uploads are NOT followed by a `Synchronize`, unlike
-  // `UploadAs` above, and the difference is deliberate. Every one is a few
-  // hundred bytes, and a pageable H2D copy that small is staged by the driver
-  // before `cudaMemcpyAsync` returns, so the host buffers below may die at the
-  // end of this scope. That is the same reliance qwen3_5.cpp:3936 already makes
-  // for the identical GDN conv metadata. A per-layer stream synchronize here
-  // would reintroduce exactly the host/GPU lockstep this unit exists to remove.
-  DBuf dcu(d, DType::kI32, {2}, cu_seqlens);
-  DBuf dcc(d, DType::kI32, {static_cast<int64_t>(cu_chunk.size())}, cu_chunk.data());
-  DBuf dlc(d, DType::kI32, {1}, last_chunk);
-  DBuf dsi(d, DType::kI32, {static_cast<int64_t>(seq_idx.size())}, seq_idx.data());
   DBuf y(d, adt, {T, Hh, P});
-  DBuf final_states(d, ssm_dtype, {1, Hh, P, N});
-  {
+  if (decode != nullptr) {
+    // `selective_state_update` (mamba_mixer2.py:1087) — ONE launch, in place at
+    // the slot, over `T` rows. It takes NO chunk metadata, allocates NO scratch
+    // and writes NO separate `final_states`: the advanced state IS the cache row
+    // it just wrote, which is the whole reason the decode half of the paged
+    // forward needs neither a gather nor a scatter nor the copy-back below.
+    //
+    // `z` stays null here for the same reason it is null on the scan: upstream
+    // gates in the norm (:583-585) and passes `z=None` to the update too
+    // (:1087-1101 names D, dt_bias and dt_softplus, and no z).
     Tensor At = MakeTensor(mr.a_neg.get(), DType::kF32, d.q.device, {Hh});
     Tensor Dt = MakeTensor(mr.d_term.get(), DType::kF32, d.q.device, {Hh});
     Tensor dbt = MakeTensor(mr.dt_bias.get(), DType::kF32, d.q.device, {Hh});
     vt::Mamba2Args args;
-    args.chunk_size = chunk;
-    // mamba_mixer2.py:888-889: dt_softplus=True, dt_limit=(0.0, +inf). `z` is
-    // NOT passed to the scan — upstream gates in the norm below (:583-585), and
-    // passing it here would apply silu(z) twice.
+    // `chunk_size` and the dt limits are IGNORED by this op (ops.h:2231,:2240).
+    // `dt_softplus` is not: it is the one shared field the update reads, and
+    // upstream passes True on both arms.
     args.dt_softplus = true;
-    args.dt_min = 0.0F;
-    args.dt_max = std::numeric_limits<float>::infinity();
-    vt::Mamba2ChunkScan(d.q, y.t(), final_states.t(), ssm_x.t(), dt.t(), At, ssm_b.t(),
-                        ssm_c.t(), &Dt, /*z=*/nullptr, &dbt, carry_in ? ssm_state : nullptr,
-                        dcu.t(), dcc.t(), dlc.t(), dsi.t(), args);
-  }
-  if (ssm_state != nullptr) {
-    // The scan READS `ssm_state` as its initial state, so the final state lands
-    // in its own buffer and is copied back afterwards rather than aliasing the
-    // operand the kernel is still reading.
-    const size_t nb = static_cast<size_t>(Hh * P * N) * vt::SizeOf(ssm_dtype);
-    d.b.Copy(d.q, ssm_state->data, final_states.t().data, nb);
+    Tensor ssm_page = decode->ssm_cache;
+    Tensor sidx = decode->state_idx;
+    VT_CHECK(ssm_page.dtype == ssm_dtype,
+             "NemotronH device mamba: the SSM cache page is not the cache dtype "
+             "this model resolves");
+    vt::Mamba2StateUpdate(d.q, y.t(), ssm_page, ssm_x.t(), dt.t(), At, ssm_b.t(),
+                          ssm_c.t(), &Dt, /*z=*/nullptr, &dbt, &sidx, args);
+    MambaArmCountsSlot().state_update_rows += T;
+  } else {
+    // One sequence, chunked on the GLOBAL token position — the single-sequence
+    // case of `compute_varlen_chunk_metadata` (v1/attention/backends/mamba2_attn.py
+    // :22-88), built exactly as the host arm builds it (nemotron_h.cpp:559-571).
+    const int64_t chunk = params.chunk_size;
+    const int32_t cu_seqlens[2] = {0, static_cast<int32_t>(T)};
+    std::vector<int32_t> cu_chunk = {0};
+    std::vector<int32_t> seq_idx;
+    for (int64_t pos = 0; pos < T; pos += chunk) {
+      cu_chunk.push_back(static_cast<int32_t>(std::min(pos + chunk, T)));
+      seq_idx.push_back(0);
+    }
+    const int32_t last_chunk[1] = {static_cast<int32_t>(seq_idx.size()) - 1};
+    // These five metadata uploads are NOT followed by a `Synchronize`, unlike
+    // `UploadAs` above, and the difference is deliberate. Every one is a few
+    // hundred bytes, and a pageable H2D copy that small is staged by the driver
+    // before `cudaMemcpyAsync` returns, so the host buffers below may die at the
+    // end of this scope. That is the same reliance qwen3_5.cpp:3936 already makes
+    // for the identical GDN conv metadata. A per-layer stream synchronize here
+    // would reintroduce exactly the host/GPU lockstep this unit exists to remove.
+    DBuf dcu(d, DType::kI32, {2}, cu_seqlens);
+    DBuf dcc(d, DType::kI32, {static_cast<int64_t>(cu_chunk.size())}, cu_chunk.data());
+    DBuf dlc(d, DType::kI32, {1}, last_chunk);
+    DBuf dsi(d, DType::kI32, {static_cast<int64_t>(seq_idx.size())}, seq_idx.data());
+    DBuf final_states(d, ssm_dtype, {1, Hh, P, N});
+    {
+      Tensor At = MakeTensor(mr.a_neg.get(), DType::kF32, d.q.device, {Hh});
+      Tensor Dt = MakeTensor(mr.d_term.get(), DType::kF32, d.q.device, {Hh});
+      Tensor dbt = MakeTensor(mr.dt_bias.get(), DType::kF32, d.q.device, {Hh});
+      vt::Mamba2Args args;
+      args.chunk_size = chunk;
+      // mamba_mixer2.py:888-889: dt_softplus=True, dt_limit=(0.0, +inf). `z` is
+      // NOT passed to the scan — upstream gates in the norm below (:583-585), and
+      // passing it here would apply silu(z) twice.
+      args.dt_softplus = true;
+      args.dt_min = 0.0F;
+      args.dt_max = std::numeric_limits<float>::infinity();
+      vt::Mamba2ChunkScan(d.q, y.t(), final_states.t(), ssm_x.t(), dt.t(), At, ssm_b.t(),
+                          ssm_c.t(), &Dt, /*z=*/nullptr, &dbt, carry_in ? ssm_state : nullptr,
+                          dcu.t(), dcc.t(), dlc.t(), dsi.t(), args);
+    }
+    if (ssm_state != nullptr) {
+      // The scan READS `ssm_state` as its initial state, so the final state lands
+      // in its own buffer and is copied back afterwards rather than aliasing the
+      // operand the kernel is still reading.
+      const size_t nb = static_cast<size_t>(Hh * P * N) * vt::SizeOf(ssm_dtype);
+      d.b.Copy(d.q, ssm_state->data, final_states.t().data, nb);
+    }
+    MambaArmCountsSlot().chunk_scan_calls += 1;
   }
 
   // 6. the silu-gated GROUP RMS norm (Mixer2RMSNormGated, mamba_mixer2.py:478-480,
@@ -1943,24 +2043,46 @@ struct NemotronHRecurrentIo {
   DBuf ssm;   // f32 [R, heads, head_dim, state_size]
 };
 
+// A CONTIGUOUS SUB-RANGE of a per-request i32 metadata vector, [first, first+n).
+// A2-D1 needs one: the recurrent half is split `[decodes, prefills]` and only
+// the PREFILL rows are gathered now, so the gather can no longer be handed the
+// whole `[R]` index vector. Mirrors `SubView` in qwen3_5.cpp, which the GDN
+// decode arm already uses for exactly this purpose.
+Tensor MetaSubView(const Tensor& t, int64_t first, int64_t n) {
+  VT_CHECK(t.rank == 1 && t.dtype == DType::kI32 && t.IsContiguous(),
+           "NemotronH paged forward: a metadata sub-view needs a contiguous i32 [R]");
+  VT_CHECK(first >= 0 && n >= 0 && first + n <= t.shape[0],
+           "NemotronH paged forward: metadata sub-view runs past the vector");
+  Tensor v = t;
+  v.data = static_cast<char*>(t.data) + static_cast<size_t>(first) * sizeof(int32_t);
+  v.rank = 1;
+  v.shape[0] = n;
+  v.stride[0] = 1;
+  return v;
+}
+
+// Gather `rows` state rows named by `state_idx` (already narrowed to the rows
+// this call owns) into compact f32 working buffers.
 NemotronHRecurrentIo GatherNemotronHState(Dev d, const GdnStateCache& cache,
-                                          const NemotronHParams& params, int64_t R,
-                                          NemotronHPagedStep& sdi) {
+                                          const NemotronHParams& params, int64_t rows,
+                                          const Tensor& state_idx,
+                                          const Tensor& has_initial) {
   const int64_t Cd = params.conv_dim();
   const int64_t Kw = params.conv_kernel;
   const int64_t Hh = params.mamba_num_heads;
   const int64_t P = params.mamba_head_dim;
   const int64_t N = params.ssm_state_size;
-  NemotronHRecurrentIo io{DBuf(d, DType::kF32, {R, Cd, Kw - 1}),
-                          DBuf(d, DType::kF32, {R, Hh, P, N})};
-  Tensor hinit = sdi.state_has_initial.t();
-  vt::GdnStateGather(d.q, io.conv.t(), cache.conv_state, sdi.state_idx.t(), &hinit);
-  vt::GdnStateGather(d.q, io.ssm.t(), cache.ssm_state, sdi.state_idx.t(), &hinit);
+  NemotronHRecurrentIo io{DBuf(d, DType::kF32, {rows, Cd, Kw - 1}),
+                          DBuf(d, DType::kF32, {rows, Hh, P, N})};
+  Tensor hinit = has_initial;
+  vt::GdnStateGather(d.q, io.conv.t(), cache.conv_state, state_idx, &hinit);
+  vt::GdnStateGather(d.q, io.ssm.t(), cache.ssm_state, state_idx, &hinit);
+  MambaArmCountsSlot().state_gathers += 2;
   return io;
 }
 
 void ScatterNemotronHState(Dev d, const GdnStateCache& cache, NemotronHRecurrentIo& io,
-                           NemotronHPagedStep& sdi) {
+                           const Tensor& state_idx) {
   // `cache` is the runner's page and is updated IN PLACE. The mutable copies are
   // views over the same storage; `GdnStateScatter` writes only the rows named by
   // `state_idx` and leaves every other slot byte-identical, which is the
@@ -1968,11 +2090,18 @@ void ScatterNemotronHState(Dev d, const GdnStateCache& cache, NemotronHRecurrent
   // once A2-B lifts the request count.
   Tensor conv_page = cache.conv_state;
   Tensor ssm_page = cache.ssm_state;
-  vt::GdnStateScatter(d.q, conv_page, io.conv.t(), sdi.state_idx.t());
-  vt::GdnStateScatter(d.q, ssm_page, io.ssm.t(), sdi.state_idx.t());
+  vt::GdnStateScatter(d.q, conv_page, io.conv.t(), state_idx);
+  vt::GdnStateScatter(d.q, ssm_page, io.ssm.t(), state_idx);
+  MambaArmCountsSlot().state_scatters += 2;
 }
 
 }  // namespace
+
+NemotronHMambaArmCounts NemotronHTakeMambaArmCounts() {
+  NemotronHMambaArmCounts out = MambaArmCountsSlot();
+  MambaArmCountsSlot() = NemotronHMambaArmCounts{};
+  return out;
+}
 
 ForwardLogits NemotronHPagedForward(const NemotronHHostWeights& host,
                                     const NemotronHParams& params,
@@ -2147,64 +2276,121 @@ ForwardLogits NemotronHPagedForward(const NemotronHHostWeights& host,
       if (trace != nullptr && trace->capture) mvec = DownloadF32(d, carry, adt, T * H);
 #endif
     } else if (mamba_on_device) {
-      // ── A2-Q1: the CARRY, without leaving the device. ──
+      // ── A2-Q1's carry, SPLIT decode-first by A2-D1 (#1311). ──
       //
-      // The gather/scatter pair and the `has_initial = true` reasoning are A2-P's
-      // and are UNCHANGED (see the block comment above `NemotronHRecurrentIo`).
-      // What changes is everything between them: the two D2H downloads, the host
-      // mixer with its per-call fp8 dequant, and the two H2D uploads are gone,
-      // and the gathered rows are handed straight to the device mixer, which
-      // advances them IN PLACE in the same buffers the scatter then writes back.
+      // `mamba_mixer2.py:754-767` splits the projected states as
+      // `[num_decode_tokens, num_prefill_tokens]` and then runs TWO DIFFERENT
+      // KERNEL PAIRS over the halves: `causal_conv1d_update` +
+      // `selective_state_update` on the decodes (:1012, :1087), and
+      // `causal_conv1d_fn` + `mamba_chunk_scan_combined` on the prefills
+      // (:869-890). A2-Q1 ran the PREFILL pair over both halves.
+      //
+      // The selection here is the metadata's own decode/prefill counts, NOT the
+      // token count. A one-token prefill is also `T == 1` and must keep the
+      // chunk scan: it carries no state in, and `prefill_has_initial_state` can
+      // be 0 for it, which the single-step kernels have no way to express.
+      //
+      // WHAT GOES WITH THE SWAP. The decode half loses the gather AND the
+      // scatter, because both single-step kernels take `state_indices` and read
+      // and write the page in place at the slot — upstream's decode half has
+      // neither, and `qwen3_5.cpp:4730-4746` already records why that matters
+      // ("the two host<->device copies per sequence per layer that dominate the
+      // decode memcpy tax"). The PREFILL half keeps them, and its gather is now
+      // narrowed to the prefill rows alone.
       const GdnStateCache& cache = input.gdn_state[mamba_i];
-      NemotronHRecurrentIo io = GatherNemotronHState(d, cache, params, R, sdi);
       const int64_t conv_row = params.conv_dim() * (params.conv_kernel - 1);
       const int64_t ssm_row =
           params.mamba_num_heads * params.mamba_head_dim * params.ssm_state_size;
+      const std::vector<int32_t>& qsl = *input.gdn_meta.non_spec_query_start_loc;
+      const int64_t nd = input.gdn_meta.num_decodes;
+      const int64_t np = input.gdn_meta.num_prefills;
+      const int64_t nd_tok = input.gdn_meta.num_decode_tokens;
+      const bool decode_step = nd > 0 && NemotronHDecodeStepEnabled();
       DBuf mixed(d, adt, {T, H});
       // Zeroed first, exactly as the host arm's `mvec.assign(T * H, 0.0F)`
       // below does, so a token no request's query range covers reads as zero
       // rather than as whatever the scratch pool last held there.
       mixed.Zero(d);
       const size_t esz = vt::SizeOf(adt);
-      for (int64_t r = 0; r < R; ++r) {
-        // The RECURRENT half's own query offsets, read exactly as the host arm
-        // below reads them, so a mixed batch stays correct when A2-B lifts the
-        // request count.
-        const std::vector<int32_t>& qsl = *input.gdn_meta.non_spec_query_start_loc;
-        const int64_t t0 = qsl[static_cast<size_t>(r)];
-        const int64_t t1 = qsl[static_cast<size_t>(r + 1)];
-        VT_CHECK(t1 > t0 && t1 <= T,
-                 "NemotronH paged forward: a request's query range is empty or "
-                 "runs past the step's tokens");
-        Tensor rows = MakeTensor(static_cast<char*>(normed.t().data) +
-                                     static_cast<size_t>(t0 * H) * esz,
-                                 adt, d.q.device, {t1 - t0, H});
-        Tensor cr = MakeTensor(static_cast<char*>(io.conv.t().data) +
-                                   static_cast<size_t>(r * conv_row) * sizeof(float),
-                               DType::kF32, d.q.device,
-                               {1, params.conv_dim(), params.conv_kernel - 1});
-        Tensor sr = MakeTensor(static_cast<char*>(io.ssm.t().data) +
-                                   static_cast<size_t>(r * ssm_row) * sizeof(float),
-                               DType::kF32, d.q.device,
-                               {1, params.mamba_num_heads, params.mamba_head_dim,
-                                params.ssm_state_size});
-        // `has_initial = true` in EVERY case, over a row the gather has already
-        // zeroed when the mask said fresh — A2-P's property, restated here
-        // because this arm is the one that now consumes it.
-        DBuf got = NemotronHMamba2MixerDevice(d, lw.mamba, params, rows, t1 - t0, adt,
-                                              &cr, &sr, /*has_initial=*/true);
-        d.b.Copy(d.q, static_cast<char*>(mixed.t().data) +
-                          static_cast<size_t>(t0 * H) * esz,
-                 got.t().data, static_cast<size_t>((t1 - t0) * H) * esz);
+
+      // ── the DECODE half: one batched single-step call, in place at the slots ──
+      if (decode_step) {
+        VT_CHECK(nd_tok == nd,
+                 "NemotronH paged forward: the single-step decode arm needs "
+                 "exactly one token per decode request (`causal_conv1d_update` "
+                 "and `selective_state_update` are both one-token ops); the "
+                 "metadata reports more, which is the speculative shape #810 W5 "
+                 "owns");
+        VT_CHECK(qsl[0] == 0 && qsl[static_cast<size_t>(nd)] == nd_tok,
+                 "NemotronH paged forward: the decode rows are not the LEADING "
+                 "one-token range the GDN metadata promises (gdn_attn.cpp:49-52)");
+        NemotronHMambaDecodeSlots slots;
+        slots.conv_cache = cache.conv_state;
+        slots.ssm_cache = cache.ssm_state;
+        slots.state_idx = MetaSubView(sdi.state_idx.t(), 0, nd);
+        Tensor rows = MakeTensor(normed.t().data, adt, d.q.device, {nd_tok, H});
+        DBuf got = NemotronHMamba2MixerDevice(d, lw.mamba, params, rows, nd_tok, adt,
+                                              /*conv_state=*/nullptr,
+                                              /*ssm_state=*/nullptr,
+                                              /*has_initial=*/true, &slots);
+        d.b.Copy(d.q, mixed.t().data, got.t().data,
+                 static_cast<size_t>(nd_tok * H) * esz);
       }
-      ScatterNemotronHState(d, cache, io, sdi);
+
+      // ── the PREFILL half (and, with the arm opted out, every row) ──
+      const int64_t chunk_first = decode_step ? nd : 0;
+      const int64_t chunk_rows = R - chunk_first;
+      if (chunk_rows > 0) {
+        NemotronHRecurrentIo io = GatherNemotronHState(
+            d, cache, params, chunk_rows,
+            MetaSubView(sdi.state_idx.t(), chunk_first, chunk_rows),
+            MetaSubView(sdi.state_has_initial.t(), chunk_first, chunk_rows));
+        for (int64_t r = chunk_first; r < R; ++r) {
+          // The RECURRENT half's own query offsets, read exactly as the host arm
+          // below reads them, so a mixed batch stays correct when A2-B lifts the
+          // request count.
+          const int64_t t0 = qsl[static_cast<size_t>(r)];
+          const int64_t t1 = qsl[static_cast<size_t>(r + 1)];
+          VT_CHECK(t1 > t0 && t1 <= T,
+                   "NemotronH paged forward: a request's query range is empty or "
+                   "runs past the step's tokens");
+          const int64_t g = r - chunk_first;  // this row's index INSIDE the gather
+          Tensor rows = MakeTensor(static_cast<char*>(normed.t().data) +
+                                       static_cast<size_t>(t0 * H) * esz,
+                                   adt, d.q.device, {t1 - t0, H});
+          Tensor cr = MakeTensor(static_cast<char*>(io.conv.t().data) +
+                                     static_cast<size_t>(g * conv_row) * sizeof(float),
+                                 DType::kF32, d.q.device,
+                                 {1, params.conv_dim(), params.conv_kernel - 1});
+          Tensor sr = MakeTensor(static_cast<char*>(io.ssm.t().data) +
+                                     static_cast<size_t>(g * ssm_row) * sizeof(float),
+                                 DType::kF32, d.q.device,
+                                 {1, params.mamba_num_heads, params.mamba_head_dim,
+                                  params.ssm_state_size});
+          // `has_initial = true` in EVERY case, over a row the gather has already
+          // zeroed when the mask said fresh — A2-P's property, restated here
+          // because this arm is the one that now consumes it.
+          DBuf got = NemotronHMamba2MixerDevice(d, lw.mamba, params, rows, t1 - t0, adt,
+                                                &cr, &sr, /*has_initial=*/true);
+          d.b.Copy(d.q, static_cast<char*>(mixed.t().data) +
+                            static_cast<size_t>(t0 * H) * esz,
+                   got.t().data, static_cast<size_t>((t1 - t0) * H) * esz);
+        }
+        ScatterNemotronHState(d, cache, io,
+                              MetaSubView(sdi.state_idx.t(), chunk_first, chunk_rows));
+      }
+      VT_CHECK(!decode_step || chunk_rows == np,
+               "NemotronH paged forward: the rows left to the chunk scan are not "
+               "exactly the metadata's prefill rows");
       ++mamba_i;
       carry = std::move(mixed);
       if (trace != nullptr && trace->capture) mvec = DownloadF32(d, carry, adt, T * H);
     } else if (lw.block == NemotronHBlock::kMamba) {
       // ── the CARRY. This is the unit. ──
       const GdnStateCache& cache = input.gdn_state[mamba_i];
-      NemotronHRecurrentIo io = GatherNemotronHState(d, cache, params, R, sdi);
+      NemotronHRecurrentIo io =
+          GatherNemotronHState(d, cache, params, R, sdi.state_idx.t(),
+                               sdi.state_has_initial.t());
       const int64_t conv_row = params.conv_dim() * (params.conv_kernel - 1);
       const int64_t ssm_row =
           params.mamba_num_heads * params.mamba_head_dim * params.ssm_state_size;
@@ -2276,7 +2462,7 @@ ForwardLogits NemotronHPagedForward(const NemotronHHostWeights& host,
       io.ssm = UploadAs(d, ssm_all, DType::kF32,
                         {R, params.mamba_num_heads, params.mamba_head_dim,
                          params.ssm_state_size});
-      ScatterNemotronHState(d, cache, io, sdi);
+      ScatterNemotronHState(d, cache, io, sdi.state_idx.t());
       ++mamba_i;
       carry = UploadAs(d, mvec, adt, {T, H});
     } else {
