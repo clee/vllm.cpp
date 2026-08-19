@@ -804,8 +804,13 @@ environment:
     build, and prefer named targets.
     **This is the SECOND recorded `unknown (no contact)` for this device.** The
     first was 2026-08-17, cited in AGENTS.md as the reason a lost controller
-    contact is a live state rather than a hypothetical. Two independent
-    occurrences in three days is a property of the box, not a coincidence.
+    contact is a live state rather than a hypothetical. **Two readings do not
+    make a rate, and neither one's cause was established**, so what this second
+    occurrence adds is that the state recurs and must be planned for — not that
+    the box has a property. Treating `unknown (no contact)` as a state a long
+    job can enter is warranted by either occurrence alone. Whether the two share
+    a cause is exactly what the boot list above would answer, and until somebody
+    reads it, the count is a reason to keep looking rather than a finding.
   - `k3s` runs here and is `enabled`; `sudo systemctl stop k3s` frees its pods
     (5 containerd shims survive the stop). It was not the crash cause.
   - Transfer code with `git archive` (NOT rsync — see

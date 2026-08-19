@@ -1657,10 +1657,33 @@ Each item names the stage that owns it. Nothing here is claimed by W1.
   fix rests on: *the captured forward demands no more blocks of any size class
   than the eager forward at the same shape did*.
 
-  **What supports it is a reading of the code, not a measurement.** Both arms run
-  the same `DenseForwardLayers`, and the capture arm draws its persistent step
-  inputs from a DEDICATED pool, so its main-pool demand is a subset of the cold
-  step's. **No test asserts that.** The device gate would go red if the
+  **What supports it is a reading of the code, not a measurement -- and the
+  reading this entry first gave was WRONG, though the conclusion survives it.**
+  The withdrawn wording was "both arms run the same `DenseForwardLayers`". They
+  call the same function and take DIFFERENT branches of it. The cold arm passes
+  13 arguments and lets `persistent_sdi` default to `nullptr`
+  (`src/vllm/model_executor/models/qwen3_5.cpp:11153-11156`); the capture arm
+  passes `dbuf ? s.dev.get() : nullptr` as a 14th (`:11084-11087`). The MoE
+  driver carries the same asymmetry (`:10595-10598` cold, `:10529-10533`
+  capture). Sameness was never the argument, and asserting it invited a reader to
+  check the wrong thing.
+
+  **The containment holds for the reason the branch itself gives, which is
+  stronger than sameness.** At `:8858-8890`, the `persistent_sdi == nullptr` arm
+  calls `BuildStepDevInputs` into the ACTIVE (main) pool and then
+  `MaybeBuildAttnCosSin`; the non-null arm allocates NOTHING there and calls only
+  `FillAttnCosSin` into buffers `s.dev` already owns, built pre-capture under
+  `ActivePoolScope persistent_scope(&PersistentDecodeInputPool(d.b))`
+  (`:11043`, `:10493`) -- a DIFFERENT pool from the one `PreGrowForCapture` grows.
+  So at the one point where the arms diverge, the capture arm's main-pool demand
+  is a strict SUBSET of the cold arm's, and the asymmetry runs in the safe
+  direction. The `warm = false` reset paths (`:10902`, `:10952`; `:10355`,
+  `:10406`) reset the graph and force a fresh cold step, so no slot ever
+  pre-grows from a profile recorded at a shape it no longer runs.
+
+  **None of that is a measurement, and the residual risk is unchanged**: the
+  argument covers the divergence the code has TODAY, and a future capture-only
+  allocation would break it silently. **No test asserts it.** The device gate would go red if the
   assumption broke *at the gate's shape*, which is one shape on one synthetic
   model, and the CPU gate asserts the pool primitive rather than the drivers'
   use of it. So a capture-only allocation with no eager counterpart -- a new
@@ -2024,6 +2047,95 @@ Each item names the stage that owns it. Nothing here is claimed by W1.
   set against a one-length one, on a real checkpoint, which needs the same `dgx`
   window with weights that the async battery below needs. Owner: row
   **`ENG-CUDAGRAPH-BREAK`**.
+
+- **The block-table bound this row lands is CPU-ONLY, and the identical
+  unbounded read stays live on five other backends**
+  ([#1406](https://github.com/mudler/vllm.cpp/issues/1406), found while fixing
+  [#1390](https://github.com/mudler/vllm.cpp/issues/1390)).
+  [#1394](https://github.com/mudler/vllm.cpp/issues/1394) is scoped to
+  `vt::cpu::PagedAttentionKernel` and to the seam case that fed it a short table,
+  and both halves land here -- so this row CLOSES it. **It does not close the
+  read.** Six backends register `OpId::kPagedAttention` and the other five carry
+  the byte-identical index with `j` bounded only by `seq_lens[r]`:
+
+  | Backend | Sites | Where |
+  |---|---|---|
+  | CUDA | 12 | `src/vt/cuda/cuda_paged_attn.cu:230,385,521,676,837,1067,1310,1387,1583,1663,1830,1912` |
+  | ROCm | 7 | `src/vt/rocm/rocm_paged_attn.hip:226,424,557,765,1064,1277,1530` |
+  | Metal | 5 | `src/vt/metal/metal_msl.h:1054,1142,1293,1341,1591` |
+  | Tenstorrent | 2 | `src/vt/tenstorrent/tenstorrent_ops.cpp:3070,3100`, the HOST fallback |
+  | Vulkan | 1 | `src/vt/vulkan/shaders/vt_paged_attn.comp:110` |
+
+  **27 sites, counted with `grep -c` on this tree rather than read off a
+  truncated listing** -- which is the failure that made #1406's first revision
+  say nine. Two sites are NOT in that list because they are already bounded, and
+  saying which matters as much as the count: Tenstorrent's device-staging path
+  (`tenstorrent_ops.cpp:2258-2267`) walks `c < max_blocks` from
+  `block_table.shape[1]`, so it cannot leave the table.
+
+  **The seam cannot hold the bound as written**, which is why this is an issue
+  and not a follow-up commit. `vt::PagedAttention` (`src/vt/ops.cpp:3575-3577`)
+  validates the block table's ROW half only, and it performs zero content
+  dereferences today -- on a device path `seq_lens` is device memory the host
+  must not read. The one host-readable quantity, `PagedAttentionArgs::max_seq_len`,
+  is documented at `include/vt/ops.h:806-812` as a value for which "an upper
+  bound is safe", so a refusal keyed on it rejects calls the contract permits.
+  Vulkan and Metal make this concrete from the other side: both pass only
+  `block_table.stride[0]` and `stride[1]` to the shader
+  (`src/vt/vulkan/vulkan_ops.cpp:994-995`, `src/vt/metal/metal_ops.mm:940-941`),
+  never the column count, so those shaders could not bound the read even if they
+  wanted to. #1406 carries the three candidate resolutions and the argument for
+  each. Owner: row **`ENG-CUDAGRAPH-BREAK`**.
+
+- **The kernel refusal this row lands is REACHED but UNGATED, and PR
+  [#1407](https://github.com/mudler/vllm.cpp/pull/1407) is the gate**
+  ([#1390](https://github.com/mudler/vllm.cpp/issues/1390)). This is a staged
+  slice under AGENTS.md's "Nothing lands dead", named here rather than left to be
+  discovered.
+
+  **What is unreached is the TEST, not the code.** The refusal at
+  `src/vt/cpu/cpu_paged_attn.cpp:145-155` sits on the production paged-attention
+  path and every existing case runs through it; what no case does is FEED it a
+  short table. That is this pull request's own doing and is not an oversight to
+  regret: its second half sizes `SpecAttnMeta`'s block table correctly, so after
+  it, no test in the tree supplies the input the refusal exists to reject.
+  `grep -rn "block table is shorter" tests/` returns nothing, and deleting the
+  guard leaves `test_qwen3_5_decode_graph_seam` at 8/8 and `test_ops_paged_attn`
+  at 14/14, both exit 0.
+
+  **The detecting case is written and reviewed in #1407**, which adds the
+  `CHECK_THROWS_AS` over-long `seq_lens` case and two negative controls to
+  `tests/vt/test_ops_paged_attn.cpp`, and which merges IMMEDIATELY after this one
+  in the sequence #1393 then #1407 then #1391. Duplicating it here would leave
+  two gates for one refusal and no owner for either, so it is deliberately not
+  duplicated. Until #1407 lands, the refusal's predicate is supported by the
+  measurement in `## Gates` G1 -- `origin/main` built with ONLY the kernel refusal
+  and WITHOUT the test-data fix, where the refusal FIRED (exit 1, 8 cases / 7
+  passed / 1 failed) -- and by no test in this tree. Owner: row
+  **`ENG-CUDAGRAPH-BREAK`**.
+
+- **`PreGrowForCapture` ignores the pool's own soft cap, and would grow into the
+  abort it exists to prevent under a non-zero one** (INERT today; recorded so it
+  is not rediscovered as a fresh defect). `include/vllm/model_executor/models/device_pool.h:165-183`
+  frees blocks back to the driver when `retained_ + key > cap`, while
+  `PreGrowForCapture` adds to `retained_` without consulting `cap` at all. A
+  `cudaFree` inside a captured region aborts the capture exactly as a `cudaMalloc`
+  does, so a pre-grow that tripped the cap DURING capture would reopen #1380 by
+  the other API. Nothing can reach it now: every platform resolves
+  `device_pool_cap_bytes` to 0, which disables the cap entirely, and the pre-grow
+  itself runs OUTSIDE the captured region. A comment naming the coupling landed
+  with this row; the refusal or the cap-aware pre-grow is owed by whichever row
+  first sets a non-zero cap. Owner: row **`ENG-CUDAGRAPH-BREAK`**.
+
+- **`MarkStepBoundary()` is called on `Pool(b)` only, so the persistent decode
+  input pool's demand profile is never read** (INFO, harmless). Both Qwen3.5
+  drivers call `Pool(b).MarkStepBoundary()`; `PersistentDecodeInputPool(d.b)` is
+  a separate `DevicePool` whose `base` therefore stays 0 and whose `peak`
+  ratchets monotonically for the process lifetime. Nothing consumes either value
+  for that pool -- `PreGrowForCapture` is only ever called on `Pool(b)` -- so the
+  effect is two unread counters and not a leak or a wrong pre-grow. It is
+  recorded because a later reader who wires a second pre-grow would inherit a
+  profile that has never been reset. Owner: row **`ENG-CUDAGRAPH-BREAK`**.
 
 ## Outcome
 

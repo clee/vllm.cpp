@@ -262,6 +262,23 @@ class DevicePool {
   // block created here is a `cudaMalloc` and would abort a capture in progress.
   // Idempotent, and a no-op once the free list is deep enough — which is the
   // steady state, so a warm server pays nothing for it.
+  //
+  // IT IGNORES THE SOFT CAP, AND UNDER A NON-ZERO ONE THAT REOPENS #1380 BY THE
+  // OTHER API. This function adds to `retained_` without consulting `cap`,
+  // while `Put` above frees a returned block STRAIGHT TO THE DRIVER once
+  // `retained_ + key > cap`. A `cudaFree` inside a captured region aborts the
+  // capture exactly as a `cudaMalloc` does — and `Put` is called from INSIDE the
+  // captured forward, every time a scratch `DBuf` there goes out of scope. So a
+  // pre-grow that pushed `retained_` over the cap would arm the abort it exists
+  // to prevent, at the first block the capture returned.
+  //
+  // Nothing can reach that today and this is a hazard note, not a live defect:
+  // every platform resolves `residency_policy().device_pool_cap_bytes` to 0,
+  // and `cap == 0` is the uncapped fast path in `Put`. WHOEVER FIRST SETS A
+  // NON-ZERO CAP OWES THE FIX HERE — either pass `cap` in and refuse to grow
+  // past it, or make the captured region's `Put` cap-exempt. Recorded under
+  // `## Owed` in `.agents/specs/eng-cudagraph-break.md`; owner row
+  // `ENG-CUDAGRAPH-BREAK`.
   size_t PreGrowForCapture(vt::Backend& b, const StepDemand& demand) {
     RequireOwnDevice(b, "PreGrowForCapture");
     if (Bypass()) return 0;  // no free list to grow; every Get is a driver call

@@ -201,18 +201,29 @@ std::vector<float> Read(vt::Backend& b, vt::Queue& q, const vllm::ForwardLogits&
   return h;
 }
 
-// The five-step comparison every driver below runs. `step_kind` names each step
-// so a failure says WHICH replay diverged rather than only that one did.
+// The five-step comparison every driver below runs. The step-kind table names
+// each step so a failure says WHICH replay diverged rather than only that one
+// did — which is the whole point of recording the steps separately, so a WRONG
+// name is worse here than no name.
+//
+// THE SPEC DRIVER DOES NOT RUN THIS SEQUENCE, so it does not use this table. A
+// single-slot driver goes cold, capture, then replays; a SPEC step always takes
+// the two-slot parity ring, so it goes cold, cold, capture, capture, replay
+// (see the note at its case). Naming step 1 "capture" there would print
+// "capture" for the second COLD step.
 const char* kStepKind[5] = {"cold (eager pre-warm)", "capture", "replay 1", "replay 2",
                             "replay 3"};
+const char* kSpecRingStepKind[5] = {"slot 0 cold", "slot 1 cold", "slot 0 capture",
+                                    "slot 1 capture", "slot 0 replay"};
 
 size_t CompareStep(int step, const std::vector<float>& eager,
-                   const std::vector<float>& graphed) {
+                   const std::vector<float>& graphed,
+                   const char* const* step_kind = kStepKind) {
   REQUIRE(eager.size() == graphed.size());
   size_t differing = 0;
   for (size_t i = 0; i < eager.size(); ++i)
     if (std::memcmp(&eager[i], &graphed[i], sizeof(float)) != 0) ++differing;
-  CHECK_MESSAGE(differing == 0, "G1 step " << step << " (" << kStepKind[step]
+  CHECK_MESSAGE(differing == 0, "G1 step " << step << " (" << step_kind[step]
                                            << "): " << differing << " of "
                                            << eager.size() << " logits differ");
   for (float x : graphed) REQUIRE(std::isfinite(x));
@@ -1018,7 +1029,8 @@ TEST_CASE("G1 CUDA W6: a SPEC shape captures on BOTH ring slots and replays (#13
     }
     captured_after[static_cast<size_t>(step)] = graphed.captured() ? 1 : 0;
     if (failed[static_cast<size_t>(step)].empty())
-      total += CompareStep(step, eager[static_cast<size_t>(step)], g);
+      total += CompareStep(step, eager[static_cast<size_t>(step)], g,
+                           kSpecRingStepKind);
   }
   for (int step = 0; step < 5; ++step) {
     MESSAGE("spec step " << step << ": captured="
