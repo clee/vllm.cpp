@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <new>  // over-aligned operator new/delete (kDeviceAliasAlignment)
 #include <optional>
 #include <string>
 #include <unordered_map>
@@ -170,6 +171,13 @@ bool MakeHostBytesDeviceAliasable(const OwnedTensor& w) {
   // this tree still compiles for, and it does not require the size to be a
   // multiple of the alignment.
   void* p = ::operator new(nb, std::align_val_t{kDeviceAliasAlignment});
+  // The keep-alive is built IMMEDIATELY, before anything that can throw, so the
+  // block is owned from the instant it exists. `shared_ptr`'s own control-block
+  // allocation is the throwing step, and holding a raw `p` across it is how an
+  // allocation leaks on a path nobody tests.
+  std::shared_ptr<const void> keep(static_cast<const void*>(p), [](const void* q) {
+    ::operator delete(const_cast<void*>(q), std::align_val_t{kDeviceAliasAlignment});
+  });
   std::memcpy(p, self.bytes.data(), nb);
   // ORDER: release the OLD pages while they are still mapped, then re-point.
   // The assignment below destroys the vector that owns them, and madvise'ing a
@@ -177,9 +185,6 @@ bool MakeHostBytesDeviceAliasable(const OwnedTensor& w) {
   // discards whatever mapped into the hole first — the same trap
   // `AdoptDeviceBytesAsHost` documents at length.
   DropResidentInteriorPages(self.bytes.data(), nb);
-  std::shared_ptr<const void> keep(static_cast<const void*>(p), [](const void* q) {
-    ::operator delete(const_cast<void*>(q), std::align_val_t{kDeviceAliasAlignment});
-  });
   self.bytes = OwnedBytes::Borrow(static_cast<const uint8_t*>(p), nb, std::move(keep));
   return true;
 }

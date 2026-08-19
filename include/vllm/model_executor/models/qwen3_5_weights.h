@@ -20,6 +20,7 @@
 // toggles retain the split residents.
 #pragma once
 
+#include <cstddef>  // size_t, for kDeviceAliasAlignment
 #include <cstdint>
 #include <functional>
 #include <memory>
