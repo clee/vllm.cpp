@@ -290,51 +290,60 @@ legs of one binary:
   quotes #1311's own bar — "Refuted if per-token time moves less than 3%" — and
   0.388% is under it. See §6.1.
 
-**★ The `dgx:gpu0` sm_121a leg then READ `95/96 DIVERGENCE` (`RC=1`) — AND SO
-DID ITS CHUNK-SCAN LEG, so this row is CLEARED.** Both legs of one binary on
-that box return `95/96 full rows=3 short rows=0 mode=decode`, with the counters
-confirming they ran different kernels (`state_update_rows=23 chunk_scan_calls=0
-gathers=0 scatters=0` against `0 / 23 / 46 / 46`). The arm that predates A2-D1
-diverges identically to the arm that replaces it, so **A2-D1 does not cause it**.
-Filed as [#1388](https://github.com/mudler/vllm.cpp/issues/1388) — the sm_121a
-re-run `STATUS` has carried as pending, failing on both arms.
+**★ The `dgx:gpu0` sm_121a leg read `95/96 DIVERGENCE` on BOTH kernel arms, and
+a THIRD leg resolved it: the cause is A2-Q1's device mamba arm, NOT this row and
+NOT the architecture.** Three legs of one binary:
 
-**★ What #1388's CAUSE is remains UNDECIDED, and the same counters show why.**
-The four kernel counters are non-zero in both legs and are reachable only from
-`mamba_on_device`, so **both legs carried A2-Q1's FP8 W8A8 projections**; the
-script pinned `VT_NEMOTRON_H_DEVICE_MAMBA=1` in both. `main` has no device mamba
-arm at all. So `95/96` on both legs fits either "the host diverges" or
-"A2-Q1's FP8 projections diverge", and this A/B separates neither. #1312's
-`96/96` on a `main`-based GB10 tree corroborates the second without settling it,
-being a different binary. **Leg 3** (`VT_NEMOTRON_H_DEVICE_MAMBA=0`, same
-binary) is the discriminator and is queued; if it reads `96/96` the finding
-belongs to A2-Q1 (#1289), which carries the only real speed win measured this
-session.
+| leg | device mamba | tokens | s/token | vs vLLM |
+|---|---|---|---|---|
+| `on` (single-step) | 1 | `95/96 DIVERGENCE` | 1.584694 | 110.3x |
+| `off` (chunk scan) | 1 | `95/96 DIVERGENCE` | 1.554233 | 108.2x |
+| **`hostmamba`** | **0** | **`96/96 STRICT PASS`** | 10.318897 | 718.1x |
 
-**The per-host verdict, which is the acceptance statement:**
+**Leg 3's own counters are what make this a discrimination and not a
+correlation**: `state_update_rows=0 chunk_scan_calls=0 conv_update_rows=0
+conv_fwd_calls=0` with `gathers=46 scatters=46`, which is the host path's
+signature and nothing else's. Without them the leg would only correlate a flag
+with an outcome. Filed as
+[#1388](https://github.com/mudler/vllm.cpp/issues/1388).
 
-| host | ON | OFF | per-token move |
+**The divergence is ONE token and both device legs lose the SAME one** —
+prompt 2, position 32 of 32, `11286` against the oracle's `3468`, positions 1-31
+byte-identical. The repaired verdict grep captured it; the first GB10 run threw
+it away. **Defect or bf16 near-tie is NOT settled**, and a separate fresh
+implementer owns root-causing it from the oracle's top-2 margin.
+
+**The acceptance statement for THIS row is unchanged.** Each host returns the
+same verdict on both KERNEL arms — `96/96` vs `96/96` on sm_110, `95/96` vs
+`95/96` on sm_121a — so the swap is token-neutral, and the sm_121a token belongs
+to the arm underneath it.
+
+### The ±2% on/off delta is NOISE, proven by a sign flip
+
+| run | on | off | on-vs-off |
 |---|---|---|---|
-| sm_110 | `96/96 STRICT PASS` | `96/96 STRICT PASS` | +0.388% slower |
-| sm_121a | `95/96 DIVERGENCE` | `95/96 DIVERGENCE` | -1.991% faster |
+| first GB10 | 1.513958 | 1.544706 | **−1.991%** (on faster) |
+| this GB10 | 1.584694 | 1.554233 | **+1.960%** (on slower) |
 
-Each host returns the SAME verdict on both arms ⇒ **token-neutral**. Both moves
-are under #1311's 3% bar ⇒ **speed refuted on both**, and they point in
-OPPOSITE directions, which is itself evidence neither is signal.
+A quantity that reverses direction between two runs of one comparison on one box
+is not a measurement of that comparison. §6.1's refutation was argued from
+#1311's 3% bar; this retires the figures outright.
 
-**NOT established: whether both legs lose the SAME token.** The counts and row
-shape match, which is what supports "neutral", but the driver's `got:`/`exp:`
-ids were discarded by the gate script's own verdict grep. That was a recipe
-defect, found by needing it, and it is fixed so the next run captures them.
+### The larger finding, which is not this row's
+
+A2-Q1's device mamba arm is worth **6.64x per output token on GB10** — 10.318897
+s off against 1.554233 s on — closing **718.1x → 108.2x** versus vLLM, decode
+busy 7.86% → 10.18%. It agrees in direction and rough magnitude with #1289's
+independent Thor A/B (7.17x). **ONE run per leg on a contended box**, engine
+load excluded; the 6.64x is large enough to survive that and the ~2% deltas are
+not. **108.2x remains an OPEN GAP, not parity**, and no ceiling is declared.
 
 ## Owed
 
-- **[#1388](https://github.com/mudler/vllm.cpp/issues/1388)** — GB10 sm_121a
-  loses one token in 96 on BOTH recurrent arms. Not this row's, and its CAUSE is
-  undecided between the host and A2-Q1's FP8 projections. The queued three-leg
-  run settles it and also reads the `got:`/`exp:` ids the old script discarded,
-  so a wrong carry and a benign bf16 near-tie are finally separated. If leg 3
-  reads `96/96`, #1289 needs flagging.
+- **[#1388](https://github.com/mudler/vllm.cpp/issues/1388)** — RESOLVED to
+  A2-Q1's device mamba arm and no longer this row's. What remains open there is
+  whether the single token is a defect or a bf16 near-tie; a fresh implementer
+  owns it, starting from the oracle's top-2 margin at prompt 2 position 32.
 - **A repeated A/B (n >= 3 per leg) on an idle box.** The sm_110 legs saw an
   18.8% spread in engine-load time and the two hosts' deltas have opposite
   signs; neither 0.388% nor 1.991% is separable from that at n=1.

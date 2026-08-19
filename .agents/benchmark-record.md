@@ -25060,7 +25060,10 @@ stays `PENDING`. Everything above is an internal two-arm number on one named box
 ## A2-D1 — NemotronH decodes on the single-step recurrent kernels (#1311)
 
 **Verdict: this change is TOKEN-NEUTRAL on both gated hosts, and its SPEED
-hypothesis is REFUTED on both.** Measured as a same-binary A/B on `thor:gpu0`
+hypothesis is REFUTED on both. The GB10 `95/96` is A2-Q1's device mamba arm and
+NOT this row and NOT the architecture** — resolved by a three-leg run, see the
+sm_121a section. That same run measured **A2-Q1's arm at 6.64x per output
+token** (718.1x -> 108.2x vs vLLM), which is the larger finding on this page.** Measured as a same-binary A/B on `thor:gpu0`
 (sm_110) and `dgx:gpu0` (GB10, sm_121a); recipe
 `scripts/nemotron-h-a2d1-gpu-gate.sh`.
 
@@ -25241,69 +25244,81 @@ trace of the DECODE WINDOW ONLY on both legs, attributing the 0.776 s/token.
 The counters say what the step stopped launching; the trace would say what the
 0.776 s is actually spent on. Peak host during the run was 44402 MiB.
 
-### sm_121a (GB10) — both arms diverge identically, so the row is CLEARED
+### sm_121a (GB10) — RESOLVED by a three-leg run: the cause is A2-Q1's arm
 
-`dgx:gpu0` in an `rc` lease, `ARCH=121a`, tree `e35c14d52`, same checkpoint,
-`cutlass-fp8: ENABLED for [121a]` so the run is not VOID. Both legs of ONE
-binary:
+`dgx:gpu0`, `rc` lease, `ARCH=121a`, logs `/workspace/a2d1-discriminate/20260819T200231Z`.
+THREE legs of ONE binary. Legs 1 and 2 vary the mamba KERNEL; leg 3 removes
+A2-Q1's device mamba arm entirely (`VT_NEMOTRON_H_DEVICE_MAMBA=0`):
 
-| | ON (single-step) | OFF (chunk scan) |
-|---|---|---|
-| `RC[a3]` | 1 | 1 |
-| TOKEN MATCH | `95/96 full rows=3 short rows=0 mode=decode` | `95/96 full rows=3 short rows=0 mode=decode` |
-| decode-step counters | `state_update_rows=23 chunk_scan_calls=0 conv_update_rows=23 conv_fwd_calls=0 gathers=0 scatters=0` | `state_update_rows=0 chunk_scan_calls=23 conv_update_rows=0 conv_fwd_calls=23 gathers=46 scatters=46` |
-| per output token | 1.513958 s | 1.544706 s |
-| GPU busy | 112 of 1013 = 11.06% | 120 of 1051 = 11.42% |
-| engine load, EXCLUDED | 347.6 s | 399.3 s |
-| `reference-tier` lines | 0 | 0 |
+| leg | device mamba | tokens | s/token | vs vLLM | decode busy |
+|---|---|---|---|---|---|
+| `on` (single-step) | 1 | `95/96 DIVERGENCE` | 1.584694 | 110.3x | 108/1052 = 10.27% |
+| `off` (chunk scan) | 1 | `95/96 DIVERGENCE` | 1.554233 | 108.2x | 108/1061 = 10.18% |
+| **`hostmamba`** | **0** | **`96/96 STRICT PASS`** | 10.318897 | 718.1x | 559/7115 = 7.86% |
 
-The counters prove the two legs ran DIFFERENT kernels and both lost exactly one
-token in 96. **The pre-change arm diverges identically to the post-change arm,
-so A2-D1 does not cause it.** Filed as #1388.
+**★ THE CAUSE IS A2-Q1's DEVICE MAMBA ARM, NOT THE ARCHITECTURE.** Removing it
+on the same binary and box restores `96/96`. The earlier "arch-specific" reading
+was retracted before this ran, and this is the experiment that actually tested
+it.
 
-**★ BUT "arch-specific" is UNDER-DETERMINED, and the same counters are what show
-it.** The four kernel counters are non-zero in BOTH legs, and they are only
-reachable from the `mamba_on_device` branch — so **both legs ran A2-Q1's FP8
-W8A8 projections**, because this script hardcoded `VT_NEMOTRON_H_DEVICE_MAMBA=1`
-in both. `main` carries NO device mamba arm at all: `NemotronHMamba2MixerDevice`,
-`MambaIsFp8` and even the `VT_NEMOTRON_H_DEVICE_MAMBA` knob are ABSENT there
-(`git show origin/main:...nemotron_h_device.cpp | grep -c` returns 0 for each).
+**★ WHY THIS IS A DISCRIMINATION AND NOT A CORRELATION: leg 3's own counters.**
+It reports `state_update_rows=0 chunk_scan_calls=0 conv_update_rows=0
+conv_fwd_calls=0` with `gathers=46 scatters=46` — all four kernel counters at
+zero while the host branch's gather/scatter stay non-zero, which is the
+signature of the host path and of nothing else. 96 ARM lines, 93 decode rows, 3
+prefill rows, `reference-tier lines: 0`. A leg that could not prove which path
+it took would have made this a correlation between a flag and an outcome; the
+counters are what make it an attribution.
 
-So `95/96` on both legs is equally consistent with two hypotheses this A/B
-CANNOT separate:
+**The divergence is ONE token, and both device legs lose the SAME one.** The
+repaired verdict grep — added after the first GB10 run discarded it — captured
+it:
 
-- **(a)** the divergence is the HOST's, i.e. arch-specific; or
-- **(b)** the divergence is **A2-Q1's FP8 projections**, which neither leg
-  turns off.
+```
+got: ...,1044,12837,2505,1261,9943,1307,11286
+exp: ...,1044,12837,2505,1261,9943,1307,3468
+```
 
-A third data point favours (b) without settling it: **#1312's GB10 run on a
-`main`-based tree — no device mamba arm at all — read `96/96 STRICT PASS`.**
-That is a different branch and a different binary, so it is corroboration and
-not the discriminator.
+Prompt 2 (13 prompt tokens, the longest), position 32 of 32, the LAST generated
+token; positions 1-31 byte-identical, and identical between the two device legs.
+Prompts 0 and 1 are 32/32. **Whether this is a defect or a bf16 near-tie is NOT
+settled here** — a fresh implementer is root-causing it from the oracle's top-2
+margin at that position, and a near-tie would mean there is no defect at all.
 
-**The discriminator is leg 3**, `VT_NEMOTRON_H_DEVICE_MAMBA=0` on the SAME
-binary and box, which routes the whole mamba block back to the host reference.
-Its own counters check that it took that path: four kernel counters at 0 with
-gathers/scatters non-zero. `96/96` there means the divergence is A2-Q1's FP8 arm
-and NOT the architecture, which re-scopes #1388 and matters for #1289 — the PR
-carrying the only real speed win measured this session. It is queued.
+### The second result, and it is the larger one
 
-Until it reports, the arch-specific reading is a HYPOTHESIS in this record, not
-a result. Recording it as settled would be the same error as reading the Thor
-pass across to GB10.
+**A2-Q1's device mamba arm is worth 6.64x per output token on GB10**: 10.318897
+s with the arm off against 1.554233 s with it on, closing the vLLM ratio
+**718.1x -> 108.2x**, with decode busy rising 7.86% -> 10.18%. It agrees in
+direction and rough magnitude with #1289's independent Thor decode-window A/B
+(7.17x less time per output token), which is two boxes and two harnesses
+agreeing.
 
-**What is NOT established: whether both legs lose the SAME token.** The counts
-and row shape are identical, which is what supports "neutral", but the driver's
-`got:`/`exp:` ids were discarded by this script's own verdict grep and are not
-in the log. That was a defect in the recipe, found by needing it, and it is
-fixed on the branch so the next run captures them. Until then the claim is "one
-token in 96 on both arms", not "the same token" -- and a wrong recurrent carry
-and a benign bf16 near-tie are not yet separated.
+**Bound honestly. This is ONE run per leg on a contended box**, engine load
+excluded from every window (376.3 s on leg 3). It is not a mean, it has no
+spread, and the box was carrying foreign jobs all day. The 6.64x is a large
+enough effect to survive that; the ~2% on/off deltas are not, and §A2-D1's own
+data now proves it — see below.
 
-**GB10 runs this arm about 2x SLOWER than Thor** — 1.513958 s/token against
-0.776159, at 11.06% decode busy against 43.96%. That is unexplained, is not
-this row's claim, and is recorded so it is not read as an A2-D1 result. Peak
-host 45043 MiB.
+**108.2x is an OPEN GAP, not a win.** It is the distance still to vLLM after the
+single biggest movement measured on this model. Nothing here claims parity, and
+no ceiling is declared.
+
+### The +-2% on/off delta is NOISE, and this run proves it
+
+Two runs of the SAME on/off comparison on the SAME box:
+
+| run | on | off | on-vs-off |
+|---|---|---|---|
+| first GB10 | 1.513958 | 1.544706 | **-1.991%** (on faster) |
+| this GB10 | 1.584694 | 1.554233 | **+1.960%** (on slower) |
+
+**The sign flipped.** A quantity that reverses direction between two runs of one
+comparison on one box is not a measurement of that comparison. This retires any
+reading of the ~2% figures as signal and strengthens #1311's refutation, which
+was already argued from the 3% bar: the single-step-vs-chunk-scan speed question
+is settled negative on both hosts, and the token question is settled neutral
+(95/96 vs 95/96 here, 96/96 vs 96/96 on Thor).
 
 ### Evidence
 
