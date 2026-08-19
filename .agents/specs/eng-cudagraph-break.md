@@ -1582,6 +1582,36 @@ Each item names the stage that owns it. Nothing here is claimed by W1.
   serves the whole step's per-class transient demand; `## Gates` G1 carries the
   measurement and the two detecting mutations.
 
+  **THE ARCHITECTURE QUESTION #1380 ASKED FIRST IS ANSWERED BY MEASUREMENT, on
+  `dgx:gpu0`.** The issue said the first thing a fix had to establish was whether
+  this reproduces at `sm_121a`, because SPEC-DSPARK W8 recorded a WORKING spec
+  capture on GB10. IT REPRODUCES. NVIDIA GB10, compute capability 12.1, driver
+  580.173.02, nvcc 13.0.88, `-DVLLM_CPP_CUDA=ON
+  -DVLLM_CPP_CUDA_ARCHITECTURES=121a -DVLLM_CPP_TRITON=OFF`, the binary resolving
+  `libcudart.so.13` and `libcublasLt.so.13`, job
+  `d092c4b6-809b-4742-81a5-5484276d000f`:
+
+  * at the RED sha `eae8cc3f0`, `cudaMalloc: operation not permitted when stream
+    is capturing`, then the queue poisoned on the following step -- the SAME
+    message and the same per-step shape as `thor:gpu0` at that sha, 507
+    assertions / 8 failed / exit 1;
+  * at the fixed sha `15906f0a4`, **6 cases, 3306 assertions, 0 failed, exit 0**,
+    the spec case reading `5 steps x 240 logits, 0 differing, 3 replays` and the
+    five pre-W6 drivers `0 differing, 4 replays` each.
+
+  **Two architectures, both arms, identical readings.** That supersedes the
+  argument this entry used to rest on -- that the defect is host-side
+  `DevicePool` arithmetic and therefore architecture-independent -- by measuring
+  it instead. The argument still holds and is still worth keeping, because
+  `tests/vllm/models/test_device_pool.cpp` reproduces the same deficit with fake
+  host backends, no GPU and no CUDA at all.
+
+  **And it explains W8 without contradicting it.** Whether the collision occurs
+  is arithmetic over the MODEL's dimensions, not the device's: at the real 35B a
+  `[S, vocab]` f32 block with `vocab = 151936` shares a size class with nothing
+  the GDN block allocates, so W8's capture had no competitor for its class. The
+  fix removes the dependence on that coincidence rather than relying on it.
+
   **The fix also uncovered a SILENT out-of-bounds read, fixed in the same flow**
   ([#1394](https://github.com/mudler/vllm.cpp/issues/1394)). Moving which pooled
   block holds a tensor moves what follows it, and `vt::cpu::PagedAttentionKernel`
