@@ -4453,13 +4453,19 @@ Four limits, stated plainly rather than left to be discovered.
   `LagunaForCausalLM` is NOT that case and is not evidence for anything here: no
   `laguna` GGUF architecture arm exists, so a Laguna GGUF is refused as an
   unsupported architecture well before this check runs.
-* **The checkpoint's expert towers have to stay QUANTIZED.** Only the keep-quant
-  arm reads experts a slice at a time; the fp4-resident and the expand-to-bf16
-  arms of the same loader stage every tower like any other weight. So
-  `VT_GGUF_KEEP_QUANT=0`, and an NVFP4 GGUF, both keep the whole bound and keep
-  the refusal on a device and a model that otherwise qualify. This is checked
-  per file, against the residency this process resolved, and a file that mixes
-  the two keeps the whole bound as well (issue
+* **The checkpoint's expert towers have to KEEP the form the file stores them
+  in, which means keep-quant OR keep-f16.** Those are the two residencies that
+  read experts a slice at a time, and they are one arm rather than two: the
+  loader sends both into the same stacked tower (`LoadExpertsStackedKq`), and the
+  slice seam sizes a row with `vt::RowSizeBytes` and so never looks at the dtype.
+  An F16 expert tower therefore gets the lane, and an operator holding one should
+  not read this section and predict a refusal. The fp4-resident and the
+  expand-to-bf16 arms of the same loader stage every tower like any other weight.
+  So `VT_GGUF_KEEP_QUANT=0` — which turns keep-f16 off with it, because keep-f16
+  rides the same condition — and an NVFP4 GGUF both keep the whole bound and keep
+  the refusal on a device and a model that otherwise qualify. This is checked per
+  file, against the residency this process resolved, and a file that mixes a kept
+  tower with a staged one keeps the whole bound as well (issue
   [#1378](https://github.com/mudler/vllm.cpp/issues/1378)).
 * **No speed claim is attached.** The decode measurement on the one machine that
   answers capable has not run at the time of writing; `docs/BENCHMARKS.md`

@@ -51,7 +51,7 @@ What that means precisely, because "W0 landed" would overstate it:
   read host slots, the resolved model's factory declares
   `streams_routed_experts`, the config says streaming is on, and **this file's
   expert towers actually take a keep residency**. Gated in
-  `test_gguf_device_fit` (16 cases / 117) for the arithmetic and the residency
+  `test_gguf_device_fit` (17 cases / 130) for the arithmetic and the residency
   predicate, and `test_gguf_device_fit_reach` (14 cases / 66) for the production
   reach. **The lane-off bound is byte-identical**, asserted three ways against
   literal values.
@@ -84,6 +84,24 @@ What that means precisely, because "W0 landed" would overstate it:
   in the safe direction: one tower that would be staged keeps the WHOLE bound, so
   it can over-refuse -- which `VT_DEVICE_WEIGHT_BUDGET_BYTES` releases -- and can
   never under-refuse.
+  **The accepted set has TWO routes, and the second one was gated by nothing
+  until the second review of #1377.** `GgufExpertTowersReachSlotLane` accepts
+  `kKeepQuant` OR `kKeepF16`, which is read off `LoadExpertsOrNvfp4`: everything
+  that is neither fp4 nor expand goes to `LoadExpertsStackedKq`, whose `VT_CHECK`
+  names both, and `KqExpertSlice` sizes a row with `vt::RowSizeBytes` and never
+  looks at the dtype. But every fixture in the tree stored its towers in Q8_0,
+  F32 or NVFP4, so narrowing the accept to `kKeepQuant` alone left
+  `test_gguf_device_fit` at 16/16 and `test_gguf_device_fit_reach` at 14/14 --
+  the same "a load-bearing term no reachable input falsifies" shape the residency
+  term itself was filed for. `BuildGgufWithF16ExpertTower` closes it with an F16
+  (ggml type 1) tower, which `KeepQuantDType` can never accept and which
+  `RouteGgufTensor` step 2 routes `kKeepF16`. Mutation M4 (narrow the accept to
+  `kKeepQuant`) was re-run on both sides of that fixture: compile status 0 both
+  times, no ENOSPC in either build log, `git diff --stat` showing 1 file / 1
+  insertion / 1 deletion, GREEN against the pre-fixture file at 16 cases / 117
+  assertions and exit status 0, RED against the current file at 17 cases with 1
+  failed and 130 assertions with 1 failed and exit status 1, and both files
+  restored byte-identical by sha256.
 * **W0a — the probe. RUN, and it answered the question W0b rests on.** On
   `dgx:gpu0` inside an `rc` lease: `cudaDevAttrPageableMemoryAccess = 1` and
   `cudaDevAttrIntegrated = 1`, which is exactly the pair `CudaPlatform`

@@ -136,6 +136,40 @@ std::string BuildGgufWithNvfp4ExpertTower() {
   return b.Build();
 }
 
+// ENG-EXPERT-STREAM-DEVICE W0d repair (#1378), the SECOND accepted route.
+//
+// `GgufExpertTowersReachSlotLane` accepts `kKeepQuant` OR `kKeepF16`, and until
+// this fixture existed nothing in the tree could tell the two-term accept from a
+// one-term accept: every file above stores its towers in Q8_0 or NVFP4, so
+// narrowing the predicate to `kKeepQuant` alone left both suites green. That is
+// the "a load-bearing term no reachable input falsifies" shape this row repaired
+// elsewhere, so it is closed the same way — with an input that falsifies it.
+//
+//   blk.0.ffn_gate_exps.weight  F16, ne [32, 2, 4] -> 256 elems, 512 B
+//
+// F16 (ggml type 1) is not a block encoding, so `KeepQuantDType` refuses it and
+// this tower can NEVER be `kKeepQuant` whatever `keep_quant` says. With
+// `keep_f16` on, `RouteGgufTensor` step 2 routes it `kKeepF16`
+// (`KeepF16KDim(kStackedExpertWeight, [4,2,32]) == 32 > 0`), and `keep_f16` is a
+// plain policy field so no environment or registered-op probe is involved.
+//
+// That residency reaches the SAME lane the keep-quant tower does:
+// `LoadExpertsOrNvfp4` sends everything that is neither `kNvfp4Fp4` nor
+// `kExpandBf16` to `LoadExpertsStackedKq`
+// (qwen3_5_gguf_weights.cpp:1262-1274), whose `VT_CHECK` names both residencies,
+// and `KqExpertSlice` (qwen3_5.cpp) slices whole rows without looking at the
+// dtype. So the accept has two routes because the loader has two, and this file
+// is the one that says so.
+constexpr size_t kF16TowerStaged = 512;  // 256 elems x 2 bytes, on disk and bf16
+
+std::string BuildGgufWithF16ExpertTower() {
+  GgufModelBuilder b;
+  b.AddKv(StrKv("general.architecture", "qwen35moe"));
+  b.AddTensor("blk.0.ffn_gate_exps.weight", {32, 2, 4}, /*ggml_type=*/1,
+              std::string(kF16TowerStaged, '\x00'));
+  return b.Build();
+}
+
 // A policy stated field by field rather than read from the environment: this is
 // the PURE decision, and a case that called `FromEnv()` would be measuring the
 // box's registered ops as well as the rule.
@@ -543,4 +577,55 @@ TEST_CASE(
   // `MoeBlockBf16Cuda`. Different arm, same verdict: the tower is staged.
   CHECK_FALSE(vllm::GgufExpertTowersReachSlotLane(
       gguf, "_exps.weight", PolicyWith(true, false, false, false)));
+}
+
+TEST_CASE(
+    "gguf_device_fit W0d: an F16 tower reaches the lane through the OTHER "
+    "accepted residency") {
+  TempFile f(BuildGgufWithF16ExpertTower());
+  const vllm::GgufFile gguf = vllm::GgufFile::Open(f.path());
+  REQUIRE(gguf.Tensors().size() == 1);
+  const vllm::GgufTensorInfo& tower = gguf.Tensors()[0];
+  REQUIRE(tower.ggml_type == 1U);
+  REQUIRE(tower.nbytes == kF16TowerStaged);
+
+  // The route is asserted BEFORE the predicate, so this case cannot pass for the
+  // wrong reason. If the fixture ever routed `kKeepQuant` instead, the predicate
+  // below would still be true and would still prove nothing about the second
+  // accepted term — which is exactly the hole this case exists to close.
+  CHECK(vllm::PeekRoute(PolicyWith(true, true, false, false), tower,
+                        vllm::GgufTensorRole::kStackedExpertWeight) ==
+        vllm::GgufResidency::kKeepF16);
+  // ...and it is NOT reachable through keep-quant, with keep-quant on: F16 has no
+  // block encoding, so `KeepQuantDType` refuses it and step 1 falls through.
+  CHECK(vllm::PeekRoute(PolicyWith(true, false, false, false), tower,
+                        vllm::GgufTensorRole::kStackedExpertWeight) ==
+        vllm::GgufResidency::kExpandBf16);
+
+  // The predicate itself. Narrowing the accept in `gguf_device_fit.cpp` to
+  // `kKeepQuant` alone makes this line red and every other case in both device-fit
+  // suites stay green, which is what makes the second term gated rather than
+  // merely correct.
+  CHECK(vllm::GgufExpertTowersReachSlotLane(gguf, "_exps.weight",
+                                            PolicyWith(true, true, false, false)));
+  // keep-f16 OFF is the opt-out (`VT_GGUF_KEEP_F16=0`): the same tower now expands
+  // to bf16 at load and IS staged, so the lane must not claim it.
+  CHECK_FALSE(vllm::GgufExpertTowersReachSlotLane(
+      gguf, "_exps.weight", PolicyWith(true, false, false, false)));
+  // `VT_CPU_REF=1` forces the expand path over both keep residencies, so it turns
+  // this route off through the same door it turns the keep-quant one off.
+  CHECK_FALSE(vllm::GgufExpertTowersReachSlotLane(
+      gguf, "_exps.weight", PolicyWith(true, true, false, true)));
+
+  // And the consequence at the boundary, so the residency term is tied to the
+  // number an operator is refused on: 512 staged bytes with the lane off, and the
+  // arena alone with it on. The largest per-expert slice is 512/4 = 128.
+  CHECK(vllm::GgufLargestExpertSliceBytes(gguf, "_exps.weight") == 128);
+  const vllm::GgufStagedFootprint off = vllm::GgufStagedWeightFootprint(gguf);
+  CHECK(off.lower_bound_bytes == kF16TowerStaged);
+  const vllm::GgufStagedFootprint on =
+      vllm::GgufStagedWeightFootprint(gguf, 2, Lane(256));
+  CHECK(on.streamed_tensor_count == 1);
+  CHECK(on.streamed_bytes == kF16TowerStaged);
+  CHECK(on.lower_bound_bytes == 256);
 }
