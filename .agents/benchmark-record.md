@@ -24128,3 +24128,71 @@ registry still counts probe refusals only and a replay-time refusal would abort 
 `mem/mem_<tag>.csv` (the per-call `cudaMemGetInfo` trace with node counts),
 `mem/smp_<tag>.csv` (the `nvidia-smi` and RSS sampler) and `out-bytes/ids_<tag>.json`
 (the token artifacts).
+
+## A2-D1 — NemotronH decodes on the single-step recurrent kernels (#1311)
+
+**No throughput, latency or occupancy number is claimed by the landing change.**
+The A3 e2e token gate on both legs of one binary is the acceptance condition and
+is OWED; the recipe is `scripts/nemotron-h-a2d1-gpu-gate.sh` and the row's spec
+lists it under `## Owed`.
+
+### What IS established, and on what
+
+The decode-vs-prefill equivalence the swap rests on, at NemotronH's own group
+count. The only pre-existing case ran `H=4 G=2`, i.e. `heads_per_group = 2`;
+this model runs 8. CPU, `test_ops_mamba2_state_update`, 7 cases / 2527
+assertions / `SUCCESS`, of which the new case contributes 58 assertions:
+
+| shape | out elements | out scale | worst \|diff\| | state elements | state scale | worst \|diff\| |
+|---|---|---|---|---|---|---|
+| multi-chunk `T=24 chunk=8` | 98,304 | 26.0174 | 1.90735e-05 | 524,288 | 4.58483 | 9.53674e-07 |
+| production `T=1 chunk=128` | 4,096 | 32.2456 | 7.62939e-06 | 524,288 | 5.54134 | 4.76837e-07 |
+
+The scale is printed beside every comparison and asserted `> 0.1`, because the
+inherited 5e-3 atol would accept everything if the tensors compared were ~1e-7
+([[count-based-tolerances-bound-nothing]]).
+
+Mutation **A2D1-M1** — clamp the state-update group index to `min(h/hpg, 1)`:
+
+```
+existing case (H=4 G=2 hpg=2)   RC=0   1 passed | 0 failed    8 |  8 passed | 0 failed
+new driver case (H=64 G=8 hpg=8) RC=1  0 passed | 1 failed   58 | 54 passed | 4 failed
+```
+
+Invisible to the case that existed, caught by the case this row adds, on BOTH
+shapes. Tree restored byte-for-byte (`src/vt/cpu/cpu_ops.cpp` md5
+`753ba5c3d0869396c20f2205eb2617d7` before and after).
+
+### The launch and allocation counts — ARITHMETIC, NOT A PROFILE
+
+Counted from `cuda_mamba2_ssd.cuh:596-641` at the driver geometry
+(`H=64 P=64 N=128 G=8 cs=128 S=1 nchunks=1 T=1`), per TOKEN over 23 mamba
+layers:
+
+| | chunk scan (before) | state update (after) |
+|---|---|---|
+| SSD kernel launches | 115 | 23 |
+| SSD `Alloc`/`Free` | 230 | 0 |
+| SSD `cudaMemsetAsync` | 46, zeroing 57.5 MiB | 0 |
+| SSD scratch | 104.9 MiB | 0 |
+| gather/scatter launches | 92 | 0 |
+| small metadata H2D | 138 | 0 |
+| `M2ChunkScanKernel` grid | 524,288 elements for 4,096 | n/a |
+
+Per-call scratch is `dtv` 32 KiB + `dac` 32 KiB + `states` 2.00 MiB + `cb`
+512 KiB + `passed` 2.00 MiB = **4.5625 MiB**, of which 2.50 MiB is memset.
+
+**Disagreement with #1311, recorded rather than reconciled.** The issue put the
+gather/scatter state churn at "roughly +414 MiB/token". Counting the three SSM
+movements (gather, scatter, `final_states` copy-back) at 4.00 MiB each gives
+12.0 MiB per layer per token = ~276 MiB/token for the SSM plus ~7 MiB for the
+conv, about **283 MiB/token**. Neither figure is measured and the direction of
+the change does not depend on which is right, so the smaller one is carried and
+the difference is stated.
+
+### Evidence
+
+`tests/vt/test_ops_mamba2_state_update.cpp` (the two driver-group cases),
+`tests/vllm/models/test_nemotron_h_paged_forward.cpp` (the arm recorder, driven
+through `ModelRegistry::Forward`), `scripts/nemotron-h-a2d1-gpu-gate.sh` (the
+owed GPU recipe).

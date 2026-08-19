@@ -60,6 +60,47 @@ x23 mamba layers = ~105 MiB scratch, 230 driver alloc/frees and 115 launches per
 token in the SSD alone, plus the gather/scatter state churn upstream's decode
 half never performs.
 
+### 0.2 The same arithmetic, re-derived here, and where it disagrees with #1311
+
+Re-counted from `cuda_mamba2_ssd.cuh:596-641` at the DRIVER geometry
+(`H=64 P=64 N=128 G=8 cs=128 S=1 nchunks=1 T=1`), because a number that is
+quoted often enough starts being treated as measured
+([[a-number-quoted-often-becomes-treated-as-measured]]). **This is arithmetic,
+not a profile.**
+
+| scratch term | elements | bytes |
+|---|---|---|
+| `dtv` = `H*nchunks*cs` | 8,192 f32 | 32 KiB |
+| `dac` = same | 8,192 f32 | 32 KiB |
+| `states` = `nchunks*H*P*N` | 524,288 f32 | 2.00 MiB |
+| `cb` = `nchunks*G*cs*cs` | 131,072 f32 | 512 KiB |
+| `passed` = `n_states * state_elem` | 524,288 f32 | 2.00 MiB |
+| **total per call** | | **4.5625 MiB** |
+
+Zeroed per call: `cb` + `passed` = 2.50 MiB. `M2ChunkScanKernel`'s grid is
+`nchunks*H*cs*P` = 524,288 elements to produce `T*H*P` = 4,096 — a factor of
+`cs` = 128.
+
+Per TOKEN over the 23 mamba layers, decode:
+
+| | chunk scan (before) | state update (after) |
+|---|---|---|
+| SSD kernel launches | 115 | 23 |
+| SSD `Alloc`/`Free` | 230 | 0 |
+| SSD `cudaMemsetAsync` | 46, zeroing 57.5 MiB | 0 |
+| SSD scratch | 104.9 MiB | 0 |
+| gather/scatter launches | 92 | 0 |
+| small metadata H2D | 138 | 0 |
+
+**Where this disagrees with #1311.** The issue estimated "roughly +414 MiB/token"
+of gather/scatter state churn. Counting the three SSM movements — gather
+(read page + write working), scatter (read working + write page) and the
+`final_states` copy-back — at 4.00 MiB each gives 12.0 MiB per layer per token,
+so **~276 MiB/token for the SSM plus ~7 MiB for the conv, about 283 MiB/token**,
+not 414. The disagreement is recorded rather than reconciled to the larger
+figure: neither number is measured, and the direction of the change does not
+depend on which is right.
+
 ---
 
 ## 1. Scope
