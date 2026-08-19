@@ -199,15 +199,49 @@ bool MakeHostBytesDeviceAliasable(const OwnedTensor& w,
   // Nothing to alias. The caller refuses this by name rather than handing a
   // kernel a null pointer; see ResidentWeight.
   if (w.bytes.empty()) return report(HostAliasOutcome::kDeclinedEmpty, false);
-  if (reinterpret_cast<uintptr_t>(w.bytes.data()) % kDeviceAliasAlignment == 0)
+  if (reinterpret_cast<uintptr_t>(w.bytes.data()) % kDeviceAliasAlignment == 0) {
+    // ISSUE #150's WINDOWED RELEASE STILL HAS TO HAPPEN, and this branch is the
+    // third path that can skip it. A safetensors direct-upload borrow whose
+    // offset happens to be a multiple of 256 is aliased here and never reaches
+    // `AdoptDeviceBytesAsHost`, which is the only other caller of
+    // `ReleaseDirectUploadSource` — so its consumed source pages would stay
+    // resident, data-dependently, for roughly one borrow in eight. The comment
+    // on the ordering inside `AdoptDeviceBytesAsHost` insists the release
+    // happens on EVERY path including the `VT_ADOPT_DEVICE_BYTES=0` arm, and
+    // this honours the same rule. A no-op unless `mmap_src` is set, which the
+    // GGUF loader never does.
+    ReleaseDirectUploadSource(w);
     return report(HostAliasOutcome::kAliasedInPlace, true);
+  }
   // A borrow owns no anonymous pages, so re-homing it would ADD residency
   // instead of removing it, and a tied pair's shared expansion must keep its one
   // keep-alive. Same reasoning, and the same answer, as `ReleaseHost`'s and
   // `AdoptDeviceBytesAsHost`'s borrowed branches.
+  //
+  // ONE EXCEPTION TO "A BORROW OWNS NO ANONYMOUS PAGES" NOW EXISTS, AND IT IS
+  // THE ONE THIS FUNCTION CREATES. The block below turns an OWNED buffer into a
+  // BORROWED one whose keep-alive is an over-aligned `operator new` block —
+  // anonymous memory. That does not change the answer here (such a buffer is
+  // already aligned and returns above), but it does mean the sentence is no
+  // longer universally true, and the three places that reason from it —
+  // `ReleaseHost`'s borrowed branch, `AdoptDeviceBytesAsHost`'s, and this one —
+  // are now reasoning about GGUF mappings and tied expansions specifically. The
+  // consequence worth naming: `ReleaseHost()` on a re-homed weight drops the
+  // keep-alive rather than madvising, which frees the block through the deleter
+  // and is correct, but it does not take the `MADV_DONTNEED` path. Nothing calls
+  // `ReleaseHost` on a dense weight today; `HostMirrorIsRedundant` is what keeps
+  // the one caller that could from doing it to an aliased one.
   if (w.bytes.borrowed())
     return report(HostAliasOutcome::kDeclinedBorrow, false);
 
+  // SINGLE-THREADED BY PRECONDITION, stated rather than enforced. The
+  // re-pointing below destroys the source vector, so two threads reaching it for
+  // the same weight would race — and unlike `AdoptDeviceBytesAsHost`, which
+  // hides behind `if (!w.d_dev)`, this branch has no memo and re-tests alignment
+  // on every call. It is safe because the first touch of every weight happens
+  // inside one forward on one thread, which is the same assumption the `d_dev`
+  // memo two branches down has always made. A model that ever builds residents
+  // from several threads must add a `call_once` here and there.
   auto& self = *const_cast<OwnedTensor*>(&w);
   const size_t nb = self.bytes.size();
   // Over-aligned `operator new` rather than `aligned_alloc`/`posix_memalign`:

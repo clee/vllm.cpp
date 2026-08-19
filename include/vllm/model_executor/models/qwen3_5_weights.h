@@ -224,9 +224,27 @@ void AdoptDeviceBytesAsHost(vt::Backend& backend, const OwnedTensor& w);
 // The alignment a HOST pointer must meet before a device kernel may be handed it
 // in place of the `Backend::Alloc` pointer it would otherwise have received.
 //
-// 256, because that is what `cudaMalloc` returns (`src/vt/cuda/cuda_backend.cu`
-// is a bare `cudaMalloc`) and the substitution is only safe while NO consumer
-// can tell the two pointers apart. Deriving a smaller number would mean
+// 256, because that is cuBLASLt's documented
+// `CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_A_BYTES` DEFAULT, which this tree never
+// sets, and it dominates every explicit pointer gate in the tree (the strictest
+// is 32, in `src/vt/cuda/cuda_nvfp4_sm12x.cu`). It is also what `cudaMalloc`
+// returns in practice, though CUDA guarantees only "suitably aligned" and
+// current devices return more — so "indistinguishable from a `cudaMalloc`
+// pointer" is the intuition, and "at least what every consumer is promised" is
+// the claim.
+//
+// WHAT ALIGNMENT DOES AND DOES NOT BUY. It makes the substitution CORRECT: no
+// kernel can fault or mis-vectorise on this pointer that would not have on the
+// other. It does not make the two pointers indistinguishable in every respect,
+// and two in-tree facts say so. `src/vllm/model_executor/models/laguna.cpp`
+// records a MEASURED GB10 penalty for reading system-allocated memory from the
+// GPU rather than a `cudaMalloc` allocation, worst on a long-K low-parallelism
+// GEMV — a consumer telling them apart by BANDWIDTH, which is why
+// `VT_QWEN35_ALIAS_HOST_WEIGHTS` exists below. And the Vulkan and Metal backends
+// resolve a tensor pointer against their own allocation tables and throw if it
+// is outside them, telling them apart by IDENTITY; harmless only because neither
+// overrides `host_memory_is_device_addressable()`, so this argument is scoped to
+// backends that take raw pointers. Deriving a smaller number would mean
 // enumerating every kernel that ever binds a weight and being right about all of
 // them, and the enumeration does not close: the widest thing any of them
 // dereferences is a 16-byte `cp.async` granule

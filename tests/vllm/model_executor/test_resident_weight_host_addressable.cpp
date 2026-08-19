@@ -166,10 +166,22 @@ OwnedTensor MakeWeight(uint8_t tag) {
   return t;
 }
 
+// Restore `host_addressable` on EVERY exit path, including a REQUIRE that
+// aborts the case body. Three cases below move the bit; a case that fails
+// halfway used to leak `false` into every later case in this binary and turn one
+// finding into a cascade of confusing ones.
+struct PlatformArm {
+  explicit PlatformArm(bool on) : prev(Platform_().host_addressable) {
+    Platform_().host_addressable = on;
+  }
+  ~PlatformArm() { Platform_().host_addressable = prev; }
+  bool prev;
+};
+
 }  // namespace
 
 TEST_CASE("a host-addressable staging device ALIASES the weight and allocates nothing") {
-  Platform_().host_addressable = true;
+  const PlatformArm arm(true);
   const OwnedTensor w = MakeWeight(/*tag=*/1);
   // A copy of the bytes taken BEFORE the call, because the call may move them.
   const std::vector<uint8_t> expect(w.bytes.data(), w.bytes.data() + w.bytes.size());
@@ -220,7 +232,7 @@ TEST_CASE("the alias is stable across calls and still allocates nothing") {
   // `d_dev` is the staging branch's memo, so a branch that does not set it must
   // not become a per-call allocation instead. Two calls, one address, zero
   // allocations.
-  Platform_().host_addressable = true;
+  const PlatformArm arm(true);
   const OwnedTensor w = MakeWeight(/*tag=*/2);
   Queue q = XpuQueue();
   const int allocs_before = Fake().allocs;
@@ -240,7 +252,7 @@ TEST_CASE("a device that CANNOT read host memory stages exactly as before") {
   // memo, and a tensor over the copy — the pre-W0f behaviour, unchanged. This is
   // the case that proves the predicate SELECTS rather than that the branch was
   // taken unconditionally.
-  Platform_().host_addressable = false;
+  const PlatformArm arm(false);
   const OwnedTensor w = MakeWeight(/*tag=*/3);
   Queue q = XpuQueue();
   const int allocs_before = Fake().allocs;
@@ -256,8 +268,6 @@ TEST_CASE("a device that CANNOT read host memory stages exactly as before") {
   // The staged copy holds the same bytes, which is what makes the aliasing arm
   // above a legitimate substitution rather than a different weight.
   CHECK(std::memcmp(t.data, w.bytes.data(), w.bytes.size()) == 0);
-
-  Platform_().host_addressable = true;
 }
 
 TEST_CASE("the aliasing branch keeps the elem_kn_repacked refusal") {
@@ -267,7 +277,7 @@ TEST_CASE("the aliasing branch keeps the elem_kn_repacked refusal") {
   // still the DEVICE kernel, which would read transposed bytes as [N,K] and
   // produce garbage silently. The refusal therefore has to survive the new
   // branch, and this is the case that says so.
-  Platform_().host_addressable = true;
+  const PlatformArm arm(true);
   OwnedTensor w = MakeWeight(/*tag=*/4);
   w.elem_kn_repacked = true;
   Queue q = XpuQueue();
@@ -295,7 +305,7 @@ TEST_CASE("an i8mm-repacked weight reaching device residency is refused BY NAME"
   // Harmless on the target checkpoint as measured — one Q8_0 tensor, 0.01% of
   // parameters, and the instrumented load recorded `quant_repack = 0` — which is
   // why this is a tripwire beside its sibling rather than a campaign.
-  Platform_().host_addressable = true;
+  const PlatformArm arm(true);
   OwnedTensor w = MakeWeight(/*tag=*/9);
   w.repacked = true;
   Queue q = XpuQueue();
@@ -307,14 +317,15 @@ TEST_CASE("an i8mm-repacked weight reaching device residency is refused BY NAME"
 
   // ...and on the DISCRETE arm too, because the kernel that misreads it is the
   // same kernel either way. Where the bytes live was never the question.
-  Platform_().host_addressable = false;
-  OwnedTensor d = MakeWeight(/*tag=*/10);
-  d.repacked = true;
-  CHECK_THROWS_WITH_AS(
-      vllm::detail::StageWeightForTest(q, d),
-      doctest::Contains("an i8mm-repacked (block_q8_0x4) weight reached device residency"),
-      std::runtime_error);
-  Platform_().host_addressable = true;
+  {
+    const PlatformArm discrete(false);
+    OwnedTensor d = MakeWeight(/*tag=*/10);
+    d.repacked = true;
+    CHECK_THROWS_WITH_AS(
+        vllm::detail::StageWeightForTest(q, d),
+        doctest::Contains("an i8mm-repacked (block_q8_0x4) weight reached device residency"),
+        std::runtime_error);
+  }
 }
 
 TEST_CASE("the aliasing branch keeps the streamed-tower refusal") {
@@ -323,7 +334,7 @@ TEST_CASE("the aliasing branch keeps the streamed-tower refusal") {
   // the tower, not about the allocator: reaching here at all means the lane was
   // defeated. Cheap on this platform and catastrophic on the other, so it fails
   // by name on both.
-  Platform_().host_addressable = true;
+  const PlatformArm arm(true);
   OwnedTensor w = MakeWeight(/*tag=*/5);
   w.expert_streamed = true;
   Queue q = XpuQueue();
@@ -340,7 +351,7 @@ TEST_CASE("an ALREADY-ALIGNED buffer is aliased in place, with no second copy") 
   // that did not need copying. A GGUF mmap borrow whose tensor offset happens to
   // be a multiple of 256 lands here, and so does the SECOND call for any weight
   // the first call re-homed.
-  Platform_().host_addressable = true;
+  const PlatformArm arm(true);
   OwnedTensor w = MakeWeight(/*tag=*/7);
   const size_t nb = w.bytes.size();
   // An aligned block, borrowed, standing exactly where a lucky mmap offset
@@ -378,7 +389,7 @@ TEST_CASE("a MISALIGNED BORROW is not re-homed, and stages instead") {
   //
   // The correct answer is to decline, and let the (unchanged) staging branch
   // copy it into device memory, where its file pages stay reclaimable.
-  Platform_().host_addressable = true;
+  const PlatformArm arm(true);
   OwnedTensor w = MakeWeight(/*tag=*/8);
   const size_t nb = w.bytes.size();
   auto backing = std::make_shared<std::vector<uint8_t>>(nb + vllm::kDeviceAliasAlignment);
@@ -417,7 +428,7 @@ TEST_CASE("a weight whose host bytes are GONE is refused by name, not aliased to
   // this branch serves. If that ever changes, the failure without this check is
   // a null weight pointer inside a kernel, which is a segfault at best and wrong
   // tokens at worst. With it, it is one legible sentence.
-  Platform_().host_addressable = true;
+  const PlatformArm arm(true);
   OwnedTensor w = MakeWeight(/*tag=*/6);
   w.ReleaseHost();
   REQUIRE(w.bytes.empty());

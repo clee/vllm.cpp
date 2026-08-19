@@ -10,9 +10,52 @@ platform may read it.
 
 ## Now
 
-`ACTIVE`. **W0b, W0c, W0d and W0f are implemented and unit-gated on the CPU
-tier. W0a and W0e are QUEUED behind a lease on `dgx:gpu0`, so no GPU number
-exists yet and none is claimed.**
+`ACTIVE`. **`--device cuda` DECODES this checkpoint on a GB10, and the
+correctness gate that would let us publish a number does not pass.** W0e ran on
+2026-08-19 inside one `rc hold` on `dgx:gpu0` at source `9c783a8be`.
+
+* **G0-LIVE: PASS.** 32/32 steps where seven previous attempts produced ZERO;
+  decode-phase `exhausted` delta **0** (6077 at step 1 and at step 32; the total
+  is the structural prefill number this spec predicted); `W0E_DOCKER_RC=0`, no
+  guard trip, peak RSS **97.75 GiB** with swap untouched.
+* **G0-CORRECT: FAIL as declared, and MEASURED to be a near-tie rather than a
+  disagreement about the model.** The 32 ids match the CPU arm for six tokens and
+  diverge at the seventh — `...,264,3177,7172,...` on CPU against
+  `...,264,3177,303,...` on CUDA. Both continuations are coherent. Three things
+  were then established rather than assumed:
+  1. **It is not W0f.** The CPU arm was re-run on the SAME binary and the SAME
+     lease and reproduced the recorded answer byte for byte. W0f cannot reach
+     that arm at all — `ResidentWeight` returns at the `is_cpu()` branch above
+     it, and the instrument counted `w0f-alias` calls **0** on the CPU arm,
+     which is a live control and not an argument.
+  2. **The two arms rank the same two candidates.** An instrumented CPU run
+     printing the top-2 logits per step shows that at the divergent step
+     (`lp_call=7`) the CPU arm's top-1 is `7172` at 18.779411 and its **top-2 is
+     `303` at 18.514702** — `303` being exactly the token CUDA emitted. The
+     **margin is 0.264709 logits**, 1.4 % of the winning logit.
+  3. **This decode is full of ties that narrow.** `lp_call=9` has a margin of
+     **0.022802**, about 0.1 %. A greedy path this finely balanced flips on any
+     arithmetic difference, and the two arms run genuinely different GEMM
+     kernels.
+  So the declared gate fails and the wave stops, which is correct. What the
+  failure means is a different question, and it is now answered with numbers:
+  the arms agree about the distribution and disagree about a coin flip.
+  Whether a token-exact cross-arm gate is the right instrument for a path with
+  no oracle is a decision for the operator, not something this row may assume.
+* **G0-SPEED: VOID, by this row's own stop condition.** It was measured —
+  steady-state **4.09-5.69 s/token** on CUDA against **8.04-9.27 s/token** on
+  CPU, interleaved on one lease — and it is NOT claimed, because a speed number
+  behind a failing correctness gate is exactly the shape #912 F1 was.
+
+**What W0f did, measured rather than inferred.** The instrument added for this
+run counts **60.793 GiB** of dense weight aliased instead of duplicated into
+device memory, against **~9.2 GiB** that declined (misaligned GGUF borrows) and
+still stages. That is the whole difference between zero decode steps and 32.
+
+W0a remains unrun as a standalone probe, and it no longer blocks anything: the
+load succeeds only when `host_memory_is_device_addressable()` answers true (W0d's
+conditional refusal is keyed on it), so a completed run is itself the
+measurement W0a was going to take.
 
 What that means precisely, because "W0 landed" would overstate it:
 
@@ -457,6 +500,8 @@ re-derived here.
 | **G-DISCRETE: validate W1/W2 on a discrete NVIDIA GPU.** The measurement: on a device with VRAM V and `host_memory_is_device_addressable() == false`, load a GGUF whose `*_exps` towers exceed V, with the lane on, and gate (i) token-exactness against the CPU arm on the same checkpoint, (ii) decode-phase `exhausted` delta 0, (iii) peak device allocation <= non-expert remainder + arena. | No discrete NVIDIA GPU is reachable from this project. `dgx:gpu0` is a GB10 where device memory IS host memory, so a device store there exercises the plumbing and not the thing W1 exists for. Recorded rather than implied, because a gate nobody can run is not a gate. |
 | **A zero-copy device filler (GPUDirect Storage / `cuFile`).** | W1 ships the staging bounce by choice, for the reasons in its design note. The measurement that would justify replacing it — a device-arm decode where the H2D leg is a measurable fraction of fill time — does not exist until W1 has run somewhere. |
 | **The CPU arm's streaming decode figure is still VOID.** `docs/BENCHMARKS.md:8` records it as VOID (#912 F1) with a re-measure owed. | Owned by `ENG-EXPERT-STREAM` and arranged separately by the operator. It is the DENOMINATOR for G0-SPEED, not a precondition for G0-CORRECT or G0-LIVE. |
+| **A ratified gate for a two-arm comparison whose greedy path is a coin flip.** The measurement that would settle it: over N prompts, the distribution of top-2 margins at each step, and the fraction of steps whose margin is below the arms' measured arithmetic spread. | W0e MEASURED the margin at the divergent step (0.264709 logits, 1.4 %) and one step later (0.022802, 0.1 %), so the token-exact gate is failing on ties rather than on a defect. Ratifying a distributional gate is exactly the decision `AGENTS.md` reserves for an explicit act — "use an explicitly ratified distributional gate only when the oracle's greedy decode is non-deterministic" — and it is the operator's, not this row's. Until it is taken, G0-CORRECT stays FAILING and G0-SPEED stays VOID, which is the conservative reading and the one that cannot publish a wrong number. |
+| **The CUDA arm's own top-2 margin at the divergent step.** | The scratch instrument that reads `logits` in the completion callback SIGSEGVs on the CUDA arm (`SCRIPT_EXIT=139`), almost certainly because the pointer it is handed there is not host memory on that arm. The CPU arm's margin is enough to establish the near-tie — `303` is its own runner-up — but the symmetric number is not in hand and is cheap to take once the callback's pointer residency is known. |
 | **The family-wide copy of this change: `include/vllm/model_executor/models/dense_attn_block.h`'s `ResidentWeight` still stages unconditionally.** The measurement: on a host-addressable staging platform, load any of the ~50 models that include that header and show peak resident bytes falling by the model's weight size, with tokens unchanged. | W0f deliberately changes only `qwen3_5.cpp`'s PRIVATE copy, which is the one that governs `Qwen3.8-2.4T-A95B UD-Q1_0` (that file kept its own helper; the header's copy is not on the Qwen3.5 path). The header's version is reached from `ModelRegistry::Forward` for every model that includes it, so extending it is not dead code — but nothing on a CPU tier can drive one of those forwards on a staging platform, so the extension would land with its reachability argued rather than gated, across ~50 architectures at once. That is a scope and a review question, not a line of code, and it gets its own row. |
 | **The missing CPU-platform gate on `p.quant_repack` itself ([#1320](https://github.com/mudler/vllm.cpp/issues/1320)).** The measurement: `elem_kn_repack` is resolved with `CurrentPlatform().device_type() == kCPU` and `quant_repack` is not, so a device load can still perform a CPU-only transform and be caught afterwards instead of never doing it. | W0f fixes the CONSEQUENCE in flow — a named refusal on both arms of `ResidentWeight`, red-first and mutation-proven — because that is the small and clear part. Moving the gate into the loader policy changes what a GGUF load DOES on a device rather than what it refuses, which is `QUANT-GGUF-KEEPQ-LOADER`'s semantics and needs its own red-first evidence. |
 | **`.agents/specs/expert-streaming.md`'s `## Owed` entry for #1124 still names no owning row ID.** | Not edited here on purpose; PRs #1200 and #1216 both edit that file. One-line follow-up once both land. |

@@ -22960,3 +22960,89 @@ for CUDA runtime version`. The Jetson 540.4.0 driver cannot run a CUDA 13 runtim
 untried route is a CUDA 12.x toolkit for that driver; it was not pursued, because the
 dgx gate had already answered the question orin was there to support. No lease held;
 `orin:gpu0` returned to ready.
+
+## ENG-EXPERT-STREAM-DEVICE W0e/W0f — `--device cuda` decodes a 369.97 GiB checkpoint on a 119.631 GiB GB10, and the token gate fails on a near-tie (2026-08-19, `row/ENG-EXPERT-STREAM-DEVICE-W0F`, source `9c783a8be`, #1299)
+
+**Setup.** One `rc hold` on `dgx:gpu0` (GB10, `sm_121a`, CUDA 13.0.1 in
+`vllmcpp-build:gb10`, driver 580.173.02). `Qwen3.8-2.4T-A95B UD-Q1_0`
+(369.97 GiB, 10 shards) from the host at `/home/mudler/ckpt/qwen3.8-q1_0`.
+Streaming ON, 4000 slots (9.28 GiB arena), greedy, 32 tokens, prompt ids
+`760,6511,314,9338,369`. Both arms on the SAME binary and the SAME lease, page
+cache dropped between them. Harness `w0e_gen`, logs under
+`/home/mudler/work/es-w0e/logs` on `dgx.casa`.
+
+**Two VOID runs first, and why they were void.** The first two CUDA attempts
+reproduced #1299 exactly (guard trip, zero decode steps) and looked like a W0f
+result. They were not: the build ran `cmake --build build --target vllm`, which
+is the STATIC library, while the harness links `build/libvllm.so`. That file was
+still the previous day's pre-W0f build, `LIB_EXIT=0` all the same. W0e's own
+`build.sh` had it right with `--target vllm-cli`. The corrected script records
+the shared object's mtime and sha256 before and after and greps the built binary
+for a string that exists only in the new code: `87c58eec` to `cf771cec`, marker
+count 0 to 1. A build that does not relink is now reported as STALE rather than
+as a pass.
+
+**G0-LIVE: PASS.**
+
+| Observable | CUDA | CPU |
+|---|---|---|
+| load | 266.330 s | 253.504 s |
+| RSS after load | 61.20 GiB | 62.45 GiB |
+| decode steps | 32 | 32 |
+| `exhausted` at step 1 / step 32 | 6077 / 6077 | 6074 / 6074 |
+| decode-phase `exhausted` delta | **0** | **0** |
+| peak RSS | 97.75 GiB | 92.19 GiB |
+| swap used at peak | 0 | 0 |
+| container exit | `W0E_DOCKER_RC=0` | `W0E_DOCKER_RC=0` |
+
+**What W0f moved, counted rather than inferred.** An RSS curve cannot separate
+"the branch declined and staged", "the branch re-homed and the pages did not come
+back" and "something else allocated", so `MakeHostBytesDeviceAliasable` reports
+its outcome per weight and `ResidentWeight` prints the split every 4 GiB on
+`VT_LOAD_STATS`. First-forward totals, at the point re-homing plateaus (call
+1361):
+
+| Outcome | Bytes |
+|---|---|
+| re-homed into an aligned host block, then aliased | **60.793 GiB** |
+| declined, misaligned GGUF borrow, still staged | ~9.2 GiB |
+| aliased in place (already 256-aligned) | 0.02 GiB at that point |
+
+On the CPU arm the same counter reads **0 calls**, which is the live control that
+the branch is platform-gated rather than an argument that it is.
+
+**G0-CORRECT: FAIL, on a measured near-tie.**
+
+```
+CPU  11751,13,11751,369,264,3177,7172,303,279,17631,919,314,9338,11,383,279,...
+CUDA 11751,13,11751,369,264,3177, 303,9338, 13, 9338,369,264,3046,303,4357,13,...
+                                  ^ first divergence, step 7
+```
+
+The CPU arm on this binary reproduces its four-times-recorded ids byte for byte,
+so the divergence is between the arms and not W0f. An instrumented CPU run
+printing the top-2 logits per step gives the reason:
+
+| step | top-1 | logit | top-2 | logit | margin |
+|---|---|---|---|---|---|
+| 5 | 264 | 18.954491 | 279 | 18.668240 | 0.286251 |
+| 6 | 3177 | 19.375208 | 6037 | 18.425795 | 0.949413 |
+| **7** | **7172** | **18.779411** | **303** | **18.514702** | **0.264709** |
+| 8 | 303 | 20.953234 | 383 | 18.930481 | 2.022753 |
+| **9** | 279 | 19.850554 | 9338 | 19.827751 | **0.022802** |
+
+At the divergent step the CPU arm's own runner-up IS the token CUDA emitted,
+1.4 % behind; one step later the margin is 0.1 %. The two arms rank the same
+candidates and disagree about a coin flip. The declared gate still fails and the
+wave still stops.
+
+**G0-SPEED: VOID and NOT claimed**, because a speed number behind a failing
+correctness gate is the #912 F1 shape. Taken for the record only: steady-state
+decode dt over the last six steps, CUDA 4.09-5.69 s/token, CPU 8.04-9.27
+s/token, interleaved on one lease.
+
+**Owed from this run.** The CUDA arm's own top-2 margin: the scratch instrument
+that reads `logits` in the completion callback SIGSEGVs on that arm
+(`SCRIPT_EXIT=139`), almost certainly because the pointer is not host memory
+there. And a ratified gate for a two-arm comparison whose greedy path is this
+finely balanced, which `AGENTS.md` reserves as an explicit operator decision.
