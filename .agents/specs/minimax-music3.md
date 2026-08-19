@@ -3625,6 +3625,134 @@ this row to four things it cannot report without:
 4. **A RANGE of latent lengths.** One point is what made the device arm look
    simply "slower" in §15.9.
 
+### 18.8a The measurement, TAKEN — Jetson Thor, under a lease, two binaries
+
+**`rc` job `da3a2f94-90e3-4e97-b519-9456310673b7` on `thor:gpu0`**, worker
+`rc-worker-hqfj4`, `Linux 6.8.12-1021-tegra` aarch64, 14 cores,
+`--max-runtime 150m`, 2026-08-19. No `ssh`, no `rc hold`, and no file mutex — the
+lease is the whole of the serialisation, which is the thing §13.10 did not have.
+
+Both arms built INSIDE the lease from two clones in `/tmp` (local overlay, not
+the CIFS `/workspace`), `CMAKE_BUILD_TYPE=Release` (`-O3`), CPU-only, `ninja -j 8`:
+
+| | before | after |
+|---|---|---|
+| `src/vt/cpu/cpu_conv1d_general.cpp` sha256 | `6fb15174c1533b93` | `a0e429ace3536479` |
+| `vllm_music3_vocoder_conv_ab` sha256 | `d90e3912cd636666` | `41ba78d2b7a8b99e` |
+
+`diff -rq` over `src/` reports that ONE file as the only difference between the
+trees, and the harness refuses to time anything when the two binaries hash the
+same. That guard exists because §16.6a's first Thor pair was VOID for exactly
+this: both arms were the same binary, and the tell was identical call counts,
+because equal times are noise where equal binaries are identity.
+
+**Correctness first, on the after arm, before any speed number was read**
+(`test cases` / `assertions` / `Status` quoted in full, because `assertions: 0`
+is a skip wearing a pass):
+
+| suite | result | rc |
+|---|---|---|
+| `test_ops_conv1d_general` | 9 cases, 375 assertions, 0 failed, `SUCCESS!` | 0 |
+| `test_host_parallel` | 8 cases, 877 assertions, 0 failed, `SUCCESS!` | 0 |
+| `test_vocoder1d` | 10 cases, 58 assertions, 0 failed, `SUCCESS!` | 0 |
+| `test_bigvgan` | 6 cases, 65 assertions, 0 failed, `SUCCESS!` | 0 |
+
+Three `[SKIP]` lines are printed and are read rather than ignored: this worker
+has no CUDA toolkit (`nvcc` MISSING), so the build is CPU-only and every
+CPU-vs-CUDA arm in that file, including this row's new one, did NOT run here.
+The device provider is unchanged by this row, and §13.4's `memcmp` arm was
+measured on a CUDA build; **it has not been re-measured against the tiled host
+kernel, and that is named as owed in §18.9 rather than implied by these greens.**
+
+**The sweep: arms ALTERNATED, three rounds, best-of-3 per point, the default
+arm** (`VLLM_CPP_VOCODER_DEVICE` unset, so this is the host kernel — see below
+for why that matters). `uptime` load average 3.29 before the build, 9.07 before
+the sweep, 8.48 after it; 0 other users; the box was NOT idle and both arms ate
+the same contention, which is what alternating them is for.
+
+Medians of the three rounds, in seconds:
+
+| latent frames | before | after | ratio |
+|---|---|---|---|
+| 20 | 5.5688 | 4.0831 | **1.364x** |
+| 40 | 11.0535 | 7.8186 | **1.414x** |
+| 86 | 23.5149 | 16.6614 | **1.411x** |
+| 172 | 47.9201 | 33.6498 | **1.424x** |
+| 344 | 97.4463 | 67.7083 | **1.439x** |
+
+The loudest pair is KEPT rather than dropped: 20 frames is the weakest ratio in
+the set and it is the one §15.9 priced the device arm at. The spread across a
+**17x span of work is 1.364x to 1.439x**, which is the signature of a RATE change
+and not of a fixed overhead — the same test §13.10 applied to the device arm, run
+in the other direction.
+
+**And the arms are BIT-IDENTICAL at full scale.** The harness prints an FNV-1a
+fingerprint of the whole stereo waveform, and across all six arm-rounds every
+length produced one value on both arms: `0x7c31c2ea73418503` (20),
+`0x35a02aad4c9cb983` (40), `0xc2d5eaf095d1c483` (86), `0x2dc69976150a5903` (172),
+`0x95e771d5f0051283` (344). Six processes, two binaries, one answer per length.
+
+**What this number is NOT.** It is the decode window's COMPUTATION at the shipped
+geometry with synthetic weights, driven through `VocoderDecode` — the call
+`Music3DecodeChunks` brackets as `vocoder.decode_window`
+(`minimax_music3_speech.cpp:397-398`). It is not an end-to-end synthesis, no
+checkpoint was read, and therefore §18.8's staging assertion
+(`SRC_BYTES == DST_BYTES`, `findmnt` on the path read) is NOT APPLICABLE here
+rather than skipped: there is no path to assert. The e2e pair on the real
+checkpoint is owed (§18.9).
+
+**And 53.6 s is the CUDA arm, not this one.** §15.2's profile ran
+`VLLM_CPP_VOCODER_DEVICE=cuda`, so the 53.6 s / 33.2 % that defined this row is
+the DEVICE arm's decode window. The default is `cpu` (§13.6) and that is the arm
+this row moves. Applying 1.42x to the 53.6 s figure would be comparing two
+different arms, so no such projection is made here.
+
+### 18.8b The KERNEL is 2.16x and the THREADPOOL gives back a third of it
+
+The obvious reading of §18.8a is that aarch64 simply vectorises worse than
+x86 and 1.42x is what the kernel is worth here. **That is measured, and it is
+wrong.**
+
+Second lease, **`rc` job `5b98f95e-a37b-4fa2-8ee9-81959caa828f` on `thor:gpu0`,
+`--max-runtime 45m`**, a fresh container, both arms rebuilt from the same two
+refs into two new binaries (`a3b14f2995...` before, `5b894d6b67...` after — both
+different from the first run's pair, so this is an independent build as well as
+an independent run). One latent length, 20 frames, because that is where §18.8a's
+ratio is weakest and therefore where the claim is hardest:
+
+| threads | before | after | ratio |
+|---|---|---|---|
+| **1** (`VLLM_CPP_CPU_THREADS=1`) | 37.0508 s | 17.1751 s | **2.157x** |
+| 14 (default), same container, same binaries | 5.4845 s | 4.0182 s | **1.365x** |
+
+The 14-thread control reproduces §18.8a's 1.364x to three digits, on a different
+container and a different pair of binaries, which is what makes the single-thread
+figure comparable to it rather than merely adjacent.
+
+**Read the scaling instead of the ratio and the cause is plain:**
+
+| arm | 1 -> 14 threads | of a possible 14x |
+|---|---|---|
+| before | 6.76x | 48 % |
+| after | **4.27x** | **31 %** |
+
+Neither arm scales, and the FASTER one scales WORSE. That is the signature of a
+shared resource: the tiled kernel needs the same bytes in less time, so it
+saturates whatever is shared sooner and gives back a third of its per-core win.
+The kernel is worth **2.16x on this box**; the threadpool returns 1.37x of it.
+
+Stated with its limits. This does not identify the resource — no bandwidth
+counter was read, and none is available on this worker — so "memory bandwidth"
+remains the leading candidate and not a finding. What it does establish is where
+the next lever is, and it is not the kernel: **it is the vocoder's parallel
+decomposition**, which partitions OUTPUT CHANNELS and therefore has every thread
+sweep the whole input tensor. §18.9 carries it as owed rather than as a ceiling.
+
+And it removes one hypothesis §18.8a left open: the aarch64 codegen is NOT the
+whole story, because per core the same source is worth 2.16x here against ~5x on
+AVX-512 x86 — a gap the 4x narrower f64 vector explains without needing anything
+else.
+
 ### 18.9 What is OWED after this row, named rather than left to a profile
 
 - **The f32-accumulate variant** (§13.10 step 3) is untouched and is now worth
@@ -3638,6 +3766,27 @@ this row to four things it cannot report without:
 - **`stride > 1`** keeps the shipped arithmetic path (§18.4).
 - **`ltx2_audio_vae.cpp:75`'s own 2-D host convolution loop** still routes
   through no op at all (#1114), so it is not reached by anything here.
+- **The CUDA-vs-CPU `memcmp` arm has NOT been re-measured against the tiled
+  kernel.** The Thor worker carries `gcc`, `g++`, `cmake`, `ninja` and `python3`
+  but **no `nvcc`** (probed 2026-08-19, which also CORRECTS §13.10's "no compiler
+  and no toolchain at all"), so the arms above are CPU-only and every
+  CPU-vs-CUDA case printed `[SKIP]`. The argument that it must still hold is
+  §18.3's — the host arm's per-cell order is unchanged, and §13.4's device kernel
+  was written against that order — but an argument is not a measurement. It needs
+  a build on a box with a CUDA toolkit.
+- **The e2e pair on the real checkpoint.** §18.8a is the decode window's
+  computation with synthetic weights, so it prices the stage without pricing a
+  song. The e2e leg is what would carry the staging assertion and a WAV identity
+  check, in the shape §16.6b took for the depth row.
+- **The vocoder's PARALLEL DECOMPOSITION is now the lever, and §18.8b measured
+  it rather than guessing.** The kernel is worth **2.16x per core** on Thor and
+  the threadpool returns **1.37x**, because both arms scale badly (6.76x and
+  4.27x of a possible 14x) and the faster arm scales worse. `ForOutputRows`
+  partitions OUTPUT CHANNELS, so every one of the 14 threads sweeps the whole
+  input tensor for its own slice of channels; a decomposition that also splits
+  the TIME axis would give the threads disjoint input windows. Not attempted
+  here, and not a ceiling: what it needs first is a bandwidth counter, and this
+  worker has none.
 
 ### 18.10 Stop conditions
 
