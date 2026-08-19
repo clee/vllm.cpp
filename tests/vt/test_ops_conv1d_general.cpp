@@ -122,7 +122,8 @@ void RequireBitIdentical(const std::vector<float>& got, const std::vector<float>
 std::vector<float> SerialConv1d(const std::vector<float>& in, int64_t batch, int64_t in_channels,
                                 int64_t in_len, const std::vector<float>& weight,
                                 const std::vector<float>* bias, int64_t out_channels,
-                                int64_t kernel, const Conv1dArgs& a, int64_t length) {
+                                int64_t kernel, const Conv1dArgs& a, int64_t length,
+                                bool reverse_ic = false) {
   const int64_t in_per_group = in_channels / a.groups;
   const int64_t out_per_group = out_channels / a.groups;
   std::vector<float> out(static_cast<size_t>(batch * out_channels * length), 0.0F);
@@ -131,7 +132,8 @@ std::vector<float> SerialConv1d(const std::vector<float>& in, int64_t batch, int
       const int64_t g = oc / out_per_group;
       for (int64_t t = 0; t < length; ++t) {
         double acc = bias != nullptr ? (*bias)[static_cast<size_t>(oc)] : 0.0;
-        for (int64_t ic = 0; ic < in_per_group; ++ic) {
+        for (int64_t step = 0; step < in_per_group; ++step) {
+          const int64_t ic = reverse_ic ? in_per_group - 1 - step : step;
           const int64_t src_c = g * in_per_group + ic;
           for (int64_t k = 0; k < kernel; ++k) {
             const int64_t pos = t * a.stride - a.padding + k * a.dilation;
@@ -228,6 +230,21 @@ const FwdCase kFwdCases[] = {
     {"batch3", 3, 24, 96, 24, 3, {1, 1, 1, 1}, false},
     // Kernel longer than the input once padded in.
     {"k-gt-l", 1, 8, 5, 8, 9, {1, 4, 1, 1}, true},
+    // --- THE TILE GEOMETRY (#1334) -----------------------------------------
+    // The CPU forward kernel walks output positions in tiles of 32, so the tile
+    // boundary is an edge the cases above only meet by coincidence. These pick
+    // lengths AGAINST it: exactly one tile, one tile plus a 1-wide tail, a
+    // length below one tile, and a length whose left clamp falls in the first
+    // tile while its right clamp falls in a partial LAST tile — the arrangement
+    // a per-position skip cannot get wrong and a per-tile clamp can.
+    {"tile-exact-32", 1, 24, 38, 24, 7, {1, 0, 1, 1}, true},
+    {"tile-plus-one", 1, 24, 39, 24, 7, {1, 0, 1, 1}, false},
+    {"sub-tile-padded", 1, 16, 20, 16, 7, {1, 3, 1, 1}, true},
+    {"multi-tile-padded", 1, 12, 100, 12, 9, {1, 4, 1, 1}, true},
+    {"tile-boundary-dilated", 1, 16, 96, 16, 5, {1, 6, 4, 1}, false},
+    // The strided arm keeps the shipped gather, and its clamp is the one with a
+    // ceiling division in it: `lo = ceil(-base/stride)`, `hi = ceil(room/stride)`.
+    {"tile-strided-padded", 1, 16, 200, 16, 5, {3, 4, 2, 1}, true},
 };
 
 struct BwdCase {
@@ -427,6 +444,78 @@ TEST_CASE("vt::ConvTranspose1d reproduces the host loop's ZERO-SKIP exactly") {
   // And state what the oracle itself produced, so a future change to the skip
   // cannot quietly agree with a co-mutated oracle.
   for (const float v : want) CHECK(std::signbit(v) == false);
+}
+
+TEST_CASE("vt::Conv1d CPU holds its sweep ORDER under cancellation, across tile boundaries") {
+  // THE case for #1334, and a hole this file had before it. The cancellation
+  // case at the bottom compares Conv1d CPU-vs-CUDA only, so on a CPU-only build
+  // NOTHING here held the forward sweep's ORDER against the pre-op host loop —
+  // every other forward assertion runs on well-scaled data, where an f64
+  // accumulator stored through an f32 hides a reduction-order change completely
+  // (measured, not assumed: tests/vllm/models/test_host_parallel.cpp).
+  //
+  // That is exactly the guarantee the tiled kernel turns on. It interleaves the
+  // (ic, k) sweep across 32 independent accumulators instead of serialising it
+  // into one, which must leave the order each individual cell sees UNCHANGED. On
+  // benign data a kernel that got that wrong would still pass everything above.
+  //
+  // The shape is chosen against the tile: length 197 is six whole tiles plus a
+  // 5-wide tail, padding 3 puts the left clamp inside tile 0 and the right clamp
+  // inside that tail, and dilation 2 makes the two clamps land at different taps.
+  const int64_t cin = 32, lin = 205, cout = 24, kernel = 8;
+  const float kBig = 1099511627776.0F;  // 2^40
+  std::vector<float> in = Spread(static_cast<size_t>(cin * lin), 0x3C3Cu);
+  std::vector<float> w = Spread(static_cast<size_t>(cout * cin * kernel), 0xC3C3u);
+  for (int64_t t = 0; t < lin; ++t) {
+    in[static_cast<size_t>(0 * lin + t)] = kBig;
+    in[static_cast<size_t>(1 * lin + t)] = -kBig;
+  }
+  // Channels 0 and 1 share a weight row, so the sequential (ic ascending) sweep
+  // cancels them at once and keeps the small remainder exactly; any other order
+  // carries 2^40 through the accumulator and quantises at ~1.2e-4.
+  for (int64_t oc = 0; oc < cout; ++oc) {
+    for (int64_t k = 0; k < kernel; ++k) {
+      w[static_cast<size_t>((oc * cin + 1) * kernel + k)] =
+          w[static_cast<size_t>((oc * cin + 0) * kernel + k)];
+    }
+  }
+
+  Conv1dArgs args;
+  args.stride = 1;
+  args.padding = 3;
+  args.dilation = 2;
+  const int64_t lout = vt::Conv1dOutLength(lin, kernel, args);
+  REQUIRE(lout == 197);
+  const std::vector<float> want =
+      SerialConv1d(in, 1, cin, lin, w, nullptr, cout, kernel, args, lout);
+  const std::vector<float> got = RunFwd(Cpu(), in, {1, cin, lin}, w, {cout, cin, kernel}, nullptr,
+                                        {1, cout, lout}, args);
+  RequireBitIdentical(got, want, "Conv1d cancellation cpu-vs-oracle");
+
+  // TEETH, before the agreement above is believed. Reversing the input-channel
+  // sweep is a genuine reassociation — the same multiset of products into every
+  // cell, added in the opposite order. If this reads 0 the cancellation has
+  // stopped biting and the equality above is vacuous, which is the one state a
+  // passing suite cannot otherwise report.
+  {
+    const std::vector<float> other =
+        SerialConv1d(in, 1, cin, lin, w, nullptr, cout, kernel, args, lout, /*reverse_ic=*/true);
+    size_t differing = 0;
+    for (size_t i = 0; i < other.size(); ++i) {
+      if (std::memcmp(&other[i], &want[i], sizeof(float)) != 0) ++differing;
+    }
+    INFO("order sensitivity: " << differing << " of " << want.size()
+                               << " cells change when the ic sweep is reversed");
+    CHECK(differing > 0);
+  }
+
+  if (!HasCuda()) {
+    std::printf("[SKIP] no CUDA backend: Conv1d tiled-cancellation CPU-vs-CUDA NOT exercised\n");
+    return;
+  }
+  const std::vector<float> cuda = RunFwd(Device{DeviceType::kCUDA, 0}, in, {1, cin, lin}, w,
+                                         {cout, cin, kernel}, nullptr, {1, cout, lout}, args);
+  RequireBitIdentical(cuda, got, "Conv1d cancellation cuda-vs-cpu across tiles");
 }
 
 TEST_CASE("vt conv1d ops REFUSE a narrow dtype by name rather than widening it") {

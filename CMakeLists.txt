@@ -2332,6 +2332,23 @@ foreach(_music3_ab_arm before after)
 endforeach()
 target_compile_definitions(vllm_music3_depth_stage_ab_after PRIVATE MUSIC3_AFTER)
 
+# ── The MiniMax-Music3 vocoder decode-window A/B driver (#672, #1334) ─────────
+# `tools/bench/music3_vocoder_conv_ab.cpp` is the artifact behind spec §18's
+# numbers. Unlike the depth-stage driver beside it this one is an EXECUTABLE,
+# because its two arms are two SOURCE TREES rather than two `#if` branches — the
+# shape spec §18.8 requires and that §16.6a was voided for not having. It is
+# registered as no test, so nothing in `ctest` runs it; it is compiled by the
+# ordinary build so the one file a reader must compile to reproduce §18 cannot
+# rot silently.
+add_executable(vllm_music3_vocoder_conv_ab tools/bench/music3_vocoder_conv_ab.cpp)
+target_link_libraries(vllm_music3_vocoder_conv_ab PRIVATE vllm)
+target_include_directories(vllm_music3_vocoder_conv_ab PRIVATE
+  ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/src ${CMAKE_BINARY_DIR}/include)
+target_include_directories(vllm_music3_vocoder_conv_ab SYSTEM PRIVATE
+  ${CMAKE_SOURCE_DIR}/third_party)
+target_compile_features(vllm_music3_vocoder_conv_ab PRIVATE cxx_std_20)
+vllm_cpp_set_warnings(vllm_music3_vocoder_conv_ab)
+
 # ── Packaged shared/static libvllm (M3.5 Task 3, library-first packaging) ─────
 # The static `vllm` core lib above stays as-is (tests + examples link it and
 # reach internal C++ symbols). Here we ALSO package a SHARED libvllm.so that
