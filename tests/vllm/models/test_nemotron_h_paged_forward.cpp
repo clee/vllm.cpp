@@ -766,10 +766,15 @@ TEST_CASE("NemotronH paged: the recurrent arm recorder counts what the step laun
   CHECK(dec.state_gathers == kMambaLayers * kPerLayerGathers);
   CHECK(dec.state_scatters == kMambaLayers * kPerLayerGathers);
 
-  // This box has no FP8 GEMM, so the device mamba arm cannot have been selected
-  // and NEITHER single-step kernel can have run. Asserting the zero here is what
-  // makes the non-zero on dgx mean something: the two counters are wired to the
-  // `vt::` call sites and not to the branch condition.
+  // THIS TEST'S QUEUE has no FP8 GEMM -- and that is a statement about the
+  // queue, not about the box: `Q()` is a CPU queue, `kMatmulFp8CublasLt` is
+  // registered only by `cuda_matmul.cu:920`, and the paged forward selects the
+  // device mamba arm by asking the OP TABLE for the queue's device. So this
+  // case reads the same on a GPU box as on a CPU one, which is why it is a
+  // stable floor rather than a property of wherever it happens to run.
+  // Asserting the zero here is what makes the non-zero on a leased GPU mean
+  // something: the two counters are wired to the `vt::` call sites and not to
+  // the branch condition.
   CHECK(dec.state_update_rows == 0);
   CHECK(dec.conv_update_rows == 0);
   CHECK(dec.chunk_scan_calls == 0);  // the HOST mixer's scan is not this counter's
