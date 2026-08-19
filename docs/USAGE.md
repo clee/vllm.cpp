@@ -1889,6 +1889,72 @@ static tuple is the CPU-only `linux-x86_64-musl-cpu-static` experiment; normal
 CPU and accelerator archives are static-core bundles with audited host runtime
 dependencies.
 
+## HuggingFace cache and credentials
+
+`--model` takes a local directory or a `.gguf` file. It does not take a
+repository identifier yet, and nothing in the tree fetches a checkpoint over the
+network. Row `ENG-HF-MODEL-DOWNLOAD`, issue
+[#1280](https://github.com/mudler/vllm.cpp/issues/1280), adds that, and this
+section records the part of it that has landed.
+
+The library now reads the HuggingFace environment. The values below are resolved
+in `vllm/transformers_utils/hf_hub` and `vllm/transformers_utils/hf_cache`, and
+they mean what `huggingface_hub` means by them:
+
+| Variable | Effect |
+|---|---|
+| `HF_TOKEN` | Bearer token for a private or gated repository |
+| `HF_TOKEN_PATH` | A file holding that token, read when `HF_TOKEN` is unset |
+| `HF_ENDPOINT` | Alternate hub host. A missing trailing slash is added |
+| `HF_HUB_OFFLINE` | Resolve from the cache and open no socket |
+| `HF_HUB_CACHE`, `HUGGINGFACE_HUB_CACHE`, `HF_HOME`, `XDG_CACHE_HOME`, `HOME` | The cache root, resolved in that order. `HF_HOME` contributes `$HF_HOME/hub` |
+
+The cache is HuggingFace's documented layout,
+`{hub}/models--org--repo/` with `refs`, `blobs` and
+`snapshots/{commit}/{path}`, so a host that already holds a Python
+`huggingface_hub` cache is read rather than re-downloaded. A repository holding
+more than one snapshot resolves to the one written most recently.
+
+Reading that layout is what the server does today. Writing into it is landed
+code with no caller yet: where the file system holds no symbolic link, which is
+the case for a CIFS mount and can be the case for the `/cache` container volume,
+a snapshot entry will become a real file, and the switch will be logged one time
+for each cache directory it happens in. The fetcher that calls it is W3 of the
+row, so nothing prints that line at this commit.
+
+A repository listing is refused, rather than partly used, when it fails either
+of two integrity checks. An object identifier given to two entries that disagree
+on the size the listing reported for them is refused, because no content hash
+names two sizes. That holds whether or not the two entries name different paths:
+one path listed twice at two sizes is self contradictory whichever entry is
+believed. An identifier whose characters are all the same, such as one character
+repeated 64 times, is refused, because no content hash produces one and that is
+the value the hub was measured serving for a gated repository on 17 August 2026.
+Neither check depends on `HF_TOKEN`. Entries that share an identifier and agree
+on size are accepted, because that is duplicate content and a repository is
+allowed to hold it.
+
+Identifiers are compared in one letter case. Hexadecimal is case-insensitive and
+the hub emits lower case, so a listing that spelled one identifier `ab23...` on
+one entry and `AB23...` on the next is naming one object and both checks see it
+that way. A mirror named by `HF_ENDPOINT` therefore cannot switch the size check
+off by changing a letter's case, and a cached blob gets the same name on a
+case-sensitive file system and on a case-insensitive one.
+
+The size check compares only the sizes a listing actually reported. It reads the
+entry's top-level `size` and falls back to `lfs.size`, never to `lfs.pointerSize`
+which is the size of the pointer file. An entry that reports no size is compared
+against nothing, and it cannot stand in as the reference for the entries that
+follow it, so a mirror named by `HF_ENDPOINT` cannot switch the check off by
+omitting one field.
+
+Two limits are worth stating plainly. No command-line surface reaches any of
+this yet, so setting `HF_TOKEN` today changes nothing a server does. And the
+DFlash draft path, which is the one caller that already resolves a repository
+identifier against the cache, still reads `$HOME/.cache/huggingface/hub` and
+ignores `HF_HOME`. Both are recorded under `## Owed` in
+`.agents/specs/hf-model-download.md`.
+
 ## Container images
 
 Published to one GHCR package with the lane in the tag. Every lane is a
@@ -2516,6 +2582,37 @@ change while still being the artifact the §16.6 measurement is reproducible fro
 (#1246). Its header carries the exact `g++` and run lines. Alternate the arms and
 take the minimum; it prints one fingerprint per process, after its round loop, so
 a "speedup" that changed the answer cannot be mistaken for one that did not.
+
+To price the **vocoder** the same way, `scripts/music3-vocoder-conv-ab.sh` runs
+the whole A/B for you:
+
+```sh
+scripts/music3-vocoder-conv-ab.sh https://github.com/mudler/vllm.cpp <after-ref> <before-ref>
+# LENGTHS=20,40,86,172,344  REPEATS=3  ROUNDS=3  JOBS=8  are the knobs
+```
+
+It clones two trees that differ in `src/vt/cpu/cpu_conv1d_general.cpp` and in
+nothing else, builds each in its own directory, and **refuses to time anything
+when the two binaries hash the same** — that is the failure that voided this
+model's first depth A/B, and equal times are noise where equal binaries are
+identity. It then runs the correctness gates on the after arm before reading any
+speed number, alternates the arms across a sweep of latent window lengths, and
+prints `uptime` on both sides of the sweep.
+
+The executable it builds, `vllm_music3_vocoder_conv_ab`, can also be run alone
+(`--lengths=`, `--repeats=`). It drives `VocoderDecode` — the same call
+`vocoder.decode_window` brackets — at the shipped vocoder geometry with
+synthetic weights, so it prices that stage without a checkpoint and makes no
+claim about audio. It prints one waveform fingerprint per length, which is how
+two arms are shown to agree BIT FOR BIT rather than closely. `ctest` never runs
+it (#1334).
+
+**What it times is the WINDOW, not the convolution.** The ratio it prints covers
+everything `VocoderDecode` does — `vt::Conv1d`, `vt::ConvTranspose1d`, the
+alias-free activations, the strided downsamples, and the threadpool and
+allocation around all of them. A kernel-level figure for `vt::Conv1d` alone is
+several times larger than the window figure at the same build and thread count,
+so the two are not interchangeable and this tool only ever reports the second.
 
 **Measured, so expectations are calibrated rather than hoped for.** On a Jetson
 Thor (sm_110, 14 cores) the device arm was *slower* on a two-frame request
@@ -4616,15 +4713,41 @@ Nothing about this is new configuration to learn: there is no new flag, no new
 config key and no new command. The seam is a library surface
 (`include/vt/breakable_graph.h`), and W1 registers one break point at the dense
 attention entry of `Qwen3ForCausalLM`. **Production steps now open a capture
-scope**, six of them as of W4: `Qwen3DenseDecodeGraph` (W2, #1261),
-`Qwen3MoeDecodeGraph`, `VoxtralDecodeGraph` and `DeepseekV2DecodeGraph` (W3,
-#1291), and `Qwen3_5DecodeGraph` with `Qwen3_5DenseDecodeGraph` (W4, #1307).
-Every one of them opens the scope in FULL mode, mirroring the decode half of
-vLLM's v1 default `CUDAGraphMode.FULL_AND_PIECEWISE`, and a `vt::GraphBreak`
-inside a FULL scope takes its pass-through arm — so the switch still changes
-nothing about the break point beyond what it already changed about the decode
-graphs. This paragraph asserted the opposite until W4: it was written at W1,
-when it was true, and W2 falsified it without rewriting it here.
+scope, and as of W5 (#1335) ALL NINE decode and draft graphs do**:
+`Qwen3DenseDecodeGraph` (W2, #1261), `Qwen3MoeDecodeGraph`, `VoxtralDecodeGraph`
+and `DeepseekV2DecodeGraph` (W3, #1291), `Qwen3_5DecodeGraph` with
+`Qwen3_5DenseDecodeGraph` (W4, #1307), and the DFlash draft graph, the DeepSeek
+V4 decode graph and the Laguna decode graph (W5, #1335). Every one of them opens
+the scope in FULL mode, mirroring the decode half of vLLM's v1 default
+`CUDAGraphMode.FULL_AND_PIECEWISE`, and a `vt::GraphBreak` inside a FULL scope
+takes its pass-through arm — so the switch still changes nothing about the break
+point beyond what it already changed about the decode graphs. This paragraph
+asserted the opposite until W4: it was written at W1, when it was true, and W2
+falsified it without rewriting it here.
+
+**W5 WIDENS WHAT THE SWITCH REACHES, and that is a user-visible change rather
+than an internal one.** The three single-shape drivers never read
+`VLLM_CPP_CUDAGRAPH` at all: each invented its own name — `VT_V4_DECODE_GRAPH`,
+`VT_DFLASH_GRAPH` and `VT_LAGUNA_DECODE_GRAPH` — so before W5 there was no single
+setting that turned capture off everywhere. There is now, and the three
+per-driver names STAY, because each is a same-binary A/B lever for exactly one
+driver rather than a copy of the shared one. Either turns its driver's capture
+off; `VLLM_CPP_CUDAGRAPH=0` turns all nine off at once.
+
+Turning capture off on those three does NOT return uncomputed memory, and the
+distinction is worth stating because it is invisible to a token gate. An INERT
+scope runs the forward eagerly, so the driver's buffers hold real values. A
+capture that FAILS is the opposite: under stream capture nothing between the
+begin and the failure executed, so those same buffers hold whatever the
+allocator last left there. The seam reports the two states apart and every
+migrated driver propagates the failure instead of returning the buffer.
+
+**The seam also owns the auxiliary-stream rule as of W5.** A model that forks a
+side stream inside a capture — the Laguna decode graph runs its FP4 shared
+expert that way — registers the fork with the capture scope, and the scope joins
+any fork still outstanding before it closes a segment, because ending a capture
+with an unjoined fork fails. There is nothing to configure: registration is part
+of the model's fork, and outside a capture both hooks do nothing at all.
 
 Building it needs no option. `src/vt/breakable_graph.cpp` and, since W4,
 `src/vt/persistent_step_input.cpp` — the capture-stable per-step device input
