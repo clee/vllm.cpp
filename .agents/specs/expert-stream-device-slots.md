@@ -42,10 +42,16 @@ correctness gate that would let us publish a number does not pass.** W0e ran on
   the arms agree about the distribution and disagree about a coin flip.
   Whether a token-exact cross-arm gate is the right instrument for a path with
   no oracle is a decision for the operator, not something this row may assume.
-* **G0-SPEED: VOID, by this row's own stop condition.** It was measured —
-  steady-state **4.09-5.69 s/token** on CUDA against **8.04-9.27 s/token** on
-  CPU, interleaved on one lease — and it is NOT claimed, because a speed number
-  behind a failing correctness gate is exactly the shape #912 F1 was.
+* **G0-SPEED: VOID, by this row's own stop condition.** It was measured over
+  the 31 DECODE steps of each arm (step 1 is prefill and is excluded),
+  interleaved on one lease: CUDA median **4.598 s/token** (min 3.012, max
+  126.456), CPU median **9.055 s/token** (min 7.857, max 23.174). Both maxima
+  are the first decode step, with the slot cache cold. It is NOT claimed,
+  because a speed number behind a failing correctness gate is exactly the shape
+  #912 F1 was. Two cautions if anyone is tempted to quote it anyway: the implied
+  1.97x rests on a token comparison that FAILED, and this CPU arm is faster than
+  the 11.05 s/token previously recorded at 4000 slots, so the two are not the
+  same measurement and must not be mixed.
 
 **What W0f did, measured rather than inferred.** The instrument added for this
 run counts **60.793 GiB** of dense weight aliased instead of duplicated into

@@ -23037,9 +23037,22 @@ candidates and disagree about a coin flip. The declared gate still fails and the
 wave still stops.
 
 **G0-SPEED: VOID and NOT claimed**, because a speed number behind a failing
-correctness gate is the #912 F1 shape. Taken for the record only: steady-state
-decode dt over the last six steps, CUDA 4.09-5.69 s/token, CPU 8.04-9.27
-s/token, interleaved on one lease.
+correctness gate is the #912 F1 shape. Taken for the record only, over the 31
+DECODE steps of each arm (step 1 is prefill and is excluded), interleaved on one
+lease:
+
+| arm | n | min | median | max |
+|---|---|---|---|---|
+| CUDA | 31 | 3.012 | **4.598** | 126.456 |
+| CPU | 31 | 7.857 | **9.055** | 23.174 |
+
+The medians are the figures; the maxima are the first decode step after prefill,
+when the slot cache is cold, and quoting either end of the range would be
+quoting the least representative number in it. The implied ratio is 1.97x and it
+is NOT a result: the correctness gate that would license it fails. Note also
+that this CPU arm is FASTER than the 11.05 s/token previously recorded for the
+CPU arm at 4000 slots, so the same-lease interleaved denominator here and that
+earlier figure are not the same measurement and should not be mixed.
 
 **Owed from this run.** The CUDA arm's own top-2 margin: the scratch instrument
 that reads `logits` in the completion callback SIGSEGVs on that arm
