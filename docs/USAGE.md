@@ -596,7 +596,7 @@ quantizes the activation once; a checkpoint whose scales differ keeps the two
 separate GEMMs automatically. `VT_GDN_MERGED_QKVZ_FP8=0` restores the two GEMMs
 in the same binary.
 
-### Block-wise FP8 loads and does not run yet
+### Block-wise FP8 runs on CPU, and its CUDA kernel is built but unverified
 
 Block-wise FP8, also called fine-grained FP8, keeps one scale for each 128x128
 block of a weight rather than one scale for the whole weight. A block-wise
@@ -610,27 +610,81 @@ checkpoint declares `quantization_config.weight_block_size` in its
 `self_attn.q_proj.weight` as `F8_E4M3` `[12288, 5120]` beside
 `self_attn.q_proj.weight_scale_inv` as `BF16` `[96, 40]`.
 
-That checkpoint now LOADS. The weights are read into a block-wise FP8 weight,
-the `BF16` scale is widened to `F32` by value the way vLLM widens it, and the
-config is cross-checked against the tensors so a disagreement is named rather
-than guessed at. Nothing can execute the weight yet, so the model refuses to
-finish preparing:
+That checkpoint now RUNS on a CPU queue. Ten projections of the Qwen3.5 dense
+model — `q_proj`, `k_proj`, `v_proj`, `o_proj`, the Gated-DeltaNet
+`in_proj_qkv`, `in_proj_z` and `out_proj`, and the MLP's `gate_proj`, `up_proj`
+and `down_proj` — quantize their activation per token per 128-wide group and
+then run a block-scaled GEMM whose scales apply in the mainloop, once per
+K-block, into an F32 accumulator. Each of the ten emits BF16, which is the
+model dtype and what vLLM emits at the same sites.
+
+Those ten projections are seven GEMMs, because `gate_proj` and `up_proj` run as
+one and `q_proj`, `k_proj` and `v_proj` run as one — the same two merged linears
+vLLM builds. A block scale belongs to a 128-row band, so the shards' scale grids
+concatenate exactly and the merged GEMM is byte-identical to the separate ones.
+
+That merge needs each projection in a group except the last to be a multiple of
+128 rows wide, which is what vLLM requires of the same checkpoints. A checkpoint
+that breaks the rule is refused by name, and the message says which projection
+and how wide it is, rather than quietly running a different arithmetic:
+
+```text
+block-wise FP8 merged 'qkv_proj': shard 'k_proj' has out_features 64, which is
+not a multiple of the quantization block's n 128. Only the LAST shard of a
+merged block-quant linear may be ragged
+```
+
+On a device with no block-scaled GEMM the model refuses while it is being
+prepared, before the first forward and before any CUDA graph is captured:
 
 ```text
 block-wise (fine-grained) 128x128 FP8 weights LOADED for
-model.layers.0.self_attn.q_proj and nothing in this build can execute them
+model.layers.0.self_attn.q_proj and there is no block-wise FP8 GEMM on device
+'cuda'. The linear method and the dense forward wiring are implemented and the
+CPU reference GEMM executes them, so this checkpoint runs on CPU today
 ```
+
+What exists on CPU is a correctness reference. It makes no speed claim, and no
+token-exact comparison against vLLM on this checkpoint has been recorded.
+
+A CUDA kernel now exists for the sm_120a and sm_121a architectures, and it is
+**build-verified only**. It is the block-scaled CUTLASS GEMM vLLM itself
+dispatches on those devices, ported whole, with the scales applied in the
+mainloop; it is compiled by continuous integration for both architectures and
+registered, so a build for one of them no longer refuses the checkpoint at
+prepare time. **It has never been executed.** No comparison against the CPU
+reference, no token-exact comparison against vLLM, and no throughput number has
+been recorded for it, on any device. The value comparison that would settle it
+is written and registered as `test_ops_matmul_fp8_block_cuda`, and on a machine
+with no device it reports that it did not run. Treat this arm as untested until
+that test has been run on hardware and its result recorded. Milestone M5 of
+[#1189](https://github.com/mudler/vllm.cpp/issues/1189) owns the kernel and the
+run it still owes; [#1166](https://github.com/mudler/vllm.cpp/issues/1166) is
+the original report.
+
+Two shapes the CPU arm accepts are refused on CUDA, by name and with the
+dimension and its remainder in the message. The CUTLASS collective needs both
+`K` and `N` to be multiples of 16, and vLLM draws the same line one rung higher
+and reroutes those shapes to a Triton kernel this build does not have. A
+*ragged* 128-block is not affected and runs: `N = 576` is `4*128 + 64` and is the
+shape vLLM's own CUTLASS test uses. A build for any other CUDA architecture has
+no such kernel compiled and keeps refusing at prepare time, which is the honest
+answer rather than a silent fallback.
+
+One lever is incompatible with this arm. `VT_KV_CACHE_F32=1` selects an F32
+paged KV cache while `v_proj` keeps emitting BF16, and the KV write requires
+both to share one dtype, so it refuses. That affects every BF16 arm rather than
+this one; it is tracked as
+[#1249](https://github.com/mudler/vllm.cpp/issues/1249). Leave the lever unset,
+which is the default.
 
 Two block-wise configurations are refused earlier, at load, because no build
 here implements them: an `activation_scheme` other than `dynamic`, and a
 `weight_block_size` other than `[128, 128]`. Both messages name the key and the
 value your `config.json` declares.
 
-Nothing is wrong with those checkpoints; the missing arm is in this project. To
-run the same model today, use a per-tensor FP8, BF16, NVFP4, or GGUF checkpoint
-of it. Issue [#1189](https://github.com/mudler/vllm.cpp/issues/1189) tracks the
-remaining milestones, and
-[#1166](https://github.com/mudler/vllm.cpp/issues/1166) is the original report.
+To run this model on a GPU with a recorded correctness result today, use a
+per-tensor FP8, BF16, NVFP4, or GGUF checkpoint of it.
 
 ### A per-tensor scale has to be one F32 number
 
@@ -656,6 +710,29 @@ per-output-channel arm itself is not implemented yet.
 
 `lm_head` is not affected. It has always read a per-output-channel scale
 correctly, as the table above records.
+
+### One load refusal that is about this code, not your checkpoint
+
+Almost every load refusal in this document names something your `config.json`
+or your tensors actually declare. Exactly one does not:
+
+```text
+dense loader: LoadQwen3_5DenseLayer was given a tensor-presence probe that
+answered YES for '__vllm_cpp__a_tensor_no_checkpoint_carries__', a name no
+checkpoint carries.
+```
+
+That name is not in your checkpoint and is not supposed to be. The loader asks
+about it to find out whether its own "is this tensor present?" predicate is
+capable of answering `no`, and this message means it is not. Your checkpoint is
+fine; please report it with the model you were loading
+([#1258](https://github.com/mudler/vllm.cpp/issues/1258)).
+
+The check exists because a predicate that only ever said yes shipped twice in one
+file, and what a reader saw was the *opposite* of the truth: a refusal naming a
+block-wise FP8 scale tensor the checkpoint had never contained
+([#1256](https://github.com/mudler/vllm.cpp/issues/1256)). A message that blames
+the wrong side costs more than the failure does.
 
 ### Architectures that resolve but refuse to run
 
@@ -2236,6 +2313,15 @@ Read it as follows.
   page-fault I/O with the copy inside a single call — so the load total on its
   own cannot say whether a slow load is storage or CPU, and `load.ac.dit_build`
   in particular touches no file at all.
+* the `calls` column on `ar.depth_forward` and `ar.depth_projection` changed
+  meaning in #672, so **two profile tables from different builds are not directly
+  comparable on those two rows**. The depth decoder used to re-run the whole
+  growing depth sequence at each of the seven codebook steps, separately per
+  guidance branch — 14 calls per frame, 70 rows of work to read 14 of them. It
+  now appends one position at a time against a K/V cache, both branches in one
+  batch-2 call: **8 calls per frame, 16 rows**. The seconds fell with the rows;
+  the call count fell for a different reason, and reading the drop in `calls` as
+  the speedup would double-count it. The output is bit-identical either way.
 
 It is **off unless the variable is set to `1`, `true`, `on` or `yes`**. Any
 other value, including a near miss like `y`, leaves it off — an operator who
@@ -2245,6 +2331,16 @@ changed. With it off, no clock is read and no `/proc` file is opened.
 This is an attribution instrument, not a benchmark harness: it takes no GPU
 clock window, so its rows are a within-run **split** and must not be quoted as
 per-kernel or cross-box figures.
+
+If you want to price the depth stage on your own box without generating a song,
+`tools/bench/music3_depth_stage_ab.cpp` drives one frame of it directly. Nothing
+RUNS it — it allocates 2.5 GB and is a two-build A/B, which one target could not
+express — but both arms are COMPILED, as the never-linked OBJECT libraries
+`vllm_music3_depth_stage_ab_{before,after}`, so it cannot rot behind a signature
+change while still being the artifact the §16.6 measurement is reproducible from
+(#1246). Its header carries the exact `g++` and run lines. Alternate the arms and
+take the minimum; it prints one fingerprint per process, after its round loop, so
+a "speedup" that changed the answer cannot be mistaken for one that did not.
 
 **Measured, so expectations are calibrated rather than hoped for.** On a Jetson
 Thor (sm_110, 14 cores) the device arm was *slower* on a two-frame request
@@ -4324,11 +4420,15 @@ honestly, and its `total` is EXACTLY `/proc/meminfo MemTotal`
 
 ## Turning CUDA graph capture off, including the break seam
 
-`VLLM_CPP_CUDAGRAPH=0` disables CUDA graph capture. It always did for the six
-batched decode drivers that each read it, and as of `ENG-CUDAGRAPH-BREAK` W1
-(#1192) it is also the switch the shared break-point seam reads, once per
-process, into a function-local static — so a process is in exactly one lane for
-its whole life and nothing can toggle it mid-run.
+`VLLM_CPP_CUDAGRAPH=0` disables CUDA graph capture. It reached the six batched
+decode drivers as six separate reads of the same name, one copied into each
+driver; as of `ENG-CUDAGRAPH-BREAK` W4 (#1307) `src/` holds exactly ONE, in the
+shared break-point seam (`src/vt/breakable_graph.cpp`), which reads it once per
+process into a function-local static — so a process is in exactly one lane for
+its whole life and nothing can toggle it mid-run. **The switch still means what
+it always meant.** What changed is that the drivers now agree by construction
+instead of by six copies of one parse, and that the lane is fixed at the first
+read rather than re-decided whenever a driver is constructed.
 
 With capture off, or on a backend that reports no capture support (Vulkan,
 Metal, and the CPU backend), a `vt::GraphCaptureScope` is INERT: it captures
@@ -4340,14 +4440,23 @@ migration stage reversible.
 Nothing about this is new configuration to learn: there is no new flag, no new
 config key and no new command. The seam is a library surface
 (`include/vt/breakable_graph.h`), and W1 registers one break point at the dense
-attention entry of `Qwen3ForCausalLM`. No production step opens a capture scope
-yet — that arrives when the decode drivers migrate onto the seam — so today the
-switch changes nothing about the break point beyond what it already changed
-about the decode graphs.
+attention entry of `Qwen3ForCausalLM`. **Production steps now open a capture
+scope**, six of them as of W4: `Qwen3DenseDecodeGraph` (W2, #1261),
+`Qwen3MoeDecodeGraph`, `VoxtralDecodeGraph` and `DeepseekV2DecodeGraph` (W3,
+#1291), and `Qwen3_5DecodeGraph` with `Qwen3_5DenseDecodeGraph` (W4, #1307).
+Every one of them opens the scope in FULL mode, mirroring the decode half of
+vLLM's v1 default `CUDAGraphMode.FULL_AND_PIECEWISE`, and a `vt::GraphBreak`
+inside a FULL scope takes its pass-through arm — so the switch still changes
+nothing about the break point beyond what it already changed about the decode
+graphs. This paragraph asserted the opposite until W4: it was written at W1,
+when it was true, and W2 falsified it without rewriting it here.
 
-Building it needs no option. `src/vt/breakable_graph.cpp` is part of the core
-`vllm` library on every platform, because the seam is backend-agnostic and asks
-nothing new of any backend.
+Building it needs no option. `src/vt/breakable_graph.cpp` and, since W4,
+`src/vt/persistent_step_input.cpp` — the capture-stable per-step device input
+the migrated drivers stage through, so that a replayed graph reads this step's
+values from the address it was captured against — are part of the core `vllm`
+library on every platform, because the seam is backend-agnostic and asks nothing
+new of any backend.
 
 The switch is GATED, and it is gated in a child process, because it is read once
 per process into a function-local static and no test in a running process can
@@ -4410,9 +4519,28 @@ ENVIRONMENT.md (`VT_GEMMA4_RESIDENT_*`, `VT_ATTN_*`). Defaults stay safe off RDN
 GetBlas keeps two per-thread hipBLAS handles (`tls_slots[2]`, device 1 → slot 1)
 so a 0→1 hop does not destroy GPU0's handle. `ProductGetBlasHandle` is the
 test accessor for that file-local `GetBlas`. HIP live probe is a separate CTest
-target (exit 77 if `HIP_VISIBLE_DEVICES` empty); it enters capture so production `StreamIsCapturing` is load-bearing. No new env. This PR does **not**
-restructure the Gemma-4 layer loop or enable decode hipGraph (those stay lab-only
-until a CUDA token-exact gate can land them).
+target (exit 77 if `HIP_VISIBLE_DEVICES` empty); it enters capture so production `StreamIsCapturing` is load-bearing. No new env.
+Prefill peer (#839) unpins dequant cache only after observed retirement; a failed fill/ready lease is retired with RetireFillLocked after the producer stream sync (never under cache.mu); restore-fail after publish retires before rethrow; failed retire quarantines the pin.
+This path does **not** restructure the Gemma-4 layer loop or enable decode hipGraph
+(those stay lab-only until a CUDA token-exact gate can land them).
+
+Contributor KEEP recipe (2x R9700 gfx1201, ROCm 7.2.4, `PREFIX_CACHE=0`, unique
+pads, 2026-08-13): SharedK-WMMA on, FLASH/FMHA off, `VT_GEMMA4_PREFILL_GEMM_M=2048`
+(the default), `VT_GEMMA4_PREFILL_PEER_ACT=1` (the default), batch MoE `T>=64`.
+Fair median prefill **2014 t/s @~11k** and **1099 t/s @~42k**; stream decode
+**55 t/s** temp=0. Paris / arith `63` / `gemma4` tool_calls held. Speculative,
+ngram, FMHA, and layer-split are **out of this recipe**. Details:
+[spec](../.agents/specs/gemma4-rocm-fp8-moe.md).
+
+These are contributor-lab numbers against **no denominator**: no pinned vLLM-ROCm
+run on the same box, same model, same quantization and same request shape exists
+for them, so `docs/BENCHMARKS.md` still records this backend as `PENDING: no
+binding throughput number` and this recipe does not change that. The decode
+figure is also not reproducible from the knobs above: the as-run recipe set four
+further decode splits that no product code in this tree reads
+([#845](https://github.com/mudler/vllm.cpp/issues/845)), and they are recorded in
+the spec rather than here, because a recipe on this page has to be one a reader
+can follow.
 
 ## LTX-2.5 text conditioning
 
@@ -5093,3 +5221,7 @@ length is the one the request's duration implies, and that it is **real audio** 
 non-zero, unclipped, non-constant, and with two channels that differ (the stereo
 fold is a contiguous split of the 128 latent channels, and an interleave produces
 a correctly shaped, correctly ranged, wrong song).
+
+Gemma-4 FP8 xdev prefill (`RunGemma4Fp8ExpertGeGLUPrefillOnExpertDevice`) is a
+Launch/Finish wrapper: cache pins stay live until host-observed `ev_e` retirement.
+Peer-pipe overlap stays off (slot 0 only).
