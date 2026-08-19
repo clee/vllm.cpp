@@ -879,8 +879,11 @@ Qwen3_5DenseWeights LoadQwen3_5Dense(const std::vector<SafetensorsFile>& shards,
 //
 // M3 refused every LOADED block weight, because the dense forward knew only
 // fp4, per-tensor fp8 and bf16 and an unwired block-wise checkpoint would fall
-// through to an EMPTY bf16 tensor. The forward reads them now
-// (`dense_fp8_block::MatmulFp8BlockScaledD` at each of the ten projections), so
+// through to an EMPTY bf16 tensor. The forward reads all ten projections now,
+// through THREE entry points rather than one:
+// `dense_fp8_block::MatmulFp8BlockScaledD` reads eight of them,
+// `MatmulFp8BlockMergedD` reads q/k/v as one operand, and
+// `Fp8BlockGateUpSwiGLUD` is the only reader of `gate_proj` and `up_proj`. So
 // what is left to refuse is a DEVICE with no kernel. M5 (`489a9a4c0`) added the
 // mainloop-scaled CUTLASS kernel for `VT_CUTLASS_FP8_ARCHS` (12.0a, 12.1a), so
 // this now fires for a CUDA arch outside that cell. It stays inert on CPU,

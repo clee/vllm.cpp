@@ -194,19 +194,27 @@ pull request with the spec committed first.
   **the CUDA kernel has never executed on hardware and there is no token gate
   against `Qwen/Qwen3.8-27B-FP8`.** That is recorded in
   `.agents/specs/vt-matmul-fp8-block-cuda.md` `## Owed` and is not narrowed here.
-- Nine more places still say the block-wise FP8 CUDA kernel is owed, outside
+- Eight more places still say the block-wise FP8 CUDA kernel is owed, outside
   the eight comment anchors [#1396](https://github.com/mudler/vllm.cpp/issues/1396)
   corrected. Three are LIVE refusal messages that tell a user on an unsupported
   CUDA arch to wait for milestone M5, which landed at `489a9a4c0`
   (`layers/quantization/fp8_block_quant.cpp:187-189`,
-  `models/dense_fp8_block_gemm.h:200-202` and `:428-430`). Six are comments
+  `models/dense_fp8_block_gemm.h:200-202` and `:428-430`). Five are comments
   (`include/vt/ops.h:1637,1658`, `src/vt/cpu/cpu_ops.cpp:668`,
   `include/vt/merged_gemm.h:92`,
-  `src/vllm/model_executor/models/qwen3_5_dense_weights.cpp:604,883`,
+  `src/vllm/model_executor/models/qwen3_5_dense_weights.cpp:604`,
   `tests/vllm/model_executor/models/test_fp8_block_linear.cpp:267`). The
   measurement `include/vt/ops.h:1637` names is still genuinely owed, so that one
   is a tense defect and not a retired obligation. Found by the fresh review of
   #1396 and left unfixed there rather than widening a comment-only change.
+  A ninth place, the `RefuseUnrunnableQwen3_5DenseFp8Block` comment block in
+  `qwen3_5_dense_weights.cpp`, WAS fixed in flow by #1396 and is no longer owed.
+  It carries no line anchor here because #1396 edits that same block. It
+  claimed `MatmulFp8BlockScaledD` reads each of the ten projections when it
+  reads eight, because `qwen3_5.cpp` reaches those ten through three entry
+  points -- `Fp8BlockGateUpSwiGLUD` is the only reader of `gate_proj_fp8_block`
+  and `up_proj_fp8_block`, and `MatmulFp8BlockMergedD` reads q/k/v as one
+  operand.
   Tracked by [#1411](https://github.com/mudler/vllm.cpp/issues/1411), which this
   row owns.
 - `ReadF32Scalar` (`src/vllm/model_executor/models/qwen3_5_weights.cpp:312`)
