@@ -91,6 +91,15 @@ Lifecycle changes still update STATUS and BENCHMARKS, while the moved row spec's
 `## Now` replaces the per-row write to `.agents/NOW.md`. Runtime and performance
 are `VOID`; no product behavior changed.
 
+Record-anchor ratchet (2026-08-18, `ENG-RECORD-ANCHOR-RATCHET` `ACTIVE`, #632):
+the record's own `file.cpp:123` citations were range-checked and never reported.
+Both forms were already parsed; a failing anchor was dropped and covered by
+`any()`, and no symbol test ran. 32 of the 38 offenders are in range.
+`check-agent-record.py` now classifies each citation OK, STALE or BROKEN and
+gates the rot against `scripts/record-anchor-baseline.json` in both directions.
+Backlog **38** (32 stale, 6 broken) over 844 correct; `ACTIVE` and `READY` rows
+join the count. No product behavior changed.
+
 Supported-model registry guard (2026-08-06): the public per-architecture list in
 [FEATURES](FEATURES.md) is CI-bound to the C++ registry by
 `scripts/check-supported-models.py` (+ mutation test), so the 37
@@ -144,7 +153,7 @@ token-for-token correctness against the pinned oracle.
 | InternLM2 dense (fused-`wqkv` interleaved split) | Correctness-complete, speed-pending | Token-exact 16/16 (internlm2-chat-1_8b): 12/16 strict + 4/16 bf16 near-tie (max gap 0.0 nats), 0 divergent; first InternLM model; ZERO new compute kernel (reuses the Llama dense forward; the only delta is a loader-side de-interleave of the fused `wqkv`, which packs q/k/v interleaved by KV-group) |
 | MiniMax-H3 (`MiniMaxH3DiTModel`, video+audio DIFFUSION) | **ABI v12 ONE SURFACE; device selector uses generic `DeviceType`; DSR 32.** t2va+fl2va COHERENT; bf16 shards STREAM | ref2va ckpt fidelity §8.12; encoder A/B §8.15; GB10 re-verify residual; CPU fold 6/137 (one queue + device provenance mutation-gated) |
 | LTX-2.5 (`LTX2VideoTransformer3DModel`, video+audio DIFFUSION) | **L1-L9c landed (#435).** 21.00B / 48 blocks. `VideoEngine` seam + ABI **v18**, DiT forward (CPU f32 parity, bf16 device-resident), Gemma-4 TE, both VAEs, connector, pipeline, NVFP4/FP8, keyframe bias (#658) | BOTH shipped DiTs load inside the contract; one runs device-resident on GB10. Caption projection on `vt::MatmulBT` (#1208); IC-LoRA fusion on `vt::Matmul` (#1202), 143x, residual now the add-back (#1254). Render OWED |
-| MiniMax-Music3 (`MiniMaxMusic3ForConditionalGeneration`, text-to-MUSIC) | **`ACTIVE`: W0-W7 landed; every stage including the 8.6B LM forward is implemented and gated (#672).** Oracle is the OPEN diffusers PR #14456 `c6da9936` | GGUF arms for 4 components owed. LM forward gated in a control; HTTP OBSERVED (#852). PARTIAL device arm, Thor sm_110 (#672): 8.6B LM + 2.4B fp32 DiT (§14). CPU kernels 10.7x on the vocoder chain. No reference number |
+| MiniMax-Music3 (`MiniMaxMusic3ForConditionalGeneration`, text-to-MUSIC) | **`ACTIVE`: W0-W7 landed; every stage including the 8.6B LM forward is implemented and gated (#672).** Oracle is the OPEN diffusers PR #14456 `c6da9936` | GGUF arms for 4 components owed. LM gated in a control; HTTP OBSERVED (#852). PARTIAL device arm, Thor sm_110 (#672): 8.6B LM + 2.4B fp32 DiT (§14). Depth 4.45x, wall 2.74x, WAV byte-identical (§16). No reference number |
 | Command-R / Cohere dense (`CohereForCausalLM`) | Implemented, gate-blocked | ZERO-new-kernel port grounded in vLLM `commandr.py`: weight-only Cohere LayerNorm + GPT-J full-width RoPE + PARALLEL residual + `logit_scale` + tied embeddings, all reuse; compiles, links, self-registers. No SACRED gate yet (real checkpoints HF-gated, ungated ones tiny-random, GPU box disk-full); oracle run-verified at W0. See docs/BENCHMARKS.md |
 | Phi-1 / Phi-2 dense (`PhiForCausalLM`, parallel residual) | Correctness-complete, speed-pending | Token-exact 16/16 (microsoft/phi-2): 9/16 strict + 7/16 bf16 near-ties (max gap 0.25 nats), 0 forward-divergent; the OLDER Microsoft Phi arch, DISTINCT from Phi-3/Phi-4; ZERO new compute kernel (GPT-J parallel residual, LayerNorm-with-bias, biased qkv/dense, partial NeoX rope 32/80, non-gated NewGELU MLP reusing `vt::GeluTanh`, untied biased lm_head); F16 dtype-aware loader |
 | MiniCPM dense (`MiniCPMForCausalLM`, three scalars) | Correctness-complete, speed-pending | Token-exact 16/16 (openbmb/MiniCPM-2B-sft-bf16): 10/16 strict + 6/16 bf16 near-ties (max gap 0.0 nats), 0 forward-divergent; first OpenBMB MiniCPM model; ZERO new compute kernel (the Llama/Granite dense forward plus three scalars: scale_emb, scale_depth/sqrt(layers) residual, dim_model_base logit scaling), tied lm_head; `.bin`-only weights converted to safetensors via trusted torch |
@@ -206,6 +215,15 @@ decode step keeps the single graph it already had; the PIECEWISE arm has no
 production driver yet, because the break closure W1 registered reads a returned
 frame on replay. Bit-exactness against a REPLAYED capture on a real GPU is owed,
 not met.
+
+W3 (2026-08-19, #1291) migrates the three remaining plain batched drivers:
+Qwen3-Coder MoE, Voxtral text and DeepSeek-V2 MLA. Each captures and replays
+through the seam in FULL mode, and each landed with its own gate. Six drivers
+read the framework capture switch for themselves before this row; two remain.
+
+W3 also closed a gate that could not fail. The mode a driver captures in was
+unobservable from outside it, so a one-token FULL-to-PIECEWISE flip left a whole
+driver gate green. The seam now counts the mode, and that flip reds each gate.
 
 A capture that FAILS is now distinguishable from a scope that was INERT. The
 capture scope has to swallow a throwing `EndCaptureGraph` — a destructor that
@@ -947,6 +965,31 @@ Resource axes on the same series: cold start to first `/health` **53 s vs
 780 s = 14.7x**, and host memory after warmup **42.5 vs 110.1 GiB = 2.59x** —
 the latter with the caveat that vLLM's figure is set by
 `--gpu-memory-utilization 0.85` pre-reserving KV on a unified-memory box.
+
+**Its quantized arms are not gated.** Three rows enter `READY` on
+[#821](https://github.com/mudler/vllm.cpp/issues/821)
+([spec](../.agents/specs/qwen38-27b-quant-arms.md)): `LOAD-GGUF-MMPROJ`,
+`QUANT-QWEN38-27B-GGUF-ARM` and `QUANT-QWEN38-27B-NVFP4-ARM`. `AGENTS.md` makes
+the quantized arms a standing requirement, and these are the arms a user can run:
+17.1 GB of Q4_K_M against 53.8 GB of bf16 GGUF.
+
+Nothing is implemented. No production path accepts a second `clip` GGUF projector
+beside the language file. The artifact published as `unsloth/Qwen3.8-27B-NVFP4`
+is a compressed-tensors `mixed-precision` checkpoint with **zero `*.input_scale`
+tensors**, which is why the reported load dies. And the Q4_K_M file ships the MTP
+drafter as block 64, so a loader reading `block_count` as decoder depth builds a
+65-layer model out of a 64-layer checkpoint.
+
+**Both token gates are `PENDING` on named external authorities, and this page
+claims no number for either.** The Q4_K_M arm's only comparator is llama.cpp,
+whose pin is recorded `gateable = no` with
+[#857](https://github.com/mudler/vllm.cpp/issues/857) owing the measurement. The
+NVFP4 arm's oracle is the pinned vLLM, which builds and imports inside an `rc`
+lease but has never been shown to RUN a model there
+([#1185](https://github.com/mudler/vllm.cpp/issues/1185)).
+
+Neither blocker is these rows' to clear, and neither stops the CPU-side work: ten
+of the sixteen declared tests need no GPU and no lease.
 
 Larger DeepSeek / GLM / MiniMax / Gemma-4 variants are recorded as
 **hardware-blocked** (they do not fit 119 GiB of unified memory on this box) or
@@ -1731,7 +1774,11 @@ Gemma4/ROCm env split: public `VT_GEMMA4_EXPERT_VRAM_MB` caps expert LRU in posi
 
 `BACKEND-TENSTORRENT-HOST-FREE-FORWARD`: `ACTIVE`: env-gated `VT_TT_HOST_FREE_DECODE` decode-graph capture. Implementer P150 run of Qwen3-0.6B, 80 tokens: 79 replays, no hang, 5.8x vs eager, 22/22 vs the per-step-copy baseline. Default path inert. Operator gate and full-engine golden still owed. A new batch after the first capture is refused.
 
-`ENG-CUDAGRAPH-DEDUP`: `ACTIVE`: env-gated `VT_CUDA_GRAPH_DEDUP` graph-executable dedup — one `cudaGraphExec` per captured TOPOLOGY instead of one per padded decode bucket per model. The GB10 same-binary A/B ran on 2026-08-18 and split: replays are byte-identical 10/10 and [#1184](https://github.com/mudler/vllm.cpp/issues/1184) is gone, but the fold NEVER engages — the signature carries the padded batch dimension, so two decode buckets never group and ON allocates as many executables as OFF. Default stays OFF; the flip is unjustified on this evidence, and a coarser key is the open hypothesis ([#1226](https://github.com/mudler/vllm.cpp/issues/1226)).
+`ENG-CUDAGRAPH-DEDUP`: `ACTIVE`: env-gated `VT_CUDA_GRAPH_DEDUP` graph-executable dedup — one `cudaGraphExec` per captured TOPOLOGY instead of one per padded decode bucket per model. Byte-identical on GB10 over 10/10 comparisons, [#1184](https://github.com/mudler/vllm.cpp/issues/1184) gone. The exact key folds nothing, because it carries the padded batch dimension; the coarse key folds and is measured below. Default OFF, and the flag stays OFF on measurement rather than on silence.
+
+`ENG-CUDAGRAPH-DEDUP` coarse key ([#1226](https://github.com/mudler/vllm.cpp/issues/1226)): landed and MEASURED, and the benefit is NEGATIVE. At the shipped bucket sets it folds 7 captures to 3 execs and 11 to 5, so the fold is real. The device-byte saving is not: 13.83 MiB nominal at 7 buckets (0.42% of a 3.25 GiB process), nothing at 11, and smaller than the disagreement of its own null control. The driver refuses 43% of probes at 7 buckets and 73% at 11, always on TOPOLOGY — the decode graphs are 376 and 404 nodes, so a coarser key makes false candidates, not folds.
+
+`ENG-CUDAGRAPH-DEDUP` defaults: both flags stay OFF. `VT_CUDA_GRAPH_DEDUP_COARSE_KEY` alone is a no-op, because the coarse key is read only inside the dedup path. **No time figure is attributable** — the clock pin was refused inside the lease. The feature is also still unreachable on the DEFAULT serving path, which captures no decode graph ([#1179](https://github.com/mudler/vllm.cpp/issues/1179)).
 
 **Platform SELECTION is the one non-additive site, and is now gated.** A
 platform missing from `CurrentPlatform()`'s hardcoded walk registers and answers

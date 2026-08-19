@@ -596,7 +596,7 @@ quantizes the activation once; a checkpoint whose scales differ keeps the two
 separate GEMMs automatically. `VT_GDN_MERGED_QKVZ_FP8=0` restores the two GEMMs
 in the same binary.
 
-### Block-wise FP8 runs on CPU and refuses on CUDA
+### Block-wise FP8 runs on CPU, and its CUDA kernel is built but unverified
 
 Block-wise FP8, also called fine-grained FP8, keeps one scale for each 128x128
 block of a weight rather than one scale for the whole weight. A block-wise
@@ -618,6 +618,22 @@ then run a block-scaled GEMM whose scales apply in the mainloop, once per
 K-block, into an F32 accumulator. Each of the ten emits BF16, which is the
 model dtype and what vLLM emits at the same sites.
 
+Those ten projections are seven GEMMs, because `gate_proj` and `up_proj` run as
+one and `q_proj`, `k_proj` and `v_proj` run as one — the same two merged linears
+vLLM builds. A block scale belongs to a 128-row band, so the shards' scale grids
+concatenate exactly and the merged GEMM is byte-identical to the separate ones.
+
+That merge needs each projection in a group except the last to be a multiple of
+128 rows wide, which is what vLLM requires of the same checkpoints. A checkpoint
+that breaks the rule is refused by name, and the message says which projection
+and how wide it is, rather than quietly running a different arithmetic:
+
+```text
+block-wise FP8 merged 'qkv_proj': shard 'k_proj' has out_features 64, which is
+not a multiple of the quantization block's n 128. Only the LAST shard of a
+merged block-quant linear may be ragged
+```
+
 On a device with no block-scaled GEMM the model refuses while it is being
 prepared, before the first forward and before any CUDA graph is captured:
 
@@ -629,11 +645,31 @@ CPU reference GEMM executes them, so this checkpoint runs on CPU today
 ```
 
 What exists on CPU is a correctness reference. It makes no speed claim, and no
-token-exact comparison against vLLM on this checkpoint has been recorded,
-because the GPU arm that would run one does not exist yet. Milestone M5 of
-[#1189](https://github.com/mudler/vllm.cpp/issues/1189) owns the
-mainloop-scaled CUTLASS kernel; [#1166](https://github.com/mudler/vllm.cpp/issues/1166)
-is the original report.
+token-exact comparison against vLLM on this checkpoint has been recorded.
+
+A CUDA kernel now exists for the sm_120a and sm_121a architectures, and it is
+**build-verified only**. It is the block-scaled CUTLASS GEMM vLLM itself
+dispatches on those devices, ported whole, with the scales applied in the
+mainloop; it is compiled by continuous integration for both architectures and
+registered, so a build for one of them no longer refuses the checkpoint at
+prepare time. **It has never been executed.** No comparison against the CPU
+reference, no token-exact comparison against vLLM, and no throughput number has
+been recorded for it, on any device. The value comparison that would settle it
+is written and registered as `test_ops_matmul_fp8_block_cuda`, and on a machine
+with no device it reports that it did not run. Treat this arm as untested until
+that test has been run on hardware and its result recorded. Milestone M5 of
+[#1189](https://github.com/mudler/vllm.cpp/issues/1189) owns the kernel and the
+run it still owes; [#1166](https://github.com/mudler/vllm.cpp/issues/1166) is
+the original report.
+
+Two shapes the CPU arm accepts are refused on CUDA, by name and with the
+dimension and its remainder in the message. The CUTLASS collective needs both
+`K` and `N` to be multiples of 16, and vLLM draws the same line one rung higher
+and reroutes those shapes to a Triton kernel this build does not have. A
+*ragged* 128-block is not affected and runs: `N = 576` is `4*128 + 64` and is the
+shape vLLM's own CUTLASS test uses. A build for any other CUDA architecture has
+no such kernel compiled and keeps refusing at prepare time, which is the honest
+answer rather than a silent fallback.
 
 One lever is incompatible with this arm. `VT_KV_CACHE_F32=1` selects an F32
 paged KV cache while `v_proj` keeps emitting BF16, and the KV write requires
@@ -647,8 +683,8 @@ here implements them: an `activation_scheme` other than `dynamic`, and a
 `weight_block_size` other than `[128, 128]`. Both messages name the key and the
 value your `config.json` declares.
 
-To run this model on a GPU today, use a per-tensor FP8, BF16, NVFP4, or GGUF
-checkpoint of it.
+To run this model on a GPU with a recorded correctness result today, use a
+per-tensor FP8, BF16, NVFP4, or GGUF checkpoint of it.
 
 ### A per-tensor scale has to be one F32 number
 
@@ -2277,6 +2313,15 @@ Read it as follows.
   page-fault I/O with the copy inside a single call — so the load total on its
   own cannot say whether a slow load is storage or CPU, and `load.ac.dit_build`
   in particular touches no file at all.
+* the `calls` column on `ar.depth_forward` and `ar.depth_projection` changed
+  meaning in #672, so **two profile tables from different builds are not directly
+  comparable on those two rows**. The depth decoder used to re-run the whole
+  growing depth sequence at each of the seven codebook steps, separately per
+  guidance branch — 14 calls per frame, 70 rows of work to read 14 of them. It
+  now appends one position at a time against a K/V cache, both branches in one
+  batch-2 call: **8 calls per frame, 16 rows**. The seconds fell with the rows;
+  the call count fell for a different reason, and reading the drop in `calls` as
+  the speedup would double-count it. The output is bit-identical either way.
 
 It is **off unless the variable is set to `1`, `true`, `on` or `yes`**. Any
 other value, including a near miss like `y`, leaves it off — an operator who
@@ -2286,6 +2331,16 @@ changed. With it off, no clock is read and no `/proc` file is opened.
 This is an attribution instrument, not a benchmark harness: it takes no GPU
 clock window, so its rows are a within-run **split** and must not be quoted as
 per-kernel or cross-box figures.
+
+If you want to price the depth stage on your own box without generating a song,
+`tools/bench/music3_depth_stage_ab.cpp` drives one frame of it directly. Nothing
+RUNS it — it allocates 2.5 GB and is a two-build A/B, which one target could not
+express — but both arms are COMPILED, as the never-linked OBJECT libraries
+`vllm_music3_depth_stage_ab_{before,after}`, so it cannot rot behind a signature
+change while still being the artifact the §16.6 measurement is reproducible from
+(#1246). Its header carries the exact `g++` and run lines. Alternate the arms and
+take the minimum; it prints one fingerprint per process, after its round loop, so
+a "speedup" that changed the answer cannot be mistaken for one that did not.
 
 **Measured, so expectations are calibrated rather than hoped for.** On a Jetson
 Thor (sm_110, 14 cores) the device arm was *slower* on a two-frame request
