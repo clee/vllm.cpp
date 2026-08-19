@@ -14,6 +14,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <vector>
 
 #include "vllm/config/device.h"
 #include "vllm/config/kv_transfer.h"
@@ -366,6 +367,17 @@ class LoadedEngine {
   // differently. It outlives every consumer that borrows it (declared before
   // input_processor_), which is what lets the OpenAI chat seam hold a reference.
   const vllm::MultiModalConfig& mm_config() const { return mm_config_; }
+  // #607 L3, the TOWER SKIP made observable from a production entry point. The
+  // stage names of the towers this engine's model constructed WITHOUT loading,
+  // because every modality they serve was at limit 0 — upstream's
+  // `_tower_model_names` + `StageMissingLayer(stage_name, ...)`
+  // (interfaces.py:141,280-283,298). EMPTY on every text model and on every
+  // multimodal model loaded with a non-zero limit, so a caller can tell
+  // "--language-model-only actually freed the tower" from "the flag was
+  // accepted and did nothing", which is the distinction L2 could not make.
+  std::vector<std::string> skipped_towers() const {
+    return model_->skipped_towers();
+  }
   // ARCH-ONE-SURFACE ROW 6: whether the loaded model registration declares the
   // POOLING task class (is_pooling_model). The entrypoints dispatch BY TASK on
   // this — text-generation refuses on a pooling engine (naming vllm_embed /

@@ -1795,8 +1795,18 @@ std::unique_ptr<LoadedEngine> LoadedEngine::FromModelDir(
           "this file declares no <arch>.nextn_predict_layers (it was converted "
           "with --no-mtp, or predates llama.cpp's Qwen3.5 MTP support)");
     }
-    std::unique_ptr<LoadedModel> model =
-        ModelRegistry::Load(config, ModelSource::FromGguf(gguf));
+    // #607 L3, THE PRODUCTION CALL SITE for the tower skip (one of three, all in
+    // this function). The engine's multimodal limits are borrowed for the load,
+    // so a loader that owns a tower can leave it uninitialised when every
+    // modality it serves is at limit 0 — the mirror of upstream reading
+    // `vllm_config.model_config.multimodal_config` inside the model's __init__
+    // (interfaces.py:288-293). `params` outlives the call. Deleting this
+    // assignment leaves the flag accepted and inert, which is exactly the
+    // failure L2 recorded and L3 exists to close; test_tower_skip's reachability
+    // case is the gate that catches it.
+    ModelSource gguf_source = ModelSource::FromGguf(gguf);
+    gguf_source.multimodal = &params.multimodal;
+    std::unique_ptr<LoadedModel> model = ModelRegistry::Load(config, gguf_source);
     // SPEC-MTP-GGUF: attach the head from the SAME file, mirroring the
     // safetensors branch's maybe_attach_mtp. The GGUF is still mapped here; the
     // loader owns its dequantized copies, so nothing borrows past this scope.
@@ -1997,8 +2007,10 @@ std::unique_ptr<LoadedEngine> LoadedEngine::FromModelDir(
       registration.factory->stage_on_load;
   if (!queue_load) {
     const auto t_weights = std::chrono::steady_clock::now();
-    std::unique_ptr<LoadedModel> model = ModelRegistry::Load(
-        config, ModelSource::FromSafetensorsOwned(shards));
+    // #607 L3 production call site (see the GGUF branch above for the argument).
+    ModelSource source = ModelSource::FromSafetensorsOwned(shards);
+    source.multimodal = &params.multimodal;
+    std::unique_ptr<LoadedModel> model = ModelRegistry::Load(config, source);
     ReportLoadPhase("weights", SecondsSince(t_weights));
     ReportLoadBytes();
     maybe_attach_mtp(*model);
@@ -2015,8 +2027,10 @@ std::unique_ptr<LoadedEngine> LoadedEngine::FromModelDir(
       SelectQueueForModel(registration.architecture, params.device);
   try {
     const auto t_weights = std::chrono::steady_clock::now();
-    std::unique_ptr<LoadedModel> model = ModelRegistry::Load(
-        config, ModelSource::FromSafetensorsOwned(shards, &load_queue));
+    // #607 L3 production call site (see the GGUF branch above for the argument).
+    ModelSource source = ModelSource::FromSafetensorsOwned(shards, &load_queue);
+    source.multimodal = &params.multimodal;
+    std::unique_ptr<LoadedModel> model = ModelRegistry::Load(config, source);
     ReportLoadPhase("weights", SecondsSince(t_weights));
     ReportLoadBytes();
     maybe_attach_mtp(*model);

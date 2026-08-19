@@ -644,31 +644,62 @@ comparing the two arms must set the flag on both sides or state that it did not.
      `src/vllm/entrypoints/model_loader.cpp`; a gate that stays green without it
      measures a class.
 
-  **The RSS gate, and its threshold declared BEFORE the measurement.**
+  **The RSS gate, its VEHICLE, and its threshold — all declared BEFORE any
+  number exists.** At the time of writing no RSS measurement has been taken, on
+  either arm, on any host.
 
-  Peak RSS, not steady-state: the load phase is where the tower's bytes are
-  paid, and a steady-state figure taken after the allocator has returned pages
-  would report a saving the box never saw. `/usr/bin/time -v` (`Maximum resident
-  set size`) around one process that loads the checkpoint and generates a fixed
-  16 greedy tokens from a fixed text prompt, run A-B-A-B, from **two separate
-  build directories of the same commit** (an A/B that reuses one build directory
-  measures one binary twice, and identical call counts are the tell), on an
-  otherwise idle box, with the page cache warmed by a discarded first run so the
-  two arms see the same I/O state.
+  *Which of the two call sites the measurement exercises: one of them, and the
+  reason is the checkpoints that exist rather than a choice.* Read at
+  `/mnt/nas_share/checkpoints` on 2026-08-19, three of the ten checkpoints
+  carrying a `config.json` declare a `vision_config`:
 
-  Vehicle: `MuseGlimmerForConditionalGeneration`, the only architecture in this
-  tree that both loads a tower on its production path and has a checkpoint on
-  the NAS.
+  | Checkpoint | Architecture | Does its PRODUCTION loader read a tower? |
+  |---|---|---|
+  | `muse-glimmer-30b` (56 G) | `MuseGlimmerForConditionalGeneration` | **yes** — `muse_glimmer_weights.cpp:791` |
+  | `qwen3.6-35b-a3b-bf16` (67 G) | `Qwen3_5MoeForConditionalGeneration` | no — `LoadQwen3_5Moe` reads the text backbone only; `LoadQwen3_5MoeVision` has no production caller (#891) |
+  | `qwen3.8-27b-safetensors` | `Qwen3_5ForConditionalGeneration` | no — the dense arm's loader reads no `model.visual.*` either |
 
-  **Declared threshold: the language-model-only arm's peak RSS must be at least
-  90% of the perception encoder's on-disk byte total below the default arm, and
-  the default arm must be within 2% of the pre-L3 binary's.** The tower's own
-  size is computable from the checkpoint index before the run, so this is a
-  threshold on the physics rather than a round number: 90% leaves room for
-  allocator granularity and for the tower geometry that is still parsed, and the
-  second half is what stops "we saved memory" from meaning "we broke the default
-  path". An outcome below it is a FAILING axis and stays open; it is not
-  renegotiated afterwards.
+  There is **no `Qwen3VLForConditionalGeneration` checkpoint on the NAS**, so the
+  `qwen3_vl.cpp:418` site is implemented and CPU-gated but not RSS-measured.
+  Measuring it would need `Qwen/Qwen3-VL-4B-Instruct` (~8.3 GiB), which is a
+  download nobody has authorised and which this row does not need: the two sites
+  run the same predicate through the same seam, and the one that is measurable
+  is the one that carries the mechanism. Recorded as a gap, not glossed.
+
+  *Method.* Peak RSS, not steady-state: the load phase is where the tower's bytes
+  are paid, and a steady-state figure taken after the allocator has returned
+  pages would report a saving the box never saw. `/usr/bin/time -v` (`Maximum
+  resident set size`) around one process that loads the checkpoint and generates
+  a fixed 16 greedy tokens from a fixed text prompt, run A-B-A-B, from **two
+  separate build directories of the same commit** (an A/B that reuses one build
+  directory measures one binary twice, and identical call counts are the tell),
+  on an otherwise idle box, with the page cache warmed by a discarded first run
+  so the two arms see the same I/O state. `scripts/mm/tower_skip_rss.sh` is that
+  procedure; `--report-only` prints the arithmetic below against a run's two
+  logs without re-running anything.
+
+  *The quantity at stake, computed from the checkpoint rather than guessed.* Of
+  `muse-glimmer-30b`'s 1436 tensors totalling 55.463 GiB, **809 are the
+  perception encoder and total 3.580 GiB on disk** (6.45%), read from the two
+  shard headers. Our loader widens that tower to HOST f32
+  (`MuseGlimmerVisionWeights` is `std::vector<float>`, `muse_glimmer_vision.h:106-118`),
+  so its resident cost is **2x the on-disk figure = 7.161 GiB**, and that — not
+  3.580 — is what the skip removes. The f32 widening is itself a departure from
+  the dtype polarity AGENTS.md requires and is filed separately; this row
+  measures the tower it has, not the tower it would prefer.
+
+  **Declared threshold, two halves, both required.**
+
+  1. `peak_rss(default) - peak_rss(--language-model-only) >= 0.90 x 7.161 GiB
+     = 6.445 GiB.` Ninety per cent, not a hundred, leaves room for allocator
+     granularity and for the tower geometry that is still parsed — the construct
+     half of construct-without-initialise.
+  2. `peak_rss(default)` within 2% of the same measurement on the pre-L3 binary
+     (`edbc47ce0`). This half is what stops "we saved memory" from meaning "we
+     broke the default path".
+
+  An outcome below either half is a FAILING axis, recorded as failing and left
+  open. The threshold is not renegotiated after the number arrives.
 
   **Stop conditions.** Stop and report, do not work around: the mechanism
   differs at the pin from the four facts above; the skip cannot be expressed at
@@ -1213,3 +1244,41 @@ pieces).**
   near-term gate.
 - No HW-blocked modality for the Qwen3.6 target: the vision tower is ~1 GiB and
   fits the 119 GiB unified pool alongside the 27B/35B LLM.
+
+---
+
+## Owed
+
+Open work this spec owns. Each line names the issue that tracks it and the
+reason it is not repaired in the change that found it.
+
+- **[#607](https://github.com/mudler/vllm.cpp/issues/607) L3 — the RSS number
+  itself.** The skip is implemented, CPU-gated and proven reachable (§1.5 L3).
+  The measurement is not taken: it needs `muse-glimmer-30b` (56 G) on a device,
+  under an `rc` lease. `scripts/mm/tower_skip_rss.sh` is the procedure and the
+  threshold is declared ahead of it. **Until that runs, the flag is still not
+  described as freeing memory**, which is the same discipline L2 recorded.
+- **[#607](https://github.com/mudler/vllm.cpp/issues/607) L3 — the
+  `qwen3_vl.cpp:418` site is implemented but not RSS-measured.** No
+  `Qwen3VLForConditionalGeneration` checkpoint exists on the NAS
+  (`Qwen/Qwen3-VL-4B-Instruct`, ~8.3 GiB, would be needed and no download is
+  authorised). Both sites run the same predicate through the same seam and both
+  are CPU-gated; only one is weighed.
+- **[#1358](https://github.com/mudler/vllm.cpp/issues/1358) — the Qwen3-VL tower
+  is loaded on the production path and read by nothing in `src/`.** Wiring it
+  into the server's mm forward is the MM-SERVE-E2E residual
+  `server_main.cpp:1315-1321` already names: a feature with its own spec and
+  gate, not a repair. L3 adds the flag that stops paying for it.
+- **[#1359](https://github.com/mudler/vllm.cpp/issues/1359) — the perception
+  encoder is held in host f32**, so a 3.580 GiB bf16 tower costs 7.161 GiB
+  resident. Narrowing a tower's storage dtype changes numerics on every path
+  that reads it, so it takes the surprising-fix path rather than an in-flow
+  repair. It is orthogonal to L3, which removes the tower rather than narrowing
+  it, and it is why the L3 threshold is stated against 7.161 GiB.
+- **[#758](https://github.com/mudler/vllm.cpp/issues/758) — a multimodal refusal
+  cannot distinguish a configured limit from an unimplemented arm.** Unchanged
+  by L3, and recorded here so the L2 finding keeps an owner.
+- **The second call site, `process_inputs_mm`**
+  (`input_processor.cpp:321,352`, upstream `context.py:461`). Blocked on the
+  per-model `get_supported_mm_limits()` hook that L1 recorded as absent, which
+  the M2 towers own. Unchanged by L3.

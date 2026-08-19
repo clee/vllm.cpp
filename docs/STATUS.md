@@ -2083,10 +2083,15 @@ runtime-verified yet.
   `--limit-mm-per-prompt`. Both set `vllm::MultiModalConfig` and are ENFORCED: a
   server started with `--language-model-only` answers a multimodal request with
   HTTP 400 `At most 0 image(s) may be provided in one prompt.`, which is what
-  upstream's flag does. The 43 recipes that pass it now reach model load. It
-  does **not** free memory yet — nothing gates vision-tower construction on the
-  limits (wave L3, owed with a measured RSS reduction), so the flag must not be
-  described as a VRAM knob until that lands.
+  upstream's flag does. The 43 recipes that pass it now reach model load. As of
+  2026-08-19 (wave L3) the limits also gate tower CONSTRUCTION: a tower whose
+  every modality is at 0 has its geometry parsed and its checkpoint tensors never
+  read, mirroring `_mark_tower_model` (`interfaces.py:288-293`), and the server
+  names what it skipped. **The byte saving is still not measured**, so the flag
+  must still not be described as a VRAM knob with a number attached: the
+  procedure and its pre-declared threshold are `scripts/mm/tower_skip_rss.sh`
+  and `.agents/specs/multimodal-track.md` §1.5 L3, and the run needs a device
+  under an `rc` lease.
 - **Surface coverage (ONE SURFACE, `ARCH-ONE-SURFACE`,
   `.agents/specs/surface-coverage-2026-08-07.md`).** 21/30 text archs
   on-framework; the recurring defect (a capability in a per-model CLI) is in seven
