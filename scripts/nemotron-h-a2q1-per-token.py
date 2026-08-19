@@ -19,7 +19,14 @@ This prints the window, the load it excludes and the token count it divides by o
 separate lines, and it REFUSES rather than printing 0 when a term is missing or
 the window is not positive.
 
-    nemotron-h-a2q1-per-token.py <a3.log> <label> <t0_epoch> <t1_epoch>
+THE vLLM RATIO IS QUOTED ONLY ON THE SILICON IT WAS MEASURED ON. 0.014369 s is a
+GB10 figure. Printing it beside a Thor per-token number invites a comparison
+across two different pieces of silicon, and the first Thor run did exactly that
+-- it printed `ratio 54.7x` for a number that was never measured against vLLM on
+that box. This is the same defect the busy-fraction reporter carried, and fixing
+one surface while leaving its twin is how a wrong comparison survives.
+
+    nemotron-h-a2q1-per-token.py <a3.log> <label> <t0_epoch> <t1_epoch> [arch]
 """
 
 from __future__ import annotations
@@ -33,11 +40,17 @@ import sys
 VLLM_PER_TOKEN_S = 0.014369
 
 
+# The arch the vLLM per-token reference was measured on. Any other arch gets the
+# number withheld rather than a ratio nobody can defend.
+VLLM_REFERENCE_ARCH = "121a"
+
+
 def main(argv: list[str]) -> int:
-    if len(argv) != 5:
+    if len(argv) not in (5, 6):
         print(__doc__.strip())
         return 2
     log, label, t0, t1 = argv[1], argv[2], float(argv[3]), float(argv[4])
+    arch = argv[5] if len(argv) == 6 else VLLM_REFERENCE_ARCH
     with open(log, errors="replace") as fh:
         text = fh.read()
     decode_s = t1 - t0
@@ -64,8 +77,13 @@ def main(argv: list[str]) -> int:
               f"brackets did not span a decode, so NO per-token time is reported")
         return 0
     per_token = decode_s / compared
-    print(f"{label}: per output token {per_token:.6f} s "
-          f"(vLLM {VLLM_PER_TOKEN_S} s; ratio {per_token / VLLM_PER_TOKEN_S:.1f}x)")
+    if arch == VLLM_REFERENCE_ARCH:
+        note = (f"vLLM {VLLM_PER_TOKEN_S} s; ratio {per_token / VLLM_PER_TOKEN_S:.1f}x")
+    else:
+        note = (f"NO vLLM ratio for arch {arch}: the {VLLM_PER_TOKEN_S} s reference is "
+                f"GB10's, so a ratio against it would compare two different pieces of "
+                f"silicon; use the ON/OFF A/B on this box")
+    print(f"{label}: per output token {per_token:.6f} s ({note})")
     return 0
 
 

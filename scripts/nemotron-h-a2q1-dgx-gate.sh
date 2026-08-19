@@ -204,7 +204,7 @@ else:
     print(f"{label}: GPU busy in {busy} of {len(vals)} DECODE samples = {pct:.2f}% busy ({note})")
 PY
   # The per-output-token time over the SAME decode window, with the terms shown.
-  python3 "$SRC/scripts/nemotron-h-a2q1-per-token.py" "$log" "$label" "$t0" "$t1"
+  python3 "$SRC/scripts/nemotron-h-a2q1-per-token.py" "$log" "$label" "$t0" "$t1" "$ARCH"
   # The reference tier is numerically CORRECT, so a pass obtained on it is
   # invisible in the numbers and only this line separates them (spec R2).
   echo "reference-tier lines in $label: $(grep -c 'reference-tier' "$log")"

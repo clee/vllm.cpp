@@ -37,13 +37,16 @@ MATCH = ("[nemotron-h] TOKEN MATCH: 96/96 over 3 prompt(s) "
          "(full rows=3, short rows=0, mode=decode)\n")
 
 
-def run(text: str, t0: float, t1: float) -> str:
+def run(text: str, t0: float, t1: float, arch: str | None = None) -> str:
     with NamedTemporaryFile("w", suffix=".log", delete=False) as fh:
         fh.write(text)
         path = fh.name
+    argv = ["prog", path, "lbl", str(t0), str(t1)]
+    if arch is not None:
+        argv.append(arch)
     buf = io.StringIO()
     with redirect_stdout(buf):
-        a2q1_per_token.main(["prog", path, "lbl", str(t0), str(t1)])
+        a2q1_per_token.main(argv)
     return buf.getvalue()
 
 
@@ -79,6 +82,21 @@ class PerTokenTests(unittest.TestCase):
                   1000.0, 1013.8)
         self.assertIn("divide by nothing", out)
         self.assertNotIn("per output token", out)
+
+    def test_the_vllm_ratio_is_withheld_on_an_arch_it_was_not_measured_on(self) -> None:
+        # 0.014369 s is a GB10 figure. The first Thor run printed `ratio 54.7x`
+        # for a number never measured against vLLM on that box -- the same
+        # cross-silicon defect the busy-fraction reporter carried. The rate
+        # itself still prints; only the comparison is withheld.
+        out = run(LOADED + MATCH, 1000.0, 1075.418, "110")
+        self.assertIn("per output token 0.785604 s", out)
+        self.assertIn("NO vLLM ratio for arch 110", out)
+        self.assertNotIn("ratio 54.7x", out)
+
+    def test_the_vllm_ratio_is_quoted_on_the_arch_it_was_measured_on(self) -> None:
+        out = run(LOADED + MATCH, 1000.0, 1075.418, "121a")
+        self.assertIn("ratio 54.7x", out)
+        self.assertNotIn("NO vLLM ratio", out)
 
     def test_the_vllm_denominator_is_the_pinned_one(self) -> None:
         # The ratio is only meaningful against the number this row's gap is

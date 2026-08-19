@@ -550,6 +550,36 @@ rather than a silent hole, so a version of it that cannot say what it means is
 the same class of defect as the band it reports on. It now builds a
 `std::string`; reproduced against doctest 2.5.2 both ways before the fix.
 
+### 10.2c The decode-window sampler works, and it quantifies the dilution
+
+Thor re-run, A3 gate with the arm ON, sampler starting only after
+`engine loaded in Ns`:
+
+```
+RC[a3 on]=0
+[nemotron-h] engine loaded in 500.9s
+[nemotron-h] TOKEN MATCH: 96/96 over 3 prompt(s) (full rows=3, short rows=0, mode=decode)
+[nemotron-h] STRICT PASS
+on: GPU busy in 240 of 564 DECODE samples = 42.55% busy
+on: decode window 75.418 s (the engine load is OUTSIDE it)
+on: per output token 0.785606 s
+reference-tier lines in on: 0
+```
+
+**42.55% over the decode alone against 15.33% over load+decode.** The load is
+500.9 s and the decode is 75.418 s, so the old window was 87% load — the
+dilution §10.3 diagnosed is now measured rather than argued.
+
+**The same cross-silicon defect was still live on the per-token line and is
+fixed.** That run printed `ratio 54.7x` against vLLM's 0.014369 s, which is a
+GB10 figure, for a decode measured on Thor. It is exactly the defect the
+busy-fraction reporter carried, and fixing one surface while leaving its twin is
+how a wrong comparison survives a correction. The ratio is now quoted only when
+`ARCH` is the arch it was measured on; elsewhere the rate still prints and the
+comparison is withheld by name. Both arms are pinned in
+`tests/scripts/test_nemotron_h_a2q1_per_token.py`, and quoting the ratio
+unconditionally reds the suite.
+
 ### 10.3 The A/B: the arm is token-exact on Thor, and the busy fraction is VOID
 
 Same lease, same binary, same checkpoint, same golden, differing only by
