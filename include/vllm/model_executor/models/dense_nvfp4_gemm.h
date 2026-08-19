@@ -77,6 +77,31 @@ using vt::Backend;
 using vt::DType;
 using vt::Tensor;
 
+// ── A2-Q2b (#810): the CALLER-OWNED resident, so a consumer can opt OUT of the
+// address-keyed cache below without hand-rolling a parallel Marlin path.
+//
+// `MarlinDenseResidentFor` (below) keys its `static` map on the ADDRESS of the
+// `Nvfp4Weight`. That is issue #984: destroy one engine and build another in
+// the same process and the allocator can hand the new weights the old address,
+// so the new weights inherit an entry marked `ready` whose device pointers
+// belong to the previous engine. `Nvfp4Weight` already carries the
+// `resident_marlin` `ResidentSlot` that #237 added to fix exactly this, and
+// this header does not read it.
+//
+// A2-Q2b does not fix #984 — that needs the two-engine red-before #984 asks
+// for, and it is out of this row's scope. It declines to INHERIT it: NemotronH
+// owns its lm_head resident in a `ResidentSlot` (the same shape A2-Q2a used for
+// the MoE arena) and hands it in here. Threading the resident through is
+// additive — every existing caller passes nothing and keeps the address-keyed
+// default byte-for-byte — so this EXTENDS the seam rather than forking it,
+// which is what AGENTS.md `## Shared seams` asks for when the seam cannot
+// represent the behaviour a consumer needs.
+//
+// Declared unconditionally (defined only under VT_MARLIN_NVFP4) so the
+// dispatcher's signature does not change with the build flag; a pointer to an
+// incomplete type is all the non-Marlin build ever needs.
+struct MarlinDenseResident;
+
 // VT_NVFP4_MARLIN (default ON): the vendored Marlin NVFP4 W4A16 GEMM is the
 // validated path (35B gate +22%, token-for-token vs the pinned oracle). Only an
 // explicit VT_NVFP4_MARLIN=0 opts back out to the naive redundant-dequant kernel
@@ -504,9 +529,11 @@ inline void* DenseMarlinWorkspace(Dev d, int* out_sms) {
 
 // y[M,N] = x[M,K] bf16 @ dequant(w).T via the single-expert Marlin W4A16 GEMM.
 inline DBuf MatmulNvfp4MarlinD(Dev d, const Tensor& x, const Nvfp4Weight& w,
-                               DType out_dtype) {
+                               DType out_dtype, MarlinDenseResident* resident = nullptr) {
   const int64_t M = x.shape[0], K = x.shape[1], N = w.n;
-  MarlinDenseResident& mr = MarlinDenseResidentFor(&w);
+  // A2-Q2b: a caller that owns the resident's lifetime supplies it; everyone
+  // else keeps the address-keyed cache, unchanged (#984).
+  MarlinDenseResident& mr = resident != nullptr ? *resident : MarlinDenseResidentFor(&w);
   if (!mr.ready) BuildMarlinDenseResident(d, w, mr);
   int sms = 0;
   void* ws = DenseMarlinWorkspace(d, &sms);  // zeroed once; kernel self-resets
@@ -728,7 +755,7 @@ inline DBuf GateUpFusedMarlinD(Dev d, const Tensor& x, const Nvfp4Weight& gw,
 // reference). `w` MUST be W4A16 (alpha == 0) — a true-W4A4 weight belongs to
 // qwen3_5.cpp's private fp4-activation path and is rejected here.
 inline DBuf MatmulNvfp4W4A16D(Dev d, const Tensor& x, const Nvfp4Weight& w,
-                              DType out_dtype) {
+                              DType out_dtype, MarlinDenseResident* resident = nullptr) {
   const int64_t M = x.shape[0], K = x.shape[1], N = w.n;
   VT_CHECK(!w.IsTrueW4A4(),
            "dense_nvfp4: true-W4A4 weight routed into the W4A16 dispatcher");
@@ -740,7 +767,9 @@ inline DBuf MatmulNvfp4W4A16D(Dev d, const Tensor& x, const Nvfp4Weight& w,
   // on the production build — accelerator-seam audit class A, work row S4).
   if (vt::OpRegistered(vt::OpId::kMoeGroupedGemmNvfp4Marlin, d.q.device.type) &&
       MarlinW4A16Enabled() && x.dtype == DType::kBF16)
-    return MatmulNvfp4MarlinD(d, x, w, out_dtype);
+    return MatmulNvfp4MarlinD(d, x, w, out_dtype, resident);
+#else
+  (void)resident;
 #endif
   ++MutableW4A16Stats().fallback_gemms;
   DBuf dout(d, out_dtype, {M, N});

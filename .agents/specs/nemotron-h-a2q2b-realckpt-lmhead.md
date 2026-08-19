@@ -5,7 +5,8 @@
 ([#517](https://github.com/mudler/vllm.cpp/issues/517)).
 **Sibling / predecessor:** [`nemotron-h-a2q2-nvfp4-moe-lmhead.md`](nemotron-h-a2q2-nvfp4-moe-lmhead.md)
 (A2-Q2a — the MoE arm, landed on the synthetic gate).
-**State:** spec only. No product code.
+**State:** IMPLEMENTED on `row/A2-Q2b-lmhead-nvfp4`; the GPU legs of §3 are pending a
+`dgx:gpu0` window. See `## Now`.
 
 ---
 
@@ -138,6 +139,93 @@ and an 8h19m outage ended by a human power cycle. Size the plan for that.
   `b_q_weight` and nothing at all about `b_scales`**, so a stride defect is
   silent at the op boundary and only the numeric gate can see it.
 
+
+- [#1410](https://github.com/mudler/vllm.cpp/issues/1410) — `check-runner-routing-consistency.py`
+  cannot resolve a cross-TU free-function device forward, so NemotronH still
+  classifies HOST although `NemotronHPagedForward` now assigns both
+  `fl.device_tensor` and `fl.device_storage`. The allowlist entry is NARROWED
+  to that instrument limit rather than removed. Not fixed in this flow because
+  it changes checker semantics, which `AGENTS.md` routes to its own row.
+- **The 23-layer MoE per-block sweep of §3 and the `lm_head` real-checkpoint
+  numeric leg** run only on `dgx:gpu0` and are PENDING a window, not waived.
+  What this change lands is the implementation, the CPU-buildable arms, and the
+  synthetic device gate that A2-Q2a's preamble argues for. `## Now` records the
+  exact state of each leg, so a `PENDING` here is a scheduled measurement with
+  a named blocker rather than a gate nobody ran.
+- **Q2-M3 … Q2-M7** (A2-Q2a's owed mutations) are unchanged by this row and
+  stay owed. They gate the MoE arm, not `lm_head`.
+
+---
+
 ## 6. Now
 
-Claimable once A2-Q2a lands. Its blocker is a GPU window, not a design question.
+**Implemented.** The device `lm_head` arm lands on `row/A2-Q2b-lmhead-nvfp4`.
+
+### What was measured BEFORE anything was built
+
+The row's premise — that host re-expansion dominates NemotronH decode and that
+`lm_head` is a large share of it — was ARITHMETIC when this row was dispatched.
+It is now a measurement, taken at the single dequant seam
+(`NemotronHOwned::DenseBf16`) on the REAL 21 GB checkpoint through the
+production ABI driver (`examples/nemotron_h_gen`), one decode step, T=1,
+top_k=6, 23 MoE layers:
+
+| group | shape | calls | elements | per call | % |
+|---|---|---|---|---|---|
+| routed expert `up_proj` | `[1856, 2688]` | 138 | 688 472 064 | 4 988 928 | 22.36% |
+| routed expert `down_proj` | `[2688, 1856]` | 138 | 688 472 064 | 4 988 928 | 22.36% |
+| shared expert `down_proj` | `[2688, 3712]` | 23 | 229 490 688 | 9 977 856 | 7.45% |
+| shared expert `up_proj` | `[3712, 2688]` | 23 | 229 490 688 | 9 977 856 | 7.45% |
+| **`lm_head`** | **`[131072, 2688]`** | **1** | **352 321 536** | **352 321 536** | **11.44%** |
+| mamba `out_proj` (FP8) | `[2688, 4096]` | 23 | 253 231 104 | 11 010 048 | 8.23% |
+| mamba `in_proj` (FP8) | `[10304, 2688]` | 23 | 637 034 496 | 27 697 152 | 20.69% |
+| **TOTAL** | | **369** | **3 078 512 640** | | **100%** |
+
+`138 == 6 * 23` exactly, which is what confirms this is the decode shape and not
+a prefill aggregate.
+
+Three things follow, and the third is why the row proceeded:
+
+1. **The dispatching estimate was wrong in both of its numbers, in the same
+   direction.** It put `lm_head` at 131072 x 4096 = 537e6 elements and at ~43%
+   of the population. `hidden_size` is 2688, not 4096: the true count is
+   352 321 536, and the true share of that population is 28.35%.
+2. **The "~1.24e9 elements / ~2.49 GB per token" figure is real and now has a
+   name.** It is not the host arm's total (3.079e9 / 6.157 GB). It is exactly
+   `mamba + lm_head` = 1 242 587 136 elements = 2.485 GB — the residue AFTER
+   A2-Q2a moved the MoE arm to the device. It matches to four significant
+   figures, which is what identifies which regime the number describes.
+3. **`lm_head` is the LAST one.** Against the three-leg discriminator on
+   `dgx:gpu0` (`/workspace/a2d1-discriminate/20260819T200231Z`: device mamba ON
+   1.554 s/token and 108.2x vs vLLM, OFF 10.319 s/token and 718.1x), the mamba
+   arm is worth 6.64x and is in flight on A2-D1. `lm_head` is on the HOST in
+   every one of those three legs. Once the mamba arm lands, `lm_head` is
+   352 321 536 of 352 321 536 — 100% of the host re-expansion left in a decode
+   step. It is also the largest SINGLE re-expansion in the model by 12.7x
+   (352.3e6 in one call against 27.7e6 for mamba `in_proj`), so its 704.6 MB
+   transient bf16 buffer is the allocation that matters most on a
+   unified-memory box that reboots rather than OOM-kills.
+
+The refutation is therefore narrow and the conclusion survives: the estimate's
+share was wrong, the direction was right, and the case is STRONGER after the
+discriminator than before it.
+
+### Leg status
+
+| Leg | State |
+|---|---|
+| seam extension (caller-owned `MarlinDenseResident`) | DONE, CPU-built |
+| device `lm_head` arm + `DeviceLmHeadEligible` | DONE, CPU-built |
+| production wiring in `NemotronHPagedForward` -> device `ForwardLogits` | DONE |
+| host arm retained as the gate's operand + the non-NVFP4 fallback | DONE |
+| routing-allowlist entry narrowed, [#1410](https://github.com/mudler/vllm.cpp/issues/1410) filed | DONE |
+| synthetic device `lm_head` numeric gate (measured band, asserted counts) | WRITTEN; runs on CUDA only |
+| CUDA build of the Marlin arm | PENDING a `dgx:gpu0` window |
+| real-checkpoint `lm_head` numeric leg + token identity | PENDING a `dgx:gpu0` window |
+| reachability deletion mutation | PENDING the same window |
+| 23-layer MoE per-block sweep (§3) | PENDING; owed above |
+
+The CPU build compiles the `#else` arms only, so **it does not compile the
+Marlin path at all**. That is stated here rather than left for a reader to
+infer, because "it builds" is exactly the claim a CPU-only green would
+wrongly support.

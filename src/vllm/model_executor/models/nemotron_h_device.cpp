@@ -110,14 +110,25 @@
 
 // DSR-ALLOW(A2-Q2a): TYPES, not behaviour -- vt/cuda/marlin_repack.h is BUILT ONLY under VT_MARLIN_NVFP4 (its own header note), so this include cannot be resolved by a runtime query. This is the platform leg for the CUDA Marlin repack.
 #ifdef VT_MARLIN_NVFP4
-// A2-Q2a: the load-time NVFP4 -> Marlin repack primitives. DELIBERATELY NOT
-// `dense_nvfp4_gemm.h`: that header's `MarlinDenseResidentFor` (:379) keys its
-// repack cache on the WEIGHT'S ADDRESS, which is issue #984, and including it
-// here would put the unsafe accessor one unqualified call away from a reviewer's
-// eye. These four functions are the same primitives it and qwen3_5.cpp both
-// drive, with no cache attached.
+// A2-Q2a: the load-time NVFP4 -> Marlin repack primitives, which the MoE arena
+// drives directly with no cache attached.
 #include "vt/cuda/marlin_repack.h"
 #endif
+
+// A2-Q2b: the SHARED NVFP4 W4A16 dense route, for `lm_head`.
+//
+// ★ THIS INCLUDE'S OWN HISTORY IS THE REVIEW NOTE. A2-Q2a deliberately did NOT
+// include this header, and said so here, because `MarlinDenseResidentFor`
+// (dense_nvfp4_gemm.h:379) keys its repack cache on the WEIGHT'S ADDRESS —
+// issue #984 — and including it put that unsafe accessor one unqualified call
+// away from a reviewer's eye. That reason was correct and it has been ANSWERED
+// rather than overruled: the seam now accepts a CALLER-OWNED resident, and the
+// only entry point this file calls (`dense_nvfp4::MatmulNvfp4W4A16D`) is called
+// with one, out of the `lm_head_marlin` slot the weights own. Nothing in this
+// translation unit calls `MarlinDenseResidentFor`, and a reviewer should check
+// that claim rather than take it — it is one grep, and it is the whole
+// difference between inheriting #984 and declining it.
+#include "vllm/model_executor/models/dense_nvfp4_gemm.h"
 
 namespace vllm {
 namespace {
@@ -833,6 +844,163 @@ std::vector<float> NemotronHMoeBlockDeviceHostIO(const NemotronHMoeWeights& w,
 #endif
 }
 
+
+// ═══ A2-Q2b: `lm_head` on the DEVICE, through the shared NVFP4 dense route ═══
+//
+// .agents/specs/nemotron-h-a2q2b-realckpt-lmhead.md, issue #810.
+//
+// ── WHY THIS IS THE LAST HOST RE-EXPANSION, MEASURED ────────────────────────
+//
+// `lm_head` is [131072, 2688] NVFP4 W4A16 g16. On the HOST arm every decode
+// step widens it whole through `NemotronHOwned::DenseBf16` — 352 321 536
+// elements, a 704.6 MB transient bf16 buffer, for ONE GEMM against ONE row.
+//
+// Counted at the single dequant seam on the real checkpoint, one decode step
+// (T=1, top_k=6, 23 MoE layers), the host arm re-expands 3 078 512 640
+// elements. `lm_head` is 11.44% of that, and it is 28.35% of the 1 242 587 136
+// that remain once A2-Q2a moved the MoE arm to the device. It is 352 321 536
+// of 352 321 536 — everything left — once the mamba arm follows. It is also
+// the largest SINGLE re-expansion in the model by 12.7x: 352.3e6 elements in
+// one call, against 27.7e6 for the next largest (mamba `in_proj`). On a
+// unified-memory box that transient is the allocation that matters.
+//
+// ── THE RESIDENCY DECISION (spec §4.3), TAKEN EXPLICITLY ────────────────────
+//
+// The spec required this row to CHOOSE rather than default, because
+// `dense_nvfp4_gemm.h`'s `MarlinDenseResidentFor` keys its repack cache on the
+// weight's ADDRESS (issue #984) and NemotronH is exactly the second-consumer
+// condition an address key cannot survive.
+//
+// Chosen: route through the shared seam `dense_nvfp4::MatmulNvfp4W4A16D`, and
+// hand it a resident this model OWNS, in the `lm_head_marlin` `ResidentSlot`
+// on the weights. That is option (b) of the spec's three — the property
+// `qwen3_5.cpp` gets by hand-rolling — reached WITHOUT hand-rolling, because
+// the seam was extended to accept a caller-owned resident rather than forked.
+// A2-Q2a made the same call for the MoE arena; this keeps the two arms
+// consistent, and it leaves #984 exactly as it was for every other caller
+// (which is where its own two-engine red-before belongs).
+#ifdef VT_MARLIN_NVFP4
+// A transient `Nvfp4Weight` VIEW over the host `lm_head` payload.
+//
+// It BORROWS: `Nvfp4Weight` wants `OwnedTensor`s and `NemotronHOwned` already
+// holds the packed codes and the group scales in exactly the layout
+// `BuildMarlinDenseResident` reads ([N, K/2] and [N, K/16], torch [out, in]).
+// Copying would add 373 MB of host residency to a load whose report is pinned
+// to the byte (`rep.host_bytes == 18888922112`,
+// test_nemotron_h_loader.cpp:310) and whose whole design is that a quantized
+// weight KEEPS its quantized memory format.
+//
+// The keep-alive is a no-op deleter, and that is correct rather than lazy:
+// `OwnedBytes::Borrow` rejects a null owner because a borrowed view must not
+// outlive its bytes, and here the bytes are the caller's `NemotronHHostWeights`,
+// which outlive this stack temporary by construction — the value is consumed by
+// the repack inside this same call and never stored.
+Nvfp4Weight LmHeadNvfp4View(const NemotronHOwned& w, int64_t V, int64_t H) {
+  VT_CHECK(w.form == NemotronHWeightForm::kNvfp4W4A16G16,
+           "NemotronH device lm_head: this arm is NVFP4 W4A16 g16 only");
+  VT_CHECK(w.shape.size() == 2 && w.shape[0] == V && w.shape[1] == H,
+           "NemotronH device lm_head: weight shape is not [vocab_size, hidden_size]");
+  VT_CHECK(w.bytes.size() == static_cast<size_t>(V) * static_cast<size_t>(H) / 2,
+           "NemotronH device lm_head: packed payload is not [vocab_size, hidden_size/2]");
+  VT_CHECK(w.scale.size() == static_cast<size_t>(V) * static_cast<size_t>(H) / 16,
+           "NemotronH device lm_head: group scales are not [vocab_size, hidden_size/16]");
+  // A keep-alive that owns nothing: see the note above.
+  static const std::shared_ptr<const void> kNoopOwner(reinterpret_cast<const void*>(1),
+                                                      [](const void*) {});
+  Nvfp4Weight nw;
+  nw.packed.bytes = OwnedBytes::Borrow(w.bytes.data(), w.bytes.size(), kNoopOwner);
+  nw.packed.dtype = DType::kI8;
+  nw.packed.rank = 2;
+  nw.packed.shape[0] = V;
+  nw.packed.shape[1] = H / 2;
+  nw.scale.bytes = OwnedBytes::Borrow(w.scale.data(), w.scale.size(), kNoopOwner);
+  nw.scale.dtype = DType::kI8;
+  nw.scale.rank = 2;
+  nw.scale.shape[0] = V;
+  nw.scale.shape[1] = H / 16;
+  nw.scale2 = w.global_scale;
+  nw.n = V;
+  nw.k = H;
+  nw.group_size = 16;
+  nw.is_mxfp4 = false;
+  // W4A16, never true-W4A4: the released checkpoint quantizes no activation, so
+  // `alpha` stays 0 and `IsTrueW4A4()` is false. The seam asserts this too; the
+  // fields are left at their defaults deliberately rather than set to 0 twice.
+  return nw;
+}
+#endif
+
+// True when the DEVICE `lm_head` arm can serve this weight on this queue.
+//
+// Four clauses, and every one of them is a REASON the host arm is still
+// correct rather than a reason to compute something else:
+//   * the build carries the Marlin NVFP4 GEMM at all (VT_MARLIN_NVFP4);
+//   * the op table realizes it for THIS device — an availability question, not
+//     a `== kCUDA` question, matching the shared dispatcher's own gate;
+//   * the weight is actually NVFP4 (a dense `lm_head` is a different arm, and
+//     a synthetic fixture ships one);
+//   * the activation dtype is bf16, which is Marlin's a/c contract.
+// Anything else falls through to `NemotronHHostLmHead`, which refuses BY NAME
+// on a non-CPU queue rather than computing on the wrong operand.
+bool DeviceLmHeadEligible(Dev d, const NemotronHHostWeights& host, DType adt) {
+#ifdef VT_MARLIN_NVFP4
+  return host.lm_head.form == NemotronHWeightForm::kNvfp4W4A16G16 &&
+         adt == DType::kBF16 &&
+         vt::OpRegistered(vt::OpId::kMoeGroupedGemmNvfp4Marlin, d.q.device.type);
+#else
+  (void)d;
+  (void)host;
+  (void)adt;
+  return false;
+#endif
+}
+
+// A device-side row gather, the same helper every other model's logits path
+// carries verbatim (opt.cpp:229, qwen3.cpp, gemma3.cpp:283). It exists here
+// because the host arm's gather was a `std::memcpy` out of a DOWNLOADED f32
+// copy of `final_normed`; the device arm must never make that download, which
+// is the whole point of moving the projection.
+void GatherRowsD(Dev d, void* dst, const Tensor& src, const std::vector<int64_t>& idx,
+                 int64_t row_elems) {
+  const size_t rb = static_cast<size_t>(row_elems) * vt::SizeOf(src.dtype);
+  auto* dp = static_cast<char*>(dst);
+  const auto* sp = static_cast<const char*>(src.data);
+  for (size_t s = 0; s < idx.size(); ++s)
+    d.b.Copy(d.q, dp + s * rb, sp + static_cast<size_t>(idx[s]) * rb, rb);
+}
+
+// y[R, vocab] f32 = gathered[R, hidden] bf16 @ dequant(lm_head).T, on the device.
+//
+// `out_dtype` is f32 and that is the CARRIER, not a widened compute: Marlin's
+// output is bf16 (`c_type=kBFloat16`) and the seam upcasts it, so this is the
+// same value the bf16 GEMM produced. f32 is what `ForwardLogits` and the
+// on-device sampler take, exactly as every other model's device logits do
+// (opt.cpp:308, minicpm3.cpp:303).
+DBuf DeviceLmHeadD(Dev d, const NemotronHHostWeights& host,
+                   const NemotronHParams& params, const Tensor& gathered) {
+#ifdef VT_MARLIN_NVFP4
+  const int64_t V = params.vocab_size;
+  const int64_t H = params.hidden_size;
+  VT_CHECK(gathered.rank == 2 && gathered.shape[1] == H,
+           "NemotronH device lm_head: gathered rows are not [R, hidden_size]");
+  VT_CHECK(gathered.shape[0] > 0, "NemotronH device lm_head: no rows requested");
+  const Nvfp4Weight nw = LmHeadNvfp4View(host.lm_head, V, H);
+  // SLOT-KEYED, never the header's address-keyed static (#984 / spec §4.3).
+  dense_nvfp4::MarlinDenseResident& mr =
+      ResidentIn<dense_nvfp4::MarlinDenseResident>(host.lm_head_marlin);
+  return dense_nvfp4::MatmulNvfp4W4A16D(d, gathered, nw, DType::kF32, &mr);
+#else
+  (void)d;
+  (void)host;
+  (void)params;
+  (void)gathered;
+  VT_CHECK(false,
+           "NemotronH device lm_head: this build has no Marlin NVFP4 GEMM "
+           "(VT_MARLIN_NVFP4 is off), so the device lm_head arm is not compiled in");
+  return DBuf(d, DType::kF32, {1, 1});
+#endif
+}
+
 // ─── the hybrid forward ─────────────────────────────────────────────────────
 
 std::vector<float> NemotronHDeviceForward(const NemotronHHostWeights& host,
@@ -1001,11 +1169,25 @@ std::vector<float> NemotronHDeviceForward(const NemotronHHostWeights& host,
   const std::vector<float> fvec = DownloadF32(d, final_normed, adt, T * H);
   if (trace != nullptr && trace->capture) trace->final_normed = fvec;
 
-  // --- lm_head, on the HOST: it is NVFP4 W4A16 g16 on the released
-  // checkpoint. Both arms therefore end in the IDENTICAL host projection, which
-  // is what makes A2-R's token gate attributable: a token difference can only
-  // have come from the 6 device attention blocks and the device residual
-  // stream, never from the output projection.
+  // --- lm_head, on the HOST, and A2-Q2b LEAVES IT THERE DELIBERATELY.
+  //
+  // A2-Q2b moves `lm_head` to the device in `NemotronHPagedForward` — the
+  // production path — and not here. Three reasons, and the first is the one
+  // that matters:
+  //
+  //   * THIS SEAM IS THE GATE'S OPERAND. A2-Q2b's numeric gate compares the
+  //     device projection against the host projection on the SAME gathered
+  //     rows. Moving both arms to the device deletes the reference the
+  //     comparison is against, which is the same mistake A2-Q2a's §4.1 refused
+  //     when it supplemented the weights instead of replacing them.
+  //   * A2-R's token gate is attributable BECAUSE both arms end in the
+  //     identical host projection: a token difference can only have come from
+  //     the 6 device attention blocks and the device residual stream. That
+  //     property is worth keeping on the seam that still has it. The spec
+  //     required this row to DISCLOSE that the property ends where `lm_head`
+  //     moves — it ends in the paged forward, and it survives here.
+  //   * `NemotronHDeviceForward` has no production caller at all (:651), so
+  //     leaving it costs no user-visible behaviour.
   std::vector<int64_t> want;
   if (logits_indices.empty()) {
     want.resize(static_cast<size_t>(T));
@@ -1752,13 +1934,14 @@ ForwardLogits NemotronHPagedForward(const NemotronHHostWeights& host,
     Tensor ot = final_normed.t();
     AddRmsNorm(d, ot, xt, wt, rt, nargs, params.layer_norm_epsilon);
   }
-  const std::vector<float> fvec = DownloadF32(d, final_normed, adt, T * H);
-  if (trace != nullptr && trace->capture) trace->final_normed = fvec;
+  // The trace is the numeric gate's operand and NOTHING else reads it, so the
+  // download that produces it stays behind `capture` rather than becoming the
+  // path. Before A2-Q2b `fvec` was unconditional because the host projection
+  // needed it; making it conditional is the point of this row, not a tidy-up.
+  if (trace != nullptr && trace->capture)
+    trace->final_normed = DownloadF32(d, final_normed, adt, T * H);
 
-  // The gather-before-lm_head rows, then the HOST projection. `lm_head` is
-  // NVFP4 W4A16 g16 and its device arm is A2-Q2b's, so this forward returns
-  // HOST logits and `scripts/runner-routing-allowlist.txt` is NARROWED rather
-  // than removed (spec §3.5). An EMPTY `logits_indices` is the runner's
+  // The gather-before-lm_head rows. An EMPTY `logits_indices` is the runner's
   // VT_LOGITS_GATHER=0 path and means "every row", which is also what the two
   // non-paged seams mean by it — so this branch serves both gather settings and
   // no runner step can escape the paged path on that flag.
@@ -1773,15 +1956,99 @@ ForwardLogits NemotronHPagedForward(const NemotronHHostWeights& host,
       want.push_back(idx);
     }
   }
+  // `n_out`, not `R`: `R` is already this function's REQUEST count (:1673) and
+  // these are the gathered LOGIT rows, which are not the same number.
+  const int64_t n_out = static_cast<int64_t>(want.size());
+
+  // ── A2-Q2b: THE DEVICE PROJECTION, AND THE PRODUCTION CALL SITE ───────────
+  //
+  // This is the line `scripts/runner-routing-allowlist.txt` was narrowed for.
+  // That entry named exactly one unmet clause — "(a) on-device logits" — and
+  // said A2-Q2b is what removes it. The entry is removed in this change, so
+  // the routing checker, not a comment, is what now holds this branch in
+  // place: put the host projection back and it goes red by name.
+  if (DeviceLmHeadEligible(d, host, adt)) {
+    DBuf grows(d, adt, {n_out, H});
+    GatherRowsD(d, grows.ptr(), final_normed.t(), want, H);
+    DBuf dlogits = DeviceLmHeadD(d, host, params, grows.t());
+    ForwardLogits fl;
+    fl.rows = n_out;
+    fl.vocab = params.vocab_size;
+    fl.device_tensor = dlogits.t();
+    // The pool block's lifetime moves into a shared_ptr whose deleter returns
+    // it to the DevicePool — the shared `WrapDeviceLogits` carrier every
+    // device-logits model uses (opt.cpp:315, minicpm3.cpp:303).
+    fl.device_storage = dlogits.ReleaseShared();
+    return fl;
+  }
+
+  // The HOST projection, kept below the fold exactly as the host reference
+  // forward is: it is the operand A2-Q2b's numeric gate compares against, and
+  // it is what serves a build with no Marlin NVFP4 GEMM and a checkpoint whose
+  // `lm_head` is dense. It refuses BY NAME on a non-CPU queue.
+  const std::vector<float> fvec = DownloadF32(d, final_normed, adt, T * H);
   std::vector<float> gathered(want.size() * static_cast<size_t>(H));
   for (size_t r = 0; r < want.size(); ++r) {
     std::memcpy(gathered.data() + r * static_cast<size_t>(H),
                 fvec.data() + static_cast<size_t>(want[r]) * static_cast<size_t>(H),
                 static_cast<size_t>(H) * sizeof(float));
   }
-  return HostLogits(NemotronHHostLmHead(host, params, gathered,
-                                        static_cast<int64_t>(want.size()), hq),
+  return HostLogits(NemotronHHostLmHead(host, params, gathered, n_out, hq),
                     params.vocab_size);
+}
+
+// ─── A2-Q2b: the PUBLIC per-block entry points for `lm_head` ────────────────
+//
+// The twins of `NemotronHHostLmHead`, argument for argument, so the numeric
+// gate compares like with like instead of against a second implementation of
+// the same projection written inside the test. That symmetry is the whole
+// point: this file's header says the per-block entry points "are public so the
+// gate can compare a BLOCK's activations against an independent reference".
+//
+// THEY ARE NOT THE REACHABILITY PROOF, and nothing here should be read as one.
+// Production reaches the device projection through
+// `ModelRegistry::Forward` -> `ForwardNemotronHForCausalLM` ->
+// `NemotronHPagedForward`, at the `DeviceLmHeadEligible` branch. These two
+// localize a failure to the projection; the real-checkpoint gate is what
+// enters through the production path (reachability.md, "Does a test enter
+// through it?").
+bool NemotronHDeviceLmHeadEligible(const NemotronHHostWeights& host, vt::DType adt,
+                                   vt::Queue& dev_queue) {
+  Dev d{vt::GetBackend(dev_queue.device.type), dev_queue};
+  return DeviceLmHeadEligible(d, host, adt);
+}
+
+std::vector<float> NemotronHDeviceLmHead(const NemotronHHostWeights& host,
+                                         const NemotronHParams& params,
+                                         const std::vector<float>& gathered_normed,
+                                         int64_t num_rows, vt::Queue& dev_queue) {
+  const DType adt = host.act_dtype;
+  const int64_t H = params.hidden_size;
+  const int64_t V = params.vocab_size;
+  VT_CHECK(num_rows > 0, "NemotronH device lm_head: no rows requested");
+  VT_CHECK(static_cast<int64_t>(gathered_normed.size()) == num_rows * H,
+           "NemotronH device lm_head: gathered row count does not match hidden_size");
+  Dev d{vt::GetBackend(dev_queue.device.type), dev_queue};
+  VT_CHECK(DeviceLmHeadEligible(d, host, adt),
+           "NemotronH device lm_head: this arm needs an NVFP4 W4A16 g16 `lm_head`, a "
+           "bf16 activation dtype, and a device whose op table realizes the Marlin "
+           "NVFP4 grouped GEMM — the host arm is NemotronHHostLmHead");
+  // Upload the gathered rows at the MODEL dtype, not f32: the operand Marlin
+  // takes is bf16, and widening here would move twice the bytes for a value the
+  // kernel narrows again on the way in.
+  DBuf rows(d, adt, {num_rows, H});
+  {
+    // PackF32 lives in nemotron_h.cpp; the conversion is one loop and doing it
+    // here avoids widening this file's dependency surface for two call sites.
+    std::vector<uint16_t> bf(static_cast<size_t>(num_rows * H));
+    for (size_t i = 0; i < bf.size(); ++i) bf[i] = vt::F32ToBF16(gathered_normed[i]);
+    d.b.Copy(d.q, rows.ptr(), bf.data(), bf.size() * sizeof(uint16_t));
+    d.b.Synchronize(d.q);
+  }
+  DBuf dlogits = DeviceLmHeadD(d, host, params, rows.t());
+  std::vector<float> out(static_cast<size_t>(num_rows * V));
+  dlogits.Download(d, out.data());
+  return out;
 }
 
 }  // namespace vllm
