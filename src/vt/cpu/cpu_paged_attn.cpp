@@ -141,6 +141,10 @@ void PagedAttentionKernel(Queue&, Tensor& out, const Tensor& query, const Tensor
   // caller's mistake.
   const int64_t bt_cols = block_table.rank >= 2 ? block_table.shape[1] : 0;
   for (int64_t r = 0; r < num_reqs; ++r) {
+    // Only the requests the token loop actually visits. A padded or inert row
+    // carries no query tokens, so its `seq_lens` entry is never read, and
+    // refusing on one would reject a batch the kernel handles correctly today.
+    if (qsl[r + 1] - qsl[r] <= 0) continue;
     const int64_t need = (slens[r] + block_size - 1) / block_size;
     VT_CHECK(need <= bt_cols,
              "paged_attention: the block table is shorter than the sequence it "

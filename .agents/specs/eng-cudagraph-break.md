@@ -1582,6 +1582,19 @@ Each item names the stage that owns it. Nothing here is claimed by W1.
   serves the whole step's per-class transient demand; `## Gates` G1 carries the
   measurement and the two detecting mutations.
 
+  **The fix also uncovered a SILENT out-of-bounds read, fixed in the same flow**
+  ([#1394](https://github.com/mudler/vllm.cpp/issues/1394)). Moving which pooled
+  block holds a tensor moves what follows it, and `vt::cpu::PagedAttentionKernel`
+  read `btab[r * bt_row + (j / block_size) * bt_col]` for every
+  `j < seq_lens[r]` without checking the table had that many columns.
+  `test_qwen3_5_decode_graph_seam.cpp`'s `SpecAttnMeta` supplied one column
+  against shape C's `seq_lens = 24` at `block_size = 16`. At `origin/main` that
+  read lands on bytes that decode to an in-range block index, which is the
+  failure mode worth naming: not a latent crash, but attention over the WRONG
+  page that no gate here can see. The kernel now refuses, one compare per request
+  outside the token loop, and the helper sizes its table for the sequence length
+  it declares.
+
   **One bounded assumption is worth naming rather than leaving to be found.** The
   profile a driver pre-grows from is the one its COLD step recorded at that shape
   and slot, so the guarantee is "the captured forward demands no more of any class
