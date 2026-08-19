@@ -34,8 +34,11 @@ not about `uid`. The NVIDIA driver's administrator test is
 
 so a privileged RM control — which is what `nvmlDeviceSetGpuLockedClocks`, and
 therefore `nvidia-smi -lgc`, issues — is gated on `CAP_SYS_ADMIN` and never on
-`uid == 0`. A container process can be root and still fail it, which is exactly
-what the job reported:
+`uid == 0`. **That quotation is an external reference nobody here has read at a
+pinned revision** (§Evidence), so what the behavioural evidence below
+establishes on its own is that container root lacks *something* host root has,
+and not *which* capability it is. A container process can be root and still
+fail it, which is exactly what the job reported:
 
 ```text
 $ nvidia-smi -lgc 2190
@@ -145,7 +148,18 @@ Every percentile in this spec, in its tables and in its test cases, is the
 below pin exact values and the two conventions disagree by enough to matter:
 ours c8 r1 reads **7.43%** on the band by linear interpolation and **7.48%** by
 nearest rank. `drift` is `|median(last third) - median(first third)| / median`
-over the retained busy series.
+over the retained busy series. Naming the **series** settles the only split
+convention that changes a number on this evidence, which is the busy series
+against the sampler's whole elapsed span; the drift paragraph below measures
+that disagreement on ours c1 r1. It does **not** settle how the thirds are cut
+*within* the busy series, and count-floor (`n // 3`), count-ceiling
+(`ceil(n / 3)`) and time-based thirds are three distinct rules. Recomputed from
+the raw samples, all three agree on every one of the nine windows — 0.0000% on
+eight of them and 1.0446% on vLLM c1 r1 — and on §Tests case 1, at 4.2553%.
+**That choice is therefore left unpinned**, and deliberately: no recorded window
+discriminates it, and a case invented to discriminate it would pin a convention
+rather than measure one. An implementer picks one of the three and records which
+beside the constant.
 
 | leg | n | min | p5 | median | p95 | max | `spread_pct` | p5–p95 band | drift | mean cost | samples <95% of median | longest run |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
@@ -162,7 +176,8 @@ over the retained busy series.
 At c1 the excursions are **single samples, isolated, and periodic**. Our c1 rep 2
 dips at 46.6 s, 78.4 s, 107.0 s, 135.6 s and 164.0 s — spacings of 31.8, 28.6,
 28.6 and 28.4 s against a median request E2EL of **28.591 s** in the same file.
-The dip lands on the request boundary.
+So the dips fall on the request period. That is one of the two readings below
+and not yet a finding, for the reason the next paragraph gives.
 
 **Two readings of those dips exist and this spec cannot settle which is right.**
 The periodicity says boundary effect. The driver says thermal: every one of the
@@ -179,12 +194,17 @@ of this spec asserted the first over the second without engaging it. Three facts
 bound what can be said. The periodicity is real and matches the request period to
 within 3 s over five events. The driver's own label is also real, and it is the
 only physical attribution anybody recorded. And the labelling is **not uniform
-across otherwise identical excursions**: our c1 rep 1 dips on the same period —
-48.8, 80.6, 109.3, 138.0, 166.1 s — and **two of its five carry
-`0x0000000000000000`**, no throttle bit at all, at the same utilization and the
-same depth as the three that carry `0x20`. A single mechanism that the driver
-labels only sometimes, or two mechanisms that coincide on the request boundary,
-both fit.
+across comparable excursions**: our c1 rep 1 dips on the same period — 48.83,
+80.60, 109.28, 137.98 and 166.07 s, at 2177, 2320, 2210, 2359 and 2268 MHz — and
+**two of its five carry `0x0000000000000000`**, no throttle bit at all, at the
+same `utilization.gpu = 96` as the three that carry `0x20`. The five are **not
+all of one depth**, and the weaker claim is the one the samples support: the
+unlabelled 2210 MHz is deeper than two of the three labelled dips (2320 and
+2268), while the unlabelled 2359 MHz is shallower than every labelled one. So a
+dip of a depth the driver elsewhere labels arrives unlabelled, at the same
+utilization and on the same period, which is the inconsistency. A single
+mechanism that the driver labels only sometimes, or two mechanisms that coincide
+on the request boundary, both fit.
 
 **Distinguishing them needs temperature or power over the window, and neither
 was collected** (§What was not measured). So this spec states the disjunction
@@ -195,7 +215,10 @@ produced the dips, and the throttle rule fires on these windows either way.
 **Drift is not 0.00% in all nine windows, and the one exception is the
 phenomenon the drift term exists for.** vLLM c1 rep 1 reads **1.04%**, and the
 shape is convention-free: **all 44 of its samples at 2515 MHz sit at indices 1
-to 46 of 163**, so the entire high state falls inside the first third however the
+to 46 of 163**, counted from **zero** over the retained busy series, as the
+sample list is indexed — 2 to 47 if counted from one, and the convention is
+named here for the same reason the percentile convention is named above. So the
+entire high state falls inside the first third however the
 thirds are cut, and the last third is 52 of 54 (53 of 55 by time) at 2489. That
 is a genuine one-way state change that never returns. It reads 1.04% under
 every median-based split convention tried — count-floor thirds, count-ceiling
@@ -272,6 +295,15 @@ The minimal patch, on each of `manifests/{dgx,thor,orin}/rc-worker.yaml`, on the
 `privileged: true` also works and is strictly worse: it grants every capability,
 disables seccomp and AppArmor, and relaxes the device cgroup, when one capability
 is what the driver asks for.
+
+**This is the patch to try, and it is not an established diagnosis.** That the
+one capability is `CAP_SYS_ADMIN` rests entirely on the driver-source quotation,
+which §Evidence records as an external reference nobody here has read at a
+pinned revision; the behavioural evidence identifies only that container root
+lacks something host root has. The `rc run` acceptance test in §Gates is what
+falsifies it. An `LGC_RC` still 4 after the grant says the capability is a
+different one, and the answer then is to identify which — not to reach for
+`privileged: true`, whose cost is above and whose success would name nothing.
 
 **Say the cost plainly.** Leased jobs run inside this same long-lived container,
 so this grants `CAP_SYS_ADMIN` to every job anybody submits through `rc`, not
@@ -595,7 +627,9 @@ argument above.
   is left exactly as it is: the only physical attribution in the record is the
   driver's, and second-guessing it would need an instrument that does not exist
   yet. Adding the two fields is a candidate follow-up and is **not** in this
-  row's scope; it changes the record schema and owes its own spec.
+  row's scope; it changes the record schema and owes its own spec. It is filed
+  as [#1386](https://github.com/mudler/vllm.cpp/issues/1386) and listed under
+  §Owed.
 - **The "a 2190 pin will hold" expectation comes from a different boot.** The
   flat 2184 MHz series of 2026-08-15 ran on boot
   `03717c9d-63c8-4652-a8fe-a63d012c5718` over the host + `flock` path. All nine
@@ -654,8 +688,10 @@ at `7ce8c77`.
   fresh GPU time on a box where the clocks can be pinned.
 - Temperature and power in `QUERY_FIELDS`, so a future `SwThermalSlowdown` label
   can be checked against a die reading. Named in §What was not measured; it
-  changes the record schema and owes its own row and spec. No issue is filed for
-  it yet, and this bullet is the record that it is owed by this spec.
+  changes the record schema and owes its own row and spec. Tracked by
+  [#1386](https://github.com/mudler/vllm.cpp/issues/1386), which carries the
+  measured consequence — the five dips of ours c1 rep 1, two of them unlabelled
+  — and is owed under this bullet until a row claims it.
 
 ## Now
 
