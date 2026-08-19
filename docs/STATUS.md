@@ -313,11 +313,33 @@ names it and assigns it to W2 — an exception CAUGHT INSIDE the scope leaves th
 rest of the forward uncaptured while `captured()` stays true, because nothing is
 unwinding at scope exit for the drain to see.
 
-**Not yet entered from a production step.** No driver opens a capture scope
-until W2 migrates `Qwen3DenseDecodeGraph`; the break point itself runs on every
-forward and takes the pass-through arm. The spec's `## Owed` names that with its
-owner, along with the auxiliary-stream auto-join, the ROCm and Tenstorrent arms,
-and GPU bit-exactness over more than one replay.
+**NINE OF THE NINE DRIVERS ARE ON THE SEAM** as of W6 (2026-08-19, #1374,
+#1020). A call-shaped grep for `BeginCapture`, `EndCaptureGraph`, `ReplayGraph`
+and `DestroyGraph` over `src/vllm/` returns nothing, and one
+`VLLM_CPP_CUDAGRAPH` read survives in the tree, the seam's own. G1 on
+`thor:gpu0`: 2066 assertions, 0 differing, five drivers, capture plus three
+replays each.
+
+**W6 moved the eligibility predicate off `pure_decode`.** The runner names the
+step's ACTUAL uniform query length once and every model reads the answer,
+instead of two model files re-deriving that test in twenty duplicated lines
+each. A speculative verify the scheduler clamped to a shorter draft prefix is
+now captured at its own depth rather than running eager, which closes #1020
+together with a `(S, q, spec)` ring key. `VT_SPEC_GRAPH_MAX_QLENS` bounds how
+many distinct speculative query lengths one driver captures.
+
+**What did NOT move is "except at the break points", and that is a result
+rather than a shortfall.** No driver in this tree serves a prefill or a mixed
+batch under any predicate: all nine are decode drivers. A piecewise arm needs a
+prefill capture driver nobody has written, and its benefit is refuted by this
+row's own dated measurements — 3.8% prefill host idle at above 96% GPU-busy on
+GB10, and the 27B prefill gap at 92.5% non-GEMM glue. The spec's `## Owed`
+states what would have to be true first.
+
+Still owed: the ROCm and Tenstorrent arms, blocked on fleet hardware; G1 and G2
+for the three single-shape drivers; and #1380, a `cudaMalloc` inside a
+capturing stream on the second parity-ring slot of a speculative shape, which
+W6 found, located and did not cause.
 
 ## Speculative decoding
 
@@ -363,7 +385,7 @@ a spike while its user-facing serving surface is finalized.
 
 **DSpark draft routing** (`SPEC-DSPARK-QWEN3-ROUTING`, ACTIVE) makes the loader classify a DSpark draft from the draft's own `config.json` before it resolves anything else. `Qwen3DSparkModel`, `Gemma4DSparkModel` and — ahead of the pin, mirroring vllm#52197 — `DSparkDraftModel` with `model_type` `qwen3` take the landed Qwen3 lane; a draft that resolves to the DeepSeek-V4 DSpark lane is refused BY NAME instead of being rewritten into a stub. CPU-gated only: the token-exact run gate against the pinned oracle waits on a draft download and GPU time that are not authorized, so it stays owed (#1193).
 
-**DFlash2** (`SPEC-DFLASH2`, READY, [#1314](https://github.com/mudler/vllm.cpp/issues/1314)) is scoped and unimplemented. Upstream carries DFlash2 as a second architecture beside DFlash rather than as a change to it, so a `DFlashDraftModel` checkpoint keeps resolving exactly as it does today; what the new `DFlash2DraftModel` adds is a grouped dynamic depthwise convolution inside each draft block and a candidate selector that replaces the per-slot argmax with a scored path walk over the target head's top-K. Nothing here routes that architecture string yet, and the published checkpoint would additionally run every layer causal under our current rule, which costs acceptance and nothing a token gate can see. The port is BEYOND-PIN on an OPEN upstream pull request and does not move the parity pin. No speed number is claimed, and none is admissible before the acceptance gate reads.
+**DFlash2** (`SPEC-DFLASH2`, ACTIVE, [#1314](https://github.com/mudler/vllm.cpp/issues/1314)) has landed its first wave and none of its mechanism. Upstream carries DFlash2 as a second architecture beside DFlash rather than as a change to it, so a `DFlashDraftModel` checkpoint keeps resolving exactly as it does today; what the new `DFlash2DraftModel` adds is a grouped dynamic depthwise convolution inside each draft block and a candidate selector that replaces the per-slot argmax with a scored path walk over the target head's top-K. Neither is implemented, so a draft that declares `DFlash2DraftModel` is now REFUSED at startup, before any weight is read, with both missing parts named. It is refused rather than loaded because a DFlash2 checkpoint carries DFlash1's whole tensor set: the DFlash1 lane would take it with nothing missing and draft worse tokens with no visible symptom, since the verify is lossless and only acceptance falls. The refusal covers the GGUF drafter too, which is the case the architecture string cannot reach: the published DFlash2 GGUF declares the same `dflash` architecture a DFlash1 drafter does, so it is identified by the convolution and selector metadata only it carries. The second half of the wave is the causality rule — a top-level `is_causal` now decides every layer ahead of `dflash_config.causal` and ahead of the `layer_types` default, which is what the published checkpoint (all five layers `sliding_attention`, `is_causal false`) depends on; no DFlash1 checkpoint declares the key, in either container, so their resolution is unchanged. The port is BEYOND-PIN on an OPEN upstream pull request and does not move the parity pin. No speed number is claimed, and none is admissible before the acceptance gate reads.
 
 **DeepSeek-V4 native MTP** (`DeepSeekV4MTPModel`, ACTIVE — W1 self-spec wiring,
 2026-07-30) has its nextn draft head wired to the same lossless spec-decode path.
