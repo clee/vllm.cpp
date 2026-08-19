@@ -885,12 +885,10 @@ TEST_CASE("G1 CUDA: Qwen3_5DenseDecodeGraph replays bit-exactly against eager, 3
 // above, nor two interleaved drivers. Those five read 2066 assertions and 0
 // differing on the same binary, so W6 does not regress them.
 //
-// SO THIS CASE PINS THE BLOCKER RATHER THAN CLAIMING THE GATE. It asserts the
-// refusal it actually finds and names the issue. **It is written to FAIL when
-// #1380 is fixed**, which is deliberate: whoever fixes the capture inherits a red
-// that points at the assertion W6 actually wanted, three lines below in a
-// comment. A case that quietly skipped instead would leave the row recording a
-// gate nobody ever ran.
+// SO THIS CASE IS THE GATE W6 WANTED. It drives one spec shape through both ring
+// slots and REPLAYS, against the driver's own eager arm, and it reports every
+// step separately because WHICH step is refused is how the defect was located.
+
 namespace {
 
 vllm::v1::GDNAttentionMetadata SpecGdnMeta(int32_t reqs, int32_t q) {
@@ -954,7 +952,7 @@ std::vector<int32_t> SpecIota(int32_t n, int32_t base) {
 // drives two spec shapes; if a SINGLE spec shape cannot capture on this device
 // at all, that case's failure says nothing about the ring key. This one drives
 // one shape, one driver, from a clean process.
-TEST_CASE("G1 CUDA W6: which spec step is refused on device (#1380)") {
+TEST_CASE("G1 CUDA W6: a SPEC shape captures and replays bit-exactly against eager (#1380)") {
   if (!HasCuda()) {
     MESSAGE("SKIP: no CUDA backend registered; G1 needs a leased device");
     return;
@@ -964,39 +962,58 @@ TEST_CASE("G1 CUDA W6: which spec step is refused on device (#1380)") {
   const HfConfig c = Qwen35DenseConfig();
   const vllm::Qwen3_5DenseWeights w = Qwen35DenseWeights(c);
   REQUIRE(c.vocab_size >= 26);  // the id range below, asserted not assumed
-  CudaGdnCachePool cache(b, q, c, /*num_blocks=*/4, /*block_size=*/16,
-                         /*spec_mql=*/3);
-  vllm::Qwen3_5DenseDecodeGraph arm(w, c, q, /*max_num_reqs=*/4);
+  CudaGdnCachePool eager_cache(b, q, c, /*num_blocks=*/4, /*block_size=*/16,
+                               /*spec_mql=*/3);
+  CudaGdnCachePool graph_cache(b, q, c, /*num_blocks=*/4, /*block_size=*/16,
+                               /*spec_mql=*/3);
+  vllm::Qwen3_5DenseDecodeGraph eager(w, c, q, /*max_num_reqs=*/0);  // EAGER arm
+  vllm::Qwen3_5DenseDecodeGraph graphed(w, c, q, /*max_num_reqs=*/4);
 
-  // Five steps, each recorded rather than aggregated, because the whole question
-  // is WHICH step is refused. A spec step always takes the two-slot parity ring
-  // (`dbuf = impl_->dbuf || spec_step`), so the sequence is: slot 0 cold, slot 1
-  // cold, slot 0 CAPTURES, slot 1 CAPTURES, slot 0 REPLAYS. A replay is
-  // unreachable unless BOTH slots capture.
+  // Five steps, each recorded rather than aggregated, because WHICH step is
+  // refused is how #1380 was located. A spec step always takes the two-slot
+  // parity ring (`dbuf = impl_->dbuf || spec_step`), so the sequence is: slot 0
+  // cold, slot 1 cold, slot 0 CAPTURES, slot 1 CAPTURES, slot 0 REPLAYS. A
+  // replay is unreachable unless BOTH slots capture.
+  const int64_t rows = 6;  // 2 requests x 3 verified tokens each
   std::vector<std::string> failed(5);
   std::vector<int> captured_after(5, -1);
+  size_t total = 0;
   for (int step = 0; step < 5; ++step) {
+    std::vector<float> e, g;
     try {
-      Read(b, q,
-           arm.Step(SpecIota(6, 10), SpecIota(6, 0), SpecAttnMeta(2, 3, 0),
-                    SpecGdnMeta(2, 3), cache.attn_kv, cache.gdn_state),
-           c.vocab_size * 6);
-    } catch (const std::exception& e) {
-      failed[static_cast<size_t>(step)] = e.what();
+      e = Read(b, q,
+               eager.Step(SpecIota(6, 10), SpecIota(6, 0), SpecAttnMeta(2, 3, 0),
+                          SpecGdnMeta(2, 3), eager_cache.attn_kv,
+                          eager_cache.gdn_state),
+               c.vocab_size * rows);
+      g = Read(b, q,
+               graphed.Step(SpecIota(6, 10), SpecIota(6, 0), SpecAttnMeta(2, 3, 0),
+                            SpecGdnMeta(2, 3), graph_cache.attn_kv,
+                            graph_cache.gdn_state),
+               c.vocab_size * rows);
+    } catch (const std::exception& ex) {
+      failed[static_cast<size_t>(step)] = ex.what();
     }
-    captured_after[static_cast<size_t>(step)] = arm.captured() ? 1 : 0;
+    captured_after[static_cast<size_t>(step)] = graphed.captured() ? 1 : 0;
+    if (failed[static_cast<size_t>(step)].empty()) total += CompareStep(step, e, g);
   }
   for (int step = 0; step < 5; ++step) {
-    MESSAGE("spec step " << step << ": captured=" << captured_after[static_cast<size_t>(step)]
-            << " threw='" << failed[static_cast<size_t>(step)] << "'");
+    MESSAGE("spec step " << step << ": captured="
+            << captured_after[static_cast<size_t>(step)] << " threw='"
+            << failed[static_cast<size_t>(step)] << "'");
+    CHECK(failed[static_cast<size_t>(step)].empty());
   }
-  // The two cold steps and the FIRST capture complete. This is what separates
-  // "the spec path is broken" from "the SECOND ring slot's capture is refused",
-  // and the difference matters: the first is a dead feature, the second is a
-  // feature that can never reach a REPLAY.
-  CHECK(failed[0].empty());
-  CHECK(failed[1].empty());
-  CHECK(failed[2].empty());
+  // BOTH ring slots capture, and step 4 REPLAYS slot 0. Before #1380 was fixed
+  // step 3 -- the SECOND slot's capture -- threw `cudaMalloc: operation not
+  // permitted when stream is capturing`, and step 4 then found the queue
+  // poisoned (`embedding: operation failed due to a previous error during
+  // capture`) without opening a scope at all.
   CHECK(captured_after[2] == 1);
-  MESSAGE("G1 W6 on this device: replays=" << arm.replay_count());
+  CHECK(captured_after[3] == 1);
+  CHECK(captured_after[4] == 1);
+  CHECK_FALSE(eager.captured());
+  CHECK(graphed.replay_count() >= 1);
+  MESSAGE("G1 W6 spec shape on CUDA: 5 steps x " << c.vocab_size * rows
+          << " logits, " << total << " differing, " << graphed.replay_count()
+          << " replays");
 }
