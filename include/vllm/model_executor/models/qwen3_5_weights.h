@@ -226,8 +226,13 @@ void AdoptDeviceBytesAsHost(vt::Backend& backend, const OwnedTensor& w);
 //
 // 256, because that is cuBLASLt's documented
 // `CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_A_BYTES` DEFAULT, which this tree never
-// sets, and it dominates every explicit pointer gate in the tree (the strictest
-// is 32, in `src/vt/cuda/cuda_nvfp4_sm12x.cu`). It is also what `cudaMalloc`
+// sets, and it dominates every explicit pointer gate in the tree. Measured, not
+// assumed: `grep -rn MIN_ALIGNMENT src/vt/` finds nothing, so the 256 default
+// applies to every cuBLASLt matmul this tree issues; and the only genuine
+// POINTER-alignment gate in the CUDA kernels is
+// `src/vt/cuda/cuda_matmul_nvfp4.cu`'s `reinterpret_cast<uintptr_t>(prow) & 0xf`,
+// which asks for 16. The other `% 32` and `% 64` tests nearby read as alignment
+// gates and are not: they check a DIMENSION (`d`, `dv`), not an address. It is also what `cudaMalloc`
 // returns in practice, though CUDA guarantees only "suitably aligned" and
 // current devices return more — so "indistinguishable from a `cudaMalloc`
 // pointer" is the intuition, and "at least what every consumer is promised" is
