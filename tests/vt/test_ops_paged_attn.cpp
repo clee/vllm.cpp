@@ -637,10 +637,16 @@ TEST_CASE("paged_attention validates shapes/args") {
   // stride. Measured at `5f68e60df`: that read returned 0 when the crashing
   // case ran alone and 1021459670 when one earlier case in its file had run
   // first, so the same source faulted at 0x533fbc625590 in the natural suite
-  // order and looked correct in isolation. The bound is asserted HERE, at
-  // `vt::PagedAttention`, rather than against any one kernel, because six
-  // backends register `OpId::kPagedAttention` and this call is what every
-  // caller writes.
+  // order and looked correct in isolation.
+  //
+  // WHERE THE BOUND LIVES, AND WHERE THIS CASE ENTERS IT. The refusal is in the
+  // CPU kernel, `src/vt/cpu/cpu_paged_attn.cpp`, beside the read it protects,
+  // and it holds for the CPU backend ONLY. This case is written against
+  // `vt::PagedAttention` because that is the call a caller writes and the one
+  // entry point all six registered backends share -- NOT because the bound is
+  // enforced there for all six. It is not: the same unbounded index sits in 19
+  // device sites, and #1406 records why the seam cannot hold one bound for them
+  // today.
   {
     Tensor tq = F32(q, {1, 2, D}), tp = F32(out, {1, 2, D});
     std::vector<int32_t> sl_over = {3};  // needs 2 columns, the table has 1
