@@ -6823,9 +6823,12 @@ DBuf MoeBlockBf16Cuda(Dev d, const MoeBlockWeights& w, const HfConfig& cfg,
       // paragraph was written for is unchanged.
       for (int64_t e = 0; e < E; ++e) {
         const size_t se = static_cast<size_t>(e);
-        if (w.expert_gate[se].d_dev != nullptr) w.expert_gate[se].ReleaseHost();
-        if (w.expert_up[se].d_dev != nullptr) w.expert_up[se].ReleaseHost();
-        if (w.expert_down[se].d_dev != nullptr) w.expert_down[se].ReleaseHost();
+        if (vllm::HostMirrorIsRedundant(w.expert_gate[se]))
+          w.expert_gate[se].ReleaseHost();
+        if (vllm::HostMirrorIsRedundant(w.expert_up[se]))
+          w.expert_up[se].ReleaseHost();
+        if (vllm::HostMirrorIsRedundant(w.expert_down[se]))
+          w.expert_down[se].ReleaseHost();
       }
     }
     mr.ready = true;

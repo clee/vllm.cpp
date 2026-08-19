@@ -310,6 +310,28 @@ HostAliasStats HostAliasSnapshot();
 // W0e could not tell a decode regression from the workload.
 bool HostWeightAliasEnabled();
 
+// May the host mirror of `w` be released, because a DEVICE copy exists to be
+// authoritative in its place?
+//
+// THE INVARIANT A USE-AFTER-FREE TAUGHT US (issue #1299). `MoeBlockBf16Cuda`
+// captures `ResidentWeight(...).data` for every expert into a device-resident
+// pointer table, uploads the table once, and then releases the host mirrors. It
+// justified that with "once the device copy exists it is authoritative and
+// nothing reads the host bytes again", which was true while `ResidentWeight`
+// had two behaviours. It has three: on a host-addressable platform it ALIASES,
+// so the captured pointers ARE `w.bytes.data()` and releasing them frees memory
+// the resident table still points at, for the model's lifetime and from inside
+// captured graphs. A fresh review demonstrated it with a scratch case that takes
+// SIGSEGV.
+//
+// The question is therefore not "did we upload" but "is there something else to
+// read", and `d_dev` already answers it: null on exactly the arm that aliases,
+// non-null on every arm that staged. Named rather than inlined so the release
+// sites state the invariant they depend on, and so a gate can mutate it.
+inline bool HostMirrorIsRedundant(const OwnedTensor& w) {
+  return w.d_dev != nullptr;
+}
+
 // Lazily-built per-weight DEVICE-RESIDENT state, OWNED BY THE WEIGHT (issue
 // #237).
 //
