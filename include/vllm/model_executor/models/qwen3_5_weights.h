@@ -266,7 +266,49 @@ inline constexpr size_t kDeviceAliasAlignment = 256;
 //
 // Logically const, like the lazy device residency beside it: only where the
 // bytes live changes, never what they are.
-bool MakeHostBytesDeviceAliasable(const OwnedTensor& w);
+// The outcomes, so a caller and a log can say WHICH one happened.
+enum class HostAliasOutcome {
+  kAliasedInPlace,    // already aligned; nothing allocated and nothing copied
+  kRehomed,           // an OWNED misaligned buffer moved into an aligned block
+  kDeclinedBorrow,    // a misaligned BORROW; the caller must stage
+  kDeclinedEmpty,     // no host bytes at all
+  kDeclinedDisabled,  // VT_QWEN35_ALIAS_HOST_WEIGHTS=0
+};
+
+bool MakeHostBytesDeviceAliasable(const OwnedTensor& w,
+                                  HostAliasOutcome* outcome = nullptr);
+
+// Bytes seen by `MakeHostBytesDeviceAliasable`, split by outcome, since process
+// start.
+//
+// WHY A COUNTER AND NOT AN INFERENCE FROM RSS. W0f's first device attempt was
+// read only through `free -m`, and what it showed — about 47 GB appearing in
+// 30 seconds at the first forward — is equally consistent with "the branch
+// declined and staged as before", with "the branch re-homed and the old pages
+// did not come back", and with "something else allocated". Those three call for
+// three different changes, and no amount of staring at an RSS curve chooses
+// between them. This says how many bytes took each outcome. It is printed
+// PERIODICALLY rather than at exit, because the process it measures is one the
+// memory guard kills before any exit handler runs.
+struct HostAliasStats {
+  uint64_t aliased_in_place_bytes = 0;
+  uint64_t rehomed_bytes = 0;
+  uint64_t declined_borrow_bytes = 0;
+  uint64_t declined_other_bytes = 0;
+  uint64_t calls = 0;
+};
+HostAliasStats HostAliasSnapshot();
+
+// The same-binary A/B back to the staging behaviour, per the house convention
+// for a default-on residency change that `VT_ADOPT_DEVICE_BYTES` and
+// `VT_MOE_HOST_FREE` already follow. `VT_QWEN35_ALIAS_HOST_WEIGHTS=0` makes
+// every call decline, so one build can measure both arms — which matters more
+// here than usual, because `src/vllm/model_executor/models/laguna.cpp` records
+// a MEASURED GB10 penalty for reading system-allocated memory from the GPU
+// rather than a `cudaMalloc` allocation, worst on a long-K low-parallelism
+// GEMV. This branch installs exactly that retag by default, and without a knob
+// W0e could not tell a decode regression from the workload.
+bool HostWeightAliasEnabled();
 
 // Lazily-built per-weight DEVICE-RESIDENT state, OWNED BY THE WEIGHT (issue
 // #237).

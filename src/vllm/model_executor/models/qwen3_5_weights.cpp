@@ -152,17 +152,61 @@ void DropResidentInteriorPages(const uint8_t* p, size_t nb) {
 
 }  // namespace
 
-bool MakeHostBytesDeviceAliasable(const OwnedTensor& w) {
+namespace {
+
+HostAliasStats& AliasStats() {
+  static HostAliasStats s;
+  return s;
+}
+
+}  // namespace
+
+HostAliasStats HostAliasSnapshot() { return AliasStats(); }
+
+bool HostWeightAliasEnabled() {
+  static const bool on = [] {
+    const char* e = std::getenv("VT_QWEN35_ALIAS_HOST_WEIGHTS");
+    return !(e != nullptr && e[0] == '0');
+  }();
+  return on;
+}
+
+bool MakeHostBytesDeviceAliasable(const OwnedTensor& w,
+                                  HostAliasOutcome* outcome) {
+  HostAliasStats& st = AliasStats();
+  ++st.calls;
+  const uint64_t nbytes = static_cast<uint64_t>(w.bytes.size());
+  auto report = [&](HostAliasOutcome o, bool ok) {
+    if (outcome != nullptr) *outcome = o;
+    switch (o) {
+      case HostAliasOutcome::kAliasedInPlace:
+        st.aliased_in_place_bytes += nbytes;
+        break;
+      case HostAliasOutcome::kRehomed:
+        st.rehomed_bytes += nbytes;
+        break;
+      case HostAliasOutcome::kDeclinedBorrow:
+        st.declined_borrow_bytes += nbytes;
+        break;
+      default:
+        st.declined_other_bytes += nbytes;
+        break;
+    }
+    return ok;
+  };
+  if (!HostWeightAliasEnabled())
+    return report(HostAliasOutcome::kDeclinedDisabled, false);
   // Nothing to alias. The caller refuses this by name rather than handing a
   // kernel a null pointer; see ResidentWeight.
-  if (w.bytes.empty()) return false;
+  if (w.bytes.empty()) return report(HostAliasOutcome::kDeclinedEmpty, false);
   if (reinterpret_cast<uintptr_t>(w.bytes.data()) % kDeviceAliasAlignment == 0)
-    return true;
+    return report(HostAliasOutcome::kAliasedInPlace, true);
   // A borrow owns no anonymous pages, so re-homing it would ADD residency
   // instead of removing it, and a tied pair's shared expansion must keep its one
   // keep-alive. Same reasoning, and the same answer, as `ReleaseHost`'s and
   // `AdoptDeviceBytesAsHost`'s borrowed branches.
-  if (w.bytes.borrowed()) return false;
+  if (w.bytes.borrowed())
+    return report(HostAliasOutcome::kDeclinedBorrow, false);
 
   auto& self = *const_cast<OwnedTensor*>(&w);
   const size_t nb = self.bytes.size();
@@ -186,7 +230,7 @@ bool MakeHostBytesDeviceAliasable(const OwnedTensor& w) {
   // `AdoptDeviceBytesAsHost` documents at length.
   DropResidentInteriorPages(self.bytes.data(), nb);
   self.bytes = OwnedBytes::Borrow(static_cast<const uint8_t*>(p), nb, std::move(keep));
-  return true;
+  return report(HostAliasOutcome::kRehomed, true);
 }
 
 void AdoptDeviceBytesAsHost(vt::Backend& backend, const OwnedTensor& w) {

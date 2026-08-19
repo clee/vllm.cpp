@@ -1044,6 +1044,39 @@ std::vector<float> WeightF32(const OwnedTensor& w) {
 // model's lifetime. On CPU the bytes are already host-resident, so a direct view
 // avoids the copy. The weight is a read-only matmul-B / norm / embed operand, so
 // the const_cast is safe. `shape` defaults to the owned shape.
+// Print what the W0f aliasing branch has actually done, every 4 GiB of weight it
+// has seen, on the same `VT_LOAD_STATS` switch the loader's byte counters use.
+//
+// WHY PERIODIC AND NOT AT EXIT. The `[vt load] bytes@exit` line is registered
+// with `std::atexit`, and the run this instruments is one a memory guard
+// SIGKILLs — no exit handler runs, so the one number that would have explained
+// the run is the one number the run cannot print. W0f's first device attempt was
+// read from an RSS curve for exactly that reason, and an RSS curve cannot tell
+// "declined and staged" from "re-homed and the pages did not come back".
+void ReportHostAliasResidency() {
+  static const bool on = [] {
+    const char* e = std::getenv("VT_LOAD_STATS");
+    return e != nullptr && e[0] != '0';
+  }();
+  if (!on) return;
+  const vllm::HostAliasStats s = vllm::HostAliasSnapshot();
+  const uint64_t total = s.aliased_in_place_bytes + s.rehomed_bytes +
+                         s.declined_borrow_bytes + s.declined_other_bytes;
+  static uint64_t last = 0;
+  constexpr uint64_t kStep = 4ULL << 30;
+  if (total < last + kStep && last != 0) return;
+  last = total;
+  const double gib = 1024.0 * 1024.0 * 1024.0;
+  std::fprintf(stderr,
+               "[vt load] w0f-alias calls=%llu aliased_in_place=%.3f GiB "
+               "rehomed=%.3f GiB declined_borrow=%.3f GiB declined_other=%.3f GiB\n",
+               static_cast<unsigned long long>(s.calls),
+               static_cast<double>(s.aliased_in_place_bytes) / gib,
+               static_cast<double>(s.rehomed_bytes) / gib,
+               static_cast<double>(s.declined_borrow_bytes) / gib,
+               static_cast<double>(s.declined_other_bytes) / gib);
+}
+
 Tensor ResidentWeight(Dev d, const OwnedTensor& w, std::vector<int64_t> shape = {}) {
   if (shape.empty()) shape.assign(w.shape, w.shape + w.rank);
   // HOST-POINTER ALIASING IS A CPU PROPERTY, NOT A "NOT-CUDA" PROPERTY (issue
@@ -1166,15 +1199,19 @@ Tensor ResidentWeight(Dev d, const OwnedTensor& w, std::vector<int64_t> shape = 
     VT_CHECK(!w.bytes.empty(),
              "qwen3_5: a weight reaching device residency has no host bytes; its "
              "host mirror was released and there is nothing to alias or upload");
-    if (MakeHostBytesDeviceAliasable(w)) {
+    const bool aliased = MakeHostBytesDeviceAliasable(w);
+    ReportHostAliasResidency();
+    if (aliased) {
       // NOT `load_stats::AddDeviceUpload`: nothing was uploaded. Issue #150's
       // counter measures bytes moved host->device, and this branch moves none.
       return MakeTensor(const_cast<uint8_t*>(w.bytes.data()), w.dtype, d.q.device,
                         shape);
     }
-    // Only a MISALIGNED BORROW reaches here (see MakeHostBytesDeviceAliasable):
-    // clean, file-backed pages that staging can copy without adding anonymous
-    // residency. Falling through is deliberate and is not a failure.
+    // A MISALIGNED BORROW, or the `VT_QWEN35_ALIAS_HOST_WEIGHTS=0` A/B, reaches
+    // here. A borrow's pages are clean and file-backed, so staging copies them
+    // without adding anonymous residency. Falling through is deliberate and is
+    // not a failure; `ReportHostAliasResidency` above says how often it happens
+    // and for how many bytes.
   }
   if (!w.d_dev) {
     const size_t nb = w.bytes.size();
@@ -6766,11 +6803,29 @@ DBuf MoeBlockBf16Cuda(Dev d, const MoeBlockWeights& w, const HfConfig& cfg,
             /*committed_compute_path=*/MoeBf16FastEnabled(),
             /*host_free_env=*/host_free_on)) {
       d.b.Synchronize(d.q);  // all E x 3 H2D uploads complete before any free
+      // W0f (#1299) FALSIFIED THIS BLOCK'S PREMISE, AND THIS IS THE REPAIR.
+      //
+      // The paragraph above says "once the device copy exists it is
+      // authoritative and nothing reads the host bytes again", and it was true
+      // while `ResidentWeight` had exactly two behaviours. It has three now: on
+      // a platform whose kernels can dereference host storage the function
+      // ALIASES, `d_dev` is never populated, and the pointers captured into
+      // `gp/up/dp` above ARE `w.bytes.data()`. Releasing the host mirror then
+      // frees the memory the resident device pointer table points at, and the
+      // grouped GEMM keeps reading it for the model's lifetime — including from
+      // inside a captured graph. A fresh review caught it with a scratch case
+      // that replays this exact sequence and takes SIGSEGV.
+      //
+      // The condition is therefore not "did we upload" but "IS THERE A DEVICE
+      // COPY TO BE AUTHORITATIVE", asked per weight, which is what `d_dev`
+      // already answers. It is `nullptr` on precisely the arm that aliases, and
+      // non-null on every arm that staged, so the discrete behaviour this
+      // paragraph was written for is unchanged.
       for (int64_t e = 0; e < E; ++e) {
         const size_t se = static_cast<size_t>(e);
-        w.expert_gate[se].ReleaseHost();
-        w.expert_up[se].ReleaseHost();
-        w.expert_down[se].ReleaseHost();
+        if (w.expert_gate[se].d_dev != nullptr) w.expert_gate[se].ReleaseHost();
+        if (w.expert_up[se].d_dev != nullptr) w.expert_up[se].ReleaseHost();
+        if (w.expert_down[se].d_dev != nullptr) w.expert_down[se].ReleaseHost();
       }
     }
     mr.ready = true;
