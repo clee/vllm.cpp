@@ -37,7 +37,7 @@ bounded (A2-Q2a §13.6.1) and cannot stand in for what this unit measures.
 | In A2-Q2b | Out |
 |---|---|
 | the per-block numeric gate on the REAL checkpoint: every one of the 23 MoE layers against `trace.mixer[l]` | anything A2-P owns (paging, carried state, batching, the G-SAFE narrowing) |
-| `lm_head` through the NVFP4 dense route, with the §4.3 residency decision applied as A2-Q2a applied it | the FP8 mamba arm — A2-Q1 |
+| `lm_head` through the NVFP4 dense route, with the `## 5. Owed` residency decision (#984) applied as A2-Q2a applied it | the FP8 mamba arm — A2-Q1 |
 | hybrid-vs-host token identity, and the disclosure that A2-R's attributability property ENDS when `lm_head` moves | fixing [#984](https://github.com/mudler/vllm.cpp/issues/984) or [#962](https://github.com/mudler/vllm.cpp/issues/962) |
 | the §5.3 mutations A2-Q2a left owed (Q2-M3 … Q2-M7) | any throughput number, on any axis |
 
@@ -214,18 +214,81 @@ discriminator than before it.
 
 | Leg | State |
 |---|---|
-| seam extension (caller-owned `MarlinDenseResident`) | DONE, CPU-built |
-| device `lm_head` arm + `DeviceLmHeadEligible` | DONE, CPU-built |
+| seam extension (caller-owned `MarlinDenseResident`) | DONE, built on BOTH arms (see below) |
+| device `lm_head` arm + `DeviceLmHeadEligible` | DONE, built on BOTH arms |
 | production wiring in `NemotronHPagedForward` -> device `ForwardLogits` | DONE |
 | host arm retained as the gate's operand + the non-NVFP4 fallback | DONE |
 | routing-allowlist entry narrowed, [#1410](https://github.com/mudler/vllm.cpp/issues/1410) filed | DONE |
-| synthetic device `lm_head` numeric gate (measured band, asserted counts) | WRITTEN; runs on CUDA only |
-| CUDA build of the Marlin arm | PENDING a `dgx:gpu0` window |
+| the CPU-reachable half (`n_out`, the shared `final_normed` download) gated through `GPUModelRunner` | DONE — `test_nemotron_h_paged_forward.cpp` §12 |
+| synthetic device `lm_head` numeric gate (measured band, asserted counts) | WRITTEN; runs on CUDA only. **NEVER RUN** |
+| `nvcc` build of the Marlin KERNEL + any execution of the device arm | PENDING a `dgx:gpu0` window |
 | real-checkpoint `lm_head` numeric leg + token identity | PENDING a `dgx:gpu0` window |
 | reachability deletion mutation | PENDING the same window |
 | 23-layer MoE per-block sweep (§3) | PENDING; owed above |
 
-The CPU build compiles the `#else` arms only, so **it does not compile the
-Marlin path at all**. That is stated here rather than left for a reader to
-infer, because "it builds" is exactly the claim a CPU-only green would
-wrongly support.
+### What "built" means here, corrected
+
+The first submission of this row said "the CPU build compiles the `#else` arms
+only, so it does not compile the Marlin path at all", and recorded the CUDA
+build of the Marlin arm as blocked on a GPU window. **That was wrong, and it
+overstated the blocker.** `include/vt/cuda/marlin_repack.h` includes only
+`<cstdint>`, `<cstddef>` and `<vector>`, so the HOST side of the Marlin arm
+needs no CUDA toolkit at all. Measured on this box, which has no `nvcc`:
+
+```
+c++ -std=c++20 -I include -I src -isystem third_party -DVT_MARLIN_NVFP4=1     -Wall -Wextra -Werror -c -o nhd_marlin.o     src/vllm/model_executor/models/nemotron_h_device.cpp
+-> rc 0, 0 errors, 0 warnings, a 1 269 696-byte object
+```
+
+Both arms are therefore compiled, and both are compiled `-Werror`. What
+genuinely needs `nvcc` is the Marlin **kernel** and every **execution** of the
+device path. Landing without those is acceptable and is what the PENDING rows
+above record; claiming the host arm could not be compiled was not.
+
+### The fresh review, and what it found
+
+A fresh reviewer returned FINDINGS on the first submission. The two blocking
+ones are recorded here because both are about EVIDENCE, and evidence is what a
+spec is for.
+
+1. **`tests/vllm/models/test_nemotron_h_moe_device.cpp` had never compiled.**
+   `NemotronHHostWeights` was used unqualified and was missing from the file's
+   using-block, so the file failed `-Wall -Wextra -Werror` with 9 errors on a
+   plain CPU build — the PR head at `rc 1`, the merge-base version of the same
+   file at `rc 0` on the same command. **The red-first result claimed for the
+   synthetic numeric gate therefore did not exist and could not have existed.**
+   The declaration is repaired and the file now compiles at `rc 0` on both
+   arms, but the gate itself is still CUDA-only and still has never executed;
+   the table above says `NEVER RUN` rather than restating a red nobody saw.
+   `vllm_cpp_add_test(test_nemotron_h_moe_device)` is deliberately registered
+   with NO CUDA guard, and that is what surfaced this: a case that skips at run
+   time still has to parse and type-check on every CPU build.
+2. **The production source asserted a protection that does not exist.** A
+   comment at the device branch claimed the allowlist entry was removed and
+   that "the routing checker, not a comment, is what now holds this branch in
+   place". All three parts were false: the entry is narrowed and still present,
+   and deleting the entire `if (DeviceLmHeadEligible(...)) { ... }` block leaves
+   `scripts/check-runner-routing-consistency.py` at `rc 0` with byte-identical
+   output ("3 host-logits off-framework (3 allowlisted)"), reproduced on the
+   repaired tree with the file restored byte-for-byte afterwards (identical
+   sha256). **Nothing automated holds that branch.** The checker is not widened
+   to make it — that changes checker semantics, and [#1410](https://github.com/mudler/vllm.cpp/issues/1410)
+   owns it with its own red-before. The comment now says so, and the
+   reachability deletion mutation stays PENDING rather than claimed.
+
+The reviewer also found a real defect that a token gate structurally cannot
+see. `DeviceLmHeadEligible` restated the shared dispatcher's selection clauses
+and dropped `MarlinW4A16Enabled()`, so under an explicit `VT_NVFP4_MARLIN=0`
+the predicate said eligible while `MatmulNvfp4W4A16D` took its naive
+redundant-dequant arm — computing the SAME logits while re-uploading the whole
+`[131072, 2688]` operand on every decode step, because `LmHeadNvfp4View` hands
+out a stack temporary that `ResidentNvfp4`'s weight-keyed cache can never hit.
+The repair is structural rather than a patched clause: the three clauses now
+live once, in `dense_nvfp4::MarlinW4A16Selects`, and both the dispatcher and
+the model call it, so they cannot drift. `DeviceLmHeadD` additionally refuses
+BY NAME if the seam's `fallback_gemms` counter moves across its own call, and
+the synthetic gate asserts the same counter — the counter is demonstrably armed
+rather than assumed, because `tests/vllm/models/test_qwen3_forward.cpp:497`
+already asserts on CPU that it reaches exactly `5 * num_hidden_layers` when the
+dispatcher does fall back. The behavioural red for this class needs CUDA and is
+PENDING with the rest.

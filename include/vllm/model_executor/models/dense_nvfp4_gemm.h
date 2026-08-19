@@ -748,6 +748,37 @@ inline DBuf GateUpFusedMarlinD(Dev d, const Tensor& x, const Nvfp4Weight& gw,
 #endif  // VT_MARLIN_NVFP4
 
 // --- The W4A16 dispatcher ---------------------------------------------------
+
+// ── A2-Q2b (#810): the dispatcher's OWN gate, as ONE predicate ───────────────
+//
+// `MatmulNvfp4W4A16D` below selects Marlin on THREE clauses. A caller that has
+// to know the answer BEFORE it calls — because the fallback is not merely
+// slower for it but pathological — must ask this function rather than restate
+// the clauses, and this exists because a restatement is exactly what went
+// wrong. A2-Q2b's first submission restated two of the three in NemotronH's
+// `DeviceLmHeadEligible` and dropped `MarlinW4A16Enabled()`, so under an
+// explicit `VT_NVFP4_MARLIN=0` the model said "eligible", the dispatcher fell
+// to the naive redundant-dequant arm, and because the caller hands in a
+// TRANSIENT `Nvfp4Weight` view the `ResidentNvfp4` cache below could never hit
+// — re-uploading the whole `[vocab, hidden]` operand on every decode step.
+//
+// A token gate cannot see any of that: the fallback computes the SAME value.
+// One expression with two call sites is what makes the two unable to drift.
+inline bool MarlinW4A16Selects(Dev d, DType act_dtype) {
+#ifdef VT_MARLIN_NVFP4
+  // The device clause is an OP-AVAILABILITY question, not a `== kCUDA` one: ask
+  // the vt::OpProvider table whether the Marlin NVFP4 grouped GEMM is realized
+  // for this device (registered only for kCUDA today, so this is byte-identical
+  // on the production build — accelerator-seam audit class A, work row S4).
+  return vt::OpRegistered(vt::OpId::kMoeGroupedGemmNvfp4Marlin, d.q.device.type) &&
+         MarlinW4A16Enabled() && act_dtype == DType::kBF16;
+#else
+  (void)d;
+  (void)act_dtype;
+  return false;
+#endif
+}
+
 // y[M,N] = x[M,K] @ dequant(w).T for an NVFP4 W4A16 weight. Mirrors vLLM's
 // forced-Marlin selection for `use_a16` (__init__.py:879-881): on CUDA with a
 // BF16 activation take Marlin; otherwise fall back to the naive
@@ -761,12 +792,9 @@ inline DBuf MatmulNvfp4W4A16D(Dev d, const Tensor& x, const Nvfp4Weight& w,
            "dense_nvfp4: true-W4A4 weight routed into the W4A16 dispatcher");
 #ifdef VT_MARLIN_NVFP4
   // Marlin requires a bf16 activation (vLLM's a16 path is bf16/fp16 too). The
-  // device gate is an OP-AVAILABILITY question, not a "== kCUDA" question: ask
-  // the vt::OpProvider table whether the Marlin NVFP4 grouped-GEMM is realized
-  // for this device (registered only for kCUDA today, so this is byte-identical
-  // on the production build — accelerator-seam audit class A, work row S4).
-  if (vt::OpRegistered(vt::OpId::kMoeGroupedGemmNvfp4Marlin, d.q.device.type) &&
-      MarlinW4A16Enabled() && x.dtype == DType::kBF16)
+  // three clauses live in `MarlinW4A16Selects` above so a caller can ask the
+  // SAME question in advance instead of restating them (A2-Q2b).
+  if (MarlinW4A16Selects(d, x.dtype))
     return MatmulNvfp4MarlinD(d, x, w, out_dtype, resident);
 #else
   (void)resident;

@@ -39,6 +39,7 @@
 #include <string>
 #include <vector>
 
+#include "vllm/model_executor/models/dense_nvfp4_gemm.h"
 #include "vllm/model_executor/models/nemotron_h_forward.h"
 #include "vt/backend.h"
 #include "vt/dtype.h"
@@ -47,6 +48,12 @@ namespace {
 
 using vllm::NemotronHBlock;
 using vllm::NemotronHExpertWeights;
+// A2-Q2b: the lm_head cases below name this type UNQUALIFIED. It was missing
+// from this block on the first submission and the file never compiled on any
+// platform, which is why `vllm_cpp_add_test(test_nemotron_h_moe_device)` is
+// registered with NO CUDA guard: the CPU build is what makes a case that
+// SKIPS at run time still have to parse and type-check.
+using vllm::NemotronHHostWeights;
 using vllm::NemotronHMoeWeights;
 using vllm::NemotronHOwned;
 using vllm::NemotronHParams;
@@ -413,7 +420,30 @@ TEST_CASE("NemotronH A2-Q2b: the device lm_head matches the host projection on t
     const std::vector<float> want = vllm::NemotronHHostLmHead(host, p, rows, R, hq);
     REQUIRE(want.size() == static_cast<size_t>(R * V));
 
+    // ── ★ THE ONE DEFECT CLASS A VALUE COMPARISON CANNOT SEE ────────────────
+    //
+    // Everything below this line compares NUMBERS, and the shared dispatcher's
+    // naive redundant-dequant fallback computes the SAME numbers as Marlin. So
+    // if `DeviceLmHeadEligible` and `dense_nvfp4::MarlinW4A16Selects` ever
+    // disagree, every assertion in this case still passes while the arm
+    // re-uploads the whole [vocab, hidden] operand on every single call —
+    // `LmHeadNvfp4View` hands out a stack temporary, so `ResidentNvfp4`'s
+    // weight-keyed cache can never hit. That is the shape of the defect this
+    // row shipped in its first submission (the predicate restated the
+    // dispatcher's clauses and dropped `MarlinW4A16Enabled()`).
+    //
+    // The counter is the seam's own, and it is DEMONSTRABLY ARMED rather than
+    // assumed: `test_qwen3_forward.cpp:497` asserts on CPU that
+    // `fallback_gemms` reaches exactly `5 * num_hidden_layers` when the
+    // dispatcher does fall back. An absent hook reads exactly like an armed one.
+    vllm::dense_nvfp4::ResetW4A16Stats();
     const std::vector<float> got = vllm::NemotronHDeviceLmHead(host, p, rows, R, dq);
+    const vllm::dense_nvfp4::Nvfp4W4A16Stats st = vllm::dense_nvfp4::GetW4A16Stats();
+    MESSAGE("R=" << R << " W4A16 counters: marlin_gemms=" << st.marlin_gemms
+                 << " fallback_gemms=" << st.fallback_gemms
+                 << " dense_gemms=" << st.dense_gemms);
+    CHECK(st.fallback_gemms == 0);
+    CHECK(st.marlin_gemms + st.dense_gemms >= 1);
 
     // ★ THE COUNT IS ASSERTED AGAINST THE GEOMETRY, never against either
     // buffer's own size — a buffer that agrees with itself proves nothing, and
