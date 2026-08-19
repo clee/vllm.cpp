@@ -69,6 +69,36 @@ never use, and its teardown can deadlock at process exit — every test passes,
 ([#132](https://github.com/mudler/vllm.cpp/issues/132)). Setting a build type,
 or putting your own `-O` in `CMAKE_HIP_FLAGS`, overrides it.
 
+### Three models sample from host logits, and what that costs per device
+
+`nemotron_h`, `laguna` and `qwen3_vl` finish their forward on the host and hand
+the runner a host `[rows, vocab]` logits buffer rather than a device-resident
+one (`scripts/runner-routing-allowlist.txt` lists them and names what removes
+each entry). The sampler itself runs on device, so those bytes have to be
+reachable by the queue device before any sampling kernel touches them.
+
+What that means for you depends on one property of your GPU, not on the model:
+
+* **Unified memory** — GB10 and other integrated CUDA devices, integrated
+  Vulkan, and CPU. Host and device address the same memory, so the logits are
+  used where they are. No copy, no extra allocation.
+* **Discrete** — the logits are copied to device memory first, once per step,
+  into a buffer that is reused and only ever grows. You pay one host-to-device
+  transfer of `rows x vocab x 4` bytes per step on these three models and on no
+  others.
+
+Before [#1313](https://github.com/mudler/vllm.cpp/issues/1313) the copy did not
+happen and the host address was handed to the kernel directly, which is valid
+only on a unified-memory device. If you ran one of these three models on a
+discrete GPU on an older build and saw an illegal-address abort during sampling,
+that was this.
+
+Not yet measured on a discrete GPU: the fix is gated at the seam
+(`tests/vllm/v1/sample/test_host_buffer_staging.cpp`, which stands in for both
+device classes with fake backends because every GPU on the project's fleet
+reports unified memory), and the unified path is gated end to end by the
+NemotronH A3 run on GB10. The discrete arm has no hardware run behind it.
+
 ### ROCm op coverage is incremental (and throws are by design)
 
 ROCm now also carries an **engine-level attention backend name**. Until #1056 the
