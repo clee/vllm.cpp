@@ -145,6 +145,63 @@ already has one. This row measured `dgx`'s worker and adds the part that turns
 an open gap into a blocker for the parity gates, which is that the ORACLE VENV
 is also unreachable from a lease.
 
+### Clock pinning does NOT work inside an `rc` lease, measured 2026-08-19
+
+[#1354](https://github.com/mudler/vllm.cpp/issues/1354) owns this.
+
+`nvidia-smi -lgc` is refused inside the leased worker, in a job running as
+**root**:
+
+```text
+$ nvidia-smi -lgc 2190
+The current user does not have permission to change clocks for GPU 0000000F:01:00.0.
+LGC_RC=4
+```
+
+Reproduced in three separate `rc run` jobs on `dgx:gpu0` on 2026-08-19
+(`.agents/benchmark-record.md`, `BENCH-QWEN38-27B-BF16` c1/c8). The container is
+root but lacks the capability the driver requires.
+
+**This outlives one campaign, and it is a records defect as much as a capability
+one.** [`benchmarking.md`](benchmarking.md) instructs "Pin the clocks before
+measuring, under the lock", and **every clock-pinned figure in this
+repository's records was taken over the retired host + `ssh` + `flock` path**.
+The migration to `rc` leases silently removed clock pinning and no record said
+so. Same class as [#1265](https://github.com/mudler/vllm.cpp/issues/1265): a
+capability the records assume, which the current access path does not provide.
+
+**Consequence for anyone measuring from a lease.** The SM clock can only be
+SAMPLED, never pinned. `tools/bench/gpu_clock_state.py` still works and is the
+only attribution such a number carries. Plan for its within-run rule to fail:
+the 2026-08-19 series recorded within-run spreads of 12.92% to 26.36% across
+nine windows on a thermally throttling GB10, against the 5% ceiling, and
+`gpu_clock_state compare` therefore returned `PAIRING_VERDICT=DISCARD` on every
+c1 pairing even though the cross-arm rule passed perfectly. Two arms measured in
+a lease may not be dividable, so budget for absolutes and say so in advance
+rather than discovering it after the GPU time is spent.
+
+**A model DOES run inside a lease.** The same series ran the pinned oracle
+`0.1.dev1+g555967922` as a server on a 52 GiB bf16 checkpoint from a lease, no
+`ssh` and no container image, and it served three clean benchmark legs. That
+retires the "nobody has run a model that way" reading of
+[#1185](https://github.com/mudler/vllm.cpp/issues/1185) recorded above. What is
+still unreachable is the image-based path SGLang needs
+([#1265](https://github.com/mudler/vllm.cpp/issues/1265)).
+
+**And one instrument rule, paid for in the same series.** A guard whose
+threshold sits inside the guarded configuration's own operating point
+manufactures the finding it was meant to detect. A 12,000 MB `MemAvailable`
+watchdog killed a healthy `vllm serve` 18 s after it reached `/health`, which
+read as "the denominator collapses in a lease" — and the arithmetic refuted it:
+`0.85 x 122,502 MB` reserved by design predicts 12,223 MB free against an
+observed floor of 11,917 MB, a 306 MB match, and the same server later ran three
+clean legs at a ~7,500 MB steady state. **A tripped guard is evidence about the
+GUARD until its threshold is shown to sit outside the guarded thing's operating
+point.** Predict the number from the configuration before believing the verdict,
+and keep instrument thresholds strictly apart from engine knobs: moving the
+floor changes nothing about what is measured, and moving
+`gpu_memory_utilization` changes what the number means.
+
 ### The lease carries bytes, and the exec bit is a mount option, measured 2026-08-17
 
 Probed with two `rc run -d dgx:gpu0 --max-runtime 3m` jobs,
