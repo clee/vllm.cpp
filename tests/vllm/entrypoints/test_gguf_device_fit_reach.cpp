@@ -237,6 +237,58 @@ std::string BuildSyntheticMoeGgufWithExpertTower() {
   return b.Build();
 }
 
+// ENG-EXPERT-STREAM-DEVICE W0d repair (#1124). A `deepseek4` GGUF carrying the
+// SAME `_exps.weight` suffix, and the same expert tower byte-for-byte, on an
+// architecture whose forward never reaches `KqExpertSlice`.
+//
+// `deepseek_v4_weights.cpp` writes `blk.<n>.ffn_{gate,up,down}_exps.weight`
+// exactly as the llama.cpp Qwen MoE export does, and `deepseek_v2.cpp` records at
+// its head that this family deliberately does NOT compose `RunMoeBlock` — so no
+// slot lane serves it, no arena is ever allocated for it, and every one of its
+// towers IS staged. A lane keyed on the suffix alone cannot tell this file from
+// the one above, which is the defect this case exists for: with the towers
+// dropped from the bound and an arena added that nothing builds, the #1123
+// refusal is replaced by the 26-minute-then-`cudaMalloc` death it was created to
+// eliminate.
+//
+// The KV set is the one `tests/vllm/models/test_deepseek_v4_gguf_load.cpp` builds,
+// reduced to the keys `DeepseekV4ParamsFromGguf` REQUIRES plus the two its
+// self-consistency checks read (`hyper_connection.count`, and
+// `attention.compress_ratios` of length >= `block_count`). It carries no
+// tokenizer, so the permitted arm dies at the same later step every other case in
+// this file uses as its positive control.
+std::string BuildSyntheticDeepseekV4GgufWithExpertTower() {
+  GgufModelBuilder b;
+  b.AddKv(StrKv("general.architecture", "deepseek4"));
+  const std::string p = "deepseek4.";
+  b.AddKv(U32Kv(p + "embedding_length", 64));
+  b.AddKv(U32Kv(p + "block_count", 2));
+  b.AddKv(U32Kv(p + "attention.head_count", 4));
+  b.AddKv(U32Kv(p + "attention.head_count_kv", 1));
+  b.AddKv(U32Kv(p + "attention.key_length", 16));
+  b.AddKv(U32Kv(p + "attention.q_lora_rank", 8));
+  b.AddKv(U32Kv(p + "attention.output_lora_rank", 8));
+  b.AddKv(U32Kv(p + "attention.output_group_count", 1));
+  b.AddKv(gguf_test::F32Kv(p + "rope.freq_base", 10000.0F));
+  b.AddKv(gguf_test::F32Kv(p + "attention.layer_norm_rms_epsilon", 1e-6F));
+  b.AddKv(U32Kv(p + "expert_count", 4));
+  b.AddKv(U32Kv(p + "expert_used_count", 2));
+  b.AddKv(U32Kv(p + "expert_shared_count", 1));
+  b.AddKv(U32Kv(p + "expert_feed_forward_length", 32));
+  b.AddKv(gguf_test::F32Kv(p + "swiglu_clamp", 10.0F));
+  b.AddKv(U32Kv(p + "hyper_connection.count", 2));
+  b.AddKv(gguf_test::I32ArrayKv(p + "attention.compress_ratios",
+                                std::vector<int32_t>{1, 1}));
+  // Byte-identical to the qwen35moe file above, so the two cases differ in the
+  // ARCHITECTURE and in nothing else the bound can see.
+  b.AddTensor("token_embd.weight", {64, 64}, /*ggml_type=*/0,
+              std::string(4096 * 4, '\0'));
+  std::string tower;
+  for (int i = 0; i < 8; ++i) tower += Q8BlockBytes();
+  b.AddTensor("blk.0.ffn_gate_exps.weight", {32, 2, 4}, /*ggml_type=*/8, tower);
+  return b.Build();
+}
+
 // The lane's environment, set before any case runs. `VT_MOE_EXPERT_STREAM`
 // LATCHES on first read, so a case that set it in its own body would work today
 // and break the moment a case ordering changed — the same hazard, and the same
@@ -466,6 +518,48 @@ TEST_CASE("device fit W0d: when the lane is on and it STILL does not fit, the me
   CHECK(message.find("the expert-stream lane IS active") != std::string::npos);
   CHECK(message.find(std::to_string(kExpertTowerStaged)) != std::string::npos);
   CHECK(message.find(std::to_string(kArenaBytes)) != std::string::npos);
+}
+
+TEST_CASE(
+    "device fit W0d: an architecture the slot lane never serves keeps the WHOLE "
+    "bound") {
+  // The case the first draft of W0d did not have, and the reason the lane grew an
+  // architecture term. Everything the loader could see was already identical to
+  // the permitted case above — a weight-staging platform, `host_addressable`
+  // true, `VT_MOE_EXPERT_STREAM=1` latched on, and a tensor whose name ends in
+  // `_exps.weight` — and the ONE thing that differs is the resolved
+  // architecture, which decides whether any slot lane exists to serve those
+  // towers. `DeepseekV4ForCausalLM`'s forward does not compose `RunMoeBlock`, so
+  // it never reaches `KqExpertSlice`, so its towers are staged in full.
+  //
+  // The direction matters. The two over-counts this bound already documents are
+  // conservative: they refuse a checkpoint that would have fitted, and the
+  // operator has `VT_DEVICE_WEIGHT_BUDGET_BYTES` to get past them. This one is
+  // not. Dropping 335.62 GiB of towers from the bound on a model that stages
+  // every one of them REMOVES a refusal that was correct, and what replaces it is
+  // the failure #1123 exists to prevent: a 26-minute load and then
+  // `cudaMalloc: out of memory` on the first forward.
+  RegisterFakeStagingPlatform();
+  Platform().host_addressable = true;
+  TempFile f(BuildSyntheticDeepseekV4GgufWithExpertTower());
+
+  // The SAME budget the qwen35moe case is let through on.
+  vllm_test::SetEnv("VT_DEVICE_WEIGHT_BUDGET_BYTES", std::to_string(kLaneOnBound + 1));
+  const std::string message = ThrownMessage(f.path(), vllm::Device::kNamedPlatform);
+  vllm_test::UnsetEnv("VT_DEVICE_WEIGHT_BUDGET_BYTES");
+  Platform().host_addressable = false;
+
+  REQUIRE_FALSE(message.empty());
+  CAPTURE(message);
+  CHECK(message.find("cannot serve this GGUF") != std::string::npos);
+  // The WHOLE table, expert tower included, and no lane note — the pre-W0d
+  // number, which is what every architecture that does not stream must still get.
+  CHECK(message.find(std::to_string(kLaneOffBound)) != std::string::npos);
+  CHECK(message.find("the expert-stream lane IS active") == std::string::npos);
+  // Not the tokenizer: the refusal fired first, which is the point of refusing at
+  // load. Asserting this rules out the reading in which the case passes because
+  // the deepseek4 config parse died before the check was reached at all.
+  CHECK(message.find("tokenizer") == std::string::npos);
 }
 
 // --- The budget as a CONFIG KEY (#1127), through the same loader --------------

@@ -5350,10 +5350,22 @@ std::vector<uint16_t> ExpertMlp(Dev d, const OwnedTensor& gate,
 // expert tower `w` [E*out, in]. Byte-IDENTICAL to MatmulF32/MatmulBf16 on a standalone
 // per-expert OwnedTensor (same kMatmulBTQuant core, same slice bytes). CRITICAL: the
 // whole tower is made DEVICE-RESIDENT via ResidentWeight (CUDA `needs_weight_staging`
-// is TRUE — the kernel CANNOT read host bytes; a raw-host-ptr view produces garbage),
-// staged ONCE (cached on `w.d_dev`) and REUSED per expert; the slice offsets the
-// RESIDENT ptr. The tower is nk=true ([N,K]) so MatmulBT applies (row = whole blocks,
-// row_off*row_bytes never cuts a block).
+// is TRUE), staged ONCE (cached on `w.d_dev`) and REUSED per expert; the slice offsets
+// the RESIDENT ptr. The tower is nk=true ([N,K]) so MatmulBT applies (row = whole
+// blocks, row_off*row_bytes never cuts a block).
+//
+// THIS COMMENT USED TO SAY "the kernel CANNOT read host bytes; a raw-host-ptr view
+// produces garbage", FULL STOP, AND THAT IS NO LONGER TRUE OF EVERY STAGING PLATFORM
+// (ENG-EXPERT-STREAM-DEVICE W0c, issue #1124). It is still true of a DISCRETE one, and
+// that is why this function exists and why a discrete device keeps taking it. But
+// `KqHostSliceView` twenty lines below deliberately builds exactly the raw-host-ptr
+// view the old sentence forbade, on a platform whose probed
+// `host_memory_is_device_addressable()` says its kernels can follow a host pointer —
+// a GB10, where `PageableMemoryAccess` and `Integrated` are both 1 (W0a, measured).
+// The predicate is what separates the two cases; "CUDA stages, therefore host bytes
+// are unreadable" was a conflation of two different device properties, and it is the
+// same conflation `interface.h` warns about where it says `is_unified_memory()` and
+// `is_integrated_gpu()` are the WRONG predicate for staging.
 Tensor KqResidentSlice(Dev d, const OwnedTensor& w, int64_t N, int64_t K,
                        int64_t row_off) {
   const Tensor whole = ResidentWeight(d, w);  // stage/view the WHOLE tower (cached)

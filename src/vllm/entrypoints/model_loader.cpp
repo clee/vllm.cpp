@@ -1768,16 +1768,36 @@ std::unique_ptr<LoadedEngine> LoadedEngine::FromModelDir(
       // wrong when the streaming lane serves them: then they are not staged at
       // all, and what the device pays instead is the slot arena.
       //
-      // THE THREE CONDITIONS, in this order because the last one LATCHES.
+      // THE FOUR CONDITIONS, in this order because the last one LATCHES.
       // `ResolveExpertStreamRequested()` fixes the process's answer for good, so
       // it is asked only once the platform has already said it both stages and
-      // can read host slots — which is false on every CPU load and on every
-      // discrete device, i.e. everywhere the latch would be a side effect rather
-      // than the question. The offload config is installed at the top of this
-      // function, well before here, so the latched answer is the configured one.
+      // can read host slots, and only once the resolved MODEL has said its
+      // forward reads experts through the slot seam — which is false on every CPU
+      // load, on every discrete device and on every architecture that does not
+      // stream, i.e. everywhere the latch would be a side effect rather than the
+      // question. The offload config is installed at the top of this function,
+      // well before here, so the latched answer is the configured one.
+      //
+      // THE ARCHITECTURE TERM IS NOT COSMETIC. Without it this block is keyed on
+      // the tensor NAME alone, and `_exps.weight` is what a llama.cpp MoE export
+      // writes for families this tree does not stream:
+      // `deepseek_v4_weights.cpp` and `laguna_weights.cpp` both emit it, and
+      // neither model composes `RunMoeBlock`, so neither ever reaches
+      // `KqExpertSlice`. `CheckDeviceWeightFit` has ONE production call site —
+      // this one — and every GGUF architecture arrives at it, so a `deepseek4`
+      // load on a GB10 with `VT_MOE_EXPERT_STREAM=1` would have had its whole
+      // expert set dropped from the bound and an arena added that nothing
+      // allocates. That is the UNSAFE direction, unlike the two over-counts this
+      // bound documents (#1136): it deletes a correct refusal and puts back the
+      // 26-minute load and the `cudaMalloc: out of memory` first forward that
+      // #1123 exists to prevent. The capability is declared on the factory beside
+      // the forward that implements it, and a model that does not declare it gets
+      // the whole bound.
       StreamedExpertLane lane;
       if (target.needs_weight_staging() &&
           target.host_memory_is_device_addressable() &&
+          gguf_arch.factory != nullptr &&
+          gguf_arch.factory->streams_routed_experts &&
           ResolveExpertStreamRequested()) {
         // `_exps.weight` is exactly the set `KqExpertSlice` streams: the stacked
         // `blk.<n>.ffn_{gate,up,down}_exps.weight` towers a llama.cpp MoE export

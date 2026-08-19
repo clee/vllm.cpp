@@ -4210,21 +4210,33 @@ into device memory (issue
 byte counts on both sides. That refusal is now **conditional on the lane**
 (`ENG-EXPERT-STREAM-DEVICE` W0d, issue
 [#1124](https://github.com/mudler/vllm.cpp/issues/1124)): with expert streaming
-on, and on a device whose kernels can dereference host memory, the routed-expert
-towers are not staged at all — their slices are read from the host slot store in
-place — so what has to fit is the NON-expert remainder plus the slot arena
-rather than the whole file.
+on, on a device whose kernels can dereference host memory, **and on a model
+family that actually streams its experts**, the routed-expert towers are not
+staged at all — their slices are read from the host slot store in place — so
+what has to fit is the NON-expert remainder plus the slot arena rather than the
+whole file.
 
-Two limits, stated plainly rather than left to be discovered.
+Three limits, stated plainly rather than left to be discovered.
 
 * **The device has to be probed capable, and most are not.** The condition is
   `cudaDevAttrPageableMemoryAccess AND cudaDevAttrIntegrated` — an integrated,
   unified part. A DISCRETE card answers false, keeps staging every tower and
   keeps the refusal. That is deliberate: a slot store the card cannot read is
   not a lane, and giving it one is later work on the same row.
-* **No speed claim is attached.** The measurement on the one machine that
-  answers true has not run at the time of writing; `docs/BENCHMARKS.md` carries
-  it as `PENDING`. Device access to host-resident weights on that part has a
+* **The model has to be one of the families whose forward reads experts through
+  the slot seam.** Today those are the Qwen MoE architectures —
+  `Qwen3_5MoeForConditionalGeneration`, `Qwen3_5MoeForCausalLM` and
+  `Qwen3MoeForCausalLM`, which share one MoE block. Every other architecture,
+  `DeepseekV4ForCausalLM` and `LagunaForCausalLM` included, keeps the whole
+  bound and keeps the refusal even with `VT_MOE_EXPERT_STREAM=1` set — their
+  GGUF exports carry the same `_exps.weight` tensor names, but their forwards
+  stage those towers, so charging the device for a slot arena instead would
+  under-count what the load really needs and turn a correct refusal into an
+  out-of-memory first forward.
+* **No speed claim is attached.** The decode measurement on the one machine that
+  answers capable has not run at the time of writing; `docs/BENCHMARKS.md`
+  carries it as `PENDING` and records what HAS been measured there, which is the
+  device probe itself. Device access to host-resident weights on that part has a
   recorded penalty, and this lane reads ~6.95 GB of expert bytes per token that
   way, so a CUDA arm slower than the CPU arm is a real possible outcome. Read
   the benchmarks file before assuming the GPU is the faster arm here.
