@@ -220,6 +220,53 @@ struct OwnedTensor {
 // behavior (house convention for a default-on residency change).
 void AdoptDeviceBytesAsHost(vt::Backend& backend, const OwnedTensor& w);
 
+// The alignment a HOST pointer must meet before a device kernel may be handed it
+// in place of the `Backend::Alloc` pointer it would otherwise have received.
+//
+// 256, because that is what `cudaMalloc` returns (`src/vt/cuda/cuda_backend.cu`
+// is a bare `cudaMalloc`) and the substitution is only safe while NO consumer
+// can tell the two pointers apart. Deriving a smaller number would mean
+// enumerating every kernel that ever binds a weight and being right about all of
+// them, and the enumeration does not close: the widest thing any of them
+// dereferences is a 16-byte `cp.async` granule
+// (`src/vt/cuda/cuda_matmul_nvfp4.cu`, whose shape gate assumes an aligned base
+// rather than checking it), but cuBLASLt is PROMISED 256 —
+// `CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_A_BYTES` defaults to 256 and this tree
+// never sets it (`src/vt/cuda/cuda_matmul.cu`), so the heuristic may pick an
+// algorithm on the strength of a promise a 16-aligned pointer breaks. Matching
+// the allocator instead of the consumers makes the whole question go away, and
+// it costs one memcpy that REPLACES the host->device copy it removes.
+inline constexpr size_t kDeviceAliasAlignment = 256;
+
+// Make `w.bytes` safe to hand to a device kernel directly, and say whether it
+// worked. On return `true`, `w.bytes.data()` is non-null and aligned to
+// `kDeviceAliasAlignment`. On `false` the caller must fall back to staging, and
+// nothing has changed.
+//
+// THREE CASES, and the middle one is the point (ENG-EXPERT-STREAM-DEVICE W0f,
+// issue #1299).
+//
+//   * ALREADY ALIGNED — true, and nothing is copied. A GGUF mmap borrow lands
+//     here whenever its tensor offset happens to be a multiple of 256; GGUF's
+//     `general.alignment` guarantees only 32, so this is luck rather than a
+//     contract, and the fallback below is what makes that acceptable.
+//   * OWNED AND MISALIGNED — the bytes are moved into a `kDeviceAliasAlignment`
+//     allocation and `w.bytes` is re-pointed at it, keeping the new block alive
+//     the way `AdoptDeviceBytesAsHost` keeps the device block alive. A plain
+//     `std::vector<uint8_t>` from glibc is 16-byte aligned and no more (a large
+//     block is an mmap chunk, so it lands at page+16), which is exactly what the
+//     GDN V-head reorder's ~44.6 GiB of bf16-expanded `attn_qkv` / `ssm_out`
+//     arrive as. Without this they could never be aliased and W0f would move no
+//     bytes at all.
+//   * BORROWED AND MISALIGNED — false. A borrow owns no anonymous pages: it is a
+//     clean, file-backed GGUF mapping or a tied pair's single shared expansion.
+//     Copying it would CREATE the anonymous residency this change exists to
+//     remove, and would break the tie. Staging is the right answer for it.
+//
+// Logically const, like the lazy device residency beside it: only where the
+// bytes live changes, never what they are.
+bool MakeHostBytesDeviceAliasable(const OwnedTensor& w);
+
 // Lazily-built per-weight DEVICE-RESIDENT state, OWNED BY THE WEIGHT (issue
 // #237).
 //

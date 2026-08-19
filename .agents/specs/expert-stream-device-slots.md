@@ -10,9 +10,9 @@ platform may read it.
 
 ## Now
 
-`ACTIVE`. **W0b, W0c and W0d are implemented and unit-gated on the CPU tier.
-W0a and W0e are QUEUED behind a four-hour lease on `dgx:gpu0` and neither has
-run, so no GPU number exists yet and none is claimed.**
+`ACTIVE`. **W0b, W0c, W0d and W0f are implemented and unit-gated on the CPU
+tier. W0a and W0e are QUEUED behind a lease on `dgx:gpu0`, so no GPU number
+exists yet and none is claimed.**
 
 What that means precisely, because "W0 landed" would overstate it:
 
@@ -39,6 +39,17 @@ What that means precisely, because "W0 landed" would overstate it:
   `test_gguf_device_fit_reach` (8 cases / 36) for the production reach. **The
   lane-off bound is byte-identical**, asserted three ways against literal
   values.
+* **W0f — the dense half, and the reason W0 still produced no token.** With
+  W0b-W0d in the tree the checkpoint LOADS on `--device cuda` and then exhausts
+  the box inside the first forward, zero decode steps over seven attempts
+  (issue #1299). The lane was doing its job; the DENSE weights were resident
+  twice, once as the host `OwnedTensor` and once as `ResidentWeight`'s device
+  staging copy, and on a part where device memory IS host memory that doubling
+  is what runs it out. W0f gives `ResidentWeight` the same branch W0c gave
+  `KqExpertSlice`, on the same probed predicate. Gated in the new
+  `test_resident_weight_host_addressable` (9 cases / 45 assertions) over the same
+  fake staging, host-addressable platform, plus one defect the work uncovered
+  and fixed in flow (#1320).
 * **W0a — the probe.** Submitted to `rc` FIRST, before any tree change, and
   still queued. It is the experiment that decides whether the W0b design is
   sound at all: if `cudaDevAttrPageableMemoryAccess` is 0 on GB10, the CUDA leg
@@ -220,6 +231,7 @@ Nothing is ported; there is no upstream. This is the local change map.
 | W0b | `include/vllm/platforms/interface.h`, `src/vllm/platforms/cuda.cpp`, `src/vllm/platforms/rocm.cpp` | new `virtual bool host_memory_is_device_addressable() const { return false; }` beside `is_integrated_gpu`; CUDA overrides from a probe taken once at registration next to the existing `cudaDevAttrIntegrated` probe; ROCm overrides from the `pageable_memory_access` capability it ALREADY probes (`rocm_backend.hip:96-103`) |
 | W0c | `src/vllm/model_executor/models/qwen3_5.cpp` | `KqExpertSlice` takes the slot arm under `is_cpu()` OR `host_memory_is_device_addressable()`; the slot branch builds its tensor without `ResidentWeight`; a named `VT_CHECK` in `ResidentWeight` refuses a streamed `*_exps` tower reaching device staging |
 | W0d | `include/vllm/model_executor/model_loader/gguf_device_fit.h`, `src/.../gguf_device_fit.cpp`, `src/vllm/entrypoints/model_loader.cpp` | the fit bound gains an explicit "these tensors are served by the slot lane, and the arena costs this instead" input; the loader passes it when the resolved config says streaming is on and the platform can read host slots |
+| W0f | `src/vllm/model_executor/models/qwen3_5.cpp`, `include/vllm/model_executor/models/qwen3_5_weights.h`, `src/vllm/model_executor/models/qwen3_5_weights.cpp` | `ResidentWeight` returns a tensor over `w.bytes.data()` where `host_memory_is_device_addressable()`, instead of `Alloc` + `Copy` into `w.d_dev`; `MakeHostBytesDeviceAliasable` + `kDeviceAliasAlignment` make that pointer indistinguishable from the `cudaMalloc` one it replaces; a named `VT_CHECK` refuses an i8mm-repacked weight reaching device residency on EITHER branch (#1320) |
 | W1 | `include/vllm/model_executor/expert_streamer.h`, new `include/vllm/model_executor/device_expert_slot_store.h` | `CommitSlot(int32_t, size_t)` on `ExpertSlotStore` (no-op on the host store); `DeviceExpertSlotStore` allocating slots through `vt::Backend::Alloc` with one pinned host staging slot, `SlotForWrite` returning staging and `CommitSlot` doing the H2D; correct the two false sentences in `expert_streamer.h` |
 | W2 | `expert_streamer.h`, `host_expert_slot_store.h`, `device_expert_slot_store.h`, `qwen3_5.cpp` | `virtual uint8_t* SlotForRead(int32_t)`; `Qwen35ExpertStream::store_` becomes `std::unique_ptr<ExpertSlotStore>`; `:5381` and `:5437` read through the virtual; the store is selected from the platform |
 
@@ -241,6 +253,7 @@ mutation:
 | `tests/vllm/model_executor/test_gguf_device_fit.cpp` (extend) | with the lane on, the bound excludes `*_exps` and adds the arena; with it off, the bound is byte-identical to today | make the exclusion unconditional |
 | `tests/vllm/entrypoints/test_gguf_device_fit_reach.cpp` (extend) | the loader reaches the conditional refusal from the production entry point | delete the production call site |
 | a `qwen3_5` slot-arm unit gate | the slot branch never calls `ResidentWeight`, and a streamed tower reaching device staging throws by name | remove the `VT_CHECK`; restore the `ResidentWeight` call |
+| `tests/vllm/model_executor/test_resident_weight_host_addressable.cpp` (new, W0f) | `ResidentWeight` aliases the host bytes on a host-addressable staging platform and allocates NOTHING; the aliased pointer meets `kDeviceAliasAlignment`; a discrete platform stages byte-identically to today; a MISALIGNED BORROW declines and stages rather than being copied into anonymous memory; the three refusals fire on the aliasing branch too | delete the aliasing branch; make the predicate unconditional; delete each `VT_CHECK`; drop the `borrowed()` guard; claim alignment without providing it; re-home without copying the bytes |
 
 ## Gates
 
@@ -346,6 +359,33 @@ where the wave ENDS, not where it degrades quietly into the next one.
   taking a general per-tensor staging POLICY (the shape #1136 explicitly refuses
   to invent), stop and return `NEEDS_DECISION`. The lane's tensor set is
   `*_exps` and is knowable; a general policy input is not.
+* **W0f — the dense half.** Discovered by W0e's first seven attempts and scoped
+  by them, not by reading: the checkpoint loads and then exhausts the box with
+  zero decode steps, and the four measurements in #1299 rule out the arena, the
+  prefill fallback, and a pinned mapping in turn. Give `ResidentWeight` the same
+  branch W0c gave `KqExpertSlice`.
+  **Why an alignment contract and not a kernel survey.** The staging branch is a
+  verbatim byte copy, so the ONLY thing a consumer can notice about the
+  substitution is the pointer's alignment. `cudaMalloc` returns 256; a
+  `std::vector<uint8_t>` returns 16, because a large glibc block is an mmap chunk
+  landing at page+16. Matching the allocator therefore settles every consumer at
+  once, and the alternative — deriving a floor from the widest load any kernel
+  performs — does not close: the widest hand-written one is a 16-byte `cp.async`
+  granule whose gate checks the SHAPE and assumes the base, and cuBLASLt is
+  separately PROMISED 256 by a preference default this tree never sets.
+  **Why a borrow is not re-homed.** It owns no anonymous pages. Copying a clean,
+  file-backed GGUF mapping into an aligned anonymous block would create exactly
+  the residency this row exists to remove, and would break a tied
+  `token_embd`/`lm_head` pair's single keep-alive.
+  **Gate:** `test_resident_weight_host_addressable`, mutation-proven.
+  **Stop condition:** if any weight on this path needed a device layout DIFFERENT
+  from its host bytes, that weight could not skip the copy and W0f would need a
+  per-tensor answer instead of a branch. It does not: `ResidentWeight` copies
+  bytes verbatim and returns the same dtype, shape and (dropped) marker set on
+  both arms, so there is no device layout to preserve. The layout-bearing
+  markers are handled instead — `elem_kn_repacked` and `repacked` are refused by
+  name, and `q8_0_aligned` is a load-time rewrite of the HOST bytes that no
+  Qwen3.5 path sets.
 * **W0e — the measurement.** G0-CORRECT, G0-LIVE, G0-SPEED, on one lease.
   **Stop condition:** a token mismatch, `steps == 0`, or a non-zero decode-phase
   `exhausted` delta stops the wave and voids the number.
@@ -417,5 +457,7 @@ re-derived here.
 | **G-DISCRETE: validate W1/W2 on a discrete NVIDIA GPU.** The measurement: on a device with VRAM V and `host_memory_is_device_addressable() == false`, load a GGUF whose `*_exps` towers exceed V, with the lane on, and gate (i) token-exactness against the CPU arm on the same checkpoint, (ii) decode-phase `exhausted` delta 0, (iii) peak device allocation <= non-expert remainder + arena. | No discrete NVIDIA GPU is reachable from this project. `dgx:gpu0` is a GB10 where device memory IS host memory, so a device store there exercises the plumbing and not the thing W1 exists for. Recorded rather than implied, because a gate nobody can run is not a gate. |
 | **A zero-copy device filler (GPUDirect Storage / `cuFile`).** | W1 ships the staging bounce by choice, for the reasons in its design note. The measurement that would justify replacing it — a device-arm decode where the H2D leg is a measurable fraction of fill time — does not exist until W1 has run somewhere. |
 | **The CPU arm's streaming decode figure is still VOID.** `docs/BENCHMARKS.md:8` records it as VOID (#912 F1) with a re-measure owed. | Owned by `ENG-EXPERT-STREAM` and arranged separately by the operator. It is the DENOMINATOR for G0-SPEED, not a precondition for G0-CORRECT or G0-LIVE. |
+| **The family-wide copy of this change: `include/vllm/model_executor/models/dense_attn_block.h`'s `ResidentWeight` still stages unconditionally.** The measurement: on a host-addressable staging platform, load any of the ~50 models that include that header and show peak resident bytes falling by the model's weight size, with tokens unchanged. | W0f deliberately changes only `qwen3_5.cpp`'s PRIVATE copy, which is the one that governs `Qwen3.8-2.4T-A95B UD-Q1_0` (that file kept its own helper; the header's copy is not on the Qwen3.5 path). The header's version is reached from `ModelRegistry::Forward` for every model that includes it, so extending it is not dead code — but nothing on a CPU tier can drive one of those forwards on a staging platform, so the extension would land with its reachability argued rather than gated, across ~50 architectures at once. That is a scope and a review question, not a line of code, and it gets its own row. |
+| **The missing CPU-platform gate on `p.quant_repack` itself ([#1320](https://github.com/mudler/vllm.cpp/issues/1320)).** The measurement: `elem_kn_repack` is resolved with `CurrentPlatform().device_type() == kCPU` and `quant_repack` is not, so a device load can still perform a CPU-only transform and be caught afterwards instead of never doing it. | W0f fixes the CONSEQUENCE in flow — a named refusal on both arms of `ResidentWeight`, red-first and mutation-proven — because that is the small and clear part. Moving the gate into the loader policy changes what a GGUF load DOES on a device rather than what it refuses, which is `QUANT-GGUF-KEEPQ-LOADER`'s semantics and needs its own red-first evidence. |
 | **`.agents/specs/expert-streaming.md`'s `## Owed` entry for #1124 still names no owning row ID.** | Not edited here on purpose; PRs #1200 and #1216 both edit that file. One-line follow-up once both land. |
 | **W1 may land UNREACHED if it is split from W2.** | The recommendation is one pull request. If a split is chosen, the commit body and the PR body must name what is unreached and name W2 as the owning wiring, per `## Nothing lands dead`. |

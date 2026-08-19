@@ -123,6 +123,67 @@ void ReleaseDirectUploadSource(const OwnedTensor& w) {
 
 }  // namespace
 
+namespace {
+
+// Drop the resident anonymous pages of `[p, p + nb)` without touching the
+// allocator's boundary metadata. Interior WHOLE pages only, for the reason
+// spelled out in `ReleaseHost` above: glibc's `free()` alone often leaves the
+// pages resident on the sbrk arena's free list, and the whole subject here is
+// the RSS.
+void DropResidentInteriorPages(const uint8_t* p, size_t nb) {
+#if defined(__unix__) || defined(__APPLE__)
+  if (p == nullptr || nb == 0) return;
+  const long ps_l = ::sysconf(_SC_PAGESIZE);
+  const auto ps = static_cast<uintptr_t>(ps_l > 0 ? ps_l : 4096);
+  const auto begin = reinterpret_cast<uintptr_t>(p);
+  const uintptr_t end = begin + nb;
+  const uintptr_t page_begin = (begin + ps - 1) & ~(ps - 1);
+  const uintptr_t page_end = end & ~(ps - 1);
+  if (page_end > page_begin) {
+    ::madvise(reinterpret_cast<void*>(page_begin),
+              static_cast<size_t>(page_end - page_begin), MADV_DONTNEED);
+  }
+#else
+  (void)p;
+  (void)nb;
+#endif
+}
+
+}  // namespace
+
+bool MakeHostBytesDeviceAliasable(const OwnedTensor& w) {
+  // Nothing to alias. The caller refuses this by name rather than handing a
+  // kernel a null pointer; see ResidentWeight.
+  if (w.bytes.empty()) return false;
+  if (reinterpret_cast<uintptr_t>(w.bytes.data()) % kDeviceAliasAlignment == 0)
+    return true;
+  // A borrow owns no anonymous pages, so re-homing it would ADD residency
+  // instead of removing it, and a tied pair's shared expansion must keep its one
+  // keep-alive. Same reasoning, and the same answer, as `ReleaseHost`'s and
+  // `AdoptDeviceBytesAsHost`'s borrowed branches.
+  if (w.bytes.borrowed()) return false;
+
+  auto& self = *const_cast<OwnedTensor*>(&w);
+  const size_t nb = self.bytes.size();
+  // Over-aligned `operator new` rather than `aligned_alloc`/`posix_memalign`:
+  // it is the one spelling that is standard C++17 AND available on MSVC, which
+  // this tree still compiles for, and it does not require the size to be a
+  // multiple of the alignment.
+  void* p = ::operator new(nb, std::align_val_t{kDeviceAliasAlignment});
+  std::memcpy(p, self.bytes.data(), nb);
+  // ORDER: release the OLD pages while they are still mapped, then re-point.
+  // The assignment below destroys the vector that owns them, and madvise'ing a
+  // range after it has been unmapped is at best a silent no-op and at worst
+  // discards whatever mapped into the hole first — the same trap
+  // `AdoptDeviceBytesAsHost` documents at length.
+  DropResidentInteriorPages(self.bytes.data(), nb);
+  std::shared_ptr<const void> keep(static_cast<const void*>(p), [](const void* q) {
+    ::operator delete(const_cast<void*>(q), std::align_val_t{kDeviceAliasAlignment});
+  });
+  self.bytes = OwnedBytes::Borrow(static_cast<const uint8_t*>(p), nb, std::move(keep));
+  return true;
+}
+
 void AdoptDeviceBytesAsHost(vt::Backend& backend, const OwnedTensor& w) {
   if (w.d_dev == nullptr) return;
   // ENG-LOAD-DIRECT-UPLOAD: a direct-upload borrow is the ONE borrow that may be
