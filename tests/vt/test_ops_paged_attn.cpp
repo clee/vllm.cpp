@@ -658,6 +658,17 @@ TEST_CASE("paged_attention validates shapes/args") {
     CHECK_NOTHROW(
         vt::PagedAttention(qq, tp, tq, tkc, tvc, tbt, tsl_fit, tqsl, fits));
   }
+  // A PADDED ROW IS NOT A CALLER MISTAKE. Request 1 carries no query tokens, so
+  // no kernel reads its seq_lens entry and its over-long context addresses
+  // nothing. Refusing on it would reject a batch that runs correctly today
+  // (#1394 measured this).
+  {
+    Tensor tq = F32(q, {1, 2, D}), tp = F32(out, {1, 2, D});
+    std::vector<int32_t> bt2 = {0, 0}, sl2 = {1, 99}, qsl2 = {0, 1, 1};
+    Tensor tbt2 = I32(bt2, {2, 1}), tsl2 = I32(sl2, {2}), tqsl2 = I32(qsl2, {3});
+    CHECK_NOTHROW(vt::PagedAttention(qq, tp, tq, tkc, tvc, tbt2, tsl2, tqsl2,
+                                     PagedAttentionArgs{1.0f, true}));
+  }
 }
 
 // ===========================================================================

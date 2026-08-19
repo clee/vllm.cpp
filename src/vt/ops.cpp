@@ -3619,7 +3619,13 @@ void PagedAttention(Queue& q, Tensor& out, const Tensor& query, const Tensor& k_
     // unmeasurable beside the layer's GEMMs, and the arm that actually caught
     // #1390, whose batch left max_seq_len unset.
     const int32_t* seq_lens_host = seq_lens.Ptr<int32_t>();
+    const int32_t* qsl_host = query_start_loc.Ptr<int32_t>();
     for (int64_t r = 0; r < num_reqs; ++r) {
+      // Only the requests the token loop VISITS. A padded or inert row carries
+      // no query tokens, so no kernel ever reads its `seq_lens` entry, and
+      // refusing on one would reject a batch that runs correctly today. That
+      // qualification is #1394's measurement, not this row's.
+      if (qsl_host[r + 1] - qsl_host[r] <= 0) continue;
       VT_CHECK(seq_lens_host[r] >= 0 && seq_lens_host[r] <= addressable_positions,
                "paged_attention: seq_lens[" + std::to_string(r) + "] == " +
                    std::to_string(seq_lens_host[r]) + " exceeds the " +
