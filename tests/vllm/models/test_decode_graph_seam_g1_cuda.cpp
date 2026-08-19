@@ -952,7 +952,7 @@ std::vector<int32_t> SpecIota(int32_t n, int32_t base) {
 // drives two spec shapes; if a SINGLE spec shape cannot capture on this device
 // at all, that case's failure says nothing about the ring key. This one drives
 // one shape, one driver, from a clean process.
-TEST_CASE("G1 CUDA W6: a SPEC shape captures and replays bit-exactly against eager (#1380)") {
+TEST_CASE("G1 CUDA W6: a SPEC shape captures on BOTH ring slots and replays (#1380)") {
   if (!HasCuda()) {
     MESSAGE("SKIP: no CUDA backend registered; G1 needs a leased device");
     return;
@@ -967,44 +967,58 @@ TEST_CASE("G1 CUDA W6: a SPEC shape captures and replays bit-exactly against eag
   CudaGdnCachePool graph_cache(b, q, c, /*num_blocks=*/4, /*block_size=*/16,
                                /*spec_mql=*/3);
   vllm::Qwen3_5DenseDecodeGraph graphed(w, c, q, /*max_num_reqs=*/4);
-  // THE EAGER ARM IS THE MODEL'S OWN `ForwardDevice`, NOT A SECOND DRIVER, and
-  // the difference is not stylistic. The five cases above select eager with
-  // `max_num_reqs == 0`, which works because `PadToCaptureSize` then returns -1.
-  // A SPEC step never pads -- `S = spec_step ? B : PadToCaptureSize(B)` -- so a
-  // driver built with `max_num_reqs == 0` captures the spec shape just like the
-  // graphed one, and the "eager" arm silently becomes a second capturing driver
-  // competing for the same pool. `Qwen3_5DenseModel::ForwardDevice` is the exact
-  // body the driver's own disabled path runs (`DenseForwardBody` +
-  // `WrapDeviceLogits`), so the two arms stay one binary on one device.
+  const int64_t rows = 6;  // 2 requests x 3 verified tokens each
+  const int64_t width = c.vocab_size * rows;
+
+  // THE EAGER ARM RUNS TO COMPLETION FIRST, AND THE ORDER IS THE MEASUREMENT.
+  // Both arms draw from ONE process-wide `DevicePool`, and #1380 is a pool-DEPTH
+  // defect: the capture starves because the free list is one block short of what
+  // the forward needs live at once. An eager reference interleaved BETWEEN the
+  // graph arm's steps deepens that free list on the graph arm's behalf and hides
+  // the defect completely -- measured on `thor:gpu0`, the interleaved shape of
+  // this case passed 1240 assertions at the un-fixed head while the driver alone
+  // threw. Each arm owns its own paged KV and GDN recurrent state, so running
+  // one after the other is the same computation with the pool left alone.
+  //
+  // The eager arm is `Qwen3_5DenseModel::ForwardDevice` rather than a second
+  // driver built with `max_num_reqs == 0`. That selector picks eager for the five
+  // decode cases above because `PadToCaptureSize` returns -1, but a SPEC step
+  // never pads (`S = spec_step ? B : PadToCaptureSize(B)`), so such an arm
+  // captures too. `ForwardDevice` is the exact body the driver's own disabled
+  // path runs (`DenseForwardBody` + `WrapDeviceLogits`).
+  std::vector<std::vector<float>> eager(5);
+  for (int step = 0; step < 5; ++step) {
+    eager[static_cast<size_t>(step)] =
+        Read(b, q,
+             vllm::Qwen3_5DenseModel::ForwardDevice(
+                 SpecIota(6, 10), SpecIota(6, 0), SpecAttnMeta(2, 3, 0),
+                 SpecGdnMeta(2, 3), eager_cache.attn_kv, eager_cache.gdn_state,
+                 w, c, q),
+             width);
+  }
 
   // Five steps, each recorded rather than aggregated, because WHICH step is
   // refused is how #1380 was located. A spec step always takes the two-slot
   // parity ring (`dbuf = impl_->dbuf || spec_step`), so the sequence is: slot 0
   // cold, slot 1 cold, slot 0 CAPTURES, slot 1 CAPTURES, slot 0 REPLAYS. A
   // replay is unreachable unless BOTH slots capture.
-  const int64_t rows = 6;  // 2 requests x 3 verified tokens each
   std::vector<std::string> failed(5);
   std::vector<int> captured_after(5, -1);
   size_t total = 0;
   for (int step = 0; step < 5; ++step) {
-    std::vector<float> e, g;
+    std::vector<float> g;
     try {
-      e = Read(b, q,
-               vllm::Qwen3_5DenseModel::ForwardDevice(
-                   SpecIota(6, 10), SpecIota(6, 0), SpecAttnMeta(2, 3, 0),
-                   SpecGdnMeta(2, 3), eager_cache.attn_kv,
-                   eager_cache.gdn_state, w, c, q),
-               c.vocab_size * rows);
       g = Read(b, q,
                graphed.Step(SpecIota(6, 10), SpecIota(6, 0), SpecAttnMeta(2, 3, 0),
                             SpecGdnMeta(2, 3), graph_cache.attn_kv,
                             graph_cache.gdn_state),
-               c.vocab_size * rows);
+               width);
     } catch (const std::exception& ex) {
       failed[static_cast<size_t>(step)] = ex.what();
     }
     captured_after[static_cast<size_t>(step)] = graphed.captured() ? 1 : 0;
-    if (failed[static_cast<size_t>(step)].empty()) total += CompareStep(step, e, g);
+    if (failed[static_cast<size_t>(step)].empty())
+      total += CompareStep(step, eager[static_cast<size_t>(step)], g);
   }
   for (int step = 0; step < 5; ++step) {
     MESSAGE("spec step " << step << ": captured="
@@ -1015,13 +1029,11 @@ TEST_CASE("G1 CUDA W6: a SPEC shape captures and replays bit-exactly against eag
   // BOTH ring slots capture, and step 4 REPLAYS slot 0. Before #1380 was fixed
   // step 3 -- the SECOND slot's capture -- threw `cudaMalloc: operation not
   // permitted when stream is capturing`, and step 4 then found the queue
-  // poisoned (`embedding: operation failed due to a previous error during
-  // capture`) without opening a scope at all.
+  // poisoned without opening a scope at all.
   CHECK(captured_after[2] == 1);
   CHECK(captured_after[3] == 1);
   CHECK(captured_after[4] == 1);
   CHECK(graphed.replay_count() >= 1);
-  MESSAGE("G1 W6 spec shape on CUDA: 5 steps x " << c.vocab_size * rows
-          << " logits, " << total << " differing, " << graphed.replay_count()
-          << " replays");
+  MESSAGE("G1 W6 spec shape on CUDA: 5 steps x " << width << " logits, " << total
+          << " differing, " << graphed.replay_count() << " replays");
 }
