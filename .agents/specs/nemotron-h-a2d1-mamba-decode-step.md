@@ -233,14 +233,19 @@ already produced one void number on this row.
 
 ## Now
 
-Implementation and T1/T2/T3 committed. T4 owes a leased-GPU run: `dgx:gpu0` for
-`121a`, `thor:gpu0` for the sm_110 correctness A/B.
+T1, T2 and T3 committed and green. **T4 MET on `thor:gpu0` (sm_110): the A3 gate
+reads `96/96 mode=decode STRICT PASS` on the single-step arm**, with every
+decode step launching 23 state-update rows and 0 chunk scans, 0 gathers and 0
+scatters. The `dgx:gpu0` sm_121a leg and the same-binary A/B delta are still
+owed.
 
 ## Owed
 
-- T4 on a leased GPU, both arms, with the decode-window sample count reported
-  beside every fraction. Owned by this row, tracked by
-  [#1311](https://github.com/mudler/vllm.cpp/issues/1311).
+- The `dgx:gpu0` sm_121a leg of T4, and the ON/OFF A/B delta on one binary. The
+  sm_110 leg is MET (see `## Now`); dgx was queued behind a two-hour job.
+  Owned by this row, tracked by
+  [#1311](https://github.com/mudler/vllm.cpp/issues/1311). NO vLLM ratio may be
+  quoted for arch 110: the 0.014369 s reference is GB10's.
 - The batched decode arm (`nd > 1`) is written and unreachable while G-SAFE pins
   `num_reqs <= 1`; A2-B owns lifting that, and the code is indexed rather than
   hardcoded so the lift is a count change.

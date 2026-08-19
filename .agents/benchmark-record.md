@@ -24583,9 +24583,61 @@ conv, about **283 MiB/token**. Neither figure is measured and the direction of
 the change does not depend on which is right, so the smaller one is carried and
 the difference is stated.
 
+### The A3 e2e token gate — MEASURED, and it is the acceptance condition
+
+`thor:gpu0` (sm_110) inside an `rc` lease, `ARCH=110`, tree `68a0ff378`, real
+`NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4` at `/workspace/a3/ckpt-stage`,
+device mamba arm ON, `VT_NEMOTRON_H_MAMBA_DECODE_STEP=1` (the default):
+
+```
+RC[a3 on]=0
+[nemotron-h] engine loaded in 654.7s
+[nemotron-h] TOKEN MATCH: 96/96 over 3 prompt(s) (full rows=3, short rows=0, mode=decode)
+[nemotron-h] STRICT PASS
+on: tokens compared 96 ; matched 96
+reference-tier lines in on: 0
+```
+
+The `reference-tier` count matters: the portable reference tier is numerically
+CORRECT, so a pass obtained on it is invisible in the tokens and only that line
+separates them.
+
+### Which kernels the decode steps LAUNCHED — the reachability evidence
+
+Every decode step of that run, read off the `vt::` call sites via
+`VT_NEMOTRON_H_ARM_TRACE`:
+
+```
+[NH-DIAG] ARM step T=1 nd=1 np=0  state_update_rows=23 chunk_scan_calls=0
+                                  conv_update_rows=23 conv_fwd_calls=0
+                                  gathers=0 scatters=0
+ARM lines total: 96
+ARM lines with a DECODE row: 93
+ARM lines with a PREFILL row: 3
+```
+
+23 is the mamba layer count and `nd=1` is one decode row, so that is ONE
+state-update row per mamba layer, ZERO chunk scans, ZERO gathers and ZERO
+scatters on a decode step. 96 forwards = 3 prefills + 93 decodes over 3 prompts
+x 32 tokens. `vt::Mamba2StateUpdate` went from zero callers under `src/vllm/` to
+23 launches per decoded token through a production entry point.
+
+### The decode window — SAMPLED ON THE DECODE ONLY
+
+```
+on: decode window 74.511 s (the engine load is OUTSIDE it)
+on: engine load 654.7 s, excluded
+on: GPU busy in 244 of 555 DECODE samples = 43.96%
+on: per output token 0.776159 s
+```
+
+**NO vLLM ratio is quoted for arch 110.** The 0.014369 s reference is GB10's,
+and a ratio against it would compare two pieces of silicon. The only admissible
+comparison is the ON/OFF A/B of this same binary on this same box.
+
 ### Evidence
 
 `tests/vt/test_ops_mamba2_state_update.cpp` (the two driver-group cases),
 `tests/vllm/models/test_nemotron_h_paged_forward.cpp` (the arm recorder, driven
 through `ModelRegistry::Forward`), `scripts/nemotron-h-a2d1-gpu-gate.sh` (the
-owed GPU recipe).
+recipe), and the Thor run logs under `/workspace/a2d1-thor/`.
