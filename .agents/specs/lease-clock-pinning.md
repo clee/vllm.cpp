@@ -555,7 +555,9 @@ states it as a delta over a named baseline rather than as a bare count.
 
 - `tests/tools/test_gpu_clock_state.py` green. The baseline is **63** cases at
   `a4efbfb15`; the expected head count is **70**, being 63 minus 0 removed plus 7
-  added, with 6 of the 63 rewritten in place under the same names. Report the
+  added, with 6 of the 63 rewritten in place under the same names — or **71** if
+  `test_the_threshold_is_inclusive_on_both_sides` has to split into one case per
+  term, which §The cases this change invalidates leaves open. Report the
   before and after counts explicitly. A count that does not move is a failure,
   not a pass; so is a count that moves without the named cases in §The cases this
   change invalidates having been touched, because that would mean the old
