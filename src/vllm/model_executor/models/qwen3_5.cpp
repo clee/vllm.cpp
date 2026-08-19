@@ -10350,7 +10350,9 @@ ForwardLogits Qwen3_5DecodeGraph::Step(
       // ring slot's capture died in `dconv`, the GDN causal-conv output
       // (`GdnBlockPaged`, this file), whose [T, conv_dim] lands in the SAME class
       // as the retained [S, vocab] logits at the gate's shape -- and a cudaMalloc
-      // inside a captured region aborts the capture.
+      // inside a captured region aborts the capture. An alloc-and-free grows the
+      // pool only when that class's free list is EMPTY, so with one block free
+      // and TWO needed live at once it grew nothing at all.
       //
       // So the driver stops naming a tensor and asks the pool for the demand the
       // EAGER step at this shape actually made (`s.demand`, taken at the end of
@@ -10899,7 +10901,9 @@ ForwardLogits Qwen3_5DenseDecodeGraph::Step(
       // ring slot's capture died in `dconv`, the GDN causal-conv output
       // (`GdnBlockPaged`, this file), whose [T, conv_dim] lands in the SAME class
       // as the retained [S, vocab] logits at the gate's shape -- and a cudaMalloc
-      // inside a captured region aborts the capture.
+      // inside a captured region aborts the capture. An alloc-and-free grows the
+      // pool only when that class's free list is EMPTY, so with one block free
+      // and TWO needed live at once it grew nothing at all.
       //
       // So the driver stops naming a tensor and asks the pool for the demand the
       // EAGER step at this shape actually made (`s.demand`, taken at the end of
