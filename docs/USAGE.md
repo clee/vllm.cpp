@@ -139,6 +139,32 @@ requested value — but it sent a contributor looking in the wrong place
 ([#168](https://github.com/mudler/vllm.cpp/issues/168)). The `build.ninja`
 gencode line remains the ground truth if you want to double-check.
 
+### FlashAttention-2 is used only where the build compiled it
+
+`--help` will not tell you which architectures your binary carries, so the engine
+now checks for itself. At configure time the build records the exact architecture
+list it hands nvcc for the FlashAttention-2 kernels, and at run time the CUDA
+platform compares your device against that list. Only a match takes the bf16 FA2
+attention path; anything else falls back to the f32 graph-captured path, which
+produces correct output and is slower.
+
+The configure step prints the list, so you can see it before you run:
+
+```text
+-- CUDA FA2 compiled-arch manifest: [121a]
+```
+
+An empty list means FlashAttention-2 was not compiled at all — either
+`-DVLLM_CPP_FLASH_ATTN=OFF`, or no CUTLASS headers, or none of your requested
+architectures has an FA2 kernel body.
+
+This matters because `VLLM_CPP_CUDA_ARCHITECTURES` defaults to `121a` alone. A
+default build moved to a different card previously took the FA2 path with no code
+for that device; it now takes the fallback. **If FlashAttention-2 seems to have
+switched off after you changed cards, rebuild with your architecture in
+`VLLM_CPP_CUDA_ARCHITECTURES`** — the manifest is telling you the truth about the
+binary rather than about the GPU ([#1357](https://github.com/mudler/vllm.cpp/issues/1357)).
+
 ### A DISABLED feature removes its kernels, not the ops that do not need it
 
 `cutlass-fp8: DISABLED` means this build has no CUTLASS sm120 FP8 **GEMM**. It
@@ -733,6 +759,47 @@ file, and what a reader saw was the *opposite* of the truth: a refusal naming a
 block-wise FP8 scale tensor the checkpoint had never contained
 ([#1256](https://github.com/mudler/vllm.cpp/issues/1256)). A message that blames
 the wrong side costs more than the failure does.
+
+### A refusal that names the attention backend, and what it cannot tell you
+
+Starting an engine resolves an attention backend for each KV-cache group, and
+that backend is now asked whether it can serve the request before it is chosen.
+When none of the backends this build registers can, the engine refuses at
+initialization rather than later, and the message names every candidate with
+every reason it lost:
+
+```text
+No valid attention backend for device type 1 from
+{FLASH_ATTN: [head_size not supported, block_size not supported]}
+(use_mla=false, use_sparse=false)
+```
+
+The reason strings are vLLM's own, so a refusal here and a refusal from the
+reference engine read the same. `head_size`, `block_size` and the KV-cache dtype
+come from the geometry the engine has just resolved for your checkpoint, so a
+refusal is about that checkpoint on this build.
+
+**What this check cannot tell you.** It reports what a backend *claims*, never
+what your binary contains and never whether the kernel will launch. A backend
+whose declared floor is compute capability 8.0 is accepted on any newer GPU, even
+when the build carries no compiled code for that GPU.
+
+That is a real failure mode, not a hypothetical one, and it surfaces as a launch
+error rather than as the refusal above. It has been measured on a GB10 board
+(compute capability 12,1) against the reference engine, same wheel and same
+prompt: asking for its `FLASHINFER` backend generates text and exits cleanly,
+while the default — which resolves `FLASH_ATTN`, the reference engine's *first*
+preference for that device — dies at the first attention call with
+`cudaErrorUnsupportedPtxVersion`. The first preference could not run and the
+second could, and no capability check on either side could tell them apart.
+
+So if a run dies inside attention rather than being refused before it starts,
+the backend was accepted on a claim your build does not honour. Confirming which
+architectures a build actually targets is a separate question, answered under
+"Confirming which CUDA architecture a build targets" above. Tracked as
+[#1332](https://github.com/mudler/vllm.cpp/issues/1332).
+
+Selecting a backend by name is not exposed yet; the engine always resolves one.
 
 ### Architectures that resolve but refuse to run
 
