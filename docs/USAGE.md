@@ -3968,12 +3968,17 @@ Two limits, stated plainly rather than left to be discovered.
   unified part. A DISCRETE card answers false, keeps staging every tower and
   keeps the refusal. That is deliberate: a slot store the card cannot read is
   not a lane, and giving it one is later work on the same row.
-* **No speed claim is attached.** The measurement on the one machine that
-  answers true has not run at the time of writing; `docs/BENCHMARKS.md` carries
-  it as `PENDING`. Device access to host-resident weights on that part has a
-  recorded penalty, and this lane reads ~6.95 GB of expert bytes per token that
-  way, so a CUDA arm slower than the CPU arm is a real possible outcome. Read
-  the benchmarks file before assuming the GPU is the faster arm here.
+* **The load now succeeds and the generation does not, so there is still no
+  speed claim.** The measurement ran on the one machine that answers true
+  (GB10, 2026-08-18) and it split: `--device cuda` loads this checkpoint in
+  255-272 s, which it could not do before, and then exhausts the machine inside
+  its first forward without emitting a token
+  ([#1299](https://github.com/mudler/vllm.cpp/issues/1299)). The slot arena is
+  measurably not the cause — a 64-slot 0.15 GiB arena fails exactly where an
+  8000-slot 18.55 GiB one does — so raising or lowering
+  `VT_MOE_EXPERT_STREAM_SLOTS` will not get you a token. **Use `--device cpu`
+  for this checkpoint today.** That arm serves it at a steady 11.05 s/token.
+  Read `docs/BENCHMARKS.md` before assuming the GPU is the faster arm here.
 
 ### The same thing as config, and which one wins
 
