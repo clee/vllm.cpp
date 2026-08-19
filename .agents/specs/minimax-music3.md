@@ -1103,6 +1103,25 @@ under `--speech-device 1`, which §13 routes through `vt::MatmulBT`,
 `vt::Add` with device-resident weights. Every profile number quoted above is the
 CPU arm's and still describes it exactly.
 
+**Where the vocoder stands after §18, so this section and `docs/STATUS.md` agree
+rather than one of them being newer.** The row does NOT move lifecycle state —
+MiniMax-Music3 stays `ACTIVE` — so by AGENTS.md's trigger table neither this line
+nor the STATUS row was owed: both are tied to a lifecycle move, and only
+`docs/BENCHMARKS.md` is owed by a new accepted measurement. They are written
+anyway, and written TOGETHER, because the STATUS row's notes cell carries this
+model's measured wins and would otherwise name the depth decoder's and not the
+vocoder's. That mismatched pair was a review finding on this row (2026-08-19),
+and the resolution recorded here is the pair, not the trigger.
+
+`vocoder.decode_window` was the term §16.7 named as the largest one no row owned.
+It is owned now, and measured: **1.36-1.44x** on Thor's 14 threads and **2.16x**
+per core (§18.8a, §18.8b), bit-identical output on every length. Next on this
+model, in the order §18.9 argues for: the vocoder's PARALLEL DECOMPOSITION, which
+§18.8b measured as the cap rather than assuming one; the CUDA-vs-CPU `memcmp`
+arm, which needs a box carrying `nvcc`; the e2e pair on the real checkpoint; and
+the f64-throughput explanation of the device arm, which §18.2 now carries as an
+inference rather than a finding.
+
 ---
 
 ## 10. The parity sweep, the music-only server, and the weights record (#672)
@@ -3720,19 +3739,69 @@ for (int64_t t = 0; t < length; ++t) {
 For a MiniMax-Music3 residual unit that is `in_per_group * kernel = 384 * 7 =
 2688` **strictly dependent** f64 additions per output element. The loop has no
 instruction-level parallelism and cannot be vectorised at any width, because
-every add waits on the previous one. The measured rate is exactly what a
-dependent `fadd` chain predicts and nothing else does: **1.7-2.0 GMAC/s on one
-core**, ~2.8-3.0 cycles per multiply-accumulate on a 5.0 GHz Zen 5 whose `fadd`
-latency is 3.
+every add waits on the previous one. Its measured rate on one core of the 20-core
+Zen 5 is **1.76-1.86 GMAC/s**: 1.86 / 1.82 / 1.84 at ranks 8 / 16 / 32 and 1.7622
+at rank 1024 for the depth decoder's loop of the same shape
+(`.agents/benchmark-record.md`, the MUSIC3-DEPTH entry), and **1.827 GMAC/s** for
+THIS loop at `in_per_group = 384`, `kernel = 7` under GCC 13.3 `-O2
+-ffp-contract=off`, pinned, measured by the fresh review of this row on
+2026-08-19.
 
-The CUDA provider loses for a DIFFERENT mechanism with the SAME cause. It gives
-each output cell its own thread, so it is not latency-bound — there are millions
-of independent chains. It is f64-RATE bound, and Thor's consumer Blackwell runs
-fp64 at a small fraction of its fp32 rate. §13.10 already isolated the
-signature and stated it as a hypothesis: a fixed staging overhead would punish
-the smallest stage far more than the largest, and the ratio is flat instead.
-The two mechanisms are different; the property they both turn on is that the
-arithmetic is f64 and arranged as one accumulator per output cell.
+**A correction, because the sentence this section first carried was not
+self-consistent** (review finding, 2026-08-19). It read "1.7-2.0 GMAC/s on one
+core, ~2.8-3.0 cycles per multiply-accumulate on a 5.0 GHz Zen 5 whose `fadd`
+latency is 3", and three of those numbers cannot all be true at once: 2.0 GMAC/s
+at 5.0 GHz is **2.5** cycles per MAC rather than 2.8-3.0, and a strictly
+dependent chain of latency-3 `fadd`s cannot exceed **5.0 / 3 = 1.67 GMAC/s** at
+all, so the top of the quoted band sat above its own stated ceiling.
+
+**The cycles-per-MAC figure is WITHDRAWN rather than corrected, because this box
+cannot supply the clock it converts through.** The measurement host is a KVM
+guest on a Ryzen 9 9950X3D; `/proc/cpuinfo` reports a nominal 4291.948 MHz,
+`/sys/devices/system/cpu/cpu0/cpufreq/` does not exist in the guest, and
+`perf_event_paranoid` is 4, so the boost clock during a timed loop is not
+observable from inside it and neither is a cycle count. Every cycles-per-MAC
+number this section quoted was therefore a conversion through an ASSUMED clock,
+which is where the inconsistency came from. What the conversion would give across
+the plausible range, stated so the next reader does not redo it: 1.827 GMAC/s is
+2.35 cycles per MAC at the reported 4.29 GHz, 2.74 at 5.0, and 3.12 at the "5.7
+GHz-class" this record uses elsewhere for the same box.
+
+**What the ceiling implies, which is the part worth keeping.** A dependent chain
+of latency-`L` adds cannot beat `clock / L` MACs per second, so the measured
+1.76-1.86 GMAC/s bounds `L` at or below ~2.4 cycles at the clock the guest
+reports, and clears a latency-3 ceiling at any clock below 5.3 GHz. Either the
+add latency on this core is under 3 or the core was boosting above 5.3 GHz, and
+this box can distinguish neither. **The mechanism does not rest on that
+constant.** What supports it is that breaking the chain — and changing nothing
+else about the arithmetic, its order, or its width — is worth **2.16x per core**
+(§18.8b). A dependency is the only property that intervention removed.
+
+The CUDA provider loses for a DIFFERENT mechanism, and **the mechanism is an
+INFERENCE rather than a finding** — stated that way here because the first
+version of this paragraph asserted it flat, and a fresh review was right to
+refuse it (2026-08-19).
+
+What is CHECKED, by reading the source: `src/vt/cuda/cuda_conv1d_general.cu`'s
+`Conv1dKernelCudaImpl` gives each output cell its own thread and one f64
+accumulator, and pins every operation with `__dadd_rn` / `__dmul_rn`. So the
+device arm is not latency-bound the way the host loop is — there are millions of
+independent chains — and its arithmetic is f64 throughout.
+
+What is MEASURED: §13.10's per-stage device-vs-host ratios are flat at 0.37-0.40x
+across a 150x span of work. That rules out a FIXED overhead, which would punish
+the smallest stage far more than the largest, and it rules out very little else.
+
+What is INFERRED, and owed: that the residual is f64 THROUGHPUT — that Thor's
+consumer Blackwell runs fp64 at a small fraction of its fp32 rate and the kernel
+is sitting on that limit. Nothing here measured it. No fp64:fp32 ratio was taken
+on the box, no occupancy or pipe-utilisation counter was read, and no CUDA A/B
+was run against an f32-accumulate arm. It is the explanation this row offers, not
+a result it establishes, and §18.9 carries it as owed.
+
+The two arms' mechanisms are different either way. The property they both turn on
+— and the only one this row changes on the host — is that the arithmetic is f64
+and arranged as one accumulator per output cell.
 
 ### 18.3 The f64 stays, and it does not have to move
 
@@ -3791,6 +3860,19 @@ difference on the same source: with a runtime-bounded accumulate loop the
 speedup is 1.1-1.8x at `-O2` and 5.1-5.4x at `-O3`; with the constant-trip fast
 path it is 5.2-5.8x at `-O2` and 5.3-6.5x at `-O3`.
 
+**Every one of those six figures is the KERNEL alone**, taken on `Conv1dKernel`
+at the vocoder's stage geometries, and none of them is what the decode window
+does. The window is not only this convolution: it also runs
+`vt::ConvTranspose1d` (§18.5 prices it far lower), the alias-free activations,
+the strided downsamples that keep the shipped gather, and the threadpool and
+allocation around all of them. The gap between the two quantities is measured
+rather than asserted — the same review that asked for this clause built the
+project at `-O2` and timed the window single-threaded, and got **2.56x and
+2.67x** where the kernel gives 5.2-5.8x. §18.8a's **1.36-1.44x** is the same
+quantity again at `Release` on 14 threads, and §18.8b's **2.16x** is that window
+on ONE thread. A kernel number applied to the window overstates the win by
+roughly a factor of two, so the two are never quoted interchangeably here.
+
 `stride > 1` keeps the shipped arithmetic path. The MiniMax-Music3 vocoder's
 `Conv1d` calls are all stride 1; the strided caller is the alias-free downsample
 in `vocoder1d::AliasFreeActivation1d::Apply`, which is depthwise
@@ -3844,10 +3926,42 @@ position clamp:
 - a `length` that is not a multiple of the tile, and a `length` BELOW one tile.
 - `dilation > 1` combined with a tile boundary.
 - the catastrophic-cancellation case §13.5 built, at a length that spans several
-  tiles, so an f64 accumulator stored through an f32 cannot hide a reordering.
+  tiles, so an f64 accumulator stored through an f32 cannot hide a reordering —
+  **once per SWEEP AXIS, because one case covers one axis and not the other.**
 
 Every one of them is asserted against a verbatim in-test copy of the pre-change
 kernel, bitwise.
+
+**The two axes, and why the count is two rather than one** (review finding,
+2026-08-19). The sweep this row hoists out of its accumulators is
+`(ic ascending, k ascending)`, and reversing EITHER loop is a genuine
+reassociation. The cancellation case as first written had teeth along `ic` ONLY,
+by construction: it pairs input CHANNELS
+(`w[(oc*cin+1)*kernel+k] = w[(oc*cin+0)*kernel+k]` with `x[0] = +2^40` and
+`x[1] = -2^40`), and its own teeth self-check reverses `ic` and nothing else.
+Measured on this tree: with the kernel's `k` loop reversed and nothing else
+changed, `test_ops_conv1d_general` reported 9/375, `test_host_parallel` 8/877,
+`test_vocoder1d` 10/58 and `test_bigvgan` 6/65, all `SUCCESS!` and all rc 0 —
+binary sha256 `c4bb0e76...` against the baseline `760061c5...`, so the mutation
+was in the binary that ran and the green was not a stale artifact.
+
+The hole is OLDER than this row — the pre-change kernel with its `k` sweep
+reversed is green too — so it is not a regression this row introduced. It is
+still this row's to close, because this row is what turns that order into a
+load-bearing guarantee. `tests/vt/test_ops_conv1d_general.cpp` therefore carries
+a SECOND cancellation case, "holds its TAP order", which pairs +2^40 against
+-2^40 across `k` inside one input channel held constant along its length, and
+whose teeth check reverses `k` alone. With that case present the same mutation
+fails 1552 of 1576 cells in exactly that case and nowhere else (10 cases / 379
+assertions, 1 failed, binary `eb25d992...`), and the restored tree hashes back to
+`f84d3a87...`. `SerialConv1d` grew a `reverse_k` parameter beside `reverse_ic`
+for it.
+
+**So state the guarantee with its axes attached.** What is gated is that the
+order each individual cell sees is unchanged along `ic` AND along `k`. Neither
+"nothing held the forward sweep's order" nor "a length at which an f64
+accumulator stored through an f32 cannot hide a reordering" was true of both
+axes when it was first written here; both were true of `ic` and false of `k`.
 
 ### 18.8 Speed evidence — what it must be, before it is taken
 
@@ -4008,6 +4122,15 @@ else.
 - **`stride > 1`** keeps the shipped arithmetic path (§18.4).
 - **`ltx2_audio_vae.cpp:75`'s own 2-D host convolution loop** still routes
   through no op at all (#1114), so it is not reached by anything here.
+- **The CUDA arm's f64-THROUGHPUT explanation is unmeasured** (§18.2). The flat
+  0.37-0.40x ratio rules out a fixed overhead; it does not establish what the
+  residual IS. Three instruments would, none of them run here: an fp64:fp32 rate
+  probe on `thor:gpu0`, a pipe-utilisation or occupancy counter over
+  `Conv1dKernelCudaImpl`, and a CUDA A/B against an f32-accumulate arm — which
+  the f32 variant in the first bullet would supply for free. Until one of them
+  exists the sentence in §18.2 is an inference, and this row does not act on it.
+  Deliberately NOT settled in flow: it needs a `thor:gpu0` lease and this row's
+  measurement budget was spent on the host arm it actually moves.
 - **The CUDA-vs-CPU `memcmp` arm has NOT been re-measured against the tiled
   kernel.** The Thor worker carries `gcc`, `g++`, `cmake`, `ninja` and `python3`
   but **no `nvcc`** (probed 2026-08-19, which also CORRECTS §13.10's "no compiler

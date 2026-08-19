@@ -123,7 +123,7 @@ std::vector<float> SerialConv1d(const std::vector<float>& in, int64_t batch, int
                                 int64_t in_len, const std::vector<float>& weight,
                                 const std::vector<float>* bias, int64_t out_channels,
                                 int64_t kernel, const Conv1dArgs& a, int64_t length,
-                                bool reverse_ic = false) {
+                                bool reverse_ic = false, bool reverse_k = false) {
   const int64_t in_per_group = in_channels / a.groups;
   const int64_t out_per_group = out_channels / a.groups;
   std::vector<float> out(static_cast<size_t>(batch * out_channels * length), 0.0F);
@@ -135,7 +135,8 @@ std::vector<float> SerialConv1d(const std::vector<float>& in, int64_t batch, int
         for (int64_t step = 0; step < in_per_group; ++step) {
           const int64_t ic = reverse_ic ? in_per_group - 1 - step : step;
           const int64_t src_c = g * in_per_group + ic;
-          for (int64_t k = 0; k < kernel; ++k) {
+          for (int64_t tap = 0; tap < kernel; ++tap) {
+            const int64_t k = reverse_k ? kernel - 1 - tap : tap;
             const int64_t pos = t * a.stride - a.padding + k * a.dilation;
             if (pos < 0 || pos >= in_len) continue;
             acc += static_cast<double>(
@@ -151,10 +152,22 @@ std::vector<float> SerialConv1d(const std::vector<float>& in, int64_t batch, int
   return out;
 }
 
-// `reverse_ic` walks the input channels DESCENDING instead of ascending. It is
-// not a mode the op has; it is the ORDER MUTATION the cancellation case uses to
-// prove it has teeth before any agreement is believed. Same multiset of
-// products into every destination cell, different sequence of additions.
+// `reverse_ic` and `reverse_k` walk the input channels / the taps DESCENDING
+// instead of ascending. Neither is a mode the op has; each is the ORDER MUTATION
+// a cancellation case uses to prove it has teeth before any agreement is
+// believed. Same multiset of products into every destination cell, different
+// sequence of additions.
+//
+// THERE ARE TWO AXES AND EACH NEEDS ITS OWN CASE, which is a finding rather than
+// a symmetry (#1334, review 2026-08-19). The sweep the CPU kernel hoists out of
+// its accumulators is `(ic ascending, k ascending)`, and reversing EITHER is a
+// genuine reassociation. Data engineered to cancel across `ic` does not bite
+// along `k`: with the kernel's `k` loop reversed and nothing else changed,
+// `test_ops_conv1d_general` 9/375, `test_host_parallel` 8/877,
+// `test_vocoder1d` 10/58 and `test_bigvgan` 6/65 all reported `SUCCESS!` —
+// measured on this tree, binary sha256 `c4bb0e76...` against the baseline
+// `760061c5...`, so the mutation was in the binary that ran. A case per axis is
+// therefore what the guarantee costs.
 std::vector<float> SerialConvTranspose1d(const std::vector<float>& in, int64_t batch,
                                          int64_t in_channels, int64_t in_len,
                                          const std::vector<float>& weight,
@@ -447,8 +460,11 @@ TEST_CASE("vt::ConvTranspose1d reproduces the host loop's ZERO-SKIP exactly") {
 }
 
 TEST_CASE("vt::Conv1d CPU holds its sweep ORDER under cancellation, across tile boundaries") {
-  // THE case for #1334, and a hole this file had before it. The cancellation
-  // case at the bottom compares Conv1d CPU-vs-CUDA only, so on a CPU-only build
+  // THE case for #1334 along the `ic` AXIS, and a hole this file had before it.
+  // The `k` axis is the case below, and the two are not interchangeable: this
+  // one pairs input CHANNELS and its TEETH check reverses `ic`, so a `k` sweep
+  // reversed in the kernel walks straight through it. The cancellation case at
+  // the bottom compares Conv1d CPU-vs-CUDA only, so on a CPU-only build
   // NOTHING here held the forward sweep's ORDER against the pre-op host loop —
   // every other forward assertion runs on well-scaled data, where an f64
   // accumulator stored through an f32 hides a reduction-order change completely
@@ -516,6 +532,90 @@ TEST_CASE("vt::Conv1d CPU holds its sweep ORDER under cancellation, across tile 
   const std::vector<float> cuda = RunFwd(Device{DeviceType::kCUDA, 0}, in, {1, cin, lin}, w,
                                          {cout, cin, kernel}, nullptr, {1, cout, lout}, args);
   RequireBitIdentical(cuda, got, "Conv1d cancellation cuda-vs-cpu across tiles");
+}
+
+TEST_CASE("vt::Conv1d CPU holds its TAP order under cancellation, across tile boundaries") {
+  // The SECOND axis, and the reason it is a separate case (#1334, review
+  // 2026-08-19). The kernel hoists `(ic ascending, k ascending)` out of 32
+  // accumulators, so reversing EITHER loop reassociates every cell — but the
+  // case above is engineered along `ic` alone, and its own teeth check reverses
+  // `ic` alone. Reversing only the kernel's `k` loop left the whole gate green:
+  // 9/375, 8/877, 10/58, 6/65, every one `SUCCESS!`. A guarantee gated on one of
+  // its two axes is gated on neither, so this case pairs TAPS instead.
+  //
+  // The construction, and why it bites. Input channel 0 is CONSTANT at 1.0, so
+  // the taps of that channel all read the same value whatever `dilation` does
+  // with their positions. Its first two taps are +2^40 and -2^40 and its
+  // remaining six are O(1), and every other channel is O(1) throughout. Sweeping
+  // `k` ascending cancels 2^40 against 2^40 at once and then adds the O(1)
+  // remainder into an accumulator of magnitude ~0, exactly. Sweeping it
+  // descending accumulates that remainder FIRST and then puts +-2^40 through it,
+  // which quantises it at 2^-12 ~ 2.4e-4 — five orders of magnitude above the
+  // f32 store's ~2e-6 ULP at this result's scale, so the difference cannot hide
+  // in the round-trip through `float` the way a well-scaled reordering does.
+  //
+  // The shape is the one the `ic` case uses, for the same reason: `lout == 197`
+  // is six whole 32-wide tiles plus a 5-wide tail, `padding == 3` puts the left
+  // clamp inside tile 0, and `dilation == 2` lands the two big taps at different
+  // positions. It also drives the clamp THROUGH the cancelling pair: at t=0..1
+  // both big taps are out of range, at t=2 only the negative one is in range,
+  // and from t=3 on both are — so a clamp that keeps the wrong tap produces 2^40
+  // rather than a rounding difference.
+  const int64_t cin = 4, lin = 205, cout = 8, kernel = 8;
+  const float kBig = 1099511627776.0F;  // 2^40
+  std::vector<float> in(static_cast<size_t>(cin * lin));
+  std::vector<float> w(static_cast<size_t>(cout * cin * kernel));
+  // O(1) and deterministic: the same LCG `Spread` uses, mapped into [0.5, 1.5)
+  // instead of across six decades. The magnitude is the point — a small term
+  // that is itself huge is not a remainder.
+  uint32_t s = 0x5EEDu;
+  const auto next = [&s]() {
+    s = s * 1664525U + 1013904223U;
+    return 0.5F + static_cast<float>(s >> 8) / 33554432.0F;  // [0.5, 1.5)
+  };
+  for (float& v : in) v = next();
+  for (float& v : w) v = next();
+  for (int64_t t = 0; t < lin; ++t) in[static_cast<size_t>(0 * lin + t)] = 1.0F;
+  for (int64_t oc = 0; oc < cout; ++oc) {
+    w[static_cast<size_t>((oc * cin + 0) * kernel + 0)] = kBig;
+    w[static_cast<size_t>((oc * cin + 0) * kernel + 1)] = -kBig;
+  }
+
+  Conv1dArgs args;
+  args.stride = 1;
+  args.padding = 3;
+  args.dilation = 2;
+  const int64_t lout = vt::Conv1dOutLength(lin, kernel, args);
+  REQUIRE(lout == 197);
+  const std::vector<float> want =
+      SerialConv1d(in, 1, cin, lin, w, nullptr, cout, kernel, args, lout);
+  const std::vector<float> got = RunFwd(Cpu(), in, {1, cin, lin}, w, {cout, cin, kernel}, nullptr,
+                                        {1, cout, lout}, args);
+  RequireBitIdentical(got, want, "Conv1d tap-order cancellation cpu-vs-oracle");
+
+  // TEETH, on THIS axis, before the agreement above is believed. Reversing the
+  // tap sweep is the mutation this case exists to detect; if it changes nothing
+  // the equality above is vacuous.
+  {
+    const std::vector<float> other =
+        SerialConv1d(in, 1, cin, lin, w, nullptr, cout, kernel, args, lout,
+                     /*reverse_ic=*/false, /*reverse_k=*/true);
+    size_t differing = 0;
+    for (size_t i = 0; i < other.size(); ++i) {
+      if (std::memcmp(&other[i], &want[i], sizeof(float)) != 0) ++differing;
+    }
+    INFO("tap order sensitivity: " << differing << " of " << want.size()
+                                   << " cells change when the k sweep is reversed");
+    CHECK(differing > 0);
+  }
+
+  if (!HasCuda()) {
+    std::printf("[SKIP] no CUDA backend: Conv1d tap-order cancellation CPU-vs-CUDA NOT exercised\n");
+    return;
+  }
+  const std::vector<float> cuda = RunFwd(Device{DeviceType::kCUDA, 0}, in, {1, cin, lin}, w,
+                                         {cout, cin, kernel}, nullptr, {1, cout, lout}, args);
+  RequireBitIdentical(cuda, got, "Conv1d tap-order cancellation cuda-vs-cpu across tiles");
 }
 
 TEST_CASE("vt conv1d ops REFUSE a narrow dtype by name rather than widening it") {
