@@ -3948,7 +3948,8 @@ VT_MOE_EXPERT_STREAM_SLOTS=8000 \
 ### Which device can serve it
 
 `--device cpu` serves this today, and that is the arm every published number for
-this checkpoint was measured on.
+this checkpoint was measured on. `--device cuda` now decodes it on a probed
+integrated part; see the three limits below before you rely on that.
 
 `--device cuda` refuses at load, by design, when the weights cannot be staged
 into device memory (issue
@@ -3961,19 +3962,38 @@ towers are not staged at all — their slices are read from the host slot store 
 place — so what has to fit is the NON-expert remainder plus the slot arena
 rather than the whole file.
 
-Two limits, stated plainly rather than left to be discovered.
+The lane alone was not enough to produce a token. With it on, the checkpoint
+loaded on `--device cuda` and then exhausted the machine inside its first
+forward — zero decode steps, seven attempts, every one identical (issue
+[#1299](https://github.com/mudler/vllm.cpp/issues/1299)) — because the DENSE
+weights were resident twice: once as the host buffer and once as the device
+staging copy, which on a part where device memory IS host memory comes out of the
+same RAM. `VT_QWEN35_ALIAS_HOST_WEIGHTS` (default **on**, `docs/ENVIRONMENT.md`)
+removes the second copy by handing the kernels the host bytes directly, and it is
+what makes the CUDA arm decode at all. Set it to `0` for the same-binary A/B back
+to the staging behaviour.
+
+**It now decodes: 32/32 steps, at peak RSS 97.75 GiB of a 119.631 GiB box.**
+Three limits, stated plainly rather than left to be discovered.
 
 * **The device has to be probed capable, and most are not.** The condition is
   `cudaDevAttrPageableMemoryAccess AND cudaDevAttrIntegrated` — an integrated,
   unified part. A DISCRETE card answers false, keeps staging every tower and
   keeps the refusal. That is deliberate: a slot store the card cannot read is
   not a lane, and giving it one is later work on the same row.
-* **No speed claim is attached.** The measurement on the one machine that
-  answers true has not run at the time of writing; `docs/BENCHMARKS.md` carries
-  it as `PENDING`. Device access to host-resident weights on that part has a
-  recorded penalty, and this lane reads ~6.95 GB of expert bytes per token that
-  way, so a CUDA arm slower than the CPU arm is a real possible outcome. Read
-  the benchmarks file before assuming the GPU is the faster arm here.
+* **The correctness gate does NOT pass.** The 32 ids match the CPU arm for six
+  tokens and diverge at the seventh. Both continuations are coherent, and the
+  divergence is a measured near-tie rather than a disagreement about the model:
+  at that step the CPU arm's own second-ranked token is exactly the one the CUDA
+  arm emitted, behind by 1.4% of the winning logit, and one step later the margin
+  is 0.1%. The two arms run genuinely different GEMM kernels. Treat the CUDA arm
+  as unverified against the CPU arm until that gate is settled.
+* **No speed claim is attached.** `docs/BENCHMARKS.md` carries G0-SPEED as
+  `VOID`, because a speed number behind a failing correctness gate is not a
+  result. Device access to host-resident weights on that part also has a recorded
+  penalty, and this lane reads ~6.95 GB of expert bytes per token that way, so a
+  CUDA arm slower than the CPU arm remains a real possible outcome. Read the
+  benchmarks file before assuming the GPU is the faster arm here.
 
 ### The same thing as config, and which one wins
 
