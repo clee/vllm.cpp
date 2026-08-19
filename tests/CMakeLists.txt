@@ -426,6 +426,13 @@ vllm_cpp_add_test(test_linear_method vllm/model_executor/layers/test_linear_meth
 target_include_directories(test_linear_method PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_qwen3_break_point vllm/models/test_qwen3_break_point.cpp)
 vllm_cpp_add_test(test_qwen3_decode_graph_seam vllm/models/test_qwen3_decode_graph_seam.cpp)
+vllm_cpp_add_test(test_qwen3_moe_decode_graph_seam vllm/models/test_qwen3_moe_decode_graph_seam.cpp)
+vllm_cpp_add_test(test_voxtral_decode_graph_seam vllm/models/test_voxtral_decode_graph_seam.cpp)
+vllm_cpp_add_test(test_deepseek_v2_decode_graph_seam vllm/models/test_deepseek_v2_decode_graph_seam.cpp)
+# G1 for the row: bit-exactness against eager over THREE replays, on a real
+# device. Inert without a CUDA backend (every case skips), because a CPU
+# "replay" recomputes nothing.
+vllm_cpp_add_test(test_decode_graph_seam_g1_cuda vllm/models/test_decode_graph_seam_g1_cuda.cpp)
 vllm_cpp_add_test(test_decode_graph_sizes vllm/models/test_decode_graph_sizes.cpp)
 vllm_cpp_add_test(test_qwen35_paged_forward vllm/models/test_qwen35_paged_forward.cpp)
 # GDN-MOE-BF16-OUT (#1168): the MoE forward's GDN output-activation dtype probe
@@ -1781,6 +1788,43 @@ target_include_directories(test_graph_dedup PRIVATE ${CMAKE_SOURCE_DIR}/src)
 # by NO test on any tier; the latch defect hid in exactly that gap.
 vllm_cpp_add_test(test_graph_dedup_runtime vt/test_graph_dedup_runtime.cpp)
 target_include_directories(test_graph_dedup_runtime PRIVATE ${CMAKE_SOURCE_DIR}/src)
+# ENG-CUDAGRAPH-DEDUP / #1226: the coarse-key knob itself. vt::GraphDedupCoarseKeyEnabled
+# caches its answer in a function-local static -- deliberately, because the drivers
+# capture lazily and a knob that moved between two captures would give one model a mixed
+# set of handles -- so ONE PROCESS CAN OBSERVE ONE VALUE. Proving that "1" enables the
+# coarse key and "10" does not therefore takes one process per value, which is what these
+# entries are. Without them the accessor's only coverage was a single unset-variable
+# CHECK_FALSE, which two mutations survived: accepting any non-null value, and reading a
+# completely different variable name.
+vllm_cpp_add_test(test_graph_dedup_coarse_env vt/test_graph_dedup_coarse_env.cpp)
+target_include_directories(test_graph_dedup_coarse_env PRIVATE ${CMAKE_SOURCE_DIR}/src)
+function(vllm_cpp_add_coarse_key_case suffix value expect)
+  add_test(NAME test_graph_dedup_coarse_env_${suffix}
+    COMMAND test_graph_dedup_coarse_env)
+  set_tests_properties(test_graph_dedup_coarse_env_${suffix} PROPERTIES
+    ENVIRONMENT "VT_CUDA_GRAPH_DEDUP_COARSE_KEY=${value};VT_COARSE_KEY_EXPECT=${expect}"
+    SKIP_RETURN_CODE 77)
+endfunction()
+# The one value that turns it on. This entry is what proves the accessor reads THIS
+# variable: a mutation that reads any other name leaves it unset and fails here.
+vllm_cpp_add_coarse_key_case(on "1" 1)
+# ...and the near misses, each of which enables the key under a `value != nullptr` test.
+# "10" is a hand-edited "1" plus a stray keystroke, and it turning a default-off
+# correctness-sensitive path on by accident is the failure the polarity exists to stop.
+vllm_cpp_add_coarse_key_case(off_zero "0" 0)
+vllm_cpp_add_coarse_key_case(off_ten "10" 0)
+vllm_cpp_add_coarse_key_case(off_oh_one "01" 0)
+vllm_cpp_add_coarse_key_case(off_one_x "1x" 0)
+vllm_cpp_add_coarse_key_case(off_true "true" 0)
+vllm_cpp_add_coarse_key_case(off_empty "" 0)
+# The knob is DEFINED but the OTHER knob is the one set. The two are separate variables
+# and the coarse key must not piggyback on VT_CUDA_GRAPH_DEDUP: a run that asked only for
+# dedup must get the exact key the 2026-08-18 device gate ran, or the A/B is not one.
+add_test(NAME test_graph_dedup_coarse_env_off_sibling_knob
+  COMMAND test_graph_dedup_coarse_env)
+set_tests_properties(test_graph_dedup_coarse_env_off_sibling_knob PROPERTIES
+  ENVIRONMENT "VT_CUDA_GRAPH_DEDUP=1;VT_COARSE_KEY_EXPECT=0"
+  SKIP_RETURN_CODE 77)
 # CPU threadpool (QUANT-GGUF-CPU-THREADPOOL): barrier/park-wake/chunk-steal
 # stress + the n_threads 1/3/20 determinism battery. Reaches the internal
 # header under src/ (the pool is not public API).
@@ -1831,6 +1875,23 @@ vllm_cpp_add_test(test_ops_quant_fp8_group_cpu vt/test_ops_quant_fp8_group_cpu.c
 # against. Its G4 holds the constraint the row exists for: the scales apply in
 # the MAINLOOP, once per K-block, which an epilogue-folded alpha cannot express.
 vllm_cpp_add_test(test_ops_matmul_fp8_block_cpu vt/test_ops_matmul_fp8_block_cpu.cpp)
+# VT-MATMUL-FP8-BLOCK-CUDA (#1189 M5): the HOST-SIDE contract of the same op's
+# CUDA arm — the tile-config heuristic, the refusal predicate, the two scale
+# layouts cutlass DEDUCES from the problem shape, and the dispatch counter. Runs
+# on every machine including one with no GPU and no CUDA toolkit, which is the
+# whole point: those four are the parts of an sm_12xa-only kernel that can be
+# wrong in a way a successful compile cannot see. Reaches the internal header
+# under src/ (not public API), exactly like its test_fp8_plan_cache neighbour.
+vllm_cpp_add_test(test_fp8_block_scaled_dispatch vt/test_fp8_block_scaled_dispatch.cpp)
+target_include_directories(test_fp8_block_scaled_dispatch PRIVATE ${CMAKE_SOURCE_DIR}/src)
+# VT-MATMUL-FP8-BLOCK-CUDA (#1189 M5), the DEVICE tier: the CUDA arm against the
+# CPU reference arm of the SAME op, carrying upstream's own
+# test_w8a8_block_fp8_cutlass_matmul whole (M=32, N=576, K=7168, rel_diff <
+# 0.001). IT HAS NEVER RUN: no GPU was leased for that row and it skips without a
+# device. The row's spec lists the on-hardware leg under `## Owed`; a skip here
+# is not a pass and must not be reported as one.
+vllm_cpp_add_test(test_ops_matmul_fp8_block_cuda vt/test_ops_matmul_fp8_block_cuda.cpp)
+target_include_directories(test_ops_matmul_fp8_block_cuda PRIVATE ${CMAKE_SOURCE_DIR}/src)
 # Opt-in arm: run the fp8 plan-cache byte-exact case with the cache ENABLED
 # (VT_FP8_PLAN_CACHE=1 -> first MatmulFp8CublasLt call builds the plan fresh,
 # later calls hit the cache). Proves the cached-plan GEMM is BYTE-identical to the
