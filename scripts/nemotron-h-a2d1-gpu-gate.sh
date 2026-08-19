@@ -99,7 +99,17 @@ grep -E "CUDA feature .*(ENABLED|DISABLED)" "$RUN/configure.log" | tee "$RUN/fea
 echo "feature cells ENABLED for [$ARCH]: $(grep -cE "ENABLED for \[$ARCH\]" "$RUN/features.txt") ; DISABLED cells: $(grep -cE 'DISABLED' "$RUN/features.txt")"
 
 step "5. build (-j 4: unconstrained parallelism has OOM-REBOOTED this box)"
-cmake --build "$BUILD" -j 4 > "$RUN/build.log" 2>&1
+# OPS_ONLY=1 builds and runs ONLY the op-level equivalence suite and stops.
+# It exists for a small board that can host the CUDA kernels but not the 20.1
+# GiB checkpoint: the driver-group equivalence is the one piece of evidence that
+# needs real CUDA and does NOT need the model, so it should not queue behind a
+# box that can run the whole gate.
+OPS_ONLY=${OPS_ONLY:-0}
+if [ "$OPS_ONLY" = "1" ]; then
+  cmake --build "$BUILD" -j 4 --target test_ops_mamba2_state_update > "$RUN/build.log" 2>&1
+else
+  cmake --build "$BUILD" -j 4 > "$RUN/build.log" 2>&1
+fi
 echo "RC[cmake build]=$?"
 tail -5 "$RUN/build.log"
 
@@ -110,6 +120,15 @@ step "6. the OP-LEVEL equivalence this swap rests on, at n_groups=8"
 echo "RC[test_ops_mamba2_state_update]=$?"
 grep -E "test cases:|assertions:|Status:" "$RUN/state_update.log"
 grep -E "driver-group equivalence" "$RUN/state_update.log"
+
+if [ "$OPS_ONLY" = "1" ]; then
+  echo
+  echo "OPS_ONLY=1: the op-level equivalence ran and NOTHING ELSE did. The A3 token"
+  echo "gate and the decode-window numbers are NOT MEASURED on this host. That is a"
+  echo "stated absence, not a pass."
+  echo "ALL LOGS: $RUN"
+  exit 0
+fi
 
 step "6b. the neighbouring suites this arm can break"
 for t in test_nemotron_h_mamba_device test_nemotron_h_paged_forward test_nemotron_h_forward \
