@@ -630,13 +630,53 @@ pinned checkout at `555967922`. The seam asymmetry is readable in one place —
 `vt::AttnQkNormRopeGate` takes `cos_sin` and no positions, where
 `fused_qk_rmsnorm_rope_gate` takes `cos_sin_cache` **and** `positions`.
 
-**What this invalidates: nothing currently binding.** The figures #414 flattered
-are already recorded as SUPERSEDED and OPTIMISTIC in `docs/BENCHMARKS.md` and in
-the benchmark record's "What this supersedes, and in which direction" table, and
-the binding rows for both gate models already carry
-`--language-model-only`. This wave therefore withdraws no number and quotes no
-new one. It removes the mechanism by which the next canonical run would have
-produced another flattered set.
+**What this invalidates, exactly.** The first draft of this section said
+"nothing currently binding", on the reasoning that the 27B and 35B figures #414
+flattered are already recorded as SUPERSEDED and OPTIMISTIC in
+`docs/BENCHMARKS.md` and in the benchmark record's "What this supersedes, and in
+which direction" table, and that the binding rows for both gate models already
+carry `--language-model-only`. That much is true and unchanged. The conclusion
+drawn from it was wrong, because it only looked at the two gate models.
+
+**`docs/BENCHMARKS.md` Qwen3.5-4B `1.0283x tput` is affected and was NOT marked.**
+The chain, each link checked rather than assumed:
+
+1. The row cites [`bench-evidence/qwen35-4b-sm120-main-20260807.md`](../../docs/bench-evidence/qwen35-4b-sm120-main-20260807.md),
+   whose reproduction identity names `Qwen/Qwen3.5-4B` and the exact workload
+   `run_qwen35_4b_compare.sh` drives.
+2. `tools/bench/run_qwen35_4b_compare.sh:120` runs the vLLM arm through
+   `tools/bench/vllm_closed_loop_metrics.py`, whose `LLM(...)` at `:160` never
+   passes `language_model_only` and exposes no way to set it — the #1345 surface.
+3. Upstream registers `Qwen/Qwen3.5-4B` under
+   **`Qwen3_5ForConditionalGeneration`** (`tests/models/registry.py:1322-1324`,
+   `extras={"4b": "Qwen/Qwen3.5-4B"}`), so its `multimodal_config` is non-`None`
+   and `text_only` is `False`.
+4. The conjunct was live at that measurement. `git log -S'use_fused_qk_norm_rope_gate'`
+   over `qwen3_next.py` dates its introduction to `16282a9c4`, 2026-06-10, two
+   months before the 2026-08-07 run.
+5. The remaining conjuncts hold: sm_120 is CUDA, and Qwen3.5-4B carries
+   `attn_output_gate` with NeoX-style RoPE.
+
+So that leg's oracle ran the UNFUSED preamble on its full-attention layers while
+our arm ran the fused one. **Direction: it flatters us**, for the same reason
+#414 gives. **Magnitude: unmeasured, and not estimated here** — the model is
+GDN-hybrid, so only its full-attention layers are exposed, and this wave took no
+measurement. The row is marked rather than withdrawn, per AGENTS.md: evidence is
+annotated, never deleted. Re-measurement is owed with #1345.
+
+**Not affected, and why, so the next reader does not re-derive it.** #414 reaches
+a figure only where the full-attention layers are `Qwen3NextAttention` AND the
+checkpoint loads as a `*ForConditionalGeneration`. That is the Qwen3.5/3.6/3.8
+family alone. The OPT, GLM-4, InternLM2, Qwen3-dense, Qwen3-Coder and
+DeepSeek-V2-Lite legs do not construct `Qwen3NextAttention` at all. The
+`Qwen3.8-27B` rows ran through `tools/bench/run_serve_low.py`, which has passed
+`--language-model-only` since it was written. The Qwen3.5-4B GDN prefill
+kernel row is conv and post-conv timing on the LINEAR-attention path, which the
+full-attention preamble does not touch.
+
+This wave therefore withdraws no number, quotes no new one, marks one, and
+removes the mechanism by which the next canonical run would have produced
+another flattered set.
 
 **Stop conditions.** Stop and escalate if upstream drops the `text_only`
 conjunct (the exception is then obsolete, not merely stale); if our fused
@@ -645,11 +685,14 @@ it); or if a harness needs the oracle launched WITHOUT the flag for a reason
 other than a text-only architecture — that is a denominator decision for the
 operator, not a checker allowlist entry.
 
-**Owed.**
-
-- [#1340](https://github.com/mudler/vllm.cpp/issues/1340) — `VT_FUSE_ATTN_PREAMBLE=0`
-  on the MRoPE path silently applies 1-D RoPE instead of refusing. Owner:
-  `ENG-MM-INPUT-PIPELINE`. Needs a GPU VL token-exactness run to gate.
+**What L4 does NOT do, so the next wave knows what it inherits.** It changes no
+product code path, so it claims no token gate and no measurement. It gates the
+CLI oracle-launch surface only; the in-process `LLM(...)` surface carries the
+same defect and is owed below, deliberately, because those harnesses take
+`--model` as a path and no static rule can know whether a run points at a
+multimodal checkpoint. And it takes no measurement at all: the flag is now
+correct in the canonical driver, but no grid has yet been run through the
+repaired driver, so nothing here supersedes or replaces a published number.
 
 ---
 
@@ -1166,3 +1209,19 @@ pieces).**
   near-term gate.
 - No HW-blocked modality for the Qwen3.6 target: the vision tower is ~1 GiB and
   fits the 119 GiB unified pool alongside the 27B/35B LLM.
+
+---
+
+## Owed
+
+Carried by `ENG-MM-INPUT-PIPELINE`, filed while landing L4 (§1.6).
+
+- [#1340](https://github.com/mudler/vllm.cpp/issues/1340) — `VT_FUSE_ATTN_PREAMBLE=0`
+  on the MRoPE path silently applies 1-D RoPE instead of refusing. Needs a GPU
+  VL token-exactness run through `ModelRegistry::Forward` to gate.
+- [#1345](https://github.com/mudler/vllm.cpp/issues/1345) — the three in-process
+  bench harnesses (`profile_vllm_online_gate.py:209`,
+  `vllm_closed_loop_metrics.py:160`, `dump_vllm_tokens.py:34`) construct the
+  oracle with `language_model_only` at its `False` default and expose no way to
+  set it. Needs the knob threaded through and the resolved value recorded beside
+  the measurement; the default is a denominator decision for the operator.

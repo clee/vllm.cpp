@@ -98,6 +98,7 @@ CHECKERS=(
   check-test-registration
   check-snapshot-pins
   check-oracle-pins
+  check-oracle-denominator-flags
   check-now-current
   check-gate-commands
   check-symbol-anchors
@@ -152,6 +153,7 @@ SUITES=(
   test_agent_preflight_skip_report
   test_agent_pr_body
   test_check_symbol_anchors
+  test_check_oracle_denominator_flags
 )
 
 failed=()
