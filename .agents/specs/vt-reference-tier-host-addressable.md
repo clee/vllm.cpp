@@ -227,6 +227,22 @@ is the landed commit message. The two GB10 logs that motivated the row are
   `cmake/CudaArchFeatures.cmake` opens by naming this exact class as what the
   feature table exists to prevent, so the diagnostic asserts the opposite of the
   truth.
+
+  REPRODUCED AGAIN, on a second box, while this row's `nvcc` check ran. Job
+  `645bf395-23fc-408f-a9ad-b9823885622c` on `thor:gpu0` (NVIDIA Thor, CUDA 13.0
+  V13.0.88, aarch64) configured this branch at `817e1769c` with
+  `-DVLLM_CPP_CUDA=ON -DVLLM_CPP_CUDA_ARCHITECTURES=121a` and NO CUTLASS at all,
+  and the configure printed:
+
+  ```text
+  CUDA feature cutlass-nvfp4: ENABLED for [121a]
+  CUDA feature cutlass-fp8: ENABLED for [121a]
+  ```
+
+  So the defect is not specific to `dgx:gpu0` and not specific to `cutlass-fp8`.
+  Every CUTLASS-dependent feature cell reports ENABLED on a build that contains
+  no CUTLASS. Evidence: `/mnt/nas_share/rc/reftier-1435/nvcc-check.sh` and
+  `/workspace/reftier-1435/nvcc-configure.log` on that worker.
 - [#844](https://github.com/mudler/vllm.cpp/issues/844) item 4 — whether a CUDA
   build lacking CUTLASS should warn at engine construction rather than only at
   configure time — is not addressed here.
