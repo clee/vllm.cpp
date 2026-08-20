@@ -481,3 +481,90 @@ row's diff touches it. It is called out because the asymmetry — refusing one
 shared static by name while silently taking another — is the kind of thing a
 reader is entitled to see stated rather than to discover. The
 behavioural red for this class needs CUDA and is PENDING with the rest.
+
+### The DSR ratchet, which no review round ever saw run
+
+`device-leakage` had not COMPLETED on this row through three review passes, so
+its verdict was never an input to any of them. It completed after the third and
+failed: `vt_ifdef` **35 against a baseline of 32**, `rc 1`. Three
+`#ifdef VT_MARLIN_NVFP4` sites had been added to the device-agnostic shared
+layer, and the ratchet exists precisely to stop that accreting.
+
+The three, located by running `scripts/check-device-leakage.py --report` at the
+failing head `7a3909187` and diffing the per-file table against `9ecaf1bb3`
+rather than by reading the diff for guards:
+
+| # | site at `7a3909187` | what the guard decided | resolution |
+|---|---|---|---|
+| 1 | `include/vllm/model_executor/models/dense_nvfp4_gemm.h:768` — `MarlinW4A16Selects` | **nothing.** `MarlinW4A16Enabled()` is declared above the guarded region and `vt::OpRegistered` is the op table's own availability answer | **removed** |
+| 2 | `src/vllm/model_executor/models/nemotron_h_device.cpp:883` — around `LmHeadNvfp4View` | **nothing.** The function names no symbol the Marlin build adds | **removed** |
+| 3 | `src/vllm/model_executor/models/nemotron_h_device.cpp:985` — `DeviceLmHeadD`'s body | `ResidentIn` and a complete `dense_nvfp4::MarlinDenseResident`, neither of which EXISTS without the guarded arena region | **`DSR-ALLOW(A2-Q2b)`** |
+
+**(1) is the case the checker's own message describes.** The build flag and the
+registration are the same condition, not two: `CMakeLists.txt`'s single
+`if(VLLM_CPP_MARLIN)` block adds `src/vt/cuda/cuda_moe_marlin.cu` — whose
+file-scope `Registrar` holds the tree's only
+`RegisterOp(OpId::kMoeGroupedGemmNvfp4Marlin, …)` — and defines
+`VT_MARLIN_NVFP4=1`, in that same block. A build without the macro therefore
+registers nothing and the query already resolves false on exactly the builds the
+`#ifdef` excluded. This is the call `nemotron_h_device.cpp`'s `moe_on_device`
+selection had already made, in a comment that says so.
+
+**(2) was measured, not reasoned.** The claim is that the function's external
+linkage at `namespace vllm` scope is what makes an unused definition harmless in
+a build where its only call site is compiled out. Adding `static` to that
+definition — the mutation that removes exactly that property — turns the same
+CPU compile RED, `error: 'vllm::Nvfp4Weight vllm::LmHeadNvfp4View(...)' defined
+but not used [-Werror=unused-function]`, `rc 1`; the file was restored to an
+identical sha256 (`9719ea70…`) afterwards.
+
+**(3) is TYPES-not-behaviour, and takes the checker's documented escape hatch
+rather than a baseline change.** `AGENTS.md` forbids making a red gate green by
+widening an assertion, and a baseline bump is that. `DSR-ALLOW` is not: the site
+is excluded from the count but COUNTED AND PRINTED on every run, so the
+exemption is visible in CI output. It is the same class, and carries the same
+stated reason, as the five sibling guards A2-Q2a and A2-P already hold in this
+file. The SELECTION for this arm is a runtime op-table query
+(`DeviceLmHeadEligible` → `MarlinW4A16Selects`, which now carries no guard);
+only the call site needs the build guard, and its `#else` refuses by name.
+
+**Measured on this tree**, a CPU build with `VT_MARLIN_NVFP4` absent from
+`build/compile_commands.json` (positive control: 1020 `VLLM_CPP` hits in the
+same file, so the grep is not silently wrong) — which is the configuration that
+exercises both removals, since it is the arm the deleted `#else` branches used
+to serve.
+
+| what | before (`7a3909187`) | after | `rc` |
+|---|---|---|---|
+| `check-device-leakage.py` `vt_ifdef` | 35 | **32** | 1 → **0** |
+| `DSR-ALLOW` exemptions in force | 20 | **21** | — |
+| `scripts/device-leakage-baseline.json` | 32 | **32, untouched** | — |
+| per-file table vs `origin/main` | +1 header, +2 model TU | **identical** | — |
+| `nemotron_h_device.cpp`, `nemotron_h.cpp`, `qwen3_5.cpp` at `-Wall -Wextra -Werror` | — | compile | **0** |
+
+Each of the three repairs is load-bearing, proven by reverting it alone in a
+scratch worktree and re-running the gate. Every mutation was verified applied by
+`git diff --stat` and restored to an identical sha256, with the unmutated
+control green immediately before and after.
+
+| mutation | applied | `vt_ifdef` | `rc` | verdict |
+|---|---|---|---|---|
+| — (control) | — | 32 | 0 | `ratchet holds` |
+| **M-B** — restore the guard on `MarlinW4A16Selects` | 4 ins | **33** | **1** | **RED**, `DSR REGRESSION` |
+| **M-C** — restore the guard around `LmHeadNvfp4View` | 2 ins | **33** | **1** | **RED**, `DSR REGRESSION` |
+| **M-D** — delete the `DSR-ALLOW(A2-Q2b)` line | 1 del | **33** | **1** | **RED**, `DSR REGRESSION` |
+| — (control, after restore) | — | 32 | 0 | `ratchet holds` |
+
+The two pre-existing allowlist entries the report also prints —
+`deepseek_v4_device.cpp [kcuda] x8` and `platform.cpp [dev_cast] x1` — are
+byte-identical at `9ecaf1bb3` and here. This change moves one bucket and
+nothing else.
+
+**The #1392 overlay is retired.** The two evidence tables above in this section
+carry an `overlay` column because this tree could not construct `GPUModelRunner`
+at all ([#1371](https://github.com/mudler/vllm.cpp/issues/1371)) and every green
+was taken with [#1392](https://github.com/mudler/vllm.cpp/pull/1392)'s fix
+applied to the working tree and reverted. #1392 has since landed on `main` and
+this branch has merged it, so the tree now carries the fix as a committed
+object. The historical rows keep their `overlay` cells, because they describe
+the tree they were measured on and rewriting them would make them false.
