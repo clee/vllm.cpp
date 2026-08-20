@@ -1307,24 +1307,45 @@ the two heads, which is what carrying it forward would have hidden.
 
 | # | Mutation | `git diff --stat` | compile | containment case | SUMS case |
 |---|---|---|---|---|---|
-| — | honest | (none) | rc 0 | exit 0, 1/1 cases, **527/527** | exit 0, 1/1, **446/446** |
-| **N1** | swap the `decode.audio.mel` and `decode.audio.vocoder` scope names — the **sibling-swap** mutation | 1 file, +2/-2 | rc 0 | **RED**, exit 1, 1 case failed, **527 assertions, 3 failed**, on the sibling order in each of the three per-render checks | exit 0, 446/446 |
-| **N6** | move `decode.video.vae` off `AccumulateTemporalGroup` onto `buffer.Allocate` — the **anchor beside the work** mutation | 1 file, +7/-7 | rc 0 | **RED**, exit 1, 1 case failed, **527 assertions, 5 failed**, on the vae coverage floor | exit 0, 446/446 |
-| M12 | re-anchored: `denoise.step` for step 0 only, `denoise` closed there, `phase.finish` over steps 1-7 | 1 file, +8/-1 | rc 0 | **RED**, exit 1, 1 case failed, **462 assertions, 3 failed** | exit 0, 374/374 |
-| M11 | re-anchored: writes stay inside `decode.video`, `artifacts.frames` emitted empty | 1 file, +3/-4 | rc 0 | **RED**, exit 1, 1 case failed, **527 assertions, 4 failed** | exit 0, 446/446 |
-| M11b | re-anchored: both `Close`s below the write, writer still around the loop | 1 file, +2/-2 | rc 0 | **RED**, exit 1, 1 case failed, **119 assertions, 1 failed** | exit 0, 446/446 |
-| M13 | re-anchored: swap the `load.dit` and `load.prompt_embeds` scope names | 1 file, +2/-2 | rc 0 | **RED**, exit 1, 1 case failed, **527 assertions, 2 failed**, on the load order | exit 0, 446/446 |
-| M7 | re-anchored: close `denoise` after the first sampler step and open `phase.finish` there | 1 file, +6/-0 | rc 0 | **RED**, exit 1, 1 case failed, **539 assertions, 24 failed** | exit 0, 458/458 |
-| M4 | re-anchored: `decode.video` left open across the audio decode | 1 file, +2/-1 | rc 0 | **RED**, exit 1, 1 case failed, **88 assertions, 2 failed** (a `REQUIRE_FALSE` aborts the case early) | exit 0, 446/446 |
-| M10 | re-anchored: after a chunk, re-label the decode as the writer | 1 file, +1/-1 | rc 0 | **RED**, exit 1, 1 case failed, **529 assertions, 5 failed** | exit 0, 446/446 |
-| N10 | detach `artifacts.frames.ppm` from the `WriteFileBytes` loop by closing it before the loop runs | 1 file, +1/-1 | rc 0 | **RED**, exit 1, 1 case failed, **527 assertions, 3 failed** | exit 0, 446/446 |
+| — | honest | (none) | rc 0 | exit 0, 1/1 cases, **554/554** | exit 0, 1/1, **446/446** |
+| **R1b** | leave `decode.audio.mel` open across the vocoder call and open `decode.audio.vocoder` EMPTY beside it — the **sibling-boundary** mutation, and the fifth review's finding | 1 file, +2/-2 | rc 0 | **RED**, exit 1, 1 case failed, **554 assertions, 3 failed**, on the per-part floor in each of the three per-render checks | exit 0, 446/446 |
+| **R1b mirror** | the same shift the other way: `decode.audio.mel` emptied, `decode.audio.vocoder` covering both calls | 1 file, +2/-2 | rc 0 | **GREEN**, exit 0, 1/1, 554/554 — **OPEN, and recorded above with the measurement that says no floor separates it** | exit 0, 446/446 |
+| **N1** | swap the `decode.audio.mel` and `decode.audio.vocoder` scope names — the **sibling-swap** mutation | 1 file, +2/-2 | rc 0 | **RED**, exit 1, 1 case failed, **554 assertions, 6 failed** — three on the sibling order and three on the per-part floor, which is new | exit 0, 446/446 |
+| **N6** | move `decode.video.vae` off `AccumulateTemporalGroup` onto `buffer.Allocate` — the **anchor beside the work** mutation | 1 file, +4/-2 | rc 0 | **RED**, exit 1, 1 case failed, **554 assertions, 3 failed**, on the vae coverage floor | exit 0, 446/446 |
+| M12 | re-anchored: `denoise.step` emitted for the first evaluation only, `denoise` closed at step 0, `phase.finish` over the rest | 1 file, +8/-1 | rc 0 | **RED**, exit 1, 1 case failed, **479 assertions, 5 failed**, first on `'denoise.step' was emitted 1 time(s)` against `dit_evaluations` = 8 | exit 0, 374/374 |
+| M11 | re-anchored: writes stay inside `decode.video`, `artifacts.frames` emitted empty | 1 file, +3/-3 | rc 0 | **RED**, exit 1, 1 case failed, **126 assertions, 1 failed** | exit 0, 446/446 |
+| M11b | re-anchored: both `Close`s below the write, writer still around the loop | 1 file, +2/-2 | rc 0 | **RED**, exit 1, 1 case failed, **126 assertions, 1 failed** | exit 0, 446/446 |
+| M13 | re-anchored: swap the `load.dit` and `load.prompt_embeds` scope names | 1 file, +2/-2 | rc 0 | **RED**, exit 1, 1 case failed, **554 assertions, 2 failed**, on the load order | exit 0, 446/446 |
+| M7 | re-anchored: close `denoise` after the first sampler step and open `phase.finish` there | 1 file, +5/-0 | rc 0 | **RED**, exit 1, 1 case failed, **556 assertions, 26 failed** | exit 0, 458/458 |
+| M4 | re-anchored: `decode.video` left open across the audio decode | 1 file, +1/-1 | rc 0 | **RED**, exit 1, 1 case failed, **92 assertions, 2 failed** (a `REQUIRE_FALSE` aborts the case early) | exit 0, 446/446 |
+| M10 | re-anchored: after a chunk, re-label the decode as the writer | 1 file, +1/-1 | rc 0 | **RED**, exit 1, 1 case failed, **556 assertions, 4 failed** | exit 0, 446/446 |
+| N10 | detach `artifacts.frames.ppm` from the `WriteFileBytes` loop by closing it before the loop runs | 1 file, +1/-1 | rc 0 | **RED**, exit 1, 1 case failed, **554 assertions, 3 failed** | exit 0, 446/446 |
 
-**N10 was RECONSTRUCTED, and it is named as such.** The fourth review's own
-definition of it is not recorded in this tree or on the forge, so what runs under
-that label here is the mutation the name describes: close `artifacts.frames.ppm`
-before the `WriteFileBytes` loop instead of after it, which detaches the writer's
-anchor from the writes while leaving the leaf, the count and the nesting intact.
-The other nine are the reviews' own.
+**Twelve mutations on `17eba8ce2`, the head that lands**, re-applied after the
+FOURTH merge rather than carried forward. The counts moved again and the
+verdicts did not: N6 reports 3 failed assertions here against 5 on `99703ce5a`,
+and N1 reports 6 against 3 — the last because the per-part floor this change adds
+catches the name swap as well as the boundary shift.
+
+**SEVEN OF THE TWELVE ARE RECONSTRUCTIONS, and this is the disclosure.** Only
+R1b, its mirror, N1, N6 and M13 run from a definition recorded in this tree. The
+earlier reviews' own definitions of M12, M11, M11b, M7, M4, M10 and N10 are not
+in this tree or on the forge, so what runs under those labels is the mutation
+each NAME describes, rebuilt from the row beside it in this table — N10, for
+instance, closes `artifacts.frames.ppm` before the `WriteFileBytes` loop instead
+of after it, which detaches the writer's anchor from the writes while leaving the
+leaf, the count and the nesting intact.
+
+**Two of the rebuilds were wrong on the first attempt, and a bare RED is what
+would have hidden it.** A first M4 that never re-closed `decode.video` reddened
+the SUMS case, which the recorded M4 does not; a first M12 closed `denoise.step`
+early instead of SUPPRESSING it, which still emits the record, and that made M12
+indistinguishable from M7 — both 556 assertions with 26 failed, on the same five
+failure texts. Both were repaired until the failure SHAPE matched the recorded
+one: M4 aborting on a `REQUIRE_FALSE(nested)` after a coverage failure, M12
+failing first on `'denoise.step' was emitted 1 time(s)` against
+`dit_evaluations` = 8. A reconstruction that merely reds is not evidence that the
+recorded mutation reds, and two of seven here proved it.
 
 Every mutation was applied by exact-text replacement that refuses unless the
 pattern occurs exactly once, with its `git diff --stat` and its compile return
@@ -1443,18 +1464,22 @@ which is where this spec's `### Decisions taken here` already said they would be
 
   **The vocoder direction is now closed** by a per-part floor of 0.50 against the
   `decode.audio` leaf (assertion (2b), `Carrying::part_min_coverage`). Honest the
-  vocoder measures 97.85%, 91.57%, 90.6% and 89.7% here and 97.0% and 99.99% on
-  the 21B artifact; under R1b it measures 0.00045% and 0.0013%. R1b now reds:
-  **exit 1, 1 case failed, 554 assertions, 3 failed.**
+  vocoder measures **99.46% and 94.10%** on the head this lands at (97.85%,
+  91.57%, 90.6% and 89.7% on earlier runs) and 97.0% and 99.99% on the 21B
+  artifact; under R1b it measures **0.00091% and 0.0035%**. R1b now reds:
+  **exit 1, 1 case failed, 554 assertions, 3 failed.** The same floor also
+  catches the NAME SWAP, which is why N1 moved from 3 failed assertions to 6:
+  under N1 the vocoder name sits on the mel's work and reads 2.76% and 7.68%.
 
   **The MIRROR direction is NOT closed** — mel emptied, the vocoder scope
   covering both calls — and no floor is available, which is a measurement and
-  not an omission. Honest, `decode.audio.mel` holds 2.13%, 8.43%, 9.4% and 10.3%
-  on this fixture and **0.0004% to 2.9%** on the 21B artifact. Under the mirror
-  it holds **0.0032% and 0.0020%**. The honest 21B render's 0.0004% is *smaller*
-  than the mirror's 0.0032%, so the two distributions overlap and any threshold
-  that reddens the mirror also reddens an honest render this row has already
-  produced. The mirror is measured GREEN: exit 0, 1/1, 554/554.
+  not an omission. Honest, `decode.audio.mel` holds **0.53% and 5.90%** on this
+  head (2.13%, 8.43%, 9.4% and 10.3% on earlier runs) and **0.0004% to 2.9%** on
+  the 21B artifact. Under the mirror it holds **0.00063% and 0.0051%**. The
+  honest 21B render's 0.0004% is *smaller* than the mirror's 0.0051%, so the two
+  distributions overlap and any threshold that reddens the mirror also reddens an
+  honest render this row has already produced. The mirror is measured GREEN:
+  exit 0, 1/1, 554/554.
 
   **What W1 inherits, in one sentence, so that it does not inherit it by
   silence:** `decode.audio.mel` may be carrying the vocoder's seconds and no gate

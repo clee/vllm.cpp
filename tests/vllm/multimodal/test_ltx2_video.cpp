@@ -3308,25 +3308,27 @@ void CheckCarryingPhase(const nlohmann::json& table, const Carrying& c) {
   // reached without touching either literal.
   //
   // ONLY THE VOCODER CARRIES A FLOOR, and the mel's 0.0 is a MEASURED debt
-  // rather than an oversight. Honest, over the two renders of this case on two
-  // runs of this box, `decode.audio.vocoder` holds 97.85%, 91.57%, 90.6% and
-  // 89.7% of its leaf; on the 21B artifact this row shipped it holds 97.0% and
-  // 99.99%. Under R1b it holds 0.00045% and 0.0013%. Between four and five
-  // orders of separation, which is the property the 0.50 `decode.video.vae`
-  // floor below exploits, and why this number is 0.50 rather than tightened
-  // toward a measured share this box destroys.
+  // rather than an oversight. Honest, over the two renders of this case,
+  // `decode.audio.vocoder` holds 99.46% and 94.10% of its leaf (97.85%, 91.57%,
+  // 90.6% and 89.7% on earlier runs of this box); on the 21B artifact this row
+  // shipped it holds 97.0% and 99.99%. Under R1b it holds 0.00091% and 0.0035%.
+  // Between four and five orders of separation, which is the property the 0.50
+  // `decode.video.vae` floor below exploits, and why this number is 0.50 rather
+  // than tightened toward a measured share this box destroys. It also catches
+  // the NAME SWAP: under N1 the vocoder name lands on the mel's work and reads
+  // 2.76% and 7.68%, so that mutation now reds here as well as on (1b).
   //
   // THE MEL CANNOT HAVE ONE, AND THE REASON IS THAT THE TWO DISTRIBUTIONS
-  // OVERLAP. Honest, `decode.audio.mel` holds 2.13% and 8.43% here (9.4% and
-  // 10.3% on the other run) and 0.0004% to 2.9% on the artifact, because the
-  // audio VAE decode's cost RELATIVE to the vocoder is a property of the
-  // geometry. Under the MIRROR of R1b — mel emptied, the vocoder scope covering
-  // both calls — it holds 0.0032% and 0.0020%. The honest 21B render's 0.0004%
-  // is SMALLER than the mirror's 0.0032%, so no threshold separates them: any
-  // floor that reddens the mirror also reddens an honest render this row has
-  // already produced. The mirror is therefore measured, GREEN, and recorded as
-  // open in `### Owed out of W0` rather than closed by a number that cannot be
-  // justified.
+  // OVERLAP. Honest, `decode.audio.mel` holds 0.53% and 5.90% here (2.13%,
+  // 8.43%, 9.4% and 10.3% on earlier runs) and 0.0004% to 2.9% on the artifact,
+  // because the audio VAE decode's cost RELATIVE to the vocoder is a property of
+  // the geometry. Under the MIRROR of R1b — mel emptied, the vocoder scope
+  // covering both calls — it holds 0.00063% and 0.0051%. The honest 21B render's
+  // 0.0004% is SMALLER than the mirror's 0.0051%, so no threshold separates
+  // them: any floor that reddens the mirror also reddens an honest render this
+  // row has already produced. The mirror is therefore measured, GREEN, and
+  // recorded as open in `### Owed out of W0` rather than closed by a number that
+  // cannot be justified.
   //
   // The two directions are not equally expensive, and that is why one is closed
   // and one is disclosed. R1b moves the VOCODER's 90-99.99% onto the mel, which
@@ -3664,11 +3666,14 @@ void CheckRenderPhases(const nlohmann::json& table,
   // claims more than the numbers do. The reopen — the empty window between the
   // final chunk and the end of the decode — is itself a `decode.video.chunk`
   // record, so it sits inside BOTH candidate denominators and separates neither.
-  // Measured here, render 1: the leaf is 0.00105035 s against 0.00103919 s of
-  // chunk, a 1.06% difference that is two scope boundaries; render 2:
-  // 0.00514612 s against 0.00512619 s, 0.39%. The two denominators are within a
-  // percent of each other and the LEAF is the marginally stricter of the two, so
-  // nothing is loosened by this choice.
+  // Measured on the head this lands at, render 1: the leaf is 0.191059 s against
+  // 0.191044 s of chunk, a 0.0079% difference that is two scope boundaries;
+  // render 2: 0.408779 s against 0.408758 s, 0.0051%. An earlier run of the same
+  // binary at the same geometry read 1.06% and 0.39%, because the boundary cost
+  // is fixed while the leaf is not — which is the box, not the structure. Either
+  // way the two denominators are within about a percent of each other and the
+  // LEAF is the marginally stricter of the two, so nothing is loosened by this
+  // choice.
   //
   // The chunk is used because it is the same window the containment assertion
   // below encloses each vae record IN, which keeps this ratio between two
