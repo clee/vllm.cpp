@@ -331,11 +331,24 @@ struct Sm120BlockwiseConfigSwapAb {
 // A config with `ScaleGranularityM != 1` on the unswapped path — or
 // `ScaleGranularityN != 1` on the swapped one — would bind `m`, and this build
 // then STOPS HERE rather than shipping a predicate that silently cannot ask.
+//
+// The same treatment covers the BLOCK GEOMETRY refusals, `kBlockN` and
+// `kBlockK`, which rested on prose alone. Those two turn away any checkpoint
+// whose `weight_block_size` is not `[128, 128]` BECAUSE the collective is
+// instantiated for that geometry and nothing else, so their constants are
+// correct only while they equal the configs' own scale-vector sizes.
+// `MatmulFp8BlockScaledKernelCuda` computes `k_tiles` from the RUNTIME
+// `block_k` while CUTLASS deduces `layout_SFA`/`layout_SFB` from
+// `ScaleGranularityK` (`blockwise_scale_layout.hpp`, `ceil_div(K, SFVecSizeK)`),
+// and the same holds along N. Let those two numbers drift apart and the
+// checkpoint's scale grid is read on a stride it was not written with — wrong
+// numbers rather than a refusal, and no token gate can see it.
 template <typename Cfg>
 struct Sm120BlockwiseConfigBinding {
   using G = typename Cfg::Gemm;
   static constexpr int kNGranularity = G::swap_ab ? G::kScaleGranularityM : G::kScaleGranularityN;
   static constexpr int kMGranularity = G::swap_ab ? G::kScaleGranularityN : G::kScaleGranularityM;
+  static constexpr int kKGranularity = G::kScaleGranularityK;
   static constexpr int kTileK = cute::size<2>(typename G::MmaTileShapeType{});
 };
 
@@ -357,6 +370,20 @@ static_assert(BindDefault::kTileK == kFp8BlockScaledTileK &&
                   BindSwapAb::kTileK == kFp8BlockScaledTileK,
               "an sm120 blockwise config has a TileShape K that kFp8BlockScaledTileK does not "
               "name");
+// The block geometry the `kBlockN` / `kBlockK` refusals pin the CHECKPOINT to
+// is the geometry these configs are instantiated for. `kTileK` above is a
+// different claim: it is the mainloop's tile, not the scale vector, and the two
+// are equal here only by arithmetic coincidence.
+static_assert(BindDefault::kNGranularity == kFp8BlockScaledBlockN &&
+                  BindPingpong::kNGranularity == kFp8BlockScaledBlockN &&
+                  BindSwapAb::kNGranularity == kFp8BlockScaledBlockN &&
+                  BindDefault::kKGranularity == kFp8BlockScaledBlockK &&
+                  BindPingpong::kKGranularity == kFp8BlockScaledBlockK &&
+                  BindSwapAb::kKGranularity == kFp8BlockScaledBlockK,
+              "an sm120 blockwise config reads the weight scale on a block geometry that "
+              "kFp8BlockScaledBlockN / kFp8BlockScaledBlockK do not name, so the block_n / "
+              "block_k refusals would admit a checkpoint whose scale grid this kernel then "
+              "reads on the wrong stride");
 
 // ---- vLLM `cutlass_gemm_caller_blockwise`, raw-pointer surface -------------
 // `a` is the activation `[M,K]` fp8 bytes; `b` is the weight `[N,K]` fp8 bytes
