@@ -245,6 +245,37 @@ genuinely needs `nvcc` is the Marlin **kernel** and every **execution** of the
 device path. Landing without those is acceptable and is what the PENDING rows
 above record; claiming the host arm could not be compiled was not.
 
+### A gate this row was already failing, and cannot repair in place
+
+`scripts/check-doc-checkpoint.py` is red on this branch, and it was red at the
+reviewed head `29b1128e` with the identical two errors, measured with
+`--base 96ed8346f --head 29b1128e3`:
+
+```
+ERROR: commit 1c62d9974: changed user_usage but did not update docs/USAGE.md
+ERROR: commit 8fa900a62: changed .agents/benchmark-record.md: measurement
+       recorded but did not update docs/STATUS.md
+```
+
+The PR description claimed this gate had one real failure and that it was
+repaired. It was not, and `.github/workflows/ci.yml:519` runs the same
+`--base/--head` invocation, so the lane is red for this reason independently of
+[#1371](https://github.com/mudler/vllm.cpp/issues/1371).
+
+The second error names a real gap and it is now closed: this row moved a
+lifecycle state and recorded a measurement, and `docs/STATUS.md` said neither.
+It does now.
+
+The first error, and the historical form of the second, cannot be closed by a
+later commit. `check_doc_checkpoint` iterates `commits_in_range` and judges each
+commit on its own contents, so the obligation belongs to `1c62d9974` and
+`8fa900a62` and nothing appended afterwards discharges it. Repairing those two
+would mean rewriting commits that are already the reviewed base, which resets
+the pull request's continuous-integration approval and moves the head a fresh
+reviewer was asked to look at. That is a scheduling decision rather than a
+technical one, so it is recorded here as owed and raised for the operator rather
+than taken unilaterally by a repair pass.
+
 ### The gate, as it actually ran
 
 Every number below is from a run on this box, `-DCMAKE_BUILD_TYPE=RelWithDebInfo`,
