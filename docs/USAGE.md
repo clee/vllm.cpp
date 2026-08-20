@@ -4408,7 +4408,7 @@ save.
 
 ```sh
 VT_MOE_EXPERT_STREAM=1 \
-VT_MOE_EXPERT_STREAM_SLOTS=8000 \
+VT_MOE_EXPERT_STREAM_SLOTS=4000 \
   ./build/examples/vllm-cli --model /models/Qwen3.8-2.4T-A95B-UD-Q1_0-00001-of-00008.gguf \
                    --prompt "The capital of France is" --max-tokens 16
 ```
@@ -4417,7 +4417,7 @@ VT_MOE_EXPERT_STREAM_SLOTS=8000 \
 
 `--device cpu` serves this today, and that is the arm every published number for
 this checkpoint was measured on. `--device cuda` now decodes it on a probed
-integrated part; see the five limits below before you rely on that.
+integrated part; see the six limits below before you rely on that.
 
 `--device cuda` refuses at load, by design, when the weights cannot be staged
 into device memory (issue
@@ -4443,7 +4443,7 @@ what makes the CUDA arm decode at all. Set it to `0` for the same-binary A/B bac
 to the staging behaviour.
 
 **It now decodes: 32/32 steps, at peak RSS 97.75 GiB of a 119.631 GiB box.**
-Five limits, stated plainly rather than left to be discovered.
+Six limits, stated plainly rather than left to be discovered.
 
 * **The device has to be probed capable, and most are not.** The condition is
   `cudaDevAttrPageableMemoryAccess AND cudaDevAttrIntegrated` — an integrated,
@@ -4489,13 +4489,23 @@ Five limits, stated plainly rather than left to be discovered.
   alias is measured ON GB10 not to be the cause — same shapes, same algorithm,
   bit-identical output from a `cudaMalloc` operand and from a 256-aligned host
   one. Treat the CUDA arm as unverified against the CPU arm until that gate is
-  settled.
+  settled, and **use `--device cpu` for this checkpoint today**: it is the arm
+  every published number here was measured on.
 * **No speed claim is attached.** `docs/BENCHMARKS.md` carries G0-SPEED as
   `VOID`, because a speed number behind a failing correctness gate is not a
-  result. Device access to host-resident weights on that part also has a recorded
-  penalty, and this lane reads ~6.95 GB of expert bytes per token that way, so a
-  CUDA arm slower than the CPU arm remains a real possible outcome. Read the
-  benchmarks file before assuming the GPU is the faster arm here.
+  result. The CPU arm serves this checkpoint at a steady **11.05 s/token at 4000
+  slots**, which is the count both recipes in this section set and the only count
+  that figure holds for. Device access to host-resident weights on that part also has
+  a recorded penalty, and this lane reads ~6.95 GB of expert bytes per token that
+  way, so a CUDA arm slower than the CPU arm remains a real possible outcome.
+* **More slots is not a free knob, and the reason is the page cache rather than
+  the arena.** The same binary at 8000 slots measured a 39.98-45.40 s/token
+  median over two runs, and the second consumed all 30,625 MiB of the box's swap:
+  the extra 9.27 GiB of arena takes the free memory the borrowed 370 GiB expert
+  mapping is served out of. The arena is also measurably not what exhausted the
+  box in [#1299](https://github.com/mudler/vllm.cpp/issues/1299) — a 64-slot
+  0.15 GiB arena failed exactly where an 8000-slot 18.55 GiB one did — so this
+  knob was never the lever there either.
 
 ### The same thing as config, and which one wins
 
@@ -4509,7 +4519,7 @@ below that, where weights stay borrowed out of the file mapping.
 ```sh
 ./build/examples/vllm-server --model /models/Qwen3.8-2.4T-A95B-UD-Q1_0-00001-of-00008.gguf \
   --offload-config '{"vllm_cpp":{"mmap":{"enabled":true,"prefault":false},
-                                 "expert_stream":{"enabled":true,"slots":8000}}}'
+                                 "expert_stream":{"enabled":true,"slots":4000}}}'
 ```
 
 | Key | Environment equivalent | Default |

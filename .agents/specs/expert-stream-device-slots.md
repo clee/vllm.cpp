@@ -111,7 +111,18 @@ the other end: the load succeeds only when
 `host_memory_is_device_addressable()` answers true, because W0d's conditional
 refusal is keyed on it.
 
-What that means precisely, because "W0 landed" would overstate it:
+The three gates, reported one result each. Every row states what it read at
+`95883dcae` where W0f moved it, so the two runs in `## Evidence` are not confused
+for one:
+
+| Gate | Result |
+|---|---|
+| **G0-CORRECT** | **FAIL, and it now has a CUDA side to fail on.** At source `95883dcae` the entry read "NO CUDA SIDE", because that arm emitted zero tokens. With W0f it emits 32, and they diverge from the CPU arm at step 7 on a MEASURED near-tie: the CPU arm's own runner-up is the token CUDA emitted, 1.4% behind, and one step later the margin is 0.1%. The CPU side remains byte-identical across four runs and two slot counts (32 ids, listed in `## Evidence`). The alias is measured ON GB10 not to be the cause; WHAT is remains open under `## Owed`. |
+| **G0-LIVE** | **PASS on both arms.** CPU: `steps=32`, `forced=0`, decode-phase `exhausted` delta **0** at both 4000 and 8000 slots. CUDA with W0f: `steps=32`, decode-phase `exhausted` delta **0**, peak RSS 97.75 GiB of a 119.631 GiB box, swap untouched, container exit 0. At `95883dcae` this read "NOT REACHED on CUDA", because no step boundary was ever crossed. |
+| **G0-SPEED** | **VOID, and no ratio is published.** The CPU denominator is measured: steady decode **11.05 s/token**, rep 2's median over 29 samples (min 9.43, max 13.25) at 4000 slots, rep 1's median 11.22, the two reps agreeing within 1.5%. A CUDA number exists now and is recorded in `../benchmark-record.md` for the record only, because this row's own stop condition VOIDS a speed result behind a failing correctness gate. No ratio may be inferred from the two. |
+
+What that means precisely, because both "W0 landed" and "W0 failed" would
+misstate it:
 
 * **W0b — the predicate.** `Platform::host_memory_is_device_addressable()`,
   base false, CUDA from `cudaDevAttrPageableMemoryAccess AND
@@ -234,17 +245,29 @@ What that means precisely, because "W0 landed" would overstate it:
   `ConcurrentManagedAccess` — are not carried here, because the verdict turns on
   the two that are and inventing the other two would be worse than omitting
   them.
-* **W0e — the measurement. RUN** on 2026-08-19 inside one `rc hold` on
-  `dgx:gpu0`, at source `9c783a8be`. G0-LIVE **PASS**, G0-CORRECT **FAIL** on a
-  measured near-tie, G0-SPEED **VOID** by this row's own stop condition. The
-  numbers and the two void attempts that preceded them are in `## Now` above and
-  in [`../benchmark-record.md`](../benchmark-record.md).
+* **W0e — the measurement. RAN TWICE, on two trees, and the pair is the
+  result.** The first run, on one `rc hold` on `dgx:gpu0` at source `95883dcae`
+  (W0f's parent), produced a reproduced CPU figure of **11.05 s/token at 4000
+  slots**, a CUDA load that works, and a CUDA arm that generates nothing. The
+  second, at source `9c783a8be` with W0f in the tree, produced **32/32 CUDA
+  decode steps**: G0-LIVE **PASS**, G0-CORRECT **FAIL** on a measured near-tie,
+  G0-SPEED **VOID** by this row's own stop condition. `## Evidence` and
+  [`../benchmark-record.md`](../benchmark-record.md) carry both, in two sections
+  that must not be mixed: 11.05 s/token is the standing CPU number and the second
+  run's CPU column is a same-lease control rather than a second attempt at it.
 
-So `--device cuda` on `Qwen3.8-2.4T-A95B UD-Q1_0` is no longer refused by the
-predicate on this box: the probe has measured `PageableMemoryAccess == 1`, and
-the predicate was probed rather than assumed precisely so that this sentence
-could change on evidence. What has NOT run is the load itself. The developer's
-target remains that GPU figure, and W0e is what produces it.
+Today `--device cuda` on `Qwen3.8-2.4T-A95B UD-Q1_0` **loads and decodes**. The
+load is what W0b-W0d were for; at `95883dcae` it then died in the first forward,
+and the cause was the DENSE half of the model rather than the expert lane -- the
+non-expert weights were resident twice on a unified part, and a 0.15 GiB slot
+arena failed in exactly the place an 18.55 GiB one did. That was
+[#1299](https://github.com/mudler/vllm.cpp/issues/1299), and W0f is the fix:
+32/32 steps at peak RSS 97.75 GiB.
+
+**The developer's target is a GPU FIGURE, and this row still cannot publish
+one.** G0-CORRECT fails on the step-7 near-tie, so G0-SPEED is VOID by this row's
+own stop condition. A decode number exists in `../benchmark-record.md` for the
+record; it is not a result and no ratio may be inferred from it.
 
 ## Scope
 
@@ -499,6 +522,277 @@ gate that stays green without it measured a class, not a capability.
 
 **G-DISCRETE (owed, cannot run here).** See `## Owed`.
 
+## Evidence
+
+W0a and W0e, `dgx:gpu0` (GB10, sm_121a, driver 580.173.02, CUDA 13.0.88, 20
+cores, 122,502 MiB RAM, 30,625 MiB swap), one `rc hold`
+`edb4b3d0-5d6e-422f-ade6-bff5339e3396`, 2026-08-18T22:13:12Z to
+2026-08-19T00:58Z, released by interrupting its client. Source `95883dcae`,
+the head of PR [#1242](https://github.com/mudler/vllm.cpp/pull/1242).
+
+### The build, because a degraded one would have voided every number
+
+`cmake -DCMAKE_BUILD_TYPE=Release -DVLLM_CPP_CUDA=ON
+-DVLLM_CPP_CUDA_ARCHITECTURES=121a -DVLLM_CPP_CUTLASS_DIR=/cutlass
+-DVLLM_CPP_TRITON=ON`, CUTLASS 4.5.0 staged host-side. The configure log
+reports `fp4-mma`, `cutlass-nvfp4`, `cutlass-fp8`, `marlin-nvfp4` and `fa2` all
+`ENABLED for [121a]`, `CUTLASS found at /cutlass; enabling sm120a NVFP4 cutlass
+GEMM`, `FlashAttention-2 prefill/decode: ENABLED for arch(es) [121a]`, and
+`Triton AOT W2: embedded trees [sm_80;sm_86;sm_89;sm_90a;sm_100a;sm_121a]`.
+Both arms are the SAME binary, and every arm ran with the page cache dropped
+first (`echo 3 > /proc/sys/vm/drop_caches`, ~90.9 GB available after each drop).
+
+### The harness, and why it is not `vllm-cli`
+
+`benchmarks/expert_stream_device_w0e.cpp`, a thin client of `include/vllm.h`
+linked against the packaged shared library, which exports the C ABI and nothing
+else. **The project builds it**, as the `expert-stream-device-w0e` target. It
+was first written unwired, beside `marlin_moe_standalone.cpp`, on the reading
+that a gate instrument is not a shipped capability. Wiring it found that the
+file did not compile under the project's own flags at all — three backslash
+continuations inside `//` comments, which `-Werror=comment` rejects — so the
+recorded recipe was the only thing that had ever built it. An instrument
+nothing compiles rots against the very ABI it measures, and a measurement whose
+harness no longer builds cannot be reproduced, so the target is the correct
+shape even though the file is not a capability. It needed to exist because the gate wants three things from ONE
+generation, and no shipped command produces all three: the generated TOKEN IDS
+(`vllm_complete_tokens`, ABI v13, which writes them into a caller buffer), a
+PER-STEP arrival timestamp (a custom logits processor, invoked once per decode
+step), and the expert-stream counters at both ends of the run
+(`VT_MOE_EXPERT_STREAM_STATS_EVERY=1`, so the periodic line prints at step 1 and
+every step after; at the default 16 a 32-token run prints two lines and a
+5-token one prints none, which is indistinguishable from a dead lane).
+
+The logits processor is a PURE OBSERVER: it records and returns without touching
+`logits`, so the argmax the sampler takes is the one it would have taken without
+it. Its own `token_ids` view is recorded but NOT used for the gate, because
+`tests/capi/test_capi.cpp` states that under the async scheduler that view can
+lag the emitted tokens.
+
+The prompt is fixed as TOKEN IDS rather than as text, `760,6511,314,9338,369`
+("The capital of France is", produced by `build/examples/tokenize` from the
+checkpoint's own GGUF metadata), so both arms are fed byte-identical input and
+no tokenizer step sits between the two.
+
+### The CPU arm: measured, reproduced, and it replaces the VOID #912 F1 figure
+
+`--device cpu`, `VT_GGUF_PREFAULT=0 VT_MOE_EXPERT_STREAM=1`, `--max-num-seqs 1`,
+greedy, 32 tokens. Four runs, two slot counts, two reps each:
+
+| slots | arena | load | TTFT (step 1) | steady decode s/token, steps 4-32 | total generate | peak RSS | min avail | peak swap |
+|---|---|---|---|---|---|---|---|---|
+| 4000 | 9.28 GiB | 271.1 s | 85.90 s | median **11.22**, min 9.62, max 12.51 | 502.3 s | 86.5 GiB | 16,840 MiB | not sampled |
+| 4000 | 9.28 GiB | 255.7 s | 79.09 s | median **11.05**, min 9.43, max 13.25 | 460.7 s | 86.5 GiB | 16,347 MiB | 6,883 MiB |
+| 8000 | 18.55 GiB | 261.6 s | 94.25 s | median 45.40, min 20.73, max 82.68 | 1643.2 s | 86.6 GiB | 6,985 MiB | not sampled |
+| 8000 | 18.55 GiB | 266.5 s | 132.74 s | median 39.98, min 16.06, max 94.30 | 1581.6 s | 86.6 GiB | 6,941 MiB | **30,625 MiB (all of it)** |
+
+**Read the 8000-slot rows as a memory result, not a cache result.** A bigger
+cache came out slower, and the four available median pairings span 3.56x to
+4.11x: 3.62x same-rep on the pair that produced the publishable figure (39.98
+against 11.05) and 4.05x pairing rep 1 with rep 1 (45.40 against 11.22). It also
+came out far less steady: the steady window's max/min ratio is 3.99x in rep 1
+(20.73 to 82.68 s) and 5.87x in rep 2 (16.06 to 94.30 s), against 1.30x and
+1.40x at 4000 slots. Whichever pairing is quoted, the direction is wrong.
+
+**The cause is NOT that the arena does not fit, and the arithmetic says so.**
+18.55 GiB of arena beside this model's 62 GiB of dense weights is 80.55 GiB on a
+119.63 GiB box, which fits with room to spare, and the columns agree: peak RSS
+moves 86.5 -> 86.6 GiB for a 9.27 GiB arena delta. The two columns that DO move
+are `min avail`, 16,347 -> 6,941 MiB, a 9,406 MiB fall that is about the arena
+delta, and peak swap, 6,883 -> 30,625 MiB, which is all of it. The
+best-supported reading of that pattern is **page-cache displacement**: the
+borrowed 370 GiB expert mapping is served out of whatever memory is free, the
+arena takes that memory, and the reclaim pressure it creates pushes anonymous
+pages to swap. That is a reading of the columns and not a proven mechanism, and
+this run cannot separate it from plain reclaim pressure, because it sampled no
+page-cache size and no major-fault counter. The operational conclusion does not
+depend on which of the two it is, and it is unchanged: **more slots is not a
+free knob.**
+
+Both 8000-slot runs reproduce each other, so this is the box's behaviour and not
+a fluke. **The publishable CPU figure is the 4000-slot one, 11.05 s/token**,
+which is rep 2's median; rep 1's is 11.22, so the two reproduce within 1.5%. It
+is the first live-cache streaming-ON decode number this project has;
+`docs/BENCHMARKS.md:8` recorded streaming-ON as VOID (#912 F1, the step clock
+dead from token 3) with a re-measure owed.
+
+Steps 1-3 are excluded from the steady figure and reported separately because
+they are not steady state: step 1 is prefill, and steps 2-3 are still filling a
+cold cache (85.90, 80.38, 16.06 s, then 11.7 and below).
+
+**G0-LIVE, gated on the DIFFERENCE and never the total.** At 4000 slots the
+after-prefill snapshot is `steps=1 hits=0 misses=10074 evictions=0 fills=4000
+bytes=9961472000 exhausted=6074` and the final one is `steps=32 hits=37096
+misses=58538 evictions=48464 fills=52464 bytes=130654666752 exhausted=6074`, so
+the decode-phase `exhausted` delta is **0** over 31 decode steps. At 8000 slots
+the same pair reads 2074 and 2074, delta **0**. Both reps of each slot count
+produce byte-identical counters, so the lane is deterministic. `steps=32 > 0`.
+`forced` is 0 by construction and is deliberately absent from the stderr line:
+its only setter is `detail::ExpertStreamSetForceFallback`, which
+`src/vllm/model_executor/models/qwen3_5_internal.h:488` records as having no
+production caller, and `qwen3_5.cpp:5521` (`++forced_` in
+`Qwen35ExpertStream::Slice`) counts it separately from `exhausted` for exactly
+that reason, in a comment that says so.
+
+**The tokens.** All four CPU runs, across both slot counts, produced the same 32
+ids:
+
+```
+11751,13,11751,369,264,3177,7172,303,279,17631,919,314,9338,11,383,279,
+181474,10629,13,1049,369,279,7526,3177,303,9338,321,369,3750,364,1141,25438
+```
+
+which detokenize to " Paris. Paris is a city located in the northern part of
+France, on the Seine River. It is the largest city in France and is known for
+its iconic", `finish_reason=length`, `completion_tokens=32`.
+
+### The CUDA arm at `95883dcae`: it loads, and it does not generate
+
+**Everything in this subsection was read on W0f's PARENT tree and is kept as
+measured.** It is the diagnosis W0f was built from, not a claim about the tree
+this spec describes; the subsection after it is the same harness re-run with W0f
+and it reaches 32 decode steps.
+
+**The load is the new thing and it works.** `--device cuda` on this checkpoint
+used to refuse ([#1123](https://github.com/mudler/vllm.cpp/issues/1123)); W0d's
+conditional bound removes that refusal when the lane serves the towers, and the
+load now completes in 255-272 s with 61.20 GiB resident. The lane then engages:
+the `[expert-stream] ON slots=... resident=... GiB` banner prints on the device
+arm, which is W0c's whole point.
+
+That banner is also the first production evidence that **W0b's CUDA leg is
+reached and answers true on real hardware**. Neither the banner nor the
+successful load is reachable unless `host_memory_is_device_addressable()`
+returned true from the CUDA platform, so the leg no longer rests on the fake
+platform in `test_expert_stream_device_slot` alone. The negative — a mutation
+that makes it answer false — is still owed and is in `## Owed`.
+
+**Then the first forward exhausts the machine. Seven attempts, zero decode
+steps, every one of them.**
+
+| slots | arena | prompt tokens | load | RSS after load | decode steps | peak system `used` | peak swap used |
+|---|---|---|---|---|---|---|---|
+| 8000 | 18.55 GiB | 5 | 267.2 s | 61.20 GiB | 0 | 100,215 MiB | not sampled |
+| 4000 | 9.28 GiB | 5 | 271.6 s | 61.20 GiB | 0 | 94,737 MiB | not sampled |
+| 4000 | 9.28 GiB | 5 | 255.3 s | 61.20 GiB | 0 | 120,351 MiB | 30,569 MiB |
+| 3500 | 8.12 GiB | 1 | 262.8 s | 61.20 GiB | 0 | 120,296 MiB | 28,138 MiB |
+| 3500 | 8.12 GiB | 1 | 265.3 s | 61.20 GiB | 0 | 120,347 MiB | 30,461 MiB |
+| 3500 | 8.12 GiB | 1 | 272.3 s | 61.20 GiB | 0 | 120,306 MiB | 30,172 MiB |
+| **64** | **0.15 GiB** | 1 | 268.9 s | 61.20 GiB | 0 | 118,257 MiB | 30,211 MiB |
+
+Each run was stopped by a guard that kills the container when MemAvailable plus
+SwapFree falls under a floor, because an out-of-memory kill on GB10 takes the
+whole machine down rather than the process. The guard is not what makes these
+runs fail: the last two rows above were still climbing at roughly 10 GB of swap
+per minute with under 600 MiB of swap left, so the kernel was seconds from the
+kill the guard exists to prevent.
+
+**The expert lane is not the cost, and that is measured rather than argued.**
+The 64-slot row is the control: a **0.15 GiB** arena dies in the same place an
+**18.55 GiB** one does, 124x smaller and no further along. The in-place tower
+fallback is not the cost either: a 1-token prompt has a protected set of
+`93 x 3 x 10 = 2,790` slices, which fits 3500 slots with no fallback taken at
+all, and it behaves exactly like the 5-token prompt whose 13,950-slice set
+cannot fit any arena on this box.
+
+**The growth is ANONYMOUS, not file-backed**, so the GPU is not pinning the
+mapping's pages through its address translation — which was the first
+hypothesis, and it is wrong. Sampling the container process every 5 s through
+the load and into the forward:
+
+```
+RssAnon:   8.1 -> 13.9 -> 25.9 -> 38.3 -> 49.4 -> 61.4 GB     (through the load)
+RssFile:   0.1-0.2 GB throughout, 4.6 GB at the very end
+VmSwap:    0 -> 5.4 -> 11.4 -> 16.5 -> 27.1 -> 31.0 GB        (inside the forward)
+```
+
+Host `RssAnon` plus `VmSwap` reaches about 65 GB while the system reports
+~119 GiB `used`, and the ~42 GiB difference is device memory that this unified
+part does not charge to the process RSS. **So the non-expert weights are
+resident twice** — once as the host-side `OwnedTensor` and once as the
+`ResidentWeight` device staging copy — and on a box where device memory IS host
+memory, that doubling is what runs it out.
+
+[`expert-streaming.md`](expert-streaming.md) already measured the host half of
+this: the GDN V-head reorder makes `attn_qkv` and `ssm_out`
+`kTransformedWeight`, which expands them from about 5.5 bits to bf16, roughly
+**50 GiB** of the 61.20. The CPU arm pays that once and serves. The CUDA arm
+pays it twice and cannot. That spec's own sentence — "Whoever takes this needs
+BOTH: the streaming lane for the ~330 GiB of experts, and a transformed-weight
+path that does not expand" — is exactly this result, and W0 delivered the first
+half. Filed as [#1299](https://github.com/mudler/vllm.cpp/issues/1299), and
+**FIXED as W0f**, which is the next subsection. The prediction that the fix would
+need a transformed-weight path turned out to be one option rather than the only
+one: not expanding, and not paying for the expansion twice, are different repairs
+and W0f is the second.
+
+### The CUDA arm with W0f at `9c783a8be`: it decodes
+
+Same harness, same lease shape, same box, same prompt ids `760,6511,314,9338,369`,
+streaming ON at 4000 slots, greedy, 32 tokens, page cache dropped between arms.
+`../benchmark-record.md` carries the full entry including the two VOID attempts
+that preceded it, which were void because the build target relinked nothing.
+
+| Observable | CUDA | CPU (same-lease control) |
+|---|---|---|
+| load | 266.330 s | 253.504 s |
+| RSS after load | 61.20 GiB | 62.45 GiB |
+| decode steps | **32** | 32 |
+| decode-phase `exhausted` delta | **0** | **0** |
+| peak RSS | **97.75 GiB** | 92.19 GiB |
+| swap used at peak | 0 | 0 |
+| container exit | 0 | 0 |
+
+**What W0f moved, counted rather than inferred.** An RSS curve cannot separate
+"the branch declined and staged", "the branch re-homed and the pages did not come
+back" and "something else allocated", so `MakeHostBytesDeviceAliasable` reports
+its outcome per weight. Read at the point re-homing plateaus, call **1361** of
+the first forward: **60.793 GiB** re-homed into an aligned host block and then
+aliased, **~9.2 GiB** declined as misaligned GGUF borrows and still staged, and
+0.02 GiB aliased in place. The qualifier is part of the number, because the
+counters are per CALL with no memo on the alias branch and keep growing at
+roughly 70 GiB per decode step. On the CPU arm the same counter reads **0
+calls**, which is a live control that the branch is platform-gated and not an
+argument that it is.
+
+**And the ids diverge at step 7.** `...,264,3177,7172,...` on CPU against
+`...,264,3177,303,...` on CUDA. An instrumented CPU run printing the top-2 logits
+per step shows the CPU arm's own runner-up at that step is `303` — exactly what
+CUDA emitted — 0.264709 logits behind, 1.4 % of the winner; two steps later the
+margin is 0.022802, about 0.1 %. The declared gate fails and the wave stops.
+
+**The alias is excluded as the cause, on the target silicon.** `rc` job
+`7c7a05e9-be87-48f4-94ae-1bbe0340f063` on `dgx:gpu0` (`NVIDIA GB10 sm_121`,
+driver 580.173.02, cuBLASLt 130101, the predicate re-derived in the job's own
+output as `pageableMemoryAccess=1 integrated=1`) ran six checkpoint shapes
+crossed with both cuBLASLt formulations the dense path issues: 12 measurements,
+`PROBE_EXIT=0`, `PROBE_FAILURES=0`. A repeated heuristic call is identical 12/12;
+the tree's unset preference equals the documented 256 default 12/12; weakening
+the promise to 16 moves nothing 12/12; and `cublasLtMatmul` output is bit-exact
+between a `cudaMalloc` operand and a 256-aligned host block 12/12,
+`differing=0`, every status `SUCCESS`. At least five distinct algorithm
+configurations appear across the twelve and they differ from the earlier
+`thor:gpu0` leg's, so the heuristic was re-resolved rather than replayed and the
+instrument discriminates. The structural reason needs no lease:
+`cublasLtMatmulAlgoGetHeuristic` takes no operand pointers, so alignment reaches
+it only through a preference this tree never sets.
+
+**Excluding one cause is not identifying another.** What the divergence IS
+remains unmeasured and is carried under `## Owed` with its next traceable step
+named.
+
+### What was running beside the measurement
+
+The lease excluded every other `rc` job for its duration. Two things were not
+excluded and are recorded rather than assumed away. An orphaned
+`VLLM::EngineCore` process from an earlier session held 3.32 GiB of host RSS for
+the entire window; it is not this row's process and it was left alone. And the
+FIRST arm started at 22:13, seconds after the previous lease holder's four-hour
+render released the device, with the one-minute load average still at 17.5 —
+which is one of the two reasons the first 8000-slot run is the noisiest of the
+four, the other being the swap it drove. Every later arm started from a quiet
+box.
+
 ## Dependencies
 
 | Dependency | Shape |
@@ -670,8 +964,10 @@ re-derived here.
 | **`scripts/check-doc-checkpoint.py` stays RED on this branch for commit `939755f99` and cannot be made green here** ([#1387](https://github.com/mudler/vllm.cpp/issues/1387)). That commit appended a measurement to `.agents/benchmark-record.md` without writing `docs/FEATURES.md`, whose streaming row then said "CPU keep-quant towers only" after W0c had made a host-readable staging device take the slot arm. | The PAGE is repaired here. The GATE is not, and cannot be: the checker walks a range one COMMIT at a time, and `main` may never be force-pushed, so no later commit can make a published one green. The squashed commit that lands carries both paths and passes. Changing the walk is checker semantics and needs its own row, spec and red-first evidence. |
 | **The CUDA registrar's own probe assembly is still unmutated.** `src/vllm/platforms/cuda.cpp`'s `Registrar` reads `cudaDevAttrPageableMemoryAccess` and `cudaDevAttrIntegrated`, defaults each to 0 on a query failure, and hands the pair to `HostMemoryIsDeviceAddressableFromAttrs`. That call and those defaults compile only in a CUDA build, so nothing on the CPU tier can mutate them. | The RULE they feed is no longer part of this debt: #1378 extracted it and gated it over all four attribute pairs in `test_platform`, and both term-deletion mutations are RED there. What remains is narrower and honest -- the probe calls, the failure defaults, and the registration itself -- and it needs the same `dgx:gpu0` lease as W0e. Named here rather than folded into the W0b bullet, which used to claim more than it had. |
 | **G-DISCRETE: validate W1/W2 on a discrete NVIDIA GPU.** The measurement: on a device with VRAM V and `host_memory_is_device_addressable() == false`, load a GGUF whose `*_exps` towers exceed V, with the lane on, and gate (i) token-exactness against the CPU arm on the same checkpoint, (ii) decode-phase `exhausted` delta 0, (iii) peak device allocation <= non-expert remainder + arena. | No discrete NVIDIA GPU is reachable from this project. `dgx:gpu0` is a GB10 where device memory IS host memory, so a device store there exercises the plumbing and not the thing W1 exists for. Recorded rather than implied, because a gate nobody can run is not a gate. |
+| **A mutation of W0b's CUDA leg.** `CudaPlatform::host_memory_is_device_addressable` compiles only in a CUDA build, so no CPU-tier gate can invert it. The bullet in `## Now` promised this line and the table did not carry it, which is fixed here. | **Half discharged by W0e and stated as half.** The lane engaged on a real `--device cuda` run — the `[expert-stream] ON` banner printed and the #1123 refusal did not fire — and neither happens unless the probed predicate returned true on the actual CUDA platform, so the leg is now proven REACHED and proven to answer true on a GB10. What is still owed is the negative: a mutation that makes it answer false and shows a gate go red. That needs a CUDA build with a test target, and W0e built with `-DVLLM_CPP_BUILD_TESTS=OFF` because the lease was for the measurement. |
 | **A zero-copy device filler (GPUDirect Storage / `cuFile`).** | W1 ships the staging bounce by choice, for the reasons in its design note. The measurement that would justify replacing it — a device-arm decode where the H2D leg is a measurable fraction of fill time — does not exist until W1 has run somewhere. |
-| **The CPU arm's streaming decode figure is still VOID.** `docs/BENCHMARKS.md:8` records it as VOID (#912 F1) with a re-measure owed. | Owned by `ENG-EXPERT-STREAM` and arranged separately by the operator. It is the DENOMINATOR for G0-SPEED, not a precondition for G0-CORRECT or G0-LIVE. |
+| ~~**The CUDA arm loads and then exhausts the box in its first forward, so this row still has no GPU number.**~~ **CLOSED by W0f**, 2026-08-19 ([#1299](https://github.com/mudler/vllm.cpp/issues/1299)): the non-expert weights were resident twice on a unified part, and `ResidentWeight` now aliases the host bytes where `host_memory_is_device_addressable()`. The same checkpoint reaches **32/32 decode steps** at peak RSS 97.75 GiB. | Kept as a line rather than deleted, because the entry recorded a diagnosis as well as a debt and the diagnosis held: a 0.15 GiB arena failed where an 18.55 GiB one did, and the growth was `RssAnon` while `RssFile` stayed flat, which is what pointed at the dense remainder rather than at the lane. What it got wrong was the scope call -- "not fixable inside this row's scope" -- and W0f fixing it in one branch is the correction. What is NOT closed is the GPU NUMBER: G0-CORRECT fails, so G0-SPEED stays VOID and no rate is published. |
+| ~~**The CPU arm's streaming decode figure is still VOID.**~~ **CLOSED by W0e**, 2026-08-18: streaming-ON decode on a live cache is **11.05 s/token** steady at 4000 slots, rep 2's median with rep 1 at 11.22, and the decode-phase `exhausted` delta is 0 in the same run. See `## Evidence`. | Kept as a line rather than deleted because `docs/BENCHMARKS.md:8` still carries the parent row's VOID (#912 F1) text for `ENG-EXPERT-STREAM`, which owns that row's own re-measure. This row measured its own denominator and is no longer waiting on one. |
 | **A ratified gate for a two-arm comparison whose greedy path is a coin flip.** The measurement that would settle it: over N prompts, the distribution of top-2 margins at each step, and the fraction of steps whose margin is below the arms' measured arithmetic spread. | W0e MEASURED the margin at the divergent step (0.264709 logits, 1.4 %) and one step later (0.022802, 0.1 %), so the token-exact gate is failing on ties rather than on a defect. Ratifying a distributional gate is exactly the decision `AGENTS.md` reserves for an explicit act — "use an explicitly ratified distributional gate only when the oracle's greedy decode is non-deterministic" — and it is the operator's, not this row's. Until it is taken, G0-CORRECT stays FAILING and G0-SPEED stays VOID, which is the conservative reading and the one that cannot publish a wrong number. |
 | **WHAT the step-7 divergence IS.** The alias is EXCLUDED as its cause, on the target silicon: the algo-identity probe ran on `dgx:gpu0` as well as on `thor:gpu0` (`rc` job `7c7a05e9-be87-48f4-94ae-1bbe0340f063`, `NVIDIA GB10 sm_121`, cuBLASLt 130101, 12/12 identical selection, 12/12 bit-exact output, `PROBE_FAILURES=0`), so this entry is no longer about the probe. | Excluding one cause is not identifying another, and nothing here may present it as one. The standing hypothesis is that the two arms run genuinely different GEMM kernels and the greedy path is a coin flip, and that is not measured. The next traceable step needs no new instrument beyond a two-arm dump of the step-7 forward: name the FIRST tensor whose values differ between the CPU and CUDA arms at that step, and the operation that produced it. It needs the same `dgx:gpu0` lease as W0e. Until it runs, G0-CORRECT stays FAILING and G0-SPEED stays VOID. |
 | **The CUDA arm's own top-2 margin at the divergent step.** | The scratch instrument that reads `logits` in the completion callback SIGSEGVs on the CUDA arm (`SCRIPT_EXIT=139`). **WHY IT FAULTS IS UNMEASURED.** An earlier draft of this row wrote "almost certainly because the pointer it is handed there is not host memory on that arm", and that is a hypothesis, not a reading: nothing printed the pointer, nothing asked `cudaPointerGetAttributes` about it, and no fault address was recorded. In a change whose central risk is handing device kernels host pointers, a segfault whose cause was guessed at is exactly the finding that must not be dismissed — so it is recorded as unmeasured rather than as explained. The CPU arm's margin is enough to establish the near-tie (`303` is its own runner-up), and the next lease should print `cudaPointerGetAttributes(logits)` in that callback before anything else. |
