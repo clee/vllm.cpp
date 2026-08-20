@@ -142,13 +142,29 @@ TEST_CASE("reference tier: the CPU source device is never eligible") {
 //
 // A SEPARATE device slot from the cases around it, deliberately: the tier cannot
 // be uninstalled once a provider is registered, so sharing kXPU with the unified
-// case below would make this assertion depend on doctest's execution order. The
-// precondition is REQUIREd rather than assumed, so a build that registers a real
-// Tenstorrent backend fails loudly here instead of measuring the wrong table.
+// case below would make this assertion depend on doctest's execution order.
+//
+// AND THAT SLOT IS SKIPPED, NOT ASSERTED EMPTY. kTENSTORRENT is not an unused
+// enumerator: src/vt/tenstorrent/tenstorrent_ops.cpp registers 21 op sites on it,
+// `OpId::kRelu` among them, and `vllm` carries an INTERFACE `--whole-archive`
+// (CMakeLists.txt), so on a `-DVLLM_CPP_TENSTORRENT=ON` build that registrar runs
+// inside THIS binary. An earlier draft REQUIREd the table empty and called that
+// failing loudly. It is not: the failure is unconditional on a legitimate
+// configuration nobody's CI builds, so it would land as a permanent red for
+// whoever next turns that backend on, and RegisterBackend would displace a live
+// backend in-process on the way. Skipping is the honest answer, because the
+// property under test needs a slot no other registrar has claimed and this build
+// then has none.
 // ---------------------------------------------------------------------------
 TEST_CASE("reference tier: unified memory the host cannot address is refused, by name") {
   constexpr DeviceType kSlot = DeviceType::kTENSTORRENT;
-  REQUIRE(vt::OpProviderCount(OpId::kRelu, kSlot) == 0);
+  if (vt::TryGetBackend(kSlot) != nullptr ||
+      vt::OpProviderCount(OpId::kRelu, kSlot) != 0) {
+    MESSAGE("SKIP: DeviceType::kTENSTORRENT carries a backend or providers in "
+            "this build, so it is not a free slot; this case needs one no other "
+            "registrar has claimed");
+    return;
+  }
   vt::RegisterBackend(kSlot, &UnifiedNotHostAddressable());
 
   // The property pair under test: the OLD gate says yes, the right one says no.

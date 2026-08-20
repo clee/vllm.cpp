@@ -111,14 +111,25 @@ audit's rule that eligibility must never key on the device type is kept.
 |---|---|---|---|---|---|
 | CPU | host | true | n/a — the tier's source device is never a target | no | no |
 | CUDA | `cudaMalloc` | probed; true on GB10 | **false** | **yes** | **no** |
-| Vulkan | host-visible and host-coherent, persistently mapped | true | true (already overridden) | yes | yes |
+| Vulkan | host-visible and host-coherent, persistently mapped | true only where a combined host-visible, host-coherent, DEVICE_LOCAL type exists | true, unconditionally (already overridden) | yes, **except** where unified is false | yes, always |
 | Metal | `MTLResourceStorageModeShared` | `hasUnifiedMemory` | true, once it answers | yes | yes |
 | ROCm | `hipMallocManaged` when integrated and managed-capable, else `hipMalloc` | `managed_alloc` or `pageable_memory_access && integrated` | equal to `UnifiedMemory()` | yes | yes |
 
-Exactly one cell moves, and it is the crash. Metal and ROCm need the one-line
-override so that they do not lose the tier as a side effect; both overrides are
-by construction equal to what those backends answer today, so their behaviour is
-byte-identical. ROCm's answer is its own `unified_memory_` rather than
+Two cells move. CUDA is the crash, and it loses the tier. **Vulkan widens**, and
+this is not a side effect worth hiding: `VulkanBackend::DeviceMemoryIsHostAddressable()`
+already returns `true` unconditionally, while `VulkanBackend::UnifiedMemory()`
+reads `VulkanContext::unified_memory()`, which the context sets from
+`FindMemoryType(mem, ~0u, kHostFlags | VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) >= 0`.
+On a device with no such combined type that flag is false, the context falls back
+to `FindMemoryType(mem, ~0u, kHostFlags)` and then `VT_CHECK`s that one was
+found. So every allocation is host-visible and host-coherent regardless, and the
+tier that used to be withheld on that device is now installed. The widening is
+sound because the `VT_CHECK` is what guarantees it, not because the tier is
+harmless.
+
+Metal and ROCm need the one-line override so that they do not lose the tier as a
+side effect; both overrides are by construction equal to what those backends
+answer today, so their behaviour is byte-identical. ROCm's answer is its own `unified_memory_` rather than
 `managed_alloc_`: the registrar widens `unified_memory_` with
 `pageable_memory_access && integrated`, and on that branch `hipMalloc` memory is
 host-dereferenceable by the same attribute, which the ROCm backend's own comment
@@ -152,9 +163,12 @@ precondition, which is a fact the reader can check.
 
 1. **A backend that is host-addressable but does not say so loses the tier.**
    The measured population is five backends and this spec enumerates all five
-   above. Vulkan already overrides; Metal and ROCm gain the override in this
-   change; CPU is not a target; CUDA is the defect. A backend added later gets
-   the safe default, which is the polarity `backend.h` chose deliberately.
+   above. Metal and ROCm gain the override in this change and are byte-identical;
+   CPU is not a target; CUDA is the defect. **Vulkan is not byte-identical** — it
+   widens, on a device with no combined host-visible, host-coherent, DEVICE_LOCAL
+   memory type, for the reason argued under [Design](#design). A backend added
+   later gets the safe default, which is the polarity `backend.h` chose
+   deliberately.
 2. **Metal and ROCm are not compiled anywhere this change can reach.** CI builds
    CPU, CUDA, Vulkan and Windows; there is no macOS or ROCm job, and this host
    has neither toolchain. The two edits are therefore one line each, placed
@@ -189,14 +203,21 @@ precondition, which is a fact the reader can check.
    gate. The new case must go red. Print `git diff --stat` and any compiler
    error with the result, because a mutation that never applied and a mutation
    that failed to build both read as a passing test.
-4. **No regression in the seam's own suites.**
+4. **Reachability, mutated at the production call site.** The new refusal clause
+   is not proved by calling `ReferenceTierRefusalReason` directly. Delete the
+   clause from the `VT_CHECK` inside `Resolve` — the production path every
+   `vt::GetOp` takes — and `tests/vt/test_reference_tier.cpp` goes red on the
+   `host-addressable` assertion. Run by the fresh reviewer, recorded here because
+   "nothing lands dead" asks for exactly this and the implementer did not run it.
+
+5. **No regression in the seam's own suites.**
    `ctest --test-dir build -R 'test_op_provider|test_reference_tier|test_backend_cross_device'`.
-5. **Record gates.** `scripts/check-agent-record.py`,
+6. **Record gates.** `scripts/check-agent-record.py`,
    `scripts/check-doc-checkpoint.py`, `scripts/check-public-doc-tables.py`,
    `scripts/check-gate-commands.py --check`,
    `scripts/check-commit-style.py --range origin/main..HEAD`,
    `scripts/check-commit-trailers.py --range origin/main..HEAD`.
-6. **Not run here, and named as such.** No CUDA build, no GPU. The defect this
+7. **Not run here, and named as such.** No CUDA build, no GPU. The defect this
    row fixes was measured on GB10 and the fix is verified on the host tier
    against a fake backend that reproduces the exact property pair. A CUDA
    re-measurement — the block-wise FP8 test refusing instead of exiting 139 —
@@ -243,9 +264,16 @@ is the landed commit message. The two GB10 logs that motivated the row are
   Every CUTLASS-dependent feature cell reports ENABLED on a build that contains
   no CUTLASS. Evidence: `/mnt/nas_share/rc/reftier-1435/nvcc-check.sh` and
   `/workspace/reftier-1435/nvcc-configure.log` on that worker.
-- [#844](https://github.com/mudler/vllm.cpp/issues/844) item 4 — whether a CUDA
-  build lacking CUTLASS should warn at engine construction rather than only at
-  configure time — is not addressed here.
+- [#1482](https://github.com/mudler/vllm.cpp/issues/1482) carries the remainder
+  of [#844](https://github.com/mudler/vllm.cpp/issues/844), and this row owns it.
+  Two of #844's four "what done looks like" items are not done here: item 1 also
+  wants the refusal to name the BUILD FEATURE that would have provided the
+  kernel, and item 4 wants a warning at engine construction rather than only at
+  configure time. The pull request carries `Fixes #844`, because the defect in
+  that issue's title — the SIGSEGV, and the banner that claimed correctness — is
+  fixed, and leaving the issue open would misreport that. The alternative,
+  `Refs #844` with the issue left open, was rejected for that reason. Splitting
+  the remainder is what keeps it owned by an OPEN issue instead of a closed one.
 - A CUDA re-run of `tests/vt/test_ops_matmul_fp8_block_cuda` on a CUTLASS-less
   build, to record the refusal replacing exit 139. Owned by this row.
 

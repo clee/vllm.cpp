@@ -847,10 +847,16 @@ bool ReferenceTierEligible(DeviceType device) {
   // pointers and the process took SIGSEGV — `vt::QuantFp8Static` on sm_110
   // (#960) and `vt::MatmulFp8BlockScaled` on a CUTLASS-less build (#1435).
   //
-  // Nothing else moves. Vulkan already overrides the narrow predicate to true;
   // Metal (StorageModeShared) and ROCm (managed or pageable-access integrated
-  // allocations) answer it with the value they already report for unified
-  // memory. A backend added later gets the safe default, which is `false`.
+  // allocations) answer the narrow predicate with the value they already report
+  // for unified memory, so neither changes. VULKAN WIDENS, and safely: it
+  // answers the narrow predicate `true` unconditionally, while its
+  // `UnifiedMemory()` is false when no HOST_VISIBLE|HOST_COHERENT|DEVICE_LOCAL
+  // memory type exists. On such a device the tier was WITHHELD before and is
+  // installed now. That is sound rather than lucky — `VulkanContext` falls back
+  // to the host flags alone and then VT_CHECKs that a host-visible, host-coherent
+  // type was found, so every allocation it hands out is host memory the GPU also
+  // reads. A backend added later gets the safe default, which is `false`.
   Backend* b = TryGetBackend(device);
   return b != nullptr && b->DeviceMemoryIsHostAddressable();
 }
