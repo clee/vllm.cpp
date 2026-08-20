@@ -191,6 +191,7 @@ in `ltx2_text_encoder.cpp` is the call that would have to change.
 | MTP speculator | Qwen3.6-27B, Qwen3.6-35B-A3B | token-identical to vLLM `mtp` at c1 | ~4% faster c1; +16% output tput (MoE) |
 | MTP speculation DEPTH (`num_speculative_tokens` > 1) | Qwen3.5/3.6 `mtp.*` heads | k=1..4 through the loader, greedy tokens unmoved, two witnesses per arm: the draft decode forwards the propose RAN, and whether the DELIVERED draft row varied with depth. `test_mtp_depth` 5/5, 63 assertions | Default stays k=1. NO speed claim at k>1. Drafts are proposed and verified, never ACCEPTED, and neither witness proves per-column provenance. Both await the owed DGX gate (#81) |
 | DFlash block-diffusion | Qwen3 (DFlash draft) | near-tie e2e 27/27 vs vLLM | 2.9x over spec-off, 1.003x vs vLLM DFlash-on |
+| DFlash2 block-diffusion (dynamic conv + candidate selector) | Qwen3 DFlash2 **safetensors** draft; DFlash2 **GGUF** REFUSED at startup | DRAFTS end to end, gated on REACHABILITY: `test_dflash2_runner_reach` 3/3 (83) through `propose_drafts_block`; ops `test_ops_dflash2_path_walk` 7/7 (49) and `test_ops_dflash2_selector_edges` 7/7 (203) | GREEDY only. NO speed number yet. CUDA arms written, UNVERIFIED (no `nvcc`). GGUF arm and the acceptance gate owed ([#1314](https://github.com/mudler/vllm.cpp/issues/1314)) |
 | DeepSeek-V4 MTP | DeepSeek-V4-Flash (nextn head) | lossless 5/5; real-model weight-blocked | pending |
 
 ### Inventoried but blocked
@@ -243,6 +244,7 @@ both refuse, naming what is missing.
 | Medusa | ☐ spike only | ✅ | ✅ |
 | EAGLE / EAGLE3 | ☐ | ✅ | ✅ |
 | DFlash block diffusion | ✅ 2.9x over spec-off, at/above vLLM DFlash-on | ✅ | ☐ |
+| DFlash2 block diffusion (a SECOND DFlash architecture, not a change to DFlash) | ◐ safetensors drafts DRAFT, greedy only, no speed number yet; GGUF REFUSED at startup ([spec](../.agents/specs/dflash2-spec-decode.md)) | ✅ BEYOND-PIN, [vllm#52816](https://github.com/vllm-project/vllm/pull/52816) | ☐ |
 | n-gram / prompt lookup | ✅ 27B 5/5 strict vs vLLM | ✅ | ✅ |
 | DSpark (semi-autoregressive block drafter) | ◐ **both gate models** ([spec](../.agents/specs/dspark-spec-decode.md)): token-identical to spec-off; T=1+k verify CAPTURED. Cross-engine ratio UNSETTLED (**0.834x** matched-and-warm); Marlin MoE CLEARED as the residual | ✅ | ◐ |
 | DSpark draft routing (which draft the loader takes) | ◐ `Qwen3DSparkModel`, `Gemma4DSparkModel` and (BEYOND-PIN, vllm#52197) `DSparkDraftModel` + `qwen3` take the Qwen3 lane; DeepSeek-V4 DSpark is REFUSED by name ([spec](../.agents/specs/dspark-qwen3-routing.md)) | ◐ at the pinned `555967922` that pair routes to DeepSeek-V4; ✅ only since vllm#52197, merged 2026-08-17 | not assessed |
@@ -305,6 +307,7 @@ Build with `-DVLLM_CPP_VULKAN=ON`; off by default.
 | Container images | ◐ `cuda`/`vulkan`/`cpu` lanes build and gate from one Dockerfile (amd64+arm64, `ENTRYPOINT vllm-server`, ffmpeg included); **nothing published to GHCR yet** | ✅ | ✅ | ✅ |
 | Graceful shutdown on `SIGTERM` | ✅ clean exit in 0.25 s, including as container PID 1 (#312) | ✅ | ✅ | ✅ |
 | Plugin / out-of-tree model registration | ✅ in-tree factory `DONE` + plugin seam | ✅ | ◐ | ☐ |
+| Fetch a checkpoint from Hugging Face by name | ◐ `vllm-server --model org/repo[:QUANT]` fetches into the HF cache. HTTPS via system OpenSSL (`VLLM_CPP_HF_DOWNLOAD`, ON). The musl-static archive has no TLS. `vllm-cli` and the C ABI take a local path (#1280) | ✅ | ✅ | ✅ |
 | A registered forward opens its OWN model type, not whatever it was handed | ✅ all 35 entry points establish the concrete type first and refuse a mismatch by name (#775, swept in [#847](https://github.com/mudler/vllm.cpp/issues/847)) | n/a | n/a | n/a |
 | Multiple engines in one process (build, destroy, rebuild) | ✅ resident device state is owned by the weights, so a new engine never inherits a freed one's pointers | ✅ | ✅ | ✅ |
 | LoRA adapters | ☐ CPU brick only | ✅ | ✅ | ✅ |
