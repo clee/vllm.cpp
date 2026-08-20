@@ -499,6 +499,12 @@ class BudgetEnforcement(unittest.TestCase):
             # including the clean-tree case, which asserts a checked count at or
             # above the recorded floor and so cannot be satisfied by silence.
             "scripts/check-symbol-anchors.py",
+            # 2026-08-20: the conflict-marker gate (#1417). Created in the same
+            # range, so it has no BASE version to mutate. The disabled stub
+            # exits 0 and prints nothing, which fails every case that runs the
+            # checker, because each one reads an exit code or an examined count
+            # that silence cannot produce.
+            "scripts/check-conflict-markers.py",
         }
         self.assertEqual(set(checker.CREATION_MUTATIONS), expected)
         for path, mutation in checker.CREATION_MUTATIONS.items():

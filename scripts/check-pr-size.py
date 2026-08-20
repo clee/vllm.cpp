@@ -328,6 +328,12 @@ CREATION_MUTATIONS = {
     # checker as a module and calls into it, so the disabled stub fails at import
     # rather than quietly passing a reduced set of cases.
     "scripts/check-cuda-op-arch-gate.py": DISABLED_CREATION_CHECKER,
+    # GATE-CONFLICT-MARKERS (#1417). Created in this range, so there is no BASE
+    # version to mutate. The empty stub exits 0 and prints nothing, which fails
+    # every case in tests/scripts/test_check_conflict_markers.py that runs the
+    # checker -- including the clean-tree cases, which parse an examined count
+    # out of the report and so cannot be satisfied by silence.
+    "scripts/check-conflict-markers.py": DISABLED_CREATION_CHECKER,
 }
 SELF_CHECKER = "scripts/check-pr-size.py"
 EVIDENCE_TIMEOUT_SECONDS = 120

@@ -108,6 +108,20 @@ so neither needs an exclusion, and the repository needs no allowlist file for
 any change to append itself to. `AGENTS.md` § *Records* forbids a surface that
 every pull request must edit, and an allowlist is exactly that surface.
 
+### The cheap reject, and what it is not
+
+A marker line necessarily contains the marker as a substring, so a buffer
+holding neither substring anywhere cannot hold one at the start of a line. The
+per-line pass is skipped for such a buffer, which is nearly every file in the
+tree. This is a **pure optimization**: it decides nothing the full scan would
+decide differently. It is measured as such in `## Evidence`, where deleting it
+leaves the whole suite green, and that green is the expected result rather than
+a gap. The semantic guard is the adjacency test, and the case above proves it.
+
+The scan reads bytes and never decodes a whole file. Decoding 142 MB of tracked
+text to find a marker in none of it cost more than reading it: 0.9 s of CPU
+against 0.29 s.
+
 ### What is skipped, and counted
 
 Three classes are skipped, and each is counted and reported rather than dropped
@@ -201,6 +215,15 @@ produce a NON-ZERO exit.
   logs and tokenizer corpora carry.
 - `test_a_separator_outside_an_open_hunk_is_not_reported` — a marker-free file
   whose separator follows other text is silent.
+- `test_a_separator_after_the_hunk_closes_is_not_named` — a file that carries a
+  closed hunk AND a legal setext underline below it. The exit code is 1 either
+  way, so this case asserts the REPORT: lines 2, 4 and 6 are named and line 8 is
+  not. **Written because the first mutation run found the adjacency guard was
+  not load-bearing.** Dropping `open_at is not None` left every other case
+  green, because a file with no marker leaves the scan early and the guard never
+  decides anything there. The absence assertion carries its own positive control
+  in the same case: three named lines prove the match works before the fourth
+  claims a line is absent.
 - `test_a_binary_file_with_marker_bytes_is_skipped` — exit 0, and the report
   counts one binary skip.
 - `test_a_symlink_is_skipped` and `test_a_tracked_path_absent_from_the_worktree_is_skipped`.
@@ -246,8 +269,10 @@ count on a clean tree, and the wall time of the tree scan.
   that every change must append to. That is a lock, and a lock is not a gate.
 - Stop if the suite can only go green by widening the marker set beyond the
   three shapes #1417 names.
-- Stop if the tree scan costs more than a second in preflight. The other record
-  gates are cheap, and a slow gate teaches people to skip preflight.
+- Stop if the tree scan costs more than one second of CPU. The bound is CPU and
+  not wall time on purpose: this box runs several agent sessions at once, and
+  the same scan measured 1.17 s to 4.60 s of wall against 0.29 s of CPU. A wall
+  bound would report the other sessions, not this gate.
 
 ## Now
 
