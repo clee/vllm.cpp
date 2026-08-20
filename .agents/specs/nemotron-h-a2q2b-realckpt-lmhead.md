@@ -568,3 +568,37 @@ applied to the working tree and reverted. #1392 has since landed on `main` and
 this branch has merged it, so the tree now carries the fix as a committed
 object. The historical rows keep their `overlay` cells, because they describe
 the tree they were measured on and rewriting them would make them false.
+
+### The full CPU suite, and a red that arrived from `main` mid-repair
+
+`origin/main` moved four times while this repair was gated, and the third sync
+brought `4712dac40` (`VT-ACT-ROUND-POLARITY`, [#1322](https://github.com/mudler/vllm.cpp/issues/1322)
+via [#1347](https://github.com/mudler/vllm.cpp/pull/1347)). Both `ctest` runs
+below are on this box, `-Wall -Wextra -Werror`, no CUDA toolkit, and neither
+carries an overlay of any kind — #1392 is a committed object here now.
+
+| tree | base | `ctest` | result |
+|---|---|---|---|
+| this row + `9ecaf1bb3` | before `4712dac40` | 567 | **`100% tests passed, 0 tests failed out of 567`**, `rc 0` |
+| this row + `01854663c` | after `4712dac40` | 569 | `rc 8`, **4 failed**: `test_minimax_music3_ar`, `test_ltx2_text_encoder`, `test_muse_glimmer_text`, `test_muse_glimmer_text_fallback` |
+
+The four are [#1458](https://github.com/mudler/vllm.cpp/issues/1458), filed from
+another flow before this control was run, and they are inherited rather than
+caused. That is proven in both directions on the same tree, each mutation
+verified applied by `git diff --stat` and restored to an identical sha256:
+
+| control | change | `compile_rc` | `run_rc` (music3 / ltx2 / glimmer) | verdict |
+|---|---|---|---|---|
+| **A** | revert THIS row's two source files to their pre-repair `7a3909187` content | 0 | **1 / 1 / 1** | still RED — **not this row's** |
+| **B** | revert `src/vt/cpu/cpu_ops.cpp` alone to `4712dac40^` | 0 | **0 / 0 / 0**, `37/37`, `27/27`, `24/24` | GREEN — **`4712dac40` is the cause** |
+
+Control A is the one that answers the attribution question and it answers it
+alone; control B is here because naming a cause is more useful to the next
+reader than clearing oneself. Neither repairs anything: #1458 needs
+`VT-ACT-ROUND-POLARITY` to decide whether the kernel or four never-re-derived
+bf16 error floors are wrong, which is that row's oracle work and not a small,
+clear, in-flow fix.
+
+`test_nemotron_h_paged_forward` — the test all three of this row's red CI jobs
+failed on — is green on both trees: `13 | 13 passed | 0 failed`,
+`assertions: 3269 | 3269 passed | 0 failed`, `Status: SUCCESS!`, `run_rc 0`.
