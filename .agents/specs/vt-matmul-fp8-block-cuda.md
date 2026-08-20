@@ -365,12 +365,40 @@ builds it and a leased box runs it.
 
 ## Owed
 
-- **No on-hardware run.** This kernel has never executed. G2, G7, G8 and G9 are
-  written, registered and RED-by-absence: on this host they report a skip, and a
-  skip is not a pass. What is established here is that the TU compiles for
-  `sm_120a`/`sm_121a` in CI and that the host-side dispatch decision is
-  correct against upstream's own source. What is NOT established is that the
-  kernel produces the reference's numbers, or any numbers.
+- ~~**No on-hardware run.**~~ **RUN, AND FAILING.** Measured 2026-08-20 on
+  `dgx:gpu0` (NVIDIA GB10, driver 580.173.02, compute capability 12.1) in an
+  `rc` lease, at tree `63d87805c`, CUDA 13.0 Release,
+  `-DVLLM_CPP_CUDA_ARCHITECTURES=121a -DVLLM_CPP_CUTLASS_FETCH=ON`. The kernel
+  executed. **G2 and G7 THROW `cutlass Invalid status`** from
+  `gemm_op.can_implement(args)`
+  (`src/vt/cuda/cuda_matmul_fp8_block_cutlass.cu:362`) on upstream's own ported
+  case, M=32 N=576 K=7168. G6, G8 and G9 pass. The suite reports 5 cases,
+  3 passed, 2 failed, **34 assertions, 0 failed** -- so this is an execution and
+  not a skip, and the two failures are throws rather than value mismatches.
+  Zero `[vt reference-tier]` lines, so the op was registered and nothing
+  silently ran on CPU. Provenance checked on the artifact:
+  `cuda_matmul_fp8_block_cutlass.cu.o` exists and `cuobjdump --list-elf` reports
+  `cuda_matmul_fp8_block_cutlass.cu.1.sm_121a.cubin`.
+
+  This is a WORSE position than the sentence it replaces, not a better one. The
+  row was "unmeasured"; it is now "measured and failing". Tracked by
+  [#1437](https://github.com/mudler/vllm.cpp/issues/1437), which carries the
+  ragged-N hypothesis (N=576 is 4*128+64) and marks it explicitly as a
+  hypothesis that has not been isolated.
+
+  What remains established is unchanged: the TU compiles for `sm_120a`/`sm_121a`
+  and the host-side dispatch decision is correct against upstream's source. What
+  is still NOT established is that the kernel produces the reference's numbers
+  on any shape it currently refuses.
+- **A CUDA build without CUTLASS headers SEGFAULTS on this path rather than
+  refusing by name.** Found in the same session and tracked by
+  [#1435](https://github.com/mudler/vllm.cpp/issues/1435): with the TU absent,
+  `kMatmulFp8BlockScaled` is unregistered for `kCUDA`, a device tensor reaches
+  the portable host kernel, and the process dies -- while the reference tier
+  prints "correct but slow". `VLLM_CPP_CUTLASS_FETCH` defaults `OFF` and CUTLASS
+  is not a submodule, so a plain clone plus `-DVLLM_CPP_CUDA=ON` reproduces it.
+  The same issue records that `vt_cuda_report_feature` prints
+  `cutlass-fp8: ENABLED` for a build in which no FP8 CUTLASS TU is compiled.
 - **No token gate.** `Qwen/Qwen3.8-27B-FP8` has not been run against the pinned
   oracle on this arm, on any device.
 - **No speed claim.** None is made anywhere in this change. The row takes no
