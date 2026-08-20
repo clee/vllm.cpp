@@ -272,6 +272,18 @@ one.** G0-CORRECT fails on the step-7 near-tie, so G0-SPEED is VOID by this row'
 own stop condition. A decode number exists in `../benchmark-record.md` for the
 record; it is not a result and no ratio may be inferred from it.
 
+**The public pages now agree with this row.** `docs/BENCHMARKS.md` and
+`docs/STATUS.md` each called the streaming-ON decode figure VOID with a
+re-measure still owed, one line above the row that records its replacement
+([#1442](https://github.com/mudler/vllm.cpp/issues/1442)). W0e's landing owed
+that write to the row it superseded and never made it. Both `ENG-EXPERT-STREAM`
+cells now keep the VOID and its cause and point at this row for the live figure,
+rather than repeat 11.05 s/token, because one number stated in two keyed rows is
+what lets the two drift apart. No gate can catch that class: the rows are keyed
+on different IDs, so `check-public-doc-tables.py` sees two well-formed rows and
+`check-agent-record.py` sees two individually consistent lifecycle states, and
+no checker here compares a claim in one keyed row against a claim in another.
+
 ## Scope
 
 **In scope.**
