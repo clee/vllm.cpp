@@ -245,8 +245,17 @@ kernel keeps refusing rather than falling through to the host reference tier
 and dereferencing device pointers.
 
 It also means a `sm_12xa` CUDA user stops being refused and starts running a
-kernel **that has never executed**. `docs/USAGE.md` and `docs/FEATURES.md` say
-so in this change, in those words, and `## Owed` is the record.
+kernel that, **at M5's landing**, had never executed. `docs/USAGE.md` and
+`docs/FEATURES.md` said so in that change, in those words, and `## Owed` was the
+record.
+
+**SUPERSEDED, and the rest of this section is kept as the reasoning taken at M5
+rather than as a current description.** The kernel has since executed, on
+`dgx:gpu0`, and it FAILS -- see `## Owed` and
+[#1437](https://github.com/mudler/vllm.cpp/issues/1437). Both pages were
+corrected in the change that recorded that run and no longer carry a
+never-executed label, so any sentence below asserting that they do is history.
+The design decision itself is unchanged and is not being re-argued here.
 
 ### Why it ships registered rather than behind an opt-in flag
 
@@ -261,12 +270,17 @@ with no premise, and this tree already carries several of those.
 The honest control is a LABEL rather than a flag, and the tree has one:
 `cmake/CudaArchFeatures.cmake` already ships `scaledmm-c3x-sm90` and
 `cutlass-nvfp4-sm100` as `DERIVED+BUILD-VERIFIED (testing-welcome)` — compiled
-and gencode-proven, never run on the board they target. This arm is in exactly
-that state and is described in exactly those words in `docs/USAGE.md`,
-`docs/FEATURES.md`, the commit body, the pull request body and `## Owed`. What
-makes that acceptable rather than reckless is that the first person to run it
-gets a written, registered test that says what to compare against and what the
-criterion is, instead of a kernel and a shrug.
+and gencode-proven, never run on the board they target. That label remains
+correct for those two features. At M5's landing this arm was in the same state
+and was described in those words in `docs/USAGE.md`, `docs/FEATURES.md`, the
+commit body, the pull request body and `## Owed`. **It no longer is**: the run
+under [#1437](https://github.com/mudler/vllm.cpp/issues/1437) moved it to RUN AND
+FAILING, and both pages now carry that instead. What made the label acceptable
+rather than reckless was that the first person to run it would get a written,
+registered test saying what to compare against and what the criterion is, instead
+of a kernel and a shrug. That is what happened, and the test is what produced the
+throw `## Owed` records -- so the control worked as designed even though the
+kernel did not.
 
 ### `check-cuda-op-arch-gate`: checked, and correctly NOT extended
 
@@ -286,7 +300,7 @@ TU present and that the new registration is the only one for its OpId.
 |---|---|
 | the activation scale is passed row-major, so every element after the first K-block reads the wrong scale | G3 pins both deduced layout formulas against a hand-derived table taken from `blockwise_scale_layout.hpp`, not from the implementation; G2 would fail on hardware |
 | the transpose is skipped for `k_tiles == 1`, where row-major and column-major coincide, and the bug hides | G3's table includes `k_tiles == 1` AND `k_tiles > 1`, and the kernel has no `k_tiles == 1` special case to skip |
-| a ragged N silently mis-slices | ragged N is supported and G2 is upstream's own `N=576` case; G4 asserts no refusal for it |
+| a ragged N silently mis-slices | AT M5: ragged N is supported and G2 is upstream's own `N=576` case; G4 asserts no refusal for it. FALSIFIED IN PART by [#1437](https://github.com/mudler/vllm.cpp/issues/1437): the HOST-side guard indeed does not refuse `N=576`, but on hardware CUTLASS itself rejects that configuration at `can_implement`, so the control did not hold. Whether raggedness is the CAUSE is a HYPOTHESIS and is not isolated -- `Invalid` names no constraint |
 | a misaligned K takes the kernel anyway and reads past a tile | refused by name; G4 asserts the refusal for `K=3884` and that the message names K and its remainder |
 | the M heuristic drifts from upstream, so decode silently stops using `swapab` | G1 pins all three boundaries by value, including `M=1`, `M=64`, `M=65`, `M=66`, `M=68`, `M=256`, `M=257` |
 | a block size other than 128x128 reaches a collective built for 128 | refused by name; G4 |
@@ -294,7 +308,7 @@ TU present and that the new registration is the only one for its OpId.
 | the f32 sink is read as an f32 compute path | recorded above and in the TU's header comment; the collective is instantiated for bf16 only |
 | a grown workspace is freed while a captured graph still holds its pointer | `RetireGraphScratch`, the same discipline both sibling CUTLASS TUs use |
 | the counter advances on a call that then throws, overstating dispatch | incremented after `run` returns `kSuccess`, and G5 asserts the ordering by counting a refused call |
-| a reader believes this arm was measured | `## Owed`, the commit body, the pull request body, `docs/USAGE.md` and `docs/FEATURES.md` all say it was not |
+| a reader believes this arm was measured | AT M5: `## Owed`, the commit body, the pull request body, `docs/USAGE.md` and `docs/FEATURES.md` all said it was not. SINCE [#1437](https://github.com/mudler/vllm.cpp/issues/1437) the risk INVERTS -- it has been measured, and the same five surfaces now have to keep saying it FAILED and that no shape has been compared against the CPU reference |
 
 ## Tests
 
@@ -528,6 +542,12 @@ alone**. G2, G7, G8 and G9 each report `assertions: 0` under a `-tc` filter and
 each printed `NO CUDA DEVICE: ... #1189 M5's on-hardware leg is OWED, not
 passed.` **`assertions: 0` is a skip wearing a pass**, and it is recorded here as
 the measurement it is: the load-bearing comparison of this row did not run.
+
+This whole section is the `27d5432f9` HOST run and stays as written. It is not
+superseded by the later device run in `## Owed`; it is the CONTROL for it. The
+27-assertion figure here is the measured pure-skip count of this file, which is
+why `## Owed` can say that 27 of the device run's 34 assertions prove nothing
+about a device.
 
 | Block | Cases | Assertions | What that means |
 |---|---:|---:|---|
