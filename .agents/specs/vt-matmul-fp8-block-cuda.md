@@ -27,9 +27,11 @@ TMA-aligned activation-scale LAYOUTS that `vt::QuantFp8Group` could emit
 directly (see `## Owed`); and any speed claim, which needs hardware this row
 does not take.
 
-**No GPU lease is taken and no on-hardware run is performed.** The fleet is
-contended. What this row establishes is the compile leg and the host-side
-dispatch decision; §`## Owed` states plainly what is not established.
+**This row's landed change took no GPU lease and performed no on-hardware run.**
+The fleet was contended. What that change establishes is the compile leg and the
+host-side dispatch decision. The first on-hardware run came later, under
+[#1437](https://github.com/mudler/vllm.cpp/issues/1437), and is recorded in
+§`## Owed`; that section states plainly what is and is not established after it.
 
 ## Which implementation actually runs, and why
 
@@ -361,7 +363,7 @@ builds it and a leased box runs it.
 | the arch gate | `python3 scripts/check-cuda-op-arch-gate.py` |
 | record | `scripts/agent-preflight.sh --fail-on-skip` |
 | **compile leg** | CI `cuda-fat-build`, which configures `120a;121a` among ten archs with `-DVLLM_CPP_CUTLASS_FETCH=ON` and audits per-source gencode |
-| **the on-hardware leg** | NOT RUN. See `## Owed`. |
+| **the on-hardware leg** | RUN 2026-08-20 on `dgx:gpu0` and FAILING, so this is not a passing gate. No command is named here because the run needs a lease and hardware this table cannot invoke. See `## Owed` and [#1437](https://github.com/mudler/vllm.cpp/issues/1437). |
 
 ## Owed
 
@@ -372,13 +374,31 @@ builds it and a leased box runs it.
   executed. **G2 and G7 THROW `cutlass Invalid status`** from
   `gemm_op.can_implement(args)`
   (`src/vt/cuda/cuda_matmul_fp8_block_cutlass.cu:362`) on upstream's own ported
-  case, M=32 N=576 K=7168. G6, G8 and G9 pass. The suite reports 5 cases,
-  3 passed, 2 failed, **34 assertions, 0 failed** -- so this is an execution and
-  not a skip, and the two failures are throws rather than value mismatches.
-  Zero `[vt reference-tier]` lines, so the op was registered and nothing
-  silently ran on CPU. Provenance checked on the artifact:
-  `cuda_matmul_fp8_block_cutlass.cu.o` exists and `cuobjdump --list-elf` reports
+  case, M=32 N=576 K=7168. G6, G8 and G9 pass, and the two failures are throws
+  rather than value mismatches.
+
+  What proves this was an EXECUTION and not a skip is the throw text, not the
+  assertion count. `vt cuda: matmul_fp8_block_scaled: cutlass Invalid status` is
+  assembled by this file's own `VT_CUTLASS_CHECK`
+  (`src/vt/cuda/cuda_matmul_fp8_block_cutlass.cu:103-110`), and the prefix
+  `matmul_fp8_block_scaled: cutlass ` appears in NO other translation unit -- the
+  per-tensor sibling `cuda_matmul_fp8_cutlass.cu` defines a macro of the same
+  name but writes a different message -- in a TU the build compiles only when
+  CUTLASS is found, so the string cannot be produced by a host fallback. Two
+  independent controls agree: the run logged ZERO `[vt reference-tier]` lines, so
+  the op was registered and nothing quietly ran on CPU, and provenance was
+  checked on the artifact rather
+  than on the log -- `cuda_matmul_fp8_block_cutlass.cu.o` exists and
+  `cuobjdump --list-elf` reports
   `cuda_matmul_fp8_block_cutlass.cu.1.sm_121a.cubin`.
+
+  The suite line reads 5 cases, 3 passed, 2 failed, **34 assertions, 0 failed**.
+  That number is recorded but is the WEAKEST evidence here, and it is attributed
+  so that nobody rests the execution claim on it: **27** of the 34 are G6, which
+  carries no `HasCuda()` guard and prints identically on a box with no device
+  (8 grid entries x 3 `CHECK`, plus the 3 tile-config `CHECK`s); the
+  device-only remainder is G8's **2** and G9's **5**. A pure skip of this file
+  prints 27.
 
   This is a WORSE position than the sentence it replaces, not a better one. The
   row was "unmeasured"; it is now "measured and failing". Tracked by
@@ -388,8 +408,17 @@ builds it and a leased box runs it.
 
   What remains established is unchanged: the TU compiles for `sm_120a`/`sm_121a`
   and the host-side dispatch decision is correct against upstream's source. What
-  is still NOT established is that the kernel produces the reference's numbers
-  on any shape it currently refuses.
+  is still NOT established is that the kernel produces the reference's numbers on
+  **ANY** shape. The only two cases that compare device output against the CPU
+  reference are G2 and G7, and both threw before their first assertion; G7's
+  sweep aborted at `Grid()[0]` -- the same M=32 N=576 K=7168 case, as its
+  `CAPTURE` output records -- so its remaining seven shapes, including the second
+  ragged-N entry M=8 N=576 K=1024, were never attempted. The one shape the kernel
+  did run to completion is G8's M=8 N=512 K=1024, and G8 compares a device f32
+  out against a device bf16 out, which is the kernel against itself and never
+  against `ReferenceBf16`. So the number of shapes on which this kernel's output
+  has been compared with the reference is ZERO, and that is a wider debt than the
+  refusal set.
 - **A CUDA build without CUTLASS headers SEGFAULTS on this path rather than
   refusing by name.** Found in the same session and tracked by
   [#1435](https://github.com/mudler/vllm.cpp/issues/1435): with the TU absent,
@@ -406,10 +435,12 @@ builds it and a leased box runs it.
   the three things `.agents/benchmarking.md` requires before a ratio means
   anything.
 - **A `sm_12xa` CUDA user is no longer refused.** Registering the arm narrows
-  M4's `Prepare` refusal automatically. Until the run above happens, the arm is
-  BUILD-VERIFIED ONLY, in the same sense `cmake/CudaArchFeatures.cmake` already
-  labels `scaledmm-c3x-sm90` and `cutlass-nvfp4-sm100`. `docs/USAGE.md` and
-  `docs/FEATURES.md` carry that label rather than a capability claim.
+  M4's `Prepare` refusal automatically. The run above has now happened, so
+  BUILD-VERIFIED ONLY is no longer the right label and `docs/USAGE.md` and
+  `docs/FEATURES.md` are corrected in the same change that records the run: the
+  arm is RUN AND FAILING on upstream's own ported case, with no shape yet
+  compared against the CPU reference and no token gate. Neither page may carry a
+  capability claim for it.
 - **The column-major and TMA-aligned activation-scale layouts**
   (`utils/fp8_utils.py:610-628`), which `vt::QuantFp8Group` could emit and does
   not. M1 shipped row-major only and recorded both as owed; M2 repeated it.
