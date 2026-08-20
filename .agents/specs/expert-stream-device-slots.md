@@ -288,8 +288,9 @@ two.
 * `docs/STATUS.md:129` read "Streaming lands but its decode figure is VOID: the
   step clock had no caller, so the cache died in token 3". It said nothing about
   a re-measure being owed, and its replacement is not adjacent: that figure sits
-  at `docs/STATUS.md:167`, 38 lines away and in a different table. It keeps the
-  cause verbatim and gains the same named pointer.
+  at `docs/STATUS.md:167`, 38 rows further down the SAME table, which spans
+  lines 126 to 190 unbroken. It keeps the cause verbatim and gains the same
+  named pointer.
 
 Neither cell repeats 11.05 s/token. `docs/BENCHMARKS.md:9` and
 `docs/STATUS.md:167` already carry it, and one number stated in two keyed rows
