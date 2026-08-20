@@ -305,14 +305,37 @@ void AdoptDeviceBytesAsHost(vt::Backend& backend, const OwnedTensor& w);
 //     256-aligned host block, gives byte-identical results: 12/12 with zero
 //     differing elements, every status `SUCCESS`.
 //
-// So a 256-aligned host pointer cannot change a logit, and this row's
-// CUDA-versus-CPU token divergence is the two arms' GEMM arithmetic rather than
-// this branch. Two things that measurement does NOT license. It was taken on
-// Thor and not on the GB10 the token gate ran on — same predicate class, not the
-// same silicon, and the GB10 leg is owed. And the 16-aligned arm also came back
+// So a 256-aligned host pointer cannot change a logit.
+//
+// AND THE SAME PROBE RAN ON THE GB10 ITSELF — the silicon the token gate ran on,
+// so this is no longer a Thor result read across to another part. `rc` job
+// `7c7a05e9-be87-48f4-94ae-1bbe0340f063` on `dgx:gpu0`, 2026-08-19 17:47 UTC,
+// `NVIDIA GB10 sm_121`, driver 580.173.02, cuBLASLt 130101, the predicate
+// re-derived in the job's own output (`pageableMemoryAccess=1 integrated=1`).
+// Same six shapes, same two formulations, 12 measurements, `PROBE_EXIT=0`,
+// `PROBE_FAILURES=0`: repeated heuristic call identical 12/12, the promise
+// weakened to 16 moving nothing 12/12, and `cublasLtMatmul` output bit-exact
+// 12/12 (`differing=0`). At least five distinct algo configurations appear
+// across the twelve and they DIFFER from Thor's, so the heuristic was
+// re-resolved rather than replayed.
+//
+// WHAT THAT ESTABLISHES, AND WHAT IT DOES NOT. It EXCLUDES this branch as the
+// cause of the row's CUDA-versus-CPU token divergence, measured on the target
+// silicon. It does not IDENTIFY the cause, and no reader of this block may take
+// it as if it did: excluding one cause is not identifying another. An earlier
+// revision of this comment named the two arms' GEMM arithmetic as the cause,
+// which the row's own spec forbids asserting — that is the STANDING HYPOTHESIS,
+// together with a greedy path whose top-2 margin at the divergent step is
+// 0.264709 logits, and it is NOT MEASURED. Naming the first tensor whose values
+// differ between the arms at that step, and the operation that produced it, is
+// carried under `## Owed` in `.agents/specs/expert-stream-device-slots.md`.
+//
+// One more thing the probe does not license. The 16-aligned arm also came back
 // bit-exact at these shapes, which is NOT a reason to lower this constant: the
 // enumeration above still does not close, and a promise kept by luck at twelve
-// shapes is not a promise.
+// shapes is not a promise. The literal below is pinned by a case in
+// `tests/vllm/model_executor/test_resident_weight_host_addressable.cpp`, so
+// lowering it reds a gate instead of passing every one of them silently.
 inline constexpr size_t kDeviceAliasAlignment = 256;
 
 // Make `w.bytes` safe to hand to a device kernel directly, and say whether it

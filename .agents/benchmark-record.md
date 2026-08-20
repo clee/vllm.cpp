@@ -25454,11 +25454,19 @@ lease:
 
 The medians are the figures; the maxima are the first decode step after prefill,
 when the slot cache is cold, and quoting either end of the range would be
-quoting the least representative number in it. The implied ratio is 1.97x and it
-is NOT a result: the correctness gate that would license it fails. Note also
-that this CPU arm is FASTER than the 11.05 s/token previously recorded for the
-CPU arm at 4000 slots, so the same-lease interleaved denominator here and that
-earlier figure are not the same measurement and should not be mixed.
+quoting the least representative number in it. **NO RATIO IS WRITTEN HERE, and
+the omission is deliberate.** A ratio of these two medians is not a result: the
+correctness gate that would license one FAILS, so it may not be published,
+quoted, or carried into `docs/BENCHMARKS.md`. An earlier revision of this entry
+did write the figure out in digits in order to disown it, which is the shape
+this repository has watched turn a disowned number into a measured one -- the
+digits survive a copy-paste and the disclaimer does not. Nothing is lost by
+removing them, because both medians are in the table above and anyone entitled
+to the quotient can do the division; what is removed is the pre-computed string
+a later reader can lift without its gate. Note also that this CPU arm is FASTER
+than the 11.05 s/token previously recorded for the CPU arm at 4000 slots, so the
+same-lease interleaved denominator here and that earlier figure are not the same
+measurement and must not be mixed.
 
 **Algo identity: the discriminating experiment, and it clears W0f.** The grounds
 first offered above could not separate "the arms' GEMM arithmetic differs" from

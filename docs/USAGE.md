@@ -4505,15 +4505,17 @@ Six limits, stated plainly rather than left to be discovered.
   [#1378](https://github.com/mudler/vllm.cpp/issues/1378)).
 * **The correctness gate does NOT pass.** The 32 ids match the CPU arm for six
   tokens and diverge at the seventh. Both continuations are coherent, and the
-  divergence is a measured near-tie rather than a disagreement about the model:
-  at that step the CPU arm's own second-ranked token is exactly the one the CUDA
-  arm emitted, behind by 1.4% of the winning logit, and one step later the margin
-  is 0.1%. The two arms run genuinely different GEMM kernels, and the host-weight
-  alias is measured ON GB10 not to be the cause — same shapes, same algorithm,
-  bit-identical output from a `cudaMalloc` operand and from a 256-aligned host
-  one. Treat the CUDA arm as unverified against the CPU arm until that gate is
-  settled, and **use `--device cpu` for this checkpoint today**: it is the arm
-  every published number here was measured on.
+  margins around it are measured and small: at that step the CPU arm's own
+  second-ranked token is exactly the one the CUDA arm emitted, behind by 1.4% of
+  the winning logit, and one step later the margin is 0.1%. **What CAUSES the
+  divergence is NOT identified.** The host-weight alias is EXCLUDED, measured ON
+  GB10 — same shapes, same algorithm, bit-identical output from a `cudaMalloc`
+  operand and from a 256-aligned host one — but excluding one cause is not
+  identifying another, and that the two arms simply run different GEMM kernels
+  over a near-tie is a standing hypothesis rather than a reading. Treat the CUDA
+  arm as unverified against the CPU arm until that gate is settled, and **use
+  `--device cpu` for this checkpoint today**: it is the arm every published
+  number here was measured on.
 * **No speed claim is attached.** `docs/BENCHMARKS.md` carries G0-SPEED as
   `VOID`, because a speed number behind a failing correctness gate is not a
   result. The CPU arm serves this checkpoint at a steady **11.05 s/token at 4000

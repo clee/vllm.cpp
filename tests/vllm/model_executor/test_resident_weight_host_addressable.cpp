@@ -181,6 +181,32 @@ struct PlatformArm {
 
 }  // namespace
 
+// THE CONSTANT ITSELF, PINNED TO ITS LITERAL.
+//
+// Every OTHER assertion about `kDeviceAliasAlignment` in this tree is written
+// `% vllm::kDeviceAliasAlignment == 0` -- three times in the cases below, and
+// twice more in `test_load_direct_upload.cpp`. Those check the BUFFERS, which is
+// a real and separate property, and they stay. What none of them checks is the
+// CONSTANT: they are tautologies in it. A fresh review measured that directly --
+// lower the constant from 256 to 16 and every one of them still holds, all
+// twelve cases in this file pass, the whole suite reports SUCCESS and exits 0.
+// The promise the alias branch rests on would be gone with no gate saying so.
+//
+// WHY 256, AND WHY IT MAY NOT BE QUIETLY LOWERED. The header's argument
+// (`qwen3_5_weights.h`, above this constant) is that the enumeration of what a
+// kernel may dereference does not close, while cuBLASLt is PROMISED 256:
+// `CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_A_BYTES` defaults to 256 and this tree
+// never overrides it -- `grep -rn MIN_ALIGNMENT src/vt/` returns nothing, and a
+// fresh review re-confirmed that with a positive control. Matching the
+// allocator's promise rather than the consumers is what makes handing a host
+// pointer to a device kernel CORRECT. The tempting change is to lower the
+// constant so the re-home memcpy is skipped; a 16-aligned arm even came back
+// bit-exact at twelve probe shapes. A promise kept by luck at twelve shapes is
+// not a promise, and this case is what makes that argument executable.
+TEST_CASE("the alias alignment constant IS 256, the promise cuBLASLt is given") {
+  CHECK(vllm::kDeviceAliasAlignment == 256u);
+}
+
 TEST_CASE("a host-addressable staging device ALIASES the weight and allocates nothing") {
   const PlatformArm arm(true);
   const OwnedTensor w = MakeWeight(/*tag=*/1);
