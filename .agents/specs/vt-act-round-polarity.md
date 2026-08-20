@@ -8,17 +8,51 @@ Row: `VT-ACT-ROUND-POLARITY`.
 
 ## Now
 
-`SPIKE`. No product code changed. [#1322](https://github.com/mudler/vllm.cpp/issues/1322)
-names two ops as one defect; the pinned primary oracle splits them. One is a
-real divergence that upstream pins **bit-exactly**. The other is not a
-divergence at all — upstream made exactly the proposed edit, called it a bugfix,
-and **reverted it three weeks later**, and the reverted-to form is what the pin
-carries and what `vt` already computes.
+`ACTIVE`. The CPU arm of the gated-activation fix has landed with the upstream
+exactness test ported as its red-first gate. The premise was re-verified against
+the primary oracle at the pin before any code was written, and it survived —
+unlike the RmsNorm half, which stays refuted (see `## The refuted half`).
 
-This spec records the ground truth, scopes the half that is real, and stops.
-The implementing wave is a separate row because the change spans six providers
-and every bf16 gated multilayer perceptron in the tree, and neither of those can
-be gated from the shared checkout.
+**The change is confined to bf16-INPUT paths by construction**, because the
+narrowing target is `x.dtype` rather than `out.dtype`. That is what keeps every
+existing f32 golden and every existing byte-exact composite contract unmoved,
+and it is asserted directly rather than inferred (see
+`tests/vt/test_ops_activation.cpp`, "leaves an f32 INPUT bit-identical").
+
+**Five providers are still owed and are listed under `
+## What landed, and what it measured
+
+`RoundThrough(DType, float)` — the helper `kRmsNormGatedGroup` already uses for
+exactly this purpose — is now forward-declared beside `LoadF32`/`StoreF32` and
+called from `SiluAndMulKernel`, `GeluAndMulKernel` and `MoeSiluMulKernel` in
+`src/vt/cpu/cpu_ops.cpp`. No new mechanism was added, as the spike predicted.
+
+Red-first, on an otherwise clean tree, kernel unchanged: `test_ops_activation`
+went **24 cases / 2 failed / Status: FAILURE!** with both bf16 exactness cases
+failing at the `REQUIRE(out[...] == want)` line, while the f32-input case passed
+already. After the kernel change: **24 cases / 24 passed / assertions 285996 /
+Status: SUCCESS!**
+
+Fourteen CPU suites were measured before and after with the binary sha256
+recorded on each side. **Every one is unchanged-green**, and the 46-case CPU
+golden pass ran 46 cases on both sides:
+
+| suite | before | after |
+|---|---|---|
+| `test_ops_activation` | 21/21, 277289 assn, SUCCESS | 24/24, 285996 assn, SUCCESS |
+| `test_op_parity` | 13/13, 153 assn, SUCCESS (46 golden cases) | 13/13, 153 assn, SUCCESS (46 golden cases) |
+| `test_ops_moe_grouped`, `test_gemma3_forward`, `test_qwen27_dense_forward` | SUCCESS | SUCCESS, unchanged |
+| `test_qwen3_forward`, `test_qwen3_moe_forward`, `test_gemma2_forward`, `test_gemma_forward`, `test_gpt2`, `test_qwen35_paged_forward`, `test_deepseek_v4_moe` | SUCCESS | SUCCESS, unchanged |
+| `test_qwen3_load`, `test_gemma3_load` | SUCCESS but **assertions: 0** | same — these are skips wearing a pass, not evidence |
+
+**No golden got worse.** The one oracle-captured activation golden improves: see
+the table under `## Premise`, where the worst element margin against the
+harness's own `atol + rtol*|want|` moves 0.5364 -> 0.2989.
+
+## Owed`.** CUDA, ROCm,
+Metal and Tenstorrent cannot be compiled from the dev box at all, and the Vulkan
+arm additionally needs a GLSL toolchain to regenerate its committed SPIR-V. This
+row does NOT claim provider parity it did not test.
 
 ## Gap verification
 
@@ -34,6 +68,76 @@ already landed.
 | `origin/row/BACKEND-VULKAN-RMSNORM` | PR [#185](https://github.com/mudler/vllm.cpp/pull/185), **MERGED** — a decode workgroup-shape speedup (7.85 → 1.59 ms/token), not a polarity change. Not an ancestor by sha because it was squash-merged, so the pull request state is the authority, not `--is-ancestor` |
 
 Nothing to reconcile. The gap is real and unowned.
+
+## Premise, re-verified independently at the pin
+
+The implementing wave re-read the primary oracle rather than inheriting the
+spike's reading. Every leg holds, and one piece of evidence is stronger than
+what the spike had.
+
+| Claim | Anchor at `5559679229bc961848b121ccdeaa8fa5d79bec98` | Verdict |
+|---|---|---|
+| `act(gate)` narrows to the input dtype | `csrc/libtorch_stable/activation_kernels.cu:36` — `return (scalar_t)(ACT_FN(gate, alpha) * ((float)up + beta));` | holds |
+| `silu` itself narrows | `activation_kernels.cu:158` — `return (T)(((float)x) / (1.0f + expf((float)-x * alpha)));` | holds |
+| `gelu_tanh` narrows | `activation_kernels.cu:205` — `return (T)(0.5f * f * (1.0f + ::tanhf(inner)));` | holds |
+| the native reference does the same | `vllm/model_executor/layers/activation.py:143` — `return F.silu(x[..., :d]) * x[..., d:]` | holds |
+| upstream pins the two bit-exactly | `tests/kernels/core/test_activation.py:108` — `torch.testing.assert_close(out, ref_out, atol=0.0, rtol=0.0)` | holds |
+| the vectorized path agrees | `activation_kernels.cu:72` — `cast_to_float2(PACKED_ACT_FN(gate, alpha))`, whose argument returns `packed_t` | holds |
+| CPU `forward_cpu` is not the mirror source | `activation.py:155-158` — returns `forward_native` on every architecture except POWERPC | holds |
+
+### The prior-attempt search, and why it had to be run differently
+
+The RmsNorm half of #1322 was refuted by an upstream revert, so the same search
+was owed here. `${VLLM_SOURCE}` is a **shallow** checkout: `.git/shallow` carries
+three grafts and the oldest commit reachable from the pin is `16282a9c4`
+(2026-06-10), six weeks before the pin. A `git log -S` walk therefore cannot see
+a revert older than that, and `git merge-base --is-ancestor` returns a false
+negative across a graft — two of the three shas the spike cites for the RmsNorm
+revert (`4d51588e2`, `124fac10c`) report NOT-an-ancestor here for that reason
+alone. Their trees are readable even though the walk is cut, so the search was
+run on **content** instead of on history:
+
+| ref | `silu_kernel` return | narrows to `T`? |
+|---|---|---|
+| v0.15.0 … v0.23.0 | `return (T)(((float)x) / (1.0f + expf((float)-x)));` | yes |
+| v0.24.0, v0.25.0, v0.26.0 | `return (T)(((float)x) / (1.0f + expf((float)-x * alpha)));` | yes |
+| the pin | same | yes |
+| v0.27.2rc0 (**newer than the pin**) | same | yes |
+
+The narrowing is continuous across twelve releases spanning the pin, and it is
+still there on the newest tag in the checkout. There is no attempt to remove it
+and no revert. This is the opposite of the RmsNorm finding, not a weaker version
+of it.
+
+### The golden proves the polarity, not just the source
+
+`tests/parity/goldens/silu_and_mul_bf16_8x256/` is a real oracle capture
+(manifest: vLLM 0.24.0 @ `e24d1b24`, torch 2.11.0; x bf16 [8,256], out f32
+[8,128], atol=rtol=0.008). Recomputing it from `x.npy` with this tree's own bf16
+codec (`src/vt/dtype.cpp:297-304`):
+
+| expression | max abs err vs golden | bit-exact? |
+|---|---|---|
+| `silu_f32(g) * up` — what `vt` computes today | 1.434994e-02 | no |
+| `bf16(silu_f32(g)) * up` — the polarity this row adds | 7.812500e-03 | no |
+| `bf16( bf16(silu_f32(g)) * up )` — upstream's full chain | **0.000000e+00** | **yes** |
+
+The third row reproduces the captured oracle bytes exactly. That is an
+end-to-end confirmation of the polarity from a running vLLM, independent of
+reading any kernel source. The residual on row two is the store rounding, which
+this seam does not take because the golden's `out` is declared f32 while
+upstream's `out` is always `x.dtype`.
+
+Under the harness's own tolerance (`tests/parity/test_op_parity.cpp:159`,
+`tol = atol + rtol*|want|`) the worst element margin moves **0.5364 -> 0.2989**,
+a 44% reduction. No element moves the wrong way and none was ever over tolerance.
+
+### The effect, reproduced
+
+Over 2^20 independently bf16-rounded standard-normal `(gate, up)` pairs, using
+this tree's `F32ToBF16`: **288456 of 1048576 outputs differ (27.51%), every one
+by exactly 1 bf16 ULP, none by more.** The spike measured 27.47% on a different
+RNG stream; the shape of the effect is the same.
 
 ## Scope
 
@@ -250,6 +354,23 @@ That is why this spec stops here.
   filed against that op. It should say that the kernel which actually runs
   agrees with us. Deferred with the implementing row rather than taken here,
   because editing that header rebuilds the tree and this row lands no code.
+
+
+- **CUDA, ROCm, Metal, Tenstorrent, Vulkan: the same narrowing, UNVERIFIED here.**
+  None of the four accelerator toolchains exists on the dev box (`nvcc`,
+  `hipcc` absent; Linux x86_64, so no Metal; no Tenstorrent runtime), so those
+  kernels are NOT edited by this row rather than edited blind. Vulkan is a
+  second-order case: `src/vt/vulkan/shaders/vt_silu_and_mul.comp` compiles
+  AHEAD OF TIME into the committed `src/vt/vulkan/vulkan_spirv.cpp`, and
+  `scripts/gen-vulkan-spirv.py --check` exits 1 here with "no GLSL->SPIR-V
+  compiler found", so editing the shader without regenerating would ship a
+  source that disagrees with the executed SPIR-V — #1342's defect in a worse
+  form. The CI job `vulkan-spirv-freshness` fetches a pinned glslang 16.5.0 and
+  would catch it. Tenstorrent needs nothing: `ttnn::silu` already materializes a
+  bf16 tile before `ttnn::multiply`, so it ALREADY has the upstream polarity.
+- **The gate for those arms is PENDING on named resources**, not waived: a CUDA
+  box for the byte-exact composite suites, a ROCm box, a Mac, and a glslang for
+  the SPIR-V regenerate.
 
 ## Stop conditions
 
