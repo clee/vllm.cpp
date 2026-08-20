@@ -302,7 +302,10 @@ under [#1437](https://github.com/mudler/vllm.cpp/issues/1437) took it first to
 RUN AND FAILING and then, once
 [#1453](https://github.com/mudler/vllm.cpp/pull/1453) had encoded the shape
 partition, to RUN AND MATCHING THE CPU REFERENCE ON THE SEVEN SHAPES IT WAS RUN
-ON, with no token gate. Both pages carry the second position. What made the label
+ON, with no token gate. That second position is the one the live surfaces carry:
+`docs/FEATURES.md`'s block-wise FP8 row, and this model's user-facing page, which
+[#1491](https://github.com/mudler/vllm.cpp/pull/1491) moved out of
+`docs/USAGE.md` into `docs/models/qwen3-8-27b.md`. What made the label
 acceptable rather than reckless was that the first person to run it would get a
 written, registered test saying what to compare against and what the criterion
 is, instead of a kernel and a shrug. That is what happened twice over: the test

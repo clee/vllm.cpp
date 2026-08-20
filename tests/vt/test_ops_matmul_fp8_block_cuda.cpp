@@ -13,8 +13,9 @@
 // REFERENCE_TIER_LINES=0 and TEST_RC=0. A device-free run of this file prints
 // 41, so 95 of those assertions ran on the board, and that delta is the
 // discriminator between a run and a skip. #1189 M5's spec records it under
-// `## Owed`, and docs/models/qwen3-8-27b.md states the same 5/136/0 result for
-// users -- it moved out of docs/USAGE.md in #1491. On a host with no
+// `## Owed`, and the user-facing documentation for Qwen3.8-27B-FP8 states the
+// same 5/136/0 result. No path to it is named here on purpose: a docs
+// reorganisation does not open this file, and no checker ties the two. On a host with no
 // CUDA device this file still SKIPS, and a skip is still not a pass — the four
 // NO CUDA DEVICE messages below say exactly that, per case.
 //
