@@ -101,13 +101,26 @@ the box reboots rather than OOM-killing a process).
 
 So:
 
-1. Take `$GPU_LOCK` with a **blocking** `flock` and wait. Never race.
-2. **Check `free -g` headroom INSIDE the locked region**, not before acquiring
-   it. A blocking flock says the previous holder released; it never says the box
-   recovered. Abort loudly below a stated floor (A2-Q2a used 60 GB).
+1. **Claim `dgx:gpu0` through the fleet controller, and run the work as the
+   lease's payload**: `rc run -d dgx:gpu0 --max-runtime <N>h -- <cmd>`, with
+   `scripts/nemotron-h-a2q2b-gpu-gate.sh` as `<cmd>`. Never `ssh` to the box,
+   and never `rc hold` an idle one. **Do not take `$GPU_LOCK` here.** `dgx:gpu0`
+   is a fleet device, so `AGENTS.md` makes the lease the required path, and the
+   file mutex is the wrong instrument for it: the fleet cannot see that mutex,
+   so a `flock` taken over `ssh` does not exclude a concurrent `rc` holder and
+   the controller keeps reporting the box free while somebody is on it. That is
+   not hypothetical — on 2026-08-17 exactly this pair of non-excluding mutexes
+   cost `.agents/specs/minimax-music3.md` §13.10 a whole speed axis, which is
+   the [#777](https://github.com/mudler/vllm.cpp/issues/777) failure again. The
+   gate script correspondingly takes **no** mutex of its own; the lease is what
+   serialises this row's window.
+2. **Check `free -g` headroom INSIDE the lease**, not before claiming it. A
+   granted lease says the previous holder released; it never says the box
+   recovered. Abort loudly below a stated floor (A2-Q2a used 60 GB), which is
+   what `scripts/nemotron-h-a2q2b-gpu-gate.sh` PRECONDITION 1 does.
 3. **Sample `free -g` on a loop for the whole load and record the PEAK**, not the
    final value. The figure that matters is transient.
-4. Build `-j 4`. One log per run. Never hang holding the lock.
+4. Build `-j 4`. One log per run. Never hang holding the lease.
 5. Verify the configure log reads `ENABLED for [121a]` — a `DISABLED` line or a
    `[121]` **voids** the result rather than failing it.
 
