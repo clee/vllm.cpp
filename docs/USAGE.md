@@ -5160,11 +5160,8 @@ on a different source tree on a different date. The two slot counts came from on
 binary on one lease and are comparable with each other; the previous section
 carries that comparison.
 
-**A bigger cache came out slower, and 8000 slots is the count to avoid.** The
-second 8000-slot rep consumed all 30 625 MiB of the box's swap. The
-best-supported reading of the recorded columns is page-cache displacement: the
-borrowed 370 GiB mapping is served out of whatever memory is free, and the arena
-takes that memory. That is a reading of those columns and not a proven mechanism.
+**A bigger cache came out slower**, which is why this recipe sets 4000 slots.
+The previous section states the reason and its evidence.
 
 Do not quote a first-token time as a decode number. Token 1 carries the prefill
 and the cold expert set. From token 2 onward you are watching steady state. The
