@@ -29,6 +29,7 @@
 
 #include <cstdint>
 #include <cstring>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -53,7 +54,15 @@ using vt::Tensor;
 // host allocator so a fallback kernel dispatched here actually runs.
 class FakeBackend final : public Backend {
  public:
-  explicit FakeBackend(bool unified) : unified_(unified) {}
+  // `unified` and `host_addressable` are the two properties under test, and they
+  // are SEPARATE because a real backend separates them. `UnifiedMemory()` says
+  // host and device address the same physical RAM; `DeviceMemoryIsHostAddressable()`
+  // says a pointer from `Alloc()` may be dereferenced by the host. CUDA on GB10
+  // answers true then false (include/vt/backend.h), which is the pair the third
+  // instance below carries. Everything else is a plain host allocator so a
+  // fallback kernel dispatched here actually runs.
+  FakeBackend(bool unified, bool host_addressable)
+      : unified_(unified), host_addressable_(host_addressable) {}
   void* Alloc(size_t bytes) override { return std::malloc(bytes == 0 ? 1 : bytes); }
   void Free(void* p) override { std::free(p); }
   void Memset(Queue&, void* p, int v, size_t bytes) override { std::memset(p, v, bytes); }
@@ -62,17 +71,25 @@ class FakeBackend final : public Backend {
   }
   Queue CreateQueue() override { return Queue{Device{DeviceType::kXPU, 0}, nullptr}; }
   bool UnifiedMemory() const override { return unified_; }
+  bool DeviceMemoryIsHostAddressable() const override { return host_addressable_; }
 
  private:
   bool unified_;
+  bool host_addressable_;
 };
 
 FakeBackend& Unified() {
-  static FakeBackend b(true);
+  static FakeBackend b(true, true);
   return b;
 }
 FakeBackend& Discrete() {
-  static FakeBackend b(false);
+  static FakeBackend b(false, false);
+  return b;
+}
+// The GB10 CUDA shape, expressed without a GPU: host and device share the RAM,
+// and a `cudaMalloc` pointer is still not host-dereferenceable.
+FakeBackend& UnifiedNotHostAddressable() {
+  static FakeBackend b(true, false);
   return b;
 }
 
@@ -101,6 +118,64 @@ TEST_CASE("reference tier: a discrete (non-unified) device is refused and still 
 // The CPU device is the SOURCE of the reference kernels and is never a target.
 TEST_CASE("reference tier: the CPU source device is never eligible") {
   CHECK_FALSE(vt::ReferenceTierEligible(DeviceType::kCPU));
+}
+
+// ---------------------------------------------------------------------------
+// 1b. THE SAFETY GATE IS HOST-ADDRESSABILITY, NOT UNIFIED MEMORY (#844, #1435).
+//
+// This is the shape that crashed twice on GB10. `Backend::UnifiedMemory()` is
+// true there, because host and device address the same physical RAM. It is NOT
+// the property a host kernel needs: `CudaBackend::Alloc` calls `cudaMalloc`, and
+// `include/vt/backend.h` records beside `DeviceMemoryIsHostAddressable()` that
+// such a pointer "is still not host-dereferenceable". Gating the tier on the
+// wide property handed the CPU kernel device pointers, and the process took
+// SIGSEGV under a banner reading "correct but slow" -- `vt::QuantFp8Static` on
+// sm_110 (#960) and `vt::MatmulFp8BlockScaled` on a CUTLASS-less build (#1435,
+// exit 139 with `test cases: 0  assertions: 0`).
+//
+// A SEPARATE device slot from the cases around it, deliberately: the tier cannot
+// be uninstalled once a provider is registered, so sharing kXPU with the unified
+// case below would make this assertion depend on doctest's execution order. The
+// precondition is REQUIREd rather than assumed, so a build that registers a real
+// Tenstorrent backend fails loudly here instead of measuring the wrong table.
+// ---------------------------------------------------------------------------
+TEST_CASE("reference tier: unified memory the host cannot address is refused, by name") {
+  constexpr DeviceType kSlot = DeviceType::kTENSTORRENT;
+  REQUIRE(vt::OpProviderCount(OpId::kRelu, kSlot) == 0);
+  vt::RegisterBackend(kSlot, &UnifiedNotHostAddressable());
+
+  // The property pair under test: the OLD gate says yes, the right one says no.
+  Backend& dev = vt::GetBackend(kSlot);
+  REQUIRE(dev.UnifiedMemory());
+  REQUIRE_FALSE(dev.DeviceMemoryIsHostAddressable());
+
+  // THE INVARIANT. A host kernel is never installed for a device whose memory
+  // the host cannot dereference.
+  CHECK_FALSE(vt::ReferenceTierEligible(kSlot));
+  CHECK(vt::RegisterReferenceTier(kSlot) == 0);
+  CHECK(vt::OpProviderCount(OpId::kRelu, kSlot) == 0);
+
+  // And the dispatch REFUSES rather than returning the host kernel. Comparing
+  // against the CPU fn pointer is what separates a refusal from a fallback: the
+  // tier installs `src->fn`, the very same pointer, so an equal answer here is
+  // the defect even when nothing throws.
+  REQUIRE(vt::OpRegistered(OpId::kRelu, DeviceType::kCPU));
+  void* thrown_fn = nullptr;
+  std::string message;
+  try {
+    thrown_fn = vt::GetOp(OpId::kRelu, kSlot);
+  } catch (const std::exception& e) {
+    message = e.what();
+  }
+  CHECK(thrown_fn == nullptr);
+  CHECK(thrown_fn != vt::GetOp(OpId::kRelu, DeviceType::kCPU));
+
+  // Refused BY NAME: the op, the device, and why the portable tier did not run.
+  // A reader who sees this must not have to open op_provider.cpp to learn that a
+  // fallback exists and was withheld.
+  CHECK(message.find("Relu") != std::string::npos);
+  CHECK(message.find("tenstorrent") != std::string::npos);
+  CHECK(message.find("host-addressable") != std::string::npos);
 }
 
 // ---------------------------------------------------------------------------

@@ -185,10 +185,29 @@ over device pointers and the process died with `SIGSEGV` after printing
 [vt reference-tier] op=QuantFp8Static device=cuda has NO native kernel; running the PORTABLE CPU fallback (correct but slow)
 ```
 
-If you ever see that banner naming an op on a `cuda` device, this build is
-missing a kernel it needs. Report it — it is not a slow path, and the message's
-"correct but slow" is not true when the device is not the CPU
-([#844](https://github.com/mudler/vllm.cpp/issues/844)).
+That banner can no longer name a `cuda` device.
+[#844](https://github.com/mudler/vllm.cpp/issues/844) fixed the gate that let it:
+the portable tier asked whether the device had unified memory, which GB10 has,
+instead of asking whether the host may dereference a device allocation, which it
+may not. A CUDA build that is missing a kernel now refuses instead, naming the
+op, the device, and the precondition the device failed:
+
+```text
+vt: no kernel for op MatmulFp8BlockScaled (id 123) on device cuda (type 1), and
+the portable CPU reference tier is NOT eligible: this backend does not report its
+device memory host-addressable, so a host kernel may not dereference what it
+allocated (unified memory is true, which is a DIFFERENT property). Build a native
+kernel for this op or run it on the CPU device
+```
+
+The real message ends with ` at <file>:<line>`, which every `vt` check appends
+and which is left out above because it moves with the source.
+
+Report that message. It means this build has no kernel for the op it names, and
+it is a build problem, not a slow path. The banner itself still appears on
+Metal, on an integrated ROCm device, and on Vulkan, where the host genuinely can
+address device memory. It stays a warning: those runs are correct and slow, and
+they are not performance measurements.
 
 ## Using more than one engine in a process
 
