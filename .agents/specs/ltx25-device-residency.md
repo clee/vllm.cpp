@@ -1000,14 +1000,15 @@ second name is inside the work". M7 fails both — seven of its eight
 `phase.finish` opens in the middle of the denoise window while the steps keep
 running around it.
 
-**Why the sub-scope for `decode.video` sits in the driver and not in the VAE.**
+**Why the sub-scope for `decode.video` sat in the driver and not in the VAE.**
 The per-chunk decode itself is `AccumulateTemporalGroup` in
 `src/vllm/model_executor/models/ltx2_video_vae_tiled.cpp`, one directory outside
-this stage's authority. The driver-side anchor is weaker and it is not nothing:
-its END is the production callback firing, so a `decode.video` leaf that closes
-before its chunk arrives, or that is re-labelled after one, stops containing the
-chunk it produced. M10 below is that case. A VAE-side sub-scope naming the tile
-accumulation is **owed** and is listed under `## Owed`.
+this stage's authority at the time. The driver-side anchor is weaker and it is
+not nothing: its END is the production callback firing, so a `decode.video` leaf
+that closes before its chunk arrives, or that is re-labelled after one, stops
+containing the chunk it produced. M10 below is that case. **The VAE-side
+sub-scope is no longer owed — the third review's repair placed it**, with
+authority extended to that one file for the reason the next section gives.
 
 | # | Mutation | `git diff --stat` | compile | containment case | SUMS case |
 |---|---|---|---|---|---|
@@ -1020,10 +1021,12 @@ The SUMS column is not a defect. It is the measurement: **a sum cannot see a
 transfer**, in three independent mutations, which is exactly why the containment
 case exists and why it is the one that must be run.
 
-On the unmutated tree the containment case reports **exit 0, 1/1 cases, 124/124
-assertions**, with `denoise.step` covering **99.667%** of `denoise` over 8
-evaluations, `decode.video.chunk` **99.439%** of `decode.video` over 2 leaf
-records, and mel+vocoder **99.995%** of `decode.audio`.
+On the unmutated tree AT THAT HEAD the containment case reported **exit 0, 1/1
+cases, 124/124 assertions**, with `denoise.step` covering **99.667%** of
+`denoise` over 8 evaluations, `decode.video.chunk` **99.439%** of `decode.video`
+over 2 leaf records, and mel+vocoder **99.995%** of `decode.audio`. Every count
+in this section is that head's; the section below re-runs all of them against the
+third review's repair and its own numbers supersede these.
 
 **Two more findings from the same review, repaired here.**
 
@@ -1050,6 +1053,125 @@ gate reads it and the next run that refutes it would have to edit a source file
 to say so. That is a live number in a place nobody looks — the failure this row
 exists to stop, one directory over. The notice is qualitative now and the
 artifact's `_caveat` keeps the numbers beside the run they came from.
+
+### What a THIRD fresh review found, and what closed it
+
+The second repair gave every carrying phase an anchor and asserted four things
+about it: containment, coverage, exclusivity and non-overlap. **All four are
+ratios taken against that anchor.** A third fresh reviewer read that and asked
+the one question the previous two had not: what happens when the anchor moves
+WITH the leaf. Two mutations, both compiling clean, both exit 0 on both gates.
+
+**M12 — the circularity, on the same phase M7 was about.** Emit `denoise.step`
+for `step_index == 0` only, close `denoise` after step 0, and open
+`phase.finish` over steps 1-7. The single surviving step scope sits inside the
+shortened `denoise` leaf, so containment holds; it covers nearly all of it, so
+coverage holds; nothing overlaps and nothing nests. The containment case reported
+**exit 0, 1/1 cases, 106/106 assertions** and the SUMS case **exit 0, 350/350**,
+over a table putting `phase.finish` at 28.73% of the named leaves against a
+`denoise` of 6.11% on a run whose honest denoise was 39.3%. **82% of the largest
+phase re-labelled onto its neighbour — M7's defect, on M7's phase, through the
+gate M7 produced.**
+
+**M11 — the writer, which had no anchor at all.** Leave the `write(2)`s inside
+`decode.video` and emit `artifacts.frames` covering nothing. The leaves stay
+disjoint, nothing nests, the sum does not move, exclusivity is blind because
+`artifacts.frames` is a DECLARED PARTNER of `decode.video`, and the containment
+case reported **exit 0, 124/124** with `artifacts.frames` at **4 microseconds
+while nine PPM files were written** (honest: 0.000186 s). The whole writer is
+charged to `decode.video`, which is the leaf W5's lever is measured from.
+
+**F11 — the case name claimed more than it checked, and the load had nothing.**
+The case was titled "each named phase CONTAINS the work it is named after" and
+checked three of about fourteen. Mutation M13 swaps the `load.dit` and
+`load.prompt_embeds` scope NAMES — two lines — and every gate in the file stayed
+green while 96% of the load's seconds moved onto the wrong name. On the shipped
+21B that name holds roughly seven and a half minutes of DiT staging, and it is
+the phase W2 and W3 both act on.
+
+**F12 — a recorded justification pointed the wrong way.** The `denoise` coverage
+margin was argued as "a percent of a 40 ms leaf", which reads as though the
+uncovered part scales with the leaf. It does not: the 16 boundary samples cost
+the same wall whether the denoise is 20 ms or 20 minutes, so the RATIO degrades
+exactly as the hardware gets faster. The reviewer measured 99.228% on a quiet box
+at a 20 ms leaf — an uncovered 0.154 ms — which puts the crossing point at a
+denoise leaf of about 3.1 ms. That is a FALSE-RED risk, never a false pass.
+
+**F13 — the artifact's caveat said "five such runs" and listed six walls.**
+
+**What closed M12 and M11 needs no clock, and neither one is a ratio.**
+
+*The RECORD COUNT.* Each anchor must be emitted once per unit of work the RENDER
+counted, and the counts come from `Ltx2ConditioningTrace`: `dit_evaluations`,
+incremented inside the shared `Evaluate` lambda every sampler arm reaches, and
+`video_decode_chunks`, added by this repair and incremented in the driver's own
+streaming sink beside `rendered_frames`. Neither is derived from the phase table,
+so no placement of a phase scope can move either, and the gate re-derives
+`video_decode_chunks` from `Ltx2GroupTilesByTemporalSlice` rather than trusting
+it. Under M12 the count reads `1 == 8`.
+
+*NOTHING BUT AN ANCHOR IS NESTED.* A leaf that grows over a NEIGHBOUR does not
+overlap it and does not break the sum: `PhaseLog::Open` marks the neighbour
+`nested`, which removes it from `sum_leaf_seconds` and from the timeline the
+exclusivity check walks. The gate now names the six anchors and refuses any other
+nested record.
+
+*And the WRITER got an anchor of its own.* `artifacts.frames.ppm` wraps the
+`WriteFileBytes` loop, so it moves with the WRITES rather than with the scope
+beside it, and `artifacts.frames` joins the carrying phases with its record count
+taken from `video_decode_chunks`. Its coverage threshold is 0.50 and loose on
+purpose: the leaf is 0.2 ms on this fixture and carries its own boundaries, so
+what binds is the containment and the count. Measured 97.97% honest.
+
+*And `decode.video` got the VAE-side sub-scope this spec recorded as owed.*
+`decode.video.vae` opens inside `Ltx2ConvVideoDecodeTiled` around
+`AccumulateTemporalGroup`, one record per temporal group, so that leaf finally
+has a sub-scope whose ends are both production events rather than statements
+adjacent to its own `Open`. Authority for that one file was extended by the
+operator for exactly this.
+
+*And the load got the only check available inside this stage's authority: its
+ORDER.* An anchor for `load.dit` would have to open inside
+`Ltx2LoadDitFromSafetensors` / `Ltx2StreamDitToDevice` in `ltx2_loader.cpp`,
+which this stage does not reach, and the driver has one statement between that
+scope's open and its close — so a sub-scope placed there would be the
+adjacent-statement anchor M11 and M12 just demonstrated the circularity of. What
+is asserted instead is that the load leaves appear in the order the driver runs
+them, which a swapped pair of names breaks. **The case title now says what it
+checks**, and `### Owed out of W0` below names every leaf whose placement is
+still unproven.
+
+| # | Mutation | `git diff --stat` | compile | containment case | SUMS case |
+|---|---|---|---|---|---|
+| **M12** | emit `denoise.step` for step 0 only, close `denoise` there, open `phase.finish` over steps 1-7 — the **circularity** mutation | 1 file, +9/-1 | rc 0, 0 errors | **RED**, exit 1, 1 case failed, **167 assertions, 2 failed**, first on `CHECK( 1 == 8 )` against `dit_evaluations` | exit 0, 374/374 |
+| **M11** | the writes stay inside `decode.video` and `artifacts.frames` is emitted covering nothing — the **empty-name** mutation | 1 file, +3/-4 | rc 0, 0 errors | **RED**, exit 1, 1 case failed, **194 assertions, 1 failed**, on `artifacts.frames.ppm` enclosed by no `artifacts.frames` leaf, with the leaf reporting 4.008e-06 s | exit 0, 446/446 |
+| M11b | the literal reading of the same instruction: both `Close`s below the write, with `artifacts.frames` still around the loop | 1 file, +2/-2 | rc 0, 0 errors | **RED**, exit 1, 1 case failed, **126 assertions, 1 failed**, on the writer being emitted `nested` | exit 0, 446/446 |
+| **M13** | swap the `load.dit` and `load.prompt_embeds` scope names | 1 file, +2/-2 | rc 0, 0 errors | **RED**, exit 1, 1 case failed, **194 assertions, 2 failed**, on the load order | exit 0, 446/446 |
+| M7 | re-anchored: close `denoise` after the first sampler step and open `phase.finish` there | 1 file, +5/-0 | rc 0, 0 errors | **RED**, exit 1, 1 case failed, **195 assertions, 9 failed** | exit 0, 458/458 |
+| M4 | re-anchored: leave `decode.video` open across the audio decode and give `decode.audio` a name with no work | 1 file, +3/-3 | rc 0, 0 errors | **RED**, exit 1, 1 case failed, **92 assertions, 1 failed** (a `REQUIRE_FALSE` aborts the case early) | exit 0, 446/446 |
+| M10 | re-anchored: after a chunk, re-label the decode as the writer | 1 file, +1/-1 | rc 0, 0 errors | **RED**, exit 1, 1 case failed, **195 assertions, 1 failed** | exit 0, 446/446 |
+
+On the unmutated tree at the same head the containment case reports **exit 0,
+1/1 cases, 194/194 assertions** and the SUMS case **exit 0, 1/1, 446/446**, with
+`denoise.step` covering 97.81% of `denoise` over 8 evaluations,
+`decode.video.chunk` 98.78% of `decode.video`, mel+vocoder 99.99% of
+`decode.audio`, and `artifacts.frames.ppm` 97.97% of `artifacts.frames`.
+
+**The SUMS column is still not a defect, and it is now the third independent
+demonstration of the same thing:** a sum cannot see a transfer, and it cannot see
+an anchor that moved with its leaf either.
+
+**The ABI number moved, and that is the one thing in this stage a merge tool
+could not have resolved.** `main` took v22 for `vllm_model_params.mmproj_path`
+(#821, landed as #1436) while this branch was open, and this branch had written
+v22 for `vllm_video_last_phase_log`. Two features under one version is not a
+textual conflict: the version is the only question a caller can ask a loaded
+library, and one that answers yes for a feature the build does not carry is worse
+than none. The phase table is **v23**, and the `>= 22` floor in
+`tests/capi/test_capi.cpp`, the block comments in `include/vllm.h`, the
+`docs/FEATURES.md` surface row and the `docs/USAGE.md` version line and table
+moved with it. The table also gained the v22 row for `mmproj_path` it was
+missing.
 
 ### No claim file, and the checker says why
 
@@ -1082,13 +1204,24 @@ which is where this spec's `### Decisions taken here` already said they would be
   the rank of its two dominant phases. Until W1 takes a lease on an idle box, no
   DURATION in any phase table this row produced may be compared with any other
   duration, including its own from the run before.
-* **The sub-millisecond leaves are named, not measured.** `generate.setup`,
-  `generate.geometry`, `generate.guiders`, `generate.image_cond`,
-  `generate.audio_input`, `generate.retake` and `phase.finish` are each under
-  0.001% of the leaf sum on the fixture; F2's containment and floor cover the
-  three phases that carry the render and say nothing about these. That is a fact
-  about the driver — they really are bookkeeping — but it means their PLACEMENT
-  is unproven, and a shipped-checkpoint render is where it would show.
+* **EVERY LEAF THAT IS NOT ONE OF THE FOUR CARRYING PHASES IS NAMED AND NOT
+  ANCHORED**, and this entry used to list only seven of them. The gate anchors
+  `denoise`, `decode.video`, `decode.audio` and `artifacts.frames` — one nested
+  sub-scope per unit of work the render counted, contained in the leaf, covering
+  it, exclusive of other leaves. **Nothing else in the table has an anchor.** The
+  full list, so that no later stage inherits an unproven placement by silence:
+
+  | Leaf | State | Who acts on it |
+  |---|---|---|
+  | `load.dit` | **order only.** Its placement is unproven, and mutation M13 shows what that costs: swapping its name with `load.prompt_embeds` moved 96% of the load's seconds and reddened nothing until the order check landed. An anchor needs a scope inside `Ltx2LoadDitFromSafetensors` / `Ltx2StreamDitToDevice` (`ltx2_loader.cpp`), outside this stage's authority | **W2 and W3, both** |
+  | `load.video_vae`, `load.audio_vae`, `load.upsampler`, `load.text_encoder`, `load.prompt_embeds` | order only, same argument | W2 |
+  | `conditioning.tower`, `conditioning.connector` | unanchored. These are the 39-100% bound [#1269](https://github.com/mudler/vllm.cpp/issues/1269) is about, so W4 acts on two numbers whose placement no gate holds | **W4** |
+  | `generate.setup`, `generate.geometry`, `generate.guiders`, `generate.image_cond`, `generate.audio_input`, `generate.retake`, `generate.trim`, `phase.finish`, `phase.prepare` | unanchored, and each under 0.001% of the leaf sum on the fixture. That is a fact about the DRIVER — they really are bookkeeping — and it is a fact about a two-block fixture, not about 21B | nobody, today |
+  | `phase.upsample_latent` | unanchored, and gated only on the reduced two-phase fixture (see below) | W2c |
+  | `artifacts.audio` | unanchored; the WAV write, one call | nobody, today |
+
+  The `load` and `generate` records are SPANS and are never summed, so they are
+  not in this list; `sum_rule` in every emitted table says which records add up.
 * **F10 IS NOW GATED, and the sentence that said it could not be was wrong.**
   This entry used to read "F10 is an absence — a thread that keeps running —
   which no assertion in this suite is positioned to observe", and asserted that a
