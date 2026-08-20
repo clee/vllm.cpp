@@ -703,28 +703,36 @@ What exists on CPU is a correctness reference. It makes no speed claim, and no
 token-exact comparison against vLLM on this checkpoint has been recorded.
 
 A CUDA kernel now exists for the sm_120a and sm_121a architectures, and it is
-**build-verified only**. It is the block-scaled CUTLASS GEMM vLLM itself
-dispatches on those devices, ported whole, with the scales applied in the
-mainloop; it is compiled by continuous integration for both architectures and
-registered, so a build for one of them no longer refuses the checkpoint at
-prepare time. **It has never been executed.** No comparison against the CPU
-reference, no token-exact comparison against vLLM, and no throughput number has
-been recorded for it, on any device. The value comparison that would settle it
-is written and registered as `test_ops_matmul_fp8_block_cuda`, and on a machine
-with no device it reports that it did not run. Treat this arm as untested until
-that test has been run on hardware and its result recorded. Milestone M5 of
-[#1189](https://github.com/mudler/vllm.cpp/issues/1189) owns the kernel and the
-run it still owes; [#1166](https://github.com/mudler/vllm.cpp/issues/1166) is
-the original report.
+**run and failing**. It is the block-scaled CUTLASS GEMM vLLM itself dispatches
+on those devices, ported whole, with the scales applied in the mainloop; it is
+compiled by continuous integration for both architectures and registered, so a
+build for one of them no longer refuses the checkpoint at prepare time. On
+2026-08-20 `test_ops_matmul_fp8_block_cuda` was run on a GB10 (compute
+capability 12.1) for the first time, and vLLM's own ported case -- M=32, N=576,
+K=7168 -- throws `cutlass Invalid status` before any kernel launches, because
+CUTLASS refuses the configuration at `can_implement`. Two of the file's five
+cases fail this way and three pass, so the failure is shape-dependent rather
+than universal; which shapes are affected is not yet isolated, and `Invalid`
+names no constraint. No shape has yet had its output compared against the CPU
+reference: the two cases that make that comparison are the two that throw. There
+is still no token-exact comparison against vLLM and no throughput number, on any
+device. Treat this arm as broken on the shape it was measured on and unproven
+everywhere else.
+[#1437](https://github.com/mudler/vllm.cpp/issues/1437) records the run,
+milestone M5 of [#1189](https://github.com/mudler/vllm.cpp/issues/1189) owns the
+kernel and the repair it now owes, and
+[#1166](https://github.com/mudler/vllm.cpp/issues/1166) is the original report.
 
 Two shapes the CPU arm accepts are refused on CUDA, by name and with the
 dimension and its remainder in the message. The CUTLASS collective needs both
 `K` and `N` to be multiples of 16, and vLLM draws the same line one rung higher
 and reroutes those shapes to a Triton kernel this build does not have. A
-*ragged* 128-block is not affected and runs: `N = 576` is `4*128 + 64` and is the
-shape vLLM's own CUTLASS test uses. A build for any other CUDA architecture has
-no such kernel compiled and keeps refusing at prepare time, which is the honest
-answer rather than a silent fallback.
+*ragged* 128-block is not refused by that rule: `N = 576` is `4*128 + 64`, is
+16-aligned, and is the shape vLLM's own CUTLASS test uses. It does not follow
+that it runs -- on hardware that shape is exactly the one CUTLASS rejects at
+`can_implement`, above. A build for any other CUDA architecture has no such
+kernel compiled and keeps refusing at prepare time, which is the honest answer
+rather than a silent fallback.
 
 One lever is incompatible with this arm. `VT_KV_CACHE_F32=1` selects an F32
 paged KV cache while `v_proj` keeps emitting BF16, and the KV write requires
@@ -1134,6 +1142,74 @@ nothing else.
 The timeline starts at the **engine load**, because on a 22B checkpoint the DiT
 staging is minutes paid at the front of every render. A process that loads a
 second engine starts a new timeline, so the table describes the last load.
+
+### While the render runs: the `[render]` lines
+
+The table above is written by a generation that **returns**. A render that is
+killed, aborted by a lease governor, or still going writes none, so LTX-2.5 also
+narrates itself on stderr as it goes, on the shipped default and behind no flag:
+
+```text
+[render] + load                     t=0.000s
+[render] + load.dit                 t=0.001s
+[render] - load.dit                 t=0.002s dur=0.001s host=0.01GiB
+...
+[render] - load                     t=0.027s dur=0.027s host=0.02GiB
+[render] + generate                 t=0.027s
+...
+[render] + denoise                  t=0.027s
+[render] + denoise.step             t=0.027s
+[render]   dit forward 1  phase 0 step 1/8  t=0.027s
+[render] - denoise.step             t=0.065s dur=0.038s host=0.02GiB
+[render] + denoise.step             t=0.066s
+[render]   dit forward 2  phase 0 step 2/8  t=0.066s last=0.038s
+[render] - denoise.step             t=0.069s dur=0.003s host=0.02GiB
+...
+[render] - denoise                  t=0.146s dur=0.118s host=0.02GiB
+[render] + decode.video             t=0.146s
+[render] - decode.video             t=0.147s dur=0.001s host=0.02GiB
+[render] + artifacts.frames         t=0.147s
+...
+[render] + decode.audio             t=0.148s
+[render] + decode.audio.mel         t=0.148s
+[render] - decode.audio.mel         t=0.155s dur=0.008s host=0.02GiB
+[render] + decode.audio.vocoder     t=0.155s
+[render] - decode.audio.vocoder     t=0.236s dur=0.081s host=0.02GiB
+[render] - decode.audio             t=0.236s dur=0.089s host=0.02GiB
+[render] - generate                 t=0.237s dur=0.209s host=0.02GiB
+```
+
+**That is a real capture**, from the CPU gate render at 64x64 over 9 frames — the
+seconds and the byte counts are that render's, on a contended box, and nothing
+here is a benchmark. It is shown at this scale on purpose. The same lines from a
+21.004 B render would carry a `load.dit` of minutes and a `last=` on the order of
+[#1375](https://github.com/mudler/vllm.cpp/issues/1375)'s measured 162 s per DiT
+forward, and **no such render has been captured yet** — that is W1's lease. A
+worked example at that scale would be a projection, and a projection printed in a
+public document gets quoted back as a measurement.
+
+Read it as three things:
+
+* **The last line names what is running.** A phase prints when it opens, not
+  only when it finishes, so a run that stops inside a phase still says which one.
+  Between the banner and `wrote N frames` there was previously nothing at all,
+  and a working render and a hung one were the same observation.
+* **`last=` is the per-forward cost.** Seconds since the previous DiT forward,
+  measured by the process doing the work rather than inferred from outside it.
+* **`step k/N` is exact; the forward counter has no denominator.** The sampler
+  decides how many denoiser calls a step takes and the guider decides how many
+  forwards each call is (one to four), so a total would be a guess. Two forwards
+  per step is what `cfg_scale != 1.0` alone buys; a guider that also runs the
+  STG and modality legs does four, which is what the device-resident arm does
+  now that [#1092](https://github.com/mudler/vllm.cpp/issues/1092) gave
+  `Ltx2DitForwardDevice` its `perturbations` argument. The `k/N` fraction is
+  unaffected either way: it reads the recipe phase's own `sigmas`.
+
+`VLLM_RENDER_PROGRESS=0` silences them. It is a measurement lane so an A/B over
+what the emitter costs runs on one binary, not a setting to turn off: the cost is
+one flushed `fprintf` per phase boundary and per forward — on the order of a
+hundred writes against hours of wall — and nothing is emitted per token or per
+VAE tile.
 
 Add `--first-frame frame.ppm --image-crf 0` for image-to-video. The PPM is
 binary P6 at maxval 255 (no PNG/JPEG codec is vendored); `--image-crf 0` is
