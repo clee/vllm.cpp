@@ -6,16 +6,21 @@
 // three properties the tier must have, WITHOUT needing Metal or Vulkan hardware:
 //
 //   1. SAFETY (the load-bearing invariant) — the CPU fallback is installed ONLY
-//      where host and device memory alias (Backend::UnifiedMemory()). A device
-//      that reports DISCRETE memory NEVER receives a CPU fallback; GetOp still
-//      throws there, exactly as before, because a CPU kernel against true device
-//      memory is corruption. This is asserted against a fake DISCRETE backend.
+//      where the HOST MAY DEREFERENCE what Backend::Alloc returned
+//      (Backend::DeviceMemoryIsHostAddressable()). A device that cannot promise
+//      that NEVER receives a CPU fallback; GetOp refuses by name instead,
+//      because a CPU kernel against device memory is corruption. Asserted twice:
+//      against a fake DISCRETE backend, and against a fake backend carrying the
+//      GB10 CUDA pair — unified memory TRUE, host-addressable FALSE. The gate
+//      read UnifiedMemory() until #844 / #1435, and the second fake is the shape
+//      that made that a SIGSEGV rather than a refusal.
 //
 //   2. CORRECTNESS-WITH-ZERO-KERNELS — a device with NO native kernel for an op
 //      still produces the right answer through the reference tier. Asserted
-//      against a fake UNIFIED backend (host-memory allocator standing in for
-//      Metal StorageModeShared / GB10 / integrated Vulkan): vt::Relu dispatched on
-//      that device falls back to the CPU kernel and returns bit-identical output.
+//      against a fake UNIFIED, host-addressable backend (host-memory allocator
+//      standing in for Metal StorageModeShared and integrated Vulkan): vt::Relu
+//      dispatched on that device falls back to the CPU kernel and returns
+//      bit-identical output.
 //
 //   3. NATIVE ALWAYS WINS + OBSERVABILITY — a registered native kernel outranks
 //      the tier (priority), the tier is never silent (GetReferenceTierHits, and a
@@ -23,8 +28,10 @@
 //      so the fused-recipe ladder is unchanged.
 //
 // This file is its own executable (tests/CMakeLists.txt: one add_executable per
-// test), so registering a backend on the otherwise-unused kXPU slot cannot leak
-// into any other test binary.
+// test), so registering a backend on the otherwise-unused kXPU and kTENSTORRENT
+// slots cannot leak into any other test binary. The two slots are separate
+// because a reference-tier provider cannot be uninstalled once registered, so a
+// case that must observe an EMPTY table needs a table nothing else has touched.
 #include <doctest/doctest.h>
 
 #include <cstdint>
