@@ -1296,19 +1296,32 @@ step, which no anchor wraps — and its share depends on the geometry. Measured
 the measured value in both cases, which is the rule the other thresholds are set
 by.
 
+**Re-run on the FINAL head**, the merge commit `8c66ffa16`, and not on the head each mutation was
+first measured on: `origin/main` moved twice while this branch was open and one
+of the incoming commits (`d0eff4f25`, W0-LIVE) edits this row's own driver, so a
+mutation proof inherited from an earlier head is a claim about a tree that no
+longer exists.
+
 | # | Mutation | `git diff --stat` | compile | containment case | SUMS case |
 |---|---|---|---|---|---|
-| — | honest | (none) | rc 0 | exit 0, 1/1, **527/527** | exit 0, 1/1, **446/446** |
+| — | honest | (none) | rc 0 | exit 0, 1/1 cases, **527/527** | exit 0, 1/1, **446/446** |
 | **N1** | swap the `decode.audio.mel` and `decode.audio.vocoder` scope names — the **sibling-swap** mutation | 1 file, +2/-2 | rc 0 | **RED**, exit 1, 1 case failed, **527 assertions, 3 failed**, on the sibling order in each of the three per-render checks | exit 0, 446/446 |
-| **N6** | move `decode.video.vae` off `AccumulateTemporalGroup` onto `buffer.Allocate` — the **anchor beside the work** mutation | 1 file, +5/-9 | rc 0 | **RED**, exit 1, 1 case failed, **527 assertions, 3 failed**, on the vae coverage floor | exit 0, 446/446 |
-| M13 | re-anchored: swap the `load.dit` and `load.prompt_embeds` scope names | 1 file, +2/-2 | rc 0 | **RED**, exit 1, 1 case failed, **527 assertions, 2 failed**, on the load order | exit 0, 446/446 |
-| M12 | re-anchored: `denoise.step` for step 0 only, `denoise` closed there, `phase.finish` over steps 1-7 | 1 file, +8/-1 | rc 0 | **RED**, exit 1, 1 case failed, **462 assertions, 3 failed** | exit 0, 374/374 |
-| M7 | re-anchored: close `denoise` after the first sampler step and open `phase.finish` there | 1 file, +6/-0 | rc 0 | **RED**, exit 1, 1 case failed, **539 assertions, 24 failed** | exit 0, 458/458 |
-| M4 | re-anchored: `decode.video` left open across the audio decode | 1 file, +2/-1 | rc 0 | **RED**, exit 1, 1 case failed, **88 assertions, 2 failed** (a `REQUIRE_FALSE` aborts the case early) | exit 0, 446/446 |
-| M10 | re-anchored: after a chunk, re-label the decode as the writer | 1 file, +1/-1 | rc 0 | **RED**, exit 1, 1 case failed, **529 assertions, 4 failed** | exit 0, 446/446 |
+| **N6** | move `decode.video.vae` off `AccumulateTemporalGroup` onto `buffer.Allocate` — the **anchor beside the work** mutation | 1 file, +7/-7 | rc 0 | **RED**, exit 1, 1 case failed, **527 assertions, 3 failed**, on the vae coverage floor | exit 0, 446/446 |
+| M12 | re-anchored: `denoise.step` for step 0 only, `denoise` closed there, `phase.finish` over steps 1-7 | 1 file, +8/-1 | rc 0 | **RED**, exit 1, 1 case failed, **462 assertions, 5 failed** | exit 0, 374/374 |
 | M11 | re-anchored: writes stay inside `decode.video`, `artifacts.frames` emitted empty | 1 file, +3/-4 | rc 0 | **RED**, exit 1, 1 case failed, **527 assertions, 4 failed** | exit 0, 446/446 |
 | M11b | re-anchored: both `Close`s below the write, writer still around the loop | 1 file, +2/-2 | rc 0 | **RED**, exit 1, 1 case failed, **119 assertions, 1 failed** | exit 0, 446/446 |
+| M13 | re-anchored: swap the `load.dit` and `load.prompt_embeds` scope names | 1 file, +2/-2 | rc 0 | **RED**, exit 1, 1 case failed, **527 assertions, 2 failed**, on the load order | exit 0, 446/446 |
+| M7 | re-anchored: close `denoise` after the first sampler step and open `phase.finish` there | 1 file, +6/-0 | rc 0 | **RED**, exit 1, 1 case failed, **539 assertions, 24 failed** | exit 0, 458/458 |
+| M4 | re-anchored: `decode.video` left open across the audio decode | 1 file, +2/-1 | rc 0 | **RED**, exit 1, 1 case failed, **88 assertions, 2 failed** (a `REQUIRE_FALSE` aborts the case early) | exit 0, 446/446 |
+| M10 | re-anchored: after a chunk, re-label the decode as the writer | 1 file, +1/-1 | rc 0 | **RED**, exit 1, 1 case failed, **529 assertions, 5 failed** | exit 0, 446/446 |
 | N10 | detach `artifacts.frames.ppm` from the `WriteFileBytes` loop by closing it before the loop runs | 1 file, +1/-1 | rc 0 | **RED**, exit 1, 1 case failed, **527 assertions, 3 failed** | exit 0, 446/446 |
+
+**N10 was RECONSTRUCTED, and it is named as such.** The fourth review's own
+definition of it is not recorded in this tree or on the forge, so what runs under
+that label here is the mutation the name describes: close `artifacts.frames.ppm`
+before the `WriteFileBytes` loop instead of after it, which detaches the writer's
+anchor from the writes while leaving the leaf, the count and the nesting intact.
+The other nine are the reviews' own.
 
 Every mutation was applied by exact-text replacement that refuses unless the
 pattern occurs exactly once, with its `git diff --stat` and its compile return
@@ -1319,6 +1332,18 @@ never applies, reads exactly like a passing test.
 **The SUMS column is still not a defect,** for the fourth time: a sum cannot see
 a transfer, an anchor that moved with its leaf, or a pair of anchor names that
 were exchanged.
+
+**The four suites on that same head**, x86 CPU, Release, `-DVLLM_CPP_SERVER=OFF`:
+`test_ltx2_video` exit 0, 96/96 cases, 3990/3990 assertions; `test_capi` exit 0,
+65/65, 654/654; `test_ltx2_vae` exit 0, 43/43, 3125/3125; `test_ltx2_tiling`
+exit 0, 10/10, 915/915.
+
+**One run of `test_ltx2_video` reported three cases THREW and it was not a
+verdict.** The box filled to 100% mid-run and the three exceptions read
+`No space left on device` and `short write .../frame_000000.ppm`. A full disk
+presents as a claim about the code, which is a shape this repository has hit
+before with checker refusals; the numbers above are a re-run with 91 GB free.
+Check `df` before believing a red.
 
 **No timing conclusion is drawn from this box.** Every threshold above is a
 within-run share. The leaf sums moved 0.658 s, 0.706 s and 0.779 s across three
