@@ -645,7 +645,7 @@ quantizes the activation once; a checkpoint whose scales differ keeps the two
 separate GEMMs automatically. `VT_GDN_MERGED_QKVZ_FP8=0` restores the two GEMMs
 in the same binary.
 
-### Block-wise FP8 runs on CPU, and its CUDA kernel matches the reference on the shapes it serves
+### Block-wise FP8 runs on CPU, and its CUDA kernel matches the reference on the shapes it was run on
 
 Block-wise FP8, also called fine-grained FP8, keeps one scale for each 128x128
 block of a weight rather than one scale for the whole weight. A block-wise
@@ -703,8 +703,8 @@ What exists on CPU is a correctness reference. It makes no speed claim, and no
 token-exact comparison against vLLM on this checkpoint has been recorded.
 
 A CUDA kernel now exists for the sm_120a and sm_121a architectures, and it is
-**run, shape-restricted, and matching the CPU reference on the shapes it
-serves**. It is the block-scaled CUTLASS GEMM vLLM itself dispatches on those
+**run, shape-restricted, and matching the CPU reference on the seven shapes it
+was run on**. It is the block-scaled CUTLASS GEMM vLLM itself dispatches on those
 devices, ported whole, with the scales applied in the mainloop; it is compiled
 by continuous integration for both architectures and registered, so a build for
 one of them no longer refuses the checkpoint at prepare time. On 2026-08-20
@@ -743,7 +743,7 @@ affected the same way. The CPU reference arm runs every one of these shapes.
 `Qwen/Qwen3.8-27B-FP8`, the checkpoint above, is not affected: its ten
 projections are all round.
 
-**The shapes it does serve are now compared, and they match.** Later the same
+**Seven shapes it serves have now been compared, and they match.** Later the same
 day, on the same GB10 and on a tree carrying the refusals above, the whole
 `test_ops_matmul_fp8_block_cuda` suite ran unpatched and reported 5 cases and
 136 assertions with none failed, and not one line saying the portable CPU

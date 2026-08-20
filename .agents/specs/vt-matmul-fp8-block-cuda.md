@@ -32,7 +32,7 @@ The fleet was contended. What that change establishes is the compile leg and the
 host-side dispatch decision. Two on-hardware runs came later, both under
 [#1437](https://github.com/mudler/vllm.cpp/issues/1437) and both recorded in
 §`## Owed`: the first FAILED, and the second MATCHES the CPU reference on the
-shapes this arm serves. That section states plainly what is and is not
+seven shapes it was run on. That section states plainly what is and is not
 established after them, and the token gate is not.
 
 ## Which implementation actually runs, and why
@@ -272,10 +272,12 @@ kernel that, **at M5's landing**, had never executed. `docs/USAGE.md` and
 record.
 
 **SUPERSEDED, and the rest of this section is kept as the reasoning taken at M5
-rather than as a current description.** The kernel has since executed, on
-`dgx:gpu0`, and it FAILS -- see `## Owed` and
+rather than as a current description.** The kernel has since executed on
+`dgx:gpu0` twice. The first run FAILED; after the intervening repair it MATCHES
+the CPU reference on the shapes it was run on, with no token gate and no speed
+number -- see `## Owed` and
 [#1437](https://github.com/mudler/vllm.cpp/issues/1437). Both pages were
-corrected in the change that recorded that run and no longer carry a
+corrected in the change that recorded each run and no longer carry a
 never-executed label, so any sentence below asserting that they do is history.
 The design decision itself is unchanged and is not being re-argued here.
 
@@ -299,8 +301,8 @@ commit body, the pull request body and `## Owed`. **It no longer is**: the runs
 under [#1437](https://github.com/mudler/vllm.cpp/issues/1437) took it first to
 RUN AND FAILING and then, once
 [#1453](https://github.com/mudler/vllm.cpp/pull/1453) had encoded the shape
-partition, to RUN AND MATCHING THE CPU REFERENCE ON THE SHAPES IT SERVES, with
-no token gate. Both pages carry the second position. What made the label
+partition, to RUN AND MATCHING THE CPU REFERENCE ON THE SEVEN SHAPES IT WAS RUN
+ON, with no token gate. Both pages carry the second position. What made the label
 acceptable rather than reckless was that the first person to run it would get a
 written, registered test saying what to compare against and what the criterion
 is, instead of a kernel and a shrug. That is what happened twice over: the test
@@ -333,7 +335,7 @@ TU present and that the new registration is the only one for its OpId.
 | the f32 sink is read as an f32 compute path | recorded above and in the TU's header comment; the collective is instantiated for bf16 only |
 | a grown workspace is freed while a captured graph still holds its pointer | `RetireGraphScratch`, the same discipline both sibling CUTLASS TUs use |
 | the counter advances on a call that then throws, overstating dispatch | incremented after `run` returns `kSuccess`, and G5 asserts the ordering by counting a refused call |
-| a reader believes this arm was measured | AT M5: `## Owed`, the commit body, the pull request body, `docs/USAGE.md` and `docs/FEATURES.md` all said it was not. SINCE [#1437](https://github.com/mudler/vllm.cpp/issues/1437) the risk INVERTS -- it HAS been measured, on the shapes it serves, and the same five surfaces now have to keep saying exactly how far that reaches: seven shapes compared against the CPU reference, every unservable shape refused by name, and NO token gate and NO speed number |
+| a reader believes this arm was measured | AT M5: `## Owed`, the commit body, the pull request body, `docs/USAGE.md` and `docs/FEATURES.md` all said it was not. SINCE [#1437](https://github.com/mudler/vllm.cpp/issues/1437) the risk INVERTS -- it HAS been measured, on seven shapes, and the same five surfaces now have to keep saying exactly how far that reaches: seven shapes compared against the CPU reference, every unservable shape refused by name, and NO token gate and NO speed number |
 
 ## Tests
 
@@ -441,7 +443,7 @@ builds it and a leased box runs it.
 ## Owed
 
 - ~~**No on-hardware run.**~~ ~~**RUN, AND FAILING.**~~ **RUN, AND MATCHING THE
-  CPU REFERENCE ON THE SHAPES IT SERVES.** Two runs, both 2026-08-20, and the
+  CPU REFERENCE ON THE SEVEN SHAPES IT WAS RUN ON.** Two runs, both 2026-08-20, and the
   second one is the current position: read the FIRST RUN and the ROOT CAUSE
   below as the history that produced it, and `CONFIRMED ON HARDWARE` at the end
   as where this row stands.
@@ -585,7 +587,7 @@ builds it and a leased box runs it.
 
   ```text
   [doctest] test cases:   5 |   5 passed | 0 failed | 0 skipped
-  [doctest] assertions: 136 | 136 passed | 0 failed
+  [doctest] assertions: 136 | 136 passed | 0 failed |
   [doctest] Status: SUCCESS!
   REFERENCE_TIER_LINES=0   TEST_RC=0
   ```
@@ -596,8 +598,16 @@ builds it and a leased box runs it.
   (10 grid entries x 3 `CHECK`, then 4 partition, 3 tile-config, 1 N-floor and 2
   swapped/unswapped checks), and G2's host half contributes the 1 `CHECK` that
   precedes its guard, while G7, G8 and G9 return before their first assertion.
-  So **95 of the 136 ran on the board**, and the job scripted `RESULT=VOID`
-  below 38 rather than reading a low count as a pass. **Zero
+  So **95 of the 136 ran on the board**, and that delta -- 136 against 41 -- is
+  the discriminator. **The job's own assertion floor is INERT and is not
+  evidence.** `run5.sh` exits `RESULT=VOID` below 38, a number sized for the
+  27-assertion skip of the pre-#1453 file; #1453 grew the host tier to 41, which
+  clears 38, so the guard can no longer fire on this file. A run whose
+  `nvidia-smi` succeeds on the host while the CUDA backend throws inside the
+  container would print 41 assertions, `TEST_RC=0`, `REFERENCE_TIER_LINES=0` and
+  `RESULT=CONFIRMED`, and only the 136-against-41 delta separates that from this
+  one. The verdict stands on the delta; the floor is recorded as inert so that
+  nobody credits it twice. **Zero
   `[vt reference-tier]` lines**, so the op was registered and nothing fell
   through to the portable host kernel -- the failure mode that produced a
   SIGSEGV and a wrong headline on an earlier attempt at this measurement. The
@@ -652,11 +662,17 @@ builds it and a leased box runs it.
   did NOT touch, and it is the one that stands between this arm and a capability
   claim.
 - **Comments in `tests/vt/test_ops_matmul_fp8_block_cuda.cpp` still say the arm
-  has never run on a device**, and they are now false. G2's header block reads
-  "Half 2 is NOT evidence that the arm works: it has never run on a device", and
-  the four `NO CUDA DEVICE` messages that G2, G7, G8 and G9 print each read
-  "#1189 M5's on-hardware leg is OWED, not passed". The leg is no longer owed
-  for the shapes this arm serves. They were left standing because the change
+  has never run on a device**, and they are now false. The loudest is the FILE
+  HEADER, which is the first thing a reader of that file sees: it opens "THIS
+  FILE HAS NEVER RUN AGAINST A DEVICE" and adds that "no number produced here
+  appears in any document as a measurement" -- doubly false now, because the
+  5/136/0 line appears both in this section and in `docs/USAGE.md`. Then G2's
+  header block, which reads "Half 2 is NOT evidence that the arm works: it has
+  never run on a device", and the four `NO CUDA DEVICE` messages that G2, G7,
+  G8 and G9 print, each reading "#1189 M5's on-hardware leg is OWED, not
+  passed". Six sites in all, and an implementer who repairs only the five below
+  the header leaves the headline asserting the opposite. The leg is no longer
+  owed for the shapes this arm was run on. They were left standing because the change
   that recorded the second run under
   [#1437](https://github.com/mudler/vllm.cpp/issues/1437) is records-only and
   edits no compiled or test source; this row owns the correction, and a reader
@@ -670,7 +686,8 @@ builds it and a leased box runs it.
   BUILD-VERIFIED ONLY is not the right label and neither is RUN AND FAILING;
   `docs/USAGE.md` and `docs/FEATURES.md` are corrected in the same change that
   records each run, and they now say that the arm serves only `N % 128 == 0` and
-  `K % 128 == 0`, that it MATCHES the CPU reference on the shapes it serves, and
+  `K % 128 == 0`, that it MATCHES the CPU reference on the seven shapes it was
+  run on, and
   that it has NO token gate and NO speed number. Neither page may carry a
   capability claim wider than that.
 - **The column-major and TMA-aligned activation-scale layouts**
@@ -762,10 +779,12 @@ passed.` **`assertions: 0` is a skip wearing a pass**, and it is recorded here a
 the measurement it is: the load-bearing comparison of this row did not run.
 
 This whole section is the `27d5432f9` HOST run and stays as written. It is not
-superseded by the later device run in `## Owed`; it is the CONTROL for it. The
-27-assertion figure here is the measured pure-skip count of this file, which is
-why `## Owed` can say that 27 of the device run's 34 assertions prove nothing
-about a device.
+superseded by the two later device runs in `## Owed`; it is the CONTROL for the
+FIRST of them. The 27-assertion figure here is the measured pure-skip count of
+this file **at `27d5432f9`**, which is why `## Owed` can say that 27 of the
+first device run's 34 assertions prove nothing about a device. It is NOT the
+control for the second run: #1453 grew the host tier of this file to 41, and
+that is the baseline the second run's 136 is measured against.
 
 | Block | Cases | Assertions | What that means |
 |---|---:|---:|---|
