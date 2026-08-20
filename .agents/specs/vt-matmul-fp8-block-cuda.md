@@ -661,22 +661,37 @@ builds it and a leased box runs it.
   oracle on this arm, on any device. This is the item the confirmation run above
   did NOT touch, and it is the one that stands between this arm and a capability
   claim.
-- **Comments in `tests/vt/test_ops_matmul_fp8_block_cuda.cpp` still say the arm
-  has never run on a device**, and they are now false. The loudest is the FILE
-  HEADER, which is the first thing a reader of that file sees: it opens "THIS
-  FILE HAS NEVER RUN AGAINST A DEVICE" and adds that "no number produced here
-  appears in any document as a measurement" -- doubly false now, because the
-  5/136/0 line appears both in this section and in `docs/USAGE.md`. Then G2's
-  header block, which reads "Half 2 is NOT evidence that the arm works: it has
-  never run on a device", and the four `NO CUDA DEVICE` messages that G2, G7,
-  G8 and G9 print, each reading "#1189 M5's on-hardware leg is OWED, not
-  passed". Six sites in all, and an implementer who repairs only the five below
-  the header leaves the headline asserting the opposite. The leg is no longer
-  owed for the shapes this arm was run on. They were left standing because the change
-  that recorded the second run under
+- ~~**Comments in `tests/vt/test_ops_matmul_fp8_block_cuda.cpp` still say the arm
+  has never run on a device.**~~ **CORRECTED**, under
+  [#1490](https://github.com/mudler/vllm.cpp/issues/1490). Six sites asserted
+  the pre-measurement position after the confirmation run had closed it: the
+  FILE HEADER, which opened "THIS FILE HAS NEVER RUN AGAINST A DEVICE" and added
+  that "no number produced here appears in any document as a measurement" --
+  doubly false, because the 5/136/0 result appears both in this section and in
+  the public documentation (`docs/USAGE.md` when the six sites were enumerated;
+  `docs/models/qwen3-8-27b.md` after #1491 moved it); G2's header block, which read "Half 2 is NOT evidence that
+  the arm works: it has never run on a device"; and the four `NO CUDA DEVICE`
+  messages that G2, G7, G8 and G9 print, each of which read "#1189 M5's
+  on-hardware leg is OWED, not passed". They stood because the change that
+  recorded the second run under
   [#1437](https://github.com/mudler/vllm.cpp/issues/1437) is records-only and
-  edits no compiled or test source; this row owns the correction, and a reader
-  of that file gets the wrong position until it lands.
+  edits no compiled or test source.
+
+  The correction is comment-and-message text only: no assertion was deleted,
+  weakened or added, and the device-free assertion count is unchanged at 41. The
+  four `MESSAGE` strings keep their job -- on a device-free host the case
+  genuinely did not run and a skip is not a pass -- and now say the case did not
+  run HERE and name where the on-hardware result is recorded, instead of
+  claiming the leg is still owed. The header and G2's block carry the three
+  caveats unweakened: NO token gate, NO speed claim of any kind, and correctness
+  established on the SEVEN shapes actually run rather than on a class, together
+  with the standing `kv_a_proj_with_mqa` N=576 capability gap. A seventh site
+  was found by sweeping the file rather than by working the list: the header's
+  "WHAT IT MEASURES WHEN IT DOES RUN" was the conditional framing that paired
+  with the removed headline, and it now reads "WHAT IT MEASURES ON A DEVICE".
+  One occurrence was deliberately LEFT: G7's "seven of eight shapes were never
+  attempted at all" is correct past-tense narrative about the FIRST run's abort
+  at `Grid()[0]`, at a tree whose grid held eight entries.
 - **No speed claim.** None is made anywhere in this row. Both hardware runs
   above took a lease for CORRECTNESS only: neither took clock control, neither
   recorded contention and neither had a denominator — the three things
