@@ -173,7 +173,7 @@ The spec therefore says what each does and what we do about it, as required:
 | Mode | Upstream default | What `mamba_attn.py` passes | A2-B |
 |---|---|---|---|
 | `decode_threshold` | `1` | `decode_threshold=decode_threshold`, itself `reorder_batch_threshold` = `1` unless spec decode widens it (`:200`) | **mirror the value 1.** The spec-decode widening is out of scope because speculative rows stay refused |
-| `require_uniform` | `False` | **not passed ⇒ `False`** | **mirror by NOT implementing it.** Adding a mode this architecture's backend cannot reach would be an invention with no oracle, and AGENTS.md's "mirror every applicable mode" turns on *applicable*. Recorded here so the absence is a decision with a reason, not an omission. Uniformity enters this architecture through the **CUDA-graph** path instead (`mamba_attn.py:204-220`), which §Design D5 handles |
+| `require_uniform` | `False` | **not passed ⇒ `False`** | **mirror by NOT implementing it.** Adding a mode this architecture's backend cannot reach would be an invention with no oracle, and AGENTS.md's "mirror every applicable mode" turns on *applicable*. Recorded here so the absence is a decision with a reason, not an omission. Uniformity enters this architecture through the **CUDA-graph** path instead (`mamba_attn.py:204-221`), which §Design D5 handles |
 | `treat_short_extends_as_decodes` | `True` | **`False`, explicitly (`:467`)** | **mirror it.** This is the divergence, and §Our baseline shows we currently implement `True` |
 
 ### What `treat_short_extends_as_decodes=False` means, concretely
@@ -233,6 +233,95 @@ opposite assertion: it proves the **promotion** is ported, because under mode
 `False` a short extend must come out classified as a **decode**. A short-extend
 arm that reds is a missing promotion, not a missing flag.
 
+### ★★★ A DIFFERING SPLIT IS NOT A DIFFERING FORWARD: (c3) needs a DIRTY state slot
+
+★★ establishes that (c3) is the only population whose **four-tuple** differs
+between the two modes. G0 requires a **token** mismatch, and that is one level
+further down. **An earlier revision of this spec stopped at the four-tuple**, and
+so specified a flagship arm that is GREEN on a fresh runner — the same defect as
+the short-extend draft it replaced, one level deeper. This section traces the
+distance and states the condition that closes it.
+
+**Every consumer of `nd` / `np` in the forward.** The population is the complete
+output of `grep -n '\bnd\b\|\bnp\b'` over
+`src/vllm/model_executor/models/nemotron_h_device.cpp`, so it is a closed list
+rather than a sample:
+
+| site | what it does | can it change a token? |
+|---|---|---|
+| `:1201-1203` | `VT_CHECK(nd + np == R)` | **no** — a refusal, and it holds under both modes |
+| `:1204-1206` | `VT_CHECK(num_decode_tokens + num_prefill_tokens == T)` | **no** — a refusal, and it holds under both modes |
+| `:1233` | `if (r < nd)` ⇒ `init[r] = 1` | only through `init` |
+| `:1239-1242` | `VT_CHECK(prefill_has_initial_state->size() == np)` | **no** — a refusal |
+| `:1244` | `init[r] = (*gm.prefill_has_initial_state)[r - nd]` | only through `init` |
+| `:1261-1263` | the `[NH-DIAG]` print | **no** |
+
+Nothing else reads the split. `non_spec_query_start_loc` and
+`non_spec_state_indices_tensor` are the builder's own inputs verbatim on the
+non-spec path — `gdn_attn.cpp:161-162`, `non_spec_state_indices = state_indices`
+and `non_spec_query_start_loc = m.query_start_loc` — and so do not depend on it;
+and the attention half reads `attn_meta` only.
+
+**So the split reaches the arithmetic through exactly one wire: `init`.** `init`
+becomes `sdi.state_has_initial` (built `:1225-1246`, uploaded `:1254`, field
+declared `:1170`), and that field has exactly one reader — `:1453`, the mask
+argument of the two `vt::GdnStateGather` calls at `:1454-1455`. The kernel's
+store is `StoreF32(working, dst, keep ? LoadF32(cache, src) : 0.0f)`
+(`src/vt/cpu/cpu_ops.cpp:2416`, and `:2423` on the widened-cache path, with
+`keep` read at `:2408-2410`). **The mask chooses between the cache slot's bytes
+and zeros, and nothing else.** The mixer is then told `state.has_initial = true`
+unconditionally (`:1663`), and A2-P's own comment at
+`nemotron_h_device.cpp:1423-1424` states the consequence outright:
+
+> "it is EXACT. With a zeroed state row, `has_initial_state = 1` and
+> `has_initial_state = 0` compute the identical answer"
+
+On (c3)'s row the mask is `0` under mode `False` — the builder sets it as
+`context_lens[r] > 0` (`gdn_attn.cpp:326`) and a no-prior-state row has
+`context_len == 0` — and `1` under mode `True`, because `r < nd`. **The two modes
+therefore produce different tokens if and only if cache slot `idx[r]` is
+non-zero.**
+
+**The GDN state cache is allocated ZEROED**: `host_data_.assign(bytes, 0)` at
+`src/vllm/v1/worker/gpu/runner.cpp:484`, or `Memset(..., 0, bytes)` at `:491` on
+the backend-resident arm. **So on a fresh runner arm (c3) is GREEN under both
+modes**, and a green there is evidence about the fixture's slot, not about the
+flag.
+
+**What makes the difference observable is a DIRTY slot**, and nothing zeroes one
+on release. `ScatterNemotronHState` (`:1459-1470`) writes a slot for its owning
+request; `remap_gdn_state_slots` returns a finished request's slot to
+`gdn_free_slots_` (`runner.cpp:1153-1160`) still carrying that request's final
+conv and SSM rows, and issues it to the next new sequence at `:1177-1178`. Those
+two loops run in **one** call, reclaim before assign, and the pool is LIFO
+(`back()` / `pop_back()`), so the slot a request frees is the very next slot
+issued. The construction is therefore deterministic rather than incidental.
+
+**★ Arm (c3)'s row must be scheduled onto a RECLAIMED slot.** "A one-token prompt
+scheduled alongside a decoding request" is necessary and **not** sufficient, and
+that phrasing on its own specifies the green arm. The fixture is:
+
+1. run a request `X` for at least one step that reaches the mamba block, so
+   `ScatterNemotronHState` writes `X`'s slot with a non-zero state;
+2. in the step where `X` is no longer scheduled, submit the (c3) one-token
+   prompt alongside a still-decoding request. `remap_gdn_state_slots` reclaims
+   `X`'s slot and issues it to the new sequence in that same call;
+3. **assert in the test that the (c3) row's `non_spec_state_indices_tensor`
+   entry is the slot `X` held**, and that the slot's gathered state is non-zero.
+   Without that assertion the arm silently degrades to the fresh-slot arm and
+   reports a green that means nothing.
+
+Under mode `False` the row is handed zeros, which is correct for a sequence with
+no prior state. Under mode `True` it is handed `X`'s final recurrent state — the
+previous tenant, decoded as this sequence's own context. That is fluent wrong
+output.
+
+**This is B-M4's mechanism, observed from the other side.** B-M4 drops the
+zeroing so that even the correct mode leaks the previous tenant; (c3) keeps the
+zeroing and asks whether the mode selects it. **They share one fixture
+requirement**, so an implementer who builds B-M4's slot-reuse fixture has built
+(c3)'s, and one that cannot dirty a slot disarms both.
+
 ---
 
 ## Our baseline
@@ -263,13 +352,13 @@ The enumeration the dispatch asked for, site by site:
 
 | Site | What it does today | What A2-B changes |
 |---|---|---|
-| `nemotron_h_device.cpp:1225-1246` — the `idx` / `init` build in `BuildNemotronHPagedStep` (the function itself is `:1173-1259`) | loops `for r in [0,R)`, reads `gm.non_spec_state_indices_tensor[r]`, range-checks it against `state_slots`, sets `init[r] = 1` for `r < nd` and reads `gm.prefill_has_initial_state[r - nd]` otherwise | **nothing structural.** The `r < nd` branch is where the ordering contract becomes load-bearing, and D4's assertion is added HERE |
+| `nemotron_h_device.cpp:1225-1246` — the `idx` / `init` build in `BuildNemotronHPagedStep` (the function itself is `:1173-1279`) | loops `for r in [0,R)`, reads `gm.non_spec_state_indices_tensor[r]`, range-checks it against `state_slots`, sets `init[r] = 1` for `r < nd` and reads `gm.prefill_has_initial_state[r - nd]` otherwise | **nothing structural.** The `r < nd` branch is where the ordering contract becomes load-bearing, and D4's assertion is added HERE |
 | `:1248-1255` — the `NemotronHPagedStep` upload | uploads `slot_mapping [T]`, `block_table [R, cols]`, `seq_lens [R]`, `query_start_loc [R+1]`, `state_idx [R]`, `state_has_initial [R]` | **nothing.** Already `R`-shaped end to end |
 | `:1443-1457` `GatherNemotronHState` | allocates `[R, Cd, Kw-1]` and `[R, Hh, P, N]`, calls `vt::GdnStateGather(…, sdi.state_idx.t(), &hinit)` twice | **nothing.** `GdnStateGather` takes the index vector and the mask; both are extent `R` |
 | `:1459-1471` `ScatterNemotronHState` | `vt::GdnStateScatter` writes only the rows named by `state_idx`; its own comment says this "keeps two concurrent sequences from overwriting each other once A2-B lifts the request count" | **nothing.** This is the property A2-B must now *prove*, and B-M3 is the mutation that proves it |
-| `:1631-1706` — the mamba layer body | downloads `conv_all` / `ssm_all` at `[R, …]`, loops `for r in [0,R)`, slices `r*conv_row` and `r*ssm_row`, reads `[t0,t1)` from `gdn_meta.non_spec_query_start_loc`, calls `NemotronHMamba2Mixer` per request, writes back per request, re-uploads and scatters | **nothing structural.** Two real defects fall out at `R > 1` and are listed below |
+| `:1630-1707` — the mamba layer body (the per-request loop is `:1650-1690`) | downloads `conv_all` / `ssm_all` at `[R, …]`, loops `for r in [0,R)`, slices `r*conv_row` and `r*ssm_row`, reads `[t0,t1)` from `gdn_meta.non_spec_query_start_loc`, calls `NemotronHMamba2Mixer` per request, writes back per request, re-uploads and scatters | **nothing structural.** Two real defects fall out at `R > 1` and are listed below |
 | `:1639-1644`, `:1692-1699` — the `[NH-DIAG]` `GATHERED` and `WROTE` prints | `DiagL2(conv_all, 0, conv_row)` — request **0 only**, at every `R` | **fix.** A diagnostic that silently reports one request of a batch is the instrument that makes a batching defect invisible during triage. Either print per request or name the request in the format string |
-| `:1477-1614` — the attention half and embedding | `NemotronHAttnBlockPaged` takes `sdi.block_table [R, cols]`, `sdi.seq_lens [R]`, `sdi.query_start_loc [R+1]` into `vt::PagedAttention`, which is varlen by construction; `pa.query_start_loc_host = meta.query_start_loc.data()` is the runner's own `R+1` vector | **nothing to write; something to PROVE.** See D1 |
+| `:1294-1399` — the attention half, called from the layer loop at `:1620-1621`; the embedding is `:1528-1571` | `NemotronHAttnBlockPaged` takes `sdi.block_table [R, cols]`, `sdi.seq_lens [R]`, `sdi.query_start_loc [R+1]` into `vt::PagedAttention` (`:1389-1390`), which is varlen by construction; `pa.query_start_loc_host = meta.query_start_loc.data()` (`:1387`, the only occurrence in the file) is the runner's own `R+1` vector | **nothing to write; something to PROVE.** See D1 |
 | `:1765-1785` — the logits tail | `logits_indices` is a per-row index list and an empty one means "every row" | **nothing.** Already general |
 
 **So the per-request state indexing is done, and the honest statement of this
@@ -288,7 +377,7 @@ block:
 
 ### The runner already delivers an ordered batch
 
-`src/vllm/v1/worker/gpu/runner.cpp:126-190`,
+`src/vllm/v1/worker/gpu/runner.cpp:126-214`,
 `reorder_batch_to_split_decodes_and_prefills`, ported from `utils.py:665`. It is
 called **unconditionally** at `runner.cpp:1257`, before any metadata is built,
 with the default `decode_threshold = 1` (`include/vllm/v1/worker/gpu/runner.h:103`).
@@ -335,7 +424,13 @@ finding that most changes how this unit should be reviewed.
 `query_start_loc`, `seq_lens`, `num_computed_tokens_cpu`, `num_reqs`,
 `num_actual_tokens`, `max_query_len`, `max_seq_len`, `block_table_tensor`,
 `slot_mapping` — and **no `is_prefilling`**. `grep -rn is_prefilling src/ include/ tests/`
-finds it only in `v1/engine/output_processor`, an unrelated per-request flag.
+returns hits in exactly two places, and neither is a field on this struct:
+`v1/engine/output_processor` (`output_processor.h:164`, `output_processor.cpp:407`,
+`:408`, `:438`, `:458`, `:460`) carries an unrelated per-request flag of the same
+name, and `include/vllm/v1/attention/backend.h:30` is the DEFERRED-fields comment
+this spec already cites above — it names `is_prefilling` as **not** ported, which
+is the claim, not a counterexample to it. **There is no `is_prefilling` declared
+anywhere in `src/`, `include/` or `tests/`**, and that is what the grep shows.
 
 ### The interlock test that exists
 
@@ -496,7 +591,7 @@ not detected, it is silently reclassified as all-prefill.
 
 - `nemotron_h_registry.cpp` — drop `input.num_reqs <= 1` entirely. Do **not**
   narrow it to a smaller count; a count is not the property.
-- `BuildNemotronHPagedStep` (`nemotron_h_device.cpp:1173-1259`; the `nd`/`np`
+- `BuildNemotronHPagedStep` (`nemotron_h_device.cpp:1173-1279`; the `nd`/`np`
   check is `:1201-1203` and the `idx`/`init` build `:1225-1246`) — add, beside the
   existing `nd + np == R` check, a positive assertion of the contract the
   function's own comment already claims:
@@ -527,7 +622,7 @@ issue if the implementer finds no existing one.
 | **A2-Q1** (FP8 mamba, [#940](https://github.com/mudler/vllm.cpp/issues/940) **(closed)**, PR #1289 — **LANDING BUT HELD `DRAFT`**, not landed and not abandoned; see D6) | swaps the arm **inside** the per-request mamba loop; the loop, the gather and the scatter are unchanged by it. No seam conflict — but a **textual** conflict in `nemotron_h_device.cpp` is near-certain | order is free. Whoever lands second rebases and re-runs the focused gate on the merge result, not on either parent. `merge-tree` reporting clean is not the same as the merge building. **A2-B must not wait for it and must not assume it** — §Gates G6 says what A2-B measures on each side of that arm |
 | **A2-Q2b** (device `lm_head`, in flight) | rewrites the `want`/`gathered` tail (`:1765-1785`). That tail is already per-row general | order is free; same rebase rule. A2-B must not pre-empt the tail |
 | **CUDA graph capture** | `GraphEligibleQueryLen` (`src/vllm/v1/worker/gpu/cudagraph_dispatch.h:161`) admits `R > 1` uniform decode steps, and `runner.cpp:1510` calls it on the shared path for **whatever model the step routes to**. Lifting the refusal therefore newly admits NemotronH multi-request decode steps into the eligible population | **measure, do not assume.** NemotronH registers no decode graph driver, so the expectation is that the predicate names a length and nothing captures. That expectation is exactly the "absent hook looks like an armed instrument" shape. The gate reads `GraphDispatchStats` (`cudagraph_dispatch.h:187+`) on a multi-request run and **records the counters in the PR body**, whatever they say. If something does capture, A2-B refuses graph capture for this architecture by name and files the driver as owed — it does not write one |
-| **`mamba_attn.py:204-220`** | upstream's mamba CG capture is decode-only and asserts `max_query_len == 1 + num_spec_tokens` | consistent with refusing; recorded so the refusal has an upstream anchor rather than being a local preference |
+| **`mamba_attn.py:204-221`** | upstream's mamba CG capture is decode-only and asserts `max_query_len == 1 + num_spec_tokens` | consistent with refusing; recorded so the refusal has an upstream anchor rather than being a local preference |
 | **#1217** (`device_token_ids` has no per-model opt-in) | A2-P's `## Owed`. The decode-row splice is per row and its correctness at `R > 1` has never been observed | A2-B's multi-request gate is the first thing in the tree that can see it. If it diverges, that is #1217 evidence, filed and referenced — **not** silently repaired inside A2-B |
 
 
@@ -588,7 +683,7 @@ Three things follow:
 3. **A per-output-token cost that a kernel arm cuts 7.28x is dominated by
    HOST-SIDE work, and that is precisely the term batching amortises
    differently.** Our mamba block is a serial per-request host loop
-   (`nemotron_h_device.cpp:1653-1706`, and §Scope item 5 keeps it serial), so at
+   (`nemotron_h_device.cpp:1650-1690`, and §Scope item 5 keeps it serial), so at
    `R` requests the host term scales with `R` while a batched device GEMM would
    not. **The consequence is a prediction, and it is falsifiable** — but only once
    the two rates are named, because "tokens/s per step" is not a defined rate and
@@ -642,7 +737,7 @@ unavoidable harness adaptation.
 | the `split_decodes_and_prefills` cases under `treat_short_extends_as_decodes=False` | that a short extend counts as a **prefill**, and that the `is_prefilling` assert (`utils.py:624`) fires when the signal is absent | extend `tests/vllm/v1/attention/test_gdn_metadata_builder.cpp`, whose `:224` already pins the ordering contract for the `True` mode. The `False` twin sits beside it, and the `True` cases must stay byte-identical — that is the regression guard for R1 |
 | `mamba_attn.py:445-461` promotion | a prefilling row with `query_len == 1` **and** `seq_len > 1` is promoted back to a decode; one with `seq_len == 1` (no prior state) is **not** | a table-driven case over the four combinations of (`is_prefilling`, `seq_len > 1`). All four, not the happy pair |
 | `mamba_attn.py:87` / `:200` | threshold 1 | assertion on the value the NemotronH path passes |
-| the mamba mixer's decode-first splits (`mamba_mixer2.py:758-767`, `:808-812`) | decode rows occupy the **leading** token range | our equivalent is the `[t0,t1)` slice at `nemotron_h_device.cpp:1673-1680`; a case asserting a two-request step's per-request output lands at the right token offsets |
+| the mamba mixer's decode-first splits (`mamba_mixer2.py:758-767`, `:808-812`) | decode rows occupy the **leading** token range | our equivalent is the `[t0,t1)` slice at `nemotron_h_device.cpp:1669-1681` (`t0`/`t1` are read at `:1670-1671` from `gdn_meta.non_spec_query_start_loc`); a case asserting a two-request step's per-request output lands at the right token offsets |
 
 The upstream harness is Python and torch-tensor based; the adaptation is
 host-vector based and is stated in each case's comment, as A2-P did for
@@ -674,7 +769,8 @@ loop are all already `R`-general on the untouched forward. So:
 |---|---|---|
 | G1(a), G1(c1), G1(c2), G1(c4) | **GREEN** | the per-request machinery already exists (§Our baseline), and none of these populations discriminates the two split modes (★★) |
 | G1(b), the oracle leg | **GREEN** | same reason |
-| **G1(c3)** ★ | **RED, with a token mismatch** | the only population where `True` and `False` give different four-tuples. This is the whole of G0 |
+| **G1(c3)** ★, **on a reclaimed state slot** | **RED, with a token mismatch** | the only population whose four-tuple differs, run in the only condition under which that four-tuple reaches the tokens (★★★). This is the whole of G0 |
+| **G1(c3)** on a FRESH state slot | **GREEN, and it proves nothing** | the split still differs, but `init` is the only wire it reaches the arithmetic on, and over a zeroed slot mask `0` and mask `1` compute the identical answer (`nemotron_h_device.cpp:1423-1424`). Named as an arm so it cannot be mistaken for the flagship |
 
 **A green on (a), (b), (c1), (c2) and (c4) is the predicted result, not a
 rebuttal of anything.** Reading it as one is the trap this section exists to
@@ -682,12 +778,25 @@ close: an earlier draft asked for a red from "G1" undifferentiated, which no arm
 but (c3) can deliver, and an implementer following it would have reported stop
 condition 2 on the unit's own flagship.
 
-If **(c3)** passes on the untouched forward, that *is* a real surprise and the
-unit's shape changes — but check the fixture first, because a (c3) arm that does
-not actually schedule a `seq_len == 1` still-prefilling row alongside a decode is
-not arm (c3), and that is the far likelier explanation. Report the constructed
-metadata (`query_start_loc`, `seq_lens`, `is_prefilling`) beside the transcript
-so a reviewer can tell the two apart.
+If **(c3)** passes on the untouched forward, work the hypotheses in this order,
+because the first one is both the likeliest and the one a correctly shaped
+fixture still hits:
+
+1. **The state slot was clean.** ★★★: the split's only wire into the arithmetic
+   is `init`, and over a zeroed slot both mask values compute the identical
+   answer. A fixture built exactly as G1(c3)'s prose prescribed before this
+   revision — a one-token prompt scheduled alongside a decoding request, on a
+   fresh runner — is green here **for a reason that is not a finding**. Check
+   the slot before anything else.
+2. **The row was not the (c3) row.** A row that does not carry
+   `query_len == 1` **and** `seq_len == 1` **and** `is_prefilling` is not arm
+   (c3).
+3. **Only then** is it a real surprise, and the unit's shape changes.
+
+Report, beside the transcript: the constructed metadata (`query_start_loc`,
+`seq_lens`, `is_prefilling`), the (c3) row's state-slot index, whether that slot
+was previously written and by which request, and the L2 of the gathered state
+row. The first two hypotheses are distinguishable only from those.
 
 Capture that transcript — the `[doctest]` `test cases:` / `assertions:` /
 `Status:` lines and the mismatching token indices — and put it in the PR body. A
@@ -718,13 +827,16 @@ Three comparisons, all required:
   |---|---|---|
   | (c1) | two plain decodes | the batched path at all. **Classifies identically under both modes** |
   | (c2) | one decode + one multi-token prefill | the decode-first token split. **Identical under both modes** |
-  | (c3) ★ | one decode + one **still-prefilling, single-token, NO-prior-state** row (`query_len == 1`, `seq_len == 1`) | **THE mode difference.** Upstream splits `(1, 1, 1, 1)`; our `True`-mode port splits `(2, 0, 2, 0)` and runs the single-step recurrence over a row that must take the prefill path |
+  | (c3) ★ | one decode + one **still-prefilling, single-token, NO-prior-state** row (`query_len == 1`, `seq_len == 1`), **on a RECLAIMED state slot** | **THE mode difference.** Upstream splits `(1, 1, 1, 1)`; our `True`-mode port splits `(2, 0, 2, 0)`, which sets the gather mask to `1` and hands the row the previous tenant's recurrent state instead of zeros. **The reclaimed slot is part of the arm, not a detail of the harness** — over a never-written slot the two masks compute the identical answer and this arm is green (★★★) |
   | (c4) | one decode + one **short extend** (`query_len == 1`, `seq_len > 1`) | **the PROMOTION**, not the flag. Under mode `False` this row must classify as a **decode**, because `mamba_attn.py:450-453` promotes it before the split. A red here is an unported promotion |
 
   Arm (c3) is the population arm (a) structurally cannot reach and the only one
-  that fails today. **Constructing (c3) needs a one-token prompt** (or a first
-  chunk clamped to one token) scheduled alongside a decoding request; a
-  two-request step of two ordinary prompts will not produce it.
+  that fails today. Constructing it needs a one-token prompt (or a first chunk
+  clamped to one token) scheduled alongside a decoding request — a two-request
+  step of two ordinary prompts will not produce it — **and that row must land on
+  a state slot a finished request already dirtied.** ★★★ gives the three-step
+  construction and the assertion that proves the slot was reused; it is the same
+  slot-reuse fixture **B-M4** needs, and neither can red without it.
 
 `RunnerGreedy` (`:418`) is single-id; a batched sibling is needed. `DecodeStep`
 (`:399-414`) already takes a vector of ids.
@@ -745,6 +857,12 @@ silently reclassified as all-prefill.
 `GraphDispatchStats` read on a multi-request run, values in the PR body
 whichever way they fall (D5).
 
+### G5 — the rewritten interlock case
+
+`test_nemotron_h_paged_forward.cpp:1356` is **rewritten, not deleted**: it now
+asserts the speculative refusal and the ordering refusal by name, with `#1395`
+and `#810` in the message. A reviewer who finds the case deleted returns FAIL.
+
 ### G6 — the arm state is part of every recipe
 
 Every correctness leg names, in the recipe and in the PR body, **which mamba arm
@@ -756,12 +874,6 @@ labelling has already been misread once. An unlabelled 95/96 is not evidence
 about batching, and A2-B records no throughput number on any axis regardless of
 the arm.
 
-### G5 — the rewritten interlock case
-
-`test_nemotron_h_paged_forward.cpp:1356` is **rewritten, not deleted**: it now
-asserts the speculative refusal and the ordering refusal by name, with `#1395`
-and `#810` in the message. A reviewer who finds the case deleted returns FAIL.
-
 ### What each gate CANNOT see
 
 | Gate | Blind to |
@@ -771,6 +883,7 @@ and `#810` in the message. A reviewer who finds the case deleted returns FAIL.
 | any token gate | **a dropped mechanism whose argmax is unchanged.** Hence G2's direct assertions |
 | **G1 arm (a), and arms (c1), (c2), (c4)** | **the entire `treat_short_extends_as_decodes` difference.** Two decodes classify identically under both modes; so do a decode plus a multi-token prefill; and so does a decode plus a short extend, because the promotion at `mamba_attn.py:450-453` always fires on one. This is why **(c3)** is required and not optional, and why an earlier draft of this spec — which named the short extend as "the population that exists only because of `treat_short_extends_as_decodes=False`" — specified a flagship arm that could not fail |
 | **G1 arm (c3), on tokens alone** | whether a misclassification changed the *answer*. A wrong split produces fluent output; on a small synthetic model it can agree by luck. G2 asserts the four-tuple directly, and G2 — not G1 — is the gate that must red for B-M1 |
+| **G1 arm (c3) on a FRESH state slot** | **the entire mode difference, again.** The split's only wire into the arithmetic is the gather mask, and over a zeroed slot mask `0` and mask `1` compute the identical answer (`nemotron_h_device.cpp:1423-1424`). The arm is well-formed, the four-tuples differ, and the tokens match. ★★★ is why the reclaimed slot is part of the arm's definition |
 | **any `num_reqs == 1` gate** | everything in this unit. Named so no A2-P result is quoted as A2-B evidence |
 | G1 | whether the graph path changed. Hence G4 |
 | a passing G1 alone | whether the code was **reached**. Hence B-M8 |
@@ -783,10 +896,10 @@ preserving mtime so ninja skips the rebuild.
 
 | # | Mutation | Must RED |
 |---|---|---|
-| B-M1 | the mamba split's `treat_short_extends_as_decodes` behaviour flipped back to `True` | **G2**, which asserts the four-tuple directly and is deterministic. **G1(c3) is expected to red too and is reported either way** — it is the only token arm that can see this mutation, and if it survives, say so, because that bounds what the token gate can see and is a finding about the fixture rather than a failed mutation. **G1(c1), (c2) and (c4) will NOT red, by construction** (see ★★); their staying green is the control, not a defect |
+| B-M1 | the mamba split's `treat_short_extends_as_decodes` behaviour flipped back to `True` | **G2**, which asserts the four-tuple directly and is deterministic. **G1(c3) is expected to red too and is reported either way** — it is the only token arm that can see this mutation, **and only when its row sits on a reclaimed state slot** (★★★). If it survives, report the row's slot and its previous tenant alongside, because a survival on a clean slot is a fixture result and a survival on a dirty one bounds what the token gate can see. **G1(c1), (c2) and (c4) will NOT red, by construction** (see ★★); their staying green is the control, not a defect |
 | B-M2 | the `mamba_attn.py:445-461` promotion dropped | G2's promotion cases, and **G1(c4)** — the short-extend arm is the one the promotion governs. Report G1(c3) either way; it should NOT move, because the promotion never fires on a no-prior-state row. If G1(c4) survives, say so, because that bounds what the token gate can see |
 | B-M3 | `GdnStateScatter` widened to write **every** slot rather than only the named rows | G1(a) — this is the cross-request contamination the scatter's own comment claims to prevent |
-| B-M4 | the fresh-request state zeroing dropped | G1(a) on the first step after a slot is reused. If it survives, the gate is blind to the loudest trap in the unit and the row owes a direct assertion on the zeroed rows |
+| B-M4 | the fresh-request state zeroing dropped | G1(a) on the first step after a slot is reused — **and G1(c3), which runs on a reclaimed slot by construction (★★★) and is the same mechanism seen from the other side**. If both survive, the fixture is not actually reusing a dirtied slot, which also disarms G0's flagship; fix the fixture before recording a surviving mutation. If they survive on a fixture whose slot reuse is asserted, the gate is blind to the loudest trap in the unit and the row owes a direct assertion on the zeroed rows |
 | B-M5 | `init[r] = 1 for r < nd` changed to `init[r] = 1` for **all** `r` | **G1(c2)** and **G1(c3)** — the arms that carry a row classified as a prefill, which is the only place the `r < nd` branch differs. If both survive, the mixed-population arms are not reaching the prefill classification and the harness is not the one described. D4's assertion cannot catch this one (see D2) |
 | B-M6 | both requests pointed at the **same** state slot | D2's distinctness assertion. **G1 must also RED**; report as a pair — a distinctness check that reds while the tokens stay correct means the fixture is not actually sharing state |
 | B-M7 | the ordering assertion removed and a deliberately unordered batch fed | G3 |
@@ -847,7 +960,7 @@ a development arm, not a gate host.
 | Depends on | State |
 |---|---|
 | A2-P, landed | **MET.** `5f68e60df` carries the paged forward and the narrowed G-SAFE clause |
-| the runner's decode-first reorder | **MET.** `runner.cpp:126-190`, unconditional at `:1257` |
+| the runner's decode-first reorder | **MET.** `runner.cpp:126-214`, unconditional at `:1257` |
 | `vt::GdnStateGather` / `GdnStateScatter` indexed forms | **MET.** Both already take the `[R]` index vector |
 | `vt::PagedAttention` mixed-batch arm on each gate backend | **UNVERIFIED.** D1; verify before implementing, and file rather than widen if it fails |
 | a NemotronH checkpoint on the gate host | inherited from A2-P §5.7; the driver is `nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4` |
@@ -890,7 +1003,8 @@ Non-overlapping, and W1 is deliberately a read rather than an edit.
   the same failure class the G-SAFE clause was built for, one level down.
   **G1(c3), G2 and B-M1 are the only things that can see it** — and of those, G2
   is the one that must red, because a token gate over a small synthetic model can
-  agree by luck on a classification error (★★).
+  agree by luck on a classification error (★★), and because G1(c3) can only see
+  it at all when its row sits on a reclaimed state slot (★★★).
 - **R4 — a token gate at `num_reqs == 1` will pass throughout.** Every existing
   NemotronH case is single-request. **None of them is evidence for A2-B**, and a
   PR body that quotes them as if they were should be rejected.
@@ -907,6 +1021,8 @@ Non-overlapping, and W1 is deliberately a read rather than an edit.
   cuts it 7.28x on a warm basis, though that arm fails its token gate and the
   figure is an ungated projection), so `R` serial host mixer calls are the term
   batching does not amortise.
+- **R8 — `merge-tree` clean is not "the merge builds".** With A2-Q1 and A2-Q2b
+  live on the same file, the focused gate runs on the merge result.
 - **R9 — a tree carrying either of A2-Q1's device mamba arms produces a 95/96
   that is not A2-B's.** D6. **Both** device arms diverge; only the host arm
   passes 96/96. Every A2-B correctness leg names its arm in the recipe, and an
@@ -917,8 +1033,18 @@ Non-overlapping, and W1 is deliberately a read rather than an edit.
   drafting. Both device legs fail their token gate, so `718.2x` remains the
   accepted figure and `108.2x` is a projection pending #1289. A number quoted
   often becomes treated as measured; grep its origin before carrying it.
-- **R8 — `merge-tree` clean is not "the merge builds".** With A2-Q1 and A2-Q2b
-  live on the same file, the focused gate runs on the merge result.
+- **R11 — G1(c3) is green on a clean state slot, and reads as "the flag is
+  already mirrored".** The split reaches the forward's arithmetic through exactly
+  one wire, the `vt::GdnStateGather` mask, and over a zeroed slot both mask
+  values compute the identical answer (★★★,
+  `nemotron_h_device.cpp:1423-1424`). The GDN state cache is allocated zeroed
+  (`runner.cpp:484`, `:491`), so the natural fixture — a one-token prompt beside
+  a decoding request on a fresh runner — is well-formed, differs in its
+  four-tuple, and passes. **Decision: the reclaimed state slot is part of arm
+  (c3)'s definition and the test asserts the reuse**, and stop condition 2 puts
+  the slot ahead of the fixture shape in the diagnosis order. This is the same
+  failure the short-extend draft had, one level down, and it survived one
+  repair.
 
 ### Stop conditions
 
@@ -927,11 +1053,18 @@ Stop and report rather than widening:
 1. **D1 fails** — `vt::PagedAttention` does not serve a mixed batch on a gate
    backend. Return `NEEDS_DECISION`; do not write an attention kernel.
 2. **G0's red does not appear on arm (c3)** — the discriminating arm passes on an
-   untouched forward. Report it with the transcript **and with the metadata the
-   arm actually built**, because the likeliest cause is a fixture that did not
-   construct a `seq_len == 1` still-prefilling row. A green on any other arm is
-   the predicted result and is **not** a stop condition (G0). Do not proceed as
-   if (c3) had failed, and do not weaken the gate to manufacture a red.
+   untouched forward. This is **not** a stop condition until the two ordinary
+   explanations are excluded, in this order (G0 states them in full):
+   **first, the state slot was clean** — the split reaches the arithmetic only
+   through the gather mask, and over a zeroed slot both mask values compute the
+   identical answer (★★★), so a (c3) arm on a fresh runner is green for a reason
+   that is not a finding; **second, the row was not the (c3) row** — it must
+   carry `query_len == 1`, `seq_len == 1` and `is_prefilling` together.
+   Report the transcript, the metadata the arm actually built, the row's
+   state-slot index, and whether that slot had a previous tenant. A green on any
+   other arm is the predicted result and is **not** a stop condition (G0). Do not
+   proceed as if (c3) had failed, and do not weaken the gate to manufacture a
+   red.
 3. **A mutation cannot be made to red** after the harness has been checked
    against the four green-but-proves-nothing shapes (zero cases, comma filter,
    failed build, unapplied diff). Report the surviving mutation as an open gap.
@@ -963,9 +1096,15 @@ The implementing change moves this row's lifecycle state, so it owes, in the
   rollup);
 - `docs/USAGE.md` if the reachable capability's checkpoint documentation changes;
   run `scripts/check-doc-checkpoint.py` rather than assuming either way;
-- `scripts/runner-routing-allowlist.txt:26` — A2-B does **not** change its
-  disposition (it is pending A2-Q2b's device `lm_head`), but the entry's prose
-  must not be left claiming a single-request forward once it is not one.
+- `scripts/runner-routing-allowlist.txt:26` — **verified stale-free at this
+  commit; the expected result is NO EDIT.** A2-B does not change the entry's
+  disposition (it is pending A2-Q2b's device `lm_head`), and its prose makes no
+  claim the request count can falsify: it describes the paged forward, the NVFP4
+  `lm_head` refusal at `nemotron_h.cpp:1031-1034` and A2-Q2b, and
+  `grep -i single scripts/runner-routing-allowlist.txt` returns nothing.
+  Re-run that grep at the implementing commit rather than assuming either way; an
+  obligation with nothing to act on is one an implementer discharges by inventing
+  a change.
 
 `.agents/NOW.md` is authored at operator cadence and is not a per-row lifecycle
 write.
@@ -998,6 +1137,16 @@ What this spec established that was not known when #1395 was filed:
    population in A2-B's scope is a still-prefilling row with `query_len == 1` and
    **no** prior state (`seq_len == 1`). A gate built on the short extend cannot
    fail, and the first draft of this spec specified exactly that gate (★★).
+1b. **A differing split is not a differing forward.** The split reaches the
+   NemotronH forward's arithmetic through exactly one wire — `init`, which is
+   the `vt::GdnStateGather` mask — and over a ZEROED state slot mask `0` and
+   mask `1` compute the identical answer, which A2-P's own comment states at
+   `nemotron_h_device.cpp:1423-1424`. The GDN state cache is allocated zeroed
+   (`runner.cpp:484`, `:491`). **So arm (c3) discriminates the two modes only
+   when its row lands on a slot a finished request already dirtied** — which the
+   runner's LIFO free list makes deterministic (`runner.cpp:1153-1160`,
+   `:1177-1178`). The reclaimed slot is part of the arm, and the second draft of
+   this spec specified a flagship arm that was green without it (★★★).
 2. A2-P's `:64` under-describes what A2-P landed. The per-request state indexing
    exists; A2-B verifies and hardens it rather than building it.
 3. The runner already reorders decode-first, unconditionally.
