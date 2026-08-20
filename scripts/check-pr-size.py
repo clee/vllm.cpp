@@ -209,6 +209,33 @@ COMPLETED_STATE_EVENT = re.compile(
 SYNC_RECORD = re.compile(r"\.agents/sync/[A-Za-z0-9_.-]+\.md\Z")
 HOOK = re.compile(r"\.githooks/(?:README\.md|[A-Za-z0-9_.-]+)\Z")
 BENCH_EVIDENCE = re.compile(r"(?:benchmarks/(?:demo|media)|docs/bench-evidence)/[A-Za-z0-9_.-]+\.(?:json|png|gif|mp4|log)\Z")
+# A PER-RUN evidence directory: docs/bench-evidence/<run-id>/<file> (#1448).
+# AGENTS.md requires the exact build and run recipe beside a measurement, so one
+# run arrives as a dated directory of logs, dumps and the scripts that produced
+# them, not as one flat file. BENCH_EVIDENCE above matches exactly ONE path
+# segment, so all ten files of the first such directory
+# (`gdn-replayssm-w0-20260818`, landed 2026-08-18) were unclassified.
+# `classify_path` FAILS CLOSED, and the sweep in
+# tests/scripts/test_check_pr_size.py classifies every TRACKED path, so that
+# suite went red on `main` and every PR touching this checker was refused
+# through its own evidence contract. Fourth instance of the class after #856,
+# #668 and #989, and repaired the same way: name the surface, do not widen a
+# rule.
+#
+# The extension list is EXACTLY the set this directory carries, and it
+# deliberately omits `.md` and `.json`. Those two already classify as
+# public_document through DOC below, and the evidence arm is tested FIRST, so
+# admitting them here would silently RECLASSIFY
+# docs/bench-evidence/mxfp4-qwen/*.md and its golden .json. Preserving the class
+# of a path that already had one matters more than making the directory
+# uniform.
+#
+# `.sh` and `.cu` are evidence, not product: they are the recipe that produced
+# the number. Nothing builds them, nothing installs them, and no entry point
+# reaches them.
+BENCH_EVIDENCE_RUN = re.compile(
+    r"docs/bench-evidence/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\.(?:txt|log|gz|sh|cu)\Z"
+)
 STATE_MIGRATION_MANIFEST = ".agents/completed/state-migration-manifest.csv"
 STATE_MIGRATION_MANIFEST_ARCHIVE = re.compile(
     r"\.agents/completed/state-migration-manifest-"
@@ -423,6 +450,7 @@ def classify_path(path: str) -> str:
         or SPEC_EVIDENCE.fullmatch(path)
         or SYNC_RECORD.fullmatch(path)
         or BENCH_EVIDENCE.fullmatch(path)
+        or BENCH_EVIDENCE_RUN.fullmatch(path)
     ):
         return "evidence"
     if path in GOVERNANCE_SUPPORT_FILES:

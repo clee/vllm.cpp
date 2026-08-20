@@ -40,6 +40,17 @@ In scope:
 3. Its mutation suite, `tests/scripts/test_check_conflict_markers.py`.
 4. The creation-mutation entry a new checker owes `scripts/check-pr-size.py`
    and its suite, because the checker has no version at the merge base.
+5. One in-flow repair the entry above uncovered
+   ([#1448](https://github.com/mudler/vllm.cpp/issues/1448)):
+   `classify_path` has no entry for a per-run
+   `docs/bench-evidence/<run-id>/<file>` directory, so ten tracked paths are
+   unclassified and `test_check_pr_size.py`'s sweep case is red on
+   `origin/main`. That red blocks the checker-evidence contract of every change
+   that edits `scripts/check-pr-size.py`, which registering a new checker
+   requires, so this row could not prove its own contract while it stood. The
+   repair names the surface and does not widen a rule, and classification of
+   all 4811 tracked paths was captured before and after to prove that exactly
+   those ten move.
 
 Out of scope, and each for a stated reason:
 
