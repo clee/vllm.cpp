@@ -4998,10 +4998,10 @@ way. Nothing is batched at this speed, and the capacity argument itself holds
 only at low concurrency: at high concurrency every step touches most of the
 experts and the working set stops being one.
 
-The recorded runs set the equivalent environment variables
-(`VT_GGUF_PREFAULT=0 VT_MOE_EXPERT_STREAM=1 VT_MOE_EXPERT_STREAM_SLOTS=4000`)
-rather than the config document. The two are the same switches, and a variable
-beats a config field wherever both are set.
+The recorded runs set the equivalent environment variables rather than the
+config document: `VT_GGUF_PREFAULT=0`, `VT_MOE_EXPERT_STREAM=1` and
+`VT_MOE_EXPERT_STREAM_SLOTS=4000`. The two forms are the same switches, and a
+variable beats a config field wherever both are set.
 
 ### What the load costs
 
@@ -5018,7 +5018,8 @@ page cache dropped before each one (`ENG-EXPERT-STREAM-DEVICE` W0e, 18 and
 | peak swap | not sampled | 6 883 MiB |
 
 Resident memory after the load settles at about **62 GiB** of 119 GiB, measured
-at 62.45 GiB on the same-lease CPU control of the following run. That is the
+at 62.45 GiB on the same-lease CPU control run of `ENG-EXPERT-STREAM-DEVICE`
+W0f. That is the
 dense remainder plus the KV cache and the runtime, and it agrees with what the
 checkpoint's own tensor table predicts: 21.56 GiB of `attn_qkv` and 17.25 GiB of
 `ssm_out` expanded to bf16, plus 5.81 GiB of embeddings and F32 norms, so
@@ -5038,12 +5039,13 @@ curl -s http://127.0.0.1:8899/v1/completions -H 'Content-Type: application/json'
        "prompt":"Q: What is the capital of France? A:","max_tokens":4}'
 ```
 
-The 16 August 2026 run answered ` Paris. Q: What`, which is the whole point: the
-output is coherent, so the one-bit encoding and the borrowed-tower path are both
-faithful enough to serve. The four W0e runs drive a fixed prompt of token ids
-instead, and all four returned the same 32 ids, which detokenize to
-` Paris. Paris is a city located in the northern part of France, on the Seine
-River. It is the largest city in France and is known for its iconic`.
+The 16 August 2026 run, which served with streaming off, answered
+` Paris. Q: What`. That is the whole point: the output is coherent, so the
+one-bit encoding and the borrowed-tower path are both faithful enough to serve.
+The four W0e runs drive a fixed prompt of token ids instead of this request, and
+all four returned the same 32 ids, which detokenize to ` Paris. Paris is a city
+located in the northern part of France, on the Seine River. It is the largest
+city in France and is known for its iconic`.
 
 ### What decode costs, and why the ceiling is where it is
 
@@ -5056,10 +5058,11 @@ Every figure here was measured on `--device cpu`, on the box named above.
 | streaming off | 66.7 s/token | 16 August 2026, streaming not yet enabled |
 
 The 11.05 s/token figure has a min of 9.43 and a max of 13.25 over its window,
-and rep 1 of the same arm gives 11.22, which agrees within 1.5%. **No ratio
-between these three rows is published.** The streaming-off row was taken on a
-different source tree on a different date, and the two slot counts differ in more
-than the arena size, as the previous section records.
+and rep 1 of the same arm gives 11.22, which agrees within 1.5%. **The
+streaming-off row carries no ratio against the other two**, because it was taken
+on a different source tree on a different date. The two slot counts came from one
+binary on one lease and are comparable with each other; the previous section
+carries that comparison.
 
 **A bigger cache came out slower, and 8000 slots is the count to avoid.** The
 second 8000-slot rep consumed all 30 625 MiB of the box's swap. The
@@ -5091,8 +5094,8 @@ hits against 58 538 misses.
 **The floor is storage, not software.** 6.95 GB at the roughly 5 GB/s an NVMe of
 this class sustains is 1.39 s/token whatever the code does, which is 0.72 tok/s.
 Reaching 3 tok/s would demand about 21 GB/s of expert bandwidth, so most of those
-reads would have to come from memory instead. The arena holds 4000 of the 2790
-slices a token needs, under one and a half tokens of working set, and
+reads would have to come from memory instead. The arena holds 4000 slices against
+the 2790 a token needs, under one and a half tokens of working set, and
 top-10-of-512 routing does not give consecutive tokens enough reuse to close the
 rest. **If you need conversational speed from this model you need more memory or
 fewer active parameters, not better software.**
@@ -5108,9 +5111,8 @@ fewer active parameters, not better software.**
   against nothing.
 - **One request at a time.** Nothing here says anything about concurrency, and
   the capacity argument stops holding as concurrency rises.
-- **One box.** Every number was taken on `dgx:gpu0` with the checkpoint on local
-  NVMe and the page cache dropped first. Different storage or a different host
-  changes them.
+- **One box.** Every number was taken on one DGX Spark GB10 with the checkpoint
+  on local NVMe. Different storage or a different host changes them.
 - **Nothing here is a `--device cuda` number.** That arm decodes this checkpoint,
   its token gate against the CPU arm fails, and `docs/BENCHMARKS.md` therefore
   carries its speed axis as `VOID`.
