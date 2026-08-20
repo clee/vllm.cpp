@@ -1266,6 +1266,11 @@ target_include_directories(test_expert_stream_wiring PRIVATE ${CMAKE_SOURCE_DIR}
 # defect, and the store is built from the FIRST model a process runs.
 vllm_cpp_add_test(test_expert_stream_mixed_slot vllm/model_executor/test_expert_stream_mixed_slot.cpp)
 target_include_directories(test_expert_stream_mixed_slot PRIVATE ${CMAKE_SOURCE_DIR}/src)
+# ENG-EXPERT-STREAM-DEVICE (#1299): the router observer's reachability gate, and
+# the lowest-index tie rule the two arms' top-k implementations both claim. Its
+# own binary because VT_ROUTER_DUMP is read ONCE into a function-local static, so
+# a process that has already run a MoE block cannot be given a different path.
+vllm_cpp_add_test(test_router_observer vllm/model_executor/test_router_observer.cpp)
 # ENG-EXPERT-STREAM-DEVICE W0c (#1124): the PLATFORM branch of the expert-slice
 # seam. Its own binary for two independent reasons -- it latches
 # VT_MOE_EXPERT_STREAM like its siblings, and it registers a fake backend and a
