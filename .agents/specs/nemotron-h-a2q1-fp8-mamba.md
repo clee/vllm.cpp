@@ -678,7 +678,7 @@ defect nobody proposed, and line 3 is refuted by the golden's own arithmetic and
 by the GB10 polarity. The bottom line did not move, because it was already
 "undetermined". The argument for it is now the one the evidence supports.
 
-#### 10.5.1 The discriminator run, and what regenerates it
+#### 10.5.1 The discriminator run, and why nothing in this tree can regenerate it
 
 | field | value |
 |---|---|
@@ -825,7 +825,7 @@ against it is a margin against an unknown, and a `26/32` cannot be told from a
 defect. Recording the configuration, or re-capturing under a recorded one, is
 cheap and it is prior.
 
-Decoded, the three continuations are one sentence taking a different fork after
+Decoded, the four continuations are one sentence taking a different fork after
 "…observed outputs, typically using a":
 
 | arm | positions 30, 31, 32 |
