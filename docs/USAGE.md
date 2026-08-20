@@ -4989,12 +4989,20 @@ the machine's memory, loads and answers on one DGX Spark. This section is the
 recipe. The mechanism it drives is the previous section,
 [Streaming routed experts from disk](#streaming-routed-experts-from-disk-capacity-mode),
 which owns the config schema, the precedence rule, the statistics line, the slot
-count warning and what each device can serve. Nothing here repeats them.
+count warning and what each device can serve. This section links them rather than
+restating them. It repeats three of their facts on purpose: which device to use,
+the expert bytes a token reads, and the two streaming decode figures in
+[What decode costs](#what-decode-costs-and-why-the-ceiling-is-where-it-is). A
+recipe that leaves those out is not a recipe. Each of the three has one record,
+so a correction has to change both places. The decode figures are
+`ENG-EXPERT-STREAM-DEVICE` W0e in
+[`.agents/benchmark-record.md`](../.agents/benchmark-record.md).
 
 **Read the speed before you spend the download.** Steady decode on the recipe
-below is 11.05 s/token, and the floor under it is storage rather than this
-implementation. See [What decode costs](#what-decode-costs-and-why-the-ceiling-is-where-it-is).
-This is a capacity result, not an interactive one.
+below is measured in seconds per token, and the floor under it is storage rather
+than this implementation. This is a capacity result, not an interactive one.
+[What decode costs](#what-decode-costs-and-why-the-ceiling-is-where-it-is) gives
+the figure and the arithmetic behind it.
 
 **Use `--device cpu` for this checkpoint.** `--device cuda` loads and decodes it
 too, and its token gate against the CPU arm does not pass, so every number below
@@ -5038,8 +5046,8 @@ hf download unsloth/Qwen3.8-2.4T-A95B-GGUF \
 
 The files land under a `UD-Q1_0/` subdirectory of `--local-dir`, because that is
 where they live in the repo. Point `--model` at a copy on **local NVMe**. A
-network filesystem puts an uncontrolled variable in front of the 6.95 GB of
-expert reads that every token makes.
+network filesystem puts an uncontrolled variable in front of the expert reads
+that every token makes.
 
 **The encoding has no upstream reference.** `UD-Q1_0` stores its expert towers as
 `IQ1_XXXS`, which upstream llama.cpp does not define. The encoding exists only in
@@ -5087,7 +5095,7 @@ Five things in that command are load-bearing.
 - **`expert_stream` is off by default, and this recipe turns it on at 4000
   slots.** That count is the one the published decode figure was measured at, and
   the previous section explains why 8000 is worse rather than better.
-- **`--device cpu`.** It is the arm every number here was measured on.
+- **`--device cpu`.** The note at the top of this section says why.
 
 `--max-num-seqs 1` and a small `--max-model-len` keep the KV cache out of the
 way. Nothing is batched at this speed, and the capacity argument itself holds
@@ -5098,6 +5106,13 @@ The recorded runs set the equivalent environment variables rather than the
 config document: `VT_GGUF_PREFAULT=0`, `VT_MOE_EXPERT_STREAM=1` and
 `VT_MOE_EXPERT_STREAM_SLOTS=4000`. The two forms are the same switches, and a
 variable beats a config field wherever both are set.
+
+They also ran a different binary. Every figure below comes from
+`benchmarks/expert_stream_device_w0e.cpp`, a purpose-built C ABI client that
+reports the token ids, a per-step timestamp and the expert-stream counters
+together, which no shipped command does. The command above starts `vllm-server`
+over the same engine. At seconds per token, the server's HTTP and SSE framing
+sits far below the run-to-run spread recorded below.
 
 ### What the load costs
 
@@ -5145,7 +5160,7 @@ city in France and is known for its iconic`.
 
 ### What decode costs, and why the ceiling is where it is
 
-Every figure here was measured on `--device cpu`, on the box named above.
+Every figure here comes from the box named above.
 
 | Arm | Steady decode | Where it comes from |
 |---|---|---|
@@ -5153,8 +5168,8 @@ Every figure here was measured on `--device cpu`, on the box named above.
 | streaming on, 8000 slots | 39.98 and 45.40 s/token | W0e, the medians of two reps |
 | streaming off | 66.7 s/token | 16 August 2026, streaming not yet enabled |
 
-The 11.05 s/token figure has a min of 9.43 and a max of 13.25 over its window,
-and rep 1 of the same arm gives 11.22, which agrees within 1.5%. **The
+That 4000-slot figure has a min of 9.43 and a max of 13.25 over its window, and
+rep 1 of the same arm gives 11.22, which is 1.54% above it. **The
 streaming-off row carries no ratio against the other two**, because it was taken
 on a different source tree on a different date. The two slot counts came from one
 binary on one lease and are comparable with each other; the previous section
@@ -5180,7 +5195,7 @@ first three rows are read from the checkpoint's own metadata:
 | expert working set per token | **6.95 GB**, that is 6.47 GiB |
 | slots this recipe reserves | 4000, a 9.28 GiB arena |
 
-That 6.95 GB is a working set and not an I/O rate, because the slot cache serves
+That figure is a working set and not an I/O rate, because the slot cache serves
 part of it from memory. The recorded 32-token run at 4000 slots counted 37 096
 hits against 58 538 misses.
 
@@ -5206,9 +5221,9 @@ fewer active parameters, not better software.**
   the capacity argument stops holding as concurrency rises.
 - **One box.** Every number was taken on one DGX Spark GB10 with the checkpoint
   on local NVMe. Different storage or a different host changes them.
-- **Nothing here is a `--device cuda` number.** That arm decodes this checkpoint,
-  its token gate against the CPU arm fails, and `docs/BENCHMARKS.md` therefore
-  carries its speed axis as `VOID`.
+- **Nothing here is a `--device cuda` number.** That arm decodes this checkpoint
+  and its token gate against the CPU arm fails. The previous section's sixth
+  limit states what follows for its speed axis.
 
 ## Turning CUDA graph capture off, including the break seam
 
