@@ -7064,6 +7064,67 @@ DBuf MoeBlockBf16Cuda(Dev d, const MoeBlockWeights& w, const HfConfig& cfg,
   return dout;
 }
 
+// --- ROUTER OBSERVER (issue #1299) ------------------------------------------
+// Env-gated, OBSERVER-ONLY dump of the MoE router's input and output, written
+// AFTER every value it records has already been computed and consumed nowhere.
+// It exists to answer one question that no token gate can: when `--device cpu`
+// and `--device cuda` select DIFFERENT expert sets, is the boundary pair a tie
+// that the two top-k implementations break differently, or do the router LOGITS
+// themselves differ? Both arms enter this same `MoeBlock`, so the two dumps are
+// taken at the identical program point and are directly comparable.
+//
+// `VT_ROUTER_DUMP=<path>` turns it on; unset, the function is a single load of a
+// null FILE* and returns. `VT_ROUTER_DUMP_MAX_CALLS` (default 128) bounds the
+// record count so one PREFILL is captured and the decode steps behind it are
+// not; the record carries `T`, so the prefill rows are identifiable offline
+// without trusting the bound.
+//
+// Record (little-endian, the host's own byte order on every target here):
+//   u32 call, u32 T, u32 E, u32 K, u32 H
+//   u16 hidden[T*H]   the bf16 router GEMM INPUT
+//   u16 logits[T*E]   the bf16 router GEMM OUTPUT
+//   i32 ids[T*K]      the selected experts
+//   f32 wts[T*K]      the renormalized weights
+// Dumping the INPUT as well as the output is what separates "the router GEMM
+// disagrees" from "the hidden state that reached it already disagreed".
+void RouterObserve(int64_t T, int64_t E, int64_t top_k, int64_t H,
+                   const std::vector<uint16_t>& hidden,
+                   const std::vector<uint16_t>& logits,
+                   const std::vector<int32_t>& ids,
+                   const std::vector<float>& weights) {
+  static std::FILE* f = [] () -> std::FILE* {
+    const char* path = std::getenv("VT_ROUTER_DUMP");
+    if (path == nullptr || path[0] == '\0') return nullptr;
+    std::FILE* h = std::fopen(path, "wb");
+    if (h == nullptr) {
+      std::fprintf(stderr, "[router-dump] cannot open %s\n", path);
+      return nullptr;
+    }
+    const char magic[4] = {'V', 'T', 'R', 'D'};
+    const uint32_t version = 1;
+    std::fwrite(magic, 1, 4, h);
+    std::fwrite(&version, sizeof(version), 1, h);
+    return h;
+  }();
+  if (f == nullptr) return;
+  static const uint32_t max_calls = [] {
+    const char* v = std::getenv("VT_ROUTER_DUMP_MAX_CALLS");
+    const long n = (v != nullptr && v[0] != '\0') ? std::atol(v) : 128;
+    return static_cast<uint32_t>(n > 0 ? n : 0);
+  }();
+  static uint32_t call = 0;
+  if (call >= max_calls) return;
+  const uint32_t hdr[5] = {call, static_cast<uint32_t>(T), static_cast<uint32_t>(E),
+                           static_cast<uint32_t>(top_k), static_cast<uint32_t>(H)};
+  std::fwrite(hdr, sizeof(uint32_t), 5, f);
+  std::fwrite(hidden.data(), sizeof(uint16_t), hidden.size(), f);
+  std::fwrite(logits.data(), sizeof(uint16_t), logits.size(), f);
+  std::fwrite(ids.data(), sizeof(int32_t), ids.size(), f);
+  std::fwrite(weights.data(), sizeof(float), weights.size(), f);
+  std::fflush(f);
+  ++call;
+}
+
 DBuf MoeBlock(Dev d, const MoeBlockWeights& w, const HfConfig& cfg,
               const Tensor& dh, int64_t T) {
   const int64_t H = cfg.hidden_size;
@@ -7112,6 +7173,9 @@ DBuf MoeBlock(Dev d, const MoeBlockWeights& w, const HfConfig& cfg,
   std::vector<int32_t> ids(static_cast<size_t>(T) * top_k);
   dtw.Download(d, weights.data());
   dtid.Download(d, ids.data());
+  // OBSERVER ONLY (#1299): every argument is already computed and is not read
+  // back; unset VT_ROUTER_DUMP makes this a null-pointer test.
+  RouterObserve(T, E, top_k, H, h, logits, ids, weights);
 
   // Activated-expert gather: per expert, the (token, slot) pairs routed to it.
   std::vector<std::vector<std::pair<int64_t, int64_t>>> lists(
