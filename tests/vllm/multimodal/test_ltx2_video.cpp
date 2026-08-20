@@ -3108,6 +3108,30 @@ struct Carrying {
   // note above this case.
   std::vector<int64_t> part_counts;
   std::string count_source;            // where those numbers came from, for the message
+  // EACH PART'S OWN FLOOR, as a share of the LEAF's seconds. One entry per name
+  // in `parts`, and 0.0 means "no floor, and the row's spec says which direction
+  // that leaves open".
+  //
+  // WHY IT IS PER PART AND NOT ONE NUMBER. `min_coverage` above is checked on
+  // the SUM of the parts, so ONE part covering everything satisfies it and the
+  // others may measure nothing. That is not a hypothetical: mutation R1b leaves
+  // `decode.audio.mel` open across the vocoder call and lets
+  // `decode.audio.vocoder` open and close EMPTY beside it — identical semantics,
+  // identical call order, two lines — and it moves ~100% of `decode.audio`'s
+  // decomposed seconds onto the wrong name, which is the same end state the
+  // NAME-SWAP mutation N1 produces. Every other assertion here survives it:
+  // (1b) passes because mel still OPENS first, so it proves an ORDER and not an
+  // IDENTITY; the counts are {1, 1} either way; containment, `nested` and
+  // non-overlap all hold. This field is what makes the two names measurable
+  // SEPARATELY.
+  //
+  // IT IS REQUIRED RATHER THAN DEFAULTED, and deliberately sits before `render`
+  // so that a future leaf cannot acquire a second part without answering the
+  // question. `decode.audio{mel, vocoder}` is the ONLY multi-part leaf today —
+  // `denoise`, `decode.video` and `artifacts.frames` have one part each, which
+  // is why (1b) and this assertion are both vacuous for them and why the hole
+  // above existed on exactly one pair.
+  std::vector<double> part_min_coverage;
   // WHICH RENDER. The table is a process timeline and every count above is a
   // per-render quantity; see `RecordsNamed`.
   int64_t render = kAnyRender;
@@ -3162,9 +3186,14 @@ void CheckCarryingPhase(const nlohmann::json& table, const Carrying& c) {
   // ...and the FIRST start of each part name, in the order `parts` lists them,
   // which is assertion (1b) below.
   std::vector<double> part_first;
+  // ...and each part's OWN seconds, kept separate from `subs` because `subs`
+  // collapses every part into one pool and assertion (2b) is precisely the
+  // question that pool cannot answer.
+  std::vector<double> part_seconds;
   for (const std::string& part : c.parts) {
     INFO("sub-scope = " << part);
     const std::vector<nlohmann::json> found = RecordsNamed(table, part, c.render);
+    double seconds = 0.0;
     REQUIRE_MESSAGE(!found.empty(),
                     "the table names no '" << part << "' record. It is the anchor that ties the '"
                         << c.leaf << "' name to the work beneath it, and without it this phase is "
@@ -3190,7 +3219,9 @@ void CheckCarryingPhase(const nlohmann::json& table, const Carrying& c) {
                                              "different places, which is the whole defect this "
                                              "case exists for");
       subs.push_back({start, end});
+      seconds += end - start;
     }
+    part_seconds.push_back(seconds);
     double first = found.front()["start_seconds"].get<double>();
     for (const nlohmann::json& r : found) {
       first = std::min(first, r["start_seconds"].get<double>());
@@ -3221,6 +3252,15 @@ void CheckCarryingPhase(const nlohmann::json& table, const Carrying& c) {
   // under `### Owed out of W0`. Compared on the FIRST record of each name, so a
   // part that legitimately repeats (`decode.video.chunk`) is unaffected, and the
   // assertion is vacuous for a leaf with a single part name.
+  //
+  // AND COMPARING FIRST RECORDS IS THE WHOLE ORDER ONLY BECAUSE THESE PARTS DO
+  // NOT INTERLEAVE. `decode.audio.mel` and `decode.audio.vocoder` emit one
+  // record each, so `first(A) <= first(B)` is exact. A future leaf with two
+  // REPEATING parts would satisfy this assertion while running `A, B, B, A, B,
+  // A` — the first pair is in order and every pair after it is not. That leaf
+  // owes a per-record pairing, and this one does not have to pay for it: the
+  // (0) count is what would make the difference visible, since `{1, 1}` is the
+  // premise the line above rests on.
   for (size_t i = 1; i < part_first.size(); ++i) {
     INFO("sub-scope pair = " << c.parts[i - 1] << " then " << c.parts[i]);
     CHECK_MESSAGE(part_first[i] >= part_first[i - 1] - 1e-9,
@@ -3253,6 +3293,66 @@ void CheckCarryingPhase(const nlohmann::json& table, const Carrying& c) {
                     << leaf_seconds << "s, under the " << (100.0 * c.min_coverage)
                     << "% this phase's anchor is expected to reach. The rest is a phase nobody "
                        "named, wearing this one's label");
+
+  // (2b) AND EACH PART'S OWN SHARE, because (2) is checked on the SUM.
+  //
+  // WHAT IT CLOSES, and it is the fifth transfer shape this case has been shown.
+  // Assertion (2) permits ONE part to cover the whole leaf while its siblings
+  // measure nothing, and the SIBLING BOUNDARY is enough to do it: leave
+  // `decode.audio.mel` open across the vocoder call and open `decode.audio.
+  // vocoder` empty after it (mutation R1b, two lines, identical semantics and
+  // identical call order) and the vocoder — the model #1010 asks for BY NAME —
+  // reports 16 microseconds of a half-second leaf, with (0), (1b), (1), (2),
+  // (3), the `nested` invariant and the non-overlap check all green. It is the
+  // same 100% attribution transfer N1 achieves by swapping the two literals,
+  // reached without touching either literal.
+  //
+  // ONLY THE VOCODER CARRIES A FLOOR, and the mel's 0.0 is a MEASURED debt
+  // rather than an oversight. Honest, over the two renders of this case on two
+  // runs of this box, `decode.audio.vocoder` holds 97.85%, 91.57%, 90.6% and
+  // 89.7% of its leaf; on the 21B artifact this row shipped it holds 97.0% and
+  // 99.99%. Under R1b it holds 0.00045% and 0.0013%. Between four and five
+  // orders of separation, which is the property the 0.50 `decode.video.vae`
+  // floor below exploits, and why this number is 0.50 rather than tightened
+  // toward a measured share this box destroys.
+  //
+  // THE MEL CANNOT HAVE ONE, AND THE REASON IS THAT THE TWO DISTRIBUTIONS
+  // OVERLAP. Honest, `decode.audio.mel` holds 2.13% and 8.43% here (9.4% and
+  // 10.3% on the other run) and 0.0004% to 2.9% on the artifact, because the
+  // audio VAE decode's cost RELATIVE to the vocoder is a property of the
+  // geometry. Under the MIRROR of R1b — mel emptied, the vocoder scope covering
+  // both calls — it holds 0.0032% and 0.0020%. The honest 21B render's 0.0004%
+  // is SMALLER than the mirror's 0.0032%, so no threshold separates them: any
+  // floor that reddens the mirror also reddens an honest render this row has
+  // already produced. The mirror is therefore measured, GREEN, and recorded as
+  // open in `### Owed out of W0` rather than closed by a number that cannot be
+  // justified.
+  //
+  // The two directions are not equally expensive, and that is why one is closed
+  // and one is disclosed. R1b moves the VOCODER's 90-99.99% onto the mel, which
+  // is the 100% attribution transfer that would have made W1 rank the wrong
+  // model. The mirror moves the MEL's 0.0004-10% onto the vocoder, so it
+  // overstates the name #1010 already asks for by at most the smaller share.
+  //
+  // AND IT IS A FLOOR, NOT A BAND. A partial transfer — an anchor covering half
+  // its call — passes 0.50 and is not detected here. Closing that needs a scope
+  // INSIDE the callee, which is the same debt the third row of the anchor table
+  // in `### Owed out of W0` carries for all six anchors.
+  REQUIRE(c.part_min_coverage.size() == c.parts.size());
+  REQUIRE(part_seconds.size() == c.parts.size());
+  for (size_t i = 0; i < c.parts.size(); ++i) {
+    INFO("sub-scope = " << c.parts[i]);
+    MESSAGE("    " << c.parts[i] << " = " << part_seconds[i] << "s, "
+                   << (100.0 * part_seconds[i] / leaf_seconds) << "% of " << c.leaf);
+    if (c.part_min_coverage[i] <= 0.0) continue;
+    CHECK_MESSAGE(part_seconds[i] >= c.part_min_coverage[i] * leaf_seconds,
+                  "'" << c.parts[i] << "' holds " << part_seconds[i] << "s of the "
+                      << leaf_seconds << "s its '" << c.leaf << "' leaf spent, under the "
+                      << (100.0 * c.part_min_coverage[i])
+                      << "% this name is expected to reach. A SIBLING scope that opened around "
+                         "this one's call carries its seconds under the sibling's name, and "
+                         "every other assertion in this case survives that");
+  }
 
   // (3) EXCLUSIVITY. Nothing else may run in the window the anchor spans. This
   // is the assertion that sees a TRANSFER directly rather than through a sum:
@@ -3473,6 +3573,10 @@ void CheckRenderPhases(const nlohmann::json& table,
        {},
        {trace.dit_evaluations},
        "Ltx2ConditioningTrace::dit_evaluations",
+       // ONE part, so (2) already IS the per-part assertion and a second copy of
+       // it would only be noise. `denoise.step`'s own placement debt is the
+       // third row of the anchor table in `### Owed out of W0`.
+       {0.0},
        render},
       {"decode.video",
        {"decode.video.chunk"},
@@ -3480,6 +3584,10 @@ void CheckRenderPhases(const nlohmann::json& table,
        {"artifacts.frames"},
        {trace.video_decode_chunks + 1},
        "Ltx2ConditioningTrace::video_decode_chunks + 1, the reopen after the last chunk",
+       // One part; and this leaf's real per-part floor is the `decode.video.vae`
+       // block below, which is a ratio between two ANCHORS rather than between an
+       // anchor and its leaf.
+       {0.0},
        render},
       {"decode.audio",
        {"decode.audio.mel", "decode.audio.vocoder"},
@@ -3487,6 +3595,11 @@ void CheckRenderPhases(const nlohmann::json& table,
        {},
        {1, 1},
        "the two calls #1010 names, once each per render",
+       // THE ONLY MULTI-PART LEAF, and therefore the only place (2b) is not
+       // vacuous. The vocoder carries 0.50 and the mel carries none; the note on
+       // `part_min_coverage` and on (2b) argues both numbers, and
+       // `### Owed out of W0` records what the mel's 0.0 leaves open.
+       {0.0, 0.50},
        render},
       // AND THE WRITER, which shipped with no anchor at all and is the leaf the
       // `decode.video` number is protected by. `artifacts.frames.ppm` wraps the
@@ -3515,6 +3628,8 @@ void CheckRenderPhases(const nlohmann::json& table,
        {"decode.video"},
        {trace.video_decode_chunks},
        "Ltx2ConditioningTrace::video_decode_chunks, one write callback per chunk",
+       // One part, so (2) already is it.
+       {0.0},
        render},
   };
   for (const Carrying& c : carrying) CheckCarryingPhase(table, c);
@@ -3543,11 +3658,22 @@ void CheckRenderPhases(const nlohmann::json& table,
   // green. The claim that this leaf "finally has a sub-scope whose ends are both
   // production events" was true of the source and unheld by the gate.
   //
-  // THE DENOMINATOR IS `decode.video.chunk`, not the leaf: the leaf's last chunk
-  // record is the empty window between the final chunk and the end of the
-  // decode, and both are inside the same leaf, so the chunk windows are the
-  // tightest thing the vae can be measured against without a second threshold
-  // for the reopen. Measured at 91.1%, 93.6%, 97.4%, 98.2%, 98.5% and 98.6% of
+  // THE DENOMINATOR IS `decode.video.chunk`, not the leaf, AND THE REOPEN IS NOT
+  // THE REASON. This note used to say the chunk windows are the tightest
+  // denominator available "without a second threshold for the reopen", which
+  // claims more than the numbers do. The reopen — the empty window between the
+  // final chunk and the end of the decode — is itself a `decode.video.chunk`
+  // record, so it sits inside BOTH candidate denominators and separates neither.
+  // Measured here, render 1: the leaf is 0.00105035 s against 0.00103919 s of
+  // chunk, a 1.06% difference that is two scope boundaries; render 2:
+  // 0.00514612 s against 0.00512619 s, 0.39%. The two denominators are within a
+  // percent of each other and the LEAF is the marginally stricter of the two, so
+  // nothing is loosened by this choice.
+  //
+  // The chunk is used because it is the same window the containment assertion
+  // below encloses each vae record IN, which keeps this ratio between two
+  // quantities at one granularity rather than comparing a per-group anchor
+  // against a whole-decode leaf. Measured at 91.1%, 93.6%, 97.4%, 98.2%, 98.5% and 98.6% of
   // the chunk seconds across six renders here — the low end is the nine-frame
   // render, whose single chunk is about a millisecond. The floor is 0.50
   // because what is NOT covered is the per-group

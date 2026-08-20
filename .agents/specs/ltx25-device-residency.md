@@ -1412,13 +1412,61 @@ which is where this spec's `### Decisions taken here` already said they would be
   |---|---|
   | It runs once per unit of work the RENDER counted | **PROVEN**, at N = 8 for `denoise.step` and at N = 1 and N = 2 for every decode-side count, over two renders in one table. The counters come from `Ltx2ConditioningTrace` and the chunk count is re-derived from `Ltx2GroupTilesByTemporalSlice` |
   | Sibling anchors under one leaf are in the driver's own order | **PROVEN** for the one sibling pair that exists (`decode.audio.mel` before `decode.audio.vocoder`), and it is an ORDER, not an identity |
+  | A sibling anchor does not carry ITS SIBLING'S seconds | **HALF PROVEN**, and the half that is open is named below. A per-part floor holds `decode.audio.vocoder` at 50% of its leaf; nothing holds `decode.audio.mel`, for a measured reason |
   | Each anchor covers the CALL it is named after | **NOT PROVEN, for any of the six.** `denoise.step`, `decode.video.chunk`, `decode.audio.mel`, `decode.audio.vocoder` and `artifacts.frames.ppm` are all opened by a statement ADJACENT to the call. `decode.video.vae` is the only one whose ends are both production events, and what holds its placement is a coverage floor against `decode.video.chunk` — a ratio between two anchors, which is weaker than a count and stronger than the nothing that held it at `165db635c` |
 
-  The third row is the same debt `load.dit` carries and it is not smaller for
+  The last row is the same debt `load.dit` carries and it is not smaller for
   being on the render side. Closing it needs a scope inside the callee —
   `Ltx2AudioDecoderForward`, `Ltx2VocoderWithBweForward`,
   `Ltx2LoadDitFromSafetensors` — which is where the placement stops being a
   statement about where somebody wrote a line.
+
+* **THE SIBLING BOUNDARY MOVES 100% OF A LEAF'S SECONDS BETWEEN TWO NAMES, AND
+  ONE OF ITS TWO DIRECTIONS IS STILL OPEN.** This is stated separately from the
+  row above because it is a different failure: that row is a PRECISION debt — an
+  anchor opened by an adjacent statement measures a few microseconds more than
+  its call. This is a whole-attribution TRANSFER, and it is reached without
+  touching a scope's name, its count, its containment or its order.
+
+  The shape, which a fifth fresh review named as mutation R1b: leave
+  `decode.audio.mel` open across the vocoder call and let
+  `decode.audio.vocoder` open and close EMPTY beside it
+  (`ltx2_video.cpp:4674-4682`, two lines, identical semantics and identical call
+  order). Assertion (1b) passes because the mel still OPENS first, so it proves
+  an order and not an identity; the counts are `{1, 1}` either way; containment,
+  `nested` and non-overlap all hold; and `min_coverage` is checked on the SUM of
+  the parts, so one part covering everything satisfies it. At `1609e1d08` the
+  gate returned exit 0, 1/1 and 527/527 assertions — byte-identical to the
+  honest tree — while the vocoder, the model
+  [#1010](https://github.com/mudler/vllm.cpp/issues/1010) asks for **by name**,
+  reported six microseconds of a half-second leaf.
+
+  **The vocoder direction is now closed** by a per-part floor of 0.50 against the
+  `decode.audio` leaf (assertion (2b), `Carrying::part_min_coverage`). Honest the
+  vocoder measures 97.85%, 91.57%, 90.6% and 89.7% here and 97.0% and 99.99% on
+  the 21B artifact; under R1b it measures 0.00045% and 0.0013%. R1b now reds:
+  **exit 1, 1 case failed, 554 assertions, 3 failed.**
+
+  **The MIRROR direction is NOT closed** — mel emptied, the vocoder scope
+  covering both calls — and no floor is available, which is a measurement and
+  not an omission. Honest, `decode.audio.mel` holds 2.13%, 8.43%, 9.4% and 10.3%
+  on this fixture and **0.0004% to 2.9%** on the 21B artifact. Under the mirror
+  it holds **0.0032% and 0.0020%**. The honest 21B render's 0.0004% is *smaller*
+  than the mirror's 0.0032%, so the two distributions overlap and any threshold
+  that reddens the mirror also reddens an honest render this row has already
+  produced. The mirror is measured GREEN: exit 0, 1/1, 554/554.
+
+  **What W1 inherits, in one sentence, so that it does not inherit it by
+  silence:** `decode.audio.mel` may be carrying the vocoder's seconds and no gate
+  in this repository would say so. The cost is bounded in one direction — the
+  mirror overstates the vocoder by at most the mel's own share, and the vocoder
+  is the name #1010 already asks for — and unbounded in the other, which is
+  exactly why the vocoder got the floor first. Closing the mirror needs the same
+  thing the row above needs and nothing weaker: a scope INSIDE
+  `Ltx2AudioDecoderForward`, so that both of the mel anchor's ends are production
+  events, in the shape `decode.video.vae` already ships. **Any W1 ranking that
+  separates the audio VAE decode from the vocoder must land that scope first, or
+  state that it is ranking a pair and not two models.**
 * **A LEAF MAY STILL GROW OVER TIME NOBODY NAMED, and the room is measurable.**
   The `nested` invariant sees a leaf swallow a NEIGHBOUR, because the neighbour
   turns `nested` and leaves the timeline. Nothing sees a leaf swallow
