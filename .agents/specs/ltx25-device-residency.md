@@ -1296,18 +1296,21 @@ step, which no anchor wraps — and its share depends on the geometry. Measured
 the measured value in both cases, which is the rule the other thresholds are set
 by.
 
-**Re-run on the FINAL head**, the merge commit `8c66ffa16`, and not on the head each mutation was
-first measured on: `origin/main` moved twice while this branch was open and one
-of the incoming commits (`d0eff4f25`, W0-LIVE) edits this row's own driver, so a
-mutation proof inherited from an earlier head is a claim about a tree that no
-longer exists.
+**Re-run on the FINAL head**, the merge commit `99703ce5a`, and not on the head
+each mutation was first measured on. `origin/main` moved TWICE while this branch
+was open: `d0eff4f25` (W0-LIVE) edits this row's own driver, and `4712dac40`
+narrows `act(gate)` to the input dtype in `src/vt/cpu/cpu_ops.cpp`, which is on
+this render's path. A mutation proof inherited from an earlier head is a claim
+about a tree that no longer exists, and the whole set was re-applied after each
+merge rather than carried forward — N6's count moved from 3 failed to 5 between
+the two heads, which is what carrying it forward would have hidden.
 
 | # | Mutation | `git diff --stat` | compile | containment case | SUMS case |
 |---|---|---|---|---|---|
 | — | honest | (none) | rc 0 | exit 0, 1/1 cases, **527/527** | exit 0, 1/1, **446/446** |
 | **N1** | swap the `decode.audio.mel` and `decode.audio.vocoder` scope names — the **sibling-swap** mutation | 1 file, +2/-2 | rc 0 | **RED**, exit 1, 1 case failed, **527 assertions, 3 failed**, on the sibling order in each of the three per-render checks | exit 0, 446/446 |
-| **N6** | move `decode.video.vae` off `AccumulateTemporalGroup` onto `buffer.Allocate` — the **anchor beside the work** mutation | 1 file, +7/-7 | rc 0 | **RED**, exit 1, 1 case failed, **527 assertions, 3 failed**, on the vae coverage floor | exit 0, 446/446 |
-| M12 | re-anchored: `denoise.step` for step 0 only, `denoise` closed there, `phase.finish` over steps 1-7 | 1 file, +8/-1 | rc 0 | **RED**, exit 1, 1 case failed, **462 assertions, 5 failed** | exit 0, 374/374 |
+| **N6** | move `decode.video.vae` off `AccumulateTemporalGroup` onto `buffer.Allocate` — the **anchor beside the work** mutation | 1 file, +7/-7 | rc 0 | **RED**, exit 1, 1 case failed, **527 assertions, 5 failed**, on the vae coverage floor | exit 0, 446/446 |
+| M12 | re-anchored: `denoise.step` for step 0 only, `denoise` closed there, `phase.finish` over steps 1-7 | 1 file, +8/-1 | rc 0 | **RED**, exit 1, 1 case failed, **462 assertions, 3 failed** | exit 0, 374/374 |
 | M11 | re-anchored: writes stay inside `decode.video`, `artifacts.frames` emitted empty | 1 file, +3/-4 | rc 0 | **RED**, exit 1, 1 case failed, **527 assertions, 4 failed** | exit 0, 446/446 |
 | M11b | re-anchored: both `Close`s below the write, writer still around the loop | 1 file, +2/-2 | rc 0 | **RED**, exit 1, 1 case failed, **119 assertions, 1 failed** | exit 0, 446/446 |
 | M13 | re-anchored: swap the `load.dit` and `load.prompt_embeds` scope names | 1 file, +2/-2 | rc 0 | **RED**, exit 1, 1 case failed, **527 assertions, 2 failed**, on the load order | exit 0, 446/446 |
