@@ -270,7 +270,30 @@ extern "C" {
  * struct keeps the CPU engine byte-identical. WHAT DEVICE 1 MOVES for Music3 is
  * the 8.6B language model and nothing else yet; the RVQ depth decoder and the
  * acoustic half are still host reference loops (see docs/FEATURES.md). */
-#define VLLM_ABI_VERSION 21
+/* v22 — vllm_model_params.mmproj_path, THE SECOND GGUF FILE (row
+ * `LOAD-GGUF-MMPROJ`, issue #821). A GGUF multimodal model ships as two files:
+ * the language `.gguf` and a `clip`-architecture `mmproj-*.gguf` carrying the
+ * vision tower. Before this field the ABI could name only the first, so a GGUF
+ * multimodal checkpoint could be loaded only as a text model and the projector
+ * had nowhere to arrive.
+ *
+ * The spelling mirrors llama.cpp's user-facing `--mmproj`, which is the flag
+ * every holder of these artifacts already types. It is EXPLICIT by design:
+ * auto-discovery of a sibling `mmproj*.gguf` is deliberately not implemented,
+ * because a directory holding two unrelated models would then silently fuse
+ * them and the failure would be a wrong-shaped model rather than an error.
+ *
+ * SCOPE, and it carries the same weight as the field: this loads the tower and
+ * hands it to the engine. THIS ABI STILL HAS NO MULTIMODAL REQUEST PATH, so
+ * `vllm_chat` / `vllm_generate` cannot yet feed the tower an image — exactly
+ * the state the v19 note above records for the multimodal limits. What the
+ * field buys today is that the projector is READ, VALIDATED and REFUSED BY
+ * NAME at load instead of being unnameable.
+ *
+ * Appended at the END of vllm_model_params, so a zero-initialized v21 struct is
+ * byte-identical: NULL/empty means no projector, which is every load that
+ * existed before. */
+#define VLLM_ABI_VERSION 22
 
 /* ── Export macro ─────────────────────────────────────────────────────────────
  * Marks the symbols that make up the stable ABI. Default visibility now; Task 3
@@ -319,7 +342,9 @@ typedef struct vllm_model_params {
    * --tokenizer-config. Ignored for a .gguf model_path, whose template comes
    * from the GGUF `tokenizer.chat_template` metadata. */
   const char* tokenizer_config_path;
-  /* KV-cache block size (tokens per block). <= 0 => 32. */
+  /* KV-cache block size (tokens per block). <= 0 => 32.
+     MUST be a multiple of 16: the attention backends' get_kv_cache_shape
+     refuses any other value, so a non-multiple throws from vllm_engine_load. */
   int32_t block_size;
   /* KV-cache block count OVERRIDE (vLLM num_gpu_blocks_override). > 0 pins the
    * pool to exactly this many blocks. <= 0 => AUTO: the pool is sized by the
@@ -444,11 +469,13 @@ typedef struct vllm_model_params {
    * meaning unchanged:
    *   {"vllm_cpp":{"mmap":{"enabled":bool,"prefault":bool},
    *                "expert_stream":{"enabled":bool,"slots":int,
-   *                                 "slot_bytes":int}}}
+   *                                 "slot_bytes":int},
+   *                "device_fit":{"weight_budget_bytes":int}}}
    * Precedence per field is environment variable > this document > built-in
    * default, so an exported VT_GGUF_MMAP / VT_GGUF_PREFAULT / VT_MOE_EXPERT_STREAM
-   * / VT_MOE_EXPERT_STREAM_SLOTS / VT_MOE_EXPERT_STREAM_SLOT_BYTES still wins; the
-   * engine prints one line on stderr naming what it installed, plus a second line
+   * / VT_MOE_EXPERT_STREAM_SLOTS / VT_MOE_EXPERT_STREAM_SLOT_BYTES /
+   * VT_DEVICE_WEIGHT_BUDGET_BYTES still wins; the engine prints one line on
+   * stderr naming what it installed, plus a second line
    * naming the variables that override it when there are any. The engine acts on it
    * during weight load, so it must be installed before then, which vllm_engine_load
    * does. Loading a SECOND engine in one process is legal: an absent field means
@@ -459,14 +486,27 @@ typedef struct vllm_model_params {
    * REFUSALS ADDED WITH THAT KEY, all VLLM_ERR_INVALID_ARGUMENT before any model
    * I/O: an UNKNOWN key anywhere in the document — a misspelled top-level key
    * (`{"vllm-cpp":...}` with a hyphen, `{"uvaa":...}`), a misspelled key inside
-   * `vllm_cpp` (`{"vllm_cpp":{"mmapp":...}}`), and a misspelled key inside the
-   * mirrored `uva` or `prefetch` object (`{"uva":{"cpu_offload_GB":10}}`); a
-   * wrong-typed field; and a non-positive `slots` or `slot_bytes`. A typo is refused
-   * rather than defaulted because a silently disabled residency tier, or a budget
-   * the operator believes is set, is met as an out-of-memory kill rather than as an
-   * error. Upstream refuses one too: every vLLM config dataclass carries
-   * `extra="forbid"`. The four legal top-level keys are `offload_backend`, `uva`,
-   * `prefetch` and `vllm_cpp`. See docs/USAGE.md.
+   * `vllm_cpp` or inside any of its THREE objects
+   * (`{"vllm_cpp":{"mmapp":...}}`,
+   * `{"vllm_cpp":{"device_fit":{"weight_budget":0}}}`), and a misspelled key
+   * inside the mirrored `uva` or `prefetch` object
+   * (`{"uva":{"cpu_offload_GB":10}}`); a wrong-typed field; a non-positive
+   * `slots` or `slot_bytes`; and a NEGATIVE `weight_budget_bytes`. A typo is
+   * refused rather than defaulted because a silently disabled residency tier, or
+   * a budget the operator believes is set, is met as an out-of-memory kill rather
+   * than as an error. Upstream refuses one too: every vLLM config dataclass
+   * carries `extra="forbid"`. The four legal top-level keys are
+   * `offload_backend`, `uva`, `prefetch` and `vllm_cpp`.
+   *
+   * `weight_budget_bytes` is the ONE field of the six that ACCEPTS `0`, and the
+   * asymmetry is the reason the key exists. It is a BUDGET, not a size: `0` is
+   * the documented spelling of "suppress the load-time device-fit refusal and get
+   * the late failure back", because the fit check reads a zero budget as UNKNOWN
+   * and decides nothing — exactly what `VT_DEVICE_WEIGHT_BUDGET_BYTES=0` already
+   * means. `slots` and `slot_bytes` are sizes, and a slot count that silently
+   * became its default is a cache the operator does not have, so those two keep
+   * refusing `0`. Only a NEGATIVE budget is refused, and the message says "must
+   * not be negative" rather than "must be positive". See docs/USAGE.md.
    * Borrowed for the call only. */
   const char* offload_config;
   /* ── Jump-forward decoding (ABI v10) ───────────────────────────────────────
@@ -578,6 +618,20 @@ typedef struct vllm_model_params {
    * per the paragraph above fails vllm_engine_load with
    * VLLM_ERR_INVALID_ARGUMENT. Borrowed for the call only. */
   const char* limit_mm_per_prompt;
+  /* ── The `clip` multimodal projector (ABI v22) ────────────────────────────
+   * Path to the SECOND GGUF file — `mmproj-*.gguf`, `general.architecture` =
+   * `clip` — beside a `.gguf` model path. NULL or empty (the zero value) means
+   * no projector, which is byte-identical to pre-v22.
+   *
+   * Refused BY NAME with VLLM_ERR_MODEL_LOAD — the code every FromModelDir
+   * failure reports, exactly as an absent named device does — when: the model path is
+   * not a `.gguf` (a safetensors checkpoint carries its tower in its own
+   * shards); the file is not a `clip` projector; its `clip.projector_type` is
+   * not one this build loads; or it carries only the first half of the
+   * temporal patch embedding, which cannot be completed without inventing the
+   * other half. Every one of those fires BEFORE the tokenizer and before any
+   * language-model weight byte is read. Borrowed for the call only. */
+  const char* mmproj_path;
 } vllm_model_params;
 
 /* ── Custom logits processor (ABI v8) ─────────────────────────────────────────

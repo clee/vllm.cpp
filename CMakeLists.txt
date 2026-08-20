@@ -694,6 +694,20 @@ include(cmake/TritonAOT.cmake)
 
 configure_file(include/vllm/version.h.in include/vllm/version.h @ONLY)
 
+# THE COMPILED-ARCH MANIFEST (issue #1357, umbrella #1332 M2) starts EMPTY, and
+# empty means "FlashAttention-2 was not compiled". It is filled in exactly one
+# place: beside the vt_cuda_set_source_gencode call that emits FA2's -gencode
+# options, so the manifest cannot claim an architecture nvcc was not asked to
+# emit SASS for. Nothing fills it in a non-CUDA build, in a build with
+# -DVLLM_CPP_FLASH_ATTN=OFF, in a build without CUTLASS headers, or in a build
+# whose requested architectures do not intersect the feature table's fa2 row --
+# and "not compiled" is the correct answer in every one of those cases.
+#
+# The header is rendered at the END of this file, after that assignment has had
+# its chance to run. Derived, never hand-written: a parallel architecture list is
+# CUDA_SUPPORTED_ARCHS, and a list that goes stale is precisely the defect.
+set(VLLM_CPP_CUDA_FA2_COMPILED_ARCHS "")
+
 add_library(vllm STATIC
   src/vllm/version.cpp
   src/vllm/sampling_params.cpp
@@ -713,6 +727,10 @@ add_library(vllm STATIC
   src/vllm/config/speculative.cpp
   src/vllm/outputs.cpp
   src/vllm/transformers_utils/hf_config.cpp
+  # ENG-HF-MODEL-DOWNLOAD (#1280): the HuggingFace cache layout. Pure file
+  # system, no transport, so it builds in every lane. The DFlash draft path
+  # in model_loader.cpp reaches it and is not behind VLLM_CPP_SERVER.
+  src/vllm/transformers_utils/hf_cache.cpp
   src/vllm/model_executor/model_loader/read_only_file_mapping.cpp
   src/vllm/model_executor/model_loader/safetensors_reader.cpp
   src/vllm/model_executor/model_loader/gguf_reader.cpp
@@ -781,6 +799,7 @@ add_library(vllm STATIC
   src/vllm/model_executor/models/minimax_music3_ar.cpp
   src/vllm/model_executor/models/minimax_music3_acoustic.cpp
   src/vllm/model_executor/models/minimax_music3_device.cpp
+  src/vllm/model_executor/models/minimax_music3_depth_device.cpp
   src/vllm/model_executor/models/minimax_music3_llm.cpp
   src/vllm/model_executor/models/minimax_music3_speech.cpp
   src/vllm/model_executor/models/gpt2.cpp
@@ -978,6 +997,9 @@ add_library(vllm STATIC
   src/vllm/model_executor/layers/quantization/fp8_block_quant.cpp
   src/vllm/plugins/plugins.cpp
   src/vllm/model_executor/models/qwen3_vl_vision.cpp
+  # LOAD-GGUF-MMPROJ (#821): the llama.cpp `clip` mmproj reader that fills the
+  # SAME Qwen3VLVisionWeights from a SECOND GGUF file beside the language one.
+  src/vllm/model_executor/models/clip_mmproj_gguf.cpp
   src/vllm/model_executor/models/gemma4_vision.cpp
   src/vllm/model_executor/models/gemma4_audio.cpp
   src/vllm/model_executor/models/whisper_audio.cpp
@@ -1083,6 +1105,7 @@ add_library(vllm STATIC
   src/vllm/v1/core/sched/async_scheduler.cpp
   src/vllm/v1/core/sched/utils.cpp
   src/vllm/v1/worker/gpu/block_table.cpp
+  src/vllm/v1/worker/gpu/cudagraph_dispatch.cpp
   src/vllm/v1/worker/gpu/input_batch.cpp
   src/vllm/v1/worker/gpu/prepare_inputs.cpp
   src/vllm/v1/worker/gpu/async_output.cpp
@@ -1090,6 +1113,7 @@ add_library(vllm STATIC
   src/vllm/platform/process.cpp
   src/vllm/platform/console_shutdown.cpp
   src/vllm/platforms/platform.cpp
+  src/vllm/platforms/cuda_arch_manifest.cpp
   src/vllm/platforms/cpu.cpp
   src/vllm/v1/attention/backend.cpp
   src/vllm/v1/attention/registry.cpp
@@ -1215,6 +1239,8 @@ add_library(vllm STATIC
   src/vllm/parser/parser_manager.cpp
   src/vt/dtype.cpp
   src/vt/backend.cpp
+  src/vt/breakable_graph.cpp
+  src/vt/persistent_step_input.cpp
   src/vt/tensor.cpp
   src/vt/arena.cpp
   src/vt/op_provider.cpp
@@ -1711,9 +1737,18 @@ if(VLLM_CPP_CUDA)
     # different upstream arch set from the NVFP4 block-scaled collective (vLLM
     # keeps them as separate SCALED_MM_ARCHS / FP4_SM120_ARCHS intersections), so
     # it is resolved separately here rather than riding on the NVFP4 gate.
+    # cuda_matmul_fp8_block_cutlass.cu (#1189 M5) rides the SAME cell: it is the
+    # BLOCK-scaled (fine-grained 128x128) sibling of the per-tensor GEMM above,
+    # built from the same ArchTag=Sm120 family -- upstream keeps both in
+    # csrc/.../w8a8/cutlass/c3x behind one SCALED_MM_ARCHS intersection. It is a
+    # separate TU rather than a second kernel in the same file because the two
+    # share no template (dense layout tags vs cute::tuple<Layout, LayoutSF>), so
+    # one file would only serialise two heavy cutlass compiles.
     set(_FP8_CUTLASS_SOURCES)
     if(VT_CUTLASS_FP8_ARCHS)
-      set(_FP8_CUTLASS_SOURCES src/vt/cuda/cuda_matmul_fp8_cutlass.cu)
+      set(_FP8_CUTLASS_SOURCES
+        src/vt/cuda/cuda_matmul_fp8_cutlass.cu
+        src/vt/cuda/cuda_matmul_fp8_block_cutlass.cu)
     endif()
     target_sources(vllm PRIVATE
       ${_NVFP4_CUTLASS_SOURCES}
@@ -2266,6 +2301,11 @@ if(VLLM_CPP_CUDA)
       src/vt/cuda/cuda_flash_attn_fa2.cu
       ${_FA2_KERNEL_SRCS})
     vt_cuda_set_source_gencode("${VT_FA2_ARCHS}" ${_VT_FA2_SOURCES})
+    # THE MANIFEST, taken from the SAME argument that just became nvcc's
+    # -gencode options for these exact sources (issue #1357). Reaching this line
+    # is what "FA2 is compiled" means, and the architectures are the ones the
+    # compiler was handed -- not a second list that has to be kept honest.
+    string(REPLACE ";" "," VLLM_CPP_CUDA_FA2_COMPILED_ARCHS "${VT_FA2_ARCHS}")
     list(APPEND _VT_CUDA_FEATURE_SOURCES ${_VT_FA2_SOURCES})
   endif()
 
@@ -2290,11 +2330,105 @@ if(VLLM_CPP_SERVER)
   # construction) lives in the library so examples/server can be a thin client of
   # the C ABI's vllm_server_main (v17). It shares api_server.cpp's httplib gate.
   target_sources(vllm PRIVATE src/vllm/entrypoints/openai/server_main.cpp)
+  # ENG-HF-MODEL-DOWNLOAD (#1280): the hub protocol speaks HTTP through the same
+  # vendored cpp-httplib header api_server.cpp uses, so it shares that gate. The
+  # cache half above stays unconditional because it opens no socket.
+  target_sources(vllm PRIVATE src/vllm/transformers_utils/hf_hub.cpp)
   target_compile_definitions(vllm PUBLIC VLLM_CPP_SERVER)
   target_link_libraries(vllm PUBLIC Threads::Threads)
   # third_party/httplib/httplib.h is reached as <httplib/httplib.h> (third_party
   # is already a SYSTEM include on the vllm target).
 endif()
+
+# ── BIT-ROT GUARD: the MiniMax-Music3 depth-stage A/B driver (#672, #1246) ────
+# `tools/bench/music3_depth_stage_ab.cpp` is the sole artifact behind spec §16.6's
+# 3.50x and its `f0cfeed6eee4f55d` fingerprint. Its own header argues, correctly,
+# that CI must never RUN it: it allocates 2.5 GB of weights, spends seconds per
+# round, and is a TWO-BUILD A/B that one target could not express anyway. None of
+# that is a reason for it to be UNCOMPILABLE — it reaches internal headers and
+# `LinearNoBias`, so the next signature change would rot the one file a reader
+# has to compile to reproduce the measurement, silently.
+#
+# So both arms are compiled and NOTHING is linked or registered as a test. An
+# OBJECT library builds the TU and discards it; `main` is never linked, so no
+# weight is ever allocated and the build stays byte-identical to what it was.
+# Two targets rather than one because the arms are `#if defined(MUSIC3_AFTER)`
+# alternatives and a single configuration would leave the other half unchecked.
+foreach(_music3_ab_arm before after)
+  add_library(vllm_music3_depth_stage_ab_${_music3_ab_arm} OBJECT
+    tools/bench/music3_depth_stage_ab.cpp)
+  target_include_directories(vllm_music3_depth_stage_ab_${_music3_ab_arm} PRIVATE
+    ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/src ${CMAKE_BINARY_DIR}/include)
+  target_include_directories(vllm_music3_depth_stage_ab_${_music3_ab_arm} SYSTEM PRIVATE
+    ${CMAKE_SOURCE_DIR}/third_party)
+  target_compile_features(vllm_music3_depth_stage_ab_${_music3_ab_arm} PRIVATE cxx_std_20)
+  vllm_cpp_set_warnings(vllm_music3_depth_stage_ab_${_music3_ab_arm})
+endforeach()
+target_compile_definitions(vllm_music3_depth_stage_ab_after PRIVATE MUSIC3_AFTER)
+
+# ── The MiniMax-Music3 vocoder decode-window A/B driver (#672, #1334) ─────────
+# `tools/bench/music3_vocoder_conv_ab.cpp` is the artifact behind spec §18's
+# numbers, and it is registered as no test, so nothing in `ctest` runs it.
+#
+# WHY THIS ONE IS AN EXECUTABLE WHERE ITS SIBLING 20 LINES ABOVE IS AN OBJECT
+# LIBRARY. That divergence was a review finding (2026-08-19) and it is argued
+# here rather than left to be noticed twice. The depth driver's two arms are
+# `#if defined(MUSIC3_AFTER)` branches of ONE file, so compiling it is the whole
+# rot guard and linking `main` would only add an entry point nobody calls; an
+# OBJECT library is strictly cheaper and it says so.
+#
+# This driver's arms are two SOURCE TREES, the shape spec §18.8 requires and that
+# §16.6a was voided for not having, and the recorded recipe is a SHIPPED SCRIPT:
+# `scripts/music3-vocoder-conv-ab.sh` configures two clones, runs
+# `ninja ... vllm_music3_vocoder_conv_ab` in each, `sha256sum`s the two results
+# and REFUSES to time anything when they hash the same, then executes them with
+# `--lengths=` / `--repeats=`. Every one of those steps needs a linked binary.
+# An OBJECT library would guard the compile and break the reproduction, which
+# inverts the point: the rot this target exists to prevent is a §18 nobody can
+# re-run.
+#
+# What it costs, stated rather than hoped: one ~21 MB executable in a build tree,
+# no test registration, and no `install(TARGETS ...)` entry — see the install
+# list below, which names `vllm` and `vllm_shared` only — so it does not ship and
+# no packaged artifact changes. `main` is linked and never runs in CI; the
+# allocation the depth driver's comment worries about happens on invocation, not
+# at load.
+add_executable(vllm_music3_vocoder_conv_ab tools/bench/music3_vocoder_conv_ab.cpp)
+target_link_libraries(vllm_music3_vocoder_conv_ab PRIVATE vllm)
+target_include_directories(vllm_music3_vocoder_conv_ab PRIVATE
+  ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/src ${CMAKE_BINARY_DIR}/include)
+target_include_directories(vllm_music3_vocoder_conv_ab SYSTEM PRIVATE
+  ${CMAKE_SOURCE_DIR}/third_party)
+target_compile_features(vllm_music3_vocoder_conv_ab PRIVATE cxx_std_20)
+vllm_cpp_set_warnings(vllm_music3_vocoder_conv_ab)
+
+# ── BIT-ROT GUARD: the BPE encode-cost harness (#1365) ───────────────────────
+# `tools/bench/bpe_encode_cost.cpp` is the artifact behind the timing figures in
+# `.agents/specs/bpe-quadratic-merge.md`. It exists because three earlier
+# harnesses for that row lived in prose only, so no reader could re-derive one
+# figure and three rounds of certified constants each failed to reproduce.
+#
+# CI COMPILES IT AND RUNS NOTHING, and that is not an oversight. The row's own
+# ruling is that a growth assertion over these figures is NOT viable on a shared
+# runner, so there is nothing here for CI to decide; and one leg on the O(n^2)
+# code costs tens of seconds of one core, which no test tier should spend. What
+# CI does buy is that the file cannot rot behind a `Tokenizer::Encode` or
+# `FromHfJson` signature change while still being the only artifact a reader can
+# reproduce the row's numbers from — the #1246 failure, where the sole named
+# harness for a measurement was compiled by nothing.
+#
+# An OBJECT library, like `vllm_music3_depth_stage_ab_*` above and unlike
+# `vllm_music3_vocoder_conv_ab`: the recorded run recipe in the file's own header
+# compiles the four tokenizer translation units directly with `g++` rather than
+# linking `libvllm.a`, so a linked target here would guard nothing the compile
+# does not and would only add an entry point nobody calls.
+add_library(vllm_bpe_encode_cost OBJECT tools/bench/bpe_encode_cost.cpp)
+target_include_directories(vllm_bpe_encode_cost PRIVATE
+  ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/src ${CMAKE_BINARY_DIR}/include)
+target_include_directories(vllm_bpe_encode_cost SYSTEM PRIVATE
+  ${CMAKE_SOURCE_DIR}/third_party)
+target_compile_features(vllm_bpe_encode_cost PRIVATE cxx_std_20)
+vllm_cpp_set_warnings(vllm_bpe_encode_cost)
 
 # ── Packaged shared/static libvllm (M3.5 Task 3, library-first packaging) ─────
 # The static `vllm` core lib above stays as-is (tests + examples link it and
@@ -2382,3 +2516,25 @@ endif()
 if(VLLM_CPP_BUILD_EXAMPLES)
   add_subdirectory(examples)
 endif()
+
+# `vllm-cli`'s own reachability gate (#1135) runs the BINARY, so it needs the
+# binary built first. The dependency is declared HERE rather than in
+# tests/CMakeLists.txt because `add_subdirectory(tests)` runs before
+# `add_subdirectory(examples)`, so the `vllm-cli` target does not exist yet at
+# that point. The `$<TARGET_FILE:vllm-cli>` compile definition in tests/ is fine
+# there, because a generator expression is evaluated after every directory has
+# been processed. With examples off there is no `vllm-cli` target, no
+# `VLLM_CLI_BINARY` define, and the test EXITS 77 so CTest reports it Skipped
+# (see tests/vllm/entrypoints/test_cli_offload_config.cpp); this guard is the only
+# thing that has to know about the ordering.
+if(TARGET test_cli_offload_config AND TARGET vllm-cli)
+  add_dependencies(test_cli_offload_config vllm-cli)
+endif()
+
+# Render the compiled-arch manifest (issue #1357). Last, so it observes whatever
+# the FA2 gencode site above did or did not set. Generated per build into the
+# build tree, so it is not a shared file any pull request has to edit.
+configure_file(include/vllm/platforms/cuda_compiled_archs.h.in
+  include/vllm/platforms/cuda_compiled_archs.h @ONLY)
+message(STATUS
+  "CUDA FA2 compiled-arch manifest: [${VLLM_CPP_CUDA_FA2_COMPILED_ARCHS}]")

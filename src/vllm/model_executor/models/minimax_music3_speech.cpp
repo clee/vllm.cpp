@@ -16,6 +16,7 @@
 #include "vllm/model_executor/model_loader/safetensors_reader.h"
 #include "vllm/model_executor/models/indextts2.h"
 #include "vllm/model_executor/models/minimax_music3_llm.h"
+#include "vllm/model_executor/models/music3_profile.h"
 #include "vt/backend.h"
 #include "vt/dtype.h"
 
@@ -151,6 +152,11 @@ Music3AcousticWeights Music3LoadAcousticWeights(const MiniMaxMusic3Paths& paths,
                                                 const MiniMaxMusic3Config& config) {
   Music3AcousticWeights out;
 
+  // BREAKDOWN ROWS, all SPANS: they sit inside the `load.acoustic_weights` leaf
+  // and summing them would double-count it. `SafetensorsFile` is an mmap whose
+  // tensors are COPIED out, so the read and the copy are interleaved and the
+  // total cannot say which one it is.
+  const auto cond_t0 = profile::Now();
   const SafetensorsFile condition_file = SafetensorsFile::Open(
       (fs::path(paths.condition_encoder_dir) / "diffusion_pytorch_model.safetensors").string());
   const auto condition_get = [&condition_file](const std::string& name) {
@@ -160,21 +166,36 @@ Music3AcousticWeights Music3LoadAcousticWeights(const MiniMaxMusic3Paths& paths,
   out.condition.layer_scale = condition_get("layer_scale");
   out.condition.proj_weight = condition_get("proj.weight");
   out.condition.proj_bias = condition_get("proj.bias");
+  profile::AddSince("load.ac.condition", cond_t0, /*span=*/true);
 
+  const auto voc_t0 = profile::Now();
   const SafetensorsFile vocoder_file = SafetensorsFile::Open(
       (fs::path(paths.vocoder_dir) / "diffusion_pytorch_model.safetensors").string());
   out.vocoder = VocoderWeightsFromLoader(
       config.vocoder, MiniMaxMusic3LoadVocoderWeights(config.vocoder, vocoder_file));
+  profile::AddSince("load.ac.vocoder", voc_t0, /*span=*/true);
 
   if (paths.transformer_shards.empty()) {
     Fail("MiniMax-Music3: the transformer has no safetensors shards");
   }
+  // The two halves of the fp32 DiT's 9.7 GB: reading each tensor out of the
+  // mmap into a `std::map` of `std::vector<float>`, and then rebuilding the
+  // weight struct from that map. They are separated because they are different
+  // costs — the first touches every source page, the second is a pure host copy
+  // that touches no file at all — and only the second can be blamed on the
+  // loader rather than on the storage.
   std::map<std::string, std::vector<float>> dit;
-  for (const std::string& shard : paths.transformer_shards) {
-    const SafetensorsFile file = SafetensorsFile::Open(shard);
-    for (const std::string& name : file.Names()) dit[name] = AcousticF32(file.Get(name), name);
+  {
+    profile::Timer read_timer("load.ac.dit_read", /*span=*/true);
+    for (const std::string& shard : paths.transformer_shards) {
+      const SafetensorsFile file = SafetensorsFile::Open(shard);
+      for (const std::string& name : file.Names()) dit[name] = AcousticF32(file.Get(name), name);
+    }
   }
-  out.dit = DitWeightsFromTensors(config.transformer, dit);
+  {
+    profile::Timer build_timer("load.ac.dit_build", /*span=*/true);
+    out.dit = DitWeightsFromTensors(config.transformer, dit);
+  }
   return out;
 }
 
@@ -241,8 +262,12 @@ std::vector<std::vector<float>> Music3DenoiseChunks(const std::vector<float>& fr
         frame_hiddens.begin() + static_cast<ptrdiff_t>(chunk.frame_end * row));
     // The condition encoder runs bf16 (spec §2.1); its OUTPUT is then consumed
     // by an fp32 DiT, which is upstream's one cast at denoise.py:83.
-    std::vector<float> condition =
-        ConditionMix(window, chunk.frames(), mix, weights.condition, ArCompute::kBFloat16);
+    std::vector<float> condition;
+    {
+      profile::Timer condition_timer("denoise.condition_mix");
+      condition = ConditionMix(window, chunk.frames(), mix, weights.condition,
+                               ArCompute::kBFloat16);
+    }
     const int64_t length = static_cast<int64_t>(condition.size()) / condition_dim;
     if (length * condition_dim != static_cast<int64_t>(condition.size())) {
       Fail("MiniMax-Music3: the condition mix returned a non-rectangular tensor");
@@ -287,16 +312,24 @@ std::vector<std::vector<float>> Music3DenoiseChunks(const std::vector<float>& fr
       // The ONLY line the device arm changes. Both CFG branches take the same
       // arm — running one on each would make the guidance mix a comparison
       // between two different numerics rather than between two conditionings.
-      const std::vector<float> conditional =
-          on_device ? DitForwardDevice(*device_arm.queue, latents, length, condition, time_value,
-                                       config.transformer, *device_arm.dit)
-                    : DitForward(latents, length, condition, time_value, config.transformer,
-                                 weights.dit);
-      const std::vector<float> unconditional =
-          on_device ? DitForwardDevice(*device_arm.queue, latents, length, zero_condition,
-                                       time_value, config.transformer, *device_arm.dit)
-                    : DitForward(latents, length, zero_condition, time_value, config.transformer,
-                                 weights.dit);
+      std::vector<float> conditional;
+      std::vector<float> unconditional;
+      {
+        // ONE bracket over BOTH CFG branches, and the call count is therefore
+        // half the DiT forwards. `calls` x 2 is the forward count the spec
+        // (§14.6) quotes a per-forward figure against.
+        profile::Timer dit_timer(on_device ? "denoise.dit_device" : "denoise.dit_host");
+        conditional =
+            on_device ? DitForwardDevice(*device_arm.queue, latents, length, condition, time_value,
+                                         config.transformer, *device_arm.dit)
+                      : DitForward(latents, length, condition, time_value, config.transformer,
+                                   weights.dit);
+        unconditional =
+            on_device ? DitForwardDevice(*device_arm.queue, latents, length, zero_condition,
+                                         time_value, config.transformer, *device_arm.dit)
+                      : DitForward(latents, length, zero_condition, time_value,
+                                   config.transformer, weights.dit);
+      }
       const std::vector<float> velocity =
           ClassifierFreeGuidanceMix(conditional, unconditional, options.guidance_scale);
       latents = FlowMatchStep(latents, velocity, step, schedule);
@@ -359,7 +392,11 @@ std::vector<float> Music3DecodeChunks(const std::vector<std::vector<float>>& lat
       Fail("MiniMax-Music3: latent window " + std::to_string(k) + " is not rectangular");
     }
     int64_t samples = 0;
-    const std::vector<float> waveform = VocoderDecode(latents, length, config, weights, &samples);
+    std::vector<float> waveform;
+    {
+      profile::Timer vocoder_timer("vocoder.decode_window");
+      waveform = VocoderDecode(latents, length, config, weights, &samples);
+    }
     const WaveformCropSpan span = VocoderCropSpan(k, num_chunks, samples, hop);
     if (span.length() <= 0) {
       Fail("MiniMax-Music3: window " + std::to_string(k) + " crops to nothing (" +
@@ -515,7 +552,11 @@ class Music3SpeechEngine final : public multimodal::SpeechEngine {
   multimodal::SpeechResult Synthesize(const multimodal::SpeechGenParams& params) override {
     // Validate FIRST: every field refusal is free, and a caller learns its
     // request was malformed without waiting for 28.5 GB to stage.
+    profile::Begin();
+    profile::Mark("synthesize.enter");
     const Music3Request request = Music3ResolveRequest(params, config_.condition_encoder);
+    profile::Count("request.max_frames", request.max_frames);
+    profile::Count("request.steps", request.num_inference_steps);
 
     // ── the AUTOREGRESSIVE half (encoders.py) ────────────────────────────────
     //
@@ -537,14 +578,48 @@ class Music3SpeechEngine final : public multimodal::SpeechEngine {
       // `queue_` and the ONLY thing the device selector changes.
       //
       // WHAT MOVES: the 8.6B `Qwen3ForCausalLM` half, through the shared
-      // `Qwen3DenseModel::ForwardEmbeds` five registrations already ride. WHAT
-      // DOES NOT: the 0.65B RVQ depth decoder and the whole acoustic half,
-      // which are host reference loops — see minimax_music3_ar.h and
-      // vocoder1d.h for exactly which pieces are owed and why.
-      const Music3ArWeights ar = Music3LoadArWeights(paths_, config_);
+      // `Qwen3DenseModel::ForwardEmbeds` five registrations already ride, AND —
+      // since #1309 — the 0.65B RVQ depth decoder, which was 48.4 % of a run
+      // (spec §19.1). WHAT DOES NOT: the depth decoder's projection, audio
+      // heads and feedback embedding, ~1.6 % of that stage and owed by §19.7;
+      // and the whole acoustic half's host reference loops — see
+      // minimax_music3_ar.h and vocoder1d.h for which pieces are owed and why.
+      //
+      // NON-const, because the depth arm below STAGES OUT OF IT.
+      const auto load_t0 = profile::Now();
+      Music3ArWeights ar = Music3LoadArWeights(paths_, config_);
+      profile::AddSince("load.ar_weights", load_t0);
+      profile::Mark("ar.weights_loaded");
       const std::vector<int32_t> prompt_ids = ar.Encode(request.prompt);
-      Music3ArResult generated = Music3GenerateFrameHiddens(
-          prompt_ids, request.max_frames, ar, Music3SeededSampler(request.seed), queue_);
+
+      // THE PRODUCTION SELECTION for the depth decoder, on the SAME switch the
+      // DiT arm rides: `--speech-device 1` resolves `queue_` to the platform's
+      // device, and a non-CPU queue takes the device arm. There is no separate
+      // flag and no environment variable, because a capability behind an option
+      // nothing turns on is the shape `.agents/reachability.md` calls dead.
+      //
+      // The rule itself lives in `Music3SelectDepthArm` rather than in an `if`
+      // here, and that placement is the #1131 repair: the condition `queue_` has
+      // to satisfy is false on every runner CI owns, so a branch written at this
+      // line is unreachable from any gate, while the function is driven by
+      // `test_minimax_music3_ar` on both sides of it. The DiT block below still
+      // carries the untestable shape and #1131 still owns it.
+      //
+      // `release_host` is TRUE: the staged tensors are the ONLY thing the host
+      // append loop reads, and it is not called when the arm is engaged. The
+      // projection, the audio embeddings and the audio heads — which this stage
+      // still reads on the host — are not staged and are not released.
+      Music3DepthDeviceWeights staged_depth;
+      const Music3DepthDeviceArm depth_arm = Music3SelectDepthArm(
+          queue_, ar.depth_config, ar.depth, /*release_host=*/true, &staged_depth);
+      Music3ArResult generated;
+      {
+        profile::Timer ar_timer("ar.TOTAL_loop", /*span=*/true);
+        generated = Music3GenerateFrameHiddens(prompt_ids, request.max_frames, ar,
+                                               Music3SeededSampler(request.seed), queue_,
+                                               depth_arm);
+      }
+      profile::Mark("ar.loop_done");
       frame_hiddens = std::move(generated.frame_hiddens);
       frames = generated.frames;
       calls = generated.calls;
@@ -560,7 +635,12 @@ class Music3SpeechEngine final : public multimodal::SpeechEngine {
     // instead of OOM-killing (.agents/environment.md). `StageMusic3DitWeights`
     // drops each host tensor as it lands, so the peak is one tensor over the
     // 9.7 GB, not twice it.
+    profile::Mark("ar.weights_released");
+    profile::Count("ar.frames", frames);
+    const auto acoustic_t0 = profile::Now();
     Music3AcousticWeights acoustic = Music3LoadAcousticWeights(paths_, config_);
+    profile::AddSince("load.acoustic_weights", acoustic_t0);
+    profile::Mark("acoustic.weights_loaded");
     Music3DenoiseOptions options;
     options.num_inference_steps = request.num_inference_steps;
     options.guidance_scale = request.guidance_scale;
@@ -578,19 +658,29 @@ class Music3SpeechEngine final : public multimodal::SpeechEngine {
     Music3DitDeviceWeights staged_dit;
     Music3DenoiseDeviceArm arm;
     if (queue_.device.type != vt::DeviceType::kCPU) {
+      profile::Timer stage_timer("acoustic.dit_staging");
       staged_dit = StageMusic3DitWeights(queue_, config_.transformer, acoustic.dit,
                                          /*release_host=*/true);
       arm.queue = &queue_;
       arm.dit = &staged_dit;
     }
-    const std::vector<std::vector<float>> chunks =
-        Music3DenoiseChunks(frame_hiddens, frames, config_, acoustic, options,
-                            Music3SeededNoise(request.seed), arm);
+    profile::Mark("acoustic.dit_staged");
+    std::vector<std::vector<float>> chunks;
+    {
+      profile::Timer denoise_timer("denoise.TOTAL", /*span=*/true);
+      chunks = Music3DenoiseChunks(frame_hiddens, frames, config_, acoustic, options,
+                                   Music3SeededNoise(request.seed), arm);
+    }
+    profile::Mark("denoise.done");
+    profile::Count("denoise.windows", static_cast<int64_t>(chunks.size()));
 
     int64_t samples = 0;
     multimodal::SpeechResult out;
-    out.samples =
-        Music3DecodeChunks(chunks, config_.vocoder, acoustic.vocoder, &samples);
+    {
+      profile::Timer decode_timer("vocoder.TOTAL", /*span=*/true);
+      out.samples = Music3DecodeChunks(chunks, config_.vocoder, acoustic.vocoder, &samples);
+    }
+    profile::Mark("vocoder.done");
     // spec §1.1: the vocoder's NATIVE rate, resample-free. The 32 kHz form is a
     // downstream delivery transform and the caller's decision, which is exactly
     // what `SpeechResult`'s own contract says `sample_rate` means.
@@ -602,6 +692,8 @@ class Music3SpeechEngine final : public multimodal::SpeechEngine {
            " values for " + std::to_string(samples) + " frames of " +
            std::to_string(kMusic3Channels) + "-channel audio");
     }
+    profile::Count("output.samples_per_channel", samples);
+    profile::Report("MiniMax-Music3 synthesize");
     return out;
   }
 

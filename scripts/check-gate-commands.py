@@ -152,6 +152,61 @@ def runnable_commands(section: str) -> list[str]:
     return good
 
 
+# A `Gates` section is a numbered list, and each item opens with a BOLD LEAD that
+# titles it. These three functions exist so a test can key on that structure
+# instead of on a sentence -- see .agents/specs/fix-gate-commands-prose-pin.md.
+#
+# They are DELIBERATELY not wired into `ratchet_errors`. A rule saying every gate
+# item without a runnable command must declare a disposition is red on arrival for
+# items this repo writes in prose rather than quoting (`Red first.`,
+# `CUDA compile.`), and this file's own header records that a gate which has to be
+# relaxed to pass is worse than no gate. That sweep is owed with its own survey.
+_GATE_ITEM = re.compile(r"(?m)^\d+\.\s")
+# The lead is a single-line title. A lead that does not close on its own line
+# returns None, which reads downstream as "declares no disposition" and takes a
+# gate RED rather than green. That is the safe direction for an unparsed record.
+_ITEM_LEAD = re.compile(r"^\d+\.\s+\*\*(.+?)\*\*")
+# A CLOSED, small vocabulary, matched in the LEAD ONLY. A status word in the lead
+# is a declaration ABOUT the gate. The same word in the body is ordinary prose
+# describing what the gate does, and crediting it would make this stop detecting
+# silence. Scope is MEASURED, not assumed: surveyed over every `Gates` section in
+# .agents/specs/ on 2026-08-18, 32 of 323 gate items GAIN a disposition when the
+# search widens from the lead to the whole item -- `**No regression:**` in
+# cpu-elementwise-gemm.md and `**Correctness gate:**` in dropin-kernel-abi.md both
+# pick up `pass` out of body prose. The row that motivated this file is NOT one of
+# the 32; that was the first hypothesis and the survey refuted it.
+_DISPOSITION = re.compile(
+    r"(?i)\b(owed|waived|blocked|deferred|superseded|not gated|ran|pass|passed|failed)\b"
+)
+
+
+def gate_items(section: str) -> list[str]:
+    """The numbered items of a `Gates` section, in order."""
+    starts = [m.start() for m in _GATE_ITEM.finditer(section)]
+    ends = starts[1:] + [len(section)]
+    return [section[a:b].rstrip() for a, b in zip(starts, ends)]
+
+
+def item_lead(item: str) -> str | None:
+    """The bold lead that titles one gate item, or None if it has no closed lead."""
+    match = _ITEM_LEAD.match(item)
+    return match.group(1) if match else None
+
+
+def gate_disposition(item: str) -> str | None:
+    """The status this gate item DECLARES in its lead, or None if it declares none.
+
+    `None` is the finding this exists to report: a gate item that names no
+    disposition and yields no runnable command is a leg the record is silent
+    about, and a reader of a credited row infers coverage nobody claimed.
+    """
+    lead = item_lead(item)
+    if lead is None:
+        return None
+    match = _DISPOSITION.search(lead)
+    return match.group(1) if match else None
+
+
 def classify_row(row) -> tuple[str, str]:
     specs = [p for p in record.local_spec_paths(row) if p.is_file()]
     if not specs:
@@ -291,6 +346,15 @@ def audit() -> list[dict]:
 # focused test file, and records that no CUDA/GPU/SACRED/oracle gate is
 # implicated because the change is argument parsing and reaches no forward pass.
 # Growth from a lifecycle move, so the set is re-pinned in the same change.
+# 2026-08-14: +ENG-RECORD-ANCHOR-RATCHET. The row leaves SPIKE for ACTIVE on its
+# implementation (issue #632), which puts it in GATED_STATES for the first time.
+# Its spec's Gates section names five invocations, and this is a STRONG credit
+# rather than one of the weak ones described above: the row's gate IS
+# `scripts/check-agent-record.py`, so the credited command is the thing under
+# test, and it fails on either direction of the ratchet. The suite
+# (`tests/scripts/test_agent_record.py`) is proven red against the BASE checker
+# by `scripts/check-pr-size.py`, which is itself one of the five. Growth from a
+# lifecycle move, so the set is re-pinned in the same change.
 # 2026-08-16: +SPEC-MTP-K-GT-1. A NEW row arriving at ACTIVE (issue #81), so it
 # enters GATED_STATES for the first time. Its spec's Gates section names
 # `scripts/agent-preflight.sh` plus the built CPU suite (493 passed / 0 failed /
@@ -311,10 +375,49 @@ def audit() -> list[dict]:
 # reproduction through the JSON form is recorded as OWED rather than skipped
 # because dgx.casa was unreachable at the SSH layer. Growth, so the set is
 # re-pinned in the same change.
+# 2026-08-18: +ENG-CUDAGRAPH-DEDUP. A NEW row arriving at ACTIVE (issue #1162),
+# so it enters GATED_STATES for the first time. Its spec's Gates section names
+# `ctest -R test_graph_dedup` and `scripts/agent-preflight.sh`, both of which
+# genuinely fail when the row regresses -- the focused suite detected 9 of 9
+# negative mutations of the registry it gates. It also records what is NOT
+# claimed and why: the device byte-identity A/B needs a leased CUDA box this
+# session did not have, so it is carried under the spec's `## Owed` rather than
+# reported as run, and the CUDA leg's compile rests on the `cuda-fat-build` CI
+# job. Growth, so the set is re-pinned in the same change.
+# 2026-08-18: +ENG-HF-MODEL-DOWNLOAD. A NEW row arriving at READY (issue #1280),
+# so it enters GATED_STATES for the first time. Its spec's Gates section names
+# `scripts/validate-container-image.py`, which boots the image and asserts the
+# failure for an unknown repository is an HTTP 404 from the hub rather than the
+# message that names the build options. That distinction is the point: a symbol
+# check passes on a build where `VLLM_CPP_HF_DOWNLOAD` resolved OFF, so the
+# container gate is the only instrument that separates a working TLS build from
+# a silently disabled one. The section also records what the runnable gates do
+# NOT cover: the hermetic suite speaks plain hypertext transfer protocol, so it
+# proves nothing about transport layer security, and the second instrument is an
+# opt-in online test that does not run in the default lane. Growth, so the set
+# is re-pinned in the same change.
+# 2026-08-19: +ENG-CUDAGRAPH-BREAK, and this entry is a REPAIR rather than a
+# landing. W5 of that row (#1361, commit 601b576c6) filled its spec's Gates
+# section with runnable evidence, including a named test binary with its case
+# and assertion counts and an exit status, which is what moves a row into the
+# runnable population. The re-pin this ratchet's own error text demands was not
+# made in that change, so `main` itself has been red on
+# tests/scripts/test_check_gate_commands.py since it landed: 8 failures of 44,
+# every one a comparison between the computed runnable set and this pin,
+# measured in a detached worktree of origin/main. The continuous integration
+# lane that would have caught it independently has not executed for this
+# repository since roughly 07:43Z that day, so the change landed with no remote
+# verdict. Found while merging origin/main into row/ENG-HF-MODEL-DOWNLOAD and
+# fixed in that flow under #1376, because the fix is small and clear and a red
+# main blocks every other row's gate. Growth, so the set is re-pinned.
 RUNNABLE_BASELINE = frozenset({
+    "ENG-CUDAGRAPH-BREAK",
+    "ENG-HF-MODEL-DOWNLOAD",
     "ENG-RESIDENCY-CONFIG",
+    "ENG-CUDAGRAPH-DEDUP",
     "SPEC-MTP-K-GT-1",
     "ATTN-CHUNKED-LOCAL",
+    "ENG-RECORD-ANCHOR-RATCHET",
     "SERVE-RECIPE-ARGS",
     "ENG-FORGE-COAUTHOR",
     "ENG-RECORD-CONFLICT-SURFACES",
@@ -357,6 +460,16 @@ RUNNABLE_BASELINE = frozenset({
     "SERVE-ASYNC-LLM",
     "SERVE-STREAM-USAGE",
     "TOOLS-STREAMING-PARSER",
+    # SPEC-BPE-QUADRATIC-MERGE (2026-08-19, issue #1365): GROWTH, re-pinned in
+    # the same change. The row was gated and command-free; its spec's `## Gates`
+    # now carries the `g++` build and the two run lines for
+    # `tools/bench/bpe_encode_cost.cpp`, the harness that replaces three
+    # prose-only ones, so the section names a command that can fail and the row
+    # joins this population. Named here so the growth is not silent: the harness
+    # itself is deliberately NOT a gate -- the row rules that a growth assertion
+    # over its figures is not viable on a shared runner -- and what became
+    # runnable is the RECIPE the section owes under AGENTS.md §Gates.
+    "SPEC-BPE-QUADRATIC-MERGE",
 })
 
 
