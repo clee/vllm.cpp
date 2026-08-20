@@ -155,9 +155,12 @@ to answer — did not run. One clause names the reason and keeps the reader out 
 **Why the banner's wording changes.** After the gate is corrected the banner
 only ever prints where the host may address device memory, so "correct" is true
 again. It is still the wrong sentence to leave behind: it asserts correctness
-without naming what makes it correct, and both #844 and `docs/USAGE.md` quote
-those three words as the thing that misled a reader. The replacement names the
-precondition, which is a fact the reader can check.
+without naming what makes it correct, and both #844 and `docs/USAGE.md` quoted
+those three words as the thing that misled a reader. `docs/USAGE.md` no longer
+quotes them: [#1491](https://github.com/mudler/vllm.cpp/pull/1491) retired the
+section that did, which is why this row edits the banner and not that file. #844
+still carries the quote. The replacement names the precondition, which is a fact
+the reader can check.
 
 ## Risks
 
