@@ -72,6 +72,7 @@ using vt::cuda::Fp8BlockScaledRefusal;
 using vt::cuda::Fp8BlockScaledRefusalFor;
 using vt::cuda::Fp8BlockScaledStats;
 using vt::cuda::Fp8BlockScaledStatsSnapshot;
+using vt::cuda::kFp8BlockScaledScaleBlockN;
 
 bool HasCuda() {
   try {
@@ -312,6 +313,17 @@ const std::vector<BlockCase>& Grid() {
       {83, 512, 1024, 128, 128},    // swapab: M > 64 but 83 % 4 != 0
       {200, 512, 1024, 128, 128},   // pingpong: M > 64, 200 % 4 == 0, M <= 256
       {512, 512, 1024, 128, 128},   // default: M > 256
+      // THE N FLOOR, AND THE ONLY ENTRY THAT BINDS OVER-REFUSAL. Every other
+      // servable N here is 512, and 512 is a multiple of 256, 128 and 64 alike,
+      // so a `kFp8BlockScaledScaleBlockN` raised above 128 -- a predicate that
+      // turns away shapes the collective CAN implement -- left this whole file
+      // green while refusing real work. 128 is the smallest N the sm120
+      // collective serves: one complete scale block, and exactly one N-tile of
+      // the pingpong config. M = 200 is reused from the entry above on purpose
+      // (200 > 64, 200 % 4 == 0, 200 <= 256, so `Fp8BlockScaledConfigFor` names
+      // pingpong for both) -- this entry is an N-axis probe and adds no new M
+      // behaviour to the sweep.
+      {200, 128, 1024, 128, 128},   // pingpong, N at the collective's floor
       // ragged N on the UNSWAPPED path: M=512 takes `default`, where the ragged
       // extent is the collective's own N at ScaleGranularityN=128 rather than its
       // M under swap. Same number, different slot, same refusal — which is what
@@ -365,7 +377,7 @@ TEST_CASE("G6 every shape this file drives gets the refusal the collective gives
   // stop testing the refusal, and a grid that drifted to all-refused would leave
   // G7 with nothing to compare against the CPU reference while still reporting a
   // pass — which is the exact shape of the failure #1437 found.
-  CHECK(servable >= 5);
+  CHECK(servable >= 6);
   CHECK(scale_block_n >= 2);
   CHECK(tile_k >= 1);
   CHECK(servable + scale_block_n + tile_k == Grid().size());
@@ -390,6 +402,16 @@ TEST_CASE("G6 every shape this file drives gets the refusal the collective gives
   CHECK(swap);
   CHECK(ping);
   CHECK(deflt);
+  // AND THE SERVABLE LANE REACHES THE N FLOOR, which is what makes the partition
+  // above bind in the OVER-refusal direction. A grid whose servable N is 512
+  // everywhere cannot tell 128 from 256 or 64: raise
+  // `kFp8BlockScaledScaleBlockN` to 256 and every check in this file still
+  // passes, because 512 % 256 == 0. One servable entry at N = 128 fails the
+  // moment the predicate refuses more than the collective does.
+  bool servable_at_n_floor = false;
+  for (const BlockCase& c : ServableGrid())
+    if (c.n == kFp8BlockScaledScaleBlockN) servable_at_n_floor = true;
+  CHECK(servable_at_n_floor);
   // The refused half spans the SWAPPED and the UNSWAPPED path, so "the swap is
   // the bug" is falsifiable rather than merely unasserted. A ragged N is refused
   // on both, because it is the collective's M under swap and its N without it,

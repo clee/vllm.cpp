@@ -159,14 +159,21 @@ its f32 sinks, and recorded here for the same reason: nothing widens the GEMM,
 the extra width buys no precision, and a reader must not mistake the f32 sink
 for an f32 compute path. One instantiation per config, three in total.
 
-### Ragged edges — supported, with the refusal upstream itself takes
+### Ragged edges — refused by name, at two different floors
 
-**Ragged block boundaries are SUPPORTED.** `tile_atom_to_shape_SFB` sizes the
-scale grid with `ceil_div(N, 128)`, so a short final N-block is expressible and
-CUTLASS predicates it. That is not inference: upstream's own CUTLASS test is
-`M=32, N=576, K=7168` — `576 = 4*128 + 64` — chosen because DSV3's
-`kv_a_proj_with_mqa` has that shape, and it asserts against the same reference
-this arm is measured against. G2 ports that case whole.
+**Ragged block boundaries are REFUSED on sm120, and this section said the
+opposite until [#1437](https://github.com/mudler/vllm.cpp/issues/1437).**
+`tile_atom_to_shape_SFB` does size the scale grid with `ceil_div(N, 128)`, so a
+short final N-block is EXPRESSIBLE — that part was right, and it is why the
+error looked safe. It is not sufficient: `sm120_mma_tma_blockwise_scaling.hpp`'s
+`can_implement` refuses the configuration three lines further down, requiring
+`N % ScaleGranularityN == 0` and `K % size<2>(TileShape{}) == 0`, and the sm90
+sibling requires neither. Upstream's own CUTLASS test is `M=32, N=576, K=7168` —
+`576 = 4*128 + 64` — chosen because DSV3's `kv_a_proj_with_mqa` has that shape,
+and on sm120 that shape cannot reach the GEMM at all. The full derivation, per
+config, is in `## Owed` below; `kScaleBlockN` and `kTileK` are that refusal, G4
+pins both by message and G6 pins the grid's partition. G2 ports upstream's case
+as a REFUSAL plus upstream's fixture on the nearest servable `N`.
 
 **The CUTLASS ALIGNMENT floor is refused by name.** `AlignmentA` and
 `AlignmentB` are `128 / sizeof_bits<e4m3>` = 16 elements, and both operands
@@ -199,6 +206,19 @@ blockwise config is built at `(1, 128, 128)` or `(128, 1, 128)`. The loader
 already refuses a `weight_block_size` other than `[128, 128]` at load
 (#1189 M3), so this is the same refusal restated where the kernel can see it,
 not a new limit.
+
+**`Fp8BlockScaledRefusalFor` takes `(n, k, block_n, block_k)` and cannot ask
+about `m`.** That is correct today and it is a claim about the CONFIGS, not
+about the predicate: `can_implement` meets `m` at granularity 1 on the unswapped
+path and at granularity 1 under swap, so there is nothing for a fourth parameter
+to ask. A fourth config with `ScaleGranularityM != 1` unswapped — or
+`ScaleGranularityN != 1` swapped — would bind `m`, and the signature would then
+have to change. That condition is not left to a comment:
+`cuda_matmul_fp8_block_cutlass.cu` `static_assert`s it against the three
+configs' own granularities and against `size<2>(TileShape{})`, the same
+expression `can_implement` uses, so the constant cannot agree with the config by
+having been copied from it. A config that broke the tie fails the build rather
+than the fleet.
 
 ### The host-side decision is a pure function, and it is where the gate lands
 
@@ -380,6 +400,16 @@ builds it and a leased box runs it.
   that the servable half still covers all three tile configs, and that the
   refused half spans the swapped AND the unswapped path — the last being what
   makes "the swap is the bug" falsifiable rather than merely unasserted.
+  **The servable half reaches `N = 128`, and that entry is what binds
+  OVER-refusal.** A grid whose every servable `N` is 512 cannot tell 128 from
+  256, because `512 % 256 == 0`: raising `kFp8BlockScaledScaleBlockN` to 256 —
+  a predicate that turns away shapes the collective CAN implement — left this
+  whole file green at `37 | 37 passed`, and only one host-tier boundary
+  assertion caught it. `{200, 128, 1024}` is servable, sits at the collective's
+  own floor of one complete scale block, reuses an `M` already in the sweep so
+  it adds no new `M` behaviour, and fails the moment the predicate refuses more
+  than `can_implement` does. G6 asserts that such an entry EXISTS, so it cannot
+  silently drift out of the grid again.
 - **G7** the M sweep: `M` at 1, 7, 8, 32, 83, 200, 512 against the same
   reference, so all three configs are exercised, with the counter asserted to
   show the config `Fp8BlockScaledConfigFor` predicted for each. Since #1437 the

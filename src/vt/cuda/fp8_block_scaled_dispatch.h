@@ -195,6 +195,16 @@ enum class Fp8BlockScaledRefusal : uint8_t {
 // (`_custom_ops.py`, `cutlass_compatible_b`), and `% 128` is CUTLASS's sm120
 // line, which upstream never reaches because it never asks. Both messages name
 // the other, so neither answer sends a reader to a shape that is still refused.
+// THE SIGNATURE HAS NO `m`, AND THAT IS A CLAIM ABOUT THE CONFIGS rather than
+// about this function. `can_implement` constrains `m` in none of the three —
+// the granularity `m` meets is 1 on the unswapped path and 1 under swap, worked
+// through at `kFp8BlockScaledScaleBlockN` above — so there is nothing for a
+// fourth parameter to ask. A config with `ScaleGranularityM != 1` unswapped, or
+// `ScaleGranularityN != 1` swapped, WOULD bind `m`, and this signature would
+// then have to change. That condition is not left to this comment:
+// `src/vt/cuda/cuda_matmul_fp8_block_cutlass.cu` static_asserts it against the
+// three configs' own granularities and TileShapes, so a config that broke it
+// fails the build rather than the fleet.
 inline Fp8BlockScaledRefusal Fp8BlockScaledRefusalFor(int64_t n, int64_t k, int block_n,
                                                       int block_k) {
   if (block_n != kFp8BlockScaledBlockN) return Fp8BlockScaledRefusal::kBlockN;
