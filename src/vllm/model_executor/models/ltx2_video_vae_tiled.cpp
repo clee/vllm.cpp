@@ -249,6 +249,16 @@ void Ltx2ConvVideoDecodeTiled(const Ltx2ConvVideoDecoderConfig& config,
     // both ends. One record per temporal group, which is one record per chunk
     // the sink is handed, so the count is a quantity the instrument cannot move.
     // Nested, so the table's sum does not change.
+    //
+    // THE PLACEMENT IS GATED BY A COVERAGE FLOOR AND NOT BY THE COUNT ALONE.
+    // Moving this scope one statement up, onto `buffer.Allocate`, keeps the
+    // count, the `nested` flag and the containment in a chunk window — and a
+    // fourth fresh review measured what that costs: `decode.video.vae = 0.000 s`
+    // beside a five-millisecond `decode.video`, with the tile decode inside no
+    // sub-scope, both gates green. `test_ltx2_video`'s containment case now
+    // requires these records to cover at least half of the render's
+    // `decode.video.chunk` seconds (measured 91.1%-98.6%), so an anchor that
+    // sits BESIDE the work rather than ON it is a red.
     std::vector<float> curr_weights;
     {
       const ::vllm::multimodal::phase::Scope vae_phase("decode.video.vae");

@@ -4547,6 +4547,15 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
   // `AccumulateTemporalGroup`, so `decode.video` has one sub-scope whose ends
   // are both production events; and the gate asserts that nothing but an anchor
   // is emitted NESTED, which is what a swallowed `artifacts.frames` becomes.
+  //
+  // AND THE VAE SUB-SCOPE IS HELD BY A COVERAGE FLOOR, not by its existence. A
+  // fourth fresh review moved that scope off `AccumulateTemporalGroup` and onto
+  // the `buffer.Allocate` beside it — seven lines — and the table reported
+  // `decode.video.vae = 0.000 s` beside a five-millisecond `decode.video`, with
+  // the tile decode inside no sub-scope at all and both gates green, because the
+  // vae anchor was checked for cardinality, `nested` and containment and its
+  // DURATION was compared against nothing. The gate now requires it to cover at
+  // least half of this render's `decode.video.chunk` seconds.
   size_t chunk_handle =
       phase::PhaseLog::Instance().Open("decode.video.chunk", /*span=*/false);
   Ltx2VideoDecodeStreaming(

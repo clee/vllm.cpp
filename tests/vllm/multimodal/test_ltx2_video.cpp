@@ -2925,8 +2925,14 @@ TEST_CASE("ltx2 video: a render through the ABI emits a phase table that SUMS to
 //       measured from — because a swallowed neighbour turns `nested`, leaves the
 //       sum, and overlaps nothing.
 //
-// So the case now asserts SIX things, and the first and the sixth are the ones
-// that are not ratios:
+// So the case now asserts the list below, over TWO renders. Read it by what each
+// item is measured against, because that is what decides which defect it can
+// see. (0), (1b) and (5) are measured against nothing the instrument controls —
+// a count the render kept, an order the driver runs in, a flag the emitter sets
+// — and they are the three that survive an anchor moving with its leaf. (1),
+// (2), (3) and (4) are ratios against the anchor. (6) is a ratio between two
+// anchors, which is a weaker guarantee than (0) and a stronger one than nothing,
+// and nothing was what held it before.
 //
 //   0. RECORD COUNT   the anchor runs once per unit of work the RENDER counted.
 //                     `denoise.step` once per `Ltx2ConditioningTrace::
@@ -2944,6 +2950,15 @@ TEST_CASE("ltx2 video: a render through the ABI emits a phase table that SUMS to
 //                   chunk BACK, which is a production event and not an
 //                   instrument statement. `decode.audio.mel` and
 //                   `decode.audio.vocoder` wrap the two calls #1010 names.
+//  1b. SIBLING ORDER two sub-scopes of one leaf appear in the order the driver
+//                   runs them, compared on each name's first record. NOTHING
+//                   ELSE TIES A SUB-SCOPE NAME TO A POSITION — the counts are
+//                   per name, containment holds for either, the intervals are
+//                   sorted before the overlap check, and the nested check is a
+//                   set membership — so swapping the `decode.audio.mel` and
+//                   `decode.audio.vocoder` literals moved 96.8% of that leaf's
+//                   decomposed seconds onto the wrong name with everything
+//                   green. This is what N1 fails.
 //   2. COVERAGE     the sub-scopes together account for nearly all of the leaf,
 //                   so a leaf that encloses its own work PLUS a phase nobody
 //                   named still fails. The threshold is per phase and is set
@@ -2965,6 +2980,21 @@ TEST_CASE("ltx2 video: a render through the ABI emits a phase table that SUMS to
 //                     `AccumulateTemporalGroup`, so that leaf has one sub-scope
 //                     whose ends are both production events rather than
 //                     statements adjacent to its own.
+//   6. VAE COVERAGE   `decode.video.vae` must cover at least half of this
+//                     render's `decode.video.chunk` seconds. Until this landed
+//                     the vae anchor was held by cardinality, `nested` and
+//                     containment alone and its DURATION was compared against
+//                     nothing, so moving it one statement up onto
+//                     `buffer.Allocate` reported `decode.video.vae = 0.000 s`
+//                     beside a five-millisecond `decode.video` with the tile
+//                     decode inside no sub-scope, both gates green. N6.
+//   7. THE COUNTS AT N > 1. The case renders twice — nine frames, which decode
+//                     in one temporal chunk, and 81, which chunk — and runs
+//                     assertions 0 through 6 over each render of one table.
+//                     Every decode-side count was previously 1 or 1+1, which
+//                     cannot distinguish "once per unit of work" from "once per
+//                     render". Both lookups are filtered by the record's
+//                     `render` field; see `RecordsNamed`.
 //
 // WHAT WAS TRIED FIRST AND REJECTED, MEASURED RATHER THAN ARGUED. The obvious
 // repair is a differential: render at two frame counts and require the phases
