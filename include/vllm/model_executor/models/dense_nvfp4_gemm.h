@@ -765,18 +765,28 @@ inline DBuf GateUpFusedMarlinD(Dev d, const Tensor& x, const Nvfp4Weight& gw,
 // A token gate cannot see any of that: the fallback computes the SAME value.
 // One expression with two call sites is what makes the two unable to drift.
 inline bool MarlinW4A16Selects(Dev d, DType act_dtype) {
-#ifdef VT_MARLIN_NVFP4
-  // The device clause is an OP-AVAILABILITY question, not a `== kCUDA` one: ask
-  // the vt::OpProvider table whether the Marlin NVFP4 grouped GEMM is realized
-  // for this device (registered only for kCUDA today, so this is byte-identical
+  // NO `#ifdef VT_MARLIN_NVFP4` HERE, and the absence is the design. This site
+  // only SELECTS a path, and every term it reads exists in every build:
+  // `MarlinW4A16Enabled()` is declared above the guarded region, and
+  // `vt::OpRegistered` IS the op/provider table's own answer to "is the Marlin
+  // arm realized for this device".
+  //
+  // The build flag and the registration are the SAME condition, so the guard
+  // would decide nothing the query does not already decide. `CMakeLists.txt`'s
+  // one `if(VLLM_CPP_MARLIN)` block adds `src/vt/cuda/cuda_moe_marlin.cu` —
+  // whose file-scope `Registrar` holds the tree's only
+  // `RegisterOp(OpId::kMoeGroupedGemmNvfp4Marlin, …)` — and defines
+  // `VT_MARLIN_NVFP4=1`, in that same block. A build without the macro
+  // therefore registers nothing, and this resolves false on exactly the builds
+  // a `#ifdef` would have excluded. Asking the table rather than the
+  // preprocessor is what `scripts/check-device-leakage.py` asks of a selection,
+  // and it is the call `nemotron_h_device.cpp`'s `moe_on_device` already made.
+  //
+  // The device clause is likewise an OP-AVAILABILITY question, not a
+  // `== kCUDA` one (registered only for kCUDA today, so this is byte-identical
   // on the production build — accelerator-seam audit class A, work row S4).
   return vt::OpRegistered(vt::OpId::kMoeGroupedGemmNvfp4Marlin, d.q.device.type) &&
          MarlinW4A16Enabled() && act_dtype == DType::kBF16;
-#else
-  (void)d;
-  (void)act_dtype;
-  return false;
-#endif
 }
 
 // y[M,N] = x[M,K] @ dequant(w).T for an NVFP4 W4A16 weight. Mirrors vLLM's

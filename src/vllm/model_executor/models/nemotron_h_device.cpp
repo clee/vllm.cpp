@@ -880,8 +880,17 @@ std::vector<float> NemotronHMoeBlockDeviceHostIO(const NemotronHMoeWeights& w,
 // A2-Q2a made the same call for the MoE arena; this keeps the two arms
 // consistent, and it leaves #984 exactly as it was for every other caller
 // (which is where its own two-engine red-before belongs).
-#ifdef VT_MARLIN_NVFP4
+
 // A transient `Nvfp4Weight` VIEW over the host `lm_head` payload.
+//
+// UNGUARDED, unlike the arena helpers above, because it names nothing that the
+// Marlin build adds: `Nvfp4Weight` comes from qwen3_5_weights.h and
+// `OwnedBytes` from the loader, both unconditional, and no `vt::cuda::` symbol
+// appears below. A `#ifdef` here would have been a device-specific reference
+// paying for nothing — the one thing `scripts/check-device-leakage.py` counts.
+// It has external linkage at `namespace vllm` scope, so a build without
+// VT_MARLIN_NVFP4, where its single call site below is compiled out, emits no
+// unused-function diagnostic.
 //
 // It BORROWS: `Nvfp4Weight` wants `OwnedTensor`s and `NemotronHOwned` already
 // holds the packed codes and the group scales in exactly the layout
@@ -929,7 +938,6 @@ Nvfp4Weight LmHeadNvfp4View(const NemotronHOwned& w, int64_t V, int64_t H) {
   // fields are left at their defaults deliberately rather than set to 0 twice.
   return nw;
 }
-#endif
 
 // True when the DEVICE `lm_head` arm can serve this weight on this queue.
 //
@@ -982,6 +990,7 @@ void GatherRowsD(Dev d, void* dst, const Tensor& src, const std::vector<int64_t>
 // (opt.cpp:308, minicpm3.cpp:303).
 DBuf DeviceLmHeadD(Dev d, const NemotronHHostWeights& host,
                    const NemotronHParams& params, const Tensor& gathered) {
+// DSR-ALLOW(A2-Q2b): TYPES, not behaviour -- this body names two symbols that do not EXIST without the guarded arena region above: the `ResidentIn` template, which is defined INSIDE that region, and `dense_nvfp4::MarlinDenseResident`, which dense_nvfp4_gemm.h DECLARES unconditionally but DEFINES only under VT_MARLIN_NVFP4, so the reference `ResidentIn` returns cannot bind to an incomplete type. The SELECTION is already a runtime op-table query: `DeviceLmHeadEligible` calls `dense_nvfp4::MarlinW4A16Selects`, which carries NO guard, and only this call site needs one. It has an #else that refuses BY NAME, so a build without Marlin reports the missing arm rather than silently computing on the host. Same shape and same reason as the `NemotronHMoeBlockDeviceD` body and the `moe_on_device` dispatch branches.
 #ifdef VT_MARLIN_NVFP4
   const int64_t V = params.vocab_size;
   const int64_t H = params.hidden_size;
