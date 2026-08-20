@@ -7081,13 +7081,20 @@ DBuf MoeBlockBf16Cuda(Dev d, const MoeBlockWeights& w, const HfConfig& cfg,
 //
 // Record (little-endian, the host's own byte order on every target here):
 //   u32 call, u32 T, u32 E, u32 K, u32 H
+//   u32 w_nk, u32 w_dtype, u64 w_bytes, u64 w_hash   the router GATE fingerprint
 //   u16 hidden[T*H]   the bf16 router GEMM INPUT
 //   u16 logits[T*E]   the bf16 router GEMM OUTPUT
 //   i32 ids[T*K]      the selected experts
 //   f32 wts[T*K]      the renormalized weights
 // Dumping the INPUT as well as the output is what separates "the router GEMM
-// disagrees" from "the hidden state that reached it already disagreed".
+// disagrees" from "the hidden state that reached it already disagreed", and the
+// gate fingerprint separates both from "the LOADER gave the two arms different
+// router weights" -- the residency policy is resolved per PLATFORM, so that is a
+// real third possibility rather than a hypothetical one. `w_bytes == 0` means
+// the host staging buffer was released after a direct-device load, which is
+// itself an arm difference worth seeing; it is not a hash of nothing.
 void RouterObserve(int64_t T, int64_t E, int64_t top_k, int64_t H,
+                   const OwnedTensor& router_gate,
                    const std::vector<uint16_t>& hidden,
                    const std::vector<uint16_t>& logits,
                    const std::vector<int32_t>& ids,
@@ -7101,7 +7108,7 @@ void RouterObserve(int64_t T, int64_t E, int64_t top_k, int64_t H,
       return nullptr;
     }
     const char magic[4] = {'V', 'T', 'R', 'D'};
-    const uint32_t version = 1;
+    const uint32_t version = 2;
     std::fwrite(magic, 1, 4, h);
     std::fwrite(&version, sizeof(version), 1, h);
     return h;
@@ -7117,6 +7124,21 @@ void RouterObserve(int64_t T, int64_t E, int64_t top_k, int64_t H,
   const uint32_t hdr[5] = {call, static_cast<uint32_t>(T), static_cast<uint32_t>(E),
                            static_cast<uint32_t>(top_k), static_cast<uint32_t>(H)};
   std::fwrite(hdr, sizeof(uint32_t), 5, f);
+  // FNV-1a over the gate's host bytes. Not a cryptographic hash and does not
+  // need to be: it answers "did the two arms multiply by the same numbers".
+  const uint64_t wb = router_gate.host_released
+                          ? 0
+                          : static_cast<uint64_t>(router_gate.bytes.size());
+  uint64_t wh = 1469598103934665603ULL;
+  for (uint64_t i = 0; i < wb; ++i) {
+    wh ^= static_cast<uint64_t>(router_gate.bytes.data()[i]);
+    wh *= 1099511628211ULL;
+  }
+  const uint32_t whdr[2] = {static_cast<uint32_t>(router_gate.nk ? 1 : 0),
+                            static_cast<uint32_t>(router_gate.dtype)};
+  std::fwrite(whdr, sizeof(uint32_t), 2, f);
+  std::fwrite(&wb, sizeof(wb), 1, f);
+  std::fwrite(&wh, sizeof(wh), 1, f);
   std::fwrite(hidden.data(), sizeof(uint16_t), hidden.size(), f);
   std::fwrite(logits.data(), sizeof(uint16_t), logits.size(), f);
   std::fwrite(ids.data(), sizeof(int32_t), ids.size(), f);
@@ -7175,7 +7197,7 @@ DBuf MoeBlock(Dev d, const MoeBlockWeights& w, const HfConfig& cfg,
   dtid.Download(d, ids.data());
   // OBSERVER ONLY (#1299): every argument is already computed and is not read
   // back; unset VT_ROUTER_DUMP makes this a null-pointer test.
-  RouterObserve(T, E, top_k, H, h, logits, ids, weights);
+  RouterObserve(T, E, top_k, H, w.router_gate, h, logits, ids, weights);
 
   // Activated-expert gather: per expert, the (token, slot) pairs routed to it.
   std::vector<std::vector<std::pair<int64_t, int64_t>>> lists(
