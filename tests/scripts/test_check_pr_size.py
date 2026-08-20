@@ -501,9 +501,11 @@ class BudgetEnforcement(unittest.TestCase):
             "scripts/check-symbol-anchors.py",
             # 2026-08-20: the conflict-marker gate (#1417). Created in the same
             # range, so it has no BASE version to mutate. The disabled stub
-            # exits 0 and prints nothing, which fails every case that runs the
-            # checker, because each one reads an exit code or an examined count
-            # that silence cannot produce.
+            # exits 0 and prints nothing, which fails 16 of its 21 cases --
+            # measured. The five that survive assert only that an ordinary
+            # document exits 0, or read no checker at all, so silence satisfies
+            # them; every case that reads an exit code of 1 or an examined count
+            # goes red.
             "scripts/check-conflict-markers.py",
         }
         self.assertEqual(set(checker.CREATION_MUTATIONS), expected)

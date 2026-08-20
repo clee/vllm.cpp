@@ -133,6 +133,21 @@ The scan reads bytes and never decodes a whole file. Decoding 142 MB of tracked
 text to find a marker in none of it cost more than reading it: 0.9 s of CPU
 against 0.29 s.
 
+### The unmerged index, counted once
+
+`git ls-files` emits stages 1, 2 and 3 for a path with an unresolved merge, so
+a live conflict names the same file three times. `tracked_paths` deduplicates
+with `dict.fromkeys`, which keeps git's order. Without it the file is read three
+times, its findings print three times, and `examined` over-counts by two per
+conflicted path: `9 findings in 1 file; examined 3 tracked text files` for one
+file. The verdict was 1 either way, so this never caused a miss, and the count
+was wrong in exactly the state the gate exists for.
+
+`test_an_unmerged_index_is_counted_once` builds the state by making `git merge`
+fail, not by writing markers into a file, and it asserts the three stage entries
+before it asserts anything else. Only a real merge failure puts three stages in
+the index, and a fixture that faked it would pass with the dedupe removed.
+
 ### What is skipped, and counted
 
 Three classes are skipped, and each is counted and reported rather than dropped
@@ -150,6 +165,13 @@ in silence:
 
 The binary test reads the first 8192 bytes and stops there for a binary file, so
 the 175 MB of tracked bytes are not all read.
+
+A file the run could not read is none of those three. It is not a skip, because
+the run does not know what it holds, and it is not a finding, because an
+`OSError` is not a merge conflict. It takes its own list, its own exit status of
+2 and its own remedy. Filing it under the findings made an I/O error exit 1 and
+print "Resolve the merge before committing", which named the wrong problem and
+the wrong repair.
 
 ### The report
 
@@ -204,6 +226,15 @@ the resolved root so no run has to be trusted about which tree it read.
 **Cost.** The tree scan must stay cheap enough to sit in preflight. Measured in
 `## Evidence`.
 
+**The unmerged index was NOT SEEN when this spec was first written, and is
+recorded here as a miss rather than as a considered trade-off.** The first
+version of this section reasoned about which files the scan reads and never
+asked what `git ls-files` returns while a merge is in flight. A fresh review
+found the triple count. It is repaired above, and the case that proves the
+repair is falsifiable is named in `## Tests`. The general lesson is the one this
+row already carries: a gate is measured by what it says it examined, and the
+count is easiest to get wrong in the very state the gate exists for.
+
 ## Tests
 
 `tests/scripts/test_check_conflict_markers.py`, registered in preflight's
@@ -242,11 +273,23 @@ produce a NON-ZERO exit.
   tracks.
 - `test_crlf_line_endings_are_refused` — a conflict written by a tool on Windows.
 - `test_a_tree_with_no_text_files_exits_two` — the vacuity floor.
+- `test_an_unmerged_index_is_counted_once` — a real `git merge` conflict, with
+  the three stage entries asserted first. Reds without the dedupe.
+- `test_an_unreadable_tracked_file_exits_two_and_names_no_merge` — a `chmod 000`
+  tracked file exits 2, is named, and does not draw the merge remedy.
+- `test_two_paths_sharing_a_colon_prefix_count_as_two_files` — two tracked paths
+  that share everything before a colon. The old file count split each report
+  line on its first colon and collapsed them into one.
 - `test_the_shipped_tree_is_clean` — runs against the real repository root,
-  requires exit 0, and requires the reported examined count to be greater than
-  one thousand. A checker that cannot say how many things it examined has not
-  reported, and a count parsed from the output is what makes the clean verdict
-  non-vacuous.
+  requires exit 0, and requires the reported examined count to EQUAL git's own
+  tracked text set, derived at read time from
+  `git grep -I --name-only -e ''` plus the tracked files that have no lines at
+  all. The first version asserted `> 1000` against a real 3733, which is 27% of
+  the count and would have stayed green over a scan that collapsed to markdown
+  alone. Equality is strictly stronger and stores no number, so it is not the
+  drift lock `AGENTS.md` forbids: both sides are re-derived on every run. A file
+  that `.gitattributes` marks binary while carrying no NUL byte would separate
+  the two sets, and the failure message names that cause beside the other one.
 - `test_the_checker_is_registered_in_preflight_and_ci` — the gate runs somewhere.
 
 ## Gates

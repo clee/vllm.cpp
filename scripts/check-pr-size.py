@@ -357,9 +357,13 @@ CREATION_MUTATIONS = {
     "scripts/check-cuda-op-arch-gate.py": DISABLED_CREATION_CHECKER,
     # GATE-CONFLICT-MARKERS (#1417). Created in this range, so there is no BASE
     # version to mutate. The empty stub exits 0 and prints nothing, which fails
-    # every case in tests/scripts/test_check_conflict_markers.py that runs the
-    # checker -- including the clean-tree cases, which parse an examined count
-    # out of the report and so cannot be satisfied by silence.
+    # 16 of the 21 cases in tests/scripts/test_check_conflict_markers.py --
+    # measured, not asserted. The five survivors are the four OrdinaryTextTests
+    # cases, which assert only that an ordinary document exits 0 and are
+    # therefore satisfied by silence, and the registration case, which reads two
+    # files and never runs the checker at all. Every case that reads an exit
+    # code of 1 or an examined count out of the report goes red, which is what
+    # makes the stub a mutation rather than a weaker checker.
     "scripts/check-conflict-markers.py": DISABLED_CREATION_CHECKER,
 }
 SELF_CHECKER = "scripts/check-pr-size.py"

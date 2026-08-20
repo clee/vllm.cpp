@@ -75,6 +75,44 @@ class CheckerCase(unittest.TestCase):
             )
         return root
 
+    def conflicted_repo(self, base: str, ours: str, theirs: str) -> Path:
+        """A repository whose index holds an UNRESOLVED merge.
+
+        Built by making git produce the conflict, not by writing markers into a
+        file and pretending. Only a real `git merge` failure puts stages 1, 2
+        and 3 in the index, which is the state the deduplication exists for.
+        """
+        root = Path(tempfile.mkdtemp(prefix="vllm-conflict-merge-"))
+        git = ["git", "-C", str(root), "-c", "user.name=t", "-c", "user.email=t@x"]
+        subprocess.run(["git", "init", "-q", "-b", "main", str(root)], check=True, capture_output=True)
+        target = root / "docs" / "STATUS.md"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        for content, message, branch in (
+            (base, "base", None),
+            (theirs, "theirs", "other"),
+        ):
+            if branch is not None:
+                subprocess.run([*git, "checkout", "-q", "-b", branch], check=True, capture_output=True)
+            target.write_text(content)
+            subprocess.run([*git, "add", "-A"], check=True, capture_output=True)
+            subprocess.run([*git, "commit", "-q", "-m", message], check=True, capture_output=True)
+        subprocess.run([*git, "checkout", "-q", "main"], check=True, capture_output=True)
+        target.write_text(ours)
+        subprocess.run([*git, "add", "-A"], check=True, capture_output=True)
+        subprocess.run([*git, "commit", "-q", "-m", "ours"], check=True, capture_output=True)
+        merge = subprocess.run([*git, "merge", "other"], capture_output=True, text=True)
+        self.assertNotEqual(merge.returncode, 0, "the merge was supposed to CONFLICT")
+        stages = subprocess.run(
+            ["git", "-C", str(root), "ls-files", "-z"], capture_output=True, check=True
+        ).stdout.decode().split("\0")
+        # The precondition, asserted rather than assumed: without three entries
+        # for one path there is nothing here to deduplicate and the case would
+        # pass vacuously.
+        self.assertEqual(
+            [n for n in stages if n].count("docs/STATUS.md"), 3, stages
+        )
+        return root
+
     def examined_count(self, output: str) -> int:
         match = EXAMINED.search(output)
         self.assertIsNotNone(
@@ -158,6 +196,37 @@ class MarkerRefusalTests(CheckerCase):
         self.assertIn("a.md:6", result.stdout)
         self.assertNotIn("a.md:8", result.stdout, result.stdout)
 
+    def test_an_unmerged_index_is_counted_once(self) -> None:
+        """A live conflict must not triple-count the file it conflicts on.
+
+        `git ls-files` emits stages 1, 2 and 3 for a conflicted path, so without
+        the dedupe in `tracked_paths` this reads `9 findings in 1 file; examined
+        3 tracked text files` for one file. The verdict is 1 either way, so the
+        observable is the COUNT, which is wrong in precisely the state this gate
+        exists for.
+        """
+        root = self.conflicted_repo(
+            base="| a | one |\n", ours="| a | ours |\n", theirs="| a | theirs |\n"
+        )
+        result = self.run_checker(root)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("3 findings in 1 file;", result.stdout)
+        self.assertEqual(self.examined_count(result.stdout), 1)
+        self.assertIn("1 tracked paths", result.stdout)
+
+    def test_two_paths_sharing_a_colon_prefix_count_as_two_files(self) -> None:
+        """The summary count, made falsifiable.
+
+        The file count used to be derived by splitting each report line on its
+        FIRST colon, so two paths that share everything before a colon collapsed
+        into one. A colon is legal in a POSIX filename and git tracks it.
+        """
+        body = f"{START} HEAD\n".encode()
+        root = self.scratch_repo({"weird:one.md": body, "weird:two.md": body})
+        result = self.run_checker(root)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("2 findings in 2 files;", result.stdout)
+
     def test_the_failure_report_names_the_remedy(self) -> None:
         root = self.scratch_repo({"a.md": f"{START} HEAD\n".encode()})
         result = self.run_checker(root)
@@ -234,6 +303,24 @@ class SkipTests(CheckerCase):
         self.assertEqual(self.examined_count(result.stdout), 1)
 
 
+class UnreadableTests(CheckerCase):
+    """A file this run could not read is not a file it may call clean."""
+
+    def test_an_unreadable_tracked_file_exits_two_and_names_no_merge(self) -> None:
+        root = self.scratch_repo({"a.md": b"clean\n", "locked.md": b"clean\n"})
+        locked = root / "locked.md"
+        locked.chmod(0o000)
+        self.addCleanup(locked.chmod, 0o644)
+        result = self.run_checker(root)
+        # 2, not 1: the run cannot report on that file, and unknown is not
+        # absence. It used to be filed as a finding, which exited 1 and printed
+        # "Resolve the merge before committing" for an I/O error.
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn("locked.md: unreadable:", result.stdout)
+        self.assertIn("0 findings", result.stdout)
+        self.assertNotIn("Resolve the merge", result.stdout)
+
+
 class ReportingTests(CheckerCase):
     """A gate that cannot say how much it examined has not reported."""
 
@@ -261,10 +348,48 @@ class ReportingTests(CheckerCase):
         )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         examined = self.examined_count(result.stdout)
-        # Not a stored count and not a ratchet: a lower bound far below the real
-        # number, which only fails when the scan collapsed to nothing. The tree
-        # carried 4806 tracked paths when this was written.
-        self.assertGreater(examined, 1000, result.stdout)
+        # EQUALITY against git's own idea of the tracked text set, DERIVED at
+        # read time. This replaces a `> 1000` floor, which was 27% of the real
+        # 3733 and would have stayed green over a scan that collapsed to
+        # markdown alone. A stored number is the drift lock AGENTS.md forbids;
+        # this stores nothing and re-derives both sides on every run.
+        #
+        # `git grep -e ''` matches every LINE, so a tracked file with no lines
+        # at all is absent from git's set while the checker reads it and counts
+        # it. Empty files are therefore added back here rather than being
+        # tolerated by a fuzzy comparison. The tree carried none when this was
+        # written, so the term is zero today and correct the day it is not.
+        text_set = set(
+            subprocess.run(
+                ["git", "-C", str(ROOT), "grep", "-I", "--name-only", "-e", ""],
+                capture_output=True,
+                text=True,
+                check=False,
+            ).stdout.split("\n")
+        ) - {""}
+        tracked = [
+            n
+            for n in subprocess.run(
+                ["git", "-C", str(ROOT), "ls-files", "-z"],
+                capture_output=True,
+                check=True,
+            ).stdout.decode("utf-8", "surrogateescape").split("\0")
+            if n
+        ]
+        empty = {
+            n
+            for n in tracked
+            if not (ROOT / n).is_symlink()
+            and (ROOT / n).is_file()
+            and (ROOT / n).stat().st_size == 0
+        }
+        self.assertEqual(
+            examined,
+            len(text_set | empty),
+            "the checker's text set no longer agrees with git's. A file marked "
+            "binary by .gitattributes but carrying no NUL byte is one way to "
+            "reach this, and so is a scan that stopped early.\n" + result.stdout,
+        )
 
 
 class RegistrationTests(unittest.TestCase):

@@ -69,10 +69,20 @@ SNIFF_BYTES = 8192
 
 
 def tracked_paths(root: Path) -> list[str]:
-    """Every path in the index, in `git`'s order.
+    """Every path in the index, once each, in `git`'s order.
 
     The index rather than a commit: the incident this gate closes happened in a
     working tree, and a fresh clone's index matches its checkout anyway.
+
+    DEDUPLICATED, and that is not a tidiness measure. An index holding an
+    unresolved merge carries stages 1, 2 and 3 for every conflicted path, so
+    `git ls-files` names such a path three times. Without this, the file is read
+    three times, its findings print three times, and `examined` over-counts by
+    two per conflicted path -- measured as `9 findings in 1 file; examined 3
+    tracked text files` for a single real conflict. The verdict was still 1, so
+    this never caused a miss, but the count was wrong in exactly the state this
+    gate exists for, and a gate that cannot say how many things it examined has
+    not reported.
     """
     result = subprocess.run(
         ["git", "-C", str(root), "ls-files", "-z"],
@@ -85,7 +95,14 @@ def tracked_paths(root: Path) -> list[str]:
             f"git ls-files exited {result.returncode} in {root}: {message}\n"
             "Unknown is not absence: this run examined nothing."
         )
-    return [name for name in result.stdout.decode("utf-8", "surrogateescape").split("\0") if name]
+    names = [
+        name
+        for name in result.stdout.decode("utf-8", "surrogateescape").split("\0")
+        if name
+    ]
+    # `dict.fromkeys` rather than `set`, so git's order survives the dedupe and
+    # the report stays reproducible run to run.
+    return list(dict.fromkeys(names))
 
 
 def scan_text(data: bytes) -> list[tuple[int, str, str]]:
@@ -127,10 +144,18 @@ def scan_text(data: bytes) -> list[tuple[int, str, str]]:
     return findings
 
 
-def scan_tree(root: Path) -> tuple[list[str], dict[str, int]]:
-    """Findings over every tracked text file, with the counts that were skipped."""
+def scan_tree(root: Path) -> tuple[list[str], set[str], list[str], dict[str, int]]:
+    """Findings over every tracked text file, with the counts that were skipped.
+
+    Returns the finding lines, the SET of paths they name, the unreadable-file
+    lines, and the counts. The offender set is collected here rather than parsed
+    back out of the report: splitting a report line on its first colon
+    mis-attributes any path that contains one.
+    """
     counts = {"tracked": 0, "examined": 0, "binary": 0, "symlink": 0, "absent": 0}
     report: list[str] = []
+    offenders: set[str] = set()
+    unreadable: list[str] = []
     for name in tracked_paths(root):
         counts["tracked"] += 1
         path = root / name
@@ -150,13 +175,19 @@ def scan_tree(root: Path) -> tuple[list[str], dict[str, int]]:
                     continue
                 data = head + handle.read()
         except OSError as error:
-            counts["absent"] += 1
-            report.append(f"{name}: unreadable: {error}")
+            # NOT a finding, and not a skip either. A file this run could not
+            # read is a file this run cannot call clean, so it takes its own
+            # list, its own exit status and its own remedy. Filing it under
+            # `report` made an I/O error exit 1 and print "Resolve the merge
+            # before committing", which is the wrong remedy for the wrong
+            # problem.
+            unreadable.append(f"{name}: unreadable: {error}")
             continue
         counts["examined"] += 1
         for number, shape, line in scan_text(data):
             report.append(f"{name}:{number}: {shape}: {line[:80]}")
-    return report, counts
+            offenders.add(name)
+    return report, offenders, unreadable, counts
 
 
 def summary(findings: int, files: int, counts: dict[str, int]) -> str:
@@ -188,24 +219,34 @@ def main(argv: list[str] | None = None) -> int:
     # somebody else's checkout.
     print(f"root: {root}")
     try:
-        report, counts = scan_tree(root)
+        report, offenders, unreadable, counts = scan_tree(root)
     except RuntimeError as error:
         print(str(error))
         print(summary(0, 0, {"tracked": 0, "examined": 0, "binary": 0, "symlink": 0, "absent": 0}))
         return 2
 
-    files = len({line.split(":", 1)[0] for line in report})
+    for line in report:
+        print(line)
+    for line in unreadable:
+        print(line)
+    print(summary(len(report), len(offenders), counts))
+
     if counts["examined"] == 0:
-        print(summary(len(report), files, counts))
         print(
             "A gate that examined nothing has not reported. Check --root, and "
             "check that it names a git repository with tracked text files."
         )
         return 2
-
-    for line in report:
-        print(line)
-    print(summary(len(report), files, counts))
+    if unreadable:
+        # Ordered BEFORE the findings arm on purpose. A run that could not read
+        # part of the tree cannot say the tree is clean, and it must not say so
+        # by reporting only the part it managed to read.
+        print(
+            f"{len(unreadable)} tracked file(s) could not be read, so this run "
+            "cannot report on them. Unknown is not absence. Repair the "
+            "permissions or the checkout and rerun."
+        )
+        return 2
     if report:
         print(
             "Resolve the merge before committing. A document that quotes a "
