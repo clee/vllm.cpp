@@ -419,12 +419,36 @@ TEST_CASE("a MISALIGNED BORROW is not re-homed, and stages instead") {
   const PlatformArm arm(true);
   OwnedTensor w = MakeWeight(/*tag=*/8);
   const size_t nb = w.bytes.size();
-  auto backing = std::make_shared<std::vector<uint8_t>>(nb + vllm::kDeviceAliasAlignment);
+  // THE DELIBERATE MISALIGNMENT, AND THE ROOM IT ACTUALLY NEEDS (#1499).
+  //
+  // `off` is `kMisalign` bytes past the first 256-boundary at or after `base`.
+  // When `base` is ALREADY 256-aligned the padding expression below yields a
+  // WHOLE `kDeviceAliasAlignment` rather than zero, so the largest offset it can
+  // produce is `kDeviceAliasAlignment + kMisalign` and the buffer has to carry
+  // that much slack on top of `nb`. It carried only `kDeviceAliasAlignment`, so
+  // on exactly the runs where the allocator handed back an aligned block the
+  // `memcpy` wrote 8 bytes past the end of a `nb + 256` vector.
+  //
+  // That is what `sanitize-cpu (thread)` reported for two days as a
+  // heap-use-after-free in this case: the 8-byte overrun landed in a block that
+  // an earlier `CHECK_THROWS_WITH_AS` case had freed — the `VT_CHECK` message
+  // string from `qwen3_5.cpp:1205` — so the detector named the FREE it could see
+  // rather than the overflow it could not. Nothing on the alias path was wrong.
+  constexpr size_t kMisalign = 8;
+  auto backing = std::make_shared<std::vector<uint8_t>>(
+      nb + vllm::kDeviceAliasAlignment + kMisalign);
   // Deliberately off by 8: aligned enough for the element type, nowhere near 256.
   uint8_t* base = backing->data();
   uint8_t* off = base + (vllm::kDeviceAliasAlignment -
                          (reinterpret_cast<uintptr_t>(base) %
-                          vllm::kDeviceAliasAlignment)) + 8;
+                          vllm::kDeviceAliasAlignment)) + kMisalign;
+  // The write is bound to the buffer HERE, because this arithmetic is wrong only
+  // on the runs where the allocator happens to return an aligned block, and a
+  // plain lane cannot see the overrun on the runs where it does. This holds for
+  // whichever block this run got; the allocation above is sized for the worst
+  // one, which is the aligned case this assertion would otherwise only catch
+  // some of the time.
+  REQUIRE(off + nb <= base + backing->size());
   std::memcpy(off, w.bytes.data(), nb);
   w.bytes = vllm::OwnedBytes::Borrow(
       off, nb, std::static_pointer_cast<const void>(backing));
