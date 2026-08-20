@@ -15,8 +15,9 @@ model-run-in-a-lease that this spec's NVFP4 gate depends on;
 [#876](https://github.com/mudler/vllm.cpp/pull/876) owns the GGUF architecture
 dispatch this spec builds on and which is still OPEN.
 **Lifecycle:** `LOAD-GGUF-MMPROJ` is `PARTIAL` (W1 landed; see
-[W1 outcome](#w1-outcome)). `QUANT-QWEN38-27B-GGUF-ARM` and
-`QUANT-QWEN38-27B-NVFP4-ARM` are `READY`.
+[W1 outcome](#w1-outcome)). `QUANT-QWEN38-27B-GGUF-ARM` is `PARTIAL` (W2
+landed; see [W2 outcome](#w2-outcome)). `QUANT-QWEN38-27B-NVFP4-ARM` is
+`PARTIAL` (W4 landed; see [W4 outcome](#w4-outcome)).
 **Owner:** unassigned
 
 ## Why this is not optional
@@ -83,6 +84,8 @@ case, not the oid.
 | `unsloth/Qwen3.8-27B-GGUF` @ `fe1e2a23d973adb629709749dc4f6756df66ef10` → `Qwen3.8-27B-Q4_K_M.gguf` | 17,106,775,008 | GGUF v3, `general.architecture = qwen35`, 866 tensors, 51 KV, align 32, header ends 10,996,704; **computed data end == 17,106,775,008 == file size** |
 | same revision → `mmproj-BF16.gguf` | 931,146,432 | GGUF v3, `general.architecture = clip`, `general.type = mmproj`, 334 tensors, 35 KV; **computed data end == 931,146,432 == file size** |
 | `unsloth/Qwen3.8-27B-NVFP4` @ `7d6f8d4d72f56b92b3cdbf22f156b90e1bab0108` → `model.safetensors` | 22,568,192,096 | safetensors header 251,128 B; **8 + header_len + max(data_offsets[1]) == 22,568,192,096 == file size**; 1953 tensors |
+| same revision → `model_mtp.safetensors` | 849,400,392 | safetensors header 1,600 B; **8 + header_len + max(data_offsets[1]) == 849,400,392 == `x-linked-size`**; 15 tensors, all BF16. Re-read from the file's OWN header 2026-08-20 by W4, which is what the `## Owed` bullet asked for; it is no longer taken on trust from the index |
+| same revision → `model.safetensors.index.json` | — | 1968 `weight_map` names = 1953 `model.safetensors` + 15 `model_mtp.safetensors`; `metadata.total_size` 23,417,592,488 == 22,568,192,096 + 849,400,392 |
 
 **Inspected directly, from bytes already on the NAS:**
 
@@ -91,10 +94,21 @@ case, not the oid.
 | `/mnt/nas_share/checkpoints/qwen3.8-27b-bf16/Qwen3.8-27B-BF16.gguf` | 53,808,281,952 | GGUF v3, `qwen35`, 851 tensors, data end == file size. The control for the Q4_K_M tensor set |
 | `/mnt/nas_share/rc/ckpt/qwen3.8-27b-hf/config.json` | 4,312 | The official bf16 config, read in full |
 
-**Taken on trust, and named as such:** `model_mtp.safetensors` (849,400,392 B) —
-its 15 tensor names come from `model.safetensors.index.json`, which I read, but I
-did not range-read that file's own header, so its data-end is unverified. Every
-other statement below rests on a header I parsed.
+**Taken on trust when this spec was written, and PAID by W4:**
+`model_mtp.safetensors` (849,400,392 B). Its 15 tensor names came from
+`model.safetensors.index.json`; W4 range-read the file's own header on
+2026-08-20 and confirms all fifteen names, dtypes and shapes and a data-end
+equal to the size the hub reports. Every other statement below rests on a header
+that was parsed.
+
+**1968 AND 1953 ARE BOTH RIGHT, and they count different things.** 1953 is the
+tensor count of `model.safetensors`'s own header. 1968 is the name count of the
+shipped `model.safetensors.index.json` weight map, which is the 1953 plus the
+MTP shard's 15. This spec's [Work breakdown](#work-breakdown) says "1968-name
+accounting" and means the index; the row above says 1953 and means the one
+shard. W4's gate accounts for **both**, from two committed manifests whose
+counts are asserted to sum to 1968, so neither number can be quoted as the other
+one's contradiction again.
 
 **Not inspected because it no longer exists:** see the next section.
 
@@ -326,10 +340,15 @@ unquantized.
 #### Four independent blockers, each anchored
 
 1. **The missing `input_scale` — the reported fatal.**
-   `src/vllm/model_executor/models/qwen3_5_dense_weights.cpp:503-505` routes an
+   `src/vllm/model_executor/models/qwen3_5_dense_weights.cpp:504-506` routes an
    `F8_E4M3` GDN `in_proj_qkv` to `LoadFp8RawShared`
-   (`src/vllm/model_executor/models/qwen3_5_weights.cpp:1196-1198`), which reaches
-   `LoadFp8Raw` at `src/vllm/model_executor/models/qwen3_5_weights.cpp:447,456-458`:
+   (`src/vllm/model_executor/models/qwen3_5_weights.cpp:1381-1382`), which reaches
+   `LoadFp8Raw` at `src/vllm/model_executor/models/qwen3_5_weights.cpp:632,641-643`.
+   The three positions in this bullet were **wrong** as this spec first wrote
+   them — `qwen3_5_weights.cpp:447` and `:456-458` are `OwnedBytes::Borrow`
+   code, and `:1196-1198` is not `LoadFp8RawShared` — and W4 re-derived them at
+   its own head. They are the `## Owed` re-anchor bullet firing exactly where it
+   said it would:
 
    ```cpp
    r.weight_scale = ReadF32Scalar(get, proj + ".weight_scale");
@@ -339,8 +358,14 @@ unquantized.
 
    `ReadF32Scalar` calls the resolver immediately
    (`include/vllm/model_executor/models/dense_weight_loaders.h:164-165`), and the
-   resolver throws at
-   `src/vllm/model_executor/models/qwen3_5_dense_weights.cpp:828`. This is the
+   resolver throws. **W4 confirms this reproduces against the re-pinned bytes,
+   from the artifact rather than from the report:** `*.input_scale` occurs
+   **zero** times in `model.safetensors`'s header at `7d6f8d4d...` (168
+   `*.input_global_scale` do, which is a different operand), and
+   `layers.0.linear_attn.in_proj_qkv.weight` is `F8_E4M3 [10240, 5120]` with a
+   `BF16 [10240, 1]` `weight_scale`, so the F8 branch is taken and asks for a
+   tensor the checkpoint does not have. W4 does not let the load get that far
+   any more; see [W4 outcome](#w4-outcome). This is the
    **only** FP8 arm with no `has()` guard: the block-wise arm refuses an
    `input_scale` (`:467-473`), the ModelOpt NVFP4 arm presence-guards it
    (`:388-395`). Verified still present at `origin/main` `836c13c35`.
@@ -363,7 +388,7 @@ unquantized.
 
 4. **The scheme is never read from the config.** The only `quantization_config`
    keys this arm consults are the block-wise FP8 ones —
-   `src/vllm/model_executor/layers/quantization/fp8_block_quant.cpp:19-28,49-61,77-91,106-116,131-142`
+   `src/vllm/model_executor/layers/quantization/fp8_block_quant.cpp:27-29,50-62,78-92,107-117,132-143`
    (`weight_block_size`, `quant_method`, `activation_scheme`, `ignored_layers`).
    Nothing reads `format`, `config_groups`, `targets`, `strategy`, or the
    compressed-tensors `ignore`. Detection is by tensor presence and dtype, per
@@ -392,7 +417,7 @@ unquantized.
 
 Two adjacent facts that will bite an implementer:
 
-- `src/vllm/model_executor/models/qwen3_5_dense_weights.cpp:698,702`
+- `src/vllm/model_executor/models/qwen3_5_dense_weights.cpp:699,703`
   (`IsQwen27QuantizedLinear`) returns **false** for any name containing
   `.linear_attn.in_proj_`, i.e. it declares the GDN input projections never
   quantized. That is correct for the *3.6* unsloth artifact —
@@ -403,12 +428,12 @@ Two adjacent facts that will bite an implementer:
   The two unsloth 27B artifacts differ, and reasoning from the 3.6 shape is what
   produced this line.
 - The GDN path never probes NVFP4 at all: `IsNvfp4Projection` is applied only to
-  `out_proj` (`src/vllm/model_executor/models/qwen3_5_dense_weights.cpp:514`),
+  `out_proj` (`src/vllm/model_executor/models/qwen3_5_dense_weights.cpp:515`),
   while `self_attn` and `mlp` do probe it (`:561`, `:594`). Correct for
   this artifact, worth stating so nobody "fixes" it.
 - **A doc comment on the NVFP4 loader is stale in the direction that matters
   here, and it is NOT this row's to repair.**
-  `src/vllm/model_executor/models/qwen3_5_dense_weights.cpp:162-163` says the
+  `src/vllm/model_executor/models/qwen3_5_dense_weights.cpp:163-164` says the
   on-disk `input_global_scale` "is not read", and `LoadCtNvfp4Raw` reads it
   unconditionally sixteen lines later at `:190`, refusing a zero at `:191-192`.
   It matters to W4 because this checkpoint's `group_1` ships
@@ -421,7 +446,7 @@ Two adjacent facts that will bite an implementer:
 The NVFP4 MLP group, by contrast, is the compressed-tensors spelling the loader
 already handles (`weight_packed` + `weight_scale` F8 + `weight_global_scale` +
 `input_global_scale` → `LoadCtNvfp4Raw`,
-`src/vllm/model_executor/models/qwen3_5_dense_weights.cpp:164`). **The NVFP4
+`src/vllm/model_executor/models/qwen3_5_dense_weights.cpp:165`). **The NVFP4
 half of this "NVFP4" checkpoint is the half that is closest to working.** The FP8
 tower is the blocker.
 
@@ -810,6 +835,34 @@ version field for the library to check. It is stated here once rather than left
 unstated; changing it is an ABI-wide decision about the struct, not a decision
 this row may make on its own.
 
+### The line-anchor rot this change caused, and repaired in the same commit
+
+Adding one `#include` to `qwen3_5_dense_weights.cpp` shifted every line below it
+by one, and rewriting `QuantizationConfigOf` in `fp8_block_quant.cpp` shifted
+that file. Between them, **31 files across `.agents/`, `include/`, `src/` and
+`tests/` carried a bare `file:line` citation into those two files**, and every
+one of them silently became wrong. They are repaired here rather than left,
+because `AGENTS.md` says a record edit rides in the pull request whose change
+made the record stale, and because `scripts/check-symbol-anchors.py` validates
+only `path::Symbol` citations — a bare line number is checked by a reader or not
+at all.
+
+The repair is a per-line remap derived from a `difflib` opcode diff between the
+merge base and this head, so it is **content-preserving by construction**: for
+every remapped line the old file's line N and the new file's line M were
+asserted byte-equal before the citation was rewritten. Only citations that exist
+in the merge base were rewritten, so the anchors this change itself authored —
+which are already head-based — were left alone. Ranges and comma lists were
+remapped endpoint by endpoint.
+
+**One surface is deliberately NOT repaired.**
+[`issue-index.md`](../issue-index.md) carries three of those citations inside
+issue #1411's row, and `AGENTS.md` §"Every change starts from an issue" says the
+index is append-only and that a row is never edited. A stale line number inside
+a closed-or-open issue row is the cost of that rule, and paying it by editing
+the row would trade a wrong number for a merge conflict on every concurrent
+branch. Left as is, on purpose, rather than missed.
+
 ### What did NOT land, and is owed
 
 - **Nothing runs the tower.** `LoadedEngine::vision_tower()` holds it; no
@@ -1044,6 +1097,288 @@ file, which is why the live case asserts both.
   rather than as one; the peak is stable to 48 kB across them. A box with less
   than about 40 GB of available memory should not start it.
 
+## W2 outcome
+
+`QUANT-QWEN38-27B-GGUF-ARM` is `PARTIAL`. W2 delivered the accounting for both
+artifacts; W3, the token gates, is untouched and still blocked on
+[#857](https://github.com/mudler/vllm.cpp/issues/857).
+
+### What landed
+
+- **Two committed header-only manifests, and the generator that made them.**
+  `scripts/gen-qwen38-27b-gguf-manifest.py` reads a GGUF **header** — tensor
+  names, ggml dims and type ids, plus the SCALAR kvs — and freezes it as a C++
+  fixture. `tests/vllm/models/qwen38_27b_q4km_gguf_manifest.inc` is 866 names
+  and 51 keys; `tests/vllm/models/qwen38_27b_mmproj_gguf_manifest.inc` is 334
+  and 35. No weight bytes, so CI carries them and reads no file on the share.
+  ARRAY kvs are deliberately not emitted: `tokenizer.ggml.tokens`, `.merges`
+  and `.token_type` are 743,494 entries between them and none of them is a
+  tensor-accounting fact, so freezing them would make a tensor manifest the
+  place a tokenizer change has to be edited.
+- **Both enumerations, beside the loaders that own them.**
+  `Qwen3_5GgufExpectedTensors` / `Qwen3_5GgufAccountTensors` in
+  `qwen3_5_gguf_weights.cpp` enumerate what the qwen3_5-family loaders read for
+  a config — embedding and head, the trunk under its `layer_types`, and the MTP
+  head blocks at `blk.{L+i}` when the checkpoint declares one — and
+  `Qwen3VLClipMmprojExpectedTensors` in `clip_mmproj_gguf.cpp` does the same for
+  the projector. An NVFP4 sidecar (`<stem>.scale`, `<stem>.input_scale`) is
+  accounted by its stem rather than enumerated, because whether it exists is a
+  property of that weight's ENCODING and not of the architecture.
+- **The refusal, on the production load path.** `LoadedEngine::FromModelDir`
+  refuses a qwen3_5-family GGUF, and a `--mmproj` projector, that carries
+  tensors nothing reads, naming them — after the architecture resolve and the
+  device-fit refusal, before the tokenizer and before any weight byte, so on the
+  real artifact that is a message rather than a 17 GB map.
+- **ONE direction, deliberately.** A tensor the loaders ask for and the file
+  lacks already refuses by name at `GgufFile::Get`, on every arm. A tensor the
+  file carries and no loader reads had no detector at all, and it is the silent
+  one. Both directions are still gated, on the committed manifest, where zero
+  unaccounted is asserted each way with no asset.
+
+### The `nextn` correction: a gap that does not exist
+
+The [Port map](#quant-qwen38-27b-gguf-arm) says the loader "must read
+`qwen35.nextn_predict_layers` and take `block_count - nextn_predict_layers` as
+the decoder depth". **It already does, and it has since before this spec was
+written.** `src/vllm/model_executor/models/qwen3_5_gguf_weights.cpp:889` is
+`c.num_hidden_layers = block_count - nextn;`, landed in `1a4db5c3c`
+(2026-07-04); `:897` republishes the depth as `mtp_num_hidden_layers` for the
+spec resolver, landed in `493327b4e` (2026-07-28). Re-derived by `git blame`
+rather than assumed, and confirmed end to end by the live case, which builds an
+`HfConfig` off the real 51-key metadata and reads back `num_hidden_layers == 64`
+and `NumMtpLayers == 1` against `block_count == 65`.
+
+What was missing was a **gate**. `tests/vllm/models/test_qwen3_5_gguf_mtp.cpp`
+is the only test in the tree that touches the key, and it cannot serve: it is
+asset-gated on `VLLM_MTP_GGUF_MODEL`, it skips with a bare `return` rather than
+loudly, so in CI it contributes nothing and says so to nobody; and where its own
+comment says "num_hidden_layers + depth == block_count" its assertion is
+`CHECK(c.num_hidden_layers > 0)`. A comment is not a gate. W2's hermetic case
+pins the arithmetic itself, off the manifest's own kvs, with no asset:
+`c.num_hidden_layers + NumMtpLayers(c) == qwen35.block_count`, plus the trunk's
+composition (16 full-attention layers at every 4th index, 48 GDN) cross-checked
+against the manifest's tensor NAMES, because a 64 that is 64 of the wrong kind
+is the same defect one level down.
+
+That weak sibling test is a finding this row did not repair and does not own.
+It is named in `## Owed`.
+
+### What did NOT land, and is owed
+
+- **No token gate, and none faked.** `.agents/oracles/llama-cpp.md` records
+  `gateable = no` at pin `b10451`, so the Q4_K_M text gate stays `PENDING` on a
+  named external authority ([#857](https://github.com/mudler/vllm.cpp/issues/857)).
+  W2 measured no throughput, latency or memory axis, so `docs/BENCHMARKS.md`
+  gains nothing.
+- **No resident-bytes assertion.** `## Risks` requires one per arm so a Q4_K_M
+  that silently dequantizes to bf16 cannot pass a token gate. It needs the
+  weights loaded, which is W3.
+- **The artifact's tokenizer and chat template** (Port map item 5) are
+  untouched. The manifest freezes `tokenizer.ggml.padding_token_id = 248055`
+  and the gate asserts it, which pins the DIFFERENCE from the BF16 GGUF's
+  248044; nothing yet loads that tokenizer.
+- **The merger and attention widths the reader never checks** stay owed to W3,
+  unchanged by this row: the accounting compares NAMES, not extents.
+
+### Evidence
+
+Every figure below was measured on the tree this change commits, on this host,
+CPU-only build, and re-derived rather than carried from the session that started
+this branch.
+
+- **The artifacts, re-parsed from the mirrored bytes** rather than from any
+  record of them. `Qwen3.8-27B-Q4_K_M.gguf`: GGUF v3, 866 tensors, 51 kv, header
+  ends at 10,996,700, `general.architecture = qwen35`,
+  `qwen35.block_count = 65`, `qwen35.nextn_predict_layers = 1`,
+  `tokenizer.ggml.padding_token_id = 248055`; encodings F32 456, Q4_K 294,
+  Q6_K 67, Q5_K 48, Q8_0 1; highest `blk` index 64 carrying 15 tensors, and the
+  block-size histogram is 48 blocks of 14 (GDN), 16 of 11 (full attention), one
+  of 15 (the drafter), plus `token_embd.weight`, `output.weight` and
+  `output_norm.weight` — 48x14 + 16x11 + 15 + 3 = 866; computed data end
+  17,106,775,008 == file size. `mmproj-BF16.gguf`: GGUF v3, 334 tensors, 35 kv,
+  `clip` / `mmproj`, `clip.projector_type = qwen3vl_merger`,
+  `clip.vision.block_count = 27`, BF16 110 + F32 224, computed data end
+  931,146,432 == file size. Both files' sha256 are in `docs/USAGE.md`, computed
+  locally by W1 on the same mirrored copies these numbers came off.
+- **The committed manifests regenerate byte-identically** from those bytes:
+  `gen-qwen38-27b-gguf-manifest.py` run over each file's header prefix produces
+  output that `diff` reports as identical to the committed `.inc`. That is what
+  binds the manifests to the artifact rather than to their author.
+- **Red first, by mutation, because the enumerations are the change.** Stubbing
+  both `*ExpectedTensors` to `return {}` — `COMPILE_RC=0`, and the stubbed
+  files measure one added line each against their pre-mutation selves, so
+  neither a mutation that failed to build nor one that never applied is being
+  read as a pass — reds `test_qwen38_27b_gguf_manifest` at rc 1, 6 cases / 4
+  passed / 2 failed, 464 assertions / 4 failed, `Status: FAILURE!`
+  (`CHECK( 0 == 866 )` and `CHECK( 0 == 334 )` on the two enumerated counts),
+  and `test_gguf_accounting_reach` at rc 1, 6 / 1 passed / 5 failed, 22
+  assertions / 8 failed. Restored by removing the two inserted lines and
+  verified by sha256 against the pre-mutation values
+  (`qwen3_5_gguf_weights.cpp` `6ebf76453872ce6cb754b8809284a4c75e2a68abd8ef196d324e6f01e6c08018`,
+  `clip_mmproj_gguf.cpp` `3c88eb4f0f1c92e1a4b84034a1d8cf4e77112c71df8bd433a2f27a8f5c5a2801`).
+- **Green after**, same binaries: `test_qwen38_27b_gguf_manifest` rc 0, 6/6,
+  464 assertions, `Status: SUCCESS!`; `test_gguf_accounting_reach` rc 0, 6/6,
+  22 assertions, `Status: SUCCESS!`.
+- **The live arm**, over the shipped bytes, with
+  `VLLM_CPP_QWEN38_27B_GGUF` and `VLLM_CPP_QWEN38_27B_MMPROJ` both set: rc 0,
+  6/6, **4745 assertions**, `Status: SUCCESS!` — 4281 more than the hermetic run,
+  which is the two live cases comparing every one of the 1200 frozen names,
+  ggml dims and type ids against the files' own headers. Unset, both live cases
+  print a `SKIPPED:` message naming the variable and the file, so a skip is
+  visible rather than a silent pass. It reads only the two headers, so it costs
+  seconds and no weight byte.
+- **Reachability, the mutation `AGENTS.md` requires.** Deleting BOTH refusal
+  call sites in `src/vllm/entrypoints/model_loader.cpp` — 5 deleted lines,
+  `COMPILE_RC=0`:
+
+  | target | rc | cases | assertions | `Status:` |
+  |---|---:|---|---|---|
+  | `test_gguf_accounting_reach` | 1 | 6, 3 passed / 3 failed | 22, 13 / 9 | `FAILURE!` |
+  | `test_qwen38_27b_gguf_manifest` | 0 | 6, 6 passed | 464 | `SUCCESS!` |
+
+  The three that red are the two refusal cases and the MTP-misread case; the
+  manifest target cannot tell the difference, which is the point. That contrast
+  is the evidence that the accounting is a capability and not a class. Restored
+  from a pre-taken copy and verified by sha256,
+  `model_loader.cpp` `b10d2487f63b4e994456cc310c03556b623f23bafbe08640f624247a4e9ac7b5`
+  before and after, and the rebuilt target green again at 6/6, 22.
+## W4 outcome
+
+`QUANT-QWEN38-27B-NVFP4-ARM` is `PARTIAL`. W4 delivered the re-pin record, the
+accounting gate and the scheme resolution, and it did NOT deliver a loadable FP8
+tower. The FP8 group is now **refused by name** instead of dying on a tensor the
+checkpoint does not ship, which is the outcome the [Port map](#quant-qwen38-27b-nvfp4-arm)
+§6 wording ("consume, or refuse by name with a message naming the missing
+piece") allows and the [Stop conditions](#stop-conditions) require.
+
+### What landed
+
+- **The re-pin, verified from bytes this project holds.**
+  `unsloth/Qwen3.8-27B-NVFP4` @ `7d6f8d4d72f56b92b3cdbf22f156b90e1bab0108`,
+  `model.safetensors`, 22,568,192,096 B, sha256
+  `c473512c70eace07e2256fe9fd76596ac03e3295bee7d54cfb72676416afcc05`, computed
+  locally over the mirrored file and never read back from the hub. Header 251,128
+  B, 1953 tensors, `8 + header_len + max(data_offsets[1])` == the file size.
+  `model_mtp.safetensors` re-read from its own header: 15 BF16 tensors, data-end
+  849,400,392. Published in `docs/USAGE.md` with the refused arm named.
+- **1968 and 1953 reconciled**, above. Both counts are real and they count
+  different things; the gate asserts they sum.
+- **A tensor-accounting gate over the real name index, per scheme**, in
+  `tests/vllm/models/test_qwen38_27b_nvfp4_arm.cpp` against two committed
+  header-only manifests generated by the committed
+  `scripts/gen-minimax-h3-safetensors-manifest.py` (names, dtypes, shapes; no
+  weight byte). Enumerated == present with zero unaccounted in both directions,
+  and a per-scheme composition that is the checkpoint's own: **466 tensors over
+  233 modules in `group_0`** (FP8 W8A8), **672 over 168 in `group_1`** (NVFP4
+  W4A4), **475 over 317 ignored**, **323 over 267 matched by no target**, and
+  **32 over 16** `k_scale`/`v_scale`, summing to 1968 with zero unclassified.
+  Hermetic in CI; a live arm behind `VLLM_CPP_QWEN38_27B_NVFP4_DIR` re-reads the
+  mirrored header and compares it name by name, and SKIPS loudly when unset.
+- **`config_groups` resolution, mirroring vLLM rather than probing dtypes**, in
+  `src/vllm/model_executor/layers/quantization/compressed_tensors/compressed_tensors_config.h`.
+  `ignore` first and outright, then the FIRST matching `targets` entry in
+  declaration order, with `re:` meaning Python `re.match` (anchored at the start,
+  not required to reach the end) and every other target an exact string compare.
+  That order is load-bearing here: both groups' targets match layer 60's
+  `gate_proj`, and only `group_0` being declared first puts layers 56-63 on the
+  FP8 side of the boundary.
+- **Upstream's own `*Attention`-only group drop, mirrored.**
+  `from_config` (`compressed_tensors.py:230-246`) removes a config group whose
+  targets are exactly one `*Attention` entry, because attention quantization on
+  its own is coupled to the KV-cache scheme rather than to a linear method. This
+  artifact declares no such group, so the branch is ported for the mirror and
+  not for the artifact: keeping the group would refuse a checkpoint upstream
+  loads, and no shipped tensor name would change, so the divergence would be
+  silent. RED first, and the same case pins the negative half — a MULTI-target
+  group whose first target ends in `Attention` is NOT dropped, because upstream's
+  condition is `len(targets) == 1 AND targets[0].endswith("Attention")`.
+- **The per-channel FP8 scale, the dynamic activation scheme and
+  `k_scale`/`v_scale`, each refused by name through the production loader.**
+  `LoadQwen3_5Dense` reads the compressed-tensors config once for the whole
+  checkpoint and refuses before the first projection, naming the count of
+  affected modules, the group, the group's `format`, and both missing pieces.
+
+### The one exact tracked exception, and its argument
+
+[Stop conditions](#stop-conditions) says to stop before writing a second
+mixed-precision resolver, to adopt or extend `modelopt_mixed_precision.h`, or to
+record ONE EXACT TRACKED EXCEPTION, and says finding it unfit is a legitimate
+outcome. **W4 records the exception.** The two headers resolve two DIFFERENT
+upstream formats that share only the English word "mixed":
+
+| | `modelopt_mixed_precision.h` | `compressed_tensors_config.h` |
+|---|---|---|
+| `quant_method` | `modelopt` | `compressed-tensors` |
+| Upstream module | `quantization/modelopt.py` | `quantization/compressed_tensors/` |
+| Membership is declared by | a `quantized_layers` map, module prefix → algorithm string | `config_groups`, each with a `targets` list |
+| Matching rule | five PREFIX strategies with `fnmatch` (`modelopt.py:2412-2505`) | ignore-first, then ORDERED FIRST REGEX MATCH (`utils.py:113-193`) |
+| Exclusions | `exclude_modules` / `ignore`, prefix-matched | `ignore`, exact or `re:`, consulted BEFORE any target |
+
+They share no key, no matching rule and no upstream module, and vLLM itself keeps
+them in two files. Reading this checkpoint with the ModelOpt resolver mis-resolves
+every module. So the tree does not end up with two resolvers for one format; it
+ends with one resolver per format, which is upstream's structure and the one
+[`porting.md`](../porting.md) requires us to mirror. What the tree does NOT get
+is a second copy of "where does the quantization config live":
+`fp8_block_quant.cpp` carried its own `QuantizationConfigOf` and now calls the
+shared one, because that lookup really is one function.
+
+### Upstream chain, read at the pin
+
+Every position below was read in `/home/mudler/_git/vllm` at
+`5559679229bc961848b121ccdeaa8fa5d79bec98`, the
+[`upstream-sync.md`](../upstream-sync.md) pin, and each is cited in the header
+that ports it:
+
+| Upstream `file:line` | What was ported |
+|---|---|
+| `compressed_tensors/utils.py:50-102` | `should_ignore_layer` — `ignore` is consulted first and wins outright |
+| `compressed_tensors/utils.py:105-110` | `check_equal_or_regex_match` — `any()`, so ignore-entry order is irrelevant |
+| `compressed_tensors/utils.py:155-172` | `_find_first_match` — FIRST match in iteration order |
+| `compressed_tensors/utils.py:175-193` | `_is_equal_or_regex_match` — `re:` means `re.match`, otherwise an exact compare |
+| `compressed_tensors/compressed_tensors.py:230-265` | `from_config`, including the `*Attention`-only group drop at `:230-246` |
+| `compressed_tensors/compressed_tensors.py:300-369` | `_quantization_scheme_map_from_config` — flattened in dict INSERTION order |
+| `compressed_tensors/compressed_tensors.py:404-421` | `_is_nvfp4_format`, mirrored predicate for predicate |
+| `compressed_tensors/compressed_tensors.py:526-560` | `_is_fp8_w8a8` |
+| `compressed_tensors/compressed_tensors.py:722-743` | `_get_scheme_from_parts`, incl. the `input_quant is None` → W4A16 split and the "NVFP4 weights need NVFP4 activations" raise at `:738-742` |
+| `compressed_tensors/compressed_tensors.py:810-836` | the W8A8 FP8 branch |
+| `compressed_tensors/compressed_tensors.py:1034-1073` | `validate_kv_cache_scheme` |
+| `compressed_tensors/schemes/compressed_tensors_w8a8_fp8.py:53-56,127-139,152-165` | the weight STRATEGY picks the scale parameter type, and `input_scale` registers ONLY for a static input scheme |
+
+### Reachability
+
+The refusal is reached from `LoadQwen3_5Dense`, the loader every consumer of a
+Qwen3.5-family safetensors checkpoint arrives through, and the gate enters
+through that function rather than constructing the resolver by hand. Proven by
+mutation: deleting the call site in a scratch copy compiles (`rc 0`, so this is
+not a build failure wearing a pass), `git diff --stat` shows the file changed,
+and two cases with six assertions go RED. Restored byte-for-byte against a
+pre-taken sha256, green again. Two further mutations inside the resolver — group
+iteration reversed, and `ignore` widened from an exact match to a prefix match —
+each turn two cases red (64 and 19 assertions), and each was reverted to the same
+sha256.
+
+### What did NOT land, and is owed
+
+- **A loadable FP8 W8A8 tower with a per-channel weight scale and dynamic
+  per-token activations.** [Port map](#quant-qwen38-27b-nvfp4-arm) §4 and §5 ask
+  for the scale widened to a resident per-channel vector and for vLLM's dynamic
+  activation path. W4 refuses both by name instead, which §6's wording permits
+  for `k_scale`/`v_scale` and which this section records explicitly for §4 and
+  §5 rather than letting the refusal read as completion. It is a kernel and
+  weight-representation change (`Fp8Weight` is three host floats with no
+  tensor-valued scale slot), it needs a GPU to gate, and W4 was scoped to the
+  CPU-side units. Owned by `QUANT-QWEN38-27B-NVFP4-ARM`, tracked by
+  [#821](https://github.com/mudler/vllm.cpp/issues/821).
+- **A consumed `kv_cache_scheme`.** There is no quantized KV cache on this arm to
+  apply `k_scale`/`v_scale` to. Refused by name; owed by the same row and issue.
+- **The resident-bytes assertion per arm**, and every token gate. Both need a
+  leased GPU and W5, and the NVFP4 gate additionally waits on
+  [#1185](https://github.com/mudler/vllm.cpp/issues/1185).
+- **`model_mtp.safetensors` has no locally-computed sha256.** Its header was
+  re-read by range request and its bytes are NOT mirrored to the NAS, so the hash
+  bullet under `## Owed` is paid for `model.safetensors` only.
+
 ## Dependencies and blockers
 
 Named here rather than under `## Owed`, because `## Owed` means this spec owns
@@ -1077,12 +1412,28 @@ them:
   [#821](https://github.com/mudler/vllm.cpp/issues/821). Named here rather than
   left to be discovered: a tower that loads and never runs is exactly the shape
   [`reachability.md`](../reachability.md) exists to keep visible.
-- **The COMMITTED 334-name manifest for `mmproj-BF16.gguf`, and the CI
-  accounting against it.** W1's CI gate is synthetic and its live comparison is
-  env-gated on a NAS file, so nothing in CI accounts for that artifact's tensor
-  set. The manifest, generated the way
-  `scripts/gen-muse-glimmer-gguf-manifest.py` generates one, belongs to
-  `QUANT-QWEN38-27B-GGUF-ARM`.
+- ~~**The COMMITTED 334-name manifest for `mmproj-BF16.gguf`, and the CI
+  accounting against it.**~~ **PAID by W2**, together with the 866-name manifest
+  for the language file: `tests/vllm/models/qwen38_27b_mmproj_gguf_manifest.inc`
+  and `qwen38_27b_q4km_gguf_manifest.inc`, generated by
+  `scripts/gen-qwen38-27b-gguf-manifest.py` the way
+  `scripts/gen-muse-glimmer-gguf-manifest.py` generates one, and accounted in CI
+  with no asset by `tests/vllm/models/test_qwen38_27b_gguf_manifest.cpp`. See
+  [W2 outcome](#w2-outcome).
+- **`test_qwen3_5_gguf_mtp.cpp` claims a guarantee it does not assert, and skips
+  silently.** Found by W2 and NOT repaired by it, because it belongs to
+  `SPEC-MTP-GGUF` rather than to this row and repairing another row's gate is
+  not a record edit this change's diff made stale. Two defects in one file: the
+  asset gate returns bare (`if (path == nullptr) return;`) so an unset
+  `VLLM_MTP_GGUF_MODEL` is indistinguishable from a pass, against the loud
+  `MESSAGE("SKIPPED: ...")` shape W1 landed and W2 follows; and the comment
+  "the trunk count must EXCLUDE the head blocks: ... num_hidden_layers + depth
+  == block_count" sits above `CHECK(c.num_hidden_layers > 0)`, which is true of
+  every config ever built. W2's hermetic case pins that arithmetic for the
+  qwen35 GGUF path, so the family is no longer ungated, but the sibling test
+  still reads as evidence it is not. **No issue is filed for it yet**, because
+  W2 had no authority to open one; the operator dispatching the repair owns
+  filing it and linking it in `.agents/issue-index.md`.
 - **The merger and attention widths the reader never checks.** W1's reader
   validates the patch embedding's shape (`clip_mmproj_gguf.cpp:241-251`: both
   halves the same shape, `[out, in_channels, patch, patch]`) and nothing else.
@@ -1111,12 +1462,20 @@ them:
   `Qwen3.8-27B-Q4_K_M.gguf` and `mmproj-BF16.gguf` are PAID: both are mirrored
   and both hashes are recorded in
   [The live confirmation](#the-live-confirmation) and in `docs/USAGE.md`.
-- `model_mtp.safetensors`'s own header parse. Its 15 tensor names came from
-  `model.safetensors.index.json`, not from its header, and this spec says so
-  rather than implying otherwise.
-- The `docs/USAGE.md` rows for the two SAFETENSORS artifacts, per
-  [`porting-a-model.md`](../porting-a-model.md) §2.1. Owed by whichever row first
-  makes an arm reachable, not by this spec. The two GGUF rows are PAID: W1 made
+  `model.safetensors` is PAID by W4: mirrored, and sha256
+  `c473512c70eace07e2256fe9fd76596ac03e3295bee7d54cfb72676416afcc05` computed
+  over the bytes we hold. `model_mtp.safetensors` is still UNPAID: its header is
+  now read but its bytes are not mirrored, so no hash of ours exists.
+- ~~`model_mtp.safetensors`'s own header parse.~~ PAID by W4, 2026-08-20: read
+  by range request over the file's own header, 15 BF16 tensors, data-end
+  849,400,392 == the size the hub reports. Its 15 names, dtypes and shapes are
+  the committed `tests/vllm/models/qwen38_27b_nvfp4_mtp_manifest.inc`.
+- ~~The `docs/USAGE.md` rows for the two SAFETENSORS artifacts~~, per
+  [`porting-a-model.md`](../porting-a-model.md) §2.1. PAID by W4, which made the
+  refusal reachable and therefore published both artifacts with their repo,
+  revision, bytes, the one sha256 it computed, the arm split, and the FP8 arm
+  named as refused. Was owed by whichever row first made an arm reachable, not by
+  this spec. The two GGUF rows are PAID: W1 made
   `--mmproj` reachable, so it published the projector and its companion language
   file under `docs/USAGE.md` §"The exact files this was gated against", named as
   the third-party Unsloth quantizations they are.
@@ -1134,20 +1493,36 @@ them:
 ## Now
 
 `LOAD-GGUF-MMPROJ` is `PARTIAL`: W1 landed, and what it did and did not deliver
-is [W1 outcome](#w1-outcome). Its blocker cleared before it started — PR #876
-merged as `250db75a2`, so the GGUF architecture dispatch names an unsupported
-file by its own architecture instead of falling through to qwen3_5's assert.
-A user can now pass `--mmproj mmproj-BF16.gguf` beside a `.gguf` model, and the
-projector is read, refused by name, or accepted with its tower held on the
-engine. That is confirmed on the shipped 334-tensor artifact and not only on a
-fixture ([The live confirmation](#the-live-confirmation)); CI still reads the
-fixture alone. Nothing runs that tower yet, and that is `## Owed`.
+is [W1 outcome](#w1-outcome). A user can pass `--mmproj mmproj-BF16.gguf` beside
+a `.gguf` model, and the projector is read, refused by name, or accepted with
+its tower held on the engine. Nothing runs that tower yet, and that is
+`## Owed`.
 
-`QUANT-QWEN38-27B-GGUF-ARM` and `QUANT-QWEN38-27B-NVFP4-ARM` stay `READY`, both
-verified against the artifacts' own headers.
+`QUANT-QWEN38-27B-GGUF-ARM` is `PARTIAL`: W2 landed the accounting, and what it
+did and did not deliver is [W2 outcome](#w2-outcome). Both artifacts now have a
+committed header-only manifest, CI accounts each against the loaders' own
+enumeration with zero unaccounted in both directions and reads no file on the
+share, and a load refuses either file by name when it carries a tensor nothing
+reads. The `nextn` correction the [Port map](#quant-qwen38-27b-gguf-arm) asks
+for was already in the loader and was ungated; it is gated now.
 
-Next action is W2, the Q4_K_M manifest and accounting gate, because it needs no
-lease, no oracle and no GPU, and because the `block_count - nextn_predict_layers`
-correction it pins is the single most likely way to get a fluent, wrong model out
-of that file. Both token gates wait on #857 and #1185 respectively, and are not
-scheduled here.
+`QUANT-QWEN38-27B-NVFP4-ARM` is `PARTIAL`: W4 landed, and what it did and did
+not deliver is [W4 outcome](#w4-outcome). The artifact is re-pinned and mirrored
+with a locally computed sha256, its 1968 index names are accounted per scheme in
+CI from committed header-only manifests, and its FP8 group — 233 of its modules,
+including every attention and GDN projection and `lm_head` — is refused by name
+at load with both missing pieces stated, instead of dying on
+`tensor not found: ...input_scale` for a tensor the checkpoint correctly does
+not ship. The NVFP4 half still loads. What is NOT there is a runnable FP8 tower,
+a consumed `kv_cache_scheme`, and any token or byte-residency measurement.
+
+**Every CPU-side unit of this spec has now landed.** What remains is W3 and W5,
+the token gates, and both are blocked on a named external authority rather than
+on work this spec can schedule: W3 on
+[#857](https://github.com/mudler/vllm.cpp/issues/857) (llama.cpp records
+`gateable = no` at pin `b10451`) and W5 on
+[#1185](https://github.com/mudler/vllm.cpp/issues/1185) (the pinned vLLM builds
+and imports inside an `rc` lease, and running a model there is untested). Until
+one of those clears, the next action on this spec is neither: it is the FP8
+tower itself, which W4 refuses by name and lists under
+[What did NOT land, and is owed](#what-did-not-land-and-is-owed-1).

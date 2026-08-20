@@ -126,7 +126,7 @@ token-for-token correctness against the pinned oracle.
 | Capability | State | Notes |
 |---|---|---|
 | Qwen3.6-27B (NVFP4) text generation | Correctness-complete; speed is CHECKPOINT-dependent | Token-exact GB10 on both. `unsloth` @`890bdef7` beats vLLM every c (1.007-1.045x), 115/124; `nvidia` @`0893e160` **flat 0.937-0.956 c1-c32** (#349; 0.838 void) |
-| Qwen3.8-2.4T-A95B (`UD-Q1_0`, 370 GiB) | **Loads and generates on ONE 119 GiB GB10**; speed is the gap | Resident 62 GiB; 66.7 s/tok, streaming OFF. Streaming lands but its decode figure is VOID: the step clock had no caller, so the cache died in token 3 ([#912](https://github.com/mudler/vllm.cpp/issues/912)) |
+| Qwen3.8-2.4T-A95B (`UD-Q1_0`, 370 GiB) | **Loads and generates on ONE 119 GiB GB10**; speed is the gap | Resident 62 GiB; 66.7 s/tok, streaming OFF. Streaming-ON decode was VOID: the step clock had no caller, so the cache died in token 3 (#912). Re-measured LIVE in the `ENG-EXPERT-STREAM-DEVICE` row |
 | Qwen3.6-35B-A3B (NVFP4, GDN MoE) | Correctness-complete; **canonical 0.918-0.972x c1-c32** @`348c265d` (first c16/c32), STALE as of 2026-08-12 (+136 src commits then, incl. a +2.05% c8 lever); regrid owed | Token-exact SYNC+ASYNC; `VT_ASYNC_DEVICE_MIRROR` ON fixes async batch-1 token-0 degeneration. Router warp kernel (#378) device-gated 315/315 both arms, kernel 1.363x, step-level not separable |
 | Qwen3.6-35B-A3B (published BF16, GDN MoE) — TEXT | Correctness-gated 2026-08-15 (#740, #864, both `DONE`); **no throughput, latency or memory number exists for this checkpoint, and none is claimed** | Greedy vs the pinned oracle @`995ad96e`: **6/7 prompts STRICT 16/16**; the 7th is one exact logit tie (`0.0 mnats`) our argmax breaks toward the higher id (#910). SACRED 3/3, goldens byte-identical |
 | Qwen3.6-35B-A3B (BF16) — IMAGE / VIDEO | Implemented, **NOT gated** (#891); row stays `PARTIAL` | The 333 `model.visual.*` tensors load and the tower computes (`[1,28,28]`→`[196,2048]`, finite, absmax 2.08) on sm_110 FALLBACK attention. The token-exact mm gate vs the oracle is OWED |
@@ -393,7 +393,7 @@ a spike while its user-facing serving surface is finalized.
 
 **DSpark draft routing** (`SPEC-DSPARK-QWEN3-ROUTING`, ACTIVE) makes the loader classify a DSpark draft from the draft's own `config.json` before it resolves anything else. `Qwen3DSparkModel`, `Gemma4DSparkModel` and — ahead of the pin, mirroring vllm#52197 — `DSparkDraftModel` with `model_type` `qwen3` take the landed Qwen3 lane; a draft that resolves to the DeepSeek-V4 DSpark lane is refused BY NAME instead of being rewritten into a stub. CPU-gated only: the token-exact run gate against the pinned oracle waits on a draft download and GPU time that are not authorized, so it stays owed (#1193).
 
-**DFlash2** (`SPEC-DFLASH2`, ACTIVE, [#1314](https://github.com/mudler/vllm.cpp/issues/1314)) has landed its first wave and none of its mechanism. Upstream carries DFlash2 as a second architecture beside DFlash rather than as a change to it, so a `DFlashDraftModel` checkpoint keeps resolving exactly as it does today; what the new `DFlash2DraftModel` adds is a grouped dynamic depthwise convolution inside each draft block and a candidate selector that replaces the per-slot argmax with a scored path walk over the target head's top-K. Neither is implemented, so a draft that declares `DFlash2DraftModel` is now REFUSED at startup, before any weight is read, with both missing parts named. It is refused rather than loaded because a DFlash2 checkpoint carries DFlash1's whole tensor set: the DFlash1 lane would take it with nothing missing and draft worse tokens with no visible symptom, since the verify is lossless and only acceptance falls. The refusal covers the GGUF drafter too, which is the case the architecture string cannot reach: the published DFlash2 GGUF declares the same `dflash` architecture a DFlash1 drafter does, so it is identified by the convolution and selector metadata only it carries. The second half of the wave is the causality rule — a top-level `is_causal` now decides every layer ahead of `dflash_config.causal` and ahead of the `layer_types` default, which is what the published checkpoint (all five layers `sliding_attention`, `is_causal false`) depends on; no DFlash1 checkpoint declares the key, in either container, so their resolution is unchanged. The port is BEYOND-PIN on an OPEN upstream pull request and does not move the parity pin. No speed number is claimed, and none is admissible before the acceptance gate reads.
+**DFlash2** (`SPEC-DFLASH2`, ACTIVE, [#1314](https://github.com/mudler/vllm.cpp/issues/1314)) has landed its route, its causality rule and the FIRST of its two mechanisms — the grouped dynamic depthwise convolution — and none of the second. A safetensors `DFlash2DraftModel` draft now loads, runs that convolution around every attention and every MLP sublayer of every draft layer, and is refused BY NAME when the candidate selector would have to choose, with a notice at startup saying so in advance. A GGUF DFlash2 drafter is still refused at startup, because its weight path does not exist yet. The paragraph below describes the wave that shipped the refusal and remains accurate about everything except where the refusal now lands. Upstream carries DFlash2 as a second architecture beside DFlash rather than as a change to it, so a `DFlashDraftModel` checkpoint keeps resolving exactly as it does today; what the new `DFlash2DraftModel` adds is a grouped dynamic depthwise convolution inside each draft block and a candidate selector that replaces the per-slot argmax with a scored path walk over the target head's top-K. Neither is implemented, so a draft that declares `DFlash2DraftModel` is now REFUSED at startup, before any weight is read, with both missing parts named. It is refused rather than loaded because a DFlash2 checkpoint carries DFlash1's whole tensor set: the DFlash1 lane would take it with nothing missing and draft worse tokens with no visible symptom, since the verify is lossless and only acceptance falls. The refusal covers the GGUF drafter too, which is the case the architecture string cannot reach: the published DFlash2 GGUF declares the same `dflash` architecture a DFlash1 drafter does, so it is identified by the convolution and selector metadata only it carries. The second half of the wave is the causality rule — a top-level `is_causal` now decides every layer ahead of `dflash_config.causal` and ahead of the `layer_types` default, which is what the published checkpoint (all five layers `sliding_attention`, `is_causal false`) depends on; no DFlash1 checkpoint declares the key, in either container, so their resolution is unchanged. The port is BEYOND-PIN on an OPEN upstream pull request and does not move the parity pin. No speed number is claimed, and none is admissible before the acceptance gate reads.
 
 **DeepSeek-V4 native MTP** (`DeepSeekV4MTPModel`, ACTIVE — W1 self-spec wiring,
 2026-07-30) has its nextn draft head wired to the same lossless spec-decode path.
@@ -1117,9 +1117,9 @@ the latter with the caveat that vLLM's figure is set by
 
 **Its quantized arms are not gated.** Three rows on
 [#821](https://github.com/mudler/vllm.cpp/issues/821)
-([spec](../.agents/specs/qwen38-27b-quant-arms.md)): `LOAD-GGUF-MMPROJ` is
-`PARTIAL`, `QUANT-QWEN38-27B-GGUF-ARM` and `QUANT-QWEN38-27B-NVFP4-ARM` are
-`READY`. `AGENTS.md` makes the quantized arms a standing requirement, and these
+([spec](../.agents/specs/qwen38-27b-quant-arms.md)): `LOAD-GGUF-MMPROJ` and
+`QUANT-QWEN38-27B-GGUF-ARM` and `QUANT-QWEN38-27B-NVFP4-ARM` are all
+`PARTIAL`. `AGENTS.md` makes the quantized arms a standing requirement, and these
 are the arms a user can run: 17.1 GB of Q4_K_M against 53.8 GB of bf16 GGUF.
 
 **`LOAD-GGUF-MMPROJ` landed the loader half.** `--mmproj` on the server and
@@ -1133,15 +1133,33 @@ reader runs over the real `mmproj-BF16.gguf` (931 146 432 B, GGUF v3, 334
 tensors, 35 keys) behind `VLLM_CPP_QWEN38_27B_MMPROJ`, and its 334 consumed
 names, its `clip.*` geometry and its two-half patch-embedding join all agree.
 CI keeps the synthetic fixture and reads no NAS file. **Nothing runs that tower
-yet**, and the committed 334-name manifest with its CI accounting is owed by
-`QUANT-QWEN38-27B-GGUF-ARM`.
+yet.**
 
-The other two arms are not implemented. The artifact published as
-`unsloth/Qwen3.8-27B-NVFP4` is a compressed-tensors `mixed-precision` checkpoint
-with **zero `*.input_scale` tensors**, which is why the reported load dies. And
-the Q4_K_M file ships the MTP drafter as block 64, so a loader reading
-`block_count` as decoder depth builds a 65-layer model out of a 64-layer
-checkpoint.
+**`QUANT-QWEN38-27B-GGUF-ARM` landed the accounting.** Both files now have a
+committed manifest — 866 and 334 names with their ggml dims, type ids and
+scalar metadata, no weight bytes — and CI accounts each against the loaders'
+own enumeration with zero unaccounted in both directions. The load itself now
+refuses a qwen3_5 GGUF, or a projector, that carries tensors nothing reads,
+naming them before the tokenizer and before any weight byte. That is the
+direction that was silent: a tensor the loader asks for and the file lacks
+already refused by name; one the file ships and no loader reads was dropped.
+
+The Q4_K_M file ships an MTP drafter as `blk.64` under
+`qwen35.block_count = 65` and `qwen35.nextn_predict_layers = 1`, and the loader
+subtracts the second from the first, so the trunk is 64 layers. That was
+already true and was ungated; the accounting is what now fails if it stops
+being true. **Text decode against llama.cpp is still owed**, and so are the
+image and video legs.
+
+**`QUANT-QWEN38-27B-NVFP4-ARM` landed its accounting and its refusal.**
+`unsloth/Qwen3.8-27B-NVFP4` is a compressed-tensors `mixed-precision`
+checkpoint with **zero `*.input_scale` tensors**, re-pinned to
+`7d6f8d4d72f56b92b3cdbf22f156b90e1bab0108` with a locally computed sha256. All
+1968 of its index names are accounted per scheme in CI from committed
+header-only manifests, and its FP8 group — 233 modules, per-channel weight scale
+and dynamic per-token activations — is now refused by name at load with both
+missing pieces stated. **It still does not run:** no FP8 tower, no consumed
+`kv_cache_scheme`, and no token or resident-byte measurement.
 
 **Both token gates are `PENDING` on named external authorities, and this page
 claims no number for either.** The Q4_K_M arm's only comparator is llama.cpp,

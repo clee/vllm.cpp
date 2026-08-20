@@ -49,6 +49,11 @@ void StoreF32(const Tensor& t, int64_t elem_offset, float v) {
   }
 }
 
+// Defined below with the Mamba2 host references. Declared here because the
+// gated activations need it too: it is the general "what this value reads back
+// as at width `dt`" helper, not a Mamba2-private one.
+float RoundThrough(DType dt, float v);
+
 // GEMM chunk worker — 16x16 block tiling inside a chunk, ported from
 // ggml_compute_forward_mul_mat_one_chunk (ggml-cpu.c:1155-1243; empty-chunk
 // yield :1181-1184, blck_0/blck_1 = 16 :1192-1194). ggml's vec_dot per output
@@ -400,12 +405,29 @@ void RmsNormKernel(Queue&, Tensor& out, const Tensor& x, const Tensor& w,
 
 void SiluAndMulKernel(Queue&, Tensor& out, const Tensor& x) {
   const int64_t t = x.shape[0], d = x.shape[1] / 2;
+  // act(gate) is narrowed to the INPUT dtype before the multiply, which is what
+  // upstream does on every accelerator path it ships:
+  // csrc/libtorch_stable/activation_kernels.cu:158 `silu_kernel` returns
+  // `(T)(((float)x) / (1.0f + expf((float)-x * alpha)))` and :36 `compute`
+  // returns `(scalar_t)(ACT_FN(gate, alpha) * ((float)up + beta))`, so ACT_FN
+  // has already narrowed by the time the multiply happens; the vectorized
+  // :72 path narrows identically. The native reference agrees --
+  // activation.py:143 is `F.silu(x[..., :d]) * x[..., d:]`, and `F.silu` on a
+  // bf16 tensor yields bf16 -- and upstream pins the two BIT-EXACTLY at
+  // tests/kernels/core/test_activation.py:108,
+  // `assert_close(out, ref_out, atol=0.0, rtol=0.0)`. Pin 555967922. (#1322)
+  //
+  // The target is x's dtype, NOT out's. Upstream never has the two differ
+  // (`SiluAndMul.forward_cuda` allocates out with `dtype=x.dtype`), while this
+  // seam permits an f32 input with a bf16 output; keying on the input leaves
+  // every f32-in path bit-identical and confines the change to bf16-in ones.
+  const DType in_dt = x.dtype;
   ForRows(t, [&](int64_t r0, int64_t r1) {
   for (int64_t i = r0; i < r1; ++i) {
     for (int64_t j = 0; j < d; ++j) {
       float gate = LoadF32(x, i * 2 * d + j);
       float up = LoadF32(x, i * 2 * d + d + j);
-      float silu = gate / (1.0f + std::exp(-gate));
+      float silu = RoundThrough(in_dt, gate / (1.0f + std::exp(-gate)));
       StoreF32(out, i * d + j, silu * up);
     }
   }
@@ -416,13 +438,19 @@ void SiluAndMulKernel(Queue&, Tensor& out, const Tensor& x) {
 // sqrt(2/pi)*(g + 0.044715*g^3))) — the exact gelu_pytorch_tanh, computed in f32.
 void GeluAndMulKernel(Queue&, Tensor& out, const Tensor& x) {
   const int64_t t = x.shape[0], d = x.shape[1] / 2;
+  // Same polarity as SiluAndMulKernel above, and the same upstream anchors:
+  // activation_kernels.cu:205 `gelu_tanh_kernel` returns
+  // `(T)(0.5f * f * (1.0f + ::tanhf(inner)))`, activation.py:418 is
+  // `F.gelu(x[..., :d], approximate=approximate) * x[..., d:]`, and gelu_tanh
+  // is one of the activations test_activation.py:108 compares at atol=rtol=0.
+  const DType in_dt = x.dtype;
   ForRows(t, [&](int64_t r0, int64_t r1) {
   for (int64_t i = r0; i < r1; ++i) {
     for (int64_t j = 0; j < d; ++j) {
       float g = LoadF32(x, i * 2 * d + j);
       float up = LoadF32(x, i * 2 * d + d + j);
       float inner = 0.7978845608028654f * (g + 0.044715f * g * g * g);
-      float gelu = 0.5f * g * (1.0f + std::tanh(inner));
+      float gelu = RoundThrough(in_dt, 0.5f * g * (1.0f + std::tanh(inner)));
       StoreF32(out, i * d + j, gelu * up);
     }
   }
@@ -451,11 +479,19 @@ void SoftCapKernel(Queue&, Tensor& out, const Tensor& x, double cap) {
 
 void MoeSiluMulKernel(Queue&, Tensor& out, const Tensor& gate, const Tensor& up) {
   const int64_t n = out.Numel();
+  // Same polarity, same kernel upstream: fused_moe.py's `fused_experts_impl`
+  // reaches `activation.py::apply_moe_activation`, which calls
+  // `torch.ops._C.silu_and_mul` -- the very kernel anchored on
+  // SiluAndMulKernel above. The narrowing target is the GATE tensor's dtype,
+  // which is the activated half's input width, so the f32-gate callers
+  // (notably the grouped bf16 GEMM composite, whose partials are f32) are
+  // bit-identical to before.
+  const DType in_dt = gate.dtype;
   // Elementwise: partition the flat output range.
   ForRows(n, [&](int64_t r0, int64_t r1) {
   for (int64_t i = r0; i < r1; ++i) {
     const float g = LoadF32(gate, i);
-    const float silu = g / (1.0f + std::exp(-g));
+    const float silu = RoundThrough(in_dt, g / (1.0f + std::exp(-g)));
     StoreF32(out, i, silu * LoadF32(up, i));
   }
   });
@@ -3011,6 +3047,90 @@ void DFlashPagedBlockAttentionKernel(Queue&, Tensor& out, const Tensor& query,
   });
 }
 
+// DFlash2 grouped dynamic depthwise convolution (SPEC-DFLASH2 W2, #1314) — the
+// CPU REFERENCE, and the authoritative implementation the CUDA kernel mirrors.
+//
+// BEYOND-PIN. Ported from `_grouped_conv`
+// (vllm/model_executor/models/qwen3_dflash2.py @ vllm-project/vllm#52816 head
+// `19c9351904df4c63042671bc67a866ca48dc7d6f`):
+//
+//     blocks = hidden_states.unflatten(-1, (num_groups, group_size))
+//     coefficients = base.view(1, taps, num_groups, group_size) + delta.unsqueeze(-1)
+//     output = coefficients[:, 0] * blocks
+//     position = torch.arange(hidden_states.shape[0], device=...)
+//     if block_size & (block_size - 1) == 0:
+//         position = position & (block_size - 1)
+//     else:
+//         position = position % block_size
+//     for tap in range(1, taps):
+//         shifted = F.pad(blocks[:-tap], (0, 0, 0, 0, tap, 0))
+//         output += coefficients[:, tap] * shifted * (position >= tap).view(-1, 1, 1)
+//     return output.flatten(-2)
+//
+// Three things are load-bearing and each is invisible to a token gate if wrong,
+// because a DFlash2 draft with a broken conv still emits the TARGET's tokens
+// (the verify is lossless) and loses only acceptance:
+//
+//  1. THE BLOCK MASK. `position` is the GLOBAL row index reduced modulo the
+//     block, so tap `t` contributes only where the source row `i-t` lies in the
+//     same (1+k) query block. Upstream's `F.pad(blocks[:-tap], ...)` supplies a
+//     zero for the first `tap` rows of the WHOLE batch and the mask supplies it
+//     at every later block boundary; this loop simply stops at `t > pos`, which
+//     is the same set because the mask is monotone in `t`.
+//  2. THE GROUP MAP. `delta` is indexed per GROUP and `base` per CHANNEL, so the
+//     same delta applies to every channel of a group. `g = c / group_size`.
+//  3. THE SIDE. `base` is `[sides, taps, H]` and dim 0 is prepare/finish, NOT a
+//     tap. On the published 27B draft both axes are 2, so a swap is undetectable
+//     by shape alone.
+//
+// ROUNDING. Upstream's chain materializes a tensor of the model dtype after each
+// step (`base + delta`, `coefficients * blocks`, `output += ...`), so each step
+// rounds here too. Every step is elementwise with no reduction-order freedom, so
+// this and the CUDA kernel agree BIT-FOR-BIT rather than within an envelope.
+void DFlashGroupedConvKernel(Queue&, Tensor& out, const Tensor& x, const Tensor& coefficients,
+                             const Tensor& base, const DFlashGroupedConvArgs& args) {
+  const int64_t rows = x.shape[0];
+  const int64_t taps = args.taps;
+  const int64_t groups = args.num_groups;
+  const int64_t gsize = args.group_size;
+  const int64_t h = groups * gsize;
+  const int64_t sides = coefficients.shape[1];
+  const int64_t side = args.side;
+  const int64_t block = args.block_size;
+  // Upstream's own power-of-two special case, mirrored including the `&` arm:
+  // both published DFlash2 checkpoints resolve to a power-of-two query block
+  // (8 and 16), and upstream's reference test parametrises 5 for the other arm.
+  const bool pot = (block & (block - 1)) == 0;
+  const DType dt = out.dtype;
+  const auto round = [dt](float v) -> float {
+    switch (dt) {
+      case DType::kF32: return v;
+      case DType::kF16: return F16ToF32(F32ToF16(v));
+      case DType::kBF16: return BF16ToF32(F32ToBF16(v));
+      default: VT_CHECK(false, "dflash2-grouped-conv: unsupported dtype"); return 0.0f;
+    }
+  };
+  ForRows(rows, [&](int64_t r0, int64_t r1) {
+    for (int64_t i = r0; i < r1; ++i) {
+      const int64_t pos = pot ? (i & (block - 1)) : (i % block);
+      for (int64_t g = 0; g < groups; ++g) {
+        for (int64_t j = 0; j < gsize; ++j) {
+          const int64_t c = g * gsize + j;
+          float acc = 0.0f;
+          for (int64_t t = 0; t < taps && t <= pos; ++t) {
+            const float b = LoadF32(base, (side * taps + t) * h + c);
+            const float d = LoadF32(coefficients, ((i * sides + side) * taps + t) * groups + g);
+            const float k = round(b + d);
+            const float term = round(k * LoadF32(x, (i - t) * h + c));
+            acc = (t == 0) ? term : round(acc + term);
+          }
+          StoreF32(out, i * h + c, acc);
+        }
+      }
+    }
+  });
+}
+
 // --- Qwen3.6 elementwise "glue" ops (M0.9 forward). Elementwise fusions of the
 // small host-side loops between the big decode ops; all math f32, dims inferred
 // from the tensor shapes.
@@ -3450,6 +3570,9 @@ struct Registrar {
     RegisterOp(OpId::kDFlashPagedBlockAttention, DeviceType::kCPU,
                reinterpret_cast<void*>(
                    static_cast<DFlashPagedBlockAttentionFn>(&DFlashPagedBlockAttentionKernel)));
+    RegisterOp(OpId::kDFlashGroupedConv, DeviceType::kCPU,
+               reinterpret_cast<void*>(
+                   static_cast<DFlashGroupedConvFn>(&DFlashGroupedConvKernel)));
     RegisterOp(OpId::kCastBf16, DeviceType::kCPU,
                reinterpret_cast<void*>(static_cast<CastBf16Fn>(&CastBf16Kernel)));
     RegisterOp(OpId::kCastF32, DeviceType::kCPU,
