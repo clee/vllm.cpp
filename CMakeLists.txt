@@ -997,6 +997,9 @@ add_library(vllm STATIC
   src/vllm/model_executor/layers/quantization/fp8_block_quant.cpp
   src/vllm/plugins/plugins.cpp
   src/vllm/model_executor/models/qwen3_vl_vision.cpp
+  # LOAD-GGUF-MMPROJ (#821): the llama.cpp `clip` mmproj reader that fills the
+  # SAME Qwen3VLVisionWeights from a SECOND GGUF file beside the language one.
+  src/vllm/model_executor/models/clip_mmproj_gguf.cpp
   src/vllm/model_executor/models/gemma4_vision.cpp
   src/vllm/model_executor/models/gemma4_audio.cpp
   src/vllm/model_executor/models/whisper_audio.cpp
@@ -1044,6 +1047,10 @@ add_library(vllm STATIC
   # composes the L2-L6 bricks into frames + a waveform (phase L7). Additive:
   # one file plus one REGISTER_VLLM_VIDEO_FAMILY line, which is the property
   # the seam exists to have.
+  # W0 of LTX25-DEVICE-RESIDENCY (#1010): where a render spends its wall, and
+  # how many bytes it held while it did. Family-neutral, driven by the LTX-2.5
+  # driver today.
+  src/vllm/multimodal/render_phase_log.cpp
   src/vllm/multimodal/ltx2_video.cpp
   src/vllm/v1/core/encoder_cache_manager.cpp
   src/vllm/tokenizer/unicode_data.cpp
@@ -1115,6 +1122,7 @@ add_library(vllm STATIC
   src/vllm/v1/attention/backend.cpp
   src/vllm/v1/attention/registry.cpp
   src/vllm/v1/attention/backends/utils.cpp
+  src/vllm/v1/attention/backends/cpu_attn.cpp
   src/vllm/v1/attention/backends/gdn_attn.cpp
   src/vllm/v1/structured_output/backend_types.cpp
   src/vllm/v1/structured_output/backend_native.cpp
