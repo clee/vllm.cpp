@@ -816,6 +816,29 @@ reference engine read the same. `head_size`, `block_size` and the KV-cache dtype
 come from the geometry the engine has just resolved for your checkpoint, so a
 refusal is about that checkpoint on this build.
 
+**A device is only ever offered the backends built for it.** On CPU the engine
+resolves `CPU_ATTN`, which is what the reference engine resolves on a CPU too. It
+is worth saying out loud because it was briefly untrue: `CPU_ATTN` was named as
+the CPU's preference while being registered nowhere, so CPU runs quietly fell
+through to `FLASH_ATTN` — harmless until `FLASH_ATTN` was taught FlashAttention-2's
+rule that a head size must be a multiple of 8. A CPU model with a head size of 6
+then had no backend at all and was refused at initialization, on hardware that
+runs it perfectly well ([#1371](https://github.com/mudler/vllm.cpp/issues/1371)).
+If you see the refusal above naming `FLASH_ATTN` alone on a device that is not an
+NVIDIA GPU, that is the shape to report: the rule quoted at you is about a kernel
+your device never runs.
+
+One consequence is worth stating on its own, because it widens what a CPU run
+accepts. `CPU_ATTN` serves **`f32` as well as `f16` and `bf16`**, which is what
+the reference engine's CPU backend serves. `FLASH_ATTN` declares the two half
+dtypes only, so while the CPU was borrowing it an `f32` model was refused at
+initialization with `dtype not supported`. It now runs. The KV-cache dtypes the
+CPU accepts are `auto`, `fp8` and `fp8_e4m3`; `fp8_e5m2` is refused by name,
+because the CPU kernel's fp8 arm reads e4m3 alone. On an NVIDIA GPU the list is
+`auto`, `float16`, `bfloat16`, `fp8` and `fp8_e4m3`, so `fp8_e5m2` is refused
+there too. That second refusal is the reference engine's own and is not
+something this project trimmed away.
+
 **What this check cannot tell you.** It reports what a backend *claims*, never
 what your binary contains and never whether the kernel will launch. A backend
 whose declared floor is compute capability 8.0 is accepted on any newer GPU, even
@@ -1169,6 +1192,74 @@ nothing else.
 The timeline starts at the **engine load**, because on a 22B checkpoint the DiT
 staging is minutes paid at the front of every render. A process that loads a
 second engine starts a new timeline, so the table describes the last load.
+
+### While the render runs: the `[render]` lines
+
+The table above is written by a generation that **returns**. A render that is
+killed, aborted by a lease governor, or still going writes none, so LTX-2.5 also
+narrates itself on stderr as it goes, on the shipped default and behind no flag:
+
+```text
+[render] + load                     t=0.000s
+[render] + load.dit                 t=0.001s
+[render] - load.dit                 t=0.002s dur=0.001s host=0.01GiB
+...
+[render] - load                     t=0.027s dur=0.027s host=0.02GiB
+[render] + generate                 t=0.027s
+...
+[render] + denoise                  t=0.027s
+[render] + denoise.step             t=0.027s
+[render]   dit forward 1  phase 0 step 1/8  t=0.027s
+[render] - denoise.step             t=0.065s dur=0.038s host=0.02GiB
+[render] + denoise.step             t=0.066s
+[render]   dit forward 2  phase 0 step 2/8  t=0.066s last=0.038s
+[render] - denoise.step             t=0.069s dur=0.003s host=0.02GiB
+...
+[render] - denoise                  t=0.146s dur=0.118s host=0.02GiB
+[render] + decode.video             t=0.146s
+[render] - decode.video             t=0.147s dur=0.001s host=0.02GiB
+[render] + artifacts.frames         t=0.147s
+...
+[render] + decode.audio             t=0.148s
+[render] + decode.audio.mel         t=0.148s
+[render] - decode.audio.mel         t=0.155s dur=0.008s host=0.02GiB
+[render] + decode.audio.vocoder     t=0.155s
+[render] - decode.audio.vocoder     t=0.236s dur=0.081s host=0.02GiB
+[render] - decode.audio             t=0.236s dur=0.089s host=0.02GiB
+[render] - generate                 t=0.237s dur=0.209s host=0.02GiB
+```
+
+**That is a real capture**, from the CPU gate render at 64x64 over 9 frames — the
+seconds and the byte counts are that render's, on a contended box, and nothing
+here is a benchmark. It is shown at this scale on purpose. The same lines from a
+21.004 B render would carry a `load.dit` of minutes and a `last=` on the order of
+[#1375](https://github.com/mudler/vllm.cpp/issues/1375)'s measured 162 s per DiT
+forward, and **no such render has been captured yet** — that is W1's lease. A
+worked example at that scale would be a projection, and a projection printed in a
+public document gets quoted back as a measurement.
+
+Read it as three things:
+
+* **The last line names what is running.** A phase prints when it opens, not
+  only when it finishes, so a run that stops inside a phase still says which one.
+  Between the banner and `wrote N frames` there was previously nothing at all,
+  and a working render and a hung one were the same observation.
+* **`last=` is the per-forward cost.** Seconds since the previous DiT forward,
+  measured by the process doing the work rather than inferred from outside it.
+* **`step k/N` is exact; the forward counter has no denominator.** The sampler
+  decides how many denoiser calls a step takes and the guider decides how many
+  forwards each call is (one to four), so a total would be a guess. Two forwards
+  per step is what `cfg_scale != 1.0` alone buys; a guider that also runs the
+  STG and modality legs does four, which is what the device-resident arm does
+  now that [#1092](https://github.com/mudler/vllm.cpp/issues/1092) gave
+  `Ltx2DitForwardDevice` its `perturbations` argument. The `k/N` fraction is
+  unaffected either way: it reads the recipe phase's own `sigmas`.
+
+`VLLM_RENDER_PROGRESS=0` silences them. It is a measurement lane so an A/B over
+what the emitter costs runs on one binary, not a setting to turn off: the cost is
+one flushed `fprintf` per phase boundary and per forward — on the order of a
+hundred writes against hours of wall — and nothing is emitted per token or per
+VAE tile.
 
 Add `--first-frame frame.ppm --image-crf 0` for image-to-video. The PPM is
 binary P6 at maxval 255 (no PNG/JPEG codec is vendored); `--image-crf 0` is
@@ -4670,7 +4761,7 @@ save.
 ```sh
 VT_MOE_EXPERT_STREAM=1 \
 VT_MOE_EXPERT_STREAM_SLOTS=4000 \
-  ./build/examples/vllm-cli --model /models/Qwen3.8-2.4T-A95B-UD-Q1_0-00001-of-00008.gguf \
+  ./build/examples/vllm-cli --model /models/Qwen3.8-2.4T-A95B-UD-Q1_0-00001-of-00010.gguf \
                    --prompt "The capital of France is" --max-tokens 16
 ```
 
@@ -4780,7 +4871,7 @@ weights from the device to host RAM, and the `vllm_cpp` key governs the tier
 below that, where weights stay borrowed out of the file mapping.
 
 ```sh
-./build/examples/vllm-server --model /models/Qwen3.8-2.4T-A95B-UD-Q1_0-00001-of-00008.gguf \
+./build/examples/vllm-server --model /models/Qwen3.8-2.4T-A95B-UD-Q1_0-00001-of-00010.gguf \
   --offload-config '{"vllm_cpp":{"mmap":{"enabled":true,"prefault":false},
                                  "expert_stream":{"enabled":true,"slots":4000}}}'
 ```
@@ -5016,6 +5107,249 @@ parser refuses it at startup.
 on a GB10, because host and device share one pool. `cudaMemGetInfo` answers
 honestly, and its `total` is EXACTLY `/proc/meminfo MemTotal`
 (125442340 kB) times 1024. Do not size this from `nvidia-smi`.
+
+## Qwen3.8-2.4T-A95B `UD-Q1_0`: 370 GiB served from a 119 GiB box
+
+A 2.4-trillion-parameter mixture-of-experts checkpoint, three times the size of
+the machine's memory, loads and answers on one DGX Spark. This section is the
+recipe. The mechanism it drives is the previous section,
+[Streaming routed experts from disk](#streaming-routed-experts-from-disk-capacity-mode),
+which owns the config schema, the precedence rule, the statistics line, the slot
+count warning and what each device can serve. This section links them rather than
+restating them. It repeats three of their facts on purpose: which device to use,
+the expert bytes a token reads, and the two streaming decode figures in
+[What decode costs](#what-decode-costs-and-why-the-ceiling-is-where-it-is). A
+recipe that leaves those out is not a recipe. Each of the three has one record,
+so a correction has to change both places. The decode figures are
+`ENG-EXPERT-STREAM-DEVICE` W0e in
+[`.agents/benchmark-record.md`](../.agents/benchmark-record.md).
+
+**Read the speed before you spend the download.** Steady decode on the recipe
+below is measured in seconds per token, and the floor under it is storage rather
+than this implementation. This is a capacity result, not an interactive one.
+[What decode costs](#what-decode-costs-and-why-the-ceiling-is-where-it-is) gives
+the figure and the arithmetic behind it.
+
+**Use `--device cpu` for this checkpoint.** `--device cuda` loads and decodes it
+too, and its token gate against the CPU arm does not pass, so every number below
+was measured on the CPU arm. The previous section states that arm's six limits.
+
+### The exact weights
+
+| Field | Value |
+|---|---|
+| Repo and revision | `unsloth/Qwen3.8-2.4T-A95B-GGUF` @ `567d3e6ac26c5474b18311e619c04350fb9a5556` |
+| Publisher | Unsloth, a third-party quantization rather than a first-party release |
+| Arm | `UD-Q1_0`, which stores the expert towers at 1.1875 bits per weight |
+| Files | `UD-Q1_0/Qwen3.8-2.4T-A95B-UD-Q1_0-000{01..10}-of-00010.gguf`, ten shards |
+| Bytes | 397 256 393 248 over the ten files, that is 369.97 GiB |
+| Tensor records | 1702, equal to the `split.tensors.count` the shards declare |
+| sha256, shard 1 | `b7770552b2ac24e7334c917bc92e90e218e87cfe29484db65e62e8ef2a60334d` for `-00001-of-00010.gguf`, 10 943 264 B |
+| sha256, shard 2 | `2765517f833c736338d3ab34354e1c10eb8d79e62325f998285b435e5cf03dcd` for `-00002-of-00010.gguf`, 48 759 636 544 B |
+
+**Ten shards, and the count is part of every file name.** A GGUF split writes
+the total into each member's name, so `-of-00008` and `-of-00010` name different
+files, and the wrong one gives a file-not-found after a 370 GiB download. The
+two recipes in the previous section carried `-of-00008` until this change
+([#1420](https://github.com/mudler/vllm.cpp/issues/1420)). The count is settled
+against the artifact and not against a document: shard 1's own metadata declares
+`split.count = 10` and `split.tensors.count = 1702`, its sha256 recomputed from
+the mirrored copy equals the value above, and the ten files sum to exactly the
+byte total above. Shard 1 holds **no tensors at all**. It is the metadata and the
+split declaration, so it is the file that says what the other nine are.
+
+**A repo id alone is not a pin**, because a quantized checkpoint gets
+re-quantized in place under an unchanged name. Shard 1's digest was recomputed
+from the mirrored copy. Shard 2's is the download manifest's, and its byte count
+was recomputed.
+
+```sh
+hf download unsloth/Qwen3.8-2.4T-A95B-GGUF \
+  --revision 567d3e6ac26c5474b18311e619c04350fb9a5556 \
+  --include "UD-Q1_0/*" \
+  --local-dir ./qwen3.8-2.4t-a95b-gguf
+```
+
+The files land under a `UD-Q1_0/` subdirectory of `--local-dir`, because that is
+where they live in the repo. Point `--model` at a copy on **local NVMe**. A
+network filesystem puts an uncontrolled variable in front of the expert reads
+that every token makes.
+
+**The encoding has no upstream reference.** `UD-Q1_0` stores its expert towers as
+`IQ1_XXXS`, which upstream llama.cpp does not define. The encoding exists only in
+the `unslothai/llama.cpp` fork, pinned as a secondary oracle in
+[`.agents/oracles/llama-cpp-unsloth.md`](../.agents/oracles/llama-cpp-unsloth.md).
+That fork is recorded `gateable = no`, because it has not been shown to build and
+run this model, and [#933](https://github.com/mudler/vllm.cpp/issues/933) owes
+the measurement. There is therefore no token-exact denominator for anything below.
+
+### Build and serve
+
+A plain CPU build is enough. No CUDA is involved on this path.
+
+```sh
+cmake -S . -B build
+cmake --build build -j
+```
+
+```sh
+./build/examples/vllm-server \
+  --model ./qwen3.8-2.4t-a95b-gguf/UD-Q1_0/Qwen3.8-2.4T-A95B-UD-Q1_0-00001-of-00010.gguf \
+  --offload-config '{"vllm_cpp":{"mmap":{"enabled":true,"prefault":false},
+                                 "expert_stream":{"enabled":true,"slots":4000}}}' \
+  --device cpu \
+  --max-num-seqs 1 \
+  --max-model-len 512 \
+  --port 8899
+```
+
+Five things in that command are load-bearing.
+
+- **`--model` takes shard 1, not the directory.** A directory sends the loader
+  down the HuggingFace branch, which fatals on a missing `config.json` before it
+  looks for a GGUF. Given shard 1 the reader finds its nine siblings from the
+  `-NNNNN-of-MMMMM.gguf` naming and cross-checks `split.count`.
+- **`prefault: false` is the setting that decides whether this works.**
+  Pre-faulting is **on** by default, and it is the right default for a model that
+  fits: it walks every borrowed span at load, so the first-touch faults do not
+  land inside the timed prefill. For 335.62 GiB of expert towers that cannot fit,
+  it reads the whole checkpoint to populate a page cache that cannot hold it.
+- **`mmap: true` confirms the default rather than enabling it.** It is already on
+  wherever the weights stay quantized, and it is what makes the checkpoint fit at
+  all: an expert tower is borrowed from the file mapping and costs zero anonymous
+  bytes, so only the dense remainder becomes resident.
+- **`expert_stream` is off by default, and this recipe turns it on at 4000
+  slots.** That count is the one the published decode figure was measured at, and
+  the previous section explains why 8000 is worse rather than better.
+- **`--device cpu`.** The note at the top of this section says why.
+
+`--max-num-seqs 1` and a small `--max-model-len` keep the KV cache out of the
+way. Nothing is batched at this speed, and the capacity argument itself holds
+only at low concurrency: at high concurrency every step touches most of the
+experts and the working set stops being one.
+
+The recorded runs set the equivalent environment variables rather than the
+config document: `VT_GGUF_PREFAULT=0`, `VT_MOE_EXPERT_STREAM=1` and
+`VT_MOE_EXPERT_STREAM_SLOTS=4000`. The two forms are the same switches, and a
+variable beats a config field wherever both are set.
+
+They also ran a different binary. Every figure below comes from
+`benchmarks/expert_stream_device_w0e.cpp`, a purpose-built C ABI client that
+reports the token ids, a per-step timestamp and the expert-stream counters
+together, which no shipped command does. The command above starts `vllm-server`
+over the same engine. At seconds per token, the server's HTTP and SSE framing
+sits far below the run-to-run spread recorded below.
+
+### What the load costs
+
+Expect to wait. Two runs of this arm are recorded on `dgx:gpu0`, a GB10 with
+119.631 GiB of unified memory reading the checkpoint from local NVMe, with the
+page cache dropped before each one (`ENG-EXPERT-STREAM-DEVICE` W0e, 18 and
+19 August 2026, [`.agents/benchmark-record.md`](../.agents/benchmark-record.md)):
+
+| Axis | Run 1 | Run 2 |
+|---|---|---|
+| load | 271.1 s | 255.7 s |
+| first token | 85.90 s | 79.09 s |
+| peak resident set | 86.5 GiB | 86.5 GiB |
+| peak swap | not sampled | 6 883 MiB |
+
+Resident memory after the load settles at about **62 GiB** of 119 GiB, measured
+at 62.45 GiB on the same-lease CPU control run of `ENG-EXPERT-STREAM-DEVICE`
+W0f. That is the
+dense remainder plus the KV cache and the runtime, and it agrees with what the
+checkpoint's own tensor table predicts: 21.56 GiB of `attn_qkv` and 17.25 GiB of
+`ssm_out` expanded to bf16, plus 5.81 GiB of embeddings and F32 norms, so
+44.6 GiB before the KV cache and the runtime. The other 335.62 GiB is mapped,
+not copied. **The model does not fit because of streaming. It fits because of
+borrowing.**
+
+Check readiness against the model list rather than against the process:
+
+```sh
+curl -sf http://127.0.0.1:8899/v1/models
+```
+
+```sh
+curl -s http://127.0.0.1:8899/v1/completions -H 'Content-Type: application/json' \
+  -d '{"model":"Qwen3.8-2.4T-A95B-UD-Q1_0-00001-of-00010.gguf",
+       "prompt":"Q: What is the capital of France? A:","max_tokens":4}'
+```
+
+The 16 August 2026 run, which served with streaming off, answered
+` Paris. Q: What`. That is the whole point: the output is coherent, so the
+one-bit encoding and the borrowed-tower path are both faithful enough to serve.
+The four W0e runs drive a fixed prompt of token ids instead of this request, and
+all four returned the same 32 ids, which detokenize to ` Paris. Paris is a city
+located in the northern part of France, on the Seine River. It is the largest
+city in France and is known for its iconic`.
+
+### What decode costs, and why the ceiling is where it is
+
+Every figure here comes from the box named above.
+
+| Arm | Steady decode | Where it comes from |
+|---|---|---|
+| streaming on, 4000 slots | **11.05 s/token** | W0e rep 2, median over steps 4 to 32 |
+| streaming on, 8000 slots | 39.98 and 45.40 s/token | W0e, the medians of two reps |
+| streaming off | 66.7 s/token | 16 August 2026, streaming not yet enabled |
+
+That 4000-slot figure has a min of 9.43 and a max of 13.25 over its window, and
+rep 1 of the same arm gives 11.22, which is 1.54% above it. **The
+streaming-off row carries no ratio against the other two**, because it was taken
+on a different source tree on a different date. The two slot counts came from one
+binary on one lease and are comparable with each other; the previous section
+carries that comparison.
+
+**A bigger cache came out slower**, which is why this recipe sets 4000 slots.
+The previous section states the reason and its evidence.
+
+Do not quote a first-token time as a decode number. Token 1 carries the prefill
+and the cold expert set. From token 2 onward you are watching steady state. The
+complete measurement record is [docs/BENCHMARKS.md](BENCHMARKS.md).
+
+The arithmetic behind those seconds is short, and it decides everything. The
+first three rows are read from the checkpoint's own metadata:
+
+| Quantity | Value |
+|---|---|
+| blocks (`qwen35moe.block_count`) | 93 |
+| experts routed per block, of `qwen35moe.expert_count` | 10 of 512 |
+| projections per routed expert | 3 |
+| expert slices per token | 2790 |
+| bytes per slice | 2 490 368, that is 2.375 MiB |
+| expert working set per token | **6.95 GB**, that is 6.47 GiB |
+| slots this recipe reserves | 4000, a 9.28 GiB arena |
+
+That figure is a working set and not an I/O rate, because the slot cache serves
+part of it from memory. The recorded 32-token run at 4000 slots counted 37 096
+hits against 58 538 misses.
+
+**The floor is storage, not software.** 6.95 GB at the roughly 5 GB/s an NVMe of
+this class sustains is 1.39 s/token whatever the code does, which is 0.72 tok/s.
+Reaching 3 tok/s would demand about 21 GB/s of expert bandwidth, so most of those
+reads would have to come from memory instead. The arena holds 4000 slices against
+the 2790 a token needs, under one and a half tokens of working set, and
+top-10-of-512 routing does not give consecutive tokens enough reuse to close the
+rest. **If you need conversational speed from this model you need more memory or
+fewer active parameters, not better software.**
+
+### What this does not establish
+
+- **The quantization is extreme.** The expert towers hold 1.1875 bits per weight,
+  and they are about 97% of the parameters. The output is coherent; this is not
+  the configuration to judge the model's quality by.
+- **There is no oracle.** No entry in the oracle table runs this checkpoint on
+  this hardware, so there is no token-exact and no throughput denominator. Every
+  figure above is an absolute measurement of this implementation, compared
+  against nothing.
+- **One request at a time.** Nothing here says anything about concurrency, and
+  the capacity argument stops holding as concurrency rises.
+- **One box.** Every number was taken on one DGX Spark GB10 with the checkpoint
+  on local NVMe. Different storage or a different host changes them.
+- **Nothing here is a `--device cuda` number.** That arm decodes this checkpoint
+  and its token gate against the CPU arm fails. The previous section's sixth
+  limit states what follows for its speed axis.
 
 ## Turning CUDA graph capture off, including the break seam
 
