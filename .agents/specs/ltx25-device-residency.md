@@ -1321,11 +1321,19 @@ the two heads, which is what carrying it forward would have hidden.
 | M10 | re-anchored: after a chunk, re-label the decode as the writer | 1 file, +1/-1 | rc 0 | **RED**, exit 1, 1 case failed, **556 assertions, 4 failed** | exit 0, 446/446 |
 | N10 | detach `artifacts.frames.ppm` from the `WriteFileBytes` loop by closing it before the loop runs | 1 file, +1/-1 | rc 0 | **RED**, exit 1, 1 case failed, **554 assertions, 3 failed** | exit 0, 446/446 |
 
-**Twelve mutations on `17eba8ce2`, the head that lands**, re-applied after the
-FOURTH merge rather than carried forward. The counts moved again and the
-verdicts did not: N6 reports 3 failed assertions here against 5 on `99703ce5a`,
-and N1 reports 6 against 3 — the last because the per-part floor this change adds
-catches the name swap as well as the boundary shift.
+**Twelve mutations, run on BOTH merge heads: `17eba8ce2` and `1160d04b5`, the
+head that lands.** The set was re-applied after each merge rather than carried
+forward. Across the fourth merge the counts moved and the verdicts did not: N6
+reports 3 failed assertions against 5 on `99703ce5a`, and N1 reports 6 against 3
+— the last because the per-part floor this change adds catches the name swap as
+well as the boundary shift.
+
+**Across the FIFTH merge every count is byte-identical**, all twelve of them,
+which is the measurement the merge commit's argument was owed. That merge touches
+`src/vt/cpu/cpu_ops.cpp`, the file whose `act(gate)` narrowing moved the counts
+last time, and `git diff --numstat` reports 87 insertions and zero deletions
+there. "Purely additive" was the prediction; twelve unchanged counts are the
+evidence for it, and the prediction is not a substitute for the run.
 
 **SEVEN OF THE TWELVE ARE RECONSTRUCTIONS, and this is the disclosure.** Only
 R1b, its mirror, N1, N6 and M13 run from a definition recorded in this tree. The
