@@ -88,7 +88,7 @@ therefore correct.
 
 The comment above the paged guard is not. It says the conv page is "never
 widened to f32", and the `VT_CHECK` on the next line admits
-`kBF16 || kF16 || kF32` (`nemotron_h_device.cpp:1582-1584`). `runner.cpp:643-644`
+`kBF16 || kF16 || kF32` (`nemotron_h_device.cpp:1581-1583`). `runner.cpp:643-644`
 admits the same three. A `conv_dtype` mutation to f32 would sail past both
 checks; nothing but the allocation would stop it, and a token gate cannot see the
 doubled bytes. This is a record defect on `main` — the comment and the guard are
