@@ -16,8 +16,11 @@
 # divergence and prints it, so it is one file per row, read with a glob
 # (AGENTS.md "Records"), rather than another writer of a shared surface.
 #
-# RUN IT INSIDE A LEASE, NEVER OVER ssh. The wheel and the load configuration
-# are the ones measured on that box -- see /workspace/oracle-vllm/README-WHEELS.md
+# RUN IT INSIDE A LEASE, NEVER OVER ssh. The WHEEL is the one measured on that
+# box. The LOAD CONFIGURATION is not: run 4 of the five ran the configuration
+# that survived on 2026-08-18 and died anyway, so it is a starting point under
+# investigation, not a known-good recipe. For the wheel see
+# /workspace/oracle-vllm/README-WHEELS.md
 # (vLLM's default FLASH_ATTN carries no sm_12x SASS and cannot run on a GB10;
 # and the wheel needs a PEP 427 name before pip will take it, #1416):
 #
@@ -58,47 +61,70 @@ def main():
     entries = golden["golden"]
     T = int(golden["sampling"]["max_tokens"])
 
-    # ★ THIS IS, EXACTLY, THE CONFIGURATION THAT IS MEASURED TO SURVIVE HERE.
-    # /workspace/nhspeed/oracle_only.sh attempt `a`, 2026-08-18: it loaded this
-    # same 20.1 GiB checkpoint on this same box, bottomed out at
+    # ★ THE CONFIGURATION BELOW IS NOT KNOWN TO SURVIVE. It is the one that used
+    # to survive, plus one variable. Both halves of that sentence were measured.
+    #
+    # FIVE runs on `dgx:gpu0`, 2026-08-19/20, logs under /workspace/a2q1-neartie/.
+    # Every one was killed by the host-memory watchdog inside engine START-UP,
+    # before a token existed (#1431). The watchdog FLOOR was not constant across
+    # them, so the kill values are not comparable as a series:
+    #
+    #   run  stamp             deviation from the reference config    floor   killed at
+    #   1    20260820T002359Z  + max_logprobs=64                      15000   12597 MB
+    #   2    20260820T024243Z  + enforce_eager=True, len 256, seqs 1  20000   19433 MB
+    #   3    20260820T025540Z  + num_gpu_blocks_override=8            20000   19797 MB
+    #   4    20260820T030818Z  NONE -- the reference config itself    15000   13941 MB
+    #   5    20260820T031644Z  + kv_cache_memory_bytes=4 GiB          15000   14846 MB
+    #
+    # RUN 4 IS THE ONE THAT MATTERS, and it falsifies the premise this block used
+    # to state. /workspace/nhspeed/oracle_only.sh attempt `a` loaded this same
+    # 20.1 GiB checkpoint on this same box on 2026-08-18, bottomed out at
     # minMemAvailable_MB=51528, and generated all three prompts
-    # (`ORACLE TOKEN MATCH: 180/192`). Nothing below deviates from it.
+    # (`ORACLE TOKEN MATCH: 180/192`). Run 4 is that configuration, unchanged, and
+    # it died. So the reference is NOT a safe base to copy; it is a REGRESSION to
+    # be explained (#1431). The environment is not byte-identical either -- run 4
+    # built its venv at /tmp/a2q1-oracle with a fresh `pip install torch==2.13.0`
+    # and a reinstalled wheel, where 08-18 used /tmp/nhspeed-oracle -- and an
+    # identity assert on the vLLM COMMIT cannot see a torch or flashinfer delta.
+    # That delta is an UNEXCLUDED candidate for the regression.
     #
-    # THREE ATTEMPTS TO IMPROVE ON IT ALL DIED, and they are why it is copied
-    # rather than tuned. Each was killed by the host-memory watchdog inside
-    # engine start-up, on this box, on #1185:
-    #   20260820T002359Z  the same config + `max_logprobs=64`  -> 12597 MB
-    #   20260820T024243Z  + `enforce_eager=True`, len 256, seqs 1 -> 19433 MB
-    #   20260820T025540Z  + `num_gpu_blocks_override=8`          -> 19797 MB
-    # The second removes `torch.compile` AND graph capture and still collapses,
-    # so neither is the cause; the third shows the block override does not reach
-    # it either. The host trace falls ~76 GB in 62 s at ~1.2 GB/s inside KV cache
-    # allocation, after the mamba page sizing prints. That NARROWS #1185, which
-    # had recorded the collapse only as "after compilation -- profiling forward
-    # or graph capture", and it is recorded there rather than chased here.
+    # Runs 2 and 3 were killed ~5 GB earlier in the drawdown than the others. That
+    # they would ALSO have crossed 15000 MB is an INFERENCE, not a measurement:
+    # the host trace was still falling at ~1.18 GB/s with no arrest when the kill
+    # landed. Do not quote runs 2 and 3 as 15000 MB results.
     #
-    # So: change the ENGINE not at all, and ask the question with REQUEST-level
-    # sampling params, which cost nothing at start-up. `max_logprobs` therefore
-    # stays at its default of 20 (config/model.py:228) and the requests below
-    # ask for exactly 20 -- ample to resolve a two-way tie, and one more engine
-    # knob not touched.
-    # ONE variable changed from that reference, and it is the one the failures
-    # point at. `kv_cache_memory_bytes` (config/cache.py:182, honoured at
-    # v1/worker/gpu_worker.py:465-476) takes an ABSOLUTE KV budget and, in its
-    # own words, "skipped memory profiling. This does not respect the
-    # gpu_memory_utilization config". That matters because the collapse measured
-    # in the three runs above lands in KV cache ALLOCATION -- after the mamba
-    # page-size print, with compile and capture already excluded by the eager
-    # run -- and because `nvidia-smi` reports `memory.total = [N/A]` on this
-    # GB10, so a UTILIZATION FRACTION is computed against a total this box does
-    # not report. An absolute byte count does not depend on that number at all.
+    # WHAT THE FIVE RUNS EXCLUDE. Host memory sits flat through the whole weight
+    # load, then falls ~76 GB in ~60 s at ~1.2 GB/s just after the mamba page-size
+    # print. Not `torch.compile`: run 5 hit the AOT cache (`torch.compile took
+    # 0.30 s`). Not CUDA graph capture: run 2 ran `enforce_eager=True`. Not KV
+    # SIZING: run 3 overrode the block count and run 5 set an absolute budget.
+    # What is left is THE FIRST FORWARD. Under `kv_cache_memory_bytes` vLLM runs
+    # `profile_run()` FIRST (v1/worker/gpu_worker.py:465-468, "still need a profile
+    # run which compiles the model for max_num_batched_tokens") and only THEN logs
+    # "Initial free memory ... skipped memory profiling" (:470-482). Run 5's log
+    # reaches neither string, so the process died INSIDE that forward. This
+    # supersedes #1185's "after compilation -- profiling forward or graph capture",
+    # and it is recorded there rather than chased here.
     #
-    # 4 GiB against a workload of three sequences of at most 45 tokens is not a
-    # tuned value, it is an over-provision: a block here is roughly 120 MB
-    # (23 mamba layers of conv + f32 SSM state, plus an attention page vLLM
-    # raises to 4176 tokens so it is >= the mamba page), so this is ~30 blocks
-    # for a job that needs one per prompt. `gpu_memory_utilization` is left at
-    # the reference 0.30 and is NOT the knob being turned.
+    # WHY THE ENGINE IS OTHERWISE UNTOUCHED. The question is asked with
+    # REQUEST-level sampling params, which cost nothing at start-up.
+    # `max_logprobs` stays at its engine default of 20 (config/model.py:228) and
+    # the requests below ask for exactly 20 -- ample for a two-way tie, and one
+    # more engine knob not turned.
+    #
+    # THE ONE VARIABLE. `kv_cache_memory_bytes` (config/cache.py:182, honoured at
+    # v1/worker/gpu_worker.py:465-476) takes an ABSOLUTE KV budget, so it does not
+    # depend on a utilization fraction -- which matters because `nvidia-smi`
+    # reports `memory.total = [N/A]` on this GB10. 4 GiB against three sequences of
+    # at most 45 tokens is an over-provision, not a tuned value: a block here is
+    # roughly 120 MB (23 mamba layers of conv + f32 SSM state, plus an attention
+    # page vLLM raises to 4176 tokens so it is >= the mamba page), so ~30 blocks
+    # for a job that needs one per prompt. `gpu_memory_utilization` is left at the
+    # reference 0.30 and is NOT the knob being turned.
+    #
+    # It did not help. Run 5 IS this configuration, and it died too. The knob is
+    # kept because it removes KV sizing from the candidate list, not because it
+    # works. READ #1431 BEFORE SPENDING A LEASE HERE.
     kw = dict(model=os.environ["MODEL"], max_model_len=512, max_num_seqs=8,
               gpu_memory_utilization=float(os.environ.get("GMU", "0.30")),
               max_num_batched_tokens=512, enforce_eager=False,

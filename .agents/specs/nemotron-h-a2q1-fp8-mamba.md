@@ -77,6 +77,24 @@ read or written, so no reconciliation is owed and none may be smuggled in.
 Recorded explicitly because the temptation runs the other way: a unit touching
 the conv looks like the place to fix the conv dtype. It is not.
 
+**The persistent conv page IS bf16 today, and the guard is not what holds it
+there.** `nemotron_h_registry.cpp:264` allocates the page as
+`vt::DType::kBF16`, and `runner.cpp:885-893` sizes the buffer from
+`vt::SizeOf(gdn_conv_cache_dtype_)`, so the ALLOCATION fixes the bytes. Only the
+transient gather row is f32 (`nemotron_h_device.cpp:1954`, two `DBuf(d,
+DType::kF32, …)`), which is `vt::GdnStateGather`'s op contract and matches
+upstream's bf16 page. The falsification of "the page was widened to f32" is
+therefore correct.
+
+The comment above the paged guard is not. It says the conv page is "never
+widened to f32", and the `VT_CHECK` on the next line admits
+`kBF16 || kF16 || kF32` (`nemotron_h_device.cpp:1582-1584`). `runner.cpp:643-644`
+admits the same three. A `conv_dtype` mutation to f32 would sail past both
+checks; nothing but the allocation would stop it, and a token gate cannot see the
+doubled bytes. This is a record defect on `main` — the comment and the guard are
+both older than this row — and it is listed under §11 rather than repaired here,
+because A2-Q1 owns no line of it.
+
 ---
 
 ## 2. Upstream anchors — `file:line` on both sides, at `555967922`
@@ -619,15 +637,21 @@ on both arms:
 
 So the `n=1` caveat is lifted FOR THOR: the host arm's 93/96 is reproducible
 there, and the device arm's 96/96 is too. GB10 remains n=1 in the other
-direction (the #1157 run, host arm, 96/96), and no GB10 run of the DEVICE arm
-exists yet. [#1290](https://github.com/mudler/vllm.cpp/issues/1290) carries this.
+direction (the #1157 run, host arm, 96/96).
+[#1290](https://github.com/mudler/vllm.cpp/issues/1290) carries this.
+
+**A GB10 run of the DEVICE arm now exists**, and §10.5 records it. This
+paragraph said it did not until 2026-08-20; the discriminator run of 2026-08-19
+superseded that and the sentence outlived it, so the file contradicted itself at
+its own head. What GB10 still lacks is the SPEED axis, not a token result.
 
 **What is still owed.** The occupancy hypothesis is now SUPPORTED on sm_110 and
 UNMEASURED on sm_121a, and the two are not interchangeable. Specifically owed:
 
-- the GB10 run, which is the only one that can be read against the 6.31%
-  baseline and the 0.014369 s per-token reference, and the only place a DEVICE-arm
-  A3 result does not yet exist at all;
+- the GB10 OCCUPANCY run, which is the only one that can be read against the
+  6.31% baseline and the 0.014369 s per-token reference. Its A3 TOKEN result was
+  taken on 2026-08-19 (§10.5); the per-token and busy-fraction numbers on `121a`
+  were not;
 - the §5.1 per-block numeric gate against `trace.mixer[l]` on the real checkpoint
   — the A3 gate is token-level and cannot see a per-layer defect whose argmax is
   unchanged;
@@ -640,57 +664,179 @@ UNMEASURED on sm_121a, and the two are not interchangeable. Specifically owed:
 decode window, withholds both GB10 references off `121a`, and refuses a fraction
 outright when the load boundary never appears.
 
-### 10.5 The one moved token is not yet shown to be a defect, and three independent lines say it is a tie
+### 10.5 The moved token is UNDETERMINED, it belongs to the device mamba block, and the measurement that decides it is blocked
 
-The GB10 three-leg discriminator settled that the moved token belongs to the
-device arm. It did NOT settle whether the arm is wrong. §10.4 already owed "the
-oracle top-2 margin at the moved tokens", and that measurement is still owed —
-it is blocked on [#1431](https://github.com/mudler/vllm.cpp/issues/1431), which
-is the oracle failing engine start-up on this checkpoint on `dgx:gpu0`. The
-instrument is committed as `scripts/nemotron-h-a2q1-neartie-gap.py` and its
-lease driver is staged at `/workspace/a2q1-neartie/job.sh`.
+**Result: NEEDS_DECISION, undetermined. [#1289](https://github.com/mudler/vllm.cpp/pull/1289)
+stays held.** The GB10 three-leg discriminator localized the moved token. It did
+not exonerate the arm.
 
-What IS established, from evidence already in the record, is that three
-independent things point away from a numerics defect:
+**An earlier version of this section is withdrawn.** It was headed "three
+independent lines say it is a tie" and it read each line as exculpatory. Every
+fact it stated is correct and is kept below. The reading was not: line 1 narrows
+suspicion ONTO the changed path rather than away from it, line 2 excludes only a
+defect nobody proposed, and line 3 is refuted by the golden's own arithmetic and
+by the GB10 polarity. The bottom line did not move, because it was already
+"undetermined". The argument for it is now the one the evidence supports.
 
-1. **The two device legs run DIFFERENT recurrent kernels and lose the SAME
-   token.** `state_update_rows=23 chunk_scan_calls=0 gathers=0 scatters=0`
-   against `state_update_rows=0 chunk_scan_calls=23 gathers=46 scatters=46`,
-   and both emit `...,9943,1307,11286`. A defect in the recurrent kernel's
-   reduction order, or in the gather/scatter state indexing, cannot be invariant
-   across that pair.
-2. **The polarity FLIPS with silicon, within one binary on each box.** The
-   device arm reads 96/96 on `thor:gpu0` and 95/96 on `dgx:gpu0`; the host arm
-   reads 93/96 on Thor and 96/96 on GB10 (the discriminator's `hostmamba` leg).
-   A systematic FP8 defect in the device arm cannot be 96/96 on Thor.
-3. **The MORE PRECISE arm is the WORSE tracker.** The host arm is W8A16 and
-   never quantizes the activation, so it is strictly more precise than vLLM
-   itself, which runs these projections W8A8 — confirmed on the oracle's own
-   startup line, `Selected FlashInferFP8ScaledMMLinearKernel for
-   ModelOptFp8LinearMethod`. If precision loss drove this, the host arm would
-   track a vLLM golden best. On Thor it is the worst, and it diverges two
-   positions EARLIER (position 30, not 32). Accumulating quantization error
-   predicts the opposite ordering.
+#### 10.5.1 The discriminator run, and what regenerates it
 
-And the oracle is not token-stable against itself on the prompt in question.
-`/workspace/nhspeed/oracle.a.out`, same box, same staged checkpoint, same greedy
-sampling, changing only the engine configuration, reproduced its OWN committed
-golden as `matched=32` on prompts 0 and 1 and **`matched=26` on prompt 2**, in
-both legs of the run. Our device arm moves one token on that prompt; the oracle
-moves six.
+| field | value |
+|---|---|
+| run | `20260819T200231Z` |
+| evidence | `/mnt/nas_share/rc/a2d1-discriminate/20260819T200231Z/` — the same directory a lease sees as `/workspace/a2d1-discriminate/20260819T200231Z/` |
+| box | `dgx:gpu0`, GB10, `sm_121a`, under an `rc` lease |
+| when | 2026-08-19, `configure.log` 20:02Z, last leg 21:16Z |
+| tree | `/root/src-a2d1d` — a clone of this row's branch PLUS an uncommitted diagnostic, see below |
+| toolchain | CUDA `13.0.88`, GCC `13.3.0`, `CUDA target architectures: 121a` |
+| features | `fa2`, `cutlass-fp8`, `cutlass-nvfp4`, `marlin-nvfp4` ENABLED (`features.txt`) |
+| library | `libvllm 0.0.3+cuda (ABI 21, header 21)` |
+| checkpoint | `/workspace/a3/ckpt-stage`, revision `29f2d1746d8f41e316523194b19018707749b1b1` |
+| golden | `tests/parity/goldens/nemotron_35_lightning_greedy/oracle.json`, oracle `vllm=0.23.1rc1.dev1511+g555967922` |
+| contention | `contention.txt` holds the CSV header only: no other compute application held the device |
 
-Decoded, all three continuations are the same sentence taking a different fork
-after "…observed outputs, typically using a":
+★ **THE COUNTERS BELOW CANNOT BE REGENERATED FROM THIS TREE, AND NO BINARY HASH
+WAS TAKEN.** The `[NH-DIAG] ARM step …` line that carries `state_update_rows`,
+`chunk_scan_calls`, `conv_update_rows`, `conv_fwd_calls`, `gathers` and
+`scatters` came from an UNCOMMITTED edit to `nemotron_h_device.cpp` in
+`/root/src-a2d1d`. None of those six names occurs anywhere in `src/`, and the
+committed `[NH-DIAG]` facility prints a different line
+(`nemotron_h_device.cpp:1764`, `[NH-DIAG] step T=… R=… nd=… np=… idx=[`). The
+logs are real and they are readable at the path above. Nobody can rebuild the
+instrument that produced them from a checkout, and nobody can prove which source
+the binary was built from. Treat the counters as a recorded observation of one
+unreproducible build, never as a gate result. Committing that instrument is owed
+in §11.
+
+#### 10.5.2 The three legs
+
+All three legs ran on that one box, from that one build, in that one lease.
+
+| leg | log | decode-step recurrent counters | A3 |
+|---|---|---|---|
+| device arm ON | `a3_on.log` | `state_update_rows=23 chunk_scan_calls=0 conv_update_rows=23 conv_fwd_calls=0 gathers=0 scatters=0` | `95/96` DIVERGENCE |
+| device arm OFF | `a3_off.log` | `state_update_rows=0 chunk_scan_calls=23 conv_update_rows=0 conv_fwd_calls=23 gathers=46 scatters=46` | `95/96` DIVERGENCE |
+| host mamba | `a3_hostmamba.log` | `state_update_rows=0 chunk_scan_calls=0 conv_update_rows=0 conv_fwd_calls=0 gathers=46 scatters=46` | `96/96` STRICT PASS |
+
+Both device legs lose the same token, on the same prompt, at the same position:
+prompt 2, generation position 32, `11286` where the golden holds `3468`.
+Positions 1 to 31 are byte-identical in every leg. The host leg is exact.
+
+**What that settles.** The moved token belongs to the DEVICE MAMBA BLOCK. The
+attention, MoE, norm and sampling paths are common to all three legs and cannot
+account for a difference between them.
+
+#### 10.5.3 What the three lines actually support
+
+**Line 1 — the two device legs run different recurrent kernels and lose the same
+token. This narrows suspicion ONTO the changed path.** The counters exclude the
+recurrent reduction order and the gather/scatter state indexing, because neither
+is invariant across `state_update_rows=23 gathers=0` and `chunk_scan_calls=23
+gathers=46`. The third leg is what the earlier reading omitted: `a3_hostmamba`
+is `96/96`, so the token is inside the device mamba block, and the recurrent
+kernel is now excluded INSIDE it. What both failing legs still share, and the
+passing leg does not, is the FP8 W8A8 projection path — which is what
+[#1289](https://github.com/mudler/vllm.cpp/pull/1289) adds. The elimination
+points at the change, not away from it.
+
+**Line 2 — the polarity flips with silicon. This excludes only a GROSS
+systematic defect, which nobody proposed.** The device arm reads `96/96` on
+`thor:gpu0` and `95/96` on `dgx:gpu0`; the host arm reads `93/96` on Thor and
+`96/96` on GB10. A defect that corrupted every FP8 projection could not be
+`96/96` on Thor, and that is the whole of what the flip rules out. A MARGINAL
+perturbation whose token flip depends on the rest of the tower survives it
+untouched — and that is the mechanism [#1290](https://github.com/mudler/vllm.cpp/issues/1290)
+already applies to the HOST arm. Applying it to one arm and refusing it to the
+other is not a reading of the evidence; it is a choice about which arm to
+protect.
+
+**Line 3 — the more precise arm is the worse tracker. This is refuted twice.**
+The facts hold. Our host arm is W8A16: `nemotron_h.cpp:416-422` selects
+`kFp8W8A8Static`, calls `DequantFp8ToBf16`, and says "Weight-only: input_scale
+is carried, not applied". The oracle is W8A8:
+`FlashInferFP8ScaledMMLinearKernel.input_quant_key()` returns
+`kFp8StaticTensorSym` and `apply_scaled_mm` passes `scale_a`
+(`vllm/model_executor/kernels/linear/scaled_mm/flashinfer.py:67-85`),
+confirmed at run time by the
+oracle's own startup line, `Selected FlashInferFP8ScaledMMLinearKernel for
+ModelOptFp8LinearMethod`.
+
+The inference from those facts does not follow.
+
+1. **The golden IS a W8A8 computation.** The quantity measured is
+   difference-from-reference, not absolute accuracy. A W8A16 arm differs from a
+   W8A8 reference by the FULL activation-quantization error that the reference
+   applied and the arm did not. A W8A8 arm carries a rounding difference against
+   it instead. "More precise" therefore predicts a LARGER distance from this
+   golden, which is the ordering observed on Thor. The line reads a confirming
+   observation as a contradiction.
+2. **On GB10 the ordering REVERSES.** Host (W8A16) is `96/96`; device (W8A8) is
+   `95/96`. The earlier text cited Thor only. Neither ordering survives both
+   boxes, so neither supports a conclusion about either arm.
+
+#### 10.5.4 The oracle is CONFIG-SENSITIVE here, not non-deterministic — and that decides the gate FORM
+
+`/workspace/nhspeed/oracle.a.out` (2026-08-18, `dgx:gpu0`) ran the SAME
+configuration twice inside one process. `ORACLE_LEG 1` and `ORACLE_LEG 2` each
+returned `matched=32`, `matched=32`, `matched=26`, for `ORACLE TOKEN MATCH:
+180/192`. **At a fixed configuration the pinned oracle is deterministic.** The
+committed `32/32` golden came from a DIFFERENT, and unrecorded, configuration.
+
+This is [#926](https://github.com/mudler/vllm.cpp/issues/926), open since
+2026-08-15 and not previously linked from this spec.
+`tests/parity/goldens/nemotron_35_lightning_greedy/oracle.json` records the
+model, the revision, the sampling parameters, and the vLLM, `transformers` and
+`flashinfer` versions. It records NO engine configuration, and `af8170154`
+committed no generator — that capture ran from `$HOME/venvs/vllm-oracle-next`.
+So the `26/32` result compares a known configuration against an unrecorded one,
+and the difference cannot be attributed to anything. #926 already names
+`enforce_eager`, `gpu_memory_utilization`, `max_model_len` and the batch shape as
+the unrecorded terms; the lease logs add one more, and it is the one with a named
+accuracy mechanism. `kv_cache_dtype=fp8_e4m3` is AUTO-SELECTED on this checkpoint
+(`cache.py:296`, "it may cause accuracy drop without a proper scaling factor")
+and the checkpoint does not carry the q scale, so vLLM imputes it:
+`kv_cache.py:134`, "Checkpoint does not provide a q scaling factor. Setting it to
+k_scale."
+
+**#926 also already recorded the same fork.** Its rebuilt oracle, at this pin
+under its own configuration, diverged on prompt 2 at index 29 to `11286`
+` transition` — which is the Thor host arm's continuation, position for position.
+A pinned vLLM oracle takes that fork. That is evidence about the POSITION, and it
+still says nothing about the device arm's position 32.
+
+**A distributional gate is INADMISSIBLE on this evidence.** AGENTS.md permits a
+ratified distributional gate only when the oracle's greedy decode is
+NON-DETERMINISTIC. `oracle.a.out` measured the opposite. What the evidence
+licenses is re-deriving or re-pinning the golden against a NAMED engine
+configuration, which is #926's own "what done looks like". Nothing in this
+section may be read as a case for weakening the token gate.
+
+#### 10.5.5 The order of work, and why the margin is not first
+
+The oracle's top-2 margin at generation position 32 decides whether this is a
+near-tie sensitivity or a wrong answer. `scripts/nemotron-h-a2q1-neartie-gap.py`
+is the instrument. It has never produced a number: five runs on `dgx:gpu0` were
+each killed by the host-memory watchdog during engine start-up, before a token
+existed. That is [#1431](https://github.com/mudler/vllm.cpp/issues/1431).
+
+**[#926](https://github.com/mudler/vllm.cpp/issues/926) precedes
+[#1431](https://github.com/mudler/vllm.cpp/issues/1431).** It needs no GPU lease.
+Until the golden names the configuration it was captured under, a margin measured
+against it is a margin against an unknown, and a `26/32` cannot be told from a
+defect. Recording the configuration, or re-capturing under a recorded one, is
+cheap and it is prior.
+
+Decoded, the three continuations are one sentence taking a different fork after
+"…observed outputs, typically using a":
 
 | arm | positions 30, 31, 32 |
 |---|---|
 | vLLM golden | ` combination`, ` of`, ` state` |
 | Thor `sm_110`, host arm | ` transition`, ` equation`, ` for` |
 | GB10 `sm_121a`, device arm | ` combination`, ` of`, ` transition` |
+| rebuilt oracle, #926, own config | ` transition`, ` equation`, ` for` |
 
-The competing token is the SAME one, `11286` ` transition`, in both divergent
-arms. None of this is a substitute for the margin in nats, which is what decides
-the FORM of the replacement gate; it is the reason the margin is worth a lease.
+The competing token is the same one, `11286` ` transition`, in every divergent
+row.
 
 ## 11. Owed
 
@@ -705,6 +851,30 @@ the FORM of the replacement gate; it is the reason the margin is worth a lease.
 - The device arm has **no production caller** until A2-P wires it through
   `ModelRegistry::Forward` (§7). Tracked on
   [#810](https://github.com/mudler/vllm.cpp/issues/810).
+- [#926](https://github.com/mudler/vllm.cpp/issues/926) — the golden records no
+  engine configuration and has no committed generator, so it cannot be
+  re-derived. **This PRECEDES the top-2 margin
+  ([#1431](https://github.com/mudler/vllm.cpp/issues/1431)) and needs no GPU
+  lease** (§10.5.4, §10.5.5). Until it closes, every comparison against
+  `oracle.json` measures a known configuration against an unknown one.
+- The `[NH-DIAG] ARM step` recurrent counters that §10.5.1 quotes exist only in
+  an uncommitted edit on a lease box. Commit the instrument, or the
+  discriminator cannot be re-run.
+- **Upstream anchor drift, for #1289's reviewer, NOT repaired here.** Checked
+  against the pin `555967922`. Introduced by
+  [#1289](https://github.com/mudler/vllm.cpp/pull/1289), in §2 above and in
+  `nemotron_h_device.cpp`: `mamba_mixer2.py:550` is the `in_proj` call at
+  **554**; `:586` is the `out_proj` call at **585**; `:583` and `:583-585` for
+  the gated norm point at the `gate` slice, and `self.norm(ssm_output, gate)` is
+  at **582**. Already on `main` and therefore wider than #1289:
+  `nemotron_h.py:440` for `self.scaling = self.head_dim**-0.5` is **441** and is
+  cited three times (`nemotron_h_device.cpp:332`, `:1882`, `nemotron_h.cpp:668`);
+  `nemotron_h.py:627-631` for `residual is None` holds no such statement — the
+  four occurrences are at 307, 350, 399 and 521, and `residual = None` is at 618;
+  `gdn_attn.py:405` names the branch that ASSIGNS `prefill_has_initial_state`,
+  while the comment describes the `else` at **406-407**.
+- **The conv-page guard admits `kF32` while its own comment forbids it**
+  (§1.1). Pre-existing on `main`; A2-Q1 owns no line of it.
 
 ## 12. Outcome
 
