@@ -297,6 +297,17 @@ two loops run in **one** call, reclaim before assign, and the pool is LIFO
 (`back()` / `pop_back()`), so the slot a request frees is the very next slot
 issued. The construction is therefore deterministic rather than incidental.
 
+**Scope that determinism honestly: it holds for EXACTLY ONE departure per
+step.** The reclaim loop iterates `gdn_slot_of_req_`, which is a
+`std::unordered_map` (`include/vllm/v1/worker/gpu/runner.h:563`), so with two or
+more requests departing in the same step the order in which their slots are
+pushed onto `gdn_free_slots_` (`:564`) is unspecified and *which* freed slot
+lands at `back()` is unspecified with it. The fixture below retires one request
+while another keeps decoding, so the case never arises — and step 3's reuse
+assertion is what would detect it if a later edit made it arise. Do not extend
+the fixture to retire two requests and keep relying on the identity of the
+reclaimed slot.
+
 **★ Arm (c3)'s row must be scheduled onto a RECLAIMED slot.** "A one-token prompt
 scheduled alongside a decoding request" is necessary and **not** sufficient, and
 that phrasing on its own specifies the green arm. The fixture is:
