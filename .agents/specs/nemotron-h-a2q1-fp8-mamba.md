@@ -838,6 +838,53 @@ Decoded, the four continuations are one sentence taking a different fork after
 The competing token is the same one, `11286` ` transition`, in every divergent
 row.
 
+### 10.6 REFUTED: the f32 SSM cache is not a too-wide dtype, and it is not mirrored from `transformers`
+
+Recorded because it was raised as a defect during review, is wrong, and is easy
+to raise again from the anchors this spec already carried.
+
+**The hypothesis.** `nemotron_h_weights.cpp:855` reads `mamba_ssm_cache_dtype`
+from the HF config with a `"float32"` default. vLLM's `CacheConfig` defaults the
+same name to `"auto"` (`vllm/config/cache.py:135`), and `"auto"` resolves the
+temporal state to the conv state dtype, which is the model dtype, bf16
+(`mamba_utils.py:101-108`). So we appear to hold 2x the temporal-state bytes, and
+to take the value from `transformers` where vLLM defines something else — which
+AGENTS.md forbids, and which a token gate cannot see.
+
+**Why it is wrong.** vLLM does not stop at `CacheConfig`. It has a per-model
+verify hook, and NemotronH is one of the models that has one.
+`vllm/model_executor/models/config.py:605-631` at the pin declares
+`class NemotronHForCausalLMConfig(VerifyAndUpdateConfig)` with
+`DEFAULT_MAMBA_SSM_CACHE_DTYPE = "float32"`, documented in its own docstring as
+"Only `float32` is known to have no accuracy issues by default". Its
+`update_mamba_ssm_cache_dtype` fires when `cache_config.mamba_ssm_cache_dtype ==
+"auto"`, reads `getattr(hf_config, "mamba_ssm_cache_dtype",
+cls.DEFAULT_MAMBA_SSM_CACHE_DTYPE)`, and writes the result back into
+`cache_config`. It is registered for `NemotronHForCausalLM` and
+`NemotronHPuzzleForCausalLM` at `config.py:879-880`.
+
+So the hook reads the key FROM THE HF CONFIG and defaults it to FLOAT32 when the
+key is absent. `nemotron_h_weights.cpp:855` mirrors vLLM exactly: same key, same
+source, same default. The `"auto"` at `cache.py:135` is the CLI default BEFORE
+the hook runs, not the value the model gets.
+
+**Observed, not only read.** The pinned oracle logs the hook firing on this
+checkpoint in five separate lease runs, including the 2026-08-18 run behind
+`oracle.a.out`:
+
+```text
+INFO 08-18 20:59:29 [config.py:621] Updating mamba_ssm_cache_dtype to 'float32' for NemotronH model
+```
+
+The checkpoint's own `config.json` carries `mamba_ssm_cache_dtype: "float32"`, so
+the hook takes the checkpoint's value and the default is not even reached.
+
+**What to fix instead.** Nothing in the dtype. The defect is the CITATION. The
+comments at `nemotron_h_registry.cpp:256-263` and `nemotron_h_device.cpp:1586`
+cite `mamba_utils.py` alone, which is the half of the chain that makes the value
+look unmirrored. Any future reader who checks those anchors reaches the same
+wrong conclusion. Add `config.py:605-631` beside them — owed in §11.
+
 ## 11. Owed
 
 - [#974](https://github.com/mudler/vllm.cpp/issues/974) — `dense_fp8::ResidentFp8`
@@ -875,6 +922,11 @@ row.
   while the comment describes the `else` at **406-407**.
 - **The conv-page guard admits `kF32` while its own comment forbids it**
   (§1.1). Pre-existing on `main`; A2-Q1 owns no line of it.
+- The `mamba_ssm_cache_dtype` comments at `nemotron_h_registry.cpp:256-263` and
+  `nemotron_h_device.cpp:1586` cite `mamba_utils.py` without the per-model verify
+  hook that supplies the value, so the anchors read as if we mirror
+  `transformers`. §10.6 records the refutation; the anchors still need
+  `vllm/model_executor/models/config.py:605-631` beside them.
 
 ## 12. Outcome
 
