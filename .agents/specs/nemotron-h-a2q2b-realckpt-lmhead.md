@@ -237,8 +237,31 @@ needs no CUDA toolkit at all. Measured on this box, which has no `nvcc`:
 
 ```
 c++ -std=c++20 -I include -I src -isystem third_party -DVT_MARLIN_NVFP4=1     -Wall -Wextra -Werror -c -o nhd_marlin.o     src/vllm/model_executor/models/nemotron_h_device.cpp
--> rc 0, 0 errors, 0 warnings, a 1 269 696-byte object
+-> rc 0, 0 errors, 0 warnings, a 1 268 552-byte object
 ```
+
+**That byte figure is anchored to `72d736867`**, gcc 13.3.0 (Ubuntu
+13.3.0-6ubuntu2~24.04.1) on a box with no `nvcc`, and compilation is
+deterministic here: two runs of the identical command produced the identical
+`sha256 42d670b6...`. The anchor is the point. Measured with that one command
+at seven commits of this branch, the size MOVES with the code:
+
+| commit | object bytes |
+|---|---|
+| `806b263e7`, `8fa900a62`, `1c62d9974`, `29b1128e3` (the reviewed head) | 1 269 696 |
+| `fedf78d86` (the `-Werror` declaration repair) | 1 272 808 |
+| `bff2b7b2f` (the F4 predicate repair) onwards, through `18f3da188` and `72d736867` | 1 268 552 |
+
+So the 1 269 696 this section carried until now was CORRECT when it was written
+and correct at the head a fresh reviewer read; it went stale two commits later
+and nothing said so, because the evidence block named no commit. An unanchored
+byte count is a measurement nobody can reproduce or falsify, which is why the
+number now travels with the SHA it was taken at. Nothing after `72d736867`
+touches this translation unit or its headers.
+
+The size is incidental either way; what the block asserts is `rc 0` with zero
+errors and zero warnings on a toolchain with no CUDA, and that holds at every
+one of those seven commits.
 
 Both arms are therefore compiled, and both are compiled `-Werror`. What
 genuinely needs `nvcc` is the Marlin **kernel** and every **execution** of the
@@ -281,12 +304,31 @@ than taken unilaterally by a repair pass.
 Every number below is from a run on this box, `-DCMAKE_BUILD_TYPE=RelWithDebInfo`,
 `-Wall -Wextra -Werror`, no CUDA toolkit.
 
-| binary | `run_rc` | cases | assertions | verdict |
-|---|---|---|---|---|
-| `test_nemotron_h_moe_device` | 0 | 4, **4 passed** | 4 | `SUCCESS!` — and **all four SKIP**, both A2-Q2b cases included |
-| `test_nemotron_h_paged_forward`, this tree | 1 | 13, 2 passed, **11 failed** | 18 | `FAILURE!` — [#1371](https://github.com/mudler/vllm.cpp/issues/1371), not this row |
-| `test_nemotron_h_paged_forward`, [#1392](https://github.com/mudler/vllm.cpp/pull/1392) overlaid | 0 | 13, **13 passed** | 3269 | `SUCCESS!` |
-| the new §12 case alone | 0 | 1 passed | 13 | `SUCCESS!` |
+**Read the `overlay` column before any other one.** This tree cannot run
+`GPUModelRunner` at all — [#1371](https://github.com/mudler/vllm.cpp/issues/1371)
+throws at its construction — so every green below was taken with
+[#1392](https://github.com/mudler/vllm.cpp/pull/1392)'s production fix applied
+to the working tree, never committed here and reverted byte-for-byte afterwards.
+Without it the §12 case does not merely score differently, it never reaches its
+first assertion. Saying "a run on this tree" without that clause made the §12
+row false of the tree it named.
+
+| binary | overlay | `run_rc` | cases | assertions | verdict |
+|---|---|---|---|---|---|
+| `test_nemotron_h_moe_device` | none | 0 | 4, **4 passed** | 4 | `SUCCESS!` — and **all four SKIP**, both A2-Q2b cases included |
+| `test_nemotron_h_paged_forward`, whole binary | **none** | 1 | 13, 2 passed, **11 failed** | 18 | `FAILURE!` — [#1371](https://github.com/mudler/vllm.cpp/issues/1371), not this row |
+| `test_nemotron_h_paged_forward`, whole binary | **#1392** | 0 | 13, **13 passed** | 3269 | `SUCCESS!` |
+| the new §12 case alone | **none** | **1** | 1, **0 passed, 1 failed**, 12 skipped | **0** | **`FAILURE!` — throws #1371 before the first assertion** |
+| the new §12 case alone | **#1392** | 0 | 1, 1 passed, 12 skipped | 13 | `SUCCESS!` |
+
+The un-overlaid §12 row is the baseline the two mutations below are measured
+against, and it is a red already. That is exactly why they are reported with the
+overlay: a mutation cannot be shown to turn a case red when the case is red
+without it. Re-derived at `72d736867`: `-tc=` the §12 case on the clean tree
+gives `run_rc=1`, `test cases: 1 | 0 passed | 1 failed | 12 skipped`,
+`assertions: 0`, and `ERROR: test case THREW exception: No valid attention
+backend for device type 0 from {FLASH_ATTN: [head_size not supported]}`. Note
+`assertions: 0` — the shape this project has read as a pass before.
 
 **The moe_device row is the honest reading of the synthetic gate, and it is not
 a pass.** The binary builds and exits 0, but all four cases take the
@@ -309,13 +351,33 @@ shape of the red: doctest reported `assertions: 18 | 18 passed | 0 failed` while
 Each mutation was applied to a scratch copy of
 `src/vllm/model_executor/models/nemotron_h_device.cpp`, verified to have applied
 by `git diff --stat`, built (a mutation that fails to build proves nothing), run,
-and restored to an identical sha256.
+and restored to an identical sha256 (`abf6e21f...`).
 
-| mutation | applied | `compile_rc` | `run_rc` | verdict |
-|---|---|---|---|---|
-| **M1** — `n_out` -> `R` at the host projection | 1 ins / 1 del | 0 | **1** | **RED**, `FAILURE!` |
-| **M2** — never fill `trace->final_normed` | 1 ins / 2 del | 0 | **1** | **RED**, `FAILURE!` |
-| **M4** — restore the exact pre-repair two-download shape | 3 ins / 8 del | 0 | 0 | **GREEN — reported, not hidden** |
+**Every row here was run with [#1392](https://github.com/mudler/vllm.cpp/pull/1392)'s
+production fix overlaid**, for the reason the table above gives: un-overlaid, the
+§12 case is already `run_rc=1` on the unmutated tree, so an M1 or M2 red measured
+there would prove nothing at all. The overlay is what makes the vehicle able to
+report a green, and only then can a mutation take it away.
+
+| mutation | overlay | applied | `compile_rc` | `run_rc` | verdict |
+|---|---|---|---|---|---|
+| — (unmutated control) | **#1392** | — | 0 | 0 | **GREEN**, `SUCCESS!`, 13 assertions |
+| — (unmutated control) | **none** | — | 0 | **1** | already **RED** — #1371, and the reason the rest of this table is overlaid |
+| **M1** — `n_out` -> `R` at the host projection | **#1392** | 1 ins / 1 del | 0 | **1** | **RED**, `FAILURE!` |
+| **M2** — never fill `trace->final_normed` | **#1392** | 1 ins / 2 del | 0 | **1** | **RED**, `FAILURE!` |
+| **M4** — restore the exact pre-repair two-download shape | **#1392** | 3 ins / 8 del | 0 | 0 | **GREEN — reported, not hidden** |
+
+Re-derived independently at `72d736867`, on a clean tree with the same overlay
+applied and reverted: the unmutated control is `run_rc=0`, `1 passed`,
+`13 assertions`, `SUCCESS!`; M1 gives `compile_rc=0`, `run_rc=1`, and
+`ERROR: test case THREW exception: vt: NemotronH lm_head: gathered row count
+does not match hidden_size at nemotron_h.cpp:1029`; M2 gives `compile_rc=0`,
+`run_rc=1`, `assertions: 8 | 7 passed | 1 failed` on `REQUIRE( 0 == 288 )`. The
+M2 edit was written as one deletion rather than the recorded `1 ins / 2 del`
+reshape, so the applied-lines cell is the original author's shape and the
+verdict is reproduced. `M4`'s cell needs no separate attestation: un-overlaid,
+every run of this case is red, so a GREEN is only reachable with the overlay in
+place and its own verdict entails the column.
 
 M1 is the red the `n_out` rename exists for: with the request count substituted
 the returned row count is 1 where the gather asked for 3. M2 arms the
@@ -384,6 +446,25 @@ fallback GEMM concurrently, and a false refusal is worse than the silence it
 replaces. The counter is the right instrument in a test, where
 single-threadedness is a property of the harness, and the synthetic gate asserts
 it there. It is demonstrably armed rather than assumed, because
-`tests/vllm/models/test_qwen3_forward.cpp:497` already asserts on CPU that it
-reaches exactly `5 * num_hidden_layers` when the dispatcher does fall back. The
+`tests/vllm/models/test_qwen3_forward.cpp:559` already asserts on CPU that it
+reaches exactly `5 * num_hidden_layers` when the dispatcher does fall back.
+
+**And the counter is not the only process-wide static on this route.** A row
+whose whole thesis is declining to inherit the sibling's process-static defect
+([#984](https://github.com/mudler/vllm.cpp/issues/984), the address-keyed Marlin
+repack cache) should say what it DOES inherit, so:
+`dense_nvfp4::DenseMarlinWorkspace` (`dense_nvfp4_gemm.h:506`) is a
+process-static **device** allocation — `static void* ws` behind a `static
+std::mutex`, sized from `MarlinDeviceSms` and keyed on nothing, not even the
+device index — and every caller of `MatmulNvfp4MarlinD` (`:539`) and
+`GateUpFusedMarlinD` (`:700`) shares the one buffer. It already has three
+consumers (the shared dense route in `dense_attn_block.h`, MiniMax-H3's
+`minimax_h3_device.cpp`, and the compressed-tensors NVFP4 scheme in
+`schemes/nvfp4.h`); NemotronH's `lm_head` becomes a fourth. It is PRE-EXISTING
+and NOT addressed here: it arrived at `80d1da096`, and the function body is
+byte-identical at this row's merge base and at its head
+(`sha256 bf4685f4...` over the whole definition, both sides). Nothing in this
+row's diff touches it. It is called out because the asymmetry — refusing one
+shared static by name while silently taking another — is the kind of thing a
+reader is entitled to see stated rather than to discover. The
 behavioural red for this class needs CUDA and is PENDING with the rest.
