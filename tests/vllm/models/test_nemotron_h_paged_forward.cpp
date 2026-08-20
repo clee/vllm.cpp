@@ -1532,7 +1532,9 @@ TEST_CASE("NemotronH paged: the recurrent state index comes from the block table
 //     the SAME bytes.
 // ═══════════════════════════════════════════════════════════════════════════
 
-TEST_CASE("NemotronH paged: the logit rows are counted from logits_indices, never from num_reqs") {
+// NO COMMA IN THIS NAME: doctest `-tc` splits filters on commas, so a comma
+// here turns a targeted run into `0 cases ran` + `SUCCESS!`.
+TEST_CASE("NemotronH paged: the logit rows are counted from logits_indices and never from num_reqs") {
   setenv("VT_KV_CACHE_F32", "1", 1);
   Fixture fx("float32");
   const vllm::ModelRegistration& reg = fx.model->registration();

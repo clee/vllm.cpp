@@ -219,8 +219,8 @@ discriminator than before it.
 | production wiring in `NemotronHPagedForward` -> device `ForwardLogits` | DONE |
 | host arm retained as the gate's operand + the non-NVFP4 fallback | DONE |
 | routing-allowlist entry narrowed, [#1410](https://github.com/mudler/vllm.cpp/issues/1410) filed | DONE |
-| the CPU-reachable half (`n_out`, the shared `final_normed` download) gated through `GPUModelRunner` | DONE — `test_nemotron_h_paged_forward.cpp` §12 |
-| synthetic device `lm_head` numeric gate (measured band, asserted counts) | WRITTEN; runs on CUDA only. **NEVER RUN** |
+| the CPU-reachable half (`n_out`, the shared `final_normed` download) gated through `GPUModelRunner` | DONE and RUN — `test_nemotron_h_paged_forward.cpp` §12, red-first below |
+| synthetic device `lm_head` numeric gate (measured band, asserted counts) | COMPILES; runs on CUDA only. **NEVER RUN** |
 | `nvcc` build of the Marlin KERNEL + any execution of the device arm | PENDING a `dgx:gpu0` window |
 | real-checkpoint `lm_head` numeric leg + token identity | PENDING a `dgx:gpu0` window |
 | reachability deletion mutation | PENDING the same window |
@@ -244,6 +244,64 @@ Both arms are therefore compiled, and both are compiled `-Werror`. What
 genuinely needs `nvcc` is the Marlin **kernel** and every **execution** of the
 device path. Landing without those is acceptable and is what the PENDING rows
 above record; claiming the host arm could not be compiled was not.
+
+### The gate, as it actually ran
+
+Every number below is from a run on this box, `-DCMAKE_BUILD_TYPE=RelWithDebInfo`,
+`-Wall -Wextra -Werror`, no CUDA toolkit.
+
+| binary | `run_rc` | cases | assertions | verdict |
+|---|---|---|---|---|
+| `test_nemotron_h_moe_device` | 0 | 4, **4 passed** | 4 | `SUCCESS!` — and **all four SKIP**, both A2-Q2b cases included |
+| `test_nemotron_h_paged_forward`, this tree | 1 | 13, 2 passed, **11 failed** | 18 | `FAILURE!` — [#1371](https://github.com/mudler/vllm.cpp/issues/1371), not this row |
+| `test_nemotron_h_paged_forward`, [#1392](https://github.com/mudler/vllm.cpp/pull/1392) overlaid | 0 | 13, **13 passed** | 3269 | `SUCCESS!` |
+| the new §12 case alone | 0 | 1 passed | 13 | `SUCCESS!` |
+
+**The moe_device row is the honest reading of the synthetic gate, and it is not
+a pass.** The binary builds and exits 0, but all four cases take the
+`TryCudaQueue` skip on a GPU-less box, so the 4 assertions are the skip notices
+themselves. The numeric gate examined nothing. That is why the table above says
+`NEVER RUN` and not `green`.
+
+**The paged-forward red is [#1371](https://github.com/mudler/vllm.cpp/issues/1371)
+and belongs to nobody here.** All 11 failing cases throw the identical
+`No valid attention backend for device type 0 from {FLASH_ATTN: [head_size not
+supported]}` at `GPUModelRunner` construction, 10 of them cases this row never
+touched. Overlaying [#1392](https://github.com/mudler/vllm.cpp/pull/1392)'s
+production fix in the working tree — never committed here, and reverted
+afterwards — turns the same binary green at 13/13 and 3269 assertions. Note the
+shape of the red: doctest reported `assertions: 18 | 18 passed | 0 failed` while
+11 cases were throwing, so the assertion line alone would have read as a pass.
+
+### The red-first, on the cases that can run
+
+Each mutation was applied to a scratch copy of
+`src/vllm/model_executor/models/nemotron_h_device.cpp`, verified to have applied
+by `git diff --stat`, built (a mutation that fails to build proves nothing), run,
+and restored to an identical sha256.
+
+| mutation | applied | `compile_rc` | `run_rc` | verdict |
+|---|---|---|---|---|
+| **M1** — `n_out` -> `R` at the host projection | 1 ins / 1 del | 0 | **1** | **RED**, `FAILURE!` |
+| **M2** — never fill `trace->final_normed` | 1 ins / 2 del | 0 | **1** | **RED**, `FAILURE!` |
+| **M4** — restore the exact pre-repair two-download shape | 3 ins / 8 del | 0 | 0 | **GREEN — reported, not hidden** |
+
+M1 is the red the `n_out` rename exists for: with the request count substituted
+the returned row count is 1 where the gather asked for 3. M2 arms the
+trace-operand assertion. Both showed the trap this project has been bitten by
+before — doctest printed `assertions: 2 | 2 passed | 0 failed` on M1 while the
+case was failing, because a `REQUIRE` throws rather than counting.
+
+**M4 stays green and that is a finding, not a gap to paper over.** The duplicate
+`DownloadF32` the first submission introduced copies the same unchanged buffer
+twice and produces identical bytes, so nothing observable from outside the
+function can distinguish it. It is repaired structurally — one call is reached on
+any path — and no assertion here pretends to catch it.
+
+The device arm's own red-first does not exist on a CPU box and is not claimed.
+`MarlinW4A16Selects` is false on a CPU queue, so the device branch, the
+`fallback_gemms` assertion and the reachability deletion mutation are all
+unreachable here and stay PENDING a `dgx:gpu0` window.
 
 ### The fresh review, and what it found
 
