@@ -3352,6 +3352,24 @@ TEST_CASE("ltx2 video: the three carrying phases contain their work and the load
        {},
        {1, 1},
        "the two calls #1010 names, once each per render"},
+      // AND THE WRITER, which shipped with no anchor at all and is the leaf the
+      // `decode.video` number is protected by. `artifacts.frames.ppm` wraps the
+      // `WriteFileBytes` loop, so it moves with the WRITES: a mutation that
+      // empties `artifacts.frames` and leaves the `write(2)`s inside
+      // `decode.video` — the reviewer's M11, which reported four microseconds
+      // for nine PPM files — no longer has a leaf that contains this record.
+      //
+      // 0.50 is the threshold and it is loose ON PURPOSE. This leaf is about
+      // 0.2 ms on the fixture and holds nine scope boundaries of its own, so the
+      // uncovered part is instrument cost against a sub-millisecond leaf, which
+      // is the regime the `decode.video` note above already explains. What binds
+      // here is the containment and the count, not the fraction.
+      {"artifacts.frames",
+       {"artifacts.frames.ppm"},
+       0.50,
+       {"decode.video"},
+       {trace.video_decode_chunks},
+       "Ltx2ConditioningTrace::video_decode_chunks, one write callback per chunk"},
   };
   for (const Carrying& c : carrying) CheckCarryingPhase(table, c);
 
@@ -3395,7 +3413,8 @@ TEST_CASE("ltx2 video: the three carrying phases contain their work and the load
   // swallow a NEIGHBOUR, which the four above cannot: see the note on
   // `CheckOnlyAnchorsAreNested`.
   CheckOnlyAnchorsAreNested(table, {"denoise.step", "decode.video.chunk", "decode.video.vae",
-                                    "decode.audio.mel", "decode.audio.vocoder"});
+                                    "decode.audio.mel", "decode.audio.vocoder",
+                                    "artifacts.frames.ppm"});
   CheckWriterIsBesideTheDecode(table);
 
   // (4) THE FLOOR, read as "this name is not detached" and nothing more. See the

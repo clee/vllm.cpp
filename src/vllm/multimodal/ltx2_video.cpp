@@ -4562,6 +4562,18 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
         shape.t = chunk.frames.frames;
         shape.h = chunk.frames.height;
         shape.w = chunk.frames.width;
+        // W0 repair (#1010, third fresh review): THE WRITER'S OWN ANCHOR, bound
+        // to the `WriteFileBytes` loop rather than to the scope beside it.
+        //
+        // Without it the writer is held by nothing. Empty this leaf and leave
+        // the `write(2)`s inside `decode.video` — which is what happens if the
+        // two `Close`s above move below the loop — and the table charges W5's
+        // lever with the cost of the writes while `artifacts.frames` reports
+        // four microseconds for nine files. Every interval assertion still
+        // holds, because the leaves stay disjoint and nothing nests. This scope
+        // moves with the WRITES, so a leaf that stops covering them stops
+        // containing it. Nested, so the sum does not move.
+        phase::Scope ppm_phase("artifacts.frames.ppm");
         for (int64_t f = 0; f < chunk.frames.frames; ++f) {
           char name[64];
           // The GLOBAL frame index, which the chunk carries so the writer does not
@@ -4575,6 +4587,7 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
           WriteFileBytes(JoinPath(gen.output_dir, name),
                          MiniMaxH3WritePpmFrame(chunk.frames.data, shape, f));
         }
+        ppm_phase.Close();
         rendered_frames += chunk.frames.frames;
         rendered_channels = chunk.frames.channels;
         // COUNTED BY THE RENDER, not by the instrument (#1010, third fresh
