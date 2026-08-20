@@ -335,7 +335,7 @@ TU present and that the new registration is the only one for its OpId.
 | the f32 sink is read as an f32 compute path | recorded above and in the TU's header comment; the collective is instantiated for bf16 only |
 | a grown workspace is freed while a captured graph still holds its pointer | `RetireGraphScratch`, the same discipline both sibling CUTLASS TUs use |
 | the counter advances on a call that then throws, overstating dispatch | incremented after `run` returns `kSuccess`, and G5 asserts the ordering by counting a refused call |
-| a reader believes this arm was measured | AT M5: `## Owed`, the commit body, the pull request body, `docs/USAGE.md` and `docs/FEATURES.md` all said it was not. SINCE [#1437](https://github.com/mudler/vllm.cpp/issues/1437) the risk INVERTS -- it HAS been measured, on seven shapes, and the same five surfaces now have to keep saying exactly how far that reaches: seven shapes compared against the CPU reference, every unservable shape refused by name, and NO token gate and NO speed number |
+| a reader believes this arm was measured | AT M5: `## Owed`, the commit body, the pull request body, `docs/USAGE.md` and `docs/FEATURES.md` all said it was not. SINCE [#1437](https://github.com/mudler/vllm.cpp/issues/1437) the risk INVERTS -- it HAS been measured, on seven shapes, and the surfaces that still carry the claim have to keep saying exactly how far it reaches. Those are `## Owed`, `docs/FEATURES.md`'s block-wise FP8 row, and this model's user-facing page, which [#1491](https://github.com/mudler/vllm.cpp/pull/1491) moved out of `docs/USAGE.md` into `docs/models/qwen3-8-27b.md`; the M5 commit and pull request bodies are history and cannot be corrected. How far it reaches: seven shapes compared against the CPU reference, every unservable shape refused by name, and NO token gate and NO speed number |
 
 ## Tests
 
@@ -559,8 +559,11 @@ builds it and a leased box runs it.
   partial scale blocks. A user learns this from three places, and the first is
   the one they will actually hit: the runtime refusal message, which names
   `kv_a_proj_with_mqa`, the arithmetic `576 = 4*128 + 64`, the sm90 contrast and
-  this issue. The other two are `docs/USAGE.md`'s block-wise FP8 section and
-  `docs/FEATURES.md`'s block-wise FP8 row. Any model whose block-wise FP8
+  this issue. The other two are `docs/FEATURES.md`'s block-wise FP8 row and the
+  block-wise FP8 section of this model's user-facing page -- in
+  `docs/models/qwen3-8-27b.md` since
+  [#1491](https://github.com/mudler/vllm.cpp/pull/1491) moved the public
+  documentation out of `docs/USAGE.md`. Any model whose block-wise FP8
   projections are not all multiples of 128 wide is affected the same way.
 
   What the first run left established was the compile leg and the host-side
@@ -667,9 +670,11 @@ builds it and a leased box runs it.
   the pre-measurement position after the confirmation run had closed it: the
   FILE HEADER, which opened "THIS FILE HAS NEVER RUN AGAINST A DEVICE" and added
   that "no number produced here appears in any document as a measurement" --
-  doubly false, because the 5/136/0 result appears both in this section and in
-  the public documentation (`docs/USAGE.md` when the six sites were enumerated;
-  `docs/models/qwen3-8-27b.md` after #1491 moved it); G2's header block, which read "Half 2 is NOT evidence that
+  doubly false, because the 5/136/0 result appears both in this section and on
+  the user-facing page -- `docs/USAGE.md` when the six sites were enumerated,
+  `docs/models/qwen3-8-27b.md` since
+  [#1491](https://github.com/mudler/vllm.cpp/pull/1491) moved it; G2's header
+  block, which read "Half 2 is NOT evidence that
   the arm works: it has never run on a device"; and the four `NO CUDA DEVICE`
   messages that G2, G7, G8 and G9 print, each of which read "#1189 M5's
   on-hardware leg is OWED, not passed". They stood because the change that
@@ -699,12 +704,17 @@ builds it and a leased box runs it.
 - **A `sm_12xa` CUDA user is no longer refused.** Registering the arm narrows
   M4's `Prepare` refusal automatically. Both runs above have now happened, so
   BUILD-VERIFIED ONLY is not the right label and neither is RUN AND FAILING;
-  `docs/USAGE.md` and `docs/FEATURES.md` are corrected in the same change that
-  records each run, and they now say that the arm serves only `N % 128 == 0` and
-  `K % 128 == 0`, that it MATCHES the CPU reference on the seven shapes it was
-  run on, and
-  that it has NO token gate and NO speed number. Neither page may carry a
-  capability claim wider than that.
+  the user-facing page and `docs/FEATURES.md` are corrected in the same change
+  that records each run. Those corrections landed in `docs/USAGE.md`, and
+  [#1491](https://github.com/mudler/vllm.cpp/pull/1491) has since moved that
+  page's block-wise FP8 section to `docs/models/qwen3-8-27b.md`, which is where
+  the user-facing claim lives now. Both say that the arm serves only
+  `N % 128 == 0` and `K % 128 == 0`, that it MATCHES the CPU reference on the
+  seven shapes it was run on, and that it has NO token gate and NO speed number.
+  Whichever page carries this arm's user-facing claim may not state one wider
+  than that -- the constraint binds the claim, not the path, because this is the
+  second time in one day that a path in this spec has gone stale under a
+  concurrent landing.
 - **The column-major and TMA-aligned activation-scale layouts**
   (`utils/fp8_utils.py:610-628`), which `vt::QuantFp8Group` could emit and does
   not. M1 shipped row-major only and recorded both as owed; M2 repeated it.
