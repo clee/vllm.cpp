@@ -198,9 +198,13 @@ pull request with the spec committed first.
   the eight comment anchors [#1396](https://github.com/mudler/vllm.cpp/issues/1396)
   corrected. Three are LIVE refusal messages that tell a user on an unsupported
   CUDA arch to wait for milestone M5, which landed at `489a9a4c0`
-  (`layers/quantization/fp8_block_quant.cpp:187-189`,
-  `models/dense_fp8_block_gemm.h:200-202` and `:428-430`). Five are comments
-  (`include/vt/ops.h:1637,1658`, `src/vt/cpu/cpu_ops.cpp:668`,
+  (`layers/quantization/fp8_block_quant.cpp:187-189`;
+  `models/dense_fp8_block_gemm.h:200-202` in the `MatmulFp8BlockScaledD`
+  guard; and `:428-430` in the shared `CheckFp8BlockMergedActivation` helper
+  that both `MatmulFp8BlockMergedD` and `Fp8BlockGateUpSwiGLUD` call, so that
+  message also fires on the merged `gate_up` path and not only on QKV -- a
+  fixer who looks in `MatmulFp8BlockMergedD` will not find it). Five are
+  comments (`include/vt/ops.h:1637,1658`, `src/vt/cpu/cpu_ops.cpp:668`,
   `include/vt/merged_gemm.h:92`,
   `src/vllm/model_executor/models/qwen3_5_dense_weights.cpp:604`,
   `tests/vllm/model_executor/models/test_fp8_block_linear.cpp:267`). The
