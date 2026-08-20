@@ -640,6 +640,58 @@ UNMEASURED on sm_121a, and the two are not interchangeable. Specifically owed:
 decode window, withholds both GB10 references off `121a`, and refuses a fraction
 outright when the load boundary never appears.
 
+### 10.5 The one moved token is not yet shown to be a defect, and three independent lines say it is a tie
+
+The GB10 three-leg discriminator settled that the moved token belongs to the
+device arm. It did NOT settle whether the arm is wrong. §10.4 already owed "the
+oracle top-2 margin at the moved tokens", and that measurement is still owed —
+it is blocked on [#1431](https://github.com/mudler/vllm.cpp/issues/1431), which
+is the oracle failing engine start-up on this checkpoint on `dgx:gpu0`. The
+instrument is committed as `scripts/nemotron-h-a2q1-neartie-gap.py` and its
+lease driver is staged at `/workspace/a2q1-neartie/job.sh`.
+
+What IS established, from evidence already in the record, is that three
+independent things point away from a numerics defect:
+
+1. **The two device legs run DIFFERENT recurrent kernels and lose the SAME
+   token.** `state_update_rows=23 chunk_scan_calls=0 gathers=0 scatters=0`
+   against `state_update_rows=0 chunk_scan_calls=23 gathers=46 scatters=46`,
+   and both emit `...,9943,1307,11286`. A defect in the recurrent kernel's
+   reduction order, or in the gather/scatter state indexing, cannot be invariant
+   across that pair.
+2. **The polarity FLIPS with silicon, within one binary on each box.** The
+   device arm reads 96/96 on `thor:gpu0` and 95/96 on `dgx:gpu0`; the host arm
+   reads 93/96 on Thor and 96/96 on GB10 (the discriminator's `hostmamba` leg).
+   A systematic FP8 defect in the device arm cannot be 96/96 on Thor.
+3. **The MORE PRECISE arm is the WORSE tracker.** The host arm is W8A16 and
+   never quantizes the activation, so it is strictly more precise than vLLM
+   itself, which runs these projections W8A8 — confirmed on the oracle's own
+   startup line, `Selected FlashInferFP8ScaledMMLinearKernel for
+   ModelOptFp8LinearMethod`. If precision loss drove this, the host arm would
+   track a vLLM golden best. On Thor it is the worst, and it diverges two
+   positions EARLIER (position 30, not 32). Accumulating quantization error
+   predicts the opposite ordering.
+
+And the oracle is not token-stable against itself on the prompt in question.
+`/workspace/nhspeed/oracle.a.out`, same box, same staged checkpoint, same greedy
+sampling, changing only the engine configuration, reproduced its OWN committed
+golden as `matched=32` on prompts 0 and 1 and **`matched=26` on prompt 2**, in
+both legs of the run. Our device arm moves one token on that prompt; the oracle
+moves six.
+
+Decoded, all three continuations are the same sentence taking a different fork
+after "…observed outputs, typically using a":
+
+| arm | positions 30, 31, 32 |
+|---|---|
+| vLLM golden | ` combination`, ` of`, ` state` |
+| Thor `sm_110`, host arm | ` transition`, ` equation`, ` for` |
+| GB10 `sm_121a`, device arm | ` combination`, ` of`, ` transition` |
+
+The competing token is the SAME one, `11286` ` transition`, in both divergent
+arms. None of this is a substitute for the margin in nats, which is what decides
+the FORM of the replacement gate; it is the reason the margin is worth a lease.
+
 ## 11. Owed
 
 - [#974](https://github.com/mudler/vllm.cpp/issues/974) — `dense_fp8::ResidentFp8`
