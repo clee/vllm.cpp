@@ -4538,6 +4538,15 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
   // statement. A `decode.video` leaf that closes before its chunk arrives, or
   // that is re-labelled after one, no longer contains the chunk it produced.
   // Nested, so the sum does not move.
+  //
+  // ITS OPEN IS STILL THE STATEMENT NEXT DOOR, and the third fresh review showed
+  // what that costs: move the two `Close`s below to after the PPM write and the
+  // leaf AND its anchor grow together, so containment and coverage both hold
+  // while the whole writer is charged to `decode.video`. Two things close it.
+  // `decode.video.vae` is opened inside `Ltx2ConvVideoDecodeTiled` around
+  // `AccumulateTemporalGroup`, so `decode.video` has one sub-scope whose ends
+  // are both production events; and the gate asserts that nothing but an anchor
+  // is emitted NESTED, which is what a swallowed `artifacts.frames` becomes.
   size_t chunk_handle =
       phase::PhaseLog::Instance().Open("decode.video.chunk", /*span=*/false);
   Ltx2VideoDecodeStreaming(
@@ -4568,6 +4577,11 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
         }
         rendered_frames += chunk.frames.frames;
         rendered_channels = chunk.frames.channels;
+        // COUNTED BY THE RENDER, not by the instrument (#1010, third fresh
+        // review). W0's containment case needs one number about this decode that
+        // no phase-scope placement can move; this is it, and it sits beside the
+        // frame count for the same reason that one does.
+        im.trace.video_decode_chunks += 1;
         write_phase.Close();
         decode_handle = phase::PhaseLog::Instance().Open("decode.video", /*span=*/false);
         chunk_handle = phase::PhaseLog::Instance().Open("decode.video.chunk", /*span=*/false);

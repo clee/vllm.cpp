@@ -2909,8 +2909,32 @@ TEST_CASE("ltx2 video: a render through the ABI emits a phase table that SUMS to
 // whose honest denoise was 73.4%. A gate blind to that is a gate this campaign
 // cannot rank levers with, because W1 ranks them off this very table.
 //
-// So each carrying phase now carries an ANCHOR, and this case asserts four
-// things about it:
+// AND A THIRD FRESH REVIEW BROKE IT AGAIN, one level over from that. All four
+// assertions below are RATIOS taken against the sub-scope anchor, so an anchor
+// that moves WITH the leaf defeats all four at once. Two mutations, both
+// building clean, both exit 0 on both cases:
+//
+//   M12 emits `denoise.step` for `step_index == 0` only, closes `denoise` after
+//       step 0 and opens `phase.finish` over steps 1-7. **exit 0, 106/106 and
+//       350/350 assertions**, over a table reporting `phase.finish` at 28.73%
+//       against a `denoise` of 6.11% on a run whose honest denoise was 39.3%.
+//       That is M7's defect again, on M7's phase, through the gate M7 produced.
+//   M11 moves the two `Close`s in the driver's chunk sink to after the PPM
+//       write. **exit 0, 124/124 and 422/422**, coverage still 99.68%, with the
+//       whole PPM writer charged to `decode.video` — the leaf W5's lever is
+//       measured from — because a swallowed neighbour turns `nested`, leaves the
+//       sum, and overlaps nothing.
+//
+// So the case now asserts SIX things, and the first and the sixth are the ones
+// that are not ratios:
+//
+//   0. RECORD COUNT   the anchor runs once per unit of work the RENDER counted.
+//                     `denoise.step` once per `Ltx2ConditioningTrace::
+//                     dit_evaluations`, `decode.video.chunk` once per
+//                     `video_decode_chunks` plus the reopen after the last one,
+//                     the audio pair once each. Neither counter is derived from
+//                     the phase table, so no placement of a scope can move them.
+//                     This is what M12 fails.
 //
 //   1. CONTAINMENT  every sub-scope interval lies inside one of the leaf's own
 //                   records. `denoise.step` wraps the denoiser evaluation inside
@@ -2931,6 +2955,16 @@ TEST_CASE("ltx2 video: a render through the ABI emits a phase table that SUMS to
 //                   is the assertion that catches the transfer directly: M7's
 //                   `phase.finish` opens in the middle of the denoise window.
 //   4. NON-OVERLAP  the carrying leaves and the writer never overlap each other.
+//   5. NOTHING BUT AN ANCHOR IS NESTED, plus the writer is never enclosed by a
+//                     `decode.video` leaf. A leaf that grows over a NEIGHBOUR
+//                     does not overlap it and does not break the sum — the
+//                     neighbour turns `nested` and leaves the timeline — so this
+//                     is the assertion M11 fails, and it needs no clock.
+//                     `decode.video` also gains `decode.video.vae`, opened
+//                     inside `Ltx2ConvVideoDecodeTiled` around
+//                     `AccumulateTemporalGroup`, so that leaf has one sub-scope
+//                     whose ends are both production events rather than
+//                     statements adjacent to its own.
 //
 // WHAT WAS TRIED FIRST AND REJECTED, MEASURED RATHER THAN ARGUED. The obvious
 // repair is a differential: render at two frame counts and require the phases
@@ -3009,6 +3043,12 @@ struct Carrying {
   std::vector<std::string> parts;      // the nested sub-scopes sitting on the work
   double min_coverage = 0.0;           // of the leaf's own seconds
   std::vector<std::string> partners;   // leaves the driver genuinely interleaves with
+  // HOW MANY RECORDS OF EACH PART, from a number the RENDER produced. One entry
+  // per name in `parts`. This is the only assertion here that is not a ratio
+  // against the leaf, and it is why the other four are worth making — see the
+  // note above this case.
+  std::vector<int64_t> part_counts;
+  std::string count_source;            // where those numbers came from, for the message
 };
 
 // The four assertions above, for one carrying phase. A free function rather than
@@ -3026,6 +3066,33 @@ void CheckCarryingPhase(const nlohmann::json& table, const Carrying& c) {
     leaf_seconds += r["end_seconds"].get<double>() - r["start_seconds"].get<double>();
   }
   REQUIRE(leaf_seconds > 0.0);
+
+  // (0) THE RECORD COUNT, and it is FIRST because it is the only one of the five
+  // that is not a ratio against `leaf_seconds`. See the note above this case:
+  // containment, coverage, exclusivity and non-overlap all measure the anchor
+  // AGAINST the leaf, so an anchor that moves WITH the leaf satisfies all four
+  // at once, and mutation M12 did exactly that — emit `denoise.step` for step 0
+  // only, close `denoise` there, open `phase.finish` over the remaining seven
+  // steps, and both cases in this file report exit 0 over a table that charges
+  // 82% of the largest phase to its neighbour.
+  //
+  // The counts come from `Ltx2ConditioningTrace`, which the RENDER maintains: an
+  // evaluation increments `dit_evaluations` inside the shared `Evaluate` lambda
+  // and the driver's own sink increments `video_decode_chunks` beside
+  // `rendered_frames`. Neither is derived from the phase table, so no placement
+  // of a phase scope can move them, and an anchor that runs a different number
+  // of times than the work it claims to wrap is caught whatever the clock did.
+  REQUIRE(c.part_counts.size() == c.parts.size());
+  for (size_t i = 0; i < c.parts.size(); ++i) {
+    const int64_t emitted = static_cast<int64_t>(RecordsNamed(table, c.parts[i]).size());
+    INFO("sub-scope = " << c.parts[i]);
+    CHECK_MESSAGE(emitted == c.part_counts[i],
+                  "'" << c.parts[i] << "' was emitted " << emitted << " time(s) and the render "
+                      << "did the work " << c.part_counts[i] << " time(s) (" << c.count_source
+                      << "). An anchor that does not run once per unit of work it names is not "
+                         "anchoring the name to the work — it is measuring whichever unit it "
+                         "happened to be opened around");
+  }
 
   // (1) CONTAINMENT, and the sub-scopes' own intervals.
   std::vector<std::pair<double, double>> subs;
@@ -3103,9 +3170,75 @@ void CheckCarryingPhase(const nlohmann::json& table, const Carrying& c) {
   }
 }
 
+// NOTHING BUT AN ANCHOR IS NESTED, and this is the assertion that closes the
+// GROWING direction the four above cannot see.
+//
+// A record is `nested` when it opened while another leaf was already open
+// (`render_phase_log.cpp`, `PhaseLog::Open`), and a nested record is dropped from
+// `sum_leaf_seconds`. So a carrying leaf that grows over one of its NEIGHBOURS
+// does not overlap anything and does not break any sum — the neighbour simply
+// turns nested and leaves the timeline. Mutation M11 is exactly that: move the
+// two `Close`s in the driver's chunk sink to after the PPM write and the whole
+// writer is charged to `decode.video`, which is the leaf W5's lever is measured
+// from. Containment held, coverage held at 99.68%, non-overlap held because the
+// leaves stayed disjoint, and exclusivity held because `artifacts.frames` is a
+// DECLARED PARTNER of `decode.video` and is skipped by name.
+//
+// The list is the anchors and nothing else, so the assertion needs no clock and
+// no threshold: any other name appearing nested means a leaf was left open
+// across work it does not name. The driver's own comment above the sink
+// (`ltx2_video.cpp`, "Folding the writes into `decode.video` would charge W5's
+// lever with the cost of a `write(2)`; nesting them would take the writer out of
+// the sum entirely") states both halves of this as a requirement; before this
+// line no gate held it.
+void CheckOnlyAnchorsAreNested(const nlohmann::json& table,
+                               const std::vector<std::string>& anchors) {
+  for (const nlohmann::json& e : table["phases"]) {
+    if (!e.value("nested", false)) continue;
+    const std::string name = e["name"].get<std::string>();
+    INFO("nested record = " << name);
+    CHECK_MESSAGE(std::find(anchors.begin(), anchors.end(), name) != anchors.end(),
+                  "'" << name << "' is emitted NESTED, and it is not one of this render's "
+                      "anchors. A nested record is excluded from `sum_leaf_seconds`, so a leaf "
+                      "that grew across this one moved its seconds onto itself and took it out "
+                      "of the table at the same time — with no overlap, no gap and no change to "
+                      "what the phases add up to");
+  }
+}
+
+// ...and the converse for the pair the driver INTERLEAVES. `artifacts.frames`
+// alternates with `decode.video` rather than nesting inside it, which is what
+// keeps the `write(2)` off W5's lever. Asserted over the INTERVALS as well as
+// over the `nested` flag, so a change in what the emitter means by `nested`
+// cannot quietly retire it.
+void CheckWriterIsBesideTheDecode(const nlohmann::json& table) {
+  const std::vector<nlohmann::json> writes = RecordsNamed(table, "artifacts.frames");
+  REQUIRE_MESSAGE(!writes.empty(), "the render wrote frames and named no 'artifacts.frames' leaf");
+  const std::vector<nlohmann::json> decodes = RecordsNamed(table, "decode.video");
+  REQUIRE(!decodes.empty());
+  for (const nlohmann::json& w : writes) {
+    const double ws = w["start_seconds"].get<double>();
+    const double we = w["end_seconds"].get<double>();
+    INFO("artifacts.frames = [" << ws << ", " << we << "]");
+    CHECK_FALSE_MESSAGE(w.value("nested", false),
+                        "the PPM writer is NESTED, so its seconds are charged to whatever leaf "
+                        "encloses it and dropped from the sum");
+    for (const nlohmann::json& d : decodes) {
+      const double ds = d["start_seconds"].get<double>();
+      const double de = d["end_seconds"].get<double>();
+      const bool outside = we <= ds + 1e-9 || ws >= de - 1e-9;
+      CHECK_MESSAGE(outside,
+                    "a 'decode.video' leaf runs [" << ds << ", " << de << "] and ENCLOSES the "
+                        << "writer at [" << ws << ", " << we << "]. W5 ranks this campaign's "
+                        << "levers off the `decode.video` number and it would be reading the "
+                        << "cost of a write(2)");
+    }
+  }
+}
+
 }  // namespace
 
-TEST_CASE("ltx2 video: each named phase CONTAINS the work it is named after") {
+TEST_CASE("ltx2 video: the three carrying phases contain their work and the load keeps its order") {
   Workspace ws;
   // `max_phase = 0` is a LOAD extra and is what keeps this on one recipe phase:
   // the default `distilled_two_stage` kind would need the latent spatial
@@ -3115,12 +3248,44 @@ TEST_CASE("ltx2 video: each named phase CONTAINS the work it is named after") {
   const std::unique_ptr<vllm::multimodal::VideoEngine> engine =
       vllm::multimodal::LoadVideoEngine(mp);
   REQUIRE(engine != nullptr);
+  vllm::multimodal::Ltx2VideoEngine* ltx2 =
+      dynamic_cast<vllm::multimodal::Ltx2VideoEngine*>(engine.get());
+  REQUIRE(ltx2 != nullptr);
 
   const vllm::multimodal::VideoResult result =
       engine->Generate(FixtureGen(ws.root + "/attribution"));
   REQUIRE(result.frame_count == 9);
   REQUIRE_MESSAGE(!result.phase_log_path.empty(), "the render wrote no phase table");
   const nlohmann::json table = nlohmann::json::parse(ReadAll(result.phase_log_path));
+
+  // ── WHAT THE RENDER COUNTED, which is not what the instrument counted ──────
+  //
+  // Two numbers, both maintained by the render itself. `dit_evaluations` is
+  // incremented inside the shared `Evaluate` lambda every sampler arm goes
+  // through; `video_decode_chunks` is incremented in the driver's streaming sink
+  // beside `rendered_frames`. They are the anchors' denominators below.
+  const vllm::multimodal::Ltx2ConditioningTrace trace = ltx2->last_conditioning();
+  REQUIRE(trace.completed);
+  REQUIRE(trace.dit_evaluations > 0);
+  REQUIRE(trace.video_decode_chunks > 0);
+
+  // AND THE CHUNK COUNT IS RE-DERIVED rather than taken on faith, in the shape
+  // the multi-chunk case above already uses: the tiling algebra the decoder runs
+  // is public, so the group count for this request is computable here from the
+  // fixture's own factors. A counter that was incremented in the wrong place
+  // would agree with the phase table and disagree with this.
+  {
+    const vllm::Ltx2ScaleFactors factors{8, 32, 32};
+    const vllm::Ltx2TileSizeConfig layout = vllm::Ltx2AutoTileSizeConfig(32, 32, factors);
+    const int64_t latent_t = (result.frame_count - 1) / factors.time + 1;
+    const std::vector<vllm::Ltx2Tile> tiles =
+        vllm::Ltx2CreateTiles(latent_t, 1, 1, layout, factors);
+    const int64_t groups =
+        static_cast<int64_t>(vllm::Ltx2GroupTilesByTemporalSlice(tiles).size());
+    CHECK_MESSAGE(trace.video_decode_chunks == groups,
+                  "the render counted " << trace.video_decode_chunks << " decoded chunk(s) and "
+                      << "this request's tiling produces " << groups << " temporal group(s)");
+  }
 
   // (1)-(3) THE THREE PHASES THAT CARRY THIS RENDER, each with its anchor.
   //
@@ -3134,11 +3299,23 @@ TEST_CASE("ltx2 video: each named phase CONTAINS the work it is named after") {
   //    with was a HOLE the second review named: at 0.90 `decode.audio` could
   //    open 11% early and swallow 0.13 s, which is 87% of this render's entire
   //    `decode.video`, while passing everything in this file.
-  //  * `denoise.step` covers the denoiser EVALUATIONS, measured at 99.67% over
-  //    8 of them. The uncovered part is real work — the post-process and the
-  //    Euler or res_2s step, which no anchor wraps — PLUS two instrument
-  //    boundaries per evaluation, and a preempted `/proc/self/statm` read at one
-  //    of those costs a percent of a 40 ms leaf on this fixture. 0.95.
+  //  * `denoise.step` covers the denoiser EVALUATIONS, measured at 99.37% and
+  //    99.67% over 8 of them. The uncovered part is real work — the post-process
+  //    and the Euler or res_2s step, which no anchor wraps — PLUS two instrument
+  //    boundaries per evaluation. 0.95.
+  //
+  //    THE MARGIN IS A FALSE-RED RISK AND THIS COMMENT USED TO ARGUE THE
+  //    OPPOSITE. It said the uncovered part "costs a percent of a 40 ms leaf",
+  //    which reads as though the overhead scales with the leaf. It does not: the
+  //    16 boundary samples cost the same wall whether the denoise is 20 ms or 20
+  //    minutes, so the RATIO gets worse exactly as the hardware gets faster. A
+  //    third fresh review measured 99.228% on a quiet box at a 20 ms leaf — an
+  //    uncovered 0.154 ms — which puts the crossing point at a denoise leaf of
+  //    about 3.1 ms. Below that this threshold reds a healthy tree. It is a
+  //    FALSE RED and never a false pass, and it is left at 0.95 rather than
+  //    loosened on an argument nobody has measured: the (0) record count is what
+  //    now ties this name to its work, and a red here has a diagnosis printed
+  //    beside it in the MESSAGE above.
   //  * `decode.video.chunk` runs from the leaf's own open to the moment the
   //    decoder hands a chunk back, so the only uncovered part is TWO instrument
   //    boundaries — measured 99.44% — and that is why its threshold is the
@@ -3149,12 +3326,77 @@ TEST_CASE("ltx2 video: each named phase CONTAINS the work it is named after") {
   //    go unnamed, which is three orders of magnitude below the 0.13 s the same
   //    0.90 permitted on the audio decode: the fraction is the same and the
   //    stake is not, which is why these three numbers are not one number.
+  //
+  // AND EACH CARRIES ITS RECORD COUNT, which is assertion (0) and the one that
+  // is not a ratio. `denoise.step` runs once per denoiser evaluation.
+  // `decode.video.chunk` opens with the leaf and reopens after every chunk the
+  // sink is handed, so it emits one more record than there are chunks — the last
+  // one is the empty window between the final chunk and the end of the decode.
+  // The audio decode is exactly one mel pass and one vocoder pass.
   const std::vector<Carrying> carrying = {
-      {"denoise", {"denoise.step"}, 0.95, {}},
-      {"decode.video", {"decode.video.chunk"}, 0.90, {"artifacts.frames"}},
-      {"decode.audio", {"decode.audio.mel", "decode.audio.vocoder"}, 0.99, {}},
+      {"denoise",
+       {"denoise.step"},
+       0.95,
+       {},
+       {trace.dit_evaluations},
+       "Ltx2ConditioningTrace::dit_evaluations"},
+      {"decode.video",
+       {"decode.video.chunk"},
+       0.90,
+       {"artifacts.frames"},
+       {trace.video_decode_chunks + 1},
+       "Ltx2ConditioningTrace::video_decode_chunks + 1, the reopen after the last chunk"},
+      {"decode.audio",
+       {"decode.audio.mel", "decode.audio.vocoder"},
+       0.99,
+       {},
+       {1, 1},
+       "the two calls #1010 names, once each per render"},
   };
   for (const Carrying& c : carrying) CheckCarryingPhase(table, c);
+
+  // (3b) THE VAE'S OWN SUB-SCOPE, which is where the video decode spends its
+  // seconds and the reason `decode.video.chunk` is not the whole answer.
+  //
+  // `decode.video.chunk` opens two statements after `Open("decode.video")` and
+  // closes one statement before `Close("decode.video")`, so containment and
+  // coverage over it hold BY CONSTRUCTION and cannot constrain the leaf in the
+  // growing direction — which is what M11 exploited. `decode.video.vae` is
+  // opened inside `Ltx2ConvVideoDecodeTiled` around `AccumulateTemporalGroup`,
+  // i.e. around the tile decode itself, so both of its ends are production
+  // events. One record per temporal group, which is one per chunk, and each one
+  // inside the chunk window that produced it.
+  {
+    const std::vector<nlohmann::json> vae = RecordsNamed(table, "decode.video.vae");
+    CHECK_MESSAGE(static_cast<int64_t>(vae.size()) == trace.video_decode_chunks,
+                  "the tiled decode emitted " << vae.size() << " 'decode.video.vae' record(s) "
+                      << "against " << trace.video_decode_chunks << " chunk(s) the render "
+                      << "counted");
+    const std::vector<nlohmann::json> chunks = RecordsNamed(table, "decode.video.chunk");
+    for (const nlohmann::json& v : vae) {
+      CHECK_MESSAGE(v.value("nested", false),
+                    "'decode.video.vae' is not marked nested, so the tile decode is being SUMMED "
+                    "as well as the leaf that contains it");
+      const double vs = v["start_seconds"].get<double>();
+      const double ve = v["end_seconds"].get<double>();
+      bool inside = false;
+      for (const nlohmann::json& ch : chunks) {
+        if (vs >= ch["start_seconds"].get<double>() - 1e-9 &&
+            ve <= ch["end_seconds"].get<double>() + 1e-9) {
+          inside = true;
+        }
+      }
+      CHECK_MESSAGE(inside, "a 'decode.video.vae' record runs [" << vs << ", " << ve
+                                << "] and no 'decode.video.chunk' window encloses it");
+    }
+  }
+
+  // (3c) AND NOTHING BUT AN ANCHOR IS NESTED. The assertion that sees a leaf
+  // swallow a NEIGHBOUR, which the four above cannot: see the note on
+  // `CheckOnlyAnchorsAreNested`.
+  CheckOnlyAnchorsAreNested(table, {"denoise.step", "decode.video.chunk", "decode.video.vae",
+                                    "decode.audio.mel", "decode.audio.vocoder"});
+  CheckWriterIsBesideTheDecode(table);
 
   // (4) THE FLOOR, read as "this name is not detached" and nothing more. See the
   // note above this case for why it is not tightened toward the measured share.
@@ -3197,6 +3439,60 @@ TEST_CASE("ltx2 video: each named phase CONTAINS the work it is named after") {
                   "two of the carrying/writer leaves overlap: [" << spans[i - 1].first << ", "
                       << spans[i - 1].second << "] and [" << spans[i].first << ", "
                       << spans[i].second << "]");
+  }
+
+  // (6) THE LOAD LEAVES SIT IN THE DRIVER'S OWN ORDER, and this is the weakest
+  // assertion in the case as well as the only one the load has.
+  //
+  // WHY IT EXISTS. The three assertions above cover the three phases that carry
+  // a RENDER. They say nothing about the six the LOAD is made of, and a third
+  // fresh review showed what that costs: swap the `load.dit` and
+  // `load.prompt_embeds` scope NAMES in the driver — two lines — and every gate
+  // in this file stays green while 96% of the load's seconds move onto the wrong
+  // name. On the shipped 21B that name holds about seven and a half minutes of
+  // DiT staging, and it is the phase W2 and W3 both act on.
+  //
+  // WHY IT IS ONLY AN ORDER. An anchor for `load.dit` would have to open inside
+  // `Ltx2LoadDitFromSafetensors` / `Ltx2StreamDitToDevice`
+  // (`ltx2_loader.cpp`), which this stage's authority does not reach; the driver
+  // has exactly one statement between the scope's open and its close, so a
+  // sub-scope placed HERE would be the adjacent-statement anchor whose
+  // circularity M11 and M12 already demonstrated. The order is what remains
+  // checkable from the table alone: the driver loads the DiT, then the video
+  // VAE, then the audio VAE, then the upsampler, then the text encoder, then the
+  // prompt embeds, and a swapped pair of names shows up here as a swapped pair
+  // of start times. What is still NOT proven is that each of these names covers
+  // the work it is named after; `### Owed out of W0` in the row's spec lists
+  // every leaf in that state, and W2 and W3 must read it before they act on
+  // `load.dit`.
+  {
+    const std::vector<std::string> load_order = {"load.dit",       "load.video_vae",
+                                                 "load.audio_vae", "load.upsampler",
+                                                 "load.text_encoder", "load.prompt_embeds"};
+    double previous = -1.0;
+    std::string previous_name;
+    int64_t seen = 0;
+    for (const std::string& name : load_order) {
+      const std::vector<nlohmann::json> found = RecordsNamed(table, name);
+      // A load phase that did not run emits nothing; this fixture carries no
+      // upsampler and no text encoder.
+      if (found.empty()) continue;
+      CHECK_MESSAGE(found.size() == 1u,
+                    "'" << name << "' was emitted " << found.size()
+                        << " times and the driver opens it once per load");
+      const double start = found.front()["start_seconds"].get<double>();
+      CHECK_MESSAGE(start >= previous,
+                    "'" << name << "' starts at " << start << " and '" << previous_name
+                        << "' starts at " << previous << ", so the table reports the load in an "
+                           "order the driver does not run it in. Two scope names that were "
+                           "swapped move their seconds onto each other and change nothing else "
+                           "in this file");
+      previous = start;
+      previous_name = name;
+      ++seen;
+    }
+    REQUIRE_MESSAGE(seen >= 4, "this fixture load names only " << seen
+                                   << " load phases; the order it checks is vacuous");
   }
 }
 
