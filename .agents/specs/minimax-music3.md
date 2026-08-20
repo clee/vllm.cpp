@@ -1103,6 +1103,25 @@ under `--speech-device 1`, which §13 routes through `vt::MatmulBT`,
 `vt::Add` with device-resident weights. Every profile number quoted above is the
 CPU arm's and still describes it exactly.
 
+**Where the vocoder stands after §18, so this section and `docs/STATUS.md` agree
+rather than one of them being newer.** The row does NOT move lifecycle state —
+MiniMax-Music3 stays `ACTIVE` — so by AGENTS.md's trigger table neither this line
+nor the STATUS row was owed: both are tied to a lifecycle move, and only
+`docs/BENCHMARKS.md` is owed by a new accepted measurement. They are written
+anyway, and written TOGETHER, because the STATUS row's notes cell carries this
+model's measured wins and would otherwise name the depth decoder's and not the
+vocoder's. That mismatched pair was a review finding on this row (2026-08-19),
+and the resolution recorded here is the pair, not the trigger.
+
+`vocoder.decode_window` was the term §16.7 named as the largest one no row owned.
+It is owned now, and measured: **1.36-1.44x** on Thor's 14 threads and **2.16x**
+per core (§18.8a, §18.8b), bit-identical output on every length. Next on this
+model, in the order §18.9 argues for: the vocoder's PARALLEL DECOMPOSITION, which
+§18.8b measured as the cap rather than assuming one; the CUDA-vs-CPU `memcmp`
+arm, which needs a box carrying `nvcc`; the e2e pair on the real checkpoint; and
+the f64-throughput explanation of the device arm, which §18.2 now carries as an
+inference rather than a finding.
+
 ---
 
 ## 10. The parity sweep, the music-only server, and the weights record (#672)
@@ -3437,3 +3456,1229 @@ reader to rediscover from a profile.
 reference axis in `docs/BENCHMARKS.md` stays `PENDING`. Everything above is an
 internal two-arm number on named hardware.
 
+
+## 17. The request-key contract, finished (#1315) — a guard that stopped looking
+
+[#925](https://github.com/mudler/vllm.cpp/issues/925) refused `audio_duration_s`
+and [#953](https://github.com/mudler/vllm.cpp/issues/953) refused the five keys
+SGLang-Omni names. Both landed and both are correct. This section is what they
+did not cover, and the first half of it is the same defect they fixed, still
+live at `678fc672c` and reachable by an ordinary body.
+
+### 17.1 Scope
+
+[#1315](https://github.com/mudler/vllm.cpp/issues/1315). One function,
+`ParseSpeechRequest`
+([`src/vllm/entrypoints/openai/speech_api.cpp`](../../src/vllm/entrypoints/openai/speech_api.cpp)),
+plus the tests that enter it through the registered route. No engine, no
+kernel, no model code, no lifecycle change: the row stays `ACTIVE`, so this
+change owes `docs/USAGE.md` (a request-key surface) and nothing in
+`docs/STATUS.md`, `docs/BENCHMARKS.md` or `## Now`.
+
+### 17.2 The oracle, and what it says
+
+vLLM registers no `/v1/audio/speech` and no MiniMax-Music3, so the primary is
+silent here and the secondary applies: SGLang-Omni, pinned at
+`748a0b437e4a8faad44d7bbfd5a0ae55d1fef830`
+([`.agents/oracles/sglang-omni.md`](../oracles/sglang-omni.md)). The pin was
+asserted against the local checkout's `HEAD` before a line of it was read,
+because an oracle whose identity is assumed measures whatever happens to be
+checked out.
+
+`_build_tts_params` (`sglang_omni/serve/speech_service.py:737-779`) forwards a
+named set of wire keys into the model builder.
+`_UNSUPPORTED_TTS_PARAMS` (`sglang_omni/models/minimax_music3/request_builders.py:20-30`)
+lists what MiniMax-Music3 cannot honour, and `_validate_tts_contract` (`:71-81`)
+raises `"MiniMax Music 3 does not support speech parameters: <names>"` for each.
+Two further keys come from the schema itself: `voice` carries
+`AliasChoices("voice", "speaker")` (`sglang_omni/serve/protocol.py:337-339`),
+and `instructions` is the music CAPTION, which the builder requires non-empty
+(`request_builders.py:104-106`).
+
+The oracle is `gateable = no` — cloned and read, never executed here — so this
+is a SOURCE reading and it is recorded as one. Nothing in this section claims a
+measured comparison against a running SGLang-Omni.
+
+### 17.3 The defect, in two parts
+
+**Part 1 — `extra_params` was a REPLACEMENT, not a second place to look.** The
+`const nlohmann::json& extra` binding in `ParseSpeechRequest` selects one of the
+two objects. It is at `speech_api.cpp:159-161` in `f06b9e93d`, the merge base of
+the change that repairs it. An earlier draft of this section and the `#1315` row
+in [`issue-index.md`](../issue-index.md) both cite `:160-163`, which is off by
+one line and, at the repaired head, lands on the `voice` and `speed` refusals
+instead. This copy is corrected; the index row is append-only and keeps the
+slip, so the anchor to trust is this one and the symbol name is what survives
+either way.
+
+```cpp
+const nlohmann::json& extra =
+    (json.contains("extra_params") && json.at("extra_params").is_object())
+        ? json.at("extra_params") : json;
+```
+
+So a body carrying an `extra_params` object AT ALL — an empty `{}` suffices —
+stops the top level being read for every knob and every refusal that resolves
+through `extra`. `{"lyrics": …, "extra_params": {"seed": 7}, "audio_duration":
+0.1}` drops the duration, leaves `audio_duration_s` at its `0.0` sentinel, and
+§4.1's resolver substitutes the family's 60 s
+(`minimax_music3_speech.cpp:478-479`). That is #852's ~750x job, behind a 200,
+with #925's guard in the tree and unable to fire. The five #953 refusals go
+quiet on the same body. The mirror hole is the other side of it: `voice`,
+`speed`, `stream`, `stream_format` and `response_format` were read from the top
+level only, so nesting any of them dropped it.
+
+**Part 2 — nine keys the oracle names, dropped silently.** The seven of
+`_UNSUPPORTED_TTS_PARAMS` that this route can see (`task_type`, `ref_audio`,
+`ref_text`, `x_vector_only_mode`, `initial_codec_chunk_frames`, `token_count`,
+`duration_tokens`), plus `speaker` and `instructions`. `token_count` and
+`duration_tokens` are LENGTH keys, so they repeat #925's cost exactly.
+
+### 17.4 Design
+
+`extra_params` becomes a second place to look, with `extra_params` winning —
+the precedence the video route already documents
+(`src/vllm/entrypoints/openai/video_api.cpp:216-225`), so the two routes resolve
+a knob the same way instead of two ways. Every request key goes through one
+`Owner(key)` resolver.
+
+**That sentence was false when this section was first written, and §17.7 records
+what the false version cost.** The first implementation routed the KNOBS and the
+REFUSALS through `Owner` and left the eight CONTENT keys (`model`, `input`,
+`text`, `language`, `lyrics`, `description`, `prompt`, `reference_audio`)
+reading the bare `json` handle, while claiming in the code that "there is no
+longer a handle on one placement only". There was: `Owner` needs `json` as its
+fallback, so the handle cannot go away. What is guaranteed is a CONVENTION that
+the code states and the tests pin, not a structural impossibility, and it is
+written that way now because the impossibility claim is exactly what let eight
+direct reads sit underneath it through an implementation and a first review.
+
+The nine keys are REFUSED by name, each naming what to send instead. `speaker`
+points at `voice`'s refusal, `instructions` at `description`, `ref_audio` at
+`reference_audio`, and both length keys at `audio_duration` in seconds.
+
+**`instructions` is refused rather than aliased, and that is a decision.**
+Upstream HONOURS it as the caption, so an alias would be the closer mirror of
+behaviour. TWO reasons hold. AGENTS.md holds that a secondary oracle "never
+becomes the mirror source", and SGLang-Omni is the secondary here only because
+vLLM registers no `/v1/audio/speech` at all. And `instructions` means
+style-and-emotion for a TTS family (`protocol.py:348`) and the caption for this
+music one, so a global alias on a SHARED route would bake one family's meaning
+into it.
+
+A third reason that the first draft of this section gave, *"one meaning keeps
+one name on this route"*, does NOT hold, and the counter-example is four
+refusals up in the same function: `prompt` is ACCEPTED as a second spelling of
+`description`, with a comment stating the opposite policy. The rule the cases
+actually follow is narrower, and it is stated in the code beside the refusal:
+an ALIAS is accepted when both spellings carry the same value in the same UNITS
+and mean the same thing for every family this route can load.
+`prompt`/`description` qualify. `instructions` fails on MEANING. And the
+`max_new_tokens` precedent from #953 — which is real, and landed in `c90e3fc02`
+— fails on UNITS, 25 Hz frames against seconds, so aliasing it would need a
+silent conversion of the one quantity this route has already shipped a 750x
+error in.
+
+**The refusal has to name BOTH readings of the key, and now does.**
+`instructions` is OpenAI's OWN createSpeech field, for voice style and emotion,
+and this route describes itself as "OpenAI's createSpeech, extended with the two
+MUSIC inputs" (`api_server.cpp:496-497`). Framing the refusal purely as
+SGLang-Omni's caption spelling and redirecting to `description` is right for the
+caller who ported an SGLang recipe and wrong for the caller who read OpenAI's:
+it moves a VOICE-STYLE string into the music caption, which is the exact
+conflation this refusal exists to prevent. The message states the OpenAI reading
+first (no registered family exposes a style control, so there is nothing to
+send), then upstream's, then the `description` redirect for that second reading
+only.
+
+**`language` is deliberately absent from the refused set.** Upstream lists it,
+but it is already refused BY NAME one layer down
+(`minimax_music3_speech.cpp:456-460`), which is the layer this tree puts
+family-specific refusals at, and where a family that HAS a language can still
+take it. A family-specific refusal belongs at the family layer, and a future
+speech family that takes a language must not have to unpick a parser-level
+refusal to get one.
+
+**The first draft justified this with "Moving it up would break IndexTTS-2.5",
+and that is not true today.** No registered family reads
+`SpeechGenParams::language` at all: `grep -rn '\.language'
+src/vllm/model_executor/models/` returns exactly one hit, the MiniMax-Music3
+refusal above, and `grep language src/vllm/model_executor/models/indextts2.cpp`
+returns nothing. Moving the refusal up would therefore break nothing; it would
+convert a SILENT DROP into a refusal. That drop is this row's own defect class
+in the family this row did not touch, and it is filed as
+[#1337](https://github.com/mudler/vllm.cpp/issues/1337) against
+`MODEL-MM-indextts2-index-tts2-talker-for-conditional-generation` rather than
+fixed here, because either fix is IndexTTS-2 model code with its own oracle
+reading. The argument above is the forward-looking form and is the one that
+stands.
+
+**The boundary from #925 is unchanged.** An unknown key is still accepted, so
+`extra_params` stays forward-compatible. Only keys the pinned oracle names are
+refused, and the negative control in the test file pins that boundary so a later
+sweep cannot quietly turn it into "refuse everything".
+
+### 17.5 Gate
+
+Red first, and the red is the point: the parser suite fails 24 assertions and
+the server suite 54 before the change, on assertions that name the dropped key.
+The content-key repair in §17.7 adds a second red on top of that one, measured
+against the merge base `f06b9e93d`.
+The failing tests enter through the production entry point —
+`ApiServer::handle_audio_speech`, which is what
+`server.Post("/v1/audio/speech", …)` calls (`api_server.cpp:1116-1120`) — and one
+of them over a real socket, because #925 was a claim about an HTTP request and a
+parser test cannot make one. The parser-level cases stay as well; they localize
+a failure, which is worth having, and they are not the proof.
+
+Reachability is proven by deleting the parse call site
+(`api_server.cpp:504`) in a scratch copy and confirming the focused gate reds.
+
+### 17.6 Risks
+
+A guard that fires on an ordinary request is worse than the drop it replaces, so
+every refusal carries a negative control: a body without the key parses, an
+unknown key parses, and the honoured knobs keep their values across both
+placements. The precedence choice is the one behaviour change a body could
+notice, and it only becomes observable when a caller sends the SAME key twice in
+two places, which today resolves to whichever object `extra` happened to bind.
+
+### 17.7 The invariant was false, and three refusals were defeatable by nesting
+
+A fresh review of the implementation returned FAIL, and it was right. The repair
+itself reproduced exactly: the 750x defect, the fact that `"extra_params":{}`
+alone was enough, and every number claimed. What failed was a STRUCTURAL claim
+the change rested its durability on, and the live defect that claim was hiding.
+
+**What was false.** `speech_api.cpp` said "Every read and every refusal below
+resolves through `Owner` ... a guard that looks at one placement only can no
+longer be written, because there is no longer a handle on one placement only".
+The handle `json` was still in scope and still used about thirteen times below
+that sentence, for `model`, `input`, `text`, `language`, `lyrics`,
+`description`, `prompt` and `reference_audio`. None of the eight resolved
+through `Owner`.
+
+**What that cost**, measured against the real downstream chain rather than
+argued. Three refusals stayed defeatable by moving the key one level down
+([#1336](https://github.com/mudler/vllm.cpp/issues/1336)):
+
+| body | before | after |
+|---|---|---|
+| `{…,"text":"hello"}` | REFUSED (`minimax_music3_speech.cpp:440-446`) | unchanged |
+| `{…,"extra_params":{"text":"hello"}}` | 200, `text` silently DROPPED | reaches the family, which refuses it |
+| `{…,"language":"en"}` | REFUSED (`:456-460`) | unchanged |
+| `{…,"extra_params":{"language":"en"}}` | 200, `language` silently DROPPED | reaches the family, which refuses it |
+| `{…,"reference_audio":"data:…"}` | decoded | unchanged |
+| `{…,"extra_params":{"reference_audio":"data:…"}}` | 200, clip silently DROPPED | decoded |
+
+The `text` case is the sharpest, because the refusal it bypassed ends with the
+words *"rather than having it silently dropped"* and nesting produced precisely
+that drop. The `reference_audio` case has a second-order cost a caller could not
+have diagnosed: for a family whose `requires_reference_audio()` is true, the
+nested clip was dropped and `api_server.cpp:511-516` then answered
+`400 "reference_audio … is required"` naming the field the caller had just sent.
+
+**None of this was a regression.** The pre-#1315 code read those keys from the
+top level only as well. It was in scope, untested and unfiled, and the false
+invariant is what let it survive an implementation and a first review: a claim
+that a defect *cannot be written* reads as a reason not to look for it.
+
+**The repair.** The eight content keys route through `Owner`, so the invariant is
+true in substance, and the comment now claims a convention the tests pin instead
+of an impossibility the code cannot provide. Two smaller findings ride with it:
+the `instructions` argument loses the leg `prompt` falsifies (§17.4), and the
+`audio_duration` refusal stops promising `> 0` while implementing `>= 0.0`
+([#1338](https://github.com/mudler/vllm.cpp/issues/1338)), which had made an
+explicit `"audio_duration": 0` resolve to the family's 60 s default with the
+message that would have explained it never printed. `docs/FEATURES.md` picks up
+the placement change its own trigger owed.
+
+**The lesson worth keeping**, because neither the code nor Git will say it: the
+review did not find the drops by reading the diff. It found them by testing the
+INVARIANT the diff asserted, and the invariant was the only part of the change
+that had no test. A claim about what can no longer be written is a claim, and it
+gets mutated like any other.
+
+---
+
+## 18. The vocoder's convolution stops running one dependent add chain per cell (#672, #1334)
+
+§16.7 named this row before it existed: *"The vocoder is now the largest single
+term in a run, and no row owns it. At 53.6 s it is 32.9 % of wall after this
+change, against 12.0 % before, and it did not move because nothing here touches
+it."* This is that row. The issue is
+[#1334](https://github.com/mudler/vllm.cpp/issues/1334).
+
+### 18.1 The gap, and the two facts that shape it
+
+`vocoder.decode_window` is **53.6 s**, and #1238's depth A/B measured it at
+53.6 s on BOTH legs. It is therefore a FIXED term: it does not scale with the
+depth work, it was 12.0 % of wall before that row and 33.2 % after, and it grows
+as a share of every future improvement to anything else.
+
+And the device arm is not the answer waiting to be switched on. §15.9 prices it
+at **3.552 s CUDA against 2.983 s host** at latent length 20, and §13.10's
+per-stage ratios are flat at 0.37-0.40x across a 150x span of work. The arm is
+real, reachable, and slower.
+
+### 18.2 Why both arms are slow, and why it is ONE cause
+
+`vt::cpu::Conv1dKernel` (`src/vt/cpu/cpu_conv1d_general.cpp::Conv1dKernel`)
+computes each output cell with a SINGLE f64 accumulator swept over
+`(ic ascending, k ascending)`:
+
+```c++
+for (int64_t t = 0; t < length; ++t) {
+  double acc = bp != nullptr ? bp[oc] : 0.0;
+  for (int64_t ic = 0; ic < in_per_group; ++ic)
+    for (int64_t k = 0; k < kernel; ++k) { ...; acc += ...; }
+  on[t] = static_cast<float>(acc);
+}
+```
+
+For a MiniMax-Music3 residual unit that is `in_per_group * kernel = 384 * 7 =
+2688` **strictly dependent** f64 additions per output element. The loop has no
+instruction-level parallelism and cannot be vectorised at any width, because
+every add waits on the previous one. Its measured rate on one core of the 20-core
+Zen 5 is **1.76-1.86 GMAC/s**: 1.86 / 1.82 / 1.84 at ranks 8 / 16 / 32 and 1.7622
+at rank 1024 for the depth decoder's loop of the same shape
+(`.agents/benchmark-record.md`, the MUSIC3-DEPTH entry), and **1.827 GMAC/s** for
+THIS loop at `in_per_group = 384`, `kernel = 7` under GCC 13.3 `-O2
+-ffp-contract=off`, pinned, measured by the fresh review of this row on
+2026-08-19.
+
+**A correction, because the sentence this section first carried was not
+self-consistent** (review finding, 2026-08-19). It read "1.7-2.0 GMAC/s on one
+core, ~2.8-3.0 cycles per multiply-accumulate on a 5.0 GHz Zen 5 whose `fadd`
+latency is 3", and three of those numbers cannot all be true at once: 2.0 GMAC/s
+at 5.0 GHz is **2.5** cycles per MAC rather than 2.8-3.0, and a strictly
+dependent chain of latency-3 `fadd`s cannot exceed **5.0 / 3 = 1.67 GMAC/s** at
+all, so the top of the quoted band sat above its own stated ceiling.
+
+**The cycles-per-MAC figure is WITHDRAWN rather than corrected, because this box
+cannot supply the clock it converts through.** The measurement host is a KVM
+guest on a Ryzen 9 9950X3D; `/proc/cpuinfo` reports a nominal 4291.948 MHz,
+`/sys/devices/system/cpu/cpu0/cpufreq/` does not exist in the guest, and
+`perf_event_paranoid` is 4, so the boost clock during a timed loop is not
+observable from inside it and neither is a cycle count. Every cycles-per-MAC
+number this section quoted was therefore a conversion through an ASSUMED clock,
+which is where the inconsistency came from. What the conversion would give across
+the plausible range, stated so the next reader does not redo it: 1.827 GMAC/s is
+2.35 cycles per MAC at the reported 4.29 GHz, 2.74 at 5.0, and 3.12 at the "5.7
+GHz-class" this record uses elsewhere for the same box.
+
+**What the ceiling implies, which is the part worth keeping.** A dependent chain
+of latency-`L` adds cannot beat `clock / L` MACs per second, so the measured
+1.76-1.86 GMAC/s bounds `L` at or below ~2.4 cycles at the clock the guest
+reports, and clears a latency-3 ceiling at any clock below 5.3 GHz. Either the
+add latency on this core is under 3 or the core was boosting above 5.3 GHz, and
+this box can distinguish neither. **The mechanism does not rest on that
+constant.** What supports it is that breaking the chain — and changing nothing
+else about the arithmetic, its order, or its width — is worth **2.16x per core**
+(§18.8b). A dependency is the only property that intervention removed.
+
+The CUDA provider loses for a DIFFERENT mechanism, and **the mechanism is an
+INFERENCE rather than a finding** — stated that way here because the first
+version of this paragraph asserted it flat, and a fresh review was right to
+refuse it (2026-08-19).
+
+What is CHECKED, by reading the source: `src/vt/cuda/cuda_conv1d_general.cu`'s
+`Conv1dKernelCudaImpl` gives each output cell its own thread and one f64
+accumulator, and pins every operation with `__dadd_rn` / `__dmul_rn`. So the
+device arm is not latency-bound the way the host loop is — there are millions of
+independent chains — and its arithmetic is f64 throughout.
+
+What is MEASURED: §13.10's per-stage device-vs-host ratios are flat at 0.37-0.40x
+across a 150x span of work. That rules out a FIXED overhead, which would punish
+the smallest stage far more than the largest, and it rules out very little else.
+
+What is INFERRED, and owed: that the residual is f64 THROUGHPUT — that Thor's
+consumer Blackwell runs fp64 at a small fraction of its fp32 rate and the kernel
+is sitting on that limit. Nothing here measured it. No fp64:fp32 ratio was taken
+on the box, no occupancy or pipe-utilisation counter was read, and no CUDA A/B
+was run against an f32-accumulate arm. It is the explanation this row offers, not
+a result it establishes, and §18.9 carries it as owed.
+
+The two arms' mechanisms are different either way. The property they both turn on
+— and the only one this row changes on the host — is that the arithmetic is f64
+and arranged as one accumulator per output cell.
+
+### 18.3 The f64 stays, and it does not have to move
+
+§13.2 records why the accumulator is f64: it is what the `vocoder1d` host loops
+used, therefore what every committed golden for all FOUR consumers was taken
+with — MiniMax-Music3, MiniMax-H3's audio VAE, LTX-2.5's audio VAE and
+IndexTTS-2.5 — and it is what makes the CUDA provider `memcmp`-identical to the
+host. torch accumulates an f32 conv in f32; this is a deliberate, recorded
+divergence.
+
+Narrowing it to f32 is a real lever and it is NOT this row (§18.9). It would
+re-gate four shipped models, it cannot inherit §13.4's `memcmp`, and it is worth
+strictly less after this row than before it.
+
+**Because the chain can be broken without touching the width.** Hold one f64
+accumulator per output cell over a TILE of output positions, and hoist the
+`(ic, k)` sweep OUTSIDE the position loop:
+
+```c++
+for (t0 = 0; t0 < length; t0 += TILE) {
+  for (i = 0; i < tn; ++i) acc[i] = seed;
+  for (ic ascending)
+    for (k ascending)
+      for (i in the in-range part of the tile) acc[i] += x[...] * w[ic][k];
+  for (i = 0; i < tn; ++i) on[t0 + i] = (float)acc[i];
+}
+```
+
+Fix any single output cell `t = t0 + i` and read the additions it receives, in
+order: the bias, then `(ic=0,k=0)`, `(ic=0,k=1)`, ... — the identical sequence of
+IEEE-754 double additions of the identical double products, in the identical
+order, as the shipped loop. Nothing is reassociated. The additions are
+INTERLEAVED across independent cells rather than serialised into one, which is
+a scheduling change and not an arithmetic one. **`memcmp` equality survives by
+construction, and no tolerance is introduced or widened.**
+
+The same argument is why the zero-padding skip has to be handled by CLAMPING the
+tile's position range rather than by testing each position: for a fixed `k` the
+in-range `i` form one contiguous interval, so the skipped `(t, ic, k)` triples
+are exactly the ones the shipped loop skips.
+
+### 18.4 The compiler has to be given a constant trip count, and that is measured
+
+The restructure alone is not the win. GCC's `-O2` vector cost model is
+`very-cheap`, which vectorises only a loop whose trip count is a known multiple
+of the vector width, and the accumulate loop's bounds are runtime values. So the
+kernel takes a fast path with a CONSTANT trip count when the whole tile is
+in range and the stride is 1, and a fixed-width chunked path plus a scalar tail
+otherwise.
+
+`Release` is `-O3` and is what CI, `scripts/build-cpu-release.sh` and the
+accelerator release build use; `scripts/dgx-bringup.sh` uses `RelWithDebInfo`,
+which is `-O2`. The kernel is therefore written to be fast at BOTH, rather than
+inheriting whichever one the next measurement happens to use. Measured
+difference on the same source: with a runtime-bounded accumulate loop the
+speedup is 1.1-1.8x at `-O2` and 5.1-5.4x at `-O3`; with the constant-trip fast
+path it is 5.2-5.8x at `-O2` and 5.3-6.5x at `-O3`.
+
+**Every one of those six figures is the KERNEL alone**, taken on `Conv1dKernel`
+at the vocoder's stage geometries, and none of them is what the decode window
+does. The window is not only this convolution: it also runs
+`vt::ConvTranspose1d` (§18.5 prices it far lower), the alias-free activations,
+the strided downsamples that keep the shipped gather, and the threadpool and
+allocation around all of them. The gap between the two quantities is measured
+rather than asserted — the same review that asked for this clause built the
+project at `-O2` and timed the window single-threaded, and got **2.56x and
+2.67x** where the kernel gives 5.2-5.8x. §18.8a's **1.36-1.44x** is the same
+quantity again at `Release` on 14 threads, and §18.8b's **2.16x** is that window
+on ONE thread. A kernel number applied to the window overstates the win by
+roughly a factor of two, so the two are never quoted interchangeably here.
+
+`stride > 1` keeps the shipped arithmetic path. The MiniMax-Music3 vocoder's
+`Conv1d` calls are all stride 1; the strided caller is the alias-free downsample
+in `vocoder1d::AliasFreeActivation1d::Apply`, which is depthwise
+(`in_per_group == 1`) and whose chain is one tap deep, so it is not the shape
+this row is about. That is a decision with a reason, not an omission.
+
+### 18.5 `vt::ConvTranspose1d` needs much less, and the number says why
+
+The scatter already writes `kernel` INDEPENDENT cells per input value, so it has
+ILP by construction and the only thing missing is a constant trip count on the
+tap loop. At `-O3` the compiler finds it and the op is **~6 % of the chain's
+wall**; at `-O2` it does not, and a fixed-width tap chunk recovers 2.7-2.9x on
+the three kernels of 8 or more taps.
+
+Both are done, because the four-line chunk is what makes a `RelWithDebInfo`
+measurement of this row mean the same thing as a `Release` one. Neither changes
+the visit order: the taps of one input value land in `kernel` DISTINCT cells, so
+chunking them reorders nothing.
+
+### 18.6 Upstream anchors
+
+vLLM does not implement a DAC Flow-VAE vocoder, and no secondary oracle is
+consulted for a NUMERIC question here, because this row changes no number. The
+semantics being preserved are `torch.nn.functional.conv1d` /
+`conv_transpose1d` as §13's port already mirrors them
+(`minimax_music3_vocoder.py:42,44,55,89,98`), and the arithmetic contract being
+preserved is this repository's own, stated in `include/vt/ops.h` at
+`vt::Conv1d` / `vt::ConvTranspose1d` and gated by
+`tests/vt/test_ops_conv1d_general.cpp` and
+`tests/vllm/models/test_host_parallel.cpp`. **The oracle for this row is the
+shipped kernel itself, carried verbatim into the gate**, which is the same
+instrument §12.2 and §13.3 used and for the same reason.
+
+### 18.7 Tests and gates
+
+| gate | what it holds |
+|---|---|
+| `test_ops_conv1d_general` | the op contract, including the CPU-vs-CUDA `memcmp` arm on a CUDA build |
+| `test_host_parallel` | the shipped `vocoder1d` entry points against a VERBATIM copy of the pre-op host loop, bitwise, at five thread counts |
+| `test_vocoder1d`, `test_bigvgan` | the two smallest consumers |
+| `test_minimax_h3`, `test_ltx2_vae`, `test_minimax_music3_*` | the four consumers' committed goldens |
+
+The shapes the first two do NOT reach today are what this row's new cases add,
+because the restructure's whole risk surface is the tile boundary and the
+position clamp:
+
+- `padding != 0` — `cpu_conv1d_general.cpp:74` states in its own comment that
+  every existing caller passes `padding == 0` and that the skip "is therefore
+  unreachable on those shapes and exists for torch parity". A clamp that is
+  wrong at the left or right edge is invisible without it.
+- a `length` that is not a multiple of the tile, and a `length` BELOW one tile.
+- `dilation > 1` combined with a tile boundary.
+- the catastrophic-cancellation case §13.5 built, at a length that spans several
+  tiles, so an f64 accumulator stored through an f32 cannot hide a reordering —
+  **once per SWEEP AXIS, because one case covers one axis and not the other.**
+
+Every one of them is asserted against a verbatim in-test copy of the pre-change
+kernel, bitwise.
+
+**The two axes, and why the count is two rather than one** (review finding,
+2026-08-19). The sweep this row hoists out of its accumulators is
+`(ic ascending, k ascending)`, and reversing EITHER loop is a genuine
+reassociation. The cancellation case as first written had teeth along `ic` ONLY,
+by construction: it pairs input CHANNELS
+(`w[(oc*cin+1)*kernel+k] = w[(oc*cin+0)*kernel+k]` with `x[0] = +2^40` and
+`x[1] = -2^40`), and its own teeth self-check reverses `ic` and nothing else.
+Measured on this tree: with the kernel's `k` loop reversed and nothing else
+changed, `test_ops_conv1d_general` reported 9/375, `test_host_parallel` 8/877,
+`test_vocoder1d` 10/58 and `test_bigvgan` 6/65, all `SUCCESS!` and all rc 0 —
+binary sha256 `c4bb0e76...` against the baseline `760061c5...`, so the mutation
+was in the binary that ran and the green was not a stale artifact.
+
+The hole is OLDER than this row — the pre-change kernel with its `k` sweep
+reversed is green too — so it is not a regression this row introduced. It is
+still this row's to close, because this row is what turns that order into a
+load-bearing guarantee. `tests/vt/test_ops_conv1d_general.cpp` therefore carries
+a SECOND cancellation case, "holds its TAP order", which pairs +2^40 against
+-2^40 across `k` inside one input channel held constant along its length, and
+whose teeth check reverses `k` alone. With that case present the same mutation
+fails 1552 of 1576 cells in exactly that case and nowhere else (10 cases / 379
+assertions, 1 failed, binary `eb25d992...`), and the restored tree hashes back to
+`f84d3a87...`. `SerialConv1d` grew a `reverse_k` parameter beside `reverse_ic`
+for it.
+
+**So state the guarantee with its axes attached.** What is gated is that the
+order each individual cell sees is unchanged along `ic` AND along `k`. Neither
+"nothing held the forward sweep's order" nor "a length at which an f64
+accumulator stored through an f32 cannot hide a reordering" was true of both
+axes when it was first written here; both were true of `ic` and false of `k`.
+
+### 18.8 Speed evidence — what it must be, before it is taken
+
+`.agents/benchmarking.md` and the recorded defects of §13.10 and §16.6a bind
+this row to four things it cannot report without:
+
+1. **An `rc` lease on `thor:gpu0`.** §13.10 is VOID because its arms were taken
+   over `ssh` under `$HOME/gpu.lock` while another session held the same box
+   through `rc`. Not a caveat — step zero.
+2. **Two separately built binaries, in separate source trees and separate build
+   directories, whose `sha256` DIFFER.** §16.6a is void because both arms were
+   the same binary, and the tell was identical call counts rather than equal
+   times.
+3. **The checkpoint staged to local disk**, with `SRC_BYTES == DST_BYTES`
+   asserted and `findmnt` printed for the path actually read. §15.6 measured
+   780 s cold CIFS / 428 s warm against 7.5 s local.
+4. **A RANGE of latent lengths.** One point is what made the device arm look
+   simply "slower" in §15.9.
+
+### 18.8a The measurement, TAKEN — Jetson Thor, under a lease, two binaries
+
+**`rc` job `da3a2f94-90e3-4e97-b519-9456310673b7` on `thor:gpu0`**, worker
+`rc-worker-hqfj4`, `Linux 6.8.12-1021-tegra` aarch64, 14 cores,
+`--max-runtime 150m`, 2026-08-19. No `ssh`, no `rc hold`, and no file mutex — the
+lease is the whole of the serialisation, which is the thing §13.10 did not have.
+
+Both arms built INSIDE the lease from two clones in `/tmp` (local overlay, not
+the CIFS `/workspace`), `CMAKE_BUILD_TYPE=Release` (`-O3`), CPU-only, `ninja -j 8`:
+
+| | before | after |
+|---|---|---|
+| `src/vt/cpu/cpu_conv1d_general.cpp` sha256 | `6fb15174c1533b93` | `a0e429ace3536479` |
+| `vllm_music3_vocoder_conv_ab` sha256 | `d90e3912cd636666` | `41ba78d2b7a8b99e` |
+
+`diff -rq` over `src/` reports that ONE file as the only difference between the
+trees, and the harness refuses to time anything when the two binaries hash the
+same. That guard exists because §16.6a's first Thor pair was VOID for exactly
+this: both arms were the same binary, and the tell was identical call counts,
+because equal times are noise where equal binaries are identity.
+
+**Correctness first, on the after arm, before any speed number was read**
+(`test cases` / `assertions` / `Status` quoted in full, because `assertions: 0`
+is a skip wearing a pass):
+
+| suite | result | rc |
+|---|---|---|
+| `test_ops_conv1d_general` | 9 cases, 375 assertions, 0 failed, `SUCCESS!` | 0 |
+| `test_host_parallel` | 8 cases, 877 assertions, 0 failed, `SUCCESS!` | 0 |
+| `test_vocoder1d` | 10 cases, 58 assertions, 0 failed, `SUCCESS!` | 0 |
+| `test_bigvgan` | 6 cases, 65 assertions, 0 failed, `SUCCESS!` | 0 |
+
+Three `[SKIP]` lines are printed and are read rather than ignored: this worker
+has no CUDA toolkit (`nvcc` MISSING), so the build is CPU-only and every
+CPU-vs-CUDA arm in that file, including this row's new one, did NOT run here.
+The device provider is unchanged by this row, and §13.4's `memcmp` arm was
+measured on a CUDA build; **it has not been re-measured against the tiled host
+kernel, and that is named as owed in §18.9 rather than implied by these greens.**
+
+**The sweep: arms ALTERNATED, three rounds, best-of-3 per point, the default
+arm** (`VLLM_CPP_VOCODER_DEVICE` unset, so this is the host kernel — see below
+for why that matters). `uptime` load average 3.29 before the build, 9.07 before
+the sweep, 8.48 after it; 0 other users; the box was NOT idle and both arms ate
+the same contention, which is what alternating them is for.
+
+Medians of the three rounds, in seconds:
+
+| latent frames | before | after | ratio |
+|---|---|---|---|
+| 20 | 5.5688 | 4.0831 | **1.364x** |
+| 40 | 11.0535 | 7.8186 | **1.414x** |
+| 86 | 23.5149 | 16.6614 | **1.411x** |
+| 172 | 47.9201 | 33.6498 | **1.424x** |
+| 344 | 97.4463 | 67.7083 | **1.439x** |
+
+The loudest pair is KEPT rather than dropped: 20 frames is the weakest ratio in
+the set and it is the one §15.9 priced the device arm at. The spread across a
+**17x span of work is 1.364x to 1.439x**, which is the signature of a RATE change
+and not of a fixed overhead — the same test §13.10 applied to the device arm, run
+in the other direction.
+
+**And the arms are BIT-IDENTICAL at full scale.** The harness prints an FNV-1a
+fingerprint of the whole stereo waveform, and across all six arm-rounds every
+length produced one value on both arms: `0x7c31c2ea73418503` (20),
+`0x35a02aad4c9cb983` (40), `0xc2d5eaf095d1c483` (86), `0x2dc69976150a5903` (172),
+`0x95e771d5f0051283` (344). Six processes, two binaries, one answer per length.
+
+**What this number is NOT.** It is the decode window's COMPUTATION at the shipped
+geometry with synthetic weights, driven through `VocoderDecode` — the call
+`Music3DecodeChunks` brackets as `vocoder.decode_window`
+(`minimax_music3_speech.cpp:397-398`). It is not an end-to-end synthesis, no
+checkpoint was read, and therefore §18.8's staging assertion
+(`SRC_BYTES == DST_BYTES`, `findmnt` on the path read) is NOT APPLICABLE here
+rather than skipped: there is no path to assert. The e2e pair on the real
+checkpoint is owed (§18.9).
+
+**And 53.6 s is the CUDA arm, not this one.** §15.2's profile ran
+`VLLM_CPP_VOCODER_DEVICE=cuda`, so the 53.6 s / 33.2 % that defined this row is
+the DEVICE arm's decode window. The default is `cpu` (§13.6) and that is the arm
+this row moves. Applying 1.42x to the 53.6 s figure would be comparing two
+different arms, so no such projection is made here.
+
+### 18.8b The KERNEL is 2.16x and the THREADPOOL gives back a third of it
+
+The obvious reading of §18.8a is that aarch64 simply vectorises worse than
+x86 and 1.42x is what the kernel is worth here. **That is measured, and it is
+wrong.**
+
+Second lease, **`rc` job `5b98f95e-a37b-4fa2-8ee9-81959caa828f` on `thor:gpu0`,
+`--max-runtime 45m`**, a fresh container, both arms rebuilt from the same two
+refs into two new binaries (`a3b14f2995...` before, `5b894d6b67...` after — both
+different from the first run's pair, so this is an independent build as well as
+an independent run). One latent length, 20 frames, because that is where §18.8a's
+ratio is weakest and therefore where the claim is hardest:
+
+| threads | before | after | ratio |
+|---|---|---|---|
+| **1** (`VLLM_CPP_CPU_THREADS=1`) | 37.0508 s | 17.1751 s | **2.157x** |
+| 14 (default), same container, same binaries | 5.4845 s | 4.0182 s | **1.365x** |
+
+The 14-thread control reproduces §18.8a's 1.364x to three digits, on a different
+container and a different pair of binaries, which is what makes the single-thread
+figure comparable to it rather than merely adjacent.
+
+**Read the scaling instead of the ratio and the cause is plain:**
+
+| arm | 1 -> 14 threads | of a possible 14x |
+|---|---|---|
+| before | 6.76x | 48 % |
+| after | **4.27x** | **31 %** |
+
+Neither arm scales, and the FASTER one scales WORSE. That is the signature of a
+shared resource: the tiled kernel needs the same bytes in less time, so it
+saturates whatever is shared sooner and gives back a third of its per-core win.
+The kernel is worth **2.16x on this box**; the threadpool returns 1.37x of it.
+
+Stated with its limits. This does not identify the resource — no bandwidth
+counter was read, and none is available on this worker — so "memory bandwidth"
+remains the leading candidate and not a finding. What it does establish is where
+the next lever is, and it is not the kernel: **it is the vocoder's parallel
+decomposition**, which partitions OUTPUT CHANNELS and therefore has every thread
+sweep the whole input tensor. §18.9 carries it as owed rather than as a ceiling.
+
+And it removes one hypothesis §18.8a left open: the aarch64 codegen is NOT the
+whole story, because per core the same source is worth 2.16x here against ~5x on
+AVX-512 x86 — a gap the 4x narrower f64 vector explains without needing anything
+else.
+
+### 18.9 What is OWED after this row, named rather than left to a profile
+
+- **The f32-accumulate variant** (§13.10 step 3) is untouched and is now worth
+  less, because the f64 path costs several times less than it did. It still
+  needs its own gate against each of the four consumers' goldens and cannot
+  inherit §13.4's `memcmp`.
+- **The device arm's staging** (§13.6's owed list: device-resident weights, one
+  persistent queue, a chain that stays on the device between stages) is
+  untouched. This row does not make the device arm win, and after it the host
+  bar the device arm has to clear is several times higher.
+- **`stride > 1`** keeps the shipped arithmetic path (§18.4).
+- **`ltx2_audio_vae.cpp:75`'s own 2-D host convolution loop** still routes
+  through no op at all (#1114), so it is not reached by anything here.
+- **The CUDA arm's f64-THROUGHPUT explanation is unmeasured** (§18.2). The flat
+  0.37-0.40x ratio rules out a fixed overhead; it does not establish what the
+  residual IS. Three instruments would, none of them run here: an fp64:fp32 rate
+  probe on `thor:gpu0`, a pipe-utilisation or occupancy counter over
+  `Conv1dKernelCudaImpl`, and a CUDA A/B against an f32-accumulate arm — which
+  the f32 variant in the first bullet would supply for free. Until one of them
+  exists the sentence in §18.2 is an inference, and this row does not act on it.
+  Deliberately NOT settled in flow: it needs a `thor:gpu0` lease and this row's
+  measurement budget was spent on the host arm it actually moves.
+- **The CUDA-vs-CPU `memcmp` arm has NOT been re-measured against the tiled
+  kernel.** The Thor worker carries `gcc`, `g++`, `cmake`, `ninja` and `python3`
+  but **no `nvcc`** (probed 2026-08-19, which also CORRECTS §13.10's "no compiler
+  and no toolchain at all"), so the arms above are CPU-only and every
+  CPU-vs-CUDA case printed `[SKIP]`. The argument that it must still hold is
+  §18.3's — the host arm's per-cell order is unchanged, and §13.4's device kernel
+  was written against that order — but an argument is not a measurement. It needs
+  a build on a box with a CUDA toolkit.
+- **The e2e pair on the real checkpoint.** §18.8a is the decode window's
+  computation with synthetic weights, so it prices the stage without pricing a
+  song. The e2e leg is what would carry the staging assertion and a WAV identity
+  check, in the shape §16.6b took for the depth row.
+- **The vocoder's PARALLEL DECOMPOSITION is now the lever, and §18.8b measured
+  it rather than guessing.** The kernel is worth **2.16x per core** on Thor and
+  the threadpool returns **1.37x**, because both arms scale badly (6.76x and
+  4.27x of a possible 14x) and the faster arm scales worse. `ForOutputRows`
+  partitions OUTPUT CHANNELS, so every one of the 14 threads sweeps the whole
+  input tensor for its own slice of channels; a decomposition that also splits
+  the TIME axis would give the threads disjoint input windows. Not attempted
+  here, and not a ceiling: what it needs first is a bandwidth counter, and this
+  worker has none.
+
+### 18.10 Stop conditions
+
+Stop and report rather than widen scope if: the byte-exactness gates cannot be
+made green without a tolerance; `thor:gpu0` is unhealthy or the lease cannot be
+taken; or the measured host win does not survive the threadpool, which would
+mean the parallel arm is bound by something this row did not measure.
+---
+
+## 19. The depth decoder reaches the device (#672, [#1309](https://github.com/mudler/vllm.cpp/issues/1309)) — §11.4's LAST owed device row, and the dtype it was blocked on
+
+§11.4 named three device rows. The vocoder closed in §13, the DiT in §14, and
+§14.5 left this one blocked on a dtype rather than on the work. §16 then removed
+the arithmetic nobody read, which made this row **worth 4.4x less than when it
+was written** and did not make it unnecessary: on `thor:gpu0` the depth forward
+is still **48.4 % of a run**.
+
+This section settles the dtype and describes the arm. The row is
+`MUSIC3-DEPTH-DEVICE`.
+
+### 19.1 The gap, measured, on the head this row starts from
+
+`main` at `678fc672c`, `thor:gpu0` sm_110, `--device 1 --duration 4 --steps 4`,
+100 frames, checkpoint staged to local disk (so §15.6's cold-CIFS load is not
+inside these figures):
+
+| bucket | seconds | share of wall |
+|---|---|---|
+| `ar.depth_forward` | 78.1 | **48.4 %** |
+| `vocoder.decode_window` | 53.6 | 33.2 % |
+| `ar.lm_decode_step` | 12.3 | 7.6 % |
+| `denoise.dit_device` | 5.1 | 3.1 % |
+
+A **0.646 B** decoder costs **6.3x** the **8.6 B** language model beside it. The
+sizes are not the reason; which processor each runs on is. §16.4 measured the
+host kernel at ~4 bytes of f32 weight traffic per multiply-accumulate — 2.28 GB
+per `DepthDecoderAppend` call, 8 calls a frame — and §16.6b measured 96.93 ms
+per call, i.e. **~23.5 GB/s achieved** across Thor's 14 cores.
+
+### 19.2 THE DTYPE — settled, and the oracle settles it by declaring nothing
+
+§14.5 blocked this row because routing an `ArCompute::kBFloat16` decoder through
+an **f32** `vt::MatmulBT` would silently drop the rounding every gated number was
+taken with. That reasoning is correct and its conclusion has expired, because
+the row does not need an f32 `vt::MatmulBT`. It needs a **bf16** one, and
+`vt::MatmulBT` has been one all along:
+
+> `a/b bf16 (or f32), out f32 or bf16, contiguous, same device` — same f32
+> accumulation and dtype contract as `Matmul`
+> ([`include/vt/ops.h:1281-1283`](../../include/vt/ops.h))
+
+The CUDA provider states the same contract as a refusal by name
+(`src/vt/cuda/cuda_matmul.cu:296-300`): `supported: (bf16,bf16)->f32|bf16,
+(f32,f32)->f32|bf16`. **Mixed f32-activation × bf16-weight is rejected**, so the
+arm is bf16 on both operands or it is not bf16 at all.
+
+**What the oracle says.** `MiniMaxMusic3RVQDepthDecoder` declares **no dtype**.
+Its `@register_to_config __init__` takes no `dtype` parameter and constructs every
+submodule at torch's ambient default
+(`diffusers` @ `c6da9936`,
+`models/transformers/minimax_music3_rvq_depth_decoder.py:101-125`). There is **no
+`torch.float32` literal and no `.float()` call anywhere in the file**. The single
+cast in the module is a **down**-cast that re-aligns the attention output to the
+query dtype:
+
+```python
+51        hidden_states = hidden_states.flatten(2, 3).to(query.dtype)
+```
+
+So the dtype is imposed from outside, by `load_components(dtype=...)`, and
+[`tools/oracle/music3_oracle.py:91-95,103-108`](../../tools/oracle/music3_oracle.py)
+resolves `rvq_depth_decoder: torch.bfloat16` under **both** its policies —
+`ON_DISK_DTYPES` and `REFERENCE_DTYPES` differ only in `condition_encoder`. That
+is the invariant §2.1 already records at :176 and :179-182:
+`dtype(language_model) == dtype(rvq_depth_decoder) == dtype(condition_encoder)`,
+bf16 AR half over fp32 acoustic half.
+
+**Where fp32 legitimately appears, and why it is not this row's.** The depth loop
+promotes to fp32 exactly twice, both **after** the decoder and both on logits:
+the CFG mix at `encoders.py:134` (`logits[:1].float()`) and the sampler at
+`encoders.py:95` (`torch.nan_to_num(logits.float(), ...)`). Both already run on
+the host in `Music3DepthStage`, and this row does not move them.
+
+**The decision.** Weights bf16, activations bf16, every op boundary storing bf16,
+accumulation f32. That is `vt::MatmulBT`'s contract unmodified, and it is what a
+bf16 torch module on a GPU does.
+
+#### 17.2a The finding this makes visible, which no gate in this tree can see
+
+The host arm holds the depth decoder's weights in `std::vector<float>`. The
+checkpoint is bf16 and the loader widens it, so every stored value is
+bf16-exact: the numbers are right, and the goldens, the token gates and §16.6b's
+WAV hash all pass **while the path moves twice the bytes the oracle moves**.
+
+That is `AGENTS.md`'s "a token gate cannot detect a dtype that is too wide", in
+this tree, on the stage that is half the run. §16.7 records the same fact from
+the other side as lever 1. It is written here as a **finding**, not as a defect
+introduced by this row: the host arm's f32 containers are what W2/W3's
+reduction-order gates were taken against, and this row does not narrow them. The
+device arm is the narrow one.
+
+Per [`.agents/porting.md`](../porting.md) "Mirror the memory format, not just the
+math", the four questions and their answers for this path:
+
+| ask | answer, and where upstream answers it |
+|---|---|
+| what dtype does the linear OUTPUT? | bf16 — `nn.Linear` at module dtype, no cast (`minimax_music3_rvq_depth_decoder.py:63-66,114,124`) |
+| what dtype do the intermediate activation buffers carry? | bf16 — read the consumer: `:51` casts the attention output back **to** `query.dtype` |
+| is a projection one physical GEMM or several? | several upstream (`to_q`/`to_k`/`to_v`, `gate_proj`/`up_proj`); **merged here**, see §19.3 |
+| what `kv_cache_dtype` is resolved? | not applicable — the depth cache is this decoder's own 16-position table, not a paged KV cache; it is bf16 with its activations |
+
+### 19.3 The design — no new kernel, and two merges the seam asks for
+
+Every op already exists with a **CPU and a CUDA provider**, so this row composes
+a forward rather than adding a kernel. That is §14.2's shape and it is deliberate.
+
+| host reference (`minimax_music3_ar.cpp`) | shared op |
+|---|---|
+| `RmsNorm` | `vt::RmsNorm` |
+| `LinearNoBias` | `vt::MatmulBT` |
+| `CausalAttentionStep` | `vt::AttentionCross`, `bias = nullptr` |
+| `silu(gate) * up` | `vt::SiluAndMul` |
+| residual adds | `vt::Add` |
+
+**The attention is causal upstream and `vt::AttentionCross` is the right op
+anyway, for a reason that is an identity rather than a shortcut.**
+`DepthDecoderAppend` presents **one** query row against a cache of `seq`
+positions that are all at or before it. A causal mask over a single query at the
+last position masks nothing. So the non-causal op computes upstream's causal
+result exactly, and `vt::Attention` — which would apply a mask keyed on a query
+index this call does not have — is the wrong one. Upstream's own
+`dispatch_attention_fn(..., is_causal=True)` (`:43-50`) runs whole sequences;
+ours runs one row, and that is §16.3's identity, already gated bitwise.
+
+**Two merges, because AGENTS.md routes mergeable projections through the merged
+seam and because they cost nothing numerically.** Each output element remains its
+own dot product, so merging changes no reduction:
+
+* `to_q | to_k | to_v` stage as one `[3H, H]` weight; one `vt::MatmulBT` produces
+  `[batch, 3H]`, split by re-view (`vt::QkvSplit` is available but a free
+  `MakeTensor` at an offset is what the DiT arm uses and needs no copy).
+* `gate_proj | up_proj` stage as one `[2I, H]` weight. This is the merge that
+  `vt::SiluAndMul` **requires**: it computes `silu(x[:, :D]) * x[:, D:]` over one
+  `[T, 2D]` buffer, and upstream's `silu(gate_proj(x)) * up_proj(x)` puts gate
+  first. **No half swap** — unlike §14.3's DiT, where the assignment was the
+  opposite way round and needed a stage-time exchange.
+
+The weight sweeps per frame fall from 8 (decoder) + 7 (projection) of f32 to the
+same counts at **half the bytes**, and the sweep itself moves from 14 host cores
+to the device.
+
+**What does NOT move.** The audio heads, the CFG mix, the top-k draw, the
+feedback embedding and the projection of the fed-back row stay on the host in
+this row, exactly as `Music3DepthStage` has them. The heads are seven
+`[1024, 4096]` GEMVs a frame against the decoder's 8 sweeps of 570 M
+multiply-accumulates; §15's profile puts `ar.depth_projection` at 1.307 s and
+the forward at 78.316 s. Moving them is owed, not skipped silently: §19.7.
+
+### 19.4 Correctness — bitwise is NOT achievable, said before the code, with the tolerance and its reason
+
+**This arm cannot be bit-identical to the host arm, and no gate here will claim
+it.** §16 could claim it because a causal identity is exact. This row changes the
+machine. Three independent reasons, each sufficient on its own:
+
+1. **The accumulator narrows.** The host keeps a sequential `double` per output
+   element (`minimax_music3_ar.cpp::LinearNoBias`); `vt::MatmulBT` accumulates in
+   **f32** (`CUBLAS_COMPUTE_32F`). Over `in_dim` 4096 and 6144 that is a real
+   difference, not a formality.
+2. **The reduction re-associates.** cuBLASLt splits K by an algorithm this row
+   does not choose, and `vt::AttentionCross`'s CUDA kernel uses an **online
+   softmax recurrence** where the host and the CPU provider use a three-pass
+   max/sum/weighted-sum. The two are not bit-identical to each other either.
+3. **The two arms normalize against different references, and both are right.**
+   The Music3 **host** arm's own RmsNorm (`minimax_music3_ar.cpp`) mirrors the
+   diffusers module this model *is*: `normalization.py::RMSNorm.forward` casts
+   back to the weight dtype at `:560` and then multiplies at `:561`, so it rounds
+   **twice**, and the decoder constructs exactly that class — `class RMSNorm` at
+   `:510`, built at `minimax_music3_rvq_depth_decoder.py:78,80,122`. (`:600-606`
+   is `GlobalResponseNorm` and `:590-597` is `MochiRMSNorm`; neither is on this
+   path. The earlier `:600-606` citation in this spec was wrong by ~46 lines.)
+   The **device** arm routes through the shared `vt::RmsNorm`, which mirrors
+   vLLM, and vLLM keeps f32 across the weight multiply and rounds **once**.
+
+   **`vt::RmsNorm` does not diverge from its reference, and an earlier revision of
+   this section said it did.** Verified directly at the parity pin `555967922`:
+   `csrc/cpu/layernorm.cpp` computes `fp32_out = fp32_x * fp32_s_variance *
+   fp32_w` and narrows once at `scalar_vec_t out(fp32_out)`;
+   `csrc/libtorch_stable/layernorm_kernels.cu:93` computes
+   `static_cast<scalar_t>(x * s_variance * w)`. Upstream landed the
+   weight-dtype multiply as vllm#42379 and **reverted** it as vllm#46070, which is
+   an ancestor of the pin. `AGENTS.md` makes vLLM the only reference wherever it
+   implements the behaviour and it implements RMSNorm, so diffusers was never the
+   mirror source for the shared op — only for the model.
+
+   What follows is that this term of the band will **not** go away, because
+   neither side is defective. Which rounding is right *for this model* is a
+   question the diffusers oracle settles through `test_minimax_music3_ar_real`,
+   and §19.6 records that as owed.
+
+**The gate is therefore a tolerance, and the tolerance is derived rather than
+chosen.** The proposal, to be replaced by the measured value before the row is
+`DONE`:
+
+* the reference is the **host arm at `ArCompute::kBFloat16`**, not an f32 forward,
+  because the host arm is what every committed number was taken with;
+* the bound is stated in **bf16 ULPs of the reference value**, not in absolute
+  units, because the activations span orders of magnitude across four layers;
+* the proposed acceptance is **max 2 bf16 ULP** with a **mean below 0.5 ULP**
+  over every compared value, which is the band §5's own matched control already
+  established for this decoder (the header records ~1.3 bf16 ULP average between
+  an f32 and a bf16 forward of the same weights);
+* the gate asserts its own **teeth**: that the compared reference values are
+  non-zero and that a deliberately wrong arm exceeds the bound. A tolerance
+  nothing can fail is not a gate.
+
+**A tolerance gate cannot see a dropped stage, so it is not the only gate.** The
+composition is held by the same instrument §16.5 had to add: the production
+`Music3DepthStage` is driven end to end and its **drawn codes and draw count**
+are compared, which a numeric tolerance would not notice.
+
+### 19.4a The tolerance was MEASURED, and it refuted §19.4's own ordering
+
+§19.4 named three sources and led with the accumulator. **The measurement puts
+that last and it is corrected here rather than quietly left standing.**
+
+`test_minimax_music3_ar`, 8 heads of 8, three layers, the full 8-position
+schedule, bf16-exact pseudo-random weights, on a **CPU `vt::Queue`**:
+
+| arm | worst | mean | composed stage, worst |
+|---|---|---|---|
+| as shipped | **110 bf16 ULP** | **2.095** | **255 bf16 ULP** |
+| host's two intermediate roundings COLLAPSED to the seam's shape | 8 ULP | 0.0596 | **0 — bit-identical** |
+
+The second row is an attribution mutation, applied to the **host** reference and
+restored `sha256`-verified. It removes exactly two roundings:
+
+1. The **host** arm's cast back to the weight dtype **before** the affine
+   multiply — `Store(Store(normed) * w)` becomes `Store(normed * w)`. That is
+   `normalization.py::RMSNorm.forward:559-561` — the `.to(self.weight.dtype)` at
+   `:560` and the `* self.weight` at `:561` — which the host arm mirrors on
+   purpose because it mirrors the diffusers module, and which `vt::RmsNorm` does
+   not do because it mirrors vLLM, where the multiply is f32 and the narrowing is
+   single (§19.4 reason 3, verified at the pin). **Neither side is defective**,
+   so this term does not close.
+2. SiLU's own store before the `* up` multiply — `Store(Store(silu) * up)`
+   becomes `Store(silu * up)`. torch computes `F.silu(gate)` into a **bf16
+   tensor** and then multiplies, so upstream rounds there too; `vt::SiluAndMul`
+   computes the whole expression in f32 and rounds once.
+
+**So ~97 % of the mean deviation is rounding POLARITY inside two shared ops, not
+the accumulator, not the reduction order and not the dtype.** The accumulator and
+reduction-order terms §19.4 led with are the 0.0596 ULP remainder, which is the
+order of magnitude first principles predict for f32-vs-f64 accumulation over 64
+terms. §19.4's reason (3) was right and was ranked third; reasons (1) and (2) are
+real and are nearly invisible beside it.
+
+**The counterfactual is the strongest statement this row has: with the roundings
+aligned, the composed device stage is BIT-IDENTICAL to the host arm over 448
+values.** The port's algebra — the merged `[3H, H]` and `[2I, H]` layouts, the
+cache indexing, the batch-2 sequencing, the attention identity — is therefore
+exactly right, and the entire remaining difference is rounding polarity in two
+shared ops — one of which (`vt::SiluAndMul`) is a genuine seam gap and one of
+which (`vt::RmsNorm`) is two references legitimately disagreeing. See §19.4
+reason 3, which corrects an earlier claim in this spec that both were seam gaps.
+
+#### What this changes about the row, said plainly
+
+**The blocker was never the dtype, and it is not the dtype now.** §14.5 named the
+dtype; §19.2 settled it and the settlement stands. What the measurement exposes
+is a different obstacle, and **it is half the size this section first claimed**.
+
+**The `vt::RmsNorm` half is not a seam gap at all.** §19.4 reason 3 carries the
+verification: vLLM's own RMSNorm multiplies in f32 and narrows once, on both the
+CPU and the CUDA path at the parity pin, and upstream reverted the weight-dtype
+variant. `vt::RmsNorm` therefore mirrors its reference exactly. The two arms
+differ because the *host* arm mirrors the diffusers module and the *device* arm
+mirrors vLLM, and both are correct against the reference each answers to. That
+term stays in the band permanently, and no seam extension removes it.
+
+**The `vt::SiluAndMul` half is real.** `F.silu(gate)` produces a **bf16 tensor**
+that is then multiplied, where `vt::SiluAndMul` computes the whole expression in
+f32 and rounds once. It cannot be worked around at the call site, because `vt`
+has no elementwise or row-broadcast multiply — `MulScalar` takes a scalar and
+`MulColVecF32` is an f32 in-place column scale — so expressing
+`Store(silu) * up` needs a seam extension with CPU and CUDA providers and its own
+gates. That is [#1322](https://github.com/mudler/vllm.cpp/issues/1322)'s
+surviving half, it is its own row, and it is NOT taken here.
+
+**What is consequently NOT claimed.** No parity claim, and no speed number. The
+row's numeric gate bounds an attributed divergence; it does not prove agreement
+with the reference. The decisive gate is `test_minimax_music3_ar_real` — the
+full-scale bf16 companion against the committed oracle goldens — run with the
+device arm, and it needs the 28.5 GB checkpoint. It has NOT been run, and until
+it has, `AGENTS.md`'s "establish the declared token-exact gate before you accept
+a performance result" forbids quoting a Thor A/B for this arm. The A/B is
+therefore **blocked on correctness, not on the box**, and that is why this row
+lands without one.
+
+The stake is measurable rather than speculative: the header of
+`minimax_music3_ar.h` records that an **fp32** depth forward left 448 450 of
+716 800 committed golden values beyond one bf16 ULP, at mean absolute error
+2.65e-03. A seam that keeps f32 through two roundings per layer is a step in that
+direction, and whether it lands inside the full-scale gate's tolerance is exactly
+what has not been measured.
+
+#### One instrument defect, found inside this row, and it printed a clean green
+
+The mutation runner restored the tree with `tar x`, which sets mtimes **from the
+archive** — i.e. from before the mutation. The restored source was therefore
+OLDER than the object ninja had built from the mutated one, **ninja skipped the
+rebuild, and the next run reported 35/35 cases and 508/508 assertions SUCCESS
+while executing the MUTATED binary**. `git diff --name-only` could not see it
+either, because after restoration the file matches `HEAD` byte for byte and a
+`sha256sum` of the source says — correctly, and uselessly — that the source is
+pristine.
+
+That is `.agents/verification.md`'s "a copied build directory rebuilds the
+original sources" arriving from the other side, and it is the same shape as
+§16.6a: **whenever an artifact is required to have changed, assert that it
+changed rather than that its inputs did.** The runner now restores with `tar xm`,
+touches every source, and rebuilds before declaring the mutation over. The
+numbers in the table above were re-taken on a forced rebuild.
+
+### 19.4b The tolerance was fitted to ONE seed, and a review falsified it
+
+§19.4a placed the bound from a single draw of the reference weights. A fresh
+review changed **nothing but the RNG seed** — same distribution, same geometry,
+no defect — and the shipped `mean <= 4.0` **reds on three of six equally valid
+draws**. A tolerance a redraw can fail is measuring the draw, not the arm.
+
+The correct arm, `test_minimax_music3_ar`, 8 heads of 8, three layers, the full
+8-position schedule, batch 2, on a CPU `vt::Queue`:
+
+| seed | worst | mean | median | under the old bound |
+|---|---:|---:|---:|---|
+| `0x9E3779B9` | 110 | 2.095 | 1 | pass (the seed it was fitted to) |
+| `0x2468ACE0` | 435 | 3.804 | 1 | pass |
+| `0x00000001` | 1110 | 5.755 | 1 | **FAIL** |
+| `0x13579BDF` | 3663 | 7.154 | 1 | **FAIL** |
+| `0xDEADBEEF` | 7340 | 9.904 | 1 | **FAIL** |
+| `0x51ED2701` | 939 | 3.103 | 1 | pass |
+
+**`worst` cannot discriminate and is no longer gated.** A *correct* arm reads
+worst 7340 at `0xDEADBEEF`; the gate/up half swap reads 6641 and the wrong
+attention scale 6865. Any `worst` bound loose enough to admit a correct
+implementation admits two structural defects, so a correct arm is *worse* on that
+axis than two defects. It is reported, with a canary at 1e6 for a non-finite
+value.
+
+**The metric itself had a defect, found by the sixth seed.** A reference value of
+exactly zero has no ULP — bf16's spacing at zero is the denormal floor — so
+`|got| / Bf16Ulp(0)` reads ~1e35 for an absolute difference of 1e-5.
+`0x51ED2701` draws one such value in 1024 and read mean **8.8e32 with the arm
+correct**. Zero references are now measured **absolutely** in their own bucket
+(worst observed 8.30e-05 against a 1e-2 bound), and the two counts are asserted
+to **sum**, so a defect cannot hide by growing the un-gated bucket.
+
+#### The battery, and why the median is the primary gate
+
+Five structural mutations, each run over all six seeds, on a clean tree, with the
+compiler exit status, `git diff --stat` and the **binary** `sha256` printed for
+every run and the source restored and verified after each:
+
+| mutation | mean range | median range | verdict |
+|---|---:|---:|---|
+| wrong attention scale (`1/sqrt(hidden)`) | 19.6 – 71.3 | 4 – 4 | RED 2 cases / 13 assertions |
+| gate/up half swap | 52.5 – 158.8 | 12 – 15 | RED 2 / 14 |
+| K/V cache row collision (`l*batch`) | 166.4 – 376.1 | 3 – 4 | RED 2 / 14 |
+| dropped position embedding | 357.8 – 1487 | 76 – 90 | RED 2 / 15 |
+| `q\|k\|v` merge order swapped | 400.0 – 1731 | 104 – 131 | RED 2 / 15 |
+
+**The median is exactly 1 bf16 ULP at every seed for the correct arm** — a
+constant, not a distribution — because the deviation this arm carries is one
+rounding-polarity tick per element and the seed only changes the tail. Every
+defect is at least 3. The bound is **2**, and it cannot be moved by a redraw,
+which is precisely the property the single-seed bound lacked.
+
+**The mean stays gated at 15, and its margin is honestly thin.** It is
+tail-sensitive, so it catches a *sparse* defect that leaves the middle of the
+distribution alone and the median would miss. Its window is
+(9.904, 19.6): the correct arm's worst draw against the tightest defect, which is
+the wrong attention scale at `0xDEADBEEF` — the same seed that produces the
+correct arm's own worst mean. 15 is 1.51x above every correct draw measured and
+1.31x below every defect draw measured. A seventh seed drawing a correct mean
+above 15 is possible in a way that one drawing a median above 2 is not, and if
+that happens the median is the gate that still holds.
+
+**This bound does not become obsolete.** §19.4 reason 3 records the verification:
+the `vt::RmsNorm` term is two references legitimately disagreeing, not a defect
+awaiting repair, so it does not close. #1322's surviving `vt::SiluAndMul` half
+may narrow the band later; it is not landed, this row does not wait for it, and
+nothing here is deferred against it.
+
+### 19.5 Reachability — the #1131 trap, named before it is fallen into
+
+[#1131](https://github.com/mudler/vllm.cpp/issues/1131) is this exact failure for
+the DiT arm: its kernels and staging are gated, its **production switch** is not,
+and setting `on_device = false` leaves every suite green. The reason it happened
+is structural rather than careless — the CUDA arm needs a GPU that CI does not
+have, so the natural gate is a unit test of the forward, and a unit test of the
+forward is exactly what cannot see the switch.
+
+**The way out is that every op this arm uses has a CPU provider.** So the device
+forward runs on a `vt::Queue` whose device is `kCPU`, with no GPU and no
+checkpoint, and CI can drive it **through the production call site**:
+
+1. `Music3DepthStage` takes a `Music3DepthDeviceArm` (queue + staged weights).
+   Non-null selects `DepthDecoderAppendDevice`; null keeps the host loop.
+2. `MiniMaxMusic3SpeechEngine` stages the arm through
+   `Music3SelectDepthArm`, on the **default** `--speech-device 1` — the same
+   switch `StageMusic3DitWeights` already rides.
+
+   **This was written as an `if` in the engine, and a review proved that was the
+   trap it claims to avoid.** Deleting the whole
+   `if (queue_.device.type != kCPU) { … }` block — the only thing
+   `--speech-device 1` reaches — left `test_minimax_music3_ar` 35/35 · 508/508
+   and `test_minimax_music3_speech` 9/9 · 223/223 SUCCESS. That is #1131's shape
+   reproduced by the change that names #1131 as its reason for existing, and it
+   is structural: on a CPU-only runner that condition can never be true, so no
+   branch written at that line is reachable by any gate CI owns.
+
+   The rule now lives in `Music3SelectDepthArm`, which executes on **both** sides
+   of the condition and is therefore drivable from a CPU gate. Three outcomes,
+   and the third is the defect: a CPU queue stages nothing and returns a
+   disengaged arm; any other device stages and returns an engaged one, or
+   `StageMusic3DepthWeights` refuses by name because this build has no provider
+   for it; a non-CPU queue **quietly** taking the host loop is what must never
+   happen. Gutting the selector reds 1 case / 6 assertions.
+3. The CI gate constructs the arm on a **CPU queue** and drives
+   `Music3DepthStage`, asserting (a) agreement with the host arm inside §19.4's
+   band, (b) identical drawn codes, and (c) that the device path was **taken** —
+   a counter, not an inference from the numbers, because the two arms agree
+   numerically by design. That last assertion is the one #1131 says is missing,
+   quoted in its own words: the gate "must assert the device path was TAKEN
+   (invocation count or resident dtype), not merely that outputs agree".
+4. The reachability mutation deletes the production selection in a scratch copy
+   and the focused gate must go **RED**. It does: gutting `Music3SelectDepthArm`
+   reds 1 case / 6 assertions.
+
+**What is still NOT gated, stated rather than implied.** Deleting the engine's
+two-line *call* to `Music3SelectDepthArm` leaves both suites green
+(`test_minimax_music3_ar` 37/37 · 640/640, `test_minimax_music3_speech`
+9/9 · 223/223), with the mutated `test_minimax_music3_speech` binary `sha256`
+`77334986…` against the baseline `6bd42129…` so the run is not a stale-binary
+artefact. Nothing here changes that, and nothing can on a CPU-only runner: the
+engine needs the 28.5 GB checkpoint and a real device. The rule it calls is now
+gated, its two components are gated, and the residual is the call itself. It is
+owned by `MUSIC3-DEPTH-DEVICE` and tracked by
+[#1131](https://github.com/mudler/vllm.cpp/issues/1131), listed under §19.7, and
+it is the same residual the DiT block one screen below still carries in full.
+
+### 19.6 Gates and evidence this row owes
+
+| leg | where | what it proves |
+|---|---|---|
+| numeric agreement, CPU queue | `tests/vllm/models/test_minimax_music3_ar.cpp` | the composition, at reduced geometry, in CI, no GPU |
+| composition + drawn codes | same | a dropped stage a tolerance cannot see |
+| device path TAKEN | same | the #1131 hole |
+| numeric agreement, CUDA | `thor:gpu0` under `rc` | the kernels the CPU provider does not exercise |
+| stage A/B + wall | `thor:gpu0` under `rc` | the reason the row exists |
+| WAV identity | `thor:gpu0` under `rc` | that it is inaudible in the product — **within** §19.4's band, so a HASH pair is not available here and an RMS/peak/max-abs comparison replaces it |
+
+**The A/B's own preconditions, which §16.6a paid for.** Two source trees, two
+build dirs, both binaries' `sha256` printed and a hard failure when they are
+**equal**; the checkpoint staged to local disk with `SRC_BYTES == DST_BYTES`
+asserted; `uptime` on both sides; alternating pairs; the loudest pair kept. The
+**call count is the control**: an arm that cannot move the counter cannot contain
+the change.
+
+### 19.7 Owed, named here rather than discovered later
+
+Every item below is owned by row `MUSIC3-DEPTH-DEVICE` and names the issue that
+tracks it, per `.agents/reachability.md` and `AGENTS.md` `## Nothing lands dead`.
+
+* **The engine's call to `Music3SelectDepthArm` is reachable but not gated**
+  ([#1131](https://github.com/mudler/vllm.cpp/issues/1131), row
+  `MUSIC3-DEPTH-DEVICE`). `--speech-device 1` reaches it and no CI gate can:
+  deleting the two-line call leaves `test_minimax_music3_ar` 37/37 · 640/640 and
+  `test_minimax_music3_speech` 9/9 · 223/223 green, because the engine needs the
+  28.5 GB checkpoint and a real device. §19.5 carries the mutation and the binary
+  hashes. The *rule* it calls is gated on both sides of its condition, so what is
+  owed is the call, not the logic. It closes with the `thor:gpu0` legs in §19.6.
+* **`scripts/check-fusion-consistency.py` is satisfied by a COMMENT**
+  ([#1351](https://github.com/mudler/vllm.cpp/issues/1351), row
+  `MUSIC3-DEPTH-DEVICE`). Replacing the `layers::UnquantizedMlpGateUpMethod` call
+  in `minimax_music3_depth_device.cpp` with an inline hand-rolled
+  `vt::MatmulBT` + `vt::SiluAndMul` path, while leaving the two comment mentions
+  in place — the `#include`'s trailing `// layers::UnquantizedMlpGateUpMethod`
+  and the `gate_up` field note — leaves the checker **green**, and the numbers
+  bit-identical so nothing else sees it either. Verified two ways: a fresh
+  reviewer ran the checker end to end at `rc=0`, and calling the checker's own
+  functions gives `uses_merged_gemm_seam = True` for the hand-rolled variant with
+  comments kept and `False` only once comments are stripped. `Check 2` runs
+  `_MERGED_GEMM_SEAM` over `path.read_text()`; the file's only comment-aware
+  helper, `allowlisted_names`, strips `#` comments from the **allowlist file**
+  rather than from the scanned source. So the checker can no longer detect a
+  regression to a hand-rolled path in this TU. **Reported rather than fixed
+  here:** a checker change needs its own spec, a red-before test and green-after
+  evidence per `AGENTS.md` `## Changing the rules or a checker`, and widening the
+  regex is exactly the move that section forbids. Renaming `MlpGateUp` to
+  `MlpGateUpXX` is *not* a detection gap — `MlpGateUp[A-Za-z]*Method` matches it
+  by design, to cover `UnquantizedMlpGateUpGeluMethod`.
+* **The depth K/V cache's pooling is unmeasured**
+  ([#1309](https://github.com/mudler/vllm.cpp/issues/1309), row
+  `MUSIC3-DEPTH-DEVICE`). It now draws from the device pool through `DBuf`
+  instead of `backend.Alloc`/`Free`, which at the shipped 4-layer batch-2
+  geometry removes 16 `cudaMalloc` and 16 synchronizing `cudaFree` per frame. The
+  change is correct by construction — `ReleaseShared` returns the block to the
+  pool it came from — but **no speed number is quoted for it**, because this box
+  has no GPU and the A/B is blocked on correctness. Measure it with the §19.6
+  `thor:gpu0` legs, not before.
+* The **audio heads, the CFG mix, the top-k draw and the fed-back projection**
+  stay on the host. They are ~1.6 % of the stage today; they become the stage's
+  remainder once the forward moves, and that is the next thing to measure rather
+  than to assume.
+* The **host arm's f32 weight containers** are unchanged (§19.2a). §16.7's lever 1
+  — bf16 host storage, bit-identical on the safetensors lineage and **not** on
+  the GGUF Q4_K one — is still open and is still not this row.
+* The **condition mix** is still host-side (§14.5). It runs once per window, not
+  once per step.
+* **Why Thor's stage ratios exceed x86's** is still a hypothesis (§16.6b) and
+  this row does not settle it.
+
+### 19.8 Stop conditions
+
+Stop and report rather than widening scope if: the CUDA arm's disagreement with
+the host arm exceeds §19.4's band and the cause is not one of that section's
+three; `vt::AttentionCross` refuses this geometry; the staged bf16 weights do not
+fit beside the 8.6 B language model on the measurement box; or the A/B's
+`ARMS_DIFFER` guard fires.

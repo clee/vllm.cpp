@@ -781,6 +781,61 @@ class RatchetTests(unittest.TestCase):
         self.assertEqual(runnable - reduced, {"ENG-CUDAGRAPH-DEDUP"})
         self.assertEqual(runnable, set(gates.RUNNABLE_BASELINE))
 
+    def test_dropping_cudagraph_break_from_the_pin_breaks_it(self):
+        # MUTATION for the #1376 repair. ENG-CUDAGRAPH-BREAK entered the runnable
+        # population when W5 (#1361) filled its spec's Gates section with runnable
+        # evidence, and the re-pin that change owed was not made, so main itself
+        # failed this suite 8 times of 44. Remove the entry and set equality has
+        # to go red, which is what proves the row was pinned because it entered
+        # the population rather than to quiet a gate.
+        reduced = set(gates.RUNNABLE_BASELINE) - {"ENG-CUDAGRAPH-BREAK"}
+        self.assertNotEqual(reduced, set(gates.RUNNABLE_BASELINE))
+        runnable = {r["id"] for r in gates.audit() if r["verdict"] == "runnable"}
+        self.assertNotEqual(runnable, reduced)
+        self.assertEqual(runnable - reduced, {"ENG-CUDAGRAPH-BREAK"})
+        self.assertEqual(runnable, set(gates.RUNNABLE_BASELINE))
+
+    def test_hf_model_download_earns_its_runnable_baseline_entry(self):
+        # ENG-HF-MODEL-DOWNLOAD (#1280) arrives at READY, so it enters the gated
+        # population for the first time and the baseline grows by one. Same
+        # shape and same reason as the row above.
+        #
+        # The row is classified runnable because its spec's `## Gates` section
+        # names `scripts/validate-container-image.py`, a command that can fail.
+        # The exact pin proves the SET agrees, which holds for any membership
+        # and cannot say this row belongs. This says it: remove the entry and
+        # set equality has to go red, which is what separates a row pinned
+        # because it entered the population from a row pinned to quiet a gate.
+        verdicts = {r["id"]: r["verdict"] for r in gates.audit()}
+        self.assertEqual(verdicts.get("ENG-HF-MODEL-DOWNLOAD"), "runnable")
+        reduced = set(gates.RUNNABLE_BASELINE) - {"ENG-HF-MODEL-DOWNLOAD"}
+        self.assertNotEqual(reduced, set(gates.RUNNABLE_BASELINE))
+        runnable = {r["id"] for r in gates.audit() if r["verdict"] == "runnable"}
+        self.assertNotEqual(runnable, reduced)
+        self.assertEqual(runnable - reduced, {"ENG-HF-MODEL-DOWNLOAD"})
+        self.assertEqual(runnable, set(gates.RUNNABLE_BASELINE))
+
+    def test_bpe_quadratic_merge_earns_its_runnable_baseline_entry(self):
+        # SPEC-BPE-QUADRATIC-MERGE (#1365) was already gated and already carried
+        # a `## Gates` section; what changed is that the section now names the
+        # `g++` build and the run lines for `tools/bench/bpe_encode_cost.cpp`.
+        # So this is growth WITHIN the population, not arrival into it, and the
+        # baseline grows by one either way.
+        #
+        # Same shape and same reason as the two rows above: set equality holds
+        # for any membership and cannot say this row belongs, so this case says
+        # it by removing the entry and requiring the equality to go red. Without
+        # it, an entry added to quiet a red gate is indistinguishable from an
+        # entry added because a row gained a command.
+        verdicts = {r["id"]: r["verdict"] for r in gates.audit()}
+        self.assertEqual(verdicts.get("SPEC-BPE-QUADRATIC-MERGE"), "runnable")
+        reduced = set(gates.RUNNABLE_BASELINE) - {"SPEC-BPE-QUADRATIC-MERGE"}
+        self.assertNotEqual(reduced, set(gates.RUNNABLE_BASELINE))
+        runnable = {r["id"] for r in gates.audit() if r["verdict"] == "runnable"}
+        self.assertNotEqual(runnable, reduced)
+        self.assertEqual(runnable - reduced, {"SPEC-BPE-QUADRATIC-MERGE"})
+        self.assertEqual(runnable, set(gates.RUNNABLE_BASELINE))
+
 
 if __name__ == "__main__":
     unittest.main()

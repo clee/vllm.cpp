@@ -32,6 +32,7 @@
 #include "vllm/v1/kv_offload/lmcache/lmcache_connector.h"  // KV-EXTERNAL-CACHE worker store/load
 #include "vllm/v1/sample/ops/bad_words.h"  // apply_allowed_token_ids (-inf mask)
 #include "vllm/v1/worker/gpu/async_runner_flag.h"  // VT_ASYNC_RUNNER predicate
+#include "vllm/v1/worker/gpu/cudagraph_dispatch.h"  // W6 (#1374) the graph-eligibility predicate
 #include "vllm/v1/spec_decode/rejection_sampler.h"  // SPEC-REJECTION I3 verify half
 #include "vllm/v1/worker/gpu/spec_decode/mtp/speculator.h"  // SPEC-MTP I5d MtpProposePrefill
 #include "vllm/v1/worker/gpu/spec_decode/dflash/speculator.h"  // SPEC-DFLASH D5 DflashProposeBlock
@@ -976,11 +977,31 @@ void GPUModelRunner::initialize_kv_cache(const KVCacheConfig& kv_cache_config) {
     // A future backend with a different layout fails LOUDLY here at init.
     const bool is_mla =
         mla_layer_mask[static_cast<size_t>(i)] != 0;
+    // #1332 M1: the selector now applies the full validate_configuration
+    // capability surface, so the request it is asked has to BE the request. The
+    // three fields this site can answer come straight from the geometry it just
+    // resolved. `dtype` (the model/query dtype) is NOT available here — the
+    // runner resolves only ResolveKvCacheDType() — so it keeps its bf16 default;
+    // that is owed to #1332 M4 and recorded under `## Owed` in
+    // .agents/specs/attn-validate-configuration.md.
+    //
+    // AND READ THIS BEFORE READING A GREEN SELECTION AS A WORKING BACKEND: the
+    // name resolved here still reaches only attn_backend_names_, the
+    // VT_ATTN_SELECT_LOG print below and CheckKvCacheShape. dense_attn::AttnBlock
+    // calls vt::PagedAttention unconditionally. Nothing DISPATCHES on this. #1332
+    // M4 owns that, and until it lands a valid name is a claim, not a route.
+    vllm::platforms::AttnSelectorConfig cfg;
+    cfg.head_size = static_cast<int>(fa_dims[i].head_size);
+    cfg.num_heads = static_cast<int>(fa_dims[i].num_kv_heads);
+    cfg.block_size = static_cast<int>(fa_block_size);
+    cfg.kv_cache_dtype = vllm::v1::KvCacheDTypeName(fa_dims[i].dtype);
+    cfg.quantized_kv_cache = vllm::v1::IsQuantizedKvCacheName(cfg.kv_cache_dtype);
+
     std::string name;
     if (is_mla) {
       if (!mla_backend_resolved) {
         mla_backend_resolved = true;
-        vllm::platforms::AttnSelectorConfig mla_cfg;
+        vllm::platforms::AttnSelectorConfig mla_cfg = cfg;
         mla_cfg.use_mla = true;
         try {
           mla_backend = vllm::v1::SelectAttentionBackendName(
@@ -995,7 +1016,7 @@ void GPUModelRunner::initialize_kv_cache(const KVCacheConfig& kv_cache_config) {
       if (!dense_backend_resolved) {
         dense_backend_resolved = true;
         dense_backend = vllm::v1::SelectAttentionBackendName(
-            vllm::platforms::GetPlatform(queue_.device.type));
+            vllm::platforms::GetPlatform(queue_.device.type), "", cfg);
       }
       name = dense_backend;
     }
@@ -1455,6 +1476,45 @@ std::optional<ModelRunnerOutput> GPUModelRunner::execute_model(
   // same gate.
   const bool pure_decode = attn_meta.num_actual_tokens == num_reqs &&
                            gdn_meta.num_prefill_tokens == 0;
+  // ENG-CUDAGRAPH-BREAK W6 (#1374): THE GRAPH-ELIGIBILITY PREDICATE, and this is
+  // the line the row exists to move. Until here the runner shipped ONE boolean
+  // that means "query length is 1", and a model wanting anything wider had to
+  // re-derive the whole test for itself -- which two of them did, in twenty
+  // duplicated lines each (`qwen3_5_moe.cpp`, `qwen3_5_dense.cpp` @ #442). The
+  // runner now names the step's ACTUAL uniform query length once and every model
+  // reads the answer.
+  //
+  // IT IS ALSO THE FIX FOR [#1020]. Those two copies compared the uniform length
+  // against the CONFIGURED `num_spec()`, so a step the scheduler clamped to a
+  // shorter -- but still perfectly uniform -- draft depth missed the predicate
+  // and ran its verify eager, with no log and no counter.
+  // `ActualUniformDecodeQueryLen` reads the length the step HAS, bounded above
+  // by `1 + num_spec()` because nothing in this tree captures a longer one.
+  //
+  // The GDN prefill conjunct is `pure_decode`'s and stays: a step with GDN
+  // prefill tokens carries recurrent-prefill segmentation no decode capture was
+  // built for, and the two model copies each tested it separately.
+  //
+  // THE ARM ABOVE 1 IS A SPECULATIVE VERIFY AND NOTHING ELSE, and the shape
+  // alone does not say so. A single request prefilling three tokens is uniform
+  // at query length 3 by every arithmetic test upstream applies, and at k >= 2
+  // it would pass a bare `q <= 1 + k` bound straight into a DECODE capture --
+  // measured on this tree's own CPU spec fixture, where a 20-token run reported
+  // 19 "uniform spec" steps before this conjunct existed. So the widened arm
+  // additionally requires that EVERY request in the step is verifying at exactly
+  // `q - 1` drafts, read off the scheduler's own per-request draft counts. That
+  // is narrower than the shape test, never wider, and it is what makes
+  // `uniform_query_len > 1` mean what its comment says it means.
+  const std::optional<int64_t> uniform_qlen =
+      gdn_meta.num_prefill_tokens == 0
+          ? v1::GraphEligibleQueryLen(num_reqs, attn_meta.num_actual_tokens,
+                                      attn_meta.max_query_len, num_spec(),
+                                      step.num_draft_tokens_per_req)
+          : std::nullopt;
+  // #1020 is titled on the word SILENTLY. A step that finds no captured shape
+  // now moves a counter, on the shared path every registered model reaches.
+  v1::NoteGraphDispatch(uniform_qlen.value_or(0),
+                        v1::UniformDecodeQueryLen(num_spec()));
   // Gather-before-lm_head indices (the SAME last-token rows sample_tokens uses).
   // Empty when the toggle is off → old full-logits path. The eager forwards skip
   // the gather when it is a no-op (pure decode: len == num_actual_tokens).
@@ -1496,6 +1556,9 @@ std::optional<ModelRunnerOutput> GPUModelRunner::execute_model(
       // (cudagraph_dispatcher.py:37). 0 when speculation is off, which makes
       // the predicate reduce to today's pure-decode shape.
       .num_speculative_tokens = num_spec(),
+      // W6 (#1374): the eligibility answer itself. 0 == no captured decode graph
+      // in this tree serves this step.
+      .uniform_query_len = uniform_qlen.value_or(0),
       .gather_logits = gather,
       // SPEC-MTP I5d: capture the target's post-final-norm [T,H] hidden for the
       // MTP drafter. Non-null only when a speculator is configured — the Qwen3.5

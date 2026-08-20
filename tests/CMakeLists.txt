@@ -63,6 +63,9 @@ vllm_cpp_add_test(test_plugin_system
   vllm/plugins/test_plugin_system.cpp
   vllm/plugins/toy_model_plugin.cpp)
 vllm_cpp_add_test(test_hf_config vllm/test_hf_config.cpp)
+# ENG-HF-MODEL-DOWNLOAD W2 (#1280): the HuggingFace cache layout. No socket,
+# so it is not behind VLLM_CPP_SERVER; the fake-hub half is, below.
+vllm_cpp_add_test(test_hf_cache vllm/transformers_utils/test_hf_cache.cpp)
 vllm_cpp_add_test(test_safetensors vllm/test_safetensors.cpp)
 vllm_cpp_add_test(test_load_direct_upload vllm/test_load_direct_upload.cpp)
 vllm_cpp_add_test(test_gguf vllm/test_gguf.cpp)
@@ -387,6 +390,8 @@ vllm_cpp_add_test(test_video_api vllm/entrypoints/openai/test_video_api.cpp)
 vllm_cpp_add_test(test_speech_api vllm/entrypoints/openai/test_speech_api.cpp)
 target_include_directories(test_model_registry PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_platform vllm/platforms/test_platform.cpp)
+vllm_cpp_add_test(test_cuda_arch_manifest
+  vllm/platforms/test_cuda_arch_manifest.cpp)
 vllm_cpp_add_test(test_device_selection
   vllm/entrypoints/test_device_selection.cpp)
 # ENG-EXPERT-STREAM #1123: the load-time GGUF device-fit refusal, in two targets
@@ -399,6 +404,15 @@ vllm_cpp_add_test(test_gguf_device_fit
   vllm/model_executor/test_gguf_device_fit.cpp)
 vllm_cpp_add_test(test_gguf_device_fit_reach
   vllm/entrypoints/test_gguf_device_fit_reach.cpp)
+# LOAD-GGUF-MMPROJ (#821): the `clip` mmproj reader, and — separately — the
+# proof that the production loader reaches it. The second target enters through
+# `LoadedEngine::FromModelDir` with `--mmproj` set, so deleting the call site in
+# `model_loader.cpp` reds it; the first would stay green, which is exactly the
+# difference between gating a class and gating a capability.
+vllm_cpp_add_test(test_clip_mmproj_gguf
+  vllm/models/test_clip_mmproj_gguf.cpp)
+vllm_cpp_add_test(test_gguf_mmproj_reach
+  vllm/entrypoints/test_gguf_mmproj_reach.cpp)
 # FIX-FP8-BLOCKWISE-REFUSAL #1166: block-wise (128x128) FP8 is refused BY NAME
 # at load. Every case enters through `ModelRegistry::Load` rather than through
 # the predicate, so deleting that call site reds this target. That is the
@@ -427,9 +441,13 @@ target_include_directories(test_linear_method PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_qwen3_break_point vllm/models/test_qwen3_break_point.cpp)
 vllm_cpp_add_test(test_qwen3_decode_graph_seam vllm/models/test_qwen3_decode_graph_seam.cpp)
 vllm_cpp_add_test(test_qwen3_moe_decode_graph_seam vllm/models/test_qwen3_moe_decode_graph_seam.cpp)
+vllm_cpp_add_test(test_moe_async_device_ids vllm/models/test_moe_async_device_ids.cpp)
 vllm_cpp_add_test(test_voxtral_decode_graph_seam vllm/models/test_voxtral_decode_graph_seam.cpp)
 vllm_cpp_add_test(test_deepseek_v2_decode_graph_seam vllm/models/test_deepseek_v2_decode_graph_seam.cpp)
 vllm_cpp_add_test(test_qwen3_5_decode_graph_seam vllm/models/test_qwen3_5_decode_graph_seam.cpp)
+# W6 (#1374): the dispatch counters live under src/, beside the runner (:561).
+target_include_directories(test_qwen3_5_decode_graph_seam PRIVATE ${CMAKE_SOURCE_DIR}/src)
+vllm_cpp_add_test(test_qwen3_dflash_decode_graph_seam vllm/models/test_qwen3_dflash_decode_graph_seam.cpp)
 # G1 for the row: bit-exactness against eager over THREE replays, on a real
 # device. Inert without a CUDA backend (every case skips), because a CPU
 # "replay" recomputes nothing.
@@ -1164,6 +1182,12 @@ vllm_cpp_add_test(test_speculative_dspark vllm/config/test_speculative_dspark.cp
 # DeepSeek-V4 DSpark lane by name, instead of trusting the CLI method string.
 vllm_cpp_add_test(test_dspark_draft_routing
   vllm/entrypoints/test_dspark_draft_routing.cpp)
+# SPEC-DFLASH2 W1 (#1314): REACHABILITY of the DFlash2 refusal — the loader
+# reads the draft's own config.json and refuses `DFlash2DraftModel` by name,
+# instead of drafting it through the DFlash1 lane with the grouped convolution
+# and the candidate selector silently absent.
+vllm_cpp_add_test(test_dflash2_draft_routing
+  vllm/entrypoints/test_dflash2_draft_routing.cpp)
 # #1160: `--speculative-config` key ADMISSION — an unknown or misspelled key is
 # refused by name, and an upstream key this engine does not implement is refused
 # with the missing part named, instead of being silently dropped.
@@ -1227,6 +1251,21 @@ target_include_directories(test_expert_stream_wiring PRIVATE ${CMAKE_SOURCE_DIR}
 # defect, and the store is built from the FIRST model a process runs.
 vllm_cpp_add_test(test_expert_stream_mixed_slot vllm/model_executor/test_expert_stream_mixed_slot.cpp)
 target_include_directories(test_expert_stream_mixed_slot PRIVATE ${CMAKE_SOURCE_DIR}/src)
+# ENG-EXPERT-STREAM-DEVICE W0c (#1124): the PLATFORM branch of the expert-slice
+# seam. Its own binary for two independent reasons -- it latches
+# VT_MOE_EXPERT_STREAM like its siblings, and it registers a fake backend and a
+# fake platform in the process-global kXPU slot, which must not leak into any
+# other suite.
+vllm_cpp_add_test(test_expert_stream_device_slot vllm/model_executor/test_expert_stream_device_slot.cpp)
+target_include_directories(test_expert_stream_device_slot PRIVATE ${CMAKE_SOURCE_DIR}/src)
+# ENG-EXPERT-STREAM-DEVICE W0f (#1299): which branch `ResidentWeight` takes on a
+# staging platform whose kernels can dereference host storage. Its own binary for
+# the same reason as its sibling above -- it registers a fake backend and a fake
+# platform in the process-global kXPU slot, which must not leak into any other
+# suite -- and separately because the two disagree about the backend's
+# UnifiedMemory(), which is a process-global registration and not a per-case flag.
+vllm_cpp_add_test(test_resident_weight_host_addressable vllm/model_executor/test_resident_weight_host_addressable.cpp)
+target_include_directories(test_resident_weight_host_addressable PRIVATE ${CMAKE_SOURCE_DIR}/src)
 # ENG-EXPERT-STREAM (#1091): the step clock at the MoE entry points ForwardLayers
 # does NOT cover, and the final statistics line. Its own binary because it is the
 # only one that can observe `steps == 0` -- the store is a process-lifetime
@@ -1257,6 +1296,8 @@ vllm_cpp_add_test(test_runner vllm/v1/worker/test_runner.cpp)
 target_include_directories(test_runner PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_common_attn_metadata vllm/v1/attention/test_common_attn_metadata.cpp)
 vllm_cpp_add_test(test_attn_backend_registry vllm/v1/attention/test_attn_backend_registry.cpp)
+vllm_cpp_add_test(test_attn_validate_configuration
+  vllm/v1/attention/test_attn_validate_configuration.cpp)
 vllm_cpp_add_test(test_attention_window vllm/model_executor/layers/attention/test_attention.cpp)
 vllm_cpp_add_test(test_chunked_local_attention
   vllm/v1/attention/test_chunked_local_attention.cpp)
@@ -1273,6 +1314,10 @@ vllm_cpp_add_test(test_mtp_speculator vllm/v1/spec_decode/test_mtp_speculator.cp
 # SPEC-MTP-K-GT-1 (#81): MTP speculation DEPTH through the production loader —
 # the configured k reaches the propose path, or is refused by name.
 vllm_cpp_add_test(test_mtp_depth vllm/v1/spec_decode/test_mtp_depth.cpp)
+# ENG-CUDAGRAPH-BREAK W6 (#1374): the graph-eligibility predicate and its
+# counters live under src/, beside the runner that computes them, exactly as
+# test_cudagraph_dispatch reads them (:561).
+target_include_directories(test_mtp_depth PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_rejection_sampler vllm/v1/spec_decode/test_rejection_sampler.cpp)
 vllm_cpp_add_test(test_prepare_prefill_inputs vllm/v1/spec_decode/test_prepare_prefill_inputs.cpp)
 # SPEC-MTP-K-GT-1 (#81): the draft-DECODE half of the autoregressive propose —
@@ -1280,6 +1325,10 @@ vllm_cpp_add_test(test_prepare_prefill_inputs vllm/v1/spec_decode/test_prepare_p
 vllm_cpp_add_test(test_prepare_decode_inputs vllm/v1/spec_decode/test_prepare_decode_inputs.cpp)
 vllm_cpp_add_test(test_dflash_kvprep vllm/v1/spec_decode/test_dflash_kvprep.cpp)
 target_include_directories(test_dflash_kvprep PRIVATE ${CMAKE_SOURCE_DIR}/src)
+# SPEC-DFLASH2 W1 (#1314): the DFlash causality rule — the port of vLLM's
+# tests/v1/spec_decode/test_dflash_causality.py as edited by vllm#52816, plus the
+# assertion that a DFlash1 checkpoint's resolution is unchanged.
+vllm_cpp_add_test(test_dflash_causality vllm/v1/spec_decode/test_dflash_causality.cpp)
 vllm_cpp_add_test(test_dflash_propose vllm/v1/spec_decode/test_dflash_propose.cpp)
 target_include_directories(test_dflash_propose PRIVATE ${CMAKE_SOURCE_DIR}/src)
 # SPEC-NGRAM (ROAD-V1-D3) — the draft-free n-gram matcher unit gate (ports
@@ -1310,6 +1359,11 @@ vllm_cpp_add_test(test_async_llm vllm/v1/test_async_llm.cpp)
 vllm_cpp_add_test(test_llm_engine vllm/v1/test_llm_engine.cpp)
 vllm_cpp_add_test(test_loaded_engine_dense vllm/entrypoints/test_loaded_engine_dense.cpp)
 vllm_cpp_add_test(test_dspark_block_size_guard vllm/entrypoints/test_dspark_block_size_guard.cpp)
+# ENG-HF-MODEL-DOWNLOAD W2 (#1280): the HuggingFace cache walk entered through
+# the production loader, with a repository identifier rather than a path. The
+# transformers_utils suite calls the function directly and cannot see a deleted
+# call site; this one can. Named `dflash` so `ctest -R "dflash|dspark"` runs it.
+vllm_cpp_add_test(test_dflash_draft_hf_cache vllm/entrypoints/test_dflash_draft_hf_cache.cpp)
 vllm_cpp_add_test(test_beam_search vllm/entrypoints/test_beam_search.cpp)
 # ROAD-V1-MM serving W1: OpenAI multimodal content-part parse + decode + route
 # to the existing single-sequence mm processors (CPU, no model weights). Reuses
@@ -1442,6 +1496,10 @@ target_compile_definitions(test_chat_template PRIVATE
   VLLM_TEST_FIXTURES_DIR="${CMAKE_SOURCE_DIR}/tests/fixtures")
 # The HTTP api_server smoke test needs the vendored cpp-httplib (gated).
 if(VLLM_CPP_SERVER)
+  # ENG-HF-MODEL-DOWNLOAD W2 (#1280): the hub protocol against an in-process fake
+  # hub. It starts a REAL cpp-httplib server on an ephemeral port, so it shares
+  # api_server.cpp's gate and the RUN_SERIAL treatment two rows below.
+  vllm_cpp_add_test(test_hf_hub vllm/transformers_utils/test_hf_hub.cpp)
   vllm_cpp_add_test(test_openai_api_server vllm/entrypoints/openai/test_api_server.cpp)
   # /v1/audio/transcriptions dispatch + socket smoke run against the REAL
   # library transcription seam on the committed parakeet_e2e fixture
@@ -1465,7 +1523,7 @@ if(VLLM_CPP_SERVER)
   # parallel suite is deterministic. (A shared RESOURCE_LOCK would only serialize
   # these two against each other, not against the CPU-hog tests that actually
   # cause the starvation.)
-  set_tests_properties(test_openai_api_server test_openai_conformance
+  set_tests_properties(test_openai_api_server test_openai_conformance test_hf_hub
     PROPERTIES RUN_SERIAL ON)
   # SERVE-RECIPE-ARGS (#606): the accepted-and-inert serve-argument seam. It
   # drives the REAL VllmServerMain (owned by the library behind the same
@@ -1702,6 +1760,47 @@ target_include_directories(test_cuda_quant_dot PRIVATE ${CMAKE_SOURCE_DIR}/src)
 # domain. Reaches src/ for the tier header and the threadpool test hook.
 vllm_cpp_add_test(test_ops_matmul_elem vt/test_ops_matmul_elem.cpp)
 target_include_directories(test_ops_matmul_elem PRIVATE ${CMAKE_SOURCE_DIR}/src)
+# LTX25-TEXT-LINEAR-MEM (#1286): the seam's ALLOCATION bound, on both
+# `MatmulOneChunk` instantiations. Every other GEMM gate here asserts values or
+# byte equality, so a kernel that allocated a whole intermediate per worker
+# would pass all of them. It counts bytes REQUESTED through replaced global
+# `operator new` overloads, not peak RSS -- the peak-RSS draft read zero at
+# every geometry while passing every bound, because glibc retains the arena
+# (spec `## Outcome` W4).
+#
+# Registered only on Linux, and NOT because of /proc or the threadpool: the
+# counter reads nothing under /proc and the pool is portable. It is that the
+# replaced allocation functions serve the WHOLE PROGRAM, so the gate depends on
+# every `delete` in the binary reaching the matching replaced `delete`, and on
+# its fixed slack term being calibrated against the library doing the
+# allocating. Both hold for glibc/libstdc++ and are unestablished elsewhere; a
+# standard library linked as its own runtime keeps its own `operator new`, and
+# the mismatch is a heap corruption rather than a red assertion. Compiling it
+# elsewhere with a skip would print `Status: SUCCESS!` over `assertions: 0`,
+# which reads as a pass. Extending the lanes is owed, not a one-line change.
+# Reaches src/ for the threadpool test hook, which is what lets one process
+# sweep the worker count.
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  vllm_cpp_add_test(test_ops_matmul_mem vt/test_ops_matmul_mem.cpp)
+  target_include_directories(test_ops_matmul_mem PRIVATE ${CMAKE_SOURCE_DIR}/src)
+  # The C allocator is counted through the LINKER, not through a symbol
+  # definition. `--wrap` redirects the calls made by the objects in this link --
+  # which includes libvllm.a, and so cpu_ops.cpp -- while leaving `malloc` itself
+  # defined by whoever normally defines it. Defining `malloc` in the test would
+  # instead be a second strong definition beside AddressSanitizer's own
+  # interceptor, which is what would break the sanitize-cpu lane. Scoped to this
+  # one target, so nothing else in the suite is affected.
+  #
+  # These flags are LOAD-BEARING, not an optimization: the test references
+  # `__real_malloc` directly, so dropping one fails the LINK rather than quietly
+  # costing the gate its malloc coverage. Verified by mutation (M-W).
+  target_link_options(test_ops_matmul_mem PRIVATE
+    -Wl,--wrap=malloc
+    -Wl,--wrap=calloc
+    -Wl,--wrap=realloc
+    -Wl,--wrap=aligned_alloc
+    -Wl,--wrap=posix_memalign)
+endif()
 # CPU-tier contract for the env-gated cuBLASLt GEMM algo-selection diagnostic
 # helpers. Reaches the internal header under src/ (not public API); the cuBLASLt
 # emit it gates is CUDA-only and lives in src/vt/cuda/cuda_matmul.cu.
