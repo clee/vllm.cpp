@@ -2693,9 +2693,15 @@ if(NOT VLLM_CPP_SANITIZE STREQUAL "OFF")
   # a50c57d69.
   #
   # Forward the PROPERTY rather than naming OpenSSL: the answer then lives in
-  # exactly one place, and the next PUBLIC dependency `vllm` acquires cannot be
+  # exactly one place, and the next PUBLIC LINK LIBRARY `vllm` acquires cannot be
   # forgotten here. A per-target `target_link_libraries(test_x OpenSSL::SSL)`
   # would repair the eight and leave the ninth to be discovered by a red lane.
+  #
+  # These four forwards are not the complete set, and saying so is the point of
+  # the paragraph above. `INTERFACE_COMPILE_OPTIONS`, `INTERFACE_COMPILE_FEATURES`
+  # and `INTERFACE_LINK_DIRECTORIES` are still unforwarded. All three are EMPTY on
+  # `vllm` today, so nothing is broken; the first one that gains a value owes a
+  # fifth line here, and will fail exactly as silently as this one did.
   #
   # It must stay INTERFACE with the property genex, and must never become
   # `PUBLIC vllm`: `vllm` carries the `--whole-archive` INTERFACE link OPTION

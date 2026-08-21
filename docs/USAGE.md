@@ -149,9 +149,12 @@ Configuring with `-DVLLM_CPP_SANITIZE=address,undefined` or
 test executables link one internal shared image of the instrumented archive
 instead of force-linking `vllm::vllm` into each of them, because the
 force-linked form runs a hosted runner out of disk. That image forwards the
-same include directories, compile definitions and link libraries, so a target
-builds identically in both configurations. Link `vllm::vllm` as above and let
-the build choose; naming the internal image yourself is not supported.
+same include directories, compile definitions and link libraries, so a target's
+own CMake is the same in both configurations. It does not LINK identically: the
+archive is force-linked into each executable only in the default build, and not
+propagating that is the reason the instrumented image exists. Link `vllm::vllm`
+as above and let the build choose; naming the internal image yourself is not
+supported.
 
 ## First-line troubleshooting
 
