@@ -380,7 +380,7 @@ W5 gates, mutations, and the record edits the change makes stale.
 | Issue | State |
 |---|---|
 | [#1536](https://github.com/mudler/vllm.cpp/issues/1536) | closed by this row |
-| [#1439](https://github.com/mudler/vllm.cpp/issues/1439) | closed by this row |
+| [#1439](https://github.com/mudler/vllm.cpp/issues/1439) | **NOT closed by this row, and it must not be.** Its RED is fixed — the assertion it was filed against passes with 4.5 to 13 points of margin — but its filed complaint is that the budget is a SHARE OF `wall`, so it decides by box load and permits minutes of un-named time at 21 B. This row restores that assertion byte for byte, so the complaint is untouched. What would close it is a bound on a quantity the scheduler cannot move, which is [#1570](https://github.com/mudler/vllm.cpp/issues/1570) and this row's own negative result |
 | [#1494](https://github.com/mudler/vllm.cpp/issues/1494) | **already CLOSED by `6b48edb2c` before this row merged `main`.** This row takes the `denoise.update` anchor that change recorded as owed; it does not close the issue and does not claim to |
 | [#1470](https://github.com/mudler/vllm.cpp/issues/1470) | closed by this row |
 | [#1567](https://github.com/mudler/vllm.cpp/issues/1567) — the res_2s arm's `denoise.update` anchor | **owed, filed by this row.** `Ltx2Res2sDenoisingLoop` runs its own post-process and step inside `ltx2_res2s.cpp` through `Ltx2Res2sHooks`, so the anchor needs a hook rather than a statement. No gate in this tree renders on that arm, so landing it here would land dead code |
@@ -449,12 +449,15 @@ frames, 0.90 at 81 — was that work leaking into a number.
   so the number that would have passed is one that also passes a load prologue
   twice as large. There is no constant that separates them, because the quantity
   on the other side is the render's wall.
-* **Naming the un-named time and keeping the ratio**, which is what #1439 itself
-  proposed as one of two options. Rejected on measurement: after the naming the
-  residue is 16.2 ms of an 11.7 s wall, so 95% leaves 570 ms of headroom at this
-  fixture scale and the gate becomes untestable, while at the 21 B render it
-  still permits minutes. A ratio whose margin is that asymmetric is not a gate at
-  either end.
+* **Naming the un-named time and keeping the ratio** — which is what #1439 itself
+  proposed as one of two options — was rejected mid-flight and is **what this row
+  actually ships.** The rejection said the ratio "becomes untestable" because the
+  residue leaves 570 ms of headroom at fixture scale. That reasoning used a
+  contended run's 16.2 ms residue on an 11.7 s wall. Measured properly the
+  residue's floor is **0.820 ms**, which at the fixture's quiet 0.26271 s wall is
+  0.31% and leaves **4.69 points** of margin under the floor rather than an
+  untestable gulf — against the original red's 2.30 points OVER it. The rejection
+  was wrong and the option it rejected is the one that landed.
 * **Bounding the residue with a fixed number of seconds.** It is the same defect
   with the scale inverted: a constant tuned on a 0.26 s fixture reds a 2.5 h
   render's ordinary instrument cost, and one tuned on the 2.5 h render passes a
@@ -543,10 +546,20 @@ are recorded rather than left for the next reader to find:
 * **Mutation D** — `denoise.update` moved below the two `PostProcessLatent`
   calls, so the anchor stops covering the post-process while its count,
   containment, nesting and sibling order are all unchanged — reddened the
-  withdrawn bound **5 of 5 runs**. Against the 0.75 floor it produces about 94%
-  coverage and passes. Nothing in the file now sees it, and no floor can: the
-  honest anchored coverage approaches the same value on a fast box, as the leaf
-  shrinks and the instrument's cost does not.
+  withdrawn bound **5 of 5 runs**. It is not detected on the landing tree, and
+  the reason is MEASURED rather than extrapolated. Under D, `denoise` coverage
+  read **99.9928%** and **99.990%**; unmutated on the same head it read
+  **99.9963%** and **99.980%**. Sorted, the two distributions **interleave** —
+  the honest 81-frame render read LOWER than both mutated runs. No floor can
+  separate populations that overlap, and this one is an overlap rather than a
+  gap.
+
+  (An earlier draft of this line said D "produces about 94% coverage". That was
+  the PRE-anchoring quiet-box figure carried across and it was wrong; the
+  conclusion was right for the wrong reason. The structural argument — that the
+  honest coverage approaches D's as the leaf shrinks on a fast box and the
+  instrument's cost does not — is reasoning, not measurement, and is kept as
+  such.)
 * **A future un-named region** smaller than 5% of wall is invisible again, which
   is the same hole at a smaller scale. The named-boundary list catches a name
   being DELETED — mutation A reds there — and not a region being ADDED.
@@ -575,10 +588,10 @@ each side contributes:
 
 | | `6b48edb2c` | this row |
 |---|---|---|
-| `denoise` share floor | moved 0.95/0.90 → 0.75 | **deleted**; 0.75 permits a quarter of a leaf to be un-anchored, `uncovered <= 2 * leaf_instrument` permits tens of microseconds |
+| `denoise` share floor | moved 0.95/0.90 → 0.75 | **kept at 0.75, unedited.** This row briefly deleted it in favour of an instrument-derived bound and withdrew that; the floor it landed with is the floor that lands |
 | the head and tail | new assertion (1c), flat 0.25 ms plain / 3 ms sanitized, per leaf record | **kept exactly as it landed**, constants and all |
 | the interior | left un-anchored, disclosed, owed | anchored as `denoise.update` |
-| the sum gate (#1439) | untouched | replaced by the instrument-derived bound |
+| the sum gate (#1439) | untouched | **also untouched**, and restored byte for byte after the same withdrawal. Its RED is fixed by the naming, not by the assertion |
 
 **Its measured population is the strongest evidence either side produced**, and
 it is kept verbatim in the source: on an unchanged `denoise` the nine-frame arm
@@ -616,6 +629,7 @@ environment, the exit status and the evidence path, and not a summary of them.
 | 4 | `361bbfb05` | `build-newest-gcc` | 0 | **GREEN**, having been RED at the Build step on every commit since `5702d8f83`; repaired here as #1565 |
 | 5 | `361bbfb05` | `ctest --test-dir build --output-on-failure`, locally | — | **VOID, not a failure.** `test_ltx2_video` reports `Subprocess terminated***Exception` at 796.58 s, and its own output ends `FATAL ERROR: test case CRASHED: SIGTERM` at case 26 of 104 with **`763 assertions \| 763 passed \| 0 failed`**. An external `SIGTERM` on a shared box is an infrastructure failure presenting as a code verdict, and it is neither a red nor a green |
 | 6 | the landing tree | the SUMS case, **30 consecutive runs** of the RESTORED floor, load 89-123 | 0 x30 | **GREEN 30/30**, every run reporting `cases=1`. `leaves/wall` min **99.6302%**, median 99.9637%, max 99.9901% against 95%. Evidence `floor30.log` |
+| 6b | `65e681438` | the same, **46 consecutive runs** by the FRESH REVIEWER, load 99-113 | 0 x46 | **GREEN 46/46**, `leaves/wall` min **99.4957%**, worst margin **4.50 points**. It also measured the residue's FLOOR at **0.820 ms**, which at the fixture's quiet 0.26271 s wall is 0.31% and leaves **4.69 points** of margin — so the floor holds at the fast end too, not only where contention inflates the denominator. The same reviewer verified the restoration is byte-exact against the merge base: identical predicates and constants, only `MESSAGE` text differs |
 | 7 | the landing tree | the SUMS case, 20 consecutive runs of the WITHDRAWN bound | 0 x20 | recorded because it is the measurement that was not enough: 1.021 to 1.464, which a fresh reviewer then showed is the body of a distribution reaching 4.115 over 45 runs. Evidence `ratios20.log` |
 
 **Row 1's exact failures**, which are the red this row exists to remove:
