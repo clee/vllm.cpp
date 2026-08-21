@@ -547,6 +547,25 @@ This row is itself a case study in a quoted number becoming treated as measured,
 so the two are separated here rather than left as one figure a reader would
 inherit.
 
+**AND THE FAST END IS NOW MEASURED RATHER THAN ARGUED, which is the one thing
+the earlier rounds could not do.** This floor's polarity is the one #1439
+recorded: *a slower render passes*, because `wall` is the denominator. So every
+number above, taken at load 89 to 123, comes from the SAFE side, and the regime
+that matters is a quiet box with a small wall — which is what CI is.
+
+The box fell to load average 11 for the first time in this row's life, and 15
+consecutive runs there give **0 red**, min `leaves/wall` **99.7947%** (4.79
+points of margin), over walls of **0.809 to 4.588 s**.
+
+The load-bearing observation is in the residue rather than the ratio: **it does
+not scale with wall.** It reads 0.896 to 4.221 ms over walls of 0.8 to 4.6 s
+here, and 0.820 ms at its floor over walls of 10 to 120 s under load. So the
+SHARE is worst at the smallest wall, and 0.809 s is three times closer to the
+0.26271 s baseline than anything measured before. Carrying a ~1 ms residue to
+that baseline wall gives 0.38%, i.e. **99.62% and 4.62 points of margin**,
+against the 19.178 ms that put the original 2.30 points UNDER. The fast end is
+where this row's claim had to hold, and it holds.
+
 **And the instrument's charge is reported at every one of them**, which is the
 half of #1439's request that does land: `unaccounted 0.00179039s` against
 `instrument 0.00137401s` on the table, and per leaf 1.017 to 1.230 as a ratio
@@ -644,6 +663,8 @@ environment, the exit status and the evidence path, and not a summary of them.
 | 5 | `361bbfb05` | `ctest --test-dir build --output-on-failure`, locally | — | **VOID, not a failure, and STOPPED at 482 of 584 on a fresh review's memory warning.** The box had ~1 GB free with swap 3/3 GB full, and `test_ltx2_video` has been kernel-OOM-killed on it three times at 30-36 GB anon-RSS, so the remaining 102 tests would have measured the box. Of the 482 that ran, the only failure is the one below. `test_ltx2_video` reports `Subprocess terminated***Exception` at 796.58 s, and its own output ends `FATAL ERROR: test case CRASHED: SIGTERM` at case 26 of 104 with **`763 assertions \| 763 passed \| 0 failed`**. No `ctest` TIMEOUT is configured and the default is 1500 s, so 796 s was an external kill rather than a timeout. An infrastructure failure presenting as a code verdict is neither a red nor a green |
 | 6 | the landing tree | the SUMS case, **30 consecutive runs** of the RESTORED floor, load 89-123 | 0 x30 | **GREEN 30/30**, every run reporting `cases=1`. `leaves/wall` min **99.6302%**, median 99.9637%, max 99.9901% against 95%. Evidence `floor30.log` |
 | 6b | `65e681438` | the same, **46 consecutive runs** by the FRESH REVIEWER, load 99-113 | 0 x46 | **GREEN 46/46**, `leaves/wall` min **99.4957%**, worst margin **4.50 points**. It also measured the residue's FLOOR at **0.820 ms**, which at the fixture's quiet 0.26271 s wall is 0.31% and leaves **4.69 points** of margin — so the floor holds at the fast end too, not only where contention inflates the denominator. The same reviewer verified the restoration is byte-exact against the merge base: identical predicates and constants, only `MESSAGE` text differs |
+| 6c | `afe8e7383` | the SUMS case, **15 consecutive runs on a QUIET box**, load 11-26 | 0 x15 | **GREEN 15/15.** min `leaves/wall` **99.7947%** (4.79 points), median 99.9582%, max 99.9788%; walls **0.809-4.588 s**, residues **0.896-4.221 ms**. This is the regime the floor is WEAKEST in and every earlier number came from the safe side of it — see below |
+| 6d | `afe8e7383` | the transfer from the gated SHA, verified independently | — | `git diff --stat 65e681438 HEAD -- src include tests` is EMPTY, and rebuilding at the head reproduced sha256 `579cde5aa0a6…`, byte-identical to the gated binary. Focused gate at the head: `4 cases \| 4 passed`, **1382 assertions**, 0 failed — matching row 2 exactly |
 | 7 | the landing tree | the SUMS case, 20 consecutive runs of the WITHDRAWN bound | 0 x20 | recorded because it is the measurement that was not enough: 1.021 to 1.464, which a fresh reviewer then showed is the body of a distribution reaching 4.115 over 45 runs. Evidence `ratios20.log` |
 
 **THE GATE'S SHA AND THE HEAD'S SHA ARE NOT THE SAME, and the difference is
