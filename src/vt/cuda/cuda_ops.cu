@@ -15,6 +15,7 @@
 #include <string>
 #include <type_traits>
 
+#include "vt/cuda/cuda_device_caps.h"
 #include "vt/cuda/rmsnorm_decode_fast.h"
 #include "vt/ops.h"
 
@@ -3326,23 +3327,54 @@ __global__ void AttentionDenseFlashKernel(Tout* out, const Tin* query, const Tin
   }
 }
 
+// The K/V tile is 2 * kFlashBc * head_dim elements of Tin, and 48 KiB is the
+// dynamic shared memory EVERY CUDA architecture gives a kernel without an
+// opt-in. f32 at head_dim 128 wants 65,536 B and f32 at head_dim 256 wants
+// 131,072 B, so the two widest f32 shapes this op advertises (d <= 256) could
+// not launch at all: the driver returned a bare `invalid argument` from a
+// kernel that had never run. Found routing LTX-2.5's head_dim-128 DiT here
+// (#1549), whose f32 arm is a supported arm.
+//
+// QUERIED, never assumed, through the same cached seam cuda_paged_attn.cu:112-127
+// uses (`cudaDevAttrMaxSharedMemoryPerBlockOptin` via vt/cuda/cuda_device_caps.h;
+// GB10/sm_121 reports 101,376 B). Returns false when the tile cannot be opted
+// into on this device, which is a signal to the caller and not an error --
+// AttentionDenseFlashKernelCuda answers it by falling back to the warp kernel.
+bool FlashTileSmemOptIn(const void* kernel, size_t bytes) {
+  if (bytes <= 48u * 1024u) return true;  // guaranteed everywhere; no opt-in needed
+  if (!DynamicSmemFits(static_cast<long long>(bytes))) return false;
+  return cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                              static_cast<int>(bytes)) == cudaSuccess;
+}
+
+// Returns false when the K/V tile does not fit this device's shared memory and
+// NOTHING was launched. Every other path launches and returns true.
 template <typename Tin>
-void LaunchAttentionDenseFlash(cudaStream_t s, Tensor& out, const Tensor& query, const Tensor& key,
+bool LaunchAttentionDenseFlash(cudaStream_t s, Tensor& out, const Tensor& query, const Tensor& key,
                                const Tensor& value, const AttentionArgs& args) {
   const int64_t t = query.shape[0], hq = query.shape[1], d = query.shape[2];
   const int64_t hk = key.shape[1];
-  if (t == 0 || hq == 0 || d == 0) return;
+  if (t == 0 || hq == 0 || d == 0) return true;
   VT_CHECK(d <= 256, "cuda attention-dense-flash: head_dim <= 256 only");
   const unsigned nblk = static_cast<unsigned>((t + kFlashBr - 1) / kFlashBr);
   const dim3 grid(nblk, static_cast<unsigned>(hq));
   const size_t shmem = static_cast<size_t>(2) * kFlashBc * d * sizeof(Tin);  // sK + sV
   switch (out.dtype) {
     case DType::kF32:
+      if (!FlashTileSmemOptIn(reinterpret_cast<const void*>(&AttentionDenseFlashKernel<Tin, float>),
+                              shmem)) {
+        return false;
+      }
       AttentionDenseFlashKernel<Tin, float><<<grid, kFlashBr * 32, shmem, s>>>(
           out.Ptr<float>(), query.Ptr<Tin>(), key.Ptr<Tin>(), value.Ptr<Tin>(), hq, hk, d, t,
           args.scale, args.causal);
       break;
     case DType::kBF16:
+      if (!FlashTileSmemOptIn(
+              reinterpret_cast<const void*>(&AttentionDenseFlashKernel<Tin, __nv_bfloat16>),
+              shmem)) {
+        return false;
+      }
       AttentionDenseFlashKernel<Tin, __nv_bfloat16><<<grid, kFlashBr * 32, shmem, s>>>(
           out.Ptr<__nv_bfloat16>(), query.Ptr<Tin>(), key.Ptr<Tin>(), value.Ptr<Tin>(), hq, hk, d,
           t, args.scale, args.causal);
@@ -3350,20 +3382,33 @@ void LaunchAttentionDenseFlash(cudaStream_t s, Tensor& out, const Tensor& query,
     default: VT_CHECK(false, "cuda attention-dense-flash: unsupported out dtype");
   }
   Check(cudaGetLastError(), "attention-dense-flash launch");
+  return true;
 }
 
 void AttentionDenseFlashKernelCuda(Queue& q, Tensor& out, const Tensor& query, const Tensor& key,
                                    const Tensor& value, const AttentionArgs& args) {
+  bool launched = false;
   switch (query.dtype) {
     case DType::kF32:
-      LaunchAttentionDenseFlash<float>(AsStream(q), out, query, key, value, args);
+      launched = LaunchAttentionDenseFlash<float>(AsStream(q), out, query, key, value, args);
       break;
     case DType::kBF16:
-      LaunchAttentionDenseFlash<__nv_bfloat16>(AsStream(q), out, query, key, value, args);
+      launched =
+          LaunchAttentionDenseFlash<__nv_bfloat16>(AsStream(q), out, query, key, value, args);
       break;
     default:
       VT_CHECK(false, "cuda attention-dense-flash: unsupported input dtype (f32/bf16 only)");
   }
+  if (launched) return;
+  // The tile does not fit this device. Fall back to the WARP kernel rather than
+  // refuse: the flash kernel's own contract (see its header above) is that it is
+  // BIT-IDENTICAL to AttentionDenseFast -- same per-warp online-softmax
+  // recurrence, same lane grouping, same j-order, same f32 accumulation, with
+  // K/V read from global instead of a shared tile. So this fallback costs the
+  // tiling speedup and NOTHING else, and the caller gets the best available
+  // kernel for its shape instead of a hard refusal. Same shape as the
+  // AttentionDenseFa2 -> AttentionDenseFlash fallback below.
+  AttentionDenseFastKernelCuda(q, out, query, key, value, args);
 }
 
 // AttentionDenseFa2 — the same dense non-causal contract run on the VENDORED

@@ -54,6 +54,7 @@
 
 #include <cmath>
 #include <cstddef>
+#include <cstdlib>
 #include <cstring>
 #include <map>
 #include <optional>
@@ -418,7 +419,39 @@ DBuf AttentionDev(Ctx& c, const Ltx2AttentionWeights& w, const Tensor& x, const 
       vt::AttentionArgs args;
       args.scale = scale;
       args.causal = false;
-      vt::Attention(c.d.q, to_t, tq_t, tk_t, tv_t, args);
+      // The FAST dense op, not `vt::Attention` (#1549). `vt::Attention` is frozen
+      // on `vt::cuda::AttentionKernel`, which its own header calls
+      // "Correctness-grade (M0.9)": one 256-thread block per (query, head), a
+      // 256-wide shared-memory tree reduction per key, and no K/V tiling, so K
+      // and V are re-read from global once per (query, head). At 768x448/49f the
+      // video stream is 2352 tokens x 32 heads = 75,264 blocks each looping 2352
+      // keys, x 48 layers, and ONE DiT forward measured 47.84 s on GB10. That
+      // freeze is deliberate and correct — it is what keeps text decode
+      // byte-identical (cuda_ops.cu:3120-3122) — but it means the fast kernels
+      // are SEPARATE OPS a caller opts into BY NAME, with no shape routing and no
+      // fallback notice. A model that never opts in gets correct output at
+      // roughly 500x the cost and nothing anywhere says so.
+      //
+      // `AttentionDenseFlash` is head_dim-generic to 256, so both LTX streams
+      // (video 128, audio 64) are served, and its square-problem contract holds
+      // here by construction: this branch is entered only when
+      // `context == nullptr`, which is exactly when `s == tq` above.
+      //
+      // NOT bit-identical to `vt::Attention` on CUDA: the warp kernel groups the
+      // head_dim partial sums across 32 lanes instead of a 256-thread block, so
+      // the same f32 online softmax associates differently. It IS byte-identical
+      // on CPU, where both ops resolve to the same registered kernel. The binding
+      // gate is the CUDA host-vs-device parity case in test_ltx2_device.cpp.
+      const char* off = std::getenv("VLLM_LTX2_DIT_FLASH_ATTN");
+      if (off != nullptr && off[0] == '0') {
+        // Same-binary A/B and RED knob, the shape VT_FA2_DENSE
+        // (cuda_ops.cu:3383-3389) already takes. Restores the naive kernel so
+        // both arms of the measurement run from ONE build. Read FRESH rather than
+        // cached, so a test can flip it inside one process.
+        vt::Attention(c.d.q, to_t, tq_t, tk_t, tv_t, args);
+      } else {
+        vt::AttentionDenseFlash(c.d.q, to_t, tq_t, tk_t, tv_t, args);
+      }
     } else {
       vt::AttentionCrossArgs args;
       args.scale = scale;

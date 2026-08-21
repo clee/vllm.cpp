@@ -13,6 +13,12 @@ prerequisite kernel repair. The A/B is the confirming evidence for the whole
 diagnosis and is not optional; it needs `dgx:gpu0`, which is the box the
 denominator was measured on, and no other box is a valid denominator for it.
 
+Every bare `file:line` anchor below is read at this row's **base, `6b48edb2c`**,
+which is `origin/main` at the claim. The change itself moves some of them —
+`ltx2_device.cpp:421` most obviously — and a reader who wants the line rather
+than the symbol should check out that SHA. Anchors written `file::Symbol`
+survive the move and are what `scripts/check-symbol-anchors.py` gates.
+
 ## 0. The one-sentence finding
 
 `src/vllm/model_executor/models/ltx2_device.cpp:421` calls `vt::Attention` for
