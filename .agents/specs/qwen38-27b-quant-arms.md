@@ -9,8 +9,10 @@ arm of the same model and explicitly excluded these two;
 [#979](https://github.com/mudler/vllm.cpp/issues/979) established which oracle
 runs which arm; [#857](https://github.com/mudler/vllm.cpp/issues/857) owes the
 llama.cpp gateability measurement this spec's GGUF gate depends on;
-[#1185](https://github.com/mudler/vllm.cpp/issues/1185) owes the vLLM
-model-run-in-a-lease that this spec's NVFP4 gate depends on;
+[#1632](https://github.com/mudler/vllm.cpp/issues/1632) owes the
+denominator-configuration run in a lease that this spec's NVFP4 gate depends on
+(it supersedes [#1185](https://github.com/mudler/vllm.cpp/issues/1185), closed
+2026-08-18 as local-only);
 [#809](https://github.com/mudler/vllm.cpp/issues/809) / PR
 [#876](https://github.com/mudler/vllm.cpp/pull/876) owns the GGUF architecture
 dispatch this spec builds on and which is still OPEN.
@@ -565,7 +567,7 @@ request; none of them is this change, which is the spec and the records.
 | W3 | Q4_K_M text / image / video token gates vs pinned llama.cpp, then the speed axes | `QUANT-QWEN38-27B-GGUF-ARM` | yes | W1, W2, #857 |
 | W4 | NVFP4 re-pin, 1968-name accounting, `config_groups` resolution, per-channel FP8 scale, dynamic-activation FP8, `k_scale`/`v_scale` | `QUANT-QWEN38-27B-NVFP4-ARM` | no | — |
 | W5 | The LOAD side of the SECOND NVFP4 artifact, `r0b0tlab/Qwen3.8-27B-NVFP4-MTP-sm121`: 2001-name per-scheme accounting, and the ModelOpt `MIXED_PRECISION` config read that cross-checks the loader's name probe | `QUANT-QWEN38-27B-NVFP4-ARM` | no | W4 |
-| W6 | NVFP4 text / image / video / MTP token gates vs pinned vLLM, then the speed axes | `QUANT-QWEN38-27B-NVFP4-ARM` | yes | W4, W5, #1185 |
+| W6 | NVFP4 text / image / video / MTP token gates vs pinned vLLM, then the speed axes | `QUANT-QWEN38-27B-NVFP4-ARM` | yes | W4, W5, #1632 |
 
 W1, W2, W4 and W5 are the majority of the work and need no GPU, no lease and no
 oracle. W3 and W6 are the only units that do.
@@ -593,7 +595,7 @@ nothing outside this file names either number.
 - **`QUANT-QWEN38-27B-GGUF-ARM` and `QUANT-QWEN38-27B-NVFP4-ARM` are separate
   rows** because they share nothing but a model name. Different file format,
   different loader translation unit, different oracle (llama.cpp vs vLLM),
-  different blockers (#857 vs #1185), different hardware needs, and the evidence
+  different blockers (#857 vs #1632), different hardware needs, and the evidence
   above shows they even ship different tokenizers. Merging them would make one
   external blocker hold the other's work.
 - **The tokenizer / chat-template / reasoning-parser / tool-parser gates are NOT a
@@ -787,10 +789,15 @@ clear:**
 
 - llama.cpp `b10451` records `gateable = no` (`.agents/oracles/llama-cpp.md`);
   #857 owes the measurement that would make the GGUF gate runnable.
-- The pinned vLLM builds, installs and imports inside an `rc` lease on `dgx:gpu0`
-  (#1185, measured 2026-08-18), but **running a model is untested**, and the last
-  oracle that reached that point consumed the host and rebooted the box. #1185
-  names this row among the five it still blocks.
+- The pinned vLLM builds, installs, imports AND generates tokens inside an `rc`
+  lease on `dgx:gpu0` (measured 2026-08-18 under #1185, which closed as
+  local-only), but it survived at `max_num_batched_tokens` 512 and
+  `max_model_len` 512 on a ~20 GiB model, where the recorded denominator for
+  this family is 8192 and 2048. `AGENTS.md` §Gates requires vLLM's PRODUCTION
+  configuration as the denominator, so a reduced-`mnbt` arm is a different
+  engine setup rather than a smaller measurement. #1632 owns the demonstration
+  that the recorded configuration survives, and the staging of this artifact's
+  ~20.4 GiB.
 
 Neither blocker stops the CPU-side work in the table above. Both stop the token
 gates, and until they clear those cells are `PENDING` on a named external
@@ -1482,7 +1489,7 @@ sha256.
   apply `k_scale`/`v_scale` to. Refused by name; owed by the same row and issue.
 - **The resident-bytes assertion per arm**, and every token gate. Both need a
   leased GPU and W6, and the NVFP4 gate additionally waits on
-  [#1185](https://github.com/mudler/vllm.cpp/issues/1185).
+  [#1632](https://github.com/mudler/vllm.cpp/issues/1632).
 - **`model_mtp.safetensors` has no locally-computed sha256.** Its header was
   re-read by range request and its bytes are NOT mirrored to the NAS, so the hash
   bullet under `## Owed` is paid for `model.safetensors` only.
@@ -1601,7 +1608,7 @@ the restored tree is green at 15 cases / 1649 assertions.
 ### What W5 did NOT deliver, and is owed
 
 - **Any token or byte measurement on this artifact.** W6, and blocked on
-  [#1185](https://github.com/mudler/vllm.cpp/issues/1185).
+  [#1632](https://github.com/mudler/vllm.cpp/issues/1632).
 - **A locally computed sha256, and mirrored bytes.** Named under `## Owed`.
 - **Routing by the declared algorithm.** Named under `## Owed`.
 - **The FP8 KV arm.** `hf_quant_config.json` asks for `kv_cache_quant_algo:
@@ -1620,9 +1627,12 @@ the issue and each of these is owned by another row.
 - [#857](https://github.com/mudler/vllm.cpp/issues/857) — the llama.cpp
   gateability measurement at pin `b10451`. The Q4_K_M token gate cannot run until
   it lands, and this row does not clear it.
-- [#1185](https://github.com/mudler/vllm.cpp/issues/1185) — a demonstrated vLLM
-  **model run** inside an `rc` lease. Build, install and import are measured;
-  running a model is not. The NVFP4 token gate cannot run until it does.
+- [#1632](https://github.com/mudler/vllm.cpp/issues/1632) — a demonstrated vLLM
+  model run inside an `rc` lease **at the recorded denominator configuration**,
+  and this artifact's ~20.4 GiB staged where a lease can read them. A model run
+  itself is measured (2026-08-18, under the now-closed #1185) at
+  `max_num_batched_tokens` 512 against a denominator of 8192. The NVFP4 token
+  gate cannot run until both clear.
 - [#1003](https://github.com/mudler/vllm.cpp/issues/1003) — re-anchoring the
   llama.cpp `file:line` citations from the superseded local fork `237ad9b96` to
   `b10451`. This spec deliberately does not copy those anchors forward.
@@ -1804,8 +1814,9 @@ the token gates, and both are blocked on a named external authority rather than
 on work this spec can schedule: W3 on
 [#857](https://github.com/mudler/vllm.cpp/issues/857) (llama.cpp records
 `gateable = no` at pin `b10451`) and W6 on
-[#1185](https://github.com/mudler/vllm.cpp/issues/1185) (the pinned vLLM builds
-and imports inside an `rc` lease, and running a model there is untested). Until
+[#1632](https://github.com/mudler/vllm.cpp/issues/1632) (the pinned vLLM runs a
+model inside an `rc` lease, and the recorded DENOMINATOR configuration is what
+has not been shown to survive there). Until
 one of those clears, the next action on this spec is neither: it is the FP8
 tower of the unsloth artifact, which W4 refuses by name and lists under
 [What did NOT land, and is owed](#what-did-not-land-and-is-owed-2).

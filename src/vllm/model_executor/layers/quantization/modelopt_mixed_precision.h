@@ -836,7 +836,10 @@ inline const std::vector<std::string>& OperandSuffixes() {
 // True when `name` ends in a known operand suffix; `module` and `suffix` are
 // then its two halves (`suffix` without the leading dot). False means this
 // resolver has never seen the family, and the caller must NOT read that as
-// "unquantized".
+// "unquantized". `Refusal` is the one caller, and it REFUSES such a name rather
+// than skipping it, because a name that belongs to no module is cross-checked
+// in neither direction — which is the silent state this whole file exists to
+// close.
 inline bool SplitOperand(const std::string& name, std::string* module,
                          std::string* suffix) {
   for (const std::string& s : OperandSuffixes()) {
@@ -854,7 +857,10 @@ inline bool SplitOperand(const std::string& name, std::string* module,
 // `kv_cache_quant_algo` is a SIBLING of `quantized_layers`
 // (modelopt.py:294, :306-314) and this tree has no quantized KV cache to
 // apply it to; see the refusal note below for why that is named as owed
-// rather than refused here.
+// rather than refused here. `ModuleOperands::Add` is the caller: a KV scale is
+// RECORDED against its module and then deliberately kept out of
+// `AnyQuantOperand`, so the decision is one branch a test can mutate rather
+// than a skip that changes no verdict.
 inline bool IsKvCacheScaleSuffix(const std::string& suffix) {
   return suffix == "k_scale" || suffix == "v_scale";
 }
@@ -872,6 +878,9 @@ struct ModuleOperands {
   bool weight_global_scale = false;
   bool input_scale = false;
   bool input_global_scale = false;
+  // Recorded, and deliberately NOT part of `AnyQuantOperand` — see below.
+  bool k_scale = false;
+  bool v_scale = false;
 
   void Add(const std::string& suffix) {
     if (suffix == "weight") weight = true;
@@ -881,6 +890,9 @@ struct ModuleOperands {
     else if (suffix == "weight_global_scale") weight_global_scale = true;
     else if (suffix == "input_scale") input_scale = true;
     else if (suffix == "input_global_scale") input_global_scale = true;
+    else if (IsKvCacheScaleSuffix(suffix)) {
+      (suffix == "k_scale" ? k_scale : v_scale) = true;
+    }
   }
 
   // A Linear ships one of these. A module carrying only `A_log`/`dt_bias`/
@@ -888,6 +900,18 @@ struct ModuleOperands {
   // not cross-checked — see the note on `Refusal` for why that matters.
   bool WeightBearing() const { return weight || weight_packed; }
 
+  // An operand whose presence means the WEIGHTS of this module are quantized.
+  //
+  // `k_scale` and `v_scale` are recorded above and are absent from this
+  // disjunction ON PURPOSE, because they quantize the KV CACHE and not the
+  // module's weights: `kv_cache_quant_algo` is a SIBLING of `quantized_layers`
+  // (modelopt.py:294, :306-314). A bf16 attention tower that ships a KV scale
+  // is therefore a checkpoint that `quantized_layers` correctly does not name,
+  // and refusing it for "shipping a quantized spelling" would refuse
+  // `nvidia/Qwen3.6-27B-NVFP4`'s successor the moment one ships the scales its
+  // `kv_cache_scheme` already declares. This is the executable half of the
+  // "THE KV CACHE IS NOT REFUSED HERE" decision argued on `Refusal`; adding
+  // either flag to this disjunction turns that case red.
   bool AnyQuantOperand() const {
     return weight_packed || weight_scale || weight_scale_2 ||
            weight_global_scale || input_scale || input_global_scale;
@@ -919,6 +943,8 @@ struct ModuleOperands {
     if (weight_global_scale) add("weight_global_scale");
     if (input_scale) add("input_scale");
     if (input_global_scale) add("input_global_scale");
+    if (k_scale) add("k_scale");
+    if (v_scale) add("v_scale");
     return out.empty() ? std::string("<no operand>") : out;
   }
 };
@@ -978,15 +1004,34 @@ inline std::string JoinModules(const std::set<std::string>& modules,
 // in `hf_quant_config.json`, a file no production path in this tree reads at
 // all. A refusal here would refuse a checkpoint that loads today. The FP8 KV
 // arm is owned by `KV-FP8` (issue #1593) and is listed under `## Owed` in
-// `.agents/specs/qwen38-27b-quant-arms.md`.
+// `.agents/specs/qwen38-27b-quant-arms.md`. `ModuleOperands` RECORDS a KV scale
+// and leaves it out of `AnyQuantOperand`, which is where that decision is
+// executable; this function no longer skips the suffix, because a skip that
+// changes no verdict is a claim no test can read.
+//
+// A TENSOR NAME WHOSE FAMILY THE SPLITTER HAS NEVER SEEN IS REFUSED, not
+// skipped. `SplitOperand` documents that `false` means "this resolver has never
+// seen the family, and the caller must NOT read that as unquantized", and a
+// `continue` here read it as exactly that: the name belonged to no module, so
+// NOTHING cross-checked it in either direction and the checkpoint loaded
+// silently. `.weight_scale_inv` is the case that makes this concrete — it is
+// the block-wise FP8 spelling `IsFp8BlockProjection` reads two rungs above the
+// call site in `qwen3_5_dense_weights.cpp`, so a ModelOpt checkpoint could ship
+// it, take the block-FP8 arm, and never be cross-checked at all. Both artifacts
+// this resolver is verified against classify EVERY shipped name (2001 of 2001
+// and 2194 of 2194), so this refusal cannot fire on either, and the suffix list
+// above carries the compressed-tensors spellings for the same reason.
 inline std::string Refusal(const MixedPrecisionConfig& c,
                            const std::vector<std::string>& tensor_names) {
   std::map<std::string, ModuleOperands> shipped;
+  std::set<std::string> unclassified;
   for (const std::string& name : tensor_names) {
     std::string module;
     std::string suffix;
-    if (!SplitOperand(name, &module, &suffix)) continue;
-    if (IsKvCacheScaleSuffix(suffix)) continue;
+    if (!SplitOperand(name, &module, &suffix)) {
+      unclassified.insert(name);
+      continue;
+    }
     shipped[module].Add(suffix);
   }
 
@@ -1040,12 +1085,19 @@ inline std::string Refusal(const MixedPrecisionConfig& c,
     }
     if (!reason.empty()) refused[{algo, reason}].insert(module);
   }
-  if (refused.empty()) return std::string();
+  if (refused.empty() && unclassified.empty()) return std::string();
 
   std::string out =
       "modelopt MIXED_PRECISION quantization_config declares " +
       std::to_string(c.num_quantized_layers()) +
       " quantized layer(s), and the shipped tensors do not agree with it.";
+  if (!unclassified.empty()) {
+    out += "\n  " + std::to_string(unclassified.size()) +
+           " shipped tensor name(s) end in an operand family this resolver has "
+           "never seen, so no module owns them and NOTHING cross-checked them "
+           "in either direction.";
+    out += "\n  unclassified: " + detail::JoinModules(unclassified, 8);
+  }
   for (const auto& kv : refused) {
     out += "\n  " + std::to_string(kv.second.size()) +
            " module(s) resolve to quant_algo \"" + kv.first.first + "\": " +

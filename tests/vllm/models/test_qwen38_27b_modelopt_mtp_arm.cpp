@@ -37,11 +37,15 @@
 //       one bucket, nothing is unaccounted, and the buckets sum to 2001. A
 //       tensor family nobody classified is the shape that goes missing
 //       silently.
-//   (2) THE PER-SCHEME COMPOSITION is the checkpoint's own: 208 FP8 modules /
-//       624 tensors, 193 W4A16_NVFP4 modules / 579 tensors, 584 unlisted
-//       modules / 798 tensors. Reading this checkpoint as uniformly NVFP4 — its
+//   (2) THE PER-SCHEME COMPOSITION is the checkpoint's own: 256 FP8 modules /
+//       720 tensors, 193 W4A16_NVFP4 modules / 579 tensors, 536 unlisted
+//       modules / 702 tensors. Reading this checkpoint as uniformly NVFP4 — its
 //       repo name says NVFP4 — is numerically plausible and token-invisible
-//       while moving the wrong bytes.
+//       while moving the wrong bytes. The FP8 side is 256 and not the 208 the
+//       map names, because the 48 `...layers.<i>.linear_attn` CONTAINERS
+//       resolve to their first quantized child through upstream's strategy-3
+//       prefix scan and carry two tensors each; the case below asserts the 208
+//       and the 48 SEPARATELY, so no count here is right for the wrong reason.
 //   (3) THE PRODUCTION LOADER READS THE CONFIG. `LoadQwen3_5Dense` routes each
 //       projection by probing tensor NAMES. That probe cannot be wrong about
 //       the bytes and it can be wrong about the CHECKPOINT, so the declared
@@ -62,6 +66,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <map>
 #include <set>
 #include <string>
@@ -166,24 +171,27 @@ void Append(std::vector<ManifestTensor>* out, const T* rows, std::size_t n,
   }
 }
 
+// The row count is DERIVED from the array, never read from the `...TensorCount`
+// literal beside it. Both live in the same generated `.inc`, and the literal is
+// hand-maintained: iterating a count LARGER than the array is an out-of-bounds
+// read, which is a SIGSEGV inside case 1 that aborts the binary with the other
+// cases never run — a crash reads as neither a pass nor a fail. Deriving makes
+// that drift an ordinary red instead, and case 1 asserts the two agree so the
+// literal is still measured rather than merely bypassed.
 const std::vector<ManifestTensor>& Manifest() {
   static const std::vector<ManifestTensor>* all = [] {
     auto* v = new std::vector<ManifestTensor>();
     Append(v, vllm_test::kQwen38_27bModeloptMtpS1Tensors,
-           static_cast<std::size_t>(
-               vllm_test::kQwen38_27bModeloptMtpS1TensorCount),
+           std::size(vllm_test::kQwen38_27bModeloptMtpS1Tensors),
            kShards[0].file);
     Append(v, vllm_test::kQwen38_27bModeloptMtpS2Tensors,
-           static_cast<std::size_t>(
-               vllm_test::kQwen38_27bModeloptMtpS2TensorCount),
+           std::size(vllm_test::kQwen38_27bModeloptMtpS2Tensors),
            kShards[1].file);
     Append(v, vllm_test::kQwen38_27bModeloptMtpS3Tensors,
-           static_cast<std::size_t>(
-               vllm_test::kQwen38_27bModeloptMtpS3TensorCount),
+           std::size(vllm_test::kQwen38_27bModeloptMtpS3Tensors),
            kShards[2].file);
     Append(v, vllm_test::kQwen38_27bModeloptMtpS4Tensors,
-           static_cast<std::size_t>(
-               vllm_test::kQwen38_27bModeloptMtpS4TensorCount),
+           std::size(vllm_test::kQwen38_27bModeloptMtpS4Tensors),
            kShards[3].file);
     return v;
   }();
@@ -219,6 +227,18 @@ TEST_CASE("Qwen3.8-27B-NVFP4-MTP: the four committed manifests account for all 2
   CHECK(vllm_test::kQwen38_27bModeloptMtpS2TensorCount == kShards[1].tensors);
   CHECK(vllm_test::kQwen38_27bModeloptMtpS3TensorCount == kShards[2].tensors);
   CHECK(vllm_test::kQwen38_27bModeloptMtpS4TensorCount == kShards[3].tensors);
+  // ... and the hand-maintained literal agrees with the array it is written
+  // beside. `Manifest()` derives the row count from the array, so a literal
+  // that drifted upward no longer reads out of bounds; this is what still
+  // MEASURES the literal instead of routing around it.
+  CHECK(vllm_test::kQwen38_27bModeloptMtpS1TensorCount ==
+        static_cast<int64_t>(std::size(vllm_test::kQwen38_27bModeloptMtpS1Tensors)));
+  CHECK(vllm_test::kQwen38_27bModeloptMtpS2TensorCount ==
+        static_cast<int64_t>(std::size(vllm_test::kQwen38_27bModeloptMtpS2Tensors)));
+  CHECK(vllm_test::kQwen38_27bModeloptMtpS3TensorCount ==
+        static_cast<int64_t>(std::size(vllm_test::kQwen38_27bModeloptMtpS3Tensors)));
+  CHECK(vllm_test::kQwen38_27bModeloptMtpS4TensorCount ==
+        static_cast<int64_t>(std::size(vllm_test::kQwen38_27bModeloptMtpS4Tensors)));
   REQUIRE(Manifest().size() == static_cast<std::size_t>(kIndexNameCount));
 
   // Every name distinct, across ALL FOUR shards. A weight map cannot name one
@@ -683,9 +703,16 @@ void AppendStaticFp8(std::vector<Spec>& out, const std::string& proj, int64_t n,
 
 enum class AttnArm { kStaticFp8, kBf16, kCtNvfp4 };
 
+// The MLP half varies for the same reason the attention half does. The config
+// declares all three MLP projections `W4A16_NVFP4`, so `kStaticFp8` and `kBf16`
+// are the two ways a checkpoint can ship something else under that declaration
+// — and that declaration covers 193 of this artifact's 401 modules, 48% of it.
+enum class MlpArm { kModeloptNvfp4, kStaticFp8, kBf16 };
+
 // A one-layer full-attention backbone in this artifact's spelling: a static-FP8
 // attention tower and a W4A16 NVFP4 MLP.
-std::vector<Spec> OneLayerSpecs(AttnArm attn) {
+std::vector<Spec> OneLayerSpecs(AttnArm attn,
+                                MlpArm mlp_arm = MlpArm::kModeloptNvfp4) {
   const std::string p = kPrefix;
   const std::string l = p + "layers.0.";
   const std::string sa = l + "self_attn.";
@@ -718,9 +745,25 @@ std::vector<Spec> OneLayerSpecs(AttnArm attn) {
         break;
     }
   }
-  AppendModeloptNvfp4(s, mlp + "gate_proj", kFfn, kH);
-  AppendModeloptNvfp4(s, mlp + "up_proj", kFfn, kH);
-  AppendModeloptNvfp4(s, mlp + "down_proj", kH, kFfn);
+  const std::pair<const char*, std::pair<int64_t, int64_t>> mlp_projs[] = {
+      {"gate_proj", {kFfn, kH}},
+      {"up_proj", {kFfn, kH}},
+      {"down_proj", {kH, kFfn}},
+  };
+  for (const auto& pr : mlp_projs) {
+    const std::string name = mlp + pr.first;
+    switch (mlp_arm) {
+      case MlpArm::kModeloptNvfp4:
+        AppendModeloptNvfp4(s, name, pr.second.first, pr.second.second);
+        break;
+      case MlpArm::kStaticFp8:
+        AppendStaticFp8(s, name, pr.second.first, pr.second.second);
+        break;
+      case MlpArm::kBf16:
+        s.push_back({name + ".weight", {pr.second.first, pr.second.second}});
+        break;
+    }
+  }
   return s;
 }
 
@@ -857,6 +900,56 @@ TEST_CASE("Qwen3.8-27B-NVFP4-MTP loader: a module declared FP8 that ships plain 
   CHECK_FALSE(Names(message, "tensor not found"));
 }
 
+// The NVFP4 direction, and the one that carries 193 of this artifact's 401
+// declared modules — 48% of it, including `lm_head`. Its refusal is ONE branch
+// in `Refusal`, and until this case existed that branch could be deleted with
+// the whole file still green: every other case here exercises the FP8, the
+// unquantized, the MXFP8 or the unimplemented-algo arm, and the sibling-shape
+// case pins only the direction in which the NVFP4 branch must NOT fire.
+// ONE CASE PER SHAPE, not one case with two `SUBCASE`s. A `REQUIRE` throws and
+// aborts the whole TEST_CASE, so a first subcase that reds takes every later
+// subcase in the same case with it and the report shows one failure where there
+// were two — which is the "a case that never ran reads as a pass" shape.
+TEST_CASE("Qwen3.8-27B-NVFP4-MTP loader: a module declared W4A16_NVFP4 that ships the static FP8 spelling is refused") {
+  // The config declares the whole MLP `W4A16_NVFP4`; the tensors spell static
+  // FP8. `IsNvfp4Projection` sees no `weight_scale_2` and no `weight_packed`,
+  // so the name probe falls to the `F8_E4M3` dtype arm and loads the MLP at
+  // eight bits where the producer wrote four — a load that succeeds, and whose
+  // tokens are plausible.
+  const std::string message =
+      LoadFailure(OneLayerSpecs(AttnArm::kStaticFp8, MlpArm::kStaticFp8),
+                  OneLayerConfig(OneLayerQuantConfig()));
+  INFO("refusal was: " << message);
+  REQUIRE_FALSE(message.empty());
+  CHECK(Names(message, "modelopt MIXED_PRECISION"));
+  CHECK(Names(message, "mlp.gate_proj"));
+  CHECK(Names(message, "W4A16_NVFP4"));
+  // The message names the spelling this build DOES read, both ways of spelling
+  // it, and the one the checkpoint actually ships.
+  CHECK(Names(message, "weight_scale_2"));
+  CHECK(Names(message, "weight_global_scale"));
+  CHECK(Names(message, "they ship weight + weight_scale + input_scale"));
+  // It is a DISAGREEMENT, not a missing tensor: the checkpoint is complete.
+  CHECK_FALSE(Names(message, "tensor not found"));
+  // And the attention tower still agrees, so only the MLP is named.
+  CHECK_FALSE(Names(message, "self_attn.q_proj"));
+}
+
+TEST_CASE("Qwen3.8-27B-NVFP4-MTP loader: a module declared W4A16_NVFP4 that ships plain bf16 is refused") {
+  // The silent-dequant direction on the NVFP4 half: 193 modules read at sixteen
+  // bits because nothing named the four.
+  const std::string message =
+      LoadFailure(OneLayerSpecs(AttnArm::kStaticFp8, MlpArm::kBf16),
+                  OneLayerConfig(OneLayerQuantConfig()));
+  INFO("refusal was: " << message);
+  REQUIRE_FALSE(message.empty());
+  CHECK(Names(message, "modelopt MIXED_PRECISION"));
+  CHECK(Names(message, "mlp.down_proj"));
+  CHECK(Names(message, "W4A16_NVFP4"));
+  CHECK(Names(message, "they ship weight."));
+  CHECK_FALSE(Names(message, "tensor not found"));
+}
+
 TEST_CASE("Qwen3.8-27B-NVFP4-MTP loader: a module the config does NOT quantize that ships scales is refused") {
   // The other direction, and the one the ModelOpt resolver exists for: reading
   // a checkpoint as uniformly quantized because its repo name says NVFP4.
@@ -947,9 +1040,6 @@ TEST_CASE("modelopt MIXED_PRECISION: the sibling gate model's shape is not refus
     names.push_back(m + ".weight");
     names.push_back(m + ".weight_scale");
     names.push_back(m + ".input_scale");
-    // (3) the KV scales this artifact does not ship, and the sibling does not
-    //     either — but the SUFFIXES must stay out of the cross-check whatever
-    //     a checkpoint does with them.
   }
   for (const char* proj : {"gate_proj", "up_proj", "down_proj"}) {
     const std::string m = l + "mlp." + proj;
@@ -965,6 +1055,10 @@ TEST_CASE("modelopt MIXED_PRECISION: the sibling gate model's shape is not refus
   names.push_back(l + "input_layernorm.weight");
   names.push_back(l + "linear_attn.A_log");
   names.push_back(l + "linear_attn.dt_bias");
+  // The KV scales neither artifact ships today, on the module a ModelOpt export
+  // attaches them to. The case below is where a KV scale on a WEIGHT-BEARING
+  // module is asserted; here they are only carried so this shape stays the
+  // sibling's, and so a resolver that refused the suffix outright would red.
   names.push_back(l + "self_attn.k_scale");
   names.push_back(l + "self_attn.v_scale");
 
@@ -979,6 +1073,123 @@ TEST_CASE("modelopt MIXED_PRECISION: the sibling gate model's shape is not refus
   // And the wildcard exclusion really does exclude, so (1) was exercised.
   CHECK(parsed.Resolve("mtp.fc").how == mo::Resolution::kExcluded);
   CHECK_FALSE(parsed.Resolve(l + "mlp.gate_proj").how == mo::Resolution::kExcluded);
+}
+
+// ── a family the splitter has never seen is REFUSED, not skipped ────────────
+//
+// `SplitOperand` documents that `false` means "this resolver has never seen the
+// family, and the caller must NOT read that as unquantized". A `continue` in
+// `Refusal` read it as exactly that: the name belonged to no module, so nothing
+// cross-checked it in either direction and the checkpoint loaded silently —
+// which is the state this whole file exists to close, arriving through the one
+// door nobody watched.
+// One case per shape, for the reason argued above the NVFP4 pair: a `REQUIRE`
+// aborts its whole TEST_CASE, so a subcase that reds hides the ones after it.
+TEST_CASE("modelopt MIXED_PRECISION: an AWQ/GPTQ triple no probe reads is refused, not skipped") {
+  // `qweight` / `qzeros` / `scales` is the AWQ/GPTQ triple this tree already
+  // names elsewhere (`minimax_music3_quant.cpp:106`), and no probe in this
+  // loader looks for any of the three. Before this arm the checkpoint LOADED:
+  // its declared-FP8 tower took the FP8 path, and three tensors carrying a
+  // different quantization of the same projection went unread and unmentioned.
+  const std::string l = std::string(kPrefix) + "layers.0.";
+  std::vector<Spec> specs = OneLayerSpecs(AttnArm::kStaticFp8);
+  const std::string m = l + "self_attn.q_proj";
+  specs.push_back({m + ".qweight", {kQ, kH / 8}, "F32"});
+  specs.push_back({m + ".qzeros", {kQ / 8, kH / 8}, "F32"});
+  specs.push_back({m + ".scales", {kQ, 1}});
+  const std::string message =
+      LoadFailure(specs, OneLayerConfig(OneLayerQuantConfig()));
+  INFO("refusal was: " << message);
+  REQUIRE_FALSE(message.empty());
+  CHECK(Names(message, "modelopt MIXED_PRECISION"));
+  CHECK(Names(message, "qweight"));
+  CHECK(Names(message, "qzeros"));
+  CHECK(Names(message, "scales"));
+  CHECK(Names(message, "never seen"));
+  CHECK(Names(message, "3 shipped tensor name(s)"));
+}
+
+TEST_CASE("modelopt MIXED_PRECISION: a block-wise FP8 scale on a module nothing names is refused") {
+  // `.weight_scale_inv` is the block-wise FP8 spelling, and the honest note is
+  // that in THIS loader it does not reach the arm above: the block-FP8 guard
+  // two rungs earlier in `LoadQwen3_5Dense` refuses it first when the config
+  // declares no `weight_block_size`. That guard belongs to one loader and this
+  // resolver is a shared header, so the family is still one it has never seen,
+  // and a module that ships only it is cross-checked in NEITHER direction —
+  // `weight` alone reads as "declared unquantized, ships nothing quantized",
+  // which is the silent answer.
+  const std::string l = std::string(kPrefix) + "layers.0.";
+  const nlohmann::json q = OneLayerQuantConfig();
+  std::vector<std::string> names;
+  const std::string m = l + "linear_attn.out_proj";
+  names.push_back(m + ".weight");
+  names.push_back(m + ".weight_scale_inv");
+  const std::string refusal = mo::RefusalForQuantizationConfig(q, names);
+  INFO("refusal was: " << refusal);
+  REQUIRE_FALSE(refusal.empty());
+  CHECK(Names(refusal, "weight_scale_inv"));
+  CHECK(Names(refusal, "1 shipped tensor name(s)"));
+  CHECK(Names(refusal, "never seen"));
+}
+
+TEST_CASE("modelopt MIXED_PRECISION: the pinned artifact classifies every name it ships") {
+  // The negative control, and the reason the refusal above is safe to add: it
+  // cannot fire on the checkpoint this file is written against. The sibling
+  // `nvidia/Qwen3.6-27B-NVFP4` is the other one that reaches this resolver, and
+  // its 2194 names classify too — read from its own index on 2026-08-21 and
+  // recorded above `OperandSuffixes`, since its manifest is not committed here.
+  std::vector<std::string> names;
+  for (const ManifestTensor& t : Manifest()) names.push_back(t.name);
+  REQUIRE(names.size() == static_cast<std::size_t>(kIndexNameCount));
+  CHECK(mo::RefusalForQuantizationConfig(ReleasedQuant(), names).empty());
+}
+
+// ── a KV-cache scale is recorded, and it NEVER decides a refusal ────────────
+//
+// `kv_cache_quant_algo` is a SIBLING of `quantized_layers` (modelopt.py:294,
+// :306-314), so a `k_scale` says nothing about how a module's WEIGHTS are
+// stored. `Refusal` used to state that by skipping the suffix before any module
+// was built, which changed no verdict and so asserted nothing — deleting the
+// skip left every case green. The statement now lives in one branch:
+// `ModuleOperands::Add` RECORDS the scale and `AnyQuantOperand` leaves it out.
+TEST_CASE("modelopt MIXED_PRECISION: a KV-cache scale on an UNLISTED weight-bearing module is not refused") {
+  // The direction `AnyQuantOperand` decides: a bf16 attention tower the config
+  // does not quantize, shipping the KV scales a `kv_cache_scheme` asks for.
+  // Counting `k_scale` as a quantized spelling would refuse it, and
+  // `nvidia/Qwen3.6-27B-NVFP4` already declares that scheme.
+  const std::string l = std::string(kPrefix) + "layers.0.";
+  nlohmann::json unlisted = OneLayerQuantConfig();
+  const std::string m = l + "self_attn.k_proj";
+  unlisted["quantized_layers"].erase(m);
+  std::vector<std::string> names;
+  names.push_back(m + ".weight");
+  names.push_back(m + ".k_scale");
+  names.push_back(m + ".v_scale");
+  const std::string refusal = mo::RefusalForQuantizationConfig(unlisted, names);
+  INFO("refusal was: " << refusal);
+  CHECK(refusal.empty());
+  // ... and the module really is unquantized, so the silence is the
+  // unquantized-direction branch staying quiet rather than a module the
+  // resolver never reached.
+  CHECK_FALSE(mo::MixedPrecisionConfig::Parse(unlisted).Resolve(m).Quantized());
+}
+
+TEST_CASE("modelopt MIXED_PRECISION: a KV-cache scale is RECORDED, and the refusal names it") {
+  // The other half: the scale is recorded rather than dropped, so it appears in
+  // the spelling the refusal prints. An `Add` that ignored the suffix would
+  // report "they ship weight" and hide what the file actually carries.
+  const std::string l = std::string(kPrefix) + "layers.0.";
+  const nlohmann::json q = OneLayerQuantConfig();
+  std::vector<std::string> names;
+  const std::string m = l + "self_attn.q_proj";
+  names.push_back(m + ".weight");
+  names.push_back(m + ".k_scale");
+  const std::string refusal = mo::RefusalForQuantizationConfig(q, names);
+  INFO("refusal was: " << refusal);
+  REQUIRE_FALSE(refusal.empty());
+  CHECK(Names(refusal, "self_attn.q_proj"));
+  CHECK(Names(refusal, "FP8"));
+  CHECK(Names(refusal, "they ship weight + k_scale"));
 }
 
 // ── a checkpoint that is NOT ModelOpt is untouched by any of this ───────────
