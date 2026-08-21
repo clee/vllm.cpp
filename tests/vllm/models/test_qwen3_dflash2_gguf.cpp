@@ -59,18 +59,13 @@
 #include <fstream>
 #include <map>
 #include <string>
-#include <vector>
-
-// `::getpid()` at the `ScratchSafetensors` temporary path below (#1565). Older
-// libstdc++ headers pull this in transitively and the newest GCC does not, which
-// left `build-newest-gcc` red at the BUILD step on `main` and therefore on every
-// pull request based on it. Unguarded, which is what the sibling
-// `tests/vllm/multimodal/test_ltx2_video.cpp` does for the same call.
 #include <unistd.h>
+#include <vector>
 
 #include <nlohmann/json.hpp>
 
 #include "../gguf_builder.h"
+#include "support/process_id.h"
 
 #include "vllm/model_executor/model_loader/gguf_reader.h"
 #include "vllm/model_executor/model_loader/safetensors_reader.h"
@@ -551,7 +546,7 @@ class ScratchSafetensors {
     static int counter = 0;
     dir_ = fs::temp_directory_path() /
            ("vllmcpp_df2gguf_st_" + std::to_string(counter++) + "_" +
-            std::to_string(static_cast<long long>(::getpid())));
+            std::to_string(static_cast<long long>(vllm_test::ProcessId())));
     fs::create_directories(dir_);
     json header = json::object();
     std::string payload;
