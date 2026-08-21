@@ -192,6 +192,34 @@ different computation. Beyond it, the token gate for our arm against the pinned
 vLLM oracle is owed by `QUANT-QWEN38-27B-NVFP4-ARM` W5 and is not re-specified
 here.
 
+### D6 — the SGLang arm runs at THEIR pinned digest, and that is not a pin advance
+
+The competitors' SGLang recipe pins
+`lmsysorg/sglang@sha256:3c0abdf41ef22de9d7a859dc16ed71eae69452e36c91f071a25e60c85a6d1fc6`
+plus a DFlash2 overlay built from their `docker/Dockerfile.dflash2`. This
+project's SGLang oracle is pinned elsewhere: v0.5.15 `f63458b5`, image
+`@sha256:d0a667e` ([sglang.md](../oracles/sglang.md)).
+
+Measuring "each engine at its best" on their subject means running THEIR digest,
+because that is the artifact their published numbers describe and the only one
+carrying DFlash2 at all. Their digest is a real pin — a content-addressed image
+is exactly what `AGENTS.md` asks an oracle record to carry — so this is not the
+unpinned-upstream hazard.
+
+**It is still not our pin, and nothing here advances one.** The SGLang oracle
+record is untouched, `gateable` does not move, and no number produced against
+their digest may be cited as an oracle result for any other row. It is a
+COMPETITOR measurement scoped to this campaign, recorded with its digest beside
+it. Advancing the project's SGLang pin stays separate deliberate work that
+[bench-qwen38-27b-four-way.md](bench-qwen38-27b-four-way.md) already lists as
+unowned.
+
+The same rule governs the vLLM competitor arm. Its image
+`ghcr.io/r0b0tlab/qwen38-27b-nvfp4-sm121:v0.27.2rc0-sm121` is vLLM `v0.27.2rc0`
+at `7f7a32c`, far ahead of our parity pin `555967922`. The pinned oracle stays
+the MIRROR for behaviour; their image is a COMPETITOR arm. Those are two
+different jobs and neither may stand in for the other.
+
 ## 5. The workloads
 
 | ID | Shape | Reports | Runs on |
