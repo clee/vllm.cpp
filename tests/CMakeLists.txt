@@ -2179,6 +2179,11 @@ vllm_cpp_add_test(test_ops_reshape_cache vt/test_ops_reshape_cache.cpp)
 # KV-FP8 W1: fp8 KV-cache store (ReshapeAndCacheFp8) + paged-attention read
 # dequant + the ParseCacheDType config wiring.
 vllm_cpp_add_test(test_ops_fp8_kv_cache vt/test_ops_fp8_kv_cache.cpp)
+# KV-FP8 W2 (#1593): the CUDA fp8-e4m3 KV store + the fp8 dequant on the CUDA
+# paged-attention read, gated for parity against the W1 CPU reference. The
+# device cases skip with a MESSAGE when no CUDA backend is present; the
+# provider-routing case runs on every leg.
+vllm_cpp_add_test(test_cuda_fp8_kv_cache vt/test_cuda_fp8_kv_cache.cpp)
 # MLA campaign W3: the compressed-latent cache write + the grouped-topk router.
 vllm_cpp_add_test(test_ops_mla_cache vt/test_ops_mla_cache.cpp)
 # MLA campaign W4: the two-stage split-KV MQA decode over the compressed latent.
@@ -2523,6 +2528,17 @@ vllm_cpp_add_test(test_qwen27_dflash_spec_decode
 target_compile_definitions(test_qwen27_dflash_spec_decode PRIVATE
   PARITY_GOLDENS_DIR="${CMAKE_SOURCE_DIR}/tests/parity/goldens")
 target_include_directories(test_qwen27_dflash_spec_decode PRIVATE
+  ${CMAKE_SOURCE_DIR}/tests/parity ${CMAKE_SOURCE_DIR}/src)
+
+# SPEC-DFLASH2 W6 — the DFlash2 e2e gate (#1314): G2 draft-token identity and
+# G3 SAME-TRAJECTORY acceptance against the beyond-pin oracle
+# (vllm-project/vllm#52816 @ 66e5414c6, TRITON_ATTN). dgx-only; loud SKIP
+# everywhere else, naming the two checkpoints and the golden it needs.
+vllm_cpp_add_test(test_qwen38_dflash2_spec_decode
+  parity/test_qwen38_dflash2_spec_decode.cpp)
+target_compile_definitions(test_qwen38_dflash2_spec_decode PRIVATE
+  PARITY_GOLDENS_DIR="${CMAKE_SOURCE_DIR}/tests/parity/goldens")
+target_include_directories(test_qwen38_dflash2_spec_decode PRIVATE
   ${CMAKE_SOURCE_DIR}/tests/parity ${CMAKE_SOURCE_DIR}/src)
 
 # SPEC-MTP M-mtp-2 — the 35B MoE-MTP k=1 speculative-decode three-way identity

@@ -52,7 +52,7 @@ are our reading of their documented behavior, not measurements.
 | Block-paged KV with refcount and LRU evict | ✅ | ✅ | ✅ | ◐ |
 | Hybrid KV groups (full attention + GDN/Mamba) | ◐ GDN gate activation resolved from the checkpoint's `output_gate_type` (silu/swish/sigmoid; anything else refused at load, #489) | ✅ | ◐ | ◐ |
 | Sliding-window and chunked-local attention | ◐ | ✅ | ✅ | ✅ |
-| fp8 KV cache | ◐ CPU only | ✅ | ✅ | ✅ |
+| fp8 KV cache | ◐ e4m3 store + read dequant on CPU and CUDA (#1593); nothing serves it yet: no runner block sizing and no `--kv-cache-dtype`. Metal/ROCm refused by name. CUDA gate UNRUN ([spec](../.agents/specs/fp8-kv-cache.md)) | ✅ | ✅ | ✅ |
 | KV offload to host memory | ✅ | ✅ | ✅ | ☐ |
 | External KV provider ABI (LMCache) | ☐ | ✅ | ◐ | ☐ |
 | KV events (block create / evict publish) | ◐ no transport | ✅ | ☐ | ☐ |
@@ -79,6 +79,7 @@ are our reading of their documented behavior, not measurements.
 | GPTQ | ◐ CPU dequant | ✅ | ✅ | ☐ |
 | MXFP4 compressed-tensors | ◐ W4A16 Marlin, mem 2.63x less. gate_up FUSION + decode-graph default-ON; #44 3/3, 32B 6/6. **`VT_MARLIN_DENSE` DEFAULT-ON** (`KERNEL-MARLIN-DENSE-EXEC`): dense marlin 48-CTA, byte-faithful, beats MoE (c8 0.969) | ✅ | ✅ | ☐ |
 | Compressed-tensors `mixed-precision` (`config_groups`, ordered regex `targets`) | ◐ scheme read from the config, never from a dtype probe; an arm with no loader is REFUSED BY NAME. On `unsloth/Qwen3.8-27B-NVFP4` the W4A4 group loads, the FP8 W8A8 group and the `kv_cache_scheme` are refused (#821) | ✅ | ✅ | ☐ |
+| ModelOpt `MIXED_PRECISION`: STATIC per-tensor FP8 + W4A16_NVFP4 | ☐ UNTRIED. `r0b0tlab/Qwen3.8-27B-NVFP4-MTP-sm121` carries 208 `input_scale`, `F32` scalar `weight_scale` and `"dynamic": false`, so the three `unsloth` blockers are absent (#1574) | ✅ | ✅ | ☐ |
 | fp8 weights, per-tensor scale | ✅ | ✅ | ✅ | ☐ |
 | Block-wise (fine-grained 128x128) FP8, the `weight_scale_inv` layout | ◐ RUNS on CPU (#1189 M4/M6): 10 projections as 7 GEMMs, `gate_up`+QKV merged. CUDA sm120: N,K %128==0 only; 7 shapes MATCH CPU ref on GB10, no token gate (#1437) ([spec](../.agents/specs/vt-matmul-fp8-block-cuda.md)) | ✅ | ✅ | ☐ |
 | Per-tensor FP8 W8A8 linear is a shared seam any model can bind | ✅ `models/dense_fp8_gemm.h` + `layers::Fp8W8A8LinearMethod` (#940), bound via `layers::MakeLinearMethod`. One definition, CUDA only ([spec](../.agents/specs/vt-fp8-shared-seam.md)) | ✅ `Fp8LinearMethod` | ✅ | ☐ |
@@ -191,7 +192,7 @@ in `ltx2_text_encoder.cpp` is the call that would have to change.
 | MTP speculator | Qwen3.6-27B, Qwen3.6-35B-A3B | token-identical to vLLM `mtp` at c1 | ~4% faster c1; +16% output tput (MoE) |
 | MTP speculation DEPTH (`num_speculative_tokens` > 1) | Qwen3.5/3.6 `mtp.*` heads | k=1..4 through the loader, greedy tokens unmoved, two witnesses per arm: the draft decode forwards the propose RAN, and whether the DELIVERED draft row varied with depth. `test_mtp_depth` 5/5, 63 assertions | Default stays k=1. NO speed claim at k>1. Drafts are proposed and verified, never ACCEPTED, and neither witness proves per-column provenance. Both await the owed DGX gate (#81) |
 | DFlash block-diffusion | Qwen3 (DFlash draft) | near-tie e2e 27/27 vs vLLM | 2.9x over spec-off, 1.003x vs vLLM DFlash-on |
-| DFlash2 block-diffusion (dynamic conv + candidate selector) | Qwen3 DFlash2 draft, safetensors or GGUF (bf16 / Q8_0 / Q4_K_M, whose four Q6_K tensors decode through the shared path) | DRAFTS from both containers: `test_dflash2_runner_reach` 3/3 (86), `test_qwen3_dflash2_gguf` 9/9 (4746; 4945 with the published artifacts present), `test_ops_dflash2_path_walk` 7/7 (49) | GREEDY only, no speed number yet, CUDA arms unverified here. A GGUF draft is dequantized to bf16 at load ([#1314](https://github.com/mudler/vllm.cpp/issues/1314)) |
+| DFlash2 block-diffusion (dynamic conv + candidate selector) | Qwen3 DFlash2 draft, safetensors or GGUF (bf16 / Q8_0 / Q4_K_M) | Gated against vLLM: 4/4 token-exact, 45/47 draft blocks identical, acceptance identical per prompt. All 7 DFlash2 suites green on `sm_121a`, zero CUDA skips | GREEDY only, no speed number. A GGUF draft is dequantized to bf16 at load ([#1314](https://github.com/mudler/vllm.cpp/issues/1314)) |
 | DeepSeek-V4 MTP | DeepSeek-V4-Flash (nextn head) | lossless 5/5; real-model weight-blocked | pending |
 
 ### Inventoried but blocked
