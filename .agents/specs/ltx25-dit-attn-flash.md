@@ -151,20 +151,61 @@ names it "the L2 parity arm" at `ltx2_device.cpp:1186-1188` — at head_dim 128.
 Swapping the call site without this repair would convert a slow-but-correct f32
 arm into a refusal.
 
-The repair mirrors the pattern this tree already established for the same
-problem in `cuda_paged_attn.cu:112-127`: query the ceiling rather than assume
-it, through the cached `vt::cuda::DynamicSmemFits` /
-`vt::cuda::GetDeviceCaps` seam (`src/vt/cuda/cuda_device_caps.h`). Where the
-tile fits the opt-in ceiling, opt in. Where it does not, **fall back to
-`AttentionDenseFastKernelCuda`**, which the flash kernel's own header
-(`cuda_ops.cu:3232-3234`) states is bit-identical to it by construction: same
-per-warp online-softmax recurrence, same lane grouping, same j-order, same f32
-accumulation, with K/V read from global rather than shared. The fallback is
-therefore numerically free and only gives up the tiling speedup.
+**The bound is a property of the DEVICE, and it is derived at runtime.** Against
+GB10's queried `cudaDevAttrMaxSharedMemoryPerBlockOptin` of 101,376 B
+(`cuda_device_caps.h:46`), with `kFlashBc = 64` and a tile of
+`2 * 64 * head_dim * sizeof(Tin)`:
 
-This is the same shape as the existing `AttentionDenseFa2` -> `AttentionDenseFlash`
-fallback (`cuda_ops.cu:3407`): the caller gets the best available kernel for its
-shape rather than a hard refusal.
+| | no opt-in (49,152 B) | with the opt-in, GB10 (101,376 B) |
+|---|---|---|
+| bf16 | head_dim <= 192 | head_dim <= 256 |
+| f32 | head_dim <= 96 | **head_dim <= 192** |
+
+Neither column is written into the code. Pinning 192/96 caps GB10 at two thirds
+of the head_dim it can serve, and pinning 256 assumes an opt-in ceiling GB10 does
+not have. `cuda_device_caps.h:46` already states the rule this row follows —
+*"other architectures differ and MUST be asked, not assumed"* — so the tile is
+asked about per device through the same cached seam
+(`vt::cuda::GetDeviceCaps` / `vt::cuda::DynamicSmemFits`).
+
+**And a tile that does not fit is REFUSED BY NAME.** The first version of this
+fix fell back to `AttentionDenseFastKernelCuda` on the argument that the flash
+kernel's own header (`cuda_ops.cu:3232-3234`) makes the two bit-identical by
+construction, so the fallback is numerically free. Both halves of that are true
+and it is still the wrong answer: **a silent degradation to the untiled rung is
+the defect this row exists to remove.** §3 is entirely about a caller sitting on
+a 500x slower kernel with nothing anywhere saying so, and a fallback with no
+notice reproduces it one layer down. Worse, it is undetectable by construction:
+because the two kernels agree bit-for-bit, no numeric gate anywhere can tell a
+fallback from a launch, which is exactly how this row's own `test_ops_attention`
+case reported 10/10 and 88,439 assertions on GB10 while flash never launched once
+at f32 head_dim 256 (§7.1).
+
+So the launcher calls `vt::cuda::SetDynamicSmemOptIn`, which **throws naming the
+device and the shortfall**. That function is not a new one and not a copy: it was
+`cuda_paged_attn.cu`'s file-local helper, and this row moves it to the shared seam
+(declared in `cuda_device_caps.h`, defined beside `DynamicSmemFits` in
+`cuda_arch_tactics.cu`) rather than writing the second copy AGENTS.md "Shared
+seams" forbids. `cuda_paged_attn.cu`'s six call sites are unchanged.
+
+Two consequences worth stating plainly:
+
+- **f32 head_dim 128 is repaired; f32 head_dim 256 is not, and cannot be on this
+  device.** 131,072 B is above GB10's 101,376 B whatever this code does. It is
+  now a refusal that names both numbers instead of a bare `invalid argument`.
+- **`AttentionDenseFa2` -> `AttentionDenseFlash` (`cuda_ops.cu`) is unaffected.**
+  That fallback only ever catches bf16 shapes at head_dim <= 256, which is
+  <= 65,536 B and inside the opt-in ceiling of every architecture that has one.
+
+**[#1578](https://github.com/mudler/vllm.cpp/pull/1578) must reconcile onto
+this.** That pull request is the opposite fix for the same defect: it narrows the
+ADVERTISED bound to bf16 192 / f32 96 and hard-`VT_CHECK`s above it. Those two
+numbers are the left column of the table above, so they are right for a device
+with no opt-in and wrong for every device that has one — on GB10 they refuse the
+f32 head_dim 128 shape LTX actually runs. The two changes touch the same lines of
+`src/vt/cuda/cuda_ops.cu` and `tests/vt/test_ops_attention.cpp` and conflict.
+Whichever lands second reconciles onto the runtime-queried bound; this row does
+not edit that branch.
 
 The bug is pre-existing and reaches every caller of `vt::AttentionDenseFlash` at
 f32 with head_dim >= 96, not only LTX. It is filed as part of
@@ -183,11 +224,11 @@ model, and itself a structural port of `AttentionDenseFlashKernel` — says:
 
 Same number, same arithmetic, same reason the existing gates cannot see it. That
 author chose to **halve the tile** until it fits (`ChooseTileCols`). This row
-chooses to **opt in** instead, and falls back only where the device's queried
-ceiling refuses: GB10 reports 101,376 B, so the full 64-column tile fits at f32
-head_dim 128 and the reuse is kept rather than halved. Where a device cannot, the
-fallback is `AttentionDenseFast`, which is bit-identical rather than merely
-narrower.
+chooses to **opt in** instead: GB10 reports 101,376 B, so the full 64-column tile
+fits at f32 head_dim 128 and the K/V reuse is kept rather than halved. Where a
+device's queried ceiling cannot take the tile, this row refuses and names both
+numbers; it does not narrow the tile and it does not quietly answer on another
+kernel.
 
 Two things follow that are worth stating. The first is that "every
 reduced-dimension gate passed" is why this row's new `test_ops_attention` case
@@ -249,9 +290,14 @@ Instrument: `vt::EnableOpProviderCallStats(true)` plus
 which counts dispatches through `GetOp`. This is a positive signal and it works
 on the **CPU backend**, so the proof does not need a GPU.
 
-Entry point: `vllm::Ltx2DitForwardDevice`, the production device forward that
-`src/vllm/multimodal/ltx2_video.cpp:4055-4059` calls. The test drives that
-function, not a hand-constructed `vt::Attention` call.
+Entry point: `vllm::Ltx2DitForwardDevice`, the production device forward called
+from the denoise loop at `src/vllm/multimodal/ltx2_video.cpp:4245-4249` (the call
+itself is on `:4246`). The test drives that function, not a hand-constructed
+`vt::Attention` call. The anchor is written at HEAD and not at this row's base:
+the review found `:4055-4059`, cited here and in the test, pointing at prose
+about the res_2s step counter at both revisions, and this is the citation the
+whole reachability argument rests on. `file::Symbol` form is what survives a
+move, and `scripts/check-symbol-anchors.py` gates it.
 
 The assertion is **two-sided**, because a one-sided count cannot tell a routed
 call from an added one:
@@ -269,6 +315,14 @@ Mutation: delete the `vt::AttentionDenseFlash` call at
 focused gate. Both halves must go red. The result is recorded in `## Outcome`
 with the exact diff applied and the exact failure text, and the tree is restored
 byte-for-byte afterwards.
+
+The case's own process state is scope-guarded, and that is not tidiness. It
+enables `vt::EnableOpProviderCallStats` and sets `VLLM_LTX2_DIT_FLASH_ATTN`, both
+of which are per-process, and it contains `REQUIRE`s that unwind. Measured with a
+scratch `REQUIRE(false)` after the `SetEnv` plus an observer case appended after
+it: **without the guards the observer reads the knob still set and counts 8
+leaked `kAttention` selections; with them it reads neither.** An unrelated case
+failing because of which case failed before it is the shape this removes.
 
 ## 7. The A/B
 
@@ -318,8 +372,23 @@ build used. Artifacts under `/workspace/ltx25-attnflash/out/20260821T092516Z/`.
 
 The f32 assertion counts are the load-bearing ones: 88,439 on CUDA against 23 on
 a CPU box, so the new head_dim 64/128/256 dense-flash case really ran rather than
-printing its skip line. §4.3's launch failure is therefore repaired against a
-device and not against a reading of the code.
+printing its skip line. §4.3's launch failure at **head_dim 128** is therefore
+repaired against a device and not against a reading of the code.
+
+**What that run did NOT prove, and the record said it did.** At f32 head_dim 256
+the tile is 131,072 B and GB10's queried ceiling is 101,376 B, so the tile never
+fitted; the then-current code fell back to `AttentionDenseFast`, which is
+bit-identical to the flash kernel by contract, and every one of those 20,480
+assertions passed **without flash launching at 256 even once**. A numeric
+comparison cannot see the difference — that is the contract — so the case
+measured a fallback and reported it as a launch. The claim "GB10 reports 101,376
+B, so the full tile fits" was **false at 256** and is corrected here, in
+`.agents/benchmark-record.md`, and in the pull request body. It remains true at
+128 (65,536 B), which is the shape LTX runs and the shape this repair is for.
+
+The case is retitled to what it exercises and the 256 arm now asserts the
+device-derived outcome: launch and match where the ceiling reaches 131,072 B,
+refuse and name both numbers where it does not.
 
 The **numerics answer is now a number**: the swap is **not bit-identical on
 CUDA**, and the measured deviation is **8.94e-08 video / 4.47e-08 audio**, which
@@ -347,8 +416,32 @@ full checkpoint, bf16, reduced from the engine's own `last=` lines:
 |---|---|---|---|---|---|
 | 19 | **7.680 s** | 7.633 s | 7.109 s | 8.196 s | 14.2% |
 
-Against the recorded **47.84 s** denominator that is **6.23x**, inside §7's
-predicted single-digit seconds.
+Against the recorded **47.84 s** denominator that is 6.23x. **The headline is
+~6.0x, not 6.23x**, because the denominator carries two confounds this arm does
+not, and both of them inflate the ratio:
+
+**Instrumentation.** The denominator ran under `job/runguard.py --stack-period 12`
+(`render.log:1`), which samples `eu-stack -p` and therefore `ptrace`-stops every
+thread in the process. Its own `stacks.txt` says what that cost: **523 samples,
+median inter-sample delta 12.40 s against a 12.0 s period**, so ~0.40 s median
+and 1.50 s maximum of stopped process per sample. At that cadence ~3.9 samples
+land inside each 47.84 s forward, which is ~1.54 s, or **~3.2% of the
+denominator**. The flash arm ran with no such sampler. Correcting only the
+denominator gives **46.3 s / 7.680 s = 6.03x**.
+
+**A different prompt.** The denominator's `render.log:1` carries a ~70-word
+prompt; `scripts/ltx25-dit-attn-flash-ab.sh` uses one short sentence.
+`ltx2_video.cpp:2253` sets `context_tokens = encoded.seq` **unpadded**, so the
+DiT's four cross-attentions per block see a different number of keys in the two
+arms. It is corroborated rather than inferred: `conditioning.tower` runs
+**45.013 s** in the denominator against **28.426 s** in the flash arm. The sign
+is the same as the sampler's — the longer prompt makes the denominator's forward
+more expensive for a reason that is not the self-attention kernel — so it inflates
+the ratio too, and it is not quantified here.
+
+**So the honest statement is a range: 6.03x to 6.23x, and ~6.0x is the value to
+quote**, with the sampler correction named and the prompt confound uncorrected
+and pushing the same way. None of this is an A/B; see below.
 
 **The naive arm did not run, so there is NO same-binary A/B yet.** At forward 20
 of the flash arm the `rc` worker was **lost** — `rc devices` then read
@@ -368,17 +461,33 @@ Until the naive arm is taken **on the same binary in the same lease**, the
 honest statement is:
 
 - the flash arm is **measured**: 7.680 s median, n=19;
-- the **6.23x is a cross-run comparison** against a number produced by a
-  different binary in a different lease, which is exactly the weaker form the
-  same-binary rule exists to replace;
+- the **~6.0x is a cross-run comparison** against a number produced by a
+  different binary, in a different lease, under a stack sampler, on a different
+  prompt — which is exactly the weaker form the same-binary rule exists to
+  replace;
 - so the A/B result is **PENDING**, not satisfied.
 
-`job/ab.sh` now carries a sample cap (13 per arm), a `MemAvailable` floor
-(12 GiB, the sibling campaign's), a per-arm memory trace, a build cache keyed on
-the source SHA so a resumed run does not re-spend 18 minutes compiling, and it
-runs the **naive arm first** — the previous order took the cheap arm first and
-lost the box before the expensive one, which is how a two-arm measurement became
-a one-arm one.
+**The flash arm's artifacts do not say what was run, and that is a defect of this
+row's harness rather than a caveat about it.** `arm-flash.log` opens at
+`[render] + load` with no command line, `wd-flash/` is empty, and no
+`phase-log.json` was written; the only description of the run was
+`/mnt/nas_share/rc/ltx25-attnflash/job/ab.sh`, a mutable path on a share, whose
+mtime is 25 minutes AFTER the run finished. The denominator has its full command
+line as line 1 of its own `render.log` and this arm has nothing. So the geometry,
+prompt, seed and sample cap behind 7.680 s are not verifiable from its own
+evidence, which is the reason the two confounds above had to be established from
+a `conditioning.tower` duration rather than read off a recipe.
+
+Both halves are repaired. The harness is now
+**`scripts/ltx25-dit-attn-flash-ab.sh`**, committed and therefore immutable per
+revision, and every arm writes its own invocation — harness sha256, binary
+sha256, source SHA, geometry, seed, prompt and the resolved command line — to
+line 1 of its own log, plus a `harness_sha256` line into `PROVENANCE`. It also
+carries a sample cap (13 per arm), a `MemAvailable` floor (12 GiB, the sibling
+campaign's), a per-arm memory trace, a build cache keyed on the source SHA so a
+resumed run does not re-spend 18 minutes compiling, and it runs the **naive arm
+first** — the previous order took the cheap arm first and lost the box before the
+expensive one, which is how a two-arm measurement became a one-arm one.
 
 ## 8. Gates
 
@@ -391,16 +500,27 @@ never a synonym for "probably fine".
 | reachability, unit | `test_ltx2_device`, new case | **PASS** — flash 8 of 8, naive 0 |
 | reachability mutation | in-place, restored and re-gated | **PASS** — both halves red, `CHECK( 0 == 8 )` and `CHECK( 8 == 0 )`, exit 1, compile rc 0 |
 | reachability, production | the real render's own log, GB10 | **PASS** — `op=21 device=1` present, `op=18 device=1` absent (§7.1) |
+| instrument scope guard, mutation | `test_ltx2_device`, in-place, restored | **PASS** — without the guards an appended observer reads the knob still set and 8 leaked `kAttention` selections; with them, neither (§6) |
 | CUDA host-vs-device parity | `test_ltx2_device` on `dgx:gpu0` | **PASS** — f32 8.94e-08 / 4.47e-08 vs 2e-5; bf16 0 |
-| f32 head_dim 128/256 launch | `test_ops_attention` on `dgx:gpu0` | **PASS** — 10/10, 88,439 assertions (23 on a CPU box, so the case really ran) |
+| f32 head_dim 128 launch | `test_ops_attention` on `dgx:gpu0` | **PASS** — 10/10, 88,439 assertions (23 on a CPU box, so the case really ran). NOT head_dim 256, which never fitted and never launched; §7.1 |
+| f32 head_dim 256 refusal | `test_ops_attention` on `dgx:gpu0` | **PENDING** — the refusal replaces the silent fallback the review found, and no device has run the case since. `dgx:gpu0` is leased to another row; the operator reruns this gate |
 | A/B, same binary, both arms | `dgx:gpu0` under an `rc` lease | **PENDING** — the flash arm is measured at 7.680 s median (n=19); the worker was lost before the naive arm, so no pair exists (§7.1) |
-| full preflight | `scripts/agent-preflight.sh` | **PASS** — clean before the first edit, on the staged spec, on the staged implementation, and after the `origin/main` merge |
-| `build-newest-gcc` | CI | **PASS for this change, red on the branch from a pre-existing break** — `main` at `483cd3198` fails the same job on `::getpid` in `test_qwen3_dflash2_gguf.cpp:547`, a file this change does not touch; owned by [#1565](https://github.com/mudler/vllm.cpp/issues/1565) |
+| full preflight | `scripts/agent-preflight.sh` | **PASS at HEAD** — and it was NOT before: `documentation-checkpoint` was red on two of this branch's own commits (see below) |
+| `documentation-checkpoint` | CI, and locally over the range | **PASS at HEAD, RED before it** — `2aa78c69b` and `2f39a9426` each recorded a measurement in `.agents/benchmark-record.md` without writing `docs/STATUS.md` (and `docs/BENCHMARKS.md` for the second). The control on the main-only range `4c193bd55..5d548d003` is rc 0, so this was the branch's own break and not an inherited one. The two commits are replaced by one that writes all three surfaces together |
+| `build-newest-gcc` | CI | **PASS for this change, red on the branch from a pre-existing break** — `main` at `e2a9e035d` fails the same job on `::getpid` in `test_qwen3_dflash2_gguf.cpp:547`, a file this change does not touch; owned by [#1565](https://github.com/mudler/vllm.cpp/issues/1565) |
 | `windows-msvc-cpu` / `-vulkan` | CI | **PASS for this change, baseline-less lane** — a markdown-only control PR (#1295) fails the identical step; #503/#603 own it |
 
-One gate below the bar is named rather than averaged away: the A/B. Everything
-this row claims about SPEED rests on one arm, and the row does not read as
-finished until the pair exists.
+**A side effect of that red is worth recording, because it was invisible.** The
+`documentation-checkpoint` job runs `set -eu` and this checker is the FIRST of
+three commands in the step, so `check-now-current.py` and
+`check-role-discipline.py` **never ran in CI on this branch at all**. Nothing
+hides behind it — both were run locally at the reviewed head and both returned
+rc 0 — but a gate that stops two other gates from running is a wider failure than
+its own message says.
+
+Two gates below the bar are named rather than averaged away: the A/B, and the
+head_dim 256 refusal. Everything this row claims about SPEED rests on one arm,
+and the row does not read as finished until the pair exists.
 
 ## 9. Stop conditions
 
@@ -414,6 +534,21 @@ finished until the pair exists.
 
 ## Owed
 
+- **There is NO numeric or pixel comparison at production geometry.** The swap
+  is not bit-identical on CUDA (§5), and the only numeric gate that exists is the
+  reduced-dimension host-vs-device case — `8.94e-08` / `4.47e-08` against `2e-5`
+  — which bounds the ARITHMETIC change and not the change at head_dim 128 with
+  2352 keys over 48 layers. A diffusion render has no token gate to fall back on,
+  and the flash arm was interrupted before it wrote any frames, so no pixel A/B
+  exists either, not even against the completed 49-frame `768x448` baseline
+  render already on the NAS. Owner: this row. Issue:
+  [#1612](https://github.com/mudler/vllm.cpp/issues/1612).
+- **A bf16 head_dim-256 arm for the flash op is ungated.** §4.3's table makes
+  bf16 256 the widest shape that both NEEDS the opt-in (65,536 B > 48 KiB) and
+  FITS GB10, so it is the case that would exercise the advertised ceiling
+  end-to-end. `test_ops_attention`'s dense-flash case is f32-only, so the ceiling
+  is currently asserted at 128 and refused at 256, with the shape in between
+  untested. Owner: this row, under [#1612](https://github.com/mudler/vllm.cpp/issues/1612).
 - **True tensor cores at head_dim 128.** `vt::AttentionDenseFa2` refuses
   anything but head_dim 64 (`src/vt/cuda/cuda_flash_attn_fa2.cu:557-560`).
   Reaching the vendored FA-2 `mma.sync` path for LTX's head_dim 128 needs an

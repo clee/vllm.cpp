@@ -25991,8 +25991,11 @@ bound from a flop ratio on a kernel nobody has written.
 ## LTX25-DIT-ATTN-FLASH — the DiT self-attention was on the correctness-grade kernel; one arm measured, the box died before the other (2026-08-21, `row/LTX25-DIT-ATTN-FLASH`, #1549)
 
 **Read this before re-running the lever.** The change is landed and its
-correctness gates are green on GB10. What is NOT done is the same-binary A/B: the
-naive arm never ran.
+correctness gates are green on GB10 at head_dim 128. What is NOT done is the
+same-binary A/B: the naive arm never ran. Two later corrections are folded in
+below and both narrow what this entry claims: f32 head_dim **256** was never
+launched (only its bit-identical fallback was), and the 6.23x ratio carried two
+undisclosed confounds and reads **~6.0x** once one of them is priced.
 
 ### Provenance
 
@@ -26019,6 +26022,18 @@ The assertion COUNT is the load-bearing number on the first row: 88,439 on CUDA
 against 23 on a CPU box. `test_ops_attention`'s new head_dim 64/128/256
 dense-flash case prints a skip line without a GPU, and `assertions: 0` is a skip
 wearing a pass, so the count is what proves it ran.
+
+**CORRECTION — what those assertions did NOT prove.** The f32 head_dim 128 launch
+IS repaired: 2 * 64 * 128 * 4 = 65,536 B, inside GB10's queried 101,376 B opt-in
+ceiling. **f32 head_dim 256 is NOT**, and an earlier version of this entry said it
+was. That tile is 2 * 64 * 256 * 4 = **131,072 B, above 101,376**, so it never
+fitted; the then-current launcher fell back to `AttentionDenseFast`, which is
+BIT-IDENTICAL to the flash kernel by contract, and all 20,480 of that arm's
+assertions passed **with flash never launching at 256 once**. A numeric
+comparison cannot distinguish the two — that IS the contract — so the case
+measured a fallback and reported it as a launch. The silent fallback is now gone:
+the launcher refuses, naming the bytes asked for and the ceiling refused, and the
+case asserts the device-derived outcome instead of assuming one.
 
 **The swap is NOT bit-identical on CUDA** and this record does not claim it is.
 `AttentionDenseFast` groups the head_dim partial sums across 32 lanes where the
@@ -26072,10 +26087,34 @@ memory guard, no sample cap and no memory trace, unlike the sibling campaign's
 That is a defect in this row's harness, not a finding about the change, and the
 next attempt is instrumented to answer it.
 
-So **6.23x is a cross-run comparison**, not an A/B: 47.84 s came from binary
+So **~6.0x is a cross-run comparison**, not an A/B: 47.84 s came from binary
 `f25b0561` in an earlier lease and 7.680 s from a different binary in this one.
 That is precisely the weaker form the same-binary rule exists to replace, and the
 A/B gate reads `PENDING` rather than satisfied.
+
+**TWO CONFOUNDS, both of which inflate the ratio, and neither was disclosed when
+this entry first read 6.23x.**
+
+*The denominator carried a stack sampler and this arm did not.* It ran under
+`job/runguard.py --stack-period 12` (`render.log:1`), which samples `eu-stack -p`
+and therefore `ptrace`-stops every thread. Its own `stacks.txt` prices that:
+**523 samples, median inter-sample delta 12.40 s against a 12.0 s period**, so
+~0.40 s median and 1.50 s maximum of stopped process per sample. At that cadence
+~3.9 samples fall inside each 47.84 s forward, ~1.54 s, **~3.2% of the
+denominator**. Correcting only the denominator: **46.3 s / 7.680 s = 6.03x**.
+
+*The two arms used different prompts.* `render.log:1` shows the denominator's
+~70-word prompt; the flash arm's harness uses one short sentence.
+`src/vllm/multimodal/ltx2_video.cpp:2253` sets `context_tokens = encoded.seq`
+UNPADDED, so the DiT's cross-attentions see a different number of keys in each
+arm. Corroborated rather than inferred: `conditioning.tower` is **45.013 s** in
+the denominator against **28.426 s** in the flash arm. Same sign as the sampler —
+it makes the denominator's forward more expensive for a reason that is not the
+self-attention kernel — and it is not quantified.
+
+**Quote ~6.0x.** The defensible statement is the range **6.03x to 6.23x** with the
+sampler correction named and the prompt confound uncorrected and pushing the same
+way. The pair that would replace all of this is still `PENDING`.
 
 The arithmetic that predicted this is worth keeping either way. The naive kernel
 launches one 256-thread block per (query, head) with no K/V tiling: 2352 tokens x
@@ -26084,16 +26123,33 @@ call, over 48 layers. At the 5.70 ns per block-key iteration nsys measured for
 this same kernel on this same box (multimodal-speed §7), that is 48.4 s against a
 measured 47.84 s.
 
+### The flash arm's artifacts do not record what was run
+
+`arm-flash.log` opens at `[render] + load` with no command line, `wd-flash/` is
+empty, and no `phase-log.json` was written. The only description of the run was
+`/mnt/nas_share/rc/ltx25-attnflash/job/ab.sh` — a mutable path on a share, whose
+mtime is **25 minutes after the run finished** — so the geometry, prompt, seed and
+sample cap behind 7.680 s cannot be verified from the run's own evidence. The
+47.84 s denominator has its full command line as line 1 of its `render.log`; this
+arm has nothing. That asymmetry is why the two confounds above had to be
+established from a `conditioning.tower` duration.
+
 ### Reproduce
+
+The harness is now committed as **`scripts/ltx25-dit-attn-flash-ab.sh`**, so a
+revision of it is immutable and citable, and it writes its own sha256 into
+`PROVENANCE` and its full resolved invocation — harness sha256, binary sha256,
+source SHA, geometry, seed, prompt, command line — into line 1 of each arm's own
+log. Stage that file into the lease's `/workspace` and run it:
 
 ```sh
 rc run -d dgx:gpu0 --max-runtime 4h -- \
-  bash -lc 'bash /workspace/ltx25-attnflash/job/ab.sh'
+  bash -lc 'bash /workspace/ltx25-attnflash/job/ltx25-dit-attn-flash-ab.sh'
 ```
 
-`job/ab.sh` now caps each arm at 13 samples, holds a 12 GiB `MemAvailable` floor,
-writes a per-arm memory trace to `watch-<arm>.tsv`, caches the built binary keyed
-on the source SHA so a resumed run does not re-spend the 18-minute compile, and
-runs the **naive arm first**. The previous order took the cheap arm first and lost
-the box before the expensive one, which is how a two-arm measurement became a
-one-arm one.
+It caps each arm at 13 samples (`WANT_SAMPLES`), holds a 12 GiB `MemAvailable`
+floor, writes a per-arm memory trace to `watch-<arm>.tsv`, caches the built binary
+keyed on the source SHA so a resumed run does not re-spend the 18-minute compile,
+and runs the **naive arm first**. The previous order took the cheap arm first and
+lost the box before the expensive one, which is how a two-arm measurement became
+a one-arm one.
