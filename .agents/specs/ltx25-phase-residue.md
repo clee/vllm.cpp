@@ -389,6 +389,7 @@ W5 gates, mutations, and the record edits the change makes stale.
 | [#1570](https://github.com/mudler/vllm.cpp/issues/1570) — an upper bound on the instrument's own share of a leaf | **owed, filed by this row.** `uncovered <= 2 * leaf_instrument` is stricter than the floor it replaces only while `leaf_instrument` stays small, and nothing bounds it. Moving the DiT `Tick` out of `Evaluate` would charge ~110 flushed writes to `denoise` and widen the gate while printing a small number |
 | a residue bound that survives a contended box | **owed, and it is this row's own negative result plus [#1570](https://github.com/mudler/vllm.cpp/issues/1570).** `residue <= 2 * instrument` measured red 4 in 45 at the table, 3 in 200 at the conservation case and 2 in 200 at `unit.parent`, and is withdrawn. Nothing replaces it, so a future un-named region under 5% of wall is invisible and **mutation D — the `denoise.update` anchor moved off the post-process, 5 of 5 red against the withdrawn bound — is not detected on the landing tree**. Closing it needs a bound on a quantity the scheduler cannot move |
 | [#1571](https://github.com/mudler/vllm.cpp/issues/1571) — a per-gap decomposition IN the emitted table | **owed, filed by this row.** This row computed the gap table in a scratch script to find the 92% region. A reader of `phase-log.json` still cannot see it without one, and the same investigation will be re-derived the next time the residue moves |
+| [#1619](https://github.com/mudler/vllm.cpp/issues/1619) — the `merge=union` driver duplicates a row | **owed, filed by this row, and MEASURED on this row's own merges.** Both sides appended before the same trailing anchor rather than at the true end, so the driver concatenated two regions that each carried `#1546` and the resolved index held it TWICE, byte-identical, at 538 lines where the correct union is 537. `git merge-tree` called that merge clean, `check-agent-record.py` passed it, and `check-issue-index-append-only.py` passed it too, because a duplicate is an ADDITION and that checker only collects removals. De-duplicating in place then FAILS the same checker, because moving the anchor back behind the other side's rows is a relocation and a line diff reads a relocation as a removal — so the gate that exists reds a correct repair while the corruption passes. Resolved canonically on every merge of this branch (take the merged branch's file byte-for-byte, append at the true end, assert `git diff --numstat` is `N 0`), and the same driver dropped `#838` on a later re-merge, so it recurs. The fix candidate is the multiplicity plus id-uniqueness checker written for these merges: 3 of its 7 assertions fail against the driver's raw output and name `#1546`. Not fixed in flow because it changes checker semantics, which `AGENTS.md` routes through a row, a spec and a red-before mutation |
 
 ## Outcome
 
@@ -669,11 +670,23 @@ environment, the exit status and the evidence path, and not a summary of them.
 
 **THE GATE'S SHA AND THE HEAD'S SHA ARE NOT THE SAME, and the difference is
 stated rather than left to be re-derived.** `AGENTS.md` wants the gate chained to
-the exact-SHA push. `build-test-cpu` ran at `65e681438`; the head carries the
-record repairs a fresh review asked for on top of it. Every commit between them
-touches `.agents/specs/ltx25-phase-residue.md` and nothing else, so no C++ gate
-reads a byte that moved and the verdict transfers by construction. The `git diff`
-between the two is one file.
+the exact-SHA push. `build-test-cpu` first ran this row's own gate at
+`65e681438`, and the commits immediately after it touch
+`.agents/specs/ltx25-phase-residue.md` and nothing else, so that verdict
+transferred by construction to `afe8e7383`.
+
+**IT DOES NOT TRANSFER PAST THE MERGES, AND THAT IS WHY THE HEAD IS GATED ON ITS
+OWN.** `origin/main` moved dozens of commits under this branch during review and
+brought C++ with it, including `f38cd69e7`, which rewrites assertion (1c) in this
+row's own `tests/vllm/multimodal/test_ltx2_video.cpp`. A transfer argument cannot
+reach across that, so it is not made. What IS true across the merges is narrower
+and checkable: this row's own product code is byte-identical to `5851581ad`,
+verified with `git diff 5851581ad HEAD -- src/vllm/multimodal
+include/vllm/multimodal`, and the one file where the two sides met resolved to
+main's (1c) plus this row's `denoise.update` anchor, which compose because they
+bound different quantities -- (1c) the head and tail of each leaf record, this
+row's anchor the interior. The verdict that counts is the head's own
+`build-test-cpu`, not an inherited one.
 
 **And the `ec3e7ac0c` green is narrower than it looks.** Job `96719179235` is
 `completed`/`success` inside a run whose own conclusion is `cancelled`, which is
