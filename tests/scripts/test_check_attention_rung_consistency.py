@@ -4,8 +4,7 @@
 The mutation cases below are the point of the file. A checker that reports zero
 drift on a green tree proves nothing on its own: it reports zero drift when its
 regex matches nothing at all, which is exactly how #1544's defect went unseen for
-nine call sites. Each `MutationTests` case makes the tree carry the regression the
-checker exists to catch and requires the checker to go RED.
+nine call sites. `MutationTests` below holds the cases that guard against it.
 """
 
 from __future__ import annotations
@@ -218,11 +217,8 @@ class ShippedTreeTests(unittest.TestCase):
         self.assertEqual(allowed, {"muse_glimmer_vision", "ltx2", "ltx2_device"})
 
     def test_every_allowlisted_stem_names_a_real_model_source(self) -> None:
-        # A misspelt stem is silent in BOTH directions, which is what makes it the
-        # real risk here: it excuses nothing, so the file it meant to cover goes on
-        # drifting unguarded, and the checker reports the entry only as STALE and
-        # does not fail. `muse_glimmer_vison` would read as a working entry
-        # forever.
+        # Pins that every allowlisted stem names a model source that exists, so a
+        # typo is reported at the typo.
         #
         # Keyed on the FILE existing, never on scan membership. A stem stops having
         # a call site the moment its removing row lands -- that is the state the
@@ -246,7 +242,7 @@ class ShippedTreeTests(unittest.TestCase):
 
 
 class MutationTests(unittest.TestCase):
-    """Each case injects the regression the checker exists to catch."""
+    """Guards for the regressions the checker exists to catch."""
 
     def setUp(self) -> None:
         self.scanned, self.allowed = mod.scan_models(), mod.allowlisted_names(
@@ -286,8 +282,12 @@ class MutationTests(unittest.TestCase):
 
     def test_widening_the_regex_to_the_fast_rungs_is_visible(self) -> None:
         # These pin the trailing `\(` and the `\s*`, never the `\b`. Measured: with
-        # the `\b` removed, this suite and the shipped tree both stay green. The
-        # comment beside `_NAIVE_CALL` still claims otherwise and is wrong.
+        # the `\b` removed, this suite and the shipped tree both stay green.
+        #
+        # Three checker comments name a cause that measurement refutes, and none is
+        # repairable here: check-pr-size.py refuses a comment-only edit to a
+        # governance checker (#1631). They are the widening paragraph (:58-61), the
+        # `_NAIVE_CALL` comment (:93-96), and the `excused` cause (:252-255).
         self.assertIsNone(mod._NAIVE_CALL.search("vt::AttentionDenseFlash(a);"))
         self.assertIsNotNone(mod._NAIVE_CALL.search("vt::Attention (a);"))
 
