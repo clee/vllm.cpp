@@ -174,10 +174,26 @@ class ShippedTreeTests(unittest.TestCase):
         self.assertEqual(mod.drift_sites(scanned, allowed), [])
 
     def test_the_population_is_not_empty(self) -> None:
-        # A checker whose scan finds nothing is green for the wrong reason. This is
-        # the guard against a regex that stops matching after a rename.
+        # A scanner that matches nothing is green for the wrong reason: an empty
+        # scan and a clean tree file the same report. This is the guard against a
+        # regex that stops matching after a rename, and it asserts only that the
+        # scan still finds SOMETHING.
+        #
+        # It deliberately does NOT pin the count. A raw total is a measurement of
+        # the model tree stored in this file, so it reds on every row that
+        # legitimately REMOVES a vt::Attention call -- which is precisely the rows
+        # the allowlist exists to unblock, and precisely the drift lock AGENTS.md
+        # `## Records` forbids: never store a measurement of one file inside
+        # another file. The floor of 9 this replaces had zero headroom against a
+        # shipped tree of exactly 9 sites, so #1545's routing change alone would
+        # have turned `main` red. Issue #1629.
+        #
+        # What a count would have bought is covered without the coupling:
+        # test_the_six_deliberate_sites_carry_a_marker names its files, and
+        # test_every_allowlisted_stem_names_a_real_model_source below catches the
+        # bogus entry a total never could.
         scanned, _ = self.scan()
-        self.assertGreaterEqual(sum(len(v) for v in scanned.values()), 9)
+        self.assertGreaterEqual(sum(len(v) for v in scanned.values()), 1)
 
     def test_the_six_deliberate_sites_carry_a_marker(self) -> None:
         scanned, _ = self.scan()
@@ -198,6 +214,33 @@ class ShippedTreeTests(unittest.TestCase):
         # set so growth is visible in a diff of this file.
         _, allowed = self.scan()
         self.assertEqual(allowed, {"muse_glimmer_vision", "ltx2", "ltx2_device"})
+
+    def test_every_allowlisted_stem_names_a_real_model_source(self) -> None:
+        # A misspelt stem is silent in BOTH directions, which is what makes it the
+        # real risk here: it excuses nothing, so the file it meant to cover goes on
+        # drifting unguarded, and the checker reports the entry only as STALE and
+        # does not fail. `muse_glimmer_vison` would read as a working entry
+        # forever.
+        #
+        # Keyed on the FILE existing, never on scan membership. A stem stops having
+        # a call site the moment its removing row lands -- that is the state the
+        # allowlist is built to survive, which the checker's own
+        # stale_allowlist_entries docstring states -- so asserting the stem is
+        # still in `scanned` would rebuild exactly the lock #1629 removes.
+        _, allowed = self.scan()
+        for stem in sorted(allowed):
+            sources = [
+                models_dir / f"{stem}{suffix}"
+                for models_dir in mod.MODEL_DIRS
+                for suffix in (".cpp", ".h")
+            ]
+            self.assertTrue(
+                any(path.is_file() for path in sources),
+                f"allowlisted stem {stem!r} names no model source: none of "
+                + ", ".join(str(path) for path in sources)
+                + " exists. A stem that matches no file excuses nothing and is "
+                "reported only as STALE, so the typo never surfaces on its own.",
+            )
 
 
 class MutationTests(unittest.TestCase):
