@@ -144,6 +144,15 @@ for `LoadedEngine`. The source-tree examples declare their link targets in
 [`examples/CMakeLists.txt`](../examples/CMakeLists.txt). External consumers
 must use the C ABI in `include/vllm.h`.
 
+Configuring with `-DVLLM_CPP_SANITIZE=address,undefined` or
+`-DVLLM_CPP_SANITIZE=thread` changes what a test target links. Instrumented
+test executables link one internal shared image of the instrumented archive
+instead of force-linking `vllm::vllm` into each of them, because the
+force-linked form runs a hosted runner out of disk. That image forwards the
+same include directories, compile definitions and link libraries, so a target
+builds identically in both configurations. Link `vllm::vllm` as above and let
+the build choose; naming the internal image yourself is not supported.
+
 ## First-line troubleshooting
 
 - Run the executable with `--help` and confirm that you are using the expected

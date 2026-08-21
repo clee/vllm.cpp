@@ -2681,6 +2681,27 @@ if(NOT VLLM_CPP_SANITIZE STREQUAL "OFF")
     "$<TARGET_PROPERTY:vllm,INTERFACE_SYSTEM_INCLUDE_DIRECTORIES>")
   target_compile_definitions(vllm_sanitize_test_shared INTERFACE
     "$<TARGET_PROPERTY:vllm,INTERFACE_COMPILE_DEFINITIONS>")
+  # ...and the LINK interface, forwarded by the same rule as the three lines
+  # above. Those forward what a consumer needs to COMPILE against `vllm`. This
+  # one forwards what it needs to LINK, and its absence is issue #1531: the
+  # `CPPHTTPLIB_OPENSSL_SUPPORT` that arrives through the line above makes every
+  # test including the vendored httplib header emit OpenSSL references, while
+  # the only libssl anywhere near the link line was a DT_NEEDED entry of THIS
+  # shared image. GNU ld refuses to resolve through one -- "DSO missing from
+  # command line" -- so eight targets failed to link and both sanitizer lanes
+  # reported `fail` without running a case, on every branch based after
+  # a50c57d69.
+  #
+  # Forward the PROPERTY rather than naming OpenSSL: the answer then lives in
+  # exactly one place, and the next PUBLIC dependency `vllm` acquires cannot be
+  # forgotten here. A per-target `target_link_libraries(test_x OpenSSL::SSL)`
+  # would repair the eight and leave the ninth to be discovered by a red lane.
+  #
+  # It must stay INTERFACE with the property genex, and must never become
+  # `PUBLIC vllm`: `vllm` carries the `--whole-archive` INTERFACE link OPTION
+  # set above, and not propagating that is the entire reason this target exists.
+  target_link_libraries(vllm_sanitize_test_shared INTERFACE
+    "$<TARGET_PROPERTY:vllm,INTERFACE_LINK_LIBRARIES>")
 endif()
 
 # make install => a consumable libvllm.so + libvllm.a + vllm.h (llama.cpp-style).
