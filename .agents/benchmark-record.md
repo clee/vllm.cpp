@@ -25988,3 +25988,112 @@ matched the GEMMs' measured 3.98 TFLOP/s, its 0.140 TFLOP would cost **35.2 ms
 instead of 688.1 ms**: forward 1569 -> 916 ms (**1.71x on the DiT**), bucket
 370.510 -> 216.3 s, run 598.207 -> 444.0 s (**1.35x end to end**). An upper
 bound from a flop ratio on a kernel nobody has written.
+## LTX25-DIT-ATTN-FLASH — the DiT self-attention was on the correctness-grade kernel; one arm measured, the box died before the other (2026-08-21, `row/LTX25-DIT-ATTN-FLASH`, #1549)
+
+**Read this before re-running the lever.** The change is landed and its
+correctness gates are green on GB10. What is NOT done is the same-binary A/B: the
+naive arm never ran.
+
+### Provenance
+
+| | |
+|---|---|
+| lease | `6c724dfd-a5e8-4832-b4fb-d0fd7d6eb458`, `dgx:gpu0` (GB10, sm_121a) |
+| source | `30dce3a1d`, staged as `/workspace/ltx25-attnflash/src.tar.gz` |
+| build | in-lease, `-DVLLM_CPP_CUDA=ON`, cutlass-nvfp4 / cutlass-fp8 / FlashAttention-2 all `ENABLED for [121a]`, `ninja -j 4` |
+| artifacts | `/workspace/ltx25-attnflash/out/20260821T092516Z/` |
+| geometry | `768x448`, 49 frames, seed 20260820, full 21.00B bf16 checkpoint, `one_stage` |
+| tokens | `(768/32) * (448/32) * ((49-1)/8 + 1)` = **2352** video tokens |
+| statistic | per-forward `last=` from the engine's own progress lines, never the governor |
+
+### Correctness, taken BEFORE any speed number was read
+
+| gate | result |
+|---|---|
+| `test_ops_attention` on CUDA | 10/10 cases, **88,439/88,439** assertions, SUCCESS |
+| `test_ltx2_device` on CUDA | 22/22 cases, **749/749** assertions, SUCCESS |
+| CUDA-vs-host f32 | video `8.9407e-08`, audio `4.47035e-08`, against the committed `2e-5` |
+| CUDA-vs-CPU-backend bf16 | `0` on both streams |
+
+The assertion COUNT is the load-bearing number on the first row: 88,439 on CUDA
+against 23 on a CPU box. `test_ops_attention`'s new head_dim 64/128/256
+dense-flash case prints a skip line without a GPU, and `assertions: 0` is a skip
+wearing a pass, so the count is what proves it ran.
+
+**The swap is NOT bit-identical on CUDA** and this record does not claim it is.
+`AttentionDenseFast` groups the head_dim partial sums across 32 lanes where the
+naive kernel uses a 256-thread block, so the same f32 online softmax associates
+differently. The measured deviation is f32 round-off scale and sits 224x inside
+the gate, and the gate was not widened to admit it. Caveat: that case runs the
+fixture's reduced dimensions, so it bounds the arithmetic change and not the
+change at head_dim 128.
+
+### Reachability, on the real model rather than a fixture
+
+`VT_OP_PROVIDER_STATS=1` makes each op announce itself once when it first
+resolves. In the full 21.00B render at `768x448/49f`, in `arm-flash.log`:
+
+| announce | count |
+|---|---|
+| `op=21 device=1` — `kAttentionDenseFlash` on CUDA | **1** |
+| `op=18 device=1` — `kAttention` on CUDA | **0** |
+| `op=19 device=1` — `kAttentionCross` on CUDA | 1 |
+
+`op=18` never resolving at all is the two-sided half. It also confirms the
+cross-attentions were on `vt::AttentionCross` (already flash-tiled) the whole
+time, so only the two self-attentions per block were ever slow.
+
+### The flash arm
+
+n=19, forwards 2 through 20 of phase 0:
+
+```
+7.109 7.173 7.267 7.392 7.430 7.460 7.598 7.656 7.658 7.680
+7.688 7.754 7.764 7.798 7.814 7.832 7.848 7.908 8.196
+```
+
+| n | median | mean | min | max | spread |
+|---|---|---|---|---|---|
+| 19 | **7.680 s** | 7.633 s | 7.109 s | 8.196 s | 14.2% |
+
+### What is NOT measured, and why
+
+**The naive arm never ran.** At forward 20 the `rc` worker was lost;
+`rc devices` then read `dgx:gpu0 unhealthy (no contact)`, and still did 43
+minutes later.
+
+**The cause is UNPROVEN. Do not record it as an OOM.** No memory trace was taken,
+the worker's log ends mid-forward, and the box did not return to be asked.
+Host-RAM exhaustion is the leading hypothesis only because GB10 shares host RAM
+with the GPU and an unconstrained job has OOM-rebooted this box before — a prior,
+not evidence. What IS established is that `job/ab.sh` as first written carried no
+memory guard, no sample cap and no memory trace, unlike the sibling campaign's
+`runguard.py`, so the run could neither avoid the failure nor say what it was.
+That is a defect in this row's harness, not a finding about the change, and the
+next attempt is instrumented to answer it.
+
+So **6.23x is a cross-run comparison**, not an A/B: 47.84 s came from binary
+`f25b0561` in an earlier lease and 7.680 s from a different binary in this one.
+That is precisely the weaker form the same-binary rule exists to replace, and the
+A/B gate reads `PENDING` rather than satisfied.
+
+The arithmetic that predicted this is worth keeping either way. The naive kernel
+launches one 256-thread block per (query, head) with no K/V tiling: 2352 tokens x
+32 heads = 75,264 blocks each looping 2352 keys = 1.77e8 block-key iterations per
+call, over 48 layers. At the 5.70 ns per block-key iteration nsys measured for
+this same kernel on this same box (multimodal-speed §7), that is 48.4 s against a
+measured 47.84 s.
+
+### Reproduce
+
+```sh
+rc run -d dgx:gpu0 --max-runtime 4h -- \
+  bash -lc 'bash /workspace/ltx25-attnflash/job/ab.sh'
+```
+
+`job/ab.sh` now caps each arm at 13 samples, holds a 12 GiB `MemAvailable` floor,
+writes a per-arm memory trace to `watch-<arm>.tsv`, caches the built binary keyed
+on the source SHA so a resumed run does not re-spend the 18-minute compile, and
+runs the **naive arm first**. The previous order took the cheap arm first and lost
+the box before the expensive one, which is how a two-arm measurement became a
+one-arm one.

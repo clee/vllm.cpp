@@ -352,11 +352,17 @@ predicted single-digit seconds.
 
 **The naive arm did not run, so there is NO same-binary A/B yet.** At forward 20
 of the flash arm the `rc` worker was **lost** — `rc devices` then read
-`dgx:gpu0 unhealthy (no contact)` for at least 19 minutes. GB10 shares host RAM
-with the GPU and an unconstrained job has OOM-rebooted this box before, and
-`job/ab.sh` as first written carried **no memory guard and no sample cap**, unlike
-the sibling campaign's `runguard.py`. That is a defect in this row's harness, not
-a finding about the change.
+`dgx:gpu0 unhealthy (no contact)`, and it still did 43 minutes later.
+
+**The cause is UNPROVEN and this row does not name one.** No memory trace was
+taken, the worker's own log ends mid-forward, and the box did not come back to be
+asked. Host-RAM exhaustion is the leading hypothesis only because GB10 shares
+host RAM with the GPU and an unconstrained job has OOM-rebooted this box before;
+that is a prior, not evidence. What IS established is that `job/ab.sh` as first
+written carried **no memory guard, no sample cap and no memory trace**, unlike the
+sibling campaign's `runguard.py` — so the run could neither avoid the failure nor
+say afterwards what it was. That is a defect in this row's harness, and it is the
+reason the next attempt can answer the question this one cannot.
 
 Until the naive arm is taken **on the same binary in the same lease**, the
 honest statement is:
