@@ -8078,6 +8078,37 @@ static void ApplyDeviceTokenIdsOverride(Dev d, DBuf& dids, int64_t T) {
   detail::ApplyDeviceTokenIds(d.b, d.q, dids.ptr(), T, "qwen3_5 embed");
 }
 
+// #1299 SPIKE OBSERVER. `VT_EMBED_DUMP=<path>` writes the EMBEDDING OUTPUT --
+// the hidden state BEFORE any GEMM, attention or norm has touched it. The router
+// dump showed the arms already differing at the FIRST MoE block, which sits
+// downstream of attention; this point is upstream of all of it, so it separates
+// "the arms read different embedding weights, or dequantize them differently"
+// from "the arms agree on the table and diverge in the compute that follows".
+// Unset, this is a single null-FILE* load and a return.
+//
+// Record: u32 magic, u32 version, u32 call, u32 T, u32 H, then u16 hidden[T*H].
+static void EmbedObserve(Dev d, int64_t T, int64_t H, DBuf& hidden) {
+  static std::FILE* out = [] {
+    const char* path = std::getenv("VT_EMBED_DUMP");
+    if (path == nullptr || path[0] == '\0') return static_cast<std::FILE*>(nullptr);
+    std::FILE* h = std::fopen(path, "wb");
+    if (h == nullptr) std::fprintf(stderr, "[embed-dump] cannot open %s\n", path);
+    return h;
+  }();
+  if (out == nullptr) return;
+  static uint32_t call = 0;
+  if (call >= 8) return;
+  std::vector<uint16_t> host(static_cast<size_t>(T) * static_cast<size_t>(H));
+  d.b.Synchronize(d.q);
+  hidden.Download(d, host.data());
+  const uint32_t hdr[5] = {0x31424D45u, 1u, call,
+                           static_cast<uint32_t>(T), static_cast<uint32_t>(H)};
+  std::fwrite(hdr, sizeof(uint32_t), 5, out);
+  std::fwrite(host.data(), sizeof(uint16_t), host.size(), out);
+  std::fflush(out);
+  ++call;
+}
+
 // Embed: hidden[T,H] bf16 = embed_tokens[token_ids] (device-resident table).
 // KEPT OUTSIDE THE CUDA-GRAPH (M2.5 Phase 2): the CUDA Embedding op allocates a
 // device bounds-check flag (cudaMalloc/cudaFree) and syncs the stream, all of
@@ -8099,6 +8130,7 @@ static void EmbedInto(Dev d, DBuf& hidden, const std::vector<int32_t>& token_ids
   DBuf dids(d, DType::kI32, {T}, token_ids.data());
   ApplyDeviceTokenIdsOverride(d, dids, T);
   vt::Embedding(d.q, hidden.t(), dtab, dids.t());
+  EmbedObserve(d, T, H, hidden);
 }
 
 // DFlash DF-AUX-TAPS (SPEC-DFLASH D1) — capture the residual-stream value at a
@@ -8725,6 +8757,7 @@ std::vector<float> Qwen3_5Model::ForwardDense(const std::vector<int32_t>& token_
   DBuf dids(d, DType::kI32, {T}, token_ids.data());
   DBuf hidden(d, DType::kBF16, {T, H});
   vt::Embedding(d.q, hidden.t(), dtab, dids.t());
+  EmbedObserve(d, T, H, hidden);
 
   DBuf res(d, ResidualDType(), {T, H});
   res.Zero(d);
@@ -8771,6 +8804,7 @@ std::vector<float> Qwen3_5DenseModel::ForwardDense(
   DBuf dids(d, DType::kI32, {T}, token_ids.data());
   DBuf hidden(d, DType::kBF16, {T, H});
   vt::Embedding(d.q, hidden.t(), dtab, dids.t());
+  EmbedObserve(d, T, H, hidden);
 
   DBuf res(d, ResidualDType(), {T, H});
   res.Zero(d);
@@ -9069,6 +9103,7 @@ static void DenseEmbedInto(Dev d, DBuf& hidden,
   DBuf dids(d, DType::kI32, {T}, token_ids.data());
   ApplyDeviceTokenIdsOverride(d, dids, T);
   vt::Embedding(d.q, hidden.t(), dtab, dids.t());
+  EmbedObserve(d, T, H, hidden);
 }
 
 // The CAPTURABLE dense paged forward region (27B): everything AFTER the embedding
