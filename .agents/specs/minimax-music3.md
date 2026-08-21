@@ -5000,3 +5000,126 @@ above 0.24 s.
 **Evidence:** `.agents/benchmark-record.md`, section `MUSIC3-E2E-ON-MAIN`. Raw
 log `/workspace/music3-e2e/log-20260820T221735Z.txt` on the shared NAS, 1080
 lines, every bucket table for all seventeen runs.
+
+---
+
+## 21. The DiT gets a profile below the stage boundary (#672, [#1542](https://github.com/mudler/vllm.cpp/issues/1542)) — §20.6's "the DiT at 62 % of the run has no row"
+
+§20 measured `denoise.dit_device` at **370.556 s, 62.24 % of the developer's
+20 s / 30 steps run**, over 120 calls = 240 forwards, and closed with "the next
+row is the DiT". This is that row.
+
+### 21.1 The gap, stated exactly
+
+The instrument reports **one bucket** for the whole forward
+(`minimax_music3_speech.cpp:321`) and nothing inside it. Everything known about
+where those 370.556 s go is arithmetic performed on the outside of a black box.
+
+**The one number that frames the row.** 370.556 s over 240 forwards is
+**~1.544 s per forward**. At the shipped geometry — 36 blocks, `inner_dim` 2048,
+`ff_inner_dim` 8192, `num_attention_heads` 32 x `attention_head_dim` 64, and a
+window of ~689 latent frames so `seq` ~690 — one forward is
+
+| term | per forward at seq 690 |
+|---|---:|
+| block-stack GEMM (qkv, out, ff_in, ff_out) | 4.83 GFLOP/token x 690 = **3.33 TFLOP** |
+| attention scores + values, 36 layers | 0.14 TFLOP |
+| fp32 weight bytes read | 9.66 GB |
+
+so the forward runs at **~2.2 TFLOP/s** and reads its weights at ~6.3 GB/s. The
+weight traffic alone is ~35 ms at this box's bandwidth, so the forward is **44x
+above its memory floor** and the question is entirely what the compute is doing.
+That fraction of the device is not known, and this row's first job is to stop
+guessing it.
+
+### 21.2 THE DTYPE — settled against the oracle before any lever is proposed
+
+AGENTS.md is explicit that a token gate cannot detect a dtype that is too wide,
+so the DiT's fp32 was re-derived from the pinned oracle rather than taken from
+§2.1, and it is **upstream's resolved choice, not a too-wide accident**:
+
+| question | oracle answer, at pin `c6da9936` |
+|---|---|
+| what dtype does the converter give the transformer? | `scripts/convert_minimax_music3_to_diffusers.py:267` — `--dtype` defaults to `float32`; `:208` applies it as `convert_transformer(...).to(args.dtype)` |
+| is that overridden anywhere for this component? | no. `:214` forces the RVQ depth decoder to `torch.bfloat16` and **only** that one, which is what makes the transformer's fp32 a deliberate default rather than an unset one |
+| what does the pipeline cast into it? | `src/diffusers/modular_pipelines/minimax_music3/denoise.py:83` — `condition = condition.to(components.transformer.dtype)` |
+| what does the released artifact carry? | the checkpoint's `transformer/diffusion_pytorch_model-00001-of-00002.safetensors` header reports **`F32` for all 231 tensors** |
+
+**So a bf16 or TF32 DiT would be a divergence from the oracle, not a repair of
+one, and this row does not propose one.** The one precision-adjacent lever that
+is admissible is a mechanism that keeps the declared operand and accumulate
+dtype at fp32 — CUDA 13's cuBLASLt fp32 emulation
+(`CUBLASLT_MATMUL_DESC_EMULATION_STRATEGY`) is the candidate, and it is
+admissible only if it holds the EXISTING `kDitRelTol` 1e-4 / `kDitAbsFloor` 5e-5
+/ `kDitMeanAbsTol` 5e-6 bounds against the upstream capture with the margin
+§14.4 already records. It is measured before it is proposed, and rejected if the
+margin moves.
+
+**vLLM owns none of this.** vLLM and vLLM-Omni do not register this
+architecture, so `diffusers` is the primary oracle for the DiT under AGENTS.md
+`## When vLLM has no implementation`. The op beneath it is a different question:
+`vt::MatmulBT`'s CUDA provider is shared with every vLLM-mirrored path in the
+tree, so a change to its numerics or its plan handling is a **vLLM-owned**
+surface and is out of this row's scope unless it is bit-identical by
+construction.
+
+### 21.3 The instrument this row adds
+
+`music3_profile.h` already separates a LEAF from a SPAN: leaves partition the
+run and are summed, spans enclose leaves, are printed for context and are
+**never added**. The intra-DiT buckets are therefore SPANS, so
+`denoise.dit_device` stays the leaf, `sum(leaf)` is unchanged, `unattributed`
+stays a real quantity, and §15.7's and §20's tables stay comparable value for
+value.
+
+**They are behind a SECOND opt-in, and that is a correctness property of the
+measurement rather than caution.** Attributing time inside the forward needs a
+`Backend::Synchronize` at every span boundary, because the ops are asynchronous
+on one stream and an un-synchronized bracket measures the launch, not the
+kernel. Those syncs perturb the total. So `VLLM_CPP_MUSIC3_DIT_SPANS=1` is
+separate from `VLLM_CPP_MUSIC3_PROFILE=1`: with only the latter set the forward
+is byte-for-byte the path §20 timed, and the perturbation is MEASURED by running
+both arms in the same job rather than argued to be small.
+
+**The bucket set is the engagement control, which is the pattern §20.2
+established.** `Music3DepthDeviceForwardCount()` is unreachable from any
+production run, so a counter proves nothing about a shipped binary; a span that
+is present *iff* the code ran is the observable. `dit.*` spans appear only from
+`DitForwardDevice`, so their presence is the assertion that the device arm — not
+the host `DitForward` — produced the numbers beside them.
+
+### 21.4 Gates
+
+| id | gate |
+|---|---|
+| G1 | the spans partition the forward: `sum(dit.*)` is within the sync overhead of `denoise.dit_device` on the same run, and a deleted bracket shows up as a gap |
+| G2 | spans OFF is byte-for-byte the §20 path: no `Synchronize` and no clock read on the default configuration |
+| G3 | correctness unmoved — `test_minimax_music3_acoustic_real` at the SAME `kDitRelTol` / `kDitAbsFloor` / `kDitMeanAbsTol`, both arms, nothing widened |
+| G4 | reachability — deleting the production call site reddens the focused gate |
+| G5 | the A/B for whatever lever the profile names, alternated, on `thor:gpu0` under an `rc` lease, checkpoint staged with `SRC_BYTES == DST_BYTES`, `uptime` on both sides, and a BEHAVIOURAL control rather than a binary hash (#1516) |
+
+### 21.5 Risks
+
+* **The sync-per-span perturbation could exceed the split it reports.** Mitigated
+  by measuring both arms in one job and quoting the split as a within-arm ratio
+  only.
+* **A cuBLASLt lever moves a shared vLLM-mirrored op.** Any change to
+  `cuda_matmul.cu` is scoped to be bit-identical by construction or to be
+  refused; a numerics change there needs its own row and its own oracle.
+* **The window geometry is inferred.** ~689 latent frames per window is derived
+  from §20's vocoder call and the condition encoder's 25 Hz -> 86.13 Hz
+  resample; this row PRINTS `seq` from the running forward rather than carrying
+  the inference.
+
+### 21.6 Stop conditions
+
+Stop and report `NEEDS_DECISION` if the profile says the forward is at the
+device's fp32 ceiling, because then the only remaining lever is a precision
+change that §21.2 has already ruled a divergence from the oracle, and that is
+the developer's call and not this row's.
+
+### 21.7 Owed
+
+* The measurement itself, until the lease job below has run: every number in
+  §21.1 above the `1.544 s` division is derived from §20's totals and from the
+  config, not observed inside the forward.
