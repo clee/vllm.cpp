@@ -76,6 +76,12 @@ for arg in "$@"; do
 done
 
 CHECKERS=(
+  # FIRST deliberately. Every other gate reads a file for its own reason and
+  # measures its own budget, so a table row that is half one branch and half
+  # another satisfies all of them (#1417). This one asks whether a merge tool
+  # wrote into a tracked file at all, and a reader who sees it fail knows to
+  # stop reading the verdicts below.
+  check-conflict-markers
   check-prompt-contract
   check-agent-record
   check-release-binary-contract
@@ -83,9 +89,11 @@ CHECKERS=(
   check-windows-release-state
   check-container-matrix
   check-container-workflow
+  check-build-runtime-deps
   check-role-discipline
   claim-view
   check-readme-structure
+  check-quickstart-recipes
   check-public-doc-tables
   check-model-checklist
   check-supported-models
@@ -117,6 +125,8 @@ SUITES=(
   test_release_postpublish_audit
   test_check_container_matrix
   test_check_container_workflow
+  test_check_build_runtime_deps
+  test_validate_container_image
   test_release_index
   test_release_metadata
   test_release_accelerator_metadata
@@ -132,6 +142,7 @@ SUITES=(
   test_upstream_inventory
   test_doc_checkpoint
   test_check_readme_structure
+  test_check_quickstart_recipes
   test_check_public_doc_tables
   test_check_model_checklist
   test_check_supported_models
@@ -154,6 +165,7 @@ SUITES=(
   test_agent_pr_body
   test_check_symbol_anchors
   test_check_oracle_denominator_flags
+  test_check_conflict_markers
 )
 
 failed=()
