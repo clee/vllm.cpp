@@ -26070,12 +26070,15 @@ on the LINEAR-attention path, which the full-attention preamble does not touch.
 
 ## LTX25-DIT-ATTN-FLASH — the DiT self-attention was on the correctness-grade kernel; one arm measured, the box died before the other (2026-08-21, `row/LTX25-DIT-ATTN-FLASH`, #1549)
 
-**Read this before re-running the lever.** The change is landed and its
-correctness gates are green on GB10 at head_dim 128. What is NOT done is the
-same-binary A/B: the naive arm never ran. Two later corrections are folded in
-below and both narrow what this entry claims: f32 head_dim **256** was never
-launched (only its bit-identical fallback was), and the 6.23x ratio carried two
-undisclosed confounds and reads **~6.0x** once one of them is priced.
+**Read this before re-running the lever.** The change is landed and its LTX
+correctness gates are green on GB10. What is NOT done is the same-binary A/B: the
+naive arm never ran. Two later corrections are folded in below and both narrow
+what this entry claims. The 6.23x ratio carried two undisclosed confounds and
+reads **~6.0x** once one of them is priced. And the shared-memory cap-raise this
+row once carried is **reverted**, so its `test_ops_attention` evidence is
+withdrawn from this entry — the row never needed it, because LTX renders bf16 at
+head_dim 128 and that tile is 32,768 B, inside the 49,152 B a launch gets without
+any opt-in at all.
 
 ### Provenance
 
@@ -26093,27 +26096,32 @@ undisclosed confounds and reads **~6.0x** once one of them is priced.
 
 | gate | result |
 |---|---|
-| `test_ops_attention` on CUDA | 10/10 cases, **88,439/88,439** assertions, SUCCESS |
 | `test_ltx2_device` on CUDA | 22/22 cases, **749/749** assertions, SUCCESS |
 | CUDA-vs-host f32 | video `8.9407e-08`, audio `4.47035e-08`, against the committed `2e-5` |
 | CUDA-vs-CPU-backend bf16 | `0` on both streams |
 
-The assertion COUNT is the load-bearing number on the first row: 88,439 on CUDA
-against 23 on a CPU box. `test_ops_attention`'s new head_dim 64/128/256
-dense-flash case prints a skip line without a GPU, and `assertions: 0` is a skip
-wearing a pass, so the count is what proves it ran.
+**WITHDRAWN — the `test_ops_attention` row that used to head this table.** The
+lease also ran it at 10/10 and 88,439 assertions, and this entry no longer claims
+anything from that run, because the code it exercised is no longer in the tree:
+the row's shared-memory cap-raise is reverted in full. Two of that case's three
+arms would not have supported the claim in any event. f32 head_dim 128 (65,536 B)
+did launch and was genuinely repaired by the raise — but LTX never runs it, since
+the model's stream dtype in production is bf16. f32 head_dim 256 asks 131,072 B
+against GB10's queried 101,376 B opt-in ceiling, so it **never fitted at all**;
+the launcher fell back to `AttentionDenseFast`, which is BIT-IDENTICAL to the
+flash kernel by contract, and all 20,480 of that arm's assertions passed **with
+flash never launching at 256 once**. A numeric comparison cannot distinguish the
+two — that IS the contract — so the case measured a fallback and reported it as a
+launch. Both facts are kept here rather than deleted, because the next reader of
+this lever will otherwise re-derive them.
 
-**CORRECTION — what those assertions did NOT prove.** The f32 head_dim 128 launch
-IS repaired: 2 * 64 * 128 * 4 = 65,536 B, inside GB10's queried 101,376 B opt-in
-ceiling. **f32 head_dim 256 is NOT**, and an earlier version of this entry said it
-was. That tile is 2 * 64 * 256 * 4 = **131,072 B, above 101,376**, so it never
-fitted; the then-current launcher fell back to `AttentionDenseFast`, which is
-BIT-IDENTICAL to the flash kernel by contract, and all 20,480 of that arm's
-assertions passed **with flash never launching at 256 once**. A numeric
-comparison cannot distinguish the two — that IS the contract — so the case
-measured a fallback and reported it as a launch. The silent fallback is now gone:
-the launcher refuses, naming the bytes asked for and the ceiling refused, and the
-case asserts the device-derived outcome instead of assuming one.
+**Why the surviving rows and the render below are unaffected by that revert.** The
+measured binary carried the opt-in call, but it was a **no-op on every launch
+these numbers came from**: LTX's bf16 head_dim-128 video tile is
+`2 * 64 * 128 * 2` = 32,768 B and the audio tile 16,384 B, and the helper returns
+immediately below 49,152 B without touching the kernel. Removing a call that
+never fired cannot move a number. The advertised head_dim bound is a real and
+separate defect, owned by #1578.
 
 **The swap is NOT bit-identical on CUDA** and this record does not claim it is.
 `AttentionDenseFast` groups the head_dim partial sums across 32 lanes where the

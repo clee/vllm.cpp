@@ -89,16 +89,26 @@ say "=== [B] source, and the PRECONDITION that it carries this change ==="
 rm -rf "$SRC"; mkdir -p "$SRC"
 tar xzf "$W/src.tar.gz" -C "$SRC" || { echo "FATAL: cannot unpack source"; exit 31; }
 cat "$W/src.sha" 2>/dev/null | sed 's/^/  built_from=/'
-# BOTH sides, because a half-applied tree satisfies either alone.
+# BOTH sides, because a half-applied tree satisfies either alone: the swapped op
+# without the knob makes the naive arm a second flash arm, and the knob without
+# the swap makes the flash arm a second naive one. Either way the A/B measures
+# one thing twice and still prints two columns.
+#
+# THERE IS NO THIRD PRECONDITION, and there used to be. It grepped `cuda_ops.cu`
+# for a shared-memory opt-in that #1549 has since REVERTED (the row's section
+# 4.3: LTX renders bf16 at head_dim 128, whose K/V tile is 32,768 B and fits the
+# 49,152 B every CUDA architecture gives without an opt-in, so the raise was
+# never what this measurement needed). It also grepped for `FlashTileSmemOptIn`,
+# a spelling that never existed in any revision of that change -- the function
+# was called `SetDynamicSmemOptIn` -- so the check counted 0 and `exit 42`-ed on
+# a correct tree as readily as on a wrong one. A precondition that cannot pass is
+# not a stricter precondition.
 NEWOP=$(grep -c 'vt::AttentionDenseFlash' "$SRC/src/vllm/model_executor/models/ltx2_device.cpp")
 KNOB=$(grep -c 'VLLM_LTX2_DIT_FLASH_ATTN' "$SRC/src/vllm/model_executor/models/ltx2_device.cpp")
-SMEM=$(grep -c 'FlashTileSmemOptIn' "$SRC/src/vt/cuda/cuda_ops.cu")
 echo "  AttentionDenseFlash call sites: $NEWOP (want >= 1)"
 echo "  A/B knob sites:                 $KNOB (want >= 1)"
-echo "  shared-memory opt-in sites:     $SMEM (want >= 1)"
 [ "$NEWOP" -ge 1 ] || { echo "FATAL: #1549 is NOT in this source tree"; exit 40; }
 [ "$KNOB"  -ge 1 ] || { echo "FATAL: the A/B knob is NOT in this source tree; both arms would be one arm"; exit 41; }
-[ "$SMEM"  -ge 1 ] || { echo "FATAL: the shared-memory opt-in is NOT in this source tree"; exit 42; }
 
 say "=== [C] cutlass (resolved, never fetched) ==="
 CUT=""

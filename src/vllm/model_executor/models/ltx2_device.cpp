@@ -427,15 +427,32 @@ DBuf AttentionDev(Ctx& c, const Ltx2AttentionWeights& w, const Tensor& x, const 
       // video stream is 2352 tokens x 32 heads = 75,264 blocks each looping 2352
       // keys, x 48 layers, and ONE DiT forward measured 47.84 s on GB10. That
       // freeze is deliberate and correct — it is what keeps text decode
-      // byte-identical (cuda_ops.cu:3120-3122) — but it means the fast kernels
+      // byte-identical (cuda_ops.cu:3119-3121) — but it means the fast kernels
       // are SEPARATE OPS a caller opts into BY NAME, with no shape routing and no
       // fallback notice. A model that never opts in gets correct output at
       // roughly 500x the cost and nothing anywhere says so.
       //
-      // `AttentionDenseFlash` is head_dim-generic to 256, so both LTX streams
-      // (video 128, audio 64) are served, and its square-problem contract holds
-      // here by construction: this branch is entered only when
-      // `context == nullptr`, which is exactly when `s == tq` above.
+      // BOTH LTX STREAMS FIT THIS OP AT THE PRODUCTION DTYPE, and it is worth
+      // writing the arithmetic down rather than citing the advertised bound. The
+      // flash kernel's K/V tile is `2 * kFlashBc(64) * head_dim * sizeof(Tin)`
+      // and it never opts into more than the 49,152 B of dynamic shared memory
+      // every CUDA architecture guarantees. At the stream dtype this model
+      // actually renders in — bf16, per the VT_CHECK in
+      // `Ltx2StreamDitToDevice` — that is 32,768 B for the video stream's
+      // head_dim 128 and 16,384 B for the audio stream's 64. Both fit, so no
+      // cap-raise is needed here and #1549 does not make one; the op's
+      // ADVERTISED head_dim domain is a separate defect owned by #1578.
+      //
+      // The f32 arm is the L2 parity reference, not a serving path, and at
+      // head_dim 128 its tile is 65,536 B and does NOT fit. It is exercised at
+      // the fixture's reduced dimensions, where it does; at production geometry
+      // it now refuses, loudly and by name, rather than running slowly. That is
+      // recorded under `## Owed` in .agents/specs/ltx25-dit-attn-flash.md and
+      // tracked by #1612.
+      //
+      // The square-problem contract holds here by construction: this branch is
+      // entered only when `context == nullptr`, which is exactly when `s == tq`
+      // above.
       //
       // NOT bit-identical to `vt::Attention` on CUDA: the warp kernel groups the
       // head_dim partial sums across 32 lanes instead of a 256-thread block, so
