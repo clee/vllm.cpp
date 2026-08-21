@@ -1524,7 +1524,7 @@ a leased GPU and are W6's.
   through upstream's strategy-3 prefix scan, and the gate asserts 401 `kDirect`
   against 48 `kPrefix` so the count cannot be right for the wrong reason. The
   937 weight-bearing modules — one per `.weight` name, and exactly the ones the
-  loader cross-checks — split 208 / 193 / 536. 15 cases / 1649 assertions,
+  loader cross-checks — split 208 / 193 / 536. 22 cases / 1687 assertions,
   hermetic; the live re-read arm is env-gated on
   `VLLM_CPP_QWEN38_27B_MODELOPT_MTP_DIR` and skips loudly.
   **W4's 1968-name gate is untouched**, and re-ran green at 9 cases / 194
@@ -1596,14 +1596,27 @@ The refusal is reached from `LoadQwen3_5Dense`, and the gate enters through that
 function rather than constructing the resolver by hand. Proven by mutation:
 deleting the call site in a scratch copy compiles (`rc 0`, so this is not a
 build failure wearing a pass), `git diff --stat` shows the file changed, and
-five cases go red; restored byte-for-byte against a pre-taken sha256, green
-again. Seven further mutations inside the resolver and the manifests were each
-detected — the disabled unquantized-direction branch, an always-true
-`StaticFp8`, a reason-less MXFP8 arm, a suffix list without `.weight_scale_2`
-(4 cases), one deleted manifest row (4 cases), the deleted container skip, and
-the `input_scale`-rejecting NVFP4 check that discriminates the sibling guard.
-Every one printed its applied diff, its compile status and its restore hash, and
-the restored tree is green at 15 cases / 1649 assertions.
+EIGHT cases go red; restored byte-for-byte against a pre-taken sha256, green
+again. Ten further mutations inside the resolver and the manifests were each
+detected, and every one printed its applied diff, its compile status and its
+restore hash:
+
+| Mutation | Cases red |
+|---|---|
+| the production call site in `LoadQwen3_5Dense` is deleted | 8 |
+| `OperandSuffixes` drops `.weight_scale_2` | 7 |
+| one manifest row removed, the count literal left at 40 | 5 |
+| the NVFP4 refusal branch never fires | 2 |
+| an unseen operand family is skipped again | 2 |
+| `StaticFp8()` accepts any spelling | 3 |
+| the container skip is removed | 3 |
+| the unquantized-direction branch never fires | 1 |
+| the MXFP8 arm carries no reason | 1 |
+| a KV-cache scale counts as a quantized weight spelling | 1 |
+| `IsKvCacheScaleSuffix` stops recognising the two suffixes | 1 |
+| `ModeloptNvfp4()` rejects a module that also ships `input_scale` | 1 (the sibling guard, and only it) |
+
+The restored tree is green at 22 cases / 1687 assertions.
 
 ### What W5 did NOT deliver, and is owed
 
@@ -1618,6 +1631,68 @@ the restored tree is green at 15 cases / 1649 assertions.
   ([#1593](https://github.com/mudler/vllm.cpp/issues/1593)) and named under
   `## Owed`. W5 does not refuse it, because the identical declaration in
   `nvidia/Qwen3.6-27B-NVFP4`'s `config.json` would then refuse a gate model.
+
+### What the fresh review found, and what the repair changed
+
+The review mutated each claimed guarantee. Six findings, all repaired in the
+same branch. None of them changes what the loader DOES for a checkpoint whose
+config and tensors agree; what changed is what the gate can SEE.
+
+- **Half the guarantee could be deleted green.** `if (false && ...)` on the
+  NVFP4 refusal branch left the suite fully green at 15 cases / 1649
+  assertions. That branch is the entire cross-check for the 193 `W4A16_NVFP4`
+  modules — 48% of this artifact's 401 and 48% of the sibling's, `lm_head`
+  included — and nothing asserted it: every case exercised the FP8, the
+  unquantized, the MXFP8 or the unimplemented-algo arm, and the sibling-shape
+  case pins only the direction in which the branch must NOT fire. Two cases now
+  assert the refusal, one per shape a checkpoint can ship under that
+  declaration, both through `LoadQwen3_5Dense`. The review's exact mutation now
+  reds both.
+- **A tensor family the splitter has never seen was skipped, not refused.**
+  `SplitOperand` documents that `false` means "this resolver has never seen the
+  family, and the caller must NOT read that as unquantized", and `Refusal` did
+  read it as exactly that: the name belonged to no module, so nothing
+  cross-checked it in either direction. A declared-FP8 module shipping
+  `qweight`/`qzeros`/`scales` LOADED through the production entry point,
+  silently. It is refused by name now. The blast radius is measured rather than
+  assumed: both artifacts that reach this resolver classify EVERY name they
+  ship — 2001 of 2001 and 2194 of 2194 — so the arm cannot fire on either, and
+  a case asserts the first of those.
+- **The KV-cache skip asserted nothing.** `Refusal` skipped `k_scale`/`v_scale`
+  before any module was built, and `ModuleOperands::Add` had no branch for
+  either, so the skip changed no verdict and deleting it left the suite green —
+  while the sibling case carried the comment "the SUFFIXES must stay out of the
+  cross-check whatever a checkpoint does with them", an assertion no assertion
+  could read. The skip is gone and the decision now lives in one branch: `Add`
+  RECORDS a KV scale and `AnyQuantOperand` deliberately leaves it out, because
+  `kv_cache_quant_algo` is a sibling of `quantized_layers` and a bf16 tower
+  shipping a KV scale must not be refused for "shipping a quantized spelling".
+  Two cases hold the two directions and two mutations red them.
+- **The manifest count was a hand-maintained literal that `Append` iterated**,
+  so a row deleted without its count was an out-of-bounds read: a SIGSEGV
+  inside case 1 that aborted the binary with 14 cases never run, and a crash is
+  neither a pass nor a fail. The row count is derived with `std::size` and the
+  literal is asserted against the array rather than trusted by it. The same
+  mutation now reds 5 cases with all 22 having run.
+- **The file header's item (2) contradicted the case below it**, giving the
+  per-scheme composition as 208 / 624, 193 / 579 and 584 / 798 where the
+  assertions read 256 / 720, 193 / 579 and 536 / 702 — a difference of exactly
+  the 48 `linear_attn` containers and their 96 tensors, which resolve to FP8
+  through the strategy-3 prefix scan rather than staying unlisted. The asserted
+  set is the measured one and the prose now says so.
+- **The W6 blocker citation named a closed issue.** #1185 closed on 2026-08-18
+  as local-only. [#1632](https://github.com/mudler/vllm.cpp/issues/1632) files
+  what actually blocks W6 — the recorded DENOMINATOR configuration surviving a
+  lease, and this artifact's ~20.4 GiB being staged — and the five citations
+  name it.
+
+Two smaller things ride along. The branch was 24 commits behind `origin/main`,
+which is why preflight SKIPPED its `commit-trailers` and `commit-style` gates
+and reported nothing about this tree; it is merged up to `c020347a7` and both
+gates now run. And new cases are one per shape rather than grouped under
+`SUBCASE`, because a `REQUIRE` aborts its whole TEST_CASE and a subcase that
+reds hides every subcase after it — which is how the first red-before run
+reported one failure where there were three.
 
 ## Dependencies and blockers
 
