@@ -102,13 +102,19 @@ It fails LOUD — `Check(cudaGetLastError(), "attention-dense-flash launch")` at
 | Head-dim bound as pure host arithmetic | `include/vt/ops.h`, beside the `AttentionDenseFlash` declaration |
 | Honest refusal at the launcher | `src/vt/cuda/cuda_ops.cu` `LaunchAttentionDenseFlash` |
 | Rung-visibility checker | `scripts/check-attention-rung-consistency.py` |
+| One source of truth for the tile bytes | `LaunchAttentionDenseFlash` now sizes its `shmem` request from the SAME `AttentionDenseFlashSmemBytes` the guard reads, so the two cannot disagree |
 | In-flight stems, with owning issue | `scripts/attention-rung-allowlist.txt` |
 | Marker comments | the six deliberate model translation units |
 | Gate wiring | `scripts/agent-preflight.sh`, `.github/workflows/ci.yml` |
 
 The checker reuses `scripts/checker_text.py::normalize_source`, so a
 commented-out, `#if 0`-ed or `if (false)`-ed call is a deletion to it and never a
-site, and the reported `file:line` still describes the original file.
+site, and the reported `file:line` still describes the original file. It scans
+both `*.cpp` and `*.h` under the two model directories, because a call moved into
+an inline function or a template in a header would otherwise leave it green, and
+it keys its results on the PATH rather than the file stem, because `ltx2.cpp` and
+`ltx2.h` share a stem and one would overwrite the other. The allowlist still
+matches on the stem, so one entry covers a model's whole translation unit.
 
 ## Tests to port
 
@@ -120,7 +126,7 @@ New, all runnable with no GPU:
 
 | Test | Pins |
 |---|---|
-| `tests/scripts/test_check_attention_rung_consistency.py` | the checker's pure functions, and five mutations that must go RED |
+| `tests/scripts/test_check_attention_rung_consistency.py` | the checker's pure functions, and six mutations that must go RED |
 | `tests/vt/test_ops_attention.cpp` new cases | the shared-memory arithmetic, both honest bounds, and that 256 is outside both |
 
 One test needs a device and is declared PENDING rather than skipped quietly: a
