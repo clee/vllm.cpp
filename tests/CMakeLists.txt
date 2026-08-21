@@ -636,6 +636,9 @@ vllm_cpp_add_test(test_gemma4_honesty vllm/models/test_gemma4_honesty.cpp)
 # case that wants a different one.
 vllm_cpp_add_test(test_gemma4_moe_device_arm_guard
                   vllm/models/test_gemma4_moe_device_arm_guard.cpp)
+vllm_cpp_add_test(test_gemma4_indexed_max_t vllm/models/test_gemma4_indexed_max_t.cpp)
+target_compile_definitions(test_gemma4_indexed_max_t PRIVATE
+  VLLM_CPP_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 vllm_cpp_add_test(test_qwen3_moe_load vllm/models/test_qwen3_moe_load.cpp)
 vllm_cpp_add_test(test_qwen3_moe_forward vllm/models/test_qwen3_moe_forward.cpp)
 target_include_directories(test_qwen3_moe_forward PRIVATE ${CMAKE_SOURCE_DIR}/src)
@@ -2520,6 +2523,17 @@ vllm_cpp_add_test(test_qwen27_dflash_spec_decode
 target_compile_definitions(test_qwen27_dflash_spec_decode PRIVATE
   PARITY_GOLDENS_DIR="${CMAKE_SOURCE_DIR}/tests/parity/goldens")
 target_include_directories(test_qwen27_dflash_spec_decode PRIVATE
+  ${CMAKE_SOURCE_DIR}/tests/parity ${CMAKE_SOURCE_DIR}/src)
+
+# SPEC-DFLASH2 W6 — the DFlash2 e2e gate (#1314): G2 draft-token identity and
+# G3 SAME-TRAJECTORY acceptance against the beyond-pin oracle
+# (vllm-project/vllm#52816 @ 66e5414c6, TRITON_ATTN). dgx-only; loud SKIP
+# everywhere else, naming the two checkpoints and the golden it needs.
+vllm_cpp_add_test(test_qwen38_dflash2_spec_decode
+  parity/test_qwen38_dflash2_spec_decode.cpp)
+target_compile_definitions(test_qwen38_dflash2_spec_decode PRIVATE
+  PARITY_GOLDENS_DIR="${CMAKE_SOURCE_DIR}/tests/parity/goldens")
+target_include_directories(test_qwen38_dflash2_spec_decode PRIVATE
   ${CMAKE_SOURCE_DIR}/tests/parity ${CMAKE_SOURCE_DIR}/src)
 
 # SPEC-MTP M-mtp-2 — the 35B MoE-MTP k=1 speculative-decode three-way identity
