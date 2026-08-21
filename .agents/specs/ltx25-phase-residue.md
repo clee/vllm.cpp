@@ -380,7 +380,7 @@ W5 gates, mutations, and the record edits the change makes stale.
 | Issue | State |
 |---|---|
 | [#1536](https://github.com/mudler/vllm.cpp/issues/1536) | closed by this row |
-| [#1439](https://github.com/mudler/vllm.cpp/issues/1439) | **NOT closed by this row, and it must not be.** Its RED is fixed — the assertion it was filed against passes with 4.5 to 13 points of margin — but its filed complaint is that the budget is a SHARE OF `wall`, so it decides by box load and permits minutes of un-named time at 21 B. This row restores that assertion byte for byte, so the complaint is untouched. What would close it is a bound on a quantity the scheduler cannot move, which is [#1570](https://github.com/mudler/vllm.cpp/issues/1570) and this row's own negative result |
+| [#1439](https://github.com/mudler/vllm.cpp/issues/1439) | **NOT closed by this row, and it must not be.** Its RED is fixed — the assertion it was filed against passes with **4.50 to 4.63 points** of margin, equivalently a **9.9x to 13.5x** growth in the residue before it reds, across 76 runs by two measurers — but its filed complaint is that the budget is a SHARE OF `wall`, so it decides by box load and permits minutes of un-named time at 21 B. This row restores that assertion byte for byte, so the complaint is untouched. What would close it is a bound on a quantity the scheduler cannot move, which is [#1570](https://github.com/mudler/vllm.cpp/issues/1570) and this row's own negative result |
 | [#1494](https://github.com/mudler/vllm.cpp/issues/1494) | **already CLOSED by `6b48edb2c` before this row merged `main`.** This row takes the `denoise.update` anchor that change recorded as owed; it does not close the issue and does not claim to |
 | [#1470](https://github.com/mudler/vllm.cpp/issues/1470) | closed by this row |
 | [#1567](https://github.com/mudler/vllm.cpp/issues/1567) — the res_2s arm's `denoise.update` anchor | **owed, filed by this row.** `Ltx2Res2sDenoisingLoop` runs its own post-process and step inside `ltx2_res2s.cpp` through `Ltx2Res2sHooks`, so the anchor needs a hook rather than a statement. No gate in this tree renders on that arm, so landing it here would land dead code |
@@ -528,10 +528,24 @@ silently empty:
 |---:|---:|---:|---:|---:|---:|
 | 30 | **0** | **99.6302%** | 99.9637% | 99.9901% | 95% |
 
-The worst observation has **13 points of margin**, i.e. the residue would have to
-grow by a factor of thirteen before it reds, where before this row it sat at
-92.700% — under the floor. That is the difference between a gate and a coin flip,
-and it comes from §Design.2 rather than from any number.
+**A POINT MARGIN AND A GROWTH FACTOR ARE NOT THE SAME NUMBER**, and an earlier
+draft of this line fused them into "13 points of margin". They are both worth
+having and they are different quantities:
+
+| | `leaves/wall` | residue | margin | growth to red |
+|---|---:|---:|---:|---:|
+| worst of this row's 30 | 99.6302% | 0.3698% | **4.63 points** | **13.5x** |
+| worst of the reviewer's 46 | 99.4957% | 0.5043% | **4.50 points** | 9.9x |
+| the red this row removes | 92.700% | 7.300% | **−2.30 points** | — |
+
+So the worst observation across 76 runs by two measurers has **4.50 points** of
+margin, and the residue would have to grow **9.9x** before it reds, where before
+this row it sat 2.30 points UNDER the floor. That is the difference between a
+gate and a coin flip, and it comes from §Design.2 rather than from any number.
+
+This row is itself a case study in a quoted number becoming treated as measured,
+so the two are separated here rather than left as one figure a reader would
+inherit.
 
 **And the instrument's charge is reported at every one of them**, which is the
 half of #1439's request that does land: `unaccounted 0.00179039s` against
@@ -627,10 +641,25 @@ environment, the exit status and the evidence path, and not a summary of them.
 | 2 | the landing tree | `./build/tests/test_ltx2_video -s -tc='<the four cases this row owns>'` | 0 | **GREEN.** `4 cases \| 4 passed \| 0 failed`, `1382 assertions \| 0 failed`. Evidence `focus-retreat.log` |
 | 3 | `ec3e7ac0c` | `build-test-cpu` on a clean GitHub runner — the same `ctest --test-dir build --output-on-failure` over all 583 tests | 0 | **GREEN.** Job `96719179235`. That is the lane `test_ltx2_video` was red in, on the idle low-load machine this box cannot imitate |
 | 4 | `361bbfb05` | `build-newest-gcc` | 0 | **GREEN**, having been RED at the Build step on every commit since `5702d8f83`; repaired here as #1565 |
-| 5 | `361bbfb05` | `ctest --test-dir build --output-on-failure`, locally | — | **VOID, not a failure.** `test_ltx2_video` reports `Subprocess terminated***Exception` at 796.58 s, and its own output ends `FATAL ERROR: test case CRASHED: SIGTERM` at case 26 of 104 with **`763 assertions \| 763 passed \| 0 failed`**. An external `SIGTERM` on a shared box is an infrastructure failure presenting as a code verdict, and it is neither a red nor a green |
+| 5 | `361bbfb05` | `ctest --test-dir build --output-on-failure`, locally | — | **VOID, not a failure, and STOPPED at 482 of 584 on a fresh review's memory warning.** The box had ~1 GB free with swap 3/3 GB full, and `test_ltx2_video` has been kernel-OOM-killed on it three times at 30-36 GB anon-RSS, so the remaining 102 tests would have measured the box. Of the 482 that ran, the only failure is the one below. `test_ltx2_video` reports `Subprocess terminated***Exception` at 796.58 s, and its own output ends `FATAL ERROR: test case CRASHED: SIGTERM` at case 26 of 104 with **`763 assertions \| 763 passed \| 0 failed`**. No `ctest` TIMEOUT is configured and the default is 1500 s, so 796 s was an external kill rather than a timeout. An infrastructure failure presenting as a code verdict is neither a red nor a green |
 | 6 | the landing tree | the SUMS case, **30 consecutive runs** of the RESTORED floor, load 89-123 | 0 x30 | **GREEN 30/30**, every run reporting `cases=1`. `leaves/wall` min **99.6302%**, median 99.9637%, max 99.9901% against 95%. Evidence `floor30.log` |
 | 6b | `65e681438` | the same, **46 consecutive runs** by the FRESH REVIEWER, load 99-113 | 0 x46 | **GREEN 46/46**, `leaves/wall` min **99.4957%**, worst margin **4.50 points**. It also measured the residue's FLOOR at **0.820 ms**, which at the fixture's quiet 0.26271 s wall is 0.31% and leaves **4.69 points** of margin — so the floor holds at the fast end too, not only where contention inflates the denominator. The same reviewer verified the restoration is byte-exact against the merge base: identical predicates and constants, only `MESSAGE` text differs |
 | 7 | the landing tree | the SUMS case, 20 consecutive runs of the WITHDRAWN bound | 0 x20 | recorded because it is the measurement that was not enough: 1.021 to 1.464, which a fresh reviewer then showed is the body of a distribution reaching 4.115 over 45 runs. Evidence `ratios20.log` |
+
+**THE GATE'S SHA AND THE HEAD'S SHA ARE NOT THE SAME, and the difference is
+stated rather than left to be re-derived.** `AGENTS.md` wants the gate chained to
+the exact-SHA push. `build-test-cpu` ran at `65e681438`; the head carries the
+record repairs a fresh review asked for on top of it. Every commit between them
+touches `.agents/specs/ltx25-phase-residue.md` and nothing else, so no C++ gate
+reads a byte that moved and the verdict transfers by construction. The `git diff`
+between the two is one file.
+
+**And the `ec3e7ac0c` green is narrower than it looks.** Job `96719179235` is
+`completed`/`success` inside a run whose own conclusion is `cancelled`, which is
+the trap `.agents/verification.md` names — a run's conclusion is not its jobs'.
+More importantly that SHA still carried the WITHDRAWN bound, so it covers a
+different assertion set from the one landing. `65e681438` is the run that covers
+the landing assertions, and it is the one this table cites.
 
 **Row 1's exact failures**, which are the red this row exists to remove:
 
