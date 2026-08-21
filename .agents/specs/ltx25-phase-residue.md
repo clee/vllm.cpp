@@ -254,15 +254,34 @@ a `MESSAGE` rather than asserted, so a change that made the instrument ten times
 more expensive would widen both gates and print a small number. That is a real
 direction of drift, and it is recorded under `## Owed` rather than papered over.
 
-**Why it is not load-flaky, which is the property the four issues are about.**
+**Why it is not load-flaky, which is the property the four issues are about —
+and the argument this row first gave for it, which is WRONG.**
+
 The old ratio compares a residue that a preemption inflates against a wall that
 the same preemption inflates only if it lands inside a leaf; the residue is 0.5%
 of the timeline, so 99.5% of preemptions help the ratio and 0.5% destroy it, and
-that is the coin flip #1439 and #1494 measured. The new bound compares the gap
-against the instrument's own measurement OF THAT GAP. A preemption inside a gap
-lands inside an instrument entry point with overwhelming probability — the
+that is the coin flip #1439 and #1494 measured. That half stands.
+
+This spec then argued that the new bound is immune because *"a preemption inside
+a gap lands inside an instrument entry point with overwhelming probability — the
 un-instrumented part of an adjacent-scope gap is a call and a return — so it
-inflates both sides of the comparison together.
+inflates both sides of the comparison together."* **A fresh review measured that
+and it is false.** Decomposing a bare micro-timeline's uncovered time: fast, its
+inter-child gaps are 9-20 us over seven boundaries against a 13-22 us charge;
+slow, 91-105 us against 52-61 us. The un-instrumented part dilates FASTER. The
+same review reddened the unit case 2 times in 200 at load 85 and 28 in 160 at
+load 125.
+
+**What actually conditions the render-level bounds is different, and it is
+measured rather than argued.** A render's boundaries carry a `Tick` and a
+`/proc/self/statm` read INSIDE the instrumented region, so the measured part of
+each gap dominates the part that is not, and the ratio stays near 1: 20 of 20
+runs of the table bound at 1.021 to 1.464, and the eight leaf measurements at
+1.02 to 1.46 by two independent measurers. Eight bare scopes carry neither, which
+is why the unit case reports the ratio and no longer asserts it. The claim this
+row makes is therefore empirical and scoped to the render, not a property of the
+comparison in general, and `## Outcome` carries the distribution that supports
+it.
 
 ### 4. The sibling pairing (1b) is strengthened, not weakened
 
@@ -317,6 +336,11 @@ configuration:
 Every gate run records `wall`, `unaccounted`, `instrument_seconds` and the ratio
 between the last two, because the bound in §Design.3 is only defensible while
 that ratio is measured rather than assumed.
+
+**The Result column above states what each gate is FOR, not what it returned.**
+A fresh review was right to refuse it as evidence. The SHA, the exact command,
+the environment, the exit status and the evidence path for every run are in
+`## Outcome`, under `### The gate report` and `### The mutations`.
 
 ## Dependencies
 
@@ -475,26 +499,48 @@ render's wall, and therefore to the residue.
 ### The measured ratios, which are what makes the bound defensible
 
 `kInstrumentBudget = 2` says the part of a gap the instrument cannot measure is
-at most as large as the part it can. Measured, on the loaded box described above:
+at most as large as the part it can. That is only worth anything as a
+distribution, so here is one, at `37f7f9aca` on the loaded box described above.
 
-| where | uncovered / charged |
-|---|---:|
-| the table, one-render case | **1.32** |
-| `denoise`, 9 frames | 1.08 |
-| `denoise`, 81 frames | 1.10 |
-| `decode.audio`, 9 frames | 1.08 |
-| `decode.audio`, 81 frames | 1.08 |
-| `decode.video`, 9 frames | 1.26 |
-| `decode.video`, 81 frames | 1.22 |
-| `artifacts.frames`, 9 frames | 1.41 |
-| `artifacts.frames`, 81 frames | 1.25 |
-| the `unit.parent` unit case | 1.21 |
+**The table bound, 20 consecutive runs of the SUMS case at load average 94-102,
+20 of 20 green and every run reporting `cases=1`:**
 
-The largest is 1.41 and most sit near 1.1. The spec's stop condition was that a
-ratio far from 1 would mean the instrument does not measure enough of its own
-gap and the bound would be a constant nobody derived; it is not, and the join
-charge above is the one place where it WAS and was repaired rather than absorbed
-into a larger factor.
+| min | median | max | bound |
+|---:|---:|---:|---:|
+| 1.021 | 1.065 | **1.464** | 2 |
+
+**The four carrying leaves, both geometries, one run:**
+
+| leaf | 9 frames | 81 frames |
+|---|---:|---:|
+| `denoise` | 1.109 | 1.068 |
+| `decode.video` | 1.220 | 1.163 |
+| `decode.audio` | 1.056 | 1.071 |
+| `artifacts.frames` | 1.257 | 1.196 |
+
+A fresh review measured the same eight quantities independently at `ec3e7ac0c`,
+before the `Open`-progress-line charge landed, and read 1.02 to 1.46.
+
+**And the one place the ratio does NOT behave, which the same review found and
+which is why the unit case no longer asserts it.** The `unit.parent`
+micro-timeline reddened 2 of 200 consecutive runs at load 85, and a standalone
+probe of the same shape reddened 28 of 160 at load 125, reaching 5.55, and 14.1
+under `address,undefined`. Decomposing that parent's uncovered time explains it:
+fast, its inter-child gaps are 9-20 us over seven boundaries against a 13-22 us
+charge; slow, 91-105 us against 52-61 us. **The un-instrumented part of a
+boundary dilates faster than the instrumented part when the box slows**, which is
+the opposite of §Design.3's claim that a preemption inflates both sides together.
+
+That claim is therefore wrong as stated, and what saves the render-level bounds
+is not it: a render's boundaries carry a `Tick` and a `/proc/self/statm` read
+INSIDE the instrumented region, so the measured part dominates and the ratio
+stays near 1. Eight bare scopes carry neither. The gates keep the bound because
+their measured distribution supports it over 20 runs and two independent
+measurers; the unit case reports the ratio and does not assert it, because at
+that scale the quantity is not well conditioned. The stop condition this row set
+itself — that a ratio far from 1 makes the bound a constant nobody derived — is
+met at the render and is NOT met at the micro scale, and both halves are written
+down here rather than only the convenient one.
 
 ### What is stricter, stated as the numbers at both ends
 
@@ -552,6 +598,84 @@ slack of 1.658 ms against a smallest leaf of 2.77 ms, 1.67x from vacuous.
 `Record::instrument_seconds` is that normaliser: it is measured on the same
 instrumented path, so an instrumented build inflates the charge and the residue
 together and the bound needs no `#if`.
+
+### The gate report
+
+`.agents/verification.md` asks for the immutable SHA, the exact command, the
+environment, the exit status and the evidence path, and not a summary of them.
+The `## Gates` table above states intentions, which is what a fresh review
+correctly rejected as evidence. This is the record.
+
+**Environment for every row below.** x86_64, 20 cores,
+`cmake -S . -B build -DVLLM_CPP_BUILD_TESTS=ON` with an **empty**
+`CMAKE_BUILD_TYPE`, which is what `build-test-cpu` uses. Load average **94 to
+140** throughout, with three to five other sessions running this same suite. That
+is stated because it is the subject: the two assertions this row replaced decided
+by that number.
+
+| # | SHA | command | exit | result |
+|---|---|---|---|---|
+| 1 | `67823aee2` (base) | `./build/tests/test_ltx2_video` | 1 | **RED.** `102 cases \| 100 passed \| 2 failed`, `4170 assertions \| 4167 passed \| 3 failed`. Evidence `red1.log` |
+| 2 | `37f7f9aca` | `./build/tests/test_ltx2_video -s -tc='<the four cases this row owns>'` | 0 | **GREEN.** `4 cases \| 4 passed \| 0 failed`, `1381 assertions \| 0 failed`. Evidence `focus-repaired.log` |
+| 3 | `37f7f9aca` | the SUMS case, 20 consecutive runs | 0 x20 | **GREEN 20/20**, every run reporting `cases=1` so the filter is not silently empty. Table ratio min **1.021**, median **1.065**, max **1.464** against the bound of 2, at load 94-102. Evidence `ratios20.log` |
+| 4 | `37f7f9aca` | `ctest --test-dir build --output-on-failure` | see `## Now` | the full gate |
+
+**Row 1's exact failures**, which are the red this row exists to remove:
+
+```
+:3256: MESSAGE: phase table: wall=0.26271s leaves=0.243533s unaccounted=0.0191776s over 35 entries
+:3259: ERROR: CHECK( leaves >= 0.95 * wall ) is NOT correct!
+  values: CHECK( 0.243533 >= 0.249575 )
+:3693: MESSAGE:   denoise = 0.00679651s over 1 leaf record(s), of which 8 sub-scope(s) cover 0.00640374s (94.221%)
+:3696: ERROR: CHECK( covered >= c.min_coverage * leaf_seconds ) is NOT correct!    [x2]
+  values: CHECK( 0.00640374 >= 0.00645668 )
+```
+
+**What row 2 reports where row 1 failed.** `denoise` coverage moves from
+**94.221% to 99.9685%** at nine frames and to 99.9872% at 81, because the
+sampler's per-step update now has a name. The four carrying leaves read, as
+`uncovered / leaf_instrument`:
+
+| leaf | 9 frames | 81 frames |
+|---|---:|---:|
+| `denoise` | 1.109 | 1.068 |
+| `decode.video` | 1.220 | 1.163 |
+| `decode.audio` | 1.056 | 1.071 |
+| `artifacts.frames` | 1.257 | 1.196 |
+
+A fresh review measured the same eight quantities independently at
+`ec3e7ac0c`, before the `Open`-progress-line charge landed, and read 1.02 to
+1.46. The bound is 2.
+
+### The mutations
+
+Five, all run by a **fresh reviewer** on `ec3e7ac0c` in its own worktree, each
+one restored with `git checkout --` and verified with an empty `git diff --stat`.
+The compile status is printed for each, because a mutation that fails to build
+reads as a passing test.
+
+| mutation | built | reddened |
+|---|---|---|
+| **A** delete the `load.setup` production call site | `compile_status=0` | **YES.** The name list at `:3277` **and** the new residue bound at `:3326`, `CHECK( 0.0223456 <= 0.00844218 )` |
+| **B** delete the `denoise.update` anchor, keep its counter | `compile_status=0` | **YES.** The record count (0) at `:3678`, `0 == 8`, and `REQUIRE(!found.empty())` at `:3702` |
+| **C** `ChargeLocked` charges everything to the table | `compile_status=0` | **YES.** Four assertions: `:4978`, `:5004`, `:5020`, `:5086` |
+| **D** `denoise.update` moved below the two `PostProcessLatent` calls | `compile_status=0` | **YES, on one of the two renders.** The coverage bound at `:4122`, ratio 2.40 on one and 1.28 on the other |
+| **E** `Sum(records, Elapsed())` restored after the copy-and-sort | `compile_status=0` | **NO — green 10 of 10.** Recorded under `## Owed`, not explained away |
+
+**Mutation A is the red-before evidence for the replacement**, and it is the row
+that `## Gates` promised and did not have. It reddens the NEW bound by 2.6x on a
+tree where the naming is gone and everything else is this row's, which is the
+same defect the old ratio was firing on — and it does so at a wall where the old
+ratio's 5% would have passed.
+
+**Mutation D is honest about its reach.** It reds on one render of two. The
+anchor stops covering the post-process, the uncovered part grows by exactly that
+work, and on the render where the leaf is larger the growth is still inside the
+budget. That is a partial detection, not a full one, and it is the same shape the
+`part_min_coverage` note already records for a half-covered anchor.
+
+**Mutation E is a finding, not a pass.** It is F2 above: `WriteJson`'s clock
+ordering is a reading of the source and no assertion sees it.
 
 ### A trap that is named rather than engineered around
 

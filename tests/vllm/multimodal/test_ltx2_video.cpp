@@ -80,6 +80,13 @@ namespace {
 // this are recorded in `.agents/specs/ltx25-phase-residue.md` `## Outcome`; a
 // value that starts creeping toward 2 is that spec's stop condition, not a
 // reason to write 3 here.
+//
+// AND IT IS ONLY WELL CONDITIONED WHERE A `Tick` AND A `/proc/self/statm` READ
+// SIT INSIDE THE BOUNDARY, which is every use of it below and is NOT a general
+// property of the comparison. A fresh review measured a bare micro-timeline
+// reaching 5.55 at load 125 and 14.1 under `address,undefined`, because there
+// the un-instrumented part of a boundary dilates faster than the instrumented
+// part. Do not reach for this constant from a site whose scopes wrap nothing.
 constexpr double kInstrumentBudget = 2.0;
 
 struct Workspace {
@@ -4115,12 +4122,23 @@ void CheckCarryingPhase(const nlohmann::json& table, const Carrying& c) {
   // part it can, and it states nothing else. Nothing in it is a share of the
   // render, so it says the same thing at 64x64x9 and at 3840x2160x241.
   //
-  // AND IT IS NOT LOAD-FLAKY, which is the property four issues are about. A
-  // preemption inside a gap lands inside an instrument entry point with
-  // overwhelming probability, because the un-instrumented part of the gap
-  // between two adjacent scopes is a call and a return. So it inflates both
-  // sides of this comparison together, where the old ratio inflated only the
-  // numerator it was dividing by the leaf.
+  // AND WHY IT IS NOT LOAD-FLAKY *HERE*, WHICH IS NOT THE REASON THIS COMMENT
+  // FIRST GAVE. It claimed that a preemption inside a gap lands inside an
+  // instrument entry point with overwhelming probability, so it inflates both
+  // sides together. A fresh review measured that on a bare micro-timeline and it
+  // is FALSE: the un-instrumented part of a boundary — the `lock_guard` release,
+  // the `Close` return, the `Scope` destructor and constructor, the call into
+  // `Open` up to its clock read — dilates FASTER than the instrumented part when
+  // the box slows. Gaps of 9-20 us against a 13-22 us charge when fast; 91-105 us
+  // against 52-61 us when slow.
+  //
+  // What conditions THESE four leaves is that their boundaries carry a `Tick`
+  // and a `/proc/self/statm` read INSIDE the instrumented region, so the measured
+  // part dominates the part that is not. Measured at this bound: 1.02 to 1.46
+  // over eight leaf measurements by two independent measurers, and 1.021 to
+  // 1.464 over 20 consecutive runs of the sum bound. The claim is empirical and
+  // scoped to a render; the unit case one screen down carries the same ratio
+  // UNASSERTED because at eight bare scopes it is not conditioned at all.
   double covered = 0.0;
   for (const std::pair<double, double>& iv : subs) covered += iv.second - iv.first;
   const double uncovered = leaf_seconds - covered;
