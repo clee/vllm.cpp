@@ -171,6 +171,33 @@ f32 with head_dim >= 96, not only LTX. It is filed as part of
 [#1549](https://github.com/mudler/vllm.cpp/issues/1549) and fixed in the same
 flow, per the AGENTS.md in-flow rule.
 
+**This is not a hypothesis: the identical failure is already documented one file
+over, and was fixed there and never back-ported.**
+`src/vt/cuda/cuda_attention_cross.cu:88-96` — a kernel written for this very
+model, and itself a structural port of `AttentionDenseFlashKernel` — says:
+
+> LTX-2.5's video stream is head_dim 128, and at f32 a fixed 64-column tile would
+> ask for `2 * 64 * 128 * 4` = 64 KiB of dynamic shared memory — over the 48 KiB
+> a launch gets without opting in — so the kernel would fail to launch on exactly
+> the real geometry while every reduced-dimension gate (head_dim 8 and 4) passed.
+
+Same number, same arithmetic, same reason the existing gates cannot see it. That
+author chose to **halve the tile** until it fits (`ChooseTileCols`). This row
+chooses to **opt in** instead, and falls back only where the device's queried
+ceiling refuses: GB10 reports 101,376 B, so the full 64-column tile fits at f32
+head_dim 128 and the reuse is kept rather than halved. Where a device cannot, the
+fallback is `AttentionDenseFast`, which is bit-identical rather than merely
+narrower.
+
+Two things follow that are worth stating. The first is that "every
+reduced-dimension gate passed" is why this row's new `test_ops_attention` case
+runs at the REAL head_dims (64, 128, 256) rather than the fixture's. The second
+is that `vt::AttentionCross` on CUDA is already flash-tiled, so **the LTX DiT's
+cross-attentions were never on the naive kernel** — the four cross-attentions per
+block and the two self-attentions were on different kernels the whole time, and
+only the self-attentions were slow. That makes §2's attribution tighter, not
+looser.
+
 ### 4.4 The A/B knob
 
 `VLLM_LTX2_DIT_FLASH_ATTN=0` restores `vt::Attention` at the swapped call site,
