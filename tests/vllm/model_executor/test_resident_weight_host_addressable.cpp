@@ -442,13 +442,43 @@ TEST_CASE("a MISALIGNED BORROW is not re-homed, and stages instead") {
   uint8_t* off = base + (vllm::kDeviceAliasAlignment -
                          (reinterpret_cast<uintptr_t>(base) %
                           vllm::kDeviceAliasAlignment)) + kMisalign;
-  // The write is bound to the buffer HERE, because this arithmetic is wrong only
-  // on the runs where the allocator happens to return an aligned block, and a
-  // plain lane cannot see the overrun on the runs where it does. This holds for
-  // whichever block this run got; the allocation above is sized for the worst
-  // one, which is the aligned case this assertion would otherwise only catch
-  // some of the time.
-  REQUIRE(off + nb <= base + backing->size());
+  // TWO ASSERTIONS, AND THE FIRST ONE IS THE ONE THAT ALWAYS RUNS.
+  //
+  // (a) THE CAPACITY, checked against the WORST case rather than against the
+  // block this run happened to get. The padding expression above yields a whole
+  // `kDeviceAliasAlignment` when `base` is already aligned, so the largest offset
+  // it can produce is `kDeviceAliasAlignment + kMisalign` and the buffer needs
+  // that much slack on top of `nb` whatever the allocator returned. This is
+  // DETERMINISTIC: it reds on every run, in every lane, on every allocator, which
+  // (b) below does not.
+  //
+  // It is close to restating the allocation, and that is deliberate rather than
+  // careless -- an assertion that reads its expectation off the line above it
+  // proves nothing on its own. What it buys is that shrinking one of the two
+  // lines is caught, which is exactly how the defect arrived: the allocation said
+  // `nb + kDeviceAliasAlignment` while the offset said `+ kMisalign` on top of a
+  // full alignment. (b) is the assertion that is not a restatement, and it is
+  // second because it cannot stand alone.
+  REQUIRE(backing->size() >= nb + vllm::kDeviceAliasAlignment + kMisalign);
+  // (b) THE WRITE ITSELF, bound to the block this run actually got. Honest about
+  // its own reach: it fires only when `base % kDeviceAliasAlignment < kMisalign`,
+  // because that is the only case where the offset runs past the end.
+  //
+  // MEASURED, with the allocation shrunk back and (a) taken out, it is not merely
+  // lane-dependent -- it is BUILD-dependent, which is worse. The residue
+  // `base % kDeviceAliasAlignment` is deterministic inside one binary and
+  // arbitrary across binaries, because every earlier allocation in the process
+  // shifts it. Two builds of the SAME mutation: one reds 40 times out of 40 in
+  // the plain lane, and one with a single extra `MESSAGE` line ahead of this
+  // assertion reports `base % 256 == 176` and stays GREEN 20 times out of 20.
+  // Under TSan the same mutation reds 6 times out of 6, at `base % 256 == 0`.
+  // So this assertion can be silenced by an unrelated edit to a line above it.
+  // That is why (a) is there and why (a) is first.
+  //
+  // Written as an integer comparison, not a pointer one: doctest decomposes
+  // `off + nb <= base + backing->size()` into `1 <= 1` because it stringifies the
+  // pointers as bools, so the red printed nothing a reader could act on.
+  REQUIRE(static_cast<size_t>(off - base) + nb <= backing->size());
   std::memcpy(off, w.bytes.data(), nb);
   w.bytes = vllm::OwnedBytes::Borrow(
       off, nb, std::static_pointer_cast<const void>(backing));

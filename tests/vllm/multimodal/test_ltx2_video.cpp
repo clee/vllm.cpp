@@ -3687,7 +3687,17 @@ void CheckCarryingPhase(const nlohmann::json& table, const Carrying& c) {
   }
 
   // (1c) THE LEAF DOES NOT EXTEND BEYOND ITS ANCHORS, and this assertion is the
-  // one that actually catches what (2) below was written for.
+  // one that catches what (2) below was written for -- down to its own
+  // resolution, which is stated here rather than left to be discovered.
+  //
+  // WHAT IT DOES NOT CATCH, MEASURED. At fixture scale this bounds a swallow at
+  // 0.25 ms and sees nothing smaller. A mutation that opens `denoise` at the top
+  // of `phase.prepare`, so the whole prepare becomes un-named time inside the
+  // leaf, moves the span slack from 26.6 us to 124.6 us and the case stays GREEN,
+  // because `phase.prepare` is only about 125 us on this fixture. The coverage
+  // floor (2) misses it too -- it moved 0.4 points -- so this is not a regression
+  // against the shape that shipped, but it IS the limit of the instrument at this
+  // geometry, and `### Owed out of W0` is where the leaf-by-leaf version lives.
   //
   // MEASURED, because the previous shape of this gate was argued rather than
   // measured and it decided by box load for two days (#1439, #1494). The
@@ -3716,19 +3726,33 @@ void CheckCarryingPhase(const nlohmann::json& table, const Carrying& c) {
   // between evaluations" from "a phase nobody named is wearing this label"; the
   // span slack can, because only the second one lands here.
   //
-  // TWO TERMS, so the assertion says the same thing at both scales, which is what
-  // both issues asked for. The share binds at production scale, where a leaf is
-  // minutes and 2% of it is seconds. The absolute term binds at fixture scale,
-  // where `artifacts.frames` is a 0.85 ms leaf and 2% of it is 17 us -- below
-  // what two scope boundaries cost on a contended two-core runner. Worst
-  // head-plus-tail observed over eight renders and four leaves is 102.5 us, so
-  // 1 ms is ~10x the worst measurement rather than a number fitted to it.
+  // ONE FLAT CONSTANT, AND DELIBERATELY NOT A SHARE OF THE LEAF. This bound was
+  // first written `max(1 ms, 2% of the leaf)`, on the reasoning that a share is
+  // what keeps an assertion meaningful at production scale. A fresh review showed
+  // that reasoning inverts here, and the measurement agrees with the review:
+  //
+  //   * A share inside a `max` never tightens, so it is pure slack and it is
+  //     LARGEST exactly where the leaf is largest. Under load `denoise` reached
+  //     3.82 s with 38 us of slack against a 76 ms bound, and `decode.audio`
+  //     3.07 s with 39 us against 61 ms -- 500x to 2200x. At production scale a
+  //     swallowed phase of several seconds would have passed.
+  //   * The quantity does not grow with the render. It is two instrument
+  //     boundaries, and every measurement taken of it -- eight renders and four
+  //     leaves here, plus a fresh review's own runs under an eight-way spin load
+  //     where the denoise leaf ballooned to 3.82 s -- is at or under 135 us
+  //     whatever the leaf did. A constant therefore holds on all of them and is
+  //     strictly tighter than the share at every leaf size.
+  //
+  // 0.25 ms is the constant: about 2.4x the worst value this row measured
+  // (102.5 us) and about 1.9x the worst the review measured (135 us). It is a
+  // multiple of a measurement rather than a number fitted to make today's run
+  // pass, and it is below the smallest leaf in the table so the check can
+  // actually fail -- which the 1 ms version could not, see the REQUIRE below.
   //
   // Computed PER LEAF RECORD, because `decode.video` has two or three of them and
   // taking the first record's start against the last record's end would charge
   // this leaf for the `artifacts.frames` it declares as a partner.
-  const double kSpanSlackShare = 0.02;
-  const double kSpanSlackSeconds = 0.001;
+  const double kSpanSlackSeconds = 0.00025;
   double span_slack = 0.0;
   for (const nlohmann::json& leaf : leaves) {
     const double lo = leaf["start_seconds"].get<double>();
@@ -3747,7 +3771,24 @@ void CheckCarryingPhase(const nlohmann::json& table, const Carrying& c) {
     // strictest one.
     span_slack += any ? (first_in - lo) + (hi - last_in) : (hi - lo);
   }
-  const double span_bound = std::max(kSpanSlackSeconds, kSpanSlackShare * leaf_seconds);
+  const double span_bound = kSpanSlackSeconds;
+  // THE BOUND MUST BE ABLE TO FAIL, and this is a REQUIRE because a check that
+  // cannot fail is worse than no check. `span_slack <= leaf_seconds` holds by
+  // construction above, so any bound at or above the leaf makes the CHECK below
+  // vacuous -- it passes at 100% slack. The 1 ms version this line first carried
+  // did exactly that on `artifacts.frames`, which measures 0.826-0.983 ms here:
+  // ten of twelve checks reddened under a forced-strict probe and that leaf's two
+  // passed AT 100% SLACK. Worse, it was a coin flip -- on slower runs the same
+  // leaf measured 1.35-13.9 ms and the check did bite -- so whether the assertion
+  // existed at all depended on box speed, which is the property this whole change
+  // exists to remove. A leaf that ever shrinks under the instrument's own noise
+  // floor now reds here and says so, instead of passing quietly.
+  REQUIRE_MESSAGE(span_bound < leaf_seconds,
+                  "the '" << c.leaf << "' leaf is " << leaf_seconds << "s, at or under the "
+                      << span_bound << "s span-slack bound, so the check below cannot fail: "
+                      << "`span_slack <= leaf_seconds` already holds by construction. This leaf "
+                         "has shrunk beneath the instrument's own noise floor and is no longer "
+                         "measurable by it");
   MESSAGE("  " << c.leaf << " span slack = " << span_slack << "s of " << leaf_seconds
                << "s (" << (100.0 * span_slack / leaf_seconds) << "%), bound " << span_bound
                << "s");
@@ -3778,9 +3819,10 @@ void CheckCarryingPhase(const nlohmann::json& table, const Carrying& c) {
   // `decode.video.vae` and `decode.audio.vocoder` floors beside it are set by:
   // it is worth having where honest and defective separate by a wide margin, and
   // it is not the assertion that carries this leaf. What carries it is (0), the
-  // record count taken from `Ltx2ConditioningTrace`, and (1c) above, which is
-  // ~10x tighter on the swallow than the 0.95 ever was. NOTHING WAS DELETED to
-  // get here: this number moved and an assertion was added beside it.
+  // record count taken from `Ltx2ConditioningTrace`, and (1c) above, which bounds
+  // the head and the tail at a flat 0.25 ms and does not move with the box.
+  // NOTHING WAS DELETED to get here: this number moved and an assertion was added
+  // beside it.
   double covered = 0.0;
   for (const std::pair<double, double>& iv : subs) covered += iv.second - iv.first;
   MESSAGE("  " << c.leaf << " = " << leaf_seconds << "s over " << leaves.size()
@@ -4059,18 +4101,16 @@ void CheckRenderPhases(const nlohmann::json& table,
   //    one number below both arms replaces two numbers sitting inside each.
   //
   //    WHAT REPLACES IT IS ASSERTION (1c), the span slack, which bounds the head
-  //    and the tail -- the only place a swallowed phase can land -- at 1 ms or
-  //    2% of the leaf, against a measured 12-40 us on the leaves where the
-  //    absolute term binds. STATED CAREFULLY, because the tempting claim is
-  //    false: 5% of a 13.7 ms leaf is 685 us, which is NUMERICALLY close to the
-  //    1 ms here. The difference is not the number, it is that the old bound
-  //    covered the head, the tail AND the interior together while the interior
-  //    alone measured 1046 us on the runner that reported it -- so the budget
-  //    was already spent before any swallow, the assertion could not be
-  //    satisfied by an honest tree, and it therefore bounded nothing. The new
-  //    one is spent by 12-40 us and does not move with the box. Nothing was
-  //    deleted to get there: this parameter moved and an assertion was added
-  //    beside it.
+  //    and the tail -- the only place a swallowed phase can land -- at a flat
+  //    0.25 ms, against a measured 12-40 us on this fixture. NO CLAIM IS MADE
+  //    THAT THIS IS TIGHTER THAN 0.95 IN NUMBERS, because it is not: 5% of a
+  //    13.7 ms leaf is 685 us. The point is a different one. The old bound
+  //    covered the head, the tail AND the interior together, while the interior
+  //    alone measured 1046 us on the runner that reported it -- so the budget was
+  //    already spent before any swallow, no honest tree could satisfy it, and it
+  //    therefore bounded nothing at all. The new one is spent by 12-40 us and
+  //    does not move with the box. Nothing was deleted to get there: this
+  //    parameter moved and an assertion was added beside it.
   //
   //    NAMING THE UN-NAMED TIME WOULD SETTLE IT PROPERLY, which is what #1439
   //    asks for first. A `denoise.update` scope over the sampler's per-step

@@ -2384,9 +2384,36 @@ with the tree.
 Assertion (1c), the SPAN SLACK, is new and is what now carries this leaf beside
 the (0) record count. It bounds the leaf's seconds lying outside the span its
 sub-scopes occupy -- computed per leaf record, because `decode.video` has two or
-three -- at `max(1 ms, 2% of the leaf)`. That is the only place a swallowed phase
-can land, it is two instrument boundaries rather than N intervals of work, and it
-measured 12-40 us on the leaves where the absolute term binds.
+three -- at a FLAT 0.25 ms. That is the only place a swallowed phase can land, it
+is two instrument boundaries rather than N intervals of work, and it measured
+11.4-64.3 us across all four leaves and both renders.
+
+The bound was first written `max(1 ms, 2% of the leaf)` and a fresh review broke
+that shape twice, both correctly:
+
+* **The share never tightens.** Inside a `max` it is pure slack, and it is
+  LARGEST where the leaf is largest -- under load `denoise` reached 3.82 s with
+  38 us of slack against a 76 ms bound, and `decode.audio` 3.07 s with 39 us
+  against 61 ms, 500x to 2200x. At production scale a swallowed phase of several
+  seconds would have passed, which is the opposite of what a share was added for.
+  The quantity does not grow with the render -- every measurement on both boxes
+  is at or under 135 us whatever the leaf did -- so a constant holds on all of
+  them and is strictly tighter at every leaf size. `kSpanSlackShare` is gone.
+* **The 1 ms term made the CHECK VACUOUS on the smallest leaf.** `span_slack <=
+  leaf_seconds` holds by construction, so any bound at or above the leaf cannot
+  fail. `artifacts.frames` measures 0.826-0.983 ms here, under the 1 ms bound:
+  forcing 100% slack on every leaf reddened only ten of twelve checks, and that
+  leaf's two PASSED AT 100% SLACK. It was also a coin flip, because on slower runs
+  the same leaf measured 1.35-13.9 ms and did bite -- so whether the assertion
+  existed depended on box speed, the exact property this change removes.
+
+Both are closed. The constant is 0.25 ms: ~2.4x the worst value measured here
+(102.5 us) and ~1.9x the worst the review measured (135 us), a multiple of a
+measurement rather than a number fitted to today's run, and below the smallest
+leaf so the check can fail. And a `REQUIRE(span_bound < leaf_seconds)` now sits
+above it, so a leaf that ever shrinks beneath the instrument's noise floor reds
+and says so instead of passing quietly. Re-run of the same forced-strict probe:
+**twelve of twelve red, `artifacts.frames` included.**
 
 The coverage floor (2) stays, and `denoise`'s parameter moves from 0.95/0.90 to
 0.75 on both arms: 10.85 points below the worst honest observation, kept for the
@@ -2397,12 +2424,13 @@ the box dependence, so one number below both arms replaces two numbers sitting
 inside each. **Nothing was deleted:** a parameter moved and an assertion was added
 beside it.
 
-The tempting claim about (1c) is false and is not made at the site: 5% of a 13.7
-ms leaf is 685 us, numerically close to the 1 ms here. The difference is that the
-old bound covered head, tail AND interior together while the interior alone
-measured 1046 us on the runner that reported it, so the budget was spent before
-any swallow and the assertion could not be satisfied by an honest tree. It bounded
-nothing. The new one is spent by 12-40 us.
+No claim is made that (1c) is tighter than 0.95 IN NUMBERS, because it is not:
+5% of a 13.7 ms leaf is 685 us against this 250 us, and against the 1 ms the bound
+first carried it was 1.5x LOOSER. The point is a different one. The old bound
+covered head, tail AND interior together while the interior alone measured 1046 us
+on the runner that reported it, so the budget was spent before any swallow, no
+honest tree could satisfy it, and it therefore bounded nothing at all. The new one
+is spent by 11.4-64.3 us and does not move with the box.
 
 ### Evidence
 
@@ -2413,13 +2441,15 @@ restored and `sha256sum`-verified afterwards.
 | # | Mutation | compile | result |
 |---|---|---|---|
 | honest | none | rc 0 | exit 0, 1/1 cases, **566/566** assertions, 4 consecutive runs at loadavg 6.7-10.2, and 3 more at loadavg 54-61 |
-| **M1** | `denoise` opens at the top of `phase.prepare` instead of after it, so the prepare's seconds become un-named time inside the leaf | rc 0 | span slack moves **14 us -> 139 us**, a 10x move, and PASSES: the phase it swallows is ~125 us, under the 1 ms bound. Disclosed rather than hidden -- (1c) catches a swallow of >= 1 ms at fixture scale, and 125 us is below this fixture's resolution, which is #1439's own finding restated |
+| **M1** | `denoise` opens at the top of `phase.prepare` instead of after it, so the prepare's seconds become un-named time inside the leaf | rc 0 | span slack moves **14 us -> 139 us** and PASSES; a fresh review reproduced it independently at **26.6 us -> 124.6 us**, 554 assertions green. `phase.prepare` is only ~125 us on this fixture, under even the tightened 0.25 ms bound. The coverage floor (2) misses it too, moving 0.4 points, so this is not a regression against the shape that shipped -- but it IS the instrument's resolution at this geometry, and it is now stated AT THE SITE rather than only here |
 | **M1 + calibration** | M1 with the bound lowered to 0.1 ms, to exercise the comparison itself | rc 0 | **RED**, exit 1, 1 case failed, 566 assertions / **3 failed**, each on (1c)'s own message quoting `0.000100121s` against `0.0001s`. The assertion is live and compares the quantity it names |
 | **M2** | `denoise` opens right after `generate.setup` opens, swallowing the whole conditioning and preparation stretch | rc 0 | **RED**, exit 1, 496 assertions / **14 failed**, on (3c) `CheckOnlyAnchorsAreNested` -- the swallowed leaves become `nested`, which is the assertion that owns that shape |
 
-Full suite on the landing head: 102 cases, 101 passed, 4182 assertions, 4181
-passed. The one failure is #1439's `CHECK(leaves >= 0.95 * wall)`, which this
-change deliberately does not touch; see below.
+Full suite on the landing head: **102 cases, 101 passed, 4194 assertions, 4193
+passed**. The one failure is #1439's `CHECK(leaves >= 0.95 * wall)`, which this
+change deliberately does not touch; see below. It flaps by box load on this host
+and is GREEN in CI, so a run of this suite here reports either 101 or 102 passed
+and neither is a statement about this change.
 
 ### #1439 is NOT repaired here, and the measurement says why not
 
