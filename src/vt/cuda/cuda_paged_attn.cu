@@ -93,39 +93,17 @@ void Check(cudaError_t err, const char* what) {
 
 cudaStream_t AsStream(const Queue& q) { return static_cast<cudaStream_t>(q.handle); }
 
-// Opt a kernel into more dynamic shared memory than the 48 KiB every CUDA
-// architecture guarantees without an opt-in.
-//
-// BACKEND-CUDA-ARCH-ADDITIVITY seam-gap #3 (.agents/specs/cuda-arch-additivity.md):
-// the opt-in CEILING used to be a hardcoded GB10 assumption living in comments
-// ("GB10/sm_121 caps opt-in shared at ~99 KiB") with nothing in the code
-// actually checking it — a kernel whose tile did not fit would fail deep inside
-// cudaFuncSetAttribute with an opaque `invalid argument`. It is now the QUERIED
-// `cudaDevAttrMaxSharedMemoryPerBlockOptin`, cached once per device in
-// vt/cuda/cuda_device_caps.h — never re-queried per launch, since an attribute
-// query is a driver round-trip on the attention hot path.
+// `SetDynamicSmemOptIn` used to be defined HERE. It moved to the shared seam it
+// always belonged to — declared in vt/cuda/cuda_device_caps.h, defined beside
+// `DynamicSmemFits` in cuda_arch_tactics.cu — when LTX25-DIT-ATTN-FLASH (#1549)
+// needed the identical decision in cuda_ops.cu's attention-dense-flash launcher.
+// Behavior is unchanged and every call below is unchanged: it still queries
+// `cudaDevAttrMaxSharedMemoryPerBlockOptin` once per device and still throws a
+// message naming this device and the shortfall.
 //
 // BEHAVIOR ON GB10 IS UNCHANGED: the queried ceiling is 101376 B and every tile
 // the WMMA ladder selects (the largest is the QG=2 flash2vec shape at ~83 KiB)
 // already fits, so this takes the same branch and makes the same call as before.
-// On an architecture with a smaller ceiling it turns a cryptic driver error into
-// a diagnosis that names the device and the shortfall.
-void SetDynamicSmemOptIn(const void* kernel, size_t bytes, const char* what) {
-  if (bytes <= 48u * 1024u) return;  // guaranteed everywhere; no opt-in needed
-  if (!DynamicSmemFits(static_cast<long long>(bytes))) {
-    const DeviceCaps& caps = GetDeviceCaps();
-    throw std::runtime_error(
-        std::string("vt cuda: ") + what + ": kernel needs " + std::to_string(bytes) +
-        " B of dynamic shared memory, but sm_" + std::to_string(caps.sm_arch()) +
-        " caps opt-in shared memory at " +
-        std::to_string(caps.max_shared_memory_per_block_optin) +
-        " B; this shape needs an architecture-specific tile (see "
-        ".agents/specs/cuda-arch-additivity.md)");
-  }
-  Check(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                             static_cast<int>(bytes)),
-        what);
-}
 
 __device__ inline float Load(const float* p, int64_t i) { return p[i]; }
 __device__ inline float Load(const __nv_bfloat16* p, int64_t i) { return __bfloat162float(p[i]); }

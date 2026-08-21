@@ -28,6 +28,8 @@
 // behavior at RUNTIME.
 #pragma once
 
+#include <cstddef>
+
 namespace vt::cuda {
 
 // Cached CUDA device capability. `valid == false` means the probe failed (no
@@ -72,5 +74,21 @@ const DeviceCaps& GetDeviceCaps(int device);
 // True when `bytes` of dynamic shared memory can be opted into on this device.
 // The hardcoded 100 KiB GB10 assumption becomes a query through this helper.
 bool DynamicSmemFits(long long bytes);
+
+// Opt `kernel` into `bytes` of dynamic shared memory, or THROW naming this
+// device and the shortfall. `what` prefixes the message and names the caller.
+//
+// Below 48 KiB this is a no-op: that much is guaranteed on every CUDA
+// architecture without an opt-in. Above it the ceiling is the QUERIED
+// `max_shared_memory_per_block_optin` above, never a compile-time constant, and
+// a tile that does not fit is refused BY NAME rather than turned into a bare
+// `invalid argument` from a kernel that never ran.
+//
+// SHARED because there were two of these. This lived in cuda_paged_attn.cu and
+// LTX25-DIT-ATTN-FLASH needed the identical decision in cuda_ops.cu's
+// attention-dense-flash launcher; a second copy is the parallel path AGENTS.md
+// "Shared seams" forbids, and the two copies would have differed at once,
+// because the second one was first written to fall back silently instead.
+void SetDynamicSmemOptIn(const void* kernel, size_t bytes, const char* what);
 
 }  // namespace vt::cuda
