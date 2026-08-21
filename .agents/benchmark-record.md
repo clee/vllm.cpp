@@ -25631,6 +25631,36 @@ WHAT the step-7 divergence is. Excluding one cause is not identifying another,
 and the next traceable hypothesis is a per-operation two-arm comparison of the
 step-7 forward, first differing tensor named.
 
+---
+
+## TT host-free decode: the 22/22 argmax is withdrawn; the operator gate records a step-46 near-tie (#1476, #1488) (2026-08-20)
+
+Row `BACKEND-TENSTORRENT-HOST-FREE-FORWARD`, evidence moved out of its
+`docs/BENCHMARKS.md` cell by the 220-char entry budget.
+
+The 2026-08-16 implementer figure "22/22 argmax vs the per-step-copy baseline"
+predates the final on-device `cur_pos` plus_one integration and does not
+reproduce on the landed tree. The operator gate at `206afb63` (2026-08-20) found
+captured replay deterministic-degenerate (word salad from ~generated token 30 =
+the first KV block boundary) while host-free eager stayed coherent; issue #1476
+carries the full derivation.
+
+After the fix (operator rerun at `2b06f98a`, identical bytes to the implementer
+and re-review runs): captured `Hello`/80-tok answer 284 bytes md5
+`3b5a579d82d58396fe4e344826946403`, eager 286 bytes md5
+`f5ffdf6aa290e11fd187673c2f3c52bb`, first divergence at byte 174 = decode step
+46, a swapped top-2 near-tie (captured gap 0.25 nats, eager 0.125 nats; the
+0.5-nat bar of `scripts/qwen3-neartie-gap.py`). 45/80 steps argmax-identical;
+the 34 later differences are prefix divergence. `VT_TT_RECAPTURE_EVERY=8` (9
+captures / mid-generation re-captures) is byte-identical to the plain captured
+arm. The #1476 degeneration is gone — G1 (`[C,1]` page_table) and G4
+(steady-state refresh suppressed) mutations each regenerate the exact word
+salad; G2 (regime early-return) reds at step 11 under the recapture arm.
+
+Whether the step-46 flip is teacher-forced-benign stays UNADJUDICATED on the
+full engine: that is #1488's `VT_DUMP_IDS` re-adjudication, the same band as
+the paged-engine anchor drift it owns. No speed number is quoted from any of
+these runs; a same-binary A/B on an idle host precedes any future figure.
 ## MUSIC3-E2E-ON-MAIN — five merges priced end to end, and the vocoder device arm answered on an idle box (2026-08-20, `row/MUSIC3-E2E-ON-MAIN`, arms `d0598a255` and `a50c57d69`, `thor:gpu0` sm_110, #672 / #1512 / #1516)
 
 ### What was measured
@@ -25852,3 +25882,496 @@ bucket table for all seventeen runs. The checkpoint is `/workspace/music3/ckpt`
 and the lyrics `/workspace/music3/lyrics.txt`; `ar.prompt_tokens` is **282** on
 every run here, against §15.8's 223, so the prompt is not the one §16.6b used and
 `ar.lm_prefill` is the only bucket that difference reaches.
+
+## 2026-08-21 — MUSIC3-DIT-SPLIT: the flow-matching DiT is ATTENTION-bound, not GEMM-bound — `vt::AttentionCross` is 43.9% of the forward for 4.0% of its flops (#672, #1542, #1555)
+
+**Result: ACCEPTED as a within-run SPLIT and a same-box A/B. NOT a per-kernel or
+cross-box figure** — `nvidia-smi` reports `clocks.sm` as `[N/A]` on this device,
+so no clock window was taken (`.agents/benchmarking.md` §The clock is part of the
+measurement). No parity claim: vLLM and vLLM-Omni register nothing for this
+architecture.
+
+**Box and lease.** `rc` job `0f95377f-70dd-4bf8-93b5-8e44fd762713` on
+`thor:gpu0`, `--max-runtime 180m`, worker `rc-worker-m4d7t`, Linux
+6.8.12-1021-tegra aarch64, 14 cores, NVIDIA Thor sm_110, driver 595.78, boot id
+`c99b7805-6e26-47a7-bc9d-93d592d676a6`. No `ssh`, no `rc hold`, no `$GPU_LOCK`:
+the lease is the whole of the serialisation. `uptime` **3.46 with 0 logins** at
+job start — this box's idle floor (§20.1 read 3.27, §18.8a 3.29) — rising to
+10-13 inside our own 14-thread host vocoder and falling between runs.
+
+**Tree and build.** `0e18f8afd` (`row/MUSIC3-DIT-SPEED`), asserted equal to the
+expected sha before anything was built. `Release`, `-DVLLM_CPP_CUDA=ON
+-DVLLM_CPP_CUDA_ARCHITECTURES=110 -DVLLM_CPP_TRITON=OFF
+-DVLLM_CPP_BUILD_TESTS=ON`, nvcc 13.0.88.
+
+**Checkpoint STAGED, and asserted.** `findmnt /workspace` ->
+`//192.168.68.102/Data[/rc] cifs`; `findmnt -T /tmp/ckpt` -> `overlay overlay /`.
+`SRC_BYTES=28517617303` = `DST_BYTES=28517617303` = the recorded
+`EXPECT_BYTES`, hard fail on mismatch. `STAGE_SECONDS=708` = 40.3 MB/s off CIFS.
+
+**Arms and the behavioural control.** #1516 records the two-binary sha256 guard
+as UNFALSIFIABLE for `minimax-music3-gen` (a 72 744-byte client of the shared
+`vllm::shared`), so the arms here are ONE binary under two environments and the
+control is the BUCKET SET: `dit.*` spans are present exactly when
+`VLLM_CPP_MUSIC3_DIT_SPANS=1`, and `ar.depth_staging` (0.754-0.757 s) is present
+in every run, so the depth device arm engaged throughout.
+
+### The split — `--duration 20 --steps 2 --device 1`, 8 calls = 16 forwards
+
+Geometry MEASURED rather than inferred: `dit.seq_sum / 16 = 690`,
+`dit.length_sum / 16 = 689`.
+
+`denoise.dit_device` **25.104 s**; the sixteen spans sum to **25.100 s** — a
+**99.98 % partition**.
+
+| group | seconds | % of the DiT | TFLOP/forward | TFLOP/s |
+|---|---:|---:|---:|---:|
+| **`dit.attn` (`vt::AttentionCross`)** | **11.010** | **43.9 %** | **0.140** | **0.204** |
+| the four `vt::MatmulBT` GEMMs | 13.390 | 53.3 % | 3.334 | **3.98** |
+| norms, rope, SiLU, packing, readback | 0.700 | 2.8 % | — | — |
+
+Per span: `dit.attn` 11.010, `dit.ff_in` 6.635, `dit.ff_out` 3.238, `dit.qkv`
+2.591, `dit.attn_out` 0.926, `dit.silu` 0.225, `dit.temb` 0.167, `dit.pre`
+0.122, `dit.rope` 0.062, `dit.norm1` 0.046, `dit.norm2` 0.045, and
+`dit.pack`/`dit.rope_build`/`dit.post`/`dit.readback`/`dit.untranspose` 0.033
+between them.
+
+**The attention kernel does 4.0 % of the forward's arithmetic in 43.9 % of its
+time — 19.5x slower per flop than the GEMMs beside it, on the same tensors, in
+the same forward, on the same device.** At the developer's 30 steps that is
+0.6881 s x 240 forwards = **165.2 s of the 370.556 s `denoise.dit_device`
+bucket and 27.7 % of the whole 595.9 s run**. Owned by #1555.
+
+**This refutes the arithmetic that opened the row.** Spec §21.1 divided §20's
+370.556 s by 240 forwards and 3.33 TFLOP of GEMM and reported "~2.2 TFLOP/s".
+The GEMMs run at **3.98 TFLOP/s**; 2.2 was an average over a forward that is
+nearly half something else, and every inference drawn from it is superseded.
+
+### The instrument's own perturbation, MEASURED rather than assumed
+
+Arms ALTERNATED `on, off, on, off` in one job on one staged checkpoint:
+
+| | spans ON | spans OFF | ratio |
+|---|---:|---:|---:|
+| round 1 `denoise.dit_device` (8 calls) | 25.104 | 24.737 | 1.0148 |
+| round 2 `denoise.dit_device` (8 calls) | 25.117 | 24.749 | 1.0149 |
+| round 1 wall | 252.902 | 253.577 | 0.9973 |
+| round 2 wall | 253.049 | 253.097 | 0.9998 |
+
+**The 331 synchronizes per forward cost 1.49 % of the DiT bucket, reproduced to
+0.01 % across two independent pairs, and do not register on wall clock at all.**
+So `denoise.dit_device` with the flag unset stays comparable to §15.7's
+370.746 s and §20's 370.556 s value for value, and the split above is
+trustworthy at the 1.5 % level.
+
+Two spans-ON rounds agree to better than 0.2 % on EVERY span (`dit.attn` 11.010
+vs 11.025, `dit.ff_in` 6.635 vs 6.625, `dit.qkv` 2.591 vs 2.591), which is the
+evidence that the box was quiet.
+
+### The audio does not move
+
+**All four short runs wrote ONE WAV hash** —
+`61a8989763bba749edab8ddc3e597d7a`, 3 530 796 bytes — across both spans arms.
+The instrument is a pure timing arm.
+
+### The instrument reproduces the record, across two jobs
+
+The AR half and the vocoder do not depend on the step count, so §20's 20 s /
+30 steps figures and this job's 20 s / 2 steps figures are a cross-job control
+on identical call counts:
+
+| bucket | §20 | here | calls | delta |
+|---|---:|---:|---:|---:|
+| `ar.lm_decode_step` | 56.174 | 56.437 | 500 | +0.5 % |
+| `ar.depth_forward` | 21.099 | 21.180 | 4008 | +0.4 % |
+| `ar.depth_projection` | 6.966 | 7.007 | 3507 | +0.6 % |
+| `ar.semantic_guide_and_draw` | 3.701 | 3.710 | 501 | +0.2 % |
+| `ar.depth_head_and_draw` | 3.489 | 3.632 | 3507 | +4.1 % |
+| `vocoder.decode_window` | 122.169 | 124.897 | 4 | +2.2 % |
+
+### The 30-step point — the §20 configuration, and it reproduces to 0.012 %
+
+`--duration 20 --steps 30 --device 1`, spans OFF, staged checkpoint, `uptime`
+14.14 before / 12.80 after:
+
+| bucket | §20 (`a50c57d69`) | here (`0e18f8afd`) | calls | delta |
+|---|---:|---:|---:|---:|
+| **`denoise.dit_device`** | **370.556** | **370.510** | 120 | **-0.012 %** |
+| `vocoder.decode_window` | 122.169 | 124.429 | 4 | +1.85 % |
+| `ar.lm_decode_step` | 56.174 | 56.395 | 500 | +0.39 % |
+| `ar.depth_forward` | 21.099 | 21.158 | 4008 | +0.28 % |
+| `ar.depth_projection` | 6.966 | 6.880 | 3507 | -1.23 % |
+| wall | 595.899 | 598.207 | — | +0.39 % |
+
+`sum(leaf)` 597.247, `unattributed` 0.313 (0.05 %). **Two commits, two jobs, two
+days, identical call counts.** With the flag unset this tree produces the number
+§20 recorded, so the instrument did not move the quantity it exists to explain.
+
+**The audio is BYTE-IDENTICAL to the record**: `55856deb3b5b727a4ca4fcc473e01a56`,
+3 530 796 bytes — the hash §20.5 recorded for its 20 s pair at `a50c57d69`.
+
+The per-forward geometry is identical at 2 and 30 steps (`seq` 690 both), so
+`dit.attn` at 0.6881 s x 240 forwards is **165.1 s of 370.510 s = 44.6 % of the
+DiT and 27.6 % of the whole 598.207 s run**.
+
+### One candidate lever is MEASURED UNAVAILABLE
+
+`CUBLASLT_MATMUL_DESC_EMULATION_STRATEGY` — cuBLASLt's fp32 emulation, the one
+precision-adjacent lever that would have kept the declared dtype at fp32 — **is
+undefined in nvcc/cuBLASLt 13.0.88 on this device**. A probe transcribing
+`MatmulBTKernelCuda`'s descriptor construction fails to compile:
+`PROBE_BUILD_RC=2`, `identifier "CUBLASLT_MATMUL_DESC_EMULATION_STRATEGY" is
+undefined`. It is an enumerator, not a macro, so no preprocessor test can guard
+it. Costs nothing: the split says the lever is the attention kernel, not
+precision.
+
+### What is NOT established
+
+* **The mechanism.** #1555 names the per-key five-step `__shfl_xor_sync`
+  butterfly and an occupancy near 8 warps per scheduler as the leading
+  hypothesis, with the instruction-count arithmetic beside it (~1.8 ms/layer
+  predicted against 19.1 ms measured). **No `ncu` counter was read on either
+  side and no occupancy figure was measured.** The split is measured; its
+  attribution is not.
+* **Any speed claim for a fix.** Nothing was made faster by this row.
+* **A cross-box or per-kernel figure.** No clock window exists on this device.
+
+### The GEMM half is at the device's fp32 CEILING, so the attention lever is the only one left in-oracle
+
+Standalone probe transcribing `MatmulBTKernelCuda`'s descriptor, three layouts,
+`TRANSA=T`/`TRANSB=N`, `CUBLAS_COMPUTE_32F`, `CUDA_R_32F` scale, 32 MB workspace
+and `requestedAlgoCount=1` — so it prices OUR invocation, not a generic SGEMM.
+`thor:gpu0`, nvcc/cuBLASLt 13.0.88 / 13.1, driver 13020, binary
+`9960f5e1e1fb41b90c1d0669c507927830bb486572a43d3030910bdfeeda44b0`, 3 rounds
+agreeing to 0.3 % on the fp32 arms.
+
+`NVIDIA Thor cc=11.0`, **20 SMs at 1.049 GHz** => fp32 CUDA-core peak
+**5.369 TFLOP/s** (128 lanes/SM assumed, stated because the percentages rest on
+it); memory bandwidth 273.0 GB/s.
+
+At the DiT's own **M = 690**, TFLOP/s:
+
+| shape | f32 `COMPUTE_32F` | % fp32 peak | f32 `FAST_TF32` | bf16 | plan rebuild |
+|---|---:|---:|---:|---:|---:|
+| `qkv` `[690,2048]x[2048,2048]` | **3.84** | **71.5 %** | 52.84 | 134.66 | 0.9 us |
+| `attn_out` | **3.84** | **71.5 %** | 52.97 | 134.45 | 0.9 us |
+| `ff_in` `[690,2048]x[16384,2048]` | **4.17** | **77.7 %** | 59.04 | 94.40 | 1.1 us |
+| `ff_out` `[690,8192]x[2048,8192]` | **4.24** | **79.0 %** | 29.51 | 48.03 | 0.9 us |
+
+TF32 and bf16 run on TENSOR cores, so the fp32-CUDA-core denominator does not
+apply to them and no percentage is quoted; they price what precision would be
+worth, and precision is a divergence from the oracle (§21.2).
+
+**1. The GEMMs are at the ceiling.** 71.5-79.0 % of the device's true-fp32 peak,
+which is what a well-served SGEMM looks like; the in-situ half measured
+**3.98 TFLOP/s**, inside that band.
+
+**2. The in-situ calls ARE those calls, within 2.9 %.** Summing the probe's
+isolated per-call times over a block (3x`qkv` + `attn_out` + `ff_in` + `ff_out`
+= 22.59 ms) over 36 blocks predicts **813.5 ms** of GEMM per forward against a
+measured **836.9 ms**. No dispatch overhead, no launch-gap term, no untuned-shape
+term hides in the 53.3 %.
+
+**3. The per-call plan rebuild is REFUTED as a lever.** `MatmulBTKernelCuda`
+rebuilds descriptor + 3 layouts + preference + heuristic on EVERY call, 252 per
+forward, measured at **0.9-1.1 us** each = **~0.25 ms of a 1569 ms forward,
+0.016 %**. A plan cache for this op buys nothing here. This was the row's
+second-ranked hypothesis and it is closed, not left open.
+
+**The prize, as a BOUND and not a promise.** If `vt::AttentionCross` merely
+matched the GEMMs' measured 3.98 TFLOP/s, its 0.140 TFLOP would cost **35.2 ms
+instead of 688.1 ms**: forward 1569 -> 916 ms (**1.71x on the DiT**), bucket
+370.510 -> 216.3 s, run 598.207 -> 444.0 s (**1.35x end to end**). An upper
+bound from a flop ratio on a kernel nobody has written.
+### The Qwen3.5-4B `1.0283x` row ran against an UNFUSED denominator (#414, #1345)
+
+Found 2026-08-19 while landing [#607](https://github.com/mudler/vllm.cpp/issues/607)
+wave L4, which gated the CLI oracle-launch surface. This leg is on the OTHER
+surface, so the new checker does not see it, and it is the one published figure
+the L4 sweep found still carrying the #414 defect unmarked.
+
+The chain, each link checked rather than assumed:
+
+1. `docs/BENCHMARKS.md` cites `docs/bench-evidence/qwen35-4b-sm120-main-20260807.md`,
+   whose reproduction identity names `Qwen/Qwen3.5-4B` and the exact workload
+   (128 requests, 128 output tokens, concurrency 32,
+   `max_num_batched_tokens=2048`, greedy) that `tools/bench/run_qwen35_4b_compare.sh`
+   drives.
+2. `tools/bench/run_qwen35_4b_compare.sh:120` runs the vLLM arm through
+   `tools/bench/vllm_closed_loop_metrics.py`. Its `LLM(...)` at `:160` never
+   passes `language_model_only` and exposes no argument that could set it.
+3. Upstream registers `Qwen/Qwen3.5-4B` under `Qwen3_5ForConditionalGeneration`
+   (`tests/models/registry.py:1322-1324`, `extras={"4b": "Qwen/Qwen3.5-4B"}`), so
+   `multimodal_config` is non-`None` and `text_only` resolves `False`
+   (`vllm/config/multimodal.py:78`, `vllm/model_executor/models/qwen3_next.py:325`).
+4. The conjunct was live at the time of the run. `git log -S'use_fused_qk_norm_rope_gate'`
+   over `vllm/model_executor/models/qwen3_next.py` dates its introduction to
+   `16282a9c4` on 2026-06-10, two months before the 2026-08-07 measurement.
+5. The remaining conjuncts hold: sm_120 is CUDA, and Qwen3.5-4B carries
+   `attn_output_gate` with NeoX-style RoPE.
+
+So the oracle issued four ops per full-attention layer where its own production
+configuration issues one, against our single fused launch.
+
+**Direction: it flatters us**, for the reason #414 gives. **Magnitude: NOT
+MEASURED, and deliberately not estimated.** The model is GDN-hybrid, so only its
+full-attention layers are exposed, and the L4 wave took no measurement: both
+fleet devices were held and it carried no lease authority. Quoting a corrected
+ratio here would be a number nobody took.
+
+The row keeps its values and gains the attribution, per AGENTS.md: evidence is
+annotated, never deleted. Re-measurement is owed with
+[#1345](https://github.com/mudler/vllm.cpp/issues/1345), which also owns the
+repair to the three in-process harnesses.
+
+**Not affected, so the next reader does not re-derive it.** #414 reaches a figure
+only where the full-attention layers are `Qwen3NextAttention` AND the checkpoint
+loads as a `*ForConditionalGeneration`. That is the Qwen3.5/3.6/3.8 family alone.
+The OPT, GLM-4, InternLM2, Qwen3-dense, Qwen3-Coder and DeepSeek-V2-Lite legs
+never construct `Qwen3NextAttention`. The `Qwen3.8-27B` rows ran through
+`tools/bench/run_serve_low.py`, which has passed `--language-model-only` since it
+was written. The Qwen3.5-4B GDN prefill kernel row is conv and post-conv timing
+on the LINEAR-attention path, which the full-attention preamble does not touch.
+
+## SPEC-DFLASH2 W6 — the gates, taken against a beyond-pin oracle that had to be made to answer (2026-08-21, `row/SPEC-DFLASH2-W6`, `dgx:gpu0`, #1314 / #1456 / #1538)
+
+**The first time either engine has been asked what the OTHER's DFlash2 draft
+proposed.** Everything before this wave measured mechanisms; this measures the
+two claims the mechanisms were built to make.
+
+### The two engines, pinned
+
+| | ours | oracle |
+|---|---|---|
+| revision | tree `0ac277b3a66b5deabe4871959f0f03566c08deda` (RECONSTRUCTED, see below), base `origin/main` `5702d8f83` | vLLM `0.1.dev1+g66e5414c6` ([vllm#52816](https://github.com/vllm-project/vllm/pull/52816) head `66e5414c6`, **MERGED** `2026-08-21T05:27:22Z` at `3406ec1d`, merge commit `b389ac29`) |
+| artifact | built in-lease, `nvcc` 13.0, `sm_121a`, `CUDA_OBJECTS_BUILT=34` | wheel sha256 `fbc247ab1bda93a81ff7a68658cdda65b697e263ad2c43a2bc62c2591d207439` |
+| attention | our own kernels | `TRITON_ATTN`, read back off the built engine and asserted |
+| graphs | DFlash2 draft runs OFF the paged CUDA-graph fast path | `Capturing dflash2 CUDA graphs (FULL)`, 77 s |
+| concurrency | 1 | `max_num_seqs=1`, `enforce_eager=False` |
+
+**THE OURS-SIDE PIN WAS WRONG AND IS CORRECTED HERE (2026-08-21).** This entry
+originally pinned tree `81b530cff097db493e44e4de9a1c727530ed4467`. That tree is
+the FAILING run's tree: it lacks `Reconstructed::verified`, the per-prompt
+`CHECK(our_recon_here == their_acc)` and three instrument assertions — exactly
++8 executed assertions on this workload — and this entry's own text records the
+pre-fix run as 134 assertions with one failure against the spec's 142/0.
+`134 + 8 = 142`. The two recorded trees differ in exactly ONE compiled file
+(`tests/parity/test_qwen38_dflash2_spec_decode.cpp`; the goldens are data), so
+the passing binary's compiled sources are `81b530cff`'s with blob
+`47c53d17a58584987599028519148747b3f018e9` in that slot, which is tree
+`0ac277b3a66b5deabe4871959f0f03566c08deda`. It is a RECONSTRUCTION: no
+`git write-tree` was taken after the fix, so no recorded object names the passing
+run. An earlier revision of this entry added that "the dispatched mutation counts
+(5 and 37)" were taken on `81b530cff` by the same arithmetic; that clause is
+DELETED, because this entry's own `### Mutations` heading says W6 recorded none,
+`git grep "5 and 37" bb416e0ae` returns nothing, and W6's commit body carries no
+mutation prose — the two counts are unfindable, and the standing statement is
+that **W6 recorded no mutation count anywhere**. `81b530cff` also carries no
+`dflash2_27b` goldens at all, which is CONSISTENT with the run reading one
+through `VLLM_DFLASH2_GOLDEN` off the lease — an inference, not a reading, since
+an untracked golden in the run's worktree fits the same evidence and no log
+survives to separate them. Either way the golden's sha256 is what pins the DATA
+and it matches the committed file byte for byte.
+
+**AND THE ORACLE'S PULL REQUEST HAD ALREADY MERGED WHEN THIS WAS WRITTEN.**
+vllm#52816 merged at `2026-08-21T05:27:22Z`, 46 minutes before the wave's work
+commit. The capture is legitimately pinned to `66e5414c` because that is the
+wheel that ran, and it predates the merge — but the row's gate head is now one
+merge behind vLLM's `main`, which
+[#1561](https://github.com/mudler/vllm.cpp/issues/1561) owns.
+
+Target `Qwen/Qwen3.8-27B` @ `1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0`, 18
+shards, 51.75 GiB, verified against the pinned checkout by `config.json` and
+`model.safetensors.index.json` sha256 rather than by directory name. Draft
+`z-lab/Qwen3.8-27B-DFlash2` @ `50307d4c4cde6860d4eee73e2547cd786fe8e8a4`,
+sha256 `67fc76d68dc5a9415511a4f394ef744d67510cd20e93b37cc2cc7d28e4bab65c`
+recomputed from the staged copy. k=7, greedy, `max_tokens` 64, the four
+`SPEC-DFLASH` D5 prompts.
+
+### G2 — 4/4 token-exact, 45/47 draft blocks byte-identical
+
+| prompt | tokens | shared | draft blocks identical |
+|---|---|---:|---:|
+| `The capital of France is` | exact | 64/64 | 14/15 |
+| `def fibonacci(n):` | exact | 64/64 | 10/10 |
+| `Q: What is 17 * 23?\nA:` | exact | 64/64 | 10/10 |
+| `The three laws of robotics are` | exact | 64/64 | 11/12 |
+
+The two blocks that differ each differ by ONE token at slot 2 and then emit the
+same target tokens: `[14227 369 14227 13 198 760 6511]` against
+`[14227 369 24844 ...]`, and `[39262 279 9861 2574 314 539 279]` against
+`[39262 279 10895 ...]`.
+
+**The attribution to "the selector's rank contraction" is WITHDRAWN**
+([#1564](https://github.com/mudler/vllm.cpp/issues/1564)). Nothing here measured
+which op moved: the golden records `{call, req_row, anchor, drafts}` and no
+values, no logits and no top-2 gap. The shape argues against the op that was
+named — in BOTH blocks only slot 2 changes while slots 3-6 are byte-identical,
+and `src/vt/cpu/cpu_ops.cpp:3219` has the walk read the predecessor row the
+previous step chose, so a flipped child index would move four later slots and
+did not. A rank swap at the same winning slot in `ComputeCandidates`' top-k
+explains it with no coincidences. Neither is measured; the next capture records
+the top-2 candidate margin on both sides, which both engines already compute.
+
+### G3 — acceptance IDENTICAL, same-trajectory — and a COROLLARY of G2, not a second measurement
+
+All four prompts produced the same token stream on both engines, so there is no
+trajectory to confound. "By construction" means by ADMISSION and not by teacher
+forcing: both engines run FREE and a prompt is admitted only when the two
+independently emitted the same stream.
+
+**The per-prompt equality below is very nearly ENTAILED by G2's result.**
+Established 2026-08-21 by recomputing the oracle side from the committed golden:
+outputs identical on all four prompts, 45 of 47 blocks byte-identical (so the
+reconstruction runs on identical inputs for 45 of them), and BOTH divergent
+blocks have their divergent slot rejected on both sides — record 0 block 13's
+output slot 2 is `31785`, neither draft's candidate, so both accept 2; record 3
+block 6 has `279` at slot 1 in both drafts against an output of `9861`, so both
+accept 1. Per-prompt equality follows arithmetically, and so do 216-vs-216 and
+the 7-token truncation deficit. The result is a real consistency check on the
+reconstruction and it is NOT withdrawn — had either flipped slot been accepted on
+one side the counts would have parted — but it must not be quoted as an
+independent second gate reading.
+
+| prompt | ours | oracle |
+|---|---:|---:|
+| 0 | 49 | 49 |
+| 1 | 54 | 54 |
+| 2 | 54 | 54 |
+| 3 | 52 | 52 |
+| total | **209** | **209** |
+
+Counted the same way on both sides, from drafts and output. On the other
+instrument they also agree: our runner's counter reads 216 and
+`vllm:spec_decode_num_accepted_tokens` reads 216; our reconstruction verifies 47
+blocks and `vllm:spec_decode_num_drafts` reads 47.
+
+**Both of those were PRINTED and neither was ASSERTED in the run this entry
+records.** `our_acc_sum` was a `MESSAGE` only, our verified block count was not
+computed at all, and the "47" the gate printed was `draft_blocks_compared` —
+bounded by the shared-prefix cut, so a count of blocks the gate could PAIR rather
+than blocks this engine verified. What the run DID assert is the oracle's
+reconstruction against vLLM's two counters and the per-prompt
+reconstruction-vs-reconstruction equality. Both are asserted now, guarded on
+`same_traj == total` because vLLM's counters are pooled, and NEITHER new
+assertion has yet executed on a device. The 209/216 gap is
+`max_tokens` truncating the last block of three of four requests, it appears on
+BOTH engines, and mixing the two instruments is the D8 shape in miniature.
+
+### G4 / O17 — a published artifact LOADED, and O13 measured at runtime
+
+`examples/vllm-cli` was pointed at `Qwen3.8-27B-DFlash2-Q4_K_M.gguf`
+(1 143 006 752 B, sha256 `18a380ef...`) over the real 27B target. It loaded,
+proposed 7 speculative blocks and generated 24 tokens.
+
+| arm | on disk | peak RSS |
+|---|---:|---:|
+| Q4_K_M GGUF | 1.06 GiB | 47 028 616 KB (44.85 GiB) |
+| safetensors | 3.58 GiB | 46 701 608 KB (44.54 GiB) |
+
+0.70% apart on files 2.52 GiB apart, and the QUANTIZED arm is the LARGER by
+319 MiB. The two arms propose DIFFERENT drafts and emit the SAME tokens.
+
+### The oracle's own backend A/B, which reprices what G2 may demand
+
+Same wheel, same host, same workload, FULL decode graphs on both; only the
+attention backend differs.
+
+| | FLASH_ATTN | TRITON_ATTN |
+|---|---:|---:|
+| `spec_decode_num_drafts` | 50 | 47 |
+| `spec_decode_num_draft_tokens` | 350 | 329 |
+| `spec_decode_num_accepted_tokens` | 209 | 216 |
+| accepted / drafted | 0.597 | 0.657 |
+
+**Identical output on 3 of 4 prompts**; `def fibonacci(n):` diverges at
+generated index 4. vLLM does not reproduce its own greedy continuation across
+two of its own backends on this model, so a 4-of-4 strict bar would be one vLLM
+fails against itself.
+
+**AND THAT FLASH_ATTN ARM'S BACKEND LABEL IS A POST-HOC RELABEL**
+([#1562](https://github.com/mudler/vllm.cpp/issues/1562)). Its golden carries
+`attention_backend_source: "corrected from the run log by w6-relabel.py"`, not a
+value read back off the built engine, which is the rule `## Owed` O22 itself lays
+down. Neither the log nor the script is committed, so the label is unauditable.
+The TRITON_ATTN arm's label WAS read back and is unaffected. That golden also
+carries NO per-block drafts on any record, so it can answer output identity and
+cannot answer draft identity or acceptance; the gate now reports that as VOID
+rather than as a structural finding about our drafts.
+
+### FLASH_ATTN is USABLE here, which #1456 concluded it was not
+
+The first capture exported `VLLM_ATTENTION_BACKEND=TRITON_ATTN`, vLLM ignored it
+because that variable does not exist at this revision, auto-selection took
+`FLASH_ATTN`, and the run worked end to end -- 54.87 GiB loaded, graphs captured,
+256 coherent tokens, speculation live. #1456's SASS measurement stands;
+`sm_80` PTX JITs forward and `cudaErrorUnsupportedPtxVersion` is the opposite
+failure. Posted to #1456.
+
+### SPEED — NOT TAKEN
+
+No ratio is claimed and none should be inferred. No idle-host same-binary A/B was
+run. Our DFlash2 draft is off the paged CUDA-graph fast path while the oracle
+graphs its draft step. And every wall-clock here was dominated by reading a
+51.75 GiB checkpoint over CIFS: 11:17 and 12:15 for 24 tokens, `tok_s` 0.115 and
+0.090, which measure loading and are recorded so nobody quotes them as decode.
+
+### The device arms, on hardware, zero skips
+
+`test_ops_dflash2_grouped_conv` 9936 assertions, `test_ops_dflash2_selector_edges`
+3859, `test_ops_topk_values_indices` 560, `test_ops_dflash2_path_walk` 83,
+`test_qwen3_dflash2_draft` 277, `test_dflash2_runner_reach` 86,
+`test_dflash2_argmax_guard` 30. All `Status: SUCCESS!`, all
+`CUDA_SKIP_LINES=0`, `DEVICE_SUITES_FAILED=0`.
+
+### Four instrument defects, three in the oracle hook and one in our own gate
+
+Recorded in the spec's `## Owed` O23. The pattern is the finding: each presents
+as a verdict about the CODE. The engine core is a separate process by default;
+`capture_model()` calls the hooked method inside a CUDA graph capture; and
+`_generate_draft` is the wrong seam entirely because `propose` replays the
+captured graph. The third asserted `InprocClient`, `HOOK_ON_CLASS=traced` and
+the resolved backend, and was still blind. Only the abort-on-zero caught them.
+The fourth was ours: the gate compared 55 raw propose calls against vLLM's 47
+drafts, which counts only blocks starting inside the output. One assertion of
+134 failed on it.
+
+### Mutations
+
+W6 recorded none. Taken 2026-08-21 by the W6 repair wave on the CPU dev box at
+the merged tree, each with its match count, `git diff --stat` and compile rc
+printed, each restored sha256-verified and rebuilt. Unmutated the suite reads
+**4 cases / 65 assertions / 0 failed / `Status: SUCCESS!` / rc 0** there (the
+e2e case SKIPs without a checkpoint); before this wave it read 3 cases / 41, and
+after the SECOND repair wave it reads 4 cases / 70.
+
+| mutation | result |
+|---|---|
+| `ListField` drops the last id of every list | 1 case / 7 of 65 red, rc 1 |
+| `len += 1 + acc` becomes `len += acc` | 1 case / 7 of 65 red, rc 1 |
+| the `len + j >= out.size()` truncation guard deleted | **SIGSEGV, rc 139** |
+
+**SECOND repair wave (2026-08-21).** Unmutated `test_dflash2_runner_reach` reads
+3 cases / 90 assertions and `test_qwen38_dflash2_spec_decode` 4 cases / 70, both
+`SUCCESS!` / rc 0.
+
+| mutation | result |
+|---|---|
+| **M1** — the DFlash2 startup notice reverted to its pre-repair `"is OPEN upstream at head 66e5414c"` text (match 1, `+3/-5`, compile rc 0) | 1 case / **4 of 90** red, `Status: FAILURE!`, rc 1 — the four new merged-state assertions and nothing else |
+| **M2** — `len < out.size()` -> `len <= out.size()` on `Reconstructed::verified` | **NOT TAKEN.** Attempted and VOIDED by a harness race: two instances ran concurrently and the second took its baseline after the first had mutated, so it read `match count: 0` — its "before" hash `770bee0a` is the MUTATED file, against the clean `843d610b`. Tree verified undamaged (both files byte-identical to `HEAD`); harness now takes a `flock`. A clean retake was unaffordable because every cycle rebuilds the whole 464-object library and the box ran at loadavg 145 / 12 objects per 10 min. The `at_end` boundary fixture IS committed and is UNPROVEN; taking M2 on a quiet box is owed |
+| liveness by TOTAL block count instead of per record | 1 case / 1 red |
+| every golden declared live | 1 case / 2 red |
+| `with_blocks` counts drafts-less records too | 1 case / 4 red |
+| the `hook_stats` residual claimed 0 instead of 3 | 1 case / 1 red |
+
+**The third one is why a doctest assertion line is not a verdict.** It prints
+`assertions: 64 | 64 passed | 0 failed` — one FEWER than green and all passing —
+while the case failed and the process died on a signal. `Status:` and the exit
+code bind; the assertions line reads like a pass.
+
+NOT mutated, and named rather than assumed: the e2e case's own `gd.live` guards
+and its two new ours-vs-theirs assertions. That case is dgx-only and SKIPs here,
+so no mutation of it — and no production-call-site deletion — can be executed on
+this box. The always-on case exists so the liveness RULE is gated where it runs;
+the WIRING is owed a device run.
+
