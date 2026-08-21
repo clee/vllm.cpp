@@ -2109,12 +2109,18 @@ the `input.num_reqs <= 1` refusal.
   nothing enforces that a forward which ignores the field is never given one. This
   architecture's paged forward was the SECOND model cut from that divergence
   (Kimi-Linear was the first), which is what [#1157](https://github.com/mudler/vllm.cpp/issues/1157)
-  turned out to be. **It is owed to `MODEL-NEMOTRON-H-ABI-A2P`, and at `b626be75a`
-  it is recorded NOWHERE in this tree** — not in `.agents/issue-index.md`, and not
-  under `## Owed` in [`nemotron-h-a2p-paged-forward.md`](nemotron-h-a2p-paged-forward.md).
-  Both writes ride in [#1221](https://github.com/mudler/vllm.cpp/pull/1221), which is
-  open and unmerged, so appending an index row for it here would give two branches
-  the same append-only key and the union driver would merge them into a DUPLICATE.
-  It is therefore named in THIS spec, where the claim is true whatever #1221 does,
-  and it is NOT owed to this reconcile to fix. It is the standing reason this row's
-  end-to-end gate is not a pass.
+  turned out to be. It is owed to `MODEL-NEMOTRON-H-ABI-A2P`. **The record for it
+  landed on `main` on 2026-08-18, in
+  [#1221](https://github.com/mudler/vllm.cpp/pull/1221) as `0ea5d249f`.** Both
+  writes are in this tree at this head. `.agents/issue-index.md:403` carries the
+  index row and names `MODEL-NEMOTRON-H-ABI-A2P` as its owning row.
+  [`nemotron-h-a2p-paged-forward.md:901`](nemotron-h-a2p-paged-forward.md) lists
+  the issue as the first bullet under that spec's `## 11. Owed`. The earlier
+  reason to withhold the index row was that #1221 was still open. Two branches
+  would then append the same key, and the union driver would merge them into a
+  DUPLICATE. That reason expired with the merge, and appending a row now would
+  create the duplicate it was written to avoid. **This reconcile therefore owes
+  nothing for #1217.** The issue stays open as a seam defect owned by
+  `MODEL-NEMOTRON-H-ABI-A2P`, and it is not why this row's end-to-end gate is
+  unrecorded on `main`. `## Now` gives that reason: the `STRICT PASS` 96/96 was
+  measured on the #1221 branch tree, and no run against current `main` exists.
