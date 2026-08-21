@@ -51,7 +51,7 @@ taken from a model card.
 | the unconditional `.input_scale` read, against `*.input_scale` appearing ZERO times | **208 present**, `F32` scalar `[]`. The unconditional read succeeds |
 | a per-channel BF16 `weight_scale` that `ReadF32Scalar` refuses on count AND dtype | **`F32` scalar `[]`** on every FP8 module. Per-tensor static |
 | no representation for a DYNAMIC per-token activation scheme | `config_groups.group_0` sets `"dynamic": false` on both weights and `input_activations` |
-| the scheme is never read from the config | discharged by W4 at `c8d926ea8` |
+| the scheme is never read from the config | **NOT discharged for this artifact** — see the correction below |
 
 The NVFP4 half is the easier one too. unsloth ships `nvfp4-pack-quantized`
 W4A**4**; this tree ships **W4A16_NVFP4, `group_size` 16**, weight-only, in the
@@ -66,12 +66,26 @@ model.language_model.layers.0.linear_attn.in_proj_qkv.weight_scale  F32     []
 model.language_model.layers.0.linear_attn.in_proj_qkv.input_scale   F32     []
 ```
 
-Accounting: 2001 tensors — 937 `.weight`, 594 `weight_scale`, 208
-`input_scale`, 193 `weight_scale_2`, 166 `.bias`, 48 `dt_bias`, 15 `mtp.*`. The
-193/208 split matches the publisher's stated 193 W4A16_NVFP4 + 208 FP8. **W4's
-accounting gate is pinned to the unsloth NAME SET** (1953 + 15 = 1968) and does
-not cover this one, so W5 owes a second per-scheme accounting gate rather than a
-re-run of the first.
+Accounting, by EXACT suffix. The first revision of this section wrote 594
+`weight_scale` and omitted `A_log`, and those buckets summed to 2146 against a
+stated total of 2001. The 594 came from a SUBSTRING match that also caught
+`weight_scale_2`. **Buckets that do not sum are the check that was skipped**, and
+the corrected ones do:
+
+| count | suffix |
+|---:|---|
+| 937 | `.weight` |
+| 401 | `.weight_scale` |
+| 208 | `.input_scale` |
+| 193 | `.weight_scale_2` |
+| 166 | `.bias` |
+| 48 | `.A_log` |
+| 48 | `.dt_bias` |
+| **2001** | **total** |
+
+The 193/208 split matches the publisher's stated 193 W4A16_NVFP4 + 208 FP8.
+**W4's accounting gate is pinned to the unsloth NAME SET** (1953 + 15 = 1968)
+and does not cover this one.
 
 **`k_scale` and `v_scale` appear ZERO times** while `hf_quant_config.json` sets
 `kv_cache_quant_algo: "FP8"`. The fp8 KV scales are therefore defaulted by the
@@ -79,6 +93,20 @@ engine, not read from the checkpoint, and `--kv-cache-dtype fp8` is load-bearing
 for CORRECTNESS and not only for memory: the publisher's canary is `19 x 23`,
 which answers `437` with the flag and `417` without it. That canary is adopted
 as this campaign's smoke gate on all three arms.
+
+**The format is ModelOpt, and the fourth blocker is NOT discharged.** The
+`quantization_config` declares `quant_method: "modelopt"`, `quant_algo:
+"MIXED_PRECISION"`, and an EMPTY `ignore` list against unsloth's 303 entries. It
+carries both a `config_groups` block, which is the compressed-tensors shape this
+section originally read, and a `quantized_layers` block naming 401 exact
+modules, which is the ModelOpt shape. The DECLARED method decides, and it is
+`modelopt`, so `ct::Config` stops at `quant_method != "compressed-tensors"` and
+**nothing in this tree reads this config at all**. Every routing decision then
+falls to a tensor-name probe, which can be silently wrong in both directions.
+
+The work is therefore not "extend W4's resolver to a second name set". It is the
+first production wiring of the ModelOpt reader, which is what
+[#1603](https://github.com/mudler/vllm.cpp/pull/1603) lands.
 
 **This falsifies #979's premise for three of the four engines.** #979 concluded
 that no single quantization is common to all four. That survives for llama.cpp,
