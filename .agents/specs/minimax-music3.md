@@ -5157,7 +5157,7 @@ Baseline binary `6d356119bd4c7e61...`, 36 cases / 345 assertions / `SUCCESS!`.
 |---|---|---|---|
 | **M1** the `dit.qkv` bracket deleted | rc 0 | `8038c347...` | **36 cases, 2 failed, 311 assertions, `FAILURE!`, rc 1** — restored to `6d356119...` byte for byte |
 | **M2** `AddSince(..., span=false)`, so the sixteen land as LEAVES | rc 0 | `c5445572...` | **36 cases, 1 failed, 16 assertions failed, `FAILURE!`, rc 1** |
-| **M3** `backend->Synchronize(queue)` deleted | **rc 1** | — | **NO VERDICT** — did not compile. Re-run PENDING; see below |
+| **M3** `backend->Synchronize(queue)` deleted | **rc 1** | — | **NO VERDICT** — did not compile. Re-run as `(void)queue;`: rc 0, `a5a1271a...`, **36 cases / 345 assertions / `SUCCESS!` / rc 0** — GREEN by design; see below |
 | **M4** `span_backend` forced null | rc 0 | `80a9a22b...` | **36 cases, 3 failed, 294 assertions, `FAILURE!`, rc 1** |
 
 **M3 is the finding inside the mutation pass.** Deleting the drain orphaned the
@@ -5179,12 +5179,35 @@ distinguish a drained bracket from an undrained one however it is written. The
 necessity of the drain is established on the DEVICE, by §21.9's spans-on /
 spans-off pair, and not by this suite.
 
-**The re-run itself is PENDING at the time of writing** — the authoring host sat
-at load 68-101 under unrelated sessions and the rebuild had not finished. It is
-recorded as pending rather than predicted, because the conclusion above does not
-need it: it follows from `backend.h:42`, and a green result would add nothing a
-reader could act on. What would be a finding is a RED one, and that is the
-reason to report the state instead of dropping the row.
+**The re-run is GREEN, and the mutation reached the binary**, which is the pair
+that makes it evidence rather than noise:
+
+| | value |
+|---|---|
+| `COMPILE_RC` | **0** |
+| binary | `6d356119...` -> **`a5a1271a...`** |
+| result | **36 cases / 345 assertions / 0 failed / `SUCCESS!` / `TEST_RC=0`** |
+
+So the drain can be deleted and this suite does not notice, on a compiled and
+executed binary rather than by inference from `backend.h:42`. The inference and
+the measurement agree.
+
+**AND THE FIRST REPORT OF THIS LINE WAS WRONG, WHICH IS ITSELF THE THIRD
+INSTRUMENT DEFECT IN THIS ROW.** An earlier revision recorded the re-run as
+pending "because the authoring host sat at load 68-101 and the rebuild had not
+finished". It had not been dispatched at all. The launcher waited on
+`until ! pgrep -f mutate.sh` and the wait loop's OWN command line contains the
+string `mutate.sh`, so the pattern matched the watcher; the loop could never
+exit and never reached the line below it. Every later check then ran
+`pgrep -f mutate3.sh`, which matched ITS own watcher for the same reason, so
+"still running" was a process watching itself for the better part of an hour.
+The tells were all present and all read the wrong way: `/tmp/mut3-build.log` did
+not exist, no `ninja` or `cc1plus` was alive, and the test binary still hashed to
+the untouched baseline. **A self-matching `pgrep` reports a job that was never
+started as a job still in progress**, and the load average supplied a plausible
+cause for a state that had a different one. Recorded here beside M3's compile
+failure and the probe's two build failures because it is the same class as both:
+an instrument failing toward a confident answer.
 
 **M2 is the one that matters most and it is the least obvious.** Sixteen spans
 landing as leaves changes no call count, no bucket name and no number inside the
