@@ -1,4 +1,4 @@
-# fp8 KV cache (`cache_dtype=fp8*`) — spike + W1 (`KV-FP8`, `QUANT-KV-FP8`)
+# fp8 KV cache (`cache_dtype=fp8*`) — spike + W1 + W2 (`KV-FP8`, `QUANT-KV-FP8`)
 
 Rows: `KV-FP8` (engine-matrix, KV cache and memory) and `QUANT-KV-FP8`
 (quantization-matrix). HIGH-priority feature gap #5
@@ -19,9 +19,12 @@ re-port).
   CPU-buildable brick: an fp8-e4m3 K/V **store** (`vt::ReshapeAndCacheFp8`) +
   the fp8 **read** dequant in CPU paged attention + the `cache_dtype` config
   parse (`vllm::v1::ParseCacheDType`), all unit-gated RED-first.
-- **Out (named later bricks):** the CUDA fp8-KV store kernel and the CUDA
-  fp8-KV paged-attention read (the GPU is the memory-halving e2e), fp8_e5m2 CPU
-  compute, per-attention-head scales, the full engine-runner integration
+- **In (W2, `## W2 — the CUDA arm` below):** the CUDA fp8-e4m3 K/V store kernel
+  and the fp8 dequant on the CUDA paged-attention read, gated for parity against
+  the W1 CPU reference.
+- **Out (named later bricks):** fp8_e5m2 compute on either backend,
+  per-attention-head scales, the Metal and ROCm fp8-KV arms (both refuse by name
+  — see `## W2` below), the full engine-runner integration
   (half-sized KV blocks in the real runner + checkpoint `k_scale`/`v_scale`
   threading + `--kv-cache-dtype`/`--calculate-kv-scales` CLI), and the vendor
   KV dtypes (`fp8_inc`, `fp8_ds_mla` — `QUANT-KV-FP8-VENDOR`) and turboquant /
@@ -99,9 +102,15 @@ W1 (this change; CPU-only, `-Werror`):
   (mirror `CacheDType` + `is_quantized_kv_cache`).
 - `tests/vt/test_ops_fp8_kv_cache.cpp` (NEW) + its `tests/CMakeLists.txt` line.
 
-Later bricks: the CUDA fp8 store + fp8 paged-attention read (GPU memory-halving
-e2e); the runner/spec integration (half-sized blocks + checkpoint scale
-threading + CLI); fp8_e5m2 CPU compute; per-head scales.
+W2 (`## W2 — the CUDA arm` below): `src/vt/cuda/cuda_cache.cu` (the fp8 store
+kernel + its kCUDA registration), `src/vt/cuda/cuda_paged_attn.cu` (`LoadKv`,
+the two scale parameters on `PagedAttentionKernel`/`PagedFlashKernel`,
+`LaunchPagedBlock`, `LaunchPagedFp8`), `src/vt/ops.cpp` (the device-class guards
+replaced by provider routing plus a named Metal/ROCm refusal), and
+`tests/vt/test_cuda_fp8_kv_cache.cpp` (NEW) + its `tests/CMakeLists.txt` line.
+
+Later bricks: the runner/spec integration (half-sized blocks + checkpoint scale
+threading + CLI); fp8_e5m2 compute; per-head scales; the Metal and ROCm arms.
 
 ## Tests to port
 
@@ -124,9 +133,17 @@ threading + CLI); fp8_e5m2 CPU compute; per-head scales.
   a wrong store direction (`hp * scale`) fails 3 cases / 480 assertions; a wrong
   read `v_scale` diverges > 0.05 from the baseline; an auto (no-dequant) read of
   an fp8 cache is refused. No sibling regressions (reshape 12/12, paged 14/14).
-- **Later:** the CUDA fp8 store + read parity vs this CPU reference; the real
-  memory-halving e2e (KV blocks ~2× on a gate model at token parity) is the
-  binding gate and is DGX-blocked (docs/BENCHMARKS PENDING).
+- **Correctness (W2, provider routing — the CPU leg):** `test_cuda_fp8_kv_cache`
+  6 cases / 10 assertions GREEN on a CPU-only build. RED-first proven: with the
+  W1 device-class guards in place the suite reports 10 assertions / 6 failed for
+  the store guard plus the read guard, naming both refusal strings.
+- **Correctness (W2, device — UNEXECUTED, see `## Owed`):** the store byte gate
+  (zero tolerance, f32 + bf16 source, a padded slot), the paged-read parity gate
+  (decode + prefill, NMSE < 1e-6 and worst < 1e-3 vs the CPU arm) and the
+  registration gate need a CUDA build and a device. Neither was available to the
+  implementing session, so **the CUDA TUs in this change are UNCOMPILED**.
+- **Later:** the real memory-halving e2e (KV blocks ~2× on a gate model at token
+  parity) is the binding gate and is DGX-blocked (docs/BENCHMARKS PENDING).
 
 ## Dependencies
 
@@ -141,10 +158,88 @@ vendor/turbo/nvfp4 KV dtypes are separate rows.
 |---|---|---|
 | W0 | this spike | DONE (this commit) |
 | W1 | CPU fp8-e4m3 store + read dequant + config parse + unit gate | DONE (this commit) |
-| W2 | CUDA fp8-e4m3 store + fp8 paged-attention read (parity vs W1) | later |
+| W2 | CUDA fp8-e4m3 store + fp8 paged-attention read (parity vs W1) | DONE (code + gate landed; the DEVICE cases are UNEXECUTED — see `## Owed`) |
 | W3 | runner/spec integration: half-sized KV blocks + checkpoint k/v_scale threading + `--kv-cache-dtype`/`--calculate-kv-scales` | later |
 | W4 | memory-halving e2e on a gate model (the binding gate, DGX) | later |
 | W5 | fp8_e5m2 CPU+CUDA compute; per-attention-head scales | later |
+
+## W2 — the CUDA arm (#1593)
+
+Issue: [#1593](https://github.com/mudler/vllm.cpp/issues/1593). W1 is the
+ORACLE: every W2 gate compares CUDA to the landed CPU kernels, never to a fresh
+reference.
+
+**Store** (`src/vt/cuda/cuda_cache.cu`, `ReshapeAndCacheFp8KernelCuda` +
+`ReshapeAndCacheFp8Kernel<Tin>`, registered for `DeviceType::kCUDA`). A 1:1 port
+of the fp8 branch of `reshape_and_cache_flash_kernel`
+(`cache_kernels.cu:314-401`) + `CopyWithScaleOp` (`:241-252`), restricted to
+upstream's `is_contiguous_heads && kv_scale_stride == 0` arm (`:352-366`) —
+which is the only arm the op's wrapper admits, because the vt cache is the NHD
+unbind slice and `ReshapeAndCacheFp8` takes two scalar scales. The converter is
+upstream's own `__nv_cvt_float_to_fp8(hp / scale, __NV_SATFINITE, __NV_E4M3)`
+(`quant_utils.cuh:497-503`) — a true DIVIDE, not the activation path's hoisted
+reciprocal multiply — and its byte-for-byte equality to the CPU software codec
+`vt::F32ToF8E4M3` is already MEASURED at zero tolerance on sm_110 and sm_121a
+([vt-fp8-quant-arch-gate.md](vt-fp8-quant-arch-gate.md) G2). Source dtypes
+f32/f16/bf16, the same set the CPU `LoadSrcF32` serves.
+
+**Read** (`src/vt/cuda/cuda_paged_attn.cu`). `LoadKv(ptr, i, scale)` joins
+`Load`: inert on the f32/bf16 arms (they forward to `Load` unchanged, so every
+existing caller reads the same bytes in the same order), and on `uint8_t` it is
+`Fp8E4M3ToF32Dev(byte) * scale` — upstream's `scaled_vec_conversion<float,
+uint8_t>` (`quant_utils.cuh:302-308`), written as the SAME ARITHMETIC as
+`vt::F8E4M3ToF32` so CUDA==CPU on the read is a property of the source rather
+than of a measurement this session could not take. `PagedAttentionKernel` and
+`PagedFlashKernel` gain `k_scale`/`v_scale`; `LaunchPagedByKv` keys on
+`args.kv_cache_dtype` (never on the storage dtype, which is a bare `kI8` byte)
+and routes to `LaunchPagedFp8`.
+
+**Scope of the read, argued.** Only the two correctness-grade kernels serve fp8:
+the tiled flash prefill and the block decode. That is what the existing ladder
+already implies — the WMMA prefill kernels stage `__nv_bfloat16` fragments, the
+vendored FA-2 launchers take bf16 pointers, and the vectorized decode-opt/GQA
+kernels read through `LoadRowN`/`LoadRow8`, 128-bit `uint4` loads specialized
+for bf16 and f32 only. Upstream draws the same line from the other side:
+FlashAttention serves a quantized KV cache only where
+`flash_attn_supports_kv_cache_dtype` says so (`flash_attn.py:181-187,796-805`).
+A tensor-core fp8 read is a PERFORMANCE brick; W2's gate is parity, and W4 owns
+the memory/throughput measurement.
+
+**The device-class guards are gone, but not the refusal.** W1 hard-refused every
+non-CPU queue inside both op wrappers, before provider lookup — that is what kept
+the CUDA arm unreachable. The STORE now resolves through the provider table like
+every other op, because `kReshapeAndCacheFp8` is its own `OpId` that only CPU and
+CUDA register, so an unimplemented backend refuses BY NAME inside `GetOp`. The
+READ cannot: it rides ADDITIVE fields on `PagedAttentionArgs` of an op `kMETAL`
+and `kROCM` already register for the FLOAT path, and nothing in the provider
+table can tell the two arms apart, so an fp8 cache would reach a float kernel and
+return silent garbage. `src/vt/ops.cpp` therefore keeps an explicit CPU-or-CUDA
+list there whose message names the missing part, and
+`tests/vt/test_cuda_fp8_kv_cache.cpp` gates it on both `kMETAL` and `kROCM`.
+
+## Owed
+
+- **The W2 device gates are UNEXECUTED** (#1593). `tests/vt/test_cuda_fp8_kv_cache.cpp`
+  G2 (provider registration, CUDA build), G3 (store byte parity, f32 + bf16), G4
+  (paged-read parity, decode + prefill) and G5 (e5m2 refusal) all need a CUDA
+  toolkit and a device; the implementing session had NEITHER — `nvcc` is absent
+  on `mudler-ubuntu-box` and the GPU fleet was leased for the #1574 campaign.
+  **The CUDA translation units in this change have therefore never been
+  compiled**, let alone run. G1/G1b (provider routing and the Metal/ROCm refusal)
+  are the only cases that executed, and they run on the CPU leg. The first CUDA
+  build or `rc` lease that touches this row must run
+  `ctest -R test_cuda_fp8_kv_cache` and record the result here before W2 counts
+  as measured. Until then the wave table's `DONE` means "landed and gated", not
+  "measured on hardware".
+- **Nothing reaches the fp8 KV path from a production entry point yet**, on
+  either backend. `vt::ReshapeAndCacheFp8` and `PagedAttentionArgs::kv_cache_dtype`
+  have no caller outside their tests; W1 landed in that state and W2 does not
+  change it. **`KV-FP8` W3 owns the wiring** — half-sized KV blocks in the runner,
+  `--kv-cache-dtype` threaded from the CLI, and the checkpoint `k_scale`/`v_scale`
+  path — and it is tracked by #1593 alongside W2.
+- **Metal and ROCm have no fp8 KV arm.** Both refuse by name (see above). Neither
+  has a row yet; they belong with W5's per-head/e5m2 work or a backend row.
+- fp8_e5m2 and per-attention-head scales stay refused on both backends (W5).
 
 ## Risks/decisions
 
