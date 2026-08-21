@@ -17,7 +17,8 @@ dispatch this spec builds on and which is still OPEN.
 **Lifecycle:** `LOAD-GGUF-MMPROJ` is `PARTIAL` (W1 landed; see
 [W1 outcome](#w1-outcome)). `QUANT-QWEN38-27B-GGUF-ARM` is `PARTIAL` (W2
 landed; see [W2 outcome](#w2-outcome)). `QUANT-QWEN38-27B-NVFP4-ARM` is
-`PARTIAL` (W4 landed; see [W4 outcome](#w4-outcome)).
+`PARTIAL` (W4 and W5 landed; see [W4 outcome](#w4-outcome) and
+[W5 outcome](#w5-outcome)).
 **Owner:** unassigned
 
 ## Why this is not optional
@@ -457,6 +458,101 @@ FP8 KV-cache scales. Nothing reads them. They must be either consumed or refused
 by name; silently ignoring a KV-cache quantization scheme is the defect class a
 token gate cannot see.
 
+### The second NVFP4 artifact: a ModelOpt checkpoint, not a compressed-tensors one
+
+`r0b0tlab/Qwen3.8-27B-NVFP4-MTP-sm121` @
+`36f717a22990e82c54c1d48ee77c491b87825680` is a second published NVFP4 quant of
+the same model, and the campaign
+[#1574](https://github.com/mudler/vllm.cpp/issues/1574) needs it. It is not a
+second revision of the artifact above and it is not the same format. Read
+2026-08-21 by HTTP range request over each of its four shards' own safetensors
+headers and over the three JSON documents it ships; every number below is from
+those bytes.
+
+| | `unsloth/Qwen3.8-27B-NVFP4` @ `7d6f8d4d` | `r0b0tlab/...-MTP-sm121` @ `36f717a2` |
+|---|---|---|
+| `quant_method` | `compressed-tensors` | **`modelopt`** |
+| declared by | `format: "mixed-precision"` | **`quant_algo: "MIXED_PRECISION"`** |
+| membership | `config_groups`, regex `targets` | **`quantized_layers`, 401 EXACT module names** |
+| `ignore` | 303 entries | **EMPTY** |
+| FP8 weight scale | per-CHANNEL, `BF16 [out, 1]` | **per-TENSOR, `F32 []`** |
+| FP8 activations | DYNAMIC per-token, zero `input_scale` | **STATIC, 208 `input_scale` `F32 []`** |
+| NVFP4 half | W4A4 `nvfp4-pack-quantized`, layers 0-55 | **W4A16_NVFP4 g16, weight-only, ALL 64 layers** |
+| NVFP4 spelling | `weight_packed` + `weight_scale` + `weight_global_scale` | **`weight` U8 + `weight_scale` F8_E4M3 + `weight_scale_2` F32 `[]`** |
+| `lm_head` | FP8 | **W4A16_NVFP4** |
+| index | 1968 names, 2 files | **2001 names, 4 files** |
+| KV scales shipped | 32 (`k_scale`/`v_scale`) | **0** |
+
+Shard verification, the same semantic check `AGENTS.md` requires in place of a
+remote hash — `8 + header_len + max(data_offsets[1])` against the size the hub
+reports:
+
+| Shard | Bytes | Header | Tensors |
+|---|---:|---:|---:|
+| `model-00001-of-00004.safetensors` | 9,965,644,108 | 118,392 | 970 |
+| `model-00002-of-00004.safetensors` | 9,985,743,924 | 122,832 | 976 |
+| `model-00003-of-00004.safetensors` | 1,120,886,516 | 4,784 | 40 |
+| `model-00004-of-00004.safetensors` | 849,400,592 | 1,800 | 15 |
+
+All four match. Their sizes sum to 21,921,675,140 and the index's
+`metadata.total_size` is 21,921,427,300; the difference, 247,840, is exactly the
+four headers plus their four 8-byte length prefixes, so the index and the files
+agree about the payload as well as about the names. The fourth shard's
+`__metadata__` carries `"merge": "mtp-head-bf16-from-source"`, and its 15
+tensors are the MTP head, all BF16 and none of them named by
+`quantized_layers`.
+
+**Every one of W4's four blockers is a property of the OTHER artifact, not of
+the format.** This one ships the per-tensor static FP8 that `LoadFp8Raw`
+already reads and the ModelOpt NVFP4 that `LoadNvfp4AnyNaming` already reads, so
+its projections load. What it exposed instead is a fifth blocker W4 could not
+see, because W4's artifact is refused before it: **nothing in this tree read
+this config at all.** `ct::Config::FromQuantizationConfig` stops at
+`quant_method != "compressed-tensors"`, so W4's whole-checkpoint read answers ""
+for a ModelOpt checkpoint and every routing decision falls to the loader's
+per-projection tensor-NAME probe. That probe cannot be wrong about the bytes and
+it can be wrong about the checkpoint, in both directions, and both directions
+load silently. W5 closes that; see [W5 outcome](#w5-outcome).
+
+**The vLLM loader log says MXFP8, and the checkpoint says otherwise.** Running
+this artifact under a vLLM image prints three `Detected ModelOpt ...` warnings,
+and one of them is `Detected ModelOpt MXFP8 checkpoint`. It is not a statement
+about the checkpoint. At the pin, `ModelOptMixedPrecisionConfig._from_config`
+(`modelopt.py:2371-2400`) UNCONDITIONALLY constructs all four candidate
+sub-configs — `ModelOptFp8Config`, two `ModelOptNvFp4Config` (`NVFP4` and
+`W4A16_NVFP4`) and `ModelOptMxFp8Config` — and each warns from its own
+`__init__` (`:386`, `:1035` twice, `:1708`). The lines therefore report what was
+CONSTRUCTED, not what was selected; a run that prints the MXFP8 line and not the
+`fp8` line at `:386` would falsify this reading, so the fp8 line is the cheap
+cross-check. SELECTION is
+`ModelOptMxFp8Config.override_quantization_method` (`:1724-1731`), which returns
+`modelopt_mxfp8` only when the extracted algo string CONTAINS `"MXFP8"`, and
+per-module dispatch is `ModelOptMixedPrecisionConfig.get_quant_method`
+(`:2525-2535`), which hands out `mxfp8_config` only for a module whose
+`quantized_layers` entry says MXFP8. This artifact's `quant_algo` is
+`MIXED_PRECISION` and its 401 entries are 208 `FP8` and 193 `W4A16_NVFP4`, with
+zero `MXFP8`. The checkpoint's own half of the argument is stronger still: MXFP8
+carries an E8M0 block scale per 32 elements and this file ships no E8M0 tensor
+at all — its dtype histogram is F32 609, BF16 798, F8_E4M3 401, U8 193, and its
+only non-scalar scales are the 193 NVFP4 group scales at `F8_E4M3 [out, in/16]`.
+Both halves are asserted in
+`tests/vllm/models/test_qwen38_27b_modelopt_mtp_arm.cpp` so that a later reader
+does not build an MXFP8 arm on the strength of a log line. **No MXFP8 arm is
+implemented here**; W5 REFUSES a module whose declared algorithm is MXFP8, and
+on this artifact that refusal never fires because no entry declares it.
+
+**It is not the only ModelOpt `MIXED_PRECISION` checkpoint this loader sees.**
+`nvidia/Qwen3.6-27B-NVFP4` @ `0893e1606ff3d5f97a441f405d5fc541a6bdf404` — the
+FP8-tower gate model of #466, recorded at
+[`hf_snapshot.h:287-315`](../../tests/parity/hf_snapshot.h) — declares the same
+`quant_method`, the same `quant_algo`, and the same 401-entry split of 208 FP8
+and 193 `W4A16_NVFP4`. Its index is 2194 names because its NVFP4 projections
+also ship an `input_scale`, its `exclude_modules` is `["mtp*", "mtp.layers.0*"]`
+rather than empty, and its `config.json` declares a `kv_cache_scheme` for which
+it ships ZERO scales. Anything W5 adds to the load path runs on that gate model
+too, which is why W5 refuses a DISAGREEMENT rather than routing by the
+declaration.
+
 ## Work breakdown
 
 Three units, in dependency order. Each is one row, one branch and one pull
@@ -468,10 +564,22 @@ request; none of them is this change, which is the spec and the records.
 | W2 | Q4_K_M manifest, 866-tensor accounting, the `nextn` block-count correction, the artifact's tokenizer and chat template | `QUANT-QWEN38-27B-GGUF-ARM` | no | — |
 | W3 | Q4_K_M text / image / video token gates vs pinned llama.cpp, then the speed axes | `QUANT-QWEN38-27B-GGUF-ARM` | yes | W1, W2, #857 |
 | W4 | NVFP4 re-pin, 1968-name accounting, `config_groups` resolution, per-channel FP8 scale, dynamic-activation FP8, `k_scale`/`v_scale` | `QUANT-QWEN38-27B-NVFP4-ARM` | no | — |
-| W5 | NVFP4 text / image / video / MTP token gates vs pinned vLLM, then the speed axes | `QUANT-QWEN38-27B-NVFP4-ARM` | yes | W4, #1185 |
+| W5 | The LOAD side of the SECOND NVFP4 artifact, `r0b0tlab/Qwen3.8-27B-NVFP4-MTP-sm121`: 2001-name per-scheme accounting, and the ModelOpt `MIXED_PRECISION` config read that cross-checks the loader's name probe | `QUANT-QWEN38-27B-NVFP4-ARM` | no | W4 |
+| W6 | NVFP4 text / image / video / MTP token gates vs pinned vLLM, then the speed axes | `QUANT-QWEN38-27B-NVFP4-ARM` | yes | W4, W5, #1185 |
 
-W1, W2 and W4 are the majority of the work and need no GPU, no lease and no
-oracle. W3 and W5 are the only units that do.
+W1, W2, W4 and W5 are the majority of the work and need no GPU, no lease and no
+oracle. W3 and W6 are the only units that do.
+
+**W5 IS NEW AND THE TOKEN-GATE UNIT MOVED TO W6.** When this table was written
+the NVFP4 arm was one artifact, so W4 was its whole CPU-side and the next unit
+was the gate. A second artifact of the same model then arrived —
+[the second NVFP4 artifact](#the-second-nvfp4-artifact-a-modelopt-checkpoint-not-a-compressed-tensors-one) —
+and its load side is neither W4's work (a different format, resolved by a
+different upstream module) nor the gate's (no GPU, no oracle). Renumbering was
+preferred to appending a W6 that runs before W5, because a dependency order a
+reader has to reconstruct from the "Blocked by" column is the thing this table
+exists to spare them. The three in-file references to the old W5 moved with it;
+nothing outside this file names either number.
 
 ### Why this is three rows and not one
 
@@ -1373,11 +1481,117 @@ sha256.
 - **A consumed `kv_cache_scheme`.** There is no quantized KV cache on this arm to
   apply `k_scale`/`v_scale` to. Refused by name; owed by the same row and issue.
 - **The resident-bytes assertion per arm**, and every token gate. Both need a
-  leased GPU and W5, and the NVFP4 gate additionally waits on
+  leased GPU and W6, and the NVFP4 gate additionally waits on
   [#1185](https://github.com/mudler/vllm.cpp/issues/1185).
 - **`model_mtp.safetensors` has no locally-computed sha256.** Its header was
   re-read by range request and its bytes are NOT mirrored to the NAS, so the hash
   bullet under `## Owed` is paid for `model.safetensors` only.
+
+## W5 outcome
+
+`QUANT-QWEN38-27B-NVFP4-ARM` stays `PARTIAL`. W5 delivered the load side of the
+SECOND NVFP4 artifact and the first production consumer of the ModelOpt
+resolver, and it delivered no token and no byte measurement, both of which need
+a leased GPU and are W6's.
+
+### What landed
+
+- **The artifact, verified from its own bytes**, in
+  [the second NVFP4 artifact](#the-second-nvfp4-artifact-a-modelopt-checkpoint-not-a-compressed-tensors-one):
+  four shards, four header parses, four data-end-equals-file-size checks, and an
+  index whose `metadata.total_size` reconciles with the four sizes to the byte.
+  Published in `docs/USAGE.md` with the arms named. **No sha256 of ours**, and
+  that is under `## Owed`: the bytes are ~20.4 GiB and were not mirrored where
+  this unit could reach them, so a remote-reported hash was not written down as
+  one.
+- **A 2001-name per-scheme accounting gate, this artifact's own**, in
+  `tests/vllm/models/test_qwen38_27b_modelopt_mtp_arm.cpp` against four
+  committed header-only manifests generated by the committed
+  `scripts/gen-minimax-h3-safetensors-manifest.py` (names, dtypes, shapes; no
+  weight byte). Every name classifies, nothing is unaccounted in either
+  direction, and the buckets sum to 2001: **720 tensors over 256 modules
+  resolve to `FP8`**, **579 over 193 to `W4A16_NVFP4`**, **702 over 536 to
+  UNLISTED**, zero to a KV-cache scale and zero unclassified. The 256 is
+  separated from the 208 the map NAMES: 48 of them are
+  `...layers.<i>.linear_attn` CONTAINERS that own no Linear weight and resolve
+  through upstream's strategy-3 prefix scan, and the gate asserts 401 `kDirect`
+  against 48 `kPrefix` so the count cannot be right for the wrong reason. The
+  937 weight-bearing modules — one per `.weight` name, and exactly the ones the
+  loader cross-checks — split 208 / 193 / 536.
+  **W4's 1968-name gate is untouched**, and re-ran green at 9 cases / 194
+  assertions on the same tree.
+- **The first production wiring of `modelopt_mixed_precision.h`.**
+  `LoadQwen3_5Dense` reads the ModelOpt `quantization_config` once for the whole
+  checkpoint, through the shared `QuantizationConfigOf` lookup, and refuses by
+  name when the DECLARED algorithm and the SHIPPED operand names disagree, in
+  both directions, or when the declared algorithm has no loader here. Before
+  this the header's only reachable entry points were its own two unit tests —
+  the `AGENTS.md` §"Nothing lands dead" state W4's record named and did not
+  change.
+- **A second operand-suffix list, for the second format.**
+  `modelopt::OperandSuffixes` carries `weight_scale_2` and `input_scale`, which
+  the compressed-tensors list does not and whose absence would leave 401 of this
+  artifact's 2001 names unsplittable and therefore silently unclassified.
+  Widening the compressed-tensors list instead would have falsified its
+  "verified complete against `unsloth/Qwen3.8-27B-NVFP4`" claim without
+  measuring anything.
+
+### Why a CROSS-CHECK and not a router
+
+The obvious change is to route each projection by the declared algorithm instead
+of by the tensor-name probe. W5 deliberately did not, and the reason is a gate
+model. `nvidia/Qwen3.6-27B-NVFP4` @ `0893e160` declares 193 modules
+`W4A16_NVFP4` and ALSO ships an `input_scale` on each of them, and this tree's
+`VT_MODELOPT_W4A4=1` arm reads that presence to select the fp4-ACTIVATION GEMM.
+Routing by the declaration would change which GEMM that A/B lever reaches on a
+checkpoint every recorded 27B NVFP4 ratio was taken on. That is a measurement
+change wearing a correctness change, and it needs its own row and its own
+before/after. The cross-check moves no arm: a checkpoint whose config and
+tensors agree loads exactly as it did.
+
+### The refusal's blast radius, measured rather than assumed
+
+Two checkpoints in this tree reach the new call site, and both were read from
+the hub before it was written: `r0b0tlab/...-MTP-sm121` @ `36f717a2` and
+`nvidia/Qwen3.6-27B-NVFP4` @ `0893e160`. On both, every one of the 937
+weight-bearing modules' declaration matches its shipped spelling, so both answer
+"". Every other checkpoint — compressed-tensors, `fp8`, GGUF, plain bf16 —
+fails `IsMixedPrecision` at `quant_method` and the refusal reads nothing at all.
+
+### Upstream chain, read at the pin
+
+The resolver W5 consumes was ported by row
+`MODEL-TEXT-nemotron-h-nemotron-hfor-causal-lm` W1 and cites
+`vllm/model_executor/layers/quantization/modelopt.py:145-181,282-367,2279-2505`
+and `quantization/utils/quant_utils.py:510-572` at
+`5559679229bc961848b121ccdeaa8fa5d79bec98` in its own header. W5 adds no new
+upstream port: it adds the CONSUMER, and the one behaviour it adds beyond
+upstream is the refusal, which is divergence 1 of that header applied to the
+operand names as well as to the algorithm string. Upstream has no equivalent,
+because upstream builds a `LinearMethodBase` from the declaration and never asks
+what the checkpoint spells.
+
+### Reachability
+
+The refusal is reached from `LoadQwen3_5Dense`, and the gate enters through that
+function rather than constructing the resolver by hand. Proven by mutation:
+deleting the call site in a scratch copy compiles (so this is not a build
+failure wearing a pass) and turns five cases red; restored byte-for-byte,
+green again. The evidence is in the pull request body.
+
+### What did NOT land, and is owed
+
+- **Any token or byte measurement on this artifact.** W6, and blocked on
+  [#1185](https://github.com/mudler/vllm.cpp/issues/1185).
+- **A locally computed sha256, and mirrored bytes.** Named under `## Owed`.
+- **Routing by the declared algorithm.** Named under `## Owed`.
+- **The FP8 KV arm.** `hf_quant_config.json` asks for `kv_cache_quant_algo:
+  "FP8"` and the checkpoint ships zero `k_scale`/`v_scale`; no production path
+  in this tree reads `hf_quant_config.json` at all, so the declaration is
+  invisible to the loader rather than ignored by it. Owned by `KV-FP8`
+  ([#1593](https://github.com/mudler/vllm.cpp/issues/1593)) and named under
+  `## Owed`. W5 does not refuse it, because the identical declaration in
+  `nvidia/Qwen3.6-27B-NVFP4`'s `config.json` would then refuse a gate model.
 
 ## Dependencies and blockers
 
@@ -1489,6 +1703,42 @@ them:
   that let the matrix permalinks go stale while the spec was being repaired.
   `scripts/check-symbol-anchors.py` validates only `path::Symbol` citations, so
   a bare line number is checked by a reader or not at all.
+- **A locally computed sha256 and mirrored bytes for
+  `r0b0tlab/Qwen3.8-27B-NVFP4-MTP-sm121` @ `36f717a2`.** W5 verified all four
+  shards semantically — header parse plus data-end equal to the size the hub
+  reports, and an index `metadata.total_size` that reconciles with the four
+  sizes to the byte — and computed no hash, because it never held the ~20.4 GiB.
+  Nothing in this spec records a hash it did not compute, and no
+  remote-reported hash may become one. Owned by
+  `QUANT-QWEN38-27B-NVFP4-ARM`, tracked by
+  [#821](https://github.com/mudler/vllm.cpp/issues/821).
+- **The Qwen3.5 dense load path routes by TENSOR PRESENCE, and the declared
+  algorithm is only cross-checked.** W5 made the declaration checkable and
+  deliberately did not make it authoritative; see
+  [Why a CROSS-CHECK and not a router](#why-a-cross-check-and-not-a-router).
+  Two consequences are live rather than hypothetical. `VT_MODELOPT_W4A4=1`
+  selects the fp4-ACTIVATION GEMM for any NVFP4 projection that happens to ship
+  an `input_scale`, so on `nvidia/Qwen3.6-27B-NVFP4` @ `0893e160` it flips 193
+  modules the config declares `W4A16_NVFP4` to W4A4. And
+  `IsQwen27QuantizedLinear`
+  (`src/vllm/model_executor/models/qwen3_5_dense_weights.cpp`, declared in
+  `include/vllm/model_executor/models/qwen3_5_dense.h`) hard-codes ONE
+  artifact's answer — it returns false for every `.linear_attn.in_proj_*` and
+  for `lm_head`, which is right for `unsloth/Qwen3.6-27B-NVFP4` and wrong for
+  both ModelOpt 27B artifacts — and has no production caller, only
+  `tests/vllm/models/test_qwen27_dense_forward.cpp`. Owned by
+  `QUANT-QWEN38-27B-NVFP4-ARM`, tracked by
+  [#1597](https://github.com/mudler/vllm.cpp/issues/1597).
+- **The FP8 KV-cache arm on the ModelOpt artifacts.**
+  `r0b0tlab/...-MTP-sm121` sets `kv_cache_quant_algo: "FP8"` in
+  `hf_quant_config.json` and ships ZERO `k_scale`/`v_scale`;
+  `nvidia/Qwen3.6-27B-NVFP4` declares an equivalent `kv_cache_scheme` in its
+  `config.json` and also ships zero. No production path in this tree reads
+  `hf_quant_config.json`, and this tree has no quantized KV cache to apply
+  either declaration to. Owned by `KV-FP8`, tracked by
+  [#1593](https://github.com/mudler/vllm.cpp/issues/1593) — named here rather
+  than refused, because refusing it would refuse a gate model this tree loads
+  and measures today.
 
 ## Now
 
@@ -1506,23 +1756,37 @@ share, and a load refuses either file by name when it carries a tensor nothing
 reads. The `nextn` correction the [Port map](#quant-qwen38-27b-gguf-arm) asks
 for was already in the loader and was ungated; it is gated now.
 
-`QUANT-QWEN38-27B-NVFP4-ARM` is `PARTIAL`: W4 landed, and what it did and did
-not deliver is [W4 outcome](#w4-outcome). The artifact is re-pinned and mirrored
-with a locally computed sha256, its 1968 index names are accounted per scheme in
-CI from committed header-only manifests, and its FP8 group — 233 of its modules,
+`QUANT-QWEN38-27B-NVFP4-ARM` is `PARTIAL`: W4 and W5 landed, and what each did
+and did not deliver is [W4 outcome](#w4-outcome) and
+[W5 outcome](#w5-outcome). The row now covers TWO published NVFP4 artifacts of
+the same model, and they are different formats.
+
+`unsloth/Qwen3.8-27B-NVFP4` @ `7d6f8d4d` is re-pinned and mirrored with a
+locally computed sha256, its 1968 index names are accounted per scheme in CI
+from committed header-only manifests, and its FP8 group — 233 modules,
 including every attention and GDN projection and `lm_head` — is refused by name
 at load with both missing pieces stated, instead of dying on
 `tensor not found: ...input_scale` for a tensor the checkpoint correctly does
-not ship. The NVFP4 half still loads. What is NOT there is a runnable FP8 tower,
-a consumed `kv_cache_scheme`, and any token or byte-residency measurement.
+not ship. Its NVFP4 half loads. Its FP8 tower still does not.
 
-**Every CPU-side unit of this spec has now landed.** What remains is W3 and W5,
+`r0b0tlab/Qwen3.8-27B-NVFP4-MTP-sm121` @ `36f717a2` LOADS, both halves. Its FP8
+is per-tensor and static and its NVFP4 is ModelOpt-spelled W4A16, which are the
+two spellings this loader already reads, so none of W4's four blockers applies
+to it — they were properties of the other artifact. Its 2001 index names are
+accounted per scheme in CI from four committed header-only manifests, and
+`LoadQwen3_5Dense` now READS its ModelOpt `quantization_config` and refuses by
+name when the declared algorithm and the shipped tensor names disagree in either
+direction. That is the first production consumer the resolver at
+`src/vllm/model_executor/layers/quantization/modelopt_mixed_precision.h` has
+ever had.
+
+**Every CPU-side unit of this spec has now landed.** What remains is W3 and W6,
 the token gates, and both are blocked on a named external authority rather than
 on work this spec can schedule: W3 on
 [#857](https://github.com/mudler/vllm.cpp/issues/857) (llama.cpp records
-`gateable = no` at pin `b10451`) and W5 on
+`gateable = no` at pin `b10451`) and W6 on
 [#1185](https://github.com/mudler/vllm.cpp/issues/1185) (the pinned vLLM builds
 and imports inside an `rc` lease, and running a model there is untested). Until
 one of those clears, the next action on this spec is neither: it is the FP8
-tower itself, which W4 refuses by name and lists under
+tower of the unsloth artifact, which W4 refuses by name and lists under
 [What did NOT land, and is owed](#what-did-not-land-and-is-owed-1).
