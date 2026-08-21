@@ -147,6 +147,138 @@ void NoteRan(const std::string& case_name) {
 
 }  // namespace
 
+// ── The golden's PROVENANCE, asserted before any token is compared (#926) ───
+// Everything below this line that touches `oracle.json` compares tokens against
+// it. This case asks the prior question: can that reference be regenerated, and
+// does it say what configuration produced it?
+//
+// As `af8170154` committed it, the answer was no and the file was silent about
+// it. `oracle.json` recorded the model, the revision, `temperature` and
+// `max_tokens` and the vllm/transformers/flashinfer versions, and NOT ONE engine
+// knob; the capture ran from an uncommitted driver in `$HOME` on `dgx.casa`,
+// which was reimaged two days later. `enforce_eager`, `max_model_len`,
+// `max_num_seqs`, `max_num_batched_tokens`, `gpu_memory_utilization` and the
+// batch shape each move a greedy argmax at a near-tie, and two later runs under
+// fully recorded configurations reproduce prompts 0 and 1 exactly and neither
+// reproduces prompt 2 (32/32, 32/32, 26/32 and 32/32, 32/32, 29/32).
+//
+// So the contract this case holds is not "the configuration is recorded" -- it
+// cannot be, and inventing one would be worse than the silence. It is that the
+// golden STATES which of the two it is. A golden that records its configuration
+// must record ALL of it; a golden that cannot must say so in the file and name
+// the issue that owes the re-derivation. The third state, silence, is the defect,
+// and it is what this case removes.
+//
+// It needs no checkpoint and no GPU: the golden is committed, so this runs on
+// every runner. That is deliberate. The provenance defect is a records defect,
+// and a gate for it must not need the hardware whose absence caused it.
+TEST_CASE("NemotronH golden: the reference says whether it can be regenerated") {
+  const std::string path = std::string(NEMOTRON_H_GOLDENS_DIR) + "/oracle.json";
+  std::ifstream in(path);
+  REQUIRE_MESSAGE(in.good(), "cannot read the committed golden at " << path);
+  nlohmann::json doc = nlohmann::json::parse(in);
+
+  // Anti-vacuity first. A comparison over zero elements reports a perfect
+  // score, so the width every later case will compare over is asserted here
+  // rather than trusted.
+  REQUIRE(doc.contains("sampling"));
+  REQUIRE(doc["sampling"].contains("max_tokens"));
+  const int width = doc["sampling"]["max_tokens"].get<int>();
+  REQUIRE(width > 0);
+  REQUIRE(doc.contains("golden"));
+  REQUIRE(doc["golden"].is_array());
+  REQUIRE(!doc["golden"].empty());
+  for (const auto& entry : doc["golden"]) {
+    REQUIRE(entry.contains("prompt_token_ids"));
+    REQUIRE(!entry["prompt_token_ids"].empty());
+    REQUIRE(entry.contains("token_ids"));
+    CHECK(static_cast<int>(entry["token_ids"].size()) == width);
+  }
+  MESSAGE("golden: " << doc["golden"].size() << " prompts x " << width
+                     << " tokens = " << doc["golden"].size() * width
+                     << " token comparisons available");
+
+  REQUIRE_MESSAGE(doc.contains("capture"),
+                  "the golden carries no `capture` block, so nothing in this "
+                  "tree can say what configuration produced it -- see #926 and "
+                  "scripts/nemotron-h-oracle-capture.py");
+  const nlohmann::json& capture = doc["capture"];
+  REQUIRE(capture.contains("engine_config_recorded"));
+  REQUIRE(capture["engine_config_recorded"].is_boolean());
+  for (const std::string& key : {std::string("schema"), std::string("generator"),
+                                 std::string("captured_utc"), std::string("host")}) {
+    // std::string, not const char*: doctest stringifies a bare char* as a
+    // BOOL, and this message read "capture is missing '1'" until it did not.
+    REQUIRE_MESSAGE(capture.contains(key), "capture is missing '" << key << "'");
+  }
+
+  if (!capture["engine_config_recorded"].get<bool>()) {
+    // UNATTRIBUTED, and saying so is the whole contract. The golden is kept --
+    // deleting evidence to make a gate green is never the repair -- but every
+    // token score taken against it is a difference from an unattributable
+    // reference, and this run says that out loud.
+    REQUIRE(capture.contains("unrecoverable_reason"));
+    CHECK(capture["unrecoverable_reason"].is_string());
+    CHECK(!capture["unrecoverable_reason"].get<std::string>().empty());
+    REQUIRE(capture.contains("issue"));
+    const std::string issue = capture["issue"].get<std::string>();
+    CHECK(issue.rfind("https://github.com/mudler/vllm.cpp/issues/", 0) == 0);
+    // "unrecorded" and "here is the record" cannot both be true.
+    REQUIRE(capture.contains("engine"));
+    CHECK(capture["engine"].is_null());
+    MESSAGE(
+        "UNATTRIBUTED GOLDEN: this reference records no engine configuration, "
+        "so a token difference against it is not yet a defect. Owed by "
+        << issue
+        << ". Re-derive with scripts/nemotron-h-oracle-capture.py --capture "
+           "--profile nhspeed-a.");
+    return;
+  }
+
+  // ATTRIBUTED: then it is attributed COMPLETELY. Each key below can move a
+  // greedy argmax at a near-tie, and a key that is absent is not "the default",
+  // it is unrecorded -- which is the state this whole case exists to refuse.
+  // The list is duplicated in scripts/nemotron-h-oracle-capture.py
+  // (REQUIRED_ENGINE_KEYS) and tests/scripts/test_nemotron_h_oracle_capture.py
+  // asserts the three agree, so neither copy can drift alone.
+  REQUIRE(capture.contains("engine"));
+  REQUIRE(capture["engine"].is_object());
+  REQUIRE(capture["engine"].contains("resolved"));
+  const nlohmann::json& resolved = capture["engine"]["resolved"];
+  const std::vector<std::string> required = {
+      "attention_backend", "block_size",       "compilation_mode",
+      "cudagraph_capture_sizes", "cudagraph_mode", "dtype",
+      "enable_chunked_prefill", "enable_prefix_caching", "enforce_eager",
+      "gpu_memory_utilization", "kv_cache_dtype", "max_model_len",
+      "max_num_batched_tokens", "max_num_seqs", "moe_backend",
+      "num_gpu_blocks", "num_gpu_blocks_override", "quantization",
+      "seed", "tensor_parallel_size"};
+  for (const std::string& key : required) {
+    REQUIRE_MESSAGE(resolved.contains(key),
+                    "capture.engine.resolved is missing '"
+                        << key << "', so this golden is only partly attributed");
+    if (key != "num_gpu_blocks_override") {
+      CHECK_MESSAGE(!resolved[key].is_null(),
+                    "capture.engine.resolved['"
+                        << key
+                        << "'] is null: a value that could not be read is not a "
+                           "value that was default");
+    }
+  }
+  REQUIRE(capture.contains("batch"));
+  REQUIRE(capture["batch"].contains("shape"));
+  CHECK(!capture["batch"]["shape"].get<std::string>().empty());
+  REQUIRE(capture.contains("legs"));
+  CHECK_MESSAGE(capture["legs"].get<int>() >= 2,
+                "one leg cannot show the configuration is deterministic");
+  REQUIRE(capture.contains("legs_agree"));
+  CHECK(capture["legs_agree"].get<bool>());
+  MESSAGE("ATTRIBUTED GOLDEN: profile "
+          << capture["engine"].value("profile", "<unnamed>") << ", "
+          << required.size() << " engine keys recorded, "
+          << capture["legs"].get<int>() << " agreeing legs");
+}
+
 TEST_CASE("NemotronH: the REAL checkpoint loads and the forward produces logits") {
   const std::string kCase = "real_checkpoint_loads_and_forwards";
   std::string why;
