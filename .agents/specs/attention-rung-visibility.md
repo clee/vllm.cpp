@@ -1,0 +1,234 @@
+# Attention rung visibility: the naive kernel stops being the silent default
+
+Issue: [#1544](https://github.com/mudler/vllm.cpp/issues/1544).
+Owning row: KERNEL-ATTN-DENSE-FLASH (kernel-matrix.md), the row that already owns
+`AttentionDenseFlash` and its head-dim contract. This spec is an increment on that
+row, linked from its evidence cell, exactly as `fusion-consistency-audit.md` is an
+increment on the fusion framework row. It is deliberately NOT added to that row's
+`Spec` column, because `check-gate-commands.py` classifies a row from the FIRST
+spec link in that column and the row is pinned there as `no-gates-section`;
+promoting a second spec into that column would move the row into
+`RUNNABLE_BASELINE` as a side effect of an unrelated change.
+
+Note on spelling: this document writes the owning row id WITHOUT backticks for the
+same reason. `check-agent-record.py::check_spec` selects a row's governing spec by
+searching for the backticked token, and a second spec carrying it can change which
+file is held to the structured-section contract.
+
+## Scope
+
+Two additive changes, both from #1544's `## Owed`. Neither changes what any
+existing caller computes.
+
+IN SCOPE:
+
+1. A checker, `scripts/check-attention-rung-consistency.py`, that refuses a model
+   translation unit which names `vt::Attention` — the naive, correctness-grade
+   rung — without a recorded reason beside the call.
+2. The marker comments the six deliberate call sites already deserve, in
+   `whisper_audio.cpp`, `qwen3_vl_vision.cpp`, `kimi_linear_device.cpp`,
+   `qwen3_5.cpp`, `nemotron_h.cpp` and `nemotron_h_device.cpp`.
+3. A repair of `AttentionDenseFlash`'s advertised head-dim contract in
+   `src/vt/cuda/cuda_ops.cu`, so the bound it states is the bound it can launch.
+4. The shared-memory bound as a pure, unit-testable host function in
+   `include/vt/ops.h`, so the arithmetic is executable on a box with no GPU.
+
+OUT OF SCOPE, and each for a stated reason:
+
+- `vt::Attention`'s behaviour and `OpId::kAttention`'s resolution. Both are frozen
+  so text decode stays byte-identical (`src/vt/cuda/cuda_ops.cu:3120-3122`), and
+  six model sites use the naive kernel as the REFERENCE arm of a numeric gate or
+  an A/B knob. Auto-routing it would delete those reference arms.
+- `ltx2.cpp`, `ltx2_device.cpp` and `muse_glimmer_vision.cpp`. Their `vt::Attention`
+  calls are being REMOVED by other rows in flight ([#1545](https://github.com/mudler/vllm.cpp/issues/1545)
+  for Muse Glimmer, the LTX-2.5 routing row for the other two). Editing the lines
+  those changes replace would conflict for no gain, so the three stems are carried
+  on `scripts/attention-rung-allowlist.txt` with the owning issue named.
+- Opting `AttentionDenseFlash` in to the >48 KiB shared-memory cap. See
+  `## Risks/decisions` D2.
+
+## Upstream chain
+
+vLLM never lets a model reach a kernel by omission, and it never advertises a
+head-size domain it cannot serve. Both halves of this row mirror that polarity at
+the pinned oracle `555967922`.
+
+| Concern | vLLM at the pin | Ours before this row |
+|---|---|---|
+| Who picks the encoder attention kernel | `vllm/model_executor/models/vision.py:99` `get_vit_attn_backend(head_size, dtype)` — every vision tower ASKS a selector, which reads the shape and the override | the C++ function name the author typed; `vt::Attention` resolves straight to the naive kernel and nothing routes it up |
+| What a backend's head-size domain means | `vllm/v1/attention/backend.py:155-163` — a backend DECLARES `get_supported_head_sizes()` and `supports_head_size()` is consulted BEFORE dispatch | `AttentionDenseFlash` declares `head_dim <= 256` and cannot launch above 192 (bf16) / 96 (f32) |
+
+We cannot mirror `get_vit_attn_backend` directly: our seam has no config object and
+no per-model backend enum, and the deliberate frozen-reference arms have no vLLM
+counterpart. What transfers is the PROPERTY the selector gives upstream for free —
+the kernel a model runs is a declared choice, not an omission. A checker is how a
+C++ tree without a selector gets that property, and item 3 is simply the
+`supports_head_size` half stated truthfully.
+
+## Our baseline
+
+Measured on this tree at `04f1cead6`.
+
+Nine live `vt::Attention(` call sites under `src/vllm/model_executor/models/`:
+
+| File:line | Disposition |
+|---|---|
+| `whisper_audio.cpp:324` | A/B rung, `VT_WHISPER_ENC_EAGER=1`, default is `AttentionDenseFlash` |
+| `qwen3_vl_vision.cpp:527` | A/B rung, `VT_QWEN3VL_ATTN_EAGER=1`, default is `AttentionDenseFlash` |
+| `kimi_linear_device.cpp:598` | behind `VT_KIMI_DEVICE_MLA`, default off, recorded as a measured negative |
+| `qwen3_5.cpp:5279` | reference arm; non-test callers are in `tests/` |
+| `nemotron_h.cpp:671` | reference arm |
+| `nemotron_h_device.cpp:330` | reference arm |
+| `muse_glimmer_vision.cpp:639` | THE defect, #1545, another row in flight |
+| `ltx2.cpp:959`, `ltx2_device.cpp:421` | THE defect, LTX-2.5 routing row in flight |
+
+`AttentionDenseFlash` at `src/vt/cuda/cuda_ops.cu:3336` states `d <= 256` and
+requests `2 * kFlashBc * d * sizeof(Tin)` bytes of dynamic shared memory at `:3338`
+with `kFlashBc = 64`. `grep -rn cudaFuncSetAttribute src/vt/cuda/` returns nothing,
+so the launch is bounded by CUDA's default 48 KiB dynamic cap:
+
+| Input dtype | Bytes per head_dim | Largest head_dim that launches | Advertised |
+|---|---:|---:|---:|
+| bf16 | 256 | 192 | 256 |
+| f32 | 512 | 96 | 256 |
+
+It fails LOUD — `Check(cudaGetLastError(), "attention-dense-flash launch")` at
+`:3352` throws — so this is a wrong contract and a trap, never silent corruption.
+
+## Port map
+
+| Change | Path |
+|---|---|
+| Head-dim bound as pure host arithmetic | `include/vt/ops.h`, beside the `AttentionDenseFlash` declaration |
+| Honest refusal at the launcher | `src/vt/cuda/cuda_ops.cu` `LaunchAttentionDenseFlash` |
+| Rung-visibility checker | `scripts/check-attention-rung-consistency.py` |
+| In-flight stems, with owning issue | `scripts/attention-rung-allowlist.txt` |
+| Marker comments | the six deliberate model translation units |
+| Gate wiring | `scripts/agent-preflight.sh`, `.github/workflows/ci.yml` |
+
+The checker reuses `scripts/checker_text.py::normalize_source`, so a
+commented-out, `#if 0`-ed or `if (false)`-ed call is a deletion to it and never a
+site, and the reported `file:line` still describes the original file.
+
+## Tests to port
+
+There is nothing to port. vLLM's `supports_head_size` contract is enforced by its
+selector rather than by a test that pins the arithmetic, and no upstream test
+covers a shared-memory ceiling that only exists in our scalar kernel.
+
+New, all runnable with no GPU:
+
+| Test | Pins |
+|---|---|
+| `tests/scripts/test_check_attention_rung_consistency.py` | the checker's pure functions, and five mutations that must go RED |
+| `tests/vt/test_ops_attention.cpp` new cases | the shared-memory arithmetic, both honest bounds, and that 256 is outside both |
+
+One test needs a device and is declared PENDING rather than skipped quietly: a
+CUDA case that calls `vt::AttentionDenseFlash` at head_dim 256 and requires the
+refusal to name `AttentionDenseFast`. It emits a loud MESSAGE and returns on a box
+with no CUDA backend, which is this box.
+
+## Gates
+
+Every leg below is CPU-only except where it says otherwise. There is no GPU lease
+on this row: `dgx:gpu0` is held by the developer, and AGENTS.md forbids reaching a
+fleet device outside a lease.
+
+1. **Ran:** `python3 scripts/check-attention-rung-consistency.py` reports zero
+   drift on the tree.
+2. **Ran:** `python3 tests/scripts/test_check_attention_rung_consistency.py`.
+3. **Ran:** `ctest -R test_ops_attention`, including the new head-dim contract
+   cases.
+4. **Ran:** `scripts/agent-preflight.sh --staged`.
+5. **Owed:** the on-device refusal case. It needs a CUDA backend, and it is listed
+   under `## Owed` with the issue that carries it.
+
+## Dependencies
+
+None on other rows. The three allowlisted stems depend on rows in flight only in
+the sense that removing their entries is those rows' cleanup, and a stale entry is
+reported and never a failure.
+
+## Work breakdown
+
+1. Spec, committed first.
+2. The checker, its allowlist and its mutation suite.
+3. Marker comments at the six deliberate sites.
+4. The head-dim bound helper, the launcher refusal, and the contract tests.
+5. Record edits: the owning row's evidence cell, the issue index, the claim.
+
+## Risks/decisions
+
+**D1 — a checker, not a selector.** #1544 owes "a selector or a checker" and both
+are legitimate. A selector that auto-routes `vt::Attention` by shape was REJECTED,
+and not on taste: six of the nine sites exist precisely BECAUSE they are the naive
+kernel. `nemotron_h.cpp:671`, `nemotron_h_device.cpp:330` and `qwen3_5.cpp:5279`
+are reference arms that tests compare against, and `whisper_audio.cpp:324` and
+`qwen3_vl_vision.cpp:527` are the `*_EAGER` rungs of a same-binary A/B. Rerouting
+any of them changes what the reference computes, which deletes the comparison the
+gate performs; AGENTS.md names that failure directly — never make a red gate green
+by widening an assertion's scope. A documented opt-in helper that picks by shape
+was also rejected as insufficient on its own: it helps an author who already knows
+the fast rungs exist, and #1544's defect is precisely the author who does not.
+
+The checker inverts that. It cannot change any caller's numerics, because it runs
+no code; and it fires on the one population that matters, an author naming the
+naive kernel without saying why.
+
+**D2 — narrow the bound, do not opt in to a larger cap.** `cudaFuncSetAttribute`
+with `cudaFuncAttributeMaxDynamicSharedMemorySize` would make the advertised 256
+true on some devices and NOT on others: head_dim 256 in f32 needs 128 KiB, above
+the opt-in per-block cap of the consumer Blackwell parts this project gates on, so
+the opt-in call itself can fail and the contract would still be a lie at the
+widest advertised width. It also cannot be verified without a device, and this row
+has no lease. Narrowing is device-independent arithmetic, provable here, and is a
+strict improvement for every caller: a head_dim that launches today still
+launches, and one that does not now fails with a message naming the rung that
+works instead of an opaque CUDA launch error from a later `cudaGetLastError`.
+Opting in remains available later as a widening, owned by nobody today because no
+live caller needs head_dim above the honest bound through this op.
+
+**D3 — refuse rather than silently fall back to `AttentionDenseFast`.**
+`AttentionDenseFa2KernelCuda` DOES fall through to `AttentionDenseFlash`
+(`cuda_ops.cu:3395-3408`), so a silent step-down has precedent here. It was
+rejected anyway. `AttentionDenseFast` re-reads K and V from global memory once per
+(query, head) — that is the exact redundancy `AttentionDenseFlash` exists to
+remove — so the fallback is a real, unannounced slowdown, which is #1544's disease
+in miniature. This row's whole subject is that a rung change must be a declared
+choice. A refusal naming `AttentionDenseFast` gives the caller the same
+information and lets them make it.
+
+**D4 — the allowlist is not a lock.** AGENTS.md forbids a record surface every
+pull request must write. `scripts/attention-rung-allowlist.txt` is written only by
+a change that ADDS an unmarked naive-attention site, which is the event the
+checker exists to make deliberate, and it is emptied by the rows already in
+flight. Two concurrent removals of different lines merge. The primary record is
+still per-site and in-file: the marker comment lives beside the call it explains,
+so the ordinary case touches no shared file at all.
+
+**D5 — the marker's reason is checked for presence, not for truth.** The checker
+requires a non-trivial reason string and cannot judge it. That is the same floor
+`check-fusion-consistency.py` sets with its allowlist reasons. A reviewer judges
+the reason; the gate only guarantees one was written.
+
+**R1 — the launcher refusal is not executed on this box.** The pure arithmetic is
+tested and mutated here, but nothing on a CPU-only box proves the launcher CALLS
+it. A reviewer's reachability mutation for that leg needs a CUDA device. Stated,
+not hidden; see `## Owed`.
+
+**R2 — the 48 KiB constant.** `49152` is CUDA's default dynamic shared-memory cap
+on every architecture this project supports, and the bound is INCLUSIVE. That
+matters in one direction only: head_dim 192 in bf16 sits exactly at 49152 and
+launches today, so an exclusive bound would refuse work that currently runs, which
+would be a regression rather than a repair.
+
+## Owed
+
+- [#1573](https://github.com/mudler/vllm.cpp/issues/1573) — run the CUDA head-dim
+  refusal case for `AttentionDenseFlash` on a leased device, and mutate the
+  launcher's bound call to prove the case reaches it. PENDING a GPU lease.
+
+## Now
+
+The change is written and CPU-gated. The next step is the fresh scoped review, and
+after it the single owed leg above, which needs whoever next holds a lease.
