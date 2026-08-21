@@ -93,6 +93,19 @@ The draft may be a checkpoint directory or a single `.gguf` file, for DFlash,
 DFlash2 and DSpark alike. A GGUF draft is dequantized to bf16 as it loads, so
 picking a smaller quantization saves download and disk and does not save memory.
 
+**The TARGET's `lm_head` may be quantized.** A DFlash or DFlash2 draft owns no
+output head and runs the target's, so until
+[#1628](https://github.com/mudler/vllm.cpp/issues/1628) that head had to be stored
+as dense bf16: pointing a draft at a safetensors target whose `lm_head.weight` is
+ModelOpt or compressed-tensors NVFP4 refused the load with `dflash: target tensor
+lm_head.weight is not BF16 (got U8)`. It is now kept packed and multiplied by the
+same GEMM the target's own logits take. A head this engine could only read by
+WIDENING it still refuses by name -- a GGUF target's `output.weight`, an FP8
+`lm_head`, and an NVFP4 head under `VT_MODELOPT_W4A4=1` -- because the DFlash2
+candidate selector reads the target head's exact top-K and a widened head changes
+that set with no visible symptom. A DSpark draft still refuses every quantized
+target head.
+
 [Speculative decoding](SPECULATIVE-DECODING.md) lists the supported methods, the
 draft checkpoints each was gated against, and what each one refuses by name.
 Drafting is greedy: `draft_sample_method` accepts only `"greedy"`, and any other

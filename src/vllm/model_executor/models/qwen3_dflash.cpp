@@ -18,6 +18,7 @@
 
 #include "vllm/model_executor/layers/linear.h"             // UnquantizedMlpGateUpMethod seam
 #include "vllm/model_executor/models/dense_attn_block.h"  // Dev/DBuf/ResidentWeight/Reshape/MakeRopeArgs
+#include "vllm/model_executor/models/dense_nvfp4_gemm.h"  // #1628: the shared NVFP4 W4A16 logits GEMM
 #include "vllm/platforms/interface.h"                     // platforms::GetPlatform (static-graph gate)
 #include "vt/backend.h"
 #include "vt/breakable_graph.h"  // ENG-CUDAGRAPH-BREAK W5: the shared capture seam
@@ -33,6 +34,53 @@ using vt::Tensor;
 using namespace dense_attn;  // Dev, DBuf, ResidentWeight, Reshape, MakeRopeArgs
 
 constexpr int64_t kPadSlotId = -1;  // vLLM PAD_SLOT_ID (attention/backends/utils.py:45)
+
+// ---------------------------------------------------------------------------
+// SPEC-DFLASH2-QUANT-LMHEAD (#1628) - the ONE draft logits GEMM.
+//
+// The draft owns no head; it runs the TARGET's over its own hidden states, and
+// the target's head has TWO storage owners (`LoadDenseLmHead`, qwen3_5_dense.h):
+// raw-NK bf16, or ModelOpt/compressed-tensors NVFP4 kept PACKED. Every block
+// forward below used to read only the first, so a target whose head is NVFP4 was
+// refused at load by stored dtype.
+//
+// The packed arm goes through `dense_nvfp4::MatmulNvfp4W4A16D`, which is the
+// W4A16 dispatcher extracted VERBATIM from the anonymous namespace of
+// qwen3_5.cpp (see dense_nvfp4_gemm.h's preamble: same forced-Marlin selection,
+// same `VT_NVFP4_MARLIN` predicate, same host dequant + bf16 Matmul fallback
+// where no fp4 GEMM is registered). That matters here more than anywhere else:
+// the DFlash2 candidate selector's whole input is the TARGET head's exact top-K,
+// so the draft has to compute it with the head the target computes with, by the
+// computation the target uses. `tests/vllm/models/test_qwen3_dflash2_draft.cpp`
+// measures that equality against `Qwen3_5MTPModel::ComputeLogits` - the OTHER
+// draft that shares the target's head - rather than asserting it from the code.
+//
+// Upstream reaches the same place and needs no branch, because its head is an
+// `nn.Module`: `compute_candidates` @ the MERGED vllm-project/vllm#52816 head
+// `b389ac29465b33f9e9c534df221ea3c129e9793f` calls
+// `LogitsProcessor.get_top_k_tokens(self.lm_head, ...)` ->
+// `_apply_head` -> `lm_head.quant_method.apply` (logits_processor.py:241-286,
+// :132-142), which IS the target's own logits path. The quant-method refusal
+// that file carried at `66e5414c` - the one `RefuseQuantizedDflash2LmHead`
+// mirrors - is gone from the merged version entirely.
+DBuf DflashLogitsF32D(Dev d, const Tensor& x, const Qwen3DFlashWeights& weights,
+                      int64_t vocab, int64_t hidden_size) {
+  if (!weights.lm_head_fp4.Empty()) {
+    // The W4A16 dispatcher refuses a true-W4A4 weight itself; this says WHY in
+    // this lane's terms, because falling into the fp4-activation GEMM the target
+    // head does not take is the silent-wrong `## Risks/decisions` D12 is about.
+    VT_CHECK(!weights.lm_head_fp4.IsTrueW4A4(),
+             "dflash: the shared lm_head is NVFP4 with an ACTIVATION scale "
+             "(true W4A4) and this draft's logits GEMM is the W4A16 dispatcher "
+             "the target's own W4A16 head takes. Unset VT_MODELOPT_W4A4. Issue "
+             "#1628 (https://github.com/mudler/vllm.cpp/issues/1628).");
+    return dense_nvfp4::MatmulNvfp4W4A16D(d, x, weights.lm_head_fp4, DType::kF32);
+  }
+  Tensor lm = ResidentWeight(d, weights.lm_head, {vocab, hidden_size});
+  DBuf logits(d, DType::kF32, {x.shape[0], vocab});
+  vt::MatmulBT(d.q, logits.t(), x, lm);
+  return logits;
+}
 
 // ---------------------------------------------------------------------------
 // SPEC-DFLASH2 W2 (#1314) — the grouped dynamic depthwise convolution that wraps
@@ -493,9 +541,7 @@ std::vector<float> Qwen3DFlashModel::ForwardBlockLogits(
     tmp.Download(d, final_out->data());
   }
 
-  Tensor lm = ResidentWeight(d, weights.lm_head, {vocab, H});
-  DBuf logits(d, DType::kF32, {T, vocab});
-  vt::MatmulBT(d.q, logits.t(), dnorm.t(), lm);
+  DBuf logits = DflashLogitsF32D(d, dnorm.t(), weights, vocab, H);
   std::vector<float> out(static_cast<size_t>(T) * vocab);
   logits.Download(d, out.data());
   return out;
@@ -758,9 +804,7 @@ static std::vector<float> ForwardWithCtxKVDev(
     final_out->assign(static_cast<size_t>(Tq) * H, 0.0f);
     tmp.Download(d, final_out->data());
   }
-  Tensor lm = ResidentWeight(d, weights.lm_head, {vocab, H});
-  DBuf logits(d, DType::kF32, {Tq, vocab});
-  vt::MatmulBT(d.q, logits.t(), dnorm.t(), lm);
+  DBuf logits = DflashLogitsF32D(d, dnorm.t(), weights, vocab, H);
   std::vector<float> out(static_cast<size_t>(Tq) * vocab);
   logits.Download(d, out.data());
   return out;
@@ -1126,10 +1170,7 @@ static DBuf ForwardPagedBody(Dev d, const DflashDeviceKVStore& store, const Tens
     vt::FusedChain(d.q, dnorm.t(), cur, w_fn, &res.t(), vt::kFusedAddRmsNormStd, eps);
   else
     vt::RmsNorm(d.q, dnorm.t(), cur, w_fn, vt::RmsNormArgs{eps, false}, &res.t());
-  Tensor lm = ResidentWeight(d, weights.lm_head, {vocab, H});
-  DBuf logits(d, DType::kF32, {Tq, vocab});
-  vt::MatmulBT(d.q, logits.t(), dnorm.t(), lm);
-  return logits;
+  return DflashLogitsF32D(d, dnorm.t(), weights, vocab, H);
 }
 
 std::vector<float> Qwen3DFlashModel::ForwardBlockLogitsWithDeviceKV(
