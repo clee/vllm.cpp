@@ -3286,15 +3286,18 @@ TEST_CASE("ltx2 video: a render through the ABI emits a phase table that SUMS to
 
   // (4) THE SUM, and what it is measured against.
   //
-  // THIS LINE READ `leaves >= 0.95 * wall` AND IT WAS RED ON `main`. Row
-  // LTX25-PHASE-RESIDUE replaced it, and the reason is not that 95% was the
-  // wrong number — it is that a SHARE of the render's wall is the wrong
-  // quantity. The residue is a fixed set of gaps between the named phases; the
-  // wall is the render. So the ratio improves when the box is slow and decays as
-  // the hardware gets faster, which is the polarity #1439 measured when a `main`
-  // run at `wall=0.579684s` PASSED while five faster runs of the same binary
-  // failed. At the 21 B render this instrument exists for, the same 95% permits
-  // MINUTES of time nobody named.
+  // THIS LINE READS `leaves >= 0.95 * wall`, IT WAS RED ON `main`, AND IT IS
+  // STILL THE ASSERTION. Row LTX25-PHASE-RESIDUE proposed replacing it, on the
+  // ground that a SHARE of the render's wall is the wrong quantity: the residue
+  // is a fixed set of gaps between the named phases, the wall is the render, so
+  // the ratio improves when the box is slow and decays as the hardware gets
+  // faster — the polarity #1439 measured when a `main` run at `wall=0.579684s`
+  // PASSED while five faster runs of the same binary failed, and at the 21 B
+  // render this instrument exists for the same 95% permits MINUTES of time
+  // nobody named. THAT REPLACEMENT IS WITHDRAWN, and the floor below is the
+  // original one with its constant unedited. The measurement that withdrew it,
+  // and the reason `wall` turns out to be the better-conditioned denominator
+  // after all, are at the CHECK itself.
   //
   // AND NOBODY HAD DECOMPOSED IT. Four issues argued about the tolerance across
   // three months. Splitting the residue into the gaps between consecutive leaves
@@ -3303,13 +3306,16 @@ TEST_CASE("ltx2 video: a render through the ABI emits a phase table that SUMS to
   // gaps between adjacent named phases held 0.108 ms between them — 6.8 us per
   // boundary, which is this instrument and nothing else.
   //
-  // WHAT IS ASSERTED NOW. The driver names the three regions that held that
-  // time, and `PhaseLog` measures the wall it spends inside its own entry points
-  // while no leaf is live and emits it as `instrument_seconds`. So the question
-  // becomes the one the table can actually answer, at any scale: is the time
-  // nobody named larger than the cost of naming the phases? See
-  // the note on `instrument_seconds` at the top of this file for why the
-  // instrument's charge is reported here and not asserted against.
+  // WHAT CHANGED IS THE NUMERATOR, NOT THE ASSERTION. The driver names the three
+  // regions that held that time, so the residue this floor divides by `wall` is
+  // an order of magnitude smaller than the one four issues argued about. And
+  // `PhaseLog` measures the wall it spends inside its own entry points while no
+  // leaf is live and emits it as `instrument_seconds`, so a reader can ask at
+  // any scale whether the time nobody named is larger than the cost of naming
+  // the phases. That charge is REPORTED, in the MESSAGE below and in the emitted
+  // table, and it is asserted against nowhere. See the note on
+  // `instrument_seconds` at the top of this file, and the note at the CHECK
+  // below, for why.
   REQUIRE(table.contains("unaccounted_seconds"));
   const double unaccounted = table["unaccounted_seconds"].get<double>();
   REQUIRE_MESSAGE(table.contains("instrument_seconds"),
@@ -4192,14 +4198,30 @@ void CheckCarryingPhase(const nlohmann::json& table, const Carrying& c) {
   // WHAT THIS NUMBER IS NOW, AND WHY IT IS NOT THE 0.95 IT WAS. It bounds the
   // INTERIOR gaps -- the residue (1c) above cannot see -- and the interior is
   // real work whose share of the leaf is a property of the BOX, not of the tree.
-  // The population, all on an unchanged `denoise`: 99.28%, 99.38%, 99.55% and
-  // 99.228% on the row's own box; 98.52%, 98.84%, 98.23%, 98.77% and 94.14% on a
-  // second x86 box as its load moved; 94.60%, 96.85% and 94.60% on the box #1494
-  // measured; and 92.39% and 88.85% on the GitHub runner that has to stay green.
-  // The 81-frame arm runs 85.85% to 97.09% over the same set. A 0.95 floor is
-  // therefore BELOW half of its own honest distribution, which is why `main`
-  // carried this red, and no floor near the measured share can be set without
-  // reopening it.
+  // THE POPULATION BELOW PREDATES `denoise.update` AND NO LONGER DESCRIBES THIS
+  // LEAF. It was measured while the sampler's per-step update was still
+  // un-anchored work INSIDE `denoise`, and it is what argued this constant down
+  // to 0.75: 99.28%, 99.38%, 99.55% and 99.228% on the row's own box; 98.52%,
+  // 98.84%, 98.23%, 98.77% and 94.14% on a second x86 box as its load moved;
+  // 94.60%, 96.85% and 94.60% on the box #1494 measured; and 92.39% and 88.85%
+  // on the GitHub runner that has to stay green.
+  // The 81-frame arm ran 85.85% to 97.09% over the same set. A 0.95 floor was
+  // therefore BELOW half of that distribution, which is why `main` carried this
+  // red, and no floor near THOSE measured shares could be set without reopening
+  // it.
+  //
+  // ROW LTX25-PHASE-RESIDUE THEN NAMED THAT WORK, so the residue this floor sees
+  // is SMALLER than the one #1494 measured. `denoise` now carries SIXTEEN
+  // sub-scopes rather than the eight the (1c) note above quotes, and five runs
+  // across two sessions read 99.5981% to 99.9915% over both arms -- the worst of
+  // them 4.60 points ABOVE the 0.95 the distribution above straddled.
+  //
+  // THE CONSTANT STAYS AT 0.75 ANYWAY, and that is a decision rather than an
+  // oversight. Setting this floor near a freshly measured share is what put this
+  // case on the known-flaky list twice, and five runs of one tree on one box say
+  // nothing about the next box, where the interior is still work whose share is
+  // a property of the BOX. Tightening it is a separate change owing its own
+  // distribution, not a follow-on from the anchor.
   //
   // So this floor is deliberately loose, on exactly the argument the
   // `decode.video.vae` and `decode.audio.vocoder` floors beside it are set by:
@@ -4458,11 +4480,13 @@ void CheckRenderPhases(const nlohmann::json& table,
   //   * The comment that stated 0.95 already predicted it. It said the margin is
   //     "a FALSE RED and never a false pass" and that the ratio "gets worse
   //     exactly as the hardware gets faster", and it left the number alone.
-  //   * `denoise_min_coverage` was a PARAMETER — 0.95 at nine frames, 0.90 at 81
-  //     — because the uncovered part is work whose share depends on the
-  //     geometry. That parameter was the un-anchored work leaking into a
-  //     threshold. `denoise.update` anchors the work, so the parameter is gone
-  //     rather than retuned.
+  //   * `denoise_min_coverage` CARRIED TWO VALUES — 0.95 at nine frames, 0.90 at
+  //     81 — because the uncovered part is work whose share depends on the
+  //     geometry. That split was the un-anchored work leaking into a threshold.
+  //     `6b48edb2c` collapsed it to one 0.75 and `denoise.update` anchors the
+  //     work the two values were tracking, so what is gone is the per-geometry
+  //     TUNING and not the parameter: `denoise_min_coverage` is still declared,
+  //     still forwarded, and now carries 0.75 at every call site.
   //   * The other three were never near their floors (99.82%, 99.97%, 99.44%)
   //     and were still wrong in the same way: 0.99 of a `decode.audio` permits
   //     83 ms of an un-anchored phase at fixture scale, and MINUTES of one on the
@@ -4521,13 +4545,19 @@ void CheckRenderPhases(const nlohmann::json& table,
   //    the work the paragraph above left owed. `denoise.update` is now a
   //    production scope over the sampler's per-step update, counted by
   //    `Ltx2ConditioningTrace::sampler_updates`, so the interior residue this
-  //    population is made of has a name and the share floor is gone rather than
-  //    moved a third time. The 88.85% the GitHub runner reported is the measured
-  //    reason it had to be: eleven points of a leaf were un-anchored work, and
-  //    no floor can separate that from a swallowed phase. What (2) asserts now
-  //    is the leaf's uncovered seconds against the instrument's OWN measured
-  //    charge to that leaf, which is the normaliser `6b48edb2c` looked for and
-  //    correctly reported did not exist yet. `denoise` becoming a multi-part
+  //    population is made of has a name. THE SHARE FLOOR IS STILL THE ASSERTION,
+  //    and what the anchor moved is the QUANTITY under it rather than the form
+  //    of it: (2) still reads `covered >= c.min_coverage * leaf_seconds`,
+  //    `6b48edb2c`'s 0.75 lands unedited, and the residue that floor now sees is
+  //    SMALLER than the one #1494 measured. The 88.85% the GitHub runner
+  //    reported is the measured reason the anchor was owed — eleven points of a
+  //    leaf were un-anchored work, and no floor can separate that from a
+  //    swallowed phase — and it is not what the leaf reads any more. The leaf's
+  //    uncovered seconds against the instrument's OWN measured charge to that
+  //    leaf is the normaliser `6b48edb2c` looked for and correctly reported did
+  //    not exist yet; it is now emitted beside the ratio and REPORTED rather
+  //    than asserted, because a third fresh review measured that comparison red
+  //    4 times in 45 consecutive runs. `denoise` becoming a multi-part
   //    leaf pulled in (1b) exactly as predicted; (1b') beside it is the
   //    per-record pairing that debt turned out to require. The res_2s arm's own
   //    update anchor is still owed, in `.agents/specs/ltx25-phase-residue.md`.

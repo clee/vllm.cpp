@@ -380,7 +380,7 @@ W5 gates, mutations, and the record edits the change makes stale.
 | Issue | State |
 |---|---|
 | [#1536](https://github.com/mudler/vllm.cpp/issues/1536) | closed by this row |
-| [#1439](https://github.com/mudler/vllm.cpp/issues/1439) | **NOT closed by this row, and it must not be.** Its RED is fixed — the assertion it was filed against passes with **4.50 to 4.63 points** of margin, equivalently a **9.9x to 13.5x** growth in the residue before it reds, across 76 runs by two measurers — but its filed complaint is that the budget is a SHARE OF `wall`, so it decides by box load and permits minutes of un-named time at 21 B. This row restores that assertion byte for byte, so the complaint is untouched. What would close it is a bound on a quantity the scheduler cannot move, which is [#1570](https://github.com/mudler/vllm.cpp/issues/1570) and this row's own negative result |
+| [#1439](https://github.com/mudler/vllm.cpp/issues/1439) | **NOT closed by this row, and it must not be.** Its RED is fixed — the assertion it was filed against passes with **4.50 to 4.63 points** of margin, equivalently a **9.9x to 13.5x** growth in the residue before it reds, across 76 runs by two measurers — but its filed complaint is that the budget is a SHARE OF `wall`, so it decides by box load and permits minutes of un-named time at 21 B. This row restores that assertion unchanged -- same predicate, same 0.95, only the failure MESSAGE differs, because it now names the instrument's charge -- so the complaint is untouched. What would close it is a bound on a quantity the scheduler cannot move, which is [#1570](https://github.com/mudler/vllm.cpp/issues/1570) and this row's own negative result |
 | [#1494](https://github.com/mudler/vllm.cpp/issues/1494) | **already CLOSED by `6b48edb2c` before this row merged `main`.** This row takes the `denoise.update` anchor that change recorded as owed; it does not close the issue and does not claim to |
 | [#1470](https://github.com/mudler/vllm.cpp/issues/1470) | closed by this row |
 | [#1567](https://github.com/mudler/vllm.cpp/issues/1567) — the res_2s arm's `denoise.update` anchor | **owed, filed by this row.** `Ltx2Res2sDenoisingLoop` runs its own post-process and step inside `ltx2_res2s.cpp` through `Ltx2Res2sHooks`, so the anchor needs a hook rather than a statement. No gate in this tree renders on that arm, so landing it here would land dead code |
@@ -625,7 +625,7 @@ each side contributes:
 | `denoise` share floor | moved 0.95/0.90 → 0.75 | **kept at 0.75, unedited.** This row briefly deleted it in favour of an instrument-derived bound and withdrew that; the floor it landed with is the floor that lands |
 | the head and tail | new assertion (1c), flat 0.25 ms plain / 3 ms sanitized, per leaf record | **kept exactly as it landed**, constants and all |
 | the interior | left un-anchored, disclosed, owed | anchored as `denoise.update` |
-| the sum gate (#1439) | untouched | **also untouched**, and restored byte for byte after the same withdrawal. Its RED is fixed by the naming, not by the assertion |
+| the sum gate (#1439) | untouched | **also untouched**, and restored unchanged after the same withdrawal -- same predicate, same 0.95, message only. Its RED is fixed by the naming, not by the assertion |
 
 **Its measured population is the strongest evidence either side produced**, and
 it is kept verbatim in the source: on an unchanged `denoise` the nine-frame arm
