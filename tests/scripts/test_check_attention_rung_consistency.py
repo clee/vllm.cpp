@@ -14,8 +14,10 @@ import contextlib
 import importlib.util
 import io
 import sys
+import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -308,7 +310,75 @@ class GreenReportTests(unittest.TestCase):
         self.assertEqual(code, 0, buffer.getvalue())
         return buffer.getvalue()
 
+    def report_over(self, scanned, allowlist_text: str) -> str:
+        """`main()`'s own report path, driven over a CONSTRUCTED tree.
+
+        The report reads two module-level names, so both are redirected for the
+        call: `scan_models`, to a dict built by hand exactly as `MutationTests`
+        builds one, and `ALLOWLIST`, to a temporary file. Nothing the model tree
+        or the real allowlist does can then change what these cases assert, which
+        is the whole reason they do not read either one.
+        """
+        buffer = io.StringIO()
+        with tempfile.TemporaryDirectory() as tmp:
+            allowlist = Path(tmp) / "attention-rung-allowlist.txt"
+            allowlist.write_text(allowlist_text, encoding="utf-8")
+            with mock.patch.object(mod, "scan_models", lambda: scanned):
+                with mock.patch.object(mod, "ALLOWLIST", allowlist):
+                    with contextlib.redirect_stdout(buffer):
+                        code = mod.main()
+        self.assertEqual(code, 0, buffer.getvalue())
+        return buffer.getvalue()
+
+    def test_the_ok_line_counts_the_sites_an_allowlist_excuses(self) -> None:
+        # The guard proper: the "unmarked and excused" branch is exercised with a
+        # NON-ZERO count on a tree this file owns. The constructed scan holds one
+        # allowlisted file carrying an unmarked site -- the debt the green hides --
+        # beside a marked one, plus a marked site nothing excuses, so a checker
+        # that printed `sites - marked`, dropped the clause or hard-coded a number
+        # cannot produce this line.
+        report = self.report_over(
+            {
+                f"{MODELS}/ltx2.cpp": [(10, False), (20, True)],
+                f"{MODELS}/whisper_audio.cpp": [(30, True)],
+            },
+            "# in flight\nltx2  # a row already open removes this call\n",
+        )
+        self.assertEqual(
+            report.strip(),
+            "OK (attention rung): 3 vt::Attention call site(s) in 2 model source "
+            "file(s); 2 carry a recorded reason, 1 unmarked and excused by 1 "
+            "allowlisted in-flight stem(s).",
+        )
+
+    def test_the_ok_line_reports_zero_when_no_stem_is_allowlisted(self) -> None:
+        # The state the allowlist exists to REACH: every in-flight row has landed
+        # and the file parks no stem. The checker prints the count even at zero,
+        # and this pins that, so no case has to require the shipped tree to still
+        # carry excused debt in order to keep the branch covered.
+        report = self.report_over(
+            {f"{MODELS}/whisper_audio.cpp": [(30, True)]},
+            "# nothing in flight\n",
+        )
+        self.assertEqual(
+            report.strip(),
+            "OK (attention rung): 1 vt::Attention call site(s) in 1 model source "
+            "file(s); 1 carry a recorded reason, 0 unmarked and excused by 0 "
+            "allowlisted in-flight stem(s).",
+        )
+
     def test_the_ok_line_reports_the_excused_sites(self) -> None:
+        # The shipped-tree half: whatever the tree's excused count IS, the OK line
+        # must state it. `excused` is RE-DERIVED here and never pinned, so this
+        # holds at 3 today and at 0 once the last in-flight stem is cleaned up.
+        #
+        # It deliberately does NOT assert `excused > 0`. That floor was a
+        # measurement of the model tree stored in this file: it passes only while
+        # some stem is still parked on the allowlist, so the row that removes the
+        # LAST one turns this case red while the checker itself is green at rc=0 --
+        # the drift lock AGENTS.md `## Records` forbids, and the same shape as the
+        # `>= 9` population floor #1629 removed. The branch it was standing in for
+        # is covered above, on a tree this file constructs.
         scanned = mod.scan_models()
         allowed = mod.allowlisted_names(ALLOWLIST.read_text(encoding="utf-8"))
         excused = sum(
@@ -318,7 +388,6 @@ class GreenReportTests(unittest.TestCase):
             for _, marked in sites
             if not marked
         )
-        self.assertGreater(excused, 0, "the shipped tree must exercise this branch")
         self.assertIn(f"{excused} unmarked and excused by", self.report())
 
     def test_the_excused_count_is_not_sites_minus_marked(self) -> None:
