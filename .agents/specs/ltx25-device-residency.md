@@ -2451,6 +2451,71 @@ change deliberately does not touch; see below. It flaps by box load on this host
 and is GREEN in CI, so a run of this suite here reports either 101 or 102 passed
 and neither is a statement about this change.
 
+### The span-slack bound, third shape: it is the BUILD that scales it (#1531 lane)
+
+The flat 0.25 ms constant passed the plain lane and reddened BOTH sanitizer lanes
+the moment #1532 made them able to run. The premise behind it -- "this quantity
+does not scale" -- was right about RENDER SIZE and wrong about BUILD
+CONFIGURATION, and every measurement behind it had come from uninstrumented
+builds. The slack is the cost of opening and closing a phase scope, and a
+sanitizer instruments exactly that path: ASan checks a shadow byte on every access
+in it, TSan additionally keeps per-access happens-before state under a lock. It is
+a different machine, not a noisier one.
+
+| lane | that test's wall | worst span slack, CI | worst span slack, 20-core box |
+|---|---|---|---|
+| plain | 259 s | 121 us | 74.7 us |
+| `address,undefined` | 1165 s | 730 us | 461 us |
+| `thread` | 2116 s | 1658 us | 895 us |
+
+The ordering is the build and not the box: both columns rank the same way, and CI
+is worse throughout because those runners are two-core and contended.
+
+**A single constant is impossible on this fixture, and the numbers say so
+exactly.** The worst slack is 1.658 ms while the SMALLEST leaf is 2.77 ms
+(`artifacts.frames`, ASan, measured). Those are 1.67x apart, so no number is both
+comfortably above the noise and below the leaf. This was not reasoned out in
+advance -- a 3 ms constant was tried and it reddened the anti-vacuity
+`REQUIRE(span_bound < leaf_seconds)` on exactly that leaf.
+
+**The bound is therefore three things, and the third one is the repair:**
+
+    span_bound = min(kSpanSlackPerRecord * leaf_records, 0.5 * leaf_seconds)
+
+* **Per leaf record**, because `decode.video` has two or three and each carries
+  its own pair of boundaries. This is a count of instrument boundaries, never a
+  share, so it is strictly tighter on multi-record leaves.
+* **Configuration-aware**: 0.25 ms plain, 3 ms under either sanitizer, selected at
+  compile time. ~2.1x the worst plain measurement and ~1.8x the worst sanitizer
+  measurement. The sanitizer margin is the thinner and is disclosed rather than
+  papered over. The guard is nested `#if`s, not one `||` expression, because GCC
+  does not define `__has_feature` and must still PARSE the call: the one-line form
+  compiled on the TSan leg only because `||` short-circuited before reaching it,
+  which is a green that means nothing.
+* **Capped at half the leaf with `min`, never `max`.** This is the polarity the
+  earlier review removed, inverted. Under `max` the share was a FLOOR, so it only
+  ever loosened the bound and loosened it most where the leaf was biggest -- 2200x
+  on a multi-second leaf. Under `min` it is a CEILING, so it only ever tightens:
+  on a big leaf the constant binds and production-scale behaviour is exactly the
+  constant, and on a leaf small enough that the constant would swallow it, the
+  leaf binds instead. It also makes `span_bound < leaf_seconds` true BY
+  CONSTRUCTION, so the anti-vacuity REQUIRE becomes an invariant on the FORMULA
+  rather than a live risk, and the forced-strict probe is guaranteed to red on
+  every leaf rather than happening to.
+
+**Verified in all three configurations**, four runs each, on the landing head:
+
+| lane | result | worst slack | smallest leaf | sanitizer findings |
+|---|---|---|---|---|
+| plain | 4/4 green, 578/578 | 74.7 us | 0.887 ms | - |
+| `address,undefined` | 4/4 green, 578/578 | 418 us | 2.92 ms | 0 ASan, 0 UBSan |
+| `thread` | 4/4 green, 578/578 | 870 us | 7.02 ms | 0 TSan |
+
+Forced-strict probe re-run under BOTH plain and ASan: **twelve of twelve red** in
+each. Full `test_ltx2_video` on the plain build: 102 cases, 101 passed, 4194
+assertions, 4193 passed, the single failure being #1439's untouched
+`CHECK(leaves >= 0.95 * wall)`.
+
 ### #1439 is NOT repaired here, and the measurement says why not
 
 The obvious move was to give the sibling assertion the same two-term bound. The

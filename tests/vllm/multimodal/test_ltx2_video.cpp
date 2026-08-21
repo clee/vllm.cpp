@@ -3726,7 +3726,7 @@ void CheckCarryingPhase(const nlohmann::json& table, const Carrying& c) {
   // between evaluations" from "a phase nobody named is wearing this label"; the
   // span slack can, because only the second one lands here.
   //
-  // ONE FLAT CONSTANT, AND DELIBERATELY NOT A SHARE OF THE LEAF. This bound was
+  // ONE CONSTANT PER LEAF RECORD, AND DELIBERATELY NOT A SHARE OF THE LEAF. This bound was
   // first written `max(1 ms, 2% of the leaf)`, on the reasoning that a share is
   // what keeps an assertion meaningful at production scale. A fresh review showed
   // that reasoning inverts here, and the measurement agrees with the review:
@@ -3743,16 +3743,64 @@ void CheckCarryingPhase(const nlohmann::json& table, const Carrying& c) {
   //     whatever the leaf did. A constant therefore holds on all of them and is
   //     strictly tighter than the share at every leaf size.
   //
-  // 0.25 ms is the constant: about 2.4x the worst value this row measured
-  // (102.5 us) and about 1.9x the worst the review measured (135 us). It is a
-  // multiple of a measurement rather than a number fitted to make today's run
-  // pass, and it is below the smallest leaf in the table so the check can
-  // actually fail -- which the 1 ms version could not, see the REQUIRE below.
+  // AND IT IS CONFIGURATION-AWARE, which is the second thing a fresh review broke
+  // and the more interesting one. The flat 0.25 ms below was set from plain and
+  // spin-loaded builds only. NO measurement behind it came from a sanitizer
+  // build, and the premise "this quantity does not scale" turned out to be right
+  // about RENDER SIZE and silently wrong about BUILD CONFIGURATION. It reds on
+  // both sanitizer lanes.
   //
-  // Computed PER LEAF RECORD, because `decode.video` has two or three of them and
-  // taking the first record's start against the last record's end would charge
-  // this leaf for the `artifacts.frames` it declares as a partner.
-  const double kSpanSlackSeconds = 0.00025;
+  // The reason is not a fudge and it is worth stating plainly: the slack is the
+  // cost of opening and closing a phase scope, and a sanitizer instruments
+  // exactly that path. ASan checks a shadow byte on every access in it; TSan
+  // additionally keeps per-access happens-before state and does it under a lock.
+  // A scope boundary therefore genuinely costs more in those builds -- it is a
+  // different machine, not a noisier one. Measured on this one test:
+  //
+  //   | lane | that test's wall | worst span slack observed |
+  //   |---|---|---|
+  //   | plain | 259 s | 121 us |
+  //   | `address,undefined` | 1165 s | 730 us |
+  //   | `thread` | 2116 s | 1658 us |
+  //
+  // (CI figures, which are the worst because those runners are two-core and
+  // contended. The same probe on a 20-core box read 94 us / 569 us / 895 us in
+  // the same order, so the ordering is the build and not the box.)
+  //
+  // WHY NOT A SINGLE FLAT 4 ms COVERING ALL THREE: it would be ~30x slack on the
+  // plain lane, where the honest value is ~121 us and the assertion currently
+  // works, and that lane is the only one giving this file a clean signal today.
+  // Two numbers keep each lane held to its own instrument.
+  //
+  // 0.25 ms plain is ~2.1x the worst plain measurement; 3 ms under a sanitizer is
+  // ~1.8x the worst sanitizer measurement. Both are multiples of a measurement
+  // rather than numbers fitted to make a run pass. The sanitizer margin is the
+  // thinner of the two and that is disclosed rather than papered over: under TSan
+  // the instrument's own noise is within about 4x of the smallest leaf it
+  // measures, which is the honest state of this fixture at this scale.
+  //
+  // PER LEAF RECORD, because `decode.video` has two or three of them and each
+  // carries its own pair of boundaries. This also makes the bound STRICTER on
+  // multi-record leaves rather than looser: `decode.video` gets 2-3x the budget
+  // for 4-6 boundaries, where its measured slack per record is the lowest in the
+  // table. It is a count of instrument boundaries, never a share of the leaf, so
+  // the 2200x-at-production-scale defect the share term had does not come back.
+  // Nested rather than one `||` expression on purpose: GCC does not define
+  // `__has_feature`, and `defined(__has_feature) && __has_feature(...)` still
+  // has to PARSE the call, which is a hard preprocessor error there. It compiled
+  // on the TSan leg only because `||` short-circuits before reaching it, which is
+  // the kind of green that means nothing.
+#if defined(__SANITIZE_ADDRESS__) || defined(__SANITIZE_THREAD__)
+  const double kSpanSlackPerRecord = 0.003;  // GCC, either sanitizer
+#elif defined(__has_feature)
+#  if __has_feature(address_sanitizer) || __has_feature(thread_sanitizer)
+  const double kSpanSlackPerRecord = 0.003;  // Clang, either sanitizer
+#  else
+  const double kSpanSlackPerRecord = 0.00025;
+#  endif
+#else
+  const double kSpanSlackPerRecord = 0.00025;
+#endif
   double span_slack = 0.0;
   for (const nlohmann::json& leaf : leaves) {
     const double lo = leaf["start_seconds"].get<double>();
@@ -3771,7 +3819,32 @@ void CheckCarryingPhase(const nlohmann::json& table, const Carrying& c) {
     // strictest one.
     span_slack += any ? (first_in - lo) + (hi - last_in) : (hi - lo);
   }
-  const double span_bound = kSpanSlackSeconds;
+  // AND IT IS CAPPED AT HALF THE LEAF, WITH `min` -- never `max`.
+  //
+  // This is the third shape this bound has had and the reason is measured. A
+  // constant alone cannot work under a sanitizer on this fixture: the worst slack
+  // observed is 1.658 ms while the SMALLEST leaf observed is 2.77 ms
+  // (`artifacts.frames`, ASan). Those are 1.67x apart, so no single number is
+  // both above the noise and below the leaf, and a 3 ms constant reddened the
+  // anti-vacuity REQUIRE below on exactly that leaf.
+  //
+  // `min` resolves it and, unlike the `max(constant, share)` a fresh review
+  // removed, it CANNOT reintroduce that defect. The polarity is the whole point:
+  //
+  //   * under `max`, the share was a FLOOR, so it only ever made the bound
+  //     LOOSER, and it was loosest where the leaf was biggest -- 2200x slack on a
+  //     multi-second leaf, where a swallowed phase would have passed;
+  //   * under `min`, the share is a CEILING, so it only ever makes the bound
+  //     TIGHTER. On a big leaf the constant binds and nothing changes; on a leaf
+  //     small enough that the constant would swallow it, the leaf's own size
+  //     binds instead.
+  //
+  // So the production-scale behaviour is exactly the constant, and the share is
+  // reachable only on leaves at the bottom of this fixture's range. It also makes
+  // `span_bound < leaf_seconds` true BY CONSTRUCTION, which is what the REQUIRE
+  // below now records rather than risks.
+  const double span_bound = std::min(kSpanSlackPerRecord * static_cast<double>(leaves.size()),
+                                     0.5 * leaf_seconds);
   // THE BOUND MUST BE ABLE TO FAIL, and this is a REQUIRE because a check that
   // cannot fail is worse than no check. `span_slack <= leaf_seconds` holds by
   // construction above, so any bound at or above the leaf makes the CHECK below
@@ -3783,6 +3856,19 @@ void CheckCarryingPhase(const nlohmann::json& table, const Carrying& c) {
   // existed at all depended on box speed, which is the property this whole change
   // exists to remove. A leaf that ever shrinks under the instrument's own noise
   // floor now reds here and says so, instead of passing quietly.
+  //
+  // IT ALSO GUARANTEES THE FORCED-STRICT PROBE REDS. Because it establishes
+  // `span_bound < leaf_seconds` for every leaf, a mutation that drives the slack
+  // to the whole leaf necessarily exceeds the bound, so all twelve checks red
+  // rather than ten of twelve. That is not a coincidence to re-measure each time;
+  // it is what this line buys.
+  //
+  // IT IS NOW GUARANTEED BY CONSTRUCTION rather than a live risk, because the
+  // bound above is capped at half the leaf. It is kept as a cheap invariant on
+  // the FORMULA: an edit that removes the cap, or reinstates a floor, reds here
+  // instead of silently restoring a vacuous check. It earned that keep already --
+  // with a bare 3 ms constant it fired on `artifacts.frames` at 2.77 ms under
+  // ASan, which is how the cap came to exist.
   REQUIRE_MESSAGE(span_bound < leaf_seconds,
                   "the '" << c.leaf << "' leaf is " << leaf_seconds << "s, at or under the "
                       << span_bound << "s span-slack bound, so the check below cannot fail: "
