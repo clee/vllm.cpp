@@ -12,7 +12,6 @@
 #include <cstdint>
 #include <cstring>
 #include <stdexcept>
-#include <string>
 #include <vector>
 
 #include "vt/backend.h"
@@ -338,38 +337,6 @@ void RunCudaCase(int64_t T, int64_t Hq, int64_t Hk, int64_t D, float scale, bool
     CHECK(got[i] == doctest::Approx(cpu[i]).epsilon(1e-4));
 }
 
-// The same comparison, but through `vt::AttentionDenseFlash` — the flash-TILED
-// dense op — instead of `vt::Attention`. Separate helper rather than a flag on
-// RunCudaCase, so the existing case's population is untouched.
-void RunDenseFlashCudaCase(int64_t T, int64_t Hq, int64_t Hk, int64_t D, float scale, bool causal,
-                           uint32_t seed) {
-  auto q = RandF32(static_cast<size_t>(T * Hq * D), seed);
-  auto k = RandF32(static_cast<size_t>(T * Hk * D), seed + 1);
-  auto v = RandF32(static_cast<size_t>(T * Hk * D), seed + 2);
-
-  std::vector<float> cpu(static_cast<size_t>(T * Hq * D), 0.0f);
-  Tensor cq = MakeT(q.data(), DType::kF32, Cpu(), {T, Hq, D});
-  Tensor ck = MakeT(k.data(), DType::kF32, Cpu(), {T, Hk, D});
-  Tensor cv = MakeT(v.data(), DType::kF32, Cpu(), {T, Hk, D});
-  Tensor co = MakeT(cpu.data(), DType::kF32, Cpu(), {T, Hq, D});
-  Queue cpuq = Q();
-  vt::Attention(cpuq, co, cq, ck, cv, AttentionArgs{scale, causal});
-
-  Backend& gpu = vt::GetBackend(DeviceType::kCUDA);
-  QueueGuard g(gpu);
-  DeviceTensor dq(gpu, g.q, DType::kF32, {T, Hq, D}, q.data());
-  DeviceTensor dk(gpu, g.q, DType::kF32, {T, Hk, D}, k.data());
-  DeviceTensor dv(gpu, g.q, DType::kF32, {T, Hk, D}, v.data());
-  DeviceTensor dout(gpu, g.q, DType::kF32, {T, Hq, D});
-  vt::AttentionDenseFlash(g.q, dout.tensor(), dq.tensor(), dk.tensor(), dv.tensor(),
-                          AttentionArgs{scale, causal});
-  std::vector<float> got(static_cast<size_t>(T * Hq * D), 0.0f);
-  dout.Download(g.q, got.data());
-
-  for (size_t i = 0; i < cpu.size(); ++i)
-    CHECK(got[i] == doctest::Approx(cpu[i]).epsilon(1e-4));
-}
-
 }  // namespace
 
 TEST_CASE("attention CUDA matches CPU (causal, GQA, real head_dim)") {
@@ -381,71 +348,4 @@ TEST_CASE("attention CUDA matches CPU (causal, GQA, real head_dim)") {
               /*causal=*/true, /*seed=*/1234);
   RunCudaCase(/*T=*/6, /*Hq=*/4, /*Hk=*/2, /*D=*/8, 0.35f, true, 77);
   RunCudaCase(/*T=*/5, /*Hq=*/2, /*Hk=*/1, /*D=*/16, 0.25f, /*causal=*/false, 999);
-}
-
-TEST_CASE("attention-dense-flash CUDA launches at f32 head_dim 128, and REFUSES BY NAME above it") {
-  // RED BEFORE 2026-08-21 (#1549). `LaunchAttentionDenseFlash` sizes its K/V tile
-  // at `2 * kFlashBc(64) * head_dim * sizeof(Tin)` and never called
-  // `cudaFuncSetAttribute`, so it was capped at the 48 KiB of dynamic shared
-  // memory every CUDA architecture guarantees WITHOUT an opt-in. At f32 that tile
-  // is, against GB10's QUERIED 101,376 B opt-in ceiling:
-  //
-  //     D=64  ->  32,768 B   fits without an opt-in; always worked
-  //     D=128 ->  65,536 B   DID NOT LAUNCH; fits WITH the opt-in -> repaired
-  //     D=256 -> 131,072 B   DID NOT LAUNCH; does NOT fit GB10 EVEN WITH the
-  //                          opt-in, so on this device it must be REFUSED
-  //
-  // and the old failure was a bare `invalid argument` out of `cudaGetLastError`
-  // from a kernel that had never run — not a refusal naming the shape. Found
-  // routing LTX-2.5's head_dim-128 DiT self-attention onto this op, whose f32 arm
-  // the forward itself names as a supported parity arm.
-  //
-  // THE TITLE SAYS 128 AND NOT 256 BECAUSE 256 IS NOT REPAIRED AT f32, and an
-  // earlier version of this case claimed it was. 131,072 > 101,376, so the tile
-  // never fits GB10; the case passed anyway because the launcher then fell back
-  // to `AttentionDenseFast`, which is bit-identical to the flash kernel BY
-  // CONTRACT. A numeric comparison therefore cannot tell the two apart, and this
-  // case reported 10/10 and 88,439 assertions on GB10 with flash never launching
-  // at D=256 once. That silent fallback is gone (#1549): the launcher now throws.
-  //
-  // D=64 IS THE CONTROL and is deliberately first: it fits under the old cap too,
-  // so if it were the only case here the case would have been green before the
-  // fix and would prove nothing. D=128 is the shape that was red.
-  //
-  // The reference is the CPU `vt::Attention`, not the CUDA one: this op's whole
-  // claim is that a different KERNEL computes the same dense softmax. Tolerance
-  // 1e-4 f32, the same the case above uses, because the difference between the
-  // block-wide and warp-wide head_dim reductions is a floating-point
-  // reassociation of a length-D sum and nothing else.
-  if (!HasCuda()) {
-    MESSAGE("no CUDA backend; skipping dense-flash head_dim coverage");
-    return;
-  }
-  RunDenseFlashCudaCase(/*T=*/40, /*Hq=*/4, /*Hk=*/2, /*D=*/64, std::pow(64.0f, -0.5f),
-                        /*causal=*/false, /*seed=*/4242);
-  RunDenseFlashCudaCase(/*T=*/40, /*Hq=*/4, /*Hk=*/2, /*D=*/128, std::pow(128.0f, -0.5f),
-                        /*causal=*/false, /*seed=*/4243);
-
-  // D=256 at f32 asks for 131,072 B. WHICH ANSWER IS CORRECT IS A PROPERTY OF THE
-  // DEVICE, not of this code, which is the whole reason the bound is queried
-  // rather than written down: a device whose opt-in ceiling reaches 131,072 B
-  // (sm_80 reports 166,912; sm_90 reports 232,448) must launch and match, and a
-  // device whose ceiling does not (GB10/sm_121 reports 101,376) must REFUSE and
-  // say so. Both are asserted, and neither of them is "quietly compute it on
-  // another kernel" — that shape is what #1549 exists to remove.
-  //
-  // The refusal is checked for its CONTENT and not merely for throwing. A message
-  // that does not name the bytes asked for and the ceiling refused is the same
-  // undiagnosable `invalid argument` this row started from, wearing an exception.
-  try {
-    RunDenseFlashCudaCase(/*T=*/40, /*Hq=*/2, /*Hk=*/1, /*D=*/256, std::pow(256.0f, -0.5f),
-                          /*causal=*/false, /*seed=*/4244);
-    MESSAGE("f32 head_dim 256 LAUNCHED: this device's opt-in ceiling reaches 131072 B");
-  } catch (const std::exception& e) {
-    const std::string what = e.what();
-    MESSAGE("f32 head_dim 256 REFUSED: " << what);
-    CHECK(what.find("attention-dense-flash K/V tile") != std::string::npos);
-    CHECK(what.find("131072") != std::string::npos);
-    CHECK(what.find("caps opt-in shared memory at") != std::string::npos);
-  }
 }

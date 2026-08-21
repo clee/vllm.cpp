@@ -12,8 +12,6 @@
 #include <cstdio>
 #include <cstdlib>
 #include <mutex>
-#include <stdexcept>
-#include <string>
 
 #include "vt/cuda/cuda_arch_tactics.h"
 #include "vt/cuda/cuda_device_caps.h"
@@ -123,45 +121,6 @@ bool DynamicSmemFits(long long bytes) {
       caps.valid ? static_cast<long long>(caps.max_shared_memory_per_block_optin)
                  : 48LL * 1024LL;
   return bytes <= ceiling;
-}
-
-// MOVED HERE 2026-08-21 (LTX25-DIT-ATTN-FLASH, #1549) from cuda_paged_attn.cu,
-// unchanged in behavior. It was a file-local helper in the one TU that needed
-// it; cuda_ops.cu's attention-dense-flash launcher needs the identical decision,
-// and a second copy is the parallel path AGENTS.md "Shared seams" forbids. It
-// belongs beside DynamicSmemFits because it is that query plus the one action a
-// caller can take on the answer.
-//
-// BACKEND-CUDA-ARCH-ADDITIVITY seam-gap #3 (.agents/specs/cuda-arch-additivity.md):
-// the opt-in CEILING used to be a hardcoded GB10 assumption living in comments
-// ("GB10/sm_121 caps opt-in shared at ~99 KiB") with nothing in the code
-// actually checking it — a kernel whose tile did not fit would fail deep inside
-// cudaFuncSetAttribute with an opaque `invalid argument`. It is now the QUERIED
-// `cudaDevAttrMaxSharedMemoryPerBlockOptin`, cached once per device — never
-// re-queried per launch, since an attribute query is a driver round-trip on the
-// attention hot path.
-//
-// IT THROWS, and that is the contract rather than an implementation detail. A
-// launcher that cannot fit its tile has no correct silent answer: computing the
-// same thing on a different kernel is what let a 500x-slower rung ship
-// unnoticed, and a bare driver error names neither the shape nor the device.
-void SetDynamicSmemOptIn(const void* kernel, size_t bytes, const char* what) {
-  if (bytes <= 48u * 1024u) return;  // guaranteed everywhere; no opt-in needed
-  if (!DynamicSmemFits(static_cast<long long>(bytes))) {
-    const DeviceCaps& caps = GetDeviceCaps();
-    throw std::runtime_error(
-        std::string("vt cuda: ") + what + ": kernel needs " + std::to_string(bytes) +
-        " B of dynamic shared memory, but sm_" + std::to_string(caps.sm_arch()) +
-        " caps opt-in shared memory at " +
-        std::to_string(caps.max_shared_memory_per_block_optin) +
-        " B; this shape needs an architecture-specific tile (see "
-        ".agents/specs/cuda-arch-additivity.md)");
-  }
-  const cudaError_t err = cudaFuncSetAttribute(
-      kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(bytes));
-  if (err != cudaSuccess) {
-    throw std::runtime_error(std::string("vt cuda: ") + what + ": " + cudaGetErrorString(err));
-  }
 }
 
 void RegisterArchTactic(TacticFamily family, const ArchTactic& tactic) {

@@ -15,7 +15,6 @@
 #include <string>
 #include <type_traits>
 
-#include "vt/cuda/cuda_device_caps.h"
 #include "vt/cuda/rmsnorm_decode_fast.h"
 #include "vt/ops.h"
 
@@ -3327,42 +3326,6 @@ __global__ void AttentionDenseFlashKernel(Tout* out, const Tin* query, const Tin
   }
 }
 
-// TWO bounds hold this launcher, and they are different in kind.
-//
-// `kMaxPerLane = 8` in the kernel above is a COMPILE-TIME register bound: each
-// lane holds 8 head_dim elements of q and of the accumulator, 32 lanes, so
-// head_dim > 256 has nowhere to live whatever device this runs on. That is the
-// `d <= 256` VT_CHECK below and it is a property of the code.
-//
-// The K/V tile is a RUNTIME bound and it is a property of the DEVICE. It is
-// 2 * kFlashBc(64) * head_dim elements of Tin, and 48 KiB is the dynamic shared
-// memory every CUDA architecture gives a kernel without an opt-in:
-//
-//              no opt-in (49,152 B)   opt-in, GB10 (101,376 B)
-//     bf16     head_dim <= 192        head_dim <= 256
-//     f32      head_dim <= 96         head_dim <= 192
-//
-// Until #1549 this launcher never called `cudaFuncSetAttribute` at all, so every
-// f32 shape above head_dim 96 -- LTX-2.5's head_dim-128 DiT among them, on an arm
-// the forward itself names as supported -- failed with a bare `invalid argument`
-// out of a kernel that had never run.
-//
-// THE BOUND IS NEITHER OF THOSE TWO COLUMNS. Writing 192/96 into the code caps
-// GB10 at two thirds of the head_dim it can actually serve; writing 256 assumes
-// an opt-in ceiling GB10 does not have (f32 at 256 wants 131,072 B and GB10 tops
-// out at 101,376). `cuda_device_caps.h` says it in one line -- "other
-// architectures differ and MUST be asked, not assumed" -- so the tile is asked
-// about, per device, through `SetDynamicSmemOptIn`.
-//
-// AND IT REFUSES BY NAME. An earlier draft of this fix fell back to
-// `AttentionDenseFastKernelCuda` when the tile did not fit, on the argument that
-// the two kernels are bit-identical so the fallback is numerically free. That is
-// true and it is not the point: a silent degradation to the untiled rung is the
-// EXACT defect #1549 exists to remove -- a caller on a slower kernel with nothing
-// anywhere saying so, which cost 47.84 s a forward for as long as nobody
-// happened to time it. `SetDynamicSmemOptIn` throws instead, naming the device
-// and the shortfall, so the shape is a refusal a caller can read and not a
-// number a caller has to notice.
 template <typename Tin>
 void LaunchAttentionDenseFlash(cudaStream_t s, Tensor& out, const Tensor& query, const Tensor& key,
                                const Tensor& value, const AttentionArgs& args) {
@@ -3375,16 +3338,11 @@ void LaunchAttentionDenseFlash(cudaStream_t s, Tensor& out, const Tensor& query,
   const size_t shmem = static_cast<size_t>(2) * kFlashBc * d * sizeof(Tin);  // sK + sV
   switch (out.dtype) {
     case DType::kF32:
-      SetDynamicSmemOptIn(reinterpret_cast<const void*>(&AttentionDenseFlashKernel<Tin, float>),
-                          shmem, "attention-dense-flash K/V tile");
       AttentionDenseFlashKernel<Tin, float><<<grid, kFlashBr * 32, shmem, s>>>(
           out.Ptr<float>(), query.Ptr<Tin>(), key.Ptr<Tin>(), value.Ptr<Tin>(), hq, hk, d, t,
           args.scale, args.causal);
       break;
     case DType::kBF16:
-      SetDynamicSmemOptIn(
-          reinterpret_cast<const void*>(&AttentionDenseFlashKernel<Tin, __nv_bfloat16>), shmem,
-          "attention-dense-flash K/V tile");
       AttentionDenseFlashKernel<Tin, __nv_bfloat16><<<grid, kFlashBr * 32, shmem, s>>>(
           out.Ptr<__nv_bfloat16>(), query.Ptr<Tin>(), key.Ptr<Tin>(), value.Ptr<Tin>(), hq, hk, d,
           t, args.scale, args.causal);
