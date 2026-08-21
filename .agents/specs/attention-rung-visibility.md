@@ -186,13 +186,26 @@ with `cudaFuncAttributeMaxDynamicSharedMemorySize` would make the advertised 256
 true on some devices and NOT on others: head_dim 256 in f32 needs 128 KiB, above
 the opt-in per-block cap of the consumer Blackwell parts this project gates on, so
 the opt-in call itself can fail and the contract would still be a lie at the
-widest advertised width. It also cannot be verified without a device, and this row
-has no lease. Narrowing is device-independent arithmetic, provable here, and is a
-strict improvement for every caller: a head_dim that launches today still
-launches, and one that does not now fails with a message naming the rung that
-works instead of an opaque CUDA launch error from a later `cudaGetLastError`.
-Opting in remains available later as a widening, owned by nobody today because no
-live caller needs head_dim above the honest bound through this op.
+widest advertised width. Narrowing is device-independent arithmetic, provable
+here, and is a strict improvement for every caller: a head_dim that launches today
+still launches, and one that does not now fails with a message naming the rung
+that works instead of an opaque CUDA launch error from a later
+`cudaGetLastError`.
+
+That paragraph originally added "and it cannot be verified without a device, and
+this row has no lease", which made the rejection read as a convenience. It is not
+one, and the number is now on the record: **GB10's queried opt-in ceiling is
+101,376 bytes**, measured while #1557 was reviewed. head_dim 256 in f32 wants
+131,072. Opting in therefore CANNOT make the advertised 256 true for f32 on the
+part this project gates on — the raise buys nothing at the width that motivated
+it, and a caller at that width would have gone on falling back silently without
+ever launching. Narrowing beats raising here on a measurement rather than on a
+preference, which is why this row lands first and unchanged rather than
+reconciling onto a cap-raising change.
+
+Opting in remains available later as a widening for bf16 widths above 192, owned
+by nobody today because no live caller needs head_dim above the honest bound
+through this op.
 
 **D3 — refuse rather than silently fall back to `AttentionDenseFast`.**
 `AttentionDenseFa2KernelCuda` DOES fall through to `AttentionDenseFlash`
@@ -253,7 +266,12 @@ would be a regression rather than a repair.
 
 - [#1573](https://github.com/mudler/vllm.cpp/issues/1573) — run the CUDA head-dim
   refusal case for `AttentionDenseFlash` on a leased device, and mutate the
-  launcher's bound call to prove the case reaches it. PENDING a GPU lease.
+  launcher's bound call to prove the case reaches it. PENDING a GPU lease. This
+  stays owed after the merge: the CPU cases pin the arithmetic and never that the
+  launcher calls it, and no lease was available for the whole branch. D2's
+  101,376-byte GB10 ceiling is a queried device value and does not discharge it,
+  because it bounds what an opt-in could buy rather than proving the refusal
+  executes.
 
 ## Now
 
