@@ -53,8 +53,8 @@ class CallDetectionTests(unittest.TestCase):
         self.assertEqual(mod.scan_file(MARKED), [(3, True)])
 
     def test_fast_rungs_are_never_sites(self) -> None:
-        # Without the word boundary in _NAIVE_CALL every one of these matches, and
-        # the checker would demand a marker beside exactly the calls it wants.
+        # The trailing `\(` is what excludes these, not the `\b`. Measured: all
+        # five still fail to match with the `\b` removed.
         for fast in (
             "vt::AttentionDenseFlash(q, o, a, b, c, args);",
             "vt::AttentionDenseFast(q, o, a, b, c, args);",
@@ -285,9 +285,9 @@ class MutationTests(unittest.TestCase):
         self.assertFalse(mod.has_marker(lines, 2))
 
     def test_widening_the_regex_to_the_fast_rungs_is_visible(self) -> None:
-        # If _NAIVE_CALL ever loses its word boundary, every fast-rung call becomes
-        # a site and the shipped tree turns red. Pinning it here means the widening
-        # is caught in this suite instead of as an unexplained mass failure.
+        # These pin the trailing `\(` and the `\s*`, never the `\b`. Measured: with
+        # the `\b` removed, this suite and the shipped tree both stay green. The
+        # comment beside `_NAIVE_CALL` still claims otherwise and is wrong.
         self.assertIsNone(mod._NAIVE_CALL.search("vt::AttentionDenseFlash(a);"))
         self.assertIsNotNone(mod._NAIVE_CALL.search("vt::Attention (a);"))
 
@@ -297,10 +297,9 @@ class GreenReportTests(unittest.TestCase):
 
     A green that prints only "9 sites, 6 marked" reads as three unaccounted sites
     or as nothing at all, depending on whether the reader does the subtraction. The
-    number that matters is how many sites carry NO reason and pass anyway, and it
-    is not `sites - marked`: a marked call inside an allowlisted file counts in
-    `marked`. Nothing asserted this line before, so the count could be dropped or
-    silently go wrong without a red.
+    number that matters is how many sites carry NO reason and pass anyway. Nothing
+    asserted this line before, so the count could be dropped or silently go wrong
+    without a red.
     """
 
     def report(self) -> str:
@@ -343,13 +342,10 @@ class GreenReportTests(unittest.TestCase):
         # line only when `drift_sites` is empty, and `drift_sites` is empty exactly
         # when no unmarked site sits outside an allowlisted file -- so on every
         # green the checker can print, every unmarked site is excused and
-        # `excused == sites - marked` identically. The two remain different
-        # quantities, because a marked call inside an allowlisted file counts in
-        # `marked`; they can only take different VALUES on a scan the checker
-        # exits 1 on, which never reaches this line. That substitution was
-        # mutated into the checker and the whole suite stayed green, so the claim
-        # is recorded here as unpinnable rather than left standing as a guarantee
-        # this case does not carry.
+        # `excused == sites - marked` identically. That substitution was mutated
+        # into the checker and the whole suite stayed green, so the claim is
+        # recorded here as unpinnable rather than left standing as a guarantee this
+        # case does not carry.
         report = self.report_over(
             {
                 f"{MODELS}/ltx2.cpp": [(10, False), (20, True)],
@@ -404,12 +400,10 @@ class GreenReportTests(unittest.TestCase):
         self.assertIn(f"{excused} unmarked and excused by", self.report())
 
     def test_the_excused_count_is_not_sites_minus_marked(self) -> None:
-        # The subtraction a reader would do by hand, and why the checker must not.
-        # A marked site in an allowlisted file lands in `marked`, so the difference
-        # under-reports the debt.
+        # The subtraction a reader would do by hand.
         #
-        # Read this as a record of the two DEFINITIONS, not as a gate on the
-        # checker: it never calls the checker, and it derives both numbers itself.
+        # Read this as a record of the two DEFINITIONS, not as a gate on the OK
+        # line: it never calls `main()`, and it derives both numbers itself.
         # Holding the OK line to `excused` rather than to the subtraction is not
         # something this file can do from any scan -- the identity is spelled out
         # in test_the_ok_line_counts_the_sites_an_allowlist_excuses.
