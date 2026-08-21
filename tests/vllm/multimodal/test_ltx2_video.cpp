@@ -3767,6 +3767,34 @@ void CheckCarryingPhase(const nlohmann::json& table, const Carrying& c) {
   // contended. The same probe on a 20-core box read 94 us / 569 us / 895 us in
   // the same order, so the ordering is the build and not the box.)
   //
+  // A NORMALISED BOUND WOULD BE BETTER AND THERE IS NO NORMALISER. The old 0.95
+  // coverage floor tolerated instrumentation ACCIDENTALLY, by being a ratio of two
+  // quantities that inflate together: when TSan makes everything 8x slower both
+  // `covered` and `leaf_seconds` grow and the ratio survives. The span slack is an
+  // ABSOLUTE quantity, so the overhead lands on it undiluted -- which is the real
+  // reason "does not grow with the render" did not generalise. It does not grow
+  // with the RENDER; it grows with the INSTRUMENT.
+  //
+  // So the right question is whether some in-run reference scales the same way.
+  // Five candidates were tested over 24 observations -- four leaves x two renders
+  // x three build configurations -- and the spread of each, worst over best:
+  //
+  //   | candidate | spread | undefined |
+  //   |---|---|---|
+  //   | `slack / submin` | 78630x | 0 |
+  //   | `slack / leaf_seconds` | 4598x | 0 |
+  //   | `slack / mean sub-scope` | 2377x | 0 |
+  //   | `slack / mean interior gap` | 418x | 3 of 24 |
+  //   | **`slack` itself** | **44.6x** | 0 |
+  //
+  // EVERY RATIO IS WORSE THAN THE RAW QUANTITY, and the two most obvious ones are
+  // worse by two orders of magnitude. The gap normaliser is also undefined for a
+  // leaf with one sub-scope, which `artifacts.frames` is. Conditioned on the build
+  // instead, the raw quantity is tight: 20.1-93.6 us plain, 128-569 us under ASan,
+  // 52.1-895 us under TSan -- about 4.7x, 4.4x and 17.2x. So configuration is the
+  // variable that actually explains this quantity, and a per-configuration
+  // constant is the most stable bound available rather than a fallback.
+  //
   // WHY NOT A SINGLE FLAT 4 ms COVERING ALL THREE: it would be ~30x slack on the
   // plain lane, where the honest value is ~121 us and the assertion currently
   // works, and that lane is the only one giving this file a clean signal today.

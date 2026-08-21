@@ -2471,6 +2471,35 @@ a different machine, not a noisier one.
 The ordering is the build and not the box: both columns rank the same way, and CI
 is worse throughout because those runners are two-core and contended.
 
+**A NORMALISED bound would be better, and there is no normaliser.** The old 0.95
+coverage floor tolerated instrumentation ACCIDENTALLY, by being a ratio of two
+quantities that inflate together -- TSan makes both `covered` and `leaf_seconds`
+8x bigger and the ratio survives. The span slack is ABSOLUTE, so the overhead
+lands on it undiluted. That is the real reason the "does not grow with the render"
+premise did not generalise: it does not grow with the RENDER, it grows with the
+INSTRUMENT.
+
+Five candidate normalisers were tested over 24 observations (four leaves x two
+renders x three build configurations), scored by the spread of the resulting
+ratio, worst over best:
+
+| candidate | spread | undefined |
+|---|---|---|
+| `slack / smallest sub-scope` | 78630x | 0 |
+| `slack / leaf_seconds` | 4598x | 0 |
+| `slack / mean sub-scope` | 2377x | 0 |
+| `slack / mean interior gap` | 418x | 3 of 24 |
+| **`slack` itself** | **44.6x** | 0 |
+
+**Every ratio is worse than the raw quantity**, the two most obvious by two orders
+of magnitude, and the interior-gap normaliser is additionally undefined for a leaf
+with a single sub-scope, which `artifacts.frames` is. Conditioned on the BUILD
+instead, the raw quantity is tight: 20.1-93.6 us plain, 128-569 us under ASan,
+52.1-895 us under TSan, i.e. about 4.7x, 4.4x and 17.2x. Configuration is the
+variable that explains this quantity, so a per-configuration constant is the most
+stable bound available here rather than a fallback taken for want of anything
+better.
+
 **A single constant is impossible on this fixture, and the numbers say so
 exactly.** The worst slack is 1.658 ms while the SMALLEST leaf is 2.77 ms
 (`artifacts.frames`, ASan, measured). Those are 1.67x apart, so no number is both
