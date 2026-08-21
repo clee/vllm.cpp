@@ -38,6 +38,18 @@ from tools.bench.serve_low_common import (
 )
 
 
+# The evidence-tree label for every benchable subject.  A key is a directory
+# name under `evidence/corpus/` and `evidence/raw/`, so it is a SUBJECT
+# IDENTITY and never a size: "27" is `unsloth/Qwen3.6-27B-NVFP4`, and
+# `online_gate.py`'s neighbouring "27"/"27n" pair records that two 27B
+# checkpoints share no goldens and no comparable ratios.  A new subject
+# therefore gets a key that cannot be read as a spelling of an existing one.
+# `q38mtp` is `r0b0tlab/Qwen3.8-27B-NVFP4-MTP-sm121` @ `36f717a2` (#1574), a
+# 27B checkpoint that is NOT the "27" subject; the key is deliberately not
+# digit-prefixed so neither can be read as the other in an evidence path.
+MODEL_KEYS = ("27", "35", "q38mtp")
+
+
 @dataclasses.dataclass(frozen=True)
 class HttpResult:
     status: int
@@ -340,6 +352,10 @@ def build_bench_command(run: BenchRun) -> list[str]:
         raise HarnessError("benchmark image does not match the digest pin")
     if run.engine not in {"ours", "sglang", "vllm"}:
         raise HarnessError(f"unknown engine arm: {run.engine}")
+    # The parser is not the only way in, and an undeclared key would silently
+    # open an evidence tree nobody declared rather than fail (#1594).
+    if run.model_key not in MODEL_KEYS:
+        raise HarnessError(f"unknown model key: {run.model_key}")
     if run.concurrency not in {1, 2, 4, 8, 16} or run.repetition not in {1, 2, 3}:
         raise HarnessError("run is outside the canonical concurrency/repetition grid")
     if not run.corpus_path.is_file():
@@ -660,7 +676,7 @@ def _parser() -> argparse.ArgumentParser:
     bench.add_argument("--model-repo", type=pathlib.Path, required=True)
     bench.add_argument("--model-revision", required=True)
     bench.add_argument("--evidence", type=pathlib.Path, required=True)
-    bench.add_argument("--model-key", choices=("27", "35"), required=True)
+    bench.add_argument("--model-key", choices=MODEL_KEYS, required=True)
     bench.add_argument("--engine", choices=("ours", "vllm", "sglang"), required=True)
     bench.add_argument("--base-url", required=True)
     bench.add_argument("--concurrency", type=int, required=True)

@@ -6,17 +6,22 @@ Sources: ``test_bench_serving_functionality.py`` and
 
 from __future__ import annotations
 
+import contextlib
 import http.server
+import io
 import json
 import pathlib
 import subprocess
+import sys
 import tempfile
 import threading
 import time
 import unittest
+import unittest.mock
 
 from tools.bench import run_serve_low
 from tools.bench.run_serve_low import (
+    MODEL_KEYS,
     BenchRun,
     build_bench_command,
     build_dry_run_manifest,
@@ -273,6 +278,202 @@ class ClientTests(unittest.TestCase):
             self.assertEqual(manifest["gpu_lock_acquisitions_planned"], 1)
             self.assertFalse(manifest["pull_under_gpu_lock"])
             self.assertIn("--pull=never", manifest["planned_commands"]["client"])
+
+
+def _synthetic_raw_result(
+    *,
+    requests: int = 80,
+    prompt_len: int = 1024,
+    output_len: int = 128,
+    max_concurrency: int = 1,
+) -> dict:
+    """The smallest record `validate_raw_result` accepts as a complete leg."""
+
+    return {
+        "completed": requests,
+        "errors": [""] * requests,
+        "generated_texts": ["x"] * requests,
+        "input_lens": [prompt_len] * requests,
+        "itls": [[0.001] * (output_len - 1) for _ in range(requests)],
+        "max_concurrent_requests": max_concurrency,
+        "num_prompts": requests,
+        "output_lens": [output_len] * requests,
+        "ttfts": [0.01] * requests,
+    }
+
+
+def _container_to_host(container: str, mounts: dict[str, pathlib.Path]) -> pathlib.Path:
+    """Resolve an in-container path through the bind mounts of the same command.
+
+    `BenchRun.corpus_path` / `BenchRun.output_path` and the `container_corpus`
+    / `container_output` strings in `build_bench_command` derive from
+    `model_key` INDEPENDENTLY.  Translating one back through the mount the same
+    command declared is what makes a disagreement between the two derivations
+    observable instead of silent.
+    """
+
+    for destination, source in sorted(mounts.items(), key=lambda item: -len(item[0])):
+        if container == destination or container.startswith(destination + "/"):
+            return source / container[len(destination):].lstrip("/")
+    raise AssertionError(f"{container} is not under any declared bind mount")
+
+
+class _FakeCompletedProcess:
+    returncode = 0
+
+
+class ModelKeyEvidenceRoutingTest(unittest.TestCase):
+    """A named subject must own its evidence, and only its own (#1594).
+
+    `--model-key` is a label that keys the evidence tree, so the failure this
+    pins is not a crash.  It is a run that completes, writes a plausible raw
+    result, and files it under ANOTHER subject's key -- which is why asserting
+    the parser's `choices` would not be enough.  The assertions below enter
+    through `main()` on a real argv and read the paths the wrapper actually
+    derived, so a key accepted at the parser but not threaded to the corpus and
+    raw paths fails here.
+    """
+
+    def _run_bench_through_main(
+        self, root: pathlib.Path, model_key: str, engine: str = "ours"
+    ) -> list[str]:
+        evidence = root / "evidence"
+        models = root / "models"
+        models.mkdir(exist_ok=True)
+        corpus = evidence / "corpus" / model_key
+        corpus.mkdir(parents=True, exist_ok=True)
+        (corpus / "c1-r1.jsonl").write_text("{}\n")
+        captured: list[list[str]] = []
+
+        def fake_run(command, check=False):  # mirrors subprocess.run's call
+            captured.append(list(command))
+            mounts: dict[str, pathlib.Path] = {}
+            for index, item in enumerate(command):
+                if item != "--mount":
+                    continue
+                fields = dict(
+                    field.split("=", 1)
+                    for field in command[index + 1].split(",")
+                    if "=" in field
+                )
+                mounts[fields["dst"]] = pathlib.Path(fields["src"])
+            dataset = command[command.index("--dataset-path") + 1]
+            self.assertTrue(_container_to_host(dataset, mounts).is_file())
+            written = _container_to_host(
+                command[command.index("--output-file") + 1], mounts
+            )
+            written.parent.mkdir(parents=True, exist_ok=True)
+            written.write_text(json.dumps(_synthetic_raw_result()) + "\n")
+            return _FakeCompletedProcess()
+
+        argv = [
+            "run_serve_low.py",
+            "bench",
+            "--model-repo", str(models),
+            "--model-revision", "36f717a22990e82c54c1d48ee77c491b87825680",
+            "--evidence", str(evidence),
+            "--model-key", model_key,
+            "--engine", engine,
+            "--base-url", "http://127.0.0.1:30000",
+            "--concurrency", "1",
+            "--repetition", "1",
+        ]
+        with unittest.mock.patch.object(run_serve_low.subprocess, "run", fake_run):
+            with unittest.mock.patch.object(sys, "argv", argv):
+                with contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(run_serve_low.main(), 0)
+        self.assertEqual(len(captured), 1)
+        return captured[0]
+
+    def test_each_admitted_key_owns_its_corpus_and_raw_tree(self) -> None:
+        self.assertIn("q38mtp", MODEL_KEYS)
+        for model_key in MODEL_KEYS:
+            with self.subTest(model_key=model_key):
+                with tempfile.TemporaryDirectory() as temporary:
+                    root = pathlib.Path(temporary)
+                    command = self._run_bench_through_main(root, model_key)
+                    evidence = root / "evidence"
+                    dataset = command[command.index("--dataset-path") + 1]
+                    output = command[command.index("--output-file") + 1]
+
+                    # The in-container paths `build_bench_command` hands
+                    # the pinned client.
+                    self.assertEqual(dataset, f"/evidence/corpus/{model_key}/c1-r1.jsonl")
+                    self.assertEqual(
+                        output, f"/evidence/raw/{model_key}/ours/c1-r1.jsonl"
+                    )
+
+                    # The host paths `BenchRun` derives.  The raw file
+                    # exists only because the container path resolved back to
+                    # it through the command's own bind mount.
+                    self.assertTrue(
+                        (
+                            evidence / "raw" / model_key / "ours" / "c1-r1.jsonl"
+                        ).is_file()
+                    )
+
+                    # No OTHER admitted subject's tree was touched or named.
+                    for other in MODEL_KEYS:
+                        if other == model_key:
+                            continue
+                        self.assertNotIn(f"/{other}/", dataset)
+                        self.assertNotIn(f"/{other}/", output)
+                        self.assertFalse((evidence / "raw" / other).exists())
+                        self.assertFalse((evidence / "corpus" / other).exists())
+
+    def test_the_third_key_is_not_a_spelling_of_an_existing_one(self) -> None:
+        """`27` already names a DIFFERENT 27B checkpoint, so the keys must not
+        collide as substrings of each other's evidence paths."""
+
+        for model_key in MODEL_KEYS:
+            for other in MODEL_KEYS:
+                if other == model_key:
+                    continue
+                with self.subTest(model_key=model_key, other=other):
+                    self.assertNotIn(other, model_key)
+
+    def test_an_unadmitted_key_is_refused_at_both_the_parser_and_the_command(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            evidence = root / "evidence"
+            (root / "models").mkdir()
+            corpus = evidence / "corpus" / "38"
+            corpus.mkdir(parents=True)
+            (corpus / "c1-r1.jsonl").write_text("{}\n")
+            with contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit) as parser_refusal:
+                    run_serve_low._parser().parse_args(
+                        [
+                            "bench",
+                            "--model-repo", str(root / "models"),
+                            "--model-revision", "revision",
+                            "--evidence", str(evidence),
+                            "--model-key", "38",
+                            "--engine", "ours",
+                            "--base-url", "http://127.0.0.1:30000",
+                            "--concurrency", "1",
+                            "--repetition", "1",
+                        ]
+                    )
+            self.assertEqual(parser_refusal.exception.code, 2)
+
+            # The library entry refuses the same key, so a caller that bypasses
+            # the parser cannot open an evidence tree nobody declared.
+            run = BenchRun(
+                image=SGLANG_IMAGE,
+                model_repo=root / "models",
+                model_revision="revision",
+                evidence_root=evidence,
+                model_key="38",
+                engine="ours",
+                base_url="http://127.0.0.1:30000",
+                concurrency=1,
+                repetition=1,
+            )
+            with self.assertRaises(HarnessError):
+                build_bench_command(run)
 
 
 if __name__ == "__main__":
