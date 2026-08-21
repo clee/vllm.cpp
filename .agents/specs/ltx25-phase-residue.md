@@ -392,11 +392,11 @@ W5 gates, mutations, and the record edits the change makes stale.
 | [#1439](https://github.com/mudler/vllm.cpp/issues/1439) | closed by this row |
 | [#1494](https://github.com/mudler/vllm.cpp/issues/1494) | **already CLOSED by `6b48edb2c` before this row merged `main`.** This row takes the `denoise.update` anchor that change recorded as owed; it does not close the issue and does not claim to |
 | [#1470](https://github.com/mudler/vllm.cpp/issues/1470) | closed by this row |
-| the res_2s arm's `denoise.update` anchor | **owed, no issue yet.** `Ltx2Res2sDenoisingLoop` runs its own post-process and step inside `ltx2_res2s.cpp` through `Ltx2Res2sHooks`, so the anchor needs a hook rather than a statement. No gate in this tree renders on that arm, so landing it here would land dead code |
-| the `denoise.step` / `denoise.update` seconds transfer | **owed, no issue yet, and this row claimed it was closed until a fresh review checked.** (1b') compares `start_seconds` only, so leaving `denoise.step` open across the post-process and emitting `denoise.update` empty after it preserves the alternation, both counters, containment, non-overlap, exclusivity, (1c) and (2), and moves 100% of the decomposed seconds onto one name. No (2b) floor separates it: the honest share of `denoise.update` runs 0.45% to 11.15% across four boxes and a transfer puts it at ~0%. Closing it needs an anchor INSIDE the callee, which is the third row of the anchor table in [`ltx25-device-residency.md`](ltx25-device-residency.md) `### Owed out of W0` for all six anchors |
-| a gate on `WriteJson`'s clock ORDERING | **owed, no issue yet, and MEASURED green under its own mutation.** `WriteJson` reads `Elapsed()` before it copies and sorts the records, so the writer stops being charged to the render. Restoring the old order left the conservation case GREEN 10 of 10, at `wall 0.0608987s, unaccounted 0.000534223s, table charge 0.000301655s`, because the copy and the sort of a three-record table are nanoseconds. Gating it needs a table with enough records for the sort to be measurable and a `WriteJson` with nothing between it and the last `Close`. The case is named for what it does prove |
-| an upper bound on the instrument's own share of a leaf | **owed, no issue yet.** `uncovered <= 2 * leaf_instrument` is stricter than the floor it replaces only while `leaf_instrument` stays small, and nothing bounds it. Moving the DiT `Tick` out of `Evaluate` would charge ~110 flushed writes to `denoise` and widen the gate while printing a small number |
-| a per-gap decomposition IN the emitted table | **owed, no issue yet.** This row computed the gap table in a scratch script to find the 92% region. A reader of `phase-log.json` still cannot see it without one, and the same investigation will be re-derived the next time the residue moves |
+| [#1567](https://github.com/mudler/vllm.cpp/issues/1567) — the res_2s arm's `denoise.update` anchor | **owed, filed by this row.** `Ltx2Res2sDenoisingLoop` runs its own post-process and step inside `ltx2_res2s.cpp` through `Ltx2Res2sHooks`, so the anchor needs a hook rather than a statement. No gate in this tree renders on that arm, so landing it here would land dead code |
+| [#1568](https://github.com/mudler/vllm.cpp/issues/1568) — the `denoise.step` / `denoise.update` seconds transfer | **owed, filed by this row, and this row claimed it was closed until a fresh review checked.** (1b') compares `start_seconds` only, so leaving `denoise.step` open across the post-process and emitting `denoise.update` empty after it preserves the alternation, both counters, containment, non-overlap, exclusivity, (1c) and (2), and moves 100% of the decomposed seconds onto one name. No (2b) floor separates it: the honest share of `denoise.update` runs 0.45% to 11.15% across four boxes and a transfer puts it at ~0%. Closing it needs an anchor INSIDE the callee, which is the third row of the anchor table in [`ltx25-device-residency.md`](ltx25-device-residency.md) `### Owed out of W0` for all six anchors |
+| [#1569](https://github.com/mudler/vllm.cpp/issues/1569) — a gate on `WriteJson`'s clock ORDERING | **owed, filed by this row, and MEASURED green under its own mutation.** `WriteJson` reads `Elapsed()` before it copies and sorts the records, so the writer stops being charged to the render. Restoring the old order left the conservation case GREEN 10 of 10, at `wall 0.0608987s, unaccounted 0.000534223s, table charge 0.000301655s`, because the copy and the sort of a three-record table are nanoseconds. Gating it needs a table with enough records for the sort to be measurable and a `WriteJson` with nothing between it and the last `Close`. The case is named for what it does prove |
+| [#1570](https://github.com/mudler/vllm.cpp/issues/1570) — an upper bound on the instrument's own share of a leaf | **owed, filed by this row.** `uncovered <= 2 * leaf_instrument` is stricter than the floor it replaces only while `leaf_instrument` stays small, and nothing bounds it. Moving the DiT `Tick` out of `Evaluate` would charge ~110 flushed writes to `denoise` and widen the gate while printing a small number |
+| [#1571](https://github.com/mudler/vllm.cpp/issues/1571) — a per-gap decomposition IN the emitted table | **owed, filed by this row.** This row computed the gap table in a scratch script to find the 92% region. A reader of `phase-log.json` still cannot see it without one, and the same investigation will be re-derived the next time the residue moves |
 
 ## Outcome
 
@@ -688,6 +688,18 @@ same kind of gap holds the TEST's own assertions between two `Generate` calls,
 the table-level bound is asserted in the one-render case only — as it always was.
 A future case that does real work between load and generate will red the sum
 assertion, correctly and confusingly. The test says so beside the line.
+
+### Observed and NOT this row's
+
+[#1572](https://github.com/mudler/vllm.cpp/issues/1572). Assertion (1c), the span
+slack `6b48edb2c` added, reddened intermittently during this row's fresh review —
+`decode.video` at `0.00256913` against a `0.00075` bound, 3.4x — on a tree whose
+only difference from the merge base is this row's residue work, and again once
+under an unrelated mutation. This row does not touch (1c) and keeps its constants
+exactly as they landed, so it is filed rather than repaired. It is the same class
+this row exists to remove, one assertion over: an absolute bound on a quantity
+whose cost is instrumentation. `Record::instrument_seconds` is the normaliser
+that change's own text says did not exist.
 
 ## Stop conditions
 

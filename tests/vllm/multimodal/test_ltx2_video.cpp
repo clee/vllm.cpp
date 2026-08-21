@@ -5165,24 +5165,47 @@ TEST_CASE("ltx2 phase log: the instrument's own cost is conserved across the tab
                 "no record carries any instrument charge, so the per-record half of the "
                 "accounting is not reaching the emitted table");
 
-  // AND THE RESIDUE OF A TIMELINE WHOSE GAPS CONTAIN NOTHING IS THE INSTRUMENT'S
-  // OWN CHARGE. Two adjacent scopes with no caller work between them, so there
-  // is nothing for `unaccounted_seconds` to hold but boundary cost. This is the
-  // assertion that found the sampler JOIN going uncharged: it read 0.000346479s
-  // of residue against a 0.000111040s charge, a ratio of 3.12, which is
-  // indistinguishable from a real un-named phase.
+  // AND THE TABLE'S OWN CHARGE IS REAL, WHICH IS ALL THAT IS ASSERTED ABOUT IT.
+  //
+  // This case carried `unaccounted <= kInstrumentBudget * table_charge` for one
+  // revision, on the argument that a two-scope timeline whose gaps contain
+  // NOTHING has nothing in its residue but boundary cost. A fresh review then
+  // ran it 200 times and it reddened **3 of 200 at load average 80**, median
+  // 1.525, p90 1.740, **max 2.934** — a HIGHER red rate than the `unit.parent`
+  // ratio removed one case up, and for exactly the same reason. Two adjacent
+  // bare scopes carry no `Tick` and no `/proc/self/statm` read inside the
+  // instrumented region, so the un-instrumented remainder of each boundary is a
+  // large share and it dilates faster than the measured part when the box slows.
+  //
+  // AND THE CLAIM THAT LINE MADE FOR ITSELF WAS WORTH LESS THAN IT LOOKED. Its
+  // message credited it with catching the uncharged sampler join at a ratio of
+  // 3.12. A 3.12 sits barely outside a distribution whose maximum on an
+  // UNMUTATED tree is 2.934, so that detection had about 6% of margin — it
+  // would have been a coin flip in both directions rather than a gate.
+  //
+  // What catches an uncharged instrument interval instead is the table bound in
+  // `a render through the ABI emits a phase table that SUMS to wall`, over 46
+  // records rather than three, where the measured part of each boundary
+  // dominates: 20 consecutive runs read 1.021 to 1.464 against the same factor
+  // of 2. That is the difference between the two sites, and it is why the
+  // constant lives at one and not the other.
   const double wall = table["wall_seconds"].get<double>();
   const double unaccounted = table["unaccounted_seconds"].get<double>();
   MESSAGE("wall " << wall << "s, unaccounted " << unaccounted << "s, table charge "
-                  << table_charge << "s");
+                  << table_charge << "s (ratio " << (unaccounted / table_charge)
+                  << ", REPORTED not asserted -- see the note above)");
   REQUIRE(wall > 0.0);
-  CHECK_MESSAGE(unaccounted <= kInstrumentBudget * table_charge,
-                "this timeline runs two adjacent scopes and NOTHING between them, so its whole "
-                "residue is this instrument's own boundary cost. It reports " << unaccounted
-                    << "s of residue against a " << table_charge
-                    << "s charge, which means an interval this instrument spends is not being "
-                       "charged to anything — the sampler join outside the lock was the one "
-                       "that was not");
+  CHECK_MESSAGE(table_charge > 0.0,
+                "the table's own instrument charge is " << table_charge
+                    << "s across a timeline that opened and closed three scopes with nothing "
+                       "live between the last two, so `ChargeLocked` never reached the `no live "
+                       "leaf` arm. That arm is the whole of `unaccounted_seconds`'s explanation");
+  CHECK_MESSAGE(unaccounted >= table_charge - 1e-9,
+                "the table reports " << unaccounted << "s of un-named time and claims "
+                    << table_charge
+                    << "s of it is this instrument's own. A charge larger than the residue it "
+                       "is part of means the accounting is charging intervals that are inside a "
+                       "leaf to the table, which would make every residue bound too loose");
   log.Reset();
 }
 
