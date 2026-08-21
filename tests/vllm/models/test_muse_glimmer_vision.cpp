@@ -357,7 +357,7 @@ TEST_CASE("muse_glimmer_vision_tower_bf16_within_envelope") {
 // --- ROUTING: WHICH attention op the tower names -----------------------------
 // The 50 blocks are the whole cost of this tower, and it must not pay them on
 // the "Correctness-grade (M0.9)" kernel `vt::Attention` is frozen on
-// (src/vt/cuda/cuda_ops.cu:1456-1459) -- issue #1545, class issue #1544.
+// (src/vt/cuda/cuda_ops.cu:1456-1460) -- issue #1545, class issue #1544.
 //
 // No case above can see that choice, BY CONSTRUCTION rather than by oversight:
 // on CPU `kAttentionDenseFlash` is registered to the SAME `AttentionKernel`

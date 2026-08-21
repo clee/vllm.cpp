@@ -145,7 +145,11 @@ that ships 37 window layers is a tower meant to run at grids well past one
 window.
 
 Arithmetic, at `Q * H * K_eff` iterations and the 5.70 ns/iteration GB10
-constant recorded at `.agents/specs/multimodal-speed.md:24-26`:
+constant stated in [#1544](https://github.com/mudler/vllm.cpp/issues/1544) and
+derived there from `.agents/specs/multimodal-speed.md:24-26`, which records 56 ms
+per block over 784 patches and 16 heads rather than the constant itself
+(`56e-3 / (784 * 16 * 784) = 5.694e-9`). The second anchor and the head_dim 64
+and 72 provenance are in that issue too, not in this tree:
 
     reading A: 13 x (16384 x 16 x 16384)              = 5.583e10
              + 37 x (16 x (1024 x 16 x 1024))         = 9.932e9
@@ -220,7 +224,7 @@ one:
 2. It moves them onto the rung Whisper's encoder and the Qwen3-VL tower already
    run on by default, which is where the tree's other non-causal encoder towers
    already are.
-3. It is bit-identical to `AttentionDenseFast` (`ops.h:3320-3327`: "the CUDA
+3. It is bit-identical to `AttentionDenseFast` (`ops.h:3313-3314`: "the CUDA
    output is BIT-IDENTICAL to it (K/V bytes merely sourced from shared memory)").
 
 No tolerance anywhere was widened to accommodate any of this. The existing
@@ -235,10 +239,22 @@ and in §8, and it is not fabricated as a pass.
 
 `LaunchAttentionDenseFlash` requests `2 * kFlashBc * d * sizeof(Tin)` bytes of
 dynamic shared memory (`cuda_ops.cu:3338`) with `kFlashBc = 64`
-(`cuda_ops.cu:3236`), and there is no `cudaFuncSetAttribute` anywhere in
-`src/vt/cuda/`, so the real cap is the 48 KiB every architecture gives without
-opting in — the defect [#1544](https://github.com/mudler/vllm.cpp/issues/1544)
-item 2 records.
+(`cuda_ops.cu:3236`), and `cuda_ops.cu` contains no `cudaFuncSetAttribute`, so
+the real cap is the 48 KiB every architecture gives without opting in — the
+defect [#1544](https://github.com/mudler/vllm.cpp/issues/1544) item 2 records.
+
+The scope of that sentence is `cuda_ops.cu` and not `src/vt/cuda/`, deliberately.
+Seven files under `src/vt/cuda/` do call `cudaFuncSetAttribute` — `cuda_gdn.cu`,
+`cuda_marlin_repack.cu`, `cuda_mla_attn.cu`, `cuda_paged_attn.cu`, the two other
+Marlin translation units, and `flash_attn/src/flash_fwd_launch_template.h`, which
+is inside the very subtree `ops.h:3309-3310` says this kernel was ported from.
+None of them is on this launch path, and the claim the argument needs is the
+narrow one.
+
+The kernel body also declares **no static `__shared__`** (`cuda_ops.cu:3239-3328`
+holds one `extern __shared__` array and nothing else), so nothing competes with
+the dynamic request. That check matters: one static byte would put the f32 arm
+over the cap.
 
 | arm | `sizeof(Tin)` | request | vs the 49,152 B cap |
 |---|---:|---:|---|
@@ -378,6 +394,19 @@ cannot — §5), or if a production caller for the tower appears (none exists �
   the whole of this row and no lease was requested. Ready-to-measure, not
   measured: the recipe is in §8 and the geometry question it needs answered is
   in §3.
+- **The f32 CUDA arm has never launched at 49,152 B** (§6). The bf16 default arm
+  has a factor of two in hand; the f32 arm sits on the 48 KiB cap to the byte, and
+  §6 argues it fits rather than measuring it. The argument is an inference about
+  driver behaviour at the exact boundary and it does not account for any per-block
+  driver shared-memory reservation. It is safe to carry today only because the arm
+  is dead twice over — no production caller for the tower at all, and every Muse
+  Glimmer f32 test is a CPU test — and because the failure mode is a loud
+  `Check(cudaGetLastError(), ...)`. It stops being safe the moment W4 wires the
+  encoder or anyone runs the f32 stage gate on CUDA, whichever comes first. Owed:
+  one launch probe at head_dim 96 f32, or the `LTX25-DIT-ATTN-FLASH`
+  ([#1549](https://github.com/mudler/vllm.cpp/issues/1549)) §4.3 opt-in landing
+  first and removing the question. Recorded as debt rather than as a settled
+  argument, because an inference quoted twice starts reading as a measurement.
 - **The image resolution is still two readings, not one** (§3). Resolving it
   needs the upstream `MuseGlimmerImageProcessor`, which is neither in this tree
   nor in a local `transformers` checkout. It changes the size of the number and
