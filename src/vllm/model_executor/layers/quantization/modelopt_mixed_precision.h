@@ -855,9 +855,11 @@ inline bool SplitOperand(const std::string& name, std::string* module,
 
 // The two operands that belong to the KV cache rather than to any Linear.
 // `kv_cache_quant_algo` is a SIBLING of `quantized_layers`
-// (modelopt.py:294, :306-314) and this tree has no quantized KV cache to
-// apply it to; see the refusal note below for why that is named as owed
-// rather than refused here. `ModuleOperands::Add` is the caller: a KV scale is
+// (modelopt.py:294, :306-314) and no path in THIS loader reads a checkpoint
+// `k_scale`/`v_scale` tensor — `KV-FP8` (#1593) landed the CUDA fp8 KV store
+// itself, and feeding it from a checkpoint's scales is a different job; see
+// the refusal note below for why that is named as owed rather than refused
+// here. `ModuleOperands::Add` is the caller: a KV scale is
 // RECORDED against its module and then deliberately kept out of
 // `AnyQuantOperand`, so the decision is one branch a test can mutate rather
 // than a skip that changes no verdict.

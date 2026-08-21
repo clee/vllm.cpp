@@ -52,7 +52,7 @@ are our reading of their documented behavior, not measurements.
 | Block-paged KV with refcount and LRU evict | ✅ | ✅ | ✅ | ◐ |
 | Hybrid KV groups (full attention + GDN/Mamba) | ◐ GDN gate activation resolved from the checkpoint's `output_gate_type` (silu/swish/sigmoid; anything else refused at load, #489) | ✅ | ◐ | ◐ |
 | Sliding-window and chunked-local attention | ◐ | ✅ | ✅ | ✅ |
-| fp8 KV cache | ◐ CPU only | ✅ | ✅ | ✅ |
+| fp8 KV cache | ◐ e4m3 store + read dequant on CPU and CUDA (#1593); nothing serves it yet: no runner block sizing and no `--kv-cache-dtype`. Metal/ROCm refused by name. CUDA gate UNRUN ([spec](../.agents/specs/fp8-kv-cache.md)) | ✅ | ✅ | ✅ |
 | KV offload to host memory | ✅ | ✅ | ✅ | ☐ |
 | External KV provider ABI (LMCache) | ☐ | ✅ | ◐ | ☐ |
 | KV events (block create / evict publish) | ◐ no transport | ✅ | ☐ | ☐ |
@@ -81,6 +81,7 @@ are our reading of their documented behavior, not measurements.
 | Compressed-tensors `mixed-precision` (`config_groups`, ordered regex `targets`) | ◐ scheme read from the config, never from a dtype probe; an arm with no loader is REFUSED BY NAME. On `unsloth/Qwen3.8-27B-NVFP4` the W4A4 group loads, the FP8 W8A8 group and the `kv_cache_scheme` are refused (#821) | ✅ | ✅ | ☐ |
 | ModelOpt `MIXED_PRECISION` (`quantized_layers`, exact module names) | ◐ the declared `quant_algo` is CROSS-CHECKED against the shipped operand names at load; a disagreement, an unimplemented algo or an unknown operand family is REFUSED BY NAME. `r0b0tlab/...-MTP-sm121` loads (#821) | ✅ | ✅ | ☐ |
 | ModelOpt `MIXED_PRECISION`: the cross-check moves no arm | ✅ `nvidia/Qwen3.6-27B-NVFP4` @`0893e160` is NOT refused, and one case says so: same format, wildcard exclusions, an `input_scale` on every NVFP4 module, a `kv_cache_scheme` shipping zero scales (#821) | ✅ | ✅ | ☐ |
+| ModelOpt `MIXED_PRECISION`: STATIC per-tensor FP8 + W4A16_NVFP4 | ◐ LOADS, never RUN. `r0b0tlab/Qwen3.8-27B-NVFP4-MTP-sm121` carries 208 `input_scale`, `F32` scalar `weight_scale` and `"dynamic": false`, so the three `unsloth` blockers are absent (#1574, #821) | ✅ | ✅ | ☐ |
 | fp8 weights, per-tensor scale | ✅ | ✅ | ✅ | ☐ |
 | Block-wise (fine-grained 128x128) FP8, the `weight_scale_inv` layout | ◐ RUNS on CPU (#1189 M4/M6): 10 projections as 7 GEMMs, `gate_up`+QKV merged. CUDA sm120: N,K %128==0 only; 7 shapes MATCH CPU ref on GB10, no token gate (#1437) ([spec](../.agents/specs/vt-matmul-fp8-block-cuda.md)) | ✅ | ✅ | ☐ |
 | Per-tensor FP8 W8A8 linear is a shared seam any model can bind | ✅ `models/dense_fp8_gemm.h` + `layers::Fp8W8A8LinearMethod` (#940), bound via `layers::MakeLinearMethod`. One definition, CUDA only ([spec](../.agents/specs/vt-fp8-shared-seam.md)) | ✅ `Fp8LinearMethod` | ✅ | ☐ |
