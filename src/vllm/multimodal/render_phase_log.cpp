@@ -175,6 +175,14 @@ struct PhaseLog::Impl {
   // open order: a nested sub-scope is appended after the leaf that contains it.
   // Caller holds `mu`.
   void ChargeLocked(double from, double to) {
+    // A NEGATIVE `from` IS REFUSED RATHER THAN CLAMPED, and the polarity is the
+    // reason. `Open` reads its clock BEFORE it takes this mutex, so a `Begin` on
+    // another thread between those two points moves the origin under it and the
+    // offset comes out negative. Clamping to zero would then charge the whole
+    // timeline so far, and every bound derived from this number LOOSENS as it
+    // grows — a defect that makes a gate pass is the one nobody finds. The
+    // interval is not attributable to this timeline, so it is dropped.
+    if (from < 0.0) return;
     if (!(to > from)) return;
     for (size_t i = open.size(); i > 0; --i) {
       Open& o = open[i - 1];
