@@ -42,6 +42,7 @@
 #include <nlohmann/json.hpp>
 
 #include "support/max_abs_diff.h"
+#include "support/test_env.h"
 #include "vllm/model_executor/model_loader/safetensors_reader.h"
 #include "vllm/model_executor/models/ltx2.h"
 #include "vllm/model_executor/models/ltx2_loader.h"
@@ -1583,11 +1584,12 @@ TEST_CASE("ltx2 device: the DiT self-attention ENTERS AttentionDenseFlash, not v
   // it is gated too: `=0` must put every one of those calls BACK on the naive op.
   // A knob that silently did nothing would leave the A/B measuring one arm twice,
   // which is the failure mode a same-binary A/B exists to avoid.
-#ifdef _WIN32
-  _putenv_s("VLLM_LTX2_DIT_FLASH_ATTN", "0");
-#else
-  setenv("VLLM_LTX2_DIT_FLASH_ATTN", "0", 1);
-#endif
+  // Through the shared shim, not a private `#ifdef _WIN32` branch: `setenv` and
+  // `unsetenv` are POSIX and MSVC has neither, and issue #603 exists because
+  // three files had already grown their own copy. `check-windows-portability.py`
+  // cannot see an unguarded `::setenv` in a test translation unit (#1107), so
+  // nothing would have caught a private branch here either.
+  vllm_test::SetEnv("VLLM_LTX2_DIT_FLASH_ATTN", "0");
   vt::ResetOpProviderStats(vt::OpId::kAttentionDenseFlash, vt::DeviceType::kCPU);
   vt::ResetOpProviderStats(vt::OpId::kAttention, vt::DeviceType::kCPU);
   const vllm::Ltx2DitOutputs off =
@@ -1596,11 +1598,7 @@ TEST_CASE("ltx2 device: the DiT self-attention ENTERS AttentionDenseFlash, not v
       vt::GetOpProviderStats(vt::OpId::kAttentionDenseFlash, vt::DeviceType::kCPU);
   const vt::OpProviderStats naive_off =
       vt::GetOpProviderStats(vt::OpId::kAttention, vt::DeviceType::kCPU);
-#ifdef _WIN32
-  _putenv_s("VLLM_LTX2_DIT_FLASH_ATTN", "");
-#else
-  unsetenv("VLLM_LTX2_DIT_FLASH_ATTN");
-#endif
+  vllm_test::UnsetEnv("VLLM_LTX2_DIT_FLASH_ATTN");
   CHECK(flash_off.selections == 0);
   CHECK(naive_off.selections == want);
   // And the two arms must agree BYTE-FOR-BYTE on CPU, where `kAttention` and
