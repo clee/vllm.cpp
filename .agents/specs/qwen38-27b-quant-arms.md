@@ -1517,9 +1517,21 @@ a leased GPU and are W6's.
   through upstream's strategy-3 prefix scan, and the gate asserts 401 `kDirect`
   against 48 `kPrefix` so the count cannot be right for the wrong reason. The
   937 weight-bearing modules — one per `.weight` name, and exactly the ones the
-  loader cross-checks — split 208 / 193 / 536.
+  loader cross-checks — split 208 / 193 / 536. 15 cases / 1649 assertions,
+  hermetic; the live re-read arm is env-gated on
+  `VLLM_CPP_QWEN38_27B_MODELOPT_MTP_DIR` and skips loudly.
   **W4's 1968-name gate is untouched**, and re-ran green at 9 cases / 194
   assertions on the same tree.
+- **A guard that the refusal stays SILENT on the sibling gate model's shape.**
+  `nvidia/Qwen3.6-27B-NVFP4` differs from this artifact in exactly three ways
+  that could each have made the refusal fire: `exclude_modules` is
+  `["mtp*", "mtp.layers.0*"]` and matched by `fnmatch` rather than exactly, its
+  193 NVFP4 modules ALSO ship an `input_scale`, and its `config.json` declares a
+  `kv_cache_scheme` for which it ships zero scales. One case rebuilds that shape
+  and asserts the answer is "". Its own mutation — `ModeloptNvfp4()` narrowed to
+  reject a module that also ships an `input_scale` — turns that case red and
+  leaves every other one green, so the case discriminates rather than
+  decorates.
 - **The first production wiring of `modelopt_mixed_precision.h`.**
   `LoadQwen3_5Dense` reads the ModelOpt `quantization_config` once for the whole
   checkpoint, through the shared `QuantizationConfigOf` lookup, and refuses by
@@ -1575,11 +1587,18 @@ what the checkpoint spells.
 
 The refusal is reached from `LoadQwen3_5Dense`, and the gate enters through that
 function rather than constructing the resolver by hand. Proven by mutation:
-deleting the call site in a scratch copy compiles (so this is not a build
-failure wearing a pass) and turns five cases red; restored byte-for-byte,
-green again. The evidence is in the pull request body.
+deleting the call site in a scratch copy compiles (`rc 0`, so this is not a
+build failure wearing a pass), `git diff --stat` shows the file changed, and
+five cases go red; restored byte-for-byte against a pre-taken sha256, green
+again. Seven further mutations inside the resolver and the manifests were each
+detected — the disabled unquantized-direction branch, an always-true
+`StaticFp8`, a reason-less MXFP8 arm, a suffix list without `.weight_scale_2`
+(4 cases), one deleted manifest row (4 cases), the deleted container skip, and
+the `input_scale`-rejecting NVFP4 check that discriminates the sibling guard.
+Every one printed its applied diff, its compile status and its restore hash, and
+the restored tree is green at 15 cases / 1649 assertions.
 
-### What did NOT land, and is owed
+### What W5 did NOT deliver, and is owed
 
 - **Any token or byte measurement on this artifact.** W6, and blocked on
   [#1185](https://github.com/mudler/vllm.cpp/issues/1185).
@@ -1789,4 +1808,4 @@ on work this spec can schedule: W3 on
 and imports inside an `rc` lease, and running a model there is untested). Until
 one of those clears, the next action on this spec is neither: it is the FP8
 tower of the unsloth artifact, which W4 refuses by name and lists under
-[What did NOT land, and is owed](#what-did-not-land-and-is-owed-1).
+[What did NOT land, and is owed](#what-did-not-land-and-is-owed-2).

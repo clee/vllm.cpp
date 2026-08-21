@@ -908,6 +908,79 @@ TEST_CASE("Qwen3.8-27B-NVFP4-MTP loader: a quant_algo this consumer does not imp
   CHECK(Names(message, "FP8_PER_CHANNEL_PER_TOKEN"));
 }
 
+// ── the OTHER ModelOpt checkpoint this loader sees must keep loading ────────
+//
+// `nvidia/Qwen3.6-27B-NVFP4` @ `0893e1606ff3d5f97a441f405d5fc541a6bdf404` is the
+// FP8-tower gate model of #466 (`tests/parity/hf_snapshot.h`), and it declares
+// the same `quant_method: "modelopt"`, the same `quant_algo: "MIXED_PRECISION"`
+// and the same 401-entry split of 208 `FP8` and 193 `W4A16_NVFP4`. It reaches
+// the new call site too, so "does this refusal fire on a checkpoint that loads
+// today" is a question about that checkpoint and not about this one.
+//
+// It differs from the artifact above in exactly three ways, read from its own
+// `config.json` and `model.safetensors.index.json` on 2026-08-21, and each of
+// the three is a way the refusal could have fired:
+//
+//   1. `exclude_modules` is `["mtp*", "mtp.layers.0*"]`, matched by `fnmatch`
+//      rather than exactly, where this artifact's `ignore` is empty.
+//   2. Its 193 NVFP4 modules ALSO ship an `input_scale` (2194 index names
+//      against 2001), which is the operand `VT_MODELOPT_W4A4=1` reads.
+//   3. Its `config.json` declares a `kv_cache_scheme` and it ships ZERO
+//      `k_scale`/`v_scale` tensors for it.
+//
+// This case rebuilds that SHAPE — not that checkpoint, whose 2194 names are not
+// committed here — and asserts the refusal stays silent on all three. A refusal
+// that fired on any of them would refuse a gate model every recorded 27B NVFP4
+// ratio was taken on.
+TEST_CASE("modelopt MIXED_PRECISION: the sibling gate model's shape is not refused") {
+  const std::string l = std::string(kPrefix) + "layers.0.";
+  nlohmann::json q = OneLayerQuantConfig();
+  // (1) wildcard exclusions rather than an empty list.
+  q["ignore"] = nlohmann::json::array({"mtp*", "mtp.layers.0*"});
+  // (3) a kv_cache_scheme in `config.json`, which `Parse` reads into
+  //     `kv_cache_quant_algo` for the flat shape.
+  q["kv_cache_scheme"] = {{"dynamic", false}, {"num_bits", 8}, {"type", "float"}};
+
+  std::vector<std::string> names;
+  for (const char* proj : {"q_proj", "k_proj", "v_proj", "o_proj"}) {
+    const std::string m = l + "self_attn." + proj;
+    names.push_back(m + ".weight");
+    names.push_back(m + ".weight_scale");
+    names.push_back(m + ".input_scale");
+    // (3) the KV scales this artifact does not ship, and the sibling does not
+    //     either — but the SUFFIXES must stay out of the cross-check whatever
+    //     a checkpoint does with them.
+  }
+  for (const char* proj : {"gate_proj", "up_proj", "down_proj"}) {
+    const std::string m = l + "mlp." + proj;
+    names.push_back(m + ".weight");
+    names.push_back(m + ".weight_scale");
+    names.push_back(m + ".weight_scale_2");
+    // (2) the extra activation scale the sibling ships on every NVFP4 module.
+    names.push_back(m + ".input_scale");
+  }
+  // The excluded MTP head, and a plain bf16 tower nothing names.
+  names.push_back("mtp.fc.weight");
+  names.push_back("mtp.layers.0.self_attn.q_proj.weight");
+  names.push_back(l + "input_layernorm.weight");
+  names.push_back(l + "linear_attn.A_log");
+  names.push_back(l + "linear_attn.dt_bias");
+  names.push_back(l + "self_attn.k_scale");
+  names.push_back(l + "self_attn.v_scale");
+
+  const std::string refusal = mo::RefusalForQuantizationConfig(q, names);
+  INFO("refusal was: " << refusal);
+  CHECK(refusal.empty());
+
+  // The kv-cache algorithm IS parsed, so the silence above is a decision and
+  // not a blind spot: `KV-FP8` (#1593) owns consuming it.
+  const mo::MixedPrecisionConfig parsed = mo::MixedPrecisionConfig::Parse(q);
+  CHECK(parsed.kv_cache_quant_algo() == "FP8");
+  // And the wildcard exclusion really does exclude, so (1) was exercised.
+  CHECK(parsed.Resolve("mtp.fc").how == mo::Resolution::kExcluded);
+  CHECK_FALSE(parsed.Resolve(l + "mlp.gate_proj").how == mo::Resolution::kExcluded);
+}
+
 // ── a checkpoint that is NOT ModelOpt is untouched by any of this ───────────
 TEST_CASE("Qwen3.8-27B-NVFP4-MTP loader: a non-modelopt quantization_config is not read by the ModelOpt arm") {
   // The selection hook, exercised through the production entry point: the
