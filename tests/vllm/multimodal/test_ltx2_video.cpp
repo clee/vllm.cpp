@@ -59,35 +59,34 @@
 
 namespace {
 
-// ── HOW MUCH UN-NAMED TIME A TABLE MAY CARRY (row LTX25-PHASE-RESIDUE) ───────
+// ── WHAT `instrument_seconds` IS FOR, NOW THAT IT IS NOT A BOUND ────────────
 //
-// The multiple of the instrument's OWN measured cost that the un-named time in a
-// table — or the uncovered part of a leaf — may reach. It replaces two wall-clock
-// ratios (`leaves >= 0.95 * wall` and `covered >= min_coverage * leaf_seconds`)
-// that decided by box load at fixture scale and permitted minutes of un-named
-// time at the scale the instrument exists for. #1439, #1470, #1494, #1536.
+// Row LTX25-PHASE-RESIDUE added `kInstrumentBudget = 2` here and replaced two
+// wall-clock ratios with `residue <= 2 * instrument`, on the argument that a gap
+// is the closing record's tail plus the opening record's head plus a call and a
+// return, so what the instrument cannot measure is at most as large as what it
+// can. **Three fresh reviews measured that argument and it is false.** The
+// un-instrumented remainder of a boundary dilates FASTER than the instrumented
+// part under contention, so the comparison has a heavy right tail rather than a
+// shifted median, and it must be measured in hundreds of runs rather than tens:
 //
-// TWO, AND THE DERIVATION IS ONE SENTENCE. A gap in the timeline is the closing
-// record's tail, plus the opening record's head, plus whatever the caller ran
-// between them; `PhaseLog` measures the first two and cannot see the third. The
-// factor states that what it cannot see is at most as large as what it can, and
-// it states nothing else. It is not a share of the render, so this number means
-// the same thing on a 0.26 s fixture and on a 2.5 h render — which is exactly
-// what the two ratios it replaces could not do.
+//   * the table bound, 45 consecutive runs of one snapshot binary at load 88:
+//     **4 red, 8.9%**, median 1.132, p90 1.776, **max 4.115**;
+//   * the conservation case's bound, 200 runs at load 80: **3 red**, median
+//     1.525, max 2.934;
+//   * the `unit.parent` bound, 200 runs at load 85: **2 red**, and a standalone
+//     probe 28 of 160 at load 125, reaching 5.55 and 14.1 under ASan.
 //
-// IT IS NOT A TOLERANCE TO BE RAISED. A table that fails it holds a phase nobody
-// named, and the repair is a scope. The measured ratios on the tree that landed
-// this are recorded in `.agents/specs/ltx25-phase-residue.md` `## Outcome`; a
-// value that starts creeping toward 2 is that spec's stop condition, not a
-// reason to write 3 here.
+// A 20-run distribution reading 1.021 to 1.464 was the BODY of the first of
+// those and saw none of its tail. All three bounds are withdrawn. The constant
+// is gone rather than raised, because a bigger constant is not a repair.
 //
-// AND IT IS ONLY WELL CONDITIONED WHERE A `Tick` AND A `/proc/self/statm` READ
-// SIT INSIDE THE BOUNDARY, which is every use of it below and is NOT a general
-// property of the comparison. A fresh review measured a bare micro-timeline
-// reaching 5.55 at load 125 and 14.1 under `address,undefined`, because there
-// the un-instrumented part of a boundary dilates faster than the instrumented
-// part. Do not reach for this constant from a site whose scopes wrap nothing.
-constexpr double kInstrumentBudget = 2.0;
+// WHAT SURVIVES, AND IT IS THE HALF THAT MATTERED. `instrument_seconds` is
+// emitted for the table and for every record, and it is REPORTED beside every
+// residue this file prints. It is the quantity #1439 asked to have "beside the
+// ratio", and it is the normaliser `6b48edb2c` records as not existing yet. A
+// reader subtracts it before calling a residue a phase nobody named. It is not
+// an assertion, because on this hardware it cannot be one.
 
 struct Workspace {
   std::string root, fixture;
@@ -3309,7 +3308,8 @@ TEST_CASE("ltx2 video: a render through the ABI emits a phase table that SUMS to
   // while no leaf is live and emits it as `instrument_seconds`. So the question
   // becomes the one the table can actually answer, at any scale: is the time
   // nobody named larger than the cost of naming the phases? See
-  // `kInstrumentBudget` for the derivation of the factor.
+  // the note on `instrument_seconds` at the top of this file for why the
+  // instrument's charge is reported here and not asserted against.
   REQUIRE(table.contains("unaccounted_seconds"));
   const double unaccounted = table["unaccounted_seconds"].get<double>();
   REQUIRE_MESSAGE(table.contains("instrument_seconds"),
@@ -3330,13 +3330,41 @@ TEST_CASE("ltx2 video: a render through the ABI emits a phase table that SUMS to
                   "the instrument charged itself NOTHING across a render of " << names.size()
                       << " phases, so `PhaseLog::ChargeLocked` is not running and the bound "
                          "below is `<= 0`");
-  CHECK_MESSAGE(unaccounted <= kInstrumentBudget * instrument,
-                "the phase table does not sum: " << unaccounted << "s of " << wall
-                    << "s is inside no named leaf, and this instrument charged itself only "
-                    << instrument << "s of it. The other " << (unaccounted - instrument)
-                    << "s is a phase nobody named, and W0 iterates until it is. Name it with a "
-                       "scope; do not raise this bound, because the bound is the instrument's "
-                       "own measured cost and not a tolerance");
+  // THE 95% FLOOR IS THE ORIGINAL ONE, UNCHANGED, AND THAT IS THE POINT.
+  //
+  // Row LTX25-PHASE-RESIDUE replaced this line with
+  // `unaccounted <= 2 * instrument` and a third fresh review measured that
+  // replacement over **45 consecutive runs of one snapshot binary at load 88**:
+  // 4 red, 8.9%, median 1.132, p90 1.776, **max 4.115**. The 20-run distribution
+  // the row had recorded (1.021 to 1.464) was the body of that same
+  // distribution and had not run long enough to see its tail. So the
+  // replacement was a coin flip too, at roughly one run in eleven, which is the
+  // defect the row exists to remove — and the row's own stop condition said to
+  // stop rather than raise the constant.
+  //
+  // THE REPLACEMENT IS WITHDRAWN AND THE CAUSE STAYS FIXED. What made this
+  // floor red was never its form: **92% of its numerator was ONE un-named
+  // region**, the load's prologue, 17.661 ms of a 19.178 ms residue, and it does
+  // not scale with anything. `load.setup`, `load.dit_config` and `artifacts.mux`
+  // name it, and the residue drops by an order of magnitude — 0.03% to 0.6% of
+  // wall across 20 runs here, against a 5% budget.
+  //
+  // AND THE RATIO IS BETTER CONDITIONED THAN THE ONE THAT REPLACED IT, for the
+  // reason the replacement was not. `wall` is in the DENOMINATOR, and wall grows
+  // with contention exactly when a preemption inflates the residue, so the two
+  // move together. `instrument` does not: the un-instrumented remainder of a
+  // boundary dilates faster than the measured part, which is the mechanism three
+  // reviews measured and the reason that comparison has a heavy right tail.
+  //
+  // `instrument_seconds` is REPORTED beside it, in the MESSAGE above and in the
+  // emitted table. That is the other half of what #1439 asked for — "bounding
+  // `unaccounted_seconds` beside the ratio" — delivered as a number a reader can
+  // subtract rather than as a second assertion nobody can keep green.
+  CHECK_MESSAGE(leaves >= 0.95 * wall,
+                "the phase table does not sum: " << leaves << "s of named leaves against " << wall
+                    << "s of wall, with " << instrument
+                    << "s of the residue charged to this instrument's own boundaries. The rest "
+                       "is a phase nobody named, and W0 iterates until it is");
   // AND THE TIMELINE INCLUDES THE CALLER, which is a trap worth naming here
   // rather than leaving for whoever trips it. `PhaseLog`'s origin is the LOAD,
   // so the gap between `vllm_video_engine_load` returning and
@@ -3592,6 +3620,7 @@ std::vector<NamedInterval> LeafIntervals(const nlohmann::json& table,
 struct Carrying {
   std::string leaf;                    // the name that claims the seconds
   std::vector<std::string> parts;      // the nested sub-scopes sitting on the work
+  double min_coverage = 0.0;           // of the leaf's own seconds
   std::vector<std::string> partners;   // leaves the driver genuinely interleaves with
   // HOW MANY RECORDS OF EACH PART, from a number the RENDER produced. One entry
   // per name in `parts`. This is the only assertion here that is not a ratio
@@ -4112,7 +4141,7 @@ void CheckCarryingPhase(const nlohmann::json& table, const Carrying& c) {
   // uncovered part of a leaf whose parts genuinely wrap its work IS that number,
   // and the assertion is:
   //
-  //     leaf_seconds - covered  <=  kInstrumentBudget * leaf_instrument
+  //     leaf_seconds - covered  <=  2 * leaf_instrument
   //
   // THE BUDGET IS DERIVED AND NOT ROUND. A gap between a leaf and its sub-scope
   // is the closing record's tail, plus the opening record's head, plus whatever
@@ -4146,15 +4175,13 @@ void CheckCarryingPhase(const nlohmann::json& table, const Carrying& c) {
                << " leaf record(s), of which " << subs.size() << " sub-scope(s) cover " << covered
                << "s (" << (100.0 * covered / leaf_seconds) << "%), uncovered " << uncovered
                << "s against an instrument charge of " << leaf_instrument << "s (ratio "
-               << (uncovered / leaf_instrument) << ")");
-  CHECK_MESSAGE(uncovered <= kInstrumentBudget * leaf_instrument,
-                "'" << c.leaf << "' spent " << leaf_seconds << "s and its named parts cover "
-                    << covered << "s, leaving " << uncovered
-                    << "s inside no sub-scope. The instrument charged itself only "
-                    << leaf_instrument << "s of that, so " << (uncovered - leaf_instrument)
-                    << "s of this leaf is work nobody named, wearing this one's label. Name it "
-                       "with a sub-scope; do not raise this bound, because the bound is the "
-                       "instrument's own measured cost and not a tolerance");
+               << (uncovered / leaf_instrument) << ", REPORTED not asserted)");
+  CHECK_MESSAGE(covered >= c.min_coverage * leaf_seconds,
+                "the named parts of '" << c.leaf << "' cover only " << covered << "s of its "
+                    << leaf_seconds << "s, under the " << (100.0 * c.min_coverage)
+                    << "% this phase's anchor is expected to reach. The instrument charged "
+                    << leaf_instrument << "s of the difference to its own boundaries; the rest "
+                       "is a phase nobody named, wearing this one's label");
 
   // (2b) AND EACH PART'S OWN SHARE, because (2) is checked on the SUM.
   //
@@ -4321,7 +4348,7 @@ void CheckWriterIsBesideTheDecode(const nlohmann::json& table, int64_t render) {
 void CheckRenderPhases(const nlohmann::json& table,
                        const vllm::multimodal::Ltx2ConditioningTrace& trace,
                        const vllm::multimodal::VideoResult& result, int64_t latent_channels,
-                       int64_t render, int64_t min_chunks) {
+                       int64_t render, int64_t min_chunks, double denoise_min_coverage) {
   INFO("render = " << render);
 
   // ── WHAT THE RENDER COUNTED, which is not what the instrument counted ──────
@@ -4486,6 +4513,7 @@ void CheckRenderPhases(const nlohmann::json& table,
        // Listed in the order the driver runs them, which assertion (1b') now
        // checks per record rather than on the first pair alone.
        {"denoise.step", "denoise.update"},
+       denoise_min_coverage,
        {},
        // TWO INDEPENDENT COUNTERS, and that is what makes this pair worth
        // asserting rather than an identity. `dit_evaluations` is incremented
@@ -4523,6 +4551,7 @@ void CheckRenderPhases(const nlohmann::json& table,
        render},
       {"decode.video",
        {"decode.video.chunk"},
+       0.90,
        {"artifacts.frames"},
        {trace.video_decode_chunks + 1},
        "Ltx2ConditioningTrace::video_decode_chunks + 1, the reopen after the last chunk",
@@ -4533,6 +4562,7 @@ void CheckRenderPhases(const nlohmann::json& table,
        render},
       {"decode.audio",
        {"decode.audio.mel", "decode.audio.vocoder"},
+       0.99,
        {},
        {1, 1},
        "the two calls #1010 names, once each per render",
@@ -4561,6 +4591,7 @@ void CheckRenderPhases(const nlohmann::json& table,
       // ever been held.
       {"artifacts.frames",
        {"artifacts.frames.ppm"},
+       0.50,
        {"decode.video"},
        {trace.video_decode_chunks},
        "Ltx2ConditioningTrace::video_decode_chunks, one write callback per chunk",
@@ -4721,7 +4752,8 @@ TEST_CASE("ltx2 video: the three carrying phases contain their work and the load
   // TAKEN BEFORE THE SECOND GENERATION OVERWRITES IT: `im.trace` is reset on
   // every `Generate`, which is half of why the counts here need a render filter.
   const vllm::multimodal::Ltx2ConditioningTrace trace_one = ltx2->last_conditioning();
-  CheckRenderPhases(first, trace_one, result, latent_channels, render_one, /*min_chunks=*/1);
+  CheckRenderPhases(first, trace_one, result, latent_channels, render_one, /*min_chunks=*/1,
+                    /*denoise_min_coverage=*/0.75);
 
   // ── RENDER 2: 81 frames, which CHUNKS, and every count above is checked at
   // N > 1 ───────────────────────────────────────────────────────────────────
@@ -4750,11 +4782,12 @@ TEST_CASE("ltx2 video: the three carrying phases contain their work and the load
                     << render_one << "; the table's `render` field is not the per-generation "
                                      "slice the counts below are taken over");
   CheckRenderPhases(table, ltx2->last_conditioning(), multi_result, latent_channels, render_two,
-                    /*min_chunks=*/2);
+                    /*min_chunks=*/2, /*denoise_min_coverage=*/0.75);
 
   // ...and the FIRST render's records are still in the second render's table and
   // still hold, which is what says the filter above selects rather than hides.
-  CheckRenderPhases(table, trace_one, result, latent_channels, render_one, /*min_chunks=*/1);
+  CheckRenderPhases(table, trace_one, result, latent_channels, render_one, /*min_chunks=*/1,
+                    /*denoise_min_coverage=*/0.75);
 
   // (3c) AND NOTHING BUT AN ANCHOR IS NESTED. The assertion that sees a leaf
   // swallow a NEIGHBOUR, which the four above cannot: see the note on
@@ -5053,7 +5086,8 @@ TEST_CASE("ltx2 phase log: the instrument charges its own cost to the innermost 
   // (4) AND WHAT IS **NOT** ASSERTED HERE, WHICH A FRESH REVIEW MEASURED.
   //
   // This case shipped, twice, with a ratio assertion on
-  // `uncovered / parent_instrument` — first at `kInstrumentBudget` (2) on the
+  // `uncovered / parent_instrument` — first at the factor of 2 the gates then
+  // carried, on the
   // argument that a budget which stopped covering a boundary would red in eleven
   // lines rather than in a forty-second render, then at an order-of-magnitude
   // backstop when a green run measured 1.87 against that 2. A fresh review then
@@ -5167,7 +5201,7 @@ TEST_CASE("ltx2 phase log: the instrument's own cost is conserved across the tab
 
   // AND THE TABLE'S OWN CHARGE IS REAL, WHICH IS ALL THAT IS ASSERTED ABOUT IT.
   //
-  // This case carried `unaccounted <= kInstrumentBudget * table_charge` for one
+  // This case carried `unaccounted <= 2 * table_charge` for one
   // revision, on the argument that a two-scope timeline whose gaps contain
   // NOTHING has nothing in its residue but boundary cost. A fresh review then
   // ran it 200 times and it reddened **3 of 200 at load average 80**, median

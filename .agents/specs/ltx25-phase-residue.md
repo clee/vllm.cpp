@@ -34,8 +34,13 @@ This row lands four things and nothing else:
    for the table, so a reader can tell instrument overhead from work nobody
    named. That number does not exist today, which is why every previous
    investigation of these two gates had to argue about it.
-4. **Replaces both wall-clock ratios with a bound derived from that measured
-   cost.** This is the part that closes the class rather than one member.
+4. ~~**Replaces both wall-clock ratios with a bound derived from that measured
+   cost.**~~ **WITHDRAWN, and the withdrawal is this row's most useful result.**
+   Three fresh reviews measured the replacement and it is load-flaky in the same
+   way the assertions it replaced were — 4 red in 45 runs at the table, max ratio
+   4.115. Both floors are therefore the tree's own, unedited, and they now carry
+   orders of magnitude of margin because item 1 removed 92% of what they were
+   measuring. See `### The bound this row proposed, and why it is not here`.
 
 **Out of scope.** No numeric behaviour of the render changes. No threshold is
 loosened: §Design proves both replacements are strictly stricter than what they
@@ -207,81 +212,67 @@ render's wall. It measures the render, not the writer.
   `Ltx2ConditioningTrace::sampler_updates` so assertion (0) has a denominator the
   phase table cannot move.
 
-### 3. Both ratios are replaced by a bound derived from §1
+### 3. Both ratios STAY, and the bound this row proposed is withdrawn
 
-Today:
-
-```cpp
-CHECK(leaves >= 0.95 * wall);                       // :3259
-CHECK(covered >= c.min_coverage * leaf_seconds);    // :3696
-```
-
-After:
+The row's plan was to replace
 
 ```cpp
-CHECK(unaccounted <= kInstrumentBudget * instrument_seconds);
-CHECK(leaf_seconds - covered <= kInstrumentBudget * leaf_instrument_seconds);
+CHECK(leaves >= 0.95 * wall);                       // the table
+CHECK(covered >= c.min_coverage * leaf_seconds);    // each carrying leaf
 ```
 
-**The derivation.** A gap between two adjacent records is the closing record's
-tail plus the opening record's head plus whatever the caller ran between them.
-The instrument measures the first two. `kInstrumentBudget = 2` states that the
-part it cannot measure — the `Close` return, the caller's own statements, and the
-`Open` call — is at most as large as the part it can. Nothing in the constant is
-a share of the render, so the assertion says the same thing at 64x64x9 and at
-3840x2160x241. The number is checked against measurement in §Gates: the ratio
-`unaccounted / instrument_seconds` is reported for every gate run and the bound
-is only defensible while that ratio sits near 1.
+with `residue <= kInstrumentBudget * instrument`, on the argument that a gap is
+the closing record's tail, plus the opening record's head, plus a call and a
+return — so what the instrument cannot measure is at most as large as what it
+can, and the bound therefore says the same thing at 64x64x9 and at 3840x2160x241.
 
-**Why this is stricter and not looser, which is the rule this row must not
-break.** At the fixture scale of the failing run, `0.95 * wall` permits 13.1 ms
-of un-named time. The new bound permits about twice the measured instrument cost
-of ~0.3 ms. At the 21 B render the instrument exists for — `ltx25-decode-speed.md`
-records rungs measured in hours — `0.95 * wall` permits **minutes** of time
-nobody named, while the new bound still permits milliseconds. The replacement is
-five orders of magnitude tighter at the scale the tolerance was originally
-argued for. The same argument holds for the coverage bound: 0.95 of a
-`decode.audio` leaf permits 83 ms of that leaf to be un-anchored at fixture
-scale and 0.90 of `denoise` at 81 frames permits 3.9 ms.
+**That argument is false, and three fresh reviews measured it rather than
+arguing with it.** The un-instrumented remainder of a boundary dilates FASTER
+than the instrumented part under contention, so the comparison has a heavy right
+tail rather than a shifted median:
 
-**It is an empirical claim and not a theorem, which a fresh review was right to
-say.** `uncovered <= 2 * leaf_instrument` beats `covered >= 0.75 * leaf_seconds`
-only while `2 * leaf_instrument < 0.25 * leaf_seconds`, and nothing bounds
-`leaf_instrument` from above. `Tick` charges to the innermost live record, so
-moving the DiT tick out of `Evaluate` would charge about 110 flushed writes to
-`denoise` and buy a budget larger than the deleted floor. The ratio is emitted as
-a `MESSAGE` rather than asserted, so a change that made the instrument ten times
-more expensive would widen both gates and print a small number. That is a real
-direction of drift, and it is recorded under `## Owed` rather than papered over.
+| site | runs | red | median | max |
+|---|---:|---:|---:|---:|
+| the table bound, load 88 | 45 | **4 (8.9%)** | 1.132 | **4.115** |
+| the conservation case, load 80 | 200 | **3** | 1.525 | 2.934 |
+| the `unit.parent` case, load 85 | 200 | **2** | 1.70 | — |
+| a standalone probe of that shape, load 125 | 160 | **28 (17.5%)** | — | 5.55 |
+| the same probe under `address,undefined` | 30 | 2 | 1.12 | **14.1** |
 
-**Why it is not load-flaky, which is the property the four issues are about —
-and the argument this row first gave for it, which is WRONG.**
+The mechanism, from decomposing a parent's uncovered time: fast, its inter-child
+gaps are 9-20 us over seven boundaries against a 13-22 us charge; slow, 91-105 us
+against 52-61 us. A 20-run distribution reading 1.021 to 1.464 was the BODY of
+the first row of that table and saw none of its tail.
 
-The old ratio compares a residue that a preemption inflates against a wall that
-the same preemption inflates only if it lands inside a leaf; the residue is 0.5%
-of the timeline, so 99.5% of preemptions help the ratio and 0.5% destroy it, and
-that is the coin flip #1439 and #1494 measured. That half stands.
+**So the bound is withdrawn at all three sites and the constant is deleted rather
+than raised.** This row's own stop condition said to stop rather than write a
+bigger number, and [#1466](https://github.com/mudler/vllm.cpp/issues/1466)
+rejects the bigger number as a class.
 
-This spec then argued that the new bound is immune because *"a preemption inside
-a gap lands inside an instrument entry point with overwhelming probability — the
-un-instrumented part of an adjacent-scope gap is a call and a return — so it
-inflates both sides of the comparison together."* **A fresh review measured that
-and it is false.** Decomposing a bare micro-timeline's uncovered time: fast, its
-inter-child gaps are 9-20 us over seven boundaries against a 13-22 us charge;
-slow, 91-105 us against 52-61 us. The un-instrumented part dilates FASTER. The
-same review reddened the unit case 2 times in 200 at load 85 and 28 in 160 at
-load 125.
+**The floors that stay are the tree's own, unedited.** `leaves >= 0.95 * wall` is
+the line that was red; `denoise_min_coverage` is `6b48edb2c`'s 0.75, and the
+other three are its 0.99, 0.90 and 0.50. Nothing is loosened by this row, and
+nothing is tightened either.
 
-**What actually conditions the render-level bounds is different, and it is
-measured rather than argued.** A render's boundaries carry a `Tick` and a
-`/proc/self/statm` read INSIDE the instrumented region, so the measured part of
-each gap dominates the part that is not, and the ratio stays near 1: 20 of 20
-runs of the table bound at 1.021 to 1.464, and the eight leaf measurements at
-1.02 to 1.46 by two independent measurers. Eight bare scopes carry neither, which
-is why the unit case reports the ratio and no longer asserts it. The claim this
-row makes is therefore empirical and scoped to the render, not a property of the
-comparison in general, and `## Outcome` carries the distribution that supports
-it.
+**And they are no longer coin flips, because §2 removed what they were
+measuring.** 92% of the sum floor's numerator was one un-named region that does
+not scale with anything. Named, the residue drops by an order of magnitude:
+**99.961% of wall** on the landing tree, where the red measured 92.700%.
+`denoise` coverage moves from **94.221% to 99.939%**, because the sampler's
+per-step update has a name.
+
+**`wall` in the denominator is also better conditioned than `instrument` was**,
+which is the part this row had backwards. Wall grows with contention exactly when
+a preemption inflates the residue, so numerator and denominator move together;
+the instrument's charge does not.
+
+`instrument_seconds` survives as a REPORTED quantity — emitted for the table and
+for every record, and printed beside every residue the file prints. That is what
+[#1439](https://github.com/mudler/vllm.cpp/issues/1439) asked for as its second
+option, "bounding `unaccounted_seconds` beside the ratio", and it is the
+normaliser `6b48edb2c` records as not existing. A reader subtracts it before
+calling a residue a phase nobody named. It is not an assertion, because on this
+hardware it cannot be one.
 
 ### 4. The sibling pairing (1b) is strengthened, not weakened
 
@@ -396,6 +387,7 @@ W5 gates, mutations, and the record edits the change makes stale.
 | [#1568](https://github.com/mudler/vllm.cpp/issues/1568) — the `denoise.step` / `denoise.update` seconds transfer | **owed, filed by this row, and this row claimed it was closed until a fresh review checked.** (1b') compares `start_seconds` only, so leaving `denoise.step` open across the post-process and emitting `denoise.update` empty after it preserves the alternation, both counters, containment, non-overlap, exclusivity, (1c) and (2), and moves 100% of the decomposed seconds onto one name. No (2b) floor separates it: the honest share of `denoise.update` runs 0.45% to 11.15% across four boxes and a transfer puts it at ~0%. Closing it needs an anchor INSIDE the callee, which is the third row of the anchor table in [`ltx25-device-residency.md`](ltx25-device-residency.md) `### Owed out of W0` for all six anchors |
 | [#1569](https://github.com/mudler/vllm.cpp/issues/1569) — a gate on `WriteJson`'s clock ORDERING | **owed, filed by this row, and MEASURED green under its own mutation.** `WriteJson` reads `Elapsed()` before it copies and sorts the records, so the writer stops being charged to the render. Restoring the old order left the conservation case GREEN 10 of 10, at `wall 0.0608987s, unaccounted 0.000534223s, table charge 0.000301655s`, because the copy and the sort of a three-record table are nanoseconds. Gating it needs a table with enough records for the sort to be measurable and a `WriteJson` with nothing between it and the last `Close`. The case is named for what it does prove |
 | [#1570](https://github.com/mudler/vllm.cpp/issues/1570) — an upper bound on the instrument's own share of a leaf | **owed, filed by this row.** `uncovered <= 2 * leaf_instrument` is stricter than the floor it replaces only while `leaf_instrument` stays small, and nothing bounds it. Moving the DiT `Tick` out of `Evaluate` would charge ~110 flushed writes to `denoise` and widen the gate while printing a small number |
+| a residue bound that survives a contended box | **owed, and it is this row's own negative result plus [#1570](https://github.com/mudler/vllm.cpp/issues/1570).** `residue <= 2 * instrument` measured red 4 in 45 at the table, 3 in 200 at the conservation case and 2 in 200 at `unit.parent`, and is withdrawn. Nothing replaces it, so a future un-named region under 5% of wall is invisible and **mutation D — the `denoise.update` anchor moved off the post-process, 5 of 5 red against the withdrawn bound — is not detected on the landing tree**. Closing it needs a bound on a quantity the scheduler cannot move |
 | [#1571](https://github.com/mudler/vllm.cpp/issues/1571) — a per-gap decomposition IN the emitted table | **owed, filed by this row.** This row computed the gap table in a scratch script to find the 92% region. A reader of `phase-log.json` still cannot see it without one, and the same investigation will be re-derived the next time the residue moves |
 
 ## Outcome
@@ -496,65 +488,58 @@ boundary".
 rather than after. The writer's own serialization was being charged to the
 render's wall, and therefore to the residue.
 
-### The measured ratios, which are what makes the bound defensible
+### The bound this row proposed, and why it is not here
 
-`kInstrumentBudget = 2` says the part of a gap the instrument cannot measure is
-at most as large as the part it can. That is only worth anything as a
-distribution, so here is one, at `37f7f9aca` on the loaded box described above.
+This is the row's most useful result and it is a negative one. §Design.3 is
+REFUTED by measurement, three times, by a fresh reviewer who ran it for hundreds
+of runs where this row had run it for tens.
 
-**The table bound, 20 consecutive runs of the SUMS case at load average 94-102,
-20 of 20 green and every run reporting `cases=1`:**
+**What that cost, stated plainly.** The row shipped that bound at three sites and
+removed it from each one only after it was measured red there: the `unit.parent`
+case (2 in 200), then the conservation case (3 in 200), then the table itself
+(4 in 45). Each removal was argued as scoped to a badly conditioned site, and
+each time the next measurement found the same defect one site over. The general
+statement was available after the first: **a ratio of two wall-clock quantities
+the box moves at different rates cannot be a gate on this hardware**, which is
+what #1439, #1470, #1494 and #1536 are all about, and this row rediscovered it
+from the other side.
 
-| min | median | max | bound |
-|---:|---:|---:|---:|
-| 1.021 | 1.065 | **1.464** | 2 |
+**What replaced it is nothing, and that is deliberate.** The two floors are the
+tree's own, unedited. What makes them hold is §Design.2: the cause is fixed.
 
-**The four carrying leaves, both geometries, one run:**
+| | before this row | on the landing tree | floor |
+|---|---:|---:|---:|
+| `leaves / wall` | 92.700% (RED) | **99.961%** | 0.95 |
+| `denoise` coverage, 9 frames | 94.221% (RED at the then-0.95) | **99.939%** | 0.75 |
+| `denoise` coverage, 81 frames | 92.99% | **99.9932%** | 0.75 |
+| `decode.video` coverage | 99.82% | 99.9856% | 0.90 |
+| `decode.audio` coverage | 99.97% | 99.9951% | 0.99 |
+| `artifacts.frames` coverage | 98.72% | 98.7657% | 0.50 |
 
-| leaf | 9 frames | 81 frames |
-|---|---:|---:|
-| `denoise` | 1.109 | 1.068 |
-| `decode.video` | 1.220 | 1.163 |
-| `decode.audio` | 1.056 | 1.071 |
-| `artifacts.frames` | 1.257 | 1.196 |
+**And the instrument's charge is reported at every one of them**, which is the
+half of #1439's request that does land: `unaccounted 0.00179039s` against
+`instrument 0.00137401s` on the table, and per leaf 1.017 to 1.230 as a ratio
+that is printed and not asserted.
 
-A fresh review measured the same eight quantities independently at `ec3e7ac0c`,
-before the `Open`-progress-line charge landed, and read 1.02 to 1.46.
+### What this cost the gate, stated rather than glossed
 
-**And the one place the ratio does NOT behave, which the same review found and
-which is why the unit case no longer asserts it.** The `unit.parent`
-micro-timeline reddened 2 of 200 consecutive runs at load 85, and a standalone
-probe of the same shape reddened 28 of 160 at load 125, reaching 5.55, and 14.1
-under `address,undefined`. Decomposing that parent's uncovered time explains it:
-fast, its inter-child gaps are 9-20 us over seven boundaries against a 13-22 us
-charge; slow, 91-105 us against 52-61 us. **The un-instrumented part of a
-boundary dilates faster than the instrumented part when the box slows**, which is
-the opposite of §Design.3's claim that a preemption inflates both sides together.
+Removing the bound loses detections the tree does not otherwise have, and they
+are recorded rather than left for the next reader to find:
 
-That claim is therefore wrong as stated, and what saves the render-level bounds
-is not it: a render's boundaries carry a `Tick` and a `/proc/self/statm` read
-INSIDE the instrumented region, so the measured part dominates and the ratio
-stays near 1. Eight bare scopes carry neither. The gates keep the bound because
-their measured distribution supports it over 20 runs and two independent
-measurers; the unit case reports the ratio and does not assert it, because at
-that scale the quantity is not well conditioned. The stop condition this row set
-itself — that a ratio far from 1 makes the bound a constant nobody derived — is
-met at the render and is NOT met at the micro scale, and both halves are written
-down here rather than only the convenient one.
+* **Mutation D** — `denoise.update` moved below the two `PostProcessLatent`
+  calls, so the anchor stops covering the post-process while its count,
+  containment, nesting and sibling order are all unchanged — reddened the
+  withdrawn bound **5 of 5 runs**. Against the 0.75 floor it produces about 94%
+  coverage and passes. Nothing in the file now sees it, and no floor can: the
+  honest anchored coverage approaches the same value on a fast box, as the leaf
+  shrinks and the instrument's cost does not.
+* **A future un-named region** smaller than 5% of wall is invisible again, which
+  is the same hole at a smaller scale. The named-boundary list catches a name
+  being DELETED — mutation A reds there — and not a region being ADDED.
 
-### What is stricter, stated as the numbers at both ends
-
-| | old gate permits | new gate permits |
-|---|---|---|
-| the fixture, wall 0.26 s | 13.1 ms un-named | ~0.6 ms, twice the measured charge |
-| a 2.5 h render | **7.5 minutes** un-named | milliseconds, twice the measured charge |
-| `decode.audio` at 0.99 | 83 ms un-anchored at fixture scale | ~0.13 ms |
-| `denoise` at 0.90, 81 frames | 3.9 ms un-anchored | ~0.5 ms |
-
-The replacement is tighter at fixture scale and five orders of magnitude tighter
-at the scale the tolerance was originally argued for. That is the whole defence
-for replacing an assertion rather than editing its constant, and it is why this
-change is not the thing `AGENTS.md` forbids.
+Both are listed under `## Owed` beside
+[#1570](https://github.com/mudler/vllm.cpp/issues/1570). What would close them is
+a bound on a quantity the scheduler cannot move, and this row does not have one.
 
 ### Reconciled with `6b48edb2c`, which landed mid-flight
 
@@ -603,22 +588,20 @@ together and the bound needs no `#if`.
 
 `.agents/verification.md` asks for the immutable SHA, the exact command, the
 environment, the exit status and the evidence path, and not a summary of them.
-The `## Gates` table above states intentions, which is what a fresh review
-correctly rejected as evidence. This is the record.
 
 **Environment for every row below.** x86_64, 20 cores,
 `cmake -S . -B build -DVLLM_CPP_BUILD_TESTS=ON` with an **empty**
-`CMAKE_BUILD_TYPE`, which is what `build-test-cpu` uses. Load average **94 to
-140** throughout, with three to five other sessions running this same suite. That
-is stated because it is the subject: the two assertions this row replaced decided
-by that number.
+`CMAKE_BUILD_TYPE`, which is what `build-test-cpu` uses. Load average **70 to
+140** throughout, with three to five other sessions running this same suite.
 
 | # | SHA | command | exit | result |
 |---|---|---|---|---|
 | 1 | `67823aee2` (base) | `./build/tests/test_ltx2_video` | 1 | **RED.** `102 cases \| 100 passed \| 2 failed`, `4170 assertions \| 4167 passed \| 3 failed`. Evidence `red1.log` |
-| 2 | `37f7f9aca` | `./build/tests/test_ltx2_video -s -tc='<the four cases this row owns>'` | 0 | **GREEN.** `4 cases \| 4 passed \| 0 failed`, `1381 assertions \| 0 failed`. Evidence `focus-repaired.log` |
-| 3 | `37f7f9aca` | the SUMS case, 20 consecutive runs | 0 x20 | **GREEN 20/20**, every run reporting `cases=1` so the filter is not silently empty. Table ratio min **1.021**, median **1.065**, max **1.464** against the bound of 2, at load 94-102. Evidence `ratios20.log` |
-| 4 | `37f7f9aca` | `ctest --test-dir build --output-on-failure` | see `## Now` | the full gate |
+| 2 | the landing tree | `./build/tests/test_ltx2_video -s -tc='<the four cases this row owns>'` | 0 | **GREEN.** `4 cases \| 4 passed \| 0 failed`, `1382 assertions \| 0 failed`. Evidence `focus-retreat.log` |
+| 3 | `ec3e7ac0c` | `build-test-cpu` on a clean GitHub runner — the same `ctest --test-dir build --output-on-failure` over all 583 tests | 0 | **GREEN.** Job `96719179235`. That is the lane `test_ltx2_video` was red in, on the idle low-load machine this box cannot imitate |
+| 4 | `361bbfb05` | `build-newest-gcc` | 0 | **GREEN**, having been RED at the Build step on every commit since `5702d8f83`; repaired here as #1565 |
+| 5 | `361bbfb05` | `ctest --test-dir build --output-on-failure`, locally | — | **VOID, not a failure.** `test_ltx2_video` reports `Subprocess terminated***Exception` at 796.58 s, and its own output ends `FATAL ERROR: test case CRASHED: SIGTERM` at case 26 of 104 with **`763 assertions \| 763 passed \| 0 failed`**. An external `SIGTERM` on a shared box is an infrastructure failure presenting as a code verdict, and it is neither a red nor a green |
+| 6 | the landing tree | the SUMS case, 20 consecutive runs of the WITHDRAWN bound | 0 x20 | recorded because it is the measurement that was not enough: 1.021 to 1.464, which a fresh reviewer then showed is the body of a distribution reaching 4.115 over 45 runs. Evidence `ratios20.log` |
 
 **Row 1's exact failures**, which are the red this row exists to remove:
 
@@ -631,51 +614,52 @@ by that number.
   values: CHECK( 0.00640374 >= 0.00645668 )
 ```
 
-**What row 2 reports where row 1 failed.** `denoise` coverage moves from
-**94.221% to 99.9685%** at nine frames and to 99.9872% at 81, because the
-sampler's per-step update now has a name. The four carrying leaves read, as
-`uncovered / leaf_instrument`:
+**Row 2 at the same two lines**, on the same floors, unedited:
 
-| leaf | 9 frames | 81 frames |
-|---|---:|---:|
-| `denoise` | 1.109 | 1.068 |
-| `decode.video` | 1.220 | 1.163 |
-| `decode.audio` | 1.056 | 1.071 |
-| `artifacts.frames` | 1.257 | 1.196 |
-
-A fresh review measured the same eight quantities independently at
-`ec3e7ac0c`, before the `Open`-progress-line charge landed, and read 1.02 to
-1.46. The bound is 2.
+```
+phase table: wall=4.59851s leaves=4.59671s unaccounted=0.00179039s instrument=0.00137401s over 46 entries
+  denoise = 1.91801s ... 16 sub-scope(s) cover 1.91684s (99.939%)
+```
 
 ### The mutations
 
-Five, all run by a **fresh reviewer** on `ec3e7ac0c` in its own worktree, each
-one restored with `git checkout --` and verified with an empty `git diff --stat`.
-The compile status is printed for each, because a mutation that fails to build
-reads as a passing test.
+Five, all run by a **fresh reviewer** in its own worktree at `ec3e7ac0c`, each
+restored with `git checkout --` and verified with an empty `git diff --stat`. The
+compile status is printed for each, because a mutation that fails to build reads
+as a passing test. **Two were run against the WITHDRAWN bound and their result no
+longer describes the landing tree; both are marked.**
 
 | mutation | built | reddened |
 |---|---|---|
-| **A** delete the `load.setup` production call site | `compile_status=0` | **YES.** The name list at `:3277` **and** the new residue bound at `:3326`, `CHECK( 0.0223456 <= 0.00844218 )` |
+| **A** delete the `load.setup` production call site | `compile_status=0` | **YES.** The name list at `:3277`, and the withdrawn residue bound at `:3326`, `CHECK( 0.0223456 <= 0.00844218 )` |
 | **B** delete the `denoise.update` anchor, keep its counter | `compile_status=0` | **YES.** The record count (0) at `:3678`, `0 == 8`, and `REQUIRE(!found.empty())` at `:3702` |
-| **C** `ChargeLocked` charges everything to the table | `compile_status=0` | **YES.** Four assertions: `:4978`, `:5004`, `:5020`, `:5086` |
-| **D** `denoise.update` moved below the two `PostProcessLatent` calls | `compile_status=0` | **YES, on one of the two renders.** The coverage bound at `:4122`, ratio 2.40 on one and 1.28 on the other |
-| **E** `Sum(records, Elapsed())` restored after the copy-and-sort | `compile_status=0` | **NO — green 10 of 10.** Recorded under `## Owed`, not explained away |
+| **C** `ChargeLocked` charges everything to the table | `compile_status=0` | **YES**, and still does after the withdrawal: `table_after_child == table_before_child`, `parent_instrument > 0.0` and `record_charge > 0.0` |
+| **D** `denoise.update` moved below the two `PostProcessLatent` calls | `compile_status=0` | **YES, 5 of 5 runs**, against the WITHDRAWN bound. **NOT detected on the landing tree** — see `### What this cost the gate` |
+| **E** `Sum(records, Elapsed())` restored after the copy-and-sort | `compile_status=0` | **NO — green 10 of 10.** A finding, not a pass; recorded as [#1569](https://github.com/mudler/vllm.cpp/issues/1569) |
 
-**Mutation A is the red-before evidence for the replacement**, and it is the row
-that `## Gates` promised and did not have. It reddens the NEW bound by 2.6x on a
-tree where the naming is gone and everything else is this row's, which is the
-same defect the old ratio was firing on — and it does so at a wall where the old
-ratio's 5% would have passed.
+**Mutation A is a SUBSTITUTE for the promised row, not that row.** The `## Gates`
+row that says "the NEW bound on the OLD tree" is not literally runnable, because
+`instrument_seconds` does not exist before this change. A instead restores the
+defect on a tree that is otherwise this row's, and reddens.
 
-**Mutation D is honest about its reach.** It reds on one render of two. The
-anchor stops covering the post-process, the uncovered part grows by exactly that
-work, and on the render where the leaf is larger the growth is still inside the
-budget. That is a partial detection, not a full one, and it is the same shape the
-`part_min_coverage` note already records for a half-covered anchor.
+**A's reach is stated rather than implied.** Its residue is 22.3 ms, and the old
+`leaves >= 0.95 * wall` permits 5% of wall — so A would ALSO have reddened the
+old floor at the 0.26271 s wall this row's baseline records, and passes it only
+above a 0.447 s wall. A therefore demonstrates that the naming is load-bearing.
+It demonstrates nothing about the withdrawn bound that the old floor could not.
 
-**Mutation E is a finding, not a pass.** It is F2 above: `WriteJson`'s clock
-ordering is a reading of the source and no assertion sees it.
+**Two further mutations, by the same reviewer, on the assertions that replaced
+the conservation case's withdrawn ratio.** Deleting `ChargeLocked`'s
+`instrument_gap += to - from;` fall-through reds `table_charge > 0.0`; starting
+the `Close` tail charge at the record's START instead of its end reds
+`unaccounted >= table_charge - 1e-9` by 163x. The second is caught by nothing
+else in the change.
+
+**And one mutation that measured a line to be worthless.** Deleting `Open`'s head
+charge left the `unit.parent` case green **100 of 100**, with a median
+statistically identical to the unmutated one. That site had no unique detection
+power at either constant, which is part of why the ratios there are reported now
+rather than asserted.
 
 ### A trap that is named rather than engineered around
 
@@ -714,5 +698,20 @@ that change's own text says did not exist.
 
 ## Now
 
-`ACTIVE`. Spec committed; implementation follows in the same pull request, in
-commit order.
+`DONE`. Landed as pull request
+[#1556](https://github.com/mudler/vllm.cpp/pull/1556) on `row/LTX25-PHASE-RESIDUE`.
+
+The gate report is in `## Outcome` under `### The gate report`. The two verdicts
+that decide this row:
+
+* **`build-test-cpu` on a clean GitHub runner: GREEN at ec3e7ac0c, job 96719179235.** That is the lane
+  `test_ltx2_video` was red in, running the same `ctest --test-dir build
+  --output-on-failure` over all 583 tests, on the idle low-load machine this
+  box cannot imitate. It ran at `ec3e7ac0c`; every commit after it either removes
+  an assertion or adds instrument charge, and neither can turn that green red.
+* **`ctest --test-dir build --output-on-failure` locally: VOID -- test 71 was killed by an external SIGTERM at case 26 of 104 with 763/763 assertions passing; an infrastructure failure is neither a red nor a green**, at load
+  average 85-105 with three to five other sessions running the same suite.
+
+`windows-msvc-cpu` and `windows-msvc-vulkan` fail on this pull request and on all
+ten of the last `main` baselines, and have no green to compare against. They are
+not this row's.
