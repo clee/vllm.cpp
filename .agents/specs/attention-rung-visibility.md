@@ -217,6 +217,27 @@ requires a non-trivial reason string and cannot judge it. That is the same floor
 `check-fusion-consistency.py` sets with its allowlist reasons. A reviewer judges
 the reason; the gate only guarantees one was written.
 
+**D6 — the detected population is one literal spelling, and that is stated.**
+The scan matches `vt::Attention(` in a model `.cpp` or `.h`. Four spellings reach
+the same kernel and are NOT detected — a `using vt::Attention;` plus a bare call, a
+namespace alias, a `#define`, and a call through `&vt::Attention` — each verified
+during review to leave the checker green with a live unmarked call. None exists in
+this tree and none is how attention is called here, so this is a stated bound and
+not a live hole. Widening the regex was rejected: dropping the `vt::` prefix makes
+every fast rung a site, which is D1's failure mode again, and no regex reaches a
+function pointer at all. Closing it needs a compiler-side population (the op
+registry, or clang tooling over the real translation unit), which is a different
+instrument and not this row's scope. The checker's docstring says so, so a green
+reads as "no unmarked `vt::Attention(` call" and never as "no model is naive".
+
+**D7 — the allowlist's stem set is pinned by a test, in another file.** D4 says the
+CHECKER never forces a removing row to edit the allowlist, and that is still true.
+`test_allowlist_holds_only_the_in_flight_stems` does force it: the expected set is
+pinned, so adding or deleting a stem reds that case until the test is updated in
+the same change. That is the intended shape for a parking lot — growth must be a
+review decision — but it is a coupling a reader of the allowlist alone would not
+see, so the allowlist header and the checker docstring both name the test.
+
 **R1 — the launcher refusal is not executed on this box.** The pure arithmetic is
 tested and mutated here, but nothing on a CPU-only box proves the launcher CALLS
 it. A reviewer's reachability mutation for that leg needs a CUDA device. Stated,
@@ -236,5 +257,13 @@ would be a regression rather than a repair.
 
 ## Now
 
-The change is written and CPU-gated. The next step is the fresh scoped review, and
-after it the single owed leg above, which needs whoever next holds a lease.
+The change is written, CPU-gated and through one fresh scoped review, whose
+findings are repaired here: the new checker registers its disabled creation-
+mutation stub in `check-pr-size.py` (measured 31 of 31 cases red under the stub);
+the kernel's register blocking is hoisted to `kFlashMaxPerLane` at file scope so
+the `static_assert` reads the constant the kernel uses instead of the literal `8`;
+the launcher's comment no longer claims the guard and the shared-memory request
+come from one function; the checker states the four spellings it does not detect
+and reports how many sites are unmarked and excused; and the kernel-matrix cell no
+longer stores this suite's case count. The single owed leg above still needs
+whoever next holds a lease.

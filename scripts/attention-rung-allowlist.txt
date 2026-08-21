@@ -17,6 +17,15 @@
 # routes the call to a fast rung, is the enforcement closing. The checker reports
 # a stem whose sites are gone or now marked as STALE and does NOT fail on it, so
 # the removing row is free to leave the deletion to whoever runs preflight next.
+#
+# The CHECKER does not fail on it. A TEST does, and it lives in another file:
+# tests/scripts/test_check_attention_rung_consistency.py
+# ::ShippedTreeTests::test_allowlist_holds_only_the_in_flight_stems pins this set
+# exactly, so adding OR deleting a stem here reds that case until the expected set
+# is updated in the same change. That is deliberate -- growth of a parking lot must
+# be a review decision and not a silent edit -- but it means "the removing row owes
+# this file nothing" is true of the checker only. A row that deletes its stem edits
+# that test too.
 
 # --- IN FLIGHT: the naive call is the defect, and another row is removing it ---
 muse_glimmer_vision   # 50 layers, H=16, head_dim=96, non-causal, sole path, no knob.

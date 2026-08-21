@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fail if a model names the NAIVE attention kernel without saying why.
+r"""Fail if a model names the NAIVE attention kernel without saying why.
 
 `vt::Attention` resolves `OpId::kAttention` (`src/vt/ops.cpp`) straight to
 `AttentionKernel` (`src/vt/cuda/cuda_ops.cu`), self-described there as
@@ -33,13 +33,36 @@ ordinary case touches no shared file. `scripts/attention-rung-allowlist.txt`
 carries only stems whose naive call is being REMOVED by a row already in flight —
 editing the very lines those changes replace would conflict for no gain. An
 allowlisted stem whose sites are all marked or gone is reported as STALE and does
-NOT fail, so the row that cleans it up owes this file nothing.
+NOT fail HERE, so the CHECKER never forces the row that cleans it up to edit this
+file. A test does: the expected stem set is pinned in
+tests/scripts/test_check_attention_rung_consistency.py, which the allowlist's own
+header says, so growth of that file stays a review decision.
 
 Text the compiler never sees is not a call site: the scan runs over
 `scripts/checker_text.py::normalize_source`, so a commented-out, `#if 0`-ed or
 `if (false)`-ed `vt::Attention(` is a deletion here, exactly as it is to nvcc.
 That normalization is position-preserving, so every reported `file:line` still
 describes the original file.
+
+What this checker DETECTS, stated as a limit rather than implied by a green:
+one literal spelling, `vt::Attention(`, in a model `.cpp` or `.h`. Four spellings
+reach the same kernel and are NOT detected, each verified to leave the checker
+green with a live unmarked call:
+
+    using vt::Attention;   then a bare  Attention(...)
+    namespace vv = vt;     then         vv::Attention(...)
+    #define MUT_ATTN vt::Attention
+    auto* fn = &vt::Attention;          then a call through `fn`
+
+None exists in this tree, and the repository does not write attention calls that
+way, so this is a stated bound and not a live hole. Widening the regex is not the
+repair: `\bAttention\s*\(` also matches every fast rung's suffix-free form and
+would demand a marker beside exactly the calls this checker wants people to make,
+and no regex reaches a call through a function pointer at all. What closes it is a
+compiler-side population — the CUDA op registry, or a clang tooling pass over the
+real translation unit — which is a different instrument, not a longer pattern. A
+green here therefore means "no unmarked `vt::Attention(` call", never "no model is
+on the naive rung".
 
 The validation logic is pure functions (`scan_file`, `drift_sites`,
 `stale_allowlist_entries`) so it is unit- and mutation-testable
@@ -226,10 +249,22 @@ def main() -> int:
 
     sites = sum(len(v) for v in scanned.values())
     marked = sum(1 for v in scanned.values() for _, m in v if m)
+    # The number a reader of a green actually needs: sites that carry NO reason and
+    # pass only because their stem is allowlisted. `sites - marked` is not it, because
+    # a marked call inside an allowlisted file counts in `marked`. This is the debt the
+    # green is hiding, so it is printed even when it is zero.
+    excused = sum(
+        1
+        for path, sites_in_file in scanned.items()
+        if Path(path).stem in allowlisted
+        for _, m in sites_in_file
+        if not m
+    )
     print(
         f"OK (attention rung): {sites} vt::Attention call site(s) in "
         f"{len(scanned)} model source file(s); {marked} carry a recorded reason, "
-        f"{len(allowlisted)} stem(s) allowlisted as in-flight."
+        f"{excused} unmarked and excused by "
+        f"{len(allowlisted)} allowlisted in-flight stem(s)."
     )
     return 0
 

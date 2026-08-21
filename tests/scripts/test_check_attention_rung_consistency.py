@@ -10,7 +10,9 @@ checker exists to catch and requires the checker to go RED.
 
 from __future__ import annotations
 
+import contextlib
 import importlib.util
+import io
 import sys
 import unittest
 from pathlib import Path
@@ -243,6 +245,62 @@ class MutationTests(unittest.TestCase):
         # is caught in this suite instead of as an unexplained mass failure.
         self.assertIsNone(mod._NAIVE_CALL.search("vt::AttentionDenseFlash(a);"))
         self.assertIsNotNone(mod._NAIVE_CALL.search("vt::Attention (a);"))
+
+
+class GreenReportTests(unittest.TestCase):
+    """What the OK line tells a reader who never opens the allowlist.
+
+    A green that prints only "9 sites, 6 marked" reads as three unaccounted sites
+    or as nothing at all, depending on whether the reader does the subtraction. The
+    number that matters is how many sites carry NO reason and pass anyway, and it
+    is not `sites - marked`: a marked call inside an allowlisted file counts in
+    `marked`. Nothing asserted this line before, so the count could be dropped or
+    silently go wrong without a red.
+    """
+
+    def report(self) -> str:
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            code = mod.main()
+        self.assertEqual(code, 0, buffer.getvalue())
+        return buffer.getvalue()
+
+    def test_the_ok_line_reports_the_excused_sites(self) -> None:
+        scanned = mod.scan_models()
+        allowed = mod.allowlisted_names(ALLOWLIST.read_text(encoding="utf-8"))
+        excused = sum(
+            1
+            for path, sites in scanned.items()
+            if Path(path).stem in allowed
+            for _, marked in sites
+            if not marked
+        )
+        self.assertGreater(excused, 0, "the shipped tree must exercise this branch")
+        self.assertIn(f"{excused} unmarked and excused by", self.report())
+
+    def test_the_excused_count_is_not_sites_minus_marked(self) -> None:
+        # The subtraction a reader would do by hand, and why the checker must not.
+        # A marked site in an allowlisted file lands in `marked`, so the difference
+        # under-reports the debt. This pins the two as separately derived.
+        scanned = {
+            "src/vllm/model_executor/models/ltx2.cpp": [(10, False), (20, True)],
+            "src/vllm/model_executor/models/whisper_audio.cpp": [(30, True)],
+        }
+        allowed = {"ltx2"}
+        excused = sum(
+            1
+            for path, sites in scanned.items()
+            if Path(path).stem in allowed
+            for _, marked in sites
+            if not marked
+        )
+        sites = sum(len(v) for v in scanned.values())
+        marked = sum(1 for v in scanned.values() for _, m in v if m)
+        self.assertEqual(excused, 1)
+        self.assertEqual(sites - marked, 1)
+        # They agree HERE only because the allowlisted file's other site is marked
+        # and cancels; drop that site and they diverge, which is the point.
+        self.assertEqual(mod.drift_sites(scanned, allowed), [])
 
 
 if __name__ == "__main__":
