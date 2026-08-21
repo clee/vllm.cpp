@@ -76,6 +76,18 @@ DBuf DflashLogitsF32D(Dev d, const Tensor& x, const Qwen3DFlashWeights& weights,
              "#1628 (https://github.com/mudler/vllm.cpp/issues/1628).");
     return dense_nvfp4::MatmulNvfp4W4A16D(d, x, weights.lm_head_fp4, DType::kF32);
   }
+  // EXACTLY ONE owner is populated, and neither being populated is a LOADER
+  // defect rather than a user error -- so it is named here instead of read as an
+  // empty tensor. Found by this row's own reachability mutation: deleting the
+  // packed branch above made the packed case reach `ResidentWeight` with an
+  // empty `lm_head` and SEGFAULT, which is a red the suite cannot explain. A
+  // named refusal is the same red with the reason attached.
+  VT_CHECK(!weights.lm_head.Empty(),
+           "dflash: the draft's SHARED lm_head is empty in BOTH owners. The draft "
+           "runs the TARGET's head, so the loader fills exactly one of "
+           "`lm_head` (raw-NK bf16) and `lm_head_fp4` (packed NVFP4) -- see "
+           "LoadDflashSharedLmHead (qwen3_dflash.h), issue #1628 "
+           "(https://github.com/mudler/vllm.cpp/issues/1628).");
   Tensor lm = ResidentWeight(d, weights.lm_head, {vocab, hidden_size});
   DBuf logits(d, DType::kF32, {x.shape[0], vocab});
   vt::MatmulBT(d.q, logits.t(), x, lm);
