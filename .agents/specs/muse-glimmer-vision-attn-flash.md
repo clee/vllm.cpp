@@ -148,8 +148,11 @@ Arithmetic, at `Q * H * K_eff` iterations and the 5.70 ns/iteration GB10
 constant stated in [#1544](https://github.com/mudler/vllm.cpp/issues/1544) and
 derived there from `.agents/specs/multimodal-speed.md:24-26`, which records 56 ms
 per block over 784 patches and 16 heads rather than the constant itself
-(`56e-3 / (784 * 16 * 784) = 5.694e-9`). The second anchor and the head_dim 64
-and 72 provenance are in that issue too, not in this tree:
+(`56e-3 / (784 * 16 * 784) = 5.694e-9`). The head_dim 64 and 72 provenance is in
+that issue too. The tree holds the second anchor's underlying measurement at
+`.agents/benchmark-record.md:4654` — the Voxtral Whisper encoder forward over
+1500 frames and 32 layers at 8870 ms — and only the 8.21 s prediction and the
+"within 7%" comparison are the issue's alone:
 
     reading A: 13 x (16384 x 16 x 16384)              = 5.583e10
              + 37 x (16 x (1024 x 16 x 1024))         = 9.932e9
