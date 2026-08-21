@@ -3624,6 +3624,179 @@ void DFlashGroupedConvKernelCuda(Queue& q, Tensor& out, const Tensor& x,
   VT_CHECK(cudaGetLastError() == cudaSuccess, "cuda dflash2-grouped-conv: launch failed");
 }
 
+// ---------------------------------------------------------------------------
+// DFlash2 candidate-selector edge lattice (SPEC-DFLASH2 W3, #1314) — the CUDA
+// MIRROR of the CPU reference `Dflash2SelectorEdgesKernel` (cpu_ops.cpp), which
+// carries the full port note and the upstream anchor.
+//
+// One block per (request, step, predecessor slot). The block first materializes
+// upstream's `predecessors * hidden[:, :, None]` for its own slot into dynamic
+// shared memory — rounded to the codebook dtype, because upstream materializes
+// that tensor — and then block-reduces one rank contraction per child candidate.
+//
+// UNLIKE vt::DFlashGroupedConv this kernel is NOT bit-identical to the CPU
+// reference and is not specified to be: the rank contraction is a REDUCTION, and
+// this tree reduction sums in a different order than the CPU reference's serial
+// loop. It is gated within an f32 envelope. The two ROUNDING PLACEMENTS are
+// still exact — the elementwise product and the single round of the completed
+// sum — because those are what upstream's materializations pin.
+template <typename T>
+__global__ void Dflash2SelectorEdgesKernel(float* scores, const T* pred_codebook,
+                                           const T* succ_codebook, const int64_t* cand,
+                                           const float* unary, const T* hidden,
+                                           const int64_t* anchors, int64_t L, int64_t K,
+                                           int64_t R) {
+  extern __shared__ float gated[];
+  const int64_t slot = blockIdx.x;
+  const int64_t p = slot % K;
+  const int64_t idx = slot / K;  // flattened (b, l)
+  const int64_t b = idx / L, l = idx - b * L;
+  const int64_t pid = (l == 0) ? anchors[b] : cand[(b * L + (l - 1)) * K + p];
+  for (int64_t r = threadIdx.x; r < R; r += blockDim.x)
+    gated[r] = ResRound<T>(__fmul_rn(Load(pred_codebook, pid * R + r),
+                                     Load(hidden, idx * R + r)));
+  __syncwarp();
+  for (int64_t c = 0; c < K; ++c) {
+    const int64_t cid = cand[idx * K + c];
+    float acc = 0.0f;
+    for (int64_t r = threadIdx.x; r < R; r += blockDim.x)
+      acc += gated[r] * Load(succ_codebook, cid * R + r);
+    // ONE WARP per block, so the contraction reduces with __shfl_xor_sync and
+    // needs no shared scratch and no __syncthreads inside this loop.
+    for (int off = 16; off > 0; off >>= 1) acc += __shfl_xor_sync(0xFFFFFFFFu, acc, off);
+    if (threadIdx.x == 0)
+      scores[idx * K * K + p * K + c] = unary[idx * K + c] + ResRound<T>(acc);
+  }
+}
+
+void Dflash2SelectorEdgesKernelCuda(Queue& q, Tensor& scores, const Tensor& pred_codebook,
+                                    const Tensor& succ_codebook, const Tensor& candidate_ids,
+                                    const Tensor& unary, const Tensor& hidden,
+                                    const Tensor& anchors,
+                                    const Dflash2SelectorEdgesArgs& args) {
+  const int64_t B = candidate_ids.shape[0], L = candidate_ids.shape[1];
+  const int64_t K = args.top_k, R = pred_codebook.shape[1];
+  const int64_t blocks = B * L * K;
+  if (blocks == 0) return;
+  constexpr int kThreads = 32;  // ONE warp: the contraction reduces by shuffle
+  const size_t shared = static_cast<size_t>(R) * sizeof(float);
+  cudaStream_t s = AsStream(q);
+  switch (pred_codebook.dtype) {
+    case DType::kF32:
+      Dflash2SelectorEdgesKernel<float>
+          <<<static_cast<unsigned>(blocks), kThreads, shared, s>>>(
+              scores.Ptr<float>(), pred_codebook.Ptr<float>(), succ_codebook.Ptr<float>(),
+              candidate_ids.Ptr<int64_t>(), unary.Ptr<float>(), hidden.Ptr<float>(),
+              anchors.Ptr<int64_t>(), L, K, R);
+      break;
+    case DType::kBF16:
+      Dflash2SelectorEdgesKernel<__nv_bfloat16>
+          <<<static_cast<unsigned>(blocks), kThreads, shared, s>>>(
+              scores.Ptr<float>(), pred_codebook.Ptr<__nv_bfloat16>(),
+              succ_codebook.Ptr<__nv_bfloat16>(), candidate_ids.Ptr<int64_t>(),
+              unary.Ptr<float>(), hidden.Ptr<__nv_bfloat16>(), anchors.Ptr<int64_t>(), L, K, R);
+      break;
+    default:
+      VT_CHECK(false, "cuda dflash2-selector-edges: unsupported dtype (f32/bf16 only)");
+  }
+  VT_CHECK(cudaGetLastError() == cudaSuccess, "cuda dflash2-selector-edges: launch failed");
+}
+
+// MIRROR of the CPU reference `Dflash2PathWalkKernel` (cpu_ops.cpp), which
+// carries the full port note. `Dflash2PathWalkArgs` (include/vt/ops.h) carries
+// the contract.
+//
+// ONE BLOCK PER REQUEST, which is upstream's own grid: `_selector_walk_kernel`
+// launches `(num_reqs,)` programs with `num_warps=1` and keeps the step loop
+// INSIDE the program, so a k-token block costs one launch instead of k. Spec
+// `## Risks/decisions` D3 requires that shape from the first landing -- the same
+// sequential walk shipped host-side in DSpark and measured 28% of the 27B draft
+// step (#436) before it was moved.
+//
+// The block is one warp. `previous` is a per-thread register that every lane
+// computes identically from the same shuffle reduction, so the carry needs no
+// shared memory and no __syncthreads: after the __shfl_xor_sync butterfly every
+// lane holds the same winner.
+//
+// BIT-EXACT with the CPU arm by construction, unlike Dflash2SelectorEdgesKernel:
+// there is no arithmetic here to reorder, only comparisons and a gather. The
+// reduction is seeded the same way on both arms (-inf with slot index `top_k`,
+// strict `>`), which is what makes the all -inf row, the tie rows and a
+// NaN-bearing row agree rather than merely usually agreeing.
+//
+// WHERE THE TIE RULE LIVES IS NOT ARBITRARY. The per-lane scan is STRICT ONLY,
+// because `j` ascends within a lane and a strict `>` therefore already keeps
+// the LOWEST-indexed maximum -- the CPU arm's answer, reached the CPU arm's
+// way. The lower-slot preference belongs to the cross-lane BUTTERFLY, which
+// combines lane winners in no particular slot order and would otherwise resolve
+// a tie by lane geometry. Until W4's fresh review the lane scan ALSO carried
+// `|| (v == best && j < slot)`. That clause is unreachable once a lane has
+// claimed anything, so its only effect was at the SEED: a lane holding -inf
+// compared equal to the -inf seed and claimed a slot, which the CPU arm's
+// strict scan refuses. On a NaN-bearing row the arms then answered differently
+// (`[NaN,-inf]` read cpu 0 / cuda 1) while every NaN-free row still agreed, so
+// no fixture without a NaN could see it. The clause is deleted rather than the
+// bit-exactness claim narrowed. THE DELETION IS VERIFIED, and #1518 corrects an
+// earlier sentence here calling it unverified: this translation unit is
+// compiled for ten architectures by CI's `build-cuda-fat` job on every pull
+// request, and the operator RAN `test_ops_dflash2_path_walk` on `dgx:gpu0`
+// (GB10, sm_121a) at the W4 merge commit -- 83 assertions on device against 49
+// on CPU, `Status: SUCCESS!`, zero `no CUDA backend; skipping` lines, the NaN
+// row among them. The AUTHORING HOST has no `nvcc` and still skips the case
+// locally, and the remainder of `## Owed` O11 in
+// .agents/specs/dflash2-spec-decode.md stands.
+__global__ void Dflash2PathWalkKernel(int64_t* tokens, const float* scores,
+                                      const int64_t* cand, int64_t L, int64_t K) {
+  const int64_t b = blockIdx.x;
+  const int lane = static_cast<int>(threadIdx.x);
+  const int width = static_cast<int>(blockDim.x);
+  int64_t previous = 0;
+  for (int64_t l = 0; l < L; ++l) {
+    const int64_t flat = b * L + l;
+    const float* row = scores + (flat * K + previous) * K;
+    float best = -CUDART_INF_F;
+    int slot = static_cast<int>(K);
+    for (int64_t j = lane; j < K; j += width) {
+      const float v = row[j];
+      // STRICT `>` and nothing else, which is the CPU arm's own scan: `j`
+      // ascends, so the first maximum a lane meets is the lowest-indexed one it
+      // holds. A `v == best` arm here would let a lane claim a slot on the -inf
+      // seed, which is where the two arms used to part on a NaN row.
+      if (v > best) {
+        best = v;
+        slot = static_cast<int>(j);
+      }
+    }
+    // The lower slot wins an exact tie HERE, because lanes combine out of slot
+    // order. `best == -inf` implies `slot == top_k` on every lane (the strict
+    // scan above never claims on -inf), so the tie arm compares real slots or
+    // two seeds and never a real slot against a seed.
+    for (int off = 16; off > 0; off >>= 1) {
+      const float ov = __shfl_xor_sync(0xFFFFFFFFu, best, off);
+      const int os = __shfl_xor_sync(0xFFFFFFFFu, slot, off);
+      if (ov > best || (ov == best && os < slot)) {
+        best = ov;
+        slot = os;
+      }
+    }
+    if (slot == static_cast<int>(K)) slot = 0;  // an all -inf (fully masked) row
+    previous = slot;
+    if (lane == 0) tokens[flat] = cand[flat * K + slot];
+  }
+}
+
+void Dflash2PathWalkKernelCuda(Queue& q, Tensor& tokens, const Tensor& scores,
+                               const Tensor& candidate_ids,
+                               const Dflash2PathWalkArgs& args) {
+  const int64_t B = candidate_ids.shape[0], L = candidate_ids.shape[1];
+  const int64_t K = args.top_k;
+  if (B == 0 || L == 0) return;
+  constexpr int kThreads = 32;  // ONE warp: the argmax reduces by shuffle
+  Dflash2PathWalkKernel<<<static_cast<unsigned>(B), kThreads, 0, AsStream(q)>>>(
+      tokens.Ptr<int64_t>(), scores.Ptr<float>(), candidate_ids.Ptr<int64_t>(), L, K);
+  VT_CHECK(cudaGetLastError() == cudaSuccess, "cuda dflash2-path-walk: launch failed");
+}
+
 // Registers the CUDA kernels during static init (pre-main, like the CPU ops).
 // Filling the op table is harmless on machines without a GPU: the kCUDA
 // backend never registers there, so no CUDA queue can exist to dispatch with.
@@ -3678,6 +3851,12 @@ struct Registrar {
     RegisterOp(OpId::kDFlashGroupedConv, DeviceType::kCUDA,
                reinterpret_cast<void*>(
                    static_cast<DFlashGroupedConvFn>(&DFlashGroupedConvKernelCuda)));
+    RegisterOp(OpId::kDflash2PathWalk, DeviceType::kCUDA,
+               reinterpret_cast<void*>(
+                   static_cast<Dflash2PathWalkFn>(&Dflash2PathWalkKernelCuda)));
+    RegisterOp(OpId::kDflash2SelectorEdges, DeviceType::kCUDA,
+               reinterpret_cast<void*>(
+                   static_cast<Dflash2SelectorEdgesFn>(&Dflash2SelectorEdgesKernelCuda)));
   }
 } registrar;
 
