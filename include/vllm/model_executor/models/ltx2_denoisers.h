@@ -141,8 +141,15 @@ struct Ltx2GuidedDenoiseInputs {
   int64_t num_blocks = 0;
 
   int64_t step_index = 0;
-  // `force_uncond_pass` (`:76`, read at `:102-103`). `RetakePipeline` is the one
-  // upstream caller that sets it (retake.py:305-311).
+  // `force_uncond_pass` (denoisers.py:74, read at `:102-103`). NO upstream
+  // caller enables it at `fd4ded7f`. It is a CFG++ affordance: it runs the
+  // uncond pass when `cfg_scale = 1.0` and the uncond prediction is still
+  // needed for the ODE derivative (`packages/ltx-pipelines/CLAUDE.md:76`).
+  // Upstream declares it and threads it through `GuidedDenoiser` (`:267,273`,
+  // forwarded at `:297`) and `FactoryGuidedDenoiser` (`:313,319`, forwarded at
+  // `:357`), and every construction site takes the `False` default —
+  // `RetakePipeline` (retake.py:305-311) included. This field mirrors that
+  // unused plumbing, so nothing in this tree assigns it either.
   bool force_uncond_pass = false;
 
   // `_last_denoised_video` / `_last_denoised_audio` (denoisers.py:274-275). Null
