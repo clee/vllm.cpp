@@ -5006,23 +5006,38 @@ TEST_CASE("ltx2 phase log: the instrument charges its own cost to the innermost 
                     << "s although eight children opened and closed inside it. This is the "
                        "quantity the coverage gate is measured against");
 
-  // (4) AND THE CHARGE IS THE WHOLE OF THE UNCOVERED PART. Nothing but the
+  // (4) AND THE CHARGE IS THE SAME ORDER AS THE UNCOVERED PART. Nothing but the
   // instrument runs inside `unit.parent` and outside `unit.child`, so the
-  // uncovered time IS the charge — which is the claim the coverage gate rests
-  // on, stated here where no model work can blur it. The budget is the same
-  // `kInstrumentBudget` the gates use, so a factor that stopped covering the
-  // un-instrumented remainder of a boundary reds HERE first, in eleven lines,
-  // rather than in a forty-second render.
+  // uncovered time here is boundary cost and nothing else. What this catches is
+  // an accounting that still returns a positive number while under-counting by
+  // an order of magnitude — the shape the `REQUIRE` above cannot see.
+  //
+  // IT IS NOT `kInstrumentBudget`, AND THE REASON IS MEASURED. The first version
+  // of this line reused the gates' own factor of 2, on the argument that a
+  // budget which stopped covering a boundary would red here first, in eleven
+  // lines, rather than in a forty-second render. That argument is wrong, and
+  // running it is how it was found: THIS timeline is the WORST-conditioned probe
+  // of that ratio in the file, not the tightest. A render's boundaries carry a
+  // `Tick` and a `/proc/self/statm` read INSIDE the instrumented region, so the
+  // measured part of each gap dominates; eight bare scopes carry neither, so the
+  // un-instrumented remainder — the `std::string` the caller builds for the
+  // scope name, the call and the return — is a far larger share. Measured on one
+  // box: 1.21 quiet and 1.87 at load average 98, against 1.06 to 1.42 for the
+  // four carrying leaves of an actual render on the same runs. Shipping the
+  // factor of 2 here would have been a NEW flake at 7% margin, which is the
+  // defect this whole row exists to remove.
+  const double kUnitBackstop = 10.0;
   const double uncovered = parent_duration - child_total;
   MESSAGE("unit.parent = " << parent_duration << "s, children " << child_total
                            << "s, uncovered " << uncovered << "s, charged " << parent_instrument
                            << "s (ratio " << (uncovered / parent_instrument) << ")");
-  CHECK_MESSAGE(uncovered <= kInstrumentBudget * parent_instrument,
+  CHECK_MESSAGE(uncovered <= kUnitBackstop * parent_instrument,
                 "the parent leaf has " << uncovered << "s inside no child and the instrument "
                     << "charged itself only " << parent_instrument
                     << "s of it, although this case runs NOTHING inside the parent but the "
-                       "child scopes. The accounting is missing part of its own boundary cost, "
-                       "and every bound derived from it is that much too tight");
+                       "child scopes. At an order of magnitude apart the accounting is not "
+                       "measuring the boundary it is supposed to measure, and every bound "
+                       "derived from it is that much too tight");
   log.Reset();
 }
 

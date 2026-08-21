@@ -61,6 +61,13 @@
 #include <string>
 #include <vector>
 
+// `::getpid()` at the `ScratchSafetensors` temporary path below (#1565). Older
+// libstdc++ headers pull this in transitively and the newest GCC does not, which
+// left `build-newest-gcc` red at the BUILD step on `main` and therefore on every
+// pull request based on it. Unguarded, which is what the sibling
+// `tests/vllm/multimodal/test_ltx2_video.cpp` does for the same call.
+#include <unistd.h>
+
 #include <nlohmann/json.hpp>
 
 #include "../gguf_builder.h"
