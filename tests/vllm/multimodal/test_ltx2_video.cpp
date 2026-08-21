@@ -3797,6 +3797,16 @@ void CheckCarryingPhase(const nlohmann::json& table, const Carrying& c) {
   for (const std::vector<double>& s : part_starts) {
     if (s.size() != part_starts.front().size()) equal_counts = false;
   }
+  // THE SKIP IS ANNOUNCED. `equal_counts` is derived from the emitted table, so
+  // a change that made two parts of one leaf emit different numbers of records
+  // would turn this assertion off and print nothing — an absent hook that looks
+  // exactly like an armed one. Assertion (0) is what would catch that change,
+  // and this line is what tells a reader which of the two is speaking.
+  if (!equal_counts && c.parts.size() > 1) {
+    MESSAGE("  (1b') SKIPPED for '" << c.leaf
+                                    << "': its parts emit different record counts, so the "
+                                       "per-record pairing is not defined. (0) is what binds.");
+  }
   if (equal_counts) {
     for (size_t rec = 0; rec < part_starts.front().size(); ++rec) {
       for (size_t i = 1; i < part_starts.size(); ++i) {
@@ -4467,14 +4477,30 @@ void CheckRenderPhases(const nlohmann::json& table,
        // moves one of them and not the other.
        {trace.dit_evaluations, trace.sampler_updates},
        "Ltx2ConditioningTrace::dit_evaluations and ::sampler_updates",
-       // NEITHER PART CARRIES A (2b) FLOOR, and the reason is measured rather
-       // than assumed. The two hold 94.2% and 5.8% of the leaf at nine frames
-       // and 93.0% and 7.0% at 81 — one order apart, where the `decode.audio`
-       // vocoder's 0.50 floor exploits four to five. A floor that separated the
-       // honest split from a transfer here would sit inside the honest
-       // distribution's own scatter, which is the defect this whole row exists
-       // to remove. What holds the pair instead is (1b'): a transfer between two
-       // ALTERNATING names cannot preserve the alternation.
+       // NEITHER PART CARRIES A (2b) FLOOR, AND THE PAIR IS THEREFORE OPEN TO
+       // A SECONDS TRANSFER. That is a disclosed hole, not a closed one, and
+       // this note said the opposite until a fresh review checked it.
+       //
+       // WHY NO FLOOR CAN BE SET. `denoise.update` holds 5.8% of the leaf at
+       // nine frames and 7.0% at 81 on a quiet box — but the same quantity,
+       // measured on an UNANCHORED `denoise` across four boxes including the
+       // GitHub runner, ranged from 0.45% to 11.15% (the population `6b48edb2c`
+       // recorded as 99.55% down to 88.85% coverage). Under a transfer it is
+       // ~0%. The honest distribution spans an order of magnitude and its bottom
+       // touches the defective value, so no floor separates them — the same
+       // finding `decode.audio.mel`'s 0.0 records for its own pair, and the
+       // reason a third threshold is not the repair here either.
+       //
+       // AND (1b') DOES NOT CLOSE IT, WHICH IS WHAT THIS NOTE GOT WRONG.
+       // (1b') compares `start_seconds` ONLY. Leaving `denoise.step` open across
+       // the post-process and the Euler step and emitting `denoise.update` as an
+       // empty scope after it preserves the alternation exactly, preserves both
+       // counters, containment, non-overlap, exclusivity, (1c) and (2), and
+       // moves 100% of the decomposed seconds onto one name. That is R1b, the
+       // transfer shape this file already documents. It is recorded under
+       // `## Owed` in `.agents/specs/ltx25-phase-residue.md` rather than claimed
+       // closed, because closing it needs an anchor INSIDE the callee and that
+       // is the same debt the anchor table's third row carries for all six.
        {0.0, 0.0},
        render},
       {"decode.video",
@@ -5006,58 +5032,77 @@ TEST_CASE("ltx2 phase log: the instrument charges its own cost to the innermost 
                     << "s although eight children opened and closed inside it. This is the "
                        "quantity the coverage gate is measured against");
 
-  // (4) AND THE CHARGE IS THE SAME ORDER AS THE UNCOVERED PART. Nothing but the
-  // instrument runs inside `unit.parent` and outside `unit.child`, so the
-  // uncovered time here is boundary cost and nothing else. What this catches is
-  // an accounting that still returns a positive number while under-counting by
-  // an order of magnitude — the shape the `REQUIRE` above cannot see.
+  // (4) AND WHAT IS **NOT** ASSERTED HERE, WHICH A FRESH REVIEW MEASURED.
   //
-  // IT IS NOT `kInstrumentBudget`, AND THE REASON IS MEASURED. The first version
-  // of this line reused the gates' own factor of 2, on the argument that a
-  // budget which stopped covering a boundary would red here first, in eleven
-  // lines, rather than in a forty-second render. That argument is wrong, and
-  // running it is how it was found: THIS timeline is the WORST-conditioned probe
-  // of that ratio in the file, not the tightest. A render's boundaries carry a
-  // `Tick` and a `/proc/self/statm` read INSIDE the instrumented region, so the
-  // measured part of each gap dominates; eight bare scopes carry neither, so the
-  // un-instrumented remainder — the `std::string` the caller builds for the
-  // scope name, the call and the return — is a far larger share. Measured on one
-  // box: 1.21 quiet and 1.87 at load average 98, against 1.06 to 1.42 for the
-  // four carrying leaves of an actual render on the same runs. Shipping the
-  // factor of 2 here would have been a NEW flake at 7% margin, which is the
-  // defect this whole row exists to remove.
-  const double kUnitBackstop = 10.0;
+  // This case shipped, twice, with a ratio assertion on
+  // `uncovered / parent_instrument` — first at `kInstrumentBudget` (2) on the
+  // argument that a budget which stopped covering a boundary would red in eleven
+  // lines rather than in a forty-second render, then at an order-of-magnitude
+  // backstop when a green run measured 1.87 against that 2. A fresh review then
+  // measured the thing properly, and BOTH numbers were wrong:
+  //
+  //   * the shipped binary reddened **2 of 200 consecutive runs** at load
+  //     average 85, at `CHECK( 0.000139078 <= 0.000127042 )`;
+  //   * a standalone probe of this exact shape reddened 0/40 at load 70, 3/40 at
+  //     load 94 and **28/160 at load 125**, reaching 5.55;
+  //   * under `-fsanitize=address,undefined` it reached **14.1**.
+  //
+  // So the backstop would have flaked too, and the mechanism matters more than
+  // either number. Decomposing this parent's uncovered time into head, inter-
+  // child gaps and tail: fast, the gaps are 9-20 us over seven boundaries
+  // against a 13-22 us charge; slow, the gaps are 91-105 us against a 52-61 us
+  // charge. **The UN-instrumented part of a boundary dilates faster than the
+  // instrumented part when the box slows** — the `lock_guard` release, the
+  // `Close` return, the `Scope` destructor and constructor, and the call into
+  // `Open` up to its clock read. That is the opposite of what row
+  // LTX25-PHASE-RESIDUE's design argued, and it is why the render's four
+  // carrying leaves (1.02-1.46 over eight measurements and two geometries, on
+  // the same runs) are far better conditioned than eight bare scopes: a render's
+  // boundaries carry a `Tick` and a `/proc/self/statm` read INSIDE the
+  // instrumented region, so the measured part dominates. This timeline carries
+  // neither, which makes it the WORST-conditioned probe of that ratio in the
+  // file rather than the tightest.
+  //
+  // The ratio is therefore REPORTED and not asserted. What this case exists to
+  // prove is the ATTRIBUTION — that a child's boundary is charged to its parent
+  // and a boundary under a bare span is charged to the table — and the three
+  // assertions above prove it: the mutation that charges everything to the table
+  // reddens four assertions in this file, none of them a ratio.
   const double uncovered = parent_duration - child_total;
   MESSAGE("unit.parent = " << parent_duration << "s, children " << child_total
                            << "s, uncovered " << uncovered << "s, charged " << parent_instrument
-                           << "s (ratio " << (uncovered / parent_instrument) << ")");
-  CHECK_MESSAGE(uncovered <= kUnitBackstop * parent_instrument,
-                "the parent leaf has " << uncovered << "s inside no child and the instrument "
-                    << "charged itself only " << parent_instrument
-                    << "s of it, although this case runs NOTHING inside the parent but the "
-                       "child scopes. At an order of magnitude apart the accounting is not "
-                       "measuring the boundary it is supposed to measure, and every bound "
-                       "derived from it is that much too tight");
+                           << "s (ratio " << (uncovered / parent_instrument)
+                           << ", REPORTED not asserted -- see the note above)");
   log.Reset();
 }
 
-// ─── the accounting is CONSERVED, and the writer is not the render (#1536) ───
+// ─── the accounting is CONSERVED (#1536) ─────────────────────────────────────
 //
-// TWO PROPERTIES THE GATES ABOVE ASSUME AND CANNOT SEE. Both are about
-// `WriteJson`, and both were wrong before row LTX25-PHASE-RESIDUE.
+// `instrument_seconds` at the top of the table and `instrument_seconds` on each
+// record are one quantity split two ways, so a charge that went to neither would
+// be an unmeasured cost that both bounds are blind to — the exact hole the
+// ratios had. Every value is non-negative, no record is charged more than its
+// own duration, and the table's own share is a real number rather than a
+// placeholder.
 //
-// CONSERVATION. `instrument_seconds` at the top of the table and
-// `instrument_seconds` on each record are one quantity split two ways, so a
-// charge that went to neither would be an unmeasured cost that both bounds are
-// blind to — the exact hole the ratios had. Every value is non-negative and the
-// table's own share is a real number rather than a placeholder.
+// WHAT THIS CASE DOES **NOT** PROVE, AND USED TO CLAIM IT DID. `WriteJson` reads
+// the clock BEFORE it copies and sorts the record vector, so the writer's own
+// serialization stops being charged to `wall_seconds` and therefore to
+// `unaccounted_seconds`. That ordering is a READING OF THE SOURCE and is
+// ungated: a fresh review restored `Sum(records, ByStart(Records()))`'s original
+// order and this case stayed GREEN 10 of 10 runs, at `wall 0.0608987s,
+// unaccounted 0.000534223s, table charge 0.000301655s`. The reason is that the
+// copy and the sort of a THREE-record table are nanoseconds, so the difference
+// the mutation makes is far below the slack in the bound below.
 //
-// THE WRITER IS NOT THE RENDER. `WriteJson` reads the clock BEFORE it copies and
-// sorts the record vector. Reading it after charged this writer's own
-// serialization to `wall_seconds`, and therefore to `unaccounted_seconds`, which
-// is a residue no render produced and no scope could ever name. The case pins
-// the order by rendering a table whose leaves are a known share of a known wall.
-TEST_CASE("ltx2 phase log: the instrument's own cost is conserved and the writer is not timed") {
+// Gating it needs a table with enough records for the sort to be measurable, and
+// a `WriteJson` called with nothing between it and the last `Close`. That is
+// recorded under `## Owed` in `.agents/specs/ltx25-phase-residue.md` rather than
+// asserted here, and the case is named for what it does prove. The precedent is
+// `phase::Tick`'s own header note: a placement that rests on a reading of the
+// call site says so, instead of being wrapped in an assertion that cannot see
+// it.
+TEST_CASE("ltx2 phase log: the instrument's own cost is conserved across the table and its records") {
   namespace phase = vllm::multimodal::phase;
   phase::PhaseLog& log = phase::PhaseLog::Instance();
   log.Reset();
@@ -5102,9 +5147,12 @@ TEST_CASE("ltx2 phase log: the instrument's own cost is conserved and the writer
                 "no record carries any instrument charge, so the per-record half of the "
                 "accounting is not reaching the emitted table");
 
-  // THE WRITER IS NOT TIMED. Two 30 ms leaves against a wall this instrument
-  // measured; a `WriteJson` that read the clock after copying and sorting the
-  // records would add its own serialization to that wall and to the residue.
+  // AND THE RESIDUE OF A TIMELINE WHOSE GAPS CONTAIN NOTHING IS THE INSTRUMENT'S
+  // OWN CHARGE. Two adjacent scopes with no caller work between them, so there
+  // is nothing for `unaccounted_seconds` to hold but boundary cost. This is the
+  // assertion that found the sampler JOIN going uncharged: it read 0.000346479s
+  // of residue against a 0.000111040s charge, a ratio of 3.12, which is
+  // indistinguishable from a real un-named phase.
   const double wall = table["wall_seconds"].get<double>();
   const double unaccounted = table["unaccounted_seconds"].get<double>();
   MESSAGE("wall " << wall << "s, unaccounted " << unaccounted << "s, table charge "
@@ -5114,8 +5162,9 @@ TEST_CASE("ltx2 phase log: the instrument's own cost is conserved and the writer
                 "this timeline runs two adjacent scopes and NOTHING between them, so its whole "
                 "residue is this instrument's own boundary cost. It reports " << unaccounted
                     << "s of residue against a " << table_charge
-                    << "s charge, which means something outside the instrument's own accounting "
-                       "is being timed — the writer's copy-and-sort is the one that was");
+                    << "s charge, which means an interval this instrument spends is not being "
+                       "charged to anything — the sampler join outside the lock was the one "
+                       "that was not");
   log.Reset();
 }
 

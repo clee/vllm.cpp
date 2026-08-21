@@ -244,6 +244,16 @@ argued for. The same argument holds for the coverage bound: 0.95 of a
 `decode.audio` leaf permits 83 ms of that leaf to be un-anchored at fixture
 scale and 0.90 of `denoise` at 81 frames permits 3.9 ms.
 
+**It is an empirical claim and not a theorem, which a fresh review was right to
+say.** `uncovered <= 2 * leaf_instrument` beats `covered >= 0.75 * leaf_seconds`
+only while `2 * leaf_instrument < 0.25 * leaf_seconds`, and nothing bounds
+`leaf_instrument` from above. `Tick` charges to the innermost live record, so
+moving the DiT tick out of `Evaluate` would charge about 110 flushed writes to
+`denoise` and buy a budget larger than the deleted floor. The ratio is emitted as
+a `MESSAGE` rather than asserted, so a change that made the instrument ten times
+more expensive would widen both gates and print a small number. That is a real
+direction of drift, and it is recorded under `## Owed` rather than papered over.
+
 **Why it is not load-flaky, which is the property the four issues are about.**
 The old ratio compares a residue that a preemption inflates against a wall that
 the same preemption inflates only if it lands inside a leaf; the residue is 0.5%
@@ -356,9 +366,12 @@ W5 gates, mutations, and the record edits the change makes stale.
 |---|---|
 | [#1536](https://github.com/mudler/vllm.cpp/issues/1536) | closed by this row |
 | [#1439](https://github.com/mudler/vllm.cpp/issues/1439) | closed by this row |
-| [#1494](https://github.com/mudler/vllm.cpp/issues/1494) | closed by this row |
+| [#1494](https://github.com/mudler/vllm.cpp/issues/1494) | **already CLOSED by `6b48edb2c` before this row merged `main`.** This row takes the `denoise.update` anchor that change recorded as owed; it does not close the issue and does not claim to |
 | [#1470](https://github.com/mudler/vllm.cpp/issues/1470) | closed by this row |
 | the res_2s arm's `denoise.update` anchor | **owed, no issue yet.** `Ltx2Res2sDenoisingLoop` runs its own post-process and step inside `ltx2_res2s.cpp` through `Ltx2Res2sHooks`, so the anchor needs a hook rather than a statement. No gate in this tree renders on that arm, so landing it here would land dead code |
+| the `denoise.step` / `denoise.update` seconds transfer | **owed, no issue yet, and this row claimed it was closed until a fresh review checked.** (1b') compares `start_seconds` only, so leaving `denoise.step` open across the post-process and emitting `denoise.update` empty after it preserves the alternation, both counters, containment, non-overlap, exclusivity, (1c) and (2), and moves 100% of the decomposed seconds onto one name. No (2b) floor separates it: the honest share of `denoise.update` runs 0.45% to 11.15% across four boxes and a transfer puts it at ~0%. Closing it needs an anchor INSIDE the callee, which is the third row of the anchor table in [`ltx25-device-residency.md`](ltx25-device-residency.md) `### Owed out of W0` for all six anchors |
+| a gate on `WriteJson`'s clock ORDERING | **owed, no issue yet, and MEASURED green under its own mutation.** `WriteJson` reads `Elapsed()` before it copies and sorts the records, so the writer stops being charged to the render. Restoring the old order left the conservation case GREEN 10 of 10, at `wall 0.0608987s, unaccounted 0.000534223s, table charge 0.000301655s`, because the copy and the sort of a three-record table are nanoseconds. Gating it needs a table with enough records for the sort to be measurable and a `WriteJson` with nothing between it and the last `Close`. The case is named for what it does prove |
+| an upper bound on the instrument's own share of a leaf | **owed, no issue yet.** `uncovered <= 2 * leaf_instrument` is stricter than the floor it replaces only while `leaf_instrument` stays small, and nothing bounds it. Moving the DiT `Tick` out of `Evaluate` would charge ~110 flushed writes to `denoise` and widen the gate while printing a small number |
 | a per-gap decomposition IN the emitted table | **owed, no issue yet.** This row computed the gap table in a scratch script to find the 92% region. A reader of `phase-log.json` still cannot see it without one, and the same investigation will be re-derived the next time the residue moves |
 
 ## Outcome

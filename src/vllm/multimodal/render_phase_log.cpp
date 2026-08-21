@@ -364,6 +364,13 @@ size_t PhaseLog::Open(const std::string& name, bool span) {
   }
   impl_->open.push_back(std::move(o));
   impl_->SampleLocked();
+  // THE TAIL OF THIS BOUNDARY, and a fresh review found it uncharged. Everything
+  // from here to the return runs INSIDE the record just opened and BEFORE any
+  // child of it, so it is uncovered time this instrument produced — the same
+  // quantity `Close`'s tail is, on the other side of the boundary. `SampleLocked`
+  // above charges itself; the flushed progress line below did not, and it is the
+  // most expensive statement in the function.
+  const double after_sample = impl_->Now();
   // W0-live (#1413): the OPEN line, which is the load-bearing half. It means the
   // last line printed names the phase that is CURRENTLY RUNNING, and that is the
   // whole difference between a working render and a hung one. A close-only
@@ -375,6 +382,10 @@ size_t PhaseLog::Open(const std::string& name, bool span) {
                   opened_at);
     impl_->EmitLocked(text);
   }
+  // Charged to the record just opened, which `ChargeLocked` resolves as the
+  // innermost live leaf. It is inside that record's own duration and outside
+  // every child of it, which is exactly where the coverage bound looks.
+  impl_->ChargeLocked(after_sample, impl_->Now());
   return impl_->open.back().handle;
 }
 
