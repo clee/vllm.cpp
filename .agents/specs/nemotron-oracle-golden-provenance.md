@@ -259,32 +259,56 @@ With the golden as `af8170154` left it, the suite collected 25 cases and
 `test_the_shipped_golden_is_not_silently_attributed`, each reporting
 `oracle.json: missing 'capture'`. After the provenance block: **26/26 OK**.
 
-### Mutation proof — golden
+### Mutation proof — the golden (data)
 
-Each mutation applied alone to the committed golden, the case rerun, the tree
-restored and its sha256 re-asserted
-(`659c26bd2301317d4a6999df0b7afc3243dcff129de89abcb66b46817dd6f9e9`).
+Each mutation applied alone, `git diff --stat` printed to prove it APPLIED, the
+target rebuilt to prove `compile_rc=0`, the case rerun, then the tree restored
+and its **sha256** re-asserted against the pre-mutation baseline
+`659c26bd2301317d4a6999df0b7afc3243dcff129de89abcb66b46817dd6f9e9`. A mutation
+that never applied and a mutation that failed to build both read as a passing
+test, so neither is inferred here.
+
+| # | Mutation | diff | Result |
+|---|---|---|---|
+| — | baseline | — | 33 assertions, 0 failed, SUCCESS |
+| M1 | delete the `capture` block (the `af8170154` shape) | -24 | 20 assertions, **1 failed** |
+| M2 | claim `engine_config_recorded: true` while `engine` is null | 1/1 | 28, **1 failed** |
+| M3 | blank `unrecoverable_reason` | 1/1 | 33, **1 failed** |
+| M4 | point `issue` at a non-vllm.cpp string | 1/1 | 33, **1 failed** |
+| M5 | truncate one golden row below `max_tokens` | 1/-28 | 33, **1 failed** |
+| M6 | empty the `golden` array | 1/-148 | 7, **1 failed** |
+| M7 | drop `engine_config_recorded` so the file says NOTHING | -1 | 21, **1 failed** |
+
+M5 and M6 are the anti-vacuity arms: a comparison over zero elements reports a
+perfect score, so the width is asserted rather than trusted. M7 is the third
+state — not "unrecorded", but silent — which is the state #926 filed.
+
+### Mutation proof — the case is the SOLE holder (source)
+
+`compile_rc` is load-bearing here, and it is printed. **M8**: delete the
+`capture` requirement from the C++ case itself (`compile_rc=0`, 0 compile
+errors, `git diff --stat` 1 insertion), then re-apply M1. The **whole binary**
+then reads `3 passed | 0 failed`, **26 assertions** against the restored 40, and
+`Status: SUCCESS!` over a golden with no provenance at all.
+
+Nothing else in this tree holds the guarantee. Restored, the binary is 40
+assertions and both sha256s match.
+
+### Mutation proof — the checker (source)
+
+Each applied alone, parsed (`parse_rc=0` — a mutation that does not parse reads
+as a passing test), the suite rerun, restored by sha256
+`a477bcefbcc90da30d8e0cae016fc474e281b74889ed5107553a6f851ce54fce`.
 
 | # | Mutation | Result |
 |---|---|---|
-| — | baseline | 33 assertions, 0 failed, SUCCESS |
-| M1 | delete the whole `capture` block (the `af8170154` shape) | 20 assertions, **1 failed** |
-| M2 | claim `engine_config_recorded: true` while `engine` stays null | 28 assertions, **1 failed** |
-| M3 | blank `unrecoverable_reason` | 33 assertions, **1 failed** |
-| M4 | point `issue` at something that is not a vllm.cpp issue | 33 assertions, **1 failed** |
-| M5 | truncate one golden row below `max_tokens` | 33 assertions, **1 failed** |
-| M6 | empty the `golden` array | 7 assertions, **1 failed** |
+| M9 | stop requiring a reason on an unattributed golden | **1 failure** |
+| M10 | stop requiring every engine key (`for key in ()`) | **2 failures** |
+| M11 | drop the anti-vacuity width check | **1 failure** |
 
-M5 and M6 are the anti-vacuity arms: a comparison over zero elements reports a
-perfect score, so the width is asserted rather than trusted.
-
-### Mutation proof — the checker
-
-Deleting the unattributed branch's reason check from `check_golden` turns
-`tests/scripts/test_nemotron_h_oracle_capture.py` red (26 run, 1 failed) and
-restoring it returns 26/26 OK. `test_each_required_engine_key_is_load_bearing`
-additionally drops each of the 20 engine keys in turn and asserts the contract
-names the one it dropped.
+`test_each_required_engine_key_is_load_bearing` additionally drops each of the
+20 engine keys in turn and asserts the contract names the one it dropped, so
+M10 is a floor and not the whole proof.
 
 ### The driver states all three cases
 
@@ -308,6 +332,17 @@ and stops reading is the reader it is for.
 `const char*` printed `capture is missing '1'`: doctest stringifies a bare
 `char*` as a **bool**. The loop iterates `std::string` now, and the messages read
 `capture is missing 'schema'`.
+
+### One red that is not this row's
+
+`scripts/agent-preflight.sh` reports `test_cpu_x86_llamacpp_floor` failing on
+`test_a_contended_leg_is_discarded_and_never_summarised`. That is
+[#618](https://github.com/mudler/vllm.cpp/issues/618) by its exact case name —
+the harness is load-dependent and this box had just finished a build. The suite
+and its script are **byte-identical to `origin/main`** in this diff
+(`git diff --stat origin/main...HEAD -- tests/scripts/test_cpu_x86_llamacpp_floor.py
+scripts/cpu-x86-llamacpp-floor.sh` is empty, against a positive control on this
+row's own files that is not). Every other preflight gate is green.
 
 ## 8. Risks
 
