@@ -516,6 +516,20 @@ tree's own, unedited. What makes them hold is §Design.2: the cause is fixed.
 | `decode.audio` coverage | 99.97% | 99.9951% | 0.99 |
 | `artifacts.frames` coverage | 98.72% | 98.7657% | 0.50 |
 
+**The restored floor is measured as a distribution, which is what this row failed
+to do for the bound it proposed.** Thirty consecutive runs of the SUMS case at
+load average 89 to 123, every one reporting `cases=1` so the filter is not
+silently empty:
+
+| n | red | min | median | max | floor |
+|---:|---:|---:|---:|---:|---:|
+| 30 | **0** | **99.6302%** | 99.9637% | 99.9901% | 95% |
+
+The worst observation has **13 points of margin**, i.e. the residue would have to
+grow by a factor of thirteen before it reds, where before this row it sat at
+92.700% — under the floor. That is the difference between a gate and a coin flip,
+and it comes from §Design.2 rather than from any number.
+
 **And the instrument's charge is reported at every one of them**, which is the
 half of #1439's request that does land: `unaccounted 0.00179039s` against
 `instrument 0.00137401s` on the table, and per leaf 1.017 to 1.230 as a ratio
@@ -601,7 +615,8 @@ environment, the exit status and the evidence path, and not a summary of them.
 | 3 | `ec3e7ac0c` | `build-test-cpu` on a clean GitHub runner — the same `ctest --test-dir build --output-on-failure` over all 583 tests | 0 | **GREEN.** Job `96719179235`. That is the lane `test_ltx2_video` was red in, on the idle low-load machine this box cannot imitate |
 | 4 | `361bbfb05` | `build-newest-gcc` | 0 | **GREEN**, having been RED at the Build step on every commit since `5702d8f83`; repaired here as #1565 |
 | 5 | `361bbfb05` | `ctest --test-dir build --output-on-failure`, locally | — | **VOID, not a failure.** `test_ltx2_video` reports `Subprocess terminated***Exception` at 796.58 s, and its own output ends `FATAL ERROR: test case CRASHED: SIGTERM` at case 26 of 104 with **`763 assertions \| 763 passed \| 0 failed`**. An external `SIGTERM` on a shared box is an infrastructure failure presenting as a code verdict, and it is neither a red nor a green |
-| 6 | the landing tree | the SUMS case, 20 consecutive runs of the WITHDRAWN bound | 0 x20 | recorded because it is the measurement that was not enough: 1.021 to 1.464, which a fresh reviewer then showed is the body of a distribution reaching 4.115 over 45 runs. Evidence `ratios20.log` |
+| 6 | the landing tree | the SUMS case, **30 consecutive runs** of the RESTORED floor, load 89-123 | 0 x30 | **GREEN 30/30**, every run reporting `cases=1`. `leaves/wall` min **99.6302%**, median 99.9637%, max 99.9901% against 95%. Evidence `floor30.log` |
+| 7 | the landing tree | the SUMS case, 20 consecutive runs of the WITHDRAWN bound | 0 x20 | recorded because it is the measurement that was not enough: 1.021 to 1.464, which a fresh reviewer then showed is the body of a distribution reaching 4.115 over 45 runs. Evidence `ratios20.log` |
 
 **Row 1's exact failures**, which are the red this row exists to remove:
 
