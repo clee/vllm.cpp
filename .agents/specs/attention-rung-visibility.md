@@ -273,6 +273,41 @@ would be a regression rather than a repair.
   because it bounds what an opt-in could buy rather than proving the refusal
   executes.
 
+- [#1629](https://github.com/mudler/vllm.cpp/issues/1629) — DISCHARGED IN THIS
+  ROW, and listed here because AGENTS.md wants the index row, this spec and the
+  pull request body to agree, and this section is where this spec links its
+  issues. Two drift locks in `tests/scripts/test_check_attention_rung_consistency.py`
+  stored counts of files they do not own, so the three rows the attention-rung
+  allowlist exists to unblock had no green path: `test_the_population_is_not_empty`
+  asserted `>= 9` against a tree holding exactly 9 `vt::Attention(` sites, and
+  `assertGreater(excused, 0)` required the shipped allowlist to stay non-empty
+  forever. Both are repaired here, and neither by lowering a number, which is the
+  mute-switch failure: the floor is now `>= 1`, which detects only a broken
+  scanner and leaves the rename guard to
+  `test_the_six_deliberate_sites_carry_a_marker`, which pins six sites by name; a
+  new case proves the stem a red message names is a real source file; and the
+  excused counter is pinned by two synthetic cases that build their own
+  allowlisted population. Nothing is owed after the merge, so this entry is the
+  link and not a debt.
+
+- [#1631](https://github.com/mudler/vllm.cpp/issues/1631) — teach
+  `scripts/check-pr-size.py` to tell a comment-only or docstring-only diff to a
+  `governance_checker` from a semantic one, so a measurably false comment in a
+  checker can be corrected on its own. `check-pr-size.py:170` classifies every
+  `scripts/check-*.py` and `.sh` as a governance checker and `change_errors` then
+  requires paired test evidence that goes red against the BASE checker, which a
+  semantically identical diff cannot produce by construction. OWED after the
+  merge, and it is why three comments in
+  `scripts/check-attention-rung-consistency.py` ship unrepaired beside a suite
+  that was repaired for #1629: `:58-61` gives the wrong reason for not widening
+  the regex, `:93-96` attributes the exclusion of the fast rungs to the `\b`
+  rather than to the trailing `\(`, and `:252-255` denies an equality that holds
+  on this tree (9 sites, 6 marked, 3 excused). It cannot be fixed here, because
+  changing what the gate accepts is what AGENTS.md `## Changing the rules or a
+  checker` routes to its own row, spec and red-before evidence; attaching the
+  correction to an unrelated semantic change is the alternative that section
+  exists to refuse. A candidate patch is parked on the issue.
+
 ## Now
 
 The change is written, CPU-gated and through one fresh scoped review, whose
