@@ -140,16 +140,27 @@ __device__ inline void Store(__nv_bfloat16* p, int64_t i, float v) { p[i] = __fl
 // caller reads exactly the bytes, in exactly the order, it read before.
 //
 // The fp8 arm mirrors upstream's attention-side dequant
-// `scaled_vec_conversion<float, uint8_t>` (quant_utils.cuh:302-308): fp8 byte ->
+// `scaled_vec_conversion<float, uint8_t>` (quant_utils.cuh:419-429): fp8 byte ->
 // float, then multiply by the scale, i.e. `Dequant(FP8) * scale = HP` (the
 // convention at :296-300). It is written as the SAME ARITHMETIC as the W1 CPU
 // codec vt::F8E4M3ToF32 (include/vt/fp8_kv.h) rather than as the hardware
 // `__nv_cvt_fp8_to_halfraw`, because W1 is this wave's oracle and sharing the
 // decode makes CUDA==CPU on the read a property of the source rather than a
-// measurement. The two agree in any case: every one of the 256 e4m3 codes is
-// exactly representable in fp16, so upstream's fp8->half->float round trip is
-// lossless. `std::ldexp(mantissa, exp - 7)` on a float IS `ldexpf`, so this is
-// the CPU codec line for line.
+// measurement. The two agree in any case: every one of the 254 FINITE e4m3 codes
+// is exactly representable in fp16, so upstream's fp8->half->float round trip is
+// lossless. `std::ldexp(mantissa, exp - 7)` on a float IS `ldexpf`, so each of
+// those 254 decodes to the same f32 bits as the CPU codec.
+//
+// THE TWO NaN CODES are not identical, and the suite cannot see it. On 0x7F and
+// 0xFF the CPU returns `std::numeric_limits<float>::quiet_NaN()` (0x7FC00000)
+// and this returns `CUDART_NAN_F` (0x7FFFFFFF): both are quiet NaNs and both
+// propagate the same way, but the PAYLOAD differs. No gate here
+// distinguishes them, because a NaN compares unequal to everything including
+// itself, so a byte or NMSE comparison fails on ANY payload rather than on the
+// wrong one. It is recorded here rather than measured. Reaching it also needs a
+// non-finite input: `__NV_SATFINITE` clamps an out-of-range magnitude to the max
+// finite code (0x7E/0xFE), so a store of a finite `hp / scale` never writes
+// 0x7F/0xFF.
 __device__ __forceinline__ float Fp8E4M3ToF32Dev(uint8_t byte) {
   const uint32_t sign = static_cast<uint32_t>(byte >> 7) & 0x1U;
   const uint32_t exp = static_cast<uint32_t>(byte >> 3) & 0xFU;
@@ -2913,7 +2924,7 @@ void LaunchPaged(cudaStream_t s, Tensor& out, const Tensor& query, const Tensor&
 // ─── fp8 KV-cache READ dispatch (KV-FP8 W2, #1593) ─────────────────────────
 // TKV is `uint8_t`: the cache pages are 1-byte fp8-e4m3 (DType::kI8) and each
 // read is dequantized as Dequant(fp8) * k_scale|v_scale inside LoadKv, mirroring
-// upstream's `scaled_vec_conversion<float, uint8_t>` (quant_utils.cuh:302-308).
+// upstream's `scaled_vec_conversion<float, uint8_t>` (quant_utils.cuh:419-429).
 //
 // SCOPE, argued rather than assumed. Only the two CORRECTNESS-GRADE kernels are
 // reachable from here — the tiled flash prefill and the block decode — and that
@@ -2974,7 +2985,7 @@ void LaunchPagedByKv(cudaStream_t s, Tensor& out, const Tensor& query, const Ten
                      const Tensor& query_start_loc, const PagedAttentionArgs& args) {
   // fp8 KV cache: the STORAGE dtype is a raw byte (kI8) and the INTERPRETATION
   // travels in args.kv_cache_dtype, exactly as upstream carries cache_t=uint8_t
-  // plus a KV_DTYPE template parameter (dtype_fp8.cuh:9-13). Key on the
+  // plus a KV_DTYPE template parameter (dtype_fp8.cuh:15-19). Key on the
   // interpretation, never on the storage dtype: a kI8 tensor with kAuto is not
   // an fp8 cache, and the op wrapper already refuses that pair.
   if (args.kv_cache_dtype == Fp8KVCacheDataType::kFp8E4M3) {

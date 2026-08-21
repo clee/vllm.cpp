@@ -110,6 +110,15 @@ void ReshapeAndCacheKernelCuda(Queue& q, const Tensor& k, const Tensor& v, Tenso
 // (`:367-400`) is a named later brick (spec W5), and per-head scales cannot
 // reach here because ReshapeAndCacheFp8 takes two scalars.
 //
+// ELEMENTWISE-IDENTICAL, NOT INSTRUCTION-IDENTICAL. Upstream's contiguous-heads
+// arm moves the row through `vectorize_with_alignment<VEC_SIZE>` (`:360-363`,
+// VEC_SIZE 8 for a 2-byte source and 4 for f32), which converts the same
+// elements in the same order under a vectorized load/store. The loop below is a
+// SCALAR strided one, so it writes the same bytes and reads the same inputs
+// while moving them one at a time. That is a bandwidth difference, not a
+// numerical one, and W4 — which owns the memory/throughput measurement — owns
+// closing it. Do not read "ported" here as "the same instructions".
+//
 // THE CONVERTER IS UPSTREAM'S OWN, and its equality to the CPU codec is already
 // MEASURED. `fp8::scaled_convert<uint8_t, float, kFp8E4M3>` is
 // `__nv_cvt_float_to_fp8(a / scale, __NV_SATFINITE, __NV_E4M3)`
