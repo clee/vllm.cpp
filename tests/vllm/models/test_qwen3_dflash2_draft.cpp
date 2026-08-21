@@ -2124,5 +2124,11 @@ TEST_CASE("dflash2 draft logits: a W4A4 shared head is REFUSED, not silently rer
     what = e.what();
   }
   INFO("what: ", what);
-  CHECK(what.find("W4A4") != std::string::npos);
+  // Assert on what THIS guard uniquely says, not on "W4A4". The W4A16
+  // dispatcher refuses the same weight one layer down with its own message, and
+  // that message also contains "W4A4" -- so a case that greps for it passes with
+  // this guard deleted, which the row's mutation pass measured. What only this
+  // guard can tell a user is the variable to unset.
+  CHECK(what.find("VT_MODELOPT_W4A4") != std::string::npos);
+  CHECK(what.find("1628") != std::string::npos);
 }

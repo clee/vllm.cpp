@@ -1503,13 +1503,23 @@ list items.
   behaviour change.
 
   A head that is NVFP4 with the ACTIVATION divisor in force (`VT_MODELOPT_W4A4=1`)
-  refuses BY NAME at startup in `LoadDflashSharedLmHead` and again in
-  `DflashLogitsF32D`, because the draft's shared-head GEMM is the W4A16
-  dispatcher and the target's own head is W4A16 under both spellings unless that
-  variable puts the divisor back (vLLM's `ModelOptNvFp4W4A16LinearMethod` DELETES
-  it, `modelopt.py:1365`). Routing the draft into the fp4-activation GEMM while
-  the target uses another one is the same silent-wrong D12 is about, so it
-  refuses instead.
+  refuses BY NAME in `DflashLogitsF32D`, because the draft's shared-head GEMM is
+  the W4A16 dispatcher and the target's own head is W4A16 under both spellings
+  unless that variable puts the divisor back (vLLM's
+  `ModelOptNvFp4W4A16LinearMethod` DELETES it, `modelopt.py:1365`). Routing the
+  draft into the fp4-activation GEMM while the target uses another one is the same
+  silent-wrong D12 is about, so it refuses instead.
+
+  **There was a SECOND copy of that refusal, at load, and the mutation pass is
+  what removed it.** A startup refusal reads better and was written first. Then
+  disabling the forward guard left the suite GREEN, because the W4A16 dispatcher
+  refuses the same weight one layer down with its own message and the case was
+  asserting on a substring both messages carry. Two guards for one rule that no
+  test can tell apart is the "two descriptions of one rule" failure AGENTS.md
+  `## Changing the rules or a checker` names, so one survives -- the one a gate
+  reaches -- and the case now asserts on what only it can say, the variable to
+  unset. The refusal arriving at the first propose rather than at load is the
+  polarity D10 already set for this lane.
 
 - **O14 — the packed shared head is gated on CPU only; the CUDA arm and the real
   checkpoint are OWED a measurement.**

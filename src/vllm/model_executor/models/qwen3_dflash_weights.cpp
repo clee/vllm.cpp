@@ -635,20 +635,15 @@ void LoadDflashSharedLmHead(const std::vector<SafetensorsFile>& shards,
       VT_CHECK(!head_fp4->Empty() && unused_bf16.Empty(),
                "qwen3_dflash: the target's NVFP4 lm_head did not take the packed "
                "arm of LoadDenseLmHead");
-      // W4A16 is the only spelling this draft's logits GEMM takes, and it is the
-      // only one an lm_head has unless VT_MODELOPT_W4A4=1 puts the activation
-      // divisor back (vLLM's ModelOptNvFp4W4A16LinearMethod DELETES it,
-      // modelopt.py:1365). Refuse at STARTUP rather than let the draft fall into
-      // a different kernel than the target's: the DFlash2 selector's whole input
-      // is the target head's exact top-K, so a head computed by another GEMM is
-      // the silent-wrong D12 exists to prevent.
-      VT_CHECK(!head_fp4->IsTrueW4A4(),
-               "dflash: the target's lm_head is NVFP4 with an ACTIVATION scale in "
-               "force (VT_MODELOPT_W4A4=1), and the draft's shared-head GEMM is the "
-               "W4A16 dispatcher the target's own W4A16 head takes. Unset "
-               "VT_MODELOPT_W4A4 to run this draft. Owed by row SPEC-DFLASH2 "
-               "(.agents/specs/dflash2-spec-decode.md `## Owed` O13), issue #1628 "
-               "(https://github.com/mudler/vllm.cpp/issues/1628).");
+      // A true-W4A4 head -- NVFP4 with the activation divisor in force under
+      // VT_MODELOPT_W4A4=1 -- is refused by `DflashLogitsF32D` and NOT a second
+      // time here. A startup refusal would read better, and it was written here
+      // first; this row's own mutation pass then showed the two copies could not
+      // be told apart by any test, which is the "two descriptions of one rule"
+      // failure AGENTS.md `## Changing the rules or a checker` names. The
+      // surviving guard is the one a gate reaches, and the refusal arriving at
+      // the first propose rather than at load is the polarity
+      // `## Risks/decisions` D10 already set for this lane.
       return;
     }
   }
