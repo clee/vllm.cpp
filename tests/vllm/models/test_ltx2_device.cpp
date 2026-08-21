@@ -1529,17 +1529,18 @@ TEST_CASE("ltx2 device: the DiT self-attention ENTERS AttentionDenseFlash, not v
   // routing here.
   //
   // ENTRY POINT. `Ltx2DitForwardDevice` is the production device forward —
-  // `src/vllm/multimodal/ltx2_video.cpp:4055-4059` calls exactly this function
-  // inside the denoiser. This case does not construct a `vt::Attention` call by
-  // hand; a test that did would prove the op works and nothing about whether the
-  // model reaches it.
+  // `src/vllm/multimodal/ltx2_video.cpp::Ltx2DitForwardDevice` at :4246, inside
+  // the denoise loop, calls exactly this function. This case does not construct a
+  // `vt::Attention` call by hand; a test that did would prove the op works and
+  // nothing about whether the model reaches it.
   //
   // CPU BACKEND, and that is not a weakening. `GetOp` is the dispatch point on
   // every backend, so the ROUTING is observable without a GPU; what a GPU gates
   // is the kernel behind it. On CPU both ops resolve to the same registered
-  // function (`src/vt/cpu/cpu_ops.cpp:3551-3562`), which is exactly why the
-  // golden cases above stay byte-unchanged by this swap and why this case has to
-  // ask the provider rather than the numbers.
+  // function (`src/vt/cpu/cpu_ops.cpp:3750-3761`, the `kAttention` /
+  // `kAttentionDenseFast` / `kAttentionDenseFlash` registrations), which is
+  // exactly why the golden cases above stay byte-unchanged by this swap and why
+  // this case has to ask the provider rather than the numbers.
   //
   // UNMASKED inputs on purpose: a MASKED self-attention carries a bias and
   // legitimately routes to `kAttentionCross` (the dispatch condition is
@@ -1553,6 +1554,19 @@ TEST_CASE("ltx2 device: the DiT self-attention ENTERS AttentionDenseFlash, not v
   Modalities m;
   BuildModalities(&m, /*masked=*/false);
   REQUIRE(m.video.batch == m.audio.batch);
+
+  // SCOPE GUARDS, because both of these are PROCESS state and this case has
+  // `REQUIRE`s in it. A failed `REQUIRE` unwinds out of the case, and a `throw`
+  // from either forward does the same; on the straight-line version the counting
+  // instrument stayed enabled and the knob stayed set for the other 21 cases in
+  // this binary, which would make an unrelated case's failure depend on which
+  // case failed first.
+  struct StatsGuard {
+    ~StatsGuard() { vt::EnableOpProviderCallStats(false); }
+  } stats_guard;
+  struct KnobGuard {
+    ~KnobGuard() { vllm_test::UnsetEnv("VLLM_LTX2_DIT_FLASH_ATTN"); }
+  } knob_guard;
 
   vt::EnableOpProviderCallStats(true);
   vt::ResetOpProviderStats(vt::OpId::kAttentionDenseFlash, vt::DeviceType::kCPU);
@@ -1598,7 +1612,7 @@ TEST_CASE("ltx2 device: the DiT self-attention ENTERS AttentionDenseFlash, not v
       vt::GetOpProviderStats(vt::OpId::kAttentionDenseFlash, vt::DeviceType::kCPU);
   const vt::OpProviderStats naive_off =
       vt::GetOpProviderStats(vt::OpId::kAttention, vt::DeviceType::kCPU);
-  vllm_test::UnsetEnv("VLLM_LTX2_DIT_FLASH_ATTN");
+  vllm_test::UnsetEnv("VLLM_LTX2_DIT_FLASH_ATTN");  // `knob_guard` repeats this on any unwind
   CHECK(flash_off.selections == 0);
   CHECK(naive_off.selections == want);
   // And the two arms must agree BYTE-FOR-BYTE on CPU, where `kAttention` and
@@ -1610,6 +1624,6 @@ TEST_CASE("ltx2 device: the DiT self-attention ENTERS AttentionDenseFlash, not v
   REQUIRE(off.audio.size() == out.audio.size());
   CHECK(std::equal(off.video.begin(), off.video.end(), out.video.begin()));
   CHECK(std::equal(off.audio.begin(), off.audio.end(), out.audio.begin()));
-
-  vt::EnableOpProviderCallStats(false);
+  // `stats_guard` disables the counting instrument on the way out, on this path
+  // and on every unwinding one.
 }

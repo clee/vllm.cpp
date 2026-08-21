@@ -444,10 +444,14 @@ DBuf AttentionDev(Ctx& c, const Ltx2AttentionWeights& w, const Tensor& x, const 
       // gate is the CUDA host-vs-device parity case in test_ltx2_device.cpp.
       const char* off = std::getenv("VLLM_LTX2_DIT_FLASH_ATTN");
       if (off != nullptr && off[0] == '0') {
-        // Same-binary A/B and RED knob, the shape VT_FA2_DENSE
-        // (cuda_ops.cu:3383-3389) already takes. Restores the naive kernel so
-        // both arms of the measurement run from ONE build. Read FRESH rather than
-        // cached, so a test can flip it inside one process.
+        // VT-ATTN-NAIVE: the OFF arm of a same-binary A/B, not a serving path.
+        // The default is `vt::AttentionDenseFlash` in the else branch below, and
+        // this call exists so both arms of the 47.84 s / 7.680 s measurement run
+        // from ONE build — the shape `VT_FA2_DENSE` (cuda_ops.cu) already takes.
+        // Deleting it would not remove a naive call from production; it would
+        // remove the control that proves the fast one is what runs.
+        //
+        // Read FRESH rather than cached, so a test can flip it inside one process.
         vt::Attention(c.d.q, to_t, tq_t, tk_t, tv_t, args);
       } else {
         vt::AttentionDenseFlash(c.d.q, to_t, tq_t, tk_t, tv_t, args);
