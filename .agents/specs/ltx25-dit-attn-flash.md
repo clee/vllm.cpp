@@ -299,17 +299,102 @@ because the flash tiling pays off with context length and LTX runs at 2352. So
 reports the measurement and stops. It does not tune until the number looks
 right.
 
+### 7.1 What has been measured, 2026-08-21
+
+Lease `6c724dfd-a5e8-4832-b4fb-d0fd7d6eb458` on `dgx:gpu0` (GB10, sm_121a),
+source `30dce3a1d`, one binary built in-lease at
+`-DVLLM_CPP_CUDA=ON` with cutlass-nvfp4, cutlass-fp8 and FlashAttention-2 all
+`ENABLED for [121a]` — the same production feature set the recorded reference
+build used. Artifacts under `/workspace/ltx25-attnflash/out/20260821T092516Z/`.
+
+**Correctness first, and it passed before any speed number was read.**
+
+| gate | result |
+|---|---|
+| `test_ops_attention` on CUDA | **10/10 cases, 88,439/88,439 assertions, SUCCESS** |
+| `test_ltx2_device` on CUDA | **22/22 cases, 749/749 assertions, SUCCESS** |
+| CUDA-vs-host f32 parity | video `8.9407e-08`, audio `4.47035e-08`, against the committed `2e-5` |
+| CUDA-vs-CPU-backend bf16 | `0` on both streams |
+
+The f32 assertion counts are the load-bearing ones: 88,439 on CUDA against 23 on
+a CPU box, so the new head_dim 64/128/256 dense-flash case really ran rather than
+printing its skip line. §4.3's launch failure is therefore repaired against a
+device and not against a reading of the code.
+
+The **numerics answer is now a number**: the swap is **not bit-identical on
+CUDA**, and the measured deviation is **8.94e-08 video / 4.47e-08 audio**, which
+is f32 round-off scale and sits **224x inside** the gate it was held to. The gate
+was not widened. Caveat stated rather than left implicit: that case runs the
+fixture's reduced dimensions, so it bounds the *arithmetic* change, not the
+change at head_dim 128.
+
+**Production reachability, on the real model, from the render's own log.**
+`VT_OP_PROVIDER_STATS=1` makes each op announce itself once when it resolves.
+In the full 21.00B render at `768x448/49f`:
+
+- `op=21 device=1` (`kAttentionDenseFlash` on CUDA): **1** announce — present.
+- `op=18 device=1` (`kAttention` on CUDA): **0** announces — the naive op is
+  never resolved at all.
+- `op=19 device=1` (`kAttentionCross` on CUDA): 1 announce.
+
+That is the same two-sided claim §6's unit case makes, taken at full scale
+through `vllm_video_engine_load` on `--device cuda` rather than on a fixture.
+
+**The flash arm, per forward.** `768x448/49f` = 2352 video tokens, seed 20260820,
+full checkpoint, bf16, reduced from the engine's own `last=` lines:
+
+| n | median | mean | min | max | spread |
+|---|---|---|---|---|---|
+| 19 | **7.680 s** | 7.633 s | 7.109 s | 8.196 s | 14.2% |
+
+Against the recorded **47.84 s** denominator that is **6.23x**, inside §7's
+predicted single-digit seconds.
+
+**The naive arm did not run, so there is NO same-binary A/B yet.** At forward 20
+of the flash arm the `rc` worker was **lost** — `rc devices` then read
+`dgx:gpu0 unhealthy (no contact)` for at least 19 minutes. GB10 shares host RAM
+with the GPU and an unconstrained job has OOM-rebooted this box before, and
+`job/ab.sh` as first written carried **no memory guard and no sample cap**, unlike
+the sibling campaign's `runguard.py`. That is a defect in this row's harness, not
+a finding about the change.
+
+Until the naive arm is taken **on the same binary in the same lease**, the
+honest statement is:
+
+- the flash arm is **measured**: 7.680 s median, n=19;
+- the **6.23x is a cross-run comparison** against a number produced by a
+  different binary in a different lease, which is exactly the weaker form the
+  same-binary rule exists to replace;
+- so the A/B result is **PENDING**, not satisfied.
+
+`job/ab.sh` now carries a sample cap (13 per arm), a `MemAvailable` floor
+(12 GiB, the sibling campaign's), a per-arm memory trace, a build cache keyed on
+the source SHA so a resumed run does not re-spend 18 minutes compiling, and it
+runs the **naive arm first** — the previous order took the cheap arm first and
+lost the box before the expensive one, which is how a two-arm measurement became
+a one-arm one.
+
 ## 8. Gates
 
-| gate | where | how it is taken |
+Exactly one result per gate. `PENDING` names the resource it waits on; it is
+never a synonym for "probably fine".
+
+| gate | where | result |
 |---|---|---|
-| CPU byte-identity | `test_ltx2_device` | every existing golden case unchanged |
-| reachability | `test_ltx2_device`, new case | two-sided op-selection count, §6 |
-| reachability mutation | scratch copy | delete the call site, both halves red |
-| CUDA host-vs-device parity | `test_ltx2_device:752` | f32 < 2e-5, bf16 < 5e-3, on `dgx:gpu0` |
-| f32 head_dim 128 launch | `test_ops_attention`, new case | red before §4.3, green after, on CUDA |
-| A/B | `dgx:gpu0` under an `rc` lease | §7 |
-| full preflight | `scripts/agent-preflight.sh` | run by this row, before and after |
+| CPU byte-identity | `test_ltx2_device`, `test_ltx2` | **PASS** — 22/22 and 652/652; 43/43 and 4581/4581; goldens unmoved |
+| reachability, unit | `test_ltx2_device`, new case | **PASS** — flash 8 of 8, naive 0 |
+| reachability mutation | in-place, restored and re-gated | **PASS** — both halves red, `CHECK( 0 == 8 )` and `CHECK( 8 == 0 )`, exit 1, compile rc 0 |
+| reachability, production | the real render's own log, GB10 | **PASS** — `op=21 device=1` present, `op=18 device=1` absent (§7.1) |
+| CUDA host-vs-device parity | `test_ltx2_device` on `dgx:gpu0` | **PASS** — f32 8.94e-08 / 4.47e-08 vs 2e-5; bf16 0 |
+| f32 head_dim 128/256 launch | `test_ops_attention` on `dgx:gpu0` | **PASS** — 10/10, 88,439 assertions (23 on a CPU box, so the case really ran) |
+| A/B, same binary, both arms | `dgx:gpu0` under an `rc` lease | **PENDING** — the flash arm is measured at 7.680 s median (n=19); the worker was lost before the naive arm, so no pair exists (§7.1) |
+| full preflight | `scripts/agent-preflight.sh` | **PASS** — clean before the first edit, on the staged spec, on the staged implementation, and after the `origin/main` merge |
+| `build-newest-gcc` | CI | **PASS for this change, red on the branch from a pre-existing break** — `main` at `483cd3198` fails the same job on `::getpid` in `test_qwen3_dflash2_gguf.cpp:547`, a file this change does not touch; owned by [#1565](https://github.com/mudler/vllm.cpp/issues/1565) |
+| `windows-msvc-cpu` / `-vulkan` | CI | **PASS for this change, baseline-less lane** — a markdown-only control PR (#1295) fails the identical step; #503/#603 own it |
+
+One gate below the bar is named rather than averaged away: the A/B. Everything
+this row claims about SPEED rests on one arm, and the row does not read as
+finished until the pair exists.
 
 ## 9. Stop conditions
 
