@@ -236,8 +236,10 @@ class ShippedTreeTests(unittest.TestCase):
                 any(path.is_file() for path in sources),
                 f"allowlisted stem {stem!r} names no model source: none of "
                 + ", ".join(str(path) for path in sources)
-                + " exists. A stem that matches no file excuses nothing and is "
-                "reported only as STALE, so the typo never surfaces on its own.",
+                + " exists. It excuses nothing, and the checker reports the "
+                "mismatch only indirectly: an unexcused call site in the file "
+                "the stem was meant to cover, or a STALE line naming the "
+                "misspelling.",
             )
 
 
