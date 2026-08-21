@@ -497,6 +497,49 @@ at the scale the tolerance was originally argued for. That is the whole defence
 for replacing an assertion rather than editing its constant, and it is why this
 change is not the thing `AGENTS.md` forbids.
 
+### Reconciled with `6b48edb2c`, which landed mid-flight
+
+`6b48edb2c` (`GATE-CI-RED-REPAIR`,
+[#1494](https://github.com/mudler/vllm.cpp/issues/1494)) merged to `main` about
+three hours after this row's baseline was measured, and it repairs the SAME
+`denoise` coverage red by a different route: it moved `denoise_min_coverage` from
+0.95 and 0.90 to **0.75** and added assertion (1c), the span slack, beside it.
+This row merged it rather than reverting it, and the reconciliation is the
+change's own words:
+
+> NAMING THE UN-NAMED TIME WOULD SETTLE IT PROPERLY, which is what #1439 asks for
+> first. A `denoise.update` scope over the sampler's per-step update would put
+> the interior residue under a name and make a tight share floor honest again.
+> ... It stays owed rather than being folded into the repair of a standing red.
+
+That is precisely this row, and the two changes agree on the diagnosis. What
+each side contributes:
+
+| | `6b48edb2c` | this row |
+|---|---|---|
+| `denoise` share floor | moved 0.95/0.90 → 0.75 | **deleted**; 0.75 permits a quarter of a leaf to be un-anchored, `uncovered <= 2 * leaf_instrument` permits tens of microseconds |
+| the head and tail | new assertion (1c), flat 0.25 ms plain / 3 ms sanitized, per leaf record | **kept exactly as it landed**, constants and all |
+| the interior | left un-anchored, disclosed, owed | anchored as `denoise.update` |
+| the sum gate (#1439) | untouched | replaced by the instrument-derived bound |
+
+**Its measured population is the strongest evidence either side produced**, and
+it is kept verbatim in the source: on an unchanged `denoise` the nine-frame arm
+reads 99.55%, 99.38%, 99.28%, 99.228%, 98.84%, 98.77%, 98.52%, 98.23%, 96.85%,
+94.60%, 94.60%, 94.14%, 92.39% and **88.85%** across four boxes including the
+GitHub runner, and the 81-frame arm spans 97.09% down to 85.85%. Eleven points
+of a leaf were un-anchored work. No share floor can separate that from a
+swallowed phase, which is exactly why anchoring it is the repair and a third
+threshold would not have been.
+
+**And it names the gap this row fills.** Its own text records that "a NORMALISED
+bound would be better, and there is no normaliser", and that its span-slack
+constant needs a per-configuration value because a sanitizer instruments the
+scope-boundary path itself — 0.25 ms plain, 3 ms under ASan or TSan, with a worst
+slack of 1.658 ms against a smallest leaf of 2.77 ms, 1.67x from vacuous.
+`Record::instrument_seconds` is that normaliser: it is measured on the same
+instrumented path, so an instrumented build inflates the charge and the residue
+together and the bound needs no `#if`.
+
 ### A trap that is named rather than engineered around
 
 `PhaseLog`'s origin is the LOAD, so the gap between `vllm_video_engine_load`
