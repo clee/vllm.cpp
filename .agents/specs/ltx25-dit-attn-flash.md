@@ -118,7 +118,7 @@ it states the shape so that the next reader recognises it.
 `src/vllm/model_executor/models/ltx2_device.cpp:421` at the base, the
 self-attention branch of `AttentionDev`, moves from `vt::Attention` to
 `vt::AttentionDenseFlash`. After this change the branch condition is `:418` and
-the swapped call `:474`, with the A/B rung's `vt::Attention` at `:472`.
+the swapped call `:478`, with the A/B rung's `vt::Attention` at `:476`.
 
 `vt::AttentionDenseFlash` is registered at `src/vt/cuda/cuda_ops.cu:3839-3840`
 and is head_dim-generic up to 256 (`cuda_ops.cu:3335`), so LTX's video head_dim
@@ -171,7 +171,7 @@ shared memory every CUDA architecture guarantees without an opt-in. This row
 originally read that as a prerequisite: raise the cap, then swap the call site.
 
 **The swap does not need it.** LTX's DiT runs at the stream dtype, which is
-**bf16 in production** (`ltx2_device.cpp:1183` after this change, `:1166` at the
+**bf16 in production** (`ltx2_device.cpp:1187` after this change, `:1166` at the
 base: "the device stream dtype is bf16 (production) or f32 (the L2 parity arm)"),
 and the video stream's head_dim is 128:
 
@@ -319,7 +319,7 @@ anywhere in the DiT forward. If somebody adds a second, unswapped self-attention
 path later, that half goes red.
 
 Mutation: delete the `vt::AttentionDenseFlash` call at
-`ltx2_device.cpp:474` in a scratch copy, restoring `vt::Attention`, and rerun the
+`ltx2_device.cpp:478` in a scratch copy, restoring `vt::Attention`, and rerun the
 focused gate. Both halves must go red. The result is recorded in `## Outcome`
 with the exact diff applied and the exact failure text, and the tree is restored
 byte-for-byte afterwards.

@@ -445,10 +445,14 @@ DBuf AttentionDev(Ctx& c, const Ltx2AttentionWeights& w, const Tensor& x, const 
       //
       // The f32 arm is the L2 parity reference, not a serving path, and at
       // head_dim 128 its tile is 65,536 B and does NOT fit. It is exercised at
-      // the fixture's reduced dimensions, where it does; at production geometry
-      // it now refuses, loudly and by name, rather than running slowly. That is
-      // recorded under `## Owed` in .agents/specs/ltx25-dit-attn-flash.md and
-      // tracked by #1612.
+      // the fixture's reduced dimensions, where it does fit; at production
+      // geometry it now REFUSES rather than running slowly. It refuses LOUDLY in
+      // either world -- today a throw from `Check(cudaGetLastError(),
+      // "attention-dense-flash launch")` at cuda_ops.cu:3352, which names the op
+      // but not the head_dim, and once #1578 lands a VT_CHECK that names the
+      // head_dim too. Never silently, which is why this is a disclosure and not
+      // a blocker. Recorded under `## Owed` in
+      // .agents/specs/ltx25-dit-attn-flash.md and tracked by #1612.
       //
       // The square-problem contract holds here by construction: this branch is
       // entered only when `context == nullptr`, which is exactly when `s == tq`
