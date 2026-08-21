@@ -2112,7 +2112,7 @@ the `input.num_reqs <= 1` refusal.
   turned out to be. It is owed to `MODEL-NEMOTRON-H-ABI-A2P`. **The record for it
   landed on `main` on 2026-08-18, in
   [#1221](https://github.com/mudler/vllm.cpp/pull/1221) as `0ea5d249f`.** Both
-  writes are in this tree at this head. `.agents/issue-index.md:403` carries the
+  writes are in this tree at this head. `.agents/issue-index.md:404` carries the
   index row and names `MODEL-NEMOTRON-H-ABI-A2P` as its owning row.
   [`nemotron-h-a2p-paged-forward.md:901`](nemotron-h-a2p-paged-forward.md) lists
   the issue as the first bullet under that spec's `## 11. Owed`. The earlier
