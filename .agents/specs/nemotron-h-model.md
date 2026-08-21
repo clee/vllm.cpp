@@ -1974,12 +1974,14 @@ filed as #772 — rather than widening silently.
 
 ## Now
 
-**State at this commit: the row moves `INVENTORIED` -> `PARTIAL`, and that is a
-RECORD move, not a new capability.** Nothing in this change touches `src/`,
-`include/`, `tests/` or `scripts/`. What moved is the matrix row, which had
-described `main` as of 2026-08-12 and had stayed `INVENTORIED` while A2-R
-(`598226e96`), A2-P (`a6df72777`), A2-Q2a and the A3 driver (`c83b96934`) all
-landed on top of it.
+**State at this commit: the row STAYS `INVENTORIED`, and what changes is that
+its text stops being false.** Nothing in this change touches `src/`, `include/`,
+`tests/` or `scripts/`. The matrix row still described `main` as of 2026-08-12,
+having gone untouched while A2-R (`598226e96`), A2-P (`a6df72777`), A2-Q2a and
+the A3 driver (`c83b96934`) all landed on top of it. This reconcile corrects
+that description and records the A3 measurement against the tree it was taken
+on. It deliberately does NOT move the lifecycle state: see the gate paragraph
+below, which is why the move is not this change's to make.
 
 **The `KERNEL-SSM-MAMBA` block the row carried is FALSE and was measured so.**
 [#496](https://github.com/mudler/vllm.cpp/issues/496) landed its host arm at
@@ -1994,12 +1996,16 @@ locally", the non-gated `relu²` MoE (`4d0c399e1`) and ModelOpt
 `MIXED_PRECISION` loading (`1bc5ef82c`) both exist; only the MTP head (W5) is
 still genuinely owed.
 
-**`PARTIAL` and not `ACTIVE`, on a rule rather than a judgement.**
-`scripts/check-agent-record.py` requires an `ACTIVE` row to name a `CLAIM-*` row
-that a claim source carries. No file under `.agents/claims/` claims
-`MODEL-TEXT-nemotron-h-nemotron-hfor-causal-lm`, and authoring one for another
-session's in-flight work would be a fabricated record. `PARTIAL` is the state
-whose contract is exact code and test anchors, which this row now has.
+**Why no state move rides here.** The earlier draft of this section moved the
+row to `PARTIAL` on the strength of the A3 gate. That argument rested on the
+gate's pass being a property of a branch that was about to land, and the premise
+expired when it landed: the pass belongs to the tree measured, not to `main`
+today. A state move needs a gate result measured on `main`, and none exists. Two
+things remain true and are recorded rather than acted on: no file under
+`.agents/claims/` claims `MODEL-TEXT-nemotron-h-nemotron-hfor-causal-lm`, so
+`scripts/check-agent-record.py` would refuse `ACTIVE` regardless; and the row's
+code and test anchors are now exact, so whoever re-runs the gate has the
+contract `PARTIAL` requires already written down.
 
 **The end-to-end token gate PASSES, and it passes on a branch that is not
 `main`.** On GB10 the A3 96-token gate reads `TOKEN MATCH: 96/96 over 3
@@ -2021,14 +2027,18 @@ have been unmoved by that revert. **The delta is the proof; the pass on its own
 is not.** Evidence: `/usr/local/nas_share/rc/nh1157/` — `gate_fixed.out`,
 `gate_red.out`, `cfg.log`, `build.log`.
 
-**The pass is a property of [#1221](https://github.com/mudler/vllm.cpp/pull/1221),
-not of `main`.** That branch is `row/MODEL-NEMOTRON-H-ABI-A2P-1157-fix` at
-`6e9e8955`, OPEN and `CONFLICTING`. `main`'s last touch of
-`nemotron_h_device.cpp` is `a6df72777` (A2-P), so the tree this row describes
-does not carry the fix and the gate does not pass on it. This spec records a
-gate that passed, pending a merge. It does not record `main` as gated. One
-config caveat travels with the run: `--gpu-memory-utilization 0.92` did not size
-the KV pool, which fell back to 256 blocks ([#83](https://github.com/mudler/vllm.cpp/issues/83)).
+**The pass belongs to the tree it was measured on, which is now on `main` --
+and that is still not a pass on `main`.**
+[#1221](https://github.com/mudler/vllm.cpp/pull/1221) MERGED on 2026-08-18 as
+`0ea5d249f`, which is `main`'s last touch of `nemotron_h_device.cpp`, so the
+`device_token_ids` repair the 96/96 depended on is no longer pending. The 96/96
+was taken on that branch tree, `main` has advanced many commits since, and no
+run against current `main` exists. Naming the SHA a measurement belongs to is
+the point: an evidence line that names a tree it was not measured on has cost
+this repository before. This spec therefore records a measured result and its
+tree, and it does NOT record `main` as gated. One config caveat travels with the
+run: `--gpu-memory-utilization 0.92` did not size the KV pool, which fell back
+to 256 blocks ([#83](https://github.com/mudler/vllm.cpp/issues/83)).
 
 **No throughput, latency or memory number exists for this architecture and none
 is claimed.** The wall times in `gate_fixed.out` — 264.4s to load, 327-343s per
@@ -2037,11 +2047,10 @@ mamba projections still execute host-side. They are not benchmarks, they are not
 a denominator, and nothing may carry them into `docs/BENCHMARKS.md` as a
 performance figure.
 
-**Next action:** land [#1221](https://github.com/mudler/vllm.cpp/pull/1221) (the
-`device_token_ids` repair for #1157). Its A3 gate has already been run and has
-already passed — 96/96, `STRICT PASS`, on GB10 — so what remains is the merge,
-which is blocked on that pull request being `CONFLICTING`, not on any
-measurement. Then W5 (the MTP head, whose 270 tensors the loader already names
+**Next action:** re-run the A3 gate against `main`. #1221 has landed, so
+nothing is blocked on a merge any more; what is missing is a gate result
+measured on a `main` tree, which is the only thing that can move this row off
+`INVENTORIED`. Then W5 (the MTP head, whose 270 tensors the loader already names
 as owed) and W7 (GGUF k-quants). A2-Q2b (the device `lm_head`) is what removes
 `nemotron_h` from `scripts/runner-routing-allowlist.txt`; A2-B is what removes
 the `input.num_reqs <= 1` refusal.
