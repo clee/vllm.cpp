@@ -941,7 +941,7 @@ __global__ void PagedFlashWmmaKernel(Tout* out, const TQ* query, const TKV* k_ca
 // accumulator [16,d] resident across the whole key-tile loop (it is updated per
 // tile). At d=256 that is 16 KiB per head. The opt-in shared-memory ceiling is
 // QUERIED, not assumed — cudaDevAttrMaxSharedMemoryPerBlockOptin, cached in
-// vt/cuda/cuda_device_caps.h and enforced by SetDynamicSmemOptIn above; GB10/
+// vt/cuda/cuda_device_caps.h and enforced by its SetDynamicSmemOptIn; GB10/
 // sm_121 measures 101376 B (~99 KiB/block), so 8 O buffers (128 KiB) alone
 // exceed the ceiling — full 8x reuse is physically impossible on this GPU. The
 // QG below is still a COMPILE-time constant tuned to that measured ceiling: an
