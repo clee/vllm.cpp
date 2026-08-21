@@ -35,6 +35,7 @@
 #include "vllm/model_executor/models/dense_device_glue.h"  // Dev/DBuf/MakeTensor/Reshape
 #include "vllm/model_executor/models/dense_nvfp4_gemm.h"   // NVFP4 W4A16 dispatch
 #include "vllm/model_executor/models/device_pool.h"  // DevicePool/Pool/ActivePool (shared)
+#include "vllm/model_executor/models/kv_cache_route.h"  // KV-FP8 W3 store/read route
 #include "vllm/model_executor/models/qwen3.h"         // Qwen3DenseAttnWeights, PagedKvCache
 #include "vllm/model_executor/models/tensor_parallel.h"  // TensorParallel/TpAllReduceSum (W2)
 #include "vllm/platforms/interface.h"
@@ -510,9 +511,16 @@ inline DBuf AttnBlock(Dev d, const Qwen3DenseAttnWeights& w, const HfConfig& cfg
   // no-op, the common production case).
   Tensor kw = k3;
   Tensor vw = v3;
-  DBuf kcast(d, kv.dtype, {T, Hkv, Dh});
-  DBuf vcast(d, kv.dtype, {T, Hkv, Dh});
-  if (kv.dtype != adt) {
+  // KV-FP8 W3: on an fp8 cache there is NO cast to do. `vt::ReshapeAndCacheFp8`
+  // takes the model-dtype K/V and performs `Quantize(hp / k_scale|v_scale)`
+  // itself (`quant_utils.cuh:296-300`), so the buffers below are allocated at
+  // the SOURCE dtype and the branch is skipped — casting to `kI8` would be
+  // meaningless, and allocating a `kI8` scratch here would silently halve it.
+  const bool fp8_kv = IsFp8KvCache(kv);
+  const DType cast_dt = fp8_kv ? adt : kv.dtype;
+  DBuf kcast(d, cast_dt, {T, Hkv, Dh});
+  DBuf vcast(d, cast_dt, {T, Hkv, Dh});
+  if (!fp8_kv && kv.dtype != adt) {
     if (kv.dtype == DType::kBF16) {
       vt::CastBf16(d.q, kcast.t(), k3);
       vt::CastBf16(d.q, vcast.t(), v3);
@@ -525,13 +533,14 @@ inline DBuf AttnBlock(Dev d, const Qwen3DenseAttnWeights& w, const HfConfig& cfg
   }
   Tensor k_cache = KvSlice(kv, d.q.device, 0);
   Tensor v_cache = KvSlice(kv, d.q.device, 1);
-  vt::ReshapeAndCache(d.q, kw, vw, k_cache, v_cache, si.slot_mapping.t());
+  WriteKvCache(d.q, kv, kw, vw, k_cache, v_cache, si.slot_mapping.t());
 
   DBuf attn(d, adt, {T, Hq, Dh});
   const float scale = 1.0F / std::sqrt(static_cast<float>(Dh));
   vt::PagedAttentionArgs pa{scale, meta.causal};
   pa.query_start_loc_host = meta.query_start_loc.data();
   pa.max_seq_len = meta.max_seq_len;
+  ApplyKvCacheQuant(pa, kv);
   vt::PagedAttention(d.q, attn.t(), q3, k_cache, v_cache, si.block_table.t(),
                      si.seq_lens.t(), si.query_start_loc.t(), pa);
 

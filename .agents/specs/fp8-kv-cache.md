@@ -1,4 +1,4 @@
-# fp8 KV cache (`cache_dtype=fp8*`) — spike + W1 + W2 (`KV-FP8`, `QUANT-KV-FP8`)
+# fp8 KV cache (`cache_dtype=fp8*`) — spike + W1 + W2 + W3 (`KV-FP8`, `QUANT-KV-FP8`)
 
 Rows: `KV-FP8` (engine-matrix, KV cache and memory) and `QUANT-KV-FP8`
 (quantization-matrix). HIGH-priority feature gap #5
@@ -22,11 +22,16 @@ re-port).
 - **In (W2, `## W2 — the CUDA arm` below):** the CUDA fp8-e4m3 K/V store kernel
   and the fp8 dequant on the CUDA paged-attention read, gated for parity against
   the W1 CPU reference.
+- **In (W3, `## W3 — the runner integration` below):** half-sized KV blocks in
+  the real runner, `--kv-cache-dtype` threaded from the server flag through the
+  checkpoint's own `kv_cache_quant_algo` to the block sizing, and the checkpoint
+  `k_scale`/`v_scale` path with its declared-but-absent arm named rather than
+  defaulted.
 - **Out (named later bricks):** fp8_e5m2 compute on either backend,
   per-attention-head scales, the Metal and ROCm fp8-KV arms (both refuse by name
-  — see `## W2` below), the full engine-runner integration
-  (half-sized KV blocks in the real runner + checkpoint `k_scale`/`v_scale`
-  threading + `--kv-cache-dtype`/`--calculate-kv-scales` CLI), and the vendor
+  — see `## W2` below), `--calculate-kv-scales` (upstream's deprecated dynamic
+  scale), the C-ABI exposure of `--kv-cache-dtype`, the 17 architectures whose
+  attention blocks W3 refuses rather than routes, and the vendor
   KV dtypes (`fp8_inc`, `fp8_ds_mla` — `QUANT-KV-FP8-VENDOR`) and turboquant /
   nvfp4 / per-token-head KV (`KV-NVFP4-TURBO`).
 
@@ -164,7 +169,7 @@ vendor/turbo/nvfp4 KV dtypes are separate rows.
 | W0 | this spike | DONE (this commit) |
 | W1 | CPU fp8-e4m3 store + read dequant + config parse + unit gate | DONE (this commit) |
 | W2 | CUDA fp8-e4m3 store + fp8 paged-attention read (parity vs W1) | DONE (code + gate landed; the DEVICE cases are UNEXECUTED — see `## Owed`) |
-| W3 | runner/spec integration: half-sized KV blocks + checkpoint k/v_scale threading + `--kv-cache-dtype`/`--calculate-kv-scales` | later |
+| W3 | runner/spec integration: half-sized KV blocks + checkpoint k/v_scale threading + `--kv-cache-dtype` | DONE (code + CPU gate landed; see `## W3` and `## Owed`) |
 | W4 | memory-halving e2e on a gate model (the binding gate, DGX) | later |
 | W5 | fp8_e5m2 CPU+CUDA compute; per-attention-head scales | later |
 
@@ -267,6 +272,124 @@ then calls the same pointer with e4m3 to prove the guard refuses one kind rather
 than disabling the kernel. Bypassing the wrapper is deliberate and is the point
 of the case; the production path still goes through it, and G1/G1b/G2 gate that.
 
+## W3 — the runner integration (#1593)
+
+Issue: [#1593](https://github.com/mudler/vllm.cpp/issues/1593), the same issue
+that carries W2. W3 is what makes the fp8 KV cache a SERVED capability instead
+of a pair of kernels: half-sized KV blocks in the real runner,
+`--kv-cache-dtype` threaded from the flag to the block sizing, and the
+checkpoint `k_scale`/`v_scale` path.
+
+**Why it is on the critical path.** Benchmark campaign
+[#1574](https://github.com/mudler/vllm.cpp/issues/1574) measures us against vLLM
+and SGLang on `r0b0tlab/Qwen3.8-27B-NVFP4-MTP-sm121`. We already beat vLLM's AR
+baseline there (11.06 vs 9.71 tok/s) — with **bf16 KV against their fp8**, so we
+move twice the KV bytes for the same tokens. Until W3 the comparison was not
+matched, and [#415](https://github.com/mudler/vllm.cpp/issues/415) attributes a
+prefill gap to exactly this.
+
+### The resolution chain, mirrored
+
+Four upstream steps, in upstream's own order. Every anchor was read in
+`/home/mudler/_git/vllm` at `555967922` (`git rev-parse HEAD` =
+`5559679229bc961848b121ccdeaa8fa5d79bec98`).
+
+1. **`--kv-cache-dtype` vs the checkpoint** — `resolve_kv_cache_dtype_string`
+   (`vllm/utils/torch_utils.py:374-392`) + `get_kv_cache_quant_algo_string`
+   (`:310-362`) + `MODELOPT_TO_VLLM_KV_CACHE_DTYPE_MAP` (`:64-67`). Ported as
+   `vllm::ResolveKvCacheDTypeString` (`include/vllm/config/cache.h`,
+   `src/vllm/config/cache.cpp`) and called ONCE, from
+   `LoadedEngine::FromModelDir`, exactly where `EngineArgs.create_engine_config`
+   calls it before constructing `CacheConfig` (`vllm/engine/arg_utils.py:
+   1915-1929`). An explicit value is returned unchanged and the checkpoint is
+   never consulted (`:380-381`) — the operator outranks the checkpoint, which
+   `attention.py:279-290` restates in its own comment.
+2. **String to storage dtype** — `kv_cache_dtype_str_to_dtype` (`:394-401`) over
+   `STR_DTYPE_TO_TORCH_DTYPE` (`:32-52`), where every fp8 CacheDType maps to
+   `torch.uint8`. W1's `vllm::v1::ParseCacheDType` already did this; W3 adds no
+   parsing.
+3. **Storage dtype to bytes** — `GPUModelRunner.__init__` resolves ONE
+   `self.kv_cache_dtype` (`vllm/v1/worker/gpu_model_runner.py:484-486`) and every
+   attention spec is built with it; `AttentionSpec.real_page_size_bytes`
+   (`vllm/v1/kv_cache_interface.py:204-218`) is linear in
+   `get_dtype_size(self.dtype)`. Ported as `vllm::v1::ApplyCacheDType`
+   (`src/vllm/v1/kv_cache_interface.cpp`), called from
+   `LoadedEngine::ApplyResolvedCacheDType` on the PROBE config **before**
+   `ResolveNumBlocks` reads its geometry. That ordering is the feature: the
+   probe's `KVBytesPerBlock` is the divisor knob 2 sizes the pool with, so an
+   fp8 page halves the divisor and doubles the block count at the same
+   `--kv-cache-memory`. Applying it afterwards would serve the same pool in half
+   the bytes instead of twice the pool.
+4. **The scales** — `BaseKVCacheMethod.process_weights_after_loading`
+   (`vllm/model_executor/layers/quantization/kv_cache.py:74-156`), ported as
+   `vllm::ResolveKvCacheScales`
+   (`include/vllm/model_executor/layers/quantization/kv_cache.h`).
+
+### The trap this checkpoint sets
+
+`r0b0tlab/Qwen3.8-27B-NVFP4-MTP-sm121` @ `36f717a2` declares
+`kv_cache_quant_algo: "FP8"` in `hf_quant_config.json` and ships **ZERO**
+`k_scale`/`v_scale` tensors. MEASURED 2026-08-21 from the public
+`model.safetensors.index.json`: 2001 tensors, none of them named `k_scale`,
+`v_scale` or `kv_scale`.
+
+So the default scale 1.0 has to be reached DELIBERATELY, by a path that knows
+the algorithm was declared and the tensors were absent — not by falling off the
+end of a missing-tensor lookup. The two are indistinguishable at runtime and
+produce identical output, right up to the first checkpoint that declares no
+algorithm at all, at which point the accidental path silently invents a scale
+for a cache nobody asked to quantize.
+
+Upstream keeps them apart STRUCTURALLY and this port mirrors that.
+`process_weights_after_loading` reaches the scale block at all only under
+`is_quantized_kv_cache(layer.kv_cache_dtype)` (`kv_cache.py:100-102`); INSIDE
+it, both scales still holding the `KVCacheScaleParameter` sentinel `-1.0`
+(`:18-30`) is the separate "no scales were loaded" arm that takes 1.0 and warns
+(`:112-116`, `:150-156`). `KvScaleOrigin` names all four arms, and
+`ScalesForFp8Store` REFUSES `kNotQuantized` by name rather than answering 1.0.
+`G2` gates the difference: two calls with identical numbers out, distinguished
+only by `origin`, and the refusal message names `kv_cache_quant_algo`.
+
+### The store and the read
+
+`PagedKvCache` gains `fp8_kind`/`k_scale`/`v_scale`, carried from the layer's
+own `AttentionSpec` by the runner. `dense_attn::WriteKvCache` and
+`dense_attn::ApplyKvCacheQuant`
+(`include/vllm/model_executor/models/kv_cache_route.h`) are the ONE place that
+decides float versus fp8, and `IsFp8KvCache` refuses a view whose storage dtype
+and fp8 interpretation disagree — a `kI8` page with no fp8 kind, or an fp8 kind
+over a float page, is a mis-sized cache and never a mode.
+
+**Routed in W3:** the shared seam `dense_attn::AttnBlock`
+(`include/vllm/model_executor/models/dense_attn_block.h`) and
+`src/vllm/model_executor/models/qwen3_5.cpp` — the Qwen3.5/3.8 family, which is
+the benchmark subject. **Every other architecture is refused BY NAME**:
+`vt::ReshapeAndCache` now rejects a `kI8` cache with a message naming
+`vt::ReshapeAndCacheFp8` and saying the architecture is not routed. That is the
+whole point of putting the refusal at the store rather than leaving the float
+path to index a half-sized page: the failure is a sentence, not wrong tokens.
+
+### Gates
+
+`tests/vllm/entrypoints/test_kv_cache_fp8_wiring.cpp` — **18 cases / 83
+assertions GREEN** on a CPU-only Release build.
+
+| Case | What it would let through if it were missing |
+|---|---|
+| G1 | the checkpoint declaration is read, and an explicit flag outranks it |
+| G2 | a declared-but-absent scale collapsing into "nothing declared" |
+| G3 | an fp8 page that is not EXACTLY half a bf16 page (closed form, not a ratio) |
+| G4 | the same halving through the LOADER: one byte budget, 2x the blocks; and the Mamba state left alone |
+| G5 | the fp8 path not being REACHED — the engine generates tokens over an fp8 cache |
+| G6 | a storage dtype and an fp8 interpretation that disagree |
+| G7 | an unrouted architecture writing floats into a half-sized page |
+| G8 | MLA, `float16` and `fp8_e5m2` being mis-sized instead of refused |
+
+G4 and G5 enter through the production entry point (the `LoadedEngine`
+constructor → `MakeKVCacheResolved` → `ApplyResolvedCacheDType` →
+`ResolveNumBlocks` → the runner → `Qwen3_5DenseModel::Forward`), not by
+constructing a spec or a `PagedKvCache` by hand.
+
 ## Owed
 
 - **The W2 device gates are UNEXECUTED** (#1593). `tests/vt/test_cuda_fp8_kv_cache.cpp`
@@ -306,12 +429,46 @@ of the case; the production path still goes through it, and G1/G1b/G2 gate that.
   owes the "CUDA TUs are UNCOMPILED" clause in
   [`.agents/engine-matrix.md`](../engine-matrix.md) and
   [`.agents/quantization-matrix.md`](../quantization-matrix.md).
-- **Nothing reaches the fp8 KV path from a production entry point yet**, on
-  either backend. `vt::ReshapeAndCacheFp8` and `PagedAttentionArgs::kv_cache_dtype`
-  have no caller outside their tests; W1 landed in that state and W2 does not
-  change it. **`KV-FP8` W3 owns the wiring** — half-sized KV blocks in the runner,
-  `--kv-cache-dtype` threaded from the CLI, and the checkpoint `k_scale`/`v_scale`
-  path — and it is tracked by #1593 alongside W2.
+- **RESOLVED by W3 on the CPU leg, still owed on the device.** W1 and W2 landed
+  with nothing reaching the fp8 KV path from a production entry point on either
+  backend. W3 wires it: `--kv-cache-dtype fp8` on the server flag now sizes
+  half-width KV blocks and the routed attention blocks call
+  `vt::ReshapeAndCacheFp8` and the scaled read, gated end to end on CPU by
+  `test_kv_cache_fp8_wiring` G5. The CUDA arm rides the SAME `PagedKvCache`
+  fields and the same two routing helpers, so it is wired by construction — and
+  it is still UNMEASURED for the reason the two bullets above give.
+- **W3: the C ABI does not expose `--kv-cache-dtype`** (#1593). The flag reaches
+  the engine through `src/vllm/entrypoints/openai/server_main.cpp` and
+  `EngineParams::kv_cache_dtype`, and NOT through `include/vllm.h` /
+  `src/capi/vllm_c.cpp` / `examples/cli/main.cpp`, which the W3 dispatch's
+  authority did not cover (it named `src/vllm/**`, `include/vllm/**`,
+  `src/vt/**`). AGENTS.md requires every shipped capability to be reachable from
+  `include/vllm.h`, so this is debt and not a design: a C-ABI caller cannot ask
+  for an fp8 KV cache today unless the CHECKPOINT declares one, which the loader
+  does honour on every path including that one. The ABI field, its version bump
+  and its `test_capi` case are owed here.
+- **W3: 17 architectures are refused rather than routed** (#1593). W3 routes the
+  shared seam `dense_attn::AttnBlock` and `src/vllm/model_executor/models/
+  qwen3_5.cpp`. The other direct `vt::ReshapeAndCache` call sites —
+  `glm4`, `minicpm`, `opt`, `gemma`, `gemma2`, `gemma3`, `gemma4` (two sites),
+  `commandr`, `phi`, `phi3`, `muse_glimmer`, `stablelm`, `qwen3_vl`, `olmo2`,
+  `granite` and `nemotron_h_device` — keep their own attention preambles and
+  refuse `--kv-cache-dtype fp8` by name at the store. Routing each is one call
+  swapped for `dense_attn::WriteKvCache` plus one `ApplyKvCacheQuant`, and each
+  needs its own gate.
+- **W3: no weight loader extracts `k_scale`/`v_scale`** (#1593). `ResolveKvCacheScales`
+  mirrors all four of upstream's arms, and the loader calls it with the
+  `KVCacheScaleParameter` unloaded sentinel for both scales, so every declaring
+  checkpoint lands on `kDeclaredButAbsent` and serves at 1.0. That is CORRECT for
+  the #1574 gate checkpoint, which ships zero KV scales — but the two
+  checkpoint-loaded arms (`kCheckpoint`, `kCheckpointKvScale`) are unit-gated and
+  unreached, and a calibrated checkpoint would silently serve uncalibrated. The
+  per-layer scale-tensor read, and a per-layer (rather than per-engine) scale on
+  `AttentionSpec`, are owed.
+- **W3: `--calculate-kv-scales` is refused, not implemented** (#1593). Upstream's
+  dynamic on-the-fly scale (`config/cache.py:111`) is deprecated there for
+  removal in v0.19; `ResolveKvCacheScales` refuses it BY NAME rather than
+  silently taking the static arm, and no flag exposes it.
 - **Metal and ROCm have no fp8 KV arm.** Both refuse by name (see above). Neither
   has a row yet; they belong with W5's per-head/e5m2 work or a backend row.
 - fp8_e5m2 and per-attention-head scales stay refused on both backends (W5).

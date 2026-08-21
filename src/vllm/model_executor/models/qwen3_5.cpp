@@ -17,6 +17,7 @@
 #include "vllm/model_executor/models/qwen3_5.h"
 
 #include "vllm/model_executor/models/decode_graph_sizes.h"
+#include "vllm/model_executor/models/kv_cache_route.h"  // KV-FP8 W3 store/read route
 #include "vllm/model_executor/models/dense_fp8_block_gemm.h"  // MODEL-FP8-BLOCK-LINEAR (#1189 M4)
 #include "vllm/model_executor/models/device_pool.h"  // DevicePool/Pool/AuxPool/ActivePool (shared)
 
@@ -5301,8 +5302,13 @@ DBuf FullAttnBlockPaged(Dev d, const FullAttnLayerWeights& w, const HfConfig& cf
   const int rot = static_cast<int>(cfg.rotary_dim);
   const float base = static_cast<float>(cfg.rope_theta);
   const float eps = static_cast<float>(cfg.rms_norm_eps);
-  VT_CHECK(kv.dtype == DType::kBF16 || kv.dtype == DType::kF32,
-           "full-attn paged: KV cache must be bf16 or f32");
+  // KV-FP8 W3: a third storage dtype joins the two float ones — 1-byte fp8
+  // (`vt::DType::kI8`), which `dense_attn::IsFp8KvCache` admits only together
+  // with a matching fp8 interpretation, so a bare `kI8` view still fails here.
+  VT_CHECK(kv.dtype == DType::kBF16 || kv.dtype == DType::kF32 ||
+               dense_attn::IsFp8KvCache(kv),
+           "full-attn paged: KV cache must be bf16, f32, or 1-byte fp8 "
+           "(--kv-cache-dtype fp8)");
   VT_CHECK(kv.num_kv_heads == Hkv && kv.head_size == Dh,
            "full-attn paged: KV cache head dims mismatch config");
 
@@ -5443,7 +5449,11 @@ DBuf FullAttnBlockPaged(Dev d, const FullAttnLayerWeights& w, const HfConfig& cf
   Tensor dblk = sdi.block_table.t();
   Tensor dsl = sdi.seq_lens.t();
   Tensor dqsl = sdi.query_start_loc.t();
-  vt::ReshapeAndCache(d.q, kw, vw, k_cache, v_cache, dslot);
+  // KV-FP8 W3: routes to `vt::ReshapeAndCacheFp8` when this layer's cache is
+  // 1-byte fp8. The `if (kv.dtype == DType::kBF16)` cast block above is already
+  // correct for that case — it leaves K/V at the model dtype, which is exactly
+  // what the fp8 store takes.
+  dense_attn::WriteKvCache(d.q, kv, kw, vw, k_cache, v_cache, dslot);
 
   // bf16 attention out on an FA2 path (FA2 writes bf16; the sigmoid
   // gate upcast is exact) — f32 everywhere else, byte-identical to today.
@@ -5460,6 +5470,7 @@ DBuf FullAttnBlockPaged(Dev d, const FullAttnLayerWeights& w, const HfConfig& cf
   vt::PagedAttentionArgs pa_args{scale, meta.causal};
   pa_args.query_start_loc_host = meta.query_start_loc.data();
   pa_args.max_seq_len = meta.max_seq_len;
+  dense_attn::ApplyKvCacheQuant(pa_args, kv);
   vt::PagedAttention(d.q, dattn.t(), qn3, k_cache, v_cache, dblk, dsl, dqsl, pa_args);
 
   // VT_DUMP_ATTN (issue #41, 0.8B ROCm divergence spike W1/W2): dump the

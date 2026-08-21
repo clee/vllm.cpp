@@ -79,6 +79,44 @@ reports every file as `already in the cache` and transfers no bytes. Before
 nothing at all, because the hub answers with a relative `Location` header that
 the client read as a URL.
 
+### Halve the KV cache with `--kv-cache-dtype fp8`
+
+Store the paged K/V as 1-byte fp8-e4m3 instead of 2-byte bf16. The KV block
+halves, so the same memory budget holds twice the context:
+
+```sh
+build/examples/vllm-server \
+  --model /path/to/model \
+  --kv-cache-dtype fp8 \
+  --kv-cache-memory 8589934592
+```
+
+Values are vLLM's own `CacheDType` names. `auto` is the default and uses the
+model dtype. `fp8` and `fp8_e4m3` select the quantized store; `bfloat16` names
+the default storage dtype explicitly. `float16` and `fp8_e5m2` parse and are
+then refused by name, because no attention block writes either yet.
+
+**The checkpoint can ask for it.** When you pass no flag, the server reads the
+checkpoint's `hf_quant_config.json` (or `config.json`'s `quantization_config`)
+and honours a declared `kv_cache_quant_algo`, printing one line naming what it
+resolved. An explicit `--kv-cache-dtype` always wins over the declaration. This
+mirrors vLLM's `resolve_kv_cache_dtype_string`.
+
+**Accuracy.** A checkpoint that declares fp8 KV but ships no `k_scale`/`v_scale`
+tensors serves on the default scale 1.0, and the server says so on stderr. That
+is the documented default, not a silent one — and a checkpoint that declares
+nothing never reaches it.
+
+**Coverage.** The store and the scaled read are routed for the Qwen3.5/3.8
+family and for the shared dense-attention seam. An architecture that carries its
+own attention preamble refuses the flag by name at the first KV write rather
+than writing floats into a half-sized block. Metal and ROCm refuse it too. See
+[the row spec](../.agents/specs/fp8-kv-cache.md) for the exact list.
+
+**Not on the C ABI yet.** `vllm_model_params` carries no `kv_cache_dtype` field,
+so a C-ABI caller reaches the fp8 cache only through a checkpoint that declares
+it. Tracked by [#1593](https://github.com/mudler/vllm.cpp/issues/1593).
+
 ## Draft with a second checkpoint
 
 Speculative decoding runs a small draft model beside the target and verifies its
