@@ -361,6 +361,154 @@ W5 gates, mutations, and the record edits the change makes stale.
 | the res_2s arm's `denoise.update` anchor | **owed, no issue yet.** `Ltx2Res2sDenoisingLoop` runs its own post-process and step inside `ltx2_res2s.cpp` through `Ltx2Res2sHooks`, so the anchor needs a hook rather than a statement. No gate in this tree renders on that arm, so landing it here would land dead code |
 | a per-gap decomposition IN the emitted table | **owed, no issue yet.** This row computed the gap table in a scratch script to find the 92% region. A reader of `phase-log.json` still cannot see it without one, and the same investigation will be re-derived the next time the residue moves |
 
+## Outcome
+
+Landed on `row/LTX25-PHASE-RESIDUE`, base
+`67823aee22d052cb53e08f5793fd899b2d0a582f`, issues
+[#1536](https://github.com/mudler/vllm.cpp/issues/1536),
+[#1439](https://github.com/mudler/vllm.cpp/issues/1439),
+[#1494](https://github.com/mudler/vllm.cpp/issues/1494),
+[#1470](https://github.com/mudler/vllm.cpp/issues/1470).
+
+Every number below is x86_64, `cmake -S . -B build -DVLLM_CPP_BUILD_TESTS=ON`
+with an **empty** `CMAKE_BUILD_TYPE`, which is what `build-test-cpu` uses. The
+box was shared with three to five other sessions running this same suite
+throughout, at load averages between 44 and 111. That is stated because it is
+the whole subject: the two assertions this row replaced decided by exactly that
+number, and the ones that replace them did not move with it.
+
+### What the defect was, and what it was not
+
+**It was one un-named region, and nobody had looked.** Four issues across three
+months argued about whether 0.95 was the right tolerance. Splitting
+`unaccounted_seconds` into the gaps between consecutive leaves took one pass over
+the table the render already writes:
+
+| gap | ms | share of the 19.178 ms residue |
+|---|---:|---:|
+| `<origin>` → `load.dit` | 17.661 | **92.09%** |
+| `load.dit` → `load.video_vae` | 0.950 | 4.95% |
+| `load.prompt_embeds` → `generate.setup` | 0.249 | 1.30% |
+| `artifacts.audio` → `WriteJson` | 0.210 | 1.09% |
+| the other 16 gaps, together | 0.108 | 0.56% |
+
+The 16 gaps between adjacent named phases hold 6.8 us each, which is the
+instrument and nothing else. The 17.661 ms is `Ltx2VideoEngine::Load` from the
+timeline's origin to `Open("load.dit")` — the platform probe, the device
+resolution, the recipe and checkpoint-class resolution, and
+`SafetensorsFile::Open(params.dit_path)`.
+
+**The hypothesis #1536 asked to test first is refuted.** `d995c52f0`'s temporal
+x2 upsampler runs inside `phase.upsample_latent`, a named leaf. It does not
+appear in the residue at all.
+
+**The coverage miss was un-anchored WORK, not overhead, and the shape proves
+it.** Three of the four carrying leaves miss by 7-42 us per sub-record — the same
+per-boundary figure the inter-leaf gaps show. `denoise` missed by **49.1 us per
+step at nine frames and 343.4 us per step at 81**, a 7x move with the latent
+inside one run of one binary. Instrument cost does not do that. The case's own
+comment had already named the culprit ("the post-process and the Euler or res_2s
+step, which no anchor wraps") and had left it un-anchored while tuning the
+threshold around it. `denoise_min_coverage` being a PARAMETER — 0.95 at nine
+frames, 0.90 at 81 — was that work leaking into a number.
+
+### What was rejected, measured rather than argued
+
+* **A bigger constant.** [#1466](https://github.com/mudler/vllm.cpp/issues/1466)
+  rejects it as a class and the residue decomposition says why it would have been
+  wrong here: at 0.95 the gate had 13.1 ms of budget and the defect was 17.7 ms,
+  so the number that would have passed is one that also passes a load prologue
+  twice as large. There is no constant that separates them, because the quantity
+  on the other side is the render's wall.
+* **Naming the un-named time and keeping the ratio**, which is what #1439 itself
+  proposed as one of two options. Rejected on measurement: after the naming the
+  residue is 16.2 ms of an 11.7 s wall, so 95% leaves 570 ms of headroom at this
+  fixture scale and the gate becomes untestable, while at the 21 B render it
+  still permits minutes. A ratio whose margin is that asymmetric is not a gate at
+  either end.
+* **Bounding the residue with a fixed number of seconds.** It is the same defect
+  with the scale inverted: a constant tuned on a 0.26 s fixture reds a 2.5 h
+  render's ordinary instrument cost, and one tuned on the 2.5 h render passes a
+  fixture whose whole load is un-named.
+* **Asserting only the leaf's HEAD and TAIL** — the part outside the anchor
+  window — which would have needed no new anchors at all. Rejected because
+  `denoise`'s tail legitimately contains one whole sampler update, so the bound
+  would have had to absorb 343 us of real work and would have measured nothing.
+* **A res_2s update anchor.** Recorded under `## Owed` rather than landed. It
+  needs a hook through `Ltx2Res2sHooks` rather than a statement, and no gate in
+  this tree renders on that arm, so it would have landed dead.
+
+### The instrument, and the one thing it was not measuring
+
+The rule is one sentence, in `render_phase_log.cpp`: every interval of the
+instrument's own wall is charged to the innermost live NON-SPAN record at the
+moment it is spent, and to the table when none is live.
+
+**The sampler JOIN was the piece that had to be added after the first
+measurement.** `Close` hands the worker thread out under the mutex and joins it
+with the lock released, so on the last close of a timeline the notify-and-join
+lands in the residue. Uncharged, it read as time nobody named: the
+`instrument's own cost is conserved` unit case measured a two-scope timeline
+whose gaps contain NOTHING reporting **0.000346 s of residue against a 0.000111 s
+charge, a ratio of 3.12** — indistinguishable from a real un-named phase.
+Charging it costs a second lock acquisition on a path that runs twice per
+process. That is why the rule is stated as "every interval" rather than "every
+boundary".
+
+`WriteJson` also reads `Elapsed()` before it copies and sorts the record vector
+rather than after. The writer's own serialization was being charged to the
+render's wall, and therefore to the residue.
+
+### The measured ratios, which are what makes the bound defensible
+
+`kInstrumentBudget = 2` says the part of a gap the instrument cannot measure is
+at most as large as the part it can. Measured, on the loaded box described above:
+
+| where | uncovered / charged |
+|---|---:|
+| the table, one-render case | **1.32** |
+| `denoise`, 9 frames | 1.08 |
+| `denoise`, 81 frames | 1.10 |
+| `decode.audio`, 9 frames | 1.08 |
+| `decode.audio`, 81 frames | 1.08 |
+| `decode.video`, 9 frames | 1.26 |
+| `decode.video`, 81 frames | 1.22 |
+| `artifacts.frames`, 9 frames | 1.41 |
+| `artifacts.frames`, 81 frames | 1.25 |
+| the `unit.parent` unit case | 1.21 |
+
+The largest is 1.41 and most sit near 1.1. The spec's stop condition was that a
+ratio far from 1 would mean the instrument does not measure enough of its own
+gap and the bound would be a constant nobody derived; it is not, and the join
+charge above is the one place where it WAS and was repaired rather than absorbed
+into a larger factor.
+
+### What is stricter, stated as the numbers at both ends
+
+| | old gate permits | new gate permits |
+|---|---|---|
+| the fixture, wall 0.26 s | 13.1 ms un-named | ~0.6 ms, twice the measured charge |
+| a 2.5 h render | **7.5 minutes** un-named | milliseconds, twice the measured charge |
+| `decode.audio` at 0.99 | 83 ms un-anchored at fixture scale | ~0.13 ms |
+| `denoise` at 0.90, 81 frames | 3.9 ms un-anchored | ~0.5 ms |
+
+The replacement is tighter at fixture scale and five orders of magnitude tighter
+at the scale the tolerance was originally argued for. That is the whole defence
+for replacing an assertion rather than editing its constant, and it is why this
+change is not the thing `AGENTS.md` forbids.
+
+### A trap that is named rather than engineered around
+
+`PhaseLog`'s origin is the LOAD, so the gap between `vllm_video_engine_load`
+returning and `vllm_video_generate` being called is inside `wall_seconds` and
+inside no leaf. In the `SUMS to wall` case that gap is two span boundaries and
+their sampler threads, and it is charged. In the two-render attribution case the
+same kind of gap holds the TEST's own assertions between two `Generate` calls,
+2.879 ms of them, which is why that case's table-level ratio reads 10.45 and why
+the table-level bound is asserted in the one-render case only — as it always was.
+A future case that does real work between load and generate will red the sum
+assertion, correctly and confusingly. The test says so beside the line.
+
 ## Stop conditions
 
 * Stop and return `NEEDS_DECISION` if the measured `unaccounted /

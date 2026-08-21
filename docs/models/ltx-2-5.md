@@ -239,8 +239,11 @@ Each completed render writes `<workdir>/phase-log.json`. The C ABI function
 render does not leave a partial file.
 
 Use `sum_leaf_seconds` for the accounted total. `unaccounted_seconds` reports
-time outside named phases. The file labels itself as diagnostic output, not a
-benchmark.
+time outside named phases. `instrument_seconds` reports how much of that residue
+the instrument itself spent, at the top of the file for the table and on each
+phase for that phase's own sub-scope boundaries. Subtract it before reading
+`unaccounted_seconds` as work nobody named. The file labels itself as diagnostic
+output, not a benchmark.
 
 Set `VLLM_RENDER_PHASE_LOG_STDERR=1` to print the phase table. Set
 `VLLM_RENDER_PHASE_SAMPLER=0` to disable the 100 ms memory sampler. The normal

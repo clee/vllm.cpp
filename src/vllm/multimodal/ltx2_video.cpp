@@ -414,7 +414,7 @@ constexpr char kLtx2DurationHeadPathExtra[] = "duration_head_path";
 // they are no longer trusted: the list below is derived from this file on every
 // run and compared, and the failure prints the replacement to paste in.
 // READER ANCHORS (derived and gated by test_ltx2_video):
-// 902 912 913 981 1077 1093 1159 1163 1256 1318 1426 1468 1510 1512
+// 917 927 928 1007 1103 1119 1185 1189 1285 1347 1455 1497 1539 1541
 
 const char* const kKnownLoadExtras[] = {
     kLtx2AudioPromptEmbedsExtra, kLtx2PipelineKindExtra,   kLtx2ModelVersionExtra,
@@ -764,6 +764,21 @@ std::unique_ptr<Ltx2VideoEngine> Ltx2VideoEngine::Load(const VideoModelParams& p
   phase::PhaseLog::Instance().Begin();
   phase::PhaseLog::Instance().SetRender(0);
   const phase::Scope load_span("load", /*span=*/true);
+  // ── W0 repair (row LTX25-PHASE-RESIDUE, #1536): THE LOAD'S PROLOGUE ───────
+  //
+  // Everything from here to `load.dit` was inside the `load` SPAN and inside no
+  // LEAF, and `Sum` skips spans, so it was the largest single hole in the phase
+  // table: **17.661 ms of a 19.178 ms residue, 92% of it**, on the 64x64x9
+  // fixture. That is the platform probe, the device resolution, the recipe and
+  // checkpoint-class resolution, and `SafetensorsFile::Open(params.dit_path)`
+  // below, which on a 1775-tensor 21 B manifest is not a free call.
+  //
+  // The sum gate's own message asked for exactly this — "The missing time is a
+  // phase nobody named, and W0 iterates until it is" — and four issues argued
+  // about the tolerance instead, because nothing decomposed the residue into the
+  // gaps between the leaves. It is named rather than rounded away, which is this
+  // instrument's stop condition.
+  phase::Scope load_setup("load.setup");
 
   // ── where this engine runs (phase L8) ─────────────────────────────────────
   //
@@ -923,6 +938,12 @@ std::unique_ptr<Ltx2VideoEngine> Ltx2VideoEngine::Load(const VideoModelParams& p
     if (!lora_strength.empty()) spec.strength = ParseLoraStrength(lora_strength);
     dit_options.loras.push_back(std::move(spec));
   }
+  // CLOSED BEFORE `load.dit` OPENS, and this is not tidiness. A leaf opened
+  // while another leaf is live is marked `nested` and dropped from
+  // `sum_leaf_seconds` (`render_phase_log.cpp`, `PhaseLog::Open`), so leaving
+  // the prologue open across the DiT load would take the largest phase of the
+  // whole render OUT of the table's sum instead of adding the prologue to it.
+  load_setup.Close();
   {
     // W0: the phase the campaign's W2 and W3 both act on. It covers the
     // materialization AND the per-tensor device staging, because from the
@@ -931,6 +952,11 @@ std::unique_ptr<Ltx2VideoEngine> Ltx2VideoEngine::Load(const VideoModelParams& p
     im.dit = im.on_device ? Ltx2StreamDitToDevice(*im.queue, dit_file, dit_options)
                           : Ltx2LoadDitFromSafetensors(dit_file, dit_options);
   }
+  // W0 repair (row LTX25-PHASE-RESIDUE, #1536): the SECOND hole, 0.950 ms of the
+  // same 19.178 ms residue and 5% of it. Everything from here to
+  // `load.video_vae` — the DiT config resolution below, plus the recipe
+  // validation that reads it — sat inside the `load` span and inside no leaf.
+  phase::Scope dit_config_phase("load.dit_config");
 
   // ── the config the SHAPES cannot see ──────────────────────────────────────
   //
@@ -1183,6 +1209,9 @@ std::unique_ptr<Ltx2VideoEngine> Ltx2VideoEngine::Load(const VideoModelParams& p
   // nothing else, and refusing it would break a caller who reuses one params
   // object across pipelines.
   if (params.video_vae_path.empty() && !im.recipe.audio_only) Fail("video_vae_path is required");
+  // Closed for the same reason `load.setup` is: a leaf still open here would
+  // make `load.video_vae` nested and drop it from the table's sum.
+  dit_config_phase.Close();
   if (!params.video_vae_path.empty()) {
     const phase::Scope video_vae_phase("load.video_vae");
     const SafetensorsFile f = SafetensorsFile::Open(params.video_vae_path);
@@ -4466,6 +4495,26 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
         // first-order loop passes its own loop counter straight through
         // (samplers.py:45, :503) — which is what `should_skip_step` reads.
         Evaluate(video.latent, audio.latent, static_cast<double>(sigma), step, v_raw, a_raw);
+        // ── W0 repair (row LTX25-PHASE-RESIDUE, #1494): THE SAMPLER'S OWN WORK
+        //
+        // `denoise.step` wraps the denoiser EVALUATION and closes when
+        // `Evaluate` returns. Everything below it — the post-process and the
+        // Euler or ancestral update — is the sampler's own work, it sits between
+        // two `denoise.step` records, and until this line no anchor wrapped it.
+        // That is the whole of the coverage gate's miss, and the shape of the
+        // miss is what proves it is work and not overhead: 49 us per step at
+        // nine frames against 343 us per step at 81 frames, in ONE run of one
+        // binary. Instrument cost does not move 7x with the latent.
+        //
+        // Nested, so the sum does not move: it is opened while `denoise` is
+        // live, and `PhaseLog::Open` marks that automatically.
+        //
+        // COUNTED BY THE RENDER, not by the instrument, for the reason
+        // `video_decode_chunks` is: the containment gate's record-count
+        // assertion is the only one there that is not a ratio, and a denominator
+        // derived from the phase table could not falsify a phase table.
+        const ::vllm::multimodal::phase::Scope update_phase("denoise.update");
+        im.trace.sampler_updates += 1;
         // `_step_state` (samplers.py:35) blends before it steps.
         const std::vector<float> v_denoised = PostProcessLatent<float>(v_raw, video);
         const std::vector<float> a_denoised = PostProcessLatent<float>(a_raw, audio);
@@ -5313,6 +5362,14 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
     WriteFileBytes(result.audio_path,
                    MiniMaxH3WriteWav(waveform, audio_channels, audio_samples, audio_rate));
   }
+  // W0 repair (row LTX25-PHASE-RESIDUE, #1536): THE TAIL, 0.210 ms of the same
+  // residue. The result assembly and the mux argv build below ran after the last
+  // named leaf closed and before `WritePhaseLog` read the clock, so they were
+  // time nobody named in every table this instrument has ever written. `mux`
+  // rather than `finish` because `phase.finish` already names something else —
+  // what a RECIPE PHASE does after its sampler — and two names one letter apart
+  // for two different things is how a reader mis-ranks a lever.
+  phase::Scope mux_phase("artifacts.mux");
   result.frame_count = rendered_frames;
   result.width = rendered_w;
   result.height = rendered_h;
@@ -5338,6 +5395,7 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
   im.trace.completed = true;
   // W0 (#1010): the table, beside the frames it explains. The enclosing span is
   // closed BEFORE the write so this render's own span appears in its own file.
+  mux_phase.Close();
   generate_span.Close();
   WritePhaseLog(gen.output_dir, kLtx2VideoFamily, phase_device, &result.phase_log_path);
   return result;

@@ -97,6 +97,8 @@ struct PhaseLog::Impl {
   // adding it to the sum would make the residue negative rather than visible.
   struct Open {
     size_t handle = 0;
+    // THE INSTRUMENT'S OWN WALL, charged to this record. See `ChargeLocked`.
+    double instrument = 0.0;
     std::string name;
     int64_t render = 0;
     double start = 0.0;
@@ -112,6 +114,10 @@ struct PhaseLog::Impl {
   int64_t render = 0;
   size_t next_handle = 1;
   int64_t samples = 0;
+  // The instrument's own wall that no LEAF absorbed, i.e. the part of
+  // `unaccounted_seconds` this instrument spent rather than the render. See
+  // `ChargeLocked`.
+  double instrument_gap = 0.0;
   std::vector<Open> open;
   // Per-unit tick clock for the live lane, so `last=` is the interval between
   // two occurrences of the SAME unit rather than since any other line.
@@ -145,9 +151,56 @@ struct PhaseLog::Impl {
     std::fflush(stderr);
   }
 
+  // ── THE INSTRUMENT'S OWN WALL (row LTX25-PHASE-RESIDUE) ───────────────────
+  //
+  // WHY THIS EXISTS. `unaccounted_seconds` and the uncovered part of a leaf both
+  // contain a term this instrument creates and never reported: the wall it
+  // spends inside its own entry points while no record — or no CHILD of the
+  // record — is open. `Open` stamps `start` after taking this mutex, so the
+  // mutex wait is before the new record begins; `Close` stamps `end` before it
+  // prints its progress line and erases the entry, so that tail is after the
+  // record ends. Both land outside every record, and until this row nothing
+  // could tell them from a phase nobody named. Two gates were comparing that
+  // mixture against a share of the render's wall, which is why both decided by
+  // box load at fixture scale (#1439, #1494, #1470, #1536).
+  //
+  // THE RULE IS ONE SENTENCE: every interval of the instrument's own wall is
+  // charged to the innermost live NON-SPAN record at the moment it is spent, and
+  // to the table when none is live. A span is excluded because `Sum` excludes
+  // spans, so time inside a span but outside a leaf is exactly the residue —
+  // charging it to the enclosing `load` or `generate` span would hide it in a
+  // number nothing adds up.
+  //
+  // "INNERMOST" IS THE LAST LIVE NON-SPAN ENTRY, because `open` is pushed in
+  // open order: a nested sub-scope is appended after the leaf that contains it.
+  // Caller holds `mu`.
+  void ChargeLocked(double from, double to) {
+    if (!(to > from)) return;
+    for (size_t i = open.size(); i > 0; --i) {
+      Open& o = open[i - 1];
+      if (!o.live || o.span) continue;
+      o.instrument += to - from;
+      return;
+    }
+    instrument_gap += to - from;
+  }
+
   // Caller holds `mu`. Reads both counters once and folds them into every open
   // scope, so a nested span sees the peak its children reached.
+  //
+  // IT CHARGES ITSELF. A sample is taken at every boundary, by the 100 ms
+  // worker, and by hand from inside the denoise loop; the last two land inside
+  // the innermost record and outside its children, which is uncovered time this
+  // instrument produced. `Open` and `Close` call it with the record they are
+  // opening or closing already innermost, so those two charge to themselves and
+  // the charge is a no-op against their own duration.
   void SampleLocked() {
+    const double entered = running ? Now() : 0.0;
+    SampleUnchargedLocked();
+    if (running) ChargeLocked(entered, Now());
+  }
+
+  void SampleUnchargedLocked() {
     const int64_t host = HostResidentBytes();
     int64_t device = -1;
     if (device_probe) {
@@ -238,6 +291,7 @@ void PhaseLog::Begin() {
   impl_->running = true;
   impl_->render = 0;
   impl_->samples = 0;
+  impl_->instrument_gap = 0.0;
   impl_->device_probe = DeviceByteProbe();
 }
 
@@ -265,7 +319,14 @@ double PhaseLog::Elapsed() const {
 }
 
 size_t PhaseLog::Open(const std::string& name, bool span) {
+  // THE HEAD OF THE BOUNDARY, taken before the process-wide mutex. Everything
+  // between here and `o.start` below — the lock wait, which the 100 ms worker
+  // can hold, and the sampler start — is wall this instrument spends BEFORE the
+  // new record begins, so it lands in the gap before it. Row
+  // LTX25-PHASE-RESIDUE charges it to whatever encloses that gap.
+  const std::chrono::steady_clock::time_point entered = std::chrono::steady_clock::now();
   std::lock_guard<std::mutex> lock(impl_->mu);
+  const bool was_running = impl_->running;
   if (!impl_->running) {
     impl_->origin = std::chrono::steady_clock::now();
     impl_->running = true;
@@ -285,6 +346,14 @@ size_t PhaseLog::Open(const std::string& name, bool span) {
   o.nested = leaf_already_open && !span;
   const double opened_at = o.start;
   const std::string opened_name = o.name;
+  // Charged BEFORE the new entry is pushed, so `ChargeLocked` resolves the
+  // innermost live leaf to this record's PARENT — which is where the head of
+  // this boundary was actually spent. Skipped when this `Open` started the
+  // timeline, because then the origin IS `o.start` and there is no gap.
+  if (was_running) {
+    impl_->ChargeLocked(
+        std::chrono::duration<double>(entered - impl_->origin).count(), opened_at);
+  }
   impl_->open.push_back(std::move(o));
   impl_->SampleLocked();
   // W0-live (#1413): the OPEN line, which is the load-bearing half. It means the
@@ -312,9 +381,19 @@ void PhaseLog::Close(size_t handle) {
   // and the `generate` span each stay open across everything beneath them, so
   // the scope stack is empty only BETWEEN a load and a generation.
   std::thread victim;
+  // The clock at the end of the locked block, kept so the sampler JOIN below can
+  // be charged too. See the note beside it.
+  double left_lock_at = -1.0;
   {
     std::lock_guard<std::mutex> lock(impl_->mu);
     impl_->SampleLocked();
+    // WHERE THIS RECORD ENDED, kept outside the loop so the TAIL of the boundary
+    // can be charged after the entry is erased. Row LTX25-PHASE-RESIDUE: the
+    // progress line, the record push and the vector erase all run after `r.end`
+    // is stamped, so they are wall this instrument spends AFTER the record ends
+    // and they land in the gap after it. Erasing first is what makes
+    // `ChargeLocked` resolve the innermost live leaf to this record's PARENT.
+    double closed_at = -1.0;
     for (size_t i = 0; i < impl_->open.size(); ++i) {
       Impl::Open& o = impl_->open[i];
       if (o.handle != handle || !o.live) continue;
@@ -323,10 +402,12 @@ void PhaseLog::Close(size_t handle) {
       r.render = o.render;
       r.start = o.start;
       r.end = impl_->Now();
+      closed_at = r.end;
       r.peak_host_bytes = o.peak_host;
       r.peak_device_bytes = o.peak_device;
       r.span = o.span;
       r.nested = o.nested;
+      r.instrument_seconds = o.instrument;
       // W0-live (#1413): what the phase COST, on the line, at the moment it ends.
       // A reader of a killed run's log takes every completed phase's duration off
       // this without waiting for a table that will never be written.
@@ -351,10 +432,25 @@ void PhaseLog::Close(size_t handle) {
       break;
     }
     if (!impl_->AnythingLive()) victim = impl_->TakeSamplerLocked();
+    if (closed_at >= 0.0) {
+      left_lock_at = impl_->Now();
+      impl_->ChargeLocked(closed_at, left_lock_at);
+    }
   }
   if (victim.joinable()) {
     impl_->stop_cv.notify_all();
     victim.join();
+    // AND THE JOIN IS CHARGED TOO, which costs a second lock acquisition and is
+    // worth it. This is the LAST close of a timeline, so nothing is live and the
+    // whole notify-and-join lands in `unaccounted_seconds` — uncharged, it read
+    // as time nobody named. Measured at about 117 us per join on a contended
+    // x86 box, against a residue of 346 us: leaving it out made a two-scope
+    // timeline whose gaps contain NOTHING report a residue three times the
+    // instrument's own charge, which is exactly the reading a real un-named
+    // phase produces. The LTX-2.5 driver pays it twice per process, once when
+    // the `load` span closes and once when `generate` does.
+    std::lock_guard<std::mutex> lock(impl_->mu);
+    if (left_lock_at >= 0.0 && impl_->running) impl_->ChargeLocked(left_lock_at, impl_->Now());
   }
 }
 
@@ -365,7 +461,15 @@ void PhaseLog::Sample() {
 
 void PhaseLog::Tick(const std::string& unit, int64_t index, const std::string& detail) {
   if (!ProgressEnabled()) return;
+  // Charged like a boundary (row LTX25-PHASE-RESIDUE): a tick is a held global
+  // lock plus a FLUSHED `fwrite`, it runs ~110 times per render from inside the
+  // denoise loop, and it lands inside the innermost record and outside its
+  // children — i.e. it is uncovered time this instrument produced.
+  const std::chrono::steady_clock::time_point entered = std::chrono::steady_clock::now();
   std::lock_guard<std::mutex> lock(impl_->mu);
+  const bool charge = impl_->running;
+  const double entered_at =
+      charge ? std::chrono::duration<double>(entered - impl_->origin).count() : 0.0;
   // A tick before any scope opened starts the timeline, exactly as `Open` does.
   // Returning silently instead would make the first unit of work of a render
   // that took no scope disappear, which is the failure this lane exists to stop.
@@ -391,11 +495,17 @@ void PhaseLog::Tick(const std::string& unit, int64_t index, const std::string& d
   }
   impl_->last_tick[unit] = now;
   impl_->EmitLocked(text);
+  if (charge) impl_->ChargeLocked(entered_at, impl_->Now());
 }
 
 std::vector<Record> PhaseLog::Records() const {
   std::lock_guard<std::mutex> lock(impl_->mu);
   return impl_->records;
+}
+
+double PhaseLog::Instrument() const {
+  std::lock_guard<std::mutex> lock(impl_->mu);
+  return impl_->instrument_gap;
 }
 
 int64_t PhaseLog::Samples() const {
@@ -412,6 +522,7 @@ void PhaseLog::Reset() {
   impl_->running = false;
   impl_->render = 0;
   impl_->samples = 0;
+  impl_->instrument_gap = 0.0;
   impl_->device_probe = DeviceByteProbe();
 }
 
@@ -454,8 +565,15 @@ Totals Sum(const std::vector<Record>& records, double wall) {
 
 bool PhaseLog::WriteJson(const std::string& path, const std::string& family,
                          const std::string& device, std::string* why) const {
+  // THE CLOCK IS READ FIRST, and the ORDER is the whole content of these two
+  // lines. `Records()` copies the record vector under the process-wide mutex and
+  // `ByStart` stable-sorts the copy; reading `Elapsed()` after them charged this
+  // WRITER's own serialization to the RENDER's wall, and therefore to
+  // `unaccounted_seconds`, which is a residue the render did not produce. This
+  // table measures the render (row LTX25-PHASE-RESIDUE).
+  const double wall = Elapsed();
   const std::vector<Record> records = ByStart(Records());
-  const Totals totals = Sum(records, Elapsed());
+  const Totals totals = Sum(records, wall);
 
   nlohmann::json out;
   out["schema"] = "vllm.cpp render phase log v1";
@@ -464,6 +582,14 @@ bool PhaseLog::WriteJson(const std::string& path, const std::string& family,
   out["wall_seconds"] = totals.wall;
   out["sum_leaf_seconds"] = totals.leaves;
   out["unaccounted_seconds"] = totals.unaccounted;
+  // HOW MUCH OF `unaccounted_seconds` THIS INSTRUMENT SPENT (row
+  // LTX25-PHASE-RESIDUE). Without it the residue can only be compared against a
+  // SHARE of the render's wall, and that share is a property of the fixture:
+  // #1439 measured a 95% floor deciding by box load at 64x64x9 while the same
+  // residue is invisible on the 21 B render this table exists for. With it, the
+  // reader — and the gate — can ask the scale-free question instead: is the time
+  // nobody named larger than the cost of naming the phases?
+  out["instrument_seconds"] = Instrument();
   out["host_bytes_source"] =
 #if defined(__linux__)
       "/proc/self/statm";
@@ -516,6 +642,12 @@ bool PhaseLog::WriteJson(const std::string& path, const std::string& family,
     e["peak_device_bytes"] = r.peak_device_bytes;
     e["span"] = r.span;
     e["nested"] = r.nested;
+    // The other half of `instrument_seconds` above: how much of THIS record's
+    // own duration the instrument spent, outside every child of it. It is what
+    // separates "this leaf encloses a phase nobody named" from "this leaf paid
+    // for its own sub-scope boundaries" — a distinction the coverage gate had no
+    // way to make (#1494).
+    e["instrument_seconds"] = r.instrument_seconds;
     phases.push_back(std::move(e));
   }
   out["phases"] = std::move(phases);

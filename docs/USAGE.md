@@ -148,6 +148,16 @@ for `LoadedEngine`. The source-tree examples declare their link targets in
 [`examples/CMakeLists.txt`](../examples/CMakeLists.txt). External consumers
 must use the C ABI in `include/vllm.h`.
 
+A completed video render writes a phase table beside its frames, and
+`vllm_video_last_phase_log(engine)` returns that file's path through the C ABI.
+Read `sum_leaf_seconds` for the accounted total and `unaccounted_seconds` for the
+time outside every named phase. **Subtract `instrument_seconds` before treating
+that residue as work nobody named**: it reports how much of the residue the
+instrument itself spent at its own phase boundaries, and each phase carries its
+own `instrument_seconds` for the boundaries of its sub-scopes. The file is
+diagnostic output and says so; it is not a benchmark. See
+[`models/ltx-2-5.md`](models/ltx-2-5.md) for the full field list.
+
 Configuring with `-DVLLM_CPP_SANITIZE=address,undefined` or
 `-DVLLM_CPP_SANITIZE=thread` changes what a test target links. Instrumented
 test executables link one internal shared image of the instrumented archive

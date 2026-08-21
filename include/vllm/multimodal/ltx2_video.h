@@ -897,6 +897,24 @@ struct Ltx2ConditioningTrace {
   // increment beside the res_2s loop's own returned `evaluations` would let the
   // two drift; the engine asserts they agree instead.
   int64_t dit_evaluations = 0;
+  // `sampler_updates` is every SAMPLER STEP this render took on the first-order
+  // arm — the post-process plus the Euler or ancestral update that turns a
+  // denoiser prediction into the next latent. Row LTX25-PHASE-RESIDUE, #1494.
+  //
+  // IT EXISTS AS A DENOMINATOR, exactly like `dit_evaluations` and
+  // `video_decode_chunks`. `denoise.update` anchors that work in the phase table
+  // and the containment gate asserts one record per unit of work the RENDER
+  // counted, so the count cannot come from the table it is checking. Before this
+  // the update was inside the `denoise` leaf and inside no sub-scope, which is
+  // the whole of the coverage gate's miss: 49 us per step at nine frames and
+  // 343 us per step at 81, in one run of one binary.
+  //
+  // IT IS ZERO ON THE res_2s ARM, and that is recorded rather than hidden. That
+  // loop runs its own post-process and step inside `Ltx2Res2sDenoisingLoop`
+  // through `Ltx2Res2sHooks`, so the anchor needs a hook rather than a statement
+  // and no gate in this tree renders on that arm. See `## Owed` in
+  // `.agents/specs/ltx25-phase-residue.md`.
+  int64_t sampler_updates = 0;
   // `dit_forwards` is every ACTUAL `Ltx2DitForward` this render ran, counted
   // inside the `Ltx2X0Model` lambda the guided denoiser drives. One evaluation
   // is one to four forwards — `cond`, `uncond`, `ptb`, `mod`

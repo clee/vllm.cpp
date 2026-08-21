@@ -59,6 +59,29 @@
 
 namespace {
 
+// ── HOW MUCH UN-NAMED TIME A TABLE MAY CARRY (row LTX25-PHASE-RESIDUE) ───────
+//
+// The multiple of the instrument's OWN measured cost that the un-named time in a
+// table — or the uncovered part of a leaf — may reach. It replaces two wall-clock
+// ratios (`leaves >= 0.95 * wall` and `covered >= min_coverage * leaf_seconds`)
+// that decided by box load at fixture scale and permitted minutes of un-named
+// time at the scale the instrument exists for. #1439, #1470, #1494, #1536.
+//
+// TWO, AND THE DERIVATION IS ONE SENTENCE. A gap in the timeline is the closing
+// record's tail, plus the opening record's head, plus whatever the caller ran
+// between them; `PhaseLog` measures the first two and cannot see the third. The
+// factor states that what it cannot see is at most as large as what it can, and
+// it states nothing else. It is not a share of the render, so this number means
+// the same thing on a 0.26 s fixture and on a 2.5 h render — which is exactly
+// what the two ratios it replaces could not do.
+//
+// IT IS NOT A TOLERANCE TO BE RAISED. A table that fails it holds a phase nobody
+// named, and the repair is a scope. The measured ratios on the tree that landed
+// this are recorded in `.agents/specs/ltx25-phase-residue.md` `## Outcome`; a
+// value that starts creeping toward 2 is that spec's stop condition, not a
+// reason to write 3 here.
+constexpr double kInstrumentBudget = 2.0;
+
 struct Workspace {
   std::string root, fixture;
   ltx2_fixture::Paths paths;
@@ -3239,8 +3262,15 @@ TEST_CASE("ltx2 video: a render through the ABI emits a phase table that SUMS to
 
   // (3) THE NAMED BOUNDARIES. Without these the sum below is satisfied by one
   // leaf called `render`, which is an instrument that measures a stopwatch.
-  for (const std::string required : {"load.dit", "denoise", "decode.video", "decode.audio",
-                                    "artifacts.frames", "artifacts.audio"}) {
+  // `load.setup` and `artifacts.mux` are in this list since row
+  // LTX25-PHASE-RESIDUE, and they are here for the reason the list exists.
+  // Between them they held 17.871 ms of the 19.178 ms residue that made the sum
+  // below red, and an instrument that stopped naming them would go back to
+  // carrying that time as a hole. Naming them is the repair; requiring the names
+  // is what keeps it.
+  for (const std::string required : {"load.setup", "load.dit", "denoise", "decode.video",
+                                    "decode.audio", "artifacts.frames", "artifacts.audio",
+                                    "artifacts.mux"}) {
     // `std::string`, not `const char*`: doctest stringifies a `char*` streamed
     // into a message as a BOOL, so a failing case here would have printed
     // "names no '1' phase" and said nothing about which name was missing.
@@ -3248,18 +3278,67 @@ TEST_CASE("ltx2 video: a render through the ABI emits a phase table that SUMS to
                   "the phase table names no '" << required << "' phase");
   }
 
-  // (4) THE SUM. Stated as the tolerance the spec fixed before the run: the
-  // named leaves account for >= 95% of the instrumented wall, and whatever is
-  // left is reported as its own quantity rather than smeared over the leaves.
+  // (4) THE SUM, and what it is measured against.
+  //
+  // THIS LINE READ `leaves >= 0.95 * wall` AND IT WAS RED ON `main`. Row
+  // LTX25-PHASE-RESIDUE replaced it, and the reason is not that 95% was the
+  // wrong number — it is that a SHARE of the render's wall is the wrong
+  // quantity. The residue is a fixed set of gaps between the named phases; the
+  // wall is the render. So the ratio improves when the box is slow and decays as
+  // the hardware gets faster, which is the polarity #1439 measured when a `main`
+  // run at `wall=0.579684s` PASSED while five faster runs of the same binary
+  // failed. At the 21 B render this instrument exists for, the same 95% permits
+  // MINUTES of time nobody named.
+  //
+  // AND NOBODY HAD DECOMPOSED IT. Four issues argued about the tolerance across
+  // three months. Splitting the residue into the gaps between consecutive leaves
+  // took one pass over the emitted table and settled it: **92% of it was one
+  // gap**, the load's prologue before `load.dit`, 17.661 ms of 19.178 ms. The 16
+  // gaps between adjacent named phases held 0.108 ms between them — 6.8 us per
+  // boundary, which is this instrument and nothing else.
+  //
+  // WHAT IS ASSERTED NOW. The driver names the three regions that held that
+  // time, and `PhaseLog` measures the wall it spends inside its own entry points
+  // while no leaf is live and emits it as `instrument_seconds`. So the question
+  // becomes the one the table can actually answer, at any scale: is the time
+  // nobody named larger than the cost of naming the phases? See
+  // `kInstrumentBudget` for the derivation of the factor.
   REQUIRE(table.contains("unaccounted_seconds"));
   const double unaccounted = table["unaccounted_seconds"].get<double>();
+  REQUIRE_MESSAGE(table.contains("instrument_seconds"),
+                  "the emitter wrote no `instrument_seconds`, so the residue below can only be "
+                  "compared against a share of the wall, which is the defect this row removed");
+  const double instrument = table["instrument_seconds"].get<double>();
   MESSAGE("phase table: wall=" << wall << "s leaves=" << leaves << "s unaccounted="
-                               << unaccounted << "s over " << names.size() << " entries");
+                               << unaccounted << "s instrument=" << instrument << "s (ratio "
+                               << (unaccounted / instrument) << ") over " << names.size()
+                               << " entries");
   CHECK(std::fabs((wall - leaves) - unaccounted) < 1e-6);
-  CHECK_MESSAGE(leaves >= 0.95 * wall,
-                "the phase table does not sum: " << leaves << "s of named leaves against " << wall
-                                                 << "s of wall. The missing time is a phase "
-                                                    "nobody named, and W0 iterates until it is");
+  // THE INSTRUMENT'S OWN PRECONDITION, and it points the other way from the
+  // bound. A zero charge would make the bound `<= 0` and red every healthy tree;
+  // it would also mean `PhaseLog::ChargeLocked` never ran, which no reader would
+  // guess from a message about un-named phases. This render opens and closes
+  // more than thirty scopes, so the charge cannot be zero.
+  REQUIRE_MESSAGE(instrument > 0.0,
+                  "the instrument charged itself NOTHING across a render of " << names.size()
+                      << " phases, so `PhaseLog::ChargeLocked` is not running and the bound "
+                         "below is `<= 0`");
+  CHECK_MESSAGE(unaccounted <= kInstrumentBudget * instrument,
+                "the phase table does not sum: " << unaccounted << "s of " << wall
+                    << "s is inside no named leaf, and this instrument charged itself only "
+                    << instrument << "s of it. The other " << (unaccounted - instrument)
+                    << "s is a phase nobody named, and W0 iterates until it is. Name it with a "
+                       "scope; do not raise this bound, because the bound is the instrument's "
+                       "own measured cost and not a tolerance");
+  // AND THE TIMELINE INCLUDES THE CALLER, which is a trap worth naming here
+  // rather than leaving for whoever trips it. `PhaseLog`'s origin is the LOAD,
+  // so the gap between `vllm_video_engine_load` returning and
+  // `vllm_video_generate` being called is inside `wall` and inside no leaf. This
+  // case does nothing there but build a params struct, so the gap is the two
+  // span boundaries and their sampler threads and it is charged. A case that
+  // did real work between the two calls would red this line, correctly and
+  // confusingly: the time IS un-named, and it belongs to the test rather than to
+  // the driver. Keep this case's middle empty.
 
   // (5) THE ABI CARRIES IT. `examples/ltx2_gen` is a client of `vllm.h` and
   // nothing else, so a client that never guesses a filename beside the frames
@@ -3431,6 +3510,7 @@ namespace {
 // "any render", for a lookup that genuinely spans the whole table.
 constexpr int64_t kAnyRender = -1;
 
+
 // Every record of one name IN ONE RENDER, in emitted (start-sorted) order.
 //
 // THE RENDER ARGUMENT IS NOT DECORATION, and a fourth fresh review named the
@@ -3505,7 +3585,6 @@ std::vector<NamedInterval> LeafIntervals(const nlohmann::json& table,
 struct Carrying {
   std::string leaf;                    // the name that claims the seconds
   std::vector<std::string> parts;      // the nested sub-scopes sitting on the work
-  double min_coverage = 0.0;           // of the leaf's own seconds
   std::vector<std::string> partners;   // leaves the driver genuinely interleaves with
   // HOW MANY RECORDS OF EACH PART, from a number the RENDER produced. One entry
   // per name in `parts`. This is the only assertion here that is not a ratio
@@ -3551,12 +3630,30 @@ void CheckCarryingPhase(const nlohmann::json& table, const Carrying& c) {
   const std::vector<nlohmann::json> leaves = RecordsNamed(table, c.leaf, c.render);
   REQUIRE_MESSAGE(!leaves.empty(), "the table names no '" << c.leaf << "' leaf at all");
   double leaf_seconds = 0.0;
+  // ...AND WHAT THE INSTRUMENT SPENT INSIDE IT, outside every child of it. Row
+  // LTX25-PHASE-RESIDUE: this is the budget assertion (2) is measured against
+  // instead of a share of the leaf. See the note there.
+  double leaf_instrument = 0.0;
   for (const nlohmann::json& r : leaves) {
     REQUIRE_FALSE(r.value("span", false));
     REQUIRE_FALSE(r.value("nested", false));
     leaf_seconds += r["end_seconds"].get<double>() - r["start_seconds"].get<double>();
+    REQUIRE_MESSAGE(r.contains("instrument_seconds"),
+                    "the emitter wrote no `instrument_seconds` for '" << c.leaf
+                        << "', so the coverage bound below has no budget to be measured against");
+    leaf_instrument += r["instrument_seconds"].get<double>();
   }
   REQUIRE(leaf_seconds > 0.0);
+  // THE INSTRUMENT'S OWN PRECONDITION. Every leaf here contains at least one
+  // sub-scope, so the instrument opened and closed at least twice inside it and
+  // the charge cannot be zero. A zero would make the bound below `<= 0` and turn
+  // a derived assertion into one that can never pass, which is a mute switch
+  // pointing the other way.
+  REQUIRE_MESSAGE(leaf_instrument > 0.0,
+                  "the instrument charged ZERO of '" << c.leaf << "'s " << leaf_seconds
+                      << "s to itself, although the leaf holds sub-scopes whose boundaries it "
+                         "paid for. The accounting in `PhaseLog::ChargeLocked` is not reaching "
+                         "this leaf, and the bound below would be `<= 0`");
 
   // (0) THE RECORD COUNT, and it is FIRST because it is the only one of the five
   // that is not a ratio against `leaf_seconds`. See the note above this case:
@@ -3591,6 +3688,9 @@ void CheckCarryingPhase(const nlohmann::json& table, const Carrying& c) {
   // ...and the FIRST start of each part name, in the order `parts` lists them,
   // which is assertion (1b) below.
   std::vector<double> part_first;
+  // ...and EVERY start of each part name, sorted, which is what turns (1b) into
+  // a per-record pairing on a leaf whose parts repeat. Row LTX25-PHASE-RESIDUE.
+  std::vector<std::vector<double>> part_starts;
   // ...and each part's OWN seconds, kept separate from `subs` because `subs`
   // collapses every part into one pool and assertion (2b) is precisely the
   // question that pool cannot answer.
@@ -3628,9 +3728,13 @@ void CheckCarryingPhase(const nlohmann::json& table, const Carrying& c) {
     }
     part_seconds.push_back(seconds);
     double first = found.front()["start_seconds"].get<double>();
+    std::vector<double> starts;
     for (const nlohmann::json& r : found) {
       first = std::min(first, r["start_seconds"].get<double>());
+      starts.push_back(r["start_seconds"].get<double>());
     }
+    std::sort(starts.begin(), starts.end());
+    part_starts.push_back(std::move(starts));
     part_first.push_back(first);
   }
   REQUIRE(!subs.empty());
@@ -3676,6 +3780,48 @@ void CheckCarryingPhase(const nlohmann::json& table, const Carrying& c) {
                          "their seconds onto each other and change nothing else in this file");
   }
 
+  // (1b') THE PAIRING THE NOTE ABOVE SAYS IS OWED, paid rather than inherited.
+  //
+  // The loop above compares FIRST records, and its own note discloses the hole:
+  // "A future leaf with two REPEATING parts would satisfy this assertion while
+  // running `A, B, B, A, B, A` — the first pair is in order and every pair after
+  // it is not." Row LTX25-PHASE-RESIDUE creates exactly that leaf: `denoise`
+  // gains `denoise.update` beside `denoise.step`, one of each per sampler step.
+  //
+  // So where every part of a leaf has the SAME record count — which is what
+  // "these parts run once each, in this order, per unit of work" means — the
+  // i-th record of each name is compared instead of the first. For
+  // `decode.audio` at {1, 1} this is identical to the loop above. For a
+  // single-part leaf it is vacuous, as (1b) already is.
+  bool equal_counts = true;
+  for (const std::vector<double>& s : part_starts) {
+    if (s.size() != part_starts.front().size()) equal_counts = false;
+  }
+  if (equal_counts) {
+    for (size_t rec = 0; rec < part_starts.front().size(); ++rec) {
+      for (size_t i = 1; i < part_starts.size(); ++i) {
+        INFO("sub-scope pair = " << c.parts[i - 1] << " then " << c.parts[i]
+                                 << ", record " << rec);
+        CHECK_MESSAGE(part_starts[i][rec] >= part_starts[i - 1][rec] - 1e-9,
+                      "occurrence " << rec << " of '" << c.parts[i] << "' runs at "
+                          << part_starts[i][rec] << " and the same occurrence of '"
+                          << c.parts[i - 1] << "' at " << part_starts[i - 1][rec]
+                          << ", so these two names do NOT alternate the way the driver runs "
+                             "them. Comparing only the first record of each name lets `A, B, B, "
+                             "A, B, A` pass, which is the hole this line closes");
+      }
+      if (rec + 1 < part_starts.front().size()) {
+        INFO("sub-scope wrap = " << c.parts.back() << " then " << c.parts.front()
+                                 << ", record " << rec);
+        CHECK_MESSAGE(part_starts.front()[rec + 1] >= part_starts.back()[rec] - 1e-9,
+                      "occurrence " << (rec + 1) << " of '" << c.parts.front() << "' runs at "
+                          << part_starts.front()[rec + 1] << ", BEFORE occurrence " << rec
+                          << " of '" << c.parts.back() << "' at " << part_starts.back()[rec]
+                          << ". The parts of '" << c.leaf << "' are not one repeating cycle");
+      }
+    }
+  }
+
   std::sort(subs.begin(), subs.end());
   // The sub-scopes decompose one leaf, so they run in sequence and never overlap
   // each other. Two that did would double count into the coverage below.
@@ -3688,16 +3834,58 @@ void CheckCarryingPhase(const nlohmann::json& table, const Carrying& c) {
 
   // (2) COVERAGE. A leaf that encloses its own sub-scopes AND a phase nobody
   // named would satisfy containment while still hiding time.
+  //
+  // MEASURED AGAINST THE INSTRUMENT AND NOT AGAINST A SHARE OF THE LEAF, which
+  // is row LTX25-PHASE-RESIDUE and the repair for #1494, #1470 and half of
+  // #1536. This line read `covered >= c.min_coverage * leaf_seconds` with
+  // `min_coverage` 0.90 or 0.95, and it decided by box load. The reason is that
+  // the uncovered part is a FIXED cost — the instrument's own boundaries — plus
+  // the leaf's un-anchored work, while the denominator is the leaf, so the ratio
+  // got worse exactly as the hardware got faster. The case's own note called it
+  // a false-RED risk before it started firing. Measured on the failing tree:
+  // `denoise` 94.22% at nine frames against a 95% floor, and `decode.audio`
+  // 99.97% where the same 0.99 floor permits 83 ms of a fixture leaf and would
+  // permit MINUTES on the 21 B render this instrument exists for.
+  //
+  // WHAT IS ASSERTED INSTEAD. The instrument now measures the wall it spends
+  // inside its own entry points while this leaf is innermost — the mutex wait
+  // before a sub-scope's `Open` stamps a start, the progress line and the vector
+  // erase after its `Close` stamps an end — and emits it per record. So the
+  // uncovered part of a leaf whose parts genuinely wrap its work IS that number,
+  // and the assertion is:
+  //
+  //     leaf_seconds - covered  <=  kInstrumentBudget * leaf_instrument
+  //
+  // THE BUDGET IS DERIVED AND NOT ROUND. A gap between a leaf and its sub-scope
+  // is the closing record's tail, plus the opening record's head, plus whatever
+  // the CALLER ran between them. The instrument measures the first two. The
+  // factor of two states that the part it cannot measure — a `Close` return, an
+  // `Open` call, and the statements between them — is at most as large as the
+  // part it can, and it states nothing else. Nothing in it is a share of the
+  // render, so it says the same thing at 64x64x9 and at 3840x2160x241.
+  //
+  // AND IT IS NOT LOAD-FLAKY, which is the property four issues are about. A
+  // preemption inside a gap lands inside an instrument entry point with
+  // overwhelming probability, because the un-instrumented part of the gap
+  // between two adjacent scopes is a call and a return. So it inflates both
+  // sides of this comparison together, where the old ratio inflated only the
+  // numerator it was dividing by the leaf.
   double covered = 0.0;
   for (const std::pair<double, double>& iv : subs) covered += iv.second - iv.first;
+  const double uncovered = leaf_seconds - covered;
   MESSAGE("  " << c.leaf << " = " << leaf_seconds << "s over " << leaves.size()
                << " leaf record(s), of which " << subs.size() << " sub-scope(s) cover " << covered
-               << "s (" << (100.0 * covered / leaf_seconds) << "%)");
-  CHECK_MESSAGE(covered >= c.min_coverage * leaf_seconds,
-                "the named parts of '" << c.leaf << "' cover only " << covered << "s of its "
-                    << leaf_seconds << "s, under the " << (100.0 * c.min_coverage)
-                    << "% this phase's anchor is expected to reach. The rest is a phase nobody "
-                       "named, wearing this one's label");
+               << "s (" << (100.0 * covered / leaf_seconds) << "%), uncovered " << uncovered
+               << "s against an instrument charge of " << leaf_instrument << "s (ratio "
+               << (uncovered / leaf_instrument) << ")");
+  CHECK_MESSAGE(uncovered <= kInstrumentBudget * leaf_instrument,
+                "'" << c.leaf << "' spent " << leaf_seconds << "s and its named parts cover "
+                    << covered << "s, leaving " << uncovered
+                    << "s inside no sub-scope. The instrument charged itself only "
+                    << leaf_instrument << "s of that, so " << (uncovered - leaf_instrument)
+                    << "s of this leaf is work nobody named, wearing this one's label. Name it "
+                       "with a sub-scope; do not raise this bound, because the bound is the "
+                       "instrument's own measured cost and not a tolerance");
 
   // (2b) AND EACH PART'S OWN SHARE, because (2) is checked on the SUM.
   //
@@ -3864,7 +4052,7 @@ void CheckWriterIsBesideTheDecode(const nlohmann::json& table, int64_t render) {
 void CheckRenderPhases(const nlohmann::json& table,
                        const vllm::multimodal::Ltx2ConditioningTrace& trace,
                        const vllm::multimodal::VideoResult& result, int64_t latent_channels,
-                       int64_t render, int64_t min_chunks, double denoise_min_coverage) {
+                       int64_t render, int64_t min_chunks) {
   INFO("render = " << render);
 
   // ── WHAT THE RENDER COUNTED, which is not what the instrument counted ──────
@@ -3918,76 +4106,71 @@ void CheckRenderPhases(const nlohmann::json& table,
 
   // (1)-(3) THE THREE PHASES THAT CARRY THIS RENDER, each with its anchor.
   //
-  // The coverage thresholds are NOT round numbers and are not the same, because
-  // what each anchor can see differs:
+  // THE COVERAGE THRESHOLDS ARE GONE, and row LTX25-PHASE-RESIDUE deleted the
+  // paragraphs that argued them rather than editing their numbers. They were
+  // 0.99, 0.95-or-0.90 and 0.90, each argued from a measured share, and each of
+  // them was a ratio of two wall-clock quantities on a box that moves both. The
+  // record of what they cost is worth keeping in one place:
   //
-  //  * `decode.audio` is exactly two calls and the leaf holds nothing else, so
-  //    mel+vocoder measure 99.997%, 99.9995% and 99.995% of it across three
-  //    runs, over a leaf of 0.1 s to 1.2 s where a scheduling hiccup at a scope
-  //    boundary is noise. 0.99 is the threshold, and the 0.90 this case shipped
-  //    with was a HOLE the second review named: at 0.90 `decode.audio` could
-  //    open 11% early and swallow 0.13 s, which is 87% of this render's entire
-  //    `decode.video`, while passing everything in this file.
-  //  * `denoise.step` covers the denoiser EVALUATIONS, measured at 99.37% and
-  //    99.67% over 8 of them. The uncovered part is real work — the post-process
-  //    and the Euler or res_2s step, which no anchor wraps — PLUS two instrument
-  //    boundaries per evaluation. 0.95.
+  //   * `denoise` reached 94.221% at nine frames against its 0.95, which is the
+  //     RED that put `test_ltx2_video` on this project's known-flaky list for
+  //     days (#1536, #1494, #1470) while it was the only failing test on `main`.
+  //   * The comment that stated 0.95 already predicted it. It said the margin is
+  //     "a FALSE RED and never a false pass" and that the ratio "gets worse
+  //     exactly as the hardware gets faster", and it left the number alone.
+  //   * `denoise_min_coverage` was a PARAMETER — 0.95 at nine frames, 0.90 at 81
+  //     — because the uncovered part is work whose share depends on the
+  //     geometry. That parameter was the un-anchored work leaking into a
+  //     threshold. `denoise.update` anchors the work, so the parameter is gone
+  //     rather than retuned.
+  //   * The other three were never near their floors (99.82%, 99.97%, 99.44%)
+  //     and were still wrong in the same way: 0.99 of a `decode.audio` permits
+  //     83 ms of an un-anchored phase at fixture scale, and MINUTES of one on the
+  //     21 B render this instrument exists for.
   //
-  //    THE MARGIN IS A FALSE-RED RISK AND THIS COMMENT USED TO ARGUE THE
-  //    OPPOSITE. It said the uncovered part "costs a percent of a 40 ms leaf",
-  //    which reads as though the overhead scales with the leaf. It does not: the
-  //    16 boundary samples cost the same wall whether the denoise is 20 ms or 20
-  //    minutes, so the RATIO gets worse exactly as the hardware gets faster. A
-  //    third fresh review measured 99.228% on a quiet box at a 20 ms leaf — an
-  //    uncovered 0.154 ms — which puts the crossing point at a denoise leaf of
-  //    about 3.1 ms. Below that this threshold reds a healthy tree. It is a
-  //    FALSE RED and never a false pass, and it is left at 0.95 rather than
-  //    loosened on an argument nobody has measured: the (0) record count is what
-  //    now ties this name to its work, and a red here has a diagnosis printed
-  //    beside it in the MESSAGE above.
-  //
-  //    AND IT IS A PARAMETER, because the uncovered part is WORK and its share
-  //    depends on the geometry. `denoise.step` wraps the denoiser evaluation;
-  //    the post-process and the Euler or res_2s step sit outside it and scale
-  //    with the latent, while the evaluation the anchor covers scales with it
-  //    too. Measured here: 99.28%, 99.38% and 99.55% at nine frames
-  //    (`latent_t = 2`) against 96.55%, 96.90% and 97.09% at 81
-  //    (`latent_t = 11`), same binary, same box, three runs each. So the
-  //    nine-frame call passes 0.95 and the 81-frame call 0.90 — six points of
-  //    margin on the measured value in both cases, which is the same rule the
-  //    other thresholds are set by and not a loosening to fit.
-  //  * `decode.video.chunk` runs from the leaf's own open to the moment the
-  //    decoder hands a chunk back, so the only uncovered part is TWO instrument
-  //    boundaries — measured 99.44% — and that is why its threshold is the
-  //    loosest of the three rather than the tightest. This leaf is 1.6 ms on
-  //    this fixture. One preemption between `Close(chunk)` and `Close(decode)`
-  //    is a millisecond, i.e. 60% of it, so a threshold set near the measured
-  //    value would be a coin flip and not a gate. 0.90 here permits 0.16 ms to
-  //    go unnamed, which is three orders of magnitude below the 0.13 s the same
-  //    0.90 permitted on the audio decode: the fraction is the same and the
-  //    stake is not, which is why these three numbers are not one number.
+  // What replaces them is in `CheckCarryingPhase` (2): the uncovered part of a
+  // leaf is compared against what the INSTRUMENT charged to that leaf, measured
+  // in the same run. Read the note there for the derivation.
   //
   // AND EACH CARRIES ITS RECORD COUNT, which is assertion (0) and the one that
-  // is not a ratio. `denoise.step` runs once per denoiser evaluation.
+  // is not a ratio at all. `denoise.step` runs once per denoiser evaluation and
+  // `denoise.update` once per sampler step, which on the first-order arm this
+  // fixture takes is the same number reached by two independent counters.
   // `decode.video.chunk` opens with the leaf and reopens after every chunk the
   // sink is handed, so it emits one more record than there are chunks — the last
   // one is the empty window between the final chunk and the end of the decode.
   // The audio decode is exactly one mel pass and one vocoder pass.
   const std::vector<Carrying> carrying = {
       {"denoise",
-       {"denoise.step"},
-       denoise_min_coverage,
+       // TWO PARTS SINCE ROW LTX25-PHASE-RESIDUE, and the second one is the
+       // repair for #1494. `denoise.step` wraps the denoiser EVALUATION and
+       // closes when `Evaluate` returns; `denoise.update` wraps the sampler's
+       // own post-process and Euler step, which sat between two `denoise.step`
+       // records inside no sub-scope and were the whole of the coverage miss.
+       // Listed in the order the driver runs them, which assertion (1b') now
+       // checks per record rather than on the first pair alone.
+       {"denoise.step", "denoise.update"},
        {},
-       {trace.dit_evaluations},
-       "Ltx2ConditioningTrace::dit_evaluations",
-       // ONE part, so (2) already IS the per-part assertion and a second copy of
-       // it would only be noise. `denoise.step`'s own placement debt is the
-       // third row of the anchor table in `### Owed out of W0`.
-       {0.0},
+       // TWO INDEPENDENT COUNTERS, and that is what makes this pair worth
+       // asserting rather than an identity. `dit_evaluations` is incremented
+       // inside the shared `Evaluate` lambda and `sampler_updates` beside the
+       // update scope; they agree on the first-order arm because that arm runs
+       // exactly one update per evaluation, and a build that lost either scope
+       // moves one of them and not the other.
+       {trace.dit_evaluations, trace.sampler_updates},
+       "Ltx2ConditioningTrace::dit_evaluations and ::sampler_updates",
+       // NEITHER PART CARRIES A (2b) FLOOR, and the reason is measured rather
+       // than assumed. The two hold 94.2% and 5.8% of the leaf at nine frames
+       // and 93.0% and 7.0% at 81 — one order apart, where the `decode.audio`
+       // vocoder's 0.50 floor exploits four to five. A floor that separated the
+       // honest split from a transfer here would sit inside the honest
+       // distribution's own scatter, which is the defect this whole row exists
+       // to remove. What holds the pair instead is (1b'): a transfer between two
+       // ALTERNATING names cannot preserve the alternation.
+       {0.0, 0.0},
        render},
       {"decode.video",
        {"decode.video.chunk"},
-       0.90,
        {"artifacts.frames"},
        {trace.video_decode_chunks + 1},
        "Ltx2ConditioningTrace::video_decode_chunks + 1, the reopen after the last chunk",
@@ -3998,12 +4181,10 @@ void CheckRenderPhases(const nlohmann::json& table,
        render},
       {"decode.audio",
        {"decode.audio.mel", "decode.audio.vocoder"},
-       0.99,
        {},
        {1, 1},
        "the two calls #1010 names, once each per render",
-       // THE ONLY MULTI-PART LEAF, and therefore the only place (2b) is not
-       // vacuous. The vocoder carries 0.50 and the mel carries none; the note on
+       // The vocoder carries 0.50 and the mel carries none; the note on
        // `part_min_coverage` and on (2b) argues both numbers, and
        // `### Owed out of W0` records what the mel's 0.0 leaves open.
        {0.0, 0.50},
@@ -4015,11 +4196,6 @@ void CheckRenderPhases(const nlohmann::json& table,
       // `decode.video` — the reviewer's M11, which reported four microseconds
       // for nine PPM files — no longer has a leaf that contains this record.
       //
-      // 0.50 is the threshold and it is loose ON PURPOSE. This leaf is about
-      // 0.2 ms on the fixture and holds nine scope boundaries of its own, so the
-      // uncovered part is instrument cost against a sub-millisecond leaf, which
-      // is the regime the `decode.video` note above already explains.
-      //
       // WHAT BINDS HERE IS THE COUNT AND THE FACT THAT THE WRITER IS NOT
       // NESTED, and this note used to say "the containment and the count", which
       // a fourth fresh review showed is false. A count of one plus containment
@@ -4027,11 +4203,12 @@ void CheckRenderPhases(const nlohmann::json& table,
       // grow over any adjacent time nobody named, up to its coverage slack. It
       // is harmless on this fixture only because nothing adjacent to the writer
       // is stealable — `decode.video` is a declared partner that the `nested`
-      // assertion and `CheckWriterIsBesideTheDecode` both hold — and that is a
-      // property of the fixture rather than of this threshold.
+      // assertion and `CheckWriterIsBesideTheDecode` both hold. Row
+      // LTX25-PHASE-RESIDUE narrows that slack from 50% of the leaf to twice the
+      // instrument's own measured charge, which is the tightest this pair has
+      // ever been held.
       {"artifacts.frames",
        {"artifacts.frames.ppm"},
-       0.50,
        {"decode.video"},
        {trace.video_decode_chunks},
        "Ltx2ConditioningTrace::video_decode_chunks, one write callback per chunk",
@@ -4192,8 +4369,7 @@ TEST_CASE("ltx2 video: the three carrying phases contain their work and the load
   // TAKEN BEFORE THE SECOND GENERATION OVERWRITES IT: `im.trace` is reset on
   // every `Generate`, which is half of why the counts here need a render filter.
   const vllm::multimodal::Ltx2ConditioningTrace trace_one = ltx2->last_conditioning();
-  CheckRenderPhases(first, trace_one, result, latent_channels, render_one, /*min_chunks=*/1,
-                    /*denoise_min_coverage=*/0.95);
+  CheckRenderPhases(first, trace_one, result, latent_channels, render_one, /*min_chunks=*/1);
 
   // ── RENDER 2: 81 frames, which CHUNKS, and every count above is checked at
   // N > 1 ───────────────────────────────────────────────────────────────────
@@ -4222,19 +4398,18 @@ TEST_CASE("ltx2 video: the three carrying phases contain their work and the load
                     << render_one << "; the table's `render` field is not the per-generation "
                                      "slice the counts below are taken over");
   CheckRenderPhases(table, ltx2->last_conditioning(), multi_result, latent_channels, render_two,
-                    /*min_chunks=*/2, /*denoise_min_coverage=*/0.90);
+                    /*min_chunks=*/2);
 
   // ...and the FIRST render's records are still in the second render's table and
   // still hold, which is what says the filter above selects rather than hides.
-  CheckRenderPhases(table, trace_one, result, latent_channels, render_one, /*min_chunks=*/1,
-                    /*denoise_min_coverage=*/0.95);
+  CheckRenderPhases(table, trace_one, result, latent_channels, render_one, /*min_chunks=*/1);
 
   // (3c) AND NOTHING BUT AN ANCHOR IS NESTED. The assertion that sees a leaf
   // swallow a NEIGHBOUR, which the four above cannot: see the note on
   // `CheckOnlyAnchorsAreNested`.
-  CheckOnlyAnchorsAreNested(table, {"denoise.step", "decode.video.chunk", "decode.video.vae",
-                                    "decode.audio.mel", "decode.audio.vocoder",
-                                    "artifacts.frames.ppm"});
+  CheckOnlyAnchorsAreNested(table, {"denoise.step", "denoise.update", "decode.video.chunk",
+                                    "decode.video.vae", "decode.audio.mel",
+                                    "decode.audio.vocoder", "artifacts.frames.ppm"});
 
   // (4) THE FLOOR, read as "this name is not detached" and nothing more. See the
   // note above this case for why it is not tightened toward the measured share.
@@ -4431,6 +4606,193 @@ TEST_CASE("ltx2 phase log: the last Close stops the sampler") {
                        "the timeline that started it. A process that renders once then serves "
                        "keeps that read under the process-wide mutex for life, and the next "
                        "render's table inherits the idle samples");
+  log.Reset();
+}
+
+// ─── the instrument charges its OWN cost to the right place (#1536) ──────────
+//
+// ROW LTX25-PHASE-RESIDUE, and it is the unit half of the two gates above. Those
+// two now compare a residue against `instrument_seconds` instead of against a
+// share of the render's wall, so the number has to mean what its name says
+// before either comparison is worth anything. Through a render it cannot: a
+// render exercises one placement, and the question here is where a charge LANDS.
+//
+// The rule under test is one sentence from `render_phase_log.cpp`: every
+// interval of the instrument's own wall is charged to the innermost live
+// NON-SPAN record at the moment it is spent, and to the table when none is live.
+// Three consequences, and each one is a different defect if it is wrong:
+//
+//   * A CHILD'S BOUNDARY IS THE PARENT'S COST. Opening and closing a nested
+//     scope costs wall that lies inside the parent and outside the child, which
+//     is precisely the uncovered time the coverage gate now bounds. If it were
+//     charged to the table instead, that gate would have a budget of zero and
+//     red every healthy tree.
+//   * A BOUNDARY WITH NOTHING LIVE IS THE TABLE'S COST. That is the residue the
+//     sum gate bounds. If it were charged to a leaf, the sum gate's budget would
+//     be zero for the same reason.
+//   * A SPAN IS NOT A LEAF. `Sum` skips spans, so time inside a span and outside
+//     every leaf IS the residue; charging it to the enclosing span would hide it
+//     in a number nothing adds up. This is the case the LTX-2.5 driver actually
+//     hits, because `load` and `generate` are spans that stay open across
+//     everything beneath them.
+TEST_CASE("ltx2 phase log: the instrument charges its own cost to the innermost LEAF") {
+  namespace phase = vllm::multimodal::phase;
+  phase::PhaseLog& log = phase::PhaseLog::Instance();
+  log.Reset();
+  log.Begin();
+
+  // (1) A SPAN THAT ENCLOSES EVERYTHING, exactly as the driver's `load` does.
+  const size_t span = log.Open("unit.span", /*span=*/true);
+  // (2) A BOUNDARY WITH NO LEAF LIVE. Only the span is open, so this pair is
+  // charged to the TABLE and not to the span.
+  const double before_gap = log.Instrument();
+  { const phase::Scope gap_probe("unit.gap_probe"); }
+  const double after_gap = log.Instrument();
+  CHECK_MESSAGE(after_gap > before_gap,
+                "opening and closing a leaf under a SPAN charged the table nothing, so either "
+                "the instrument is not measuring its own boundaries or it charged them to the "
+                "span. A span is not summed, so that time would vanish from the table");
+
+  // (3) A LEAF WITH A NESTED CHILD. The child's boundaries are wall spent inside
+  // the parent and outside the child.
+  const size_t parent = log.Open("unit.parent", /*span=*/false);
+  const double table_before_child = log.Instrument();
+  for (int i = 0; i < 8; ++i) {
+    const phase::Scope child("unit.child");
+  }
+  const double table_after_child = log.Instrument();
+  // EXACTLY EQUAL, not `Approx`. `doctest::Approx` scales its epsilon by
+  // `max(1, |value|)`, so on a quantity of ~1e-4 s it tolerates 1.19e-5 s —
+  // 11.9 us, which is about one whole boundary. That is the size of the leak
+  // this line exists to detect, so the tolerance would have been the blind spot.
+  // Nothing here may charge the table at all while a leaf is live, so the two
+  // reads are the same double.
+  CHECK_MESSAGE(table_after_child == table_before_child,
+                "eight nested boundaries moved the TABLE's charge by "
+                    << (table_after_child - table_before_child)
+                    << "s while a leaf was live. They belong to the leaf that contains them; "
+                       "charging them to the table would make the coverage bound `<= 0`");
+  log.Close(parent);
+  log.Close(span);
+
+  const std::vector<phase::Record> records = log.Records();
+  double parent_instrument = -1.0;
+  double parent_duration = -1.0;
+  double child_total = 0.0;
+  int64_t children = 0;
+  for (const phase::Record& r : records) {
+    if (r.name == "unit.parent") {
+      parent_instrument = r.instrument_seconds;
+      parent_duration = r.end - r.start;
+    }
+    if (r.name == "unit.child") {
+      child_total += r.end - r.start;
+      ++children;
+      CHECK_MESSAGE(r.nested, "'unit.child' opened inside a live leaf and is not marked nested");
+    }
+  }
+  REQUIRE(children == 8);
+  REQUIRE(parent_duration > 0.0);
+  CHECK_MESSAGE(parent_instrument > 0.0,
+                "the parent leaf was charged " << parent_instrument
+                    << "s although eight children opened and closed inside it. This is the "
+                       "quantity the coverage gate is measured against");
+
+  // (4) AND THE CHARGE IS THE WHOLE OF THE UNCOVERED PART. Nothing but the
+  // instrument runs inside `unit.parent` and outside `unit.child`, so the
+  // uncovered time IS the charge — which is the claim the coverage gate rests
+  // on, stated here where no model work can blur it. The budget is the same
+  // `kInstrumentBudget` the gates use, so a factor that stopped covering the
+  // un-instrumented remainder of a boundary reds HERE first, in eleven lines,
+  // rather than in a forty-second render.
+  const double uncovered = parent_duration - child_total;
+  MESSAGE("unit.parent = " << parent_duration << "s, children " << child_total
+                           << "s, uncovered " << uncovered << "s, charged " << parent_instrument
+                           << "s (ratio " << (uncovered / parent_instrument) << ")");
+  CHECK_MESSAGE(uncovered <= kInstrumentBudget * parent_instrument,
+                "the parent leaf has " << uncovered << "s inside no child and the instrument "
+                    << "charged itself only " << parent_instrument
+                    << "s of it, although this case runs NOTHING inside the parent but the "
+                       "child scopes. The accounting is missing part of its own boundary cost, "
+                       "and every bound derived from it is that much too tight");
+  log.Reset();
+}
+
+// ─── the accounting is CONSERVED, and the writer is not the render (#1536) ───
+//
+// TWO PROPERTIES THE GATES ABOVE ASSUME AND CANNOT SEE. Both are about
+// `WriteJson`, and both were wrong before row LTX25-PHASE-RESIDUE.
+//
+// CONSERVATION. `instrument_seconds` at the top of the table and
+// `instrument_seconds` on each record are one quantity split two ways, so a
+// charge that went to neither would be an unmeasured cost that both bounds are
+// blind to — the exact hole the ratios had. Every value is non-negative and the
+// table's own share is a real number rather than a placeholder.
+//
+// THE WRITER IS NOT THE RENDER. `WriteJson` reads the clock BEFORE it copies and
+// sorts the record vector. Reading it after charged this writer's own
+// serialization to `wall_seconds`, and therefore to `unaccounted_seconds`, which
+// is a residue no render produced and no scope could ever name. The case pins
+// the order by rendering a table whose leaves are a known share of a known wall.
+TEST_CASE("ltx2 phase log: the instrument's own cost is conserved and the writer is not timed") {
+  namespace phase = vllm::multimodal::phase;
+  phase::PhaseLog& log = phase::PhaseLog::Instance();
+  log.Reset();
+  log.Begin();
+  {
+    const phase::Scope one("unit.one");
+    std::this_thread::sleep_for(std::chrono::milliseconds(30));
+    { const phase::Scope inner("unit.one.inner"); }
+  }
+  {
+    const phase::Scope two("unit.two");
+    std::this_thread::sleep_for(std::chrono::milliseconds(30));
+  }
+
+  char dir[] = "/tmp/vllm_phase_conserve_XXXXXX";
+  REQUIRE(::mkdtemp(dir) != nullptr);
+  const std::string path = std::string(dir) + "/phase-log.json";
+  std::string why;
+  REQUIRE_MESSAGE(log.WriteJson(path, "unit", "cpu", &why), why);
+  const nlohmann::json table = nlohmann::json::parse(ReadAll(path));
+  ::unlink(path.c_str());
+  ::rmdir(dir);
+
+  REQUIRE(table.contains("instrument_seconds"));
+  const double table_charge = table["instrument_seconds"].get<double>();
+  CHECK(table_charge >= 0.0);
+  double record_charge = 0.0;
+  for (const nlohmann::json& e : table["phases"]) {
+    REQUIRE_MESSAGE(e.contains("instrument_seconds"),
+                    "the record for '" << e["name"].get<std::string>()
+                                       << "' carries no instrument charge");
+    const double c = e["instrument_seconds"].get<double>();
+    CHECK_MESSAGE(c >= 0.0, "'" << e["name"].get<std::string>() << "' was charged " << c << "s");
+    CHECK_MESSAGE(c <= e["duration_seconds"].get<double>() + 1e-9,
+                  "'" << e["name"].get<std::string>() << "' was charged " << c
+                      << "s of its own " << e["duration_seconds"].get<double>()
+                      << "s duration, which is more instrument than record");
+    record_charge += c;
+  }
+  MESSAGE("instrument: table " << table_charge << "s + records " << record_charge << "s");
+  CHECK_MESSAGE(record_charge > 0.0,
+                "no record carries any instrument charge, so the per-record half of the "
+                "accounting is not reaching the emitted table");
+
+  // THE WRITER IS NOT TIMED. Two 30 ms leaves against a wall this instrument
+  // measured; a `WriteJson` that read the clock after copying and sorting the
+  // records would add its own serialization to that wall and to the residue.
+  const double wall = table["wall_seconds"].get<double>();
+  const double unaccounted = table["unaccounted_seconds"].get<double>();
+  MESSAGE("wall " << wall << "s, unaccounted " << unaccounted << "s, table charge "
+                  << table_charge << "s");
+  REQUIRE(wall > 0.0);
+  CHECK_MESSAGE(unaccounted <= kInstrumentBudget * table_charge,
+                "this timeline runs two adjacent scopes and NOTHING between them, so its whole "
+                "residue is this instrument's own boundary cost. It reports " << unaccounted
+                    << "s of residue against a " << table_charge
+                    << "s charge, which means something outside the instrument's own accounting "
+                       "is being timed — the writer's copy-and-sort is the one that was");
   log.Reset();
 }
 

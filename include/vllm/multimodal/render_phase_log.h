@@ -62,6 +62,11 @@ struct Record {
   int64_t peak_device_bytes = -1;  // -1 => no device probe was installed on this arm
   bool span = false;    // printed for context, never summed
   bool nested = false;  // opened while another leaf was open; excluded from the sum
+  // HOW MUCH OF THIS RECORD'S OWN DURATION THE INSTRUMENT SPENT, outside every
+  // child of it. Row LTX25-PHASE-RESIDUE. See the note on `PhaseLog::Instrument`
+  // below: this is the number that separates "a phase nobody named" from "the
+  // cost of naming the phases", which is what two gates could not do.
+  double instrument_seconds = 0.0;
 };
 
 // Resident set size in bytes, or -1 where the platform publishes none.
@@ -119,6 +124,24 @@ class PhaseLog {
 
   std::vector<Record> Records() const;
   int64_t Samples() const;
+
+  // ── WHAT THE INSTRUMENT ITSELF COST (row LTX25-PHASE-RESIDUE) ─────────────
+  //
+  // The wall this instrument spent inside its own entry points while NO leaf was
+  // live — the process-wide mutex wait before `Open` stamps a start, the
+  // progress line and the vector erase after `Close` stamps an end. It is
+  // therefore the part of `unaccounted_seconds` that this instrument produced
+  // rather than the render.
+  //
+  // WHY IT IS PUBLIC AND NOT A DETAIL. Without it a reader of the table — and a
+  // gate — can only compare the residue against a SHARE of the render's wall,
+  // and that share is a property of the fixture rather than of the code:
+  // [#1439](https://github.com/mudler/vllm.cpp/issues/1439) measured the same
+  // 95% floor deciding by box load at 64x64x9 while the same residue would be
+  // invisible on the 21 B render this instrument exists for. The per-record half
+  // is `Record::instrument_seconds`, and the two partition every interval this
+  // instrument spends: whatever is not charged to a live leaf is charged here.
+  double Instrument() const;
 
   // Write the table as JSON. Returns false with *why set on an IO failure — a
   // render must not fail because its instrument could not write.
