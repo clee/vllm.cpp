@@ -335,8 +335,21 @@ class GreenReportTests(unittest.TestCase):
         # NON-ZERO count on a tree this file owns. The constructed scan holds one
         # allowlisted file carrying an unmarked site -- the debt the green hides --
         # beside a marked one, plus a marked site nothing excuses, so a checker
-        # that printed `sites - marked`, dropped the clause or hard-coded a number
-        # cannot produce this line.
+        # that dropped the clause, or hard-coded the number, cannot produce this
+        # line. Both mutations were run against this case and both turn it red.
+        #
+        # A checker that printed `sites - marked` in place of `excused` is NOT on
+        # that list, and no constructed scan can add it. `main()` reaches the OK
+        # line only when `drift_sites` is empty, and `drift_sites` is empty exactly
+        # when no unmarked site sits outside an allowlisted file -- so on every
+        # green the checker can print, every unmarked site is excused and
+        # `excused == sites - marked` identically. The two remain different
+        # quantities, because a marked call inside an allowlisted file counts in
+        # `marked`; they can only take different VALUES on a scan the checker
+        # exits 1 on, which never reaches this line. That substitution was
+        # mutated into the checker and the whole suite stayed green, so the claim
+        # is recorded here as unpinnable rather than left standing as a guarantee
+        # this case does not carry.
         report = self.report_over(
             {
                 f"{MODELS}/ltx2.cpp": [(10, False), (20, True)],
@@ -393,7 +406,13 @@ class GreenReportTests(unittest.TestCase):
     def test_the_excused_count_is_not_sites_minus_marked(self) -> None:
         # The subtraction a reader would do by hand, and why the checker must not.
         # A marked site in an allowlisted file lands in `marked`, so the difference
-        # under-reports the debt. This pins the two as separately derived.
+        # under-reports the debt.
+        #
+        # Read this as a record of the two DEFINITIONS, not as a gate on the
+        # checker: it never calls the checker, and it derives both numbers itself.
+        # Holding the OK line to `excused` rather than to the subtraction is not
+        # something this file can do from any scan -- the identity is spelled out
+        # in test_the_ok_line_counts_the_sites_an_allowlist_excuses.
         scanned = {
             "src/vllm/model_executor/models/ltx2.cpp": [(10, False), (20, True)],
             "src/vllm/model_executor/models/whisper_audio.cpp": [(30, True)],
@@ -410,8 +429,12 @@ class GreenReportTests(unittest.TestCase):
         marked = sum(1 for v in scanned.values() for _, m in v if m)
         self.assertEqual(excused, 1)
         self.assertEqual(sites - marked, 1)
-        # They agree HERE only because the allowlisted file's other site is marked
-        # and cancels; drop that site and they diverge, which is the point.
+        # They agree HERE, and on any scan the checker reports OK on, because no
+        # unmarked site sits outside the allowlist -- which is what the assert
+        # below states. Dropping the allowlisted file's marked site does not
+        # separate them either: it lowers `sites` and `marked` together. They
+        # diverge only once an unmarked site lands in a file no stem excuses, and
+        # that scan is a red.
         self.assertEqual(mod.drift_sites(scanned, allowed), [])
 
 
