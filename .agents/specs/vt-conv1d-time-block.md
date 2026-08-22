@@ -51,7 +51,7 @@ available across output channels is not taken. At 344 latent frames the b3
 residual activation is **67.6 MiB** against **96** output channels; the b1
 residual is **33.8 MiB** against **384**.
 
-## 2. What is not established, and the ablation for each
+## 2. What was not established, and the ablation for each
 
 `ncu` is refused on this fleet — `ERR_NVGPUCTRPERM` even from the root `rc`
 worker, `NVreg_RestrictProfilingToAdminUsers` on the host driver module — and
@@ -75,6 +75,83 @@ disagreement** between this kernel bench and the e2e bucket at 344 latents
 (54.091 s against 97.4463 s through the same call), and §18.4 prices the
 kernel-to-window gap at a further factor of ~2. A ratio from the probe is a
 ratio ON the probe.
+
+## 2a. THE ANSWER — measured, and it is not the convolution
+
+**`rc` job `706f15ef-8add-4e8e-a976-954af66e90f5` on `thor:gpu0`**, worker
+`rc-worker-m4d7t`, `Linux 6.8.12-1021-tegra` aarch64, 14 cores, boot id
+`fabedc13-97a1-4cb9-909f-217a425d3f70`, `--max-runtime 150m`, 2026-08-22. One
+lease, one boot, no `ssh`, no file mutex. Release `-O3`, CPU only, built inside
+the lease from `1745d9017`. Box facts that the rest of this section rests on,
+read rather than assumed: **L1d 64 KiB 4-way and L2 1 MiB 8-way, both PRIVATE
+per core, and NO shared last-level cache in `sysfs` at all**; governor
+`schedutil`, `scaling_max_freq` 2 601 000 kHz.
+
+### The window does not scale, and the op does
+
+| threads | `vocoder.decode_window`, 20 latents | speedup | `vt::Conv1d`, one of each geometry, 86 latents | speedup |
+|---|---|---|---|---|
+| 1 | 9.6374 s | 1.00x | 4.24978 s | 1.00x |
+| 2 | 6.2616 s | 1.54x | 2.20365 s | 1.93x |
+| 4 | 4.6068 s | 2.09x | 1.08414 s | 3.92x |
+| 8 | 3.7876 s | 2.54x | 0.53646 s | 7.92x |
+| 14 | 3.4247 s | **2.81x** | 0.34177 s | **12.44x** |
+
+**The convolution scales 12.44x of 14 while the window it sits in scales
+2.81x.** `user/wall` on the op is 13.91, 13.82, 13.52 and 13.45 at the four
+heaviest geometries, so the pool is running and productive. Every arm printed
+one fingerprint per length across every thread count, so nothing here trades
+correctness for the ratio.
+
+### Each candidate, and what killed it
+
+| # | Candidate | Verdict | The measurement |
+|---|---|---|---|
+| 1 | Activation residency | **NOT the limit** | The residency sweep is nearly flat where it matters: at 14 threads `b2_res_conv1` reads 1.008x/1.021x/0.997x/0.989x across a 165x footprint range and `b3_res_conv1` reads 0.977x/1.019x/1.132x/1.067x. The largest reading anywhere at 14 threads is `b1_res_conv1` at **1.307x**. Real, and worth about 6 % of a window the convolution is 20 % of |
+| 2 | Barrier / dispatch | **DEAD BY ARITHMETIC** | One empty `ParallelForRows` costs 11.845 µs at 14 threads. The window makes **62**. That is **0.734 ms against 3.4247 s — 0.02 %** |
+| 3 | Granularity | **NOT the limit, with one real exception** | The chunk grid is 48-55 chunks on 14 threads at every heavy geometry. The exception is `conv_out`: ONE output row, so `chunks = 1` and `user/wall = 1.00` at every thread count. It is 0.2 % of the op total, so it is a defect and not the gap |
+| 4 | The pool is not running | **DEAD** | `user/wall` 13.45-13.91 at 14 threads |
+| 5 | The CPU clock falls as cores light up | **DEAD** | `scaling_cur_freq` sampled every 2 s across all 14 CPUs: max **2 601 000 kHz at every leg**, and the MEDIAN over 14 CPUs is 2 601 000 at 8 and at 14 threads — i.e. with the box full, the typical core is at the cap. (At 1 and 2 threads the median reads the 972 000 kHz idle floor, because 12 of the 14 samples are idle cores. That is the statistic reporting what it was asked, not a throttle) |
+
+**No bandwidth counter was read and none is claimed.** `perf` is NOT INSTALLED
+on the `thor:gpu0` worker and `perf_event_paranoid` is 2; `ncu` is refused on
+this fleet. Candidate 1 is settled by ablation instead, and the ablation says
+residency is worth 1.0-1.31x rather than the several-fold factor a
+bandwidth-saturation story needs.
+
+### So where does the window go? The split says it in one line
+
+`vocoder.decode_window` split into leaves through `profile::Timer` on the
+production path, 14 threads. **PROVENANCE, because the two halves of this
+section come from different boxes:** the scaling curve and the five verdicts
+above are `thor:gpu0` under the lease named at the top. The split below is the
+AUTHORING host (x86-64, 20 cores, `uptime` load 18.5 — not an idle box) at 20
+latents, because the instrument did not exist when the Thor job was submitted.
+It is quoted as a SHARE and never as a duration, and §2b re-takes it on Thor.
+
+| leaf | seconds | calls | share |
+|---|---|---|---|
+| **`vocoder.snake`** | 4.231 | 58 | **70.70 %** |
+| `vocoder.conv1d` | 1.197 | 54 | 20.00 % |
+| `vocoder.conv_transpose` | 0.489 | 8 | 8.17 % |
+| `vocoder.pad` | 0.053 | 28 | 0.89 % |
+| `vocoder.copy` | 0.006 | 32 | 0.10 % |
+| `vocoder.residual_add` | 0.004 | 24 | 0.07 % |
+| `vocoder.tanh` | 0.000 | 2 | 0.00 % |
+| sum(leaf) | 5.982 | — | 99.95 % |
+
+`vocoder1d::SnakeActivation` is a **serial** loop — no partition of any kind —
+over every element of every activation in the chain, computing a `double`
+`std::sin` per element. Amdahl's law over it predicts the window's whole curve:
+solving `p/12.44 + (1 - p) = 3.4247/9.6374` gives **p = 0.70**, and the split
+independently reads the parallel part at 0.70 of the T=1 window if the snake is
+the serial term. Two instruments, one number.
+
+**§18.8b's shared-bandwidth candidate is therefore refuted rather than
+refined.** The scaling it measured was real, its reading of the cause was not,
+and the reason it could not see this is stated plainly: it timed the WINDOW and
+reasoned about the KERNEL, with nothing in between. The instrument that was
+missing was a split, not a counter.
 
 ## 3. The design, and why it is bit-identical BY CONSTRUCTION
 
