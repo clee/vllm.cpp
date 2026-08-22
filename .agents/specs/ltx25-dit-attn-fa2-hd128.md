@@ -280,6 +280,20 @@ Recorded when measured. Nothing is written here that was not run.
   row's numeric evidence is per-op and does not bound a 120-forward denoise
   trajectory.
 
+- **The distilled NVFP4 DiT's recorded revision disagrees with its own download
+  sidecar.** `docs/USAGE.md` pins
+  `Lightricks/LTX-2.5 @ 6c7e5e573ac1667efc83407806fe9b0b93730e60` for
+  `diffusion_models/ltx-2.5-22b-distilled-transformer-nvfp4.safetensors`, while
+  that file's `huggingface_hub` `.metadata` sidecar on the shared checkout
+  records `8a4ff96f581e72bedc1b44367581c49d544a05f1`. Both can be true — a later
+  re-download explains it, and the two bf16 DiT rows have no sidecar at all, so
+  nothing local contradicts them. Found while adding the three missing LTX-2.5
+  rows and deliberately NOT folded in: choosing a revision without knowing which
+  bytes that row's author measured replaces a possibly-stale pin with a
+  definitely-unverified one, which is worse. This row does not run that model
+  arm and has no way to re-derive it. Owner: this row.
+  Issue: [#1702](https://github.com/mudler/vllm.cpp/issues/1702).
+
 ## Outcome
 
 Recorded when the row reaches `DONE`.

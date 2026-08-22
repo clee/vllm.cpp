@@ -1499,7 +1499,7 @@ TEST_CASE("ltx2 device: a malformed perturbation is REFUSED with the HOST arm's 
 // REACHABILITY — the DiT self-attention must actually ENTER the fast op
 // ---------------------------------------------------------------------------
 
-TEST_CASE("ltx2 device: the DiT self-attention ENTERS AttentionDenseFlash, not vt::Attention") {
+TEST_CASE("ltx2 device: the DiT self-attention ENTERS AttentionDenseFa2, not Flash or vt::Attention") {
   // WHY THIS CASE EXISTS (#1549). Until 2026-08-21 the device DiT self-attention
   // called `vt::Attention`, which on CUDA is `vt::cuda::AttentionKernel` — the
   // kernel whose own header calls itself "Correctness-grade (M0.9)". One DiT
@@ -1514,15 +1514,23 @@ TEST_CASE("ltx2 device: the DiT self-attention ENTERS AttentionDenseFlash, not v
   //
   // TWO-SIDED, because either half alone is passable by a defect:
   //
-  //   POSITIVE   `kAttentionDenseFlash` must be selected once per self-attention
+  //   POSITIVE   `kAttentionDenseFa2` must be selected once per self-attention
   //              per block per batch row. A count of zero means the swap did not
   //              happen or the branch was never entered.
-  //   NEGATIVE   `kAttention` must be selected ZERO times across the whole
-  //              forward. This is the half that makes it a ROUTING proof rather
-  //              than an ADDITION proof: LTX's cross-attentions use
-  //              `kAttentionCross`, so after the swap the DiT has no remaining
-  //              `kAttention` caller at all. A second, unswapped self-attention
-  //              path added later turns this half red.
+  //   NEGATIVE   `kAttention` AND `kAttentionDenseFlash` must both be selected
+  //              ZERO times across the whole forward. This is the half that makes
+  //              it a ROUTING proof rather than an ADDITION proof: LTX's
+  //              cross-attentions use `kAttentionCross`, so after the swap the DiT
+  //              has no remaining caller of either rung. A second, unswapped
+  //              self-attention path added later turns this half red.
+  //
+  // THREE RUNGS, THREE OPS, and the negative half now names two of them because
+  // #1551 moved the default UP a rung rather than sideways. `kAttentionDenseFlash`
+  // was the #1549 default and is still reachable through the A/B knob, so "not
+  // selected" is a statement about the DEFAULT arm specifically. Dropping the
+  // flash half of the negative would let a partial revert — one stream moved back
+  // to flash, the other left on FA-2 — stay green while the video stream, which is
+  // the whole point of #1551, quietly lost its tensor cores.
   //
   // The EXACT count is asserted, not a floor. A floor below the real count is a
   // mute switch: it stays green while one of the two streams silently stops
@@ -1536,11 +1544,12 @@ TEST_CASE("ltx2 device: the DiT self-attention ENTERS AttentionDenseFlash, not v
   //
   // CPU BACKEND, and that is not a weakening. `GetOp` is the dispatch point on
   // every backend, so the ROUTING is observable without a GPU; what a GPU gates
-  // is the kernel behind it. On CPU both ops resolve to the same registered
-  // function (`src/vt/cpu/cpu_ops.cpp:3750-3761`, the `kAttention` /
-  // `kAttentionDenseFast` / `kAttentionDenseFlash` registrations), which is
-  // exactly why the golden cases above stay byte-unchanged by this swap and why
-  // this case has to ask the provider rather than the numbers.
+  // is the kernel behind it. On CPU all four ops resolve to the same registered
+  // function (`src/vt/cpu/cpu_ops.cpp:3750-3764`, the `kAttention` /
+  // `kAttentionDenseFast` / `kAttentionDenseFlash` / `kAttentionDenseFa2`
+  // registrations), which is exactly why the golden cases above stay
+  // byte-unchanged by this swap and why this case has to ask the provider rather
+  // than the numbers.
   //
   // UNMASKED inputs on purpose: a MASKED self-attention carries a bias and
   // legitimately routes to `kAttentionCross` (the dispatch condition is
@@ -1569,6 +1578,7 @@ TEST_CASE("ltx2 device: the DiT self-attention ENTERS AttentionDenseFlash, not v
   } knob_guard;
 
   vt::EnableOpProviderCallStats(true);
+  vt::ResetOpProviderStats(vt::OpId::kAttentionDenseFa2, vt::DeviceType::kCPU);
   vt::ResetOpProviderStats(vt::OpId::kAttentionDenseFlash, vt::DeviceType::kCPU);
   vt::ResetOpProviderStats(vt::OpId::kAttention, vt::DeviceType::kCPU);
 
@@ -1579,6 +1589,8 @@ TEST_CASE("ltx2 device: the DiT self-attention ENTERS AttentionDenseFlash, not v
   REQUIRE(MaxAbsOf(out.video) > 1e-6);
   REQUIRE(MaxAbsOf(out.audio) > 1e-6);
 
+  const vt::OpProviderStats fa2 =
+      vt::GetOpProviderStats(vt::OpId::kAttentionDenseFa2, vt::DeviceType::kCPU);
   const vt::OpProviderStats flash =
       vt::GetOpProviderStats(vt::OpId::kAttentionDenseFlash, vt::DeviceType::kCPU);
   const vt::OpProviderStats naive =
@@ -1588,10 +1600,11 @@ TEST_CASE("ltx2 device: the DiT self-attention ENTERS AttentionDenseFlash, not v
   // `audio_attn1` on the audio one — each looping the batch rows.
   const unsigned long long want =
       static_cast<unsigned long long>(2 * p.num_layers * m.video.batch);
-  MESSAGE("kAttentionDenseFlash selections = " << flash.selections << " (want " << want
-                                               << "), kAttention selections = "
-                                               << naive.selections);
-  CHECK(flash.selections == want);
+  MESSAGE("kAttentionDenseFa2 selections = " << fa2.selections << " (want " << want
+                                             << "), kAttentionDenseFlash = " << flash.selections
+                                             << ", kAttention = " << naive.selections);
+  CHECK(fa2.selections == want);
+  CHECK(flash.selections == 0);
   CHECK(naive.selections == 0);
 
   // The A/B knob is the same-binary control this row's measurement runs on, so
