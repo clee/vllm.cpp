@@ -302,7 +302,20 @@ Recorded when measured. Nothing is written here that was not run.
   stale pin for a definitely unverified one, which is worse. Settling it needs an
   authenticated fetch at a named revision, which this row has no authority to
   make and no way to gate. This row does not run that model arm. Owner: this row.
-  Issue: [#1702](https://github.com/mudler/vllm.cpp/issues/1702).
+  Issue: [#1723](https://github.com/mudler/vllm.cpp/issues/1723).
+
+  **Why #1723 and not #1702, which this bullet named first.** The discrepancy was
+  found while fixing [#1702](https://github.com/mudler/vllm.cpp/issues/1702) and
+  was first recorded against it. #1702's subject is a different bug — three of
+  the four LTX-2.5 artefacts every render is fed having no row in the
+  `docs/USAGE.md` checkpoint registry — and this pull request fixes that
+  completely and carries `Closes #1702`, so the merge closes it. The discrepancy
+  above is about a FOURTH row that already existed and that the fix does not
+  touch. Tracking it on #1702 would therefore have made it invisible at the exact
+  moment this change landed, because AGENTS.md relies on GitHub holding the open
+  and closed state and a `## Owed` bullet pointing at a closed issue tracks
+  nothing. It is split onto #1723 so the closed half and the open half each have
+  their own record.
 
 - **The #1702 index row's sidecar count is stale and cannot be repaired in
   place.** That row states that "all four `Lightricks/LTX-2.5` sidecars carry the
@@ -318,8 +331,38 @@ Recorded when measured. Nothing is written here that was not run.
   snapshot revision rather than a blob id, and it is the two sidecars the row did
   not count that carry the extra evidence. `.agents/issue-index.md` is
   append-only and carries `merge=union`, so the row itself is not editable and is
-  not edited; this bullet is where the corrected count lives. Owner: this row.
-  Issue: [#1702](https://github.com/mudler/vllm.cpp/issues/1702).
+  not edited; this bullet is where the corrected count lives. It is also recorded
+  on [#1723](https://github.com/mudler/vllm.cpp/issues/1723), because the
+  six-sidecar census is the evidence that makes `8a4ff96f…` a snapshot revision,
+  and #1702 — the issue whose row carries the stale count — closes with this pull
+  request and cannot hold a correction after that. Owner: this row.
+  Issue: [#1723](https://github.com/mudler/vllm.cpp/issues/1723).
+
+- **The FA-2 dense head-dim fall-through `else throw` has no executable
+  coverage, and no mutation in this tree can turn it red.** The launcher's
+  head-dim dispatch now ends `if (d == 64) { … } else if (d == 128) { … } else
+  { throw … }` (`cuda_flash_attn_fa2.cu::LaunchDenseFA2Bf16`), and the fresh
+  review of this row asked for that shape because it is right: the shape it
+  replaced put the 128 call in a bare `else`, so widening only the
+  `d != 64 && d != 128` admissibility guard earlier in the same function — the
+  exact first edit a head_dim-192 rung makes — would have routed 192 into the 128
+  kernel, which reads 128 of its 192 channels and returns a silently truncated
+  answer. But the two guards are ORDERED, so while the admissibility guard stands
+  the `else` cannot be entered: no input reaches it, no test can enter it without
+  first making the very edit it guards, and deleting the arm or inverting its
+  condition leaves every case green. It is a guarantee no mutation can red. This
+  is NOT a regression and NOT a capability that landed dead — the same input
+  previously produced a silently truncated answer with no diagnostic, so the arm
+  strictly replaces silence with a named refusal. The owning suite,
+  `test_ops_attention_dense_fa2`, is CUDA-gated in all 12 of its cases and
+  reports `12 cases | 0 assertions` on a CPU build, so it gives the arm no
+  coverage on the authoring host either. OWED: the first commit that widens the
+  `d != 64 && d != 128` guard — for head_dim 192, for f32, or for any new rung —
+  owes a RED-FIRST case proving this throw fires for a head dim the widened guard
+  admits and the launcher has no instantiation for, taken BEFORE the
+  instantiation that makes the throw unreachable again is added. That widening is
+  the only moment at which the guarantee is both reachable and provable. Owner:
+  this row. Issue: [#1724](https://github.com/mudler/vllm.cpp/issues/1724).
 
 ## Outcome
 
