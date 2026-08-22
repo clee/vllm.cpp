@@ -84,7 +84,52 @@ gate is PENDING a `dgx:gpu0` window.
 
 ---
 
-## MODEL-NEMOTRON-H-ABI-A2P — the FIRST Nemotron speed numbers AND the first pinned-oracle model run inside a lease: 0.00139x decode, 2.12x faster load, GPU idle 93.7% of our decode (2026-08-18, `row/MODEL-NEMOTRON-H-ABI-A2P-speed`, #1250, #1253) (2026-08-18, `row/MODEL-NEMOTRON-H-ABI-A2P-speed`, #1250, #1253)
+## ENG-EXPERT-STREAM-DEVICE W0a — a GB10 kernel CAN dereference the host slot arena (2026-08-19, `row/ENG-EXPERT-STREAM-DEVICE-W0`, #1124)
+
+**W0a is the probe the whole W0 mechanism rests on, and it answered
+`W0A_VERDICT=PAGEABLE_OK`.** It is recorded here rather than only in the
+scoreboard because it is a MEASUREMENT, and because the row's spec and
+`docs/BENCHMARKS.md` had both carried it as "not run" after it had run.
+
+The question. `HostExpertSlotStore`'s arena is a plain `std::vector<uint8_t>`.
+W0c serves an expert slice by handing a CUDA GEMM a pointer INTO that vector.
+If a GB10 kernel cannot dereference ordinary host storage, the design is wrong
+at the root, `Platform::host_memory_is_device_addressable()` answers false on the
+one box that matters, the lane never engages, and the row returns
+`NEEDS_DECISION` in favour of a `cudaHostAlloc` arena, which is a different
+allocator and a different ownership story.
+
+The answer, on `dgx:gpu0` inside an `rc` lease:
+
+| Quantity | Value |
+|---|---|
+| `cudaDevAttrPageableMemoryAccess` | 1 |
+| `cudaDevAttrIntegrated` | 1 |
+| kernel read AND write of a 2,490,368 B slot in `std::vector` storage | correct |
+| bandwidth ratio over that access, range across reps | 2.06-2.28x |
+| verdict | `W0A_VERDICT=PAGEABLE_OK` |
+
+Two things this deliberately does not say. The attribute pair is exactly what
+`CudaPlatform` conjoins, so it is the predicate's own input and not a proxy for
+it; but an attribute is a CLAIM, which is why the probe also ran the access. The
+slot size is 2,490,368 B because that is one real IQ1_XXXS expert slice on
+`Qwen3.8-2.4T-A95B UD-Q1_0` (1,275,068,416 / 512), so the measured access is the
+access the lane will perform and not a synthetic stand-in.
+
+Two of the four attributes the spec's port map names,
+`cudaDevAttrPageableMemoryAccessUsesHostPageTables` and
+`cudaDevAttrConcurrentManagedAccess`, are NOT carried here. The verdict turns on
+the two that are, and writing down two numbers that were not handed over would be
+worse than the gap.
+
+**This is not a decode number and does not become one.** W0e — G0-CORRECT,
+G0-LIVE and G0-SPEED — is still queued on the box, no speed floor is set for it,
+and a CUDA arm slower than the CPU arm remains a real publishable outcome: the
+recorded GB10 ATS penalty applies to all ~6.95 GB of expert bytes this lane reads
+per token, and the 2.06-2.28x above is a microbenchmark of one access, not of a
+decode step.
+
+## MODEL-NEMOTRON-H-ABI-A2P — the FIRST Nemotron speed numbers AND the first pinned-oracle model run inside a lease: 0.00139x decode, 2.12x faster load, GPU idle 93.7% of our decode (2026-08-18, `row/MODEL-NEMOTRON-H-ABI-A2P-speed`, #1250, #1253)
 
 **These are the first speed numbers for `NemotronHForCausalLM` on any axis, and
 the denominator is the first pinned-oracle MODEL RUN ever completed inside an
@@ -328,51 +373,6 @@ sides took the same number of decode steps — but a token-exact gate against th
 golden does NOT survive a change to the oracle's memory configuration, and that
 is a live constraint on how the gate may be re-run.
 
-
-## ENG-EXPERT-STREAM-DEVICE W0a — a GB10 kernel CAN dereference the host slot arena (2026-08-19, `row/ENG-EXPERT-STREAM-DEVICE-W0`, #1124)
-
-**W0a is the probe the whole W0 mechanism rests on, and it answered
-`W0A_VERDICT=PAGEABLE_OK`.** It is recorded here rather than only in the
-scoreboard because it is a MEASUREMENT, and because the row's spec and
-`docs/BENCHMARKS.md` had both carried it as "not run" after it had run.
-
-The question. `HostExpertSlotStore`'s arena is a plain `std::vector<uint8_t>`.
-W0c serves an expert slice by handing a CUDA GEMM a pointer INTO that vector.
-If a GB10 kernel cannot dereference ordinary host storage, the design is wrong
-at the root, `Platform::host_memory_is_device_addressable()` answers false on the
-one box that matters, the lane never engages, and the row returns
-`NEEDS_DECISION` in favour of a `cudaHostAlloc` arena, which is a different
-allocator and a different ownership story.
-
-The answer, on `dgx:gpu0` inside an `rc` lease:
-
-| Quantity | Value |
-|---|---|
-| `cudaDevAttrPageableMemoryAccess` | 1 |
-| `cudaDevAttrIntegrated` | 1 |
-| kernel read AND write of a 2,490,368 B slot in `std::vector` storage | correct |
-| bandwidth ratio over that access, range across reps | 2.06-2.28x |
-| verdict | `W0A_VERDICT=PAGEABLE_OK` |
-
-Two things this deliberately does not say. The attribute pair is exactly what
-`CudaPlatform` conjoins, so it is the predicate's own input and not a proxy for
-it; but an attribute is a CLAIM, which is why the probe also ran the access. The
-slot size is 2,490,368 B because that is one real IQ1_XXXS expert slice on
-`Qwen3.8-2.4T-A95B UD-Q1_0` (1,275,068,416 / 512), so the measured access is the
-access the lane will perform and not a synthetic stand-in.
-
-Two of the four attributes the spec's port map names,
-`cudaDevAttrPageableMemoryAccessUsesHostPageTables` and
-`cudaDevAttrConcurrentManagedAccess`, are NOT carried here. The verdict turns on
-the two that are, and writing down two numbers that were not handed over would be
-worse than the gap.
-
-**This is not a decode number and does not become one.** W0e — G0-CORRECT,
-G0-LIVE and G0-SPEED — is still queued on the box, no speed floor is set for it,
-and a CUDA arm slower than the CPU arm remains a real publishable outcome: the
-recorded GB10 ATS penalty applies to all ~6.95 GB of expert bytes this lane reads
-per token, and the 2.06-2.28x above is a microbenchmark of one access, not of a
-decode step.
 
 ## MODEL-NEMOTRON-H-ABI-A2P — the A3 gate PASSES on the host, and the device divergence was the STALE input ids (2026-08-18, `row/MODEL-NEMOTRON-H-ABI-A2P-1157`, #1157, #1217, #810)
 
@@ -26962,3 +26962,58 @@ keyed on the source SHA so a resumed run does not re-spend the 18-minute compile
 and runs the **naive arm first**. The previous order took the cheap arm first and
 lost the box before the expensive one, which is how a two-arm measurement became
 a one-arm one.
+
+## MUSIC3-DEPTH-THOR-PAIR-2 — CORRECTION: which of that pair's two preconditions is load-bearing (2026-08-22, [#1516](https://github.com/mudler/vllm.cpp/issues/1516), row `BENCH-AB-ARMS-CONTROL`)
+
+**The figures above are NOT withdrawn and are not restated.** This corrects one
+inference drawn beside them: `MUSIC3-DEPTH-THOR-PAIR-2` reads its
+`ARMS_DIFFER=yes` on two `minimax-music3-gen` hashes as the precondition the
+entry exists to insist on, and that leg proves nothing.
+
+`minimax-music3-gen` is a **72 744-byte client** of `libvllm_shared.so`
+([`examples/CMakeLists.txt:425-426`](../examples/CMakeLists.txt),
+[`CMakeLists.txt:2633`](../CMakeLists.txt)), every line of the change under test
+lives in the library, and no `CMAKE_SKIP_BUILD_RPATH` is set anywhere in this
+tree. CMake therefore writes the build-tree RPATH into the client and two build
+directories hash apart whatever the source says. Both arms of that pair were
+72 744 bytes to the byte.
+
+Reproduced on a minimal CMake project of the same shape — one `SHARED` library
+carrying the change, one thin client linking it:
+
+```text
+two BYTE-IDENTICAL source trees, two build dirs
+  16016 bytes  d4ead254e9b3461d91ffc96807de171aa5bfe888f1893981862b48833fe488ac  bld-old/abdemo-client
+  16016 bytes  7a791ed2bac9790b6b01121234ad48346f798e21e872e74f056639f71426b11f  bld-new/abdemo-client
+  RUNPATH [.../bld-old] vs RUNPATH [.../bld-new]   <- the whole difference
+  ar.depth_forward calls=808  on BOTH arms
+
+then the library change is made for real (frames*8 -> frames*4)
+  7a791ed2bac9790b6b01121234ad48346f798e21e872e74f056639f71426b11f  bld-new/abdemo-client
+  ar.depth_forward calls=404
+```
+
+The client comes back **byte-for-byte the hash it already had**. Its hash is a
+function of the build directory, not of the code under test.
+
+**What IS load-bearing for `MUSIC3-DEPTH-THOR-PAIR-2`: the call counts.**
+`ar.depth_forward` moves 1414 -> 808 and `ar.depth_projection` 1414 -> 707 in
+that entry's own table. A pair that could not have contained the change cannot
+move a call count, which is the same tell that voided
+`MUSIC3-DEPTH-THOR-PAIR-1`, read in the other direction. The
+`STAGE_SECONDS`/`SRC_BYTES`/`DST_BYTES` staging assertion is unaffected.
+
+**Hashing the library instead is not the general repair.** It is stable across
+two BUILD directories and differs across two SOURCE directories, because
+`VT_CHECK` ([`include/vt/dtype.h:11-17`](../include/vt/dtype.h)) embeds
+`__FILE__` and nothing sets `-ffile-prefix-map`; separate clones are the shape
+the corrected-pair recipe mandates. `CMAKE_SKIP_BUILD_RPATH` is worse: it makes
+the client insensitive in both directions, so a correct pair would fire FATAL.
+
+**What to use instead:** `scripts/ab-arms-differ.py`, which keeps the equal-hash
+FATAL, reports whether an artifact embeds its own build or source root, and takes
+its verdict from a control that must move. Prefer a same-binary A/B
+(`VT_OP_PROVIDER_DISABLE`) where the seam allows one. Method in
+[`benchmarking.md`](benchmarking.md) §Two arms have to BE two arms; the row's
+reasoning and both rejected repairs in
+[`specs/ab-arms-control.md`](specs/ab-arms-control.md).

@@ -95,7 +95,7 @@ The gate run measured engine load 264.4 s and 342.61 / 328.19 / 327.51 s for 32
 tokens each, about **10.3 s per output token** at batch 1. Two named arms cause
 it, and neither has landed:
 
-- **The NVFP4 `lm_head` still executes HOST-side.** `nemotron_h.cpp:1031-1034`
+- **The NVFP4 `lm_head` still executes HOST-side.** `src/vllm/model_executor/models/nemotron_h.cpp::NemotronHHostLmHead`
   refuses it on a non-CPU queue, so the last step of every forward is a host
   projection and the forward returns `HostLogits`. Owned by A2-Q2b.
 - **The 46 FP8 W8A8 mamba `in_proj`/`out_proj` projections still execute
