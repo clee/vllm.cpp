@@ -23,24 +23,24 @@ path correct on every backend; it does not change which models take it.
 `vt::GreedyArgmax` does NOT copy its input before touching it. The CUDA arm
 passes the caller's pointer straight to a kernel:
 
-* `src/vt/cuda/cuda_sample.cu:199` — `GreedyArgmaxKernelSlow<<<...>>>(..., logits.Ptr<float>(), v)`
-* `src/vt/cuda/cuda_sample.cu:207` — `ArgmaxPartialKernel<<<...>>>(..., logits.Ptr<float>(), v, bpr)`
+* `src/vt/cuda/cuda_sample.cu::GreedyArgmaxKernelSlow` — `GreedyArgmaxKernelSlow<<<...>>>(..., logits.Ptr<float>(), v)`
+* `src/vt/cuda/cuda_sample.cu::ArgmaxPartialKernel` — `ArgmaxPartialKernel<<<...>>>(..., logits.Ptr<float>(), v, bpr)`
 
 So the pointer IS dereferenced on device. This is a latent illegal access on a
 discrete GPU, not a mislabelling.
 
 The same is true of the rest of the sampling pipeline the tensor feeds
 (`ApplyTemperature`, `ApplyTopKTopP`, `ComputeProbs`, `ComputeLogprobs` —
-`src/vt/ops.cpp:3615-3665`), and of `apply_grammar_bitmask`.
+`src/vt/ops.cpp::CheckSamplingLogits`), and of `apply_grammar_bitmask`.
 
 ## Affected sites (four, not one)
 
 | Site | Path | Host buffer |
 |---|---|---|
-| `runner.cpp:1663` | (A') `VT_GPU_SAMPLE=0` download-then-sample A/B | `sampled_logits` |
-| `runner.cpp:1668` | host logits, rows already gathered (the reported one) | `fl.host` |
-| `runner.cpp:1683` | (B) `VT_LOGITS_GATHER=0` host re-gather | `sampled_logits` |
-| `runner.cpp:1777` | `collect_prompt_logprobs` prompt-row slice | `fl.host + offset` |
+| `src/vllm/v1/worker/gpu/runner.cpp::assemble_sample_logits` | (A') `VT_GPU_SAMPLE=0` download-then-sample A/B | `sampled_logits` |
+| `src/vllm/v1/worker/gpu/runner.cpp::assemble_sample_logits` | host logits, rows already gathered (the reported one) | `fl.host` |
+| `src/vllm/v1/worker/gpu/runner.cpp::assemble_sample_logits` | (B) `VT_LOGITS_GATHER=0` host re-gather | `sampled_logits` |
+| `src/vllm/v1/worker/gpu/runner.cpp::collect_prompt_logprobs` | `collect_prompt_logprobs` prompt-row slice | `fl.host + offset` |
 
 Affected models are the three that return `ForwardLogits.host`, i.e. exactly the
 `scripts/runner-routing-allowlist.txt` entries: `nemotron_h`, `laguna`,
@@ -49,7 +49,7 @@ Affected models are the three that return `ForwardLogits.host`, i.e. exactly the
 ## Why it has not bitten
 
 `vt::CudaBackend::UnifiedMemory()` is `caps.pageable_memory_access &&
-caps.integrated` (`src/vt/cuda/cuda_backend.cu:363`). GB10 is integrated, so the
+caps.integrated` (`src/vt/cuda/cuda_backend.cu::UnifiedMemory`). GB10 is integrated, so the
 driver services an ordinary host pointer through ATS and the NemotronH A3 gate
 reads `96/96 STRICT PASS` at host-memory latency. A discrete GPU reports
 `integrated == false` and the same address is illegal.
@@ -71,7 +71,7 @@ construction, because this sits on the per-token decode path. Route all four
 sites through it.
 
 Two staging members, not one: `collect_prompt_logprobs` runs while the assembled
-sample-logits tensor is still live (`runner.cpp:2083-2090`), so one shared buffer
+sample-logits tensor is still live (`src/vllm/v1/worker/gpu/runner.cpp::sample_tokens`), so one shared buffer
 would invalidate it.
 
 ### Alternatives rejected
@@ -84,7 +84,7 @@ which is the same new seam the repair needs anyway — so it costs what the repa
 costs and delivers less.
 
 **Build the tensor with the host device and dispatch accordingly.** Rejected.
-`CheckSamplingLogits` (`src/vt/ops.cpp:3608`) requires `logits.device ==
+`CheckSamplingLogits` (`src/vt/ops.cpp::CheckSamplingLogits`) requires `logits.device ==
 q.device` for every sampling op, so a host-device logits tensor needs a host
 queue and the whole pipeline re-dispatched to CPU. That regresses GB10 from
 on-device sampling to host sampling, and `apply_grammar_bitmask`, the random
@@ -95,9 +95,9 @@ read the device off the same tensor.
 issue, and this is worth recording because it looks free. Two registered
 backends legitimately stamp a host-dereferenceable pointer with a non-unified
 device: Tenstorrent, whose `Alloc` returns `aligned_alloc` host memory by design
-(`src/vt/tenstorrent/tenstorrent_backend.cpp:41-47`, `UnifiedMemory() == false`
-at `:72`), and a discrete Vulkan device, whose buffers are HOST_VISIBLE and
-persistently mapped (`include/vt/backend.h:56-70`). Both register a
+(`src/vt/tenstorrent/tenstorrent_backend.cpp::Alloc`, with
+`src/vt/tenstorrent/tenstorrent_backend.cpp::UnifiedMemory` returning false), and a discrete Vulkan device, whose buffers are HOST_VISIBLE and
+persistently mapped (`include/vt/backend.h::DeviceMemoryIsHostAddressable`). Both register a
 `kGreedyArgmax` provider. A blanket assert would false-fire on both. Making it
 not false-fire needs a new per-backend residency virtual that every backend has
 to get right, on the hottest constructor in the tree, for a debug-only net —
