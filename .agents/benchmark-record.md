@@ -40,13 +40,30 @@ divergence is downstream of a routing divergence. The near-tie margins W0f
 measured stay true as measurements of the sampler's input. They are no longer
 the explanation.
 
-**Say what "routing" is, because the shorthand overstates the finding.** The top
-of this section, the row's public pages and the landing commit subject all say
-the failure IS expert routing. That is where an upstream numeric difference
-first becomes DISCRETE and therefore visible, and it is not the thing that
-differs. What differs is the router's GEMM INPUT. The wording is kept because
-every surface pairs it with "cause open", and it is recorded as imprecise here
-so a later reader does not read it as an attribution.
+**Say what "routing" is, because the shorthand overstates the finding, and say
+exactly WHERE the shorthand still stands.** Routing is where an upstream numeric
+difference first becomes DISCRETE and therefore visible. It is not the thing
+that differs. What differs is the router's GEMM INPUT.
+
+The shorthand "the failure IS expert routing" survives at **three places, all in
+[`specs/expert-stream-device-slots.md`](specs/expert-stream-device-slots.md)**:
+the `## Now` W0g bullet header, the closing "G0-CORRECT fails on a divergence
+W0g locates in expert ROUTING" paragraph, and the `## Owed` header for the entry
+that owns the question. It is kept there because each of the three pairs it with
+"cause open" in the same sentence.
+
+**The other surfaces were corrected in the same commit that added this
+paragraph, and an earlier revision of this paragraph wrongly named them as
+offenders.** The top of this section says the arms "differ UPSTREAM of the
+router"; `docs/BENCHMARKS.md` says "router INPUT differs at block 0";
+`docs/STATUS.md` says routing is "where the difference becomes visible and not
+the thing that differs"; the Qwen3.8 model guide says "router GEMM input"; and
+the pull request title says "differ upstream of the router". `git grep -i
+'expert rout' -- docs/ README.md` is rc 1 with no output, against a whole-tree
+control that fires on nine files, which is what makes that absence a reading
+rather than a wrong pattern. **The landing commit subject of the FIRST commit on
+this branch does carry the shorthand and cannot be edited**, which is the fourth
+site and the reason this paragraph exists.
 
 **Provenance.** `dgx:gpu0` (NVIDIA GB10, `sm_121`, driver 580.173.02), source
 `cffe59b`, weights `/home/mudler/ckpt/qwen3.8-q1_0` (`Qwen3.8-2.4T-A95B
@@ -252,7 +269,13 @@ dequantize it identically. With the router gate fingerprints matching on all 184
 records of Run B, the WEIGHTS side is now closed at both ends of the stack. The
 divergence therefore begins in the COMPUTE after the embedding, somewhere in
 block 0's attention and dense path, and by the first MoE router it has reached
-0.56 %, which is about one bf16 rounding step.
+0.56 %. **That is NOT "about one bf16 rounding step", and an earlier revision of
+this section said it was.** The bf16 relative step is 2^-8 = 0.3906 %, so 0.56 %
+is 1.43x it, and 0.56 % is a mean of per-element ratios, which is the statistic
+the caution under Run B's record-0 table says may not be compared with a ratio
+of means. The honest statement is the bare one: the mean relative difference at
+the first MoE router is 0.56 %, and this record does not convert it into a count
+of rounding steps.
 
 **What Run C does NOT establish.** It removes one candidate. It does not
 identify a cause and it does not make the divergence benign. The 13.4 %

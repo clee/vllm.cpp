@@ -107,6 +107,7 @@ Six limits, stated plainly rather than left to be discovered.
   that figure holds for. Device access to host-resident weights on that part also has
   a recorded penalty, and this lane reads ~6.95 GB of expert bytes per token that
   way, so a CUDA arm slower than the CPU arm remains a real possible outcome.
+  No published figure bounds this either way.
 * **More slots is not a free knob, and the reason is the page cache rather than
   the arena.** The same binary at 8000 slots measured a 39.98-45.40 s/token
   median over two runs, and the second consumed all 30,625 MiB of the box's swap:

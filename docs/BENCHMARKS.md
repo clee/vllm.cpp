@@ -570,6 +570,7 @@ built on it rather than keeping the flattering one.
 | Async serving correctness (#323) | **FIXED**: the decode graph replayed stale HOST token ids, degenerating concurrent requests past slot 0 (classic-dense, graph on = default). Graph declines while the mirror is live; async 7/7, SACRED 184/184 | Graph to read ids at REPLAY |
 | Ampere consumer (`sm_86`, RTX 3090 class) | **No number owed; no such board here.** 2026-08-06 build-verify: 7/7 FA2 TUs 0-warn, real `sm_86` SASS. [Detail](../.agents/benchmark-record.md) | External RTX 3090 report. Floor is llama.cpp on that card (GGUF, not our Blackwell-only NVFP4 grid) |
 | Pre-Ampere breadth (Turing `sm_75` / Volta `sm_70` / Pascal) | **No number owed; nothing runs on these arches.** 2026-08-06 `sm_75`: 20/20 TUs PASS (0 err/warn), WMMA bodies + all 3 selectors arch-gated; GB10 SASS byte-identical. [Detail](../.agents/benchmark-record.md) | Full-library LINK at `sm_75` + `cuobjdump` SASS, then a build-supported row. The fp16 `fattn` port is speed-only now; its floor when a card exists is llama.cpp on that card |
+| Device expert slices, CUDA against CPU (`ENG-EXPERT-STREAM-DEVICE`, [#1299](https://github.com/mudler/vllm.cpp/issues/1299)) | **No number, and the DIRECTION is unbounded.** G0-SPEED is VOID behind a failing G0-CORRECT, so nothing published says whether the CUDA arm is faster or slower than the CPU arm here | G0-CORRECT first, then a clock-controlled repeat |
 
 ## Reproduce
 
