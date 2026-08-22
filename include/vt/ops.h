@@ -1121,7 +1121,7 @@ struct PagedAttentionArgs {
   // device read (companion to query_start_loc_host). 0 => that launcher falls
   // back to the D2H+sync.
   int32_t max_seq_len = 0;
-  // OPTIONAL fp8 KV-cache read (KV-FP8 W1). kAuto (default) => the cache holds
+  // OPTIONAL fp8 KV-cache read (KV-FP8 W1 CPU, W2 CUDA). kAuto (default) => the cache holds
   // the model float dtype and is read directly — every existing caller is
   // byte-identical. When != kAuto the K/V cache pages are 1-byte fp8 (DType::kI8
   // storage) and each read is DEQUANTIZED as Dequant(fp8) * k_scale|v_scale
@@ -1129,6 +1129,9 @@ struct PagedAttentionArgs {
   // (scaled_vec_conversion<float,uint8_t>, quant_utils.cuh:302-308). k_scale /
   // v_scale are the per-tensor scales from BaseKVCacheMethod (kv_cache.py:108-191)
   // — 1.0 is the uncalibrated default. Per-head scales are a later brick.
+  // Implemented on CPU and CUDA. kMETAL/kROCM register kPagedAttention for the
+  // FLOAT path only, and because these fields are ADDITIVE the provider table
+  // cannot tell the two arms apart, so src/vt/ops.cpp refuses them by name.
   Fp8KVCacheDataType kv_cache_dtype = Fp8KVCacheDataType::kAuto;
   float k_scale = 1.0f;
   float v_scale = 1.0f;
@@ -3317,6 +3320,46 @@ void AttentionDenseFast(Queue& q, Tensor& out, const Tensor& query, const Tensor
 void AttentionDenseFlash(Queue& q, Tensor& out, const Tensor& query, const Tensor& key,
                          const Tensor& value, const AttentionArgs& args);
 
+// The head_dim domain AttentionDenseFlash can actually LAUNCH, as arithmetic a
+// host without a GPU can execute and a test can pin (#1544).
+//
+// The tiling is what bounds it: each CTA stages `kAttentionDenseFlashTileCols`
+// columns of BOTH K and V in dynamic shared memory, so it asks the driver for
+// `2 * cols * head_dim * sizeof(input element)` bytes. There is no
+// `cudaFuncSetAttribute(..., cudaFuncAttributeMaxDynamicSharedMemorySize, ...)`
+// anywhere in src/vt/cuda/, so that request is capped at CUDA's DEFAULT 48 KiB per
+// block on every architecture — not at the 256 the kernel's register blocking
+// allows, which is what this op used to advertise on its own. head_dim 256 in bf16
+// wants 64 KiB and in f32 wants 128 KiB; both are refused by the driver, and the
+// caller used to learn that from a bare launch error one `cudaGetLastError` later.
+//
+// This mirrors what vLLM makes every backend declare — `get_supported_head_sizes`
+// / `supports_head_size`, vllm/v1/attention/backend.py:155-163 @ 555967922 — where
+// the domain is consulted BEFORE dispatch rather than discovered by launching.
+// AttentionDenseFast (kAttentionDenseFast) uses NO shared memory and is the rung
+// that serves head_dim above the bound below.
+inline constexpr int64_t kAttentionDenseFlashTileCols = 64;
+// The register blocking: 8 elements per lane across 32 lanes.
+inline constexpr int64_t kAttentionDenseMaxHeadDim = 256;
+// CUDA's default per-block dynamic shared-memory cap, and it is INCLUSIVE. That
+// direction matters: head_dim 192 in bf16 lands on exactly 49152 bytes and launches
+// today, so an exclusive bound would refuse work that currently runs.
+inline constexpr int64_t kCudaDefaultDynamicSmemBytes = 49152;
+
+// Bytes of dynamic shared memory one CTA requests for `head_dim` at `elem_size`.
+constexpr int64_t AttentionDenseFlashSmemBytes(int64_t head_dim, int64_t elem_size) {
+  return 2 * kAttentionDenseFlashTileCols * head_dim * elem_size;
+}
+
+// The largest head_dim AttentionDenseFlash can launch for an input element size.
+// bf16 -> 192, f32 -> 96.
+constexpr int64_t AttentionDenseFlashMaxHeadDim(int64_t elem_size) {
+  if (elem_size <= 0) return 0;  // no element size, no admissible head_dim
+  const int64_t by_smem =
+      kCudaDefaultDynamicSmemBytes / (2 * kAttentionDenseFlashTileCols * elem_size);
+  return by_smem < kAttentionDenseMaxHeadDim ? by_smem : kAttentionDenseMaxHeadDim;
+}
+
 // Same contract as AttentionDenseFlash, but the CUDA impl runs the VENDORED
 // FlashAttention-2 forward (src/vt/cuda/flash_attn/) on its tensor cores instead of a
 // scalar per-warp recurrence — the kernel vLLM itself dispatches for dense non-causal
@@ -3446,9 +3489,10 @@ void ReshapeAndCache(Queue& q, const Tensor& k, const Tensor& v, Tensor& k_cache
 // the fp8::scaled_convert scale convention, quant_utils.cuh:296-308) @ pin
 // 555967922. k_scale/v_scale are the per-tensor scales BaseKVCacheMethod loads
 // from the checkpoint (kv_cache.py:108-191); both must be > 0. Same shape/stride
-// contract as ReshapeAndCache; the ONLY difference is the fp8 store. CPU-only in
-// W1 (the CUDA fp8-KV store kernel is a named later brick); kFp8E5M2 CPU compute
-// is likewise a later brick.
+// contract as ReshapeAndCache; the ONLY difference is the fp8 store. Implemented
+// on CPU (W1, src/vt/cpu/cpu_cache.cpp) and CUDA (W2, src/vt/cuda/cuda_cache.cu,
+// gated byte-for-byte against the CPU arm); a backend that registers no provider
+// refuses by name in GetOp. kFp8E5M2 is a named later brick (spec W5).
 void ReshapeAndCacheFp8(Queue& q, const Tensor& k, const Tensor& v, Tensor& k_cache,
                         Tensor& v_cache, const Tensor& slot_mapping, Fp8KVCacheDataType kind,
                         float k_scale, float v_scale);
