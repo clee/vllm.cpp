@@ -450,6 +450,27 @@ drop each key in turn and assert the contract names the one dropped, and
 floored field in turn. `test_an_argument_at_the_floor_is_accepted` is the other
 side of the floor, so the cases cannot pass by refusing everything.
 
+### Mutation proof — the NEW gate, and the new cross-gate
+
+Four more, each applied alone, `parse_rc=0` printed, `git diff --stat` printed to
+prove it applied, restored by sha256 (`5b81281f7fa76824253d4b119459c1dad0b54ed2e35c6d4265beb53db9967411`
+for the checker, `812808faf1e149378fb13c84be6ccb0a661d2b45c62f5d652361d14d9a60b93e`
+for the C++ consumer).
+
+| # | Mutation | Result |
+|---|---|---|
+| M12 | lower the checker's floor, `MIN_ARGUMENT_CHARS = 80 → 5`, to hide a shrinking record | **3 failures** |
+| M13 | stop requiring the evidence keys, `REQUIRED_EVIDENCE_KEYS = ()` | **4 failures** |
+| M14 | drop `quantization` from the **C++** `kForcedTermKeys` alone, leaving both other copies intact | **1 failure**, `test_the_cpp_consumer_names_every_unattributed_key` |
+| M15 | change the **C++** `kMinArgumentChars` to 5 alone | **1 failure**, `test_the_cpp_consumer_carries_the_same_argument_floor` |
+
+M14 and M15 are the ones worth reading. Nothing in Python imports the C++ file,
+so a mutation confined to it could only be caught by a case that reads that
+source and holds it to a suite-owned expectation. Both fire, and they fire on the
+key that was actually removed. The floor and the key lists cannot be quietly
+relaxed in either direction: raising the floor to hide a shrinking record is red,
+and lowering it to admit one is red too.
+
 ### The driver's third state named a cause it could not know
 
 `nemotron-h-gen` printed `(no capture block)` for `capture_recorded == -1`. The
