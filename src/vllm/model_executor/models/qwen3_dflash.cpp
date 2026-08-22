@@ -18,6 +18,7 @@
 
 #include "vllm/model_executor/layers/linear.h"             // UnquantizedMlpGateUpMethod seam
 #include "vllm/model_executor/models/dense_attn_block.h"  // Dev/DBuf/ResidentWeight/Reshape/MakeRopeArgs
+#include "vllm/model_executor/models/dense_nvfp4_gemm.h"  // #1628: the shared NVFP4 W4A16 logits GEMM
 #include "vllm/platforms/interface.h"                     // platforms::GetPlatform (static-graph gate)
 #include "vt/backend.h"
 #include "vt/breakable_graph.h"  // ENG-CUDAGRAPH-BREAK W5: the shared capture seam
@@ -33,6 +34,179 @@ using vt::Tensor;
 using namespace dense_attn;  // Dev, DBuf, ResidentWeight, Reshape, MakeRopeArgs
 
 constexpr int64_t kPadSlotId = -1;  // vLLM PAD_SLOT_ID (attention/backends/utils.py:45)
+
+// ---------------------------------------------------------------------------
+// SPEC-DFLASH2-QUANT-LMHEAD (#1628) - the ONE draft logits GEMM.
+//
+// The draft owns no head; it runs the TARGET's over its own hidden states, and
+// the target's head has TWO storage owners (`LoadDenseLmHead`, qwen3_5_dense.h):
+// raw-NK bf16, or ModelOpt/compressed-tensors NVFP4 kept PACKED. Every block
+// forward below used to read only the first, so a target whose head is NVFP4 was
+// refused at load by stored dtype.
+//
+// The packed arm goes through `dense_nvfp4::MatmulNvfp4W4A16D`. That matters
+// here more than anywhere else: the DFlash2 candidate selector's whole input is
+// the TARGET head's exact top-K, so the draft has to compute it with the head
+// the target computes with, by the computation the target uses.
+// `tests/vllm/models/test_qwen3_dflash2_draft.cpp` measures that equality
+// against `Qwen3_5MTPModel::ComputeLogits` - the OTHER draft that shares the
+// target's head - rather than asserting it from the code.
+//
+// IT IS NOT THE SAME FUNCTION, and this comment used to say it was "extracted
+// VERBATIM". Read against the tree that is false twice over. The target's own
+// logits take `MatmulNvfp4F32D` (qwen3_5.cpp:3106, reached from :3139), a
+// different dispatcher; and the two `MatmulNvfp4MarlinD` bodies underneath them
+// (qwen3_5.cpp:2849-2903 vs dense_nvfp4_gemm.h:505-560) differ in four ways.
+// They hold SEPARATE function-local `static void* ws` workspaces. qwen3_5.cpp
+// `Memset`s its workspace on EVERY call while the shared one zeroes it ONCE, on
+// a documented kernel-self-reset invariant. The shared one threads
+// `w.group_size` / `w.is_mxfp4` where qwen3_5.cpp hardcodes 16 / false. And the
+// shared one increments `MutableW4A16Stats()`, which qwen3_5.cpp does not.
+//
+// The CONCLUSION survives, and the reason is narrower than "same code": FOR A
+// HEAD the last three differences are unreachable. `LoadCtNvfp4Raw` and
+// `LoadNvfp4AnyNaming` set neither `group_size` nor `is_mxfp4`, so both stay at
+// their defaults 16 / false -- exactly what qwen3_5.cpp hardcodes and what
+// `vt::MoeMarlinArgs` already defaults to -- and the stats counter is
+// observational. What is left is the workspace-zero POLICY, which is the one
+// thing a CUDA run has to check; `.agents/specs/dflash2-spec-decode.md`
+// `## Owed` O29 names it as such.
+//
+// Upstream reaches the same place and needs no branch, because its head is an
+// `nn.Module`: `compute_candidates` @ the MERGED vllm-project/vllm#52816 head
+// `b389ac29465b33f9e9c534df221ea3c129e9793f` calls
+// `LogitsProcessor.get_top_k_tokens(self.lm_head, ...)` ->
+// `_apply_head` -> `lm_head.quant_method.apply` (logits_processor.py:241-286,
+// :132-142), which IS the target's own logits path. The quant-method refusal
+// that file carried at `66e5414c` - the one `RefuseQuantizedDflash2LmHead`
+// mirrors - is gone from the merged version entirely.
+DBuf DflashLogitsF32D(Dev d, const Tensor& x, const Qwen3DFlashWeights& weights,
+                      int64_t vocab, int64_t hidden_size) {
+  if (!weights.lm_head_fp4.Empty()) {
+    // The W4A16 dispatcher refuses a true-W4A4 weight itself; this says WHY in
+    // this lane's terms, because falling into the fp4-activation GEMM the target
+    // head does not take is the silent-wrong `## Risks/decisions` D12 is about.
+    VT_CHECK(!weights.lm_head_fp4.IsTrueW4A4(),
+             "dflash: the shared lm_head is NVFP4 with an ACTIVATION scale "
+             "(true W4A4) and this draft's logits GEMM is the W4A16 dispatcher "
+             "the target's own W4A16 head takes. Unset VT_MODELOPT_W4A4. Issue "
+             "#1628 (https://github.com/mudler/vllm.cpp/issues/1628).");
+    return dense_nvfp4::MatmulNvfp4W4A16D(d, x, weights.lm_head_fp4, DType::kF32);
+  }
+  // EXACTLY ONE owner is populated, and neither being populated is a LOADER
+  // defect rather than a user error -- so it is named here instead of read as an
+  // empty tensor. Found by this row's own reachability mutation: deleting the
+  // packed branch above made the packed case reach `ResidentWeight` with an
+  // empty `lm_head` and SEGFAULT, which is a red the suite cannot explain. A
+  // named refusal is the same red with the reason attached.
+  VT_CHECK(!weights.lm_head.Empty(),
+           "dflash: the draft's SHARED lm_head is empty in BOTH owners. The draft "
+           "runs the TARGET's head, so the loader fills exactly one of "
+           "`lm_head` (raw-NK bf16) and `lm_head_fp4` (packed NVFP4) -- see "
+           "LoadDflashSharedLmHead (qwen3_dflash.h), issue #1628 "
+           "(https://github.com/mudler/vllm.cpp/issues/1628).");
+  Tensor lm = ResidentWeight(d, weights.lm_head, {vocab, hidden_size});
+  DBuf logits(d, DType::kF32, {x.shape[0], vocab});
+  vt::MatmulBT(d.q, logits.t(), x, lm);
+  return logits;
+}
+
+// ---------------------------------------------------------------------------
+// SPEC-DFLASH2 W2 (#1314) — the grouped dynamic depthwise convolution that wraps
+// each attention and each MLP sublayer of a DFlash2 draft block.
+//
+// BEYOND-PIN, from `DFlashGroupedConv.prepare` / `.finish` and
+// `DFlash2Qwen3DecoderLayer.forward`
+// (vllm/model_executor/models/qwen3_dflash2.py @ vllm-project/vllm#52816 head
+// `19c9351904df4c63042671bc67a866ca48dc7d6f`). Upstream's decoder layer is:
+//
+//     hidden, coefficients = self.attention_conv.prepare(hidden)
+//     hidden               = self.self_attn(positions, hidden)
+//     hidden               = self.attention_conv.finish(hidden, coefficients)
+//     hidden, residual     = self.post_attention_layernorm(hidden, residual)
+//     hidden, coefficients = self.mlp_conv.prepare(hidden)
+//     hidden               = self.mlp(hidden)
+//     hidden               = self.mlp_conv.finish(hidden, coefficients)
+//
+// TWO things about the shape of this pair are load-bearing and neither is
+// visible in a token gate, because a DFlash2 draft whose conv is wrong still
+// emits the TARGET's tokens (the verify is lossless) and loses only acceptance:
+//
+//  * ONE projection, TWO sides. `prepare` projects the sublayer INPUT once into
+//    `[T, 2, taps, num_groups]` and convolves with side 0; `finish` reuses that
+//    SAME buffer with side 1, over the sublayer OUTPUT. So the finish
+//    coefficients are a function of the input, not of the output, and computing
+//    them again after the sublayer would be a different model.
+//  * The conv's block is the QUERY block, `1 + k`, and the taps are zeroed
+//    across its boundary, which is what `weights.conv_block_size` carries.
+//
+// `stream` is convolved IN PLACE (the DBuf is replaced by the conv output),
+// mirroring upstream's rebinding of `hidden_states`.
+DBuf DflashConvPrepare(Dev d, const Qwen3DFlashConvWeights& cw,
+                       const Qwen3DFlashWeights& weights, const HfConfig& config,
+                       DBuf* stream) {
+  const int64_t T = stream->t().shape[0];
+  const int64_t H = config.hidden_size;
+  const int64_t taps = weights.conv_taps;
+  const int64_t groups = H / weights.conv_group_size;
+  // ONE projection of the sublayer input -> [T, 2, taps, num_groups]. The GEMM
+  // writes a flat [T, 2*taps*num_groups] view of the same buffer, which is the
+  // reshape upstream spells as `.reshape(hidden.shape[0], 2, taps, num_groups)`.
+  DBuf coef(d, DType::kBF16, {T, 2, taps, groups});
+  {
+    Tensor flat = Reshape(coef.t(), {T, 2 * taps * groups});
+    Tensor wp = ResidentWeight(d, cw.kernel_projection);
+    vt::MatmulBT(d.q, flat, stream->t(), wp);
+  }
+  DBuf out(d, DType::kBF16, {T, H});
+  Tensor base = ResidentWeight(d, cw.base_kernel, {2, taps, H});
+  vt::DFlashGroupedConvArgs a;
+  a.block_size = weights.conv_block_size;
+  a.taps = taps;
+  a.num_groups = groups;
+  a.group_size = weights.conv_group_size;
+  a.side = 0;  // prepare
+  vt::DFlashGroupedConv(d.q, out.t(), stream->t(), coef.t(), base, a);
+  *stream = std::move(out);
+  return coef;
+}
+
+void DflashConvFinish(Dev d, const Qwen3DFlashConvWeights& cw,
+                      const Qwen3DFlashWeights& weights, const HfConfig& config,
+                      DBuf* stream, const DBuf& coef) {
+  const int64_t T = stream->t().shape[0];
+  const int64_t H = config.hidden_size;
+  const int64_t taps = weights.conv_taps;
+  const int64_t groups = H / weights.conv_group_size;
+  DBuf out(d, DType::kBF16, {T, H});
+  Tensor base = ResidentWeight(d, cw.base_kernel, {2, taps, H});
+  vt::DFlashGroupedConvArgs a;
+  a.block_size = weights.conv_block_size;
+  a.taps = taps;
+  a.num_groups = groups;
+  a.group_size = weights.conv_group_size;
+  a.side = 1;  // finish, reading the SAME coefficients the prepare projected
+  vt::DFlashGroupedConv(d.q, out.t(), stream->t(), coef.t(), base, a);
+  *stream = std::move(out);
+}
+
+// The conv masks its taps by `row index mod conv_block_size`, exactly as
+// upstream's `torch.arange(hidden_states.shape[0]) % block_size` does. That is
+// the intra-block offset ONLY while every request block is contiguous and
+// `conv_block_size`-aligned, which is the uniform (1+k) DFlash batch. A ragged
+// batch would silently mask the wrong taps -- acceptance-only and token-invisible
+// -- so it is refused here rather than discovered on a gate host.
+void CheckDflashConvBatch(const Qwen3DFlashWeights& weights, const std::vector<int32_t>& cu) {
+  VT_CHECK(weights.conv_block_size > 0,
+           "qwen3_dflash2: conv_block_size must be set (1 + num_speculative_tokens)");
+  for (size_t r = 0; r + 1 < cu.size(); ++r) {
+    VT_CHECK(cu[r] % weights.conv_block_size == 0 &&
+                 cu[r + 1] - cu[r] == static_cast<int32_t>(weights.conv_block_size),
+             "qwen3_dflash2: the grouped convolution needs a uniform "
+             "conv_block_size-aligned query block per request");
+  }
+}
+
 
 // Device-resident per-layer context K/V (D7). The D5 path downloaded each layer's
 // projected K/V to host (2 D->H copies/layer) and re-uploaded them in the block
@@ -240,6 +414,7 @@ std::vector<float> Qwen3DFlashModel::ForwardBlockLogits(
            "qwen3_dflash: cu_seqlens must span [0,T]");
   VT_CHECK(weights.layers.size() == static_cast<size_t>(config.num_hidden_layers),
            "qwen3_dflash: one layer weight per config.num_hidden_layers");
+  if (weights.IsDflash2()) CheckDflashConvBatch(weights, cu);
 
   // Embed: hidden[T,H] bf16 = embed_tokens[input_ids]; mask slots take
   // embed_tokens[mask_token_id] naturally (in-vocab), or the dedicated mask
@@ -286,6 +461,11 @@ std::vector<float> Qwen3DFlashModel::ForwardBlockLogits(
       vt::FusedChain(d.q, dhn.t(), hidden.t(), w_in, &res.t(), vt::kFusedAddRmsNormStd, eps);
     else
       vt::RmsNorm(d.q, dhn.t(), hidden.t(), w_in, vt::RmsNormArgs{eps, false}, &res.t());
+
+    // SPEC-DFLASH2 W2 (#1314): attention_conv.prepare, before the sublayer.
+    DBuf attn_coef(d, DType::kBF16, {0});
+    if (weights.IsDflash2())
+      attn_coef = DflashConvPrepare(d, layer.attention_conv, weights, config, &dhn);
 
     // attention over the context-free block (routes through DFlashBlockAttention).
     // Reuse the block helper but feed the real positions to RoPE.
@@ -336,6 +516,11 @@ std::vector<float> Qwen3DFlashModel::ForwardBlockLogits(
       return o;
     }();
 
+    // SPEC-DFLASH2 W2: attention_conv.finish, over the sublayer OUTPUT with the
+    // coefficients the prepare projected off the sublayer INPUT.
+    if (weights.IsDflash2())
+      DflashConvFinish(d, layer.attention_conv, weights, config, &attn, attn_coef);
+
     // post_attention_layernorm (std add+RMSNorm).
     Tensor w_post = ResidentWeight(d, layer.post_attention_layernorm, {H});
     DBuf dh2(d, DType::kBF16, {T, H});
@@ -349,11 +534,17 @@ std::vector<float> Qwen3DFlashModel::ForwardBlockLogits(
     // — byte-for-byte the same op sequence the inline path ran, now on the same
     // exemplar as qwen3.cpp MlpBlock. (Tier-A1 fold, arch-fusion-fold-plan.)
     const int64_t I = config.intermediate_size;
+    // SPEC-DFLASH2 W2: mlp_conv.prepare / .finish around the MLP sublayer.
+    DBuf mlp_coef(d, DType::kBF16, {0});
+    if (weights.IsDflash2())
+      mlp_coef = DflashConvPrepare(d, layer.mlp_conv, weights, config, &dh2);
     DBuf act =
         layers::UnquantizedMlpGateUpMethod(&layer.gate_up_proj, I).Apply(d, dh2.t());
     Tensor wdn = ResidentWeight(d, layer.down_proj);
     DBuf down(d, DType::kBF16, {T, H});
     vt::MatmulBT(d.q, down.t(), act.t(), wdn);
+    if (weights.IsDflash2())
+      DflashConvFinish(d, layer.mlp_conv, weights, config, &down, mlp_coef);
     if (per_layer_out != nullptr) {
       DBuf tmp(d, DType::kF32, {T, H});
       vt::CastF32(d.q, tmp.t(), down.t());
@@ -379,9 +570,7 @@ std::vector<float> Qwen3DFlashModel::ForwardBlockLogits(
     tmp.Download(d, final_out->data());
   }
 
-  Tensor lm = ResidentWeight(d, weights.lm_head, {vocab, H});
-  DBuf logits(d, DType::kF32, {T, vocab});
-  vt::MatmulBT(d.q, logits.t(), dnorm.t(), lm);
+  DBuf logits = DflashLogitsF32D(d, dnorm.t(), weights, vocab, H);
   std::vector<float> out(static_cast<size_t>(T) * vocab);
   logits.Download(d, out.data());
   return out;
@@ -455,6 +644,7 @@ static std::vector<float> ForwardWithCtxKVDev(
   const int64_t C = ckv.num_ctx;
   VT_CHECK(ctx_cu.back() == static_cast<int32_t>(C),
            "ForwardWithCtxKVDev: ctx_cu.back() must equal num_ctx");
+  if (weights.IsDflash2()) CheckDflashConvBatch(weights, cu);
 
   // Combined [context; block] per-request layout for the attention (cu_comb), plus
   // the DEVICE index maps (D7) that place context/block rows into the combined
@@ -527,6 +717,11 @@ static std::vector<float> ForwardWithCtxKVDev(
     else
       vt::RmsNorm(d.q, dhn.t(), hidden.t(), w_in, vt::RmsNormArgs{eps, false}, &res.t());
 
+    // SPEC-DFLASH2 W2 (#1314): attention_conv.prepare, before the sublayer.
+    DBuf attn_coef(d, DType::kBF16, {0});
+    if (weights.IsDflash2())
+      attn_coef = DflashConvPrepare(d, layer.attention_conv, weights, config, &dhn);
+
     // Block q/k/v: same per-layer path as the context-free forward.
     const float scale = 1.0F / std::sqrt(static_cast<float>(Dh));
     DBuf q(d, DType::kBF16, {Tq, qdim});
@@ -590,6 +785,11 @@ static std::vector<float> ForwardWithCtxKVDev(
     DBuf attn(d, DType::kBF16, {Tq, H});
     vt::MatmulBT(d.q, attn.t(), a.t(), wo);
 
+    // SPEC-DFLASH2 W2 (#1314): attention_conv.finish. Its prepare ran above, on
+    // the input_layernorm output, before the qkv projection.
+    if (weights.IsDflash2())
+      DflashConvFinish(d, layer.attention_conv, weights, config, &attn, attn_coef);
+
     // post_attention_layernorm + SwiGLU MLP (unchanged from ForwardBlockLogits).
     Tensor w_post = ResidentWeight(d, layer.post_attention_layernorm, {H});
     DBuf dh2(d, DType::kBF16, {Tq, H});
@@ -598,6 +798,9 @@ static std::vector<float> ForwardWithCtxKVDev(
     else
       vt::RmsNorm(d.q, dh2.t(), attn.t(), w_post, vt::RmsNormArgs{eps, false}, &res.t());
     const int64_t I = config.intermediate_size;
+    DBuf mlp_coef(d, DType::kBF16, {0});
+    if (weights.IsDflash2())
+      mlp_coef = DflashConvPrepare(d, layer.mlp_conv, weights, config, &dh2);
     Tensor wgu = ResidentWeight(d, layer.gate_up_proj);
     DBuf gu(d, DType::kBF16, {Tq, 2 * I});
     vt::MatmulBT(d.q, gu.t(), dh2.t(), wgu);
@@ -606,6 +809,8 @@ static std::vector<float> ForwardWithCtxKVDev(
     Tensor wdn = ResidentWeight(d, layer.down_proj);
     DBuf down(d, DType::kBF16, {Tq, H});
     vt::MatmulBT(d.q, down.t(), act.t(), wdn);
+    if (weights.IsDflash2())
+      DflashConvFinish(d, layer.mlp_conv, weights, config, &down, mlp_coef);
     if (per_layer_out != nullptr) {
       DBuf tmp(d, DType::kF32, {Tq, H});
       vt::CastF32(d.q, tmp.t(), down.t());
@@ -628,9 +833,7 @@ static std::vector<float> ForwardWithCtxKVDev(
     final_out->assign(static_cast<size_t>(Tq) * H, 0.0f);
     tmp.Download(d, final_out->data());
   }
-  Tensor lm = ResidentWeight(d, weights.lm_head, {vocab, H});
-  DBuf logits(d, DType::kF32, {Tq, vocab});
-  vt::MatmulBT(d.q, logits.t(), dnorm.t(), lm);
+  DBuf logits = DflashLogitsF32D(d, dnorm.t(), weights, vocab, H);
   std::vector<float> out(static_cast<size_t>(Tq) * vocab);
   logits.Download(d, out.data());
   return out;
@@ -902,6 +1105,10 @@ static DBuf ForwardPagedBody(Dev d, const DflashDeviceKVStore& store, const Tens
   const int64_t qdim = Hq * Dh, kdim = Hkv * Dh;
   const int64_t vocab = weights.draft_vocab_size;
   const float eps = static_cast<float>(config.rms_norm_eps);
+  // SPEC-DFLASH2 W2 (#1314): this body serves ONE request whose whole (1+k)
+  // query block is rows [0, Tq), so the conv's alignment condition is just
+  // Tq == conv_block_size.
+  if (weights.IsDflash2()) CheckDflashConvBatch(weights, {0, static_cast<int32_t>(Tq)});
   Tensor cur = hidden_in;
   std::vector<DBuf> keep;  // keep each layer's post-MLP `down` alive across iterations
   keep.reserve(static_cast<size_t>(config.num_hidden_layers));
@@ -915,6 +1122,14 @@ static DBuf ForwardPagedBody(Dev d, const DflashDeviceKVStore& store, const Tens
       vt::FusedChain(d.q, dhn.t(), cur, w_in, &res.t(), vt::kFusedAddRmsNormStd, eps);
     else
       vt::RmsNorm(d.q, dhn.t(), cur, w_in, vt::RmsNormArgs{eps, false}, &res.t());
+
+    // SPEC-DFLASH2 W2 (#1314): attention_conv.prepare. This body is the one the
+    // production decode path reaches (runner.cpp -> ForwardBlockLogitsWithDeviceKV)
+    // and the one that is CUDA-graph captured; vt::DFlashGroupedConv is a plain
+    // stream kernel with no host upload, so it captures like every other op here.
+    DBuf attn_coef(d, DType::kBF16, {0});
+    if (weights.IsDflash2())
+      attn_coef = DflashConvPrepare(d, layer.attention_conv, weights, config, &dhn);
 
     const float scale = 1.0F / std::sqrt(static_cast<float>(Dh));
     DBuf q(d, DType::kBF16, {Tq, qdim});
@@ -950,6 +1165,10 @@ static DBuf ForwardPagedBody(Dev d, const DflashDeviceKVStore& store, const Tens
     DBuf attn(d, DType::kBF16, {Tq, H});
     vt::MatmulBT(d.q, attn.t(), a, wo);
 
+    // SPEC-DFLASH2 W2: attention_conv.finish.
+    if (weights.IsDflash2())
+      DflashConvFinish(d, layer.attention_conv, weights, config, &attn, attn_coef);
+
     Tensor w_post = ResidentWeight(d, layer.post_attention_layernorm, {H});
     DBuf dh2(d, DType::kBF16, {Tq, H});
     if (FusedChainAdoptEnabled())
@@ -957,6 +1176,9 @@ static DBuf ForwardPagedBody(Dev d, const DflashDeviceKVStore& store, const Tens
     else
       vt::RmsNorm(d.q, dh2.t(), attn.t(), w_post, vt::RmsNormArgs{eps, false}, &res.t());
     const int64_t I = config.intermediate_size;
+    DBuf mlp_coef(d, DType::kBF16, {0});
+    if (weights.IsDflash2())
+      mlp_coef = DflashConvPrepare(d, layer.mlp_conv, weights, config, &dh2);
     Tensor wgu = ResidentWeight(d, layer.gate_up_proj);
     DBuf gu(d, DType::kBF16, {Tq, 2 * I});
     vt::MatmulBT(d.q, gu.t(), dh2.t(), wgu);
@@ -965,6 +1187,8 @@ static DBuf ForwardPagedBody(Dev d, const DflashDeviceKVStore& store, const Tens
     Tensor wdn = ResidentWeight(d, layer.down_proj);
     DBuf down(d, DType::kBF16, {Tq, H});
     vt::MatmulBT(d.q, down.t(), act.t(), wdn);
+    if (weights.IsDflash2())
+      DflashConvFinish(d, layer.mlp_conv, weights, config, &down, mlp_coef);
     keep.push_back(std::move(down));
     cur = keep.back().t();
   }
@@ -975,10 +1199,7 @@ static DBuf ForwardPagedBody(Dev d, const DflashDeviceKVStore& store, const Tens
     vt::FusedChain(d.q, dnorm.t(), cur, w_fn, &res.t(), vt::kFusedAddRmsNormStd, eps);
   else
     vt::RmsNorm(d.q, dnorm.t(), cur, w_fn, vt::RmsNormArgs{eps, false}, &res.t());
-  Tensor lm = ResidentWeight(d, weights.lm_head, {vocab, H});
-  DBuf logits(d, DType::kF32, {Tq, vocab});
-  vt::MatmulBT(d.q, logits.t(), dnorm.t(), lm);
-  return logits;
+  return DflashLogitsF32D(d, dnorm.t(), weights, vocab, H);
 }
 
 std::vector<float> Qwen3DFlashModel::ForwardBlockLogitsWithDeviceKV(

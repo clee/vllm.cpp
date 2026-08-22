@@ -335,6 +335,17 @@ def audit() -> list[dict]:
 # the same day on reaching DONE (closing commit 157080c8) -- a DONE row leaves
 # the gated population, so its verdict is None rather than a downgraded one.
 # A shrink for a real record edit, named as the message demands.
+# 2026-08-21: -SPEC-BPE-QUADRATIC-MERGE. It entered on 2026-08-19 as GROWTH,
+# when its `## Gates` section gained the `g++` build and the two run lines for
+# `tools/bench/bpe_encode_cost.cpp`, and it leaves now because the row was
+# promoted `GATING` -> `DONE` by its closing commit (fix `67823aee2`, PR #1539,
+# issue #1365). Same shape and same reason as ENG-TRAILER-MERGE-ARTIFACTS above:
+# `DONE` is not in GATED_STATES, so the row leaves the AUDITED population and its
+# verdict becomes None rather than a downgraded one. It did NOT lose its command
+# -- the recipe is still in the spec and still runnable by hand -- which is
+# exactly the distinction `ratchet_errors` draws, and why this is a shrink for a
+# real record edit rather than a gate erasing its own finding. A shrink, named as
+# the message demands, and re-pinned in the SAME change as the promotion.
 # 2026-08-11: +ENG-FORGE-COAUTHOR. Reaches ACTIVE on its committed spec (issue
 # #418), whose Gates section names the preflight, tests/scripts and
 # agent-integration invocations plus the per-commit re-verification of

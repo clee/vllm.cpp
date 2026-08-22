@@ -94,7 +94,7 @@ void ResetQwen3_5MixedSpecInvocations() {
 // Do not read that as "and now the removal is observable in production", because
 // it is not, in either order (fresh-review finding). `has_packed_ba` needs
 // `in_proj_ba`, written at exactly one site in the tree — the dense loader,
-// qwen3_5_dense_weights.cpp:431 — so on a MoE checkpoint the eligibility is
+// qwen3_5_dense_weights.cpp:432 — so on a MoE checkpoint the eligibility is
 // false before the shape term is ever read. Removing it therefore reaches packed
 // decode on NO checkpoint; it removes a contradiction with both references and a
 // second answer to a question the dtype rule already answers. Reaching packed
@@ -543,6 +543,27 @@ int64_t detail::ValidateGdnStateCacheLayout(
 detail::DeviceTokenIds& detail::DeviceTokenIdsOverride() {
   thread_local DeviceTokenIds ids;
   return ids;
+}
+
+// #1305 — THE CONSUMER SIDE, once, beside the publisher it reads. See
+// `qwen3_5_internal.h` for what each argument means and why the copy goes on the
+// queue. Four models call these: this one, `qwen3.cpp`, `qwen3_moe.cpp` and
+// `deepseek_v2.cpp`, each of which used to carry its own copy of both bodies.
+detail::DeviceTokenIds detail::TakeDeviceTokenIds() {
+  const DeviceTokenIds ov = DeviceTokenIdsOverride();
+  if (ov.ids != nullptr) DeviceTokenIdsOverride() = DeviceTokenIds{};
+  return ov;
+}
+
+bool detail::ApplyDeviceTokenIds(vt::Backend& backend, vt::Queue& queue,
+                                 void* dst, int64_t dst_count, const char* what) {
+  const DeviceTokenIds ov = TakeDeviceTokenIds();
+  if (ov.ids == nullptr) return false;
+  VT_CHECK(ov.count <= dst_count,
+           std::string(what) + ": device input ids longer than the embed input");
+  backend.Copy(queue, dst, ov.ids,
+               static_cast<size_t>(ov.count) * sizeof(int32_t));
+  return true;
 }
 
 vt::DType detail::ResolveMambaSsmCacheDType(const HfConfig& config,
@@ -1048,6 +1069,61 @@ std::vector<float> WeightF32(const OwnedTensor& w) {
 // model's lifetime. On CPU the bytes are already host-resident, so a direct view
 // avoids the copy. The weight is a read-only matmul-B / norm / embed operand, so
 // the const_cast is safe. `shape` defaults to the owned shape.
+// Print what the W0f aliasing branch has actually done, every 4 GiB of weight it
+// has seen, on the same `VT_LOAD_STATS` switch the loader's byte counters use.
+//
+// WHY PERIODIC AND NOT AT EXIT. The `[vt load] bytes@exit` line is registered
+// with `std::atexit`, and the run this instruments is one a memory guard
+// SIGKILLs — no exit handler runs, so the one number that would have explained
+// the run is the one number the run cannot print. W0f's first device attempt was
+// read from an RSS curve for exactly that reason, and an RSS curve cannot tell
+// "declined and staged" from "re-homed and the pages did not come back".
+void ReportHostAliasResidency() {
+  static const bool on = [] {
+    const char* e = std::getenv("VT_LOAD_STATS");
+    return e != nullptr && e[0] != '0';
+  }();
+  if (!on) return;
+  const vllm::HostAliasStats s = vllm::HostAliasSnapshot();
+  const uint64_t total = s.aliased_in_place_bytes + s.rehomed_bytes +
+                         s.declined_borrow_bytes + s.declined_other_bytes;
+  static uint64_t last = 0;
+  constexpr uint64_t kStep = 4ULL << 30;
+  if (total < last + kStep && last != 0) return;
+  last = total;
+  // BOUNDED, because the counter this trips on is CUMULATIVE OVER CALLS and
+  // never stops growing. `ResidentWeight` re-enters the alias branch about 1,361
+  // times per decode step, roughly 70 GiB of counted bytes, so a 4 GiB step
+  // prints about 17 lines EVERY step for the life of the process. The first
+  // forward is what this instrument exists to explain — it is where the aliasing
+  // set is established and where the recorded 60.793 GiB was read — and that
+  // fits inside the cap with room to spare. Everything after it is the same
+  // weights being counted again.
+  static int lines = 0;
+  constexpr int kMaxLines = 24;
+  if (lines >= kMaxLines) return;
+  ++lines;
+  const double gib = 1024.0 * 1024.0 * 1024.0;
+  // "per call", spelled out in the line itself. These are BYTES SEEN, not bytes
+  // resident: a weight aliased on every step is counted on every step, so the
+  // figures are traffic and become a residency measurement only when read at a
+  // stated point (see HostAliasStats in qwen3_5_weights.h).
+  std::fprintf(stderr,
+               "[vt load] w0f-alias per-call totals: calls=%llu "
+               "aliased_in_place=%.3f GiB rehomed=%.3f GiB "
+               "declined_borrow=%.3f GiB declined_other=%.3f GiB\n",
+               static_cast<unsigned long long>(s.calls),
+               static_cast<double>(s.aliased_in_place_bytes) / gib,
+               static_cast<double>(s.rehomed_bytes) / gib,
+               static_cast<double>(s.declined_borrow_bytes) / gib,
+               static_cast<double>(s.declined_other_bytes) / gib);
+  if (lines == kMaxLines)
+    std::fprintf(stderr,
+                 "[vt load] w0f-alias: %d lines printed; further lines are "
+                 "suppressed (the counters keep running)\n",
+                 kMaxLines);
+}
+
 Tensor ResidentWeight(Dev d, const OwnedTensor& w, std::vector<int64_t> shape = {}) {
   if (shape.empty()) shape.assign(w.shape, w.shape + w.rank);
   // HOST-POINTER ALIASING IS A CPU PROPERTY, NOT A "NOT-CUDA" PROPERTY (issue
@@ -1114,6 +1190,93 @@ Tensor ResidentWeight(Dev d, const OwnedTensor& w, std::vector<int64_t> shape = 
            "expert-stream lane serves its slices from host slot storage and the "
            "whole tower must never be uploaded (ENG-EXPERT-STREAM-DEVICE W0c, "
            "issues #1123 and #1124)");
+  // The SAME invariant as the elem_kn_repacked guard above, for the i8mm
+  // interleave, and it was missing until now (issue #1320). The CUDA
+  // quant dot reads `block_q8_0`; `VT_CPU_QUANT_REPACK` rewrites the buffer to
+  // `block_q8_0x4` at load and only the CPU MatmulBTKernel understands that.
+  // Unlike `elem_kn_repack`, whose policy IS gated on the CPU platform
+  // (gguf_keep_quant.cpp), `quant_repack` rides `QuantRepackActive()` alone —
+  // a HOST-CPU i8mm probe — so an aarch64 box doing `--device cuda` can repack a
+  // Q8_0 weight and then upload it verbatim to a kernel that misreads it. That is
+  // silent wrong tokens, not a crash. Measured harmless on the target checkpoint
+  // (one Q8_0 tensor, 0.01% of parameters, and the instrumented load recorded
+  // `quant_repack = 0`), which is why it is a tripwire here rather than a
+  // campaign; `VT_CPU_QUANT_REPACK=0` is the operator's way past it.
+  VT_CHECK(!w.repacked,
+           "qwen3_5: an i8mm-repacked (block_q8_0x4) weight reached device "
+           "residency; VT_CPU_QUANT_REPACK is a CPU-only load transform and the "
+           "device quant kernels read plain block_q8_0");
+  // ENG-EXPERT-STREAM-DEVICE W0f (issue #1299). THE SECOND COPY THIS ROW EXISTS
+  // TO PREVENT, at the one line that makes it.
+  //
+  // Everything below this branch is a VERBATIM byte copy: `Alloc(w.bytes.size())`,
+  // `Copy`, then a tensor with the same dtype, the same shape and the same
+  // (dropped) marker set as the source. Nothing about the bytes changes, which is
+  // exactly why a token gate cannot see the cost — and the cost is a second full
+  // resident copy of every dense weight. On a discrete device that copy is the
+  // whole point: the kernel cannot follow a host pointer. On a part whose kernels
+  // CAN, it buys nothing and comes out of the same RAM the first copy did.
+  //
+  // MEASURED (#1299, `dgx:gpu0`, seven runs). `Qwen3.8-2.4T-A95B UD-Q1_0` loads
+  // on `--device cuda` at 61.20 GiB resident and then exhausts a 119.631 GiB box
+  // inside the FIRST forward, zero decode steps, every time. A 0.15 GiB slot
+  // arena died exactly where an 18.55 GiB one did, so the arena is not the cost;
+  // growth was anonymous while file-backed stayed flat, so the mapping is not
+  // pinned. About 39 GiB of that 61.20 is `attn_qkv` (21.56) and `ssm_out`
+  // (17.25), which the GDN V-head reorder makes `kTransformedWeight` and
+  // therefore expands to bf16 in OWNED host buffers — the split is measured in
+  // `.agents/specs/expert-streaming.md`, not derived here. The CPU arm pays that
+  // once and serves. This branch is what stops the CUDA arm paying it twice.
+  //
+  // WHY THE SAME PREDICATE AS W0c AND NOT A NEW ONE. `KqExpertSlice` already
+  // hands this platform a host pointer for every expert slice it serves; a dense
+  // weight is the same question about a different tensor. `is_cpu()` is what the
+  // early return above answers, `needs_weight_staging()` is true on CUDA
+  // everywhere and would gate nothing, and `is_unified_memory()` answers the
+  // opposite question — GB10 reports unified while a `cudaMalloc` pointer is
+  // still not host-dereferenceable (vt/backend.h). A DISCRETE device answers
+  // false here, falls through, and gets byte-for-byte what it gets today.
+  if (vllm::platforms::GetPlatform(d.q.device.type)
+          .host_memory_is_device_addressable()) {
+    // A weight with NEITHER host bytes NOR a device copy cannot be served at
+    // all, and the staging branch below would not notice: it would `Alloc(0)`,
+    // copy nothing, and hand out a pointer to nothing. That is the precondition
+    // this states.
+    //
+    // THE `w.d_dev` HALF IS NOT DEFENSIVE, AND THIS CHANGE IS WHAT CREATED THE
+    // POPULATION IT SERVES (found by a fresh review of #1299). A weight whose
+    // host mirror is gone but whose `d_dev` is populated has ALWAYS been served,
+    // by the memo below, and it returned the device tensor without complaint.
+    // W0f put this check ABOVE that memo, so the same weight began to throw. The
+    // justification written here first — "`ReleaseHost()` is not reachable for
+    // the dense weights this branch serves" — is true of the dense weights and
+    // FALSE of the expert weights the same function serves at the `gp/up/dp`
+    // capture below, whose misaligned GGUF borrows decline the alias, stage, get
+    // a `d_dev`, and are then released by the guarded loop beside that capture.
+    // So the condition is "nothing to serve", not "no host bytes".
+    VT_CHECK(!w.bytes.empty() || w.d_dev != nullptr,
+             "qwen3_5: a weight reaching device residency has no host bytes and "
+             "no device copy; its host mirror was released and there is nothing "
+             "to alias or upload");
+    // ...and with no host bytes there is nothing to alias, so skip the attempt
+    // rather than charging a `kDeclinedEmpty` to the residency instrument for a
+    // weight that is already device-resident.
+    if (!w.bytes.empty()) {
+      const bool aliased = MakeHostBytesDeviceAliasable(w);
+      ReportHostAliasResidency();
+      if (aliased) {
+        // NOT `load_stats::AddDeviceUpload`: nothing was uploaded. Issue #150's
+        // counter measures bytes moved host->device, and this branch moves none.
+        return MakeTensor(const_cast<uint8_t*>(w.bytes.data()), w.dtype, d.q.device,
+                          shape);
+      }
+    }
+    // A MISALIGNED BORROW, or the `VT_QWEN35_ALIAS_HOST_WEIGHTS=0` A/B, reaches
+    // here. A borrow's pages are clean and file-backed, so staging copies them
+    // without adding anonymous residency. Falling through is deliberate and is
+    // not a failure; `ReportHostAliasResidency` above says how often it happens
+    // and for how many bytes.
+  }
   if (!w.d_dev) {
     const size_t nb = w.bytes.size();
     void* p = d.b.Alloc(nb);
@@ -5113,6 +5276,11 @@ DBuf FullAttnBlock(Dev d, const FullAttnLayerWeights& w, const HfConfig& cfg,
   }
   DBuf dattn(d, DType::kF32, {T, Hq, Dh});
   const float scale = 1.0F / std::sqrt(SizeF(Dh));
+  // VT-ATTN-NAIVE: the REFERENCE (non-paged) dense arm, as the comment on the V
+  // upcast above already says. Production decode runs `FullAttnBlockPaged`, which
+  // replaces this call with vt::ReshapeAndCache + vt::PagedAttention; this arm is
+  // what that path is compared against, so a rung change here moves the golden
+  // rather than the shipping kernel (#1544).
   vt::Attention(d.q, dattn.t(), qn3, kn3, v3, vt::AttentionArgs{scale, true});
 
   // Sigmoid output gate on the raw gate split, folded into the o_proj activation
@@ -6832,11 +7000,32 @@ DBuf MoeBlockBf16Cuda(Dev d, const MoeBlockWeights& w, const HfConfig& cfg,
             /*committed_compute_path=*/MoeBf16FastEnabled(),
             /*host_free_env=*/host_free_on)) {
       d.b.Synchronize(d.q);  // all E x 3 H2D uploads complete before any free
+      // W0f (#1299) FALSIFIED THIS BLOCK'S PREMISE, AND THIS IS THE REPAIR.
+      //
+      // The paragraph above says "once the device copy exists it is
+      // authoritative and nothing reads the host bytes again", and it was true
+      // while `ResidentWeight` had exactly two behaviours. It has three now: on
+      // a platform whose kernels can dereference host storage the function
+      // ALIASES, `d_dev` is never populated, and the pointers captured into
+      // `gp/up/dp` above ARE `w.bytes.data()`. Releasing the host mirror then
+      // frees the memory the resident device pointer table points at, and the
+      // grouped GEMM keeps reading it for the model's lifetime — including from
+      // inside a captured graph. A fresh review caught it with a scratch case
+      // that replays this exact sequence and takes SIGSEGV.
+      //
+      // The condition is therefore not "did we upload" but "IS THERE A DEVICE
+      // COPY TO BE AUTHORITATIVE", asked per weight, which is what `d_dev`
+      // already answers. It is `nullptr` on precisely the arm that aliases, and
+      // non-null on every arm that staged, so the discrete behaviour this
+      // paragraph was written for is unchanged.
       for (int64_t e = 0; e < E; ++e) {
         const size_t se = static_cast<size_t>(e);
-        w.expert_gate[se].ReleaseHost();
-        w.expert_up[se].ReleaseHost();
-        w.expert_down[se].ReleaseHost();
+        if (vllm::HostMirrorIsRedundant(w.expert_gate[se]))
+          w.expert_gate[se].ReleaseHost();
+        if (vllm::HostMirrorIsRedundant(w.expert_up[se]))
+          w.expert_up[se].ReleaseHost();
+        if (vllm::HostMirrorIsRedundant(w.expert_down[se]))
+          w.expert_down[se].ReleaseHost();
       }
     }
     mr.ready = true;
@@ -7765,9 +7954,9 @@ vt::Tensor detail::ExpertSliceForTest(vt::Queue& q, const OwnedTensor& w,
   return KqExpertSlice(d, w, N, K, row_off, expert);
 }
 
-void detail::StageWeightForTest(vt::Queue& q, const OwnedTensor& w) {
+vt::Tensor detail::StageWeightForTest(vt::Queue& q, const OwnedTensor& w) {
   Dev d{vt::GetBackend(q.device.type), q};
-  (void)ResidentWeight(d, w);
+  return ResidentWeight(d, w);
 }
 
 void detail::EndExpertStreamStep() { Qwen35ExpertStream::EndStepIfActive(); }
@@ -7801,17 +7990,11 @@ detail::ExpertStreamStepScope::~ExpertStreamStepScope() {
 // (the multimodal helper embeds a prompt and then single tokens); consuming on
 // first use means those cannot be handed ids that were never meant for them.
 // The first embed in a registry forward is always the step's own.
+// #1305: the take-and-clear and the bounds-checked copy this used to spell out
+// are `detail::ApplyDeviceTokenIds` (defined above, declared in
+// `qwen3_5_internal.h`), one body for the four models that consume the scope.
 static void ApplyDeviceTokenIdsOverride(Dev d, DBuf& dids, int64_t T) {
-  const detail::DeviceTokenIds ov = detail::DeviceTokenIdsOverride();
-  if (ov.ids == nullptr) return;
-  detail::DeviceTokenIdsOverride() = detail::DeviceTokenIds{};
-  // A device buffer LONGER than the embed's input would run past the end. That
-  // can only mean the runner and the model disagree about this step's shape, so
-  // fail loudly rather than corrupt the embedding.
-  VT_CHECK(ov.count <= T,
-           "qwen3_5 embed: device input ids longer than the embed input");
-  d.b.Copy(d.q, dids.ptr(), ov.ids,
-           static_cast<size_t>(ov.count) * sizeof(int32_t));
+  detail::ApplyDeviceTokenIds(d.b, d.q, dids.ptr(), T, "qwen3_5 embed");
 }
 
 // Embed: hidden[T,H] bf16 = embed_tokens[token_ids] (device-resident table).
@@ -10132,6 +10315,13 @@ struct Qwen3_5DecodeGraph::Impl {
     int fa_cols = -1;                 // captured block-table column count
     bool warm = false;
     int64_t replays = 0;
+    // #1380: what the EAGER step at THIS shape demanded of the scratch pool, per
+    // size class. Taken at the end of the cold step and handed back to
+    // `DevicePool::PreGrowForCapture` immediately before this slot's capture, so
+    // every allocation the captured forward makes is a pool HIT. Per SLOT rather
+    // than per pool because two shapes interleave through one pool and the pool's
+    // own last-step state would answer for whichever step ran most recently.
+    DevicePool::StepDemand demand;
     // VT_ASYNC_EXECUTOR (Option A) input-staged event: recorded on the main queue
     // right AFTER StageStepInputs enqueues the async H2D (NOT after the replay), and
     // host-waited before this slot's next Refresh — so the wait costs only the tiny
@@ -10243,6 +10433,10 @@ ForwardLogits Qwen3_5DecodeGraph::Step(
   detail::ValidateGdnDecodeGraphState(gdn_meta, gdn_state, B);
   Backend& b = vt::GetBackend(impl_->queue.device.type);
   Dev d{b, impl_->queue};
+  // #1380: open a fresh demand measurement for this step. `PreGrowForCapture`
+  // reads the profile the COLD step at this shape recorded, and a profile is a
+  // property of one step, so the boundary is here and not inside a branch.
+  Pool(b).MarkStepBoundary();
   const int64_t vocab = impl_->config.vocab_size;
   const int64_t H = impl_->config.hidden_size;
 
@@ -10432,14 +10626,27 @@ ForwardLogits Qwen3_5DecodeGraph::Step(
     // steady-state replay never captures, so this never touches the overlap path.
     if (dbuf) {
       b.Synchronize(impl_->queue);
-      // Pre-grow the pool for THIS slot's RETAINED [S,vocab] logits block while the
-      // OTHER ring slot's logits is held, so the captured logits alloc is a pool HIT
-      // (a cudaMalloc mid-capture aborts it). Working scratch is freed at
-      // ForwardLayers return and SAFELY shared between the two graphs — they replay
-      // sequentially on one stream, so only the retained logits needs two live
-      // copies. Alloc+free forces the (out-of-capture) growth; the block returns to
-      // the free list for the capture's own allocation to hit.
-      { DBuf pregrow(d, DType::kF32, std::vector<int64_t>{S, vocab}); }
+      // #1380: THE POOL MUST BE ABLE TO SERVE THE WHOLE CAPTURED FORWARD, not one
+      // block of one tensor. This used to alloc-and-free a single [S, vocab] f32
+      // block, on the reasoning that the capture RETAINS its logits while the
+      // other ring slot still holds its own, so the free list is one short. The
+      // retention half is right and the "one block of that shape" half is not:
+      // `DevicePool` is keyed by SIZE CLASS, so the block the capture then misses
+      // on need not be the logits. Measured on `thor:gpu0` (sm_110), the second
+      // ring slot's capture died in `dconv`, the GDN causal-conv output
+      // (`GdnBlockPaged`, this file), whose [T, conv_dim] lands in the SAME class
+      // as the retained [S, vocab] logits at the gate's shape -- and a cudaMalloc
+      // inside a captured region aborts the capture. An alloc-and-free grows the
+      // pool only when that class's free list is EMPTY, so with one block free
+      // and TWO needed live at once it grew nothing at all.
+      //
+      // So the driver stops naming a tensor and asks the pool for the demand the
+      // EAGER step at this shape actually made (`s.demand`, taken at the end of
+      // the cold step). Working scratch is still freed at ForwardLayers return and
+      // still SAFELY shared between the two graphs -- they replay sequentially on
+      // one stream. This runs OUTSIDE the capture, which is where a cudaMalloc is
+      // legal, and it is a no-op once the free list is deep enough.
+      Pool(b).PreGrowForCapture(b, s.demand);
       // Option A: build this slot's PERSISTENT device inputs + pinned staging OUTSIDE
       // the capture. BuildStepDevInputs fills s.dev from the refreshed host vectors so
       // the capture step reads correct inputs; the persistent cos|sin (fused-preamble
@@ -10573,6 +10780,12 @@ ForwardLogits Qwen3_5DecodeGraph::Step(
                           nullptr, /*mrope_cos_sin=*/nullptr, aux_ids_arg,
                           aux_out_arg);
   s.warm = true;
+  // #1380: the cold step is the ONE eager run of this exact forward at this exact
+  // shape, so it is where the capture's allocation demand is measurable. Recorded
+  // per SLOT and consumed by `PreGrowForCapture` at this slot's capture. Taken
+  // AFTER the forward and BEFORE the logits leave: the profile is a per-class
+  // PEAK, so it already holds every block this step had live at once.
+  s.demand = Pool(b).StepDemandProfile();
   publish_aux();
   record_staged();
   // lg is [S,vocab]; hand ownership out but expose only the first B (real) rows.
@@ -10652,6 +10865,13 @@ struct Qwen3_5DenseDecodeGraph::Impl {
     int fa_cols = -1;                 // captured block-table column count
     bool warm = false;
     int64_t replays = 0;
+    // #1380: what the EAGER step at THIS shape demanded of the scratch pool, per
+    // size class. Taken at the end of the cold step and handed back to
+    // `DevicePool::PreGrowForCapture` immediately before this slot's capture, so
+    // every allocation the captured forward makes is a pool HIT. Per SLOT rather
+    // than per pool because two shapes interleave through one pool and the pool's
+    // own last-step state would answer for whichever step ran most recently.
+    DevicePool::StepDemand demand;
     // VT_ASYNC_EXECUTOR (Option A) input-staged event: recorded on the main queue
     // right AFTER StageStepInputs enqueues the async H2D (NOT after the replay), and
     // host-waited before this slot's next Refresh — so the wait costs only the tiny
@@ -10764,6 +10984,10 @@ ForwardLogits Qwen3_5DenseDecodeGraph::Step(
   detail::ValidateGdnDecodeGraphState(gdn_meta, gdn_state, B);
   Backend& b = vt::GetBackend(impl_->queue.device.type);
   Dev d{b, impl_->queue};
+  // #1380: open a fresh demand measurement for this step. `PreGrowForCapture`
+  // reads the profile the COLD step at this shape recorded, and a profile is a
+  // property of one step, so the boundary is here and not inside a branch.
+  Pool(b).MarkStepBoundary();
   const int64_t vocab = impl_->config.vocab_size;
   const int64_t H = impl_->config.hidden_size;
 
@@ -10953,13 +11177,27 @@ ForwardLogits Qwen3_5DenseDecodeGraph::Step(
     // steady-state replay never captures, so this never touches the overlap path.
     if (dbuf) {
       b.Synchronize(impl_->queue);
-      // Pre-grow the pool for THIS slot's RETAINED [S,vocab] logits block while the
-      // OTHER ring slot's logits is held, so the captured logits alloc is a pool HIT
-      // (a cudaMalloc mid-capture aborts it). Working scratch is freed at
-      // DenseForwardLayers return and SAFELY shared between the two graphs — they
-      // replay sequentially on one stream, so only the retained logits needs two
-      // live copies.
-      { DBuf pregrow(d, DType::kF32, std::vector<int64_t>{S, vocab}); }
+      // #1380: THE POOL MUST BE ABLE TO SERVE THE WHOLE CAPTURED FORWARD, not one
+      // block of one tensor. This used to alloc-and-free a single [S, vocab] f32
+      // block, on the reasoning that the capture RETAINS its logits while the
+      // other ring slot still holds its own, so the free list is one short. The
+      // retention half is right and the "one block of that shape" half is not:
+      // `DevicePool` is keyed by SIZE CLASS, so the block the capture then misses
+      // on need not be the logits. Measured on `thor:gpu0` (sm_110), the second
+      // ring slot's capture died in `dconv`, the GDN causal-conv output
+      // (`GdnBlockPaged`, this file), whose [T, conv_dim] lands in the SAME class
+      // as the retained [S, vocab] logits at the gate's shape -- and a cudaMalloc
+      // inside a captured region aborts the capture. An alloc-and-free grows the
+      // pool only when that class's free list is EMPTY, so with one block free
+      // and TWO needed live at once it grew nothing at all.
+      //
+      // So the driver stops naming a tensor and asks the pool for the demand the
+      // EAGER step at this shape actually made (`s.demand`, taken at the end of
+      // the cold step). Working scratch is still freed at DenseForwardLayers return and
+      // still SAFELY shared between the two graphs -- they replay sequentially on
+      // one stream. This runs OUTSIDE the capture, which is where a cudaMalloc is
+      // legal, and it is a no-op once the free list is deep enough.
+      Pool(b).PreGrowForCapture(b, s.demand);
       // Option A: build this slot's PERSISTENT device inputs + pinned staging OUTSIDE
       // the capture (see the 35B driver). The dense fused-preamble arch (27B W4A4)
       // allocates + fills the persistent cos|sin here (pre-capture); the captured
@@ -11100,6 +11338,12 @@ ForwardLogits Qwen3_5DenseDecodeGraph::Step(
                                impl_->config, {}, nullptr, nullptr, aux_ids_arg,
                                aux_out_arg);
   s.warm = true;
+  // #1380: the cold step is the ONE eager run of this exact forward at this exact
+  // shape, so it is where the capture's allocation demand is measurable. Recorded
+  // per SLOT and consumed by `PreGrowForCapture` at this slot's capture. Taken
+  // AFTER the forward and BEFORE the logits leave: the profile is a per-class
+  // PEAK, so it already holds every block this step had live at once.
+  s.demand = Pool(b).StepDemandProfile();
   publish_aux();
   record_staged();
   // lg is [S,vocab]; hand ownership out but expose only the first B (real) rows.

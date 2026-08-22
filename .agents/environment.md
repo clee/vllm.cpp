@@ -185,6 +185,42 @@ c1 pairing even though the cross-arm rule passed perfectly. Two arms measured in
 a lease may not be dividable, so budget for absolutes and say so in advance
 rather than discovering it after the GPU time is spent.
 
+**The missing capability is `CAP_SYS_ADMIN`, and it is missing from the BOUNDING
+set. Measured 2026-08-21 inside leases on `thor:gpu0` and `orin:gpu0`.**
+`/proc/self/status` in the worker reads `CapEff = CapPrm = CapBnd =
+0x00000000a80425fb` on both boxes, byte-identical -- the default 14-capability
+OCI set, which holds neither `CAP_SYS_ADMIN` nor `CAP_PERFMON` nor
+`CAP_SYS_NICE`. Those three are the whole Linux privilege surface of the NVIDIA
+open kernel module: at tag `580.173.02`, `grep -n 'capable(\|CAP_'` over
+`kernel-open/common/inc/nv-linux.h` and `kernel-open/nvidia/os-interface.c`
+returns `NV_IS_SUSER() == capable(CAP_SYS_ADMIN)` at `nv-linux.h:537`,
+`capable(CAP_PERFMON)` at `os-interface.c:390`, and `capable(CAP_SYS_NICE)` at
+`os-interface.c:397`, and nothing else. **`CapBnd` is why no job can route around
+it**: a capability absent from the bounding set cannot be regained by `setcap`,
+by a setuid binary, or by re-execing, so this is container configuration and not
+job authorship. `thor:gpu0` reproduced the refusal itself on driver `595.78`
+(`LGC_RC=4`), so the refusal is measured on two boxes and two driver versions.
+`/proc/driver/nvidia/params` reads `RmProfilingAdminOnly: 1` in the lease, which
+governs PROFILING COUNTERS and is a different gate -- do not reach for an `NVreg`
+knob expecting `-lgc` to start working. The ask, the acceptance test that
+falsifies it, and the cost are in
+[`lease-gpu-capability.md`](specs/lease-gpu-capability.md).
+
+**Clock pinning DOES work from the leased HOST, and the pod path is still
+refused. Measured 2026-08-21.** Under an `rc hold` lease on `dgx:gpu0`, over
+`ssh` to the host, `sudo -n nvidia-smi -pm 1` then `-lgc 2100` held **0.29%**
+SM-clock spread over a ten-minute decode load (120 samples, min 2080, max 2086),
+against the 12.92%-26.36% the unpinned windows above recorded. **That path needs
+an authorization most rows do not have**: `.agents/developer-preferences.md`
+scopes `rc hold` plus `ssh` to the `BENCH-QWEN38-27B-SOTA` campaign and leaves
+the standing rule unchanged for every other row. So a ratio is derivable on that
+box by that path, and the pod path -- the only path for every other row -- still
+returns `LGC_RC=4`. Two caveats travel with the host path: persistence mode had
+to be enabled first, and it can be lost when the last GPU client detaches, so
+**verify the clock DURING the run and never only before it**; and the recorded
+`-lgc 2100` recipe is about 69% of this device's 3003 MHz maximum SM clock, which
+is right for a RATIO and wrong for an ABSOLUTE.
+
 **A model DOES run inside a lease.** The same series ran the pinned oracle
 `0.1.dev1+g555967922` as a server on a 52 GiB bf16 checkpoint from a lease, no
 `ssh` and no container image, and it served three clean benchmark legs. That
@@ -529,6 +565,57 @@ environment:
     parallel-flake advice in the Apple/Metal profile below does not transfer
     here. Serialising also means every other probe queues behind the suite, so
     run attribution arms BEFORE a full suite, never during one.
+  - **★ TREAT A SERVING LEG AS AT RISK OF A REBOOT TOO, NOT ONLY A BUILD OR A
+    LOAD — THOUGH ONLY THE REBOOT IS OBSERVED AND ITS PLACEMENT NEXT TO THE LEG
+    IS DERIVED — AND FROM INSIDE A LEASE `boot_id` IS THE ONLY INSTRUMENT THAT
+    SEES A REBOOT AT ALL
+    (measured 2026-08-19, [#915](https://github.com/mudler/vllm.cpp/issues/915)).**
+    **Read the heading at the strength of its parts.** What `boot_id` observes is
+    that a reboot happened somewhere between two readings about **11.2 hours**
+    apart, and across the same unpinned clock boundary: the old value is last
+    recorded in `clock-vllm-c1-r3.json`, written 10:18:51.7Z on `dgx`, and the
+    new one landed in a log written 21:29:35.6Z on the local host. The serving
+    leg occupied about
+    **6.5 minutes** of that span. Putting the reboot next to the leg needs the
+    DERIVED `/proc/uptime` bound below, and tying it to the worker's death is not
+    claimed at all. So "under a serving load" is the working assumption this
+    bullet is written for, not a measured fact.
+    The pinned oracle's c8 denominator leg for `Qwen/Qwen3.8-27B` bf16 — vLLM's
+    production graphed shape at `--gpu-memory-utilization 0.85
+    --max-num-batched-tokens 8192` — answered `GET /health 200 OK` at 10:25:07Z
+    with about 9,950 MB of `MemAvailable`, read 6,261 MB at 10:25:26Z, and the
+    worker was then lost inside one 2-second sample, during the untimed warmup.
+    That is OBSERVED, and it is the loss rather than the reboot. That
+    configuration leaves roughly **6-7 GB of headroom** on this box. The
+    earlier reboots this file records for this machine are a `ctest -j 4` and an
+    oracle LOAD; this one is only ASSOCIATED with a server that was already
+    healthy and serving-ready, and on that association "survived startup" is not
+    a safe state.
+    **Read `boot_id` in every leased job that loads anything large.** A lease
+    gives you a pod, not the box's history: `uptime` resetting and
+    `journalctl --list-boots` are host instruments a pod does not have, and a
+    lost worker looks identical whether the pod died or the machine did. That
+    ambiguity stood unresolved in the campaign record for a day.
+    `/proc/sys/kernel/random/boot_id` is kernel-wide and regenerated per boot,
+    so a changed value is a reboot and nothing else can forge it: a later job
+    (`97cf3e63-e4a4-4506-bde7-f19f19be3bbf`) read
+    `64c495a3-8c9c-4b20-8496-a97efda0e332` against the benchmark's
+    `3fd9745a-d25a-426c-ba3c-97c958a85515`. **Do not promote a boot TIME derived
+    from `/proc/uptime` to the same strength.** Read inside a pod, `/proc/uptime`
+    is the host's only if the worker does not virtualize `/proc` — `lxcfs` does,
+    and it cannot touch `boot_id` — so the identity change is observed and any
+    derived timestamp carries that assumption. State it beside the number. The
+    bound is also ONE-SIDED: the log mtime you subtract from is when the LAST
+    line landed, so it is an upper bound on the read instant and never a
+    midpoint. Here that gives a boot at or before 10:41:47.6Z with no lower
+    bound, and the mtime is on a different host's clock from the uptime, with the
+    offset unmeasured.
+    **And a sampling watchdog cannot guard the REBOOT CLASS of failure at all.**
+    A userspace sampler dies with the kernel, so there is no floor and no cadence
+    at which it reports a reboot; that holds on its own and needs no link to any
+    particular worker loss. Here the 2-second sampler never even saw a value
+    below its own 5,000 MB floor. Detail in
+    [`specs/qwen38-27b-bf16-gate.md`](specs/qwen38-27b-bf16-gate.md).
   - **GPU mutex:** this runs INSIDE an `rc` lease, never instead of one. The
     lease decides who gets the box. The mutex serialises the work of whoever
     holds it. Every CUDA test/model/serve/benchmark/profile holds the
@@ -771,6 +858,50 @@ environment:
     this box: Qwen3-4B bf16 spec-off warm ~24.6 tok/s; Qwen3.6-27B bf16 spec-off
     warm 4.42 tok/s (portable kernels, no fast paths — absolute numbers are NOT
     comparable to GB10).
+  - **★ A BUILD CAN DO IT TOO, and the load list above is not the whole
+    envelope. Measured 2026-08-19** ([#1380](https://github.com/mudler/vllm.cpp/issues/1380)).
+    An `rc run` job on `thor:gpu0` ran `cmake --build <dir> -j 8` over the whole
+    tree — **1098 targets**, which is a compile phase followed by a link phase
+    that runs several `ld` processes at once, each mapping a multi-hundred-MB
+    static image. Roughly five minutes in, `rc devices` went from `busy` to
+    `unknown (no contact)` and then to `unhealthy`, the job vanished from
+    `rc ps`, and its `/workspace` log stopped mid-phase with no error written.
+    The box recovered on its own about twenty minutes later and now reads
+    `ready`. **It was NOT re-leased while unhealthy** — AGENTS.md forbids
+    clearing a quarantined device, and nothing was cleared.
+    **"Most likely" is the honest register here.** The signature matches the
+    reboot-instead-of-OOM shape this file already documents, and a parallel link
+    of that tree is the largest concurrent host-memory demand in the build. What
+    was NOT measured is the kernel's own account: nobody read `uptime`, `dmesg`
+    or `journalctl --list-boots` on the host afterwards, so "the parallel link
+    exhausted memory and the box rebooted" is inference from the fleet's view
+    alone.
+    **One piece of corroboration WAS measured, on the next job.** The worker that
+    picked up the following lease reported a DIFFERENT pod name (`rc-worker-m4d7t`
+    against `rc-worker-hqfj4` before), and its `/tmp` had lost the source tree and
+    the build directory the earlier jobs had left there, and `/usr/local/cuda-13.0`
+    was gone so the job had to `apt-get` the toolkit again. So the worker
+    container was certainly recreated. That still does not distinguish a host
+    reboot from a pod restart, which is exactly the gap the boot list closes.
+    **What would settle it:** re-run the same full build at `-j 8` while
+    sampling `free -m` from inside the job, and read `journalctl --list-boots` on
+    the host afterwards — a GAP in the boot list is the evidence
+    ([[kairos-oem-rw-paths-change-cost-a-boot]]), and a host that did not reboot
+    would falsify it and point at the worker pod instead.
+    **The instruction that already existed is the one to follow.** The build
+    recipe above says `-j4` is deliberate, and every NAMED-TARGET build in that
+    campaign — five jobs, `-j 8`, one to four targets each — completed without
+    incident. It is the whole-tree build that correlates. Use `-j 4` for a full
+    build, and prefer named targets.
+    **This is the SECOND recorded `unknown (no contact)` for this device.** The
+    first was 2026-08-17, cited in AGENTS.md as the reason a lost controller
+    contact is a live state rather than a hypothetical. **Two readings do not
+    make a rate, and neither one's cause was established**, so what this second
+    occurrence adds is that the state recurs and must be planned for — not that
+    the box has a property. Treating `unknown (no contact)` as a state a long
+    job can enter is warranted by either occurrence alone. Whether the two share
+    a cause is exactly what the boot list above would answer, and until somebody
+    reads it, the count is a reason to keep looking rather than a finding.
   - `k3s` runs here and is `enabled`; `sudo systemctl stop k3s` frees its pods
     (5 containerd shims survive the stop). It was not the crash cause.
   - Transfer code with `git archive` (NOT rsync — see
