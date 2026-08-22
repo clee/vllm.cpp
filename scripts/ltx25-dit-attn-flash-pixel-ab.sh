@@ -46,15 +46,28 @@ FULL=/workspace/ltx25-fullmodel        # checkpoints and the text-encoder config
 SRC=/root/src-pixab
 BLD=/root/build-pixab
 CK=/root/ckpt
-OUT=$W/pixel-ab/$(date -u +%Y%m%dT%H%M%SZ)
+# RUN_ID IS OVERRIDABLE, and that is the whole resume mechanism. `dgx:gpu0` has
+# lost its worker three times, and this job renders three arms over about four
+# hours, so a lease lost after the ~2 h naive arm used to throw that arm away
+# and start a new timestamped directory. A resumed lease passes the same RUN_ID,
+# lands in the same $OUT, and every arm that is already COMPLETE there is
+# skipped. It composes with the binary cache in phase [D], which is keyed on the
+# source sha, so a resumed run reaches its first missing render in minutes.
+RUN_ID=${RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)}
+OUT=$W/pixel-ab/$RUN_ID
 mkdir -p "$OUT" "$CK"
 export DEBIAN_FRONTEND=noninteractive
-say "OUT=$OUT"
+say "RUN_ID=$RUN_ID OUT=$OUT"
+# APPENDED, never truncated: a resumed lease writes its own block, and the
+# earlier lease's binary sha and start time are part of what the resumed run's
+# evidence rests on.
 {
+  echo "--- lease $(date -Is) ---"
+  echo "run_id=$RUN_ID"
   echo "rc_job=${RC_JOB_ID:-unknown}"
   echo "harness_sha256=$(sha256sum "$0" 2>/dev/null | awk '{print $1}')"
   echo "started=$(date -Is)"
-} > "$OUT/PROVENANCE"
+} >> "$OUT/PROVENANCE"
 
 # A LIVENESS LINE, and nothing more. The build redirects to a file and a single
 # 42 GB checkpoint copy takes minutes, so this job can produce no stdout at all
@@ -65,12 +78,100 @@ say "OUT=$OUT"
 # the forward count separately, and that one CAN stop advancing.
 ( while :; do sleep 120; echo "[pixab-alive +$(( $(date +%s) - T0 ))s]"; done ) &
 HEARTBEAT=$!
-trap 'kill $HEARTBEAT 2>/dev/null' EXIT
+# EXIT ALONE DOES NOT COVER A LEASE KILL. `rc` reclaiming a device sends SIGTERM,
+# and a bash trap on EXIT does not run for a signal that has no handler, so the
+# heartbeat subshell survived its parent and kept printing into a job nobody was
+# reading. Each signal cleans up and then exits with 128+signo, which is the
+# status the shell would have reported had the trap not existed.
+cleanup() { kill "$HEARTBEAT" 2>/dev/null; }
+trap cleanup EXIT
+trap 'cleanup; exit 129' HUP
+trap 'cleanup; exit 130' INT
+trap 'cleanup; exit 143' TERM
+
+# BEGIN pixab-helpers -- extracted verbatim by
+# tests/scripts/test_ltx25_pixel_ab_harness.py, which runs both branches of the
+# memory gate against a fabricated meminfo. Everything between these markers
+# must depend on nothing but `say`, $MEMINFO and coreutils.
+#
+# ONE READER for MemAvailable, because two gates that disagree about what they
+# measured are worse than one gate. The start gate below and the render
+# watchdog in render() both call this, and neither reads `free`'s "available"
+# column: that is a second source for the same quantity, and phase [0] printing
+# one number while the watchdog acts on another is how this job walked into a
+# box with 5 GiB free while printing that it had 5 GiB free.
+MEMINFO=${MEMINFO:-/proc/meminfo}
+mem_avail_gib() {
+  awk '/^MemAvailable:/{printf "%.1f", $2/1048576; f=1; exit} END{if(!f) print ""}' \
+    "$MEMINFO" 2>/dev/null
+}
+
+# WAIT, then refuse. A lease spent waiting and refusing costs a lease; a lease
+# spent building into an out-of-memory kill costs the lease AND leaves a record
+# that says nothing about why. Each poll logs its value so a reader can tell a
+# recovering box from a flat one.
+wait_for_memory() {  # $1 floor GiB, $2 budget s, $3 poll s
+  local floor=$1 budget=$2 poll=$3 avail waited=0
+  while :; do
+    avail=$(mem_avail_gib)
+    if [ -z "$avail" ]; then
+      echo "FATAL: cannot read MemAvailable from $MEMINFO"
+      return 39
+    fi
+    if awk -v a="$avail" -v f="$floor" 'BEGIN{exit !(a>=f)}'; then
+      say "  MemAvailable ${avail} GiB >= floor ${floor} GiB after ${waited}s: proceeding"
+      return 0
+    fi
+    if [ "$waited" -ge "$budget" ]; then
+      echo "FATAL: MemAvailable ${avail} GiB is below the ${floor} GiB start floor" \
+           "after ${waited}s of waiting (budget ${budget}s). The box was already" \
+           "occupied when this lease started; nothing was built and nothing was rendered."
+      return 39
+    fi
+    say "  MemAvailable ${avail} GiB < ${floor} GiB, waited ${waited}s of ${budget}s"
+    sleep "$poll"
+    waited=$((waited + poll))
+  done
+}
+
+# A COMPLETE ARM, and nothing weaker. Exactly the expected frame count and a
+# non-empty wav. A partial arm is re-rendered from scratch rather than resumed
+# mid-flight: the engine deletes stale frame_*.ppm in its own output directory
+# but nothing else there, so a half-arm's leftovers would outlive it.
+arm_is_complete() {  # $1 dir, $2 wanted frame count
+  local d=$1 want=$2 n
+  [ -d "$d" ] || return 1
+  n=$(ls "$d"/frame_*.ppm 2>/dev/null | wc -l)
+  [ "$n" = "$want" ] || return 1
+  [ -s "$d/audio.wav" ] || return 1
+  return 0
+}
+# END pixab-helpers
 
 say "=== [0] the box ==="
 uname -m; nproc; free -g | head -2
 nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv 2>&1 | head -3
 df -h / /root /workspace 2>&1 | head -6
+
+say "=== [0b] the MemAvailable PRECONDITION, gated rather than printed ==="
+# THE NUMBER COMES FROM THE BASELINE, not from taste. The recorded 20260820
+# render at this geometry started from baseline_used 4.643 GiB, peaked at
+# 79.503 GiB and had a MemAvailable low-water of 40.13 GiB, so this job needs
+# most of the box and cannot start on the tail of it.
+#
+# This gate exists because phase [0] above PRINTED
+#   Mem: total 119 used 114 free 1 shared 0 buff/cache 4 available 5
+# at +0s on 2026-08-22 (rc job 5fb9399f-4f4e-417c-adbd-4d741a2e18e4) and the run
+# proceeded anyway: cmake, then ninja -j 4 on CUDA, then a lost worker at ~+728s
+# with no binary cached and nothing measured. The box was already at 114 of 119
+# GiB before this job allocated a byte, so the harness cannot fix the cause --
+# but it must not walk into it while printing the exact number that says not to.
+MEM_START_FLOOR_GIB=${MEM_START_FLOOR_GIB:-60.0}
+MEM_START_WAIT_S=${MEM_START_WAIT_S:-1200}
+MEM_START_POLL_S=${MEM_START_POLL_S:-30}
+say "start floor ${MEM_START_FLOOR_GIB} GiB, wait budget ${MEM_START_WAIT_S}s, poll ${MEM_START_POLL_S}s"
+wait_for_memory "$MEM_START_FLOOR_GIB" "$MEM_START_WAIT_S" "$MEM_START_POLL_S" || exit 39
+echo "mem_available_at_start_gib=$(mem_avail_gib)" >> "$OUT/PROVENANCE"
 
 say "=== [1] tools ==="
 # ffmpeg matters beyond the mp4: ltx2-gen exits 127 from its absence AFTER every
@@ -192,6 +293,13 @@ if [ "$SKIP_BUILD" = 0 ]; then
   fi
   cp -f /root/cfg.log "$OUT/configure.log"
   # Unconstrained parallelism has OOM-rebooted this box.
+  #
+  # THE MEMORY AT THE MOMENT THE BUILD STARTS, logged here and not only at [0b].
+  # The 2026-08-22 worker was lost during exactly this command and the log could
+  # not say what memory it began with, because the only reading was taken 38 s
+  # earlier under a different tenant's allocation.
+  say "  ninja -j 4 starting with MemAvailable $(mem_avail_gib) GiB"
+  echo "mem_available_at_build_gib=$(mem_avail_gib)" >> "$OUT/PROVENANCE"
   ninja -C "$BLD" -j 4 ltx2-gen test_ltx2_device > /root/build.log 2>&1
   B=$?; echo "BUILD_RC=$B"
   echo "  compile_errors=$(grep -ciE ' error: ' /root/build.log)"
@@ -263,12 +371,26 @@ say "=== [F] CORRECTNESS FIRST: the CUDA unit gate, before any render ==="
 # AGENTS.md: establish the correctness gate before accepting a performance
 # result. `assertions: 0` is a skip wearing a pass and a thrown case shows up
 # only on the `Status:` line, so both are printed rather than a grep for ok.
+#
+# AND IT REFUSES. It used to print its status and carry on, which made
+# "correctness first" a heading rather than a gate: a red unit case, or a binary
+# with no unit case at all, reached three renders and a published pixel verdict
+# with nothing between them.
 if [ -x "$BIN/test_ltx2_device" ]; then
   "$BIN/test_ltx2_device" > "$OUT/test_ltx2_device.log" 2>&1
-  echo "  test_ltx2_device_RC=$?"
+  UNIT_RC=$?
+  echo "  test_ltx2_device_RC=$UNIT_RC"
   grep -E 'assertions:|test cases:|Status:|SKIP' "$OUT/test_ltx2_device.log" | tail -8
+  [ "$UNIT_RC" = 0 ] || {
+    echo "FATAL: the CUDA unit gate FAILED (rc=$UNIT_RC); see $OUT/test_ltx2_device.log."
+    echo "       Correctness comes before a render, so no arm is taken on this binary."
+    exit 44
+  }
 else
-  echo "  MISSING test_ltx2_device"
+  echo "FATAL: $BIN/test_ltx2_device is absent, so the correctness gate cannot run."
+  echo "       A cached binary staged without it is the usual cause; rebuild with"
+  echo "       an empty $CACHE to restore it."
+  exit 45
 fi
 
 say "=== [G] the three renders ==="
@@ -291,10 +413,38 @@ say "MemAvailable floor ${MEM_FLOOR_GIB} GiB (the recorded baseline's low-water 
   echo "prompt_sha256=$(printf '%s' "$PROMPT" | sha256sum | awk '{print $1}')"
 } >> "$OUT/PROVENANCE"
 
+REUSED_ARMS=""
 render() {  # $1 = label, $2 = knob value, $3 = hard timeout seconds
   local label=$1 knob=$2 tmo=$3
-  local d="$OUT/$label"; mkdir -p "$d"
+  local d="$OUT/$label"
   local log="$d/render.log"
+  # RESUME, and say so. A skipped arm is loud, because a speed pair assembled
+  # from two leases is NOT a same-binary same-lease pair, and the report must
+  # not be able to claim one silently. The routing proof below still runs for a
+  # skipped arm, from the log that arm already has: a reused arm whose routing
+  # was never proved is worse than no arm at all.
+  local timing_from="this-lease"
+  if arm_is_complete "$d" "$FRAMES"; then
+    say "--- render $label SKIPPED: $d already holds $FRAMES frames and an audio.wav"
+    say "    (resumed run RUN_ID=$RUN_ID; its timings were taken in an EARLIER lease)"
+    timing_from="an-earlier-lease"
+    REUSED_ARMS="$REUSED_ARMS $label"
+  else
+    if [ -d "$d" ]; then
+      say "  $label is INCOMPLETE ($(ls "$d"/frame_*.ppm 2>/dev/null | wc -l) of $FRAMES"\
+          "frames, audio=$([ -s "$d/audio.wav" ] && echo yes || echo no)); re-rendering from scratch"
+      rm -rf "${d:?}"
+    fi
+    mkdir -p "$d"
+    render_arm "$label" "$knob" "$tmo" "$d" "$log"
+  fi
+  echo "arm=$label timing_source=$timing_from" >> "$OUT/PROVENANCE"
+  echo "  timing_source=$timing_from" | tee -a "$d/ARM"
+  arm_report "$label" "$knob" "$d" "$log"
+}
+
+render_arm() {  # $1 label, $2 knob, $3 tmo, $4 dir, $5 log
+  local label=$1 knob=$2 tmo=$3 d=$4 log=$5
   say "--- render $label (VLLM_LTX2_DIT_FLASH_ATTN=$knob, hard cap ${tmo}s) ---"
   : > "$log"
   # EVERY RENDER STATES ITS OWN INVOCATION on line 1 of its own log, the way the
@@ -339,7 +489,7 @@ render() {  # $1 = label, $2 = knob value, $3 = hard timeout seconds
   while kill -0 "$pid" 2>/dev/null; do
     local n avail
     n=$(grep -c 'last=' "$log" 2>/dev/null | head -1)
-    avail=$(awk '/^MemAvailable:/{printf "%.1f", $2/1048576}' /proc/meminfo 2>/dev/null)
+    avail=$(mem_avail_gib)   # the SAME reader phase [0b] gates on
     echo "$(date -u +%H:%M:%S)	$label	forwards=$n	memavail_gib=$avail" >> "$d/watch.tsv"
     # HEARTBEAT ON STDOUT, every ~2 minutes. The engine writes to its own log, so
     # without this the job produces NOTHING on stdout for up to two hours during
@@ -359,20 +509,41 @@ render() {  # $1 = label, $2 = knob value, $3 = hard timeout seconds
   unset VLLM_LTX2_DIT_FLASH_ATTN
   local nf; nf=$(ls "$d"/frame_*.ppm 2>/dev/null | wc -l)
   say "render $label exit=$rc stopped_by=$stopped_by frames=$nf"
+}
+
+arm_report() {  # $1 label, $2 knob, $3 dir, $4 log -- runs for a RENDERED and a RESUMED arm
+  local label=$1 knob=$2 d=$3 log=$4
   # THE TWO-SIDED ROUTING PROOF, per arm, from that arm's own log. One-sided
   # counting cannot tell a routed call from an added one: the flash arm must show
   # op=21 AND NOT op=18, and the naive arm the reverse. LTX's cross-attentions use
   # op=19 in both, which is why it is printed rather than asserted on.
   echo "--- op-provider selections (18 kAttention / 19 kAttentionCross / 21 kAttentionDenseFlash, device=1 CUDA) ---" | tee -a "$d/ARM"
   grep -E 'op-provider.*op=(18|19|20|21) device=1' "$log" | sort -u | sed 's/^/  /' | tee -a "$d/ARM"
-  local n18 n21
+  local n18 n21 routing
   n18=$(grep -cE 'op-provider.*op=18 device=1' "$log")
   n21=$(grep -cE 'op-provider.*op=21 device=1' "$log")
   echo "  op18_naive=$n18 op21_flash=$n21" | tee -a "$d/ARM"
+  # THE VERDICT IS COMPUTED INTO A VARIABLE FIRST, and only then printed. It used
+  # to be echoed inside a `case ... | tee` pipeline, where an `exit` would have
+  # left the subshell and not the run -- so ROUTING_BAD was a word in a log and
+  # nothing more. If the knob is not read, BOTH arms are flash, the two renders
+  # come out bit-identical, and this file publishes PASS with all four thresholds
+  # vacuous: the strongest positive verdict it can produce, from an experiment
+  # that had one arm.
   case "$knob" in
-    0) [ "$n18" -ge 1 ] && [ "$n21" = 0 ] && echo "  ROUTING_OK=naive" || echo "  ROUTING_BAD=naive (want op18>=1 op21==0)";;
-    *) [ "$n21" -ge 1 ] && [ "$n18" = 0 ] && echo "  ROUTING_OK=flash" || echo "  ROUTING_BAD=flash (want op21>=1 op18==0)";;
-  esac | tee -a "$d/ARM"
+    0) if [ "$n18" -ge 1 ] && [ "$n21" = 0 ]; then routing="OK"; else routing="BAD"; fi;;
+    *) if [ "$n21" -ge 1 ] && [ "$n18" = 0 ]; then routing="OK"; else routing="BAD"; fi;;
+  esac
+  local want; case "$knob" in 0) want="op18>=1 and op21==0";; *) want="op21>=1 and op18==0";; esac
+  if [ "$routing" = OK ]; then
+    echo "  ROUTING_OK=$label (knob=$knob, want $want, saw op18=$n18 op21=$n21)" | tee -a "$d/ARM"
+  else
+    echo "  ROUTING_BAD=$label (knob=$knob, want $want, saw op18=$n18 op21=$n21)" | tee -a "$d/ARM"
+    echo "FATAL: arm $label did not route as its knob asked. Both arms may be the" \
+         "same arm, and an A/B of one configuration against itself reads as a" \
+         "perfect match. Nothing further is measured on this run."
+    exit 46
+  fi
   # Per-forward MEDIAN from the engine's own `last=` lines. Never the governor,
   # which has reported 1.00 s, 69.1 s, 162 s and 396.9 s for this one quantity.
   grep -ohE 'last=[0-9.]+s' "$log" | sed 's/last=//;s/s$//' > "$d/samples.txt"
@@ -382,14 +553,25 @@ render() {  # $1 = label, $2 = knob value, $3 = hard timeout seconds
          m = (NR%2) ? a[(NR+1)/2] : (a[NR/2]+a[NR/2+1])/2;
          printf "  %s: n=%d median=%.3fs mean=%.3fs min=%.3fs max=%.3fs\n", L, NR, m, s/NR, a[1], a[NR] }' | tee -a "$d/ARM"
   echo "  memavail low-water: $(awk -F'\t' '{gsub(/memavail_gib=/,"",$4); print $4}' "$d/watch.tsv" 2>/dev/null | sort -n | head -1) GiB" | tee -a "$d/ARM"
-  echo "  frames=$nf audio=$([ -s "$d/audio.wav" ] && stat -c %s "$d/audio.wav" || echo 0)" | tee -a "$d/ARM"
+  echo "  frames=$(ls "$d"/frame_*.ppm 2>/dev/null | wc -l)" \
+       "audio=$([ -s "$d/audio.wav" ] && stat -c %s "$d/audio.wav" || echo 0)" | tee -a "$d/ARM"
 }
 
 render flash     1 "${TMO_FLASH:-3600}"
 render naive     0 "${TMO_NAIVE:-10800}"
 render flash-ctl 1 "${TMO_FLASH:-3600}"
 
-say "=== [H] the speed pair, same binary, same lease, neither arm sampled ==="
+say "=== [H] the speed pair, same binary, neither arm sampled ==="
+# SAME LEASE IS A CLAIM, so it is stated rather than assumed. A resumed run
+# reuses an arm's `last=` samples from the lease that produced them, and a ratio
+# across two leases is not the same-binary same-lease pair section 7.1 owes.
+if [ -n "$REUSED_ARMS" ]; then
+  say "  NOT a same-lease pair: reused arms:$REUSED_ARMS (their per-forward samples were taken earlier)"
+  echo "speed_pair_same_lease=no reused_arms=$REUSED_ARMS" >> "$OUT/PROVENANCE"
+else
+  say "  same binary, same lease: every arm was rendered in this run"
+  echo "speed_pair_same_lease=yes" >> "$OUT/PROVENANCE"
+fi
 python3 - "$OUT/flash/samples.txt" "$OUT/naive/samples.txt" "$OUT/flash-ctl/samples.txt" <<'PY'
 import sys, statistics
 def med(p):
@@ -410,11 +592,22 @@ say "=== [I] the pixel comparison ==="
 # the thresholds it applies are the ones the spec derives and not a copy that
 # drifted. Its exit status is the gate: 0 pass, 1 a threshold failed, 2 an input
 # could not be read. A 2 is never a pass.
+#
+# ARM A IS FLASH, and that is not cosmetic. The control is a repeat of FLASH, and
+# the tool compares the control against the arm named by --control-of. This call
+# used to pass `--a naive --b flash --control flash-ctl`, which made the
+# "run-to-run noise floor" a SECOND naive-vs-flash comparison: it necessarily
+# read about the same size as the treatment, and section 10.5's second branch
+# would then have published "indistinguishable from run-to-run nondeterminism"
+# whatever the kernel did. --control-of is passed explicitly rather than left to
+# its default, so the wiring states its own intent.
 python3 "$CMP" \
-  --a "$OUT/naive" --b "$OUT/flash" --control "$OUT/flash-ctl" \
-  --label-a naive --label-b flash --label-control flash-ctl \
+  --a "$OUT/flash" --b "$OUT/naive" --control "$OUT/flash-ctl" --control-of a \
+  --label-a flash --label-b naive --label-control flash-ctl \
   --json "$OUT/pixel-compare.json" 2>&1 | tee "$OUT/pixel-compare.txt"
-echo "PIXEL_COMPARE_RC=${PIPESTATUS[0]}"
+PIXEL_RC=${PIPESTATUS[0]}
+echo "PIXEL_COMPARE_RC=$PIXEL_RC"
+echo "pixel_compare_rc=$PIXEL_RC" >> "$OUT/PROVENANCE"
 
 say "=== [J] the cross-check against the recorded 20260820 baseline ==="
 # A different binary lineage (a50c57d69, an ancestor of the swap), so this is
@@ -439,4 +632,20 @@ for d in "$OUT"/flash "$OUT"/naive "$OUT"/flash-ctl; do
     "$([ -s "$d/audio.wav" ] && echo yes || echo no)" \
     "$([ -s "$d/video.mp4" ] && echo yes || echo no)"
 done
-say "DONE OUT=$OUT"
+say "=== [L] the verdict, which is this job's exit status ==="
+# THE GATE IS THE EXIT STATUS, and it used to be a line of text. [I]'s comment
+# already said "its exit status is the gate ... a 2 is never a pass", and then
+# the script printed PIXEL_COMPARE_RC, carried on through [J] and [K], and ended
+# on DONE with status 0. A failing pixel verdict, an unreadable input and a
+# zero-frame render all exited 0. [J] and [K] still run before this line, so the
+# artefacts and the cross-check are produced either way -- what changes is that
+# the run ends on the verdict rather than on the fact that it finished.
+case "$PIXEL_RC" in
+  0) say "PIXEL VERDICT: PASS -- every registered threshold held (see $OUT/pixel-compare.txt)";;
+  1) say "PIXEL VERDICT: FAIL -- a registered threshold was not met. Section 10.5: this is a"
+     say "               finding about a change already on main, and it does not owe a widened gate";;
+  2) say "PIXEL VERDICT: UNREADABLE -- nothing was compared. This is never a pass";;
+  *) say "PIXEL VERDICT: UNKNOWN -- the comparison exited $PIXEL_RC, which it does not define";;
+esac
+say "DONE OUT=$OUT RUN_ID=$RUN_ID PIXEL_COMPARE_RC=$PIXEL_RC"
+exit "$PIXEL_RC"
