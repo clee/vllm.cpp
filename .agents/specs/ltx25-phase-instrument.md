@@ -399,7 +399,7 @@ Measured on this branch, on an x86_64 box at load average 103 to 131 -- which is
 Build: `cmake -S . -B build -DVLLM_CPP_BUILD_TESTS=ON`, no `CMAKE_BUILD_TYPE`,
 which is what `build-test-cpu` configures.
 
-### The two bounds, over 310 runs across five load regimes
+### The two bounds, over 355 runs across six load regimes
 
 Every run's `test cases:` line was recorded, because a `-tc` filter that matches
 nothing prints `0 cases ran` and `Status: SUCCESS!` and is indistinguishable
@@ -439,7 +439,20 @@ what rules out a filter that matched nothing. The margin is 27.6x rather than
 reader should expect: the honest head grows with contention and the budget under
 it does not.
 
-**0 red in 310.** And the defective values are not near either bound:
+**And once more against the tree that finally lands**, which is neither of the
+trees above: the console gate moved into its own case, the table arm gained one,
+and two gap tautologies were replaced.
+
+| population | n | load | min | median | p90 | max | margin |
+|---|---:|---|---:|---:|---:|---:|---:|
+| `head / min(copy, sort)` | 45 | 13-24 | 0.003355 | 0.006841 | 0.008413 | **0.010226** | **48.9x** |
+| `instrument / duration`, 24 threads | 45 | 13-24 | 0.9898 | 0.9958 | 0.9967 | **0.99686** | bound 1.0 |
+
+All 45 read `test cases: 7 | 7 passed | 0 failed` and
+`assertions: 100 | 100 passed | 0 failed` -- the SAME string on every run, which
+is what rules out a filter that matched nothing.
+
+**0 red in 355.** And the defective values are not near either bound:
 
 ```
 #1569        honest [0.0037 .. 0.0181]   bound 0.5    main's order 17.2,  partial regression 1.024
