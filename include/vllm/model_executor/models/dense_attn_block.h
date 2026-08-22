@@ -347,8 +347,18 @@ inline DBuf AttnBlock(Dev d, const Qwen3DenseAttnWeights& w, const HfConfig& cfg
   const int64_t qdim = Hq * Dh, kdim = Hkv * Dh;
   VT_CHECK(w.qkv_bias.Empty(),
            "qwen3 dense forward: attention_bias not supported yet (Qwen3-0.6B has none)");
-  VT_CHECK(kv.dtype == DType::kBF16 || kv.dtype == DType::kF32,
-           "qwen3 dense: KV cache must be bf16 or f32");
+  // KV-FP8 W3: a third storage dtype joins the two float ones — 1-byte fp8
+  // (`vt::DType::kI8`), which `IsFp8KvCache` admits only together with a
+  // matching fp8 interpretation, so a bare `kI8` view still fails here. This
+  // guard and the routing at the store/read below are ONE decision: leaving it
+  // at the two float dtypes made `fp8_kv` provably false at every call and the
+  // fp8 arms of `WriteKvCache`/`ApplyKvCacheQuant` unreachable, which is the
+  // shape G12 exists to keep out (`qwen3_5.cpp:5313` is the same widening on
+  // the other routed family).
+  VT_CHECK(kv.dtype == DType::kBF16 || kv.dtype == DType::kF32 ||
+               IsFp8KvCache(kv),
+           "qwen3 dense: KV cache must be bf16, f32, or 1-byte fp8 "
+           "(--kv-cache-dtype fp8)");
   VT_CHECK(kv.num_kv_heads == Hkv && kv.head_size == Dh,
            "qwen3 dense: KV cache head dims mismatch config");
 

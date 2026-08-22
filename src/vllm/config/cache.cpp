@@ -82,28 +82,58 @@ std::optional<std::string> GetKvCacheQuantAlgoString(
   const json& inner = (cfg.contains("quantization") && cfg["quantization"].is_object())
                           ? cfg["quantization"]
                           : cfg;
-  const std::string inner_method =
-      inner.contains("quant_method") && inner["quant_method"].is_string()
-          ? inner["quant_method"].get<std::string>()
-          : std::string();
-  // `hf_quant_config.json` nests everything under "quantization" and names the
-  // producer at the TOP level (`{"producer":{"name":"modelopt"},...}`), while a
-  // flat `config.json:quantization_config` carries `quant_method` beside the
-  // algorithm. Accept the producer name as the modelopt marker for the nested
-  // shape — `modelopt_mixed_precision.h:325-345` already reads both shapes for
-  // the WEIGHT half, and the KV half must agree with it or one checkpoint gets
-  // two different answers.
+  // THE MARKER IS TWO UPSTREAM FUNCTIONS, NOT ONE, and reading only the first
+  // gets this wrong. `get_kv_cache_quant_algo_string` tests
+  // `quant_cfg.get("quant_method", "").startswith("modelopt")` at the TOP level
+  // (`torch_utils.py:319`) — which a ModelOpt 0.29.0-and-before
+  // `hf_quant_config.json` does not carry, because that file nests the algorithm
+  // under `"quantization"` and names the producer at the top
+  // (`{"producer":{"name":"modelopt"},"quantization":{...}}`). Upstream STILL
+  // resolves it, because `ModelArchConfigConvertorBase.
+  // _normalize_quantization_config`
+  // (`vllm/transformers_utils/model_arch_config_convertor.py:208-247`) runs
+  // FIRST, at `ModelConfig.__post_init__` (`vllm/config/model.py:577` ->
+  // `get_model_arch_config`), and INJECTS `quant_cfg["quant_method"]` when
+  // `producer["name"] == "modelopt"` OR the nested document carries
+  // `modelopt_quant_config` (`:216-235`); it mutates the very dict
+  // `hf_config.quantization_config` names, so the test at `:319` sees the
+  // injected marker. `:238-246` then lower-cases it, which is what `Lower()`
+  // mirrors here.
+  //
+  // MEASURED 2026-08-22 by running BOTH pinned functions (extracted with `ast`
+  // from the files at `555967922`, not transcribed) over the live documents:
+  // `nvidia/Llama-3.3-70B-Instruct-FP8`'s producer-only `hf_quant_config.json`
+  // answers `None` before normalization and `'fp8_e4m3'` after it. Accepting
+  // the producer name here is that two-step chain collapsed into one function,
+  // and it is a MIRROR rather than a widening.
+  //
+  // ONE DIFFERENCE REMAINS and is recorded rather than copied: the injector
+  // RAISES `ValueError: Unknown ModelOpt quant algo: <algo>` (`:235`) when the
+  // producer is modelopt and the nested `quant_algo` is neither FP8-family nor
+  // NVFP4 — which is what `r0b0tlab/Qwen3.8-27B-NVFP4-MTP-sm121`'s legacy file
+  // (`MIXED_PRECISION`) gets, and we answer `fp8_e4m3` for it instead. That
+  // refusal is a WEIGHT-half validation living in a config convertor this port
+  // does not have, and importing it into the KV resolver would refuse a
+  // checkpoint whose weights we load; the spec's `## Owed` names it. It is
+  // unreachable for that checkpoint anyway, because its `config.json` carries an
+  // inline `quantization_config` and that document wins.
   const std::string producer =
       cfg.contains("producer") && cfg["producer"].is_object() &&
               cfg["producer"].contains("name") && cfg["producer"]["name"].is_string()
           ? cfg["producer"]["name"].get<std::string>()
           : std::string();
+  // `_normalize_quantization_config:218-220` — the legacy nested shape, which
+  // names no producer and is recognised by the key alone.
+  const bool legacy_modelopt = inner.contains("modelopt_quant_config");
   const auto starts_with_modelopt = [](const std::string& s) {
     return s.rfind("modelopt", 0) == 0;
   };
-  if (!starts_with_modelopt(Lower(quant_method)) &&
-      !starts_with_modelopt(Lower(inner_method)) &&
-      !starts_with_modelopt(Lower(producer))) {
+  // `quant_method` is prefix-matched and case-folded because upstream lower-cases
+  // it before testing (`:238-246` then `torch_utils.py:319`); the producer name
+  // is neither, because `:222` is a raw `==` against the literal and nothing
+  // normalises it first. Same file, two different tests, mirrored separately.
+  if (!starts_with_modelopt(Lower(quant_method)) && producer != "modelopt" &&
+      !legacy_modelopt) {
     return std::nullopt;
   }
 

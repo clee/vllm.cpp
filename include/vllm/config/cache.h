@@ -22,10 +22,19 @@
 //
 // WHAT A DECLARATION IS AND IS NOT. `Declared()` answers "did the checkpoint ask
 // for a quantized KV cache", and it is a DIFFERENT question from "did the
-// checkpoint ship k/v scales". `r0b0tlab/Qwen3.8-27B-NVFP4-MTP-sm121` answers
-// yes to the first and no to the second; see
+// checkpoint ship k/v scales". A checkpoint can answer yes to the first and no
+// to the second; see
 // `include/vllm/model_executor/layers/quantization/kv_cache.h` for why the two
 // must not collapse into one fallthrough.
+//
+// `r0b0tlab/Qwen3.8-27B-NVFP4-MTP-sm121` @ `36f717a2` — the #1574 campaign
+// subject — is NOT that checkpoint, although its legacy `hf_quant_config.json`
+// reads like it: its `config.json:quantization_config` declares no
+// `kv_cache_*` key, and the inline document is the one that is read
+// (`transformers_utils/config.py:751-761`). It therefore answers NO to the
+// first question on both engines, and an fp8 KV run of it needs
+// `--kv-cache-dtype fp8` typed explicitly on each side. MEASURED from the live
+// artifact 2026-08-22.
 #ifndef VLLM_CONFIG_CACHE_H_
 #define VLLM_CONFIG_CACHE_H_
 

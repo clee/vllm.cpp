@@ -124,6 +124,17 @@ honours a declared `kv_cache_quant_algo`, printing one line naming what it
 resolved. An explicit `--kv-cache-dtype` always wins over the declaration. Both
 the order of the two files and the precedence mirror vLLM.
 
+Check which document your checkpoint declares in before you rely on this. A
+repository can carry a current `config.json` beside a stale
+`hf_quant_config.json` that disagrees with it, and the inline one is the one
+that counts — on this server and on vLLM. `r0b0tlab/Qwen3.8-27B-NVFP4-MTP-sm121`
+is exactly that shape: only its legacy file mentions the KV cache, so neither
+engine turns fp8 KV on for it and the flag has to be typed.
+
+Note that `--kv-cache-memory` is what turns the halved block into twice the
+pool. Without it the server falls back to a fixed block count, and `fp8` then
+halves the KV bytes for the same context instead.
+
 **It costs you the fast attention kernels, and we have not measured the net.**
 An fp8 KV cache is read by the tiled prefill and block decode kernels only.
 FA-2 prefill, all three FA-2 decode topologies, the WMMA ladder and the
@@ -139,9 +150,14 @@ is the documented default, not a silent one — and a checkpoint that declares
 nothing never reaches it.
 
 **Coverage.** The store and the scaled read are routed for the Qwen3.5/3.8
-family and for the shared dense-attention seam. An architecture that carries its
-own attention preamble refuses the flag by name at the first KV write rather
-than writing floats into a half-sized block. Metal and ROCm refuse it too. See
+family and for the shared dense-attention seam, which serves Qwen3 dense,
+Qwen3-MoE, Voxtral and the Llama, Mistral and InternLM2 registries. The other 16
+architectures carry their own attention preamble and refuse before writing
+anything, rather than writing floats into a half-sized block. Three of them
+(Gemma-4, Qwen3-VL, Nemotron-H) name the flag in the refusal; the other 13
+report their own dtype rule — `"<arch>: KV cache must be bf16 or f32"` — which
+tells you the architecture is not routed without saying which flag caused it.
+Metal and ROCm refuse it too. See
 [the row spec](../.agents/specs/fp8-kv-cache.md) for the exact list.
 
 A refusal arrives AFTER the pool has already been sized at half, which is the

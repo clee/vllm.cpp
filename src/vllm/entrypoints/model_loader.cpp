@@ -1540,9 +1540,12 @@ void LoadedEngine::ApplyResolvedCacheDType(const EngineParams& params,
   // `BaseKVCacheMethod.process_weights_after_loading` that upstream uses. Both
   // loaded scales are the `KVCacheScaleParameter` sentinel because no model's
   // weight loader extracts `k_scale`/`v_scale` yet (owed, see the spec's
-  // `## Owed`), so a declaring checkpoint lands on `kDeclaredButAbsent` — which
-  // is what `r0b0tlab/Qwen3.8-27B-NVFP4-MTP-sm121` ships, and is a DIFFERENT
-  // state from a checkpoint that declared nothing.
+  // `## Owed`), so a declaring checkpoint lands on `kDeclaredButAbsent`, which
+  // is a DIFFERENT state from a checkpoint that declared nothing. The #1574
+  // subject `r0b0tlab/Qwen3.8-27B-NVFP4-MTP-sm121` reaches this arm only when an
+  // operator types `--kv-cache-dtype fp8`: its inline
+  // `config.json:quantization_config` declares no `kv_cache_*` key, and that is
+  // the document both engines read (`transformers_utils/config.py:751-761`).
   const vllm::ResolvedKvCacheScales scales = vllm::ResolveKvCacheScales(
       params.kv_cache_dtype, /*calculate_kv_scales=*/false,
       vllm::kKvScaleUnloaded, vllm::kKvScaleUnloaded);

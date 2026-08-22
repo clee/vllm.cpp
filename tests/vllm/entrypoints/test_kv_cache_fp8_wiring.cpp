@@ -33,8 +33,11 @@
 //   G8  the refusals: MLA, float16, e5m2, and a Mamba state left alone
 #include <doctest/doctest.h>
 
+#include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -51,6 +54,7 @@
 #include "vllm/entrypoints/model_loader.h"
 #include "vllm/model_executor/layers/quantization/kv_cache.h"
 #include "vllm/model_executor/models/kv_cache_route.h"
+#include "vllm/model_executor/models/qwen3.h"
 #include "vllm/model_executor/models/qwen3_5_dense.h"
 #include "vllm/sampling_params.h"
 #include "vllm/tokenizer/bpe.h"
@@ -111,6 +115,28 @@ constexpr const char* kNoKvDeclarationQuantConfig = R"({
 constexpr const char* kInlineWeightsOnlyQuantConfig = R"({
   "model_type": "qwen3_5_text",
   "quantization_config": {"quant_method": "modelopt", "quant_algo": "FP8"}
+})";
+
+// AND THE ONE THE GATE CHECKPOINT ACTUALLY SHIPS. Fetched from the same
+// revision's `config.json` on 2026-08-22 and trimmed to the keys this resolver
+// reads (`config_groups`, `quantized_layers` and `ignore` are the WEIGHT half;
+// `quantized_layers` holds 401 entries). It carries `quant_method` and
+// `producer` — so the modelopt marker is present twice over — and NO
+// `kv_cache_*` key anywhere. Because `config.json:quantization_config` is read
+// in preference to `hf_quant_config.json`, THIS is the document that decides,
+// and it declares nothing. The transcription above is the file that does not
+// get read for this checkpoint.
+constexpr const char* kGateCheckpointInlineConfig = R"({
+  "model_type": "qwen3_5",
+  "quantization_config": {
+    "quant_algo": "MIXED_PRECISION",
+    "producer": {"name": "modelopt", "version": "0.46.0rc1"},
+    "quant_method": "modelopt",
+    "quantized_layers": {
+      "model.language_model.layers.0.mlp.gate_proj":
+        {"quant_algo": "W4A16_NVFP4", "group_size": 16}
+    }
+  }
 })";
 
 // ─── Synthetic dense-hybrid model (the same shape as
@@ -398,11 +424,86 @@ struct HostKvPair {
 TEST_CASE("kv-fp8 W3 G1: the gate checkpoint's kv_cache_quant_algo resolves") {
   // torch_utils.py:374-392 + :310-362 + :64-67. "FP8" (the modelopt spelling,
   // upper case) maps to vLLM's own `fp8_e4m3`, not to the bare "fp8" alias.
+  //
+  // This document names NO top-level `quant_method`, and upstream's
+  // `get_kv_cache_quant_algo_string` tests exactly that key (`:319`). It still
+  // resolves upstream, because `_normalize_quantization_config`
+  // (`transformers_utils/model_arch_config_convertor.py:208-247`) INJECTS the
+  // marker from `producer.name` into the same dict first — see the long comment
+  // in `src/vllm/config/cache.cpp` for the measurement. Reading only the first
+  // function makes this case look like a divergence; running both says it is
+  // the mirror.
   const vllm::ResolvedCacheDTypeString r =
       vllm::ResolveKvCacheDTypeString("auto", kGateCheckpointQuantConfig);
   CHECK(r.cache_dtype == "fp8_e4m3");
   // The FACT that separates this from an operator who typed the flag.
   CHECK(r.declared_by_checkpoint);
+}
+
+TEST_CASE("kv-fp8 W3 G1: the modelopt marker is upstream's THREE, and no more") {
+  // `_normalize_quantization_config:216-235` injects `quant_method` on exactly
+  // two conditions — `producer["name"] == "modelopt"` (an equality, not a
+  // prefix) and a nested `modelopt_quant_config` key — and `torch_utils.py:319`
+  // reads the top-level key itself. Nothing upstream can put a marker anywhere
+  // else, so nothing else may be accepted here: a resolver that reads a marker
+  // upstream cannot see turns on an fp8 KV cache vLLM would not, at half the
+  // page, on a checkpoint nobody flagged.
+
+  // (a) The flat 0.31.0-and-after shape: the marker upstream reads directly.
+  CHECK(vllm::ResolveKvCacheDTypeString(
+            "auto",
+            R"({"quant_method":"modelopt","quant_algo":"FP8",)"
+            R"("kv_cache_quant_algo":"FP8"})")
+            .cache_dtype == "fp8_e4m3");
+
+  // (b) The legacy nested shape, recognised by the key alone (`:218-220`).
+  CHECK(vllm::ResolveKvCacheDTypeString(
+            "auto",
+            R"({"quantization":{"modelopt_quant_config":{},)"
+            R"("kv_cache_quant_algo":"FP8"}})")
+            .cache_dtype == "fp8_e4m3");
+
+  // (c) A marker only INSIDE `quantization`. Upstream never looks there — its
+  // injector writes the top level and `:319` reads the top level — so neither
+  // do we.
+  const vllm::ResolvedCacheDTypeString inner = vllm::ResolveKvCacheDTypeString(
+      "auto",
+      R"({"quantization":{"quant_method":"modelopt",)"
+      R"("kv_cache_quant_algo":"FP8"}})");
+  CHECK(inner.cache_dtype == "auto");
+  CHECK_FALSE(inner.declared_by_checkpoint);
+
+  // (d) A producer that merely STARTS with "modelopt". `:222` is `==`, so
+  // `modelopt_fp4` as a PRODUCER name is not the marker (it is a `quant_method`
+  // VALUE the injector writes, which arm (a) already covers).
+  const vllm::ResolvedCacheDTypeString near = vllm::ResolveKvCacheDTypeString(
+      "auto",
+      R"({"producer":{"name":"modelopt_fp4"},)"
+      R"("quantization":{"kv_cache_quant_algo":"FP8"}})");
+  CHECK(near.cache_dtype == "auto");
+  CHECK_FALSE(near.declared_by_checkpoint);
+
+  // (e) A non-modelopt producer with the same key is still nothing.
+  CHECK(vllm::ResolveKvCacheDTypeString(
+            "auto",
+            R"({"producer":{"name":"llm-compressor"},)"
+            R"("quantization":{"kv_cache_quant_algo":"FP8"}})")
+            .cache_dtype == "auto");
+
+  // (f) The two markers are normalised DIFFERENTLY, because upstream normalises
+  // them differently: `quant_method` is lower-cased before the prefix test
+  // (`:238-246`), the producer name is compared raw against the literal
+  // (`:222`). A `MODELOPT` quant_method resolves; a `ModelOpt` producer does
+  // not.
+  CHECK(vllm::ResolveKvCacheDTypeString(
+            "auto",
+            R"({"quant_method":"MODELOPT","kv_cache_quant_algo":"FP8"})")
+            .cache_dtype == "fp8_e4m3");
+  CHECK(vllm::ResolveKvCacheDTypeString(
+            "auto",
+            R"({"producer":{"name":"ModelOpt"},)"
+            R"("quantization":{"kv_cache_quant_algo":"FP8"}})")
+            .cache_dtype == "auto");
 }
 
 TEST_CASE("kv-fp8 W3 G1: an explicit --kv-cache-dtype outranks the checkpoint") {
@@ -1120,6 +1221,39 @@ TEST_CASE("kv-fp8 W3 G10: config.json's quantization_config OUTRANKS hf_quant_co
             .value_or("auto") == "fp8_e4m3");
 }
 
+TEST_CASE("kv-fp8 W3 G10: the #1574 checkpoint declares NOTHING about the KV") {
+  // THE CAMPAIGN CONSEQUENCE, stated as a gate instead of as prose. The two
+  // documents above are shaped like the gate checkpoint's; these ARE the gate
+  // checkpoint's, both transcribed from
+  // `r0b0tlab/Qwen3.8-27B-NVFP4-MTP-sm121` @ `36f717a2` on 2026-08-22. The
+  // legacy file declares `kv_cache_quant_algo: "FP8"`, the inline one declares
+  // no `kv_cache_*` key, and the inline one is what gets read — so an fp8 KV
+  // run of the #1574 subject needs `--kv-cache-dtype fp8` typed EXPLICITLY, on
+  // this engine and on vLLM alike. Running the pinned
+  // `get_kv_cache_quant_algo_string` over the same bytes returns `None`, before
+  // and after `_normalize_quantization_config`, so the two engines agree.
+  CheckpointDir dir;
+  dir.Write("config.json", kGateCheckpointInlineConfig);
+  dir.Write("hf_quant_config.json", kGateCheckpointQuantConfig);
+
+  const std::string read = vllm::ReadQuantConfigJson(dir.str());
+  // It IS the inline document — the modelopt marker is there twice, so this is
+  // not "nothing was found".
+  CHECK(read.find("MIXED_PRECISION") != std::string::npos);
+  CHECK(read.find("kv_cache_quant_algo") == std::string::npos);
+
+  const vllm::ResolvedCacheDTypeString r =
+      vllm::ResolveKvCacheDTypeString("auto", read);
+  CHECK(r.cache_dtype == "auto");
+  CHECK_FALSE(r.declared_by_checkpoint);
+
+  // And the flag still reaches it, which is the path the campaign uses.
+  const vllm::ResolvedCacheDTypeString typed =
+      vllm::ResolveKvCacheDTypeString("fp8", read);
+  CHECK(typed.cache_dtype == "fp8");
+  CHECK_FALSE(typed.declared_by_checkpoint);
+}
+
 TEST_CASE("kv-fp8 W3 G10: the drafter-chain refusal runs BEFORE the KV resolution") {
   // THE ORDERING F0 had to keep. `main`'s SPEC-DRAFTER-CHAIN W1 refusal (#1522)
   // and this row's resolution stanza both want to be the first statement of
@@ -1209,4 +1343,221 @@ TEST_CASE("kv-fp8 W3 G11: per_layer_attn_specs are retyped, and the pool halves"
   // ratio: `KVBytesPerBlock` reads `per_layer_attn_specs` in preference to the
   // groups, so this number is what the runner's `--kv-cache-memory` buys.
   CHECK(vllm::v1::KVBytesPerBlock(fp8) * 2 == bf16_bytes);
+}
+
+// ─── G12. The SHARED SEAM, entered through a model that uses it ──────────────
+//
+// WHY THIS CASE EXISTS, and what its absence let through. `## Shared seams` in
+// AGENTS.md names `dense_attn::AttnBlock` as the decode seam, and `## W3` of the
+// spec lists it as ROUTED. It was not. The routing was written
+// (`dense_attn_block.h:519,536,543`) behind a preamble guard that admits only
+// `kBF16` and `kF32`, and `IsFp8KvCache` is true only for `kI8` — so `fp8_kv`
+// was provably false at every call and the fp8 arms of `WriteKvCache` and
+// `ApplyKvCacheQuant` could never execute. A fresh review reverted the WHOLE of
+// the seam's routing in a scratch copy and this file stayed at 26/26 SUCCESS,
+// because every case above enters through `Qwen3_5DenseModel::Forward` and none
+// of them enters here.
+//
+// The seam is the production forward for the Qwen3 dense family
+// (`qwen3.cpp:185`), Qwen3-MoE (`qwen3_moe.cpp:84`), Voxtral
+// (`voxtral.cpp:102`) and the Llama/Mistral/InternLM2 registries that share
+// `Qwen3DenseModel`. `Qwen3DenseModel::Forward` is the function
+// `ForwardQwen3ForCausalLM` calls under `ModelRegistry::Forward`
+// (`qwen3_dense.cpp:113`), which is the entry `.agents/reachability.md` names;
+// the harness adaptation, stated once, is that `LoadedEngine` has no in-memory
+// overload for `Qwen3DenseWeights`, so the cache is allocated here rather than
+// by the runner. Everything the case measures — the preamble guard, the store
+// and the read — is production code entered through the registered forward.
+namespace {
+
+vllm::OwnedTensor MakeSeamBf16(const std::vector<int64_t>& shape, bool nk,
+                               uint64_t seed) {
+  vllm::OwnedTensor t = MakeOwned(DType::kBF16, shape, seed);
+  t.nk = nk;
+  return t;
+}
+
+constexpr int64_t kSeamVocab = 64;
+
+HfConfig MakeSeamConfig() {
+  HfConfig c;
+  c.model_type = "qwen3";
+  c.architectures = {"Qwen3ForCausalLM"};
+  c.num_hidden_layers = 2;
+  c.hidden_size = 64;
+  c.num_attention_heads = 4;
+  c.num_key_value_heads = 2;
+  c.head_dim = 16;
+  c.rotary_dim = 16;
+  c.intermediate_size = 128;
+  c.rms_norm_eps = 1e-6;
+  c.rope_theta = 1000000.0;
+  c.vocab_size = kSeamVocab;
+  c.max_position_embeddings = 128;
+  c.raw = json::object();
+  return c;
+}
+
+vllm::Qwen3DenseWeights MakeSeamWeights(const HfConfig& c) {
+  const int64_t H = c.hidden_size, Hq = c.num_attention_heads;
+  const int64_t Hkv = c.num_key_value_heads, Dh = c.head_dim;
+  const int64_t I = c.intermediate_size, V = c.vocab_size;
+  const int64_t qdim = Hq * Dh, kdim = Hkv * Dh;
+  vllm::Qwen3DenseWeights w;
+  w.tie_word_embeddings = true;
+  w.attention_bias = false;
+  w.embed_tokens = MakeSeamBf16({V, H}, /*nk=*/false, 7001);
+  w.final_norm = MakeSeamBf16({H}, false, 7002);
+  for (int64_t l = 0; l < c.num_hidden_layers; ++l) {
+    const uint64_t s = 8000 + static_cast<uint64_t>(l) * 4000;
+    vllm::Qwen3DenseLayerWeights lw;
+    lw.input_layernorm = MakeSeamBf16({H}, false, s + 1);
+    lw.post_attention_layernorm = MakeSeamBf16({H}, false, s + 2);
+    lw.attn.qkv_proj = MakeSeamBf16({qdim + 2 * kdim, H}, /*nk=*/true, s + 3);
+    lw.attn.o_proj = MakeSeamBf16({H, qdim}, /*nk=*/true, s + 4);
+    lw.attn.q_norm = MakeSeamBf16({Dh}, false, s + 5);
+    lw.attn.k_norm = MakeSeamBf16({Dh}, false, s + 6);
+    lw.mlp.gate_up_proj = MakeSeamBf16({2 * I, H}, /*nk=*/true, s + 7);
+    lw.mlp.down_proj = MakeSeamBf16({H, I}, /*nk=*/true, s + 8);
+    w.layers.push_back(std::move(lw));
+  }
+  return w;
+}
+
+constexpr int64_t kSeamBlocks = 2;
+constexpr int64_t kSeamBlockSize = 8;
+
+// One paged KV buffer per layer, at the STORAGE WIDTH the cache dtype names —
+// one byte per element for fp8, two for bf16. Allocating the fp8 arm at the
+// float width would hide exactly the mis-sizing this row exists to prevent.
+struct SeamCachePool {
+  std::vector<std::vector<uint8_t>> buf;
+  std::vector<vllm::PagedKvCache> attn_kv;
+
+  SeamCachePool(const HfConfig& c, DType dt, vt::Fp8KVCacheDataType kind,
+                float k_scale, float v_scale) {
+    const int64_t Hkv = c.num_key_value_heads, Dh = c.head_dim;
+    const size_t elems = static_cast<size_t>(kSeamBlocks * 2 * kSeamBlockSize *
+                                             Hkv * Dh);
+    for (int64_t l = 0; l < c.num_hidden_layers; ++l)
+      buf.emplace_back(elems * vt::SizeOf(dt), 0);
+    for (auto& b : buf) {
+      vllm::PagedKvCache kv;
+      kv.data = b.data();
+      kv.dtype = dt;
+      kv.num_blocks = kSeamBlocks;
+      kv.block_size = kSeamBlockSize;
+      kv.num_kv_heads = Hkv;
+      kv.head_size = Dh;
+      kv.fp8_kind = kind;
+      kv.k_scale = k_scale;
+      kv.v_scale = v_scale;
+      attn_kv.push_back(kv);
+    }
+  }
+};
+
+vllm::v1::CommonAttentionMetadata SeamPrefillMeta(int64_t T) {
+  vllm::v1::CommonAttentionMetadata m;
+  m.num_reqs = 1;
+  m.num_actual_tokens = static_cast<int>(T);
+  m.query_start_loc = {0, static_cast<int32_t>(T)};
+  m.query_start_loc_cpu = m.query_start_loc;
+  m.seq_lens = {static_cast<int32_t>(T)};
+  m.seq_lens_cpu = m.seq_lens;
+  m.max_query_len = static_cast<int>(T);
+  m.max_seq_len = static_cast<int>(T);
+  m.block_table_num_cols = 1;
+  m.block_table_tensor = {0};
+  for (int64_t t = 0; t < T; ++t)
+    m.slot_mapping.push_back(static_cast<int32_t>(t % kSeamBlockSize));
+  m.causal = true;
+  return m;
+}
+
+const std::vector<int32_t> kSeamTokens = {3, 17, 42, 8, 61};
+const std::vector<int32_t> kSeamPositions = {0, 1, 2, 3, 4};
+
+std::vector<float> RunSeamForward(const HfConfig& c,
+                                  const vllm::Qwen3DenseWeights& w,
+                                  SeamCachePool& pool) {
+  vt::Queue q{vt::Device{vt::DeviceType::kCPU, 0}, nullptr};
+  const vllm::v1::CommonAttentionMetadata meta =
+      SeamPrefillMeta(static_cast<int64_t>(kSeamTokens.size()));
+  return vllm::Qwen3DenseModel::Forward(kSeamTokens, kSeamPositions, meta,
+                                        pool.attn_kv, w, c, q);
+}
+
+size_t NonZeroBytes(const std::vector<uint8_t>& b) {
+  size_t n = 0;
+  for (uint8_t x : b)
+    if (x != 0) ++n;
+  return n;
+}
+
+}  // namespace
+
+TEST_CASE("kv-fp8 W3 G12: the SHARED SEAM serves an fp8 KV cache") {
+  const HfConfig c = MakeSeamConfig();
+  const vllm::Qwen3DenseWeights w = MakeSeamWeights(c);
+
+  SeamCachePool fp8(c, DType::kI8, vt::Fp8KVCacheDataType::kFp8E4M3, 1.0F,
+                    1.0F);
+  // BEFORE the repair this line threw
+  // "qwen3 dense: KV cache must be bf16 or f32" — the preamble guard refused the
+  // cache the routing below it was written to serve.
+  const std::vector<float> logits = RunSeamForward(c, w, fp8);
+  REQUIRE(logits.size() ==
+          kSeamTokens.size() * static_cast<size_t>(c.vocab_size));
+  for (float v : logits) REQUIRE(std::isfinite(v));
+
+  // The STORE ran through the seam: the half-width pages carry bytes now. Zero
+  // here is what a store that silently skipped the fp8 arm would leave.
+  for (const auto& page : fp8.buf) CHECK(NonZeroBytes(page) > 0);
+
+  // Deterministic over a fresh cache — an fp8 KV store is still a function of
+  // its inputs.
+  SeamCachePool again(c, DType::kI8, vt::Fp8KVCacheDataType::kFp8E4M3, 1.0F,
+                      1.0F);
+  const std::vector<float> repeat = RunSeamForward(c, w, again);
+  REQUIRE(repeat.size() == logits.size());
+  CHECK(std::memcmp(repeat.data(), logits.data(),
+                    logits.size() * sizeof(float)) == 0);
+}
+
+TEST_CASE("kv-fp8 W3 G12: the seam's fp8 cache is really QUANTIZED, not float") {
+  // The counter-case to the one above, and the reason "it ran and produced
+  // finite numbers" is not enough. An fp8 cache that behaved identically to a
+  // bf16 one would mean the read never dequantized — and `ApplyKvCacheQuant` is
+  // the only thing that tells the paged kernel to. Four mantissa bits against
+  // bf16's eight is a difference the logits carry.
+  const HfConfig c = MakeSeamConfig();
+  const vllm::Qwen3DenseWeights w = MakeSeamWeights(c);
+
+  SeamCachePool bf16(c, DType::kBF16, vt::Fp8KVCacheDataType::kAuto, 1.0F, 1.0F);
+  const std::vector<float> float_logits = RunSeamForward(c, w, bf16);
+
+  SeamCachePool fp8(c, DType::kI8, vt::Fp8KVCacheDataType::kFp8E4M3, 1.0F, 1.0F);
+  const std::vector<float> fp8_logits = RunSeamForward(c, w, fp8);
+
+  REQUIRE(float_logits.size() == fp8_logits.size());
+  REQUIRE(!float_logits.empty());
+  // The fp8 page is EXACTLY half the bf16 one, which is the memory the feature
+  // buys and the sizing the store has to agree with.
+  REQUIRE(fp8.buf[0].size() * 2 == bf16.buf[0].size());
+
+  size_t differing = 0;
+  double max_abs = 0.0;
+  for (size_t i = 0; i < fp8_logits.size(); ++i) {
+    if (fp8_logits[i] != float_logits[i]) ++differing;
+    max_abs = std::max(max_abs, static_cast<double>(std::fabs(
+                                    fp8_logits[i] - float_logits[i])));
+  }
+  CHECK(differing > 0);
+  // And it is a QUANTIZATION difference rather than a wrong-offset read: an
+  // fp8 store indexed at the float width would land the second half of every
+  // page outside the tokens it wrote and the logits would not track at all.
+  CHECK(max_abs < 1.0);
+  MESSAGE("fp8 vs bf16 cache: " << differing << "/" << fp8_logits.size()
+                                << " logits differ, max |delta| " << max_abs);
 }

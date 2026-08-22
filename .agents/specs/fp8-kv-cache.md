@@ -30,7 +30,7 @@ re-port).
 - **Out (named later bricks):** fp8_e5m2 compute on either backend,
   per-attention-head scales, the Metal and ROCm fp8-KV arms (both refuse by name
   — see `## W2` below), `--calculate-kv-scales` (upstream's deprecated dynamic
-  scale), the C-ABI exposure of `--kv-cache-dtype`, the 17 architectures whose
+  scale), the C-ABI exposure of `--kv-cache-dtype`, the 16 architectures whose
   attention blocks W3 refuses rather than routes, and the vendor
   KV dtypes (`fp8_inc`, `fp8_ds_mla` — `QUANT-KV-FP8-VENDOR`) and turboquant /
   nvfp4 / per-token-head KV (`KV-NVFP4-TURBO`).
@@ -354,11 +354,29 @@ Four upstream steps, in upstream's own order. Every anchor was read in
 
 ### The trap this checkpoint sets
 
+**First, the fact that changes what the trap is.**
 `r0b0tlab/Qwen3.8-27B-NVFP4-MTP-sm121` @ `36f717a2` declares
-`kv_cache_quant_algo: "FP8"` in `hf_quant_config.json` and ships **ZERO**
-`k_scale`/`v_scale` tensors. MEASURED 2026-08-21 from the public
-`model.safetensors.index.json`: 2001 tensors, none of them named `k_scale`,
-`v_scale` or `kv_scale`.
+`kv_cache_quant_algo: "FP8"` in
+`hf_quant_config.json` — and that file is NOT the one that gets read.
+MEASURED from the live artifact 2026-08-22: its
+`config.json:quantization_config` carries `quant_method: "modelopt"`,
+`quant_algo: "MIXED_PRECISION"` and **no `kv_cache_*` key at all**, and an
+inline document suppresses the legacy file entirely
+(`transformers_utils/config.py:751-761`, and the same order in
+`vllm::ReadQuantConfigJson`). Running the pinned
+`get_kv_cache_quant_algo_string` over those exact bytes returns `None`.
+
+**So the #1574 subject auto-selects nothing, on either engine, and
+`--kv-cache-dtype fp8` has to be typed on BOTH sides of the comparison.** The
+competitors' own `serve.sh` already passes it, so the campaign is consistent
+rather than blocked; what is wrong is any sentence that says this checkpoint
+takes the declared-fp8 path by itself. G10's `#1574 checkpoint declares NOTHING`
+case pins it with both real documents in one directory.
+
+**The scale trap is real and unchanged**, and it is what the flag runs into: the
+checkpoint ships **ZERO** `k_scale`/`v_scale` tensors. MEASURED 2026-08-21 from
+the public `model.safetensors.index.json`: 2001 tensors, none of them named
+`k_scale`, `v_scale` or `kv_scale`.
 
 So the default scale 1.0 has to be reached DELIBERATELY, by a path that knows
 the algorithm was declared and the tensors were absent — not by falling off the
@@ -388,24 +406,46 @@ and fp8 interpretation disagree — a `kI8` page with no fp8 kind, or an fp8 kin
 over a float page, is a mis-sized cache and never a mode.
 
 **Routed in W3:** the shared seam `dense_attn::AttnBlock`
-(`include/vllm/model_executor/models/dense_attn_block.h`) and
-`src/vllm/model_executor/models/qwen3_5.cpp` — the Qwen3.5/3.8 family, which is
-the benchmark subject. **Every other architecture is refused BY NAME**:
-`vt::ReshapeAndCache` now rejects a `kI8` cache with a message naming
-`vt::ReshapeAndCacheFp8` and saying the architecture is not routed. That is the
-whole point of putting the refusal at the store rather than leaving the float
-path to index a half-sized page: the failure is a sentence, not wrong tokens.
+(`include/vllm/model_executor/models/dense_attn_block.h`) — reached by the
+Qwen3 dense family (`qwen3.cpp:185`), Qwen3-MoE (`qwen3_moe.cpp:84`), Voxtral
+(`voxtral.cpp:102`) and the Llama/Mistral/InternLM2 registries that share
+`Qwen3DenseModel` — and `src/vllm/model_executor/models/qwen3_5.cpp`, the
+Qwen3.5/3.8 family, which is the benchmark subject.
+
+**The seam's routing was DEAD until the second review.** Its preamble guard
+still admitted only `kBF16` and `kF32`, so `IsFp8KvCache` was false at every
+call and neither fp8 arm could execute; reverting the whole of the seam's
+routing left the gate at 26/26 green, because every case entered through
+`Qwen3_5DenseModel::Forward`. The guard is widened the same way
+`qwen3_5.cpp:5313` was, and **G12** enters an fp8 cache through
+`Qwen3DenseModel::Forward` — the function `ForwardQwen3ForCausalLM` calls under
+`ModelRegistry::Forward` (`qwen3_dense.cpp:113`) — so the same revert now goes
+red.
+
+**Every other architecture is refused BY NAME, and the name is usually its
+OWN.** 16 architectures at 17 call sites keep their own attention preambles. Of
+those, 13 refuse at their own dtype guard first — `granite:95`, `minicpm:96`,
+`phi3:78`, `gemma3:121`, `opt:125`, `stablelm:86`, `glm4:93`, `commandr:93`,
+`gemma:53`, `gemma2:135`, `phi:98`, `muse_glimmer:144` and `olmo2:94`, each
+saying `"<arch>: KV cache must be bf16 or f32"` — which names the architecture
+but neither fp8 nor the flag. Only `gemma4` (two sites), `qwen3_vl` and
+`nemotron_h_device` carry no such guard and reach `vt::ReshapeAndCache`, whose
+refusal names `vt::ReshapeAndCacheFp8` and says the architecture is not routed.
+Either way the failure is a sentence rather than a float path indexing a
+half-sized page, which is the property that matters; that the better message is
+reached by only 3 of the 16 is recorded under `## Owed` rather than claimed
+away.
 
 ### Gates
 
-`tests/vllm/entrypoints/test_kv_cache_fp8_wiring.cpp` — **26 cases / 120
+`tests/vllm/entrypoints/test_kv_cache_fp8_wiring.cpp` — **30 cases / 465
 assertions GREEN** on a CPU-only Release build, plus
 `tests/vllm/entrypoints/openai/test_serve_kv_cache_dtype.cpp` — **3 cases / 26
 assertions GREEN**, which drives the REAL `VllmServerMain`.
 
 | Case | What it would let through if it were missing |
 |---|---|
-| G1 | the checkpoint declaration RESOLVES, and an explicit flag outranks it |
+| G1 | the checkpoint declaration RESOLVES, an explicit flag outranks it, and the modelopt marker is exactly the three upstream can produce |
 | G2 | a declared-but-absent scale collapsing into "nothing declared" |
 | G3 | an fp8 page that is not EXACTLY half a bf16 page (closed form, not a ratio) |
 | G4 | the same halving through the LOADER: one byte budget, 2x the blocks; and the Mamba state left alone |
@@ -414,8 +454,9 @@ assertions GREEN**, which drives the REAL `VllmServerMain`.
 | G7 | an unrouted architecture writing floats into a half-sized page |
 | G8 | MLA, `float16` and `fp8_e5m2` being mis-sized instead of refused |
 | G9 | the store handed K and V in DIFFERENT float dtypes, which is every production weight arm |
-| G10 | the loader's own resolution stanza — that it runs, which file it reads first, and that the drafter-chain refusal still precedes it |
+| G10 | the loader's own resolution stanza — that it runs, which file it reads first, that the drafter-chain refusal still precedes it, and that the #1574 subject's own two documents resolve to `auto` |
 | G11 | the heterogeneous per-layer specs (Gemma-4 G1b) left at full width while the pool is sized at half |
+| G12 | the SHARED SEAM's fp8 routing being dead code, which it was — the guard above it admitted no fp8 cache |
 | serve | `--kv-cache-dtype` never reaching `EngineParams` from the command line |
 
 G4, G5, G9 and G10 enter through the production entry point (the `LoadedEngine`
@@ -423,6 +464,18 @@ constructor or `LoadedEngine::FromModelDir` → `MakeKVCacheResolved` →
 `ApplyResolvedCacheDType` → `ResolveNumBlocks` → the runner →
 `Qwen3_5DenseModel::Forward`), not by constructing a spec or a `PagedKvCache` by
 hand. The `serve` cases enter one step earlier still, at `argv`.
+
+**G12 enters through the OTHER registered forward**, and states its harness
+adaptation once. `LoadedEngine` has no in-memory overload for
+`Qwen3DenseWeights`, so its paged buffers are allocated by the case rather than
+by the runner — at the width the cache dtype names, one byte per element for
+fp8 and two for bf16, because allocating the fp8 arm at the float width would
+hide the very mis-sizing this row exists to prevent. Everything else is
+production code entered through `Qwen3DenseModel::Forward`, which is what
+`ForwardQwen3ForCausalLM` calls under `ModelRegistry::Forward`
+(`qwen3_dense.cpp:113`); this is the same entry
+`tests/vllm/models/test_qwen3_break_point.cpp` uses for the graph-break
+reachability gate.
 
 **G9 is the case the first version of this gate could not have.** Every case in
 the file built its model with `MakeDenseWeights`, whose projection weights carry
@@ -507,20 +560,38 @@ declaration first and that line is the evidence.
   for an fp8 KV cache today unless the CHECKPOINT declares one, which the loader
   does honour on every path including that one. The ABI field, its version bump
   and its `test_capi` case are owed here.
-- **W3: 17 architectures are refused rather than routed** (#1593). W3 routes the
-  shared seam `dense_attn::AttnBlock` and `src/vllm/model_executor/models/
-  qwen3_5.cpp`. The other direct `vt::ReshapeAndCache` call sites —
-  `glm4`, `minicpm`, `opt`, `gemma`, `gemma2`, `gemma3`, `gemma4` (two sites),
-  `commandr`, `phi`, `phi3`, `muse_glimmer`, `stablelm`, `qwen3_vl`, `olmo2`,
-  `granite` and `nemotron_h_device` — keep their own attention preambles and
-  refuse `--kv-cache-dtype fp8` by name at the store. Routing each is one call
-  swapped for `dense_attn::WriteKvCache` plus one `ApplyKvCacheQuant`, and each
-  needs its own gate.
+- **W3: 16 architectures are refused rather than routed, at 17 call sites**
+  (#1593). W3 routes the shared seam `dense_attn::AttnBlock` and
+  `src/vllm/model_executor/models/qwen3_5.cpp`. The other direct
+  `vt::ReshapeAndCache` call sites — `glm4`, `minicpm`, `opt`, `gemma`,
+  `gemma2`, `gemma3`, `gemma4` (two sites), `commandr`, `phi`, `phi3`,
+  `muse_glimmer`, `stablelm`, `qwen3_vl`, `olmo2`, `granite` and
+  `nemotron_h_device` — keep their own attention preambles and refuse
+  `--kv-cache-dtype fp8` by name. Routing each is one call swapped for
+  `dense_attn::WriteKvCache` plus one `ApplyKvCacheQuant`, and each needs its
+  own gate.
+- **W3: 13 of those 16 refuse with a message that names neither fp8 nor the
+  flag** (#1593). The refusal was described as arriving at
+  `vt::ReshapeAndCache`, and for 13 architectures it does not: `granite:95`,
+  `minicpm:96`, `phi3:78`, `gemma3:121`, `opt:125`, `stablelm:86`, `glm4:93`,
+  `commandr:93`, `gemma:53`, `gemma2:135`, `phi:98`, `muse_glimmer:144` and
+  `olmo2:94` each carry their own `"<arch>: KV cache must be bf16 or f32"`
+  guard, which fires first. Only `gemma4`, `qwen3_vl` and `nemotron_h_device`
+  reach the store guard and get the message that names `vt::ReshapeAndCacheFp8`
+  and the unrouted architecture. The SAFETY property holds either way — nothing
+  writes floats into a half-sized page — but an operator who typed
+  `--kv-cache-dtype fp8` on one of the 13 is told a dtype rule rather than what
+  they asked for. Widening those 13 guards the way `dense_attn_block.h:358` and
+  `qwen3_5.cpp:5313` were widened is the same edit that routes them, so this is
+  owed together with the bullet above rather than separately.
 - **W3: no weight loader extracts `k_scale`/`v_scale`** (#1593). `ResolveKvCacheScales`
   mirrors all four of upstream's arms, and the loader calls it with the
   `KVCacheScaleParameter` unloaded sentinel for both scales, so every declaring
   checkpoint lands on `kDeclaredButAbsent` and serves at 1.0. That is CORRECT for
-  the #1574 gate checkpoint, which ships zero KV scales — but the two
+  the #1574 gate checkpoint under an explicit `--kv-cache-dtype fp8`, since it
+  ships zero KV scales (and it never reaches the arm without the flag, because
+  its inline `config.json:quantization_config` declares no `kv_cache_*` key) —
+  but the two
   checkpoint-loaded arms (`kCheckpoint`, `kCheckpointKvScale`) are unit-gated and
   unreached, and a calibrated checkpoint would silently serve uncalibrated. The
   per-layer scale-tensor read, and a per-layer (rather than per-engine) scale on
@@ -545,10 +616,35 @@ declaration first and that line is the evidence.
   group specs, which is what keeps `KVBytesPerBlock` and the runner's own
   per-layer allocation agreeing, and G11 gates that arithmetic. No shipped
   architecture can spend it yet: the only model that populates that vector is
-  Gemma-4 (G1b), and Gemma-4 is one of the 17 architectures whose attention block
+  Gemma-4 (G1b), and Gemma-4 is one of the 16 architectures whose attention block
   refuses the fp8 store by name. So a Gemma-4 run with `--kv-cache-dtype fp8`
   gets a correctly halved pool and then a named refusal at the first forward,
-  which is the intended order. Routing Gemma-4 is owed with the other 16 above.
+  which is the intended order. Routing Gemma-4 is owed with the other 15 above.
+- **W3: the resolver accepts one producer-only document upstream REFUSES**
+  (#1593). `GetKvCacheQuantAlgoString` takes the modelopt marker from
+  `producer["name"] == "modelopt"`, which mirrors the injection
+  `ModelArchConfigConvertorBase._normalize_quantization_config`
+  (`transformers_utils/model_arch_config_convertor.py:208-247`) performs before
+  `torch_utils.py:319` ever reads the key — RUN, not transcribed, on 2026-08-22:
+  `nvidia/Llama-3.3-70B-Instruct-FP8`'s producer-only `hf_quant_config.json`
+  answers `None` before normalization and `'fp8_e4m3'` after it, and G1's marker
+  case pins all three markers. **One arm of that injection is not mirrored:**
+  upstream RAISES `ValueError: Unknown ModelOpt quant algo: <algo>` (`:235`)
+  when the producer is modelopt and the nested `quant_algo` is neither
+  FP8-family nor NVFP4, and we answer `fp8_e4m3` instead. That refusal is a
+  WEIGHT-half validation living in a config convertor this port does not have,
+  and moving it into the KV resolver would refuse a `MIXED_PRECISION`
+  checkpoint whose weights `modelopt_mixed_precision.h` loads. It is unreachable
+  for the #1574 subject, whose inline `config.json` document wins, so it is
+  recorded here rather than implemented; porting the convertor's validation is
+  its own row.
+- **W3: no engine auto-selects fp8 KV for the #1574 subject** (#1593), and the
+  campaign has to type `--kv-cache-dtype fp8` on both sides. Not a defect — the
+  mirror is correct on both halves and the competitors' `serve.sh` already
+  passes the flag — but it means the checkpoint declaration path this row
+  builds is gated by G1/G10 rather than exercised by the benchmark it was built
+  for. A calibrated ModelOpt checkpoint that declares the algorithm INLINE is
+  what would exercise it end to end, and this row has none.
 - **Metal and ROCm have no fp8 KV arm.** Both refuse by name (see above). Neither
   has a row yet; they belong with W5's per-head/e5m2 work or a backend row.
 - fp8_e5m2 and per-attention-head scales stay refused on both backends (W5).

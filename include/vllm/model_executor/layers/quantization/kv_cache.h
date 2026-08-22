@@ -59,7 +59,14 @@ enum class KvScaleOrigin {
   // kv_cache.py:112-116 — an fp8 KV cache WAS declared and both scales are the
   // unloaded sentinel, so the documented default 1.0 applies and the
   // uncalibrated warning fires (`:150-156`). This is the arm the
-  // `r0b0tlab/Qwen3.8-27B-NVFP4-MTP-sm121` gate checkpoint takes.
+  // `r0b0tlab/Qwen3.8-27B-NVFP4-MTP-sm121` gate checkpoint takes WHEN
+  // `--kv-cache-dtype fp8` is typed. It does not reach it on its own:
+  // MEASURED 2026-08-22 from the live artifact @ `36f717a2`, that repository's
+  // `config.json:quantization_config` carries `quant_method: "modelopt"` and
+  // `quant_algo: "MIXED_PRECISION"` and NO `kv_cache_*` key at all, and only the
+  // legacy `hf_quant_config.json` declares `kv_cache_quant_algo: "FP8"`. The
+  // inline document wins (`transformers_utils/config.py:751-761`), on both
+  // engines, so neither vLLM nor this port auto-selects an fp8 KV cache for it.
   kDeclaredButAbsent,
 };
 
