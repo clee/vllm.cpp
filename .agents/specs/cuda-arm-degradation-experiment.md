@@ -559,6 +559,11 @@ failed precondition gives `UNDETERMINED` under R5; it never gives a silent pass.
 * **P3 — teacher forcing actually forces.** The emitted ids equal the corpus ids
   at every position on both arms. If an arm emits anything else, the mask did
   not apply and every NLL from that run is void.
+* **P4 — the clock window is real.** At least 30 retained busy samples and a
+  majority of the window busy, per
+  [`bench-assert-clock-state.md`](bench-assert-clock-state.md). A failed window
+  is recorded and does not void the NLL verdict, for the reason under
+  `## Constraints`.
 * **P5 — the streaming lane stayed live, which is this row's G0-LIVE.** The
   harness snapshots `detail::ExpertStreamSnapshot()` immediately after the
   prefill step and again at the end of each corpus item, and the **decode-phase
@@ -568,11 +573,6 @@ failed precondition gives `UNDETERMINED` under R5; it never gives a silent pass.
   set is larger and the decode-phase delta is not free. A non-zero delta or a
   non-zero `forced` voids the run: a slice served by the forced fallback is not
   the arm the experiment is comparing.
-* **P4 — the clock window is real.** At least 30 retained busy samples and a
-  majority of the window busy, per
-  [`bench-assert-clock-state.md`](bench-assert-clock-state.md). A failed window
-  is recorded and does not void the NLL verdict, for the reason under
-  `## Constraints`.
 
 ## Risks and decisions
 
@@ -629,7 +629,7 @@ path, size and revision; `benchmarks/w0h_corpus.json` and its sha256; the full
 environment block (`VT_GGUF_PREFAULT`, `VT_MOE_EXPERT_STREAM`,
 `VT_MOE_EXPERT_STREAM_SLOTS`, `--max-num-seqs`, sampling parameters); the clock
 window per arm; the per-position NLL and logit-delta arrays for both arms; the
-P0 to P4 results; and the R1 to R5 verdicts with the exact command that
+P0 to P5 results; and the R1 to R5 verdicts with the exact command that
 reproduces each from the arrays.
 
 Per [`../benchmarking.md`](../benchmarking.md) §Recording it, that record goes to
@@ -646,6 +646,10 @@ stays `ACTIVE`. What the run does owe is a W0h bullet in that row spec's
 * **P1 or P3 fails.** Stop. The instrument is not measuring what the design
   says. Report `UNDETERMINED` and fix the instrument in a separate dispatch.
 * **P0 fails.** Stop. Two arms that are one arm produce a tie by construction.
+* **P5 fails.** Stop. A non-zero decode-phase `exhausted` delta or a non-zero
+  `forced` means a slice came from the fallback, so the run measured a mixture
+  of two paths rather than the arm. Shorten the prompts per the pre-registered
+  fallback and re-run the whole corpus.
 * **The lease ends before both arms complete the same corpus.** Stop and report
   what ran. A partial corpus is not a smaller corpus: the bootstrap unit count
   changes, and R1's thresholds are written for `P = 16`. Re-run whole.
