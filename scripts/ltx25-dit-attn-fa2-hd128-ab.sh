@@ -96,31 +96,54 @@ cat "$W/src.sha" 2>/dev/null | sed 's/^/  built_from=/'
 # the swap makes the flash arm a second naive one. Either way the A/B measures
 # one thing twice and still prints two columns.
 #
-# FOUR PRECONDITIONS, because a half-applied tree satisfies any three of them
-# and still measures one thing twice while printing two columns. This is the
-# #1549 harness's rule with the ladder's extra rungs added, not a new rule.
+# SIX PRECONDITIONS, because a half-applied tree satisfies any five of them and
+# still measures one thing twice while printing two columns. This is the #1549
+# harness's rule with the ladder's extra rungs added, not a new rule.
 #
 #   1. the model calls the FA-2 op at all;
-#   2. the knob has its "flash" arm, or the denominator is a second FA-2 arm;
-#   3. the knob is present at all, or the naive floor is unreachable;
-#   4. the hd-128 INSTANTIATION is in the tree AND in the build list -- without
-#      it `vt::AttentionDenseFa2` falls through to AttentionDenseFlash by its own
-#      TOTAL contract, silently, and arm A becomes a second arm B. That is the
-#      one failure this A/B cannot detect from its own numbers, because a 1.00x
-#      ratio is also what "no speedup" looks like.
-FA2OP=$(grep -c 'vt::AttentionDenseFa2' "$SRC/src/vllm/model_executor/models/ltx2_device.cpp")
-KFLASH=$(grep -c '"flash"' "$SRC/src/vllm/model_executor/models/ltx2_device.cpp")
-KNOB=$(grep -c 'VLLM_LTX2_DIT_FLASH_ATTN' "$SRC/src/vllm/model_executor/models/ltx2_device.cpp")
+#   2. the knob COMPARES against "flash", or the denominator is a second FA-2 arm;
+#   3. the flash arm CALLS vt::AttentionDenseFlash, which 2 alone does not imply:
+#      the comparison can survive while the body it guards does not;
+#   4. the knob is read at all, or the naive floor is unreachable;
+#   5. the hd-128 INSTANTIATION is in the tree, and
+#   6. it is in the build list -- without it `vt::AttentionDenseFa2` falls through
+#      to AttentionDenseFlash by its own TOTAL contract, silently, and arm A
+#      becomes a second arm B. That is the one failure this A/B cannot detect
+#      from its own numbers, because a 1.00x ratio is also what "no speedup"
+#      looks like.
+#
+# STATIC PRECONDITIONS ARE NOT SUFFICIENT ON THEIR OWN, whatever they count.
+# They read the SOURCE, and what the ratio depends on is which op each arm
+# RESOLVED AT RUN TIME. Phase [F] asserts that separately, per arm, from the
+# arm's own log.
+#
+# COUNTED OVER CODE, NEVER OVER COMMENTS, and that distinction is not pedantry.
+# The previous version of this block counted the bare string `"flash"`, which
+# `ltx2_device.cpp` mentions in PROSE as well as in the one place that matters.
+# It read 3 on a clean tree and STILL READ 2 with the entire
+# `else if (std::strcmp(arm, "flash") == 0)` arm deleted, so its `-ge 1` passed
+# on exactly the tree it exists to reject (review of #1551). `FA2OP` and `KNOB`
+# had the same defect. Each count below now names the CALL EXPRESSION, over a
+# copy with every `//` comment stripped, so only code can raise a count.
+LTXSRC="$SRC/src/vllm/model_executor/models/ltx2_device.cpp"
+[ -f "$LTXSRC" ] || { echo "FATAL: $LTXSRC is absent"; exit 40; }
+CODE=$(sed 's|//.*||' "$LTXSRC")
+FA2OP=$(printf '%s\n' "$CODE" | grep -c 'vt::AttentionDenseFa2(')
+KFLASH=$(printf '%s\n' "$CODE" | grep -c 'strcmp(arm, "flash")')
+KFLASHOP=$(printf '%s\n' "$CODE" | grep -c 'vt::AttentionDenseFlash(')
+KNOB=$(printf '%s\n' "$CODE" | grep -c 'getenv("VLLM_LTX2_DIT_FLASH_ATTN")')
 HD128SRC=0
 [ -f "$SRC/src/vt/cuda/flash_attn/src/flash_fwd_hdim128_bf16_sm80.cu" ] && HD128SRC=1
 HD128CM=$(grep -c 'flash_fwd_hdim128_bf16_sm80.cu' "$SRC/CMakeLists.txt")
-echo "  vt::AttentionDenseFa2 call sites:  $FA2OP    (want >= 1)"
-echo "  knob flash arm:                    $KFLASH   (want >= 1)"
-echo "  knob sites:                        $KNOB     (want >= 1)"
-echo "  hd-128 instantiation TU present:   $HD128SRC (want 1)"
-echo "  hd-128 TU in the build list:       $HD128CM  (want >= 1)"
-[ "$FA2OP"    -ge 1 ] || { echo "FATAL: #1551 is NOT in this source tree"; exit 40; }
-[ "$KFLASH"   -ge 1 ] || { echo "FATAL: the knob has no flash arm; the denominator would be a second FA-2 arm"; exit 41; }
+echo "  vt::AttentionDenseFa2( call sites:      $FA2OP    (want >= 1)"
+echo "  strcmp(arm, flash) comparisons:         $KFLASH   (want >= 1)"
+echo "  vt::AttentionDenseFlash( call sites:    $KFLASHOP (want >= 1)"
+echo "  getenv(VLLM_LTX2_DIT_FLASH_ATTN) sites: $KNOB     (want >= 1)"
+echo "  hd-128 instantiation TU present:        $HD128SRC (want 1)"
+echo "  hd-128 TU in the build list:            $HD128CM  (want >= 1)"
+[ "$FA2OP"    -ge 1 ] || { echo "FATAL: #1551 is NOT in this source tree; no vt::AttentionDenseFa2( call site survives the comment strip"; exit 40; }
+[ "$KFLASH"   -ge 1 ] || { echo "FATAL: the knob has no flash arm; the denominator would be a second FA-2 arm, and the ratio would read about 1.00x, which is also what 'no speedup' looks like"; exit 41; }
+[ "$KFLASHOP" -ge 1 ] || { echo "FATAL: nothing calls vt::AttentionDenseFlash(; the denominator would be a second FA-2 arm"; exit 41; }
 [ "$KNOB"     -ge 1 ] || { echo "FATAL: the A/B knob is NOT in this source tree; every arm would be one arm"; exit 41; }
 [ "$HD128SRC" = 1 ]   || { echo "FATAL: flash_fwd_hdim128_bf16_sm80.cu is absent; FA-2 would fall through to flash"; exit 43; }
 [ "$HD128CM"  -ge 1 ] || { echo "FATAL: the hd-128 TU is not in CMakeLists; FA-2 would fall through to flash"; exit 43; }
@@ -356,8 +379,6 @@ run_arm() {  # $1 = label, $2 = timeout seconds, $3 = knob value ("" = unset)
   say "arm $label exit=$rc stopped_by=$stopped_by"
   say "  a non-zero exit is EXPECTED: the arm is capped at enough forwards for a"
   say "  median and interrupted, never run to a finished render."
-  echo "--- op-provider selections (op=18 naive / op=21 flash / op=22 fa2, device=1 CUDA) ---"
-  grep -E 'op-provider.*op=(18|19|20|21|22) device=1' "$log" | sort -u | sed 's/^/  /'
   echo "--- per-forward last= ---"
   grep -ohE 'last=[0-9.]+s' "$log" | sed 's/last=//;s/s$//' > "$OUT/samples-$label.txt"
   sort -n "$OUT/samples-$label.txt" | awk -v L="$label" '
@@ -369,6 +390,50 @@ run_arm() {  # $1 = label, $2 = timeout seconds, $3 = knob value ("" = unset)
   echo "  memavail low-water: $(awk -F'\t' '{gsub(/memavail_gib=/,"",$4); print $4}' "$OUT/watch-$label.tsv" 2>/dev/null | sort -n | head -1) GiB"
 }
 
+# WHICH RUNG RAN IS NOW ASSERTED, not printed. The previous version printed the
+# `[vt op-provider]` lines under a header calling them the answer and then
+# computed the ratio in phase [G] without consulting them, so an arm that had
+# quietly resolved another arm's op produced a number that read as a result. It
+# is the composed failure the review of #1551 named: if the flash arm regresses
+# to the FA-2 default, arm B becomes a second arm A, the ratio reads about 1.00x,
+# and that is indistinguishable from "no speedup" -- the A/B cannot report its
+# own failure from its own numbers, so something outside the numbers has to.
+#
+# `vt::Announce` (src/vt/op_provider.cpp:262-269) fires ONCE per (op, device)
+# slot on first resolution, so the presence of a line is the observation and its
+# count is not. Each arm must resolve EXACTLY its own op among the three rungs:
+# op=18 kAttention, op=21 kAttentionDenseFlash, op=22 kAttentionDenseFa2, all at
+# device=1 (kCUDA). Resolving another rung's op is the failure; resolving NONE of
+# them means the DiT self-attention was never reached at all, which is equally
+# fatal to the number and reads identically in the timing.
+#
+# It runs AFTER `run_arm` returns, so the arm's samples and median are already
+# written to $OUT and survive the exit.
+assert_arm_op() {  # $1 = label, $2 = the op id this arm MUST resolve, $3 = the arm's log
+  local label=$1 want=$2 log=$3
+  local n18 n21 n22 seen
+  n18=$(grep -cE '\[vt op-provider\] op=18 device=1' "$log" 2>/dev/null || true)
+  n21=$(grep -cE '\[vt op-provider\] op=21 device=1' "$log" 2>/dev/null || true)
+  n22=$(grep -cE '\[vt op-provider\] op=22 device=1' "$log" 2>/dev/null || true)
+  seen=""
+  [ "${n18:-0}" -gt 0 ] && seen="$seen 18"
+  [ "${n21:-0}" -gt 0 ] && seen="$seen 21"
+  [ "${n22:-0}" -gt 0 ] && seen="$seen 22"
+  seen=${seen# }
+  echo "  op-provider on device=1: resolved [${seen:-none}], want exactly [$want]" \
+       "(18=kAttention 21=kAttentionDenseFlash 22=kAttentionDenseFa2)"
+  if [ "$seen" != "$want" ]; then
+    echo "FATAL: arm '$label' resolved [${seen:-none}] on device=1 and must resolve exactly [$want]."
+    echo "FATAL:   18=kAttention  21=kAttentionDenseFlash  22=kAttentionDenseFa2"
+    echo "FATAL: an arm that resolved another arm's op IS that arm, so the ratio it feeds is"
+    echo "FATAL: 1.00x by construction -- which is also what 'no speedup' looks like. Resolving"
+    echo "FATAL: none of the three means the DiT self-attention was never reached."
+    echo "FATAL: the [vt op-provider] lines this arm did emit:"
+    grep -E '\[vt op-provider\]' "$log" | sort -u | sed 's/^/FATAL:   /'
+    exit 47
+  fi
+}
+
 # THE DENOMINATOR FIRST, and for the reason the #1549 harness records: the arm
 # most likely to be cut short is the one to take while the box is known to be
 # up. Here that is `flash`, which is the slower of the two rungs the ratio needs
@@ -378,9 +443,9 @@ ARMS="${ARMS:-flash fa2}"
 say "arms: $ARMS"
 for a in $ARMS; do
   case "$a" in
-    flash) run_arm flash "${TMO_FLASH:-1200}" "flash" ;;
-    fa2)   run_arm fa2   "${TMO_FA2:-1200}"   ""      ;;
-    naive) run_arm naive "${TMO_NAIVE:-1800}" "0"     ;;
+    flash) run_arm flash "${TMO_FLASH:-1200}" "flash"; assert_arm_op flash 21 "$OUT/arm-flash.log" ;;
+    fa2)   run_arm fa2   "${TMO_FA2:-1200}"   ""     ; assert_arm_op fa2   22 "$OUT/arm-fa2.log"   ;;
+    naive) run_arm naive "${TMO_NAIVE:-1800}" "0"    ; assert_arm_op naive 18 "$OUT/arm-naive.log" ;;
     *)     echo "FATAL: unknown arm '$a' (want flash|fa2|naive)"; exit 44 ;;
   esac
 done

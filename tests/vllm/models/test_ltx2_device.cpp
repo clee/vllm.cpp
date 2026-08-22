@@ -1637,6 +1637,57 @@ TEST_CASE("ltx2 device: the DiT self-attention ENTERS AttentionDenseFa2, not Fla
   REQUIRE(off.audio.size() == out.audio.size());
   CHECK(std::equal(off.video.begin(), off.video.end(), out.video.begin()));
   CHECK(std::equal(off.audio.begin(), off.audio.end(), out.audio.begin()));
+
+  // AND THE THIRD ARM, `=flash`, which until the review of #1551 was protected by
+  // NOTHING EXECUTABLE. Deleting the whole `else if (std::strcmp(arm, "flash"))`
+  // arm from `ltx2_device.cpp` left this binary at 22 cases / 653 assertions /
+  // SUCCESS, because no case here ever set the knob to anything but `"0"`: the
+  // deleted arm simply fell through to the FA-2 default, and the FA-2 default is
+  // what every other half of this case already asserts. The harness precondition
+  // meant to catch that (`ltx25-dit-attn-fa2-hd128-ab.sh`) counted COMMENTS
+  // rather than code, so it read 2 on the mutated tree and passed its own
+  // `-ge 1`. Both halves are repaired; this is the executable one.
+  //
+  // WHY IT IS A CORRECTNESS PROBLEM AND NOT A TIDINESS ONE. `flash` is the
+  // DENOMINATOR of this row's ratio. An arm that silently becomes a second copy
+  // of the numerator's arm makes the A/B measure one rung twice and still print
+  // two columns, and the ratio it yields is ~1.00x — which is also exactly what
+  // "no speedup" looks like, so the number cannot report its own failure. A
+  // denominator therefore needs the same routing proof the default arm has, and
+  // for the same reason.
+  //
+  // ALL THREE counters are reset first. `kAttentionDenseFa2` in particular has
+  // been counting since the top of this case, and a stale value would make the
+  // `== 0` below pass for a reason that has nothing to do with the knob. EXACT
+  // counts again, never floors, for the reason recorded at the head of this case.
+  vllm_test::SetEnv("VLLM_LTX2_DIT_FLASH_ATTN", "flash");
+  vt::ResetOpProviderStats(vt::OpId::kAttentionDenseFa2, vt::DeviceType::kCPU);
+  vt::ResetOpProviderStats(vt::OpId::kAttentionDenseFlash, vt::DeviceType::kCPU);
+  vt::ResetOpProviderStats(vt::OpId::kAttention, vt::DeviceType::kCPU);
+  const vllm::Ltx2DitOutputs den =
+      Ltx2DitForwardDevice(q, p, staged.weights, &m.video, &m.audio, vt::DType::kF32);
+  const vt::OpProviderStats flash_on =
+      vt::GetOpProviderStats(vt::OpId::kAttentionDenseFlash, vt::DeviceType::kCPU);
+  const vt::OpProviderStats fa2_on =
+      vt::GetOpProviderStats(vt::OpId::kAttentionDenseFa2, vt::DeviceType::kCPU);
+  const vt::OpProviderStats naive_on =
+      vt::GetOpProviderStats(vt::OpId::kAttention, vt::DeviceType::kCPU);
+  vllm_test::UnsetEnv("VLLM_LTX2_DIT_FLASH_ATTN");  // `knob_guard` repeats this on any unwind
+  MESSAGE("=flash: kAttentionDenseFlash selections = "
+          << flash_on.selections << " (want " << want
+          << "), kAttentionDenseFa2 = " << fa2_on.selections
+          << ", kAttention = " << naive_on.selections);
+  CHECK(flash_on.selections == want);
+  CHECK(fa2_on.selections == 0);
+  CHECK(naive_on.selections == 0);
+  // The denominator arm must also COMPUTE what the other two do, for the reason
+  // the `=0` equality above states: on CPU all three ops are the one registered
+  // function, so byte equality is the only defensible bound here, and the CUDA
+  // deviation is the parity case's question rather than this one's.
+  REQUIRE(den.video.size() == out.video.size());
+  REQUIRE(den.audio.size() == out.audio.size());
+  CHECK(std::equal(den.video.begin(), den.video.end(), out.video.begin()));
+  CHECK(std::equal(den.audio.begin(), den.audio.end(), out.audio.begin()));
   // `stats_guard` disables the counting instrument on the way out, on this path
   // and on every unwinding one.
 }

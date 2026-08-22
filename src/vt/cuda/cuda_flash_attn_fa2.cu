@@ -573,7 +573,7 @@ void LaunchDenseFA2Bf16(cudaStream_t s, Tensor& out, const Tensor& query,
   }
   if (causal) {
     throw std::runtime_error(
-        "cuda flash-attn-2 dense: non-causal only — the sole compiled instantiation is "
+        "cuda flash-attn-2 dense: non-causal only — both compiled instantiations are "
         "Is_causal=false (dispatch gate must enforce)");
   }
 
@@ -660,14 +660,31 @@ void LaunchDenseFA2Bf16(cudaStream_t s, Tensor& out, const Tensor& query,
   p.num_splits = 1;  // the non-split kernel writes O directly
 
   // The head dim is a TEMPLATE parameter, so the two compiled instantiations are
-  // two call sites and not one call with an argument. The guard above admitted
-  // exactly {64, 128}; this switch is total over that set and the `else` is
-  // unreachable rather than a silent default — a head dim that reached here
-  // without an instantiation would be a LINK error, not a wrong answer.
+  // two call sites and not one call with an argument. EVERY ARM IS THEREFORE
+  // NAMED, and the fall-through THROWS rather than picking one.
+  //
+  // The previous shape put the 128 call in a bare `else` and called that `else`
+  // unreachable, on the reasoning that a head dim with no instantiation would be
+  // a LINK error. That reasoning is wrong, and the review of #1551 caught it: the
+  // set this function serves is decided by the `d != 64 && d != 128` guard above,
+  // not by the linker. Widening that guard alone — the exact edit a head_dim-192
+  // rung would begin with — links fine and sends 192 into the 128 kernel, which
+  // reads 128 of its 192 channels and returns a SILENTLY TRUNCATED answer. The
+  // one-file diff that adds a dtype/head-dim rung is the diff this project makes
+  // most often, so the arm that has to fail loudly is the one nobody edited.
+  //
+  // Behaviour for d in {64, 128} is unchanged: same kernel, same arguments.
   if (d == 64) {
     FLASH_NAMESPACE::run_mha_fwd_<cutlass::bfloat16_t, 64, false>(p, s);
-  } else {
+  } else if (d == 128) {
     FLASH_NAMESPACE::run_mha_fwd_<cutlass::bfloat16_t, 128, false>(p, s);
+  } else {
+    throw std::runtime_error(
+        "cuda flash-attn-2 dense: no compiled kernel for head_dim " + std::to_string(d) +
+        " — the launcher instantiates run_mha_fwd_<bfloat16_t, 64, false> and "
+        "run_mha_fwd_<bfloat16_t, 128, false> only "
+        "(src/vt/cuda/flash_attn/src/flash_fwd_hdim{64,128}_bf16_sm80.cu). Widening the "
+        "head_dim guard above without adding the instantiation reaches here");
   }
   Check(cudaGetLastError(), "dense fa2 launch");
 }
