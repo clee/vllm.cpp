@@ -1457,12 +1457,19 @@ which is where this spec's `### Decisions taken here` already said they would be
 
   The `load` and `generate` records are SPANS and are never summed, so they are
   not in this list; `sum_rule` in every emitted table says which records add up.
-* **(1c) DOES NOT HOLD A LEAF RECORD SHORTER THAN 60 ms**, and this
-  entry names which ones so no later stage inherits the silence. The span-slack
-  bound is per leaf RECORD and its `min` cap binds below
+* **(1c) DOES NOT HOLD A LEAF RECORD SHORTER THAN `8 x THIS RUN'S BOUNDARY
+  CEILING`**, and this entry names which ones so no later stage inherits the
+  silence. The span-slack bound is per leaf RECORD and its `min` cap binds below
   `2 * kSpanSlackPerRecord`; a record there is reported and not checked, because
   the capped bound is a 50% share and the honest head-plus-tail on those records
   measured 4.6-72.3% of the record itself ([#1559](https://github.com/mudler/vllm.cpp/issues/1559)).
+
+  **That floor was a flat 60 ms and is now a per-run number the case prints**
+  (`### The span-slack bound, fifth shape`). Over 120 runs on this box it ran
+  2.4 ms to 838 ms, median 26.6 ms, so the ranges in the table below -- which
+  were measured against the 60 ms floor -- now say which records are resolvable
+  on a QUIET run rather than on every run. A record the run cannot resolve is
+  counted in the case's own `N below this instrument's resolution` line.
 
   | Record | Measured range | What still holds it, and what escapes |
   |---|---|---|
@@ -2950,3 +2957,188 @@ the reason is that the document publishes none: `## Inspect a render` describes
 `sum_leaf_seconds`, `unaccounted_seconds` and the two environment switches, and
 names no individual phase. Checked rather than assumed, because a sentence
 written when a document had a different shape is how a stale obligation survives.
+
+### The span-slack bound, fifth shape: the instrument measures its own resolution (#1572, #1576)
+
+Four issues describe one behaviour -- `test_ltx2_video` decides by box load --
+and every repair so far has replaced one constant with a larger constant.
+
+| Issue | What it recorded | State after this change |
+|---|---|---|
+| [#1576](https://github.com/mudler/vllm.cpp/issues/1576) | (1c) is a fixed wall-clock budget with an allowance for INSTRUMENTATION and none for LOAD, measured swinging 171x on one binary | **closed here** |
+| [#1572](https://github.com/mudler/vllm.cpp/issues/1572) | (1c) redding intermittently on `main`, `decode.video` at 0.00256913 against 0.00075 | **closed here** |
+| [#1536](https://github.com/mudler/vllm.cpp/issues/1536) | the phase-coverage floors missed by 0.18-0.8% on an idle box, while the suites that ARE load-dependent passed | **thesis refuted by measurement**, see below |
+| [#1470](https://github.com/mudler/vllm.cpp/issues/1470) | one case of 96 false-redded under load, four greens after, case identity never captured | **identity and rate measured, STAYS OPEN**, see below |
+
+The history of the number they are about is the argument for not choosing
+another one: 0.95 of the leaf, then 0.25 ms per record, then 3 ms under a
+sanitizer, then 30 ms everywhere. Each was calibrated on a sample of one box and
+each was afterwards found redding an unmutated tree. The 30 ms also cost
+resolution: it widened the smallest swallow (1c) can see from about 0.5 ms to
+60 ms.
+
+#### The red-before, on an UNMUTATED tree at `73ada0df8`
+
+120 runs of the containment case alone, one Release CPU-only binary, one build
+directory, this 20-core box at loadavg 40-155, full output kept, 1440
+leaf-record observations. **One run red.**
+
+```
+b3_003  loadavg 155.65 133.50 102.10
+test_ltx2_video.cpp:4074: CHECK( span_slack <= span_bound )     0.0675591 <= 0.03
+test_ltx2_video.cpp:4122: CHECK( covered >= c.min_coverage * leaf_seconds )
+                                                            0.00730277 >= 0.0374371
+[doctest] test cases: 1 | 0 passed | 1 failed
+```
+
+Both failures are **one event**. `artifacts.frames` render 2 record 2 runs
+[55.431342293, 55.499995634] -- 68.65 ms -- and its `artifacts.frames.ppm`
+sub-scope runs [55.431346873, 55.432441132]. The 67.55 ms between
+`ppm_phase.Close()` and `write_phase`'s destructor holds two statements
+(`rendered_frames += chunk.frames.frames` and the trace increment) and one
+descheduled thread. It reds (1c) at 2.25x the 30 ms constant, and it reds (2)
+because 67.55 ms of a 74.87 ms leaf is then uncovered.
+
+That is the cluster in one observation: the SAME scheduler event decides (1c)
+and (2), on a tree nobody touched, and a reader of either red learns nothing
+about the tree.
+
+#### The design: the denominator is measured, and it is measured FOR the render
+
+A boundary is not a constant, so the bound is not one either. What one costs is
+read out of `render_phase_log.cpp` rather than guessed: `PhaseLog::Open` takes
+the process-wide mutex, stamps `o.start`, appends the open entry, calls
+`SampleLocked` -- one `/proc/self/statm` read -- and, on the shipped default,
+writes and FLUSHES one line to stderr. `Close` takes the same mutex, samples,
+THEN stamps `r.end`, and flushes its own line. Both stamps sit inside that work,
+which is exactly what puts the cost inside the leaf record.
+
+`InstrumentCeiling` times those three operations, through the instrument's own
+public entry points, from a thread that runs FOR the load and both renders at
+one sample per millisecond, and the bound reads the WORST it saw.
+
+**The worst, and not a mean, and that is the design rather than a detail.** The
+numerator is itself a maximum over a small number of draws. A mean denominator
+under a maximum numerator is the shape `ltx25-phase-residue.md` `## Design` 3
+measured at 4 reds in 45 runs -- worst ratio 4.115 against a bound of 1 -- and
+withdrew, because under contention the un-instrumented remainder of a boundary
+dilates faster than the instrumented part, so the comparison has a heavy right
+tail rather than a shifted median. Here both sides are tail quantities.
+
+**Two denominator shapes were measured and rejected**, and both are worth
+carrying forward because both are the obvious thing to reach for:
+
+| ceiling shape | worst `slack / ceiling` over 1440 observations |
+|---|---:|
+| bursts of 4096 taken BESIDE each render (about 40 ms of a case that runs for tens of seconds) | **2.954** |
+| the continuous sampler's 99.9th percentile | **199.4** |
+| **the continuous sampler's maximum** | **0.645** |
+
+The 99.9th percentile is the interesting reject. It is 20x to 200x tighter and
+would be a far better instrument if it were safe. It is not, for the same reason
+the mean is not: it is not a maximum. On run b3_003 it read 0.339 ms against a
+67.55 ms boundary, so it would have kept the very red this change exists to
+explain.
+
+#### The bound, and the whole of the judgement in it
+
+```cpp
+const double kBoundariesPerRecord = 4.0;
+const double kSpanSlackPerRecord = kBoundariesPerRecord * ceiling.ceiling_seconds();
+const double span_bound = std::min(kSpanSlackPerRecord, 0.5 * record_seconds);
+```
+
+The head of a leaf record is `Open(leaf)`'s sample and flushed line followed by
+`Open(sub)`'s acquisition of the same mutex; the tail is `Close(sub)`'s flushed
+line followed by `Close(leaf)`'s acquisition, sample and stamp. TWO
+boundary-sized operations. `2 x ceiling` is what the structure gives; the four
+carries one factor of two over it, and that factor is the only number in the
+line that was chosen rather than derived. Against the measured population it is
+6.2x inside the worst observation, and zero of 1440 records violate it at any
+`C` from 1 upward.
+
+#### What it costs, and what it buys, measured on the same box
+
+The bound is a property of the run, so its RESOLUTION is too. Measured over the
+same 120 runs, `4 x ceiling` ran **1.18 ms to 419 ms, median 13.3 ms**, against
+the flat 30 ms it replaces. On the quiet end that is 25x tighter; at loadavg 155
+it says out loud that it can resolve nothing under a tenth of a second, which
+run b3_003 proves is the truth about that box rather than a weakness of the
+bound.
+
+Staged as a mutation, the difference is visible directly. `D-unnamed-head`
+inserts a phase nobody named, of a known size, between `Open("decode.audio")`
+and `Open("decode.audio.mel")` -- the exact defect (1c) exists for:
+
+| mutation | old bound (30 ms) | new bound |
+|---|---|---|
+| 20 ms un-named head | **GREEN on (1c)** (caught only by `decode.audio`'s 0.99 coverage floor) | **RED on (1c), 3 of 3**, at a run ceiling of 79-126 us and a bound of 0.32-0.50 ms |
+| 2 ms un-named head | **GREEN 3 of 3** | RED 1 of 3 -- and the two greens report a ceiling of 2.26-2.56 ms, so the bound was 9-10 ms and the run said so |
+
+#### The same term was written for (2), MEASURED, and WITHDRAWN
+
+The obvious companion change is to give the coverage floor the same allowance as
+a second arm:
+
+```cpp
+CHECK(covered >= c.min_coverage * leaf_seconds || uncovered <= boundary_allowance);
+```
+
+with `boundary_allowance = 2 * (leaf records + sub-scope records) * ceiling`. It
+was written, built, and it makes b3_003's coverage red green. **It is withdrawn,
+because it makes a real mutation green as well.**
+
+Mutation `B-empty-ppm` moves `phase::Scope ppm_phase("artifacts.frames.ppm")`
+from before the `WriteFileBytes` loop to after it, so the writer's anchor stops
+covering the writes -- the defect that anchor exists for. Coverage of
+`artifacts.frames` falls from about 98% to **1.1% and 5.0%**. Under the
+disjunction the case reported `carried by the INSTRUMENT ARM alone` and passed,
+3 of 3. Against the floor as it stands it reds, 2 of 2.
+
+The reason is a property of the fixture and not of the arithmetic:
+`artifacts.frames` is **0.2 ms to 7 ms** here, while one boundary on this host
+is **0.3 ms to 1.2 ms even pinned to two otherwise idle cores** (`taskset -c
+18,19`). Any allowance built out of the boundary is larger than the leaf. The
+0.50 floor on that leaf is a RELATIVE test at a scale the absolute instrument
+cannot reach, which is why it catches `B-empty-ppm` and why it reds under load:
+those are the same property, and no threshold separates them.
+
+So (2) is unchanged by this row, and #1470 keeps it. What would settle it is an
+anchor whose seconds the writer can be read against -- the same class of repair
+`### Owed out of W0` already asks for on the short records, and the same class
+`denoise.update` ([#1668](https://github.com/mudler/vllm.cpp/issues/1668)) is
+for `denoise`. It is a production scope, not a number.
+
+#### Mutations
+
+Restored byte-for-byte after each, `git status` clean between runs; every
+mutation prints `compile_status=0` and asserts its anchor matched exactly once,
+so a mutation that failed to build or failed to apply cannot read as a pass.
+
+| Mutation | What it stages | Verdict |
+|---|---|---|
+| `C-no-sampler` | the `CeilingSamplerGuard` is deleted from the case, so every bound would be `4 x 0` | **RED**, `REQUIRE( ceiling.observations() > 0 )`, 45 assertions in |
+| `D-unnamed-head-20ms` | a 20 ms phase nobody named in `decode.audio`'s head | **RED on (1c), 3 of 3** (green on (1c) at the 30 ms constant) |
+| `D-unnamed-head-2ms` | the same at 2 ms | RED 1 of 3, and the greens print the ceiling that explains them (green 3 of 3 at the 30 ms constant) |
+| `B-empty-ppm` | `artifacts.frames.ppm` opened after the write loop instead of around it | **RED on (2), 2 of 2** -- detection unchanged by this row, which is why the (2) arm was withdrawn |
+
+#### What this does NOT do, stated before it is relied on
+
+* **It does not close #1439.** `leaves >= 0.95 * wall` is untouched and is still
+  a share of a contended clock.
+* **It does not close #1470.** The coverage floors still decide by load on
+  `artifacts.frames`, at a measured rate of 1 run in 120 on this box, and the
+  section above is the measurement that says why a bound cannot fix it.
+* **#1536's thesis is refuted rather than repaired.** That issue's claim is that
+  the suite is "persistently red on an idle box, not load-flaky". At
+  `73ada0df8` it is the opposite: 119 of 120 green, and the single red was at
+  loadavg 155.65. Its 0.18-0.8% misses were against the 0.95 floor that
+  `6b48edb2c` moved to 0.75; the measured coverage on this box is 99.6% for
+  `denoise` and 98.4%-100% for the decode leaves, so nothing is near that floor.
+* **The sampler perturbs what it measures.** It takes the phase mutex about a
+  thousand times a second against a render that takes it about thirty times in
+  total, and it writes to the same fd the live lane writes to. The perturbation
+  is inside the quantity it reports, which is the conservative direction. It is
+  also why the guard is RAII: a failing `REQUIRE` in this case would otherwise
+  leave a thread writing to fd 2 while the later cases in the file `dup2` a
+  capture file over it.
