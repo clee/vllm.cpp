@@ -1953,8 +1953,12 @@ std::unique_ptr<LoadedEngine> LoadedEngine::FromModelDir(
   //
   // It reads `params_in`, the UNRESOLVED argument, deliberately: it must run
   // ahead of the KV-FP8 W3 stanza below, whose `ReadQuantConfigJson` opens a
-  // file inside `model_dir`. `ChainRefusalPrecedesKvCacheDTypeResolution` in
-  // `tests/vllm/entrypoints/test_kv_cache_fp8_wiring.cpp` gates that order.
+  // file inside `model_dir`. The case
+  // "kv-fp8 W3 G10: the drafter-chain refusal runs BEFORE the KV resolution" in
+  // `tests/vllm/entrypoints/test_kv_cache_fp8_wiring.cpp` gates that order, by
+  // pointing at a directory that EXISTS and declares fp8 -- which
+  // `test_drafter_chain_reach.cpp` cannot do, because its nonexistent path makes
+  // `ReadQuantConfigJson` answer "" without opening anything.
   if (params_in.speculative_config.has_value() &&
       params_in.speculative_config->use_drafter_chain()) {
     (void)ResolveSpecConfig(params_in, vllm::HfConfig{});

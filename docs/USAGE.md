@@ -123,6 +123,13 @@ own attention preamble refuses the flag by name at the first KV write rather
 than writing floats into a half-sized block. Metal and ROCm refuse it too. See
 [the row spec](../.agents/specs/fp8-kv-cache.md) for the exact list.
 
+A refusal arrives AFTER the pool has already been sized at half, which is the
+intended order: the sizing is what a wrong answer would corrupt silently, so it
+is made consistent first and the unrouted store then says so out loud. On a
+heterogeneous-KV model such as Gemma-4, where each layer carries its own
+attention spec, that means you see a doubled block count in the startup line and
+then a named refusal at the first forward — not a served run.
+
 **Not on the C ABI yet.** `vllm_model_params` carries no `kv_cache_dtype` field,
 so a C-ABI caller reaches the fp8 cache only through a checkpoint that declares
 it. Tracked by [#1593](https://github.com/mudler/vllm.cpp/issues/1593).
