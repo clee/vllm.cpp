@@ -7,7 +7,14 @@ Issue: [#1549](https://github.com/mudler/vllm.cpp/issues/1549).
 
 ## Now
 
-`ACTIVE`. The diagnosis is confirmed against the tree and the change is scoped
+`ACTIVE`. The routing change landed as `90e8c3c85` (#1557). What is live now is
+**§10, the pixel A/B** ([#1612](https://github.com/mudler/vllm.cpp/issues/1612)):
+the swap is on `main` with no comparison of what it RENDERS, and §10 is committed
+before the renders are taken so the acceptance criterion cannot be read off the
+numbers it judges. The same lease settles the speed A/B that §8 still carries as
+`PENDING`.
+
+The diagnosis is confirmed against the tree and the change is scoped
 to **one production call site**. It was once scoped to that call site plus a
 shared-memory cap repair in `LaunchAttentionDenseFlash`; that repair is
 **reverted and out of scope** — see §4.3 for why, and for who owns the bound
@@ -514,6 +521,9 @@ never a synonym for "probably fine".
 | bf16 head_dim 128 tile fits without an opt-in | arithmetic, `cuda_ops.cu:3338` | **PASS** — `2 * kFlashBc(64) * 128 * sizeof(bf16)` = 32,768 B against the 49,152 B every architecture gives without an opt-in. This is the whole of what the swapped shape needs from §4.3, and it is a property of the code, so no device is owed for it |
 | the flash op's advertised head_dim bound | not this row | **NOT A GATE HERE** — §4.3's cap-raise is reverted, so `LaunchAttentionDenseFlash` and `tests/vt/test_ops_attention.cpp` are byte-identical to `main`. Owned by [#1578](https://github.com/mudler/vllm.cpp/pull/1578), which merges first |
 | A/B, same binary, both arms | `dgx:gpu0` under an `rc` lease | **PENDING** — the flash arm is measured at 7.680 s median (n=19); the worker was lost before the naive arm, so no pair exists (§7.1) |
+| pixel A/B at production geometry | `dgx:gpu0` under an `rc` lease, `scripts/ltx25-dit-attn-flash-pixel-ab.sh` | **PENDING** — criterion registered in §10.4; result in §10.7 |
+| run-to-run control (`flash` twice) | the same lease | **PENDING** — §10.3; without it no arm-to-arm delta is attributable to the kernel |
+| the comparison tool discriminates | `tests/scripts/test_ltx25_render_compare.py` | **PENDING until §10.7** — a dither passes and a one-pixel shift fails all four checks (§10.4) |
 | full preflight | `scripts/agent-preflight.sh` | **PASS at HEAD** — and it was NOT before: `documentation-checkpoint` was red on two of this branch's own commits (see below) |
 | `documentation-checkpoint` | CI, and locally over the branch range | **PASS at HEAD, RED before it, and the red was THIS BRANCH's** — `2aa78c69b` and `2f39a9426` each recorded a measurement in `.agents/benchmark-record.md` without writing `docs/STATUS.md` (and `docs/BENCHMARKS.md` for the second). The control on the main-only range `4c193bd55..5d548d003` is rc 0, so it was not inherited. Both commits were replaced by one that writes all three surfaces together when the branch was rebuilt, and the checker is re-run at each head rather than trusted to have stayed fixed — a job that has stopped appearing in a failing set is not the same fact as a job that passes |
 | `build-newest-gcc` | CI | **PASS, and now green on `main` too** — it was red on `main` on `::getpid` in `test_qwen3_dflash2_gguf.cpp:547`, a file this change does not touch; [#1581](https://github.com/mudler/vllm.cpp/pull/1581) fixed it and this branch carries that fix through the merge. A red here after the merge is therefore this row's, not inherited |
@@ -544,10 +554,203 @@ because it passed.
 - `NEEDS_DECISION` if the measured speedup is far from §7's prediction.
 - The A/B is reported as **pending an external resource** if `dgx:gpu0` is not
   free. It is never taken on another box, and never replaced by an estimate.
+- **The pixel thresholds in §10.4 are never widened to admit the change.** A
+  failing check is a finding about a change already on `main`, filed as its own
+  issue with what diverged and by how much (§10.5), and it is never repaired by
+  moving a number in `scripts/ltx25-render-compare.py`.
+
+## 10. The pixel A/B — what the model RENDERS, designed before it is read
+
+Issue: [#1612](https://github.com/mudler/vllm.cpp/issues/1612). This section is
+written and committed **before the renders are taken**, because a criterion read
+off the numbers it is meant to judge is not a criterion.
+
+### 10.1 Why this section has to exist at all
+
+Every other model in this tree leans on a token gate. Greedy decode gives a
+discrete output, and either the tokens match the oracle or they do not. **A
+diffusion render has no such output.** The DiT emits latents, the VAE emits
+pixels, and nothing in that chain is a symbol that can be compared for equality
+against a reference by construction.
+
+So when §5 says the swap is **not bit-identical on CUDA**, the usual net is
+absent. What remains is the reduced-dimension host-vs-device parity case
+(`8.94e-08` video, `4.47e-08` audio against `2e-5`), and §7.1 already states its
+limit in the same breath as its result: it bounds the *arithmetic* change — a
+length-`head_dim` sum reassociated — at the fixture's dimensions. Production is
+bf16, head_dim 128, 2352 keys, 32 heads, 48 layers, 120 forwards. Nothing has
+measured that.
+
+### 10.2 What bf16 predicts, which is that the frames WILL differ
+
+This is a prediction registered in advance, not a result.
+
+`vt::Attention` and `vt::AttentionDenseFlash` run the same f32 online softmax
+and differ only in association (`include/vt/ops.h:3304-3306`). Two summation
+orders of an `n`-term f32 sum differ by roughly `sqrt(n) * u` in the
+random-walk regime, with `u = 2^-24 = 5.96e-08` the f32 unit roundoff:
+
+| axis reassociated | `n` | relative deviation |
+|---|---|---|
+| the head_dim dot product, which §5 names | 128 | `~6.7e-07` |
+| the key-axis online accumulation | 2352 | `~2.9e-06` |
+
+The DiT then **stores that result to bf16**, whose spacing is `2^-7 = 7.81e-03`
+relative — four orders of magnitude coarser. A perturbation of relative size
+`d` moves the rounded bf16 value only when the exact value sits within `d` of a
+rounding boundary, so the per-element flip probability is `d / 7.81e-03`:
+between `8.6e-05` and `3.7e-04`.
+
+The video stream carries `2352 * 32 * 128 = 9.63e6` attention output elements
+per layer and `4.62e8` over 48 layers, so **one forward injects between 4.0e4
+and 1.7e5 single-ULP bf16 flips**, and a render is 120 forwards inside a
+nonlinear sampler that feeds each step's output into the next.
+
+**Three things follow, and the third is the one that shapes the gate.**
+
+1. **Bit-identical frames are not the expected outcome.** Predicting them and
+   then finding a difference would make any threshold read as a retrofit.
+2. **The floor is not zero.** "Within bf16 noise" has to mean something other
+   than equality, because equality is not what the arithmetic predicts.
+3. **A tight a-priori pixel bound is NOT derivable.** The sampler is nonlinear
+   and iterative; whether ~1e5 ULP flips per step damp or amplify over 120 steps
+   is an empirical property of this model at this geometry, not something the
+   error analysis above can be pushed to answer. Anyone who claims to derive one
+   is deriving it from an assumption of contraction that nothing here has
+   measured.
+
+So the bound is not derived from the arithmetic. It is derived from two things
+that exist independently of this experiment: a convention the video-coding field
+already agreed on, and the render's own scale.
+
+### 10.3 The design: three renders, and the third is the whole argument
+
+One binary, built once, in one `rc` lease on `dgx:gpu0`, on one staged
+checkpoint set, at `768x448/49f` (2352 tokens), seed `20260820`, with the exact
+70-word prompt of the recorded 20260820 baseline.
+
+| # | render | knob | what it is |
+|---|---|---|---|
+| 1 | `flash` | `VLLM_LTX2_DIT_FLASH_ATTN=1` | the arm #1549 shipped |
+| 2 | `naive` | `VLLM_LTX2_DIT_FLASH_ATTN=0` | the arm it replaced |
+| 3 | `flash-ctl` | `VLLM_LTX2_DIT_FLASH_ATTN=1` | **flash again**, same binary, same seed |
+
+**(3) is not a spare. It is the control, and without it the experiment does not
+answer its own question.** A difference between (1) and (2) is only attributable
+to the kernel if the box produces the same render twice when nothing changes.
+cuBLAS reduction splits, allocator-dependent kernel selection and any
+nondeterminism anywhere in 120 forwards plus a VAE decode would otherwise sit
+inside the measured delta with no way to separate them. So:
+
+- **control == 0** (bit-identical): the noise floor is exactly zero, and every
+  bit of the flash-vs-naive delta is the swapped op. The strongest attribution
+  available.
+- **control ~= treatment**: the swap changed nothing the machine does not change
+  by itself. The strongest possible *null* result, and it can only be stated
+  because the control was taken.
+- **control > 0 and < treatment**: the delta is partly kernel, and the control
+  is the floor the thresholds must be read against.
+
+Every one of those is an answer. None is available from two renders, which is
+what #1612 asked for and what this section deliberately exceeds.
+
+**Order: flash, naive, flash-ctl.** The naive arm is ~6x the wall clock and it
+is the one whose loss leaves no A/B at all, so it is taken while the box is
+known good rather than last. The control goes last because it is the only one
+recoverable cheaply: the harness caches the binary keyed on the source sha, so a
+follow-up lease reaches a render in minutes rather than re-spending the build.
+
+**Both arms are instrumented identically and neither is stack-sampled.** §7.1
+established that `runguard.py --stack-period 12` cost the recorded 47.84 s
+denominator ~3.2% by `ptrace`-stopping every thread. This harness runs a
+`MemAvailable` watchdog and nothing else, so the speed pair it produces needs no
+sampler correction and finally replaces the cross-run 6.03-6.23x range with a
+same-binary ratio.
+
+**Routing is proved per arm, two-sided, from that arm's own log.**
+`VT_OP_PROVIDER_STATS=1` makes each op announce itself once when it resolves.
+The flash arm must show `op=21 device=1` **and no** `op=18 device=1`; the naive
+arm the reverse. A one-sided count cannot tell a routed call from an added one,
+and "the knob was exported" is not evidence that the branch was taken.
+
+### 10.4 The registered acceptance criterion
+
+Committed as the defaults of `scripts/ltx25-render-compare.py`, so the numbers
+are read by a tool that already holds the thresholds rather than compared to
+them by hand afterwards.
+
+| # | check | threshold | where it comes from |
+|---|---|---|---|
+| V1 | mean \|delta\|, 8-bit RGB | `<= 1.0` level | one level is the quantisation step of the artefact itself; a mean below it says the average pixel is within the PPM's own resolution |
+| V2 | worst-frame PSNR | `>= 40 dB` | the video-coding "visually lossless" convention. This experiment did not choose it |
+| V3 | worst-frame SSIM | `>= 0.99` | Wang et al. 2004, 11x11 Gaussian sigma=1.5 on luma. 0.98 is the usual transparency line; this is stricter, and it is the WORST frame rather than the mean |
+| V4 | mean \|delta\| on luma / arm A's mean adjacent-frame MAD | `<= 0.10` | **the self-calibrating one** |
+| A1 | audio PSNR vs full scale | `>= 40 dB` | same convention as V2 |
+| A2 | audio Pearson r | `>= 0.999` | a waveform that has drifted in time fails this while PSNR can still look tolerable |
+
+**V4 is the bound that is derived rather than borrowed, so it carries the
+argument.** The denominator is the render's own frame-to-frame step: how much
+one frame differs from the next, in the same 8-bit luma units as the numerator.
+`0.10` therefore says *the two arms differ by less than a tenth of one frame of
+this video's own motion*. It needs no re-argument at another geometry or another
+prompt, because both terms move together — which is exactly what a constant
+cannot do, and why the FA-2 arm (#1551) can take this same criterion.
+
+**The scale is executable, not asserted.** Measured on the recorded 20260820
+baseline's own frames, and pinned in `tests/scripts/test_ltx25_render_compare.py`
+on synthetic fixtures so it is a gate rather than a claim:
+
+| perturbation of a real frame | mean \|d\| | PSNR | SSIM | V4 ratio | verdict |
+|---|---|---|---|---|---|
+| none | 0 | inf | 1.000000 | 0.000 | bit-identical |
+| +/-1 LSB on 3% of samples | 0.0199 | 65.1 dB | 0.99992 | 0.0026 | **PASS**, all four |
+| one pixel of global horizontal shift | 5.183 | 28.1 dB | 0.8705 | 0.624 | **FAIL**, all four |
+
+So the thresholds sit between a dither and a single pixel of motion, nearer the
+dither: V4 at `0.10` refuses anything above a sixth of a one-pixel global shift.
+A criterion that admitted the shift row would not be a criterion.
+
+### 10.5 Reading the result, stated before there is one
+
+- **All checks pass and the control is 0** — the swap changes the render by less
+  than a tenth of its own motion step, the difference is entirely the kernel's,
+  and the verdict is **within bf16 noise**. The measured values, with their
+  headroom, are then what belongs in the record.
+- **All checks pass and the control is comparable to the delta** — the verdict is
+  **indistinguishable from run-to-run nondeterminism**, which is stronger, and
+  the row additionally owes an issue for the nondeterminism itself, because a
+  render that is not reproducible is its own defect.
+- **Any check fails** — the verdict is **visibly different**, and that is a
+  finding about a change already on `main`, not a failure of this work. It owes
+  an issue naming what diverged and by how much, and it does not owe a widened
+  threshold. Widening a gate to admit a change is the failure this protocol
+  exists to prevent, and §9's stop conditions already say so for the numeric
+  gate.
+
+### 10.6 What this deliberately does not measure
+
+- **PPM is 8-bit.** The comparison is on the artefact the pipeline writes, which
+  is already quantised from the VAE's float output. A difference below `1/255`
+  relative is invisible to it. That is the right resolution for the question
+  "does it render the same video" and the wrong one for "how large is the
+  latent-space deviation"; the second is the host-vs-device case's job and it is
+  answered at the fixture's dimensions in §7.1.
+- **One prompt, one seed, one geometry.** A sampler is chaotic and one trajectory
+  is one trajectory. This bounds the swap on the trajectory production actually
+  ran and recorded, and it does not claim a bound over the prompt distribution.
+- **The 20260820 NAS baseline is a cross-check, never the control.** It was built
+  from `a50c57d69`, an ancestor of the swap, so it is a different binary lineage:
+  everything else that landed on `main` in between sits inside any delta measured
+  against it. It is compared anyway, because how far two naive renders drift
+  across builds bounds how much of the A/B delta could be something other than
+  the kernel — but the same-binary pair is the evidence and this is context.
 
 ## Owed
 
-- **There is NO numeric or pixel comparison at production geometry.** The swap
+- **There is NO numeric or pixel comparison at production geometry.**
+  **§10 is the design that discharges this, and it is committed before the
+  renders are taken.** The result lands in §10.7. Until it does, the statement
+  below is still the honest one. The swap
   is not bit-identical on CUDA (§5), and the only numeric gate that exists is the
   reduced-dimension host-vs-device case — `8.94e-08` / `4.47e-08` against `2e-5`
   — which bounds the ARITHMETIC change and not the change at head_dim 128 with
