@@ -70,7 +70,7 @@ constexpr int64_t kPadSlotId = -1;  // vLLM PAD_SLOT_ID (attention/backends/util
 // `vt::MoeMarlinArgs` already defaults to -- and the stats counter is
 // observational. What is left is the workspace-zero POLICY, which is the one
 // thing a CUDA run has to check; `.agents/specs/dflash2-spec-decode.md`
-// `## Owed` O27 names it as such.
+// `## Owed` O29 names it as such.
 //
 // Upstream reaches the same place and needs no branch, because its head is an
 // `nn.Module`: `compute_candidates` @ the MERGED vllm-project/vllm#52816 head
