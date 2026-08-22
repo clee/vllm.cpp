@@ -523,7 +523,7 @@ never a synonym for "probably fine".
 | A/B, same binary, both arms | `dgx:gpu0` under an `rc` lease | **PENDING** — the flash arm is measured at 7.680 s median (n=19); the worker was lost before the naive arm, so no pair exists (§7.1) |
 | pixel A/B at production geometry | `dgx:gpu0` under an `rc` lease, `scripts/ltx25-dit-attn-flash-pixel-ab.sh` | **PENDING** — criterion registered in §10.4; result in §10.7 |
 | run-to-run control (`flash` twice) | the same lease | **PENDING** — §10.3; without it no arm-to-arm delta is attributable to the kernel |
-| the comparison tool discriminates | `tests/scripts/test_ltx25_render_compare.py` | **PENDING until §10.7** — a dither passes and a one-pixel shift fails all four checks (§10.4) |
+| the comparison tool discriminates | `tests/scripts/test_ltx25_render_compare.py` | **PENDING until §10.7** — a dither passes, a one-pixel shift fails all four V checks, and two all-black renders fail C0 while reading as a perfect match on every V (§10.4) |
 | full preflight | `scripts/agent-preflight.sh` | **PASS at HEAD** — and it was NOT before: `documentation-checkpoint` was red on two of this branch's own commits (see below) |
 | `documentation-checkpoint` | CI, and locally over the branch range | **PASS at HEAD, RED before it, and the red was THIS BRANCH's** — `2aa78c69b` and `2f39a9426` each recorded a measurement in `.agents/benchmark-record.md` without writing `docs/STATUS.md` (and `docs/BENCHMARKS.md` for the second). The control on the main-only range `4c193bd55..5d548d003` is rc 0, so it was not inherited. Both commits were replaced by one that writes all three surfaces together when the branch was rebuilt, and the checker is re-run at each head rather than trusted to have stayed fixed — a job that has stopped appearing in a failing set is not the same fact as a job that passes |
 | `build-newest-gcc` | CI | **PASS, and now green on `main` too** — it was red on `main` on `::getpid` in `test_qwen3_dflash2_gguf.cpp:547`, a file this change does not touch; [#1581](https://github.com/mudler/vllm.cpp/pull/1581) fixed it and this branch carries that fix through the merge. A red here after the merge is therefore this row's, not inherited |
@@ -681,12 +681,25 @@ them by hand afterwards.
 
 | # | check | threshold | where it comes from |
 |---|---|---|---|
+| C0 | each arm, ON ITS OWN: frames written, no near-uniform frame, every frame hash distinct, no zero-motion pair | all four, per arm | **the hole every difference-only comparison has** |
 | V1 | mean \|delta\|, 8-bit RGB | `<= 1.0` level | one level is the quantisation step of the artefact itself; a mean below it says the average pixel is within the PPM's own resolution |
 | V2 | worst-frame PSNR | `>= 40 dB` | the video-coding "visually lossless" convention. This experiment did not choose it |
 | V3 | worst-frame SSIM | `>= 0.99` | Wang et al. 2004, 11x11 Gaussian sigma=1.5 on luma. 0.98 is the usual transparency line; this is stricter, and it is the WORST frame rather than the mean |
 | V4 | mean \|delta\| on luma / arm A's mean adjacent-frame MAD | `<= 0.10` | **the self-calibrating one** |
 | A1 | audio PSNR vs full scale | `>= 40 dB` | same convention as V2 |
 | A2 | audio Pearson r | `>= 0.999` | a waveform that has drifted in time fails this while PSNR can still look tolerable |
+
+**C0 is not a formality, and this criterion did not have it at first.** Every
+other line in the table is a DIFFERENCE, and a difference cannot tell two good
+renders from two identically broken ones. Two all-black renders differ by zero,
+score infinite PSNR and SSIM `1.000000`, and would read as the strongest
+possible pass this table can produce. A run that exited 0 having written frames
+that were all one colour has happened in this repository, so that is a recorded
+failure mode rather than a hypothesis. C0 is computed per arm before anything is
+subtracted, and it is checked first. `verify_render.py` makes the same checks,
+and they are recomputed inside `scripts/ltx25-render-compare.py` rather than
+shelled out to, because that file lives on a mutable path on a share and this
+one is committed per revision — the same reason §7.1 gives for the harness.
 
 **V4 is the bound that is derived rather than borrowed, so it carries the
 argument.** The denominator is the render's own frame-to-frame step: how much

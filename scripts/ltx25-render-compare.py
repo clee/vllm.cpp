@@ -186,6 +186,55 @@ def psnr_from_mse(mse: float, peak: float = 255.0) -> float:
     return 20.0 * math.log10(peak) - 10.0 * math.log10(mse)
 
 
+# --- what each arm rendered, on its own -------------------------------------
+def arm_content(d: str) -> dict:
+    """Absolute content of ONE arm, independent of the other.
+
+    THE HOLE THIS CLOSES. Every other measurement in this file is a DIFFERENCE,
+    and a difference cannot tell two good renders from two identically broken
+    ones. Two all-black renders differ by zero, score infinite PSNR and SSIM
+    1.0, and would read as the strongest possible pass. A run that exited 0
+    having written frames that were all one colour has happened in this
+    repository, so this is a recorded failure mode and not a hypothetical.
+
+    So each arm is also judged on its own: does it contain a picture, are the
+    frames distinct, and does anything move. These are the checks
+    `ltx25-fullmodel/job/verify_render.py` makes, computed here instead of
+    shelled out to, because that file lives on a mutable path on a share and
+    this one is committed per revision.
+    """
+    paths = frame_paths(d)
+    out: dict = {"dir": os.path.abspath(d), "frames": len(paths)}
+    if not paths:
+        out["verdict"] = "NO FRAMES"
+        return out
+    means, variances, hashes, adjacent = [], [], set(), []
+    prev = None
+    for p in paths:
+        a = read_ppm(p)
+        f = a.astype(np.float64)
+        means.append(float(f.mean()))
+        variances.append(float(f.var()))
+        hashes.add(sha256_file(p))
+        lu = luma(a)
+        if prev is not None:
+            adjacent.append(float(np.abs(lu - prev).mean()))
+        prev = lu
+    out["pixel_mean"] = float(np.mean(means))
+    out["per_frame_var_min"] = float(np.min(variances))
+    out["per_frame_mean_min"] = float(np.min(means))
+    out["per_frame_mean_max"] = float(np.max(means))
+    out["distinct_frame_hashes"] = len(hashes)
+    out["adjacent_frame_mad_mean"] = float(np.mean(adjacent)) if adjacent else 0.0
+    out["adjacent_frame_mad_min"] = float(np.min(adjacent)) if adjacent else 0.0
+    out["zero_motion_pairs"] = int(sum(1 for m in adjacent if m == 0.0))
+    # A frame whose variance is under this carries no picture. 1.0 in squared
+    # 8-bit levels is a standard deviation of one level: below that, every pixel
+    # in the frame is the same colour to within the artefact's own resolution.
+    out["near_uniform_frames"] = int(sum(1 for v in variances if v < 1.0))
+    return out
+
+
 # --- video --------------------------------------------------------------------
 def compare_video(dir_a: str, dir_b: str, label_a: str, label_b: str) -> dict:
     pa, pb = frame_paths(dir_a), frame_paths(dir_b)
@@ -350,6 +399,16 @@ def main() -> int:
                    "control": os.path.abspath(args.control) if args.control else None},
     }
 
+    # WHAT EACH ARM RENDERED, before anything is subtracted. Reported first
+    # because a difference of zero between two broken renders is the strongest
+    # possible pass on every other line in this report.
+    report["content"] = {
+        args.label_a: arm_content(args.a),
+        args.label_b: arm_content(args.b),
+    }
+    if args.control:
+        report["content"][args.label_control] = arm_content(args.control)
+
     v = compare_video(args.a, args.b, args.label_a, args.label_b)
     luma_delta = compare_video_luma_delta(args.a, args.b)
     v["mean_abs_luma"] = luma_delta
@@ -371,6 +430,28 @@ def main() -> int:
 
     # --- verdict --------------------------------------------------------------
     checks: list[tuple[str, bool, str]] = []
+    # C0 FIRST, and it is not a formality. Everything after this line is a
+    # DIFFERENCE, and every difference check passes vacuously when both arms are
+    # equally broken. An arm that rendered nothing, rendered one colour, or
+    # rendered the same frame 49 times fails HERE, where the failure is legible,
+    # rather than passing silently as a perfect match.
+    for label in (args.label_a, args.label_b):
+        c = report["content"][label]
+        if not c.get("frames"):
+            checks.append((f"content.{label}.frames", False, "no frames written"))
+            continue
+        checks.append((f"content.{label}.frames", True, f"{c['frames']} frames"))
+        checks.append((f"content.{label}.not_uniform",
+                       c["near_uniform_frames"] == 0,
+                       f"near-uniform frames {c['near_uniform_frames']} == 0 "
+                       f"(min per-frame variance {c['per_frame_var_min']:.3f})"))
+        checks.append((f"content.{label}.distinct_frames",
+                       c["distinct_frame_hashes"] == c["frames"],
+                       f"{c['distinct_frame_hashes']} distinct of {c['frames']}"))
+        checks.append((f"content.{label}.motion",
+                       c["zero_motion_pairs"] == 0 and c["adjacent_frame_mad_mean"] > 0.0,
+                       f"zero-motion pairs {c['zero_motion_pairs']}, "
+                       f"mean adjacent MAD {c['adjacent_frame_mad_mean']:.4f}"))
     if v["bit_identical"]:
         checks.append(("video.bit_identical", True, "every frame file sha256-equal"))
     else:
@@ -412,6 +493,16 @@ def main() -> int:
     report["verdict"] = "PASS" if ok else "FAIL"
 
     # --- print ----------------------------------------------------------------
+    print("=== what each arm rendered, before anything is subtracted ===")
+    for label, c in report["content"].items():
+        if not c.get("frames"):
+            print(f"{label:12s} NO FRAMES")
+            continue
+        print(f"{label:12s} frames={c['frames']} distinct={c['distinct_frame_hashes']} "
+              f"mean={c['pixel_mean']:.3f} min_var={c['per_frame_var_min']:.1f} "
+              f"near_uniform={c['near_uniform_frames']} "
+              f"adj_mad={c['adjacent_frame_mad_mean']:.4f} "
+              f"zero_motion_pairs={c['zero_motion_pairs']}")
     print(f"=== {args.label_a} vs {args.label_b} ===")
     print(f"frames                 {v['frames']}")
     print(f"bit-identical frames   {v['identical_frame_files']}/{v['frames']}")

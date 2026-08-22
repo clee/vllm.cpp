@@ -235,6 +235,80 @@ class Discrimination(unittest.TestCase):
         self.assertNotIn("control", " ".join(c["name"] for c in rep["checks"]))
 
 
+class IdenticallyBroken(unittest.TestCase):
+    """The hole every difference-only comparison has.
+
+    Two all-black renders differ by zero, score infinite PSNR and SSIM 1.0, and
+    would read as the strongest possible pass. A run that exited 0 having
+    written frames that were all one colour has happened in this repository, so
+    this is a recorded failure mode and not a hypothetical. Each arm is
+    therefore judged on its own content BEFORE anything is subtracted.
+    """
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def _flat(self, d: Path, value: int = 0) -> None:
+        d.mkdir(parents=True, exist_ok=True)
+        arr = np.full((H, W, 3), value, dtype=np.uint8)
+        for i in range(FRAMES):
+            write_ppm(d / f"frame_{i:06d}.ppm", arr)
+        t = np.arange(4800)
+        write_wav(d / "audio.wav", np.stack([8000 * np.sin(t / 20.0)] * 2, axis=1))
+
+    def test_two_all_black_renders_do_not_read_as_a_perfect_match(self) -> None:
+        a, b = self.root / "a", self.root / "b"
+        self._flat(a)
+        self._flat(b)
+        rc, out, rep = run("--a", str(a), "--b", str(b), "--label-a", "x", "--label-b", "y")
+        # The difference really is nothing, and the tool says so honestly.
+        self.assertTrue(rep["video"]["bit_identical"], out)
+        # And it still FAILS, because neither arm rendered a picture.
+        self.assertEqual(rc, EXIT_FAIL, out)
+        names = checks_of(rep)
+        self.assertFalse(names["content.x.not_uniform"], out)
+        self.assertFalse(names["content.y.not_uniform"], out)
+        self.assertFalse(names["content.x.motion"], out)
+        self.assertFalse(names["content.x.distinct_frames"], out)
+
+    def test_a_frozen_render_fails_on_motion_even_when_it_has_a_picture(self) -> None:
+        """Textured but identical frames: a picture with nothing moving. The
+        variance check passes and the motion check is what catches it, which is
+        why both exist."""
+        a = self.root / "a"
+        make_render(a, np.random.default_rng(11))
+        frozen = self.root / "frozen"
+        frozen.mkdir()
+        first = sorted(a.glob("frame_*.ppm"))[0].read_bytes()
+        for i in range(FRAMES):
+            (frozen / f"frame_{i:06d}.ppm").write_bytes(first)
+        (frozen / "audio.wav").write_bytes((a / "audio.wav").read_bytes())
+        rc, out, rep = run("--a", str(a), "--b", str(frozen),
+                           "--label-a", "good", "--label-b", "frozen")
+        self.assertEqual(rc, EXIT_FAIL, out)
+        names = checks_of(rep)
+        self.assertTrue(names["content.frozen.not_uniform"], out)
+        self.assertFalse(names["content.frozen.motion"], out)
+        self.assertFalse(names["content.frozen.distinct_frames"], out)
+        self.assertTrue(names["content.good.motion"], out)
+
+    def test_a_healthy_pair_passes_every_content_check(self) -> None:
+        a, b = self.root / "a", self.root / "b"
+        make_render(a, np.random.default_rng(13))
+        make_render(b, np.random.default_rng(13))
+        rc, out, rep = run("--a", str(a), "--b", str(b), "--label-a", "p", "--label-b", "q")
+        self.assertEqual(rc, EXIT_PASS, out)
+        names = checks_of(rep)
+        for label in ("p", "q"):
+            for check in ("frames", "not_uniform", "distinct_frames", "motion"):
+                self.assertTrue(names[f"content.{label}.{check}"],
+                                f"content.{label}.{check} failed on a healthy render: {out}")
+
+
 class Refusal(unittest.TestCase):
     def test_missing_directory_exits_two(self) -> None:
         with tempfile.TemporaryDirectory() as t:
