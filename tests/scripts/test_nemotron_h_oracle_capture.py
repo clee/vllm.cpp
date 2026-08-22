@@ -22,6 +22,7 @@ import contextlib
 import importlib.util
 import io
 import json
+import re
 import sys
 import tempfile
 import unittest
@@ -71,6 +72,35 @@ EXPECTED_ENGINE_KEYS = {
 # are the ones the rebuild differed on and are the reason the contract exists.
 KNOBS_926_NAMED = ("enforce_eager", "gpu_memory_utilization", "max_model_len")
 
+# The unattributed arm's own expectation, owned here for the same reason. The
+# attributed arm is gated by structure; this arm's whole record is prose, so
+# "present and truthy" gates the shape and not the substance -- a reviewer
+# replaced an 814-character `unrecoverable_reason` with the word "dunno",
+# emptied `evidence`, `forced_by_checkpoint_or_device` and `captured_utc_is`,
+# and every gate stayed green.
+EXPECTED_FORCED_TERM_KEYS = {"kv_cache_dtype", "moe_backend", "dtype", "quantization"}
+EXPECTED_EVIDENCE_KEYS = {"never_reproduced", "gate_form"}
+
+# The fields whose content is an ARGUMENT rather than a value, and the floor
+# they carry. The floor detects REMOVAL; it does not and cannot claim the prose
+# is true. 80 is owned here as a literal so that raising it in the checker to
+# hide a shrinking record is red, and lowering it to admit one is red too.
+EXPECTED_MIN_ARGUMENT_CHARS = 80
+EXPECTED_ARGUMENT_FIELDS = {
+    ("unrecoverable_reason",),
+    ("forced_by_checkpoint_or_device", "kv_cache_dtype"),
+    ("evidence", "never_reproduced"),
+    ("evidence", "gate_form"),
+}
+
+# Long enough to clear EXPECTED_MIN_ARGUMENT_CHARS without being a paraphrase of
+# the shipped golden's text. The fixture must not borrow the artifact's prose,
+# or a case that deletes the artifact's prose still passes.
+_ARGUMENT = (
+    "A sentence long enough to be an argument rather than a hand-wave, which is "
+    "the only property a length floor can honestly test for."
+)
+
 RESOLVED = {
     "attention_backend": "FLASHINFER",
     "block_size": 512,
@@ -93,6 +123,19 @@ RESOLVED = {
     "seed": 0,
     "tensor_parallel_size": 1,
 }
+
+
+def _cpp_string_list(source, name):
+    """The set of string literals in the C++ initializer list called `name`.
+
+    Parsed rather than grepped: two of the keys under test also appear in the
+    C++ engine-key list, so `assertIn('"dtype"', source)` would pass without the
+    unattributed arm naming it at all.
+    """
+    match = re.search(re.escape(name) + r"\s*=\s*\{(.*?)\};", source, re.S)
+    if match is None:
+        raise AssertionError(f"{CPP_CONSUMER.name} has no list called {name}")
+    return set(re.findall(r'"([^"]*)"', match.group(1)))
 
 
 def _entry(prompt, prompt_ids, tokens):
@@ -132,15 +175,39 @@ def attributed():
 
 
 def unattributed():
-    """A golden that does NOT record its configuration and SAYS so."""
+    """A golden that does NOT record its configuration and SAYS so.
+
+    A TEST-OWNED literal, deliberately. This fixture used to be built by
+    `capture.unattributed_capture()`, which made setup and expectation move
+    together: a key dropped from the checker's requirements was also dropped
+    from the fixture, so the case could not go red. That helper had no other
+    caller and is gone (#926); the shape lives here, where the suite owns it.
+    """
     doc = attributed()
-    doc["capture"] = capture.unattributed_capture(
-        reason="the capture host was reimaged and the driver was never committed",
-        issue="https://github.com/mudler/vllm.cpp/issues/926",
-        captured_utc="2026-08-12T22:37:57Z",
-        host="dgx.casa (GB10)",
-        generator="none -- af8170154 committed no generator",
-    )
+    doc["capture"] = {
+        "schema": 2,
+        "generator": "none -- af8170154 committed no generator",
+        "captured_utc": "2026-08-12T22:37:57Z",
+        "captured_utc_is": "the committing author date, not a recorded run time",
+        "host": "dgx.casa (GB10)",
+        "engine_config_recorded": False,
+        "unrecoverable_reason": _ARGUMENT,
+        "issue": "https://github.com/mudler/vllm.cpp/issues/926",
+        "engine": None,
+        "batch": None,
+        "legs": None,
+        "legs_agree": None,
+        "forced_by_checkpoint_or_device": {
+            "kv_cache_dtype": _ARGUMENT,
+            "moe_backend": "a backend the device forced",
+            "dtype": "a dtype the checkpoint forced",
+            "quantization": "a quantization the checkpoint forced",
+        },
+        "evidence": {
+            "never_reproduced": _ARGUMENT,
+            "gate_form": _ARGUMENT,
+        },
+    }
     return doc
 
 
@@ -175,6 +242,24 @@ class RequiredKeysTests(unittest.TestCase):
         for key in sorted(EXPECTED_ENGINE_KEYS):
             self.assertIn(f'"{key}"', source,
                           f"{CPP_CONSUMER.name} does not name '{key}'")
+
+    def test_the_cpp_consumer_names_every_unattributed_key(self) -> None:
+        # The same cross-gate as above, for the unattributed arm. A SUBSTRING
+        # grep would pass vacuously here -- "dtype" and "quantization" already
+        # appear in the C++ engine-key list -- so the two initializer lists are
+        # PARSED out of the source and compared as sets. The expectation is this
+        # suite's, so a key deleted from both production copies is still red.
+        source = CPP_CONSUMER.read_text(encoding="utf-8")
+        self.assertEqual(_cpp_string_list(source, "kForcedTermKeys"),
+                         EXPECTED_FORCED_TERM_KEYS)
+        self.assertEqual(_cpp_string_list(source, "kEvidenceKeys"),
+                         EXPECTED_EVIDENCE_KEYS)
+
+    def test_the_cpp_consumer_carries_the_same_argument_floor(self) -> None:
+        source = CPP_CONSUMER.read_text(encoding="utf-8")
+        match = re.search(r"kMinArgumentChars\s*=\s*(\d+)", source)
+        self.assertIsNotNone(match, "the C++ consumer names no argument floor")
+        self.assertEqual(int(match.group(1)), EXPECTED_MIN_ARGUMENT_CHARS)
 
     def test_the_prompt_battery_is_the_committed_one(self) -> None:
         shipped = json.loads(SHIPPED_GOLDEN.read_text(encoding="utf-8"))
@@ -280,6 +365,110 @@ class ContractTests(unittest.TestCase):
         doc = attributed()
         doc["capture"]["schema"] = 1
         self.assertTrue(capture.check_golden(doc))
+
+
+class UnattributedSubstanceTests(unittest.TestCase):
+    """The unattributed arm's record has to still BE there, not merely fit.
+
+    The reviewer's mutation that motivated every case below: gut `evidence`,
+    `forced_by_checkpoint_or_device` and `captured_utc_is`, and set
+    `unrecoverable_reason` to "dunno". The file keeps its shape, `--check` keeps
+    printing `engine_config_recorded=False`, and every argument the artifact
+    rests on is gone. That is silence wearing the shape of a record, which is
+    the state #926 filed.
+    """
+
+    def test_the_forced_term_keys_are_the_ones_this_suite_owns(self) -> None:
+        self.assertEqual(set(capture.REQUIRED_FORCED_TERM_KEYS),
+                         EXPECTED_FORCED_TERM_KEYS)
+
+    def test_the_evidence_keys_are_the_ones_this_suite_owns(self) -> None:
+        self.assertEqual(set(capture.REQUIRED_EVIDENCE_KEYS), EXPECTED_EVIDENCE_KEYS)
+
+    def test_the_argument_fields_and_their_floor_are_the_ones_this_suite_owns(self) -> None:
+        self.assertEqual({tuple(f) for f in capture.ARGUMENT_FIELDS},
+                         EXPECTED_ARGUMENT_FIELDS)
+        self.assertEqual(capture.MIN_ARGUMENT_CHARS, EXPECTED_MIN_ARGUMENT_CHARS)
+
+    def test_the_reviewers_gutting_mutation_is_refused(self) -> None:
+        # Mutation E, reproduced verbatim as a case so it can never go green
+        # again silently.
+        doc = unattributed()
+        doc["capture"]["unrecoverable_reason"] = "dunno"
+        doc["capture"]["captured_utc_is"] = ""
+        doc["capture"]["forced_by_checkpoint_or_device"] = {}
+        doc["capture"]["evidence"] = {}
+        problems = capture.check_golden(doc)
+        for named in ("unrecoverable_reason", "captured_utc_is",
+                      "forced_by_checkpoint_or_device", "evidence"):
+            self.assertTrue(any(named in p for p in problems),
+                            f"gutting '{named}' left the contract silent: {problems}")
+
+    def test_each_forced_term_is_load_bearing(self) -> None:
+        for key in sorted(EXPECTED_FORCED_TERM_KEYS):
+            doc = unattributed()
+            del doc["capture"]["forced_by_checkpoint_or_device"][key]
+            problems = capture.check_golden(doc)
+            self.assertTrue(any(key in p for p in problems),
+                            f"dropping '{key}' left the contract green: {problems}")
+
+    def test_each_evidence_key_is_load_bearing(self) -> None:
+        for key in sorted(EXPECTED_EVIDENCE_KEYS):
+            doc = unattributed()
+            del doc["capture"]["evidence"][key]
+            problems = capture.check_golden(doc)
+            self.assertTrue(any(key in p for p in problems),
+                            f"dropping '{key}' left the contract green: {problems}")
+
+    def test_a_missing_forced_block_is_refused(self) -> None:
+        doc = unattributed()
+        del doc["capture"]["forced_by_checkpoint_or_device"]
+        self.assertTrue(capture.check_golden(doc))
+
+    def test_a_missing_evidence_block_is_refused(self) -> None:
+        doc = unattributed()
+        del doc["capture"]["evidence"]
+        self.assertTrue(capture.check_golden(doc))
+
+    def test_a_missing_timestamp_gloss_is_refused(self) -> None:
+        # A commit's author date read as a capture time is a fabricated
+        # provenance, so the file has to say which one it is.
+        doc = unattributed()
+        del doc["capture"]["captured_utc_is"]
+        self.assertTrue(capture.check_golden(doc))
+
+    def test_each_argument_field_refuses_a_one_word_answer(self) -> None:
+        for path in sorted(EXPECTED_ARGUMENT_FIELDS):
+            doc = unattributed()
+            block = doc["capture"]
+            for step in path[:-1]:
+                block = block[step]
+            block[path[-1]] = "dunno"
+            problems = capture.check_golden(doc)
+            self.assertTrue(any(".".join(path) in p for p in problems),
+                            f"'{'.'.join(path)}' accepted one word: {problems}")
+
+    def test_the_floor_is_not_met_by_whitespace(self) -> None:
+        doc = unattributed()
+        doc["capture"]["evidence"]["gate_form"] = " " * 200
+        self.assertTrue(capture.check_golden(doc))
+
+    def test_an_argument_at_the_floor_is_accepted(self) -> None:
+        # The other side of the floor, so the case cannot pass by refusing
+        # everything. A gate that fires on ordinary work is the defect.
+        doc = unattributed()
+        doc["capture"]["evidence"]["gate_form"] = "x" * EXPECTED_MIN_ARGUMENT_CHARS
+        self.assertEqual(capture.check_golden(doc), [])
+
+    def test_the_attributed_arm_is_not_burdened_by_these_keys(self) -> None:
+        # `engine.resolved` already records kv_cache_dtype, dtype, quantization
+        # and moe_backend as VALUES, so an attributed golden owes no prose about
+        # them. Scoping matters: a requirement that fired on both arms would red
+        # every future capture this generator writes.
+        doc = attributed()
+        for key in ("captured_utc_is", "forced_by_checkpoint_or_device", "evidence"):
+            self.assertNotIn(key, doc["capture"])
+        self.assertEqual(capture.check_golden(doc), [])
 
 
 class CliTests(unittest.TestCase):

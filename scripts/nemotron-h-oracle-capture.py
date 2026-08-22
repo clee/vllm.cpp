@@ -154,6 +154,74 @@ NULLABLE_ENGINE_KEYS = frozenset({"num_gpu_blocks_override"})
 
 ISSUE_PREFIX = "https://github.com/mudler/vllm.cpp/issues/"
 
+# ── What an UNATTRIBUTED golden has to carry (#926) ─────────────────────────
+# The attributed arm is gated by STRUCTURE: `engine.resolved` either carries all
+# twenty keys or it does not, and a checker can answer that exactly. The
+# unattributed arm has no structure to gate, because its whole record IS prose —
+# and a contract that asks only whether the prose is TRUTHY gates the shape and
+# not the substance.
+#
+# That gap was demonstrated, not imagined. A reviewer gutted
+# `forced_by_checkpoint_or_device`, `evidence` and `captured_utc_is` and replaced
+# an 814-character `unrecoverable_reason` with the single word "dunno", and all
+# four gates stayed green while `--check` kept printing
+# `engine_config_recorded=False`. Every argument this artifact rests on — that
+# nothing has ever reproduced prompt 2, that `kv_cache_dtype` is a common term
+# rather than a candidate difference, that a distributional gate is inadmissible
+# — lived in ungated prose inside a data file. Silence wearing the shape of a
+# record is exactly what #926 filed, so the gap is closed here rather than noted.
+#
+# It is closed in the two ways a checker can actually answer, and in no way it
+# cannot.
+
+# 1. STRUCTURE. Present, an object, and every sub-key a non-empty string.
+#
+# `forced_by_checkpoint_or_device` names the terms that are COMMON to every
+# unoverridden run of this checkpoint on this class of device. It is what
+# NARROWS "unrecoverable" to the knobs a driver passes, so deleting an entry
+# widens the unrecoverable set without saying so.
+REQUIRED_FORCED_TERM_KEYS = ("kv_cache_dtype", "moe_backend", "dtype", "quantization")
+
+# `evidence` carries the two findings that decide how this golden may be USED:
+# whether anything has ever reproduced it, and which gate form its behaviour
+# licenses. `gate_form` is the one that refuses a distributional gate; a golden
+# that loses it loses the reason the refusal was on evidence rather than taste.
+REQUIRED_EVIDENCE_KEYS = ("never_reproduced", "gate_form")
+
+# 2. SUBSTANCE. A length floor, on the four fields whose content is an ARGUMENT
+# rather than a value.
+#
+# A floor cannot prove the prose is TRUE. Nothing in a checker can. A keyword
+# grep would be worse than useless here: it proves only the checker's own
+# vocabulary, and it reds an honest rewording. What a floor detects is REMOVAL,
+# which is the threat that was actually demonstrated — one word in place of a
+# paragraph.
+#
+# 80 is set from measurement rather than taste. In the shipped golden the four
+# floored fields are 814, 448, 702 and 293 characters, so the tightest margin is
+# 3.7x and no honest rewrite of an argument comes near it, while "dunno",
+# "unknown", "TBD" and "see the spec" are all under it. AGENTS.md's rule that a
+# gate firing on ordinary work is the defect is why the floor is set from the
+# SHORTEST real field and not from the longest.
+MIN_ARGUMENT_CHARS = 80
+
+# The floored fields, as paths under `capture`. `captured_utc_is` is required
+# and must be a non-empty string, but it is deliberately NOT floored: its job is
+# to say what the timestamp is, and that can honestly be said in a clause —
+# "af8170154's author date, not a run time" is 44 characters and is not a
+# hand-wave. Flooring it would be a gate that fires on ordinary work.
+ARGUMENT_FIELDS = (
+    ("unrecoverable_reason",),
+    ("forced_by_checkpoint_or_device", "kv_cache_dtype"),
+    ("evidence", "never_reproduced"),
+    ("evidence", "gate_form"),
+)
+
+
+def _is_prose(value):
+    """True when `value` is a string carrying something other than whitespace."""
+    return isinstance(value, str) and bool(value.strip())
+
 
 # ── The provenance contract ─────────────────────────────────────────────────
 
@@ -243,6 +311,48 @@ def check_golden(doc):
             problems.append(
                 "capture.engine_config_recorded is false but 'engine' is not "
                 "null: a configuration that is recorded is not unrecorded")
+
+        # ── The substance, not only the shape ───────────────────────────────
+        # Everything above this point is satisfied by a file that says
+        # "unrecorded", names an issue and argues NOTHING. That file passes as
+        # a record while being one, and it is the state #926 filed. What
+        # follows requires the record to still be there.
+        if not _is_prose(capture.get("captured_utc_is")):
+            problems.append(
+                "capture.captured_utc_is is empty: an unattributed golden's "
+                "timestamp is not a run time unless the file says what it is, "
+                "and a commit's author date read as a capture time is a "
+                "fabricated provenance")
+        for parent, keys in (("forced_by_checkpoint_or_device",
+                              REQUIRED_FORCED_TERM_KEYS),
+                             ("evidence", REQUIRED_EVIDENCE_KEYS)):
+            block = capture.get(parent)
+            if not isinstance(block, dict):
+                problems.append(
+                    f"capture.{parent}: must be an object on an unattributed "
+                    f"golden, got {type(block).__name__} -- an unrecoverable "
+                    "configuration is a claim, and a claim without its "
+                    "supporting record is the silence this contract refuses")
+                continue
+            for key in keys:
+                if not _is_prose(block.get(key)):
+                    problems.append(
+                        f"capture.{parent}['{key}'] is empty: it is named by "
+                        "this contract because deleting it removes an argument "
+                        "the golden's admissibility rests on")
+        for path in ARGUMENT_FIELDS:
+            value = capture
+            for step in path:
+                value = value.get(step) if isinstance(value, dict) else None
+            # Absence and emptiness are already reported above, so this arm
+            # only judges LENGTH and cannot report the same defect twice.
+            if _is_prose(value) and len(value.strip()) < MIN_ARGUMENT_CHARS:
+                problems.append(
+                    "capture.%s is %d characters, under the %d this contract "
+                    "requires of a field whose content is an ARGUMENT: a "
+                    "one-word answer here is the record going missing while "
+                    "the file keeps its shape" % (
+                        ".".join(path), len(value.strip()), MIN_ARGUMENT_CHARS))
         return problems
 
     engine = capture.get("engine")
@@ -282,24 +392,26 @@ def check_golden(doc):
     return problems
 
 
-def unattributed_capture(reason, issue, captured_utc, host, generator, notes=None):
-    """The provenance block for a golden whose configuration is NOT recorded."""
-    block = {
-        "schema": SCHEMA,
-        "generator": generator,
-        "captured_utc": captured_utc,
-        "host": host,
-        "engine_config_recorded": False,
-        "unrecoverable_reason": reason,
-        "issue": issue,
-        "engine": None,
-        "batch": None,
-        "legs": None,
-        "legs_agree": None,
-    }
-    if notes:
-        block["notes"] = notes
-    return block
+# There is deliberately NO builder for the unattributed provenance block here.
+#
+# One lived at this line and had exactly one caller: a fixture in
+# tests/scripts/test_nemotron_h_oracle_capture.py. `--capture` cannot reach it —
+# a capture that runs records its configuration, which is the whole point of the
+# mode — so no production path produced the shape it described, and the one
+# unattributed golden this repository has was written by hand and carried three
+# keys the builder could not emit. Under AGENTS.md's "Nothing lands dead" that
+# is a helper documenting a production shape nothing in production produces.
+#
+# Deleting it also repairs the fixture. This suite's own rule is that a fixture
+# must never be derived from the module under test, because setup and
+# expectation then move together and a key deleted from the checker deletes its
+# own test. The unattributed fixture was the one place that broke that rule. It
+# is a test-owned literal now, and the contract's requirements are proven key by
+# key by dropping each one from it.
+#
+# `--capture` builds the ATTRIBUTED block inline in main(), where the values it
+# needs are in scope; that block is reached, and check_golden() refuses it if it
+# is wrong.
 
 
 # ── The oracle side ─────────────────────────────────────────────────────────

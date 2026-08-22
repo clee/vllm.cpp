@@ -119,9 +119,13 @@ before `CacheConfig` is built:
 
 - `vllm/engine/arg_utils.py:1916` — `resolved_cache_dtype =
   resolve_kv_cache_dtype_string(self.kv_cache_dtype, model_config)`, whose
-  result is passed as `cache_dtype=` at `:1928`. This is the **unique** call
-  site that sets it; the other two occurrences of the symbol at the pin are the
-  import (`:115`) and a defensive comment (`attention.py:282`).
+  result is passed as `cache_dtype=` at `:1928`. `:1916` is the **unique call
+  site of `resolve_kv_cache_dtype_string`** — the symbol has exactly four
+  occurrences at the pin: this call, the import (`:115`), a defensive comment
+  (`attention.py:282`) and the definition (`torch_utils.py:374`). It is *not*
+  the unique place the string `cache_dtype` appears, which is 29 occurrences on
+  21 lines of `arg_utils.py`; the resolver is what is unique, and `:1928` is
+  where its result reaches `CacheConfig`.
 - `vllm/utils/torch_utils.py:374-392` — returns early unless `kv_cache_dtype ==
   "auto"`, then reads `hf_config.quantization_config`.
 - `vllm/utils/torch_utils.py:310-362` — for `quant_method` starting `modelopt`,
@@ -179,6 +183,58 @@ A null inside `resolved` is refused for every key but
 was default.** That is the same rule AGENTS.md states for `.env` — a missing
 value never becomes an assumption.
 
+The unattributed arm needs a **second** half, and the first round of this row
+shipped without it. Everything above is satisfied by a file that says
+"unrecorded", names an issue and argues **nothing**. The attributed arm is gated
+by structure — twenty keys are in `resolved` or they are not — but the
+unattributed arm's whole record is prose, and a contract that asks only whether
+the prose is *truthy* gates the shape and not the substance.
+
+The fresh review demonstrated it rather than predicting it: gut `evidence`,
+`forced_by_checkpoint_or_device` and `captured_utc_is`, put the single word
+`"dunno"` in `unrecoverable_reason`, and **all four gates stayed green** while
+`--check` kept printing `engine_config_recorded=False`. Every argument this
+artifact rests on — that nothing has ever reproduced prompt 2, that
+`kv_cache_dtype` is a common term rather than a candidate difference, that a
+distributional gate is inadmissible — lived in ungated prose inside a data file.
+That is silence wearing the shape of a record, which is the state #926 filed,
+reached from the other side.
+
+So an unattributed golden also carries, and the contract checks:
+
+| Requirement | Why it is named |
+|---|---|
+| `captured_utc_is`, non-empty | a commit's author date read as a capture time is a **fabricated** provenance |
+| `forced_by_checkpoint_or_device`, an object with `kv_cache_dtype`, `moe_backend`, `dtype`, `quantization`, each non-empty | these are the terms COMMON to every unoverridden run of this checkpoint. They are what **narrows** "unrecoverable" to the knobs a driver passes (§3), so deleting one widens the unrecoverable set without saying so |
+| `evidence`, an object with `never_reproduced` and `gate_form`, each non-empty | whether anything ever reproduced this golden, and which gate form its behaviour licenses. `gate_form` is the field that refuses a distributional gate; losing it loses the reason the refusal was on evidence rather than on taste |
+
+and four of those fields carry a **length floor of 80 characters**, because their
+content is an *argument* rather than a value: `unrecoverable_reason`,
+`forced_by_checkpoint_or_device.kv_cache_dtype`, `evidence.never_reproduced` and
+`evidence.gate_form`.
+
+**What the floor is, and what it is not.** It cannot prove the prose is *true* —
+nothing in a checker can. A keyword grep would be worse: it proves only the
+checker's own vocabulary and it reds an honest rewording. What a floor detects is
+**removal**, which is the threat that was actually demonstrated, one word in
+place of a paragraph. 80 is set from measurement rather than taste. In the
+shipped golden those four fields are 814, 448, 702 and 293 characters, so the
+tightest margin is **3.7x** and no honest rewrite of an argument approaches it,
+while `dunno`, `unknown`, `TBD` and `see the spec` are all under it. AGENTS.md's
+rule that a gate firing on ordinary work is the defect is why the floor is taken
+from the *shortest* real field and not from the longest.
+
+`captured_utc_is` is required but deliberately **not** floored. Its job is to say
+what the timestamp is, and that can honestly be said in a clause —
+"af8170154's author date, not a run time" is 44 characters and is not a
+hand-wave. Flooring it would be a gate that fires on ordinary work.
+
+The requirement is scoped to the **unattributed arm only**. An attributed golden
+records `kv_cache_dtype`, `dtype`, `quantization` and `moe_backend` in
+`engine.resolved` as *values*, so it owes no prose about them, and a requirement
+that fired on both arms would red every future capture this generator writes.
+`test_the_attributed_arm_is_not_burdened_by_these_keys` holds that scoping.
+
 The shipped golden is in the second state. It is **kept**, because deleting
 evidence to make a gate green is never the repair.
 
@@ -205,7 +261,19 @@ Four properties are deliberate:
 3. **`--capture` refuses to write** a golden that fails its own contract, or
    whose legs disagree. A golden written from disagreeing legs records a coin
    flip.
-4. **The body is under `if __name__ == "__main__":`** — vLLM v1 spawns
+4. **There is no builder for the unattributed block, deliberately.** One
+   existed and had exactly one caller: a fixture in the test suite. `--capture`
+   cannot reach it — a capture that runs records its configuration, which is the
+   mode's whole point — so no production path produced the shape it described,
+   and the one unattributed golden this repository has was hand-written and
+   carried three keys the builder could not emit. Under "Nothing lands dead"
+   that is a helper documenting a production shape nothing in production
+   produces, and it is gone. Deleting it also repaired the fixture: the suite's
+   own rule is that a fixture must never be derived from the module under test,
+   because setup and expectation then move together and a key dropped from the
+   checker drops from the fixture too. That fixture was the one place the suite
+   broke its own rule. It is a test-owned literal now.
+5. **The body is under `if __name__ == "__main__":`** — vLLM v1 spawns
    EngineCore, the module re-imports, and an unguarded driver fails as a
    `multiprocessing` traceback naming neither vLLM nor the caller. The tell is
    the banner printing twice.
@@ -333,6 +401,66 @@ and stops reading is the reader it is for.
 `char*` as a **bool**. The loop iterates `std::string` now, and the messages read
 `capture is missing 'schema'`.
 
+### The repair round — closing the SHAPE-not-SUBSTANCE gap
+
+The fresh review refuted nothing and returned findings. The substantive one is
+above: the contract gated the shape of the unattributed block and not its
+content. The re-run below is the proof that it no longer does.
+
+**Mutation E, re-applied verbatim** to the shipped golden: `unrecoverable_reason`
+→ `"dunno"`, `captured_utc_is` → `""`, `forced_by_checkpoint_or_device` → `{}`,
+`evidence` → `{}`. Applied alone, `json_parse_rc=0` (a mutation that does not
+parse reads as a passing test), `git diff --stat` **5 insertions, 13 deletions**
+so it demonstrably APPLIED, then restored and its sha256 re-asserted against the
+pre-mutation baseline
+`659c26bd2301317d4a6999df0b7afc3243dcff129de89abcb66b46817dd6f9e9`.
+
+| Gate | Before the repair | After |
+|---|---|---|
+| `--check` | 0 problems, **rc=0** | **8 problems, rc=1**, naming all four gutted fields |
+| the Python suite | 26/26 OK | **2 failures**, rc=1 |
+| the C++ consumer | 40 assertions, `SUCCESS!` | **38 assertions, 2 failed, `Status: FAILURE!`** |
+
+The C++ arm is the one that matters for the cross-gate: the guarantee is not
+held by one file. `Status:` is read as well as `assertions:`, because an
+`assertions:` line can say `0 failed` while cases threw.
+
+Green again on the restored tree: `--check` 0 problems, the suite **41 cases OK**
+(26 before this round, 13 new substance cases, 2 new cross-gate cases), and the
+C++ case **63 assertions** against the previous 40, `Status: SUCCESS!`.
+
+The new contract holds the **shipped golden byte-for-byte unchanged**. Its
+sha256 is the same value before this round and after it, and its diff against
+`af8170154` is still 24 insertions and **zero** deletions.
+
+### The three copies still cannot drift, including the new ones
+
+`test_the_cpp_consumer_names_every_unattributed_key` parses `kForcedTermKeys` and
+`kEvidenceKeys` out of the C++ source as initializer lists and compares them as
+sets, and `test_the_cpp_consumer_carries_the_same_argument_floor` reads
+`kMinArgumentChars` out of it. Parsed, not grepped, and the distinction is
+load-bearing: `"dtype"` and `"quantization"` already appear in the C++
+*engine-key* list, so `assertIn('"dtype"', source)` would have passed without the
+unattributed arm naming either of them. The expectation is the suite's own
+literal, so a key deleted from both production copies is still red.
+
+`test_each_forced_term_is_load_bearing` and `test_each_evidence_key_is_load_bearing`
+drop each key in turn and assert the contract names the one dropped, and
+`test_each_argument_field_refuses_a_one_word_answer` puts `"dunno"` in each
+floored field in turn. `test_an_argument_at_the_floor_is_accepted` is the other
+side of the floor, so the cases cannot pass by refusing everything.
+
+### The driver's third state named a cause it could not know
+
+`nemotron-h-gen` printed `(no capture block)` for `capture_recorded == -1`. The
+tri-state was right and the parenthetical was not: two different files reach that
+arm — a golden with no `capture` block at all, and a golden that HAS one whose
+`engine_config_recorded` flag is missing or unreadable, which is the file the
+reviewer actually fed it. The message now names both and asserts neither.
+Verified on all four inputs: `recorded=false` → UNRECORDED, `recorded=true` →
+RECORDED, no block → the tri-state line, block-with-flag-deleted → the same
+tri-state line.
+
 ### One red that is not this row's
 
 `scripts/agent-preflight.sh` reports `test_cpu_x86_llamacpp_floor` failing on
@@ -367,9 +495,12 @@ row's own files that is not). Every other preflight gate is green.
 
 ## 10. Now
 
-Landed: the generator, the contract, its three gates, the truthful provenance
-block, and the driver line. The golden's tokens are **byte-for-byte unchanged**
-— the diff against `af8170154` is 24 inserted lines and zero deletions.
+Landed: the generator, the contract in **both** its halves — the attributed
+arm's twenty keys and the unattributed arm's required, floored record — its
+three gates, the truthful provenance block, and the driver line. The golden's
+tokens are **byte-for-byte unchanged** — the diff against `af8170154` is 24
+inserted lines and zero deletions, and its sha256 is the same before and after
+the repair round.
 
 ## 11. Owed
 
@@ -403,3 +534,25 @@ Recorded because the code does not say it:
   actually missing.
 - **A distributional gate was available and was rejected**, on the evidence in
   §4 rather than on preference.
+- **The first round gated the SHAPE and not the SUBSTANCE, and only a mutation
+  found it.** Both gate arms read as symmetric — one requires twenty keys, the
+  other requires a reason and an issue — and both were green on the shipped
+  artifact, so nothing in the diff looked wrong. What made the asymmetry visible
+  was gutting the block and watching four gates stay green. The rule this leaves
+  behind: **where a record is prose rather than structure, a truthiness check is
+  not a gate.** It admits the exact artifact the row exists to refuse, and it
+  admits it silently.
+- **A length floor was chosen over a keyword grep, and the choice is a
+  limitation, not a feature.** The floor cannot see whether the prose is true; it
+  sees only that somebody removed it. That is a genuinely weaker guarantee than
+  the attributed arm's, and it is recorded as weaker rather than described as
+  equivalent. The alternative — asserting the text contains "distributional" or
+  "reimaged" — would gate the checker's own vocabulary and would red an honest
+  rewrite, which is the failure mode AGENTS.md names when it says a gate that
+  fires on ordinary work is the defect.
+- **A helper with one caller, and that caller a test, is dead code even in a
+  script.** `unattributed_capture()` looked like production structure. It could
+  not emit three of the keys the artifact it described actually carries, and
+  `--capture` could never reach it. Deleting it removed a fourth copy of the
+  contract that could drift and repaired a fixture that was deriving its setup
+  from the module under test.

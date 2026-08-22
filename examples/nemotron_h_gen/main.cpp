@@ -297,9 +297,16 @@ int main(int argc, char** argv) {
                    gold.capture_issue.empty() ? "" : "; owed by ",
                    gold.capture_issue.c_str());
     } else {
+      // Two different files reach this arm and the message must not name
+      // either: a golden with NO `capture` block at all (the af8170154 shape),
+      // and a golden that HAS one whose `engine_config_recorded` flag is
+      // missing or unreadable. The tri-state is what separates them from
+      // "unrecorded"; it does not separate them from each other, and a
+      // parenthetical that picked one was wrong for the other.
       std::fprintf(stderr,
                    "             capture: the golden does not SAY whether its "
-                   "engine configuration was recorded (no capture block)\n");
+                   "engine configuration was recorded (no `capture` block, or "
+                   "one with no readable `engine_config_recorded` flag)\n");
     }
     if (gold.entries.empty()) {
       std::fprintf(stderr,

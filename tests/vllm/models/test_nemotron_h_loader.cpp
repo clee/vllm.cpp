@@ -226,6 +226,91 @@ TEST_CASE("NemotronH golden: the reference says whether it can be regenerated") 
     // "unrecorded" and "here is the record" cannot both be true.
     REQUIRE(capture.contains("engine"));
     CHECK(capture["engine"].is_null());
+
+    // ── The substance, not only the shape ──────────────────────────────────
+    // Everything above is satisfied by a file that says "unrecorded", names an
+    // issue and argues NOTHING. The attributed arm below is gated by STRUCTURE
+    // -- twenty keys are there or they are not -- but this arm's whole record
+    // is prose, and a check that asks only whether the prose is non-empty gates
+    // the shape and not the substance. Gut `evidence`,
+    // `forced_by_checkpoint_or_device` and `captured_utc_is`, put the word
+    // "dunno" in `unrecoverable_reason`, and the file still passes as a record
+    // while being one. That is the state #926 filed, reached from the other
+    // side.
+    //
+    // `forced_by_checkpoint_or_device` names the terms COMMON to every
+    // unoverridden run of this checkpoint, which is what narrows
+    // "unrecoverable" to the knobs a driver passes. `evidence` carries whether
+    // anything ever reproduced this golden and which gate form its behaviour
+    // licenses. The floor below detects REMOVAL of an argument; it does not and
+    // cannot claim the prose is true, and it is set from the shortest real
+    // field so that an honest rewording does not red it.
+    //
+    // Mirrored from REQUIRED_FORCED_TERM_KEYS, REQUIRED_EVIDENCE_KEYS and
+    // MIN_ARGUMENT_CHARS in scripts/nemotron-h-oracle-capture.py;
+    // tests/scripts/test_nemotron_h_oracle_capture.py parses these very lists
+    // out of this file and refuses to let the copies drift.
+    const size_t kMinArgumentChars = 80;
+    const std::vector<std::string> kForcedTermKeys = {
+        "kv_cache_dtype", "moe_backend", "dtype", "quantization"};
+    const std::vector<std::string> kEvidenceKeys = {"never_reproduced",
+                                                    "gate_form"};
+
+    REQUIRE_MESSAGE(capture.contains("captured_utc_is"),
+                    "capture is missing 'captured_utc_is': a commit's author "
+                    "date read as a capture time is a fabricated provenance, so "
+                    "the file has to say which one this is");
+    CHECK(!capture["captured_utc_is"].get<std::string>().empty());
+
+    for (const auto& block : {std::make_pair(std::string("forced_by_checkpoint_or_device"),
+                                             kForcedTermKeys),
+                              std::make_pair(std::string("evidence"), kEvidenceKeys)}) {
+      REQUIRE_MESSAGE(capture.contains(block.first),
+                      "capture is missing '" << block.first
+                                             << "': an unrecoverable "
+                                                "configuration is a claim, and "
+                                                "a claim without its supporting "
+                                                "record is silence");
+      REQUIRE(capture[block.first].is_object());
+      for (const std::string& key : block.second) {
+        REQUIRE_MESSAGE(capture[block.first].contains(key),
+                        "capture." << block.first << " is missing '" << key
+                                   << "', so an argument this golden's "
+                                      "admissibility rests on is gone");
+        CHECK_MESSAGE(!capture[block.first][key].get<std::string>().empty(),
+                      "capture." << block.first << "['" << key << "'] is empty");
+      }
+    }
+
+    // The four fields whose content is an ARGUMENT rather than a value.
+    for (const std::vector<std::string>& path :
+         std::vector<std::vector<std::string>>{
+             {"unrecoverable_reason"},
+             {"forced_by_checkpoint_or_device", "kv_cache_dtype"},
+             {"evidence", "never_reproduced"},
+             {"evidence", "gate_form"}}) {
+      const nlohmann::json* node = &capture;
+      bool reachable = true;
+      std::string dotted;
+      for (const std::string& step : path) {
+        dotted += (dotted.empty() ? "" : ".") + step;
+        if (!node->is_object() || !node->contains(step)) {
+          reachable = false;
+          break;
+        }
+        node = &(*node)[step];
+      }
+      REQUIRE_MESSAGE(reachable, "capture." << dotted << " is absent");
+      REQUIRE_MESSAGE(node->is_string(), "capture." << dotted << " is not prose");
+      CHECK_MESSAGE(node->get<std::string>().size() >= kMinArgumentChars,
+                    "capture." << dotted << " is "
+                               << node->get<std::string>().size()
+                               << " characters, under the " << kMinArgumentChars
+                               << " an ARGUMENT needs: a one-word answer here is "
+                                  "the record going missing while the file keeps "
+                                  "its shape");
+    }
+
     MESSAGE(
         "UNATTRIBUTED GOLDEN: this reference records no engine configuration, "
         "so a token difference against it is not yet a defect. Owed by "
