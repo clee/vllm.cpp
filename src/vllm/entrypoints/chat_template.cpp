@@ -17,6 +17,7 @@
 #include <exception>
 #include <fstream>
 #include <iomanip>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <utility>
@@ -110,7 +111,7 @@ std::string apply_chat_template(
     const std::vector<openai::ChatMessage>& messages, bool add_generation_prompt,
     const std::string& bos_token, const std::string& eos_token,
     const std::vector<openai::ChatCompletionToolsParam>& tools,
-    bool enable_thinking) {
+    const nlohmann::ordered_json& chat_template_kwargs) {
   try {
     std::shared_ptr<minja::TemplateNode> root = minja::Parser::parse(
         template_str, minja::Options{/*trim_blocks=*/true,
@@ -120,14 +121,27 @@ std::string apply_chat_template(
     nlohmann::ordered_json top = nlohmann::ordered_json::object();
     top["messages"] = BuildMessages(messages);
     top["add_generation_prompt"] = add_generation_prompt;
-    // vLLM/HF: enable_thinking controls Gemma4 CoT channel (default false).
-    top["enable_thinking"] = enable_thinking;
     std::shared_ptr<minja::Context> context =
         minja::Context::make(minja::Value(top));
     context->set("bos_token", minja::Value(bos_token));
     context->set("eos_token", minja::Value(eos_token));
-    context->set("enable_thinking", minja::Value(enable_thinking));
     context->set("tools", minja::Value(BuildTools(tools)));
+    // The caller's chat_template_kwargs, and ONLY those. A key nobody supplied
+    // is left unbound, so `{% if enable_thinking is undefined %}` sees what
+    // transformers shows it (vllm/renderers/hf.py:731-734 forwards the resolved
+    // kwargs and nothing else). Binding `enable_thinking` unconditionally --
+    // which this function used to do -- makes that test permanently false and
+    // silently flips a model's own reasoning default (#1681).
+    if (chat_template_kwargs.is_object()) {
+      for (auto it = chat_template_kwargs.begin();
+           it != chat_template_kwargs.end(); ++it) {
+        // Upstream refuses these two rather than binding them: both are
+        // apply_chat_template's own parameters, not template variables
+        // (resolve_chat_template_kwargs, hf.py:640-650).
+        if (it.key() == "chat_template" || it.key() == "tokenize") continue;
+        context->set(it.key(), minja::Value(it.value()));
+      }
+    }
     const auto now = std::chrono::system_clock::now();
     context->set(
         "strftime_now",
@@ -156,18 +170,36 @@ std::string apply_chat_template(
   }
 }
 
-openai::ChatPromptFn MakeChatTemplatePromptFn(std::string template_str,
-                                              std::string bos_token,
-                                              std::string eos_token,
-                                              bool enable_thinking) {
+openai::ChatPromptFn MakeChatTemplatePromptFn(
+    std::string template_str, std::string bos_token, std::string eos_token,
+    nlohmann::ordered_json default_chat_template_kwargs) {
   return [tmpl = std::move(template_str), bos = std::move(bos_token),
-          eos = std::move(eos_token), enable_thinking](
+          eos = std::move(eos_token),
+          defaults = std::move(default_chat_template_kwargs)](
              const std::vector<openai::ChatMessage>& messages,
              bool add_generation_prompt,
-             const std::vector<openai::ChatCompletionToolsParam>& tools) {
+             const std::vector<openai::ChatCompletionToolsParam>& tools,
+             const nlohmann::ordered_json& request_kwargs) {
+    // merge_kwargs (multimodal/media/base.py:53-67, reached from
+    // chat_completion/protocol.py:552-556): a shallow merge in which the
+    // request's keys win over the server defaults.
+    nlohmann::ordered_json merged =
+        defaults.is_object() ? defaults : nlohmann::ordered_json::object();
+    if (request_kwargs.is_object()) {
+      for (auto it = request_kwargs.begin(); it != request_kwargs.end(); ++it) {
+        merged[it.key()] = it.value();
+      }
+    }
     return apply_chat_template(tmpl, messages, add_generation_prompt, bos, eos,
-                               tools, enable_thinking);
+                               tools, merged);
   };
+}
+
+nlohmann::ordered_json DefaultChatTemplateKwargs(
+    std::optional<bool> enable_thinking) {
+  nlohmann::ordered_json kwargs = nlohmann::ordered_json::object();
+  if (enable_thinking.has_value()) kwargs["enable_thinking"] = *enable_thinking;
+  return kwargs;
 }
 
 std::string LoadChatTemplateFromConfig(

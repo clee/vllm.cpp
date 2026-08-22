@@ -69,6 +69,25 @@ The server also supports OpenAI clients that use
 `http://localhost:8000/v1` as their base URL. The model-specific guides record
 extra files and launch flags when a model needs them.
 
+`/v1/chat/completions` renders the checkpoint's own chat template, and it takes
+`chat_template_kwargs` for the extra Jinja variables a template gates on, the
+same field and the same name vLLM uses:
+
+```sh
+curl http://localhost:8000/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"model","messages":[{"role":"user","content":"hi"}],
+       "chat_template_kwargs":{"enable_thinking":false}}'
+```
+
+A key you do not send is not a template variable at all, so a template asking
+`{% if enable_thinking is undefined %}` gets its own default: the Qwen3.8 family
+reasons unless you turn it off. `--enable-thinking` and `--no-enable-thinking`
+set the server-wide default, and a request's own keys win over them. Passing
+neither flag is not the same as `--no-enable-thinking`; it leaves the variable
+unset, which is what vLLM does. [Server reference](reference/server.md) carries
+the endpoint and flag tables.
+
 `--model` also takes a Hugging Face repository name, which the server fetches
 into the cache before it binds:
 

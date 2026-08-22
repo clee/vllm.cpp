@@ -848,7 +848,16 @@ ApiServer::DispatchResult ApiServer::handle_tokenize(
                          "tokenize: the chat form needs the chat template of a "
                          "text-generation server (transcription-only server)");
       }
-      prompt = chat_->prompt_fn()(messages, render_generation_prompt, tools);
+      // chat_template_kwargs: the tokenize chat form carries it too
+      // (serve/tokenize/protocol.py:97,138), and it must render through the
+      // same kwargs create_chat_completion would use or the two disagree.
+      nlohmann::ordered_json template_kwargs = nlohmann::ordered_json::object();
+      if (auto it = body.find("chat_template_kwargs");
+          it != body.end() && it->is_object()) {
+        template_kwargs = nlohmann::ordered_json::parse(it->dump());
+      }
+      prompt = chat_->prompt_fn()(messages, render_generation_prompt, tools,
+                                  template_kwargs);
     } catch (const std::exception& e) {
       return MakeError(400, "BadRequestError",
                        std::string("Chat template render failed: ") + e.what());

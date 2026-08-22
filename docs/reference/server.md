@@ -75,6 +75,26 @@ pending. See the
 [owning model specification](../../.agents/specs/indextts-2-5.md) for the owned
 limitations and verification evidence.
 
+`/v1/chat/completions` accepts `chat_template_kwargs`, an object of extra Jinja
+variables handed to the model's chat template, exactly as vLLM does. It is how a
+client selects a reasoning mode on a template that gates one:
+
+```sh
+curl -sS -X POST http://127.0.0.1:8000/v1/chat/completions \
+  -H 'Content-Type: application/json' -d '{
+    "model": "qwen38-27b",
+    "messages": [{"role": "user", "content": "hi"}],
+    "chat_template_kwargs": {"enable_thinking": false}
+  }'
+```
+
+The request keys win over anything `--enable-thinking` / `--no-enable-thinking`
+set at startup. **A key nobody supplies is not a template variable at all**, so
+`{% if enable_thinking is undefined %}` answers true and the model's own default
+applies; that is what vLLM does and what the Qwen3.8 family's template expects.
+`/tokenize`'s chat form accepts the same field and renders through the same
+template, so its token ids match what `/v1/chat/completions` would send.
+
 `prompt_logprobs` is accepted on `/v1/completions` and `/v1/chat/completions`
 and the engine computes it, every prompt position is scored against the token
 that followed it, accumulated across chunked prefill, but the **response body
@@ -171,7 +191,7 @@ a stop token early.
 | `--enable-log-outputs` | off | Also log the generated output, not just the request |
 | `--max-log-len N` | `256` | Truncate logged prompts and outputs to N characters |
 | `--enable-metrics` / `--disable-metrics` | on | Serve the metrics endpoint |
-| `--enable-thinking` / `--no-enable-thinking` | off | Set the `enable_thinking` chat-template variable for templates that gate a reasoning block on it (Gemma-4 and friends). Our spelling of vLLM's `--default-chat-template-kwargs enable_thinking` |
+| `--enable-thinking` / `--no-enable-thinking` | neither | Set the `enable_thinking` chat-template variable for templates that gate a reasoning block on it. Our spelling of vLLM's `--default-chat-template-kwargs enable_thinking`, whose default is also to set nothing. **Passing neither is not the same as `--no-enable-thinking`:** it leaves the variable UNSET, so a template asking `{% if enable_thinking is undefined %}` gets its own default (the Qwen3.8 family reasons; Gemma-4 does not). `--no-enable-thinking` forces it off for every request |
 | `--verbose`, `-v` | off | Verbose server logging |
 | `--cuda-profile-graph-replays N` | `0` (off) | Trace-only diagnostic: arm the CUDA-graph-replay profiler and stop after N replays, printing a pid to signal with `SIGUSR2`. Requires a build with `VT_BENCH_PROFILE_CONTROL` |
 | `--cuda-profile-graph-batch N` | `16` when replays are armed | Batch size the profiler traces. Must not exceed `--max-num-seqs` |

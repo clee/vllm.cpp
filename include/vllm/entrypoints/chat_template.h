@@ -33,9 +33,12 @@
 #ifndef VLLM_ENTRYPOINTS_CHAT_TEMPLATE_H_
 #define VLLM_ENTRYPOINTS_CHAT_TEMPLATE_H_
 
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <vector>
+
+#include <nlohmann/json.hpp>
 
 #include "vllm/entrypoints/openai/protocol.h"
 #include "vllm/entrypoints/openai/serving_chat.h"
@@ -63,22 +66,46 @@ class ChatTemplateError : public std::runtime_error {
 //                         branch. Empty => the `tools` variable is an empty list
 //                         (falsy). The `tojson` filter is a minja builtin.
 // Throws ChatTemplateError on any parse or evaluation error.
-// chat_template_kwargs: optional Jinja variables (vLLM
-// --default-chat-template-kwargs). Supported keys today: enable_thinking (bool).
+//
+// chat_template_kwargs: the extra Jinja variables the caller supplied, from the
+// request's `chat_template_kwargs` merged over the server default (upstream
+// `--default-chat-template-kwargs`, itself defaulting to none). Each key becomes
+// a template variable; **a key that is absent stays Jinja-UNDEFINED**, which is
+// what upstream does (vllm/renderers/hf.py:633-661 passes only the resolved
+// keys) and what a template asking `{% if enable_thinking is undefined %}`
+// needs. Defining every known name unconditionally would make `is undefined`
+// permanently false and silently invert the model's own default (#1681).
+// `chat_template` and `tokenize` are skipped: upstream refuses them
+// (hf.py:640-650) because both are the renderer's own parameters, not template
+// variables.
 std::string apply_chat_template(
     const std::string& template_str,
     const std::vector<openai::ChatMessage>& messages, bool add_generation_prompt,
     const std::string& bos_token = "", const std::string& eos_token = "",
     const std::vector<openai::ChatCompletionToolsParam>& tools = {},
-    bool enable_thinking = false);
+    const nlohmann::ordered_json& chat_template_kwargs =
+        nlohmann::ordered_json::object());
 
 // Adapt a chat template to Task 2's ChatPromptFn seam (serving_chat.h).
-// enable_thinking defaults false for agent/Hermes latency (Gemma4 empty thought
-// block when false — HF/vLLM recipe parity).
-openai::ChatPromptFn MakeChatTemplatePromptFn(std::string template_str,
-                                              std::string bos_token = "",
-                                              std::string eos_token = "",
-                                              bool enable_thinking = false);
+// `default_chat_template_kwargs` is the SERVER-level default (our
+// `--enable-thinking` / `--no-enable-thinking` write `enable_thinking` into it;
+// neither flag leaves it empty). The per-request kwargs the seam hands the
+// returned function are merged OVER it, mirroring upstream's merge_kwargs
+// precedence (vllm/entrypoints/openai/chat_completion/protocol.py:552-556).
+openai::ChatPromptFn MakeChatTemplatePromptFn(
+    std::string template_str, std::string bos_token = "",
+    std::string eos_token = "",
+    nlohmann::ordered_json default_chat_template_kwargs =
+        nlohmann::ordered_json::object());
+
+// The RULE behind `--enable-thinking` / `--no-enable-thinking`, lifted out of
+// server_main so it can be driven from a gate: neither flag (nullopt) yields an
+// EMPTY object, which is upstream's `--default-chat-template-kwargs` default
+// (`None`, cli_args.py:93) and leaves `enable_thinking` Jinja-undefined. Either
+// flag yields `{"enable_thinking": <bool>}`. The difference between "unset" and
+// "explicitly false" is the whole point and is invisible to a bool (#1681).
+nlohmann::ordered_json DefaultChatTemplateKwargs(
+    std::optional<bool> enable_thinking);
 
 // Load the `chat_template` string out of a tokenizer_config.json file. Handles
 // both the plain-string form and the list-of-{name,template} form (picks the

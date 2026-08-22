@@ -262,7 +262,8 @@ vllm_engine* MakeSyntheticChatEngine(EngineParams p) {
       [](const std::vector<vllm::entrypoints::openai::ChatMessage>& messages,
          bool /*add_generation_prompt*/,
          const std::vector<
-             vllm::entrypoints::openai::ChatCompletionToolsParam>& /*tools*/) {
+             vllm::entrypoints::openai::ChatCompletionToolsParam>& /*tools*/,
+         const nlohmann::ordered_json& /*chat_template_kwargs*/) {
         std::string p;
         for (const auto& m : messages)
           if (m.content.has_value()) p += *m.content;

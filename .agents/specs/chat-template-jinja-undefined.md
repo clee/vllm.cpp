@@ -303,7 +303,13 @@ repo-wide `windows-msvc-*` red of
   that gains autoescape must revisit it.
 - **The fixture is a copy of a published file.** It can drift from the
   checkpoint. It is pinned by repo and revision in the test's header comment and
-  in section 2a.
+  in section 2a, and by content here: `tests/fixtures/qwen38_chat_template.jinja`
+  is 8,952 bytes, sha256
+  `c3cf9e34abf4f9e36c2d72165aa9c132d3e2a725b6c2586aaa3a8af9d7a81041`, which is
+  the `chat_template` value of `tokenizer_config.json` AND the whole of
+  `chat_template.jinja` at `r0b0tlab/Qwen3.8-27B-NVFP4-MTP-sm121` @
+  `36f717a22990e82c54c1d48ee77c491b87825680` -- the two are byte-identical, which
+  is also what rules out the standalone-file discovery path as the cause.
 
 ---
 

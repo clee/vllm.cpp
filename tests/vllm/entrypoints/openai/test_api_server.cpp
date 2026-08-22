@@ -27,6 +27,7 @@
 #include <fstream>
 #include <functional>
 #include <memory>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -59,6 +60,7 @@
 #include "vllm/config/device.h"
 #include "vllm/config/scheduler.h"
 #include "vllm/config/multimodal.h"
+#include "vllm/entrypoints/chat_template.h"
 #include "vllm/entrypoints/model_loader.h"
 #include "vllm/entrypoints/openai/chat_mm.h"
 #include "vllm/entrypoints/openai/serving_chat.h"
@@ -445,7 +447,8 @@ const Tokenizer& Fixture() {
 // In-vocab chat prompt seam (the fixture vocab is ids 0..21).
 std::string InVocabChatPrompt(
     const std::vector<ChatMessage>& messages, bool,
-    const std::vector<vllm::entrypoints::openai::ChatCompletionToolsParam>&) {
+    const std::vector<vllm::entrypoints::openai::ChatCompletionToolsParam>&,
+    const nlohmann::ordered_json&) {
   std::string p;
   for (const ChatMessage& m : messages)
     if (m.content.has_value()) p += *m.content;
@@ -458,7 +461,9 @@ struct ServerHarness {
                 const Tokenizer& tok,
                 bool enable_force_include_usage = false,
                 size_t max_concurrent_streams =
-                    ApiServer::kDefaultMaxConcurrentStreams)
+                    ApiServer::kDefaultMaxConcurrentStreams,
+                vllm::entrypoints::openai::ChatPromptFn chat_prompt =
+                    InVocabChatPrompt)
       : scheduler(MakeSchedulerConfig(), MakeKvConfig(c), kBlockSize,
                   /*enable_caching=*/true),
         runner(c, w, MakeKvConfig(c), Q(), 8, kMaxModelLen, kMaxModelLen * 8),
@@ -469,7 +474,7 @@ struct ServerHarness {
                      Hasher()),
         models("test-model"),
         completion(async_engine, "test-model", enable_force_include_usage),
-        chat(async_engine, "test-model", InVocabChatPrompt, "hermes",
+        chat(async_engine, "test-model", std::move(chat_prompt), "hermes",
              /*reasoning_parser_name=*/std::string(), enable_force_include_usage),
         server(completion, chat, models, "9.9.9", max_concurrent_streams) {}
 
@@ -767,6 +772,161 @@ TEST_CASE("api_server: chat dispatch → assistant message") {
   json j = json::parse(r.body);
   CHECK(j.at("object") == "chat.completion");
   CHECK(j.at("choices").at(0).at("message").at("role") == "assistant");
+}
+
+// ─── #1681 — the REAL published Qwen3.8 chat template through the PRODUCTION
+// /v1/chat/completions dispatch ──────────────────────────────────────────────
+//
+// tests/fixtures/qwen38_chat_template.jinja is the `chat_template` value of
+// r0b0tlab/Qwen3.8-27B-NVFP4-MTP-sm121 @
+// 36f717a22990e82c54c1d48ee77c491b87825680 (tokenizer_config.json; byte
+// identical to that revision's chat_template.jinja). It gates on
+//   {%- if enable_thinking is undefined or enable_thinking is true %}
+// and `undefined` is a Jinja2 built-in test the vendored minja engine did not
+// implement, so every chat request against the whole family answered HTTP 500.
+//
+// The ENTRY POINT is the point. A unit test on the renderer would have missed
+// this the same way every gate in this tree did: the only client that drives
+// them is `vllm-cli`, which renders no chat template at all. So the render runs
+// inside ApiServer::handle_chat_completions, through the same production
+// MakeChatTemplatePromptFn that server_main.cpp installs.
+//
+// ONE adaptation, named rather than hidden: the synthetic engine behind the
+// dispatch carries a 22-token fixture vocabulary that cannot encode Qwen text,
+// so the prompt function records the rendered prompt and hands the ENGINE an
+// in-vocabulary string. The render, its failure mode and the HTTP status are
+// all production.
+namespace {
+
+std::string ReadTestFixture(const std::string& name) {
+  const std::string path = std::string(VLLM_TEST_FIXTURES_DIR) + "/" + name;
+  std::ifstream f(path, std::ios::binary);
+  REQUIRE_MESSAGE(f.good(), "missing test fixture: " << path);
+  std::ostringstream ss;
+  ss << f.rdbuf();
+  return ss.str();
+}
+
+// The production renderer, wrapped so the captured prompt is readable and the
+// engine still gets something its 22-token vocabulary can encode.
+struct CapturingTemplatePrompt {
+  std::shared_ptr<std::string> rendered = std::make_shared<std::string>();
+  vllm::entrypoints::openai::ChatPromptFn fn;
+
+  explicit CapturingTemplatePrompt(const std::string& template_str)
+      : fn([inner = vllm::entrypoints::MakeChatTemplatePromptFn(
+                template_str, /*bos_token=*/"", /*eos_token=*/"<|im_end|>"),
+            out = rendered](
+               const std::vector<ChatMessage>& messages,
+               bool add_generation_prompt,
+               const std::vector<
+                   vllm::entrypoints::openai::ChatCompletionToolsParam>& tools,
+               const nlohmann::ordered_json& chat_template_kwargs) {
+          *out = inner(messages, add_generation_prompt, tools,
+                       chat_template_kwargs);
+          return std::string("hello");
+        }) {}
+};
+
+}  // namespace
+
+TEST_CASE("api_server: the real Qwen3.8 chat template renders through the "
+          "production /v1/chat/completions dispatch (#1681)") {
+  const HfConfig c = MakeConfig();
+  const Qwen3_5MoeWeights w = MakeWeights(c);
+  CapturingTemplatePrompt prompt(ReadTestFixture("qwen38_chat_template.jinja"));
+  ServerHarness h(c, w, Fixture(), /*enable_force_include_usage=*/false,
+                  ApiServer::kDefaultMaxConcurrentStreams, prompt.fn);
+
+  const std::string body =
+      R"({"messages":[{"role":"user","content":"hi"}],)"
+      R"("max_completion_tokens":4,"temperature":0.0})";
+  ApiServer::DispatchResult r = h.server.handle_chat_completions(body);
+
+  // The defect: 500 with "Unknown type for 'is' operator: undefined".
+  INFO("dispatch body: " << r.body);
+  CHECK(r.status == 200);
+  CHECK(r.body.find("Unknown type for 'is' operator") == std::string::npos);
+  // The template really ran: its own system header is in the rendered prompt.
+  CHECK(prompt.rendered->find("<|im_start|>user\nhi<|im_end|>") !=
+        std::string::npos);
+}
+
+// The other half of #1681. `is undefined` is only useful if the variable CAN be
+// undefined, and before this row apply_chat_template bound `enable_thinking`
+// on every render, so the test could never answer true and the Qwen3.8 family's
+// own reasoning default was silently inverted against vLLM and SGLang.
+TEST_CASE("api_server: an unsupplied chat template kwarg stays Jinja-undefined "
+          "so Qwen3.8 renders its own reasoning default (#1681)") {
+  const HfConfig c = MakeConfig();
+  const Qwen3_5MoeWeights w = MakeWeights(c);
+  CapturingTemplatePrompt prompt(ReadTestFixture("qwen38_chat_template.jinja"));
+  ServerHarness h(c, w, Fixture(), /*enable_force_include_usage=*/false,
+                  ApiServer::kDefaultMaxConcurrentStreams, prompt.fn);
+
+  const std::string body =
+      R"({"messages":[{"role":"user","content":"hi"}],)"
+      R"("max_completion_tokens":4,"temperature":0.0})";
+  ApiServer::DispatchResult r = h.server.handle_chat_completions(body);
+
+  REQUIRE(r.status == 200);
+  // The `{%- if enable_thinking is undefined or enable_thinking is true %}`
+  // branch and nothing else emits this sentence.
+  CHECK(prompt.rendered->find("Reasoning effort is set to xhigh") !=
+        std::string::npos);
+}
+
+// The body both competitor arms of #1574 were measured with. Before this row
+// ChatCompletionRequest had no such field and the seam had nowhere to put it,
+// so the flag was accepted by the JSON parser and dropped on the floor.
+TEST_CASE("api_server: a request's chat_template_kwargs reach the renderer "
+          "(#1681)") {
+  const HfConfig c = MakeConfig();
+  const Qwen3_5MoeWeights w = MakeWeights(c);
+  CapturingTemplatePrompt prompt(ReadTestFixture("qwen38_chat_template.jinja"));
+  ServerHarness h(c, w, Fixture(), /*enable_force_include_usage=*/false,
+                  ApiServer::kDefaultMaxConcurrentStreams, prompt.fn);
+
+  const std::string body =
+      R"({"messages":[{"role":"user","content":"hi"}],)"
+      R"("max_completion_tokens":4,"temperature":0.0,)"
+      R"("chat_template_kwargs":{"enable_thinking":false}})";
+  ApiServer::DispatchResult r = h.server.handle_chat_completions(body);
+
+  REQUIRE(r.status == 200);
+  CHECK(prompt.rendered->find("Reasoning effort is set to xhigh") ==
+        std::string::npos);
+  // Still the same conversation, so the difference really is the kwarg.
+  CHECK(prompt.rendered->find("<|im_start|>user\nhi<|im_end|>") !=
+        std::string::npos);
+}
+
+// The /tokenize chat form renders through the SAME seam, so it has to see the
+// same kwargs or the two disagree about what the model is fed
+// (serve/tokenize/protocol.py:97,138).
+TEST_CASE("api_server: /tokenize chat form honours chat_template_kwargs "
+          "(#1681)") {
+  const HfConfig c = MakeConfig();
+  const Qwen3_5MoeWeights w = MakeWeights(c);
+  CapturingTemplatePrompt prompt(ReadTestFixture("qwen38_chat_template.jinja"));
+  ServerHarness h(c, w, Fixture(), /*enable_force_include_usage=*/false,
+                  ApiServer::kDefaultMaxConcurrentStreams, prompt.fn);
+  h.server.set_tokenizer(&Fixture(), /*max_model_len=*/kMaxModelLen);
+
+  ApiServer::DispatchResult on = h.server.handle_tokenize(
+      R"({"messages":[{"role":"user","content":"hi"}]})");
+  REQUIRE(on.status == 200);
+  const std::string with_default = *prompt.rendered;
+
+  ApiServer::DispatchResult off = h.server.handle_tokenize(
+      R"({"messages":[{"role":"user","content":"hi"}],)"
+      R"("chat_template_kwargs":{"enable_thinking":false}})");
+  REQUIRE(off.status == 200);
+
+  CHECK(with_default.find("Reasoning effort is set to xhigh") !=
+        std::string::npos);
+  CHECK(prompt.rendered->find("Reasoning effort is set to xhigh") ==
+        std::string::npos);
 }
 
 TEST_CASE("api_server: live chat SSE emits role, content, finish, and DONE") {
@@ -1129,7 +1289,8 @@ TEST_CASE("api_server: /tokenize chat form renders template + tokenizes") {
       ChatMessage{"user", std::string("hello")},
       ChatMessage{"assistant", std::string("world")}};
   const std::string rendered = InVocabChatPrompt(
-      kMessages, /*add_generation_prompt=*/true, {});
+      kMessages, /*add_generation_prompt=*/true, {},
+      nlohmann::ordered_json::object());
   const std::vector<int> expect = Fixture().Encode(rendered);
 
   ApiServer::DispatchResult tok = h.server.handle_tokenize(kChatBody);
