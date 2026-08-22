@@ -41,10 +41,12 @@
 #
 # BEFORE YOU SPEND A LEASE ON THIS, read these three paragraphs.
 #
-#   EXIT STATUS. 0, 1 and 2 are the pixel comparison's own verdict and this job
-#   exits with it: 0 every threshold held, 1 a threshold failed, 2 an input could
-#   not be read and NOTHING was compared. A 2 is never a pass. Everything else is
-#   a refusal before the verdict exists:
+#   EXIT STATUS. 0, 1, 2 and 3 are the pixel comparison's own verdict and this
+#   job exits with it: 0 every threshold held, 1 a threshold failed, 2 an input
+#   could not be read and NOTHING was compared, 3 the treatment passed and the
+#   CONTROL failed its own content checks, so the pass cannot be READ. A 2 is
+#   never a pass and neither is a 3. Everything else is a refusal before the
+#   verdict exists:
 #     23 checkpoint staging      25 ltx2-gen will not exec
 #     31 source tarball          33 configure      34 build      35 artefacts
 #     36 no CUTLASS              38 no complete CUDA toolkit
@@ -168,9 +170,18 @@ wait_for_memory() {  # $1 floor GiB, $2 budget s, $3 poll s
 # non-empty wav. A partial arm is re-rendered from scratch rather than resumed
 # mid-flight: the engine deletes stale frame_*.ppm in its own output directory
 # but nothing else there, so a half-arm's leftovers would outlive it.
+#
+# TWO CHECKS, and there used to be a third. `[ -d "$d" ] || return 1` stood on
+# the first line and no mutation could reach it: deleting it left this suite
+# green, because the glob does not expand for a directory that is not there, so
+# `ls ... | wc -l` reports 0 and the frame count refuses the arm anyway. That is
+# the same argument section 10.4 already made against the fourth C0 check in
+# `ltx25-render-compare.py` -- a guard that cannot be observed to fail is a
+# decoration -- so it is removed rather than kept for the look of it. An absent
+# directory is still refused, by the line below, and
+# `test_an_absent_directory_is_not_complete` says which line does it.
 arm_is_complete() {  # $1 dir, $2 wanted frame count
   local d=$1 want=$2 n
-  [ -d "$d" ] || return 1
   n=$(ls "$d"/frame_*.ppm 2>/dev/null | wc -l)
   [ "$n" = "$want" ] || return 1
   [ -s "$d/audio.wav" ] || return 1
@@ -675,6 +686,10 @@ case "$PIXEL_RC" in
   1) say "PIXEL VERDICT: FAIL -- a registered threshold was not met. Section 10.5: this is a"
      say "               finding about a change already on main, and it does not owe a widened gate";;
   2) say "PIXEL VERDICT: UNREADABLE -- nothing was compared. This is never a pass";;
+  3) say "PIXEL VERDICT: CONTROL DEGENERATE -- every registered threshold held, and the"
+     say "               control rendered no picture, so it is not a noise floor and section"
+     say "               10.5's R cannot be read. The renders are a PASS nobody may READ:"
+     say "               re-take the control arm, and do not publish a reading from this run";;
   *) say "PIXEL VERDICT: UNKNOWN -- the comparison exited $PIXEL_RC, which it does not define";;
 esac
 say "DONE OUT=$OUT RUN_ID=$RUN_ID PIXEL_COMPARE_RC=$PIXEL_RC"

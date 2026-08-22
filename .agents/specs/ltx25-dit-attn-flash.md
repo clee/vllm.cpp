@@ -708,7 +708,7 @@ them by hand afterwards.
 
 | # | check | threshold | where it comes from |
 |---|---|---|---|
-| C0 | each arm, ON ITS OWN: no near-uniform frame, every frame hash distinct, no zero-motion pair | all three, per arm | **the hole every difference-only comparison has** |
+| C0 | each RENDER, ON ITS OWN — arm A, arm B and the control: no near-uniform frame, every frame hash distinct, no zero-motion pair | all three, per render | **the hole every difference-only comparison has** |
 | V1 | mean \|delta\|, 8-bit RGB | `<= 1.0` level | one level is the quantisation step of the artefact itself; a mean below it says the average pixel is within the PPM's own resolution |
 | V2 | worst-frame PSNR | `>= 40 dB` | the video-coding "visually lossless" convention. This experiment did not choose it |
 | V3 | worst-frame SSIM | `>= 0.99` | Wang et al. 2004, 11x11 Gaussian sigma=1.5 on luma. 0.98 is the usual transparency line; this is stricter, and it is the WORST frame rather than the mean |
@@ -722,8 +722,17 @@ renders from two identically broken ones. Two all-black renders differ by zero,
 score infinite PSNR and SSIM `1.000000`, and would read as the strongest
 possible pass this table can produce. A run that exited 0 having written frames
 that were all one colour has happened in this repository, so that is a recorded
-failure mode rather than a hypothesis. C0 is computed per arm before anything is
-subtracted, and it is checked first.
+failure mode rather than a hypothesis. C0 is computed per render before anything
+is subtracted, and it is checked first.
+
+**C0 covers the CONTROL, and it did not at first.** The control is the third
+render and it is the one every reading in §10.5 is built on, and its content was
+computed, printed and never checked. Its three checks are registered like the
+arms', and they drive a DIFFERENT outcome: a failing arm check is a treatment
+FAIL at exit 1, and a failing control check is exit 3, `CONTROL_DEGENERATE`,
+because a control with no picture in it is a broken experiment rather than a
+visible difference between two renders. §10.5 records the reading that status
+selects and the repair's mid-flight timing.
 
 **"Frames written" used to be a fourth C0 check and it is now a REFUSAL.** An
 arm directory holding no `frame_*.ppm` leaves the tool at exit 2 with no JSON,
@@ -771,8 +780,30 @@ can compute. These are the numbers that are a gate:
 | perturbation of a FIXTURE frame | mean \|d\| | worst PSNR | worst SSIM | V4 ratio | verdict |
 |---|---|---|---|---|---|
 | none | 0 | inf | 1.000000 | 0.000 | bit-identical |
-| +/-1 LSB on 3% of samples | 0.0194 | 65.0 dB | 0.99999 | 0.0007 | **PASS**, all four |
-| one pixel of global horizontal shift | 16.6120 | 21.8 dB | 0.77036 | 0.4487 | **FAIL**, all four |
+| +/-1 LSB on 3% of samples | 0.01935944733796296 | 65.04621554883309 dB | 0.99998566099925 | 0.0007008817611029302 | **PASS**, all four |
+| one pixel of global horizontal shift | 16.611979166666668 | 21.789085745489977 dB | 0.7703600993461216 | 0.44871294988741245 | **FAIL**, all four |
+
+**"GATED" was a label and not a fact until this revision, and a fresh review
+found it.** The eight cells of the two lower rows were reproducible and
+accurate — recomputed independently, all eight — and no test asserted any of
+them. `test_dither_passes_every_video_check` asserted `mean < 0.1`, `psnr > 50`
+and `ssim > 0.99`, bounds every one of those cells clears by two orders of
+magnitude, and `test_one_pixel_shift_fails_all_four_video_checks` asserted four
+booleans. A change to the fixture generator therefore moved all eight numbers
+with the suite green: raising `make_render`'s `motion` from 3 to 4 left 43 of 43
+tests passing while this table went silently wrong. A fixture that failed V4 by a
+hair and one that fails it by 4.5x are the same test to a boolean, and the
+argument two paragraphs below rests on which of those it is.
+
+The eight cells are now asserted to the precision printed, by
+`Discrimination.test_the_dither_row_of_the_gated_table_is_pinned` and
+`Discrimination.test_the_one_pixel_shift_row_of_the_gated_table_is_pinned`, at
+the precision this file already pins its three SSIMs to. Three independent
+mutations of the generator — the motion step, the dither seed, the texture
+period — each move at least one cell and each red the suite. The `none` row
+needs no separate assertion: a bit-identical pair registers `video.bit_identical`
+and no threshold at all, which
+`test_identical_renders_read_as_bit_identical` already pins.
 
 **Why they differ, and why both belong.** The fixture is a sine grating with a
 4-pixel period plus uniform noise, so one pixel of shift moves each row by a
@@ -836,6 +867,44 @@ number.
 - **`R` is `null`** — the two arms are bit-identical, which §10.2 says they will
   not be. Read that as a finding about the experiment (one arm rendered twice,
   a knob not read, a cached artefact) before reading it as a result.
+- **`R` is marked UNUSABLE and the tool exits 3** — the CONTROL failed its own
+  C0 content checks. None of the four readings above is available, because every
+  one of them assumes the control is a repeat of a render and this one is a
+  repeat of no picture. The treatment result stands and is reported; the
+  *reading* of it does not exist, and the control arm has to be re-taken before
+  one does. This is not "visibly different" and it is not a pass: it is a broken
+  experiment, and it has its own status so that it can be neither.
+- **Any check fails** — the verdict is **visibly different**, and that is a
+  finding about a change already on `main`, not a failure of this work. It owes
+  an issue naming what diverged and by how much, and it does not owe a widened
+  threshold. Widening a gate to admit a change is the failure this protocol
+  exists to prevent, and §9's stop conditions already say so for the numeric
+  gate. This branch outranks the one above it: a failing check and a degenerate
+  control together exit 1, because "the two renders differ" is established
+  without the control at all and a broken control must not swallow it.
+
+**THE CONTROL'S CONTENT WAS UNJUDGED, AND THAT IS REPAIRED HERE, MID-FLIGHT.**
+`arm_content(control)` was computed, printed, and never registered as a check.
+Arms A and B were judged on their own content and the control was not, so a
+control of six one-colour frames left the tool at exit 0, verdict `PASS`, with
+`R = 112.77` — the second branch above, **indistinguishable from run-to-run
+nondeterminism**, which is the *stronger* of the two null readings. A control
+that rendered no picture at all upgraded the published conclusion. That is
+§10.6's class one step removed, and §10.4's own C0 rationale — a difference
+cannot tell two good renders from two identically broken ones — applies to the
+control-vs-arm comparison with identical force. "Reported, never checked" was
+argued for the ratio `R`, never for the control's content, and §10.8 does not
+list the control as exempt.
+
+**The timing has to be said plainly, because this section's whole standing is
+that it was committed before the numbers.** A fresh review raised this while the
+renders were running in an `rc` lease and **before any number had been read**.
+The criterion is therefore edited after the run started and before the run
+reported, and the edit only ever TIGHTENS: it adds a way for a run to fail that
+did not exist, removes none, and widens no threshold. Every V and A bound in
+§10.4 is byte-for-byte what it was. A reader entitled to be suspicious of a
+criterion edited mid-flight should check exactly that, and `git log -p` on this
+file is where.
 
 **WHICH ARM the control repeats is now an argument, not a convention.**
 `--control-of {a,b}` names it, the JSON records it, and the control block prints
@@ -844,12 +913,6 @@ the tool compared the control against arm A, so the "run-to-run noise floor" was
 a SECOND naive-vs-flash comparison: it necessarily read about the same size as
 the treatment, and the second branch above would have been published whatever the
 kernel did. A silent convention a caller can invert is not a convention.
-- **Any check fails** — the verdict is **visibly different**, and that is a
-  finding about a change already on `main`, not a failure of this work. It owes
-  an issue naming what diverged and by how much, and it does not owe a widened
-  threshold. Widening a gate to admit a change is the failure this protocol
-  exists to prevent, and §9's stop conditions already say so for the numeric
-  gate.
 
 ### 10.6 The failure this design nearly shipped: a well-formed answer about the wrong thing
 
@@ -998,26 +1061,56 @@ ratio `R` and which of §10.5's readings it selects, the cross-check against the
   extracts the `MemAvailable` reader, the start gate and the arm-completeness
   check verbatim from `scripts/ltx25-dit-attn-flash-pixel-ab.sh` and runs them
   against a fabricated `/proc/meminfo`, so those three execute here. **The render
-  loop, the routing assertion, the phase [I] call site and the phase [L] exit do
-  not.** They are pinned as TEXT — the suite asserts the exact call site that
-  shipped inverted, and the exact `exit` lines — and a text assertion is a
-  tripwire, not a proof: it catches the inversion that happened and would not
-  catch a rewrite that reintroduced it in different words. `dgx:gpu0` under a
-  lease is the only place those lines run, which is why every one of them was
-  wrong at once: they had never executed anywhere a test could watch. **That is
-  a structural explanation of a cluster rather than four coincidences**, and it
-  tells the next reader which claims in this harness are load-bearing and which
-  are decorative — what a test can execute is now checked, and what only a lease
-  can execute is a comment to be verified against the run's own log.
+  loop, the routing assertion, the phase [I] call site, the phase [L] exit, the
+  phase [F] unit-gate refusal and the signal traps do not.** Five of those six
+  are pinned as TEXT — the suite asserts the exact call site that shipped
+  inverted, the exact `exit` lines, the two unit-gate statuses and the four
+  `trap` lines — and a text assertion is a tripwire, not a proof: it catches the
+  inversion that happened and would not catch a rewrite that reintroduced it in
+  different words. **The render loop is pinned by nothing at all.** `dgx:gpu0`
+  under a lease is the only place those lines run, which is why every one of them
+  was wrong at once: they had never executed anywhere a test could watch. **That
+  is a structural explanation of a cluster rather than a run of coincidences**,
+  and it tells the next reader which claims in this harness are load-bearing and
+  which are decorative — what a test can execute is now checked, and what only a
+  lease can execute is a comment to be verified against the run's own log.
 
-  **One mutation of the memory gate is deliberately a TIMEOUT rather than a
-  failed assertion.** Inverting its floor comparison makes the gate wait out its
-  whole budget instead of proceeding, so the suite never returns. The mutation
-  runner records that as RED with the reason named, because a suite that did not
-  report `OK` is not a suite that passed. A timeout read as success is the exact
-  silent hole a wait-for-quiet loop already cost this campaign once, so that
-  path was exercised on purpose rather than left for whoever next inverts that
-  line.
+  **This list and the tripwire count had both drifted, and a fresh review caught
+  it.** The prose named four unexecuted things while the `Wiring` class defined
+  five tests, and the two the prose omitted — the phase [F] unit-gate refusal and
+  the signal traps — were text-only and absent from `## Owed` as well. The error
+  was in the SAFE direction: nothing claimed as executed was in fact only
+  text-pinned. It was still a number in a document that no longer described the
+  file beside it, so
+  `TheDisclosureCountsWhatIsThere.test_the_wiring_docstring_names_as_many_tripwires_as_it_defines`
+  now holds the count against the class and a sixth tripwire cannot be added
+  silently. It fired on exactly that when the exit-3 tripwire was added.
+
+  **Two mutations of the memory gate are deliberately a TIMEOUT rather than a
+  failed assertion, and both are named because one of them was not.** Inverting
+  the floor comparison (M27) makes the gate wait out its whole budget instead of
+  proceeding, and neutering the wait-budget comparison
+  `[ "$waited" -ge "$budget" ]` so that it never fires (M29) makes the loop run
+  forever on a box that never recovers. Either way the suite never returns. The
+  mutation runner records that as RED with the reason named, because a suite that
+  did not report `OK` is not a suite that passed. A timeout read as success is
+  the exact silent hole a wait-for-quiet loop already cost this campaign once, so
+  that path is exercised on purpose rather than left for whoever next touches
+  either line. **The hang is not engineered away**, and that is a choice: a
+  budget that gives up early to keep a test suite responsive is a weaker gate on
+  a four-hour lease than one that waits, and the guard's whole purpose is to
+  wait. What is owed is the disclosure, and M29 had not carried one.
+
+- **A GUARD THAT NO MUTATION COULD REACH, now removed rather than kept.**
+  `arm_is_complete` opened with `[ -d "$d" ] || return 1`, and deleting it left
+  the harness suite green: the glob does not expand for a directory that is not
+  there, so `ls "$d"/frame_*.ppm | wc -l` reports 0 and the frame-count check
+  refuses the arm on its own. Observable behaviour was identical with the line
+  and without it, so it was a redundant guard rather than a defect — and it is
+  the same argument §10.4 already made against C0's fourth check. It is gone, the
+  two remaining guards are each proved observable by their own mutation, and
+  `test_an_absent_directory_is_not_complete` now says in its docstring which line
+  does the refusing, so the next reader adds it back deliberately or not at all.
 - **PPM is 8-bit.** The comparison is on the artefact the pipeline writes, which
   is already quantised from the VAE's float output. A difference below `1/255`
   relative is invisible to it. That is the right resolution for the question
@@ -1076,11 +1169,14 @@ ratio `R` and which of §10.5's readings it selects, the cross-check against the
 - **Most of the harness still runs nowhere but a lease.**
   `tests/scripts/test_ltx25_pixel_ab_harness.py` exercises the memory
   precondition and the arm-completeness check, which are extracted verbatim from
-  `scripts/ltx25-dit-attn-flash-pixel-ab.sh`. The render loop, the routing
-  assertion, the phase [I] call site and the phase [L] exit are pinned as TEXT
-  and nothing executes them, so a rewrite that reintroduced any of those defects
-  in different words would pass. That is a limit of where the file runs, not a
-  gap that another local test can close. Owner: this row. Issue:
+  `scripts/ltx25-dit-attn-flash-pixel-ab.sh`. Six things it does not execute:
+  the render loop, the routing assertion, the phase [I] call site, the phase [L]
+  exit, the phase [F] unit-gate refusal and the signal traps. Five of the six are
+  pinned as TEXT and nothing executes them, so a rewrite that reintroduced any of
+  those defects in different words would pass; the render loop is pinned by
+  nothing. That is a limit of where the file runs, not a gap that another local
+  test can close. This list said "four" and omitted the unit-gate refusal and
+  the traps until a fresh review counted them. Owner: this row. Issue:
   [#1612](https://github.com/mudler/vllm.cpp/issues/1612).
 - **`scripts/ltx25-render-compare.py` writes `Infinity` into its JSON.** A
   bit-identical pair has zero MSE and infinite PSNR, and `json.dump` spells that

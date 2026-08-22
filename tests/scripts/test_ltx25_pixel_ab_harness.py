@@ -219,15 +219,37 @@ class ArmCompleteness(unittest.TestCase):
             self.assertEqual(self._check(d), "1")
 
     def test_an_absent_directory_is_not_complete(self) -> None:
+        """AND THE FRAME COUNT IS WHAT REFUSES IT. `arm_is_complete` opened with
+        `[ -d "$d" ] || return 1`, and deleting that line left this whole suite
+        green: the glob does not expand for a directory that is not there, so
+        `ls ... | wc -l` reports 0 and the frame-count check returns 1 on its
+        own. The observable behaviour was identical with the guard and without
+        it, so it was a redundant guard rather than a defect, and it is gone.
+        This case is written down so that the next reader adds it back
+        deliberately or not at all."""
         with tempfile.TemporaryDirectory() as t:
             self.assertEqual(self._check(Path(t) / "never-rendered"), "1")
 
+    def test_an_absent_directory_is_not_complete_even_at_zero_frames(self) -> None:
+        """The one call shape where the frame count could not refuse an absent
+        directory on its own: ask for zero frames and `0 = 0` holds. The wav
+        check is what refuses it, so no argument makes an arm that was never
+        rendered read as a completed one."""
+        with tempfile.TemporaryDirectory() as t:
+            self.assertEqual(self._check(Path(t) / "never-rendered", want=0), "1")
+
 
 class Wiring(unittest.TestCase):
-    """TEXT TRIPWIRES on the four call sites that cannot be executed here.
+    """TEXT TRIPWIRES on the six call sites that cannot be executed here.
 
     Each pins a defect that shipped, in the words that shipped it. None is a
     proof: the lease is the only place these lines run.
+
+    The count was "four" while five tests stood here, and the two the prose left
+    out -- the phase [F] unit-gate refusal and the signal traps -- were absent
+    from the spec's list of text-pinned guards as well. `TheDisclosureCounts-
+    WhatIsThere` below now holds this number against the class, so the next
+    tripwire cannot be added silently.
     """
 
     def setUp(self) -> None:
@@ -254,12 +276,51 @@ class Wiring(unittest.TestCase):
         self.assertIn(f"exit {UNIT_GATE_FAILED}", self.text)
         self.assertIn(f"exit {UNIT_GATE_ABSENT}", self.text)
 
+    def test_a_degenerate_control_is_a_status_the_run_defines(self) -> None:
+        """The comparison gained exit 3 -- the treatment passed and the control
+        rendered no picture -- and phase [L]'s `case` has a `*)` arm that calls
+        an unlisted status UNKNOWN. An exit this repository defines must not
+        reach it, because "the comparison exited 3, which it does not define"
+        reads as a harness defect rather than as the verdict it is."""
+        self.assertIn("  3) say \"PIXEL VERDICT: CONTROL DEGENERATE", self.text)
+        self.assertIn("do not publish a reading from this run", self.text)
+
     def test_the_heartbeat_is_reaped_on_a_lease_kill(self) -> None:
         """`rc` reclaiming a device sends SIGTERM, and a bash EXIT trap does not
         run for a signal with no handler of its own."""
         self.assertIn("trap cleanup EXIT", self.text)
         for sig, status in (("HUP", 129), ("INT", 130), ("TERM", 143)):
             self.assertIn(f"trap 'cleanup; exit {status}' {sig}", self.text)
+
+
+class TheDisclosureCountsWhatIsThere(unittest.TestCase):
+    """The count of text tripwires is itself a claim, and it had drifted.
+
+    `Wiring` said "the four call sites" while defining five tests, and the
+    spec's section 10.8 and `## Owed` named four unexecuted things -- the render
+    loop, the routing assertion, the phase [I] call site and the phase [L] exit
+    -- while two further guards, the phase [F] unit-gate refusal and the signal
+    traps, were text-only and in neither list. The error was in the safe
+    direction: nothing claimed as EXECUTED was in fact only text-pinned. It is
+    still a number in a document that no longer described the file beside it,
+    which is the shape section 10.6 is about, and it is cheap to hold.
+    """
+
+    WORDS = {"one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6,
+             "seven": 7, "eight": 8, "nine": 9, "ten": 10}
+
+    def test_the_wiring_docstring_names_as_many_tripwires_as_it_defines(self) -> None:
+        doc = Wiring.__doc__ or ""
+        found = [w for w in self.WORDS if w in doc.split("\n")[0].lower()]
+        self.assertEqual(len(found), 1,
+                         f"the first line of Wiring's docstring must name exactly one "
+                         f"count word so this gate can read it; it names {found}")
+        claimed = self.WORDS[found[0]]
+        defined = len([m for m in dir(Wiring) if m.startswith("test_")])
+        self.assertEqual(claimed, defined,
+                         f"Wiring's docstring claims {claimed} tripwires and the class "
+                         f"defines {defined}. Adding a tripwire without saying so leaves "
+                         f"a count in a document that no longer describes the file.")
 
 
 if __name__ == "__main__":

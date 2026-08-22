@@ -71,11 +71,29 @@ REPORTED and never checked, because it chooses between two readings of a passing
 result rather than between passing and failing. It is `null`, with a reason,
 when the treatment is bit-identical and the denominator is therefore zero.
 
+THE CONTROL'S OWN CONTENT IS JUDGED, and that is separate from the ratio being
+unchecked. C0 asks of each arm "is there a picture in it", and the same question
+has to be asked of the control, for the same reason section 10.4 gives for arms
+A and B: a difference cannot tell two good renders from two identically broken
+ones. It was asked of A and B only. A control of six one-colour frames therefore
+left this tool at exit 0, verdict PASS, with `R = 112.77` -- which section 10.5
+reads as `R >= 0.5`, *indistinguishable from run-to-run nondeterminism*, the
+STRONGER of its two null readings. A control that rendered nothing at all
+upgraded the published conclusion, which is the section 10.6 class one step
+removed.
+
 Exit 0 when every threshold passes, 1 when one fails, 2 when the inputs cannot
-be read. A missing input is never a pass, and it is never an exit 1 either: a
+be read, 3 when the treatment passed and the CONTROL failed its own content
+checks. A missing input is never a pass, and it is never an exit 1 either: a
 1 says "the two renders differ", which is a reading of an experiment that
 happened, and a broken render that reported it would be indistinguishable from
-the finding this tool exists to make.
+the finding this tool exists to make. A 3 is not an exit 1 for the mirror-image
+reason: a degenerate control is a broken EXPERIMENT, not a visible difference
+between two renders, and section 10.5 maps exit 1 to the second of those. It is
+not an exit 0 either, because the pass it would report is a pass nobody may
+read. When a threshold fails AND the control is degenerate, the status is 1: the
+renders differ, that is established without the control, and it is a finding
+about a change already on `main` that a broken control must not hide.
 """
 
 from __future__ import annotations
@@ -90,10 +108,11 @@ import wave
 
 import numpy as np
 
-# --- the three exit statuses, which are three different statements ------------
+# --- the four exit statuses, which are four different statements --------------
 EXIT_PASS = 0        # every threshold passed
 EXIT_FAIL = 1        # a threshold failed: the renders differ, and by how much
 EXIT_UNREADABLE = 2  # nothing was compared, because an input could not be read
+EXIT_CONTROL_DEGENERATE = 3  # the treatment passed and the control has no picture in it
 
 
 class UnreadableInput(ValueError):
@@ -545,72 +564,146 @@ def _compare(args: argparse.Namespace) -> int:
             "treatment_mean_abs_rgb": den_rgb,
             "ratio_mean_abs_rgb": (num_rgb / den_rgb) if den_rgb > 0.0 else None,
             "undefined": undefined,
+            # `undefined` is arithmetic: there was no denominator. `unusable` is
+            # about the control itself: the ratio divides two real numbers and
+            # still means nothing, because the numerator came from a render with
+            # no picture in it. The verdict block below fills it in.
+            "unusable": None,
         }
 
     # --- verdict --------------------------------------------------------------
-    checks: list[tuple[str, bool, str]] = []
+    # Every entry carries WHICH outcome it drives: `treatment` entries decide the
+    # arm-A-vs-arm-B verdict and the exit status, `control` entries decide only
+    # whether the control is a noise floor the ratio may be read against. One
+    # list rather than two, so that a reader of `report["checks"]` sees every
+    # judged thing in one place and can see which is which; and the field rather
+    # than a naming convention, because a convention a caller can misread
+    # silently is what section 10.6 is about.
+    checks: list[tuple[str, bool, str, str]] = []
+
+    def c0_checks(label: str, judges: str) -> None:
+        """C0 for ONE render, judged on its own content before anything is
+        subtracted. Three checks, not four: "frames written" used to be a fourth
+        and it could never be False, because `frame_paths` refuses an empty
+        directory at EXIT_UNREADABLE long before this runs, and a row that
+        cannot fail is a decoration in a table whose entire value is that every
+        row can."""
+        c = report["content"][label]
+        checks.append((f"content.{label}.not_uniform",
+                       c["near_uniform_frames"] == 0,
+                       f"near-uniform frames {c['near_uniform_frames']} == 0 "
+                       f"(min per-frame variance {c['per_frame_var_min']:.3f})",
+                       judges))
+        checks.append((f"content.{label}.distinct_frames",
+                       c["distinct_frame_hashes"] == c["frames"],
+                       f"{c['distinct_frame_hashes']} distinct of {c['frames']}",
+                       judges))
+        checks.append((f"content.{label}.motion",
+                       c["zero_motion_pairs"] == 0 and c["adjacent_frame_mad_mean"] > 0.0,
+                       f"zero-motion pairs {c['zero_motion_pairs']}, "
+                       f"mean adjacent MAD {c['adjacent_frame_mad_mean']:.4f}",
+                       judges))
+
     # C0 FIRST, and it is not a formality. Everything after this line is a
     # DIFFERENCE, and every difference check passes vacuously when both arms are
     # equally broken. An arm that rendered nothing, rendered one colour, or
     # rendered the same frame 49 times fails HERE, where the failure is legible,
     # rather than passing silently as a perfect match.
-    #
-    # THREE checks per arm, not four. "frames written" used to be a fourth, and
-    # it could never be False: `frame_paths` refuses an empty arm at
-    # EXIT_UNREADABLE long before this loop runs. A row that cannot fail is a
-    # decoration in a table whose entire value is that every row can.
     for label in (args.label_a, args.label_b):
-        c = report["content"][label]
-        checks.append((f"content.{label}.not_uniform",
-                       c["near_uniform_frames"] == 0,
-                       f"near-uniform frames {c['near_uniform_frames']} == 0 "
-                       f"(min per-frame variance {c['per_frame_var_min']:.3f})"))
-        checks.append((f"content.{label}.distinct_frames",
-                       c["distinct_frame_hashes"] == c["frames"],
-                       f"{c['distinct_frame_hashes']} distinct of {c['frames']}"))
-        checks.append((f"content.{label}.motion",
-                       c["zero_motion_pairs"] == 0 and c["adjacent_frame_mad_mean"] > 0.0,
-                       f"zero-motion pairs {c['zero_motion_pairs']}, "
-                       f"mean adjacent MAD {c['adjacent_frame_mad_mean']:.4f}"))
+        c0_checks(label, "treatment")
+    # AND THE CONTROL, for the same reason and to a different outcome. The
+    # control was the one render whose content nothing judged: it was computed,
+    # printed, and never registered. A control of one-colour frames then read as
+    # a very large noise floor, which is section 10.5's STRONGER null.
+    if args.control:
+        c0_checks(args.label_control, "control")
+
     if v["bit_identical"]:
-        checks.append(("video.bit_identical", True, "every frame file sha256-equal"))
+        checks.append(("video.bit_identical", True, "every frame file sha256-equal",
+                       "treatment"))
     else:
         checks.append(
             ("video.mean_abs", v["mean_abs"] <= args.max_mean_abs,
-             f"{v['mean_abs']:.6f} <= {args.max_mean_abs}")
+             f"{v['mean_abs']:.6f} <= {args.max_mean_abs}", "treatment")
         )
         checks.append(
             ("video.psnr_min_db", v["psnr_min_db"] >= args.min_psnr_db,
-             f"{v['psnr_min_db']:.3f} >= {args.min_psnr_db}")
+             f"{v['psnr_min_db']:.3f} >= {args.min_psnr_db}", "treatment")
         )
         checks.append(
             ("video.ssim_min", v["ssim_min"] >= args.min_ssim,
-             f"{v['ssim_min']:.6f} >= {args.min_ssim}")
+             f"{v['ssim_min']:.6f} >= {args.min_ssim}", "treatment")
         )
         if v.get("temporal_ratio") is not None:
             checks.append(
                 ("video.temporal_ratio", v["temporal_ratio"] <= args.max_temporal_ratio,
-                 f"{v['temporal_ratio']:.6f} <= {args.max_temporal_ratio}")
+                 f"{v['temporal_ratio']:.6f} <= {args.max_temporal_ratio}", "treatment")
             )
         else:
-            checks.append(("video.temporal_ratio", False, "no adjacent-frame denominator"))
+            checks.append(("video.temporal_ratio", False, "no adjacent-frame denominator",
+                           "treatment"))
 
     a = report["audio"]
     if not a.get("present"):
-        checks.append(("audio.present", False, a.get("reason", "absent")))
+        checks.append(("audio.present", False, a.get("reason", "absent"), "treatment"))
     elif not a.get("comparable"):
-        checks.append(("audio.comparable", False, "shape or sample rate differs"))
+        checks.append(("audio.comparable", False, "shape or sample rate differs",
+                       "treatment"))
     elif a.get("bit_identical"):
-        checks.append(("audio.bit_identical", True, "wav sha256-equal"))
+        checks.append(("audio.bit_identical", True, "wav sha256-equal", "treatment"))
     else:
         checks.append(("audio.psnr_db", a["psnr_db"] >= args.min_audio_psnr_db,
-                       f"{a['psnr_db']:.3f} >= {args.min_audio_psnr_db}"))
+                       f"{a['psnr_db']:.3f} >= {args.min_audio_psnr_db}", "treatment"))
         checks.append(("audio.pearson_r", (a["pearson_r"] or 0.0) >= args.min_audio_corr,
-                       f"{a['pearson_r']} >= {args.min_audio_corr}"))
+                       f"{a['pearson_r']} >= {args.min_audio_corr}", "treatment"))
 
-    ok = all(c[1] for c in checks)
-    report["checks"] = [{"name": n, "pass": p, "detail": d} for n, p, d in checks]
-    report["verdict"] = "PASS" if ok else "FAIL"
+    report["checks"] = [{"name": n, "pass": p, "detail": d, "judges": j}
+                        for n, p, d, j in checks]
+    treatment = [c for c in checks if c[3] == "treatment"]
+    control_c = [c for c in checks if c[3] == "control"]
+    ok = all(c[1] for c in treatment)
+    report["treatment_verdict"] = "PASS" if ok else "FAIL"
+
+    # THE CONTROL'S OWN VERDICT, which is a separate statement about a separate
+    # render. `USABLE` says the control has a picture in it and is therefore a
+    # noise floor the ratio may be read against. `DEGENERATE` says it does not,
+    # and then no reading of `R` is available at all -- section 10.5's four
+    # branches all assume the control is a repeat of a render, and a repeat of
+    # nothing is not one of them.
+    control_failed = [c[0] for c in control_c if not c[1]]
+    if not args.control:
+        report["control_verdict"] = None
+    elif control_failed:
+        report["control_verdict"] = "DEGENERATE"
+    else:
+        report["control_verdict"] = "USABLE"
+
+    degenerate_reason = None
+    if report["control_verdict"] == "DEGENERATE":
+        degenerate_reason = (
+            f"the control {args.label_control} failed {len(control_failed)} of its own "
+            f"{len(control_c)} content checks ({', '.join(control_failed)}), so it is "
+            f"a repeat of no picture rather than a repeat of a render: it is NOT a "
+            f"noise floor and section 10.5's R is not readable from this run")
+        report["control_ratio"]["unusable"] = degenerate_reason
+
+    # THE STATUS, and its precedence is an argument rather than an ordering.
+    #   FAIL outranks a degenerate control: "the two renders differ" is
+    #   established without the control at all, and section 10.5 calls that a
+    #   finding about a change already on `main`. A broken control must not
+    #   swallow it.
+    #   A degenerate control outranks a PASS: the pass is real and the READING
+    #   of it is what the control supplies, so a run that cannot be read must
+    #   not exit with the status that says it may be.
+    if not ok:
+        report["verdict"] = "FAIL"
+        status = EXIT_FAIL
+    elif report["control_verdict"] == "DEGENERATE":
+        report["verdict"] = "CONTROL_DEGENERATE"
+        status = EXIT_CONTROL_DEGENERATE
+    else:
+        report["verdict"] = "PASS"
+        status = EXIT_PASS
 
     # --- print ----------------------------------------------------------------
     print("=== what each arm rendered, before anything is subtracted ===")
@@ -651,22 +744,40 @@ def _compare(args: argparse.Namespace) -> int:
                   f"({r['control_mean_abs_luma']:.6f} / "
                   f"{r['treatment_mean_abs_luma']:.6f}), "
                   f"{r['ratio_mean_abs_rgb']:.6f} on RGB")
-        print("                       REPORTED, never checked: section 10.5 reads it")
+        if r["unusable"]:
+            print("                       REPORTED, and NOT READABLE:")
+            print(f"                       {r['unusable']}")
+        else:
+            print("                       REPORTED, never checked: section 10.5 reads it")
     print("--- audio ---")
     for k in ("present", "comparable", "bit_identical", "max_abs_lsb", "max_abs_fs",
               "rms_diff_fs", "psnr_db", "pearson_r"):
         if k in a:
             print(f"{k:22s} {a[k]}")
+    # WHICH LIST DRIVES WHAT, in the report's own words. `.agents/verification.md`
+    # asks an instrument to state what it compared against what: a reader who
+    # cannot see which checks decide the exit status cannot audit the ones that
+    # do not, and the control's three checks sat outside every list for exactly
+    # as long as nothing said so.
     print("--- checks ---")
-    for n, p, d in checks:
+    print(f"  these decide the verdict: the {args.label_a} vs {args.label_b} comparison")
+    for n, p, d, j in treatment:
         print(f"  [{'PASS' if p else 'FAIL'}] {n}: {d}")
-    print(f"VERDICT {report['verdict']}")
+    if control_c:
+        print(f"  these decide whether the control {args.label_control} is a noise floor "
+              f"at all, and they do NOT decide the "
+              f"{args.label_a} vs {args.label_b} verdict")
+        for n, p, d, j in control_c:
+            print(f"  [{'PASS' if p else 'FAIL'}] {n}: {d}")
+    if degenerate_reason:
+        print(f"CONTROL DEGENERATE: {degenerate_reason}")
+    print(f"VERDICT {report['verdict']} (exit {status})")
 
     if args.json:
         with open(args.json, "w") as fh:
             json.dump(report, fh, indent=2, sort_keys=True)
         print(f"wrote {args.json}")
-    return EXIT_PASS if ok else EXIT_FAIL
+    return status
 
 
 if __name__ == "__main__":
