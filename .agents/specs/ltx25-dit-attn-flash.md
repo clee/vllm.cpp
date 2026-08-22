@@ -922,6 +922,53 @@ and left the cause open. A read-only diagnostic to identify the resident
 allocation is with the operator, and #1709 owes the correction. The renders
 cannot be taken on that box until it is resolved, and no arm has run.
 
+**THE DIAGNOSTIC IS TAKEN, AND THE MEMORY BELONGS TO NOBODY.** `rc` job
+`ab12aac1-b862-4ac6-8292-9f2c641e6a8d`, read-only, 2026-08-22T16:55:46Z, run
+from inside a lease because the fleet rule forbids `ssh`. Every ordinary owner
+is excluded by measurement rather than by argument:
+
+| field | value |
+|---|---|
+| `MemTotal` | 119.63 GiB |
+| `MemFree` | 5.23 |
+| `AnonPages` | 0.93 |
+| `Cached` | 0.91 |
+| `Buffers` | 0.05 |
+| `Shmem` | 0.04, and it sits inside `Cached` rather than beside it |
+| `Slab` | 1.10 |
+| `VmallocUsed` | 1.00 |
+| **accounted** | **9.22 GiB** |
+| **UNACCOUNTED** | **110.41 GiB, 92.3% of the box** |
+
+No process: `ps aux --sort=-rss` lists the `rc` worker at 11 MB and two zombies,
+and the sum of `VmRSS` over every visible `/proc/*/status` is **0.0 GiB**. No
+tmpfs: `/dev/shm` is a 64 M mount containing nothing, `du` 0. Not the GPU being
+busy: `nvidia-smi` reads `0%`, `11W`, `No running processes found`. Not a
+container view artefact: the cgroup reports `memory.max=max` and
+`memory.current` 113 MiB. Not transient: 5.0 GiB at 15:49Z, 5.1 GiB flat through
+16:39Z, 4.98 GiB at 16:55Z, across four leases by three submitters, on a box
+`up 2:33` at load average 0.25.
+
+On a unified-memory part the driver takes host RAM for the GPU, and an
+allocation that outlives its process is attributed to nothing userspace can see
+— which fits every observation, including `Memory-Usage: Not Supported` being
+the one meter that would have named it. **That is a hypothesis and this row does
+not assert it.** What is established is the 110.41 GiB gap and the exclusions.
+
+The operational consequence does not depend on the mechanism. **Nothing a lease
+can do repairs it** — there is no process to kill and no file to delete — so
+this row's measurement is `PENDING` on a named external resource, which is a
+result under AGENTS.md and never a synonym for "probably fine". `dgx:gpu0` has
+continued to report `ready` and hand out leases throughout, which is the
+controller half of #1709.
+
+**Three leases spent and no wrong number among them.** `5fb9399f` lost its
+worker to an OOM during a build started against 5 GiB; `2ccd1acf` waited its
+full 1200 s at a flat 5.0 GiB and refused with exit 39; `ab12aac1` measured the
+box. The one thing this row will not do is take the renders somewhere else: §7's
+denominator argument binds, and a ratio against a different GPU is not this
+measurement taken late, it is a different measurement.
+
 When it lands, this section records: the three arms' frame counts and routing
 proofs, the C0 block, V1 to V4 and A1 to A2 with their headroom, the control
 ratio `R` and which of §10.5's readings it selects, the cross-check against the
