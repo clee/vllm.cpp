@@ -31,7 +31,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 GENERATOR = ROOT / "scripts/nemotron-h-oracle-capture.py"
-SHIPPED_GOLDEN = ROOT / "tests/parity/goldens/nemotron_35_lightning_greedy/oracle.json"
+GOLDEN_DIR = ROOT / "tests/parity/goldens/nemotron_35_lightning_greedy"
+SHIPPED_GOLDEN = GOLDEN_DIR / "oracle.json"
 CPP_CONSUMER = ROOT / "tests/vllm/models/test_nemotron_h_loader.cpp"
 SPEC = importlib.util.spec_from_file_location("nemotron_h_oracle_capture", GENERATOR)
 assert SPEC is not None and SPEC.loader is not None
@@ -270,6 +271,26 @@ class ContractTests(unittest.TestCase):
     def test_the_shipped_golden_satisfies_the_contract(self) -> None:
         shipped = json.loads(SHIPPED_GOLDEN.read_text(encoding="utf-8"))
         self.assertEqual(capture.check_golden(shipped), [])
+
+    def test_every_committed_golden_satisfies_the_contract(self) -> None:
+        # A GLOB, not a second hard-coded constant. `SHIPPED_GOLDEN` names ONE
+        # file, so a golden captured BESIDE it -- which is exactly what #926's
+        # re-derivation produces -- would be held to nothing at all, and under
+        # AGENTS.md's "Nothing lands dead" an artifact no gate reaches is a
+        # defect rather than an omission. A per-row surface read with a glob is
+        # the record shape that rule names: it costs no future capture a line in
+        # a shared list, and two branches that each add a golden do not collide.
+        goldens = sorted(GOLDEN_DIR.glob("*.json"))
+        # ANTI-VACUITY, and it is not decoration: a loop over zero files reports
+        # a perfect score, and a renamed or moved directory is precisely how
+        # that happens without anyone noticing. The width is asserted, and so is
+        # the identity of the one golden this suite is named for.
+        self.assertGreaterEqual(len(goldens), 1, f"no goldens under {GOLDEN_DIR}")
+        self.assertIn(SHIPPED_GOLDEN, goldens)
+        for path in goldens:
+            with self.subTest(golden=path.name):
+                doc = json.loads(path.read_text(encoding="utf-8"))
+                self.assertEqual(capture.check_golden(doc), [], path.name)
 
     def test_the_shipped_golden_is_not_silently_attributed(self) -> None:
         # It records no engine configuration, and the file has to say so. If a
