@@ -26838,3 +26838,31 @@ rounds ran at `uptime` load 8.84 — the decaying residue of three back-to-back
 builds inside the same lease — and the two arms landed inside that noise of each
 other (B 0.8852/0.8877, C 0.9309/0.8365 at 20 latents). Those rounds do not
 settle B against C and are not quoted as if they did.
+
+### The paired B-vs-D re-take — `rc` job `214f5f70-9ed4-460b-82c8-3ca62411877e`, same boot
+
+The schedule defect above is repaired rather than argued away: the job sleeps
+300 s after the builds and prints `uptime` on both sides of the wait, then
+alternates the two arms seven times. Arm B is the parallel snake alone; arm D
+is B plus the conv decomposition CONDITIONED on
+`out_channels * kernel <= in_len`.
+
+Window, 86 latents, 14 threads, seven rounds — B 3.7293 / 3.7042 / 4.0695 /
+3.9063 / 3.7452 / 3.7319 / 3.7183, median **3.7319 s**; D 3.7612 / 3.4755 /
+3.4620 / 3.4989 / 3.7632 / 3.8783 / 3.4770, median **3.4989 s**. **1.067x**, and
+**4.11x** against arm A's 14.3895 s at the same length. Every leg printed
+`0xc2d5eaf095d1c483`.
+
+Paired split, both arms: `vocoder.conv1d` 2.192/2.205 s → 1.720/1.758 s
+(**1.27x / 1.25x**); TOTAL 3.987/3.985 → 3.492/3.573 s.
+
+Per geometry, paired, round 2 of 3 (medians agree). Declined by the rule and
+therefore ties: `dec_in_proj` 1.00x, `conv_in` 0.95x, `b0_res_conv1` 0.98x,
+`b0_res_conv2` 0.99x. Taken and gaining: `b1_res_conv1` 1.07x,
+`b1_res_conv2` **1.45x**, `b2_res_conv1` 1.19x, `b2_res_conv2` **1.63x**,
+`b3_res_conv1` 1.20x, `b3_res_conv2` **1.68x**, `conv_out` **15.3x**. TOTAL,
+median of three rounds, 0.34977 → 0.29552 s, **1.18x**.
+
+**Nothing regresses**, against the unconditional arm's 0.82x and 0.89x on the
+same two b0 shapes. `conv_out`'s `user/wall` goes from **1.00 to 12.26** — the
+`rows == 1` inline path being reached for the first time.

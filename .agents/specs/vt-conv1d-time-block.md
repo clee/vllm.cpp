@@ -8,9 +8,10 @@ PARALLEL DECOMPOSITION is now the lever"*.
 
 ## Now
 
-`ACTIVE`. The ablation is taken (§2a) and it refuted the candidate the row was
-written to test. Two changes follow from it, §3a and §3b; the gates and the
-mutation evidence are §6, and the `thor:gpu0` A/B/C is §2b.
+`DONE` pending review. The ablation is taken (§2a) and it refuted the candidate
+the row was written to test; §2b prices the two changes and §2c is the paired
+re-take that settles the second one. The gates and the mutation evidence are
+§6, what the row declines to close is §7, and §9 records the outcome.
 
 ## 0. Scope
 
@@ -251,6 +252,77 @@ same lease, and the two arms landed inside that noise of each other — B
 the SCHEDULE of the job rather than as a result, and §2c is the re-take with a
 settle period and seven alternated rounds.
 
+## 2c. The paired B-vs-D re-take, and the rule holds on every geometry
+
+**`rc` job `214f5f70-9ed4-460b-82c8-3ca62411877e`**, `thor:gpu0`, worker
+`rc-worker-m4d7t`, **same boot id `fabedc13-97a1-4cb9-909f-217a425d3f70`** as
+§2a and §2b. Two trees, two binaries, distinct hashes, and the schedule defect
+§2b names is repaired rather than argued away: the job **sleeps 300 s after the
+builds and prints `uptime` on both sides of the wait**, then alternates B and D
+seven times.
+
+Arm B is `fd99a0d7f` (the parallel snake alone). Arm D is `0f738d6ec` — B plus
+the conv decomposition **conditioned** on `out_channels * kernel <= in_len`.
+
+### The window, 86 latents, 14 threads, seven alternated rounds
+
+| round | arm B | arm D |
+|---|---|---|
+| 1 | 3.7293 s | 3.7612 s |
+| 2 | 3.7042 s | 3.4755 s |
+| 3 | 4.0695 s | 3.4620 s |
+| 4 | 3.9063 s | 3.4989 s |
+| 5 | 3.7452 s | 3.7632 s |
+| 6 | 3.7319 s | 3.8783 s |
+| 7 | 3.7183 s | 3.4770 s |
+| **median** | **3.7319 s** | **3.4989 s** |
+
+**1.067x**, and against arm A's 14.3895 s at the same length the shipped arm is
+**4.11x**. Medians rather than best-of, because the two arms have different
+spreads and the loudest single pair (round 3, 1.176x) is kept rather than
+quoted.
+
+### The paired split, both arms, same length
+
+| leaf | arm B | arm D | ratio |
+|---|---|---|---|
+| `vocoder.conv1d` | 2.192 / 2.205 s | 1.720 / 1.758 s | **1.27x / 1.25x** |
+| `vocoder.snake` | 1.043 / 1.023 s | 0.962 / 0.991 s | 1.08x / 1.03x |
+| `vocoder.conv_transpose` | 0.541 / 0.540 s | 0.602 / 0.607 s | 0.90x / 0.89x |
+| TOTAL | 3.987 / 3.985 s | 3.492 / 3.573 s | 1.14x / 1.12x |
+
+### Per geometry — and this is what the condition was for
+
+Op-level probe, paired, three alternated rounds. Round 2, and the medians agree:
+
+| geometry | rule | arm B | arm D | ratio |
+|---|---|---|---|---|
+| `dec_in_proj` k1 | declined | 0.00018 s | 0.00018 s | 1.00x |
+| `conv_in` k7 | declined | 0.01562 s | 0.01647 s | 0.95x |
+| `b0_res_conv1` k7 | declined | 0.03803 s | 0.03865 s | 0.98x |
+| `b0_res_conv2` k1 | declined | 0.01108 s | 0.01122 s | 0.99x |
+| `b1_res_conv1` k7 | taken | 0.07797 s | 0.07287 s | 1.07x |
+| `b1_res_conv2` k1 | taken | 0.02447 s | 0.01686 s | **1.45x** |
+| `b2_res_conv1` k7 | taken | 0.08204 s | 0.06898 s | 1.19x |
+| `b2_res_conv2` k1 | taken | 0.02902 s | 0.01777 s | **1.63x** |
+| `b3_res_conv1` k7 | taken | 0.04124 s | 0.03437 s | 1.20x |
+| `b3_res_conv2` k1 | taken | 0.01433 s | 0.00851 s | **1.68x** |
+| `conv_out` k7 | taken | 0.00841 s | 0.00055 s | **15.3x** |
+| TOTAL, median of 3 | | 0.34977 s | 0.29552 s | **1.18x** |
+
+**Nothing regresses.** The four shapes the rule declines are ties inside the
+run's own spread; every shape it takes gains. Against §2b's unconditional arm,
+where the same two b0 shapes read **0.82x and 0.89x**, the condition is what
+turned a mixed result into a monotone one.
+
+`conv_out`'s `user/wall` goes from **1.00 to 12.26**. That is the `rows == 1`
+inline path — the whole convolution on the caller at every thread count — being
+reached for the first time, and it is the clearest single reading that the
+second axis is live at a production shape.
+
+**Bit-identity throughout.** Every leg of every round on both arms printed
+`0xc2d5eaf095d1c483`.
+
 ## 3. What the row changes, and why each is bit-identical BY CONSTRUCTION
 
 The measurement moved the row's lever, so there are TWO changes and they are
@@ -469,4 +541,39 @@ ratio is quoted at all rather than quoted from another box.
 
 ## 9. Outcome
 
-Written when the row reaches `DONE`.
+**What was measured.** The window's scaling on `thor:gpu0` at the shipped
+default goes from **2.81x of 14 threads to 11.48x**, and the arm-to-arm ratio is
+**4.11x** at 86 latents (median of seven alternated rounds against the
+instrumented baseline, one boot, three jobs). Every arm is bit-identical to
+every other at full scale.
+
+**What was rejected, and why.**
+
+- **The premise of the row.** §18.8b's shared-bandwidth candidate is refuted:
+  `vt::Conv1d` already scaled **12.44x of 14** before this row touched it, and
+  the residency ablation reads 0.98-1.31x rather than the several-fold factor a
+  bandwidth story needs. The window's problem was Amdahl's law over an
+  activation function with no partition, which no instrument in that section
+  could see because it timed the window and reasoned about the kernel with
+  nothing in between.
+- **Blocking the convolution unconditionally.** Measured **0.82x and 0.89x** on
+  the two b0 shapes, where the weight tensor is 16.5 MiB against a 2.1 MiB
+  activation. Shipped conditionally instead.
+- **A new pooled primitive for the decomposition.** Rejected on blast radius: it
+  would be inherited by eleven other call sites whose right blocking factor is
+  not a property they share (§4).
+- **`vt::ConvTranspose1d`**, and **narrowing the snake's `double`**. Both are
+  out of scope with a reason, not overlooked (§0, §3a).
+
+**Why each default has its value.**
+
+- `kConv1dSliceBytes` is **512 KiB**: half of `thor:gpu0`'s measured 1 MiB
+  PRIVATE L2, because the weight rows of the output channels in flight stream
+  through the same L2 and a slice sized to fill it evicts itself. The box has no
+  shared last-level cache at all, which is why the budget is a per-core one.
+- The block is a **multiple of `kConv1dPosTile`** so the position tiles land
+  where they land today, which is what keeps the code path — not only the
+  arithmetic — unchanged.
+- The blocking condition carries **no constant**: it is `weights <= activation`
+  with the common `in_per_group` divided out, and it flips with the window
+  length rather than naming shapes.
