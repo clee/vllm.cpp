@@ -255,9 +255,11 @@ class Wiring(unittest.TestCase):
         self.assertIn(f"exit {UNIT_GATE_ABSENT}", self.text)
 
     def test_the_heartbeat_is_reaped_on_a_lease_kill(self) -> None:
-        for sig in ("HUP", "INT", "TERM"):
-            self.assertIn(f"' {sig}", self.text.replace("'HUP", "' HUP"))
+        """`rc` reclaiming a device sends SIGTERM, and a bash EXIT trap does not
+        run for a signal with no handler of its own."""
         self.assertIn("trap cleanup EXIT", self.text)
+        for sig, status in (("HUP", 129), ("INT", 130), ("TERM", 143)):
+            self.assertIn(f"trap 'cleanup; exit {status}' {sig}", self.text)
 
 
 if __name__ == "__main__":

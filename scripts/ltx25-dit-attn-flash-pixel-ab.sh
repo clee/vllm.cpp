@@ -38,6 +38,36 @@
 # every thread and cost the recorded 47.84 s denominator ~3.2% (spec section
 # 7.1). Both arms here are instrumented identically and neither is sampled, so
 # the ratio needs no correction.
+#
+# BEFORE YOU SPEND A LEASE ON THIS, read these three paragraphs.
+#
+#   EXIT STATUS. 0, 1 and 2 are the pixel comparison's own verdict and this job
+#   exits with it: 0 every threshold held, 1 a threshold failed, 2 an input could
+#   not be read and NOTHING was compared. A 2 is never a pass. Everything else is
+#   a refusal before the verdict exists:
+#     23 checkpoint staging      25 ltx2-gen will not exec
+#     31 source tarball          33 configure      34 build      35 artefacts
+#     36 no CUTLASS              38 no complete CUDA toolkit
+#     39 MemAvailable is below the start floor and stayed there
+#     40 the swapped op is not in this source     41 the A/B knob is not either
+#     43 the comparison tool is not in this source
+#     44 the CUDA unit gate FAILED       45 the CUDA unit gate BINARY IS ABSENT
+#     46 an arm did not route as its knob asked
+#
+#   A 45 IS USUALLY THE STAGED BINARY CACHE, and the fix is one command. Phase
+#   [D] reuses `$W/pixab-bin` when its `SRC_SHA` matches, and it copies
+#   `test_ltx2_device` only `[ -s ]` -- a cache staged without it therefore
+#   satisfies the build skip and then has no correctness gate to run. This job
+#   refuses rather than rendering, because a routing assertion that cannot run,
+#   inside a job whose whole purpose is proving which kernel executed, is a
+#   silent hole. Clear `$W/pixab-bin` and the build regenerates both.
+#
+#   RESUMING. `RUN_ID` is an environment override. Pass the same one and this
+#   run lands in the same `$OUT` and skips every arm that is already complete
+#   there. A reused arm's per-forward samples came from the earlier lease, so it
+#   is recorded as `timing_source=an-earlier-lease` and phase [H] states that the
+#   speed pair is not a same-lease pair. Its routing is still proved, from the
+#   log that arm already has.
 set -u
 T0=$(date +%s)
 say() { echo "[pixab +$(( $(date +%s) - T0 ))s] $*"; }

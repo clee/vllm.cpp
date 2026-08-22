@@ -523,7 +523,9 @@ never a synonym for "probably fine".
 | A/B, same binary, both arms | `dgx:gpu0` under an `rc` lease | **PENDING** — the flash arm is measured at 7.680 s median (n=19); the worker was lost before the naive arm, so no pair exists (§7.1) |
 | pixel A/B at production geometry | `dgx:gpu0` under an `rc` lease, `scripts/ltx25-dit-attn-flash-pixel-ab.sh` | **PENDING** — criterion registered in §10.4; result in §10.7 |
 | run-to-run control (`flash` twice) | the same lease | **PENDING** — §10.3; without it no arm-to-arm delta is attributable to the kernel |
-| the comparison tool discriminates | `tests/scripts/test_ltx25_render_compare.py` | **PENDING until §10.7** — a dither passes, a one-pixel shift fails all four V checks, and two all-black renders fail C0 while reading as a perfect match on every V (§10.4) |
+| the comparison tool discriminates | `tests/scripts/test_ltx25_render_compare.py` | **PASS** — 37 tests, `OK`, at `2026-08-22`. It needs no GPU, no lease and no NAS, so `PENDING until §10.7` was misreporting a gate that was already green: a dither passes, a one-pixel shift fails all four V checks, two all-black renders fail C0 while reading as a perfect match on every V, an unreadable input exits 2 while a threshold failure exits 1, A1 and A2 disagree on a time-shifted waveform, and the SSIM is pinned by its taps, its impulse response and three fixture values (§10.4). The count dates the run; it is not a floor to defend |
+| the comparison tool runs on a lane | `scripts/agent-preflight.sh`, `.github/workflows/ci.yml` | **PASS** — it ran on NO lane when it landed: absent from preflight's `SUITES`, from the enumerated python block in CI and from `tests/CMakeLists.txt`, while the row above registered it as a gate. Both are registered now. Preflight SKIPs it when numpy is absent, which is the third state and never an `ok`; the CI lane installs `python3-numpy` so the lane that must not be silent cannot be |
+| the harness's own preconditions | `tests/scripts/test_ltx25_pixel_ab_harness.py` | **PASS** — 19 tests, `OK`, at `2026-08-22`. The memory precondition and the arm-completeness check are extracted verbatim from the harness and run against a fabricated `/proc/meminfo`. The four call sites that only a lease can execute are text tripwires and are labelled as such |
 | full preflight | `scripts/agent-preflight.sh` | **PASS at HEAD** — and it was NOT before: `documentation-checkpoint` was red on two of this branch's own commits (see below) |
 | `documentation-checkpoint` | CI, and locally over the branch range | **PASS at HEAD, RED before it, and the red was THIS BRANCH's** — `2aa78c69b` and `2f39a9426` each recorded a measurement in `.agents/benchmark-record.md` without writing `docs/STATUS.md` (and `docs/BENCHMARKS.md` for the second). The control on the main-only range `4c193bd55..5d548d003` is rc 0, so it was not inherited. Both commits were replaced by one that writes all three surfaces together when the branch was rebuilt, and the checker is re-run at each head rather than trusted to have stayed fixed — a job that has stopped appearing in a failing set is not the same fact as a job that passes |
 | `build-newest-gcc` | CI | **PASS, and now green on `main` too** — it was red on `main` on `::getpid` in `test_qwen3_dflash2_gguf.cpp:547`, a file this change does not touch; [#1581](https://github.com/mudler/vllm.cpp/pull/1581) fixed it and this branch carries that fix through the merge. A red here after the merge is therefore this row's, not inherited |
@@ -667,11 +669,36 @@ denominator ~3.2% by `ptrace`-stopping every thread. This harness runs a
 sampler correction and finally replaces the cross-run 6.03-6.23x range with a
 same-binary ratio.
 
-**Routing is proved per arm, two-sided, from that arm's own log.**
-`VT_OP_PROVIDER_STATS=1` makes each op announce itself once when it resolves.
-The flash arm must show `op=21 device=1` **and no** `op=18 device=1`; the naive
-arm the reverse. A one-sided count cannot tell a routed call from an added one,
-and "the knob was exported" is not evidence that the branch was taken.
+**Routing is proved per arm, two-sided, from that arm's own log, and a failure
+STOPS THE RUN.** `VT_OP_PROVIDER_STATS=1` makes each op announce itself once when
+it resolves. The flash arm must show `op=21 device=1` **and no** `op=18
+device=1`; the naive arm the reverse. A one-sided count cannot tell a routed call
+from an added one, and "the knob was exported" is not evidence that the branch
+was taken. The verdict was originally echoed inside a `case ... | tee` pipeline
+and nothing acted on it, which is the shape that matters most here: if the knob
+is not read, both arms are flash, the renders come out bit-identical, and this
+design publishes PASS with all four thresholds vacuous — the strongest positive
+verdict it can produce, from an experiment that had one arm. It is now computed
+into a variable, tested outside any pipeline, and exits 46.
+
+**The lease is not assumed to survive, and the box is not assumed to be empty.**
+Two failures of this harness are recorded rather than smoothed over. It printed
+`available 5` at +0s on 2026-08-22 and built into a lost worker anyway, so phase
+[0b] now gates on `MemAvailable` against a 60 GiB start floor — derived from this
+geometry's own recorded 79.503 GiB peak and 40.13 GiB low-water — waits for a
+previous tenant's memory to be reclaimed, and refuses at exit 39 rather than
+proceeding. And three lost workers each discarded every arm already rendered, so
+`RUN_ID` is overridable and a resumed lease reuses any arm that is complete in
+`$OUT`, states in that arm's record that its timings came from an earlier lease,
+and still proves that arm's routing from the log it already has. A reused arm
+makes the speed pair a cross-lease pair, and phase [H] says so rather than
+letting the ratio imply otherwise. **That declaration is not bookkeeping.** The
+speedup #1549 shipped on is already qualified — its control arm never ran, and
+§8 carries the A/B as `PENDING` because of it — so a resumed run that quietly
+produced a cross-lease ratio presented as a within-lease one would replace a
+stated gap with a false closure. The arm's `ARM` file, the run's `PROVENANCE`
+and phase [H]'s own line all carry `timing_source`, and a reader who takes the
+ratio without them has to have ignored three places that said so.
 
 ### 10.4 The registered acceptance criterion
 
@@ -681,7 +708,7 @@ them by hand afterwards.
 
 | # | check | threshold | where it comes from |
 |---|---|---|---|
-| C0 | each arm, ON ITS OWN: frames written, no near-uniform frame, every frame hash distinct, no zero-motion pair | all four, per arm | **the hole every difference-only comparison has** |
+| C0 | each arm, ON ITS OWN: no near-uniform frame, every frame hash distinct, no zero-motion pair | all three, per arm | **the hole every difference-only comparison has** |
 | V1 | mean \|delta\|, 8-bit RGB | `<= 1.0` level | one level is the quantisation step of the artefact itself; a mean below it says the average pixel is within the PPM's own resolution |
 | V2 | worst-frame PSNR | `>= 40 dB` | the video-coding "visually lossless" convention. This experiment did not choose it |
 | V3 | worst-frame SSIM | `>= 0.99` | Wang et al. 2004, 11x11 Gaussian sigma=1.5 on luma. 0.98 is the usual transparency line; this is stricter, and it is the WORST frame rather than the mean |
@@ -696,7 +723,19 @@ score infinite PSNR and SSIM `1.000000`, and would read as the strongest
 possible pass this table can produce. A run that exited 0 having written frames
 that were all one colour has happened in this repository, so that is a recorded
 failure mode rather than a hypothesis. C0 is computed per arm before anything is
-subtracted, and it is checked first. `verify_render.py` makes the same checks,
+subtracted, and it is checked first.
+
+**"Frames written" used to be a fourth C0 check and it is now a REFUSAL.** An
+arm directory holding no `frame_*.ppm` leaves the tool at exit 2 with no JSON,
+before any check is built, so the check could never report `False` and one of the
+four sub-checks this table registered could never fire. Exit 1 is the status that
+says *the two renders differ*, which is a reading of an experiment that happened;
+an arm that rendered nothing is not that, and a broken render that reported it
+would be indistinguishable from the finding this whole section exists to make. An
+absent `audio.wav` stays a failed CHECK rather than a refusal, deliberately: the
+video comparison is fully defined without it, so there is a result to report.
+
+`verify_render.py` makes the same checks,
 and they are recomputed inside `scripts/ltx25-render-compare.py` rather than
 shelled out to, because that file lives on a mutable path on a share and this
 one is committed per revision — the same reason §7.1 gives for the harness.
@@ -709,30 +748,102 @@ this video's own motion*. It needs no re-argument at another geometry or another
 prompt, because both terms move together — which is exactly what a constant
 cannot do, and why the FA-2 arm (#1551) can take this same criterion.
 
-**The scale is executable, not asserted.** Measured on the recorded 20260820
-baseline's own frames, and pinned in `tests/scripts/test_ltx25_render_compare.py`
-on synthetic fixtures so it is a gate rather than a claim:
+**The scale is executable, and it comes from TWO populations that must not be
+read as one.** An earlier version of this section quoted the first table and said
+it was "pinned in `tests/...` so it is a gate rather than a claim". That sentence
+was false of those numbers: what the suite pins is the second table, on synthetic
+frames, and the two differ by 3.2x on mean `|d|` for the same perturbation.
 
-| perturbation of a real frame | mean \|d\| | PSNR | SSIM | V4 ratio | verdict |
+**Population 1, MEASURED, not gated here.** The recorded 20260820 baseline's own
+`768x448/49f` frames, on the NAS. Nothing in this repository can reach that share,
+so no test asserts these:
+
+| perturbation of a REAL frame | mean \|d\| | PSNR | SSIM | V4 ratio | verdict |
 |---|---|---|---|---|---|
 | none | 0 | inf | 1.000000 | 0.000 | bit-identical |
 | +/-1 LSB on 3% of samples | 0.0199 | 65.1 dB | 0.99992 | 0.0026 | **PASS**, all four |
 | one pixel of global horizontal shift | 5.183 | 28.1 dB | 0.8705 | 0.624 | **FAIL**, all four |
 
+**Population 2, GATED.** The synthetic 96x64/6f fixtures of
+`tests/scripts/test_ltx25_render_compare.py`, seed `20260822`, which every lane
+can compute. These are the numbers that are a gate:
+
+| perturbation of a FIXTURE frame | mean \|d\| | worst PSNR | worst SSIM | V4 ratio | verdict |
+|---|---|---|---|---|---|
+| none | 0 | inf | 1.000000 | 0.000 | bit-identical |
+| +/-1 LSB on 3% of samples | 0.0194 | 65.0 dB | 0.99999 | 0.0007 | **PASS**, all four |
+| one pixel of global horizontal shift | 16.6120 | 21.8 dB | 0.77036 | 0.4487 | **FAIL**, all four |
+
+**Why they differ, and why both belong.** The fixture is a sine grating with a
+4-pixel period plus uniform noise, so one pixel of shift moves each row by a
+quarter of a cycle. The render's real frames are smoother, and the same shift
+moves them less. The fixture is therefore a HARSHER shift and a slightly gentler
+dither, which is the direction a discrimination proof should err in: the pass row
+passes with less headroom than the real one, and the fail row fails harder.
+Neither table calibrates the other, and the sentence that used to imply one
+pinned the other is the defect being repaired here.
+
+The SSIM those tables are computed with is itself pinned by property and by
+value: the eleven taps of the `sigma=1.5` window, the impulse response as
+`outer(k, k)`, its equality along both axes, the Rec.601 luma triple, and three
+fixture SSIMs to eight decimals. Ten separate mutations of that metric -- sigma,
+window, C1, C2, the second separable pass, the luma weights -- left the earlier
+suite green, so "Wang et al. 2004" was a name and not a criterion.
+
 So the thresholds sit between a dither and a single pixel of motion, nearer the
-dither: V4 at `0.10` refuses anything above a sixth of a one-pixel global shift.
-A criterion that admitted the shift row would not be a criterion.
+dither: V4 at `0.10` refuses anything above a quarter of a one-pixel global shift
+on the fixtures, and a sixth of one on the real frames. A criterion that admitted
+either shift row would not be a criterion.
 
 ### 10.5 Reading the result, stated before there is one
 
-- **All checks pass and the control is 0** — the swap changes the render by less
-  than a tenth of its own motion step, the difference is entirely the kernel's,
-  and the verdict is **within bf16 noise**. The measured values, with their
-  headroom, are then what belongs in the record.
-- **All checks pass and the control is comparable to the delta** — the verdict is
-  **indistinguishable from run-to-run nondeterminism**, which is stronger, and
-  the row additionally owes an issue for the nondeterminism itself, because a
-  render that is not reproducible is its own defect.
+**The selector is a number, `R`, and the tool computes it.** Two of the three
+readings below are opposite published verdicts on the same passing result, and
+until this revision nothing computed the comparison they turn on: the tool
+printed the control's figures for a reader to eyeball, and "comparable to the
+delta" was left to a judgement made after the numbers were in view. So:
+
+```
+R = control mean |delta| on luma / treatment mean |delta| on luma
+```
+
+Both terms are the same statistic in the same 8-bit luma units, one from the
+control-vs-its-own-arm comparison and one from the flash-vs-naive comparison.
+The tool reports `R` as `control_ratio.ratio_mean_abs_luma`, alongside the RGB
+ratio and both numerators. **It is reported and never checked**, because it
+selects between two readings of a pass rather than between pass and fail, and a
+check cannot express a choice between two answers that are both answers. `R` is
+`null`, with a stated reason, when the treatment is bit-identical: that is a
+division by zero the arithmetic expects, and §10.2 predicts it will not occur.
+
+The boundary is `0.5`, and it is written here before any `R` exists. It is the
+point at which the control accounts for half of the measured delta, so that
+attributing the delta to the kernel and attributing it to the box are equally
+defensible; a selector without a stated boundary is a judgement call wearing a
+number.
+
+- **All checks pass and `R = 0`** (the control is bit-identical) — the swap
+  changes the render by less than a tenth of its own motion step, the difference
+  is entirely the kernel's, and the verdict is **within bf16 noise**. The
+  measured values, with their headroom, are then what belongs in the record.
+- **All checks pass and `R >= 0.5`** — the verdict is **indistinguishable from
+  run-to-run nondeterminism**, which is stronger, and the row additionally owes
+  an issue for the nondeterminism itself, because a render that is not
+  reproducible is its own defect.
+- **All checks pass and `0 < R < 0.5`** — the delta is partly the kernel's, and
+  the control is the floor every threshold above must be read against. The record
+  states `R` rather than choosing one of the two verdicts.
+- **`R` is `null`** — the two arms are bit-identical, which §10.2 says they will
+  not be. Read that as a finding about the experiment (one arm rendered twice,
+  a knob not read, a cached artefact) before reading it as a result.
+
+**WHICH ARM the control repeats is now an argument, not a convention.**
+`--control-of {a,b}` names it, the JSON records it, and the control block prints
+the sentence. The harness passed `--a naive --b flash --control flash-ctl` while
+the tool compared the control against arm A, so the "run-to-run noise floor" was
+a SECOND naive-vs-flash comparison: it necessarily read about the same size as
+the treatment, and the second branch above would have been published whatever the
+kernel did. A silent convention a caller can invert is not a convention.
 - **Any check fails** — the verdict is **visibly different**, and that is a
   finding about a change already on `main`, not a failure of this work. It owes
   an issue naming what diverged and by how much, and it does not owe a widened
@@ -740,8 +851,126 @@ A criterion that admitted the shift row would not be a criterion.
   exists to prevent, and §9's stop conditions already say so for the numeric
   gate.
 
-### 10.6 What this deliberately does not measure
+### 10.6 The failure this design nearly shipped: a well-formed answer about the wrong thing
 
+**A control compared against the wrong arm is not a weak control. It is a
+fabricated result.** The harness passed `--a naive --b flash --control
+flash-ctl` while the tool compared the control against arm A. `flash-ctl` is a
+repeat of FLASH, so what got labelled "the run-to-run noise floor" was a second
+naive-vs-flash comparison. It would have printed a number of the right
+magnitude, in the right units, in the right place in the report — and it would
+have been the treatment measured twice. §10.5's second branch,
+**indistinguishable from run-to-run nondeterminism**, would then have been the
+published verdict *whatever the kernel did*, and it would have read as the
+strongest null result this design can produce.
+
+**No threshold in §10.4 could have caught it.** V1 to V4 and A1 to A2 judge the
+treatment, and the treatment was wired correctly; C0 judges each arm's content,
+and all three arms had content. The defect was in the WIRING, one argument
+deep, and every number downstream of it was arithmetically correct. A criterion
+committed in advance protects against a threshold moved after the fact. It does
+not protect against an instrument pointed at the wrong thing.
+
+**This campaign keeps meeting that class, and the instances are worth naming
+together, because the shape is what makes them recognisable:**
+
+- the governor that reported `1.00 s`, `69.1 s`, `162 s` and `396.9 s` for one
+  quantity — four well-formed answers, at most one of them about the thing that
+  was asked (§7.1 reads the engine's own `last=` lines instead, for this
+  reason);
+- the append-only checker that read the WORKING TREE instead of the commits and
+  returned `rc=0` three times over a violation that was there;
+- the `static_assert` that compared a literal against itself and read
+  `256 == 256`, staying green when the constant it was meant to pin changed.
+
+Each returned a confident, structurally valid answer to a question nobody had
+verified it was asking. **The repair for the class is the same each time: make
+the instrument state what it is measuring, in its own output, in words.** So
+`--control-of` is now a required-by-default argument, the JSON records
+`control_of`, and the control block prints the sentence naming the arm it was
+read against. A convention a caller can invert silently is not a convention, and
+a reader who cannot see the wiring in the report cannot audit it.
+
+### 10.7 The measurement
+
+**NOT YET TAKEN.** The renders have not landed. A run is submitted on
+`f407019e3` as `rc` job `2ccd1acf-dfa6-40b4-b095-1928caebe2c1`, `RUN_ID=1612-r2`,
+on `dgx:gpu0`. This heading exists so that the result has one place to go and so
+that its absence is visible; it is not a promise that the run succeeded. The
+previous attempt (job `5fb9399f-4f4e-417c-adbd-4d741a2e18e4`, 2026-08-22) lost
+its worker during the build with the box already at 114 of 119 GiB used before
+it allocated anything, which is what §10.3's start-floor gate now refuses.
+
+**AND THE GATE IS ALREADY REFUSING, WHICH FALSIFIES THE READING THIS ROW STARTED
+FROM.** Job `2ccd1acf` reports, from its own poll log:
+
+```
+[pixab +0s] === [0b] the MemAvailable PRECONDITION, gated rather than printed ===
+[pixab +0s]   MemAvailable 5.1 GiB < 60.0 GiB, waited 0s of 1200s
+[pixab +360s]  MemAvailable 5.1 GiB < 60.0 GiB, waited 360s of 1200s
+```
+
+`5.0` GiB in the lost lease an hour earlier, `5.1` GiB now, **flat for six
+minutes across two leases and at least two intervening jobs.** So this is NOT a
+previous tenant's memory awaiting reclamation, which is what
+[#1709](https://github.com/mudler/vllm.cpp/issues/1709) currently records and
+what the wait in §10.3 was designed for: something on that box holds ~114 GiB
+persistently. The condition is PERSISTENT and the transient reading is
+falsified. That distinction is only available because the gate logs EVERY poll
+rather than only its refusal — a single refusal line would have said "5.1 GiB"
+and left the cause open. A read-only diagnostic to identify the resident
+allocation is with the operator, and #1709 owes the correction. The renders
+cannot be taken on that box until it is resolved, and no arm has run.
+
+When it lands, this section records: the three arms' frame counts and routing
+proofs, the C0 block, V1 to V4 and A1 to A2 with their headroom, the control
+ratio `R` and which of §10.5's readings it selects, the cross-check against the
+20260820 baseline, and the exit status the harness returned.
+
+### 10.8 What this deliberately does not measure
+
+- **WHETHER THE CONTENT IS THE RIGHT CONTENT. C0 is necessary and it is not
+  sufficient.** C0 asks three questions — is there variance in each frame, is
+  every frame hash distinct, does anything move between them — and **two
+  identical sequences of pure noise answer all three and pass every C and V
+  check with the verdict `PASS`**. That is demonstrated, not feared. The same
+  hole admits a pair of renders that are perfectly consistent with each other
+  and wrong together: the wrong prompt, the wrong seed, the wrong checkpoint
+  class, a text encoder that produced nothing, a VAE decoding a latent the
+  sampler never refined. Each of those is a *difference from an intended
+  render*, and every measurement in this section is a difference between two
+  arms, so none of them can see it. Nothing here should be extended to try:
+  a check for "is this a golden retriever shaking off water" is a model, not a
+  threshold. **The only absolute reference present is the cross-check against
+  the recorded 20260820 baseline in phase [J] of the harness** — a real render
+  of this prompt at this geometry, from an ancestor build — and it is a
+  cross-check precisely because its binary lineage differs, so it bounds this
+  class rather than closing it. When that baseline is unreachable, the run says
+  so and this class is unmeasured for that run.
+- **MOST OF THE HARNESS ITSELF.** `tests/scripts/test_ltx25_pixel_ab_harness.py`
+  extracts the `MemAvailable` reader, the start gate and the arm-completeness
+  check verbatim from `scripts/ltx25-dit-attn-flash-pixel-ab.sh` and runs them
+  against a fabricated `/proc/meminfo`, so those three execute here. **The render
+  loop, the routing assertion, the phase [I] call site and the phase [L] exit do
+  not.** They are pinned as TEXT — the suite asserts the exact call site that
+  shipped inverted, and the exact `exit` lines — and a text assertion is a
+  tripwire, not a proof: it catches the inversion that happened and would not
+  catch a rewrite that reintroduced it in different words. `dgx:gpu0` under a
+  lease is the only place those lines run, which is why every one of them was
+  wrong at once: they had never executed anywhere a test could watch. **That is
+  a structural explanation of a cluster rather than four coincidences**, and it
+  tells the next reader which claims in this harness are load-bearing and which
+  are decorative — what a test can execute is now checked, and what only a lease
+  can execute is a comment to be verified against the run's own log.
+
+  **One mutation of the memory gate is deliberately a TIMEOUT rather than a
+  failed assertion.** Inverting its floor comparison makes the gate wait out its
+  whole budget instead of proceeding, so the suite never returns. The mutation
+  runner records that as RED with the reason named, because a suite that did not
+  report `OK` is not a suite that passed. A timeout read as success is the exact
+  silent hole a wait-for-quiet loop already cost this campaign once, so that
+  path was exercised on purpose rather than left for whoever next inverts that
+  line.
 - **PPM is 8-bit.** The comparison is on the artefact the pipeline writes, which
   is already quantised from the VAE's float output. A difference below `1/255`
   relative is invisible to it. That is the right resolution for the question
@@ -788,6 +1017,22 @@ A criterion that admitted the shift row would not be a criterion.
   the two stems also edits that checker's pinned-set test, which is #1578's file
   and not this row's, so it is left to whoever runs preflight next — the handoff
   that allowlist's own header describes. Owner: this row until it is deleted.
+- **Most of the harness still runs nowhere but a lease.**
+  `tests/scripts/test_ltx25_pixel_ab_harness.py` exercises the memory
+  precondition and the arm-completeness check, which are extracted verbatim from
+  `scripts/ltx25-dit-attn-flash-pixel-ab.sh`. The render loop, the routing
+  assertion, the phase [I] call site and the phase [L] exit are pinned as TEXT
+  and nothing executes them, so a rewrite that reintroduced any of those defects
+  in different words would pass. That is a limit of where the file runs, not a
+  gap that another local test can close. Owner: this row. Issue:
+  [#1612](https://github.com/mudler/vllm.cpp/issues/1612).
+- **`scripts/ltx25-render-compare.py` writes `Infinity` into its JSON.** A
+  bit-identical pair has zero MSE and infinite PSNR, and `json.dump` spells that
+  `Infinity`, which `json.load` reads back and a strict JSON parser refuses. Every
+  consumer here is Python, so it is disclosed rather than repaired: replacing it
+  with `null` or a sentinel would change what the report means for the one case
+  the whole comparison hopes to see. Owner: this row. Issue:
+  [#1612](https://github.com/mudler/vllm.cpp/issues/1612).
 - **True tensor cores at head_dim 128.** `vt::AttentionDenseFa2` refuses
   anything but head_dim 64 (`src/vt/cuda/cuda_flash_attn_fa2.cu:557-560`).
   Reaching the vendored FA-2 `mma.sync` path for LTX's head_dim 128 needs an
