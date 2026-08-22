@@ -71,9 +71,12 @@ std::optional<std::string> GetKvCacheQuantAlgoString(
 ResolvedCacheDTypeString ResolveKvCacheDTypeString(
     const std::string& requested, const std::string& quant_config_json);
 
-// Read `hf_quant_config.json` from a model directory, falling back to the
-// `quantization_config` object inside `config.json`. Returns "" when the
-// directory holds neither — which is not an error: most checkpoints declare no
+// Read the `quantization_config` object inside `config.json` from a model
+// directory, falling back to a standalone `hf_quant_config.json`. That order is
+// upstream's (`transformers_utils/config.py:751-761`) and it is the inline
+// document first: ModelOpt writes it into `config.json` from 0.31.0 on, and the
+// separate file is what 0.29.0 and before wrote. Returns "" when the directory
+// holds neither — which is not an error: most checkpoints declare no
 // quantization at all.
 std::string ReadQuantConfigJson(const std::string& model_dir);
 

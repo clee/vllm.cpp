@@ -636,6 +636,9 @@ vllm_cpp_add_test(test_gemma4_honesty vllm/models/test_gemma4_honesty.cpp)
 # case that wants a different one.
 vllm_cpp_add_test(test_gemma4_moe_device_arm_guard
                   vllm/models/test_gemma4_moe_device_arm_guard.cpp)
+vllm_cpp_add_test(test_gemma4_indexed_max_t vllm/models/test_gemma4_indexed_max_t.cpp)
+target_compile_definitions(test_gemma4_indexed_max_t PRIVATE
+  VLLM_CPP_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 vllm_cpp_add_test(test_qwen3_moe_load vllm/models/test_qwen3_moe_load.cpp)
 vllm_cpp_add_test(test_qwen3_moe_forward vllm/models/test_qwen3_moe_forward.cpp)
 target_include_directories(test_qwen3_moe_forward PRIVATE ${CMAKE_SOURCE_DIR}/src)
@@ -1230,6 +1233,13 @@ vllm_cpp_add_test(test_dflash2_draft_routing
 # with the missing part named, instead of being silently dropped.
 vllm_cpp_add_test(test_speculative_unknown_keys
   vllm/config/test_speculative_unknown_keys.cpp)
+# SPEC-DRAFTER-CHAIN W1 (#1522): the `vllm_cpp.drafter_chain` extension of
+# --speculative-config -- its parsing, its validation and its refusals. The
+# nesting under `vllm_cpp` is the same convention `--offload-config` already
+# uses for this engine's non-vLLM keys, and it is what bounds the collision
+# surface with vLLM's own `SpeculativeConfig` to exactly one name.
+vllm_cpp_add_test(test_speculative_drafter_chain
+  vllm/config/test_speculative_drafter_chain.cpp)
 # SPEC-MTP-K-GT-1 (#81): the MTP speculation-DEPTH config contract — the k=1
 # default, the upstream divisibility rule, and that a configured k above 1 is
 # carried rather than silently degraded.
@@ -1416,6 +1426,15 @@ vllm_cpp_add_test(test_dspark_block_size_guard vllm/entrypoints/test_dspark_bloc
 # transformers_utils suite calls the function directly and cannot see a deleted
 # call site; this one can. Named `dflash` so `ctest -R "dflash|dspark"` runs it.
 vllm_cpp_add_test(test_dflash_draft_hf_cache vllm/entrypoints/test_dflash_draft_hf_cache.cpp)
+# SPEC-DRAFTER-CHAIN W1 (#1522): the REACHABILITY and ORDERING half. W1 stores a
+# field nothing resolves yet, so the one way it could land dead is a parsed chain
+# no production caller reads. `ResolveSpecConfig` is that reader and it refuses by
+# name; `FromModelDir` runs the refusal ahead of the path resolution, which is what
+# G5's "before any weight I/O" means. Needs src/ on the include path for the same
+# reason `test_weight_residency_reach` does: it drives the public `vllm.h` ABI.
+vllm_cpp_add_test(test_drafter_chain_reach
+  vllm/entrypoints/test_drafter_chain_reach.cpp)
+target_include_directories(test_drafter_chain_reach PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_beam_search vllm/entrypoints/test_beam_search.cpp)
 # ROAD-V1-MM serving W1: OpenAI multimodal content-part parse + decode + route
 # to the existing single-sequence mm processors (CPU, no model weights). Reuses
@@ -1637,6 +1656,11 @@ if(VLLM_CPP_SERVER)
   vllm_cpp_add_test(test_serve_residency_config
     vllm/entrypoints/openai/test_serve_residency_config.cpp)
   target_include_directories(test_serve_residency_config PRIVATE ${CMAKE_SOURCE_DIR}/src)
+  # KV-FP8 W3 (#1593): --kv-cache-dtype reaching EngineParams through the REAL
+  # VllmServerMain. Same shape and the same reason as the row above.
+  vllm_cpp_add_test(test_serve_kv_cache_dtype
+    vllm/entrypoints/openai/test_serve_kv_cache_dtype.cpp)
+  target_include_directories(test_serve_kv_cache_dtype PRIVATE ${CMAKE_SOURCE_DIR}/src)
 endif()
 vllm_cpp_add_test(test_outputs vllm/test_outputs.cpp)
 
@@ -2530,6 +2554,17 @@ target_compile_definitions(test_qwen27_dflash_spec_decode PRIVATE
 target_include_directories(test_qwen27_dflash_spec_decode PRIVATE
   ${CMAKE_SOURCE_DIR}/tests/parity ${CMAKE_SOURCE_DIR}/src)
 
+# SPEC-DFLASH2 W6 — the DFlash2 e2e gate (#1314): G2 draft-token identity and
+# G3 SAME-TRAJECTORY acceptance against the beyond-pin oracle
+# (vllm-project/vllm#52816 @ 66e5414c6, TRITON_ATTN). dgx-only; loud SKIP
+# everywhere else, naming the two checkpoints and the golden it needs.
+vllm_cpp_add_test(test_qwen38_dflash2_spec_decode
+  parity/test_qwen38_dflash2_spec_decode.cpp)
+target_compile_definitions(test_qwen38_dflash2_spec_decode PRIVATE
+  PARITY_GOLDENS_DIR="${CMAKE_SOURCE_DIR}/tests/parity/goldens")
+target_include_directories(test_qwen38_dflash2_spec_decode PRIVATE
+  ${CMAKE_SOURCE_DIR}/tests/parity ${CMAKE_SOURCE_DIR}/src)
+
 # SPEC-MTP M-mtp-2 — the 35B MoE-MTP k=1 speculative-decode three-way identity
 # gate (Qwen3_5MoeMTP: our spec-ON == our spec-OFF == vLLM greedy) + measured
 # nonzero acceptance. Mirror of the 27B gate at 35B (MoE MTP draft head).
@@ -2642,6 +2677,25 @@ vllm_cpp_add_test(test_qwen38_27b_nvfp4_arm
 target_compile_definitions(test_qwen38_27b_nvfp4_arm PRIVATE
   QWEN38_27B_NVFP4_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/vllm/models/fixtures/qwen38_27b_nvfp4")
 target_include_directories(test_qwen38_27b_nvfp4_arm PRIVATE
+  ${CMAKE_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
+
+# QUANT-QWEN38-27B-NVFP4-ARM W5 (#821, #1574,
+# .agents/specs/qwen38-27b-quant-arms.md): the ModelOpt `MIXED_PRECISION`
+# accounting + config/tensor cross-check for
+# `r0b0tlab/Qwen3.8-27B-NVFP4-MTP-sm121`. A SECOND artifact of the same model,
+# and a second file rather than a widening of the gate above: that one pins the
+# 1968-name compressed-tensors set and this one pins a 2001-name ModelOpt set,
+# and a gate that accepted both by loosening would measure neither. Hermetic —
+# it reads the four COMMITTED manifests and the two COMMITTED config documents,
+# never a weight byte; the live re-verification arm is env-gated on
+# VLLM_CPP_QWEN38_27B_MODELOPT_MTP_DIR and SKIPS loudly without it. `src` is on
+# the include path because the resolver under test is a model-private header
+# under src/, not an include/vllm/ surface.
+vllm_cpp_add_test(test_qwen38_27b_modelopt_mtp_arm
+  vllm/models/test_qwen38_27b_modelopt_mtp_arm.cpp)
+target_compile_definitions(test_qwen38_27b_modelopt_mtp_arm PRIVATE
+  QWEN38_27B_MODELOPT_MTP_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/vllm/models/fixtures/qwen38_27b_modelopt_mtp")
+target_include_directories(test_qwen38_27b_modelopt_mtp_arm PRIVATE
   ${CMAKE_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
 
 vllm_cpp_add_test(test_qwen3_32b_nvfp4a16_paged_engine

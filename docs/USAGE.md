@@ -97,10 +97,20 @@ the default storage dtype explicitly. `float16` and `fp8_e5m2` parse and are
 then refused by name, because no attention block writes either yet.
 
 **The checkpoint can ask for it.** When you pass no flag, the server reads the
-checkpoint's `hf_quant_config.json` (or `config.json`'s `quantization_config`)
-and honours a declared `kv_cache_quant_algo`, printing one line naming what it
-resolved. An explicit `--kv-cache-dtype` always wins over the declaration. This
-mirrors vLLM's `resolve_kv_cache_dtype_string`.
+checkpoint's `config.json` `quantization_config` (falling back to a standalone
+`hf_quant_config.json`, which is what ModelOpt 0.29.0 and before wrote) and
+honours a declared `kv_cache_quant_algo`, printing one line naming what it
+resolved. An explicit `--kv-cache-dtype` always wins over the declaration. Both
+the order of the two files and the precedence mirror vLLM.
+
+**It costs you the fast attention kernels, and we have not measured the net.**
+An fp8 KV cache is read by the tiled prefill and block decode kernels only.
+FA-2 prefill, all three FA-2 decode topologies, the WMMA ladder and the
+vectorized decode-opt/GQA kernels are bf16-native and are skipped whenever the
+cache is not bf16. So this flag buys half the KV bytes and twice the pool, and
+spends an unmeasured amount of attention throughput to do it. Which way the sum
+goes depends on your model, context length and concurrency; measure your own
+workload both ways rather than assuming the memory win is free.
 
 **Accuracy.** A checkpoint that declares fp8 KV but ships no `k_scale`/`v_scale`
 tensors serves on the default scale 1.0, and the server says so on stderr. That
@@ -131,10 +141,46 @@ The draft may be a checkpoint directory or a single `.gguf` file, for DFlash,
 DFlash2 and DSpark alike. A GGUF draft is dequantized to bf16 as it loads, so
 picking a smaller quantization saves download and disk and does not save memory.
 
+**The TARGET's `lm_head` may be quantized.** A DFlash or DFlash2 draft owns no
+output head and runs the target's, so until
+[#1628](https://github.com/mudler/vllm.cpp/issues/1628) that head had to be stored
+as dense bf16: pointing a draft at a safetensors target whose `lm_head.weight` is
+ModelOpt or compressed-tensors NVFP4 refused the load with `dflash: target tensor
+lm_head.weight is not BF16 (got U8)`. It is now kept packed and multiplied by the
+same GEMM the target's own logits take. A head this engine could only read by
+WIDENING it still refuses by name -- a GGUF target's `output.weight`, an FP8
+`lm_head`, and an NVFP4 head under `VT_MODELOPT_W4A4=1` -- because the DFlash2
+candidate selector reads the target head's exact top-K and a widened head changes
+that set with no visible symptom. A DSpark draft still refuses every quantized
+target head. `VT_LMHEAD_FP4=0` (see [environment](ENVIRONMENT.md)) rolls the
+packed head back for the whole engine, and it rolls this refusal back with it:
+the draft load then fails by name on an NVFP4 target, which is the pre-#1628
+behaviour and is the point of a rollback.
+
+Loading a DFlash2 draft prints a notice to **stderr**, on both the safetensors
+and the GGUF arm. **It prints TWICE per load**, on the server, the C API and the
+bench client alike: the loader reaches the same check from two places on one set
+of engine parameters — directly, before the target is mapped, and again through
+the speculative-config resolution the engine constructor runs — and the check
+carries no once-flag. That is a known defect and it is cosmetic: nothing is
+refused, and no WEIGHTS are loaded twice -- what re-runs is the classification
+and its paragraph
+([#1607](https://github.com/mudler/vllm.cpp/issues/1607)). The notice is purely
+informational. It names what runs, what is still owed (the bf16 residency
+above, and that no throughput number has been taken), and that the port mirrors
+[vllm#52816](https://github.com/vllm-project/vllm/pull/52816), which merged
+upstream on 2026-08-21 at `3406ec1d` and onto which this port is not yet
+reconciled ([#1561](https://github.com/mudler/vllm.cpp/issues/1561)).
+
 [Speculative decoding](SPECULATIVE-DECODING.md) lists the supported methods, the
 draft checkpoints each was gated against, and what each one refuses by name.
 Drafting is greedy: `draft_sample_method` accepts only `"greedy"`, and any other
 value is refused at startup rather than silently ignored.
+
+The same flag also takes one key vLLM does not have, `vllm_cpp.drafter_chain`,
+which names several speculators in preference order. It is parsed and checked
+today and **refused at startup**, because nothing resolves a chain yet; the same
+page says what the document looks like and what each rule refuses.
 
 ## Use the C ABI
 
@@ -208,6 +254,20 @@ supported.
 - Read the matching model or task guide before you add model-specific flags.
 - If startup fails, use the exact error text to find the refused file, option,
   operation, or checkpoint arm in the focused guides.
+- On ROCm, GGUF mixture-of-experts checkpoints compute on the quantized
+  expert blocks (Q8_0, Q4_K, Q5_K, Q6_K) instead of being dequantized to
+  bf16 at load time.
+- On ROCm, mixture-of-experts models run the shared-expert gate and both
+  expert-combine steps on device. Before these ops were registered the
+  engine refused with `no kernel for op` on that path.
+- On ROCm, decode-shaped GEMMs (batch of 4 or fewer, bf16) run on a split-K
+  skinny-GEMM kernel rather than the tiled BLAS path. Set `VT_ROCM_SKINNY=0`
+  to restore the BLAS path when you want to compare the two.
+- On ROCm, Gemma-4 FP8 mixture-of-experts decode uses the device-indexed
+  expert gate for batches up to 63 tokens; wider batches use the
+  prefill-batch path. Set `VT_GEMMA4_DECODE_INDEXED_MAX_T=1` to restore the
+  previous single-token gate when you want to compare the two paths. See
+  [Environment variables](ENVIRONMENT.md).
 - `tokenizer: merge token "..." at merge rank N ... is not in the vocabulary`
   means the tokenizer file names a merge whose left token, right token, or
   joined result is missing from its own vocabulary. Both `tokenizer.json` and a
@@ -236,7 +296,7 @@ lists other published arms when they have not been used as a gated checkpoint.
 | Model or component | File | Size | Repository and revision | Quantized SHA-256 | Supported arms | Refused arms or missing part |
 |---|---|---|---|---|---|---|
 | DSpark for Qwen3.8-27B | `model.safetensors` | 2,718,576,122 bytes | `RadixArk/Qwen3.8-27B-DSpark` @ `85ef153be924f17ce4bf62726954eeaa4a73e854` | n/a (non-quantized) | Qwen3 DSpark routing | Token-exact decode gate is pending |
-| Nemotron-3.5-Lightning-30B | `model-000{01..52}-of-00052.safetensors` | 21,583,809,748 bytes total | `nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4` @ `29f2d1746d8f41e316523194b19018707749b1b1` | `672c8bda10fdec0256e0819e112d2aa3a936cc3e5d311a05fd3ff773ca9a44b9` (first shard) | Device bf16, GQA, and NVFP4 experts; host FP8 Mamba2 and NVFP4 head | GGUF, MTP, and batched decode |
+| Nemotron-3.5-Lightning-30B | `model-000{01..52}-of-00052.safetensors` | 21,583,809,748 bytes total | `nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4` @ `29f2d1746d8f41e316523194b19018707749b1b1` | `672c8bda10fdec0256e0819e112d2aa3a936cc3e5d311a05fd3ff773ca9a44b9` (first shard) | Device bf16, GQA, NVFP4 experts, and the NVFP4 head (A2-Q2b, unmeasured); host FP8 Mamba2 | GGUF, MTP, and batched decode |
 | MiniMax-H3 FL2VA | `MiniMax-H3-FL2VA-Q4_K_M.gguf` | 19,864,208,160 bytes | `realrebelai/MiniMax-H3_GGUFs` @ `daf03b4ca652cce16dfd4fcf91e79c52ffa5c1e7` | `5e8fa6e960d5fbd547390ceec63fcead275435d8f3bd2466a8a2cbd8c2e361e3` | Q4_K_M `t2va` and `fl2va`, verified end to end | `ref2va` requires the REF2VA partition |
 | MiniMax-H3 REF2VA | `MiniMax-H3-REF2VA-Q4_K_M.gguf` | 19,864,208,064 bytes | `realrebelai/MiniMax-H3_GGUFs` @ `daf03b4ca652cce16dfd4fcf91e79c52ffa5c1e7` | `17925612821ea3037ffaf5f7f9789f5460e87025385bd45e9ec6c7d536684d56` | Q4_K_M `ref2va`, verified end to end | `t2va` and `fl2va` require the FL2VA partition |
 | MiniMax-H3 encoder | `qwen3vl-32B-MiniMax-H3-Q4_K_M.gguf` | 14,576,977,888 bytes | `realrebelai/MiniMax-H3_GGUFs` @ `daf03b4ca652cce16dfd4fcf91e79c52ffa5c1e7` | `1bf75e038c5895b97b6ea16cc1e3d32076254b06ec3df10657650d86dc82279e` | Q4_K_M text and multimodal conditioning | No separate refused arm recorded |
@@ -255,6 +315,10 @@ lists other published arms when they have not been used as a gated checkpoint.
 | Qwen3.8-27B GGUF projector | `mmproj-BF16.gguf` | 931,146,432 bytes | `unsloth/Qwen3.8-27B-GGUF` @ `fe1e2a23d973adb629709749dc4f6756df66ef10` | `83ee4f4f205fa514161778c41df1ea14144faa0f713510893b63c2395f5c2d53` | BF16 `clip` projector loads and validates through `--mmproj` | No request path runs the loaded projector |
 | Qwen3.8-27B mixed FP8 and NVFP4 | `model.safetensors` | 22,568,192,096 bytes | `unsloth/Qwen3.8-27B-NVFP4` @ `7d6f8d4d72f56b92b3cdbf22f156b90e1bab0108` | `c473512c70eace07e2256fe9fd76596ac03e3295bee7d54cfb72676416afcc05` | NVFP4 modules load | FP8 modules and quantized KV cache are refused |
 | Qwen3.8-27B MTP drafter | `model_mtp.safetensors` | 849,400,392 bytes | `unsloth/Qwen3.8-27B-NVFP4` @ `7d6f8d4d72f56b92b3cdbf22f156b90e1bab0108` | n/a (non-quantized) | BF16 MTP artifact is present | MTP execution is owed |
+| Qwen3.8-27B ModelOpt NVFP4 shard 1 of 4 | `model-00001-of-00004.safetensors` | 9,965,644,108 bytes | `r0b0tlab/Qwen3.8-27B-NVFP4-MTP-sm121` @ `36f717a22990e82c54c1d48ee77c491b87825680` | Locally computed hash is owed; the bytes are not mirrored here, and the four shards are verified semantically instead (header parse plus data end equal to the published size); #821 | 208 per-tensor static FP8 and 193 W4A16_NVFP4 modules load | The declared FP8 KV cache is unread; #1593 |
+| Qwen3.8-27B ModelOpt NVFP4 shard 2 of 4 | `model-00002-of-00004.safetensors` | 9,985,743,924 bytes | `r0b0tlab/Qwen3.8-27B-NVFP4-MTP-sm121` @ `36f717a22990e82c54c1d48ee77c491b87825680` | Locally computed hash is owed; #821 | Same arms as shard 1 | The declared FP8 KV cache is unread; #1593 |
+| Qwen3.8-27B ModelOpt NVFP4 shard 3 of 4 | `model-00003-of-00004.safetensors` | 1,120,886,516 bytes | `r0b0tlab/Qwen3.8-27B-NVFP4-MTP-sm121` @ `36f717a22990e82c54c1d48ee77c491b87825680` | Locally computed hash is owed; #821 | Same arms as shard 1 | The declared FP8 KV cache is unread; #1593 |
+| Qwen3.8-27B ModelOpt MTP drafter | `model-00004-of-00004.safetensors` | 849,400,592 bytes | `r0b0tlab/Qwen3.8-27B-NVFP4-MTP-sm121` @ `36f717a22990e82c54c1d48ee77c491b87825680` | Locally computed hash is owed; #821 | Fifteen BF16 MTP tensors are present and unquantized | MTP execution is owed |
 | Qwen3.8-2.4T-A95B | `UD-Q1_0` ten-file GGUF split | about 370 GiB | `unsloth/Qwen3.8-2.4T-A95B-GGUF` @ `567d3e6ac26c5474b18311e619c04350fb9a5556` | `b7770552b2ac24e7334c917bc92e90e218e87cfe29484db65e62e8ef2a60334d` (shard 1); `2765517f833c736338d3ab34354e1c10eb8d79e62325f998285b435e5cf03dcd` (shard 2) | CPU expert streaming from disk | CUDA refuses a checkpoint that exceeds device capacity |
 <!-- checkpoint-registry:end -->
 

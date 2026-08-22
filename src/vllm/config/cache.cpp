@@ -181,15 +181,22 @@ std::string ReadQuantConfigJson(const std::string& model_dir) {
   const fs::path dir(model_dir);
   if (!fs::is_directory(dir, ec)) return std::string();
 
-  const fs::path hf_quant = dir / "hf_quant_config.json";
-  if (fs::is_regular_file(hf_quant, ec)) {
-    std::ifstream in(hf_quant, std::ios::binary);
-    if (in) {
-      std::ostringstream ss;
-      ss << in.rdbuf();
-      return ss.str();
-    }
-  }
+  // UPSTREAM ORDER, and it is the CURRENT file first. `config.py:751-761`:
+  //
+  //   quantization_config = config_dict.get("quantization_config", None)
+  //   if quantization_config is None and file_or_path_exists(
+  //           model, "hf_quant_config.json", revision):
+  //       quantization_config = get_hf_file_to_dict("hf_quant_config.json", ...)
+  //
+  // carrying upstream's own two comments: "ModelOpt 0.31.0 and after saves the
+  // quantization config in the model config file", and the separate file is
+  // "ModelOpt 0.29.0 and before". So the legacy file is a FALLBACK and is never
+  // opened when `config.json` carries the inline document. That matters because
+  // checkpoints get re-quantized in place: a repository that grew an inline
+  // `quantization_config` and kept its old `hf_quant_config.json` beside it
+  // resolves to what the CURRENT file says rather than to the stale one. W3
+  // shipped this pair in the other order and nothing gated it; the case that
+  // does now is G10 in tests/vllm/entrypoints/test_kv_cache_fp8_wiring.cpp.
   const fs::path config = dir / "config.json";
   if (fs::is_regular_file(config, ec)) {
     std::ifstream in(config, std::ios::binary);
@@ -201,8 +208,22 @@ std::string ReadQuantConfigJson(const std::string& model_dir) {
           return doc["quantization_config"].dump();
         }
       } catch (const nlohmann::json::exception&) {
+        // A malformed `config.json` is not this resolver's error to raise, and
+        // it is not a reason to reach for the legacy file either: upstream
+        // parses this file once and would have failed there. "Nothing declared"
+        // is the honest answer; the loader reports the parse with its own
+        // context.
         return std::string();
       }
+    }
+  }
+  const fs::path hf_quant = dir / "hf_quant_config.json";
+  if (fs::is_regular_file(hf_quant, ec)) {
+    std::ifstream in(hf_quant, std::ios::binary);
+    if (in) {
+      std::ostringstream ss;
+      ss << in.rdbuf();
+      return ss.str();
     }
   }
   return std::string();

@@ -47,6 +47,7 @@
 #include <nlohmann/json.hpp>
 
 #include "vllm/config/cache.h"
+#include "vllm/config/speculative.h"
 #include "vllm/entrypoints/model_loader.h"
 #include "vllm/model_executor/layers/quantization/kv_cache.h"
 #include "vllm/model_executor/models/kv_cache_route.h"
@@ -99,6 +100,17 @@ constexpr const char* kGateCheckpointQuantConfig = R"({
 constexpr const char* kNoKvDeclarationQuantConfig = R"({
   "producer": {"name": "modelopt", "version": "0.46.0rc1"},
   "quantization": {"quant_algo": "FP8", "quantized_layers": {}}
+})";
+
+// The SAME declaration in the place ModelOpt 0.31.0 and after writes it: inline
+// under `config.json:quantization_config`, flat, with `quant_method` beside the
+// algorithm (`vllm/transformers_utils/config.py:751-753`). It quantizes weights
+// and says nothing about the KV cache, so a loader that reads it takes the model
+// dtype — and a loader that reaches past it to a stale `hf_quant_config.json`
+// does not.
+constexpr const char* kInlineWeightsOnlyQuantConfig = R"({
+  "model_type": "qwen3_5_text",
+  "quantization_config": {"quant_method": "modelopt", "quant_algo": "FP8"}
 })";
 
 // ─── Synthetic dense-hybrid model (the same shape as
@@ -219,6 +231,64 @@ vllm::Qwen3_5DenseWeights MakeDenseWeights(const HfConfig& c) {
   }
   return w;
 }
+
+// The same model with its full-attention K and V projections in the RAW torch
+// Linear layout every real safetensors checkpoint ships: [N=out, K=in] with
+// `nk` set. `ProjectFullAttnQkv` serves those through `MatmulBf16D`, so the
+// projection emits the MODEL dtype (bf16) instead of the f32 that `MakeDenseWeights`
+// happens to produce — which is the difference the fp8 store sees. See G9.
+vllm::Qwen3_5DenseWeights MakeDenseWeightsTorchKv(const HfConfig& c) {
+  vllm::Qwen3_5DenseWeights w = MakeDenseWeights(c);
+  const int64_t H = c.hidden_size;
+  const int64_t Hkv = c.num_key_value_heads, Dh = c.head_dim;
+  for (size_t l = 0; l < w.layers.size(); ++l) {
+    vllm::Qwen3_5DenseLayerWeights& lw = w.layers[l];
+    if (lw.is_linear_attention) continue;
+    const uint64_t s = 1000 + static_cast<uint64_t>(l) * 5000;
+    const int64_t Hq = c.num_attention_heads;
+    // All THREE, because that is the only shape a checkpoint comes in: the fused
+    // preamble requires `qgate` and `kf` to share one dtype
+    // (`vt::AttnQkNormRopeGate`), so a half-converted layer is a harness defect
+    // rather than a case.
+    lw.attn.q_proj = MakeOwned(DType::kBF16, {2 * Hq * Dh, H}, s + 10);
+    lw.attn.q_proj.nk = true;
+    lw.attn.k_proj = MakeOwned(DType::kBF16, {Hkv * Dh, H}, s + 20);
+    lw.attn.k_proj.nk = true;
+    lw.attn.v_proj = MakeOwned(DType::kBF16, {Hkv * Dh, H}, s + 30);
+    lw.attn.v_proj.nk = true;
+  }
+  return w;
+}
+
+// A throwaway model directory carrying only the files the loader's resolution
+// stanza opens. `LoadedEngine::FromModelDir` is the only caller of
+// `vllm::ReadQuantConfigJson`, so a case that wants to measure the LOADER has to
+// hand it a directory rather than a string.
+class CheckpointDir {
+ public:
+  CheckpointDir() {
+    static int counter = 0;
+    path_ = std::filesystem::temp_directory_path() /
+            ("vllm_kvfp8_ckpt_" + std::to_string(counter++));
+    std::error_code ec;
+    std::filesystem::remove_all(path_, ec);
+    std::filesystem::create_directories(path_);
+  }
+  ~CheckpointDir() {
+    std::error_code ec;
+    std::filesystem::remove_all(path_, ec);
+  }
+  CheckpointDir(const CheckpointDir&) = delete;
+  CheckpointDir& operator=(const CheckpointDir&) = delete;
+
+  void Write(const char* name, const std::string& body) const {
+    std::ofstream(path_ / name, std::ios::binary) << body;
+  }
+  std::string str() const { return path_.string(); }
+
+ private:
+  std::filesystem::path path_;
+};
 
 vllm::tok::Tokenizer BuildFixture() {
   static int counter = 0;
@@ -845,4 +915,298 @@ TEST_CASE("kv-fp8 W3 G8: float16 and fp8_e5m2 are refused, not mis-stored") {
   } catch (const std::runtime_error& e) {
     CHECK(std::string(e.what()).find("fp8_e5m2") != std::string::npos);
   }
+}
+
+// ─── G9. The store's TWO sources must share one float dtype ──────────────────
+TEST_CASE("kv-fp8 W3 G9: the op refuses a mixed f32 K / bf16 V pair by name") {
+  // The contract the model has to satisfy, asserted where it lives, so the case
+  // below cannot be read as being about a layout. `vt::ReshapeAndCacheFp8` takes
+  // the model floats and quantizes them itself; it has ONE source-dtype template
+  // instantiation, so a K and a V of different widths is a refusal and never a
+  // mode.
+  vt::Queue q{vt::Device{vt::DeviceType::kCPU, 0}, nullptr};
+
+  constexpr int64_t T = 2, Hkv = 2, Dh = 4, kBlocks = 2, kBlockSize = 4;
+  std::vector<float> k_src(static_cast<size_t>(T * Hkv * Dh), 0.5F);
+  std::vector<uint16_t> v_src(static_cast<size_t>(T * Hkv * Dh),
+                              vt::F32ToBF16(0.5F));
+  std::vector<uint8_t> cache(
+      static_cast<size_t>(kBlocks * 2 * kBlockSize * Hkv * Dh), 0);
+  std::vector<int64_t> slots{0, 1};
+
+  vt::Tensor k = vt::Tensor::Contiguous(k_src.data(), DType::kF32, q.device,
+                                        {T, Hkv, Dh});
+  vt::Tensor v = vt::Tensor::Contiguous(v_src.data(), DType::kBF16, q.device,
+                                        {T, Hkv, Dh});
+  vt::Tensor slot_mapping = vt::Tensor::Contiguous(
+      slots.data(), DType::kI64, q.device, {static_cast<int64_t>(slots.size())});
+
+  const auto kv_slice = [&](int which) {
+    vt::Tensor t;
+    t.data = cache.data() + static_cast<size_t>(which) *
+                                static_cast<size_t>(kBlockSize * Hkv * Dh);
+    t.dtype = DType::kI8;
+    t.device = q.device;
+    t.rank = 4;
+    t.shape[0] = kBlocks;
+    t.shape[1] = kBlockSize;
+    t.shape[2] = Hkv;
+    t.shape[3] = Dh;
+    t.stride[0] = 2 * kBlockSize * Hkv * Dh;
+    t.stride[1] = Hkv * Dh;
+    t.stride[2] = Dh;
+    t.stride[3] = 1;
+    return t;
+  };
+  vt::Tensor k_cache = kv_slice(0);
+  vt::Tensor v_cache = kv_slice(1);
+
+  try {
+    vt::ReshapeAndCacheFp8(q, k, v, k_cache, v_cache, slot_mapping,
+                           vt::Fp8KVCacheDataType::kFp8E4M3, 1.0F, 1.0F);
+    FAIL("the fp8 store accepted a mixed-dtype k/v pair");
+  } catch (const std::runtime_error& e) {
+    CHECK(std::string(e.what()).find("must share one float dtype") !=
+          std::string::npos);
+  }
+}
+
+TEST_CASE("kv-fp8 W3 G9: an fp8 engine serves TORCH-LAYOUT K/V projections") {
+  // THE PRODUCTION ARM, and the one the CPU gate could not see.
+  //
+  // `ProjectFullAttnQkv` picks the projection GEMM's OUTPUT dtype from the
+  // weight's own layout: a raw torch Linear weight ([N=out, K=in], `nk`) — which
+  // is what every real safetensors checkpoint ships — takes `MatmulBf16D` and
+  // therefore emits the MODEL dtype, bf16. `MakeDenseWeights` builds [K,N]
+  // weights with `nk` unset, so every other case in this file takes `MatmulF32D`
+  // and gets an f32 V. That is the ONLY reason they pass.
+  //
+  // K never has the choice. The attention preamble writes K into `dk3`, whose
+  // dtype is `attn_dt`, and `attn_dt` is f32 for EVERY fp8 cache because
+  // `kv.dtype == DType::kBF16` is a term of both FA2 eligibility tests
+  // (qwen3_5.cpp, `fa2_prefill` and `fa2_decode`). So the fp8 route hands the
+  // store an f32 K beside a bf16 V, and the case above is what it then gets.
+  //
+  // The bf16 cache route never had this problem: it casts BOTH K and V to the
+  // cache dtype. The fp8 route now normalises the same way, to the same bf16 —
+  // which is also the dtype upstream quantizes from, because upstream's model IS
+  // bf16 at `reshape_and_cache_flash` (`cache_kernels.cu:314-401`).
+  const HfConfig c = MakeDenseConfig();
+  constexpr int kMaxTokens = 4;
+
+  LoadedEngine fp8(c, MakeDenseWeightsTorchKv(c), BuildFixture(),
+                   ParamsWithCacheDType("fp8"));
+  const auto* spec = SoleAttentionSpec(fp8);
+  REQUIRE(spec != nullptr);
+  REQUIRE(spec->dtype == DType::kI8);
+  const vllm::RequestOutput out =
+      fp8.engine().generate("hello world", Greedy(kMaxTokens), "req");
+  REQUIRE(out.finished);
+  REQUIRE(out.outputs.size() == 1);
+  CHECK(static_cast<int>(out.outputs[0].token_ids.size()) == kMaxTokens);
+
+  // NOT a case about the layout: the same weights serve the default cache too.
+  // Without this the case could go green by the torch layout becoming
+  // unloadable, which is a different failure wearing the same colour.
+  LoadedEngine automatic(c, MakeDenseWeightsTorchKv(c), BuildFixture(),
+                         ParamsWithCacheDType("auto"));
+  const vllm::RequestOutput ref =
+      automatic.engine().generate("hello world", Greedy(kMaxTokens), "req");
+  REQUIRE(ref.outputs.size() == 1);
+  CHECK(static_cast<int>(ref.outputs[0].token_ids.size()) == kMaxTokens);
+}
+
+// ─── G10. The loader stanza, entered through the loader ──────────────────────
+TEST_CASE("kv-fp8 W3 G10: FromModelDir READS the checkpoint's declaration") {
+  // `LoadedEngine::FromModelDir` is the ONLY caller of
+  // `vllm::ReadQuantConfigJson` and of `vllm::ResolveKvCacheDTypeString` on a
+  // model directory. G1 calls the resolver with a string; that measures the
+  // resolver. This case measures the LOADER, which is the thing an operator
+  // reaches: it hands `FromModelDir` a directory and reads what it said.
+  //
+  // The directory carries no weights, so the load fails — after the stanza,
+  // which is what makes the stanza observable without a checkpoint (the pattern
+  // tests/vllm/entrypoints/openai/test_serve_residency_config.cpp establishes).
+  CheckpointDir dir;
+  dir.Write("hf_quant_config.json", kGateCheckpointQuantConfig);
+
+  std::ostringstream captured;
+  std::string thrown;
+  {
+    CerrRedirect guard(captured.rdbuf());
+    try {
+      (void)LoadedEngine::FromModelDir(dir.str(), EngineParams{});
+    } catch (const std::exception& e) {
+      thrown = e.what();
+    }
+    std::cerr.flush();
+  }
+  CHECK_FALSE(thrown.empty());
+  const std::string logged = captured.str();
+  CHECK(logged.find("the checkpoint declares kv_cache_quant_algo") !=
+        std::string::npos);
+  // It names the RESOLVED value, not the modelopt spelling, because that is the
+  // string every consumer downstream will see.
+  CHECK(logged.find("fp8_e4m3") != std::string::npos);
+}
+
+TEST_CASE("kv-fp8 W3 G10: an explicit flag stops the loader consulting the checkpoint") {
+  // torch_utils.py:380-381 through the loader rather than through the resolver.
+  // The same directory, one explicit `--kv-cache-dtype`, and the line is gone:
+  // the operator outranks the checkpoint, and the checkpoint is not even read.
+  CheckpointDir dir;
+  dir.Write("hf_quant_config.json", kGateCheckpointQuantConfig);
+
+  EngineParams params;
+  params.kv_cache_dtype = "bfloat16";
+
+  std::ostringstream captured;
+  {
+    CerrRedirect guard(captured.rdbuf());
+    try {
+      (void)LoadedEngine::FromModelDir(dir.str(), params);
+    } catch (const std::exception&) {
+    }
+    std::cerr.flush();
+  }
+  CHECK(captured.str().find("the checkpoint declares") == std::string::npos);
+}
+
+TEST_CASE("kv-fp8 W3 G10: config.json's quantization_config OUTRANKS hf_quant_config.json") {
+  // MIRROR, and it used to be inverted. `vllm/transformers_utils/config.py:751-761`:
+  //
+  //   quantization_config = config_dict.get("quantization_config", None)
+  //   if quantization_config is None and file_or_path_exists(hf_quant_config.json):
+  //       quantization_config = get_hf_file_to_dict("hf_quant_config.json", ...)
+  //
+  // with upstream's own comments naming the two producers: "ModelOpt 0.31.0 and
+  // after saves the quantization config in the model config file", and the
+  // separate file is "ModelOpt 0.29.0 and before". So an inline
+  // `quantization_config` means the legacy file is NEVER opened, and a
+  // re-quantized checkpoint that still carries a stale `hf_quant_config.json`
+  // beside a current `config.json` resolves to what the CURRENT one says.
+  //
+  // The two files below disagree on purpose, and only on the KV half: the inline
+  // one quantizes weights and declares nothing about the KV cache, the legacy one
+  // declares FP8. Reading them in the wrong order quantizes a KV cache nobody
+  // asked for, at half the page, silently.
+  CheckpointDir dir;
+  dir.Write("config.json", kInlineWeightsOnlyQuantConfig);
+  dir.Write("hf_quant_config.json", kGateCheckpointQuantConfig);
+
+  // The unit half: which bytes come back.
+  const std::string read = vllm::ReadQuantConfigJson(dir.str());
+  CHECK(read.find("kv_cache_quant_algo") == std::string::npos);
+  CHECK(vllm::GetKvCacheQuantAlgoString(read).value_or("auto") == "auto");
+
+  // The loader half: and therefore nothing is declared.
+  std::ostringstream captured;
+  {
+    CerrRedirect guard(captured.rdbuf());
+    try {
+      (void)LoadedEngine::FromModelDir(dir.str(), EngineParams{});
+    } catch (const std::exception&) {
+    }
+    std::cerr.flush();
+  }
+  CHECK(captured.str().find("the checkpoint declares") == std::string::npos);
+
+  // And the legacy file IS read when `config.json` carries no inline document —
+  // the 0.29.0-and-before arm, which the inversion would have made unreachable.
+  CheckpointDir legacy;
+  legacy.Write("config.json", R"({"model_type":"qwen3_5_text"})");
+  legacy.Write("hf_quant_config.json", kGateCheckpointQuantConfig);
+  CHECK(vllm::GetKvCacheQuantAlgoString(vllm::ReadQuantConfigJson(legacy.str()))
+            .value_or("auto") == "fp8_e4m3");
+}
+
+TEST_CASE("kv-fp8 W3 G10: the drafter-chain refusal runs BEFORE the KV resolution") {
+  // THE ORDERING F0 had to keep. `main`'s SPEC-DRAFTER-CHAIN W1 refusal (#1522)
+  // and this row's resolution stanza both want to be the first statement of
+  // `FromModelDir`, and both are load-bearing: G5 of that row requires the chain
+  // refusal "before any weight I/O", and `ReadQuantConfigJson` opens a file
+  // inside `model_dir`. Taking either side of that conflict drops a guarantee.
+  //
+  // `tests/vllm/entrypoints/test_drafter_chain_reach.cpp` cannot see an
+  // inversion: it points at a NONEXISTENT directory, and `ReadQuantConfigJson`
+  // answers "" for one of those without opening anything, so the chain refusal
+  // still arrives. This case points at a directory that EXISTS and declares
+  // fp8 — so an inverted order announces the declaration first, and that line is
+  // the evidence.
+  CheckpointDir dir;
+  dir.Write("hf_quant_config.json", kGateCheckpointQuantConfig);
+
+  EngineParams params;
+  params.speculative_config = vllm::ParseSpeculativeConfigJson(
+      R"({"vllm_cpp":{"drafter_chain":[)"
+      R"({"method":"ngram","num_speculative_tokens":4},)"
+      R"({"method":"mtp"}]}})");
+  REQUIRE(params.speculative_config.has_value());
+  REQUIRE(params.speculative_config->use_drafter_chain());
+
+  std::ostringstream captured;
+  std::string thrown;
+  {
+    CerrRedirect guard(captured.rdbuf());
+    try {
+      (void)LoadedEngine::FromModelDir(dir.str(), params);
+    } catch (const std::exception& e) {
+      thrown = e.what();
+    }
+    std::cerr.flush();
+  }
+  CHECK(thrown.find("drafter_chain") != std::string::npos);
+  CHECK(captured.str().find("the checkpoint declares") == std::string::npos);
+}
+
+// ─── G11. The heterogeneous-per-layer seam ───────────────────────────────────
+TEST_CASE("kv-fp8 W3 G11: per_layer_attn_specs are retyped, and the pool halves") {
+  // `gpu_model_runner.py:484-486` — upstream resolves ONE kv_cache_dtype and
+  // EVERY attention spec is built with it. Ours arrives after the specs exist,
+  // so `ApplyCacheDType` has to reach every one of them, and a heterogeneous
+  // model (Gemma-4 G1b) allocates from `per_layer_attn_specs` instead of from the
+  // group spec. A rewrite that reached only the groups would leave
+  // `KVBytesPerBlock` at the full width for exactly the models whose pool it
+  // sizes — the half-sizing this row calls silent-corruption territory, with the
+  // sign reversed.
+  const auto build = [] {
+    vllm::v1::KVCacheConfig cfg;
+    cfg.num_blocks = 4;
+    // Two full-attention layers and one GDN layer, which is the null entry the
+    // loop has to step over rather than dereference.
+    cfg.kv_cache_groups.emplace_back(
+        std::vector<std::string>{"fa0", "fa1"},
+        std::make_shared<vllm::v1::FullAttentionSpec>(16, 4, 64, DType::kBF16));
+    cfg.per_layer_attn_specs = {
+        std::make_shared<vllm::v1::FullAttentionSpec>(16, 4, 64, DType::kBF16),
+        nullptr,
+        std::make_shared<vllm::v1::FullAttentionSpec>(16, 2, 64, DType::kBF16)};
+    return cfg;
+  };
+
+  vllm::v1::KVCacheConfig bf16 = build();
+  const int64_t bf16_bytes = vllm::v1::KVBytesPerBlock(bf16);
+  REQUIRE(bf16_bytes > 0);
+
+  vllm::v1::KVCacheConfig fp8 = build();
+  vllm::v1::ApplyCacheDType(fp8, vllm::v1::ParseCacheDType("fp8", DType::kBF16),
+                            0.5F, 0.25F);
+
+  // Every non-null per-layer spec carries the fp8 storage AND its interpretation
+  // AND the scales, because the store and the read both read them off the spec.
+  int retyped = 0;
+  for (const auto& spec : fp8.per_layer_attn_specs) {
+    if (spec == nullptr) continue;
+    CHECK(spec->dtype == DType::kI8);
+    CHECK(spec->fp8_kind == vt::Fp8KVCacheDataType::kFp8E4M3);
+    CHECK(spec->k_scale == doctest::Approx(0.5F));
+    CHECK(spec->v_scale == doctest::Approx(0.25F));
+    ++retyped;
+  }
+  CHECK(retyped == 2);  // the case would be vacuous without them
+
+  // And the divisor the pool is sized with is EXACTLY half. An equality, not a
+  // ratio: `KVBytesPerBlock` reads `per_layer_attn_specs` in preference to the
+  // groups, so this number is what the runner's `--kv-cache-memory` buys.
+  CHECK(vllm::v1::KVBytesPerBlock(fp8) * 2 == bf16_bytes);
 }

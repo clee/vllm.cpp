@@ -288,6 +288,21 @@ move twice the KV bytes for the same tokens. Until W3 the comparison was not
 matched, and [#415](https://github.com/mudler/vllm.cpp/issues/415) attributes a
 prefill gap to exactly this.
 
+**What turning it on COSTS, unmeasured and therefore not claimed.** An fp8 KV
+cache takes the subject OFF every fast attention kernel this engine has.
+`qwen3_5.cpp` makes `kv.dtype == DType::kBF16` a term of both `fa2_prefill` and
+`fa2_decode`, so FA-2 prefill and all three FA-2 decode topologies are disabled;
+`src/vt/cuda/cuda_paged_attn.cu` routes an fp8 read only through tiled prefill
+and block decode, because the WMMA ladder, the vendored FA-2 launchers and the
+vectorized decode-opt/GQA kernels are bf16-native by construction. So the 11.06
+vs 9.71 tok/s lead above was measured on the bf16 path, and matching vLLM's KV
+dtype plausibly LOSES it. Nothing here has measured which way the sum goes: half
+the KV bytes and twice the pool against a slower attention kernel is an
+empirical question and this session had no GPU. It is recorded so that the next
+`--kv-cache-dtype fp8` benchmark is read as a NEW measurement rather than as a
+regression, and `docs/USAGE.md` says the same thing to an operator. Routing the
+fp8 read through the fast kernels is owed below.
+
 ### The resolution chain, mirrored
 
 Four upstream steps, in upstream's own order. Every anchor was read in
@@ -304,6 +319,18 @@ Four upstream steps, in upstream's own order. Every anchor was read in
    1915-1929`). An explicit value is returned unchanged and the checkpoint is
    never consulted (`:380-381`) — the operator outranks the checkpoint, which
    `attention.py:279-290` restates in its own comment.
+
+   **Which file the declaration is read FROM is also upstream's, and W3 first
+   shipped it inverted.** `vllm/transformers_utils/config.py:751-761` takes
+   `config_dict["quantization_config"]` and consults `hf_quant_config.json` only
+   when that is `None`, under upstream's own comments: ModelOpt writes the
+   inline document from 0.31.0 on, and the standalone file is what 0.29.0 and
+   before wrote. `vllm::ReadQuantConfigJson` now reads them in that order.
+   Reversed, a repository that was re-quantized in place — inline document
+   added, stale `hf_quant_config.json` left beside it — resolves to the OLD
+   declaration, which for the KV half means quantizing a cache nobody asked to
+   quantize, at half the page, silently. G10 gates the order at both the
+   resolver and the loader.
 2. **String to storage dtype** — `kv_cache_dtype_str_to_dtype` (`:394-401`) over
    `STR_DTYPE_TO_TORCH_DTYPE` (`:32-52`), where every fp8 CacheDType maps to
    `torch.uint8`. W1's `vllm::v1::ParseCacheDType` already did this; W3 adds no
@@ -371,12 +398,14 @@ path to index a half-sized page: the failure is a sentence, not wrong tokens.
 
 ### Gates
 
-`tests/vllm/entrypoints/test_kv_cache_fp8_wiring.cpp` — **18 cases / 83
-assertions GREEN** on a CPU-only Release build.
+`tests/vllm/entrypoints/test_kv_cache_fp8_wiring.cpp` — **26 cases / 120
+assertions GREEN** on a CPU-only Release build, plus
+`tests/vllm/entrypoints/openai/test_serve_kv_cache_dtype.cpp` — **3 cases / 26
+assertions GREEN**, which drives the REAL `VllmServerMain`.
 
 | Case | What it would let through if it were missing |
 |---|---|
-| G1 | the checkpoint declaration is read, and an explicit flag outranks it |
+| G1 | the checkpoint declaration RESOLVES, and an explicit flag outranks it |
 | G2 | a declared-but-absent scale collapsing into "nothing declared" |
 | G3 | an fp8 page that is not EXACTLY half a bf16 page (closed form, not a ratio) |
 | G4 | the same halving through the LOADER: one byte budget, 2x the blocks; and the Mamba state left alone |
@@ -384,11 +413,42 @@ assertions GREEN** on a CPU-only Release build.
 | G6 | a storage dtype and an fp8 interpretation that disagree |
 | G7 | an unrouted architecture writing floats into a half-sized page |
 | G8 | MLA, `float16` and `fp8_e5m2` being mis-sized instead of refused |
+| G9 | the store handed K and V in DIFFERENT float dtypes, which is every production weight arm |
+| G10 | the loader's own resolution stanza — that it runs, which file it reads first, and that the drafter-chain refusal still precedes it |
+| G11 | the heterogeneous per-layer specs (Gemma-4 G1b) left at full width while the pool is sized at half |
+| serve | `--kv-cache-dtype` never reaching `EngineParams` from the command line |
 
-G4 and G5 enter through the production entry point (the `LoadedEngine`
-constructor → `MakeKVCacheResolved` → `ApplyResolvedCacheDType` →
-`ResolveNumBlocks` → the runner → `Qwen3_5DenseModel::Forward`), not by
-constructing a spec or a `PagedKvCache` by hand.
+G4, G5, G9 and G10 enter through the production entry point (the `LoadedEngine`
+constructor or `LoadedEngine::FromModelDir` → `MakeKVCacheResolved` →
+`ApplyResolvedCacheDType` → `ResolveNumBlocks` → the runner →
+`Qwen3_5DenseModel::Forward`), not by constructing a spec or a `PagedKvCache` by
+hand. The `serve` cases enter one step earlier still, at `argv`.
+
+**G9 is the case the first version of this gate could not have.** Every case in
+the file built its model with `MakeDenseWeights`, whose projection weights carry
+no `nk` flag, so `ProjectFullAttnQkv` served them through `MatmulF32D` and the V
+projection came out f32 — the same dtype the attention preamble gives K. A real
+checkpoint ships raw torch Linear weights ([N=out, K=in], `nk`), which take
+`MatmulBf16D` and emit the MODEL dtype, and the fp8 store then saw an f32 K
+beside a bf16 V and refused the pair by name at the first forward. That is true
+of the block-wise fp8 arm (`MatmulFp8BlockScaledD`), the NVFP4 arm under the
+default `VT_BF16_GEMM_OUT`, and ordinary bf16 safetensors — which includes the
+#1574 campaign checkpoint. The fix normalises both to bf16 on the fp8 route
+exactly as the bf16-cache route already did, and bf16 rather than f32 because
+bf16 is the dtype upstream quantizes from: its model IS bf16 where
+`reshape_and_cache_flash` takes key/value (`cache_kernels.cu:314-401`).
+
+**G10 also holds an ORDERING that a merge can silently drop.** `main`'s
+SPEC-DRAFTER-CHAIN W1 refusal (#1522) and this row's resolution stanza both
+insert as the first statement of `FromModelDir`, and both are load-bearing: that
+row's G5 requires the chain refusal before any weight I/O, and
+`ReadQuantConfigJson` opens a file inside `model_dir`. Taking either side of that
+textual conflict drops a guarantee.
+`tests/vllm/entrypoints/test_drafter_chain_reach.cpp` cannot see an inversion,
+because it points at a NONEXISTENT directory and `ReadQuantConfigJson` answers ""
+for one of those without opening anything. G10's ordering case points at a
+directory that EXISTS and declares fp8, so an inverted order announces the
+declaration first and that line is the evidence.
 
 ## Owed
 
@@ -469,6 +529,26 @@ constructing a spec or a `PagedKvCache` by hand.
   dynamic on-the-fly scale (`config/cache.py:111`) is deprecated there for
   removal in v0.19; `ResolveKvCacheScales` refuses it BY NAME rather than
   silently taking the static arm, and no flag exposes it.
+- **W3: an fp8 KV cache is served by the SLOW attention kernels only** (#1593).
+  `fa2_prefill` and `fa2_decode` in `src/vllm/model_executor/models/qwen3_5.cpp`
+  both require `kv.dtype == DType::kBF16`, and
+  `src/vt/cuda/cuda_paged_attn.cu` routes an fp8 read to tiled prefill and block
+  decode only. Every other launcher — the WMMA ladder, the vendored FA-2
+  kernels, the vectorized decode-opt and GQA kernels — is bf16-native by
+  construction and would need an fp8 instantiation. Owed by this row (`KV-FP8`)
+  under #1593. Until it lands, `--kv-cache-dtype fp8` trades attention
+  throughput for KV bytes at an unmeasured exchange rate, and the row says so in
+  `## W3`, in `docs/USAGE.md` and in `docs/FEATURES.md` rather than implying the
+  memory win is free.
+- **W3: the heterogeneous per-layer fp8 arm is SIZING-only** (#1593).
+  `ApplyCacheDType` retypes `KVCacheConfig::per_layer_attn_specs` as well as the
+  group specs, which is what keeps `KVBytesPerBlock` and the runner's own
+  per-layer allocation agreeing, and G11 gates that arithmetic. No shipped
+  architecture can spend it yet: the only model that populates that vector is
+  Gemma-4 (G1b), and Gemma-4 is one of the 17 architectures whose attention block
+  refuses the fp8 store by name. So a Gemma-4 run with `--kv-cache-dtype fp8`
+  gets a correctly halved pool and then a named refusal at the first forward,
+  which is the intended order. Routing Gemma-4 is owed with the other 16 above.
 - **Metal and ROCm have no fp8 KV arm.** Both refuse by name (see above). Neither
   has a row yet; they belong with W5's per-head/e5m2 work or a backend row.
 - fp8_e5m2 and per-attention-head scales stay refused on both backends (W5).

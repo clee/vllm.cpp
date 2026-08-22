@@ -5277,6 +5277,11 @@ DBuf FullAttnBlock(Dev d, const FullAttnLayerWeights& w, const HfConfig& cfg,
   }
   DBuf dattn(d, DType::kF32, {T, Hq, Dh});
   const float scale = 1.0F / std::sqrt(SizeF(Dh));
+  // VT-ATTN-NAIVE: the REFERENCE (non-paged) dense arm, as the comment on the V
+  // upcast above already says. Production decode runs `FullAttnBlockPaged`, which
+  // replaces this call with vt::ReshapeAndCache + vt::PagedAttention; this arm is
+  // what that path is compared against, so a rung change here moves the golden
+  // rather than the shipping kernel (#1544).
   vt::Attention(d.q, dattn.t(), qn3, kn3, v3, vt::AttentionArgs{scale, true});
 
   // Sigmoid output gate on the raw gate split, folded into the o_proj activation
@@ -5417,11 +5422,25 @@ DBuf FullAttnBlockPaged(Dev d, const FullAttnLayerWeights& w, const HfConfig& cf
   // V to bf16 only when the cache is bf16. The query stays f32 either way
   // (Phase 1: f32 query · <cache-dtype> cache, f32-accumulate softmax — the
   // attention kernel converts bf16 cache reads to f32).
+  //
+  // KV-FP8 W3 (#1593): the fp8 cache takes the SAME bf16 normalisation, and it
+  // has to. `vt::ReshapeAndCacheFp8` quantizes from ONE source dtype
+  // (`k.dtype == v.dtype`, ops.cpp), and K and V do not arrive in the same one:
+  // K is `attn_dt`, which is f32 for every fp8 cache because `kv.dtype ==
+  // DType::kBF16` is a term of both FA2 eligibility tests above, while V is
+  // whatever the v_proj GEMM emitted — bf16 on the block-wise fp8 arm
+  // (`MatmulFp8BlockScaledD`), bf16 on the NVFP4 arm under the default
+  // `VT_BF16_GEMM_OUT`, and bf16 on ordinary torch safetensors
+  // (`MatmulBf16D`). Only the per-tensor fp8 arm and the transposed
+  // GGUF/synthetic path pair f32 with f32, which is why a CPU gate over
+  // synthetic weights could not see this. bf16 rather than f32 because bf16 is
+  // the dtype upstream quantizes from: its model IS bf16 where
+  // `reshape_and_cache_flash` takes key/value (`cache_kernels.cu:314-401`).
   Tensor kw = kn3;
   Tensor vw = v3;
   DBuf kbf(d, DType::kBF16, {T, Hkv, Dh});
   DBuf vbf(d, DType::kBF16, {T, Hkv, Dh});
-  if (kv.dtype == DType::kBF16) {
+  if (kv.dtype == DType::kBF16 || dense_attn::IsFp8KvCache(kv)) {
     // K may already be bf16 (an FA2 preamble emits bf16 k directly —
     // the RN round of the same f32 value this CastBf16 would produce); only
     // down-cast when the preamble/fallback produced f32 K.
@@ -5450,9 +5469,8 @@ DBuf FullAttnBlockPaged(Dev d, const FullAttnLayerWeights& w, const HfConfig& cf
   Tensor dsl = sdi.seq_lens.t();
   Tensor dqsl = sdi.query_start_loc.t();
   // KV-FP8 W3: routes to `vt::ReshapeAndCacheFp8` when this layer's cache is
-  // 1-byte fp8. The `if (kv.dtype == DType::kBF16)` cast block above is already
-  // correct for that case — it leaves K/V at the model dtype, which is exactly
-  // what the fp8 store takes.
+  // 1-byte fp8, and the cast block above has already put K and V into the ONE
+  // model dtype that store quantizes from.
   dense_attn::WriteKvCache(d.q, kv, kw, vw, k_cache, v_cache, dslot);
 
   // bf16 attention out on an FA2 path (FA2 writes bf16; the sigmoid

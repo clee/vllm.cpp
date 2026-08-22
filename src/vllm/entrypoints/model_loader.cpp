@@ -361,17 +361,26 @@ class SharedHeadSource {
   // can refuse outright, so it does: every caller now names what it wants, and
   // dropping the argument is a COMPILE ERROR rather than a green run. The DSpark
   // caller passes `nullptr` explicitly and says why.
+  //
+  // `head_fp4` is the SPEC-DFLASH2-QUANT-LMHEAD (#1628) owner and is REQUIRED
+  // for the same reason `head_was_quantized` is: a defaulted argument is what
+  // silently turned the D12 carry off. `nullptr` means "this lane cannot compute
+  // with a packed head", and the safetensors arm then refuses a quantized target
+  // head exactly as it did before that row. The DSpark caller passes it and says
+  // why; the GGUF arm never sets it, because a GGUF target's `output.weight` is
+  // dequantized on the way in and is the case D12 refuses.
   void LoadInto(vllm::OwnedTensor* embed, vllm::OwnedTensor* head,
-                bool* head_was_quantized) const {
+                bool* head_was_quantized, vllm::Nvfp4Weight* head_fp4) const {
     if (head_was_quantized != nullptr) *head_was_quantized = false;
+    if (head_fp4 != nullptr) *head_fp4 = vllm::Nvfp4Weight{};
     if (gguf_ != nullptr) {
       vllm::LoadGgufSharedEmbedAndHeadBf16(*gguf_, embed, head, head_was_quantized);
     } else {
       *embed = LoadNamedBf16(
           *shards_, "model.language_model.embed_tokens.weight", false);
-      *head = LoadNamedBf16(*shards_, "lm_head.weight", true);
+      vllm::LoadDflashSharedLmHead(*shards_, head, head_fp4);
     }
-    if (embed->Empty() || head->Empty()) {
+    if (embed->Empty() || (head->Empty() && (head_fp4 == nullptr || head_fp4->Empty()))) {
       throw std::runtime_error(
           "dflash: the target's bf16 embed_tokens + lm_head (which the draft "
           "SHARES) were not found in " +
@@ -555,9 +564,11 @@ void CheckDflash2DraftArm(const std::string& draft_model_path) {
          "this architecture -- a DFlash2 draft runs its block forward off the "
          "paged CUDA-graph fast path, because the candidate selector needs the "
          "hidden states of the same forward its logits came from. This port "
-         "mirrors vllm-project/vllm#52816, which is OPEN upstream at head "
-         "66e5414c6d75a8529473d977f7458c140bbab8a0; it does not advance the "
-         "parity pin.\n";
+         "mirrors vllm-project/vllm#52816, which MERGED upstream on 2026-08-21 "
+         "at head 3406ec1dae9916f920b90f0dbf90dcf54923d042, merge commit "
+         "b389ac29465b33f9e9c534df221ea3c129e9793f. It does not advance the "
+         "parity pin, and the port is not yet reconciled onto that merged head "
+         "(issue #1561).\n";
 }
 
 // SPEC-DSPARK-QWEN3-ROUTING (#1193): the two keys upstream classifies a DSpark
@@ -750,10 +761,16 @@ std::unique_ptr<DflashDraft> LoadDsparkDraft(const vllm::SpeculativeConfig& spec
       draft->dspark->backbone.lm_head.Empty()) {
     vllm::OwnedTensor shared_embed;
     vllm::OwnedTensor shared_lm_head;
-    // nullptr, and NOT a default: the DSpark lane has no DFlash2 selector, so no
-    // guard reads a dequantized-head flag here. Named rather than omitted so the
-    // DFlash caller's third argument cannot be deleted without a build failure.
-    shared.LoadInto(&shared_embed, &shared_lm_head, /*head_was_quantized=*/nullptr);
+    // Both nullptr, and NEITHER a default. The DSpark lane has no DFlash2
+    // selector, so no guard reads a dequantized-head flag here; and its backbone
+    // holds ONE bf16 `lm_head` owner, so there is nowhere to put a packed head.
+    // A quantized target head therefore still refuses at
+    // `LoadDflashSharedLmHead`, by name and at startup. Both are NAMED rather
+    // than omitted so neither can be deleted at the DFlash call site without a
+    // build failure. Owed: .agents/specs/dflash2-spec-decode.md `## Owed` O26,
+    // issue #1628.
+    shared.LoadInto(&shared_embed, &shared_lm_head, /*head_was_quantized=*/nullptr,
+                    /*head_fp4=*/nullptr);
     if (draft->dspark->backbone.embed_tokens.Empty()) {
       draft->dspark->backbone.embed_tokens = std::move(shared_embed);
     }
@@ -817,15 +834,25 @@ std::unique_ptr<DflashDraft> LoadDflashDraft(
     source_kind = "safetensors";
   }
 
-  // The draft SHARES the target's embed_tokens + lm_head (bf16 in both
-  // containers of the NVFP4 27B: the safetensors leaves them unquantized, and
-  // the GGUF stores token_embd/output as ggml BF16 next to its NVFP4 body),
-  // exactly as vLLM's skip_substrs(embed_tokens)/tie handling. Common to BOTH
-  // draft sources and BOTH target containers since B1 - the source abstraction
-  // is what lets the four combinations share one code path.
+  // The draft SHARES the target's embed_tokens + lm_head, exactly as vLLM's
+  // skip_substrs(embed_tokens)/tie handling. Common to BOTH draft sources and
+  // BOTH target containers since B1 - the source abstraction is what lets the
+  // four combinations share one code path.
+  //
+  // SPEC-DFLASH2-QUANT-LMHEAD (#1628) corrects what this comment used to claim,
+  // which was that the head is "bf16 in both containers of the NVFP4 27B". It is
+  // not: `r0b0tlab/Qwen3.8-27B-NVFP4-MTP-sm121` stores `lm_head.weight` as
+  // ModelOpt NVFP4 (U8), and the read here refused it by stored dtype. It is now
+  // taken PACKED into `lm_head_fp4`, which is what the target itself computes
+  // with, so the DFlash2 selector reads the target head's exact top-K rather
+  // than a widened head's - the state D12 refuses and the state it admits are
+  // different, and the dtype cannot tell them apart.
   shared.LoadInto(&draft->weights.embed_tokens, &draft->weights.lm_head,
-                  &draft->weights.lm_head_dequantized);
-  draft->weights.draft_vocab_size = draft->weights.lm_head.shape[0];
+                  &draft->weights.lm_head_dequantized,
+                  &draft->weights.lm_head_fp4);
+  draft->weights.draft_vocab_size = draft->weights.lm_head_fp4.Empty()
+                                        ? draft->weights.lm_head.shape[0]
+                                        : draft->weights.lm_head_fp4.n;
   // A DFLASH GGUF draft carries NO vocab KV and no embedding tensor (it SHARES
   // the target's), so MakeDflashGgufConfig leaves vocab_size 0 - right for the
   // config, fatal for the forward: the draft sizes its embedding lookup as
@@ -1183,6 +1210,49 @@ std::optional<vllm::SpeculativeConfig> LoadedEngine::ResolveSpecConfig(
     return std::nullopt;  // production default: no speculation.
   }
   const vllm::SpeculativeConfig& cli = *params.speculative_config;
+  // SPEC-DRAFTER-CHAIN W1 (#1522): THE PRODUCTION READER of the parsed chain,
+  // and the reason the field does not land dead.
+  //
+  // W1 lands the field, its validation and its refusals, and NO chain
+  // behaviour. Nothing resolves a chain and nothing changes which speculator
+  // drafts. That leaves exactly one way for the wave to be harmful, and it is
+  // not a malformed document: it is a WELL-FORMED one that parses, stores, and
+  // is then ignored. The engine would draft with one speculator — or with none —
+  // under a document whose author believes it configures several, and any
+  // measurement taken there is a measurement of a configuration nobody chose.
+  // That is #1160's failure with a larger blast radius, so the chain is REFUSED
+  // BY NAME rather than silently reduced.
+  //
+  // FIRST in this function, before every method branch, because two of those
+  // branches read a draft checkpoint's own config.json off disk
+  // (`CheckDflash2DraftArm`, `ReadDsparkDraftKeys`) and because `cli.method` is
+  // EMPTY on a chain config — it would otherwise fall through to the "only
+  // methods mtp, dflash and ngram are supported" line at the bottom and tell the
+  // user that "" is not one of them.
+  //
+  // `FromModelDir` calls this function ahead of its path resolution so the
+  // refusal also precedes every weight operation, which is what G5 means by
+  // "before any weight I/O"; `tests/vllm/entrypoints/test_drafter_chain_reach.cpp`
+  // asserts that ordering by refusing a chain against a path that does not
+  // exist.
+  if (cli.use_drafter_chain()) {
+    std::string listed;
+    for (const vllm::SpeculativeChainEntry& entry : cli.drafter_chain) {
+      if (!listed.empty()) listed += ", ";
+      listed += "\"" + entry.method + "\"";
+    }
+    throw std::invalid_argument(
+        "speculative-config: \"vllm_cpp.drafter_chain\" [" + listed +
+        "] parses and validates here, but NOTHING resolves a chain yet: this "
+        "engine still drafts with exactly one speculator per step. It is "
+        "refused rather than silently reduced to one drafter or to no "
+        "speculation at all, because a run under a configuration nobody chose "
+        "is worse than a run that does not start. Per-sequence resolution is "
+        "owed by row SPEC-DRAFTER-CHAIN wave W3, after the per-drafter "
+        "attribution of W2 (.agents/specs/drafter-chain.md), issue "
+        "https://github.com/mudler/vllm.cpp/issues/1522. Name one method at the "
+        "top level to run today.");
+  }
   // SPEC-DFLASH D5: the block-diffusion drafter. num_speculative_tokens is REQUIRED
   // (= the draft block_size, e.g. 16; speculative.py raises if None) and there is no
   // n_predict-module divisibility (the drafter is non-autoregressive). The concrete
@@ -1864,7 +1934,32 @@ vllm::v1::AsyncLLM& LoadedEngine::async_engine() {
 
 std::unique_ptr<LoadedEngine> LoadedEngine::FromModelDir(
     const std::string& model_dir, const EngineParams& params_in) {
-  // KV-FP8 W3 — resolve `--kv-cache-dtype` against the CHECKPOINT once, here,
+  // SPEC-DRAFTER-CHAIN W1 (#1522): refuse a drafter chain BEFORE anything else
+  // this function does.
+  //
+  // G5 requires the refusal to land "before any weight I/O", and the ordering is
+  // the requirement rather than tidiness. Below this line the function reads the
+  // checkpoint's quantization config, installs two process-global
+  // configurations, resolves a device, stats the model directory, parses a
+  // config, builds a tokenizer and maps weights. A chain config cannot produce
+  // an engine, so every one of those is work spent on a load that will not
+  // happen, and the two installs are not free, because one of them latches
+  // decisions that a later engine in the same process cannot retake.
+  //
+  // It delegates to `ResolveSpecConfig` rather than repeating the test, so there
+  // is ONE chain refusal with ONE message. `ResolveSpecConfig` runs again in the
+  // constructor further down, which is what refuses a chain on the loader paths
+  // that do not come through this function.
+  //
+  // It reads `params_in`, the UNRESOLVED argument, deliberately: it must run
+  // ahead of the KV-FP8 W3 stanza below, whose `ReadQuantConfigJson` opens a
+  // file inside `model_dir`. `ChainRefusalPrecedesKvCacheDTypeResolution` in
+  // `tests/vllm/entrypoints/test_kv_cache_fp8_wiring.cpp` gates that order.
+  if (params_in.speculative_config.has_value() &&
+      params_in.speculative_config->use_drafter_chain()) {
+    (void)ResolveSpecConfig(params_in, vllm::HfConfig{});
+  }
+  // KV-FP8 W3: resolve `--kv-cache-dtype` against the CHECKPOINT once, here,
   // before any consumer reads it. Upstream does exactly this and in exactly this
   // position: `EngineArgs.create_engine_config` calls
   // `resolve_kv_cache_dtype_string(self.kv_cache_dtype, model_config)` and hands
