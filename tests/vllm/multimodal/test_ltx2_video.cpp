@@ -30,11 +30,13 @@
 #include <fstream>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <sstream>
 #include <stdexcept>
 #include <string>
 #include <vector>
 
+#include <atomic>
 #include <chrono>
 #include <thread>
 
@@ -3509,6 +3511,177 @@ std::vector<NamedInterval> LeafIntervals(const nlohmann::json& table,
 }
 
 // One carrying phase and the anchor that ties its name to its work.
+// ─── WHAT ONE INSTRUMENT BOUNDARY COSTS, ON THE RUN THAT IS ASSERTING ───────
+//
+// EVERY WALL-CLOCK TOLERANCE BELOW USED TO BE A COMPILE-TIME NUMBER, and each
+// of the four this case has carried was afterwards found redding an UNMUTATED
+// tree: the 0.95 coverage floor (#1439, #1494), 0.25 ms per leaf record (#1559,
+// #1572), 3 ms under a sanitizer, and the 30 ms that replaced both (#1576).
+// Each was calibrated against a sample of one box and each was wrong on the
+// next one.
+//
+// The quantity all four bound is the wall a PHASE BOUNDARY costs, and that is
+// not a property of this tree. It is a property of the machine, of the build
+// configuration, and of what else held a core at that second: on ONE host, ONE
+// build type and ONE binary it has measured 25.0 us and 10.032 ms with nothing
+// mutated, a spread of 402x (#1559). #1576 measured 171x between two runs of one
+// binary and said in its own text that a bigger constant "would only move the
+// threshold at which the same ambiguity appears". That is what the 30 ms shape
+// did: it widened the smallest swallow this case can see from about 0.5 ms to
+// 60 ms and left a fixed budget with no allowance for load.
+//
+// SO THE NUMBER IS NOT CHOSEN HERE. IT IS MEASURED, ON THE RUN THAT ASSERTS.
+//
+// WHAT A BOUNDARY IS, READ OUT OF `render_phase_log.cpp` RATHER THAN GUESSED.
+// `PhaseLog::Open` takes the process-wide mutex, stamps `o.start`, appends the
+// open entry, calls `SampleLocked` -- one `/proc/self/statm` read folded into
+// every live scope -- and, on the shipped default, writes and FLUSHES one line
+// to stderr. `Close` takes the same mutex, calls `SampleLocked`, THEN stamps
+// `r.end`, and flushes its own line. Both stamps sit inside that work, which is
+// what puts the cost inside the leaf record and makes it the head and the tail
+// that assertion (1c) below measures.
+//
+// One boundary is therefore one acquisition of that mutex, one sample, and one
+// flushed write. This sampler times exactly those three, through the
+// instrument's own public entry points, and keeps the WORST it saw.
+//
+// A MAXIMUM AND NOT A MEAN, AND THAT IS THE DESIGN RATHER THAN A DETAIL.
+// The numerator of the bound below is itself a MAXIMUM over a small number of
+// draws from this same distribution. A mean denominator under a maximum
+// numerator is the shape `ltx25-phase-residue.md` `## Design` 3 measured at 4
+// reds in 45 runs -- worst ratio 4.115 against a bound of 1 -- and withdrew:
+// under contention the un-instrumented remainder of a boundary dilates FASTER
+// than the instrumented part, so that comparison has a heavy right tail rather
+// than a shifted median, and a 20-run sample never sees it. Here the
+// denominator is the MAXIMUM over tens of thousands of draws of the same
+// operation taken across the same window, which is a tail quantity compared
+// with a tail quantity.
+//
+// AND (2) BELOW IS DELIBERATELY NOT GIVEN THIS TERM. Adding `uncovered <=
+// boundary allowance` to the coverage floor as a second arm was written,
+// built and MEASURED here, and it is withdrawn: it turns mutation B --
+// `artifacts.frames.ppm` opened AFTER the `WriteFileBytes` loop instead of
+// around it, which drops that leaf's coverage from 98% to 1.1% -- from a red
+// into a green. The reason is that `artifacts.frames` is 0.2-7 ms on this
+// fixture while one boundary on this host is 0.3-1.2 ms even pinned to two
+// idle cores, so any allowance built from the boundary swamps the leaf. What
+// the 0.50 floor there catches, and the load it reds under, are the same
+// property of a leaf smaller than the instrument measuring it. #1470 owns
+// that, and the repair is an anchor the writer's own seconds can be read
+// against, not a threshold.
+//
+// AND IT IS SAMPLED ACROSS THE RENDER, NOT BESIDE IT. That is measured rather
+// than assumed. A burst taken before and after each render covers about 40 ms of
+// a case that runs for tens of seconds, and a contention spike inside a render
+// is then absent from the denominator while being present in the numerator: with
+// bursts alone the worst observed `slack / ceiling` was 3.96 over 161 leaf
+// records. The sampler below runs FOR the render, which is what makes the
+// denominator a statement about the window the numerator is drawn from.
+//
+// IT ALSO RETIRES THE PER-CONFIGURATION CONSTANT. A sanitizer instruments the
+// scope boundary this quantity IS -- ASan checks a shadow byte on every access
+// in it, TSan additionally keeps per-access happens-before state under a lock --
+// which is why the third shape needed 0.25 ms plain and 3 ms under a sanitizer,
+// and why the nested `#if` that GCC's missing `__has_feature` made mandatory was
+// in this file at all. This loop is built out of the same operations and is
+// compiled into the same binary, so it inherits the same instrumentation.
+class InstrumentCeiling {
+ public:
+  void Start() {
+    if (running_) return;
+    running_ = true;
+    stop_.store(false);
+    worker_ = std::thread([this]() { Loop(); });
+  }
+  void Stop() {
+    if (!running_) return;
+    stop_.store(true);
+    worker_.join();
+    running_ = false;
+    std::fputs("\n", stderr);
+  }
+
+  // THE WORST boundary this run measured, and the two order statistics beside
+  // it that a reader of a red needs. Readable WHILE the sampler runs, which is
+  // what `mu_` is for: the assertions run in the middle of the case, and
+  // stopping the sampler to read it would make the denominator a statement
+  // about a window the numerator was not drawn from.
+  //
+  // A QUANTILE IS NOT ENOUGH AND THAT IS MEASURED, not assumed. The 99.9th
+  // percentile of the same population is 20x to 200x tighter and would be a far
+  // better instrument if it were safe. It is not: over 1440 leaf-record
+  // observations the worst `slack / p999` is **199.4**, against **0.645** for
+  // the maximum, and on the one run that redded the 30 ms constant p999 read
+  // 0.339 ms against a 67.55 ms boundary. The numerator is a maximum over two
+  // draws, so the denominator has to be a maximum too.
+  double ceiling_seconds() const { return Quantile(1, 1); }
+  double p999_seconds() const { return Quantile(999, 1000); }
+  double median_seconds() const { return Quantile(1, 2); }
+  size_t observations() const {
+    std::lock_guard<std::mutex> lock(mu_);
+    return seconds_.size();
+  }
+
+ private:
+  double Quantile(size_t num, size_t den) const {
+    std::vector<double> copy;
+    {
+      std::lock_guard<std::mutex> lock(mu_);
+      copy = seconds_;
+    }
+    if (copy.empty()) return 0.0;
+    const size_t index = std::min(copy.size() - 1, (copy.size() * num) / den);
+    std::nth_element(copy.begin(), copy.begin() + static_cast<long>(index), copy.end());
+    return copy[index];
+  }
+
+  void Loop() {
+    while (!stop_.load()) {
+      const std::chrono::steady_clock::time_point before = std::chrono::steady_clock::now();
+      // The three things `Open` and `Close` BOTH do. `SampleNow()` is the public
+      // entry point for the mutex plus the `/proc/self/statm` read; the flushed
+      // write is `EmitLocked`, which the live lane performs on every boundary on
+      // the shipped default.
+      vllm::multimodal::phase::SampleNow();
+      std::fputs(".", stderr);
+      std::fflush(stderr);
+      const std::chrono::steady_clock::time_point after = std::chrono::steady_clock::now();
+      const double elapsed = std::chrono::duration<double>(after - before).count();
+      {
+        std::lock_guard<std::mutex> lock(mu_);
+        seconds_.push_back(elapsed);
+      }
+      // A CADENCE AND NOT A SPIN. One sample per millisecond draws tens of
+      // thousands of observations across a render and costs about 1% of one
+      // core; a spin would draw more and would change the contention it is
+      // measuring.
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+  }
+
+  std::atomic<bool> stop_{false};
+  std::thread worker_;
+  bool running_ = false;
+  mutable std::mutex mu_;
+  std::vector<double> seconds_;
+};
+
+// Process-wide: the bounds read the boundary cost the WHOLE run measured.
+InstrumentCeiling& RunCeiling() {
+  static InstrumentCeiling ceiling;
+  return ceiling;
+}
+
+// RAII, and the reason is not tidiness. A failed `REQUIRE` inside the case
+// throws, and a sampler left running would keep writing to fd 2 while the LATER
+// cases in this file `dup2` a capture file over it -- so one failure here would
+// become three unrelated ones there, in a file whose whole subject is
+// attributing a red.
+struct CeilingSamplerGuard {
+  CeilingSamplerGuard() { RunCeiling().Start(); }
+  ~CeilingSamplerGuard() { RunCeiling().Stop(); }
+};
+
 struct Carrying {
   std::string leaf;                    // the name that claims the seconds
   std::vector<std::string> parts;      // the nested sub-scopes sitting on the work
@@ -3707,8 +3880,11 @@ void CheckCarryingPhase(const nlohmann::json& table, const Carrying& c) {
   // limit of the instrument at this geometry, and `### Owed out of W0` is where
   // the leaf-by-leaf version lives.
   //
-  // AND THE RESOLUTION IS NOW 30 ms RATHER THAN 0.25 ms, which is a real
-  // loss and is the price of a bound that survives a two-core contended runner.
+  // THE FOURTH SHAPE'S RESOLUTION WAS 30 ms RATHER THAN 0.25 ms, which was a
+  // real loss and was the price of a bound that survives a two-core contended
+  // runner. The fifth shape below buys most of it back by measuring the number
+  // instead of choosing it: on this box the same bound ran 0.54 ms to 419 ms,
+  // median 9.7 ms, because it is now a property of the RUN.
   // The 0.25 ms constant was inside its own honest distribution: at head
   // 6b48edb2c, unmutated, it reddened 3 of 33 runs on a shared
   // 20-core box and 2 of 10 under an added eight-way spin load.
@@ -3784,7 +3960,11 @@ void CheckCarryingPhase(const nlohmann::json& table, const Carrying& c) {
   // contended. The same probe on a 20-core box read 94 us / 569 us / 895 us in
   // the same order, so the ordering is the build and not the box.)
   //
-  // A NORMALISED BOUND WOULD BE BETTER AND THERE IS NO NORMALISER. The old 0.95
+  // A NORMALISED BOUND WOULD BE BETTER AND THERE IS NO NORMALISER IN THE TABLE.
+  // That is what the five candidates below establish, and it was read as though
+  // it said there is none anywhere. The fifth shape MEASURES one, from outside
+  // the table, by running the instrument's own boundary operations beside the
+  // render -- see the note above `InstrumentCeiling`. The old 0.95
   // coverage floor tolerated instrumentation ACCIDENTALLY, by being a ratio of two
   // quantities that inflate together: when TSan makes everything 8x slower both
   // `covered` and `leaf_seconds` grow and the ratio survives. The span slack is an
@@ -3810,7 +3990,10 @@ void CheckCarryingPhase(const nlohmann::json& table, const Carrying& c) {
   // instead, the raw quantity is tight: 20.1-93.6 us plain, 128-569 us under ASan,
   // 52.1-895 us under TSan -- about 4.7x, 4.4x and 17.2x. So configuration is the
   // variable that actually explains this quantity, and a per-configuration
-  // constant is the most stable bound available rather than a fallback.
+  // constant is the most stable bound available FROM THE TABLE rather than a
+  // fallback. Every candidate in that column is a ratio to something the render
+  // produced; none of them is a measurement of the instrument, which is what the
+  // fifth shape adds and why it is not a sixth row of this table.
   //
   // WHY NOT A SINGLE FLAT 4 ms COVERING ALL THREE: it would be ~30x slack on the
   // plain lane, where the honest value is ~121 us and the assertion currently
@@ -3848,7 +4031,9 @@ void CheckCarryingPhase(const nlohmann::json& table, const Carrying& c) {
   // bounded -- and it is strictly tighter than the sum on every leaf that has
   // more than one record.
   //
-  // AND THERE IS ONE CONSTANT NOW, NOT ONE PER BUILD CONFIGURATION. The third
+  // AND THERE WAS ONE CONSTANT, NOT ONE PER BUILD CONFIGURATION -- until the
+  // fifth shape retired the constant itself. The paragraph is kept because its
+  // measurement is why a per-build number was not enough either. The third
   // shape carried 0.25 ms plain and 3 ms under either sanitizer, on the measured
   // ground that a sanitizer instruments the scope boundary this quantity IS. That
   // ground is still true and it is no longer the biggest term. Within the PLAIN
@@ -3866,7 +4051,29 @@ void CheckCarryingPhase(const nlohmann::json& table, const Carrying& c) {
   // `||` form compiled on the TSan leg only because `||` short-circuits before
   // reaching it, which is the kind of green that means nothing. Anyone
   // reintroducing a per-configuration constant needs the nested form again.
-  const double kSpanSlackPerRecord = 0.03;  // 30 ms, every build configuration
+  // AND THE BOUND IS FOUR OF THIS RUN'S OWN BOUNDARIES, NOT A CONSTANT.
+  //
+  // The head of a leaf record is `Open(leaf)`'s own sample and flushed line
+  // followed by `Open(sub)`'s acquisition of the same mutex; the tail is
+  // `Close(sub)`'s flushed line followed by `Close(leaf)`'s acquisition, sample
+  // and stamp. TWO boundary-sized operations, one at each end, both read out of
+  // `render_phase_log.cpp` in the note above `InstrumentCeiling` rather than
+  // assumed. `2 x ceiling` is the bound the structure gives; the four here
+  // carries one factor of two over it, and that factor is the whole of the
+  // judgement in this line.
+  //
+  // NOTHING ABOUT IT IS A BOX CONSTANT ANY MORE, which is what closes #1572 and
+  // #1576. On a quiet host the ceiling is tens of microseconds and this bound is
+  // far tighter than any number this case has carried; on a contended one it
+  // widens with the thing that made the quantity widen, and a record it can no
+  // longer resolve is REPORTED rather than decided.
+  const InstrumentCeiling& ceiling = RunCeiling();
+  REQUIRE_MESSAGE(ceiling.observations() > 0,
+                  "no `InstrumentCeiling` sampler ran before this check, so every bound below is "
+                  "zero and this case would be asserting against an unmeasured number. The "
+                  "`CeilingSamplerGuard` belongs in the case, around the renders");
+  const double kBoundariesPerRecord = 4.0;
+  const double kSpanSlackPerRecord = kBoundariesPerRecord * ceiling.ceiling_seconds();
   // THE COVERAGE FLOOR (2) IS WHAT HOLDS A SINGLE-RECORD LEAF THE CAP BELOW
   // SWALLOWS -- and ONLY a single-record leaf, which is the scope this line
   // used to leave out. Where the cap binds, this bound degrades to "head plus
@@ -3997,7 +4204,10 @@ void CheckCarryingPhase(const nlohmann::json& table, const Carrying& c) {
                          "phase");
   }
   MESSAGE("  " << c.leaf << " span slack: " << span_checked << " of " << leaves.size()
-               << " leaf record(s) checked at " << kSpanSlackPerRecord << "s, "
+               << " leaf record(s) checked at " << kSpanSlackPerRecord << "s ("
+               << kBoundariesPerRecord << " x this run's worst boundary of "
+               << ceiling.ceiling_seconds() << "s, median " << ceiling.median_seconds()
+               << "s over " << ceiling.observations() << " samples), "
                << span_unresolvable << " below this instrument's resolution; worst "
                << worst_span_slack << "s");
 
@@ -4538,6 +4748,12 @@ void CheckRenderPhases(const nlohmann::json& table,
 }  // namespace
 
 TEST_CASE("ltx2 video: the three carrying phases contain their work and the load keeps its order") {
+  // THE INSTRUMENT MEASURES ITSELF FIRST, and it does it FOR the load and both
+  // renders rather than beside them. Every wall-clock bound below is a multiple
+  // of what this sampler observes; the note above `InstrumentCeiling` is the
+  // argument, and the `REQUIRE` inside `CheckCarryingPhase` is what stops the
+  // bounds from silently becoming zero if this line is ever deleted.
+  const CeilingSamplerGuard sampling;
   Workspace ws;
   // `max_phase = 0` is a LOAD extra and is what keeps this on one recipe phase:
   // the default `distilled_two_stage` kind would need the latent spatial
