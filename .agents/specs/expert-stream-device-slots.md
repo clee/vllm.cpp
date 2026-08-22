@@ -18,10 +18,11 @@ correctness gate that would let us publish a number does not pass.** W0e ran on
   decode-phase `exhausted` delta **0** (6077 at step 1 and at step 32; the total
   is the structural prefill number this spec predicted); `W0E_DOCKER_RC=0`, no
   guard trip, peak RSS **97.75 GiB** with swap untouched.
-* **G0-CORRECT: FAIL as declared, and MEASURED to be a near-tie rather than a
-  disagreement about the model.** The 32 ids match the CPU arm for six tokens and
-  diverge at the seventh — `...,264,3177,7172,...` on CPU against
-  `...,264,3177,303,...` on CUDA. Both continuations are coherent. Three things
+* **G0-CORRECT: FAIL as declared. This bullet read the failure as a near-tie,
+  and W0g has since shown that reading to be the SYMPTOM. Read the W0g bullet
+  below before the three findings under this one.** The 32 ids match the CPU
+  arm for six tokens and diverge at the seventh — `...,264,3177,7172,...` on
+  CPU against `...,264,3177,303,...` on CUDA. Both continuations are coherent. Three things
   were then established rather than assumed:
   1. **Is it W0f? The two grounds first offered here could not answer that, and
      they are withdrawn.** The CPU arm was re-run on the SAME binary and the
@@ -77,10 +78,53 @@ correctness gate that would let us publish a number does not pass.** W0e ran on
      arithmetic difference, and the two arms run genuinely different GEMM
      kernels.
   So the declared gate fails and the wave stops, which is correct. What the
-  failure means is a different question, and it is now answered with numbers:
-  the arms agree about the distribution and disagree about a coin flip.
+  failure MEANS is a different question. This bullet used to answer it with
+  "the arms agree about the distribution and disagree about a coin flip", and
+  W0g falsifies that answer: the two arms already select different EXPERTS in
+  the first MoE block of the first forward, so the sampler is not comparing the
+  same distribution and the margins above measure an input that already
+  differs. The three findings above stay true as measurements. Only the
+  conclusion drawn from them is withdrawn.
   Whether a token-exact cross-arm gate is the right instrument for a path with
-  no oracle is a decision for the operator, not something this row may assume.
+  no oracle is still a decision for the operator, not something this row may
+  assume.
+* **W0g: the divergence is expert ROUTING from the FIRST MoE block, and its
+  cause is still not identified.** Two runs on `dgx:gpu0` at source `cffe59b`,
+  on 2026-08-20 and 2026-08-21, with the page cache dropped on the HOST before
+  each arm and the weights on local NVMe. Every number is in
+  [`../benchmark-record.md`](../benchmark-record.md) under
+  `ENG-EXPERT-STREAM-DEVICE W0g` and is not repeated here.
+  * **What is now EXCLUDED, measured rather than argued.** The router GATE
+    weights: an FNV fingerprint of the gate is identical on all 184 dump
+    records of both arms, so the arms do not load different router weights.
+    Both TOP-K implementations: the selected set was re-derived offline from
+    each arm's OWN logits by a plain lowest-index-wins rank, and no row
+    deviates on either arm. The W0f host alias was already excluded on this
+    silicon by the algo-identity probe.
+  * **What the dump shows instead.** The arms differ at record 0, the first MoE
+    block, in the router GEMM INPUT rather than in anything the router does
+    with it, and the difference compounds smoothly up the stack. The observed
+    flip is an exact bf16 tie that one arm sees and the other does not. Run A's
+    step-1 miss counters corroborate this from a counter neither dump touches:
+    at step 1 the slot cache is empty, so the miss count IS the number of
+    distinct expert slices requested, and the arms are 27 slices apart eight
+    tokens before any emitted token differs.
+  * **What is NOT excluded, and this row may not present the case as closed.**
+    No fingerprint was taken of the embedding table, the expert projections,
+    the attention weights, or the norms. The evidence is CONSISTENT with bf16
+    reduction-order accumulation across two genuinely different GEMM kernels,
+    and consistency is not attribution.
+  * **The CUDA continuation degenerates, and that is a reason not to ratify.**
+    The two arms agree for 8 tokens, then the CUDA text falls into a mechanical
+    recursion in which each sentence re-uses the previous object. A coin flip
+    between two equally good tokens does not do that, so this reads as a wrong
+    distribution rather than as admissible non-determinism.
+  * **No speed result follows, and none is claimed.** Run A's decode medians
+    are recorded in the benchmark record with their three qualifications: one
+    stalled step inside each arm's steady window, an application clock pin of
+    2418 MHz against a 3003 MHz maximum, and G0-CORRECT still failing. No ratio
+    is written anywhere and neither median may reach `docs/BENCHMARKS.md` as a
+    speed claim.
 * **G0-SPEED: VOID, by this row's own stop condition.** It was measured over
   the 31 DECODE steps of each arm (step 1 is prefill and is excluded),
   interleaved on one lease: CUDA median **4.598 s/token** (min 3.012, max
@@ -120,7 +164,7 @@ for one:
 
 | Gate | Result |
 |---|---|
-| **G0-CORRECT** | **FAIL, and it now has a CUDA side to fail on.** At source `95883dcae` the entry read "NO CUDA SIDE", because that arm emitted zero tokens. With W0f it emits 32, and they diverge from the CPU arm at step 7 on a MEASURED near-tie: the CPU arm's own runner-up is the token CUDA emitted, 1.4% behind, and one step later the margin is 0.1%. The CPU side remains byte-identical across four runs and two slot counts (32 ids, listed in `## Evidence`). The alias is measured ON GB10 not to be the cause; WHAT is remains open under `## Owed`. |
+| **G0-CORRECT** | **FAIL, and it now has a CUDA side to fail on.** At source `95883dcae` the entry read "NO CUDA SIDE", because that arm emitted zero tokens. With W0f it emits 32, and they diverge from the CPU arm at step 7 on a MEASURED near-tie: the CPU arm's own runner-up is the token CUDA emitted, 1.4% behind, and one step later the margin is 0.1%. The CPU side remains byte-identical across four runs and two slot counts (32 ids, listed in `## Evidence`). The alias is measured ON GB10 not to be the cause. **W0g then moved the failure upstream of the sampler**: at source `cffe59b` the two arms already select different EXPERTS in the FIRST MoE block of the FIRST forward, eight tokens before any emitted token differs, so the near-tie is the symptom. The router gate weights and both top-k implementations are now excluded as well. WHAT the cause is remains open under `## Owed`. |
 | **G0-LIVE** | **PASS on both arms.** CPU: `steps=32`, `forced=0`, decode-phase `exhausted` delta **0** at both 4000 and 8000 slots. CUDA with W0f: `steps=32`, decode-phase `exhausted` delta **0**, peak RSS 97.75 GiB of a 119.631 GiB box, swap untouched, container exit 0. At `95883dcae` this read "NOT REACHED on CUDA", because no step boundary was ever crossed. |
 | **G0-SPEED** | **VOID, and no ratio is published.** The CPU denominator is measured: steady decode **11.05 s/token**, rep 2's median over 29 samples (min 9.43, max 13.25) at 4000 slots, rep 1's median 11.22, the two reps agreeing within 1.5%. A CUDA number exists now and is recorded in `../benchmark-record.md` for the record only, because this row's own stop condition VOIDS a speed result behind a failing correctness gate. No ratio may be inferred from the two. |
 
@@ -268,9 +312,10 @@ arena failed in exactly the place an 18.55 GiB one did. That was
 32/32 steps at peak RSS 97.75 GiB.
 
 **The developer's target is a GPU FIGURE, and this row still cannot publish
-one.** G0-CORRECT fails on the step-7 near-tie, so G0-SPEED is VOID by this row's
-own stop condition. A decode number exists in `../benchmark-record.md` for the
-record; it is not a result and no ratio may be inferred from it.
+one.** G0-CORRECT fails on a divergence W0g locates in expert ROUTING at the
+first MoE block, so G0-SPEED is VOID by this row's own stop condition. A decode
+number exists in `../benchmark-record.md` for the record; it is not a result and
+no ratio may be inferred from it.
 
 **The public pages now agree with this row**
 ([#1442](https://github.com/mudler/vllm.cpp/issues/1442)). Both carried the
@@ -999,8 +1044,8 @@ re-derived here.
 | **A zero-copy device filler (GPUDirect Storage / `cuFile`).** | W1 ships the staging bounce by choice, for the reasons in its design note. The measurement that would justify replacing it — a device-arm decode where the H2D leg is a measurable fraction of fill time — does not exist until W1 has run somewhere. |
 | ~~**The CUDA arm loads and then exhausts the box in its first forward, so this row still has no GPU number.**~~ **CLOSED by W0f**, 2026-08-19 ([#1299](https://github.com/mudler/vllm.cpp/issues/1299)): the non-expert weights were resident twice on a unified part, and `ResidentWeight` now aliases the host bytes where `host_memory_is_device_addressable()`. The same checkpoint reaches **32/32 decode steps** at peak RSS 97.75 GiB. | Kept as a line rather than deleted, because the entry recorded a diagnosis as well as a debt and the diagnosis held: a 0.15 GiB arena failed where an 18.55 GiB one did, and the growth was `RssAnon` while `RssFile` stayed flat, which is what pointed at the dense remainder rather than at the lane. What it got wrong was the scope call -- "not fixable inside this row's scope" -- and W0f fixing it in one branch is the correction. What is NOT closed is the GPU NUMBER: G0-CORRECT fails, so G0-SPEED stays VOID and no rate is published. |
 | ~~**The CPU arm's streaming decode figure is still VOID.**~~ **CLOSED by W0e**, 2026-08-18: streaming-ON decode on a live cache is **11.05 s/token** steady at 4000 slots, rep 2's median with rep 1 at 11.22, and the decode-phase `exhausted` delta is 0 in the same run. See `## Evidence`. | Kept as a line rather than deleted because `docs/BENCHMARKS.md:8` still carries the parent row's VOID (#912 F1) text for `ENG-EXPERT-STREAM`, which owns that row's own re-measure. This row measured its own denominator and is no longer waiting on one. |
-| **A ratified gate for a two-arm comparison whose greedy path is a coin flip.** The measurement that would settle it: over N prompts, the distribution of top-2 margins at each step, and the fraction of steps whose margin is below the arms' measured arithmetic spread. | W0e MEASURED the margin at the divergent step (0.264709 logits, 1.4 %) and one step later (0.022802, 0.1 %), so the token-exact gate is failing on ties rather than on a defect. Ratifying a distributional gate is exactly the decision `AGENTS.md` reserves for an explicit act — "use an explicitly ratified distributional gate only when the oracle's greedy decode is non-deterministic" — and it is the operator's, not this row's. Until it is taken, G0-CORRECT stays FAILING and G0-SPEED stays VOID, which is the conservative reading and the one that cannot publish a wrong number. |
-| **WHAT the step-7 divergence IS.** The alias is EXCLUDED as its cause, on the target silicon: the algo-identity probe ran on `dgx:gpu0` as well as on `thor:gpu0` (`rc` job `7c7a05e9-be87-48f4-94ae-1bbe0340f063`, `NVIDIA GB10 sm_121`, cuBLASLt 130101, 12/12 identical selection, 12/12 bit-exact output, `PROBE_FAILURES=0`), so this entry is no longer about the probe. | Excluding one cause is not identifying another, and nothing here may present it as one. The standing hypothesis is that the two arms run genuinely different GEMM kernels and the greedy path is a coin flip, and that is not measured. The next traceable step needs no new instrument beyond a two-arm dump of the step-7 forward: name the FIRST tensor whose values differ between the CPU and CUDA arms at that step, and the operation that produced it. It needs the same `dgx:gpu0` lease as W0e. Until it runs, G0-CORRECT stays FAILING and G0-SPEED stays VOID. |
+| **A ratified gate for a two-arm comparison whose greedy path is a coin flip.** The measurement that would settle it: over N prompts, the distribution of top-2 margins at each step, and the fraction of steps whose margin is below the arms' measured arithmetic spread. **This entry's own premise is now in doubt, and it is recorded as such rather than deleted.** | W0e MEASURED the margin at the divergent step (0.264709 logits, 1.4 %) and one step later (0.022802, 0.1 %), which was read as the token-exact gate failing on ties rather than on a defect. **W0g weakens that reading twice.** The arms select different experts from the first MoE block, so the two sampler inputs are not the same distribution and a margin measured on one arm does not bound the disagreement. And the CUDA continuation degenerates into a mechanical recursion after the 8 tokens the arms share, which a coin flip between two equally good tokens does not produce. Ratifying a distributional gate on this evidence would ratify a possible defect, and ratifying one at all is exactly the decision `AGENTS.md` reserves for an explicit act — "use an explicitly ratified distributional gate only when the oracle's greedy decode is non-deterministic" — and it is the operator's, not this row's. Until it is taken, G0-CORRECT stays FAILING and G0-SPEED stays VOID, which is the conservative reading and the one that cannot publish a wrong number. |
+| **WHAT the divergence IS. It is expert ROUTING and not sampling, and its CAUSE is still unnamed.** W0g ran the two-arm dump this entry asked for and moved the question upstream. At source `cffe59b` the arms already select different experts in the FIRST MoE block of the FIRST forward, eight tokens before any emitted token differs, and they differ there in the router GEMM INPUT rather than in anything the router does with it. Three causes are now EXCLUDED by measurement: the W0f host alias, on the algo-identity probe that ran on `dgx:gpu0` as well as on `thor:gpu0` (`rc` job `7c7a05e9-be87-48f4-94ae-1bbe0340f063`, `NVIDIA GB10 sm_121`, cuBLASLt 130101, 12/12 identical selection, 12/12 bit-exact output, `PROBE_FAILURES=0`); the router GATE weights, whose FNV fingerprint is identical on all 184 dump records of both arms; and both TOP-K implementations, neither of which deviates from a plain lowest-index-wins rank of its own arm's logits. Numbers in [`../benchmark-record.md`](../benchmark-record.md) under `ENG-EXPERT-STREAM-DEVICE W0g`. | Excluding three causes is not identifying a fourth, and nothing here may present it as one. **The embedding table, the expert projections, the attention weights and the norms are NOT exonerated: none was fingerprinted.** The evidence is CONSISTENT with bf16 reduction-order accumulation across two genuinely different GEMM kernels, and consistency is not attribution. The next traceable step is queued and UNRUN: branch `task/1299-embed-dump`, commit `0544b6224`, adds `VT_EMBED_DUMP`, which writes the EMBEDDING OUTPUT itself, upstream of every GEMM. A difference there puts the cause at or before the embedding and refutes the GEMM hypothesis; agreement there puts it inside the first attention block and bisects the search into it. It needs the same `dgx:gpu0` lease as W0e. Until it runs, G0-CORRECT stays FAILING and G0-SPEED stays VOID. |
 | **The CUDA arm's own top-2 margin at the divergent step.** | The scratch instrument that reads `logits` in the completion callback SIGSEGVs on the CUDA arm (`SCRIPT_EXIT=139`). **WHY IT FAULTS IS UNMEASURED.** An earlier draft of this row wrote "almost certainly because the pointer it is handed there is not host memory on that arm", and that is a hypothesis, not a reading: nothing printed the pointer, nothing asked `cudaPointerGetAttributes` about it, and no fault address was recorded. In a change whose central risk is handing device kernels host pointers, a segfault whose cause was guessed at is exactly the finding that must not be dismissed — so it is recorded as unmeasured rather than as explained. The CPU arm's margin is enough to establish the near-tie (`303` is its own runner-up), and the next lease should print `cudaPointerGetAttributes(logits)` in that callback before anything else. |
 | **No CI gate reaches the alias branch through a production entry point.** `test_expert_stream_wiring` enters `Qwen3_5Model::Forward` and the reachability mutation reds it, but it runs on the **CPU** device, where `ResidentWeight` returns at the `is_cpu()` early return roughly ninety lines above the alias branch. In CI the branch is reached only through `detail::StageWeightForTest`, a test-only seam. | Deliberate, and this is the entry `## Nothing lands dead` requires for it. The branch is selected by `needs_weight_staging() && host_memory_is_device_addressable()`, and no CPU tier can register a platform that answers both — a real one exists on exactly one machine this project can reach. The device evidence is real and is the stronger of the two (the W0e run entered the branch **43,501 times** through `Qwen3_5Model::Forward` on `dgx:gpu0`); it is simply not repeatable in CI. Closing this means either a GPU CI lane on a probed-capable part, or a production entry point that a fake staging platform can drive end to end. It is owned by `ENG-EXPERT-STREAM-DEVICE` and tracked by [#1299](https://github.com/mudler/vllm.cpp/issues/1299) until either lands, and that pair is named in the landing commit body and the pull request body as well as here, because `## Nothing lands dead` requires all three and the spec alone is not the disclosure. |
 | **The family-wide copy of this change: `include/vllm/model_executor/models/dense_attn_block.h`'s `ResidentWeight` still stages unconditionally.** The measurement: on a host-addressable staging platform, load any of the ~50 models that include that header and show peak resident bytes falling by the model's weight size, with tokens unchanged. | W0f deliberately changes only `qwen3_5.cpp`'s PRIVATE copy, which is the one that governs `Qwen3.8-2.4T-A95B UD-Q1_0` (that file kept its own helper; the header's copy is not on the Qwen3.5 path). The header's version is reached from `ModelRegistry::Forward` for every model that includes it, so extending it is not dead code — but nothing on a CPU tier can drive one of those forwards on a staging platform, so the extension would land with its reachability argued rather than gated, across ~50 architectures at once. That is a scope and a review question, not a line of code, and it gets its own row. |

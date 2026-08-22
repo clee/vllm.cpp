@@ -78,10 +78,22 @@ Six limits, stated plainly rather than left to be discovered.
   GB10 — same shapes, same algorithm, bit-identical output from a `cudaMalloc`
   operand and from a 256-aligned host one — but excluding one cause is not
   identifying another, and that the two arms simply run different GEMM kernels
-  over a near-tie is a standing hypothesis rather than a reading. Treat the CUDA
-  arm as unverified against the CPU arm until that gate is settled, and **use
-  `--device cpu` for this checkpoint today**: it is the arm every published
-  number here was measured on.
+  over a near-tie is a standing hypothesis rather than a reading.
+  **2026-08-21: a router dump moved the failure UPSTREAM of the sampler.** On a
+  later tree, source `cffe59b`, the two arms already select different MoE
+  experts in the FIRST block of the FIRST forward, eight tokens before any
+  emitted token differs, and they differ there in the router GEMM input rather
+  than in anything the router does with it. Two more causes are excluded by
+  measurement: the router gate weights, whose fingerprint is identical on both
+  arms, and both top-k implementations, neither of which deviates from a plain
+  lowest-index-wins rank of its own arm's logits. The cause is STILL not
+  identified, because the embedding table, the expert projections, the
+  attention weights and the norms were never fingerprinted. The CUDA
+  continuation also degenerates into a mechanical recursion after the tokens the
+  two arms share, which a coin flip between two equally good tokens does not
+  produce. Treat the CUDA arm as unverified against the CPU arm until that gate
+  is settled, and **use `--device cpu` for this checkpoint today**: it is the
+  arm every published number here was measured on.
 * **No speed claim is attached.** `docs/BENCHMARKS.md` carries G0-SPEED as
   `VOID`, because a speed number behind a failing correctness gate is not a
   result. The CPU arm serves this checkpoint at a steady **11.05 s/token at 4000

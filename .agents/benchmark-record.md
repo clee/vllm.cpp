@@ -19,6 +19,169 @@ from relative link targets repointed for this file's location.
 
 # Benchmarks
 
+## ENG-EXPERT-STREAM-DEVICE W0g: the CPU-against-CUDA divergence is expert ROUTING from the FIRST MoE block, and it is NOT a sampling near-tie (2026-08-20 and 2026-08-21, `dgx:gpu0`, source `cffe59b`, #1124, #1299)
+
+**Read the W0e and W0f sections further down this file first.** This is a third
+run of the same harness on a third tree, and its CPU column is again a control
+for the CUDA arm rather than a new attempt at the standing 11.05 s/token CPU
+figure. The three sections must not be mixed.
+
+**What this section replaces.** W0f recorded the G0-CORRECT failure as a
+near-tie at the first divergent token, on a measured CPU top-2 margin of
+0.264709 logits. That reading described the symptom. The two runs below show
+that the arms already choose different EXPERTS in the first MoE block of the
+first forward, eight tokens before any emitted token differs, so the token
+divergence is downstream of a routing divergence. The near-tie margins W0f
+measured stay true as measurements of the sampler's input. They are no longer
+the explanation.
+
+**Provenance.** `dgx:gpu0` (NVIDIA GB10, `sm_121`, driver 580.173.02), source
+`cffe59b`, weights `/home/mudler/ckpt/qwen3.8-q1_0` (`Qwen3.8-2.4T-A95B
+UD-Q1_0`, 369.97 GiB) on LOCAL NVMe ext4 rather than on the CIFS share, prompt
+ids `760,6511,314,9338,369` ("The capital of France is"),
+`VT_GGUF_PREFAULT=0 VT_MOE_EXPERT_STREAM=1 VT_MOE_EXPERT_STREAM_SLOTS=4000`,
+greedy, `--max-num-seqs 1`. Both arms ran at source `cffe59b`.
+
+### Run A: decode, with the page cache dropped on the HOST before each arm
+
+A container cannot drop the host page cache, so this run took an `rc hold` on
+`dgx:gpu0` and held `$GPU_LOCK` inside the lease, then dropped the cache from
+the host between the two arms. Raw logs on `dgx.casa` at
+`/home/mudler/qwen38-run/out/host-cpu.txt` and
+`/home/mudler/qwen38-run/out/host-cuda.txt`.
+
+| Observable | CPU | CUDA |
+|---|---|---|
+| load | 270.1 s | 261.1 s |
+| steady decode median, steps 4-32 | **9.09 s/token** | **4.72 s/token** |
+| steady decode min | 7.81 s | 3.41 s |
+| one stalled step inside the same window | 26.84 s | 87.32 s |
+| decode steps | 32/32 | 32/32 |
+| decode-phase `exhausted` delta | **0** (6074 flat) | **0** (6101 flat) |
+| `advised` | 0 | 0 |
+| peak RSS | 96.48 GiB | 98.39 GiB |
+| harness verdict | `W0E_RESULT=OK` | `W0E_RESULT=OK` |
+
+**Three qualifications travel with those two medians, and none of them is
+optional.**
+
+1. **Each steady window contains ONE stalled step**, 26.84 s on CPU and 87.32 s
+   on CUDA. Neither was investigated. The medians are the honest figure for
+   decode behavior and the maxima are not decode behavior, so neither maximum
+   may be quoted as one and neither may be quoted as a spread.
+2. **The run was taken under an application clock pin of 2418 MHz against a
+   3003 MHz maximum**, discovered after the fact. These are therefore NOT
+   clock-controlled numbers, and a repeat at the full clock is owed before any
+   comparison rests on them.
+3. **No ratio of the two medians is written here, and the omission is
+   deliberate.** G0-CORRECT fails, so this row's own stop condition VOIDS a
+   speed result, and neither median may reach `docs/BENCHMARKS.md`, a release
+   note, or any other page as a speed claim. Both figures are in the table for
+   the record, exactly as the W0f section states its own.
+
+**A measured negative result: the cold page cache is worth about 7 %.** An
+earlier run of the same CPU arm inside a container, with the page cache WARM,
+read 8.46 s/token against the 9.09 s/token above. The lane reads about
+6.95 GB per token out of a 369.97 GiB file, so the working set cannot sit in a
+page cache on a 119.631 GiB box and warming it buys almost nothing. Dropping
+the cache is still the correct protocol, and anyone who cannot drop it now has
+the measured size of the error rather than a guess.
+
+### Run B: a router dump on both arms, one prefill each
+
+An env-gated observer on branch `task/1299-router-dump` (`VT_ROUTER_DUMP`,
+documented in `docs/ENVIRONMENT.md` on that branch, observer-only: every value
+is written after it is computed and none is read back) records, per MoE block:
+the router GEMM INPUT, the bf16 router LOGITS it produced, the selected expert
+ids and their renormalized weights, and an FNV fingerprint of the router GATE
+weight. Both arms ran the same 5-token prefill and wrote **184 records each,
+9,661,480 bytes each**.
+
+**The router gate weights are IDENTICAL on both arms.** The gate fingerprint
+and `w_bytes` agree on all 184 records. The arms are not loading, dequantizing
+or repacking different router weights, which is the cheapest explanation and it
+is now excluded rather than assumed away.
+
+**Both top-k implementations are CORRECT.** For each arm, the selected set was
+re-derived offline from that arm's OWN logits by a plain lowest-index-wins rank.
+**0 of 5 rows deviate on either arm.** Neither selector is broken, and neither
+breaks a tie in a way the other would not.
+
+**The arms already differ at record 0**, the first MoE block, in the GEMM INPUT
+rather than in anything the router does with it:
+
+| Quantity, record 0 hidden state | Value |
+|---|---|
+| elements | 40,960 (5 tokens x 8192) |
+| elements that differ | **35.15 %** |
+| max absolute difference | 0.03125 |
+| mean absolute difference | 3.14e-4 |
+| mean magnitude of the values themselves | 0.168 |
+
+**The observed flip is an EXACT bf16 tie.** At token 3, the CPU arm reads
+experts 205 and 212 at exactly the same logit, **-4.937500**, and takes the
+lower index. The CUDA arm reads 212 at **-4.906250**, one bf16 step higher, and
+takes it outright. So the selectors agree on the rule and disagree about the
+input, which is the same conclusion the top-k re-derivation reaches from the
+other side.
+
+**The divergence compounds smoothly up the stack**, which is an accumulation
+signature rather than one bad weight:
+
+| MoE block | mean relative difference of the hidden state |
+|---|---|
+| 0 | 0.56 % |
+| 1 | 1.63 % |
+| 2 | 1.86 % |
+| 5 | 4.20 % |
+| 10 | 4.38 % |
+| 20 | 5.72 % |
+| 45 | 11.0 % |
+| 91 | **13.4 %** |
+
+**Run A corroborates Run B independently, from a counter neither dump touches.**
+At step 1 the slot cache is empty, so `misses` IS the number of distinct expert
+slices the forward requested. CPU reads 10074 and CUDA reads 10101: **27 slices
+apart on the first forward**, three projections per expert, so roughly **9
+differing (block, expert) selections** out of the routing events in a 5-token
+prefill. That is the same 27 the decode-phase `exhausted` totals differ by
+(6074 against 6101), and it happens eight tokens before any emitted token
+differs.
+
+**The generated text says the same thing, and the difference is not symmetric.**
+
+* **CPU**: ` Paris. Paris is a city located in the northern part of France, on the Seine River. It is the largest city in France and is known for its iconic`
+* **CUDA**: ` Paris. Paris is a city located in France. France is a country located in Europe. Europe is a continent located on Earth. Earth is a planet located in`
+
+The two agree for 8 tokens. The CUDA continuation then degenerates into a
+mechanical recursion in which each sentence re-uses the previous object. A coin
+flip between two equally good tokens does not do that. This is the signature of
+a subtly wrong distribution, and it is a reason to treat the failure as a defect
+rather than to ratify it as admissible non-determinism.
+
+### What these two runs exclude, and what they do NOT
+
+**Excluded, measured rather than argued:** the router gate weights, on the
+fingerprint; both top-k implementations, on the re-derivation; and the W0f host
+alias, which the algo-identity probe already excluded on this silicon (see the
+W0f section).
+
+**NOT excluded, and nothing here may present the case as closed.** No
+fingerprint was taken of the embedding table, the expert projections, the
+attention weights, or the norms. The evidence is CONSISTENT with bf16
+reduction-order accumulation across two genuinely different GEMM kernels, and
+consistency is not attribution. The first operation whose output differs is
+still unnamed, because record 0 is already downstream of the embedding and of a
+whole attention block.
+
+**The next traceable step is queued and UNRUN.** Branch `task/1299-embed-dump`,
+commit `0544b6224`, adds `VT_EMBED_DUMP`, which writes the EMBEDDING OUTPUT
+itself, upstream of every GEMM. If the two arms differ there, the cause is at or
+before the embedding and the whole GEMM hypothesis is wrong. If they agree, the
+divergence enters inside the first attention block and the search bisects into
+it. It needs the same `dgx:gpu0` lease. Until it runs, G0-CORRECT stays FAILING
+and G0-SPEED stays VOID.
+
 ## SPEC-DFLASH2 O26 — the FIRST DFlash2 speed ratio: **0.8017x** output throughput, RECORDED and NOT a pass (2026-08-22, `dgx:gpu0`, gate tree `d25730fbbc2afeafb9096d150823c2a4334d0619`, #1562)
 
 **O26 asked for the run; the run happened and the gate emitted a number.**
