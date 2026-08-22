@@ -8,9 +8,9 @@ PARALLEL DECOMPOSITION is now the lever"*.
 
 ## Now
 
-`ACTIVE`. The instrument is written and the measurement is the first gate; no
-kernel change is committed until the ablation says which candidate the curve
-actually has.
+`ACTIVE`. The ablation is taken (§2a) and it refuted the candidate the row was
+written to test. Two changes follow from it, §3a and §3b; the gates and the
+mutation evidence are §6, and the `thor:gpu0` A/B/C is §2b.
 
 ## 0. Scope
 
@@ -153,7 +153,30 @@ and the reason it could not see this is stated plainly: it timed the WINDOW and
 reasoned about the KERNEL, with nothing in between. The instrument that was
 missing was a split, not a counter.
 
-## 3. The design, and why it is bit-identical BY CONSTRUCTION
+## 3. What the row changes, and why each is bit-identical BY CONSTRUCTION
+
+The measurement moved the row's lever, so there are TWO changes and they are
+not the same size. The larger one is the one §2a found; the smaller one is the
+one the row was written to make, kept because it is measured and because it
+reaches a shape the row partition could not.
+
+### 3a. The activation function gets a partition — the row's lever
+
+`vocoder1d::SnakeActivation` had none. It now partitions the CHANNEL axis
+through `host_parallel::ForOutputRows`, the same seam every other host-reference
+body in this tree uses.
+
+**It needs none of the argument §3b needs.** Output element `(c, t)` is a
+function of input element `(c, t)` and of `alpha[c]` alone. There is no
+reduction, so there is no summation order, no accumulator, no reassociation and
+no tolerance. The `double` intermediates, the `std::sin` and `kSnakeEps` are
+UNTOUCHED — narrowing them is a numerics change an oracle owns and this row does
+not make.
+
+The size guard is the shared one, so a small activation still runs inline; and
+`channels == 1` stays inline, which no shipped consumer geometry hits.
+
+### 3b. The convolution gets a second axis
 
 **Blocked over the time axis, and parallel over (time block, output row).**
 
@@ -235,27 +258,108 @@ reaches `vt::Conv1d` on the CPU device:
 
 ## 6. Gates and evidence
 
-**Correctness before speed, in this order.**
+### 6a. The suites — counts and `Status:` in full, because `assertions: 0` is a skip wearing a pass
 
-1. `test_ops_conv1d_general` and `test_host_parallel` — the two suites whose
-   serial references are verbatim copies of the pre-op host loops, so they
-   prove *the order did not move*, which is the property at risk. Both carry
-   catastrophic-cancellation cases on the `ic` and the `k` axis, and both are
-   run because an f32 accumulator on benign data cannot see a reordering.
-2. Every consumer suite in §4's table.
-3. `test cases:`, `assertions:` **and** `Status:` quoted for each, because
-   `assertions: 0` is a skip wearing a pass.
-4. A red-before test for the new geometry conditions, and a mutation that
-   deletes the production call site to prove the gate is measuring a capability
-   and not a class.
+Authoring host, x86-64 20 cores, Release `-O3`, CPU only, at the row's head.
+Every binary's sha256 was taken before it ran.
 
-**Speed.** `thor:gpu0` under an `rc` lease, boot id recorded, every ratio inside
-one boot, `uptime` on both sides, arms alternated, the loudest pair kept, and a
-clock window sampled from `/sys` around every leg.
+| suite | result | rc |
+|---|---|---|
+| `test_ops_conv1d_general` | 14 cases, 19 617 assertions, 0 failed, `SUCCESS!` | 0 |
+| `test_host_parallel` | 11 cases, 968 assertions, 0 failed, `SUCCESS!` | 0 |
+| `test_vocoder1d` | 10 cases, 58 assertions, 0 failed, `SUCCESS!` | 0 |
+| `test_bigvgan` | 6 cases, 65 assertions, 0 failed, `SUCCESS!` | 0 |
+| `test_minimax_music3_acoustic` | 36 cases, 345 assertions, 0 failed, `SUCCESS!` | 0 |
+| `test_ltx2_vae` | 44 cases, 3 131 assertions, 0 failed, `SUCCESS!` | 0 |
+| `test_minimax_h3` | 79 cases, 57 395 assertions, 0 failed, `SUCCESS!` | 0 |
+| `test_indextts2_pipeline` | 8 cases, 433 assertions, 0 failed, `SUCCESS!` | 0 |
+| `test_indextts2_family` | 7 cases, 22 assertions, 0 failed, `SUCCESS!` | 0 |
+| `test_ops_conv1d_depthwise` | 5 cases, 1 184 assertions, 0 failed, `SUCCESS!` | 0 |
+
+`test_ops_conv1d_general` prints four `[SKIP]` lines and they are read rather
+than ignored: this host has no CUDA toolkit, so every CPU-vs-CUDA arm in that
+file — including #1334's two cancellation arms — did NOT run. The device
+provider is unchanged by this row and §7 carries the re-measure as owed.
+
+### 6b. Red before green — every mutation with its compile rc, its hunk count and its binary sha256
+
+Baseline binaries: `test_ops_conv1d_general` `0f886491b735fdea…`,
+`test_host_parallel` `63a79608a7f270de…`.
+
+| # | Mutation | compile_rc | hunks | binary sha256 | result |
+|---|---|---|---|---|---|
+| M1 | `Conv1dTimeBlock` drops the position-tile rounding | 0 | 1 | `08c97a3952bc6b57…` | **2 cases / 1 343 assertions FAILED**, rc 1 |
+| M2b | the trailing time block is dropped (floor for ceil) | 0 | 1 | `463a2bab3160077c…` | **2 cases / 2 assertions FAILED**, rc 1 |
+| M3 | the snake partition drops the last channel of every chunk | 0 | 1 | `82b2f989663a4dc6…` | **1 case / 20 assertions FAILED**, rc 1 |
+| M4 | the snake body is never dispatched | 0 | 1 | `daa17366f828bc71…` | **1 case / 20 assertions FAILED**, rc 1 |
+| M5b | the registered CPU `vt::Conv1d` provider refuses every call | 0 | 1 | per suite, all distinct | **every consumer suite red** — see 6c |
+| — | restored | 0 | 0 | `0f886491b735fdea…`, `63a79608a7f270de…` | back to baseline, byte for byte |
+
+**M2 is recorded as a defect in the INSTRUMENT, not omitted.** The first
+attempt at M2 removed the clamp on the last block, which writes past the output
+row. That is undefined behaviour rather than a wrong answer: the binary built
+(`2eb599bc05546129…`) and the suite had not finished after 201 s, so it was
+killed and reads `test_rc=137`. A hang is a detection nobody can grade, so M2b
+replaces it with a mutation that computes FEWER cells and writes none out of
+range, and that one reds cleanly on the two block-crossing cancellation cases.
+
+### 6c. Reachability, measured rather than argued
+
+A scheduling change is invisible to every arithmetic assertion BY DESIGN, so
+two separate instruments carry the reachability claim.
+
+**The op is reached from all four consumers' production paths.** M5b makes the
+registered CPU provider refuse every call, and the suites red in exactly the
+places that prove it: `test_ops_conv1d_general` 5 cases, `test_host_parallel` 3,
+`test_vocoder1d` 3, `test_bigvgan` 3, `test_minimax_music3_acoustic` 6,
+`test_ltx2_vae` 5. `test_indextts2_family` and `test_ops_conv1d_depthwise` stay
+green, which is correct — neither reaches this op — and is the control that
+says the red is a signal and not a broken build.
+
+**The second axis is entered at the SHIPPED geometries.** The gate evaluates
+`Conv1dTimeBlock` at MiniMax-Music3's own eight `vt::Conv1d` shapes at a
+344-latent window and asserts `blocks > 1` on every one, plus the tile alignment
+and the slice budget. Without it a future budget change could collapse the
+decomposition back to one block and no arithmetic test would notice.
+
+**And the snake's dispatch is mutated directly.** M4 replaces the
+`ForOutputRows` call with one that runs the body over an empty range; the gate
+reds. A green there would have meant the case was measuring a class.
 
 ## 7. Owed
 
-- Nothing yet. Items land here as the measurement closes them out.
+Named here rather than left to a profile, because each is a real gap this row
+declines to close.
+
+- **The CUDA provider is not re-measured against either change.** The authoring
+  host has no CUDA toolkit, so `test_ops_conv1d_general`'s four CPU-vs-CUDA arms
+  printed `[SKIP]` and the `thor:gpu0` job was built CPU-only. Neither change
+  touches `cuda_conv1d_general.cu`, and the `memcmp` argument is §18.3's — the
+  per-cell order is unchanged on the host — but an argument is not a
+  measurement. It needs a CUDA build, which §20.2 records as reachable inside a
+  lease (`apt` installs `cuda-nvcc-13-0`).
+- **`vt::ConvTranspose1d` keeps the row-only partition.** It was 8.17 % of the
+  window before this row and is a larger share after it, and its scatter form
+  makes a time block's output overlap its neighbour's by
+  `dilation * (kernel - 1)`, so the per-cell order would have to be argued
+  rather than inherited. Deliberately a different row.
+- **The snake returns about 7x, not 14x**, on the authoring host. Why it stops
+  there is not measured: candidates are the `std::sin` call's own throughput,
+  the pool's chunk grid at 96 channels, and the pass being a pure stream over an
+  activation that does not fit any cache here. Not chased, because after this
+  row it is no longer the largest term.
+- **`vocoder.pad` and `vocoder.copy` are unpartitioned**, at 0.89 % and 0.10 %.
+  They are named so that the next reader does not re-derive that they are small.
+- **The block byte budget was not swept per geometry ON `thor:gpu0`.** The
+  residency instrument sweeps four footprints at each geometry and
+  `kConv1dSliceBytes` was chosen at half of the measured 1 MiB private L2 rather
+  than at a per-geometry optimum. A finer sweep may move it; the constant is
+  derived from a stated budget, so moving it is a one-line change with a shipped
+  instrument behind it.
+- **The snake's arithmetic is untouched and unexamined.** It evaluates a
+  `double` `std::sin` per element. Whether upstream's `Snake1d` needs that width
+  is a numerics question an oracle owns, and narrowing it would re-gate four
+  models — exactly the shape #1474 was.
 
 ## 8. Stop conditions
 
