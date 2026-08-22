@@ -66,14 +66,19 @@ registries and cuBLASLt/CUTLASS per-call heuristics — which select per call an
 do not expose a decline counter, so vLLM answers nothing here and this is a
 local-seam decision. Local anchors:
 
-| What | Where |
-|---|---|
-| The false guarantee | `include/vt/op_provider.h:178-184` |
-| The second increment | `src/vt/op_provider.cpp:709` |
-| The single-counter helper | `src/vt/op_provider.cpp:727-729` |
-| Live caching site (CUDA) | `src/vt/cuda/cuda_attention_cross.cu:586-620` |
-| Live caching site (Metal) | `src/vt/metal/metal_mlx_provider.mm:207-241` |
-| The workaround | `tests/vt/test_ops_attention_cross.cpp:511-543` |
+Line numbers are read at the base commit `73ada0df8`, because this row moves
+several of them and an anchor recorded against the head is stale before the
+pull request merges. Grep the symbol, not the line.
+
+| What | Symbol | At `73ada0df8` |
+|---|---|---|
+| The false guarantee | the `NoteOpDecline` doc comment | `include/vt/op_provider.h:178-184` |
+| The second increment | `slot.declines.fetch_add` inside `GetOpFallback` | `src/vt/op_provider.cpp:709` |
+| The single-counter helper | `NoteOpDecline` | `src/vt/op_provider.cpp:727-729` |
+| Live caching site (CUDA) | `BlockedFallback` / `AttentionCrossBlockedCuda` | `src/vt/cuda/cuda_attention_cross.cu:586-620` |
+| Live caching site (Metal) | `MlxFallback` / `MlxMatmulKernel` | `src/vt/metal/metal_mlx_provider.mm:207-241` |
+| The workaround | `WarmDeclineOnce` | `tests/vt/test_ops_attention_cross.cpp:511-543` |
+| Non-caching callers, unchanged | `GetOpFallback(` | `src/vt/vulkan/vulkan_ops.cpp:950,1067,1488,1509`, `src/vt/tenstorrent/tenstorrent_ops.cpp:1341` |
 
 ## 4. Design
 
