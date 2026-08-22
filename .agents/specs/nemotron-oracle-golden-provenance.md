@@ -471,6 +471,16 @@ key that was actually removed. The floor and the key lists cannot be quietly
 relaxed in either direction: raising the floor to hide a shrinking record is red,
 and lowering it to admit one is red too.
 
+### One more disagreement between the copies, found while proving the fix
+
+The checker tested `unrecoverable_reason` for **truthiness** while the C++ copy
+had always spelled it `is_string()`. So `"unrecoverable_reason": 123` returned
+**zero problems** from `--check` and was refused by the C++ gate: two copies of
+one contract disagreeing about what satisfies it, which is exactly the drift
+this three-copy design promises cannot happen. The weaker copy moved to
+`_is_prose`, and `test_a_non_string_reason_is_refused` holds it there. Suite
+41 → 42 cases.
+
 ### The driver's third state named a cause it could not know
 
 `nemotron-h-gen` printed `(no capture block)` for `capture_recorded == -1`. The

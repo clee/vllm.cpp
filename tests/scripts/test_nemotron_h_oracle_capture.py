@@ -448,6 +448,15 @@ class UnattributedSubstanceTests(unittest.TestCase):
             self.assertTrue(any(".".join(path) in p for p in problems),
                             f"'{'.'.join(path)}' accepted one word: {problems}")
 
+    def test_a_non_string_reason_is_refused(self) -> None:
+        # The C++ copy has always spelled this `is_string()`. A bare truthiness
+        # test in the checker let a number through, so the two copies of one
+        # contract disagreed about what satisfied it.
+        doc = unattributed()
+        doc["capture"]["unrecoverable_reason"] = 123
+        problems = capture.check_golden(doc)
+        self.assertTrue(any("unrecoverable_reason" in p for p in problems), problems)
+
     def test_the_floor_is_not_met_by_whitespace(self) -> None:
         doc = unattributed()
         doc["capture"]["evidence"]["gate_form"] = " " * 200

@@ -297,11 +297,17 @@ def check_golden(doc):
         # An UNATTRIBUTED golden is allowed to exist — deleting it would delete
         # evidence — but it has to say so out loud and name the issue that owes
         # the re-derivation. Silence is what #926 is.
-        if not capture.get("unrecoverable_reason"):
+        # `_is_prose`, not truthiness. The C++ copy of this contract already
+        # spells it `is_string()`, and a bare truthiness test let a NUMBER
+        # through here -- `"unrecoverable_reason": 123` returned zero problems
+        # from this checker while the C++ gate refused it. Two copies of one
+        # contract disagreeing about what satisfies it is the drift this design
+        # promises cannot happen, so the weaker copy is the one that moves.
+        if not _is_prose(capture.get("unrecoverable_reason")):
             problems.append(
                 "capture.engine_config_recorded is false and "
-                "'unrecoverable_reason' is empty: an unattributed golden must "
-                "state why it cannot be attributed")
+                "'unrecoverable_reason' is not prose: an unattributed golden "
+                "must state IN WORDS why it cannot be attributed")
         issue = capture.get("issue") or ""
         if not str(issue).startswith(ISSUE_PREFIX):
             problems.append(
