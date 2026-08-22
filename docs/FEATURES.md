@@ -4,7 +4,7 @@ What vllm.cpp supports, next to the engines it is measured against. This page is
 a **keyed table**: one row per feature, kept current. It is not a changelog.
 
 For measured speed see [BENCHMARKS.md](BENCHMARKS.md); for per-capability
-lifecycle state and the caveats behind each row see [STATUS.md](STATUS.md); for
+lifecycle conventions see [Project status](../README.md#project-status); for
 the agent-facing parity inventory with upstream file references see
 [.agents/feature-matrix.md](../.agents/feature-matrix.md).
 
@@ -100,7 +100,7 @@ architecture self-registers via `REGISTER_VLLM_MODEL`, and
 `scripts/check-supported-models.py` gates this list against the source so it
 cannot drift. Today that is **40 registered architectures**. Each row names the
 checkpoint it was gated against and the verdict; caveats are in
-[STATUS.md](STATUS.md), agent detail in `.agents/model-matrix.md`. A mergeable
+[Project status](../README.md#project-status), agent detail in `.agents/model-matrix.md`. A mergeable
 gate/up MLP routes through one shared merged-GEMM method, so a tuned arm added
 once reaches every such arch; Command-R, GLM-4, MiniCPM, MiniCPM3 and Phi-3
 joined on 2026-08-10 (#299), and
@@ -279,7 +279,7 @@ both refuse, naming what is missing.
 | ROCm | W0: 5 gfx archs; dense/GDN all-native; 0.8B dispatch fixed. **M4:** Qwen3-0.6B/3.5-0.8B 16/16 (#41). **M3:** `ROCM_ATTN` registered (#1056/#1065, [spec](../.agents/specs/rocm-attn-backend.md)). CPU parity open (#269) | 49 registered ops: full GDN, MoE combine/gate, keep-quant GEMM; ctest-green gfx1151/1103/1100/1201/1200 ([#41](https://github.com/mudler/vllm.cpp/issues/41)). APU managed allocation is unverified. [ROCm guide](ROCM.md) | ✅ | ✅ |
 | XPU / TPU | ☐ | ✅ | ◐ | ☐ |
 | Tenstorrent Blackhole | ◐ `ACTIVE`, OPT-125m 6/6; Qwen3-0.6B wired; Mistral-7B-v0.3 16/16 on P150 ([spec](../.agents/specs/tenstorrent-mistral.md)). 16x16 rerun and residual-RMS owed ([spec](../.agents/specs/tenstorrent-backend.md)) | ✅ | ☐ | ☐ |
-| Tenstorrent host-free decode | ◐ env-gated `VT_TT_HOST_FREE_DECODE`; implementer P150 79-replay/5.8x. Default inert. New batch after capture refused. Engine golden owed | ☐ | ☐ | ☐ |
+| Tenstorrent host-free decode | ◐ DEFAULT since #1604 (`0` opts out): no per-step host readback; 2.1x default-leg tok/s; both golden pairs re-adjudicated, both paged gates 16/16. Capture opt-in only (#1625 hang); async off (#1627) | ☐ | ☐ | ☐ |
 
 CUDA runtime-verified on GB10 (sm_121a), Jetson Thor (sm_110) and Jetson AGX
 Orin (sm_87). sm_110 has no CUTLASS FP4 tensor-core kernels and no `fp4-mma`,
@@ -390,5 +390,5 @@ named test in the tree. A ◐ means the path works only within the limits in its
 table row.
 
 The marks describe support, not speed or current ownership. See
-[Status](STATUS.md) for lifecycle state and [Benchmarks](BENCHMARKS.md) for
+[Status](../README.md#project-status) for lifecycle state and [Benchmarks](BENCHMARKS.md) for
 performance. An inventoried row is not a supported feature.
