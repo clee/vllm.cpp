@@ -313,7 +313,6 @@ TEST_CASE("chat_template: chat_template_kwargs bind only the keys supplied") {
                             kwargs) == "False");
   CHECK(apply_chat_template("{{ other is undefined }}", {}, false, "", "", {},
                             kwargs) == "True");
-
 }
 
 // ─── #1681 review F1/F2: what a request may NOT put in chat_template_kwargs ──
