@@ -94,7 +94,7 @@ void ResetQwen3_5MixedSpecInvocations() {
 // Do not read that as "and now the removal is observable in production", because
 // it is not, in either order (fresh-review finding). `has_packed_ba` needs
 // `in_proj_ba`, written at exactly one site in the tree — the dense loader,
-// qwen3_5_dense_weights.cpp:431 — so on a MoE checkpoint the eligibility is
+// qwen3_5_dense_weights.cpp:432 — so on a MoE checkpoint the eligibility is
 // false before the shape term is ever read. Removing it therefore reaches packed
 // decode on NO checkpoint; it removes a contradiction with both references and a
 // second answer to a question the dtype rule already answers. Reaching packed
@@ -5276,6 +5276,11 @@ DBuf FullAttnBlock(Dev d, const FullAttnLayerWeights& w, const HfConfig& cfg,
   }
   DBuf dattn(d, DType::kF32, {T, Hq, Dh});
   const float scale = 1.0F / std::sqrt(SizeF(Dh));
+  // VT-ATTN-NAIVE: the REFERENCE (non-paged) dense arm, as the comment on the V
+  // upcast above already says. Production decode runs `FullAttnBlockPaged`, which
+  // replaces this call with vt::ReshapeAndCache + vt::PagedAttention; this arm is
+  // what that path is compared against, so a rung change here moves the golden
+  // rather than the shipping kernel (#1544).
   vt::Attention(d.q, dattn.t(), qn3, kn3, v3, vt::AttentionArgs{scale, true});
 
   // Sigmoid output gate on the raw gate split, folded into the o_proj activation

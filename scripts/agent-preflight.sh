@@ -76,6 +76,12 @@ for arg in "$@"; do
 done
 
 CHECKERS=(
+  # FIRST deliberately. Every other gate reads a file for its own reason and
+  # measures its own budget, so a table row that is half one branch and half
+  # another satisfies all of them (#1417). This one asks whether a merge tool
+  # wrote into a tracked file at all, and a reader who sees it fail knows to
+  # stop reading the verdicts below.
+  check-conflict-markers
   check-prompt-contract
   check-agent-record
   check-release-binary-contract
@@ -83,14 +89,17 @@ CHECKERS=(
   check-windows-release-state
   check-container-matrix
   check-container-workflow
+  check-build-runtime-deps
   check-role-discipline
   claim-view
   check-readme-structure
+  check-quickstart-recipes
   check-public-doc-tables
   check-model-checklist
   check-supported-models
   check-env-doc
   check-fusion-consistency
+  check-attention-rung-consistency
   check-fp4-resident-consistency
   check-cuda-op-arch-gate
   check-runner-routing-consistency
@@ -98,6 +107,7 @@ CHECKERS=(
   check-test-registration
   check-snapshot-pins
   check-oracle-pins
+  check-oracle-denominator-flags
   check-now-current
   check-gate-commands
   check-symbol-anchors
@@ -116,6 +126,8 @@ SUITES=(
   test_release_postpublish_audit
   test_check_container_matrix
   test_check_container_workflow
+  test_check_build_runtime_deps
+  test_validate_container_image
   test_release_index
   test_release_metadata
   test_release_accelerator_metadata
@@ -131,12 +143,14 @@ SUITES=(
   test_upstream_inventory
   test_doc_checkpoint
   test_check_readme_structure
+  test_check_quickstart_recipes
   test_check_public_doc_tables
   test_check_model_checklist
   test_check_supported_models
   test_check_env_doc
   test_checker_text
   test_check_fusion_consistency
+  test_check_attention_rung_consistency
   test_check_fp4_resident_consistency
   test_check_cuda_op_arch_gate
   test_check_runner_routing_consistency
@@ -152,6 +166,8 @@ SUITES=(
   test_agent_preflight_skip_report
   test_agent_pr_body
   test_check_symbol_anchors
+  test_check_oracle_denominator_flags
+  test_check_conflict_markers
 )
 
 failed=()
@@ -358,6 +374,28 @@ run "trailer suites" python3 -m unittest \
   tests.scripts.test_check_commit_trailers
 run "commit style suites" python3 -m unittest \
   tests.scripts.test_check_commit_style
+# THE BENCHMARK-TOOL SUITES, which PREFLIGHT never ran until #1646 (#1648).
+# `tests/tools/` holds the oracle pin, the clock-state assertions, the
+# online-gate client and summary, and the serve-low request-set completeness.
+#
+# #1646 said no lane ran them at all. That was WRONG and #1648 corrects it:
+# `tests/CMakeLists.txt` has registered them as the CTest target
+# `test_serve_low_tools` since `e58858a91`, and CI's `build-test-cpu` runs
+# `ctest --test-dir build` on every pull request. The claim came from grepping
+# for `tests.tools`, the dotted module path, while CMake spells it
+# `tests/tools` -- a null grep proving the terms wrong rather than the thing
+# absent. The parity ledger's "all tools" citations were therefore citing a
+# LIVE suite, not a dead one.
+#
+# The narrow gap was real and this line closes it: preflight ran none of them,
+# so a local pre-edit check missed a red these suites would have caught, and
+# only a full C++ configure-and-build surfaced it.
+#
+# DISCOVERED rather than enumerated. An enumeration is a shared list every new
+# suite must edit, which is the record-lock shape AGENTS.md §Records forbids;
+# discovery makes the file's existence the registration. Standard library only,
+# no GPU and no wheel.
+run "tools suites" python3 -m unittest discover -s tests/tools -t . -p "test_*.py"
 
 # The COMMITTED range, checked the way CI checks it. Deliberately OUTSIDE the
 # --staged block: `--staged` inspects staged paths and is therefore VACUOUS after
