@@ -203,6 +203,14 @@ if (vllm_complete(engine, "The capital of France is", &sampling, &output) == VLL
 vllm_engine_free(engine);
 ```
 
+`vllm_chat` takes a whole OpenAI chat request as JSON, so it accepts
+`chat_template_kwargs` exactly as the server does, and it applies the same
+default: a key nobody sends is not a template variable at all, so a Qwen3.8
+checkpoint reasons unless the request turns it off. A key that names something
+the renderer supplies (`messages`, `tools`, `chat_template`, `tokenize`) is
+refused with `VLLM_ERR_INVALID_ARGUMENT` rather than honoured, so no request can
+replace the conversation the caller passed in `messages`.
+
 ## Use the internal C++ library in the source tree
 
 The headers under [`include/vllm/`](../include/vllm/) are source-tree

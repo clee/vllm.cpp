@@ -225,18 +225,66 @@ Four changes, smallest each.
    `bool enable_thinking` parameter of `apply_chat_template` and
    `MakeChatTemplatePromptFn` becomes an `nlohmann::ordered_json`
    `chat_template_kwargs` object whose keys are set into the render context and
-   whose absence leaves the variable undefined. `chat_template` and `tokenize`
-   are skipped, because upstream refuses them: both are the renderer's own
-   parameters rather than template variables (`hf.py:640-650`). A new
+   whose absence leaves the variable undefined. A new
    `DefaultChatTemplateKwargs(std::optional<bool>)` carries the
    `--enable-thinking` tri-state rule, so the rule is drivable from a CPU gate
    even though `server_main`'s one call to it is not (it runs only after a real
    tokenizer loads).
 
+   **The request keys are FILTERED, not bound as they come.** This is the seam
+   the field opens, and the fresh review of the first implementation caught it
+   wide open: bound unfiltered, and bound AFTER the renderer had set its own
+   names, a request key silently REPLACED `messages`, so the model was fed a
+   conversation that the request log line, `usage`, `ToolsEnabled` and every
+   policy layer reading `request.messages` never saw. Nothing upstream can do
+   that. Re-executing the pinned chain (vLLM `555967922`, transformers 5.3.0)
+   over `tests/fixtures/qwen38_chat_template.jinja` measured all four arms:
+
+   | Request key | Pinned vLLM | Here |
+   |---|---|---|
+   | `chat_template`, `tokenize` | `resolve_chat_template_kwargs` raises `ValueError: Found unexpected chat template kwargs from request: {...}` (`vllm/renderers/hf.py:639-648`; its only call site takes the default `raise_on_unexpected=True`, `hf.py:727-731`) | refused |
+   | `messages`, `tools` | kept by the filter (both are in `find_undeclared_variables`, and `tools` is an `apply_chat_template` parameter), then `TypeError: got multiple values for keyword argument ...` at `tokenizer.apply_chat_template(conversation=..., tools=tools, ...)` and at `compiled_template.render(messages=chat, ..., **kwargs)` | refused |
+   | `add_generation_prompt`, `continue_final_message` | kept, but `build_chat_params` already put the request's OWN field on the OVERRIDE side of `merge_kwargs` (`chat_completion/protocol.py:530-544`, `renderers/params.py:28-40`), so the kwarg never reaches the render | ignored; the function's `add_generation_prompt` parameter IS that field |
+   | `bos_token`, `eos_token` | dropped when the template names neither; kept when it names either, and then they win over `special_tokens_map` (`template_kwargs = {**self.special_tokens_map, **kwargs}`) | bound, which is the same render in both cases |
+
+   The refusal throws `vllm::v1::InputValidationError`, not `ChatTemplateError`,
+   because it is a client mistake: `api_server` maps that type to **400** the
+   way upstream's `ValueError`/`TypeError` reach `create_error_response`'s
+   `BadRequestError` default (`serve/utils/error_response.py:16-21`), and the C
+   ABI maps it to `VLLM_ERR_INVALID_ARGUMENT`. `apply_chat_template` rethrows it
+   ahead of the generic arm so it is not rewrapped into a 500.
+
+   **What this does NOT reproduce, and why that is complete.** Upstream's filter
+   is `accept_vars = fn_kw | template_vars | hf_base_params - {chat_template,
+   tokenize}`, where `template_vars` is
+   `jinja2.meta.find_undeclared_variables(chat_template)`. minja exposes no AST
+   walk, so there is no `find_undeclared_variables` to port without forking the
+   engine. It is not needed: for every name that does NOT collide with one the
+   renderer supplies, "bound but never read" and "dropped" render the same
+   bytes, so the filter is observable only on the collisions -- and those are
+   refused here.
+
 3. **The `ChatPromptFn` seam** gains the same object as a fourth parameter, so a
    per-request value can reach the renderer at all; `MakeChatTemplatePromptFn`
-   merges the server default under the request kwargs, mirroring upstream's
-   `merge_kwargs` precedence.
+   merges the server default under the request kwargs, mirroring `merge_kwargs`
+   (`vllm/renderers/params.py:28-40`) as reached through
+   `ChatParams.with_defaults` (`params.py:93-122`) from
+   `vllm/entrypoints/openai/chat_completion/serving.py:208`:
+
+   ```python
+   defaults | {k: v for k, v in overrides.items() if v not in unset_values}
+   #                                     unset_values = (None, "auto")
+   ```
+
+   The request's keys win, **except** that an override valued `null` or `"auto"`
+   means "the client did not set this" and leaves the server default standing.
+   The first implementation overwrote unconditionally and cited
+   `multimodal/media/base.py:53-67`, which is `MediaIO.merge_kwargs` -- the
+   media-io path, not this one. The consequence was measurable: with
+   `--no-enable-thinking`, a request sending
+   `{"chat_template_kwargs":{"enable_thinking":null}}` rendered thinking ON here
+   and OFF on vLLM, defeating the operator's server-wide default on the very
+   field this row adds.
 
 4. **`ChatCompletionRequest::chat_template_kwargs`** is parsed and handed to
    `prompt_fn_` by `OpenAIServingChat::create_chat_completion`;
@@ -270,9 +318,32 @@ Three cases:
 - `{"chat_template_kwargs":{"enable_thinking":false}}` reaches the renderer and
   removes it.
 
+A fourth case, added by the fresh review's repair, is the forgery probe: a
+request whose `chat_template_kwargs` tries to replace `messages` must not change
+the rendered prompt. It renders a benign request first so that "unchanged" is a
+comparison and not an empty string, then drives the forged body, `tools`,
+`chat_template` and `tokenize` through the same dispatch and requires a non-200
+with the benign prompt still standing; `add_generation_prompt` is driven through
+the same dispatch and required to render 200 with the assistant header, because
+upstream ignores rather than refuses it.
+
+The **C ABI** is gated too, in `tests/capi/test_capi.cpp`, because `vllm_chat`
+parses the same request with `ParseChatRequest` and calls the same
+`create_chat_completion`, and `vllm_c.cpp` installs
+`vllm::capi::ResolveTemplatePromptFn` as its prompt seam -- so this row changed
+the ABI's chat default (an unsupplied kwarg is now Jinja-undefined) and gave the
+ABI a `chat_template_kwargs` field. One case drives all three through
+`vllm_chat` on the same published Qwen3.8 fixture: the bare request renders the
+checkpoint's own reasoning branch, `{"enable_thinking":false}` removes it, and a
+forged `messages` returns a non-`VLLM_OK` status with the rendered prompt
+unchanged. `tests/CMakeLists.txt` hands `test_capi` the fixtures directory for
+it.
+
 Plus, in `tests/vllm/entrypoints/test_chat_template.cpp`, one case per added
-built-in test and one asserting that an unknown test name still throws, so the
-closed list stays closed.
+built-in test, one asserting that an unknown test name still throws so the
+closed list stays closed, one for each arm of the kwargs filter table in section
+4, and one for the `unset_values` rule (`null` and `"auto"` leave the server
+default standing; `false` and `""` do not).
 
 ---
 
@@ -328,6 +399,13 @@ repo-wide `windows-msvc-*` red of
   [#1681](https://github.com/mudler/vllm.cpp/issues/1681).
 - Reporting the missing tests to `google/minja` upstream, whose `main` has the
   same gap.
+- **`jinja2.meta.find_undeclared_variables` is not ported**, so the request
+  kwargs are filtered by refusing the names the renderer supplies rather than by
+  reproducing upstream's `accept_vars` set (section 4). For every name that does
+  not collide, binding it and dropping it render the same bytes, so the residual
+  is unobservable today; it becomes observable only if minja gains an AST walk
+  and someone wants the drop to be visible to a template. Tracked by
+  [#1681](https://github.com/mudler/vllm.cpp/issues/1681).
 - **The multimodal chat path drops `chat_template_kwargs`.** The mm seam is
   `(messages) -> MultiModalInputs` (`chat_mm.h` `MultiModalChatFn`), so there is
   nothing to carry them on and `chat_mm.cpp` renders with an empty object. A

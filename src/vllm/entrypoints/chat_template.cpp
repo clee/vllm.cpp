@@ -11,6 +11,7 @@
 #include "vllm/entrypoints/chat_template.h"
 
 #include "vllm/model_executor/model_loader/gguf_reader.h"
+#include "vllm/v1/engine/validation_error.h"  // refused kwarg -> HTTP 400
 
 #include <chrono>
 #include <ctime>
@@ -135,11 +136,66 @@ std::string apply_chat_template(
     if (chat_template_kwargs.is_object()) {
       for (auto it = chat_template_kwargs.begin();
            it != chat_template_kwargs.end(); ++it) {
-        // Upstream refuses these two rather than binding them: both are
-        // apply_chat_template's own parameters, not template variables
-        // (resolve_chat_template_kwargs, hf.py:640-650).
-        if (it.key() == "chat_template" || it.key() == "tokenize") continue;
-        context->set(it.key(), minja::Value(it.value()));
+        const std::string& key = it.key();
+        // (1) apply_chat_template's OWN parameters. resolve_chat_template_kwargs
+        // RAISES on them before anything renders, rather than dropping them
+        // (vllm/renderers/hf.py:639-648 @ 555967922; `raise_on_unexpected`
+        // defaults to True and its only call site takes the default,
+        // hf.py:727-731).
+        if (key == "chat_template" || key == "tokenize") {
+          throw vllm::v1::InputValidationError(
+              "Found unexpected chat template kwargs from request: {'" + key +
+              "'}");
+        }
+        // (2) The names the RENDERER supplies. resolve_chat_template_kwargs
+        // KEEPS these two -- `messages` is in
+        // jinja2.meta.find_undeclared_variables of every real chat template and
+        // `tools` is an apply_chat_template parameter as well -- and
+        // transformers then dies on the duplicate keyword before it renders:
+        //   tokenizer.apply_chat_template(conversation=..., tools=tools,
+        //       chat_template=..., tokenize=..., **resolved_kwargs)
+        //     -> TypeError: got multiple values for keyword argument 'tools'
+        //   compiled_template.render(messages=chat, tools=..., **kwargs)
+        //     -> TypeError: got multiple values for keyword argument 'messages'
+        //   (transformers 5.3.0, utils/chat_template_utils.py)
+        // Measured on the pin against tests/fixtures/qwen38_chat_template.jinja.
+        // So upstream has NO path on which a request replaces the conversation.
+        // Binding them here did have one, and it was silent: the request log
+        // line, `usage`, `ToolsEnabled` and any policy layer reading
+        // request.messages all described a conversation the model never got.
+        // InputValidationError, not ChatTemplateError, because this is a CLIENT
+        // mistake: api_server maps it to 400 exactly as upstream's ValueError /
+        // TypeError reach create_error_response's BadRequestError default
+        // (serve/utils/error_response.py:16-21), and the C ABI maps it to
+        // VLLM_ERR_INVALID_ARGUMENT.
+        if (key == "messages" || key == "tools") {
+          throw vllm::v1::InputValidationError(
+              "chat template kwargs from request may not set '" + key +
+              "': the renderer supplies it");
+        }
+        // (3) `add_generation_prompt` is the one renderer-owned name upstream
+        // neither raises on nor honours. build_chat_params puts the request's
+        // OWN add_generation_prompt field in `extra_kwargs`, the OVERRIDE side
+        // of merge_kwargs, so the field has already replaced the kwarg before
+        // resolve_chat_template_kwargs ever sees it
+        // (vllm/entrypoints/openai/chat_completion/protocol.py:530-544,
+        //  merge_kwargs at vllm/renderers/params.py:28-40). This function's
+        // `add_generation_prompt` parameter IS that field.
+        if (key == "add_generation_prompt") continue;
+        // Everything else binds, `bos_token` / `eos_token` included, and that
+        // matches upstream in both directions: a template that NAMES either has
+        // it in find_undeclared_variables, so the request value survives the
+        // filter and transformers lets it win over the tokenizer's special
+        // tokens (`template_kwargs = {**self.special_tokens_map, **kwargs}`,
+        // PythonBackend.apply_chat_template); a template that names neither
+        // drops it upstream and cannot observe it here.
+        //
+        // A name the template never uses is likewise unobservable, which is why
+        // this mirrors upstream's accept_vars filter by REFUSING the collisions
+        // rather than reproducing find_undeclared_variables: minja exposes no
+        // AST walk, and for every non-colliding name "bound but never read" and
+        // "dropped" render the same bytes.
+        context->set(key, minja::Value(it.value()));
       }
     }
     const auto now = std::chrono::system_clock::now();
@@ -164,6 +220,11 @@ std::string apply_chat_template(
     return root->render(context);
   } catch (const ChatTemplateError&) {
     throw;
+  } catch (const vllm::v1::InputValidationError&) {
+    // A refused kwarg is a CLIENT error, not a render failure. Rethrown before
+    // the generic arm so it stays a 400 / VLLM_ERR_INVALID_ARGUMENT instead of
+    // being rewrapped as a ChatTemplateError the server reports as a 500.
+    throw;
   } catch (const std::exception& e) {
     throw ChatTemplateError(std::string("chat template render failed: ") +
                             e.what());
@@ -180,13 +241,25 @@ openai::ChatPromptFn MakeChatTemplatePromptFn(
              bool add_generation_prompt,
              const std::vector<openai::ChatCompletionToolsParam>& tools,
              const nlohmann::ordered_json& request_kwargs) {
-    // merge_kwargs (multimodal/media/base.py:53-67, reached from
-    // chat_completion/protocol.py:552-556): a shallow merge in which the
-    // request's keys win over the server defaults.
+    // merge_kwargs (vllm/renderers/params.py:28-40 @ 555967922), reached as
+    // ChatParams.with_defaults(default_chat_template_kwargs) (params.py:93-122)
+    // from vllm/entrypoints/openai/chat_completion/serving.py:208:
+    //   defaults | {k: v for k, v in overrides.items()
+    //               if v not in unset_values}      unset_values = (None, "auto")
+    // A shallow merge in which the request's keys win over the server defaults,
+    // EXCEPT that an override valued null or "auto" means "the client did not
+    // set this" and leaves the server default standing. Without that exception
+    // a request null defeated `--no-enable-thinking`.
+    // (`multimodal/media/base.py:53-67`, cited here before the #1681 review, is
+    //  MediaIO.merge_kwargs -- the media-io path, not this one.)
     nlohmann::ordered_json merged =
         defaults.is_object() ? defaults : nlohmann::ordered_json::object();
     if (request_kwargs.is_object()) {
       for (auto it = request_kwargs.begin(); it != request_kwargs.end(); ++it) {
+        if (it.value().is_null()) continue;
+        if (it.value().is_string() && it.value().get<std::string>() == "auto") {
+          continue;
+        }
         merged[it.key()] = it.value();
       }
     }

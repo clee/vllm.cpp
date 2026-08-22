@@ -75,9 +75,27 @@ class ChatTemplateError : public std::runtime_error {
 // keys) and what a template asking `{% if enable_thinking is undefined %}`
 // needs. Defining every known name unconditionally would make `is undefined`
 // permanently false and silently invert the model's own default (#1681).
-// `chat_template` and `tokenize` are skipped: upstream refuses them
-// (hf.py:640-650) because both are the renderer's own parameters, not template
-// variables.
+//
+// A key that names something the renderer ITSELF supplies is REFUSED with
+// `vllm::v1::InputValidationError`, which api_server maps to HTTP 400 and the C
+// ABI to VLLM_ERR_INVALID_ARGUMENT, mirroring the pinned vLLM (`555967922`):
+//   `chat_template`, `tokenize` -- apply_chat_template's own parameters;
+//     resolve_chat_template_kwargs RAISES on them (hf.py:639-648), and its only
+//     call site takes the default raise_on_unexpected=True (hf.py:727-731).
+//   `messages`, `tools` -- resolve_chat_template_kwargs KEEPS these, and
+//     transformers then dies on the duplicate keyword before rendering
+//     (`TypeError: got multiple values for keyword argument 'messages'`).
+//     Binding them let a request REPLACE the conversation the caller passed,
+//     which no upstream path can do.
+// `add_generation_prompt` is accepted and IGNORED, because upstream's
+// build_chat_params has already overwritten it with the request's own
+// add_generation_prompt field before the filter runs
+// (chat_completion/protocol.py:530-544, merge_kwargs params.py:28-40) -- and
+// that field is this function's parameter of the same name.
+// Every other key binds, `bos_token`/`eos_token` included: a template that
+// names either has it in find_undeclared_variables, so upstream keeps the
+// request value and lets it win over the tokenizer's special_tokens_map; a
+// template that names neither cannot observe it on either side.
 std::string apply_chat_template(
     const std::string& template_str,
     const std::vector<openai::ChatMessage>& messages, bool add_generation_prompt,
@@ -90,8 +108,12 @@ std::string apply_chat_template(
 // `default_chat_template_kwargs` is the SERVER-level default (our
 // `--enable-thinking` / `--no-enable-thinking` write `enable_thinking` into it;
 // neither flag leaves it empty). The per-request kwargs the seam hands the
-// returned function are merged OVER it, mirroring upstream's merge_kwargs
-// precedence (vllm/entrypoints/openai/chat_completion/protocol.py:552-556).
+// returned function are merged OVER it, mirroring merge_kwargs
+// (vllm/renderers/params.py:28-40 @ 555967922) as reached through
+// ChatParams.with_defaults (params.py:93-122) from
+// vllm/entrypoints/openai/chat_completion/serving.py:208. A request value of
+// null or "auto" is `unset_values` and does NOT override: the server default
+// stands.
 openai::ChatPromptFn MakeChatTemplatePromptFn(
     std::string template_str, std::string bos_token = "",
     std::string eos_token = "",

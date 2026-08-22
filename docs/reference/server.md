@@ -95,6 +95,14 @@ applies; that is what vLLM does and what the Qwen3.8 family's template expects.
 `/tokenize`'s chat form accepts the same field and renders through the same
 template, so its token ids match what `/v1/chat/completions` would send.
 
+A key valued `null` or `"auto"` means "not set", so it leaves the server-wide
+default standing rather than clearing it, and a key that names something the
+renderer supplies is **refused** with HTTP 400 rather than honoured:
+`messages`, `tools`, `chat_template` and `tokenize`. Without that refusal a
+request could hand the model a conversation its own `messages` field never
+carried, which the request log, `usage` and any policy layer would then
+describe wrongly. vLLM refuses the same four.
+
 `prompt_logprobs` is accepted on `/v1/completions` and `/v1/chat/completions`
 and the engine computes it, every prompt position is scored against the token
 that followed it, accumulated across chunked prefill, but the **response body
