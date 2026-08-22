@@ -4,7 +4,7 @@ What vllm.cpp supports, next to the engines it is measured against. This page is
 a **keyed table**: one row per feature, kept current. It is not a changelog.
 
 For measured speed see [BENCHMARKS.md](BENCHMARKS.md); for per-capability
-lifecycle state and the caveats behind each row see [STATUS.md](STATUS.md); for
+lifecycle conventions see [Project status](../README.md#project-status); for
 the agent-facing parity inventory with upstream file references see
 [.agents/feature-matrix.md](../.agents/feature-matrix.md).
 
@@ -100,7 +100,7 @@ architecture self-registers via `REGISTER_VLLM_MODEL`, and
 `scripts/check-supported-models.py` gates this list against the source so it
 cannot drift. Today that is **40 registered architectures**. Each row names the
 checkpoint it was gated against and the verdict; caveats are in
-[STATUS.md](STATUS.md), agent detail in `.agents/model-matrix.md`. A mergeable
+[Project status](../README.md#project-status), agent detail in `.agents/model-matrix.md`. A mergeable
 gate/up MLP routes through one shared merged-GEMM method, so a tuned arm added
 once reaches every such arch; Command-R, GLM-4, MiniCPM, MiniCPM3 and Phi-3
 joined on 2026-08-10 (#299), and
@@ -194,7 +194,7 @@ in `ltx2_text_encoder.cpp` is the call that would have to change.
 | MTP speculator | Qwen3.6-27B, Qwen3.6-35B-A3B | token-identical to vLLM `mtp` at c1 | ~4% faster c1; +16% output tput (MoE) |
 | MTP speculation DEPTH (`num_speculative_tokens` > 1) | Qwen3.5/3.6 `mtp.*` heads | k=1..4 through the loader, greedy tokens unmoved, two witnesses per arm: the draft decode forwards the propose RAN, and whether the DELIVERED draft row varied with depth. `test_mtp_depth` 5/5, 63 assertions | Default stays k=1. NO speed claim at k>1. Drafts are proposed and verified, never ACCEPTED, and neither witness proves per-column provenance. Both await the owed DGX gate (#81) |
 | DFlash block-diffusion | Qwen3 (DFlash draft) | near-tie e2e 27/27 vs vLLM | 2.9x over spec-off, 1.003x vs vLLM DFlash-on |
-| DFlash2 block-diffusion (dynamic conv + candidate selector) | Qwen3 DFlash2 draft, safetensors or GGUF (bf16 / Q8_0 / Q4_K_M) | Gated against vLLM: 4/4 token-exact, 45/47 draft blocks identical, acceptance identical per prompt. All 7 DFlash2 suites green on `sm_121a`, zero CUDA skips | GREEDY only, no speed number. A GGUF draft is dequantized to bf16 at load ([#1314](https://github.com/mudler/vllm.cpp/issues/1314)) |
+| DFlash2 block-diffusion (dynamic conv + candidate selector) | Qwen3 DFlash2 draft, safetensors or GGUF (bf16 / Q8_0 / Q4_K_M) | Gated against vLLM: 4/4 token-exact, 45/47 draft blocks identical, acceptance identical per prompt. All 7 DFlash2 suites green on `sm_121a`, zero CUDA skips | GREEDY only. Speed 0.8017x vLLM: RECORDED, no floor, NOT a pass (#1562). A GGUF draft is dequantized to bf16 at load ([#1314](https://github.com/mudler/vllm.cpp/issues/1314)) |
 | DFlash/DFlash2 shared `lm_head` kept PACKED | a DFlash or DFlash2 draft off an NVFP4 safetensors target | `test_qwen3_dflash2_draft` 36/36 (353): block logits BITWISE equal to `Qwen3_5MTPModel::ComputeLogits` on the same packed head, and `FromModelDir` loads and drafts off one | Widening a head stays refused by name: GGUF `output.weight`, FP8, W4A4. `VT_LMHEAD_FP4=0` rolls back to the refusal. DSpark and the CUDA arm owed ([#1628](https://github.com/mudler/vllm.cpp/issues/1628)) |
 | DeepSeek-V4 MTP | DeepSeek-V4-Flash (nextn head) | lossless 5/5; real-model weight-blocked | pending |
 
@@ -248,7 +248,7 @@ both refuse, naming what is missing.
 | Medusa | ☐ spike only | ✅ | ✅ |
 | EAGLE / EAGLE3 | ☐ | ✅ | ✅ |
 | DFlash block diffusion | ✅ 2.9x over spec-off, at/above vLLM DFlash-on | ✅ | ☐ |
-| DFlash2 block diffusion (a SECOND DFlash architecture, not a change to DFlash) | ◐ safetensors AND GGUF drafts DRAFT (bf16, Q8_0, mixed Q4_K_M: 45 Q4_K + 4 Q6_K), greedy only, no speed number, no published artifact LOADED yet ([spec](../.agents/specs/dflash2-spec-decode.md)) | ✅ BEYOND-PIN, [vllm#52816](https://github.com/vllm-project/vllm/pull/52816) | ☐ |
+| DFlash2 block diffusion (a SECOND DFlash architecture, not a change to DFlash) | ◐ safetensors AND GGUF drafts DRAFT (bf16, Q8_0, mixed Q4_K_M: 45 Q4_K + 4 Q6_K), greedy, 0.8017x vLLM RECORDED not a pass (#1562), no published artifact LOADED yet ([spec](../.agents/specs/dflash2-spec-decode.md)) | ✅ BEYOND-PIN, [vllm#52816](https://github.com/vllm-project/vllm/pull/52816) | ☐ |
 | n-gram / prompt lookup | ✅ 27B 5/5 strict vs vLLM | ✅ | ✅ |
 | DSpark (semi-autoregressive block drafter) | ◐ **both gate models** ([spec](../.agents/specs/dspark-spec-decode.md)): token-identical to spec-off; T=1+k verify CAPTURED. Cross-engine ratio UNSETTLED (**0.834x** matched-and-warm); Marlin MoE CLEARED as the residual | ✅ | ◐ |
 | DSpark draft routing (which draft the loader takes) | ◐ `Qwen3DSparkModel`, `Gemma4DSparkModel` and (BEYOND-PIN, vllm#52197) `DSparkDraftModel` + `qwen3` take the Qwen3 lane; DeepSeek-V4 DSpark is REFUSED by name ([spec](../.agents/specs/dspark-qwen3-routing.md)) | ◐ at the pinned `555967922` that pair routes to DeepSeek-V4; ✅ only since vllm#52197, merged 2026-08-17 | not assessed |
@@ -279,7 +279,7 @@ both refuse, naming what is missing.
 | ROCm | W0: 5 gfx archs; dense/GDN all-native; 0.8B dispatch fixed. **M4:** Qwen3-0.6B/3.5-0.8B 16/16 (#41). **M3:** `ROCM_ATTN` registered (#1056/#1065, [spec](../.agents/specs/rocm-attn-backend.md)). CPU parity open (#269) | 49 registered ops: full GDN, MoE combine/gate, keep-quant GEMM; ctest-green gfx1151/1103/1100/1201/1200 ([#41](https://github.com/mudler/vllm.cpp/issues/41)). APU managed allocation is unverified. [ROCm guide](ROCM.md) | ✅ | ✅ |
 | XPU / TPU | ☐ | ✅ | ◐ | ☐ |
 | Tenstorrent Blackhole | ◐ `ACTIVE`, OPT-125m 6/6; Qwen3-0.6B wired; Mistral-7B-v0.3 16/16 on P150 ([spec](../.agents/specs/tenstorrent-mistral.md)). 16x16 rerun and residual-RMS owed ([spec](../.agents/specs/tenstorrent-backend.md)) | ✅ | ☐ | ☐ |
-| Tenstorrent host-free decode | ◐ env-gated `VT_TT_HOST_FREE_DECODE`; implementer P150 79-replay/5.8x. Default inert. New batch after capture refused. Engine golden owed | ☐ | ☐ | ☐ |
+| Tenstorrent host-free decode | ◐ DEFAULT since #1604 (`0` opts out): no per-step host readback; 2.1x default-leg tok/s; both golden pairs re-adjudicated, both paged gates 16/16. Capture opt-in only (#1625 hang); async off (#1627) | ☐ | ☐ | ☐ |
 
 CUDA runtime-verified on GB10 (sm_121a), Jetson Thor (sm_110) and Jetson AGX
 Orin (sm_87). sm_110 has no CUTLASS FP4 tensor-core kernels and no `fp4-mma`,
@@ -390,5 +390,5 @@ named test in the tree. A ◐ means the path works only within the limits in its
 table row.
 
 The marks describe support, not speed or current ownership. See
-[Status](STATUS.md) for lifecycle state and [Benchmarks](BENCHMARKS.md) for
+[Status](../README.md#project-status) for lifecycle state and [Benchmarks](BENCHMARKS.md) for
 performance. An inventoried row is not a supported feature.
