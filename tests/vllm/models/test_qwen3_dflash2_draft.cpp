@@ -489,7 +489,23 @@ void WriteSafetensors(const std::vector<StEntry>& entries, const std::string& pa
                       {"data_offsets", json::array({offset, offset + nbytes})}};
     offset += nbytes;
   }
-  const std::string hs = header.dump();
+  // PAD the header to an 8-byte boundary, which is what the reference
+  // `safetensors` writer does and therefore what every published checkpoint
+  // looks like. It is not cosmetic here: the dense loader BORROWS the mapping
+  // for a bf16 weight rather than copying it, and `WeightF32`
+  // (`qwen3_5.cpp:1054`) reads that borrow through a `const uint16_t*`. An
+  // unpadded header leaves `8 + header_len` odd, every tensor lands on an odd
+  // offset, and the read is a misaligned load -- undefined behaviour that
+  // `-fsanitize=undefined` halts on and that a strict-alignment target would
+  // fault on. Measured: without this padding the loader-seam cases below exit 1
+  // under the `address,undefined` lane with `load of misaligned address ... for
+  // type 'const short unsigned int'`. That the loader ACCEPTS an unpadded
+  // producer and then reads it as UB is a separate defect, filed as
+  // [#1654](https://github.com/mudler/vllm.cpp/issues/1654) against
+  // `ENG-LOAD-DIRECT-UPLOAD`; this fixture's job is to feed the loader what a
+  // reference writer produces, not to be the gate for that.
+  std::string hs = header.dump();
+  while ((8 + hs.size()) % 8 != 0) hs.push_back(' ');
   std::ofstream out(path, std::ios::binary);
   uint64_t hlen = hs.size();
   out.write(reinterpret_cast<const char*>(&hlen), sizeof(hlen));
@@ -2439,7 +2455,25 @@ class ScratchDir {
 // empty string and read as "the loader never got there", which is the instrument
 // failing toward a verdict about the code.
 std::string CaptureRealStderr(const std::function<void()>& body) {
-  std::FILE* cap = std::tmpfile();
+  // A NAMED file rather than `std::tmpfile()`, and this is the whole reason.
+  //
+  // While fd 2 is redirected, ANYTHING that writes to it lands here -- including
+  // a sanitizer report. The `address,undefined` lane builds with
+  // `-fno-sanitize-recover=all` (`CMakeLists.txt:260`), so UBSan does not
+  // continue after a finding: it writes its diagnostic to fd 2 and exits 1.
+  // With an anonymous temporary that console read as two lines of doctest banner,
+  // no summary, and exit 1 -- an empty red that says nothing about the code, which
+  // is the "broken instruments fail toward a code verdict" shape.
+  //
+  // This file is removed on the normal return below, so an abnormal exit LEAVES
+  // it, named and findable: `ls /tmp/vllmcpp_dflash2_stderr_*`. The `strace -f -s
+  // 2000 -e trace=write` route recovers the same bytes live.
+  static int counter = 0;
+  const fs::path cap_path =
+      fs::temp_directory_path() /
+      ("vllmcpp_dflash2_stderr_" + std::to_string(counter++) + "_" +
+       std::to_string(static_cast<long long>(::getpid())) + ".log");
+  std::FILE* cap = std::fopen(cap_path.string().c_str(), "w+b");
   REQUIRE(cap != nullptr);
   std::cerr.flush();
   std::fflush(stderr);
@@ -2458,6 +2492,8 @@ std::string CaptureRealStderr(const std::function<void()>& body) {
   size_t n = 0;
   while ((n = std::fread(buf, 1, sizeof(buf), cap)) > 0) out.append(buf, n);
   std::fclose(cap);
+  std::error_code ec;
+  fs::remove(cap_path, ec);
   return out;
 }
 
