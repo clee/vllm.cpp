@@ -759,15 +759,14 @@ std::unique_ptr<DflashDraft> LoadDsparkDraft(const vllm::SpeculativeConfig& spec
       draft->dspark->backbone.lm_head.Empty()) {
     vllm::OwnedTensor shared_embed;
     vllm::OwnedTensor shared_lm_head;
-    // nullptr, and NOT a default: the DSpark lane has no DFlash2 selector, so no
-    // guard reads a dequantized-head flag here. Named rather than omitted so the
-    // DFlash caller's third argument cannot be deleted without a build failure.
     // Both nullptr, and NEITHER a default. The DSpark lane has no DFlash2
     // selector, so no guard reads a dequantized-head flag here; and its backbone
     // holds ONE bf16 `lm_head` owner, so there is nowhere to put a packed head.
     // A quantized target head therefore still refuses at
-    // `LoadDflashSharedLmHead`, by name and at startup. Owed:
-    // .agents/specs/dflash2-spec-decode.md `## Owed`, issue #1628.
+    // `LoadDflashSharedLmHead`, by name and at startup. Both are NAMED rather
+    // than omitted so neither can be deleted at the DFlash call site without a
+    // build failure. Owed: .agents/specs/dflash2-spec-decode.md `## Owed` O26,
+    // issue #1628.
     shared.LoadInto(&shared_embed, &shared_lm_head, /*head_was_quantized=*/nullptr,
                     /*head_fp4=*/nullptr);
     if (draft->dspark->backbone.embed_tokens.Empty()) {

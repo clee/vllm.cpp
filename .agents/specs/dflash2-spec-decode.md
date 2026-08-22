@@ -854,18 +854,42 @@ reviewer who mutates the guarantee rather than reading it.
   (`:132-142`) -> `lm_head.quant_method.apply` — the same call
   `LogitsProcessor.forward` makes for the target's own logits. Upstream's answer
   is therefore "compute the top-K through the head the target computes with", and
-  it needs no branch to say so because its head is an `nn.Module`. SGLang logs
-  the same shape on the same checkpoint (`DFLASH draft greedy head kept eager
-  (reason=quantized lm_head)`, measured 2026-08-21), which is a second engine
-  reaching it without dequantising and never the mirror source.
+  it needs no branch to say so because its head is an `nn.Module`.
+
+  **SGLang is a FALLBACK on the same shape, and it is not corroboration.** The
+  decision above rests on vLLM alone, which is the primary mirror wherever it
+  implements the behaviour, and this observation changes nothing about it. It is
+  recorded because it was measured and because the earlier wording read it the
+  wrong way round: `DFLASH draft greedy head kept eager (reason=quantized
+  lm_head)` means SGLang DECLINED to graph that head on a quantized checkpoint,
+  so it is a second engine stepping AROUND the case rather than a second engine
+  reaching the head natively. Provenance, because a competitor line without one
+  is not evidence:
+
+  - Run by the OPERATOR on `dgx:gpu0` inside an `rc hold` lease, 2026-08-21, for
+    campaign [#1574](https://github.com/mudler/vllm.cpp/issues/1574).
+  - Image `lmsysorg/sglang@sha256:3c0abdf41ef22de9d7a859dc16ed71eae69452e36c91f071a25e60c85a6d1fc6`
+    plus the DFlash2 overlay built from `r0b0tlab/qwen38-27b-nvfp4-sm121-sglang`'s
+    `docker/Dockerfile.dflash2`, tagged `qwen38-27b-sglang-dflash2-sm121:0.2.0`.
+  - Checkpoint `r0b0tlab/Qwen3.8-27B-NVFP4-MTP-sm121` @
+    `36f717a22990e82c54c1d48ee77c491b87825680`, four shards sha256-verified
+    against the publisher's `final-sota-shards.sha256`; draft
+    `z-lab/Qwen3.8-27B-DFlash2`.
+  - Launched by that repository's own `scripts/serve.sh dflash2`; the line
+    appears in `docker logs` at `[2026-08-21 16:43:32]`.
+  - Evidence: the operator's measured-results comment on
+    [#1574](https://github.com/mudler/vllm.cpp/issues/1574).
 
   **What lands.** `LoadDflashSharedLmHead` (`qwen3_dflash.h`) asks the TARGET
   loader's own routing question — `DenseLmHeadTakesNvfp4`, the predicate
   `LoadDenseLmHead` routes on, exported so there is one predicate and not two
   descriptions of one — and a ModelOpt/compressed-tensors NVFP4 head lands PACKED
   in `Qwen3DFlashWeights::lm_head_fp4`. `DflashLogitsF32D` routes it through
-  `dense_nvfp4::MatmulNvfp4W4A16D`, the W4A16 dispatcher extracted verbatim from
-  qwen3_5.cpp's anonymous namespace, which is what the target's own head takes.
+  `dense_nvfp4::MatmulNvfp4W4A16D`, the SHARED W4A16 dispatcher. It is not the
+  same function the target's own head takes -- the target takes
+  `MatmulNvfp4F32D` (`qwen3_5.cpp:3106`) -- and `## Owed` O27 records the four
+  differences between the two Marlin bodies and which single one of them a head
+  can reach.
   `RefuseQuantizedDflash2LmHead` is unchanged in code: it reads
   `lm_head_dequantized`, which only `LoadGgufSharedEmbedAndHeadBf16` sets, so the
   container that still widens a head still refuses.
@@ -886,6 +910,30 @@ reviewer who mutates the guarantee rather than reading it.
   — `LoadLmHeadAnyDtype` would widen it, which is D12's case exactly. The
   refusal now means "this storage form cannot be computed with", not "this head
   is quantized".
+
+  **AND THE PROPERTY IS REACHED FROM THE LOADER.** The row's fresh review
+  measured that every case above entered at `LoadDflashSharedLmHead` or at the
+  draft forward, so restoring the pre-row read at
+  `src/vllm/entrypoints/model_loader.cpp` — `*head = LoadNamedBf16(*shards_,
+  "lm_head.weight", true);`, the exact line #1628 reports as the defect —
+  compiled clean and left all three DFlash2 suites GREEN. That is `AGENTS.md`
+  `## Nothing lands dead`: a gate nobody can turn red by putting the bug back
+  measures a function rather than a capability. Three cases now drive
+  `LoadedEngine::FromModelDir` against an on-disk Qwen3.5 dense target whose
+  `lm_head.weight` is ModelOpt NVFP4 and an on-disk DFlash2 draft named by
+  `--speculative-config`, which is #1628's own reproduction, and they LOAD and
+  then GENERATE: the packed arm, the BF16 control arm, and the `VT_LMHEAD_FP4=0`
+  rollback, which must refuse by name and must not draft. Restoring that
+  `LoadNamedBf16` line takes the suite to 35/36 with four failed assertions, and
+  deleting the packed `draft_vocab_size` branch — the second call site the review
+  found ungated, which only a PROPOSE reads — crashes the packed case rather than
+  passing it. Both were measured on this branch and restored byte-for-byte.
+
+  The four packed-arm cases now name the arm they measure with a scoped
+  `VT_LMHEAD_FP4` rather than inheriting the ambient value. Under the documented
+  rollback they used to throw `not BF16 (got U8)` and read as four broken tests
+  while the behaviour was correct and failing closed; the rollback has its own
+  case instead.
 
 ## Owed
 
@@ -2137,17 +2185,32 @@ list items.
 - **O27 — the packed shared head is gated on CPU only; the CUDA arm and the real
   checkpoint are OWED a measurement.**
   [#1628](https://github.com/mudler/vllm.cpp/issues/1628), 2026-08-21. The
-  implementer had no GPU (`BENCH-QWEN38-27B-SOTA` held the fleet), so nothing in
-  this change was run on a device. Three things are therefore unmeasured and are
-  claimed nowhere:
+  implementer had no GPU (`BENCH-QWEN38-27B-SOTA` held the fleet), so **THIS
+  CHANGE'S OWN gates are all CPU**. That is a statement about this row and not
+  about the lane: W6 took device gates for `SPEC-DFLASH2` on `dgx:gpu0` the same
+  day (`## Now`), and the SGLang observation in `## Upstream chain` is itself a
+  device measurement. What no device has seen is the packed head. Three things
+  are therefore unmeasured and are claimed nowhere:
 
   1. The equality the CPU gate measures is measured on the CPU arm of the W4A16
      dispatcher (host dequant + bf16 `vt::Matmul`). On CUDA both sides take the
-     Marlin NVFP4 GEMM instead. They are the same code by extraction —
-     `dense_nvfp4_gemm.h`'s preamble records that qwen3_5.cpp keeps its own
-     copies of exactly these definitions, and the two Marlin predicates read the
-     same `VT_NVFP4_MARLIN` variable — but "the same code" is an argument and not
-     a measurement, and the equality is what this row is gated on.
+     Marlin NVFP4 GEMM instead, and **they are not the same function**. The
+     target's logits take `MatmulNvfp4F32D` (`qwen3_5.cpp:3106`, reached from
+     `:3139`) while the draft takes `dense_nvfp4::MatmulNvfp4W4A16D`, and the two
+     `MatmulNvfp4MarlinD` bodies below them (`qwen3_5.cpp:2849-2903` vs
+     `dense_nvfp4_gemm.h:505-560`) hold SEPARATE function-local `static void* ws`
+     workspaces, thread `w.group_size`/`w.is_mxfp4` in one and hardcode `16`/
+     `false` in the other, and differ on a `MutableW4A16Stats()` counter. For a
+     HEAD the last two collapse: `LoadCtNvfp4Raw` and `LoadNvfp4AnyNaming` set
+     neither field, so both stay at the `Nvfp4Weight` defaults `group_size = 16`
+     and `is_mxfp4 = false`, which is what `vt::MoeMarlinArgs` already defaults
+     to and what qwen3_5.cpp hardcodes, and the counter is observational. **THE
+     ONE THING THE CUDA RUN MUST CHECK IS THE WORKSPACE-ZERO POLICY**: qwen3_5.cpp
+     `Memset`s the Marlin lock workspace before EVERY call, and the shared copy
+     zeroes it ONCE on a documented kernel-self-reset invariant
+     (`dense_nvfp4_gemm.h:495-500`). Two separate workspaces under two policies
+     is the thing that could make the two paths disagree on a device, and no
+     reading settles it -- the equality is what this row is gated on.
   2. `r0b0tlab/Qwen3.8-27B-NVFP4-MTP-sm121` @ `36f717a2` has never been loaded
      with a DFlash2 draft attached. The load refusal that #1628 reports is gone
      in this tree by construction; that it now LOADS, drafts, and holds the

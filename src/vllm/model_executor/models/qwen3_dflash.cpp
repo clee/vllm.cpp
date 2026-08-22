@@ -44,16 +44,33 @@ constexpr int64_t kPadSlotId = -1;  // vLLM PAD_SLOT_ID (attention/backends/util
 // forward below used to read only the first, so a target whose head is NVFP4 was
 // refused at load by stored dtype.
 //
-// The packed arm goes through `dense_nvfp4::MatmulNvfp4W4A16D`, which is the
-// W4A16 dispatcher extracted VERBATIM from the anonymous namespace of
-// qwen3_5.cpp (see dense_nvfp4_gemm.h's preamble: same forced-Marlin selection,
-// same `VT_NVFP4_MARLIN` predicate, same host dequant + bf16 Matmul fallback
-// where no fp4 GEMM is registered). That matters here more than anywhere else:
-// the DFlash2 candidate selector's whole input is the TARGET head's exact top-K,
-// so the draft has to compute it with the head the target computes with, by the
-// computation the target uses. `tests/vllm/models/test_qwen3_dflash2_draft.cpp`
-// measures that equality against `Qwen3_5MTPModel::ComputeLogits` - the OTHER
-// draft that shares the target's head - rather than asserting it from the code.
+// The packed arm goes through `dense_nvfp4::MatmulNvfp4W4A16D`. That matters
+// here more than anywhere else: the DFlash2 candidate selector's whole input is
+// the TARGET head's exact top-K, so the draft has to compute it with the head
+// the target computes with, by the computation the target uses.
+// `tests/vllm/models/test_qwen3_dflash2_draft.cpp` measures that equality
+// against `Qwen3_5MTPModel::ComputeLogits` - the OTHER draft that shares the
+// target's head - rather than asserting it from the code.
+//
+// IT IS NOT THE SAME FUNCTION, and this comment used to say it was "extracted
+// VERBATIM". Read against the tree that is false twice over. The target's own
+// logits take `MatmulNvfp4F32D` (qwen3_5.cpp:3106, reached from :3139), a
+// different dispatcher; and the two `MatmulNvfp4MarlinD` bodies underneath them
+// (qwen3_5.cpp:2849-2903 vs dense_nvfp4_gemm.h:505-560) differ in four ways.
+// They hold SEPARATE function-local `static void* ws` workspaces. qwen3_5.cpp
+// `Memset`s its workspace on EVERY call while the shared one zeroes it ONCE, on
+// a documented kernel-self-reset invariant. The shared one threads
+// `w.group_size` / `w.is_mxfp4` where qwen3_5.cpp hardcodes 16 / false. And the
+// shared one increments `MutableW4A16Stats()`, which qwen3_5.cpp does not.
+//
+// The CONCLUSION survives, and the reason is narrower than "same code": FOR A
+// HEAD the last three differences are unreachable. `LoadCtNvfp4Raw` and
+// `LoadNvfp4AnyNaming` set neither `group_size` nor `is_mxfp4`, so both stay at
+// their defaults 16 / false -- exactly what qwen3_5.cpp hardcodes and what
+// `vt::MoeMarlinArgs` already defaults to -- and the stats counter is
+// observational. What is left is the workspace-zero POLICY, which is the one
+// thing a CUDA run has to check; `.agents/specs/dflash2-spec-decode.md`
+// `## Owed` O27 names it as such.
 //
 // Upstream reaches the same place and needs no branch, because its head is an
 // `nn.Module`: `compute_candidates` @ the MERGED vllm-project/vllm#52816 head
