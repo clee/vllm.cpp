@@ -51,8 +51,10 @@ disagree on exactly one prompt:
 **Prompt 2 has never been reproduced by any nameable configuration.** Prompts 0
 and 1 have been, twice, under two different recorded configurations. #1289's
 single divergence sits at **generation position 32** -- the last token of the 32,
-0-based index 31 -- which is **inside the tail that both other oracle-side runs
-also fail**. That is the fact that makes the 95/96 unreadable: nobody can say
+0-based index 31 -- on **the one prompt both other oracle-side runs also fail**.
+WHERE inside the 32 tokens those two runs miss is not something `main` records,
+so the overlap is established at prompt granularity and no finer. That is still
+the fact that makes the 95/96 unreadable: nobody can say
 whether the moved token is a defect in our arm or a property of a configuration
 nobody recorded.
 
@@ -64,8 +66,9 @@ for the mismatching row". The position is named in
 and unmerged**, so it is cited here as a claim in flight rather than as something
 `main` records. The #926 rebuild's index 29 comes from the same section. Neither
 number is re-derived here, and this row does not depend on either: what it depends
-on is that prompt 2's tail is where all three disagree, which every recorded run
-shows on its own.
+on is that prompt 2 is the prompt all three disagree on, which every recorded run
+shows on its own. It deliberately does not depend on WHERE in prompt 2 they
+disagree, because only the in-flight #1432 numbers say that.
 
 Two configurations, each internally repeatable, disagreeing on the same prompt is
 **configuration sensitivity, not non-determinism**. AGENTS.md admits a ratified
@@ -232,6 +235,22 @@ one file per row, read with a glob — applied to goldens.
 Proven by mutation rather than asserted: gut the new golden's `capture` block and
 the suite must red **naming that file**. §7 records it.
 
+**A glob over the contract is not enough, and the fresh review of PR #1703
+measured why.** `check_golden` asks whether a golden records the configuration
+it was captured under. Nothing in that contract is tied to a model, a checkpoint
+or a battery, so a contract-VALID file naming a completely different checkpoint,
+carrying one entry instead of three and the prompt `"Write a haiku about ducks"`,
+passed the glob and `--check` printed `0 problem(s)` over it. The suite now runs
+`identity_problems(doc, reference)` beside the contract on every golden it finds:
+`model`, `revision`, the prompt battery in ORDER, and `prompt_token_ids` must all
+match `oracle.json`'s. The last of those is §2a's own check — it is the field
+that says the engine received the identical token sequence despite `--capture`
+submitting text where the 2026-08-18 run submitted `TokensPrompt`s — so a
+difference there reds and gets read, rather than landing under a green. The guard
+is reference-relative rather than a second table of literals, and the reference
+is anchored by its own cases: the battery to `capture.PROMPTS`, the revision to
+`capture.CHECKPOINT_REVISION`.
+
 **What is NOT reached, and is owed.** `test_nemotron_h_loader.cpp` and the A3
 driver still read `oracle.json` only. Repointing them is a change to what the
 token gate compares against, which needs its own fresh review and its own
@@ -258,22 +277,36 @@ the document it built and raises rather than writing when it fails.
 
 **Measured on** `mudler-ubuntu-box` (x86_64, 20 cores) in the worktree
 `/home/mudler/_git/vllm.cpp-golden-rederive`, branch
-`row/GATE-NEMOTRON-GOLDEN-REDERIVE`, base `origin/main` `8540a27558813faef`,
-**nothing overlaid**. The GPU side ran on `dgx:gpu0` (NVIDIA GB10, sm_121,
+`row/GATE-NEMOTRON-GOLDEN-REDERIVE`, base **pinned** at `2f2a709253c60599f`
+after the second merge (`8540a27558813faef` before it), **nothing overlaid**.
+The GPU side ran on `dgx:gpu0` (NVIDIA GB10, sm_121,
 driver 580.173.02, aarch64) inside an `rc` lease, never over `ssh`, submitter
 `claude/mudler-ubuntu-box/golden-rederive`. Job artifacts on the share under
 `/mnt/nas_share/rc/golden-rederive/` (the worker sees `/workspace/golden-rederive`).
 
 ### 7.1 The contract gates, and the count beside every green
 
+Measured at the review-repair commit, whose suite file is
+sha256 `9a4407f77e73627bd5adfbc09b6002e2ab18f9a7e190567802a89e14b15f3af8` --
+named by content rather than by commit id because the branch was rebuilt onto a
+newly pinned base after the measurements and the commit id moved while the file
+did not. The record commit after it touches neither the suite nor the golden, so
+every figure below still reads at the branch head. They all MOVED with the
+repair, so the pre-repair numbers this section used to carry -- 43 cases, and
+`RANGE_COUNT=3` against `8540a27558813faef` -- are superseded rather than
+re-stated. An evidence table has to name the tree it was measured on.
+
 ```
 python3 scripts/nemotron-h-oracle-capture.py --check .../oracle.json   -> 0 problems, rc=0
-python3 tests/scripts/test_nemotron_h_oracle_capture.py               -> 43 cases, OK
+python3 tests/scripts/test_nemotron_h_oracle_capture.py               -> 54 cases, OK
 ```
 
 `scripts/agent-preflight.sh --fail-on-skip`: **zero gates skipped**, and
-`commit-trailers` and `commit-style` both report `ok` against `origin/main`
-`8540a27558813faef` at **`RANGE_COUNT=3`**.
+`commit-trailers` and `commit-style` both report `ok` against the pinned base
+`2f2a709253c60599f` at **`RANGE_COUNT=7`**. `RANGE_COUNT=3` was 4 when it was
+written -- `git rev-list --count 8540a2755..HEAD` read 4, not 3 -- and the
+figure is now recounted at the head it is recorded on, which is the only place
+a count means anything.
 
 The count is not decoration. Both checkers were run against an EMPTY range
 (`HEAD..HEAD`) and **returned rc=0** -- a gate that examined nothing prints the
@@ -281,34 +314,74 @@ same green as a gate that examined everything -- so the range width is reported
 beside the result rather than inferred from it. The first preflight of this
 branch is the other half of that lesson: it SKIPPED both gates because
 `origin/main` had moved and was no longer an ancestor, and a skipped gate
-reported nothing about this tree. The merge commit exists to make them run.
+reported nothing about this tree. The merge commit exists to make them run --
+and it had to be made TWICE, because `origin/main` moved again while the branch
+was in review and put the branch behind for the second time. `agent-preflight.sh`
+takes its `TRAILER_BEHIND` arm on exactly that condition, so the merge is not
+housekeeping: without it both trailer gates report nothing and the run still
+looks green. `git merge-base --is-ancestor origin/main HEAD` is the check, and
+it returns 0 at the head this section records. The base is PINNED by SHA
+rather than by ref name, because `origin/main` moved a THIRD time mid-repair --
+another worktree in this shared checkout fetched and the ref advanced from
+`08c81a892` to `2f2a70925` under a merge already resolved against it.
 
-**One red that is not this row's.** `test_cpu_x86_llamacpp_floor` fails on
-`test_a_contended_leg_is_discarded_and_never_summarised` and
-`test_the_quiet_gate_does_not_see_the_harnesss_own_process_tree`, both reporting
-`NO_QUIET_WINDOW ... load=50.63`. That is
-[#618](https://github.com/mudler/vllm.cpp/issues/618) by its exact case names --
-the harness is load-dependent and this box was carrying other sessions' builds.
+**Three reds, and none of them is this row's.**
+
+`test_cpu_x86_llamacpp_floor` fails on
+`test_a_contended_leg_is_discarded_and_never_summarised`, reporting
+`NO_QUIET_WINDOW`. That is
+[#618](https://github.com/mudler/vllm.cpp/issues/618) by its exact case name --
+the harness is load-dependent and this box was carrying other sessions' builds
+at `load average: 60.87`, which is also why the earlier run of this branch saw a
+second case of the same suite fail and this one did not.
 `git diff --stat origin/main -- tests/scripts/test_cpu_x86_llamacpp_floor.py
 scripts/cpu-x86-llamacpp-floor.sh` is **empty**, against a positive control on
 this row's own files that is not, so the suite is byte-identical to `origin/main`.
 
+`check-agent-record` and `test_agent_record` fail on the same one error:
+`.agents/issue-index.md: issue #1649 listed twice`. Both `#1649` rows are on
+`2f2a70925` already -- `git show origin/main:.agents/issue-index.md | grep -c
+'^| \[#1649\]'` is `2`, added by `a7bb3130b` and `2f2a70925` -- and the three
+rows this branch adds are `#1694`, `#1729` and `#1730`, which
+`git diff origin/main -- .agents/issue-index.md` shows as the only additions.
+`main` is red on this gate, and it is filed as
+[#1731](https://github.com/mudler/vllm.cpp/issues/1731). The repair is not
+available to this branch anyway: the file is append-only, so deleting a row is
+the one edit its own rule forbids.
+
 ### 7.2 The re-derived golden is REACHED, proven by mutation
 
 `SHIPPED_GOLDEN` named `oracle.json` alone, so a golden captured beside it would
-have been gated by nothing. Both directions were mutated, on this tree, each
-applied alone.
+have been gated by nothing. Every mutation below was applied alone, on the head
+named in §7.1, and the whole table was **re-measured there**: the review repair
+edited the very case M-B deletes, which silently disarms a mutation proof taken
+before it.
 
 | # | Mutation | Proof it applied | Result |
 |---|---|---|---|
-| — | baseline | — | 43 cases, `OK` |
-| M-A | a second golden in the directory carrying the `af8170154` shape (no `capture` block) | `git status --short` shows the file | **1 failure**, and it NAMES the file: `(golden='oracle.MUTANT.json')`, `missing 'capture'` |
-| M-B | the same mutant golden, and the new CASE deleted instead | `git diff --stat` 2 insertions 1 deletion, `parse_rc=0` | **42 cases, `OK`** — nothing else in this tree holds it |
+| — | baseline | — | **54 cases, `OK`** |
+| M-A | a second golden in the directory carrying the `af8170154` shape (no `capture` block) | `git status --short` shows the untracked file | **1 failure**, and the subTest NAMES the file: `(golden='oracle.MUTANT.json')`, `missing 'capture'` |
+| M-B | the same mutant golden, and the glob CASE deleted instead | `git diff --stat` **27 deletions**, `parse_rc=0` | **53 cases, `OK`** — nothing else in this tree holds it |
+| M-G | a CONTRACT-VALID second golden of a DIFFERENT model: bogus `revision`, ONE entry, prompt `"Write a haiku about ducks"` | `git status --porcelain` shows the untracked file; `--check` reads it and prints `1 golden entry` | **before the repair: 54→43 cases `OK`, `--check` `0 problem(s)`.** After: **1 failure** naming all four differences |
+| M-1 | M-G present, and the `identity_problems` CALL SITE deleted from the glob loop | `git diff --stat` 1 deletion, compiles | **54 cases, `OK`** — the call site is what makes the glob reach the guard |
+| M-2 | M-G present, and `identity_problems` neutered to `return []` | `git diff --stat` 1 insertion, compiles | **7 failures**, all in `CaptureIdentityTests` |
 
-M-B is the one that matters: it is the reachability question rather than the
-contract question. Restored byte-for-byte afterwards, suite sha256
-`41037bc0f32c49e98db7369b98f0d8710ecab0d004c045b1bcd8b3acb20d95a5` and the
-committed golden's sha256 unchanged at
+M-B is the reachability question rather than the contract question. M-G is the
+review finding that motivated the repair: it is what a glob gating provenance
+SHAPE cannot see, and M-1 and M-2 are the two halves of its fix — that the guard
+is REACHED from the glob, and that the guard itself is gated by cases rather than
+by a mutation somebody has to remember to repeat.
+
+**M-A also exhibits the `--check` labelling defect**, in its own evidence line:
+the subTest says `oracle.MUTANT.json` and the contract message says
+`oracle.json: missing 'capture'`, because the top-level `where` label is a string
+literal. That is [#1729](https://github.com/mudler/vllm.cpp/issues/1729), listed
+under `## Owed`; it is pre-existing and not repaired here.
+
+Restored byte-for-byte after every mutation: suite sha256
+`9a4407f77e73627bd5adfbc09b6002e2ab18f9a7e190567802a89e14b15f3af8` at the head
+named in §7.1, `git status --porcelain` and `git diff` both clean over
+`tests/`, and the committed golden's sha256 unchanged at
 `659c26bd2301317d4a6999df0b7afc3243dcff129de89abcb66b46817dd6f9e9`.
 
 ### 7.3 The capture shape was checked BEFORE spending a lease
@@ -520,3 +593,33 @@ are already measured green.
 - **Who holds ~117 GB on `dgx.casa` while the CPU is idle.** Filed on #1431. It
   needs the host process table, which this row has no authority to read.
 - **#1431's root cause.** Untouched by this row: its wall was never reached.
+- **[#1710](https://github.com/mudler/vllm.cpp/issues/1710) -- `dgx:gpu0` begins
+  a lease with 5 GB of 122 GB available and `rc` exposes no available-memory
+  label, so `ready` cannot mean usable.** This is the blocker §10 describes, in
+  its filed form: the capture is one `rc` job away, and the job cannot be
+  usefully queued while a lease can be granted on a box with no memory. Owner:
+  #1710. This row is BLOCKED on it and does not repair it -- the fix is a
+  controller-side label, which this row has no authority over.
+- **[#1729](https://github.com/mudler/vllm.cpp/issues/1729) -- `--check <path>`
+  reports every top-level violation against the hardcoded name `oracle.json`.**
+  Found by the fresh review of PR #1703 and visible in this spec's own §7.2
+  M-A line. PRE-EXISTING: it predates this branch, and it becomes reader-visible
+  the moment a second golden exists beside `oracle.json`, which is what this row
+  produces. NOT fixed in flow: the repair threads the checked path into
+  `check_golden` and owes its own regression case, which is a checker-semantics
+  change rather than a one-line accuracy fix. Owner: #1729.
+- **[#1730](https://github.com/mudler/vllm.cpp/issues/1730) -- this suite's only
+  registration is one line of `ci.yml`, and `check-test-registration.py` stays
+  at rc=0 when it is deleted.** The suite is also absent from
+  `agent-preflight.sh`'s `SUITES` array. Found by the same review; PRE-EXISTING,
+  since the suite was registered this way when it landed under #926. NOT fixed
+  in flow: the repair edits a checker's required set and a shared runner array,
+  which needs its own red-before evidence. Owner: #1730. Related: #408, #1509.
+- **`sampling` is NOT part of the identity guard.** `identity_problems` holds a
+  second golden to the same model, revision, prompt battery and tokenization as
+  `oracle.json`, and deliberately not to the same `sampling` block:
+  `check_golden` already ties every row's `token_ids` length to that file's own
+  `sampling.max_tokens`, so a capture at a different depth is internally
+  consistent and legible rather than silent. A future comparison that needs the
+  depths equal should say so in its own row. Named here so the omission is a
+  decision rather than an oversight.
