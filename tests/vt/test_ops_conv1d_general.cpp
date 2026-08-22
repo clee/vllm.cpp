@@ -800,7 +800,9 @@ TEST_CASE("Conv1dTimeBlock keeps every block boundary on a position-tile boundar
       for (const int64_t kernel : kernels) {
         for (const int64_t cin : channels) {
           for (const int64_t length : lengths) {
-            const int64_t block = vt::cpu::Conv1dTimeBlock(cin, kernel, stride, dilation, length);
+            const int64_t in_len = (length - 1) * stride + (kernel - 1) * dilation + 1;
+            const int64_t block =
+                vt::cpu::Conv1dTimeBlock(cin, cin, kernel, stride, dilation, in_len, length);
             ++checked;
             REQUIRE(block >= 1);
             REQUIRE(block <= length);
@@ -843,18 +845,24 @@ TEST_CASE("the shipped vocoder geometries are MULTI-BLOCK, so the decomposition 
   struct Shape {
     const char* name;
     int64_t in_ch;
+    int64_t out_ch;
     int64_t kernel;
     int64_t dilation;
     int64_t length;
   };
+  // The five shapes the WEIGHTS-SMALLER rule takes. The three it declines are
+  // the negative case below, and they are not an omission: blocking measured
+  // 0.82x and 0.89x on the two b0 shapes on `thor:gpu0` (spec §2b), so a gate
+  // that asserted `blocks > 1` on all eight would be pinning a regression.
   const Shape shapes[] = {
-      {"conv_in", 1024, 7, 1, 344},        {"b0_res_conv1", 768, 7, 9, 2752},
-      {"b0_res_conv2", 768, 1, 1, 2752},   {"b1_res_conv1", 384, 7, 9, 22016},
-      {"b2_res_conv1", 192, 7, 9, 88064},  {"b3_res_conv1", 96, 7, 9, 176128},
-      {"b3_res_conv2", 96, 1, 1, 176128},  {"conv_out", 96, 7, 1, 176128},
+      {"b1_res_conv1", 384, 384, 7, 9, 22016},  {"b2_res_conv1", 192, 192, 7, 9, 88064},
+      {"b3_res_conv1", 96, 96, 7, 9, 176128},   {"b3_res_conv2", 96, 96, 1, 1, 176128},
+      {"conv_out", 96, 1, 7, 1, 176128},        {"b0_res_conv2", 768, 768, 1, 1, 2752},
   };
   for (const Shape& sh : shapes) {
-    const int64_t block = vt::cpu::Conv1dTimeBlock(sh.in_ch, sh.kernel, 1, sh.dilation, sh.length);
+    const int64_t in_len = sh.length + (sh.kernel - 1) * sh.dilation;
+    const int64_t block = vt::cpu::Conv1dTimeBlock(sh.in_ch, sh.out_ch, sh.kernel, 1, sh.dilation,
+                                                  in_len, sh.length);
     const int64_t blocks = (sh.length + block - 1) / block;
     INFO(sh.name << ": in_ch=" << sh.in_ch << " length=" << sh.length << " block=" << block
                  << " blocks=" << blocks);
@@ -868,8 +876,33 @@ TEST_CASE("the shipped vocoder geometries are MULTI-BLOCK, so the decomposition 
   }
   // `conv_out` is the shape the row-only partition could not reach at all: ONE
   // output row means `rows == 1`, and `ForOutputRows` runs a single row inline
-  // on the caller at every thread count.
-  CHECK(vt::cpu::Conv1dTimeBlock(96, 7, 1, 1, 176128) < 176128);
+  // on the caller at every thread count. It is 10.49x on `thor:gpu0`.
+  CHECK(vt::cpu::Conv1dTimeBlock(96, 1, 7, 1, 1, 176134, 176128) < 176128);
+
+  // THE NEGATIVE CASE, and it carries as much of the rule as the positive one.
+  // Where the weight tensor is the larger of the two, blocking re-reads it once
+  // per block and MEASURED SLOWER; the rule must decline these, and a gate that
+  // only asserted `blocks > 1` somewhere would not notice if it stopped.
+  const Shape declined[] = {
+      {"conv_in", 1024, 1536, 7, 1, 344},
+      {"dec_in_proj", 64, 1024, 1, 1, 344},
+      {"b0_res_conv1", 768, 768, 7, 9, 2752},
+      // AND THE RULE FLIPS WITH THE WINDOW, which is the point of stating it as
+      // a comparison rather than as a list. `b0_res_conv2` is DECLINED at a
+      // 20-latent window, where 768 weights face a 688-position activation and
+      // blocking measured 0.89x, and TAKEN at 344 latents above, where the same
+      // weights face 2 752 positions. A rule written as a list of shape names
+      // could not do that.
+      {"b0_res_conv2 at a 20-latent window", 768, 768, 1, 1, 688},
+  };
+  for (const Shape& sh : declined) {
+    const int64_t in_len = sh.length + (sh.kernel - 1) * sh.dilation;
+    const int64_t block = vt::cpu::Conv1dTimeBlock(sh.in_ch, sh.out_ch, sh.kernel, 1, sh.dilation,
+                                                  in_len, sh.length);
+    INFO(sh.name << ": weights " << sh.out_ch * sh.kernel << " against in_len " << in_len
+                 << ", block=" << block);
+    CHECK(block == sh.length);  // one block: the pre-decomposition loop
+  }
 }
 
 TEST_CASE("vt::Conv1d holds its sweep ORDER under cancellation ACROSS TIME BLOCKS") {
@@ -880,7 +913,8 @@ TEST_CASE("vt::Conv1d holds its sweep ORDER under cancellation ACROSS TIME BLOCK
   const int64_t lout = 300;
   Conv1dArgs args;  // stride 1, padding 0, dilation 1
   const int64_t lin = lout + kernel - 1;
-  const int64_t block = vt::cpu::Conv1dTimeBlock(cin, kernel, args.stride, args.dilation, lout);
+  const int64_t block =
+      vt::cpu::Conv1dTimeBlock(cin, cout, kernel, args.stride, args.dilation, lin, lout);
   INFO("block=" << block << " lout=" << lout);
   REQUIRE(block < lout);          // the case is NOT one block
   REQUIRE(lout % block != 0);     // and the last block is SHORT, which is the
@@ -925,7 +959,8 @@ TEST_CASE("vt::Conv1d holds its TAP order under cancellation ACROSS TIME BLOCKS"
   const int64_t lout = 300;
   Conv1dArgs args;
   const int64_t lin = lout + kernel - 1;
-  const int64_t block = vt::cpu::Conv1dTimeBlock(cin, kernel, args.stride, args.dilation, lout);
+  const int64_t block =
+      vt::cpu::Conv1dTimeBlock(cin, cout, kernel, args.stride, args.dilation, lin, lout);
   INFO("block=" << block << " lout=" << lout);
   REQUIRE(block < lout);
   const float kBig = 1099511627776.0F;  // 2^40

@@ -53,18 +53,40 @@ constexpr int64_t kConv1dPosTile = 32;
 // to fill it evicts itself.
 constexpr int64_t kConv1dSliceBytes = 512 * 1024;
 
-// Output positions per time block: the largest multiple of the position tile
-// whose input span fits `kConv1dSliceBytes`, clamped into [tile, length].
+// Output positions per time block, or `length` for "do not block at all".
 //
-// THE MULTIPLE OF `kConv1dPosTile` IS LOAD-BEARING AND IS NOT ROUNDING. Every
+// TWO RULES, AND BOTH ARE MEASURED RATHER THAN PICKED.
+//
+// (1) BLOCK ONLY WHEN THE WEIGHTS ARE THE SMALLER TENSOR. Blocking trades one
+// cost for another: the unblocked loop reads the activation `out_channels`
+// times and the weights once, and the blocked loop reads the activation once
+// and the weights once per block. That trade is only worth taking when what it
+// makes resident is the SMALLER of the two tensors — weights
+// `out_channels * in_per_group * kernel` against activation
+// `in_per_group * in_len`, so the condition reduces to
+// `out_channels * kernel <= in_len` with no constant in it at all.
+//
+// MEASURED, paired, on `thor:gpu0` at 14 threads over the vocoder's eleven
+// geometries (spec §2b). Blocking unconditionally is 1.26x, 1.32x, 1.78x and
+// 2.04x on the four residual shapes where the activation dominates, and 10.49x
+// on `conv_out` — and **0.82x and 0.89x on the two b0 shapes, where the weights
+// are 16.5 MiB against a 2.1 MiB activation.** The condition above is the sign
+// of that same comparison, and it selects correctly on all eleven: it declines
+// `conv_in` (10 752 > 92), `dec_in_proj` (1 024 > 92) and both b0 shapes
+// (5 376 > 694, 768 > 694), and takes every shape that gained.
+//
+// (2) THE BLOCK IS THE LARGEST MULTIPLE OF THE POSITION TILE THAT FITS
+// `kConv1dSliceBytes`. The multiple is load-bearing and is not rounding: every
 // block boundary is then also a position-tile boundary, so each tile spans
 // exactly the positions it spans today and takes exactly the code path it takes
 // today — including the `span == kConv1dPosTile` constant-trip-count fast path,
-// which §18.4 prices at up to 5x against the chunked one. A block length that
-// was not a multiple would silently re-cut the tiles and report a speed result
-// about a different kernel. `tests/vt/test_ops_conv1d_general.cpp` gates it.
-inline int64_t Conv1dTimeBlock(int64_t in_per_group, int64_t kernel, int64_t stride, int64_t dilation,
-                               int64_t length) {
+// which §18.4 prices at up to 5x. A block length that was not a multiple would
+// silently re-cut the tiles and report a speed result about a different kernel.
+// `tests/vt/test_ops_conv1d_general.cpp` gates both rules.
+inline int64_t Conv1dTimeBlock(int64_t in_per_group, int64_t out_channels, int64_t kernel,
+                               int64_t stride, int64_t dilation, int64_t in_len, int64_t length) {
+  // Rule (1). `length` means one block, which is the pre-decomposition loop.
+  if (out_channels * kernel > in_len) return length;
   // One block of `b` output positions reads input positions
   // [t0*stride - pad, t0*stride - pad + (b-1)*stride + (kernel-1)*dilation], so
   // the span grows with `stride` and the constant term with the dilated kernel.
