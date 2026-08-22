@@ -83,17 +83,23 @@ Six limits, stated plainly rather than left to be discovered.
   later tree, source `cffe59b`, the two arms already select different MoE
   experts in the FIRST block of the FIRST forward, eight tokens before any
   emitted token differs, and they differ there in the router GEMM input rather
-  than in anything the router does with it. Two more causes are excluded by
+  than in anything the router does with it. One more cause is excluded by
   measurement: the router gate weights, whose fingerprint is identical on both
-  arms, and both top-k implementations, neither of which deviates from a plain
-  lowest-index-wins rank of its own arm's logits. The cause is STILL not
-  identified, because the embedding table, the expert projections, the
-  attention weights and the norms were never fingerprinted. The CUDA
-  continuation also degenerates into a mechanical recursion after the tokens the
-  two arms share, which a coin flip between two equally good tokens does not
-  produce. Treat the CUDA arm as unverified against the CPU arm until that gate
-  is settled, and **use `--device cpu` for this checkpoint today**: it is the
-  arm every published number here was measured on.
+  arms. The two top-k implementations were checked as well and agreed with a
+  plain lowest-index-wins rank of each arm's own logits, but only on 5 of the
+  552 token-rows the dumps hold, so read that as a sample and not as a property
+  of either implementation. A third probe then dumped the
+  EMBEDDING OUTPUT, the hidden state before any GEMM, norm or attention touches
+  it, and the two arms are BIT-IDENTICAL there: 0 of 40,960 bf16 values differ.
+  So the weights are the same at both ends of the stack and the divergence
+  starts in the compute inside the first block. The cause is STILL not
+  identified, because the expert projections, the attention weights and the
+  norms were never fingerprinted. The CUDA continuation also degenerates into a
+  mechanical recursion after the tokens the two arms share, which a coin flip
+  between two equally good tokens does not produce. Treat the CUDA arm as
+  unverified against the CPU arm until that gate is settled, and **use
+  `--device cpu` for this checkpoint today**: it is the arm every published
+  number here was measured on.
 * **No speed claim is attached.** `docs/BENCHMARKS.md` carries G0-SPEED as
   `VOID`, because a speed number behind a failing correctness gate is not a
   result. The CPU arm serves this checkpoint at a steady **11.05 s/token at 4000

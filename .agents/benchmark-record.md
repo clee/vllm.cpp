@@ -19,21 +19,34 @@ from relative link targets repointed for this file's location.
 
 # Benchmarks
 
-## ENG-EXPERT-STREAM-DEVICE W0g: the CPU-against-CUDA divergence is expert ROUTING from the FIRST MoE block, and it is NOT a sampling near-tie (2026-08-20 and 2026-08-21, `dgx:gpu0`, source `cffe59b`, #1124, #1299)
+## ENG-EXPERT-STREAM-DEVICE W0g: the CPU-against-CUDA arms differ UPSTREAM of the router, and it first shows as a different expert selection in the FIRST MoE block rather than as a sampling near-tie (2026-08-20 to 2026-08-22, `dgx:gpu0`, source `cffe59b`, #1124, #1299)
 
 **Read the W0e and W0f sections further down this file first.** This is a third
 run of the same harness on a third tree, and its CPU column is again a control
 for the CUDA arm rather than a new attempt at the standing 11.05 s/token CPU
 figure. The three sections must not be mixed.
 
+**Placement.** This file is strictly newest-first. The section sits above
+`SPEC-DFLASH2 O26` because its last run, Run C, is 2026-08-22, the same day.
+When the section carried only Runs A and B it was misfiled by one position, and
+Run C is what corrects that rather than an argument for an exception.
+
 **What this section replaces.** W0f recorded the G0-CORRECT failure as a
 near-tie at the first divergent token, on a measured CPU top-2 margin of
-0.264709 logits. That reading described the symptom. The two runs below show
+0.264709 logits. That reading described the symptom. The three runs below show
 that the arms already choose different EXPERTS in the first MoE block of the
 first forward, eight tokens before any emitted token differs, so the token
 divergence is downstream of a routing divergence. The near-tie margins W0f
 measured stay true as measurements of the sampler's input. They are no longer
 the explanation.
+
+**Say what "routing" is, because the shorthand overstates the finding.** The top
+of this section, the row's public pages and the landing commit subject all say
+the failure IS expert routing. That is where an upstream numeric difference
+first becomes DISCRETE and therefore visible, and it is not the thing that
+differs. What differs is the router's GEMM INPUT. The wording is kept because
+every surface pairs it with "cause open", and it is recorded as imprecise here
+so a later reader does not read it as an attribution.
 
 **Provenance.** `dgx:gpu0` (NVIDIA GB10, `sm_121`, driver 580.173.02), source
 `cffe59b`, weights `/home/mudler/ckpt/qwen3.8-q1_0` (`Qwen3.8-2.4T-A95B
@@ -87,25 +100,50 @@ page cache on a 119.631 GiB box and warming it buys almost nothing. Dropping
 the cache is still the correct protocol, and anyone who cannot drop it now has
 the measured size of the error rather than a guess.
 
-### Run B: a router dump on both arms, one prefill each
+### Run B: a router dump on both arms, one prefill and one decode step each
 
 An env-gated observer on branch `task/1299-router-dump` (`VT_ROUTER_DUMP`,
 documented in `docs/ENVIRONMENT.md` on that branch, observer-only: every value
 is written after it is computed and none is read back) records, per MoE block:
 the router GEMM INPUT, the bf16 router LOGITS it produced, the selected expert
 ids and their renormalized weights, and an FNV fingerprint of the router GATE
-weight. Both arms ran the same 5-token prefill and wrote **184 records each,
-9,661,480 bytes each**.
+weight. Both arms wrote **184 records each, 9,661,480 bytes each**.
+
+**What those 184 records SPAN, re-derived from the byte count rather than
+assumed.** An earlier revision of this section said "one prefill each". The
+file format is self-verifying and says otherwise. The layout is an 8-byte header
+plus, per record, 44 fixed bytes (`u32 call,T,E,K,H` and the four gate
+fingerprint fields) plus `T` token-rows of `H*2 + E*2 + K*4 + K*4` bytes.
+Solving `8 + 184*44 + sum(T)*17488 = 9,661,480` gives `sum(T) = 552`, and
+`17488` fixes `K = 10` at `H = 8192`, `E = 512`, which is the top-10 of 512 this
+model routes. `552 = 92*5 + 92*1`, so the dump is **92 MoE blocks x 2 calls: one
+5-token PREFILL and one 1-token DECODE step**, and **552 token-rows per arm**.
+
+**Two consequences, both of which the earlier revision got wrong.** The gate
+fingerprint agreement is partly a decode-step observation and not purely a
+prefill one. And the env block recorded under `**Provenance**` does NOT
+reproduce this file: `VT_ROUTER_DUMP_MAX_CALLS` defaults to **128** on that
+branch, which truncates at 128 records, so the run must have raised it to at
+least 184. **The value actually used was not captured in the evidence handed to
+this record**, and it is named here as a reproduction gap rather than guessed at.
 
 **The router gate weights are IDENTICAL on both arms.** The gate fingerprint
 and `w_bytes` agree on all 184 records. The arms are not loading, dequantizing
 or repacking different router weights, which is the cheapest explanation and it
 is now excluded rather than assumed away.
 
-**Both top-k implementations are CORRECT.** For each arm, the selected set was
-re-derived offline from that arm's OWN logits by a plain lowest-index-wins rank.
-**0 of 5 rows deviate on either arm.** Neither selector is broken, and neither
-breaks a tie in a way the other would not.
+**Both top-k implementations agree with a plain rank ON THE ROWS THAT WERE
+CHECKED, and the denominator is part of the result.** For each arm, the selected
+set was re-derived offline from that arm's OWN logits by a plain
+lowest-index-wins rank. **0 of 5 token-rows deviate on either arm, out of the
+552 token-rows each dump contains**, which is 0.91 % of them and is consistent
+with record 0's five rows alone. On that sample neither selector is broken and
+neither breaks a tie in a way the other would not. **This does NOT support the
+universal "both top-k implementations are correct"**, and where this record's
+first revision, the spec and the model guide wrote the universal, they were
+generalizing from under one percent of the available rows. Re-deriving over all
+552 rows needs no lease, only the two dumps, and it is carried under the spec's
+`## Owed`.
 
 **The arms already differ at record 0**, the first MoE block, in the GEMM INPUT
 rather than in anything the router does with it:
@@ -117,6 +155,14 @@ rather than in anything the router does with it:
 | max absolute difference | 0.03125 |
 | mean absolute difference | 3.14e-4 |
 | mean magnitude of the values themselves | 0.168 |
+
+**The 0.19 % here and the 0.56 % in the block table below are DIFFERENT
+STATISTICS.** 3.14e-4 over 0.168 is 0.19 %, a ratio of two means taken over the
+whole tensor. The block table reports a mean relative difference, a mean of
+per-element ratios. A mean of ratios weights a small denominator heavily and a
+ratio of means does not, so the two are not comparable and neither is a
+correction of the other. They are twelve lines apart and are labelled here
+because nothing else in this section says so.
 
 **The observed flip is an EXACT bf16 tie.** At token 3, the CPU arm reads
 experts 205 and 212 at exactly the same logit, **-4.937500**, and takes the
@@ -159,28 +205,72 @@ flip between two equally good tokens does not do that. This is the signature of
 a subtly wrong distribution, and it is a reason to treat the failure as a defect
 rather than to ratify it as admissible non-determinism.
 
-### What these two runs exclude, and what they do NOT
+### What Runs A and B exclude, and what they do NOT
 
 **Excluded, measured rather than argued:** the router gate weights, on the
-fingerprint; both top-k implementations, on the re-derivation; and the W0f host
-alias, which the algo-identity probe already excluded on this silicon (see the
-W0f section).
+fingerprint over all 184 records; and the W0f host alias, which the
+algo-identity probe already excluded on this silicon (see the W0f section).
+**Weaker than those two:** the top-k implementations, which agree with a plain
+rank on 5 of the 552 token-rows each dump holds. That is a sample, not the
+population, and it is written with its denominator wherever it appears.
 
 **NOT excluded, and nothing here may present the case as closed.** No
-fingerprint was taken of the embedding table, the expert projections, the
-attention weights, or the norms. The evidence is CONSISTENT with bf16
-reduction-order accumulation across two genuinely different GEMM kernels, and
-consistency is not attribution. The first operation whose output differs is
-still unnamed, because record 0 is already downstream of the embedding and of a
-whole attention block.
+fingerprint was taken of the expert projections, the attention weights, or the
+norms. The evidence is CONSISTENT with bf16 reduction-order accumulation across
+two genuinely different GEMM kernels, and consistency is not attribution. The
+first operation whose output differs is still unnamed, because record 0 is
+already downstream of a whole attention block.
 
-**The next traceable step is queued and UNRUN.** Branch `task/1299-embed-dump`,
-commit `0544b6224`, adds `VT_EMBED_DUMP`, which writes the EMBEDDING OUTPUT
-itself, upstream of every GEMM. If the two arms differ there, the cause is at or
-before the embedding and the whole GEMM hypothesis is wrong. If they agree, the
-divergence enters inside the first attention block and the search bisects into
-it. It needs the same `dgx:gpu0` lease. Until it runs, G0-CORRECT stays FAILING
-and G0-SPEED stays VOID.
+### Run C: the embedding probe RAN, and the embedding output is BIT-IDENTICAL
+
+The step the two paragraphs above called queued and unrun has now run, on
+`dgx:gpu0` under an `rc hold` that released cleanly. The observer is on branch
+`task/1299-embed-dump` at commit `0544b6224`: four call sites, `VT_EMBED_DUMP`,
+self-bounded at 8 records. It writes the EMBEDDING OUTPUT, which is the hidden
+state before any GEMM, norm or attention has touched it. One prefill on each
+arm, weights on local NVMe, the same prompt ids `760,6511,314,9338,369`.
+
+| Observable | CPU | CUDA |
+|---|---|---|
+| dump size | 81,940 B | 81,940 B |
+| header | `magic=0x31424d45`, version 1, call 0, T=5, H=8192 | identical |
+| bf16 values | 40,960 | 40,960 |
+| sha256 prefix | `3f81114a87a0774e84086fe4` | `3f81114a87a0774e84086fe4` |
+| elements that differ | **0 of 40,960** | **0 of 40,960** |
+
+20 header bytes plus 40,960 bf16 values is 81,940 bytes, so the size agrees with
+the shape, and 5 tokens times 8192 is the 40,960 the header declares. **The two
+files are BIT-IDENTICAL**, on the hash and on an element-wise comparison of
+every value.
+
+**The comparison is not two absent files agreeing.** Non-emptiness and equal
+element counts were asserted before the values were compared, which is what
+separates a genuine match from an instrument that read nothing twice.
+
+**What Run C establishes.** The two arms read the same embedding table and
+dequantize it identically. With the router gate fingerprints matching on all 184
+records of Run B, the WEIGHTS side is now closed at both ends of the stack. The
+divergence therefore begins in the COMPUTE after the embedding, somewhere in
+block 0's attention and dense path, and by the first MoE router it has reached
+0.56 %, which is about one bf16 rounding step.
+
+**What Run C does NOT establish.** It removes one candidate. It does not
+identify a cause and it does not make the divergence benign. The 13.4 %
+accumulated divergence by block 91 and the degenerate CUDA continuation both
+stand unchanged, and no CUDA speed claim becomes publishable as a result. The
+expert projections, the attention weights and the norms are still
+unfingerprinted, and this entry does not widen the exoneration past the
+embedding table.
+
+**The next traceable step, restated.** Localize WHERE inside block 0's attention
+and dense path the two arms first differ. Embedding-out is identical and
+router-in is not, so the first differing operation lies between them and the
+search now bisects a bounded interval rather than the whole stack. It needs the
+same `dgx:gpu0` lease. Until it runs, G0-CORRECT stays FAILING and G0-SPEED
+stays VOID.
+
+Artefacts: `/home/mudler/router-dive/out/embed-cpu.bin` and
+`/home/mudler/router-dive/out/embed-cuda.bin` on the host.
 
 ## SPEC-DFLASH2 O26 — the FIRST DFlash2 speed ratio: **0.8017x** output throughput, RECORDED and NOT a pass (2026-08-22, `dgx:gpu0`, gate tree `d25730fbbc2afeafb9096d150823c2a4334d0619`, #1562)
 
