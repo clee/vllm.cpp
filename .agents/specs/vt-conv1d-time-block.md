@@ -153,6 +153,104 @@ and the reason it could not see this is stated plainly: it timed the WINDOW and
 reasoned about the KERNEL, with nothing in between. The instrument that was
 missing was a split, not a counter.
 
+## 2b. The A/B/C on `thor:gpu0` — what each change is worth
+
+**`rc` job `3ca07477-f3b7-402a-bcc4-b6af55f30a66`**, same worker
+`rc-worker-m4d7t`, **same boot id `fabedc13-97a1-4cb9-909f-217a425d3f70`** as
+§2a, so every ratio on this page is inside one boot. Three SOURCE TREES built
+inside the lease into three binaries, hashed, and the run refuses to time
+anything if two hash the same:
+
+| arm | tree | `vllm_music3_vocoder_conv_ab` sha256 |
+|---|---|---|
+| A | `3b00897fe` — instrumented baseline, no perf change | `4e9b30b65ffd2aad…` |
+| B | `fd99a0d7f` — A + the parallel snake | `5f6c9960a2ef74b3…` |
+| C | `cf9296496` — B + the conv decomposition, blocked UNCONDITIONALLY | (third distinct hash) |
+
+**Correctness first, on arm C, before any speed number was read** — five suites,
+`test cases:` / `assertions:` / `Status:` in full: `test_ops_conv1d_general`
+14/19 617/`SUCCESS!`, `test_host_parallel` 11/968/`SUCCESS!`, `test_vocoder1d`
+10/58/`SUCCESS!`, `test_bigvgan` 6/65/`SUCCESS!`,
+`test_minimax_music3_acoustic` 36/345/`SUCCESS!`. All rc 0.
+
+**And every arm is bit-identical at full scale.** Across all three arms, every
+round and every thread count from 1 to 14, each length produced ONE waveform
+fingerprint: `0xcdfc4309a0070783` at 20 latents and `0xc2d5eaf095d1c483` at 86.
+
+### The window's scaling curve, before and after
+
+20 latents, best of 3, `VLLM_CPP_CPU_THREADS` swept:
+
+| threads | arm A | speedup | arm C | speedup |
+|---|---|---|---|---|
+| 1 | 9.6374 s | 1.00x | 9.4392 s | 1.00x |
+| 2 | 6.2616 s | 1.54x | 4.8859 s | 1.93x |
+| 4 | 4.6068 s | 2.09x | 2.4640 s | 3.83x |
+| 8 | 3.7876 s | 2.54x | 1.2884 s | 7.33x |
+| 14 | 3.4247 s | **2.81x** | 0.8223 s | **11.48x** |
+
+**2.81x of 14 becomes 11.48x of 14**, and the arm-to-arm ratio at the shipped
+default is **3.4478 / 0.8223 = 4.19x** (arm A re-measured in the same job).
+
+### The split says the same thing twice
+
+`thor:gpu0`, 86 latents, 14 threads, arm A against arm C:
+
+| leaf | arm A | share | arm C | share |
+|---|---|---|---|---|
+| `vocoder.snake` | **11.418 s** | **79.35 %** | 0.955 s | 27.35 % |
+| `vocoder.conv1d` | 2.212 s | 15.37 % | 1.727 s | 49.43 % |
+| `vocoder.conv_transpose` | 0.542 s | 3.77 % | 0.604 s | 17.30 % |
+| `vocoder.pad` | 0.085 s | 0.59 % | 0.079 s | 2.27 % |
+| `vocoder.copy` | 0.049 s | 0.34 % | 0.048 s | 1.37 % |
+| `vocoder.residual_add` | 0.069 s | 0.48 % | 0.066 s | 1.90 % |
+| sum(leaf) / TOTAL | 14.376 / 14.390 s | 99.90 % | 3.480 / 3.493 s | 99.63 % |
+
+`vocoder.snake` **11.418 s → 0.955 s, 11.96x**.
+
+**And the serial claim is confirmed by a second, independent reading.** On arm A
+the snake costs 2.653 s at 20 latents on ONE thread and 11.418 s at 86 latents
+on FOURTEEN — 0.13265 and 0.13277 seconds per latent frame. A loop with no
+partition costs the same wall clock however many cores are idle beside it, and
+that is what two legs at different lengths and different thread counts read, to
+four significant figures.
+
+### The conv decomposition, priced on its own
+
+The op-level probe, arm A against arm C at 14 threads, `latents=86`, paired in
+one job:
+
+| geometry | arm A | arm C | ratio |
+|---|---|---|---|
+| `conv_in` k7 | 0.01660 s | 0.01671 s | 0.99x |
+| **`b0_res_conv1` k7** | 0.03805 s | 0.04656 s | **0.82x** |
+| **`b0_res_conv2` k1** | 0.01117 s | 0.01261 s | **0.89x** |
+| `b1_res_conv1` k7 | 0.07551 s | 0.07616 s | 0.99x |
+| `b1_res_conv2` k1 | 0.02582 s | 0.02009 s | 1.29x |
+| `b2_res_conv1` k7 | 0.10550 s | 0.08399 s | 1.26x |
+| `b2_res_conv2` k1 | 0.03118 s | 0.01748 s | 1.78x |
+| `b3_res_conv1` k7 | 0.04609 s | 0.03489 s | 1.32x |
+| `b3_res_conv2` k1 | 0.01715 s | 0.00841 s | 2.04x |
+| **`conv_out` k7** | 0.00913 s | 0.00087 s | **10.49x** |
+| TOTAL, one of each | 0.37634 s | 0.31857 s | 1.18x |
+
+`conv_out`'s `user/wall` goes from **0.98 to 15.18**: that is the `rows == 1`
+inline path, which ran the whole convolution on the caller at every thread
+count, being reached for the first time.
+
+**The two b0 losses are the reason §3b acquired a condition.** Where the weight
+tensor is 16.5 MiB against a 2.1 MiB activation, re-reading the weights once per
+block costs more than reading the activation 768 times saves. Arm D
+(`0f738d6ec`) blocks only where `out_channels * kernel <= in_len`, and §2c pairs
+it against arm B.
+
+**Why the whole-window A/B/C rounds do NOT settle B against C.** They ran at
+`uptime` load 8.84, the decaying residue of three back-to-back builds in the
+same lease, and the two arms landed inside that noise of each other — B
+0.8852/0.8877 and C 0.9309/0.8365 at 20 latents. That is recorded as a defect in
+the SCHEDULE of the job rather than as a result, and §2c is the re-take with a
+settle period and seven alternated rounds.
+
 ## 3. What the row changes, and why each is bit-identical BY CONSTRUCTION
 
 The measurement moved the row's lever, so there are TWO changes and they are
@@ -265,7 +363,7 @@ Every binary's sha256 was taken before it ran.
 
 | suite | result | rc |
 |---|---|---|
-| `test_ops_conv1d_general` | 14 cases, 19 617 assertions, 0 failed, `SUCCESS!` | 0 |
+| `test_ops_conv1d_general` | 14 cases, 19 615 assertions, 0 failed, `SUCCESS!` | 0 |
 | `test_host_parallel` | 11 cases, 968 assertions, 0 failed, `SUCCESS!` | 0 |
 | `test_vocoder1d` | 10 cases, 58 assertions, 0 failed, `SUCCESS!` | 0 |
 | `test_bigvgan` | 6 cases, 65 assertions, 0 failed, `SUCCESS!` | 0 |
