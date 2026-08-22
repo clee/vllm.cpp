@@ -268,20 +268,142 @@ TEST_CASE("ltx2 phase log: the instrument's own cost is CONSERVED across the tab
                        "is part of means the accounting is charging intervals that are inside a "
                        "leaf to the table, which would make every residue bound too loose");
 
-  // AND THE CONSOLE COPY ANSWERS THE SAME QUESTION AS THE FILE. `RenderText` is
-  // what a reader watching a terminal gets, and it printed `sum(leaf)`,
-  // `unaccounted` and `WALL` while the file alone carried `instrument_seconds`
-  // — so the residue was on screen with no way to subtract the cost of naming
-  // the phases from it, which is the whole reason that number exists. This
-  // assertion is the only thing holding the two copies together, and without it
-  // the line is a production statement nothing reaches.
-  //
-  // THE TOLERANCE IS THE FORMAT'S OWN RESOLUTION AND NOT A MEASUREMENT.
-  // `RenderText` prints every total with `%10.3f`, so the printed value differs
-  // from the number it was given by strictly less than half of the last digit,
-  // 5e-4 seconds, by the definition of the conversion. No box load can move
-  // that, because nothing here is timed: both sides read the SAME `Instrument()`
-  // through two different code paths.
+  log.Reset();
+}
+
+// ─── and the TABLE's own share is disjoint too, which is a SECOND arm ────────
+//
+// `ChargeLocked` has two targets and the clamp landed on both, but only the
+// record arm was gated: a second fresh review removed the TABLE arm's
+// high-water mark and the whole file stayed green, because every other case
+// charges the table from ONE thread, where the intervals are already disjoint.
+//
+// The shape that breaks it is the hammer above with NOTHING LIVE. `Tick` reads
+// its clock before taking the process-wide mutex, so N threads blocked on the
+// same acquisition each charge their own full wait — and with no leaf open they
+// all land on `instrument_gap`. Overlapping charges to one counter then sum past
+// the timeline that contains them.
+//
+// THE BOUND IS THE TIMELINE ITSELF and it is not a measurement. `Instrument()`
+// is a sum of intervals inside `[0, wall]`; if they are disjoint their sum is at
+// most `wall`, by arithmetic. A slow box moves both numbers and moves no
+// verdict.
+TEST_CASE("ltx2 phase log: the TABLE's own charge is disjoint so it cannot exceed the timeline") {
+  phase::PhaseLog& log = phase::PhaseLog::Instance();
+  log.Reset();
+  log.Begin();
+
+  // The same deterministic blocker the record-arm case uses: a device probe that
+  // sleeps WHILE HOLDING the mutex makes the pile-up happen every run rather
+  // than sometimes, and a detector that fires sometimes is what #1569 is about.
+  std::atomic<bool> blocking(true);
+  log.SetDeviceProbe([&blocking]() -> int64_t {
+    if (blocking.load(std::memory_order_relaxed)) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+    return -1;
+  });
+
+  const int kThreads = 24;
+  const int kRounds = 12;
+  std::atomic<bool> stop_blocker(false);
+  std::thread blocker([&stop_blocker]() {
+    while (!stop_blocker.load(std::memory_order_relaxed)) phase::SampleNow();
+  });
+  std::vector<std::thread> hammers;
+  hammers.reserve(kThreads);
+  for (int t = 0; t < kThreads; ++t) {
+    hammers.emplace_back([kRounds, t]() {
+      for (int i = 0; i < kRounds; ++i) {
+        phase::Tick("unit.table.hammer", static_cast<int64_t>(t), "concurrent");
+      }
+    });
+  }
+  for (std::thread& h : hammers) h.join();
+  stop_blocker.store(true, std::memory_order_relaxed);
+  blocker.join();
+  blocking.store(false, std::memory_order_relaxed);
+  log.SetDeviceProbe(phase::DeviceByteProbe());
+
+  // NOTHING WAS EVER LIVE, so every charge above went to the table.
+  const double charge = log.Instrument();
+  const double wall = log.Elapsed();
+  MESSAGE("table charge " << charge << "s over a timeline of " << wall << "s by " << kThreads
+                          << " threads (ratio " << (charge / wall) << ")");
+  REQUIRE_MESSAGE(phase::ProgressEnabled(),
+                  "VLLM_RENDER_PROGRESS is off in this process, so `phase::Tick` returned "
+                  "without taking the mutex and the threads above contended over nothing");
+  REQUIRE_MESSAGE(charge > 0.0,
+                  "no leaf was ever live and " << kThreads
+                      << " threads ticked, and the table was charged nothing. This case is "
+                         "measuring an instrument that is switched off");
+  CHECK_MESSAGE(charge <= wall + 1e-9,
+                "the table charged itself " << charge << "s inside a timeline of " << wall
+                    << "s. Charges to the table must be disjoint; overlapping ones are counted "
+                       "twice, and every reader who subtracts this number from a residue would "
+                       "subtract more than the residue holds");
+  log.Reset();
+}
+
+// ─── the CONSOLE copy answers the same question as the FILE copy ─────
+//
+// `RenderText` is what a reader watching a terminal gets, and it printed
+// `sum(leaf)`, `unaccounted` and `WALL` while the file alone carried
+// `instrument_seconds` — so the residue was on screen with no way to subtract
+// the cost of naming the phases from it, which is the whole reason that number
+// exists. This case is the only thing holding the two copies together; without
+// it the added line is a production statement nothing reaches.
+//
+// THE TOLERANCE IS THE FORMAT'S OWN RESOLUTION AND NOT A MEASUREMENT.
+// `RenderText` prints every total with `%10.3f`, so the printed value differs
+// from the number it was given by strictly less than half of the last digit --
+// 5e-4 seconds, by the definition of the conversion. Nothing here is timed:
+// both sides read the SAME `Instrument()` through two different code paths, so
+// no box load can move the verdict.
+//
+// ── AND THE QUANTITY HAS TO BE ABOVE THAT RESOLUTION, WHICH IS THE WHOLE CASE
+//
+// The first version of this gate lived inside the conservation case above, on
+// its three-scope timeline, and a fresh review measured it VACUOUS. There
+// `Instrument()` is 2.80e-4 to 2.95e-4 s — SMALLER than the tolerance — so
+// `%10.3f` prints `0.000` for the honest value and the comparison is satisfied
+// by anything in `(-5e-4, +5e-4)`, the literal `0.0` included. Mutation
+// `NTEXTZERO` replaced `Instrument()` with `0.0` in the production line and the
+// whole file stayed GREEN at `5 | 5 passed` and `93 | 93 passed`.
+//
+// That is #1569's own failure reproduced inside #1569's own repair: a
+// discriminator below the instrument's resolution cannot discriminate. The fix
+// is the same one #1569 took — make the quantity an EVENT, and REFUSE to assert
+// when it is not. The table's own share accrues one boundary at a time in the
+// gaps where no leaf is live, so a few thousand sequential scopes put it three
+// orders of magnitude above the format's last digit, and the `REQUIRE` below
+// says so out loud rather than passing quietly on a table too cheap to print.
+TEST_CASE("ltx2 phase log: the CONSOLE copy carries the same instrument charge as the FILE copy") {
+  phase::PhaseLog& log = phase::PhaseLog::Instance();
+  log.Reset();
+  log.Begin();
+  // SEQUENTIAL AND NOT NESTED, because it is the gaps BETWEEN leaves that the
+  // table's own share is made of: `ChargeLocked` reaches `instrument_gap` only
+  // when no leaf is live.
+  const int kScopes = 4000;
+  for (int i = 0; i < kScopes; ++i) {
+    const phase::Scope leaf("unit.console.leaf");
+  }
+
+  // `%10.3f` rounds to the nearest millisecond, so half of the last digit is
+  // the largest error the conversion can introduce. Both numbers below are the
+  // same `double`, so this is the only difference that can exist between them.
+  const double kFormatResolution = 5e-4;
+  const double charge = log.Instrument();
+  REQUIRE_MESSAGE(charge > 20.0 * kFormatResolution,
+                  "the table charged itself " << charge << "s over " << kScopes
+                      << " scopes, which `RenderText`'s `%10.3f` cannot distinguish from zero at "
+                         "its own " << kFormatResolution
+                      << "s resolution. A gate over a quantity below the resolution of the "
+                         "thing it reads is satisfied by a hardcoded zero -- which is exactly "
+                         "how #1569's three-record case stayed green under its own mutation, and "
+                         "how the first version of THIS case did too");
+
   const std::string text = log.RenderText("unit", "cpu");
   const std::string::size_type at = text.find("instrument");
   REQUIRE_MESSAGE(at != std::string::npos,
@@ -289,15 +411,17 @@ TEST_CASE("ltx2 phase log: the instrument's own cost is CONSERVED across the tab
                   "charge, so the console copy of this table cannot separate the residue the "
                   "render produced from the residue this instrument produced. The file copy "
                   "carries it and they have to answer the same question:\n"
-                      << text);
+                      << text.substr(0, 400));
   const double printed = std::strtod(text.c_str() + at + std::string("instrument").size(),
                                      nullptr);
-  CHECK_MESSAGE(std::fabs(printed - log.Instrument()) < 5e-4,
+  MESSAGE("console instrument " << printed << "s against Instrument() " << charge << "s over "
+                                << kScopes << " scopes");
+  CHECK_MESSAGE(std::fabs(printed - charge) < kFormatResolution,
                 "`RenderText` prints " << printed << "s of instrument charge and `Instrument()` "
-                    << "returns " << log.Instrument()
-                    << "s. The console copy is printing some other number, and 5e-4 is this "
-                       "line's own %10.3f resolution rather than a tolerance:\n"
-                    << text);
+                    << "returns " << charge
+                    << "s. The console copy is printing some other number, and "
+                    << kFormatResolution
+                    << " is this line's own %10.3f resolution rather than a tolerance");
   log.Reset();
 }
 
@@ -525,9 +649,13 @@ TEST_CASE("ltx2 phase log: the emitted table DECOMPOSES its residue into the gap
 
   // The leaves the decomposition must lie between, in the emitter's own order.
   std::vector<std::string> leaf_names;
+  std::vector<double> leaf_starts;
+  std::vector<double> leaf_ends;
   for (const nlohmann::json& e : table["phases"]) {
     if (e.value("span", false) || e.value("nested", false)) continue;
     leaf_names.push_back(e["name"].get<std::string>());
+    leaf_starts.push_back(e["start_seconds"].get<double>());
+    leaf_ends.push_back(e["start_seconds"].get<double>() + e["duration_seconds"].get<double>());
   }
   REQUIRE(leaf_names.size() == 2);
 
@@ -575,27 +703,48 @@ TEST_CASE("ltx2 phase log: the emitted table DECOMPOSES its residue into the gap
                             "those endpoints would be sent somewhere else");
     gap_total += seconds;
   }
-  // AND THE GAPS TILE THE TIMELINE, WHICH IS WHERE THE ORDER IS ACTUALLY HELD.
-  // Each gap starts where the previous one ended plus the leaf between them, the
-  // first starts at the origin, and the last ends at `wall`. The identity below
-  // cannot see any of that — it telescopes for any sequence at all.
-  CHECK_MESSAGE(gaps.front()["start_seconds"].get<double>() == 0.0,
-                "the first gap starts at " << gaps.front()["start_seconds"].get<double>()
-                    << "s rather than at the timeline's origin, so whatever ran before it is "
-                       "outside the decomposition entirely");
-  CHECK_MESSAGE(std::fabs(gaps.back()["end_seconds"].get<double>() -
-                          table["wall_seconds"].get<double>()) < 1e-9,
-                "the last gap ends at " << gaps.back()["end_seconds"].get<double>()
-                    << "s and the render's wall is " << table["wall_seconds"].get<double>()
-                    << "s, so the tail of the timeline is outside the decomposition");
-  for (size_t i = 1; i < gaps.size(); ++i) {
+  // AND EACH GAP'S ENDPOINTS ARE THE TWO RECORDS IT LIES BETWEEN, read out of
+  // the SAME table. This is where the order is held, and getting here took two
+  // wrong answers worth recording.
+  //
+  // THE IDENTITY BELOW HOLDS ONE THING AND IT IS NOT THE ORDER. A fresh review
+  // did the algebra: the gap sum telescopes to `wall - sum(durations)` for ANY
+  // record sequence, ordered or not, overlapping or not, and confirmed it by
+  // execution -- reversing the record order left the identity green while two
+  // other assertions fired. What it does hold is that `GapsBetweenLeaves` and
+  // `Sum` select the SAME records: both skip `span` and both skip `nested`.
+  //
+  // AND THE FIRST REPAIR FOR IT WAS TWO TAUTOLOGIES, which a SECOND fresh
+  // review measured. `gaps[i].start >= gaps[i-1].end` reduces, inside this
+  // emitter, to `records[i-1].end >= records[i-1].start` -- a non-negative leaf
+  // duration, which a monotone clock guarantees unconditionally. And
+  // `gaps.front().start == 0.0` is constant-true unless the first gap is
+  // dropped, because `cursor` is initialised to the literal `0.0`. The reviewer
+  // staged `cursor = r.start` instead of `r.end`, so every gap swallows the leaf
+  // before it, and BOTH of those passed; only the pre-existing identity fired.
+  //
+  // Comparing each endpoint against the leaf record it is supposed to touch is
+  // what that mutation cannot survive, and it needs no tolerance beyond double
+  // rounding because both numbers come out of the same emitted file.
+  REQUIRE(gaps.size() == leaf_names.size() + 1);
+  for (size_t i = 0; i < gaps.size(); ++i) {
+    const double from = gaps[i]["start_seconds"].get<double>();
+    const double to = gaps[i]["end_seconds"].get<double>();
+    const double expect_from = i == 0 ? 0.0 : leaf_ends[i - 1];
+    const double expect_to =
+        i == leaf_names.size() ? table["wall_seconds"].get<double>() : leaf_starts[i];
     INFO("gap " << i);
-    CHECK_MESSAGE(gaps[i]["start_seconds"].get<double>() >=
-                      gaps[i - 1]["end_seconds"].get<double>() - 1e-9,
-                  "gap " << i << " starts at " << gaps[i]["start_seconds"].get<double>()
-                         << "s, BEFORE gap " << (i - 1) << " ended at "
-                         << gaps[i - 1]["end_seconds"].get<double>()
-                         << "s. The decomposition is not walking the timeline in order");
+    CHECK_MESSAGE(std::fabs(from - expect_from) < 1e-9,
+                  "gap " << i << " starts at " << from << "s and the record before it ends at "
+                         << expect_from
+                         << "s. A gap that does not begin where the previous leaf ended is "
+                            "either overlapping that leaf or skipping part of the timeline, and "
+                            "the sum can still reconcile while it does");
+    CHECK_MESSAGE(std::fabs(to - expect_to) < 1e-9,
+                  "gap " << i << " ends at " << to << "s and the record after it starts at "
+                         << expect_to
+                         << "s. A reader who looks up the region at those endpoints would be "
+                            "sent somewhere else");
   }
 
   // THE IDENTITY. No tolerance beyond double rounding over a handful of

@@ -200,8 +200,46 @@ less than half of the last digit -- 5e-4 seconds -- **by the definition of the
 conversion**. The case reads that line back and compares it with `Instrument()`
 through the public entry point. Nothing in it is timed, both sides read the same
 number through two different code paths, and no box load can move the verdict.
-Without it the added line is a production statement nothing reaches; `NTEXT`
-deletes it and the case reds.
+
+**AND THE QUANTITY HAS TO BE ABOVE THAT RESOLUTION, WHICH A SECOND FRESH REVIEW
+MEASURED THAT IT WAS NOT.** The first version of this gate lived inside the
+conservation case, on its three-scope timeline, where `Instrument()` is
+**2.80e-4 to 2.95e-4 s -- SMALLER than the tolerance**. `%10.3f` therefore
+prints `0.000` for the honest value and the comparison is satisfied by anything
+in `(-5e-4, +5e-4)`, the literal `0.0` included. The reviewer replaced
+`Instrument()` with `0.0` in the production line and the whole file stayed GREEN
+at `5 | 5 passed` and `93 | 93 passed`.
+
+That is #1569's own failure reproduced inside #1569's own repair: a
+discriminator below the instrument's resolution cannot discriminate. The repair
+is the one #1569 itself took -- make the quantity an EVENT and REFUSE to assert
+when it is not. The gate now has its own case with 4000 sequential scopes, where
+the table's own share measures **0.40 to 0.44 s, about 800x the format's last
+digit**, and a `REQUIRE` above it says so out loud rather than passing quietly
+on a table too cheap to print. `NTEXTZERO` reds there; so does `NTEXT`, which
+deletes the line.
+
+### 8. The table's own charge is disjoint too, and that is a SECOND arm
+
+`ChargeLocked` has two targets and the clamp landed on both, but the second
+review found only the RECORD arm was gated: removing the TABLE arm's high-water
+mark left the whole file green, because every other case charges the table from
+ONE thread, where the intervals are already disjoint.
+
+The shape that breaks it is the hammer with NOTHING LIVE. `Tick` reads its clock
+before taking the process-wide mutex, so N threads blocked on the same
+acquisition each charge their own full wait, and with no leaf open they all land
+on `instrument_gap`. The bound is the timeline itself and it is arithmetic:
+`Instrument()` is a sum of intervals inside `[0, wall]`, so if they are disjoint
+their sum is at most `wall`. Measured 0.993 honest, and `NTABLECLAMP` reds it.
+
+**That mutation's FIRST run is worth recording, because it is the trap this
+project keeps hitting from a new direction.** The new case's name contained a
+COMMA -- `... is disjoint, so it cannot exceed the timeline` -- and doctest's
+`-tc` filter SPLITS ON COMMAS, so the filter matched nothing and the run printed
+`test cases: 0 | 0 passed | 0 failed | 7 skipped` and `Status: SUCCESS!` at
+`rc=0`. Only the harness printing the case count separated that from a mutation
+the suite genuinely does not catch. The comma is gone from the name.
 
 `serialize > 1e-5` guards the comparison from the other side. A table too cheap
 to serialise cannot separate the two orderings at all, which is precisely why
@@ -444,20 +482,46 @@ suite can see. Every entry below is from that re-run.
 | M5 | a SPAN absorbs the charge, so the residue's explanation vanishes into a number `Sum` skips | RED on the span assertion |
 | M6 | the per-record charge is not emitted | RED at `REQUIRE(e.contains("instrument_seconds"))` |
 | NEND | every gap's `start_seconds` and `end_seconds` zeroed, `seconds` untouched | RED on 4 -- and GREEN before this row's repair, which is why the endpoints are now read |
+| NCURSOR | each gap starts at the PREVIOUS LEAF'S START, so every gap swallows the leaf before it | RED -- and GREEN against the first repair for it, see `### 9` |
 | NREVSORT | `ByStart` orders the table by DESCENDING start | RED at `CHECK(seconds >= 0.0)` on -16.996 ms |
 | NTEXT | `RenderText` stops printing the instrument charge, so the console and the file copies answer different questions | RED at `REQUIRE(at != std::string::npos)` |
+| NTEXTZERO | `RenderText` prints a hardcoded `0.0` instead of `Instrument()` | RED -- and **GREEN against the first version of that gate**, see `### 7` |
+| NTABLECLAMP | the TABLE arm's high-water mark is removed | RED -- and **GREEN before `### 8`'s case existed**; its own first run printed `0 cases ran` and `SUCCESS!` |
+| NSEED | the per-record mark is seeded with `0.0` instead of the record's own `start` | **GREEN** -- [#1718](https://github.com/mudler/vllm.cpp/issues/1718) |
 | R1 | the production emitter stops writing `gaps` -- run against the RENDER case | RED at `REQUIRE(table.contains("gaps"))` |
 | R2 | `ChargeLocked` charges nothing anywhere -- run against the RENDER case | RED at `REQUIRE(instrument > 0.0)` |
 | N4 | `ChargeLocked`'s negative-`from` refusal becomes a clamp | **GREEN** -- [#1718](https://github.com/mudler/vllm.cpp/issues/1718) |
 | N6 | `Open`'s pre-lock wait is computed and charged to nothing | **GREEN** -- [#1718](https://github.com/mudler/vllm.cpp/issues/1718) |
 | NNOSORT | `ByStart` stable-sorts an empty range, i.e. does not sort at all | **GREEN** -- [#1718](https://github.com/mudler/vllm.cpp/issues/1718) |
 
-THE THREE GREENS ARE THE POINT OF PRINTING THEM. A mutation table that lists
+### 9. Two of the first four gap assertions were TAUTOLOGIES
+
+The first answer to the endpoints finding added four assertions and a second
+fresh review measured that two of them have no power. Inside this emitter
+`gaps[i].start == records[i-1].end` and `gaps[i-1].end == records[i-1].start`,
+so `gaps[i].start >= gaps[i-1].end` reduces to `records[i-1].end >=
+records[i-1].start` -- a non-negative leaf duration, which a monotone clock
+guarantees unconditionally. And `gaps.front().start == 0.0` is constant-true
+unless the first gap is dropped, because `cursor` is initialised to the literal
+`0.0`. The reviewer staged `cursor = r.start` instead of `r.end`, so every gap
+swallows the leaf before it, and BOTH passed; only the pre-existing identity
+fired.
+
+Both are replaced by one comparison that has power: each gap's endpoints are
+checked against **the leaf records it lies between, read out of the same emitted
+table**. `NCURSOR` cannot survive that, and it needs no tolerance beyond double
+rounding because both numbers come out of the same file.
+
+THE FOUR GREENS ARE THE POINT OF PRINTING THEM. A mutation table that lists
 only its successes is an argument and not a measurement, and these three are
 what [#1718](https://github.com/mudler/vllm.cpp/issues/1718) is. `NREVSORT`
 beside `NNOSORT` says exactly how much of `ByStart` is held: an inversion is
 caught and a removal is not, because every timeline this suite builds is already
-start-ordered.
+start-ordered. `NSEED` is the fourth, found by the second review: the per-record
+mark's SEED -- the half that stops a charge reaching back before the record
+began -- is held by nothing, because staging it needs a `Tick` whose clock read
+predates a record and whose lock acquisition follows it, which this row could
+not make deterministic.
 
 N6's FIRST STAGING DID NOT COMPILE, and that is worth a line because it is the
 trap this project keeps walking into. Written as `if (false) { ... }` it left
