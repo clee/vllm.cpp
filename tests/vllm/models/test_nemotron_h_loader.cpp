@@ -145,6 +145,32 @@ void NoteRan(const std::string& case_name) {
   Verdicts()[case_name] = "RAN";
 }
 
+// #926: the provenance contract's notion of "prose", matching
+// `_is_prose`/`len(value.strip())` in scripts/nemotron-h-oracle-capture.py
+// EXACTLY.
+//
+// This exists because the two copies disagreed on whitespace. Python has always
+// spelled these `value.strip()`; this file spelled them `.empty()` and `.size()`
+// on the raw string. So a golden carrying 200 SPACES in `unrecoverable_reason`,
+// `evidence.never_reproduced` and `evidence.gate_form` was refused by `--check`
+// with 3 problems and accepted here at 70 assertions, 0 failed, `SUCCESS!`. A
+// blank paragraph is the record going missing exactly as surely as a deleted
+// one, and two copies of one contract disagreeing about what satisfies it is
+// the drift this three-copy design exists to prevent.
+//
+// Scope is deliberate and is NOT "trim everything". Python trims in `_is_prose`
+// and in the argument floor, and it does NOT trim `capture.batch.shape`, which
+// it tests for truthiness. Trimming that one here would repair this divergence
+// by opening the mirror image of it.
+std::string TrimmedProse(const nlohmann::json& node) {
+  if (!node.is_string()) return std::string();
+  const std::string raw = node.get<std::string>();
+  const char* kSpace = " \t\n\r\f\v";
+  const size_t first = raw.find_first_not_of(kSpace);
+  if (first == std::string::npos) return std::string();
+  return raw.substr(first, raw.find_last_not_of(kSpace) - first + 1);
+}
+
 }  // namespace
 
 // ── The golden's PROVENANCE, asserted before any token is compared (#926) ───
@@ -172,6 +198,42 @@ void NoteRan(const std::string& case_name) {
 // It needs no checkpoint and no GPU: the golden is committed, so this runs on
 // every runner. That is deliberate. The provenance defect is a records defect,
 // and a gate for it must not need the hardware whose absence caused it.
+// #926: the whitespace half of the contract, pinned HERE rather than only in
+// the Python suite.
+//
+// The provenance case below reads the one committed golden, so it can only ever
+// exercise the shape that golden happens to have. That made this arm unable to
+// hold its own half: a blank-paragraph golden was refused by `--check` and
+// accepted here. `test_the_floor_is_not_met_by_whitespace` in
+// tests/scripts/test_nemotron_h_oracle_capture.py pins the Python side; this
+// case is its counterpart, so neither copy depends on the other to notice.
+//
+// The values are the reviewer's: 200 spaces, which is over the 80-character
+// floor by every untrimmed measure and is not one word of a record.
+TEST_CASE("NemotronH golden: a blank paragraph is not prose") {
+  CHECK(TrimmedProse(nlohmann::json(std::string(200, ' '))).empty());
+  CHECK(TrimmedProse(nlohmann::json(std::string("\t\n\r\f\v  "))).empty());
+  CHECK(TrimmedProse(nlohmann::json(std::string())).empty());
+
+  // 200 spaces measures 200 raw and 0 trimmed. The floor must read the second.
+  const nlohmann::json blank = std::string(200, ' ');
+  CHECK(blank.get<std::string>().size() == 200);
+  CHECK(TrimmedProse(blank).size() == 0);
+
+  // A non-string is not prose either, matching `_is_prose`'s isinstance check —
+  // this is the `"unrecoverable_reason": 123` divergence, held on both sides.
+  CHECK(TrimmedProse(nlohmann::json(123)).empty());
+  CHECK(TrimmedProse(nlohmann::json()).empty());
+
+  // And the other side of the rule, so the case cannot pass by refusing
+  // everything: real prose survives, and surrounding whitespace is not counted
+  // toward the floor.
+  CHECK(TrimmedProse(nlohmann::json(std::string("  a real reason  "))) ==
+        "a real reason");
+  const std::string padded = "   " + std::string(80, 'x') + "   ";
+  CHECK(TrimmedProse(nlohmann::json(padded)).size() == 80);
+}
+
 TEST_CASE("NemotronH golden: the reference says whether it can be regenerated") {
   const std::string path = std::string(NEMOTRON_H_GOLDENS_DIR) + "/oracle.json";
   std::ifstream in(path);
@@ -219,7 +281,7 @@ TEST_CASE("NemotronH golden: the reference says whether it can be regenerated") 
     // reference, and this run says that out loud.
     REQUIRE(capture.contains("unrecoverable_reason"));
     CHECK(capture["unrecoverable_reason"].is_string());
-    CHECK(!capture["unrecoverable_reason"].get<std::string>().empty());
+    CHECK(!TrimmedProse(capture["unrecoverable_reason"]).empty());
     REQUIRE(capture.contains("issue"));
     const std::string issue = capture["issue"].get<std::string>();
     CHECK(issue.rfind("https://github.com/mudler/vllm.cpp/issues/", 0) == 0);
@@ -260,7 +322,7 @@ TEST_CASE("NemotronH golden: the reference says whether it can be regenerated") 
                     "capture is missing 'captured_utc_is': a commit's author "
                     "date read as a capture time is a fabricated provenance, so "
                     "the file has to say which one this is");
-    CHECK(!capture["captured_utc_is"].get<std::string>().empty());
+    CHECK(!TrimmedProse(capture["captured_utc_is"]).empty());
 
     for (const auto& block : {std::make_pair(std::string("forced_by_checkpoint_or_device"),
                                              kForcedTermKeys),
@@ -277,8 +339,9 @@ TEST_CASE("NemotronH golden: the reference says whether it can be regenerated") 
                         "capture." << block.first << " is missing '" << key
                                    << "', so an argument this golden's "
                                       "admissibility rests on is gone");
-        CHECK_MESSAGE(!capture[block.first][key].get<std::string>().empty(),
-                      "capture." << block.first << "['" << key << "'] is empty");
+        CHECK_MESSAGE(!TrimmedProse(capture[block.first][key]).empty(),
+                      "capture." << block.first << "['" << key
+                                 << "'] is empty or blank");
       }
     }
 
@@ -302,9 +365,9 @@ TEST_CASE("NemotronH golden: the reference says whether it can be regenerated") 
       }
       REQUIRE_MESSAGE(reachable, "capture." << dotted << " is absent");
       REQUIRE_MESSAGE(node->is_string(), "capture." << dotted << " is not prose");
-      CHECK_MESSAGE(node->get<std::string>().size() >= kMinArgumentChars,
+      CHECK_MESSAGE(TrimmedProse(*node).size() >= kMinArgumentChars,
                     "capture." << dotted << " is "
-                               << node->get<std::string>().size()
+                               << TrimmedProse(*node).size()
                                << " characters, under the " << kMinArgumentChars
                                << " an ARGUMENT needs: a one-word answer here is "
                                   "the record going missing while the file keeps "

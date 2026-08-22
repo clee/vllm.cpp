@@ -224,6 +224,10 @@ while `dunno`, `unknown`, `TBD` and `see the spec` are all under it. AGENTS.md's
 rule that a gate firing on ordinary work is the defect is why the floor is taken
 from the *shortest* real field and not from the longest.
 
+Scoping the floor to the four *argument* fields is load-bearing rather than
+tidy: `forced.dtype` and `forced.quantization` are **35 characters each**, so a
+floor applied to every forced term would make the shipped golden red itself.
+
 `captured_utc_is` is required but deliberately **not** floored. Its job is to say
 what the timestamp is, and that can honestly be said in a clause —
 "af8170154's author date, not a run time" is 44 characters and is not a
@@ -419,11 +423,21 @@ pre-mutation baseline
 |---|---|---|
 | `--check` | 0 problems, **rc=0** | **8 problems, rc=1**, naming all four gutted fields |
 | the Python suite | 26/26 OK | **2 failures**, rc=1 |
-| the C++ consumer | 40 assertions, `SUCCESS!` | **38 assertions, 2 failed, `Status: FAILURE!`** |
+| the C++ consumer | `SUCCESS!` | **2 failed, `Status: FAILURE!`** |
 
 The C++ arm is the one that matters for the cross-gate: the guarantee is not
 held by one file. `Status:` is read as well as `assertions:`, because an
 `assertions:` line can say `0 failed` while cases threw.
+
+**The assertion COUNT under this mutation is shape-dependent, so it is not the
+evidence.** A `REQUIRE` aborts its case, so the total depends on which one trips
+first, which depends on the mutation's exact diff shape and on whether the count
+is read for the single case or for the whole binary. This round measured **38**
+for the provenance case alone at diff shape `+5/-13`; the fresh reviewer
+measured **45** at `+4/-12`. Both are correct measurements of different shapes,
+and an evidence table carrying a number that does not reproduce is worse than
+one that omits it. What DOES reproduce, and what the gate rests on, is
+**`2 failed`, `Status: FAILURE!`, rc=1**.
 
 Green again on the restored tree: `--check` 0 problems, the suite **41 cases OK**
 (26 before this round, 13 new substance cases, 2 new cross-gate cases), and the
@@ -480,6 +494,39 @@ one contract disagreeing about what satisfies it, which is exactly the drift
 this three-copy design promises cannot happen. The weaker copy moved to
 `_is_prose`, and `test_a_non_string_reason_is_refused` holds it there. Suite
 41 → 42 cases.
+
+### The copies disagreed a SECOND time, on whitespace
+
+Found by the fresh review, and it is the `123` divergence again with the weaker
+copy on the other side. Python has always spelled these `value.strip()`; the C++
+consumer spelled them `.empty()` and `.size()` on the raw string. So a golden
+carrying **200 spaces** in `unrecoverable_reason`, `evidence.never_reproduced`
+and `evidence.gate_form` read:
+
+| Copy | Before | After |
+|---|---|---|
+| `--check` | **3 problems, rc=1** | 3 problems, rc=1 |
+| the C++ consumer | **70 assertions, 0 failed, `SUCCESS!`, rc=0** | **79 assertions, 6 failed, `Status: FAILURE!`, rc=1** |
+
+A blank paragraph is the record going missing exactly as surely as a deleted
+one. `TrimmedProse()` now matches `_is_prose`/`len(value.strip())` exactly.
+
+**The scope is deliberate and is not "trim everything".** Python trims in
+`_is_prose` and in the argument floor, and it does **not** trim
+`capture.batch.shape`, which it tests for truthiness. Trimming that one in C++
+would have repaired this divergence by opening its mirror image, so it is left
+alone.
+
+**The C++ arm can now hold its half alone.** The provenance case reads the one
+committed golden, so it can only ever exercise the shape that golden happens to
+have — which is why this arm could not notice. `NemotronH golden: a blank
+paragraph is not prose` tests `TrimmedProse` directly and is the counterpart of
+`test_the_floor_is_not_met_by_whitespace` on the Python side. Proven: reverting
+`TrimmedProse` to the untrimmed behaviour reds it **5 of 9 assertions with the
+golden untouched** (`compile_rc=0`, 0 compile errors, `git diff --stat`
+printed), restored by sha256
+`00cd7e05a32fa4be3cc852156633dbdc4b3069bc183bbeb4889183c7613f80cb`. It asserts
+both sides of the rule, so it cannot pass by refusing everything.
 
 ### The driver's third state named a cause it could not know
 
