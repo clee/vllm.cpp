@@ -28,6 +28,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include "support/process_id.h"  // vllm_test::ProcessId, the collision fix below
 #include "vllm/transformers_utils/hf_config.h"
 #include "vt/dtype.h"
 
@@ -105,9 +106,17 @@ inline std::string BuildSt(const std::vector<Fx>& ts) {
 class TempFile {
  public:
   explicit TempFile(const std::string& bytes) {
+    // The counter alone is PER PROCESS, and since this header was extracted TWO
+    // binaries build it, so `ctest -j` runs two processes that both start at 0,
+    // claim the same path, and let one destructor `std::remove` a file the other
+    // still has mmapped. That is a SIGBUS on the next page touch, not a failed
+    // assertion, so it reads as a crash in whichever suite lost the race.
+    // Measured on 770ed57a6: 100 concurrent test_muse_glimmer_wiring +
+    // test_tower_skip pairs produced 2 x rc 135, serial 25/25 clean.
     static int counter = 0;
     path_ = (std::filesystem::temp_directory_path() /
-             ("muse_glimmer_tiny_" + std::to_string(counter++) + ".safetensors"))
+             ("muse_glimmer_tiny_" + std::to_string(vllm_test::ProcessId()) + "_" +
+              std::to_string(counter++) + ".safetensors"))
                 .string();
     std::ofstream out(path_, std::ios::binary);
     out.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
@@ -288,9 +297,12 @@ inline std::string TinyTokenizerJson() {
 class TempModelDir {
  public:
   TempModelDir() {
+    // Per-process, for the reason TempFile above records: `remove_all` on a
+    // directory another process is loading from is the same collision.
     static int counter = 0;
     dir_ = (std::filesystem::temp_directory_path() /
-            ("muse_glimmer_tiny_dir_" + std::to_string(counter++)))
+            ("muse_glimmer_tiny_dir_" + std::to_string(vllm_test::ProcessId()) +
+             "_" + std::to_string(counter++)))
                .string();
     std::filesystem::create_directories(dir_);
     Write("config.json", TinyConfigJson().dump(1));

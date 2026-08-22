@@ -50,6 +50,7 @@
 #include "vllm/model_executor/models/model_registry.h"
 #include "vllm/model_executor/models/muse_glimmer.h"
 #include "vllm/model_executor/models/qwen3_5.h"  // PagedKvCache, ForwardLogits
+#include "vllm/model_executor/models/qwen3_vl.h"  // #607 L3 the SECOND tower loader
 #include "vllm/transformers_utils/hf_config.h"
 #include "vllm/v1/attention/backend.h"
 #include "vt/device.h"
@@ -132,6 +133,85 @@ CommonAttentionMetadata PrefillMeta(int64_t T, int64_t block_size) {
   m.causal = true;
   return m;
 }
+
+// ── The SECOND architecture that owns a tower: Qwen3-VL ─────────────────────
+//
+// The tiny Qwen3-VL checkpoint carries the TEXT BACKBONE ONLY, and that absence
+// is the instrument. `Qwen3VLWeights::vision_cfg` is not read from the config —
+// it is the hard-coded 4B geometry (hidden 1024, depth 24, 2304 position
+// embeddings), which is ~300M parameters, so a checkpoint the vision reader
+// could actually consume is not something a unit test can synthesise. What a
+// unit test CAN do is take away the tensors and watch who asks for them:
+//
+//   * default limits -> `LoadQwen3VLVisionWeights` runs, reaches for
+//     `model.visual.patch_embed.proj.weight`, and throws by that name;
+//   * zero limits    -> nothing reaches for it, and the load returns.
+//
+// A skip that stopped working therefore turns this red by THROWING, which is
+// what the previous cut of this row had no case for: destroying the Qwen3-VL
+// half outright (`(void)mm_config; vision_skipped = false;`) left all twelve
+// declared suites green, because no test anywhere passed a non-null
+// `mm_config` to `LoadQwen3VLWeights` at all.
+namespace qwen3vl_tiny {
+
+constexpr int64_t kVocab = 32, kHidden = 16, kInter = 24, kLayers = 2;
+constexpr int64_t kHeads = 2, kKvHeads = 1, kHeadDim = 8;
+
+using muse_glimmer_tiny::Bf16;
+using muse_glimmer_tiny::Fx;
+
+// The text backbone `LoadTextBackbone` reads (qwen3_vl.cpp:110-135), in the
+// real on-disk `model.language_model.*` spelling, and NOTHING under
+// `model.visual.*`.
+inline std::vector<Fx> TextOnlyTensors() {
+  const std::string P = "model.language_model.";
+  uint32_t seed = 1;
+  std::vector<Fx> ts;
+  ts.push_back(Bf16(P + "embed_tokens.weight", {kVocab, kHidden}, seed++));
+  ts.push_back(Bf16(P + "norm.weight", {kHidden}, seed++));
+  for (int64_t l = 0; l < kLayers; ++l) {
+    const std::string b = P + "layers." + std::to_string(l) + ".";
+    ts.push_back(Bf16(b + "input_layernorm.weight", {kHidden}, seed++));
+    ts.push_back(Bf16(b + "post_attention_layernorm.weight", {kHidden}, seed++));
+    ts.push_back(Bf16(b + "self_attn.q_proj.weight", {kHeads * kHeadDim, kHidden}, seed++));
+    ts.push_back(Bf16(b + "self_attn.k_proj.weight", {kKvHeads * kHeadDim, kHidden}, seed++));
+    ts.push_back(Bf16(b + "self_attn.v_proj.weight", {kKvHeads * kHeadDim, kHidden}, seed++));
+    ts.push_back(Bf16(b + "self_attn.o_proj.weight", {kHidden, kHeads * kHeadDim}, seed++));
+    ts.push_back(Bf16(b + "self_attn.q_norm.weight", {kHeadDim}, seed++));
+    ts.push_back(Bf16(b + "self_attn.k_norm.weight", {kHeadDim}, seed++));
+    ts.push_back(Bf16(b + "mlp.gate_proj.weight", {kInter, kHidden}, seed++));
+    ts.push_back(Bf16(b + "mlp.up_proj.weight", {kInter, kHidden}, seed++));
+    ts.push_back(Bf16(b + "mlp.down_proj.weight", {kHidden, kInter}, seed++));
+  }
+  return ts;
+}
+
+inline HfConfig Config() {
+  HfConfig c;
+  c.architectures = {"Qwen3VLForConditionalGeneration"};
+  c.hidden_size = kHidden;
+  c.intermediate_size = kInter;
+  c.num_hidden_layers = kLayers;
+  c.num_attention_heads = kHeads;
+  c.num_key_value_heads = kKvHeads;
+  c.head_dim = kHeadDim;
+  c.vocab_size = kVocab;
+  c.rms_norm_eps = 1e-6;
+  c.rope_theta = 5e6;
+  return c;
+}
+
+// The first tensor `LoadQwen3VLVisionWeights` reaches for, as its own resolver
+// refuses it (qwen3_vl.cpp, `VT_CHECK(it != where.end(), ...)`). Matched as a
+// SUBSTRING because VT_CHECK wraps it in a `vt: ` prefix and a ` at file:line`
+// suffix, and the line number is not this test's business.
+inline const std::string& FirstVisionTensor() {
+  static const std::string s =
+      "qwen3-vl vision: tensor not found: model.visual.patch_embed.proj.weight";
+  return s;
+}
+
+}  // namespace qwen3vl_tiny
 
 // A pure TEXT prompt: no image and no video placeholder, so it is servable on
 // both arms and its logits are the thing the token-exactness gate compares.
@@ -295,6 +375,94 @@ TEST_CASE("tower skip: the loader reads the tower by default and not at zero lim
     CHECK_FALSE(w.params.vision.present);
     CHECK_FALSE(w.vision.loaded);
     CHECK_FALSE(w.vision_skipped);
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 2b. THE OTHER LOADER — Qwen3-VL, whose skip had no test at all until this
+//     case. See `namespace qwen3vl_tiny` above for why the absence of the
+//     vision tensors is the instrument.
+// ─────────────────────────────────────────────────────────────────────────────
+TEST_CASE("tower skip: the Qwen3-VL loader reads model.visual.* by default and not at zero limits") {
+  const TempFile file(muse_glimmer_tiny::BuildSt(qwen3vl_tiny::TextOnlyTensors()));
+  std::vector<vllm::SafetensorsFile> shards = OpenShards(file);
+  const HfConfig config = qwen3vl_tiny::Config();
+
+  SUBCASE("default: the vision reader RUNS, and says which tensor it wanted") {
+    std::string message;
+    try {
+      (void)vllm::LoadQwen3VLWeights(shards, config);
+      FAIL("the default load must reach for model.visual.*");
+    } catch (const std::exception& e) {
+      message = e.what();
+    }
+    CAPTURE(message);
+    // By NAME, not merely "it threw": a load that died in the text backbone
+    // would also throw, and would prove the opposite of what is claimed here.
+    CHECK(message.find(qwen3vl_tiny::FirstVisionTensor()) != std::string::npos);
+  }
+
+  SUBCASE("--language-model-only: nothing reaches for them, and the text tower loads") {
+    const MultiModalConfig lmo = LanguageModelOnly();
+    const vllm::Qwen3VLWeights w =
+        vllm::LoadQwen3VLWeights(shards, config, &lmo);
+    CHECK(w.vision_skipped);
+    CHECK_FALSE(w.vision_loaded);
+    CHECK(w.vision.blocks.empty());
+    CHECK(w.vision.patch_proj_w.empty());
+    // The LANGUAGE model is untouched — a skip that also dropped a text tensor
+    // would satisfy every assertion above.
+    CHECK(w.text.layers.size() == static_cast<size_t>(qwen3vl_tiny::kLayers));
+    CHECK(w.text.embed_tokens.bytes.size() ==
+          static_cast<size_t>(qwen3vl_tiny::kVocab * qwen3vl_tiny::kHidden) * 2U);
+  }
+
+  SUBCASE("explicit per-modality zeros take the same road") {
+    const MultiModalConfig zeros = ZeroImageAndVideo();
+    const vllm::Qwen3VLWeights w =
+        vllm::LoadQwen3VLWeights(shards, config, &zeros);
+    CHECK(w.vision_skipped);
+  }
+
+  SUBCASE("ALL, not ANY: image:0 alone still reads the tower") {
+    // qwen3_vl.py:1747 marks this tower {"image", "video"}, so a load that can
+    // still serve video must still load it — and here that means throwing.
+    MultiModalConfig image_only;
+    image_only.limit_per_prompt = {{"image", 0}};
+    std::string message;
+    try {
+      (void)vllm::LoadQwen3VLWeights(shards, config, &image_only);
+      FAIL("image:0 alone must NOT skip the {image, video} tower");
+    } catch (const std::exception& e) {
+      message = e.what();
+    }
+    CHECK(message.find(qwen3vl_tiny::FirstVisionTensor()) != std::string::npos);
+  }
+
+  SUBCASE("the tower's GEOMETRY survives the skip") {
+    // construct-without-initialise (utils.py:762): every shape still resolves.
+    const MultiModalConfig lmo = LanguageModelOnly();
+    const vllm::Qwen3VLWeights w =
+        vllm::LoadQwen3VLWeights(shards, config, &lmo);
+    CHECK(w.vision_cfg.depth == 24);
+    CHECK(w.vision_cfg.hidden_size == 1024);
+  }
+
+  SUBCASE("through ModelRegistry::Load, the skip is reported by stage name") {
+    // The seam a production entry point actually uses, and the only thing that
+    // exercises Qwen3VLLoadedModel::skipped_towers (qwen3_vl_registry.cpp:70).
+    vllm::ModelSource source = vllm::ModelSource::FromSafetensors(shards);
+    const MultiModalConfig lmo = LanguageModelOnly();
+    source.multimodal = &lmo;
+    std::unique_ptr<vllm::LoadedModel> skipped = ModelRegistry::Load(config, source);
+    REQUIRE(skipped != nullptr);
+    REQUIRE(skipped->skipped_towers().size() == 1);
+    CHECK(skipped->skipped_towers()[0] == "vision_tower");
+
+    // ... and with the limits absent the same source throws, which is this
+    // checkpoint's way of saying the tensors were wanted.
+    source.multimodal = nullptr;
+    CHECK_THROWS_AS((void)ModelRegistry::Load(config, source), std::exception);
   }
 }
 
