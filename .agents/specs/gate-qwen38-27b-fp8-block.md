@@ -77,8 +77,10 @@ and the artifact is on the share at `/mnt/nas_share/rc/ckpt/qwen38-27b-fp8`,
 which a leased worker reads as `/workspace/ckpt/qwen38-27b-fp8`. The
 HuggingFace repository is confirmed to need no access grant. Read what staging
 discharges and what it does not in
-[`## Owed`](#owed): the checkpoint is STAGED, it is not REACHED, and it is not
-GATED. Those are three different states and this spec keeps them apart.
+[`## Owed`](#owed): the checkpoint is STAGED, the arm is REACHED on those bytes
+-- measured on 2026-08-22 by `rc` job `15e0bfa4-53bc-4f1e-93ad-b9e939e22235` on
+`dgx:gpu0` -- and it is NOT GATED. Those are three different states and this
+spec keeps them apart.
 
 **How the staged bytes were verified, in two independent legs.** The
 HuggingFace API returned **zero LFS oids** for this repository, so there was no
