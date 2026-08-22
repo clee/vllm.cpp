@@ -525,7 +525,7 @@ never a synonym for "probably fine".
 | run-to-run control (`flash` twice) | the same lease | **PENDING** — §10.3; without it no arm-to-arm delta is attributable to the kernel |
 | the comparison tool discriminates | `tests/scripts/test_ltx25_render_compare.py` | **PASS** — 37 tests, `OK`, at `2026-08-22`. It needs no GPU, no lease and no NAS, so `PENDING until §10.7` was misreporting a gate that was already green: a dither passes, a one-pixel shift fails all four V checks, two all-black renders fail C0 while reading as a perfect match on every V, an unreadable input exits 2 while a threshold failure exits 1, A1 and A2 disagree on a time-shifted waveform, and the SSIM is pinned by its taps, its impulse response and three fixture values (§10.4). The count dates the run; it is not a floor to defend |
 | the comparison tool runs on a lane | `scripts/agent-preflight.sh`, `.github/workflows/ci.yml` | **PASS** — it ran on NO lane when it landed: absent from preflight's `SUITES`, from the enumerated python block in CI and from `tests/CMakeLists.txt`, while the row above registered it as a gate. Both are registered now. Preflight SKIPs it when numpy is absent, which is the third state and never an `ok`; the CI lane installs `python3-numpy` so the lane that must not be silent cannot be |
-| the harness's own preconditions | `tests/scripts/test_ltx25_pixel_ab_harness.py` | **PASS** — 19 tests, `OK`, at `2026-08-22`. The memory precondition and the arm-completeness check are extracted verbatim from the harness and run against a fabricated `/proc/meminfo`. The four call sites that only a lease can execute are text tripwires and are labelled as such |
+| the harness's own preconditions | `tests/scripts/test_ltx25_pixel_ab_harness.py` | **PASS** — 27 tests, `OK`, at `2026-08-22`. The memory precondition and the arm-completeness check are extracted verbatim from the harness and run against a fabricated `/proc/meminfo`. The call sites that only a lease can execute are text tripwires and are labelled as such; §10.8 counts them and holds its own count. The count dates the run; it is not a floor to defend, and it said "19 tests" and "four call sites" after both had moved |
 | full preflight | `scripts/agent-preflight.sh` | **PASS at HEAD** — and it was NOT before: `documentation-checkpoint` was red on two of this branch's own commits (see below) |
 | `documentation-checkpoint` | CI, and locally over the branch range | **PASS at HEAD, RED before it, and the red was THIS BRANCH's** — `2aa78c69b` and `2f39a9426` each recorded a measurement in `.agents/benchmark-record.md` without writing `docs/STATUS.md` (and `docs/BENCHMARKS.md` for the second). The control on the main-only range `4c193bd55..5d548d003` is rc 0, so it was not inherited. Both commits were replaced by one that writes all three surfaces together when the branch was rebuilt, and the checker is re-run at each head rather than trusted to have stayed fixed — a job that has stopped appearing in a failing set is not the same fact as a job that passes |
 | `build-newest-gcc` | CI | **PASS, and now green on `main` too** — it was red on `main` on `::getpid` in `test_qwen3_dflash2_gguf.cpp:547`, a file this change does not touch; [#1581](https://github.com/mudler/vllm.cpp/pull/1581) fixed it and this branch carries that fix through the merge. A red here after the merge is therefore this row's, not inherited |
@@ -1063,12 +1063,18 @@ ratio `R` and which of §10.5's readings it selects, the cross-check against the
   against a fabricated `/proc/meminfo`, so those three execute here. **The render
   loop, the routing assertion, the phase [I] call site, the phase [L] exit, the
   phase [F] unit-gate refusal and the signal traps do not.** Five of those six
-  are pinned as TEXT — the suite asserts the exact call site that shipped
-  inverted, the exact `exit` lines, the two unit-gate statuses and the four
-  `trap` lines — and a text assertion is a tripwire, not a proof: it catches the
-  inversion that happened and would not catch a rewrite that reintroduced it in
-  different words. **The render loop is pinned by nothing at all.** `dgx:gpu0`
-  under a lease is the only place those lines run, which is why every one of them
+  surfaces are pinned as TEXT, by seven tripwire tests — the suite asserts the
+  exact call site that shipped inverted, the exact `exit` lines, both arms of
+  phase [L]'s `case` that this row wrote (the exit-3 verdict and the `*)`
+  fallback that a status nobody defined would otherwise fall through silently),
+  the two unit-gate statuses and the four `trap` lines. **Those two counts are
+  about different sets**: six is how many things never execute, seven is how
+  many tests pin the five of them that are pinned at all, because phase [L]
+  carries three tests by itself. They both read "six" for one commit, which
+  looked like two records agreeing. A text assertion is a tripwire, not a proof:
+  it catches the inversion that happened and would not catch a rewrite that
+  reintroduced it in different words. **The render loop is pinned by nothing at
+  all.** `dgx:gpu0` under a lease is the only place those lines run, which is why every one of them
   was wrong at once: they had never executed anywhere a test could watch. **That
   is a structural explanation of a cluster rather than a run of coincidences**,
   and it tells the next reader which claims in this harness are load-bearing and
@@ -1083,8 +1089,13 @@ ratio `R` and which of §10.5's readings it selects, the cross-check against the
   text-pinned. It was still a number in a document that no longer described the
   file beside it, so
   `TheDisclosureCountsWhatIsThere.test_the_wiring_docstring_names_as_many_tripwires_as_it_defines`
-  now holds the count against the class and a sixth tripwire cannot be added
-  silently. It fired on exactly that when the exit-3 tripwire was added.
+  now holds the count against the class and a further tripwire cannot be added
+  silently. It fired on exactly that when the exit-3 tripwire was added, and
+  again when the `*)` tripwire was.
+  `TheDisclosureCountsWhatIsThere.test_the_spec_counts_tripwire_TESTS_and_not_unexecuted_SURFACES`
+  holds the same number against THIS SECTION, which the docstring gate never
+  reached: the review that raised it found the two sixes counting different sets
+  and neither list naming the `case` arm.
 
   **Two mutations of the memory gate are deliberately a TIMEOUT rather than a
   failed assertion, and both are named because one of them was not.** Inverting
@@ -1172,10 +1183,12 @@ ratio `R` and which of §10.5's readings it selects, the cross-check against the
   `scripts/ltx25-dit-attn-flash-pixel-ab.sh`. Six things it does not execute:
   the render loop, the routing assertion, the phase [I] call site, the phase [L]
   exit, the phase [F] unit-gate refusal and the signal traps. Five of the six are
-  pinned as TEXT and nothing executes them, so a rewrite that reintroduced any of
-  those defects in different words would pass; the render loop is pinned by
-  nothing. That is a limit of where the file runs, not a gap that another local
-  test can close. This list said "four" and omitted the unit-gate refusal and
+  pinned as TEXT, by seven tripwire tests — a count of tests, not of surfaces:
+  phase [L] carries three, for its exit wiring, its exit-3 verdict and the `*)`
+  arm that catches a status nobody defined. Nothing executes any of them, so a
+  rewrite that reintroduced any of those defects in different words would pass;
+  the render loop is pinned by nothing. That is a limit of where the file runs,
+  not a gap that another local test can close. This list said "four" and omitted the unit-gate refusal and
   the traps until a fresh review counted them. Owner: this row. Issue:
   [#1612](https://github.com/mudler/vllm.cpp/issues/1612).
 - **`scripts/ltx25-render-compare.py` writes `Infinity` into its JSON.** A

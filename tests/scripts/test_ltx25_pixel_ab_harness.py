@@ -32,6 +32,7 @@ papered over.
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 import tempfile
 import threading
@@ -240,7 +241,15 @@ class ArmCompleteness(unittest.TestCase):
 
 
 class Wiring(unittest.TestCase):
-    """TEXT TRIPWIRES on the six call sites that cannot be executed here.
+    """Seven text tripwires on harness lines that only a lease executes.
+
+    THEY STAND OVER FIVE SURFACES, AND THE TWO NUMBERS ARE NOT THE SAME NUMBER.
+    Phase [L] carries three of the seven by itself -- the exit wiring, the
+    exit-3 arm and the `*)` fallback -- and the phase [I] call site, the routing
+    assertion, the phase [F] unit-gate refusal and the signal traps carry one
+    each. The spec's section 10.8 counts SURFACES that never execute; this class
+    counts TESTS. Both read "six" for one commit, which looked like two records
+    agreeing and was two different sets landing on one number.
 
     Each pins a defect that shipped, in the words that shipped it. None is a
     proof: the lease is the only place these lines run.
@@ -285,12 +294,98 @@ class Wiring(unittest.TestCase):
         self.assertIn("  3) say \"PIXEL VERDICT: CONTROL DEGENERATE", self.text)
         self.assertIn("do not publish a reading from this run", self.text)
 
+    def test_an_unlisted_status_still_gets_a_verdict_line(self) -> None:
+        """THE `*)` ARM ABOVE IS A GUARD AND NOTHING HELD IT. The test directly
+        above cites it -- "phase [L]'s `case` has a `*)` arm that calls an
+        unlisted status UNKNOWN" -- as the whole reason exit 3 needed its own
+        arm, and deleting the `*)` line left this suite green at 22/22. Without
+        it a status the comparison never defined (a `python3` that died on an
+        import, a 137 from the OOM killer) prints no verdict at all: the run
+        ends on DONE and exits on a number nobody named, which is the exact
+        silence phase [L] was added to remove.
+        """
+        marker = 'case "$PIXEL_RC" in'
+        self.assertIn(marker, self.text, "phase [L] no longer branches on the verdict")
+        block = self.text.split(marker, 1)[1].split("esac", 1)[0]
+        arm = re.search(r"^\s*\*\)\s*(say .*)$", block, re.M)
+        self.assertIsNotNone(
+            arm, "phase [L]'s `case` has no `*)` arm, so a status it does not "
+                 "enumerate produces no verdict line at all")
+        self.assertIn("PIXEL VERDICT: UNKNOWN", arm.group(1))
+        self.assertIn("$PIXEL_RC", arm.group(1),
+                      "the fallback must print the status it could not name")
+
     def test_the_heartbeat_is_reaped_on_a_lease_kill(self) -> None:
         """`rc` reclaiming a device sends SIGTERM, and a bash EXIT trap does not
         run for a signal with no handler of its own."""
         self.assertIn("trap cleanup EXIT", self.text)
         for sig, status in (("HUP", 129), ("INT", 130), ("TERM", 143)):
             self.assertIn(f"trap 'cleanup; exit {status}' {sig}", self.text)
+
+
+class ThePhaseICommentDescribesTheToolItCalls(unittest.TestCase):
+    """[I]'s comment is the only place a reader is told what the run's exit
+    status means, and it went stale the moment [L] gained a fourth verdict.
+
+    `12c880a52` added exit 3 -- the treatment passed and the CONTROL rendered no
+    picture -- and it updated the header's EXIT STATUS block and phase [L]'s
+    `case`. Phase [I]'s comment still enumerated "0 pass, 1 a threshold failed,
+    2 an input could not be read", so a reader who trusted it would have read a
+    3 as an undefined status, or worse, quoted `PIXEL_COMPARE_RC` as a pass
+    because it was neither 1 nor 2. These two tests derive the statuses from
+    the `case` that prints them, so the comment cannot fall behind the code
+    again without a red.
+    """
+
+    def setUp(self) -> None:
+        self.text = HARNESS.read_text()
+
+    def _phase_i_comment(self) -> str:
+        marker = 'say "=== [I] the pixel comparison ==="'
+        self.assertIn(marker, self.text, "phase [I] is not in this harness")
+        after = self.text.split(marker, 1)[1]
+        self.assertIn('python3 "$CMP"', after, "phase [I] no longer calls the tool")
+        return after.split('python3 "$CMP"', 1)[0]
+
+    def _verdict_statuses(self) -> list[str]:
+        """The statuses phase [L]'s `case` actually prints a verdict for."""
+        found = sorted(set(re.findall(r'^\s*(\d+)\) say "PIXEL VERDICT:', self.text,
+                                      re.M)), key=int)
+        # Guard the instrument before trusting it: a regex that matched nothing
+        # would make every assertion below vacuously true.
+        self.assertEqual(found, ["0", "1", "2", "3"],
+                         "phase [L] defines a different set of verdict statuses than this "
+                         "gate was written against; update the comment in [I], the header "
+                         "EXIT STATUS block and this line together")
+        return found
+
+    def test_the_phase_i_comment_names_every_status_the_verdict_defines(self) -> None:
+        comment = self._phase_i_comment()
+        for s in self._verdict_statuses():
+            self.assertIn(s, comment,
+                          f"phase [L] prints a verdict for exit {s} and phase [I]'s comment "
+                          f"does not name it. The comment is what a reader trusts when they "
+                          f"quote PIXEL_COMPARE_RC.")
+
+    def test_the_phase_i_comment_refuses_both_non_pass_statuses_by_name(self) -> None:
+        """2 and 3 are the two that are NOT failures and are NOT passes either,
+        which is exactly the pair a reader mis-reads as a pass."""
+        comment = self._phase_i_comment()
+        self.assertIn("never a pass", comment)
+        for s in ("2", "3"):
+            self.assertRegex(comment, rf"(?s)never a pass.{{0,80}}\b{s}\b|\b{s}\b.{{0,80}}never a pass",
+                             f"the comment must say that a {s} is never a pass")
+
+    def test_the_phase_i_comment_names_where_the_comparison_tool_came_from(self) -> None:
+        """`$CMP` is `$SRC/scripts/ltx25-render-compare.py`, and `$SRC` is
+        unpacked in phase [B] from `$W/pixab-src.tar.gz` -- a tarball STAGED ON
+        THE SHARE, not this checkout. A lease whose tarball predates the exit-3
+        repair cannot return a 3 at all: a degenerate control exits 0 there. The
+        comment must send the reader to `source_sha` rather than let them assume
+        the tool is the one beside this comment."""
+        comment = self._phase_i_comment()
+        self.assertIn("pixab-src.tar.gz", comment)
+        self.assertIn("source_sha", comment)
 
 
 class TheDisclosureCountsWhatIsThere(unittest.TestCase):
@@ -309,6 +404,8 @@ class TheDisclosureCountsWhatIsThere(unittest.TestCase):
     WORDS = {"one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6,
              "seven": 7, "eight": 8, "nine": 9, "ten": 10}
 
+    SPEC = ROOT / ".agents/specs/ltx25-dit-attn-flash.md"
+
     def test_the_wiring_docstring_names_as_many_tripwires_as_it_defines(self) -> None:
         doc = Wiring.__doc__ or ""
         found = [w for w in self.WORDS if w in doc.split("\n")[0].lower()]
@@ -321,6 +418,37 @@ class TheDisclosureCountsWhatIsThere(unittest.TestCase):
                          f"Wiring's docstring claims {claimed} tripwires and the class "
                          f"defines {defined}. Adding a tripwire without saying so leaves "
                          f"a count in a document that no longer describes the file.")
+
+    def test_the_spec_counts_tripwire_TESTS_and_not_unexecuted_SURFACES(self) -> None:
+        """TWO SIXES THAT COUNT DIFFERENT SETS ARE NOT A CROSS-CHECK. Section
+        10.8 and `## Owed` count the harness lines that do NOT execute -- six of
+        them, five text-pinned, one pinned by nothing -- while `Wiring` counts
+        the TESTS that pin them. Both read "six" and the coincidence was read as
+        agreement, so the tripwire the two lists were missing (phase [L]'s
+        `case` arm for exit 3) was invisible in both. The spec now states the
+        test count in its own words, and this gate holds that number against the
+        class the way the docstring gate above holds the docstring's.
+        """
+        text = self.SPEC.read_text()
+        found = re.findall(r"([A-Za-z]+) tripwire tests", text)
+        self.assertGreaterEqual(
+            len(found), 2,
+            "section 10.8 and `## Owed` must each state how many tripwire TESTS "
+            f"stand over the surfaces they list, in the form '<word> tripwire "
+            f"tests', so the two counts cannot be mistaken for one; found {found}")
+        words = {w.lower() for w in found}
+        self.assertEqual(len(words), 1,
+                         f"the spec states more than one tripwire-test count: {sorted(words)}")
+        word = words.pop()
+        self.assertIn(word, self.WORDS, f"{word!r} is not a count this gate can read")
+        defined = len([m for m in dir(Wiring) if m.startswith("test_")])
+        self.assertEqual(self.WORDS[word], defined,
+                         f"the spec claims {self.WORDS[word]} tripwire tests and Wiring "
+                         f"defines {defined}. A count in a document must describe the "
+                         f"file beside it.")
+        self.assertIn("`case` arm", text,
+                      "the tripwire the two lists omitted is phase [L]'s `case` arm; the "
+                      "spec must name it, not leave it inside a total")
 
 
 if __name__ == "__main__":

@@ -629,10 +629,20 @@ else:
 PY
 
 say "=== [I] the pixel comparison ==="
-# The tool is the one committed in this same source tree, run from the tree, so
-# the thresholds it applies are the ones the spec derives and not a copy that
-# drifted. Its exit status is the gate: 0 pass, 1 a threshold failed, 2 an input
-# could not be read. A 2 is never a pass.
+# The tool is `$SRC/scripts/ltx25-render-compare.py`, so the thresholds it
+# applies travel with the sources the binary was built from rather than being a
+# copy that drifted from them. WHICH SOURCES THOSE ARE IS A FACT ABOUT THE RUN,
+# not about this checkout: phase [B] unpacks `$W/pixab-src.tar.gz`, a tarball
+# staged on the share, and records what it was in `source_sha`. Read that line
+# before quoting a run's PIXEL_COMPARE_RC -- a tarball staged before exit 3
+# existed carries a tool that cannot return one, and a degenerate control is a
+# plain 0 there.
+#
+# Its exit status is the gate, and phase [L] below turns it into this job's:
+# 0 every threshold held, 1 a threshold failed, 2 an input could not be read and
+# nothing was compared, 3 the thresholds held and the control failed its own
+# content checks. A 2 is never a pass, and a 3 is never a pass either: it is a
+# result that exists and that nobody may READ.
 #
 # ARM A IS FLASH, and that is not cosmetic. The control is a repeat of FLASH, and
 # the tool compares the control against the arm named by --control-of. This call
