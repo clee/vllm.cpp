@@ -3,15 +3,28 @@
 //
 // WHY THEY ARE IN A HEADER RATHER THAN IN THE KERNEL'S ANONYMOUS NAMESPACE.
 // `Conv1dTimeBlock` decides how many units of work the kernel hands the pool,
-// and the whole bit-identity argument for the (time block, output row)
-// decomposition rests on ONE property of its answer: it is a multiple of
-// `kConv1dPosTile`, so every block boundary is also a position-tile boundary
-// and each tile spans exactly the positions it spanned before the
-// decomposition existed. A gate that cannot evaluate the function cannot assert
-// that property, and cannot assert that its own shapes produce more than one
-// block either -- which is the difference between a case that crosses a
-// boundary and a case that silently does not.
-// `tests/vt/test_ops_conv1d_general.cpp` includes this header for exactly that.
+// and a gate that cannot evaluate the function cannot assert either of the two
+// properties of its answer that the row rests on -- the tile alignment below,
+// and that the shipped shapes produce more than ONE block, which is the
+// difference between a case that crosses a boundary and a case that silently
+// does not. `tests/vt/test_ops_conv1d_general.cpp` includes this header for
+// exactly that.
+//
+// AND THE ALIGNMENT IS A PERFORMANCE INVARIANT, NOT THE BIT-IDENTITY ARGUMENT.
+// An earlier revision of this comment said the bit-identity of the (time block,
+// output row) decomposition rested on the multiple-of-`kConv1dPosTile` property.
+// IT DOES NOT, and the review of #1678 proved that by mutation: misaligning the
+// block leaves every arithmetic assertion in `test_ops_conv1d_general` green --
+// 19 615 assertions, including both engineered cancellation cases -- and reds
+// only the two property `CHECK`s that read the function's answer directly. The
+// reason is in the kernel: a cell's reduction is `seed`, then `ic` ascending,
+// then `k` ascending, and that sequence does not mention `t0`, so re-cutting the
+// tiles cannot move a bit. What the alignment buys is that a tile which takes
+// the `span == kConv1dPosTile` constant-trip-count path today still takes it
+// after the change -- .agents/specs/minimax-music3.md §18.4 prices that path at
+// up to 5x, so a block length that silently re-cut the tiles would report a
+// SPEED result about a different kernel. The property gate stays, for that
+// reason rather than for the one this comment used to give.
 #pragma once
 
 #include <cstdint>

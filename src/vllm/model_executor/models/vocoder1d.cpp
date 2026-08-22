@@ -278,15 +278,25 @@ void SnakeActivation(std::vector<float>& x, int64_t channels, int64_t length,
                               bool logscale) {
   // THE LARGEST TERM IN THE MiniMax-Music3 DECODE WINDOW, and it had no
   // parallel decomposition at all (#1664). Measured with the production
-  // instrument rather than reasoned about: with `vocoder.decode_window` split
-  // into leaves, `vocoder.snake` is 70.70 % of the window against
-  // `vocoder.conv1d`'s 20.00 % and `vocoder.conv_transpose`'s 8.17 %, while
-  // `vt::Conv1d` itself scales 12.44x of 14 threads. So the window's 2.81x was
-  // never the convolution's decomposition — it was Amdahl's law over an
-  // activation function that ran on ONE core, and
+  // instrument rather than reasoned about, and EVERY SHARE BELOW CARRIES ITS
+  // HOST AND ITS WINDOW LENGTH, because the row took the split on two boxes and
+  // the two readings are different measurements rather than a contradiction.
+  //
+  //   * AUTHORING HOST, x86-64 20 cores at `uptime` load 18.5, 20 latents:
+  //     `vocoder.snake` 70.70 %, `vocoder.conv1d` 20.00 %,
+  //     `vocoder.conv_transpose` 8.17 %, `vocoder.pad` 0.89 %,
+  //     `vocoder.copy` 0.10 % (spec §2a).
+  //   * `thor:gpu0` UNDER A LEASE, 14 threads, 86 latents — the box every ratio
+  //     the row quotes comes from: `vocoder.snake` 79.35 %,
+  //     `vocoder.conv1d` 15.37 %, `vocoder.conv_transpose` 3.77 %,
+  //     `vocoder.pad` 0.59 %, `vocoder.copy` 0.34 % (spec §2b).
+  //
+  // On the same lease `vt::Conv1d` itself scales 12.44x of 14 threads. So the
+  // window's 2.81x was never the convolution's decomposition — it was Amdahl's
+  // law over an activation function that ran on ONE core, and
   // `.agents/specs/minimax-music3.md` §18.8b's shared-bandwidth candidate is
   // refuted rather than refined. `.agents/specs/vt-conv1d-time-block.md` §2
-  // carries the table.
+  // carries both tables.
   //
   // WHY THE PARTITION IS FREE OF EVERY QUESTION THE CONVOLUTIONS HAVE TO
   // ANSWER. This is a MAP: output element (c, t) is a function of input element

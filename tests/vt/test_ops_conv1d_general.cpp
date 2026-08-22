@@ -64,6 +64,12 @@
 #include "vt/backend.h"
 #include "vt/cpu/cpu_conv1d_block.h"  // Conv1dTimeBlock, kConv1dPosTile
 #include "vt/ops.h"
+// The shipped-geometry case below READS the vocoder's configuration rather than
+// transcribing it. `MiniMaxMusic3VocoderConfig` carries the channel counts and
+// the upsampling ratios; `kVocoderResidualDilations` / `kVocoderResidualUnits`
+// carry the residual stack. Both are header-only, so this adds no link edge.
+#include "vllm/model_executor/models/minimax_music3_acoustic.h"
+#include "vllm/model_executor/models/minimax_music3_loader.h"
 
 using vt::Conv1dArgs;
 using vt::ConvTranspose1dArgs;
@@ -827,6 +833,76 @@ TEST_CASE("Conv1dTimeBlock keeps every block boundary on a position-tile boundar
   CHECK(multi_block > 0);
 }
 
+namespace {
+
+// One `vt::Conv1d` call the MiniMax-Music3 vocoder makes at a given window.
+struct VocoderConvShape {
+  std::string name;
+  int64_t in_ch;
+  int64_t out_ch;
+  int64_t kernel;
+  int64_t dilation;
+  int64_t in_len;   // AFTER the pad the caller applies
+  int64_t length;   // produced positions
+};
+
+// Every `vt::Conv1d` the vocoder runs for one stream at a `latents`-frame
+// window, DERIVED FROM THE CONFIGURATION rather than transcribed.
+//
+// WHY IT IS DERIVED. The previous revision of this gate carried the six channel
+// counts and lengths as literals copied by hand out of
+// `minimax_music3_loader.h`. A hand-copied constant cannot notice that its
+// source moved: a checkpoint whose `decoder_hidden_dim` or `upsampling_ratios`
+// differ would leave this case green while the production shapes collapsed back
+// to one block, which is precisely the drift the case exists to catch. So the
+// walk below reads `MiniMaxMusic3VocoderConfig` and the residual-stack
+// constants and reproduces the recurrence in `minimax_music3_acoustic.cpp`
+// `VocoderDecode` / `VocoderBlock` / `VocoderResidualUnit`.
+//
+// WHAT IS STILL MIRRORED, stated rather than glossed: the SHAPE OF THE CHAIN --
+// which convolutions exist, their kernel sizes (7 / 1 / 7) and the pads their
+// callers apply -- is written twice, here and in `VocoderDecode`. The config is
+// no longer. The residual cross-check is that `VocoderDecode` itself refuses at
+// run time unless the chain produces `latents * hop_length()` samples
+// (minimax_music3_acoustic.cpp:857-861), and the walk below reproduces that same
+// invariant from the ratios, so a change to the upsampling arithmetic on either
+// side stops agreeing with the other.
+std::vector<VocoderConvShape> Music3VocoderConvShapes(
+    const vllm::MiniMaxMusic3VocoderConfig& config, int64_t latents) {
+  using vllm::models::music3::kVocoderResidualDilations;
+  using vllm::models::music3::kVocoderResidualUnits;
+  std::vector<VocoderConvShape> shapes;
+  const int64_t hidden = config.decoder_hidden_dim;
+  int64_t current = latents;
+  // `dec_in_proj`, a 1x1 over one of the two streams (:110-115).
+  shapes.push_back({"dec_in_proj", config.stream_channels(), config.decoder_input_dim, 1, 1,
+                    current, current});
+  // `conv_in`: nn.Conv1d(kernel_size=7, padding=3) (:89), so the caller pads 3/3.
+  shapes.push_back({"conv_in", config.decoder_input_dim, hidden, 7, 1, current + 6, current});
+  for (size_t index = 0; index < config.upsampling_ratios.size(); ++index) {
+    const int64_t stride = config.upsampling_ratios[index];
+    const int64_t output_dim = hidden >> (index + 1);
+    // ConvTranspose1d(kernel=2*stride, padding=ceil(stride/2)) (:57).
+    const int64_t padding = (stride + 1) / 2;
+    current = (current - 1) * stride - 2 * padding + 2 * stride;
+    for (int64_t unit = 0; unit < kVocoderResidualUnits; ++unit) {
+      const int64_t dilation = kVocoderResidualDilations[unit];
+      // `pad = (7 - 1) * dilation // 2`, symmetric (:39).
+      const int64_t pad = (7 - 1) * dilation / 2;
+      const std::string tag = "b" + std::to_string(index) + "_u" + std::to_string(unit);
+      shapes.push_back({tag + "_conv1 k7 d" + std::to_string(dilation), output_dim, output_dim, 7,
+                        dilation, current + 2 * pad, current});
+      shapes.push_back({tag + "_conv2 k1", output_dim, output_dim, 1, 1, current, current});
+    }
+  }
+  const int64_t last_output = hidden >> config.upsampling_ratios.size();
+  // `conv_out`: kernel 7, padding 3, ONE output channel.
+  shapes.push_back({"conv_out", last_output, 1, 7, 1, current + 6, current});
+  return shapes;
+}
+
+}  // namespace
+
 TEST_CASE("the shipped vocoder geometries are MULTI-BLOCK, so the decomposition is reached") {
   // REACHABILITY, as a gate rather than as a paragraph. A scheduling change is
   // invisible to every arithmetic assertion in this file BY DESIGN — the cases
@@ -836,73 +912,88 @@ TEST_CASE("the shipped vocoder geometries are MULTI-BLOCK, so the decomposition 
   // geometry change collapses them back to one block, the decomposition becomes
   // dead code that no test can otherwise notice.
   //
-  // The geometries are MiniMax-Music3's, read off `MiniMaxMusic3VocoderConfig`
-  // (decoder_input_dim 1024, decoder_hidden_dim 1536, upsampling ratios
-  // 8/8/4/2 — minimax_music3_loader.h:253-265) at a 344-latent window, which is
-  // the length spec §18.8a's sweep tops out at. LTX-2.5, IndexTTS-2.5 and
-  // MiniMax-H3 reach the same op and are not enumerated here: this case asserts
-  // that the path is entered, not that every consumer enters it.
-  struct Shape {
-    const char* name;
-    int64_t in_ch;
-    int64_t out_ch;
-    int64_t kernel;
-    int64_t dilation;
-    int64_t length;
-  };
-  // The five shapes the WEIGHTS-SMALLER rule takes. The three it declines are
-  // the negative case below, and they are not an omission: blocking measured
-  // 0.82x and 0.89x on the two b0 shapes on `thor:gpu0` (spec §2b), so a gate
-  // that asserted `blocks > 1` on all eight would be pinning a regression.
-  const Shape shapes[] = {
-      {"b1_res_conv1", 384, 384, 7, 9, 22016},  {"b2_res_conv1", 192, 192, 7, 9, 88064},
-      {"b3_res_conv1", 96, 96, 7, 9, 176128},   {"b3_res_conv2", 96, 96, 1, 1, 176128},
-      {"conv_out", 96, 1, 7, 1, 176128},        {"b0_res_conv2", 768, 768, 1, 1, 2752},
-  };
-  for (const Shape& sh : shapes) {
-    const int64_t in_len = sh.length + (sh.kernel - 1) * sh.dilation;
+  // The geometries come from `MiniMaxMusic3VocoderConfig`'s own defaults, read
+  // rather than copied (`Music3VocoderConvShapes` above). LTX-2.5, IndexTTS-2.5
+  // and MiniMax-H3 reach the same op and are not enumerated here: this case
+  // asserts that the path is entered, not that every consumer enters it.
+  //
+  // WHAT NO SUITE HERE COVERS, named because §6c of the spec had to be
+  // corrected for saying otherwise: this case evaluates the FUNCTION, and the
+  // arithmetic gate on a shape that actually crosses a block boundary lives at
+  // `tests/vllm/models/test_vocoder1d.cpp` — through
+  // `vllm::vocoder1d::Conv1d`, the body all four audio consumers call.
+  const vllm::MiniMaxMusic3VocoderConfig config;
+  // 344 latent frames: the length .agents/specs/minimax-music3.md §18.8a's
+  // sweep tops out at.
+  const std::vector<VocoderConvShape> shapes = Music3VocoderConvShapes(config, 344);
+  REQUIRE(shapes.size() > 8U);
+
+  // The chain's own length invariant, reproduced from the ratios. This is what
+  // makes the derived walk answerable to `VocoderDecode`, which refuses at run
+  // time unless it produces exactly this many samples.
+  int64_t hop = 1;
+  for (const int64_t ratio : config.upsampling_ratios) hop *= ratio;
+  CHECK(shapes.back().length == 344 * hop);
+
+  int64_t taken = 0;
+  int64_t declined = 0;
+  bool saw_conv_out = false;
+  for (const VocoderConvShape& sh : shapes) {
     const int64_t block = vt::cpu::Conv1dTimeBlock(sh.in_ch, sh.out_ch, sh.kernel, 1, sh.dilation,
-                                                  in_len, sh.length);
+                                                   sh.in_len, sh.length);
     const int64_t blocks = (sh.length + block - 1) / block;
-    INFO(sh.name << ": in_ch=" << sh.in_ch << " length=" << sh.length << " block=" << block
-                 << " blocks=" << blocks);
-    CHECK(blocks > 1);
-    CHECK(block % vt::cpu::kConv1dPosTile == 0);
-    // The slice one unit of work touches stays inside the budget the constant
-    // names. A block that overran it would be the residency argument's own
-    // premise failing silently.
-    const int64_t slice = sh.in_ch * ((block - 1) + (sh.kernel - 1) * sh.dilation + 1) * 4;
-    CHECK(slice <= vt::cpu::kConv1dSliceBytes);
+    INFO(sh.name << ": in_ch=" << sh.in_ch << " out_ch=" << sh.out_ch << " length=" << sh.length
+                 << " in_len=" << sh.in_len << " block=" << block << " blocks=" << blocks);
+    if (sh.out_ch * sh.kernel <= sh.in_len) {
+      // TAKEN by the weights-smaller rule: it must actually block, land on a
+      // position-tile boundary, and stay inside the budget the constant names.
+      // A block that overran it would be the residency argument's own premise
+      // failing silently.
+      ++taken;
+      CHECK(blocks > 1);
+      CHECK(block % vt::cpu::kConv1dPosTile == 0);
+      const int64_t slice = sh.in_ch * ((block - 1) + (sh.kernel - 1) * sh.dilation + 1) * 4;
+      CHECK(slice <= vt::cpu::kConv1dSliceBytes);
+      if (sh.out_ch == 1) saw_conv_out = true;
+    } else {
+      // DECLINED, and this half carries as much of the rule as the other. Where
+      // the weight tensor is the larger of the two, blocking re-reads it once
+      // per block and MEASURED SLOWER on `thor:gpu0` — 0.82x and 0.89x on the
+      // two b0 shapes (spec §2b) — so the rule must decline these, and a gate
+      // that only asserted `blocks > 1` somewhere would not notice if it
+      // stopped.
+      ++declined;
+      CHECK(block == sh.length);  // one block: the pre-decomposition loop
+    }
   }
+  INFO("taken=" << taken << " declined=" << declined);
+  CHECK(taken > 0);
+  CHECK(declined > 0);
   // `conv_out` is the shape the row-only partition could not reach at all: ONE
   // output row means `rows == 1`, and `ForOutputRows` runs a single row inline
-  // on the caller at every thread count. It is 10.49x on `thor:gpu0`.
-  CHECK(vt::cpu::Conv1dTimeBlock(96, 1, 7, 1, 1, 176134, 176128) < 176128);
+  // on the caller at every thread count. It is 15.3x on `thor:gpu0`.
+  CHECK(saw_conv_out);
 
-  // THE NEGATIVE CASE, and it carries as much of the rule as the positive one.
-  // Where the weight tensor is the larger of the two, blocking re-reads it once
-  // per block and MEASURED SLOWER; the rule must decline these, and a gate that
-  // only asserted `blocks > 1` somewhere would not notice if it stopped.
-  const Shape declined[] = {
-      {"conv_in", 1024, 1536, 7, 1, 344},
-      {"dec_in_proj", 64, 1024, 1, 1, 344},
-      {"b0_res_conv1", 768, 768, 7, 9, 2752},
-      // AND THE RULE FLIPS WITH THE WINDOW, which is the point of stating it as
-      // a comparison rather than as a list. `b0_res_conv2` is DECLINED at a
-      // 20-latent window, where 768 weights face a 688-position activation and
-      // blocking measured 0.89x, and TAKEN at 344 latents above, where the same
-      // weights face 2 752 positions. A rule written as a list of shape names
-      // could not do that.
-      {"b0_res_conv2 at a 20-latent window", 768, 768, 1, 1, 688},
-  };
-  for (const Shape& sh : declined) {
-    const int64_t in_len = sh.length + (sh.kernel - 1) * sh.dilation;
+  // AND THE RULE FLIPS WITH THE WINDOW, which is the point of stating it as a
+  // comparison rather than as a list. At a 20-latent window the same chain
+  // declines strictly more shapes than at 344 — `b0_res_conv2` is the one that
+  // moves, where 768 weights face a 160-position activation instead of a
+  // 2 752-position one. A rule written as a list of shape names could not do
+  // that, and neither could a gate that only ever evaluated one window.
+  int64_t declined_short = 0;
+  for (const VocoderConvShape& sh : Music3VocoderConvShapes(config, 20)) {
     const int64_t block = vt::cpu::Conv1dTimeBlock(sh.in_ch, sh.out_ch, sh.kernel, 1, sh.dilation,
-                                                  in_len, sh.length);
-    INFO(sh.name << ": weights " << sh.out_ch * sh.kernel << " against in_len " << in_len
-                 << ", block=" << block);
-    CHECK(block == sh.length);  // one block: the pre-decomposition loop
+                                                   sh.in_len, sh.length);
+    INFO(sh.name << " at 20 latents: block=" << block << " length=" << sh.length);
+    if (sh.out_ch * sh.kernel <= sh.in_len) {
+      CHECK(block % vt::cpu::kConv1dPosTile == 0);
+    } else {
+      ++declined_short;
+      CHECK(block == sh.length);
+    }
   }
+  INFO("declined at 20 latents=" << declined_short << ", at 344=" << declined);
+  CHECK(declined_short > declined);
 }
 
 TEST_CASE("vt::Conv1d holds its sweep ORDER under cancellation ACROSS TIME BLOCKS") {

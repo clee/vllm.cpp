@@ -13,6 +13,17 @@ the row was written to test; §2b prices the two changes and §2c is the paired
 re-take that settles the second one. The gates and the mutation evidence are
 §6, what the row declines to close is §7, and §9 records the outcome.
 
+**The fresh review returned `FAIL` on the RECORDS and found the code correct.**
+It attacked bit-identity from several directions, could not break it, and found
+the guarantee stronger than the row claimed. What it found instead: the headline
+curve was labelled with the wrong arm (§2b, §9,
+[#1683](https://github.com/mudler/vllm.cpp/issues/1683)), the 4.11x ratio is
+composed across two jobs (§2c, #1683), the geometry gate transcribed its shapes
+by hand and no model suite entered the blocked path arithmetically (§6c,
+[#1684](https://github.com/mudler/vllm.cpp/issues/1684)), the header stated a
+false premise for the tile alignment (§3b, §6b), and three counts in §6 had gone
+stale. Every one is repaired or recorded above.
+
 ## 0. Scope
 
 **In scope.** The CPU provider of `vt::Conv1d`
@@ -178,11 +189,11 @@ anything if two hash the same:
 round and every thread count from 1 to 14, each length produced ONE waveform
 fingerprint: `0xcdfc4309a0070783` at 20 latents and `0xc2d5eaf095d1c483` at 86.
 
-### The window's scaling curve, before and after
+### The window's scaling curve, before and after — ON ARM C, WHICH DOES NOT SHIP
 
 20 latents, best of 3, `VLLM_CPP_CPU_THREADS` swept:
 
-| threads | arm A | speedup | arm C | speedup |
+| threads | arm A | speedup | arm C, blocked UNCONDITIONALLY | speedup |
 |---|---|---|---|---|
 | 1 | 9.6374 s | 1.00x | 9.4392 s | 1.00x |
 | 2 | 6.2616 s | 1.54x | 4.8859 s | 1.93x |
@@ -192,6 +203,19 @@ fingerprint: `0xcdfc4309a0070783` at 20 latents and `0xc2d5eaf095d1c483` at 86.
 
 **2.81x of 14 becomes 11.48x of 14**, and the arm-to-arm ratio at the shipped
 default is **3.4478 / 0.8223 = 4.19x** (arm A re-measured in the same job).
+
+**READ THE COLUMN HEADER, because the shipped tree is not in this table.** The
+right-hand arm is C — `cf9296496`, blocked UNCONDITIONALLY — and the shipped
+arm is D (`0f738d6ec`), which added the `out_channels * kernel <= in_len`
+condition in `06ba79d1b`. **Arm D was measured at exactly ONE operating point,
+86 latents at 14 threads (§2c), and no thread sweep of it exists.** The
+difference is expected to be conservative rather than the other way round: at a
+20-latent window the condition DECLINES the two b0 shapes where C measured
+0.82x and 0.89x, so D should be at least C. That is an inference, and §2's own
+rule is that an unmeasured quantity is reported as unmeasured rather than
+replaced by one, so 11.48x is arm C's number wherever it appears and the sweep
+of the shipped arm is owed
+([#1683](https://github.com/mudler/vllm.cpp/issues/1683), §7).
 
 ### The split says the same thing twice
 
@@ -282,6 +306,20 @@ the conv decomposition **conditioned** on `out_channels * kernel <= in_len`.
 spreads and the loudest single pair (round 3, 1.176x) is kept rather than
 quoted.
 
+**THE 1.067x IS PAIRED; THE 4.11x IS COMPOSED ACROSS TWO JOBS AND ONE OF THEM
+IS THE JOB THIS SECTION EXISTS TO REPLACE.** The numerator, 3.4989 s, is arm D's
+median here — 300 s settle, seven alternated rounds. The denominator, 14.3895 s,
+is arm A's 86-latent leg in job `3ca07477`, the job whose whole-window rounds
+§2b records as running at `uptime` load 8.84 and calls "a defect in the SCHEDULE
+of the job rather than as a result". Same boot id and same worker, but a
+different job, not alternated against D, and not under the settle. **Whether arm
+A's 86-latent leg fell inside that load-8.84 window is not stated anywhere in the
+record and cannot be recovered from the tree, because no job log is committed.**
+So 4.11x is quoted as composed, with the denominator's contention named, and it
+is not on the same footing as the 1.067x beside it. A paired A-against-D leg is
+owed with the sweep, in one job
+([#1683](https://github.com/mudler/vllm.cpp/issues/1683), §7).
+
 ### The paired split, both arms, same length
 
 | leaf | arm B | arm D | ratio |
@@ -369,6 +407,14 @@ the arithmetic, and both are gated:
    constant-trip-count fast path today takes it after the change. §18.4 prices
    that path at up to 5x, so a change that silently moved a tile onto the
    chunked path would report a speed result about a different kernel.
+   **THIS IS A PERFORMANCE INVARIANT AND NOT PART OF THE BIT-IDENTITY
+   ARGUMENT**, which `src/vt/cpu/cpu_conv1d_block.h` used to say it was. The
+   argument above never mentions `t0`: a cell is seeded and swept `ic` ascending
+   then `k` ascending whatever tile it falls in, so re-cutting the tiles cannot
+   move a bit — and §6b measures exactly that, with the misalignment mutation
+   reddening 1 014 assertions of which every single one is an alignment property
+   check and none is arithmetic. The gate on the property stays, for the speed
+   reason rather than the correctness one.
 2. **The trailing block carries the remainder.** `length` is not in general a
    multiple of the block, and the last block is short exactly as the last
    position tile is short today.
@@ -439,12 +485,21 @@ Every binary's sha256 was taken before it ran.
 | `test_host_parallel` | 11 cases, 968 assertions, 0 failed, `SUCCESS!` | 0 |
 | `test_vocoder1d` | 10 cases, 58 assertions, 0 failed, `SUCCESS!` | 0 |
 | `test_bigvgan` | 6 cases, 65 assertions, 0 failed, `SUCCESS!` | 0 |
-| `test_minimax_music3_acoustic` | 36 cases, 345 assertions, 0 failed, `SUCCESS!` | 0 |
+| `test_minimax_music3_acoustic` | 39 cases, 386 assertions, 0 failed, `SUCCESS!` | 0 |
 | `test_ltx2_vae` | 44 cases, 3 131 assertions, 0 failed, `SUCCESS!` | 0 |
 | `test_minimax_h3` | 79 cases, 57 395 assertions, 0 failed, `SUCCESS!` | 0 |
 | `test_indextts2_pipeline` | 8 cases, 433 assertions, 0 failed, `SUCCESS!` | 0 |
 | `test_indextts2_family` | 7 cases, 22 assertions, 0 failed, `SUCCESS!` | 0 |
 | `test_ops_conv1d_depthwise` | 5 cases, 1 184 assertions, 0 failed, `SUCCESS!` | 0 |
+
+RE-TAKEN AT THE REVIEW-REPAIR HEAD, and the row's earlier printing of
+`test_minimax_music3_acoustic` as 36/345 is corrected rather than left standing:
+that suite runs 39/386 once `origin/main` is merged in, and it was recorded
+before that merge. The two conv suites also move at this head, because the
+repair adds cases to both — `test_ops_conv1d_general` 14 cases / **19 696**
+assertions (was 19 615: the derived geometry sweep replaces six hand-copied
+shapes with 27+27 evaluated ones) and `test_vocoder1d` **11** cases / **66**
+assertions (was 10/58: the block-boundary case, §6c).
 
 `test_ops_conv1d_general` prints four `[SKIP]` lines and they are read rather
 than ignored: this host has no CUDA toolkit, so every CPU-vs-CUDA arm in that
@@ -465,6 +520,27 @@ Baseline binaries: `test_ops_conv1d_general` `0f886491b735fdea…`,
 | M5b | the registered CPU `vt::Conv1d` provider refuses every call | 0 | 1 | per suite, all distinct | **every consumer suite red** — see 6c |
 | — | restored | 0 | 0 | `0f886491b735fdea…`, `63a79608a7f270de…` | back to baseline, byte for byte |
 
+**THE TABLE ABOVE PREDATES THE FUNCTION IT DESCRIBES, and that is corrected
+rather than glossed.** It was taken at `8c67da748`; `06ba79d1b` then added rule
+(1) to `Conv1dTimeBlock`, so M1's recorded "2 cases / 1 343 assertions" is a
+count against a function that no longer exists. **Re-taken at the review-repair
+head**, on the shipped function and against the derived geometry gate: one line
+removed, `compile_rc` 0, binary `e9e3124ff3c76b85…` against the baseline
+`ab93820e4bb17ac4…`, `test_ops_conv1d_general` **2 cases / 1 014 assertions
+FAILED**, rc 1, and `test_vocoder1d` **1 case / 1 assertion FAILED**, rc 1 —
+the new block-boundary case's `REQUIRE(block % kConv1dPosTile == 0)`. Both
+binaries hash back to baseline after restore.
+
+**AND EVERY ONE OF THOSE 1 014 IS AN ALIGNMENT PROPERTY CHECK, WHICH IS THE
+POINT.** Read by name: 976 are `CHECK(aligned)` in the tile-boundary sweep and
+38 are `CHECK(block % kConv1dPosTile == 0)` in the two shipped-geometry loops.
+**Zero arithmetic assertions move** — not the 19 615 that were there before the
+repair, not either engineered cancellation case, not `test_host_parallel`, which
+stays 11 cases / 968 assertions / `SUCCESS!`, rc 0. That is the measurement
+behind §3b's corrected claim: misaligning the block cannot move a bit, and the
+alignment is a PERFORMANCE invariant that this gate pins for a performance
+reason.
+
 **M2 is recorded as a defect in the INSTRUMENT, not omitted.** The first
 attempt at M2 removed the clamp on the last block, which writes past the output
 row. That is undefined behaviour rather than a wrong answer: the binary built
@@ -484,13 +560,49 @@ places that prove it: `test_ops_conv1d_general` 5 cases, `test_host_parallel` 3,
 `test_vocoder1d` 3, `test_bigvgan` 3, `test_minimax_music3_acoustic` 6,
 `test_ltx2_vae` 5. `test_indextts2_family` and `test_ops_conv1d_depthwise` stay
 green, which is correct — neither reaches this op — and is the control that
-says the red is a signal and not a broken build.
+says the red is a signal and not a broken build. **The list of six/two above is
+UNDERSOLD and is corrected here:** the fresh reviewer ran all ten suites under
+the same mutation and got **eight red, two green**, which is a stronger result
+than the row claimed, not a weaker one.
 
-**The second axis is entered at the SHIPPED geometries.** The gate evaluates
-`Conv1dTimeBlock` at MiniMax-Music3's own eight `vt::Conv1d` shapes at a
-344-latent window and asserts `blocks > 1` on every one, plus the tile alignment
-and the slice budget. Without it a future budget change could collapse the
-decomposition back to one block and no arithmetic test would notice.
+**The second axis is entered at the SHIPPED geometries, and the gate now READS
+those geometries.** It walks `MiniMaxMusic3VocoderConfig` and the residual-stack
+constants `kVocoderResidualDilations` / `kVocoderResidualUnits`, reproducing the
+recurrence in `minimax_music3_acoustic.cpp` `VocoderDecode` / `VocoderBlock` /
+`VocoderResidualUnit`, and evaluates `Conv1dTimeBlock` at every convolution the
+chain makes: at a 344-latent window 22 shapes are taken and 5 declined, and the
+case asserts `blocks > 1`, the tile alignment and the slice budget on every taken
+one and `block == length` on every declined one. It runs the same walk at a
+20-latent window and asserts strictly more shapes are declined, which is the rule
+flipping with the window rather than with a list of names.
+
+**The previous revision transcribed six shapes by hand from
+`minimax_music3_loader.h:253-265` and could not have noticed the source moving,
+and that is measured rather than asserted.** Mutating the loader's
+`upsampling_ratios` to `{1, 1, 1, 1}` — a checkpoint geometry that collapses the
+production shapes back to one block — reds the DERIVED gate at 1 case / 16
+assertions, rc 1, and leaves the hand-transcribed one at **14 cases / 19 615
+assertions / `SUCCESS!`, rc 0**: completely blind, on the exact drift the case
+exists to catch. `compile_rc` 0 on both legs, binaries `3ec7121712179109…`
+(derived) and `169faecba6c898d6…` (transcribed), and the tree restored to
+`ab93820e4bb17ac4…` byte for byte.
+
+**AND A CONSUMER NOW ENTERS THE BLOCKED PATH ARITHMETICALLY.** Mutation **M7b**
+— sign-flip every output cell where `blocks > 1`, exactly and only the axis this
+row adds — was run over all ten suites and left **eight green** at the row's
+head: only `test_ops_conv1d_general` and `test_host_parallel` reddened. Every
+audio consumer reached `vt::Conv1d` at SINGLE-BLOCK shapes. That is repaired on
+the shared-core side by `tests/vllm/models/test_vocoder1d.cpp`'s `vocoder1d
+Conv1d is exact ACROSS a time block boundary`, which enters through
+`vllm::vocoder1d::Conv1d` — the body all four audio models call — at 32
+channels, kernel 7, 10 000 positions, asserts the block length is SHORTER than
+the output length so the case cannot silently become single-block, and reads
+`out[oc][t] == 7t + 21 + oc` exactly, every partial sum being an integer below
+2^24. Re-run at the repaired head, M7b reds it: `compile_rc` 0, one line, binary
+`622ad67775df5e6c…`, **1 case / 4 assertions FAILED, rc 1**. The four MODEL
+suites still reach the provider at single-block shapes only and M7b still leaves
+them green — recorded as owed
+([#1684](https://github.com/mudler/vllm.cpp/issues/1684), §7).
 
 **And the snake's dispatch is mutated directly.** M4 replaces the
 `ForOutputRows` call with one that runs the body over an empty range; the gate
@@ -501,6 +613,26 @@ reds. A green there would have meant the case was measuring a class.
 Named here rather than left to a profile, because each is a real gap this row
 declines to close.
 
+- **No thread sweep of the SHIPPED arm exists, and the 4.11x denominator is not
+  paired with its numerator** ([#1683](https://github.com/mudler/vllm.cpp/issues/1683)).
+  The 1 / 2 / 4 / 8 / 14 curve that produces 11.48x is arm C's, blocked
+  unconditionally; arm D has one measured point, 86 latents at 14 threads. The
+  4.11x is composed across jobs `214f5f70` and `3ca07477`, and §2b calls the
+  latter's schedule defective at `uptime` load 8.84. One lease, one boot id, both
+  arms built inside it with distinct binary sha256, a 300 s settle with `uptime`
+  on both sides, and the five thread counts swept with the arms ALTERNATED at
+  each count closes both halves in one job. Every public site names the arm and
+  the composition until it does.
+- **No per-MODEL suite exercises a `blocks > 1` shape**
+  ([#1684](https://github.com/mudler/vllm.cpp/issues/1684)). §6c carries the
+  measurement and the partial repair: the shared vocoder core now has an
+  arithmetic case that crosses a block boundary, and `test_bigvgan`,
+  `test_minimax_music3_acoustic`, `test_ltx2_vae`, `test_minimax_h3` and both
+  IndexTTS-2.5 suites still reach the provider at single-block shapes only, so
+  M7b leaves them green. Closing it means lengthening each consumer's
+  reduced-dimension fixture until its convolutions cross a boundary, which moves
+  those fixtures' goldens — a fixture change per model, not a test addition, and
+  not something to fold into a review repair.
 - **The CUDA provider is not re-measured against either change.** The authoring
   host has no CUDA toolkit, so `test_ops_conv1d_general`'s four CPU-vs-CUDA arms
   printed `[SKIP]` and the `thor:gpu0` job was built CPU-only. Neither change
@@ -518,8 +650,12 @@ declines to close.
   the pool's chunk grid at 96 channels, and the pass being a pure stream over an
   activation that does not fit any cache here. Not chased, because after this
   row it is no longer the largest term.
-- **`vocoder.pad` and `vocoder.copy` are unpartitioned**, at 0.89 % and 0.10 %.
-  They are named so that the next reader does not re-derive that they are small.
+- **`vocoder.pad` and `vocoder.copy` are unpartitioned**, at 0.89 % and 0.10 %
+  on the AUTHORING HOST at 20 latents (§2a) and at 0.59 % and 0.34 % on
+  `thor:gpu0` at 86 latents and 14 threads (§2b). Both readings are real and
+  neither is quotable without its host and its window length, which is why they
+  are written with them here. They are named so that the next reader does not
+  re-derive that they are small.
 - **The block byte budget was not swept per geometry ON `thor:gpu0`.** The
   residency instrument sweeps four footprints at each geometry and
   `kConv1dSliceBytes` was chosen at half of the measured 1 MiB private L2 rather
@@ -541,11 +677,16 @@ ratio is quoted at all rather than quoted from another box.
 
 ## 9. Outcome
 
-**What was measured.** The window's scaling on `thor:gpu0` at the shipped
-default goes from **2.81x of 14 threads to 11.48x**, and the arm-to-arm ratio is
-**4.11x** at 86 latents (median of seven alternated rounds against the
-instrumented baseline, one boot, three jobs). Every arm is bit-identical to
-every other at full scale.
+**What was measured, and on which arm.** The window's scaling on `thor:gpu0`
+goes from **2.81x of 14 threads to 11.48x** — swept on **arm C, blocked
+UNCONDITIONALLY**, which is not the tree that ships. **The shipped arm D has one
+measured operating point, 86 latents at 14 threads, and no thread sweep**
+([#1683](https://github.com/mudler/vllm.cpp/issues/1683)). Against arm B, paired
+and alternated seven times in one job with a 300 s settle, arm D is **1.067x**;
+that is the clean number this row produces. The **4.11x** against the
+instrumented baseline is COMPOSED across two jobs, and its denominator is arm A's
+leg in the job §2b records as schedule-defective at `uptime` load 8.84. Every arm
+is bit-identical to every other at full scale.
 
 **What was rejected, and why.**
 

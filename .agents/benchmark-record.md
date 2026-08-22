@@ -26860,6 +26860,16 @@ Arm A re-measured in the same job reads 3.4478 s at 14 threads, so the
 arm-to-arm ratio at the shipped default is **4.19x**. `vocoder.snake` 11.418 →
 0.955 s, **11.96x**.
 
+**THE RIGHT-HAND COLUMN IS ARM C AND ARM C DOES NOT SHIP**, which this page
+already said in its arm table and the public projections did not. The shipped
+tree is arm D, conditioned on `out_channels * kernel <= in_len`, and it was
+measured at exactly ONE operating point — 86 latents at 14 threads, in the
+re-take below. **No thread sweep of arm D exists**
+([#1683](https://github.com/mudler/vllm.cpp/issues/1683)). The gap is expected to
+favour D, because at a 20-latent window the condition declines the two b0 shapes
+where C reads 0.82x and 0.89x, but that is an inference and is not quoted as a
+measurement.
+
 **Bit-identity across every arm and every thread count.** One fingerprint per
 length throughout: `0xcdfc4309a0070783` at 20 latents, `0xc2d5eaf095d1c483` at
 86.
@@ -26906,6 +26916,17 @@ Window, 86 latents, 14 threads, seven rounds — B 3.7293 / 3.7042 / 4.0695 /
 3.4620 / 3.4989 / 3.7632 / 3.8783 / 3.4770, median **3.4989 s**. **1.067x**, and
 **4.11x** against arm A's 14.3895 s at the same length. Every leg printed
 `0xc2d5eaf095d1c483`.
+
+**The 1.067x is PAIRED; the 4.11x is COMPOSED ACROSS TWO JOBS.** Its denominator
+is arm A's 86-latent leg in job `3ca07477` — the job whose whole-window rounds
+this page records above as running at `uptime` load 8.84 and being a schedule
+defect rather than a result. Same boot id and worker, but a different job, not
+alternated against D, and not under the 300 s settle this re-take exists to
+provide. **Whether arm A's 86-latent leg fell inside that load window is not
+recoverable from the tree: no job log is committed.** So 4.11x carries its
+denominator's contention wherever it is quoted, and a paired A-against-D leg is
+owed with the sweep, in one job
+([#1683](https://github.com/mudler/vllm.cpp/issues/1683)).
 
 Paired split, both arms: `vocoder.conv1d` 2.192/2.205 s → 1.720/1.758 s
 (**1.27x / 1.25x**); TOTAL 3.987/3.985 → 3.492/3.573 s.
