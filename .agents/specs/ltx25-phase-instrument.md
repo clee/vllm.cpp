@@ -44,7 +44,7 @@ OUT OF SCOPE, and each is named because each was tempting:
 - **Widening either floor.** `leaves >= 0.95 * wall` and
   `covered >= min_coverage * leaf_seconds` are untouched by this row, in both
   their form and their constants.
-- **Any bound with `instrument_seconds` in a denominator.** See `## Design` 4.
+- **Any bound with `instrument_seconds` in a denominator.** See `## Design` 5.
 
 ## Our baseline
 
@@ -108,7 +108,30 @@ arithmetic over numbers already in the file, so no box load can move its verdict
 Every other assertion this table has ever carried was a ratio of two wall-clock
 quantities, and two of them spent three months being argued about.
 
-### 4. What replaces the withdrawn bound, and what does not
+### 4. The charges to one record are DISJOINT, so the conservation invariant is one
+
+`instrument_seconds <= duration_seconds` was asserted from the first version of
+this row and it was **not an invariant**. `Open` and `Tick` read their clock
+BEFORE taking the process-wide mutex, so the interval they charge to a record
+spans a window in which another thread, holding that mutex, charges the SAME
+record. Both charges are individually correct and they OVERLAP, and the sum of
+overlapping intervals is not bounded by the interval that contains them. A fresh
+review drove the ratio to **1.914** with 24 threads inside one live leaf, red in
+3 runs of 5.
+
+`ChargeLocked` now clamps each charge to the end of the last one that reached
+the same target, and seeds that mark with the record's own `start`. Every
+charged interval then lies inside `[start, end]` and no two of them overlap, so
+the sum is at most the duration **by construction**. Reproduced and gated: the
+same shape now measures 0.09 to 0.996 over 45 runs and the mutation that removes
+the clamp measures 4.0, 20.3 and 22.0.
+
+It can under-count, and that direction is deliberate: two charges arriving out
+of order lose the earlier one. Under-counting is safe here only because this
+quantity is in no denominator anywhere, which `## Design` 5 below is the reason
+for. If it ever enters one, this clamp becomes a defect.
+
+### 5. What replaces the withdrawn bound, and what does not
 
 **Nothing in this row puts `instrument_seconds` in a denominator.** That is the
 single most important sentence here, and [`ltx25-phase-residue.md`](ltx25-phase-residue.md)
@@ -123,7 +146,7 @@ floors keep `wall` and `leaf_seconds` in their denominators, which is the better
 conditioning: those grow with contention exactly when a preemption inflates the
 numerator.
 
-### 5. The one new bound, and how it is derived
+### 6. The one new bound, and how it is derived
 
 #1569 needs a gate, and a gate needs a comparison. The comparison is
 `head < 0.5 * serialize`, where both quantities are measured in the same run:
@@ -137,11 +160,21 @@ numerator.
   the same public `Records()`, on the same data, on this box, in this run.
 
 So the constant is not a tolerance. Under the correct order the head holds ZERO
-copies and ZERO sorts; under the mutated order it holds exactly one of each and
-is therefore at least `1.0 * serialize` **by the definition of the two
+copies and ZERO sorts; under any wrong order it holds at least ONE of the two in
+full, so it is at least `1.0 * min(copy, sort)` **by the definition of the
 quantities**. Any constant strictly inside `(0, 1)` separates them. 0.5 is the
-midpoint, and the measured separation is five orders of magnitude, not a factor
-of two.
+midpoint.
+
+**THE FIRST VERSION OF THIS PARAGRAPH WAS FALSE AND A FRESH REVIEW MEASURED IT.**
+It bounded the head against `copy + sort` TOGETHER, on the argument that the
+mutated head contains one of each. That holds only when both move. The reviewer
+hoisted `Records()` above the clock read and left `ByStart` below it -- the
+natural shape of a partial regression, and the exact edit somebody makes while
+moving one line -- and the bound stayed GREEN at a ratio of 0.0588, because the
+copy is about 6% of copy-plus-sort. Against `min(copy, sort)` that same mutation
+is red -- **1.035** on the review's own run and **1.024** on the full re-run
+against the repaired tree. The constant did not move; the quantity under it got
+smaller.
 
 **The estimator is a MINIMUM over K probes, and that is what makes this not the
 withdrawn bound wearing a new name.** Contention is one-sided: it can only make
@@ -152,6 +185,23 @@ strips the sporadic term from the honest side and cannot strip the deterministic
 term from the defective side. The withdrawn bound compared two single
 measurements of comparable magnitude and the tail decided it. This compares the
 minima of two populations that differ by five orders of magnitude.
+
+### 7. The console copy answers the same question as the file copy
+
+A fresh review found the two had diverged. `phase-log.json` carried
+`instrument_seconds` and `PhaseLog::RenderText` printed `sum(leaf)`,
+`unaccounted` and `WALL` without it, so a reader watching a terminal saw the
+residue with no way to subtract the cost of naming the phases from it -- which
+is the whole reason that number exists. `RenderText` now prints it.
+
+The gate over it is not a measurement. `RenderText` formats every total with
+`%10.3f`, so the printed value differs from the number it was given by strictly
+less than half of the last digit -- 5e-4 seconds -- **by the definition of the
+conversion**. The case reads that line back and compares it with `Instrument()`
+through the public entry point. Nothing in it is timed, both sides read the same
+number through two different code paths, and no box load can move the verdict.
+Without it the added line is a production statement nothing reaches; `NTEXT`
+deletes it and the case reds.
 
 `serialize > 1e-5` guards the comparison from the other side. A table too cheap
 to serialise cannot separate the two orderings at all, which is precisely why
@@ -233,10 +283,76 @@ FAILURE TEXT rather than by job name.
 | Issue | Owed |
 |---|---|
 | [#1668](https://github.com/mudler/vllm.cpp/issues/1668) | items 1 to 3, the three driver anchors and `sampler_updates`. Item 4 lands here |
-| [#1570](https://github.com/mudler/vllm.cpp/issues/1570) | the bound on `instrument_seconds / duration_seconds` per record. It needs `instrument_seconds`, which this row lands, and it is worth setting on the anchors rather than on this row's synthetic scopes — a bound on `unit.child` measures nothing anybody ships |
-| [#1568](https://github.com/mudler/vllm.cpp/issues/1568) | the `denoise.step` / `denoise.update` seconds transfer. `denoise.update` does not exist yet |
+| [#1570](https://github.com/mudler/vllm.cpp/issues/1570) | the bound on `instrument_seconds / duration_seconds`. It needs `instrument_seconds`, which this row lands. **Set it on a CARRYING LEAF, not per record.** See `### The instrument share, measured before it was proposed` below: on a leaf holding seconds of work the honest share is ~1e-4 and the margin is enormous, which is where #1570's actual concern lives -- an instrument that got ten times more expensive would be visible there. On a sub-scope of tens of microseconds it is not a gate at all |
+| [#1568](https://github.com/mudler/vllm.cpp/issues/1568) | the `denoise.step` / `denoise.update` seconds transfer. `denoise.update` does not exist yet -- **and the obvious closure is now MEASURED SHUT.** See below |
 | [#1567](https://github.com/mudler/vllm.cpp/issues/1567) | the res_2s arm's anchor. No gate in this tree renders on that arm |
 | [#1439](https://github.com/mudler/vllm.cpp/issues/1439) | NOT closed. See `## Stop conditions` |
+| [#1718](https://github.com/mudler/vllm.cpp/issues/1718) | the charge sites are gated only in AGGREGATE. Three of this row's own mutations -- N4, N6 and NNOSORT -- are GREEN, and they are printed in the mutation table rather than left out |
+| [#1719](https://github.com/mudler/vllm.cpp/issues/1719) | `PhaseLog::Close`'s pre-lock wait is charged to nobody, so it inflates the closing record's UNCOVERED time -- which is the quantity the coverage floor reads. It has to land before #1718 can, because it is where staged contention actually goes |
+| [#1720](https://github.com/mudler/vllm.cpp/issues/1720) | `WriteJson` now takes the process-wide mutex TWICE, so `wall_seconds` and the record set are two snapshots rather than one. Unreachable on the shipped path and argued in the function's own comment; the repair is a single locked snapshot, which is a public API change |
+
+### Owed out of the fresh review
+
+Filed by the fresh review of this row and left open ON PURPOSE, with what each
+one would take. None of them is a defect in what landed; each is a gate this row
+could not make honest.
+
+| what | why it is not here |
+|---|---|
+| [#1718](https://github.com/mudler/vllm.cpp/issues/1718) -- **a per-site charge gate.** Deleting any ONE charge site -- `Open`'s pre-lock mutex wait, `Open`'s tail, `Close`'s tail, the sampler join, `SampleLocked`'s self-charge -- leaves the suite green; only deleting every site reddens it. The worst is the pre-lock wait, which `## Design` 1 names as the reason the mechanism exists | A case for it was written and run THREE times and it does not measure the site. `PhaseLog::Records()` is the only public entry point that holds the mutex without charging itself, and contention through it lands mostly in `PhaseLog::Close`'s lock wait -- which is charged to nobody and lies inside the CHILD's duration, not the parent's charge. The case passed in isolation at 615x and failed 5 of 5 inside the suite. The full account is in the comment where it would have been |
+| [#1719](https://github.com/mudler/vllm.cpp/issues/1719) -- **`Close`'s pre-lock wait is charged to nobody.** Found by the attempt above. `Open` reads a clock before its lock and `Close` does not, so the wait before a record's `end` is stamped is instrument wall that no record and no table absorbs | It is a production change to a shared instrument and it owes its own red-first evidence. It inflates the closing record's UNCOVERED time, which is the quantity the coverage floor reads |
+| [#1718](https://github.com/mudler/vllm.cpp/issues/1718) -- **`ChargeLocked`'s `if (from < 0.0) return;` is ungated.** Changing it to a clamp reddens nothing, although the comment beside it argues at length that clamping is the defect that makes a gate pass | Staging it needs a `Begin()` on another thread between `Open`'s clock read and its lock acquisition, which is a race this row could not make deterministic |
+| [#1718](https://github.com/mudler/vllm.cpp/issues/1718) -- **`ByStart`'s REMOVAL is held by nothing, although its INVERSION now is.** `NNOSORT` leaves the suite green and `NREVSORT` reds it | It cannot matter for the decomposition -- non-nested leaves are strictly sequential and already close in start order -- but `## Design` 3 leans on it and the emitted table's monotone-start assertion lives in `test_ltx2_video` |
+| **The new suite writes about 8000 flushed `[render]` lines per run.** The live lane is on by the shipped default (#1413) and the #1569 case builds 8000 leaves | Silencing it needs `VLLM_RENDER_PROGRESS=0` at process start, and that would take the flushed progress line -- the most expensive statement in `Open`, and one of the charge sites -- out of everything this file measures |
+| **A gap's `after` and `before` are ambiguous when a name repeats.** `decode.video` opens more than once per render, so two gaps can carry the same pair of names | The pairing assertion accepts it, and a reader wanting the exact region has `start_seconds` and `end_seconds`, which this row's repair made gated |
+
+### The instrument share, measured before it was proposed
+
+The natural way to close #1568 and #1570 at once, once `instrument_seconds`
+exists, is a ceiling on `instrument_seconds / duration_seconds` per record: an
+empty scope is nothing but its own boundaries, so its ratio approaches 1, while
+a scope carrying work sits far below. #1568's R1b transfer leaves
+`denoise.update` empty, so one ceiling would catch it.
+
+**That was measured on this tree before it was proposed, and at
+`denoise.update`'s real scale it does not work.** A standalone probe opens two
+nested scopes inside one parent -- one empty, one holding a sleep -- and reports
+both ratios from one process. `VLLM_RENDER_PROGRESS=0`, this branch's binary,
+`build/libvllm.a`:
+
+| work scope | n | EMPTY min | EMPTY median | WORK median | WORK max | separated? |
+|---|---:|---:|---:|---:|---:|---|
+| 5 ms | 60 | 0.3656 | 0.8520 | 0.0045 | 0.0097 | yes, 38x |
+| ~1.1 ms | 60 | -- | -- | 0.0195 | 0.0528 | yes |
+| ~134 us | 80 | 0.3914 | 0.8418 | 0.1248 | 0.2500 | barely, 1.57x |
+| ~134 us | **200** | **0.0804** | 0.8487 | 0.1255 | **0.8930** | **NO -- they overlap completely** |
+
+The 80-sample row says the populations are separated by 1.57x. The 200-sample
+row, same probe, same box, says the honest maximum (0.8930) is ELEVEN TIMES the
+defective minimum (0.0804). **A small sample of this quantity does not see the
+tail that decides the gate**, which is the same finding
+[`ltx25-phase-residue.md`](ltx25-phase-residue.md) `## Design` 3 records for the
+withdrawn bound, reached independently by a different route.
+
+The mechanism is the same one too, and its direction is worth stating. The part
+of a boundary this instrument CANNOT measure -- the `lock_guard` release, the
+`Close` return, the `Scope` destructor and constructor, the call into `Open` up
+to its clock read -- dilates faster under contention than the part it can. It
+sits inside the record and outside the charge, so a preemption there drives an
+EMPTY scope's ratio DOWN toward an honest one's, and a preemption inside a tiny
+honest scope's own boundaries drives it UP toward an empty one's. Both
+populations move toward each other, and at 49 to 343 us -- which is what
+`denoise.update` measures -- they meet.
+
+So #1568 stays open, and its own text was right for a reason it did not name:
+"the honest distribution's bottom touches the defective value". It does, in this
+formulation as well as in a coverage floor.
+
+#1570 survives, on a LEAF rather than a record. `denoise` is seconds of work
+against an instrument charge measured in microseconds, so a ceiling there has
+four orders of magnitude of margin and would still catch the ten-times-more-
+expensive instrument #1570 is about. The row that lands `denoise.update` owes
+that measurement on the real leaf.
 
 ## Evidence
 
@@ -245,32 +361,62 @@ Measured on this branch, on an x86_64 box at load average 103 to 131 -- which is
 Build: `cmake -S . -B build -DVLLM_CPP_BUILD_TESTS=ON`, no `CMAKE_BUILD_TYPE`,
 which is what `build-test-cpu` configures.
 
-### The #1569 bound, over 50 consecutive runs under real load
+### The two bounds, over 310 runs across five load regimes
 
-The one bound this row keeps. Each run executed the ONE case and the case count
-was recorded for every run, because a `-tc` filter that matches nothing prints
-`0 cases ran` and `Status: SUCCESS!` and is indistinguishable from a green run.
-All 50 read `test cases: 1 | 1 passed | 0 failed`.
+Every run's `test cases:` line was recorded, because a `-tc` filter that matches
+nothing prints `0 cases ran` and `Status: SUCCESS!` and is indistinguishable
+from a green run in a log or an `&&` chain. Every run of the whole suite also
+read `assertions: N | N passed | 0 failed`.
 
-| quantity | min | median | p90 | max |
-|---|---:|---:|---:|---:|
-| `head / serialize` | 0.000716 | 0.002308 | 0.003115 | **0.004228** |
-| `head` seconds | 5.02e-6 | 8.22e-6 | 1.04e-5 | 1.19e-5 |
-| `serialize` seconds | 2.55e-3 | 3.26e-3 | -- | 9.65e-3 |
-| box load average | 102.8 | 125.7 | -- | 131.4 |
+**Before the fresh review**, on the one-number `copy + sort` budget:
 
-**0 red in 50.** The bound is 0.5, so the worst observed run had **118x** of
-margin. The same case with the mutation applied -- `main`'s own clock ordering --
-measures **1.00383**, which is 237x above the honest maximum and 2.0x above the
-bound. The three populations do not overlap and are not close to overlapping:
+| population | n | load | min | median | p90 | max |
+|---|---:|---|---:|---:|---:|---:|
+| the #1569 case alone | 50 | 103-131 | 0.000716 | 0.002308 | 0.003115 | **0.004228** |
+| the whole suite | 60 | 20-28 | 0.000320 | 0.000759 | 0.001145 | 0.001894 |
+| the #1569 case alone | 50 | 57-83 | 0.001650 | 0.002600 | 0.003648 | 0.004197 |
+| the whole suite | 60 | 35-48 | 0.000320 | 0.000759 | 0.001145 | 0.001894 |
+
+**After it**, on the repaired `min(copy, sort)` budget, which is about ten times
+smaller and therefore about ten times tighter:
+
+| population | n | load | min | median | p90 | max | margin |
+|---|---:|---|---:|---:|---:|---:|---:|
+| `head / min(copy, sort)` | 45 | 58-85 | 0.00198 | 0.00444 | 0.00654 | **0.00958** | **52x** |
+| `instrument / duration`, 24 threads | 45 | 58-85 | 0.0904 | 0.9920 | 0.9945 | **0.9961** | bound 1.0 |
+
+**And re-measured over 45 further runs of the WHOLE suite against the tree that
+actually lands**, which is not the tree the two rows above were taken on: the
+`RenderText` gate is new, and it is the only quantity a re-run could have moved.
+
+| population | n | load | min | median | p90 | max | margin |
+|---|---:|---|---:|---:|---:|---:|---:|
+| `head / min(copy, sort)` | 45 | 56-113 | 0.003744 | 0.006467 | 0.010502 | **0.018123** | **27.6x** |
+| `instrument / duration`, 24 threads | 45 | 56-113 | 0.0723 | 0.9928 | 0.9962 | **0.99756** | bound 1.0 |
+
+All 45 read `test cases: 5 | 5 passed | 0 failed` and
+`assertions: 93 | 93 passed | 0 failed` -- the SAME string on every run, which is
+what rules out a filter that matched nothing. The margin is 27.6x rather than
+52x because this population is a load regime higher, and that is the direction a
+reader should expect: the honest head grows with contention and the budget under
+it does not.
+
+**0 red in 310.** And the defective values are not near either bound:
 
 ```
-honest    [0.00072 .. 0.00423]      bound 0.5      defective ~1.004
+#1569        honest [0.0037 .. 0.0181]   bound 0.5    main's order 17.2,  partial regression 1.024
+conservation honest [0.072 .. 0.99756]   bound 1.0    no clamp     21.97
 ```
 
-That is the shape the withdrawn bound did not have. Its honest population had a
-median of 1.132 and a maximum of 4.115 against a bound of 2, so the bound sat
-INSIDE the scatter and 4 runs in 45 crossed it.
+The conservation ratio sits just under its bound BY CONSTRUCTION and a reader
+should not read that as a bound about to flap. That leaf is 24 threads ticking
+and almost nothing else, so almost all of it IS instrument. It cannot cross 1.0
+on a slow box, because the charges to one record are disjoint intervals inside
+it: the arithmetic holds it, not the margin.
+
+Contrast the withdrawn bound: its honest population had a median of 1.132 and a
+maximum of 4.115 against a bound of 2, so the bound sat INSIDE its own scatter
+and 4 runs in 45 crossed it.
 
 ### The mutation table
 
@@ -281,18 +427,44 @@ the first attempt at a text-reverse restore FAILED that check -- its anchor was
 no longer unique once applied, because `RenderText` carries the same two lines
 `WriteJson` does -- so the harness restores from a pristine byte copy instead.
 
+THE WHOLE SET WAS RE-RUN AGAINST THE REPAIRED TREE, not carried over from the
+run that preceded the fresh review, because three of the repairs change what the
+suite can see. Every entry below is from that re-run.
+
 | id | mutation | verdict |
 |---|---|---|
-| M1 | `WriteJson` reads its clock AFTER the copy and sort, i.e. `main`'s code | RED, `head/serialize` 1.004 against 0.5 |
-| M2 | the decomposition drops the FIRST gap -- the prologue, 92% of a real residue | RED on the gap count |
-| M3 | the decomposition counts NESTED records as leaves | RED on all three: a negative gap, the identity, the count |
-| M7 | the tail gap reported as zero, count and names untouched | RED on the identity alone |
+| M1 | `WriteJson` reads its clock AFTER the copy and sort, i.e. `main`'s code | RED, head 8.331 ms against a budget of 0.484 ms -- 17.2x |
+| N11 | the clock read moves BELOW the copy and stays ABOVE the sort -- a PARTIAL regression, which the one-number budget missed at 0.0588 | RED, 1.024 |
+| NCLAMP | the per-target high-water mark is removed, so overlapping charges are counted twice again | RED, charged 9.491 s of a 0.432 s record -- 21.97 |
+| M2 | the decomposition drops the FIRST gap -- the prologue, 92% of a real residue | RED on 4: the first gap's origin, the identity, the count, and the prologue's own floor |
+| M3 | the decomposition counts NESTED records as leaves | RED on 3: a negative gap at -1.198 ms, the identity, the count |
+| M7 | the tail gap reported as zero, count and names untouched | RED on 2: the endpoint agreement and the identity |
 | M8 | each gap measured to the leaf's END rather than its START | RED on the identity alone |
 | M4 | every instrument interval charged to the TABLE, never to a leaf | RED on 4 assertions across 2 cases |
 | M5 | a SPAN absorbs the charge, so the residue's explanation vanishes into a number `Sum` skips | RED on the span assertion |
-| M6 | the per-record charge is not emitted | RED on 2 assertions across 2 cases |
+| M6 | the per-record charge is not emitted | RED at `REQUIRE(e.contains("instrument_seconds"))` |
+| NEND | every gap's `start_seconds` and `end_seconds` zeroed, `seconds` untouched | RED on 4 -- and GREEN before this row's repair, which is why the endpoints are now read |
+| NREVSORT | `ByStart` orders the table by DESCENDING start | RED at `CHECK(seconds >= 0.0)` on -16.996 ms |
+| NTEXT | `RenderText` stops printing the instrument charge, so the console and the file copies answer different questions | RED at `REQUIRE(at != std::string::npos)` |
 | R1 | the production emitter stops writing `gaps` -- run against the RENDER case | RED at `REQUIRE(table.contains("gaps"))` |
 | R2 | `ChargeLocked` charges nothing anywhere -- run against the RENDER case | RED at `REQUIRE(instrument > 0.0)` |
+| N4 | `ChargeLocked`'s negative-`from` refusal becomes a clamp | **GREEN** -- [#1718](https://github.com/mudler/vllm.cpp/issues/1718) |
+| N6 | `Open`'s pre-lock wait is computed and charged to nothing | **GREEN** -- [#1718](https://github.com/mudler/vllm.cpp/issues/1718) |
+| NNOSORT | `ByStart` stable-sorts an empty range, i.e. does not sort at all | **GREEN** -- [#1718](https://github.com/mudler/vllm.cpp/issues/1718) |
+
+THE THREE GREENS ARE THE POINT OF PRINTING THEM. A mutation table that lists
+only its successes is an argument and not a measurement, and these three are
+what [#1718](https://github.com/mudler/vllm.cpp/issues/1718) is. `NREVSORT`
+beside `NNOSORT` says exactly how much of `ByStart` is held: an inversion is
+caught and a removal is not, because every timeline this suite builds is already
+start-ordered.
+
+N6's FIRST STAGING DID NOT COMPILE, and that is worth a line because it is the
+trap this project keeps walking into. Written as `if (false) { ... }` it left
+`entered` unused and failed `-Werror` with `compile_status=1`. A mutation that
+fails to build reads exactly like a passing test; only the printed compile
+status separated the two. Re-staged as a `(void)` cast of the same expression it
+compiles, and it is green.
 
 R1 and R2 are the reachability half. Both were run against
 `ltx2 video: a render through the ABI emits a phase table that SUMS to wall`,
@@ -332,7 +504,7 @@ What was measured, and what was rejected:
   sites and hundreds of runs, and re-deriving a settled negative result is the
   cost that record exists to remove.
 - **The one new constant is 0.5 and it is not a tolerance.** Its derivation is
-  in `## Design` 5: the two orderings differ by exactly one copy and one sort,
+  in `## Design` 6: the two orderings differ by exactly one copy and one sort,
   so the defective value is at least 1.0 by definition and any constant inside
   `(0, 1)` separates them. The measurement's job was to confirm the separation,
   not to choose the number, and it confirmed 237x.

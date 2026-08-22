@@ -99,6 +99,11 @@ struct PhaseLog::Impl {
     size_t handle = 0;
     // THE INSTRUMENT'S OWN WALL, charged to this record. See `ChargeLocked`.
     double instrument = 0.0;
+    // The end of the last interval charged to this record, so two overlapping
+    // charges cannot be counted twice. Seeded with the record's own `start`, so
+    // a charge whose clock read happened BEFORE this record existed cannot reach
+    // back past it either. See `ChargeLocked`.
+    double instrument_charged_to = 0.0;
     std::string name;
     int64_t render = 0;
     double start = 0.0;
@@ -118,6 +123,8 @@ struct PhaseLog::Impl {
   // `unaccounted_seconds` this instrument spent rather than the render. See
   // `ChargeLocked`.
   double instrument_gap = 0.0;
+  // The same high-water mark for the table's own share. See `ChargeLocked`.
+  double instrument_gap_charged_to = 0.0;
   std::vector<Open> open;
   // Per-unit tick clock for the live lane, so `last=` is the interval between
   // two occurrences of the SAME unit rather than since any other line.
@@ -185,13 +192,50 @@ struct PhaseLog::Impl {
     // dropped.
     if (from < 0.0) return;
     if (!(to > from)) return;
+    // ── WHY EACH TARGET CARRIES A HIGH-WATER MARK ────────────────────────────
+    //
+    // A fresh review broke the invariant `instrument_seconds <= duration_seconds`
+    // and it took no race to do it. `Open` and `Tick` read their clock BEFORE
+    // they take this mutex, so the interval they charge to a record spans a
+    // window in which ANOTHER thread — the 100 ms sampler, or a second caller —
+    // can hold the mutex and charge the SAME record. Both charges are correct
+    // individually and they OVERLAP, so their sum exceeded the record's own
+    // single-threaded duration: 24 threads calling `SampleNow()` inside one live
+    // leaf drove that ratio to 1.914, red in 3 runs of 5.
+    //
+    // Clamping `from` to the end of the last interval already charged to this
+    // target makes the charges disjoint, so their sum is at most the UNION of
+    // the intervals. The mark starts at the record's OWN `start`, so the union
+    // also cannot reach back before the record began -- which a `Tick` whose
+    // clock read predates the record and whose lock acquisition follows it would
+    // otherwise do. Every charged interval then lies inside `[start, end]` and
+    // no two of them overlap, so `instrument_seconds <= duration_seconds` holds
+    // by construction rather than by hoping the box stays quiet.
+    //
+    // IT CAN UNDER-COUNT, and that direction is deliberate. Two charges that
+    // arrive out of order — a later `to` first, then an earlier interval — lose
+    // the earlier one entirely. Under-counting the instrument is the safe
+    // direction here BECAUSE this quantity is in no denominator anywhere: a
+    // smaller charge makes every gate that reads it stricter, never looser, and
+    // `.agents/specs/ltx25-phase-residue.md` `## Design` 3 is why it is in no
+    // denominator. The opposite choice — counting the overlap — makes a bound
+    // pass, and a defect that makes a gate pass is the one nobody finds.
     for (size_t i = open.size(); i > 0; --i) {
       Open& o = open[i - 1];
       if (!o.live || o.span) continue;
-      o.instrument += to - from;
+      const double start = from > o.instrument_charged_to ? from : o.instrument_charged_to;
+      if (to > start) {
+        o.instrument += to - start;
+        o.instrument_charged_to = to;
+      }
       return;
     }
-    instrument_gap += to - from;
+    const double start =
+        from > instrument_gap_charged_to ? from : instrument_gap_charged_to;
+    if (to > start) {
+      instrument_gap += to - start;
+      instrument_gap_charged_to = to;
+    }
   }
 
   // Caller holds `mu`. Reads both counters once and folds them into every open
@@ -301,6 +345,7 @@ void PhaseLog::Begin() {
   impl_->render = 0;
   impl_->samples = 0;
   impl_->instrument_gap = 0.0;
+  impl_->instrument_gap_charged_to = 0.0;
   impl_->device_probe = DeviceByteProbe();
 }
 
@@ -346,6 +391,7 @@ size_t PhaseLog::Open(const std::string& name, bool span) {
   o.name = name;
   o.render = impl_->render;
   o.start = impl_->Now();
+  o.instrument_charged_to = o.start;
   o.span = span;
   o.live = true;
   bool leaf_already_open = false;
@@ -542,6 +588,7 @@ void PhaseLog::Reset() {
   impl_->render = 0;
   impl_->samples = 0;
   impl_->instrument_gap = 0.0;
+  impl_->instrument_gap_charged_to = 0.0;
   impl_->device_probe = DeviceByteProbe();
 }
 
@@ -646,6 +693,25 @@ bool PhaseLog::WriteJson(const std::string& path, const std::string& family,
   // is `the emitter reads its clock BEFORE it serialises the table` in
   // `tests/vllm/multimodal/test_render_phase_log.cpp`, and it needs a table of
   // thousands of records to see the difference at all.
+  //
+  // AND THE COST OF THAT ORDER, WHICH A FRESH REVIEW ASKED FOR IN WRITING. The
+  // wall below and the records on the next line are taken under TWO separate
+  // acquisitions of the process-wide mutex, so they are no longer one snapshot.
+  // Before this order they were effectively one in the direction that matters:
+  // the clock was read last, so `wall >= max(end_seconds)` held by
+  // construction. It no longer does, and the observable if it broke is a
+  // NEGATIVE tail gap, which `gaps` reports and the unit case refuses.
+  //
+  // IT IS UNREACHABLE ON THE SHIPPED PATH, and that is a property of the CALL
+  // SITE rather than of this function. Both `WritePhaseLog` calls in
+  // `ltx2_video.cpp` run after `generate_span.Close()`, that span is the last
+  // live scope, and `PhaseLog::Close` stops and JOINS the sampler before it
+  // returns when nothing is left live. So no thread can close a scope between
+  // these two lines on any path this project ships. A fresh review also failed
+  // to stage an inversion adversarially: 27,471 probes of a churn thread
+  // against a replica of these two statements produced zero. Making the pair a
+  // single locked snapshot is the real repair and it is a public API change;
+  // it is recorded as owed rather than smuggled in here.
   const double wall = Elapsed();
   const std::vector<Record> records = ByStart(Records());
   const Totals totals = Sum(records, wall);
@@ -788,6 +854,14 @@ std::string PhaseLog::RenderText(const std::string& family, const std::string& d
                 totals.unaccounted);
   out += line;
   std::snprintf(line, sizeof(line), "  %-4s %-30s %10s %10.3f\n", "", "WALL", "", totals.wall);
+  out += line;
+  // AND WHAT THE INSTRUMENT CHARGED ITSELF, so the console copy and the file
+  // copy answer the same question. A fresh review found the two had diverged:
+  // `phase-log.json` carried `instrument_seconds` and this block did not, so a
+  // reader watching a terminal saw a residue with no way to subtract the cost of
+  // naming the phases from it -- which is the whole reason that number exists.
+  std::snprintf(line, sizeof(line), "  %-4s %-30s %10s %10.3f\n", "", "instrument", "",
+                Instrument());
   out += line;
   return out;
 }

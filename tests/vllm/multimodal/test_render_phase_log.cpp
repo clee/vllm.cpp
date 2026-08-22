@@ -30,6 +30,7 @@
 // ratio here.
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -266,6 +267,191 @@ TEST_CASE("ltx2 phase log: the instrument's own cost is CONSERVED across the tab
                     << "s of it is this instrument's own. A charge larger than the residue it "
                        "is part of means the accounting is charging intervals that are inside a "
                        "leaf to the table, which would make every residue bound too loose");
+
+  // AND THE CONSOLE COPY ANSWERS THE SAME QUESTION AS THE FILE. `RenderText` is
+  // what a reader watching a terminal gets, and it printed `sum(leaf)`,
+  // `unaccounted` and `WALL` while the file alone carried `instrument_seconds`
+  // — so the residue was on screen with no way to subtract the cost of naming
+  // the phases from it, which is the whole reason that number exists. This
+  // assertion is the only thing holding the two copies together, and without it
+  // the line is a production statement nothing reaches.
+  //
+  // THE TOLERANCE IS THE FORMAT'S OWN RESOLUTION AND NOT A MEASUREMENT.
+  // `RenderText` prints every total with `%10.3f`, so the printed value differs
+  // from the number it was given by strictly less than half of the last digit,
+  // 5e-4 seconds, by the definition of the conversion. No box load can move
+  // that, because nothing here is timed: both sides read the SAME `Instrument()`
+  // through two different code paths.
+  const std::string text = log.RenderText("unit", "cpu");
+  const std::string::size_type at = text.find("instrument");
+  REQUIRE_MESSAGE(at != std::string::npos,
+                  "`RenderText` prints sum(leaf), unaccounted and WALL and no instrument "
+                  "charge, so the console copy of this table cannot separate the residue the "
+                  "render produced from the residue this instrument produced. The file copy "
+                  "carries it and they have to answer the same question:\n"
+                      << text);
+  const double printed = std::strtod(text.c_str() + at + std::string("instrument").size(),
+                                     nullptr);
+  CHECK_MESSAGE(std::fabs(printed - log.Instrument()) < 5e-4,
+                "`RenderText` prints " << printed << "s of instrument charge and `Instrument()` "
+                    << "returns " << log.Instrument()
+                    << "s. The console copy is printing some other number, and 5e-4 is this "
+                       "line's own %10.3f resolution rather than a tolerance:\n"
+                    << text);
+  log.Reset();
+}
+
+// ─── WHY THERE IS NO PER-SITE CHARGE CASE HERE (F1, and it was TRIED) ───────
+//
+// A fresh review found that the attribution rule is gated only in AGGREGATE:
+// deleting any ONE charge site -- `Open`'s pre-lock mutex wait, `Open`'s tail,
+// `Close`'s tail, the sampler join, `SampleLocked`'s self-charge -- leaves this
+// whole file green, and only deleting every site at once reddens it. The worst
+// of those is the pre-lock wait, because `## Design` 1 and `Open`'s own comment
+// both name that interval as the reason `instrument_seconds` exists.
+//
+// A case for it was written and run, three times, and it is NOT here because it
+// does not measure that site. What each cut found:
+//
+//   1. Two parents, one contended by a reader thread, compared by charge. The
+//      QUIET parent was slower, because it ran first and paid for the record
+//      vector's reallocation -- a copy that happens under the mutex inside
+//      `Close` and is charged to the parent.
+//   2. With a warm-up parent absorbing the growth, the reader thread had not
+//      reached its first copy before the 330 us measurement window closed.
+//   3. With four readers, a 16 MiB critical section and a start barrier, the
+//      case passed in ISOLATION at a separation of 615x -- and failed 5 of 5
+//      runs inside this suite, twice because no reader held the lock at all and
+//      three times because a contended parent that took 21 ms was charged
+//      112 us.
+//
+// THAT LAST NUMBER IS THE FINDING. Contention through `Records()` -- the only
+// public entry point that holds this mutex without charging itself, which is
+// what makes it usable as a hold at all -- lands mostly in `PhaseLog::Close`'s
+// lock wait. `Close` has no pre-lock clock read, so that wait is charged to
+// NOBODY, and it lies inside the CHILD's own duration rather than in the
+// parent's charge. So a parent-against-parent comparison does not track the
+// site under test, however the contention is arranged.
+//
+// Both halves are recorded under `## Owed` in
+// `.agents/specs/ltx25-phase-instrument.md`: the per-site gate, and the
+// uncharged `Close` wait this attempt found. A flaky gate over an instrument
+// whose whole subject is flaky gates would be the joke that writes itself.
+
+// ─── the accounting stays CONSERVED when several threads charge one record ───
+//
+// F3 of the fresh review, and it was a real defect rather than a missing test.
+// `instrument_seconds <= duration_seconds` was asserted, documented as an
+// invariant, and was NOT one: `Open` and `Tick` read their clock before taking
+// the mutex, so their charge to a record spans a window in which another thread
+// holding the mutex charges the SAME record. The sum was over OVERLAPPING
+// intervals while the duration is one wall interval, and 24 threads calling
+// `SampleNow()` inside one live leaf drove the ratio to 1.914, red in 3 runs of
+// 5.
+//
+// `ChargeLocked` now clamps each charge to the end of the last one that reached
+// the same target, so the charges are disjoint and their sum is at most their
+// union. This case is what holds that, and it is the reviewer's own probe shape.
+TEST_CASE("ltx2 phase log: a record charged from MANY THREADS is still charged less than it lasted") {
+  phase::PhaseLog& log = phase::PhaseLog::Instance();
+  log.Reset();
+  log.Begin();
+
+  // THE HAMMER TICKS, AND WHICH ENTRY POINT IT USES IS THE WHOLE REPRODUCTION.
+  //
+  //   * `PhaseLog::Sample` reads its clock INSIDE the mutex, so concurrent
+  //     samples are serialised and their charges are already disjoint. A first
+  //     cut of this case used one and measured 0.29 -- and stayed GREEN under
+  //     the very mutation it was written for, which is the trap this whole
+  //     cluster is about.
+  //   * Opening SIBLING scopes does not work either: while several siblings are
+  //     live, "the innermost live non-span record" resolves to a sibling rather
+  //     than to the leaf under test, so the overlapping charges land somewhere
+  //     else.
+  //   * `PhaseLog::Tick` reads its clock BEFORE the mutex and pushes nothing, so
+  //     the innermost live record stays the leaf. N threads blocked on the same
+  //     acquisition each charge their OWN full wait to it, and those waits
+  //     overlap by construction. That is the shape that breaks the invariant.
+  // AND A BLOCKER MAKES THE PILE-UP DETERMINISTIC. `SetDeviceProbe` installs a
+  // callback that `SampleLocked` runs WHILE HOLDING the mutex, so a probe that
+  // sleeps holds it for a known time. Without one the ticking threads spread out
+  // and mostly do not queue: the unclamped tree measured 1.85 on one run and
+  // 0.29 on the next, so the mutation that removes the repair went GREEN. A
+  // detector that fires sometimes is exactly what #1569 is about.
+  std::atomic<bool> blocking(false);
+  log.SetDeviceProbe([&blocking]() -> int64_t {
+    if (blocking.load(std::memory_order_relaxed)) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+    return -1;
+  });
+
+  const size_t leaf = log.Open("unit.hammered", /*span=*/false);
+  const int kThreads = 24;
+  const int kRounds = 12;
+  std::atomic<int> ready(0);
+  std::atomic<bool> stop_blocker(false);
+  blocking.store(true, std::memory_order_relaxed);
+  std::thread blocker([&stop_blocker]() {
+    while (!stop_blocker.load(std::memory_order_relaxed)) phase::SampleNow();
+  });
+  std::vector<std::thread> hammers;
+  hammers.reserve(kThreads);
+  for (int t = 0; t < kThreads; ++t) {
+    hammers.emplace_back([&ready, kRounds, t]() {
+      ready.fetch_add(1, std::memory_order_relaxed);
+      for (int i = 0; i < kRounds; ++i) {
+        phase::Tick("unit.hammer", static_cast<int64_t>(t), "concurrent");
+      }
+    });
+  }
+  for (std::thread& h : hammers) h.join();
+  stop_blocker.store(true, std::memory_order_relaxed);
+  blocker.join();
+  blocking.store(false, std::memory_order_relaxed);
+  log.SetDeviceProbe(phase::DeviceByteProbe());
+  log.Close(leaf);
+  REQUIRE(ready.load() == kThreads);
+  // THE LIVE LANE HAS TO BE ON FOR THIS CASE TO MEAN ANYTHING. `Tick` returns
+  // immediately when `VLLM_RENDER_PROGRESS=0`, so a process that silenced it
+  // would run this case as 24 threads doing nothing at all.
+  REQUIRE_MESSAGE(phase::ProgressEnabled(),
+                  "VLLM_RENDER_PROGRESS is off in this process, so `phase::Tick` returned "
+                  "without taking the mutex and the 24 threads above contended over nothing. "
+                  "This case measured an instrument that is switched off");
+
+  double charge = -1.0;
+  double duration = -1.0;
+  for (const phase::Record& r : log.Records()) {
+    if (r.name != "unit.hammered") continue;
+    charge = r.instrument_seconds;
+    duration = r.end - r.start;
+  }
+  REQUIRE(duration > 0.0);
+  // THE RATIO SITS JUST UNDER 1 ON PURPOSE, and a reader should not read that as
+  // a bound about to flap. Measured over 45 runs at load 58-85: median 0.9920,
+  // maximum 0.9961. This leaf is 24 threads ticking and almost nothing else, so
+  // almost all of it IS instrument -- that is what the case constructs. The
+  // bound cannot be crossed by a slow box, because the charges to one record are
+  // disjoint intervals inside it: the arithmetic, not the margin, is what holds.
+  MESSAGE("unit.hammered = " << duration << "s, charged " << charge << "s by " << kThreads
+                             << " threads (ratio " << (charge / duration) << ")");
+  // THE PRECONDITION. If the hammer threads charged nothing, the bound below is
+  // satisfied by an instrument that is not running.
+  REQUIRE_MESSAGE(charge > 0.0,
+                  "24 threads ticked inside a live leaf and it was charged nothing, so this "
+                  "case is measuring an instrument that is switched off rather than an "
+                  "invariant");
+  // AND NO TOLERANCE, BEYOND THE ONE THE SUM OF DOUBLES NEEDS. This is not a
+  // measurement: the charges to one record are disjoint intervals inside it, so
+  // their sum cannot exceed it. A box under load moves both numbers and moves
+  // neither verdict -- which is what the previous version of this claim said and
+  // was wrong about, before the clamp existed.
+  CHECK_MESSAGE(charge <= duration + 1e-9,
+                "'unit.hammered' lasted " << duration << "s and was charged " << charge
+                    << "s, which is more instrument than record. Charges to one record must be "
+                       "disjoint; overlapping ones are being counted twice, and every reader "
+                       "who subtracts this number from a residue would subtract too much");
   log.Reset();
 }
 
@@ -280,12 +466,23 @@ TEST_CASE("ltx2 phase log: the instrument's own cost is CONSERVED across the tab
 // while the sixteen gaps between adjacent named phases held 6.8 us each. That
 // pass was a scratch script nobody shipped.
 //
-// THE IDENTITY IS THE GATE, and it is arithmetic rather than a tolerance. The
-// leaves `Sum` adds are non-overlapping and start-ordered, so the complement of
-// their union inside `[0, wall]` is exactly `wall - sum_leaf_seconds`. The gaps
-// therefore add to `unaccounted_seconds` by construction, and a decomposition
-// that dropped one, double counted one or mis-ordered the leaves fails by an
-// amount no box load can supply.
+// THE IDENTITY IS ARITHMETIC RATHER THAN A TOLERANCE, AND IT HOLDS EXACTLY ONE
+// THING. A fresh review did the algebra: the gap sum telescopes to
+// `wall - sum(durations)` for ANY record sequence -- ordered or not, overlapping
+// or not -- so the identity cannot see a reordering, and the reviewer confirmed
+// it by execution, reversing the record order and watching the identity stay
+// green while two other assertions fired. The comment here used to claim it
+// caught a mis-ordering. It does not.
+//
+// WHAT IT DOES HOLD is that `GapsBetweenLeaves` and `Sum` select the SAME
+// records: both skip `span` and both skip `nested`. A decomposition that walked
+// a different population -- one that counted a nested record, or dropped one, or
+// stopped short of `wall` -- fails by an amount no box load can supply. That is
+// the whole of it, it is worth having, and three of this file's mutations are
+// caught by nothing else.
+//
+// The ORDER, the POSITIONS and the NAMES are held below by (1), (2) and (3),
+// which is where those claims belong.
 //
 // THE ONE DURATION HERE IS A LOWER BOUND ON A SLEEP, which is the only shape of
 // wall-clock assertion contention cannot break: `sleep_for` returns no earlier
@@ -337,20 +534,32 @@ TEST_CASE("ltx2 phase log: the emitted table DECOMPOSES its residue into the gap
   const nlohmann::json& gaps = table["gaps"];
   REQUIRE(!gaps.empty());
 
-  // (1) NO GAP IS NEGATIVE, AND THEY ADD TO THE RESIDUE. Both come first and
-  // neither is fatal, so one broken decomposition reports every way it is
-  // broken rather than the first one. THE ORDER HERE IS A REPAIR: the count
-  // below was a `REQUIRE` above this loop, and a mutation that counted NESTED
-  // records as leaves aborted the case on the count and never reached these two
-  // — so the negative gap that same mutation produces went unobserved, and two
-  // of this case's three assertions were unproven while the case reddened.
+  // (1) NO GAP IS NEGATIVE, EACH ONE'S SECONDS ARE ITS OWN ENDPOINTS, AND THEY
+  // ADD TO THE RESIDUE. All non-fatal and all first, so one broken decomposition
+  // reports every way it is broken rather than the first one. THE ORDER HERE IS
+  // A REPAIR: the count below was a `REQUIRE` above this loop, and a mutation
+  // that counted NESTED records as leaves aborted the case on the count and
+  // never reached these — so the negative gap that same mutation produces went
+  // unobserved, and two of this case's assertions were unproven while the case
+  // reddened.
+  //
+  // THE ENDPOINTS ARE READ, WHICH A FRESH REVIEW FOUND THEY WERE NOT. They were
+  // emitted and asserted nowhere: zeroing both left this whole file green. They
+  // are the half a reader uses to LOCATE a region, and locating one was the
+  // entire content of #1571 — 92% of a residue sat at one position, and a
+  // decomposition that says how long a gap is but not where it starts sends the
+  // reader back to the script it replaced.
   double gap_total = 0.0;
   for (size_t i = 0; i < gaps.size(); ++i) {
     const nlohmann::json& g = gaps[i];
     REQUIRE(g.contains("after"));
     REQUIRE(g.contains("before"));
     REQUIRE(g.contains("seconds"));
+    REQUIRE(g.contains("start_seconds"));
+    REQUIRE(g.contains("end_seconds"));
     const double seconds = g["seconds"].get<double>();
+    const double from = g["start_seconds"].get<double>();
+    const double to = g["end_seconds"].get<double>();
     INFO("gap " << i << " = " << g["after"].get<std::string>() << " -> "
                 << g["before"].get<std::string>());
     CHECK_MESSAGE(seconds >= 0.0,
@@ -359,7 +568,34 @@ TEST_CASE("ltx2 phase log: the emitted table DECOMPOSES its residue into the gap
                          << "s. A negative gap means two records the emitter is treating as "
                             "non-overlapping leaves overlap, which would make every sum in this "
                             "table the residue of double counting");
+    CHECK_MESSAGE(std::fabs((to - from) - seconds) < 1e-9,
+                  "gap " << i << " runs from " << from << "s to " << to << "s, a span of "
+                         << (to - from) << "s, and reports " << seconds
+                         << "s. A reader who sorts by `seconds` and then looks up the region at "
+                            "those endpoints would be sent somewhere else");
     gap_total += seconds;
+  }
+  // AND THE GAPS TILE THE TIMELINE, WHICH IS WHERE THE ORDER IS ACTUALLY HELD.
+  // Each gap starts where the previous one ended plus the leaf between them, the
+  // first starts at the origin, and the last ends at `wall`. The identity below
+  // cannot see any of that — it telescopes for any sequence at all.
+  CHECK_MESSAGE(gaps.front()["start_seconds"].get<double>() == 0.0,
+                "the first gap starts at " << gaps.front()["start_seconds"].get<double>()
+                    << "s rather than at the timeline's origin, so whatever ran before it is "
+                       "outside the decomposition entirely");
+  CHECK_MESSAGE(std::fabs(gaps.back()["end_seconds"].get<double>() -
+                          table["wall_seconds"].get<double>()) < 1e-9,
+                "the last gap ends at " << gaps.back()["end_seconds"].get<double>()
+                    << "s and the render's wall is " << table["wall_seconds"].get<double>()
+                    << "s, so the tail of the timeline is outside the decomposition");
+  for (size_t i = 1; i < gaps.size(); ++i) {
+    INFO("gap " << i);
+    CHECK_MESSAGE(gaps[i]["start_seconds"].get<double>() >=
+                      gaps[i - 1]["end_seconds"].get<double>() - 1e-9,
+                  "gap " << i << " starts at " << gaps[i]["start_seconds"].get<double>()
+                         << "s, BEFORE gap " << (i - 1) << " ended at "
+                         << gaps[i - 1]["end_seconds"].get<double>()
+                         << "s. The decomposition is not walking the timeline in order");
   }
 
   // THE IDENTITY. No tolerance beyond double rounding over a handful of
@@ -443,9 +679,20 @@ TEST_CASE("ltx2 phase log: the emitted table DECOMPOSES its residue into the gap
 //     the writer's clock is one function call and one uncontended mutex behind
 //     this case's own, i.e. the instrument's resolution. With it read late the
 //     head contains a whole copy and a whole `stable_sort`.
-//   * `serialize` — that same copy and that same sort, performed by this case
-//     through the same public `Records()`, on the same data, on this box, in
-//     this run. It is the size of the defect, measured rather than assumed.
+//   * `copy` and `sort` — those two steps, performed by this case through the
+//     same public `Records()`, on the same data, on this box, in this run.
+//     MEASURED SEPARATELY, and the bound is against the SMALLER of them.
+//
+// THE TWO ARE SEPARATE BECAUSE A FRESH REVIEW BROKE THE ONE-NUMBER FORM. This
+// case first bounded the head against `copy + sort` together, on the argument
+// that the mutated head contains one of each and is therefore at least 1.0x
+// their sum. That is true only when BOTH move. The reviewer hoisted `Records()`
+// above the clock read and left `ByStart` below it -- the natural shape of a
+// partial regression, and the exact edit somebody makes while "just moving one
+// line" -- and the bound stayed GREEN at a ratio of 0.0588, because the copy is
+// about 6% of copy-plus-sort on this data. Against `min(copy, sort)` that same
+// mutation is red. The constant did not move; the quantity under it got smaller,
+// which is the only direction a repair may take a bound.
 //
 // AND THE ESTIMATOR IS A MINIMUM, WHICH IS WHY THIS IS NOT THE WITHDRAWN BOUND
 // AGAIN. Contention is ONE-SIDED: it can only make a measured interval longer,
@@ -460,11 +707,12 @@ TEST_CASE("ltx2 phase log: the emitted table DECOMPOSES its residue into the gap
 // construction.
 //
 // THE FACTOR IS 0.5 AND IT IS NOT A TOLERANCE. Under the correct ordering the
-// head contains ZERO copies and ZERO sorts. Under the mutated ordering it
-// contains exactly one of each, so it is at least 1.0 x `serialize` by the
-// definition of the two quantities. Any constant strictly between 0 and 1
-// separates them; 0.5 is the midpoint, and the measured separation on this tree
-// is about five orders of magnitude rather than a factor of two.
+// head contains ZERO copies and ZERO sorts. Under any wrong ordering it contains
+// at least ONE of the two steps in full, so it is at least
+// `1.0 x min(copy, sort)` by the definition of the quantities. Any constant
+// strictly between 0 and 1 separates them; 0.5 is the midpoint. What the
+// measurement decides is not the constant but whether the separation is real,
+// and it is: see `## Evidence` in the row's spec.
 TEST_CASE("ltx2 phase log: the emitter reads its CLOCK before it serialises the table") {
   phase::PhaseLog& log = phase::PhaseLog::Instance();
   log.Reset();
@@ -474,7 +722,22 @@ TEST_CASE("ltx2 phase log: the emitter reads its CLOCK before it serialises the 
   // this ungateable; the sort is `n log n` on a vector of records carrying a
   // `std::string`, so the discriminator grows with `kRecords` while the honest
   // head does not depend on it at all.
-  const int kRecords = 4000;
+  // 8000 RATHER THAN 4000, and the reason is the budget below rather than the
+  // sort. The bound is against the CHEAPER of the writer's two post-clock steps,
+  // which is the copy, and the copy is linear in the record count while the
+  // honest head does not depend on it at all. Doubling the table doubles the
+  // margin. Three records made this ungateable in the first place (#1569).
+  const int kRecords = 8000;
+  // AND A NAME LONGER THAN THE SMALL-STRING BUFFER, which is not decoration.
+  // The budget below is the CHEAPER of the writer's two post-clock steps, and
+  // with a short name the copy is a flat memcpy while the sort is `n log n`, so
+  // the copy is the cheap one by a factor of twenty and it sets the whole
+  // budget. A name past `std::string`'s inline buffer makes the copy allocate
+  // once per record, which is what the LTX-2.5 table's own names
+  // (`decode.video.chunk`, `artifacts.frames.ppm`) do anyway. The two steps then
+  // sit within one order of magnitude of each other and the budget stops being
+  // decided by an implementation detail of `std::string`.
+  const std::string kLeafName = "unit.leaf.with.a.name.past.the.small.string.buffer";
   // ONE SPAN HELD OPEN ACROSS THE BUILD, for two reasons. It stops the sampler
   // thread from being created and joined once per leaf, which would dominate the
   // build; and closing it before the measurement leaves NOTHING live, so the
@@ -482,14 +745,15 @@ TEST_CASE("ltx2 phase log: the emitter reads its CLOCK before it serialises the 
   {
     const phase::Scope holder("unit.holder", /*span=*/true);
     for (int i = 0; i < kRecords; ++i) {
-      const phase::Scope leaf("unit.leaf");
+      const phase::Scope leaf(kLeafName);
     }
   }
 
   const TableFile file;
   const int kProbes = 5;
   double head = -1.0;
-  double serialize = -1.0;
+  double copy_cost = -1.0;
+  double sort_cost = -1.0;
   int64_t emitted = 0;
   for (int k = 0; k < kProbes; ++k) {
     const double before_call = log.Elapsed();
@@ -499,22 +763,30 @@ TEST_CASE("ltx2 phase log: the emitter reads its CLOCK before it serialises the 
     const double this_head = writer_clock - before_call;
     if (head < 0.0 || this_head < head) head = this_head;
 
-    // THE DISCRIMINATOR, MEASURED THE SAME WAY THE WRITER DOES IT. `Records()`
-    // returns a copy taken under the process-wide mutex and `ByStart` sorts that
-    // copy; this is the same copy and the same sort through the same public
-    // entry point, so it is the cost the writer would pay after its clock read
-    // rather than a number quoted from another box.
-    const double before_sort = log.Elapsed();
+    // THE DISCRIMINATOR, MEASURED THE SAME WAY THE WRITER DOES IT, AND IN THE
+    // SAME TWO STEPS. `Records()` returns a copy taken under the process-wide
+    // mutex and `ByStart` stable-sorts that copy; this is the same copy and the
+    // same sort through the same public entry point, so these are the costs the
+    // writer would pay after its clock read rather than numbers quoted from
+    // another box.
+    const double before_copy = log.Elapsed();
     std::vector<phase::Record> copy = log.Records();
+    const double after_copy = log.Elapsed();
     std::stable_sort(copy.begin(), copy.end(),
                      [](const phase::Record& a, const phase::Record& b) {
                        return a.start < b.start;
                      });
-    const double this_serialize = log.Elapsed() - before_sort;
+    const double after_sort = log.Elapsed();
     // Kept from being optimised away: the sorted copy has to be observed.
     REQUIRE(!copy.empty());
-    if (serialize < 0.0 || this_serialize < serialize) serialize = this_serialize;
+    const double this_copy = after_copy - before_copy;
+    const double this_sort = after_sort - after_copy;
+    if (copy_cost < 0.0 || this_copy < copy_cost) copy_cost = this_copy;
+    if (sort_cost < 0.0 || this_sort < sort_cost) sort_cost = this_sort;
   }
+  // THE SMALLER OF THE TWO STEPS IS THE BUDGET. A wrong ordering puts at least
+  // one of them after the clock read, so the head is at least this large.
+  const double serialize = copy_cost < sort_cost ? copy_cost : sort_cost;
 
   REQUIRE_MESSAGE(emitted >= kRecords,
                   "the timeline was built with " << kRecords << " leaves and the table carries "
@@ -526,19 +798,23 @@ TEST_CASE("ltx2 phase log: the emitter reads its CLOCK before it serialises the 
   // `serialize` that collapsed toward the clock's resolution would make the
   // comparison meaningless in the other direction. It has to be an event.
   REQUIRE_MESSAGE(serialize > 1e-5,
-                  "copying and sorting " << emitted << " records measured " << serialize
-                      << "s, which is at or below this clock's own resolution. The difference "
-                         "between the two orderings is that copy and that sort, so a table this "
-                         "cheap to serialise cannot separate them -- which is exactly why the "
-                         "three-record case in #1569 stayed green under its own mutation");
-  MESSAGE("writer clock lag " << head << "s against a serialization cost of " << serialize
-                              << "s over " << emitted << " records (min of " << kProbes
-                              << " probes, ratio " << (head / serialize) << ")");
+                  "the CHEAPER of the writer's two post-clock steps over " << emitted
+                      << " records measured " << serialize
+                      << "s (copy " << copy_cost << "s, sort " << sort_cost
+                      << "s), which is at or below this clock's own resolution. A wrong "
+                         "ordering is detected by whichever step it moves, so a step this cheap "
+                         "cannot be detected at all -- which is exactly why the three-record "
+                         "case in #1569 stayed green under its own mutation");
+  MESSAGE("writer clock lag " << head << "s against copy " << copy_cost << "s and sort "
+                              << sort_cost << "s over " << emitted << " records (min of "
+                              << kProbes << " probes, budget " << serialize << "s, ratio "
+                              << (head / serialize) << ")");
   CHECK_MESSAGE(head < 0.5 * serialize,
                 "`WriteJson` recorded a wall " << head
                     << "s later than the clock this case read immediately before calling it, "
-                       "against a measured copy-and-sort of "
-                    << serialize << "s over " << emitted
+                       "against the cheaper of its two measured post-clock steps at "
+                    << serialize << "s (copy " << copy_cost << "s, sort " << sort_cost
+                    << "s) over " << emitted
                     << " records. The writer is reading its clock AFTER it serialises the "
                        "table, so its own copy and sort are charged to `wall_seconds` and "
                        "therefore to `unaccounted_seconds`. This table measures the render");
