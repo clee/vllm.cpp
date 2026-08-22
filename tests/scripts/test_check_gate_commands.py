@@ -274,7 +274,7 @@ class RatchetTests(unittest.TestCase):
         self.assertNotIn("ENG-NOW-DERIVED", gates.RUNNABLE_BASELINE)
 
     def test_re_adding_done_to_the_gated_population_breaks_the_pin(self):
-        # MUTATION: restoring the departed lifecycle state must expose the four
+        # MUTATION: restoring the departed lifecycle state must expose the five
         # runnable DONE rows and disagree with the re-pinned baseline.
         original = gates.GATED_STATES
         gates.GATED_STATES = frozenset(original | {"DONE"})
@@ -289,6 +289,7 @@ class RatchetTests(unittest.TestCase):
             "SERVE-HTTP-TRANSPORT",
             "ENG-NOW-DERIVED",
             "ENG-TRAILER-MERGE-ARTIFACTS",
+            "SPEC-BPE-QUADRATIC-MERGE",
         }
         self.assertEqual(runnable - set(gates.RUNNABLE_BASELINE), departed)
         self.assertNotEqual(runnable, set(gates.RUNNABLE_BASELINE))
@@ -361,6 +362,42 @@ class RatchetTests(unittest.TestCase):
         runnable = {r["id"] for r in gates.audit() if r["verdict"] == "runnable"}
         self.assertNotEqual(runnable, reduced)
         self.assertEqual(runnable - reduced, {"SERVE-RECIPE-ARGS"})
+
+    def test_dropping_the_request_length_guard_from_the_pin_breaks_it(self):
+        # MUTATION, in the direction this re-pin actually moved: the entry added
+        # for #1541 must be what keeps the exact pin agreeing with the audit.
+        # Remove it and the equality assertion above has to go red, which is
+        # what proves the row was pinned because it ENTERED the population and
+        # not to quiet a gate. Same shape and reason as SERVE-RECIPE-ARGS above.
+        reduced = set(gates.RUNNABLE_BASELINE) - {"SERVE-REQUEST-LENGTH-GUARD"}
+        self.assertNotEqual(reduced, set(gates.RUNNABLE_BASELINE))
+        runnable = {r["id"] for r in gates.audit() if r["verdict"] == "runnable"}
+        self.assertNotEqual(runnable, reduced)
+        self.assertEqual(runnable - reduced, {"SERVE-REQUEST-LENGTH-GUARD"})
+
+    def test_the_request_length_guard_is_credited_for_real_commands(self):
+        # The entry in RUNNABLE_BASELINE is the WHOLE of what this row changed
+        # in the checker, so without a case that reads the SPEC the constant is
+        # the only artifact and the credit is plausible rather than checkable --
+        # which `scripts/check-pr-size.py`'s `governance_checker` contract
+        # refuses, and it refused this row's first commit by name.
+        #
+        # Three things are pinned, not one: the row is in the exact pin, the
+        # audit really verdicts it `runnable`, and its `## Gates` section really
+        # does name commands that can fail rather than a `git diff --stat` that
+        # exits 0 unconditionally.
+        self.assertIn("SERVE-REQUEST-LENGTH-GUARD", gates.RUNNABLE_BASELINE)
+        verdicts = {r["id"]: r["verdict"] for r in gates.audit()}
+        self.assertEqual(verdicts.get("SERVE-REQUEST-LENGTH-GUARD"), "runnable")
+        spec = (
+            gates.ROOT / ".agents/specs/serve-request-length-guard.md"
+        ).read_text(encoding="utf-8")
+        # Split on the HEADING, not on the string: the spec's `## Now`
+        # section names `## Gates` in prose, and splitting on the bare
+        # text takes that mention instead of the section.
+        gate_section = spec.split("\n## Gates\n", 1)[1].split("\n## ", 1)[0]
+        self.assertIn("ninja -C build", gate_section)
+        self.assertIn("./build/tests/test_openai_api_server", gate_section)
 
     def test_residency_config_is_credited_for_real_commands(self):
         # ENG-RESIDENCY-CONFIG (#1110) is a NEW row arriving at ACTIVE, which is
@@ -780,6 +817,60 @@ class RatchetTests(unittest.TestCase):
         self.assertNotEqual(runnable, reduced)
         self.assertEqual(runnable - reduced, {"ENG-CUDAGRAPH-DEDUP"})
         self.assertEqual(runnable, set(gates.RUNNABLE_BASELINE))
+
+    def test_dropping_cudagraph_break_from_the_pin_breaks_it(self):
+        # MUTATION for the #1376 repair. ENG-CUDAGRAPH-BREAK entered the runnable
+        # population when W5 (#1361) filled its spec's Gates section with runnable
+        # evidence, and the re-pin that change owed was not made, so main itself
+        # failed this suite 8 times of 44. Remove the entry and set equality has
+        # to go red, which is what proves the row was pinned because it entered
+        # the population rather than to quiet a gate.
+        reduced = set(gates.RUNNABLE_BASELINE) - {"ENG-CUDAGRAPH-BREAK"}
+        self.assertNotEqual(reduced, set(gates.RUNNABLE_BASELINE))
+        runnable = {r["id"] for r in gates.audit() if r["verdict"] == "runnable"}
+        self.assertNotEqual(runnable, reduced)
+        self.assertEqual(runnable - reduced, {"ENG-CUDAGRAPH-BREAK"})
+        self.assertEqual(runnable, set(gates.RUNNABLE_BASELINE))
+
+    def test_hf_model_download_earns_its_runnable_baseline_entry(self):
+        # ENG-HF-MODEL-DOWNLOAD (#1280) arrives at READY, so it enters the gated
+        # population for the first time and the baseline grows by one. Same
+        # shape and same reason as the row above.
+        #
+        # The row is classified runnable because its spec's `## Gates` section
+        # names `scripts/validate-container-image.py`, a command that can fail.
+        # The exact pin proves the SET agrees, which holds for any membership
+        # and cannot say this row belongs. This says it: remove the entry and
+        # set equality has to go red, which is what separates a row pinned
+        # because it entered the population from a row pinned to quiet a gate.
+        verdicts = {r["id"]: r["verdict"] for r in gates.audit()}
+        self.assertEqual(verdicts.get("ENG-HF-MODEL-DOWNLOAD"), "runnable")
+        reduced = set(gates.RUNNABLE_BASELINE) - {"ENG-HF-MODEL-DOWNLOAD"}
+        self.assertNotEqual(reduced, set(gates.RUNNABLE_BASELINE))
+        runnable = {r["id"] for r in gates.audit() if r["verdict"] == "runnable"}
+        self.assertNotEqual(runnable, reduced)
+        self.assertEqual(runnable - reduced, {"ENG-HF-MODEL-DOWNLOAD"})
+        self.assertEqual(runnable, set(gates.RUNNABLE_BASELINE))
+
+    def test_bpe_quadratic_merge_left_the_gated_population_cleanly(self):
+        # SPEC-BPE-QUADRATIC-MERGE (#1365) entered the runnable population on
+        # 2026-08-19 as growth, when its `## Gates` section gained the `g++`
+        # build and the run lines for `tools/bench/bpe_encode_cost.cpp`. Its
+        # closing commit promoted the row `GATING` -> `DONE`, and `DONE` is not
+        # in GATED_STATES, so it leaves the AUDITED population entirely.
+        #
+        # Assert the departure on BOTH sides -- gone from the audit AND gone
+        # from the baseline -- because a row present in one and not the other is
+        # exactly what the exact pin exists to catch. Same shape and same reason
+        # as ENG-TRAILER-MERGE-ARTIFACTS and ENG-NOW-DERIVED above.
+        #
+        # The row is NOT re-verdicted downward and it did not lose its command:
+        # the recipe is still in the spec. This case pins the difference, since
+        # a row that leaves and a row that silently drops its gate command are
+        # the two things this classifier must never confuse.
+        verdicts = {r["id"]: r["verdict"] for r in gates.audit()}
+        self.assertIsNone(verdicts.get("SPEC-BPE-QUADRATIC-MERGE"))
+        self.assertNotIn("SPEC-BPE-QUADRATIC-MERGE", gates.RUNNABLE_BASELINE)
 
 
 if __name__ == "__main__":
