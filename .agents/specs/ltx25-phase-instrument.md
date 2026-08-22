@@ -240,9 +240,121 @@ FAILURE TEXT rather than by job name.
 
 ## Evidence
 
-Filled by the run that lands this row. See `## Outcome`.
+Measured on this branch, on an x86_64 box at load average 103 to 131 -- which is
+5 to 6 times its core count and is the regime the withdrawn bound failed in.
+Build: `cmake -S . -B build -DVLLM_CPP_BUILD_TESTS=ON`, no `CMAKE_BUILD_TYPE`,
+which is what `build-test-cpu` configures.
+
+### The #1569 bound, over 50 consecutive runs under real load
+
+The one bound this row keeps. Each run executed the ONE case and the case count
+was recorded for every run, because a `-tc` filter that matches nothing prints
+`0 cases ran` and `Status: SUCCESS!` and is indistinguishable from a green run.
+All 50 read `test cases: 1 | 1 passed | 0 failed`.
+
+| quantity | min | median | p90 | max |
+|---|---:|---:|---:|---:|
+| `head / serialize` | 0.000716 | 0.002308 | 0.003115 | **0.004228** |
+| `head` seconds | 5.02e-6 | 8.22e-6 | 1.04e-5 | 1.19e-5 |
+| `serialize` seconds | 2.55e-3 | 3.26e-3 | -- | 9.65e-3 |
+| box load average | 102.8 | 125.7 | -- | 131.4 |
+
+**0 red in 50.** The bound is 0.5, so the worst observed run had **118x** of
+margin. The same case with the mutation applied -- `main`'s own clock ordering --
+measures **1.00383**, which is 237x above the honest maximum and 2.0x above the
+bound. The three populations do not overlap and are not close to overlapping:
+
+```
+honest    [0.00072 .. 0.00423]      bound 0.5      defective ~1.004
+```
+
+That is the shape the withdrawn bound did not have. Its honest population had a
+median of 1.132 and a maximum of 4.115 against a bound of 2, so the bound sat
+INSIDE the scatter and 4 runs in 45 crossed it.
+
+### The mutation table
+
+Every mutation prints its own `compile_status` and a sha256 pair, because a
+mutation that fails to build and a mutation that never applied both read as a
+passing test. Every one restored the tree byte-for-byte, verified by sha256, and
+the first attempt at a text-reverse restore FAILED that check -- its anchor was
+no longer unique once applied, because `RenderText` carries the same two lines
+`WriteJson` does -- so the harness restores from a pristine byte copy instead.
+
+| id | mutation | verdict |
+|---|---|---|
+| M1 | `WriteJson` reads its clock AFTER the copy and sort, i.e. `main`'s code | RED, `head/serialize` 1.004 against 0.5 |
+| M2 | the decomposition drops the FIRST gap -- the prologue, 92% of a real residue | RED on the gap count |
+| M3 | the decomposition counts NESTED records as leaves | RED on all three: a negative gap, the identity, the count |
+| M7 | the tail gap reported as zero, count and names untouched | RED on the identity alone |
+| M8 | each gap measured to the leaf's END rather than its START | RED on the identity alone |
+| M4 | every instrument interval charged to the TABLE, never to a leaf | RED on 4 assertions across 2 cases |
+| M5 | a SPAN absorbs the charge, so the residue's explanation vanishes into a number `Sum` skips | RED on the span assertion |
+| M6 | the per-record charge is not emitted | RED on 2 assertions across 2 cases |
+| R1 | the production emitter stops writing `gaps` -- run against the RENDER case | RED at `REQUIRE(table.contains("gaps"))` |
+| R2 | `ChargeLocked` charges nothing anywhere -- run against the RENDER case | RED at `REQUIRE(instrument > 0.0)` |
+
+R1 and R2 are the reachability half. Both were run against
+`ltx2 video: a render through the ABI emits a phase table that SUMS to wall`,
+which enters through `vllm_video_engine_load` and `vllm_video_generate`, so what
+they prove is that a RENDER reaches this code and not that the class works.
+
+M3's verdict is itself a repair. On its first run the case aborted at a fatal
+count `REQUIRE` placed above the loop, so the negative gap that same mutation
+produces was never observed and two of the case's three assertions were unproven
+while the case reddened. The count moved below the loop and became a `CHECK`.
+
+### What the decomposition found on its first real render
+
+On the 64x64x9 ABI render, at wall 21.89 s on a loaded box: a residue of
+2.013 ms over 21 gaps, of which **0.944 ms -- 47% -- is charged to the
+instrument itself**. That is the quantity #1439 asked to have beside the ratio,
+and this is the first table that carries it.
+
+The largest remaining gap is **`load.dit` -> `load.video_vae`, 0.627 ms**. That
+is exactly the region `load.dit_config` names, which is item 1 of #1668. The
+decomposition pointed at the next un-named region on its first run, from the
+emitted file, with no script -- which is the whole of what #1571 asked for.
+
+The load's prologue, which held 92% of this residue when #1556 measured it, no
+longer appears: `519303d15` named it `load.open`.
+
+## Outcome
+
+**Closed: #1569 and #1571.** #1668 keeps items 1 to 3 and stays open. #1570,
+#1568 and #1567 stay open and are recorded under `## Owed` with what each still
+needs.
+
+What was measured, and what was rejected:
+
+- **`residue <= 2 * instrument` was not re-proposed.** It was not re-measured
+  either. `ltx25-phase-residue.md` `## Design` 3 already measured it across four
+  sites and hundreds of runs, and re-deriving a settled negative result is the
+  cost that record exists to remove.
+- **The one new constant is 0.5 and it is not a tolerance.** Its derivation is
+  in `## Design` 5: the two orderings differ by exactly one copy and one sort,
+  so the defective value is at least 1.0 by definition and any constant inside
+  `(0, 1)` separates them. The measurement's job was to confirm the separation,
+  not to choose the number, and it confirmed 237x.
+- **The estimator carries the argument, not the constant.** Contention is
+  one-sided, so a minimum over K probes strips the sporadic term from the honest
+  side and cannot strip the deterministic term from the defective side. A gate
+  whose noise is one-sided AWAY from red does not need a tail budget.
+- **`serialize > 1e-5` is a precondition and not decoration.** #1569 exists
+  because a three-record table made the two orderings indistinguishable, and a
+  gate that silently loses its discriminator is a mute switch. Measured
+  headroom on this tree: 255x.
+- **The gap decomposition is arithmetic, not a measurement.** That is why it is
+  the strongest thing in this row. Five of the ten mutations above are caught by
+  a comparison with no clock in it.
+
+What a reader should NOT conclude: that either floor is now honest at 21 B
+scale. `leaves >= 0.95 * wall` still decides by box load at small wall and still
+permits minutes of un-named time at large wall. This row gives a reader the
+quantity that would settle it -- the residue, split by region, with the
+instrument's own share subtracted -- and asserts an identity over it. #1439
+stays open because a quantity a reader can see is not yet a budget a gate holds.
 
 ## Now
 
-Spec committed. Implementation follows in the same pull request, and the commit
-order proves the spec came first.
+Landed. #1569 and #1571 closed; #1668 keeps items 1 to 3.
