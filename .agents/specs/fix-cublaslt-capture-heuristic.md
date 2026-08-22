@@ -133,6 +133,34 @@ path; the board gate must fail again with status 14.
   surface, and the build-verified to run-verified wording for sm_80 rides in
   this row's `## Outcome`, not in a projection.
 
+### Board gate record (2026-08-22)
+
+Board: CMP 170HX 64GB (GA100, sm_80, 70 SMs), driver 610.57.04, CUDA 13.3
+V13.3.73. Build dir `build-cuda-wt` with `-DVLLM_CPP_CUDA_ARCHITECTURES=80`.
+Every GPU run held `flock ${GPU_LOCK:-$HOME/gpu.lock}`.
+
+Command:
+
+```sh
+build-cuda-wt/examples/vllm-cli --model /home/models/Qwen3.8-27B-UD-Q8_K_XL.gguf --prompt 'The quick brown fox' --max-tokens 24
+```
+
+Three default (graphs-on) runs exit 0 with the identical 24-token output
+(" jumps over the lazy dog." continuation), `tok_s` 1.018/1.022/1.022. One
+`VLLM_CPP_CUDAGRAPH=0` run exits 0 with the identical token stream. One
+`VT_GEMM_PLAN_CACHE=0` run (graphs on) exits 1 with:
+
+```text
+vt cuda: matmul: bt cublasLtMatmulAlgoGetHeuristic: cublas status 14
+(CUBLAS_STATUS_INTERNAL_ERROR)
+```
+
+That disabled-cache run is the reachability proof: the cache is the fix
+path. Reviewer mutations, tree restored byte-for-byte after each: M1 deleted
+the `bt` cache-hit return and the board gate went red with status 14; M2
+dropped `ld` from the key and the CPU test went red; M3 flipped the flag
+default and the CPU test went red. Verdict: PASS at `06f905912`.
+
 ## Stop conditions
 
 - If CUDA 13.3 also fails `cublasLtMatmul` itself inside capture, the cache is
@@ -151,5 +179,6 @@ path; the board gate must fail again with status 14.
 
 ## Now
 
-- 2026-08-22: SPEC. Defect reproduced and diagnosed on the board; issue
-  #1732 filed; spec committed before implementation.
+- 2026-08-22: SPEC committed (`8dc827cbc`).
+- 2026-08-22: IMPLEMENTED and reviewed PASS (`06f905912`); board gate green;
+  awaiting merge.
