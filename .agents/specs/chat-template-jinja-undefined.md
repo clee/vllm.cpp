@@ -428,8 +428,9 @@ repo-wide `windows-msvc-*` red of
 ## Now
 
 The owning matrix row stays `ANCHOR-BACKFILL`. This row repairs a defect inside
-it and moves no lifecycle state, so it owes no `docs/STATUS.md` or
-`docs/BENCHMARKS.md` edit. `docs/reference/server.md` changes because the
-request field and the `--enable-thinking` default are user-visible; it is the
-lookup surface `docs/USAGE.md` sends a reader to for serving flags and request
-fields, so nothing in `USAGE.md` itself goes stale.
+it and moves no lifecycle state, so it owes no `## Now` move and no
+`docs/BENCHMARKS.md` edit (`docs/STATUS.md` was retired on `main` in `1db7e59cf`
+while this branch was open). `docs/reference/server.md` changes because the
+request field, the refused keys and the `--enable-thinking` default are all
+user-visible; `docs/USAGE.md` changes because the C ABI's chat default changed
+with this row and `vllm_chat` gained the field.
