@@ -65,7 +65,7 @@ class Qwen3VLLoadedModel final : public LoadedModel {
   const Qwen3VLWeights& weights() const { return *weights_; }
 
   // #607 L3: the mirror of `_tower_model_names` + `StageMissingLayer`'s
-  // stage_name (interfaces.py:141,280-283,298). Non-empty only when this load
+  // stage_name (interfaces.py:141,279-282,298). Non-empty only when this load
   // deliberately left `model.visual.*` unread.
   std::vector<std::string> skipped_towers() const override {
     if (!weights_->vision_skipped) return {};

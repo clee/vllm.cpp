@@ -44,7 +44,7 @@
 
 namespace vllm {
 
-// `stage_name` for the {"image", "video"} pair (interfaces.py:280-283). Named
+// `stage_name` for the {"image", "video"} pair (interfaces.py:279-282). Named
 // once so the loader that sets it and the gate that reads it cannot drift.
 inline constexpr std::string_view kVisionTowerStageName = "vision_tower";
 
@@ -61,7 +61,7 @@ inline constexpr std::string_view kVisionTowerStageName = "vision_tower";
 // literal port would skip every tower marked with no modality at all. Upstream
 // cannot reach that state — `_mark_tower_model` is only ever called with a
 // non-empty set, and a `str` argument is normalised to a one-element set at
-// `:275-276` — so the divergence is unobservable against upstream and closes a
+// `:276-277` — so the divergence is unobservable against upstream and closes a
 // failure mode that is silent on ours.
 bool SkipTowerForModalities(const MultiModalConfig* mm_config,
                             std::initializer_list<std::string_view> modalities);

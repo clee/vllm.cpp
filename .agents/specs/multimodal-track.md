@@ -496,7 +496,7 @@ comparing the two arms must set the flag on both sides or state that it did not.
      Qwen3.6 / Qwen3-VL tower is marked `{"image", "video"}`
      (`qwen3_5.py:422`, `qwen3_5.py:634`, `qwen3_vl.py:1747`), so `image: 0`
      alone does NOT skip it. `stage_name` is `"vision_tower"` for exactly that
-     pair (`interfaces.py:280-283`).
+     pair (`interfaces.py:279-282`).
   3. **CONSTRUCT-without-initialise, not "do not construct".** `no_init_weights`
      enters `torch.device("meta")` (`utils.py:762`) — every submodule's
      `__init__` still runs and every shape is still resolved, and no storage is
@@ -515,8 +515,17 @@ comparing the two arms must set the flag on both sides or state that it did not.
 
   **One correction to #607's own framing, found by reading our tree rather than
   upstream's.** The issue says "builds the tower uninitialised" as though it
-  were one site. In THIS tree there are exactly **two** production tower-load
-  call sites, and a third that a name-only search would wrongly count:
+  were one site. In THIS tree there are **three** production tower-load call
+  sites, and a fourth that a name-only search would wrongly count.
+
+  This paragraph said **two** through the first cut of L3, and it was wrong. The
+  count was taken by searching the model loaders, and the third site is not in
+  one: it is in the ENTRYPOINT, it reads a SECOND FILE the user names with
+  `--mmproj`, and it belongs to no architecture's weights struct. So the survey
+  that produced this list could not have found it, and the number it produced
+  read as exhaustive. Recorded as a correction rather than edited into silence,
+  because the shape of the miss is the reusable part: a tower is whatever costs
+  tower-sized memory, not whatever a model loader calls a tower.
 
   - `src/vllm/model_executor/models/qwen3_vl.cpp:418` —
     `w.vision = LoadQwen3VLVisionWeights(shards, w.vision_cfg)` inside
@@ -527,6 +536,15 @@ comparing the two arms must set the flag on both sides or state that it did not.
     inside `LoadMuseGlimmerForConditionalGenerationWeights`, reached from
     `muse_glimmer_registry.cpp:77-78` (both `MuseGlimmerForCausalLM` and
     `MuseGlimmerForConditionalGeneration`);
+  - `src/vllm/entrypoints/model_loader.cpp` —
+    `vision_tower = LoadQwen3VLVisionFromClipMmproj(*mmproj, vision_config)` in
+    the `FromModelDir` GGUF branch, reached whenever `--mmproj`
+    (`server_main.cpp`, `mmproj_path`) names a `clip` projector beside a `.gguf`
+    language file (row `LOAD-GGUF-MMPROJ`, #821). It is the SAME Qwen3-VL tower
+    as the first site, read out of a second file instead of out of the model's
+    shards, and the engine holds it for the process lifetime. Until L3's repair
+    wave, `--language-model-only` on this path zeroed every limit, refused every
+    image request, and still paid for the projector;
   - **NOT** `LoadQwen3_5MoeVision` (`qwen3_5_weights.h:991`). It has no
     production caller at all — the only references outside its own definition
     are `tests/vllm/models/test_qwen3_5_moe_vision.cpp` and
@@ -605,7 +623,7 @@ comparing the two arms must set the flag on both sides or state that it did not.
 
   empty on every text model and on every multimodal model loaded with a non-zero
   limit, `{"vision_tower"}` on a skipped one — `stage_name` for `{"image",
-  "video"}` at `interfaces.py:280-283`. `LoadedEngine::skipped_towers()`
+  "video"}` at `interfaces.py:279-282`. `LoadedEngine::skipped_towers()`
   forwards it, which is what lets the gate below enter through a production
   entry point instead of asserting on a class.
 
@@ -659,18 +677,34 @@ comparing the two arms must set the flag on both sides or state that it did not.
   | `qwen3.6-35b-a3b-bf16` (67 G) | `Qwen3_5MoeForConditionalGeneration` | no — `LoadQwen3_5Moe` reads the text backbone only; `LoadQwen3_5MoeVision` has no production caller (#891) |
   | `qwen3.8-27b-safetensors` | `Qwen3_5ForConditionalGeneration` | no — the dense arm's loader reads no `model.visual.*` either |
 
-  There is **no `Qwen3VLForConditionalGeneration` checkpoint on the NAS**, so the
-  `qwen3_vl.cpp:418` site is implemented and CPU-gated but not RSS-measured.
-  Measuring it would need `Qwen/Qwen3-VL-4B-Instruct` (~8.3 GiB), which is a
-  download nobody has authorised and which this row does not need: the two sites
-  run the same predicate through the same seam, and the one that is measurable
-  is the one that carries the mechanism. Recorded as a gap, not glossed.
+  That table was read on 2026-08-19 and the checkpoint set has since moved.
+  `Qwen/Qwen3-VL-4B-Instruct` is now **present and pinned** at
+  `/mnt/nas_share/checkpoints/qwen3-vl-4b-instruct` — 8.3 GiB,
+  `architectures: ["Qwen3VLForConditionalGeneration"]`, revision
+  `ebb281ec70b05090aa6165b016eac8ec08e71b17` — so the `qwen3_vl.cpp` site is
+  **measurable**, and is simply not measured yet. Keep that polarity: it was
+  never unmeasurable by nature, only unfed, and the operator sequences the run.
+  The earlier text here said no such checkpoint existed and called the download
+  unauthorised, while `## Owed` said the fetch was authorised and in progress;
+  both halves were stale at once, which is what a fact recorded in two places
+  does.
+
+  The CPU gate that half of the skip does have is
+  `tests/vllm/models/test_tower_skip.cpp`, section 2b, over a synthetic
+  TEXT-BACKBONE-ONLY checkpoint. That gate did not exist through the first cut
+  of L3: nothing passed a non-null `mm_config` to `LoadQwen3VLWeights`, so
+  destroying the Qwen3-VL half of the skip outright left every declared suite
+  green. The measurement is owed; the gate no longer is.
 
   *Method.* Peak RSS, not steady-state: the load phase is where the tower's bytes
   are paid, and a steady-state figure taken after the allocator has returned
   pages would report a saving the box never saw. `/usr/bin/time -v` (`Maximum
   resident set size`) around one process that loads the checkpoint and generates
-  a fixed 16 greedy tokens from a fixed text prompt, run A-B-A-B, from **two
+  a fixed 16 greedy tokens from a fixed text prompt, run as two pairs with the
+  arm-to-binary assignment SWAPPED between them (A-B then B-A, so each binary
+  runs each arm exactly once — pinning one binary to one arm would make binary
+  identity perfectly correlated with the arm, and any difference between the
+  builds would arrive as the result), from **two
   separate build directories of the same commit** (an A/B that reuses one build
   directory measures one binary twice, and identical call counts are the tell),
   on an otherwise idle box, with the page cache warmed by a discarded first run
@@ -1502,12 +1536,24 @@ L4 (§1.6); the second while landing L3 (§1.5).
   threshold is declared ahead of it. **Until that runs, the flag is still not
   described as freeing memory**, which is the same discipline L2 recorded.
 - **[#607](https://github.com/mudler/vllm.cpp/issues/607) L3 — the
-  `qwen3_vl.cpp:418` site is implemented and CPU-gated but not RSS-measured in
-  this wave.** No `Qwen3VLForConditionalGeneration` checkpoint was on the NAS
-  when L3 landed; the fetch of `Qwen/Qwen3-VL-4B-Instruct` is authorised and in
-  progress, so the site becomes measurable rather than being unmeasurable by
-  nature. Tracked by [#1358](https://github.com/mudler/vllm.cpp/issues/1358).
-  Both sites run the same predicate through the same seam.
+  `qwen3_vl.cpp` site is CPU-gated but not RSS-measured in this wave.** The
+  checkpoint is now PRESENT: `Qwen/Qwen3-VL-4B-Instruct` at
+  `/mnt/nas_share/checkpoints/qwen3-vl-4b-instruct`, 8.3 GiB, revision
+  `ebb281ec70b05090aa6165b016eac8ec08e71b17`. So the site is measurable and
+  simply unmeasured; it was never unmeasurable by nature. The harness does not
+  drive Qwen3-VL yet, and the operator sequences both that and the run. Tracked
+  by [#1358](https://github.com/mudler/vllm.cpp/issues/1358). All three sites
+  run the same predicate through the same seam.
+- **[#607](https://github.com/mudler/vllm.cpp/issues/607) L3 — the `--mmproj`
+  arm's SKIP REPORTING is env-gated only.** The behaviour (the projector's
+  tensors go unread at zero limits) is gated in CI by the message A/B in
+  `tests/vllm/entrypoints/test_gguf_mmproj_reach.cpp`, which needs no artifact.
+  What `LoadedEngine::skipped_towers()` REPORTS on that arm is observed only by
+  the env-gated case beside it, because no `LoadedEngine` can be built from the
+  synthetic language GGUF — it carries no tokenizer on purpose. Closing this
+  needs either a complete synthetic GGUF or a run with
+  `VLLM_CPP_QWEN38_27B_GGUF` / `VLLM_CPP_QWEN38_27B_MMPROJ` set. Tracked by
+  [#1358](https://github.com/mudler/vllm.cpp/issues/1358).
 - **[#1358](https://github.com/mudler/vllm.cpp/issues/1358)** — the Qwen3-VL
   tower is loaded on the production path and read by nothing in `src/`. Wiring
   it into the server's mm forward is the MM-SERVE-E2E residual

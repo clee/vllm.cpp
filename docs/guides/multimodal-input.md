@@ -121,9 +121,15 @@ so a refusal can still name what is missing, and its checkpoint tensors are neve
 read. This mirrors vLLM's `_mark_tower_model`
 (`vllm/model_executor/models/interfaces.py:288-293`), and it follows from the
 LIMITS rather than from the flag: `--limit-mm-per-prompt '{"image":0,"video":0}'`
-skips the same tower, and one non-zero modality keeps it. Two architectures load
-a tower on the production path and both are gated,
-`MuseGlimmerForConditionalGeneration` and `Qwen3VLForConditionalGeneration`.
+skips the same tower, and one non-zero modality keeps it.
+
+Three production tower loads exist and all three are gated: the two
+architectures that read a tower out of their own checkpoint,
+`MuseGlimmerForConditionalGeneration` and `Qwen3VLForConditionalGeneration`, and
+the `--mmproj` projector, which is the Qwen3-VL tower read out of a second
+`clip` GGUF beside a `.gguf` language file. On the `--mmproj` path the file is
+still opened and still validated at zero limits — a projector this build cannot
+use is refused by name whatever the limits are — and only its tensors go unread.
 
 The server prints one line naming what was skipped, read back off the loaded
 model rather than off the flag:

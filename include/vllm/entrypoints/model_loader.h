@@ -444,7 +444,7 @@ class LoadedEngine {
   // stage names of the towers this engine's model constructed WITHOUT loading,
   // because every modality they serve was at limit 0 — upstream's
   // `_tower_model_names` + `StageMissingLayer(stage_name, ...)`
-  // (interfaces.py:141,280-283,298). EMPTY on every text model and on every
+  // (interfaces.py:141,279-282,298). EMPTY on every text model and on every
   // multimodal model loaded with a non-zero limit, so a caller can tell
   // "--language-model-only actually freed the tower" from "the flag was
   // accepted and did nothing", which is the distinction L2 could not make.

@@ -54,7 +54,7 @@ class MuseGlimmerLoadedModel final : public LoadedModel {
   const MuseGlimmerWeights& weights() const { return weights_; }
 
   // #607 L3: the mirror of `_tower_model_names` + `StageMissingLayer`'s
-  // stage_name (interfaces.py:141,280-283,298). Non-empty ONLY when the
+  // stage_name (interfaces.py:141,279-282,298). Non-empty ONLY when the
   // checkpoint carries a perception encoder that this load deliberately did not
   // read; a text-only checkpoint reports nothing, because nothing was skipped.
   std::vector<std::string> skipped_towers() const override {

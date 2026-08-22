@@ -359,7 +359,7 @@ TEST_CASE("tower skip: the loader reads the tower by default and not at zero lim
     std::unique_ptr<vllm::LoadedModel> skipped = ModelRegistry::Load(config, source);
     REQUIRE(skipped != nullptr);
     REQUIRE(skipped->skipped_towers().size() == 1);
-    // interfaces.py:280-283 — the stage_name for exactly the {image, video} pair.
+    // interfaces.py:279-282 — the stage_name for exactly the {image, video} pair.
     CHECK(skipped->skipped_towers()[0] == "vision_tower");
   }
 

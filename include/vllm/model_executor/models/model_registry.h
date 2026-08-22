@@ -142,7 +142,7 @@ class LoadedModel {
 
   // ENG-MM-INPUT-PIPELINE wave L3 (#607): the mirror of
   // `SupportsMultiModal._tower_model_names` (interfaces.py:141,298) together
-  // with the `stage_name` each skipped stage carries (`:280-283`). The stage
+  // with the `stage_name` each skipped stage carries (`:279-282`). The stage
   // names of the towers this model CONSTRUCTED WITHOUT LOADING because every
   // modality they serve had limit 0 — upstream's
   // `isinstance(model.visual, StageMissingLayer)`, expressed on a type-erased

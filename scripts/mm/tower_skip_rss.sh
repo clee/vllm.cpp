@@ -146,8 +146,21 @@ done
 BIN_A=$(find /tmp/tower-skip-build-a -name vllm-server -type f | head -1)
 BIN_B=$(find /tmp/tower-skip-build-b -name vllm-server -type f | head -1)
 [ -n "$BIN_A" ] && [ -n "$BIN_B" ] || { echo "vllm-server not found in one of the build trees" >&2; exit 4; }
-echo "binary A        $(sha256sum "$BIN_A")"
-echo "binary B        $(sha256sum "$BIN_B")"
+SHA_A=$(sha256sum "$BIN_A" | cut -d' ' -f1)
+SHA_B=$(sha256sum "$BIN_B" | cut -d' ' -f1)
+echo "binary A        $SHA_A  $BIN_A"
+echo "binary B        $SHA_B  $BIN_B"
+# The two builds come from one commit with one set of flags, so they SHOULD be
+# byte-identical. Not asserted: the build directory path is embedded (`__FILE__`,
+# debug prefixes), so a difference here is usually the path and not the code, and
+# a hard stop on it would fail a correct run. Printed instead, and decorrelated
+# below, which is the property that actually matters.
+if [ "$SHA_A" = "$SHA_B" ]; then
+  echo "binaries        IDENTICAL"
+else
+  echo "binaries        DIFFER (expected only if the embedded build path leaks in;"
+  echo "                the A-B-B-A order below keeps this off the arm axis anyway)"
+fi
 
 # One arm of the measurement: start the server, wait for it to answer, ask for
 # exactly $MAX_TOKENS greedy tokens, stop it. `/usr/bin/time -v` wraps the SERVER,
@@ -185,11 +198,19 @@ run_arm() {
 echo "== warming the page cache (this run is DISCARDED) =="
 run_arm "$BIN_A" warmup || exit 5
 
-echo "== A-B-A-B =="
+# The arm-to-binary assignment SWAPS between the two pairs. Pinning `default` to
+# BIN_A and `lmo` to BIN_B in both pairs makes binary identity perfectly
+# correlated with the arm, so any difference between the two binaries — a stale
+# object, a different toolchain resolution, one tree that did not rebuild —
+# arrives as a difference between the arms and is indistinguishable from the
+# saving being measured. Swapping puts each binary on each arm once, so a
+# binary-shaped effect shows up as disagreement BETWEEN the pairs (which the
+# spread report already prints) rather than as the result.
+echo "== A-B then B-A: each binary runs each arm exactly once =="
 run_arm "$BIN_A" default            || exit 5
 run_arm "$BIN_B" lmo --language-model-only || exit 5
-run_arm "$BIN_A" default2           || exit 5
-run_arm "$BIN_B" lmo2 --language-model-only || exit 5
+run_arm "$BIN_B" default2           || exit 5
+run_arm "$BIN_A" lmo2 --language-model-only || exit 5
 
 echo
 echo "== first pair =="

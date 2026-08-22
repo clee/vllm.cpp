@@ -796,7 +796,7 @@ MuseGlimmerWeights LoadMuseGlimmerForConditionalGenerationWeights(
   // geometry off `vision_config`, which is upstream's construct-then-do-not-
   // initialise exactly (interfaces.py:288-293 over `torch.device("meta")`); only
   // the storage is skipped. The perception encoder covers image AND video
-  // (muse_glimmer_registry.cpp:36-37), which is the modality set `_mark_tower_
+  // (muse_glimmer_registry.cpp:37-39), which is the modality set `_mark_tower_
   // model` would be called with, so BOTH must be 0 — `--limit-mm-per-prompt
   // '{"image":0}'` alone keeps the tower.
   if (w.params.vision.present) {
