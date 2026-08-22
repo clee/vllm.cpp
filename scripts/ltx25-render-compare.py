@@ -46,17 +46,36 @@ WHAT IT MEASURES, and why each one is here rather than a fourth statistic:
 
 USAGE
     ltx25-render-compare.py --a <dir> --b <dir> [--control <dir>] \
-        [--label-a naive] [--label-b flash] [--json out.json]
+        [--control-of a|b] [--label-a naive] [--label-b flash] [--json out.json]
 
-`--control` is a THIRD render of arm A's own configuration. It measures the
-noise floor: run-to-run nondeterminism of the same binary and the same knob.
-Without it, an arm-to-arm delta cannot be attributed to the knob rather than to
-the machine. With it, the attribution is arithmetic -- if the control is zero,
-every bit of the A-vs-B delta is the knob; if the control is the same size as
-the delta, the knob changed nothing the box does not change on its own.
+`--control` is a THIRD render that repeats ONE of the two arms with nothing
+changed. It measures the noise floor: run-to-run nondeterminism of the same
+binary and the same knob. Without it, an arm-to-arm delta cannot be attributed
+to the knob rather than to the machine. With it, the attribution is arithmetic
+-- if the control is zero, every bit of the A-vs-B delta is the knob; if the
+control is the same size as the delta, the knob changed nothing the box does not
+change on its own.
+
+`--control-of` says WHICH ARM the control repeats, and it exists because the
+answer used to be a silent convention. The control was always compared against
+arm A, stated only here, and the harness called this tool with the control
+repeating arm B -- so the "noise floor" was a second copy of the treatment
+comparison, guaranteed to read about the same size as the delta it was supposed
+to calibrate, and the null verdict below would have been published whatever the
+kernel did. The argument is now explicit, it is recorded in the JSON as
+`control_of`, and the control block prints the arm it was read against.
+
+`control_ratio` is the number section 10.5 selects on: the control's mean
+absolute difference over the treatment's, on luma, in the same units. It is
+REPORTED and never checked, because it chooses between two readings of a passing
+result rather than between passing and failing. It is `null`, with a reason,
+when the treatment is bit-identical and the denominator is therefore zero.
 
 Exit 0 when every threshold passes, 1 when one fails, 2 when the inputs cannot
-be read. A missing input is never a pass.
+be read. A missing input is never a pass, and it is never an exit 1 either: a
+1 says "the two renders differ", which is a reading of an experiment that
+happened, and a broken render that reported it would be indistinguishable from
+the finding this tool exists to make.
 """
 
 from __future__ import annotations
@@ -66,11 +85,25 @@ import hashlib
 import json
 import math
 import os
-import struct
 import sys
 import wave
 
 import numpy as np
+
+# --- the three exit statuses, which are three different statements ------------
+EXIT_PASS = 0        # every threshold passed
+EXIT_FAIL = 1        # a threshold failed: the renders differ, and by how much
+EXIT_UNREADABLE = 2  # nothing was compared, because an input could not be read
+
+
+class UnreadableInput(ValueError):
+    """An input this tool cannot read, as opposed to one it read and refused.
+
+    It subclasses `ValueError` because `read_ppm` raised that before this class
+    existed and callers outside `main()` still catch it. Everything that raises
+    it leaves `main()` at `EXIT_UNREADABLE` with no JSON written: a report with
+    no comparison in it is worse than no report.
+    """
 
 # --- the registered thresholds ------------------------------------------------
 # These are DEFAULTS, and they are written here rather than passed at the call
@@ -98,7 +131,7 @@ def read_ppm(path: str) -> np.ndarray:
     with open(path, "rb") as fh:
         data = fh.read()
     if not data.startswith(b"P6"):
-        raise ValueError(f"{path}: not a binary P6 PPM (starts {data[:2]!r})")
+        raise UnreadableInput(f"{path}: not a binary P6 PPM (starts {data[:2]!r})")
     # Header tokens: P6 width height maxval, with '#' comments allowed anywhere.
     tokens: list[bytes] = []
     i = 2
@@ -117,16 +150,26 @@ def read_ppm(path: str) -> np.ndarray:
     i += 1  # exactly one whitespace byte after maxval, per the format
     w, h, maxval = (int(t) for t in tokens)
     if maxval != 255:
-        raise ValueError(f"{path}: maxval {maxval}, expected 255")
+        raise UnreadableInput(f"{path}: maxval {maxval}, expected 255")
     need = w * h * 3
     px = data[i : i + need]
     if len(px) != need:
-        raise ValueError(f"{path}: truncated, {len(px)} of {need} pixel bytes")
+        raise UnreadableInput(f"{path}: truncated, {len(px)} of {need} pixel bytes")
     return np.frombuffer(px, dtype=np.uint8).reshape(h, w, 3)
 
 
 def frame_paths(d: str) -> list[str]:
+    """Every `frame_*.ppm` in one arm, in name order, and NEVER an empty list.
+
+    A directory with no frames is a render that did not happen, so it is refused
+    here rather than carried forward as a comparison with zero terms. It used to
+    reach a `content.<arm>.frames = False` check that could never fire -- the
+    zero-frame arm raised out of `compare_video` first -- and exit 1, which is
+    the status that says the two renders DIFFER.
+    """
     names = sorted(n for n in os.listdir(d) if n.startswith("frame_") and n.endswith(".ppm"))
+    if not names:
+        raise UnreadableInput(f"{d}: no frame_*.ppm files, so this arm rendered nothing")
     return [os.path.join(d, n) for n in names]
 
 
@@ -203,15 +246,21 @@ def arm_content(d: str) -> dict:
     shelled out to, because that file lives on a mutable path on a share and
     this one is committed per revision.
     """
-    paths = frame_paths(d)
+    paths = frame_paths(d)  # refuses an empty arm; see EXIT_UNREADABLE above
     out: dict = {"dir": os.path.abspath(d), "frames": len(paths)}
-    if not paths:
-        out["verdict"] = "NO FRAMES"
-        return out
     means, variances, hashes, adjacent = [], [], set(), []
     prev = None
+    shape = None
     for p in paths:
         a = read_ppm(p)
+        # ONE geometry per arm. Without this the adjacent-frame difference below
+        # raises a numpy broadcast error, which is not an exit status this tool
+        # defines and would leave the run with a traceback instead of a verdict.
+        if shape is None:
+            shape = a.shape
+        elif a.shape != shape:
+            raise UnreadableInput(
+                f"{p}: frame shape {a.shape} differs from {shape} earlier in {d}")
         f = a.astype(np.float64)
         means.append(float(f.mean()))
         variances.append(float(f.var()))
@@ -238,10 +287,26 @@ def arm_content(d: str) -> dict:
 # --- video --------------------------------------------------------------------
 def compare_video(dir_a: str, dir_b: str, label_a: str, label_b: str) -> dict:
     pa, pb = frame_paths(dir_a), frame_paths(dir_b)
-    if not pa or not pb:
-        raise SystemExit(f"FATAL: no frames ({label_a}: {len(pa)}, {label_b}: {len(pb)})")
     if len(pa) != len(pb):
-        raise SystemExit(f"FATAL: frame count differs ({len(pa)} vs {len(pb)})")
+        raise UnreadableInput(f"frame count differs ({len(pa)} vs {len(pb)})")
+    # PAIRED BY NAME, not merely by position. `sorted()` against `sorted()` puts
+    # index i of one arm against index i of the other, and equal counts are not
+    # equal frames: an arm that lost `frame_000000.ppm` and gained a later one
+    # pairs every frame against its neighbour, and then reports the render's own
+    # frame-to-frame motion as the arm-to-arm delta. That is a large, plausible
+    # and entirely spurious number, and nothing downstream can tell it from a
+    # real divergence.
+    na = [os.path.basename(p) for p in pa]
+    nb = [os.path.basename(p) for p in pb]
+    if na != nb:
+        i = next(i for i, (x, y) in enumerate(zip(na, nb)) if x != y)
+        only_a = sorted(set(na) - set(nb))[:4]
+        only_b = sorted(set(nb) - set(na))[:4]
+        raise UnreadableInput(
+            f"frame names do not correspond at index {i}: "
+            f"{label_a} has {na[i]}, {label_b} has {nb[i]}; "
+            f"only in {label_a}: {only_a or 'none'}; only in {label_b}: {only_b or 'none'}"
+        )
 
     res: dict = {"label_a": label_a, "label_b": label_b, "frames": len(pa), "per_frame": []}
 
@@ -260,7 +325,7 @@ def compare_video(dir_a: str, dir_b: str, label_a: str, label_b: str) -> dict:
         identical_files += int(same_file)
         A, B = read_ppm(fa), read_ppm(fb)
         if A.shape != B.shape:
-            raise SystemExit(f"FATAL: frame {idx} shape {A.shape} vs {B.shape}")
+            raise UnreadableInput(f"frame {idx} shape {A.shape} vs {B.shape}")
         d = np.abs(A.astype(np.int16) - B.astype(np.int16))
         hist += np.bincount(d.reshape(-1), minlength=256).astype(np.int64)
         mx = int(d.max())
@@ -324,11 +389,14 @@ def compare_video_luma_delta(dir_a: str, dir_b: str) -> float:
 
 # --- audio --------------------------------------------------------------------
 def read_wav(path: str) -> tuple[np.ndarray, int]:
-    with wave.open(path, "rb") as w:
-        n, ch, sw, sr = w.getnframes(), w.getnchannels(), w.getsampwidth(), w.getframerate()
-        raw = w.readframes(n)
+    try:
+        with wave.open(path, "rb") as w:
+            n, ch, sw, sr = w.getnframes(), w.getnchannels(), w.getsampwidth(), w.getframerate()
+            raw = w.readframes(n)
+    except wave.Error as exc:  # a file that is present and is not a wav
+        raise UnreadableInput(f"{path}: not a readable wav ({exc})") from exc
     if sw != 2:
-        raise ValueError(f"{path}: sample width {sw}, expected 2 (16-bit PCM)")
+        raise UnreadableInput(f"{path}: sample width {sw}, expected 2 (16-bit PCM)")
     a = np.frombuffer(raw, dtype="<i2").astype(np.float64)
     return a.reshape(-1, ch), sr
 
@@ -367,7 +435,11 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--a", required=True, help="arm A render directory (the reference)")
     ap.add_argument("--b", required=True, help="arm B render directory (the change under test)")
-    ap.add_argument("--control", default=None, help="a repeat of arm A: the run-to-run noise floor")
+    ap.add_argument("--control", default=None,
+                    help="a repeat of ONE arm, unchanged: the run-to-run noise floor")
+    ap.add_argument("--control-of", choices=("a", "b"), default="a",
+                    help="which arm --control repeats, and therefore which arm it is "
+                         "compared against (default: a)")
     ap.add_argument("--label-a", default="a")
     ap.add_argument("--label-b", default="b")
     ap.add_argument("--label-control", default="control")
@@ -381,10 +453,27 @@ def main() -> int:
     ap.add_argument("--min-audio-corr", type=float, default=DEFAULT_MIN_AUDIO_CORR)
     args = ap.parse_args()
 
+    # ONE place turns an unreadable input into the status that says so. Every
+    # refusal below raises rather than returning a number, so a new one cannot
+    # be added that quietly reports `the renders differ` instead.
+    try:
+        return _compare(args)
+    except UnreadableInput as exc:
+        print(f"FATAL: {exc}", file=sys.stderr)
+        print(f"VERDICT UNREADABLE (exit {EXIT_UNREADABLE}): nothing was compared",
+              file=sys.stderr)
+        return EXIT_UNREADABLE
+    except OSError as exc:
+        print(f"FATAL: cannot read an input: {exc}", file=sys.stderr)
+        print(f"VERDICT UNREADABLE (exit {EXIT_UNREADABLE}): nothing was compared",
+              file=sys.stderr)
+        return EXIT_UNREADABLE
+
+
+def _compare(args: argparse.Namespace) -> int:
     for d in (args.a, args.b) + ((args.control,) if args.control else ()):
         if not os.path.isdir(d):
-            print(f"FATAL: not a directory: {d}", file=sys.stderr)
-            return 2
+            raise UnreadableInput(f"not a directory: {d}")
 
     report: dict = {
         "thresholds": {
@@ -397,6 +486,7 @@ def main() -> int:
         },
         "inputs": {"a": os.path.abspath(args.a), "b": os.path.abspath(args.b),
                    "control": os.path.abspath(args.control) if args.control else None},
+        "control_of": args.control_of if args.control else None,
     }
 
     # WHAT EACH ARM RENDERED, before anything is subtracted. Reported first
@@ -421,12 +511,41 @@ def main() -> int:
     )
 
     if args.control:
-        c = compare_video(args.a, args.control, args.label_a, args.label_control)
-        c["mean_abs_luma"] = compare_video_luma_delta(args.a, args.control)
+        # THE ARM THE CONTROL REPEATS, named by the caller. A control is only a
+        # noise floor when it is compared against the arm it is a repeat OF.
+        ctl_dir = args.a if args.control_of == "a" else args.b
+        ctl_label = args.label_a if args.control_of == "a" else args.label_b
+        c = compare_video(ctl_dir, args.control, ctl_label, args.label_control)
+        c["mean_abs_luma"] = compare_video_luma_delta(ctl_dir, args.control)
         report["control_video"] = c
         report["control_audio"] = compare_audio(
-            os.path.join(args.a, args.audio_name), os.path.join(args.control, args.audio_name)
+            os.path.join(ctl_dir, args.audio_name), os.path.join(args.control, args.audio_name)
         )
+        # THE NUMBER SECTION 10.5 SELECTS ON, computed rather than eyeballed.
+        # It is reported and never checked: it chooses between two readings of a
+        # PASSING result -- "the delta is entirely the kernel's" against "the
+        # delta is what the box does on its own" -- and a pass/fail cannot
+        # express a choice between two answers that are both answers.
+        num, den = c["mean_abs_luma"], v["mean_abs_luma"]
+        num_rgb, den_rgb = c["mean_abs"], v["mean_abs"]
+        undefined = None
+        if den <= 0.0:
+            # The EXPECTED division by zero, and it has a name: a bit-identical
+            # treatment. Section 10.2 predicts this experiment will not see one,
+            # so a reader meets this line only when something else went wrong.
+            undefined = (f"the {args.label_a} vs {args.label_b} delta is zero, "
+                         f"so the ratio has no denominator")
+        report["control_ratio"] = {
+            "repeats": args.control_of,
+            "repeats_label": ctl_label,
+            "control_mean_abs_luma": num,
+            "treatment_mean_abs_luma": den,
+            "ratio_mean_abs_luma": (num / den) if den > 0.0 else None,
+            "control_mean_abs_rgb": num_rgb,
+            "treatment_mean_abs_rgb": den_rgb,
+            "ratio_mean_abs_rgb": (num_rgb / den_rgb) if den_rgb > 0.0 else None,
+            "undefined": undefined,
+        }
 
     # --- verdict --------------------------------------------------------------
     checks: list[tuple[str, bool, str]] = []
@@ -435,12 +554,13 @@ def main() -> int:
     # equally broken. An arm that rendered nothing, rendered one colour, or
     # rendered the same frame 49 times fails HERE, where the failure is legible,
     # rather than passing silently as a perfect match.
+    #
+    # THREE checks per arm, not four. "frames written" used to be a fourth, and
+    # it could never be False: `frame_paths` refuses an empty arm at
+    # EXIT_UNREADABLE long before this loop runs. A row that cannot fail is a
+    # decoration in a table whose entire value is that every row can.
     for label in (args.label_a, args.label_b):
         c = report["content"][label]
-        if not c.get("frames"):
-            checks.append((f"content.{label}.frames", False, "no frames written"))
-            continue
-        checks.append((f"content.{label}.frames", True, f"{c['frames']} frames"))
         checks.append((f"content.{label}.not_uniform",
                        c["near_uniform_frames"] == 0,
                        f"near-uniform frames {c['near_uniform_frames']} == 0 "
@@ -495,9 +615,6 @@ def main() -> int:
     # --- print ----------------------------------------------------------------
     print("=== what each arm rendered, before anything is subtracted ===")
     for label, c in report["content"].items():
-        if not c.get("frames"):
-            print(f"{label:12s} NO FRAMES")
-            continue
         print(f"{label:12s} frames={c['frames']} distinct={c['distinct_frame_hashes']} "
               f"mean={c['pixel_mean']:.3f} min_var={c['per_frame_var_min']:.1f} "
               f"near_uniform={c['near_uniform_frames']} "
@@ -517,10 +634,24 @@ def main() -> int:
     print(f"|delta| histogram      {dict(list(report['video']['delta_histogram'].items())[:12])}")
     if "control_video" in report:
         c = report["control_video"]
-        print(f"--- control ({args.label_a} vs {args.label_control}): the noise floor ---")
+        r = report["control_ratio"]
+        arm = "A" if r["repeats"] == "a" else "B"
+        # SAY WHICH ARM, in words, in the block itself. The convention used to be
+        # silent and the harness inverted it.
+        print(f"--- control ({args.label_control}): the noise floor ---")
+        print(f"the control {args.label_control} repeats arm {arm} "
+              f"({r['repeats_label']}), so it is compared against {r['repeats_label']}")
         print(f"bit-identical frames   {c['identical_frame_files']}/{c['frames']}")
         print(f"max |delta|            {c['max_abs']}   mean {c['mean_abs']:.6f}")
         print(f"PSNR                   {c['psnr_db']:.3f} dB   SSIM min {c['ssim_min']:.6f}")
+        if r["ratio_mean_abs_luma"] is None:
+            print(f"control/treatment      undefined: {r['undefined']}")
+        else:
+            print(f"control/treatment      {r['ratio_mean_abs_luma']:.6f} on luma "
+                  f"({r['control_mean_abs_luma']:.6f} / "
+                  f"{r['treatment_mean_abs_luma']:.6f}), "
+                  f"{r['ratio_mean_abs_rgb']:.6f} on RGB")
+        print("                       REPORTED, never checked: section 10.5 reads it")
     print("--- audio ---")
     for k in ("present", "comparable", "bit_identical", "max_abs_lsb", "max_abs_fs",
               "rms_diff_fs", "psnr_db", "pearson_r"):
@@ -535,7 +666,7 @@ def main() -> int:
         with open(args.json, "w") as fh:
             json.dump(report, fh, indent=2, sort_keys=True)
         print(f"wrote {args.json}")
-    return 0 if ok else 1
+    return EXIT_PASS if ok else EXIT_FAIL
 
 
 if __name__ == "__main__":
