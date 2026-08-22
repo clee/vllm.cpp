@@ -59,8 +59,14 @@ ExpertStreamer::Result ExpertStreamer::EnsureFile(const ExpertKey& key, int fd,
   }
 
   // pread in a loop: a short read is legal and must be finished, not accepted.
-  // The destination is the slot itself, so the bytes never pass through a
-  // staging buffer or the page tables of the mapping.
+  // The destination is whatever the store says is host-writable, so on the host
+  // store the bytes never pass through a staging buffer or the page tables of
+  // the mapping at all. On a store whose slots are DEVICE memory that pointer
+  // cannot be the slot -- `vt::Backend::DeviceMemoryIsHostAddressable()` is
+  // false for CUDA -- so `SlotForWrite` hands back a staging buffer and
+  // `CommitSlot` below publishes it. Without that pair a device store could not
+  // be filled by this function at all, which is issue #1124's third piece and
+  // the reason the contract change rides in W1 rather than after it.
   //
   // THE ACQUISITION IS UNDONE IF THE READ THROWS, and that is the whole reason
   // this loop sits inside a try. Acquire must run first, because the read needs
@@ -92,6 +98,13 @@ ExpertStreamer::Result ExpertStreamer::EnsureFile(const ExpertKey& key, int fd,
       }
       done += static_cast<size_t>(n);
     }
+    // INSIDE the try, deliberately. Publishing is the last step of the fill and
+    // it can fail for the same class of reason the read can -- a device copy
+    // that throws leaves the slot holding whatever it held before, under a cache
+    // entry that already claims the key is resident. That is the same silent,
+    // plausible and wrong outcome the loop above is wrapped for, so it takes the
+    // same undo.
+    store_.CommitSlot(acq.slot, bytes);
   } catch (...) {
     cache_.Invalidate(key);
     throw;

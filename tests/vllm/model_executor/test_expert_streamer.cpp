@@ -8,6 +8,9 @@
 // The store is an interface precisely so these run without a GPU; the host
 // implementation below records what was written, which is what makes "a hit
 // wrote nothing" checkable at all.
+#include <fcntl.h>
+#include <unistd.h>
+
 #include <doctest/doctest.h>
 
 #include <cstring>
@@ -58,11 +61,25 @@ class RecordingStore final : public ExpertSlotStore {
     return mem_.data() + static_cast<size_t>(slot) * bytes_;
   }
 
+  // ENG-EXPERT-STREAM-DEVICE W1 (#1124): the double writes in place like the
+  // host store, so there is nothing to publish — but it COUNTS the calls, so a
+  // case can assert that the streamer commits exactly the fills it performed
+  // and never a hit.
+  void CommitSlot(int32_t slot, size_t bytes) override {
+    REQUIRE(slot >= 0);
+    REQUIRE(slot < slots_);
+    REQUIRE(bytes <= bytes_);
+    ++commits;
+    last_commit_slot = slot;
+  }
+
   const uint8_t* slot(int32_t s) const { return mem_.data() + static_cast<size_t>(s) * bytes_; }
 
   int writes = 0;
   int64_t written_bytes = 0;
   int32_t last_slot = -1;
+  int commits = 0;
+  int32_t last_commit_slot = -1;
 
  private:
   int32_t slots_;
@@ -238,4 +255,57 @@ TEST_CASE("experts of different layers do not share a slot") {
   CHECK(r0.slot != r1.slot);
   CHECK(r1.filled);
   CHECK(s.fills() == 2);
+}
+
+
+TEST_CASE("EnsureFile PUBLISHES exactly the fills, and never a hit or a failure") {
+  // ENG-EXPERT-STREAM-DEVICE W1 (#1124). `CommitSlot` is what lets a store whose
+  // slots the host cannot write be filled at all, and it is only correct if the
+  // streamer calls it in exactly the places a fill succeeded. A commit on a HIT
+  // would republish a slot whose staging buffer now holds a different expert; a
+  // commit after a failed read would publish a partial slice under a key the
+  // cache is about to invalidate.
+  char path[] = "/tmp/vllm_expert_commit_XXXXXX";
+  const int fd = ::mkstemp(path);
+  REQUIRE(fd >= 0);
+  std::vector<uint8_t> file(96);
+  for (size_t i = 0; i < file.size(); ++i) file[i] = static_cast<uint8_t>(i + 3);
+  REQUIRE(::write(fd, file.data(), file.size()) ==
+          static_cast<ssize_t>(file.size()));
+
+  ExpertSlotCache cache(2);
+  RecordingStore store(2, 32);
+  ExpertStreamer s(cache, store);
+
+  const ExpertKey key{2, 5};
+  const ExpertStreamer::Result first = s.EnsureFile(key, fd, 0, 32);
+  REQUIRE(first.filled);
+  CHECK(store.commits == 1);
+  // The slot published is the slot filled, not merely some slot.
+  CHECK(store.last_commit_slot == first.slot);
+
+  // A hit moves no bytes, so there is nothing to publish.
+  REQUIRE(s.EnsureFile(key, fd, 0, 32).hit);
+  CHECK(store.commits == 1);
+
+  // A short read throws; nothing is published and the key is not resident.
+  CHECK_THROWS_AS(s.EnsureFile(ExpertKey{2, 6}, fd, 80, 32), std::runtime_error);
+  CHECK(store.commits == 1);
+  CHECK_FALSE(cache.IsResident(ExpertKey{2, 6}));
+
+  // A slice too large is refused before the cache is touched, so no slot was
+  // ever handed out to publish.
+  CHECK_THROWS_AS(s.EnsureFile(ExpertKey{2, 7}, fd, 0, 33), std::invalid_argument);
+  CHECK(store.commits == 1);
+
+  // An exhausted budget returns an invalid slot with neither flag set.
+  REQUIRE(s.EnsureFile(ExpertKey{2, 8}, fd, 32, 32).filled);
+  CHECK(store.commits == 2);
+  const ExpertStreamer::Result none = s.EnsureFile(ExpertKey{2, 9}, fd, 0, 32);
+  CHECK(none.slot == -1);
+  CHECK_FALSE(none.filled);
+  CHECK(store.commits == 2);
+
+  ::close(fd);
+  ::unlink(path);
 }

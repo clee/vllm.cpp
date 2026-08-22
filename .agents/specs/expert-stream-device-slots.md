@@ -14,6 +14,51 @@ platform may read it.
 correctness gate that would let us publish a number does not pass.** W0e ran on
 2026-08-19 inside one `rc hold` on `dgx:gpu0` at source `9c783a8be`.
 
+**W1 HAS LANDED, and it lands UNREACHED, which this section says out loud
+because `## Nothing lands dead` allows the shape only when it is declared.**
+`DeviceExpertSlotStore` (`include/vllm/model_executor/device_expert_slot_store.h`,
+`src/vllm/model_executor/device_expert_slot_store.cpp`) allocates one contiguous
+device arena through `vt::Backend::Alloc` plus one pinned host staging slot, and
+`ExpertSlotStore` gains the `CommitSlot(int32_t, size_t)` without which that
+class could not be filled by any caller. **Nothing selects the device store.**
+`Qwen35ExpertStream::store_` is still a `std::unique_ptr<HostExpertSlotStore>`
+and `Qwen35ExpertStream::Slice` still reads the concrete
+`HostExpertSlotStore::Slot`, so no load can reach the new class; the wiring is
+W2 of this row and is tracked by
+[#1124](https://github.com/mudler/vllm.cpp/issues/1124). The entry under
+`## Owed` records the same thing. The split from W2 was chosen by the dispatch
+rather than by this spec, whose own recommendation stays "land W1 and W2 as one
+pull request".
+
+* **G1: PASS, red-first and on a CPU `vt::Backend`.** The RED was taken with
+  everything present except the streamer's publish call, which is exactly the
+  defect #1124's third piece names: `test_device_expert_slot_store` returned
+  exit status 1, 9 cases with 2 failed and 97 assertions with 17 failed,
+  `Status: FAILURE!`, compile status 0 and no ENOSPC in the build log. All four
+  slices failed both halves of the comparison — against the host store AND
+  against the file — because the bytes sat in staging and never reached the
+  device slot. With `CommitSlot` called from `EnsureFile` the same binary is 9
+  cases / 97 assertions / 0 failed at exit status 0.
+* **The host path is byte-identical, which is W1's stop condition.**
+  `HostExpertSlotStore::SlotForWrite` still returns the slot itself, its
+  `CommitSlot` is a bounds-checked no-op, and no staging buffer is allocated,
+  touched or copied on that path. `test_host_expert_slot_store` is 9 cases / 203
+  assertions / 0 failed, unchanged in count from before the contract change.
+* **`CommitSlot` is PURE on the interface, not a defaulted no-op.** A default
+  would be correct for exactly one implementation — the host one — and silently
+  wrong for every store whose slots the host cannot write, which is the entire
+  population the method was added for. The cost is two overrides: the host store
+  and `test_expert_streamer`'s `RecordingStore`, which now counts the calls so
+  a case can assert the streamer publishes exactly the fills it performed and
+  never a hit, a refused acquire or a failed read.
+* **The gate file is `tests/vllm/model_executor/test_device_expert_slot_store.cpp`,
+  not the `test_expert_slot_store.cpp` this spec's `## Tests to port` table named
+  when it was written.** Stated rather than done quietly: the header it gates is
+  `device_expert_slot_store.h`, and the suite sits beside a
+  `test_host_expert_slot_store.cpp` that is its ORACLE, so a name that does not
+  say which store it is about would be the one thing a reader has to
+  disambiguate every time. The table below is corrected to match the tree.
+
 * **G0-LIVE: PASS.** 32/32 steps where seven previous attempts produced ZERO;
   decode-phase `exhausted` delta **0** (6077 at step 1 and at step 32; the total
   is the structural prefill number this spec predicted); `W0E_DOCKER_RC=0`, no
@@ -446,8 +491,13 @@ records parsed against 1702 declared).
    is the only production `ExpertSlotStore`; the only other subclass is a test
    double. `include/vllm/model_executor/expert_streamer.h:8-9,30-31` says "the
    production destination is a contiguous device-side slot array" and "production
-   writes to device memory". **Both sentences are false today**, and W1 makes them
-   true rather than adding a second claim beside them.
+   writes to device memory". **Both sentences are false today.** W1 was written
+   here as "makes them true"; what it actually did is replace them, and the
+   difference is worth the line. A second production `ExpertSlotStore` existing
+   does not make "the production destination is a contiguous device-side slot
+   array" true, because production still selects the host one — that is W2. The
+   header now names both implementations and says which one anything reaches,
+   which is the correction the false sentences needed.
 2. **No device-capable read.** `Qwen35ExpertStream` holds
    `std::unique_ptr<HostExpertSlotStore> store_` (`qwen3_5.cpp:5621`) and reads
    `store_->Slot(r.slot)` at `:5381` and `:5437` — the CONCRETE class. There is no
@@ -565,7 +615,7 @@ mutation:
 | Test | Proves | Mutation that must red it |
 |---|---|---|
 | `tests/vllm/platforms/test_platform.cpp` (extend) | the new predicate defaults false and the CUDA/ROCm assembly threads the probed value | flip the default to true; drop the assignment |
-| `tests/vllm/model_executor/test_expert_slot_store.cpp` (new) | a device-flavoured store filled via `EnsureFile` yields byte-identical slot content to the host store | delete `CommitSlot`'s copy; return staging from `SlotForRead` |
+| `tests/vllm/model_executor/test_device_expert_slot_store.cpp` (new, W1) | a device store filled via `EnsureFile` yields byte-identical slot content to the host store; the arena is ONE device allocation and staging is ONE pinned slot; `SlotForWrite` hands out staging and `SlotForRead` hands out the slot; a hit, a refused acquire and a failed read publish nothing; the host path is unchanged | delete `CommitSlot`'s copy; delete its `Synchronize`; return the slot from `SlotForWrite`; return staging from `SlotForRead`; delete the `CommitSlot` call in `EnsureFile`; delete the staged-slot identity check; drop the overflow guard; acquire the queue above the budget refusals |
 | `tests/vllm/model_executor/test_gguf_device_fit.cpp` (extend) | with the lane on, the bound excludes `*_exps` and adds the arena; with it off, the bound is byte-identical to today | make the exclusion unconditional |
 | `tests/vllm/entrypoints/test_gguf_device_fit_reach.cpp` (extend) | the loader reaches the conditional refusal from the production entry point | delete the production call site |
 | a `qwen3_5` slot-arm unit gate | the slot branch never calls `ResidentWeight`, and a streamed tower reaching device staging throws by name | remove the `VT_CHECK`; restore the `ResidentWeight` call |
@@ -1022,6 +1072,31 @@ name W2 as the owning wiring. **The cheaper and more honest shape is to land W1
 and W2 as one pull request**, and that is the recommendation here; splitting
 them is a scheduling choice that costs an explicitly-declared unreached slice.
 
+**LANDED, split from W2, and the cost the paragraph above predicted was paid in
+full.** `DeviceExpertSlotStore` is unreached, it is declared in the commit body,
+the pull request body and `## Owed`, and the class carries the reachability
+statement in its own header comment as well. One qualifier belongs here rather
+than in a summary, because it is the part a reader would otherwise get wrong in
+the generous direction: the CONTRACT half is not in the same position as the
+class. `store_.CommitSlot(acq.slot, bytes)` sits inside
+`ExpertStreamer::EnsureFile`, which IS a production call site —
+`qwen3_5.cpp`'s `Qwen35ExpertStream::Slice` reaches it from
+`Qwen3_5Model::Forward` — so the line executes on every real streamed fill
+today. What it does there is nothing, because the store production selects is
+the host one and its `CommitSlot` is a no-op. So the reachability mutation on
+that call site reds the new suite and CANNOT red the model path, and reporting
+it as reach would be reading a call count as a capability. Both halves wait on
+W2 for a consumer.
+
+**One design decision was taken inside the wave and is recorded rather than
+left in the diff.** `CommitSlot` is PURE on `ExpertSlotStore`. A defaulted
+no-op would have cost nothing at the two existing implementations and would have
+been silently wrong at the next one: the failure it hides — a device store that
+compiles, fills its staging buffer and publishes nothing — is precisely the RED
+this wave was gated on, and it presents as zeros in a slot rather than as a
+compile error. The two overrides a pure method costs are one no-op and one
+counter.
+
 **Stop condition:** if `CommitSlot` cannot be added without changing every
 existing `ExpertSlotStore` caller's contract in a way that alters host-path
 behaviour, stop — the host path must stay byte-identical, and a change that
@@ -1075,4 +1150,4 @@ re-derived here.
 | **The family-wide copy of this change: `include/vllm/model_executor/models/dense_attn_block.h`'s `ResidentWeight` still stages unconditionally.** The measurement: on a host-addressable staging platform, load any of the ~50 models that include that header and show peak resident bytes falling by the model's weight size, with tokens unchanged. | W0f deliberately changes only `qwen3_5.cpp`'s PRIVATE copy, which is the one that governs `Qwen3.8-2.4T-A95B UD-Q1_0` (that file kept its own helper; the header's copy is not on the Qwen3.5 path). The header's version is reached from `ModelRegistry::Forward` for every model that includes it, so extending it is not dead code — but nothing on a CPU tier can drive one of those forwards on a staging platform, so the extension would land with its reachability argued rather than gated, across ~50 architectures at once. That is a scope and a review question, not a line of code, and it gets its own row. |
 | **The missing CPU-platform gate on `p.quant_repack` itself ([#1320](https://github.com/mudler/vllm.cpp/issues/1320)).** The measurement: `elem_kn_repack` is resolved with `CurrentPlatform().device_type() == kCPU` and `quant_repack` is not, so a device load can still perform a CPU-only transform and be caught afterwards instead of never doing it. | W0f fixes the CONSEQUENCE in flow — a named refusal on both arms of `ResidentWeight`, red-first and mutation-proven — because that is the small and clear part. Moving the gate into the loader policy changes what a GGUF load DOES on a device rather than what it refuses, which is `QUANT-GGUF-KEEPQ-LOADER`'s semantics and needs its own red-first evidence. |
 | **`.agents/specs/expert-streaming.md`'s `## Owed` entry for #1124 still names no owning row ID.** | Not edited here on purpose; PRs #1200 and #1216 both edit that file. One-line follow-up once both land. |
-| **W1 may land UNREACHED if it is split from W2.** | The recommendation is one pull request. If a split is chosen, the commit body and the PR body must name what is unreached and name W2 as the owning wiring, per `## Nothing lands dead`. |
+| **W1 LANDED UNREACHED, and W2 owns the wiring.** What is not reached: `DeviceExpertSlotStore` — no loader, no model and no registered command constructs one, because `Qwen35ExpertStream::store_` is still a `std::unique_ptr<HostExpertSlotStore>` and `Qwen35ExpertStream::Slice` reads the concrete `HostExpertSlotStore::Slot`. Owning row: `ENG-EXPERT-STREAM-DEVICE`, wave W2. Tracking issue: [#1124](https://github.com/mudler/vllm.cpp/issues/1124), which stays OPEN. | The split from W2 was a dispatch decision, not this spec's recommendation, which is still one pull request. Named in the landing commit body and the pull request body as well as here, because `## Nothing lands dead` requires all three and the spec alone is not the disclosure. The narrower half: the `CommitSlot` CALL is on a production path (`ExpertStreamer::EnsureFile`, reached from `Qwen3_5Model::Forward` via `Qwen35ExpertStream::Slice`) and executes on every streamed fill, but its effect is a no-op until a store that needs it is selected, so the call site's reachability is not the class's. |
