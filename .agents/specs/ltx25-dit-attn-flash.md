@@ -1036,6 +1036,15 @@ ratio `R` and which of §10.5's readings it selects, the cross-check against the
 
 ## Owed
 
+- **`dgx:gpu0` holds ~110 GiB that belongs to no `/proc/meminfo` category, and
+  the controller keeps handing out leases against it.**
+  [#1709](https://github.com/mudler/vllm.cpp/issues/1709), measured in §10.7.
+  The half this row owns is fixed in flow: the harness's `MemAvailable` start
+  gate waits, logs every poll and refuses by name. Two halves are NOT this
+  row's and are named rather than folded in — a device-readiness condition in
+  `rc`, which would have parked three jobs instead of spending them, and a line
+  in `.agents/environment.md`'s DGX profile saying a granted lease does not
+  imply a reclaimed box. Owner: this row until the controller half has one.
 - **There is NO numeric or pixel comparison at production geometry.**
   **§10 is the design that discharges this, and it is committed before the
   renders are taken.** The result lands in §10.7. Until it does, the statement
